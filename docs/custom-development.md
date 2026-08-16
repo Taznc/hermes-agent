@@ -1,15 +1,15 @@
 # Customized Hermes Development
 
-This fork is reserved for upstream-compatible Hermes core changes. Keep product-specific integrations, skills, MCP packages, and Desktop extensions in the private sibling repository at `~/Projects/hermes-customizations` whenever an extension surface can support them.
+This fork is reserved for upstream-compatible Hermes core changes. It lives in the Hermes workspace at `~/Projects/hermes/hermes-agent`. Keep product-specific integrations, skills, MCP packages, and Desktop extensions in the private sibling repository at `~/Projects/hermes/hermes-customizations` whenever an extension surface can support them. The workspace root owns cross-repository roadmap and architecture artifacts; this repository remains independently versioned.
 
 ## Repository topology
 
 ```text
-~/Projects/hermes-agent/             # Taznc/hermes-agent fork; core changes only
-  origin   https://github.com/Taznc/hermes-agent.git
-  upstream https://github.com/NousResearch/hermes-agent.git (fetch-only)
-
-~/Projects/hermes-customizations/    # private integrations and extensions
+~/Projects/hermes/                   # Taznc/hermes workspace; roadmap and orchestration only
+  hermes-agent/                      # Taznc/hermes-agent fork; core changes only
+    origin   https://github.com/Taznc/hermes-agent.git
+    upstream https://github.com/NousResearch/hermes-agent.git (fetch-only)
+  hermes-customizations/             # private integrations and extensions
 
 ~/.hermes/venvs/hermes-dev/          # external editable Python development venv
 ~/.hermes-dev/                       # isolated development runtime state
@@ -23,14 +23,14 @@ This fork is reserved for upstream-compatible Hermes core changes. Keep product-
 The setup is intentionally split from the daily-use runtime:
 
 ```bash
-cd ~/Projects/hermes-agent
+cd ~/Projects/hermes/hermes-agent
 uv venv ~/.hermes/venvs/hermes-dev --python 3.11
 uv pip install --python ~/.hermes/venvs/hermes-dev/bin/python -e '.[all,dev]'
 PATH="$(brew --prefix node)/bin:$PATH" npm ci
 ./scripts/dev-env.sh hermes config set display.interface cli
 ```
 
-`./scripts/dev-env.sh` selects the Node 26 line pinned by `.nvmrc`, the external development venv, the source checkout, and `~/.hermes-dev`. Run all development commands through it. It never reads or writes credentials from the daily-use `~/.hermes` runtime.
+`./scripts/dev-env.sh` selects the Node 26 line pinned by `.nvmrc`, the external development venv, the source checkout, and `~/.hermes-dev`. Run all development commands through it. It never inherits `HERMES_HOME` from a calling shell, so it cannot accidentally use the daily-use `~/.hermes` runtime; set `HERMES_DEV_HOME` only when you intentionally need another isolated development profile.
 
 Settings belong in the active `config.yaml`, managed with `hermes config set`; credentials belong only in the active `.env`. Do not copy production credentials into this repository or commit any `.env` file.
 
@@ -62,7 +62,7 @@ Desktop starts its local Hermes backend itself. `HERMES_DESKTOP_HERMES_ROOT` is 
 Only synchronize a clean `main` branch:
 
 ```bash
-cd ~/Projects/hermes-agent
+cd ~/Projects/hermes/hermes-agent
 git switch main
 git fetch upstream --prune
 git merge --ff-only upstream/main

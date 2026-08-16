@@ -30,7 +30,11 @@ fi
 
 export PATH="$node_bin:$venv/bin:$PATH"
 export HERMES_PYTHON="$venv/bin/python"
-export HERMES_HOME="${HERMES_HOME:-$HOME/.hermes-dev}"
+# Never inherit the managed daily-use profile from the calling shell. The
+# development launcher must remain isolated even when Hermes Desktop or a
+# parent process exported HERMES_HOME. Use HERMES_DEV_HOME for an explicit
+# alternate development profile.
+export HERMES_HOME="${HERMES_DEV_HOME:-$HOME/.hermes-dev}"
 export HERMES_DESKTOP_HERMES_ROOT="${HERMES_DESKTOP_HERMES_ROOT:-$repo_root}"
 
 if [[ "$#" -eq 0 ]]; then
