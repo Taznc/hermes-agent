@@ -1424,6 +1424,10 @@ export interface Translations {
     switchToProfile: (name: string) => string
     manageProfiles: string
     connectGateway: string
+    switchToAgent: (profile: string, device: string) => string
+    agentsHeading: string
+    thisDevice: string
+    sourceUnreachable: string
     actions: string
     color: string
     colorFor: string
