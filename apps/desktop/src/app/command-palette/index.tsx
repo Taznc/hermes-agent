@@ -70,6 +70,12 @@ import { $bindings, bindingsFor } from '@/store/keybinds'
 import { $dismissedAutoProjectIds, filterVisibleProjects } from '@/store/layout'
 import { openPetGenerate } from '@/store/pet-generate'
 import { openBrowserTab } from '@/store/preview'
+import {
+  $activeGatewayConnection,
+  $activeGatewayProfile,
+  normalizeProfileKey,
+  selectAgent
+} from '@/store/profile'
 import { $projectTree, goToProject, openFolderAsProject, requestStartWorkSession } from '@/store/projects'
 import { $connection } from '@/store/session'
 import { runGatewayRestart } from '@/store/system-actions'
@@ -104,6 +110,7 @@ import { SECTIONS } from '../settings/constants'
 import { type SettingsSearchEntry, settingsSearchTargetQuery } from '../settings/settings-search'
 import { useSettingsSearchCatalog } from '../settings/use-settings-search'
 
+import { buildAgentPaletteRows } from './agent-rows'
 import { usePaletteContributions } from './contrib'
 import { HighlightWatcher } from './highlight-watcher'
 import { MarketplaceThemePage } from './marketplace-theme-page'
@@ -554,6 +561,8 @@ function CommandPaletteBody({ onExited }: { onExited: () => void }) {
   const worktrees = useStore($repoWorktrees)
   const projectTree = useStore($projectTree)
   const dismissedAutoProjects = useStore($dismissedAutoProjectIds)
+  const activeGatewayProfile = useStore($activeGatewayProfile)
+  const activeGatewayConnection = useStore($activeGatewayConnection)
   const navigate = useNavigate()
 
   const { availableThemes, clearThemePreview, mode, previewTheme, resolvedMode, setMode, setTheme, themeName } =
@@ -648,6 +657,24 @@ function CommandPaletteBody({ onExited }: { onExited: () => void }) {
     queryFn: () => listAllProfileSessions(200, 0, 'only')
   })
 
+  // The union agent roster across every registered connection (Settings →
+  // Connections). This is the ONLY built-in surface that lists agents from
+  // other machines: the profile rail renders /api/profiles from whichever
+  // backend is currently active, so a remote source's profiles are invisible
+  // there until you're already on it (#85731).
+  //
+  // Feature-detected: older Desktop builds have no bridge method, and the
+  // handler itself reports unreachable sources per-row rather than failing, so
+  // one dead box can't empty the list. A missing bridge yields no rows and the
+  // group simply doesn't render.
+  const rosterQuery = useQuery({
+    queryKey: ['command-palette', 'agent-roster'],
+    queryFn: async () => (await window.hermesDesktop?.getAgentRoster?.()) ?? null,
+    // The roster fans out REST calls to every registered source; keep reopens
+    // cheap but let an added/removed connection show up without a restart.
+    staleTime: 30_000
+  })
+
   const mcpServers = useMemo(() => {
     const raw = configQuery.data?.mcp_servers
 
@@ -719,6 +746,40 @@ function CommandPaletteBody({ onExited }: { onExited: () => void }) {
   const [selectTick, setSelectTick] = useState(0)
 
   const contributedItems = usePaletteContributions()
+
+  // Agents on every registered connection → "switch this window onto that
+  // machine". Selecting a row re-homes the app the same way the profile rail
+  // does for local profiles (sidebar, sessions, cron and new chats all follow),
+  // but dials the socket against that connection's OWN backend via selectAgent.
+  // Row selection/suppression rules live in buildAgentPaletteRows (pure).
+  const agentGroup = useMemo<PaletteGroup[]>(() => {
+    const rows = buildAgentPaletteRows({
+      activeConnectionId: activeGatewayConnection,
+      activeProfile: activeGatewayProfile,
+      localLabel: t.profiles.thisDevice,
+      normalizeProfile: normalizeProfileKey,
+      roster: rosterQuery.data
+    })
+
+    if (rows.length === 0) {
+      return []
+    }
+
+    return [
+      {
+        heading: t.profiles.agentsHeading,
+        items: rows.map(row => ({
+          active: row.isActive,
+          detail: row.isUnreachable ? t.profiles.sourceUnreachable : row.device,
+          icon: row.isLocal ? Monitor : Globe,
+          id: `agent-${row.connectionId ?? 'local'}-${row.profile}`,
+          keywords: ['agent', 'connection', 'gateway', 'switch', 'remote', row.profile, row.device, row.handle],
+          label: t.profiles.switchToAgent(row.profile, row.device),
+          run: () => selectAgent(row.connectionId, row.profile)
+        }))
+      }
+    ]
+  }, [activeGatewayConnection, activeGatewayProfile, rosterQuery.data, t])
 
   // The active repo's worktrees → "new conversation in <branch>". This is the
   // ⌘K-typed "I want to work on <branch>" reflex: each entry seeds a fresh
@@ -1242,13 +1303,14 @@ function CommandPaletteBody({ onExited }: { onExited: () => void }) {
     themeName
   ])
 
-  // Branch rows rank below BOTH the fixed groups and the typed-only lists: they
-  // scale with whatever worktrees happen to exist, so on a tie they're the least
-  // likely thing meant. Everything above is either always-present chrome or a
-  // list the search itself asked for.
+  // Agent rows sit between the fixed groups and the branch list: they're a
+  // deliberate "which machine am I on" switch (more intentional than a
+  // worktree), but still rank below always-present chrome and the lists search
+  // asked for. Branch rows stay last: they scale with whatever worktrees happen
+  // to exist, so on a tie they're the least likely thing meant.
   const groups = useMemo(
-    () => [...baseGroups, ...searchGroups, ...branchGroup],
-    [baseGroups, branchGroup, searchGroups]
+    () => [...baseGroups, ...searchGroups, ...agentGroup, ...branchGroup],
+    [agentGroup, baseGroups, branchGroup, searchGroups]
   )
 
   // Settings-scoped page (⌘K on the Settings overlay, or its search pill):

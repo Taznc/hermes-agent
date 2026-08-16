@@ -189,6 +189,14 @@ export async function switchProfile(name: string): Promise<void> {
 // leave this naming a profile the active socket no longer serves (#89206).
 export const $activeGatewayProfile = atom<string>('default')
 
+// The REGISTRY CONNECTION the live gateway is dialed through, or null for the
+// local pool (the app-managed runtime on this device). $activeGatewayProfile
+// alone cannot answer "which machine am I on": the same profile name commonly
+// exists on several registered sources, so `default` locally and `default` on a
+// remote box are indistinguishable by profile key. Surfaces that switch or
+// report the active agent need the pair.
+export const $activeGatewayConnection = atom<null | string>(null)
+
 // Profile for the NEXT new chat (chosen via the new-chat picker). null = primary
 // / default, so single-profile users are unaffected.
 export const $newChatProfile = atom<string | null>(null)
@@ -310,7 +318,14 @@ export async function ensureGatewayProfile(profile: string | null | undefined): 
 
   const target = normalizeProfileKey(profile)
 
-  if (normalizeProfileKey($activeGatewayProfile.get()) === target && $gateway.get()) {
+  // "Already here" requires being on the LOCAL POOL too, not just the same
+  // profile name. A registry agent can hold the identical profile key (remote
+  // `default` vs local `default`), so a key-only comparison would treat
+  // returning to this device as a no-op and strand the window on the remote
+  // backend — the same (connection, profile) confusion as #85731.
+  const onLocalPool = $activeGatewayConnection.get() === null
+
+  if (onLocalPool && normalizeProfileKey($activeGatewayProfile.get()) === target && $gateway.get()) {
     return
   }
 
@@ -319,7 +334,11 @@ export async function ensureGatewayProfile(profile: string | null | undefined): 
   if (gatewaySwitch) {
     await gatewaySwitch.catch(() => undefined)
 
-    if (normalizeProfileKey($activeGatewayProfile.get()) === target && $gateway.get()) {
+    if (
+      $activeGatewayConnection.get() === null &&
+      normalizeProfileKey($activeGatewayProfile.get()) === target &&
+      $gateway.get()
+    ) {
       return
     }
   }
@@ -356,6 +375,11 @@ export async function ensureGatewayProfile(profile: string | null | undefined): 
       }
 
       $activeGatewayProfile.set(target)
+
+      // The local pool owns this backend, so the active source is "this
+      // device". Published inside the same batch as the profile pointer so
+      // the profile/connection-source pair is never observable half-updated.
+      $activeGatewayConnection.set(null)
 
       if (connection) {
         setConnection(connection)
@@ -456,6 +480,11 @@ export async function ensureGatewayAgent(connectionId: null | string, profile: s
 
       $activeGatewayProfile.set(target)
 
+      // Registry-scoped: the live socket belongs to `connection`, not the
+      // pool. Published in the same batch as the profile pointer so no
+      // listener can observe the agent paired with the wrong source.
+      $activeGatewayConnection.set(connection)
+
       // Remote-aware paths (image.attach_bytes vs image.attach, /api/fs/*,
       // /api/media) follow $connection. Null here is only the no-bridge case,
       // so keeping the previous descriptor is correct; a failed lookup
@@ -512,9 +541,16 @@ export const $profileScope = computed([$showAllProfiles, $activeGatewayProfile],
 // $activeGatewayProfile → name, so $profileScope follows).
 export function selectProfile(name: string): void {
   const target = normalizeProfileKey(name)
+
   // Switching profiles (or coming back from the all-profiles browse view) starts
   // fresh; re-tapping the profile you're already in leaves your session be.
-  const switching = $showAllProfiles.get() || target !== normalizeProfileKey($activeGatewayProfile.get())
+  // Coming back from a REGISTRY agent counts as switching even when the profile
+  // key matches — it's a different machine.
+  const switching =
+    $showAllProfiles.get() ||
+    target !== normalizeProfileKey($activeGatewayProfile.get()) ||
+    $activeGatewayConnection.get() !== null
+
   $showAllProfiles.set(false)
   $newChatProfile.set(target)
 
@@ -523,6 +559,43 @@ export function selectProfile(name: string): void {
   }
 
   void ensureGatewayProfile(target)
+}
+
+// Registry-aware sibling of selectProfile: switch the active context to an agent
+// on a NAMED connection. Same user-visible contract (leave the all-profiles
+// view, point new chats at it, start fresh when the context actually changes),
+// but the swap goes through ensureGatewayAgent so the socket is dialed against
+// that connection's own backend. A null/local connectionId is delegated to
+// selectProfile verbatim, so the single-source path is untouched.
+//
+// "Switching" is judged on the (connection, profile) PAIR, not the profile key
+// alone — re-selecting `default` on a remote source while sitting on the local
+// `default` is a real backend change, and comparing profile names alone would
+// silently skip it.
+export function selectAgent(connectionId: null | string, name: string): void {
+  const connection = (connectionId ?? '').trim() || null
+
+  if (!connection) {
+    selectProfile(name)
+
+    return
+  }
+
+  const target = normalizeProfileKey(name)
+
+  const switching =
+    $showAllProfiles.get() ||
+    target !== normalizeProfileKey($activeGatewayProfile.get()) ||
+    connection !== $activeGatewayConnection.get()
+
+  $showAllProfiles.set(false)
+  $newChatProfile.set(target)
+
+  if (switching) {
+    requestFreshSession()
+  }
+
+  void ensureGatewayAgent(connection, target)
 }
 
 // Start a fresh session in `name` WITHOUT collapsing the "All profiles" browse
