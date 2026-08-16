@@ -1,20 +1,127 @@
 import { MessagePrimitive, useAuiState } from '@assistant-ui/react'
-import { type FC } from 'react'
+import { type FC, useState } from 'react'
 
 import { messageContentText } from '@/components/assistant-ui/thread/content'
 import { MessageTimelineTimestamp } from '@/components/assistant-ui/thread/timeline-timestamp'
 import { SCAFFOLD_LABEL_CLASS } from '@/components/chat/scaffold-row'
 import { Codicon } from '@/components/ui/codicon'
+import { DisclosureCaret } from '@/components/ui/disclosure-caret'
 import { ToolIcon } from '@/components/ui/tool-icon'
+import { useI18n } from '@/i18n'
 import { LinkifiedText } from '@/lib/external-link'
 import { cn } from '@/lib/utils'
+import type { ReviewActionRecord } from '@/types/hermes'
 
 const SLASH_STATUS_RE = /^slash:(?<command>\/[^\n]+)\n(?<output>[\s\S]*)$/
 const STEER_NOTE_RE = /^steer:(?<text>[\s\S]+)$/
 const REVIEW_NOTE_RE = /^review:(?<label>[^:\n]+):?\s*(?<detail>[\s\S]*)$/
 
+// Glyph per operation verb — mirrors the ➕/✏️/➖ prefixes the backend's
+// verbose-mode compact summary already uses (agent/background_review.py),
+// so the expanded row reads consistently with anyone who also sees the
+// CLI/TUI's plain-text form.
+const OPERATION_ICON: Record<string, string> = {
+  add: 'add',
+  create: 'add',
+  replace: 'edit',
+  patch: 'edit',
+  edit: 'edit',
+  remove: 'trash'
+}
+
+/** One row inside the expanded self-improvement detail list. */
+function ReviewActionRow({ action }: { action: ReviewActionRecord }) {
+  const { t } = useI18n()
+  const copy = t.assistant.thread.review
+  const icon = OPERATION_ICON[action.operation] ?? 'circle'
+  const skillLabel = action.skill_name ? `${action.label} "${action.skill_name}"` : action.label
+
+  return (
+    <li className="flex min-w-0 items-start gap-1.5 py-0.5">
+      <span className="flex h-(--conversation-line-height) w-3 shrink-0 items-center justify-center">
+        <Codicon
+          className={action.success ? 'text-(--ui-text-tertiary)' : 'text-destructive'}
+          name={action.success ? icon : 'warning'}
+          size="0.75rem"
+        />
+      </span>
+      <span className="min-w-0 wrap-anywhere text-[0.6875rem] leading-5 text-muted-foreground/80">
+        <span className="font-medium text-muted-foreground">{skillLabel}</span>
+        {action.old_preview !== undefined && action.new_preview !== undefined ? (
+          <>
+            {': "'}
+            {action.old_preview}
+            {'" → "'}
+            {action.new_preview}
+            {'"'}
+          </>
+        ) : action.content_preview !== undefined ? (
+          <>
+            {': '}
+            {action.content_preview}
+          </>
+        ) : action.old_preview !== undefined ? (
+          <>
+            {': '}
+            {action.old_preview}
+          </>
+        ) : null}
+        {!action.success && action.message && (
+          <span className="block text-destructive/90">{copy.failedReason(action.message)}</span>
+        )}
+      </span>
+    </li>
+  )
+}
+
+/**
+ * The self-improvement review's per-action detail list, behind a disclosure
+ * caret next to the summary row. Collapsed by default so an ordinary "saved
+ * something" glance doesn't grow the transcript; opens to show exactly which
+ * memory/skill mutations happened, including failed/skipped attempts, so the
+ * user never has to trust an opaque one-line summary (ROADMAP.md Phase 1).
+ */
+function ReviewActionsDisclosure({ actions }: { actions: ReviewActionRecord[] }) {
+  const { t } = useI18n()
+  const copy = t.assistant.thread.review
+  const [open, setOpen] = useState(false)
+  const failedCount = actions.filter(action => !action.success).length
+
+  return (
+    <span className="ml-1 inline-flex items-center align-middle">
+      <button
+        aria-expanded={open}
+        className={cn(
+          SCAFFOLD_LABEL_CLASS,
+          'inline-flex items-center gap-1 bg-transparent text-muted-foreground/55 transition-colors hover:text-foreground'
+        )}
+        onClick={() => setOpen(value => !value)}
+        type="button"
+      >
+        {open ? copy.hideDetails : failedCount > 0 ? copy.showDetailsWithFailures(failedCount) : copy.showDetails}
+        <DisclosureCaret className="text-muted-foreground/55" open={open} size="0.625rem" />
+      </button>
+      {open && (
+        <ul className="mt-1 block w-full list-none space-y-0.5 pl-0">
+          {actions.map((action, index) => (
+            // Records have no stable id; the review pass emits them once and
+            // the list never reorders in place, so positional key is safe.
+            // eslint-disable-next-line react/no-array-index-key
+            <ReviewActionRow action={action} key={index} />
+          ))}
+        </ul>
+      )}
+    </span>
+  )
+}
+
 export const SystemMessage: FC = () => {
   const text = useAuiState(s => messageContentText(s.message.content))
+  const reviewActions = useAuiState(s => {
+    const custom = (s.message.metadata?.custom ?? {}) as { reviewActions?: ReviewActionRecord[] }
+
+    return custom.reviewActions
+  })
 
   if (!text) {
     return null
@@ -31,7 +138,7 @@ export const SystemMessage: FC = () => {
 
     return (
       <MessagePrimitive.Root
-        className="flex w-full min-w-0 max-w-full items-start gap-1.5 self-start py-0.5"
+        className="flex w-full min-w-0 max-w-full flex-wrap items-start gap-1.5 self-start py-0.5"
         data-role="system"
         data-slot="aui_system-message-root"
       >
@@ -44,6 +151,7 @@ export const SystemMessage: FC = () => {
         {detail && (
           <span className={cn(SCAFFOLD_LABEL_CLASS, 'tool-memory-legendary-meta min-w-0 wrap-anywhere')}>{detail}</span>
         )}
+        {reviewActions?.length ? <ReviewActionsDisclosure actions={reviewActions} /> : null}
       </MessagePrimitive.Root>
     )
   }
