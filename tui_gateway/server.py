@@ -2426,8 +2426,16 @@ def _start_agent_build(sid: str, session: dict) -> None:
             # default cold resume) build through here, so without this their
             # review summaries would leak to stdout instead of the chat.
             try:
-                agent.background_review_callback = lambda message, _sid=sid: _emit(
-                    "review.summary", _sid, {"text": str(message)}
+                # `background_review_detail_callback` (not just the plain-text
+                # `background_review_callback`) so the desktop's review.summary
+                # event carries structured per-action records too (Desktop's
+                # expandable self-improvement row, ROADMAP.md Phase 1). Ink/TUI
+                # consumers only read `text` and ignore the extra `actions`
+                # field, so this is backward compatible with older clients.
+                agent.background_review_detail_callback = (
+                    lambda message, records, _sid=sid: _emit(
+                        "review.summary", _sid, {"text": str(message), "actions": records}
+                    )
                 )
                 agent.memory_notifications = _load_memory_notifications()
             except Exception:
@@ -7121,8 +7129,14 @@ def _init_session(
     # prompt_toolkit; the TUI has no equivalent print surface, so without
     # this callback the review would write the skill/memory change silently.
     try:
-        agent.background_review_callback = lambda message, _sid=sid: _emit(
-            "review.summary", _sid, {"text": str(message)}
+        # See the matching comment at the deferred-build call site above:
+        # the detail callback carries structured per-action records
+        # alongside the compact text (Desktop's expandable self-improvement
+        # row, ROADMAP.md Phase 1); older/plain clients only read `text`.
+        agent.background_review_detail_callback = (
+            lambda message, records, _sid=sid: _emit(
+                "review.summary", _sid, {"text": str(message), "actions": records}
+            )
         )
         # Honor display.memory_notifications (off | on | verbose) like the
         # messaging gateway and CLI do — otherwise the review always behaved as
