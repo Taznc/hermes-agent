@@ -644,6 +644,13 @@ def init_agent(
     # would mangle the escape sequences.  None = use builtins.print.
     agent._print_fn = None
     agent.background_review_callback = None  # Optional sync callback for gateway delivery
+    # Optional sync callback receiving the SAME event as background_review_callback,
+    # plus structured per-action records (list[dict] from
+    # agent.background_review.collect_background_review_actions). Only the TUI
+    # gateway wires this (Desktop's expandable self-improvement transcript row,
+    # ROADMAP.md Phase 1); the CLI and messaging-gateway paths render plain text
+    # and have no use for the structured form, so they leave it unset.
+    agent.background_review_detail_callback = None
     agent.memory_notifications = "on"  # Memory update notifications: "off", "on", "verbose"
     agent.skip_context_files = skip_context_files
     agent.load_soul_identity = load_soul_identity

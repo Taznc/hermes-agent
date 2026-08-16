@@ -701,6 +701,186 @@ def summarize_background_review_actions(
     return actions
 
 
+def collect_background_review_actions(
+    review_messages: List[Dict],
+    prior_snapshot: List[Dict],
+    notification_mode: str = "on",
+) -> List[Dict[str, Any]]:
+    """Build structured per-call action records for a background review pass.
+
+    Companion to ``summarize_background_review_actions``: that function
+    renders the compact chat-line summary text (one joined string, success
+    only); this one returns every individual add/replace/remove/create/
+    patch/edit *call* the review made this pass — including calls that
+    FAILED (e.g. a memory write that would exceed the char budget) — as
+    structured records. A UI (Desktop's expandable self-improvement row,
+    Phase 1 of ROADMAP.md) can then present each mutation individually
+    without exposing the entire memory/skill store or collapsing distinct
+    operations into one opaque line.
+
+    Each record has: ``target`` ("memory" | "user" | "skill"), ``label``
+    (display string), ``operation`` (the tool's ``action`` — "add",
+    "replace", "remove", "create", "patch", "edit", or "unknown"),
+    ``success`` (bool), ``message`` (the tool's own success/error string),
+    and, when available, ``content_preview`` / ``old_preview`` /
+    ``new_preview`` truncated the same way the compact summary is.
+    Skill records also carry ``skill_name`` when known.
+
+    Mirrors ``summarize_background_review_actions``'s prior-snapshot
+    de-duplication (issue #14944) and its ``notification_mode`` gate: mode
+    ``off`` returns no records at all, matching the compact summary's
+    behavior of surfacing nothing when the user disabled the notice.
+    """
+    mode = str(notification_mode or "on").lower()
+    if mode == "off":
+        return []
+
+    existing_tool_call_ids = set()
+    existing_tool_contents = set()
+    for prior in prior_snapshot or []:
+        if not isinstance(prior, dict) or prior.get("role") != "tool":
+            continue
+        tcid = prior.get("tool_call_id")
+        if tcid:
+            existing_tool_call_ids.add(tcid)
+        else:
+            content = prior.get("content")
+            if isinstance(content, str):
+                existing_tool_contents.add(content)
+
+    notify_tools = {"memory", "skill_manage"}
+    call_details: dict = {}
+    for msg in review_messages or []:
+        if not isinstance(msg, dict) or msg.get("role") != "assistant":
+            continue
+        for tc in msg.get("tool_calls", []) or []:
+            if not isinstance(tc, dict):
+                continue
+            fn = tc.get("function", {}) or {}
+            fn_name = fn.get("name", "")
+            tcid = tc.get("id")
+            if fn_name not in notify_tools or not tcid:
+                continue
+            try:
+                args = json.loads(fn.get("arguments", "{}"))
+            except (json.JSONDecodeError, TypeError):
+                args = {}
+            call_details[tcid] = {
+                "tool": fn_name,
+                "action": args.get("action", ""),
+                "target": args.get("target", "memory"),
+                "content": args.get("content", ""),
+                "old_text": args.get("old_text", ""),
+                "operations": args.get("operations") or [],
+                "name": args.get("name", ""),
+                "old_string": args.get("old_string", ""),
+                "new_string": args.get("new_string", ""),
+            }
+
+    max_preview = 120
+    max_short_preview = 80
+    max_remove_preview = 60
+
+    def _preview(text: Any, limit: int) -> str:
+        text = text if isinstance(text, str) else ""
+        return text[:limit] + ("…" if len(text) > limit else "")
+
+    records: List[Dict[str, Any]] = []
+    for msg in review_messages or []:
+        if not isinstance(msg, dict) or msg.get("role") != "tool":
+            continue
+        tcid = msg.get("tool_call_id")
+        if tcid and tcid in existing_tool_call_ids:
+            continue
+        if not tcid:
+            content_str = msg.get("content")
+            if isinstance(content_str, str) and content_str in existing_tool_contents:
+                continue
+        # Only calls the review agent itself made this pass have a captured
+        # detail — inherited/foreign tool messages have nothing to key off.
+        detail = call_details.get(tcid)
+        if not detail:
+            continue
+
+        try:
+            data = json.loads(msg.get("content", "{}"))
+        except (json.JSONDecodeError, TypeError):
+            data = {}
+        # A buggy/legacy tool response can be a list or scalar rather than a
+        # dict (see the #59437 note in summarize_background_review_actions) —
+        # normalize so downstream .get() calls never AttributeError.
+        if not isinstance(data, dict):
+            data = {}
+
+        success = bool(data.get("success"))
+        raw_message = data.get("message") or data.get("error") or ""
+        is_skill = detail.get("tool") == "skill_manage"
+        target = data.get("target", "") or detail.get("target", "")
+
+        if is_skill:
+            label = "Skill"
+        elif target == "user":
+            label = "User profile"
+        else:
+            label = "Memory"
+
+        base: Dict[str, Any] = {
+            "target": "skill" if is_skill else (target or "memory"),
+            "label": label,
+            "success": success,
+            "message": str(raw_message),
+        }
+        if is_skill and detail.get("name"):
+            base["skill_name"] = detail["name"]
+
+        action = detail.get("action", "") or "unknown"
+        operations = detail.get("operations")
+        operations = operations if isinstance(operations, list) else []
+
+        if is_skill:
+            change_raw = data.get("_change")
+            change: dict = change_raw if isinstance(change_raw, dict) else {}
+            old_string = change.get("old", "") or detail.get("old_string", "")
+            new_string = change.get("new", "") or detail.get("new_string", "")
+            description = change.get("description", "")
+            record = dict(base)
+            record["operation"] = action
+            if old_string or new_string:
+                record["old_preview"] = _preview(old_string, max_short_preview)
+                record["new_preview"] = _preview(new_string, max_short_preview)
+            if description:
+                record["content_preview"] = str(description)
+            records.append(record)
+        elif operations:
+            # Batch ``memory`` call — one record per sub-operation so each
+            # add/replace/remove within the batch is individually visible.
+            for op in operations:
+                if not isinstance(op, dict):
+                    continue
+                op_act = op.get("action", "") or "unknown"
+                record = dict(base)
+                record["operation"] = op_act
+                op_content = op.get("content") or ""
+                op_old = op.get("old_text") or ""
+                if op_content:
+                    record["content_preview"] = _preview(op_content, max_preview)
+                if op_old:
+                    record["old_preview"] = _preview(op_old, max_remove_preview)
+                records.append(record)
+        else:
+            record = dict(base)
+            record["operation"] = action
+            content = detail.get("content", "")
+            old_text = detail.get("old_text", "")
+            if content:
+                record["content_preview"] = _preview(content, max_preview)
+            if old_text:
+                record["old_preview"] = _preview(old_text, max_remove_preview)
+            records.append(record)
+
+    return records
+
+
 def build_memory_write_metadata(
     agent: Any,
     *,
@@ -1259,19 +1439,53 @@ def _run_review_in_thread(
             review_usage, _classify_review_result(actions)
         )
 
+        # Structured per-action records for surfaces that render an
+        # expandable detail view (Desktop) instead of one flattened line.
+        # Same defensive wrapping as the summary above — a malformed tool
+        # response shape must not take down the whole review pass.
+        try:
+            detail_records = collect_background_review_actions(
+                review_messages,
+                messages_snapshot,
+                notification_mode=getattr(agent, "memory_notifications", "on"),
+            )
+        except Exception as e:
+            logger.warning(
+                "collect_background_review_actions returned partial results "
+                "after exception (treating as empty): %s",
+                e,
+            )
+            detail_records = []
+
         if actions:
             summary = " · ".join(dict.fromkeys(actions))
             agent._safe_print(
                 f"  💾 Self-improvement review: {summary}"
             )
-            _bg_cb = agent.background_review_callback
-            if _bg_cb:
+            # The structured detail callback (Desktop/TUI gateway) is a
+            # strict superset of the plain-text callback (CLI, messaging
+            # gateway) — same event, plus per-action records. When both are
+            # wired, call ONLY the detail one so the surface doesn't receive
+            # the same review.summary event twice; fall back to the plain
+            # callback when no detail callback is registered.
+            _bg_detail_cb = getattr(agent, "background_review_detail_callback", None)
+            if _bg_detail_cb:
                 try:
-                    _bg_cb(
-                        f"💾 Self-improvement review: {summary}"
+                    _bg_detail_cb(
+                        f"💾 Self-improvement review: {summary}",
+                        detail_records,
                     )
                 except Exception:
                     pass
+            else:
+                _bg_cb = agent.background_review_callback
+                if _bg_cb:
+                    try:
+                        _bg_cb(
+                            f"💾 Self-improvement review: {summary}"
+                        )
+                    except Exception:
+                        pass
 
     except Exception as e:
         logger.warning("Background memory/skill review failed: %s", e)
@@ -1372,5 +1586,6 @@ __all__ = [
     "load_background_review_settings",
     "spawn_background_review_thread",
     "summarize_background_review_actions",
+    "collect_background_review_actions",
     "build_memory_write_metadata",
 ]
