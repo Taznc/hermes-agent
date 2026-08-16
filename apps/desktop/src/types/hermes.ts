@@ -555,6 +555,37 @@ export interface MessageReaction {
   at: number
 }
 
+/**
+ * One structured memory/skill mutation from a self-improvement background
+ * review pass (`agent.background_review.collect_background_review_actions`
+ * on the backend). Carried on the `review.summary` gateway event's
+ * `actions` array alongside the compact summary text, so Desktop's
+ * self-improvement transcript row can expand into the individual
+ * add/replace/remove/create/patch/edit calls the review made — including
+ * calls that FAILED (e.g. a write that would exceed the memory char
+ * budget) — instead of collapsing everything into one opaque line.
+ * ROADMAP.md Phase 1 (Desktop transcript auditability). Field names mirror
+ * the backend's snake_case wire shape, matching the rest of this file's
+ * gateway-projected types.
+ */
+export interface ReviewActionRecord {
+  /** 'memory' | 'user' | 'skill' */
+  target: string
+  /** Display label for the target: "Memory" | "User profile" | "Skill". */
+  label: string
+  /** The tool's own action verb: 'add' | 'replace' | 'remove' | 'create' |
+   *  'patch' | 'edit' | 'unknown'. */
+  operation: string
+  success: boolean
+  /** The tool's own success/error message. */
+  message: string
+  content_preview?: string
+  old_preview?: string
+  new_preview?: string
+  /** Present on skill records when the skill name is known. */
+  skill_name?: string
+}
+
 export interface SessionMessage {
   /**
    * Full tool arguments for a gateway-projected tool row (`role: 'tool'`).

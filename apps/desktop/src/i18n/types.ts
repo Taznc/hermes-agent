@@ -2531,6 +2531,14 @@ export interface Translations {
       goForward: string
       sendEdited: string
       attachingFile: string
+      /** Self-improvement review row's expandable per-action detail list
+       *  (ROADMAP.md Phase 1: Desktop transcript auditability). */
+      review: {
+        showDetails: string
+        showDetailsWithFailures: (count: number) => string
+        hideDetails: string
+        failedReason: (message: string) => string
+      }
     }
     approval: {
       gatewayDisconnected: string

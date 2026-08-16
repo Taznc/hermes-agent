@@ -6,7 +6,7 @@ import { dedupeGeneratedImageEchoesInParts } from '@/lib/generated-images'
 import { mediaDisplayLabel, mediaMarkdownHref } from '@/lib/media'
 import { normalize } from '@/lib/text'
 import { parseTodos } from '@/lib/todos'
-import type { MessageReaction, SessionMessage, UsageStats } from '@/types/hermes'
+import type { MessageReaction, ReviewActionRecord, SessionMessage, UsageStats } from '@/types/hermes'
 
 export interface TimelinePartMetadata {
   /** Unix seconds when this visible activity segment began. Fractional values
@@ -42,6 +42,11 @@ export type ChatMessage = {
   rowId?: number
   /** Emoji reactions on this message — one per author (see MessageReaction). */
   reactions?: MessageReaction[]
+  /** Structured self-improvement mutations on a `review:` system message
+   *  (see ReviewActionRecord) — lets SystemMessage render an expandable
+   *  per-action detail view instead of the flattened summary text alone.
+   *  Absent for every other message role/kind. */
+  reviewActions?: ReviewActionRecord[]
 }
 
 export type GatewayEventPayload = {
@@ -63,6 +68,13 @@ export type GatewayEventPayload = {
   preview?: string
   result?: unknown
   summary?: string
+  // review.summary — structured per-action records alongside `text`
+  // (agent.background_review.collect_background_review_actions on the
+  // backend). Desktop's self-improvement transcript row uses these to
+  // render an expandable list of the individual memory/skill mutations
+  // instead of one flattened line. Absent on a backend older than this
+  // app, or when notification mode is "off".
+  actions?: ReviewActionRecord[]
   error?: string | boolean
   inline_diff?: string
   duration_s?: number
