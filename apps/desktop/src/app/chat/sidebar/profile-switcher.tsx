@@ -19,7 +19,7 @@ import {
 } from '@dnd-kit/sortable'
 import { CSS } from '@dnd-kit/utilities'
 import { useStore } from '@nanostores/react'
-import { useEffect, useRef, useState } from 'react'
+import { useCallback, useEffect, useRef, useState } from 'react'
 import { useNavigate } from 'react-router'
 
 import { CodeEditor } from '@/components/chat/code-editor'
@@ -55,6 +55,7 @@ import {
   ALL_PROFILES,
   normalizeProfileKey,
   refreshActiveProfile,
+  selectAgent,
   selectProfile,
   setProfileColor,
   setProfileOrder,
@@ -220,8 +221,27 @@ export function ProfileRail() {
     void refreshActiveProfile()
   }, [backendScope, gatewayProfile])
 
-  // Open the create dialog when the `profile.create` hotkey fires (the dialog
-  // state lives here, so the global keybind bumps a request atom we watch).
+  // Selecting a profile must stay on the CONNECTION the rail is enumerating.
+  // The rail lists whichever backend is live, so on a remote it shows that
+  // machine's profiles — but selectProfile() always routes to the local pool,
+  // which then tries to spawn a local backend for a profile that only exists on
+  // the remote ("Hermes backend for profile X exited before it became ready").
+  // selectAgent keeps the (connection, profile) pair together; with a null
+  // connection it delegates to selectProfile, so local users are unchanged.
+  const selectProfileOnActiveConnection = useCallback(
+    (name: string) => {
+      if (backendScope) {
+        void selectAgent(backendScope, name)
+
+        return
+      }
+
+      void selectProfile(name)
+    },
+    [backendScope]
+  )
+
+
   const createRequest = useStore($profileCreateRequest)
   const lastCreateRef = useRef(createRequest)
 
@@ -248,7 +268,7 @@ export function ProfileRail() {
             active={isAll || onDefault}
             glyph={isAll ? 'layers' : 'home'}
             label={onDefault ? p.showAllProfiles : p.switchToProfile(defaultProfile.name)}
-            onSelect={() => (onDefault ? setShowAllProfiles(true) : selectProfile(defaultProfile.name))}
+            onSelect={() => (onDefault ? setShowAllProfiles(true) : selectProfileOnActiveConnection(defaultProfile.name))}
           />
         ) : (
           <ProfilePill active={isAll} glyph="layers" label={p.allProfiles} onSelect={() => setShowAllProfiles(true)} />
@@ -260,7 +280,7 @@ export function ProfileRail() {
           active
           glyph="home"
           label={defaultProfile.name}
-          onSelect={() => selectProfile(defaultProfile.name)}
+          onSelect={() => selectProfileOnActiveConnection(defaultProfile.name)}
         />
       )}
 
@@ -306,7 +326,7 @@ export function ProfileRail() {
                       onEditSoul={() => setPendingSoul(profile.name)}
                       onRecolor={color => setProfileColor(profile.name, color)}
                       onRename={() => setPendingRename(profile)}
-                      onSelect={() => selectProfile(profile.name)}
+                      onSelect={() => selectProfileOnActiveConnection(profile.name)}
                     />
                   ))}
                 </div>
@@ -343,7 +363,7 @@ export function ProfileRail() {
         onClose={() => setCreateOpen(false)}
         onCreated={async name => {
           await refreshActiveProfile()
-          selectProfile(name)
+          selectProfileOnActiveConnection(name)
         }}
         open={createOpen}
         profiles={profiles}

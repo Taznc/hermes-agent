@@ -8904,7 +8904,13 @@ async function requestJsonForProfile(profile: string, path: string, method: stri
     return fetchJsonViaOauthSession(url, opts)
   }
 
-  return fetchJson(url, conn.token, opts)
+  // Same bearer rule as hermes:api — a gated remote verifies the session token
+  // as `Authorization: Bearer`, while `X-Hermes-Session-Token` is honoured only
+  // by an ungated loopback backend. Sending both keeps local and remote working.
+  return fetchJson(url, conn.token, {
+    ...opts,
+    bearer: conn.mode === 'remote' && conn.token ? conn.token : undefined
+  })
 }
 
 async function probeRemoteAuthMode(rawUrl) {
@@ -12905,11 +12911,19 @@ ipcMain.handle('hermes:api', async (_event, request) => {
     })
   }
 
+  // Gated remotes verify the session token as `Authorization: Bearer` via the
+  // provider stack; the `X-Hermes-Session-Token` header is only honoured by an
+  // ungated loopback backend. Sending just the loopback header is what produced
+  // `401 no_cookie` on every REST call to a gated dashboard. Send both: local
+  // backends ignore the bearer, gated remotes ignore the loopback header.
+  const isRemoteToken = connection.mode === 'remote' || Boolean(requestConnectionId)
+
   return fetchJson(url, connection.token, {
     method: request?.method,
     body: request?.body,
     upload: request?.upload,
-    timeoutMs
+    timeoutMs,
+    bearer: isRemoteToken && connection.token ? connection.token : undefined
   }).catch(noteApiFailure)
 })
 
