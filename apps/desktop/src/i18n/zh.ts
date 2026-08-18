@@ -3127,7 +3127,13 @@ export const zh: Translations = {
       restoreNext: '恢复下一个检查点',
       goForward: '前进',
       sendEdited: '发送编辑后的消息',
-      attachingFile: '正在附加…'
+      attachingFile: '正在附加…',
+      review: {
+        showDetails: '显示详情',
+        showDetailsWithFailures: count => `显示详情（${count} 项失败）`,
+        hideDetails: '隐藏详情',
+        failedReason: message => `失败：${message}`
+      }
     },
     approval: {
       gatewayDisconnected: 'Hermes 网关未连接',

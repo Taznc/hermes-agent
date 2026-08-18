@@ -157,7 +157,16 @@ const COMPARED_FIELDS = [
   'durationS'
 ] as const
 
-const IGNORED_FIELDS = ['attachmentRefs', 'parts', 'rowId'] as const
+const IGNORED_FIELDS = [
+  'attachmentRefs',
+  'parts',
+  'rowId',
+  // Structured self-improvement detail records — stamped once when the
+  // review.summary system message is created (gateway-event.ts) and never
+  // mutated afterward for that message id, so there is nothing for a later
+  // reconcile pass to diff. Same rationale as rowId above.
+  'reviewActions'
+] as const
 
 // Compile-time check: every ChatMessagePart discriminant must be handled by
 // chatPartsEquivalent. If @assistant-ui adds a new part type, this fails tsc.

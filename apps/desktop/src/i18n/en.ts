@@ -2962,7 +2962,13 @@ export const en: Translations = {
       restoreNext: 'Restore next checkpoint',
       goForward: 'Go forward',
       sendEdited: 'Send edited message',
-      attachingFile: 'Attaching…'
+      attachingFile: 'Attaching…',
+      review: {
+        showDetails: 'Show details',
+        showDetailsWithFailures: count => (count === 1 ? 'Show details (1 failed)' : `Show details (${count} failed)`),
+        hideDetails: 'Hide details',
+        failedReason: message => `Failed: ${message}`
+      }
     },
     approval: {
       gatewayDisconnected: 'Hermes gateway is not connected',

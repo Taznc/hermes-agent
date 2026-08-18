@@ -453,13 +453,17 @@ export function toRuntimeMessage(message: ChatMessage): ThreadMessage {
 
   if (role === 'system') {
     const text = chatMessageText(message)
+    // Structured self-improvement action records ride metadata.custom the
+    // same way reactions/rowId do for the other roles — SystemMessage reads
+    // them back via useAuiState to render the expandable detail view.
+    const reviewMeta = message.reviewActions?.length ? { reviewActions: message.reviewActions } : {}
 
     return {
       id: message.id,
       role,
       content: [textPart(text)],
       createdAt,
-      metadata: { custom: timelineMeta }
+      metadata: { custom: { ...timelineMeta, ...reviewMeta } }
     } as ThreadMessage
   }
 
