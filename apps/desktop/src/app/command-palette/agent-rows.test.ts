@@ -139,11 +139,104 @@ describe('buildAgentPaletteRows row shape', () => {
     // Listed, not dropped: a dead box should be visible and diagnosable, and an
     // SSH source is connect-on-demand rather than broken.
     expect(rows).toHaveLength(2)
-    expect(rows.find(row => !row.isLocal)?.isUnreachable).toBe(true)
-    expect(rows.find(row => row.isLocal)?.isUnreachable).toBe(false)
+    expect(rows.find(row => row.isLocal)?.needsConnect).toBe(false)
   })
 
   it('carries the @name-device handle through as a search keyword', () => {
     expect(build().find(row => !row.isLocal)?.handle).toBe('@default-hermes-dev-env')
+  })
+})
+
+// The regression that made the feature useless in practice: hermes:agents:roster
+// SKIPS ssh connections that have never been dialed (so merely listing agents
+// cannot spawn tunnels), returning zero agents for them. Rendering only
+// enumerated agents left the user in a dead end — the source could not be dialed
+// because it had no row, and had no row because it was never dialed.
+describe('buildAgentPaletteRows undialed sources', () => {
+  const undialed = () =>
+    roster({
+      agents: [
+        {
+          connectionId: 'local',
+          connectionKind: 'local',
+          connectionLabel: 'This device',
+          handle: 'default',
+          profile: 'default'
+        }
+      ],
+      sources: [
+        { connectionId: 'local', kind: 'local', label: 'This device', reachable: true },
+        {
+          connectionId: 'hermes-dev',
+          error: 'connect-on-demand',
+          kind: 'ssh',
+          label: 'hermes-dev-env',
+          reachable: false
+        }
+      ]
+    } as Partial<DesktopAgentRoster>)
+
+  it('synthesizes a connect row for a source that enumerated no agents', () => {
+    const rows = build({ roster: undialed() })
+    const connect = rows.find(row => row.connectionId === 'hermes-dev')
+
+    expect(connect).toBeDefined()
+    expect(connect?.needsConnect).toBe(true)
+    // Dialing blind lands on the profile every Hermes install has.
+    expect(connect?.profile).toBe('default')
+    expect(connect?.device).toBe('hermes-dev-env')
+  })
+
+  it('does not surface connect-on-demand as an error reason', () => {
+    // It is the normal resting state of an undialed ssh box, not a failure.
+    expect(build({ roster: undialed() }).find(row => row.needsConnect)?.unavailableReason).toBeUndefined()
+  })
+
+  it('surfaces a genuine failure as the reason', () => {
+    const rows = build({
+      roster: roster({
+        agents: [
+          {
+            connectionId: 'local',
+            connectionKind: 'local',
+            connectionLabel: 'This device',
+            handle: 'default',
+            profile: 'default'
+          }
+        ],
+        sources: [
+          { connectionId: 'local', kind: 'local', label: 'This device', reachable: true },
+          {
+            connectionId: 'hermes-dev',
+            error: 'connect ECONNREFUSED 10.27.1.20:22',
+            kind: 'ssh',
+            label: 'hermes-dev-env',
+            reachable: false
+          }
+        ]
+      } as Partial<DesktopAgentRoster>)
+    })
+
+    expect(rows.find(row => row.needsConnect)?.unavailableReason).toBe('connect ECONNREFUSED 10.27.1.20:22')
+  })
+
+  it('never double-lists a source that already enumerated agents', () => {
+    // Both sources enumerate in the default fixture — no synthesized rows.
+    expect(build().filter(row => row.needsConnect)).toHaveLength(0)
+  })
+
+  it('never synthesizes a connect row for the local runtime', () => {
+    const rows = build({
+      roster: roster({
+        agents: [],
+        sources: [
+          { connectionId: 'local', kind: 'local', label: 'This device', reachable: true },
+          { connectionId: 'hermes-dev', kind: 'ssh', label: 'hermes-dev-env', reachable: true }
+        ]
+      } as Partial<DesktopAgentRoster>)
+    })
+
+    expect(rows.every(row => !row.isLocal)).toBe(true)
+    expect(rows).toHaveLength(1)
   })
 })

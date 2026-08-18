@@ -446,6 +446,12 @@ export interface DesktopVersionInfo {
   nodeVersion: string
   platform: string
   hermesRoot: string
+  /** Build provenance from install-stamp.json; null on builds without a stamp. */
+  buildBranch?: null | string
+  buildCommit?: null | string
+  buildAt?: null | string
+  buildDirty?: boolean | null
+  buildSource?: null | string
 }
 
 export type DesktopUninstallMode = 'full' | 'gui' | 'lite'

@@ -1883,6 +1883,8 @@ export const zh: Translations = {
     manageProfiles: '管理配置档案…',
     connectGateway: '连接另一个 Hermes 网关…',
     switchToAgent: (profile, device) => `切换到 ${device} 上的 ${profile}`,
+    connectToAgent: device => `连接到 ${device}`,
+    notConnected: '尚未连接',
     agentsHeading: '智能体与连接',
     thisDevice: '本设备',
     sourceUnreachable: '无法连接',
