@@ -9207,6 +9207,113 @@ function broadcastConnectionsChanged(payload: { connectionId: string; reason: 'r
   }
 }
 
+// ── Dev: main-process bundle staleness ──────────────────────────────────────
+// The renderer hot-reloads through Vite, but Electron cannot hot-swap an
+// already-evaluated main process — an electron/ edit only lands on restart.
+// Rather than restarting under the user (which would destroy whatever they were
+// mid-way through), watch the built bundle and let the renderer offer an
+// explicit "Restart to apply". Dev-only: a packaged build never watches and the
+// renderer's affordance stays hidden, so release users see nothing.
+const DEV_MAIN_BUNDLE = path.join(APP_ROOT, 'dist', 'electron-main.mjs')
+const DEV_PRELOAD_BUNDLE = path.join(APP_ROOT, 'dist', 'electron-preload.js')
+
+let devMainBundleStale = false
+let devBundleWatchers: fs.FSWatcher[] = []
+
+function broadcastDevBundleStale() {
+  for (const win of BrowserWindow.getAllWindows()) {
+    const { webContents } = win
+
+    if (webContents && !webContents.isDestroyed()) {
+      webContents.send('hermes:dev:main-bundle-stale', { stale: devMainBundleStale })
+    }
+  }
+}
+
+function watchDevMainBundle() {
+  if (IS_PACKAGED || !DEV_SERVER) {
+    return
+  }
+
+  // Signature at boot: anything different later is a rebuild we are not running.
+  const signature = target => {
+    try {
+      const stat = fs.statSync(target)
+
+      return `${stat.size}:${stat.mtimeMs}`
+    } catch {
+      return ''
+    }
+  }
+
+  for (const target of [DEV_MAIN_BUNDLE, DEV_PRELOAD_BUNDLE]) {
+    const original = signature(target)
+
+    if (!original) {
+      continue
+    }
+
+    try {
+      // Debounced: esbuild writes in bursts, and a rebuild can touch both
+      // bundles. Once stale we stay stale — only a restart clears it.
+      let timer: NodeJS.Timeout | null = null
+
+      const watcher = fs.watch(target, () => {
+        if (devMainBundleStale) {
+          return
+        }
+
+        if (timer) {
+          clearTimeout(timer)
+        }
+
+        timer = setTimeout(() => {
+          if (!devMainBundleStale && signature(target) !== original) {
+            devMainBundleStale = true
+            console.log('[hermes] main-process bundle changed on disk — restart to apply')
+            broadcastDevBundleStale()
+          }
+        }, 150)
+      })
+
+      devBundleWatchers.push(watcher)
+    } catch {
+      // Watching is a convenience; a platform that refuses it must not break dev.
+    }
+  }
+}
+
+app.on('before-quit', () => {
+  for (const watcher of devBundleWatchers) {
+    try {
+      watcher.close()
+    } catch {
+      void 0
+    }
+  }
+
+  devBundleWatchers = []
+})
+
+ipcMain.handle('hermes:dev:main-bundle-stale', async () => ({
+  stale: devMainBundleStale,
+  // The renderer must not render a restart affordance in a packaged build.
+  supported: !IS_PACKAGED && Boolean(DEV_SERVER)
+}))
+
+ipcMain.handle('hermes:dev:restart', async () => {
+  if (IS_PACKAGED) {
+    return { ok: false, reason: 'not-a-dev-build' }
+  }
+
+  // relaunch() queues a fresh instance for after this one exits, so the new
+  // process picks up the rebuilt bundle.
+  app.relaunch()
+  app.exit(0)
+
+  return { ok: true }
+})
+
 async function waitForBackendExit(child, timeoutMs = 5000) {
   if (!child || child.exitCode !== null || child.signalCode !== null) {
     return
@@ -12735,6 +12842,32 @@ ipcMain.handle('hermes:api', async (_event, request) => {
 
   const url = `${connection.baseUrl}${requestPath}`
 
+  // Diagnostic breadcrumb for cross-backend routing. A REST call that silently
+  // lands on the WRONG backend (or is rejected by the right one) surfaces to the
+  // user only as an empty list or a permanent skeleton, with nothing in the log
+  // tying it to a connection. Log the resolved route on failure so "the remote
+  // shows no profiles" is answerable from desktop.log alone.
+  const routeLabel = requestConnectionId
+    ? `conn=${requestConnectionId}${routeProfile ? ` profile=${routeProfile}` : ''}`
+    : `pool profile=${routeProfile || 'primary'}`
+
+  const noteApiFailure = error => {
+    const status = error?.statusCode ?? error?.status
+
+    console.warn(
+      `[hermes] REST ${request?.method || 'GET'} ${request.path} -> ${routeLabel} ` +
+        `(${connection.baseUrl}, auth=${connection.authMode || 'token'}) FAILED` +
+        (status ? ` status=${status}` : '') +
+        `: ${error?.message || error}` +
+        (status === 401 || status === 403
+          ? ' — stored credential rejected. A pasted session token expires;' +
+            ' re-authenticate in Settings → Connections.'
+          : '')
+    )
+
+    throw error
+  }
+
   // OAuth gateways authenticate REST via EITHER a native bearer token
   // (cookieless RFC 8252 flow) OR the HttpOnly session cookie held in the OAuth
   // partition. Prefer the native bearer when present (mirroring
@@ -12777,7 +12910,7 @@ ipcMain.handle('hermes:api', async (_event, request) => {
     body: request?.body,
     upload: request?.upload,
     timeoutMs
-  })
+  }).catch(noteApiFailure)
 })
 
 // One deduper per cross-window cue — the choke point every window shares. Main
@@ -14407,6 +14540,10 @@ app.whenReady().then(() => {
   }
 
   createWindow()
+
+  // Dev only: notice when the main-process bundle is rebuilt underneath us so
+  // the renderer can offer an explicit restart.
+  watchDevMainBundle()
 
   // Win/Linux cold start: the launching hermes:// URL is in our own argv.
   const _coldStartLink = _extractDeepLink(process.argv)

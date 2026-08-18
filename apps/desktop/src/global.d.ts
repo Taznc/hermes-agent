@@ -371,6 +371,11 @@ declare global {
       cancelBootstrap: () => Promise<{ ok: boolean; cancelled: boolean }>
       onBootstrapEvent: (callback: (payload: DesktopBootstrapEvent) => void) => () => void
       getVersion: () => Promise<DesktopVersionInfo>
+      /** Dev-only: whether the built main-process bundle is newer than the
+       *  running one. `supported` is false in a packaged build. */
+      getDevMainBundleStale: () => Promise<{ stale: boolean; supported: boolean }>
+      restartForDevBundle: () => Promise<{ ok: boolean; reason?: string }>
+      onDevMainBundleStale: (callback: (payload: { stale: boolean }) => void) => () => void
       getRemoteDisplayReason?: () => Promise<string | null>
       updates: {
         check: () => Promise<DesktopUpdateStatus>

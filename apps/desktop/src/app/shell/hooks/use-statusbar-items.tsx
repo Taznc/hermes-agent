@@ -1,5 +1,5 @@
 import { useStore } from '@nanostores/react'
-import { useMemo } from 'react'
+import { useEffect, useMemo, useState } from 'react'
 
 import type { CommandCenterSection } from '@/app/command-center'
 import { useApprovalModeStatusbarItem } from '@/app/shell/approval-mode-menu'
@@ -408,6 +408,55 @@ export function useStatusbarItems({
     }
   }, [desktopVersion])
 
+  // Dev only: the main-process bundle was rebuilt after this process started.
+  // The renderer hot-reloads through Vite, but Electron cannot swap an
+  // already-evaluated main process, so an electron/ edit needs a relaunch. Show
+  // an explicit affordance rather than restarting under the user — losing an
+  // in-flight turn to an automatic restart is worse than a stale main process.
+  // Hidden entirely in packaged builds (`supported: false`).
+  const [devBundleStale, setDevBundleStale] = useState(false)
+
+  useEffect(() => {
+    let active = true
+
+    void window.hermesDesktop.getDevMainBundleStale?.().then(res => {
+      if (active && res?.supported) {
+        setDevBundleStale(Boolean(res.stale))
+      }
+    })
+
+    const off = window.hermesDesktop.onDevMainBundleStale?.(payload => {
+      if (active) {
+        setDevBundleStale(Boolean(payload?.stale))
+      }
+    })
+
+    return () => {
+      active = false
+      off?.()
+    }
+  }, [])
+
+  const devRestartItem = useMemo<StatusbarItem | null>(() => {
+    if (!devBundleStale) {
+      return null
+    }
+
+    return {
+      className: 'px-2 font-semibold bg-blue-600 text-white hover:bg-blue-500',
+      icon: <Loader2 className="size-3" />,
+      id: 'dev-restart',
+      label: 'Restart to apply',
+      onSelect: () => {
+        void window.hermesDesktop.restartForDevBundle?.()
+      },
+      title:
+        'The Electron main-process bundle was rebuilt after this window started.\n' +
+        'Renderer changes are already live; main-process changes need a relaunch.\n' +
+        'Click to restart now.'
+    }
+  }, [devBundleStale])
+
   const connectionItem = useMemo<StatusbarItem | null>(() => {
     if (connection?.mode !== 'remote' || !connection.remoteHost) {
       return null
@@ -436,6 +485,7 @@ export function useStatusbarItems({
   const coreLeftStatusbarItems = useMemo<readonly StatusbarItem[]>(
     () => [
       ...(forkBuildItem ? [forkBuildItem] : []),
+      ...(devRestartItem ? [devRestartItem] : []),
       ...(connectionItem ? [connectionItem] : []),
       {
         className: `w-7 justify-center px-0${commandCenterOpen ? ' bg-accent/55 text-foreground' : ''}`,
@@ -549,6 +599,7 @@ export function useStatusbarItems({
       agentsOpen,
       commandCenterOpen,
       connectionItem,
+      devRestartItem,
       forkBuildItem,
       copy,
       currentCwd,
