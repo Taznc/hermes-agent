@@ -139,9 +139,13 @@ interface ActiveProfileResponse {
 // Best-effort: failures (backend not up yet) leave the prior values intact.
 export async function refreshActiveProfile(): Promise<void> {
   const epoch = profileListEpoch
+  // Scope both calls to the live backend: on a registry connection these must
+  // enumerate THAT machine's profiles, not the local pool's (#85731).
+  const connectionId = $activeGatewayConnection.get() || undefined
 
   try {
     const res = await window.hermesDesktop.api<ActiveProfileResponse>({
+      connectionId,
       path: '/api/profiles/active',
       timeoutMs: STARTUP_REQUEST_TIMEOUT_MS
     })

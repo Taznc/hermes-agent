@@ -1064,8 +1064,10 @@ export interface HermesApiRequest {
   // Route this REST call to a specific REGISTERED gateway connection (v2
   // registry). Data owned by a remote gateway — cron jobs and their run
   // sessions — lives in that host's state.db, so requests for it must resolve
-  // through the owning connection, not the local profile pool. Omit / '' /
-  // 'local' keep the legacy profile-routed path.
+  // through the owning connection, not the local profile pool. Also required
+  // for anything that must enumerate the ACTIVE source's own state — its
+  // profile list, config, skills — since profile-only routing always resolves
+  // the local backend. Omit / '' / 'local' keep the legacy profile-routed path.
   connectionId?: string | null
 }
 

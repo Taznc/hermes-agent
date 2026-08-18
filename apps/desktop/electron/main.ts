@@ -13658,6 +13658,14 @@ async function handleHermesApiRequest(request) {
   // primary rename the lifecycle has already made `default` the temporary
   // primary until the PATCH settles, so the request routes there.
   const apiRoute = resolveProfileApiRequest(profile, request.path, profileRouteOptions(profile, request))
+  // Connection-scoped REST: when the renderer names a registry connection, the
+  // call must reach THAT source's backend. Routing by profile alone always
+  // resolves the local pool, so a remote's own data (its profile list, config,
+  // skills) could never be enumerated — the rail kept showing local profiles
+  // after connecting to a remote (#85731). Falls back to the profile-keyed
+  // pool when no connection is named, so local users are unchanged. A
+  // torn-down profile stays on the local teardown path resolved above.
+  const requestConnectionId = request?.connectionId
 
   const routeProfile = profileRename
     ? profileRename.routeProfile
@@ -13666,7 +13674,10 @@ async function handleHermesApiRequest(request) {
   let response
 
   try {
-    const connection = await ensureBackend(routeProfile)
+    const connection =
+      requestConnectionId && !tornDownProfile
+        ? await ensureRegistryBackend(requestConnectionId, routeProfile)
+        : await ensureBackend(routeProfile)
     const timeoutMs = resolveTimeoutMs(request?.timeoutMs, DEFAULT_FETCH_TIMEOUT_MS)
 
     const url = `${connection.baseUrl}${apiRoute.requestPath}`

@@ -1750,6 +1750,9 @@ export function instantiateAutomationBlueprint(
 
 export function getProfiles(): Promise<ProfilesResponse> {
   return window.hermesDesktop.api<ProfilesResponse>({
+    // Enumerate the ACTIVE source's profiles. Without the connection scope this
+    // always lists the local pool's profiles, even while a remote is live.
+    connectionId: _apiConnectionId,
     path: '/api/profiles',
     timeoutMs: STARTUP_REQUEST_TIMEOUT_MS
   })
