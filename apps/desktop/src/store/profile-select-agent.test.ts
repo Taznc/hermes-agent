@@ -19,6 +19,7 @@ const ensureGatewayForProfile = vi.fn(async (_profile: string) => undefined)
 const openGatewayForProfile = vi.fn(async (_profile: string) => undefined)
 const $gateway = atom<unknown>({ id: 'live-socket' })
 const resetStarmapGraph = vi.fn()
+const wipeSessionListsForGatewaySwitch = vi.fn()
 
 vi.mock('@/store/gateway', () => ({
   $gateway,
@@ -32,6 +33,7 @@ vi.mock('@/hermes', () => ({
 }))
 vi.mock('@/lib/query-client', () => ({ invalidateProfileScopedQueries: vi.fn() }))
 vi.mock('@/store/starmap', () => ({ resetStarmapGraph }))
+vi.mock('@/store/gateway-switch', () => ({ wipeSessionListsForGatewaySwitch }))
 
 const {
   $activeGatewayConnection,

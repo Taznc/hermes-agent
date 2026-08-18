@@ -7396,11 +7396,34 @@ async function saveGatewayFileViaDataUrl(connection, profile, filePath, ctx: any
 }
 
 // Mint a single-use WS ticket for a gated gateway. Returns the ticket string.
-// Prefers a native bearer token (cookieless RFC 8252 flow) when present,
-// falling back to the OAuth cookie partition otherwise.
-// Throws (with statusCode 401) if the session cookie is missing/expired —
+// Three credential shapes, in order: an explicit static session token (the
+// token-auth remote path), a native bearer token (cookieless RFC 8252 flow),
+// then the OAuth cookie partition.
+// Throws (with statusCode 401) if the credential is missing/expired —
 // callers treat that as "needs re-login".
-async function mintGatewayWsTicket(baseUrl, headers = {}) {
+async function mintGatewayWsTicket(baseUrl, headers = {}, staticToken = null) {
+  // Token-auth remotes: a gated dashboard rejects the legacy `?token=` query
+  // param on the WS upgrade (403) — only a minted ticket is accepted — but it
+  // DOES accept that same token as a bearer on the mint endpoint. Without this
+  // rung a basic-auth/token backend can pass every HTTP check and still never
+  // open /api/ws.
+  if (staticToken) {
+    const body = (await fetchJson(`${baseUrl}/api/auth/ws-ticket`, null, {
+      method: 'POST',
+      timeoutMs: 8_000,
+      bearer: staticToken,
+      headers
+    })) as any
+
+    const ticket = body?.ticket
+
+    if (!ticket || typeof ticket !== 'string') {
+      throw new Error('Gateway did not return a WS ticket.')
+    }
+
+    return ticket
+  }
+
   // Native flow: mint the ticket with the bearer token, no cookie involved.
   const nativeAt = await ensureNativeAccessToken(baseUrl).catch(() => null)
 
@@ -7460,7 +7483,25 @@ async function freshGatewayWsUrl(profile) {
     return wsUrl
   }
 
-  // Local/token: the cached wsUrl already carries the (long-lived) token.
+  // Remote token-auth: a gated dashboard refuses the legacy `?token=` param on
+  // the WS upgrade, so trade the token for a single-use ticket. Local backends
+  // are ungated and have no mint endpoint — the cached wsUrl is correct there,
+  // and a mint failure falls back to it.
+  if (connection.mode === 'remote' && connection.token) {
+    try {
+      const ticket = await mintGatewayWsTicket(
+        connection.baseUrl,
+        connection.headers,
+        connection.token
+      )
+
+      return buildGatewayWsUrlWithTicket(connection.baseUrl, ticket)
+    } catch {
+      return connection.wsUrl
+    }
+  }
+
+  // Local/ungated: the cached wsUrl already carries the (long-lived) token.
   rememberRemoteWsHeaders(connection.wsUrl, connection.headers)
 
   return connection.wsUrl
@@ -12933,7 +12974,8 @@ ipcMain.handle('hermes:agents:roster', async () => {
 })
 
 // Registry-scoped fresh WS URL: the (connectionId, profile) analogue of
-// hermes:gateway:ws-url. Same single-use-ticket discipline for OAuth sources.
+// hermes:gateway:ws-url. Every gated remote gets a freshly-minted single-use
+// ticket — OAuth via its session, token-auth via its static token as a bearer.
 ipcMain.handle('hermes:gateway:ws-url-for', async (_event, payload) => {
   const { connectionId, profile } = payload && typeof payload === 'object' ? (payload as any) : ({} as any)
 
@@ -12947,6 +12989,25 @@ ipcMain.handle('hermes:gateway:ws-url-for', async (_event, payload) => {
       rememberRemoteWsHeaders(wsUrl, connection.headers)
 
       return registryGatewayWsUrl(connection, wsUrl)
+    }
+
+    // Token-auth against a GATED dashboard: the legacy `?token=` query param is
+    // refused on the WS upgrade (403) even though the same token authenticates
+    // every REST call, so mint a ticket with it. Falls back to the cached
+    // token-bearing wsUrl when the backend is ungated (loopback/local), where
+    // the mint endpoint does not exist.
+    if (connection.token) {
+      try {
+        const ticket = await mintGatewayWsTicket(
+          connection.baseUrl,
+          connection.headers,
+          connection.token
+        )
+
+        return buildGatewayWsUrlWithTicket(connection.baseUrl, ticket)
+      } catch {
+        return connection.wsUrl
+      }
     }
 
     rememberRemoteWsHeaders(connection.wsUrl, connection.headers)
@@ -15020,7 +15081,14 @@ ipcMain.handle('hermes:version', async () => {
     platform: process.platform,
     hermesRoot: resolveUpdateRoot(),
     bundleOutOfSync: skew.outOfSync,
-    bundleCommitsBehind: skew.desktopCommitsBehind
+    bundleCommitsBehind: skew.desktopCommitsBehind,
+    // Build provenance for the fork/dev marker. Null on an official release
+    // built without a stamp; the renderer decides visibility from `source`.
+    buildBranch: INSTALL_STAMP?.branch ?? null,
+    buildCommit: INSTALL_STAMP?.commit ?? null,
+    buildAt: INSTALL_STAMP?.builtAt ?? null,
+    buildDirty: INSTALL_STAMP ? Boolean(INSTALL_STAMP.dirty) : null,
+    buildSource: INSTALL_STAMP?.source ?? null
   }
 })
 

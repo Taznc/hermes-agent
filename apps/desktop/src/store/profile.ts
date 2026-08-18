@@ -212,30 +212,61 @@ export function requestFreshSession(): void {
 }
 
 // Route profile-scoped REST settings (config/env/skills/tools/model/…) to the
-// profile the live gateway is currently on, and drop cached settings from the
-// previous profile so pages refetch against the right backend. Fires once
-// immediately (no real change → no invalidation), so single-profile users just
-// get "default" (→ the primary backend) with no extra fetches.
-let _lastRoutedProfile: string | null = null
+// profile the live gateway is currently on, and drop cached state from the
+// previous backend so pages refetch against the right one.
+//
+// Keyed on the (connection, profile) PAIR, not the profile name. The same
+// profile name routinely exists on several registered sources — local
+// `default` and remote `default` are different machines with different
+// sessions — so a name-only comparison sees NO CHANGE when you switch
+// machines and leaves the previous box's sessions, settings and cron on
+// screen. That is the "I switched but I still have all my same
+// conversations" symptom.
+//
+// Fires once immediately (no real change → no invalidation), so single-source
+// users are unaffected.
+let _lastRoutedScope: string | null = null
 
-$activeGatewayProfile.subscribe(value => {
-  const key = normalizeProfileKey(value)
-  setApiRequestProfile(key)
+const $activeBackendScope = computed(
+  [$activeGatewayConnection, $activeGatewayProfile],
+  (connectionId, profile) => `${connectionId ?? 'local'}::${normalizeProfileKey(profile)}`
+)
 
-  if (_lastRoutedProfile !== null && _lastRoutedProfile !== key) {
+$activeBackendScope.subscribe(scope => {
+  const profileKey = normalizeProfileKey($activeGatewayProfile.get())
+  setApiRequestProfile(profileKey)
+
+  if (_lastRoutedScope !== null && _lastRoutedScope !== scope) {
     invalidateCronModelImpactScopeState()
     // Profile-scoped settings + the unified session list are now stale.
     // Narrowed so account/marketplace/onboarding caches don't refetch on
-    // every profile switch.
+    // every switch.
     invalidateProfileScopedQueries()
     resetStarmapGraph()
     // /api/profiles now routes to a different backend: strand any in-flight
     // profile-list fetch so the previous backend's late answer can't clobber
     // the rail (the #85731 class — same guard as the connection-apply wipe).
     invalidateProfileListFetches()
+
+    // Sessions live in nanostores, NOT React Query: refreshSessions merges
+    // into the existing list, so query invalidation alone cannot evict the
+    // previous backend's rows — they must be wiped explicitly, exactly as the
+    // connection/mode apply path does. Without this the sidebar keeps
+    // painting the machine you just left.
+    //
+    // Imported lazily: store/gateway-switch reaches store/session and
+    // store/layout, which import back into this module. A static import here
+    // closes that cycle and strands `$showAllProfiles` in its temporal dead
+    // zone at module-eval time (blank window). Deferring to call time keeps
+    // the graph acyclic at import.
+    if (_lastRoutedScope.split('::')[0] !== scope.split('::')[0]) {
+      void import('@/store/gateway-switch').then(m => {
+        m.wipeSessionListsForGatewaySwitch()
+      })
+    }
   }
 
-  _lastRoutedProfile = key
+  _lastRoutedScope = scope
 })
 
 // Target profile while a gateway swap is mid-flight (spawning/reconnecting that

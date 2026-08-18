@@ -770,11 +770,15 @@ function CommandPaletteBody({ onExited }: { onExited: () => void }) {
         heading: t.profiles.agentsHeading,
         items: rows.map(row => ({
           active: row.isActive,
-          detail: row.isUnreachable ? t.profiles.sourceUnreachable : row.device,
+          // The label already names the device, so the detail carries STATUS:
+          // why a source has no agents yet, or nothing when it's just a switch.
+          detail: row.needsConnect ? (row.unavailableReason ?? t.profiles.notConnected) : undefined,
           icon: row.isLocal ? Monitor : Globe,
           id: `agent-${row.connectionId ?? 'local'}-${row.profile}`,
           keywords: ['agent', 'connection', 'gateway', 'switch', 'remote', row.profile, row.device, row.handle],
-          label: t.profiles.switchToAgent(row.profile, row.device),
+          label: row.needsConnect
+            ? t.profiles.connectToAgent(row.device)
+            : t.profiles.switchToAgent(row.profile, row.device),
           run: () => selectAgent(row.connectionId, row.profile)
         }))
       }

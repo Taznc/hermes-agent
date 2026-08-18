@@ -1765,6 +1765,8 @@ export const en: Translations = {
     manageProfiles: 'Manage profiles…',
     connectGateway: 'Connect another Hermes gateway…',
     switchToAgent: (profile: string, device: string) => `Switch to ${profile} on ${device}`,
+    connectToAgent: (device: string) => `Connect to ${device}`,
+    notConnected: 'Not connected yet',
     agentsHeading: 'Agents & connections',
     thisDevice: 'This device',
     sourceUnreachable: 'Unreachable',

@@ -11,6 +11,7 @@ import { Codicon } from '@/components/ui/codicon'
 import { GlyphSpinner } from '@/components/ui/glyph-spinner'
 import { useI18n } from '@/i18n'
 import { displayPath, pathLeaf } from '@/lib/display-path'
+import { resolveForkBuildMarker } from '@/lib/fork-build-marker'
 import { Activity, AlertCircle, Clock, Command, FolderOpen, Globe, Hash, Loader2, Terminal } from '@/lib/icons'
 import type { RuntimeReadinessResult } from '@/lib/runtime-readiness'
 import { contextBarLabel, LiveDuration, usageContextLabel } from '@/lib/statusbar'
@@ -386,6 +387,27 @@ export function useStatusbarItems({
     copy
   ])
 
+  // Unofficial/local build marker. Deliberately loud (amber, uppercase) and
+  // pinned leftmost: its whole job is to make "am I running my own build?"
+  // answerable at a glance, since a feature branch never bumps the version and
+  // About looks identical to a release. Renders nothing on official builds —
+  // see resolveForkBuildMarker for the rule.
+  const forkBuildItem = useMemo<StatusbarItem | null>(() => {
+    const marker = resolveForkBuildMarker(desktopVersion)
+
+    if (!marker) {
+      return null
+    }
+
+    return {
+      className: 'px-2 -ml-1 font-semibold bg-amber-500 text-black hover:bg-amber-400',
+      icon: <AlertCircle className="size-3" />,
+      id: 'fork-build',
+      label: marker.label,
+      title: marker.title
+    }
+  }, [desktopVersion])
+
   const connectionItem = useMemo<StatusbarItem | null>(() => {
     if (connection?.mode !== 'remote' || !connection.remoteHost) {
       return null
@@ -413,6 +435,7 @@ export function useStatusbarItems({
 
   const coreLeftStatusbarItems = useMemo<readonly StatusbarItem[]>(
     () => [
+      ...(forkBuildItem ? [forkBuildItem] : []),
       ...(connectionItem ? [connectionItem] : []),
       {
         className: `w-7 justify-center px-0${commandCenterOpen ? ' bg-accent/55 text-foreground' : ''}`,
@@ -526,6 +549,7 @@ export function useStatusbarItems({
       agentsOpen,
       commandCenterOpen,
       connectionItem,
+      forkBuildItem,
       copy,
       currentCwd,
       fileMenu.copyPath,

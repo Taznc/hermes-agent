@@ -205,6 +205,22 @@ async function resolveTestWsUrl(baseUrl, authMode, token, deps: any = {}) {
     return null
   }
 
+  // Token auth: a GATED dashboard refuses the legacy `?token=` query param on
+  // the WS upgrade (403) while still accepting that token as a bearer on the
+  // mint endpoint, so prefer a ticket and keep `?token=` as the fallback for
+  // ungated backends that have no mint endpoint. Testing the URL we would not
+  // actually dial is precisely the false positive this helper exists to avoid.
+  const mintTicket = deps.mintTicket
+
+  if (typeof mintTicket === 'function') {
+    try {
+      return buildGatewayWsUrlWithTicket(baseUrl, await mintTicket(baseUrl, token))
+    } catch {
+      // Ungated backend (no mint endpoint) or a transient failure — fall back
+      // to the legacy token URL, which the probe then verifies for real.
+    }
+  }
+
   return buildGatewayWsUrl(baseUrl, token)
 }
 

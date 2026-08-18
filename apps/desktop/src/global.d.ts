@@ -477,6 +477,12 @@ export interface DesktopVersionInfo {
   bundleOutOfSync?: boolean
   /** Commits under apps/desktop/ the running bundle is missing (null unknown). */
   bundleCommitsBehind?: null | number
+  /** Build provenance from install-stamp.json; null on builds without a stamp. */
+  buildBranch?: null | string
+  buildCommit?: null | string
+  buildAt?: null | string
+  buildDirty?: boolean | null
+  buildSource?: null | string
 }
 
 export type DesktopUninstallMode = 'full' | 'gui' | 'lite'
