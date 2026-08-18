@@ -12716,7 +12716,19 @@ ipcMain.handle('hermes:api', async (_event, request) => {
   // backend calls ensure_hermes_home() which recreates the profile directory,
   // defeating the deletion and leaving a zombie process.
   const routeProfile = resolveRouteProfile(tornDownProfile, profile)
-  const connection = await ensureBackend(routeProfile)
+  // Connection-scoped REST: when the renderer names a registry connection, the
+  // call must reach THAT source's backend. Routing by profile alone always
+  // resolves the local pool, so a remote's own data (its profile list, config,
+  // skills) could never be enumerated — the rail kept showing local profiles
+  // after connecting to a remote (#85731). Falls back to the profile-keyed
+  // pool when no connection is named, so local users are unchanged.
+  const requestConnectionId = request?.connectionId
+
+  const connection =
+    requestConnectionId && !tornDownProfile
+      ? await ensureRegistryBackend(requestConnectionId, routeProfile)
+      : await ensureBackend(routeProfile)
+
   const timeoutMs = resolveTimeoutMs(request?.timeoutMs, DEFAULT_FETCH_TIMEOUT_MS)
 
   const requestPath = pathWithGlobalRemoteProfile(request.path, profile, profileRouteOptions(profile))

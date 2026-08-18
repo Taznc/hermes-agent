@@ -997,6 +997,11 @@ export interface HermesApiRequest {
   // (window) backend. Read-only cross-profile data is served by the primary, so
   // this is only needed for profile-scoped live/settings calls.
   profile?: string | null
+  // Route this REST call to a registry connection's backend (a remote/SSH
+  // source). Omit for the local pool. Needed for anything that must enumerate
+  // the ACTIVE source's own state — its profile list, config, skills — since
+  // profile-only routing always resolves the local backend.
+  connectionId?: string | null
 }
 
 export interface HermesNotification {

@@ -45,6 +45,7 @@ import {
 import { cn } from '@/lib/utils'
 import { notify, notifyError } from '@/store/notifications'
 import {
+  $activeGatewayConnection,
   $activeGatewayProfile,
   $profileColors,
   $profileCreateRequest,
@@ -206,9 +207,18 @@ export function ProfileRail() {
 
   // Re-pull the running profile + list on mount so a profile created elsewhere
   // shows up; cheap and best-effort.
+  //
+  // Keyed on the active backend scope, NOT just mount: switching connection or
+  // profile is a soft re-home that deliberately keeps this component mounted,
+  // so a mount-only fetch leaves the rail showing the PREVIOUS machine's
+  // profiles forever (issue #85731 — "profile rail disappears / never updates
+  // when connecting to a remote"). A remote box has its own profile list and
+  // the rail must re-enumerate against whichever backend is now live.
+  const backendScope = useStore($activeGatewayConnection)
+
   useEffect(() => {
     void refreshActiveProfile()
-  }, [])
+  }, [backendScope, gatewayProfile])
 
   // Open the create dialog when the `profile.create` hotkey fires (the dialog
   // state lives here, so the global keybind bumps a request atom we watch).
