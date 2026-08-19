@@ -86,6 +86,7 @@ import {
   profileRemoteOverride,
   profileSshOverride,
   remoteRequestMatchesBaseUrl,
+  remoteTokenNeedsBearer,
   resolveAuthMode,
   resolveProfileApiRequest,
   resolveProfileBackendRoute,
@@ -13245,12 +13246,21 @@ async function fetchJsonForBackend(
     })
   }
 
+  // Same bearer rule as the hermes:api handler, via the shared resolver: a
+  // GATED remote verifies the session token as `Authorization: *** while
+  // `X-Hermes-Session-Token` is honoured only by an ungated loopback backend.
+  // Sending only the loopback header is what produced `401 no_cookie` on every
+  // REST call routed through this helper (registry `hermes:api`, roster
+  // enumeration, install-id probes) against a password/OAuth-gated dashboard.
+  const sendBearer = remoteTokenNeedsBearer(descriptor)
+
   return fetchJson(url, descriptor.token, {
     method: opts.method,
     body: opts.body,
     upload: opts.upload,
     timeoutMs: opts.timeoutMs,
-    headers: descriptor.headers
+    headers: descriptor.headers,
+    bearer: sendBearer && descriptor.token ? descriptor.token : undefined
   })
 }
 
@@ -13850,13 +13860,14 @@ async function handleHermesApiRequest(request) {
         })
       }
     } else {
-      // Gated remotes verify the session token as `Authorization: Bearer` via
+      // Gated remotes verify the session token as `Authorization: *** via
       // the provider stack; `X-Hermes-Session-Token` is only honoured by an
       // ungated loopback backend. Sending just the loopback header is what
       // produced `401 no_cookie` on every REST call to a gated dashboard. Send
       // both: local backends ignore the bearer, gated remotes ignore the
-      // loopback header.
-      const isRemoteToken = connection.mode === 'remote' || Boolean(requestConnectionId)
+      // loopback header. Shared resolver with fetchJsonForBackend so the two
+      // REST paths cannot drift apart.
+      const isRemoteToken = remoteTokenNeedsBearer(connection, requestConnectionId)
 
       response = await fetchJson(url, connection.token, {
         method: request?.method,

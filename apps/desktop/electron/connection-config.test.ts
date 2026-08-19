@@ -40,6 +40,7 @@ import {
   profileRemoteOverride,
   profileSshOverride,
   remoteRequestMatchesBaseUrl,
+  remoteTokenNeedsBearer,
   resolveAuthMode,
   resolveProfileApiRequest,
   resolveProfileBackendRoute,
@@ -1125,6 +1126,29 @@ test('gateway WS URL IPC result serializes success and the auth-vs-transport mat
       ok: false
     })
   }
+})
+
+test('remoteTokenNeedsBearer sends the session token as a bearer for gated remotes only', () => {
+  // The #no_cookie class: a gated dashboard verifies the session token as
+  // `Authorization: *** and ignores `X-Hermes-Session-Token`. Any descriptor
+  // that reaches a remote must therefore carry the bearer.
+  assert.equal(remoteTokenNeedsBearer({ mode: 'remote' }), true)
+  // A registry-scoped descriptor is remote by construction, whatever its mode
+  // field says — this is the branch fetchJsonForBackend was missing.
+  assert.equal(remoteTokenNeedsBearer({ connectionId: 'hermes-dev-env' }), true)
+  assert.equal(remoteTokenNeedsBearer({ mode: 'local', connectionId: 'hermes-dev-env' }), true)
+  // The request-scoped connection id (the hermes:api handler's own signal)
+  // counts even when the resolved descriptor carries neither field.
+  assert.equal(remoteTokenNeedsBearer({ mode: 'local' }, 'hermes-dev-env'), true)
+
+  // A genuinely-local loopback backend keeps the bearer OFF, so the
+  // single-machine path is byte-identical to before.
+  assert.equal(remoteTokenNeedsBearer({ mode: 'local' }), false)
+  assert.equal(remoteTokenNeedsBearer({}), false)
+  assert.equal(remoteTokenNeedsBearer({ mode: 'local', connectionId: '' }), false)
+  assert.equal(remoteTokenNeedsBearer({ mode: 'local', connectionId: '   ' }), false)
+  assert.equal(remoteTokenNeedsBearer({ mode: 'local' }, null), false)
+  assert.equal(remoteTokenNeedsBearer(null), false)
 })
 
 test('resolveTestWsUrl (oauth) requires a mintTicket function', async () => {
