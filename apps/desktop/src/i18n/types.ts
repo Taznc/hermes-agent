@@ -2536,6 +2536,11 @@ export interface Translations {
   zones: {
     showHeader: string
     hideHeader: string
+    showStripTab: (title: string) => string
+    hideStripTab: (title: string) => string
+    lastTabKeptTitle: string
+    lastTabKeptBody: string
+    toggleStripTab: (title: string) => string
     minimize: string
     restore: string
     closeRunningTitle: string
