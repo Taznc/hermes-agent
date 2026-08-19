@@ -1,20 +1,28 @@
 #!/usr/bin/env bash
-# Sync the fork with upstream and rebase the custom `dev` branch onto it.
+# Sync the fork with upstream and merge it into the custom `dev` branch.
 #
 #   origin   = Taznc/hermes-agent        (YOUR fork — safe to push)
 #   upstream = NousResearch/hermes-agent (READ ONLY — never pushed to)
 #
-# Encodes the lessons from the 2026-08-19 sync:
-#   * shallow clones silently break rebases and fake huge "behind" counts
+# `dev` is MERGE-based, not rebase-based. That is the whole reason this script
+# is short and safe to run from two machines:
+#   * merging only ever ADDS commits, so `dev` fast-forwards on the other box
+#     and a plain `git push` is enough — no --force-with-lease, no pre-push
+#     backup branch, no "adopt the other machine's rewritten history" dance
+#   * a conflict is resolved ONCE, recorded in the merge commit, and never
+#     replayed again; rebasing re-resolves the same conflicts every sync
+#   * history grows merge bubbles. This is a daily-driver branch, not a PR —
+#     upstream PRs are cut fresh off `upstream/main` and cherry-picked, so a
+#     tidy `dev` history buys nothing.
+#
+# Other lessons this encodes:
+#   * shallow clones silently break merges and fake huge "behind" counts
 #   * fork main must be a pure upstream mirror before fast-forwarding
-#   * a GitHub-side backup must exist BEFORE history is rewritten
-#   * `git log main..dev` overcounts: commits already merged upstream still
-#     appear. `git cherry` marks those with '-' and is the honest count.
 #   * conflicts are usually semantic (upstream renamed/restructured an API),
 #     so a green typecheck + vitest run is the only real proof of a good merge
 #
 # Usage:
-#   ./scripts/fork-sync.sh              # the one command: adopt, sync, rebase, verify, push
+#   ./scripts/fork-sync.sh              # the one command: sync, merge, verify, push
 #   ./scripts/fork-sync.sh --no-push    # ...stop before pushing dev
 #   ./scripts/fork-sync.sh --check      # report divergence only, change nothing
 set -euo pipefail
@@ -23,7 +31,7 @@ REPO="${FORK_SYNC_REPO:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)}"
 DEV_BRANCH="${FORK_SYNC_DEV_BRANCH:-dev}"
 MAIN_BRANCH="${FORK_SYNC_MAIN_BRANCH:-main}"
 # Push is the default: the whole point is one command. --no-push is the escape
-# hatch for inspecting a rebase before it becomes public.
+# hatch for inspecting the merge before it becomes public.
 DO_PUSH=1
 CHECK_ONLY=0
 
@@ -32,7 +40,7 @@ for arg in "$@"; do
     --push) DO_PUSH=1 ;;
     --no-push) DO_PUSH=0 ;;
     --check) CHECK_ONLY=1 ;;
-    -h|--help) sed -n '2,25p' "$0"; exit 0 ;;
+    -h|--help) sed -n '2,28p' "$0"; exit 0 ;;
     *) echo "unknown arg: $arg" >&2; exit 2 ;;
   esac
 done
@@ -61,7 +69,7 @@ restore_branch() {
 # --- 0. Preconditions -------------------------------------------------------
 say "Preconditions"
 
-# A shallow clone makes rebases explode across the graft boundary and reports
+# A shallow clone makes merges explode across the graft boundary and reports
 # nonsense ahead/behind numbers. This cost a full debugging detour once.
 if [[ "$(git rev-parse --is-shallow-repository)" == "true" ]]; then
   warn "shallow clone detected — fetching full history (this is slow, once)"
@@ -81,83 +89,63 @@ say "Fetching origin + upstream"
 git fetch origin --prune --quiet
 git fetch upstream --prune --quiet
 
-# --- 1b. Reconcile with the OTHER machine -----------------------------------
-# Two machines (laptop + dev VM) both push this branch, and dev gets REBASED,
-# so it moves non-fast-forward. A stale local dev therefore looks "N ahead" of
-# upstream while origin/dev already contains those same commits rebased — and
-# working from it silently duplicates the other machine's sync. (This exact
-# trap cost a ~500-commit redundant merge once.)
-#
-# `git cherry` is what makes the adopt decision safe: '+' is genuinely unique
-# to local, '-' means an equivalent patch already exists on origin/dev.
+# --- 1b. Take the other machine's work first --------------------------------
+# Both machines push `dev`. Because dev is merge-based, origin/dev is always a
+# descendant of what we have, so this is a plain fast-forward — no history
+# rewriting, nothing to reconcile. If it is NOT a fast-forward, this machine
+# has local commits that were never pushed; merge them rather than guessing.
 if git rev-parse --verify --quiet "origin/$DEV_BRANCH" >/dev/null; then
   BEHIND_ORIGIN="$(git rev-list --count "$DEV_BRANCH..origin/$DEV_BRANCH")"
+  AHEAD_ORIGIN="$(git rev-list --count "origin/$DEV_BRANCH..$DEV_BRANCH")"
 
   if [[ "$BEHIND_ORIGIN" != "0" ]]; then
-    say "origin/$DEV_BRANCH is ahead by $BEHIND_ORIGIN commit(s) — the other machine synced"
-
-    # `git cherry` alone is too strict here: when the other machine rebased, it
-    # RESOLVED CONFLICTS, so the replayed commit is no longer patch-identical
-    # and shows as '+' even though the work is present. Fall back to comparing
-    # subjects — a commit whose subject already exists on origin/dev is
-    # accounted for; anything else is genuinely unpushed local work.
-    MISSING=""
-    while IFS= read -r sha; do
-      [[ -z "$sha" ]] && continue
-      subject="$(git log -1 --format='%s' "$sha")"
-
-      if ! git log --format='%s' "upstream/$MAIN_BRANCH..origin/$DEV_BRANCH" | grep -qxF "$subject"; then
-        MISSING+="  $(git log -1 --format='%h %s' "$sha")"$'\n'
-      fi
-    done < <(git cherry "origin/$DEV_BRANCH" "$DEV_BRANCH" | awk '/^\+/ {print $2}')
-
-    if [[ -n "$MISSING" ]]; then
-      printf '%s' "$MISSING"
-      die "local $DEV_BRANCH has commit(s) NOT on origin (above).
-    Rebase them yourself first — this script will not choose which side wins:
-      git rebase origin/$DEV_BRANCH"
-    fi
+    say "origin/$DEV_BRANCH has $BEHIND_ORIGIN new commit(s) from the other machine"
 
     if [[ "$CHECK_ONLY" == "1" ]]; then
-      echo "  (--check) would adopt origin/$DEV_BRANCH; every local commit already exists there"
+      echo "  (--check) would pull them into local $DEV_BRANCH"
     else
-      # Safe: every local subject is present on origin/dev (rebased there, with
-      # conflicts already resolved), so adopting loses nothing. The tag makes
-      # the pre-adopt state recoverable regardless.
-      git tag -f "preadopt-$DEV_BRANCH-$(date +%Y%m%d-%H%M%S)" "$DEV_BRANCH" >/dev/null
-      say "Adopting origin/$DEV_BRANCH (all local work already present there)"
       git checkout -q "$DEV_BRANCH"
-      git reset --hard -q "origin/$DEV_BRANCH"
+
+      if [[ "$AHEAD_ORIGIN" == "0" ]]; then
+        git merge --ff-only "origin/$DEV_BRANCH"
+        echo "  fast-forwarded"
+      else
+        # Both sides moved. A merge keeps both; conflicts here are the same
+        # semantic kind as an upstream merge and get resolved once.
+        say "Local $DEV_BRANCH also has $AHEAD_ORIGIN commit(s) — merging both sides"
+        git merge --no-edit "origin/$DEV_BRANCH" \
+          || die "merge with origin/$DEV_BRANCH conflicted — resolve, commit, then re-run"
+      fi
     fi
   fi
 fi
-
-UPSTREAM_HEAD="$(git rev-parse upstream/$MAIN_BRANCH)"
-MAIN_HEAD="$(git rev-parse $MAIN_BRANCH)"
-DEV_HEAD="$(git rev-parse $DEV_BRANCH)"
 
 # --- 2. Report divergence ---------------------------------------------------
 say "Divergence"
 
 # `git cherry` is the honest count: '+' = genuinely unique to dev,
-# '-' = an equivalent patch already exists upstream (would be dropped).
-UNIQUE="$(git cherry "$MAIN_BRANCH" "$DEV_BRANCH" | grep -c '^+' || true)"
-DUPES="$(git cherry "$MAIN_BRANCH" "$DEV_BRANCH" | grep -c '^-' || true)"
-BEHIND="$(git rev-list --count "$MAIN_BRANCH".."upstream/$MAIN_BRANCH")"
+# '-' = an equivalent patch already exists upstream.
+UNIQUE="$(git cherry "upstream/$MAIN_BRANCH" "$DEV_BRANCH" 2>/dev/null | grep -c '^+' || true)"
+BEHIND="$(git rev-list --count "$DEV_BRANCH".."upstream/$MAIN_BRANCH")"
+MAIN_BEHIND="$(git rev-list --count "$MAIN_BRANCH".."upstream/$MAIN_BRANCH")"
 
-echo "  fork $MAIN_BRANCH is behind upstream by : $BEHIND commit(s)"
-echo "  $DEV_BRANCH commits genuinely unique     : $UNIQUE"
-echo "  $DEV_BRANCH commits already upstream     : $DUPES (will be dropped by rebase — expected)"
+echo "  fork $MAIN_BRANCH is behind upstream by : $MAIN_BEHIND commit(s)"
+echo "  $DEV_BRANCH is behind upstream by        : $BEHIND commit(s)"
+echo "  $DEV_BRANCH commits not upstream         : $UNIQUE"
 
 if [[ "$CHECK_ONLY" == "1" ]]; then
   say "--check requested; nothing modified."
   exit 0
 fi
 
-if [[ "$BEHIND" == "0" ]]; then
-  # Upstream is caught up, but an adopt above may still have moved dev, and the
-  # working branch must be restored either way.
+if [[ "$BEHIND" == "0" && "$MAIN_BEHIND" == "0" ]]; then
   say "Already up to date with upstream."
+
+  # An earlier fast-forward from origin may still be unpushed.
+  if [[ "$DO_PUSH" == "1" ]] && [[ "$(git rev-list --count "origin/$DEV_BRANCH..$DEV_BRANCH")" != "0" ]]; then
+    git push origin "$DEV_BRANCH"
+  fi
+
   restore_branch
   exit 0
 fi
@@ -165,45 +153,35 @@ fi
 # --- 3. Verify fork main is a clean mirror ----------------------------------
 say "Verifying fork $MAIN_BRANCH is a pure upstream mirror"
 
-# Anything here means someone committed to the fork's main directly. Rebasing
-# on top of that silently buries the work, so refuse instead.
+# Anything here means someone committed to the fork's main directly. Merging on
+# top of that silently buries the work, so refuse instead.
 STRAY="$(git log --oneline "upstream/$MAIN_BRANCH..$MAIN_BRANCH" | head -20)"
 if [[ -n "$STRAY" ]]; then
   echo "$STRAY"
   die "fork $MAIN_BRANCH has commits NOT in upstream (above). Resolve before syncing."
 fi
 
-# --- 4. Backup BEFORE rewriting anything ------------------------------------
-STAMP="$(date +%Y%m%d-%H%M%S)"
-BACKUP="backup/$DEV_BRANCH-$STAMP"
-
-say "Pushing safety backup to your fork: $BACKUP"
-git branch -f "$BACKUP" "$DEV_BRANCH"
-git tag -f "presync-$DEV_BRANCH-$STAMP" "$DEV_BRANCH" >/dev/null
-# Backup must live on GitHub, not just locally — a local-only backup does not
-# survive the machine it was made on.
-git push -q origin "$BACKUP" --force
-git push -q origin "presync-$DEV_BRANCH-$STAMP" --force
-echo "  recover with: git reset --hard presync-$DEV_BRANCH-$STAMP"
-
-# --- 5. Fast-forward fork main ---------------------------------------------
+# --- 4. Fast-forward fork main ---------------------------------------------
 say "Fast-forwarding fork $MAIN_BRANCH -> upstream/$MAIN_BRANCH"
 git checkout -q "$MAIN_BRANCH"
 git merge --ff-only "upstream/$MAIN_BRANCH"
 git push -q origin "$MAIN_BRANCH"
 
-# --- 6. Rebase dev ----------------------------------------------------------
-say "Rebasing $DEV_BRANCH onto $MAIN_BRANCH ($UNIQUE commit(s) to replay)"
+# --- 5. Merge upstream into dev ---------------------------------------------
+# No backup branch needed: a merge only adds commits, so the pre-merge state is
+# still reachable (`git reset --hard ORIG_HEAD` / the reflog) and nothing that
+# was pushed is ever rewritten.
+say "Merging $MAIN_BRANCH into $DEV_BRANCH ($UNIQUE custom commit(s) preserved)"
 git checkout -q "$DEV_BRANCH"
 
-# rerere records conflict resolutions so a re-run of the same rebase replays
-# them automatically instead of asking twice.
+# rerere records conflict resolutions so a repeat of the same conflict replays
+# automatically instead of asking twice.
 git config rerere.enabled true
 
-if ! git rebase "$MAIN_BRANCH"; then
+if ! git merge --no-edit "$MAIN_BRANCH"; then
   cat <<'EOF'
 
-  Rebase stopped on a conflict. This is normal and usually SEMANTIC:
+  Merge stopped on a conflict. This is normal and usually SEMANTIC:
   upstream renamed or restructured an API your commit also touched.
 
   Rules that made the last sync correct:
@@ -212,38 +190,42 @@ if ! git rebase "$MAIN_BRANCH"; then
         git grep -n "theFunctionName" -- apps/desktop/src
       If upstream deleted it, your side cannot compile — adapt, don't keep.
     * "Both added different things" = keep BOTH, not one.
-    * After resolving: git add -A && git rebase --continue
+    * After resolving: git add -A && git commit    (finishes the merge)
 
-  When finished, re-run this script with --push.
+  Unlike a rebase this is resolved ONCE — the merge commit records it.
+  Abort at any point with: git merge --abort
+  Then re-run this script.
 EOF
   exit 1
 fi
 
-# --- 7. Verify -------------------------------------------------------------
+# --- 6. Verify -------------------------------------------------------------
 say "Verifying (typecheck + tests) — the only real proof the merge is correct"
 cd apps/desktop
 
 if ! npm run typecheck; then
-  die "typecheck FAILED — fix before pushing. Your rebase is intact; nothing was pushed."
+  die "typecheck FAILED — fix and commit before pushing. Your merge is intact; nothing was pushed.
+    undo the merge with: git reset --hard ORIG_HEAD"
 fi
 
 if ! npx vitest run; then
-  die "tests FAILED — fix before pushing. Your rebase is intact; nothing was pushed."
+  die "tests FAILED — fix and commit before pushing. Your merge is intact; nothing was pushed.
+    undo the merge with: git reset --hard ORIG_HEAD"
 fi
 
 cd "$REPO"
 
-# --- 8. Push ---------------------------------------------------------------
+# --- 7. Push ---------------------------------------------------------------
 if [[ "$DO_PUSH" == "1" ]]; then
-  say "Force-pushing rebased $DEV_BRANCH to YOUR FORK (origin)"
-  # --force-with-lease refuses to clobber commits fetched after our last fetch.
-  git push --force-with-lease origin "$DEV_BRANCH"
+  say "Pushing $DEV_BRANCH to YOUR FORK (origin)"
+  # A plain push: merges never rewrite history, so no force is involved.
+  git push origin "$DEV_BRANCH"
   restore_branch
-  say "Done. Backup retained at origin/$BACKUP"
+  say "Done."
   echo "  the other machine picks this up with: ./scripts/fork-sync.sh"
 else
   restore_branch
-  say "Rebase verified and GREEN. Not pushed (--no-push)."
-  echo "  push with: git push --force-with-lease origin $DEV_BRANCH"
-  echo "  backup at: origin/$BACKUP"
+  say "Merge verified and GREEN. Not pushed (--no-push)."
+  echo "  push with: git push origin $DEV_BRANCH"
+  echo "  undo with: git reset --hard ORIG_HEAD"
 fi
