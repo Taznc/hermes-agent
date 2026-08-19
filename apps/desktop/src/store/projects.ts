@@ -600,7 +600,30 @@ function syncReposScanning(): void {
 
 $gateway.subscribe(syncReposScanning)
 
+// Reset the gateway-bound project cache. Projects live in the ACTIVE backend's
+// per-profile projects.db, so the list, the tree, the drilled-in scope and the
+// backend-capability verdict all describe one machine. Nanostores are not
+// React Query: nothing invalidates them, so without this a connection switch
+// keeps painting the PREVIOUS machine's projects — local repo names in the
+// sidebar while the chat runs on the remote box. Same reason the session lists
+// are wiped explicitly next door.
+//
+// The persisted $projectScope is reset too: its ids (`p_<hex>` rows and
+// filesystem paths alike) are meaningful only on the backend that issued them,
+// so a drilled-in local project would scope the remote sidebar to a project it
+// has never heard of.
+export function resetProjectsForGatewaySwitch(): void {
+  $projects.set([])
+  $activeProjectId.set(null)
+  $projectTree.set([])
+  $projectTreeLoading.set(false)
+  $projectsRpcAvailable.set(null)
+  $projectScope.set(ALL_PROJECTS)
+}
+
 export async function scanAndRecordRepos(force = false): Promise<void> {
+  // Repo discovery crawls the LOCAL filesystem, so it must never record this
+  // machine's repos into a remote backend's projects.db.
   if (isDesktopFsRemoteMode()) {
     return
   }

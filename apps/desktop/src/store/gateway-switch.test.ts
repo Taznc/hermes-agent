@@ -79,3 +79,30 @@ describe('wipeSessionListsForGatewaySwitch', () => {
     expect(invalidateProfileListFetches).toHaveBeenCalled()
   })
 })
+
+describe('wipeSessionListsForGatewaySwitch → projects', () => {
+  it('drops the previous backend\'s projects, tree and drilled-in scope', async () => {
+    const { $activeProjectId, $projects, $projectScope, $projectsRpcAvailable, $projectTree, ALL_PROJECTS } =
+      await import('@/store/projects')
+
+    // State as it looks after browsing the LOCAL machine: repo names from
+    // /Users/..., a drilled-in project, and a probed capability verdict.
+    $projects.set([{ id: 'p_local', label: 'hermes-agent', path: '/Users/me/Projects/hermes' } as never])
+    $projectTree.set([{ id: 'p_local', label: 'hermes-agent' } as never])
+    $activeProjectId.set('p_local')
+    $projectScope.set('p_local')
+    $projectsRpcAvailable.set(true)
+
+    wipeSessionListsForGatewaySwitch()
+
+    // Nothing from the previous machine may survive into the next one — this
+    // is what left local repo names in the sidebar while the chat ran remote.
+    expect($projects.get()).toEqual([])
+    expect($projectTree.get()).toEqual([])
+    expect($activeProjectId.get()).toBeNull()
+    expect($projectsRpcAvailable.get()).toBeNull()
+    // The persisted scope is backend-specific: keeping it would scope the new
+    // sidebar to a project id the new backend has never issued.
+    expect($projectScope.get()).toBe(ALL_PROJECTS)
+  })
+})
