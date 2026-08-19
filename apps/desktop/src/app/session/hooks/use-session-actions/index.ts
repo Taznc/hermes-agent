@@ -22,6 +22,7 @@ import {
   $newChatProfile,
   ensureGatewayAgent,
   ensureGatewayProfile,
+  ensureGatewaySessionProfile,
   normalizeProfileKey
 } from '@/store/profile'
 import {
@@ -201,7 +202,9 @@ async function desktopSessionCreateParams(cwd: string): Promise<Record<string, u
   }
 
   const profile = $newChatProfile.get() ?? normalizeProfileKey($activeGatewayProfile.get())
-  await ensureGatewayProfile(profile)
+  // Source-preserving: on a registry agent this must NOT re-home the window
+  // to a same-named local profile (the silent local-fallback on Send).
+  await ensureGatewaySessionProfile(profile)
 
   return {
     cols: 96,
@@ -1501,7 +1504,7 @@ export function useSessionActions({
         // lands the branch on the launch (default) profile — the "session
         // jumps between profiles after branching" bug. The swap also makes
         // upsertOptimisticSession's $activeGatewayProfile stamp correct.
-        await ensureGatewayProfile(profile)
+        await ensureGatewaySessionProfile(profile)
 
         // No title: the backend auto-names the branch from its parent's lineage.
         const branched = sourceSessionId
@@ -1689,7 +1692,7 @@ export function useSessionActions({
       const profile = sessionProfile ?? stored?.profile
 
       try {
-        await ensureGatewayProfile(profile)
+        await ensureGatewaySessionProfile(profile)
         const { messages } = await getAllSessionMessages(storedSessionId, profile)
         const branchMessages = toBranchMessages(toChatMessages(messages))
 

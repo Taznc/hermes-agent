@@ -538,6 +538,37 @@ export async function ensureGatewayAgent(connectionId: null | string, profile: s
   }
 }
 
+// Session-create/branch swap that PRESERVES the active source. The callers
+// (send, fork, branch) resolve only a profile NAME, but a profile name does
+// not identify a backend: `claudecode` on a registry connection and
+// `claudecode` on the local pool are different machines. ensureGatewayProfile
+// is by design the LOCAL-POOL door — its "already here" fast path requires
+// $activeGatewayConnection === null, so calling it while a registry agent is
+// active never no-ops: it dials a same-named LOCAL backend and re-homes the
+// whole window to this device ($activeGatewayConnection ← null). That is the
+// "I typed a message on the remote profile and got dumped back to my main
+// profile" bug: the send itself silently retargeted the window — the exact
+// authoritative-write fallback the desktop ladder forbids.
+//
+// When the target profile is the one the active registry connection already
+// serves, stay on that connection (re-dialing through the agent door, which
+// also recovers a dropped socket). Anything else keeps the legacy local-pool
+// meaning, byte-identical for single-source users.
+export async function ensureGatewaySessionProfile(profile: string | null | undefined): Promise<void> {
+  const connection = $activeGatewayConnection.get()
+
+  if (connection) {
+    const active = normalizeProfileKey($activeGatewayProfile.get())
+    const target = profile == null || !String(profile).trim() ? active : normalizeProfileKey(profile)
+
+    if (target === active) {
+      return ensureGatewayAgent(connection, target)
+    }
+  }
+
+  return ensureGatewayProfile(profile)
+}
+
 // ── Sidebar profile scope (the "workspace switcher" model) ─────────────────
 // Mirrors how Slack/VS Code/Linear do multi-context: you're "in" one profile at
 // a time and the sidebar shows only that profile's sessions (clean rows, no
