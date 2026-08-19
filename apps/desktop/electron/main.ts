@@ -9711,6 +9711,10 @@ function broadcastConnectionsChanged(payload: { connectionId: string; reason: 'r
 const DEV_MAIN_BUNDLE = path.join(APP_ROOT, 'dist', 'electron-main.mjs')
 const DEV_PRELOAD_BUNDLE = path.join(APP_ROOT, 'dist', 'electron-preload.js')
 
+// Sentinel exit code meaning "the dev watcher should respawn me", as opposed to
+// a real quit. Must match the value in scripts/dev-electron-watch.mjs.
+const DEV_RESTART_EXIT_CODE = 86
+
 let devMainBundleStale = false
 let devBundleWatchers: fs.FSWatcher[] = []
 
@@ -9800,8 +9804,22 @@ ipcMain.handle('hermes:dev:restart', async () => {
     return { ok: false, reason: 'not-a-dev-build' }
   }
 
-  // relaunch() queues a fresh instance for after this one exits, so the new
-  // process picks up the rebuilt bundle.
+  // Exit with a sentinel code and let the DEV WATCHER respawn us.
+  //
+  // app.relaunch() is wrong here: it exits 0, which is indistinguishable from a
+  // real quit, so the watcher tears itself down (and `concurrently -k` kills
+  // Vite with it) while the relaunched window loads a dev server that no longer
+  // exists — a permanent blank screen. Handing the restart to the supervisor
+  // that owns the process keeps Vite up and the new window attached.
+  //
+  // Without a watcher (plain `npm run dev`), nothing respawns us, so fall back
+  // to relaunch there.
+  if (process.env.HERMES_DEV_WATCH === '1') {
+    app.exit(DEV_RESTART_EXIT_CODE)
+
+    return { ok: true }
+  }
+
   app.relaunch()
   app.exit(0)
 

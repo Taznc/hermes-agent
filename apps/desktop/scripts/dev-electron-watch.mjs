@@ -32,6 +32,11 @@ mkdirSync(distDir, { recursive: true })
 const DEV_SERVER = process.env.HERMES_DESKTOP_DEV_SERVER || 'http://127.0.0.1:5174'
 const external = ['electron', 'node-pty', 'get-windows', 'fs']
 
+// Sentinel exit code the app uses to ask for a respawn (the "Restart to apply"
+// button). Must match DEV_RESTART_EXIT_CODE in electron/main.ts. Anything else
+// — including a plain 0 from Cmd+Q — means the user really quit.
+const DEV_RESTART_EXIT_CODE = 86
+
 // Mirror everything (watcher notes + the Electron main process's own stdout /
 // stderr) into one file. Console output scrolls away and is easy to lose; a
 // stable path means a failure can be read back after the fact — including by an
@@ -113,12 +118,6 @@ log(`log file: ${LOG_PATH}`)
 // 'pipe' rather than 'inherit' so main-process output can be tee'd to both the
 // terminal and the log file. Anything Electron prints — including the REST
 // route diagnostics — is then readable after the fact.
-child = spawn(resolve(root, 'node_modules/.bin/electron'), ['.'], {
-  cwd: root,
-  env: { ...process.env, HERMES_DESKTOP_DEV_SERVER: DEV_SERVER, XCURSOR_SIZE: '24' },
-  stdio: ['inherit', 'pipe', 'pipe']
-})
-
 const tee = (stream, sink) => {
   stream.on('data', chunk => {
     sink.write(chunk)
@@ -131,17 +130,43 @@ const tee = (stream, sink) => {
   })
 }
 
-tee(child.stdout, process.stdout)
-tee(child.stderr, process.stderr)
+function startElectron() {
+  child = spawn(resolve(root, 'node_modules/.bin/electron'), ['.'], {
+    cwd: root,
+    env: {
+      ...process.env,
+      // Tells main.ts a supervisor is present, so "Restart to apply" can exit
+      // with the sentinel instead of calling app.relaunch().
+      HERMES_DESKTOP_DEV_SERVER: DEV_SERVER,
+      HERMES_DEV_WATCH: '1',
+      XCURSOR_SIZE: '24'
+    },
+    stdio: ['inherit', 'pipe', 'pipe']
+  })
 
-// The app relaunches itself in place (app.relaunch), so a normal exit here means
-// the user quit for real — tear the watcher down with it.
-child.on('exit', code => {
-  if (!shuttingDown) {
+  tee(child.stdout, process.stdout)
+  tee(child.stderr, process.stderr)
+
+  child.on('exit', code => {
+    if (shuttingDown) {
+      return
+    }
+
+    // The app asked to be restarted: respawn it and keep Vite (and this
+    // watcher) alive. Anything else is a real quit.
+    if (code === DEV_RESTART_EXIT_CODE) {
+      log('restarting electron with the rebuilt bundle…')
+      startElectron()
+
+      return
+    }
+
     log(`electron exited (code ${code}) — stopping watcher`)
     void stop(code ?? 0)
-  }
-})
+  })
+}
+
+startElectron()
 
 async function stop(code = 0) {
   if (shuttingDown) {
