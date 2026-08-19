@@ -17,6 +17,12 @@ import type { HermesConnection } from '@/global'
 const ensureGatewayForAgent = vi.fn(async (_connectionId: null | string, _profile: string) => undefined)
 const ensureGatewayForProfile = vi.fn(async (_profile: string) => undefined)
 const openGatewayForProfile = vi.fn(async (_profile: string) => undefined)
+// Upstream's two-phase swap: prepare* dials the socket WITHOUT publishing and
+// hands back an activation thunk the caller runs inside a batch(). A truthy
+// return means "activation still valid" — returning false models a disposed
+// target, which must publish nothing.
+const prepareGatewayForAgent = vi.fn(async (_connectionId: null | string, _profile: string) => () => true)
+const prepareGatewayForProfile = vi.fn(async (_profile: string) => () => true)
 const $gateway = atom<unknown>({ id: 'live-socket' })
 const resetStarmapGraph = vi.fn()
 const wipeSessionListsForGatewaySwitch = vi.fn()
@@ -25,7 +31,9 @@ vi.mock('@/store/gateway', () => ({
   $gateway,
   ensureGatewayForAgent,
   ensureGatewayForProfile,
-  openGatewayForProfile
+  openGatewayForProfile,
+  prepareGatewayForAgent,
+  prepareGatewayForProfile
 }))
 vi.mock('@/hermes', () => ({
   getProfiles: vi.fn(async () => ({ profiles: [] })),
@@ -67,6 +75,10 @@ beforeEach(() => {
   getConnectionFor.mockResolvedValue(remoteConn())
   ensureGatewayForAgent.mockClear()
   ensureGatewayForProfile.mockClear()
+  // Cleared per-test for the same reason: call counts leak across cases and
+  // "not.toHaveBeenCalled()" would see the PREVIOUS test's dial.
+  prepareGatewayForAgent.mockClear()
+  prepareGatewayForProfile.mockClear()
   $gateway.set({ id: 'live-socket' })
   $activeGatewayProfile.set('default')
   $activeGatewayConnection.set(null)
@@ -90,7 +102,7 @@ describe('selectAgent switches on the (connection, profile) pair', () => {
     selectAgent('hermes-dev', 'default')
     await settle()
 
-    expect(ensureGatewayForAgent).toHaveBeenCalledWith('hermes-dev', 'default')
+    expect(prepareGatewayForAgent).toHaveBeenCalledWith('hermes-dev', 'default')
     expect($activeGatewayProfile.get()).toBe('default')
     expect($activeGatewayConnection.get()).toBe('hermes-dev')
     // A fresh draft was requested: this is a context switch, not a no-op.
@@ -119,7 +131,7 @@ describe('selectAgent switches on the (connection, profile) pair', () => {
     selectAgent(null, 'default')
     await settle()
 
-    expect(ensureGatewayForProfile).toHaveBeenCalledWith('default')
+    expect(prepareGatewayForProfile).toHaveBeenCalledWith('default')
     expect($activeGatewayConnection.get()).toBeNull()
   })
 
@@ -137,8 +149,8 @@ describe('selectAgent switches on the (connection, profile) pair', () => {
     selectAgent(null, 'research')
     await settle()
 
-    expect(ensureGatewayForProfile).toHaveBeenCalledWith('research')
-    expect(ensureGatewayForAgent).not.toHaveBeenCalled()
+    expect(prepareGatewayForProfile).toHaveBeenCalledWith('research')
+    expect(prepareGatewayForAgent).not.toHaveBeenCalled()
     expect($activeGatewayConnection.get()).toBeNull()
   })
 
@@ -146,7 +158,7 @@ describe('selectAgent switches on the (connection, profile) pair', () => {
     selectAgent('   ', 'research')
     await settle()
 
-    expect(ensureGatewayForAgent).not.toHaveBeenCalled()
-    expect(ensureGatewayForProfile).toHaveBeenCalledWith('research')
+    expect(prepareGatewayForAgent).not.toHaveBeenCalled()
+    expect(prepareGatewayForProfile).toHaveBeenCalledWith('research')
   })
 })
