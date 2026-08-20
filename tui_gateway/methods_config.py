@@ -105,6 +105,84 @@ def _(rid, params: dict) -> dict:
         return _err(rid, 5061, str(e))
 
 
+@method("projects.scan_repos")
+def _(rid, params: dict) -> dict:
+    """Walk THIS backend's own filesystem for git repos, persist, and return the
+    merged repo list.
+
+    The server-side sibling of ``projects.record_repos``. The desktop's native
+    crawl reaches only the machine Electron runs on, so a remote gateway's
+    Projects sidebar could never be populated: the client correctly refuses to
+    write its local paths into another host's projects.db. This handler closes
+    that gap by scanning the disk the backend actually owns.
+
+    The policy is resolved here, server-side, because the roots being walked are
+    this machine's. An optional ``discovery_policy`` param is accepted only as a
+    staleness check: if the client's view of the policy no longer matches the
+    effective one, the scan is refused rather than persisting a result the user
+    has since reconfigured (same contract as ``record_repos``).
+    """
+    try:
+        from hermes_cli import projects_db as pdb
+
+        from .repo_scan import scan_repos_on_disk
+
+        policy = _repo_discovery_policy()
+        policy_key = _repo_discovery_policy_key(policy)
+        incoming_raw = params.get("discovery_policy")
+        incoming_policy = (
+            _repo_discovery_policy(incoming_raw)
+            if isinstance(incoming_raw, dict)
+            else None
+        )
+        # No policy sent means "use whatever this backend is configured for" —
+        # the honest default for a remote scan, since the client cannot know the
+        # remote machine's roots. A sent policy must match to be honored.
+        policy_matches = (
+            incoming_policy is None
+            or _repo_discovery_policy_key(incoming_policy) == policy_key
+        )
+        accepted = bool(policy["enabled"] and policy_matches)
+
+        # A disabled policy must not touch the filesystem at all.
+        pairs: list[tuple[str, str | None]] = []
+        if accepted:
+            pairs = [
+                (root, label)
+                for root, label in scan_repos_on_disk(policy)
+                if not _is_repo_junk(root)
+            ]
+
+        with pdb.connect_closing() as conn:
+            pdb.reconcile_discovered_repos_policy(
+                conn,
+                policy_key,
+                preserve_unversioned=_repo_discovery_policy_is_default(policy),
+            )
+            if accepted:
+                pdb.record_discovered_repos(
+                    conn, pairs, replace=True, policy_key=policy_key
+                )
+            elif not policy["enabled"]:
+                pdb.clear_discovered_repos(conn, policy_key=policy_key)
+
+        db = _get_db()
+        return _ok(
+            rid,
+            {
+                "repos": _discover_repos_payload(
+                    db, include_cached=policy["enabled"]
+                )
+                if db is not None
+                else [],
+                "accepted": accepted,
+                "discovery_policy": policy,
+            },
+        )
+    except Exception as e:
+        return _err(rid, 5061, str(e))
+
+
 @method("projects.tree")
 def _(rid, params: dict) -> dict:
     """Authoritative project overview: project -> repo -> lane structure with

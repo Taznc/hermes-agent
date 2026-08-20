@@ -55,6 +55,18 @@ function markProjectsRpcFailure(err: unknown): void {
   }
 }
 
+// False when the connected backend predates `projects.scan_repos` (server-side
+// repo discovery). Null until the first probe. Mirrors $projectsRpcAvailable
+// rather than inventing a second capability mechanism: a missing method is a
+// verdict about this backend, not a transient failure to retry.
+export const $remoteRepoScanAvailable = atom<boolean | null>(null)
+
+function markRemoteRepoScanFailure(err: unknown): void {
+  if (isMissingRpcMethod(err)) {
+    $remoteRepoScanAvailable.set(false)
+  }
+}
+
 function projectsStaleBackendError(): Error {
   return new Error(translateNow('sidebar.projects.staleBackend'))
 }
@@ -618,13 +630,22 @@ export function resetProjectsForGatewaySwitch(): void {
   $projectTree.set([])
   $projectTreeLoading.set(false)
   $projectsRpcAvailable.set(null)
+  // The scan_repos verdict describes the machine we just left, not the one we
+  // are dialling — a new backend gets a fresh probe.
+  $remoteRepoScanAvailable.set(null)
   $projectScope.set(ALL_PROJECTS)
 }
 
 export async function scanAndRecordRepos(force = false): Promise<void> {
   // Repo discovery crawls the LOCAL filesystem, so it must never record this
-  // machine's repos into a remote backend's projects.db.
-  if (isDesktopFsRemoteMode()) {
+  // machine's repos into a remote backend's projects.db. A remote backend owns
+  // a disk we cannot reach, so it scans itself: `projects.scan_repos` is the
+  // server-side sibling of `projects.record_repos`.
+  const remote = isDesktopFsRemoteMode()
+
+  // Capability absent is a verdict, not a failure: an older backend has no
+  // scan_repos, so stop asking instead of retrying every refresh.
+  if (remote && $remoteRepoScanAvailable.get() === false) {
     return
   }
 
@@ -636,9 +657,9 @@ export async function scanAndRecordRepos(force = false): Promise<void> {
     return
   }
 
-  const scan = desktopGit()?.scanRepos
+  const scan = remote ? undefined : desktopGit()?.scanRepos
 
-  if (!scan) {
+  if (!remote && !scan) {
     return
   }
 
@@ -648,7 +669,9 @@ export async function scanAndRecordRepos(force = false): Promise<void> {
 
   try {
     const policy = repoDiscoveryPolicyFromConfig(await getHermesConfig(context.profile))
-    const signature = repoDiscoveryPolicySignature(policy)
+    // Namespaced so a local and a remote scan of the same gateway can never
+    // share a dedupe key — they scan different machines.
+    const signature = `${remote ? 'remote:' : 'local:'}${repoDiscoveryPolicySignature(policy)}`
 
     if (!force && (state.completedSignature === signature || state.runningSignature === signature)) {
       return
@@ -657,7 +680,15 @@ export async function scanAndRecordRepos(force = false): Promise<void> {
     generation = ++state.generation
     state.runningSignature = signature
 
-    if (!policy.enabled) {
+    if (remote) {
+      scanningGatewayGenerations.set(context.gateway, generation)
+      syncReposScanning()
+
+      // No discovery_policy is sent on purpose. The roots being walked are the
+      // BACKEND's, so the backend resolves its own policy — one resolver owns
+      // it. A disabled policy there returns [] and clears its cache server-side.
+      await gatewayRequestOn(context.gateway, 'projects.scan_repos', {})
+    } else if (!policy.enabled) {
       await gatewayRequestOn(context.gateway, 'projects.record_repos', {
         discovery_policy: policy,
         repos: []
@@ -666,7 +697,7 @@ export async function scanAndRecordRepos(force = false): Promise<void> {
       scanningGatewayGenerations.set(context.gateway, generation)
       syncReposScanning()
 
-      const repos = await scan(policy.roots, {
+      const repos = await scan!(policy.roots, {
         enabled: true,
         excludePaths: policy.exclude_paths
       })
@@ -685,12 +716,20 @@ export async function scanAndRecordRepos(force = false): Promise<void> {
       return
     }
 
+    if (remote) {
+      $remoteRepoScanAvailable.set(true)
+    }
+
     state.completedSignature = signature
     // Scope-aware on purpose: the scan records into one profile, but folding
     // its result back in through the active scope keeps an all-profiles tree
     // from being overwritten by the scanned profile's own.
     await refreshProjectTree()
-  } catch {
+  } catch (err) {
+    if (remote) {
+      markRemoteRepoScanFailure(err)
+    }
+
     state.completedSignature = undefined
   } finally {
     state.runningSignature = undefined

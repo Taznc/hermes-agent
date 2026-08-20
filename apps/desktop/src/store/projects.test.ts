@@ -10,6 +10,7 @@ import {
   $activeProjectId,
   $projectScope,
   $projectsRpcAvailable,
+  $remoteRepoScanAvailable,
   $projectTree,
   $removedSessionIds,
   $sessionMutationsInFlight,
@@ -27,6 +28,7 @@ import {
   refreshProjects,
   refreshProjectTree,
   refreshWorktrees,
+  resetProjectsForGatewaySwitch,
   resolveNewSessionCwd,
   scanAndRecordRepos,
   startWorkInRepo,
@@ -416,6 +418,7 @@ describe('repository discovery policy', () => {
     vi.clearAllMocks()
     $activeGatewayProfile.set('default')
     isDesktopFsRemoteMode.mockReturnValue(false)
+    $remoteRepoScanAvailable.set(null)
   })
 
   function gatewayWith(request: ReturnType<typeof vi.fn>) {
@@ -488,15 +491,113 @@ describe('repository discovery policy', () => {
     })
   })
 
-  it('does not scan the local filesystem for remote connections', async () => {
+  it('never crawls the local filesystem for a remote backend', async () => {
+    // The local crawl reaches only this machine; recording its paths into a
+    // remote projects.db is the bug this whole path exists to avoid.
     isDesktopFsRemoteMode.mockReturnValue(true)
+    const request = vi.fn(async (method: string) =>
+      method === 'projects.tree'
+        ? { active_id: null, projects: [], scoped_session_ids: [] }
+        : { accepted: true, repos: [] }
+    )
+
+    gatewayWith(request)
     const scanRepos = vi.fn()
     desktopGit.mockReturnValue({ scanRepos } as never)
+    getHermesConfig.mockResolvedValue({
+      desktop: { repo_scan_enabled: true, repo_scan_exclude_paths: [], repo_scan_roots: [] }
+    })
 
     await scanAndRecordRepos(true)
 
     expect(scanRepos).not.toHaveBeenCalled()
-    expect(getHermesConfig).not.toHaveBeenCalled()
+    expect(request).not.toHaveBeenCalledWith('projects.record_repos', expect.anything())
+  })
+
+  it('asks a remote backend to scan its own disk', async () => {
+    isDesktopFsRemoteMode.mockReturnValue(true)
+    const request = vi.fn(async (method: string) =>
+      method === 'projects.tree'
+        ? { active_id: null, projects: [], scoped_session_ids: [] }
+        : { accepted: true, discovery_policy: {}, repos: [{ label: 'vm-repo', root: '/home/hermes/projects/x' }] }
+    )
+
+    gatewayWith(request)
+    desktopGit.mockReturnValue({ scanRepos: vi.fn() } as never)
+    getHermesConfig.mockResolvedValue({
+      desktop: { repo_scan_enabled: true, repo_scan_exclude_paths: [], repo_scan_roots: [] }
+    })
+
+    await scanAndRecordRepos(true)
+
+    // No discovery_policy: the backend owns the policy for its own disk.
+    expect(request).toHaveBeenCalledWith('projects.scan_repos', {})
+    expect($remoteRepoScanAvailable.get()).toBe(true)
+  })
+
+  it('treats a missing scan_repos as an absent capability, not a retry loop', async () => {
+    isDesktopFsRemoteMode.mockReturnValue(true)
+    const request = vi.fn(async (method: string) => {
+      if (method === 'projects.scan_repos') {
+        throw new Error('unknown method: projects.scan_repos')
+      }
+
+      return { active_id: null, projects: [], scoped_session_ids: [] }
+    })
+
+    gatewayWith(request)
+    desktopGit.mockReturnValue({ scanRepos: vi.fn() } as never)
+    getHermesConfig.mockResolvedValue({
+      desktop: { repo_scan_enabled: true, repo_scan_exclude_paths: [], repo_scan_roots: [] }
+    })
+
+    await scanAndRecordRepos(true)
+    expect($remoteRepoScanAvailable.get()).toBe(false)
+
+    const callsAfterVerdict = request.mock.calls.filter(([method]) => method === 'projects.scan_repos').length
+
+    // Even a forced rescan must not re-ask a backend that cannot answer.
+    await scanAndRecordRepos(true)
+
+    expect(
+      request.mock.calls.filter(([method]) => method === 'projects.scan_repos').length
+    ).toBe(callsAfterVerdict)
+  })
+
+  it('keeps retrying after a transient remote failure', async () => {
+    // A dropped socket is not a capability verdict — the next refresh retries.
+    isDesktopFsRemoteMode.mockReturnValue(true)
+    const request = vi.fn(async (method: string) => {
+      if (method === 'projects.scan_repos') {
+        throw new Error('connection reset')
+      }
+
+      return { active_id: null, projects: [], scoped_session_ids: [] }
+    })
+
+    gatewayWith(request)
+    desktopGit.mockReturnValue({ scanRepos: vi.fn() } as never)
+    getHermesConfig.mockResolvedValue({
+      desktop: { repo_scan_enabled: true, repo_scan_exclude_paths: [], repo_scan_roots: [] }
+    })
+
+    await scanAndRecordRepos(true)
+
+    expect($remoteRepoScanAvailable.get()).not.toBe(false)
+
+    await scanAndRecordRepos(true)
+
+    expect(request.mock.calls.filter(([method]) => method === 'projects.scan_repos').length).toBe(2)
+  })
+
+  it('clears the scan capability verdict on a gateway switch', () => {
+    // The verdict describes one machine; carrying it to the next backend would
+    // permanently disable discovery on a capable one.
+    $remoteRepoScanAvailable.set(false)
+
+    resetProjectsForGatewaySwitch()
+
+    expect($remoteRepoScanAvailable.get()).toBeNull()
   })
 })
 

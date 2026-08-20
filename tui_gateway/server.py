@@ -270,6 +270,9 @@ _LONG_HANDLERS = frozenset(
         "image.generate",
         "projects.discover_repos",
         "projects.record_repos",
+        # projects.scan_repos walks this backend's own disk (bounded, but still
+        # thousands of stat calls on a cold FS) — never on the WS reader thread.
+        "projects.scan_repos",
         "projects.for_cwd",
         "projects.tree",
         "projects.project_sessions",
