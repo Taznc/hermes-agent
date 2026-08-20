@@ -256,7 +256,8 @@ import {
   localProfilePoolKeys,
   ProfileDeletionGate,
   profileNameFromDeleteRequest,
-  resolveRouteProfile
+  resolveRouteProfile,
+  resolveStoredDesktopProfile
 } from './profile-delete-routing'
 import { prepareProfileRenameLifecycle, profileRenameFromRequest } from './profile-rename-routing'
 import {
@@ -651,8 +652,17 @@ function loadInstallStamp() {
         })
       }
     } catch (e) {
-      console.warn(`[hermes] install-stamp.json found at ${p} , but parsing failed with ${e}`)
-      // Either ENOENT or malformed JSON; try the next candidate
+      // A MISSING file is the normal case, not a fault: in dev,
+      // process.resourcesPath points inside the prebuilt Electron.app, which
+      // never carries a stamp, so this candidate always misses. Warning about
+      // it on every launch — with the self-contradicting "found ... but
+      // parsing failed with ENOENT" wording — trains the reader to ignore a
+      // message that should mean something. Only a stamp that EXISTS and is
+      // malformed is worth surfacing.
+      if ((e as NodeJS.ErrnoException)?.code !== 'ENOENT') {
+        console.warn(`[hermes] install-stamp.json at ${p} could not be parsed: ${e}`)
+      }
+      // Either way, try the next candidate.
     }
   }
 
@@ -8536,20 +8546,53 @@ async function saveRegistryConnection(input: any = {}) {
 // Returns the desktop's chosen profile name, or null when unset. "default" is
 // a valid stored value (pins the root HERMES_HOME explicitly); null means "no
 // preference" and preserves the legacy launch (no --profile flag).
+//
+// A stored name must also still EXIST on this machine. The preference outlives
+// the profile it names: deleting a profile elsewhere, syncing this file between
+// machines, or restoring a backup all leave a name here with no directory
+// behind it. Because every profile-scoped consumer funnels through this
+// function -- primaryProfileKey(), the `hermes:profile:get` IPC the renderer
+// adopts at boot, and the backend launch path -- an unvalidated name routes
+// EVERY profile-scoped REST call (config, env, model info, schema, sessions)
+// at a profile the backend will never have. Each one 404s
+// ("Profile 'x' does not exist."), nothing self-heals, and the app retries
+// forever.
+//
+// Format validation alone cannot catch that: `claudeprimary` is a perfectly
+// well-formed name for a profile that isn't here. Validate existence at the
+// same boundary the local spawn guard uses (assertLocalProfileCanStart), then
+// self-heal by clearing the dead preference so the next read is clean and the
+// app falls back to the default profile instead of looping.
 function readActiveDesktopProfile() {
+  let stored = ''
+
   try {
     const raw = fs.readFileSync(DESKTOP_PROFILE_CONFIG_PATH, 'utf8')
     const parsed = JSON.parse(raw)
-    const name = parsed && typeof parsed.profile === 'string' ? parsed.profile.trim() : ''
-
-    if (name && (name === 'default' || PROFILE_NAME_RE.test(name))) {
-      return name
-    }
+    stored = parsed && typeof parsed.profile === 'string' ? parsed.profile : ''
   } catch {
     // Missing or malformed → no preference.
   }
 
-  return null
+  const resolved = resolveStoredDesktopProfile(
+    stored,
+    key => PROFILE_NAME_RE.test(key),
+    key => directoryExists(path.join(HERMES_HOME, 'profiles', key))
+  )
+
+  // A well-formed name that resolved to nothing means the profile is gone (a
+  // malformed/absent file yields an empty `stored` and is not worth logging).
+  if (!resolved && stored.trim()) {
+    rememberLog(`Stored desktop profile "${stored.trim()}" no longer exists — falling back to the default profile`)
+
+    try {
+      writeActiveDesktopProfile(null)
+    } catch {
+      // Best-effort self-heal: a read-only userData dir still falls back.
+    }
+  }
+
+  return resolved
 }
 
 function writeActiveDesktopProfile(name) {

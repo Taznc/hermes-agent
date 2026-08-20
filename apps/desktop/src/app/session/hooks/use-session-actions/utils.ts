@@ -3,6 +3,7 @@ import { getSession } from '@/hermes'
 import { assistantTextPart, type ChatMessage, chatMessageText, textPart } from '@/lib/chat-messages'
 import { normalizePersonalityValue } from '@/lib/chat-runtime'
 import { embeddedImageUrls, textWithoutEmbeddedImages } from '@/lib/embedded-images'
+import { isProfileKnownMissing, noteProfileError } from '@/lib/profile-liveness'
 import { reconcileApprovalModeForProfile } from '@/store/approval-mode'
 import { requestDesktopOnboardingForCredentialWarning } from '@/store/onboarding'
 import { $activeGatewayProfile, $profiles, normalizeProfileKey } from '@/store/profile'
@@ -1338,12 +1339,16 @@ export async function resolveStoredSession(storedSessionId: string): Promise<Ses
   // Multi-profile only: probe each other profile by id (still one cheap lookup
   // each) rather than pulling every profile's recent sessions. The first hit
   // carries its owning `profile`, which routes the resume to the right backend.
+  //
+  // Profiles the spawn guard has already declared gone are skipped: that
+  // rejection is permanent, so re-probing them each lookup only reproduces the
+  // same error (the repeating `?profile=<dead>` bursts in the dev console).
   const activeKey = normalizeProfileKey($activeGatewayProfile.get())
 
   const otherProfiles = $profiles
     .get()
     .map(profile => normalizeProfileKey(profile.name))
-    .filter(key => key !== activeKey)
+    .filter(key => key !== activeKey && !isProfileKnownMissing(key))
 
   for (const profile of otherProfiles) {
     try {
@@ -1358,8 +1363,11 @@ export async function resolveStoredSession(storedSessionId: string): Promise<Ses
       upsertResolvedSession(session, storedSessionId)
 
       return session
-    } catch {
-      // Not on this profile; try the next.
+    } catch (error) {
+      // A plain 404 just means the id isn't on this profile — try the next.
+      // "no longer exists" / "is being deleted" is the spawn guard telling us
+      // the profile itself is gone; remember it so later lookups skip it.
+      noteProfileError(profile, error)
     }
   }
 
