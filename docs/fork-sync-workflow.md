@@ -162,6 +162,30 @@ the cheapest fork is a small one. Two ways to shrink it:
   notifications. A customization built as a plugin lives outside the upstream
   tree and **never conflicts**.
 
+## Pulling the VM's work onto the laptop
+
+One command on the laptop, from the workspace control plane:
+
+```bash
+~/Projects/hermes/scripts/dev-pull.sh              # pull + rebuild + launch
+~/Projects/hermes/scripts/dev-pull.sh --check      # report only, change nothing
+~/Projects/hermes/scripts/dev-pull.sh --no-launch  # pull + deps, don't start the app
+```
+
+It fetches `origin`, **fast-forwards `dev` only** — never merges, never rewrites —
+reinstalls npm/python deps only when the relevant manifests actually moved in the
+pulled range, then hands off to `scripts/hermes-dev.sh` (rebuilds the Electron
+main bundle, starts Vite on 5174, isolated `Hermes-Dev` userData).
+
+If it refuses to fast-forward, the laptop has commits the VM has not seen. That
+is a real decision, not something a pull script should paper over — run
+`./scripts/fork-sync.sh` from the fork to merge and push instead.
+
+Direction is asymmetric on purpose: `fork-sync.sh` **publishes** (merge upstream,
+verify, push), `dev-pull.sh` **consumes** (fast-forward only). The Python package
+is an editable install, so source edits are live on pull; only the desktop needs
+a build step.
+
 ## Dev build on this VM
 
 ```bash
