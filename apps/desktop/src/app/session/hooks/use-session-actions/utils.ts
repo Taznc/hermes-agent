@@ -3,6 +3,7 @@ import { getSession } from '@/hermes'
 import { assistantTextPart, type ChatMessage, chatMessageText, textPart } from '@/lib/chat-messages'
 import { normalizePersonalityValue } from '@/lib/chat-runtime'
 import { embeddedImageUrls, textWithoutEmbeddedImages } from '@/lib/embedded-images'
+import { parseErrorSurface } from '@/lib/error-surface'
 import { isProfileKnownMissing, noteProfileError } from '@/lib/profile-liveness'
 import { reconcileApprovalModeForProfile } from '@/store/approval-mode'
 import { requestDesktopOnboardingForCredentialWarning } from '@/store/onboarding'
@@ -147,6 +148,9 @@ const COMPARED_FIELDS = [
   'role',
   'pending',
   'error',
+  // Structured failure layer — drives the error card's title and action row,
+  // so a change (e.g. resume replay attaching the descriptor) must repaint.
+  'errorSurface',
   'hidden',
   'branchGroupId',
   'interim',
@@ -264,6 +268,11 @@ export function chatMessagesEquivalent(a: ChatMessage, b: ChatMessage): boolean 
     a.role !== b.role ||
     a.pending !== b.pending ||
     a.error !== b.error ||
+    // Structural compare — the descriptor arrives as a fresh object per
+    // resume/replay, so identity comparison would repaint forever.
+    (a.errorSurface?.layer ?? null) !== (b.errorSurface?.layer ?? null) ||
+    (a.errorSurface?.code ?? null) !== (b.errorSurface?.code ?? null) ||
+    (a.errorSurface?.retryable ?? null) !== (b.errorSurface?.retryable ?? null) ||
     a.hidden !== b.hidden ||
     a.branchGroupId !== b.branchGroupId ||
     a.timestamp !== b.timestamp ||
@@ -752,6 +761,7 @@ export function appendLiveSessionProjection(messages: ChatMessage[], projection:
   // the terminal frame may have been lost to a disconnect) — surface the
   // failure on the projected row instead of rendering the partial as healthy.
   const inflightError = projection.inflight?.error?.trim() ?? ''
+  const inflightErrorSurface = parseErrorSurface(projection.inflight?.error_surface)
   const queuedUser = projection.queued?.user?.trim() ?? ''
 
   if (
@@ -914,7 +924,8 @@ export function appendLiveSessionProjection(messages: ChatMessage[], projection:
         role: 'assistant',
         parts: inflightAssistant ? [assistantTextPart(inflightAssistant)] : [],
         pending: inflightStreaming,
-        ...(inflightError ? { error: inflightError } : {})
+        ...(inflightError ? { error: inflightError } : {}),
+        ...(inflightError && inflightErrorSurface ? { errorSurface: inflightErrorSurface } : {})
       })
     }
 
@@ -1317,17 +1328,19 @@ export async function resolveStoredSession(storedSessionId: string): Promise<Ses
     return cached
   }
 
-  // Direct by-id on the live backend — one row lookup, no list scan. Covers
-  // single-profile users and any id on the active profile (e.g. an old session
-  // past the sidebar's recent window). 404 just means it's not on this profile.
-  try {
-    const session = await getSession(storedSessionId)
+  // Direct by-id on the active profile — one row lookup, no list scan. Electron
+  // routes an unscoped GET to the primary backend, which may not own the
+  // active profile. A 404 there used to skip that profile in the probes below,
+  // so the session was never found.
+  const activeKey = normalizeProfileKey($activeGatewayProfile.get())
 
-    // Older backends omit `profile` on unscoped GETs; the serving backend is
-    // the active gateway's, so back-fill that rather than caching an unowned
-    // row. A present stamp is preserved: in app-global remote mode a bare hit
-    // can legitimately carry another profile's row (see the branch tests).
-    session.profile ||= normalizeProfileKey($activeGatewayProfile.get())
+  try {
+    const session = await getSession(storedSessionId, activeKey)
+
+    // Older backends can omit `profile`; this request targeted the active
+    // profile, so back-fill that rather than caching an unowned row. A present
+    // stamp is preserved for backend compatibility.
+    session.profile ||= activeKey
 
     upsertResolvedSession(session, storedSessionId)
 
@@ -1336,15 +1349,14 @@ export async function resolveStoredSession(storedSessionId: string): Promise<Ses
     // Not on the active profile — fall through to the cross-profile probe.
   }
 
-  // Multi-profile only: probe each other profile by id (still one cheap lookup
-  // each) rather than pulling every profile's recent sessions. The first hit
-  // carries its owning `profile`, which routes the resume to the right backend.
+  // Multi-profile only: probe each remaining profile by id (still one cheap
+  // lookup each) rather than pulling every profile's recent sessions. The
+  // first hit carries its owning `profile`, which routes the resume to the
+  // right backend. The active profile was already tried above.
   //
   // Profiles the spawn guard has already declared gone are skipped: that
   // rejection is permanent, so re-probing them each lookup only reproduces the
   // same error (the repeating `?profile=<dead>` bursts in the dev console).
-  const activeKey = normalizeProfileKey($activeGatewayProfile.get())
-
   const otherProfiles = $profiles
     .get()
     .map(profile => normalizeProfileKey(profile.name))

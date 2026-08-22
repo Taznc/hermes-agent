@@ -6,17 +6,23 @@ import {
   type SidebarProjectTree
 } from '@/app/chat/sidebar/projects/workspace-groups'
 import type { HermesGitBaseBranch, HermesGitBranch } from '@/global'
-import { getHermesConfig, type HermesGateway } from '@/hermes'
+import { getHermesConfig, hermesApi, type HermesGateway } from '@/hermes'
 import { translateNow } from '@/i18n'
 import { desktopDefaultCwd, isDesktopFsRemoteMode, selectDesktopPaths, writeDesktopFileText } from '@/lib/desktop-fs'
-import { desktopGit, isGitEndpointMissingError } from '@/lib/desktop-git'
-import { isMissingRpcMethod } from '@/lib/gateway-rpc'
+import { desktopGit } from '@/lib/desktop-git'
+import { isMissingRestEndpoint, isMissingRpcMethod } from '@/lib/gateway-rpc'
 import { isUnderPath } from '@/lib/path-compare'
 import { persistentAtom } from '@/lib/persisted'
 import { $gateway, activeGateway, ensureActiveGatewayOpen } from '@/store/gateway'
 import { setSidebarAgentsGrouped } from '@/store/layout'
 import { notify } from '@/store/notifications'
-import { $activeGatewayProfile, $profileScope, ALL_PROFILES, requestFreshSession } from '@/store/profile'
+import {
+  $activeGatewayProfile,
+  $profileScope,
+  ALL_PROFILES,
+  normalizeProfileKey,
+  requestFreshSession
+} from '@/store/profile'
 import {
   $selectedStoredSessionId,
   $sessions,
@@ -52,18 +58,6 @@ function markProjectsRpcSuccess(): void {
 function markProjectsRpcFailure(err: unknown): void {
   if (isMissingRpcMethod(err)) {
     $projectsRpcAvailable.set(false)
-  }
-}
-
-// False when the connected backend predates `projects.scan_repos` (server-side
-// repo discovery). Null until the first probe. Mirrors $projectsRpcAvailable
-// rather than inventing a second capability mechanism: a missing method is a
-// verdict about this backend, not a transient failure to retry.
-export const $remoteRepoScanAvailable = atom<boolean | null>(null)
-
-function markRemoteRepoScanFailure(err: unknown): void {
-  if (isMissingRpcMethod(err)) {
-    $remoteRepoScanAvailable.set(false)
   }
 }
 
@@ -353,6 +347,23 @@ async function gatewayRequest<T>(method: string, params: Record<string, unknown>
   return gateway.request<T>(method, params)
 }
 
+function projectProfile(): null | string {
+  const profile = normalizeProfileKey($activeGatewayProfile.get())
+
+  return $profileScope.get() === ALL_PROFILES || profile === ALL_PROFILES ? null : profile
+}
+
+function projectParams(
+  params: Record<string, unknown> = {},
+  profile: null | string = projectProfile()
+): Record<string, unknown> {
+  if (!profile) {
+    throw new Error('Projects are unavailable while viewing all profiles')
+  }
+
+  return { ...params, profile }
+}
+
 async function gatewayRequestOn<T>(
   gateway: HermesGateway,
   method: string,
@@ -366,15 +377,24 @@ interface ActiveProjectsContext {
   profile: string
 }
 
+function stillOnProjectsContext(context: ActiveProjectsContext): boolean {
+  return activeGateway() === context.gateway && projectProfile() === context.profile
+}
+
 async function activeProjectsContext(): Promise<ActiveProjectsContext> {
-  const profile = $activeGatewayProfile.get() || 'default'
+  const profile = projectProfile()
+
+  if (!profile) {
+    throw new Error('Projects are unavailable while viewing all profiles')
+  }
+
   let gateway = activeGateway()
 
   if (!gateway || gateway.connectionState !== 'open') {
     gateway = await ensureActiveGatewayOpen()
   }
 
-  if (!gateway || gateway !== activeGateway() || profile !== ($activeGatewayProfile.get() || 'default')) {
+  if (!gateway || gateway !== activeGateway() || profile !== projectProfile()) {
     throw new Error('Active Hermes profile changed while connecting')
   }
 
@@ -386,14 +406,33 @@ function applyPayload(payload: ProjectsPayload): void {
   $activeProjectId.set(payload.active_id ?? null)
 }
 
+let projectsRefreshGeneration = 0
+
 // Pull the full project list + active pointer. Best-effort: a failure (gateway
 // not up yet) leaves the cached atoms intact so the sidebar doesn't flicker.
 export async function refreshProjects(): Promise<void> {
+  const generation = ++projectsRefreshGeneration
+  let context: ActiveProjectsContext | null = null
+
   try {
-    applyPayload(await gatewayRequest<ProjectsPayload>('projects.list'))
+    context = await activeProjectsContext()
+
+    const payload = await gatewayRequestOn<ProjectsPayload>(
+      context.gateway,
+      'projects.list',
+      projectParams({}, context.profile)
+    )
+
+    if (generation !== projectsRefreshGeneration || !stillOnProjectsContext(context)) {
+      return
+    }
+
+    applyPayload(payload)
     markProjectsRpcSuccess()
   } catch (err) {
-    markProjectsRpcFailure(err)
+    if (context && generation === projectsRefreshGeneration && stillOnProjectsContext(context)) {
+      markProjectsRpcFailure(err)
+    }
     // Backend may not be ready; keep the last known list.
   }
 }
@@ -431,26 +470,29 @@ function applyProjectTreePayload(res: ProjectTreePayload): void {
   }
 }
 
-async function refreshProjectTreeOn(gateway: HermesGateway): Promise<void> {
+async function refreshProjectTreeOn(context: ActiveProjectsContext): Promise<void> {
   const generation = ++projectTreeRefreshGeneration
+  const { gateway, profile } = context
 
   if (activeGateway() === gateway) {
     $projectTreeLoading.set(true)
   }
 
   try {
-    const res = await gatewayRequestOn<ProjectTreePayload>(gateway, 'projects.tree', {
-      preview_limit: PROJECT_TREE_PREVIEW_LIMIT
-    })
+    const res = await gatewayRequestOn<ProjectTreePayload>(
+      gateway,
+      'projects.tree',
+      projectParams({ preview_limit: PROJECT_TREE_PREVIEW_LIMIT }, profile)
+    )
 
-    if (generation !== projectTreeRefreshGeneration || activeGateway() !== gateway) {
+    if (generation !== projectTreeRefreshGeneration || !stillOnProjectsContext(context)) {
       return
     }
 
     applyProjectTreePayload(res)
     markProjectsRpcSuccess()
   } catch (err) {
-    if (activeGateway() === gateway) {
+    if (generation === projectTreeRefreshGeneration && stillOnProjectsContext(context)) {
       markProjectsRpcFailure(err)
     }
   } finally {
@@ -471,8 +513,7 @@ export async function refreshProjectTree(): Promise<void> {
   }
 
   try {
-    const { gateway } = await activeProjectsContext()
-    await refreshProjectTreeOn(gateway)
+    await refreshProjectTreeOn(await activeProjectsContext())
   } catch {
     // Backend may not be ready; keep the last known tree.
   }
@@ -487,7 +528,7 @@ async function refreshProjectTreeAcrossProfiles(): Promise<void> {
   $projectTreeLoading.set(true)
 
   try {
-    const res = await window.hermesDesktop.api<ProjectTreePayload>({
+    const res = await hermesApi<ProjectTreePayload>({
       path: `/api/profiles/projects/tree?preview_limit=${PROJECT_TREE_PREVIEW_LIMIT}`,
       timeoutMs: PROJECT_TREE_REQUEST_TIMEOUT_MS
     })
@@ -512,11 +553,23 @@ async function refreshProjectTreeAcrossProfiles(): Promise<void> {
 // Fully hydrated lanes (repo -> lane -> session rows) for one project, fetched
 // when the user enters it. Same backend grouping as `projects.tree`, so ids and
 // membership match exactly.
+let projectSessionsRefreshGeneration = 0
+
 export async function fetchProjectSessions(projectId: string): Promise<SidebarProjectTree | null> {
+  const generation = ++projectSessionsRefreshGeneration
+
   try {
-    const res = await gatewayRequest<{ project: SidebarProjectTree | null }>('projects.project_sessions', {
-      project_id: projectId
-    })
+    const context = await activeProjectsContext()
+
+    const res = await gatewayRequestOn<{ project: SidebarProjectTree | null }>(
+      context.gateway,
+      'projects.project_sessions',
+      projectParams({ project_id: projectId }, context.profile)
+    )
+
+    if (generation !== projectSessionsRefreshGeneration || !stillOnProjectsContext(context)) {
+      return null
+    }
 
     return res.project ?? null
   } catch {
@@ -630,22 +683,49 @@ export function resetProjectsForGatewaySwitch(): void {
   $projectTree.set([])
   $projectTreeLoading.set(false)
   $projectsRpcAvailable.set(null)
-  // The scan_repos verdict describes the machine we just left, not the one we
-  // are dialling — a new backend gets a fresh probe.
-  $remoteRepoScanAvailable.set(null)
   $projectScope.set(ALL_PROJECTS)
 }
 
 export async function scanAndRecordRepos(force = false): Promise<void> {
-  // Repo discovery crawls the LOCAL filesystem, so it must never record this
-  // machine's repos into a remote backend's projects.db. A remote backend owns
-  // a disk we cannot reach, so it scans itself: `projects.scan_repos` is the
-  // server-side sibling of `projects.record_repos`.
-  const remote = isDesktopFsRemoteMode()
+  if (isDesktopFsRemoteMode()) {
+    // On a remote backend the desktop can't crawl the host filesystem.
+    // Ask the host to scan its own discovery roots (`projects.discover_repos`
+    // with `scan: true` — added in #81723) so repos with zero Hermes
+    // sessions still surface, then refresh the tree so the sidebar picks up
+    // the merged session-derived + scanned list.
+    try {
+      const context = await activeProjectsContext()
 
-  // Capability absent is a verdict, not a failure: an older backend has no
-  // scan_repos, so stop asking instead of retrying every refresh.
-  if (remote && $remoteRepoScanAvailable.get() === false) {
+      const discovered = await gatewayRequestOn<{
+        repos?: unknown
+        discovery_policy?: unknown
+      }>(context.gateway, 'projects.discover_repos', projectParams({ scan: true }, context.profile))
+
+      // A resolved response must be the discovery shape. Anything else (an
+      // error/`accepted:false` body, or a backend that ignored `scan` and
+      // returned no repo list) means the scan didn't happen — bail out without
+      // touching the tree so the sidebar keeps its last known list instead of
+      // being blanked back to the silent, unpopulated state of #81723.
+      if (discovered?.repos === undefined) {
+        markProjectsRpcFailure(new Error('projects.discover_repos returned no repo list'))
+
+        return
+      }
+
+      // Remote scan succeeded: refresh the tree so the merged session-derived +
+      // scanned list surfaces. Skip if the user moved on — a stale scan must
+      // not publish into the newly focused profile.
+      if (stillOnProjectsContext(context)) {
+        await refreshProjectTreeOn(context)
+      }
+    } catch (err) {
+      // Surface the failure (stale backend, RPC error, gateway drop) instead
+      // of swallowing it: a silent return is exactly the "sidebar goes quiet"
+      // symptom `scan:true` was meant to fix (#81723). Keep the old list and
+      // let the sidebar show the error/absent state.
+      markProjectsRpcFailure(err)
+    }
+
     return
   }
 
@@ -657,9 +737,9 @@ export async function scanAndRecordRepos(force = false): Promise<void> {
     return
   }
 
-  const scan = remote ? undefined : desktopGit()?.scanRepos
+  const scan = desktopGit()?.scanRepos
 
-  if (!remote && !scan) {
+  if (!scan) {
     return
   }
 
@@ -669,9 +749,7 @@ export async function scanAndRecordRepos(force = false): Promise<void> {
 
   try {
     const policy = repoDiscoveryPolicyFromConfig(await getHermesConfig(context.profile))
-    // Namespaced so a local and a remote scan of the same gateway can never
-    // share a dedupe key — they scan different machines.
-    const signature = `${remote ? 'remote:' : 'local:'}${repoDiscoveryPolicySignature(policy)}`
+    const signature = repoDiscoveryPolicySignature(policy)
 
     if (!force && (state.completedSignature === signature || state.runningSignature === signature)) {
       return
@@ -680,24 +758,17 @@ export async function scanAndRecordRepos(force = false): Promise<void> {
     generation = ++state.generation
     state.runningSignature = signature
 
-    if (remote) {
-      scanningGatewayGenerations.set(context.gateway, generation)
-      syncReposScanning()
-
-      // No discovery_policy is sent on purpose. The roots being walked are the
-      // BACKEND's, so the backend resolves its own policy — one resolver owns
-      // it. A disabled policy there returns [] and clears its cache server-side.
-      await gatewayRequestOn(context.gateway, 'projects.scan_repos', {})
-    } else if (!policy.enabled) {
-      await gatewayRequestOn(context.gateway, 'projects.record_repos', {
-        discovery_policy: policy,
-        repos: []
-      })
+    if (!policy.enabled) {
+      await gatewayRequestOn(
+        context.gateway,
+        'projects.record_repos',
+        projectParams({ discovery_policy: policy, repos: [] }, context.profile)
+      )
     } else {
       scanningGatewayGenerations.set(context.gateway, generation)
       syncReposScanning()
 
-      const repos = await scan!(policy.roots, {
+      const repos = await scan(policy.roots, {
         enabled: true,
         excludePaths: policy.exclude_paths
       })
@@ -706,30 +777,27 @@ export async function scanAndRecordRepos(force = false): Promise<void> {
         return
       }
 
-      await gatewayRequestOn(context.gateway, 'projects.record_repos', {
-        discovery_policy: policy,
-        repos
-      })
+      await gatewayRequestOn(
+        context.gateway,
+        'projects.record_repos',
+        projectParams({ discovery_policy: policy, repos }, context.profile)
+      )
     }
 
     if (state.generation !== generation) {
       return
     }
 
-    if (remote) {
-      $remoteRepoScanAvailable.set(true)
-    }
-
     state.completedSignature = signature
-    // Scope-aware on purpose: the scan records into one profile, but folding
-    // its result back in through the active scope keeps an all-profiles tree
-    // from being overwritten by the scanned profile's own.
-    await refreshProjectTree()
-  } catch (err) {
-    if (remote) {
-      markRemoteRepoScanFailure(err)
-    }
 
+    // Completion refresh only when the focused profile still matches the one
+    // the scan was captured under. refreshProjectTree() re-derives the current
+    // context, so skipping on mismatch keeps a stale scan from publishing into
+    // the newly focused profile.
+    if (stillOnProjectsContext(context)) {
+      await refreshProjectTree()
+    }
+  } catch {
     state.completedSignature = undefined
   } finally {
     state.runningSignature = undefined
@@ -856,17 +924,20 @@ export async function createProject(input: CreateProjectInput): Promise<ProjectI
   let res: { project: ProjectInfo | null }
 
   try {
-    res = await gatewayRequest<{ project: ProjectInfo | null }>('projects.create', {
-      name: input.name,
-      folders: input.folders ?? [],
-      primary_path: input.primaryPath,
-      slug: input.slug,
-      description: input.description,
-      icon: input.icon,
-      color: input.color,
-      board_slug: input.boardSlug,
-      use: input.use ?? false
-    })
+    res = await gatewayRequest<{ project: ProjectInfo | null }>(
+      'projects.create',
+      projectParams({
+        name: input.name,
+        folders: input.folders ?? [],
+        primary_path: input.primaryPath,
+        slug: input.slug,
+        description: input.description,
+        icon: input.icon,
+        color: input.color,
+        board_slug: input.boardSlug,
+        use: input.use ?? false
+      })
+    )
   } catch (err) {
     if (isMissingRpcMethod(err)) {
       $projectsRpcAvailable.set(false)
@@ -939,12 +1010,15 @@ export async function updateProject(
   // Backend treats null/undefined as "leave unchanged"; "" clears (stores NULL).
   // Map explicit null → "" so "no color"/"no icon" actually clear.
   await persistOrRollback(snap, () =>
-    gatewayRequest('projects.update', {
-      id,
-      ...patch,
-      ...(patch.color === null && { color: '' }),
-      ...(patch.icon === null && { icon: '' })
-    })
+    gatewayRequest(
+      'projects.update',
+      projectParams({
+        id,
+        ...patch,
+        ...(patch.color === null && { color: '' }),
+        ...(patch.icon === null && { icon: '' })
+      })
+    )
   )
 }
 
@@ -1015,7 +1089,10 @@ export async function addProjectFolder(
   }
 
   await persistOrRollback(snap, () =>
-    gatewayRequest('projects.add_folder', { id, path, label: opts.label, is_primary: opts.isPrimary ?? false })
+    gatewayRequest(
+      'projects.add_folder',
+      projectParams({ id, path, label: opts.label, is_primary: opts.isPrimary ?? false })
+    )
   )
   reconcileProjects()
 }
@@ -1058,13 +1135,13 @@ export async function deleteProject(id: string): Promise<void> {
   }
 
   await persistOrRollback(snap, async () => {
-    applyPayload(await gatewayRequest<ProjectsPayload>('projects.delete', { id }))
+    applyPayload(await gatewayRequest<ProjectsPayload>('projects.delete', projectParams({ id })))
   })
   void refreshProjectTree()
 }
 
 export async function setActiveProject(id: null | string): Promise<void> {
-  const res = await gatewayRequest<{ active_id: null | string }>('projects.set_active', { id })
+  const res = await gatewayRequest<{ active_id: null | string }>('projects.set_active', projectParams({ id }))
   $activeProjectId.set(res.active_id ?? null)
 }
 
@@ -1145,7 +1222,7 @@ export async function startWorkInRepo(
     // backend's /api/git mirror, and an older backend may predate it. The raw
     // failure ("Expected JSON … but got HTML" / a bare 404) reads like a git
     // error — name the real remedy instead of degrading silently.
-    if (isDesktopFsRemoteMode() && isGitEndpointMissingError(err)) {
+    if (isDesktopFsRemoteMode() && isMissingRestEndpoint(err)) {
       throw new Error(translateNow('sidebar.projects.worktreeStaleBackend'))
     }
 

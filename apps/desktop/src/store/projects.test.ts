@@ -3,14 +3,14 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
 import { NO_PROJECT_ID, type SidebarProjectTree } from '@/app/chat/sidebar/projects/workspace-groups'
 import { $sidebarAgentsGrouped, setSidebarAgentsGrouped } from '@/store/layout'
-import { $activeGatewayProfile } from '@/store/profile'
+import { $activeGatewayProfile, setShowAllProfiles } from '@/store/profile'
 import { $currentCwd, $selectedStoredSessionId, $sessions, applyConfiguredDefaultProjectDir } from '@/store/session'
 
 import {
   $activeProjectId,
+  $projects,
   $projectScope,
   $projectsRpcAvailable,
-  $remoteRepoScanAvailable,
   $projectTree,
   $removedSessionIds,
   $sessionMutationsInFlight,
@@ -21,6 +21,7 @@ import {
   endSessionMutation,
   enterProject,
   exitProjectScope,
+  fetchProjectSessions,
   openProjectCreate,
   pickProjectFolder,
   projectIdForCwd,
@@ -28,7 +29,6 @@ import {
   refreshProjects,
   refreshProjectTree,
   refreshWorktrees,
-  resetProjectsForGatewaySwitch,
   resolveNewSessionCwd,
   scanAndRecordRepos,
   startWorkInRepo,
@@ -64,6 +64,7 @@ vi.mock('@/lib/desktop-git', async importOriginal => ({
 vi.mock('@/hermes', () => ({
   getHermesConfig: vi.fn(),
   getProfiles: vi.fn(),
+  hermesApi: vi.fn(),
   setApiRequestProfile: vi.fn(),
   STARTUP_REQUEST_TIMEOUT_MS: 1000
 }))
@@ -84,6 +85,16 @@ const hermes = await import('@/hermes')
 const getHermesConfig = vi.mocked(hermes.getHermesConfig)
 const notifications = await import('@/store/notifications')
 const notify = vi.mocked(notifications.notify)
+
+function deferred<T>() {
+  let resolve!: (value: T) => void
+
+  const promise = new Promise<T>(done => {
+    resolve = done
+  })
+
+  return { promise, resolve }
+}
 
 describe('project scope', () => {
   beforeEach(() => {
@@ -116,6 +127,50 @@ describe('project scope', () => {
   it('persists the scope to localStorage', () => {
     enterProject('p_abc')
     expect(window.localStorage.getItem('hermes.desktop.projectScope')).toBe('p_abc')
+  })
+})
+
+describe('projects RPC profile forwarding', () => {
+  beforeEach(() => {
+    vi.clearAllMocks()
+    $activeGatewayProfile.set('default')
+    $activeProjectId.set(null)
+    $projectTree.set([])
+    setShowAllProfiles(false)
+  })
+
+  it('forwards the normalized active profile to project read RPCs', async () => {
+    const request = vi.fn(async () => ({ active_id: null, projects: [], scoped_session_ids: [] }))
+    const gateway = { connectionState: 'open', request }
+    activeGateway.mockReturnValue(gateway as never)
+    gatewayAtom.set(gateway as never)
+    $activeGatewayProfile.set('  coder  ')
+
+    await refreshProjects()
+    await refreshProjectTree()
+    await fetchProjectSessions('p_123')
+
+    expect(request).toHaveBeenNthCalledWith(1, 'projects.list', { profile: 'coder' })
+    expect(request).toHaveBeenNthCalledWith(2, 'projects.tree', { preview_limit: 3, profile: 'coder' })
+    expect(request).toHaveBeenNthCalledWith(3, 'projects.project_sessions', {
+      profile: 'coder',
+      project_id: 'p_123'
+    })
+  })
+
+  it('skips project reads in the all-profiles view rather than forwarding its sentinel', async () => {
+    const request = vi.fn()
+    const gateway = { connectionState: 'open', request }
+    activeGateway.mockReturnValue(gateway as never)
+    gatewayAtom.set(gateway as never)
+    setShowAllProfiles(true)
+
+    await refreshProjects()
+    await refreshProjectTree()
+    await fetchProjectSessions('p_123')
+
+    expect(request).not.toHaveBeenCalled()
+    setShowAllProfiles(false)
   })
 })
 
@@ -402,6 +457,34 @@ describe('projects RPC capability', () => {
     expect($projectsRpcAvailable.get()).toBe(false)
   })
 
+  it('does not publish a late project list from the previous source', async () => {
+    let resolveA: ((value: unknown) => void) | undefined
+
+    const responseA = new Promise(resolve => {
+      resolveA = resolve
+    })
+
+    const gatewayA = { connectionState: 'open', request: vi.fn(() => responseA) }
+
+    const gatewayB = {
+      connectionState: 'open',
+      request: vi.fn().mockResolvedValue({ active_id: null, projects: [{ id: 'source-b', name: 'Source B' }] })
+    }
+
+    let current = gatewayA
+
+    activeGateway.mockImplementation(() => current as never)
+    const pendingA = refreshProjects()
+
+    current = gatewayB
+    await refreshProjects()
+
+    resolveA?.({ active_id: null, projects: [{ id: 'source-a', name: 'Source A' }] })
+    await pendingA
+
+    expect($projects.get().map(project => project.id)).toEqual(['source-b'])
+  })
+
   it('blocks opening the create dialog once the backend is known stale', () => {
     $projectsRpcAvailable.set(false)
 
@@ -418,7 +501,6 @@ describe('repository discovery policy', () => {
     vi.clearAllMocks()
     $activeGatewayProfile.set('default')
     isDesktopFsRemoteMode.mockReturnValue(false)
-    $remoteRepoScanAvailable.set(null)
   })
 
   function gatewayWith(request: ReturnType<typeof vi.fn>) {
@@ -452,6 +534,7 @@ describe('repository discovery policy', () => {
     expect(scanRepos).not.toHaveBeenCalled()
     expect(request).toHaveBeenCalledWith('projects.record_repos', {
       discovery_policy: { enabled: false, exclude_paths: [], roots: [] },
+      profile: 'default',
       repos: []
     })
   })
@@ -487,122 +570,165 @@ describe('repository discovery policy', () => {
         exclude_paths: ['/work/vendor'],
         roots: ['/work']
       },
+      profile: 'default',
       repos: [{ label: 'repo', root: '/work/repo' }]
     })
   })
 
-  it('never crawls the local filesystem for a remote backend', async () => {
-    // The local crawl reaches only this machine; recording its paths into a
-    // remote projects.db is the bug this whole path exists to avoid.
+  it('does not scan the local filesystem for remote connections but still refreshes the project tree', async () => {
     isDesktopFsRemoteMode.mockReturnValue(true)
+    const scanRepos = vi.fn()
+    desktopGit.mockReturnValue({ scanRepos } as never)
+
     const request = vi.fn(async (method: string) =>
       method === 'projects.tree'
         ? { active_id: null, projects: [], scoped_session_ids: [] }
-        : { accepted: true, repos: [] }
+        : { accepted: false, repos: [] }
     )
 
     gatewayWith(request)
-    const scanRepos = vi.fn()
-    desktopGit.mockReturnValue({ scanRepos } as never)
-    getHermesConfig.mockResolvedValue({
-      desktop: { repo_scan_enabled: true, repo_scan_exclude_paths: [], repo_scan_roots: [] }
-    })
+    $projectTree.set([
+      { id: 'seed', label: 'seed', path: null, repos: [], sessionCount: 0 } satisfies SidebarProjectTree
+    ])
 
     await scanAndRecordRepos(true)
 
     expect(scanRepos).not.toHaveBeenCalled()
-    expect(request).not.toHaveBeenCalledWith('projects.record_repos', expect.anything())
+    expect(getHermesConfig).not.toHaveBeenCalled()
+    // The desktop can't crawl the remote host's filesystem, so it asks the
+    // host to scan its own discovery roots (`projects.discover_repos` with
+    // `scan: true`) — repos with zero Hermes sessions must still surface —
+    // then refreshes the tree to pick up the merged list. Regression for
+    // #81723: the sidebar used to go silent in remote mode and never
+    // refresh again.
+    expect(request).toHaveBeenCalledWith('projects.discover_repos', { profile: 'default', scan: true })
+    expect(request).toHaveBeenCalledWith(
+      'projects.tree',
+      expect.objectContaining({ preview_limit: expect.any(Number), profile: 'default' })
+    )
+    // A successful scan refreshes the tree (here to the empty list the mock
+    // tree returns), so a later discover-repos call replaces it instead of
+    // keeping the stale seed.
+    expect($projectTree.get()).toEqual([])
   })
 
-  it('asks a remote backend to scan its own disk', async () => {
+  it('surfaces a reject from remote discover_repos without clearing the sidebar', async () => {
+    // Backend error (RPC `error` frame) rejects the request — the sidebar must
+    // keep its last known list and flag the failure, not go silently blank.
     isDesktopFsRemoteMode.mockReturnValue(true)
+    desktopGit.mockReturnValue({ scanRepos: vi.fn() } as never)
+
+    const request = vi.fn(async (method: string) => {
+      if (method === 'projects.discover_repos') {
+        throw new Error('discover_repos failed')
+      }
+
+      if (method === 'projects.tree') {
+        return { active_id: null, projects: [], scoped_session_ids: [] }
+      }
+
+      return { accepted: false, repos: [] }
+    })
+
+    gatewayWith(request)
+    $projectTree.set([
+      { id: 'seed', label: 'seed', path: null, repos: [], sessionCount: 0 } satisfies SidebarProjectTree
+    ])
+
+    await scanAndRecordRepos(true)
+
+    // The tree refresh must NOT run against a failed remote scan ...
+    expect(request).not.toHaveBeenCalledWith(
+      'projects.tree',
+      expect.objectContaining({ preview_limit: expect.any(Number) })
+    )
+    // ... the cached tree is preserved ...
+    expect($projectTree.get()).toEqual([{ id: 'seed', label: 'seed', path: null, repos: [], sessionCount: 0 }])
+  })
+
+  it('does not treat an error-shaped discover_repos response as a successful refresh', async () => {
+    // A resolved-but-error-shaped body (`{accepted:false}` / no `repos`) must
+    // be treated as a failure: keep the old list rather than refreshing into
+    // the silent, empty sidebar of #81723.
+    isDesktopFsRemoteMode.mockReturnValue(true)
+    desktopGit.mockReturnValue({ scanRepos: vi.fn() } as never)
+
     const request = vi.fn(async (method: string) =>
-      method === 'projects.tree'
-        ? { active_id: null, projects: [], scoped_session_ids: [] }
-        : { accepted: true, discovery_policy: {}, repos: [{ label: 'vm-repo', root: '/home/hermes/projects/x' }] }
+      method === 'projects.tree' ? { active_id: null, projects: [], scoped_session_ids: [] } : { accepted: false }
     )
 
     gatewayWith(request)
-    desktopGit.mockReturnValue({ scanRepos: vi.fn() } as never)
-    getHermesConfig.mockResolvedValue({
-      desktop: { repo_scan_enabled: true, repo_scan_exclude_paths: [], repo_scan_roots: [] }
-    })
+    $projectTree.set([
+      { id: 'seed', label: 'seed', path: null, repos: [], sessionCount: 0 } satisfies SidebarProjectTree
+    ])
 
     await scanAndRecordRepos(true)
 
-    // No discovery_policy: the backend owns the policy for its own disk.
-    expect(request).toHaveBeenCalledWith('projects.scan_repos', {})
-    expect($remoteRepoScanAvailable.get()).toBe(true)
+    expect(request).not.toHaveBeenCalledWith(
+      'projects.tree',
+      expect.objectContaining({ preview_limit: expect.any(Number) })
+    )
+    expect($projectTree.get()).toEqual([{ id: 'seed', label: 'seed', path: null, repos: [], sessionCount: 0 }])
   })
 
-  it('treats a missing scan_repos as an absent capability, not a retry loop', async () => {
-    isDesktopFsRemoteMode.mockReturnValue(true)
-    const request = vi.fn(async (method: string) => {
-      if (method === 'projects.scan_repos') {
-        throw new Error('unknown method: projects.scan_repos')
-      }
+  it('records repos under the profile the scan started with, not one focused mid-scan', async () => {
+    const { promise: scanResult, resolve: resolveScan } = deferred<Array<{ label: string; root: string }>>()
+    const { promise: scanStarted, resolve: markScanStarted } = deferred<void>()
 
-      return { active_id: null, projects: [], scoped_session_ids: [] }
-    })
+    const request = vi.fn(async (method: string) =>
+      method === 'projects.tree'
+        ? {
+            active_id: null,
+            projects: [{ id: 'p_lured', label: 'Lured', path: null, repos: [], sessionCount: 0 }],
+            scoped_session_ids: []
+          }
+        : { accepted: true, repos: [] }
+    )
 
     gatewayWith(request)
-    desktopGit.mockReturnValue({ scanRepos: vi.fn() } as never)
-    getHermesConfig.mockResolvedValue({
-      desktop: { repo_scan_enabled: true, repo_scan_exclude_paths: [], repo_scan_roots: [] }
+
+    const scanRepos = vi.fn(() => {
+      markScanStarted()
+
+      return scanResult
     })
 
-    await scanAndRecordRepos(true)
-    expect($remoteRepoScanAvailable.get()).toBe(false)
-
-    const callsAfterVerdict = request.mock.calls.filter(([method]) => method === 'projects.scan_repos').length
-
-    // Even a forced rescan must not re-ask a backend that cannot answer.
-    await scanAndRecordRepos(true)
-
-    expect(
-      request.mock.calls.filter(([method]) => method === 'projects.scan_repos').length
-    ).toBe(callsAfterVerdict)
-  })
-
-  it('keeps retrying after a transient remote failure', async () => {
-    // A dropped socket is not a capability verdict — the next refresh retries.
-    isDesktopFsRemoteMode.mockReturnValue(true)
-    const request = vi.fn(async (method: string) => {
-      if (method === 'projects.scan_repos') {
-        throw new Error('connection reset')
+    desktopGit.mockReturnValue({ scanRepos } as never)
+    getHermesConfig.mockResolvedValue({
+      desktop: {
+        repo_scan_enabled: true,
+        repo_scan_exclude_paths: [],
+        repo_scan_roots: ['/work']
       }
-
-      return { active_id: null, projects: [], scoped_session_ids: [] }
     })
+    $activeGatewayProfile.set('launch')
+    $projectTree.set([])
 
-    gatewayWith(request)
-    desktopGit.mockReturnValue({ scanRepos: vi.fn() } as never)
-    getHermesConfig.mockResolvedValue({
-      desktop: { repo_scan_enabled: true, repo_scan_exclude_paths: [], repo_scan_roots: [] }
+    const pending = scanAndRecordRepos()
+    await scanStarted
+    $activeGatewayProfile.set('coder')
+    resolveScan([{ label: 'repo', root: '/work/repo' }])
+    await pending
+
+    expect(request).toHaveBeenCalledWith('projects.record_repos', {
+      discovery_policy: { enabled: true, exclude_paths: [], roots: ['/work'] },
+      profile: 'launch',
+      repos: [{ label: 'repo', root: '/work/repo' }]
     })
-
-    await scanAndRecordRepos(true)
-
-    expect($remoteRepoScanAvailable.get()).not.toBe(false)
-
-    await scanAndRecordRepos(true)
-
-    expect(request.mock.calls.filter(([method]) => method === 'projects.scan_repos').length).toBe(2)
-  })
-
-  it('clears the scan capability verdict on a gateway switch', () => {
-    // The verdict describes one machine; carrying it to the next backend would
-    // permanently disable discovery on a capable one.
-    $remoteRepoScanAvailable.set(false)
-
-    resetProjectsForGatewaySwitch()
-
-    expect($remoteRepoScanAvailable.get()).toBeNull()
+    expect(request).not.toHaveBeenCalledWith('projects.record_repos', expect.objectContaining({ profile: 'coder' }))
+    expect($projectTree.get()).toEqual([])
   })
 })
 
 describe('project tree profile isolation', () => {
-  it('does not publish a late response from the previous profile', async () => {
+  beforeEach(() => {
+    setShowAllProfiles(false)
+    $activeGatewayProfile.set('default')
+    $projects.set([])
+    $projectTree.set([])
+  })
+
+  it('does not publish a late response from the previous gateway', async () => {
     let resolveA: ((value: unknown) => void) | undefined
 
     const responseA = new Promise(resolve => {
@@ -637,6 +763,90 @@ describe('project tree profile isolation', () => {
     await pendingA
 
     expect($projectTree.get().map(project => project.id)).toEqual(['profile-b'])
+  })
+
+  it('does not publish a late projects.list response from the previous profile', async () => {
+    const { promise: defaultResponse, resolve: resolveDefault } = deferred<unknown>()
+
+    const request = vi.fn((_method: string, params: Record<string, unknown>) =>
+      params.profile === 'default'
+        ? defaultResponse
+        : Promise.resolve({
+            active_id: null,
+            projects: [{ id: 'profile-b', label: 'Profile B' }]
+          })
+    )
+
+    const gateway = { connectionState: 'open', request }
+    activeGateway.mockReturnValue(gateway as never)
+    gatewayAtom.set(gateway as never)
+
+    const pendingDefault = refreshProjects()
+    $activeGatewayProfile.set('profile-b')
+    await refreshProjects()
+    resolveDefault({
+      active_id: null,
+      projects: [{ id: 'profile-a', label: 'Profile A' }]
+    })
+    await pendingDefault
+
+    expect($projects.get().map(project => project.id)).toEqual(['profile-b'])
+  })
+
+  it('does not publish a late projects.tree response from the previous profile', async () => {
+    const { promise: defaultResponse, resolve: resolveDefault } = deferred<unknown>()
+
+    const request = vi.fn((_method: string, params: Record<string, unknown>) =>
+      params.profile === 'default'
+        ? defaultResponse
+        : Promise.resolve({
+            active_id: null,
+            projects: [{ id: 'profile-b', label: 'Profile B', path: null, repos: [], sessionCount: 0 }],
+            scoped_session_ids: []
+          })
+    )
+
+    const gateway = { connectionState: 'open', request }
+    activeGateway.mockReturnValue(gateway as never)
+    gatewayAtom.set(gateway as never)
+
+    const pendingDefault = refreshProjectTree()
+    $activeGatewayProfile.set('profile-b')
+    await refreshProjectTree()
+    resolveDefault({
+      active_id: null,
+      projects: [{ id: 'profile-a', label: 'Profile A', path: null, repos: [], sessionCount: 0 }],
+      scoped_session_ids: []
+    })
+    await pendingDefault
+
+    expect($projectTree.get().map(project => project.id)).toEqual(['profile-b'])
+  })
+
+  it('drops a late hydrated-project response from the previous profile', async () => {
+    const { promise: defaultResponse, resolve: resolveDefault } = deferred<unknown>()
+
+    const request = vi.fn((_method: string, params: Record<string, unknown>) =>
+      params.profile === 'default'
+        ? defaultResponse
+        : Promise.resolve({
+            project: { id: 'profile-b', label: 'Profile B', path: null, repos: [], sessionCount: 0 }
+          })
+    )
+
+    const gateway = { connectionState: 'open', request }
+    activeGateway.mockReturnValue(gateway as never)
+    gatewayAtom.set(gateway as never)
+
+    const pendingDefault = fetchProjectSessions('p_123')
+    $activeGatewayProfile.set('profile-b')
+    const profileB = await fetchProjectSessions('p_123')
+    resolveDefault({
+      project: { id: 'profile-a', label: 'Profile A', path: null, repos: [], sessionCount: 0 }
+    })
+
+    expect(profileB?.id).toBe('profile-b')
+    await expect(pendingDefault).resolves.toBeNull()
   })
 })
 
