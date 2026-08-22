@@ -93,14 +93,16 @@ export function setGlobalModel(
 export function getAuxiliaryModels(profile?: null | string): Promise<AuxiliaryModelsResponse> {
   return hermesApi<AuxiliaryModelsResponse>({
     ...profileScoped(profile),
-    path: '/api/model/auxiliary'
+    path: '/api/model/auxiliary',
+    timeoutMs: STARTUP_REQUEST_TIMEOUT_MS
   })
 }
 
 export function getMoaModels(profile?: null | string): Promise<MoaConfigResponse> {
   return hermesApi<MoaConfigResponse>({
     ...profileScoped(profile),
-    path: '/api/model/moa'
+    path: '/api/model/moa',
+    timeoutMs: STARTUP_REQUEST_TIMEOUT_MS
   })
 }
 
