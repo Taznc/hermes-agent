@@ -14,9 +14,11 @@ logger = logging.getLogger(__name__)
 
 _POOL_PROVIDER = "openai-codex"
 _ALLOWED_PATHS: FrozenSet[str] = frozenset({"/responses", "/models"})
-_OWNED_HEADERS: FrozenSet[str] = frozenset(
-    {"User-Agent", "originator", "ChatGPT-Account-ID"}
-)
+_OWNED_HEADERS: FrozenSet[str] = frozenset({
+    "User-Agent",
+    "originator",
+    "ChatGPT-Account-ID",
+})
 
 
 class OpenAICodexAdapter(UpstreamAdapter):
@@ -38,6 +40,10 @@ class OpenAICodexAdapter(UpstreamAdapter):
 
     @property
     def loopback_only(self) -> bool:
+        return True
+
+    @property
+    def requires_client_auth(self) -> bool:
         return True
 
     @property
@@ -137,7 +143,9 @@ class OpenAICodexAdapter(UpstreamAdapter):
         try:
             return load_pool(_POOL_PROVIDER)
         except Exception:
-            logger.warning("proxy: failed to load Codex OAuth credential pool", exc_info=True)
+            logger.warning(
+                "proxy: failed to load Codex OAuth credential pool", exc_info=True
+            )
             return None
 
     def _credential_from_entry(self, entry: PooledCredential) -> UpstreamCredential:
@@ -147,9 +155,11 @@ class OpenAICodexAdapter(UpstreamAdapter):
                 "Codex OAuth pool entry has no access token. Re-authenticate "
                 "with `hermes auth add openai-codex --type oauth`."
             )
-        base_url = str(
-            entry.runtime_base_url or entry.base_url or DEFAULT_CODEX_BASE_URL
-        ).strip().rstrip("/")
+        base_url = (
+            str(entry.runtime_base_url or entry.base_url or DEFAULT_CODEX_BASE_URL)
+            .strip()
+            .rstrip("/")
+        )
         trusted_base = DEFAULT_CODEX_BASE_URL.rstrip("/")
         if base_url != trusted_base:
             raise RuntimeError(
