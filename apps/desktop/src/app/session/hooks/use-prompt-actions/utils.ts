@@ -2,6 +2,7 @@ import type { AppendMessage } from '@assistant-ui/react'
 
 import { translateNow, type Translations } from '@/i18n'
 import type { ChatMessage } from '@/lib/chat-messages'
+import { readDesktopFileDataUrlLocalFirst } from '@/lib/desktop-fs'
 import { type CommandsCatalogLike, filterDesktopCommandsCatalog } from '@/lib/desktop-slash-commands'
 import { isProviderSetupErrorMessage } from '@/lib/provider-setup-errors'
 import type { ComposerAttachment } from '@/store/composer'
@@ -387,7 +388,12 @@ export async function readImageForRemoteAttach(
     }
   }
 
-  const dataUrl = await window.hermesDesktop?.readFileDataUrl(filePath)
+  // readDesktopFileDataUrlLocalFirst, not the raw bridge: it prefers this
+  // machine's disk (picker/clipboard/drop paths) and falls back to the
+  // gateway's /api/fs/read-data-url. The bare bridge call threw
+  // "readFileDataUrl is not a function" in the web build, where the member is
+  // deliberately omitted so the remote read stays in charge.
+  const dataUrl = await readDesktopFileDataUrlLocalFirst(filePath)
   const contentBase64 = dataUrl ? base64FromDataUrl(dataUrl) : ''
 
   return contentBase64 ? { contentBase64, filename: imageFilenameFromPath(filePath) } : null

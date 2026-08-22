@@ -278,6 +278,12 @@ async function readTextPreview(filePath: string) {
 
   // Back-compat for a running Electron process whose preload hasn't been
   // restarted since readFileText was added. readFileDataUrl already existed.
+  // Guarded because the web build's shim omits it — without this the original
+  // (useful) error would be replaced by "readFileDataUrl is not a function".
+  if (!window.hermesDesktop?.readFileDataUrl) {
+    throw new Error('Reading this file is not supported here')
+  }
+
   const dataUrl = await window.hermesDesktop.readFileDataUrl(filePath)
   const [, metadata = '', data = ''] = dataUrl.match(/^data:([^,]*),(.*)$/) || []
   const base64 = metadata.includes(';base64')

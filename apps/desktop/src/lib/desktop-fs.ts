@@ -180,7 +180,27 @@ export async function trashDesktopPath(path: string): Promise<void> {
 }
 
 export async function copyTextToClipboard(text: string): Promise<void> {
-  await bridge().writeClipboard(text)
+  // Ladder, not a hard dependency: the Electron bridge is preferred (its main
+  // process write survives focus loss, which navigator.clipboard does not),
+  // but it is absent in the browser build and in older preloads. Falling back
+  // to the DOM API keeps "Copy path" working instead of throwing
+  // "writeClipboard is not a function". Mirrors writeClipboardText in
+  // components/ui/copy-button.tsx — the two must stay in agreement.
+  const ipc = bridge().writeClipboard
+
+  if (ipc) {
+    await ipc(text)
+
+    return
+  }
+
+  if (navigator.clipboard?.writeText) {
+    await navigator.clipboard.writeText(text)
+
+    return
+  }
+
+  throw new Error('Clipboard is not available')
 }
 
 // Working-tree-vs-HEAD diff for one file. Empty when unchanged / not a repo.

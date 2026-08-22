@@ -5,6 +5,7 @@ import { requestComposerSubmit } from '@/app/chat/composer/focus'
 import { useSessionView } from '@/app/chat/session-view'
 import { useIsDark } from '@/components/assistant-ui/embeds/use-is-dark'
 import { PreviewAttachment } from '@/components/chat/preview-attachment'
+import { readDesktopFileText } from '@/lib/desktop-fs'
 import { localPreviewTarget } from '@/lib/local-preview'
 import { isRemoteGateway } from '@/lib/media'
 
@@ -297,7 +298,12 @@ function InlineHtmlFrame({
 
     let alive = true
 
-    void Promise.resolve(window.hermesDesktop?.readFileText(path))
+    // readDesktopFileText, not the raw bridge: it routes to the gateway's
+    // /api/fs/read-text in remote mode and doesn't exist on the web build's
+    // bridge shim. Calling window.hermesDesktop?.readFileText directly threw
+    // synchronously here ("not a function") — inside an effect that is an
+    // error-boundary crash, not a failed preview.
+    void readDesktopFileText(path)
       .then(result => {
         if (!alive) {
           return

@@ -3,6 +3,7 @@ import { useCallback, useEffect, useState } from 'react'
 import { PageLoader } from '@/components/page-loader'
 import { Badge } from '@/components/ui/badge'
 import { Button } from '@/components/ui/button'
+import { writeClipboardText } from '@/components/ui/copy-button'
 import {
   type ActionResponse,
   type CuratorStatusResponse,
@@ -237,7 +238,10 @@ export function MaintenancePanel() {
                 </span>
                 <Button
                   onClick={() => {
-                    void window.hermesDesktop.writeClipboard(url)
+                    // writeClipboardText ladders bridge → navigator.clipboard;
+                    // the raw bridge call threw in the web build, where
+                    // writeClipboard is deliberately absent.
+                    void writeClipboardText(url)
                     notify({ durationMs: 1500, kind: 'success', message: mm.linkCopied })
                   }}
                   size="xs"
