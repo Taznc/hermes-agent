@@ -27,9 +27,21 @@ interface SpikeApiRequest {
 // HTML by the launcher) and is stashed in sessionStorage so in-app navigation
 // keeps it.
 const BASE_URL = window.location.origin
+// Token delivery: ?token= on first visit, then persisted in localStorage so
+// later visits (any tab, after browser restart) need no query param. Scrub it
+// from the address bar/history once stored. Spike-grade; behind Authelia.
 const tokenFromUrl = new URLSearchParams(window.location.search).get('token')
-if (tokenFromUrl) sessionStorage.setItem('hermes-web-spike-token', tokenFromUrl)
-const TOKEN = tokenFromUrl ?? sessionStorage.getItem('hermes-web-spike-token') ?? ''
+if (tokenFromUrl) {
+  localStorage.setItem('hermes-web-spike-token', tokenFromUrl)
+  const scrubbed = new URL(window.location.href)
+  scrubbed.searchParams.delete('token')
+  window.history.replaceState(null, '', scrubbed)
+}
+const TOKEN =
+  tokenFromUrl ??
+  localStorage.getItem('hermes-web-spike-token') ??
+  sessionStorage.getItem('hermes-web-spike-token') ??
+  ''
 const WS_URL = `${BASE_URL.replace(/^http/, 'ws')}/api/ws${TOKEN ? `?token=${encodeURIComponent(TOKEN)}` : ''}`
 
 const unsub = () => () => {}
