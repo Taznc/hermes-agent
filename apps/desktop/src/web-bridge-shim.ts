@@ -50,6 +50,34 @@ const WS_URL = `${BASE_URL.replace(/^http/, 'ws')}/api/ws${TOKEN ? `?token=${enc
 
 const unsub = () => () => {}
 
+// Composer images: the renderer hands the bridge raw bytes and expects a
+// gateway-visible PATH back (attachments travel to the model as paths, not
+// blobs). A browser can't write to disk, so the honest equivalent is to POST
+// the bytes to the backend's existing chat image-upload route, which stores
+// them under HERMES_HOME/images/ — the same directory clipboard.paste and
+// image.attach already use — and returns the absolute path.
+const IMAGE_MIME_BY_EXT: Record<string, string> = {
+  '.bmp': 'image/bmp',
+  '.gif': 'image/gif',
+  '.jpeg': 'image/jpeg',
+  '.jpg': 'image/jpeg',
+  '.png': 'image/png',
+  '.webp': 'image/webp'
+}
+
+// btoa() needs a binary string; String.fromCharCode(...bytes) blows the call
+// stack on multi-MB screenshots, so fold in fixed-size chunks.
+function bytesToBase64(bytes: Uint8Array): string {
+  let binary = ''
+  const CHUNK = 0x8000
+
+  for (let offset = 0; offset < bytes.length; offset += CHUNK) {
+    binary += String.fromCharCode(...bytes.subarray(offset, offset + CHUNK))
+  }
+
+  return btoa(binary)
+}
+
 function connection(profile?: string | null) {
   return {
     baseUrl: BASE_URL,
@@ -192,6 +220,43 @@ const shim = {
   selectPaths: async () => [] as string[],
   saveImageFromUrl: async (_url: string) => false,
   getPathForFile: (_file: File) => '',
+
+  // ── composer images ──────────────────────────────────────────────────────
+  // Pasted/dropped image bytes → a real path on the gateway host. Called by
+  // use-composer-actions.attachImageBlob with `?.` on the OBJECT, so a missing
+  // method here throws "saveImageBuffer is not a function" and every paste
+  // fails. Non-image extensions (the .html artifact-staging callers in
+  // lib/local-preview.ts and preview-artifact.tsx) have no browser equivalent:
+  // throw a clear error so their existing catch surfaces a real toast rather
+  // than silently handing back a file:// URL this browser can never open.
+  saveImageBuffer: async (data: ArrayBuffer | Uint8Array, ext: string) => {
+    const bytes = data instanceof Uint8Array ? data : new Uint8Array(data)
+    const raw = String(ext || '.png').trim().toLowerCase()
+    const suffix = raw.startsWith('.') ? raw : `.${raw}`
+    const mimeType = IMAGE_MIME_BY_EXT[suffix]
+
+    if (!mimeType) {
+      throw new Error(`Staging ${suffix} files to disk is not supported in the browser build`)
+    }
+
+    const result = await api<{ path?: string }>({
+      path: '/api/chat/image-upload',
+      method: 'POST',
+      body: {
+        data_url: `data:${mimeType};base64,${bytesToBase64(bytes)}`,
+        filename: `pasted${suffix}`
+      }
+    })
+
+    return result?.path ?? ''
+  },
+
+  // The server-side clipboard is the HOST's, not the browser user's, so
+  // reading it would attach the wrong machine's image. The DOM paste event
+  // already delivers real clipboard bytes to attachImageBlob; this only runs
+  // as the composer's empty-paste fallback, where '' means "nothing to
+  // attach" and is passed `{ silent: true }`.
+  saveClipboardImage: async () => '',
   getVersion: async () => {
     // Injected by vite.config.web.ts `define` (real git provenance of the
     // served checkout); absent if an older config serves this file.
@@ -225,6 +290,11 @@ const shim = {
   // openSessionWindow/openWindow, writeClipboard, setActiveWork,
   // setTranslucency, battery, readDir/readFileText (remote mode → /api/fs/*),
   // watchPreviewFile, contextMenu*, oauth*/ssh*/connection-config surfaces.
+  //
+  // readFileDataUrl in particular MUST stay omitted: desktop-fs's
+  // readDesktopFileDataUrlLocalFirst tries the bridge before the gateway, so
+  // defining it would shadow the remote /api/fs/read-data-url read that makes
+  // composer thumbnails work here.
 } as const
 
 ;(window as unknown as { hermesDesktop: unknown }).hermesDesktop = shim
