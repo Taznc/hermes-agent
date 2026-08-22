@@ -126,6 +126,15 @@ const shim = {
   onPreviewFileChanged: unsub,
   notify: async (_payload: unknown) => false,
 
+  // ── recovery/error surfaces ──────────────────────────────────────────────
+  // The boot-failure overlay calls these with `window.hermesDesktop?.method()`
+  // — optional-chained on the OBJECT, not the method — so with a shim object
+  // present they must exist or the error boundary trips on the recovery
+  // surface itself (observed on the dev branch behind Traefik).
+  getRecentLogs: async () => ({ path: '(web spike: no desktop.log)', lines: [] as string[] }),
+  revealLogs: async () => ({ ok: false, path: '', error: 'not available in the web spike' }),
+  reportRendererError: (_report: unknown) => {},
+
   // ── cheap browser natives ────────────────────────────────────────────────
   openExternal: async (url: string) => {
     window.open(url, '_blank', 'noopener,noreferrer')
