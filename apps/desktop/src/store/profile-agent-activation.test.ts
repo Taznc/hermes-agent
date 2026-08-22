@@ -203,14 +203,14 @@ describe('ensureGatewaySessionProfile (source-preserving session-create swap)', 
     getConnectionFor.mockResolvedValue(agentConn())
     await ensureGatewayAgent('hermes-dev', 'claudecode')
     expect($activeGatewayConnection.get()).toBe('hermes-dev')
-    prepareGatewayForAgent.mockClear()
-    prepareGatewayForProfile.mockClear()
+    ensureGatewayForAgent.mockClear()
+    ensureGatewayForProfile.mockClear()
 
     await ensureGatewaySessionProfile('claudecode')
 
     // Re-dials the AGENT door — never the local-pool profile door.
-    expect(prepareGatewayForAgent).toHaveBeenCalledWith('hermes-dev', 'claudecode')
-    expect(prepareGatewayForProfile).not.toHaveBeenCalled()
+    expect(ensureGatewayForAgent).toHaveBeenCalledWith('hermes-dev', 'claudecode')
+    expect(ensureGatewayForProfile).not.toHaveBeenCalled()
     expect($activeGatewayConnection.get()).toBe('hermes-dev')
     expect($activeGatewayProfile.get()).toBe('claudecode')
   })
@@ -218,14 +218,14 @@ describe('ensureGatewaySessionProfile (source-preserving session-create swap)', 
   it('treats a null/empty profile as the active one and stays on the connection', async () => {
     getConnectionFor.mockResolvedValue(agentConn())
     await ensureGatewayAgent('hermes-dev', 'claudecode')
-    prepareGatewayForAgent.mockClear()
-    prepareGatewayForProfile.mockClear()
+    ensureGatewayForAgent.mockClear()
+    ensureGatewayForProfile.mockClear()
 
     await ensureGatewaySessionProfile(null)
     await ensureGatewaySessionProfile('   ')
 
-    expect(prepareGatewayForAgent).toHaveBeenCalledTimes(2)
-    expect(prepareGatewayForProfile).not.toHaveBeenCalled()
+    expect(ensureGatewayForAgent).toHaveBeenCalledTimes(2)
+    expect(ensureGatewayForProfile).not.toHaveBeenCalled()
     expect($activeGatewayConnection.get()).toBe('hermes-dev')
   })
 
@@ -237,19 +237,19 @@ describe('ensureGatewaySessionProfile (source-preserving session-create swap)', 
 
     await ensureGatewaySessionProfile('research')
 
-    expect(prepareGatewayForProfile).toHaveBeenCalledWith('research')
-    expect(prepareGatewayForAgent).not.toHaveBeenCalled()
+    expect(ensureGatewayForProfile).toHaveBeenCalledWith('research')
+    expect(ensureGatewayForAgent).not.toHaveBeenCalled()
   })
 
   it('routes a DIFFERENT profile through the profile door (explicit cross-machine move)', async () => {
     getConnectionFor.mockResolvedValue(agentConn())
     await ensureGatewayAgent('hermes-dev', 'claudecode')
-    prepareGatewayForAgent.mockClear()
+    ensureGatewayForAgent.mockClear()
     getConnection.mockResolvedValue(localConn({ profile: 'other' }))
 
     await ensureGatewaySessionProfile('other')
 
-    expect(prepareGatewayForProfile).toHaveBeenCalledWith('other')
-    expect(prepareGatewayForAgent).not.toHaveBeenCalled()
+    expect(ensureGatewayForProfile).toHaveBeenCalledWith('other')
+    expect(ensureGatewayForAgent).not.toHaveBeenCalled()
   })
 })
