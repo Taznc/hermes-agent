@@ -3,34 +3,35 @@
 // Wraps the real vite.config.ts (function config) and overlays:
 //   - /api proxy (HTTP + WS) to a private loopback `hermes serve`
 //     (HERMES_WEB_SPIKE_BACKEND, default http://127.0.0.1:9219)
-//   - port 5175 so the normal Electron dev flow on 5174 is untouched
+//   - HERMES_WEB_PORT (default 5175) so two checkouts (stable + dev) can run
+//     side by side; the normal Electron dev flow on 5174 is untouched either way
+//   - HERMES_WEB_PUBLIC_HOST: the Traefik-fronted hostname this instance is
+//     served under (vite 8 rejects unknown Host headers — DNS rebinding guard)
 //
 // Run:  npx vite --config vite.config.web.ts
-// Open: http://127.0.0.1:5175/index-web.html?token=<session-token>
-//
-// UNTRACKED SPIKE FILE — not part of the app. Do not commit without review.
+// Open: http://127.0.0.1:<port>/index-web.html?token=<session-token>
 import { defineConfig, mergeConfig, type ConfigEnv, type UserConfig } from 'vite'
 
 import baseConfig from './vite.config'
 
 const BACKEND = process.env.HERMES_WEB_SPIKE_BACKEND ?? 'http://127.0.0.1:9219'
+const PORT = Number(process.env.HERMES_WEB_PORT ?? 5175)
+const PUBLIC_HOST = process.env.HERMES_WEB_PUBLIC_HOST ?? 'hermes-desktop.jashworth.com'
 
 export default defineConfig(async (env: ConfigEnv): Promise<UserConfig> => {
   const resolved = await (typeof baseConfig === 'function' ? baseConfig(env) : baseConfig)
 
   return mergeConfig(resolved, {
     server: {
-      // 0.0.0.0 so the operator can open the spike from another machine on
-      // the LAN. The backend itself stays loopback-only; only this vite
+      // 0.0.0.0 so the Traefik host (and LAN, if UFW admits it) can reach the
+      // instance. The backend itself stays loopback-only; only this vite
       // process is exposed, and every /api call still requires the session
       // token. SPIKE-ONLY tradeoff — a real deployment terminates TLS+auth
       // in front.
       host: '0.0.0.0',
-      port: 5175,
+      port: PORT,
       strictPort: true,
-      // Vite 8 rejects requests whose Host header it doesn't recognize (DNS
-      // rebinding guard). Allow the Traefik-fronted public name.
-      allowedHosts: ['hermes-desktop.jashworth.com'],
+      allowedHosts: [PUBLIC_HOST],
       proxy: {
         '/api': {
           target: BACKEND,
