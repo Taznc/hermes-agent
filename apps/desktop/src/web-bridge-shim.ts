@@ -21,6 +21,10 @@ interface SpikeApiRequest {
   upload?: { bytes: ArrayBuffer | Uint8Array; contentType?: string; filename: string }
 }
 
+// Injected at serve time by vite.config.web.ts `define` — real git provenance
+// of the checkout being served (branch/commit/dirty).
+declare const __HERMES_WEB_BUILD_INFO__: { branch: string; commit: string; dirty: boolean } | undefined
+
 // ── Server wiring ──────────────────────────────────────────────────────────
 // Same-origin: vite dev proxies /api (HTTP + WS) to the private loopback
 // `hermes serve`. Token arrives via ?token= (scraped from the ungated serve's
@@ -147,6 +151,19 @@ const shim = {
   revealLogs: async () => ({ ok: false, path: '', error: 'not available in the web spike' }),
   reportRendererError: (_report: unknown) => {},
 
+  // ── updates namespace ────────────────────────────────────────────────────
+  // Present so startUpdatePoller() (store/updates.ts) runs: it's the only
+  // caller of refreshDesktopVersion(), which populates $desktopVersion — the
+  // input for About and the dev branch's fork-build statusbar marker.
+  // supported:false is the designed "updates don't apply here" answer.
+  updates: {
+    check: async () => ({ supported: false, reason: 'web spike: updates are managed on the server' }),
+    apply: async () => ({ ok: false, error: 'not available in the web spike' }),
+    getBranch: async () => ({ branch: '' }),
+    setBranch: async (_name: string) => ({ branch: '' }),
+    onProgress: unsub
+  },
+
   // ── cheap browser natives ────────────────────────────────────────────────
   openExternal: async (url: string) => {
     window.open(url, '_blank', 'noopener,noreferrer')
@@ -175,13 +192,27 @@ const shim = {
   selectPaths: async () => [] as string[],
   saveImageFromUrl: async (_url: string) => false,
   getPathForFile: (_file: File) => '',
-  getVersion: async () => ({
-    appVersion: 'web-spike',
-    electronVersion: '',
-    nodeVersion: '',
-    platform: 'web',
-    hermesRoot: ''
-  }),
+  getVersion: async () => {
+    // Injected by vite.config.web.ts `define` (real git provenance of the
+    // served checkout); absent if an older config serves this file.
+    const info =
+      typeof __HERMES_WEB_BUILD_INFO__ !== 'undefined'
+        ? __HERMES_WEB_BUILD_INFO__
+        : { branch: '', commit: '', dirty: false }
+
+    return {
+      appVersion: 'web-spike',
+      electronVersion: '',
+      nodeVersion: '',
+      platform: 'web',
+      hermesRoot: '',
+      // Fork-build marker inputs (dev branch feature; harmless extras on main).
+      buildSource: 'local',
+      buildBranch: info.branch,
+      buildCommit: info.commit,
+      buildDirty: info.dirty
+    }
+  },
 
   // Module-init platform facts — force the browser answer, not the UA sniff.
   glassSupported: false,
