@@ -537,7 +537,7 @@ Run a local OpenAI-compatible HTTP server that forwards requests to an OAuth-aut
 
 | Subcommand | Description |
 |------------|-------------|
-| `start` | Run the proxy in the foreground. Flags: `--provider <codex\|nous\|xai>` (default `nous`), `--host <addr>` (default `127.0.0.1`), `--port <int>` (default `8645`), `--auth-token-file <path>` (required for Codex; owner-only regular file, mode `0600` on POSIX). Codex refuses non-loopback binds. |
+| `start` | Run the proxy in the foreground. Flags: `--provider <codex\|nous\|xai>` (default `nous`), `--host <addr>` (default `127.0.0.1`), `--port <int>` (default `8645`), `--auth-token-file <path>` (required for Codex; owner-only regular file, mode `0600` on POSIX or a current-user/SYSTEM-only DACL on Windows). Codex refuses non-loopback binds. |
 | `status` | Show which proxy upstreams are ready (credentials present, OAuth valid). |
 | `providers` | List available proxy upstream providers. |
 

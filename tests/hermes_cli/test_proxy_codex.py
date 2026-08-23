@@ -4,14 +4,19 @@ import asyncio
 import base64
 import json
 import os
+import sys
 import threading
 import time
+from pathlib import Path
 from types import SimpleNamespace
+from typing import cast
 from unittest.mock import MagicMock, patch
 
 import pytest
 
+from hermes_cli.proxy import cli as proxy_cli
 from hermes_cli.proxy.adapters import ADAPTERS, get_adapter
+from hermes_cli.proxy.adapters.base import UpstreamCredential
 from hermes_cli.proxy.adapters.codex import OpenAICodexAdapter
 from hermes_cli.proxy.cli import _read_client_auth_token, cmd_proxy_start
 from hermes_cli.proxy.server import create_app, is_loopback_host, run_server
@@ -83,7 +88,9 @@ def test_codex_cli_requires_owner_only_client_auth_file(tmp_path, capsys):
 
     token_file = tmp_path / "proxy-token"
     token_file.write_text("owner-client-secret\n", encoding="utf-8")
-    if os.name != "nt":
+    if os.name == "nt":
+        _set_windows_client_auth_acl(token_file, allow_everyone=False)
+    else:
         token_file.chmod(0o644)
         with pytest.raises(ValueError, match="owner-only"):
             _read_client_auth_token(str(token_file))
@@ -92,10 +99,100 @@ def test_codex_cli_requires_owner_only_client_auth_file(tmp_path, capsys):
     assert _read_client_auth_token(str(token_file)) == "owner-client-secret"
 
 
+def test_windows_client_auth_acl_policy_rejects_other_owners_and_allowed_sids():
+    allowed = {"S-1-5-18", "S-1-5-21-owner"}
+
+    with pytest.raises(ValueError, match="wrong owner"):
+        proxy_cli._validate_windows_owner_only_acl(
+            owner_sid="S-1-5-21-other",
+            allowed_sids=allowed,
+            allowed_aces=[],
+        )
+
+    with pytest.raises(ValueError, match="permissive DACL"):
+        proxy_cli._validate_windows_owner_only_acl(
+            owner_sid="S-1-5-21-owner",
+            allowed_sids=allowed,
+            allowed_aces=[(0x1, "S-1-1-0")],
+        )
+
+    proxy_cli._validate_windows_owner_only_acl(
+        owner_sid="S-1-5-21-owner",
+        allowed_sids=allowed,
+        allowed_aces=[(0x1, "S-1-5-21-owner"), (0x1, "S-1-5-18")],
+    )
+
+
+def _set_windows_client_auth_acl(path: Path, *, allow_everyone: bool) -> None:
+    if sys.platform != "win32":
+        raise RuntimeError("Windows ACL fixtures require native Windows.")
+
+    import ntsecuritycon
+    import win32api
+    import win32con
+    import win32security
+
+    token = win32security.OpenProcessToken(
+        win32api.GetCurrentProcess(), win32con.TOKEN_QUERY
+    )
+    owner = win32security.GetTokenInformation(token, win32security.TokenUser)[0]
+    system = win32security.ConvertStringSidToSid("S-1-5-18")
+    acl = win32security.ACL()
+    for sid in (owner, system):
+        acl.AddAccessAllowedAceEx(
+            win32security.ACL_REVISION,
+            0,
+            ntsecuritycon.FILE_ALL_ACCESS,
+            sid,
+        )
+    if allow_everyone:
+        everyone = win32security.ConvertStringSidToSid("S-1-1-0")
+        acl.AddAccessAllowedAceEx(
+            win32security.ACL_REVISION,
+            0,
+            ntsecuritycon.FILE_GENERIC_READ,
+            everyone,
+        )
+    descriptor = win32security.SECURITY_DESCRIPTOR()
+    descriptor.SetSecurityDescriptorOwner(owner, False)
+    descriptor.SetSecurityDescriptorDacl(True, acl, False)
+    descriptor.SetSecurityDescriptorControl(
+        win32security.SE_DACL_PROTECTED,
+        win32security.SE_DACL_PROTECTED,
+    )
+    win32security.SetFileSecurity(
+        str(path),
+        win32security.OWNER_SECURITY_INFORMATION
+        | win32security.DACL_SECURITY_INFORMATION,
+        descriptor,
+    )
+
+
+@pytest.mark.windows_only
+def test_windows_client_auth_file_rejects_broadly_readable_dacl(tmp_path):
+    token_file = tmp_path / "proxy-token-broad"
+    token_file.write_text("owner-client-secret\n", encoding="utf-8")
+    _set_windows_client_auth_acl(token_file, allow_everyone=True)
+
+    with pytest.raises(ValueError, match="permissive DACL"):
+        _read_client_auth_token(str(token_file))
+
+
+@pytest.mark.windows_only
+def test_windows_client_auth_file_accepts_current_user_and_system_only(tmp_path):
+    token_file = tmp_path / "proxy-token-private"
+    token_file.write_text("owner-client-secret\n", encoding="utf-8")
+    _set_windows_client_auth_acl(token_file, allow_everyone=False)
+
+    assert _read_client_auth_token(str(token_file)) == "owner-client-secret"
+
+
 def test_codex_cli_passes_client_authority_without_logging_it(tmp_path, capsys):
     token_file = tmp_path / "proxy-token"
     token_file.write_text("owner-client-secret\n", encoding="utf-8")
-    if os.name != "nt":
+    if os.name == "nt":
+        _set_windows_client_auth_acl(token_file, allow_everyone=False)
+    else:
         token_file.chmod(0o600)
 
     adapter = OpenAICodexAdapter()
@@ -130,21 +227,27 @@ def test_codex_cli_passes_client_authority_without_logging_it(tmp_path, capsys):
 def test_client_auth_file_rejects_symlink_and_empty_file(tmp_path):
     empty = tmp_path / "empty-token"
     empty.write_text("\n", encoding="utf-8")
-    if os.name != "nt":
+    if os.name == "nt":
+        _set_windows_client_auth_acl(empty, allow_everyone=False)
+    else:
         empty.chmod(0o600)
     with pytest.raises(ValueError, match="empty"):
         _read_client_auth_token(str(empty))
 
     multiline = tmp_path / "multiline-token"
     multiline.write_text("first\nsecond\n", encoding="utf-8")
-    if os.name != "nt":
+    if os.name == "nt":
+        _set_windows_client_auth_acl(multiline, allow_everyone=False)
+    else:
         multiline.chmod(0o600)
     with pytest.raises(ValueError, match="without whitespace"):
         _read_client_auth_token(str(multiline))
 
     target = tmp_path / "real-token"
     target.write_text("secret", encoding="utf-8")
-    if os.name != "nt":
+    if os.name == "nt":
+        _set_windows_client_auth_acl(target, allow_everyone=False)
+    else:
         target.chmod(0o600)
     link = tmp_path / "token-link"
     try:
@@ -219,7 +322,10 @@ def test_codex_adapter_rejects_untrusted_upstream_before_returning_bearer():
 
 def test_codex_owned_account_header_survives_missing_jwt_claim_as_owned_only():
     adapter = OpenAICodexAdapter()
-    credential = SimpleNamespace(bearer="malformed-token")
+    credential = cast(
+        UpstreamCredential,
+        SimpleNamespace(bearer="malformed-token"),
+    )
     headers = adapter.get_upstream_headers(credential)
     assert "ChatGPT-Account-ID" not in headers
     assert "ChatGPT-Account-ID" in adapter.get_owned_upstream_header_names()
@@ -251,7 +357,10 @@ def test_codex_adapter_reuses_concurrently_refreshed_current_credential():
     pool.select.return_value = refreshed
     adapter = OpenAICodexAdapter()
     adapter._pool = pool
-    failed = SimpleNamespace(bearer=_jwt_with_account("old-token"))
+    failed = cast(
+        UpstreamCredential,
+        SimpleNamespace(bearer=_jwt_with_account("old-token")),
+    )
 
     first = adapter.get_retry_credential(
         failed_credential=failed,
@@ -288,7 +397,10 @@ def test_codex_adapter_concurrent_401_refresh_is_serialized():
     pool.try_refresh_matching.side_effect = refresh
     adapter = OpenAICodexAdapter()
     adapter._pool = pool
-    failed = SimpleNamespace(bearer=_jwt_with_account("failed"))
+    failed = cast(
+        UpstreamCredential,
+        SimpleNamespace(bearer=_jwt_with_account("failed")),
+    )
     results = []
 
     def worker():

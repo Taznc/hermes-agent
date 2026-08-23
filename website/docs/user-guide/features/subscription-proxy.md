@@ -97,6 +97,10 @@ On POSIX systems the token file must be owned by the current user and have mode
 `0600`; symlinks are rejected. Keep its contents out of logs, command arguments,
 and source-controlled configuration.
 
+On Windows the file owner must be the current user (or SYSTEM), and its DACL may
+grant access only to that user and SYSTEM. Inherited or explicit allow entries
+for principals such as `Everyone` or `BUILTIN\\Users` are rejected.
+
 Codex forwards only `/v1/responses` and `/v1/models`. The adapter attaches the
 native Codex `originator`, `User-Agent`, and JWT-derived
 `ChatGPT-Account-ID` headers after stripping client-supplied values, so a

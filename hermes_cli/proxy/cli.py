@@ -24,6 +24,73 @@ logger = logging.getLogger(__name__)
 _MAX_CLIENT_AUTH_TOKEN_CHARS = 4096
 
 
+def _validate_windows_owner_only_acl(
+    *,
+    owner_sid: str,
+    allowed_sids: set[str],
+    allowed_aces: list[tuple[int, str]],
+) -> None:
+    """Reject Windows file ACLs that grant authority beyond owner and SYSTEM."""
+    if owner_sid not in allowed_sids:
+        raise ValueError("Proxy auth token file has the wrong owner on Windows.")
+    for mask, sid in allowed_aces:
+        if mask and sid not in allowed_sids:
+            raise ValueError("Proxy auth token file has a permissive DACL on Windows.")
+
+
+def _verify_windows_owner_only_descriptor(descriptor: int) -> None:
+    """Verify the opened Windows token file's owner and DACL via pywin32."""
+    if sys.platform != "win32":
+        raise RuntimeError("Windows token-file ACL verification requires Windows.")
+
+    import msvcrt
+
+    import win32api
+    import win32con
+    import win32security
+
+    process_token = win32security.OpenProcessToken(
+        win32api.GetCurrentProcess(), win32con.TOKEN_QUERY
+    )
+    current_sid = win32security.GetTokenInformation(
+        process_token, win32security.TokenUser
+    )[0]
+    system_sid = win32security.ConvertStringSidToSid("S-1-5-18")
+    allowed_sids = {
+        win32security.ConvertSidToStringSid(current_sid),
+        win32security.ConvertSidToStringSid(system_sid),
+    }
+
+    handle = msvcrt.get_osfhandle(descriptor)
+    info = (
+        win32security.OWNER_SECURITY_INFORMATION
+        | win32security.DACL_SECURITY_INFORMATION
+    )
+    security = win32security.GetSecurityInfo(handle, win32security.SE_FILE_OBJECT, info)
+    owner = security.GetSecurityDescriptorOwner()
+    owner_sid = win32security.ConvertSidToStringSid(owner)
+    dacl = security.GetSecurityDescriptorDacl()
+    if dacl is None:
+        raise ValueError("Proxy auth token file has a null DACL on Windows.")
+
+    allow_types = {
+        win32security.ACCESS_ALLOWED_ACE_TYPE,
+        win32security.ACCESS_ALLOWED_OBJECT_ACE_TYPE,
+        getattr(win32security, "ACCESS_ALLOWED_CALLBACK_ACE_TYPE", 9),
+        getattr(win32security, "ACCESS_ALLOWED_CALLBACK_OBJECT_ACE_TYPE", 11),
+    }
+    allowed_aces: list[tuple[int, str]] = []
+    for index in range(dacl.GetAceCount()):
+        ace = dacl.GetAce(index)
+        if ace[0][0] in allow_types:
+            allowed_aces.append((ace[1], win32security.ConvertSidToStringSid(ace[-1])))
+    _validate_windows_owner_only_acl(
+        owner_sid=owner_sid,
+        allowed_sids=allowed_sids,
+        allowed_aces=allowed_aces,
+    )
+
+
 def _read_client_auth_token(path: str) -> str:
     """Read a bounded token from an owner-only regular file."""
     token_path = Path(path).expanduser()
@@ -58,7 +125,9 @@ def _read_client_auth_token(path: str) -> str:
             metadata.st_ino,
         ):
             raise ValueError("Proxy auth token file changed while it was opened.")
-        if os.name != "nt":
+        if os.name == "nt":
+            _verify_windows_owner_only_descriptor(descriptor)
+        else:
             if opened.st_mode & 0o077:
                 raise ValueError(
                     "Proxy auth token file must be owner-only (mode 0600)."

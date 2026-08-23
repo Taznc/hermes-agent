@@ -7,7 +7,7 @@ import json
 import threading
 from pathlib import Path
 from types import SimpleNamespace
-from typing import Any, Dict
+from typing import Any, Dict, cast
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -455,7 +455,7 @@ def test_prepare_failure_releases_upstream_response_and_session():
     upstream.status = 200
     upstream.headers = {}
     session = SimpleNamespace(close=AsyncMock())
-    request = SimpleNamespace(transport=None)
+    request = cast(web.Request, SimpleNamespace(transport=None))
 
     with patch.object(
         web.StreamResponse,
