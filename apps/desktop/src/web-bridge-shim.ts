@@ -119,7 +119,7 @@ async function api<T>(request: SpikeApiRequest): Promise<T> {
     const bytes = request.upload.bytes instanceof Uint8Array ? request.upload.bytes : new Uint8Array(request.upload.bytes)
     form.append(
       'file',
-      new Blob([bytes], { type: request.upload.contentType ?? 'application/octet-stream' }),
+      new Blob([Uint8Array.from(bytes)], { type: request.upload.contentType ?? 'application/octet-stream' }),
       request.upload.filename
     )
     body = form
