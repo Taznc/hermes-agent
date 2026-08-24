@@ -443,7 +443,12 @@ interface ProjectTreePayload {
   scoped_session_ids: string[]
 }
 
-const PROJECT_TREE_PREVIEW_LIMIT = 3
+// Keep in sync with PROJECT_PREVIEW_COUNT (app/chat/sidebar/projects/model.ts)
+// — that's the renderer's slice of these same preview sessions, so raising one
+// without the other just truncates one level earlier and silently hides rows
+// again. Not imported directly: model.ts already imports from this module
+// (via $worktreeRefreshToken), so importing back would create a cycle.
+const PROJECT_TREE_PREVIEW_LIMIT = 8
 // The all-profiles fan-out reads one database per profile, so it is allowed the
 // same headroom as the cross-profile session list rather than the interactive
 // default.
