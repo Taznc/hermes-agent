@@ -572,17 +572,9 @@ def _apply_profile_override() -> None:
     # 1. Check for explicit -p / --profile flag. Historically this worked even
     # after the subcommand (`hermes chat -p coder`), so keep scanning broadly.
     # The exception is command-argv passthrough regions such as `mcp add --args`.
-    value_flags = {
-        "-z", "--oneshot",
-        "-m", "--model",
-        "--provider",
-        "-t", "--toolsets",
-        "-r", "--resume",
-        "-s", "--skills",
-        "--usage-file",
-        "--in",
-    }
-    optional_value_flags = {"-c", "--continue"}
+    from hermes_cli._parser import top_level_value_flag_sets
+
+    value_flags, optional_value_flags = top_level_value_flag_sets()
     i = 0
     while i < len(argv):
         arg = argv[i]
@@ -1998,7 +1990,24 @@ def _print_tui_exit_summary(
     )
 
 
-_NPM_LOCK_RUNTIME_KEYS = frozenset({"ideallyInert", "peer"})
+_NPM_LOCK_RUNTIME_KEYS = frozenset(
+    {
+        "ideallyInert",
+        "peer",
+        # npm writes these boolean annotation fields non-deterministically
+        # between the declarative package-lock.json and the hidden actualized
+        # .package-lock.json.  The intersection comparison (see
+        # _tui_need_npm_install) already handles the "field present in root
+        # but absent in hidden" case for structured fields like version,
+        # dependencies, license, etc.  These boolean flags need explicit
+        # exclusion because when present in *both* lockfiles they may still
+        # differ (e.g. dev: true → stripped in hidden).
+        "dev",
+        "extraneous",
+        "hasInstallScript",
+        "optional",
+    }
+)
 """Lockfile fields npm writes non-deterministically at install time.
 
 ``ideallyInert`` is npm's runtime annotation for packages it skipped installing
@@ -2008,6 +2017,14 @@ on dev-dependencies that are *also* declared as peers — the canonical
 it.  Neither key represents a real skew between what was declared and what was
 installed, so we exclude them from the comparison in :func:`_tui_need_npm_install`
 to avoid false-positive reinstalls on every launch.
+
+``dev``, ``optional``, ``extraneous``, and ``hasInstallScript`` are boolean
+annotations that npm populates differently in the hidden lock (npm >= 10/11
+writes ``extraneous`` into the hidden lock only, and ``dev: true`` from the
+root lock may be absent or ``false`` in the hidden actualized tree).
+They never indicate a changed dependency — the authoritative check is the
+``resolved``/``integrity`` pair, which the intersection comparison always
+catches.
 """
 
 
@@ -2064,6 +2081,108 @@ def _termux_workspace_install_context(
     return ws_root, tuple(workspace_args)
 
 
+def _npm_lock_workspace_closure(packages: dict, starts) -> Optional[set]:
+    """Package-map keys reachable from the selected workspaces via npm resolution.
+
+    *starts* is the set of workspace keys the launch install explicitly scopes
+    to (a single str is accepted for convenience).  ``devDependencies`` are
+    followed for **each** of those workspaces, since ``npm install`` installs
+    the dev toolchain for every workspace it selects.  Returns ``None`` when
+    none of *starts* are present in *packages* so callers fall back to the
+    full-lockfile comparison.
+
+    The launch install is scoped with ``npm install --workspace ui-tui`` (see
+    ``_make_tui_argv``), so only the ui-tui workspace's dependency closure is
+    written to the hidden ``.package-lock.json``.  On Termux it additionally
+    selects ui-tui's child ``packages/*`` workspaces, so their devDependencies
+    join the closure too.  The shared root ``package-lock.json`` additionally
+    lists every *other* workspace's deps (``apps/desktop``, ``web``, …);
+    comparing the two in full reports those unrelated packages as "missing" and
+    reinstalls on every launch (#66978).
+
+    Keys follow npm's v3 ``packages`` map (``""`` root, ``ui-tui`` /
+    ``apps/desktop`` workspace members, ``node_modules/<name>`` hoisted deps,
+    ``<dir>/node_modules/<name>`` nested deps).  Dependency names resolve to a
+    key by walking up ``node_modules`` ancestors, mirroring node resolution, and
+    workspace symlinks (``link: true``) are followed to their real entry so a
+    linked workspace's own deps join the closure.
+    """
+    start_set = {starts} if isinstance(starts, str) else {s for s in starts if s}
+    present = [s for s in start_set if s in packages]
+    if not present:
+        return None
+
+    def resolve(from_key: str, dep: str) -> Optional[str]:
+        base = from_key
+        while True:
+            prefix = f"{base}/" if base else ""
+            candidate = f"{prefix}node_modules/{dep}"
+            if candidate in packages:
+                return candidate
+            if not base:
+                return None
+            base = base.rsplit("/", 1)[0] if "/" in base else ""
+
+    seen: set = set()
+    stack = list(present)
+    while stack:
+        key = stack.pop()
+        if key in seen:
+            continue
+        seen.add(key)
+        entry = packages.get(key)
+        if not isinstance(entry, dict):
+            continue
+        # Workspace symlink (e.g. node_modules/@hermes/ink → ui-tui/packages/…):
+        # follow to the real package entry so its dependencies join the closure.
+        resolved = entry.get("resolved")
+        if entry.get("link") and isinstance(resolved, str) and resolved in packages:
+            stack.append(resolved)
+        # devDependencies are installed for each explicitly-selected workspace
+        # (its build toolchain), but not for transitive deps.
+        fields = ["dependencies", "optionalDependencies", "peerDependencies"]
+        if key in start_set:
+            fields.append("devDependencies")
+        for field in fields:
+            deps = entry.get(field)
+            if not isinstance(deps, dict):
+                continue
+            for dep in deps:
+                target = resolve(key, dep)
+                if target is not None:
+                    stack.append(target)
+    return seen
+
+
+def _tui_selected_workspace_keys(tui_dir: Path, ws_root: Path) -> set:
+    """Lock-map keys for the workspaces the launch install scopes to.
+
+    Mirrors ``_make_tui_argv``: always the ui-tui workspace, plus its child
+    ``packages/*`` workspaces on Termux (where ``include_child_workspaces=True``
+    in ``_termux_workspace_install_context``).  ``npm install`` installs the
+    devDependencies of every workspace it selects, so the freshness closure must
+    treat each as a dev-included root — otherwise a devDependency unique to a
+    selected child is dropped from the closure and a genuine missing package
+    slips past the check.  Returns an empty set when ui-tui can't be located
+    under *ws_root*, so the caller falls back to the full comparison.
+    """
+    try:
+        primary = tui_dir.relative_to(ws_root).as_posix()
+    except ValueError:
+        return set()
+    keys = {primary}
+    if _is_termux_startup_environment():
+        packages_dir = tui_dir / "packages"
+        if packages_dir.is_dir():
+            for child in sorted(packages_dir.iterdir()):
+                if child.is_dir() and (child / "package.json").is_file():
+                    try:
+                        keys.add(child.relative_to(ws_root).as_posix())
+                    except ValueError:
+                        continue
+    return keys
+
+
 def _tui_need_npm_install(root: Path) -> bool:
     """True when @hermes/ink is missing or node_modules is behind package-lock.json.
 
@@ -2087,8 +2206,13 @@ def _tui_need_npm_install(root: Path) -> bool:
     For each entry in the root lock's ``packages`` map:
       - missing from hidden lock → reinstall (unless the entry is marked
         ``optional`` or ``peer``, which npm may intentionally skip per platform)
-      - present but with differing fields (excluding npm-written runtime
-        annotations like ``ideallyInert``) → reinstall
+      - present in both → compare only the **intersection** of fields (after
+        stripping ``_NPM_LOCK_RUNTIME_KEYS``).  npm's hidden lock
+        intentionally omits many metadata fields (version, license, engines,
+        dependencies, funding, etc.) — those one-side-only fields are normal
+        npm artefacts, not real skew.  A real version/dependency change will
+        change ``resolved``/``integrity``, which are present in both locks
+        and will be caught by the intersection comparison.
 
     Extra entries that exist only in the hidden lock are ignored — stale
     transitives left over from a removed dependency don't break runtime and
@@ -2122,23 +2246,66 @@ def _tui_need_npm_install(root: Path) -> bool:
     except (OSError, UnicodeDecodeError, json.JSONDecodeError):
         return lock.stat().st_mtime > marker.stat().st_mtime
 
-    def comparable(pkg: dict) -> dict:
-        return {k: v for k, v in pkg.items() if k not in _NPM_LOCK_RUNTIME_KEYS}
+    def entries_differ(pkg: dict, installed_pkg: dict) -> bool:
+        # Only compare keys present in *both* lockfiles with non-null values.
+        # npm's hidden .package-lock.json intentionally omits many metadata
+        # fields the root lock records (version, dependencies, license,
+        # engines, bin, ...), and npm >= 10/11 writes a further *reduced*
+        # hidden lockfile that stores some of them as null.  Missing- or
+        # null-on-one-side is a normal npm artefact, not a real skew.  The
+        # authoritative fields "resolved" and "integrity" are present in both
+        # locks for installed packages, so a genuinely stale install (root
+        # lockfile bumped while node_modules is behind) still differs on them.
+        a = {k: v for k, v in pkg.items() if k not in _NPM_LOCK_RUNTIME_KEYS}
+        b = {
+            k: v
+            for k, v in installed_pkg.items()
+            if k not in _NPM_LOCK_RUNTIME_KEYS
+        }
+        for k in a.keys() & b.keys():
+            if a[k] is None or b[k] is None:
+                continue
+            if a[k] != b[k]:
+                return True
+        return False
+
+    # In a shared workspace checkout the launch install is scoped to the ui-tui
+    # workspace (plus its child packages/* workspaces on Termux), so only that
+    # dependency closure lands in the hidden lock.  Limit the comparison to the
+    # same selected-workspace closure so unrelated workspace deps (apps/desktop,
+    # web, …) don't force a reinstall every launch (#66978).  Standalone /
+    # own-lockfile layouts (ws_root == root) do a full install, so keep the full
+    # comparison; a missing/unlocatable workspace falls back to it too.
+    closure: Optional[set] = None
+    if ws_root != root:
+        selected = _tui_selected_workspace_keys(root, ws_root)
+        if selected:
+            closure = _npm_lock_workspace_closure(wanted, selected)
 
     for name, pkg in wanted.items():
         if not name:
+            continue
+
+        if closure is not None and name not in closure:
             continue
 
         if not isinstance(pkg, dict):
             continue
 
         if name not in installed:
-            if pkg.get("optional") or pkg.get("peer"):
+            # Workspace link entries (`"link": true`, paths outside
+            # node_modules/ like `apps/desktop`, `node_modules/web`) are never
+            # materialized by a partial `npm install --workspace ui-tui` —
+            # they're deliberately skipped (see #38772) and would otherwise
+            # force a reinstall on every launch.
+            if pkg.get("optional") or pkg.get("peer") or pkg.get("link"):
+                continue
+            if not name.startswith("node_modules/"):
                 continue
             return True
 
-        if isinstance(installed[name], dict) and comparable(pkg) != comparable(
-            installed[name]
+        if isinstance(installed[name], dict) and entries_differ(
+            pkg, installed[name]
         ):
             return True
 
@@ -3579,7 +3746,13 @@ def cmd_model(args):
             print("  Cleared model picker cache.")
         except Exception:
             pass
-    select_provider_and_model(args=args)
+    from hermes_cli.setup import run_setup_action_with_navigation
+
+    run_setup_action_with_navigation(
+        "Model & Provider",
+        lambda: select_provider_and_model(args=args),
+        cancelled_message="No change.",
+    )
 
 
 def _is_profile_api_key_provider(provider_id: str) -> bool:
@@ -4098,7 +4271,6 @@ def _clear_stale_openai_base_url():
 _AUX_TASKS: list[tuple[str, str, str]] = [
     ("vision", "Vision", "image/screenshot analysis"),
     ("compression", "Compression", "context summarization"),
-    ("web_extract", "Web extract", "web page summarization"),
     ("approval", "Approval", "smart command approval"),
     ("mcp", "MCP", "MCP tool reasoning"),
     ("title_generation", "Title generation", "session titles"),
@@ -4884,6 +5056,7 @@ _LAZY_COMMAND_EXPORTS = {
         "_capture_active_lazy_features",
         "_capture_active_tool_dependencies",
         "_capture_head_sha",
+        "_classify_concurrent_instance",
         "_assess_parked_branch_switch",
         "_branch_head_label",
         "_branch_head_suffix",
@@ -4903,6 +5076,8 @@ _LAZY_COMMAND_EXPORTS = {
         "_ensure_fhs_path_guard",
         "_ensure_uv_for_termux",
         "_finish_dashboard_update_cleanup",
+        "_fleet_probe_expected_runtimes",
+        "_filter_non_gateway_concurrent_instances",
         "_for_each_systemd_gateway_unit",
         "_format_concurrent_instances_message",
         "_format_time_ago",
@@ -7769,26 +7944,29 @@ def _detect_linux_password_store() -> str | None:
     return None
 
 
-def _desktop_launch_options() -> tuple[list[str], str, str]:
+def _desktop_launch_options() -> tuple[list[str], str, str, str]:
     """Read `desktop.*` launch options from config.yaml.
 
-    Returns ``(electron_flags, disable_gpu, password_store)`` where
+    Returns ``(electron_flags, disable_gpu, password_store, ozone_hint)`` where
     ``electron_flags`` is a list of extra Electron CLI flags, ``disable_gpu``
     is one of "auto"/"1"/"0" (normalized for the HERMES_DESKTOP_DISABLE_GPU
-    env var the Electron app reads), and ``password_store`` is "auto" or one
+    env var the Electron app reads), ``password_store`` is "auto" or one
     of the Chromium password-store backends (unknown values normalize to
-    "auto"). Best-effort: any config error yields the safe defaults
-    ``([], "auto", "auto")`` so a malformed config never blocks the launch.
+    "auto"), and ``ozone_hint`` is one of "auto"/"x11"/"wayland" (normalized
+    for ``ELECTRON_OZONE_PLATFORM_HINT``). Best-effort: any config error
+    yields the safe defaults ``([], "auto", "auto", "auto")`` so a malformed
+    config never blocks the launch.
     """
     flags: list[str] = []
     disable_gpu = "auto"
     password_store = "auto"
+    ozone_hint = "auto"
     try:
         from hermes_cli.config import load_config
 
         desktop_cfg = (load_config() or {}).get("desktop") or {}
     except Exception:
-        return flags, disable_gpu, password_store
+        return flags, disable_gpu, password_store, ozone_hint
 
     raw_flags = desktop_cfg.get("electron_flags")
     if isinstance(raw_flags, str):
@@ -7813,7 +7991,13 @@ def _desktop_launch_options() -> tuple[list[str], str, str]:
         low_store = raw_store.strip().lower()
         if low_store in _LINUX_PASSWORD_STORES:
             password_store = low_store
-    return flags, disable_gpu, password_store
+
+    raw_ozone = desktop_cfg.get("ozone_platform_hint", "auto")
+    if isinstance(raw_ozone, str):
+        low_ozone = raw_ozone.strip().lower()
+        if low_ozone in ("auto", "x11", "wayland"):
+            ozone_hint = low_ozone
+    return flags, disable_gpu, password_store, ozone_hint
 
 
 def _register_linux_desktop_entry() -> None:
@@ -7864,12 +8048,18 @@ def cmd_gui(args: argparse.Namespace):
         env["HERMES_DESKTOP_CWD"] = os.getcwd()
 
     # Desktop launch options from config.yaml (`desktop.electron_flags`,
-    # `desktop.disable_gpu`). The GPU policy is bridged to the env var the
-    # Electron app already reads; an explicit env var still wins over config so
-    # `HERMES_DESKTOP_DISABLE_GPU=... hermes desktop` keeps working.
-    config_electron_flags, config_disable_gpu, config_password_store = _desktop_launch_options()
+    # `desktop.disable_gpu`, `desktop.ozone_platform_hint`). The GPU policy
+    # and ozone hint are bridged to env vars the Electron/Chromium process
+    # already reads; an explicit env var still wins over config so
+    # `HERMES_DESKTOP_DISABLE_GPU=... hermes desktop` and
+    # `ELECTRON_OZONE_PLATFORM_HINT=... hermes desktop` keep working.
+    config_electron_flags, config_disable_gpu, config_password_store, config_ozone_hint = (
+        _desktop_launch_options()
+    )
     if config_disable_gpu != "auto" and "HERMES_DESKTOP_DISABLE_GPU" not in os.environ:
         env["HERMES_DESKTOP_DISABLE_GPU"] = config_disable_gpu
+    if config_ozone_hint != "auto" and "ELECTRON_OZONE_PLATFORM_HINT" not in os.environ:
+        env["ELECTRON_OZONE_PLATFORM_HINT"] = config_ozone_hint
 
     # Linux keychain backend for safeStorage (`desktop.password_store`).
     # Chromium needs the --password-store switch to pick the right keychain;
@@ -10379,6 +10569,10 @@ def cmd_update(args):
         _finalize_update_output(_update_io_state)
         sys.exit(UPDATE_EXIT_CONCURRENT)
 
+    # Exit code for the Windows hand-off child's hard exit (see finally).
+    # None = not a SystemExit-shaped outcome; real exceptions keep the
+    # normal raise path so their traceback still prints.
+    _update_handoff_exit_code: int | None = None
     try:
         _self()._cmd_update_impl(args, gateway_mode=gateway_mode)
     except SystemExit as _update_exit:
@@ -10395,6 +10589,9 @@ def cmd_update(args):
             finalize_pending_update_receipt(_code, f"sys.exit({_code})")
         except Exception:
             pass
+        _update_handoff_exit_code = (
+            _update_exit.code if isinstance(_update_exit.code, int) else 0
+        )
         raise
     except BaseException as _update_exc:
         try:
@@ -10413,9 +10610,29 @@ def cmd_update(args):
             finalize_pending_update_receipt(0, "completed at command boundary")
         except Exception:
             pass
+        _update_handoff_exit_code = 0
     finally:
         _update_lock.release()
         _finalize_update_output(_update_io_state)
+        # Windows hand-off child (#93581): the re-exec'd venv child cannot
+        # rely on graceful interpreter shutdown — a leftover non-daemon
+        # thread from the update tail keeps the console busy long after
+        # the receipt is durable (success, exit 0, "completed at command
+        # boundary"), freezing the PowerShell window for minutes. By this
+        # point every durable step is done (receipt finalized above, lock
+        # released, stdio restored), so on the hand-off path only, flush
+        # and exit hard instead of waiting for the interpreter to unwind
+        # — the same treatment #79040's cron workaround applies. No-op on
+        # every non-hand-off invocation: the marker env is set solely by
+        # _reexec_dependency_sync_off_windows_shim when it spawns the child.
+        if _update_handoff_exit_code is not None and os.environ.get(_UPDATE_REEXEC_ENV) == "1":
+            logger.debug(
+                "Update hand-off child %s exiting via os._exit(%s)",
+                os.getpid(), _update_handoff_exit_code,
+            )
+            sys.stdout.flush()
+            sys.stderr.flush()
+            os._exit(_update_handoff_exit_code)
 
 
 def _coalesce_session_name_args(argv: list) -> list:
@@ -11902,33 +12119,6 @@ _BUILTIN_SUBCOMMANDS = frozenset(
 )
 
 
-# Top-level flags that take a value. Needed by ``_first_positional_argv``
-# so that in ``hermes -m gpt5 chat``, ``gpt5`` is correctly skipped as a
-# flag value rather than misclassified as a subcommand. Kept in sync with
-# the top-level flags declared in ``hermes_cli/_parser.py``.
-#
-# Correctness-safe either way: missing an entry here only makes the
-# fast-path bail out too eagerly (we run plugin discovery when we didn't
-# need to); extra entries would make us skip a real positional.
-_TOP_LEVEL_VALUE_FLAGS = frozenset(
-    {
-        "-z", "--oneshot",
-        "-m", "--model",
-        "--provider",
-        "-t", "--toolsets",
-        "-r", "--resume",
-        "-s", "--skills",
-        "--usage-file",
-        "--in",
-        # ``-c / --continue`` is nargs='?' (optional value). Treat it as
-        # value-taking: if the next token is a subcommand-looking word
-        # the user almost certainly meant it as the session name, and
-        # either interpretation keeps us on the safe side.
-        "-c", "--continue",
-    }
-)
-
-
 def _first_positional_argv() -> str | None:
     """Return the first non-flag, non-flag-value token in ``sys.argv[1:]``.
 
@@ -11941,6 +12131,10 @@ def _first_positional_argv() -> str | None:
     bar`` flags degrade gracefully (``bar`` may be wrongly classified as
     a positional, which at worst forces a one-time plugin discovery).
     """
+    from hermes_cli._parser import top_level_value_flag_sets
+
+    required_value_flags, optional_value_flags = top_level_value_flag_sets()
+    value_flags = required_value_flags | optional_value_flags
     argv = sys.argv[1:]
     i = 0
     while i < len(argv):
@@ -11955,7 +12149,7 @@ def _first_positional_argv() -> str | None:
             if "=" in tok:
                 i += 1
                 continue
-            if tok in _TOP_LEVEL_VALUE_FLAGS and i + 1 < len(argv):
+            if tok in value_flags and i + 1 < len(argv):
                 i += 2
                 continue
             i += 1

@@ -91,11 +91,20 @@ declare global {
       // bar — so it mounts the real composer rather than a lookalike. Main
       // owns the window; `onChanged` keeps every window's toggle truthful.
       hud?: {
+        nativeDrag: boolean
+        windowing?: {
+          clientPlacement: boolean
+          controlDrag: boolean
+          nativeDrag: boolean
+          workspaceTransfer: boolean
+        }
         open: (request?: { sessionId?: null | string; profile?: null | string }) => Promise<{ ok: boolean }>
         close: () => Promise<{ ok: boolean }>
         setIgnoreMouse: (ignore: boolean) => void
         moveBy: (delta: { x: number; y: number; width: number; height: number }) => void
+        setWorkspaceTransfer?: (transferring: boolean) => void
         setBounds: (bounds: { x: number; y: number; width: number; height: number }) => void
+        resetLayout: () => Promise<{ ok: boolean }>
         setFrost: (showing: boolean) => Promise<{ ok: boolean }>
         setSession: (sessionId: null | string) => void
         onGoto: (callback: (sessionId: string) => void) => () => void
@@ -136,6 +145,11 @@ declare global {
       saveConnectionConfig: (payload: DesktopConnectionConfigInput) => Promise<DesktopConnectionConfig>
       applyConnectionConfig: (payload: DesktopConnectionConfigInput) => Promise<DesktopConnectionConfig>
       testConnectionConfig: (payload: DesktopConnectionConfigInput) => Promise<DesktopConnectionTestResult>
+      // Opt-in OS-keychain encryption for stored gateway secrets (default
+      // off). `get` never touches the OS keychain; `set` re-encodes stored
+      // secrets and can throw when the keychain is unusable.
+      getSecretStorageEncryption: () => Promise<{ on: boolean }>
+      setSecretStorageEncryption: (on: boolean) => Promise<{ on: boolean }>
       // v2 multi-connection registry: named agent sources, all persisted
       // together (local + any number of remote/cloud/ssh instances).
       connections: {

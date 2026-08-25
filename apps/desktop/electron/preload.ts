@@ -8,6 +8,8 @@ import { contextBridge, ipcRenderer, webFrame, webUtils } from 'electron'
 // "Desktop IPC bridge is unavailable"). No reply means no glass, which degrades
 // to an ordinary opaque window rather than a page thinned over nothing.
 const translucencySupport = ipcRenderer.sendSync('hermes:translucency:support')
+const hudWindowing = ipcRenderer.sendSync('hermes:hud:windowing')
+const hudNativeDrag = hudWindowing?.nativeDrag === true
 
 contextBridge.exposeInMainWorld('hermesDesktop', {
   glassSupported: translucencySupport?.glass === true,
@@ -70,11 +72,20 @@ contextBridge.exposeInMainWorld('hermesDesktop', {
   // sized as a floating bar, so it mounts the real composer. Main owns the
   // window; `onChanged` keeps every window's toggle truthful.
   hud: {
+    nativeDrag: hudNativeDrag,
+    windowing: {
+      clientPlacement: hudWindowing?.clientPlacement !== false,
+      controlDrag: hudWindowing?.controlDrag === true,
+      nativeDrag: hudNativeDrag,
+      workspaceTransfer: hudWindowing?.workspaceTransfer === true
+    },
     open: request => ipcRenderer.invoke('hermes:hud:open', request),
     close: () => ipcRenderer.invoke('hermes:hud:close'),
     setIgnoreMouse: ignore => ipcRenderer.send('hermes:hud:ignore-mouse', ignore),
     moveBy: delta => ipcRenderer.send('hermes:hud:move-by', delta),
+    setWorkspaceTransfer: transferring => ipcRenderer.send('hermes:hud:workspace-transfer', transferring),
     setBounds: bounds => ipcRenderer.send('hermes:hud:set-bounds', bounds),
+    resetLayout: () => ipcRenderer.invoke('hermes:hud:reset-layout'),
     // Whether the band covers the window below the bar. Main pairs it with the
     // user's translucency setting to decide the native frost (macOS vibrancy /
     // Windows 11 DWM backdrop) — see hudFrostFor.
@@ -154,6 +165,10 @@ contextBridge.exposeInMainWorld('hermesDesktop', {
   saveConnectionConfig: payload => ipcRenderer.invoke('hermes:connection-config:save', payload),
   applyConnectionConfig: payload => ipcRenderer.invoke('hermes:connection-config:apply', payload),
   testConnectionConfig: payload => ipcRenderer.invoke('hermes:connection-config:test', payload),
+  // Opt-in OS-keychain encryption for stored gateway secrets (default off —
+  // see secret-storage-policy.ts). get never touches the OS keychain.
+  getSecretStorageEncryption: () => ipcRenderer.invoke('hermes:secret-storage:get'),
+  setSecretStorageEncryption: (on: boolean) => ipcRenderer.invoke('hermes:secret-storage:set', on),
   // v2 multi-connection registry: named agent sources (local / remote / cloud / ssh).
   connections: {
     list: () => ipcRenderer.invoke('hermes:connections:list'),
