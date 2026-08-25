@@ -337,7 +337,7 @@ function PluginRow({ record }: { record: PluginRecord }) {
       }
       description={
         record.status === 'error' ? (
-          <span className="text-(--ui-danger,#f87171)">{record.error}</span>
+          <span className="text-destructive">{record.error}</span>
         ) : (
           (record.description ?? record.file ?? record.id)
         )
