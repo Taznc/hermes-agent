@@ -257,6 +257,25 @@ const shim = {
   // as the composer's empty-paste fallback, where '' means "nothing to
   // attach" and is passed `{ silent: true }`.
   saveClipboardImage: async () => '',
+
+  // ── connection-config surfaces (reachable, unsupported) ─────────────────
+  // The profile rail's remote-override dialog and the Settings → Connections
+  // registry editor both mount in the web build and call these UNGUARDED on
+  // the object (`window.hermesDesktop.applyConnectionConfig(...)`), so a
+  // partial shim throws "... is not a function" at click time. Connection and
+  // OAuth state live in the Electron main process's desktop config — a
+  // browser tab has no equivalent, and faking a success shape would make the
+  // dialogs report a save/sign-in that never happened. Throw a clear error
+  // instead: every call site wraps these in try/catch and surfaces the
+  // message honestly (inline dialog error / notifyError toast), the same
+  // honest-failure pattern as saveImageBuffer's non-image branch.
+  applyConnectionConfig: async (_payload: unknown): Promise<never> => {
+    throw new Error('Connection settings are managed on the server in the web build')
+  },
+  oauthLoginConnectionConfig: async (_remoteUrl: string): Promise<never> => {
+    throw new Error('OAuth sign-in is not available in the web build')
+  },
+
   getVersion: async () => {
     // Injected by vite.config.web.ts `define` (real git provenance of the
     // served checkout); absent if an older config serves this file.
@@ -289,7 +308,11 @@ const shim = {
   // onBootstrapEvent (must stay omitted TOGETHER), readFileDataUrl,
   // openSessionWindow/openWindow, writeClipboard, setActiveWork,
   // setTranslucency, battery, readDir/readFileText (remote mode → /api/fs/*),
-  // watchPreviewFile, contextMenu*, oauth*/ssh*/connection-config surfaces.
+  // watchPreviewFile, contextMenu*, and the REMAINING oauth*/ssh*/
+  // connection-config surfaces (getConnectionConfig stays omitted — it is the
+  // sentinel that gates Settings → Gateway and the boot-failure overlay;
+  // applyConnectionConfig + oauthLoginConnectionConfig above are the two
+  // reachable exceptions).
   //
   // readFileDataUrl in particular MUST stay omitted: desktop-fs's
   // readDesktopFileDataUrlLocalFirst tries the bridge before the gateway, so
