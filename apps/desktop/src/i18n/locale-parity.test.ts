@@ -3,7 +3,7 @@ import { describe, expect, it } from 'vitest'
 import { TRANSLATIONS } from './catalog'
 import { en } from './en'
 import type { Locale } from './types'
-import { zh } from './zh'
+import { zhAuthored } from './zh'
 
 // Key-parity invariant: every locale catalog must declare every key `en`
 // declares — including keys inside plain Record<string, string> sections
@@ -26,9 +26,11 @@ function isTree(value: unknown): value is Tree {
 function flattenKeys(node: Tree, prefix = '', out: string[] = []): string[] {
   for (const [key, value] of Object.entries(node)) {
     const path = prefix ? `${prefix}.${key}` : key
-    if (isTree(value)) flattenKeys(value, path, out)
-    else out.push(path)
+
+    if (isTree(value)) {flattenKeys(value, path, out)}
+    else {out.push(path)}
   }
+
   return out
 }
 
@@ -46,9 +48,10 @@ const LOCALES = Object.keys(TRANSLATIONS) as Locale[]
 // keep their authored overrides inline (not exported) in files outside this
 // change's scope, so today they are covered only by the merged-catalog check.
 const AUTHORED: Partial<Record<Locale, Tree>> = {
-  // zh authors its full catalog directly (no defineLocale), so the exported
-  // object IS the authored key set.
-  zh: zh as unknown as Tree
+  // zh keeps its full authored catalog typed as `Translations` and exported
+  // separately from the defineLocale() merge, so its authored key set is
+  // checkable directly.
+  zh: zhAuthored as unknown as Tree
 }
 
 describe('desktop i18n locale key parity', () => {
@@ -65,7 +68,8 @@ describe('desktop i18n locale key parity', () => {
 
   it.each(Object.keys(AUTHORED) as Locale[])('authored "%s" translations declare every en key', locale => {
     const authored = AUTHORED[locale]
-    if (!authored) throw new Error(`no authored catalog registered for ${locale}`)
+
+    if (!authored) {throw new Error(`no authored catalog registered for ${locale}`)}
     const keys = new Set(flattenKeys(authored))
     const missing = EN_KEYS.filter(key => !keys.has(key))
     expect(missing).toEqual([])
