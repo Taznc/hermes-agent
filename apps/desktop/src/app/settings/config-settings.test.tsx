@@ -37,9 +37,16 @@ vi.mock('@/store/profile', async () => {
 })
 
 vi.mock('@/store/settings-scope', async () => {
-  const { atom } = await import('nanostores')
+  const { atom, computed } = await import('nanostores')
 
-  return { $settingsScopeOverride: atom<null | string>(null) }
+  const $settingsScopeOverride = atom<null | string>(null)
+
+  return {
+    // Same contract as the real module: `null` override means "follow the
+    // app's active profile", which maps to `undefined` on requests.
+    $settingsRequestProfile: computed($settingsScopeOverride, (override): string | undefined => override ?? undefined),
+    $settingsScopeOverride
+  }
 })
 
 vi.mock('@/store/keep-awake', async () => {

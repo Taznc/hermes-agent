@@ -19,12 +19,21 @@ import type { HermesConnection } from '@/global'
 const ensureGatewayForAgent = vi.fn(async (_connectionId: null | string, _profile: string) => true)
 const ensureGatewayForProfile = vi.fn(async (_profile: string) => undefined)
 const openGatewayForProfile = vi.fn(async (_profile: string) => undefined)
+// The registry's own "which source is live" answer (store/gateway). Since
+// #92194, selectProfile routes a null-connection pick through
+// activateOnCurrentSource, which asks the REGISTRY — not the
+// $activeGatewayConnection atom. The stubbed ensure* doubles never move this
+// registry, so it stays on the primary (null) unless a test steers it with
+// mockReturnValue — same harness shape as profile-select-source.test.ts,
+// which owns the registry-routing cases.
+const activeGatewayConnectionId = vi.fn<() => null | string>(() => null)
 const $gateway = atom<unknown>({ id: 'live-socket' })
 const resetStarmapGraph = vi.fn()
 const wipeSessionListsForGatewaySwitch = vi.fn()
 
 vi.mock('@/store/gateway', () => ({
   $gateway,
+  activeGatewayConnectionId,
   ensureGatewayForAgent,
   ensureGatewayForProfile,
   openGatewayForProfile
@@ -71,6 +80,8 @@ beforeEach(() => {
   // "not.toHaveBeenCalled()" would see the PREVIOUS test's dial.
   ensureGatewayForAgent.mockClear()
   ensureGatewayForProfile.mockClear()
+  activeGatewayConnectionId.mockReset()
+  activeGatewayConnectionId.mockReturnValue(null)
   $gateway.set({ id: 'live-socket' })
   $activeGatewayProfile.set('default')
   $activeGatewayConnection.set(null)
