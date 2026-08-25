@@ -1,8 +1,14 @@
 import { defineFieldCopy } from '@/app/settings/field-copy'
 
+import { defineLocale } from './define-locale'
 import type { Translations } from './types'
 
-export const zh: Translations = {
+// Authored catalog. Kept fully typed as `Translations` (not
+// TranslationOverrides) so tsc still enforces every non-Record member, and
+// exported so locale-parity.test.ts can assert the AUTHORED key set against
+// `en` — the defineLocale() merge below would otherwise hide missing keys as
+// silent English fallback.
+export const zhAuthored: Translations = {
   common: {
     apply: '应用',
     back: '返回',
@@ -306,7 +312,13 @@ export const zh: Translations = {
       'view.toggleTabStrip': '切换标签',
       'view.showFiles': '显示文件浏览器',
       'view.showBrowser': '打开浏览器',
+      'view.toggleHud': '切换 HUD 模式',
+      'hud.snapToPointer': '将 HUD 移到指针位置（全局，HUD 打开时）',
       'view.showTerminal': '显示终端',
+      'view.newTerminal': '新建终端',
+      'view.nextTerminal': '下一个终端',
+      'view.prevTerminal': '上一个终端',
+      'view.closeTerminal': '关闭终端',
       'view.selectionToComposer': '将选区发送到输入框',
       'view.terminalCopy': '复制终端选区',
       'view.terminalPaste': '粘贴到终端',
@@ -707,6 +719,7 @@ export const zh: Translations = {
       },
       stt: {
         enabled: '语音转文字',
+        echoTranscripts: '回显转写文本',
         provider: '语音转文字提供方',
         local: {
           model: '本地转写模型',
@@ -772,6 +785,10 @@ export const zh: Translations = {
         },
         piper: {
           voice: 'Piper 语音'
+        },
+        deepinfra: {
+          model: 'DeepInfra TTS 模型',
+          voice: 'DeepInfra 语音'
         }
       },
       memory: {
@@ -823,7 +840,11 @@ export const zh: Translations = {
       terminal: {
         cwd: '工具与终端操作的默认项目目录。',
         persistentShell: '当后端支持时，在命令之间保留 Shell 状态。',
-        envPassthrough: '传入工具执行的环境变量。'
+        envPassthrough: '传入工具执行的环境变量。',
+        dockerImage: '执行后端为 Docker 时使用的容器镜像。',
+        singularityImage: '执行后端为 Singularity 时使用的镜像。',
+        modalImage: '执行后端为 Modal 时使用的镜像。',
+        daytonaImage: '执行后端为 Daytona 时使用的镜像。'
       },
       codeExecution: {
         mode: '代码执行被限定到当前项目的严格程度。'
@@ -852,8 +873,23 @@ export const zh: Translations = {
       voice: {
         autoTts: '自动朗读助手回复。'
       },
+      tts: {
+        xai: {
+          voiceId: 'xAI 语音 ID（如 eve）或自定义语音 ID。',
+          language: '朗读语言代码（如 en、pt-BR），或 "auto" 自动检测。',
+          speed: '播放速度。0.7 = 较慢，1.0 = 正常，1.5 = 较快。',
+          autoSpeechTags: '让 LLM 在合成前向文本插入富有表现力的音频标签（[laughing]、[sighs]）。',
+          optimizeStreamingLatency: '延迟与质量的权衡。0 = 最佳质量，2 = 最低延迟。',
+          sampleRate: '音频采样率（Hz）。越高质量越好，文件越大。',
+          bitRate: 'MP3 比特率（bps）。仅当编码为 mp3 时生效。'
+        },
+        neutts: {
+          device: 'NeuTTS 的本地推理设备。'
+        }
+      },
       stt: {
         enabled: '启用本地或提供方支持的语音转写。',
+        echoTranscripts: '将语音消息的原始 🎙️ 转写文本发回对话。',
         elevenlabs: {
           languageCode: '可选的 ISO-639-3 语言代码。留空让 ElevenLabs 自动检测。'
         }
@@ -3604,3 +3640,9 @@ export const zh: Translations = {
     }
   }
 }
+
+// Merge over `en` like the sibling locales (ja / zh-hant / ar): the authored
+// catalog above is complete today, and defineLocale() keeps any future
+// en-only key rendering as readable English fallback instead of `undefined`
+// at runtime. The parity test guards against relying on that fallback.
+export const zh = defineLocale(zhAuthored)
