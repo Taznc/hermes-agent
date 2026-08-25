@@ -35,17 +35,20 @@ const BASE_URL = window.location.origin
 // later visits (any tab, after browser restart) need no query param. Scrub it
 // from the address bar/history once stored. Spike-grade; behind Authelia.
 const tokenFromUrl = new URLSearchParams(window.location.search).get('token')
+
 if (tokenFromUrl) {
   localStorage.setItem('hermes-web-spike-token', tokenFromUrl)
   const scrubbed = new URL(window.location.href)
   scrubbed.searchParams.delete('token')
   window.history.replaceState(null, '', scrubbed)
 }
+
 const TOKEN =
   tokenFromUrl ??
   localStorage.getItem('hermes-web-spike-token') ??
   sessionStorage.getItem('hermes-web-spike-token') ??
   ''
+
 const WS_URL = `${BASE_URL.replace(/^http/, 'ws')}/api/ws${TOKEN ? `?token=${encodeURIComponent(TOKEN)}` : ''}`
 
 const unsub = () => () => {}
@@ -108,12 +111,15 @@ const READY_BOOT = {
 
 async function api<T>(request: SpikeApiRequest): Promise<T> {
   const url = new URL(request.path, BASE_URL)
-  if (request.profile) url.searchParams.set('profile', request.profile)
+
+  if (request.profile) {url.searchParams.set('profile', request.profile)}
 
   const headers: Record<string, string> = {}
-  if (TOKEN) headers['X-Hermes-Session-Token'] = TOKEN
+
+  if (TOKEN) {headers['X-Hermes-Session-Token'] = TOKEN}
 
   let body: BodyInit | undefined
+
   if (request.upload) {
     const form = new FormData()
     const bytes = request.upload.bytes instanceof Uint8Array ? request.upload.bytes : new Uint8Array(request.upload.bytes)
@@ -130,6 +136,7 @@ async function api<T>(request: SpikeApiRequest): Promise<T> {
 
   const controller = new AbortController()
   const timer = request.timeoutMs ? setTimeout(() => controller.abort(), request.timeoutMs) : null
+
   try {
     const res = await fetch(url, {
       method: request.method ?? (body ? 'POST' : 'GET'),
@@ -138,11 +145,13 @@ async function api<T>(request: SpikeApiRequest): Promise<T> {
       signal: controller.signal,
       credentials: 'include'
     })
-    if (!res.ok) throw new Error(`Hermes API ${request.path} failed: ${res.status}`)
+
+    if (!res.ok) {throw new Error(`Hermes API ${request.path} failed: ${res.status}`)}
     const text = await res.text()
+
     return (text ? JSON.parse(text) : undefined) as T
   } finally {
-    if (timer) clearTimeout(timer)
+    if (timer) {clearTimeout(timer)}
   }
 }
 
@@ -209,6 +218,7 @@ const shim = {
   requestMicrophoneAccess: async () => {
     try {
       await navigator.mediaDevices.getUserMedia({ audio: true })
+
       return true
     } catch {
       return false
