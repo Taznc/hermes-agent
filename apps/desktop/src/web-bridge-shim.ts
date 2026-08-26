@@ -10,6 +10,26 @@
  * UNTRACKED SPIKE FILE — not part of the app. Do not commit without review.
  */
 
+import { markWebReloadPending, registerNativeWebReload } from '@/store/web-reload'
+
+// ── HMR full-reload trap (DEV only) ─────────────────────────────────────────
+// Vite's built-in HMR client calls window.location.reload() directly whenever
+// an edited module can't Fast Refresh (any file that also exports a
+// non-component value — a store, an i18n locale file, a helper) and again on
+// dev-server WebSocket reconnect. `vite:beforeFullReload` listeners cannot
+// cancel that call — Vite notifies them and proceeds regardless — so the only
+// real interception point is the browser API itself. Capture the native
+// reload first (the "Refresh" statusbar item calls it back), then replace
+// `location.reload` with a flag flip. Gated on DEV so this never ships in a
+// production web build. See docs/web-ui-hard-refresh-diagnosis.md.
+if (import.meta.env.DEV) {
+  registerNativeWebReload(window.location.reload.bind(window.location))
+  Object.defineProperty(window.location, 'reload', {
+    configurable: true,
+    value: () => markWebReloadPending()
+  })
+}
+
 // Self-contained minimal types (structural subsets of src/global.d.ts shapes;
 // kept local so the shim never affects the app's module graph).
 interface SpikeApiRequest {
