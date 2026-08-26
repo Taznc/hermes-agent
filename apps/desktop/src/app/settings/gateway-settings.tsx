@@ -1532,7 +1532,20 @@ export function GatewaySettings({ embedded = false }: { embedded?: boolean } = {
           />
           <ListRow
             action={
-              <Button onClick={() => void window.hermesDesktop?.revealLogs()} size="sm" variant="textStrong">
+              <Button
+                onClick={() => {
+                  void window.hermesDesktop
+                    ?.revealLogs()
+                    .then(result => {
+                      if (!result?.ok) {
+                        notifyError(new Error(result?.error || 'reveal logs failed'), g.openLogsFailed)
+                      }
+                    })
+                    .catch(err => notifyError(err, g.openLogsFailed))
+                }}
+                size="sm"
+                variant="textStrong"
+              >
                 <FileText />
                 {g.openLogs}
               </Button>

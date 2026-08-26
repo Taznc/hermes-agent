@@ -116,6 +116,7 @@ export const ar = defineLocale({
       cloudDownCheckPortal: 'التحقق من حالة البوابة',
       cloudDownDiscord: 'الحصول على مساعدة عبر Discord',
       openLogs: 'فتح السجلات',
+      openLogsFailed: 'تعذّر فتح مجلد السجلات',
       repairHint: 'يعيد الإصلاح تشغيل المثبت وقد يستغرق بضع دقائق على جهاز جديد.',
       remoteSignInHint: signInLabel =>
         `يسجّل الخروج من جلسة المتصفح البعيدة المحفوظة، ثم يفتح ${signInLabel}. استخدم البوابة المحلية للتبديل إلى الخلفية المضمنة.`,
@@ -776,6 +777,7 @@ export const ar = defineLocale({
       diagnostics: 'التشخيصات',
       diagnosticsDesc: 'اعرض desktop.log في مدير الملفات، وهذا مفيد عند فشل تشغيل البوابة.',
       openLogs: 'فتح السجلات',
+      openLogsFailed: 'تعذّر فتح مجلد السجلات',
       incompleteTitle: 'إعداد البوابة البعيدة غير مكتمل',
       incompleteSignIn: 'أدخل رابط البوابة البعيدة وسجل الدخول قبل التبديل إلى البعيد.',
       incompleteToken: 'أدخل رابط البوابة البعيدة ورمز الجلسة قبل التبديل إلى البعيد.',
@@ -2825,7 +2827,8 @@ export const ar = defineLocale({
     boundaryTitle: 'تعطل جزء من الواجهة',
     boundaryDesc: 'يمكنك إعادة تحميل النافذة أو فتح السجلات لمعرفة التفاصيل.',
     reloadWindow: 'إعادة تحميل النافذة',
-    openLogs: 'فتح السجلات'
+    openLogs: 'فتح السجلات',
+    openLogsFailed: 'تعذّر فتح مجلد السجلات'
   },
   ui: {
     search: {

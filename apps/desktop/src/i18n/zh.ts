@@ -97,6 +97,7 @@ export const zh: Translations = {
       gatewaySettings: '网关设置',
       back: '返回',
       openLogs: '打开日志',
+      openLogsFailed: '无法打开日志文件夹',
       repairHint: '修复会重新运行安装器，在新机器上可能需要几分钟。',
       remoteSignInHint: signInLabel =>
         `先退出已保存的远程浏览器会话，然后打开${signInLabel}。也可以使用本地网关切换到随应用提供的后端。`,
@@ -1095,6 +1096,7 @@ export const zh: Translations = {
       diagnostics: '诊断',
       diagnosticsDesc: '在文件管理器中显示 desktop.log，网关启动失败时很有用。',
       openLogs: '打开日志',
+      openLogsFailed: '无法打开日志文件夹',
       incompleteTitle: '远程网关配置不完整',
       incompleteSignIn: '切换到远程前，请输入远程 URL 并完成登录。',
       incompleteToken: '切换到远程前，请输入远程 URL 和会话 token。',
@@ -3585,7 +3587,8 @@ export const zh: Translations = {
     boundaryTitle: '界面出错了',
     boundaryDesc: '此视图遇到意外错误。你的对话和设置是安全的。',
     reloadWindow: '重新加载窗口',
-    openLogs: '打开日志'
+    openLogs: '打开日志',
+    openLogsFailed: '无法打开日志文件夹'
   },
 
   ui: {

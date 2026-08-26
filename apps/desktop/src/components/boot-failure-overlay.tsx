@@ -199,7 +199,17 @@ export function BootFailureOverlay() {
     }
   }
 
-  const openLogs = () => void window.hermesDesktop?.revealLogs().catch(() => undefined)
+  const openLogs = () => {
+    void window.hermesDesktop
+      ?.revealLogs()
+      .then(result => {
+        if (!result?.ok) {
+          notifyError(new Error(result?.error || 'reveal logs failed'), copy.openLogsFailed)
+        }
+      })
+      .catch(err => notifyError(err, copy.openLogsFailed))
+  }
+
   const copy = t.boot.failure
 
   const label = signInLabel(remoteReauth, {
@@ -253,6 +263,13 @@ export function BootFailureOverlay() {
   // progress. When set, the recovery screen leads with the cloud-specific
   // guidance instead of the generic remote-failure copy (#85335).
   const cloudDown = Boolean(boot.isCloudBackendDown)
+  // The web-spike bridge (web-bridge-shim.ts) deliberately omits these
+  // Electron-only capabilities, so a served-as-web-app build must not offer
+  // buttons that silently no-op (repair) or route into an EmptyState
+  // (gateway settings — see gateway-settings.tsx's own getConnectionConfig
+  // check).
+  const canRepair = Boolean(window.hermesDesktop?.repairBootstrap)
+  const canOpenGatewaySettings = Boolean(window.hermesDesktop?.getConnectionConfig)
 
   if (remoteReauth) {
     actions = [
@@ -312,6 +329,22 @@ export function BootFailureOverlay() {
     ]
     hint = copy.repairHint
   }
+
+  // Drop actions the web-spike bridge can't back: repair silently reloads
+  // with no effect, and gateway settings routes into its own "unavailable"
+  // EmptyState. Filtering here (rather than gating each action's onClick)
+  // keeps a build that lacks the capability from ever showing the button.
+  actions = actions.filter(action => {
+    if (action.key === 'repair') {
+      return canRepair
+    }
+
+    if (action.key === 'settings') {
+      return canOpenGatewaySettings
+    }
+
+    return true
+  })
 
   if (view === 'connect') {
     return (

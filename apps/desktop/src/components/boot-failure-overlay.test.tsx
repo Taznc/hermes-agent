@@ -25,11 +25,20 @@ function failBoot() {
   })
 }
 
-function stubDesktop(config: Record<string, unknown>) {
+// Simulates the real Electron preload bridge: repairBootstrap/getConnectionConfig
+// are always defined there (only the browser web-spike shim omits them — see
+// web-bridge-shim.ts), so every scenario here gets both unless a test is
+// specifically exercising the web-spike's missing-capability case.
+function stubDesktop(config: Record<string, unknown> | null) {
   const original = window.hermesDesktop
   Object.defineProperty(window, 'hermesDesktop', {
     configurable: true,
-    value: { getRecentLogs: async () => ({ lines: [] }), getConnectionConfig: async () => config }
+    value: {
+      getRecentLogs: async () => ({ lines: [] }),
+      getConnectionConfig: async () => config,
+      repairBootstrap: async () => ({ ok: true }),
+      resetBootstrap: async () => ({ ok: true })
+    }
   })
 
   return () => Object.defineProperty(window, 'hermesDesktop', { configurable: true, value: original })
@@ -66,24 +75,58 @@ afterEach(cleanup)
 
 describe('BootFailureOverlay', () => {
   it('swaps to the in-place gateway settings view (no route nav) and back', async () => {
-    render(<BootFailureOverlay />)
+    const restore = stubDesktop(null)
 
-    fireEvent.click(screen.getByRole('button', { name: /gateway settings/i }))
-    // Recovery actions give way to the embedded panel (behind a Back control).
-    expect(await screen.findByRole('button', { name: /back/i })).toBeTruthy()
-    expect(screen.queryByRole('button', { name: /retry/i })).toBeNull()
+    try {
+      render(<BootFailureOverlay />)
 
-    fireEvent.click(screen.getByRole('button', { name: /back/i }))
-    expect(screen.getByRole('button', { name: /retry/i })).toBeTruthy()
-    expect(screen.queryByRole('button', { name: /back/i })).toBeNull()
+      fireEvent.click(screen.getByRole('button', { name: /gateway settings/i }))
+      // Recovery actions give way to the embedded panel (behind a Back control).
+      expect(await screen.findByRole('button', { name: /back/i })).toBeTruthy()
+      expect(screen.queryByRole('button', { name: /retry/i })).toBeNull()
+
+      fireEvent.click(screen.getByRole('button', { name: /back/i }))
+      expect(screen.getByRole('button', { name: /retry/i })).toBeTruthy()
+      expect(screen.queryByRole('button', { name: /back/i })).toBeNull()
+    } finally {
+      restore()
+    }
   })
 
   it('drops local-only Repair and Use-local-gateway on a local failure', () => {
-    render(<BootFailureOverlay />)
-    // No connection config stub → treated as a local failure.
-    expect(screen.getByRole('button', { name: /retry/i })).toBeTruthy()
-    expect(screen.getByRole('button', { name: /repair/i })).toBeTruthy()
-    expect(screen.queryByRole('button', { name: /use local gateway/i })).toBeNull()
+    const restore = stubDesktop(null)
+
+    try {
+      render(<BootFailureOverlay />)
+      // No remote connection config → treated as a local failure. Electron
+      // (unlike the browser web-spike) always exposes repairBootstrap, so
+      // Repair is offered.
+      expect(screen.getByRole('button', { name: /retry/i })).toBeTruthy()
+      expect(screen.getByRole('button', { name: /repair/i })).toBeTruthy()
+      expect(screen.queryByRole('button', { name: /use local gateway/i })).toBeNull()
+    } finally {
+      restore()
+    }
+  })
+
+  it('hides Repair and Gateway settings when the bridge lacks those capabilities (web-spike)', () => {
+    // The browser-served web build's web-bridge-shim.ts deliberately omits
+    // repairBootstrap/getConnectionConfig — the boot-failure overlay must not
+    // offer buttons that silently no-op or route into an "unavailable" panel.
+    const original = window.hermesDesktop
+    Object.defineProperty(window, 'hermesDesktop', {
+      configurable: true,
+      value: { getRecentLogs: async () => ({ lines: [] }) }
+    })
+
+    try {
+      render(<BootFailureOverlay />)
+      expect(screen.getByRole('button', { name: /retry/i })).toBeTruthy()
+      expect(screen.queryByRole('button', { name: /repair/i })).toBeNull()
+      expect(screen.queryByRole('button', { name: /gateway settings/i })).toBeNull()
+    } finally {
+      Object.defineProperty(window, 'hermesDesktop', { configurable: true, value: original })
+    }
   })
 
   it('leads with Gateway settings and drops Repair for a remote (token) failure', async () => {

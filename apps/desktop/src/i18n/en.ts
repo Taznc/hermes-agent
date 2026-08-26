@@ -99,6 +99,7 @@ export const en: Translations = {
       gatewaySettings: 'Gateway settings',
       back: 'Back',
       openLogs: 'Open logs',
+      openLogsFailed: 'Could not open the logs folder',
       repairHint: 'Repair re-runs the installer and can take a few minutes on a fresh machine.',
       remoteSignInHint: signInLabel =>
         `Signs out of the saved remote browser session, then opens ${signInLabel}. Use local gateway to switch to the bundled backend instead.`,
@@ -897,6 +898,7 @@ export const en: Translations = {
       diagnostics: 'Diagnostics',
       diagnosticsDesc: 'Reveal desktop.log in your file manager — useful when the gateway fails to start.',
       openLogs: 'Open logs',
+      openLogsFailed: 'Could not open the logs folder',
       incompleteTitle: 'Remote gateway incomplete',
       incompleteSignIn: 'Enter a remote URL and sign in before switching to remote.',
       incompleteToken: 'Enter a remote URL and session token before switching to remote.',
@@ -3441,7 +3443,8 @@ export const en: Translations = {
     boundaryTitle: 'Something broke in the interface',
     boundaryDesc: 'The view hit an unexpected error. Your chats and settings are safe.',
     reloadWindow: 'Reload window',
-    openLogs: 'Open logs'
+    openLogs: 'Open logs',
+    openLogsFailed: 'Could not open the logs folder'
   },
 
   ui: {

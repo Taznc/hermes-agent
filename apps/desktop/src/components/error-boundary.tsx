@@ -3,6 +3,7 @@ import { Component, type ErrorInfo, type ReactNode } from 'react'
 import { Button } from '@/components/ui/button'
 import { ErrorState } from '@/components/ui/error-state'
 import { useI18n } from '@/i18n'
+import { notifyError } from '@/store/notifications'
 
 export interface ErrorBoundaryFallbackProps {
   error: Error
@@ -142,6 +143,17 @@ export function RootErrorBoundary({ children }: { children: ReactNode }) {
 function RootErrorFallback({ error, reset }: ErrorBoundaryFallbackProps) {
   const { t } = useI18n()
 
+  const openLogs = () => {
+    void window.hermesDesktop
+      ?.revealLogs()
+      .then(result => {
+        if (!result?.ok) {
+          notifyError(new Error(result?.error || 'reveal logs failed'), t.errors.openLogsFailed)
+        }
+      })
+      .catch(err => notifyError(err, t.errors.openLogsFailed))
+  }
+
   return (
     <div
       className="fixed inset-0 z-(--z-crash) grid place-items-center bg-(--ui-chat-surface-background) p-6"
@@ -160,7 +172,7 @@ function RootErrorFallback({ error, reset }: ErrorBoundaryFallbackProps) {
         <Button onClick={() => window.location.reload()} variant="text">
           {t.errors.reloadWindow}
         </Button>
-        <Button onClick={() => void window.hermesDesktop?.revealLogs()?.catch(() => undefined)} variant="text">
+        <Button onClick={openLogs} variant="text">
           {t.errors.openLogs}
         </Button>
       </ErrorState>

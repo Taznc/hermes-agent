@@ -142,6 +142,7 @@ export interface Translations {
       gatewaySettings: string
       back: string
       openLogs: string
+      openLogsFailed: string
       repairHint: string
       remoteSignInHint: (signInLabel: string) => string
       signOutAndSignIn: string
@@ -763,6 +764,7 @@ export interface Translations {
       diagnostics: string
       diagnosticsDesc: string
       openLogs: string
+      openLogsFailed: string
       incompleteTitle: string
       incompleteSignIn: string
       incompleteToken: string
@@ -2964,6 +2966,7 @@ export interface Translations {
     boundaryDesc: string
     reloadWindow: string
     openLogs: string
+    openLogsFailed: string
   }
 
   ui: {
