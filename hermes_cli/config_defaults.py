@@ -3718,6 +3718,15 @@ DEFAULT_CONFIG = {
         # explicit ozone backend, or GPU workaround flags. A list of strings;
         # a single string is also accepted and shell-split.
         "electron_flags": [],
+        # Whether the Desktop app may contact upstream (git ls-remote/fetch
+        # against origin, plus the GitHub compare API) to check for client
+        # self-updates. Covers both the background poller (startup + 30-minute
+        # interval + window-focus recheck) and the "Check for Updates..." menu
+        # item. Set false on a dev checkout to stop the app pinging upstream
+        # while iterating locally — bridged to HERMES_DESKTOP_DISABLE_UPDATE_CHECKS
+        # (an explicit env var still wins). Does not affect `hermes update`
+        # run manually from the CLI.
+        "auto_update_checks_enabled": True,
         # Linux Ozone backend hint, bridged to ELECTRON_OZONE_PLATFORM_HINT
         # at launch (an explicit env var still wins). "auto" is Chromium's
         # default — Wayland on a Wayland session, X11 otherwise.
