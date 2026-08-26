@@ -147,9 +147,11 @@ def _conn(board: Optional[str] = None):
 # ``scheduled`` is a first-class waiting column used for time-based follow-ups;
 # if it is omitted here, the board-level fallback below mis-buckets scheduled
 # tasks into ``todo`` and makes the dashboard look like the Scheduled column
-# disappeared.
+# disappeared. ``on_hold`` is the human-initiated shelf/pause column — a task
+# a human explicitly parked, distinct from ``blocked`` (worker needs input)
+# and ``scheduled`` (waiting on time).
 BOARD_COLUMNS: list[str] = [
-    "triage", "todo", "scheduled", "ready", "running", "blocked", "review", "done",
+    "triage", "todo", "scheduled", "ready", "running", "blocked", "on_hold", "review", "done",
 ]
 
 
@@ -908,6 +910,8 @@ def update_task(task_id: str, payload: UpdateTaskBody, board: Optional[str] = Qu
                 ok = kanban_db.block_task(conn, task_id, reason=payload.block_reason)
             elif s == "scheduled":
                 ok = kanban_db.schedule_task(conn, task_id, reason=payload.block_reason)
+            elif s == "on_hold":
+                ok = kanban_db.hold_task(conn, task_id, reason=payload.block_reason)
             elif s == "review":
                 # Manual "request review" from the board. Routes through
                 # request_review so it is NOT a
@@ -924,12 +928,14 @@ def update_task(task_id: str, payload: UpdateTaskBody, board: Optional[str] = Qu
                 if ok and review_assignee_deferred and not payload.assignee:
                     ok = kanban_db.assign_task(conn, task_id, None)
             elif s == "ready":
-                # Re-open a blocked/scheduled/review task, or just an explicit
-                # status set. "Changes requested" (review -> ready) goes through
-                # reopen_review_task via _reopen_if_review.
+                # Re-open a blocked/scheduled/on_hold/review task, or just an
+                # explicit status set. "Changes requested" (review -> ready)
+                # goes through reopen_review_task via _reopen_if_review.
                 current = kanban_db.get_task(conn, task_id)
                 if current and current.status in ("blocked", "scheduled"):
                     ok = kanban_db.unblock_task(conn, task_id)
+                elif current and current.status == "on_hold":
+                    ok = kanban_db.unhold_task(conn, task_id)
                 else:
                     reopened = _reopen_if_review(conn, task_id, current)
                     # Direct status write for drag-drop (todo -> ready etc).
@@ -1350,6 +1356,8 @@ def bulk_update(payload: BulkTaskBody, board: Optional[str] = Query(None)):
                         )
                     elif s == "blocked":
                         ok = kanban_db.block_task(conn, tid)
+                    elif s == "on_hold":
+                        ok = kanban_db.hold_task(conn, tid)
                     elif s == "review":
                         # Non-block review handoff (mirror of PATCH /tasks/{id}).
                         ok = kanban_db.request_review(
@@ -1363,6 +1371,8 @@ def bulk_update(payload: BulkTaskBody, board: Optional[str] = Query(None)):
                         cur = kanban_db.get_task(conn, tid)
                         if cur and cur.status in ("blocked", "scheduled"):
                             ok = kanban_db.unblock_task(conn, tid)
+                        elif cur and cur.status == "on_hold":
+                            ok = kanban_db.unhold_task(conn, tid)
                         else:
                             reopened = _reopen_if_review(conn, tid, cur)
                             ok = reopened if reopened is not None else _set_status_direct(conn, tid, "ready")
