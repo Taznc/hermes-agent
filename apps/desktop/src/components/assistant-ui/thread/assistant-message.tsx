@@ -7,7 +7,7 @@ import {
   useMessageRuntime
 } from '@assistant-ui/react'
 import { useStore } from '@nanostores/react'
-import { type FC, type ReactNode, useCallback, useMemo, useState } from 'react'
+import { type FC, type ReactNode, useCallback, useEffect, useMemo, useState } from 'react'
 import { useInRouterContext, useNavigate } from 'react-router'
 
 import { useSessionView } from '@/app/chat/session-view'
@@ -49,7 +49,16 @@ import { useEnterAnimation } from '@/lib/use-enter-animation'
 import { cn } from '@/lib/utils'
 import { playSpeechText, stopVoicePlayback } from '@/lib/voice-playback'
 import { notify, notifyError } from '@/store/notifications'
-import { applyFallbackAndRetry, cancelScheduledResume, resolveNextFallback, scheduleResumeAtReset, setRateLimitDefaultRecovery, $scheduledResumeJobs } from '@/store/rate-limit-recovery'
+import {
+  $rateLimitDefaultRecovery,
+  applyFallbackAndRetry,
+  cancelScheduledResume,
+  loadRateLimitDefaultRecovery,
+  resolveNextFallback,
+  scheduleResumeAtReset,
+  setRateLimitDefaultRecovery,
+  $scheduledResumeJobs
+} from '@/store/rate-limit-recovery'
 import { requestSendDiagnostics } from '@/store/send-diagnostics'
 import { $connection, $currentModel } from '@/store/session'
 import { $gateway } from '@/store/gateway'
@@ -515,6 +524,49 @@ const SwitchProviderAction: FC<{ label: string }> = ({ label }) => {
   )
 }
 
+// Countdown before auto-scheduling the resume when the user's default is
+// resume_at_reset (item 4). Never schedules before this has painted at least
+// once — the effect below only fires the schedule after the FIRST tick,
+// giving the UI a real paint. Cancelling at any point leaves the card in its
+// normal manual-choice state (no job created).
+const AUTO_RESUME_COUNTDOWN_SECONDS = 5
+
+const AutoResumeCountdown: FC<{ onCancel: () => void; onElapsed: () => void }> = ({ onCancel, onElapsed }) => {
+  const { t } = useI18n()
+  const copy = t.assistant.thread.rateLimit
+  const [secondsLeft, setSecondsLeft] = useState(AUTO_RESUME_COUNTDOWN_SECONDS)
+
+  useEffect(() => {
+    if (secondsLeft <= 0) {
+      onElapsed()
+
+      return
+    }
+
+    const timer = setTimeout(() => setSecondsLeft(s => s - 1), 1_000)
+
+    return () => clearTimeout(timer)
+    // onElapsed is a fresh closure per render from the parent; only the
+    // ticking countdown itself should re-arm this effect.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [secondsLeft])
+
+  return (
+    <div className="flex items-center gap-2 text-[0.75rem]" data-slot="aui-rate-limit-countdown" role="status">
+      <span>{copy.countdownLabel(secondsLeft)}</span>
+      <button
+        className="aui-error-action"
+        onClick={() => {
+          onCancel()
+        }}
+        type="button"
+      >
+        {copy.cancelCountdown}
+      </button>
+    </div>
+  )
+}
+
 /**
  * Phase 2.12 rate-limit recovery row: Resume at reset (schedules a one-shot
  * cron job) / Switch model & retry (fallbackAvailable only, immediate no-wait
@@ -522,6 +574,11 @@ const SwitchProviderAction: FC<{ label: string }> = ({ label }) => {
  * Configure automatic fallback… (deep-link, shown when fallbackAvailable is
  * false or absent). Rendered ALONGSIDE the existing Retry/Copy/etc actions,
  * never replacing them.
+ *
+ * When the user's default recovery is resume_at_reset (Settings → Sessions,
+ * or the inline "Make this the default" checkbox), the FULL card and its
+ * context always render first — this is never a silent auto-action — and a
+ * visible, cancelable countdown runs before the job is actually scheduled.
  */
 const RateLimitRecoveryActions: FC<{ messageId: string }> = ({ messageId }) => {
   const { t } = useI18n()
@@ -533,13 +590,26 @@ const RateLimitRecoveryActions: FC<{ messageId: string }> = ({ messageId }) => {
   const sessionId = useStore(view.$storedId)
   const runtimeSessionId = useStore(view.$runtimeId)
   const inRouter = useInRouterContext()
+  const defaultRecovery = useStore($rateLimitDefaultRecovery)
 
   const [scheduling, setScheduling] = useState(false)
   const [switching, setSwitching] = useState(false)
   const [makeDefault, setMakeDefault] = useState(false)
+  // Countdown is armed once per mount (not re-armed on every render) and
+  // permanently dismissed by an explicit cancel — a re-render must never
+  // resurrect a countdown the user just cancelled.
+  const [countdownDismissed, setCountdownDismissed] = useState(false)
 
   const scheduledJobs = useStore($scheduledResumeJobs)
   const scheduledJob = scheduledJobs[messageId]
+
+  // Fetch the profile's current default once per mount so a countdown can
+  // key off it even if the settings toggle was flipped in a prior session
+  // (loadRateLimitDefaultRecovery populates $rateLimitDefaultRecovery, which
+  // this component then reads reactively above).
+  useEffect(() => {
+    void loadRateLimitDefaultRecovery()
+  }, [])
 
   if (!isRateLimitSurface(surface) || !surface) {
     return null
@@ -622,32 +692,49 @@ const RateLimitRecoveryActions: FC<{ messageId: string }> = ({ messageId }) => {
     }
   }
 
+  // Auto-countdown only when: the default is resume_at_reset, a reset time
+  // exists to schedule against, no job is scheduled yet for this failure,
+  // and the user hasn't already cancelled it on this card.
+  const showCountdown =
+    defaultRecovery === 'resume_at_reset' && resetAt !== undefined && !scheduledJob && !countdownDismissed
+
   return (
-    <div className="flex flex-wrap items-center gap-1.5" data-slot="aui-rate-limit-actions">
-      {scheduledJob ? (
-        <button className="aui-error-action" onClick={() => void cancelResume()} type="button">
-          {copy.jobCancel}
-        </button>
-      ) : (
-        resetAt !== undefined && (
-          <>
-            <button className="aui-error-action" disabled={scheduling} onClick={() => void resumeAtReset()} type="button">
-              {copy.resumeAtReset}
-            </button>
-            <label className="flex items-center gap-1 text-[0.7rem] opacity-80">
-              <input checked={makeDefault} onChange={e => setMakeDefault(e.target.checked)} type="checkbox" />
-              {copy.makeDefault}
-            </label>
-          </>
-        )
+    <div className="flex flex-col gap-1.5" data-slot="aui-rate-limit-actions">
+      {showCountdown && (
+        <AutoResumeCountdown onCancel={() => setCountdownDismissed(true)} onElapsed={() => void resumeAtReset()} />
       )}
-      {surface.fallbackAvailable === true ? (
-        <button className="aui-error-action" disabled={switching} onClick={() => void switchModelAndRetry()} type="button">
-          {copy.switchModelAndRetry}
-        </button>
-      ) : (
-        inRouter && <SwitchProviderAction label={copy.configureFallback} />
-      )}
+      <div className="flex flex-wrap items-center gap-1.5">
+        {scheduledJob ? (
+          <button className="aui-error-action" onClick={() => void cancelResume()} type="button">
+            {copy.jobCancel}
+          </button>
+        ) : (
+          resetAt !== undefined &&
+          !showCountdown && (
+            <>
+              <button
+                className="aui-error-action"
+                disabled={scheduling}
+                onClick={() => void resumeAtReset()}
+                type="button"
+              >
+                {copy.resumeAtReset}
+              </button>
+              <label className="flex items-center gap-1 text-[0.7rem] opacity-80">
+                <input checked={makeDefault} onChange={e => setMakeDefault(e.target.checked)} type="checkbox" />
+                {copy.makeDefault}
+              </label>
+            </>
+          )
+        )}
+        {surface.fallbackAvailable === true ? (
+          <button className="aui-error-action" disabled={switching} onClick={() => void switchModelAndRetry()} type="button">
+            {copy.switchModelAndRetry}
+          </button>
+        ) : (
+          inRouter && <SwitchProviderAction label={copy.configureFallback} />
+        )}
+      </div>
     </div>
   )
 }
