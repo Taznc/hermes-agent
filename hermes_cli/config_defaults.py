@@ -3342,6 +3342,17 @@ DEFAULT_CONFIG = {
 
     # ``hermes update`` behaviour.
     "updates": {
+        # Whether Hermes may check upstream (GitHub) for newer commits/
+        # releases at all — the startup banner prefetch, `hermes --version`,
+        # the TUI gateway prefetch, and the dashboard's cached (non-forced)
+        # System-page check all route through this one flag. Set to false
+        # to fully silence upstream contact for update checks, e.g. on a
+        # local dev build/fork where "you're behind main" noise is not
+        # wanted. `HERMES_DEV=1` (the existing local-checkout dev-mode
+        # env guard) disables the same checks unconditionally, without
+        # needing a config edit. Does not affect `hermes update` itself,
+        # which is always an explicit user action.
+        "check_for_updates": True,
         # Pre-update safety backup — ONE consolidated mechanism, three modes:
         #
         #   quick (default) — snapshot critical small state files (pairing
@@ -3614,6 +3625,16 @@ DEFAULT_CONFIG = {
         # every invocation (MCP backend, status, doctor, install). Set true
         # to let cua-driver use its own default (telemetry on).
         "cua_telemetry": False,
+        # Whether the backend may background-check trycua/cua's GitHub
+        # Releases for a newer cua-driver build (`_maybe_nudge_update()`,
+        # once per process, ~20h cache) and log a one-line nudge. This is a
+        # distinct upstream contact point from Hermes' own `updates.
+        # check_for_updates` — it asks about the third-party driver
+        # binary, not Hermes itself. `HERMES_DEV=1` (the existing
+        # local-checkout dev-mode env guard) disables it unconditionally
+        # too. Explicit `hermes computer-use status`/`install --upgrade`
+        # checks are user-initiated and always run regardless of this flag.
+        "check_for_driver_updates": True,
         # Cap driver screenshot longest edge (pixels) via set_config on
         # session start. Shrinks SOM multimodal payloads; 0 disables.
         "max_image_dimension": 1456,
@@ -3731,6 +3752,15 @@ DEFAULT_CONFIG = {
         # explicit ozone backend, or GPU workaround flags. A list of strings;
         # a single string is also accepted and shell-split.
         "electron_flags": [],
+        # Whether the Desktop app may contact upstream (git ls-remote/fetch
+        # against origin, plus the GitHub compare API) to check for client
+        # self-updates. Covers both the background poller (startup + 30-minute
+        # interval + window-focus recheck) and the "Check for Updates..." menu
+        # item. Set false on a dev checkout to stop the app pinging upstream
+        # while iterating locally — bridged to HERMES_DESKTOP_DISABLE_UPDATE_CHECKS
+        # (an explicit env var still wins). Does not affect `hermes update`
+        # run manually from the CLI.
+        "auto_update_checks_enabled": True,
         # Linux Ozone backend hint, bridged to ELECTRON_OZONE_PLATFORM_HINT
         # at launch (an explicit env var still wins). "auto" is Chromium's
         # default — Wayland on a Wayland session, X11 otherwise.

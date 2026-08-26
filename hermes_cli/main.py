@@ -8136,29 +8136,33 @@ def _detect_linux_password_store() -> str | None:
     return None
 
 
-def _desktop_launch_options() -> tuple[list[str], str, str, str]:
+def _desktop_launch_options() -> tuple[list[str], str, str, str, bool]:
     """Read `desktop.*` launch options from config.yaml.
 
-    Returns ``(electron_flags, disable_gpu, password_store, ozone_hint)`` where
-    ``electron_flags`` is a list of extra Electron CLI flags, ``disable_gpu``
-    is one of "auto"/"1"/"0" (normalized for the HERMES_DESKTOP_DISABLE_GPU
-    env var the Electron app reads), ``password_store`` is "auto" or one
-    of the Chromium password-store backends (unknown values normalize to
-    "auto"), and ``ozone_hint`` is one of "auto"/"x11"/"wayland" (normalized
-    for ``ELECTRON_OZONE_PLATFORM_HINT``). Best-effort: any config error
-    yields the safe defaults ``([], "auto", "auto", "auto")`` so a malformed
-    config never blocks the launch.
+    Returns ``(electron_flags, disable_gpu, password_store, ozone_hint,
+    auto_update_checks_enabled)`` where ``electron_flags`` is a list of extra
+    Electron CLI flags, ``disable_gpu`` is one of "auto"/"1"/"0" (normalized
+    for the HERMES_DESKTOP_DISABLE_GPU env var the Electron app reads),
+    ``password_store`` is "auto" or one of the Chromium password-store
+    backends (unknown values normalize to "auto"), ``ozone_hint`` is one of
+    "auto"/"x11"/"wayland" (normalized for ``ELECTRON_OZONE_PLATFORM_HINT``),
+    and ``auto_update_checks_enabled`` is whether the Desktop app may contact
+    upstream to check for client self-updates (bridged to
+    HERMES_DESKTOP_DISABLE_UPDATE_CHECKS). Best-effort: any config error
+    yields the safe defaults ``([], "auto", "auto", "auto", True)`` so a
+    malformed config never blocks the launch.
     """
     flags: list[str] = []
     disable_gpu = "auto"
     password_store = "auto"
     ozone_hint = "auto"
+    auto_update_checks_enabled = True
     try:
         from hermes_cli.config import load_config
 
         desktop_cfg = (load_config() or {}).get("desktop") or {}
     except Exception:
-        return flags, disable_gpu, password_store, ozone_hint
+        return flags, disable_gpu, password_store, ozone_hint, auto_update_checks_enabled
 
     raw_flags = desktop_cfg.get("electron_flags")
     if isinstance(raw_flags, str):
@@ -8189,7 +8193,19 @@ def _desktop_launch_options() -> tuple[list[str], str, str, str]:
         low_ozone = raw_ozone.strip().lower()
         if low_ozone in ("auto", "x11", "wayland"):
             ozone_hint = low_ozone
-    return flags, disable_gpu, password_store, ozone_hint
+
+    raw_auto_update = desktop_cfg.get("auto_update_checks_enabled", True)
+    if isinstance(raw_auto_update, bool):
+        auto_update_checks_enabled = raw_auto_update
+    elif isinstance(raw_auto_update, str):
+        auto_update_checks_enabled = raw_auto_update.strip().lower() not in (
+            "0",
+            "false",
+            "no",
+            "off",
+        )
+
+    return flags, disable_gpu, password_store, ozone_hint, auto_update_checks_enabled
 
 
 def _register_linux_desktop_entry() -> None:
@@ -8240,16 +8256,24 @@ def cmd_gui(args: argparse.Namespace):
         env["HERMES_DESKTOP_CWD"] = os.getcwd()
 
     # Desktop launch options from config.yaml (`desktop.electron_flags`,
-    # `desktop.disable_gpu`, `desktop.ozone_platform_hint`). The GPU policy
-    # and ozone hint are bridged to env vars the Electron/Chromium process
+    # `desktop.disable_gpu`, `desktop.ozone_platform_hint`,
+    # `desktop.auto_update_checks_enabled`). The GPU policy, ozone hint, and
+    # update-check gate are bridged to env vars the Electron/Chromium process
     # already reads; an explicit env var still wins over config so
-    # `HERMES_DESKTOP_DISABLE_GPU=... hermes desktop` and
-    # `ELECTRON_OZONE_PLATFORM_HINT=... hermes desktop` keep working.
-    config_electron_flags, config_disable_gpu, config_password_store, config_ozone_hint = (
-        _desktop_launch_options()
-    )
+    # `HERMES_DESKTOP_DISABLE_GPU=... hermes desktop`,
+    # `ELECTRON_OZONE_PLATFORM_HINT=... hermes desktop`, and
+    # `HERMES_DESKTOP_DISABLE_UPDATE_CHECKS=... hermes desktop` keep working.
+    (
+        config_electron_flags,
+        config_disable_gpu,
+        config_password_store,
+        config_ozone_hint,
+        config_auto_update_checks_enabled,
+    ) = _desktop_launch_options()
     if config_disable_gpu != "auto" and "HERMES_DESKTOP_DISABLE_GPU" not in os.environ:
         env["HERMES_DESKTOP_DISABLE_GPU"] = config_disable_gpu
+    if not config_auto_update_checks_enabled and "HERMES_DESKTOP_DISABLE_UPDATE_CHECKS" not in os.environ:
+        env["HERMES_DESKTOP_DISABLE_UPDATE_CHECKS"] = "1"
     if config_ozone_hint != "auto" and "ELECTRON_OZONE_PLATFORM_HINT" not in os.environ:
         env["ELECTRON_OZONE_PLATFORM_HINT"] = config_ozone_hint
 

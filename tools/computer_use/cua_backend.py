@@ -1220,6 +1220,36 @@ def cua_driver_update_nudge() -> Optional[str]:
     )
 
 
+def _driver_update_checks_disabled() -> bool:
+    """True when the background cua-driver update nudge should stay silent.
+
+    ``_maybe_nudge_update()`` runs a `cua-driver check-update --json` shell-out
+    on every ``CuaDriverBackend.start()`` — a distinct upstream (trycua/cua's
+    GitHub Releases) from Hermes' own update check, so it isn't covered by
+    ``hermes_cli.banner._update_checks_disabled``. Mirrors that gate's two
+    guards for consistency:
+
+    - ``HERMES_DEV=1`` — the existing dev-mode env guard (local checkout,
+      not a packaged install); a dev build shelling out to check a
+      third-party driver's release feed on every action is exactly the
+      upstream noise this flag exists to silence.
+    - ``computer_use.check_for_driver_updates: false`` in config — an
+      explicit, persistent opt-out independent of the environment.
+
+    Never raises — a config read failure falls back to checks enabled (the
+    pre-existing behavior), since this only gates a best-effort, swallowed
+    nudge, never functionality.
+    """
+    if os.environ.get("HERMES_DEV") == "1":
+        return True
+    try:
+        if _computer_use_cfg().get("check_for_driver_updates") is False:
+            return True
+    except Exception:
+        pass
+    return False
+
+
 _update_checked = False
 
 # One auto-repair attempt per process. The runtime-contract gate in
@@ -1271,11 +1301,19 @@ def _maybe_repair_runtime_contract(contract: Dict[str, Any]) -> Dict[str, Any]:
 
 def _maybe_nudge_update() -> None:
     """Emit an update nudge at most once per process, off-thread so the
-    (cached, ~20h) GitHub poll never blocks the first computer_use action."""
+    (cached, ~20h) GitHub poll never blocks the first computer_use action.
+
+    No-ops entirely (never spawns the thread, never shells out to
+    cua-driver, never touches the network) when
+    ``_driver_update_checks_disabled()`` — dev build or explicit config
+    opt-out.
+    """
     global _update_checked
     if _update_checked:
         return
     _update_checked = True
+    if _driver_update_checks_disabled():
+        return
 
     def _run() -> None:
         try:

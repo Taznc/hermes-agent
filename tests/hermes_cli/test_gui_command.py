@@ -839,7 +839,7 @@ def test_gui_skips_desktop_entry_off_linux(tmp_path, monkeypatch):
 def test_desktop_launch_options_normalizes_password_store(raw, expected):
     cfg = {"desktop": {"password_store": raw}}
     with patch("hermes_cli.config.load_config", return_value=cfg):
-        _, _, store, _ = cli_main._desktop_launch_options()
+        _, _, store, _, _ = cli_main._desktop_launch_options()
     assert store == expected
 
 
@@ -857,13 +857,80 @@ def test_desktop_launch_options_normalizes_ozone_hint(raw, expected):
     """``desktop.ozone_platform_hint`` normalizes to x11/wayland/auto."""
     cfg = {"desktop": {"ozone_platform_hint": raw}}
     with patch("hermes_cli.config.load_config", return_value=cfg):
-        _, _, _, hint = cli_main._desktop_launch_options()
+        _, _, _, hint, _ = cli_main._desktop_launch_options()
     assert hint == expected
 
 
 def test_desktop_launch_options_ozone_hint_defaults_auto():
     with patch("hermes_cli.config.load_config", return_value={}):
         assert cli_main._desktop_launch_options()[3] == "auto"
+
+
+@pytest.mark.parametrize(
+    "raw,expected",
+    [
+        (True, True),
+        (False, False),
+        ("true", True),
+        ("false", False),
+        ("0", False),
+        ("off", False),
+        ("yes", True),
+    ],
+)
+def test_desktop_launch_options_normalizes_auto_update_checks_enabled(raw, expected):
+    cfg = {"desktop": {"auto_update_checks_enabled": raw}}
+    with patch("hermes_cli.config.load_config", return_value=cfg):
+        assert cli_main._desktop_launch_options()[4] is expected
+
+
+def test_desktop_launch_options_auto_update_checks_defaults_enabled():
+    with patch("hermes_cli.config.load_config", return_value={}):
+        assert cli_main._desktop_launch_options()[4] is True
+
+
+def test_gui_bridges_disabled_update_checks_to_launch_env(tmp_path, monkeypatch):
+    """``desktop.auto_update_checks_enabled: false`` sets
+    ``HERMES_DESKTOP_DISABLE_UPDATE_CHECKS=1`` on the launched Electron process,
+    and an explicit env var always wins over config."""
+    root = _make_desktop_tree(tmp_path)
+    monkeypatch.setattr(cli_main, "PROJECT_ROOT", root)
+    _make_packaged_executable(root, monkeypatch)
+    monkeypatch.delenv("HERMES_DESKTOP_DISABLE_UPDATE_CHECKS", raising=False)
+
+    ok = subprocess.CompletedProcess([], 0)
+    cfg = {"desktop": {"auto_update_checks_enabled": False}}
+
+    with patch("hermes_cli.main.shutil.which", return_value="/usr/bin/npm"), \
+         patch("hermes_cli.main._run_npm_install_deterministic", return_value=ok), \
+         patch("hermes_cli.main._desktop_build_needed", return_value=True), \
+         patch("hermes_cli.main._write_desktop_build_stamp"), \
+         patch("hermes_cli.main._desktop_macos_relaunchable_fixup"), \
+         patch("hermes_cli.main._desktop_linux_sandbox_fixup", return_value=True), \
+         patch("hermes_cli.config.load_config", return_value=cfg), \
+         patch("hermes_cli.linux_desktop_entry.install_desktop_entry", return_value=None), \
+         patch("hermes_cli.main.subprocess.run", side_effect=[ok, ok]) as mock_run, \
+         pytest.raises(SystemExit):
+        cli_main.cmd_gui(_ns())
+
+    launch_env = mock_run.call_args_list[1].kwargs["env"]
+    assert launch_env.get("HERMES_DESKTOP_DISABLE_UPDATE_CHECKS") == "1"
+
+    # Default config (auto_update_checks_enabled=True) never sets the env var.
+    with patch("hermes_cli.main.shutil.which", return_value="/usr/bin/npm"), \
+         patch("hermes_cli.main._run_npm_install_deterministic", return_value=ok), \
+         patch("hermes_cli.main._desktop_build_needed", return_value=True), \
+         patch("hermes_cli.main._write_desktop_build_stamp"), \
+         patch("hermes_cli.main._desktop_macos_relaunchable_fixup"), \
+         patch("hermes_cli.main._desktop_linux_sandbox_fixup", return_value=True), \
+         patch("hermes_cli.config.load_config", return_value={}), \
+         patch("hermes_cli.linux_desktop_entry.install_desktop_entry", return_value=None), \
+         patch("hermes_cli.main.subprocess.run", side_effect=[ok, ok]) as mock_run2, \
+         pytest.raises(SystemExit):
+        cli_main.cmd_gui(_ns())
+
+    launch_env = mock_run2.call_args_list[1].kwargs["env"]
+    assert "HERMES_DESKTOP_DISABLE_UPDATE_CHECKS" not in launch_env
 
 
 def test_gui_bridges_ozone_hint_to_launch_env(tmp_path, monkeypatch):
