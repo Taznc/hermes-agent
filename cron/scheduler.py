@@ -5115,6 +5115,141 @@ class _BoundedCronSessionDB:
         return _bounded
 
 
+def _run_resume_session_job(
+    job: dict,
+    job_id: str,
+    job_name: str,
+    *,
+    extra_prompt: Optional[str] = None,
+) -> tuple[bool, str, str, Optional[str]]:
+    """Resume an EXISTING session and resubmit its stored prompt.
+
+    Drives the in-process gateway's own ``session.resume`` + ``prompt.submit``
+    JSON-RPC handlers (``tui_gateway/methods_session.py``,
+    ``tui_gateway/methods_prompt.py``) — the exact RPC path Desktop's own
+    resume/retry UI already uses — instead of constructing a brand-new
+    ``AIAgent`` under a synthetic ``cron_{job_id}_{timestamp}`` session id.
+    This is what lets a scheduled "resume at reset" fire retry the ORIGINAL
+    rate-limited turn in its own conversation rather than starting a fresh
+    one nobody will ever see.
+
+    Requires the JSON-RPC gateway (``tui_gateway.server``) to already be
+    loaded in this process — a standalone ``hermes cron tick`` invocation
+    with no live gateway/session registry has nothing to resume into. That
+    case, a target session that no longer exists, and any other resume/submit
+    RPC failure are all treated as a harmless no-op (success=True, silent
+    delivery) per this feature's contract: a resume job must never crash the
+    scheduler or spam an error alert just because its one-shot window found
+    the session already gone or already handled another way.
+    """
+    session_id = str(job.get("resume_session_id") or "").strip()
+    now_iso = _hermes_now().strftime("%Y-%m-%d %H:%M:%S")
+
+    def _noop(reason: str) -> tuple[bool, str, str, None]:
+        logger.info(
+            "Job '%s': resume_session_id %r no-op — %s", job_id, session_id, reason
+        )
+        doc = (
+            f"# Cron Job: {job_name}\n\n"
+            f"**Job ID:** {job_id}\n"
+            f"**Run Time:** {now_iso}\n"
+            f"**Mode:** resume_session_id\n"
+            f"**Target session:** {session_id}\n"
+            f"**Status:** no-op\n\n"
+            f"{reason}\n"
+        )
+        return True, doc, SILENT_MARKER, None
+
+    if not session_id:
+        return _noop("no resume_session_id on the job record")
+
+    server = sys.modules.get("tui_gateway.server")
+    methods = getattr(server, "_methods", None) if server is not None else None
+    if not isinstance(methods, dict):
+        return _noop(
+            "no live gateway session registry in this process (standalone "
+            "cron tick, or a backend that never loaded tui_gateway) — "
+            "nothing to resume into"
+        )
+
+    resume_method = methods.get("session.resume")
+    submit_method = methods.get("prompt.submit")
+    if resume_method is None or submit_method is None:
+        return _noop("gateway RPC handlers unavailable in this process")
+
+    def _rpc_error_detail(response: Any) -> str:
+        if not isinstance(response, dict):
+            return "malformed RPC response"
+        error = response.get("error")
+        if isinstance(error, dict):
+            return str(error.get("message") or "unknown error")
+        return "unknown error"
+
+    rid = f"cron-resume-{job_id}"
+    try:
+        resume_response = resume_method(
+            rid, {"session_id": session_id, "omit_messages": True}
+        )
+    except Exception as exc:
+        logger.warning(
+            "Job '%s': session.resume raised for %s: %s", job_id, session_id, exc
+        )
+        return _noop(f"session.resume raised: {exc}")
+
+    if not isinstance(resume_response, dict) or resume_response.get("error"):
+        return _noop(
+            f"session.resume failed: {_rpc_error_detail(resume_response)}"
+        )
+
+    result = resume_response.get("result") or {}
+    ui_session_id = result.get("session_id")
+    if not ui_session_id:
+        return _noop("session.resume returned no session_id")
+
+    prompt_text = str(job.get("prompt") or "").strip()
+    if extra_prompt:
+        prompt_text = (
+            f"{prompt_text}\n\n## Run Context\n{extra_prompt}"
+            if prompt_text
+            else str(extra_prompt)
+        )
+    if not prompt_text:
+        return _noop("job prompt is empty — nothing to resubmit")
+
+    try:
+        submit_response = submit_method(
+            rid, {"session_id": ui_session_id, "text": prompt_text}
+        )
+    except Exception as exc:
+        logger.warning(
+            "Job '%s': prompt.submit raised for %s: %s", job_id, ui_session_id, exc
+        )
+        return _noop(f"prompt.submit raised: {exc}")
+
+    if not isinstance(submit_response, dict) or submit_response.get("error"):
+        return _noop(
+            f"prompt.submit failed: {_rpc_error_detail(submit_response)}"
+        )
+
+    logger.info(
+        "Job '%s': resumed session %s and resubmitted the stored prompt",
+        job_id,
+        session_id,
+    )
+    doc = (
+        f"# Cron Job: {job_name}\n\n"
+        f"**Job ID:** {job_id}\n"
+        f"**Run Time:** {now_iso}\n"
+        f"**Mode:** resume_session_id\n"
+        f"**Target session:** {session_id}\n"
+        f"**Status:** resumed and resubmitted the stored prompt\n"
+    )
+    # The resumed turn now streams asynchronously inside its OWN session —
+    # that session's transcript is the real deliverable, not this cron run's
+    # own output. SILENT_MARKER blocks a redundant delivery on top of it.
+    return True, doc, SILENT_MARKER, None
+
+
 def run_job(
     job: dict,
     *,
@@ -5271,6 +5406,17 @@ def run_job(
             f"{output}\n"
         )
         return True, doc, output, None
+
+    # ---------------------------------------------------------------
+    # resume_session_id short-circuit — this job re-submits its stored
+    # prompt into an EXISTING local session instead of spawning a fresh
+    # cron_{job_id}_{timestamp} AIAgent. Checked before the empty-payload
+    # guard below (a resume job's whole point is a short "retry" instruction,
+    # never a script/skill payload) and before any AIAgent/SessionDB
+    # construction — a resume never needs either.
+    # ---------------------------------------------------------------
+    if job.get("resume_session_id"):
+        return _run_resume_session_job(job, job_id, job_name, extra_prompt=extra_prompt)
 
     # ---------------------------------------------------------------
     # Fail-closed guard for legacy / hand-edited agent jobs that have nothing
