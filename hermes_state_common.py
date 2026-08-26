@@ -326,6 +326,31 @@ def _sql_session_last_active_by_id(session_id_expr: str) -> str:
     )
 
 
+def _sql_served_route_column(alias: str, column: str) -> str:
+    """SQL expression for the ACTUALLY-SERVED route on a session's most
+    recent completed turn (Phase 2.13 sidebar identity).
+
+    ``sessions.model`` / ``sessions.billing_provider`` are only ever the
+    FIRST accounted route (``update_token_counts`` COALESCE-backfills them —
+    see its docstring) — a silent mid-conversation fallback never rewrites
+    them, so they go stale the moment a session falls back after its first
+    successful call. ``session_model_usage`` (schema v20, per-model
+    attribution) records every distinct (model, provider) route touched by
+    the main loop (``task=''``) with a ``last_seen`` timestamp, so the
+    freshest main-loop row there IS the latest-served route. Falls back to
+    the ``sessions`` column for legacy sessions with no session_model_usage
+    rows (pre-v20, or a session that never recorded a delta) — which also
+    naturally reads as "no mismatch" against the configured route.
+
+    ``column`` must be ``"model"`` or ``"billing_provider"``.
+    """
+    return (
+        f"COALESCE(NULLIF((SELECT smu.{column} FROM session_model_usage smu "
+        f"WHERE smu.session_id = {alias}.id AND smu.task = '' "
+        f"ORDER BY smu.last_seen DESC LIMIT 1), ''), {alias}.{column})"
+    )
+
+
 SCHEMA_VERSION = 26
 
 

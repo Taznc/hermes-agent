@@ -1791,6 +1791,10 @@ export const ar = defineLocale({
       openInNewTab: 'فتح في تبويب جديد',
       openInSplit: 'فتح في تقسيم',
       ownedByProfile: profile => `مملوكة للملف الشخصي ${profile}`,
+      providerConfigured: family => `النموذج المُهيأ: ${family}`,
+      providerVia: family => `عبر ${family}`,
+      providerConfiguredVia: (configuredFamily, servedFamily) =>
+        `النموذج المُهيأ: ${configuredFamily}، ويُخدَم حاليًا عبر ${servedFamily}`,
       untitledChat: id => `محادثة ${id}`,
       handoffOrigin: platform => `قادمة من ${platform}`,
       renamed: 'تمت إعادة التسمية',

@@ -95,6 +95,47 @@ export function displayModelName(model: string): string {
   return modelDisplayParts(model).name
 }
 
+// Provider ids whose FAMILY reads differently than their raw slug — mirrors
+// the small subset of `hermes_cli.models.CANONICAL_PROVIDERS` labels a
+// session-sidebar chip actually needs to disambiguate (Phase 2.13). This is
+// deliberately NOT a full copy of the backend's ~40-entry provider table:
+// unlisted providers fall back to a title-cased slug, which is an accurate,
+// non-misleading label (never implies a false Claude/Codex identity) even
+// though it won't win a beauty contest for every long-tail provider id.
+const PROVIDER_FAMILY_OVERRIDES: Readonly<Record<string, string>> = {
+  anthropic: 'Claude',
+  'claude-code': 'Claude',
+  'openai-codex': 'Codex',
+  'openai-api': 'OpenAI',
+  custom: 'Custom'
+}
+
+/** Bare billing buckets that are not a routable provider identity on their
+ *  own — mirrors `hermes_state._BARE_BILLING_PROVIDERS`. A session whose
+ *  configured/served provider resolved to one of these has no opinion worth
+ *  showing (never a Claude/Codex family). */
+const BARE_PROVIDER_BUCKETS = new Set(['auto'])
+
+/** Resolve a raw Hermes provider id (`session.configured_provider` /
+ *  `session.served_provider`) to a short display family — "Claude",
+ *  "Codex", or a title-cased fallback for every other provider. Returns
+ *  `null` for empty/bare-bucket input so callers (legacy sessions, sessions
+ *  that never resolved a provider) can render nothing instead of a
+ *  misleading guess. */
+export function providerFamilyLabel(provider: null | string | undefined): string | null {
+  const raw = (provider || '').trim().toLowerCase()
+
+  if (!raw || BARE_PROVIDER_BUCKETS.has(raw)) {return null}
+
+  if (PROVIDER_FAMILY_OVERRIDES[raw]) {return PROVIDER_FAMILY_OVERRIDES[raw]}
+
+  return raw
+    .split(/[-_]+/)
+    .filter(Boolean)
+    .map(word => word.charAt(0).toUpperCase() + word.slice(1))
+    .join(' ')
+}
+
 /** Status bar trigger label — model name plus the live session state (effort/fast).
  *  `defaultEffort` is the profile's configured level, used when the surface has
  *  no explicit effort so the label never advertises a default the agent won't use. */

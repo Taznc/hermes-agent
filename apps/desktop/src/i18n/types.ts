@@ -1928,6 +1928,18 @@ export interface Translations {
       draftSession: string
       handoffOrigin: (platform: string) => string
       ownedByProfile: (profile: string) => string
+      /** Accessible name for the primary configured-model chip when the
+       *  actually-served route for the latest turn matches (the common,
+       *  no-mismatch case) — e.g. "Configured model: Claude". */
+      providerConfigured: (family: string) => string
+      /** Visible secondary text AND tooltip label shown only when the
+       *  latest completed turn's actually-served provider differs from the
+       *  configured one (e.g. after a rate-limit fallback) — e.g. "via
+       *  Codex". */
+      providerVia: (family: string) => string
+      /** Accessible name for the chip when a mismatch is showing — e.g.
+       *  "Configured model: Claude, currently served via Codex". */
+      providerConfiguredVia: (configuredFamily: string, servedFamily: string) => string
       renamed: string
       renameFailed: string
       renameTitle: string
