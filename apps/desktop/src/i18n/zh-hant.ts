@@ -1898,6 +1898,10 @@ export const zhHant = defineLocale({
       draftSession: '草稿 — 尚未傳送',
       handoffOrigin: platform => `從 ${platform} 轉接`,
       ownedByProfile: profile => `設定檔：${profile}`,
+      providerConfigured: family => `設定的模型：${family}`,
+      providerVia: family => `經由 ${family}`,
+      providerConfiguredVia: (configuredFamily, servedFamily) =>
+        `設定的模型：${configuredFamily}，目前經由 ${servedFamily} 提供服務`,
       renamed: '已重新命名',
       renameFailed: '重新命名失敗',
       renameTitle: '重新命名工作階段',

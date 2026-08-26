@@ -2268,6 +2268,10 @@ export const en: Translations = {
       draftSession: 'Draft — nothing sent yet',
       handoffOrigin: platform => `Handed off from ${platform}`,
       ownedByProfile: profile => `Profile: ${profile}`,
+      providerConfigured: family => `Configured model: ${family}`,
+      providerVia: family => `via ${family}`,
+      providerConfiguredVia: (configuredFamily, servedFamily) =>
+        `Configured model: ${configuredFamily}, currently served via ${servedFamily}`,
       renamed: 'Renamed',
       renameFailed: 'Rename failed',
       renameTitle: 'Rename session',

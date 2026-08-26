@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest'
 
-import { currentPickerSelection, displayModelName, formatModelStatusLabel } from './model-status-label'
+import { currentPickerSelection, displayModelName, formatModelStatusLabel, providerFamilyLabel } from './model-status-label'
 import { reasoningEffortLabel } from './reasoning-effort'
 
 describe('model-status-label', () => {
@@ -68,6 +68,33 @@ describe('model-status-label', () => {
 
     it('falls back to the store while options are still loading', () => {
       expect(currentPickerSelection(store, undefined)).toEqual(store)
+    })
+  })
+
+  describe('providerFamilyLabel', () => {
+    it('maps known provider ids to their family', () => {
+      expect(providerFamilyLabel('anthropic')).toBe('Claude')
+      expect(providerFamilyLabel('claude-code')).toBe('Claude')
+      expect(providerFamilyLabel('openai-codex')).toBe('Codex')
+      expect(providerFamilyLabel('openai-api')).toBe('OpenAI')
+    })
+
+    it('is case-insensitive', () => {
+      expect(providerFamilyLabel('Anthropic')).toBe('Claude')
+      expect(providerFamilyLabel('OPENAI-CODEX')).toBe('Codex')
+    })
+
+    it('title-cases an unrecognized provider instead of guessing a family', () => {
+      expect(providerFamilyLabel('fireworks')).toBe('Fireworks')
+      expect(providerFamilyLabel('opencode-zen')).toBe('Opencode Zen')
+    })
+
+    it('returns null for empty, missing, or a bare billing bucket', () => {
+      expect(providerFamilyLabel(null)).toBeNull()
+      expect(providerFamilyLabel(undefined)).toBeNull()
+      expect(providerFamilyLabel('')).toBeNull()
+      expect(providerFamilyLabel('  ')).toBeNull()
+      expect(providerFamilyLabel('auto')).toBeNull()
     })
   })
 })

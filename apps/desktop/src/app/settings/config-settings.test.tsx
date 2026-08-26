@@ -37,9 +37,13 @@ vi.mock('@/store/profile', async () => {
 })
 
 vi.mock('@/store/settings-scope', async () => {
-  const { atom } = await import('nanostores')
+  const { atom, computed } = await import('nanostores')
+  const override = atom<null | string>(null)
 
-  return { $settingsScopeOverride: atom<null | string>(null) }
+  return {
+    $settingsScopeOverride: override,
+    $settingsRequestProfile: computed(override, (o): string | undefined => o ?? undefined)
+  }
 })
 
 vi.mock('@/store/keep-awake', async () => {

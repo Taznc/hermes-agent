@@ -608,7 +608,14 @@ export const $profileScope = computed([$showAllProfiles, $activeGatewayProfile],
 // Switch the active context to `name`: leave "All profiles" mode, point new
 // chats at it, and swap the single live gateway onto its backend (which moves
 // $activeGatewayProfile → name, so $profileScope follows).
-export function selectProfile(name: string): void {
+//
+// `forceLocal` pins the activation to the LOCAL pool regardless of whichever
+// source is currently browsed — needed by selectAgent's explicit
+// connectionId:null case (the command palette's "this device" row), which
+// must not inherit activateOnCurrentSource's "stay on the browsed remote"
+// behavior below (#92194): that behavior is for bare rail/menu picks with no
+// explicit connection in play, not for an explicit "go local" request.
+export function selectProfile(name: string, options?: { forceLocal?: boolean }): void {
   const target = normalizeProfileKey(name)
 
   // Switching profiles (or coming back from the all-profiles browse view) starts
@@ -631,7 +638,9 @@ export function selectProfile(name: string): void {
   // A profile with a remote override can fail to activate because the remote
   // host rejected its saved token (rotated/revoked). That must surface as a
   // "re-enter token" affordance, never a silently dead profile (#91349).
-  void activateOnCurrentSource(target).catch(error => notifyRemoteOverrideAuthFailure(target, error))
+  void activateOnCurrentSource(target, options?.forceLocal ?? false).catch(error =>
+    notifyRemoteOverrideAuthFailure(target, error)
+  )
 }
 
 // Route a profile pick at the source the user is LOOKING at. $profiles is the
@@ -642,8 +651,11 @@ export function selectProfile(name: string): void {
 // remote source opened a local backend of the same name and dropped the user
 // back home, making the pick look like it never took. A null connection id
 // means the primary is live, which is exactly the legacy path.
-function activateOnCurrentSource(target: string): Promise<void> {
-  const connectionId = activeGatewayConnectionId()
+//
+// `forceLocal` bypasses that "current source" lookup entirely and always
+// targets the local pool — see selectProfile's doc above.
+function activateOnCurrentSource(target: string, forceLocal = false): Promise<void> {
+  const connectionId = forceLocal ? null : activeGatewayConnectionId()
 
   return connectionId ? ensureGatewayAgent(connectionId, target) : ensureGatewayProfile(target)
 }
@@ -653,7 +665,9 @@ function activateOnCurrentSource(target: string): Promise<void> {
 // view, point new chats at it, start fresh when the context actually changes),
 // but the swap goes through ensureGatewayAgent so the socket is dialed against
 // that connection's own backend. A null/local connectionId is delegated to
-// selectProfile verbatim, so the single-source path is untouched.
+// selectProfile with forceLocal — an explicit (connection, profile) pair
+// naming the local pool must land there, not wherever the app currently
+// happens to be browsing.
 //
 // "Switching" is judged on the (connection, profile) PAIR, not the profile key
 // alone — re-selecting `default` on a remote source while sitting on the local
@@ -663,7 +677,7 @@ export function selectAgent(connectionId: null | string, name: string): void {
   const connection = (connectionId ?? '').trim() || null
 
   if (!connection) {
-    selectProfile(name)
+    selectProfile(name, { forceLocal: true })
 
     return
   }

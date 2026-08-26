@@ -29,6 +29,7 @@ back to today's string-sniffing behavior (older backends keep working).
 from __future__ import annotations
 
 import logging
+import time
 from typing import Any, Optional
 
 logger = logging.getLogger(__name__)
@@ -77,6 +78,14 @@ _NON_RETRYABLE_REASONS = {
     "format_error",
     "ssl_cert_verification",
 }
+
+# Reasons for which the optional ``reset_at`` / ``fallback_available`` wire
+# fields are meaningful (Phase 2.12): a true provider-side rate limit, either
+# the caller's own account bucket or an upstream-aggregator throttle. Every
+# other reason omits both keys — a billing wall or auth failure has no
+# "resets at X" semantics, and stamping the fields there would mislead a
+# client into offering a wait/countdown action that never resolves.
+_RATE_LIMIT_RESET_REASONS = {"rate_limit", "upstream_rate_limit"}
 
 # Providers whose base_url is user-supplied rather than a known vendor —
 # transport failures against these are endpoint-config problems.
@@ -141,6 +150,8 @@ def _surface(
     retryable: bool,
     provider: str = "",
     model: str = "",
+    reset_at: Optional[float] = None,
+    fallback_available: Optional[bool] = None,
 ) -> dict:
     out = {"layer": layer, "code": code, "retryable": bool(retryable)}
     # The failing session's identity, captured at classification time so
@@ -150,6 +161,17 @@ def _surface(
         out["provider"] = provider
     if model:
         out["model"] = model
+    # Phase 2.12: optional rate-limit recovery hints. Both are omitted
+    # (never set to None/0) when the caller has no usable data — see the
+    # module docstring on _RATE_LIMIT_RESET_REASONS for why omission is a
+    # distinct, meaningful state from an explicit false/0 on the wire.
+    if code in _RATE_LIMIT_RESET_REASONS and reset_at is not None:
+        try:
+            out["reset_at"] = float(reset_at)
+        except (TypeError, ValueError):
+            pass
+    if fallback_available is not None:
+        out["fallback_available"] = bool(fallback_available)
     return out
 
 
@@ -170,6 +192,20 @@ def build_error_surface_from_result(
         if not error_text and not reason:
             return None
 
+        # Phase 2.12: optional rate-limit recovery hints threaded through
+        # from conversation_loop.py's terminal-failure result dicts (see
+        # agent/conversation_loop.py's ``_resolve_rate_limit_reset_at`` /
+        # ``_fallback_availability``). Both are wire-optional — a caller on
+        # an older backend simply never sets these keys, and ``_surface``
+        # itself re-gates ``reset_at`` on the code being a rate-limit reason
+        # so a stray value here can never leak onto an unrelated failure.
+        _reset_at = result.get("reset_at")
+        if not isinstance(_reset_at, (int, float)) or isinstance(_reset_at, bool):
+            _reset_at = None
+        _fallback_available = result.get("fallback_available")
+        if not isinstance(_fallback_available, bool):
+            _fallback_available = None
+
         # Disk-full wins outright: the fix (free space) is unrelated to the
         # provider stack, and hermes_state owns the pattern list.
         try:
@@ -181,7 +217,10 @@ def build_error_surface_from_result(
             pass
 
         if result.get("billing_block") or reason in ("billing", "billing_unverified"):
-            return _surface(LAYER_BILLING, reason or "billing", False, provider, model)
+            return _surface(
+                LAYER_BILLING, reason or "billing", False, provider, model,
+                reset_at=_reset_at, fallback_available=_fallback_available,
+            )
 
         if not reason:
             # Failed result without a classified reason (legacy paths).
@@ -203,14 +242,21 @@ def build_error_surface_from_result(
         retryable = result.get("failure_retryable")
         if not isinstance(retryable, bool):
             retryable = reason not in _NON_RETRYABLE_REASONS
-        return _surface(layer, reason, retryable, provider, model)
+        return _surface(
+            layer, reason, retryable, provider, model,
+            reset_at=_reset_at, fallback_available=_fallback_available,
+        )
     except Exception:  # pragma: no cover — never break the error path
         logger.debug("error_surface: result classification failed", exc_info=True)
         return None
 
 
 def build_error_surface_from_exception(
-    exc: BaseException, provider: str = "", model: str = ""
+    exc: BaseException,
+    provider: str = "",
+    model: str = "",
+    *,
+    fallback_available: Optional[bool] = None,
 ) -> Optional[dict]:
     """Descriptor for an exception that escaped the turn dispatcher.
 
@@ -218,6 +264,13 @@ def build_error_surface_from_exception(
     ``classify_api_error`` pipeline (same taxonomy as the retry loop);
     anything else is a gateway-layer failure — a bug or environment problem
     in our own dispatcher, not a provider verdict.
+
+    ``fallback_available``: exception-path callers (e.g. tui_gateway.server)
+    have direct access to the ``agent`` object and its ``_fallback_chain`` /
+    ``_fallback_index`` state (see
+    ``agent.conversation_loop._fallback_availability`` for the same tri-state
+    logic used on the result-dict path); pass it through here when known.
+    Left unset when the caller has no such visibility — never guessed.
     """
     try:
         message = str(exc) or type(exc).__name__
@@ -243,10 +296,27 @@ def build_error_surface_from_exception(
         classified = classify_api_error(exc, provider=provider, model=model)
         reason = classified.reason.value
 
-        synthetic = {
+        synthetic: dict[str, Any] = {
             "error": classified.message or message,
             "failure_reason": reason,
         }
+        # The classifier itself stamps a best-effort reset time into
+        # error_context for rate_limit/upstream_rate_limit verdicts (see
+        # agent/error_classifier.py's ``_extract_reset_epoch_seconds``) —
+        # carry it through the same synthetic-result path used for the
+        # returned-error case so both entry points share one code path.
+        try:
+            _ctx_reset = (getattr(classified, "error_context", None) or {}).get(
+                "reset_at"
+            )
+            if isinstance(_ctx_reset, (int, float)) and not isinstance(
+                _ctx_reset, bool
+            ):
+                synthetic["reset_at"] = float(_ctx_reset)
+        except Exception:
+            pass
+        if fallback_available is not None:
+            synthetic["fallback_available"] = bool(fallback_available)
         surface = build_error_surface_from_result(
             synthetic, provider=provider, model=model
         )

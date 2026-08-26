@@ -740,6 +740,70 @@ def _billing_or_entitlement_message(
     return "\n".join(lines)
 
 
+def _resolve_rate_limit_reset_at(agent, classified) -> Optional[float]:
+    '''Best-effort epoch-seconds reset time for a rate-limited terminal failure.
+
+    Phase 2.12 (see agent/error_surface.py's wire reset_at field). Source
+    order per the card's decision: the classifier's own parsed reset (Retry-
+    After header / body fields on the response that actually failed -- see
+    agent.error_classifier._extract_reset_epoch_seconds, stamped into
+    classified.error_context["reset_at"]); when that's unavailable, fall
+    back to agent._rate_limit_state (agent/rate_limit_tracker.py) -- headers
+    captured from a PRIOR successful call on the same provider, used only
+    when fresh enough (<5 min old) to be trustworthy. Returns None when
+    nothing usable exists so the caller can omit the wire key entirely.
+    '''
+    try:
+        ctx_reset = (getattr(classified, "error_context", None) or {}).get("reset_at")
+        if isinstance(ctx_reset, (int, float)) and not isinstance(ctx_reset, bool):
+            return float(ctx_reset)
+    except Exception:
+        pass
+    try:
+        state = getattr(agent, "_rate_limit_state", None)
+        if state is not None and getattr(state, "has_data", False):
+            state_provider = (getattr(state, "provider", "") or "").strip().lower()
+            classified_provider = (getattr(classified, "provider", "") or "").strip().lower()
+            provider_match = (
+                not state_provider or not classified_provider
+                or state_provider == classified_provider
+            )
+            if provider_match and state.age_seconds < 300:
+                buckets = [
+                    b for b in (
+                        state.requests_min, state.requests_hour,
+                        state.tokens_min, state.tokens_hour,
+                    )
+                    if b.limit > 0
+                ]
+                if buckets:
+                    soonest = min(b.remaining_seconds_now for b in buckets)
+                    return time.time() + soonest
+    except Exception:
+        pass
+    return None
+
+
+def _fallback_availability(agent) -> Optional[bool]:
+    '''Tri-state fallback-chain visibility for the wire fallback_available field.
+
+    True: the chain has an untried entry for THIS turn (switch-and-retry has
+    something to switch to). False: a chain was configured but every entry
+    has been tried. None (caller must omit the wire key): no fallback chain
+    was ever configured, so there is nothing to distinguish from "exhausted"
+    -- see agent/error_surface.py's docstring on why omission carries that
+    distinct meaning.
+    '''
+    try:
+        chain = getattr(agent, "_fallback_chain", None)
+        if not chain:
+            return None
+        index = getattr(agent, "_fallback_index", 0)
+        return index < len(chain)
+    except Exception:
+        return None
+
+
 def _billing_block_dict(
     provider, base_url, model, message="", *, unverified: bool = False
 ) -> Optional[dict]:
@@ -784,6 +848,7 @@ def _billing_failure_result(
     base_url,
     model: str,
     guidance: Optional[str] = None,
+    agent=None,
 ) -> dict:
     """Structured terminal result for a billing-classified failure.
 
@@ -803,7 +868,7 @@ def _billing_failure_result(
     final = _billing_terminal_label(summary, unverified)
     if guidance:
         final += f"\n\n{guidance}"
-    return {
+    result = {
         "final_response": final,
         "messages": messages,
         "api_calls": api_call_count,
@@ -822,6 +887,17 @@ def _billing_failure_result(
             provider, base_url, model, guidance, unverified=unverified
         ),
     }
+    # Phase 2.12: fallback-chain visibility, independent of the billing
+    # verdict itself — a billing wall can still have an untried fallback
+    # entry. reset_at is intentionally NOT populated here: billing has no
+    # "resets at X" semantics (agent/error_surface.py's _RATE_LIMIT_RESET_REASONS
+    # gates on reason, so a stray reset_at here would be silently dropped
+    # anyway, but omitting it at the source keeps this dict's meaning honest).
+    if agent is not None:
+        fallback_available = _fallback_availability(agent)
+        if fallback_available is not None:
+            result["fallback_available"] = fallback_available
+    return result
 
 
 def _print_billing_or_entitlement_guidance(
@@ -6333,6 +6409,7 @@ def run_conversation(
                             provider=_provider,
                             base_url=_base,
                             model=_model,
+                            agent=agent,
                         )
                     return {
                         "final_response": _nonretryable_summary,
@@ -6567,6 +6644,23 @@ def run_conversation(
                         # Present only for billing walls: structured recovery
                         # descriptor (provider, billing_url, is_nous, message).
                         "billing_block": _billing_block,
+                        **(
+                            {"reset_at": _rl_reset_at}
+                            if (_rl_reset_at := (
+                                _resolve_rate_limit_reset_at(agent, classified)
+                                if classified.reason in (
+                                    FailoverReason.rate_limit,
+                                    FailoverReason.upstream_rate_limit,
+                                )
+                                else None
+                            )) is not None
+                            else {}
+                        ),
+                        **(
+                            {"fallback_available": _fb_avail}
+                            if (_fb_avail := _fallback_availability(agent)) is not None
+                            else {}
+                        ),
                     }
 
                 # For rate limits, respect the Retry-After header if present

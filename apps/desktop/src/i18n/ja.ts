@@ -1965,6 +1965,10 @@ export const ja = defineLocale({
       draftSession: '下書き — 未送信',
       handoffOrigin: platform => `${platform} から引き継ぎ`,
       ownedByProfile: profile => `プロファイル: ${profile}`,
+      providerConfigured: family => `設定済みモデル: ${family}`,
+      providerVia: family => `${family} 経由`,
+      providerConfiguredVia: (configuredFamily, servedFamily) =>
+        `設定済みモデル: ${configuredFamily}（現在は ${servedFamily} 経由で応答中）`,
       renamed: '名前を変更しました',
       renameFailed: '名前の変更に失敗しました',
       renameTitle: 'セッションの名前を変更',

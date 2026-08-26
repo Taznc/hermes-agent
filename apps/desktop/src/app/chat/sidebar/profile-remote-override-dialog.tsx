@@ -135,7 +135,7 @@ export function ProfileRemoteOverrideDialog({ profileNames }: { profileNames: st
   const needsPlainTextOptIn = Boolean(loaded && loaded.secureTokenStorage === false && token.trim() && !allowPlainText)
 
   const performSave = async () => {
-    if (!profile) {
+    if (!profile || !window.hermesDesktop?.applyConnectionConfig) {
       return
     }
 
@@ -184,7 +184,7 @@ export function ProfileRemoteOverrideDialog({ profileNames }: { profileNames: st
   }
 
   const removeOverride = async () => {
-    if (!profile) {
+    if (!profile || !window.hermesDesktop?.applyConnectionConfig) {
       return
     }
 
