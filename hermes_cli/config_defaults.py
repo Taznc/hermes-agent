@@ -3298,6 +3298,18 @@ DEFAULT_CONFIG = {
         # (non-streaming) export such as `hermes sessions export`. Checked
         # per session, so full-DB backups of many small sessions still work.
         "max_export_messages": 20000,
+        # Desktop-facing default recovery choice when a turn fails on a
+        # provider rate limit (`layer == "provider"`, `code` in
+        # `rate_limit`/`upstream_rate_limit`) and the wire descriptor
+        # carries a usable `reset_at`. "ask" (default): the failure card
+        # always waits for the user to pick an action (retry / resume at
+        # reset / switch fallback model). "resume_at_reset": Desktop shows
+        # the same failure card and a brief cancelable countdown, then
+        # auto-schedules the resume-at-reset cron job if not cancelled.
+        # Read by Desktop only -- the backend never auto-resumes a session
+        # on its own account (Phase 2.12 backend half; see
+        # agent/error_surface.py's `reset_at`/`fallback_available`).
+        "rate_limit_default_recovery": "ask",
     },
 
     # Contextual first-touch onboarding hints (see agent/onboarding.py).

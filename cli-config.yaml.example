@@ -900,6 +900,28 @@ max_concurrent_sessions: null
 # explicitly want one shared "room brain" per group/channel.
 group_sessions_per_user: true
 
+# =============================================================================
+# Session Storage & Recovery (sessions.*)
+# =============================================================================
+# Miscellaneous session-level behavioral settings. See hermes_cli/config_defaults.py
+# for the full set (transcript safety limits, auto-prune/archive, FTS storage
+# migration notices, etc.) — only the Desktop-facing recovery key is called
+# out here.
+#
+# sessions:
+#   # Desktop-facing default choice when a turn fails on a provider rate
+#   # limit and the structured error descriptor (agent/error_surface.py's
+#   # `reset_at` / `fallback_available` wire fields) carries a usable
+#   # `reset_at`. The backend NEVER auto-resumes a session on its own — this
+#   # only controls what Desktop's failure card defaults to:
+#   #   "ask"            (default) - always wait for the user to pick an
+#   #                      action (retry now / resume at reset / switch to
+#   #                      a fallback model).
+#   #   "resume_at_reset" - Desktop shows the same failure card plus a brief
+#   #                      cancelable countdown, then auto-schedules the
+#   #                      resume-at-reset job if the user doesn't cancel.
+#   rate_limit_default_recovery: ask   # "ask" (default) | "resume_at_reset"
+
 # Startup sweep of session rows orphaned by a dead gateway process.
 # The normal disconnect cleanup runs on an in-process grace timer, so a
 # gateway restart (update, crash, systemd) leaves those rows permanently

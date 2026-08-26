@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import enum
 import logging
+import time
 from dataclasses import dataclass, field
 from typing import Any, Dict, Optional
 
@@ -765,6 +766,102 @@ _SSL_TRANSIENT_PATTERNS = [
 ]
 
 
+# ── Rate-limit reset extraction ─────────────────────────────────────────
+#
+# Best-effort epoch-seconds reset time for a rate-limited/upstream-throttled
+# response, stamped into ``ClassifiedError.error_context["reset_at"]`` by the
+# ``_result()`` closure below so ``agent/error_surface.py`` can populate the
+# wire ``reset_at`` field without re-deriving it from raw headers/body.
+
+# Body fields that unambiguously carry a seconds-from-now delta.
+_RESET_DELTA_FIELDS = ("resets_in_seconds",)
+# Body fields whose unit is ambiguous across providers — some send an
+# absolute epoch timestamp, others a seconds-from-now delta under the same
+# key name. Disambiguated by magnitude in ``_coerce_reset_epoch``.
+_RESET_AMBIGUOUS_FIELDS = ("resets_at", "reset_at", "retry_after")
+
+# A numeric value at or above this magnitude is treated as an absolute
+# epoch-seconds timestamp rather than a seconds-from-now delta — no
+# legitimate rate-limit reset delta is anywhere near ~3 years, and no
+# epoch-seconds timestamp is this small (~1973-03-03T09:46:40Z).
+_EPOCH_VS_DELTA_THRESHOLD = 100_000_000.0
+
+
+def _coerce_reset_epoch(value: Any, *, is_delta: bool, now: float) -> Optional[float]:
+    """Best-effort coercion of one reset field into an epoch-seconds float."""
+    if value is None or value == "":
+        return None
+    try:
+        num = float(value)
+    except (TypeError, ValueError):
+        return None
+    if num < 0:
+        return None
+    if is_delta:
+        return now + num
+    # Ambiguous field: some providers send epoch milliseconds, some epoch
+    # seconds, some a seconds-from-now delta under the same key name.
+    if num >= _EPOCH_VS_DELTA_THRESHOLD * 1000:
+        return num / 1000.0
+    if num >= _EPOCH_VS_DELTA_THRESHOLD:
+        return num
+    return now + num
+
+
+def _extract_reset_epoch_seconds(body: Any, response_headers: Any) -> Optional[float]:
+    """Best-effort epoch-seconds reset time for a rate-limited response.
+
+    Checked in order: the response's own ``Retry-After`` header (most
+    reliable — a direct HTTP signal from the request that actually failed),
+    then ``x-ratelimit-reset-*`` headers, then the structured body fields the
+    billing-vs-rate_limit disambiguation already inspects (see
+    ``_has_usage_limit_transient_signal`` / #93419 — kept in sync with that
+    field list). Returns None when nothing usable is present; callers must
+    render a truthful "reset time unknown" state rather than guessing.
+    """
+    now = time.time()
+    try:
+        from agent.retry_utils import parse_retry_after_seconds
+
+        delta = parse_retry_after_seconds(response_headers)
+        if delta is not None:
+            return now + delta
+    except Exception:
+        pass
+
+    if response_headers and hasattr(response_headers, "get"):
+        for header in (
+            "x-ratelimit-reset-requests-1h",
+            "x-ratelimit-reset-requests",
+            "x-ratelimit-reset-tokens-1h",
+            "x-ratelimit-reset-tokens",
+        ):
+            try:
+                raw = response_headers.get(header)
+            except Exception:
+                raw = None
+            if raw is not None and raw != "":
+                coerced = _coerce_reset_epoch(raw, is_delta=True, now=now)
+                if coerced is not None:
+                    return coerced
+
+    payloads = []
+    if isinstance(body, dict):
+        payloads.append(body)
+        if isinstance(body.get("error"), dict):
+            payloads.append(body["error"])
+    for payload in payloads:
+        for field_name in _RESET_DELTA_FIELDS:
+            coerced = _coerce_reset_epoch(payload.get(field_name), is_delta=True, now=now)
+            if coerced is not None:
+                return coerced
+        for field_name in _RESET_AMBIGUOUS_FIELDS:
+            coerced = _coerce_reset_epoch(payload.get(field_name), is_delta=False, now=now)
+            if coerced is not None:
+                return coerced
+    return None
+
+
 # ── Classification pipeline ─────────────────────────────────────────────
 
 def classify_api_error(
@@ -862,6 +959,23 @@ def classify_api_error(
             "message": _extract_message(error, body),
         }
         defaults.update(overrides)
+        # Stamp a best-effort reset time into error_context for rate-limited /
+        # upstream-throttled verdicts only — agent/error_surface.py reads
+        # this to populate the wire ``reset_at`` field. Never overrides an
+        # explicit error_context an override already supplied (e.g. the
+        # upstream_rate_limit branch's ``upstream_provider`` context).
+        if defaults["reason"] in (
+            FailoverReason.rate_limit,
+            FailoverReason.upstream_rate_limit,
+        ):
+            try:
+                _reset_at = _extract_reset_epoch_seconds(body, response_headers)
+            except Exception:
+                _reset_at = None
+            if _reset_at is not None:
+                _ctx = dict(defaults.get("error_context") or {})
+                _ctx.setdefault("reset_at", _reset_at)
+                defaults["error_context"] = _ctx
         return ClassifiedError(**defaults)
 
     # ── 0. Plugin classifiers (first valid result wins) ─────────────

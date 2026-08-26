@@ -1,6 +1,7 @@
 """Tests for agent.error_classifier — structured API error classification."""
 
 from types import SimpleNamespace
+import time
 
 import pytest
 from agent.error_classifier import (
@@ -1577,5 +1578,76 @@ class TestServerInjectedParameterRejection:
         result = classify_api_error(e, provider="custom", model="m")
         assert result.reason == FailoverReason.format_error
         assert result.retryable is False
+
+
+# ── Phase 2.12: reset_at stamped into error_context ──────────────────────
+
+
+class TestRateLimitResetAtContext:
+    """``classify_api_error`` stamps a best-effort ``reset_at`` (epoch
+    seconds) into ``ClassifiedError.error_context`` for rate_limit /
+    upstream_rate_limit verdicts, so agent/error_surface.py's wire
+    ``reset_at`` field doesn't need to re-derive it from raw headers/body."""
+
+    def test_reset_at_from_retry_after_header(self):
+        before = time.time()
+        e = MockAPIError(
+            "rate limit exceeded",
+            status_code=429,
+            headers={"Retry-After": "30"},
+        )
+        result = classify_api_error(e, provider="openrouter", model="m")
+        assert result.reason == FailoverReason.rate_limit
+        reset_at = result.error_context.get("reset_at")
+        assert reset_at is not None
+        # Should land ~30s from "now" (call time), generously bounded.
+        assert before + 25 <= reset_at <= before + 40
+
+    def test_reset_at_from_ratelimit_reset_header(self):
+        before = time.time()
+        e = MockAPIError(
+            "rate limit exceeded",
+            status_code=429,
+            headers={"x-ratelimit-reset-requests": "45"},
+        )
+        result = classify_api_error(e, provider="nous", model="m")
+        assert result.reason == FailoverReason.rate_limit
+        reset_at = result.error_context.get("reset_at")
+        assert reset_at is not None
+        assert before + 40 <= reset_at <= before + 55
+
+    def test_reset_at_from_body_field(self):
+        before = time.time()
+        e = MockAPIError(
+            "rate limit exceeded",
+            status_code=429,
+            body={"error": {"resets_in_seconds": 60}},
+        )
+        result = classify_api_error(e, provider="openrouter", model="m")
+        assert result.reason == FailoverReason.rate_limit
+        reset_at = result.error_context.get("reset_at")
+        assert reset_at is not None
+        assert before + 55 <= reset_at <= before + 70
+
+    def test_reset_at_omitted_when_unknown(self):
+        """No Retry-After / x-ratelimit-reset-* / body reset field anywhere
+        -- error_context must not carry a guessed reset_at key at all."""
+        e = MockAPIError("rate limit exceeded", status_code=429)
+        result = classify_api_error(e, provider="openrouter", model="m")
+        assert result.reason == FailoverReason.rate_limit
+        assert "reset_at" not in result.error_context
+
+    def test_reset_at_not_stamped_for_non_rate_limit_reasons(self):
+        """Only rate_limit / upstream_rate_limit verdicts get reset_at --
+        an unrelated verdict (e.g. server_error) must never carry one even
+        if a Retry-After header happens to be present."""
+        e = MockAPIError(
+            "internal server error",
+            status_code=500,
+            headers={"Retry-After": "30"},
+        )
+        result = classify_api_error(e, provider="openrouter", model="m")
+        assert result.reason == FailoverReason.server_error
+        assert "reset_at" not in result.error_context
 
 
