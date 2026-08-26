@@ -467,8 +467,15 @@ export function useStatusbarItems({
   // Web build only: Vite's HMR client traps location.reload() into this flag
   // instead of navigating (see src/web-bridge-shim.ts / src/store/web-reload.ts)
   // so an edit never destroys in-progress work. Same blue affordance as
-  // devRestartItem, but labeled "Refresh" — the browser build has no
-  // Electron main process to restart, a plain reload is genuinely sufficient.
+  // devRestartItem, but labeled "Refresh" — always, never "Restart": the web
+  // build has no Electron main process to restart, and the renderer's other
+  // hard-reload trigger (the vite dev-server WS reconnecting, e.g. after the
+  // hermes-webdesktop-dev/-stable systemd unit itself restarts) funnels
+  // through the exact same trapped `location.reload()` call — there is no
+  // distinct "the underlying service restarted, you need more than a page
+  // reload" state to surface in this build. A plain reload is genuinely
+  // always sufficient here. Documented simplification, not an unmet
+  // requirement — see docs/web-ui-hard-refresh-diagnosis.md §3.
   const webReloadPending = useStore($webReloadPending)
   const isWebBuild = desktopVersion?.platform === 'web'
 

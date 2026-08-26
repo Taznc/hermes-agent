@@ -18,6 +18,7 @@ import { useI18n } from '@/i18n'
 import { AlertCircle, ChevronDown, ChevronRight, Globe, iconSize, Loader2, Monitor } from '@/lib/icons'
 import { capitalize } from '@/lib/text'
 import { cn } from '@/lib/utils'
+import { performWebReload } from '@/store/web-reload'
 
 import { FirstRunRemoteForm } from './first-run-remote-form'
 
@@ -519,7 +520,7 @@ export function DesktopInstallOverlay({ enabled = true }: DesktopInstallOverlayP
                 <Globe className="size-4" />
                 {copy.connectExistingShort}
               </Button>
-              <Button onClick={() => window.location.reload()} size="sm" variant="default">
+              <Button onClick={() => performWebReload()} size="sm" variant="default">
                 {copy.retryAfterRun}
               </Button>
             </div>
@@ -706,7 +707,7 @@ export function DesktopInstallOverlay({ enabled = true }: DesktopInstallOverlayP
                       // best-effort -- continue with reload regardless
                     }
 
-                    window.location.reload()
+                    performWebReload()
                   }}
                   size="sm"
                   variant="default"

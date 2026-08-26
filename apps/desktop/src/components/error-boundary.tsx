@@ -4,6 +4,7 @@ import { Button } from '@/components/ui/button'
 import { ErrorState } from '@/components/ui/error-state'
 import { useI18n } from '@/i18n'
 import { notifyError } from '@/store/notifications'
+import { performWebReload } from '@/store/web-reload'
 
 export interface ErrorBoundaryFallbackProps {
   error: Error
@@ -169,7 +170,7 @@ function RootErrorFallback({ error, reset }: ErrorBoundaryFallbackProps) {
         <Button className="font-semibold" onClick={reset} size="lg">
           {t.common.retry}
         </Button>
-        <Button onClick={() => window.location.reload()} variant="text">
+        <Button onClick={() => performWebReload()} variant="text">
           {t.errors.reloadWindow}
         </Button>
         <Button onClick={openLogs} variant="text">

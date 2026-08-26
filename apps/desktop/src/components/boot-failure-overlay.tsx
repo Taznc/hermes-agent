@@ -12,6 +12,7 @@ import { ChevronLeft, ExternalLink, FileText, Loader2, LogIn, RefreshCw, Sliders
 import { $desktopBoot } from '@/store/boot'
 import { notify, notifyError } from '@/store/notifications'
 import { $desktopOnboarding } from '@/store/onboarding'
+import { performWebReload } from '@/store/web-reload'
 
 import type { RemoteReauth } from './boot-failure-reauth'
 import {
@@ -147,13 +148,13 @@ export function BootFailureOverlay() {
   const retry = async () => {
     setBusy('retry')
     await window.hermesDesktop?.resetBootstrap().catch(() => undefined)
-    window.location.reload()
+    performWebReload()
   }
 
   const repair = async () => {
     setBusy('repair')
     await window.hermesDesktop?.repairBootstrap().catch(() => undefined)
-    window.location.reload()
+    performWebReload()
   }
 
   const switchToLocalGateway = async () => {
@@ -182,7 +183,7 @@ export function BootFailureOverlay() {
 
       if (result?.connected) {
         notify({ kind: 'success', title: t.boot.failure.signedInTitle, message: t.boot.failure.signedInMessage })
-        window.location.reload()
+        performWebReload()
 
         return
       }
