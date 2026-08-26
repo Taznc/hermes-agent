@@ -94,9 +94,11 @@
   const FALLBACK_COLUMN_LABEL = {
     triage: "Triage",
     todo: "Todo",
+    scheduled: "Scheduled",
     ready: "Ready",
     running: "In Progress",
     blocked: "Blocked",
+    on_hold: "On Hold",
     review: "Review",
     done: "Done",
     archived: "Archived",
@@ -104,9 +106,11 @@
   const FALLBACK_COLUMN_HELP = {
     triage: "Raw ideas — a specifier will flesh out the spec",
     todo: "Waiting on dependencies or unassigned",
+    scheduled: "Waiting for a scheduled time to arrive",
     ready: "Dependencies satisfied; assign a profile to dispatch",
     running: "Claimed by a worker — in-flight",
     blocked: "Worker asked for human input",
+    on_hold: "Shelved by a human — drag back to Ready when you want it resumed",
     review: "Implementation complete — awaiting review",
     done: "Completed",
     archived: "Archived",
@@ -172,9 +176,11 @@
   const COLUMN_DOT = {
     triage: "hermes-kanban-dot-triage",
     todo: "hermes-kanban-dot-todo",
+    scheduled: "hermes-kanban-dot-scheduled",
     ready: "hermes-kanban-dot-ready",
     running: "hermes-kanban-dot-running",
     blocked: "hermes-kanban-dot-blocked",
+    on_hold: "hermes-kanban-dot-on-hold",
     review: "hermes-kanban-dot-review",
     done: "hermes-kanban-dot-done",
     archived: "hermes-kanban-dot-archived",
@@ -4807,6 +4813,8 @@
         specifyButton,
         decomposeButton,
         b("→ triage",  { status: "triage" },   task.status !== "triage"),
+        b(tx(t, "hold", "Shelve"), { status: "on_hold" },
+          task.status !== "on_hold" && task.status !== "done" && task.status !== "archived"),
         b("→ ready",   { status: "ready" },    task.status !== "ready"),
         // No direct → running button: /tasks/:id PATCH rejects status=running
         // with 400 (issue #19535). Tasks enter running only through the
