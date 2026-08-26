@@ -41,6 +41,7 @@ import { $focusedRuntimeId, $focusedSessionState, $focusedStoredSessionId } from
 import { $statusbarHiddenIds } from '@/store/statusbar-prefs'
 import { $subagentsBySession, activeSubagentCount, failedSubagentCount } from '@/store/subagents'
 import { $gatewayRestarting } from '@/store/system-actions'
+import { $webReloadPending, performWebReload } from '@/store/web-reload'
 import {
   $backendUpdateApply,
   $backendUpdateStatus,
@@ -463,6 +464,33 @@ export function useStatusbarItems({
     }
   }, [devBundleStale])
 
+  // Web build only: Vite's HMR client traps location.reload() into this flag
+  // instead of navigating (see src/web-bridge-shim.ts / src/store/web-reload.ts)
+  // so an edit never destroys in-progress work. Same blue affordance as
+  // devRestartItem, but labeled "Refresh" — the browser build has no
+  // Electron main process to restart, a plain reload is genuinely sufficient.
+  const webReloadPending = useStore($webReloadPending)
+  const isWebBuild = desktopVersion?.platform === 'web'
+
+  const webReloadItem = useMemo<StatusbarItem | null>(() => {
+    if (!isWebBuild || !webReloadPending) {
+      return null
+    }
+
+    return {
+      className: 'px-2 font-semibold bg-blue-600 text-white hover:bg-blue-500',
+      icon: <Loader2 className="size-3" />,
+      id: 'web-reload',
+      label: 'Refresh',
+      onSelect: () => {
+        performWebReload()
+      },
+      title:
+        'New code was built and the page would normally auto-reload.\n' +
+        'Reloading now discards nothing you have not already sent — click when ready.'
+    }
+  }, [isWebBuild, webReloadPending])
+
   const connectionItem = useMemo<StatusbarItem | null>(() => {
     if (connection?.mode !== 'remote' || !connection.remoteHost) {
       return null
@@ -492,6 +520,7 @@ export function useStatusbarItems({
     () => [
       ...(forkBuildItem ? [forkBuildItem] : []),
       ...(devRestartItem ? [devRestartItem] : []),
+      ...(webReloadItem ? [webReloadItem] : []),
       ...(connectionItem ? [connectionItem] : []),
       {
         className: `w-7 justify-center px-0${commandCenterOpen ? ' bg-accent/55 text-foreground' : ''}`,
@@ -614,6 +643,7 @@ export function useStatusbarItems({
       commandCenterOpen,
       connectionItem,
       devRestartItem,
+      webReloadItem,
       forkBuildItem,
       copy,
       currentCwd,
