@@ -7,7 +7,7 @@ import { $activeGatewayProfile, $profiles } from '@/store/profile'
 import { $cronSessions, $messagingSessions, $sessions } from '@/store/session'
 import type { SessionInfo } from '@/types/hermes'
 
-import { resolveSessionProfile, resolveStoredSession } from './utils'
+import { __resetSessionProbeCache, resolveSessionProfile, resolveStoredSession } from './utils'
 
 vi.mock('@/hermes', async importActual => ({
   ...(await importActual<typeof HermesModule>()),
@@ -30,6 +30,9 @@ describe('resolveStoredSession profile ownership', () => {
     mockGetSession.mockReset()
     // Dead-profile memory is module state shared across tests.
     __resetMissingProfiles()
+    // So is the negative/in-flight probe cache: a miss recorded by one test
+    // would otherwise short-circuit the next test's lookup of the same id.
+    __resetSessionProbeCache()
   })
 
   afterEach(() => {
@@ -194,5 +197,68 @@ describe('resolveStoredSession profile ownership', () => {
     mockGetSession.mockResolvedValueOnce(session({ id: 's9', profile: 'default' }))
 
     await expect(resolveStoredSession('s9')).resolves.toMatchObject({ profile: 'default' })
+  })
+
+  // The negative cache is what keeps a stuck id (dead deep link, orphaned Bot
+  // tile) from re-running the N-profile fan-out on every 1.5s backstop poll.
+  it('serves a repeat miss from the negative cache instead of re-probing', async () => {
+    mockGetSession.mockRejectedValue(new Error('404: Session not found'))
+
+    await expect(resolveStoredSession('stuck')).resolves.toBeUndefined()
+
+    const afterFirst = mockGetSession.mock.calls.length
+
+    expect(afterFirst).toBeGreaterThan(0)
+
+    await expect(resolveStoredSession('stuck')).resolves.toBeUndefined()
+
+    expect(mockGetSession).toHaveBeenCalledTimes(afterFirst)
+  })
+
+  // It is a TTL, not a blacklist: once the window lapses the id is probed
+  // again, so a session that appears moments later still resolves.
+  it('re-probes after the negative TTL lapses', async () => {
+    vi.useFakeTimers()
+
+    try {
+      mockGetSession.mockRejectedValue(new Error('404: Session not found'))
+
+      await expect(resolveStoredSession('later')).resolves.toBeUndefined()
+
+      mockGetSession.mockReset()
+      vi.advanceTimersByTime(20_000)
+
+      mockGetSession.mockResolvedValueOnce(session({ id: 'later', profile: 'default' }))
+
+      await expect(resolveStoredSession('later')).resolves.toMatchObject({ profile: 'default' })
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+
+  // Concurrent callers (wiring.tsx probes + the backstop poll) must share one
+  // fan-out, not each start their own.
+  it('de-dups concurrent lookups of the same id into one probe', async () => {
+    mockGetSession.mockRejectedValue(new Error('404: Session not found'))
+
+    // Baseline: what one lookup costs in backend calls.
+    await resolveStoredSession('same')
+
+    const singleProbeCalls = mockGetSession.mock.calls.length
+
+    expect(singleProbeCalls).toBeGreaterThan(0)
+
+    __resetSessionProbeCache()
+    mockGetSession.mockClear()
+
+    // Three simultaneous callers must not cost three fan-outs.
+    const results = await Promise.all([
+      resolveStoredSession('same'),
+      resolveStoredSession('same'),
+      resolveStoredSession('same')
+    ])
+
+    expect(results).toEqual([undefined, undefined, undefined])
+    expect(mockGetSession.mock.calls.length).toBe(singleProbeCalls)
   })
 })

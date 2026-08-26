@@ -1361,6 +1361,60 @@ export async function resolveStoredSession(
     return cached
   }
 
+  // The full N-profile fan-out below is not cheap to repeat: every ambient
+  // gateway RPC that can't resolve its routing session's owner re-triggers it
+  // (wiring.tsx's shared requestGateway probes via resolveSessionProfile), and
+  // the 1.5s session.active_list backstop poll alone can fire it dozens of
+  // times a minute for one stuck id — a dead deep link, an orphaned Bot tile,
+  // a session deleted out from under a live route. With N profiles that is N
+  // GETs every ~1.5s, indefinitely, which is enough to starve Settings' own
+  // config/model-catalog fetches behind Chrome's per-origin connection cap
+  // (symptom: Settings never finishes loading while a stuck session is open).
+  // A short negative TTL plus in-flight de-dup caps the fan-out to roughly
+  // once per TTL window per id, not once per caller per tick — and it's a
+  // TTL, not a permanent blacklist like isProfileKnownMissing, because the
+  // session can legitimately appear moments later (still being created, a
+  // profile swap resolving).
+  if (isNegativelyCachedSessionProbe(storedSessionId)) {
+    return undefined
+  }
+
+  const inFlight = inFlightSessionProbes.get(storedSessionId)
+
+  if (inFlight) {
+    return inFlight
+  }
+
+  const probe = probeStoredSessionAcrossProfiles(storedSessionId).finally(() => {
+    inFlightSessionProbes.delete(storedSessionId)
+  })
+
+  inFlightSessionProbes.set(storedSessionId, probe)
+
+  return probe
+}
+
+// Bounded backstop for the cross-profile probe fan-out — see the call site's
+// comment in resolveStoredSession for why this exists. TTL-based (not a
+// permanent cache): a miss just means "not found on any profile RIGHT NOW".
+const SESSION_PROBE_NEGATIVE_TTL_MS = 15_000
+const negativeSessionProbes = new Map<string, number>()
+const inFlightSessionProbes = new Map<string, Promise<SessionInfo | undefined>>()
+
+function isNegativelyCachedSessionProbe(storedSessionId: string): boolean {
+  const missedAt = negativeSessionProbes.get(storedSessionId)
+
+  return missedAt !== undefined && Date.now() - missedAt < SESSION_PROBE_NEGATIVE_TTL_MS
+}
+
+/** Drop every recorded probe result and in-flight entry. Exported for tests —
+ *  this module-level state persists across test cases like isProfileKnownMissing. */
+export function __resetSessionProbeCache(): void {
+  negativeSessionProbes.clear()
+  inFlightSessionProbes.clear()
+}
+
+async function probeStoredSessionAcrossProfiles(storedSessionId: string): Promise<SessionInfo | undefined> {
   // Direct by-id on the active profile — one row lookup, no list scan. Electron
   // routes an unscoped GET to the primary backend, which may not own the
   // active profile. A 404 there used to skip that profile in the probes below,
@@ -1376,6 +1430,7 @@ export async function resolveStoredSession(
     session.profile ||= activeKey
 
     upsertResolvedSession(session, storedSessionId)
+    negativeSessionProbes.delete(storedSessionId)
 
     return session
   } catch {
@@ -1406,6 +1461,7 @@ export async function resolveStoredSession(
       session.profile = profile
 
       upsertResolvedSession(session, storedSessionId)
+      negativeSessionProbes.delete(storedSessionId)
 
       return session
     } catch (error) {
@@ -1415,6 +1471,8 @@ export async function resolveStoredSession(
       noteProfileError(profile, error)
     }
   }
+
+  negativeSessionProbes.set(storedSessionId, Date.now())
 
   return undefined
 }
