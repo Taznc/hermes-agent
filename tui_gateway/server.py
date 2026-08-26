@@ -9119,12 +9119,16 @@ def _emit_terminal_turn_error(
     # recovery actions instead of a generic toast. Never raises (advisory).
     if error_surface is None and isinstance(error, BaseException):
         try:
+            from agent.conversation_loop import _fallback_availability
             from agent.error_surface import build_error_surface_from_exception
 
             error_surface = build_error_surface_from_exception(
                 error,
                 provider=str(getattr(agent, "provider", "") or ""),
                 model=str(getattr(agent, "model", "") or ""),
+                fallback_available=(
+                    _fallback_availability(agent) if agent is not None else None
+                ),
             )
         except Exception:
             error_surface = None

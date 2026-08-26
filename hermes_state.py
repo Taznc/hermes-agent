@@ -145,6 +145,34 @@ def resolved_max_export_messages() -> int:
     )
 
 
+_RATE_LIMIT_RECOVERY_CHOICES = ("ask", "resume_at_reset")
+
+
+def resolved_rate_limit_default_recovery() -> str:
+    """Config-resolved ``sessions.rate_limit_default_recovery`` (Phase 2.12).
+
+    Desktop-facing default action when a turn's wire error descriptor
+    (``agent.error_surface``) carries a usable ``reset_at`` for a provider
+    rate limit: "ask" (default) waits for the user to pick an action;
+    "resume_at_reset" lets Desktop auto-schedule a resume once the failure
+    card's countdown isn't cancelled. The backend itself never consults this
+    value to auto-resume a session on its own — it exists purely so every
+    Desktop-facing surface reads the same one config key instead of each
+    inventing its own default. An unrecognized or missing value falls back
+    to "ask" rather than silently enabling unattended auto-resume.
+    """
+    try:
+        from hermes_cli.config import load_config_readonly
+
+        sessions_cfg = load_config_readonly().get("sessions") or {}
+        value = str(sessions_cfg.get("rate_limit_default_recovery") or "").strip()
+        if value in _RATE_LIMIT_RECOVERY_CHOICES:
+            return value
+        return "ask"
+    except Exception:
+        return "ask"
+
+
 class SessionResumeTooLargeError(ValueError):
     def __init__(
         self,
