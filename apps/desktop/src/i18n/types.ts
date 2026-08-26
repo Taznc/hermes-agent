@@ -1542,6 +1542,12 @@ export interface Translations {
     switchConnectionFailed: (name: string) => string
     manageProfiles: string
     connectGateway: string
+    switchToAgent: (profile: string, device: string) => string
+    connectToAgent: (device: string) => string
+    notConnected: string
+    agentsHeading: string
+    thisDevice: string
+    sourceUnreachable: string
     remoteOverride: {
       menuItem: string
       badge: (host: string) => string
@@ -2752,6 +2758,14 @@ export interface Translations {
       goForward: string
       sendEdited: string
       attachingFile: string
+      /** Self-improvement review row's expandable per-action detail list
+       *  (ROADMAP.md Phase 1: Desktop transcript auditability). */
+      review: {
+        showDetails: string
+        showDetailsWithFailures: (count: number) => string
+        hideDetails: string
+        failedReason: (message: string) => string
+      }
     }
     approval: {
       gatewayDisconnected: string

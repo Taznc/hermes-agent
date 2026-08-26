@@ -443,7 +443,12 @@ interface ProjectTreePayload {
   scoped_session_ids: string[]
 }
 
-const PROJECT_TREE_PREVIEW_LIMIT = 3
+// Keep in sync with PROJECT_PREVIEW_COUNT (app/chat/sidebar/projects/model.ts)
+// — that's the renderer's slice of these same preview sessions, so raising one
+// without the other just truncates one level earlier and silently hides rows
+// again. Not imported directly: model.ts already imports from this module
+// (via $worktreeRefreshToken), so importing back would create a cycle.
+const PROJECT_TREE_PREVIEW_LIMIT = 8
 // The all-profiles fan-out reads one database per profile, so it is allowed the
 // same headroom as the cross-profile session list rather than the interactive
 // default.
@@ -664,6 +669,27 @@ function syncReposScanning(): void {
 }
 
 $gateway.subscribe(syncReposScanning)
+
+// Reset the gateway-bound project cache. Projects live in the ACTIVE backend's
+// per-profile projects.db, so the list, the tree, the drilled-in scope and the
+// backend-capability verdict all describe one machine. Nanostores are not
+// React Query: nothing invalidates them, so without this a connection switch
+// keeps painting the PREVIOUS machine's projects — local repo names in the
+// sidebar while the chat runs on the remote box. Same reason the session lists
+// are wiped explicitly next door.
+//
+// The persisted $projectScope is reset too: its ids (`p_<hex>` rows and
+// filesystem paths alike) are meaningful only on the backend that issued them,
+// so a drilled-in local project would scope the remote sidebar to a project it
+// has never heard of.
+export function resetProjectsForGatewaySwitch(): void {
+  $projects.set([])
+  $activeProjectId.set(null)
+  $projectTree.set([])
+  $projectTreeLoading.set(false)
+  $projectsRpcAvailable.set(null)
+  $projectScope.set(ALL_PROJECTS)
+}
 
 export async function scanAndRecordRepos(force = false): Promise<void> {
   if (isDesktopFsRemoteMode()) {

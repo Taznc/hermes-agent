@@ -71,7 +71,8 @@ export function getHermesConfig(profile?: string): Promise<HermesConfig> {
 export function getHermesConfigRecord(profile?: ProfileScope): Promise<HermesConfigRecord> {
   return window.hermesDesktop.api<HermesConfigRecord>({
     ...capabilityScoped(profile),
-    path: '/api/config'
+    path: '/api/config',
+    timeoutMs: STARTUP_REQUEST_TIMEOUT_MS
   })
 }
 
@@ -86,7 +87,8 @@ export function getHermesConfigDefaults(): Promise<HermesConfigRecord> {
 export function getHermesConfigSchema(profile?: null | string): Promise<ConfigSchemaResponse> {
   return hermesApi<ConfigSchemaResponse>({
     ...profileScoped(profile),
-    path: '/api/config/schema'
+    path: '/api/config/schema',
+    timeoutMs: STARTUP_REQUEST_TIMEOUT_MS
   })
 }
 
@@ -102,7 +104,8 @@ export function saveHermesConfig(config: HermesConfigRecord, profile?: null | st
 export function getEnvVars(profile?: null | string): Promise<Record<string, EnvVarInfo>> {
   return hermesApi<Record<string, EnvVarInfo>>({
     ...profileScoped(profile),
-    path: '/api/env'
+    path: '/api/env',
+    timeoutMs: STARTUP_REQUEST_TIMEOUT_MS
   })
 }
 

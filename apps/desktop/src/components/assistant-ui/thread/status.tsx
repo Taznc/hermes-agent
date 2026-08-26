@@ -3,6 +3,7 @@ import { useStore } from '@nanostores/react'
 import { type FC, type ReactNode, useEffect, useMemo, useState } from 'react'
 
 import { useSessionView } from '@/app/chat/session-view'
+import { ThreadActivityMark } from '@/components/assistant-ui/thread/activity-mark'
 import { activitySignature, toolNarratesWait, TURN_QUIET_S } from '@/components/assistant-ui/thread/turn-activity'
 import { toolPresentVerb } from '@/components/assistant-ui/tool/run-summary'
 import { useElapsedSeconds } from '@/components/chat/activity-timer'
@@ -10,7 +11,6 @@ import { ActivityTimerText } from '@/components/chat/activity-timer-text'
 import { SCAFFOLD_LABEL_CLASS } from '@/components/chat/scaffold-row'
 import { Codicon } from '@/components/ui/codicon'
 import { Loader } from '@/components/ui/loader'
-import { StatusPulse } from '@/components/ui/status-pulse'
 import { useI18n } from '@/i18n'
 import { cn } from '@/lib/utils'
 import { $backgroundResume } from '@/store/background-delegation'
@@ -150,10 +150,11 @@ export const ResponseLoadingIndicator: FC = () => {
 
   return (
     <StatusRow data-slot="aui_response-loading" label={hint || t.assistant.thread.loadingResponse}>
-      <StatusPulse
-        aria-hidden="true"
-        className="dither inline-block size-3 rounded-[2px] text-midground/80"
-        kind="opacity"
+      <ThreadActivityMark
+        elapsedSeconds={elapsed}
+        hint={hint}
+        phase={compacting ? 'compacting' : hint ? 'working' : 'thinking'}
+        slot="response"
       />
       {hint && <HintText>{hint}</HintText>}
       <ActivityTimerText seconds={elapsed} />
@@ -258,10 +259,11 @@ export const TurnActivityIndicator: FC = () => {
 
   return (
     <StatusRow data-slot="aui_turn-activity" label={hint || 'Hermes is working'}>
-      <StatusPulse
-        aria-hidden="true"
-        className="dither inline-block size-3 rounded-[2px] text-midground/80"
-        kind="opacity"
+      <ThreadActivityMark
+        elapsedSeconds={elapsed}
+        hint={hint}
+        phase={compacting ? 'compacting' : hint ? 'working' : 'thinking'}
+        slot="turn"
       />
       {hint && <HintText>{hint}</HintText>}
       <ActivityTimerText seconds={elapsed} />

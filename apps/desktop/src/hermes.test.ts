@@ -10,12 +10,17 @@ import {
   deleteProfile,
   deleteSession,
   getAllSessionMessages,
+  getAuxiliaryModels,
   getCronJobs,
+  getEnvVars,
   getGlobalModelInfo,
   getGlobalModelOptions,
   getHermesConfig,
   getHermesConfigDefaults,
+  getHermesConfigRecord,
+  getHermesConfigSchema,
   getLatestSessionMessages,
+  getMoaModels,
   getOlderSessionMessages,
   getProfiles,
   getSession,
@@ -423,7 +428,18 @@ describe('Hermes REST helpers', () => {
       [getHermesConfigDefaults, '/api/config/defaults'],
       [getGlobalModelInfo, '/api/model/info'],
       [() => getGlobalModelOptions(), '/api/model/options?explicit_only=1'],
-      [getCronJobs, '/api/cron/jobs']
+      [getCronJobs, '/api/cron/jobs'],
+      // Regression: the Settings panel's schema fetch (GET /api/config/schema)
+      // used to be the one boot-burst call missing timeoutMs, so a stalled
+      // fetch never rejected and the panel spun on a bare skeleton forever
+      // with no error/retry affordance (see config-settings.test.tsx). Every
+      // sibling read the Settings panel fires during its own load must carry
+      // the same bounded timeout.
+      [() => getHermesConfigSchema(), '/api/config/schema'],
+      [() => getHermesConfigRecord(), '/api/config'],
+      [() => getAuxiliaryModels(), '/api/model/auxiliary'],
+      [() => getMoaModels(), '/api/model/moa'],
+      [() => getEnvVars(), '/api/env']
     ]
 
     for (const [call, path] of bootCalls) {

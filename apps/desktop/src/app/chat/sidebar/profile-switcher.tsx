@@ -19,7 +19,7 @@ import {
 } from '@dnd-kit/sortable'
 import { CSS } from '@dnd-kit/utilities'
 import { useStore } from '@nanostores/react'
-import { useEffect, useRef, useState } from 'react'
+import { useCallback, useEffect, useRef, useState } from 'react'
 import { useNavigate } from 'react-router'
 
 import { CodeEditor } from '@/components/chat/code-editor'
@@ -54,6 +54,7 @@ import { cn } from '@/lib/utils'
 import { $hasMultipleConnections } from '@/store/connections'
 import { notify, notifyError } from '@/store/notifications'
 import {
+  $activeGatewayConnection,
   $activeGatewayProfile,
   $profileColors,
   $profileCreateRequest,
@@ -64,6 +65,7 @@ import {
   normalizeProfileKey,
   profileLabel,
   refreshActiveProfile,
+  selectAgent,
   selectProfile,
   setProfileColor,
   setProfileOrder,
@@ -228,8 +230,36 @@ export function ProfileRail() {
   // rail's cached $profiles stale until something re-fetches it. See
   // use-profile-rail-refresh-on-active.ts for the extracted (and tested)
   // wiring.
-  useProfileRailRefreshOnActive()
+  //
+  // Keyed on the active backend scope, NOT just mount: switching connection or
+  // profile is a soft re-home that deliberately keeps this component mounted,
+  // so a mount-only fetch leaves the rail showing the PREVIOUS machine's
+  // profiles forever (issue #85731 — "profile rail disappears / never updates
+  // when connecting to a remote"). A remote box has its own profile list and
+  // the rail must re-enumerate against whichever backend is now live.
+  const backendScope = useStore($activeGatewayConnection)
 
+  useProfileRailRefreshOnActive(`${backendScope || 'local'}::${gatewayProfile}`)
+
+  // Selecting a profile must stay on the CONNECTION the rail is enumerating.
+  // The rail lists whichever backend is live, so on a remote it shows that
+  // machine's profiles — but selectProfile() always routes to the local pool,
+  // which then tries to spawn a local backend for a profile that only exists on
+  // the remote ("Hermes backend for profile X exited before it became ready").
+  // selectAgent keeps the (connection, profile) pair together; with a null
+  // connection it delegates to selectProfile, so local users are unchanged.
+  const selectProfileOnActiveConnection = useCallback(
+    (name: string) => {
+      if (backendScope) {
+        void selectAgent(backendScope, name)
+
+        return
+      }
+
+      void selectProfile(name)
+    },
+    [backendScope]
+  )
   // Which profiles carry a per-profile remote override (connection.json
   // profiles.<name>) — refreshed whenever the profile list changes so the
   // rail's "remote" badge tracks create/rename/override edits.
@@ -268,7 +298,9 @@ export function ProfileRail() {
             active={isAll || onDefault}
             glyph={isAll ? 'layers' : 'home'}
             label={onDefault ? p.showAllProfiles : p.switchToProfile(profileLabel(defaultProfile))}
-            onSelect={() => (onDefault ? setShowAllProfiles(true) : selectProfile(defaultProfile.name))}
+            onSelect={() =>
+              onDefault ? setShowAllProfiles(true) : selectProfileOnActiveConnection(defaultProfile.name)
+            }
           />
         ) : (
           <ProfilePill active={isAll} glyph="layers" label={p.allProfiles} onSelect={() => setShowAllProfiles(true)} />
@@ -280,7 +312,7 @@ export function ProfileRail() {
           active
           glyph="home"
           label={profileLabel(defaultProfile)}
-          onSelect={() => selectProfile(defaultProfile.name)}
+          onSelect={() => selectProfileOnActiveConnection(defaultProfile.name)}
         />
       )}
 
@@ -294,7 +326,7 @@ export function ProfileRail() {
             colors={colors}
             onCreate={() => setCreateOpen(true)}
             onImport={() => void runImportProfileFlow()}
-            onSelect={selectProfile}
+            onSelect={selectProfileOnActiveConnection}
             profiles={named}
           />
         </div>
@@ -327,7 +359,7 @@ export function ProfileRail() {
                       onEditSoul={() => setPendingSoul(profile.name)}
                       onRecolor={color => setProfileColor(profile.name, color)}
                       onRename={() => setPendingRename(profile)}
-                      onSelect={() => selectProfile(profile.name)}
+                      onSelect={() => selectProfileOnActiveConnection(profile.name)}
                       remoteHost={remoteOverrides[normalizeProfileKey(profile.name)]?.host ?? null}
                     />
                   ))}
@@ -365,7 +397,7 @@ export function ProfileRail() {
         onClose={() => setCreateOpen(false)}
         onCreated={async name => {
           await refreshActiveProfile()
-          selectProfile(name)
+          selectProfileOnActiveConnection(name)
         }}
         open={createOpen}
         profiles={profiles}

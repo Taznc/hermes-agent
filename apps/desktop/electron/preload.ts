@@ -463,6 +463,16 @@ contextBridge.exposeInMainWorld('hermesDesktop', {
     return () => ipcRenderer.removeListener('hermes:bootstrap:event', listener)
   },
   getVersion: () => ipcRenderer.invoke('hermes:version'),
+  // Dev-only: is the built main-process bundle newer than the running one?
+  // `supported` is false in a packaged build so the UI stays hidden there.
+  getDevMainBundleStale: () => ipcRenderer.invoke('hermes:dev:main-bundle-stale'),
+  restartForDevBundle: () => ipcRenderer.invoke('hermes:dev:restart'),
+  onDevMainBundleStale: callback => {
+    const listener = (_event, payload) => callback(payload)
+    ipcRenderer.on('hermes:dev:main-bundle-stale', listener)
+
+    return () => ipcRenderer.removeListener('hermes:dev:main-bundle-stale', listener)
+  },
   getRemoteDisplayReason: () => ipcRenderer.invoke('hermes:get-remote-display-reason'),
   uninstall: {
     summary: () => ipcRenderer.invoke('hermes:uninstall:summary'),

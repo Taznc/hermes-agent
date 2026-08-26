@@ -61,6 +61,7 @@ export function handleStatusEvent(ctx: GatewayEventContext): boolean {
 
     if (text && sessionId) {
       flushQueuedDeltas(sessionId)
+      const actions = Array.isArray(payload?.actions) ? payload.actions : undefined
       updateSessionState(sessionId, state => ({
         ...state,
         messages: [
@@ -69,7 +70,14 @@ export function handleStatusEvent(ctx: GatewayEventContext): boolean {
             id: `review-summary-${Date.now()}`,
             role: 'system',
             parts: [textPart(`review:${text}`, occurredAt)],
-            timestamp: occurredAt
+            timestamp: occurredAt,
+            // Structured per-action records (add/replace/remove/create/
+            // patch/edit, including failed attempts) so the row can
+            // expand into individual mutations instead of staying one
+            // flattened line. Absent on an older backend or when
+            // notification mode is "off" — the row still renders fine
+            // without an expand affordance in that case.
+            ...(actions?.length ? { reviewActions: actions } : {})
           }
         ]
       }))

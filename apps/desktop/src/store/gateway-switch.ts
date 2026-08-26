@@ -8,6 +8,7 @@ import { invalidateCronJobsRequests, setCronJobs } from '@/store/cron'
 import { resetSessionsLimit } from '@/store/layout'
 import { resetLiveSync } from '@/store/live-sync'
 import { invalidateProfileListFetches } from '@/store/profile'
+import { resetProjectsForGatewaySwitch } from '@/store/projects'
 import {
   $unreadFinishedSessionIds,
   setActiveSessionId,
@@ -94,6 +95,12 @@ export function wipeSessionListsForGatewaySwitch(): void {
   // different backend can recycle stored ids, and painting another machine's
   // conversation under a same-named id is worse than a loader. Wipe them.
   clearTranscriptTails()
+
+  // Projects are per-backend too (each machine has its own projects.db and its
+  // own filesystem), and like sessions they live in nanostores, so query
+  // invalidation cannot evict them. Without this the sidebar kept listing the
+  // LOCAL machine's repos while the chat ran on the remote box.
+  resetProjectsForGatewaySwitch()
 
   // Narrowed: account/marketplace/onboarding caches are global, not gateway-
   // scoped, so a mode swap must not refetch them.

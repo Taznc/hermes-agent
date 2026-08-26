@@ -104,6 +104,7 @@ import {
   profileSshOverride,
   type RegistryBackendRequestScope,
   remoteRequestMatchesBaseUrl,
+  remoteTokenNeedsBearer,
   resolveAuthMode,
   resolveProfileApiRequest,
   resolveProfileBackendRoute,
@@ -258,7 +259,8 @@ import {
   localProfilePoolKeys,
   ProfileDeletionGate,
   profileNameFromDeleteRequest,
-  resolveRouteProfile
+  resolveRouteProfile,
+  resolveStoredDesktopProfile
 } from './profile-delete-routing'
 import { prepareProfileRenameLifecycle, profileRenameFromRequest } from './profile-rename-routing'
 import {
@@ -663,8 +665,17 @@ function loadInstallStamp() {
         })
       }
     } catch (e) {
-      console.warn(`[hermes] install-stamp.json found at ${p} , but parsing failed with ${e}`)
-      // Either ENOENT or malformed JSON; try the next candidate
+      // A MISSING file is the normal case, not a fault: in dev,
+      // process.resourcesPath points inside the prebuilt Electron.app, which
+      // never carries a stamp, so this candidate always misses. Warning about
+      // it on every launch — with the self-contradicting "found ... but
+      // parsing failed with ENOENT" wording — trains the reader to ignore a
+      // message that should mean something. Only a stamp that EXISTS and is
+      // malformed is worth surfacing.
+      if ((e as NodeJS.ErrnoException)?.code !== 'ENOENT') {
+        console.warn(`[hermes] install-stamp.json at ${p} could not be parsed: ${e}`)
+      }
+      // Either way, try the next candidate.
     }
   }
 
@@ -7684,15 +7695,38 @@ async function saveGatewayFileViaDataUrl(
 }
 
 // Mint a single-use WS ticket for a gated gateway. Returns the ticket string.
-// Prefers a native bearer token (cookieless RFC 8252 flow) when present,
-// falling back to the OAuth cookie partition otherwise.
-// Throws (with statusCode 401) if the session cookie is missing/expired —
+// Three credential shapes, in order: an explicit static session token (the
+// token-auth remote path), a native bearer token (cookieless RFC 8252 flow),
+// then the OAuth cookie partition.
+// Throws (with statusCode 401) if the credential is missing/expired —
 // callers treat that as "needs re-login".
 // Transient transport blips (brief host unreachable, 5xx, timeouts) are retried
 // a few times before failing — those 1-3s flaps were promoting into the
 // full-screen "couldn't start" lockout on reconnect.
-async function mintGatewayWsTicket(baseUrl, headers = {}) {
+async function mintGatewayWsTicket(baseUrl, headers = {}, staticToken = null) {
   return withTransientRetries(async () => {
+    // Token-auth remotes: a gated dashboard rejects the legacy `?token=` query
+    // param on the WS upgrade (403) — only a minted ticket is accepted — but it
+    // DOES accept that same token as a bearer on the mint endpoint. Without this
+    // rung a basic-auth/token backend can pass every HTTP check and still never
+    // open /api/ws.
+    if (staticToken) {
+      const body = (await fetchJson(`${baseUrl}/api/auth/ws-ticket`, null, {
+        method: 'POST',
+        timeoutMs: 8_000,
+        bearer: staticToken,
+        headers
+      })) as any
+
+      const ticket = body?.ticket
+
+      if (!ticket || typeof ticket !== 'string') {
+        throw new Error('Gateway did not return a WS ticket.')
+      }
+
+      return ticket
+    }
+
     // Native flow: mint the ticket with the bearer token, no cookie involved.
     const nativeAt = await ensureNativeAccessToken(baseUrl).catch(() => null)
 
@@ -7753,7 +7787,25 @@ async function freshGatewayWsUrl(profile) {
     return wsUrl
   }
 
-  // Local/token: the cached wsUrl already carries the (long-lived) token.
+  // Remote token-auth: a gated dashboard refuses the legacy `?token=` param on
+  // the WS upgrade, so trade the token for a single-use ticket. Local backends
+  // are ungated and have no mint endpoint — the cached wsUrl is correct there,
+  // and a mint failure falls back to it.
+  if (connection.mode === 'remote' && connection.token) {
+    try {
+      const ticket = await mintGatewayWsTicket(
+        connection.baseUrl,
+        connection.headers,
+        connection.token
+      )
+
+      return buildGatewayWsUrlWithTicket(connection.baseUrl, ticket)
+    } catch {
+      return connection.wsUrl
+    }
+  }
+
+  // Local/ungated: the cached wsUrl already carries the (long-lived) token.
   rememberRemoteWsHeaders(connection.wsUrl, connection.headers)
 
   return connection.wsUrl
@@ -9058,20 +9110,53 @@ async function saveRegistryConnection(input: any = {}) {
 // Returns the desktop's chosen profile name, or null when unset. "default" is
 // a valid stored value (pins the root HERMES_HOME explicitly); null means "no
 // preference" and preserves the legacy launch (no --profile flag).
+//
+// A stored name must also still EXIST on this machine. The preference outlives
+// the profile it names: deleting a profile elsewhere, syncing this file between
+// machines, or restoring a backup all leave a name here with no directory
+// behind it. Because every profile-scoped consumer funnels through this
+// function -- primaryProfileKey(), the `hermes:profile:get` IPC the renderer
+// adopts at boot, and the backend launch path -- an unvalidated name routes
+// EVERY profile-scoped REST call (config, env, model info, schema, sessions)
+// at a profile the backend will never have. Each one 404s
+// ("Profile 'x' does not exist."), nothing self-heals, and the app retries
+// forever.
+//
+// Format validation alone cannot catch that: `claudeprimary` is a perfectly
+// well-formed name for a profile that isn't here. Validate existence at the
+// same boundary the local spawn guard uses (assertLocalProfileCanStart), then
+// self-heal by clearing the dead preference so the next read is clean and the
+// app falls back to the default profile instead of looping.
 function readActiveDesktopProfile() {
+  let stored = ''
+
   try {
     const raw = fs.readFileSync(DESKTOP_PROFILE_CONFIG_PATH, 'utf8')
     const parsed = JSON.parse(raw)
-    const name = parsed && typeof parsed.profile === 'string' ? parsed.profile.trim() : ''
-
-    if (name && (name === 'default' || PROFILE_NAME_RE.test(name))) {
-      return name
-    }
+    stored = parsed && typeof parsed.profile === 'string' ? parsed.profile : ''
   } catch {
     // Missing or malformed → no preference.
   }
 
-  return null
+  const resolved = resolveStoredDesktopProfile(
+    stored,
+    key => PROFILE_NAME_RE.test(key),
+    key => directoryExists(path.join(HERMES_HOME, 'profiles', key))
+  )
+
+  // A well-formed name that resolved to nothing means the profile is gone (a
+  // malformed/absent file yields an empty `stored` and is not worth logging).
+  if (!resolved && stored.trim()) {
+    rememberLog(`Stored desktop profile "${stored.trim()}" no longer exists — falling back to the default profile`)
+
+    try {
+      writeActiveDesktopProfile(null)
+    } catch {
+      // Best-effort self-heal: a read-only userData dir still falls back.
+    }
+  }
+
+  return resolved
 }
 
 function writeActiveDesktopProfile(name) {
@@ -9907,7 +9992,14 @@ async function requestJsonForProfile(profile: string, path: string, method: stri
     return fetchJsonViaOauthSession(url, { ...opts, headers: conn.headers })
   }
 
-  return fetchJson(url, conn.token, { ...opts, headers: conn.headers })
+  // Same bearer rule as hermes:api — a gated remote verifies the session token
+  // as `Authorization: Bearer`, while `X-Hermes-Session-Token` is honoured only
+  // by an ungated loopback backend. Sending both keeps local and remote working.
+  return fetchJson(url, conn.token, {
+    ...opts,
+    headers: conn.headers,
+    bearer: conn.mode === 'remote' && conn.token ? conn.token : undefined
+  })
 }
 
 async function probeRemoteAuthMode(rawUrl) {
@@ -10237,6 +10329,131 @@ function broadcastConnectionsChanged(payload: { connectionId: string; reason: 'r
     }
   }
 }
+
+// ── Dev: main-process bundle staleness ──────────────────────────────────────
+// The renderer hot-reloads through Vite, but Electron cannot hot-swap an
+// already-evaluated main process — an electron/ edit only lands on restart.
+// Rather than restarting under the user (which would destroy whatever they were
+// mid-way through), watch the built bundle and let the renderer offer an
+// explicit "Restart to apply". Dev-only: a packaged build never watches and the
+// renderer's affordance stays hidden, so release users see nothing.
+const DEV_MAIN_BUNDLE = path.join(APP_ROOT, 'dist', 'electron-main.mjs')
+const DEV_PRELOAD_BUNDLE = path.join(APP_ROOT, 'dist', 'electron-preload.js')
+
+// Sentinel exit code meaning "the dev watcher should respawn me", as opposed to
+// a real quit. Must match the value in scripts/dev-electron-watch.mjs.
+const DEV_RESTART_EXIT_CODE = 86
+
+let devMainBundleStale = false
+let devBundleWatchers: fs.FSWatcher[] = []
+
+function broadcastDevBundleStale() {
+  for (const win of BrowserWindow.getAllWindows()) {
+    const { webContents } = win
+
+    if (webContents && !webContents.isDestroyed()) {
+      webContents.send('hermes:dev:main-bundle-stale', { stale: devMainBundleStale })
+    }
+  }
+}
+
+function watchDevMainBundle() {
+  if (IS_PACKAGED || !DEV_SERVER) {
+    return
+  }
+
+  // Signature at boot: anything different later is a rebuild we are not running.
+  const signature = target => {
+    try {
+      const stat = fs.statSync(target)
+
+      return `${stat.size}:${stat.mtimeMs}`
+    } catch {
+      return ''
+    }
+  }
+
+  for (const target of [DEV_MAIN_BUNDLE, DEV_PRELOAD_BUNDLE]) {
+    const original = signature(target)
+
+    if (!original) {
+      continue
+    }
+
+    try {
+      // Debounced: esbuild writes in bursts, and a rebuild can touch both
+      // bundles. Once stale we stay stale — only a restart clears it.
+      let timer: NodeJS.Timeout | null = null
+
+      const watcher = fs.watch(target, () => {
+        if (devMainBundleStale) {
+          return
+        }
+
+        if (timer) {
+          clearTimeout(timer)
+        }
+
+        timer = setTimeout(() => {
+          if (!devMainBundleStale && signature(target) !== original) {
+            devMainBundleStale = true
+            console.log('[hermes] main-process bundle changed on disk — restart to apply')
+            broadcastDevBundleStale()
+          }
+        }, 150)
+      })
+
+      devBundleWatchers.push(watcher)
+    } catch {
+      // Watching is a convenience; a platform that refuses it must not break dev.
+    }
+  }
+}
+
+app.on('before-quit', () => {
+  for (const watcher of devBundleWatchers) {
+    try {
+      watcher.close()
+    } catch {
+      void 0
+    }
+  }
+
+  devBundleWatchers = []
+})
+
+ipcMain.handle('hermes:dev:main-bundle-stale', async () => ({
+  stale: devMainBundleStale,
+  // The renderer must not render a restart affordance in a packaged build.
+  supported: !IS_PACKAGED && Boolean(DEV_SERVER)
+}))
+
+ipcMain.handle('hermes:dev:restart', async () => {
+  if (IS_PACKAGED) {
+    return { ok: false, reason: 'not-a-dev-build' }
+  }
+
+  // Exit with a sentinel code and let the DEV WATCHER respawn us.
+  //
+  // app.relaunch() is wrong here: it exits 0, which is indistinguishable from a
+  // real quit, so the watcher tears itself down (and `concurrently -k` kills
+  // Vite with it) while the relaunched window loads a dev server that no longer
+  // exists — a permanent blank screen. Handing the restart to the supervisor
+  // that owns the process keeps Vite up and the new window attached.
+  //
+  // Without a watcher (plain `npm run dev`), nothing respawns us, so fall back
+  // to relaunch there.
+  if (process.env.HERMES_DEV_WATCH === '1') {
+    app.exit(DEV_RESTART_EXIT_CODE)
+
+    return { ok: true }
+  }
+
+  app.relaunch()
+  app.exit(0)
+
+  return { ok: true }
+})
 
 async function waitForBackendExit(child, timeoutMs = 5000) {
   if (!child || child.exitCode !== null || child.signalCode !== null) {
@@ -13554,7 +13771,8 @@ ipcMain.handle('hermes:agents:roster', async () => {
 })
 
 // Registry-scoped fresh WS URL: the (connectionId, profile) analogue of
-// hermes:gateway:ws-url. Same single-use-ticket discipline for OAuth sources.
+// hermes:gateway:ws-url. Every gated remote gets a freshly-minted single-use
+// ticket — OAuth via its session, token-auth via its static token as a bearer.
 ipcMain.handle('hermes:gateway:ws-url-for', async (_event, payload) => {
   const { connectionId, profile } = payload && typeof payload === 'object' ? (payload as any) : ({} as any)
 
@@ -13568,6 +13786,25 @@ ipcMain.handle('hermes:gateway:ws-url-for', async (_event, payload) => {
       rememberRemoteWsHeaders(wsUrl, connection.headers)
 
       return registryGatewayWsUrl(connection, wsUrl)
+    }
+
+    // Token-auth against a GATED dashboard: the legacy `?token=` query param is
+    // refused on the WS upgrade (403) even though the same token authenticates
+    // every REST call, so mint a ticket with it. Falls back to the cached
+    // token-bearing wsUrl when the backend is ungated (loopback/local), where
+    // the mint endpoint does not exist.
+    if (connection.token) {
+      try {
+        const ticket = await mintGatewayWsTicket(
+          connection.baseUrl,
+          connection.headers,
+          connection.token
+        )
+
+        return buildGatewayWsUrlWithTicket(connection.baseUrl, ticket)
+      } catch {
+        return connection.wsUrl
+      }
     }
 
     rememberRemoteWsHeaders(connection.wsUrl, connection.headers)
@@ -13690,12 +13927,21 @@ async function fetchJsonForBackend(
     })
   }
 
+  // Same bearer rule as the hermes:api handler, via the shared resolver: a
+  // GATED remote verifies the session token as `Authorization: *** while
+  // `X-Hermes-Session-Token` is honoured only by an ungated loopback backend.
+  // Sending only the loopback header is what produced `401 no_cookie` on every
+  // REST call routed through this helper (registry `hermes:api`, roster
+  // enumeration, install-id probes) against a password/OAuth-gated dashboard.
+  const sendBearer = remoteTokenNeedsBearer(descriptor)
+
   return fetchJson(url, descriptor.token, {
     method: opts.method,
     body: opts.body,
     upload: opts.upload,
     timeoutMs: opts.timeoutMs,
-    headers: descriptor.headers
+    headers: descriptor.headers,
+    bearer: sendBearer && descriptor.token ? descriptor.token : undefined
   })
 }
 
@@ -14317,6 +14563,14 @@ async function handleHermesApiRequest(request) {
   // primary rename the lifecycle has already made `default` the temporary
   // primary until the PATCH settles, so the request routes there.
   const apiRoute = resolveProfileApiRequest(profile, request.path, profileRouteOptions(profile, request))
+  // Connection-scoped REST: when the renderer names a registry connection, the
+  // call must reach THAT source's backend. Routing by profile alone always
+  // resolves the local pool, so a remote's own data (its profile list, config,
+  // skills) could never be enumerated — the rail kept showing local profiles
+  // after connecting to a remote (#85731). Falls back to the profile-keyed
+  // pool when no connection is named, so local users are unchanged. A
+  // torn-down profile stays on the local teardown path resolved above.
+  const requestConnectionId = request?.connectionId
 
   const routeProfile = profileRename
     ? profileRename.routeProfile
@@ -14325,7 +14579,10 @@ async function handleHermesApiRequest(request) {
   let response
 
   try {
-    const connection = await ensureBackend(routeProfile)
+    const connection =
+      requestConnectionId && !tornDownProfile
+        ? await ensureRegistryBackend(requestConnectionId, routeProfile)
+        : await ensureBackend(routeProfile)
     const timeoutMs = resolveTimeoutMs(request?.timeoutMs, DEFAULT_FETCH_TIMEOUT_MS)
 
     const url = `${connection.baseUrl}${apiRoute.requestPath}`
@@ -14366,14 +14623,44 @@ async function handleHermesApiRequest(request) {
         })
       }
     } else {
+      // Gated remotes verify the session token as `Authorization: *** via
+      // the provider stack; `X-Hermes-Session-Token` is only honoured by an
+      // ungated loopback backend. Sending just the loopback header is what
+      // produced `401 no_cookie` on every REST call to a gated dashboard. Send
+      // both: local backends ignore the bearer, gated remotes ignore the
+      // loopback header. Shared resolver with fetchJsonForBackend so the two
+      // REST paths cannot drift apart.
+      const isRemoteToken = remoteTokenNeedsBearer(connection, requestConnectionId)
+
       response = await fetchJson(url, connection.token, {
         method: request?.method,
         body: request?.body,
         upload: request?.upload,
-        timeoutMs
+        timeoutMs,
+        bearer: isRemoteToken && connection.token ? connection.token : undefined
       })
     }
   } catch (error) {
+    // Diagnostic breadcrumb for cross-backend routing. A REST call that silently
+    // lands on the WRONG backend (or is rejected by the right one) surfaces to
+    // the user only as an empty list or a permanent skeleton, with nothing in
+    // the log tying it to a connection. Log the resolved route on failure so
+    // "the remote shows no profiles" is answerable from desktop.log alone.
+    const routeLabel = requestConnectionId
+      ? `conn=${requestConnectionId}${routeProfile ? ` profile=${routeProfile}` : ''}`
+      : `pool profile=${routeProfile || 'primary'}`
+    const status = error?.statusCode ?? error?.status
+
+    console.warn(
+      `[hermes] REST ${request?.method || 'GET'} ${request.path} -> ${routeLabel} FAILED` +
+        (status ? ` status=${status}` : '') +
+        `: ${error?.message || error}` +
+        (status === 401 || status === 403
+          ? ' — stored credential rejected. A pasted session token expires;' +
+            ' re-authenticate in Settings → Connections.'
+          : '')
+    )
+
     // A failed rename PATCH must not strand the app on the temporary primary:
     // restore the original active profile and restart its backend.
     if (profileRename) {
@@ -15317,7 +15604,14 @@ ipcMain.handle('hermes:version', async () => {
     platform: process.platform,
     hermesRoot: resolveUpdateRoot(),
     bundleOutOfSync: skew.outOfSync,
-    bundleCommitsBehind: skew.desktopCommitsBehind
+    bundleCommitsBehind: skew.desktopCommitsBehind,
+    // Build provenance for the fork/dev marker. Null on an official release
+    // built without a stamp; the renderer decides visibility from `source`.
+    buildBranch: INSTALL_STAMP?.branch ?? null,
+    buildCommit: INSTALL_STAMP?.commit ?? null,
+    buildAt: INSTALL_STAMP?.builtAt ?? null,
+    buildDirty: INSTALL_STAMP ? Boolean(INSTALL_STAMP.dirty) : null,
+    buildSource: INSTALL_STAMP?.source ?? null
   }
 })
 
@@ -15766,6 +16060,10 @@ app.whenReady().then(() => {
   }
 
   createWindow()
+
+  // Dev only: notice when the main-process bundle is rebuilt underneath us so
+  // the renderer can offer an explicit restart.
+  watchDevMainBundle()
 
   // Win/Linux cold start: the launching hermes:// URL is in our own argv.
   const _coldStartLink = _extractDeepLink(process.argv)

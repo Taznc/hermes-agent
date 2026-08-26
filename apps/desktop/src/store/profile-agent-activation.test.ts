@@ -35,7 +35,8 @@ vi.mock('@/hermes', () => ({
 vi.mock('@/lib/query-client', () => ({ invalidateProfileScopedQueries: vi.fn() }))
 vi.mock('@/store/starmap', () => ({ resetStarmapGraph }))
 
-const { $activeGatewayProfile, ensureGatewayAgent, ensureGatewayProfile } = await import('./profile')
+const { $activeGatewayConnection, $activeGatewayProfile, ensureGatewayAgent, ensureGatewayProfile, ensureGatewaySessionProfile } =
+  await import('./profile')
 const { $connection } = await import('./session')
 
 const agentConn = (over: Partial<HermesConnection> = {}): HermesConnection =>
@@ -191,5 +192,64 @@ describe('ensureGatewayAgent shares the gatewaySwitch mutex with profile switche
 
     expect(order).toEqual(['agent:research', 'profile:worker'])
     expect($activeGatewayProfile.get()).toBe('worker')
+  })
+})
+
+describe('ensureGatewaySessionProfile (source-preserving session-create swap)', () => {
+  // The silent-local-fallback-on-Send class: a send/fork/branch resolves only a
+  // profile NAME, and routing that name through the local-pool door while a
+  // registry agent is active re-homed the whole window to this device.
+  it('stays on the active registry connection when the profile matches', async () => {
+    getConnectionFor.mockResolvedValue(agentConn())
+    await ensureGatewayAgent('hermes-dev', 'claudecode')
+    expect($activeGatewayConnection.get()).toBe('hermes-dev')
+    ensureGatewayForAgent.mockClear()
+    ensureGatewayForProfile.mockClear()
+
+    await ensureGatewaySessionProfile('claudecode')
+
+    // Re-dials the AGENT door — never the local-pool profile door.
+    expect(ensureGatewayForAgent).toHaveBeenCalledWith('hermes-dev', 'claudecode')
+    expect(ensureGatewayForProfile).not.toHaveBeenCalled()
+    expect($activeGatewayConnection.get()).toBe('hermes-dev')
+    expect($activeGatewayProfile.get()).toBe('claudecode')
+  })
+
+  it('treats a null/empty profile as the active one and stays on the connection', async () => {
+    getConnectionFor.mockResolvedValue(agentConn())
+    await ensureGatewayAgent('hermes-dev', 'claudecode')
+    ensureGatewayForAgent.mockClear()
+    ensureGatewayForProfile.mockClear()
+
+    await ensureGatewaySessionProfile(null)
+    await ensureGatewaySessionProfile('   ')
+
+    expect(ensureGatewayForAgent).toHaveBeenCalledTimes(2)
+    expect(ensureGatewayForProfile).not.toHaveBeenCalled()
+    expect($activeGatewayConnection.get()).toBe('hermes-dev')
+  })
+
+  it('keeps the legacy local-pool route when no registry connection is active', async () => {
+    getConnection.mockResolvedValue(localConn({ profile: 'research' }))
+    // The shared beforeEach resets the profile atom but not the connection one;
+    // put this test on the local pool explicitly.
+    $activeGatewayConnection.set(null)
+
+    await ensureGatewaySessionProfile('research')
+
+    expect(ensureGatewayForProfile).toHaveBeenCalledWith('research')
+    expect(ensureGatewayForAgent).not.toHaveBeenCalled()
+  })
+
+  it('routes a DIFFERENT profile through the profile door (explicit cross-machine move)', async () => {
+    getConnectionFor.mockResolvedValue(agentConn())
+    await ensureGatewayAgent('hermes-dev', 'claudecode')
+    ensureGatewayForAgent.mockClear()
+    getConnection.mockResolvedValue(localConn({ profile: 'other' }))
+
+    await ensureGatewaySessionProfile('other')
+
+    expect(ensureGatewayForProfile).toHaveBeenCalledWith('other')
+    expect(ensureGatewayForAgent).not.toHaveBeenCalled()
   })
 })

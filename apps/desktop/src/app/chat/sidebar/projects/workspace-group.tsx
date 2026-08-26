@@ -50,15 +50,20 @@ export function SidebarWorkspaceGroup({ group, renderRows, onNewSession, onRemov
   // lanes that already hold sessions default open.
   const defaultOpen = isProfileGroup || group.sessions.length > 0
   const [open, toggleOpen] = useWorkspaceNodeOpen(group.id, defaultOpen)
-  const [visibleCount, setVisibleCount] = useState(SIDEBAR_GROUP_PAGE)
+  // A profile starts on the same preview size a project row uses; paging past
+  // it (the "…" button below) reveals the rest SIDEBAR_GROUP_PAGE at a time,
+  // same as a workspace lane. Previously a profile group's hiddenCount was
+  // hardcoded to 0, so the button never rendered and anything past the
+  // preview was silently unreachable — the list wasn't actually capped
+  // (`group.sessions` already holds every session for the profile), only the
+  // "reveal more" affordance was missing.
+  const [visibleCount, setVisibleCount] = useState(isProfileGroup ? PROJECT_PREVIEW_COUNT : SIDEBAR_GROUP_PAGE)
 
   // A lane ranks by whatever the sort key says before it trims itself, so the
   // rows it hides are the ones the sort ranked last.
   const sessions = rankSessions(group.sessions, rankIds)
-  // A profile previews the same handful a project does, and clicking its label
-  // is how you see the rest. Workspace groups page within what's loaded.
-  const visibleSessions = sessions.slice(0, isProfileGroup ? PROJECT_PREVIEW_COUNT : visibleCount)
-  const hiddenCount = isProfileGroup ? 0 : sessions.length - visibleSessions.length
+  const visibleSessions = sessions.slice(0, visibleCount)
+  const hiddenCount = sessions.length - visibleSessions.length
   const nextCount = Math.min(SIDEBAR_GROUP_PAGE, hiddenCount)
 
   // Leading glyph: a home mark for the repo's primary checkout (labeled by its

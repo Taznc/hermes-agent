@@ -1,5 +1,5 @@
 import { useStore } from '@nanostores/react'
-import { useMemo } from 'react'
+import { useEffect, useMemo, useState } from 'react'
 import { useNavigate } from 'react-router'
 
 import { ConnectionSwitcher } from '@/app/chat/sidebar/connection-switcher'
@@ -13,6 +13,7 @@ import { Codicon } from '@/components/ui/codicon'
 import { GlyphSpinner } from '@/components/ui/glyph-spinner'
 import { useI18n } from '@/i18n'
 import { displayPath, pathLeaf } from '@/lib/display-path'
+import { resolveForkBuildMarker } from '@/lib/fork-build-marker'
 import { Activity, AlertCircle, Clock, Command, FolderOpen, Globe, Hash, Loader2, Terminal } from '@/lib/icons'
 import { runtimeReadinessDisplay, type RuntimeReadinessResult } from '@/lib/runtime-readiness'
 import { contextBarLabel, LiveDuration, usageContextLabel } from '@/lib/statusbar'
@@ -392,8 +393,106 @@ export function useStatusbarItems({
     copy
   ])
 
+  // Unofficial/local build marker. Deliberately loud (amber, uppercase) and
+  // pinned leftmost: its whole job is to make "am I running my own build?"
+  // answerable at a glance, since a feature branch never bumps the version and
+  // About looks identical to a release. Renders nothing on official builds —
+  // see resolveForkBuildMarker for the rule.
+  const forkBuildItem = useMemo<StatusbarItem | null>(() => {
+    const marker = resolveForkBuildMarker(desktopVersion)
+
+    if (!marker) {
+      return null
+    }
+
+    return {
+      className: 'px-2 -ml-1 font-semibold bg-amber-500 text-black hover:bg-amber-400',
+      icon: <AlertCircle className="size-3" />,
+      id: 'fork-build',
+      label: marker.label,
+      title: marker.title
+    }
+  }, [desktopVersion])
+
+  // Dev only: the main-process bundle was rebuilt after this process started.
+  // The renderer hot-reloads through Vite, but Electron cannot swap an
+  // already-evaluated main process, so an electron/ edit needs a relaunch. Show
+  // an explicit affordance rather than restarting under the user — losing an
+  // in-flight turn to an automatic restart is worse than a stale main process.
+  // Hidden entirely in packaged builds (`supported: false`).
+  const [devBundleStale, setDevBundleStale] = useState(false)
+
+  useEffect(() => {
+    let active = true
+
+    void window.hermesDesktop.getDevMainBundleStale?.().then(res => {
+      if (active && res?.supported) {
+        setDevBundleStale(Boolean(res.stale))
+      }
+    })
+
+    const off = window.hermesDesktop.onDevMainBundleStale?.(payload => {
+      if (active) {
+        setDevBundleStale(Boolean(payload?.stale))
+      }
+    })
+
+    return () => {
+      active = false
+      off?.()
+    }
+  }, [])
+
+  const devRestartItem = useMemo<StatusbarItem | null>(() => {
+    if (!devBundleStale) {
+      return null
+    }
+
+    return {
+      className: 'px-2 font-semibold bg-blue-600 text-white hover:bg-blue-500',
+      icon: <Loader2 className="size-3" />,
+      id: 'dev-restart',
+      label: 'Restart to apply',
+      onSelect: () => {
+        void window.hermesDesktop.restartForDevBundle?.()
+      },
+      title:
+        'The Electron main-process bundle was rebuilt after this window started.\n' +
+        'Renderer changes are already live; main-process changes need a relaunch.\n' +
+        'Click to restart now.'
+    }
+  }, [devBundleStale])
+
+  const connectionItem = useMemo<StatusbarItem | null>(() => {
+    if (connection?.mode !== 'remote' || !connection.remoteHost) {
+      return null
+    }
+
+    const ssh = connection.remoteKind === 'ssh'
+    const cloud = connection.remoteKind === 'cloud'
+
+    return {
+      className: cn(
+        'px-2 -ml-1 font-medium',
+        ssh ? 'bg-primary text-primary-foreground' : 'bg-accent text-accent-foreground'
+      ),
+      icon: <Terminal className="size-3" />,
+      id: 'connection',
+      label: ssh
+        ? copy.connectionSsh(connection.remoteHost)
+        : cloud
+          ? copy.connectionCloud(connection.remoteHost)
+          : copy.connectionRemote(connection.remoteHost),
+      // Label already names the host — no "click to manage" tip lecture.
+      to: `${SETTINGS_ROUTE}?tab=gateway`
+    }
+  }, [connection?.mode, connection?.remoteHost, connection?.remoteKind, copy])
+
   const coreLeftStatusbarItems = useMemo<readonly StatusbarItem[]>(
     () => [
+      ...(forkBuildItem ? [forkBuildItem] : []),
+      ...(devRestartItem ? [devRestartItem] : []),
+      ...(connectionItem ? [connectionItem] : []),
       {
         className: `w-7 justify-center px-0${commandCenterOpen ? ' bg-accent/55 text-foreground' : ''}`,
         icon: <Command className="size-3.5" />,
@@ -513,6 +612,9 @@ export function useStatusbarItems({
       agentsOpen,
       botsShowing,
       commandCenterOpen,
+      connectionItem,
+      devRestartItem,
+      forkBuildItem,
       copy,
       currentCwd,
       fileMenu.copyPath,

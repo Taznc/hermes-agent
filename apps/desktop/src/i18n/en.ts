@@ -1825,6 +1825,12 @@ export const en: Translations = {
     switchConnectionFailed: name => `Could not connect to ${name}`,
     manageProfiles: 'Manage profiles…',
     connectGateway: 'Manage gateways…',
+    switchToAgent: (profile: string, device: string) => `Switch to ${profile} on ${device}`,
+    connectToAgent: (device: string) => `Connect to ${device}`,
+    notConnected: 'Not connected yet',
+    agentsHeading: 'Agents & connections',
+    thisDevice: 'This device',
+    sourceUnreachable: 'Unreachable',
     remoteOverride: {
       menuItem: 'Connect to a remote host…',
       badge: (host: string) => `Runs on ${host}`,
@@ -3193,7 +3199,13 @@ export const en: Translations = {
       restoreNext: 'Restore next checkpoint',
       goForward: 'Go forward',
       sendEdited: 'Send edited message',
-      attachingFile: 'Attaching…'
+      attachingFile: 'Attaching…',
+      review: {
+        showDetails: 'Show details',
+        showDetailsWithFailures: count => (count === 1 ? 'Show details (1 failed)' : `Show details (${count} failed)`),
+        hideDetails: 'Hide details',
+        failedReason: message => `Failed: ${message}`
+      }
     },
     approval: {
       gatewayDisconnected: 'Hermes gateway is not connected',

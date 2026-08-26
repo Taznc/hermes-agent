@@ -19,7 +19,13 @@ import { createClientSessionState } from '@/lib/chat-runtime'
 import { $clarifyRequests, clearClarifyRequest, setClarifyRequest } from '@/store/clarify'
 import { clearSessionDraft, stashSessionDraft, takeSessionDraft } from '@/store/composer'
 import { requestGatewayForAgent } from '@/store/gateway'
-import { $activeGatewayProfile, $newChatProfile, $newChatRoute, ensureGatewayProfile } from '@/store/profile'
+import {
+  $activeGatewayProfile,
+  $newChatProfile,
+  $newChatRoute,
+  ensureGatewayProfile,
+  ensureGatewaySessionProfile
+} from '@/store/profile'
 import { $projectScope, $projectTree, ALL_PROJECTS } from '@/store/projects'
 import {
   $activeSessionId,
@@ -75,7 +81,11 @@ vi.mock('@/hermes', async importOriginal => ({
 vi.mock('@/store/profile', async importOriginal => ({
   ...(await importOriginal<Record<string, unknown>>()),
   ensureGatewayAgent: vi.fn().mockResolvedValue(undefined),
-  ensureGatewayProfile: vi.fn().mockResolvedValue(undefined)
+  ensureGatewayProfile: vi.fn().mockResolvedValue(undefined),
+  // The source-preserving session-create door. Mocked as its own spy: the
+  // real one routes through the registry-agent path when a connection is
+  // active, which these local-pool tests neither set up nor assert.
+  ensureGatewaySessionProfile: vi.fn().mockResolvedValue(undefined)
 }))
 
 vi.mock('@/store/gateway', async importOriginal => ({
@@ -630,7 +640,7 @@ describe('createBackendSessionForSend profile routing', () => {
 
   it('freezes the visible selector state before profile readiness and sends fast: false explicitly', async () => {
     const profileReady = deferred<void>()
-    vi.mocked(ensureGatewayProfile).mockReturnValueOnce(profileReady.promise)
+    vi.mocked(ensureGatewaySessionProfile).mockReturnValueOnce(profileReady.promise)
 
     setCurrentModel('anthropic/claude-sonnet-4.6')
     setCurrentProvider('anthropic')
@@ -657,7 +667,7 @@ describe('createBackendSessionForSend profile routing', () => {
     act(() => {
       createPromise = handle!.createBackendSessionForSend()
     })
-    await waitFor(() => expect(ensureGatewayProfile).toHaveBeenCalled())
+    await waitFor(() => expect(ensureGatewaySessionProfile).toHaveBeenCalled())
 
     // A background refresh or a second click can mutate the sticky atoms while
     // the profile is waking. This send must still use what was visible at Enter.
@@ -1837,7 +1847,7 @@ describe('branchStoredSession desktop source tagging', () => {
 
     await expect(branchStoredSession!('stored-parent')).resolves.toBe(true)
 
-    expect(ensureGatewayProfile).toHaveBeenCalledWith('work')
+    expect(ensureGatewaySessionProfile).toHaveBeenCalledWith('work')
     expect(getAllSessionMessages).toHaveBeenCalledWith('stored-parent', 'work')
     // The create itself must carry the owning profile: in app-global remote
     // mode the soft gateway swap alone is not enough — an omitted profile
@@ -1872,7 +1882,7 @@ describe('branchStoredSession desktop source tagging', () => {
 
     await expect(branchStoredSession!('stored-parent')).resolves.toBe(true)
 
-    expect(ensureGatewayProfile).toHaveBeenCalledWith('work')
+    expect(ensureGatewaySessionProfile).toHaveBeenCalledWith('work')
     expect(createParams).toMatchObject({ profile: 'work' })
   })
 

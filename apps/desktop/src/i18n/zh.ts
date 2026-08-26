@@ -2010,6 +2010,12 @@ export const zh: Translations = {
     switchConnectionFailed: name => `无法连接到 ${name}`,
     manageProfiles: '管理配置档案…',
     connectGateway: '管理网关…',
+    switchToAgent: (profile, device) => `切换到 ${device} 上的 ${profile}`,
+    connectToAgent: device => `连接到 ${device}`,
+    notConnected: '尚未连接',
+    agentsHeading: '智能体与连接',
+    thisDevice: '本设备',
+    sourceUnreachable: '无法连接',
     remoteOverride: {
       menuItem: '连接到远程主机…',
       badge: (host: string) => `运行于 ${host}`,
@@ -3351,7 +3357,13 @@ export const zh: Translations = {
       restoreNext: '恢复下一个检查点',
       goForward: '前进',
       sendEdited: '发送编辑后的消息',
-      attachingFile: '正在附加…'
+      attachingFile: '正在附加…',
+      review: {
+        showDetails: '显示详情',
+        showDetailsWithFailures: count => `显示详情（${count} 项失败）`,
+        hideDetails: '隐藏详情',
+        failedReason: message => `失败：${message}`
+      }
     },
     approval: {
       gatewayDisconnected: 'Hermes 网关未连接',

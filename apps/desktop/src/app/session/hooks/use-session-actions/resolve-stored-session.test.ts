@@ -2,6 +2,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
 import type * as HermesModule from '@/hermes'
 import { getSession } from '@/hermes'
+import { __resetMissingProfiles } from '@/lib/profile-liveness'
 import { $activeGatewayProfile, $profiles } from '@/store/profile'
 import { $cronSessions, $messagingSessions, $sessions } from '@/store/session'
 import type { SessionInfo } from '@/types/hermes'
@@ -27,6 +28,8 @@ describe('resolveStoredSession profile ownership', () => {
     $profiles.set(profiles('default', 'meta'))
     $activeGatewayProfile.set('meta')
     mockGetSession.mockReset()
+    // Dead-profile memory is module state shared across tests.
+    __resetMissingProfiles()
   })
 
   afterEach(() => {
@@ -142,5 +145,54 @@ describe('resolveStoredSession profile ownership', () => {
     mockGetSession.mockResolvedValueOnce(session({ id: 's1', profile: 'default' }))
 
     await expect(resolveSessionProfile('s1')).resolves.toBe('default')
+  })
+
+  // Regression: the cross-profile probe's catch treated every failure alike, so
+  // a profile the Electron spawn guard had already declared permanently gone
+  // ("no longer exists") was re-probed on every single lookup — the repeating
+  // `?profile=<dead>` bursts in the dev console. A dead profile must drop out
+  // of the fan-out after the first rejection.
+  it('stops probing a profile once the spawn guard reports it gone', async () => {
+    $profiles.set(profiles('default', 'meta', 'ghost'))
+    $activeGatewayProfile.set('meta')
+
+    // First lookup: active backend misses, `default` misses, `ghost` is gone.
+    mockGetSession.mockRejectedValueOnce(new Error('404: Session not found'))
+    mockGetSession.mockRejectedValueOnce(new Error('404: Session not found'))
+    mockGetSession.mockRejectedValueOnce(new Error('Profile "ghost" no longer exists.'))
+
+    await expect(resolveStoredSession('s1')).resolves.toBeUndefined()
+    expect(mockGetSession).toHaveBeenCalledWith('s1', 'ghost')
+
+    // Second lookup: `ghost` must not be probed again.
+    mockGetSession.mockReset()
+    mockGetSession.mockRejectedValueOnce(new Error('404: Session not found'))
+    mockGetSession.mockRejectedValueOnce(new Error('404: Session not found'))
+
+    await expect(resolveStoredSession('s2')).resolves.toBeUndefined()
+
+    const probed = mockGetSession.mock.calls.map(call => call[1])
+
+    expect(probed).not.toContain('ghost')
+  })
+
+  // The other half of the contract: a plain 404 is a legitimate miss, not a
+  // dead profile. Blacklisting on a 404 would skip the profile that actually
+  // owns a later session and make it unresolvable.
+  it('keeps probing a profile that merely 404s for one session id', async () => {
+    $profiles.set(profiles('default', 'meta'))
+    $activeGatewayProfile.set('meta')
+
+    mockGetSession.mockRejectedValueOnce(new Error('404: Session not found'))
+    mockGetSession.mockRejectedValueOnce(new Error('404: Session not found'))
+
+    await expect(resolveStoredSession('missing')).resolves.toBeUndefined()
+
+    // A later id that DOES live on `default` still resolves.
+    mockGetSession.mockReset()
+    mockGetSession.mockRejectedValueOnce(new Error('404: Session not found'))
+    mockGetSession.mockResolvedValueOnce(session({ id: 's9', profile: 'default' }))
+
+    await expect(resolveStoredSession('s9')).resolves.toMatchObject({ profile: 'default' })
   })
 })

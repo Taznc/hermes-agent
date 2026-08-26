@@ -254,6 +254,22 @@ async function resolveTestWsUrl(baseUrl, authMode, token, deps: any = {}) {
     return null
   }
 
+  // Token auth: a GATED dashboard refuses the legacy `?token=` query param on
+  // the WS upgrade (403) while still accepting that token as a bearer on the
+  // mint endpoint, so prefer a ticket and keep `?token=` as the fallback for
+  // ungated backends that have no mint endpoint. Testing the URL we would not
+  // actually dial is precisely the false positive this helper exists to avoid.
+  const mintTicket = deps.mintTicket
+
+  if (typeof mintTicket === 'function') {
+    try {
+      return buildGatewayWsUrlWithTicket(baseUrl, await mintTicket(baseUrl, token))
+    } catch {
+      // Ungated backend (no mint endpoint) or a transient failure — fall back
+      // to the legacy token URL, which the probe then verifies for real.
+    }
+  }
+
   return buildGatewayWsUrl(baseUrl, token)
 }
 
@@ -888,6 +904,28 @@ function resolveProfileApiRequest(profile, path, opts: ProfileRouteOptions = {})
   }
 }
 
+/**
+ * Whether a token-auth descriptor must also send its session token as
+ * `Authorization: *** .
+ *
+ * A GATED dashboard (password/OAuth provider stack) verifies the session token
+ * as a bearer; the `X-Hermes-Session-Token` header is honoured ONLY by an
+ * ungated loopback backend. Sending just the loopback header is what produced
+ * `401 {"reason":"no_cookie"}` on every REST call to a gated remote. Sending
+ * both is safe: a local backend ignores the bearer, a gated remote ignores the
+ * loopback header.
+ *
+ * One resolver so the `hermes:api` handler and the descriptor request path
+ * cannot drift apart — the scatter that left half the call sites 401ing.
+ */
+function remoteTokenNeedsBearer(descriptor, requestConnectionId?: null | string): boolean {
+  const mode = descriptor && typeof descriptor === 'object' ? (descriptor as any).mode : null
+  const connectionId =
+    requestConnectionId ?? (descriptor && typeof descriptor === 'object' ? (descriptor as any).connectionId : null)
+
+  return mode === 'remote' || Boolean(String(connectionId ?? '').trim())
+}
+
 function tokenPreview(value) {
   const raw = String(value || '')
 
@@ -1030,6 +1068,7 @@ export {
   profileRemoteOverride,
   profileSshOverride,
   remoteRequestMatchesBaseUrl,
+  remoteTokenNeedsBearer,
   resolveAuthMode,
   resolveProfileApiRequest,
   resolveProfileBackendRoute,

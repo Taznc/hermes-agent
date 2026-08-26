@@ -251,6 +251,15 @@ the original gate could never have passed.
 
 ## Development Environment
 
+> **On the dev VM: work in a worktree, never in the shared checkout.**
+> `~/projects/hermes/hermes-agent` is served live by the `hermes-webdesktop-dev`
+> renderer via `vite`, which has no build step — every file you save in that
+> tree is immediately the desktop app the user is running. Editing, checking
+> out, or stashing there ships untested code straight to them. Create your own
+> worktree (`git worktree add .worktrees/<task-id> -b <branch>`), work there,
+> and merge into `dev` only once tests, typecheck, and lint pass. See the
+> workspace `AGENTS.md` at `~/projects/hermes/AGENTS.md` for the full policy.
+
 ```bash
 # Prefer .venv; fall back to venv if that's what your checkout has.
 source .venv/bin/activate   # or: source venv/bin/activate

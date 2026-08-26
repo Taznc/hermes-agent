@@ -9,7 +9,8 @@ import {
   localProfilePoolKeys,
   ProfileDeletionGate,
   profileNameFromDeleteRequest,
-  resolveRouteProfile
+  resolveRouteProfile,
+  resolveStoredDesktopProfile
 } from './profile-delete-routing'
 
 // ---------------------------------------------------------------------------
@@ -151,6 +152,69 @@ test('localProfilePoolKeys returns every local process scope for one profile', (
 
 test('resolveRouteProfile preserves a primary-backend route from another routing policy', () => {
   assert.equal(resolveRouteProfile(null, null), null)
+})
+
+// ---------------------------------------------------------------------------
+// resolveStoredDesktopProfile
+//
+// Regression: the desktop's stored profile preference was validated for NAME
+// FORMAT but never for EXISTENCE. A preference naming a profile that isn't
+// installed on this machine (deleted elsewhere, config synced between
+// machines, restored backup) routed every profile-scoped REST call at a
+// profile the backend will never have — config, env, model info, schema and
+// sessions each answering `404 Profile 'x' does not exist.` in a loop that
+// nothing self-healed.
+// ---------------------------------------------------------------------------
+
+const validName = (profile: string) => /^[a-z0-9][a-z0-9_-]{0,63}$/.test(profile)
+const noProfilesOnDisk = () => false
+const allProfilesOnDisk = () => true
+
+test('resolveStoredDesktopProfile keeps a stored profile that exists on disk', () => {
+  assert.equal(
+    resolveStoredDesktopProfile('worker', validName, profile => profile === 'worker'),
+    'worker'
+  )
+})
+
+// The core fix: well-formed, but not installed here → no preference.
+test('resolveStoredDesktopProfile drops a well-formed profile that is not installed', () => {
+  assert.equal(resolveStoredDesktopProfile('claudeprimary', validName, noProfilesOnDisk), null)
+})
+
+// "default" is the root HERMES_HOME — it has no profiles/<name> directory, so
+// an existence check must never reject it or the app self-heals into nothing.
+test('resolveStoredDesktopProfile always accepts default without a directory check', () => {
+  assert.equal(resolveStoredDesktopProfile('default', validName, noProfilesOnDisk), 'default')
+})
+
+test('resolveStoredDesktopProfile treats an absent or blank preference as unset', () => {
+  assert.equal(resolveStoredDesktopProfile('', validName, allProfilesOnDisk), null)
+  assert.equal(resolveStoredDesktopProfile('   ', validName, allProfilesOnDisk), null)
+  assert.equal(resolveStoredDesktopProfile(null, validName, allProfilesOnDisk), null)
+  assert.equal(resolveStoredDesktopProfile(undefined, validName, allProfilesOnDisk), null)
+})
+
+// Format validation still applies: a malformed name must not reach the
+// filesystem probe as a path segment.
+test('resolveStoredDesktopProfile rejects a malformed name before probing disk', () => {
+  let probed = false
+
+  const result = resolveStoredDesktopProfile('../escape', validName, () => {
+    probed = true
+
+    return true
+  })
+
+  assert.equal(result, null)
+  assert.equal(probed, false)
+})
+
+test('resolveStoredDesktopProfile trims surrounding whitespace before resolving', () => {
+  assert.equal(
+    resolveStoredDesktopProfile('  worker  ', validName, profile => profile === 'worker'),
+    'worker'
+  )
 })
 
 test('explicit registered local DELETE holds one gate through teardown and dispatch', async () => {

@@ -456,6 +456,11 @@ declare global {
       cancelBootstrap: () => Promise<{ ok: boolean; cancelled: boolean }>
       onBootstrapEvent: (callback: (payload: DesktopBootstrapEvent) => void) => () => void
       getVersion: () => Promise<DesktopVersionInfo>
+      /** Dev-only: whether the built main-process bundle is newer than the
+       *  running one. `supported` is false in a packaged build. */
+      getDevMainBundleStale: () => Promise<{ stale: boolean; supported: boolean }>
+      restartForDevBundle: () => Promise<{ ok: boolean; reason?: string }>
+      onDevMainBundleStale: (callback: (payload: { stale: boolean }) => void) => () => void
       getRemoteDisplayReason?: () => Promise<string | null>
       updates: {
         check: () => Promise<DesktopUpdateStatus>
@@ -536,6 +541,12 @@ export interface DesktopVersionInfo {
   bundleOutOfSync?: boolean
   /** Commits under apps/desktop/ the running bundle is missing (null unknown). */
   bundleCommitsBehind?: null | number
+  /** Build provenance from install-stamp.json; null on builds without a stamp. */
+  buildBranch?: null | string
+  buildCommit?: null | string
+  buildAt?: null | string
+  buildDirty?: boolean | null
+  buildSource?: null | string
 }
 
 export type DesktopUninstallMode = 'full' | 'gui' | 'lite'
@@ -1132,8 +1143,10 @@ export interface HermesApiRequest {
   // Route this REST call to a specific REGISTERED gateway connection (v2
   // registry). Data owned by a remote gateway — cron jobs and their run
   // sessions — lives in that host's state.db, so requests for it must resolve
-  // through the owning connection, not the local profile pool. Omit / '' to
-  // keep the legacy profile-routed path; explicit 'local' forces this device.
+  // through the owning connection, not the local profile pool. Also required
+  // for anything that must enumerate the ACTIVE source's own state — its
+  // profile list, config, skills — since profile-only routing always resolves
+  // the local backend. Omit / '' / 'local' keep the legacy profile-routed path.
   connectionId?: string | null
 }
 
