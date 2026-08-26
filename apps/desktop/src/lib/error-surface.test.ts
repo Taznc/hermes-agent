@@ -49,6 +49,56 @@ describe('parseErrorSurface', () => {
   })
 })
 
+describe('parseErrorSurface — Phase 2.12 rate-limit fields', () => {
+  it('parses reset_at (wire) into resetAt (epoch seconds)', () => {
+    const surface = parseErrorSurface({
+      layer: 'provider',
+      code: 'rate_limit',
+      retryable: true,
+      reset_at: 1_700_000_000
+    })
+
+    expect(surface?.resetAt).toBe(1_700_000_000)
+  })
+
+  it('parses fallback_available (wire) into fallbackAvailable', () => {
+    expect(
+      parseErrorSurface({ layer: 'provider', code: 'rate_limit', retryable: true, fallback_available: true })
+        ?.fallbackAvailable
+    ).toBe(true)
+    expect(
+      parseErrorSurface({ layer: 'provider', code: 'rate_limit', retryable: true, fallback_available: false })
+        ?.fallbackAvailable
+    ).toBe(false)
+  })
+
+  it('omits both fields when absent — tolerant of older backends', () => {
+    const surface = parseErrorSurface({ layer: 'provider', code: 'rate_limit', retryable: true })
+
+    expect(surface?.resetAt).toBeUndefined()
+    expect(surface?.fallbackAvailable).toBeUndefined()
+    expect('resetAt' in (surface ?? {})).toBe(false)
+    expect('fallbackAvailable' in (surface ?? {})).toBe(false)
+  })
+
+  it('rejects a garbled reset_at (NaN/Infinity/non-number) rather than fabricating a time', () => {
+    expect(parseErrorSurface({ layer: 'provider', code: 'rate_limit', retryable: true, reset_at: NaN })?.resetAt).toBeUndefined()
+    expect(
+      parseErrorSurface({ layer: 'provider', code: 'rate_limit', retryable: true, reset_at: Infinity })?.resetAt
+    ).toBeUndefined()
+    expect(
+      parseErrorSurface({ layer: 'provider', code: 'rate_limit', retryable: true, reset_at: 'soon' })?.resetAt
+    ).toBeUndefined()
+  })
+
+  it('ignores a non-boolean fallback_available', () => {
+    expect(
+      parseErrorSurface({ layer: 'provider', code: 'rate_limit', retryable: true, fallback_available: 'yes' })
+        ?.fallbackAvailable
+    ).toBeUndefined()
+  })
+})
+
 describe('formatErrorDiagnostics', () => {
   it('includes layer, code, model and error', () => {
     const text = formatErrorDiagnostics({
@@ -82,5 +132,31 @@ describe('formatErrorDiagnostics', () => {
     expect(text).not.toContain('layer:')
     expect(text).not.toContain('model:')
     expect(text.split('\n').every(line => line.trim().length > 0)).toBe(true)
+  })
+
+  it('includes reset_at and fallback_available when the surface carries them (Phase 2.12)', () => {
+    const text = formatErrorDiagnostics({
+      errorText: 'rate limited',
+      surface: {
+        layer: 'provider',
+        code: 'rate_limit',
+        retryable: true,
+        resetAt: 1_700_000_000,
+        fallbackAvailable: true
+      }
+    })
+
+    expect(text).toContain('reset_at: ')
+    expect(text).toContain('fallback_available: true')
+  })
+
+  it('omits reset_at/fallback_available lines when the surface lacks them', () => {
+    const text = formatErrorDiagnostics({
+      errorText: 'boom',
+      surface: { layer: 'provider', code: 'unknown', retryable: true }
+    })
+
+    expect(text).not.toContain('reset_at:')
+    expect(text).not.toContain('fallback_available:')
   })
 })

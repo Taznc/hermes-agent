@@ -44,12 +44,15 @@ import {
 } from '@/lib/icons'
 import { extractPreviewTargets } from '@/lib/preview-targets'
 import { markAssistantIdSpoken } from '@/lib/spoken-reply'
+import { fmtClock } from '@/lib/time'
 import { useEnterAnimation } from '@/lib/use-enter-animation'
 import { cn } from '@/lib/utils'
 import { playSpeechText, stopVoicePlayback } from '@/lib/voice-playback'
-import { notifyError } from '@/store/notifications'
+import { notify, notifyError } from '@/store/notifications'
+import { applyFallbackAndRetry, cancelScheduledResume, resolveNextFallback, scheduleResumeAtReset, setRateLimitDefaultRecovery, $scheduledResumeJobs } from '@/store/rate-limit-recovery'
 import { requestSendDiagnostics } from '@/store/send-diagnostics'
 import { $connection, $currentModel } from '@/store/session'
+import { $gateway } from '@/store/gateway'
 import { $voicePlayback } from '@/store/voice-playback'
 
 // Stable empty identity for the settled-parts selector — a fresh [] per render
@@ -244,7 +247,7 @@ const AssistantMessageBody: FC<AssistantMessageProps & { collapsedNotice?: null 
                 <div className="flex items-start gap-1.5">
                   <div className="min-w-0 flex-1">
                     <ErrorLayerLabel />
-                    <ErrorPrimitive.Message className="min-w-0" />
+                    <ErrorMessageBody />
                   </div>
                   {onDismissError && (
                     <TooltipIconButton
@@ -257,7 +260,7 @@ const AssistantMessageBody: FC<AssistantMessageProps & { collapsedNotice?: null 
                     </TooltipIconButton>
                   )}
                 </div>
-                <ErrorRecoveryActions />
+                <ErrorRecoveryActions messageId={messageId} onDismissError={onDismissError} />
               </ErrorPrimitive.Root>
             </MessagePrimitive.Error>
           </div>
@@ -472,6 +475,33 @@ const ErrorLayerLabel: FC = () => {
   return <div className="font-medium">{label}</div>
 }
 
+// A rate_limit / upstream_rate_limit provider failure gets truthful,
+// plain-language copy (naming the provider, the reset time or its absence)
+// instead of the raw backend error string — see the module docstring on the
+// wire fields (`@/lib/error-surface`). Every other layer/code keeps the
+// existing raw ErrorPrimitive.Message.
+const isRateLimitSurface = (surface: ErrorSurface | undefined): boolean =>
+  surface?.layer === 'provider' && (surface.code === 'rate_limit' || surface.code === 'upstream_rate_limit')
+
+const ErrorMessageBody: FC = () => {
+  const { t } = useI18n()
+  const copy = t.assistant.thread.rateLimit
+  const surface = useAuiState(s => s.message.metadata?.custom?.errorSurface as ErrorSurface | undefined)
+
+  if (!isRateLimitSurface(surface)) {
+    return <ErrorPrimitive.Message className="min-w-0" />
+  }
+
+  return (
+    <div className="min-w-0">
+      <div>{copy.message(surface!.provider || '')}</div>
+      <div className="text-[0.72rem] opacity-80">
+        {surface!.resetAt !== undefined ? copy.resetsAt(fmtClock.format(new Date(surface!.resetAt * 1000))) : copy.resetUnknown}
+      </div>
+    </div>
+  )
+}
+
 // Isolated because useNavigate() THROWS outside a <Router> (bare test
 // harnesses, embedded panes render threads router-free). The parent gates
 // this child's mount on useInRouterContext(), which is safe anywhere.
@@ -485,7 +515,146 @@ const SwitchProviderAction: FC<{ label: string }> = ({ label }) => {
   )
 }
 
-const ErrorRecoveryActions: FC = () => {
+/**
+ * Phase 2.12 rate-limit recovery row: Resume at reset (schedules a one-shot
+ * cron job) / Switch model & retry (fallbackAvailable only, immediate no-wait
+ * retry via the same config.set path a manual /model switch uses) /
+ * Configure automatic fallback… (deep-link, shown when fallbackAvailable is
+ * false or absent). Rendered ALONGSIDE the existing Retry/Copy/etc actions,
+ * never replacing them.
+ */
+const RateLimitRecoveryActions: FC<{ messageId: string }> = ({ messageId }) => {
+  const { t } = useI18n()
+  const copy = t.assistant.thread.rateLimit
+  const surface = useAuiState(s => s.message.metadata?.custom?.errorSurface as ErrorSurface | undefined)
+  const messageRuntime = useMessageRuntime()
+  const gateway = useStore($gateway)
+  const view = useSessionView()
+  const sessionId = useStore(view.$storedId)
+  const runtimeSessionId = useStore(view.$runtimeId)
+  const inRouter = useInRouterContext()
+
+  const [scheduling, setScheduling] = useState(false)
+  const [switching, setSwitching] = useState(false)
+  const [makeDefault, setMakeDefault] = useState(false)
+
+  const scheduledJobs = useStore($scheduledResumeJobs)
+  const scheduledJob = scheduledJobs[messageId]
+
+  if (!isRateLimitSurface(surface) || !surface) {
+    return null
+  }
+
+  const resetAt = surface.resetAt
+
+  const resumeAtReset = async () => {
+    if (!resetAt || !sessionId || scheduling) {
+      return
+    }
+
+    setScheduling(true)
+
+    try {
+      const { deduped } = await scheduleResumeAtReset({
+        messageId,
+        model: surface.model,
+        provider: surface.provider,
+        resetAt,
+        sessionId
+      })
+
+      if (makeDefault) {
+        await setRateLimitDefaultRecovery('resume_at_reset').catch(() => undefined)
+      }
+
+      notify({
+        durationMs: 4_000,
+        kind: 'success',
+        message: deduped ? copy.jobDuplicate : copy.jobScheduled(fmtClock.format(new Date(resetAt * 1000)))
+      })
+    } catch (error) {
+      notifyError(error, copy.jobScheduleFailed)
+    } finally {
+      setScheduling(false)
+    }
+  }
+
+  const cancelResume = async () => {
+    if (!scheduledJob || !sessionId) {
+      return
+    }
+
+    try {
+      await cancelScheduledResume(messageId, sessionId)
+    } catch (error) {
+      notifyError(error, copy.jobCancelFailed)
+    }
+  }
+
+  const switchModelAndRetry = async () => {
+    if (!gateway || !runtimeSessionId || switching) {
+      return
+    }
+
+    setSwitching(true)
+
+    try {
+      const next = await resolveNextFallback(surface.provider, surface.model)
+
+      if (!next) {
+        return
+      }
+
+      const ok = await applyFallbackAndRetry(
+        (method, params) => gateway.request(method, params),
+        runtimeSessionId,
+        next.provider,
+        next.model
+      )
+
+      if (ok) {
+        messageRuntime.reload()
+      } else {
+        notifyError(new Error('config.set failed'), copy.switchModelFailed)
+      }
+    } finally {
+      setSwitching(false)
+    }
+  }
+
+  return (
+    <div className="flex flex-wrap items-center gap-1.5" data-slot="aui-rate-limit-actions">
+      {scheduledJob ? (
+        <button className="aui-error-action" onClick={() => void cancelResume()} type="button">
+          {copy.jobCancel}
+        </button>
+      ) : (
+        resetAt !== undefined && (
+          <>
+            <button className="aui-error-action" disabled={scheduling} onClick={() => void resumeAtReset()} type="button">
+              {copy.resumeAtReset}
+            </button>
+            <label className="flex items-center gap-1 text-[0.7rem] opacity-80">
+              <input checked={makeDefault} onChange={e => setMakeDefault(e.target.checked)} type="checkbox" />
+              {copy.makeDefault}
+            </label>
+          </>
+        )
+      )}
+      {surface.fallbackAvailable === true ? (
+        <button className="aui-error-action" disabled={switching} onClick={() => void switchModelAndRetry()} type="button">
+          {copy.switchModelAndRetry}
+        </button>
+      ) : (
+        inRouter && <SwitchProviderAction label={copy.configureFallback} />
+      )}
+    </div>
+  )
+}
+
+const ErrorRecoveryActions: FC<{ messageId: string; onDismissError?: (messageId: string) => void }> = ({
+  messageId
+}) => {
   const { t } = useI18n()
   const copy = t.assistant.thread
   const surface = useAuiState(s => s.message.metadata?.custom?.errorSurface as ErrorSurface | undefined)
@@ -515,8 +684,11 @@ const ErrorRecoveryActions: FC = () => {
   const retryable = !surface || surface.retryable
 
   // Switch Provider deep-links Settings → Models for the layers where the fix
-  // is provider/endpoint/auth config, not a retry.
-  const showSwitchProvider = surface != null && ['auth', 'billing', 'endpoint', 'provider'].includes(surface.layer)
+  // is provider/endpoint/auth config, not a retry. The rate-limit action row
+  // (below) offers its own, differently-labeled deep-link for that one code
+  // pair, so this generic one is suppressed there to avoid a duplicate.
+  const showSwitchProvider =
+    surface != null && ['auth', 'billing', 'endpoint', 'provider'].includes(surface.layer) && !isRateLimitSurface(surface)
 
   const openLogs = useCallback(async () => {
     try {
@@ -549,32 +721,35 @@ const ErrorRecoveryActions: FC = () => {
   )
 
   return (
-    <div className="flex flex-wrap items-center gap-1.5">
-      {retryable && (
-        <ActionBarPrimitive.Reload asChild>
-          <button className="aui-error-action" onClick={() => triggerHaptic('submit')} type="button">
-            <RefreshCwIcon className="size-3" />
-            {copy.errorRetry}
+    <>
+      {isRateLimitSurface(surface) && <RateLimitRecoveryActions messageId={messageId} />}
+      <div className="flex flex-wrap items-center gap-1.5">
+        {retryable && (
+          <ActionBarPrimitive.Reload asChild>
+            <button className="aui-error-action" onClick={() => triggerHaptic('submit')} type="button">
+              <RefreshCwIcon className="size-3" />
+              {copy.errorRetry}
+            </button>
+          </ActionBarPrimitive.Reload>
+        )}
+        {showSwitchProvider && inRouter && <SwitchProviderAction label={copy.errorSwitchProvider} />}
+        {window.hermesDesktop?.logsRoot && (
+          <button className="aui-error-action" onClick={() => void openLogs()} type="button">
+            {remoteConnection ? copy.errorOpenDesktopLogs : copy.errorOpenLogs}
           </button>
-        </ActionBarPrimitive.Reload>
-      )}
-      {showSwitchProvider && inRouter && <SwitchProviderAction label={copy.errorSwitchProvider} />}
-      {window.hermesDesktop?.logsRoot && (
-        <button className="aui-error-action" onClick={() => void openLogs()} type="button">
-          {remoteConnection ? copy.errorOpenDesktopLogs : copy.errorOpenLogs}
+        )}
+        <button className="aui-error-action" onClick={() => requestSendDiagnostics(diagnosticsText())} type="button">
+          <Upload className="size-3" />
+          {copy.errorSendDiagnostics}
         </button>
-      )}
-      <button className="aui-error-action" onClick={() => requestSendDiagnostics(diagnosticsText())} type="button">
-        <Upload className="size-3" />
-        {copy.errorSendDiagnostics}
-      </button>
-      <CopyButton
-        appearance="inline"
-        className="aui-error-action"
-        label={copy.errorCopyDiagnostics}
-        text={diagnosticsText}
-      />
-    </div>
+        <CopyButton
+          appearance="inline"
+          className="aui-error-action"
+          label={copy.errorCopyDiagnostics}
+          text={diagnosticsText}
+        />
+      </div>
+    </>
   )
 }
 

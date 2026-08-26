@@ -1147,7 +1147,11 @@ export const en: Translations = {
       unarchiveFailed: 'Unarchive failed',
       deleteFailed: 'Delete failed',
       updateDirFailed: 'Could not update default directory',
-      clearDirFailed: 'Could not clear default directory'
+      clearDirFailed: 'Could not clear default directory',
+      rateLimitRecoveryTitle: 'When a turn hits a rate limit',
+      rateLimitRecoveryDesc:
+        'Ask each time (default) always shows the failure card and lets you choose. Resume automatically starts a brief, cancelable countdown before scheduling a resume.',
+      rateLimitRecoveryFailed: 'Could not update the rate-limit recovery preference'
     },
     toolsets: {
       loadingConfig: 'Loading configuration',
@@ -2264,6 +2268,10 @@ export const en: Translations = {
       finishedUnread: 'Finished — unread',
       backgroundRunning: 'Background task running',
       draftSession: 'Draft — nothing sent yet',
+      rateLimited: {
+        withTime: time => `Rate limited — retry at ${time}`,
+        unknown: 'Rate limited — reset time unknown'
+      },
       handoffOrigin: platform => `Handed off from ${platform}`,
       ownedByProfile: profile => `Profile: ${profile}`,
       renamed: 'Renamed',
@@ -3179,6 +3187,24 @@ export const en: Translations = {
       errorOpenDesktopLogs: 'Open Desktop logs',
       errorCopyDiagnostics: 'Copy error details',
       errorSendDiagnostics: 'Send diagnostics',
+      rateLimit: {
+        message: provider => `${provider || 'The provider'} is rate limiting this account.`,
+        resetsAt: time => `Retry at ${time}`,
+        resetUnknown: 'Reset time unknown',
+        resumeAtReset: 'Resume at reset',
+        makeDefault: 'Make this the default',
+        switchModelAndRetry: 'Switch model & retry',
+        configureFallback: 'Configure automatic fallback…',
+        switchedNotice: (from, to) => `Switched from ${from} to ${to} and continued`,
+        countdownLabel: seconds => `Resuming in ${seconds}s… Cancel`,
+        cancelCountdown: 'Cancel',
+        jobScheduled: time => `Resume scheduled for ${time}`,
+        jobCancel: 'Cancel resume',
+        jobCancelFailed: 'Could not cancel the scheduled resume',
+        jobScheduleFailed: 'Could not schedule the resume',
+        jobDuplicate: 'A resume is already scheduled for this turn',
+        switchModelFailed: 'Could not switch models'
+      },
       filesChanged: count => (count === 1 ? '1 file changed' : `${count} files changed`),
       reviewChanges: 'Review',
       readAloudFailed: 'Read aloud failed',

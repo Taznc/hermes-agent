@@ -1338,7 +1338,11 @@ export const zh: Translations = {
       unarchiveFailed: '取消归档失败',
       deleteFailed: '删除失败',
       updateDirFailed: '无法更新默认目录',
-      clearDirFailed: '无法清除默认目录'
+      clearDirFailed: '无法清除默认目录',
+      rateLimitRecoveryTitle: 'When a turn hits a rate limit',
+      rateLimitRecoveryDesc:
+        'Ask each time (default) always shows the failure card and lets you choose. Resume automatically starts a brief, cancelable countdown before scheduling a resume.',
+      rateLimitRecoveryFailed: 'Could not update the rate-limit recovery preference'
     },
     toolsets: {
       loadingConfig: '正在加载配置',
@@ -2444,6 +2448,10 @@ export const zh: Translations = {
       finishedUnread: '已完成 — 未读',
       backgroundRunning: '后台任务运行中',
       draftSession: '草稿 — 尚未发送',
+      rateLimited: {
+        withTime: time => `Rate limited — retry at ${time}`,
+        unknown: 'Rate limited — reset time unknown'
+      },
       handoffOrigin: platform => `从 ${platform} 转接`,
       ownedByProfile: profile => `配置档：${profile}`,
       renamed: '已重命名',
@@ -3338,6 +3346,24 @@ export const zh: Translations = {
       errorOpenDesktopLogs: '打开桌面端日志',
       errorCopyDiagnostics: '复制错误详情',
       errorSendDiagnostics: '发送诊断信息',
+      rateLimit: {
+        message: provider => `${provider || 'The provider'} is rate limiting this account.`,
+        resetsAt: time => `Retry at ${time}`,
+        resetUnknown: 'Reset time unknown',
+        resumeAtReset: 'Resume at reset',
+        makeDefault: 'Make this the default',
+        switchModelAndRetry: 'Switch model & retry',
+        configureFallback: 'Configure automatic fallback…',
+        switchedNotice: (from, to) => `Switched from ${from} to ${to} and continued`,
+        countdownLabel: seconds => `Resuming in ${seconds}s… Cancel`,
+        cancelCountdown: 'Cancel',
+        jobScheduled: time => `Resume scheduled for ${time}`,
+        jobCancel: 'Cancel resume',
+        jobCancelFailed: 'Could not cancel the scheduled resume',
+        jobScheduleFailed: 'Could not schedule the resume',
+        jobDuplicate: 'A resume is already scheduled for this turn',
+        switchModelFailed: 'Could not switch models'
+      },
       filesChanged: count => `${count} 个文件已更改`,
       reviewChanges: '查看',
       readAloudFailed: '朗读失败',

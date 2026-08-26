@@ -992,6 +992,10 @@ export interface Translations {
       deleteFailed: string
       updateDirFailed: string
       clearDirFailed: string
+      /** Phase 2.12 — `sessions.rate_limit_default_recovery` (ask | resume_at_reset). */
+      rateLimitRecoveryTitle: string
+      rateLimitRecoveryDesc: string
+      rateLimitRecoveryFailed: string
     }
     toolsets: {
       loadingConfig: string
@@ -1926,6 +1930,13 @@ export interface Translations {
       finishedUnread: string
       backgroundRunning: string
       draftSession: string
+      /** Phase 2.12 — "rate limited" terminal sidebar status.
+       *  `withTime` when resetAt is known, `unknown` otherwise — never
+       *  fabricate a reset time. */
+      rateLimited: {
+        withTime: (time: string) => string
+        unknown: string
+      }
       handoffOrigin: (platform: string) => string
       ownedByProfile: (profile: string) => string
       renamed: string
@@ -2738,6 +2749,30 @@ export interface Translations {
       errorOpenDesktopLogs: string
       errorCopyDiagnostics: string
       errorSendDiagnostics: string
+      /** Phase 2.12 — rate-limit turn recovery (resetAt/fallbackAvailable). */
+      rateLimit: {
+        /** Plain-language failure message naming the provider/account. */
+        message: (provider: string) => string
+        /** Local human-readable reset time, when resetAt is present. */
+        resetsAt: (time: string) => string
+        /** Shown instead of resetsAt when resetAt is absent — never fabricate a time. */
+        resetUnknown: string
+        resumeAtReset: string
+        makeDefault: string
+        switchModelAndRetry: string
+        configureFallback: string
+        /** Small transcript/status note when the backend's mid-turn fallback
+         *  already fixed the turn — never rendered as a failure card. */
+        switchedNotice: (from: string, to: string) => string
+        countdownLabel: (seconds: number) => string
+        cancelCountdown: string
+        jobScheduled: (time: string) => string
+        jobCancel: string
+        jobCancelFailed: string
+        jobScheduleFailed: string
+        jobDuplicate: string
+        switchModelFailed: string
+      }
       filesChanged: (count: number) => string
       reviewChanges: string
       readAloudFailed: string

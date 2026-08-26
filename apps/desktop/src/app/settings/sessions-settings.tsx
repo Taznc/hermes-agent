@@ -18,6 +18,7 @@ import { Archive, ArchiveOff, FolderOpen, Loader2, Trash2 } from '@/lib/icons'
 import { confirm } from '@/store/confirm'
 import { notify, notifyError } from '@/store/notifications'
 import { untombstoneSessions } from '@/store/projects'
+import { loadRateLimitDefaultRecovery, setRateLimitDefaultRecovery } from '@/store/rate-limit-recovery'
 import { applyConfiguredDefaultProjectDir, ensureDefaultWorkspaceCwd, setSessions } from '@/store/session'
 import { forgetSessionUnread } from '@/store/session-unread'
 import type { HermesConfigRecord, SessionInfo } from '@/types/hermes'
@@ -120,6 +121,8 @@ export function SessionsSettings() {
       <DefaultProjectDirSetting />
 
       <AutoArchiveSetting />
+
+      <RateLimitRecoverySetting />
 
       <SectionHeading
         icon={Archive}
@@ -283,6 +286,64 @@ function AutoArchiveSetting() {
           title={s.autoArchiveDaysLabel}
         />
       )}
+    </div>
+  )
+}
+
+/** `sessions.rate_limit_default_recovery` (Phase 2.12): Ask each turn
+ *  (default) vs. auto-schedule a resume via the countdown in the error card
+ *  (assistant-message.tsx's RateLimitRecoveryActions). This toggle and the
+ *  card's inline "Make this the default" checkbox write the same config key
+ *  through the same helper, so either surface stays authoritative. */
+function RateLimitRecoverySetting() {
+  const { t } = useI18n()
+  const s = t.settings.sessions
+  const [value, setValue] = useState<'ask' | 'resume_at_reset'>('ask')
+  const [loaded, setLoaded] = useState(false)
+
+  useEffect(() => {
+    let alive = true
+
+    void loadRateLimitDefaultRecovery().then(resolved => {
+      if (alive) {
+        setValue(resolved)
+        setLoaded(true)
+      }
+    })
+
+    return () => {
+      alive = false
+    }
+  }, [])
+
+  const toggle = useCallback(
+    async (on: boolean) => {
+      const next = on ? 'resume_at_reset' : 'ask'
+
+      setValue(next)
+
+      try {
+        await setRateLimitDefaultRecovery(next)
+      } catch (err) {
+        setValue(next === 'resume_at_reset' ? 'ask' : 'resume_at_reset')
+        notifyError(err, s.rateLimitRecoveryFailed)
+      }
+    },
+    [s.rateLimitRecoveryFailed]
+  )
+
+  if (!loaded) {
+    return null
+  }
+
+  return (
+    <div className="mb-6">
+      <ToggleRow
+        checked={value === 'resume_at_reset'}
+        description={s.rateLimitRecoveryDesc}
+        label={s.rateLimitRecoveryTitle}
+        onChange={on => void toggle(on)}
+      />
     </div>
   )
 }
