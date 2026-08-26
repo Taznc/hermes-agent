@@ -8,6 +8,7 @@ import { createClientSessionState } from '@/lib/chat-runtime'
 import type * as ChatRuntime from '@/lib/chat-runtime'
 import type * as Time from '@/lib/time'
 import type * as ComposerStatusStore from '@/store/composer-status'
+import { setSidebarWidth, SIDEBAR_DEFAULT_WIDTH, SIDEBAR_MAX_WIDTH } from '@/store/layout'
 import type * as SessionStore from '@/store/session'
 import { clearAllSessionStates, publishSessionState } from '@/store/session-states'
 import type * as SessionStatesStore from '@/store/session-states'
@@ -34,6 +35,10 @@ vi.mock('@/i18n', () => ({
           handoffOrigin: (platform: string) => `Started on ${platform}`,
           messageCount: (count: number) => `${count} messages`,
           needsInput: 'Needs input',
+          providerConfigured: (family: string) => `Configured model: ${family}`,
+          providerConfiguredVia: (configuredFamily: string, servedFamily: string) =>
+            `Configured model: ${configuredFamily}, currently served via ${servedFamily}`,
+          providerVia: (family: string) => `via ${family}`,
           sessionActions: 'Session actions',
           sessionRunning: 'Running',
           todoProgress: 'Tasks completed',
@@ -422,5 +427,101 @@ describe('Inbox-style session card', () => {
 
     expect(workspace.className).toMatch(/\btruncate\b/)
     expect(screen.getByText('133 messages')).toBeTruthy()
+  })
+})
+
+describe('Provider identity (Phase 2.13)', () => {
+  afterEach(() => {
+    setSidebarWidth(SIDEBAR_MAX_WIDTH)
+  })
+
+  it('shows only the configured family when the served route matches', () => {
+    renderRow(
+      makeSession({
+        configured_provider: 'anthropic',
+        served_provider: 'anthropic',
+        title: 'Matching route'
+      }),
+      { card: true }
+    )
+
+    expect(screen.getByText('Claude')).toBeTruthy()
+    expect(screen.queryByText(/^via /)).toBeNull()
+  })
+
+  it('surfaces a "via <provider>" note only when the served route differs (fallback)', () => {
+    renderRow(
+      makeSession({
+        configured_provider: 'anthropic',
+        served_provider: 'openai-codex',
+        title: 'Fell back mid-conversation'
+      }),
+      { card: true }
+    )
+
+    expect(screen.getByText('Claude')).toBeTruthy()
+    expect(screen.getByText('via Codex')).toBeTruthy()
+  })
+
+  it('renders no identity chip for a legacy session with no resolvable provider', () => {
+    renderRow(
+      makeSession({
+        configured_provider: null,
+        served_provider: null,
+        title: 'Legacy session'
+      }),
+      { card: true }
+    )
+
+    expect(screen.queryByText('Claude')).toBeNull()
+    expect(screen.queryByText('Codex')).toBeNull()
+    expect(screen.queryByText(/^via /)).toBeNull()
+  })
+
+  it('title-cases an unrecognized provider instead of implying a false Claude/Codex identity', () => {
+    renderRow(
+      makeSession({
+        configured_provider: 'my-custom-endpoint',
+        served_provider: 'my-custom-endpoint',
+        title: 'Custom endpoint session'
+      }),
+      { card: true }
+    )
+
+    expect(screen.getByText('My Custom Endpoint')).toBeTruthy()
+  })
+
+  it('exposes the full mismatch text as the accessible name of the identity chip', () => {
+    renderRow(
+      makeSession({
+        configured_provider: 'anthropic',
+        served_provider: 'openai-codex',
+        title: 'Accessible mismatch'
+      }),
+      { card: true }
+    )
+
+    expect(screen.getByLabelText('Configured model: Claude, currently served via Codex')).toBeTruthy()
+  })
+
+  it('collapses the "via" note to a tooltip-only glyph below the narrow-sidebar threshold', () => {
+    setSidebarWidth(SIDEBAR_DEFAULT_WIDTH)
+
+    renderRow(
+      makeSession({
+        configured_provider: 'anthropic',
+        served_provider: 'openai-codex',
+        title: 'Narrow sidebar'
+      }),
+      { card: true }
+    )
+
+    // The full "via Codex" text is gone from the DOM at the narrow width...
+    expect(screen.queryByText('via Codex')).toBeNull()
+    // ...but the mismatch is still discoverable: the tooltip trigger carries
+    // the same text as its label, and the wrapper's accessible name is intact.
+    expect(screen.getByText('•')).toBeTruthy()
+    expect(tipTrigger(screen.getByText('•'))).toBeTruthy()
+    expect(screen.getByLabelText('Configured model: Claude, currently served via Codex')).toBeTruthy()
   })
 })

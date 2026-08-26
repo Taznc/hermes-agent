@@ -504,6 +504,26 @@ export interface SessionInfo {
   last_active: number
   message_count: number
   model: null | string
+  /** Provider `session_gateway_runtime` would resolve for the NEXT turn/
+   *  resume of this session (Phase 2.13 sidebar identity) — the
+   *  configured/intended route. Raw Hermes provider id (e.g. `anthropic`,
+   *  `openai-codex`), not a display label; run through `providerFamilyLabel`
+   *  before rendering. `null`/undefined on a legacy session with no
+   *  resolvable provider (predates `model_config`, or backend predates this
+   *  field) — never infer a family from that. */
+  configured_provider?: null | string
+  /** Model id that actually served this session's most RECENT completed
+   *  turn, from `session_model_usage` (falls back to the legacy
+   *  first-call-only `sessions.model` column pre-v20 / for sessions with no
+   *  usage rows). Paired with {@link served_provider} for the mismatch
+   *  check below; not itself rendered unless a future surface wants it. */
+  served_model?: null | string
+  /** Provider that actually served this session's most recent completed
+   *  turn — see {@link served_model}. Compare (case-insensitively) against
+   *  {@link configured_provider}: a difference means a fallback occurred and
+   *  the sidebar's secondary "via <provider>" note should show. Equal (or
+   *  either missing) means no mismatch — render nothing extra. */
+  served_provider?: null | string
   output_tokens: number
   /** Parent conversation when this row is a /branch fork. */
   parent_session_id?: null | string

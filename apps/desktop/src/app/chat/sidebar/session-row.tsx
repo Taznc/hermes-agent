@@ -24,7 +24,7 @@ import { handoffOriginSource, sessionSourceLabel } from '@/lib/session-source'
 import { coarseElapsed } from '@/lib/time'
 import { useStoreSelector } from '@/lib/use-session-slice'
 import { cn } from '@/lib/utils'
-import { $sidebarRowMeta } from '@/store/layout'
+import { $sidebarRowMeta, $sidebarWidth, SIDEBAR_DEFAULT_WIDTH, SIDEBAR_MAX_WIDTH } from '@/store/layout'
 import { normalizeProfileKey } from '@/store/profile'
 import { $projects } from '@/store/projects'
 import { $pullRequestsByBranch, sessionPrKey } from '@/store/pull-requests'
@@ -47,7 +47,7 @@ import {
   SidebarRowShell
 } from './chrome'
 import { SessionActionsMenu, SessionContextMenu } from './session-actions-menu'
-import { sessionRowDetails } from './session-row-details'
+import { sessionRowDetails, type SessionRowIdentity, sessionRowIdentity } from './session-row-details'
 import { resolveSessionRowClick } from './session-row-gesture'
 import { useProfilePrewarm } from './use-profile-prewarm'
 
@@ -120,6 +120,55 @@ function formatAge(seconds: number, r: Translations['sidebar']['row']): string {
   return unit === 'second' ? r.ageNow : `${value}${r[AGE_KEY[unit]]}`
 }
 
+/** Configured-model family text, plus a secondary "via <provider>" note ONLY
+ *  on a mismatch with the session's latest-served turn (Phase 2.13). Never
+ *  color-only: the "via" note is always real text (or, below `narrow`, a
+ *  glyph that still carries the same text as its tooltip and the wrapper's
+ *  accessible name) — color is not the identity signal here at all, just the
+ *  quaternary muting every other secondary row label already uses. */
+function ProviderIdentityBadge({
+  className,
+  identity,
+  narrow,
+  r
+}: {
+  className?: string
+  identity: SessionRowIdentity
+  narrow: boolean
+  r: Translations['sidebar']['row']
+}) {
+  if (!identity.configured) return null
+
+  if (!identity.served) {
+    return (
+      <span aria-label={r.providerConfigured(identity.configured)} className={className}>
+        {identity.configured}
+      </span>
+    )
+  }
+
+  const viaText = r.providerVia(identity.served)
+
+  return (
+    <span
+      aria-label={r.providerConfiguredVia(identity.configured, identity.served)}
+      className={cn('inline-flex min-w-0 items-center gap-1', className)}
+    >
+      <span aria-hidden="true" className="truncate">
+        {identity.configured}
+      </span>
+      <Tip label={viaText}>
+        {/* Below `narrow` the note collapses to this dot — still tooltipped,
+            never vanishing outright, so the mismatch stays discoverable at
+            any sidebar width. */}
+        <span aria-hidden="true" className="shrink-0 truncate text-(--ui-text-quaternary)">
+          {narrow ? '•' : viaText}
+        </span>
+      </Tip>
+    </span>
+  )
+}
+
 function SidebarSessionRowImpl({
   session,
   branchStem,
@@ -153,6 +202,25 @@ function SidebarSessionRowImpl({
     messageCount: fmt.messageCount,
     toolCallCount: fmt.toolCallCount
   })
+
+  // Configured-vs-served provider identity (Phase 2.13): `configured` is the
+  // primary family label (Claude/Codex/etc, or a title-cased fallback for an
+  // unrecognized provider — never guessed for a legacy session with no
+  // resolvable provider). `served` is populated ONLY on a mismatch with the
+  // session's latest completed turn (e.g. a rate-limit fallback), so the
+  // common case where they agree renders nothing extra.
+  const identity = sessionRowIdentity(session)
+  // Below this width the secondary "via <provider>" note collapses to
+  // tooltip-only — same responsive intent as the row's other truncation
+  // rules, just gated on the sidebar's own resizable width rather than a CSS
+  // container query (the note's text needs to vanish, not just visually
+  // clip, so the accessible name can still carry it as a tooltip). The
+  // threshold sits at the midpoint of the sidebar's own resize range
+  // (SIDEBAR_DEFAULT_WIDTH..SIDEBAR_MAX_WIDTH) — the default width is
+  // "narrow" by this measure, and widening the rail past the midpoint earns
+  // back the full "via <provider>" text.
+  const sidebarWidth = useStore($sidebarWidth)
+  const narrowSidebar = sidebarWidth < (SIDEBAR_DEFAULT_WIDTH + SIDEBAR_MAX_WIDTH) / 2
 
   const timestamp = session.last_active || session.started_at
   const age = formatAge(timestamp, r)
@@ -505,14 +573,26 @@ function SidebarSessionRowImpl({
                     {/* Session-list density (#68119): comfortable adds one
                         deterministic metadata line; detailed adds the initial
                         request preview. Compact keeps today's one-line row. */}
-                    {density !== 'compact' && details.metadata && (
+                    {density !== 'compact' && (details.metadata || identity.configured) && (
                       <span
                         className={cn(
-                          'mt-0.5 block truncate text-[0.625rem] text-(--ui-text-tertiary)',
+                          'mt-0.5 flex min-w-0 items-baseline gap-1 text-[0.625rem] text-(--ui-text-tertiary)',
                           SIDEBAR_TRUNCATED_LEADING
                         )}
                       >
-                        {details.metadata}
+                        {identity.configured && (
+                          <ProviderIdentityBadge
+                            className="shrink-0"
+                            identity={identity}
+                            narrow={narrowSidebar}
+                            r={r}
+                          />
+                        )}
+                        {details.metadata && (
+                          <span className={cn('min-w-0 truncate', SIDEBAR_TRUNCATED_LEADING)}>
+                            {identity.configured ? ` · ${details.metadata}` : details.metadata}
+                          </span>
+                        )}
                       </span>
                     )}
                     {density === 'detailed' && details.preview && (
@@ -576,13 +656,21 @@ function SidebarSessionRowImpl({
                     </span>
                   ) : null}
                 </div>
-                {model || size || todoProgress ? (
+                {model || size || todoProgress || identity.configured ? (
                   <span
                     className={cn(
                       'flex min-w-0 items-baseline gap-2 text-[0.625rem] text-(--ui-text-tertiary)',
                       SIDEBAR_TRUNCATED_LEADING
                     )}
                   >
+                    {identity.configured ? (
+                      <ProviderIdentityBadge
+                        className="min-w-0 shrink-0"
+                        identity={identity}
+                        narrow={narrowSidebar}
+                        r={r}
+                      />
+                    ) : null}
                     {model ? <span className="min-w-0 truncate">{model}</span> : null}
                     {size ? <span className="shrink-0 tabular-nums">{size}</span> : null}
                     {todoProgress ? (

@@ -72,6 +72,7 @@ from hermes_state_common import (  # noqa: F401  (re-exported for back-compat)
     _ephemeral_child_sql,
     _legacy_reset_child_sql,
     _shape_preview,
+    _sql_served_route_column,
     _sql_session_last_active,
     _sql_session_last_active_by_id,
     escape_like as _escape_like,
@@ -10077,7 +10078,9 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                         ''
                     ) AS _preview_raw,
                     {_sql_session_last_active("s")} AS last_active,
-                    COALESCE(cm.effective_last_active, s.started_at) AS _effective_last_active
+                    COALESCE(cm.effective_last_active, s.started_at) AS _effective_last_active,
+                    {_sql_served_route_column("s", "model")} AS served_model,
+                    {_sql_served_route_column("s", "billing_provider")} AS served_provider
                 FROM sessions s
                 LEFT JOIN chain_max cm ON cm.root_id = s.id
                 {prompt_join}
@@ -10100,7 +10103,9 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                          ORDER BY m.timestamp, m.id LIMIT 1),
                         ''
                     ) AS _preview_raw,
-                    {_sql_session_last_active("s")} AS last_active
+                    {_sql_session_last_active("s")} AS last_active,
+                    {_sql_served_route_column("s", "model")} AS served_model,
+                    {_sql_served_route_column("s", "billing_provider")} AS served_provider
                 FROM sessions s
                 {prompt_join}
                 {where_sql}
@@ -10117,6 +10122,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
             s["preview"] = _shape_preview(s.pop("_preview_raw", ""))
             # Drop the internal ordering column so callers see a clean dict.
             s.pop("_effective_last_active", None)
+            s["configured_provider"] = self._configured_provider_for_row(s)
             sessions.append(s)
 
         # Back-fill pinned conversations the page missed. A pin outlives
@@ -10143,7 +10149,9 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                     COALESCE(
                         (SELECT MAX(m2.timestamp) FROM messages m2 WHERE m2.session_id = s.id),
                         s.started_at
-                    ) AS last_active
+                    ) AS last_active,
+                    {_sql_served_route_column("s", "model")} AS served_model,
+                    {_sql_served_route_column("s", "billing_provider")} AS served_provider
                 FROM sessions s
                 {prompt_join}
                 {pinned_where}
@@ -10157,6 +10165,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                 if s["id"] in seen_ids:
                     continue
                 s["preview"] = _shape_preview(s.pop("_preview_raw", ""))
+                s["configured_provider"] = self._configured_provider_for_row(s)
                 seen_ids.add(s["id"])
                 sessions.append(s)
 
@@ -10202,6 +10211,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                     "id", "ended_at", "end_reason", "message_count",
                     "tool_call_count", "title", "last_active", "preview",
                     "model", "system_prompt", "cwd", "git_branch", "git_repo_root",
+                    "configured_provider", "served_model", "served_provider",
                 ):
                     if key in tip_row:
                         merged[key] = tip_row[key]
