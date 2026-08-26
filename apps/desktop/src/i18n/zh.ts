@@ -2446,6 +2446,10 @@ export const zh: Translations = {
       draftSession: '草稿 — 尚未发送',
       handoffOrigin: platform => `从 ${platform} 转接`,
       ownedByProfile: profile => `配置档：${profile}`,
+      providerConfigured: family => `配置的模型：${family}`,
+      providerVia: family => `经由 ${family}`,
+      providerConfiguredVia: (configuredFamily, servedFamily) =>
+        `配置的模型：${configuredFamily}，当前经由 ${servedFamily} 提供服务`,
       renamed: '已重命名',
       renameFailed: '重命名失败',
       renameTitle: '重命名会话',
