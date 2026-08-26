@@ -16,8 +16,19 @@ import type { HermesConnection } from '@/global'
 
 // A truthy resolution means "activation landed" — resolving false models a
 // disposed target, which must publish nothing.
-const ensureGatewayForAgent = vi.fn(async (_connectionId: null | string, _profile: string) => true)
-const ensureGatewayForProfile = vi.fn(async (_profile: string) => undefined)
+// Mirrors gateway.ts's own internal (activeKey/secondaries) bookkeeping: the
+// real activeGatewayConnectionId() reads gateway module state that ONLY
+// changes when ensureGatewayForAgent/ensureGatewayForProfile actually land —
+// it is independent of profile.ts's $activeGatewayConnection publish atom.
+let mockActiveConnectionId: null | string = null
+
+const ensureGatewayForAgent = vi.fn(async (connectionId: null | string, _profile: string) => {
+  mockActiveConnectionId = connectionId
+  return true
+})
+const ensureGatewayForProfile = vi.fn(async (_profile: string) => {
+  mockActiveConnectionId = null
+})
 const openGatewayForProfile = vi.fn(async (_profile: string) => undefined)
 const $gateway = atom<unknown>({ id: 'live-socket' })
 const resetStarmapGraph = vi.fn()
@@ -25,6 +36,7 @@ const wipeSessionListsForGatewaySwitch = vi.fn()
 
 vi.mock('@/store/gateway', () => ({
   $gateway,
+  activeGatewayConnectionId: () => mockActiveConnectionId,
   ensureGatewayForAgent,
   ensureGatewayForProfile,
   openGatewayForProfile
@@ -71,6 +83,7 @@ beforeEach(() => {
   // "not.toHaveBeenCalled()" would see the PREVIOUS test's dial.
   ensureGatewayForAgent.mockClear()
   ensureGatewayForProfile.mockClear()
+  mockActiveConnectionId = null
   $gateway.set({ id: 'live-socket' })
   $activeGatewayProfile.set('default')
   $activeGatewayConnection.set(null)
