@@ -118,6 +118,7 @@ type KanbanMessages = {
   evtReprioritized: (priority: string) => string
   someone: string
   // drawer — meta + sections
+  metaSectionLabel: string
   metaPriority: string
   metaTenant: string
   metaCreatedBy: string
@@ -126,6 +127,17 @@ type KanbanMessages = {
   readyUnassignedTitle: string
   readyUnassignedBody: string
   diagnosticsN: (n: number) => string
+  // Call-to-action banner — the top-of-drawer answer to "why is this stuck
+  // and what do I do about it" for blocked/review tasks.
+  ctaBlockedTitle: string
+  ctaBlockedNoReason: string
+  ctaReply: string
+  ctaUnblock: string
+  ctaReviewTitle: string
+  ctaReviewBody: string
+  ctaApprove: string
+  ctaSendBack: string
+  blockKind: Record<'capability' | 'dependency' | 'needs_input' | 'transient', string>
   commandCopied: string
   description: string
   editDescription: string
@@ -318,6 +330,7 @@ export const en: KanbanMessages = {
   evtArchived: 'archived',
   evtReprioritized: priority => `priority set to ${priority}`,
   someone: 'someone',
+  metaSectionLabel: 'Details',
   metaPriority: 'Priority',
   metaTenant: 'Tenant',
   metaCreatedBy: 'Created by',
@@ -327,6 +340,20 @@ export const en: KanbanMessages = {
   readyUnassignedBody:
     'The dispatcher only claims Ready cards that have an assignee. Pick a profile in the Assignee field above (or set a default assignee in the orchestration settings) and it runs within a minute.',
   diagnosticsN: n => `Diagnostics · ${n}`,
+  ctaBlockedTitle: 'Blocked — needs your input',
+  ctaBlockedNoReason: 'The worker blocked this task but did not record a reason.',
+  ctaReply: 'Reply',
+  ctaUnblock: 'Unblock',
+  ctaReviewTitle: 'Needs review',
+  ctaReviewBody: 'A reviewer should check the work below before this is marked done.',
+  ctaApprove: 'Approve (mark done)',
+  ctaSendBack: 'Send back to Ready',
+  blockKind: {
+    dependency: 'Waiting on a dependency',
+    needs_input: 'Needs your input',
+    capability: 'Missing a capability',
+    transient: 'Hit a transient failure'
+  },
   commandCopied: 'Command copied',
   description: 'Description',
   editDescription: 'Edit description',
@@ -519,6 +546,7 @@ const ja: KanbanMessages = {
   evtArchived: 'アーカイブ済み',
   evtReprioritized: priority => `優先度を ${priority} に設定`,
   someone: '誰か',
+  metaSectionLabel: '詳細',
   metaPriority: '優先度',
   metaTenant: 'テナント',
   metaCreatedBy: '作成者',
@@ -528,6 +556,20 @@ const ja: KanbanMessages = {
   readyUnassignedBody:
     'ディスパッチャは担当のある Ready カードのみ取得します。上の担当フィールドでプロフィールを選ぶ（またはオーケストレーション設定でデフォルトの担当を設定する）と、1分以内に実行されます。',
   diagnosticsN: n => `診断・${n}`,
+  ctaBlockedTitle: 'ブロック中 — あなたの対応が必要です',
+  ctaBlockedNoReason: 'ワーカーがこのタスクをブロックしましたが、理由は記録されていません。',
+  ctaReply: '返信',
+  ctaUnblock: 'ブロック解除',
+  ctaReviewTitle: 'レビューが必要です',
+  ctaReviewBody: '完了とマークする前に、下の内容をレビュアーが確認してください。',
+  ctaApprove: '承認（完了にする）',
+  ctaSendBack: 'Ready に差し戻す',
+  blockKind: {
+    dependency: '依存関係待ち',
+    needs_input: '入力が必要',
+    capability: '機能が不足',
+    transient: '一時的な失敗が発生'
+  },
   commandCopied: 'コマンドをコピーしました',
   description: '説明',
   editDescription: '説明を編集',
@@ -719,6 +761,7 @@ const zh: KanbanMessages = {
   evtArchived: '已归档',
   evtReprioritized: priority => `优先级设为 ${priority}`,
   someone: '某人',
+  metaSectionLabel: '详情',
   metaPriority: '优先级',
   metaTenant: '租户',
   metaCreatedBy: '创建者',
@@ -728,6 +771,20 @@ const zh: KanbanMessages = {
   readyUnassignedBody:
     '调度器只领取有负责人的就绪卡片。在上面的负责人字段选择一个配置档（或在编排设置中设置默认负责人），它会在一分钟内运行。',
   diagnosticsN: n => `诊断・${n}`,
+  ctaBlockedTitle: '受阻 — 需要你的输入',
+  ctaBlockedNoReason: '工作单元阻塞了此任务，但未记录原因。',
+  ctaReply: '回复',
+  ctaUnblock: '解除阻塞',
+  ctaReviewTitle: '需要审查',
+  ctaReviewBody: '在标记完成之前，审查者应检查下面的工作内容。',
+  ctaApprove: '批准（标记完成）',
+  ctaSendBack: '退回到就绪',
+  blockKind: {
+    dependency: '正在等待依赖',
+    needs_input: '需要你的输入',
+    capability: '缺少能力',
+    transient: '发生了临时故障'
+  },
   commandCopied: '命令已复制',
   description: '描述',
   editDescription: '编辑描述',
@@ -917,6 +974,7 @@ const zhHant: KanbanMessages = {
   evtArchived: '已封存',
   evtReprioritized: priority => `優先順序設為 ${priority}`,
   someone: '某人',
+  metaSectionLabel: '詳情',
   metaPriority: '優先順序',
   metaTenant: '租戶',
   metaCreatedBy: '建立者',
@@ -926,6 +984,20 @@ const zhHant: KanbanMessages = {
   readyUnassignedBody:
     '排程器只領取有負責人的就緒卡片。在上方的負責人欄位選擇一個設定檔（或在編排設定中設定預設負責人），它會在一分鐘內執行。',
   diagnosticsN: n => `診斷・${n}`,
+  ctaBlockedTitle: '受阻 — 需要你的輸入',
+  ctaBlockedNoReason: '工作單元封鎖了此任務，但未記錄原因。',
+  ctaReply: '回覆',
+  ctaUnblock: '解除封鎖',
+  ctaReviewTitle: '需要審查',
+  ctaReviewBody: '在標記完成之前，審查者應檢查下面的工作內容。',
+  ctaApprove: '核准（標記完成）',
+  ctaSendBack: '退回至就緒',
+  blockKind: {
+    dependency: '正在等待相依項目',
+    needs_input: '需要你的輸入',
+    capability: '缺少能力',
+    transient: '發生暫時性故障'
+  },
   commandCopied: '指令已複製',
   description: '描述',
   editDescription: '編輯描述',

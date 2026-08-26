@@ -271,6 +271,44 @@ export function Callout({
   )
 }
 
+// The task detail view's top-of-drawer call-to-action: a full-bordered,
+// tone-washed banner (louder than Callout's left-rule treatment) reserved for
+// states that need a human decision right now — blocked, needs review, needs
+// an answer. Rendered once, above the meta table, so it's the first thing a
+// user sees on a card that needs them; everything else stays informational.
+export function Banner({
+  actions,
+  children,
+  icon,
+  title,
+  tone
+}: {
+  actions?: ReactNode
+  children?: ReactNode
+  icon: string
+  title: ReactNode
+  tone: string
+}) {
+  return (
+    <div
+      className="flex flex-col gap-2 rounded-lg border p-3"
+      style={{
+        backgroundColor: `color-mix(in srgb, ${tone} 10%, transparent)`,
+        borderColor: `color-mix(in srgb, ${tone} 32%, transparent)`
+      }}
+    >
+      <div className="flex items-center gap-2">
+        <Codicon className="shrink-0" name={icon} size="0.9rem" style={{ color: tone }} />
+        <span className="text-[0.8125rem] font-semibold" style={{ color: tone }}>
+          {title}
+        </span>
+      </div>
+      {children}
+      {actions && <div className="flex flex-wrap gap-1.5">{actions}</div>}
+    </div>
+  )
+}
+
 // A short, edge-masked scroll area. Thin wrapper over the app's FadeScroll so
 // the drawer's scrollers behave exactly like the ones in chat; kept as a local
 // name because every call site here passes `max`.
