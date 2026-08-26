@@ -24,7 +24,7 @@ afterEach(() => {
 })
 
 describe('ExpandableBlock', () => {
-  it('lets horizontal scroll through and keeps the last line selectable', () => {
+  it('keeps the toggle outside the scroll container, below the scrollbars', () => {
     vi.stubGlobal('ResizeObserver', TestResizeObserver)
 
     const { container } = render(
@@ -35,27 +35,28 @@ describe('ExpandableBlock', () => {
 
     const inner = container.querySelector('[data-testid="content"]')!.parentElement!
     const toggle = screen.getByRole('button', { name: /expand|collapse/i })
-    const fade = toggle.parentElement!
+    const fade = screen.getByTestId('expandable-fade')
 
     // Inner container allows horizontal scroll so wide code gets a scrollbar:
     // platform overlay (`scrollbar-overlay`), not the always-on classic gutter.
     expect(inner.className).toContain('overflow-x-auto')
     expect(inner.className).toContain('scrollbar-overlay')
 
-    // The full-width fade is a pure cue: it spans the bottom edge but must not
-    // intercept pointer events, so the scrollbar drag and text selection on the
-    // last line pass through to the content underneath.
+    // The fade is a pure decorative cue and must not intercept pointer
+    // events or carry the click target.
     expect(fade.className).toContain('pointer-events-none')
-    expect(fade.className).toContain('inset-x-0')
+    expect(fade.getAttribute('role')).not.toBe('button')
 
-    // Only the compact toggle is clickable, and it is pinned to the right edge
-    // rather than spanning the full width (the old bug).
-    expect(toggle.className).toContain('pointer-events-auto')
-    expect(toggle.className).toContain('w-9')
-    expect(toggle.className).not.toContain('inset-x-0')
+    // The toggle is NOT nested inside the scrollable box (the old bug: an
+    // icon pinned inside the scroller's own corner, where a vertical or
+    // horizontal scrollbar could sit on top of it and eat the click). It is
+    // a sibling, full-width row below the box, so it can never overlap
+    // either scrollbar regardless of scroll position or code block width.
+    expect(inner.contains(toggle)).toBe(false)
+    expect(toggle.className).toContain('w-full')
   })
 
-  it('still toggles expanded state when the compact control is clicked', () => {
+  it('still toggles expanded state when the toggle is clicked', () => {
     vi.stubGlobal('ResizeObserver', TestResizeObserver)
 
     render(
@@ -70,5 +71,15 @@ describe('ExpandableBlock', () => {
     fireEvent.click(toggle)
 
     expect(screen.getByRole('button', { name: 'Collapse' }).getAttribute('aria-expanded')).toBe('true')
+  })
+
+  it('renders no toggle when the content does not overflow', () => {
+    render(
+      <ExpandableBlock>
+        <pre data-testid="content">{'short'}</pre>
+      </ExpandableBlock>
+    )
+
+    expect(screen.queryByRole('button', { name: /expand|collapse/i })).toBeNull()
   })
 })
