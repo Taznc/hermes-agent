@@ -29,6 +29,7 @@ back to today's string-sniffing behavior (older backends keep working).
 from __future__ import annotations
 
 import logging
+import time
 from typing import Any, Optional
 
 logger = logging.getLogger(__name__)
@@ -77,6 +78,14 @@ _NON_RETRYABLE_REASONS = {
     "format_error",
     "ssl_cert_verification",
 }
+
+# Reasons for which the optional ``reset_at`` / ``fallback_available`` wire
+# fields are meaningful (Phase 2.12): a true provider-side rate limit, either
+# the caller's own account bucket or an upstream-aggregator throttle. Every
+# other reason omits both keys — a billing wall or auth failure has no
+# "resets at X" semantics, and stamping the fields there would mislead a
+# client into offering a wait/countdown action that never resolves.
+_RATE_LIMIT_RESET_REASONS = {"rate_limit", "upstream_rate_limit"}
 
 # Providers whose base_url is user-supplied rather than a known vendor —
 # transport failures against these are endpoint-config problems.
