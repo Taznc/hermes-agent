@@ -761,6 +761,14 @@ export function TaskDrawer({
     }
   })
 
+  // Priority-only PATCH — never touches status/title/body/assignee, so a
+  // failed toggle can't be mistaken for a bigger write going wrong.
+  const priorityMut = useMutation({
+    mutationFn: (priority: number) => patchTask(id!, { priority }),
+    onError: err => host.notify({ kind: 'error', message: errText(err) }),
+    onSuccess: invalidate
+  })
+
   const uploadMut = useMutation({
     mutationFn: async (file: File) =>
       uploadAttachment(id!, {
@@ -820,6 +828,18 @@ export function TaskDrawer({
                 </DropdownMenuTrigger>
                 <DropdownMenuContent align="end">
                   <DropdownMenuItem
+                    onSelect={() =>
+                      void priorityMut.mutate(typeof task.priority === 'number' && task.priority > 0 ? 0 : 1)
+                    }
+                  >
+                    <Codicon
+                      name={typeof task.priority === 'number' && task.priority > 0 ? 'star-full' : 'star-empty'}
+                      size="0.85rem"
+                    />
+                    {typeof task.priority === 'number' && task.priority > 0 ? k.removeHighPriority : k.markHighPriority}
+                  </DropdownMenuItem>
+                  <DropdownMenuSeparator />
+                  <DropdownMenuItem
                     onSelect={() => {
                       void navigator.clipboard.writeText(task.id)
                       host.notify({ kind: 'info', message: k.copiedId(task.id) })
@@ -860,7 +880,17 @@ export function TaskDrawer({
           </div>
         </div>
         {task && (
-          <h2 className="text-sm leading-snug font-semibold text-foreground" data-selectable-text="true">
+          <h2
+            className="flex items-center gap-1.5 text-sm leading-snug font-semibold text-foreground"
+            data-selectable-text="true"
+          >
+            {typeof task.priority === 'number' && task.priority > 0 && (
+              <Tip label={k.highPriorityTip}>
+                <span className="shrink-0 text-amber-500">
+                  <Codicon name="star-full" size="0.8rem" />
+                </span>
+              </Tip>
+            )}
             {task.title || task.id}
           </h2>
         )}
