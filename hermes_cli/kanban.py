@@ -644,6 +644,15 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
     p_schedule.add_argument("--ids", nargs="+", default=None,
                             help="Additional task ids to schedule with the same reason (bulk mode)")
 
+    p_hold = sub.add_parser(
+        "hold",
+        help="Shelve one or more tasks in On Hold (a deliberate human pause, not a block or a schedule)",
+    )
+    p_hold.add_argument("task_id")
+    p_hold.add_argument("reason", nargs="*", help="Reason/note (also appended as a comment)")
+    p_hold.add_argument("--ids", nargs="+", default=None,
+                        help="Additional task ids to hold with the same reason (bulk mode)")
+
     p_unblock = sub.add_parser(
         "unblock",
         help="Return blocked/scheduled tasks to ready, or todo while parents remain open",
@@ -654,6 +663,17 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
         help="Optional reason/note — recorded as a comment before unblocking. Quote multi-word reasons.",
     )
     p_unblock.add_argument("task_ids", nargs="+")
+
+    p_unhold = sub.add_parser(
+        "unhold",
+        help="Take one or more tasks off On Hold, returning them to ready (or todo while parents remain open)",
+    )
+    p_unhold.add_argument(
+        "--reason",
+        default=None,
+        help="Optional reason/note — recorded as a comment before unholding. Quote multi-word reasons.",
+    )
+    p_unhold.add_argument("task_ids", nargs="+")
 
     p_request_review = sub.add_parser(
         "request-review",
@@ -1129,7 +1149,9 @@ def kanban_command(args: argparse.Namespace) -> int:
             "edit":     _cmd_edit,
             "block":    _cmd_block,
             "schedule": _cmd_schedule,
+            "hold":     _cmd_hold,
             "unblock":  _cmd_unblock,
+            "unhold":   _cmd_unhold,
             "request-review": _cmd_request_review,
             "request-changes": _cmd_request_changes,
             "reopen-review":  _cmd_reopen_review,
@@ -1197,7 +1219,9 @@ _DELEGATED_CHILD_DENIED_ACTIONS: frozenset[str] = frozenset({
     "edit",
     "block",
     "schedule",
+    "hold",
     "unblock",
+    "unhold",
     "promote",
     "archive",
     "dispatch",
@@ -2393,6 +2417,28 @@ def _cmd_schedule(args: argparse.Namespace) -> int:
     return 0 if not failed else 1
 
 
+def _cmd_hold(args: argparse.Namespace) -> int:
+    reason = " ".join(args.reason).strip() if args.reason else None
+    author = _profile_author()
+    ids = [args.task_id] + list(getattr(args, "ids", None) or [])
+    failed: list[str] = []
+    with kb.connect_closing() as conn:
+        for tid in ids:
+            if reason:
+                kb.add_comment(conn, tid, author, f"ON HOLD: {reason}")
+            if not kb.hold_task(
+                conn,
+                tid,
+                reason=reason,
+                expected_run_id=_worker_run_id_for(tid),
+            ):
+                failed.append(tid)
+                print(f"cannot hold {tid}", file=sys.stderr)
+            else:
+                print(f"On hold {tid}" + (f": {reason}" if reason else ""))
+    return 0 if not failed else 1
+
+
 def _cmd_unblock(args: argparse.Namespace) -> int:
     ids = list(args.task_ids or [])
     if not ids:
@@ -2412,6 +2458,28 @@ def _cmd_unblock(args: argparse.Namespace) -> int:
                 print(f"cannot unblock {tid} (not blocked/scheduled?)", file=sys.stderr)
             else:
                 print(f"Unblocked {tid}" + (f": {reason}" if reason else ""))
+    return 0 if not failed else 1
+
+
+def _cmd_unhold(args: argparse.Namespace) -> int:
+    ids = list(args.task_ids or [])
+    if not ids:
+        print("at least one task_id is required", file=sys.stderr)
+        return 1
+    reason = getattr(args, "reason", None)
+    if reason is not None:
+        reason = reason.strip() or None
+    author = _profile_author() if reason else None
+    failed: list[str] = []
+    with kb.connect_closing() as conn:
+        for tid in ids:
+            if reason:
+                kb.add_comment(conn, tid, author, f"UNHOLD: {reason}")
+            if not kb.unhold_task(conn, tid):
+                failed.append(tid)
+                print(f"cannot unhold {tid} (not on hold?)", file=sys.stderr)
+            else:
+                print(f"Unheld {tid}" + (f": {reason}" if reason else ""))
     return 0 if not failed else 1
 
 
@@ -2924,7 +2992,7 @@ def _cmd_stats(args: argparse.Namespace) -> int:
         print(json.dumps(stats, indent=2, ensure_ascii=False))
         return 0
     print("By status:")
-    for k in ("triage", "todo", "scheduled", "ready", "running", "blocked", "done"):
+    for k in ("triage", "todo", "scheduled", "ready", "running", "blocked", "on_hold", "done"):
         print(f"  {k:8s}  {stats['by_status'].get(k, 0)}")
     if stats["by_assignee"]:
         print("\nBy assignee:")

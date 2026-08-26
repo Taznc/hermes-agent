@@ -99,7 +99,10 @@ _log = logging.getLogger(__name__)
 # Constants
 # ---------------------------------------------------------------------------
 
-VALID_STATUSES = {"triage", "todo", "scheduled", "ready", "running", "blocked", "review", "done", "archived"}
+VALID_STATUSES = {
+    "triage", "todo", "scheduled", "ready", "running", "blocked", "on_hold",
+    "review", "done", "archived",
+}
 VALID_INITIAL_STATUSES = {"running", "blocked"}
 
 # Typed block reasons. Distinguishes the two fundamentally different things a
@@ -4491,7 +4494,7 @@ def _resume_status_from_events(conn: sqlite3.Connection, task_id: str) -> str:
         "WHERE task_id = ? AND kind IN ("
         "'blocked', 'block_loop_detected', 'dependency_wait', 'gave_up', "
         "'unblocked', 'changes_requested', 'review_reopened', 'status', 'reclaimed', "
-        "'stale', 'timed_out', 'crashed', 'spawn_failed', 'rate_limited'"
+        "'stale', 'timed_out', 'crashed', 'spawn_failed', 'rate_limited', 'held'"
         ") ORDER BY id DESC LIMIT 1",
         (task_id,),
     ).fetchone()
@@ -7954,6 +7957,102 @@ def schedule_task(
                 summary=reason,
             )
         _append_event(conn, task_id, "scheduled", {"reason": reason}, run_id=run_id)
+        return True
+
+
+def hold_task(
+    conn: sqlite3.Connection,
+    task_id: str,
+    *,
+    reason: Optional[str] = None,
+    expected_run_id: Optional[int] = None,
+) -> bool:
+    """Shelve a task in ``on_hold`` — a deliberate human pause, distinct from
+    ``blocked`` (worker needs input) and ``scheduled`` (waiting on time).
+
+    ``on_hold`` tasks are intentionally not dispatchable and are not
+    considered by ``recompute_ready``'s auto-recovery pass: unlike a
+    dependency ``blocked`` task, a shelved task never resumes on its own — an
+    explicit :func:`unhold_task` (or the dashboard's drag-out-of-the-column
+    action) is required. This mirrors ``schedule_task``'s shape (closes any
+    active run, clears the claim) but is a purely human-initiated pause with
+    no time or dependency semantics attached.
+    """
+    with write_txn(conn):
+        params: list[Any] = [task_id]
+        sql = """
+            UPDATE tasks
+               SET status       = 'on_hold',
+                   claim_lock   = NULL,
+                   claim_expires= NULL,
+                   worker_pid   = NULL
+             WHERE id = ?
+               AND status IN ('todo', 'triage', 'ready', 'running', 'blocked', 'scheduled')
+        """
+        if expected_run_id is not None:
+            sql += " AND current_run_id = ?"
+            params.append(int(expected_run_id))
+        cur = conn.execute(sql, params)
+        if cur.rowcount != 1:
+            return False
+        run_id = _end_run(
+            conn, task_id,
+            outcome="on_hold", status="on_hold",
+            summary=reason,
+        )
+        if run_id is None and reason:
+            run_id = _synthesize_ended_run(
+                conn, task_id,
+                outcome="on_hold",
+                summary=reason,
+            )
+        _append_event(conn, task_id, "held", {"reason": reason}, run_id=run_id)
+        return True
+
+
+def unhold_task(conn: sqlite3.Connection, task_id: str) -> bool:
+    """Resume an ``on_hold`` task to its safe resumable phase.
+
+    Mirrors :func:`unblock_task`: re-gates on parent completion (``todo`` if
+    any parent isn't done yet, else ``ready``/``review``), defensively closes
+    any stale ``current_run_id`` left dangling, and never auto-fires — a
+    shelved task ONLY leaves ``on_hold`` via this explicit call.
+    """
+    now = int(time.time())
+    with write_txn(conn):
+        current = conn.execute(
+            "SELECT status FROM tasks WHERE id = ?",
+            (task_id,),
+        ).fetchone()
+        if not current or current["status"] != "on_hold":
+            return False
+        resume_status = _resume_status_from_events(conn, task_id)
+        _reclaim_dangling_run(
+            conn, task_id, statuses=("on_hold",), now=now,
+            note="invariant recovery on unhold",
+        )
+        landing_status = _landing_status_after_parents(conn, task_id)
+        new_status = (
+            "review"
+            if landing_status == "ready" and resume_status == "review"
+            else landing_status
+        )
+        cur = conn.execute(
+            "UPDATE tasks SET status = ?, current_run_id = NULL, "
+            "consecutive_failures = 0, last_failure_error = NULL "
+            "WHERE id = ? AND status = 'on_hold'",
+            (new_status, task_id),
+        )
+        if cur.rowcount != 1:
+            return False
+        _append_event(
+            conn, task_id, "unheld",
+            (
+                {"status": new_status, "resume_status": resume_status}
+                if new_status != "ready" or resume_status != "ready"
+                else None
+            ),
+        )
         return True
 
 

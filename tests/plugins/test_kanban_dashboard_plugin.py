@@ -73,7 +73,7 @@ def test_board_empty(client):
     # All canonical columns present (triage + the rest), each empty.
     names = [c["name"] for c in data["columns"]]
     assert set(names) == kb.VALID_STATUSES - {"archived"}
-    for expected in ("triage", "todo", "scheduled", "ready", "running", "blocked", "done"):
+    for expected in ("triage", "todo", "scheduled", "ready", "running", "blocked", "on_hold", "done"):
         assert expected in names, f"missing column {expected}: {names}"
     assert all(len(c["tasks"]) == 0 for c in data["columns"])
     assert data["tenants"] == []
@@ -161,6 +161,75 @@ def test_scheduled_tasks_have_their_own_column_not_todo(client):
     columns = {c["name"]: c["tasks"] for c in r.json()["columns"]}
     assert any(t["id"] == task["id"] for t in columns["scheduled"])
     assert not any(t["id"] == task["id"] for t in columns["todo"])
+
+
+def test_on_hold_column_present_and_task_shelvable_via_patch(client):
+    """The dashboard board must expose an on_hold column, and PATCHing a
+    task's status to 'on_hold' must shelve it there (not into 'blocked' or
+    'todo'), then PATCHing to 'ready' must resume it."""
+    task = client.post(
+        "/api/plugins/kanban/tasks",
+        json={"title": "shelve this", "assignee": "ops"},
+    ).json()["task"]
+
+    r = client.get("/api/plugins/kanban/board")
+    names = [c["name"] for c in r.json()["columns"]]
+    assert "on_hold" in names
+
+    r = client.patch(
+        f"/api/plugins/kanban/tasks/{task['id']}",
+        json={"status": "on_hold", "block_reason": "waiting on stakeholder"},
+    )
+    assert r.status_code == 200, r.text
+
+    r = client.get("/api/plugins/kanban/board")
+    columns = {c["name"]: c["tasks"] for c in r.json()["columns"]}
+    assert any(t["id"] == task["id"] for t in columns["on_hold"])
+    assert not any(t["id"] == task["id"] for t in columns["todo"])
+    assert not any(t["id"] == task["id"] for t in columns["blocked"])
+
+    # Resume: PATCH status back to 'ready' must route through unhold_task,
+    # not get rejected as an invalid transition.
+    r = client.patch(
+        f"/api/plugins/kanban/tasks/{task['id']}",
+        json={"status": "ready"},
+    )
+    assert r.status_code == 200, r.text
+    r = client.get("/api/plugins/kanban/board")
+    columns = {c["name"]: c["tasks"] for c in r.json()["columns"]}
+    assert any(t["id"] == task["id"] for t in columns["ready"])
+    assert not any(t["id"] == task["id"] for t in columns["on_hold"])
+
+
+def test_bulk_hold_and_resume(client):
+    """Bulk status update must support on_hold and resuming via ready,
+    same as the single-task PATCH endpoint."""
+    a = client.post("/api/plugins/kanban/tasks", json={"title": "A"}).json()["task"]
+    b = client.post("/api/plugins/kanban/tasks", json={"title": "B"}).json()["task"]
+
+    r = client.post(
+        "/api/plugins/kanban/tasks/bulk",
+        json={"ids": [a["id"], b["id"]], "status": "on_hold"},
+    )
+    assert r.status_code == 200, r.text
+    assert all(entry["ok"] for entry in r.json()["results"])
+
+    r = client.get("/api/plugins/kanban/board")
+    columns = {c["name"]: c["tasks"] for c in r.json()["columns"]}
+    ids_on_hold = {t["id"] for t in columns["on_hold"]}
+    assert {a["id"], b["id"]} <= ids_on_hold
+
+    r = client.post(
+        "/api/plugins/kanban/tasks/bulk",
+        json={"ids": [a["id"], b["id"]], "status": "ready"},
+    )
+    assert r.status_code == 200, r.text
+    assert all(entry["ok"] for entry in r.json()["results"])
+
+    r = client.get("/api/plugins/kanban/board")
+    columns = {c["name"]: c["tasks"] for c in r.json()["columns"]}
+    ids_ready = {t["id"] for t in columns["ready"]}
+    assert {a["id"], b["id"]} <= ids_ready
 
 
 def test_tenant_filter(client):

@@ -200,6 +200,99 @@ def test_schedule_task_parks_time_delay_without_dispatching(kanban_home):
         assert any(e.kind == "scheduled" and e.payload == {"reason": "run next week"} for e in events)
 
 
+# ---------------------------------------------------------------------------
+# On-hold status + priority field
+# ---------------------------------------------------------------------------
+
+
+def test_create_task_defaults_to_normal_priority_and_not_on_hold(kanban_home):
+    """New tasks must default to non-held, normal (0) priority — existing
+    board data (and every other create_task caller) must not have to
+    special-case the new fields."""
+    with kb.connect() as conn:
+        t = kb.create_task(conn, title="freshly created", assignee="ops")
+        task = kb.get_task(conn, t)
+        assert task.priority == 0
+        assert task.status != "on_hold"
+
+
+def test_hold_task_shelves_and_is_not_dispatchable(kanban_home):
+    with kb.connect() as conn:
+        t = kb.create_task(conn, title="shelve me", assignee="ops")
+        assert kb.hold_task(conn, t, reason="waiting on budget approval") is True
+        task = kb.get_task(conn, t)
+        assert task.status == "on_hold"
+        assert task.claim_lock is None
+        # A held task must never be claimable by the dispatcher.
+        assert kb.claim_task(conn, t) is None
+
+        events = kb.list_events(conn, t)
+        assert any(
+            e.kind == "held" and e.payload == {"reason": "waiting on budget approval"}
+            for e in events
+        )
+
+
+def test_hold_task_closes_active_run(kanban_home):
+    """Holding a running task must close its active run so attempt history
+    isn't orphaned, mirroring schedule_task's run-closing behaviour."""
+    with kb.connect() as conn:
+        t = kb.create_task(conn, title="running then held", assignee="worker")
+        kb.claim_task(conn, t)
+        run_id = kb.get_task(conn, t).current_run_id
+        assert run_id is not None
+
+        assert kb.hold_task(conn, t, reason="pause") is True
+        task = kb.get_task(conn, t)
+        assert task.status == "on_hold"
+        assert task.current_run_id is None
+        run = kb.get_run(conn, run_id)
+        assert run.outcome == "on_hold"
+        assert run.ended_at is not None
+
+
+def test_unhold_task_returns_to_ready_when_parents_done(kanban_home):
+    with kb.connect() as conn:
+        t = kb.create_task(conn, title="shelved and resumed", assignee="ops")
+        assert kb.hold_task(conn, t) is True
+        assert kb.get_task(conn, t).status == "on_hold"
+
+        assert kb.unhold_task(conn, t) is True
+        task = kb.get_task(conn, t)
+        assert task.status == "ready"
+        assert task.current_run_id is None
+
+
+def test_unhold_task_waits_on_incomplete_parents(kanban_home):
+    """A shelved child with an unfinished parent must resume into 'todo',
+    not 'ready' — never bypass the parent-completion gate."""
+    with kb.connect() as conn:
+        parent = kb.create_task(conn, title="parent still working", assignee="ops")
+        child = kb.create_task(
+            conn, title="child shelved", assignee="ops", parents=[parent],
+        )
+        assert kb.hold_task(conn, child) is True
+        assert kb.unhold_task(conn, child) is True
+        assert kb.get_task(conn, child).status == "todo"
+
+
+def test_unhold_task_only_valid_from_on_hold(kanban_home):
+    with kb.connect() as conn:
+        t = kb.create_task(conn, title="not held", assignee="ops")
+        assert kb.get_task(conn, t).status == "ready"
+        assert kb.unhold_task(conn, t) is False
+
+
+def test_on_hold_is_a_recognized_status(kanban_home):
+    assert "on_hold" in kb.VALID_STATUSES
+    with kb.connect() as conn:
+        # list_tasks(status=...) must accept it like any other column.
+        t = kb.create_task(conn, title="filterable", assignee="ops")
+        kb.hold_task(conn, t)
+        held = kb.list_tasks(conn, status="on_hold")
+        assert [task.id for task in held] == [t]
+
+
 
 
 
