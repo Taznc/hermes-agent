@@ -327,6 +327,7 @@ import {
   resolveCommitLogSelection,
   shouldCountCommits
 } from './update-count'
+import { updateChecksDisabled } from './update-checks-gate'
 import { waitForUpdateClearance } from './update-gate'
 import { readLiveUpdateMarker, updateHandoffConflict, writeUpdateMarker } from './update-marker'
 import { isOfficialSshRemote, OFFICIAL_REPO_HTTPS_URL } from './update-remote'
@@ -405,11 +406,11 @@ const IS_WSL = isWslEnvironment()
 // origin, plus the GitHub compare API). Bridged from `desktop.
 // auto_update_checks_enabled` in config.yaml by the `hermes desktop`
 // launcher (hermes_cli/main.py cmd_gui); an env var set directly (e.g. by a
-// dev running `electron .` outside the launcher) works the same way. Default
-// is checks ON — this only ever narrows behavior, never widens it.
-const UPDATE_CHECKS_DISABLED = ['1', 'true', 'yes', 'on'].includes(
-  String(process.env.HERMES_DESKTOP_DISABLE_UPDATE_CHECKS || '').trim().toLowerCase()
-)
+// dev running `electron .` outside the launcher) works the same way. Also
+// short-circuits unconditionally on HERMES_DEV=1 — see update-checks-gate.ts
+// for the full rationale. Default is checks ON — this only ever narrows
+// behavior, never widens it.
+const UPDATE_CHECKS_DISABLED = updateChecksDisabled()
 // Truthful macOS kernel major (Tahoe = 25). Product version lies (16 vs 26) per
 // build SDK, so gate Tahoe workarounds on Darwin instead.
 const DARWIN_MAJOR = IS_MAC ? Number.parseInt(os.release(), 10) || 0 : 0
