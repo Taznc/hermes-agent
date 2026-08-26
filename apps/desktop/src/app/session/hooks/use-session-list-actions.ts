@@ -13,9 +13,12 @@ import {
   $pinnedSessionIds,
   $sessionsLimit,
   $sidebarFiltersActive,
+  $sidebarListLimit,
   bumpSessionsLimit,
   raiseSessionsLimit,
+  resetSessionsLimit,
   SIDEBAR_FILTERED_PAGE_SIZE,
+  SIDEBAR_SESSIONS_MAX_AUTOLOAD,
   SIDEBAR_SESSIONS_PAGE_SIZE
 } from '@/store/layout'
 import { messagingTotalsKey, normalizeProfileKey, sidebarProfileForScope } from '@/store/profile'
@@ -245,35 +248,44 @@ export function useSessionListActions({ profileScope }: UseSessionListActionsArg
     }
 
     try {
-      const limit = $sessionsLimit.get()
+      // Fetch + commit one page at the current $sessionsLimit. Returns whether
+      // the backend reports more rows for this scope past what was just
+      // loaded (null when the response was discarded as stale — a newer
+      // refresh superseded it, the profile scope moved on, or the gateway
+      // re-activated mid-flight).
+      const commitPage = async (): Promise<boolean | null> => {
+        const limit = $sessionsLimit.get()
 
-      // Require at least one message so abandoned/empty "Untitled" drafts (one
-      // was created per TUI/desktop launch before the lazy-create fix) don't
-      // clutter the sidebar.
-      // Unified cross-profile list (served read-only off each profile's
-      // state.db; no per-profile backend is spawned). Single-profile users get
-      // the same rows tagged profile="default".
-      // Scope every sidebar slice to the active profile (not always 'all') so a profile
-      // with few recent sessions isn't windowed out of the cross-profile
-      // recency page and never inherits another profile's cron or messaging
-      // sections. ALL_PROFILES remains the explicit unified view.
-      // Batched: one request opens each profile DB once and returns all three
-      // source-scoped slices, instead of three separate listAllProfileSessions
-      // calls that each reopened + re-counted every profile DB per refresh.
-      const result = await listSidebarSessions({
-        recentsProfile: sessionProfile,
-        recentsLimit: limit,
-        recentsExclude: SIDEBAR_EXCLUDED_SOURCES,
-        cronLimit: CRON_SECTION_LIMIT,
-        messagingLimit: MESSAGING_SECTION_LIMIT,
-        messagingExclude: MESSAGING_EXCLUDED_SOURCES
-      })
+        // Require at least one message so abandoned/empty "Untitled" drafts (one
+        // was created per TUI/desktop launch before the lazy-create fix) don't
+        // clutter the sidebar.
+        // Unified cross-profile list (served read-only off each profile's
+        // state.db; no per-profile backend is spawned). Single-profile users get
+        // the same rows tagged profile="default".
+        // Scope every sidebar slice to the active profile (not always 'all') so a profile
+        // with few recent sessions isn't windowed out of the cross-profile
+        // recency page and never inherits another profile's cron or messaging
+        // sections. ALL_PROFILES remains the explicit unified view.
+        // Batched: one request opens each profile DB once and returns all three
+        // source-scoped slices, instead of three separate listAllProfileSessions
+        // calls that each reopened + re-counted every profile DB per refresh.
+        const result = await listSidebarSessions({
+          recentsProfile: sessionProfile,
+          recentsLimit: limit,
+          recentsExclude: SIDEBAR_EXCLUDED_SOURCES,
+          cronLimit: CRON_SECTION_LIMIT,
+          messagingLimit: MESSAGING_SECTION_LIMIT,
+          messagingExclude: MESSAGING_EXCLUDED_SOURCES
+        })
 
-      if (
-        refreshSessionsRequestRef.current === requestId &&
-        sidebarProfileForScope(profileScopeRef.current) === sessionProfile &&
-        gatewayActivationEpoch() === activationEpoch
-      ) {
+        if (
+          refreshSessionsRequestRef.current !== requestId ||
+          sidebarProfileForScope(profileScopeRef.current) !== sessionProfile ||
+          gatewayActivationEpoch() !== activationEpoch
+        ) {
+          return null
+        }
+
         const recents = result.recents
 
         // Drop rows the user just deleted/archived: a refresh can race an
@@ -291,18 +303,21 @@ export function useSessionListActions({ profileScope }: UseSessionListActionsArg
 
           return sameCronSignature(prev, next) ? prev : next
         })
+
+        const truncatedMap = recents.profiles_truncated ?? {}
+
         // "Is there another page?" instead of an exact total: the backend
         // reports which profiles filled their window, which costs nothing on
         // top of the rows it already read (the old exact totals ran a COUNT(*)
         // per profile DB on every refresh). Reference-stable when unchanged so
         // the sidebar's group memos don't recompute per refresh.
         setSessionProfilesTruncated(prev => {
-          const next = recents.profiles_truncated ?? {}
           const prevKeys = Object.keys(prev)
 
-          return prevKeys.length === Object.keys(next).length && prevKeys.every(key => prev[key] === next[key])
+          return prevKeys.length === Object.keys(truncatedMap).length &&
+            prevKeys.every(key => prev[key] === truncatedMap[key])
             ? prev
-            : next
+            : truncatedMap
         })
         // Same identity gate: these totals only move when a session bills, and
         // a fresh object every refresh would repaint every profile header.
@@ -330,6 +345,33 @@ export function useSessionListActions({ profileScope }: UseSessionListActionsArg
         setMessagingSessions(prev => (sameCronSignature(prev, messagingRows) ? prev : messagingRows))
         // Hit the cap → at least one platform may have more on disk than loaded.
         setMessagingTruncated(result.messaging.sessions.length >= MESSAGING_SECTION_LIMIT)
+
+        // "Is there more of THIS scope's window left to page through?" — the
+        // signal the 'all' auto-page loop below reads to decide whether to
+        // keep going.
+        return sessionProfile === 'all' ? Object.values(truncatedMap).some(Boolean) : Boolean(truncatedMap[sessionProfile])
+      }
+
+      let hasMore = await commitPage()
+
+      // Cap 5 (SIDEBAR_SESSIONS_PAGE_SIZE / $sessionsLimit) auto-pages while the
+      // list-length setting is 'all': keep raising the backend fetch window and
+      // refetching as long as the backend reports more rows for this scope,
+      // bounded by SIDEBAR_SESSIONS_MAX_AUTOLOAD so a pathological amount of
+      // history cannot spin the gateway forever. A numeric list-length setting
+      // never enters this loop — "Load more" (bumpSessionsLimit/loadMoreSessions)
+      // owns paging in that mode. Skipped while a filter is active: the
+      // unfilteredLimit effect below already deepens $sessionsLimit to
+      // SIDEBAR_FILTERED_PAGE_SIZE for a filtered view, and letting both loops
+      // drive the same atom would thrash it back and forth.
+      while (
+        hasMore === true &&
+        $sidebarListLimit.get() === 'all' &&
+        !$sidebarFiltersActive.get() &&
+        $sessionsLimit.get() < SIDEBAR_SESSIONS_MAX_AUTOLOAD
+      ) {
+        bumpSessionsLimit(Math.min(SIDEBAR_SESSIONS_PAGE_SIZE, SIDEBAR_SESSIONS_MAX_AUTOLOAD - $sessionsLimit.get()))
+        hasMore = await commitPage()
       }
     } finally {
       // The request id is enough here: a newer refresh owns its own loading
@@ -377,6 +419,30 @@ export function useSessionListActions({ profileScope }: UseSessionListActionsArg
             void refreshSessions()
           }
         }
+      }),
+    [refreshSessions]
+  )
+
+  // Switching the list-length setting (the filter menu's "List length"
+  // submenu) resets the flat recents page to that setting's own floor and
+  // refetches. Picking a number restores capped/paged behavior immediately
+  // (rather than waiting for the next natural refresh to notice); picking
+  // 'all' restarts refreshSessions's own bounded auto-page loop from the
+  // default page size instead of wherever a numeric pick had left it, so
+  // switching back to 'all' after browsing at "25" re-widens the window
+  // instead of freezing it at 25. Skipped while a filter is active: the
+  // effect above already owns $sessionsLimit until it clears. `listen` (not
+  // `subscribe`): the initial mount's own refresh already fetches at the
+  // current setting, so this must only react to a later CHANGE.
+  useEffect(
+    () =>
+      $sidebarListLimit.listen(() => {
+        if ($sidebarFiltersActive.get()) {
+          return
+        }
+
+        resetSessionsLimit()
+        void refreshSessions()
       }),
     [refreshSessions]
   )

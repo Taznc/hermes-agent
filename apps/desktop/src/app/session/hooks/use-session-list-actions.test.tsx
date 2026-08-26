@@ -1,9 +1,16 @@
-import { act, render, renderHook } from '@testing-library/react'
+import { act, cleanup, render, renderHook } from '@testing-library/react'
 import { Suspense } from 'react'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
 import type { SessionInfo, SidebarSessionsResponse } from '@/hermes'
 import { $cronJobs, setCronJobs } from '@/store/cron'
+import {
+  $sessionsLimit,
+  $sidebarListLimit,
+  resetSessionsLimit,
+  SIDEBAR_SESSIONS_MAX_AUTOLOAD,
+  SIDEBAR_SESSIONS_PAGE_SIZE
+} from '@/store/layout'
 import {
   $cronSessions,
   $messagingPlatformTotals,
@@ -105,9 +112,12 @@ beforeEach(() => {
   setMessagingPlatformTotals({})
   setMessagingTruncated(false)
   setSessionsLoading(false)
+  $sidebarListLimit.set('all')
+  resetSessionsLimit()
 })
 
 afterEach(() => {
+  cleanup()
   setCronJobs([])
   setSessions([])
   setCronSessions([])
@@ -115,6 +125,8 @@ afterEach(() => {
   setMessagingPlatformTotals({})
   setMessagingTruncated(false)
   setSessionsLoading(false)
+  $sidebarListLimit.set('all')
+  resetSessionsLimit()
 })
 
 describe('refreshSessions identity + loading hygiene', () => {
@@ -705,5 +717,108 @@ describe('messaging profile scope', () => {
 
     expect(listAllProfileSessions).not.toHaveBeenCalled()
     expect($messagingPlatformTotals.get()).toEqual({ 'work:signal': 12 })
+  })
+})
+
+describe('the flat recents auto-page loop under $sidebarListLimit "all"', () => {
+  it('keeps raising $sessionsLimit and refetching while the backend reports more, then stops on a short page', async () => {
+    // Three pages: first two report more (profiles_truncated true), the third
+    // (a short page) reports exhausted — the loop must stop right there.
+    listSidebarSessions
+      .mockResolvedValueOnce(sidebar({ profiles_truncated: { default: true }, sessions: [row('a')] }))
+      .mockResolvedValueOnce(sidebar({ profiles_truncated: { default: true }, sessions: [row('a'), row('b')] }))
+      .mockResolvedValueOnce(sidebar({ profiles_truncated: { default: false }, sessions: [row('a'), row('b'), row('c')] }))
+
+    const { result } = renderHook(() => useSessionListActions({ profileScope: 'default' }))
+
+    await act(async () => {
+      await result.current.refreshSessions()
+    })
+
+    expect(listSidebarSessions).toHaveBeenCalledTimes(3)
+    expect($sessionsLimit.get()).toBe(SIDEBAR_SESSIONS_PAGE_SIZE * 3)
+    expect($sessions.get().map(s => s.id)).toEqual(['a', 'b', 'c'])
+  })
+
+  it('respects SIDEBAR_SESSIONS_MAX_AUTOLOAD as a hard ceiling even when the backend never reports exhaustion', async () => {
+    // Every page claims more remain — without the ceiling this spins forever.
+    listSidebarSessions.mockResolvedValue(sidebar({ profiles_truncated: { default: true }, sessions: [row('a')] }))
+
+    const { result } = renderHook(() => useSessionListActions({ profileScope: 'default' }))
+
+    await act(async () => {
+      await result.current.refreshSessions()
+    })
+
+    expect($sessionsLimit.get()).toBeLessThanOrEqual(SIDEBAR_SESSIONS_MAX_AUTOLOAD)
+    expect($sessionsLimit.get()).toBe(SIDEBAR_SESSIONS_MAX_AUTOLOAD)
+  })
+
+  it('does not auto-page at all under a numeric list-length', async () => {
+    $sidebarListLimit.set(25)
+    resetSessionsLimit()
+    listSidebarSessions.mockResolvedValue(sidebar({ profiles_truncated: { default: true }, sessions: [row('a')] }))
+
+    const { result } = renderHook(() => useSessionListActions({ profileScope: 'default' }))
+
+    await act(async () => {
+      await result.current.refreshSessions()
+    })
+
+    // One fetch, no widening: a numeric pick's own "Load more" button owns
+    // paging, not the 'all' auto-page loop.
+    expect(listSidebarSessions).toHaveBeenCalledTimes(1)
+    expect($sessionsLimit.get()).toBe(25)
+  })
+
+  it('switching the list-length setting mid-session resets $sessionsLimit and refetches at the new floor', async () => {
+    listSidebarSessions.mockResolvedValue(sidebar({ profiles_truncated: { default: false }, sessions: [row('a')] }))
+    const { result } = renderHook(() => useSessionListActions({ profileScope: 'default' }))
+
+    await act(async () => {
+      await result.current.refreshSessions()
+    })
+
+    listSidebarSessions.mockClear()
+
+    // The listener fires a fire-and-forget refreshSessions() call — flush it
+    // fully (a macrotask tick past the resolved mock) before asserting, so no
+    // pending promise chain leaks into the next test.
+    await act(async () => {
+      $sidebarListLimit.set(10)
+      await new Promise(resolve => setTimeout(resolve, 0))
+    })
+
+    expect(listSidebarSessions).toHaveBeenCalled()
+    expect($sessionsLimit.get()).toBe(10)
+  })
+
+  it('a switch/reset cancels an in-flight auto-page loop against the old backend', async () => {
+    const first = deferred<SidebarSessionsResponse>()
+
+    listSidebarSessions.mockReturnValueOnce(first.promise)
+
+    const { result } = renderHook(() => useSessionListActions({ profileScope: 'default' }))
+
+    let refresh!: Promise<void>
+
+    act(() => {
+      refresh = result.current.refreshSessions()
+    })
+
+    // Simulate a gateway reconnect / profile switch mid-flight: the seam this
+    // reuses is the same resetSessionsLimit() the gateway-switch wipe calls.
+    gatewayScope.epoch += 1
+    resetSessionsLimit()
+
+    await act(async () => {
+      first.resolve(sidebar({ profiles_truncated: { default: true }, sessions: [row('a')] }))
+      await refresh
+    })
+
+    // The stale response must not resume raising the limit for a backend that
+    // is no longer active — only the one fetch from the original call happened.
+    expect(listSidebarSessions).toHaveBeenCalledTimes(1)
+    expect($sessionsLimit.get()).toBe(SIDEBAR_SESSIONS_PAGE_SIZE)
   })
 })

@@ -27,6 +27,12 @@ export const SIDEBAR_SESSIONS_PAGE_SIZE = 50
 // the loaded page answers the wrong question — "6 merged PRs" really meant "6
 // among the last 50 rows" — so narrowing the view widens the window it reads.
 export const SIDEBAR_FILTERED_PAGE_SIZE = 300
+// Hard ceiling on the 'all' list-length auto-page loop (cap 5): the sidebar
+// keeps raising $sessionsLimit and refetching while the backend reports more
+// rows, but never past this many, so a pathological amount of history cannot
+// spin the gateway forever. Numeric list-length picks never approach it — it
+// only bites while the setting is 'all'.
+export const SIDEBAR_SESSIONS_MAX_AUTOLOAD = 5000
 
 const SIDEBAR_PINNED_STORAGE_KEY = 'hermes.desktop.pinnedSessions'
 const SIDEBAR_AGENTS_GROUPED_STORAGE_KEY = 'hermes.desktop.agentsGroupedByWorkspace'
@@ -42,6 +48,7 @@ const SIDEBAR_ROW_META_STORAGE_KEY = 'hermes.desktop.sidebarRowMeta'
 const SIDEBAR_CARD_ROWS_STORAGE_KEY = 'hermes.desktop.sidebarCardRows'
 const SIDEBAR_STATUS_FILTER_STORAGE_KEY = 'hermes.desktop.sidebarStatusFilter'
 const SIDEBAR_SHOW_ARCHIVED_STORAGE_KEY = 'hermes.desktop.sidebarShowArchived'
+const SIDEBAR_LIST_LIMIT_STORAGE_KEY = 'hermes.desktop.sidebarListLimit'
 const SIDEBAR_PROJECT_FILTER_STORAGE_KEY = 'hermes.desktop.sidebarProjectFilter'
 const SIDEBAR_PROFILE_FILTER_STORAGE_KEY = 'hermes.desktop.sidebarProfileFilter'
 const SIDEBAR_PR_FILTER_STORAGE_KEY = 'hermes.desktop.sidebarPrFilter'
@@ -246,6 +253,16 @@ export type SidebarSortKey = Exclude<SidebarOrdering, 'manual'>
 /** Optional per-row metadata the user can switch on. `preview` is card-only:
  *  the one-line row has nowhere to put a second line. */
 export type SidebarRowMeta = 'cost' | 'pr' | 'preview' | 'profile' | 'tokens' | 'updated'
+/** How many rows the sidebar renders per list before hiding the rest behind a
+ *  "load more" affordance. `'all'` (the shipped default) lifts every cap:
+ *  every loaded row renders and the affordance never appears. A number
+ *  replaces the initial visible count everywhere (messaging groups, cron
+ *  jobs, workspace lanes, project previews) AND the backend fetch page for
+ *  the flat recents list — see SIDEBAR_SESSIONS_MAX_AUTOLOAD for the safety
+ *  ceiling on `'all'`'s auto-paging. */
+export type SidebarListLimit = 'all' | number
+/** Picks the `List length` submenu offers, in display order. */
+export const SIDEBAR_LIST_LIMIT_OPTIONS: readonly SidebarListLimit[] = ['all', 10, 25, 50, 100]
 
 function oneOf<T extends string>(values: readonly T[], fallback: T): Codec<T> {
   return {
@@ -259,6 +276,22 @@ function listOf<T extends string>(values: readonly T[]): Codec<T[]> {
     decode: raw => Codecs.stringArray.decode(raw).filter((item): item is T => values.includes(item as T)),
     encode: value => Codecs.stringArray.encode(value)
   }
+}
+
+// 'all' | number, where a stored number must be one of the offered picks —
+// an unrecognized or corrupt value falls back to 'all' rather than silently
+// adopting an arbitrary cap.
+const sidebarListLimitCodec: Codec<SidebarListLimit> = {
+  decode: raw => {
+    if (raw === 'all') {
+      return 'all'
+    }
+
+    const parsed = Number(raw)
+
+    return SIDEBAR_LIST_LIMIT_OPTIONS.includes(parsed) ? parsed : 'all'
+  },
+  encode: value => String(value)
 }
 
 const ROW_META: readonly SidebarRowMeta[] = ['cost', 'pr', 'preview', 'profile', 'tokens', 'updated']
@@ -292,6 +325,7 @@ const $sidebarAllProfilesGrouping = persistentAtom<SidebarGrouping>(
 const SIDEBAR_DEFAULT_GROUPING: SidebarGrouping = 'date'
 const SIDEBAR_DEFAULT_ORDERING: SidebarOrdering = 'updated'
 const SIDEBAR_DEFAULT_ROW_META: SidebarRowMeta[] = ['preview', 'updated']
+const SIDEBAR_DEFAULT_LIST_LIMIT: SidebarListLimit = 'all'
 
 const $sidebarSortKey = persistentAtom<SidebarSortKey>(
   SIDEBAR_SORT_KEY_STORAGE_KEY,
@@ -304,6 +338,19 @@ export const $sidebarRowMeta = persistentAtom<SidebarRowMeta[]>(
   SIDEBAR_DEFAULT_ROW_META,
   listOf(ROW_META)
 )
+
+// The one setting governing all five sidebar truncation caps (see the module
+// doc for `SidebarListLimit`). Default ships as 'all': every unarchived row
+// renders with no "load more" affordance anywhere in the sidebar.
+export const $sidebarListLimit = persistentAtom<SidebarListLimit>(
+  SIDEBAR_LIST_LIMIT_STORAGE_KEY,
+  SIDEBAR_DEFAULT_LIST_LIMIT,
+  sidebarListLimitCodec
+)
+
+export function setSidebarListLimit(limit: SidebarListLimit) {
+  $sidebarListLimit.set(limit)
+}
 
 /** Inbox style: render the flat list's session rows as three-line cards
  *  (project · age / title / model · size) instead of the one-line row. A
@@ -378,20 +425,30 @@ export const $sidebarFiltersActive: ReadableAtom<boolean> = computed(
  *  offering. Broader than `$sidebarFiltersActive`, which only knows about what
  *  hides rows, not about how they're grouped, sorted or labelled. */
 export const $sidebarViewCustomized: ReadableAtom<boolean> = computed(
-  [$sidebarGrouping, $sidebarOrdering, $sidebarRowMeta, $sidebarCardRows, $sidebarFiltersActive],
-  (grouping, ordering, rowMeta, cardRows, filtersActive) =>
+  [$sidebarGrouping, $sidebarOrdering, $sidebarRowMeta, $sidebarCardRows, $sidebarFiltersActive, $sidebarListLimit],
+  (grouping, ordering, rowMeta, cardRows, filtersActive, listLimit) =>
     grouping !== SIDEBAR_DEFAULT_GROUPING ||
     ordering !== SIDEBAR_DEFAULT_ORDERING ||
     !sameRowMeta(rowMeta, SIDEBAR_DEFAULT_ROW_META) ||
     cardRows ||
-    filtersActive
+    filtersActive ||
+    listLimit !== SIDEBAR_DEFAULT_LIST_LIMIT
 )
 
 // When true, the sessions sidebar moves to the right and the file browser +
 // preview rail move to the left — a mirror of the default layout.
 export const $panesFlipped = persistentAtom(PANES_FLIPPED_STORAGE_KEY, false, Codecs.bool)
 export const $isSidebarResizing = atom(false)
-export const $sessionsLimit = atom(SIDEBAR_SESSIONS_PAGE_SIZE)
+
+/** Effective initial/step size for the flat recents fetch, given the current
+ *  list-length setting: the number the user picked, or the default page size
+ *  while 'all' drives its own bounded auto-page loop (see
+ *  `nextAutoLoadSessionsLimit` and `SIDEBAR_SESSIONS_MAX_AUTOLOAD`). */
+export function sidebarSessionsPageSize(limit: SidebarListLimit = $sidebarListLimit.get()): number {
+  return limit === 'all' ? SIDEBAR_SESSIONS_PAGE_SIZE : limit
+}
+
+export const $sessionsLimit = atom(sidebarSessionsPageSize())
 
 // Resolve a node's open state against its default (absent = follow default).
 export function workspaceNodeOpen(id: string, defaultOpen = true): boolean {
@@ -673,6 +730,7 @@ export function resetSidebarView() {
   setSidebarOrdering(SIDEBAR_DEFAULT_ORDERING)
   $sidebarRowMeta.set(SIDEBAR_DEFAULT_ROW_META)
   $sidebarCardRows.set(false)
+  $sidebarListLimit.set(SIDEBAR_DEFAULT_LIST_LIMIT)
   clearSidebarFilters()
 }
 
@@ -777,7 +835,9 @@ export function raiseSessionsLimit(floor: number): boolean {
 }
 
 export function resetSessionsLimit() {
-  if ($sessionsLimit.get() !== SIDEBAR_SESSIONS_PAGE_SIZE) {
-    $sessionsLimit.set(SIDEBAR_SESSIONS_PAGE_SIZE)
+  const floor = sidebarSessionsPageSize()
+
+  if ($sessionsLimit.get() !== floor) {
+    $sessionsLimit.set(floor)
   }
 }

@@ -41,6 +41,7 @@ import {
   $sidebarCronOpen,
   $sidebarFiltersActive,
   $sidebarGrouping,
+  $sidebarListLimit,
   $sidebarMessagingOpenIds,
   $sidebarOrdering,
   $sidebarPinsOpen,
@@ -157,7 +158,6 @@ import {
   orderProjectsByIds,
   overlayLiveLanes,
   overlayLivePreviews,
-  PROJECT_PREVIEW_COUNT,
   ProjectBackRow,
   ProjectMenu,
   projectTreeCwd,
@@ -175,10 +175,10 @@ import { buildSessionByAnyId, resolvePinnedSessions } from './session-index'
 import { SidebarSessionsSection, VIRTUALIZE_THRESHOLD } from './sessions-section'
 import { CONTEXT_SPLIT_KIT, SplitSubmenu } from './split-submenu'
 
-// Non-session groups (messaging platforms) stay compact: show a few rows up
-// front, reveal more in larger steps on demand. Keeps a busy platform from
-// dominating the sidebar before the user asks to see it.
-const NON_SESSION_INITIAL_ROWS = 3
+// Non-session groups (messaging platforms) stay compact when a numeric
+// list-length is picked: show a few rows up front, reveal more in larger
+// steps on demand. Under the default 'all' setting there is no initial cap
+// at all — see $sidebarListLimit.
 const NON_SESSION_LOAD_STEP = 10
 
 // How long after connecting to warm the project tree for someone who isn't in
@@ -364,6 +364,7 @@ export function ChatSidebar({
   const filtersActive = useStore($sidebarFiltersActive)
   const showArchived = useStore($sidebarShowArchived)
   const cardRows = useStore($sidebarCardRows)
+  const listLimit = useStore($sidebarListLimit)
   const archivedSessions = useStore($archivedSessions)
   const dotStates = useStore($sessionDotStateById)
   // The active sort key as an id order. The flat list applies it within its
@@ -437,10 +438,19 @@ export function ChatSidebar({
   const [messagingLoadMorePending, setMessagingLoadMorePending] = useState<Record<string, boolean>>({})
   const [recentsLoadMorePending, setRecentsLoadMorePending] = useState(false)
   const messagingOpenIds = useStore($sidebarMessagingOpenIds)
-  // Per-platform count of rows currently revealed (starts at NON_SESSION_INITIAL_ROWS).
+  // Per-platform count of rows currently revealed while a numeric list-length
+  // is picked (moot under 'all', which shows every loaded row — see the
+  // render site below).
   const [messagingVisible, setMessagingVisible] = useState<Record<string, number>>({})
   const searchInputRef = useRef<HTMLInputElement>(null)
   const trimmedQuery = searchQuery.trim()
+
+  // Switching the list-length setting (the filter menu) resets every
+  // messaging group's own reveal-count back to that setting's floor, the same
+  // way the flat recents list and cron section react to the same event.
+  useEffect(() => {
+    setMessagingVisible({})
+  }, [listLimit])
 
   // Hotkey (session.focusSearch) → focus the field once it's mounted.
   useEffect(() => {
@@ -1116,13 +1126,13 @@ export function ChatSidebar({
   // matching the flat Recents list. Keyed by project id for the rows.
   const overviewPreviews = useMemo<Record<string, SessionInfo[]>>(
     () =>
-      overlayLivePreviews(projectOverview ?? [], agentSessions, projects, PROJECT_PREVIEW_COUNT, {
+      overlayLivePreviews(projectOverview ?? [], agentSessions, projects, listLimit === 'all' ? Infinity : listLimit, {
         removed: removedSessionIds,
         // Rank before the trim, so "3 priciest in this project" isn't "3 most
         // recent, priciest first".
         rankIds: sortOrderIds
       }),
-    [projectOverview, agentSessions, projects, removedSessionIds, sortOrderIds]
+    [projectOverview, agentSessions, projects, removedSessionIds, sortOrderIds, listLimit]
   )
 
   const onEnterProject = useCallback(
@@ -1177,9 +1187,11 @@ export function ChatSidebar({
   )
 
   // Reveal another batch of a platform's rows; fetch from the backend too if we
-  // run past what's loaded and more remain on disk.
+  // run past what's loaded and more remain on disk. Not reachable under 'all'
+  // (no cap, no button) — only fires while a numeric list-length is picked.
   const revealMoreMessaging = (platform: string, loaded: number, hasMore: boolean) => {
-    const next = (messagingVisible[platform] ?? NON_SESSION_INITIAL_ROWS) + NON_SESSION_LOAD_STEP
+    const step = typeof listLimit === 'number' ? listLimit : NON_SESSION_LOAD_STEP
+    const next = (messagingVisible[platform] ?? step) + NON_SESSION_LOAD_STEP
 
     setMessagingVisible(prev => ({ ...prev, [platform]: next }))
 
@@ -1827,11 +1839,17 @@ export function ChatSidebar({
             {!trimmedQuery &&
               !worktreeGroupingActive &&
               messagingGroups.map(group => {
-                const visible = messagingVisible[group.sourceId] ?? NON_SESSION_INITIAL_ROWS
+                const visible =
+                  listLimit === 'all' ? group.sessions.length : (messagingVisible[group.sourceId] ?? listLimit)
+
                 const shownSessions = group.sessions.slice(0, visible)
                 // More to show if rows are hidden behind the cap, or the backend
-                // still has older threads on disk.
-                const canRevealMore = visible < group.sessions.length || group.hasMore
+                // still has older threads on disk. Under 'all' there is no cap —
+                // the affordance never renders for this surface (though the
+                // backend can still have more on disk; the auto-page loop in
+                // useSessionListActions handles that for the flat recents list,
+                // not messaging groups, which stay bounded by their own fetch).
+                const canRevealMore = listLimit !== 'all' && (visible < group.sessions.length || group.hasMore)
 
                 return (
                   <SidebarSessionsSection
