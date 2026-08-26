@@ -25,6 +25,7 @@ import {
   $sidebarCardRows,
   $sidebarFiltersActive,
   $sidebarGrouping,
+  $sidebarListLimit,
   $sidebarOrdering,
   $sidebarPrFilter,
   $sidebarProfileFilter,
@@ -37,10 +38,13 @@ import {
   resetSidebarView,
   setSidebarCardRows,
   setSidebarGrouping,
+  setSidebarListLimit,
   setSidebarOrdering,
   setSidebarShowArchived,
   setWorkspaceNodesOpen,
+  SIDEBAR_LIST_LIMIT_OPTIONS,
   type SidebarGrouping,
+  type SidebarListLimit,
   type SidebarOrdering,
   type SidebarRowMeta,
   toggleSidebarPrFilter,
@@ -77,6 +81,11 @@ const GROUPINGS: Option<SidebarGrouping>[] = [
   { icon: 'pulse', id: 'status', label: 'Status' },
   { icon: 'account', id: 'profile', label: 'Profile' }
 ]
+
+const LIST_LENGTHS: Option<string>[] = SIDEBAR_LIST_LIMIT_OPTIONS.map(option => ({
+  id: String(option),
+  label: option === 'all' ? 'All' : String(option)
+}))
 
 const ORDERINGS: Option<SidebarOrdering>[] = [
   { icon: 'clock', id: 'updated', label: 'Updated' },
@@ -154,6 +163,7 @@ export function SidebarFilterMenu({ className }: { className?: string }) {
   const ordering = useStore($sidebarOrdering)
   const rowMeta = useStore($sidebarRowMeta)
   const cardRows = useStore($sidebarCardRows)
+  const listLimit = useStore($sidebarListLimit)
   const statusFilter = useStore($sidebarStatusFilter)
   const projectFilter = useStore($sidebarProjectFilter)
   const profileFilter = useStore($sidebarProfileFilter)
@@ -177,6 +187,7 @@ export function SidebarFilterMenu({ className }: { className?: string }) {
   const projectsCollapsed = projects.length > 0 && projects.every(project => nodeOpen[project.id] === false)
 
   const groupingLabel = GROUPINGS.find(option => option.id === grouping)?.label
+  const listLengthLabel = listLimit === 'all' ? 'All' : String(listLimit)
 
   // Two options are conditional: dragging a row is what picks manual, so it
   // only appears as a way back out once there's a hand-picked order to leave;
@@ -239,6 +250,28 @@ export function SidebarFilterMenu({ className }: { className?: string }) {
                 value={grouping}
               >
                 {GROUPINGS.map(option => (
+                  <OptionRadio key={option.id} option={option} />
+                ))}
+              </DropdownMenuRadioGroup>
+            </DropdownMenuSubContent>
+          </DropdownMenuSub>
+
+          <DropdownMenuSub>
+            <DropdownMenuSubTrigger hideChevron>
+              List length
+              <span className="ml-auto flex items-center gap-1 pl-4 text-(--ui-text-tertiary)">
+                {listLengthLabel}
+                <Codicon name="chevron-right" size="1rem" />
+              </span>
+            </DropdownMenuSubTrigger>
+            <DropdownMenuSubContent>
+              <DropdownMenuRadioGroup
+                onValueChange={value =>
+                  setSidebarListLimit((value === 'all' ? 'all' : Number(value)) as SidebarListLimit)
+                }
+                value={String(listLimit)}
+              >
+                {LIST_LENGTHS.map(option => (
                   <OptionRadio key={option.id} option={option} />
                 ))}
               </DropdownMenuRadioGroup>

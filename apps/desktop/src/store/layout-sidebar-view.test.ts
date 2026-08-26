@@ -2,12 +2,15 @@ import { beforeEach, describe, expect, it } from 'vitest'
 
 import {
   $sidebarGrouping,
+  $sidebarListLimit,
   $sidebarOrdering,
   $sidebarRowMeta,
   $sidebarViewCustomized,
   resetSidebarView,
   setSidebarGrouping,
+  setSidebarListLimit,
   setSidebarOrdering,
+  SIDEBAR_LIST_LIMIT_OPTIONS,
   toggleSidebarRowMeta,
   toggleSidebarStatusFilter
 } from './layout'
@@ -74,5 +77,40 @@ describe('the sidebar as it ships', () => {
 
     expect($showAllProfiles.get()).toBe(true)
     expect($sidebarGrouping.get()).toBe('profile')
+  })
+})
+
+describe('the sidebar list-length setting', () => {
+  it('ships as "all" — every unarchived row, no load-more affordance', () => {
+    expect($sidebarListLimit.get()).toBe('all')
+  })
+
+  it('offers the documented picks in order: all, 10, 25, 50, 100', () => {
+    expect(SIDEBAR_LIST_LIMIT_OPTIONS).toEqual(['all', 10, 25, 50, 100])
+  })
+
+  it('trims to the numeric pick and reports the view as customized', () => {
+    setSidebarListLimit(25)
+
+    expect($sidebarListLimit.get()).toBe(25)
+    expect($sidebarViewCustomized.get()).toBe(true)
+  })
+
+  it('is not "customized" while still on the shipped default', () => {
+    expect($sidebarViewCustomized.get()).toBe(false)
+
+    setSidebarListLimit('all')
+
+    expect($sidebarViewCustomized.get()).toBe(false)
+  })
+
+  it('resetSidebarView returns it to "all" alongside every other knob', () => {
+    setSidebarGrouping('project')
+    setSidebarListLimit(50)
+
+    resetSidebarView()
+
+    expect($sidebarListLimit.get()).toBe('all')
+    expect($sidebarViewCustomized.get()).toBe(false)
   })
 })
