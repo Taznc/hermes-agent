@@ -1890,6 +1890,7 @@ def _validate_job_mode_invariants(
     monitor_url: Optional[str],
     no_agent: bool,
     script: Optional[str],
+    resume_session_id: Optional[str] = None,
 ) -> None:
     """Shared create/update validation for job execution-mode invariants.
 
@@ -1910,6 +1911,19 @@ def _validate_job_mode_invariants(
         )
     if no_agent and not script:
         raise ValueError(NO_AGENT_WITHOUT_SCRIPT_ERROR)
+    if resume_session_id and no_agent:
+        raise ValueError(
+            "resume_session_id cannot be combined with no_agent=True — a "
+            "resume job re-submits a prompt into an EXISTING agent session; "
+            "there is no agent to resume into a no_agent (script-only) job."
+        )
+    if resume_session_id and (monitor_script or monitor_url):
+        raise ValueError(
+            "resume_session_id cannot be combined with monitor_script/"
+            "monitor_url — a resume job targets one specific existing "
+            "session, which is incompatible with monitor mode's per-tick "
+            "suppress/wake semantics."
+        )
 
 
 def create_job(
@@ -1933,6 +1947,7 @@ def create_job(
     monitor_script: Optional[str] = None,
     monitor_url: Optional[str] = None,
     reasoning_effort: Optional[str] = None,
+    resume_session_id: Optional[str] = None,
 ) -> Dict[str, Any]:
     """
     Create a new cron job.
@@ -2000,6 +2015,16 @@ def create_job(
                 exactly like config-set effort. Inert with ``no_agent=True``
                 (no LLM call to configure). None/empty = unset (job follows
                 config resolution, pre-existing behavior).
+        resume_session_id: Optional id of an EXISTING local session this job
+                should resume and resubmit its stored ``prompt`` into, instead
+                of spawning a fresh ``cron_{job_id}_{timestamp}`` agent
+                session (see ``cron.scheduler.run_job``'s resume branch). The
+                stored prompt should be a short resume instruction only (e.g.
+                "Retry the last turn.") — never transcript content or
+                secrets. Mutually exclusive with ``no_agent`` and
+                ``monitor_script``/``monitor_url``. When the target session no
+                longer exists (or was already resumed by another path), the
+                run completes as a harmless no-op rather than an error.
 
     Returns:
         The created job dict
@@ -2037,6 +2062,10 @@ def create_job(
     normalized_monitor_script = normalized_monitor_script or None
     normalized_monitor_url = str(monitor_url).strip() if isinstance(monitor_url, str) else None
     normalized_monitor_url = normalized_monitor_url or None
+    normalized_resume_session_id = (
+        str(resume_session_id).strip() if isinstance(resume_session_id, str) else None
+    )
+    normalized_resume_session_id = normalized_resume_session_id or None
 
     # Monitor-mode validation: exactly one source, and monitor mode only
     # makes sense when there IS an agent to suppress/wake.
@@ -2049,6 +2078,7 @@ def create_job(
         normalized_monitor_url,
         normalized_no_agent,
         normalized_script,
+        normalized_resume_session_id,
     )
 
     # Normalize context_from: accept str or list of str, store as list or None
@@ -2149,6 +2179,11 @@ def create_job(
     # absent key = job follows config resolution (pre-feature behavior).
     if normalized_reasoning_effort is not None:
         job["reasoning_effort"] = normalized_reasoning_effort
+    # Same conditional-persist rule for resume_session_id: absent key means
+    # this is a normal fresh-agent-session job (pre-feature behavior for
+    # every existing job and the common case).
+    if normalized_resume_session_id is not None:
+        job["resume_session_id"] = normalized_resume_session_id
 
     with _jobs_lock():
         jobs = load_jobs()
@@ -2255,6 +2290,12 @@ def update_job(job_id: str, updates: Dict[str, Any]) -> Optional[Dict[str, Any]]
                     _mv = str(_mv).strip() if isinstance(_mv, str) else None
                     updates[_mon_field] = _mv or None
 
+            # Same clear-on-empty normalization for resume_session_id.
+            if "resume_session_id" in updates:
+                _rsid = updates["resume_session_id"]
+                _rsid = str(_rsid).strip() if isinstance(_rsid, str) else None
+                updates["resume_session_id"] = _rsid or None
+
             # Validate/normalize the per-job reasoning effort pin the same
             # way create_job does: canonical grammar only, empty string (or
             # None) clears. Invalid values raise BEFORE the merge so the
@@ -2284,14 +2325,21 @@ def update_job(job_id: str, updates: Dict[str, Any]) -> Optional[Dict[str, Any]]
             # monitor: the scheduler's no_agent short-circuit runs before
             # the monitor gate). Scoped to changed fields so legacy records
             # untouched by this update keep loading.
-            if {"monitor_script", "monitor_url", "no_agent", "script"}.intersection(updates):
+            if {"monitor_script", "monitor_url", "no_agent", "script", "resume_session_id"}.intersection(updates):
                 _upd_script = updated.get("script")
                 _upd_script = str(_upd_script).strip() if isinstance(_upd_script, str) else None
+                _upd_resume_session_id = updated.get("resume_session_id")
+                _upd_resume_session_id = (
+                    str(_upd_resume_session_id).strip()
+                    if isinstance(_upd_resume_session_id, str)
+                    else None
+                )
                 _validate_job_mode_invariants(
                     updated.get("monitor_script") or None,
                     updated.get("monitor_url") or None,
                     bool(updated.get("no_agent")),
                     _upd_script or None,
+                    _upd_resume_session_id or None,
                 )
 
             if any(k in updates for k in _PAYLOAD_FIELDS):

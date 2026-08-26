@@ -919,6 +919,13 @@ export interface CronJobCreatePayload {
   name?: string
   prompt: string
   provider?: string
+  /**
+   * Optional id of an EXISTING local session this job should resume and
+   * resubmit its stored `prompt` into (see cron/scheduler.py's resume
+   * branch), instead of spawning a fresh agent session — the seam
+   * "Resume at reset" schedules against (see rate-limit-recovery.ts).
+   */
+  resume_session_id?: string
   schedule: string
 }
 
@@ -935,6 +942,7 @@ export interface CronJobUpdates {
   name?: string
   prompt?: string
   provider?: null | string
+  resume_session_id?: null | string
   schedule?: string
 }
 
