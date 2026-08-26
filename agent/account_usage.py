@@ -9,7 +9,14 @@ from typing import TYPE_CHECKING, Any, Optional
 import httpx
 
 from agent.anthropic_adapter import _is_oauth_token, resolve_anthropic_token
-from hermes_cli.auth import AuthError, _read_codex_tokens, resolve_codex_runtime_credentials
+from hermes_cli.auth import (
+    AuthError,
+    _codex_access_token_is_expiring,
+    _import_codex_cli_tokens,
+    _read_codex_tokens,
+    is_rate_limited_auth_error,
+    resolve_codex_runtime_credentials,
+)
 from hermes_cli.runtime_provider import resolve_runtime_provider
 
 if TYPE_CHECKING:
@@ -558,8 +565,10 @@ def _resolve_codex_usage_credentials(
             # Pool-only creds carry no singleton account_id; header is optional.
             logger.debug("codex ▸ /usage account_id read failed (best-effort)", exc_info=True)
         return creds["api_key"], str(creds.get("base_url", "") or "").strip(), account_id
-    except AuthError:
+    except AuthError as exc:
         logger.debug("codex ▸ /usage runtime resolver returned no creds; trying pool", exc_info=True)
+        rate_limited = is_rate_limited_auth_error(exc)
+        quota_error = exc
 
     # Tier 3: direct pool select. Reached only when the resolver itself raises
     # AuthError (e.g. singleton missing AND its own pool read found nothing at
@@ -570,9 +579,42 @@ def _resolve_codex_usage_credentials(
 
     pool = load_pool("openai-codex")
     entry = pool.select()
-    if entry is None:
-        raise RuntimeError("No available openai-codex credential in credential pool")
-    return entry.runtime_api_key, str(entry.runtime_base_url or base_url or "").strip(), None
+    if entry is not None:
+        return entry.runtime_api_key, str(entry.runtime_base_url or base_url or "").strip(), None
+
+    # Tier 4: quota-exhausted rescue. ``resolve_codex_runtime_credentials``
+    # withholds a credential once the Codex MODEL quota is spent, while stating
+    # outright that the credentials remain valid. The usage endpoint is a
+    # read-only GET that consumes no model quota, so honoring that refusal here
+    # would black out the usage view at precisely the moment the user needs it —
+    # to see when their limit resets. Fall back to the stored access token, but
+    # ONLY for rate-limiting: a missing/invalid-credential AuthError must still
+    # fail so a genuine re-login isn't masked by a stale token.
+    if rate_limited:
+        for reader in (_read_codex_tokens, _import_codex_cli_tokens):
+            try:
+                token_data = reader() or {}
+            except AuthError:
+                logger.debug("codex ▸ /usage stored-token rescue: %s found nothing", reader.__name__, exc_info=True)
+                continue
+            raw_tokens = token_data.get("tokens")
+            tokens = raw_tokens if isinstance(raw_tokens, dict) else token_data
+            stored_token = str(tokens.get("access_token", "") or "").strip()
+            # An EXPIRED token would just 401. Refreshing it here is not an
+            # option: Codex OAuth refresh_tokens are single-use (see the
+            # rotation note in hermes_cli/auth.py), so spending one on a
+            # read-only usage probe could rotate the user's real login out from
+            # under the Codex CLI. Prefer an honest "unavailable" over that.
+            if stored_token and not _codex_access_token_is_expiring(stored_token, 0):
+                account_id = str(tokens.get("account_id", "") or "").strip() or None
+                logger.debug("codex ▸ /usage using stored token while model quota is exhausted")
+                return stored_token, str(base_url or "").strip(), account_id
+        # Surface the provider's own reason ("quota exhausted; retry after Ns")
+        # instead of a generic pool error, so the UI can say what is actually
+        # wrong rather than claiming no account is configured.
+        raise quota_error
+
+    raise RuntimeError("No available openai-codex credential in credential pool")
 
 
 def _fetch_codex_account_usage(
@@ -941,6 +983,8 @@ def _fetch_anthropic_account_usage() -> Optional[AccountUsageSnapshot]:
         "seven_day_opus",
         "seven_day_sonnet",
     }
+    details: list[str] = []
+    balances: list[AccountUsageBalance] = []
     for key, raw in payload.items():
         if key in known_window_keys or not isinstance(raw, dict):
             continue
@@ -948,35 +992,81 @@ def _fetch_anthropic_account_usage() -> Optional[AccountUsageSnapshot]:
         if not isinstance(utilization, (int, float)):
             continue
         used_percent = float(utilization) * 100 if float(utilization) <= 1 else float(utilization)
+        label = _title_case_slug(key) or "Usage limit"
         windows.append(
             AccountUsageWindow(
-                label=_title_case_slug(key) or "Usage limit",
+                label=label,
                 used_percent=used_percent,
                 reset_at=_parse_dt(raw.get("resets_at")),
                 severity=str(raw["severity"]) if raw.get("severity") is not None else None,
                 is_active=raw.get("is_active") if isinstance(raw.get("is_active"), bool) else None,
             )
         )
-    details: list[str] = []
-    balances: list[AccountUsageBalance] = []
+        # Some codenamed windows are denominated in dollars rather than percent.
+        # Carry those amounts through instead of discarding them, so a plan whose
+        # only meaningful signal is a dollar figure still shows something real.
+        dollar_fields = ("used_dollars", "limit_dollars", "remaining_dollars")
+        if any(isinstance(raw.get(field), (int, float)) for field in dollar_fields):
+            used_dollars = raw.get("used_dollars")
+            limit_dollars = raw.get("limit_dollars")
+            remaining_dollars = raw.get("remaining_dollars")
+            balances.append(
+                AccountUsageBalance(
+                    label=label,
+                    used=float(used_dollars) if isinstance(used_dollars, (int, float)) else None,
+                    limit=float(limit_dollars) if isinstance(limit_dollars, (int, float)) else None,
+                    remaining=(
+                        float(remaining_dollars)
+                        if isinstance(remaining_dollars, (int, float))
+                        else None
+                    ),
+                    currency="USD",
+                )
+            )
     extra = payload.get("extra_usage") or {}
+    # Extra usage is a real bucket on its own: some plans (managed/work accounts)
+    # expose NO session/weekly limits at all, only this credit pool. Requiring a
+    # complete used+limit pair here made such an account render as an empty
+    # tracker, so map whatever the provider actually sent and omit the rest.
     if extra.get("is_enabled"):
         used_credits = extra.get("used_credits")
         monthly_limit = extra.get("monthly_limit")
         currency = extra.get("currency") or "USD"
-        if isinstance(used_credits, (int, float)) and isinstance(monthly_limit, (int, float)):
-            details.append(
-                f"Extra usage: {used_credits:.2f} / {monthly_limit:.2f} {currency}"
+        utilization = extra.get("utilization")
+        has_used = isinstance(used_credits, (int, float))
+        has_limit = isinstance(monthly_limit, (int, float))
+
+        used_percent: Optional[float] = None
+        if isinstance(utilization, (int, float)):
+            used_percent = float(utilization) * 100 if float(utilization) <= 1 else float(utilization)
+        elif has_used and has_limit and float(monthly_limit) > 0:
+            used_percent = float(used_credits) / float(monthly_limit) * 100
+
+        if has_used or has_limit or used_percent is not None:
+            windows.append(
+                AccountUsageWindow(
+                    label="Extra Usage",
+                    used_percent=used_percent,
+                    limit_reached=bool(extra.get("spend_limit_reached")) or None,
+                )
             )
             balances.append(
                 AccountUsageBalance(
-                    label="Extra usage",
-                    used=float(used_credits),
-                    limit=float(monthly_limit),
-                    remaining=max(0.0, float(monthly_limit) - float(used_credits)),
+                    label="Extra Usage",
+                    used=float(used_credits) if has_used else None,
+                    limit=float(monthly_limit) if has_limit else None,
+                    remaining=(
+                        max(0.0, float(monthly_limit) - float(used_credits))
+                        if has_used and has_limit
+                        else None
+                    ),
                     currency=str(currency),
                 )
             )
+            if has_used and has_limit:
+                details.append(f"Extra usage: {float(used_credits):.2f} / {float(monthly_limit):.2f} {currency}")
+            elif has_used:
+                details.append(f"Extra usage: {float(used_credits):.2f} {currency} used")
     return AccountUsageSnapshot(
         provider="anthropic",
         source="oauth_usage_api",
@@ -1059,6 +1149,34 @@ def _fetch_openrouter_account_usage(base_url: Optional[str], api_key: Optional[s
     )
 
 
+def _account_limits_unavailable_reason(provider: str) -> str:
+    """Explain why a provider's limits are missing, in the user's terms.
+
+    ``fetch_account_usage`` deliberately fails open and returns ``None`` for
+    every failure mode, which made a rate-limited or expired account look
+    identical to one that was never configured. Re-derive the specific cause so
+    the UI can tell the user what to actually do about it.
+    """
+
+    if provider != "openai-codex":
+        return "No compatible account credentials are configured for provider limits."
+    try:
+        resolve_codex_runtime_credentials(refresh_if_expiring=True)
+    except AuthError as exc:
+        if is_rate_limited_auth_error(exc):
+            # Quota is spent AND no usable token remained to read usage with.
+            # The stored token being expired is the common cause; say so rather
+            # than implying the account is missing.
+            return (
+                f"{exc} Sign in again with `hermes auth` to restore the usage view."
+            )
+        if getattr(exc, "relogin_required", False):
+            return "Codex sign-in has expired. Run `hermes auth` to reconnect the account."
+    except Exception:  # pragma: no cover - diagnostics must never raise
+        logger.debug("codex ▸ unavailable-reason probe failed", exc_info=True)
+    return "No compatible account credentials are configured for provider limits."
+
+
 def fetch_account_limits(
     providers: Optional[tuple[str, ...]] = None,
 ) -> tuple[AccountUsageSnapshot, ...]:
@@ -1084,7 +1202,7 @@ def fetch_account_limits(
                 provider=provider,
                 source="account_limits",
                 fetched_at=_utc_now(),
-                unavailable_reason="No compatible account credentials are configured for provider limits.",
+                unavailable_reason=_account_limits_unavailable_reason(provider),
             )
         snapshots.append(snapshot)
     return tuple(snapshots)
