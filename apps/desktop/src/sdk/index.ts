@@ -1377,6 +1377,16 @@ export { evaluateRuntimeReadiness, type RuntimeReadinessResult } from '@/lib/run
 export const STATUSBAR_AREAS = { left: 'statusBar.left', right: 'statusBar.right' } as const
 export const TITLEBAR_AREAS = { center: 'titleBar.center', left: 'titleBar.left', right: 'titleBar.right' } as const
 
+/** The transcript's active-work indicator as a contribution area: register a
+ *  `thread.activity` contribution and your component draws the "thinking" mark
+ *  in place of the core dither pulse. The row's status role, label, hint text,
+ *  and elapsed clock stay core-owned — you draw the mark, nothing else. */
+export {
+  THREAD_ACTIVITY_AREA,
+  type ThreadActivityContribution,
+  type ThreadActivityPhase,
+  type ThreadActivityState
+} from '@/lib/thread-activity'
 export { coarseElapsed, fmtDateTime, fmtDayTime, relativeTime } from '@/lib/time'
 /** The transcript as a contribution area: register a named `::directive{...}`
  *  and the model can render your component inline in assistant messages. */
