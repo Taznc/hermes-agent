@@ -125,8 +125,9 @@ const BARE_PROVIDER_BUCKETS = new Set(['auto'])
 export function providerFamilyLabel(provider: null | string | undefined): string | null {
   const raw = (provider || '').trim().toLowerCase()
 
-  if (!raw || BARE_PROVIDER_BUCKETS.has(raw)) return null
-  if (PROVIDER_FAMILY_OVERRIDES[raw]) return PROVIDER_FAMILY_OVERRIDES[raw]
+  if (!raw || BARE_PROVIDER_BUCKETS.has(raw)) {return null}
+
+  if (PROVIDER_FAMILY_OVERRIDES[raw]) {return PROVIDER_FAMILY_OVERRIDES[raw]}
 
   return raw
     .split(/[-_]+/)

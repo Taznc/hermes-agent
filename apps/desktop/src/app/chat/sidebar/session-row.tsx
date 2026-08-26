@@ -137,7 +137,7 @@ function ProviderIdentityBadge({
   narrow: boolean
   r: Translations['sidebar']['row']
 }) {
-  if (!identity.configured) return null
+  if (!identity.configured) {return null}
 
   if (!identity.served) {
     return (

@@ -33,8 +33,9 @@ export function sessionRowIdentity(session: SessionInfo): SessionRowIdentity {
   const configured = providerFamilyLabel(session.configured_provider)
   const served = providerFamilyLabel(session.served_provider)
 
-  if (!configured || !served) return { configured, served: null }
-  if (configured.toLowerCase() === served.toLowerCase()) return { configured, served: null }
+  if (!configured || !served) {return { configured, served: null }}
+
+  if (configured.toLowerCase() === served.toLowerCase()) {return { configured, served: null }}
 
   return { configured, served }
 }
