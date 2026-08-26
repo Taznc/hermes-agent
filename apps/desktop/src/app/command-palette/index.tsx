@@ -88,6 +88,7 @@ import {
   $updateStatus,
   requestActiveUpdate
 } from '@/store/updates'
+import { performWebReload } from '@/store/web-reload'
 import { canOpenNewWindow, openNewWindow } from '@/store/windows'
 import { luminance } from '@/themes/color'
 import { type ThemeMode, useTheme } from '@/themes/context'
@@ -1000,7 +1001,7 @@ function CommandPaletteBody({ onExited }: { onExited: () => void }) {
             id: 'cc-reload-window',
             keywords: ['reload', 'window', 'refresh', 'restart', 'ui', 'stuck'],
             label: cc.reloadWindow,
-            run: () => window.location.reload()
+            run: () => performWebReload()
           },
           {
             action: 'view.showBrowser',

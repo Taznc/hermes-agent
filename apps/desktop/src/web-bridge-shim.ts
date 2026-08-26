@@ -22,12 +22,46 @@ import { markWebReloadPending, registerNativeWebReload } from '@/store/web-reloa
 // reload first (the "Refresh" statusbar item calls it back), then replace
 // `location.reload` with a flag flip. Gated on DEV so this never ships in a
 // production web build. See docs/web-ui-hard-refresh-diagnosis.md.
-if (import.meta.env.DEV) {
-  registerNativeWebReload(window.location.reload.bind(window.location))
-  Object.defineProperty(window.location, 'reload', {
-    configurable: true,
-    value: () => markWebReloadPending()
-  })
+//
+// This module itself gets RE-EVALUATED by Vite's own HMR (it's imported by
+// index-web.html, and an edit anywhere upstream of it can trigger a fresh
+// module graph load without a real page navigation). A second evaluation
+// must not repeat the install:
+//   1. `Object.defineProperty(window.location, 'reload', ...)` can throw
+//      `TypeError: Cannot redefine property: reload` — some environments
+//      expose `reload` as a non-configurable own property, and even a
+//      `configurable: true` redefinition attempt on top of an existing
+//      non-configurable descriptor is rejected. That throw happens BEFORE
+//      `window.hermesDesktop = shim` runs at the bottom of this file, so an
+//      unguarded throw here takes down the entire shim — every
+//      `window.hermesDesktop?.xxx()` call site then reads `undefined` and
+//      the app renders as fully crashed, which is strictly worse than the
+//      individual reload call sites this trap is meant to fix.
+//   2. Even when it doesn't throw, re-running `registerNativeWebReload`
+//      would capture our OWN flag-flip function as "native" (since the
+//      first pass already replaced `window.location.reload`), permanently
+//      losing the real native reload the "Refresh" button depends on.
+// A `window`-level flag (surviving across a fresh module instance, unlike a
+// module-scoped variable) plus a try/catch guards both failure modes: if
+// installation ever fails, native `reload()` is left alone for this session
+// — HMR full-reloads act as they did before this whole feature (immediate,
+// ungated hard refresh) rather than crashing the app.
+const RELOAD_TRAP_FLAG = '__hermesWebReloadTrapInstalled'
+
+if (import.meta.env.DEV && !(window as unknown as Record<string, unknown>)[RELOAD_TRAP_FLAG]) {
+  try {
+    registerNativeWebReload(window.location.reload.bind(window.location))
+    Object.defineProperty(window.location, 'reload', {
+      configurable: true,
+      value: () => markWebReloadPending()
+    })
+    ;(window as unknown as Record<string, unknown>)[RELOAD_TRAP_FLAG] = true
+  } catch (err) {
+    console.warn(
+      '[web-bridge-shim] could not trap window.location.reload; HMR full-reloads will navigate directly this session',
+      err
+    )
+  }
 }
 
 // Self-contained minimal types (structural subsets of src/global.d.ts shapes;
