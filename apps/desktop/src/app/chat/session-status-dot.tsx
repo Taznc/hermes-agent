@@ -1,10 +1,11 @@
 import { useStore } from '@nanostores/react'
 
 import { type Translations, useI18n } from '@/i18n'
+import { fmtClock } from '@/lib/time'
 import { useStoreSelector } from '@/lib/use-session-slice'
 import { cn } from '@/lib/utils'
 import { $sessionColorById, sessionColorFor } from '@/store/session-color'
-import { $sessionDotStateById, type SessionDotState } from '@/store/session-dot-state'
+import { $sessionDotStateById, $rateLimitedSessionIds, type SessionDotState } from '@/store/session-dot-state'
 import type { SessionInfo } from '@/types/hermes'
 
 // A pure lookup table: each state maps to its className, aria-label, and title.
@@ -68,6 +69,19 @@ const DOT_VARIANTS: Record<SessionDotState, DotVariant> = {
     className: `${DOT_BASE} bg-(--ui-success)`,
     role: 'status',
     title: r => r.finishedUnread
+  },
+  // Amber-adjacent but distinct: orange, so a rate-limited session never gets
+  // confused with an amber needs-input prompt. Filled — it's a definite,
+  // named terminal state, not a quiet "still open" hollow dot. Label/title
+  // are resolved dynamically in SessionStatusDot (need the resolved reset
+  // time), so this entry carries only the visual — its ariaLabel/title
+  // functions here are unused fallbacks for callers that read the table
+  // directly (sessionDotClassName consumers never need the live label).
+  'rate-limited': {
+    ariaLabel: r => r.rateLimited.unknown,
+    className: `${DOT_BASE} bg-orange-500`,
+    role: 'status',
+    title: r => r.rateLimited.unknown
   },
   // Hollow grey, the faintest ink the app has — nothing has ever run here. It
   // shares the outline with `background` because both mean "open, not
@@ -137,7 +151,21 @@ export function SessionStatusDot({ storedSessionId, session, branchStem, classNa
     storedSessionId ? (states[storedSessionId] ?? 'idle') : 'draft'
   )
 
+  // Rate-limited (Phase 2.12): the label needs the resolved reset time, which
+  // the static DOT_VARIANTS table can't carry — read it directly rather than
+  // widening the table to accept per-call args.
+  const rateLimitedResetAt = useStoreSelector($rateLimitedSessionIds, entries =>
+    storedSessionId ? entries[storedSessionId]?.resetAt : undefined
+  )
+
   const variant = DOT_VARIANTS[dotState]
+
+  const rateLimitedLabel =
+    dotState === 'rate-limited'
+      ? rateLimitedResetAt !== undefined
+        ? r.rateLimited.withTime(fmtClock.format(new Date(rateLimitedResetAt * 1000)))
+        : r.rateLimited.unknown
+      : null
 
   return (
     <span className={cn('flex items-center gap-0.5', className)}>
@@ -153,10 +181,10 @@ export function SessionStatusDot({ storedSessionId, session, branchStem, classNa
         <span aria-hidden="true" className={variant.className} style={color ? { backgroundColor: color } : undefined} />
       ) : (
         <span
-          aria-label={variant.ariaLabel?.(r)}
+          aria-label={rateLimitedLabel ?? variant.ariaLabel?.(r)}
           className={variant.className}
           role={variant.role}
-          title={variant.title?.(r)}
+          title={rateLimitedLabel ?? variant.title?.(r)}
         />
       )}
     </span>
