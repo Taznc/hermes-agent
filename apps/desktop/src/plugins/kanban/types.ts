@@ -109,6 +109,9 @@ export interface KanbanTaskFull extends KanbanTask {
   branch_name?: null | string
   consecutive_failures?: number
   diagnostics?: Diagnostic[]
+  /** Typed reason the task is in `blocked` (one of VALID_BLOCK_KINDS) or null
+   *  for a legacy/un-typed block. Drives the CTA banner's copy. */
+  block_kind?: null | string
 }
 
 /** GET /tasks/:id — the task plus its related collections, which are SIBLINGS

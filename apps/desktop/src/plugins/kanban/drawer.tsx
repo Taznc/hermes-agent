@@ -47,21 +47,25 @@ import {
 } from './api'
 import { ModelOverrideField, overridePatch } from './model-override'
 import {
+  columnMeta,
   type Diagnostic,
   type DiagnosticAction,
   type KanbanAttachment,
   type KanbanEvent,
   type KanbanTaskDetail,
+  type KanbanTaskFull,
   SEVERITY_TONE,
   type TaskEstimate
 } from './types'
 import {
   ago,
   Avatar,
+  Banner,
   Callout,
   columnLabel,
   duration,
   errText,
+  FIELD_LABEL,
   isLockedTarget,
   type KanbanText,
   lockedReason,
@@ -177,6 +181,120 @@ function MetaRow({ children, label }: { children: ReactNode; label: string }) {
     </>
   )
 }
+
+/** The reason text on the most recent `blocked` event, if any — this is the
+ *  worker's own explanation for why the task is stuck, surfaced verbatim in
+ *  the CTA banner rather than making the user dig through Activity for it. */
+export function latestBlockReason(events: KanbanEvent[]): null | string {
+  for (let i = events.length - 1; i >= 0; i--) {
+    const event = events[i]
+
+    if (event.kind === 'blocked' || event.kind === 'block_loop_detected') {
+      const payload = event.payload
+
+      if (typeof payload === 'string' && payload) {
+        try {
+          const parsed = JSON.parse(payload) as Record<string, unknown>
+          const reason = parsed.reason
+
+          return typeof reason === 'string' && reason ? reason : null
+        } catch {
+          return null
+        }
+      } else if (payload && typeof payload === 'object') {
+        const reason = (payload as Record<string, unknown>).reason
+
+        return typeof reason === 'string' && reason ? reason : null
+      }
+
+      return null
+    }
+  }
+
+  return null
+}
+
+/**
+ * The task detail view's top-of-drawer call to action. This is the answer to
+ * "why is this stuck and what do I do about it" — rendered once, above
+ * everything else, whenever the task needs a human decision right now
+ * (blocked, needs an answer, or parked in review). Everything else in the
+ * drawer stays informational; this is the only thing asking for action.
+ */
+export function CtaBanner({
+  events,
+  onFocusComment,
+  onMove,
+  task
+}: {
+  events: KanbanEvent[]
+  onFocusComment: () => void
+  onMove: (status: string) => void
+  task: KanbanTaskFull
+}) {
+  const k = useKanban()
+
+  if (task.status === 'blocked') {
+    const kind = (task.block_kind ?? null) as null | 'capability' | 'needs_input' | 'transient'
+    const reason = latestBlockReason(events)
+    // needs_input reads as a literal question waiting on the user; the other
+    // kinds (capability / transient / untyped legacy) are still "blocked",
+    // just for a different reason — the icon + label change, the actions don't.
+    const icon = kind === 'needs_input' ? 'question' : kind === 'transient' ? 'sync' : 'error'
+    const tone = kind === 'transient' ? '#fbbf24' : SEVERITY_TONE.error
+
+    return (
+      <Banner
+        actions={
+          <>
+            <Button onClick={onFocusComment} size="xs" variant="secondary">
+              <Codicon name="comment" size="0.7rem" />
+              {k.ctaReply}
+            </Button>
+            <Button onClick={() => onMove('ready')} size="xs" variant="outline">
+              <Codicon name="debug-continue" size="0.7rem" />
+              {k.ctaUnblock}
+            </Button>
+          </>
+        }
+        icon={icon}
+        title={kind ? k.blockKind[kind] : k.ctaBlockedTitle}
+        tone={tone}
+      >
+        <p className="text-[0.75rem] leading-relaxed text-(--ui-text-secondary)">
+          {reason || k.ctaBlockedNoReason}
+        </p>
+      </Banner>
+    )
+  }
+
+  if (task.status === 'review') {
+    return (
+      <Banner
+        actions={
+          <>
+            <Button onClick={() => onMove('done')} size="xs" variant="secondary">
+              <Codicon name="check" size="0.7rem" />
+              {k.ctaApprove}
+            </Button>
+            <Button onClick={() => onMove('ready')} size="xs" variant="outline">
+              <Codicon name="discard" size="0.7rem" />
+              {k.ctaSendBack}
+            </Button>
+          </>
+        }
+        icon="eye"
+        title={k.ctaReviewTitle}
+        tone={columnMeta('review').tone}
+      >
+        <p className="text-[0.75rem] leading-relaxed text-(--ui-text-secondary)">{k.ctaReviewBody}</p>
+      </Banner>
+    )
+  }
+
+  return null
+}
+
 
 /** The dashboard's diagnostics panel: severity-toned, plain-English, with the
  *  backend's structured recovery actions as buttons. `reassign` is skipped —
@@ -320,6 +438,7 @@ function CommentComposer({
       <div className="relative">
         <Textarea
           className={cn('field-sizing-content max-h-40 min-h-0 resize-none', running ? 'pr-[3.5rem]' : 'pr-[5rem]')}
+          data-kanban-comment-input="true"
           onChange={event => setBody(event.target.value)}
           onKeyDown={event => {
             if (event.key === 'Enter' && !event.shiftKey) {
@@ -756,34 +875,49 @@ export function TaskDrawer({
           </div>
         ) : (
           <div className="flex flex-col gap-4 text-sm">
-            <div className="grid grid-cols-[6rem_minmax(0,1fr)] gap-x-3 gap-y-1 text-[0.71rem]">
-              <MetaRow label={k.assignee}>
-                <AssigneeMenu
-                  current={task.assignee}
-                  onReassign={profile => void mutate(() => reassignTask(task.id, profile))()}
-                />
-              </MetaRow>
-              {typeof task.priority === 'number' && <MetaRow label={k.metaPriority}>{task.priority}</MetaRow>}
-              {task.tenant && <MetaRow label={k.metaTenant}>{task.tenant}</MetaRow>}
-              {task.workspace_path && (
-                <MetaRow label={k.workspace}>
-                  {task.workspace_kind ? `${task.workspace_kind}: ` : ''}
-                  {task.workspace_path}
+            <CtaBanner
+              events={detail.events}
+              onFocusComment={() => {
+                const el = document.querySelector<HTMLElement>('[data-kanban-comment-input="true"]')
+
+                el?.scrollIntoView({ behavior: 'smooth', block: 'nearest' })
+                el?.focus()
+              }}
+              onMove={move}
+              task={task}
+            />
+
+            <div className="flex flex-col gap-1.5 opacity-80">
+              <div className={FIELD_LABEL}>{k.metaSectionLabel}</div>
+              <div className="grid grid-cols-[6rem_minmax(0,1fr)] gap-x-3 gap-y-1 text-[0.71rem]">
+                <MetaRow label={k.assignee}>
+                  <AssigneeMenu
+                    current={task.assignee}
+                    onReassign={profile => void mutate(() => reassignTask(task.id, profile))()}
+                  />
                 </MetaRow>
-              )}
-              <MetaRow label={k.model}>
-                <ModelOverrideField
-                  onChange={next => void mutate(() => patchTask(task.id, overridePatch(next)))()}
-                  value={{
-                    effort: task.reasoning_effort ?? '',
-                    model: task.model_override ?? '',
-                    provider: task.provider_override ?? ''
-                  }}
-                />
-              </MetaRow>
-              {task.created_by && <MetaRow label={k.metaCreatedBy}>{task.created_by}</MetaRow>}
-              {ago(task.created_at) && <MetaRow label={k.metaCreated}>{ago(task.created_at)}</MetaRow>}
-              {running && task.worker_pid ? <MetaRow label={k.metaWorkerPid}>{task.worker_pid}</MetaRow> : null}
+                {typeof task.priority === 'number' && <MetaRow label={k.metaPriority}>{task.priority}</MetaRow>}
+                {task.tenant && <MetaRow label={k.metaTenant}>{task.tenant}</MetaRow>}
+                {task.workspace_path && (
+                  <MetaRow label={k.workspace}>
+                    {task.workspace_kind ? `${task.workspace_kind}: ` : ''}
+                    {task.workspace_path}
+                  </MetaRow>
+                )}
+                <MetaRow label={k.model}>
+                  <ModelOverrideField
+                    onChange={next => void mutate(() => patchTask(task.id, overridePatch(next)))()}
+                    value={{
+                      effort: task.reasoning_effort ?? '',
+                      model: task.model_override ?? '',
+                      provider: task.provider_override ?? ''
+                    }}
+                  />
+                </MetaRow>
+                {task.created_by && <MetaRow label={k.metaCreatedBy}>{task.created_by}</MetaRow>}
+                {ago(task.created_at) && <MetaRow label={k.metaCreated}>{ago(task.created_at)}</MetaRow>}
+                {running && task.worker_pid ? <MetaRow label={k.metaWorkerPid}>{task.worker_pid}</MetaRow> : null}
+              </div>
             </div>
 
             {task.status === 'ready' && !task.assignee && !defaultAssignee && (

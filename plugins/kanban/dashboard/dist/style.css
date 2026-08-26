@@ -1591,3 +1591,77 @@
 .hermes-kanban-trash-label {
   font-weight: 500;
 }
+
+/* ---------------------------------------------------------------------- */
+/* Task detail CTA — the loud, top-of-drawer banner that answers "why is  */
+/* this stuck and what do I do about it" for blocked/review/needs-input   */
+/* tasks. Louder than a diagnostic card: full border + tinted fill, not   */
+/* just a left rule, so it reads as the ONE thing asking for action.      */
+/* ---------------------------------------------------------------------- */
+
+.hermes-kanban-cta {
+  display: flex;
+  flex-direction: column;
+  gap: 0.5rem;
+  padding: 0.65rem 0.75rem;
+  border-radius: 0.5rem;
+  border: 1px solid;
+}
+
+.hermes-kanban-cta-head {
+  display: flex;
+  align-items: center;
+  gap: 0.4rem;
+}
+
+.hermes-kanban-cta-icon { font-size: 0.9rem; line-height: 1; }
+
+.hermes-kanban-cta-title {
+  font-size: 0.85rem;
+  font-weight: 700;
+}
+
+.hermes-kanban-cta-body {
+  font-size: 0.8rem;
+  line-height: 1.45;
+  color: var(--color-foreground);
+}
+
+.hermes-kanban-cta-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.4rem;
+}
+
+.hermes-kanban-cta--blocked {
+  border-color: rgba(255, 107, 61, 0.45);
+  background: rgba(255, 107, 61, 0.09);
+}
+.hermes-kanban-cta--blocked .hermes-kanban-cta-icon,
+.hermes-kanban-cta--blocked .hermes-kanban-cta-title {
+  color: var(--hermes-diag-error, #ff6b3d);
+}
+
+.hermes-kanban-cta--transient {
+  border-color: rgba(255, 158, 59, 0.45);
+  background: rgba(255, 158, 59, 0.09);
+}
+.hermes-kanban-cta--transient .hermes-kanban-cta-icon,
+.hermes-kanban-cta--transient .hermes-kanban-cta-title {
+  color: var(--hermes-diag-warning, #ff9e3b);
+}
+
+.hermes-kanban-cta--review {
+  border-color: rgba(251, 191, 36, 0.45);
+  background: rgba(251, 191, 36, 0.09);
+}
+.hermes-kanban-cta--review .hermes-kanban-cta-icon,
+.hermes-kanban-cta--review .hermes-kanban-cta-title {
+  color: #d69e00;
+}
+
+/* De-emphasise the meta table relative to the CTA — it's supporting detail,
+   not the thing the user needs to act on. */
+.hermes-kanban-drawer-meta {
+  opacity: 0.85;
+}

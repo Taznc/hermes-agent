@@ -3892,6 +3892,7 @@
               onClick: function () { props.setEditing(true); },
             }, t.title || tx(i18n, "untitled", "(untitled)")),
       ),
+      h(CtaBanner, { task: t, events: events, onPatch: props.onPatch }),
       h("div", { className: "hermes-kanban-drawer-meta" },
         h(MetaRow, { label: tx(i18n, "status", "Status"), value: t.status }),
         h(AssigneeEditor, { task: t, onPatch: props.onPatch }),
@@ -4206,6 +4207,102 @@
       h("span", { className: "hermes-kanban-meta-label" }, props.label),
       h("span", { className: "hermes-kanban-meta-value" }, props.value),
     );
+  }
+
+  // The reason text on the most recent `blocked` event, if any — the
+  // worker's own explanation for why the task is stuck, surfaced verbatim
+  // in the CTA banner instead of making the user dig through Events for it.
+  function _latestBlockReason(events) {
+    for (let i = events.length - 1; i >= 0; i--) {
+      const e = events[i];
+      if (e.kind === "blocked" || e.kind === "block_loop_detected") {
+        const p = e.payload;
+        if (p && typeof p === "object" && typeof p.reason === "string" && p.reason) {
+          return p.reason;
+        }
+        return null;
+      }
+    }
+    return null;
+  }
+
+  const BLOCK_KIND_LABEL = {
+    dependency: "waitingOnDependency",
+    needs_input: "needsYourInput",
+    capability: "missingCapability",
+    transient: "transientFailure",
+  };
+  const BLOCK_KIND_FALLBACK = {
+    dependency: "Waiting on a dependency",
+    needs_input: "Needs your input",
+    capability: "Missing a capability",
+    transient: "Hit a transient failure",
+  };
+
+  // The task detail view's top-of-drawer call to action: the answer to "why
+  // is this stuck and what do I do about it", rendered once above everything
+  // else whenever the task needs a human decision right now (blocked or
+  // parked in review). Everything below stays informational.
+  function CtaBanner(props) {
+    const { t } = useI18n();
+    const task = props.task;
+    const events = props.events || [];
+
+    if (task.status === "blocked") {
+      const kind = task.block_kind || null;
+      const reason = _latestBlockReason(events);
+      const cls = kind === "transient" ? "hermes-kanban-cta--transient" : "hermes-kanban-cta--blocked";
+      const icon = kind === "needs_input" ? "?" : kind === "transient" ? "\u21BB" : "!!";
+      const title = kind
+        ? tx(t, "cta." + BLOCK_KIND_LABEL[kind], BLOCK_KIND_FALLBACK[kind])
+        : tx(t, "cta.blockedTitle", "Blocked — needs your input");
+      return h("div", { className: cn("hermes-kanban-cta", cls) },
+        h("div", { className: "hermes-kanban-cta-head" },
+          h("span", { className: "hermes-kanban-cta-icon" }, icon),
+          h("span", { className: "hermes-kanban-cta-title" }, title),
+        ),
+        h("div", { className: "hermes-kanban-cta-body" },
+          reason || tx(t, "cta.blockedNoReason", "The worker blocked this task but did not record a reason.")),
+        h("div", { className: "hermes-kanban-cta-actions" },
+          h(Button, {
+            size: "sm",
+            onClick: function () {
+              const ta = document.querySelector(".hermes-kanban-drawer-comment-row input, .hermes-kanban-drawer-comment-row textarea");
+              if (ta) { ta.scrollIntoView({ behavior: "smooth", block: "nearest" }); ta.focus(); }
+            },
+          }, tx(t, "cta.reply", "Reply")),
+          h(Button, {
+            size: "sm",
+            variant: "outline",
+            onClick: function () { props.onPatch({ status: "ready" }); },
+          }, tx(t, "unblock", "Unblock")),
+        ),
+      );
+    }
+
+    if (task.status === "review") {
+      return h("div", { className: "hermes-kanban-cta hermes-kanban-cta--review" },
+        h("div", { className: "hermes-kanban-cta-head" },
+          h("span", { className: "hermes-kanban-cta-icon" }, "\u{1F441}"),
+          h("span", { className: "hermes-kanban-cta-title" }, tx(t, "cta.reviewTitle", "Needs review")),
+        ),
+        h("div", { className: "hermes-kanban-cta-body" },
+          tx(t, "cta.reviewBody", "A reviewer should check the work below before this is marked done.")),
+        h("div", { className: "hermes-kanban-cta-actions" },
+          h(Button, {
+            size: "sm",
+            onClick: function () { props.onPatch({ status: "done" }, { confirm: getDestructiveConfirm(t, "done") }); },
+          }, tx(t, "cta.approve", "Approve (mark done)")),
+          h(Button, {
+            size: "sm",
+            variant: "outline",
+            onClick: function () { props.onPatch({ status: "ready" }); },
+          }, tx(t, "cta.sendBack", "Send back to Ready")),
+        ),
+      );
+    }
+
+    return null;
   }
 
   function TitleEditor(props) {
