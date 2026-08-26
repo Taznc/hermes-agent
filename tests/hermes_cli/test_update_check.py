@@ -33,6 +33,56 @@ def test_check_for_updates_uses_cache(tmp_path, monkeypatch):
     mock_run.assert_not_called()
 
 
+def test_check_for_updates_disabled_via_hermes_dev_env(tmp_path, monkeypatch):
+    """HERMES_DEV=1 must short-circuit before any cache read or subprocess call."""
+    from hermes_cli.banner import check_for_updates
+    from hermes_cli import __version__
+
+    repo_dir = tmp_path / "hermes-agent"
+    repo_dir.mkdir()
+    (repo_dir / ".git").mkdir()
+
+    # Even a fresh cache claiming "3 behind" must be ignored — dev mode wins.
+    cache_file = tmp_path / ".update_check"
+    cache_file.write_text(json.dumps({"ts": time.time(), "behind": 3, "ver": __version__}))
+
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    monkeypatch.setenv("HERMES_DEV", "1")
+    with patch("hermes_cli.banner.subprocess.run") as mock_run:
+        result = check_for_updates()
+
+    assert result is None
+    mock_run.assert_not_called()
+
+
+def test_check_for_updates_disabled_via_config_flag(tmp_path, monkeypatch):
+    """``updates.check_for_updates: false`` in config.yaml disables the check."""
+    from hermes_cli.banner import check_for_updates
+
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    monkeypatch.delenv("HERMES_DEV", raising=False)
+
+    with patch(
+        "hermes_cli.config.load_config_readonly",
+        return_value={"updates": {"check_for_updates": False}},
+    ):
+        with patch("hermes_cli.banner.subprocess.run") as mock_run:
+            result = check_for_updates()
+
+    assert result is None
+    mock_run.assert_not_called()
+
+
+def test_update_checks_disabled_defaults_to_false(monkeypatch):
+    """With no env guard and default config, checks are NOT disabled."""
+    from hermes_cli.banner import _update_checks_disabled
+
+    monkeypatch.delenv("HERMES_DEV", raising=False)
+    with patch(
+        "hermes_cli.config.load_config_readonly",
+        return_value={"updates": {"check_for_updates": True}},
+    ):
+        assert _update_checks_disabled() is False
 
 
 

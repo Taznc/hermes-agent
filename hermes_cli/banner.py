@@ -142,6 +142,37 @@ _UPSTREAM_REPO_URL = "https://github.com/NousResearch/hermes-agent.git"
 _OFFICIAL_REPO_CANONICAL = "github.com/nousresearch/hermes-agent"
 
 
+def _update_checks_disabled() -> bool:
+    """True when automatic/cached upstream update checks should be skipped.
+
+    Two independent guards, either is sufficient:
+
+    - ``HERMES_DEV=1`` — the existing dev-mode env guard used elsewhere in
+      the codebase (e.g. ``get_container_exec_info``) for "I'm running a
+      local checkout directly, skip machinery meant for managed/packaged
+      installs". A dev build contacting upstream on every startup just to
+      report "N commits behind" is exactly that kind of noise.
+    - ``updates.check_for_updates: false`` in config — an explicit,
+      persistent opt-out that doesn't depend on the environment.
+
+    This is the single choke point ``check_for_updates()`` gates on, so it
+    covers every caller: the startup banner prefetch, ``hermes --version``,
+    the TUI gateway prefetch, and the dashboard's cached System-page check.
+    Never raises — a config read failure falls back to checks enabled.
+    """
+    if os.environ.get("HERMES_DEV") == "1":
+        return True
+    try:
+        from hermes_cli.config import load_config_readonly
+
+        updates_cfg = load_config_readonly().get("updates") or {}
+        if updates_cfg.get("check_for_updates") is False:
+            return True
+    except Exception:
+        pass
+    return False
+
+
 def _canonical_github_remote(url: str | None) -> str:
     """Return ``host/owner/repo`` for common GitHub remote URL forms."""
     if not url:
@@ -397,6 +428,13 @@ def check_for_updates() -> Optional[int]:
     cache_file = hermes_home / ".update_check"
     embedded_rev = os.environ.get("HERMES_REVISION") or None
 
+    if _update_checks_disabled():
+        # Dev build / explicit opt-out: never contact upstream. Returning
+        # None (not 0) is deliberate — it means "unknown", same as the
+        # existing offline/no-checkout paths below, rather than falsely
+        # implying we verified the checkout is current.
+        return None
+
     # Docker images have no working tree to count commits against — the
     # published image excludes `.git` (see .dockerignore) and sets no
     # HERMES_REVISION (that's nix-only). Returning None makes both the Rich
@@ -640,7 +678,18 @@ _update_check_done = threading.Event()
 
 
 def prefetch_update_check():
-    """Kick off update check in a background daemon thread."""
+    """Kick off update check in a background daemon thread.
+
+    No-ops entirely (never spawns the thread, never touches the network)
+    when ``_update_checks_disabled()`` — dev build or explicit config
+    opt-out. ``_update_result`` stays ``None`` and ``_update_check_done``
+    stays set so callers that wait on it don't block.
+    """
+    if _update_checks_disabled():
+        global _update_result
+        _update_result = None
+        _update_check_done.set()
+        return
     def _run():
         global _update_result
         _update_result = check_for_updates()

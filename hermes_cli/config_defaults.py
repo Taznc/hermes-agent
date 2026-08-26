@@ -3329,6 +3329,17 @@ DEFAULT_CONFIG = {
 
     # ``hermes update`` behaviour.
     "updates": {
+        # Whether Hermes may check upstream (GitHub) for newer commits/
+        # releases at all — the startup banner prefetch, `hermes --version`,
+        # the TUI gateway prefetch, and the dashboard's cached (non-forced)
+        # System-page check all route through this one flag. Set to false
+        # to fully silence upstream contact for update checks, e.g. on a
+        # local dev build/fork where "you're behind main" noise is not
+        # wanted. `HERMES_DEV=1` (the existing local-checkout dev-mode
+        # env guard) disables the same checks unconditionally, without
+        # needing a config edit. Does not affect `hermes update` itself,
+        # which is always an explicit user action.
+        "check_for_updates": True,
         # Pre-update safety backup — ONE consolidated mechanism, three modes:
         #
         #   quick (default) — snapshot critical small state files (pairing
