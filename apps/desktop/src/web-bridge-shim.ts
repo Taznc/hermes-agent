@@ -22,12 +22,30 @@ import { markWebReloadPending, registerNativeWebReload } from '@/store/web-reloa
 // reload first (the "Refresh" statusbar item calls it back), then replace
 // `location.reload` with a flag flip. Gated on DEV so this never ships in a
 // production web build. See docs/web-ui-hard-refresh-diagnosis.md.
+//
+// `Object.defineProperty(window.location, 'reload', ...)` THROWS in Chrome
+// ("Cannot redefine property: reload") — `Location` is a platform exotic
+// object and its own-property redefinition is spec-restricted in ways that
+// differ from a plain object, regardless of `configurable: true` on the
+// descriptor you pass. That throw happens at module-eval time, before this
+// file reaches its `window.hermesDesktop = shim` assignment below — so the
+// WHOLE bridge silently fails to install and every `window.hermesDesktop.*`
+// call in the app crashes. A missing capability must degrade to a disabled
+// state, never take down the app that's supposed to host it — so this is
+// wrapped: if the browser won't let us trap the reload, the manual "Refresh"
+// button never appears and Vite's original auto-reload behavior continues
+// (the pre-existing state this feature set out to improve on, not a new
+// failure mode).
 if (import.meta.env.DEV) {
-  registerNativeWebReload(window.location.reload.bind(window.location))
-  Object.defineProperty(window.location, 'reload', {
-    configurable: true,
-    value: () => markWebReloadPending()
-  })
+  try {
+    registerNativeWebReload(window.location.reload.bind(window.location))
+    Object.defineProperty(window.location, 'reload', {
+      configurable: true,
+      value: () => markWebReloadPending()
+    })
+  } catch {
+    // Trap unsupported in this browser — leave native reload() in place.
+  }
 }
 
 // Self-contained minimal types (structural subsets of src/global.d.ts shapes;
