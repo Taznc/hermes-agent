@@ -3601,6 +3601,16 @@ DEFAULT_CONFIG = {
         # every invocation (MCP backend, status, doctor, install). Set true
         # to let cua-driver use its own default (telemetry on).
         "cua_telemetry": False,
+        # Whether the backend may background-check trycua/cua's GitHub
+        # Releases for a newer cua-driver build (`_maybe_nudge_update()`,
+        # once per process, ~20h cache) and log a one-line nudge. This is a
+        # distinct upstream contact point from Hermes' own `updates.
+        # check_for_updates` — it asks about the third-party driver
+        # binary, not Hermes itself. `HERMES_DEV=1` (the existing
+        # local-checkout dev-mode env guard) disables it unconditionally
+        # too. Explicit `hermes computer-use status`/`install --upgrade`
+        # checks are user-initiated and always run regardless of this flag.
+        "check_for_driver_updates": True,
         # Cap driver screenshot longest edge (pixels) via set_config on
         # session start. Shrinks SOM multimodal payloads; 0 disables.
         "max_image_dimension": 1456,
