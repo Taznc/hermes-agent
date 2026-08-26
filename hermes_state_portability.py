@@ -19,6 +19,7 @@ from hermes_state_common import (
     _PREVIEW_ELIGIBLE_SQL,
     _PREVIEW_RAW_SELECT,
     _shape_preview,
+    _sql_served_route_column,
     _sql_session_last_active,
 )
 
@@ -197,7 +198,9 @@ class SessionPortabilityMixin:
                      ORDER BY m.timestamp, m.id LIMIT 1),
                     ''
                 ) AS _preview_raw,
-                {_sql_session_last_active("s")} AS last_active
+                {_sql_session_last_active("s")} AS last_active,
+                {_sql_served_route_column("s", "model")} AS served_model,
+                {_sql_served_route_column("s", "billing_provider")} AS served_provider
             FROM sessions s
             {prompt_join}
             WHERE s.id IN ({placeholders})
@@ -209,6 +212,7 @@ class SessionPortabilityMixin:
         for row in rows:
             s = self._session_row_dict(row)
             s["preview"] = _shape_preview(s.pop("_preview_raw", ""))
+            s["configured_provider"] = self._configured_provider_for_row(s)
             result[s["id"]] = s
         return result
 

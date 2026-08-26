@@ -8216,6 +8216,20 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
             return {"provider": billing_provider}
         return {k: v for k, v in (runtime or {}).items() if v is not None} if isinstance(runtime, dict) else {}
 
+    @classmethod
+    def _configured_provider_for_row(cls, session_meta: Optional[Dict[str, Any]]) -> Optional[str]:
+        """Resolve just the provider string ``session_gateway_runtime`` would
+        use for the next turn/resume of this session row.
+
+        Thin projection for list/compact-row consumers (Desktop sidebar
+        Phase 2.13) that need the *configured* identity without threading the
+        full runtime dict or the raw ``model_config`` blob out to callers.
+        Returns ``None`` when unresolvable (a legacy row with no route
+        recorded at all — resume would fall back to ambient config).
+        """
+        provider = str(cls.session_gateway_runtime(session_meta).get("provider") or "").strip()
+        return provider or None
+
     def update_session_billing_route(
         self,
         session_id: str,
