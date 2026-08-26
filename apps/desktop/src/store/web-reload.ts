@@ -64,6 +64,7 @@ export function registerNativeWebReload(fn: () => void): void {
 export function performWebReload(): void {
   if (nativeReload) {
     nativeReload()
+
     return
   }
 

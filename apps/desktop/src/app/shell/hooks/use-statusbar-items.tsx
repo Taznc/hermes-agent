@@ -41,7 +41,6 @@ import { $focusedRuntimeId, $focusedSessionState, $focusedStoredSessionId } from
 import { $statusbarHiddenIds } from '@/store/statusbar-prefs'
 import { $subagentsBySession, activeSubagentCount, failedSubagentCount } from '@/store/subagents'
 import { $gatewayRestarting } from '@/store/system-actions'
-import { $webReloadPending, performWebReload } from '@/store/web-reload'
 import {
   $backendUpdateApply,
   $backendUpdateStatus,
@@ -50,6 +49,7 @@ import {
   $updateStatus,
   openUpdateOverlayFor
 } from '@/store/updates'
+import { $webReloadPending, performWebReload } from '@/store/web-reload'
 import type { StatusResponse, UsageStats } from '@/types/hermes'
 
 import { CRON_ROUTE, SETTINGS_ROUTE, WEBHOOKS_ROUTE } from '../../routes'
