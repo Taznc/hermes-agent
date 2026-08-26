@@ -62,6 +62,9 @@ type KanbanMessages = {
   titlePlaceholder: string
   descPlaceholder: string
   priority: string
+  markHighPriority: string
+  removeHighPriority: string
+  highPriorityTip: string
   workspace: string
   boardDefaultSuffix: string
   workspaceOverride: string
@@ -262,6 +265,9 @@ export const en: KanbanMessages = {
   titlePlaceholder: 'Title',
   descPlaceholder: 'Description (optional)',
   priority: 'Priority',
+  markHighPriority: 'Mark high priority',
+  removeHighPriority: 'Remove high priority',
+  highPriorityTip: 'High priority — claimed and shown first in its column.',
   workspace: 'Workspace',
   boardDefaultSuffix: ' · board default',
   workspaceOverride: 'Workspace path (optional override)',
@@ -464,6 +470,9 @@ const ja: KanbanMessages = {
   titlePlaceholder: 'タイトル',
   descPlaceholder: '説明（任意）',
   priority: '優先度',
+  markHighPriority: '優先度を高に設定',
+  removeHighPriority: '優先度の高設定を解除',
+  highPriorityTip: '優先度高 — このタスクを最初に取得・列の先頭に表示します。',
   workspace: 'ワークスペース',
   boardDefaultSuffix: '・ボード既定',
   workspaceOverride: 'ワークスペースパス（任意の上書き）',
@@ -664,6 +673,9 @@ const zh: KanbanMessages = {
   titlePlaceholder: '标题',
   descPlaceholder: '描述（可选）',
   priority: '优先级',
+  markHighPriority: '标记为高优先级',
+  removeHighPriority: '取消高优先级',
+  highPriorityTip: '高优先级 — 会被优先领取，并显示在所在列的最前面。',
   workspace: '工作区',
   boardDefaultSuffix: '・面板默认',
   workspaceOverride: '工作区路径（可选覆盖）',
@@ -862,6 +874,9 @@ const zhHant: KanbanMessages = {
   titlePlaceholder: '標題',
   descPlaceholder: '描述（選填）',
   priority: '優先順序',
+  markHighPriority: '標記為高優先順序',
+  removeHighPriority: '取消高優先順序',
+  highPriorityTip: '高優先順序 — 會被優先領取，並顯示在所在欄的最前面。',
   workspace: '工作區',
   boardDefaultSuffix: '・面板預設',
   workspaceOverride: '工作區路徑（選填覆寫）',

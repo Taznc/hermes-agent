@@ -133,6 +133,23 @@ function removeCard(board: KanbanBoard, id: string): KanbanBoard {
   return { ...board, columns: board.columns.map(col => ({ ...col, tasks: col.tasks.filter(t => t.id !== id) })) }
 }
 
+// High-priority is a boolean affordance on top of the integer `priority`
+// field (0 = normal, 1 = high) — the backend already sorts priority DESC
+// within a column, so flipping this also pins the card to the top on the
+// next refresh without any client-side re-sort.
+const HIGH_PRIORITY = 1
+const isHighPriority = (task: KanbanTask) => typeof task.priority === 'number' && task.priority > 0
+
+function setPriorityCard(board: KanbanBoard, id: string, priority: number): KanbanBoard {
+  return {
+    ...board,
+    columns: board.columns.map(col => ({
+      ...col,
+      tasks: col.tasks.map(task => (task.id === id ? { ...task, priority } : task))
+    }))
+  }
+}
+
 // ── card ─────────────────────────────────────────────────────────────────────
 
 function Meta({ children, icon }: { children: ReactNode; icon: string }) {
@@ -211,8 +228,8 @@ function CardFooter({ arc, task }: { arc: ArcState | null; task: KanbanTask }) {
       <div className="ml-auto flex min-w-0 shrink items-center gap-2">
         {typeof task.priority === 'number' && task.priority > 0 && (
           <span className="inline-flex items-center gap-0.5 text-amber-500">
-            <Codicon name="arrow-up" size="0.7rem" />
-            {task.priority}
+            <Codicon name="star-full" size="0.7rem" />
+            {task.priority > 1 ? task.priority : null}
           </span>
         )}
         {task.progress && task.progress.total > 0 && (
@@ -243,6 +260,7 @@ function Card({
   onMove,
   onOpen,
   onToggleSelect,
+  onTogglePriority,
   selected,
   task
 }: {
@@ -251,6 +269,7 @@ function Card({
   onMove: (id: string, status: string) => void
   onOpen: (id: string) => void
   onToggleSelect: (id: string) => void
+  onTogglePriority: (id: string, next: boolean) => void
   selected: boolean
   task: KanbanTask
 }) {
@@ -260,6 +279,7 @@ function Card({
   const summary = task.latest_summary || task.body
   const fallback = useDefaultAssignee()
   const arc = arcState(task, fallback)
+  const highPriority = isHighPriority(task)
 
   return (
     <ContextMenu>
@@ -271,6 +291,11 @@ function Card({
             // selected = the theme's focus color (same as a focused input).
             'transition-colors hover:bg-primary/[0.06] active:cursor-grabbing',
             selected && 'border-(--dt-composer-ring) bg-[color-mix(in_srgb,var(--dt-composer-ring)_7%,transparent)]',
+            // High priority gets a warm wash so it reads as distinct even when
+            // scanning quickly, on top of the star badge and left-border tint.
+            highPriority &&
+              !selected &&
+              'bg-[color-mix(in_srgb,#fbbf24_5%,var(--ui-bg-elevated))] hover:bg-[color-mix(in_srgb,#fbbf24_9%,var(--ui-bg-elevated))]',
             dragging && 'opacity-40'
           )}
           draggable
@@ -284,7 +309,13 @@ function Card({
             event.dataTransfer.setDragImage(event.currentTarget, event.nativeEvent.offsetX, event.nativeEvent.offsetY)
             setDragging(true)
           }}
-          style={{ '--kanban-tone': meta.tone, borderLeftColor: meta.tone } as CSSProperties}
+          style={
+            {
+              '--kanban-tone': meta.tone,
+              borderLeftColor: highPriority ? '#f59e0b' : meta.tone,
+              borderLeftWidth: highPriority ? '3px' : undefined
+            } as CSSProperties
+          }
         >
           {/* Machine-activity arc: animates ONLY while an agent is actually on
               the card (claimed + working; amber when the heartbeat is gone).
@@ -294,7 +325,26 @@ function Card({
           {(arc === 'running' || arc === 'stale') && !dragging && !selected && (
             <span aria-hidden className={cn('kanban-arc', arc === 'stale' && 'kanban-arc--stale')} />
           )}
-          <span className="line-clamp-2 text-[0.8125rem] font-medium leading-snug text-foreground">
+          <Tip label={highPriority ? k.removeHighPriority : k.markHighPriority}>
+            <button
+              aria-label={highPriority ? k.removeHighPriority : k.markHighPriority}
+              aria-pressed={highPriority}
+              className={cn(
+                'absolute top-1.5 right-1.5 grid size-5 place-items-center rounded text-(--ui-text-quaternary) transition-opacity hover:bg-(--chrome-action-hover) hover:text-amber-500',
+                highPriority
+                  ? 'text-amber-500 opacity-100'
+                  : 'opacity-0 focus-visible:opacity-100 group-hover:opacity-100'
+              )}
+              onClick={event => {
+                event.stopPropagation()
+                onTogglePriority(task.id, !highPriority)
+              }}
+              type="button"
+            >
+              <Codicon name={highPriority ? 'star-full' : 'star-empty'} size="0.8rem" />
+            </button>
+          </Tip>
+          <span className="line-clamp-2 pr-5 text-[0.8125rem] font-medium leading-snug text-foreground">
             {task.title || task.id}
           </span>
           {summary && (
@@ -311,6 +361,10 @@ function Card({
         <ContextMenuItem onSelect={() => onToggleSelect(task.id)}>
           <Codicon name={selected ? 'close' : 'check-all'} size="0.85rem" />
           {selected ? k.deselect : k.select(formatModifierToken('mod'))}
+        </ContextMenuItem>
+        <ContextMenuItem onSelect={() => onTogglePriority(task.id, !highPriority)}>
+          <Codicon name={highPriority ? 'star-full' : 'star-empty'} size="0.85rem" />
+          {highPriority ? k.removeHighPriority : k.markHighPriority}
         </ContextMenuItem>
         <ContextMenuSeparator />
         {columns
@@ -344,6 +398,7 @@ function Column({
   onOpen,
   onToggle,
   onToggleSelect,
+  onTogglePriority,
   selected
 }: {
   collapsed: boolean
@@ -356,6 +411,7 @@ function Column({
   onOpen: (id: string) => void
   onToggle: () => void
   onToggleSelect: (id: string) => void
+  onTogglePriority: (id: string, next: boolean) => void
   selected: ReadonlySet<string>
 }) {
   const k = useKanban()
@@ -477,6 +533,7 @@ function Column({
                     onDelete={onDelete}
                     onMove={onMove}
                     onOpen={onOpen}
+                    onTogglePriority={onTogglePriority}
                     onToggleSelect={onToggleSelect}
                     selected={selected.has(task.id)}
                     task={task}
@@ -491,6 +548,7 @@ function Column({
                 onDelete={onDelete}
                 onMove={onMove}
                 onOpen={onOpen}
+                onTogglePriority={onTogglePriority}
                 onToggleSelect={onToggleSelect}
                 selected={selected.has(task.id)}
                 task={task}
@@ -1232,6 +1290,36 @@ export function KanbanBoardPage() {
     onSettled: () => void qc.invalidateQueries({ queryKey: ['kanban', 'board'] })
   })
 
+  // Toggling the star only ever touches `priority` — never status, title, or
+  // any other field — so a rejected write can't be mistaken for a bigger
+  // failure, and the optimistic patch below is safe to apply in isolation.
+  const priorityMut = useMutation({
+    mutationFn: ({ id, priority }: { id: string; priority: number }) => patchTask(id, { priority }),
+    onMutate: async ({ id, priority }) => {
+      await qc.cancelQueries({ queryKey: boardKey(slug, archived) })
+      const previous = qc.getQueryData<KanbanBoard>(boardKey(slug, archived))
+
+      if (previous) {
+        qc.setQueryData(boardKey(slug, archived), setPriorityCard(previous, id, priority))
+      }
+
+      return { previous }
+    },
+    onError: (err, _vars, context) => {
+      if (context?.previous) {
+        qc.setQueryData(boardKey(slug, archived), context.previous)
+      }
+
+      host.notify({ kind: 'error', message: errText(err) })
+    },
+    onSettled: (_data, _err, vars) => {
+      void qc.invalidateQueries({ queryKey: ['kanban', 'board'] })
+      void qc.invalidateQueries({ queryKey: ['kanban', 'task', slug, vars.id] })
+    }
+  })
+
+  const onTogglePriority = (id: string, next: boolean) => priorityMut.mutate({ id, priority: next ? HIGH_PRIORITY : 0 })
+
   const onMove = (id: string, status: string) => {
     const task = board?.columns.flatMap(col => col.tasks).find(candidate => candidate.id === id)
 
@@ -1407,6 +1495,7 @@ export function KanbanBoardPage() {
                 onMove={onMove}
                 onOpen={setOpenId}
                 onToggle={() => toggleLane(col.name, auto)}
+                onTogglePriority={onTogglePriority}
                 onToggleSelect={toggleSelect}
                 selected={selected}
               />
