@@ -227,3 +227,132 @@ def test_redeem_missing_credentials_reports_unavailable(monkeypatch):
 
     assert result.status == "unavailable"
     assert "hermes auth" in result.message
+
+
+def test_codex_usage_keeps_blocked_state_window_metadata_and_safe_balance(monkeypatch):
+    payload = {
+        "plan_type": "plus",
+        "email": "private@example.com",
+        "account_id": "acct_private",
+        "user_id": "user_private",
+        "rate_limit": {
+            "allowed": False,
+            "limit_reached": True,
+            "primary_window": {
+                "used_percent": 100,
+                "reset_at": 1_900_000_000,
+                "limit_window_seconds": 18_000,
+            },
+            "secondary_window": None,
+        },
+        "code_review_rate_limit": {
+            "used_percent": 64,
+            "reset_at": 1_900_010_000,
+            "limit_window_seconds": 604_800,
+        },
+        "credits": {"has_credits": True, "balance": 12.5},
+    }
+    monkeypatch.setattr(account_usage, "resolve_codex_runtime_credentials", lambda **kwargs: {
+        "api_key": "access-token", "base_url": "https://chatgpt.com/backend-api/codex"
+    })
+    monkeypatch.setattr(account_usage, "_read_codex_tokens", lambda: {"tokens": {}})
+    monkeypatch.setattr(account_usage.httpx, "Client", lambda timeout: _FakeClient([], payload))
+
+    snapshot = account_usage.fetch_account_usage("openai-codex")
+
+    assert snapshot is not None
+    assert snapshot.allowed is False
+    assert snapshot.limit_reached is True
+    assert snapshot.windows[0].limit_window_seconds == 18_000
+    assert snapshot.windows[0].limit_reached is True
+    assert snapshot.windows[1].label == "Code review"
+    assert snapshot.windows[1].limit_window_seconds == 604_800
+    assert snapshot.balances[0].label == "Credits"
+    assert snapshot.balances[0].remaining == 12.5
+    serialized = account_usage.serialize_account_usage(snapshot)
+    assert serialized["limit_reached"] is True
+    assert serialized["windows"][0]["limit_window_seconds"] == 18_000
+    assert serialized["balances"] == [{"label": "Credits", "remaining": 12.5, "currency": "USD"}]
+    assert "private@example.com" not in repr(serialized)
+    assert "acct_private" not in repr(serialized)
+    assert "user_private" not in repr(serialized)
+
+
+def test_codex_usage_supports_nested_code_review_windows(monkeypatch):
+    payload = {
+        "rate_limit": {},
+        "code_review_rate_limit": {
+            "primary_window": {"used_percent": 12, "reset_at": 1_900_000_000},
+            "secondary_window": {"used_percent": 55, "reset_at": 1_900_500_000},
+        },
+    }
+    monkeypatch.setattr(account_usage, "resolve_codex_runtime_credentials", lambda **kwargs: {
+        "api_key": "access-token", "base_url": "https://chatgpt.com/backend-api/codex"
+    })
+    monkeypatch.setattr(account_usage, "_read_codex_tokens", lambda: {"tokens": {}})
+    monkeypatch.setattr(account_usage.httpx, "Client", lambda timeout: _FakeClient([], payload))
+
+    snapshot = account_usage.fetch_account_usage("openai-codex")
+
+    assert snapshot is not None
+    assert [(window.label, window.used_percent) for window in snapshot.windows] == [
+        ("Code review session", 12.0),
+        ("Code review week", 55.0),
+    ]
+
+
+def test_anthropic_usage_maps_self_describing_limits_without_known_kind(monkeypatch):
+    payload = {
+        "limits": [
+            {
+                "kind": "tangelo",
+                "group": "seven_day",
+                "percent": 42,
+                "severity": "warning",
+                "is_active": True,
+                "resets_at": "2030-01-01T00:00:00Z",
+                "scope": {"model": "claude-opus-4"},
+            }
+        ],
+        "extra_usage": {"is_enabled": True, "used_credits": 3.5, "monthly_limit": 10, "currency": "USD"},
+    }
+    monkeypatch.setattr(account_usage, "resolve_anthropic_token", lambda: "sk-ant-oat01-token")
+    monkeypatch.setattr(account_usage.httpx, "Client", lambda timeout: _FakeClient([], payload))
+
+    snapshot = account_usage.fetch_account_usage("anthropic")
+
+    assert snapshot is not None
+    assert snapshot.windows[0].label == "Tangelo"
+    assert snapshot.windows[0].severity == "warning"
+    assert snapshot.windows[0].is_active is True
+    assert snapshot.windows[0].scope == "claude-opus-4"
+    assert snapshot.balances[0].label == "Extra usage"
+    assert snapshot.balances[0].used == 3.5
+    assert snapshot.balances[0].limit == 10.0
+
+
+def test_anthropic_usage_keeps_unknown_top_level_window(monkeypatch):
+    payload = {
+        "tangelo": {"utilization": 0.37, "resets_at": "2030-01-01T00:00:00Z"},
+        "future_provider_window": {"utilization": 88, "resets_at": "2030-01-02T00:00:00Z"},
+    }
+    monkeypatch.setattr(account_usage, "resolve_anthropic_token", lambda: "sk-ant-oat01-token")
+    monkeypatch.setattr(account_usage.httpx, "Client", lambda timeout: _FakeClient([], payload))
+
+    snapshot = account_usage.fetch_account_usage("anthropic")
+
+    assert snapshot is not None
+    assert [(window.label, window.used_percent) for window in snapshot.windows] == [
+        ("Tangelo", 37.0),
+        ("Future Provider Window", 88.0),
+    ]
+
+
+def test_fetch_account_limits_returns_a_sanitized_unavailable_snapshot(monkeypatch):
+    monkeypatch.setattr(account_usage, "fetch_account_usage", lambda provider: None)
+
+    snapshots = account_usage.fetch_account_limits(("anthropic", "openai-codex"))
+
+    assert [snapshot.provider for snapshot in snapshots] == ["anthropic", "openai-codex"]
+    assert all(snapshot.available is False for snapshot in snapshots)
+    assert all("No compatible" in (snapshot.unavailable_reason or "") for snapshot in snapshots)

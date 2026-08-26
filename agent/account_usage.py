@@ -28,6 +28,26 @@ class AccountUsageWindow:
     used_percent: Optional[float] = None
     reset_at: Optional[datetime] = None
     detail: Optional[str] = None
+    severity: Optional[str] = None
+    is_active: Optional[bool] = None
+    scope: Optional[str] = None
+    limit_window_seconds: Optional[int] = None
+    limit_reached: Optional[bool] = None
+
+
+@dataclass(frozen=True)
+class AccountUsageBalance:
+    """A sanitized provider balance suitable for UI rendering.
+
+    Provider responses can contain account identifiers beside balance fields;
+    this model intentionally has no identifier-bearing fields.
+    """
+
+    label: str
+    used: Optional[float] = None
+    limit: Optional[float] = None
+    remaining: Optional[float] = None
+    currency: Optional[str] = None
 
 
 @dataclass(frozen=True)
@@ -39,11 +59,59 @@ class AccountUsageSnapshot:
     plan: Optional[str] = None
     windows: tuple[AccountUsageWindow, ...] = ()
     details: tuple[str, ...] = ()
+    balances: tuple[AccountUsageBalance, ...] = ()
+    allowed: Optional[bool] = None
+    limit_reached: Optional[bool] = None
     unavailable_reason: Optional[str] = None
 
     @property
     def available(self) -> bool:
-        return bool(self.windows or self.details) and not self.unavailable_reason
+        return bool(self.windows or self.details or self.balances) and not self.unavailable_reason
+
+
+def serialize_account_usage(snapshot: AccountUsageSnapshot) -> dict[str, Any]:
+    """Return a JSON-safe, explicitly allowlisted account-limits payload."""
+
+    return {
+        "provider": snapshot.provider,
+        "source": snapshot.source,
+        "fetched_at": snapshot.fetched_at.isoformat(),
+        "title": snapshot.title,
+        "plan": snapshot.plan,
+        "available": snapshot.available,
+        "allowed": snapshot.allowed,
+        "limit_reached": snapshot.limit_reached,
+        "unavailable_reason": snapshot.unavailable_reason,
+        "details": list(snapshot.details),
+        "windows": [
+            {
+                "label": window.label,
+                "used_percent": window.used_percent,
+                "reset_at": window.reset_at.isoformat() if window.reset_at else None,
+                "detail": window.detail,
+                "severity": window.severity,
+                "is_active": window.is_active,
+                "scope": window.scope,
+                "limit_window_seconds": window.limit_window_seconds,
+                "limit_reached": window.limit_reached,
+            }
+            for window in snapshot.windows
+        ],
+        "balances": [
+            {
+                key: value
+                for key, value in {
+                    "label": balance.label,
+                    "used": balance.used,
+                    "limit": balance.limit,
+                    "remaining": balance.remaining,
+                    "currency": balance.currency,
+                }.items()
+                if value is not None
+            }
+            for balance in snapshot.balances
+        ],
+    }
 
 
 def _title_case_slug(value: Optional[str]) -> Optional[str]:
@@ -524,6 +592,7 @@ def _fetch_codex_account_usage(
         response.raise_for_status()
     payload = response.json() or {}
     rate_limit = payload.get("rate_limit") or {}
+    limit_reached = bool(rate_limit.get("limit_reached")) or rate_limit.get("allowed") is False
     windows: list[AccountUsageWindow] = []
     for key, label in (("primary_window", "Session"), ("secondary_window", "Weekly")):
         window = rate_limit.get(key) or {}
@@ -535,8 +604,53 @@ def _fetch_codex_account_usage(
                 label=label,
                 used_percent=float(used),
                 reset_at=_parse_dt(window.get("reset_at")),
+                limit_window_seconds=(
+                    int(window["limit_window_seconds"])
+                    if isinstance(window.get("limit_window_seconds"), (int, float))
+                    else None
+                ),
+                limit_reached=bool(window.get("limit_reached")) or limit_reached,
             )
         )
+    code_review_window = payload.get("code_review_rate_limit") or {}
+    code_review_used = code_review_window.get("used_percent")
+    if isinstance(code_review_used, (int, float)):
+        windows.append(
+            AccountUsageWindow(
+                label="Code review",
+                used_percent=float(code_review_used),
+                reset_at=_parse_dt(code_review_window.get("reset_at")),
+                limit_window_seconds=(
+                    int(code_review_window["limit_window_seconds"])
+                    if isinstance(code_review_window.get("limit_window_seconds"), (int, float))
+                    else None
+                ),
+                limit_reached=code_review_window.get("limit_reached")
+                if isinstance(code_review_window.get("limit_reached"), bool)
+                else None,
+            )
+        )
+    else:
+        for key, label in (("primary_window", "Code review session"), ("secondary_window", "Code review week")):
+            window = code_review_window.get(key) or {}
+            used = window.get("used_percent")
+            if not isinstance(used, (int, float)):
+                continue
+            windows.append(
+                AccountUsageWindow(
+                    label=label,
+                    used_percent=float(used),
+                    reset_at=_parse_dt(window.get("reset_at")),
+                    limit_window_seconds=(
+                        int(window["limit_window_seconds"])
+                        if isinstance(window.get("limit_window_seconds"), (int, float))
+                        else None
+                    ),
+                    limit_reached=code_review_window.get("limit_reached")
+                    if isinstance(code_review_window.get("limit_reached"), bool)
+                    else None,
+                )
+            )
     details: list[str] = []
     reset_credits = payload.get("rate_limit_reset_credits") or {}
     banked = reset_credits.get("available_count")
@@ -547,10 +661,12 @@ def _fetch_codex_account_usage(
             f"You have {count} reset{plural} banked - use /usage reset to activate"
         )
     credits = payload.get("credits") or {}
+    balances: list[AccountUsageBalance] = []
     if credits.get("has_credits"):
         balance = credits.get("balance")
         if isinstance(balance, (int, float)):
             details.append(f"Credits balance: ${float(balance):.2f}")
+            balances.append(AccountUsageBalance(label="Credits", remaining=float(balance), currency="USD"))
         elif credits.get("unlimited"):
             details.append("Credits balance: unlimited")
     return AccountUsageSnapshot(
@@ -560,6 +676,9 @@ def _fetch_codex_account_usage(
         plan=_title_case_slug(payload.get("plan_type")),
         windows=tuple(windows),
         details=tuple(details),
+        balances=tuple(balances),
+        allowed=rate_limit.get("allowed") if isinstance(rate_limit.get("allowed"), bool) else None,
+        limit_reached=limit_reached,
     )
 
 
@@ -771,26 +890,75 @@ def _fetch_anthropic_account_usage() -> Optional[AccountUsageSnapshot]:
         response.raise_for_status()
     payload = response.json() or {}
     windows: list[AccountUsageWindow] = []
-    mapping = (
-        ("five_hour", "Current session"),
-        ("seven_day", "Current week"),
-        ("seven_day_opus", "Opus week"),
-        ("seven_day_sonnet", "Sonnet week"),
-    )
-    for key, label in mapping:
-        window = payload.get(key) or {}
-        util = window.get("utilization")
-        if util is None:
+    raw_limits = payload.get("limits")
+    if isinstance(raw_limits, list):
+        for raw in raw_limits:
+            if not isinstance(raw, dict):
+                continue
+            used = raw.get("percent", raw.get("utilization"))
+            if not isinstance(used, (int, float)):
+                continue
+            used_percent = float(used) * 100 if float(used) <= 1 else float(used)
+            scope = raw.get("scope")
+            if isinstance(scope, dict):
+                scope = scope.get("model") or scope.get("name")
+            windows.append(
+                AccountUsageWindow(
+                    label=_title_case_slug(raw.get("kind")) or "Usage limit",
+                    used_percent=used_percent,
+                    reset_at=_parse_dt(raw.get("resets_at")),
+                    severity=str(raw["severity"]) if raw.get("severity") is not None else None,
+                    is_active=raw.get("is_active") if isinstance(raw.get("is_active"), bool) else None,
+                    scope=str(scope) if scope else None,
+                    limit_reached=raw.get("limit_reached") if isinstance(raw.get("limit_reached"), bool) else None,
+                )
+            )
+    else:
+        mapping = (
+            ("five_hour", "Current session"),
+            ("seven_day", "Current week"),
+            ("seven_day_opus", "Opus week"),
+            ("seven_day_sonnet", "Sonnet week"),
+        )
+        for key, label in mapping:
+            window = payload.get(key) or {}
+            util = window.get("utilization")
+            if util is None:
+                continue
+            used = float(util) * 100 if float(util) <= 1 else float(util)
+            windows.append(
+                AccountUsageWindow(
+                    label=label,
+                    used_percent=used,
+                    reset_at=_parse_dt(window.get("resets_at")),
+                )
+            )
+    known_window_keys = {
+        "limits",
+        "extra_usage",
+        "five_hour",
+        "seven_day",
+        "seven_day_opus",
+        "seven_day_sonnet",
+    }
+    for key, raw in payload.items():
+        if key in known_window_keys or not isinstance(raw, dict):
             continue
-        used = float(util) * 100 if float(util) <= 1 else float(util)
+        utilization = raw.get("utilization")
+        if not isinstance(utilization, (int, float)):
+            continue
+        used_percent = float(utilization) * 100 if float(utilization) <= 1 else float(utilization)
         windows.append(
             AccountUsageWindow(
-                label=label,
-                used_percent=used,
-                reset_at=_parse_dt(window.get("resets_at")),
+                label=_title_case_slug(key) or "Usage limit",
+                used_percent=used_percent,
+                reset_at=_parse_dt(raw.get("resets_at")),
+                severity=str(raw["severity"]) if raw.get("severity") is not None else None,
+                is_active=raw.get("is_active") if isinstance(raw.get("is_active"), bool) else None,
             )
         )
     details: list[str] = []
+    balances: list[AccountUsageBalance] = []
     extra = payload.get("extra_usage") or {}
     if extra.get("is_enabled"):
         used_credits = extra.get("used_credits")
@@ -800,12 +968,22 @@ def _fetch_anthropic_account_usage() -> Optional[AccountUsageSnapshot]:
             details.append(
                 f"Extra usage: {used_credits:.2f} / {monthly_limit:.2f} {currency}"
             )
+            balances.append(
+                AccountUsageBalance(
+                    label="Extra usage",
+                    used=float(used_credits),
+                    limit=float(monthly_limit),
+                    remaining=max(0.0, float(monthly_limit) - float(used_credits)),
+                    currency=str(currency),
+                )
+            )
     return AccountUsageSnapshot(
         provider="anthropic",
         source="oauth_usage_api",
         fetched_at=_utc_now(),
         windows=tuple(windows),
         details=tuple(details),
+        balances=tuple(balances),
     )
 
 
@@ -879,6 +1057,37 @@ def _fetch_openrouter_account_usage(base_url: Optional[str], api_key: Optional[s
         windows=tuple(windows),
         details=tuple(details),
     )
+
+
+def fetch_account_limits(
+    providers: Optional[tuple[str, ...]] = None,
+) -> tuple[AccountUsageSnapshot, ...]:
+    """Fetch the Desktop-safe account-limit view for supported providers.
+
+    This deliberately wraps the CLI's fail-open fetcher: a provider outage or
+    missing compatible credential becomes a per-provider unavailable snapshot,
+    never an exception that breaks another provider's display.
+    """
+
+    supported = ("anthropic", "openai-codex")
+    requested = providers or supported
+    normalized = tuple(str(provider or "").strip().lower() for provider in requested)
+    invalid = tuple(provider for provider in normalized if provider not in supported)
+    if invalid:
+        raise ValueError(f"Unsupported account-limit provider: {invalid[0]}")
+
+    snapshots: list[AccountUsageSnapshot] = []
+    for provider in normalized:
+        snapshot = fetch_account_usage(provider)
+        if snapshot is None:
+            snapshot = AccountUsageSnapshot(
+                provider=provider,
+                source="account_limits",
+                fetched_at=_utc_now(),
+                unavailable_reason="No compatible account credentials are configured for provider limits.",
+            )
+        snapshots.append(snapshot)
+    return tuple(snapshots)
 
 
 def fetch_account_usage(

@@ -363,6 +363,9 @@ _LONG_HANDLERS = frozenset(
         "shell.exec",
         "skills.manage",
         "slash.exec",
+        # Account limits make synchronous provider HTTP requests (the account
+        # fetcher bounds them, but they still must not stall the WS reader).
+        "account_limits.get",
     }
 )
 
@@ -16407,6 +16410,7 @@ def _mcp_summarize_server(name, cfg):  # noqa: E402
 # Imported at the end of this module so every global the handlers close
 # over already exists; register() rebinds them onto this namespace.
 from . import (  # noqa: E402
+    methods_account_limits as _methods_account_limits,
     methods_browser_control as _methods_browser_control,
     methods_bot_relay as _methods_bot_relay,
     methods_complete as _methods_complete,
@@ -16419,6 +16423,7 @@ from . import (  # noqa: E402
 )
 
 for _m in (
+    _methods_account_limits,
     _methods_browser_control,
     _methods_session,
     _methods_prompt,
