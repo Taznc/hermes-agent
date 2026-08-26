@@ -401,6 +401,15 @@ const IS_PACKAGED = app.isPackaged || Boolean(process.env.HERMES_DESKTOP_IS_PACK
 const IS_MAC = process.platform === 'darwin'
 const IS_WINDOWS = process.platform === 'win32'
 const IS_WSL = isWslEnvironment()
+// Gate for the desktop self-update checker (git ls-remote/fetch against
+// origin, plus the GitHub compare API). Bridged from `desktop.
+// auto_update_checks_enabled` in config.yaml by the `hermes desktop`
+// launcher (hermes_cli/main.py cmd_gui); an env var set directly (e.g. by a
+// dev running `electron .` outside the launcher) works the same way. Default
+// is checks ON — this only ever narrows behavior, never widens it.
+const UPDATE_CHECKS_DISABLED = ['1', 'true', 'yes', 'on'].includes(
+  String(process.env.HERMES_DESKTOP_DISABLE_UPDATE_CHECKS || '').trim().toLowerCase()
+)
 // Truthful macOS kernel major (Tahoe = 25). Product version lies (16 vs 26) per
 // build SDK, so gate Tahoe workarounds on Darwin instead.
 const DARWIN_MAJOR = IS_MAC ? Number.parseInt(os.release(), 10) || 0 : 0
@@ -2825,6 +2834,17 @@ async function resolveHealedBranch(updateRoot, branch) {
 }
 
 async function checkUpdates() {
+  if (UPDATE_CHECKS_DISABLED) {
+    return {
+      supported: false,
+      reason: 'update-checks-disabled',
+      message:
+        'Desktop update checks are disabled (desktop.auto_update_checks_enabled: false in config.yaml, or HERMES_DESKTOP_DISABLE_UPDATE_CHECKS).',
+      hermesRoot: resolveUpdateRoot(),
+      branch: readDesktopUpdateConfig().branch
+    }
+  }
+
   const updateRoot = resolveUpdateRoot()
   let { branch } = readDesktopUpdateConfig()
   const gitDir = path.join(updateRoot, '.git')
