@@ -41,6 +41,8 @@ vi.mock('@/store/settings-scope', async () => {
   const override = atom<null | string>(null)
 
   return {
+    // Same contract as the real module: `null` override means "follow the
+    // app's active profile", which maps to `undefined` on requests.
     $settingsScopeOverride: override,
     $settingsRequestProfile: computed(override, (o): string | undefined => o ?? undefined)
   }

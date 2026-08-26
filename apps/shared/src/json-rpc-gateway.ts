@@ -103,6 +103,14 @@ export class JsonRpcGatewayClient {
   private nextId = 0
   private pending = new Map<GatewayRequestId, PendingCall>()
   private socket: WebSocketLike | null = null
+  /**
+   * Rejects the in-flight connect() dial when its socket generation is
+   * abandoned (close()/invalidate()/server close) before open/error/timeout
+   * settles it. Settling clears the dial's connect-timeout timer, so an
+   * abandoned dial can never fire 15s later and publish 'error' over a newer
+   * healthy generation. Cleared whenever the dial settles.
+   */
+  private abortDial: ((error: Error) => void) | null = null
   private state: ConnectionState = 'idle'
   private heartbeatTimer: ReturnType<typeof setInterval> | null = null
   private heartbeatSequence = 0
@@ -177,7 +185,16 @@ export class JsonRpcGatewayClient {
       throw invalidUrl()
     }
 
-    if (this.socket?.readyState === WebSocket.OPEN || this.state === 'connecting') {
+    if (this.socket?.readyState === WebSocket.OPEN) {
+      // Redundant connect() against a healthy socket: republish 'open' so a
+      // wrongly latched state (e.g. 'error' from an older abandoned dial)
+      // heals instead of trapping callers in a no-op reconnect loop.
+      this.setState('open')
+
+      return
+    }
+
+    if (this.state === 'connecting') {
       return
     }
 
@@ -205,6 +222,10 @@ export class JsonRpcGatewayClient {
         return
       }
 
+      // Settle the in-flight dial BEFORE publishing 'closed': a state
+      // subscriber may synchronously start a new dial, and settling after
+      // would abort that new generation instead of this one.
+      this.settleDial(new Error(this.options.closedErrorMessage))
       this.socket = null
       this.stopHeartbeat()
       this.setState('closed')
@@ -220,12 +241,37 @@ export class JsonRpcGatewayClient {
           clearTimeout(timer)
         }
 
+        if (this.abortDial === abort) {
+          this.abortDial = null
+        }
+
         socket.removeEventListener('open', onOpen)
         socket.removeEventListener('error', onError)
       }
 
+      // Settle this dial locally — reject the promise, clear the timer,
+      // detach listeners — WITHOUT touching shared state. Used when this
+      // socket generation was abandoned (close()/invalidate()/server close):
+      // whoever abandoned it owns the published state, and a settled dial
+      // leaves no stale timer to fire 'error' over a newer generation later.
+      const abort = (error: Error) => {
+        if (settled) {
+          return
+        }
+
+        settled = true
+        cleanup()
+        reject(error)
+      }
+
       const onOpen = () => {
-        if (settled || this.socket !== socket) {
+        if (settled) {
+          return
+        }
+
+        if (this.socket !== socket) {
+          abort(new Error(this.options.closedErrorMessage))
+
           return
         }
 
@@ -240,7 +286,13 @@ export class JsonRpcGatewayClient {
       }
 
       const onError = () => {
-        if (settled || this.socket !== socket) {
+        if (settled) {
+          return
+        }
+
+        if (this.socket !== socket) {
+          abort(new Error(this.options.connectErrorMessage))
+
           return
         }
 
@@ -252,10 +304,20 @@ export class JsonRpcGatewayClient {
 
       socket.addEventListener('open', onOpen, { once: true })
       socket.addEventListener('error', onError, { once: true })
+      this.abortDial = abort
 
       if (this.options.connectTimeoutMs > 0) {
         timer = setTimeout(() => {
           if (settled) {
+            return
+          }
+
+          // Abandoned generation: a newer dial (or none) owns the shared
+          // state now. Settle locally only — publishing 'error' here is how
+          // a stale 15s timer used to break a healthy newer connection.
+          if (this.socket !== socket) {
+            abort(new Error(this.options.connectErrorMessage))
+
             return
           }
 
@@ -264,15 +326,13 @@ export class JsonRpcGatewayClient {
 
           // Drop the half-open socket so the next connect() starts clean
           // instead of short-circuiting on a zombie 'connecting' state.
-          if (this.socket === socket) {
-            try {
-              socket.close()
-            } catch {
-              // ignore
-            }
-
-            this.socket = null
+          try {
+            socket.close()
+          } catch {
+            // ignore
           }
+
+          this.socket = null
 
           this.setState('error')
           reject(new Error(this.options.connectErrorMessage))
@@ -291,6 +351,13 @@ export class JsonRpcGatewayClient {
     try {
       socket.close()
     } finally {
+      // Order matters: settle the abandoned dial before setState('closed')
+      // notifies subscribers, because a subscriber may synchronously redial
+      // and install a new dial that must NOT be aborted here. A real socket
+      // dispatches its 'close' event asynchronously, so waiting for that
+      // event would leave the dial pending (and its 15s timer live) —
+      // settle it at close() time instead.
+      this.settleDial(new Error(this.options.closedErrorMessage))
       this.socket = null
       this.stopHeartbeat()
       this.setState('closed')
@@ -696,6 +763,9 @@ export class JsonRpcGatewayClient {
       return
     }
 
+    // Settle this generation's dial before subscribers hear 'closed' — same
+    // ordering contract as close().
+    this.settleDial(error)
     this.socket = null
     this.stopHeartbeat()
 
@@ -707,6 +777,19 @@ export class JsonRpcGatewayClient {
 
     this.setState('closed')
     this.rejectAllPending(error)
+  }
+
+  /**
+   * Settle (reject) the in-flight connect() dial, if any, clearing its
+   * connect-timeout timer. Called on the abandonment paths — close(),
+   * invalidate(), server-initiated close — BEFORE state subscribers are
+   * notified, so a subscriber that synchronously redials installs a fresh
+   * dial that this settle cannot touch.
+   */
+  private settleDial(error: Error): void {
+    const abort = this.abortDial
+    this.abortDial = null
+    abort?.(error)
   }
 
   private clearPending(id: GatewayRequestId): void {

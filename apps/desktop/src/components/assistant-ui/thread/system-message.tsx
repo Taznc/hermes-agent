@@ -106,7 +106,6 @@ function ReviewActionsDisclosure({ actions }: { actions: ReviewActionRecord[] })
           {actions.map((action, index) => (
             // Records have no stable id; the review pass emits them once and
             // the list never reorders in place, so positional key is safe.
-            // eslint-disable-next-line react/no-array-index-key
             <ReviewActionRow action={action} key={index} />
           ))}
         </ul>

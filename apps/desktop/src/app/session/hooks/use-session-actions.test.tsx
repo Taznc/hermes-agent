@@ -23,7 +23,6 @@ import {
   $activeGatewayProfile,
   $newChatProfile,
   $newChatRoute,
-  ensureGatewayProfile,
   ensureGatewaySessionProfile
 } from '@/store/profile'
 import { $projectScope, $projectTree, ALL_PROJECTS } from '@/store/projects'

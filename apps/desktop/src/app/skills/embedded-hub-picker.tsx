@@ -110,13 +110,20 @@ export const EmbeddedHubPicker = memo(function EmbeddedHubPicker({
       )
     }
 
+    // Ends on pointerup OR pointercancel (window drag-out, touch cancel,
+    // system gesture) — a cancelled stream must tear down exactly like
+    // pointerup, or the hub keeps resizing with no button held. Explicit
+    // removal instead of `{ once: true }`: once doesn't cross-remove.
     const onUp = () => {
       window.removeEventListener('pointermove', onMove)
+      window.removeEventListener('pointerup', onUp)
+      window.removeEventListener('pointercancel', onUp)
       setDragging(false)
     }
 
     window.addEventListener('pointermove', onMove)
-    window.addEventListener('pointerup', onUp, { once: true })
+    window.addEventListener('pointerup', onUp)
+    window.addEventListener('pointercancel', onUp)
   }
 
   // Picker messages from the embedded hub page. Origin-checked; installs route

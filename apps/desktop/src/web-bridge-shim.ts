@@ -55,17 +55,20 @@ const BASE_URL = window.location.origin
 // later visits (any tab, after browser restart) need no query param. Scrub it
 // from the address bar/history once stored. Spike-grade; behind Authelia.
 const tokenFromUrl = new URLSearchParams(window.location.search).get('token')
+
 if (tokenFromUrl) {
   localStorage.setItem('hermes-web-spike-token', tokenFromUrl)
   const scrubbed = new URL(window.location.href)
   scrubbed.searchParams.delete('token')
   window.history.replaceState(null, '', scrubbed)
 }
+
 const TOKEN =
   tokenFromUrl ??
   localStorage.getItem('hermes-web-spike-token') ??
   sessionStorage.getItem('hermes-web-spike-token') ??
   ''
+
 const WS_URL = `${BASE_URL.replace(/^http/, 'ws')}/api/ws${TOKEN ? `?token=${encodeURIComponent(TOKEN)}` : ''}`
 
 const unsub = () => () => {}
@@ -128,12 +131,15 @@ const READY_BOOT = {
 
 async function api<T>(request: SpikeApiRequest): Promise<T> {
   const url = new URL(request.path, BASE_URL)
-  if (request.profile) url.searchParams.set('profile', request.profile)
+
+  if (request.profile) {url.searchParams.set('profile', request.profile)}
 
   const headers: Record<string, string> = {}
-  if (TOKEN) headers['X-Hermes-Session-Token'] = TOKEN
+
+  if (TOKEN) {headers['X-Hermes-Session-Token'] = TOKEN}
 
   let body: BodyInit | undefined
+
   if (request.upload) {
     const form = new FormData()
     const bytes = request.upload.bytes instanceof Uint8Array ? request.upload.bytes : new Uint8Array(request.upload.bytes)
@@ -150,6 +156,7 @@ async function api<T>(request: SpikeApiRequest): Promise<T> {
 
   const controller = new AbortController()
   const timer = request.timeoutMs ? setTimeout(() => controller.abort(), request.timeoutMs) : null
+
   try {
     const res = await fetch(url, {
       method: request.method ?? (body ? 'POST' : 'GET'),
@@ -158,11 +165,13 @@ async function api<T>(request: SpikeApiRequest): Promise<T> {
       signal: controller.signal,
       credentials: 'include'
     })
-    if (!res.ok) throw new Error(`Hermes API ${request.path} failed: ${res.status}`)
+
+    if (!res.ok) {throw new Error(`Hermes API ${request.path} failed: ${res.status}`)}
     const text = await res.text()
+
     return (text ? JSON.parse(text) : undefined) as T
   } finally {
-    if (timer) clearTimeout(timer)
+    if (timer) {clearTimeout(timer)}
   }
 }
 
@@ -229,6 +238,7 @@ const shim = {
   requestMicrophoneAccess: async () => {
     try {
       await navigator.mediaDevices.getUserMedia({ audio: true })
+
       return true
     } catch {
       return false
@@ -277,6 +287,25 @@ const shim = {
   // as the composer's empty-paste fallback, where '' means "nothing to
   // attach" and is passed `{ silent: true }`.
   saveClipboardImage: async () => '',
+
+  // ── connection-config surfaces (reachable, unsupported) ─────────────────
+  // The profile rail's remote-override dialog and the Settings → Connections
+  // registry editor both mount in the web build and call these UNGUARDED on
+  // the object (`window.hermesDesktop.applyConnectionConfig(...)`), so a
+  // partial shim throws "... is not a function" at click time. Connection and
+  // OAuth state live in the Electron main process's desktop config — a
+  // browser tab has no equivalent, and faking a success shape would make the
+  // dialogs report a save/sign-in that never happened. Throw a clear error
+  // instead: every call site wraps these in try/catch and surfaces the
+  // message honestly (inline dialog error / notifyError toast), the same
+  // honest-failure pattern as saveImageBuffer's non-image branch.
+  applyConnectionConfig: async (_payload: unknown): Promise<never> => {
+    throw new Error('Connection settings are managed on the server in the web build')
+  },
+  oauthLoginConnectionConfig: async (_remoteUrl: string): Promise<never> => {
+    throw new Error('OAuth sign-in is not available in the web build')
+  },
+
   getVersion: async () => {
     // Injected by vite.config.web.ts `define` (real git provenance of the
     // served checkout); absent if an older config serves this file.
@@ -309,7 +338,11 @@ const shim = {
   // onBootstrapEvent (must stay omitted TOGETHER), readFileDataUrl,
   // openSessionWindow/openWindow, writeClipboard, setActiveWork,
   // setTranslucency, battery, readDir/readFileText (remote mode → /api/fs/*),
-  // watchPreviewFile, contextMenu*, oauth*/ssh*/connection-config surfaces.
+  // watchPreviewFile, contextMenu*, and the REMAINING oauth*/ssh*/
+  // connection-config surfaces (getConnectionConfig stays omitted — it is the
+  // sentinel that gates Settings → Gateway and the boot-failure overlay;
+  // applyConnectionConfig + oauthLoginConnectionConfig above are the two
+  // reachable exceptions).
   //
   // readFileDataUrl in particular MUST stay omitted: desktop-fs's
   // readDesktopFileDataUrlLocalFirst tries the bridge before the gateway, so

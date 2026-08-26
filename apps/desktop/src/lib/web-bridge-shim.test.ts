@@ -21,8 +21,9 @@
  *   - it is behind a remote-mode branch  isDesktopFsRemoteMode()
  * Anything else must be defined by the shim.
  */
-import { readFileSync, readdirSync, statSync } from 'node:fs'
+import { readdirSync, readFileSync, statSync } from 'node:fs'
 import { join, relative } from 'node:path'
+
 import { describe, expect, it } from 'vitest'
 
 const SRC = join(__dirname, '..')
@@ -30,11 +31,13 @@ const SHIM = join(SRC, 'web-bridge-shim.ts')
 
 function walk(dir: string, out: string[] = []): string[] {
   for (const entry of readdirSync(dir)) {
-    if (entry === 'node_modules' || entry === 'dist') continue
+    if (entry === 'node_modules' || entry === 'dist') {continue}
     const full = join(dir, entry)
-    if (statSync(full).isDirectory()) walk(full, out)
-    else if (/\.tsx?$/.test(entry) && !/\.test\.tsx?$/.test(entry)) out.push(full)
+
+    if (statSync(full).isDirectory()) {walk(full, out)}
+    else if (/\.tsx?$/.test(entry) && !/\.test\.tsx?$/.test(entry)) {out.push(full)}
   }
+
   return out
 }
 
@@ -49,15 +52,18 @@ function shimMembers(): Set<string> {
 
   for (let i = text.indexOf('{', start); i < text.length; i += 1) {
     const ch = text[i]
-    if (ch === '{') depth += 1
+
+    if (ch === '{') {depth += 1}
     else if (ch === '}') {
       depth -= 1
-      if (depth === 0) break
+
+      if (depth === 0) {break}
     } else if (depth === 1 && ch === '\n') {
       const eol = text.indexOf('\n', i + 1)
       const line = text.slice(i + 1, eol === -1 ? undefined : eol)
       const match = /^\s*(\w+)\s*[:,]/.exec(line)
-      if (match) keys.add(match[1])
+
+      if (match) {keys.add(match[1])}
     }
   }
 
@@ -122,9 +128,10 @@ function unguardedSites(): Site[] {
   const sites: Site[] = []
 
   for (const file of walk(SRC)) {
-    if (file === SHIM || file.endsWith('global.d.ts')) continue
+    if (file === SHIM || file.endsWith('global.d.ts')) {continue}
     const body = readFileSync(file, 'utf8')
-    if (!body.includes('hermesDesktop')) continue
+
+    if (!body.includes('hermesDesktop')) {continue}
 
     const rel = relative(SRC, file).split('\\').join('/')
 
@@ -132,18 +139,22 @@ function unguardedSites(): Site[] {
     // AND the shim still omits the sentinel. If either changes, the file goes
     // back under scrutiny instead of silently staying exempt.
     const sentinel = SENTINEL_GATED[rel]
+
     if (sentinel) {
       const gateFile = GATE_OWNER[rel] ?? rel
       const gateBody = gateFile === rel ? body : readFileSync(join(SRC, gateFile), 'utf8')
-      if (gateBody.includes(sentinel) && !members.has(sentinel)) continue
+
+      if (gateBody.includes(sentinel) && !members.has(sentinel)) {continue}
     }
 
     const guarded = new Set<string>()
+
     const collect = (re: RegExp) => {
       for (const m of body.matchAll(re)) {
-        for (const name of m[1].split(',')) guarded.add(name.trim())
+        for (const name of m[1].split(',')) {guarded.add(name.trim())}
       }
     }
+
     collect(new RegExp(String.raw`!\s*` + BRIDGE + String.raw`(?:\?)?\.(\w+)`, 'g'))
     collect(new RegExp(BRIDGE + String.raw`(?:\?)?\.(\w+)\s*&&`, 'g'))
     collect(new RegExp(BRIDGE + String.raw`(?:\?)?\.(\w+)\s*\?\s*`, 'g'))
@@ -160,10 +171,14 @@ function unguardedSites(): Site[] {
     body.split('\n').forEach((line, index) => {
       for (const m of line.matchAll(CALL)) {
         const [, method, methodOptional] = m
-        if (methodOptional) continue
-        if (members.has(method) || NAMESPACED.has(method) || guarded.has(method)) continue
-        if (VERIFIED_SAFE[`${rel}:${method}`]) continue
-        if (remoteGated && /^(readDir|readFileText|readFileDataUrl|writeTextFile|gitRoot)$/.test(method)) continue
+
+        if (methodOptional) {continue}
+
+        if (members.has(method) || NAMESPACED.has(method) || guarded.has(method)) {continue}
+
+        if (VERIFIED_SAFE[`${rel}:${method}`]) {continue}
+
+        if (remoteGated && /^(readDir|readFileText|readFileDataUrl|writeTextFile|gitRoot)$/.test(method)) {continue}
         sites.push({ file: rel, line: index + 1, method, text: line.trim() })
       }
     })
