@@ -334,3 +334,128 @@ class TestSchemaSurface:
         ]
         for level in enum:
             assert parse_reasoning_effort(level) is not None, level
+
+
+# ── top-level-as-batch-default semantics ─────────────────────────────────
+
+class TestTopLevelAppliesToBatch:
+    """A top-level model/effort is the DEFAULT for every task in a batch.
+
+    Regression guard for a review finding: the top-level argument was
+    originally scoped to single-goal calls only, so a top-level `model` on a
+    `tasks[]` fan-out was silently DROPPED — every child inherited instead of
+    honouring the caller's explicit routing argument. Silently ignoring a
+    caller-supplied routing argument is the precise failure class this feature
+    exists to eliminate, and the tool schema promises "In batch mode,
+    tasks[].model overrides this per item" — which only makes sense if the
+    top-level value applies to the batch in the first place.
+    """
+
+    def _resolve(self, monkeypatch, *, tasks, top_model=None, top_effort=None):
+        """Report the raw model/effort the pre-pass resolved for each task.
+
+        Patches the resolver at its source module (``delegate_task`` imports
+        the names inside the function body, so a module-attribute patch is
+        what it actually picks up) and raises a sentinel from the LAST task's
+        resolution to stop before child construction — this test is about the
+        pre-pass's input resolution, not about building agents.
+        """
+        import tools.delegation_model_override as mo
+
+        from tools.delegate_tool import delegate_task
+
+        seen = []
+
+        class _Done(Exception):
+            pass
+
+        n = len(tasks)
+
+        def fake_model(raw_model, parent, cfg):
+            seen.append(("model", raw_model))
+            if len([1 for k, _ in seen if k == "model"]) == n:
+                raise _Done()
+            return (None, None)
+
+        def fake_effort(raw):
+            seen.append(("effort", raw))
+            return (None, None)
+
+        monkeypatch.setattr(mo, "resolve_model_override", fake_model)
+        monkeypatch.setattr(mo, "resolve_effort_override", fake_effort)
+
+        try:
+            delegate_task(
+                tasks=tasks, model=top_model, reasoning_effort=top_effort,
+                parent_agent=_parent(),
+            )
+        except _Done:
+            pass
+        return seen
+
+    def test_top_level_model_reaches_every_batch_task(self, monkeypatch):
+        seen = self._resolve(
+            monkeypatch,
+            tasks=[
+                {"goal": "a mechanical batch task with no per-item override"},
+                {"goal": "another mechanical batch task with no override"},
+            ],
+            top_model="claude-haiku-4",
+        )
+        models = [v for k, v in seen if k == "model"]
+        assert models == ["claude-haiku-4", "claude-haiku-4"], (
+            f"top-level model dropped in batch mode: {models}"
+        )
+
+    def test_per_item_beats_top_level(self, monkeypatch):
+        seen = self._resolve(
+            monkeypatch,
+            tasks=[
+                {"goal": "task taking the top-level batch default model"},
+                {"goal": "task with its own explicit per-item model",
+                 "model": "claude-opus-5"},
+            ],
+            top_model="claude-haiku-4",
+        )
+        models = [v for k, v in seen if k == "model"]
+        assert models == ["claude-haiku-4", "claude-opus-5"], models
+
+    def test_top_level_effort_reaches_every_batch_task(self, monkeypatch):
+        seen = self._resolve(
+            monkeypatch,
+            tasks=[
+                {"goal": "a batch task inheriting the top-level effort value"},
+                {"goal": "another batch task inheriting that same effort"},
+            ],
+            top_effort="high",
+        )
+        efforts = [v for k, v in seen if k == "effort"]
+        assert efforts == ["high", "high"], (
+            f"top-level reasoning_effort dropped in batch mode: {efforts}"
+        )
+
+    def test_per_item_effort_beats_top_level(self, monkeypatch):
+        seen = self._resolve(
+            monkeypatch,
+            tasks=[
+                {"goal": "task taking the top-level batch default effort"},
+                {"goal": "task pinning its own effort explicitly here",
+                 "reasoning_effort": "none"},
+            ],
+            top_effort="high",
+        )
+        efforts = [v for k, v in seen if k == "effort"]
+        assert efforts == ["high", "none"], efforts
+
+    def test_omitted_top_level_still_means_inherit(self, monkeypatch):
+        """No top-level value → every task resolves None (inherit), as before."""
+        seen = self._resolve(
+            monkeypatch,
+            tasks=[
+                {"goal": "a plain batch task with no overrides of any kind"},
+                {"goal": "another plain batch task with nothing set at all"},
+            ],
+        )
+        assert [v for k, v in seen if k == "model"] == [None, None]
+        assert [v for k, v in seen if k == "effort"] == [None, None]
+

@@ -3869,8 +3869,12 @@ def delegate_task(
     _default_source = "config" if creds.get("model") else "inherit"
     for i, task in enumerate(task_list):
         # -- reasoning effort ------------------------------------------------
+        # A top-level value is the DEFAULT for every task in the batch; a
+        # per-item value overrides it. Scoping the top-level argument to
+        # single-goal calls only would silently drop a caller-supplied routing
+        # argument on a fan-out — the exact failure this feature exists to fix.
         raw_effort = task.get("reasoning_effort")
-        if raw_effort is None and len(task_list) == 1 and reasoning_effort is not None:
+        if raw_effort is None and reasoning_effort is not None:
             raw_effort = reasoning_effort
         parsed_effort, effort_err = resolve_effort_override(raw_effort)
         if effort_err:
@@ -3879,7 +3883,7 @@ def delegate_task(
 
         # -- model -----------------------------------------------------------
         raw_model = task.get("model")
-        if raw_model is None and len(task_list) == 1 and model is not None:
+        if raw_model is None and model is not None:
             raw_model = model
         override_cfg, model_err = resolve_model_override(
             raw_model, parent_agent, _override_cfg_base
