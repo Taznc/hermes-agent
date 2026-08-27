@@ -2510,7 +2510,7 @@ The delegation provider uses the same credential resolution as CLI/gateway start
 
 **Precedence:** `delegation.base_url` in config → `delegation.provider` in config → parent provider (inherited). `delegation.model` in config → parent model (inherited). Setting just `model` without `provider` changes only the model name while keeping the parent's credentials (useful for switching models within the same provider like OpenRouter).
 
-**Per-spawn overrides (`model` / `reasoning_effort` on `delegate_task`):** the `delegation.*` keys above are global — they apply to every delegation and cannot vary per spawn. For a heterogeneous batch (cheap mechanical tasks alongside one hard reasoning task), the agent can pass optional `model` and `reasoning_effort` arguments to `delegate_task`, either at the top level for a single goal or per item inside `tasks[]`. The full precedence for both fields is:
+**Per-spawn overrides (`model` / `reasoning_effort` on `delegate_task`):** the `delegation.*` keys above are global — they apply to every delegation and cannot vary per spawn. For a heterogeneous batch (cheap mechanical tasks alongside one hard reasoning task), the agent can pass optional `model` and `reasoning_effort` arguments to `delegate_task`, either at the top level for a single goal, or as the default for every task in a `tasks[]` batch with a per-item value overriding it. The full precedence for both fields is:
 
 ```
 per-spawn argument  >  global delegation.* pin  >  parent inheritance
