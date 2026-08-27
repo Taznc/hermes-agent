@@ -2071,12 +2071,15 @@ class RoadmapIdeaBody(BaseModel):
     text: str
     # Optional provenance when the idea was captured from an existing card
     # (the second-slice "send to roadmap ideas" per-card action). The
-    # free-text board affordance in this slice omits both. Constrained to
-    # the same shape as a kanban task id (``t_<hex>`` in practice, but kept
-    # a bit looser here so a future id format doesn't need an endpoint
-    # change) — this is the HTTP-layer half of the source_id defense; the
-    # roadmap-sync plugin re-validates independently on its side too.
-    source_id: Optional[str] = Field(default=None, max_length=64, pattern=r"^[A-Za-z0-9_-]+$")
+    # free-text board affordance in this slice omits both. The authenticated
+    # HTTP boundary validates this against the CANONICAL kanban task-id shape
+    # emitted by ``hermes_cli.kanban_db`` (``"t_" + secrets.token_hex(4)``,
+    # i.e. exactly 8 lowercase hex digits after the prefix) — provenance on
+    # a value that didn't actually come from the board is rejected here with
+    # a 422 rather than silently accepted. The roadmap-sync plugin keeps its
+    # own, deliberately broader allowlist as defense-in-depth for future
+    # direct (non-HTTP) callers that may not be kanban card ids.
+    source_id: Optional[str] = Field(default=None, pattern=r"^t_[0-9a-f]{8}$")
 
 
 @router.post("/roadmap/idea")

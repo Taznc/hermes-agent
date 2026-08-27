@@ -175,9 +175,11 @@ def test_append_idea_happy_path_writes_real_roadmap_file(env, monkeypatch):
 def test_append_idea_carries_source_id_provenance(env, monkeypatch):
     _stub_manager(monkeypatch, env.plugin_api, env.roadmap_sync)
 
+    # Real-shaped kanban task id: "t_" + 8 lowercase hex digits, matching
+    # the canonical generator in hermes_cli/kanban_db.py (secrets.token_hex(4)).
     resp = env.client.post(
         "/api/plugins/kanban/roadmap/idea",
-        json={"text": "Ship the widget", "source_id": "t_abc123"},
+        json={"text": "Ship the widget", "source_id": "t_ab12cd34"},
         params={"board": "default"},
     )
 
@@ -185,7 +187,7 @@ def test_append_idea_carries_source_id_provenance(env, monkeypatch):
     assert resp.json()["ok"] is True
     text = env.roadmap_path.read_text(encoding="utf-8")
     assert "Ship the widget" in text
-    assert "t_abc123" in text
+    assert "t_ab12cd34" in text
 
 
 def test_append_idea_hostile_source_id_rejected_by_payload_validation(env, monkeypatch):
@@ -215,6 +217,38 @@ def test_append_idea_oversized_source_id_rejected_by_payload_validation(env, mon
     )
 
     assert resp.status_code == 422
+
+
+@pytest.mark.parametrize(
+    "bad_source_id,reason",
+    [
+        ("not-a-card", "wrong prefix, no t_ at all"),
+        ("_", "just an underscore — matched the old loose allowlist"),
+        ("x_ab12cd34", "wrong prefix"),
+        ("t_ab12cd3", "hex portion too short (7 chars, needs 8)"),
+        ("t_ab12cd345", "hex portion too long (9 chars, needs 8)"),
+        ("t_ABCD1234", "uppercase hex — token_hex() only ever emits lowercase"),
+        ("t_ab12cd3g", "non-hex character ('g') in the id portion"),
+        ("t_abc123", "six hex digits — a plausible-looking but wrong-length id"),
+    ],
+)
+def test_append_idea_well_formed_but_non_card_source_id_rejected(env, monkeypatch, bad_source_id, reason):
+    """Round-2 review: the loose ``^[A-Za-z0-9_-]+$`` allowlist accepted
+    values that look like provenance but were never actually emitted by
+    hermes_cli.kanban_db.create_task_id() (``"t_" + secrets.token_hex(4)``).
+    The authenticated HTTP boundary must reject anything that doesn't match
+    that exact canonical shape, even when it isn't otherwise hostile."""
+    _stub_manager(monkeypatch, env.plugin_api, env.roadmap_sync)
+
+    resp = env.client.post(
+        "/api/plugins/kanban/roadmap/idea",
+        json={"text": "An idea", "source_id": bad_source_id},
+        params={"board": "default"},
+    )
+
+    assert resp.status_code == 422, reason
+    text = env.roadmap_path.read_text(encoding="utf-8")
+    assert env.roadmap_sync._IDEAS_START not in text
 
 
 # ---------------------------------------------------------------------------
