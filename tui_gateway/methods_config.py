@@ -366,7 +366,15 @@ def _(rid, params: dict) -> dict:
         return _ok(rid, {"value": _load_busy_input_mode()})
     if key in {"approval_mode", "approvals.mode"}:
         try:
-            return _ok(rid, {"value": _load_approval_mode()})
+            # Profile-scoped config, so it must answer for the REQUESTED
+            # profile. This handler is not wrapped in @_profile_scoped (it
+            # serves many keys, most of which are launch-scoped), so bind the
+            # profile explicitly for this one rather than widening the wrapper
+            # and silently re-homing every other key.
+            return _ok(
+                rid,
+                {"value": _load_approval_mode(_profile_home(params.get("profile")))},
+            )
         except Exception as e:
             return _err(rid, 5001, str(e))
     if key == "details_mode":
