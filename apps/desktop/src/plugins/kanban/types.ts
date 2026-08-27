@@ -91,6 +91,18 @@ export interface KanbanAttachment {
   size?: null | number
 }
 
+/** A file (typically a pasted image) uploaded before the owning task exists —
+ *  from the "new task" dialog's paste-to-upload flow. Promoted into a real
+ *  KanbanAttachment via `pending_attachment_tokens` on task create; the
+ *  `token` is the only client-facing handle until then. */
+export interface StagedAttachment {
+  token: string
+  filename: string
+  content_type?: null | string
+  size: number
+  created_at?: number
+}
+
 /** Fields present only on the detail endpoint (beyond the card's KanbanTask).
  *  `started_at`/`worker_pid`/`last_heartbeat_at` are inherited — they live on
  *  KanbanTask now that the board's liveness arc reads them. */

@@ -52,6 +52,7 @@ import {
 } from '@hermes/plugin-sdk'
 import {
   type CSSProperties,
+  type ClipboardEvent as ReactClipboardEvent,
   type DragEvent as ReactDragEvent,
   type ReactNode,
   useEffect,
@@ -69,13 +70,15 @@ import {
   BOARDS_KEY,
   bulkTasks,
   createTask,
+  deleteStagedAttachment,
   deleteTask,
   estimateNew,
   fetchBoard,
   fetchBoards,
   fetchProfiles,
   patchTask,
-  PROFILES_KEY
+  PROFILES_KEY,
+  stageAttachment
 } from './api'
 import { BoardSwitcher } from './board-switcher'
 import { TaskDrawer } from './drawer'
@@ -592,7 +595,18 @@ function Field({ children, label }: { children: ReactNode; label: string }) {
   )
 }
 
-function NewTaskDialog({
+// One image pasted into the new-task dialog before the task exists — staged
+// server-side immediately (see api.ts's stageAttachment), previewed locally
+// via an object URL, and promoted into a real attachment on submit via its
+// `token`.
+interface PendingImage {
+  token: string
+  filename: string
+  previewUrl: string
+  size: number
+}
+
+export function NewTaskDialog({
   onClose,
   parents,
   target
@@ -635,6 +649,14 @@ function NewTaskDialog({
   const [busy, setBusy] = useState(false)
   const [error, setError] = useState<null | string>(null)
   const [estimate, setEstimate] = useState<null | TaskEstimate>(null)
+  // Images pasted (Cmd/Ctrl+V) into the dialog before the task exists — each
+  // is uploaded to the staging endpoint immediately so the create-task call
+  // only ever carries small tokens, never raw bytes. `uploading` tracks
+  // in-flight paste uploads so the create button can wait for them.
+  const [pendingImages, setPendingImages] = useState<PendingImage[]>([])
+  const [uploadingImages, setUploadingImages] = useState(0)
+  const pendingImagesRef = useRef<PendingImage[]>([])
+  pendingImagesRef.current = pendingImages
 
   // Rough effort estimate from the typed title/body (before the task exists),
   // via the auto-routed auxiliary model. Makes a model call — explicit action.
@@ -668,8 +690,80 @@ function NewTaskDialog({
       setError(null)
       setBusy(false)
       setEstimate(null)
+      setPendingImages([])
+      setUploadingImages(0)
     }
   }, [target, boardDefaultKind])
+
+  // Best-effort cleanup for images pasted but never submitted: revoke the
+  // local object URLs (avoid leaking blob: refs) and delete the staged
+  // blobs server-side. Not required for correctness — the TTL reaper cleans
+  // up abandoned staged uploads regardless — but keeps the board tidy
+  // immediately. Fire-and-forget: a failure here shouldn't block closing.
+  const cleanupPending = () => {
+    for (const image of pendingImagesRef.current) {
+      URL.revokeObjectURL(image.previewUrl)
+      deleteStagedAttachment(image.token).catch(() => undefined)
+    }
+  }
+
+  const handleClose = () => {
+    cleanupPending()
+    onClose()
+  }
+
+  // Paste handler: pull image items off the clipboard, upload each straight
+  // to the staging endpoint (before Create is ever clicked), and show a
+  // thumbnail immediately. Non-image clipboard data (plain text, etc.) is
+  // left alone so normal paste-into-textarea keeps working.
+  const handlePaste = (event: ReactClipboardEvent<HTMLTextAreaElement>) => {
+    const items = Array.from(event.clipboardData?.items ?? []).filter(item => item.type.startsWith('image/'))
+
+    if (items.length === 0) {
+      return
+    }
+
+    event.preventDefault()
+
+    for (const item of items) {
+      const blob = item.getAsFile()
+
+      if (!blob) {
+        continue
+      }
+
+      const previewUrl = URL.createObjectURL(blob)
+      const filename = blob.name || `pasted-image-${Date.now()}.${(blob.type.split('/')[1] || 'png').replace('jpeg', 'jpg')}`
+
+      setUploadingImages(count => count + 1)
+
+      blob
+        .arrayBuffer()
+        .then(bytes => stageAttachment({ bytes, contentType: blob.type || undefined, filename }))
+        .then(({ attachment }) => {
+          setPendingImages(images => [
+            ...images,
+            { filename: attachment.filename, previewUrl, size: attachment.size, token: attachment.token }
+          ])
+        })
+        .catch(err => {
+          URL.revokeObjectURL(previewUrl)
+          host.notify({ kind: 'error', message: `${k.imagePasteFailed}: ${errText(err)}` })
+        })
+        .finally(() => setUploadingImages(count => count - 1))
+    }
+  }
+
+  const removePendingImage = (token: string) => {
+    const image = pendingImages.find(candidate => candidate.token === token)
+
+    if (image) {
+      URL.revokeObjectURL(image.previewUrl)
+    }
+
+    setPendingImages(images => images.filter(candidate => candidate.token !== token))
+    deleteStagedAttachment(token).catch(() => undefined)
+  }
 
   const submit = async () => {
     const trimmed = title.trim()
@@ -694,6 +788,9 @@ function NewTaskDialog({
         body: bodyText.trim() || undefined,
         goal_mode: goalMode,
         parents: parent ? [parent] : undefined,
+        // Images travel exclusively as staged tokens, never inlined into
+        // `body` — the backend promotes each token into a real attachment.
+        pending_attachment_tokens: pendingImages.length ? pendingImages.map(image => image.token) : undefined,
         priority: Number(priority) || 0,
         skills: skillList.length ? skillList : undefined,
         title: trimmed,
@@ -715,6 +812,9 @@ function NewTaskDialog({
       }
 
       await qc.invalidateQueries({ queryKey: ['kanban', 'board'] })
+      // Submitted images are now real attachments — clear without re-deleting
+      // the (already-promoted) staged blobs.
+      setPendingImages([])
       onClose()
     } catch (err) {
       setError(errText(err))
@@ -723,7 +823,7 @@ function NewTaskDialog({
   }
 
   return (
-    <Dialog onOpenChange={open => !open && onClose()} open={Boolean(target)}>
+    <Dialog onOpenChange={open => !open && handleClose()} open={Boolean(target)}>
       {/* `overflow-visible`: DialogContent publishes ITSELF as the portal
           container for popovers opened inside it (dialog-portal-context), and
           its default `overflow-y-auto` then crops them at the dialog's edge —
@@ -752,9 +852,42 @@ function NewTaskDialog({
           <Textarea
             className="min-h-20"
             onChange={event => setBodyText(event.target.value)}
+            onPaste={handlePaste}
             placeholder={k.descPlaceholder}
             value={bodyText}
           />
+
+          {(pendingImages.length > 0 || uploadingImages > 0) && (
+            <div className="flex flex-col gap-1.5">
+              <span className="text-[0.625rem] text-(--ui-text-quaternary)">
+                {k.pastedImages(pendingImages.length + uploadingImages)}
+              </span>
+              <div className="flex flex-wrap gap-2">
+                {pendingImages.map(image => (
+                  <div className="group relative h-16 w-16 overflow-hidden rounded-md border border-(--ui-border)" key={image.token}>
+                    <img alt={image.filename} className="h-full w-full object-cover" src={image.previewUrl} />
+                    <Button
+                      aria-label={k.removeImage}
+                      className="absolute top-0.5 right-0.5 h-4 w-4 opacity-0 group-hover:opacity-100"
+                      onClick={() => removePendingImage(image.token)}
+                      size="icon-xs"
+                      variant="destructive"
+                    >
+                      <Codicon name="close" size="0.6rem" />
+                    </Button>
+                  </div>
+                ))}
+                {Array.from({ length: uploadingImages }).map((_, index) => (
+                  <div
+                    className="flex h-16 w-16 items-center justify-center rounded-md border border-(--ui-border) border-dashed"
+                    key={`uploading-${index}`}
+                  >
+                    <Codicon name="loading" size="1rem" spinning />
+                  </div>
+                ))}
+              </div>
+            </div>
+          )}
 
           <div className="grid grid-cols-2 gap-3">
             <Field label={k.priority}>
@@ -883,10 +1016,10 @@ function NewTaskDialog({
               </Tip>
             )}
           </div>
-          <Button onClick={onClose} variant="text">
+          <Button onClick={handleClose} variant="text">
             {k.cancel}
           </Button>
-          <Button disabled={!title.trim() || busy} onClick={() => void submit()}>
+          <Button disabled={!title.trim() || busy || uploadingImages > 0} onClick={() => void submit()}>
             {busy ? k.creating : k.createTask}
           </Button>
         </DialogFooter>
