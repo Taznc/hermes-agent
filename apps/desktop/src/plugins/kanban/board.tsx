@@ -73,6 +73,7 @@ import {
   deleteStagedAttachment,
   deleteTask,
   estimateNew,
+  fetchAttachmentDataUrl,
   fetchBoard,
   fetchBoards,
   fetchProfiles,
@@ -161,6 +162,36 @@ function Meta({ children, icon }: { children: ReactNode; icon: string }) {
       <Codicon name={icon} size="0.7rem" />
       {children}
     </span>
+  )
+}
+
+/** Small thumbnail indicator on cards that have at least one image
+ *  attachment (#cae4c2ba). Lazily fetches the first image's bytes as a data
+ *  URL only once mounted (cards off-screen never pay the fetch); a fetch or
+ *  decode failure quietly hides the thumbnail rather than showing a broken
+ *  image icon on a card. */
+function CardThumb({ attachmentId }: { attachmentId: number | string }) {
+  const [broken, setBroken] = useState(false)
+
+  const { data } = useQuery({
+    queryFn: () => fetchAttachmentDataUrl(attachmentId),
+    queryKey: ['kanban', 'attachment-data-url', attachmentId],
+    retry: false,
+    staleTime: Infinity
+  })
+
+  if (!data?.data_url || broken) {
+    return null
+  }
+
+  return (
+    <img
+      alt=""
+      aria-hidden
+      className="size-8 shrink-0 rounded object-cover"
+      onError={() => setBroken(true)}
+      src={data.data_url}
+    />
   )
 }
 
@@ -353,6 +384,7 @@ function Card({
           {summary && (
             <span className="line-clamp-2 text-[0.6875rem] leading-snug text-(--ui-text-tertiary)">{summary}</span>
           )}
+          {task.image_attachment_id != null && <CardThumb attachmentId={task.image_attachment_id} />}
           <CardFooter arc={arc} task={task} />
         </div>
       </ContextMenuTrigger>

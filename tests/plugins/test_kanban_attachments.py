@@ -226,6 +226,85 @@ def test_download_unknown_attachment_404(client):
 
 
 # ---------------------------------------------------------------------------
+# GET /attachments/{id}/data-url — inline base64 rendering (#cae4c2ba)
+# ---------------------------------------------------------------------------
+
+
+def test_attachment_data_url_roundtrip(client):
+    task_id = _create_task_via_api(client)
+    png_bytes = b"\x89PNG\r\n\x1a\nfake-png-body"
+
+    r = client.post(
+        f"/api/plugins/kanban/tasks/{task_id}/attachments",
+        files={"file": ("pic.png", png_bytes, "image/png")},
+    )
+    assert r.status_code == 200, r.text
+    att_id = r.json()["attachment"]["id"]
+
+    r = client.get(f"/api/plugins/kanban/attachments/{att_id}/data-url")
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["content_type"] == "image/png"
+    assert body["size"] == len(png_bytes)
+
+    import base64
+
+    prefix = "data:image/png;base64,"
+    assert body["data_url"].startswith(prefix)
+    assert base64.b64decode(body["data_url"][len(prefix):]) == png_bytes
+
+
+def test_attachment_data_url_unknown_attachment_404(client):
+    r = client.get("/api/plugins/kanban/attachments/424242/data-url")
+    assert r.status_code == 404
+
+
+def test_attachment_data_url_missing_file_on_disk_404(client):
+    """DB row present but the blob was deleted out from under it (or never
+    written) must 404 gracefully, never crash (#cae4c2ba: broken/missing
+    images handled gracefully)."""
+    task_id = _create_task_via_api(client)
+    r = client.post(
+        f"/api/plugins/kanban/tasks/{task_id}/attachments",
+        files={"file": ("pic.png", b"x", "image/png")},
+    )
+    att_id = r.json()["attachment"]["id"]
+
+    conn = kb.connect()
+    try:
+        att = kb.get_attachment(conn, att_id)
+        Path(att.stored_path).unlink()
+    finally:
+        conn.close()
+
+    r = client.get(f"/api/plugins/kanban/attachments/{att_id}/data-url")
+    assert r.status_code == 404
+
+
+def test_attachment_data_url_oversized_returns_413(client):
+    task_id = _create_task_via_api(client)
+    r = client.post(
+        f"/api/plugins/kanban/tasks/{task_id}/attachments",
+        files={"file": ("pic.png", b"x", "image/png")},
+    )
+    att_id = r.json()["attachment"]["id"]
+
+    conn = kb.connect()
+    try:
+        att = kb.get_attachment(conn, att_id)
+        # Overwrite the on-disk blob past the inline-render cap without
+        # actually writing 12MB of test data over the wire.
+        with open(att.stored_path, "wb") as f:
+            f.seek(13 * 1024 * 1024)
+            f.write(b"\0")
+    finally:
+        conn.close()
+
+    r = client.get(f"/api/plugins/kanban/attachments/{att_id}/data-url")
+    assert r.status_code == 413
+
+
+# ---------------------------------------------------------------------------
 # Shared helper — store_attachment_bytes (used by dashboard + tool + CLI)
 # ---------------------------------------------------------------------------
 
