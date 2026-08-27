@@ -2030,9 +2030,15 @@ def _run_estimate(title: str, body: Optional[str]) -> dict:
 # one roadmap writer with its own locking, not a second one growing here.
 # ---------------------------------------------------------------------------
 
-# Mirror the ideas plugin's own bound so an obviously-oversized paste gets a
-# clean 400 instead of a silent server-side truncation the user never sees.
-_ROADMAP_IDEA_MAX_LEN = 2000
+# Mirror the ideas plugin's own bound (see roadmap-sync's _IDEA_MAX_LEN) so
+# an obviously-oversized paste gets a clean 400 instead of a silent
+# server-side truncation the user never sees. This MUST stay equal to the
+# plugin's cap, not merely close to it: since the plugin's sanitizer never
+# lengthens text (it only collapses whitespace and neutralizes marker
+# syntax in place), any input at or under this bound is guaranteed to be
+# stored in full — matching bounds is what makes that guarantee hold, not
+# just cosmetic consistency with the UI's maxLength.
+_ROADMAP_IDEA_MAX_LEN = 300
 
 
 def _load_roadmap_sync_module():
@@ -2065,8 +2071,12 @@ class RoadmapIdeaBody(BaseModel):
     text: str
     # Optional provenance when the idea was captured from an existing card
     # (the second-slice "send to roadmap ideas" per-card action). The
-    # free-text board affordance in this slice omits both.
-    source_id: Optional[str] = None
+    # free-text board affordance in this slice omits both. Constrained to
+    # the same shape as a kanban task id (``t_<hex>`` in practice, but kept
+    # a bit looser here so a future id format doesn't need an endpoint
+    # change) — this is the HTTP-layer half of the source_id defense; the
+    # roadmap-sync plugin re-validates independently on its side too.
+    source_id: Optional[str] = Field(default=None, max_length=64, pattern=r"^[A-Za-z0-9_-]+$")
 
 
 @router.post("/roadmap/idea")

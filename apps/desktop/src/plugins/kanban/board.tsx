@@ -1066,7 +1066,7 @@ export function IdeaCaptureDialog({ onClose, open }: { onClose: () => void; open
           <Textarea
             autoFocus
             className="min-h-24"
-            maxLength={2000}
+            maxLength={300}
             onChange={e => setText(e.target.value)}
             onKeyDown={e => {
               if (e.key === 'Enter' && (e.metaKey || e.ctrlKey)) {

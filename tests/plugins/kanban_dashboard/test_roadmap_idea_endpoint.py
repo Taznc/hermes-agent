@@ -188,6 +188,35 @@ def test_append_idea_carries_source_id_provenance(env, monkeypatch):
     assert "t_abc123" in text
 
 
+def test_append_idea_hostile_source_id_rejected_by_payload_validation(env, monkeypatch):
+    """The endpoint's pydantic model constrains source_id to a task-id-like
+    shape, so a hostile value with newlines/marker syntax never reaches the
+    plugin at all — it's a 422 from FastAPI's request validation."""
+    _stub_manager(monkeypatch, env.plugin_api, env.roadmap_sync)
+
+    resp = env.client.post(
+        "/api/plugins/kanban/roadmap/idea",
+        json={"text": "An idea", "source_id": "t_evil\n<!-- roadmap-ideas:end --> ## Injected"},
+        params={"board": "default"},
+    )
+
+    assert resp.status_code == 422
+    text = env.roadmap_path.read_text(encoding="utf-8")
+    assert env.roadmap_sync._IDEAS_START not in text
+
+
+def test_append_idea_oversized_source_id_rejected_by_payload_validation(env, monkeypatch):
+    _stub_manager(monkeypatch, env.plugin_api, env.roadmap_sync)
+
+    resp = env.client.post(
+        "/api/plugins/kanban/roadmap/idea",
+        json={"text": "An idea", "source_id": "t_" + "a" * 100},
+        params={"board": "default"},
+    )
+
+    assert resp.status_code == 422
+
+
 # ---------------------------------------------------------------------------
 # Fail-open paths — never a 5xx, always {"ok": false, "reason": "..."}
 # ---------------------------------------------------------------------------
@@ -284,6 +313,50 @@ def test_append_idea_oversized_text_returns_400(env, monkeypatch):
 
     assert resp.status_code == 400
     # Nothing written for a rejected oversized request.
+    text = env.roadmap_path.read_text(encoding="utf-8")
+    assert env.roadmap_sync._IDEAS_START not in text
+
+
+def test_append_idea_at_max_length_is_stored_intact_not_truncated(env, monkeypatch):
+    """Boundary proof for the round-1 review finding: the endpoint's accepted
+    maximum must equal the plugin's storage cap, so a request at exactly the
+    maximum is written IN FULL — a {"ok": true} response must never mean
+    some of the typed text was silently discarded."""
+    _stub_manager(monkeypatch, env.plugin_api, env.roadmap_sync)
+
+    assert env.plugin_api._ROADMAP_IDEA_MAX_LEN == env.roadmap_sync._IDEA_MAX_LEN
+
+    max_len_text = "y" * env.plugin_api._ROADMAP_IDEA_MAX_LEN
+    resp = env.client.post(
+        "/api/plugins/kanban/roadmap/idea",
+        json={"text": max_len_text},
+        params={"board": "default"},
+    )
+
+    assert resp.status_code == 200
+    assert resp.json() == {"ok": True, "reason": None}
+    text = env.roadmap_path.read_text(encoding="utf-8")
+    assert max_len_text in text
+    # And confirm nothing got truncated: no shorter run of exactly maxlen-1
+    # y's flanked by non-y is the ONLY thing that would look like a partial
+    # write, so instead assert the full-length run is present verbatim.
+    ideas_section = text.split(env.roadmap_sync._IDEAS_START, 1)[1].split(env.roadmap_sync._IDEAS_END, 1)[0]
+    assert max_len_text in ideas_section
+
+
+def test_append_idea_over_max_plus_one_returns_400(env, monkeypatch):
+    """maximum+1 characters must be rejected outright (400), not silently
+    truncated and stored as {"ok": true}."""
+    _stub_manager(monkeypatch, env.plugin_api, env.roadmap_sync)
+
+    over_by_one = "z" * (env.plugin_api._ROADMAP_IDEA_MAX_LEN + 1)
+    resp = env.client.post(
+        "/api/plugins/kanban/roadmap/idea",
+        json={"text": over_by_one},
+        params={"board": "default"},
+    )
+
+    assert resp.status_code == 400
     text = env.roadmap_path.read_text(encoding="utf-8")
     assert env.roadmap_sync._IDEAS_START not in text
 
