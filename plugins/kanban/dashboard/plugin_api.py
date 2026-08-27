@@ -215,6 +215,23 @@ def _attachment_dict(a: kanban_db.Attachment) -> dict[str, Any]:
     }
 
 
+def _staged_attachment_dict(a: "kanban_db.StagedAttachment") -> dict[str, Any]:
+    """Serialise a StagedAttachment for the pre-submit paste flow.
+
+    Deliberately omits ``stored_path`` (unlike ``_attachment_dict``) — the
+    staged blob is a client-scoped, short-lived intermediate the browser
+    already has a local ``Blob``/preview URL for, so there's no reason to
+    leak the server filesystem path pre-task-creation.
+    """
+    return {
+        "token": a.token,
+        "filename": a.filename,
+        "content_type": a.content_type,
+        "size": a.size,
+        "created_at": a.created_at,
+    }
+
+
 def _run_dict(r: kanban_db.Run) -> dict[str, Any]:
     """Serialise a Run for the drawer's Run history section."""
     return {
@@ -621,6 +638,11 @@ class CreateTaskBody(BaseModel):
     # Explicit project link; when omitted, create_task inherits the board's
     # scoped project (if any) so a project-scoped board anchors every task.
     project_id: Optional[str] = None
+    # Tokens from POST /attachments/staged (pasted images uploaded before
+    # this task existed, e.g. the "new task" dialog). Promoted into real
+    # task_attachments rows after the task is created; defaults to [] so
+    # older dashboard builds that never send this field are unaffected.
+    pending_attachment_tokens: list[str] = Field(default_factory=list)
 
 
 @router.post("/tasks")
@@ -653,6 +675,24 @@ def create_task(payload: CreateTaskBody, board: Optional[str] = Query(None)):
         )
         task = kanban_db.get_task(conn, task_id)
         body: dict[str, Any] = {"task": _task_dict(task) if task else None}
+
+        # Promote any pasted-image attachments staged before the task
+        # existed (dashboard "new task" dialog paste flow). A stale/unknown
+        # token is surfaced as a warning, never a task-creation failure.
+        attachments: list[dict[str, Any]] = []
+        attachment_warnings: list[str] = []
+        if payload.pending_attachment_tokens:
+            promoted, attachment_warnings = kanban_db.promote_staged_attachments(
+                conn,
+                task_id,
+                payload.pending_attachment_tokens,
+                uploaded_by="dashboard",
+                board=board,
+            )
+            attachments = [_attachment_dict(a) for a in promoted]
+        body["attachments"] = attachments
+        body["attachment_warnings"] = attachment_warnings
+
         # Surface a dispatcher-presence warning so the UI can show a
         # banner when a `ready` task would otherwise sit idle because no
         # gateway is running (or dispatch_in_gateway=false). Only emit
@@ -822,6 +862,118 @@ def remove_attachment(attachment_id: int, board: Optional[str] = Query(None)):
         return {"ok": True, "id": attachment_id}
     finally:
         conn.close()
+
+
+# ---------------------------------------------------------------------------
+# Staged attachments — pre-task-creation pasted images (kanban new-task-image
+# spec, docs/design/kanban-task-image-attachments.md). Distinct from the
+# generic /tasks/{id}/attachments surface above because a task_id doesn't
+# exist yet: the "new task" dialog needs to accept & preview a pasted image
+# before the user hits Create. Image-only (mime allowlist + 10 MB cap),
+# unlike the generic (any mime, 25 MB) task-attachment upload.
+# ---------------------------------------------------------------------------
+
+from hermes_cli.kanban_db import (  # noqa: E402
+    KANBAN_IMAGE_ATTACHMENT_MAX_BYTES,
+    KANBAN_IMAGE_ALLOWED_MIME_TYPES,
+)
+
+
+@router.post("/attachments/staged", status_code=http_status.HTTP_201_CREATED)
+async def upload_staged_attachment(
+    file: UploadFile = File(...),
+    board: Optional[str] = Query(None),
+    uploaded_by: Optional[str] = Form(None),
+):
+    """Stage a pasted image before its owning task exists.
+
+    Validates ``file.content_type`` against the image mime allowlist up
+    front (400 on mismatch), then streams to disk with a hard cap at
+    ``KANBAN_IMAGE_ATTACHMENT_MAX_BYTES`` (413 on exceed), matching the
+    existing ``upload_task_attachment`` streaming-with-cap pattern.
+    """
+    board = _resolve_board(board)
+
+    content_type = (file.content_type or "").split(";", 1)[0].strip().lower()
+    if content_type not in KANBAN_IMAGE_ALLOWED_MIME_TYPES:
+        accepted = ", ".join(sorted(KANBAN_IMAGE_ALLOWED_MIME_TYPES))
+        raise HTTPException(
+            status_code=400,
+            detail=f"unsupported image type: {file.content_type or 'unknown'}; accepted: {accepted}",
+        )
+
+    try:
+        safe_name = kanban_db._safe_attachment_name(file.filename or "")
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+    # Stream to a temp buffer with a hard size cap so a huge upload can't
+    # fill the disk before we know it's oversized.
+    chunks: list[bytes] = []
+    total = 0
+    while True:
+        chunk = await file.read(1024 * 1024)
+        if not chunk:
+            break
+        total += len(chunk)
+        if total > KANBAN_IMAGE_ATTACHMENT_MAX_BYTES:
+            raise HTTPException(
+                status_code=413,
+                detail=(
+                    f"attachment exceeds {KANBAN_IMAGE_ATTACHMENT_MAX_BYTES // (1024 * 1024)} MB limit"
+                ),
+            )
+        chunks.append(chunk)
+    data = b"".join(chunks)
+
+    try:
+        staged = kanban_db.stage_attachment_bytes(
+            safe_name,
+            data,
+            content_type=file.content_type,
+            uploaded_by=(uploaded_by or "dashboard"),
+            board=board,
+        )
+    except kanban_db.AttachmentTooLarge as e:
+        raise HTTPException(status_code=413, detail=str(e))
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    return {"attachment": _staged_attachment_dict(staged)}
+
+
+@router.get("/attachments/staged/{token}")
+def download_staged_attachment(token: str, board: Optional[str] = Query(None)):
+    """Serve a staged blob. Parity with ``GET /attachments/{id}`` for a
+    dialog reload / multi-tab edge case; not required for the paste-preview
+    itself (the browser already has a local Blob/object URL)."""
+    board = _resolve_board(board)
+    staged = kanban_db.get_staged_attachment(token, board=board)
+    if staged is None:
+        raise HTTPException(status_code=404, detail="staged attachment not found")
+    # Confirm the blob still lives under the board's attachments root
+    # before serving — same defense-in-depth check as download_attachment.
+    root = kanban_db.attachments_root(board=board).resolve()
+    try:
+        stored = Path(staged.stored_path).resolve()
+        stored.relative_to(root)
+    except (ValueError, OSError):
+        raise HTTPException(status_code=404, detail="staged attachment file unavailable")
+    if not stored.is_file():
+        raise HTTPException(status_code=404, detail="staged attachment file missing on disk")
+    return FileResponse(
+        path=str(stored),
+        filename=staged.filename,
+        media_type=staged.content_type or "application/octet-stream",
+    )
+
+
+@router.delete("/attachments/staged/{token}")
+def remove_staged_attachment(token: str, board: Optional[str] = Query(None)):
+    board = _resolve_board(board)
+    removed = kanban_db.delete_staged_attachment(token, board=board)
+    if not removed:
+        raise HTTPException(status_code=404, detail="staged attachment not found")
+    return {"ok": True, "token": token}
 
 
 # ---------------------------------------------------------------------------

@@ -162,7 +162,13 @@ def normalize_reasoning_effort(effort: Optional[str]) -> Optional[str]:
 
 KNOWN_TOOLSET_NAMES = frozenset(name.casefold() for name in get_toolset_names())
 _IS_WINDOWS = sys.platform == "win32"
-KANBAN_ATTACHMENT_MAX_BYTES = 25 * 1024 * 1024
+KANBAN_ATTACHMENT_MAX_BYTES = 25 * 1024 * 1024        # existing, unchanged — generic files
+KANBAN_IMAGE_ATTACHMENT_MAX_BYTES = 10 * 1024 * 1024  # new — pasted-image specific cap
+KANBAN_IMAGE_ALLOWED_MIME_TYPES = frozenset({
+    "image/png", "image/jpeg", "image/gif", "image/webp",
+})
+KANBAN_STAGED_ATTACHMENT_TTL_SECONDS = 24 * 60 * 60   # abandoned-draft GC window
+KANBAN_MAX_PENDING_ATTACHMENTS_PER_TASK = 10          # abuse guard on promote
 
 
 def _assert_not_delegated_child_mutation() -> None:
@@ -1319,6 +1325,25 @@ class Attachment:
 
 
 @dataclass
+class StagedAttachment:
+    """In-memory view of a row from the ``staged_attachments`` table.
+
+    Mirrors :class:`Attachment` minus ``task_id`` (the owning task doesn't
+    exist yet), plus the client-facing ``token`` used to reference it before
+    promotion.
+    """
+
+    token: str
+    filename: str
+    stored_path: str
+    content_type: Optional[str]
+    size: int
+    uploaded_by: Optional[str]
+    board: Optional[str]
+    created_at: int
+
+
+@dataclass
 class Event:
     id: int
     task_id: str
@@ -1496,6 +1521,23 @@ CREATE TABLE IF NOT EXISTS task_attachments (
     uploaded_by  TEXT,
     created_at   INTEGER NOT NULL
 );
+
+-- Pasted images (or any file) uploaded before the owning task exists, e.g.
+-- from the "new task" dialog. Promoted into task_attachments (and this row
+-- deleted) when the task is created; swept by a TTL reaper if the dialog is
+-- abandoned. Lives under attachments_root(board)/_staged/<token>/. See the
+-- kanban-task-image-attachments design doc (docs/design/).
+CREATE TABLE IF NOT EXISTS staged_attachments (
+    token        TEXT PRIMARY KEY,
+    filename     TEXT NOT NULL,
+    stored_path  TEXT NOT NULL,
+    content_type TEXT,
+    size         INTEGER NOT NULL DEFAULT 0,
+    uploaded_by  TEXT,
+    board        TEXT,
+    created_at   INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_staged_created ON staged_attachments(created_at);
 
 -- Subscription from a gateway source (platform + chat + thread) to a
 -- task. The gateway's kanban-notifier watcher tails task_events and
@@ -4274,6 +4316,293 @@ def delete_attachment(conn: sqlite3.Connection, attachment_id: int) -> Optional[
     except OSError:
         pass
     return att
+
+
+# ---------------------------------------------------------------------------
+# Staged attachments — pre-task-creation paste window (kanban new-task-image
+# spec, docs/design/kanban-task-image-attachments.md)
+# ---------------------------------------------------------------------------
+
+
+def _staged_attachments_dir(board: Optional[str] = None) -> Path:
+    """Return the directory under which staged (pre-task) blobs are stored.
+
+    Lives in a ``_staged/`` subdirectory of the board's attachments root so
+    the existing "confirm the blob is under the board's attachments root"
+    defense-in-depth check applies unchanged to the staged download route.
+    """
+    return attachments_root(board=board) / "_staged"
+
+
+def stage_attachment_bytes(
+    filename: str,
+    data: bytes,
+    *,
+    content_type: Optional[str] = None,
+    uploaded_by: Optional[str] = None,
+    board: Optional[str] = None,
+) -> StagedAttachment:
+    """Validate and persist a pasted-image blob before its task exists.
+
+    Enforces the image-specific mime allowlist (:data:`KANBAN_IMAGE_ALLOWED_MIME_TYPES`)
+    and size cap (:data:`KANBAN_IMAGE_ATTACHMENT_MAX_BYTES`) rather than the
+    generic attachment rules — this path is deliberately image-only (see the
+    design doc). Writes the blob under
+    ``attachments_root(board)/_staged/<token>/<safe_name>`` and inserts a
+    ``staged_attachments`` row keyed by a fresh opaque ``token``.
+
+    Raises :class:`ValueError` for an unsupported mime type or bad filename,
+    :class:`AttachmentTooLarge` when ``data`` exceeds the cap.
+    """
+    normalized_type = (content_type or "").split(";", 1)[0].strip().lower()
+    if normalized_type not in KANBAN_IMAGE_ALLOWED_MIME_TYPES:
+        accepted = ", ".join(sorted(KANBAN_IMAGE_ALLOWED_MIME_TYPES))
+        raise ValueError(
+            f"unsupported image type: {content_type or 'unknown'}; accepted: {accepted}"
+        )
+    if len(data) > KANBAN_IMAGE_ATTACHMENT_MAX_BYTES:
+        raise AttachmentTooLarge(
+            f"attachment exceeds {KANBAN_IMAGE_ATTACHMENT_MAX_BYTES // (1024 * 1024)} MB limit"
+        )
+    safe_name = _safe_attachment_name(filename)
+    token = f"st_{secrets.token_hex(8)}"
+    dest_dir = _staged_attachments_dir(board=board) / token
+    dest_dir.mkdir(parents=True, exist_ok=True)
+    dest_path = dest_dir / safe_name
+    dest_path.write_bytes(data)
+    now = int(time.time())
+    conn = connect(board=board)
+    try:
+        with write_txn(conn):
+            conn.execute(
+                "INSERT INTO staged_attachments "
+                "(token, filename, stored_path, content_type, size, uploaded_by, board, created_at) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                (
+                    token,
+                    safe_name,
+                    str(dest_path.resolve()),
+                    content_type,
+                    len(data),
+                    uploaded_by,
+                    board,
+                    now,
+                ),
+            )
+    except Exception:
+        try:
+            dest_path.unlink(missing_ok=True)
+            dest_dir.rmdir()
+        except OSError:
+            pass
+        raise
+    finally:
+        conn.close()
+    return StagedAttachment(
+        token=token,
+        filename=safe_name,
+        stored_path=str(dest_path.resolve()),
+        content_type=content_type,
+        size=len(data),
+        uploaded_by=uploaded_by,
+        board=board,
+        created_at=now,
+    )
+
+
+def _row_to_staged_attachment(r: sqlite3.Row) -> StagedAttachment:
+    return StagedAttachment(
+        token=r["token"],
+        filename=r["filename"],
+        stored_path=r["stored_path"],
+        content_type=r["content_type"],
+        size=r["size"] or 0,
+        uploaded_by=r["uploaded_by"],
+        board=r["board"],
+        created_at=r["created_at"],
+    )
+
+
+def get_staged_attachment(
+    token: str, *, board: Optional[str] = None
+) -> Optional[StagedAttachment]:
+    """Look up a staged attachment by token. Returns ``None`` if unknown."""
+    conn = connect(board=board)
+    try:
+        r = conn.execute(
+            "SELECT * FROM staged_attachments WHERE token = ?", (token,)
+        ).fetchone()
+        return _row_to_staged_attachment(r) if r is not None else None
+    finally:
+        conn.close()
+
+
+def delete_staged_attachment(token: str, *, board: Optional[str] = None) -> bool:
+    """Remove a staged attachment's row and on-disk blob (+ its directory).
+
+    Used both by the explicit ``DELETE /attachments/staged/{token}`` route
+    (user removes a pasted image before submit) and by promotion cleanup.
+    Returns ``False`` if the token is unknown; the blob removal itself is
+    best-effort (a missing file is not an error).
+    """
+    conn = connect(board=board)
+    try:
+        with write_txn(conn):
+            r = conn.execute(
+                "SELECT * FROM staged_attachments WHERE token = ?", (token,)
+            ).fetchone()
+            if r is None:
+                return False
+            staged = _row_to_staged_attachment(r)
+            conn.execute("DELETE FROM staged_attachments WHERE token = ?", (token,))
+    finally:
+        conn.close()
+    try:
+        p = Path(staged.stored_path)
+        if p.is_file():
+            p.unlink()
+        # Clean up the now-empty per-token staging directory too.
+        parent = p.parent
+        if parent.is_dir() and not any(parent.iterdir()):
+            parent.rmdir()
+    except OSError:
+        pass
+    return True
+
+
+def promote_staged_attachments(
+    conn: sqlite3.Connection,
+    task_id: str,
+    tokens: list[str],
+    *,
+    uploaded_by: Optional[str] = None,
+    board: Optional[str] = None,
+) -> tuple[list[Attachment], list[str]]:
+    """Promote staged (pre-task) blobs into real ``task_attachments`` rows.
+
+    For each token: look up the staged row, ``os.rename()`` the blob into
+    :func:`task_attachments_dir` (same filesystem, so this is a metadata-only
+    move, not a copy), insert the ``task_attachments`` row via
+    :func:`add_attachment`, delete the staged row + its now-empty directory.
+
+    Returns ``(promoted_attachments, warnings)``. An unknown/expired/
+    already-promoted token, or exceeding
+    :data:`KANBAN_MAX_PENDING_ATTACHMENTS_PER_TASK`, becomes a warning
+    string rather than failing the whole call — a stale token must never
+    fail task creation.
+    """
+    promoted: list[Attachment] = []
+    warnings: list[str] = []
+    accepted_tokens = list(dict.fromkeys(tokens))[:KANBAN_MAX_PENDING_ATTACHMENTS_PER_TASK]
+    overflow_tokens = list(dict.fromkeys(tokens))[KANBAN_MAX_PENDING_ATTACHMENTS_PER_TASK:]
+    for token in overflow_tokens:
+        warnings.append(
+            f"token {token} dropped: exceeds max "
+            f"{KANBAN_MAX_PENDING_ATTACHMENTS_PER_TASK} pending attachments per task"
+        )
+
+    for token in accepted_tokens:
+        staged_conn = connect(board=board)
+        try:
+            r = staged_conn.execute(
+                "SELECT * FROM staged_attachments WHERE token = ?", (token,)
+            ).fetchone()
+        finally:
+            staged_conn.close()
+        if r is None:
+            warnings.append(f"token {token} not found or expired")
+            continue
+        staged = _row_to_staged_attachment(r)
+        src_path = Path(staged.stored_path)
+        if not src_path.is_file():
+            warnings.append(f"token {token} blob missing on disk")
+            delete_staged_attachment(token, board=board)
+            continue
+
+        dest_dir = task_attachments_dir(task_id, board=board)
+        dest_dir.mkdir(parents=True, exist_ok=True)
+        safe_name = _safe_attachment_name(staged.filename)
+        dest_path = _collision_free_path(dest_dir, safe_name)
+        try:
+            os.rename(src_path, dest_path)
+        except OSError:
+            # Cross-device or other rename failure: fall back to copy+remove
+            # so a promotion never silently loses the pasted image.
+            dest_path.write_bytes(src_path.read_bytes())
+            try:
+                src_path.unlink()
+            except OSError:
+                pass
+
+        try:
+            att_id = add_attachment(
+                conn,
+                task_id,
+                filename=dest_path.name,
+                stored_path=str(dest_path.resolve()),
+                content_type=staged.content_type,
+                size=staged.size,
+                uploaded_by=uploaded_by,
+            )
+        except Exception:
+            try:
+                dest_path.unlink(missing_ok=True)
+            except OSError:
+                pass
+            warnings.append(f"token {token} failed to promote: unknown task {task_id}")
+            continue
+
+        att = get_attachment(conn, att_id)
+        if att is not None:
+            promoted.append(att)
+
+        # Remove the staged row + its now-empty per-token directory. The
+        # blob itself already moved via os.rename above.
+        del_conn = connect(board=board)
+        try:
+            with write_txn(del_conn):
+                del_conn.execute(
+                    "DELETE FROM staged_attachments WHERE token = ?", (token,)
+                )
+        finally:
+            del_conn.close()
+        try:
+            staged_dir = src_path.parent
+            if staged_dir.is_dir() and not any(staged_dir.iterdir()):
+                staged_dir.rmdir()
+        except OSError:
+            pass
+
+    return promoted, warnings
+
+
+def reap_staged_attachments(
+    max_age_seconds: int = KANBAN_STAGED_ATTACHMENT_TTL_SECONDS,
+    *,
+    board: Optional[str] = None,
+) -> int:
+    """Delete staged rows/blobs older than ``max_age_seconds``.
+
+    Cleans up abandoned "new task" dialogs where the user pasted an image
+    but never submitted (or explicitly removed it). Intended to be called
+    from the same dispatcher-tick GC pass that already runs
+    ``reconcile_orphaned_running`` / ``release_stale_claims``. Returns the
+    count removed.
+    """
+    cutoff = int(time.time()) - max_age_seconds
+    conn = connect(board=board)
+    try:
+        rows = conn.execute(
+            "SELECT * FROM staged_attachments WHERE created_at < ?", (cutoff,)
+        ).fetchall()
+    finally:
+        conn.close()
+    removed = 0
+    for r in rows:
+        token = r["token"]
+        if delete_staged_attachment(token, board=board):
+            removed += 1
+    return removed
 
 
 def list_events(conn: sqlite3.Connection, task_id: str) -> list[Event]:
@@ -10047,6 +10376,13 @@ def _dispatch_once_locked(
         # bookkeeping is broken (no valid claim, dead/gone worker) that the
         # TTL/crash/stale paths can never see. See reconcile_orphaned_running.
         result.reconciled_orphans = reconcile_orphaned_running(conn)
+    # Sweep abandoned pre-task-creation pasted-image uploads (e.g. a "new
+    # task" dialog closed without submitting). Best-effort: a GC failure
+    # here must never abort the dispatcher tick.
+    try:
+        reap_staged_attachments(board=board)
+    except Exception:
+        _log.debug("reap_staged_attachments failed during dispatch tick", exc_info=True)
     result.stale = detect_stale_running(
         conn, stale_timeout_seconds=stale_timeout_seconds,
     )
