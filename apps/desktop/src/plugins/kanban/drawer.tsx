@@ -11,6 +11,8 @@ import {
   cn,
   Codicon,
   compactNumber,
+  Dialog,
+  DialogContent,
   DropdownMenu,
   DropdownMenuContent,
   DropdownMenuItem,
@@ -34,6 +36,7 @@ import {
   addComment,
   deleteTask,
   estimateTask,
+  fetchAttachmentDataUrl,
   fetchLog,
   fetchProfiles,
   fetchTask,
@@ -528,6 +531,86 @@ function DescriptionSection({ body, onSave }: { body: null | string | undefined;
 // administrative note into that slot; hide those (Runs still shows them).
 const isAdminSummary = (summary: string) => /^status changed to \w+ \(dashboard\/direct\)$/.test(summary)
 
+export const isImageAttachment = (a: KanbanAttachment) => (a.content_type ?? '').startsWith('image/')
+
+/** One image tile: fetches its bytes lazily as a base64 data URL (the
+ *  desktop plugin host has no authenticated `<img src>` door — REST goes
+ *  over the Electron IPC JSON bridge) and swaps in a broken-image
+ *  placeholder on either a fetch failure or a decode failure, never a
+ *  crash (#cae4c2ba acceptance: broken/missing images handled gracefully). */
+export function ImageThumb({
+  attachment,
+  onOpen
+}: {
+  attachment: KanbanAttachment
+  onOpen: (filename: string, src: string) => void
+}) {
+  const k = useKanban()
+  const [decodeFailed, setDecodeFailed] = useState(false)
+
+  const { data, isError, isLoading } = useQuery({
+    queryFn: () => fetchAttachmentDataUrl(attachment.id),
+    queryKey: ['kanban', 'attachment-data-url', attachment.id],
+    retry: false,
+    staleTime: Infinity
+  })
+
+  const broken = isError || decodeFailed
+  const src = data?.data_url
+
+  return (
+    <Tip label={broken ? k.brokenImage : attachment.filename}>
+      <button
+        aria-label={broken ? k.brokenImage : k.openImage}
+        className="grid size-16 shrink-0 place-items-center overflow-hidden rounded border border-(--ui-stroke-tertiary) bg-(--ui-bg-quaternary) text-(--ui-text-quaternary) transition-colors hover:border-(--ui-stroke-secondary)"
+        disabled={!src || broken}
+        onClick={() => src && !broken && onOpen(attachment.filename, src)}
+        type="button"
+      >
+        {broken ? (
+          <Codicon name="warning" size="1rem" />
+        ) : src ? (
+          <img
+            alt={attachment.filename}
+            className="size-full object-cover"
+            onError={() => setDecodeFailed(true)}
+            src={src}
+          />
+        ) : (
+          <Codicon name="sync" size="0.9rem" spinning={isLoading} />
+        )}
+      </button>
+    </Tip>
+  )
+}
+
+/** Image strip above the generic Attachments/Files section — every task
+ *  attachment whose content_type starts with `image/`. Click to enlarge in
+ *  a lightbox. */
+export function ImagesSection({
+  attachments,
+  onOpen
+}: {
+  attachments: KanbanAttachment[]
+  onOpen: (filename: string, src: string) => void
+}) {
+  const k = useKanban()
+
+  if (attachments.length === 0) {
+    return null
+  }
+
+  return (
+    <Section label={k.images(attachments.length)}>
+      <div className="flex flex-wrap gap-2">
+        {attachments.map(attachment => (
+          <ImageThumb attachment={attachment} key={attachment.id} onOpen={onOpen} />
+        ))}
+      </div>
+    </Section>
+  )
+}
+
 function AttachmentsSection({
   attachments,
   onUpload,
@@ -670,6 +753,7 @@ export function TaskDrawer({
   const k = useKanban()
   const qc = useQueryClient()
   const slug = useValue($boardSlug)
+  const [lightbox, setLightbox] = useState<null | { filename: string; src: string }>(null)
 
   // Socket-invalidated (bindApi); the interval is only the socketless heartbeat.
   const { data: detail, error } = useQuery({
@@ -1109,14 +1193,34 @@ export function TaskDrawer({
               </Section>
             )}
 
+            <ImagesSection attachments={detail.attachments.filter(isImageAttachment)} onOpen={(filename, src) => setLightbox({ filename, src })} />
+
             <AttachmentsSection
-              attachments={detail.attachments}
+              attachments={detail.attachments.filter(a => !isImageAttachment(a))}
               onUpload={file => uploadMut.mutate(file)}
               pending={uploadMut.isPending}
             />
           </div>
         )}
       </div>
+
+      <Dialog onOpenChange={open => !open && setLightbox(null)} open={!!lightbox}>
+        <DialogContent
+          bodyClassName="block overflow-visible p-0"
+          className="w-auto max-h-[calc(100vh-12rem)] max-w-[calc(100vw-12rem)] border-0 bg-transparent shadow-none"
+          showCloseButton={false}
+        >
+          {lightbox && (
+            <img
+              alt={lightbox.filename}
+              className="block max-h-[calc(100vh-12rem)] max-w-[calc(100vw-12rem)] cursor-zoom-out rounded-lg object-contain shadow-2xl"
+              onClick={() => setLightbox(null)}
+              onError={() => setLightbox(null)}
+              src={lightbox.src}
+            />
+          )}
+        </DialogContent>
+      </Dialog>
     </div>
   )
 }

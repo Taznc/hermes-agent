@@ -238,6 +238,14 @@ export const reclaimTask = (id: string) => nudged(call(withBoard(`/tasks/${id}/r
 export const uploadAttachment = (id: string, upload: { filename: string; contentType?: string; bytes: ArrayBuffer }) =>
   call(withBoard(`/tasks/${id}/attachments`), { method: 'POST', upload })
 
+/** Fetch an attachment's bytes as a base64 data URL — the desktop plugin
+ *  host has no authenticated `<img src>` door of its own (REST goes over
+ *  the Electron IPC bridge, JSON only), so rendering a pasted image inline
+ *  in the drawer needs the bytes delivered as a data URL rather than a URL
+ *  to point an `<img>` at. */
+export const fetchAttachmentDataUrl = (id: number | string) =>
+  call<{ data_url: string; content_type: string; size: number }>(withBoard(`/attachments/${id}/data-url`))
+
 /** Upload a pasted image before the task exists (new-task dialog paste flow).
  *  Returns a `token` that travels in `pending_attachment_tokens` on
  *  `createTask` and is promoted into a real attachment server-side. */

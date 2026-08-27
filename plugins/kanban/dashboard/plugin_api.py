@@ -36,6 +36,7 @@ the port.
 from __future__ import annotations
 
 import asyncio
+import base64
 import json
 import logging
 import sqlite3
@@ -448,6 +449,18 @@ def get_board(
             )
         }
 
+        # First image attachment per task, for the card thumbnail indicator
+        # (#cae4c2ba). One aggregate query (MIN(id) per task among image/*
+        # attachments) rather than N per-task lookups; the drawer fetches
+        # the full attachments list separately via GET /tasks/:id.
+        first_image_attachment: dict[str, int] = {
+            r["task_id"]: r["min_id"]
+            for r in conn.execute(
+                "SELECT task_id, MIN(id) AS min_id FROM task_attachments "
+                "WHERE content_type LIKE 'image/%' GROUP BY task_id"
+            )
+        }
+
         # Progress rollup: for each parent, how many children are done / total.
         # One pass over task_links joined with child status — cheaper than
         # N per-task queries and the plugin uses it to render "N/M".
@@ -489,6 +502,7 @@ def get_board(
             d = _task_dict(t, latest_summary=preview)
             d["link_counts"] = link_counts.get(t.id, {"parents": 0, "children": 0})
             d["comment_count"] = comment_counts.get(t.id, 0)
+            d["image_attachment_id"] = first_image_attachment.get(t.id)
             d["progress"] = progress.get(t.id)  # None when the task has no children
             diags = diagnostics_per_task.get(t.id)
             if diags:
@@ -860,6 +874,59 @@ def remove_attachment(attachment_id: int, board: Optional[str] = Query(None)):
         if att is None:
             raise HTTPException(status_code=404, detail="attachment not found")
         return {"ok": True, "id": attachment_id}
+    finally:
+        conn.close()
+
+
+# Inline-rendering size cap for the data-url endpoint below. Desktop has no
+# authenticated <img src> door of its own (unlike the browser dashboard, which
+# can rely on the session cookie) — plugin REST calls go through the Electron
+# IPC bridge, which only carries JSON/ArrayBuffer, not a streamed byte range a
+# plain <img> tag could point at. Base64-inlining a 10 MB pasted image (the
+# already-enforced KANBAN_IMAGE_ATTACHMENT_MAX_BYTES cap) fits comfortably in
+# one JSON response; this cap is a second line of defense against a much
+# larger GENERIC attachment (25 MB cap) that was never meant for inline
+# rendering — those stay download-only via GET /attachments/{id}.
+_ATTACHMENT_INLINE_MAX_BYTES = 12 * 1024 * 1024
+
+
+@router.get("/attachments/{attachment_id}/data-url")
+def attachment_data_url(attachment_id: int, board: Optional[str] = Query(None)):
+    """Serve an attachment's bytes as a base64 data URL (JSON body).
+
+    Companion to ``GET /attachments/{id}`` (which streams raw bytes for a
+    browser `<a href>`/authenticated-fetch download): the desktop plugin host
+    has no equivalent authenticated binary-fetch door, only JSON REST over the
+    Electron IPC bridge, so rendering a pasted image inline (task detail view,
+    #cae4c2ba) needs the bytes delivered as a data URL instead of a URL to
+    point an `<img>` at.
+    """
+    board = _resolve_board(board)
+    conn = _conn(board=board)
+    try:
+        att = kanban_db.get_attachment(conn, attachment_id)
+        if att is None:
+            raise HTTPException(status_code=404, detail="attachment not found")
+        root = kanban_db.attachments_root(board=board).resolve()
+        try:
+            stored = Path(att.stored_path).resolve()
+            stored.relative_to(root)
+        except (ValueError, OSError):
+            raise HTTPException(status_code=404, detail="attachment file unavailable")
+        if not stored.is_file():
+            raise HTTPException(status_code=404, detail="attachment file missing on disk")
+        size = stored.stat().st_size
+        if size > _ATTACHMENT_INLINE_MAX_BYTES:
+            raise HTTPException(
+                status_code=413,
+                detail=(
+                    f"attachment exceeds {_ATTACHMENT_INLINE_MAX_BYTES // (1024 * 1024)} MB "
+                    "inline-render limit; download it instead"
+                ),
+            )
+        encoded = base64.b64encode(stored.read_bytes()).decode("ascii")
+        mime = att.content_type or "application/octet-stream"
+        return {"data_url": f"data:{mime};base64,{encoded}", "content_type": mime, "size": size}
     finally:
         conn.close()
 

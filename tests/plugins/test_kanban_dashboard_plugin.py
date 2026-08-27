@@ -116,6 +116,42 @@ def test_create_task_appears_on_board(client):
     assert "researcher" in data["assignees"]
 
 
+def test_board_image_attachment_id_thumbnail_indicator(client):
+    """Card gains `image_attachment_id` (first image attachment, by id) once
+    a task has a pasted/uploaded image; non-image attachments don't set it,
+    and it's the *first* image, not the last (#cae4c2ba card thumbnail)."""
+    task_id = client.post("/api/plugins/kanban/tasks", json={"title": "img-card"}).json()["task"]["id"]
+
+    r = client.get("/api/plugins/kanban/board")
+    card = next(t for c in r.json()["columns"] for t in c["tasks"] if t["id"] == task_id)
+    assert card.get("image_attachment_id") is None
+
+    # A non-image attachment must not set it.
+    client.post(
+        f"/api/plugins/kanban/tasks/{task_id}/attachments",
+        files={"file": ("notes.txt", b"text", "text/plain")},
+    )
+    r = client.get("/api/plugins/kanban/board")
+    card = next(t for c in r.json()["columns"] for t in c["tasks"] if t["id"] == task_id)
+    assert card.get("image_attachment_id") is None
+
+    r1 = client.post(
+        f"/api/plugins/kanban/tasks/{task_id}/attachments",
+        files={"file": ("first.png", b"a", "image/png")},
+    )
+    first_id = r1.json()["attachment"]["id"]
+    r2 = client.post(
+        f"/api/plugins/kanban/tasks/{task_id}/attachments",
+        files={"file": ("second.png", b"b", "image/png")},
+    )
+    second_id = r2.json()["attachment"]["id"]
+    assert second_id > first_id
+
+    r = client.get("/api/plugins/kanban/board")
+    card = next(t for c in r.json()["columns"] for t in c["tasks"] if t["id"] == task_id)
+    assert card["image_attachment_id"] == first_id
+
+
 def test_patch_board_sets_project_directory(client, tmp_path):
     """Board-level default_workdir must be editable after creation."""
     kb.create_board("late-config")

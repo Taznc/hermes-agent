@@ -19,6 +19,10 @@ export interface KanbanTask {
   progress?: null | { done: number; total: number }
   /** Compact diagnostics rollup — present only when a card has warnings. */
   warnings?: null | { count: number; highest_severity?: null | string }
+  /** id of the first image attachment (content_type starting `image/`), if
+   *  any — drives the card's thumbnail indicator. Fetch bytes via
+   *  `fetchAttachmentDataUrl(id)`. */
+  image_attachment_id?: null | number | string
   /** Worker liveness (present on running cards) — drives the arc + run clock. */
   started_at?: null | number
   worker_pid?: null | number
@@ -88,6 +92,7 @@ export interface KanbanEvent {
 export interface KanbanAttachment {
   id: number | string
   filename: string
+  content_type?: null | string
   size?: null | number
 }
 
