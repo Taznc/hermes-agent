@@ -51,9 +51,11 @@ import {
   useValue
 } from '@hermes/plugin-sdk'
 import {
+  createContext,
   type CSSProperties,
   type DragEvent as ReactDragEvent,
   type ReactNode,
+  useContext,
   useEffect,
   useMemo,
   useRef,
@@ -78,6 +80,7 @@ import {
   PROFILES_KEY
 } from './api'
 import { BoardSwitcher } from './board-switcher'
+import { blockerStand, buildGraph, type DependencyGraph, downstreamOf, focusSets, indexBoard, upstreamOf } from './deps'
 import { TaskDrawer } from './drawer'
 import { EMPTY_OVERRIDE, ModelOverrideField, overrideCreateFields, type TaskModelOverride } from './model-override'
 import { OrchestrationPanel } from './orchestration'
@@ -150,13 +153,166 @@ function setPriorityCard(board: KanbanBoard, id: string, priority: number): Kanb
   }
 }
 
+// ── dependency view (graph + focus), shared by every card ────────────────────
+
+/**
+ * The board's dependency adjacency, its id→task index, and the current focus,
+ * handed to cards through context rather than threaded as props: `Column`
+ * already carries a dozen callbacks, and every card needs the same three
+ * objects. The graph and index are built ONCE per board payload up in
+ * `KanbanBoardPage` — rebuilding them per card would be O(cards × edges) on
+ * every render.
+ *
+ * `hasEdges` is the capability probe for an older backend that sends
+ * `link_counts` but not `link_edges`: without edges we can still show honest
+ * counts, but we cannot know which blockers are still gating.
+ */
+interface DependencyView {
+  downstream: ReadonlySet<string>
+  focused: null | string
+  graph: DependencyGraph
+  hasEdges: boolean
+  index: Map<string, KanbanTask>
+  onFocus: (id: string) => void
+  upstream: ReadonlySet<string>
+}
+
+const EMPTY_IDS: ReadonlySet<string> = new Set<string>()
+
+// Module-level constant so the context default keeps a stable identity across
+// renders (a fresh object here would re-render every consumer for nothing).
+const NO_DEPENDENCIES: DependencyView = {
+  downstream: EMPTY_IDS,
+  focused: null,
+  graph: { blockedBy: new Map(), blocking: new Map() },
+  hasEdges: false,
+  index: new Map(),
+  onFocus: () => {},
+  upstream: EMPTY_IDS
+}
+
+const DependencyContext = createContext<DependencyView>(NO_DEPENDENCIES)
+
+const useDependencies = () => useContext(DependencyContext)
+
+type FocusRole = 'downstream' | 'focused' | 'upstream'
+
+/** Where a card sits relative to the focused one. `null` while nothing is
+ *  focused AND for unrelated cards — callers tell them apart via `focused`. */
+function focusRole(deps: DependencyView, id: string): FocusRole | null {
+  if (!deps.focused) {
+    return null
+  }
+
+  if (deps.focused === id) {
+    return 'focused'
+  }
+
+  return deps.upstream.has(id) ? 'upstream' : deps.downstream.has(id) ? 'downstream' : null
+}
+
+/** Does this card have any link at all — i.e. is focusing it meaningful? */
+function hasDependencies(deps: DependencyView, task: KanbanTask): boolean {
+  if (deps.hasEdges) {
+    return upstreamOf(deps.graph, task.id).length > 0 || downstreamOf(deps.graph, task.id).length > 0
+  }
+
+  return Boolean(task.link_counts && (task.link_counts.parents > 0 || task.link_counts.children > 0))
+}
+
+/**
+ * Statuses where "every blocker is done" is ACTIONABLE news worth a green chip.
+ *
+ * Deliberately narrow, and please don't "simplify" this gate away. On a real
+ * board the overwhelmingly common shape of `parents > 0 && gating === 0` is a
+ * card that is ITSELF already done — it finished long after its blockers did.
+ * Measured on the reference board: of 32 tasks with all blockers satisfied, 30
+ * were `done` and 2 were `running`. Dropping the status gate paints 30 done
+ * cards green and drowns the handful that actually need a human to move them.
+ * Only a card still parked in a waiting lane can act on the news.
+ */
+const PROMOTABLE_STATUSES: ReadonlySet<string> = new Set(['on_hold', 'scheduled', 'todo', 'triage'])
+
 // ── card ─────────────────────────────────────────────────────────────────────
 
-function Meta({ children, icon }: { children: ReactNode; icon: string }) {
+function Meta({ children, className, icon }: { children: ReactNode; className?: string; icon: string }) {
   return (
-    <span className="inline-flex items-center gap-1">
+    <span className={cn('inline-flex items-center gap-1', className)}>
       <Codicon name={icon} size="0.7rem" />
       {children}
+    </span>
+  )
+}
+
+/**
+ * The dependency chips. Replaces an anonymous `parents + children` total that
+ * told the reader nothing: the two directions mean opposite things, so they
+ * get separate chips.
+ *
+ *  - blocked-by, red while at least one blocker still gates;
+ *  - "blockers clear" in green, but only on a card that can act on it
+ *    (see `PROMOTABLE_STATUSES`);
+ *  - blocks-n, in a cool tone — informational, never alarming.
+ *
+ * Without `link_edges` (older backend) we can't resolve blocker statuses, so
+ * we fall back to the raw `link_counts` numbers and drop the gating/clear
+ * distinction entirely rather than guessing at it.
+ */
+function DependencyChips({ task }: { task: KanbanTask }) {
+  const k = useKanban()
+  const deps = useDependencies()
+  const stand = blockerStand(deps.graph, deps.index, task.id)
+
+  const blockedBy = deps.hasEdges ? stand.total : (task.link_counts?.parents ?? 0)
+  const blocks = deps.hasEdges ? downstreamOf(deps.graph, task.id).length : (task.link_counts?.children ?? 0)
+  const clear = deps.hasEdges && blockedBy > 0 && stand.gating === 0 && PROMOTABLE_STATUSES.has(task.status)
+
+  return (
+    <>
+      {clear ? (
+        <Tip label={k.depClearTip}>
+          <span className="inline-flex shrink-0 cursor-help items-center gap-1 font-medium text-emerald-500">
+            <Codicon name="pass-filled" size="0.7rem" />
+            {k.depClear}
+          </span>
+        </Tip>
+      ) : blockedBy > 0 ? (
+        <Meta className={cn('shrink-0', stand.gating > 0 && 'text-destructive')} icon="circle-slash">
+          {k.depBlockedByCount(blockedBy)}
+        </Meta>
+      ) : null}
+      {blocks > 0 && (
+        <Meta className="shrink-0 text-sky-400/80" icon="references">
+          {k.depBlocksCount(blocks)}
+        </Meta>
+      )}
+    </>
+  )
+}
+
+/**
+ * The upstream/downstream flag on a card caught in the focused chain. Lives in
+ * the footer's left group rather than as its own row so lighting a chain never
+ * changes a card's HEIGHT — only colours and this one inline chip appear, and
+ * the flex row absorbs the width. Nothing below it in the column moves.
+ */
+function FocusFlag({ task }: { task: KanbanTask }) {
+  const k = useKanban()
+  const deps = useDependencies()
+  const role = focusRole(deps, task.id)
+
+  if (role !== 'downstream' && role !== 'upstream') {
+    return null
+  }
+
+  return (
+    <span
+      className={cn(
+        'shrink-0 font-semibold uppercase tracking-[0.08em]',
+        role === 'upstream' ? 'text-amber-500' : 'text-sky-400'
+      )}
+    >
+      {role === 'upstream' ? k.depFocusUpstream : k.depFocusDownstream}
     </span>
   )
 }
@@ -164,7 +320,6 @@ function Meta({ children, icon }: { children: ReactNode; icon: string }) {
 function CardFooter({ arc, task }: { arc: ArcState | null; task: KanbanTask }) {
   const k = useKanban()
   const created = ago(task.created_at)
-  const links = task.link_counts ? task.link_counts.parents + task.link_counts.children : 0
   const fallback = useDefaultAssignee()
   const orchestrator = useOrchestration()?.resolved_orchestrator_profile ?? ''
   // Ready + no assignee: with a configured default assignee the dispatcher
@@ -225,6 +380,7 @@ function CardFooter({ arc, task }: { arc: ArcState | null; task: KanbanTask }) {
           </span>
         </Tip>
       )}
+      <FocusFlag task={task} />
       <div className="ml-auto flex min-w-0 shrink items-center gap-2">
         {typeof task.priority === 'number' && task.priority > 0 && (
           <span className="inline-flex items-center gap-0.5 text-amber-500">
@@ -238,7 +394,7 @@ function CardFooter({ arc, task }: { arc: ArcState | null; task: KanbanTask }) {
           </Meta>
         )}
         {Boolean(task.comment_count) && <Meta icon="comment">{task.comment_count}</Meta>}
-        {links > 0 && <Meta icon="references">{links}</Meta>}
+        <DependencyChips task={task} />
         {task.warnings && task.warnings.count > 0 && (
           <span className="inline-flex items-center gap-0.5 text-destructive">
             <Codicon name="warning" size="0.7rem" />
@@ -281,6 +437,13 @@ function Card({
   const arc = arcState(task, fallback)
   const highPriority = isHighPriority(task)
 
+  const deps = useDependencies()
+  const role = focusRole(deps, task.id)
+  // Dimmed = a focus is active and this card is on neither end of it. Purely a
+  // class swap: the card keeps its position, its identity, and its subtree.
+  const dimmed = Boolean(deps.focused) && role === null
+  const linked = hasDependencies(deps, task)
+
   return (
     <ContextMenu>
       <ContextMenuTrigger asChild>
@@ -296,10 +459,35 @@ function Card({
             highPriority &&
               !selected &&
               'bg-[color-mix(in_srgb,#fbbf24_5%,var(--ui-bg-elevated))] hover:bg-[color-mix(in_srgb,#fbbf24_9%,var(--ui-bg-elevated))]',
+            // Focus chain. Rings only — no layout property moves, so nothing
+            // reflows and no card is re-ordered or unmounted.
+            'transition-[opacity,filter,box-shadow,background-color]',
+            role === 'focused' && 'ring-2 ring-(--ui-stroke-primary)',
+            role === 'upstream' && 'ring-2 ring-amber-500/70',
+            role === 'downstream' && 'ring-2 ring-sky-500/70',
+            dimmed && 'opacity-35 saturate-50',
             dragging && 'opacity-40'
           )}
           draggable
-          onClick={event => (event.metaKey || event.ctrlKey ? onToggleSelect(task.id) : onOpen(task.id))}
+          onClick={event => {
+            if (event.metaKey || event.ctrlKey) {
+              onToggleSelect(task.id)
+
+              return
+            }
+
+            // Alt/Option-click is the power-user shortcut for the same trace
+            // the hover button starts. Bare click still opens the drawer.
+            if (event.altKey) {
+              if (linked) {
+                deps.onFocus(task.id)
+              }
+
+              return
+            }
+
+            onOpen(task.id)
+          }}
           onDragEnd={() => setDragging(false)}
           onDragStart={event => {
             event.dataTransfer.setData('text/plain', task.id)
@@ -344,7 +532,42 @@ function Card({
               <Codicon name={highPriority ? 'star-full' : 'star-empty'} size="0.8rem" />
             </button>
           </Tip>
-          <span className="line-clamp-2 pr-5 text-[0.8125rem] font-medium leading-snug text-foreground">
+          {/* Trace this card's dependency chain. A dedicated affordance rather
+              than overloading a bare click (which must keep opening the
+              drawer): it appears on hover exactly like the star above it, and
+              ONLY on cards that actually have a link — so it advertises where
+              dependencies exist instead of adding noise to every card.
+              Alt-click on the card body does the same thing for the keyboard-
+              hand crowd. Pressed state doubles as the "clear" control. */}
+          {linked && (
+            <Tip label={role === 'focused' ? k.depClearFocus : k.depFocusHint}>
+              <button
+                aria-label={role === 'focused' ? k.depClearFocus : k.depFocusHint}
+                aria-pressed={role === 'focused'}
+                className={cn(
+                  'absolute top-1.5 right-7 grid size-5 place-items-center rounded text-(--ui-text-quaternary) transition-opacity hover:bg-(--chrome-action-hover) hover:text-foreground',
+                  role === 'focused'
+                    ? 'text-foreground opacity-100'
+                    : 'opacity-0 focus-visible:opacity-100 group-hover:opacity-100'
+                )}
+                onClick={event => {
+                  event.stopPropagation()
+                  deps.onFocus(task.id)
+                }}
+                type="button"
+              >
+                <Codicon name="references" size="0.8rem" />
+              </button>
+            </Tip>
+          )}
+          <span
+            className={cn(
+              'line-clamp-2 text-[0.8125rem] font-medium leading-snug text-foreground',
+              // Keep the title clear of the corner buttons. Static per task
+              // (a card either has links or it doesn't), so no hover thrash.
+              linked ? 'pr-11' : 'pr-5'
+            )}
+          >
             {task.title || task.id}
           </span>
           {summary && (
@@ -1158,6 +1381,10 @@ export function KanbanBoardPage() {
   const [tenant, setTenant] = useState('')
   const [assignee, setAssignee] = useState('')
   const [selected, setSelected] = useState<ReadonlySet<string>>(new Set())
+  // Dependency-chain focus. Pure per-window presentation — deliberately local
+  // state, never a persisted store: a reload should not resurrect a trace the
+  // user started three sessions ago.
+  const [focused, setFocused] = useState<null | string>(null)
 
   // A new-task request raised from outside the page (⌘⌥N, the palette row).
   // The command navigates here and parks the lane; the page picks it up on
@@ -1202,6 +1429,47 @@ export function KanbanBoardPage() {
     })
   }, [board])
 
+  // Graph + index built exactly ONCE per board payload, then shared by every
+  // card through context. Per-card construction would be O(cards × edges) on
+  // every render. Keyed off the raw `board`, not the filtered view: a search
+  // filter hides cards but must not rewrite what depends on what.
+  const graph = useMemo(() => buildGraph(board), [board])
+  const index = useMemo(() => indexBoard(board), [board])
+  const hasEdges = Boolean(board?.link_edges && board.link_edges.length > 0)
+
+  // One hop only (see focusSets) — a transitive closure lights up most of a
+  // busy board and defeats the dimming.
+  const chain = useMemo(
+    () => (focused ? focusSets(graph, focused) : { downstream: EMPTY_IDS, upstream: EMPTY_IDS }),
+    [graph, focused]
+  )
+
+  // A focused card that left the board (deleted, archived, filtered away by a
+  // board switch) would strand every other card dimmed with nothing lit.
+  useEffect(() => {
+    if (focused && board && !index.has(focused)) {
+      setFocused(null)
+    }
+  }, [board, focused, index])
+
+  const dependencies = useMemo<DependencyView>(
+    () => ({
+      downstream: chain.downstream,
+      focused,
+      graph,
+      hasEdges,
+      index,
+      // Toggle: re-triggering the focused card clears it, so the same
+      // affordance both starts and ends a trace. Defined inline because
+      // `setFocused` is stable — a handler declared in the component body
+      // would be a fresh function every render and rebuild this object (and
+      // thus re-render every card) for nothing.
+      onFocus: (id: string) => setFocused(prev => (prev === id ? null : id)),
+      upstream: chain.upstream
+    }),
+    [chain, focused, graph, hasEdges, index]
+  )
+
   useEffect(() => {
     if (selected.size === 0) {
       return
@@ -1217,6 +1485,29 @@ export function KanbanBoardPage() {
 
     return () => window.removeEventListener('keydown', onKey)
   }, [selected.size])
+
+  // Esc clears the focus, but only when it is the topmost dismissable thing.
+  // The drawer owns Esc while it is open (it has no backdrop to click off, see
+  // drawer.tsx), the dialogs own it while *they* are open, and the selection
+  // handler above owns it while cards are selected. Gating on all four keeps
+  // this listener unregistered in exactly those cases, so nothing races over a
+  // single keypress and Esc always dismisses one layer at a time, innermost
+  // first. Same shape as the selection handler.
+  useEffect(() => {
+    if (!focused || openId || addStatus || selected.size > 0) {
+      return
+    }
+
+    const onKey = (event: KeyboardEvent) => {
+      if (event.key === 'Escape') {
+        setFocused(null)
+      }
+    }
+
+    window.addEventListener('keydown', onKey)
+
+    return () => window.removeEventListener('keydown', onKey)
+  }, [focused, openId, addStatus, selected.size])
 
   const columnNames = board?.columns.map(col => col.name) ?? []
 
@@ -1409,112 +1700,143 @@ export function KanbanBoardPage() {
   }
 
   return (
-    <div className="relative flex h-full flex-col overflow-hidden bg-(--ui-surface-background)">
-      {/* Page-owned titlebar chrome: exists exactly while this page is mounted. */}
-      <Contribute area={TITLEBAR_AREAS.center} id="kanban:board-switcher">
-        <BoardSwitcher />
-      </Contribute>
+    <DependencyContext.Provider value={dependencies}>
+      <div className="relative flex h-full flex-col overflow-hidden bg-(--ui-surface-background)">
+        {/* Page-owned titlebar chrome: exists exactly while this page is mounted. */}
+        <Contribute area={TITLEBAR_AREAS.center} id="kanban:board-switcher">
+          <BoardSwitcher />
+        </Contribute>
 
-      <header className="flex shrink-0 flex-wrap items-center gap-2 px-4 py-2">
-        <h1 className="text-sm font-semibold text-foreground">{k.title}</h1>
-        <span className="rounded-full bg-(--ui-bg-quaternary) px-1.5 py-px text-[0.625rem] tabular-nums text-(--ui-text-tertiary)">
-          {total}
-        </span>
-        {board && (
-          <FilterMenu
-            archived={archived}
-            assignee={assignee}
-            board={board}
-            onArchived={setArchived}
-            onAssignee={setAssignee}
-            onTenant={setTenant}
-            tenant={tenant}
-          />
-        )}
-        <SearchField aria-label={k.filterCards} onChange={setSearch} placeholder={k.filterCards} value={search} />
-        <div className="ml-auto flex items-center gap-1">
-          <Tip label={k.orchestrationSettings}>
-            <Button
-              aria-label={k.orchestrationSettings}
-              className={cn(settingsOpen && 'bg-(--ui-control-active-background) text-foreground')}
-              onClick={() => setSettingsOpen(!settingsOpen)}
-              size="icon-xs"
-              variant="ghost"
-            >
-              <Codicon name="organization" size="0.85rem" />
-            </Button>
-          </Tip>
-          <Button onClick={() => setAddStatus('triage')} size="sm">
-            <Codicon name="add" size="0.8rem" />
-            {k.newTask}
-          </Button>
-        </div>
-      </header>
-
-      {settingsOpen && <OrchestrationPanel />}
-
-      {board && <Intro />}
-
-      {errorMessage && !board ? (
-        <div className="grid flex-1 place-items-center">
-          <ErrorState title={errorMessage} />
-        </div>
-      ) : !filtered ? (
-        <div className="grid flex-1 place-items-center">
-          <Loader type="lemniscate-bloom" />
-        </div>
-      ) : total === 0 ? (
-        <div className="grid flex-1 place-items-center px-4 text-center">
-          <div className="flex flex-col items-center gap-2">
-            <Codicon className="text-(--ui-text-quaternary)" name="project" size="1.25rem" />
-            <p className="text-xs text-(--ui-text-tertiary)">{search || tenant || assignee ? k.noMatch : k.noTasks}</p>
-            <Button className="mt-0.5" onClick={() => setAddStatus('triage')} size="sm" variant="outline">
-              <Codicon name="add" size="0.75rem" />
+        <header className="flex shrink-0 flex-wrap items-center gap-2 px-4 py-2">
+          <h1 className="text-sm font-semibold text-foreground">{k.title}</h1>
+          <span className="rounded-full bg-(--ui-bg-quaternary) px-1.5 py-px text-[0.625rem] tabular-nums text-(--ui-text-tertiary)">
+            {total}
+          </span>
+          {board && (
+            <FilterMenu
+              archived={archived}
+              assignee={assignee}
+              board={board}
+              onArchived={setArchived}
+              onAssignee={setAssignee}
+              onTenant={setTenant}
+              tenant={tenant}
+            />
+          )}
+          <SearchField aria-label={k.filterCards} onChange={setSearch} placeholder={k.filterCards} value={search} />
+          <div className="ml-auto flex items-center gap-1">
+            <Tip label={k.orchestrationSettings}>
+              <Button
+                aria-label={k.orchestrationSettings}
+                className={cn(settingsOpen && 'bg-(--ui-control-active-background) text-foreground')}
+                onClick={() => setSettingsOpen(!settingsOpen)}
+                size="icon-xs"
+                variant="ghost"
+              >
+                <Codicon name="organization" size="0.85rem" />
+              </Button>
+            </Tip>
+            <Button onClick={() => setAddStatus('triage')} size="sm">
+              <Codicon name="add" size="0.8rem" />
               {k.newTask}
             </Button>
           </div>
-        </div>
-      ) : (
-        <div
-          className={cn('flex flex-1 gap-2 overflow-x-auto px-4 pt-1 pb-3', grabbing && 'cursor-grabbing')}
-          onMouseDown={onMouseDown}
-          ref={lanesRef}
-        >
-          {filtered.columns.map(col => {
-            const auto = boardHasWork && col.tasks.length === 0
+        </header>
 
-            return (
-              <Column
-                collapsed={laneOverrides[col.name] ?? auto}
-                column={col}
-                columns={columnNames}
-                key={col.name}
-                onAdd={setAddStatus}
-                onDelete={id => deleteMut.mutate(id)}
-                onDropTask={onMove}
-                onMove={onMove}
-                onOpen={setOpenId}
-                onToggle={() => toggleLane(col.name, auto)}
-                onTogglePriority={onTogglePriority}
-                onToggleSelect={toggleSelect}
-                selected={selected}
-              />
-            )
-          })}
-        </div>
-      )}
+        {settingsOpen && <OrchestrationPanel />}
 
-      {selected.size > 0 && (
-        <SelectionBar
-          columns={columnNames}
-          onClear={() => setSelected(new Set())}
-          onDone={failed => setSelected(new Set(failed))}
-          selected={selected}
-        />
-      )}
+        {board && <Intro />}
 
-      <NewTaskDialog onClose={() => setAddStatus(null)} parents={parentOptions} target={addStatus} />
-      <TaskDrawer columns={columnNames} id={openId} onClose={() => setOpenId(null)} onOpen={setOpenId} />
-    </div>
+        {/* Focus-mode hint. Only while a trace is live, so the board chrome is
+          unchanged in the common case. Its own row rather than an overlay:
+          the board is dimmed underneath and an overlay would compete with the
+          selection bar for the same corner. */}
+        {focused && (
+          <div className="mx-4 mb-2 flex shrink-0 items-center gap-2 rounded-lg bg-(--ui-bg-quinary) px-3 py-1.5 text-[0.6875rem] text-(--ui-text-secondary)">
+            <Codicon className="shrink-0 text-(--ui-text-tertiary)" name="references" size="0.8rem" />
+            <span className="min-w-0 truncate">{k.depFocusHint}</span>
+            <Button className="ml-auto shrink-0" onClick={() => setFocused(null)} size="xs" variant="ghost">
+              <Codicon name="close" size="0.7rem" />
+              {k.depClearFocus}
+            </Button>
+          </div>
+        )}
+
+        {errorMessage && !board ? (
+          <div className="grid flex-1 place-items-center">
+            <ErrorState title={errorMessage} />
+          </div>
+        ) : !filtered ? (
+          <div className="grid flex-1 place-items-center">
+            <Loader type="lemniscate-bloom" />
+          </div>
+        ) : total === 0 ? (
+          <div className="grid flex-1 place-items-center px-4 text-center">
+            <div className="flex flex-col items-center gap-2">
+              <Codicon className="text-(--ui-text-quaternary)" name="project" size="1.25rem" />
+              <p className="text-xs text-(--ui-text-tertiary)">
+                {search || tenant || assignee ? k.noMatch : k.noTasks}
+              </p>
+              <Button className="mt-0.5" onClick={() => setAddStatus('triage')} size="sm" variant="outline">
+                <Codicon name="add" size="0.75rem" />
+                {k.newTask}
+              </Button>
+            </div>
+          </div>
+        ) : (
+          <div
+            className={cn('flex flex-1 gap-2 overflow-x-auto px-4 pt-1 pb-3', grabbing && 'cursor-grabbing')}
+            // Clicking the board background clears the trace — the gaps between
+            // lanes, a lane's padding, a lane header, empty column space. Keyed
+            // off "the click did not land on a card" rather than a strict
+            // `currentTarget` check, which would only catch the thin gutters.
+            // Cards are the draggable nodes (same vocabulary useGrabScroll uses),
+            // so a click on a card — including its own trace button — is left to
+            // the card's own handler.
+            onClickCapture={event => {
+              if (focused && !(event.target as HTMLElement).closest('[draggable="true"]')) {
+                setFocused(null)
+              }
+            }}
+            onMouseDown={onMouseDown}
+            ref={lanesRef}
+          >
+            {filtered.columns.map(col => {
+              const auto = boardHasWork && col.tasks.length === 0
+
+              return (
+                <Column
+                  collapsed={laneOverrides[col.name] ?? auto}
+                  column={col}
+                  columns={columnNames}
+                  key={col.name}
+                  onAdd={setAddStatus}
+                  onDelete={id => deleteMut.mutate(id)}
+                  onDropTask={onMove}
+                  onMove={onMove}
+                  onOpen={setOpenId}
+                  onToggle={() => toggleLane(col.name, auto)}
+                  onTogglePriority={onTogglePriority}
+                  onToggleSelect={toggleSelect}
+                  selected={selected}
+                />
+              )
+            })}
+          </div>
+        )}
+
+        {selected.size > 0 && (
+          <SelectionBar
+            columns={columnNames}
+            onClear={() => setSelected(new Set())}
+            onDone={failed => setSelected(new Set(failed))}
+            selected={selected}
+          />
+        )}
+
+        <NewTaskDialog onClose={() => setAddStatus(null)} parents={parentOptions} target={addStatus} />
+        <TaskDrawer columns={columnNames} id={openId} onClose={() => setOpenId(null)} onOpen={setOpenId} />
+      </div>
+    </DependencyContext.Provider>
   )
 }
