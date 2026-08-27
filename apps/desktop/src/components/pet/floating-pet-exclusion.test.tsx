@@ -77,6 +77,7 @@ afterEach(() => {
   mount.unmount()
   vi.useRealTimers()
   vi.restoreAllMocks()
+  vi.unstubAllGlobals()
   petStores.setPetInfo({ enabled: false })
   document.body.innerHTML = ''
 })
@@ -88,6 +89,22 @@ function containerEl(): HTMLDivElement {
   expect(el).not.toBeNull()
 
   return el!
+}
+
+// Same pattern as status-pulse.test.tsx: stub matchMedia so useMediaQuery's
+// prefers-reduced-motion read is deterministic in jsdom (which has no real
+// implementation).
+function installMatchMedia(matches: boolean) {
+  vi.stubGlobal(
+    'matchMedia',
+    vi.fn(() => ({
+      addEventListener: vi.fn(),
+      matches,
+      media: '(prefers-reduced-motion: reduce)',
+      onchange: null,
+      removeEventListener: vi.fn()
+    }))
+  )
 }
 
 // Regression coverage for Phase 2.3: the alpha hit-test (#95001) stops the pet
@@ -198,5 +215,39 @@ describe('FloatingPet non-interference: exclusion zones (Phase 2.3)', () => {
     })
 
     expect(containerEl().style.opacity).toBe('1')
+  })
+
+  it('skips the fade transition under prefers-reduced-motion', () => {
+    installMatchMedia(true)
+
+    document.body.innerHTML = '<div data-slot="composer-surface"><input data-slot="composer-rich-input" /></div>'
+    const input = document.querySelector('[data-slot="composer-rich-input"]') as HTMLInputElement
+
+    vi.spyOn(input, 'closest').mockReturnValue(input)
+    vi.spyOn(document.querySelector('[data-slot="composer-surface"]')!, 'getBoundingClientRect').mockReturnValue({
+      bottom: 500,
+      height: 40,
+      left: 0,
+      right: 300,
+      toJSON: () => ({}),
+      top: 460,
+      width: 300,
+      x: 0,
+      y: 460
+    } as DOMRect)
+
+    act(() => {
+      mount.render(<FloatingPet />)
+    })
+
+    expect(containerEl().style.transition).toBe('none')
+
+    act(() => {
+      input.focus()
+      vi.advanceTimersByTime(120)
+    })
+
+    expect(containerEl().style.opacity).toBe('0.16')
+    expect(containerEl().style.transition).toBe('none')
   })
 })
