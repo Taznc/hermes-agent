@@ -33,6 +33,8 @@ type KanbanMessages = {
   deselect: string
   moveTo: (label: string) => string
   delete: string
+  // per-card "send to roadmap ideas" (Phase 2.15 follow-up)
+  sendToRoadmap: string
   reviewChecking: string
   attachedTip: (name: string) => string
   orchestratorTip: (name: string) => string
@@ -257,6 +259,7 @@ export const en: KanbanMessages = {
   deselect: 'Deselect',
   moveTo: label => `Move to ${label}`,
   delete: 'Delete',
+  sendToRoadmap: 'Send to roadmap ideas',
   reviewChecking: 'A review agent is checking the completed work.',
   attachedTip: name => `${name} is attached — the dispatcher hands this over on its next tick (≤1m).`,
   orchestratorTip: name => `${name} (the orchestrator) picks this up on the next tick and writes the spec.`,
@@ -486,6 +489,7 @@ const ja: KanbanMessages = {
   deselect: '選択解除',
   moveTo: label => `${label} へ移動`,
   delete: '削除',
+  sendToRoadmap: 'ロードマップのアイデアに送る',
   reviewChecking: 'レビューエージェントが完了した作業を確認中です。',
   attachedTip: name => `${name} が担当 — ディスパッチャが次のティック（≤1分）で引き渡します。`,
   orchestratorTip: name => `${name}（オーケストレーター）が次のティックでこれを取得し、仕様を書きます。`,
@@ -714,6 +718,7 @@ const zh: KanbanMessages = {
   deselect: '取消选择',
   moveTo: label => `移动到 ${label}`,
   delete: '删除',
+  sendToRoadmap: '发送到路线图想法',
   reviewChecking: '审查代理正在检查已完成的工作。',
   attachedTip: name => `${name} 已接手 — 调度器将在下一个周期（≤1 分钟）移交。`,
   orchestratorTip: name => `${name}（编排者）将在下一个周期领取并撰写规格。`,
@@ -939,6 +944,7 @@ const zhHant: KanbanMessages = {
   deselect: '取消選取',
   moveTo: label => `移至 ${label}`,
   delete: '刪除',
+  sendToRoadmap: '傳送到路線圖想法',
   reviewChecking: '審查代理正在檢查已完成的工作。',
   attachedTip: name => `${name} 已接手 — 排程器將在下一個週期（≤1 分鐘）移交。`,
   orchestratorTip: name => `${name}（編排者）將在下一個週期領取並撰寫規格。`,

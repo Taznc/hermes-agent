@@ -255,7 +255,7 @@ function CardFooter({ arc, task }: { arc: ArcState | null; task: KanbanTask }) {
   )
 }
 
-function Card({
+export function Card({
   columns,
   onDelete,
   onMove,
@@ -281,6 +281,23 @@ function Card({
   const fallback = useDefaultAssignee()
   const arc = arcState(task, fallback)
   const highPriority = isHighPriority(task)
+
+  // Per-card "send to roadmap ideas" (Phase 2.15 follow-up). Provenance-only
+  // — title + id, never the body — reusing the exact contract + toast copy
+  // the board-header free-typed capture already established (IdeaCaptureDialog
+  // above): success and roadmap-unavailable get distinct feedback, and this
+  // never touches the task query cache since it isn't a board mutation.
+  const sendIdeaMut = useMutation({
+    mutationFn: () => addRoadmapIdea(task.title, task.id),
+    onSuccess: ({ ok, reason }) => {
+      if (ok) {
+        host.notify({ kind: 'success', message: k.ideaSaved })
+      } else {
+        host.notify({ kind: 'warning', message: reason === 'empty_idea' ? k.ideaEmpty : k.ideaUnavailable })
+      }
+    },
+    onError: err => host.notify({ kind: 'error', message: errText(err) })
+  })
 
   return (
     <ContextMenu>
@@ -376,6 +393,11 @@ function Card({
               {k.moveTo(columnLabel(k, name))}
             </ContextMenuItem>
           ))}
+        <ContextMenuSeparator />
+        <ContextMenuItem disabled={sendIdeaMut.isPending} onSelect={() => sendIdeaMut.mutate()}>
+          <Codicon name="lightbulb" size="0.85rem" />
+          {k.sendToRoadmap}
+        </ContextMenuItem>
         <ContextMenuSeparator />
         <ContextMenuItem onSelect={() => onDelete(task.id)} variant="destructive">
           <Codicon name="trash" size="0.85rem" />
