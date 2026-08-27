@@ -71,11 +71,26 @@ export interface KanbanRun {
   ended_at?: null | number
 }
 
+/** A structured multiple-choice answer, persisted alongside a comment's plain
+ *  `body` (see docs/design/blocked-callout-multiple-choice-spec.md).
+ *  `question_event_id` binds the answer to the specific `blocked` /
+ *  `block_loop_detected` event it answers, so re-blocking with a new
+ *  question never gets confused with an old answer. */
+export interface ChoiceResponse {
+  key: string
+  label: string
+  question_event_id: number
+}
+
 export interface KanbanComment {
   id: number | string
   author: string
   body: string
   created_at: number
+  /** Present only when this comment was submitted by clicking a rendered
+   *  choice option; absent/null for every free-text comment (including all
+   *  comments written before this feature existed). */
+  choice?: null | ChoiceResponse
 }
 
 export interface KanbanEvent {

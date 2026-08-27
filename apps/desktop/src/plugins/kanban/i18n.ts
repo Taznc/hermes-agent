@@ -141,6 +141,10 @@ type KanbanMessages = {
   ctaApprove: string
   ctaSendBack: string
   blockKind: Record<'capability' | 'dependency' | 'needs_input' | 'transient', string>
+  // Structured multiple-choice question rendering (blocked-callout options).
+  choicesGroupLabel: string
+  choiceSubmitError: string
+  choiceRetry: string
   commandCopied: string
   description: string
   editDescription: string
@@ -361,6 +365,9 @@ export const en: KanbanMessages = {
     capability: 'Missing a capability',
     transient: 'Hit a transient failure'
   },
+  choicesGroupLabel: 'Choose an option',
+  choiceSubmitError: 'Could not submit your answer. Try again.',
+  choiceRetry: 'Retry',
   commandCopied: 'Command copied',
   description: 'Description',
   editDescription: 'Edit description',
@@ -581,6 +588,9 @@ const ja: KanbanMessages = {
     capability: '機能が不足',
     transient: '一時的な失敗が発生'
   },
+  choicesGroupLabel: 'オプションを選択してください',
+  choiceSubmitError: '回答を送信できませんでした。もう一度お試しください。',
+  choiceRetry: '再試行',
   commandCopied: 'コマンドをコピーしました',
   description: '説明',
   editDescription: '説明を編集',
@@ -800,6 +810,9 @@ const zh: KanbanMessages = {
     capability: '缺少能力',
     transient: '发生了临时故障'
   },
+  choicesGroupLabel: '请选择一个选项',
+  choiceSubmitError: '无法提交你的回答，请重试。',
+  choiceRetry: '重试',
   commandCopied: '命令已复制',
   description: '描述',
   editDescription: '编辑描述',
@@ -1017,6 +1030,9 @@ const zhHant: KanbanMessages = {
     capability: '缺少能力',
     transient: '發生暫時性故障'
   },
+  choicesGroupLabel: '請選擇一個選項',
+  choiceSubmitError: '無法送出你的回答，請再試一次。',
+  choiceRetry: '重試',
   commandCopied: '指令已複製',
   description: '描述',
   editDescription: '編輯描述',
