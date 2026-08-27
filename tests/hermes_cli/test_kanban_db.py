@@ -166,6 +166,72 @@ def test_connect_migrates_legacy_db_before_optional_column_indexes(tmp_path):
     assert "idx_events_run" in indexes
 
 
+def test_connect_migrates_legacy_task_comments_adds_choice_json(tmp_path):
+    """Legacy DBs whose ``task_comments`` predates the multiple-choice
+    feature (no ``choice_json`` column) migrate cleanly and existing rows
+    read back with ``choice=None`` (see docs/design/
+    blocked-callout-multiple-choice-spec.md)."""
+    db_path = tmp_path / "legacy-comments-kanban.db"
+    conn = sqlite3.connect(str(db_path))
+    conn.execute("""
+        CREATE TABLE tasks (
+            id TEXT PRIMARY KEY,
+            title TEXT NOT NULL,
+            body TEXT,
+            assignee TEXT,
+            status TEXT NOT NULL,
+            priority INTEGER NOT NULL DEFAULT 0,
+            created_by TEXT,
+            created_at INTEGER NOT NULL,
+            started_at INTEGER,
+            completed_at INTEGER,
+            workspace_kind TEXT NOT NULL DEFAULT 'scratch',
+            workspace_path TEXT,
+            claim_lock TEXT,
+            claim_expires INTEGER
+        )
+    """)
+    conn.execute("""
+        CREATE TABLE task_events (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            task_id TEXT NOT NULL,
+            kind TEXT NOT NULL,
+            payload TEXT,
+            created_at INTEGER NOT NULL
+        )
+    """)
+    # Pre-feature ``task_comments`` shape: no ``choice_json``.
+    conn.execute("""
+        CREATE TABLE task_comments (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            task_id TEXT NOT NULL,
+            author TEXT NOT NULL,
+            body TEXT NOT NULL,
+            created_at INTEGER NOT NULL
+        )
+    """)
+    conn.execute(
+        "INSERT INTO tasks (id, title, status, created_at) "
+        "VALUES ('legacy', 'old board task', 'ready', 1)"
+    )
+    conn.execute(
+        "INSERT INTO task_comments (task_id, author, body, created_at) "
+        "VALUES ('legacy', 'someone', 'pre-existing free-text comment', 1)"
+    )
+    conn.commit()
+    conn.close()
+
+    with kb.connect(db_path) as migrated:
+        comment_columns = {
+            row["name"] for row in migrated.execute("PRAGMA table_info(task_comments)")
+        }
+        assert "choice_json" in comment_columns
+        comments = kb.list_comments(migrated, "legacy")
+        assert len(comments) == 1
+        assert comments[0].body == "pre-existing free-text comment"
+        assert comments[0].choice is None
+
+
 # ---------------------------------------------------------------------------
 # Task creation + status inference
 # ---------------------------------------------------------------------------
@@ -564,6 +630,82 @@ def test_delete_archived_task_removes_related_rows(kanban_home):
         assert conn.execute("SELECT COUNT(*) FROM task_events WHERE task_id = ?", (tid,)).fetchone()[0] == 0
         assert conn.execute("SELECT COUNT(*) FROM task_runs WHERE task_id = ?", (tid,)).fetchone()[0] == 0
         assert conn.execute("SELECT COUNT(*) FROM kanban_notify_subs WHERE task_id = ?", (tid,)).fetchone()[0] == 0
+
+
+def test_add_comment_with_choice_persists_structured_answer(kanban_home):
+    """Structured multiple-choice answer round-trips through Comment.choice.
+
+    See docs/design/blocked-callout-multiple-choice-spec.md — this is the
+    ``kanban_block(reason=...``choices`` fence) -> click -> comment`` wire
+    contract's DB layer.
+    """
+    with kb.connect() as conn:
+        tid = kb.create_task(conn, title="needs a decision")
+        assert kb.block_task(
+            conn, tid, reason="Pick one:\n```choices\n"
+            '[{"key": "A", "label": "Option A"}, {"key": "B", "label": "Option B"}]\n```',
+            kind="needs_input",
+        )
+        blocked_events = [e for e in kb.list_events(conn, tid) if e.kind == "blocked"]
+        assert len(blocked_events) == 1
+        event_id = blocked_events[0].id
+        comment_id = kb.add_comment(
+            conn,
+            tid,
+            author="dashboard",
+            body="A) Option A",
+            choice={"key": "A", "label": "Option A", "question_event_id": event_id},
+        )
+        assert comment_id > 0
+        comments = kb.list_comments(conn, tid)
+        assert len(comments) == 1
+        c = comments[0]
+        assert c.body == "A) Option A"
+        assert c.choice == {"key": "A", "label": "Option A", "question_event_id": event_id}
+
+
+def test_add_comment_without_choice_leaves_choice_none(kanban_home):
+    """Existing free-text callers (every caller before this feature) are
+    unaffected — ``choice`` defaults to None and round-trips as such."""
+    with kb.connect() as conn:
+        tid = kb.create_task(conn, title="t")
+        kb.add_comment(conn, tid, author="user", body="just a note")
+        comments = kb.list_comments(conn, tid)
+        assert comments[0].choice is None
+
+
+def test_add_comment_choice_rejects_unknown_question_event(kanban_home):
+    """A ``question_event_id`` that doesn't reference a real event on this
+    task is rejected (matches the spec's §6 error-handling table: server-side
+    422, click never silently dropped)."""
+    with kb.connect() as conn:
+        tid = kb.create_task(conn, title="t")
+        with pytest.raises(ValueError, match="question_event_id"):
+            kb.add_comment(
+                conn,
+                tid,
+                author="dashboard",
+                body="A) Option A",
+                choice={"key": "A", "label": "Option A", "question_event_id": 999999},
+            )
+        assert kb.list_comments(conn, tid) == []
+
+
+def test_add_comment_choice_rejects_missing_key_or_label(kanban_home):
+    with kb.connect() as conn:
+        tid = kb.create_task(conn, title="t")
+        assert kb.block_task(conn, tid, reason="q", kind="needs_input")
+        event_id = [e for e in kb.list_events(conn, tid) if e.kind == "blocked"][0].id
+        with pytest.raises(ValueError, match="choice.key"):
+            kb.add_comment(
+                conn, tid, author="dashboard", body="x",
+                choice={"key": "", "label": "Option A", "question_event_id": event_id},
+            )
+        with pytest.raises(ValueError, match="choice.label"):
+            kb.add_comment(
+                conn, tid, author="dashboard", body="x",
+                choice={"key": "A", "label": "", "question_event_id": event_id},
+            )
 
 
 def test_delete_task_removes_task_and_cascades(kanban_home):

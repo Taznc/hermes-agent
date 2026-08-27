@@ -23,6 +23,7 @@ import { bindCompletionNotify, type CompletionEvent, onKanbanEventsFrame } from 
 import type {
   BoardMeta,
   BoardsResponse,
+  ChoiceResponse,
   KanbanBoard,
   KanbanProfile,
   KanbanProject,
@@ -227,13 +228,30 @@ export const bulkTasks = (ids: string[], patch: Record<string, unknown>) =>
     })
   )
 
-export const addComment = (id: string, body: string) =>
-  call(withBoard(`/tasks/${id}/comments`), { method: 'POST', body: { author: 'desktop', body } })
+/** `choice`, when present, is the clicked multiple-choice option — see
+ *  docs/design/blocked-callout-multiple-choice-spec.md. Optional so every
+ *  free-text reply keeps sending exactly the payload it always has. */
+export const addComment = (id: string, body: string, choice?: ChoiceResponse) =>
+  call(withBoard(`/tasks/${id}/comments`), { method: 'POST', body: { author: 'desktop', body, choice: choice ?? null } })
 
 export const reassignTask = (id: string, profile: string) =>
   nudged(call(withBoard(`/tasks/${id}/reassign`), { method: 'POST', body: { profile, reclaim_first: true } }))
 
 export const reclaimTask = (id: string) => nudged(call(withBoard(`/tasks/${id}/reclaim`), { method: 'POST', body: {} }))
+
+/** Create a dependency edge: `parentId` BLOCKS `childId`. Nudges, because a
+ *  new gate can change what the dispatcher is allowed to spawn. */
+export const linkTasks = (parentId: string, childId: string) =>
+  nudged(call(withBoard('/links'), { method: 'POST', body: { parent_id: parentId, child_id: childId } }))
+
+/** Cut a dependency edge. Nudges: removing the last gate on a todo task can
+ *  promote it to ready immediately. */
+export const unlinkTasks = (parentId: string, childId: string) =>
+  nudged(
+    call(withBoard('/links', { parent_id: parentId, child_id: childId }), {
+      method: 'DELETE'
+    })
+  )
 
 export const uploadAttachment = (id: string, upload: { filename: string; contentType?: string; bytes: ArrayBuffer }) =>
   call(withBoard(`/tasks/${id}/attachments`), { method: 'POST', upload })

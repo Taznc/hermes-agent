@@ -1308,6 +1308,10 @@ class Comment:
     author: str
     body: str
     created_at: int
+    # Structured multiple-choice answer (key/label/question_event_id) or
+    # None for a plain free-text comment. See docs/design/
+    # blocked-callout-multiple-choice-spec.md.
+    choice: Optional[dict] = None
 
 
 @dataclass
@@ -1464,7 +1468,13 @@ CREATE TABLE IF NOT EXISTS task_comments (
     task_id    TEXT NOT NULL,
     author     TEXT NOT NULL,
     body       TEXT NOT NULL,
-    created_at INTEGER NOT NULL
+    created_at INTEGER NOT NULL,
+    -- Structured multiple-choice answer, serialized JSON of
+    -- {"key": str, "label": str, "question_event_id": int}, or NULL for a
+    -- plain free-text comment (every comment before this feature, and every
+    -- free-text reply after it). Additive/optional — see
+    -- docs/design/blocked-callout-multiple-choice-spec.md.
+    choice_json TEXT
 );
 
 CREATE TABLE IF NOT EXISTS task_events (
@@ -2724,6 +2734,14 @@ def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
             "block_recurrences INTEGER NOT NULL DEFAULT 0",
         )
 
+    comment_cols = {row["name"] for row in conn.execute("PRAGMA table_info(task_comments)")}
+    if comment_cols and "choice_json" not in comment_cols:
+        # Structured multiple-choice answer (see docs/design/
+        # blocked-callout-multiple-choice-spec.md). NULL for every comment
+        # written before this feature and for every free-text reply after
+        # it — additive, never required.
+        _add_column_if_missing(conn, "task_comments", "choice_json", "choice_json TEXT")
+
     # Indexes over additive ``tasks`` columns must be created after the
     # columns exist. Keeping them in SCHEMA_SQL breaks legacy boards: SQLite
     # parses each statement in ``executescript`` against the live schema, so a
@@ -2910,7 +2928,7 @@ _REBUILD_SPECS = {
         "CREATE TABLE task_comments ("
         " id INTEGER PRIMARY KEY AUTOINCREMENT,"
         " task_id TEXT NOT NULL, author TEXT NOT NULL, body TEXT NOT NULL,"
-        " created_at INTEGER NOT NULL)",
+        " created_at INTEGER NOT NULL, choice_json TEXT)",
         ("CREATE INDEX idx_comments_task ON task_comments(task_id, created_at)",),
     ),
     "task_runs": (
@@ -4025,12 +4043,64 @@ def parent_results(conn: sqlite3.Connection, task_id: str) -> list[tuple[str, Op
 # ---------------------------------------------------------------------------
 
 def add_comment(
-    conn: sqlite3.Connection, task_id: str, author: str, body: str
+    conn: sqlite3.Connection,
+    task_id: str,
+    author: str,
+    body: str,
+    *,
+    choice: Optional[Mapping[str, Any]] = None,
 ) -> int:
+    """Insert a comment; ``choice``, if given, is the structured answer to a
+    multiple-choice ``blocked``/``block_loop_detected`` question (see
+    docs/design/blocked-callout-multiple-choice-spec.md). ``body`` is always
+    required and always renders in the plain comment stream — ``choice`` is
+    an additive, optional annotation for downstream automation, never a
+    replacement channel.
+    """
     if not body or not body.strip():
         raise ValueError("comment body is required")
     if not author or not author.strip():
         raise ValueError("comment author is required")
+    choice_json: Optional[str] = None
+    if choice is not None:
+        key = choice.get("key") if isinstance(choice, Mapping) else None
+        label = choice.get("label") if isinstance(choice, Mapping) else None
+        question_event_id = choice.get("question_event_id") if isinstance(choice, Mapping) else None
+        if not isinstance(key, str) or not key.strip():
+            raise ValueError("choice.key is required")
+        if not isinstance(label, str) or not label.strip():
+            raise ValueError("choice.label is required")
+        try:
+            if question_event_id is None:
+                raise TypeError
+            question_event_id = int(question_event_id)
+        except (TypeError, ValueError):
+            raise ValueError("choice.question_event_id must be an integer")
+        now = int(time.time())
+        with write_txn(conn, allow_nested=True):
+            if not conn.execute(
+                "SELECT 1 FROM tasks WHERE id = ?", (task_id,)
+            ).fetchone():
+                raise ValueError(f"unknown task {task_id}")
+            event_row = conn.execute(
+                "SELECT 1 FROM task_events WHERE id = ? AND task_id = ?",
+                (question_event_id, task_id),
+            ).fetchone()
+            if event_row is None:
+                raise ValueError(
+                    f"choice.question_event_id {question_event_id} does not "
+                    f"reference an existing event on task {task_id}"
+                )
+            choice_json = json.dumps(
+                {"key": key, "label": label, "question_event_id": question_event_id}
+            )
+            cur = conn.execute(
+                "INSERT INTO task_comments (task_id, author, body, created_at, choice_json) "
+                "VALUES (?, ?, ?, ?, ?)",
+                (task_id, author.strip(), body.strip(), now, choice_json),
+            )
+            _append_event(conn, task_id, "commented", {"author": author, "len": len(body)})
+            return int(cur.lastrowid or 0)
     now = int(time.time())
     # ``allow_nested=True``: graph builders (kanban_swarm blackboard seeding)
     # compose comment writes under one outer commit.
@@ -4048,6 +4118,16 @@ def add_comment(
         return int(cur.lastrowid or 0)
 
 
+def _comment_choice_from_row(r: sqlite3.Row) -> Optional[dict]:
+    keys = r.keys()
+    if "choice_json" not in keys or not r["choice_json"]:
+        return None
+    try:
+        return json.loads(r["choice_json"])
+    except (TypeError, ValueError):
+        return None
+
+
 def list_comments(conn: sqlite3.Connection, task_id: str) -> list[Comment]:
     rows = conn.execute(
         "SELECT * FROM task_comments WHERE task_id = ? ORDER BY created_at ASC",
@@ -4060,6 +4140,7 @@ def list_comments(conn: sqlite3.Connection, task_id: str) -> list[Comment]:
             author=r["author"],
             body=r["body"],
             created_at=r["created_at"],
+            choice=_comment_choice_from_row(r),
         )
         for r in rows
     ]
@@ -4076,7 +4157,7 @@ def list_comments_after(
     ``tools.kanban_tools.inject_new_comments_from_env``).
     """
     rows = conn.execute(
-        "SELECT id, task_id, author, body, created_at FROM task_comments "
+        "SELECT * FROM task_comments "
         "WHERE task_id = ? AND id > ? ORDER BY id ASC",
         (task_id, int(after_id)),
     ).fetchall()
@@ -4087,6 +4168,7 @@ def list_comments_after(
             author=r["author"],
             body=r["body"],
             created_at=r["created_at"],
+            choice=_comment_choice_from_row(r),
         )
         for r in rows
     ]

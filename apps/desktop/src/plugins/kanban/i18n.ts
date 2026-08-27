@@ -144,6 +144,10 @@ type KanbanMessages = {
   ctaApprove: string
   ctaSendBack: string
   blockKind: Record<'capability' | 'dependency' | 'needs_input' | 'transient', string>
+  // Structured multiple-choice question rendering (blocked-callout options).
+  choicesGroupLabel: string
+  choiceSubmitError: string
+  choiceRetry: string
   commandCopied: string
   description: string
   editDescription: string
@@ -154,6 +158,22 @@ type KanbanMessages = {
   dependencies: string
   blockedBy: string
   blocks: string
+  /** Dependency-chain UI (drawer rows + card chips + board focus). */
+  depGating: string
+  depSatisfied: string
+  depBlockedByCount: (n: number) => string
+  depBlocksCount: (n: number) => string
+  depClear: string
+  depClearTip: string
+  depUnlink: string
+  depUnlinkTip: string
+  depMissing: string
+  depMissingTip: string
+  depWaitingBanner: (gating: number, total: number) => string
+  depFocusHint: string
+  depFocusUpstream: string
+  depFocusDownstream: string
+  depClearFocus: string
   comments: (n: number) => string
   commentsHelpRunning: string
   commentsHelp: string
@@ -370,6 +390,9 @@ export const en: KanbanMessages = {
     capability: 'Missing a capability',
     transient: 'Hit a transient failure'
   },
+  choicesGroupLabel: 'Choose an option',
+  choiceSubmitError: 'Could not submit your answer. Try again.',
+  choiceRetry: 'Retry',
   commandCopied: 'Command copied',
   description: 'Description',
   editDescription: 'Edit description',
@@ -380,6 +403,24 @@ export const en: KanbanMessages = {
   dependencies: 'Dependencies',
   blockedBy: 'Blocked by',
   blocks: 'Blocks',
+  depGating: 'Still gating',
+  depSatisfied: 'Satisfied',
+  depBlockedByCount: n => `blocked by ${n}`,
+  depBlocksCount: n => `blocks ${n}`,
+  depClear: 'Blockers clear',
+  depClearTip: 'Every task blocking this one is done — it can move to ready.',
+  depUnlink: 'Remove',
+  depUnlinkTip: 'Remove this dependency. The tasks stay; only the link is cut.',
+  depMissing: 'not on this board',
+  depMissingTip: 'This linked task was deleted, or is hidden by the current tenant/archive filter.',
+  depWaitingBanner: (gating, total) =>
+    total === 1
+      ? 'Waiting on 1 blocker.'
+      : `Waiting on ${gating} of ${total} blockers.`,
+  depFocusHint: 'Click a card to trace its dependency chain · Esc to clear',
+  depFocusUpstream: 'blocks this',
+  depFocusDownstream: 'waits on this',
+  depClearFocus: 'Clear focus',
   comments: n => `Comments · ${n}`,
   commentsHelpRunning:
     'This task is running. Your note is folded into the worker’s current turn within a few seconds — no block/unblock dance. “Requeue with note” instead restarts the task from scratch with your note in context.',
@@ -596,6 +637,9 @@ const ja: KanbanMessages = {
     capability: '機能が不足',
     transient: '一時的な失敗が発生'
   },
+  choicesGroupLabel: 'オプションを選択してください',
+  choiceSubmitError: '回答を送信できませんでした。もう一度お試しください。',
+  choiceRetry: '再試行',
   commandCopied: 'コマンドをコピーしました',
   description: '説明',
   editDescription: '説明を編集',
@@ -606,6 +650,22 @@ const ja: KanbanMessages = {
   dependencies: '依存関係',
   blockedBy: 'ブロック元',
   blocks: 'ブロック先',
+  depGating: 'ブロック中',
+  depSatisfied: '解消済み',
+  depBlockedByCount: n => `${n} 件にブロック`,
+  depBlocksCount: n => `${n} 件をブロック`,
+  depClear: 'ブロック解消',
+  depClearTip: 'このタスクをブロックしていたタスクはすべて完了しました。準備完了に移動できます。',
+  depUnlink: '解除',
+  depUnlinkTip: 'この依存関係を解除します。タスク自体は削除されず、リンクのみ切れます。',
+  depMissing: 'このボードにありません',
+  depMissingTip: 'リンク先のタスクは削除されたか、現在のテナント／アーカイブ絞り込みで非表示です。',
+  depWaitingBanner: (gating, total) =>
+    total === 1 ? '1 件のブロック待ちです。' : `${total} 件中 ${gating} 件のブロック待ちです。`,
+  depFocusHint: 'カードをクリックすると依存関係をたどれます · Esc で解除',
+  depFocusUpstream: 'これをブロック',
+  depFocusDownstream: 'これを待機',
+  depClearFocus: 'フォーカス解除',
   comments: n => `コメント・${n}`,
   commentsHelpRunning:
     'このタスクは実行中です。あなたのメモは数秒以内にワーカーの現在のターンに取り込まれます — ブロック/解除の操作は不要です。「メモを付けて再キュー」を選ぶと、メモを文脈に含めてタスクを最初からやり直します。',
@@ -821,6 +881,9 @@ const zh: KanbanMessages = {
     capability: '缺少能力',
     transient: '发生了临时故障'
   },
+  choicesGroupLabel: '请选择一个选项',
+  choiceSubmitError: '无法提交你的回答，请重试。',
+  choiceRetry: '重试',
   commandCopied: '命令已复制',
   description: '描述',
   editDescription: '编辑描述',
@@ -831,6 +894,22 @@ const zh: KanbanMessages = {
   dependencies: '依赖关系',
   blockedBy: '受阻于',
   blocks: '阻塞',
+  depGating: '仍在阻塞',
+  depSatisfied: '已满足',
+  depBlockedByCount: n => `被 ${n} 项阻塞`,
+  depBlocksCount: n => `阻塞 ${n} 项`,
+  depClear: '阻塞已清除',
+  depClearTip: '阻塞此任务的任务均已完成，可以移至就绪。',
+  depUnlink: '移除',
+  depUnlinkTip: '移除此依赖关系。任务本身保留，仅断开链接。',
+  depMissing: '不在此看板中',
+  depMissingTip: '关联任务已被删除，或被当前租户／归档筛选隐藏。',
+  depWaitingBanner: (gating, total) =>
+    total === 1 ? '正在等待 1 项阻塞。' : `正在等待 ${total} 项中的 ${gating} 项阻塞。`,
+  depFocusHint: '点击卡片可追踪其依赖链 · 按 Esc 清除',
+  depFocusUpstream: '阻塞它',
+  depFocusDownstream: '等待它',
+  depClearFocus: '清除聚焦',
   comments: n => `评论・${n}`,
   commentsHelpRunning:
     '此任务正在运行。你的备注会在几秒内融入工作单元当前的回合 — 无需阻塞/解除操作。选择“附带备注重新入队”则会带着你的备注从头重跑任务。',
@@ -1044,6 +1123,9 @@ const zhHant: KanbanMessages = {
     capability: '缺少能力',
     transient: '發生暫時性故障'
   },
+  choicesGroupLabel: '請選擇一個選項',
+  choiceSubmitError: '無法送出你的回答，請再試一次。',
+  choiceRetry: '重試',
   commandCopied: '指令已複製',
   description: '描述',
   editDescription: '編輯描述',
@@ -1054,6 +1136,22 @@ const zhHant: KanbanMessages = {
   dependencies: '相依關係',
   blockedBy: '受阻於',
   blocks: '阻擋',
+  depGating: '仍在阻擋',
+  depSatisfied: '已滿足',
+  depBlockedByCount: n => `被 ${n} 項阻擋`,
+  depBlocksCount: n => `阻擋 ${n} 項`,
+  depClear: '阻擋已清除',
+  depClearTip: '阻擋此任務的任務皆已完成，可以移至就緒。',
+  depUnlink: '移除',
+  depUnlinkTip: '移除此相依關係。任務本身保留，僅斷開連結。',
+  depMissing: '不在此看板中',
+  depMissingTip: '關聯任務已被刪除，或被目前租戶／封存篩選隱藏。',
+  depWaitingBanner: (gating, total) =>
+    total === 1 ? '正在等待 1 項阻擋。' : `正在等待 ${total} 項中的 ${gating} 項阻擋。`,
+  depFocusHint: '點擊卡片可追蹤其相依鏈 · 按 Esc 清除',
+  depFocusUpstream: '阻擋它',
+  depFocusDownstream: '等待它',
+  depClearFocus: '清除聚焦',
   comments: n => `留言・${n}`,
   commentsHelpRunning:
     '此任務正在執行。你的備註會在幾秒內融入工作單元目前的回合 — 無需阻擋/解除操作。選擇「附上備註重新排入佇列」則會帶著你的備註從頭重跑任務。',

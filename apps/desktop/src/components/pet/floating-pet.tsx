@@ -5,6 +5,7 @@ import { useGatewayRequest } from '@/app/gateway/hooks/use-gateway-request'
 import { useOnProfileSwitch } from '@/app/hooks/use-on-profile-switch'
 import { useRouteOverlayActive } from '@/app/hooks/use-route-overlay-active'
 import { PetHeartField } from '@/components/chat/vibe-hearts'
+import { isSolidCanvasPixel } from '@/components/pet/pet-hit-test'
 import { persistString, storedString } from '@/lib/storage'
 import { $changeEventsAvailable, $petChange } from '@/store/live-sync'
 import {
@@ -128,6 +129,10 @@ export function FloatingPet() {
   // directly to avoid a React re-render (and canvas reflow) per pointermove —
   // state is only committed on release.
   const dragRef = useRef<{ dx: number; dy: number; x: number; y: number } | null>(null)
+  // Last observed viewport pointer position, used by the click-through effect
+  // below (it needs to re-test after the PET moves under a stationary cursor,
+  // not just after the cursor moves).
+  const lastPointerRef = useRef<Point | null>(null)
 
   // Keep the *whole* pet on-screen at its current size, so growing it near an
   // edge can't leave the window cropping it. Shared by drag + the reclamp effect.
@@ -336,6 +341,87 @@ export function FloatingPet() {
     return () => window.removeEventListener('resize', reclamp)
   }, [clamp])
 
+  // Click-through: the mascot's bounding BOX is a rectangle, but its ART is
+  // not — most of the box is transparent padding around the sprite. Treating
+  // the whole box as solid meant the pet (roaming or parked) sat on top of
+  // whatever the box happened to overlap — most visibly conversation text —
+  // and silently swallowed every click, double-click, and drag-select there:
+  // no error, the interaction just did nothing (#95001). The container
+  // defaults to `pointer-events: none` (see the JSX below) and this effect is
+  // the ONLY thing that ever flips it to `auto`, and only while the pointer
+  // sits on a genuinely opaque sprite pixel — mirroring the pop-out overlay's
+  // OS-level click-through (pet-overlay-app.tsx), minus the OS call.
+  //
+  // Two triggers, not one: a `pointermove` re-tests when the CURSOR moves,
+  // but the pet also moves under a motionless cursor while roaming — a poll
+  // re-tests against the last known pointer position so the box can't get
+  // stuck `auto` after the sprite has already walked out from under it.
+  //
+  // Depends on the mount condition below, not `[]`: on first render the pet
+  // is usually not yet active (its info/sprite arrives async), so
+  // `containerRef.current` is still null when an empty-deps effect would
+  // run — and never gets a second chance to look again. Re-running when the
+  // mounted condition flips true is what actually catches the live node.
+  const petMounted = Boolean(info.enabled && info.spritesheetBase64 && !overlayActive)
+
+  // eslint-disable-next-line no-restricted-syntax -- legitimate non-atom ref write (DOM pointer position, not an atom value)
+  useEffect(() => {
+    const el = containerRef.current
+
+    if (!el) {
+      return
+    }
+
+    const setInteractive = (interactive: boolean) => {
+      const next = interactive ? 'auto' : 'none'
+
+      if (el.style.pointerEvents !== next) {
+        el.style.pointerEvents = next
+      }
+    }
+
+    const isOverSolidPixel = (x: number, y: number): boolean => {
+      // Never drop capture mid-drag, however far the pointer has wandered
+      // from the sprite — the drag already owns the gesture.
+      if (dragRef.current) {
+        return true
+      }
+
+      const rect = el.getBoundingClientRect()
+
+      if (x < rect.left || x > rect.right || y < rect.top || y > rect.bottom) {
+        return false
+      }
+
+      const canvas = el.querySelector('canvas')
+
+      return canvas ? isSolidCanvasPixel(canvas, x, y) : false
+    }
+
+    const evaluate = () => {
+      const point = lastPointerRef.current
+
+      if (point) {
+        setInteractive(isOverSolidPixel(point.x, point.y))
+      }
+    }
+
+    const onMove = (e: PointerEvent) => {
+      lastPointerRef.current = { x: e.clientX, y: e.clientY }
+      evaluate()
+    }
+
+    window.addEventListener('pointermove', onMove, { passive: true })
+    // 120ms: fast enough that a roaming pet can't visibly linger as a dead
+    // click zone after walking off, slow enough to cost nothing measurable.
+    const poll = window.setInterval(evaluate, 120)
+
+    return () => {
+      window.removeEventListener('pointermove', onMove)
+      window.clearInterval(poll)
+    }
+  }, [petMounted])
+
   const onPointerDown = useCallback((e: React.PointerEvent) => {
     const el = containerRef.current
 
@@ -472,7 +558,13 @@ export function FloatingPet() {
       style={{
         cursor: 'grab',
         left: position.x,
-        pointerEvents: 'auto',
+        // Click-through by default — the effect above is the ONLY place that
+        // ever sets this to 'auto', and only while the pointer is over an
+        // opaque sprite pixel. Do not add `pointerEvents: 'auto'` here: a
+        // React re-render (e.g. the position commit at drag-end) would
+        // reconcile the inline style and silently undo the direct DOM write,
+        // making the pet solid again everywhere it happens to sit.
+        pointerEvents: 'none',
         position: 'fixed',
         top: position.y,
         touchAction: 'none',
