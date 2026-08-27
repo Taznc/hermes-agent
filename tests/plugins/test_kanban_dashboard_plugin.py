@@ -565,6 +565,63 @@ def test_add_comment(client):
     assert len(comments) == 1
     assert comments[0]["body"] == "how's progress?"
     assert comments[0]["author"] == "teknium"
+    assert comments[0]["choice"] is None
+
+
+def test_add_comment_with_choice(client):
+    """Clicking a rendered multiple-choice option POSTs body + structured
+    ``choice``; both persist and are visible in the task's comment stream.
+
+    See docs/design/blocked-callout-multiple-choice-spec.md §2.
+    """
+    t = client.post("/api/plugins/kanban/tasks", json={"title": "x"}).json()["task"]
+    tid = t["id"]
+    conn = kb.connect()
+    try:
+        assert kb.block_task(
+            conn, tid,
+            reason='Pick one:\n```choices\n[{"key": "A", "label": "Option A"}, '
+                   '{"key": "B", "label": "Option B"}]\n```',
+            kind="needs_input",
+        )
+        event_id = [e for e in kb.list_events(conn, tid) if e.kind == "blocked"][0].id
+    finally:
+        conn.close()
+
+    r = client.post(
+        f"/api/plugins/kanban/tasks/{tid}/comments",
+        json={
+            "body": "A) Option A",
+            "author": "dashboard",
+            "choice": {"key": "A", "label": "Option A", "question_event_id": event_id},
+        },
+    )
+    assert r.status_code == 200
+
+    r = client.get(f"/api/plugins/kanban/tasks/{tid}")
+    comments = r.json()["comments"]
+    assert len(comments) == 1
+    assert comments[0]["body"] == "A) Option A"
+    assert comments[0]["choice"] == {
+        "key": "A", "label": "Option A", "question_event_id": event_id,
+    }
+
+
+def test_add_comment_with_choice_bad_question_event_id_422(client):
+    """A choice referencing a nonexistent event is rejected 422, not silently
+    dropped (spec §6 error-handling table)."""
+    t = client.post("/api/plugins/kanban/tasks", json={"title": "x"}).json()["task"]
+    r = client.post(
+        f"/api/plugins/kanban/tasks/{t['id']}/comments",
+        json={
+            "body": "A) Option A",
+            "author": "dashboard",
+            "choice": {"key": "A", "label": "Option A", "question_event_id": 999999},
+        },
+    )
+    assert r.status_code == 422
+    r = client.get(f"/api/plugins/kanban/tasks/{t['id']}")
+    assert r.json()["comments"] == []
 
 
 # ---------------------------------------------------------------------------

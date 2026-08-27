@@ -197,6 +197,7 @@ def _comment_dict(c: kanban_db.Comment) -> dict[str, Any]:
         "author": c.author,
         "body": c.body,
         "created_at": c.created_at,
+        "choice": c.choice,
     }
 
 
@@ -1238,9 +1239,24 @@ def _set_status_direct(
 # Comments
 # ---------------------------------------------------------------------------
 
+class ChoiceResponse(BaseModel):
+    """Structured multiple-choice answer submitted alongside a comment.
+
+    See docs/design/blocked-callout-multiple-choice-spec.md. ``question_event_id``
+    must reference an existing ``task_events`` row on the same task (typically
+    the ``blocked``/``block_loop_detected`` event whose ``reason`` carried the
+    ```choices``` fence being answered) — enforced in ``kanban_db.add_comment``.
+    """
+
+    key: str
+    label: str
+    question_event_id: int
+
+
 class CommentBody(BaseModel):
     body: str
     author: Optional[str] = "dashboard"
+    choice: Optional[ChoiceResponse] = None
 
 
 @router.post("/tasks/{task_id}/comments")
@@ -1252,9 +1268,16 @@ def add_comment(task_id: str, payload: CommentBody, board: Optional[str] = Query
     try:
         if kanban_db.get_task(conn, task_id) is None:
             raise HTTPException(status_code=404, detail=f"task {task_id} not found")
-        kanban_db.add_comment(
-            conn, task_id, author=payload.author or "dashboard", body=payload.body,
-        )
+        try:
+            kanban_db.add_comment(
+                conn,
+                task_id,
+                author=payload.author or "dashboard",
+                body=payload.body,
+                choice=(payload.choice.model_dump() if payload.choice is not None else None),
+            )
+        except ValueError as e:
+            raise HTTPException(status_code=422, detail=str(e))
         return {"ok": True}
     finally:
         conn.close()
