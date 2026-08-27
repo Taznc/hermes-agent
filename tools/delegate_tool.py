@@ -1626,6 +1626,10 @@ def _build_child_agent(
     # 'leaf' (default) cannot; 'orchestrator' retains the delegation
     # toolset subject to depth/kill-switch bounds applied below.
     role: str = "leaf",
+    # Per-spawn reasoning override, already parsed by
+    # tools.delegation_model_override.resolve_effort_override.  None means
+    # "not requested" and preserves the existing global-pin/inherit chain.
+    override_reasoning_config: Optional[Dict[str, Any]] = None,
 ):
     """
     Build a child AIAgent on the main thread (thread-safe construction).
@@ -1847,27 +1851,35 @@ def _build_child_agent(
         effective_provider = "copilot-acp"
         effective_api_mode = "chat_completions"
 
-    # Resolve reasoning config: delegation override > parent inherit
+    # Resolve reasoning config, in precedence order:
+    #   per-spawn argument > global delegation.reasoning_effort > parent
+    # The per-spawn value arrives already parsed (and already validated, so an
+    # unknown level failed the whole spawn upstream rather than silently
+    # degrading here). It wins outright: a caller that named a depth must not
+    # be quietly overridden by a global config pin.
     parent_reasoning = getattr(parent_agent, "reasoning_config", None)
     child_reasoning = parent_reasoning
-    try:
-        # Keep the raw value — ``str(x or "")`` would coerce a YAML boolean
-        # False (``reasoning_effort: false``) to "" and inherit the parent
-        # instead of disabling thinking for children.
-        delegation_effort = delegation_cfg.get("reasoning_effort")
-        if delegation_effort or delegation_effort is False:
-            from hermes_constants import parse_reasoning_effort
+    if override_reasoning_config is not None:
+        child_reasoning = override_reasoning_config
+    else:
+        try:
+            # Keep the raw value — ``str(x or "")`` would coerce a YAML boolean
+            # False (``reasoning_effort: false``) to "" and inherit the parent
+            # instead of disabling thinking for children.
+            delegation_effort = delegation_cfg.get("reasoning_effort")
+            if delegation_effort or delegation_effort is False:
+                from hermes_constants import parse_reasoning_effort
 
-            parsed = parse_reasoning_effort(delegation_effort)
-            if parsed is not None:
-                child_reasoning = parsed
-            else:
-                logger.warning(
-                    "Unknown delegation.reasoning_effort '%s', inheriting parent level",
-                    delegation_effort,
-                )
-    except Exception as exc:
-        logger.debug("Could not load delegation reasoning_effort: %s", exc)
+                parsed = parse_reasoning_effort(delegation_effort)
+                if parsed is not None:
+                    child_reasoning = parsed
+                else:
+                    logger.warning(
+                        "Unknown delegation.reasoning_effort '%s', inheriting parent level",
+                        delegation_effort,
+                    )
+        except Exception as exc:
+            logger.debug("Could not load delegation reasoning_effort: %s", exc)
 
     # Inherit the parent's fallback provider chain so subagents can recover
     # from rate-limits and credential exhaustion exactly like the top-level
@@ -3633,6 +3645,8 @@ def delegate_task(
     action: Optional[str] = None,
     subagent_id: Optional[str] = None,
     message: Optional[str] = None,
+    model: Optional[str] = None,
+    reasoning_effort: Optional[str] = None,
     parent_agent=None,
     credentials_cfg: Optional[Dict[str, Any]] = None,
 ) -> str:
@@ -3654,6 +3668,17 @@ def delegate_task(
     'leaf' (default) cannot; 'orchestrator' retains the delegation
     toolset and can spawn its own workers, bounded by
     delegation.max_spawn_depth.  Per-task role beats the top-level one.
+
+    Optional 'model' and 'reasoning_effort' route an individual spawn without
+    touching global config.  Both accept a top-level value (single goal) and a
+    per-item value inside tasks[], and both resolve with the same precedence:
+
+        per-spawn argument > global delegation.* pin > parent inheritance
+
+    Omitting them preserves the historical behaviour exactly.  A per-spawn
+    model may only select a provider this profile holds credentials for; an
+    unknown model or effort level fails the call rather than silently running
+    the child somewhere else.
 
     Returns JSON with results array, one entry per task.
     """
@@ -3770,6 +3795,10 @@ def delegate_task(
         single_task: Dict[str, Any] = {"goal": goal, "context": context, "role": top_role}
         if output_schema is not None:
             single_task["output_schema"] = output_schema
+        if model is not None:
+            single_task["model"] = model
+        if reasoning_effort is not None:
+            single_task["reasoning_effort"] = reasoning_effort
         task_list = [single_task]
     else:
         return tool_error("Provide either 'goal' (single task) or 'tasks' (batch).")
@@ -3813,6 +3842,66 @@ def delegate_task(
             return tool_error(f"Task {i} output_schema invalid: {schema_err}")
         task_schemas.append(coerced_schema)
 
+    # Phase 2.11: resolve optional per-spawn model / reasoning_effort for
+    # every task in a PRE-PASS, before any child agent is constructed.
+    #
+    # Doing this up front is the whole point: a bad override on task N of a
+    # fan-out must return a clean tool_error while zero children exist, rather
+    # than leaving tasks 0..N-1 already built and registered for interrupt
+    # propagation while the call aborts. Same reason the output_schema pass
+    # above runs here.
+    #
+    # Precedence per task: per-spawn argument > global delegation.* pin >
+    # parent inheritance. ``creds`` (resolved above from the global pin or the
+    # internal credentials_cfg) is the fallback each task starts from, so
+    # omitting both fields reproduces today's behaviour byte for byte.
+    from tools.delegation_model_override import (
+        describe_route,
+        resolve_effort_override,
+        resolve_model_override,
+    )
+
+    task_creds: List[Dict[str, Any]] = []
+    task_reasoning: List[Optional[Dict[str, Any]]] = []
+    task_model_source: List[str] = []
+    _override_cfg_base = credentials_cfg if credentials_cfg else cfg
+    # Which precedence level the DEFAULT (non-overridden) route came from.
+    _default_source = "config" if creds.get("model") else "inherit"
+    for i, task in enumerate(task_list):
+        # -- reasoning effort ------------------------------------------------
+        raw_effort = task.get("reasoning_effort")
+        if raw_effort is None and len(task_list) == 1 and reasoning_effort is not None:
+            raw_effort = reasoning_effort
+        parsed_effort, effort_err = resolve_effort_override(raw_effort)
+        if effort_err:
+            return tool_error(f"Task {i}: {effort_err}")
+        task_reasoning.append(parsed_effort)
+
+        # -- model -----------------------------------------------------------
+        raw_model = task.get("model")
+        if raw_model is None and len(task_list) == 1 and model is not None:
+            raw_model = model
+        override_cfg, model_err = resolve_model_override(
+            raw_model, parent_agent, _override_cfg_base
+        )
+        if model_err:
+            return tool_error(f"Task {i}: {model_err}")
+        if override_cfg is None:
+            task_creds.append(creds)
+            task_model_source.append(_default_source)
+            continue
+        # Route the per-spawn model through the SAME credential resolver the
+        # global pin uses, so credential scoping is enforced identically: a
+        # provider with no key raises here and the spawn fails loudly instead
+        # of the child silently falling back to the parent's credentials.
+        try:
+            task_creds.append(
+                _resolve_delegation_credentials(override_cfg, parent_agent)
+            )
+        except ValueError as exc:
+            return tool_error(f"Task {i} model override rejected: {exc}")
+        task_model_source.append("spawn")
+
     overall_start = time.monotonic()
     results = []
 
@@ -3831,8 +3920,27 @@ def delegate_task(
         wrap_progress_callback,
     )
 
+    # Per-task route (model + provider) for auditability. Computed from the
+    # resolved credentials so it reports where the child ACTUALLY runs, with
+    # inheritance already applied — never a bare null the reader has to
+    # interpret.
+    task_routes = [
+        describe_route(
+            task_creds[i] if i < len(task_creds) else creds,
+            parent_agent,
+            source=(
+                task_model_source[i] if i < len(task_model_source) else _default_source
+            ),
+        )
+        for i in range(len(task_list))
+    ]
+
     live_deleg_id, live_writers, live_paths = create_live_transcripts(
-        task_list, context, model=creds.get("model"), provider=creds.get("provider")
+        task_list,
+        context,
+        model=creds.get("model"),
+        provider=creds.get("provider"),
+        task_routes=task_routes,
     )
 
     # Capture the ORIGINATING session's wake target BEFORE any child agent is
@@ -3875,6 +3983,7 @@ def delegate_task(
 
             _child_context = append_output_contract(_child_context, _task_schema)
         try:
+            _creds = task_creds[i] if i < len(task_creds) else creds
             child = _build_child_preserving_parent_tools(
                 task_index=i,
                 goal=t["goal"],
@@ -3882,19 +3991,22 @@ def delegate_task(
                 # Subagents always inherit the parent's toolsets; the model
                 # cannot choose or narrow them (no model-facing toolsets arg).
                 toolsets=None,
-                model=creds["model"],
+                model=_creds["model"],
                 max_iterations=effective_max_iter,
                 task_count=n_tasks,
                 parent_agent=parent_agent,
-                override_provider=creds["provider"],
-                override_base_url=creds["base_url"],
-                override_api_key=creds["api_key"],
-                override_api_mode=creds["api_mode"],
-                override_request_overrides=creds.get("request_overrides"),
-                override_max_tokens=creds.get("max_output_tokens"),
-                override_acp_command=creds.get("command"),
-                override_acp_args=creds.get("args"),
+                override_provider=_creds["provider"],
+                override_base_url=_creds["base_url"],
+                override_api_key=_creds["api_key"],
+                override_api_mode=_creds["api_mode"],
+                override_request_overrides=_creds.get("request_overrides"),
+                override_max_tokens=_creds.get("max_output_tokens"),
+                override_acp_command=_creds.get("command"),
+                override_acp_args=_creds.get("args"),
                 role=effective_role,
+                override_reasoning_config=(
+                    task_reasoning[i] if i < len(task_reasoning) else None
+                ),
             )
         except ValueError as exc:
             # Explicit-pin preflight failures (e.g. pinned delegation.command
@@ -4341,6 +4453,18 @@ def delegate_task(
                     "task). Read or `tail -f` these paths at any time to watch "
                     "a child work while it runs."
                 )
+            # Surface the resolved route per child so the caller can audit
+            # where each one actually ran — required when a batch mixes
+            # models, and harmless when it doesn't.
+            if task_routes:
+                payload["routes"] = list(task_routes)
+                if any(not r.get("inherited") for r in task_routes):
+                    payload["routes_hint"] = (
+                        "'routes' lists the model each subagent actually runs "
+                        "on. inherited=false means a per-spawn model override "
+                        "was applied; inherited=true means the child took the "
+                        "delegation default or the parent's model."
+                    )
             return json.dumps(payload, ensure_ascii=False)
 
         # Pool at capacity / schedule failure — children are still attached
@@ -4826,6 +4950,24 @@ DELEGATE_TASK_SCHEMA = {
                                 "require only fields you will actually read."
                             ),
                         },
+                        "model": {
+                            "type": "string",
+                            "description": (
+                                "Optional model for THIS task only, so a batch "
+                                "can run cheap mechanical work and one hard "
+                                "reasoning task on different models. Must be a "
+                                "model on a provider you have credentials for; "
+                                "an unknown model fails the call. Omit to "
+                                "inherit. See top-level 'model'."
+                            ),
+                        },
+                        "reasoning_effort": {
+                            "type": "string",
+                            "description": (
+                                "Optional reasoning depth for THIS task only. "
+                                "See top-level 'reasoning_effort'."
+                            ),
+                        },
                     },
                     "required": ["goal"],
                 },
@@ -4845,6 +4987,36 @@ DELEGATE_TASK_SCHEMA = {
                     "Optional JSON Schema for the single-goal form — the "
                     "subagent's final answer must validate against it "
                     "(same semantics as tasks[].output_schema)."
+                ),
+            },
+            "model": {
+                "type": "string",
+                "description": (
+                    "Optional model for this delegation, overriding the "
+                    "model children would otherwise inherit. Use it to run a "
+                    "hard task deeper or cheap work cheaper without changing "
+                    "global config. Precedence: this argument > the global "
+                    "delegation.model pin > the parent's model. You may only "
+                    "select a model on a provider this profile has "
+                    "credentials for; an unknown model returns an error "
+                    "rather than silently falling back. In batch mode, "
+                    "tasks[].model overrides this per item."
+                ),
+            },
+            "reasoning_effort": {
+                "type": "string",
+                "enum": [
+                    "none", "minimal", "low", "medium", "high", "xhigh",
+                    "max", "ultra",
+                ],
+                "description": (
+                    "Optional reasoning depth for this delegation, on "
+                    "providers that support it (ignored by models without "
+                    "reasoning support). 'none' disables thinking for the "
+                    "child. Same precedence as 'model': this argument > the "
+                    "global delegation.reasoning_effort pin > the parent's "
+                    "level. In batch mode, tasks[].reasoning_effort "
+                    "overrides this per item."
                 ),
             },
             "background": {
@@ -4955,6 +5127,8 @@ registry.register(
         action=args.get("action"),
         subagent_id=args.get("subagent_id"),
         message=args.get("message"),
+        model=args.get("model"),
+        reasoning_effort=args.get("reasoning_effort"),
         parent_agent=kw.get("parent_agent"),
     ),
     check_fn=check_delegate_requirements,
