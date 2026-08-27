@@ -259,6 +259,16 @@ export const updateBoard = (slug: string, patch: Record<string, unknown>) =>
 
 export const nudgeDispatcher = () => call<{ spawned?: unknown[] }>(withBoard('/dispatch'), { method: 'POST', body: {} })
 
+/** Append a free-typed idea to the board's roadmap `## Ideas` inbox
+ *  (Phase 2.15). Never rejects on a roadmap-unavailable outcome — the
+ *  backend is fail-open by contract — so callers branch on `ok`/`reason`
+ *  rather than a thrown error, matching `estimateNew`'s shape. */
+export const addRoadmapIdea = (text: string, sourceId?: string) =>
+  call<{ ok: boolean; reason?: null | string }>(withBoard('/roadmap/idea'), {
+    method: 'POST',
+    body: { text, ...(sourceId ? { source_id: sourceId } : {}) }
+  })
+
 export const saveOrchestration = (patch: Record<string, unknown>) =>
   call<OrchestrationSettings>('/orchestration', { method: 'PUT', body: patch })
 

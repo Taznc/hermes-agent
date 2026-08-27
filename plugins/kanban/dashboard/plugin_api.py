@@ -2022,6 +2022,96 @@ def _run_estimate(title: str, body: Optional[str]) -> dict:
 
 
 # ---------------------------------------------------------------------------
+# POST /roadmap/idea — Phase 2.15: capture a free-typed roadmap idea into the
+# roadmap-sync plugin's managed "## Ideas" inbox. This is the ONLY writer of
+# the roadmap from this router: it delegates the actual file mutation to
+# roadmap_sync.append_idea_for_board(), which owns the flock + atomic-write
+# path (see hermes-customizations/plugins/roadmap-sync) so there is exactly
+# one roadmap writer with its own locking, not a second one growing here.
+# ---------------------------------------------------------------------------
+
+# Mirror the ideas plugin's own bound so an obviously-oversized paste gets a
+# clean 400 instead of a silent server-side truncation the user never sees.
+_ROADMAP_IDEA_MAX_LEN = 2000
+
+
+def _load_roadmap_sync_module():
+    """Best-effort import of the roadmap-sync plugin's module object.
+
+    Goes through the SAME plugin loader/registry the agent core uses
+    (``hermes_cli.plugins.get_plugin_manager()``) rather than hand-rolling a
+    second importlib call, so this endpoint sees the plugin exactly as
+    loaded (or not) for the active profile/home — same enable/disable gate,
+    same directory resolution, no drift from a bespoke import path.
+
+    Returns ``None`` on ANY failure (plugin not installed, not enabled,
+    failed to load, or the loader API shape changes under us) — the caller
+    must always treat that as "roadmap unavailable" and degrade, never
+    raise. This is the dashboard-request half of the fail-open contract;
+    the plugin's own ``append_idea_for_board`` covers the write half.
+    """
+    try:
+        from hermes_cli.plugins import get_plugin_manager
+        manager = get_plugin_manager()
+        loaded = manager._plugins.get("roadmap-sync")
+        if loaded is None or not getattr(loaded, "enabled", False):
+            return None
+        return getattr(loaded, "module", None)
+    except Exception:
+        return None
+
+
+class RoadmapIdeaBody(BaseModel):
+    text: str
+    # Optional provenance when the idea was captured from an existing card
+    # (the second-slice "send to roadmap ideas" per-card action). The
+    # free-text board affordance in this slice omits both.
+    source_id: Optional[str] = None
+
+
+@router.post("/roadmap/idea")
+def append_roadmap_idea(payload: RoadmapIdeaBody, board: Optional[str] = Query(None)):
+    """Append one idea to the active board's roadmap ``## Ideas`` inbox.
+
+    Never a 5xx for a missing/misconfigured roadmap — that is the fail-open
+    contract carried through from the plugin. Returns
+    ``{"ok": true}`` on success or ``{"ok": false, "reason": "<code>"}`` so
+    the UI can distinguish "written" from "roadmap unavailable" per the
+    card's acceptance criteria. The ONLY validation done here (as opposed
+    to in the plugin) is the length pre-check, which needs a real 400 so a
+    UI bug pasting megabytes doesn't reach the roadmap writer at all;
+    empty/whitespace-only text is intentionally NOT rejected here — the
+    plugin's own sanitizer is authoritative for that so there is one place
+    that defines "empty" for both this endpoint and any future non-HTTP
+    caller (e.g. a CLI command hitting the same helper directly).
+    """
+    text = payload.text or ""
+    if len(text) > _ROADMAP_IDEA_MAX_LEN:
+        raise HTTPException(
+            status_code=400,
+            detail=f"idea text exceeds {_ROADMAP_IDEA_MAX_LEN} characters",
+        )
+
+    slug = _resolve_board(board) or kanban_db.get_current_board()
+
+    module = _load_roadmap_sync_module()
+    if module is None:
+        return {"ok": False, "reason": "roadmap_unavailable"}
+
+    try:
+        ok, reason = module.append_idea_for_board(
+            slug, text, source_id=(payload.source_id or None)
+        )
+    except Exception:
+        # Fail-open at the endpoint boundary too — the plugin function
+        # already catches internally, but a future edit to it (or an
+        # incompatible version mismatch between this endpoint and an
+        # older/newer roadmap-sync) must not turn into a 500 here either.
+        return {"ok": False, "reason": "roadmap_unavailable"}
+    return {"ok": bool(ok), "reason": None if ok else reason}
+
+
+# ---------------------------------------------------------------------------
 # Plugin config (read dashboard.kanban.* defaults from config.yaml)
 # ---------------------------------------------------------------------------
 
