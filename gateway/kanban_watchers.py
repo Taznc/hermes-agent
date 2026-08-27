@@ -239,7 +239,7 @@ class GatewayKanbanWatchersMixin:
         # but is not a block (see kanban_db.request_review); the task is not
         # archived, so the subscription stays alive and later review
         # cycles keep notifying.
-        TERMINAL_KINDS = ("completed", "blocked", "gave_up", "crashed", "timed_out", "status", "archived", "unblocked", "block_loop_detected", "review_requested")
+        TERMINAL_KINDS = ("completed", "blocked", "gave_up", "crashed", "timed_out", "status", "archived", "unblocked", "block_loop_detected", "review_requested", "review_no_verdict")
         # Subscriptions are removed only when the task reaches the irreversible
         # archived status. ``done`` is reversible in review/controller flows,
         # so removing its subscription would silence a later reopen. We used
@@ -617,6 +617,19 @@ class GatewayKanbanWatchersMixin:
                             msg = (
                                 f"👀 {board_tag}{tag}Kanban {sub['task_id']} ready for review"
                                 f" — {title}{handoff}"
+                            )
+                        elif kind == "review_no_verdict":
+                            # Neutral audit outcome: the reviewer exited
+                            # cleanly without approving, requesting
+                            # changes, or escalating. Not a failure — but
+                            # the card is now sticky-blocked and needs an
+                            # explicit kanban_unblock before another
+                            # reviewer pass can be dispatched, so surface
+                            # it like a block would.
+                            msg = (
+                                f"👀 {board_tag}{tag}Kanban {sub['task_id']} review "
+                                f"ended with no verdict — parked; run "
+                                f"`kanban_unblock` to requeue for review"
                             )
                         elif kind == "block_loop_detected":
                             # A task re-blocked for the same cause past the

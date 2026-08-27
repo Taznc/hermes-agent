@@ -1134,3 +1134,77 @@ def test_attach_url_happy_path_public_host(worker_env, default_url_guard, monkey
         assert Path(atts[0].stored_path).read_bytes() == payload
     finally:
         conn.close()
+
+
+# ---------------------------------------------------------------------------
+# Reviewer escalation via the real kanban_block tool path (task
+# t_f4ab1544, acceptance criterion 4: reviewer escalation is a legal
+# terminal action through the real tool path).
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture
+def review_claim_env(monkeypatch, tmp_path):
+    """A worker env whose task is claimed by a REVIEWER (not the original
+    implementer): request_review -> claim_review_task, then
+    HERMES_KANBAN_TASK is pointed at that claimed run."""
+    home = tmp_path / ".hermes"
+    home.mkdir()
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    monkeypatch.setenv("HERMES_PROFILE", "reviewer")
+    monkeypatch.delenv("HERMES_SESSION_ID", raising=False)
+    from pathlib import Path as _Path
+    monkeypatch.setattr(_Path, "home", lambda: tmp_path)
+
+    from hermes_cli import kanban_db as kb
+    kb._INITIALIZED_PATHS.clear()
+    kb.init_db()
+    conn = kb.connect()
+    try:
+        tid = kb.create_task(conn, title="reviewer-escalation-test", assignee="builder")
+        implementation = kb.claim_task(conn, tid, claimer="builder:1")
+        assert implementation is not None
+        assert kb.request_review(
+            conn, tid, summary="ready", reviewer="reviewer",
+            expected_run_id=implementation.current_run_id,
+        )
+        review = kb.claim_review_task(conn, tid, claimer="reviewer:1")
+        assert review is not None
+    finally:
+        conn.close()
+    monkeypatch.setenv("HERMES_KANBAN_TASK", tid)
+    return tid
+
+
+def test_reviewer_escalates_via_real_kanban_block_tool(review_claim_env):
+    """An active reviewer must be able to escalate through the real
+    ``kanban_block`` tool/handler, and an explicit unblock must resume
+    the task in ``review`` (not ``ready``) — the reviewer's escalation
+    is a legal terminal action, distinct from an implementer's block."""
+    from tools import kanban_tools as kt
+    from hermes_cli import kanban_db as kb
+
+    out = kt._handle_block({
+        "reason": "needs_input: maintainer decision required",
+        "kind": "needs_input",
+    })
+    d = json.loads(out)
+    assert d["ok"] is True
+    assert d["status"] == "blocked"
+
+    conn = kb.connect()
+    try:
+        blocked = kb.get_task(conn, review_claim_env)
+        assert blocked is not None
+        assert blocked.status == "blocked"
+        events = kb.list_events(conn, review_claim_env)
+        blocked_event = [e for e in events if e.kind == "blocked"][-1]
+        assert blocked_event.payload is not None
+        assert blocked_event.payload.get("source_status") == "review"
+
+        assert kb.unblock_task(conn, review_claim_env)
+        resumed = kb.get_task(conn, review_claim_env)
+        assert resumed is not None
+        assert resumed.status == "review"
+    finally:
+        conn.close()
