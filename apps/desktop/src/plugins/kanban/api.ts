@@ -238,6 +238,20 @@ export const reassignTask = (id: string, profile: string) =>
 
 export const reclaimTask = (id: string) => nudged(call(withBoard(`/tasks/${id}/reclaim`), { method: 'POST', body: {} }))
 
+/** Create a dependency edge: `parentId` BLOCKS `childId`. Nudges, because a
+ *  new gate can change what the dispatcher is allowed to spawn. */
+export const linkTasks = (parentId: string, childId: string) =>
+  nudged(call(withBoard('/links'), { method: 'POST', body: { parent_id: parentId, child_id: childId } }))
+
+/** Cut a dependency edge. Nudges: removing the last gate on a todo task can
+ *  promote it to ready immediately. */
+export const unlinkTasks = (parentId: string, childId: string) =>
+  nudged(
+    call(withBoard('/links', { parent_id: parentId, child_id: childId }), {
+      method: 'DELETE'
+    })
+  )
+
 export const uploadAttachment = (id: string, upload: { filename: string; contentType?: string; bytes: ArrayBuffer }) =>
   call(withBoard(`/tasks/${id}/attachments`), { method: 'POST', upload })
 

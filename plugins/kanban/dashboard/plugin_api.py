@@ -412,8 +412,11 @@ def get_board(
             workflow_template_id=workflow_template_id,
             current_step_key=current_step_key,
         )
-        # Pre-fetch link counts per task (cheap: one query).
+        # Pre-fetch link counts per task (cheap: one query). The same rows are
+        # kept as an explicit edge list so the UI can highlight a card's whole
+        # dependency chain without N per-task round-trips.
         link_counts: dict[str, dict[str, int]] = {}
+        link_edges: list[list[str]] = []
         for row in conn.execute(
             "SELECT parent_id, child_id FROM task_links"
         ).fetchall():
@@ -423,6 +426,7 @@ def get_board(
             link_counts.setdefault(row["child_id"], {"parents": 0, "children": 0})[
                 "parents"
             ] += 1
+            link_edges.append([row["parent_id"], row["child_id"]])
 
         # Comment + event counts (both cheap aggregates).
         comment_counts: dict[str, int] = {
@@ -509,6 +513,7 @@ def get_board(
             ],
             "tenants": tenants,
             "assignees": assignees,
+            "link_edges": link_edges,
             "latest_event_id": int(latest_event_id),
             "now": int(time.time()),
         }

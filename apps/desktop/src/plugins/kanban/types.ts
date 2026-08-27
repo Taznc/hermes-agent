@@ -34,8 +34,23 @@ export interface KanbanBoard {
   columns: KanbanColumn[]
   tenants: string[]
   assignees: string[]
+  /** Every dependency edge on the board as `[parent_id, child_id]` — the
+   *  parent BLOCKS the child. Absent on older backends, so always guard. */
+  link_edges?: Array<[string, string]>
   latest_event_id: number
   now: number
+}
+
+/** A dependency resolved against the board cache for display: the linked
+ *  task's own identity, so a row can be read without opening it. `missing`
+ *  marks an id the board no longer has (deleted, or filtered out by the
+ *  current tenant/archive view). */
+export interface ResolvedLink {
+  id: string
+  title: string
+  status: string
+  assignee?: null | string
+  missing: boolean
 }
 
 /** A structured recovery action attached to a diagnostic. */
