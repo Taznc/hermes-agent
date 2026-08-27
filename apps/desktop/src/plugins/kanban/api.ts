@@ -29,6 +29,7 @@ import type {
   KanbanTask,
   KanbanTaskDetail,
   OrchestrationSettings,
+  StagedAttachment,
   TaskEstimate,
   WorkerLog
 } from './types'
@@ -236,6 +237,17 @@ export const reclaimTask = (id: string) => nudged(call(withBoard(`/tasks/${id}/r
 
 export const uploadAttachment = (id: string, upload: { filename: string; contentType?: string; bytes: ArrayBuffer }) =>
   call(withBoard(`/tasks/${id}/attachments`), { method: 'POST', upload })
+
+/** Upload a pasted image before the task exists (new-task dialog paste flow).
+ *  Returns a `token` that travels in `pending_attachment_tokens` on
+ *  `createTask` and is promoted into a real attachment server-side. */
+export const stageAttachment = (upload: { filename: string; contentType?: string; bytes: ArrayBuffer }) =>
+  call<{ attachment: StagedAttachment }>(withBoard('/attachments/staged'), { method: 'POST', upload })
+
+/** Remove a staged (pre-submit) image — used by the remove (×) button and by
+ *  best-effort cleanup when the new-task dialog closes without submitting. */
+export const deleteStagedAttachment = (token: string) =>
+  call(withBoard(`/attachments/staged/${encodeURIComponent(token)}`), { method: 'DELETE' })
 
 export const createBoard = (slug: string, name: string, projectId?: string) =>
   call<{ board: { slug: string } }>('/boards', {

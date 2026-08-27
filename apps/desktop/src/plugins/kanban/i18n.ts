@@ -61,6 +61,9 @@ type KanbanMessages = {
   titlePlaceholderTriage: string
   titlePlaceholder: string
   descPlaceholder: string
+  pastedImages: (n: number) => string
+  removeImage: string
+  imagePasteFailed: string
   priority: string
   markHighPriority: string
   removeHighPriority: string
@@ -277,6 +280,9 @@ export const en: KanbanMessages = {
   titlePlaceholderTriage: 'Rough idea — a specifier will flesh it out',
   titlePlaceholder: 'Title',
   descPlaceholder: 'Description (optional)',
+  pastedImages: n => `Pasted images · ${n}`,
+  removeImage: 'Remove image',
+  imagePasteFailed: 'Could not upload pasted image',
   priority: 'Priority',
   markHighPriority: 'Mark high priority',
   removeHighPriority: 'Remove high priority',
@@ -498,6 +504,9 @@ const ja: KanbanMessages = {
   titlePlaceholderTriage: '大まかなアイデア — スペシファイアが具体化します',
   titlePlaceholder: 'タイトル',
   descPlaceholder: '説明（任意）',
+  pastedImages: n => `貼り付けた画像・${n}`,
+  removeImage: '画像を削除',
+  imagePasteFailed: '貼り付けた画像をアップロードできませんでした',
   priority: '優先度',
   markHighPriority: '優先度を高に設定',
   removeHighPriority: '優先度の高設定を解除',
@@ -717,6 +726,9 @@ const zh: KanbanMessages = {
   titlePlaceholderTriage: '大致想法 — 细化代理会补全',
   titlePlaceholder: '标题',
   descPlaceholder: '描述（可选）',
+  pastedImages: n => `已粘贴的图片・${n}`,
+  removeImage: '移除图片',
+  imagePasteFailed: '无法上传粘贴的图片',
   priority: '优先级',
   markHighPriority: '标记为高优先级',
   removeHighPriority: '取消高优先级',
@@ -934,6 +946,9 @@ const zhHant: KanbanMessages = {
   titlePlaceholderTriage: '大致想法 — 細化代理會補全',
   titlePlaceholder: '標題',
   descPlaceholder: '描述（選填）',
+  pastedImages: n => `已貼上的圖片・${n}`,
+  removeImage: '移除圖片',
+  imagePasteFailed: '無法上傳貼上的圖片',
   priority: '優先順序',
   markHighPriority: '標記為高優先順序',
   removeHighPriority: '取消高優先順序',
