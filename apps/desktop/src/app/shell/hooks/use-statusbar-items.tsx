@@ -464,6 +464,70 @@ export function useStatusbarItems({
     }
   }, [devBundleStale])
 
+  // Dev only: backend Python source (agent/ tui_gateway/ tools/ hermes_cli/)
+  // changed on disk after the running `hermes serve` child already imported
+  // it (Phase 2.9). Distinct from devRestartItem (the Electron main process)
+  // and from backendVersionItem/backendUpdateApply (a REMOTE backend's git
+  // update state) — this is specifically "your own local backend process is
+  // stale," worded to name the backend so it can't be confused with either.
+  // Never restarts automatically: only the explicit click here calls
+  // restartDevBackend(), same offer-don't-act contract as the main-process
+  // affordance above. Hidden entirely in packaged builds and whenever the
+  // primary backend is remote (`supported: false`).
+  const [devBackendStaleState, setDevBackendStaleState] = useState<
+    'fresh' | 'stale' | 'restarting' | 'failed' | null
+  >(null)
+
+  useEffect(() => {
+    let active = true
+
+    void window.hermesDesktop.getDevBackendStale?.().then(res => {
+      if (active && res?.supported) {
+        setDevBackendStaleState(res.state)
+      }
+    })
+
+    const off = window.hermesDesktop.onDevBackendStale?.(payload => {
+      if (active) {
+        setDevBackendStaleState(payload?.state ?? 'fresh')
+      }
+    })
+
+    return () => {
+      active = false
+      off?.()
+    }
+  }, [])
+
+  const devBackendRestartItem = useMemo<StatusbarItem | null>(() => {
+    if (!devBackendStaleState || devBackendStaleState === 'fresh') {
+      return null
+    }
+
+    const restarting = devBackendStaleState === 'restarting'
+    const failed = devBackendStaleState === 'failed'
+
+    return {
+      className: `px-2 font-semibold text-white ${failed ? 'bg-destructive hover:bg-destructive/90' : 'bg-blue-600 hover:bg-blue-500'}`,
+      icon: restarting ? <Loader2 className="size-3 animate-spin" /> : <Loader2 className="size-3" />,
+      id: 'dev-backend-restart',
+      label: restarting ? 'Restarting backend…' : failed ? 'Backend restart failed — retry' : 'Restart backend to apply',
+      onSelect: () => {
+        if (restarting) {
+          return
+        }
+
+        void window.hermesDesktop.restartDevBackend?.()
+      },
+      title: failed
+        ? 'The backend restart failed. Click to try again.'
+        : 'Backend Python source (agent/, tui_gateway/, tools/, hermes_cli/) changed on disk\n' +
+          'after this window\'s Hermes backend process already imported it.\n' +
+          'The renderer stays connected; an in-flight turn is never interrupted automatically.\n' +
+          'Click to restart the backend now.'
+    }
+  }, [devBackendStaleState])
+
   // Web build only: Vite's HMR client traps location.reload() into this flag
   // instead of navigating (see src/web-bridge-shim.ts / src/store/web-reload.ts)
   // so an edit never destroys in-progress work. Same blue affordance as
@@ -527,6 +591,7 @@ export function useStatusbarItems({
     () => [
       ...(forkBuildItem ? [forkBuildItem] : []),
       ...(devRestartItem ? [devRestartItem] : []),
+      ...(devBackendRestartItem ? [devBackendRestartItem] : []),
       ...(webReloadItem ? [webReloadItem] : []),
       ...(connectionItem ? [connectionItem] : []),
       {
@@ -650,6 +715,7 @@ export function useStatusbarItems({
       commandCenterOpen,
       connectionItem,
       devRestartItem,
+      devBackendRestartItem,
       webReloadItem,
       forkBuildItem,
       copy,

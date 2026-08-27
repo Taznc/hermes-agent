@@ -480,6 +480,17 @@ contextBridge.exposeInMainWorld('hermesDesktop', {
 
     return () => ipcRenderer.removeListener('hermes:dev:main-bundle-stale', listener)
   },
+  // Dev-only: has backend Python source the running `hermes serve` child
+  // already imported changed on disk (agent/ tui_gateway/ tools/ hermes_cli/)?
+  // `supported` is false in a packaged build and against a remote primary.
+  getDevBackendStale: () => ipcRenderer.invoke('hermes:dev:backend-stale'),
+  restartDevBackend: () => ipcRenderer.invoke('hermes:dev:backend-restart'),
+  onDevBackendStale: callback => {
+    const listener = (_event, payload) => callback(payload)
+    ipcRenderer.on('hermes:dev:backend-stale', listener)
+
+    return () => ipcRenderer.removeListener('hermes:dev:backend-stale', listener)
+  },
   getRemoteDisplayReason: () => ipcRenderer.invoke('hermes:get-remote-display-reason'),
   uninstall: {
     summary: () => ipcRenderer.invoke('hermes:uninstall:summary'),
