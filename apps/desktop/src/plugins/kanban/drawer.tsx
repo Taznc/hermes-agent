@@ -47,10 +47,12 @@ import {
 } from './api'
 import { ModelOverrideField, overridePatch } from './model-override'
 import {
+  type ChoiceResponse,
   columnMeta,
   type Diagnostic,
   type DiagnosticAction,
   type KanbanAttachment,
+  type KanbanComment,
   type KanbanEvent,
   type KanbanTaskDetail,
   type KanbanTaskFull,
@@ -214,6 +216,301 @@ export function latestBlockReason(events: KanbanEvent[]): null | string {
   return null
 }
 
+/** Same lookup as `latestBlockReason`, but also carries the event's id — the
+ *  stable handle that binds a clicked answer to the specific question it
+ *  answers (`ChoiceResponse.question_event_id`), so a re-block with a new
+ *  question can never be confused with an old, already-answered one. */
+function latestBlockEvent(events: KanbanEvent[]): null | { id: number; reason: string } {
+  for (let i = events.length - 1; i >= 0; i--) {
+    const event = events[i]
+
+    if (event.kind === 'blocked' || event.kind === 'block_loop_detected') {
+      const reason = latestBlockReason([event])
+
+      return reason ? { id: event.id, reason } : null
+    }
+  }
+
+  return null
+}
+
+/** One clickable option in a blocked-callout multiple-choice question — see
+ *  docs/design/blocked-callout-multiple-choice-spec.md §1. */
+interface BlockedChoiceOption {
+  key: string
+  label: string
+  description?: string
+}
+
+const MAX_CHOICES_FENCE_BYTES = 4096
+const MIN_OPTIONS = 2
+const MAX_OPTIONS = 6
+
+function devWarn(message: string): void {
+  if (import.meta.env.DEV) {
+    console.warn(`[kanban] ${message}`)
+  }
+}
+
+/**
+ * Parses an optional fenced ```choices JSON block out of a blocked-task
+ * `reason` string. Returns `null` whenever no fence is present or the fence
+ * fails any validation rule — the caller must then fall back to rendering
+ * `reason` as plain text exactly as it did before this feature existed.
+ * Never throws: every failure path returns `null` (+ a dev-only console
+ * warning), matching the spec's "malformed input never crashes" contract.
+ */
+export function parseBlockedChoices(reason: string): null | { options: BlockedChoiceOption[]; prose: string } {
+  if (!reason) {
+    return null
+  }
+
+  // The LAST fence in the string wins (a worker's prose could quote an
+  // example fence earlier); scan all matches and keep the final one.
+  const fenceRe = /```choices\s*([\s\S]*?)```/g
+  let lastMatch: null | RegExpExecArray = null
+  let match: null | RegExpExecArray
+
+  while ((match = fenceRe.exec(reason))) {
+    lastMatch = match
+  }
+
+  if (!lastMatch) {
+    return null
+  }
+
+  const fenceBody = lastMatch[1]
+
+  if (new TextEncoder().encode(fenceBody).length > MAX_CHOICES_FENCE_BYTES) {
+    devWarn(`malformed choices fence: body exceeds ${MAX_CHOICES_FENCE_BYTES} bytes`)
+
+    return null
+  }
+
+  let parsed: unknown
+
+  try {
+    parsed = JSON.parse(fenceBody)
+  } catch (err) {
+    devWarn(`malformed choices fence: invalid JSON (${String(err)})`)
+
+    return null
+  }
+
+  if (!Array.isArray(parsed) || parsed.length < MIN_OPTIONS || parsed.length > MAX_OPTIONS) {
+    devWarn(`malformed choices fence: expected an array of ${MIN_OPTIONS}-${MAX_OPTIONS} options`)
+
+    return null
+  }
+
+  const options: BlockedChoiceOption[] = []
+  const seenKeys = new Set<string>()
+
+  for (let i = 0; i < parsed.length; i++) {
+    const item = parsed[i] as unknown
+
+    if (!item || typeof item !== 'object') {
+      devWarn(`malformed choices fence: option ${i} is not an object`)
+
+      return null
+    }
+
+    const { description, key, label } = item as Record<string, unknown>
+
+    if (typeof key !== 'string' || !key) {
+      devWarn(`malformed choices fence: option ${i} missing a non-empty "key"`)
+
+      return null
+    }
+
+    if (typeof label !== 'string' || !label) {
+      devWarn(`malformed choices fence: option ${i} missing a non-empty "label"`)
+
+      return null
+    }
+
+    if (description !== undefined && typeof description !== 'string') {
+      devWarn(`malformed choices fence: option ${i} has a non-string "description"`)
+
+      return null
+    }
+
+    if (seenKeys.has(key)) {
+      devWarn(`malformed choices fence: duplicate key "${key}"`)
+
+      return null
+    }
+
+    seenKeys.add(key)
+    options.push(description ? { description, key, label } : { key, label })
+  }
+
+  const prose = reason.slice(0, lastMatch.index).trimEnd()
+
+  return { options, prose }
+}
+
+/**
+ * The clickable option list rendered in place of a plain-text CTA banner
+ * paragraph when `parseBlockedChoices` finds a valid option set. A single-
+ * select ARIA radiogroup with roving tabindex (see spec §4): arrow keys move
+ * focus + selection, Enter/Space submits (native <button> semantics — no
+ * extra key handling needed for that part). One shared submit path handles
+ * both pointer and keyboard activation.
+ */
+function ChoiceOptions({
+  comments,
+  onSubmit,
+  options,
+  prose,
+  questionEventId
+}: {
+  comments: KanbanComment[]
+  onSubmit: (body: string, choice: ChoiceResponse) => Promise<unknown>
+  options: BlockedChoiceOption[]
+  prose: string
+  questionEventId: number
+}) {
+  const k = useKanban()
+  const listRef = useRef<HTMLDivElement>(null)
+  const [focusIndex, setFocusIndex] = useState(0)
+  const [pendingKey, setPendingKey] = useState<null | string>(null)
+  const [errorKey, setErrorKey] = useState<null | string>(null)
+  // Sticky local confirmation so the UI doesn't flash back to "unanswered"
+  // between a successful submit and the subsequent comment-list refetch.
+  const [optimisticKey, setOptimisticKey] = useState<null | string>(null)
+
+  const answeredComment = comments.find(
+    comment => comment.choice && comment.choice.question_event_id === questionEventId
+  )
+
+  const submittedKey = answeredComment?.choice?.key ?? optimisticKey
+  const isSubmitted = submittedKey != null
+
+  const isDisabled = (option: BlockedChoiceOption) =>
+    isSubmitted || pendingKey !== null || (errorKey !== null && errorKey !== option.key)
+
+  const focusDomIndex = (index: number) => {
+    requestAnimationFrame(() => {
+      const buttons = listRef.current?.querySelectorAll<HTMLButtonElement>('[role="radio"]')
+
+      buttons?.[index]?.focus()
+    })
+  }
+
+  const moveFocus = (delta: number) => {
+    if (options.every(isDisabled)) {
+      return
+    }
+
+    let next = focusIndex
+
+    for (let i = 0; i < options.length; i++) {
+      next = (next + delta + options.length) % options.length
+
+      if (!isDisabled(options[next])) {
+        break
+      }
+    }
+
+    setFocusIndex(next)
+    focusDomIndex(next)
+  }
+
+  const submit = (option: BlockedChoiceOption) => {
+    if (isDisabled(option)) {
+      return
+    }
+
+    setErrorKey(null)
+    setPendingKey(option.key)
+
+    void onSubmit(`${option.key}) ${option.label}`, {
+      key: option.key,
+      label: option.label,
+      question_event_id: questionEventId
+    }).then(
+      () => {
+        setPendingKey(null)
+        setOptimisticKey(option.key)
+      },
+      () => {
+        setPendingKey(null)
+        setErrorKey(option.key)
+      }
+    )
+  }
+
+  return (
+    <div
+      aria-label={prose || k.choicesGroupLabel}
+      className="flex flex-col gap-1.5"
+      ref={listRef}
+      role="radiogroup"
+    >
+      {options.map((option, index) => {
+        const checked = submittedKey === option.key
+        const isPending = pendingKey === option.key
+        const isError = errorKey === option.key
+        const disabled = isDisabled(option)
+
+        return (
+          <button
+            aria-checked={checked}
+            className={cn(
+              'flex flex-col gap-0.5 rounded-md px-2.5 py-2 text-left text-[0.75rem] shadow-[inset_0_0_0_1px_color-mix(in_srgb,var(--ui-stroke-secondary)_50%,transparent)] transition-colors outline-none focus-visible:border-ring focus-visible:ring-[0.1875rem] focus-visible:ring-ring/50 disabled:cursor-default',
+              checked
+                ? 'bg-(--ui-bg-quaternary) text-(--ui-text-primary) shadow-[inset_0_0_0_1px_color-mix(in_srgb,var(--ui-text-secondary)_35%,transparent)]'
+                : 'text-(--ui-text-secondary) hover:bg-(--chrome-action-hover) hover:text-(--ui-text-primary)',
+              disabled && !checked && !isError && 'opacity-50'
+            )}
+            disabled={disabled}
+            key={option.key}
+            onClick={() => submit(option)}
+            onKeyDown={event => {
+              if (event.key === 'ArrowDown' || event.key === 'ArrowRight') {
+                event.preventDefault()
+                moveFocus(1)
+              } else if (event.key === 'ArrowUp' || event.key === 'ArrowLeft') {
+                event.preventDefault()
+                moveFocus(-1)
+              } else if (event.key === 'Home') {
+                event.preventDefault()
+                setFocusIndex(0)
+                focusDomIndex(0)
+              } else if (event.key === 'End') {
+                event.preventDefault()
+                setFocusIndex(options.length - 1)
+                focusDomIndex(options.length - 1)
+              }
+            }}
+            role="radio"
+            tabIndex={index === focusIndex ? 0 : -1}
+            type="button"
+          >
+            <span className="flex items-center gap-2">
+              <span className="shrink-0 rounded bg-(--ui-bg-quaternary) px-1.5 py-0.5 font-mono text-[0.625rem] text-(--ui-text-tertiary)">
+                {option.key}
+              </span>
+              <span className="min-w-0 flex-1">{option.label}</span>
+              {checked && <Codicon className="shrink-0" name="check" size="0.8rem" />}
+              {isPending && <Codicon className="shrink-0" name="loading" size="0.8rem" spinning />}
+            </span>
+            {option.description && (
+              <span className="pl-[1.9rem] text-[0.6875rem] text-(--ui-text-quaternary)">{option.description}</span>
+            )}
+            {isError && (
+              <span className="pl-[1.9rem] text-[0.6875rem] text-destructive">
+                {k.choiceSubmitError} · {k.choiceRetry}
+              </span>
+            )}
+          </button>
+        )
+      })}
+    </div>
+  )
+}
+
 /**
  * The task detail view's top-of-drawer call to action. This is the answer to
  * "why is this stuck and what do I do about it" — rendered once, above
@@ -222,21 +519,30 @@ export function latestBlockReason(events: KanbanEvent[]): null | string {
  * drawer stays informational; this is the only thing asking for action.
  */
 export function CtaBanner({
+  comments,
   events,
   onFocusComment,
   onMove,
+  onSubmitChoice,
   task
 }: {
+  comments: KanbanComment[]
   events: KanbanEvent[]
   onFocusComment: () => void
   onMove: (status: string) => void
+  onSubmitChoice: (body: string, choice: ChoiceResponse) => Promise<unknown>
   task: KanbanTaskFull
 }) {
   const k = useKanban()
 
   if (task.status === 'blocked') {
     const kind = (task.block_kind ?? null) as null | 'capability' | 'needs_input' | 'transient'
-    const reason = latestBlockReason(events)
+    const blockEvent = latestBlockEvent(events)
+    const reason = blockEvent?.reason ?? null
+    // A valid ```choices fence renders clickable options instead of the plain
+    // paragraph; any missing/malformed fence falls back to today's exact
+    // plain-text + free-text-composer path (spec §5).
+    const choices = reason ? parseBlockedChoices(reason) : null
     // needs_input reads as a literal question waiting on the user; the other
     // kinds (capability / transient / untyped legacy) are still "blocked",
     // just for a different reason — the icon + label change, the actions don't.
@@ -246,24 +552,46 @@ export function CtaBanner({
     return (
       <Banner
         actions={
-          <>
-            <Button onClick={onFocusComment} size="xs" variant="secondary">
-              <Codicon name="comment" size="0.7rem" />
-              {k.ctaReply}
-            </Button>
+          choices ? (
             <Button onClick={() => onMove('ready')} size="xs" variant="outline">
               <Codicon name="debug-continue" size="0.7rem" />
               {k.ctaUnblock}
             </Button>
-          </>
+          ) : (
+            <>
+              <Button onClick={onFocusComment} size="xs" variant="secondary">
+                <Codicon name="comment" size="0.7rem" />
+                {k.ctaReply}
+              </Button>
+              <Button onClick={() => onMove('ready')} size="xs" variant="outline">
+                <Codicon name="debug-continue" size="0.7rem" />
+                {k.ctaUnblock}
+              </Button>
+            </>
+          )
         }
         icon={icon}
         title={kind ? k.blockKind[kind] : k.ctaBlockedTitle}
         tone={tone}
       >
-        <p className="text-[0.75rem] leading-relaxed text-(--ui-text-secondary)">
-          {reason || k.ctaBlockedNoReason}
-        </p>
+        {choices ? (
+          <>
+            {choices.prose && (
+              <p className="text-[0.75rem] leading-relaxed text-(--ui-text-secondary)">{choices.prose}</p>
+            )}
+            <ChoiceOptions
+              comments={comments}
+              onSubmit={onSubmitChoice}
+              options={choices.options}
+              prose={choices.prose}
+              questionEventId={blockEvent!.id}
+            />
+          </>
+        ) : (
+          <p className="text-[0.75rem] leading-relaxed text-(--ui-text-secondary)">
+            {reason || k.ctaBlockedNoReason}
+          </p>
+        )}
       </Banner>
     )
   }
@@ -741,7 +1069,7 @@ export function TaskDrawer({
     )
 
   const commentMut = useMutation({
-    mutationFn: (body: string) => addComment(id!, body),
+    mutationFn: ({ body, choice }: { body: string; choice?: ChoiceResponse }) => addComment(id!, body, choice),
     onError: err => host.notify({ kind: 'error', message: errText(err) }),
     onSuccess: invalidate
   })
@@ -906,6 +1234,7 @@ export function TaskDrawer({
         ) : (
           <div className="flex flex-col gap-4 text-sm">
             <CtaBanner
+              comments={detail.comments}
               events={detail.events}
               onFocusComment={() => {
                 const el = document.querySelector<HTMLElement>('[data-kanban-comment-input="true"]')
@@ -914,6 +1243,7 @@ export function TaskDrawer({
                 el?.focus()
               }}
               onMove={move}
+              onSubmitChoice={(body, choice) => commentMut.mutateAsync({ body, choice })}
               task={task}
             />
 
@@ -1027,7 +1357,7 @@ export function TaskDrawer({
               )}
               <CommentComposer
                 onRequeue={body => requeueMut.mutate(body)}
-                onSubmit={body => commentMut.mutate(body)}
+                onSubmit={body => commentMut.mutate({ body })}
                 pending={commentMut.isPending || requeueMut.isPending}
                 running={running}
               />

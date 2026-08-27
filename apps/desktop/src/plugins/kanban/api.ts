@@ -23,6 +23,7 @@ import { bindCompletionNotify, type CompletionEvent, onKanbanEventsFrame } from 
 import type {
   BoardMeta,
   BoardsResponse,
+  ChoiceResponse,
   KanbanBoard,
   KanbanProfile,
   KanbanProject,
@@ -226,8 +227,11 @@ export const bulkTasks = (ids: string[], patch: Record<string, unknown>) =>
     })
   )
 
-export const addComment = (id: string, body: string) =>
-  call(withBoard(`/tasks/${id}/comments`), { method: 'POST', body: { author: 'desktop', body } })
+/** `choice`, when present, is the clicked multiple-choice option — see
+ *  docs/design/blocked-callout-multiple-choice-spec.md. Optional so every
+ *  free-text reply keeps sending exactly the payload it always has. */
+export const addComment = (id: string, body: string, choice?: ChoiceResponse) =>
+  call(withBoard(`/tasks/${id}/comments`), { method: 'POST', body: { author: 'desktop', body, choice: choice ?? null } })
 
 export const reassignTask = (id: string, profile: string) =>
   nudged(call(withBoard(`/tasks/${id}/reassign`), { method: 'POST', body: { profile, reclaim_first: true } }))
