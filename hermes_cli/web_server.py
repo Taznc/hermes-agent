@@ -3025,6 +3025,37 @@ async def fs_read_text(path: str):
     }
 
 
+_FS_PLUGIN_SOURCE_MAX_BYTES = 16 * 1024 * 1024
+
+
+@app.get("/api/fs/read-plugin-source")
+async def fs_read_plugin_source(path: str):
+    """Full-source read for runtime desktop plugins, no truncation.
+
+    Mirrors Electron's ``hermes:readPluginSource`` IPC handler
+    (apps/desktop/electron/main.ts): a dedicated generous cap and a hard
+    413 instead of the 512 KiB silent truncation ``/api/fs/read-text``
+    applies for preview reads — evaluating a truncated plugin.js file as ESM
+    is a real failure the caller must see, not a payload the loader partially
+    executes (apps/desktop/src/contrib/runtime-loader.ts `readPluginSourceText`).
+    """
+    target, st = _fs_regular_file(_fs_path(path))
+    if st.st_size > _FS_PLUGIN_SOURCE_MAX_BYTES:
+        raise HTTPException(status_code=413, detail="Plugin source exceeds the 16 MiB read limit")
+    try:
+        data = target.read_bytes()
+    except PermissionError:
+        raise HTTPException(status_code=403, detail="File is not readable")
+    except OSError as exc:
+        raise HTTPException(status_code=400, detail=str(exc) or "File read failed")
+    return {
+        "byteSize": st.st_size,
+        "path": str(target),
+        "text": data.decode("utf-8", errors="replace"),
+        "truncated": False,
+    }
+
+
 @app.post("/api/fs/write-text")
 async def fs_write_text(payload: FsWriteText):
     """Overwrite (or create) a UTF-8 text file for the in-app spot editor.
@@ -3114,6 +3145,40 @@ async def fs_git_root(path: str):
 async def fs_default_cwd():
     cwd = _fs_default_cwd()
     return {"cwd": cwd, "branch": _fs_git_branch(cwd)}
+
+
+# ---------------------------------------------------------------------------
+# Disk-plugin roots — the remote half of the desktop's on-disk plugin door
+# (apps/desktop/src/contrib/runtime-loader.ts `diskRoots()`), for the web-spike
+# bridge shim (apps/desktop/src/web-bridge-shim.ts) which has no Electron main
+# process to resolve these paths locally. Mirrors Electron's
+# `hermes:fs:desktopPluginsRoot` / `hermes:fs:agentPluginsRoot` IPC handlers
+# (apps/desktop/electron/fs-ipc.ts `localPluginsRoot`): profile-aware,
+# created on demand so a fresh profile with no folder yet still resolves a
+# real (if empty) path instead of the scanner silently finding nothing.
+# ---------------------------------------------------------------------------
+
+
+def _fs_plugin_root(dir_name: str, profile: Optional[str]) -> Path:
+    with _config_profile_scope(profile):
+        target = get_hermes_home() / dir_name
+    try:
+        target.mkdir(parents=True, exist_ok=True)
+    except OSError:
+        pass  # Best-effort create, same as the Electron handler; the scan just finds nothing.
+    return target
+
+
+@app.get("/api/fs/desktop-plugins-root")
+async def fs_desktop_plugins_root(profile: Optional[str] = None):
+    """The standalone on-disk plugin root: `<HERMES_HOME>/desktop-plugins`."""
+    return {"path": str(_fs_plugin_root("desktop-plugins", profile))}
+
+
+@app.get("/api/fs/agent-plugins-root")
+async def fs_agent_plugins_root(profile: Optional[str] = None):
+    """The unified agent-plugin root's desktop half: `<HERMES_HOME>/plugins`."""
+    return {"path": str(_fs_plugin_root("plugins", profile))}
 
 
 # ---------------------------------------------------------------------------
