@@ -18,6 +18,7 @@ import {
   DropdownMenuTrigger,
   ErrorState,
   host,
+  Input,
   Loader,
   LogView,
   Textarea,
@@ -27,24 +28,28 @@ import {
   useQueryClient,
   useValue
 } from '@hermes/plugin-sdk'
-import { type ReactNode, useEffect, useRef, useState } from 'react'
+import { type ReactNode, useEffect, useMemo, useRef, useState } from 'react'
 
 import {
   $boardSlug,
   addComment,
+  boardKey,
   deleteTask,
   estimateTask,
   fetchLog,
   fetchProfiles,
   fetchTask,
+  linkTasks,
   logKey,
   patchTask,
   PROFILES_KEY,
   reassignTask,
   reclaimTask,
   taskKey,
+  unlinkTasks,
   uploadAttachment
 } from './api'
+import { indexBoard, partitionBlockers, resolveLinks } from './deps'
 import { ModelOverrideField, overridePatch } from './model-override'
 import {
   type ChoiceResponse,
@@ -52,10 +57,13 @@ import {
   type Diagnostic,
   type DiagnosticAction,
   type KanbanAttachment,
+  type KanbanBoard,
   type KanbanComment,
   type KanbanEvent,
+  type KanbanTask,
   type KanbanTaskDetail,
   type KanbanTaskFull,
+  type ResolvedLink,
   SEVERITY_TONE,
   type TaskEstimate
 } from './types'
@@ -984,6 +992,297 @@ function EstimateSection({ id }: { id: string }) {
   )
 }
 
+// Left-rule accents for the two blocker halves — the board's own red/green, so
+// a gating blocker reads the same here as a blocked card does on the board.
+const GATING_TONE = SEVERITY_TONE.error
+const SATISFIED_TONE = '#34d399'
+
+/**
+ * One dependency, as a row you can read without opening it: status dot, status
+ * pill, title, assignee, short id, and a remove button. The row body navigates;
+ * the remove button stops propagation so cutting a link never also opens it.
+ *
+ * A `missing` link (an id the board cache can't see — deleted, or filtered out
+ * by the current tenant/archive view) keeps its row and its remove button. A
+ * dangling link is precisely the thing the user needs to be able to cut, so it
+ * says so in muted text rather than disappearing.
+ */
+function DependencyRow({
+  accent = 'transparent',
+  link,
+  onOpen,
+  onUnlink
+}: {
+  accent?: string
+  link: ResolvedLink
+  onOpen: (id: string) => void
+  onUnlink: () => void
+}) {
+  const k = useKanban()
+  const meta = columnMeta(link.status)
+
+  return (
+    <li
+      className="group/dep flex items-center gap-1.5 rounded-r pr-0.5 transition-colors hover:bg-(--chrome-action-hover)"
+      style={{ borderLeft: `2px solid ${accent}` }}
+    >
+      <button
+        className="flex min-w-0 flex-1 items-center gap-1.5 py-1 pl-1.5 text-left"
+        onClick={() => onOpen(link.id)}
+        type="button"
+      >
+        <span className="size-1.5 shrink-0 rounded-full" style={{ backgroundColor: meta.tone }} />
+        {link.missing ? (
+          <Tip label={k.depMissingTip}>
+            <span className="min-w-0 flex-1 truncate text-[0.71rem] italic text-(--ui-text-quaternary)">
+              {k.depMissing}
+            </span>
+          </Tip>
+        ) : (
+          <>
+            <span
+              className="shrink-0 rounded px-1 py-px text-[0.5625rem] font-semibold uppercase tracking-wide"
+              style={{ backgroundColor: `color-mix(in srgb, ${meta.tone} 15%, transparent)`, color: meta.tone }}
+            >
+              {columnLabel(k, link.status)}
+            </span>
+            <span className="min-w-0 flex-1 truncate text-[0.71rem] text-(--ui-text-secondary)" title={link.title}>
+              {link.title || shortId(link.id)}
+            </span>
+          </>
+        )}
+        {link.assignee && <Avatar name={link.assignee} size="0.875rem" />}
+        <span className="shrink-0 font-mono text-[0.5625rem] text-(--ui-text-quaternary)">{shortId(link.id)}</span>
+      </button>
+      <Tip label={k.depUnlinkTip}>
+        <button
+          aria-label={k.depUnlink}
+          className="grid size-5 shrink-0 place-items-center rounded text-(--ui-text-quaternary) opacity-0 transition-[opacity,color] group-hover/dep:opacity-100 hover:text-destructive focus-visible:opacity-100"
+          onClick={event => {
+            event.stopPropagation()
+            onUnlink()
+          }}
+          type="button"
+        >
+          <Codicon name="close" size="0.7rem" />
+        </button>
+      </Tip>
+    </li>
+  )
+}
+
+// The inline "link a blocker" picker: type to filter the board's own cards by
+// title or id, click one to gate this task on it. Deliberately cache-only and
+// in-file — it's a one-shot list, not a surface worth a component of its own.
+function DependencyPicker({
+  candidates,
+  onCancel,
+  onPick
+}: {
+  candidates: KanbanTask[]
+  onCancel: () => void
+  onPick: (id: string) => void
+}) {
+  const k = useKanban()
+  const [query, setQuery] = useState('')
+
+  const matches = useMemo(() => {
+    const needle = query.trim().toLowerCase()
+
+    return candidates
+      .filter(
+        candidate =>
+          !needle || candidate.title.toLowerCase().includes(needle) || candidate.id.toLowerCase().includes(needle)
+      )
+      .slice(0, 8)
+  }, [candidates, query])
+
+  return (
+    <div className="flex flex-col gap-1 rounded-md border border-(--ui-stroke-tertiary) bg-(--ui-bg-tertiary) p-1.5">
+      <Input
+        autoFocus
+        onChange={event => setQuery(event.target.value)}
+        onKeyDown={event => event.key === 'Escape' && onCancel()}
+        placeholder={k.filterCards}
+        size="xs"
+        value={query}
+      />
+      {matches.length > 0 ? (
+        <ul className="flex flex-col">
+          {matches.map(candidate => (
+            <li key={candidate.id}>
+              <button
+                className="flex w-full min-w-0 items-center gap-1.5 rounded px-1 py-1 text-left transition-colors hover:bg-(--chrome-action-hover)"
+                onClick={() => onPick(candidate.id)}
+                type="button"
+              >
+                <span
+                  className="size-1.5 shrink-0 rounded-full"
+                  style={{ backgroundColor: columnMeta(candidate.status).tone }}
+                />
+                <span className="min-w-0 flex-1 truncate text-[0.71rem] text-(--ui-text-secondary)">
+                  {candidate.title || candidate.id}
+                </span>
+                <span className="shrink-0 font-mono text-[0.5625rem] text-(--ui-text-quaternary)">
+                  {shortId(candidate.id)}
+                </span>
+              </button>
+            </li>
+          ))}
+        </ul>
+      ) : (
+        <p className="px-1 py-1.5 text-[0.6875rem] text-(--ui-text-quaternary)">{k.noMatch}</p>
+      )}
+      <Button className="self-end" onClick={onCancel} size="xs" variant="ghost">
+        {k.cancel}
+      </Button>
+    </div>
+  )
+}
+
+/**
+ * DEPENDENCIES — the chain, readable without opening every linked card.
+ *
+ * Blockers (`links.parents`) are split into the ones still holding the gate and
+ * the ones already satisfied; the subgroup headers only appear when BOTH halves
+ * exist, because a flat list is calmer when every blocker still gates.
+ * Dependants (`links.children`) follow as a plain group.
+ *
+ * Resolution is CACHE-ONLY: ids are matched against the board the query cache
+ * already holds, never a new fetch. The drawer doesn't own the archived toggle
+ * (the board page does), so the lookup walks the non-archived key, then the
+ * archived one, then any cached board for this slug. A miss is an acceptable
+ * degraded state — those rows render as `missing` and can still be cut.
+ */
+function DependenciesSection({
+  detail,
+  onLink,
+  onOpen,
+  onUnlink,
+  slug,
+  task
+}: {
+  detail: KanbanTaskDetail
+  onLink: (parentId: string) => void
+  onOpen: (id: string) => void
+  onUnlink: (parentId: string, childId: string) => void
+  slug: string
+  task: KanbanTaskFull
+}) {
+  const k = useKanban()
+  const qc = useQueryClient()
+  const [picking, setPicking] = useState(false)
+
+  // A new task closes an open picker (the drawer reuses one instance).
+  useEffect(() => setPicking(false), [task.id])
+
+  const board =
+    qc.getQueryData<KanbanBoard>(boardKey(slug, false)) ??
+    qc.getQueryData<KanbanBoard>(boardKey(slug, true)) ??
+    qc.getQueriesData<KanbanBoard>({ queryKey: ['kanban', 'board', slug] }).find(([, data]) => !!data)?.[1]
+
+  const index = useMemo(() => indexBoard(board), [board])
+  const blockers = resolveLinks(detail.links.parents, index)
+  const dependants = resolveLinks(detail.links.children, index)
+  const { gating, satisfied } = partitionBlockers(blockers)
+  // Headers earn their place only when the split is real.
+  const split = gating.length > 0 && satisfied.length > 0
+
+  const candidates = useMemo(() => {
+    const linked = new Set([task.id, ...detail.links.parents, ...detail.links.children])
+
+    return [...index.values()].filter(candidate => !linked.has(candidate.id))
+  }, [detail.links.children, detail.links.parents, index, task.id])
+
+  return (
+    <Section label={k.dependencies}>
+      {gating.length > 0 && (
+        <Callout title={k.depWaitingBanner(gating.length, blockers.length)} tone={SEVERITY_TONE.warning} />
+      )}
+
+      {blockers.length > 0 && gating.length === 0 && (
+        <Tip label={k.depClearTip}>
+          <div className="flex items-center gap-1.5 text-[0.6875rem] font-medium" style={{ color: SATISFIED_TONE }}>
+            <Codicon name="pass" size="0.75rem" />
+            {k.depClear}
+          </div>
+        </Tip>
+      )}
+
+      {blockers.length > 0 && (
+        <div className="flex flex-col gap-1">
+          <div className="text-[0.6875rem] text-(--ui-text-quaternary)">{k.blockedBy}</div>
+          {split && <div className={cn(FIELD_LABEL, 'pl-1.5')}>{k.depGating}</div>}
+          {gating.length > 0 && (
+            <ul className="flex flex-col gap-0.5">
+              {gating.map(link => (
+                <DependencyRow
+                  accent={GATING_TONE}
+                  key={link.id}
+                  link={link}
+                  onOpen={onOpen}
+                  onUnlink={() => onUnlink(link.id, task.id)}
+                />
+              ))}
+            </ul>
+          )}
+          {split && <div className={cn(FIELD_LABEL, 'pt-1 pl-1.5')}>{k.depSatisfied}</div>}
+          {satisfied.length > 0 && (
+            <ul className="flex flex-col gap-0.5">
+              {satisfied.map(link => (
+                <DependencyRow
+                  accent={SATISFIED_TONE}
+                  key={link.id}
+                  link={link}
+                  onOpen={onOpen}
+                  onUnlink={() => onUnlink(link.id, task.id)}
+                />
+              ))}
+            </ul>
+          )}
+        </div>
+      )}
+
+      {dependants.length > 0 && (
+        <div className="flex flex-col gap-1">
+          <div className="text-[0.6875rem] text-(--ui-text-quaternary)">{k.blocks}</div>
+          <ul className="flex flex-col gap-0.5">
+            {dependants.map(link => (
+              <DependencyRow
+                key={link.id}
+                link={link}
+                onOpen={onOpen}
+                onUnlink={() => onUnlink(task.id, link.id)}
+              />
+            ))}
+          </ul>
+        </div>
+      )}
+
+      {picking ? (
+        <DependencyPicker
+          candidates={candidates}
+          onCancel={() => setPicking(false)}
+          onPick={id => {
+            onLink(id)
+            setPicking(false)
+          }}
+        />
+      ) : (
+        <button
+          aria-label={k.parent}
+          className="flex items-center justify-center gap-1 rounded-md border border-dashed border-(--ui-stroke-secondary) py-1 text-[0.6875rem] text-(--ui-text-tertiary) transition-colors hover:border-(--ui-text-quaternary) hover:bg-(--chrome-action-hover) hover:text-foreground"
+          onClick={() => setPicking(true)}
+          type="button"
+        >
+          <Codicon name="add" size="0.7rem" />
+          <span className="truncate">{k.parent}</span>
+        </button>
+      )}
+    </Section>
+  )
+}
+
 export function TaskDrawer({
   columns,
   id,
@@ -1308,29 +1607,14 @@ export function TaskDrawer({
               </Section>
             )}
 
-            {(detail.links.parents.length > 0 || detail.links.children.length > 0) && (
-              <Section label={k.dependencies}>
-                {(['parents', 'children'] as const).map(side =>
-                  detail.links[side].length > 0 ? (
-                    <div className="flex flex-wrap items-center gap-1.5" key={side}>
-                      <span className="text-[0.6875rem] text-(--ui-text-quaternary)">
-                        {side === 'parents' ? k.blockedBy : k.blocks}
-                      </span>
-                      {detail.links[side].map(linked => (
-                        <button
-                          className="rounded bg-(--ui-bg-quaternary) px-1.5 py-0.5 font-mono text-[0.625rem] text-(--ui-text-secondary) transition-colors hover:bg-(--chrome-action-hover) hover:text-foreground"
-                          key={linked}
-                          onClick={() => onOpen(linked)}
-                          type="button"
-                        >
-                          {shortId(linked)}
-                        </button>
-                      ))}
-                    </div>
-                  ) : null
-                )}
-              </Section>
-            )}
+            <DependenciesSection
+              detail={detail}
+              onLink={parentId => void mutate(() => linkTasks(parentId, task.id))()}
+              onOpen={onOpen}
+              onUnlink={(parentId, childId) => void mutate(() => unlinkTasks(parentId, childId))()}
+              slug={slug}
+              task={task}
+            />
 
             <Section
               action={

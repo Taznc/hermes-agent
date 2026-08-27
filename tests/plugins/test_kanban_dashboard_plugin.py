@@ -1356,3 +1356,111 @@ def test_specify_happy_path(client, monkeypatch):
 # ---------------------------------------------------------------------------
 
 
+
+
+# ---------------------------------------------------------------------------
+# GET /board — link_edges (dependency-chain highlighting on the desktop board)
+# ---------------------------------------------------------------------------
+
+
+def test_board_link_edges_empty_when_no_links(client):
+    """A board with tasks but no dependencies reports an empty edge list.
+
+    The key is that the field is always PRESENT: the desktop plugin treats a
+    missing `link_edges` as "older backend, degrade gracefully", so silently
+    omitting it on an unlinked board would flip the UI into fallback mode.
+    """
+    with kb.connect() as conn:
+        kb.create_task(conn, title="lonely", assignee="alice")
+
+    body = client.get("/api/plugins/kanban/board").json()
+    assert body["link_edges"] == []
+
+
+def test_board_link_edges_are_parent_child_pairs(client):
+    """Each edge is [parent_id, child_id] — parent BLOCKS child.
+
+    The whole desktop feature (blocked-by vs blocks chips, upstream/downstream
+    focus) keys off this ordering, so an inversion here would be silent and
+    would corrupt every consumer. Pin the direction down explicitly.
+    """
+    with kb.connect() as conn:
+        parent_id = kb.create_task(conn, title="blocker", assignee="alice")
+        child_id = kb.create_task(
+            conn, title="blocked", assignee="bob", parents=[parent_id],
+        )
+
+    body = client.get("/api/plugins/kanban/board").json()
+    assert body["link_edges"] == [[parent_id, child_id]]
+
+    # And the edge list must agree with the per-card counts it is derived from.
+    cards = {t["id"]: t for col in body["columns"] for t in col["tasks"]}
+    assert cards[parent_id]["link_counts"] == {"parents": 0, "children": 1}
+    assert cards[child_id]["link_counts"] == {"parents": 1, "children": 0}
+
+
+def test_board_link_edges_cover_fan_in_and_fan_out(client):
+    """A diamond (A blocks B and C; B and C block D) round-trips completely."""
+    with kb.connect() as conn:
+        a = kb.create_task(conn, title="A", assignee="alice")
+        b = kb.create_task(conn, title="B", assignee="alice", parents=[a])
+        c = kb.create_task(conn, title="C", assignee="alice", parents=[a])
+        d = kb.create_task(conn, title="D", assignee="alice", parents=[b, c])
+
+    body = client.get("/api/plugins/kanban/board").json()
+    edges = {tuple(e) for e in body["link_edges"]}
+    assert edges == {(a, b), (a, c), (b, d), (c, d)}
+
+    # Every edge endpoint is a real task id on the same payload — the desktop
+    # resolves edges against the board index, so a dangling id would render as
+    # a permanently "missing" row.
+    ids = {t["id"] for col in body["columns"] for t in col["tasks"]}
+    for parent, child in edges:
+        assert parent in ids and child in ids
+
+
+def test_board_link_edges_survive_completion(client):
+    """Completing the parent keeps the edge; only the child's gate opens.
+
+    The desktop's "blockers clear" chip needs the edge to still be there after
+    the blocker finishes — that is exactly the state it renders.
+    """
+    with kb.connect() as conn:
+        parent_id = kb.create_task(conn, title="blocker", assignee="alice")
+        child_id = kb.create_task(
+            conn, title="blocked", assignee="bob", parents=[parent_id],
+        )
+        assert kb.complete_task(conn, parent_id)
+
+    body = client.get("/api/plugins/kanban/board").json()
+    assert [parent_id, child_id] in body["link_edges"]
+
+    cards = {t["id"]: t for col in body["columns"] for t in col["tasks"]}
+    assert cards[parent_id]["status"] == "done"
+    # Child kept its blocker link even though nothing gates it any more.
+    assert cards[child_id]["link_counts"]["parents"] == 1
+
+
+def test_board_link_edges_drop_after_unlink(client):
+    """DELETE /links removes the edge from the next board payload."""
+    with kb.connect() as conn:
+        parent_id = kb.create_task(conn, title="blocker", assignee="alice")
+        child_id = kb.create_task(
+            conn, title="blocked", assignee="bob", parents=[parent_id],
+        )
+
+    assert [parent_id, child_id] in client.get(
+        "/api/plugins/kanban/board"
+    ).json()["link_edges"]
+
+    r = client.delete(
+        "/api/plugins/kanban/links",
+        params={"parent_id": parent_id, "child_id": child_id},
+    )
+    assert r.status_code == 200
+    assert r.json()["ok"] is True
+
+    body = client.get("/api/plugins/kanban/board").json()
+    assert body["link_edges"] == []
+    cards = {t["id"]: t for col in body["columns"] for t in col["tasks"]}
+    assert cards[child_id]["link_counts"]["parents"] == 0
