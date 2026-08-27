@@ -1413,6 +1413,11 @@ def _handle_create(args: dict, **kw) -> str:
     provider_override = args.get("provider")
     if provider_override and not model_override:
         return tool_error("'provider' requires 'model' to be set as well")
+    # Per-task thinking depth. Independent of model_override/provider_override
+    # — reuses the same validator create_task() calls internally, so an
+    # invalid level raises ValueError and is surfaced as a tool_error below
+    # rather than silently falling back to the profile default.
+    reasoning_effort = args.get("reasoning_effort")
     if isinstance(parents, str):
         parents = [parents]
     if not isinstance(parents, (list, tuple)):
@@ -1454,6 +1459,7 @@ def _handle_create(args: dict, **kw) -> str:
                 skills=skills,
                 model_override=model_override,
                 provider_override=provider_override,
+                reasoning_effort=reasoning_effort,
                 goal_mode=goal_mode,
                 goal_max_turns=(
                     int(goal_max_turns) if goal_max_turns is not None else None
@@ -2301,6 +2307,21 @@ KANBAN_CREATE_SCHEMA = {
                     "provider — a model name alone is resolved against "
                     "the profile's provider and will fail if it belongs "
                     "to a different one. Requires 'model'."
+                ),
+            },
+            "reasoning_effort": {
+                "type": "string",
+                "description": (
+                    "Pin the dispatched worker's thinking depth for this "
+                    "task (e.g. 'minimal', 'low', 'medium', 'high', "
+                    "'xhigh', 'max', 'ultra', or 'none' to disable "
+                    "thinking), passed to the worker as "
+                    "'--reasoning <level>'. Independent of 'model'/"
+                    "'provider' — a task can run the profile's own model "
+                    "at a different depth. Omit to inherit the assignee "
+                    "profile's own agent.reasoning_effort. An invalid "
+                    "level is rejected at creation time rather than "
+                    "silently falling back to the profile default."
                 ),
             },
             "board": _board_schema_prop(),
