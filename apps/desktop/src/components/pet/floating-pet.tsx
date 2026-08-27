@@ -6,6 +6,7 @@ import { useOnProfileSwitch } from '@/app/hooks/use-on-profile-switch'
 import { useRouteOverlayActive } from '@/app/hooks/use-route-overlay-active'
 import { PetHeartField } from '@/components/chat/vibe-hearts'
 import { isSolidCanvasPixel } from '@/components/pet/pet-hit-test'
+import { useMediaQuery } from '@/hooks/use-media-query'
 import { persistString, storedString } from '@/lib/storage'
 import { $changeEventsAvailable, $petChange } from '@/store/live-sync'
 import {
@@ -29,6 +30,7 @@ import { useTheme } from '@/themes/context'
 
 import { PET_STARTUP_RETRY_MS, petInfoPollIntervalMs } from './pet-info-poll'
 import { PetSprite, roamWalkRow } from './pet-sprite'
+import { usePetExclusion } from './use-pet-exclusion'
 import { usePetRoam } from './use-pet-roam'
 import { type PetZoomAnchor, usePetZoomGesture } from './use-pet-zoom-gesture'
 
@@ -364,6 +366,17 @@ export function FloatingPet() {
   // mounted condition flips true is what actually catches the live node.
   const petMounted = Boolean(info.enabled && info.spritesheetBase64 && !overlayActive)
 
+  // Non-interference beats delight (Phase 2.3): the click-through fix above
+  // stops the pet from EATING clicks it doesn't visually occupy, but it can
+  // still sit ON TOP of the composer while you type, or the exact spot a
+  // drag-selection is growing toward — technically clickable underneath, but
+  // visually in the way. Yielding fades the sprite and forces it click-through
+  // regardless of the alpha test while either zone is active.
+  const reducedMotion = useMediaQuery('(prefers-reduced-motion: reduce)')
+  const yielding = usePetExclusion({ containerRef, enabled: petMounted })
+  const yieldingRef = useRef(false)
+  yieldingRef.current = yielding
+
   // eslint-disable-next-line no-restricted-syntax -- legitimate non-atom ref write (DOM pointer position, not an atom value)
   useEffect(() => {
     const el = containerRef.current
@@ -385,6 +398,14 @@ export function FloatingPet() {
       // from the sprite — the drag already owns the gesture.
       if (dragRef.current) {
         return true
+      }
+
+      // Yielding (composer focused / a drag-selection reaching toward the
+      // pet) forces click-through regardless of alpha — the pet must not
+      // reclaim the click zone just because the pointer paused over its
+      // fading sprite.
+      if (yieldingRef.current) {
+        return false
       }
 
       const rect = el.getBoundingClientRect()
@@ -558,6 +579,11 @@ export function FloatingPet() {
       style={{
         cursor: 'grab',
         left: position.x,
+        // Non-interference (Phase 2.3): fade toward invisible while yielding
+        // (composer focused / a selection reaching for the pet) instead of
+        // sitting fully opaque on top of it. Never fully 0 — a hard vanish
+        // reads as a glitch, not a deliberate "getting out of your way".
+        opacity: yielding ? 0.16 : 1,
         // Click-through by default — the effect above is the ONLY place that
         // ever sets this to 'auto', and only while the pointer is over an
         // opaque sprite pixel. Do not add `pointerEvents: 'auto'` here: a
@@ -568,6 +594,7 @@ export function FloatingPet() {
         position: 'fixed',
         top: position.y,
         touchAction: 'none',
+        transition: reducedMotion ? 'none' : 'opacity 160ms ease-out',
         userSelect: 'none',
         zIndex: 60
       }}
