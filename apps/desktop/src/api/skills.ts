@@ -47,7 +47,10 @@ export function getStarmapGraph(): Promise<StarmapGraph> {
     ...profileScoped(),
     // Backend REST contract — stays /api/learning even though the UI feature is
     // now "star map". Renaming this would break against an un-upgraded backend.
-    path: '/api/learning/graph'
+    path: '/api/learning/graph',
+    // Builds the full memory/skill graph server-side — well past the 30s
+    // default fetch timeout on a large learned corpus.
+    timeoutMs: 60_000
   })
 }
 
