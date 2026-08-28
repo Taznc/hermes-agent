@@ -69,13 +69,13 @@ import {
 import { useSlashCommand } from './slash'
 import { useSubmitPrompt } from './submit'
 import {
+  attachFileBytes,
   blobToDataUrl,
   delay,
   friendlyRemoteAttachError,
   type GatewayRequest,
   inlineErrorMessage,
   markSessionRecentlyInterrupted,
-  readFileDataUrlForAttach,
   readImageForRemoteAttach,
   shouldInterruptBeforeRewind,
   type SubmitTextOptions,
@@ -137,26 +137,26 @@ export async function uploadComposerAttachment(
   const label = attachment.label || pathLabel(path)
   const uploadBytes = remote || attachmentPathNeedsUpload(path, backendCwd, terminalBackend)
 
-  // Read bytes/paths ONCE, outside the retry. Only the session-scoped RPC is
-  // replayed on recovery — re-reading a multi-MB file to retry a dead session
-  // id would double the disk/IPC cost of every recovered attach. For images,
-  // the chip's previewUrl already holds the full file as a base64 data URL,
-  // so passing it avoids re-reading the same bytes off disk at submit.
+  // Images: read bytes ONCE, outside the retry. The chip's previewUrl already
+  // holds the full file as a base64 data URL, so passing it avoids re-reading
+  // the same bytes off disk at submit, and images stay small enough that a
+  // whole-file read/retry is cheap either way.
+  //
+  // Files go through attachFileBytes instead, which streams disk -> gateway
+  // in bounded chunks (t_275f8015) and is called PER ATTEMPT inside
+  // stageForSession — a stale-session retry re-streams the file against the
+  // recovered id rather than replaying a pre-read buffer, since nothing here
+  // holds the whole file in memory to replay from.
   let imagePayload: Awaited<ReturnType<typeof readImageForRemoteAttach>> | null = null
-  let fileDataUrl: null | string = null
 
-  if (uploadBytes) {
+  if (uploadBytes && attachment.kind === 'image') {
     try {
-      if (attachment.kind === 'image') {
-        imagePayload = await readImageForRemoteAttach(path, attachment.previewUrl)
-      } else {
-        fileDataUrl = await readFileDataUrlForAttach(path)
-      }
+      imagePayload = await readImageForRemoteAttach(path, attachment.previewUrl)
     } catch (err) {
       throw friendlyRemoteAttachError(err, label)
     }
 
-    if (attachment.kind === 'image' ? !imagePayload : !fileDataUrl) {
+    if (!imagePayload) {
       throw new Error(`Could not read ${label}`)
     }
   }
@@ -189,12 +189,15 @@ export async function uploadComposerAttachment(
       }
     }
 
-    const result = await requestGateway<FileAttachResponse>('file.attach', {
-      name: label,
-      path,
-      session_id: liveSessionId,
-      ...(fileDataUrl ? { data_url: fileDataUrl } : {})
-    })
+    const result = uploadBytes
+      ? await attachFileBytes(path, label, requestGateway, liveSessionId).catch(err => {
+          throw friendlyRemoteAttachError(err, label)
+        })
+      : await requestGateway<FileAttachResponse>('file.attach', {
+          name: label,
+          path,
+          session_id: liveSessionId
+        })
 
     if (!result.attached || !result.ref_text) {
       throw new Error(result.message || `Could not attach ${label}`)

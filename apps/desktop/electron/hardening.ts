@@ -528,7 +528,72 @@ async function readFileDataUrlForIpc(
   return `data:${options.mimeType};base64,${data.toString('base64')}`
 }
 
+// Largest multiple of 3 at or below 8 MiB. Base64-encoding a byte range only
+// omits padding ('=') when that range's length is a multiple of 3 — encoding
+// arbitrary-length slices independently and concatenating the strings would
+// splice padding into the MIDDLE of the base64 stream and corrupt it. Every
+// chunk but the last (the true end of the file, which pads correctly) must
+// therefore be sized to a multiple of 3.
+const ATTACHMENT_CHUNK_BYTES = 8 * 1024 * 1024 - ((8 * 1024 * 1024) % 3)
+
+/**
+ * Read one bounded slice of a file and base64-encode ONLY that slice.
+ *
+ * The whole-file readFileDataUrlForIpc above is what t_275f8015 exists to
+ * route large attachments away from: a 256 MiB attachment there means a
+ * ~256 MiB Buffer, a ~341 MiB base64 string, and a single IPC reply Electron
+ * has to structured-clone in one shot — hundreds of ms to seconds with the
+ * main process (and therefore the whole app) frozen, and ~600 MB+ transiently
+ * resident. This function bounds main's transient memory and the per-call
+ * structured-clone payload to ATTACHMENT_CHUNK_BYTES regardless of file size;
+ * the renderer (readFileDataUrlForAttach in use-prompt-actions/utils.ts)
+ * drives repeated calls and concatenates the base64 chunks. Re-validates the
+ * path on every call (cheap: stat + realpath) rather than holding an open
+ * file descriptor across IPC round-trips, so an abandoned upload (renderer
+ * navigated away, file deleted mid-read) can never leak a handle.
+ */
+async function readFileChunkForIpc(
+  filePath,
+  options: {
+    purpose?: string
+    baseDir?: fs.PathOrFileDescriptor
+    fs?: typeof fs
+    blockSensitive?: boolean
+    maxBytes?: number
+    mimeType: string
+  },
+  offset: number,
+  length: number = ATTACHMENT_CHUNK_BYTES
+): Promise<{ base64: string; bytesRead: number; mimeType: string; totalBytes: number }> {
+  const fsImpl = options.fs || fs
+  const { resolvedPath, stat } = await resolveReadableFileForIpc(filePath, options)
+  const totalBytes = stat.size
+  const safeOffset = Number.isFinite(offset) && offset > 0 ? Math.floor(offset) : 0
+  const readLength = Math.max(0, Math.min(length, totalBytes - safeOffset))
+
+  if (readLength <= 0) {
+    return { base64: '', bytesRead: 0, mimeType: options.mimeType, totalBytes }
+  }
+
+  const handle = await fsImpl.promises.open(resolvedPath, 'r')
+
+  try {
+    const buffer = Buffer.alloc(readLength)
+    const { bytesRead } = await handle.read(buffer, 0, readLength, safeOffset)
+
+    return {
+      base64: buffer.subarray(0, bytesRead).toString('base64'),
+      bytesRead,
+      mimeType: options.mimeType,
+      totalBytes
+    }
+  } finally {
+    await handle.close()
+  }
+}
+
 export {
+  ATTACHMENT_CHUNK_BYTES,
   ATTACHMENT_UPLOAD_DEFAULT_MAX_BYTES,
   clampDataUrlReadMaxMb,
   DATA_URL_READ_DEFAULT_MAX_MB,
@@ -538,6 +603,7 @@ export {
   DEFAULT_FETCH_TIMEOUT_MS,
   enableBasicPasswordStoreEncryption,
   encryptDesktopSecret,
+  readFileChunkForIpc,
   readFileDataUrlForIpc,
   rejectUnsafePathSyntax,
   resolveDirectoryForIpc,
