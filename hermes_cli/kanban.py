@@ -2743,6 +2743,7 @@ def _cmd_dispatch(args: argparse.Namespace) -> int:
             "timed_out": res.timed_out,
             "stale": res.stale,
             "auto_blocked": res.auto_blocked,
+            "review_no_verdict": res.review_no_verdict,
             "promoted": res.promoted,
             "spawned": [
                 {"task_id": tid, "assignee": who, "workspace": ws}
@@ -2770,6 +2771,9 @@ def _cmd_dispatch(args: argparse.Namespace) -> int:
     print(f"Auto-blocked: {len(res.auto_blocked)}")
     if res.auto_blocked:
         print(f"  {', '.join(res.auto_blocked)}")
+    print(f"Review (no verdict): {len(res.review_no_verdict)}")
+    if res.review_no_verdict:
+        print(f"  {', '.join(res.review_no_verdict)}")
     print(f"Promoted:     {res.promoted}")
     print(f"Spawned:      {len(res.spawned)}")
     for tid, who, ws in res.spawned:

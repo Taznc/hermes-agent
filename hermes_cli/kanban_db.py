@@ -348,6 +348,7 @@ def _fire_dispatch_tick_hook(
             result.timed_out,
             result.auto_blocked,
             result.rate_limited,
+            result.review_no_verdict,
             result.auto_assigned_default,
             result.respawn_guarded,
             result.skipped_per_profile_capped,
@@ -4856,9 +4857,10 @@ def _synthesize_ended_run(
 
 def _has_sticky_block(conn: sqlite3.Connection, task_id: str) -> bool:
     """Return True when ``task_id`` is sticky-blocked by an explicit
-    worker/operator ``kanban_block`` call (#28712).
+    worker/operator ``kanban_block`` call (#28712) or by a neutral
+    reviewer no-verdict exit (see ``review_no_verdict`` below).
 
-    A ``blocked`` status can come from two very different sources:
+    A ``blocked`` status can come from several different sources:
 
     * **Worker- or operator-initiated** — a worker called
       ``kanban_block(reason="review-required: ...")`` (or somebody ran
@@ -4866,30 +4868,91 @@ def _has_sticky_block(conn: sqlite3.Connection, task_id: str) -> bool:
       should stay blocked until an operator unblocks it.  The block tool
       emits a ``"blocked"`` event row in ``task_events``.
 
+    * **Reviewer no-verdict** — a claimed reviewer run exited cleanly
+      without approving, requesting changes, or escalating. This is a
+      neutral audit outcome (not a failure, not a crash), but it must
+      not leave the card auto-claimable every dispatcher tick either —
+      it needs an explicit review requeue (``kanban_unblock``) before a
+      reviewer can pick it up again. Emits a ``"review_no_verdict"``
+      event row.
+
     * **Circuit-breaker** — ``_record_task_failure`` tripped after
       repeated crashes / spawn failures / timeouts.  This emits
       ``"gave_up"``, *not* ``"blocked"``, and is meant to recover
       automatically once the underlying conditions change (e.g. parents
-      finish, transient infra error clears).
+      finish, transient infra error clears). ``gave_up`` is deliberately
+      excluded from this function's own event scan (see the sibling
+      helper ``_gave_up_was_force_tripped`` for the force-tripped subset
+      that IS sticky) so a synthetic/legacy ``gave_up`` row appended
+      after a genuine worker ``"blocked"`` event can never mask it —
+      only an ``"unblocked"`` event ends a worker/operator block.
 
-    The cheapest signal that distinguishes the two is the most recent
-    ``"blocked"`` / ``"unblocked"`` event for the task.  If the most
-    recent one is ``"blocked"`` (or there is a ``"blocked"`` event and
-    no ``"unblocked"`` event has fired since), the task is sticky and
+    The cheapest signal that distinguishes them is the most recent
+    ``"blocked"`` / ``"unblocked"`` / ``"review_no_verdict"`` event for
+    the task.  If the most recent one is ``"blocked"`` or
+    ``"review_no_verdict"`` (or such an event fired and no
+    ``"unblocked"`` has fired since), the task is sticky and
     ``recompute_ready`` must *not* auto-promote it.
 
     Returns ``False`` when there is no such event at all (e.g. the task
     was set to ``status='blocked'`` by the circuit breaker or by direct
     DB manipulation) — preserves the pre-#28712 auto-recover semantics
-    for that path.
+    for that path. Callers that also need to catch a force-tripped
+    breaker trip should additionally consult
+    ``_gave_up_was_force_tripped``.
     """
     row = conn.execute(
         "SELECT kind FROM task_events "
-        "WHERE task_id = ? AND kind IN ('blocked', 'unblocked') "
+        "WHERE task_id = ? AND kind IN ('blocked', 'unblocked', 'review_no_verdict') "
         "ORDER BY id DESC LIMIT 1",
         (task_id,),
     ).fetchone()
-    return bool(row) and row["kind"] == "blocked"
+    return bool(row) and row["kind"] in ("blocked", "review_no_verdict")
+
+
+def _gave_up_was_force_tripped(conn: sqlite3.Connection, task_id: str) -> bool:
+    """Return True when the task's current ``blocked`` status came from a
+    force-tripped circuit breaker (``_record_task_failure(force_trip=True)``)
+    rather than a normal threshold-crossing trip.
+
+    A normal trip (``force_trip=False``) blocks because
+    ``consecutive_failures`` crossed the ``effective_limit`` that
+    ``recompute_ready`` independently re-derives, so the two always
+    agree and auto-recovery (promote once ``failures < effective_limit``)
+    is safe.
+
+    A forced trip already applied its OWN bounded-retry policy against a
+    *different* counter — e.g. the protocol-violation streak in
+    ``detect_crashed_workers`` — before deciding to give up, so the
+    unified ``consecutive_failures`` value recorded alongside it can sit
+    well under whatever limit ``recompute_ready`` would derive on its
+    own. Re-checking that unrelated counter/limit pair would silently
+    override a decision already made and reopen the
+    ``gave_up -> promoted -> claimed`` loop this guards against. Forced
+    trips are therefore sticky exactly like a worker-initiated
+    ``kanban_block`` — only an explicit ``kanban_unblock`` clears them.
+
+    Scoped to the most recent event among ``('gave_up', 'unblocked')``
+    only (deliberately excluding ``'blocked'`` / ``'review_no_verdict'``,
+    which ``_has_sticky_block`` already owns) so this check composes
+    additively: OR it with ``_has_sticky_block`` rather than merging the
+    event sets, so a stray/legacy ``gave_up`` row appended after a real
+    worker block can never un-stick that block (see
+    ``test_protocol_violation_loop_is_broken``).
+    """
+    row = conn.execute(
+        "SELECT payload FROM task_events "
+        "WHERE task_id = ? AND kind IN ('gave_up', 'unblocked') "
+        "ORDER BY id DESC LIMIT 1",
+        (task_id,),
+    ).fetchone()
+    if not row:
+        return False
+    try:
+        payload = json.loads(row["payload"]) if row["payload"] else {}
+    except (json.JSONDecodeError, TypeError):
+        payload = {}
+    return bool(isinstance(payload, dict) and payload.get("force_trip"))
 
 
 def _resume_status_from_events(conn: sqlite3.Connection, task_id: str) -> str:
@@ -4905,7 +4968,8 @@ def _resume_status_from_events(conn: sqlite3.Connection, task_id: str) -> str:
         "WHERE task_id = ? AND kind IN ("
         "'blocked', 'block_loop_detected', 'dependency_wait', 'gave_up', "
         "'unblocked', 'changes_requested', 'review_reopened', 'status', 'reclaimed', "
-        "'stale', 'timed_out', 'crashed', 'spawn_failed', 'rate_limited', 'held'"
+        "'stale', 'timed_out', 'crashed', 'spawn_failed', 'rate_limited', 'held', "
+        "'review_no_verdict'"
         ") ORDER BY id DESC LIMIT 1",
         (task_id,),
     ).fetchone()
@@ -4944,6 +5008,18 @@ def recompute_ready(
        counter would reset on every recovery cycle and the circuit
        breaker could never trip (#35072).
 
+    3. The most recent ``gave_up`` was force-tripped
+       (``_record_task_failure(force_trip=True)``) — the caller already
+       applied its own bounded-retry policy against a counter this
+       function doesn't see (e.g. the review-source protocol-violation
+       streak), so re-deriving ``effective_limit`` here and comparing it
+       to the unrelated unified counter would silently override that
+       decision. This is what let ``gave_up -> promoted {status:
+       review} -> claimed`` happen: a force-tripped review claim's
+       ``consecutive_failures`` sat under this function's ``effective_limit``
+       even though the breaker had already given up. Sticky like case 1;
+       only ``kanban_unblock`` clears it.
+
     The effective failure limit resolves in the same order as the
     circuit breaker in ``_record_task_failure`` so the two never
     disagree about when a task is permanently blocked:
@@ -4969,6 +5045,13 @@ def recompute_ready(
                 # silently auto-recover.  ``unblock_task`` is the only
                 # legitimate exit (it emits ``"unblocked"`` which flips
                 # this predicate back).
+                continue
+            if cur_status == "blocked" and _gave_up_was_force_tripped(
+                conn, task_id
+            ):
+                # Case 3 above: a force-tripped breaker trip is sticky —
+                # see _gave_up_was_force_tripped's docstring for why this
+                # must not fall through to the threshold re-check below.
                 continue
             parents = conn.execute(
                 "SELECT t.status FROM tasks t "
@@ -8579,6 +8662,12 @@ class DispatchResult:
     (EX_TEMPFAIL sentinel exit) and were released back to ``ready`` WITHOUT
     counting a failure. These never trip the circuit breaker — a long quota
     window just makes the task bounce cheaply until the window clears."""
+    review_no_verdict: list[str] = field(default_factory=list)
+    """Task ids whose claimed reviewer run exited cleanly without a verdict
+    (no approve / request-changes / escalate). Neutral audit outcome — no
+    failure counted, no breaker fed — but NOT auto-recoverable like a
+    rate-limit requeue: the task lands in ``blocked`` and stays sticky
+    until an explicit ``kanban_unblock`` reopens it for another reviewer."""
     skipped_locked: bool = False
     """True when this tick was skipped because another process already held
     the board's dispatch lock (issue #35240). A losing dispatcher does no
@@ -9389,6 +9478,11 @@ def detect_crashed_workers(conn: sqlite3.Connection) -> list[str]:
     """
     crashed: list[str] = []
     rate_limited: list[str] = []
+    # Task ids parked with the neutral ``review_no_verdict`` outcome this
+    # tick (claimed reviewer exited cleanly without a verdict). Kept out of
+    # ``crashed`` and never enters ``crash_details`` / ``_record_task_failure``
+    # below — see the review-lane branch further down.
+    review_no_verdict_ids: list[str] = []
     # Per-crash details collected inside the main txn, used after it
     # closes to run ``_record_task_failure`` (which needs its own
     # write_txn so can't nest). ``protocol_violation`` flags the
@@ -9426,7 +9520,44 @@ def detect_crashed_workers(conn: sqlite3.Connection) -> list[str]:
             pid = int(row["worker_pid"])
             kind, code = _classify_worker_exit(pid)
             rate_limited_exit = False
-            if kind == "clean_exit":
+            review_no_verdict_exit = False
+            # Computed up front (not just for the crashed/protocol-violation
+            # branches below) because a clean exit's handling differs by
+            # lane: an implementer clean-exit-with-no-terminal-call is a
+            # protocol violation, but a REVIEWER clean-exit-with-no-verdict
+            # is a distinct, neutral audit outcome (see the branch below).
+            retry_status = _retry_status_for_run(conn, row["id"])
+            if kind == "clean_exit" and retry_status == "review":
+                # A claimed reviewer run exited cleanly without approving,
+                # requesting changes, or escalating (kanban_block). This is
+                # NOT a protocol violation (the implementer clean-exit case
+                # below) and NOT a crash: an idle/no-op reviewer pass is a
+                # legitimate, common outcome (nothing needed reviewing, or
+                # the model decided not to act) — it says nothing about
+                # whether the underlying work is good or bad, so it must
+                # never increment any failure counter or feed either
+                # breaker. But it also must not leave the card
+                # auto-claimable on the very next dispatcher tick (that
+                # would spin an idle reviewer forever) — it lands in
+                # ``blocked`` and stays there ( ``_has_sticky_block``
+                # treats ``review_no_verdict`` as sticky) until an explicit
+                # ``kanban_unblock`` reopens it for another reviewer pass.
+                protocol_violation = False
+                review_no_verdict_exit = True
+                error_text = (
+                    "reviewer exited cleanly without a verdict (no "
+                    "kanban_complete/kanban_request_changes/kanban_block "
+                    "call) — parked for an explicit review requeue via "
+                    "kanban_unblock; no failure counted."
+                )
+                event_kind = "review_no_verdict"
+                event_payload = {
+                    "pid": pid,
+                    "claimer": row["claim_lock"],
+                    "exit_code": code,
+                    "retry_status": "review",
+                }
+            elif kind == "clean_exit":
                 # Worker subprocess returned 0 but its task is still
                 # ``running`` in the DB — it exited without calling
                 # ``kanban_complete`` / ``kanban_block``. Overwhelmingly the
@@ -9487,20 +9618,27 @@ def detect_crashed_workers(conn: sqlite3.Connection) -> list[str]:
                     event_payload["exit_kind"] = kind
                     event_payload["exit_code"] = code
 
-            retry_status = _retry_status_for_run(conn, row["id"])
+            target_status = "blocked" if review_no_verdict_exit else retry_status
             event_payload["retry_status"] = retry_status
             cur = conn.execute(
                 "UPDATE tasks SET status = ?, claim_lock = NULL, "
                 "claim_expires = NULL, worker_pid = NULL "
                 "WHERE id = ? AND status = 'running' "
                 "  AND worker_pid = ? AND claim_lock IS ?",
-                (retry_status, row["id"], pid, row["claim_lock"]),
+                (target_status, row["id"], pid, row["claim_lock"]),
             )
             if cur.rowcount == 1:
                 # Rate-limited requeues are a clean release, not a crash —
                 # record the run outcome as ``rate_limited`` so the board
                 # history doesn't show a phantom crash for a quota wall.
-                _run_outcome = "rate_limited" if rate_limited_exit else "crashed"
+                # Reviewer no-verdict exits get their own neutral outcome
+                # for the same reason: it is neither a crash nor a failure.
+                if rate_limited_exit:
+                    _run_outcome = "rate_limited"
+                elif review_no_verdict_exit:
+                    _run_outcome = "review_no_verdict"
+                else:
+                    _run_outcome = "crashed"
                 run_id = _end_run(
                     conn, row["id"],
                     outcome=_run_outcome, status=_run_outcome,
@@ -9533,6 +9671,16 @@ def detect_crashed_workers(conn: sqlite3.Connection) -> list[str]:
                         (error_text[:500], row["id"]),
                     )
                     rate_limited.append(row["id"])
+                elif review_no_verdict_exit:
+                    # Neutral audit outcome: deliberately does NOT stamp
+                    # ``last_failure_error`` (this is not a failure) and
+                    # does NOT enter ``crash_details`` below, so it never
+                    # reaches ``_record_task_failure`` and never feeds
+                    # either breaker. The task is already parked in
+                    # ``blocked`` above; ``_has_sticky_block`` keeps it out
+                    # of ``recompute_ready`` until an explicit
+                    # ``kanban_unblock``.
+                    review_no_verdict_ids.append(row["id"])
                 else:
                     if protocol_violation:
                         # Stamp the failure error now: a below-budget
@@ -9642,6 +9790,11 @@ def detect_crashed_workers(conn: sqlite3.Connection) -> list[str]:
     # Same side-channel for rate-limited requeues — these did NOT count a
     # failure and are NOT crashes, so they stay out of the ``crashed`` return.
     detect_crashed_workers._last_rate_limited = rate_limited  # type: ignore[attr-defined]
+    # Same side-channel for reviewer no-verdict parks — also NOT a failure,
+    # NOT a crash, and (unlike rate-limited) NOT auto-recoverable either:
+    # the task landed in ``blocked`` and stays sticky until an explicit
+    # ``kanban_unblock``.
+    detect_crashed_workers._last_review_no_verdict = review_no_verdict_ids  # type: ignore[attr-defined]
     # Worker-lifecycle observer (RFC #58548): exit events are tick-derived
     # from this reclaim pass — fired only now, after the main reclaim txn
     # AND the breaker accounting above have committed, so subscribers always
@@ -9786,6 +9939,25 @@ def _record_task_failure(
                 "error": error[:500],
                 "trigger_outcome": outcome,
                 "retry_status": retry_status,
+                # Durable marker consulted by ``_has_sticky_block``. A
+                # force-tripped breaker (the protocol-violation streak, or
+                # any future caller that pre-decided its own bounded-retry
+                # policy) bypassed the counter-vs-threshold comparison
+                # below, so ``consecutive_failures`` at trip time can sit
+                # well under whatever limit ``recompute_ready`` would
+                # independently resolve (default/dispatcher-config vs. the
+                # violation-specific limit actually used here). Without
+                # this marker recompute_ready re-derives its own limit,
+                # sees the smaller unified counter under it, and wrongly
+                # auto-promotes a `gave_up` the breaker just tripped —
+                # the exact `gave_up -> promoted -> claimed` loop this
+                # fixes. force_trip=True makes the block sticky (like a
+                # worker-initiated kanban_block) until an explicit
+                # kanban_unblock; a normal threshold-crossing trip
+                # (force_trip=False) keeps the original auto-recover
+                # behavior because both call sites agree on the same
+                # effective_limit resolution order.
+                "force_trip": bool(force_trip),
             }
             if event_payload_extra:
                 payload.update(event_payload_extra)
@@ -10485,6 +10657,13 @@ def _dispatch_once_locked(
     )
     if _crash_rate_limited:
         result.rate_limited.extend(_crash_rate_limited)
+    # Reviewer no-verdict parks (neutral audit outcome, sticky-blocked) —
+    # surface for telemetry / tests alongside the other side-channels.
+    _crash_review_no_verdict = getattr(
+        detect_crashed_workers, "_last_review_no_verdict", []
+    )
+    if _crash_review_no_verdict:
+        result.review_no_verdict.extend(_crash_review_no_verdict)
     result.timed_out = enforce_max_runtime(conn)
     result.promoted = recompute_ready(conn, failure_limit=failure_limit)
 
