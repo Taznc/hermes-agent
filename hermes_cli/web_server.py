@@ -2984,10 +2984,31 @@ async def fs_list(path: str):
             for entry in scan:
                 if entry.name in _FS_READDIR_HIDDEN:
                     continue
+                # Follow symlinks when classifying directories, matching the
+                # Electron shell's readDirForIpc (fs-read-dir.ts), which stats
+                # every symlinked dirent for exactly this reason. Both shells
+                # feed the SAME renderer code, so a divergence here is a real
+                # behavior fork: contrib/runtime-loader.ts's disk scan keeps
+                # only `entries.filter(e => e.isDirectory)`, so a symlinked
+                # plugin folder reported as a non-directory is silently never
+                # scanned and its plugin never loads. That is the documented
+                # dev install for desktop plugins (`ln -s` from a source repo
+                # into <hermes home>/desktop-plugins), so on the web build it
+                # broke every symlink-installed plugin.
+                #
+                # Not a sandbox weakening: `_fs_path()` already resolve()s the
+                # requested path, so symlinks are followed for reads either
+                # way; this only fixes the reported TYPE. A broken/dangling
+                # link raises OSError from the follow, which is caught here and
+                # reported as a non-directory rather than failing the listing.
+                try:
+                    is_directory = entry.is_dir()
+                except OSError:
+                    is_directory = False
                 entries.append({
                     "name": entry.name,
                     "path": str(target / entry.name),
-                    "isDirectory": entry.is_dir(follow_symlinks=False),
+                    "isDirectory": is_directory,
                 })
         entries.sort(key=lambda item: (not item["isDirectory"], item["name"].lower(), item["name"]))
         return {"entries": entries}
