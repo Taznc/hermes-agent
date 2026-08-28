@@ -80,6 +80,12 @@ interface SidebarCronJobsSectionProps {
   onTriggerJob: (jobId: string) => Promise<void>
   onToggle: () => void
   open: boolean
+  /** False in the grouped-by-workspace (Projects) view, which has no room for
+   *  this section. Kept as a prop (not an internal store read) so the
+   *  parent's own `$sidebarWorktreeGroupingActive` subscription is the single
+   *  place that gate lives — this component still owns its own `$cronJobs`
+   *  subscription and empty-list gating below. */
+  visible?: boolean
 }
 
 export function SidebarCronJobsSection({
@@ -89,7 +95,8 @@ export function SidebarCronJobsSection({
   onOpenRun,
   onTriggerJob,
   onToggle,
-  open
+  open,
+  visible: sectionVisible = true
 }: SidebarCronJobsSectionProps) {
   // Owns its own subscription: the parent used to pass `jobs` down from a
   // useStore($cronJobs) at the sidebar root, which meant a cron tick
@@ -200,7 +207,7 @@ export function SidebarCronJobsSection({
   // The section owns its own visibility now that it owns its own $cronJobs
   // subscription — the parent used to gate rendering on `cronJobs.length > 0`
   // before ever mounting this component.
-  if (jobs.length === 0) {
+  if (!sectionVisible || jobs.length === 0) {
     return null
   }
 
