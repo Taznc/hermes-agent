@@ -38,10 +38,44 @@ function gitBuildInfo() {
   }
 }
 
+/** Serve the web entry at `/`.
+ *
+ * `index.html` is the ELECTRON entry: it loads /src/main.tsx directly, with no
+ * web-bridge-shim, so `window.hermesDesktop` is undefined and the first bare
+ * `window.hermesDesktop.x` call site (use-statusbar-items' getDevMainBundleStale)
+ * throws into the root error boundary. Only `index-web.html` loads the shim
+ * first. Visiting the bare hostname is the natural thing to do, so rewrite the
+ * root (and the Electron entry) onto the web entry rather than leaving a
+ * guaranteed crash on the front door. Rewrite, not redirect: the URL stays
+ * clean and the `?token=` bootstrap query is preserved verbatim.
+ */
+function webRootEntryPlugin() {
+  return {
+    name: 'hermes-web-root-entry',
+    configureServer(server: { middlewares: { use: (fn: MiddlewareFn) => void } }) {
+      server.middlewares.use((req, _res, next) => {
+        const url = req.url ?? '/'
+        const queryAt = url.indexOf('?')
+        const pathname = queryAt === -1 ? url : url.slice(0, queryAt)
+        const search = queryAt === -1 ? '' : url.slice(queryAt)
+
+        if (pathname === '/' || pathname === '/index.html') {
+          req.url = `/index-web.html${search}`
+        }
+
+        next()
+      })
+    }
+  }
+}
+
+type MiddlewareFn = (req: { url?: string }, res: unknown, next: () => void) => void
+
 export default defineConfig(async (env: ConfigEnv): Promise<UserConfig> => {
   const resolved = await (typeof baseConfig === 'function' ? baseConfig(env) : baseConfig)
 
   return mergeConfig(resolved, {
+    plugins: [webRootEntryPlugin()],
     define: {
       // Consumed by src/web-bridge-shim.ts getVersion(); JSON-stringified so
       // it lands as an object literal in the served module.
