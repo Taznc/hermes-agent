@@ -19,7 +19,7 @@ import {
 import { sessionBucketLabel } from '@/lib/time'
 import { cn } from '@/lib/utils'
 import { sessionPinId } from '@/store/session'
-import { $sessionDotStateById, hasLiveTurn } from '@/store/session-dot-state'
+import { $liveTurnSessionIds } from '@/store/session-dot-state'
 
 import { SidebarDateDivider, SidebarSectionMeta } from './chrome'
 import { orderRowsWithinGroups, reorderableRowIds } from './order'
@@ -217,7 +217,12 @@ export function SidebarSessionsSection({
   const { t } = useI18n()
   const dividerLabels = t.sidebar.dateDivider
   const statusDividerLabels = t.sidebar.statusDivider
-  const dotStates = useStore($sessionDotStateById)
+  // Membership only — not the raw dot-state map. $liveTurnSessionIds is a
+  // stableArray-guarded projection (see store/session-dot-state.ts), so this
+  // section only re-renders when a session's hasLiveTurn bucket actually
+  // flips, not on every dot-state tick (unread, background, etc. no-op here).
+  const liveTurnIds = useStore($liveTurnSessionIds)
+  const liveTurnIdSet = useMemo(() => new Set(liveTurnIds), [liveTurnIds])
   const sectionOpen = collapsible ? open : true
   const hasGroupedSessions = Boolean(groups?.some(group => group.sessions.length > 0))
   // A defined project list is itself content (even an empty project should
@@ -342,15 +347,11 @@ export function SidebarSessionsSection({
       grouping === 'date'
         ? groupEntriesByRecency(displayEntries)
         : grouping === 'status'
-          ? groupEntriesByStatus(
-              displayEntries,
-              entry => hasLiveTurn(dotStates[entry.session.id] ?? 'idle'),
-              statusDividerLabels
-            )
+          ? groupEntriesByStatus(displayEntries, entry => liveTurnIdSet.has(entry.session.id), statusDividerLabels)
           : toSessionRows(displayEntries)
 
     return manualOrderIds?.length ? orderRowsWithinGroups(rows, manualOrderIds) : rows
-  }, [grouping, displayEntries, dotStates, manualOrderIds, statusDividerLabels])
+  }, [grouping, displayEntries, liveTurnIdSet, manualOrderIds, statusDividerLabels])
 
   // dnd-kit must see exactly the ids it renders, in render order: the sortable
   // set is derived from the rows, not from `sessions`. Feeding it the unrendered

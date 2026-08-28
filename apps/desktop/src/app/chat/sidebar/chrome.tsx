@@ -13,6 +13,20 @@ import { $sidebarRowMeta } from '@/store/layout'
 // sections and the project/workspace tree, so it lives outside either to keep
 // imports one-directional (no index <-> projects cycle).
 
+// Two modes via the `compact` height variant (styles.css):
+//   tall    → each section is shrink-0, capped, its own scroller; Sessions is flex-1.
+//   compact → COMPACT_FLAT drops the caps so the whole stack scrolls as one.
+// Sections stay shrink-0 so none can be squeezed below its content and bleed onto
+// the next — the flexbox `min-height: auto` overlap trap that caused the bug.
+export const SIDEBAR_COMPACT_FLAT = 'compact:max-h-none compact:overflow-visible'
+
+// Vertical scroll only — never a horizontal bar from glow bleed, long titles,
+// etc. The bar itself only shows while the pointer is in the list.
+export const SIDEBAR_SCROLL_Y = 'overflow-y-auto overflow-x-hidden overscroll-contain scrollbar-fade'
+
+// A non-session group's scroll body: own scroller when tall, flattened when compact.
+export const SIDEBAR_GROUP_BODY = cn(SIDEBAR_SCROLL_Y, SIDEBAR_COMPACT_FLAT)
+
 /** The muted slot beside a section label (loading glyph, status hint). */
 export function SidebarSectionMeta({ children }: { children: React.ReactNode }) {
   return <span className="shrink-0 text-[0.6875rem] font-medium text-(--ui-text-quaternary)">{children}</span>
