@@ -92,11 +92,7 @@ const SENTINEL_GATED: Record<string, string> = {
   // Rendered ONLY by desktop-install-overlay (its remote-setup step), which
   // bails before mount unless onBootstrapEvent exists — so this form never
   // reaches its connection-config calls in the web build.
-  'components/first-run-remote-form.tsx': 'onBootstrapEvent',
-  // contrib disk scan: diskRoots() returns [] without desktopPluginsRoot?.()/
-  // agentPluginsRoot?.(), so the readDir/readFileText/watch calls never run —
-  // and each is additionally wrapped in try/catch.
-  'contrib/runtime-loader.ts': 'desktopPluginsRoot'
+  'components/first-run-remote-form.tsx': 'onBootstrapEvent'
 }
 
 /** Files exempted by a gate that lives in ANOTHER file (the renderer). */

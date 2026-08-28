@@ -109,6 +109,28 @@ def _redact(text: str) -> str:
         return "[line withheld: redaction unavailable]"
 
 
+def _format_route(route: Optional[Dict[str, Any]]) -> str:
+    """Render a per-task route as one header line, or "" when unknown.
+
+    Marks inherited routes explicitly so the reader can tell "this child was
+    routed here on purpose" from "this child took the parent's model".
+    """
+    if not isinstance(route, dict):
+        return ""
+    model = str(route.get("model") or "").strip()
+    if not model:
+        return ""
+    provider = str(route.get("provider") or "").strip()
+    where = f"{provider}/{model}" if provider else model
+    source = str(route.get("source") or "").strip()
+    label = {
+        "spawn": " (per-spawn override)",
+        "config": " (delegation.model pin)",
+        "inherit": " (inherited from parent)",
+    }.get(source, "")
+    return f"model: {_redact(where)}{label}"
+
+
 class LiveTranscriptWriter:
     """Append-only human-readable event log for ONE subagent task.
 
@@ -117,7 +139,8 @@ class LiveTranscriptWriter:
     """
 
     def __init__(self, delegation_id: str, task_index: int, goal: str,
-                 context: Optional[str] = None, root: Optional[Path] = None):
+                 context: Optional[str] = None, root: Optional[Path] = None,
+                 route: Optional[Dict[str, Any]] = None):
         self.delegation_id = delegation_id
         self.task_index = task_index
         self._ok = True
@@ -135,6 +158,11 @@ class LiveTranscriptWriter:
                 # Header bypasses event(), so redact here too — a goal string
                 # can carry a key the caller pasted into the task.
                 f"goal: {_redact(_one_line(goal, _KICKOFF_MAX))}",
+            ]
+            route_line = _format_route(route)
+            if route_line:
+                header.append(route_line)
+            header += [
                 f"started: {time.strftime('%Y-%m-%d %H:%M:%S')}",
                 "(append-only; streams while the subagent runs — tail -f me)",
                 "=" * 40,
@@ -315,12 +343,19 @@ def create_live_transcripts(
     delegation_id: Optional[str] = None,
     model: Optional[str] = None,
     provider: Optional[str] = None,
+    task_routes: Optional[List[Optional[Dict[str, Any]]]] = None,
 ) -> tuple[Optional[str], List[Optional[LiveTranscriptWriter]], List[str]]:
     """Create one pre-headered writer per task + a manifest.json.
 
     Returns ``(delegation_id, writers, paths)``. On any top-level failure
     returns ``(None, [None]*n, [])`` so delegation proceeds untouched.
     Also opportunistically prunes stale live dirs (retention).
+
+    ``task_routes`` is an optional per-task ``{"model", "provider",
+    "inherited"}`` mapping (see ``tools.delegation_model_override``). When
+    present each task's header names the model that task actually runs on,
+    which is the only way to audit a heterogeneous batch — the batch-level
+    ``model``/``provider`` describe the delegation default, not task N.
     """
     n = len(task_list)
     try:
@@ -332,16 +367,23 @@ def create_live_transcripts(
         writers: List[Optional[LiveTranscriptWriter]] = []
         paths: List[str] = []
         for i, t in enumerate(task_list):
+            route = None
+            if task_routes is not None and i < len(task_routes):
+                route = task_routes[i]
             w = LiveTranscriptWriter(
                 deleg_id, i, str(t.get("goal", "")),
                 context=t.get("context") or context,
+                route=route,
             )
             writers.append(w if w.path is not None else None)
             if w.path is not None:
                 paths.append(str(w.path))
         if not paths:
             return None, [None] * n, []
-        _write_manifest(deleg_id, task_list, paths, model=model, provider=provider)
+        _write_manifest(
+            deleg_id, task_list, paths, model=model, provider=provider,
+            task_routes=task_routes,
+        )
         return deleg_id, writers, paths
     except Exception as exc:
         logger.debug("Live transcript creation failed: %s", exc)
@@ -354,7 +396,8 @@ def _manifest_path(delegation_id: str) -> Path:
 
 def _write_manifest(delegation_id: str, task_list: List[Dict[str, Any]],
                     paths: List[str], model: Optional[str] = None,
-                    provider: Optional[str] = None) -> None:
+                    provider: Optional[str] = None,
+                    task_routes: Optional[List[Optional[Dict[str, Any]]]] = None) -> None:
     try:
         manifest = {
             "delegation_id": delegation_id,
@@ -373,6 +416,16 @@ def _write_manifest(delegation_id: str, task_list: List[Dict[str, Any]],
                     "goal": _redact(str(t.get("goal", ""))[:500]),
                     "log": paths[i] if i < len(paths) else None,
                     "status": "running",
+                    # Where this specific task runs. Present even when
+                    # inherited, so a heterogeneous batch is auditable from
+                    # the manifest alone.
+                    **(
+                        {"route": task_routes[i]}
+                        if task_routes is not None
+                        and i < len(task_routes)
+                        and isinstance(task_routes[i], dict)
+                        else {}
+                    ),
                 }
                 for i, t in enumerate(task_list)
             ],

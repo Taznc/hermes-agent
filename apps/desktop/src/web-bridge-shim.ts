@@ -75,6 +75,28 @@ interface SpikeApiRequest {
   upload?: { bytes: ArrayBuffer | Uint8Array; contentType?: string; filename: string }
 }
 
+interface SpikeReadDirEntry {
+  isDirectory: boolean
+  name: string
+  path: string
+}
+
+interface SpikeReadDirResult {
+  entries: SpikeReadDirEntry[]
+  error?: string
+}
+
+interface SpikeReadFileTextResult {
+  binary?: boolean
+  byteSize?: number
+  language?: string
+  mimeType?: string
+  path: string
+  text: string
+  truncated?: boolean
+}
+
+
 // Injected at serve time by vite.config.web.ts `define` — real git provenance
 // of the checkout being served (branch/commit/dirty).
 declare const __HERMES_WEB_BUILD_INFO__: { branch: string; commit: string; dirty: boolean } | undefined
@@ -229,6 +251,29 @@ const shim = {
   // ── data layer ───────────────────────────────────────────────────────────
   api,
 
+  // ── disk-plugin door (proxied over /api/fs/*) ───────────────────────────
+  // contrib/runtime-loader.ts's diskRoots() calls desktopPluginsRoot()/
+  // agentPluginsRoot() to discover the two on-disk plugin scan roots
+  // (<hermes home>/desktop-plugins/*, <hermes home>/plugins/*/desktop/) and
+  // then readDir()/readPluginSource() (readFileText() on older shells) to
+  // walk and load them. Without these members diskRoots() short-circuits to
+  // [] and NO on-disk plugin — including account-limits — ever loads in this
+  // build. There's no Electron main process here to resolve <hermes home> or
+  // touch the filesystem directly, so every member proxies through the
+  // backend's /api/fs/* gateway REST routes, the same seam desktop-fs.ts's
+  // remote-mode branch already uses for the editor/preview file surfaces.
+  desktopPluginsRoot: async () => (await api<{ path: string }>({ path: '/api/fs/desktop-plugins-root' })).path,
+  agentPluginsRoot: async () => (await api<{ path: string }>({ path: '/api/fs/agent-plugins-root' })).path,
+  readDir: async (dirPath: string) =>
+    api<SpikeReadDirResult>({ path: `/api/fs/list?path=${encodeURIComponent(dirPath)}` }),
+  readFileText: async (filePath: string) =>
+    api<SpikeReadFileTextResult>({ path: `/api/fs/read-text?path=${encodeURIComponent(filePath)}` }),
+  // Full-source, non-truncating read — runtime-loader.ts prefers this over
+  // readFileText for evaluating plugin.js (readFileText silently truncates at
+  // 512 KiB, which would evaluate half a module).
+  readPluginSource: async (filePath: string) =>
+    api<SpikeReadFileTextResult>({ path: `/api/fs/read-plugin-source?path=${encodeURIComponent(filePath)}` }),
+
   // ── first-render adjacents ───────────────────────────────────────────────
   onPreviewFileChanged: unsub,
   notify: async (_payload: unknown) => false,
@@ -371,8 +416,8 @@ const shim = {
   // themes, cloud, connections, settings, findInPage*, getBootstrapState/
   // onBootstrapEvent (must stay omitted TOGETHER), readFileDataUrl,
   // openSessionWindow/openWindow, writeClipboard, setActiveWork,
-  // setTranslucency, battery, readDir/readFileText (remote mode → /api/fs/*),
-  // watchPreviewFile, contextMenu*, and the REMAINING oauth*/ssh*/
+  // setTranslucency, battery, watchPreviewFile/watchDirectory/
+  // stopPreviewFileWatch, contextMenu*, and the REMAINING oauth*/ssh*/
   // connection-config surfaces (getConnectionConfig stays omitted — it is the
   // sentinel that gates Settings → Gateway and the boot-failure overlay;
   // applyConnectionConfig + oauthLoginConnectionConfig above are the two
@@ -382,6 +427,14 @@ const shim = {
   // readDesktopFileDataUrlLocalFirst tries the bridge before the gateway, so
   // defining it would shadow the remote /api/fs/read-data-url read that makes
   // composer thumbnails work here.
+  //
+  // watchPreviewFile/watchDirectory are optional on the loader's own contract
+  // (`desktop.watchPreviewFile?.()`/`desktop.watchDirectory?.()`, wrapped in
+  // try/catch) — omitting them costs live hot-reload of an edited plugin.js
+  // and hands folder-churn detection to runtime-loader.ts's 5s poll fallback
+  // instead of a push notification; disk plugins (account-limits included)
+  // still discover and load correctly on the initial scan/poll via
+  // desktopPluginsRoot/agentPluginsRoot + readDir/readPluginSource above.
 } as const
 
 ;(window as unknown as { hermesDesktop: unknown }).hermesDesktop = shim

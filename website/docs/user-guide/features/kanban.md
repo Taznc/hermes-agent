@@ -479,6 +479,27 @@ hermes kanban set-model t_abcd none    # clear the override
 
 The dispatcher spawns the worker with the pinned model (`--provider <name>` is passed when set; `--provider` requires a model). The dashboard's per-task model dropdown drives the same `model_override` field. With no override, the worker uses its profile's configured model.
 
+### Per-task reasoning effort
+
+Pin a task's worker to a specific thinking depth, independent of the model override — a task can run the assignee profile's own model at a different depth:
+
+```bash
+# At creation
+hermes kanban create "hard refactor" --assignee coder \
+    --reasoning high
+
+# Model and reasoning together — independent knobs, both reach the worker
+hermes kanban create "hard refactor" --assignee coder \
+    --model claude-opus-4.6 --provider anthropic --reasoning xhigh
+
+# Or later — takes effect on the next dispatch
+hermes kanban set-model t_abcd --reasoning medium   # model override untouched
+hermes kanban set-model t_abcd --reasoning none     # thinking off (a real value)
+hermes kanban set-model t_abcd --reasoning clear    # fall back to profile default
+```
+
+Precedence is per-card `reasoning_effort` > the assignee profile's own `agent.reasoning_effort` — same shape as the model override above, and evaluated independently of it. `--reasoning` accepts any level in `VALID_REASONING_EFFORTS` (`minimal`, `low`, `medium`, `high`, `xhigh`, `max`, `ultra`) plus `none` to disable thinking; an invalid level is rejected at filing/setting time with the valid set named in the error, rather than silently falling back to the profile default. Omitting the flag leaves the field unset (`NULL`), and the worker inherits its profile's configured reasoning effort — unchanged behavior. The `kanban_create` MCP tool exposes the same field as `reasoning_effort` so an orchestrator can set depth per child when it fans out.
+
 ### Cost strategy: frontier orchestrator, inexpensive workers
 
 Kanban's per-profile configs make the planner/worker cost split natural. Decomposing a project into well-scoped cards takes frontier-level judgment; executing a card that already carries a clear goal, context, and handoff evidence usually doesn't — and the workers are where the vast majority of tokens are spent, so the worker model is where the cost lives. Run your orchestrator/dispatcher profile on a frontier model and point worker profiles at inexpensive models. Each profile has its own `config.yaml` under `~/.hermes/profiles/<name>/`, and the dispatcher injects the profile-scoped `HERMES_HOME` when it spawns `hermes -p <assignee>`, so each worker reads its own profile's model settings:

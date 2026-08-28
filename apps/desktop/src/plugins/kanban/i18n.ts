@@ -33,6 +33,8 @@ type KanbanMessages = {
   deselect: string
   moveTo: (label: string) => string
   delete: string
+  // per-card "send to roadmap ideas" (Phase 2.15 follow-up)
+  sendToRoadmap: string
   reviewChecking: string
   attachedTip: (name: string) => string
   orchestratorTip: (name: string) => string
@@ -101,6 +103,15 @@ type KanbanMessages = {
   tokUnit: string
   couldNotEstimate: string
   complexity: Record<'L' | 'M' | 'S', string>
+  // idea capture (Phase 2.15) — free-typed roadmap idea, board header
+  ideaTitle: string
+  ideaHint: string
+  ideaPlaceholder: string
+  ideaSave: string
+  ideaSaving: string
+  ideaSaved: string
+  ideaEmpty: string
+  ideaUnavailable: string
   introBody: string
   introGotIt: string
   // drawer — activity prose
@@ -185,9 +196,25 @@ type KanbanMessages = {
   requeueWithNote: string
   notePosted: string
   activity: (n: number) => string
+  /** Collapsed-run summary for identical consecutive activity events, e.g.
+   *  "heartbeat ×6 · last 46 sec. ago". */
+  activityRun: (label: string, n: number, ago: string) => string
   runs: (n: number) => string
+  /** Rollup badge next to the Runs section header when at least one run failed. */
+  runsFailedCount: (n: number) => string
+  // Plain-language framing for the raw dispatcher diagnostics that land in
+  // `run.error` — the human summary is primary; the raw string stays
+  // available behind an expand toggle (see runErrRaw / expand / collapse).
+  runErrStaleLock: string
+  runErrPidNotAlive: string
+  runErrPidExited: (code: string) => string
+  runErrPidSignaled: (signal: string) => string
+  runErrRaw: string
   workerLog: string
   workerLogTail: string
+  /** "Show more" affordance under a truncated worker log — widens the tail
+   *  instead of leaving a bare unexplained `...`. */
+  workerLogShowMore: string
   attachments: (n: number) => string
   noAttachments: string
   uploadAttachment: string
@@ -274,6 +301,7 @@ export const en: KanbanMessages = {
   deselect: 'Deselect',
   moveTo: label => `Move to ${label}`,
   delete: 'Delete',
+  sendToRoadmap: 'Send to roadmap ideas',
   reviewChecking: 'A review agent is checking the completed work.',
   attachedTip: name => `${name} is attached — the dispatcher hands this over on its next tick (≤1m).`,
   orchestratorTip: name => `${name} (the orchestrator) picks this up on the next tick and writes the spec.`,
@@ -343,6 +371,14 @@ export const en: KanbanMessages = {
   tokUnit: 'tok',
   couldNotEstimate: 'Could not estimate',
   complexity: { S: 'Small', M: 'Medium', L: 'Large' },
+  ideaTitle: 'Capture idea',
+  ideaHint: 'Jot a rough roadmap idea — it lands in ROADMAP.md’s Ideas list for later triage, not as a card.',
+  ideaPlaceholder: 'Rough idea…',
+  ideaSave: 'Save idea',
+  ideaSaving: 'Saving…',
+  ideaSaved: 'Idea saved to the roadmap',
+  ideaEmpty: 'Type something before saving.',
+  ideaUnavailable: 'Roadmap unavailable — the idea was not saved.',
   introBody:
     'You don’t run the cards — agents do. Put a card in Ready with an assignee and an agent picks it up within a minute. No assignee, no run. Triage: an agent rewrites the idea into a proper task first. Todo: waiting on other cards. Scheduled: waiting on a timer. Running and Review: the agents’ lanes, hands off. Blocked: it’s waiting on you. Results come back on the card.',
   introGotIt: 'Got it',
@@ -434,9 +470,17 @@ export const en: KanbanMessages = {
   requeueWithNote: 'Requeue with note',
   notePosted: 'Note posted — worker requeued',
   activity: n => `Activity · ${n}`,
+  activityRun: (label, n, ago) => `${label} ×${n} · last ${ago}`,
   runs: n => `Runs · ${n}`,
+  runsFailedCount: n => (n === 1 ? '1 failed' : `${n} failed`),
+  runErrStaleLock: 'The worker’s claim expired, so the task was returned to the queue.',
+  runErrPidNotAlive: 'The worker process disappeared unexpectedly.',
+  runErrPidExited: code => `The worker exited with an error (code ${code}).`,
+  runErrPidSignaled: signal => `The worker was killed (signal ${signal}).`,
+  runErrRaw: 'Raw diagnostic',
   workerLog: 'Worker log',
   workerLogTail: 'Worker log · tail',
+  workerLogShowMore: 'Show more',
   attachments: n => `Attachments · ${n}`,
   noAttachments: 'No attachments yet.',
   uploadAttachment: 'Upload attachment',
@@ -522,6 +566,7 @@ const ja: KanbanMessages = {
   deselect: '選択解除',
   moveTo: label => `${label} へ移動`,
   delete: '削除',
+  sendToRoadmap: 'ロードマップのアイデアに送る',
   reviewChecking: 'レビューエージェントが完了した作業を確認中です。',
   attachedTip: name => `${name} が担当 — ディスパッチャが次のティック（≤1分）で引き渡します。`,
   orchestratorTip: name => `${name}（オーケストレーター）が次のティックでこれを取得し、仕様を書きます。`,
@@ -591,6 +636,14 @@ const ja: KanbanMessages = {
   tokUnit: 'tok',
   couldNotEstimate: '見積もりできませんでした',
   complexity: { S: '小', M: '中', L: '大' },
+  ideaTitle: 'アイデアを記録',
+  ideaHint: 'ラフなロードマップのアイデアをメモ — カードではなく ROADMAP.md の Ideas リストに追加され、後でトリアージされます。',
+  ideaPlaceholder: 'ラフなアイデア…',
+  ideaSave: 'アイデアを保存',
+  ideaSaving: '保存中…',
+  ideaSaved: 'アイデアをロードマップに保存しました',
+  ideaEmpty: '保存する前に入力してください。',
+  ideaUnavailable: 'ロードマップが利用できません — アイデアは保存されませんでした。',
   introBody:
     'カードはあなたではなくエージェントが実行します。担当を設定したカードを Ready に置くと、1分以内にエージェントが取得します。担当がなければ実行されません。トリアージ: エージェントがまずアイデアを適切なタスクに書き直します。Todo: 他のカード待ち。スケジュール: タイマー待ち。実行中とレビュー: エージェントのレーンなので手を出さないでください。ブロック: あなたの対応待ちです。結果はカードに戻ってきます。',
   introGotIt: '了解',
@@ -679,9 +732,17 @@ const ja: KanbanMessages = {
   requeueWithNote: 'メモを付けて再キュー',
   notePosted: 'メモを投稿しました — ワーカーを再キューしました',
   activity: n => `アクティビティ・${n}`,
+  activityRun: (label, n, ago) => `${label} ×${n}・最新 ${ago}`,
   runs: n => `実行・${n}`,
+  runsFailedCount: n => `失敗 ${n} 件`,
+  runErrStaleLock: 'ワーカーの取得ロックが期限切れになり、キューに戻されました。',
+  runErrPidNotAlive: 'ワーカープロセスが予期せず消失しました。',
+  runErrPidExited: code => `ワーカーがエラーで終了しました（コード ${code}）。`,
+  runErrPidSignaled: signal => `ワーカーが強制終了されました（シグナル ${signal}）。`,
+  runErrRaw: '生の診断情報',
   workerLog: 'ワーカーログ',
   workerLogTail: 'ワーカーログ・末尾',
+  workerLogShowMore: 'もっと見る',
   attachments: n => `添付・${n}`,
   noAttachments: 'まだ添付はありません。',
   uploadAttachment: '添付をアップロード',
@@ -767,6 +828,7 @@ const zh: KanbanMessages = {
   deselect: '取消选择',
   moveTo: label => `移动到 ${label}`,
   delete: '删除',
+  sendToRoadmap: '发送到路线图想法',
   reviewChecking: '审查代理正在检查已完成的工作。',
   attachedTip: name => `${name} 已接手 — 调度器将在下一个周期（≤1 分钟）移交。`,
   orchestratorTip: name => `${name}（编排者）将在下一个周期领取并撰写规格。`,
@@ -835,6 +897,14 @@ const zh: KanbanMessages = {
   tokUnit: 'tok',
   couldNotEstimate: '无法估算',
   complexity: { S: '小', M: '中', L: '大' },
+  ideaTitle: '记录想法',
+  ideaHint: '记下一个粗略的路线图想法 — 它会加入 ROADMAP.md 的 Ideas 列表，而不是新建卡片，稍后再分诊。',
+  ideaPlaceholder: '粗略的想法…',
+  ideaSave: '保存想法',
+  ideaSaving: '保存中…',
+  ideaSaved: '想法已保存到路线图',
+  ideaEmpty: '请先输入内容再保存。',
+  ideaUnavailable: '路线图不可用 — 想法未保存。',
   introBody:
     '卡片不由你运行，而是由代理运行。把带有负责人的卡片放入“就绪”，代理会在一分钟内领取。没有负责人就不会运行。分诊：代理先把想法改写成合适的任务。待办：等待其他卡片。已排期：等待计时器。运行中与审查：这是代理的通道，请勿插手。受阻：正在等你。结果会回到卡片上。',
   introGotIt: '知道了',
@@ -922,9 +992,17 @@ const zh: KanbanMessages = {
   requeueWithNote: '附带备注重新入队',
   notePosted: '备注已发布 — 工作单元已重新入队',
   activity: n => `活动・${n}`,
+  activityRun: (label, n, ago) => `${label} ×${n}・最近 ${ago}`,
   runs: n => `运行・${n}`,
+  runsFailedCount: n => `${n} 个失败`,
+  runErrStaleLock: '工作单元的领取锁已过期，任务已放回队列。',
+  runErrPidNotAlive: '工作单元进程意外消失。',
+  runErrPidExited: code => `工作单元因错误退出（代码 ${code}）。`,
+  runErrPidSignaled: signal => `工作单元被强制终止（信号 ${signal}）。`,
+  runErrRaw: '原始诊断信息',
   workerLog: '工作单元日志',
   workerLogTail: '工作单元日志・末尾',
+  workerLogShowMore: '显示更多',
   attachments: n => `附件・${n}`,
   noAttachments: '暂无附件。',
   uploadAttachment: '上传附件',
@@ -1009,6 +1087,7 @@ const zhHant: KanbanMessages = {
   deselect: '取消選取',
   moveTo: label => `移至 ${label}`,
   delete: '刪除',
+  sendToRoadmap: '傳送到路線圖想法',
   reviewChecking: '審查代理正在檢查已完成的工作。',
   attachedTip: name => `${name} 已接手 — 排程器將在下一個週期（≤1 分鐘）移交。`,
   orchestratorTip: name => `${name}（編排者）將在下一個週期領取並撰寫規格。`,
@@ -1077,6 +1156,14 @@ const zhHant: KanbanMessages = {
   tokUnit: 'tok',
   couldNotEstimate: '無法估算',
   complexity: { S: '小', M: '中', L: '大' },
+  ideaTitle: '記錄想法',
+  ideaHint: '記下一個粗略的路線圖想法 — 它會加入 ROADMAP.md 的 Ideas 清單，而不是新建卡片，稍後再分診。',
+  ideaPlaceholder: '粗略的想法…',
+  ideaSave: '儲存想法',
+  ideaSaving: '儲存中…',
+  ideaSaved: '想法已儲存到路線圖',
+  ideaEmpty: '請先輸入內容再儲存。',
+  ideaUnavailable: '路線圖不可用 — 想法未儲存。',
   introBody:
     '卡片不由你執行，而是由代理執行。把有負責人的卡片放入「就緒」，代理會在一分鐘內領取。沒有負責人就不會執行。分類：代理先把想法改寫成合適的任務。待辦：等待其他卡片。已排程：等待計時器。執行中與審查：這是代理的通道，請勿插手。受阻：正在等你。結果會回到卡片上。',
   introGotIt: '知道了',
@@ -1164,9 +1251,17 @@ const zhHant: KanbanMessages = {
   requeueWithNote: '附上備註重新排入佇列',
   notePosted: '備註已發布 — 工作單元已重新排入佇列',
   activity: n => `活動・${n}`,
+  activityRun: (label, n, ago) => `${label} ×${n}・最近 ${ago}`,
   runs: n => `執行・${n}`,
+  runsFailedCount: n => `${n} 個失敗`,
+  runErrStaleLock: '工作單元的領取鎖已過期，任務已放回佇列。',
+  runErrPidNotAlive: '工作單元行程意外消失。',
+  runErrPidExited: code => `工作單元因錯誤結束（代碼 ${code}）。`,
+  runErrPidSignaled: signal => `工作單元被強制終止（訊號 ${signal}）。`,
+  runErrRaw: '原始診斷資訊',
   workerLog: '工作單元日誌',
   workerLogTail: '工作單元日誌・末尾',
+  workerLogShowMore: '顯示更多',
   attachments: n => `附件・${n}`,
   noAttachments: '尚無附件。',
   uploadAttachment: '上傳附件',

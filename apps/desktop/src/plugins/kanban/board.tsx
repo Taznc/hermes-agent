@@ -68,6 +68,7 @@ import {
   $collapsedLanes,
   $introDismissed,
   $lanesByProfile,
+  addRoadmapIdea,
   boardKey,
   BOARDS_KEY,
   bulkTasks,
@@ -444,7 +445,7 @@ function CardFooter({ arc, task }: { arc: ArcState | null; task: KanbanTask }) {
   )
 }
 
-function Card({
+export function Card({
   columns,
   onDelete,
   onMove,
@@ -477,6 +478,23 @@ function Card({
   // class swap: the card keeps its position, its identity, and its subtree.
   const dimmed = Boolean(deps.focused) && role === null
   const linked = hasDependencies(deps, task)
+
+  // Per-card "send to roadmap ideas" (Phase 2.15 follow-up). Provenance-only
+  // — title + id, never the body — reusing the exact contract + toast copy
+  // the board-header free-typed capture already established (IdeaCaptureDialog
+  // above): success and roadmap-unavailable get distinct feedback, and this
+  // never touches the task query cache since it isn't a board mutation.
+  const sendIdeaMut = useMutation({
+    mutationFn: () => addRoadmapIdea(task.title, task.id),
+    onSuccess: ({ ok, reason }) => {
+      if (ok) {
+        host.notify({ kind: 'success', message: k.ideaSaved })
+      } else {
+        host.notify({ kind: 'warning', message: reason === 'empty_idea' ? k.ideaEmpty : k.ideaUnavailable })
+      }
+    },
+    onError: err => host.notify({ kind: 'error', message: errText(err) })
+  })
 
   return (
     <ContextMenu>
@@ -633,6 +651,11 @@ function Card({
               {k.moveTo(columnLabel(k, name))}
             </ContextMenuItem>
           ))}
+        <ContextMenuSeparator />
+        <ContextMenuItem disabled={sendIdeaMut.isPending} onSelect={() => sendIdeaMut.mutate()}>
+          <Codicon name="lightbulb" size="0.85rem" />
+          {k.sendToRoadmap}
+        </ContextMenuItem>
         <ContextMenuSeparator />
         <ContextMenuItem onSelect={() => onDelete(task.id)} variant="destructive">
           <Codicon name="trash" size="0.85rem" />
@@ -1388,6 +1411,97 @@ function FilterMenu({
   )
 }
 
+// ── idea capture (Phase 2.15) ───────────────────────────────────────────────
+
+/**
+ * Free-typed roadmap idea capture — jot a rough idea straight from the board
+ * into ROADMAP.md's managed `## Ideas` inbox (roadmap-sync plugin), without
+ * opening an editor or filing a premature card. A rejected/unavailable
+ * roadmap is reported distinctly from success (`k.ideaUnavailable` vs.
+ * `k.ideaSaved`) per the card's acceptance criteria — this is a fire-and-log
+ * action, not a board mutation, so it never touches the task query cache.
+ */
+export function IdeaCaptureDialog({ onClose, open }: { onClose: () => void; open: boolean }) {
+  const k = useKanban()
+  const [text, setText] = useState('')
+  const [busy, setBusy] = useState(false)
+  const [error, setError] = useState<null | string>(null)
+
+  useEffect(() => {
+    if (open) {
+      setText('')
+      setBusy(false)
+      setError(null)
+    }
+  }, [open])
+
+  const submit = async () => {
+    const trimmed = text.trim()
+
+    if (!trimmed || busy) {
+      return
+    }
+
+    setBusy(true)
+    setError(null)
+
+    try {
+      const { ok, reason } = await addRoadmapIdea(trimmed)
+
+      if (ok) {
+        host.notify({ kind: 'success', message: k.ideaSaved })
+        onClose()
+      } else {
+        // Distinct from a thrown error: the request succeeded, the ROADMAP
+        // write did not (unmapped board, missing file, empty after
+        // sanitization) — surface it inline so the user can decide whether
+        // to retry rather than silently losing the idea.
+        setError(reason === 'empty_idea' ? k.ideaEmpty : k.ideaUnavailable)
+        setBusy(false)
+      }
+    } catch (err) {
+      setError(errText(err))
+      setBusy(false)
+    }
+  }
+
+  return (
+    <Dialog onOpenChange={next => !next && onClose()} open={open}>
+      <DialogContent className="w-[min(28rem,94vw)]">
+        <DialogHeader>
+          <DialogTitle>{k.ideaTitle}</DialogTitle>
+        </DialogHeader>
+        <div className="flex flex-col gap-3">
+          <p className="text-xs text-(--ui-text-tertiary)">{k.ideaHint}</p>
+          <Textarea
+            autoFocus
+            className="min-h-24"
+            maxLength={300}
+            onChange={e => setText(e.target.value)}
+            onKeyDown={e => {
+              if (e.key === 'Enter' && (e.metaKey || e.ctrlKey)) {
+                e.preventDefault()
+                void submit()
+              }
+            }}
+            placeholder={k.ideaPlaceholder}
+            value={text}
+          />
+          {error && <p className="text-xs text-destructive">{error}</p>}
+        </div>
+        <DialogFooter>
+          <Button onClick={onClose} size="sm" variant="ghost">
+            {k.cancel}
+          </Button>
+          <Button disabled={!text.trim() || busy} onClick={() => void submit()} size="sm">
+            {busy ? k.ideaSaving : k.ideaSave}
+          </Button>
+        </DialogFooter>
+      </DialogContent>
+    </Dialog>
+  )
+}
+
 // ── selection bar ────────────────────────────────────────────────────────────
 
 /**
@@ -1541,6 +1655,7 @@ export function KanbanBoardPage() {
 
   const [openId, setOpenId] = useState<null | string>(null)
   const [addStatus, setAddStatus] = useState<null | string>(null)
+  const [ideaOpen, setIdeaOpen] = useState(false)
   const [settingsOpen, setSettingsOpen] = useState(false)
   const [search, setSearch] = useState('')
   const [tenant, setTenant] = useState('')
@@ -1890,6 +2005,11 @@ export function KanbanBoardPage() {
           )}
           <SearchField aria-label={k.filterCards} onChange={setSearch} placeholder={k.filterCards} value={search} />
           <div className="ml-auto flex items-center gap-1">
+            <Tip label={k.ideaTitle}>
+              <Button aria-label={k.ideaTitle} onClick={() => setIdeaOpen(true)} size="icon-xs" variant="ghost">
+                <Codicon name="lightbulb" size="0.85rem" />
+              </Button>
+            </Tip>
             <Tip label={k.orchestrationSettings}>
               <Button
                 aria-label={k.orchestrationSettings}
@@ -2000,6 +2120,7 @@ export function KanbanBoardPage() {
         )}
 
         <NewTaskDialog onClose={() => setAddStatus(null)} parents={parentOptions} target={addStatus} />
+        <IdeaCaptureDialog onClose={() => setIdeaOpen(false)} open={ideaOpen} />
         <TaskDrawer columns={columnNames} id={openId} onClose={() => setOpenId(null)} onOpen={setOpenId} />
       </div>
     </DependencyContext.Provider>

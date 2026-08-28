@@ -707,3 +707,198 @@ def test_review_transitions_preserve_consecutive_failures(conn) -> None:
         )
     assert kb.complete_task(conn, ok_id, summary="done")
     assert _failures(conn, ok_id) == 0
+
+
+# ---------------------------------------------------------------------------
+# Review no-verdict dispatch loop + circuit-breaker promotion mismatch
+# (parent t_00fea4fd root cause; this card's fix).
+# ---------------------------------------------------------------------------
+
+
+def _drive_worker_exit(conn, tid, fake_pid, raw_status):
+    """Claim ``tid``'s current running run against ``fake_pid`` and reap it.
+
+    Mirrors ``test_kanban_core_functionality._drive_worker_exit`` but does
+    NOT re-claim: the caller is expected to already have a live claim (e.g.
+    from ``claim_review_task``) that this function kills off. ``started_at``
+    is backdated past the crash-detection grace period so the reaper does
+    not skip a freshly-claimed run as still-launching.
+    """
+    import hermes_cli.kanban_db as _kb
+    host_prefix = _kb._claimer_id().split(":", 1)[0]
+    task = _kb.get_task(conn, tid)
+    assert task is not None and task.status == "running"
+    old = int(time.time()) - 1_000
+    with _kb.write_txn(conn):
+        conn.execute(
+            "UPDATE tasks SET worker_pid = ?, claim_lock = ?, started_at = ? "
+            "WHERE id = ?",
+            (fake_pid, f"{host_prefix}:mock", old, tid),
+        )
+        if task.current_run_id:
+            conn.execute(
+                "UPDATE task_runs SET worker_pid = ?, started_at = ? "
+                "WHERE id = ?",
+                (fake_pid, old, task.current_run_id),
+            )
+    _kb._record_worker_exit(fake_pid, raw_status)
+    original_alive = _kb._pid_alive
+    _kb._pid_alive = lambda p: False
+    try:
+        return _kb.detect_crashed_workers(conn)
+    finally:
+        _kb._pid_alive = original_alive
+
+
+def test_review_claim_no_verdict_produces_neutral_audit_and_no_reclaim(conn) -> None:
+    """1. review claim -> no verdict -> no second claim.
+
+    A claimed reviewer whose process exits cleanly (rc=0) without calling
+    kanban_complete / kanban_request_changes / kanban_block must land a
+    ``review_no_verdict`` event (not ``protocol_violation``, not
+    ``crashed``), must NOT increment ``consecutive_failures``, and the
+    task must be un-claimable by a fresh dispatcher tick until an
+    explicit ``kanban_unblock``.
+    """
+    task_id, review = _claimed_review(conn, "Idle reviewer pass")
+    before_failures = kb.get_task(conn, task_id).consecutive_failures
+
+    crashed = _drive_worker_exit(conn, task_id, 881001, 0)  # rc=0 clean exit
+    assert crashed == []  # not reported as a crash
+
+    task = kb.get_task(conn, task_id)
+    assert task is not None
+    assert task.status == "blocked"
+    assert task.consecutive_failures == before_failures
+
+    events = kb.list_events(conn, task_id)
+    kinds = [e.kind for e in events]
+    assert "review_no_verdict" in kinds
+    assert "protocol_violation" not in kinds
+    assert "crashed" not in kinds
+    assert "gave_up" not in kinds
+
+    verdict_event = _event(events, "review_no_verdict")
+    assert verdict_event.payload is not None
+    assert verdict_event.payload.get("retry_status") == "review"
+
+    run = _run(kb.list_runs(conn, task_id), "review_no_verdict")
+    assert run.status == "review_no_verdict"
+
+    # A dispatcher tick must NOT re-promote/re-claim it — sticky like a
+    # worker-initiated kanban_block.
+    assert kb.recompute_ready(conn) == 0
+    assert kb.get_task(conn, task_id).status == "blocked"
+    assert kb.claim_review_task(conn, task_id) is None
+
+    # Explicit requeue reopens it for another reviewer pass.
+    assert kb.unblock_task(conn, task_id)
+    reopened = kb.get_task(conn, task_id)
+    assert reopened is not None
+    assert reopened.status == "review"
+    second_pass = kb.claim_review_task(conn, task_id, claimer="reviewer:2")
+    assert second_pass is not None
+
+
+def test_repeated_unblock_review_cycles_never_trip_block_loop_accounting(
+    conn,
+) -> None:
+    """2. repeated unblock -> review cycles never trip block-loop accounting.
+
+    ``review_no_verdict`` is a neutral audit outcome, not a worker/operator
+    ``kanban_block`` — cycling through several no-verdict parks and
+    unblocks must never touch ``block_recurrences`` or route the card to
+    ``triage`` the way a same-cause re-block would.
+    """
+    task_id, _review = _claimed_review(conn, "Repeatedly idle reviewer")
+    for i in range(5):
+        crashed = _drive_worker_exit(conn, task_id, 882000 + i, 0)
+        assert crashed == []
+        task = kb.get_task(conn, task_id)
+        assert task is not None
+        assert task.status == "blocked"
+        assert task.block_recurrences == 0
+        assert kb.unblock_task(conn, task_id)
+        resumed = kb.get_task(conn, task_id)
+        assert resumed is not None
+        assert resumed.status == "review"
+        claimed = kb.claim_review_task(conn, task_id, claimer=f"reviewer:{i}")
+        assert claimed is not None
+
+    final = kb.get_task(conn, task_id)
+    assert final is not None
+    assert final.block_recurrences == 0
+    assert final.status != "triage"
+    events = kb.list_events(conn, task_id)
+    assert not any(e.kind == "block_loop_detected" for e in events)
+
+
+def test_review_source_protocol_streak_trip_never_promotes_via_recompute_ready(
+    conn,
+) -> None:
+    """3. review-source protocol streak trips -> recompute_ready never
+    writes ``promoted {status: review}``.
+
+    Reproduces the live ``t_023d0c6a`` bug: a review-claimed run whose
+    worker exits cleanly WHILE the task is still ``running`` (i.e. NOT a
+    reviewer no-verdict park — the review-source protocol-violation path)
+    trips the force-tripped breaker after
+    ``_PROTOCOL_VIOLATION_FAILURE_LIMIT`` consecutive violations. Before
+    this fix, ``recompute_ready`` independently re-derived a higher
+    ``effective_limit`` (default/dispatcher), saw the smaller unified
+    ``consecutive_failures`` sitting under it, and wrongly emitted
+    ``promoted {status: review}`` — reopening the review claim without
+    an operator ever unblocking it.
+    """
+    task_id, review = _claimed_review(conn, "Review-source protocol streak")
+    # Simulate the shape detect_crashed_workers produces for a review-source
+    # protocol-violation streak: the main reclaim txn has ALREADY flipped
+    # the task to its source phase (``review``, from the claimed event's
+    # ``source_status``) before the post-txn accounting loop calls
+    # ``_record_task_failure(release_claim=False, ...)`` — the same
+    # call shape the streak's force-trip branch uses in
+    # ``detect_crashed_workers``.
+    with kb.write_txn(conn):
+        conn.execute(
+            "UPDATE tasks SET status = 'review', claim_lock = NULL, "
+            "claim_expires = NULL, worker_pid = NULL, current_run_id = NULL "
+            "WHERE id = ?",
+            (task_id,),
+        )
+    limit = kb._PROTOCOL_VIOLATION_FAILURE_LIMIT
+    for i in range(limit):
+        tripped = kb._record_task_failure(
+            conn,
+            task_id,
+            error="worker exited cleanly without a terminal call",
+            outcome="crashed",
+            failure_limit=limit,
+            force_trip=(i == limit - 1),
+            release_claim=False,
+            end_run=False,
+            event_payload_extra={"protocol_violations": i + 1},
+        )
+        if i < limit - 1:
+            assert tripped is False
+        else:
+            assert tripped is True
+
+    blocked = kb.get_task(conn, task_id)
+    assert blocked is not None
+    assert blocked.status == "blocked"
+    # The unified counter is far under a generous dispatcher-configured
+    # limit — exactly the mismatch that used to fool recompute_ready.
+    generous_limit = blocked.consecutive_failures + 10
+    assert kb.recompute_ready(conn, failure_limit=generous_limit) == 0
+    still_blocked = kb.get_task(conn, task_id)
+    assert still_blocked is not None
+    assert still_blocked.status == "blocked"
+    events = kb.list_events(conn, task_id)
+    assert not any(
+        e.kind == "promoted" and (e.payload or {}).get("status") == "review"
+        for e in events
+    )
+
+    # Only an explicit unblock recovers it.
+    assert kb.unblock_task(conn, task_id)
+    assert kb.get_task(conn, task_id).status == "review"

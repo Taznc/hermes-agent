@@ -192,7 +192,10 @@ Sizes: `default`, `xs`, `overlay` (titlebar glyph counts).
   nodes for title/description so Radix `DialogTitle`/`Description` can flow
   through for a11y.
 - **Logs:** `LogView` — no bg, hairline border, tight padding, small mono.
-  Every place we surface raw logs uses it.
+  Every place we surface raw logs uses it. Default mode wraps short status
+  lines to fit (install/boot-failure overlays). Pass `numbered content=`
+  for a line-numbered variant that never wraps mid-token — gutter + text
+  scroll horizontally together instead (the kanban worker log).
 - **Empty:** `EmptyState` for plain page bodies; `PanelEmpty` for overlay
   master/detail empties with an icon and action. Don't hand-roll a third
   centered empty.

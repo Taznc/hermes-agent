@@ -466,6 +466,18 @@ declare global {
       getDevMainBundleStale: () => Promise<{ stale: boolean; supported: boolean }>
       restartForDevBundle: () => Promise<{ ok: boolean; reason?: string }>
       onDevMainBundleStale: (callback: (payload: { stale: boolean }) => void) => () => void
+      /** Dev-only: whether backend Python source (agent/ tui_gateway/ tools/
+       *  hermes_cli/) the running `hermes serve` child already imported has
+       *  changed on disk. `supported` is false in a packaged build and when
+       *  the primary backend is remote (Phase 2.9). */
+      getDevBackendStale: () => Promise<{
+        state: 'fresh' | 'stale' | 'restarting' | 'failed'
+        supported: boolean
+      }>
+      restartDevBackend: () => Promise<{ ok: boolean; reason?: string }>
+      onDevBackendStale: (
+        callback: (payload: { state: 'fresh' | 'stale' | 'restarting' | 'failed' }) => void
+      ) => () => void
       getRemoteDisplayReason?: () => Promise<string | null>
       updates: {
         check: () => Promise<DesktopUpdateStatus>
