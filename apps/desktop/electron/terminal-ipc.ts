@@ -13,6 +13,7 @@ import nodePty from 'node-pty'
 import { resolveTerminalConnection } from './connection-apply'
 import { ensureSpawnHelperExecutable } from './spawn-helper-perms'
 import { buildInteractiveSshArgs } from './ssh-connection'
+import { SSH_BINARY_MISSING_MESSAGE } from './ssh-binary'
 import { buildWindowsInteractiveCommand } from './windows-remote-lifecycle'
 
 export interface TerminalIpcDeps {
@@ -22,6 +23,8 @@ export interface TerminalIpcDeps {
   activeSshTerminalTarget: () => unknown
   ensureBackend: () => Promise<unknown>
   getSshConnectionState: (scope: string) => undefined | { remotePlatform?: string }
+  /** Shared System32 → PATH → Git-for-Windows ladder (see ssh-binary.ts). */
+  resolveSshBinary: () => null | string
 }
 
 export interface TerminalIpcApi {
@@ -36,7 +39,8 @@ export function registerTerminalIpc({
   rememberLog,
   activeSshTerminalTarget,
   ensureBackend,
-  getSshConnectionState
+  getSshConnectionState,
+  resolveSshBinary
 }: TerminalIpcDeps): TerminalIpcApi {
   const terminalSessions = new Map()
 
@@ -301,15 +305,23 @@ export function registerTerminalIpc({
         ? buildWindowsInteractiveCommand(String(payload?.cwd || '').trim())
         : undefined
 
-    const ptyProcess = remote
-      ? nodePty.spawn(
-          process.platform === 'win32'
-            ? path.join(process.env.SystemRoot || 'C:\\Windows', 'System32', 'OpenSSH', 'ssh.exe')
-            : 'ssh',
-          buildInteractiveSshArgs(sshTarget.ssh, String(payload?.cwd || '').trim(), undefined, remoteCommand),
-          { cols, cwd: app.getPath('home'), env: terminalShellEnv(), name: 'xterm-256color', rows }
-        )
-      : nodePty.spawn(command, args, { cols, cwd, env: terminalShellEnv(), name: 'xterm-256color', rows })
+    let ptyProcess
+
+    if (remote) {
+      const sshBinary = resolveSshBinary()
+
+      if (!sshBinary) {
+        throw new Error(SSH_BINARY_MISSING_MESSAGE)
+      }
+
+      ptyProcess = nodePty.spawn(
+        sshBinary,
+        buildInteractiveSshArgs(sshTarget.ssh, String(payload?.cwd || '').trim(), undefined, remoteCommand),
+        { cols, cwd: app.getPath('home'), env: terminalShellEnv(), name: 'xterm-256color', rows }
+      )
+    } else {
+      ptyProcess = nodePty.spawn(command, args, { cols, cwd, env: terminalShellEnv(), name: 'xterm-256color', rows })
+    }
 
     terminalSessions.set(id, {
       pty: ptyProcess,

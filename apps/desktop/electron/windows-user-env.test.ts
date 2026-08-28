@@ -54,8 +54,8 @@ test('readWindowsUserEnvVar returns null off Windows without spawning', () => {
   assert.equal(spawned, false)
 })
 
-test('readWindowsUserEnvVar queries HKCU\\Environment and expands the value', () => {
-  const calls = []
+test('readWindowsUserEnvVar routes through PowerShell with UTF-8 console output', () => {
+  const calls: any[] = []
 
   const exec = (cmd, args) => {
     calls.push([cmd, args])
@@ -70,7 +70,27 @@ test('readWindowsUserEnvVar queries HKCU\\Environment and expands the value', ()
   })
 
   assert.equal(value, 'F:\\Hermes')
-  assert.deepEqual(calls, [['reg', ['query', 'HKCU\\Environment', '/v', 'HERMES_HOME']]])
+  assert.equal(calls.length, 1)
+  assert.equal(calls[0][0], 'powershell.exe')
+  // The whole `reg query ...` invocation is embedded in one -Command script
+  // (not passed as separate argv, since it now runs inside PowerShell), so
+  // assert on the script content rather than a literal argv shape.
+  const script = calls[0][1].at(-1)
+  assert.match(script, /\[Console\]::OutputEncoding = \[System\.Text\.Encoding\]::UTF8/)
+  assert.match(script, /reg 'query' 'HKCU\\Environment' '\/v' 'HERMES_HOME'/)
+})
+
+test('readWindowsUserEnvVar survives non-ASCII values a naive UTF-8 decode of reg output would mangle', () => {
+  // Simulates reg.exe emitting console-codepage bytes for a CJK path — the
+  // PowerShell wrapper is responsible for handing back correctly-decoded
+  // UTF-8 text, so from this module's perspective the "mocked buffer output"
+  // is just the already-correct decoded string PowerShell would produce.
+  const exec = () =>
+    'HKEY_CURRENT_USER\\Environment\r\n    HERMES_HOME    REG_SZ    C:\\Users\\\u674e\u96f7\\hermes\r\n'
+
+  const value = readWindowsUserEnvVar('HERMES_HOME', { platform: 'win32', exec })
+
+  assert.equal(value, 'C:\\Users\\\u674e\u96f7\\hermes')
 })
 
 test('readWindowsUserEnvVar returns null when reg exits non-zero (value missing)', () => {

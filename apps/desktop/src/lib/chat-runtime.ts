@@ -4,6 +4,7 @@ import type { QuickModelOption } from '@/app/chat/composer/types'
 import type { ClientSessionState, CommandDispatchResponse } from '@/app/types'
 import { formatRefValue } from '@/components/assistant-ui/directive-text'
 import { type ChatMessage, type ChatMessagePart, chatMessageText, textPart } from '@/lib/chat-messages'
+import { cleanPath, comparisonPath } from '@/lib/path-compare'
 import { normalize } from '@/lib/text'
 import type { ComposerAttachment } from '@/store/composer'
 import type { ModelOptionsResponse, SessionInfo } from '@/types/hermes'
@@ -130,14 +131,22 @@ export function isImageGenerationTool(name?: string): boolean {
   return name === 'image_generate'
 }
 
+// A local Windows backend reports backslash cwds (and, for a mapped drive or
+// UNC share, different case than the frontend's spelling); route the prefix
+// strip through the shared path-compare helpers so a Windows-shaped cwd still
+// collapses `path` to its repo-relative form instead of rendering the full
+// absolute path in chat.
 export function contextPath(path: string, cwd: string): string {
   if (!cwd) {
     return path
   }
 
-  const normalizedCwd = cwd.endsWith('/') ? cwd : `${cwd}/`
+  const cleanedPath = cleanPath(path)
+  const comparePath = comparisonPath(cleanedPath)
+  const compareCwd = comparisonPath(cleanPath(cwd))
+  const prefix = `${compareCwd}/`
 
-  return path.startsWith(normalizedCwd) ? path.slice(normalizedCwd.length) : path
+  return comparePath.startsWith(prefix) ? cleanedPath.slice(prefix.length) : path
 }
 
 // IDs are content-derived (`kind:value`), not uuids, so upsertAttachment's
