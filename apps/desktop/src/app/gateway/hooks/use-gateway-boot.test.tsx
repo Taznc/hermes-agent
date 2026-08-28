@@ -4,6 +4,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { $desktopBoot } from '@/store/boot'
 import { closeSecondaryGateways, isActivePrimary } from '@/store/gateway'
 import { reconnectGateway } from '@/store/gateway-reconnect'
+import { $notifications } from '@/store/notifications'
 import { $activeGatewayProfile, $profiles, ensureGatewayProfile } from '@/store/profile'
 import { $connection, $currentCwd, $gatewayState } from '@/store/session'
 import { $sessionTiles } from '@/store/session-states'
@@ -245,6 +246,7 @@ beforeEach(() => {
   ;(globalThis as { WebSocket: unknown }).WebSocket = FakeWebSocket
   ;(window as { hermesDesktop?: unknown }).hermesDesktop = fakeDesktop()
   $gatewayState.set('idle')
+  $notifications.set([])
   $desktopBoot.set({
     error: null,
     fakeMode: false,
@@ -297,6 +299,30 @@ async function flushAsync() {
 async function advanceBackoff() {
   await act(async () => {
     await vi.advanceTimersByTimeAsync(15_000)
+  })
+}
+
+// Like advanceBackoff, but stops as soon as a new socket is dialed (a new
+// FakeWebSocket instance appears) instead of always burning a full 15s. Used
+// where the assertion cares about state right after ONE reconnect attempt
+// settles — burning the full backoff cap risks also crossing an unrelated
+// timer in the same window (e.g. a toast's auto-dismiss).
+async function advanceUntilNextAttempt(maxMs = 16_000, stepMs = 50) {
+  const startInstances = FakeWebSocket.instances.length
+  let elapsed = 0
+
+  while (elapsed < maxMs && FakeWebSocket.instances.length === startInstances) {
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(stepMs)
+    })
+    elapsed += stepMs
+  }
+
+  // Let the newly-dialed socket's queued open/error microtask and the
+  // reconnect handler's subsequent awaits (refreshHermesConfig/refreshSessions)
+  // settle before the caller inspects state.
+  await act(async () => {
+    await vi.advanceTimersByTimeAsync(0)
   })
 }
 
@@ -469,6 +495,150 @@ describe('useGatewayBoot remote reconnect loop (real hook, fake socket)', () => 
 
     expect($gatewayState.get()).toBe('open')
     expect($desktopBoot.get().error).toBeNull()
+  })
+
+  // The escalation toast is time-based (25s, not the historical 5 minutes —
+  // see RECONNECT_ESCALATE_AFTER_MS's comment). A single backoff cycle must
+  // stay quiet (don't cry wolf on a blip); only once genuinely past the
+  // threshold does the non-blocking warning fire, and only once per episode.
+  // Full-jitter backoff delays are randomized (see reconnect-backoff.ts), so
+  // pin Math.random for a deterministic elapsed-time budget across attempts —
+  // otherwise how many reconnect attempts fit in N advanced seconds (and thus
+  // whether the 25s mark is crossed) varies test run to test run.
+  it('does not fire the connection-lost toast before the 25s escalation threshold', async () => {
+    const randomSpy = vi.spyOn(Math, 'random').mockReturnValue(0.5)
+
+    try {
+      render(<Harness />)
+      await flushAsync()
+
+      FakeWebSocket.mode = 'fail'
+      act(() => FakeWebSocket.instances[0].drop())
+      await flushAsync()
+
+      // One backoff cycle (~15s of advanced mock time) is well under the 25s
+      // threshold: with random pinned at 0.5, cumulative attempt delays only
+      // reach ~9.45s of elapsed failure time by the 15s mark.
+      await advanceBackoff()
+
+      expect($notifications.get().some(n => n.title === 'Lost connection to the gateway')).toBe(false)
+    } finally {
+      randomSpy.mockRestore()
+    }
+  })
+
+  it('fires exactly one connection-lost toast once the reconnect loop has been failing past 25s', async () => {
+    const randomSpy = vi.spyOn(Math, 'random').mockReturnValue(0.5)
+
+    try {
+      render(<Harness />)
+      await flushAsync()
+
+      FakeWebSocket.mode = 'fail'
+      act(() => FakeWebSocket.instances[0].drop())
+      await flushAsync()
+
+      // With random pinned at 0.5, cumulative attempt delays cross the 25s
+      // mark around 32s of elapsed failure time — three 15s cycles (45s)
+      // comfortably covers it regardless of exactly which attempt trips it.
+      await advanceBackoff()
+      await advanceBackoff()
+      await advanceBackoff()
+
+      const lostToasts = $notifications.get().filter(n => n.title === 'Lost connection to the gateway')
+
+      expect(lostToasts).toHaveLength(1)
+      expect(lostToasts[0]?.message).toBe(
+        'Still retrying in the background. You can keep reading and drafting — open Gateway settings if this persists.'
+      )
+
+      // Escalation is once-per-episode: further failing cycles must not stack
+      // duplicate toasts.
+      await advanceBackoff()
+      await advanceBackoff()
+
+      expect($notifications.get().filter(n => n.title === 'Lost connection to the gateway')).toHaveLength(1)
+    } finally {
+      randomSpy.mockRestore()
+    }
+  })
+
+  it('surfaces a warning once refreshSessions fails on two consecutive post-reconnect attempts', async () => {
+    const refreshSessions = vi.fn(async () => {
+      throw new Error('refresh failed')
+    })
+
+    render(<Harness refreshSessions={refreshSessions} />)
+    await flushAsync()
+    expect($gatewayState.get()).toBe('open')
+
+    // First drop + reconnect: the socket comes back up (mode stays 'open')
+    // but refreshSessions keeps failing — one miss is normal jitter, so no
+    // toast yet. Advance in small increments (rather than a full 15s backoff
+    // cap) so we inspect state right after the attempt settles, before the
+    // toast's own 8s auto-dismiss timer would also fire in the same jump.
+    act(() => FakeWebSocket.instances[0].drop())
+    await advanceUntilNextAttempt()
+
+    expect($gatewayState.get()).toBe('open')
+    expect(refreshSessions).toHaveBeenCalledTimes(2)
+    expect(
+      $notifications.get().some(n => n.message === 'Reconnected, but sessions/settings could not refresh. Some lists may be stale.')
+    ).toBe(false)
+
+    // Second consecutive miss in a row: now surface it once.
+    act(() => FakeWebSocket.instances[FakeWebSocket.instances.length - 1].drop())
+    await advanceUntilNextAttempt()
+
+    expect(refreshSessions).toHaveBeenCalledTimes(3)
+
+    const staleToasts = $notifications
+      .get()
+      .filter(n => n.message === 'Reconnected, but sessions/settings could not refresh. Some lists may be stale.')
+
+    expect(staleToasts).toHaveLength(1)
+  })
+
+  it('resets the refresh-failure streak after a clean success, allowing a later notice to fire again', async () => {
+    let shouldFail = true
+    const refreshSessions = vi.fn(async () => {
+      if (shouldFail) {
+        throw new Error('refresh failed')
+      }
+    })
+
+    render(<Harness refreshSessions={refreshSessions} />)
+    await flushAsync()
+
+    act(() => FakeWebSocket.instances[0].drop())
+    await advanceUntilNextAttempt()
+    act(() => FakeWebSocket.instances[FakeWebSocket.instances.length - 1].drop())
+    await advanceUntilNextAttempt()
+
+    expect(
+      $notifications
+        .get()
+        .filter(n => n.message === 'Reconnected, but sessions/settings could not refresh. Some lists may be stale.')
+    ).toHaveLength(1)
+
+    // A clean reconnect (both refreshes succeed) resets the streak.
+    shouldFail = false
+    act(() => FakeWebSocket.instances[FakeWebSocket.instances.length - 1].drop())
+    await advanceUntilNextAttempt()
+
+    // Two more consecutive failures after the reset should surface a SECOND,
+    // independent notice rather than staying silent forever.
+    shouldFail = true
+    act(() => FakeWebSocket.instances[FakeWebSocket.instances.length - 1].drop())
+    await advanceUntilNextAttempt()
+    act(() => FakeWebSocket.instances[FakeWebSocket.instances.length - 1].drop())
+    await advanceUntilNextAttempt()
+
+    expect(
+      $notifications
+        .get()
+        .filter(n => n.message === 'Reconnected, but sessions/settings could not refresh. Some lists may be stale.')
+    ).toHaveLength(2)
   })
 
   it('a getConnection() that hangs on reconnect does not permanently latch the backoff loop (#93454)', async () => {
