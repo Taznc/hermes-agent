@@ -78,6 +78,7 @@ import {
   transcriptBackfillAvailable
 } from './transcript-backfill'
 import { advanceTranscriptWindow, type TranscriptWindowState } from './transcript-window'
+import { useTranscriptWindowPagesDecay } from './use-transcript-window-pages-decay'
 
 interface ChatViewProps extends Omit<React.ComponentProps<'div'>, 'onSubmit'> {
   gateway: HermesGateway | null
@@ -262,6 +263,14 @@ function ChatRuntimeBoundary({
 
     return next.window
   }, [messages, windowPages])
+
+  // Trailing-edge decay: "Show earlier" only ever grows windowPages, so a
+  // session opened for days after one big expand keeps materializing pages
+  // the user is no longer reading. Bring it back to 1 after the user has
+  // settled at the bottom with nothing selected for a sustained interval —
+  // the same re-cut path a fresh session start already takes, just reached
+  // from idle instead of from a session swap.
+  useTranscriptWindowPagesDecay(windowPages, () => setWindowPages(1))
 
   const runtimeMessageRepository = useRuntimeMessageRepository(windowedMessages)
 

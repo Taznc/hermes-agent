@@ -1,7 +1,13 @@
 import { act, render, screen } from '@testing-library/react'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
-import { __resetElapsedTimerRegistryForTests, useElapsedSeconds, useMeasuredDuration } from './activity-timer'
+import {
+  __resetElapsedTimerRegistryForTests,
+  __TIMER_REGISTRY_MAX_FOR_TESTS,
+  __timerRegistrySizesForTests,
+  useElapsedSeconds,
+  useMeasuredDuration
+} from './activity-timer'
 
 function Probe({ active, since, timerKey }: { active: boolean; since?: number; timerKey?: string }) {
   const elapsed = useElapsedSeconds(active, timerKey, since)
@@ -184,5 +190,42 @@ describe('useMeasuredDuration', () => {
     probe.rerender(<DurationProbe active={false} timerKey="reasoning:background" />)
 
     expect(screen.getByTestId('measured').textContent).toBe('5')
+  })
+})
+
+describe('timer registry bounded LRU', () => {
+  beforeEach(() => {
+    vi.useFakeTimers()
+    vi.setSystemTime(new Date('2026-01-01T00:00:00.000Z'))
+    __resetElapsedTimerRegistryForTests()
+  })
+
+  afterEach(() => {
+    vi.useRealTimers()
+    __resetElapsedTimerRegistryForTests()
+  })
+
+  it('caps startedAtByKey so distinct keys cannot grow the registry unbounded', () => {
+    const overflow = 50
+
+    for (let i = 0; i < __TIMER_REGISTRY_MAX_FOR_TESTS + overflow; i++) {
+      const probe = render(<Probe active timerKey={`tool:${i}`} />)
+      probe.unmount()
+    }
+
+    expect(__timerRegistrySizesForTests().startedAtByKey).toBeLessThanOrEqual(__TIMER_REGISTRY_MAX_FOR_TESTS)
+  })
+
+  it('caps durationByKey the same way once entries finish', () => {
+    const overflow = 20
+
+    for (let i = 0; i < __TIMER_REGISTRY_MAX_FOR_TESTS + overflow; i++) {
+      const key = `reasoning:${i}`
+      const probe = render(<DurationProbe active timerKey={key} />)
+      probe.rerender(<DurationProbe active={false} timerKey={key} />)
+      probe.unmount()
+    }
+
+    expect(__timerRegistrySizesForTests().durationByKey).toBeLessThanOrEqual(__TIMER_REGISTRY_MAX_FOR_TESTS)
   })
 })

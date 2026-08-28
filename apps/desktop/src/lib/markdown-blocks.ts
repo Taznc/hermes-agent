@@ -35,8 +35,52 @@ import { parseMarkdownIntoBlocks } from '@assistant-ui/react-streamdown'
  * full lex, i.e. exactly the previous behavior.
  */
 
-const EXACT_CACHE_MAX = 256
+// Byte-budgeted instead of count-bounded: a count cap of 256 bounds how many
+// DISTINCT texts are cached, not how much memory they cost. Long streamed
+// replies (tens of KB each) can pin tens of MB behind 256 entries — the very
+// "creeps over days" class this module's cache exists to fix should not
+// itself be one. Approximate size (2 bytes/UTF-16 code unit, key + every
+// cached block string) is tracked per entry so eviction can run purely off a
+// running total instead of re-measuring the whole cache on every write.
+const EXACT_CACHE_BYTE_BUDGET = 4 * 1024 * 1024
 const exactCache = new Map<string, string[]>()
+const exactCacheBytes = new Map<string, number>()
+let exactCacheTotalBytes = 0
+
+function approxByteSize(markdown: string, blocks: string[]): number {
+  let size = markdown.length * 2
+
+  for (const block of blocks) {
+    size += block.length * 2
+  }
+
+  return size
+}
+
+function exactCacheDelete(key: string): void {
+  const size = exactCacheBytes.get(key)
+
+  if (size !== undefined) {
+    exactCacheTotalBytes -= size
+    exactCacheBytes.delete(key)
+  }
+
+  exactCache.delete(key)
+}
+
+function exactCacheSet(key: string, blocks: string[]): void {
+  const size = approxByteSize(key, blocks)
+
+  exactCache.set(key, blocks)
+  exactCacheBytes.set(key, size)
+  exactCacheTotalBytes += size
+
+  while (exactCacheTotalBytes > EXACT_CACHE_BYTE_BUDGET && exactCache.size > 1) {
+    const oldestKey = exactCache.keys().next().value as string
+
+    exactCacheDelete(oldestKey)
+  }
+}
 
 // Streaming messages grow monotonically, and only a handful stream at once
 // (main reply + reasoning part, maybe a tile). A tiny ring is enough; each
@@ -118,9 +162,22 @@ export function parseMarkdownIntoBlocksCached(markdown: string): string[] {
   const hit = exactCache.get(markdown)
 
   if (hit) {
-    // Refresh recency (Map iteration order is insertion order).
+    // Refresh recency (Map iteration order is insertion order): re-set both
+    // the blocks and their tracked byte size so eviction still walks
+    // oldest-first without double-counting the entry's bytes.
+    const size = exactCacheBytes.get(markdown)
+
     exactCache.delete(markdown)
+
+    if (size !== undefined) {
+      exactCacheBytes.delete(markdown)
+    }
+
     exactCache.set(markdown, hit)
+
+    if (size !== undefined) {
+      exactCacheBytes.set(markdown, size)
+    }
 
     return hit
   }
@@ -128,11 +185,21 @@ export function parseMarkdownIntoBlocksCached(markdown: string): string[] {
   const blocks = lexIncrementally(markdown) ?? parseMarkdownIntoBlocks(markdown)
 
   rememberAppend(markdown, blocks)
-  exactCache.set(markdown, blocks)
-
-  if (exactCache.size > EXACT_CACHE_MAX) {
-    exactCache.delete(exactCache.keys().next().value as string)
-  }
+  exactCacheSet(markdown, blocks)
 
   return blocks
+}
+
+// Test-only introspection: the byte-budget eviction is a memory-shape
+// contract that isn't otherwise observable from the cached parser's return
+// value (eviction never changes correctness, only what's retained).
+export function __exactCacheStatsForTests() {
+  return { entries: exactCache.size, totalBytes: exactCacheTotalBytes }
+}
+
+export function __resetMarkdownBlocksCachesForTests() {
+  exactCache.clear()
+  exactCacheBytes.clear()
+  exactCacheTotalBytes = 0
+  appendCache.length = 0
 }
