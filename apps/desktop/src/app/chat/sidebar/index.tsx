@@ -18,10 +18,8 @@ import {
 } from '@/components/ui/sidebar'
 import { TipKeybindLabel } from '@/components/ui/tooltip'
 import { useContributions } from '@/contrib/react/use-contributions'
-import { searchSessions, type SessionInfo, type SessionSearchResult } from '@/hermes'
 import { useI18n } from '@/i18n'
 import { comboTokens } from '@/lib/keybinds/combo'
-import { sessionMatchesSearch } from '@/lib/session-search'
 import { cn } from '@/lib/utils'
 import { $bindings } from '@/store/keybinds'
 import {
@@ -40,7 +38,7 @@ import { openRouteTile } from '@/store/route-tiles'
 import { $sessions } from '@/store/session'
 import { $focusedStoredSessionId, type SplitDir } from '@/store/session-states'
 import { markSessionUnread } from '@/store/session-unread-remote'
-import { $sidebarSessionByAnyId, $sidebarShowSessionSections, $sidebarSortedSessions, $sidebarWorktreeGroupingActive } from '@/store/sidebar-model'
+import { $sidebarShowSessionSections, $sidebarWorktreeGroupingActive } from '@/store/sidebar-model'
 
 import {
   type AppView,
@@ -60,8 +58,8 @@ import { SidebarPinsSection } from './pins-section'
 import { ProfileRail } from './profile-switcher'
 import { ProjectDialog } from './project-dialog'
 import { WorktreeDialog } from './projects/worktree-dialog'
-import { SidebarBlankState, SidebarSessionSkeletons } from './section-states'
-import { SidebarSessionsSection } from './sessions-section'
+import { SidebarSearchSection } from './search-section'
+import { SidebarBlankState } from './section-states'
 import { CONTEXT_SPLIT_KIT, SplitSubmenu } from './split-submenu'
 import { SidebarWorkspaceSection } from './workspace-section'
 
@@ -102,42 +100,6 @@ const SIDEBAR_NAV: SidebarNavItem[] = [
     keybindActionId: 'nav.cron'
   }
 ]
-
-// FTS results cover sessions that aren't in the loaded page; synthesize a
-// minimal SessionInfo so they render in the same row component (resume works
-// by id; the snippet stands in for the preview).
-
-// The backend's FTS layer wraps matched terms in literal '>>>' / '<<<'
-// highlight markers (sqlite snippet() delimiters — see hermes_state_search.py).
-// The sidebar renders the snippet as plain text, so the markers must be
-// stripped or a search for "foo" paints rows titled ">>>foo<<<".
-// Exported for tests.
-export function stripFtsMarkers(snippet: string): string {
-  return snippet.replaceAll('>>>', '').replaceAll('<<<', '')
-}
-
-function searchResultToSession(result: SessionSearchResult): SessionInfo {
-  const ts = result.session_started ?? Date.now() / 1000
-
-  return {
-    archived: false,
-    cwd: null,
-    ended_at: null,
-    id: result.session_id,
-    _lineage_root_id: result.lineage_root ?? null,
-    input_tokens: 0,
-    is_active: false,
-    last_active: ts,
-    message_count: 0,
-    model: result.model ?? null,
-    output_tokens: 0,
-    preview: stripFtsMarkers(result.snippet ?? '').trim() || null,
-    source: result.source ?? null,
-    started_at: ts,
-    title: null,
-    tool_call_count: 0
-  }
-}
 
 interface ChatSidebarProps extends React.ComponentProps<typeof Sidebar> {
   currentView: AppView
@@ -223,8 +185,6 @@ export function ChatSidebar({
   const newSessionCombo = useStore($bindings)['session.new']?.[0]
   const newSessionKbd = newSessionCombo ? comboTokens(newSessionCombo) : []
   const [searchQuery, setSearchQuery] = useState('')
-  const [serverMatches, setServerMatches] = useState<SessionSearchResult[]>([])
-  const [searchPending, setSearchPending] = useState(false)
   const [newSessionKbdFlash, setNewSessionKbdFlash] = useState(false)
   const searchInputRef = useRef<HTMLInputElement>(null)
   const trimmedQuery = searchQuery.trim()
@@ -274,70 +234,6 @@ export function ChatSidebar({
     },
     [s.row.unreadFailed]
   )
-
-  // Full-text search across *all* sessions (not just the loaded page) so many
-  // sessions stay findable. Debounced; loaded sessions are matched instantly
-  // client-side and merged ahead of the server hits.
-  useEffect(() => {
-    if (!trimmedQuery) {
-      setServerMatches([])
-      setSearchPending(false)
-
-      return
-    }
-
-    let cancelled = false
-
-    setSearchPending(true)
-
-    const id = window.setTimeout(() => {
-      void searchSessions(trimmedQuery)
-        .then(res => {
-          if (!cancelled) {
-            setServerMatches(res.results)
-          }
-        })
-        .catch(() => undefined)
-        .finally(() => {
-          if (!cancelled) {
-            setSearchPending(false)
-          }
-        })
-    }, 200)
-
-    return () => {
-      cancelled = true
-      window.clearTimeout(id)
-    }
-  }, [trimmedQuery])
-
-  const sortedSessions = useStore($sidebarSortedSessions)
-  const sessionByAnyId = useStore($sidebarSessionByAnyId)
-
-  const searchResults = useMemo(() => {
-    if (!trimmedQuery) {
-      return []
-    }
-
-    const out = new Map<string, SessionInfo>()
-
-    for (const sess of sortedSessions) {
-      if (sessionMatchesSearch(sess, trimmedQuery)) {
-        out.set(sess.id, sess)
-      }
-    }
-
-    for (const match of serverMatches) {
-      if (out.has(match.session_id)) {
-        continue
-      }
-
-      const loaded = sessionByAnyId.get(match.session_id)
-      out.set(match.session_id, loaded ?? searchResultToSession(match))
-    }
-
-    return [...out.values()]
-  }, [trimmedQuery, sortedSessions, serverMatches, sessionByAnyId])
 
   return (
     <Sidebar
@@ -465,30 +361,17 @@ export function ChatSidebar({
         {showSessionSections && (
           <div className={cn('flex min-h-0 flex-1 flex-col pb-1.75', SIDEBAR_SCROLL_Y, '[scrollbar-gutter:stable]')}>
             {trimmedQuery ? (
-              <SidebarSessionsSection
+              <SidebarSearchSection
                 activeSessionId={activeSidebarSessionId}
                 contentClassName={cn('flex min-h-0 flex-1 flex-col gap-px pb-1.75', SIDEBAR_SCROLL_Y)}
-                emptyState={
-                  searchPending ? (
-                    <SidebarSessionSkeletons />
-                  ) : (
-                    <div className="wrap-anywhere grid min-h-24 place-items-center rounded-lg px-2 text-center text-xs text-(--ui-text-tertiary)">
-                      {s.noMatch(trimmedQuery)}
-                    </div>
-                  )
-                }
-                label={s.results}
                 onArchiveSession={onArchiveSession}
                 onBranchSession={onBranchSession}
                 onDeleteSession={onDeleteSession}
                 onResumeSession={onResumeSession}
-                onToggle={() => undefined}
                 onTogglePin={pinSession}
                 onToggleUnread={toggleUnread}
-                open
-                pinned={false}
+                query={trimmedQuery}
                 rootClassName="min-h-32 flex-1 overflow-hidden p-0"
-                sessions={searchResults}
               />
             ) : (
               <>
