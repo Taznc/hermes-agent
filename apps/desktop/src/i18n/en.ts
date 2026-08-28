@@ -94,6 +94,11 @@ export const en: Translations = {
       remoteTitle: 'Remote gateway sign-in required',
       remoteDescription:
         'Your remote gateway session has expired. Sign in again to reconnect. Nothing here deletes your chats or settings.',
+      wsAuthTitle: 'Sign-in required',
+      wsAuthDescription:
+        "Hermes is running and responding normally — only the live connection's access credential was rejected. Nothing here deletes your chats or settings.",
+      wsAuthHint:
+        'Open the link you were given to reach this Hermes instance again (it carries a fresh credential), or ask whoever set it up for a new one.',
       retry: 'Retry',
       repairInstall: 'Repair install',
       useLocalGateway: 'Use local gateway',

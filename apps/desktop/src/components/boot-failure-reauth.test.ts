@@ -7,9 +7,11 @@ import {
   isRemoteConfig,
   isRemoteReauthError,
   isRemoteReauthFailure,
+  isWsAuthRejectedFailure,
   shouldApplyPostBootProgressError,
   signInLabel,
-  sshFailureMessage
+  sshFailureMessage,
+  wsAuthRejectedMessage
 } from './boot-failure-reauth'
 
 function config(overrides: Partial<DesktopConnectionConfig> = {}): DesktopConnectionConfig {
@@ -189,5 +191,20 @@ describe('signInLabel', () => {
 
   it('null reauth falls back to the generic provider phrase', () => {
     expect(signInLabel(null)).toBe('Sign in with your identity provider')
+  })
+})
+
+describe('wsAuthRejectedMessage / isWsAuthRejectedFailure', () => {
+  it('round-trips: a message built by wsAuthRejectedMessage is recognized as auth-rejected', () => {
+    const message = wsAuthRejectedMessage('No access token was found for this session.')
+    expect(isWsAuthRejectedFailure(message)).toBe(true)
+  })
+
+  it('does not misclassify the generic gateway-down or reauth-required errors', () => {
+    expect(isWsAuthRejectedFailure('Hermes background process exited during startup.')).toBe(false)
+    expect(isWsAuthRejectedFailure('Your remote gateway session has expired.')).toBe(false)
+    expect(isWsAuthRejectedFailure('Could not connect to Hermes gateway')).toBe(false)
+    expect(isWsAuthRejectedFailure(null)).toBe(false)
+    expect(isWsAuthRejectedFailure(undefined)).toBe(false)
   })
 })
