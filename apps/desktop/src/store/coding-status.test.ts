@@ -284,4 +284,51 @@ describe('repoChangeKindForPath', () => {
 
     unsubscribe()
   })
+
+  it('matches a backslash-rooted win32 cwd against a forward-slash git path', () => {
+    // Reproduces the original bug: cwd arrives backslash-separated (a local
+    // Windows backend), git reports repo-root-relative paths with forward
+    // slashes, and the tree row's id is a path.join()'d backslash path. All
+    // three must resolve to the same lookup key.
+    $currentCwd.set('C:\\Users\\x\\proj')
+    $repoStatusByCwd.set({
+      'C:\\Users\\x\\proj': {
+        ...sampleStatus,
+        files: [{ path: 'src/a.ts', untracked: true } as HermesRepoStatus['files'][number]]
+      }
+    })
+
+    const row = repoChangeKindForPath('C:\\Users\\x\\proj\\src\\a.ts')
+
+    expect(row.get()).toBe('added')
+  })
+
+  it('matches regardless of drive-letter/segment case (NTFS case-insensitivity)', () => {
+    $currentCwd.set('c:\\users\\x\\proj')
+    $repoStatusByCwd.set({
+      'c:\\users\\x\\proj': {
+        ...sampleStatus,
+        files: [{ path: 'src/A.ts', untracked: true } as HermesRepoStatus['files'][number]]
+      }
+    })
+
+    // Tree row id spells the drive letter and casing differently than the cwd
+    // used to build the map — NTFS treats these as the same file.
+    const row = repoChangeKindForPath('C:\\Users\\x\\proj\\src\\A.ts')
+
+    expect(row.get()).toBe('added')
+  })
+
+  it('stays case-sensitive for POSIX paths', () => {
+    $currentCwd.set('/repo')
+    $repoStatusByCwd.set({
+      '/repo': {
+        ...sampleStatus,
+        files: [{ path: 'src/a.ts', untracked: true } as HermesRepoStatus['files'][number]]
+      }
+    })
+
+    expect(repoChangeKindForPath('/repo/src/a.ts').get()).toBe('added')
+    expect(repoChangeKindForPath('/repo/src/A.ts').get()).toBeUndefined()
+  })
 })
