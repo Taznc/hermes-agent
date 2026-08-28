@@ -67,8 +67,8 @@ function renderCard(overrides: Partial<KanbanTask> = {}) {
         onDelete={vi.fn()}
         onMove={vi.fn()}
         onOpen={vi.fn()}
-        onToggleSelect={vi.fn()}
         onTogglePriority={vi.fn()}
+        onToggleSelect={vi.fn()}
         selected={false}
         task={{ ...task, ...overrides }}
       />

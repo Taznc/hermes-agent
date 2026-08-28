@@ -1,4 +1,4 @@
-import { mkdtempSync, mkdirSync, writeFileSync, rmSync } from 'node:fs'
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs'
 import fs from 'node:fs'
 import { tmpdir } from 'node:os'
 import path from 'node:path'
@@ -28,6 +28,7 @@ afterEach(() => {
 function waitForRelevantEvent(watchDir: string, timeoutMs = 4000): Promise<string[]> {
   return new Promise((resolve, reject) => {
     const seen: string[] = []
+
     const timer = setTimeout(() => {
       watcher.close()
       resolve(seen)
@@ -56,6 +57,7 @@ it('a real .py write under the watched dir is detected as relevant (affordance w
 
 it('a real __pycache__ write under the watched dir is never flagged relevant (affordance stays hidden)', async () => {
   const flagged: string[] = []
+
   const watcher = fs.watch(dir, { recursive: true }, (_eventType, filename) => {
     if (isRelevantBackendPythonChange(filename ? String(filename) : null)) {
       flagged.push(String(filename))
