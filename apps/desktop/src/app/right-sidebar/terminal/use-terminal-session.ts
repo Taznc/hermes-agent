@@ -78,6 +78,11 @@ function previewSelectionLabel(): string {
 
 const HERMES_PATHS_MIME = 'application/x-hermes-paths'
 
+// Shared encoder for ack byte-counting — must match the main process's
+// Buffer.byteLength(data, 'utf8') so the flow-control accounting on both
+// sides of the ack agree on how many bytes a chunk represents.
+const textEncoder = new TextEncoder()
+
 function readEscapeSequence(data: string, index: number) {
   if (data.charCodeAt(index) !== 0x1b || index + 1 >= data.length) {
     return null
@@ -702,7 +707,7 @@ export function useTerminalSession({
       }
 
       hasSessionActivityRef.current = true
-      void terminalApi.write(id, `${paths.map(p => quotePathForShell(p, shellNameRef.current)).join(' ')} `)
+      terminalApi.write(id, `${paths.map(p => quotePathForShell(p, shellNameRef.current)).join(' ')} `)
       term.focus()
       triggerHaptic('selection')
     }
@@ -763,7 +768,7 @@ export function useTerminalSession({
 
       if (sessionId && (lastSentSize?.cols !== term.cols || lastSentSize?.rows !== term.rows)) {
         lastSentSize = { cols: term.cols, rows: term.rows }
-        void terminalApi.resize(sessionId, { cols: term.cols, rows: term.rows })
+        terminalApi.resize(sessionId, { cols: term.cols, rows: term.rows })
       }
     }
 
@@ -774,7 +779,7 @@ export function useTerminalSession({
       const id = sessionIdRef.current
 
       if (id) {
-        void terminalApi.write(id, data)
+        terminalApi.write(id, data)
       }
     })
 
@@ -877,6 +882,13 @@ export function useTerminalSession({
             terminalApi.onData(session.id, data => {
               armedWrite(data)
               scheduleSnapshot()
+              // Ack drives the main process's pause/resume flow control (see
+              // terminal-output-batcher.ts) — reporting bytes back only once
+              // this callback actually ran means a renderer whose event loop
+              // is jammed naturally stops acking, which is exactly when we
+              // want the pty to pause. TextEncoder (not .length) so the byte
+              // count matches the main side's UTF-8 Buffer.byteLength.
+              terminalApi.ack(session.id, textEncoder.encode(data).length)
             }),
             terminalApi.onExit(session.id, () => {
               // Shell exited (`exit` / Ctrl-D / crash) — drop the tab like a real

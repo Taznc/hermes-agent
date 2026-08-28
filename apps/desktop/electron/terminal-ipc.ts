@@ -13,6 +13,7 @@ import nodePty from 'node-pty'
 import { resolveTerminalConnection } from './connection-apply'
 import { ensureSpawnHelperExecutable } from './spawn-helper-perms'
 import { buildInteractiveSshArgs } from './ssh-connection'
+import { createTerminalOutputBatcher } from './terminal-output-batcher'
 import { buildWindowsInteractiveCommand } from './windows-remote-lifecycle'
 
 export interface TerminalIpcDeps {
@@ -269,6 +270,8 @@ export function registerTerminalIpc({
       return false
     }
 
+    sessionInfo.outputBatcher.dispose()
+
     try {
       sessionInfo.pty.kill()
     } catch {
@@ -354,12 +357,6 @@ export function registerTerminalIpc({
         )
       : nodePty.spawn(command, args, { cols, cwd, env: terminalShellEnv(), name: 'xterm-256color', rows })
 
-    terminalSessions.set(id, {
-      pty: ptyProcess,
-      webContentsId: event.sender.id,
-      ...(remote ? { sshScope: sshTarget.scope, remoteCwd: String(payload?.cwd || '') } : {})
-    })
-
     const send = (suffix, payload) => {
       if (event.sender.isDestroyed()) {
         return
@@ -368,9 +365,42 @@ export function registerTerminalIpc({
       event.sender.send(terminalChannel(id, suffix), payload)
     }
 
-    ptyProcess.onData(data => send('data', data))
+    // Coalesce PTY output into batched sends and apply ack-based flow control
+    // (pause the pty past the high-water mark, resume once the renderer acks
+    // enough of the outstanding backlog) — see terminal-output-batcher.ts.
+    const outputBatcher = createTerminalOutputBatcher({
+      pause: () => {
+        try {
+          ptyProcess.pause()
+        } catch {
+          // Process may already be gone.
+        }
+      },
+      resume: () => {
+        try {
+          ptyProcess.resume()
+        } catch {
+          // Process may already be gone.
+        }
+      },
+      send: data => send('data', data)
+    })
+
+    terminalSessions.set(id, {
+      outputBatcher,
+      pty: ptyProcess,
+      webContentsId: event.sender.id,
+      ...(remote ? { sshScope: sshTarget.scope, remoteCwd: String(payload?.cwd || '') } : {})
+    })
+
+    ptyProcess.onData(data => outputBatcher.push(data))
     ptyProcess.onExit(({ exitCode, signal }) => {
       forgetTerminalSession(id)
+      // Flush any output still buffered so it lands before the exit message —
+      // without this a shell's final printf could be silently dropped or
+      // reordered after 'exit' reaches the renderer.
+      outputBatcher.flush()
+      outputBatcher.dispose()
       send('exit', { code: exitCode, signal: signal || null })
     })
     trackTerminalSessionForWebContents(event.sender.id, id, event.sender)
@@ -378,31 +408,45 @@ export function registerTerminalIpc({
     return { cwd: remote ? null : cwd, id, shell: remote ? 'ssh' : name }
   })
 
-  ipcMain.handle('hermes:terminal:write', (_event, id, data) => {
+  ipcMain.on('hermes:terminal:write', (_event, id, data) => {
     const sessionInfo = terminalSessions.get(String(id || ''))
 
     if (!sessionInfo) {
-      return false
+      return
     }
 
     sessionInfo.pty.write(String(data || ''))
-
-    return true
   })
 
-  ipcMain.handle('hermes:terminal:resize', (_event, id, size = {}) => {
+  // Renderer's ack of processed output bytes, driving the pty's pause/resume
+  // flow control (see terminal-output-batcher.ts). Fire-and-forget like write:
+  // a lost ack just means flow control stays conservative for a bit longer,
+  // never a hang, since the next ack (or a fresh session) can still resume it.
+  ipcMain.on('hermes:terminal:ack', (_event, id, bytes) => {
     const sessionInfo = terminalSessions.get(String(id || ''))
 
     if (!sessionInfo) {
-      return false
+      return
+    }
+
+    const acked = Number(bytes)
+
+    if (Number.isFinite(acked) && acked > 0) {
+      sessionInfo.outputBatcher.ack(acked)
+    }
+  })
+
+  ipcMain.on('hermes:terminal:resize', (_event, id, size = {}) => {
+    const sessionInfo = terminalSessions.get(String(id || ''))
+
+    if (!sessionInfo) {
+      return
     }
 
     const cols = Math.max(2, Number.parseInt(String(size?.cols || 80), 10) || 80)
     const rows = Math.max(2, Number.parseInt(String(size?.rows || 24), 10) || 24)
 
     sessionInfo.pty.resize(cols, rows)
-
-    return true
   })
   ipcMain.handle('hermes:terminal:cwd', async (_event, id) => {
     const sessionInfo = terminalSessions.get(String(id || ''))
