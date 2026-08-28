@@ -966,7 +966,27 @@ export function startUpdatePoller(): void {
   }
 
   pollerStarted = true
-  void checkUpdates()
+  void checkUpdates().then(status => {
+    // Client update checks are disabled (desktop.auto_update_checks_enabled:
+    // false, or HERMES_DESKTOP_DISABLE_UPDATE_CHECKS) — the first check above
+    // already reported that and did no network I/O. Don't arm the 30-minute
+    // timer or the focus listener either; they'd just call checkUpdates()
+    // again every time, hitting the same no-op gate for no reason. The
+    // backend-update poller below is unaffected — it's a separate check for
+    // the Python backend's own git checkout, not the desktop client updater.
+    if (status?.reason === 'update-checks-disabled') {
+      return
+    }
+
+    window.addEventListener('focus', onFocus)
+    backgroundTimer = setInterval(
+      () => {
+        void checkUpdates()
+        void checkBackendUpdates()
+      },
+      30 * 60 * 1000
+    )
+  })
   void checkBackendUpdates()
   void refreshDesktopVersion()
   bridge.onProgress(ingestProgress)
@@ -985,15 +1005,6 @@ export function startUpdatePoller(): void {
       void checkBackendUpdates()
     }
   })
-
-  window.addEventListener('focus', onFocus)
-  backgroundTimer = setInterval(
-    () => {
-      void checkUpdates()
-      void checkBackendUpdates()
-    },
-    30 * 60 * 1000
-  )
 }
 
 export function stopUpdatePoller(): void {
