@@ -893,6 +893,11 @@ export const en: Translations = {
       keychainEncryptionDesc:
         'Off by default. When on, gateway tokens and sign-in credentials are encrypted with your system keychain (Keychain Access, GNOME Keyring, or Windows DPAPI) — your system may ask for permission or a password. When off, they are stored as plain files readable only by your user account.',
       keychainEncryptionFailed: 'Could not change secret encryption',
+      secretStorageHintTitle: 'Stored without OS keychain encryption',
+      secretStorageHintDesc:
+        'Gateway tokens and sign-in credentials are stored as plain files readable only by your user account. Enable OS keychain encryption below for stronger protection.',
+      secretStorageHintEnable: 'Enable encryption',
+      secretStorageHintDismiss: 'Dismiss',
       testRemote: 'Test remote',
       saveForRestart: 'Save for next restart',
       saveAndReconnect: 'Save and reconnect',

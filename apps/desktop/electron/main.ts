@@ -305,8 +305,11 @@ import { attachRendererConsoleCapture, formatRendererBoundaryReport } from './re
 import {
   classifyStoredSecret,
   readSecretStoragePolicy,
+  resolveSecureTokenStorageState,
+  SECRET_STORAGE_LAST_ON_MARKER_FILE,
   SECRET_STORAGE_POLICY_FILE,
   type SecretStoragePolicy,
+  type SecureTokenStorageState,
   writeSecretStoragePolicy
 } from './secret-storage-policy'
 import {
@@ -7421,15 +7424,49 @@ function _nativeTokenStoreIo(): NativeTokenStoreIo {
     encrypt: encryptDesktopSecret,
     decrypt: decryptDesktopSecret,
     readStoreText: () => fs.readFileSync(_nativeTokenStorePath(), 'utf8'),
+    // Atomic (temp file + rename, owner-only mode) via the same helper the
+    // adjacent secret-storage-policy.json write uses — a crash/power-loss/
+    // full-disk failure mid-write can now only ever leave the OLD file intact
+    // or the NEW file complete, never a truncated hybrid that reads as an
+    // empty store and silently drops every other gateway's tokens on the
+    // next persist.
     writeStoreText: (text: string) => {
       fs.mkdirSync(path.dirname(_nativeTokenStorePath()), { recursive: true })
-      fs.writeFileSync(_nativeTokenStorePath(), text, { mode: 0o600 })
+      writeSecretFileAtomic(_nativeTokenStorePath(), text, { encoding: 'utf8' })
+    },
+    // A store that fails to JSON.parse is quarantined instead of being
+    // silently treated as empty and then overwritten on the next persist —
+    // rename it aside so the corrupt bytes aren't lost to a "recoverable"
+    // read that isn't actually recoverable once the next write lands.
+    preserveCorruptStore: () => {
+      const target = _nativeTokenStorePath()
+      const quarantined = `${target}.corrupt-${Date.now()}`
+
+      try {
+        fs.renameSync(target, quarantined)
+        rememberLog(`[native-oauth] quarantined corrupt token store at ${quarantined}`)
+      } catch (error) {
+        rememberLog(
+          `[native-oauth] failed to quarantine corrupt token store: ${
+            error instanceof Error ? error.message : String(error)
+          }`
+        )
+      }
     },
     rememberLog
   }
 }
 
 function _persistNativeTokens(baseUrl: string, tokens: NativeTokenSet | null) {
+  // Deliberately NOT wrapped in try/catch: persistNativeTokenSet already
+  // catches its own recoverable failure (an unwritable disk) internally and
+  // only THROWS for the two authoritative-failure cases — an unusable/null
+  // keychain and a corrupt-store abort — that must surface to the caller
+  // rather than be silently absorbed. Every call site already handles that
+  // (native login falls back to the embedded flow; ensureNativeAccessToken's
+  // refresh/force-clear callers already `.catch(() => null)`), so swallowing
+  // it here would silently turn a real "your tokens may not have saved"
+  // failure into a false "everything's fine".
   persistNativeTokenSet(baseUrl, tokens, _nativeTokenStoreIo())
 }
 
@@ -8457,10 +8494,50 @@ async function cloudAgentSilentSignIn(dashboardUrl) {
 // stored secrets in place.
 // ---------------------------------------------------------------------------
 const SECRET_STORAGE_POLICY_PATH = path.join(app.getPath('userData'), SECRET_STORAGE_POLICY_FILE)
+// Independent of the policy file itself — see readSecretStoragePolicy's doc
+// comment on why "the policy file disappeared" needs a durability signal that
+// doesn't live inside the same file that can disappear.
+const SECRET_STORAGE_LAST_ON_MARKER_PATH = path.join(app.getPath('userData'), SECRET_STORAGE_LAST_ON_MARKER_FILE)
 
 const _secretStoragePolicyIo = {
   readText: () => fs.readFileSync(SECRET_STORAGE_POLICY_PATH, 'utf8'),
-  writeText: (text: string) => writeSecretFileAtomic(SECRET_STORAGE_POLICY_PATH, text, { encoding: 'utf8' })
+  writeText: (text: string) => writeSecretFileAtomic(SECRET_STORAGE_POLICY_PATH, text, { encoding: 'utf8' }),
+  // A present-but-corrupt policy file is quarantined rather than silently
+  // treated as the OFF default — see readSecretStoragePolicy's doc comment
+  // for why "corrupt while present" and "absent" must not read the same.
+  preserveCorruptPolicy: () => {
+    const quarantined = `${SECRET_STORAGE_POLICY_PATH}.corrupt-${Date.now()}`
+
+    try {
+      fs.renameSync(SECRET_STORAGE_POLICY_PATH, quarantined)
+      rememberLog(`[secret-storage] quarantined corrupt policy file at ${quarantined}`)
+    } catch (error) {
+      rememberLog(
+        `[secret-storage] failed to quarantine corrupt policy file: ${
+          error instanceof Error ? error.message : String(error)
+        }`
+      )
+    }
+  },
+  // The marker's mere PRESENCE means "last deliberate write was ON" — its
+  // content is irrelevant, only existence is checked, so a truncated/corrupt
+  // marker file still correctly answers "yes, it existed" rather than needing
+  // its own corruption-handling ladder for a one-bit signal.
+  readLastKnownOn: () => fs.existsSync(SECRET_STORAGE_LAST_ON_MARKER_PATH),
+  writeLastKnownOn: (on: boolean) => {
+    if (on) {
+      writeSecretFileAtomic(SECRET_STORAGE_LAST_ON_MARKER_PATH, String(Date.now()), { encoding: 'utf8' })
+    } else {
+      try {
+        fs.rmSync(SECRET_STORAGE_LAST_ON_MARKER_PATH, { force: true })
+      } catch {
+        // Best-effort removal; a stale marker after an explicit turn-OFF just
+        // means a future disappearance of the main policy file conservatively
+        // reads as ON again, which is the safe direction to fail in.
+      }
+    }
+  },
+  rememberLog
 }
 
 let _secretStoragePolicy: SecretStoragePolicy | null = null
@@ -8482,19 +8559,31 @@ function setSecretStoragePolicy(next: SecretStoragePolicy) {
  * Keychain availability as the renderer should see it. With encryption
  * opted out this must NOT probe safeStorage — isEncryptionAvailable() is
  * itself a keychain touch that raises the macOS dialog this feature exists
- * to avoid. We report `true` so no plain-text warning banners fire: storing
- * plaintext is the user's chosen (default) mode, not a degraded state.
+ * to avoid. We report `true` so the plain-text CONFIRMATION dialog (the
+ * "your keychain is broken, opt into plaintext to continue" flow) never
+ * fires: storing plaintext with the policy off is the user's chosen
+ * (default) mode, not a degraded state that needs a gate.
+ *
+ * This does NOT mean the renderer is blind to the real state — see
+ * probeSecureTokenStorageState() below, which both callers of this function
+ * also read and forward honestly as `secretStorageState`.
  */
 function probeSecureTokenStorage(): boolean {
-  if (!secretStoragePolicy().on) {
-    return true
-  }
+  const state = probeSecureTokenStorageState()
 
-  try {
-    return Boolean(safeStorage.isEncryptionAvailable())
-  } catch {
-    return false
-  }
+  return state.policyOn ? state.available : true
+}
+
+/**
+ * The full, honest answer to "is what I save right now actually OS-keychain
+ * encrypted?" — `{ available, policyOn }`. Unlike probeSecureTokenStorage()
+ * above (which exists only to gate the plaintext-opt-in CONFIRM dialog and
+ * intentionally reads as "fine" while the policy is off), this is what the
+ * renderer uses to show an honest, non-blocking "stored without OS keychain
+ * encryption" hint instead of asserting security it cannot back up.
+ */
+function probeSecureTokenStorageState(): SecureTokenStorageState {
+  return resolveSecureTokenStorageState(secretStoragePolicy(), () => Boolean(safeStorage.isEncryptionAvailable()))
 }
 
 /**
@@ -9145,6 +9234,12 @@ function sanitizeConnectionsRegistry(registry = readDesktopConnectionsRegistry()
   // offer the plain-text opt-in on keyring-less Linux instead of failing.
   // Policy-aware: never touches safeStorage while encryption is opted out.
   const secureTokenStorage = probeSecureTokenStorage()
+  // The renderer-facing honest state ({ available, policyOn }) so Settings can
+  // show "stored without OS keychain encryption" instead of trusting the
+  // gated `secureTokenStorage` flag above, which always reads true while the
+  // policy is off (that flag exists only to suppress the plain-text opt-in
+  // CONFIRM dialog, not to describe the actual encryption state).
+  const secretStorageState = probeSecureTokenStorageState()
 
   return {
     version: registry.version,
@@ -9152,6 +9247,7 @@ function sanitizeConnectionsRegistry(registry = readDesktopConnectionsRegistry()
     launchMode: registry.launchMode,
     lastUsed: registry.lastUsed,
     secureTokenStorage,
+    secretStorageState,
     connections: registry.connections.map(sanitizeRegistryConnection)
   }
 }
@@ -9305,6 +9401,9 @@ async function sanitizeDesktopConnectionConfig(config = readDesktopConnectionCon
   // true WITHOUT touching safeStorage — probing is itself a keychain touch
   // that raises the macOS password dialog (see probeSecureTokenStorage).
   const secureTokenStorage = probeSecureTokenStorage()
+  // The honest counterpart: { available, policyOn }. See
+  // sanitizeConnectionsRegistry for why the two are not the same signal.
+  const secretStorageState = probeSecureTokenStorageState()
 
   // Whether the currently saved token is stored in plain text (the keyring-less
   // opt-in path). The env override supplies its token from the environment, not
@@ -9342,6 +9441,10 @@ async function sanitizeDesktopConnectionConfig(config = readDesktopConnectionCon
     // Whether the OS keyring can encrypt a token; drives the plain-text opt-in
     // affordance in Settings → Gateway on keyring-less Linux.
     secureTokenStorage,
+    // The honest { available, policyOn } state (see probeSecureTokenStorageState)
+    // so the renderer can show a real "not OS-keychain encrypted" hint instead
+    // of relying on the gated `secureTokenStorage` flag above.
+    secretStorageState,
     // Whether the saved token is currently persisted in plain text.
     remoteTokenPlainText,
     sshHost: (ssh || savedSsh)?.host || '',
@@ -13741,8 +13844,22 @@ ipcMain.handle('hermes:connection-config:test', async (_event, payload) => testD
 // ── Opt-in keychain encryption for stored secrets ───────────────────────────
 // get returns the current policy without touching safeStorage; set flips it
 // and re-encodes every stored secret (see applySecretStorageEncryption).
-ipcMain.handle('hermes:secret-storage:get', async () => ({ on: secretStoragePolicy().on }))
-ipcMain.handle('hermes:secret-storage:set', async (_event: any, on: any) => applySecretStorageEncryption(on === true))
+ipcMain.handle('hermes:secret-storage:get', async () => ({
+  on: secretStoragePolicy().on,
+  secretStorageState: probeSecureTokenStorageState()
+}))
+ipcMain.handle('hermes:secret-storage:set', async (_event: any, on: any) => {
+  const result = applySecretStorageEncryption(on === true)
+
+  // Return the HONEST post-toggle state, not just the gated `on` flag — the
+  // renderer's hint needs to know immediately whether the toggle it just
+  // confirmed actually left secrets encrypted (enable can succeed at the
+  // policy level yet still read `available: false` if the keychain probe
+  // itself is flaky at exactly this instant; disable always reads as the
+  // honest "off" state). Without this, the hint stayed stale until the next
+  // unrelated getConnectionConfig() hydration.
+  return { ...result, secretStorageState: probeSecureTokenStorageState() }
+})
 
 // ── v2 connection registry IPC (multi-source) ───────────────────────────────
 // Storage-level CRUD for named agent sources. Routing/pooling consumption of

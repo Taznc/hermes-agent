@@ -1127,6 +1127,10 @@ export const zhAuthored: Translations = {
       keychainEncryptionDesc:
         '默认关闭。开启后，网关 token 和登录凭据将使用系统钥匙串（Keychain Access、GNOME Keyring 或 Windows DPAPI）加密——系统可能会请求授权或密码。关闭时，它们以仅当前用户可读的普通文件形式存储。',
       keychainEncryptionFailed: '无法更改机密加密设置',
+      secretStorageHintTitle: '未使用系统钥匙串加密存储',
+      secretStorageHintDesc: '网关 token 和登录凭据以仅当前用户可读的普通文件形式存储。可在下方启用系统钥匙串加密以获得更强保护。',
+      secretStorageHintEnable: '启用加密',
+      secretStorageHintDismiss: '关闭',
       testRemote: '测试远程',
       saveForRestart: '保存到下次重启',
       saveAndReconnect: '保存并重连',

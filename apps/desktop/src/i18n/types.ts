@@ -759,6 +759,10 @@ export interface Translations {
       keychainEncryptionTitle: string
       keychainEncryptionDesc: string
       keychainEncryptionFailed: string
+      secretStorageHintTitle: string
+      secretStorageHintDesc: string
+      secretStorageHintEnable: string
+      secretStorageHintDismiss: string
       testRemote: string
       saveForRestart: string
       saveAndReconnect: string

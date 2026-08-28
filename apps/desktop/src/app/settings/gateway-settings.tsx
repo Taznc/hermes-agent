@@ -5,7 +5,12 @@ import { ConfirmDialog } from '@/components/ui/confirm-dialog'
 import { Input } from '@/components/ui/input'
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '@/components/ui/select'
 import { Tip } from '@/components/ui/tooltip'
-import type { DesktopAuthProvider, DesktopCloudAgent, DesktopCloudOrg, DesktopConnectionProbeResult } from '@/global'
+import type {
+  DesktopAuthProvider,
+  DesktopCloudAgent,
+  DesktopCloudOrg,
+  DesktopConnectionProbeResult
+} from '@/global'
 import { useI18n } from '@/i18n'
 import { ExternalLink } from '@/lib/external-link'
 import {
@@ -15,11 +20,13 @@ import {
   FileText,
   Globe,
   HelpCircle,
+  Info,
   Loader2,
   LogIn,
   Monitor,
   RefreshCw,
-  Terminal
+  Terminal,
+  X
 } from '@/lib/icons'
 import { coerceRemoteUrlScheme } from '@/lib/remote-url'
 import { selectableCardClass } from '@/lib/selectable-card'
@@ -47,6 +54,11 @@ interface GatewaySettingsState {
   // Whether OS-keychain-backed encryption (Electron safeStorage) is available.
   // Default true so we never gate on a value we haven't hydrated yet.
   secureTokenStorage: boolean
+  // The honest { available, policyOn } counterpart to secureTokenStorage —
+  // undefined until the first getConnectionConfig() response lands (or on an
+  // older Electron main that hasn't started sending it), in which case the
+  // renderer shows no hint rather than guessing.
+  secretStorageState?: { available: boolean; policyOn: boolean }
   // Whether the currently-persisted remote token is stored as plain text on
   // disk (opted-in on a machine without secure storage). Drives the warning banner.
   remoteTokenPlainText: boolean
@@ -61,6 +73,9 @@ interface GatewaySettingsState {
 }
 
 const SSH_HOST_CUSTOM = '__custom__'
+// One-time, non-blocking "stored without OS keychain encryption" hint.
+// Dismissal is per-machine (localStorage), not per-session.
+const SECRET_STORAGE_HINT_DISMISSED_KEY = 'hermes-secret-storage-hint-dismissed-v1'
 
 const EMPTY_STATE: GatewaySettingsState = {
   envOverride: false,
@@ -164,6 +179,98 @@ export function GatewaySettings({ embedded = false }: { embedded?: boolean } = {
   const [keychainEncryption, setKeychainEncryptionState] = useState(false)
   const [keychainEncryptionBusy, setKeychainEncryptionBusy] = useState(false)
 
+  // One-time, non-blocking "stored without OS keychain encryption" hint.
+  // Doesn't nag on every app restart once the user has seen and acknowledged
+  // it — but reappears if the state genuinely CHANGES to a new unencrypted
+  // shape later (see the effect below), since that's new information. The
+  // persisted value pairs the dismiss flag with a fingerprint of the exact
+  // unencrypted state that was dismissed (`policyOn:available`), so a plain
+  // app restart that lands back on the SAME unencrypted state the user already
+  // dismissed does not resurface it — only an actual transition to a
+  // DIFFERENT unencrypted shape (e.g. the user turned encryption on, it
+  // failed, they dismissed that, and it later fails in a still-different way)
+  // counts as new information worth re-showing.
+  const secretStorageFingerprint = (s?: { available: boolean; policyOn: boolean }) =>
+    s ? `${s.policyOn}:${s.available}` : ''
+
+  const readSecretStorageDismissal = (): { dismissed: boolean; fingerprint: string } => {
+    try {
+      const raw = window.localStorage.getItem(SECRET_STORAGE_HINT_DISMISSED_KEY)
+
+      if (!raw) {
+        return { dismissed: false, fingerprint: '' }
+      }
+
+      // Back-compat with the earlier plain '1' sentinel (no fingerprint):
+      // treat it as dismissed-for-any-state-seen-so-far, which is the
+      // conservative direction (never resurfaces a hint the user already saw
+      // just because we changed the storage shape under them).
+      if (raw === '1') {
+        return { dismissed: true, fingerprint: '' }
+      }
+
+      const parsed = JSON.parse(raw)
+
+      return { dismissed: parsed?.dismissed === true, fingerprint: typeof parsed?.fingerprint === 'string' ? parsed.fingerprint : '' }
+    } catch {
+      return { dismissed: false, fingerprint: '' }
+    }
+  }
+
+  const writeSecretStorageDismissal = (dismissed: boolean, fingerprint: string) => {
+    try {
+      if (dismissed) {
+        window.localStorage.setItem(SECRET_STORAGE_HINT_DISMISSED_KEY, JSON.stringify({ dismissed: true, fingerprint }))
+      } else {
+        window.localStorage.removeItem(SECRET_STORAGE_HINT_DISMISSED_KEY)
+      }
+    } catch {
+      // localStorage unavailable — degrade silently, hint just re-shows next visit.
+    }
+  }
+
+  const [secretStorageHintDismissed, setSecretStorageHintDismissed] = useState(() => readSecretStorageDismissal().dismissed)
+  // Ref (not state) — only ever read inside the reconciliation effect below,
+  // never rendered, so it doesn't need to trigger a re-render of its own.
+  const dismissedFingerprintRef = useRef(readSecretStorageDismissal().fingerprint)
+
+  const dismissSecretStorageHint = () => {
+    const fingerprint = secretStorageFingerprint(state.secretStorageState)
+
+    setSecretStorageHintDismissed(true)
+    dismissedFingerprintRef.current = fingerprint
+    writeSecretStorageDismissal(true, fingerprint)
+  }
+
+  // A hint that was dismissed for one unencrypted shape (e.g. policy off)
+  // should resurface if the observed shape later changes to a DIFFERENT
+  // unencrypted shape (e.g. the user turned encryption on and it failed) —
+  // that is new, actionable information. It must NOT resurface merely because
+  // the app restarted and hydrated back into the exact same shape that was
+  // already dismissed; that was the bug (every restart cleared the dismissal
+  // outright). Comparing fingerprints instead of using presence/absence of a
+  // dependency change means a same-shape rehydration is a no-op here.
+  const secretStorageUnencrypted =
+    state.secretStorageState !== undefined &&
+    !(state.secretStorageState.policyOn && state.secretStorageState.available)
+
+  useEffect(() => {
+    if (!secretStorageUnencrypted) {
+      return
+    }
+
+    const fingerprint = secretStorageFingerprint(state.secretStorageState)
+
+    if (secretStorageHintDismissed && fingerprint !== dismissedFingerprintRef.current) {
+      setSecretStorageHintDismissed(false)
+      writeSecretStorageDismissal(false, '')
+    }
+    // secretStorageHintDismissed intentionally excluded: this effect only
+    // reacts to the OBSERVED STATE changing, not to its own dismissal writes,
+    // to avoid re-running immediately after dismissSecretStorageHint sets it.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [secretStorageUnencrypted, state.secretStorageState?.policyOn, state.secretStorageState?.available])
+
   useEffect(() => {
     let cancelled = false
 
@@ -172,6 +279,14 @@ export function GatewaySettings({ embedded = false }: { embedded?: boolean } = {
       .then(res => {
         if (!cancelled && res) {
           setKeychainEncryptionState(res.on === true)
+
+          // Same fixture-compatibility rule as acceptSavedConfig: an older
+          // Electron main that hasn't started sending secretStorageState
+          // simply leaves the field absent rather than clobbering whatever
+          // getConnectionConfig() already hydrated into state.
+          if (res.secretStorageState) {
+            setState(prev => ({ ...prev, secretStorageState: res.secretStorageState }))
+          }
         }
       })
       .catch(() => {})
@@ -190,6 +305,13 @@ export function GatewaySettings({ embedded = false }: { embedded?: boolean } = {
       const res = await window.hermesDesktop.setSecretStorageEncryption(on)
 
       setKeychainEncryptionState(res?.on === true)
+
+      // Refresh the honest state from the SAME response instead of waiting for
+      // a later, unrelated getConnectionConfig() hydration — this is what made
+      // the hint go stale after a successful enable/disable (round 1 review).
+      if (res?.secretStorageState) {
+        setState(prev => ({ ...prev, secretStorageState: res.secretStorageState }))
+      }
     } catch (err) {
       setKeychainEncryptionState(!on)
       notifyError(err, g.keychainEncryptionFailed)
@@ -1523,6 +1645,35 @@ export function GatewaySettings({ embedded = false }: { embedded?: boolean } = {
 
       {embedded ? null : (
         <div className="mt-6 grid gap-1">
+          {/* Honest, non-blocking hint: the gated `secureTokenStorage` flag above
+              always reads "fine" while the policy is off, so this reads the real
+              { available, policyOn } state to tell the user what's actually
+              happening instead of asserting security it can't back up. */}
+          {secretStorageUnencrypted && !secretStorageHintDismissed ? (
+            <div className="mb-2 flex items-start gap-2 rounded-xl border border-(--stroke-nous) bg-muted/40 px-3 py-2.5 text-[length:var(--conversation-caption-font-size)]">
+              <Info className="mt-0.5 size-4 shrink-0 text-(--ui-text-tertiary)" />
+              <div className="flex-1">
+                <div className="font-medium">{g.secretStorageHintTitle}</div>
+                <div className="mt-1 leading-5 text-(--ui-text-tertiary)">{g.secretStorageHintDesc}</div>
+              </div>
+              <Button
+                className="shrink-0"
+                onClick={() => void setKeychainEncryption(true)}
+                size="sm"
+                variant="text"
+              >
+                {g.secretStorageHintEnable}
+              </Button>
+              <button
+                aria-label={g.secretStorageHintDismiss}
+                className="shrink-0 text-(--ui-text-tertiary) hover:text-(--ui-text-secondary)"
+                onClick={dismissSecretStorageHint}
+                type="button"
+              >
+                <X className="size-4" />
+              </button>
+            </div>
+          ) : null}
           <ToggleRow
             checked={keychainEncryption}
             description={g.keychainEncryptionDesc}
