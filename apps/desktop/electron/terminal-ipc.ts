@@ -39,6 +39,51 @@ export function registerTerminalIpc({
   getSshConnectionState
 }: TerminalIpcDeps): TerminalIpcApi {
   const terminalSessions = new Map()
+  // One 'destroyed' listener per webContents id, not one per terminal. Every
+  // terminal start used to add its own `event.sender.once('destroyed', ...)`;
+  // a sender that opens more than ~10 terminals over its lifetime (routine on
+  // a long-lived tab) trips Node's MaxListenersExceededWarning and pins one
+  // closure per terminal ever opened on that webContents, even after the
+  // terminal itself was disposed. Track session ids per webContents id and
+  // install a single shared listener the first time that id is seen.
+  const sessionIdsByWebContentsId = new Map<number, Set<string>>()
+
+  function forgetTerminalSession(id: string) {
+    const sessionInfo = terminalSessions.get(id)
+
+    terminalSessions.delete(id)
+
+    if (sessionInfo) {
+      const siblingIds = sessionIdsByWebContentsId.get(sessionInfo.webContentsId)
+
+      siblingIds?.delete(id)
+
+      if (siblingIds && siblingIds.size === 0) {
+        sessionIdsByWebContentsId.delete(sessionInfo.webContentsId)
+      }
+    }
+
+    return sessionInfo
+  }
+
+  function trackTerminalSessionForWebContents(webContentsId: number, id: string, sender: Electron.WebContents) {
+    let siblingIds = sessionIdsByWebContentsId.get(webContentsId)
+
+    if (!siblingIds) {
+      siblingIds = new Set()
+      sessionIdsByWebContentsId.set(webContentsId, siblingIds)
+
+      sender.once('destroyed', () => {
+        for (const siblingId of [...(sessionIdsByWebContentsId.get(webContentsId) ?? [])]) {
+          disposeTerminalSession(siblingId)
+        }
+
+        sessionIdsByWebContentsId.delete(webContentsId)
+      })
+    }
+
+    siblingIds.add(id)
+  }
 
   function isExecutableFile(filePath) {
     if (!filePath || !path.isAbsolute(filePath)) {
@@ -218,13 +263,11 @@ export function registerTerminalIpc({
   }
 
   function disposeTerminalSession(id: string) {
-    const sessionInfo = terminalSessions.get(id)
+    const sessionInfo = forgetTerminalSession(id)
 
     if (!sessionInfo) {
       return false
     }
-
-    terminalSessions.delete(id)
 
     try {
       sessionInfo.pty.kill()
@@ -327,10 +370,10 @@ export function registerTerminalIpc({
 
     ptyProcess.onData(data => send('data', data))
     ptyProcess.onExit(({ exitCode, signal }) => {
-      terminalSessions.delete(id)
+      forgetTerminalSession(id)
       send('exit', { code: exitCode, signal: signal || null })
     })
-    event.sender.once('destroyed', () => disposeTerminalSession(id))
+    trackTerminalSessionForWebContents(event.sender.id, id, event.sender)
 
     return { cwd: remote ? null : cwd, id, shell: remote ? 'ssh' : name }
   })
