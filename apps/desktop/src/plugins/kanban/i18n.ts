@@ -33,6 +33,8 @@ type KanbanMessages = {
   deselect: string
   moveTo: (label: string) => string
   delete: string
+  // per-card "send to roadmap ideas" (Phase 2.15 follow-up)
+  sendToRoadmap: string
   reviewChecking: string
   attachedTip: (name: string) => string
   orchestratorTip: (name: string) => string
@@ -101,6 +103,15 @@ type KanbanMessages = {
   tokUnit: string
   couldNotEstimate: string
   complexity: Record<'L' | 'M' | 'S', string>
+  // idea capture (Phase 2.15) — free-typed roadmap idea, board header
+  ideaTitle: string
+  ideaHint: string
+  ideaPlaceholder: string
+  ideaSave: string
+  ideaSaving: string
+  ideaSaved: string
+  ideaEmpty: string
+  ideaUnavailable: string
   introBody: string
   introGotIt: string
   // drawer — activity prose
@@ -274,6 +285,7 @@ export const en: KanbanMessages = {
   deselect: 'Deselect',
   moveTo: label => `Move to ${label}`,
   delete: 'Delete',
+  sendToRoadmap: 'Send to roadmap ideas',
   reviewChecking: 'A review agent is checking the completed work.',
   attachedTip: name => `${name} is attached — the dispatcher hands this over on its next tick (≤1m).`,
   orchestratorTip: name => `${name} (the orchestrator) picks this up on the next tick and writes the spec.`,
@@ -343,6 +355,14 @@ export const en: KanbanMessages = {
   tokUnit: 'tok',
   couldNotEstimate: 'Could not estimate',
   complexity: { S: 'Small', M: 'Medium', L: 'Large' },
+  ideaTitle: 'Capture idea',
+  ideaHint: 'Jot a rough roadmap idea — it lands in ROADMAP.md’s Ideas list for later triage, not as a card.',
+  ideaPlaceholder: 'Rough idea…',
+  ideaSave: 'Save idea',
+  ideaSaving: 'Saving…',
+  ideaSaved: 'Idea saved to the roadmap',
+  ideaEmpty: 'Type something before saving.',
+  ideaUnavailable: 'Roadmap unavailable — the idea was not saved.',
   introBody:
     'You don’t run the cards — agents do. Put a card in Ready with an assignee and an agent picks it up within a minute. No assignee, no run. Triage: an agent rewrites the idea into a proper task first. Todo: waiting on other cards. Scheduled: waiting on a timer. Running and Review: the agents’ lanes, hands off. Blocked: it’s waiting on you. Results come back on the card.',
   introGotIt: 'Got it',
@@ -522,6 +542,7 @@ const ja: KanbanMessages = {
   deselect: '選択解除',
   moveTo: label => `${label} へ移動`,
   delete: '削除',
+  sendToRoadmap: 'ロードマップのアイデアに送る',
   reviewChecking: 'レビューエージェントが完了した作業を確認中です。',
   attachedTip: name => `${name} が担当 — ディスパッチャが次のティック（≤1分）で引き渡します。`,
   orchestratorTip: name => `${name}（オーケストレーター）が次のティックでこれを取得し、仕様を書きます。`,
@@ -591,6 +612,14 @@ const ja: KanbanMessages = {
   tokUnit: 'tok',
   couldNotEstimate: '見積もりできませんでした',
   complexity: { S: '小', M: '中', L: '大' },
+  ideaTitle: 'アイデアを記録',
+  ideaHint: 'ラフなロードマップのアイデアをメモ — カードではなく ROADMAP.md の Ideas リストに追加され、後でトリアージされます。',
+  ideaPlaceholder: 'ラフなアイデア…',
+  ideaSave: 'アイデアを保存',
+  ideaSaving: '保存中…',
+  ideaSaved: 'アイデアをロードマップに保存しました',
+  ideaEmpty: '保存する前に入力してください。',
+  ideaUnavailable: 'ロードマップが利用できません — アイデアは保存されませんでした。',
   introBody:
     'カードはあなたではなくエージェントが実行します。担当を設定したカードを Ready に置くと、1分以内にエージェントが取得します。担当がなければ実行されません。トリアージ: エージェントがまずアイデアを適切なタスクに書き直します。Todo: 他のカード待ち。スケジュール: タイマー待ち。実行中とレビュー: エージェントのレーンなので手を出さないでください。ブロック: あなたの対応待ちです。結果はカードに戻ってきます。',
   introGotIt: '了解',
@@ -767,6 +796,7 @@ const zh: KanbanMessages = {
   deselect: '取消选择',
   moveTo: label => `移动到 ${label}`,
   delete: '删除',
+  sendToRoadmap: '发送到路线图想法',
   reviewChecking: '审查代理正在检查已完成的工作。',
   attachedTip: name => `${name} 已接手 — 调度器将在下一个周期（≤1 分钟）移交。`,
   orchestratorTip: name => `${name}（编排者）将在下一个周期领取并撰写规格。`,
@@ -835,6 +865,14 @@ const zh: KanbanMessages = {
   tokUnit: 'tok',
   couldNotEstimate: '无法估算',
   complexity: { S: '小', M: '中', L: '大' },
+  ideaTitle: '记录想法',
+  ideaHint: '记下一个粗略的路线图想法 — 它会加入 ROADMAP.md 的 Ideas 列表，而不是新建卡片，稍后再分诊。',
+  ideaPlaceholder: '粗略的想法…',
+  ideaSave: '保存想法',
+  ideaSaving: '保存中…',
+  ideaSaved: '想法已保存到路线图',
+  ideaEmpty: '请先输入内容再保存。',
+  ideaUnavailable: '路线图不可用 — 想法未保存。',
   introBody:
     '卡片不由你运行，而是由代理运行。把带有负责人的卡片放入“就绪”，代理会在一分钟内领取。没有负责人就不会运行。分诊：代理先把想法改写成合适的任务。待办：等待其他卡片。已排期：等待计时器。运行中与审查：这是代理的通道，请勿插手。受阻：正在等你。结果会回到卡片上。',
   introGotIt: '知道了',
@@ -1009,6 +1047,7 @@ const zhHant: KanbanMessages = {
   deselect: '取消選取',
   moveTo: label => `移至 ${label}`,
   delete: '刪除',
+  sendToRoadmap: '傳送到路線圖想法',
   reviewChecking: '審查代理正在檢查已完成的工作。',
   attachedTip: name => `${name} 已接手 — 排程器將在下一個週期（≤1 分鐘）移交。`,
   orchestratorTip: name => `${name}（編排者）將在下一個週期領取並撰寫規格。`,
@@ -1077,6 +1116,14 @@ const zhHant: KanbanMessages = {
   tokUnit: 'tok',
   couldNotEstimate: '無法估算',
   complexity: { S: '小', M: '中', L: '大' },
+  ideaTitle: '記錄想法',
+  ideaHint: '記下一個粗略的路線圖想法 — 它會加入 ROADMAP.md 的 Ideas 清單，而不是新建卡片，稍後再分診。',
+  ideaPlaceholder: '粗略的想法…',
+  ideaSave: '儲存想法',
+  ideaSaving: '儲存中…',
+  ideaSaved: '想法已儲存到路線圖',
+  ideaEmpty: '請先輸入內容再儲存。',
+  ideaUnavailable: '路線圖不可用 — 想法未儲存。',
   introBody:
     '卡片不由你執行，而是由代理執行。把有負責人的卡片放入「就緒」，代理會在一分鐘內領取。沒有負責人就不會執行。分類：代理先把想法改寫成合適的任務。待辦：等待其他卡片。已排程：等待計時器。執行中與審查：這是代理的通道，請勿插手。受阻：正在等你。結果會回到卡片上。',
   introGotIt: '知道了',
