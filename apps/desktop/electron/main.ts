@@ -327,6 +327,7 @@ import {
   windowOpacityFor,
   windowOpacityOptions
 } from './translucency'
+import { updateChecksDisabled } from './update-checks-gate'
 import {
   compareApiUrl,
   parseCompareBehindCount,
@@ -334,7 +335,6 @@ import {
   resolveCommitLogSelection,
   shouldCountCommits
 } from './update-count'
-import { updateChecksDisabled } from './update-checks-gate'
 import { waitForUpdateClearance } from './update-gate'
 import { readLiveUpdateMarker, updateHandoffConflict, writeUpdateMarker } from './update-marker'
 import { isOfficialSshRemote, OFFICIAL_REPO_HTTPS_URL } from './update-remote'
@@ -409,15 +409,6 @@ const IS_PACKAGED = app.isPackaged || Boolean(process.env.HERMES_DESKTOP_IS_PACK
 const IS_MAC = process.platform === 'darwin'
 const IS_WINDOWS = process.platform === 'win32'
 const IS_WSL = isWslEnvironment()
-// Gate for the desktop self-update checker (git ls-remote/fetch against
-// origin, plus the GitHub compare API). Bridged from `desktop.
-// auto_update_checks_enabled` in config.yaml by the `hermes desktop`
-// launcher (hermes_cli/main.py cmd_gui); an env var set directly (e.g. by a
-// dev running `electron .` outside the launcher) works the same way. Also
-// short-circuits unconditionally on HERMES_DEV=1 — see update-checks-gate.ts
-// for the full rationale. Default is checks ON — this only ever narrows
-// behavior, never widens it.
-const UPDATE_CHECKS_DISABLED = updateChecksDisabled()
 // Truthful macOS kernel major (Tahoe = 25). Product version lies (16 vs 26) per
 // build SDK, so gate Tahoe workarounds on Darwin instead.
 const DARWIN_MAJOR = IS_MAC ? Number.parseInt(os.release(), 10) || 0 : 0
@@ -768,6 +759,22 @@ function resolveHermesHome() {
 }
 
 const HERMES_HOME = resolveHermesHome()
+
+// Gate for the desktop self-update checker (git ls-remote/fetch against
+// origin, plus the GitHub compare API). Bridged from `desktop.
+// auto_update_checks_enabled` in config.yaml by the `hermes desktop`
+// launcher (hermes_cli/main.py cmd_gui); an env var set directly (e.g. by a
+// dev running `electron .` outside the launcher) works the same way. A
+// packaged Hermes.app launched from the Dock/Finder/Spotlight gets none of
+// those bridged env vars, so the config.yaml path is a second, lower-priority
+// rung read directly from HERMES_HOME/config.yaml — that's why this has to
+// come after resolveHermesHome() rather than sit with the other early
+// launch-arg gates above. Also short-circuits unconditionally on
+// HERMES_DEV=1 — see update-checks-gate.ts for the full rationale. Default
+// is checks ON — this only ever narrows behavior, never widens it.
+const UPDATE_CHECKS_DISABLED = updateChecksDisabled(process.env, {
+  configPath: path.join(HERMES_HOME, 'config.yaml')
+})
 
 function pathWithHermesManagedNode(...entries) {
   const managed = hermesManagedNodePathEntries(HERMES_HOME).filter(directoryExists)
@@ -6394,7 +6401,12 @@ function buildApplicationMenu() {
   const template = []
 
   const checkForUpdatesItem = {
-    label: 'Check for Updates…',
+    // Update checks are disabled (desktop.auto_update_checks_enabled: false
+    // in config.yaml, or HERMES_DESKTOP_DISABLE_UPDATE_CHECKS) — clicking
+    // this still opens the updates panel, which reports the same
+    // 'update-checks-disabled' reason, but the label says so up front instead
+    // of looking like a normal, functional menu item.
+    label: UPDATE_CHECKS_DISABLED ? 'Check for Updates… (disabled)' : 'Check for Updates…',
     click: () => sendOpenUpdatesRequested()
   }
 
