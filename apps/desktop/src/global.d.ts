@@ -403,6 +403,11 @@ declare global {
         ) => Promise<{ root: string; label: string }[]>
       }
       terminal: {
+        /** Renderer's ack of processed output bytes for a data flush; drives
+         *  the main-process pty's pause/resume flow control. Fire-and-forget
+         *  (no return value) — a dropped ack just leaves flow control
+         *  conservative a little longer. */
+        ack: (id: string, bytes: number) => void
         /** Best-effort current working directory of the live PTY child (POSIX
          *  only; null on Windows or when unavailable). Used to reopen a tab
          *  where the user last `cd`'d. */
@@ -410,9 +415,12 @@ declare global {
         dispose: (id: string) => Promise<boolean>
         onData: (id: string, callback: (payload: string) => void) => () => void
         onExit: (id: string, callback: (payload: HermesTerminalExit) => void) => () => void
-        resize: (id: string, size: { cols: number; rows: number }) => Promise<boolean>
+        /** Fire-and-forget — no round trip per resize (SIGWINCH is one-way). */
+        resize: (id: string, size: { cols: number; rows: number }) => void
         start: (options?: { cols?: number; cwd?: string; rows?: number }) => Promise<HermesTerminalSession>
-        write: (id: string, data: string) => Promise<boolean>
+        /** Fire-and-forget — no round trip per keystroke; the previous
+         *  boolean return value was never read by any caller. */
+        write: (id: string, data: string) => void
       }
       reachPreviewUrl?: (url: string) => Promise<string>
       onClosePreviewRequested?: (callback: () => void) => () => void

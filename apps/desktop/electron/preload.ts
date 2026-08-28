@@ -336,11 +336,12 @@ contextBridge.exposeInMainWorld('hermesDesktop', {
     }
   },
   terminal: {
+    ack: (id, bytes) => ipcRenderer.send('hermes:terminal:ack', id, bytes),
     cwd: id => ipcRenderer.invoke('hermes:terminal:cwd', id),
     dispose: id => ipcRenderer.invoke('hermes:terminal:dispose', id),
-    resize: (id, size) => ipcRenderer.invoke('hermes:terminal:resize', id, size),
+    resize: (id, size) => ipcRenderer.send('hermes:terminal:resize', id, size),
     start: options => ipcRenderer.invoke('hermes:terminal:start', options),
-    write: (id, data) => ipcRenderer.invoke('hermes:terminal:write', id, data),
+    write: (id, data) => ipcRenderer.send('hermes:terminal:write', id, data),
     onData: (id, callback) => {
       const channel = `hermes:terminal:${id}:data`
       const listener = (_event, payload) => callback(payload)
