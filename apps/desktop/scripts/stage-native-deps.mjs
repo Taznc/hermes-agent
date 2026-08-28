@@ -531,8 +531,12 @@ export function stageGetWindowsInto(
       cpSync(join(bindingRoot, dir, 'node-get-windows.node'), destFile)
       const classified = classifyNativeBinary(destFile)
       if (classified !== platform) {
+        // `dir/node-get-windows.node` below is error-message TEXT, not a
+        // real fs path — the actual path used for I/O is `destFile` above,
+        // already built with join(). This is display-only, so the missing
+        // separator normalization has no functional effect on any OS.
         throw new Error(
-          `[stage-native-deps] get-windows binding ${dir}/node-get-windows.node: ` +
+          `[stage-native-deps] get-windows binding ${dir}/node-get-windows.node: ` + // windows-footgun: ok — error-message text, not an fs path (destFile above is the real join()'d path)
             `expected ${platform}, got ${classified ?? 'unknown'}. ` +
             'Refusing to stage a binary compiled for the wrong platform.'
         )
