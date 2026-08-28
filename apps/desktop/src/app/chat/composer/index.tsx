@@ -61,6 +61,7 @@ import { useSessionStatusPresence } from './hooks/use-status-presence'
 import { ActionBadges } from './micro-actions'
 import { chipTypedPathOnSpace, pathifyRefs } from './path-refs'
 import { QueuePanel } from './queue-panel'
+import { ReconnectStatusBanner } from './reconnect-banner'
 import {
   beginComposerComposition,
   composerPlainText,
@@ -92,6 +93,7 @@ export function ChatBar({
   queueSessionKey,
   sessionId,
   state,
+  storedSessionId,
   onCancel,
   onAddUrl,
   onAttachDroppedItems,
@@ -101,6 +103,7 @@ export function ChatBar({
   onPickFiles,
   onPickFolders,
   onPickImages,
+  onReload,
   onRemoveAttachment,
   onSteer,
   onSubmit: onSubmitProp,
@@ -1305,6 +1308,7 @@ export function ChatBar({
                   {/* Contribution seams: banners above, a row below, inline
                     additions beside the "+" menu and before the controls.
                     All four render nothing until something contributes. */}
+                  <ReconnectStatusBanner onReload={onReload} storedSessionId={storedSessionId} />
                   <ContribSlot area={COMPOSER_AREAS.top} />
                   <VoiceActivity state={voiceActivityState} />
                   <VoicePlaybackActivity />

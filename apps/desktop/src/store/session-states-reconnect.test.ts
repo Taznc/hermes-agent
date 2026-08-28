@@ -7,10 +7,14 @@ import { createClientSessionState } from '@/lib/chat-runtime'
 import { $activeSessionId, $selectedStoredSessionId, $unreadFinishedSessionIds } from './session'
 import {
   $attentionSessionIds,
+  $catchingUpSessionIds,
   $stalledSessionIds,
+  $turnLostSessionIds,
   $workingSessionIds,
   clearAllSessionStates,
+  dismissTurnLost,
   publishSessionState,
+  RECONNECT_CATCHUP_GRACE_MS,
   reconcileBusyStatesOnReconnect,
   recordSessionEventScope,
   SESSION_WATCHDOG_TIMEOUT_MS
@@ -112,5 +116,102 @@ describe('reconcileBusyStatesOnReconnect', () => {
     publishSessionState('rt2', state({ busy: true, storedSessionId: 's1' }))
 
     expect($workingSessionIds.get()).toContain('s1')
+  })
+})
+
+// Catch-up / turn-lost tracking: reconcileBusyStatesOnReconnect force-clears a
+// pre-reconnect busy flag because its runtime id died with the old
+// connection. That is indistinguishable from "the turn actually finished"
+// without an explicit marker, so it arms a grace window distinguishing a
+// live turn re-asserting itself ("catching up" resolves) from genuine
+// silence ("turn lost").
+describe('reconnect catch-up / turn-lost tracking', () => {
+  beforeEach(() => {
+    vi.useFakeTimers()
+    vi.setSystemTime(0)
+    clearAllSessionStates()
+    $unreadFinishedSessionIds.set([])
+    $selectedStoredSessionId.set(null)
+    $activeSessionId.set(null)
+  })
+
+  afterEach(() => {
+    vi.runOnlyPendingTimers()
+    vi.useRealTimers()
+    clearAllSessionStates()
+    $unreadFinishedSessionIds.set([])
+    $selectedStoredSessionId.set(null)
+    $activeSessionId.set(null)
+  })
+
+  it('marks a downgraded-busy session catching-up and arms the grace timer', () => {
+    publishSessionState('rt1', state({ busy: true, storedSessionId: 's1' }))
+
+    reconcileBusyStatesOnReconnect()
+
+    expect($catchingUpSessionIds.get()).toContain('s1')
+    expect($turnLostSessionIds.get()).not.toContain('s1')
+  })
+
+  it('flips catching-up to turn-lost when nothing re-publishes busy before the grace window ends', () => {
+    publishSessionState('rt1', state({ busy: true, storedSessionId: 's1' }))
+    reconcileBusyStatesOnReconnect()
+    expect($catchingUpSessionIds.get()).toContain('s1')
+
+    vi.advanceTimersByTime(RECONNECT_CATCHUP_GRACE_MS - 1)
+    expect($catchingUpSessionIds.get()).toContain('s1')
+    expect($turnLostSessionIds.get()).not.toContain('s1')
+
+    vi.advanceTimersByTime(2)
+
+    expect($catchingUpSessionIds.get()).not.toContain('s1')
+    expect($turnLostSessionIds.get()).toContain('s1')
+  })
+
+  it('a live busy republish inside the grace window clears both catching-up and turn-lost', () => {
+    publishSessionState('rt1', state({ busy: true, storedSessionId: 's1' }))
+    reconcileBusyStatesOnReconnect()
+    expect($catchingUpSessionIds.get()).toContain('s1')
+
+    // The genuinely-alive backend's next event lands under a fresh runtime id
+    // before the grace window expires — this IS the "still running" answer.
+    vi.advanceTimersByTime(RECONNECT_CATCHUP_GRACE_MS / 2)
+    publishSessionState('rt2', state({ busy: true, storedSessionId: 's1' }))
+
+    expect($catchingUpSessionIds.get()).not.toContain('s1')
+    expect($turnLostSessionIds.get()).not.toContain('s1')
+
+    // And the grace timer was actually disarmed, not just raced — running
+    // past the original window must not retroactively mark it lost.
+    vi.advanceTimersByTime(RECONNECT_CATCHUP_GRACE_MS)
+    expect($turnLostSessionIds.get()).not.toContain('s1')
+  })
+
+  it('dismissTurnLost clears the mark and disarms any pending grace timer', () => {
+    publishSessionState('rt1', state({ busy: true, storedSessionId: 's1' }))
+    reconcileBusyStatesOnReconnect()
+    vi.advanceTimersByTime(RECONNECT_CATCHUP_GRACE_MS)
+    expect($turnLostSessionIds.get()).toContain('s1')
+
+    dismissTurnLost('s1')
+
+    expect($turnLostSessionIds.get()).not.toContain('s1')
+    expect($catchingUpSessionIds.get()).not.toContain('s1')
+  })
+
+  it('dismissTurnLost is a no-op for a session with no lost mark', () => {
+    expect(() => dismissTurnLost('never-marked')).not.toThrow()
+    expect($turnLostSessionIds.get()).not.toContain('never-marked')
+  })
+
+  it('scoped reconcile only arms catch-up tracking for sessions in that scope', () => {
+    publishSessionState('rtA', state({ busy: true, storedSessionId: 'sA' }))
+    recordSessionEventScope({ connectionId: 'connA', profile: 'default', session_id: 'rtA' })
+    publishSessionState('rtLocal', state({ busy: true, storedSessionId: 'sLocal' }))
+
+    reconcileBusyStatesOnReconnect()
+
+    expect($catchingUpSessionIds.get()).toContain('sLocal')
+    expect($catchingUpSessionIds.get()).not.toContain('sA')
   })
 })

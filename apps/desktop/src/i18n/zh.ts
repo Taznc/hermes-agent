@@ -89,6 +89,7 @@ export const zhAuthored: Translations = {
       gatewayConnectionLost: '与网关的连接已断开',
       gatewayConnectionLostDetail:
         'Still retrying in the background. You can keep reading and drafting — open Gateway settings if this persists.',
+      gatewaySessionsStale: '已重新连接，但会话/设置未能刷新。部分列表可能已过期。',
       gatewaySignInRequired: '需要登录网关',
       ipcBridgeUnavailable: '桌面 IPC 桥不可用。'
     },
@@ -2536,6 +2537,10 @@ export const zhAuthored: Translations = {
     wakingProfile: profile => `正在唤醒 ${profile}…`,
     placeholderStarting: '正在启动 Hermes…',
     placeholderReconnecting: '正在重新连接 Hermes…',
+    reconnectingBanner: '正在重新连接 Hermes — 你仍可以阅读和输入。',
+    catchingUpNotice: '已重新连接 — 正在追上进度…',
+    turnLostNotice: '此次对话在断线期间可能未完成。',
+    turnLostRegenerate: '重新生成',
     placeholderFollowUp: '发送后续消息',
     newSessionPlaceholders: [
       '我们要构建什么？',

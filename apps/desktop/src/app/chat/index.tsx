@@ -722,6 +722,7 @@ const ChatViewContent = memo(function ChatViewContent({
               onPickFiles={onPickFiles}
               onPickFolders={onPickFolders}
               onPickImages={onPickImages}
+              onReload={onReload}
               onRemoveAttachment={onRemoveAttachment}
               onSteer={onSteer}
               onSubmit={onSubmit}
@@ -729,6 +730,7 @@ const ChatViewContent = memo(function ChatViewContent({
               queueSessionKey={queueSessionKey}
               sessionId={activeSessionId}
               state={chatBarState}
+              storedSessionId={storedId}
             />
           </Suspense>
         )}
