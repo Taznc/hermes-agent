@@ -11881,7 +11881,12 @@ function spawnSecondaryWindow({ sessionId, watch }: { sessionId?: string; watch?
     // covers it. ready-to-show fires after the boot-time paint in
     // themes/context.tsx, so the window appears already themed.
     show: false,
-    webPreferences: chatWindowWebPreferences(PRELOAD_PATH)
+    // Must carry WINDOW_CAPS_ARGUMENT like every other PRELOAD_PATH window:
+    // preload no longer answers translucency/HUD-windowing via sendSync, it
+    // reads --hermes-window-caps off argv, so a window missing this argument
+    // gets glassSupported/translucencySupported forced false and hudWindowing
+    // undefined (#331b1a5e round-1 review finding).
+    webPreferences: withWindowCapsArgument(chatWindowWebPreferences(PRELOAD_PATH))
   })
 
   // Chat-surface registration: applyWindowTranslucency swaps this window's
