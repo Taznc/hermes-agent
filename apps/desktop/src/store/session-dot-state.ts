@@ -296,3 +296,28 @@ export const $sidebarStatusExcludedIds = computed(
     return (statusExcludedIds = stableSet(statusExcludedIds, next))
   }
 )
+
+/** Session ids with a live turn (working/stalled/needs-input) — the same
+ *  predicate {@link hasLiveTurn} exposes per-row, projected as a stable id
+ *  list so a consumer that needs MEMBERSHIP (not the per-row state itself)
+ *  can subscribe without taking every dot-state edge.
+ *
+ *  `SidebarSessionsSection` is the concrete case: its WORKING/DONE status
+ *  grouping used to read the raw `$sessionDotStateById` map directly, which
+ *  re-rendered the section (recents, pinned, or a messaging group — whichever
+ *  instance) on every dot-state tick regardless of whether `grouping` was
+ *  even `'status'`. This list only changes reference when a session's
+ *  hasLiveTurn bucket actually flips. */
+let liveTurnIds: readonly string[] = []
+
+export const $liveTurnSessionIds = computed($sessionDotStateById, byId => {
+  const ids: string[] = []
+
+  for (const [id, state] of Object.entries(byId)) {
+    if (hasLiveTurn(state)) {
+      ids.push(id)
+    }
+  }
+
+  return (liveTurnIds = stableArray(liveTurnIds, ids))
+})
