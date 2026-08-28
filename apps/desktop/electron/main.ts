@@ -186,6 +186,7 @@ import {
 } from './find-in-page'
 import { createFirstRunSetupGate } from './first-run-setup-gate'
 import { registerFsIpc } from './fs-ipc'
+import { guardWatcherErrors, PreviewWatcherRegistry } from './preview-watchers'
 import {
   filenameFromContentDisposition,
   gatewayFilePath,
@@ -1435,7 +1436,7 @@ let connectionRegistryCacheMtime = null
 let remoteHeaderRulesInstalled = false
 const remoteWsHeadersByUrl = new Map<string, Record<string, string>>()
 const hermesLog = []
-const previewWatchers = new Map()
+const previewWatchers = new PreviewWatcherRegistry()
 let previewShortcutActive = false
 let desktopLogBuffer = ''
 let desktopLogFlushTimer = null
@@ -5920,7 +5921,7 @@ function sendPreviewFileChanged(payload) {
   webContents.send('hermes:preview-file-changed', payload)
 }
 
-async function watchPreviewFile(rawUrl) {
+async function watchPreviewFile(rawUrl, webContentsId: number | null = null) {
   const filePath = await filePathFromPreviewUrl(rawUrl)
   const watchDir = path.dirname(filePath)
   const targetName = path.basename(filePath)
@@ -5949,36 +5950,45 @@ async function watchPreviewFile(rawUrl) {
     }, PREVIEW_WATCH_DEBOUNCE_MS)
   })
 
-  previewWatchers.set(id, {
-    close: () => {
-      if (timer) {
-        clearTimeout(timer)
-      }
-
-      watcher.close()
+  // Deleting/renaming the watched directory raises FSWatcher 'error' (EPERM
+  // on Windows). Unhandled, that throws and crashes the main process — this
+  // is a plugin-folder/preview-file watcher on a user-managed path users
+  // routinely delete or rename, so it's reachable in normal use, not an edge
+  // case. Forget the watcher and let the renderer's own poll fallback pick up
+  // the loss instead of crashing the app.
+  guardWatcherErrors(watcher, error => {
+    if (timer) {
+      clearTimeout(timer)
+      timer = null
     }
+
+    previewWatchers.stop(id)
+    rememberLog(`[preview] file watcher error on ${watchDir}: ${error instanceof Error ? error.message : error}`)
   })
+
+  previewWatchers.register(
+    id,
+    {
+      close: () => {
+        if (timer) {
+          clearTimeout(timer)
+        }
+
+        watcher.close()
+      }
+    },
+    webContentsId
+  )
 
   return { id, path: filePath }
 }
 
 function stopPreviewFileWatch(id) {
-  const watcher = previewWatchers.get(id)
-
-  if (!watcher) {
-    return false
-  }
-
-  watcher.close()
-  previewWatchers.delete(id)
-
-  return true
+  return previewWatchers.stop(id)
 }
 
 function closePreviewWatchers() {
-  for (const id of previewWatchers.keys()) {
-    stopPreviewFileWatch(id)
-  }
+  previewWatchers.stopAll()
 }
 
 function requestOptionsWithHeaders(options: any = {}, headers = {}) {
@@ -5996,7 +6006,7 @@ function requestOptionsWithHeaders(options: any = {}, headers = {}) {
  *  readdir poll. Same registry + change channel as the preview file watchers
  *  (the renderer reconciles on any tick; per-file edits stay on their own
  *  watches), so stopPreviewFileWatch/closePreviewWatchers manage these too. */
-function watchDirectory(rawDir) {
+function watchDirectory(rawDir, webContentsId: number | null = null) {
   const watchDir = path.resolve(String(rawDir || ''))
 
   if (!fs.existsSync(watchDir) || !fs.statSync(watchDir).isDirectory()) {
@@ -6017,15 +6027,34 @@ function watchDirectory(rawDir) {
     }, PREVIEW_WATCH_DEBOUNCE_MS)
   })
 
-  previewWatchers.set(id, {
-    close: () => {
-      if (timer) {
-        clearTimeout(timer)
-      }
-
-      watcher.close()
+  // Same crash class as watchPreviewFile: a plugin-folder directory watcher
+  // that users routinely delete/rename must not let an unhandled 'error'
+  // (EPERM on Windows) take down the main process. runtime-loader already has
+  // a readdir-poll fallback for shells that predate watchDirectory — losing
+  // the watch here just means that fallback keeps reconciling.
+  guardWatcherErrors(watcher, error => {
+    if (timer) {
+      clearTimeout(timer)
+      timer = null
     }
+
+    previewWatchers.stop(id)
+    rememberLog(`[preview] directory watcher error on ${watchDir}: ${error instanceof Error ? error.message : error}`)
   })
+
+  previewWatchers.register(
+    id,
+    {
+      close: () => {
+        if (timer) {
+          clearTimeout(timer)
+        }
+
+        watcher.close()
+      }
+    },
+    webContentsId
+  )
 
   return { id, path: watchDir }
 }
@@ -10450,6 +10479,24 @@ function watchDevMainBundle() {
             broadcastDevBundleStale()
           }
         }, 150)
+      })
+
+      // The try/catch around fs.watch() only guards the SYNCHRONOUS call —
+      // it does not cover the watcher's own async 'error' event (EPERM on
+      // Windows if the dist/ dir is deleted/rebuilt mid-watch, ENOENT if a
+      // build tool briefly unlinks-then-recreates the file). Unhandled,
+      // that throws and crashes the main process same as any other
+      // fs.watch() site; dev-only doesn't make it safe to skip.
+      guardWatcherErrors(watcher, error => {
+        if (timer) {
+          clearTimeout(timer)
+          timer = null
+        }
+
+        devBundleWatchers = devBundleWatchers.filter(w => w !== watcher)
+        console.log(
+          `[hermes] dev bundle watcher error on ${target}: ${error instanceof Error ? error.message : error}`
+        )
       })
 
       devBundleWatchers.push(watcher)
@@ -15322,9 +15369,43 @@ ipcMain.handle('hermes:normalizePreviewTarget', (_event, target, baseDir) =>
   normalizePreviewTarget(String(target || ''), baseDir ? String(baseDir) : '')
 )
 
-ipcMain.handle('hermes:watchPreviewFile', (_event, url) => watchPreviewFile(String(url || '')))
+// Ties preview/directory watchers to the requesting webContents so a
+// renderer crash, reload, or re-home can't orphan fs.watch handles + debounce
+// timers forever (inotify watches are finite on Linux; this matters for
+// multi-day sessions). Installed once per webContents id — reload fires
+// 'did-start-navigation' repeatedly, and the listener itself removes any
+// watchers the (about to be replaced) page still owned, not itself.
+const previewWatcherOwnersHooked = new Set<number>()
 
-ipcMain.handle('hermes:watchDirectory', (_event, dir) => watchDirectory(String(dir || '')))
+function ensurePreviewWatcherOwnerCleanup(sender: Electron.WebContents) {
+  const senderId = sender.id
+
+  if (previewWatcherOwnersHooked.has(senderId)) {
+    return
+  }
+
+  previewWatcherOwnersHooked.add(senderId)
+
+  const cleanup = () => previewWatchers.stopForWebContents(senderId)
+
+  sender.on('did-start-navigation', cleanup)
+  sender.once('destroyed', () => {
+    cleanup()
+    previewWatcherOwnersHooked.delete(senderId)
+  })
+}
+
+ipcMain.handle('hermes:watchPreviewFile', (event, url) => {
+  ensurePreviewWatcherOwnerCleanup(event.sender)
+
+  return watchPreviewFile(String(url || ''), event.sender.id)
+})
+
+ipcMain.handle('hermes:watchDirectory', (event, dir) => {
+  ensurePreviewWatcherOwnerCleanup(event.sender)
+
+  return watchDirectory(String(dir || ''), event.sender.id)
+})
 
 ipcMain.handle('hermes:stopPreviewFileWatch', (_event, id) => stopPreviewFileWatch(String(id || '')))
 
