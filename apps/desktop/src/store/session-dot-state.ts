@@ -32,7 +32,7 @@ import { $messagingSessions, $sessions, $unreadFinishedSessionIds, lineageAliase
 import {
   $attentionSessionIds,
   $draftSessionIds,
-  $sessionStates,
+  $sessionStatusById,
   $stalledSessionIds,
   $workingSessionIds
 } from './session-states'
@@ -47,9 +47,12 @@ import { $subagentsBySession, activeSubagentCount } from './subagents'
 // bridge and fresh-chat fallback as $backgroundRunningSessionIds:
 // $subagentsBySession is keyed by runtime id, surfaces key on stored ids, and
 // lineageAliases covers whichever tip of the conversation a surface holds.
+// Reads `$sessionStatusById` (not `$sessionStates`) for the same reason the
+// other status computeds do: it only republishes on a real status edge, not
+// on every streamed message delta.
 let delegatingIds: readonly string[] = []
 export const $delegatingSessionIds = computed(
-  [$subagentsBySession, $sessionStates, $sessions],
+  [$subagentsBySession, $sessionStatusById, $sessions],
   (bySession, states, sessions) => {
     const ids = new Set<string>()
 

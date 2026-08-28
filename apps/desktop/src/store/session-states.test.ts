@@ -3,13 +3,17 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import type { ClientSessionState } from '@/app/types'
 import { findGroupOfPane, group, split } from '@/components/pane-shell/tree/model'
 import { $layoutTree } from '@/components/pane-shell/tree/store'
+import { createClientSessionState } from '@/lib/chat-runtime'
 import { $activeGatewayProfile } from '@/store/profile'
 import { $selectedStoredSessionId, setSessions } from '@/store/session'
 import type { SessionTile } from '@/store/session-states'
 import {
   $sessionStates,
+  $sessionStatusById,
   $sessionTiles,
   blankDraftTile,
+  clearAllSessionStates,
+  dropSessionState,
   focusedSessionNeedsRoute,
   focusOpenSession,
   knownOwnerForSession,
@@ -18,6 +22,7 @@ import {
   openSessionTile,
   orderTilesByTree,
   patchSessionTile,
+  publishSessionState,
   releaseSessionTranscript,
   requestForOwnedSession,
   resetTileRuntimeBindings,
@@ -286,6 +291,72 @@ describe('releaseSessionTranscript', () => {
 
     expect(() => releaseSessionTranscript('runtime')).not.toThrow()
     expect($sessionStates.get()).toHaveProperty('runtime', undefined)
+  })
+})
+
+describe('$sessionStatusById', () => {
+  afterEach(() => {
+    clearAllSessionStates()
+  })
+
+  it('publishes on the first publish of a runtime', () => {
+    publishSessionState('rt-1', createClientSessionState('stored-1'))
+
+    expect($sessionStatusById.get()['rt-1']).toEqual({
+      busy: false,
+      needsInput: false,
+      storedSessionId: 'stored-1',
+      hasMessages: false
+    })
+  })
+
+  it('does NOT republish on a pure message-delta with unchanged status fields', () => {
+    publishSessionState('rt-1', createClientSessionState('stored-1'))
+    const first = $sessionStatusById.get()
+
+    // A streamed token: messages grows, busy/needsInput/storedSessionId are
+    // unchanged — the exact shape of a ~30Hz streaming publish.
+    publishSessionState('rt-1', {
+      ...createClientSessionState('stored-1'),
+      messages: [{ id: 'm1', role: 'assistant', parts: [{ type: 'text', text: 'partial' }] }]
+    } as ClientSessionState)
+
+    // hasMessages flips false -> true on the FIRST message landing, which is
+    // itself a real status edge (drives $draftSessionIds); that one publish
+    // is expected. Assert the record kept its reference across a SECOND,
+    // purely-additional delta once hasMessages is already true.
+    const afterFirstMessage = $sessionStatusById.get()
+    expect(afterFirstMessage).not.toBe(first)
+
+    publishSessionState('rt-1', {
+      ...createClientSessionState('stored-1'),
+      messages: [
+        { id: 'm1', role: 'assistant', parts: [{ type: 'text', text: 'partial' }] },
+        { id: 'm2', role: 'assistant', parts: [{ type: 'text', text: 'more tokens' }] }
+      ]
+    } as ClientSessionState)
+
+    expect($sessionStatusById.get()).toBe(afterFirstMessage)
+    expect($sessionStatusById.get()['rt-1']).toEqual(afterFirstMessage['rt-1'])
+  })
+
+  it('republishes on a real busy edge', () => {
+    publishSessionState('rt-1', createClientSessionState('stored-1'))
+    const before = $sessionStatusById.get()
+
+    publishSessionState('rt-1', { ...createClientSessionState('stored-1'), busy: true } as ClientSessionState)
+
+    expect($sessionStatusById.get()).not.toBe(before)
+    expect($sessionStatusById.get()['rt-1']?.busy).toBe(true)
+  })
+
+  it('drops the entry when the runtime is dropped', () => {
+    publishSessionState('rt-1', { ...createClientSessionState('stored-1'), busy: true } as ClientSessionState)
+    expect($sessionStatusById.get()['rt-1']).toBeDefined()
+
+    dropSessionState('rt-1')
+
+    expect($sessionStatusById.get()).not.toHaveProperty('rt-1')
   })
 })
 
