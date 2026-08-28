@@ -426,13 +426,13 @@ export function useStatusbarItems({
   useEffect(() => {
     let active = true
 
-    void window.hermesDesktop.getDevMainBundleStale?.().then(res => {
+    void window.hermesDesktop?.getDevMainBundleStale?.().then(res => {
       if (active && res?.supported) {
         setDevBundleStale(Boolean(res.stale))
       }
     })
 
-    const off = window.hermesDesktop.onDevMainBundleStale?.(payload => {
+    const off = window.hermesDesktop?.onDevMainBundleStale?.(payload => {
       if (active) {
         setDevBundleStale(Boolean(payload?.stale))
       }
@@ -455,7 +455,7 @@ export function useStatusbarItems({
       id: 'dev-restart',
       label: 'Restart to apply',
       onSelect: () => {
-        void window.hermesDesktop.restartForDevBundle?.()
+        void window.hermesDesktop?.restartForDevBundle?.()
       },
       title:
         'The Electron main-process bundle was rebuilt after this window started.\n' +
@@ -481,13 +481,13 @@ export function useStatusbarItems({
   useEffect(() => {
     let active = true
 
-    void window.hermesDesktop.getDevBackendStale?.().then(res => {
+    void window.hermesDesktop?.getDevBackendStale?.().then(res => {
       if (active && res?.supported) {
         setDevBackendStaleState(res.state)
       }
     })
 
-    const off = window.hermesDesktop.onDevBackendStale?.(payload => {
+    const off = window.hermesDesktop?.onDevBackendStale?.(payload => {
       if (active) {
         setDevBackendStaleState(payload?.state ?? 'fresh')
       }
@@ -517,7 +517,7 @@ export function useStatusbarItems({
           return
         }
 
-        void window.hermesDesktop.restartDevBackend?.()
+        void window.hermesDesktop?.restartDevBackend?.()
       },
       title: failed
         ? 'The backend restart failed. Click to try again.'
