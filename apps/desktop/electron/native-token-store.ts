@@ -42,8 +42,22 @@ export interface NativeTokenStoreIo {
   decrypt: (secret: any) => string
   /** Raw store-file text. Throws when the file is absent — treated as empty. */
   readStoreText: () => string
-  /** Persist the store-file text (main.ts writes mode 0600 under userData). */
+  /**
+   * Persist the store-file text. main.ts writes this atomically (temp file +
+   * rename, owner-only mode) via writeSecretFileAtomic, so a crash/power-loss/
+   * full-disk failure mid-write can only ever leave the OLD file intact or the
+   * NEW file complete — never a truncated hybrid that would silently look
+   * like an empty store on the next read.
+   */
   writeStoreText: (text: string) => void
+  /**
+   * Move an unparseable store file aside so a later write does not silently
+   * clobber bytes that might still be worth a manual recovery attempt.
+   * Called at most once per detected corruption (once quarantined, the next
+   * readStoreText() throws ENOENT and reads as a normal absent store).
+   * Optional so tests that never hit corruption need not implement it.
+   */
+  preserveCorruptStore?: () => void
   rememberLog?: (message: string) => void
 }
 
@@ -51,17 +65,46 @@ export interface NativeTokenStoreIo {
  * baseUrl → encrypted payload. A missing, unreadable, or hand-mangled store
  * reads as empty rather than throwing: a failed *read* falls to the next rung.
  *
- * Arrays are rejected alongside every other non-object shape: assigning
- * store[baseUrl] on an array would set a non-index property, which
- * JSON.stringify drops on the way back out — the write would look like it
- * succeeded and the tokens would be gone on the next launch.
+ * Arrays (and every other syntactically-valid-but-wrong-shaped JSON value)
+ * are rejected alongside a missing file: assigning store[baseUrl] on an array
+ * would set a non-index property, which JSON.stringify drops on the way back
+ * out — the write would look like it succeeded and the tokens would be gone
+ * on the next launch. This is a deliberate, recoverable "start fresh" case,
+ * not corruption — the bytes were never a valid store to begin with, so
+ * there's nothing to preserve.
+ *
+ * Invalid JSON is different: it is usually the signature of a truncated
+ * write (kill -9 / power loss mid-save with a pre-atomic writer, or a
+ * genuinely damaged disk). Silently treating that the same as "empty" would
+ * let the very next persist for any OTHER gateway overwrite those bytes for
+ * good, destroying whatever forensic value they had — so this path quarantines
+ * the file first (via `preserveCorruptStore`) and logs once before it too is
+ * read as empty.
  */
 function readStore(io: NativeTokenStoreIo): Record<string, any> {
+  let text: string
+
   try {
-    const parsed = JSON.parse(io.readStoreText())
+    text = io.readStoreText()
+  } catch {
+    return {}
+  }
+
+  try {
+    const parsed = JSON.parse(text)
 
     return parsed && typeof parsed === 'object' && !Array.isArray(parsed) ? parsed : {}
   } catch {
+    try {
+      io.preserveCorruptStore?.()
+    } catch {
+      // Best-effort quarantine; even if it fails, still refuse to trust the bytes.
+    }
+
+    io.rememberLog?.(
+      '[native-oauth] token store file is corrupt (unparseable JSON); quarantined the file and continuing as if empty'
+    )
+
     return {}
   }
 }

@@ -770,6 +770,14 @@ export interface DesktopActiveProfile {
   profile: string | null
 }
 
+// Honest, renderer-facing OS-keychain state for stored desktop secrets. See
+// the `secretStorageState` fields on DesktopConnectionConfig and
+// DesktopConnectionsRegistry for the exact semantics.
+export interface DesktopSecretStorageState {
+  available: boolean
+  policyOn: boolean
+}
+
 export interface DesktopConnectionConfig {
   envOverride: boolean
   // The saved connection mode. 'cloud' is a Hermes Cloud connection: it carries
@@ -787,8 +795,21 @@ export interface DesktopConnectionConfig {
   remoteTokenSet: boolean
   // Whether OS-keychain-backed encryption (Electron safeStorage) is currently
   // available on this machine. When false, a persisted remote token can only be
-  // stored as plain text on disk (with an explicit opt-in).
+  // stored as plain text on disk (with an explicit opt-in). NOTE: this reads
+  // `true` whenever keychain encryption is opted OUT (the default) — it exists
+  // only to gate the plain-text CONFIRM dialog, not to describe reality. Read
+  // `secretStorageState` for the honest answer.
   secureTokenStorage: boolean
+  // The honest counterpart to `secureTokenStorage`: whether a secret saved
+  // right now would actually be OS-keychain encrypted. `policyOn` is the
+  // user's opt-in choice (Settings → "Encrypt saved secrets with the OS
+  // keychain"); `available` is only meaningful when `policyOn` is true and
+  // tells you whether the keychain itself is currently usable. Drives a
+  // one-time, non-blocking "stored without OS keychain encryption" hint —
+  // never a blocking assertion of security. Optional so a rolling app update
+  // (older Electron main, pre-release build, or a hand-crafted test fixture)
+  // that hasn't started sending it degrades to no hint rather than a crash.
+  secretStorageState?: DesktopSecretStorageState
   // Whether the currently-persisted remote token is stored with encoding
   // 'plain' (i.e. plain text on disk in connection.json), which happens when
   // the user opted in on a machine without secure storage.
@@ -895,8 +916,14 @@ export interface DesktopConnectionsRegistry {
   // compatibility with an older Electron main during a rolling app update.
   lastUsed?: string
   // Whether OS-keychain-backed encryption (Electron safeStorage) is available;
-  // false drives the plain-text token opt-in on keyring-less Linux.
+  // false drives the plain-text token opt-in on keyring-less Linux. NOTE: this
+  // reads `true` whenever keychain encryption is opted OUT (the default); read
+  // `secretStorageState` for the honest answer (see DesktopConnectionConfig).
   secureTokenStorage: boolean
+  // The honest { available, policyOn } state — see DesktopConnectionConfig's
+  // `secretStorageState` for the exact semantics. Optional for the same
+  // rolling-update / fixture-compatibility reason as there.
+  secretStorageState?: DesktopSecretStorageState
   connections: DesktopRegistryConnection[]
 }
 

@@ -22,8 +22,11 @@ import {
   writeSecretStoragePolicy
 } from './secret-storage-policy'
 
-function fakeIo(initial: string | null = null): SecretStoragePolicyIo & { fileText: () => string | null } {
+function fakeIo(
+  initial: string | null = null
+): SecretStoragePolicyIo & { fileText: () => string | null; logs: string[] } {
   let text = initial
+  const logs: string[] = []
 
   return {
     readText: () => {
@@ -36,7 +39,12 @@ function fakeIo(initial: string | null = null): SecretStoragePolicyIo & { fileTe
     writeText: (next: string) => {
       text = next
     },
-    fileText: () => text
+    preserveCorruptPolicy: () => {
+      text = null
+    },
+    rememberLog: message => logs.push(message),
+    fileText: () => text,
+    logs
   }
 }
 
@@ -48,10 +56,27 @@ test('missing policy file defaults to encryption OFF, not migrated', () => {
   assert.deepEqual(policy, { on: false, migrated: false })
 })
 
-test('corrupt or non-object policy file reads as the default', () => {
+test('corrupt or non-object policy file — while PRESENT — is read as the conservative sticky-on default, not silently defaulted off', () => {
+  // A file that exists only got there via this module's own atomic writer, so
+  // corruption while present is a sign of external tampering (garbling), not
+  // "never configured." Reading it as the OFF default would silently flip an
+  // opted-in user back to plaintext storage — exactly what this guards against.
   for (const bad of ['not-json', '[]', '"on"', 'null', '123']) {
-    assert.deepEqual(readSecretStoragePolicy(fakeIo(bad)), { on: false, migrated: false })
+    const io = fakeIo(bad)
+
+    assert.deepEqual(readSecretStoragePolicy(io), { on: true, migrated: true })
+    // The corrupt bytes are quarantined so a later write doesn't erase them.
+    assert.equal(io.fileText(), null)
   }
+})
+
+test('a corrupt policy file logs once and is quarantined via preserveCorruptPolicy', () => {
+  const io = fakeIo('{not json')
+
+  readSecretStoragePolicy(io)
+
+  assert.equal(io.logs.length, 1)
+  assert.match(io.logs[0], /corrupt or malformed/)
 })
 
 test('truthy-but-not-true values do NOT enable encryption', () => {

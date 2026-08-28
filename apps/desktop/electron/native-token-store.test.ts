@@ -225,11 +225,15 @@ test('a locked keychain keeps the stored entry for a later retry', () => {
   assert.deepEqual(locked.fileText(), first.fileText())
 })
 
-test('a corrupt store file loads as signed out instead of throwing', () => {
+test('a corrupt store file loads as signed out and logs the corruption instead of throwing', () => {
   const disk = createFakeDisk('{not json')
 
   assert.equal(loadNativeTokenSet(GATEWAY, disk.io), null)
-  assert.deepEqual(disk.logs, [])
+  // Unlike a merely-absent store (logs stay empty), a PRESENT-but-corrupt
+  // store is worth a log line: it's likely a truncated write, not "never
+  // used" — see readStore()'s doc comment in native-token-store.ts.
+  assert.equal(disk.logs.length, 1)
+  assert.match(disk.logs[0], /corrupt/)
 })
 
 test('an array store file loads as signed out instead of throwing', () => {
@@ -306,6 +310,72 @@ test('a non-Error write failure keeps its detail in the log', () => {
   // the only diagnostic there was.
   assert.doesNotThrow(() => persistNativeTokenSet(GATEWAY, TOKENS, disk.io))
   assert.equal(disk.logs[0], '[native-oauth] failed to persist tokens: disk went away')
+})
+
+// --- crash-safety: corrupt-store quarantine must not destroy other gateways ---
+//
+// The bug this guards against: a truncated write (kill -9 mid-persist with a
+// non-atomic writer) leaves the JSON unparseable. readStore() used to treat
+// that identically to "file never existed" — empty object, no signal — so the
+// very next persist() for ANY gateway would silently drop every other
+// gateway's stored refresh token by writing a fresh store containing only the
+// current entry. Quarantining the corrupt bytes instead of reading them as
+// empty-and-then-overwriting is what makes that no longer possible: the
+// corrupt file is moved aside before it can be clobbered, and a caller that
+// still wants to write is writing a genuinely fresh store, not overwriting
+// evidence.
+
+test('preserveCorruptStore is invoked exactly once when the store fails to parse', () => {
+  let quarantines = 0
+
+  const disk = createFakeDisk('{not valid json at all', {
+    preserveCorruptStore: () => {
+      quarantines += 1
+    }
+  })
+
+  loadNativeTokenSet(GATEWAY, disk.io)
+
+  assert.equal(quarantines, 1)
+})
+
+test('a quarantine failure does not prevent the corrupt store from still being read as empty', () => {
+  const disk = createFakeDisk('{not valid json at all', {
+    preserveCorruptStore: () => {
+      throw new Error('rename failed: EACCES')
+    }
+  })
+
+  // The quarantine attempt itself failing must not throw out of loadNativeTokenSet —
+  // "refuse to trust corrupt bytes" must hold even when quarantining is impossible.
+  assert.equal(loadNativeTokenSet(GATEWAY, disk.io), null)
+})
+
+test('an io without preserveCorruptStore (older/simpler callers) still refuses to trust corrupt bytes', () => {
+  // preserveCorruptStore is optional on the interface; omitting it must not
+  // change the safety property — corruption still reads as empty, not as a
+  // thrown error that could crash the caller.
+  const disk = createFakeDisk('{not valid json at all')
+
+  delete (disk.io as any).preserveCorruptStore
+
+  assert.equal(loadNativeTokenSet(GATEWAY, disk.io), null)
+})
+
+test('array store and truly-corrupt-JSON store are told apart: only the latter is quarantined', () => {
+  // An array is a deliberate "start fresh" case (see readStore's doc comment)
+  // — it's valid JSON, just the wrong shape, so there's nothing to preserve.
+  let arrayQuarantines = 0
+  const arrayDisk = createFakeDisk('[]', { preserveCorruptStore: () => (arrayQuarantines += 1) })
+
+  loadNativeTokenSet(GATEWAY, arrayDisk.io)
+  assert.equal(arrayQuarantines, 0, 'a syntactically valid array must not be treated as corruption')
+
+  let jsonQuarantines = 0
+  const corruptDisk = createFakeDisk('{not json', { preserveCorruptStore: () => (jsonQuarantines += 1) })
+
+  loadNativeTokenSet(GATEWAY, corruptDisk.io)
+  assert.equal(jsonQuarantines, 1, 'unparseable JSON must be quarantined')
 })
 
 test('an unusable keychain fails the write loudly and writes nothing', () => {

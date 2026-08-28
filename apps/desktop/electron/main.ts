@@ -301,8 +301,10 @@ import { attachRendererConsoleCapture, formatRendererBoundaryReport } from './re
 import {
   classifyStoredSecret,
   readSecretStoragePolicy,
+  resolveSecureTokenStorageState,
   SECRET_STORAGE_POLICY_FILE,
   type SecretStoragePolicy,
+  type SecureTokenStorageState,
   writeSecretStoragePolicy
 } from './secret-storage-policy'
 import {
@@ -7351,9 +7353,34 @@ function _nativeTokenStoreIo(): NativeTokenStoreIo {
     encrypt: encryptDesktopSecret,
     decrypt: decryptDesktopSecret,
     readStoreText: () => fs.readFileSync(_nativeTokenStorePath(), 'utf8'),
+    // Atomic (temp file + rename, owner-only mode) via the same helper the
+    // adjacent secret-storage-policy.json write uses — a crash/power-loss/
+    // full-disk failure mid-write can now only ever leave the OLD file intact
+    // or the NEW file complete, never a truncated hybrid that reads as an
+    // empty store and silently drops every other gateway's tokens on the
+    // next persist.
     writeStoreText: (text: string) => {
       fs.mkdirSync(path.dirname(_nativeTokenStorePath()), { recursive: true })
-      fs.writeFileSync(_nativeTokenStorePath(), text, { mode: 0o600 })
+      writeSecretFileAtomic(_nativeTokenStorePath(), text, { encoding: 'utf8' })
+    },
+    // A store that fails to JSON.parse is quarantined instead of being
+    // silently treated as empty and then overwritten on the next persist —
+    // rename it aside so the corrupt bytes aren't lost to a "recoverable"
+    // read that isn't actually recoverable once the next write lands.
+    preserveCorruptStore: () => {
+      const target = _nativeTokenStorePath()
+      const quarantined = `${target}.corrupt-${Date.now()}`
+
+      try {
+        fs.renameSync(target, quarantined)
+        rememberLog(`[native-oauth] quarantined corrupt token store at ${quarantined}`)
+      } catch (error) {
+        rememberLog(
+          `[native-oauth] failed to quarantine corrupt token store: ${
+            error instanceof Error ? error.message : String(error)
+          }`
+        )
+      }
     },
     rememberLog
   }
@@ -8390,7 +8417,25 @@ const SECRET_STORAGE_POLICY_PATH = path.join(app.getPath('userData'), SECRET_STO
 
 const _secretStoragePolicyIo = {
   readText: () => fs.readFileSync(SECRET_STORAGE_POLICY_PATH, 'utf8'),
-  writeText: (text: string) => writeSecretFileAtomic(SECRET_STORAGE_POLICY_PATH, text, { encoding: 'utf8' })
+  writeText: (text: string) => writeSecretFileAtomic(SECRET_STORAGE_POLICY_PATH, text, { encoding: 'utf8' }),
+  // A present-but-corrupt policy file is quarantined rather than silently
+  // treated as the OFF default — see readSecretStoragePolicy's doc comment
+  // for why "corrupt while present" and "absent" must not read the same.
+  preserveCorruptPolicy: () => {
+    const quarantined = `${SECRET_STORAGE_POLICY_PATH}.corrupt-${Date.now()}`
+
+    try {
+      fs.renameSync(SECRET_STORAGE_POLICY_PATH, quarantined)
+      rememberLog(`[secret-storage] quarantined corrupt policy file at ${quarantined}`)
+    } catch (error) {
+      rememberLog(
+        `[secret-storage] failed to quarantine corrupt policy file: ${
+          error instanceof Error ? error.message : String(error)
+        }`
+      )
+    }
+  },
+  rememberLog
 }
 
 let _secretStoragePolicy: SecretStoragePolicy | null = null
@@ -8412,19 +8457,31 @@ function setSecretStoragePolicy(next: SecretStoragePolicy) {
  * Keychain availability as the renderer should see it. With encryption
  * opted out this must NOT probe safeStorage — isEncryptionAvailable() is
  * itself a keychain touch that raises the macOS dialog this feature exists
- * to avoid. We report `true` so no plain-text warning banners fire: storing
- * plaintext is the user's chosen (default) mode, not a degraded state.
+ * to avoid. We report `true` so the plain-text CONFIRMATION dialog (the
+ * "your keychain is broken, opt into plaintext to continue" flow) never
+ * fires: storing plaintext with the policy off is the user's chosen
+ * (default) mode, not a degraded state that needs a gate.
+ *
+ * This does NOT mean the renderer is blind to the real state — see
+ * probeSecureTokenStorageState() below, which both callers of this function
+ * also read and forward honestly as `secretStorageState`.
  */
 function probeSecureTokenStorage(): boolean {
-  if (!secretStoragePolicy().on) {
-    return true
-  }
+  const state = probeSecureTokenStorageState()
 
-  try {
-    return Boolean(safeStorage.isEncryptionAvailable())
-  } catch {
-    return false
-  }
+  return state.policyOn ? state.available : true
+}
+
+/**
+ * The full, honest answer to "is what I save right now actually OS-keychain
+ * encrypted?" — `{ available, policyOn }`. Unlike probeSecureTokenStorage()
+ * above (which exists only to gate the plaintext-opt-in CONFIRM dialog and
+ * intentionally reads as "fine" while the policy is off), this is what the
+ * renderer uses to show an honest, non-blocking "stored without OS keychain
+ * encryption" hint instead of asserting security it cannot back up.
+ */
+function probeSecureTokenStorageState(): SecureTokenStorageState {
+  return resolveSecureTokenStorageState(secretStoragePolicy(), () => Boolean(safeStorage.isEncryptionAvailable()))
 }
 
 /**
@@ -9075,6 +9132,12 @@ function sanitizeConnectionsRegistry(registry = readDesktopConnectionsRegistry()
   // offer the plain-text opt-in on keyring-less Linux instead of failing.
   // Policy-aware: never touches safeStorage while encryption is opted out.
   const secureTokenStorage = probeSecureTokenStorage()
+  // The renderer-facing honest state ({ available, policyOn }) so Settings can
+  // show "stored without OS keychain encryption" instead of trusting the
+  // gated `secureTokenStorage` flag above, which always reads true while the
+  // policy is off (that flag exists only to suppress the plain-text opt-in
+  // CONFIRM dialog, not to describe the actual encryption state).
+  const secretStorageState = probeSecureTokenStorageState()
 
   return {
     version: registry.version,
@@ -9082,6 +9145,7 @@ function sanitizeConnectionsRegistry(registry = readDesktopConnectionsRegistry()
     launchMode: registry.launchMode,
     lastUsed: registry.lastUsed,
     secureTokenStorage,
+    secretStorageState,
     connections: registry.connections.map(sanitizeRegistryConnection)
   }
 }
@@ -9235,6 +9299,9 @@ async function sanitizeDesktopConnectionConfig(config = readDesktopConnectionCon
   // true WITHOUT touching safeStorage — probing is itself a keychain touch
   // that raises the macOS password dialog (see probeSecureTokenStorage).
   const secureTokenStorage = probeSecureTokenStorage()
+  // The honest counterpart: { available, policyOn }. See
+  // sanitizeConnectionsRegistry for why the two are not the same signal.
+  const secretStorageState = probeSecureTokenStorageState()
 
   // Whether the currently saved token is stored in plain text (the keyring-less
   // opt-in path). The env override supplies its token from the environment, not
@@ -9272,6 +9339,10 @@ async function sanitizeDesktopConnectionConfig(config = readDesktopConnectionCon
     // Whether the OS keyring can encrypt a token; drives the plain-text opt-in
     // affordance in Settings → Gateway on keyring-less Linux.
     secureTokenStorage,
+    // The honest { available, policyOn } state (see probeSecureTokenStorageState)
+    // so the renderer can show a real "not OS-keychain encrypted" hint instead
+    // of relying on the gated `secureTokenStorage` flag above.
+    secretStorageState,
     // Whether the saved token is currently persisted in plain text.
     remoteTokenPlainText,
     sshHost: (ssh || savedSsh)?.host || '',

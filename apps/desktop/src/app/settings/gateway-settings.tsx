@@ -15,11 +15,13 @@ import {
   FileText,
   Globe,
   HelpCircle,
+  Info,
   Loader2,
   LogIn,
   Monitor,
   RefreshCw,
-  Terminal
+  Terminal,
+  X
 } from '@/lib/icons'
 import { coerceRemoteUrlScheme } from '@/lib/remote-url'
 import { selectableCardClass } from '@/lib/selectable-card'
@@ -47,6 +49,11 @@ interface GatewaySettingsState {
   // Whether OS-keychain-backed encryption (Electron safeStorage) is available.
   // Default true so we never gate on a value we haven't hydrated yet.
   secureTokenStorage: boolean
+  // The honest { available, policyOn } counterpart to secureTokenStorage —
+  // undefined until the first getConnectionConfig() response lands (or on an
+  // older Electron main that hasn't started sending it), in which case the
+  // renderer shows no hint rather than guessing.
+  secretStorageState?: { available: boolean; policyOn: boolean }
   // Whether the currently-persisted remote token is stored as plain text on
   // disk (opted-in on a machine without secure storage). Drives the warning banner.
   remoteTokenPlainText: boolean
@@ -61,6 +68,9 @@ interface GatewaySettingsState {
 }
 
 const SSH_HOST_CUSTOM = '__custom__'
+// One-time, non-blocking "stored without OS keychain encryption" hint.
+// Dismissal is per-machine (localStorage), not per-session.
+const SECRET_STORAGE_HINT_DISMISSED_KEY = 'hermes-secret-storage-hint-dismissed-v1'
 
 const EMPTY_STATE: GatewaySettingsState = {
   envOverride: false,
@@ -163,6 +173,42 @@ export function GatewaySettings({ embedded = false }: { embedded?: boolean } = {
   // in the main process and can legitimately prompt for keychain access.
   const [keychainEncryption, setKeychainEncryptionState] = useState(false)
   const [keychainEncryptionBusy, setKeychainEncryptionBusy] = useState(false)
+
+  // One-time, non-blocking "stored without OS keychain encryption" hint.
+  // Doesn't nag on every app restart once the user has seen and acknowledged
+  // it — but reappears if the state genuinely changes back to unencrypted
+  // later (see the effect below), since that's new information.
+  const [secretStorageHintDismissed, setSecretStorageHintDismissed] = useState(() => {
+    try {
+      return window.localStorage.getItem(SECRET_STORAGE_HINT_DISMISSED_KEY) === '1'
+    } catch {
+      return false
+    }
+  })
+
+  const dismissSecretStorageHint = () => {
+    setSecretStorageHintDismissed(true)
+
+    try {
+      window.localStorage.setItem(SECRET_STORAGE_HINT_DISMISSED_KEY, '1')
+    } catch {
+      // localStorage unavailable — degrade silently, hint just re-shows next visit.
+    }
+  }
+
+  // A hint that was dismissed while the policy was off should resurface if
+  // the user later turns encryption ON then it fails (available: false,
+  // policyOn: true) — that is new, actionable information, not a repeat of
+  // what they already dismissed.
+  const secretStorageUnencrypted =
+    state.secretStorageState !== undefined &&
+    !(state.secretStorageState.policyOn && state.secretStorageState.available)
+
+  useEffect(() => {
+    if (state.secretStorageState?.policyOn && !state.secretStorageState.available) {
+      setSecretStorageHintDismissed(false)
+    }
+  }, [state.secretStorageState?.policyOn, state.secretStorageState?.available])
 
   useEffect(() => {
     let cancelled = false
@@ -1523,6 +1569,35 @@ export function GatewaySettings({ embedded = false }: { embedded?: boolean } = {
 
       {embedded ? null : (
         <div className="mt-6 grid gap-1">
+          {/* Honest, non-blocking hint: the gated `secureTokenStorage` flag above
+              always reads "fine" while the policy is off, so this reads the real
+              { available, policyOn } state to tell the user what's actually
+              happening instead of asserting security it can't back up. */}
+          {secretStorageUnencrypted && !secretStorageHintDismissed ? (
+            <div className="mb-2 flex items-start gap-2 rounded-xl border border-(--stroke-nous) bg-muted/40 px-3 py-2.5 text-[length:var(--conversation-caption-font-size)]">
+              <Info className="mt-0.5 size-4 shrink-0 text-(--ui-text-tertiary)" />
+              <div className="flex-1">
+                <div className="font-medium">{g.secretStorageHintTitle}</div>
+                <div className="mt-1 leading-5 text-(--ui-text-tertiary)">{g.secretStorageHintDesc}</div>
+              </div>
+              <Button
+                className="shrink-0"
+                onClick={() => void setKeychainEncryption(true)}
+                size="sm"
+                variant="text"
+              >
+                {g.secretStorageHintEnable}
+              </Button>
+              <button
+                aria-label={g.secretStorageHintDismiss}
+                className="shrink-0 text-(--ui-text-tertiary) hover:text-(--ui-text-secondary)"
+                onClick={dismissSecretStorageHint}
+                type="button"
+              >
+                <X className="size-4" />
+              </button>
+            </div>
+          ) : null}
           <ToggleRow
             checked={keychainEncryption}
             description={g.keychainEncryptionDesc}
