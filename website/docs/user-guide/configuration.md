@@ -2510,6 +2510,20 @@ The delegation provider uses the same credential resolution as CLI/gateway start
 
 **Precedence:** `delegation.base_url` in config → `delegation.provider` in config → parent provider (inherited). `delegation.model` in config → parent model (inherited). Setting just `model` without `provider` changes only the model name while keeping the parent's credentials (useful for switching models within the same provider like OpenRouter).
 
+**Per-spawn overrides (`model` / `reasoning_effort` on `delegate_task`):** the `delegation.*` keys above are global — they apply to every delegation and cannot vary per spawn. For a heterogeneous batch (cheap mechanical tasks alongside one hard reasoning task), the agent can pass optional `model` and `reasoning_effort` arguments to `delegate_task`, either at the top level for a single goal, or as the default for every task in a `tasks[]` batch with a per-item value overriding it. The full precedence for both fields is:
+
+```
+per-spawn argument  >  global delegation.* pin  >  parent inheritance
+```
+
+A per-task value beats a top-level one, which beats `delegation.model` / `delegation.reasoning_effort` in config, which beats what the child would inherit from the parent. Omitting both fields preserves the inheritance behavior described above exactly.
+
+Per-spawn overrides are **credential-scoped**: they resolve through the same credential path as the global `delegation.provider` pin, so a child can only select a model on a provider this profile already has working credentials for. An unknown model or an unrecognized effort level returns a tool error naming the problem rather than silently running the child somewhere else. Validation only rejects on positive evidence — when a provider's catalog is unavailable (custom endpoints, a local Ollama that isn't answering), the model is accepted and the provider reports its own error.
+
+The resolved route is surfaced for auditability: the dispatch response carries a `routes` array (model, provider, and which precedence level supplied it), and each subagent's live transcript header names the model that child actually runs on.
+
+`reasoning_effort` accepts `none`, `minimal`, `low`, `medium`, `high`, `xhigh`, `max`, `ultra`. `none` disables thinking for that child. On providers and models without reasoning support the value is carried but never emitted on the wire, so it is a safe no-op rather than an error.
+
 **Width and depth:** `max_concurrent_children` caps how many subagents run in parallel per batch (default `3`, floor of 1, no ceiling). Can also be set via the `DELEGATION_MAX_CONCURRENT_CHILDREN` env var. When the model submits a `tasks` array longer than the cap, `delegate_task` returns a tool error explaining the limit rather than silently truncating. `max_spawn_depth` controls the delegation tree depth (clamped to 1-3). At the default `1`, delegation is flat: children cannot spawn grandchildren, and passing `role="orchestrator"` silently degrades to `leaf`. Raise to `2` so orchestrator children can spawn leaf grandchildren; `3` for three-level trees. The agent opts into orchestration per call via `role="orchestrator"`; `orchestrator_enabled: false` forces every child back to leaf regardless. Cost scales multiplicatively — at `max_spawn_depth: 3` with `max_concurrent_children: 3`, the tree can reach 3×3×3 = 27 concurrent leaf agents. See [Subagent Delegation → Depth Limit and Nested Orchestration](features/delegation.md#depth-limit-and-nested-orchestration) for usage patterns.
 
 ## Clarify
