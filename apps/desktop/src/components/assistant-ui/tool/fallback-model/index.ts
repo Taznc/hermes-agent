@@ -224,7 +224,7 @@ const BACKTICK_NOISE_RE = /`{3,}/g
 export const selectMessageRunning = (state: MessageRunningStateSlice) =>
   state.thread.isRunning && state.message.status?.type === 'running'
 
-function titleForTool(name: string): string {
+export function titleForTool(name: string): string {
   const normalized = name.replace(/^browser_/, '').replace(/^web_/, '')
 
   return normalized.split('_').filter(Boolean).map(capitalize).join(' ') || name
