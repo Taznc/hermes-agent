@@ -22,6 +22,7 @@ import {
 } from '@/hermes'
 import { useI18n } from '@/i18n'
 import { AlertCircle } from '@/lib/icons'
+import { reconnectBackoffDelayMs } from '@/lib/reconnect-backoff'
 import { cn } from '@/lib/utils'
 import { upsertDesktopActionTask } from '@/store/activity'
 import { confirm } from '@/store/confirm'
@@ -30,6 +31,9 @@ import type { ActionStatusResponse } from '@/types/hermes'
 
 const ACTION_POLL_MS = 1200
 const ACTION_POLL_LIMIT = 240 // ~5 minutes of polling before giving up.
+// Status-endpoint hiccups retry with backoff before giving up on the tail —
+// a single dropped poll must not permanently freeze a visible running action.
+const ACTION_TAIL_RETRY_LIMIT = 3
 
 function formatBytes(size: number): string {
   if (size <= 0) {
@@ -57,35 +61,55 @@ export function MaintenancePanel() {
 
   const [actionName, setActionName] = useState<null | string>(null)
   const [actionStatus, setActionStatus] = useState<ActionStatusResponse | null>(null)
+  const [actionTailLost, setActionTailLost] = useState(false)
   const [curator, setCurator] = useState<CuratorStatusResponse | null>(null)
   const [curatorBusy, setCuratorBusy] = useState(false)
+  const [curatorError, setCuratorError] = useState('')
   const [memory, setMemory] = useState<MemoryStatusResponse | null>(null)
   const [memoryBusy, setMemoryBusy] = useState(false)
+  const [memoryError, setMemoryError] = useState('')
   const [share, setShare] = useState<DebugShareResponse | null>(null)
   const [sharing, setSharing] = useState(false)
   const [error, setError] = useState('')
 
-  useEffect(() => {
-    let cancelled = false
+  const loadCurator = useCallback(async () => {
+    setCuratorError('')
 
-    getCuratorStatus()
-      .then(next => !cancelled && setCurator(next))
-      .catch(() => {})
-    getMemoryStatus()
-      .then(next => !cancelled && setMemory(next))
-      .catch(() => {})
-
-    return () => void (cancelled = true)
+    try {
+      setCurator(await getCuratorStatus())
+    } catch (err) {
+      // Surfaced inline (error row + Retry) instead of an eternal PageLoader —
+      // a timeout, 500, or an older backend missing the route must not spin forever.
+      setCuratorError(err instanceof Error ? err.message : String(err))
+    }
   }, [])
+
+  const loadMemory = useCallback(async () => {
+    setMemoryError('')
+
+    try {
+      setMemory(await getMemoryStatus())
+    } catch (err) {
+      setMemoryError(err instanceof Error ? err.message : String(err))
+    }
+  }, [])
+
+  useEffect(() => {
+    void loadCurator()
+    void loadMemory()
+  }, [loadCurator, loadMemory])
 
   // Tail the most recently launched spawn action.
   useEffect(() => {
+    setActionTailLost(false)
+
     if (!actionName) {
       return
     }
 
     let cancelled = false
     let polls = 0
+    let consecutiveFailures = 0
     let timer: null | number = null
 
     const poll = async () => {
@@ -96,6 +120,7 @@ export function MaintenancePanel() {
           return
         }
 
+        consecutiveFailures = 0
         setActionStatus(status)
         upsertDesktopActionTask(status)
         polls += 1
@@ -104,7 +129,21 @@ export function MaintenancePanel() {
           timer = window.setTimeout(() => void poll(), ACTION_POLL_MS)
         }
       } catch {
-        // Status endpoint hiccup — stop tailing; the activity rail still has the task.
+        if (cancelled) {
+          return
+        }
+
+        consecutiveFailures += 1
+
+        if (consecutiveFailures >= ACTION_TAIL_RETRY_LIMIT) {
+          // Status endpoint keeps failing — stop tailing rather than freeze the
+          // panel silently forever. The activity rail still has the task.
+          setActionTailLost(true)
+
+          return
+        }
+
+        timer = window.setTimeout(() => void poll(), reconnectBackoffDelayMs(consecutiveFailures - 1))
       }
     }
 
@@ -180,14 +219,14 @@ export function MaintenancePanel() {
       try {
         const result = await resetMemory(target)
         notify({ kind: 'success', title: mm.resetDone(result.deleted.join(', ') || label), message: '' })
-        setMemory(await getMemoryStatus())
+        await loadMemory()
       } catch (err) {
         notifyError(err, mm.resetFailed)
       } finally {
         setMemoryBusy(false)
       }
     },
-    [mm]
+    [loadMemory, mm]
   )
 
   return (
@@ -254,25 +293,45 @@ export function MaintenancePanel() {
           </div>
         )}
 
-        {actionStatus && (
+        {(actionStatus || actionTailLost) && (
           <div className="mt-2">
             <div className="mb-1.5 flex items-center gap-2 text-[0.68rem] font-semibold uppercase tracking-[0.12em] text-muted-foreground">
               {mm.viewLog}
-              {actionStatus.running && <span className="normal-case tracking-normal">{mm.running}</span>}
+              {actionStatus?.running && !actionTailLost && (
+                <span className="normal-case tracking-normal">{mm.running}</span>
+              )}
+              {actionTailLost && (
+                <span className="inline-flex items-center gap-1 normal-case tracking-normal text-destructive">
+                  <AlertCircle className="size-3" />
+                  {mm.actionTailLost}
+                </span>
+              )}
             </div>
-            <pre
-              className="max-h-48 overflow-auto whitespace-pre-wrap wrap-break-word rounded-lg border border-(--ui-stroke-tertiary) bg-(--ui-bg-quinary) p-3 font-mono text-[0.65rem] leading-relaxed text-(--ui-text-tertiary)"
-              data-selectable-text="true"
-            >
-              {actionStatus.lines.join('\n')}
-            </pre>
+            {actionStatus && (
+              <pre
+                className="max-h-48 overflow-auto whitespace-pre-wrap wrap-break-word rounded-lg border border-(--ui-stroke-tertiary) bg-(--ui-bg-quinary) p-3 font-mono text-[0.65rem] leading-relaxed text-(--ui-text-tertiary)"
+                data-selectable-text="true"
+              >
+                {actionStatus.lines.join('\n')}
+              </pre>
+            )}
           </div>
         )}
       </section>
 
       <section>
         <SectionLabel>{mm.curator}</SectionLabel>
-        {!curator ? (
+        {curatorError ? (
+          <div className="flex min-h-16 flex-col items-start justify-center gap-2 py-2">
+            <span className="inline-flex items-center gap-1 text-[length:var(--conversation-caption-font-size)] text-destructive">
+              <AlertCircle className="size-3.5" />
+              {mm.curatorLoadFailed}
+            </span>
+            <Button onClick={() => void loadCurator()} size="xs" variant="text">
+              {mm.retry}
+            </Button>
+          </div>
+        ) : !curator ? (
           <PageLoader className="min-h-16" label={mm.curator} />
         ) : (
           <div className="flex items-center justify-between gap-3 py-2">
@@ -318,7 +377,17 @@ export function MaintenancePanel() {
 
       <section>
         <SectionLabel>{mm.memoryData}</SectionLabel>
-        {!memory ? (
+        {memoryError ? (
+          <div className="flex min-h-16 flex-col items-start justify-center gap-2 py-2">
+            <span className="inline-flex items-center gap-1 text-[length:var(--conversation-caption-font-size)] text-destructive">
+              <AlertCircle className="size-3.5" />
+              {mm.memoryLoadFailed}
+            </span>
+            <Button onClick={() => void loadMemory()} size="xs" variant="text">
+              {mm.retry}
+            </Button>
+          </div>
+        ) : !memory ? (
           <PageLoader className="min-h-16" label={mm.memoryData} />
         ) : (
           <div>

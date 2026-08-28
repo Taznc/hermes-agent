@@ -1813,7 +1813,11 @@ export const zhAuthored: Translations = {
       actionStarted: name => `${name} 已启动 — 正在跟踪日志…`,
       actionFailed: name => `${name} 启动失败`,
       running: '运行中…',
-      viewLog: '操作日志'
+      viewLog: '操作日志',
+      curatorLoadFailed: '无法加载维护器状态',
+      memoryLoadFailed: '无法加载记忆数据',
+      retry: '重试',
+      actionTailLost: '已失去该任务的跟踪 — 请在活动栏中查看'
     }
   },
 
@@ -3356,6 +3360,7 @@ export const zhAuthored: Translations = {
     thread: {
       loadingSession: '正在加载会话',
       showEarlier: '显示更早的消息',
+      showEarlierFailed: '无法加载更早的消息',
       loadingResponse: 'Hermes 正在加载回复',
       resumeWhenBackgroundDone: count =>
         count === 1 ? '后台任务完成后将自动继续' : `${count} 个后台任务完成后将自动继续`,

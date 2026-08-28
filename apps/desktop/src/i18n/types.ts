@@ -1407,6 +1407,10 @@ export interface Translations {
       actionFailed: (name: string) => string
       running: string
       viewLog: string
+      curatorLoadFailed: string
+      memoryLoadFailed: string
+      retry: string
+      actionTailLost: string
     }
   }
 
@@ -2730,6 +2734,7 @@ export interface Translations {
     thread: {
       loadingSession: string
       showEarlier: string
+      showEarlierFailed: string
       loadingResponse: string
       resumeWhenBackgroundDone: (count: number) => string
       thinking: string
