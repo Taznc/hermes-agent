@@ -1,0 +1,345 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<title>Kanban dependency visibility — mockup</title>
+<style>
+  :root{
+    --bg:#0a0c0e; --col:#0e1114; --card:#12161a; --card2:#151a1f;
+    --line:#1e242b; --line2:#2a323b;
+    --t1:#e6edf3; --t2:#b3bfcb; --t3:#7d8b99; --t4:#5a6672;
+    --red:#f87171; --amber:#fbbf24; --blue:#60a5fa; --green:#34d399;
+    --violet:#a78bfa; --slate:#94a3b8;
+    --mono:ui-monospace,SFMono-Regular,"SF Mono",Menlo,monospace;
+  }
+  *{box-sizing:border-box}
+  body{margin:0;background:var(--bg);color:var(--t1);
+    font:13px/1.45 -apple-system,BlinkMacSystemFont,"Segoe UI",Inter,sans-serif;
+    padding:28px 32px 60px}
+  h1{font-size:16px;font-weight:600;margin:0 0 4px}
+  .sub{color:var(--t3);font-size:12px;margin-bottom:26px}
+  .sec{margin:0 0 34px}
+  .sech{display:flex;align-items:baseline;gap:10px;margin:0 0 4px}
+  .num{display:grid;place-items:center;width:20px;height:20px;border-radius:5px;
+    background:#182029;color:var(--blue);font:600 11px/1 var(--mono);flex:none}
+  .sect{font-size:13.5px;font-weight:600}
+  .secd{color:var(--t3);font-size:11.5px;margin:0 0 12px 30px;max-width:760px}
+  .frame{border:1px solid var(--line);border-radius:10px;background:var(--col);
+    padding:14px;margin-left:30px;max-width:960px}
+  .lbl{font:600 9.5px/1 var(--mono);letter-spacing:.12em;color:var(--t4);
+    text-transform:uppercase;margin:0 0 9px;display:flex;align-items:center;gap:6px}
+  .id{font:11px/1 var(--mono);color:var(--t3);background:#191f26;
+    padding:3px 5px;border-radius:4px}
+
+  /* ---------- dependency rows ---------- */
+  .drow{display:flex;align-items:center;gap:9px;padding:7px 8px;border-radius:7px;
+    border:1px solid transparent;cursor:pointer;transition:.12s}
+  .drow:hover{background:#171d23;border-color:var(--line2)}
+  .dot{width:7px;height:7px;border-radius:50%;flex:none}
+  .dtitle{flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;
+    white-space:nowrap;font-size:12.5px;color:var(--t2)}
+  .drow:hover .dtitle{color:var(--t1)}
+  .pill{font:600 9.5px/1 var(--mono);letter-spacing:.06em;text-transform:uppercase;
+    padding:3px 6px;border-radius:4px;flex:none}
+  .ava{width:16px;height:16px;border-radius:50%;flex:none;display:grid;
+    place-items:center;font:600 9px/1 var(--mono);color:#0a0c0e}
+  .x{width:20px;height:20px;border-radius:5px;display:grid;place-items:center;
+    color:var(--t4);flex:none;font-size:13px;opacity:0;transition:.12s;border:0;
+    background:transparent;cursor:pointer}
+  .drow:hover .x{opacity:1}
+  .x:hover{background:#3a1d1f;color:var(--red)}
+  .gate{border-left:2px solid var(--red);background:#160f10;border-radius:4px 7px 7px 4px}
+  .gate:hover{background:#1c1214}
+  .clear{border-left:2px solid var(--green);background:#0d1512;border-radius:4px 7px 7px 4px}
+  .clear:hover{background:#101a16}
+  .grp{display:flex;align-items:center;gap:8px;margin:12px 0 6px}
+  .grpl{font:600 10px/1 var(--mono);letter-spacing:.1em;text-transform:uppercase}
+  .rule{flex:1;height:1px;background:var(--line)}
+  .cnt{font:600 10px/1 var(--mono);color:var(--t4)}
+  .addbtn{margin-top:10px;width:100%;padding:7px;border-radius:7px;
+    border:1px dashed var(--line2);background:transparent;color:var(--t4);
+    font-size:11.5px;cursor:pointer;transition:.12s}
+  .addbtn:hover{border-color:var(--blue);color:var(--blue);background:#0e1620}
+  .banner{display:flex;align-items:center;gap:9px;padding:9px 11px;border-radius:8px;
+    background:#1a1113;border:1px solid #3a1f22;margin-bottom:14px}
+  .banner b{color:var(--red);font-weight:600}
+  .bantxt{font-size:12px;color:var(--t2);flex:1}
+  .btn{padding:5px 9px;border-radius:6px;border:1px solid var(--line2);
+    background:#1a2029;color:var(--t2);font-size:11px;cursor:pointer;flex:none}
+  .btn:hover{background:#222a34;color:var(--t1);border-color:#3a444f}
+  .btn.pri{background:#1e2b3d;border-color:#2c4058;color:#9ec5f5}
+  .btn.pri:hover{background:#25364c}
+
+  /* ---------- mini board ---------- */
+  .board{display:flex;gap:10px;overflow:hidden}
+  .bcol{flex:1;min-width:0;background:#0c0f12;border:1px solid var(--line);
+    border-radius:8px;padding:8px}
+  .bch{display:flex;align-items:center;gap:6px;margin-bottom:8px}
+  .bct{font:600 9.5px/1 var(--mono);letter-spacing:.12em;text-transform:uppercase;
+    color:var(--t3)}
+  .mc{background:var(--card);border:1px solid var(--line);border-left-width:2px;
+    border-radius:6px;padding:8px;margin-bottom:7px;cursor:pointer;transition:.15s}
+  .mc:last-child{margin-bottom:0}
+  .mct{font-size:11.5px;color:var(--t2);line-height:1.35;margin-bottom:7px;
+    display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical;overflow:hidden}
+  .mcf{display:flex;align-items:center;gap:6px}
+  .chip{display:inline-flex;align-items:center;gap:4px;padding:2px 5px;border-radius:4px;
+    font:600 9.5px/1 var(--mono);letter-spacing:.03em}
+  .chip.blk{background:#2a1416;color:#f0a0a0}
+  .chip.blks{background:#1c2530;color:#8fb6e0}
+  .chip.rdy{background:#12251d;color:#6ee7b7}
+  .mid{margin-left:auto;font:10px/1 var(--mono);color:var(--t4)}
+  /* focus mode */
+  .board.focus .mc{opacity:.22;filter:saturate(.3)}
+  .board.focus .mc.sel{opacity:1;filter:none;border-color:var(--t2);
+    box-shadow:0 0 0 1px var(--t2),0 4px 18px #0008}
+  .board.focus .mc.up{opacity:1;filter:none;border-color:var(--amber);
+    box-shadow:0 0 0 1px #fbbf2455}
+  .board.focus .mc.down{opacity:1;filter:none;border-color:var(--blue);
+    box-shadow:0 0 0 1px #60a5fa55}
+  .flag{display:none;font:600 9px/1 var(--mono);letter-spacing:.08em;
+    text-transform:uppercase;padding:2px 4px;border-radius:3px;margin-bottom:5px}
+  .board.focus .mc.up .flag,.board.focus .mc.down .flag,
+  .board.focus .mc.sel .flag{display:inline-block}
+  .mc.up .flag{background:#2e2410;color:var(--amber)}
+  .mc.down .flag{background:#131f2e;color:var(--blue)}
+  .mc.sel .flag{background:#20262d;color:var(--t2)}
+  .hint{font-size:11px;color:var(--t4);margin-top:10px;display:flex;
+    align-items:center;gap:8px}
+  kbd{font:10px/1 var(--mono);background:#1a2028;border:1px solid var(--line2);
+    border-bottom-width:2px;border-radius:4px;padding:3px 5px;color:var(--t3)}
+
+  /* ---------- triage list ---------- */
+  .tr{border:1px solid var(--line);border-radius:8px;background:var(--card);
+    margin-bottom:9px;overflow:hidden}
+  .trh{display:flex;align-items:center;gap:9px;padding:9px 11px;background:#141a20}
+  .trt{flex:1;font-size:12.5px;color:var(--t1);min-width:0;overflow:hidden;
+    text-overflow:ellipsis;white-space:nowrap}
+  .trb{padding:4px 8px 9px 28px;position:relative}
+  .trb::before{content:"";position:absolute;left:17px;top:0;bottom:14px;
+    width:1px;background:var(--line2)}
+  .stat{font:600 10px/1 var(--mono);padding:3px 6px;border-radius:4px;flex:none}
+  .stat.wait{background:#2a1416;color:#f0a0a0}
+  .stat.ok{background:#12251d;color:#6ee7b7}
+  .foot{margin:34px 0 0 30px;max-width:960px;border-top:1px solid var(--line);
+    padding-top:14px;color:var(--t3);font-size:11.5px}
+  .foot b{color:var(--t2);font-weight:600}
+  .foot code{font:11px/1 var(--mono);background:#171d23;padding:2px 5px;
+    border-radius:4px;color:#9ec5f5}
+  .gone{display:none!important}
+</style>
+</head>
+<body>
+
+<h1>Blocked / blocking — visibility &amp; manual control</h1>
+<div class="sub">Four changes, all buildable on the endpoints that already exist. Interactive: try the ×, and click a card in §3.</div>
+
+<!-- 1 -->
+<div class="sec">
+  <div class="sech"><span class="num">1</span><span class="sect">Drawer: dependency rows that actually say something</span></div>
+  <div class="secd">Today this section is bare short-id chips — <span class="id">31ee24</span> <span class="id">d61c0d</span> — so you must open each one to learn anything. The board cache already holds every task's title, status and assignee, so the same ids can resolve to full rows with zero extra fetches. Blockers are split into <b style="color:var(--red)">still gating</b> vs <b style="color:var(--green)">satisfied</b>, and each row gets an unlink button.</div>
+  <div class="frame">
+    <div class="banner">
+      <span style="color:var(--red);font-size:14px">⛔</span>
+      <span class="bantxt"><b>Waiting on 1 of 2 blockers.</b> This card cannot enter Ready until <span class="id">31ee24</span> is done.</span>
+      <button class="btn pri" onclick="alert('PATCH /tasks/:id { status: \'ready\' } — force-promotes past the gate')">Force ready</button>
+    </div>
+
+    <div class="lbl">Dependencies</div>
+
+    <div class="grp"><span class="grpl" style="color:var(--red)">Blocked by</span>
+      <span class="cnt" id="c-up">2</span><span class="rule"></span></div>
+
+    <div class="drow gate" id="r1">
+      <span class="dot" style="background:var(--red)"></span>
+      <span class="pill" style="background:#2a1416;color:#f0a0a0">blocked</span>
+      <span class="dtitle">Session config drawer: honor per-profile execution overrides</span>
+      <span class="ava" style="background:var(--blue)">c</span>
+      <span class="id">31ee24</span>
+      <button class="x" title="Remove this dependency" onclick="drop('r1','c-up')">✕</button>
+    </div>
+
+    <div class="drow clear" id="r2">
+      <span class="dot" style="background:var(--green)"></span>
+      <span class="pill" style="background:#12251d;color:#6ee7b7">done</span>
+      <span class="dtitle">Rate limit descriptor wiring for account-limits RPC</span>
+      <span class="ava" style="background:var(--green)">c</span>
+      <span class="id">d61c0d</span>
+      <button class="x" title="Remove this dependency" onclick="drop('r2','c-up')">✕</button>
+    </div>
+
+    <div class="grp"><span class="grpl" style="color:var(--blue)">Blocks</span>
+      <span class="cnt" id="c-down">1</span><span class="rule"></span></div>
+
+    <div class="drow" id="r3">
+      <span class="dot" style="background:var(--t3)"></span>
+      <span class="pill" style="background:#1a2029;color:var(--t3)">todo</span>
+      <span class="dtitle">Kanban new task support pasting images</span>
+      <span class="ava" style="background:var(--amber)">o</span>
+      <span class="id">149f7c</span>
+      <button class="x" title="Remove this dependency" onclick="drop('r3','c-down')">✕</button>
+    </div>
+
+    <button class="addbtn" onclick="alert('Opens a task picker → POST /links {parent_id, child_id}')">+ Add a dependency…</button>
+  </div>
+</div>
+
+<!-- 2 -->
+<div class="sec">
+  <div class="sech"><span class="num">2</span><span class="sect">Card: say <em>why</em> it is sitting there</span></div>
+  <div class="secd">Cards already carry <code style="font:11px var(--mono)">link_counts</code>, but render it as an anonymous <span class="id">⛓ 4</span>. Splitting it into a red "blocked by N" and a blue "blocks N" chip means the Blocked column reads at a glance — and a card whose blockers are all done gets a green <b style="color:var(--green)">ready</b> chip, which is exactly the card you want to clear by hand.</div>
+  <div class="frame" style="max-width:340px">
+    <div class="mc" style="border-left-color:var(--red)">
+      <div class="mct">Session config drawer: honor per-profile execution overrides</div>
+      <div class="mcf">
+        <span class="chip blk">⛔ blocked by 2</span>
+        <span class="chip blks">↳ blocks 1</span>
+        <span class="mid">31ee24</span>
+      </div>
+    </div>
+    <div class="mc" style="border-left-color:var(--red)">
+      <div class="mct">Desktop plugin list loses ordering after profile swap</div>
+      <div class="mcf">
+        <span class="chip rdy">✓ blockers clear</span>
+        <span class="mid">4ab293</span>
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- 3 -->
+<div class="sec">
+  <div class="sech"><span class="num">3</span><span class="sect">Board: focus a card, see its whole chain</span></div>
+  <div class="secd">Click any card below. Everything unrelated dims; upstream blockers ring <b style="color:var(--amber)">amber</b>, downstream dependants ring <b style="color:var(--blue)">blue</b>. <code>/board</code> already reads the entire <code>task_links</code> table to compute counts — returning those pairs as an edge list is a couple of lines, and the highlight is pure CSS after that. Click empty space to clear.</div>
+  <div class="frame">
+    <div class="board" id="bd" onclick="clearFocus(event)">
+      <div class="bcol">
+        <div class="bch"><span class="dot" style="background:var(--t3)"></span><span class="bct">Todo</span></div>
+        <div class="mc" data-id="149f7c" style="border-left-color:var(--t3)" onclick="focusCard(event,'149f7c')">
+          <span class="flag">blocked by this</span>
+          <div class="mct">Kanban new task support pasting images</div>
+          <div class="mcf"><span class="chip blk">⛔ 1</span><span class="mid">149f7c</span></div>
+        </div>
+      </div>
+      <div class="bcol">
+        <div class="bch"><span class="dot" style="background:var(--green)"></span><span class="bct">Running</span></div>
+        <div class="mc" data-id="cae4c2" style="border-left-color:var(--green)" onclick="focusCard(event,'cae4c2')">
+          <span class="flag">blocked by this</span>
+          <div class="mct">Display attached images on task cards / detail view</div>
+          <div class="mcf"><span class="mid">cae4c2</span></div>
+        </div>
+        <div class="mc" data-id="29d147" style="border-left-color:var(--green)" onclick="focusCard(event,'29d147')">
+          <span class="flag">blocked by this</span>
+          <div class="mct">Fix web-spike bridge shim: disk plugins (incl. account-limits)</div>
+          <div class="mcf"><span class="chip blks">↳ 1</span><span class="mid">29d147</span></div>
+        </div>
+      </div>
+      <div class="bcol">
+        <div class="bch"><span class="dot" style="background:var(--red)"></span><span class="bct">Blocked</span></div>
+        <div class="mc sel" data-id="31ee24" style="border-left-color:var(--red)" onclick="focusCard(event,'31ee24')">
+          <span class="flag">focused</span>
+          <div class="mct">Session config drawer: honor per-profile execution overrides</div>
+          <div class="mcf"><span class="chip blk">⛔ 2</span><span class="chip blks">↳ 1</span><span class="mid">31ee24</span></div>
+        </div>
+      </div>
+      <div class="bcol">
+        <div class="bch"><span class="dot" style="background:var(--t4)"></span><span class="bct">Done</span></div>
+        <div class="mc" data-id="d61c0d" style="border-left-color:var(--t4)" onclick="focusCard(event,'d61c0d')">
+          <span class="flag">blocked by this</span>
+          <div class="mct">Rate limit descriptor wiring for account-limits RPC</div>
+          <div class="mcf"><span class="mid">d61c0d</span></div>
+        </div>
+      </div>
+    </div>
+    <div class="hint"><kbd>click</kbd> focus a chain · <kbd>esc</kbd> clear · amber = blocks it · blue = waits on it</div>
+  </div>
+</div>
+
+<!-- 4 -->
+<div class="sec">
+  <div class="sech"><span class="num">4</span><span class="sect">Blocked column: a triage list you can clear from</span></div>
+  <div class="secd">A toggle on the Blocked column header swaps cards for a nested list: each blocked task with its blockers indented under it, live status on each. The whole point is the right-hand action — cut the edge (<code>DELETE /links</code>) or force the card past its gate, without opening four drawers to work out what is holding it.</div>
+  <div class="frame">
+    <div class="tr">
+      <div class="trh">
+        <span class="dot" style="background:var(--red)"></span>
+        <span class="trt">Session config drawer: honor per-profile execution overrides</span>
+        <span class="stat wait">1 gating</span>
+        <span class="id">31ee24</span>
+      </div>
+      <div class="trb">
+        <div class="drow" id="t1">
+          <span class="dot" style="background:var(--red)"></span>
+          <span class="pill" style="background:#2a1416;color:#f0a0a0">blocked</span>
+          <span class="dtitle">Applying runtime overrides at dispatch</span>
+          <span class="id">7f8aa1</span>
+          <button class="x" onclick="drop('t1')">✕</button>
+        </div>
+        <div class="drow" id="t2">
+          <span class="dot" style="background:var(--green)"></span>
+          <span class="pill" style="background:#12251d;color:#6ee7b7">done</span>
+          <span class="dtitle">Rate limit descriptor wiring for account-limits RPC</span>
+          <span class="id">d61c0d</span>
+          <button class="x" onclick="drop('t2')">✕</button>
+        </div>
+      </div>
+    </div>
+    <div class="tr">
+      <div class="trh">
+        <span class="dot" style="background:var(--green)"></span>
+        <span class="trt">Desktop plugin list loses ordering after profile swap</span>
+        <span class="stat ok">all clear → promote</span>
+        <span class="id">4ab293</span>
+        <button class="btn pri" onclick="alert('PATCH /tasks/4ab293 { status: \'ready\' }')">Move to ready</button>
+      </div>
+    </div>
+  </div>
+</div>
+
+<div class="foot">
+  <b>Why this is all buildable now.</b>
+  §1 and §4 need no backend work at all — <code>GET /tasks/:id</code> already returns
+  <code>links.parents</code> / <code>links.children</code>, the board cache resolves those ids to
+  titles and statuses, and <code>POST /links</code> + <code>DELETE&nbsp;/links?parent_id&amp;child_id</code>
+  already exist for the ✕ and the add-picker. §2 reads
+  <code>link_counts</code>, which every card already carries.
+  §3 is the only one that touches Python: <code>/board</code> already
+  loads the full <code>task_links</code> table to build those counts, so it just has to also
+  return the pairs.
+</div>
+
+<script>
+function drop(id, counter){
+  const el = document.getElementById(id);
+  el.classList.add('gone');
+  if (counter){
+    const c = document.getElementById(counter);
+    c.textContent = Math.max(0, parseInt(c.textContent,10) - 1);
+  }
+}
+// upstream (blocks the key) / downstream (waits on the key)
+const EDGES = {
+  '31ee24': { up:['7f8aa1','d61c0d'], down:['149f7c'] },
+  '29d147': { up:[], down:['31ee24'] },
+  'cae4c2': { up:[], down:[] },
+  'd61c0d': { up:[], down:['31ee24'] },
+  '149f7c': { up:['31ee24'], down:[] }
+};
+function focusCard(ev, id){
+  ev.stopPropagation();
+  const bd = document.getElementById('bd');
+  bd.classList.add('focus');
+  const e = EDGES[id] || {up:[],down:[]};
+  bd.querySelectorAll('.mc').forEach(c=>{
+    c.classList.remove('sel','up','down');
+    const cid = c.dataset.id;
+    if (cid===id) c.classList.add('sel');
+    else if (e.up.includes(cid)) c.classList.add('up');
+    else if (e.down.includes(cid)) c.classList.add('down');
+  });
+}
+function clearFocus(){ document.getElementById('bd').classList.remove('focus'); }
+document.addEventListener('keydown', e=>{ if(e.key==='Escape') clearFocus(); });
+</script>
+</body>
+</html>
