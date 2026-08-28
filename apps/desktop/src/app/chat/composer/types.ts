@@ -40,6 +40,10 @@ export interface ChatBarProps {
   gateway?: HermesGateway | null
   queueSessionKey?: string | null
   sessionId?: string | null
+  /** The STORED session id (survives runtime-id churn across a reconnect) —
+   *  keys the reconnect catch-up / turn-lost notices, which live in
+   *  session-states.ts keyed by stored id, not runtime id. */
+  storedSessionId?: string | null
   cwd?: string | null
   onCancel: () => Promise<void> | void
   onAddContextRef?: (refText: string, label?: string, detail?: string) => void
@@ -53,6 +57,7 @@ export interface ChatBarProps {
   onPickFiles?: () => void
   onPickFolders?: () => void
   onPickImages?: () => void
+  onReload?: (parentId: string | null) => Promise<void>
   onRemoveAttachment?: (id: string) => void
   onSteer?: (text: string) => Promise<boolean> | boolean
   onSubmit: (value: string, options?: SubmitTextOptions) => Promise<boolean> | boolean

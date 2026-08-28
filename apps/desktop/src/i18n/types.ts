@@ -128,6 +128,7 @@ export interface Translations {
       desktopBootFailed: string
       gatewayConnectionLost: string
       gatewayConnectionLostDetail: string
+      gatewaySessionsStale: string
       gatewaySignInRequired: string
       ipcBridgeUnavailable: string
     }
@@ -1989,6 +1990,10 @@ export interface Translations {
     wakingProfile: (profile: string) => string
     placeholderStarting: string
     placeholderReconnecting: string
+    reconnectingBanner: string
+    catchingUpNotice: string
+    turnLostNotice: string
+    turnLostRegenerate: string
     placeholderFollowUp: string
     newSessionPlaceholders: readonly string[]
     followUpPlaceholders: readonly string[]

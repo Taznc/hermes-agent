@@ -83,6 +83,7 @@ export const en: Translations = {
       gatewayConnectionLost: 'Lost connection to the gateway',
       gatewayConnectionLostDetail:
         'Still retrying in the background. You can keep reading and drafting — open Gateway settings if this persists.',
+      gatewaySessionsStale: 'Reconnected, but sessions/settings could not refresh. Some lists may be stale.',
       gatewaySignInRequired: 'Gateway sign-in required',
       ipcBridgeUnavailable: 'Desktop IPC bridge is unavailable.'
     },
@@ -2316,6 +2317,10 @@ export const en: Translations = {
     wakingProfile: profile => `Waking up ${profile}…`,
     placeholderStarting: 'Starting Hermes...',
     placeholderReconnecting: 'Reconnecting to Hermes…',
+    reconnectingBanner: 'Reconnecting to Hermes — you can keep reading and typing.',
+    catchingUpNotice: 'Reconnected — catching up…',
+    turnLostNotice: 'This turn may not have completed during the disconnect.',
+    turnLostRegenerate: 'Regenerate',
     placeholderFollowUp: 'Send follow-up',
     newSessionPlaceholders: [
       'What are we building?',

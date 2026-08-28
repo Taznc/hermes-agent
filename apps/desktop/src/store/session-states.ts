@@ -119,6 +119,110 @@ export function setSessionStalled(storedSessionId: string | null | undefined, st
   }
 }
 
+// --- Reconnect catch-up / lost-turn tracking --------------------------------
+// A session that was BUSY right before the socket dropped gets its busy flag
+// force-cleared by reconcileBusyStatesOnReconnect (its runtime id died with
+// the old connection — see that function's docstring). That leaves two
+// indistinguishable outcomes with no UI difference: the backend turn is still
+// genuinely running and will re-assert busy on its next event ("catching
+// up"), or the backend died mid-turn and nothing more is ever coming ("turn
+// lost"). Both states are keyed by STORED session id (aliased) so the
+// composer/thread can show a one-line notice without caring which runtime id
+// eventually claims the session.
+export const $catchingUpSessionIds = atom<string[]>([])
+export const $turnLostSessionIds = atom<string[]>([])
+
+function setSessionCatchingUp(storedSessionId: string | null | undefined, catchingUp: boolean) {
+  if (!storedSessionId) {
+    return
+  }
+
+  const current = $catchingUpSessionIds.get()
+  const present = current.includes(storedSessionId)
+
+  if (catchingUp && !present) {
+    $catchingUpSessionIds.set([...current, storedSessionId])
+  } else if (!catchingUp && present) {
+    $catchingUpSessionIds.set(current.filter(id => id !== storedSessionId))
+  }
+}
+
+export function setSessionTurnLost(storedSessionId: string | null | undefined, lost: boolean) {
+  if (!storedSessionId) {
+    return
+  }
+
+  const current = $turnLostSessionIds.get()
+  const present = current.includes(storedSessionId)
+
+  if (lost && !present) {
+    $turnLostSessionIds.set([...current, storedSessionId])
+  } else if (!lost && present) {
+    $turnLostSessionIds.set(current.filter(id => id !== storedSessionId))
+  }
+}
+
+// Grace window a downgraded-busy session gets to re-assert itself (a genuinely
+// live turn re-publishes busy within a beat of reconnect) before its silence
+// is read as "the turn was lost", not merely "still catching up". Independent
+// of SESSION_WATCHDOG_TIMEOUT_MS (5 min, below) — that one covers a turn that
+// is still AUTHORITATIVELY busy but has gone quiet; this one covers a turn
+// reconcileBusyStatesOnReconnect just force-cleared because its runtime id
+// died with the old connection, so there is no authoritative state to wait on
+// at all past this window.
+export const RECONNECT_CATCHUP_GRACE_MS = 20_000
+const catchupGraceTimers = new Map<string, ReturnType<typeof setTimeout>>()
+
+function armCatchupGrace(storedSessionId: string | null | undefined) {
+  if (!storedSessionId) {
+    return
+  }
+
+  const existing = catchupGraceTimers.get(storedSessionId)
+
+  if (existing) {
+    clearTimeout(existing)
+  }
+
+  catchupGraceTimers.set(
+    storedSessionId,
+    setTimeout(() => {
+      catchupGraceTimers.delete(storedSessionId)
+
+      // Still catching up and nothing re-asserted busy in the window: read as
+      // lost rather than leaving an indefinite "catching up…" notice.
+      if ($catchingUpSessionIds.get().includes(storedSessionId)) {
+        setSessionCatchingUp(storedSessionId, false)
+        setSessionTurnLost(storedSessionId, true)
+      }
+    }, RECONNECT_CATCHUP_GRACE_MS)
+  )
+}
+
+function clearCatchupGrace(storedSessionId: string | null | undefined) {
+  if (!storedSessionId) {
+    return
+  }
+
+  const timer = catchupGraceTimers.get(storedSessionId)
+
+  if (timer) {
+    clearTimeout(timer)
+    catchupGraceTimers.delete(storedSessionId)
+  }
+}
+
+/** Dismiss the "turn lost" notice without regenerating — e.g. the user reads
+ *  the transcript and decides the reply actually did land. */
+export function dismissTurnLost(storedSessionId: string | null | undefined) {
+  if (!storedSessionId) {
+    return
+  }
+
+  clearCatchupGrace(storedSessionId)
+  setSessionTurnLost(storedSessionId, false)
+}
+
 // --- Watchdog: marks busy sessions quiet after a long stream silence -------
 // Tuned against what this app actually does rather than a round number: a
 // typecheck or a full test run here goes quiet for minutes at a stretch and is
@@ -210,6 +314,12 @@ function handleTransition(previous: ClientSessionState | null, next: ClientSessi
   if (next.busy) {
     setSessionStalled(next.storedSessionId, false)
     armWatchdog(runtimeId)
+    // A live turn re-asserting busy after a reconnect downgrade IS the
+    // "still running" resolution — clear both the transient catch-up notice
+    // and any (impossible, since this fired) turn-lost mark for this session.
+    clearCatchupGrace(next.storedSessionId)
+    setSessionCatchingUp(next.storedSessionId, false)
+    setSessionTurnLost(next.storedSessionId, false)
   } else {
     clearWatchdog(runtimeId)
     setSessionStalled(next.storedSessionId, false)
@@ -373,6 +483,14 @@ export function clearAllSessionStates() {
   clearAllProviderWaits()
   sessionScopeByRuntimeId.clear()
   $stalledSessionIds.set([])
+
+  for (const timer of catchupGraceTimers.values()) {
+    clearTimeout(timer)
+  }
+
+  catchupGraceTimers.clear()
+  $catchingUpSessionIds.set([])
+  $turnLostSessionIds.set([])
   $sessionStates.set({})
 }
 
@@ -414,6 +532,16 @@ export function reconcileBusyStatesOnReconnect(scope?: string) {
     if (scope === undefined ? recorded !== undefined : recorded !== scope) {
       continue
     }
+
+    // Mark as catching up and arm the grace window BEFORE downgrading: a
+    // session already re-asserting busy on the SAME publish (impossible here,
+    // since we're about to force it false) would otherwise race the mark.
+    // handleTransition (fired by publishSessionState below) clears both if
+    // the state genuinely settles as non-busy on its own terms; a live
+    // backend's next event instead re-publishes busy and handleTransition's
+    // busy branch clears the catch-up/lost marks for real.
+    setSessionCatchingUp(state.storedSessionId, true)
+    armCatchupGrace(state.storedSessionId)
 
     publishSessionState(runtimeId, { ...state, awaitingResponse: false, busy: false })
   }

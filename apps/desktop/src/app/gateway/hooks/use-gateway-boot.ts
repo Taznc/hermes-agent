@@ -70,10 +70,13 @@ import { stashGatewaySurvivor, survivorIsStale, takeGatewaySurvivor } from './ga
 // is required). Time-based (not attempt-count) because full-jitter backoff
 // makes attempt counts a meaningless clock.
 //
-// 5 minutes (not the historical ~45s) so brief transport weather — ticket mint
-// flaps, sleep/wake, Wi‑Fi blips that self-heal in 1–3 minutes — never even
-// toast. Chat stays readable/draftable the whole time either way.
-const RECONNECT_ESCALATE_AFTER_MS = 300_000
+// 25s (not the historical 5 minutes) so a genuine drop is admitted inside the
+// audit's ~20-30s budget instead of leaving "sends mysteriously fail" as the
+// only cue for minutes. The composer's own reconnecting banner (see
+// composer/index.tsx) already covers the immediate, non-alarming case — this
+// threshold is only for the louder toast, and a fast self-healing blip still
+// clears before it fires. Chat stays readable/draftable the whole time either way.
+const RECONNECT_ESCALATE_AFTER_MS = 25_000
 
 // Bound for the sleep/wake liveness probe (see reconnectNow): long enough to
 // ride out a busy-but-healthy backend's scheduling jitter, short enough that a
@@ -214,6 +217,13 @@ export function useGatewayBoot({
     // RECONNECT_ESCALATE_AFTER_MS so we fire a single non-blocking toast.
     // Reset on a clean open or a manual/wake-driven reconnect.
     let escalated = false
+    // Consecutive post-reconnect refreshSessions/refreshHermesConfig failures.
+    // A single miss is normal jitter (the socket only just reopened); two in a
+    // row means the sidebar/config are genuinely stuck stale behind an open
+    // socket, which used to fail silently (both calls were `.catch(() =>
+    // undefined)`). Surfaced once per streak, not per attempt.
+    let postReconnectRefreshFailures = 0
+    let refreshFailureNotified = false
     // Bounded automatic boot retry for transient REMOTE failures (#82679).
     let bootRetryAttempt = 0
     let bootRetryTimer: ReturnType<typeof setTimeout> | null = null
@@ -330,8 +340,34 @@ export function useGatewayBoot({
         // post-reconnect event.
         reconcileBusyStatesOnReconnect()
         // Resync state that may have moved on the backend while we were asleep.
-        await callbacksRef.current.refreshHermesConfig().catch(() => undefined)
-        await callbacksRef.current.refreshSessions().catch(() => undefined)
+        // Track repeated failures (not the odd blip on a socket that just
+        // reopened) so a backend that keeps rejecting these RPCs post-reconnect
+        // gets ONE visible notice instead of leaving the sidebar/config stale
+        // with no signal at all.
+        const configOk = await callbacksRef.current.refreshHermesConfig().then(
+          () => true,
+          () => false
+        )
+        const sessionsOk = await callbacksRef.current.refreshSessions().then(
+          () => true,
+          () => false
+        )
+
+        if (configOk && sessionsOk) {
+          postReconnectRefreshFailures = 0
+          refreshFailureNotified = false
+        } else {
+          postReconnectRefreshFailures += 1
+
+          if (postReconnectRefreshFailures >= 2 && !refreshFailureNotified) {
+            refreshFailureNotified = true
+            notify({
+              kind: 'warning',
+              message: translateNow('boot.errors.gatewaySessionsStale'),
+              durationMs: 8_000
+            })
+          }
+        }
       } catch (err) {
         // OAuth session expired mid-reconnect: surface the actionable "sign in
         // again" recovery overlay once instead of silently looping the backoff
@@ -395,6 +431,8 @@ export function useGatewayBoot({
       reconnectAttempt = 0
       reconnectFailingSince = null
       escalated = false
+      postReconnectRefreshFailures = 0
+      refreshFailureNotified = false
       reconnectSecondaryGateways({ forceOpenSockets: forceOpenSocket })
 
       // Browser WebSocket state can remain OPEN after sleep even though the OS
@@ -484,6 +522,8 @@ export function useGatewayBoot({
       reconnectAttempt = 0
       reconnectFailingSince = null
       escalated = false
+      postReconnectRefreshFailures = 0
+      refreshFailureNotified = false
       reauthNotified = false
       callbacksRef.current.beforeConnectionSwitch()
       wipeSessionListsForGatewaySwitch()
