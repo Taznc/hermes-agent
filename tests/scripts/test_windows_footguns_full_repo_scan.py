@@ -47,7 +47,11 @@ SCRIPT = REPO_ROOT / "scripts" / "check-windows-footguns.py"
 KNOWN_JS_TRUE_POSITIVES = {
     ("apps/desktop/src/lib/chat-runtime.ts", "template-literal filesystem path join with bare '/'"),
     ("apps/desktop/src/app/settings/plugins-settings.tsx", "template-literal filesystem path join with bare '/'"),
-    ("apps/desktop/src/app/right-sidebar/review/file-tree.tsx", "template-literal filesystem path join with bare '/'"),
+    # NOTE: right-sidebar/review/file-tree.tsx used to be listed here. The
+    # Windows path-correctness card (fcc6e84153) routed that join through
+    # path-compare.ts's cleanPath/comparisonPath, so the checker no longer
+    # flags it. Both cards were in flight at once; this allowlist was written
+    # against the pre-fix tree.
     ("apps/desktop/src/app/right-sidebar/files/ipc.ts", "template-literal filesystem path join with bare '/'"),
     ("apps/desktop/src/app/chat/composer/index.tsx", "metaKey without a ctrlKey fallback"),
     ("apps/desktop/src/store/coding-status.ts", "template-literal filesystem path join with bare '/'"),

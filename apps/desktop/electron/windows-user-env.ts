@@ -108,7 +108,7 @@ function readWindowsUserEnvVar(
   let stdout
 
   try {
-    stdout = runRegQuery<string>(['query', 'HKCU\Environment', '/v', name], {
+    stdout = runRegQuery<string>(['query', 'HKCU\\Environment', '/v', name], {
       exec: exec as (file?: string, args?: any, options?: any) => string,
       timeout: 5000
     })

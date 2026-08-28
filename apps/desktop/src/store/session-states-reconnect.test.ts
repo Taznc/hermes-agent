@@ -14,8 +14,8 @@ import {
   clearAllSessionStates,
   dismissTurnLost,
   publishSessionState,
-  RECONNECT_CATCHUP_GRACE_MS,
   reconcileBusyStatesOnReconnect,
+  RECONNECT_CATCHUP_GRACE_MS,
   recordSessionEventScope,
   SESSION_WATCHDOG_TIMEOUT_MS
 } from './session-states'

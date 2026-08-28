@@ -188,7 +188,6 @@ import {
 } from './find-in-page'
 import { createFirstRunSetupGate } from './first-run-setup-gate'
 import { registerFsIpc } from './fs-ipc'
-import { guardWatcherErrors, PreviewWatcherRegistry } from './preview-watchers'
 import {
   filenameFromContentDisposition,
   gatewayFilePath,
@@ -265,6 +264,7 @@ import { createPoolStopper } from './pool-stop'
 import { poolTouchKeys } from './pool-touch-scope'
 import { createKeepAwake } from './power-save'
 import { PreviewReachRegistry } from './preview-reach'
+import { guardWatcherErrors, PreviewWatcherRegistry } from './preview-watchers'
 import {
   createPrimaryRemoteConnection,
   FirstRunSetupResetError,
@@ -323,8 +323,8 @@ import {
   SESSION_WINDOW_MIN_WIDTH
 } from './session-windows'
 import { ensureLoginShellPath } from './shell-path'
-import { createBootstrapCoordinator, sshConfigFingerprint } from './ssh-bootstrap-coordinator'
 import { resolveSshBinary, SSH_BINARY_MISSING_MESSAGE } from './ssh-binary'
+import { createBootstrapCoordinator, sshConfigFingerprint } from './ssh-bootstrap-coordinator'
 import { collectSshConfigHosts, parseSshGOutput } from './ssh-config'
 import { createSshProbeConnection, pickLocalPort, redactSecrets, SshConnection } from './ssh-connection'
 import { createStreamThrottle } from './stream-throttle'

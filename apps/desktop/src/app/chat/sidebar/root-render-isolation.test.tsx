@@ -146,9 +146,10 @@ vi.mock('./split-submenu', () => ({
 }))
 vi.mock('./workspace-section', () => ({ SidebarWorkspaceSection: spySection('workspace') }))
 
-// eslint-disable-next-line import/first -- module mocks above must run before this import resolves
+// NOTE: these two imports intentionally sit BELOW the vi.mock() calls above —
+// the module mocks must be registered before these modules resolve.
 import { SidebarProvider } from '@/components/ui/sidebar'
-// eslint-disable-next-line import/first -- module mocks above must run before this import resolves
+
 import { ChatSidebar } from './index'
 
 const noop = () => {}
@@ -175,11 +176,11 @@ function Harness() {
         onArchiveSession={noop}
         onBranchSession={noop}
         onDeleteSession={noop}
+        onLoadMoreSessions={noop}
         onManageCronJob={noop}
         onNavigate={noop}
         onNewSessionInWorkspace={noop}
         onNewSessionSplit={noop}
-        onLoadMoreSessions={noop}
         onResumeSession={noop}
         onTriggerCronJob={() => Promise.resolve()}
       />

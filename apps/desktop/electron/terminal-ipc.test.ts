@@ -21,7 +21,15 @@ const { electronMock, nodePtyMock } = vi.hoisted(() => {
     ipcMain: {
       handle: (channel: string, handler: (event: unknown, ...args: unknown[]) => unknown) => {
         handlers.set(channel, handler)
-      }
+      },
+      // The PTY output-batching card added fire-and-forget `ipcMain.on`
+      // channels (write/resize/ack) alongside the existing `handle` ones.
+      // Registration must not throw here even though these tests only drive
+      // the invoke-style handlers.
+      on: (channel: string, handler: (event: unknown, ...args: unknown[]) => unknown) => {
+        handlers.set(channel, handler)
+      },
+      removeAllListeners: () => {}
     }
   }
 
@@ -106,7 +114,11 @@ function makeDeps() {
     findOnPath: () => null,
     getSshConnectionState: () => undefined,
     isWindows: false,
-    rememberLog: () => {}
+    rememberLog: () => {},
+    // Added by the Windows path-correctness card: terminal-ipc now takes the
+    // shared System32 → PATH → Git-for-Windows ssh resolver as a dependency.
+    // These tests only spawn local shells, so a plain 'ssh' satisfies it.
+    resolveSshBinary: () => 'ssh'
   }
 }
 

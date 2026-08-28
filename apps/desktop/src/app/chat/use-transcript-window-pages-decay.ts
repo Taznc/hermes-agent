@@ -46,6 +46,7 @@ export function useTranscriptWindowPagesDecay(
   const onDecayRef = useRef(onDecay)
   onDecayRef.current = onDecay
 
+  // eslint-disable-next-line no-restricted-syntax -- legitimate non-atom ref write (see eslint rule comment): stateRef is this hook's own decay accumulator, not a mirror of a reactive atom
   useEffect(() => {
     if (windowPages <= 1) {
       stateRef.current = INITIAL_WINDOW_PAGES_DECAY_STATE

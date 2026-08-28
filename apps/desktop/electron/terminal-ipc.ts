@@ -12,8 +12,8 @@ import nodePty from 'node-pty'
 
 import { resolveTerminalConnection } from './connection-apply'
 import { ensureSpawnHelperExecutable } from './spawn-helper-perms'
-import { buildInteractiveSshArgs } from './ssh-connection'
 import { SSH_BINARY_MISSING_MESSAGE } from './ssh-binary'
+import { buildInteractiveSshArgs } from './ssh-connection'
 import { createTerminalOutputBatcher } from './terminal-output-batcher'
 import { buildWindowsInteractiveCommand } from './windows-remote-lifecycle'
 
