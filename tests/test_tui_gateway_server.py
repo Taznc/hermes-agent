@@ -8051,6 +8051,166 @@ def test_config_set_approval_mode_persists_three_way_value_and_emits_live_status
     assert emitted[0][2]["approval_mode"] == "manual"
 
 
+def _profile_home_layout(tmp_path, monkeypatch, launch_mode, named_mode, name="work"):
+    """Launch profile + one named profile with DIFFERENT approval modes.
+
+    The desktop's app-global remote mode serves every profile from ONE backend,
+    so the ambient HERMES_HOME is the launch profile's. These tests assert the
+    named profile's own configured mode survives that, which is exactly what
+    regressed: a profile configured `smart` was reported as `manual`.
+    """
+    import yaml
+
+    launch_home = tmp_path / "launch"
+    launch_home.mkdir()
+    (launch_home / "config.yaml").write_text(
+        yaml.safe_dump({"approvals": {"mode": launch_mode}})
+    )
+
+    named_home = launch_home / "profiles" / name
+    named_home.mkdir(parents=True)
+    (named_home / "config.yaml").write_text(
+        yaml.safe_dump({"approvals": {"mode": named_mode}})
+    )
+
+    monkeypatch.setattr(server, "_hermes_home", launch_home)
+    monkeypatch.setenv("HERMES_HOME", str(launch_home))
+
+    return launch_home, named_home
+
+
+def test_config_get_approval_mode_resolves_the_requested_profile(tmp_path, monkeypatch):
+    """A configured `smart` profile must not report the launch profile's mode.
+
+    Initial-mode selection. The desktop statusbar caches approval mode per
+    profile and syncs it with config.get on mount; an unscoped read answered
+    for whichever profile launched the backend, so a profile configured
+    `smart` settled to `manual` right after session start.
+    """
+    _profile_home_layout(tmp_path, monkeypatch, launch_mode="manual", named_mode="smart")
+
+    scoped = server.handle_request(
+        {
+            "id": "1",
+            "method": "config.get",
+            "params": {"key": "approvals.mode", "profile": "work"},
+        }
+    )
+    assert scoped["result"]["value"] == "smart"
+
+    # The launch profile still answers for itself when no profile is named.
+    unscoped = server.handle_request(
+        {"id": "2", "method": "config.get", "params": {"key": "approvals.mode"}}
+    )
+    assert unscoped["result"]["value"] == "manual"
+
+
+def test_session_info_approval_mode_matches_its_own_profile_name(tmp_path, monkeypatch):
+    """`approval_mode` and `profile_name` must describe the SAME profile.
+
+    Initial-mode selection at the other divergence site: the payload derived
+    `profile_name` from the session's `profile_home` but resolved the mode
+    against the ambient home, so one dict named `work` and reported the launch
+    profile's mode.
+    """
+    _, named_home = _profile_home_layout(
+        tmp_path, monkeypatch, launch_mode="manual", named_mode="smart"
+    )
+
+    class _Agent:
+        model = "test/model"
+        provider = "test"
+        session_id = "sid"
+        reasoning_config = None
+        service_tier = None
+
+    session = {
+        "cwd": str(named_home),
+        "session_key": "sid",
+        "profile_home": str(named_home),
+    }
+    info = server._session_info(_Agent(), session)
+
+    assert info["profile_name"] == "work"
+    assert info["approval_mode"] == "smart"
+    # approvals.mode=off is the only bypass source here, and it isn't set.
+    assert info["yolo"] is False
+
+
+def test_session_info_approval_mode_survives_a_failing_yolo_lookup(tmp_path, monkeypatch):
+    """A failure in the session-yolo lookup must not publish a guessed mode.
+
+    `approval_mode` was seeded `"manual"` before the try block and the except
+    branch reset only `yolo`, so any exception raised before the resolver ran
+    shipped that guess to the desktop as authoritative backend truth.
+    """
+    _, named_home = _profile_home_layout(
+        tmp_path, monkeypatch, launch_mode="manual", named_mode="smart"
+    )
+
+    import tools.approval as approval_mod
+
+    def _boom(_key):
+        raise RuntimeError("session yolo lookup failed")
+
+    monkeypatch.setattr(approval_mod, "is_session_yolo_enabled", _boom)
+
+    class _Agent:
+        model = "test/model"
+        provider = "test"
+        session_id = "sid"
+        reasoning_config = None
+        service_tier = None
+
+    info = server._session_info(
+        _Agent(),
+        {"cwd": str(named_home), "session_key": "sid", "profile_home": str(named_home)},
+    )
+
+    assert info["approval_mode"] == "smart"
+
+
+def test_config_set_approval_mode_writes_to_the_requested_profile(tmp_path, monkeypatch):
+    """A mode change during a session must persist to that session's profile.
+
+    Mode-change coverage. A scoped read plus an unscoped write would land the
+    new value in the launch profile's config.yaml, so the menu would revert on
+    the next sync while the wrong profile's policy silently changed.
+    """
+    import yaml
+
+    launch_home, named_home = _profile_home_layout(
+        tmp_path, monkeypatch, launch_mode="manual", named_mode="smart"
+    )
+    monkeypatch.setattr(server, "_emit", lambda *args: None)
+
+    resp = server.handle_request(
+        {
+            "id": "1",
+            "method": "config.set",
+            "params": {"key": "approvals.mode", "value": "off", "profile": "work"},
+        }
+    )
+    assert resp["result"] == {"key": "approvals.mode", "value": "off"}
+
+    named_cfg = yaml.safe_load((named_home / "config.yaml").read_text())
+    launch_cfg = yaml.safe_load((launch_home / "config.yaml").read_text())
+    assert named_cfg["approvals"]["mode"] == "off"
+    # The launch profile must be untouched by another profile's change.
+    assert launch_cfg["approvals"]["mode"] == "manual"
+
+    # And the change is immediately observable through the scoped read — the
+    # round-trip the desktop menu actually performs.
+    readback = server.handle_request(
+        {
+            "id": "2",
+            "method": "config.get",
+            "params": {"key": "approvals.mode", "profile": "work"},
+        }
+    )
+    assert readback["result"]["value"] == "off"
+
+
 def test_pet_gallery_quoted_false_enabled_reports_disabled(tmp_path, monkeypatch):
     """display.pet.enabled: "false" (quoted) must report enabled=False.
 
@@ -19677,12 +19837,21 @@ def test_prompt_submit_releases_old_history_before_heap_trim(monkeypatch):
         monkeypatch.setattr(server, "_get_usage", lambda _a: {})
         monkeypatch.setattr(server, "render_message", lambda _t, _c: "")
         monkeypatch.setattr(server, "_emit", lambda *a: None)
-        monkeypatch.setattr(server, "set_hermes_home_override", lambda _home: object())
-        monkeypatch.setattr(
-            server,
-            "reset_hermes_home_override",
-            lambda _token: cleanup_order.append("reset_home"),
-        )
+        # Faithful stub: delegate to the real contextvar setter so
+        # get_hermes_home_override() actually reflects the bind. A no-op stub
+        # that still returned a token made the override invisible to readers,
+        # so profile-scoped resolvers (e.g. _session_info's approval-mode
+        # lookup) could not tell the profile was already bound and re-bound it
+        # — an artifact of the mock, not of production behavior.
+        _real_set = server.set_hermes_home_override
+        _real_reset = server.reset_hermes_home_override
+        monkeypatch.setattr(server, "set_hermes_home_override", lambda _home: _real_set(_home))
+
+        def _recording_reset(token):
+            cleanup_order.append("reset_home")
+            _real_reset(token)
+
+        monkeypatch.setattr(server, "reset_hermes_home_override", _recording_reset)
         monkeypatch.setattr("hermes_cli.mem_trim.trim_memory", _inspect_trim_frame)
 
         resp = server.handle_request(
@@ -19696,7 +19865,15 @@ def test_prompt_submit_releases_old_history_before_heap_trim(monkeypatch):
         assert resp is not None and resp.get("result")
         assert not observed["history"]
         assert not observed["run_kwargs"]
-        assert cleanup_order == ["trim", "reset_home"]
+        # Ordering invariant, not a call count: the trim must run before the
+        # turn's HERMES_HOME override is released. A later reset is legitimate
+        # — the settled `session.info` emit runs AFTER the turn releases its
+        # bind, so the profile-scoped approval-mode lookup in `_session_info`
+        # binds the session's profile itself (otherwise it would report the
+        # launch profile's mode for another profile's session).
+        assert cleanup_order[:2] == ["trim", "reset_home"]
+        assert set(cleanup_order) == {"trim", "reset_home"}
+        assert cleanup_order.count("trim") == 1
     finally:
         server._sessions.pop("sid_trim", None)
 

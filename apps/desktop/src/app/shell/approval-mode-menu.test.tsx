@@ -60,7 +60,11 @@ describe('approval mode statusbar item', () => {
     fireEvent.click(await screen.findByRole('menuitemradio', { name: /manual/i }))
 
     await waitFor(() => {
-      expect(requestGateway).toHaveBeenCalledWith('config.set', { key: 'approvals.mode', value: 'manual' })
+      expect(requestGateway).toHaveBeenCalledWith('config.set', {
+        key: 'approvals.mode',
+        profile: 'work',
+        value: 'manual'
+      })
       expect(screen.getByRole('button', { name: /manual/i })).toBeTruthy()
     })
   })

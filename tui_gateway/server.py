@@ -3938,7 +3938,16 @@ def _save_cfg(cfg: dict):
 
     from utils import atomic_roundtrip_yaml_save
 
-    path = _hermes_home / "config.yaml"
+    # Honor the same per-profile override `_load_cfg_raw` reads through.
+    # Without this the read and write halves of a `_load_cfg_raw` →  mutate →
+    # `_save_cfg` round-trip target DIFFERENT files whenever an override is
+    # active: the override profile's config is read, then written back to the
+    # LAUNCH profile — silently copying one profile's whole config over
+    # another's. The cache is keyed on the resolved path, so both halves must
+    # resolve it the same way.
+    override = get_hermes_home_override()
+    home = override if isinstance(override, str) and override else _hermes_home
+    path = Path(home) / "config.yaml"
     # Comment-, ordering-, and Unicode-preserving full-state write.
     # Replaces the previous `yaml.safe_dump(cfg, f)` (and later
     # `atomic_config_write`, which is not comment-preserving) which clobbered
@@ -5090,7 +5099,7 @@ _STATUSBAR_MODES = frozenset({"off", "top", "bottom"})
 _APPROVAL_MODES = frozenset({"manual", "smart", "off"})
 
 
-def _load_approval_mode() -> str:
+def _load_approval_mode(profile_home=None) -> str:
     """Resolve the effective ``approvals.mode`` for the TUI surface.
 
     Delegates to the canonical resolver in ``tools.approval``
@@ -5104,11 +5113,39 @@ def _load_approval_mode() -> str:
     canonical ``hermes_cli.config.load_config`` path applies managed-scope
     overlays and ``${VAR}`` env expansion that the TUI's raw YAML read did
     not fully mirror).
+
+    ``profile_home`` binds that profile's ``HERMES_HOME`` for the lookup.
+    Approval mode is PROFILE-scoped config, so a caller that knows which
+    profile it is answering for must say so — otherwise the mode resolves
+    against whichever profile happens to have launched this backend. One
+    backend serves every profile in the desktop's app-global remote mode,
+    so the ambient home is the launch profile's, not the session's: that
+    is how a profile configured ``smart`` reported ``manual`` while the
+    same payload named the right profile. Omit it only when the launch
+    profile genuinely is the subject.
     """
     from tools.approval import _get_approval_mode
 
-    mode = _get_approval_mode()
-    return mode if mode in _APPROVAL_MODES else "manual"
+    def _resolved() -> str:
+        mode = _get_approval_mode()
+        return mode if mode in _APPROVAL_MODES else "manual"
+
+    # Already resolving against this profile — either it IS the launch profile
+    # or an enclosing scope (the per-turn bind in the prompt path, the agent
+    # build, `@_profile_scoped`) has bound it. Re-binding would be a redundant
+    # contextvar push/pop on a hot payload path.
+    if profile_home is None:
+        return _resolved()
+
+    effective = get_hermes_home_override() or str(_hermes_home)
+    if str(profile_home) == str(effective):
+        return _resolved()
+
+    token = set_hermes_home_override(profile_home)
+    try:
+        return _resolved()
+    finally:
+        reset_hermes_home_override(token)
 
 
 def _coerce_statusbar(raw) -> str:
@@ -6324,17 +6361,32 @@ def _session_info(agent, session: dict | None = None) -> dict:
     # the desktop status bar (it would show YOLO "off" while approvals.mode=off
     # silently auto-approves every dangerous command).
     yolo = False
-    approval_mode = "manual"
+    # Approval mode is PROFILE-scoped config, and this payload also reports
+    # `profile_name` (below) derived from the session's own `profile_home`.
+    # Resolving the mode against the ambient HERMES_HOME instead made the two
+    # fields describe DIFFERENT profiles in one dict: a session bound to a
+    # profile configured `smart` was reported as `manual` because the launch
+    # profile owned the ambient home. Bind the session's profile so both
+    # fields answer for the same profile.
+    session_profile_home = (session or {}).get("profile_home") or None
+    # Seeded from the resolver, not a hardcoded guess. `_load_approval_mode`
+    # has its own fail-safe, so a `manual` here would only ever be a *second*,
+    # less-informed default — and the except-branch below deliberately does not
+    # reset it, so a failure in the yolo lookup used to publish that guess to
+    # the desktop as authoritative truth.
+    try:
+        approval_mode = _load_approval_mode(session_profile_home)
+    except Exception:
+        approval_mode = "manual"
     try:
         from tools.approval import _YOLO_MODE_FROZEN, is_session_yolo_enabled
 
         session_yolo = (
             bool(is_session_yolo_enabled(session_key)) if session_key else False
         )
-        approval_mode = _load_approval_mode()
         yolo = bool(_YOLO_MODE_FROZEN) or session_yolo or approval_mode == "off"
     except Exception:
-        yolo = False
+        yolo = approval_mode == "off"
     # A model switch queued mid-turn (pending_model_switch) applies at the next
     # turn start, so agent.model still reads the OLD model until then. Report the
     # pending pick instead — it's the model the next turn will run, and it stops
@@ -13121,7 +13173,17 @@ def _(rid, params: dict) -> dict:
                 f"unknown approval mode: {value}; pick one of manual|smart|off",
             )
 
-        _write_config_key("approvals.mode", raw)
+        # Write to the REQUESTED profile's config, matching the scoped read in
+        # config.get. Without this the desktop's mode menu read one profile and
+        # wrote another: the write landed in the launch profile's config.yaml
+        # and the next read of the session's own profile reverted the menu.
+        write_home = _profile_home(params.get("profile"))
+        write_token = set_hermes_home_override(write_home) if write_home else None
+        try:
+            _write_config_key("approvals.mode", raw)
+        finally:
+            if write_token is not None:
+                reset_hermes_home_override(write_token)
         for sid, sess in list(_sessions.items()):
             agent = sess.get("agent")
             if agent is not None:
