@@ -2,6 +2,7 @@ import { atom } from 'nanostores'
 import { beforeEach, describe, expect, it, vi } from 'vitest'
 
 const STORAGE_KEY = 'hermes.desktop.terminals.v1'
+const bufferKey = (id: string) => `hermes.desktop.terminal-buffer.v1.${id}`
 
 async function loadTerminalStore() {
   const $currentCwd = atom('/workspace')
@@ -25,22 +26,41 @@ describe('terminal store persistence', () => {
       JSON.stringify({
         activeTerminalId: 'term-two',
         terminals: [
-          { auto: false, cwd: '/repo/one', id: 'term-one', reviveBuffer: 'last output', title: 'zsh' },
+          { auto: false, cwd: '/repo/one', id: 'term-one', title: 'zsh' },
           { auto: true, cwd: '/repo/two', id: 'term-two', title: 'Terminal' }
         ]
       })
     )
+    window.localStorage.setItem(bufferKey('term-one'), JSON.stringify({ reviveBuffer: 'last output' }))
 
-    const { $activeTerminalId, $terminals } = await loadTerminalStore()
+    const { $activeTerminalId, $terminals, getTerminalBuffer } = await loadTerminalStore()
 
     expect($activeTerminalId.get()).toBe('term-two')
     expect($terminals.get()).toEqual([
-      { auto: false, cwd: '/repo/one', id: 'term-one', kind: 'user', reviveBuffer: 'last output', title: 'zsh' },
+      { auto: false, cwd: '/repo/one', id: 'term-one', kind: 'user', title: 'zsh' },
       { auto: true, cwd: '/repo/two', id: 'term-two', kind: 'user', title: 'Terminal' }
     ])
+    expect(getTerminalBuffer('term-one')).toEqual({ reviveBuffer: 'last output' })
   })
 
-  it('persists user tabs and history synchronously, skipping agent mirrors', async () => {
+  it('migrates a legacy inline reviveBuffer/restoreCwd into the per-tab buffer store', async () => {
+    window.localStorage.setItem(
+      STORAGE_KEY,
+      JSON.stringify({
+        activeTerminalId: 'term-one',
+        terminals: [
+          { auto: false, cwd: '/repo', id: 'term-one', restoreCwd: '/repo/api', reviveBuffer: 'hist', title: 'zsh' }
+        ]
+      })
+    )
+
+    const { $terminals, getTerminalBuffer } = await loadTerminalStore()
+
+    expect($terminals.get()[0]).toEqual({ auto: false, cwd: '/repo', id: 'term-one', kind: 'user', title: 'zsh' })
+    expect(getTerminalBuffer('term-one')).toEqual({ restoreCwd: '/repo/api', reviveBuffer: 'hist' })
+  })
+
+  it('persists user tabs as pure metadata, skipping agent mirrors and buffer bytes', async () => {
     const { createTerminal, ensureAgentTerminal, renameTerminal, selectTerminal, updateTerminalReviveBuffer } =
       await loadTerminalStore()
 
@@ -50,32 +70,32 @@ describe('terminal store persistence', () => {
     ensureAgentTerminal('proc-1', 'background task')
     selectTerminal(userId)
 
-    // No flush/tick: persistence is synchronous, so the snapshot is already on
-    // disk (this is what makes app-quit restore reliable).
+    // No flush/tick: the metadata list persists synchronously (this is what
+    // makes app-quit restore reliable). The buffer write is throttled
+    // separately and is asserted via getTerminalBuffer, not this key.
     expect(JSON.parse(window.localStorage.getItem(STORAGE_KEY) ?? '{}')).toEqual({
       activeTerminalId: userId,
-      terminals: [{ auto: false, cwd: '/repo', id: userId, reviveBuffer: 'recent scrollback', title: 'server' }]
+      terminals: [{ auto: false, cwd: '/repo', id: userId, title: 'server' }]
     })
   })
 
   it('never attaches a revive buffer to an agent tab', async () => {
-    const { $terminals, ensureAgentTerminal, updateTerminalReviveBuffer } = await loadTerminalStore()
+    const { ensureAgentTerminal, getTerminalBuffer, updateTerminalReviveBuffer } = await loadTerminalStore()
 
     const agentId = ensureAgentTerminal('proc-1', 'background task')!
     updateTerminalReviveBuffer(agentId, 'should be ignored')
 
-    expect($terminals.get().find(term => term.id === agentId)?.reviveBuffer).toBeUndefined()
-    expect(window.localStorage.getItem(STORAGE_KEY)).toBeNull()
+    expect(getTerminalBuffer(agentId)).toBeUndefined()
   })
 
   it('tail-trims an oversized revive buffer to stay under the storage budget', async () => {
-    const { $terminals, createTerminal, updateTerminalReviveBuffer } = await loadTerminalStore()
+    const { createTerminal, getTerminalBuffer, updateTerminalReviveBuffer } = await loadTerminalStore()
 
     const userId = createTerminal('/repo')
     const huge = 'x'.repeat(60_000)
     updateTerminalReviveBuffer(userId, huge)
 
-    const stored = $terminals.get().find(term => term.id === userId)?.reviveBuffer ?? ''
+    const stored = getTerminalBuffer(userId)?.reviveBuffer ?? ''
     expect(stored.length).toBe(48_000)
     expect(stored).toBe(huge.slice(-48_000))
   })
@@ -90,28 +110,54 @@ describe('terminal store persistence', () => {
     expect(window.localStorage.getItem(STORAGE_KEY)).toBeNull()
   })
 
+  it('frees a closed tab buffer entry from the map and its own storage key', async () => {
+    vi.useFakeTimers()
+
+    const { closeTerminal, createTerminal, getTerminalBuffer, updateTerminalReviveBuffer } = await loadTerminalStore()
+
+    const userId = createTerminal('/repo')
+    updateTerminalReviveBuffer(userId, 'scrollback')
+    await vi.runAllTimersAsync()
+    expect(window.localStorage.getItem(bufferKey(userId))).not.toBeNull()
+
+    closeTerminal(userId)
+
+    expect(getTerminalBuffer(userId)).toBeUndefined()
+    expect(window.localStorage.getItem(bufferKey(userId))).toBeNull()
+
+    vi.useRealTimers()
+  })
+
   it('restores and persists the last observed cwd so a reopened tab lands where the user cd-d', async () => {
     window.localStorage.setItem(
       STORAGE_KEY,
       JSON.stringify({
         activeTerminalId: 'term-one',
-        terminals: [{ auto: false, cwd: '/repo', id: 'term-one', restoreCwd: '/repo/packages/api', title: 'zsh' }]
+        terminals: [{ auto: false, cwd: '/repo', id: 'term-one', title: 'zsh' }]
       })
     )
+    window.localStorage.setItem(bufferKey('term-one'), JSON.stringify({ restoreCwd: '/repo/packages/api' }))
 
-    const { $terminals, updateTerminalRestoreCwd } = await loadTerminalStore()
+    vi.useFakeTimers()
 
-    expect($terminals.get()[0]?.restoreCwd).toBe('/repo/packages/api')
+    const { getTerminalBuffer, updateTerminalRestoreCwd } = await loadTerminalStore()
+
+    expect(getTerminalBuffer('term-one')?.restoreCwd).toBe('/repo/packages/api')
 
     updateTerminalRestoreCwd('term-one', '/repo/packages/web')
-    expect($terminals.get()[0]?.restoreCwd).toBe('/repo/packages/web')
-    expect(JSON.parse(window.localStorage.getItem(STORAGE_KEY) ?? '{}').terminals[0].restoreCwd).toBe(
+    expect(getTerminalBuffer('term-one')?.restoreCwd).toBe('/repo/packages/web')
+
+    await vi.runAllTimersAsync()
+    expect(JSON.parse(window.localStorage.getItem(bufferKey('term-one')) ?? '{}').restoreCwd).toBe(
       '/repo/packages/web'
     )
+
+    vi.useRealTimers()
   })
 
   it('never attaches a restore cwd to an agent tab and ignores empty values', async () => {
-    const { $terminals, createTerminal, ensureAgentTerminal, updateTerminalRestoreCwd } = await loadTerminalStore()
+    const { createTerminal, ensureAgentTerminal, getTerminalBuffer, updateTerminalRestoreCwd } =
+      await loadTerminalStore()
 
     const userId = createTerminal('/repo')
     const agentId = ensureAgentTerminal('proc-1', 'background task')!
@@ -119,8 +165,8 @@ describe('terminal store persistence', () => {
     updateTerminalRestoreCwd(agentId, '/somewhere')
     updateTerminalRestoreCwd(userId, '   ')
 
-    expect($terminals.get().find(term => term.id === agentId)?.restoreCwd).toBeUndefined()
-    expect($terminals.get().find(term => term.id === userId)?.restoreCwd).toBeUndefined()
+    expect(getTerminalBuffer(agentId)).toBeUndefined()
+    expect(getTerminalBuffer(userId)?.restoreCwd).toBeUndefined()
   })
 })
 
