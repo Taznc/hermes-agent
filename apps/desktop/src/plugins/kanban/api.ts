@@ -154,7 +154,7 @@ function withBoard(path: string, params: Record<string, string> = {}): string {
 
 export const boardKey = (slug: string, archived: boolean) => ['kanban', 'board', slug, archived] as const
 export const taskKey = (slug: string, id: string) => ['kanban', 'task', slug, id] as const
-export const logKey = (slug: string, id: string) => ['kanban', 'log', slug, id] as const
+export const logKey = (slug: string, id: string, tailBytes: number) => ['kanban', 'log', slug, id, tailBytes] as const
 export const BOARDS_KEY = ['kanban', 'boards'] as const
 export const PROFILES_KEY = ['kanban', 'profiles'] as const
 export const PROJECTS_KEY = ['kanban', 'projects'] as const
@@ -167,8 +167,11 @@ export const fetchBoard = (archived: boolean) =>
 
 export const fetchTask = (id: string) => call<KanbanTaskDetail>(withBoard(`/tasks/${id}`))
 
-/** Worker stdout/stderr tail (last 16 KiB — plenty for the drawer). */
-export const fetchLog = (id: string) => call<WorkerLog>(withBoard(`/tasks/${id}/log`, { tail: '16384' }))
+/** Worker stdout/stderr tail (16 KiB by default; the drawer's "show more"
+ *  affordance requests a larger tail instead of leaving truncation
+ *  unexplained). */
+export const fetchLog = (id: string, tailBytes = 16384) =>
+  call<WorkerLog>(withBoard(`/tasks/${id}/log`, { tail: String(tailBytes) }))
 
 export const fetchBoards = () => call<BoardsResponse>('/boards')
 

@@ -196,9 +196,25 @@ type KanbanMessages = {
   requeueWithNote: string
   notePosted: string
   activity: (n: number) => string
+  /** Collapsed-run summary for identical consecutive activity events, e.g.
+   *  "heartbeat ×6 · last 46 sec. ago". */
+  activityRun: (label: string, n: number, ago: string) => string
   runs: (n: number) => string
+  /** Rollup badge next to the Runs section header when at least one run failed. */
+  runsFailedCount: (n: number) => string
+  // Plain-language framing for the raw dispatcher diagnostics that land in
+  // `run.error` — the human summary is primary; the raw string stays
+  // available behind an expand toggle (see runErrRaw / expand / collapse).
+  runErrStaleLock: string
+  runErrPidNotAlive: string
+  runErrPidExited: (code: string) => string
+  runErrPidSignaled: (signal: string) => string
+  runErrRaw: string
   workerLog: string
   workerLogTail: string
+  /** "Show more" affordance under a truncated worker log — widens the tail
+   *  instead of leaving a bare unexplained `...`. */
+  workerLogShowMore: string
   attachments: (n: number) => string
   noAttachments: string
   uploadAttachment: string
@@ -454,9 +470,17 @@ export const en: KanbanMessages = {
   requeueWithNote: 'Requeue with note',
   notePosted: 'Note posted — worker requeued',
   activity: n => `Activity · ${n}`,
+  activityRun: (label, n, ago) => `${label} ×${n} · last ${ago}`,
   runs: n => `Runs · ${n}`,
+  runsFailedCount: n => (n === 1 ? '1 failed' : `${n} failed`),
+  runErrStaleLock: 'The worker’s claim expired, so the task was returned to the queue.',
+  runErrPidNotAlive: 'The worker process disappeared unexpectedly.',
+  runErrPidExited: code => `The worker exited with an error (code ${code}).`,
+  runErrPidSignaled: signal => `The worker was killed (signal ${signal}).`,
+  runErrRaw: 'Raw diagnostic',
   workerLog: 'Worker log',
   workerLogTail: 'Worker log · tail',
+  workerLogShowMore: 'Show more',
   attachments: n => `Attachments · ${n}`,
   noAttachments: 'No attachments yet.',
   uploadAttachment: 'Upload attachment',
@@ -708,9 +732,17 @@ const ja: KanbanMessages = {
   requeueWithNote: 'メモを付けて再キュー',
   notePosted: 'メモを投稿しました — ワーカーを再キューしました',
   activity: n => `アクティビティ・${n}`,
+  activityRun: (label, n, ago) => `${label} ×${n}・最新 ${ago}`,
   runs: n => `実行・${n}`,
+  runsFailedCount: n => `失敗 ${n} 件`,
+  runErrStaleLock: 'ワーカーの取得ロックが期限切れになり、キューに戻されました。',
+  runErrPidNotAlive: 'ワーカープロセスが予期せず消失しました。',
+  runErrPidExited: code => `ワーカーがエラーで終了しました（コード ${code}）。`,
+  runErrPidSignaled: signal => `ワーカーが強制終了されました（シグナル ${signal}）。`,
+  runErrRaw: '生の診断情報',
   workerLog: 'ワーカーログ',
   workerLogTail: 'ワーカーログ・末尾',
+  workerLogShowMore: 'もっと見る',
   attachments: n => `添付・${n}`,
   noAttachments: 'まだ添付はありません。',
   uploadAttachment: '添付をアップロード',
@@ -960,9 +992,17 @@ const zh: KanbanMessages = {
   requeueWithNote: '附带备注重新入队',
   notePosted: '备注已发布 — 工作单元已重新入队',
   activity: n => `活动・${n}`,
+  activityRun: (label, n, ago) => `${label} ×${n}・最近 ${ago}`,
   runs: n => `运行・${n}`,
+  runsFailedCount: n => `${n} 个失败`,
+  runErrStaleLock: '工作单元的领取锁已过期，任务已放回队列。',
+  runErrPidNotAlive: '工作单元进程意外消失。',
+  runErrPidExited: code => `工作单元因错误退出（代码 ${code}）。`,
+  runErrPidSignaled: signal => `工作单元被强制终止（信号 ${signal}）。`,
+  runErrRaw: '原始诊断信息',
   workerLog: '工作单元日志',
   workerLogTail: '工作单元日志・末尾',
+  workerLogShowMore: '显示更多',
   attachments: n => `附件・${n}`,
   noAttachments: '暂无附件。',
   uploadAttachment: '上传附件',
@@ -1211,9 +1251,17 @@ const zhHant: KanbanMessages = {
   requeueWithNote: '附上備註重新排入佇列',
   notePosted: '備註已發布 — 工作單元已重新排入佇列',
   activity: n => `活動・${n}`,
+  activityRun: (label, n, ago) => `${label} ×${n}・最近 ${ago}`,
   runs: n => `執行・${n}`,
+  runsFailedCount: n => `${n} 個失敗`,
+  runErrStaleLock: '工作單元的領取鎖已過期，任務已放回佇列。',
+  runErrPidNotAlive: '工作單元行程意外消失。',
+  runErrPidExited: code => `工作單元因錯誤結束（代碼 ${code}）。`,
+  runErrPidSignaled: signal => `工作單元被強制終止（訊號 ${signal}）。`,
+  runErrRaw: '原始診斷資訊',
   workerLog: '工作單元日誌',
   workerLogTail: '工作單元日誌・末尾',
+  workerLogShowMore: '顯示更多',
   attachments: n => `附件・${n}`,
   noAttachments: '尚無附件。',
   uploadAttachment: '上傳附件',

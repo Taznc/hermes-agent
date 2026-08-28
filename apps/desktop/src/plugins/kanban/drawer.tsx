@@ -11,6 +11,7 @@ import {
   cn,
   Codicon,
   compactNumber,
+  CopyButton,
   Dialog,
   DialogContent,
   DropdownMenu,
@@ -194,6 +195,162 @@ function MetaRow({ children, label }: { children: ReactNode; label: string }) {
     </>
   )
 }
+
+/**
+ * ACTIVITY · 71 rendering as six identical "heartbeat" rows is pure noise —
+ * group consecutive events that render to the same label+detail into one
+ * summarized row (expandable) instead of listing each one. Grouping on the
+ * RENDERED text (not the raw `kind`) means two different kinds that happen
+ * to read identically still collapse, and a kind whose detail changes
+ * between events (e.g. two different comment authors) does NOT collapse —
+ * exactly the granularity a human scanning the feed wants.
+ */
+export interface ActivityGroup {
+  events: KanbanEvent[]
+  label: string
+  detail?: string
+}
+
+export function groupActivity(events: KanbanEvent[], k: KanbanText): ActivityGroup[] {
+  const groups: ActivityGroup[] = []
+
+  for (const event of events) {
+    const { detail, label } = eventText(event, k)
+    const last = groups[groups.length - 1]
+
+    if (last && last.label === label && last.detail === detail) {
+      last.events.push(event)
+    } else {
+      groups.push({ detail, events: [event], label })
+    }
+  }
+
+  return groups
+}
+
+export function ActivityRow({ group, k }: { group: ActivityGroup; k: KanbanText }) {
+  const [expanded, setExpanded] = useState(false)
+  const latest = group.events[group.events.length - 1]
+
+  if (group.events.length === 1) {
+    return (
+      <li className="flex items-baseline gap-2 text-[0.6875rem]">
+        <span className="shrink-0 text-(--ui-text-secondary)">{group.label}</span>
+        {group.detail && (
+          <span className="min-w-0 truncate text-[0.625rem] text-(--ui-text-quaternary)" title={group.detail}>
+            {group.detail}
+          </span>
+        )}
+        <span className="ml-auto shrink-0 text-(--ui-text-quaternary)">{ago(latest.created_at)}</span>
+      </li>
+    )
+  }
+
+  return (
+    <li className="flex flex-col gap-1">
+      <button
+        aria-expanded={expanded}
+        className="flex w-full items-baseline gap-2 text-left text-[0.6875rem] text-(--ui-text-secondary) hover:text-(--ui-text-primary)"
+        onClick={() => setExpanded(v => !v)}
+        type="button"
+      >
+        <Codicon
+          className={cn('shrink-0 transition-transform duration-150', expanded && 'rotate-90')}
+          name="chevron-right"
+          size="0.65rem"
+        />
+        <span className="shrink-0">{k.activityRun(group.label, group.events.length, ago(latest.created_at) ?? '')}</span>
+        <span className="ml-auto shrink-0 text-(--ui-text-quaternary)">{ago(latest.created_at)}</span>
+      </button>
+      {expanded && (
+        <ul className="flex flex-col gap-1 border-l border-(--ui-stroke-tertiary) pl-3.5">
+          {group.events.map(event => (
+            <li className="flex items-baseline gap-2 text-[0.6875rem]" key={event.id}>
+              <span className="shrink-0 text-(--ui-text-secondary)">{group.label}</span>
+              {group.detail && (
+                <span className="min-w-0 truncate text-[0.625rem] text-(--ui-text-quaternary)" title={group.detail}>
+                  {group.detail}
+                </span>
+              )}
+              <span className="ml-auto shrink-0 text-(--ui-text-quaternary)">{ago(event.created_at)}</span>
+            </li>
+          ))}
+        </ul>
+      )}
+    </li>
+  )
+}
+
+/**
+ * The dispatcher writes machine-shaped diagnostics into `run.error`
+ * (`stale_lock=hermes-dev:27237`, `pid 111279 not alive`) that a human
+ * cannot act on unread. Recognized shapes get a plain-language primary line;
+ * the raw string stays available behind an expand toggle rather than being
+ * the primary text. Unrecognized shapes fall back to showing the raw string
+ * as primary — there's nothing to translate.
+ */
+export function runErrorText(error: string, k: KanbanText): { primary: string; raw?: string } {
+  const staleLock = /^stale_lock=(.+)$/.exec(error)
+
+  if (staleLock) {
+    return { primary: k.runErrStaleLock, raw: error }
+  }
+
+  const notAlive = /^pid \d+ not alive$/.exec(error)
+
+  if (notAlive) {
+    return { primary: k.runErrPidNotAlive, raw: error }
+  }
+
+  const exited = /^pid \d+ exited with code (.+)$/.exec(error)
+
+  if (exited) {
+    return { primary: k.runErrPidExited(exited[1]), raw: error }
+  }
+
+  const signaled = /^pid \d+ killed by signal (.+)$/.exec(error)
+
+  if (signaled) {
+    return { primary: k.runErrPidSignaled(signaled[1]), raw: error }
+  }
+
+  return { primary: error }
+}
+
+export function RunErrorLine({ error, k }: { error: string; k: KanbanText }) {
+  const [expanded, setExpanded] = useState(false)
+  const { primary, raw } = runErrorText(error, k)
+  const showRaw = raw && raw !== primary
+
+  return (
+    <div className="flex flex-col gap-0.5">
+      <p className="line-clamp-2 whitespace-pre-wrap text-destructive">{primary}</p>
+      {showRaw && (
+        <>
+          <button
+            aria-expanded={expanded}
+            className="flex w-fit items-baseline gap-1 text-left text-[0.625rem] text-(--ui-text-quaternary) hover:text-(--ui-text-secondary)"
+            onClick={() => setExpanded(v => !v)}
+            type="button"
+          >
+            <Codicon
+              className={cn('shrink-0 transition-transform duration-150', expanded && 'rotate-90')}
+              name="chevron-right"
+              size="0.6rem"
+            />
+            {k.runErrRaw}
+          </button>
+          {expanded && (
+            <p className="whitespace-pre-wrap rounded bg-(--ui-bg-quaternary) px-1.5 py-1 font-mono text-[0.625rem] text-(--ui-text-quaternary)">
+              {raw}
+            </p>
+          )}
+        </>
+      )}
+    </div>
+  )
+}
+
 
 /** The reason text on the most recent `blocked` event, if any — this is the
  *  worker's own explanation for why the task is stuck, surfaced verbatim in
@@ -1366,6 +1523,10 @@ function DependenciesSection({
   )
 }
 
+const DEFAULT_LOG_TAIL_BYTES = 16_384
+const MAX_LOG_TAIL_BYTES = 1_048_576 // 1 MiB — well under the backend's 2 MiB rotation size.
+const FAILED_OUTCOMES = ['crashed', 'failed', 'timed_out', 'gave_up']
+
 export function TaskDrawer({
   columns,
   id,
@@ -1394,10 +1555,17 @@ export function TaskDrawer({
   const running = task?.status === 'running'
   const defaultAssignee = useDefaultAssignee()
 
+  // "Show more" widens the requested tail instead of leaving a bare `...]` —
+  // the acceptance criteria want a visible affordance, not silent truncation.
+  // Resets to the default whenever the drawer switches to a different task.
+  const [logTail, setLogTail] = useState(DEFAULT_LOG_TAIL_BYTES)
+
+  useEffect(() => setLogTail(DEFAULT_LOG_TAIL_BYTES), [id])
+
   const { data: log } = useQuery({
     enabled: !!id,
-    queryFn: () => fetchLog(id!),
-    queryKey: logKey(slug, id ?? ''),
+    queryFn: () => fetchLog(id!, logTail),
+    queryKey: logKey(slug, id ?? '', logTail),
     refetchInterval: running ? 3_000 : 15_000
   })
 
@@ -1496,6 +1664,7 @@ export function TaskDrawer({
   }
 
   const errorMessage = error ? errText(error) : null
+  const runsFailed = detail?.runs.filter(run => FAILED_OUTCOMES.includes(run.outcome ?? run.status)).length ?? 0
 
   const move = (status: string) => {
     if (!task || status === task.status) {
@@ -1735,35 +1904,29 @@ export function TaskDrawer({
               <Section label={k.activity(detail.events.length)}>
                 <ScrollFade deps={detail.events.length} max="7rem">
                   <ul className="flex flex-col gap-1">
-                    {detail.events.map(event => {
-                      const { detail: extra, label } = eventText(event, k)
-
-                      return (
-                        <li className="flex items-baseline gap-2 text-[0.6875rem]" key={event.id}>
-                          <span className="shrink-0 text-(--ui-text-secondary)">{label}</span>
-                          {extra && (
-                            <span
-                              className="min-w-0 truncate text-[0.625rem] text-(--ui-text-quaternary)"
-                              title={extra}
-                            >
-                              {extra}
-                            </span>
-                          )}
-                          <span className="ml-auto shrink-0 text-(--ui-text-quaternary)">{ago(event.created_at)}</span>
-                        </li>
-                      )
-                    })}
+                    {groupActivity(detail.events, k).map(group => (
+                      <ActivityRow group={group} k={k} key={group.events[0].id} />
+                    ))}
                   </ul>
                 </ScrollFade>
               </Section>
             )}
 
             {detail.runs.length > 0 && (
-              <Section label={k.runs(detail.runs.length)}>
+              <Section
+                action={
+                  runsFailed > 0 ? (
+                    <Badge size="xs" variant="destructive">
+                      {k.runsFailedCount(runsFailed)}
+                    </Badge>
+                  ) : undefined
+                }
+                label={k.runs(detail.runs.length)}
+              >
                 <ScrollFade max="11rem">
                   <ul className="flex flex-col gap-1.5">
                     {detail.runs.map(run => {
-                      const failed = ['crashed', 'failed', 'timed_out', 'gave_up'].includes(run.outcome ?? run.status)
+                      const failed = FAILED_OUTCOMES.includes(run.outcome ?? run.status)
 
                       return (
                         <li className="flex flex-col gap-0.5 text-[0.71rem]" key={run.id}>
@@ -1781,15 +1944,14 @@ export function TaskDrawer({
                               {ago(run.ended_at ?? run.started_at)}
                             </span>
                           </div>
-                          {(run.error || run.summary) && (
-                            <p
-                              className={cn(
-                                'line-clamp-2 whitespace-pre-wrap',
-                                run.error ? 'text-destructive' : 'text-(--ui-text-quaternary)'
-                              )}
-                            >
-                              {run.error ?? run.summary}
-                            </p>
+                          {run.error ? (
+                            <RunErrorLine error={run.error} k={k} />
+                          ) : (
+                            run.summary && (
+                              <p className="line-clamp-2 whitespace-pre-wrap text-(--ui-text-quaternary)">
+                                {run.summary}
+                              </p>
+                            )
                           )}
                         </li>
                       )
@@ -1800,10 +1962,30 @@ export function TaskDrawer({
             )}
 
             {log?.exists && log.content && (
-              <Section label={log.truncated ? k.workerLogTail : k.workerLog}>
-                <ScrollFade deps={log.content.length} max="12rem">
-                  <LogView className="border-0 px-0">{log.content}</LogView>
+              <Section
+                action={
+                  <CopyButton
+                    appearance="icon"
+                    buttonSize="icon-xs"
+                    buttonVariant="ghost"
+                    text={() => log.content}
+                  />
+                }
+                label={log.truncated ? k.workerLogTail : k.workerLog}
+              >
+                <ScrollFade deps={log.content.length} max="16rem">
+                  <LogView className="border-0 px-0" content={log.content} numbered />
                 </ScrollFade>
+                {log.truncated && logTail < MAX_LOG_TAIL_BYTES && (
+                  <Button
+                    className="self-start"
+                    onClick={() => setLogTail(t => Math.min(t * 4, MAX_LOG_TAIL_BYTES))}
+                    size="xs"
+                    variant="text"
+                  >
+                    {k.workerLogShowMore}
+                  </Button>
+                )}
               </Section>
             )}
 
