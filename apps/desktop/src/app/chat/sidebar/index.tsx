@@ -29,6 +29,7 @@ import { comboTokens } from '@/lib/keybinds/combo'
 import { resolveProfileColor } from '@/lib/profile-color'
 import { sessionMatchesSearch } from '@/lib/session-search'
 import { normalizeSessionSource, sessionSourceLabel } from '@/lib/session-source'
+import { useStoreSelector } from '@/lib/use-session-slice'
 import { cn } from '@/lib/utils'
 import { $activeConnectionId } from '@/store/connections'
 import { $cronJobs } from '@/store/cron'
@@ -387,7 +388,11 @@ export function ChatSidebar({
   const selectedSessionId = useStore($focusedStoredSessionId)
   const sessions = useStore($sessions)
   const cronSessions = useStore($cronSessions)
-  const cronJobs = useStore($cronJobs)
+  // A presence check, not the array: mounting the section (which owns its own
+  // $cronJobs subscription) is gated on "any jobs at all" without the parent
+  // re-rendering every time the JOB LIST's contents change — only when the
+  // list flips empty<->non-empty.
+  const hasCronJobs = useStoreSelector($cronJobs, jobs => jobs.length > 0)
   const messagingSessions = useStore($messagingSessions)
   const messagingPlatformTotals = useStore($messagingPlatformTotals)
   const messagingTruncated = useStore($messagingTruncated)
@@ -1901,9 +1906,8 @@ export function ChatSidebar({
                 )
               })}
 
-            {!trimmedQuery && !worktreeGroupingActive && cronJobs.length > 0 && (
+            {!trimmedQuery && !worktreeGroupingActive && hasCronJobs && (
               <SidebarCronJobsSection
-                jobs={cronJobs}
                 label={s.cronJobs}
                 onManageJob={onManageCronJob}
                 onOpenRun={onResumeSession}
