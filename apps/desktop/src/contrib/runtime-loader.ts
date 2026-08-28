@@ -477,7 +477,11 @@ async function scanDiskPlugins(): Promise<void> {
         }
 
         try {
-          record.watchId = (await desktop.watchPreviewFile(file)).id
+          // Optional-chained: the web-spike shim omits watchPreviewFile (no
+          // push-change channel over HTTP), so this throws "not a function"
+          // under Electron only if a future shell regresses the contract —
+          // everywhere else it degrades to the visible-tab poll below.
+          record.watchId = (await desktop.watchPreviewFile?.(file))?.id ?? null
         } catch {
           // Unwatchable — the poll still reconciles new folders; edits need a
           // manual "Reload desktop plugins".
@@ -499,7 +503,7 @@ async function scanDiskPlugins(): Promise<void> {
       dropOriginRecord(record.origin, record)
 
       if (record.watchId) {
-        void desktop.stopPreviewFileWatch(record.watchId)
+        void desktop.stopPreviewFileWatch?.(record.watchId)
       }
 
       disk.delete(file)
