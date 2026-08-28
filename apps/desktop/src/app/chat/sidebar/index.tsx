@@ -822,11 +822,18 @@ export function ChatSidebar({
   }, [prDataWanted, scopedSessions, prBranchOverrides])
 
   // A stable identity for "the same question as last time", so a re-render that
-  // rebuilds the map doesn't re-ask GitHub.
-  const prQueryKey = JSON.stringify(
-    Object.entries(prLookupsByRepo)
-      .map(([root, lookups]) => [root, [...lookups].sort()] as const)
-      .sort(([a], [b]) => a.localeCompare(b))
+  // rebuilds the map doesn't re-ask GitHub. Memoized on prLookupsByRepo alone:
+  // this used to run stringify + a double sort unconditionally on EVERY
+  // render (any atom tick, not just a PR-relevant one) — cheap for a handful
+  // of repos, but pointless work repeated on every sidebar re-render.
+  const prQueryKey = useMemo(
+    () =>
+      JSON.stringify(
+        Object.entries(prLookupsByRepo)
+          .map(([root, lookups]) => [root, [...lookups].sort()] as const)
+          .sort(([a], [b]) => a.localeCompare(b))
+      ),
+    [prLookupsByRepo]
   )
 
   useEffect(() => {
