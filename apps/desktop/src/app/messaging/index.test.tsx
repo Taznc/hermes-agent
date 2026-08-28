@@ -41,8 +41,12 @@ vi.mock('@/lib/external-link', () => ({
 }))
 
 vi.mock('@/store/notifications', () => ({
+  dismissNotification: vi.fn(),
   notify: vi.fn(),
-  notifyError: vi.fn()
+  notifyError: vi.fn(),
+  readableError: (error: unknown, fallback: string) => ({
+    message: error instanceof Error ? error.message : fallback
+  })
 }))
 
 vi.mock('@/store/system-actions', () => ({
@@ -230,5 +234,59 @@ describe('MessagingView pairing', () => {
       $platformsChangeTick.set($platformsChangeTick.get() + 1)
     })
     expect(getPairing).not.toHaveBeenCalled()
+  })
+})
+
+describe('MessagingView silent background refresh failures', () => {
+  it('does not toast on isolated silent-refresh failures but does after repeated ones, then dismisses on recovery', async () => {
+    vi.useFakeTimers({ shouldAdvanceTime: true })
+
+    const { notify, dismissNotification } = await import('@/store/notifications')
+    // Force the legacy interval-poll path regardless of test execution order
+    // (another test in this file flips this atom and never resets it).
+    const { $changeEventsAvailable } = await import('@/store/live-sync')
+    $changeEventsAvailable.set(false)
+
+    getMessagingPlatforms.mockResolvedValueOnce({ platforms: [platform()] })
+    await renderMessaging()
+
+    // The legacy visible-tab poll fires every 6s when change events aren't
+    // available (changeEventsAvailable defaults to false in this store mock).
+    getMessagingPlatforms.mockRejectedValue(new Error('backend down'))
+
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(6_000)
+      await vi.advanceTimersByTimeAsync(0)
+    })
+    expect(notify).not.toHaveBeenCalled()
+
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(6_000)
+      await vi.advanceTimersByTimeAsync(0)
+    })
+    expect(notify).not.toHaveBeenCalled()
+
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(6_000)
+      await vi.advanceTimersByTimeAsync(0)
+    })
+    expect(notify).toHaveBeenCalledTimes(1)
+
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(6_000)
+      await vi.advanceTimersByTimeAsync(0)
+    })
+    // A third consecutive failure must not stack another toast.
+    expect(notify).toHaveBeenCalledTimes(1)
+
+    getMessagingPlatforms.mockResolvedValue({ platforms: [platform()] })
+
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(6_000)
+      await vi.advanceTimersByTimeAsync(0)
+    })
+    expect(dismissNotification).toHaveBeenCalledWith('messaging-silent-refresh-failed')
+
+    vi.useRealTimers()
   })
 })

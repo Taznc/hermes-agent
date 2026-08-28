@@ -1590,7 +1590,11 @@ export const en: Translations = {
       actionStarted: name => `${name} started — tailing log...`,
       actionFailed: name => `${name} failed to start`,
       running: 'Running...',
-      viewLog: 'Action log'
+      viewLog: 'Action log',
+      curatorLoadFailed: 'Could not load curator status',
+      memoryLoadFailed: 'Could not load memory data',
+      retry: 'Retry',
+      actionTailLost: 'Lost track of this task — view in activity rail'
     }
   },
 
@@ -3159,6 +3163,7 @@ export const en: Translations = {
     thread: {
       loadingSession: 'Loading session',
       showEarlier: 'Show earlier messages',
+      showEarlierFailed: 'Could not load earlier messages',
       loadingResponse: 'Hermes is loading a response',
       resumeWhenBackgroundDone: count =>
         count === 1

@@ -16,7 +16,9 @@
  */
 
 import { getOlderSessionMessages } from '@/hermes'
+import { translateNow } from '@/i18n'
 import { type ChatMessage, toChatMessages } from '@/lib/chat-messages'
+import { notify } from '@/store/notifications'
 import { recordTranscriptBackfillPage, type TranscriptProfileScope, transcriptTailState } from '@/store/transcript-tail'
 
 /** Older rows likely exist beyond what the in-memory store holds. */
@@ -112,9 +114,17 @@ export interface BackfillRequest {
 // so a mid-fetch runtime rebind cannot double-fetch the same page.
 const inflightByStoredSessionId = new Map<string, Promise<boolean>>()
 
+// Consecutive backfill failures per stored session — used to notify once
+// (not on every click) when "Show earlier" keeps failing, so the user gets
+// SOME feedback about why nothing loaded instead of a silently-inert button.
+const failureStreakByStoredSessionId = new Map<string, number>()
+const BACKFILL_FAILURE_NOTIFY_THRESHOLD = 2
+const BACKFILL_FAILED_NOTIFICATION_ID = 'transcript-backfill-failed'
+
 /** Test-only: drop in-flight guards between cases. */
 export function _resetTranscriptBackfillForTests(): void {
   inflightByStoredSessionId.clear()
+  failureStreakByStoredSessionId.clear()
 }
 
 /**
@@ -144,8 +154,23 @@ export function backfillOlderTranscriptPage(request: BackfillRequest): Promise<b
       page = await getOlderSessionMessages(storedSessionId, tail.profile, tail.nextOffset)
     } catch {
       // Non-fatal: the action stays available and the next click retries.
+      // Repeated failures get one notification so "Show earlier" doing
+      // nothing isn't mistaken for "there's nothing older" (#swallowed-error).
+      const streak = (failureStreakByStoredSessionId.get(inflightKey) ?? 0) + 1
+      failureStreakByStoredSessionId.set(inflightKey, streak)
+
+      if (streak === BACKFILL_FAILURE_NOTIFY_THRESHOLD) {
+        notify({
+          id: BACKFILL_FAILED_NOTIFICATION_ID,
+          kind: 'error',
+          message: translateNow('assistant.thread.showEarlierFailed')
+        })
+      }
+
       return false
     }
+
+    failureStreakByStoredSessionId.delete(inflightKey)
 
     // Session switched while the page was in flight: discard it entirely.
     // The bookkeeping stays untouched so a later re-visit (which re-records
