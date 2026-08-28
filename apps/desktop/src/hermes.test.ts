@@ -484,7 +484,8 @@ describe('Hermes REST helpers', () => {
 
     expect(api).toHaveBeenCalledWith({
       path: '/api/sessions/session-1/messages?profile=xiaoxuxu',
-      profile: 'xiaoxuxu'
+      profile: 'xiaoxuxu',
+      timeoutMs: 60_000
     })
   })
 
@@ -503,7 +504,8 @@ describe('Hermes REST helpers', () => {
     expect(api).toHaveBeenNthCalledWith(2, {
       connectionId: 'source-a',
       path: '/api/sessions/session-1/messages?profile=backend-default',
-      profile: 'backend-default'
+      profile: 'backend-default',
+      timeoutMs: 60_000
     })
   })
 
@@ -536,7 +538,8 @@ describe('Hermes REST helpers', () => {
     expect(LATEST_SESSION_MESSAGES_LIMIT).toBe(120)
     expect(api).toHaveBeenCalledWith({
       path: '/api/sessions/session-1/messages?profile=xiaoxuxu&limit=120&order=latest&include_compacted=true',
-      profile: 'xiaoxuxu'
+      profile: 'xiaoxuxu',
+      timeoutMs: 60_000
     })
   })
 
@@ -561,7 +564,8 @@ describe('Hermes REST helpers', () => {
 
     expect(api).toHaveBeenCalledWith({
       path: '/api/sessions/session-1/messages?profile=xiaoxuxu&limit=120&offset=240&order=latest&include_compacted=true',
-      profile: 'xiaoxuxu'
+      profile: 'xiaoxuxu',
+      timeoutMs: 60_000
     })
   })
 
@@ -576,7 +580,8 @@ describe('Hermes REST helpers', () => {
 
     expect(api).toHaveBeenCalledWith({
       path: '/api/sessions/session-1/messages?profile=xiaoxuxu&limit=500&offset=1000&order=latest',
-      profile: 'xiaoxuxu'
+      profile: 'xiaoxuxu',
+      timeoutMs: 60_000
     })
   })
 
@@ -598,11 +603,13 @@ describe('Hermes REST helpers', () => {
     expect(result.messages).toEqual([{ id: 1 }, { id: 2 }, { id: 3 }])
     expect(api).toHaveBeenNthCalledWith(1, {
       path: '/api/sessions/session-1/messages?profile=xiaoxuxu&limit=500&offset=0&order=oldest&include_compacted=true',
-      profile: 'xiaoxuxu'
+      profile: 'xiaoxuxu',
+      timeoutMs: 60_000
     })
     expect(api).toHaveBeenNthCalledWith(2, {
       path: '/api/sessions/session-1/messages?profile=xiaoxuxu&limit=500&offset=2&order=oldest&include_compacted=true',
-      profile: 'xiaoxuxu'
+      profile: 'xiaoxuxu',
+      timeoutMs: 60_000
     })
   })
 

@@ -50,7 +50,10 @@ export function getToolsetModels(
 
   return window.hermesDesktop.api<ToolsetModelsResponse>({
     ...capabilityScoped(profile),
-    path: `/api/tools/toolsets/${encodeURIComponent(name)}/models${suffix}`
+    path: `/api/tools/toolsets/${encodeURIComponent(name)}/models${suffix}`,
+    // Live model listing against the provider — well past the 30s default
+    // fetch timeout.
+    timeoutMs: 60_000
   })
 }
 

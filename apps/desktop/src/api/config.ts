@@ -145,7 +145,10 @@ export function validateProviderCredential(
     ...profileScoped(),
     path: '/api/providers/validate',
     method: 'POST',
-    body: { key, value, api_key: apiKey ?? '' }
+    body: { key, value, api_key: apiKey ?? '' },
+    // Live-probes the provider (network round trip, sometimes a model list
+    // fetch) — well past the 30s default fetch timeout.
+    timeoutMs: 60_000
   })
 }
 
@@ -169,7 +172,10 @@ export function validateCustomEndpoint(endpoint: CustomEndpointUpdate): Promise<
   return hermesApi<CustomEndpointValidationResponse>({
     path: '/api/providers/custom-endpoints/validate',
     method: 'POST',
-    body: endpoint
+    body: endpoint,
+    // Live-probes the endpoint (network round trip, model listing) — well
+    // past the 30s default fetch timeout.
+    timeoutMs: 60_000
   })
 }
 

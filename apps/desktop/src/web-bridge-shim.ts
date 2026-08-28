@@ -210,8 +210,18 @@ async function api<T>(request: SpikeApiRequest): Promise<T> {
     body = JSON.stringify(request.body)
   }
 
+  // Mirror electron/hardening.ts DEFAULT_FETCH_TIMEOUT_MS: Electron main
+  // clamps every hermesApi call to a 30s fallback even when the caller sets
+  // no timeoutMs. This shim used to only arm the abort timer when timeoutMs
+  // was explicitly set, so on the web-served desktop the ~60 api/*.ts exports
+  // with no timeoutMs had NO ceiling at all — a stalled socket never
+  // rejected, so useQuery's isError never flipped and the panel spun forever
+  // with no retry affordance. A per-call timeoutMs now only RAISES the
+  // budget above this default, matching Electron semantics exactly.
+  const DEFAULT_FETCH_TIMEOUT_MS = 30_000
+  const timeoutMs = request.timeoutMs ?? DEFAULT_FETCH_TIMEOUT_MS
   const controller = new AbortController()
-  const timer = request.timeoutMs ? setTimeout(() => controller.abort(), request.timeoutMs) : null
+  const timer = setTimeout(() => controller.abort(), timeoutMs)
 
   try {
     const res = await fetch(url, {
@@ -227,7 +237,7 @@ async function api<T>(request: SpikeApiRequest): Promise<T> {
 
     return (text ? JSON.parse(text) : undefined) as T
   } finally {
-    if (timer) {clearTimeout(timer)}
+    clearTimeout(timer)
   }
 }
 

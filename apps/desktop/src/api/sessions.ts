@@ -368,7 +368,10 @@ export function getSessionMessages(
 
   return hermesApi<SessionMessagesResponse>({
     ...sessionScope,
-    path: `/api/sessions/${encodeURIComponent(id)}/messages${suffix}`
+    path: `/api/sessions/${encodeURIComponent(id)}/messages${suffix}`,
+    // Transcript reads can be large (full backfill pages) — well past the
+    // 30s default fetch timeout.
+    timeoutMs: SESSION_LIST_REQUEST_TIMEOUT_MS
   })
 }
 

@@ -156,7 +156,10 @@ export function updateHermes(): Promise<ActionResponse> {
 export function checkHermesUpdate(force = false): Promise<BackendUpdateCheckResponse> {
   return hermesApi<BackendUpdateCheckResponse>({
     ...profileScoped(),
-    path: `/api/hermes/update/check${force ? '?force=true' : ''}`
+    path: `/api/hermes/update/check${force ? '?force=true' : ''}`,
+    // Hits GitHub/PyPI for the latest release info — well past the 30s
+    // default fetch timeout.
+    timeoutMs: 60_000
   })
 }
 
@@ -199,7 +202,10 @@ export function speakText(text: string): Promise<AudioSpeakResponse> {
 export function getElevenLabsVoices(profile?: null | string): Promise<ElevenLabsVoicesResponse> {
   return hermesApi<ElevenLabsVoicesResponse>({
     path: '/api/audio/elevenlabs/voices',
-    ...profileScoped(profile)
+    ...profileScoped(profile),
+    // Live voice-list fetch against the ElevenLabs API — well past the 30s
+    // default fetch timeout.
+    timeoutMs: 60_000
   })
 }
 
