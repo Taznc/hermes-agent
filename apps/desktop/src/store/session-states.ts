@@ -60,6 +60,74 @@ import { isBrowserWindow, isSecondaryWindow } from './windows'
 export const $sessionStates = atom<Record<string, ClientSessionState>>({})
 
 // ---------------------------------------------------------------------------
+// Lightweight per-runtime status projection — the fields status computeds
+// actually read ($workingSessionIds, $attentionSessionIds, $draftSessionIds,
+// $delegatingSessionIds, $sessionDotStateById). $sessionStates republishes a
+// fresh Record on EVERY message delta while a turn streams (tens/sec) so
+// tile views can paint the growing transcript; every one of those publishes
+// used to also wake the status computeds even though busy/needsInput rarely
+// change mid-stream. This mirror publishes ONLY when one of the four status
+// fields actually changes, so status computeds recompute on real status
+// edges instead of on every token.
+// ---------------------------------------------------------------------------
+
+export interface SessionLightStatus {
+  busy: boolean
+  needsInput: boolean
+  storedSessionId: string | null
+  /** Substitutes for `state.messages.length > 0` in the draft predicate
+   *  without requiring a subscriber to hold the (potentially large, per-
+   *  token-growing) message array. */
+  hasMessages: boolean
+}
+
+export const $sessionStatusById = atom<Record<string, SessionLightStatus>>({})
+
+function lightStatusOf(state: ClientSessionState): SessionLightStatus {
+  return {
+    busy: state.busy,
+    needsInput: state.needsInput,
+    storedSessionId: state.storedSessionId,
+    // Older persisted snapshots / minimal test fixtures can omit `messages`
+    // entirely (see releaseSessionTranscript's same defensive check) — treat
+    // that as no messages rather than throwing on `.length`.
+    hasMessages: Array.isArray(state.messages) && state.messages.length > 0
+  }
+}
+
+function sameLightStatus(a: SessionLightStatus | undefined, b: SessionLightStatus): boolean {
+  return (
+    a !== undefined &&
+    a.busy === b.busy &&
+    a.needsInput === b.needsInput &&
+    a.storedSessionId === b.storedSessionId &&
+    a.hasMessages === b.hasMessages
+  )
+}
+
+function publishLightStatus(runtimeId: string, state: ClientSessionState): void {
+  const current = $sessionStatusById.get()
+  const next = lightStatusOf(state)
+
+  if (sameLightStatus(current[runtimeId], next)) {
+    return
+  }
+
+  $sessionStatusById.set({ ...current, [runtimeId]: next })
+}
+
+function dropLightStatus(runtimeId: string): void {
+  const current = $sessionStatusById.get()
+
+  if (!(runtimeId in current)) {
+    return
+  }
+
+  const { [runtimeId]: _dropped, ...rest } = current
+  $sessionStatusById.set(rest)
+}
+
+// ---------------------------------------------------------------------------
 // Event-source scopes: which registry connection's socket delivered a runtime
 // session's events. Working/attention membership alone is profile-blind — two
 // connected gateways can both expose a 'default' profile, so the gateway
@@ -303,6 +371,11 @@ export function publishSessionState(runtimeId: string, state: ClientSessionState
     return
   }
 
+  // Status computeds read this projection instead of $sessionStates: it only
+  // republishes on a real busy/needsInput/storedSessionId/hasMessages edge,
+  // so a stream's tens-per-second message deltas don't wake them.
+  publishLightStatus(runtimeId, state)
+
   if (prev && evictable(runtimeId, state)) {
     handleTransition(prev, state, runtimeId)
     releaseSessionTranscript(runtimeId, state)
@@ -346,6 +419,7 @@ export function dropSessionState(runtimeId: string) {
   clearWatchdog(runtimeId)
   clearSessionProviderWait(runtimeId)
   sessionScopeByRuntimeId.delete(runtimeId)
+  dropLightStatus(runtimeId)
 
   const current = $sessionStates.get()
   setSessionStalled(current[runtimeId]?.storedSessionId, false)
@@ -374,6 +448,7 @@ export function clearAllSessionStates() {
   sessionScopeByRuntimeId.clear()
   $stalledSessionIds.set([])
   $sessionStates.set({})
+  $sessionStatusById.set({})
 }
 
 /** Downgrade cached busy/awaiting states after a gateway reconnect.
@@ -419,14 +494,18 @@ export function reconcileBusyStatesOnReconnect(scope?: string) {
   }
 }
 
-// Derived per-session status sets — pure projections of `$sessionStates` (which
-// holds `busy`/`needsInput` per runtime), keeping the data flow one-directional:
-// gateway event → cache → $sessionStates → computed views.
+// Derived per-session status sets — pure projections of `$sessionStatusById`
+// (the lightweight busy/needsInput/storedSessionId/hasMessages mirror of
+// `$sessionStates`), keeping the data flow one-directional: gateway event →
+// cache → $sessionStates → $sessionStatusById → computed views.
 //
-// Perf: `$sessionStates` is republished on EVERY message delta (tens/sec during
-// a turn), but these sets only change on busy/needsInput edges. `stableArray`
-// keeps the prior reference when membership is unchanged so `computed` skips the
-// emit — otherwise the whole sidebar + every row re-renders per token.
+// Perf: `$sessionStates` republishes on EVERY message delta (tens/sec during
+// a turn) for tile views, but `$sessionStatusById` only republishes on a real
+// busy/needsInput/storedSessionId/hasMessages edge — so these sets, which
+// only ever change on such an edge, stop recomputing per token. `stableArray`
+// on top keeps the prior reference when membership is unchanged so `computed`
+// skips the emit too — otherwise the whole sidebar + every row re-renders per
+// token.
 // Published under every id the conversation answers to, not just its current
 // tip: consumers hold whichever id they were created with, and compression
 // rotates the tip out from under them (see lineageAliases).
@@ -439,9 +518,9 @@ export function reconcileBusyStatesOnReconnect(scope?: string) {
 // conversation's queue key IS its runtime id"), so the row matches; once a
 // session is persisted its runtime id is nobody's key and the fallback is inert.
 const storedIds = (
-  states: Record<string, ClientSessionState>,
+  states: Record<string, SessionLightStatus>,
   sessions: readonly SessionInfo[],
-  pred: (s: ClientSessionState) => boolean
+  pred: (s: SessionLightStatus) => boolean
 ) => {
   const ids = new Set<string>()
 
@@ -460,7 +539,7 @@ const storedIds = (
 
 let workingIds: readonly string[] = []
 export const $workingSessionIds = computed(
-  [$sessionStates, $sessions],
+  [$sessionStatusById, $sessions],
   (states, sessions) =>
     (workingIds = stableArray(
       workingIds,
@@ -470,7 +549,7 @@ export const $workingSessionIds = computed(
 
 let attentionIds: readonly string[] = []
 export const $attentionSessionIds = computed(
-  [$sessionStates, $sessions],
+  [$sessionStatusById, $sessions],
   (states, sessions) =>
     (attentionIds = stableArray(
       attentionIds,
@@ -487,9 +566,9 @@ export const $attentionSessionIds = computed(
 // binding its runtime and loading its transcript, and calling that a draft
 // would flash the wrong mark on a conversation with years of history in it.
 let draftIds: readonly string[] = []
-export const $draftSessionIds = computed([$sessionStates, $sessions], (states, sessions) => {
-  const unsent = (state: ClientSessionState) => {
-    if (state.busy || state.messages.length > 0) {
+export const $draftSessionIds = computed([$sessionStatusById, $sessions], (states, sessions) => {
+  const unsent = (state: SessionLightStatus) => {
+    if (state.busy || state.hasMessages) {
       return false
     }
 

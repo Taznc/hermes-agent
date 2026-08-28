@@ -9,7 +9,7 @@ import { $goalsBySession, type GoalStatus } from './goals'
 import { dispatchNativeNotification } from './native-notifications'
 import { notifyError } from './notifications'
 import { $sessions, lineageAliases } from './session'
-import { $sessionStates } from './session-states'
+import { $sessionStatusById } from './session-states'
 import { $subagentsBySession, type SubagentProgress } from './subagents'
 import { $todosBySession } from './todos'
 
@@ -48,14 +48,16 @@ export const $backgroundStatusBySession = atom<Record<string, ComposerStatusItem
 //
 // $backgroundStatusBySession is keyed by RUNTIME session id (gateway events
 // and process.list both speak that); the sidebar row knows only the STORED id.
-// $sessionStates bridges the two: runtime id → state.storedSessionId, then
+// $sessionStatusById bridges the two: runtime id → state.storedSessionId, then
 // lineageAliases covers whichever tip of that conversation a surface holds.
-// Perf: recomputes on every $sessionStates change (message deltas, tens/sec),
-// but the background-running set rarely moves. `stableArray` keeps the prior
-// reference when unchanged so rows reading this don't re-render per token.
+// Perf: recomputes on every $sessionStatusById change (a real busy/needsInput/
+// storedSessionId/hasMessages edge — not the per-token message deltas
+// $sessionStates republishes), and the background-running set rarely moves.
+// `stableArray` keeps the prior reference when unchanged so rows reading this
+// don't re-render per token.
 let backgroundRunningIds: readonly string[] = []
 export const $backgroundRunningSessionIds = computed(
-  [$backgroundStatusBySession, $sessionStates, $sessions],
+  [$backgroundStatusBySession, $sessionStatusById, $sessions],
   (bg, states, sessions) => {
     const ids = new Set<string>()
 
