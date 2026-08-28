@@ -12,6 +12,39 @@
 
 import { execFileSync } from 'node:child_process'
 
+type ExecFn = typeof execFileSync | ((file?: string, args?: any, options?: any) => string)
+
+// Shared registry-read building block. `reg.exe` writes its output in the
+// CONSOLE OUTPUT CODEPAGE, not UTF-8 — for a US/Western-locale codepage this
+// happens to line up with ASCII/Latin-1 closely enough that nobody notices,
+// but a codepage like cp936 (Simplified Chinese) mangles any non-ASCII byte
+// (a CJK Windows username in HERMES_HOME, a Python install path under a CJK
+// "Program Files", ...) into mojibake the instant it's decoded as UTF-8.
+// Route the query through PowerShell with the console forced to UTF-8 first
+// so reg's own output round-trips correctly regardless of the system locale.
+// `exit $LASTEXITCODE` preserves reg's real exit code (value absent → 1) so
+// callers can keep using try/catch exactly as if they'd spawned reg directly.
+//
+// Generic over the exec function's return type so the same wrapper serves both
+// the synchronous caller below and main.ts's async boot-path resolver (which
+// passes a promisified exec to keep the main thread unblocked).
+function runRegQuery<T = string>(
+  args: string[],
+  {
+    exec = execFileSync as unknown as (file?: string, args?: any, options?: any) => T,
+    timeout = 5000
+  }: { exec?: (file?: string, args?: any, options?: any) => T; timeout?: number } = {}
+): T {
+  const quoted = args.map(arg => `'${String(arg).replace(/'/g, "''")}'`).join(' ')
+  const script = `[Console]::OutputEncoding = [System.Text.Encoding]::UTF8; reg ${quoted}; exit $LASTEXITCODE`
+
+  return exec('powershell.exe', ['-NoProfile', '-NonInteractive', '-Command', script], {
+    encoding: 'utf8',
+    windowsHide: true,
+    timeout
+  })
+}
+
 // Parse the output of `reg query HKCU\Environment /v <name>`, which looks like:
 //
 //   HKEY_CURRENT_USER\Environment
@@ -65,7 +98,7 @@ function readWindowsUserEnvVar(
   }: {
     platform?: NodeJS.Platform
     env?: NodeJS.ProcessEnv
-    exec?: typeof execFileSync | ((file?: string, args?: any) => string)
+    exec?: ExecFn
   } = {}
 ) {
   if (platform !== 'win32' || !name) {
@@ -75,13 +108,12 @@ function readWindowsUserEnvVar(
   let stdout
 
   try {
-    stdout = exec('reg', ['query', 'HKCU\\Environment', '/v', name], {
-      encoding: 'utf8',
-      windowsHide: true,
+    stdout = runRegQuery<string>(['query', 'HKCU\Environment', '/v', name], {
+      exec: exec as (file?: string, args?: any, options?: any) => string,
       timeout: 5000
     })
   } catch {
-    // `reg` missing, or value absent (reg exits 1) — caller falls back.
+    // `reg`/PowerShell missing, or value absent (reg exits 1) — caller falls back.
     return null
   }
 
@@ -96,4 +128,4 @@ function readWindowsUserEnvVar(
   return expanded || null
 }
 
-export { expandWindowsEnvRefs, parseRegQueryValue, readWindowsUserEnvVar }
+export { expandWindowsEnvRefs, parseRegQueryValue, readWindowsUserEnvVar, runRegQuery }

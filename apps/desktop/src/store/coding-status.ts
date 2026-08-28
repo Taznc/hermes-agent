@@ -2,6 +2,7 @@ import { atom, computed, type ReadableAtom } from 'nanostores'
 
 import type { HermesGitWorktree, HermesRepoStatus } from '@/global'
 import { desktopGit } from '@/lib/desktop-git'
+import { cleanPath, comparisonPath } from '@/lib/path-compare'
 
 import {
   $projectScope,
@@ -140,19 +141,23 @@ export type RepoChangeKind = 'added' | 'conflicted' | 'modified'
 
 // Absolute file path → its git change kind, for VS Code-style file-tree tinting.
 // Reuses the same bounded $repoStatus probe (capped file list); git reports
-// repo-root-relative paths, so we join them onto the active cwd. Deletions never
-// appear — the file is gone from disk, so there's no tree row to tint.
+// repo-root-relative paths (forward slashes), while the cwd and the tree rows'
+// ids can be backslash-separated Windows paths — join through `comparisonPath`/
+// `cleanPath` (case-folded on Windows, separator-unified everywhere) so the
+// join side and the lookup side agree regardless of host spelling. Deletions
+// never appear — the file is gone from disk, so there's no tree row to tint.
 export const $repoChangeByPath = computed([$repoStatus, $currentCwd], (status, cwd) => {
   const map = new Map<string, RepoChangeKind>()
-  const root = (cwd || '').replace(/[/\\]+$/, '')
 
-  if (!status || !root) {
+  if (!status || !cwd) {
     return map
   }
 
+  const root = cleanPath(cwd)
+
   for (const file of status.files) {
     const kind: RepoChangeKind = file.conflicted ? 'conflicted' : file.untracked ? 'added' : 'modified'
-    map.set(`${root}/${file.path}`, kind)
+    map.set(comparisonPath(`${root}/${cleanPath(file.path)}`), kind)
   }
 
   return map
@@ -163,7 +168,9 @@ export const $repoChangeByPath = computed([$repoStatus, $currentCwd], (status, c
  * a fresh repo-status map only re-renders that row when its own kind changed.
  */
 export function repoChangeKindForPath(path: string): ReadableAtom<RepoChangeKind | undefined> {
-  return computed($repoChangeByPath, changes => changes.get(path))
+  const key = comparisonPath(cleanPath(path))
+
+  return computed($repoChangeByPath, changes => changes.get(key))
 }
 
 // Cwds whose rails are on screen right now (refcounted — two tiles in one

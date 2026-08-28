@@ -324,6 +324,7 @@ import {
 } from './session-windows'
 import { ensureLoginShellPath } from './shell-path'
 import { createBootstrapCoordinator, sshConfigFingerprint } from './ssh-bootstrap-coordinator'
+import { resolveSshBinary, SSH_BINARY_MISSING_MESSAGE } from './ssh-binary'
 import { collectSshConfigHosts, parseSshGOutput } from './ssh-config'
 import { createSshProbeConnection, pickLocalPort, redactSecrets, SshConnection } from './ssh-connection'
 import { createStreamThrottle } from './stream-throttle'
@@ -406,7 +407,7 @@ import {
   writeSandboxMarker
 } from './windows-sandbox-fallback'
 import { installWindowsSystemCaTrust } from './windows-system-ca'
-import { readWindowsUserEnvVar } from './windows-user-env'
+import { readWindowsUserEnvVar, runRegQuery } from './windows-user-env'
 import { isPackagedInstallPath as isPackagedInstallPathUnderRoots } from './workspace-cwd'
 import { readWslWindowsClipboardImage } from './wsl-clipboard-image'
 import { resolvePickerDefaultPath, setActiveGatewayProfile, setWslBridgeProfileState } from './wsl-path-bridge'
@@ -2516,14 +2517,21 @@ async function findSystemPython() {
   const SUPPORTED_VERSIONS = ['3.11', '3.12', '3.13']
   const SUPPORTED_VERSIONS_NO_DOT = ['311', '312', '313']
 
-  // Pass 1: registry. Use `reg query` since main process doesn't have
-  // a reliable in-process registry API across all electron versions.
+  // Pass 1: registry. Use `reg query` (through the shared PowerShell/UTF-8
+  // wrapper — see windows-user-env.ts's runRegQuery) since main process
+  // doesn't have a reliable in-process registry API across all electron
+  // versions, and reg.exe's raw output is in the console codepage: a
+  // straight `execFileSync('reg', ...)` + utf8 decode mangles any
+  // non-ASCII byte, which for `InstallPath` values under a CJK-named
+  // Program Files/user directory means the resolved python.exe path comes
+  // back mojibake'd and fileExists() below silently (and wrongly) fails.
   // The (hive, version) probes are independent reads, so run them all
   // concurrently (this used to be a fully synchronous serial loop that
   // could block the main thread for the sum of every probe's latency);
   // priority among the settled results is still HKLM-before-HKCU,
   // lowest-version-first, exactly like the old loop order.
   const registryCandidates: Array<{ hive: string; version: string }> = []
+
 
   for (const hive of ['HKLM', 'HKCU']) {
     for (const version of SUPPORTED_VERSIONS) {
@@ -2534,12 +2542,14 @@ async function findSystemPython() {
   const registryResults = await Promise.all(
     registryCandidates.map(async ({ hive, version }) => {
       try {
-        const { stdout } = await execFileAsync(
-          'reg',
+        const stdout = await runRegQuery<Promise<string>>(
           ['query', `${hive}\\SOFTWARE\\Python\\PythonCore\\${version}\\InstallPath`, '/ve', '/reg:64'],
           // Registry reads are near-instant; the bound only exists so a
           // pathologically wedged reg.exe can't hang boot forever.
-          hiddenWindowsChildOptions({ encoding: 'utf8', timeout: 5_000 })
+          {
+            exec: async (file, args, options) => (await execFileAsync(file as string, args, options)).stdout as string,
+            timeout: 5_000
+          }
         )
 
         // Output format: "    (Default)    REG_SZ    C:\Path\To\Python\"
@@ -2644,6 +2654,21 @@ function findGitBash() {
     env: process.env,
     fileExists,
     findOnPath
+  })
+}
+
+// resolveSsh — one ladder for every embedded-terminal/SSH-config call site
+// (see ssh-binary.ts): System32 OpenSSH (existence-checked, since the
+// feature is removable/absent on LTSC/IoT) → ssh.exe on PATH → Git for
+// Windows' bundled ssh.exe next to whatever findGitBash() resolved. Off
+// Windows this is just 'ssh', letting spawn's normal PATH search handle it.
+function resolveSsh() {
+  return resolveSshBinary({
+    isWindows: IS_WINDOWS,
+    env: process.env,
+    fileExists,
+    findOnPath,
+    gitBashPath: IS_WINDOWS ? findGitBash() : null
   })
 }
 
@@ -9980,10 +10005,11 @@ async function reachablePreviewUrl(rawUrl: string): Promise<string> {
 }
 
 async function effectiveSshConfigFingerprint(sshConfig) {
-  const ssh =
-    process.platform === 'win32'
-      ? path.join(process.env.SystemRoot || 'C:\\Windows', 'System32', 'OpenSSH', 'ssh.exe')
-      : 'ssh'
+  const ssh = resolveSsh()
+
+  if (!ssh) {
+    throw new Error(SSH_BINARY_MISSING_MESSAGE)
+  }
 
   const args = ['-G']
 
@@ -10039,13 +10065,20 @@ async function bootstrapSshConnectionInner(profile, sshConfig, reuseToken, sourc
   let removeForceCleanup = () => {}
 
   if (created) {
+    const sshBinary = resolveSsh()
+
+    if (!sshBinary) {
+      throw new Error(SSH_BINARY_MISSING_MESSAGE)
+    }
+
     ssh = new SshConnection(
       { host: sshConfig.host, user: sshConfig.user, port: sshConfig.port, keyPath: sshConfig.keyPath },
       {
         rememberLog: sshRememberLog,
         ownershipId: sshOwnershipKey(profile),
         scope,
-        effectiveConfigFingerprint: sshConfig.effectiveConfigFingerprint
+        effectiveConfigFingerprint: sshConfig.effectiveConfigFingerprint,
+        sshBinary
       }
     )
     removeForceCleanup = lease.onForceCleanup(() => ssh.close())
@@ -10390,7 +10423,7 @@ async function testDesktopConnectionConfig(input: any = {}) {
 
     const ssh = createSshProbeConnection(
       { host: sshConfig.host, user: sshConfig.user, port: sshConfig.port, keyPath: sshConfig.keyPath },
-      { rememberLog: sshRememberLog }
+      { rememberLog: sshRememberLog, sshBinary: resolveSsh() }
     )
 
     try {
@@ -13906,10 +13939,11 @@ ipcMain.handle('hermes:ssh-config:resolve', async (_event, host) => {
     throw new Error('SSH host is required.')
   }
 
-  const ssh =
-    process.platform === 'win32'
-      ? path.join(process.env.SystemRoot || 'C:\\Windows', 'System32', 'OpenSSH', 'ssh.exe')
-      : 'ssh'
+  const ssh = resolveSsh()
+
+  if (!ssh) {
+    throw new Error(SSH_BINARY_MISSING_MESSAGE)
+  }
 
   return new Promise((resolve, reject) => {
     const child = spawn(ssh, ['-G', '--', value], hiddenWindowsChildOptions({ stdio: ['ignore', 'pipe', 'pipe'] }))
@@ -14190,7 +14224,7 @@ async function probeSshProfileInventory(connection) {
 
   const ssh = createSshProbeConnection(
     { host: sshConfig.host, user: sshConfig.user, port: sshConfig.port, keyPath: sshConfig.keyPath },
-    { rememberLog: sshRememberLog }
+    { rememberLog: sshRememberLog, sshBinary: resolveSsh() }
   )
 
   try {
@@ -16133,7 +16167,8 @@ const terminalIpc = registerTerminalIpc({
   rememberLog,
   activeSshTerminalTarget,
   ensureBackend: () => ensureBackend(primaryProfileKey()),
-  getSshConnectionState: scope => sshConnections.get(scope)
+  getSshConnectionState: scope => sshConnections.get(scope),
+  resolveSshBinary: resolveSsh
 })
 
 const disposeTerminalSession = terminalIpc.disposeTerminalSession
