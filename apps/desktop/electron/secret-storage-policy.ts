@@ -39,6 +39,16 @@ export interface SecretStoragePolicy {
 
 export const SECRET_STORAGE_POLICY_FILE = 'secure-token-storage.json'
 
+/**
+ * A durable marker kept in its OWN file, separate from `SECRET_STORAGE_POLICY_FILE`.
+ * Its only job is answering "was encryption ever explicitly turned on?" even
+ * after the main policy file itself has vanished — see the "disappearance of
+ * a previously-on policy" branch in `readSecretStoragePolicy` for why the two
+ * files cannot be merged into one: a single file that disappears takes its own
+ * history with it.
+ */
+export const SECRET_STORAGE_LAST_ON_MARKER_FILE = 'secure-token-storage.last-on'
+
 export interface SecretStoragePolicyIo {
   readText: () => string
   writeText: (text: string) => void
@@ -48,20 +58,55 @@ export interface SecretStoragePolicyIo {
    * corruption need not implement it.
    */
   preserveCorruptPolicy?: () => void
+  /**
+   * Durable "was encryption last explicitly turned ON?" marker, read from a
+   * file independent of the main policy file (see
+   * `SECRET_STORAGE_LAST_ON_MARKER_FILE`). Returns false when the marker is
+   * absent — which covers both "never touched" and "explicitly turned off",
+   * since `writeLastKnownOn(false)` removes it. Optional so tests that only
+   * exercise the ordinary present/corrupt-file paths need not implement it;
+   * when omitted, a genuinely absent policy file always reads as the OFF
+   * default (the pre-existing behavior), which is the conservative choice for
+   * an IO stub that hasn't opted into the extra durability.
+   */
+  readLastKnownOn?: () => boolean
+  /**
+   * Persist the "was encryption last explicitly turned ON?" marker. Called
+   * every time `writeSecretStoragePolicy` runs, alongside the main policy
+   * write, so the marker always mirrors the last *deliberately written*
+   * policy — never the conservative-assumption value synthesized when the
+   * main file is merely found corrupt or missing (those paths return a
+   * `SecretStoragePolicy` but do not themselves call `writeSecretStoragePolicy`).
+   */
+  writeLastKnownOn?: (on: boolean) => void
   rememberLog?: (message: string) => void
 }
 
 /**
  * Normalize whatever is on disk into a policy.
  *
- *   - File genuinely ABSENT (readText throws, e.g. ENOENT — the ordinary
- *     "never opted in" case for the overwhelming majority of installs): the
- *     product default, encryption OFF, migration not yet attempted. This is
- *     the case "Do NOT default the policy ON" protects — a machine that has
- *     never written this file must never see a keychain dialog.
+ *   - File genuinely ABSENT (readText throws, e.g. ENOENT): this is NOT
+ *     automatically "never opted in" anymore — it also covers a previously-ON
+ *     policy file that some external actor (backup tool, sync client, a stray
+ *     `rm`) deleted out from under a machine that HAD explicitly turned
+ *     encryption on. Silently reverting that to the OFF default would be the
+ *     exact silent-downgrade this whole module exists to prevent — a user who
+ *     opted into keychain encryption would find themselves back on plaintext
+ *     with no warning. So an absent policy file consults the independent
+ *     `readLastKnownOn` marker (see `SECRET_STORAGE_LAST_ON_MARKER_FILE`):
+ *       - marker says it was last ON: return the conservative `{ on: true,
+ *         migrated: true }`, exactly like the present-but-corrupt case below.
+ *       - marker says OFF (or the IO doesn't implement it): the ordinary
+ *         "never opted in" default, `{ on: false, migrated: false }`. This is
+ *         still the product default for the overwhelming majority of installs
+ *         — the marker file is only ever written when the user's own Settings
+ *         toggle runs, so a genuinely new install with neither file present
+ *         reads as OFF, never ON. This is the case "Do NOT default the policy
+ *         ON" protects — a machine that never wrote either file must never
+ *         see a keychain dialog.
  *   - File PRESENT but unparseable/hand-mangled/wrong-shaped: this is NOT the
- *     same case. A file that exists only got there by this module's own
- *     atomic writer, so a corrupt-but-present file is a sign of external
+ *     same case as absent. A file that exists only got there by this module's
+ *     own atomic writer, so a corrupt-but-present file is a sign of external
  *     tampering (a backup tool, a sync client, a stray `> file` truncation)
  *     rather than "never configured." Silently reading that as the OFF
  *     default would flip an opted-in user back to plaintext storage without
@@ -80,7 +125,27 @@ export function readSecretStoragePolicy(io: SecretStoragePolicyIo): SecretStorag
   try {
     text = io.readText()
   } catch {
-    // Genuinely absent: the ordinary, safe-to-default-off case.
+    // Genuinely absent. Distinguish "never configured" from "a previously-ON
+    // policy file vanished" via the independent last-known-on marker.
+    let wasOn = false
+
+    try {
+      wasOn = io.readLastKnownOn?.() === true
+    } catch {
+      // Marker unreadable: fail toward the safe default rather than assuming ON
+      // from a read failure on the marker itself — the marker file failing to
+      // read is not evidence the policy was ever on.
+      wasOn = false
+    }
+
+    if (wasOn) {
+      io.rememberLog?.(
+        '[secret-storage] policy file is missing but was last known to be ON; assuming encryption is still ON until confirmed'
+      )
+
+      return { on: true, migrated: true }
+    }
+
     return { on: false, migrated: false }
   }
 
@@ -108,7 +173,19 @@ export function readSecretStoragePolicy(io: SecretStoragePolicyIo): SecretStorag
 }
 
 export function writeSecretStoragePolicy(policy: SecretStoragePolicy, io: SecretStoragePolicyIo): void {
-  io.writeText(JSON.stringify({ on: policy.on === true, migrated: policy.migrated === true }))
+  const normalized = { on: policy.on === true, migrated: policy.migrated === true }
+
+  io.writeText(JSON.stringify(normalized))
+
+  // Keep the durable last-known-on marker in lockstep with every deliberate
+  // write, so a later disappearance of the main policy file alone can still
+  // be told apart from a genuinely fresh install (see readSecretStoragePolicy).
+  try {
+    io.writeLastKnownOn?.(normalized.on)
+  } catch {
+    // Best-effort: losing the marker degrades the disappearance-recovery case
+    // back to the ordinary absent-file default, not a crash of the actual write.
+  }
 }
 
 /** One stored secret blob as it appears on disk. */

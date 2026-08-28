@@ -62,6 +62,23 @@ export interface NativeTokenStoreIo {
 }
 
 /**
+ * The result of reading the store file, with corruption called out as its own
+ * dimension rather than collapsed into "empty". `corrupted: true` is the
+ * signal `persistNativeTokenSet` uses to refuse a destructive rewrite — see
+ * that function's doc comment.
+ */
+interface ReadStoreResult {
+  store: Record<string, any>
+  /**
+   * True only when the file was PRESENT but failed to parse as a JSON object
+   * (truncated write, hand-mangled bytes). False for a genuinely absent file
+   * and for a syntactically-valid-but-wrong-shaped value (e.g. `[]`) — those
+   * are "nothing to preserve" cases, not corruption.
+   */
+  corrupted: boolean
+}
+
+/**
  * baseUrl → encrypted payload. A missing, unreadable, or hand-mangled store
  * reads as empty rather than throwing: a failed *read* falls to the next rung.
  *
@@ -78,22 +95,24 @@ export interface NativeTokenStoreIo {
  * genuinely damaged disk). Silently treating that the same as "empty" would
  * let the very next persist for any OTHER gateway overwrite those bytes for
  * good, destroying whatever forensic value they had — so this path quarantines
- * the file first (via `preserveCorruptStore`) and logs once before it too is
- * read as empty.
+ * the file first (via `preserveCorruptStore`), logs once, and tells the caller
+ * `corrupted: true` so a WRITE can refuse to proceed (a READ still degrades to
+ * an empty store — `loadNativeTokenSet` has nothing to write, so "signed out,
+ * logged, evidence preserved" is the safe answer there).
  */
-function readStore(io: NativeTokenStoreIo): Record<string, any> {
+function readStore(io: NativeTokenStoreIo): ReadStoreResult {
   let text: string
 
   try {
     text = io.readStoreText()
   } catch {
-    return {}
+    return { store: {}, corrupted: false }
   }
 
   try {
     const parsed = JSON.parse(text)
 
-    return parsed && typeof parsed === 'object' && !Array.isArray(parsed) ? parsed : {}
+    return { store: parsed && typeof parsed === 'object' && !Array.isArray(parsed) ? parsed : {}, corrupted: false }
   } catch {
     try {
       io.preserveCorruptStore?.()
@@ -105,7 +124,7 @@ function readStore(io: NativeTokenStoreIo): Record<string, any> {
       '[native-oauth] token store file is corrupt (unparseable JSON); quarantined the file and continuing as if empty'
     )
 
-    return {}
+    return { store: {}, corrupted: true }
   }
 }
 
@@ -137,9 +156,34 @@ function redactGatewayUrl(baseUrl: string): string {
 /**
  * Write (or, with `tokens === null`, drop) one gateway's token set, merging
  * into whatever other gateways are already stored.
+ *
+ * A corrupt-but-present store file is a hard stop for this function, not a
+ * "read as empty and carry on": the card's acceptance criteria is that a
+ * kill-9/truncated write can never lose another gateway's tokens, and writing
+ * a fresh canonical store over a quarantined-but-still-live corruption would
+ * do exactly that for whatever entries the corrupt bytes still held that
+ * `preserveCorruptStore` couldn't restore automatically. So a corrupted read
+ * aborts the persist entirely — no store write, no cache mutation upstream —
+ * and reports the failure the same way an unusable/null-returning keychain
+ * already does: thrown synchronously, straight through to the caller (main.ts's
+ * `_persistNativeTokens` does not swallow this — see its own comment). This is
+ * DIFFERENT from an unwritable disk (`io.writeStoreText` throwing), which is
+ * caught and merely logged below — that failure happens AFTER the in-memory
+ * store object has already been safely updated with the caller's intent, so
+ * there is nothing left to protect by throwing. A corrupted read is caught
+ * before any mutation, and the whole point is to stop before mutating. The
+ * bytes are already quarantined by `readStore` for a human/support recovery
+ * flow; the CURRENT request (the gateway actually being persisted right now)
+ * simply fails loudly instead of silently discarding its siblings.
  */
 export function persistNativeTokenSet(baseUrl: string, tokens: NativeTokenSet | null, io: NativeTokenStoreIo): void {
-  const store = readStore(io)
+  const { store, corrupted } = readStore(io)
+
+  if (corrupted) {
+    throw new Error(
+      'Token store file is corrupt; quarantined for recovery and refusing to overwrite it with a partial store. Retry once the quarantined file has been reviewed.'
+    )
+  }
 
   if (tokens) {
     // Encrypt the whole set as one blob so the refresh token never lands in
@@ -174,10 +218,14 @@ export function persistNativeTokenSet(baseUrl: string, tokens: NativeTokenSet | 
  * Reconstruct a gateway's token set from the stored encrypted payload. Returns
  * null when nothing is stored, when the blob cannot be decrypted, or when it
  * does not parse — never a partially-populated set.
+ *
+ * Unlike `persistNativeTokenSet`, a corrupted store here is NOT a hard stop:
+ * there is nothing to write, so the only honest answer is "signed out" —
+ * the corruption is already logged and the bytes quarantined by `readStore`.
  */
 export function loadNativeTokenSet(baseUrl: string, io: NativeTokenStoreIo): NativeTokenSet | null {
   // The UNREDACTED url is the store key — redaction is for logs only.
-  const secret = readStore(io)[baseUrl]
+  const secret = readStore(io).store[baseUrl]
 
   if (!secret) {
     return null

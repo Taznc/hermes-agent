@@ -48,6 +48,37 @@ function fakeIo(
   }
 }
 
+/**
+ * A fakeIo augmented with the durable last-known-on marker as its own
+ * independent piece of state — mirrors main.ts's real wiring, where the
+ * marker lives in a SEPARATE file from the policy file so deleting one
+ * doesn't take out the other.
+ */
+function fakeIoWithMarker(
+  initial: string | null = null,
+  markerInitiallyOn = false
+): SecretStoragePolicyIo & { fileText: () => string | null; logs: string[]; deletePolicyFile: () => void } {
+  const base = fakeIo(initial)
+  let markerOn = markerInitiallyOn
+
+  return {
+    ...base,
+    readLastKnownOn: () => markerOn,
+    writeLastKnownOn: (on: boolean) => {
+      markerOn = on
+    },
+    // Simulates an external actor (backup tool, sync client, stray `rm`)
+    // deleting JUST the policy file, leaving the independent marker intact.
+    deletePolicyFile: () => {
+      // Re-derive an ENOENT-throwing readText without touching the marker —
+      // fakeIo's own `text` closure isn't reachable from here, so route
+      // through the same preserveCorruptPolicy hook the real quarantine path
+      // uses (it already sets text to null).
+      base.preserveCorruptPolicy!()
+    }
+  }
+}
+
 // ── defaults ────────────────────────────────────────────────────────────────
 
 test('missing policy file defaults to encryption OFF, not migrated', () => {
@@ -95,6 +126,91 @@ test('round trip preserves both fields', () => {
 
   writeSecretStoragePolicy({ on: false, migrated: true }, io)
   assert.deepEqual(readSecretStoragePolicy(io), { on: false, migrated: true })
+})
+
+// ── durable last-known-on marker (review round 2) ──────────────────────────
+//
+// A deleted previously-ON policy file must NOT silently downgrade to the OFF
+// default on restart — that is exactly the silent-downgrade this whole module
+// exists to prevent, and it was previously missed for the "file plain
+// vanished" case (only "file present but corrupt" was covered). The
+// independent last-known-on marker (its own file, written every time
+// writeSecretStoragePolicy runs) is what lets readSecretStoragePolicy tell
+// "genuinely never configured" apart from "was on, and only the policy file
+// itself disappeared".
+
+test('a genuinely new install (marker never written) still defaults OFF when the policy file is absent', () => {
+  const io = fakeIoWithMarker(null, false)
+
+  assert.deepEqual(readSecretStoragePolicy(io), { on: false, migrated: false })
+})
+
+test('restart after the policy file is deleted, with the marker recording it was last ON, resolves sticky-on', () => {
+  const io = fakeIoWithMarker(null, true)
+
+  const policy = readSecretStoragePolicy(io)
+
+  assert.deepEqual(policy, { on: true, migrated: true })
+  assert.equal(io.logs.length, 1)
+  assert.match(io.logs[0], /missing but was last known to be ON/)
+})
+
+test('the marker is written every time the policy is deliberately turned ON', () => {
+  const io = fakeIoWithMarker(null, false)
+
+  writeSecretStoragePolicy({ on: true, migrated: true }, io)
+
+  // Simulate the policy file vanishing after the deliberate ON write — the
+  // marker (a separate file) must have survived and still says ON.
+  io.deletePolicyFile()
+
+  assert.deepEqual(readSecretStoragePolicy(io), { on: true, migrated: true })
+})
+
+test('the marker is cleared when the policy is deliberately turned back OFF', () => {
+  const io = fakeIoWithMarker(null, false)
+
+  writeSecretStoragePolicy({ on: true, migrated: true }, io)
+  writeSecretStoragePolicy({ on: false, migrated: true }, io)
+
+  // Deliberately turned off, then the policy file vanishes — must NOT come
+  // back as sticky-on, because the LAST deliberate write was off.
+  io.deletePolicyFile()
+
+  assert.deepEqual(readSecretStoragePolicy(io), { on: false, migrated: false })
+})
+
+test('a present-but-corrupt policy file still wins over the marker (corruption handling is unchanged)', () => {
+  // Corruption-while-present already has its own conservative sticky-on
+  // handling (tested above); the marker must not change or duplicate that —
+  // it only matters on the ABSENT-file path.
+  const io = fakeIoWithMarker('not-json', false)
+
+  assert.deepEqual(readSecretStoragePolicy(io), { on: true, migrated: true })
+  assert.equal(io.fileText(), null, 'still quarantined via the normal corrupt-file path')
+})
+
+test('an IO that does not implement the marker (older/simpler caller) keeps the pre-existing absent-defaults-off behavior', () => {
+  const io = fakeIo(null)
+
+  delete (io as any).readLastKnownOn
+  delete (io as any).writeLastKnownOn
+
+  assert.deepEqual(readSecretStoragePolicy(io), { on: false, migrated: false })
+
+  // And writing through an IO without writeLastKnownOn must not throw.
+  assert.doesNotThrow(() => writeSecretStoragePolicy({ on: true, migrated: true }, io))
+})
+
+test('a throwing readLastKnownOn fails toward the safe (OFF) default rather than propagating', () => {
+  const io: SecretStoragePolicyIo = {
+    ...fakeIo(null),
+    readLastKnownOn: () => {
+      throw new Error('marker file unreadable for an unrelated reason')
+    }
+  }
+
+  assert.deepEqual(readSecretStoragePolicy(io), { on: false, migrated: false })
 })
 
 // ── classification ──────────────────────────────────────────────────────────

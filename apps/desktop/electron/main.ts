@@ -302,6 +302,7 @@ import {
   classifyStoredSecret,
   readSecretStoragePolicy,
   resolveSecureTokenStorageState,
+  SECRET_STORAGE_LAST_ON_MARKER_FILE,
   SECRET_STORAGE_POLICY_FILE,
   type SecretStoragePolicy,
   type SecureTokenStorageState,
@@ -7387,6 +7388,15 @@ function _nativeTokenStoreIo(): NativeTokenStoreIo {
 }
 
 function _persistNativeTokens(baseUrl: string, tokens: NativeTokenSet | null) {
+  // Deliberately NOT wrapped in try/catch: persistNativeTokenSet already
+  // catches its own recoverable failure (an unwritable disk) internally and
+  // only THROWS for the two authoritative-failure cases — an unusable/null
+  // keychain and a corrupt-store abort — that must surface to the caller
+  // rather than be silently absorbed. Every call site already handles that
+  // (native login falls back to the embedded flow; ensureNativeAccessToken's
+  // refresh/force-clear callers already `.catch(() => null)`), so swallowing
+  // it here would silently turn a real "your tokens may not have saved"
+  // failure into a false "everything's fine".
   persistNativeTokenSet(baseUrl, tokens, _nativeTokenStoreIo())
 }
 
@@ -8414,6 +8424,10 @@ async function cloudAgentSilentSignIn(dashboardUrl) {
 // stored secrets in place.
 // ---------------------------------------------------------------------------
 const SECRET_STORAGE_POLICY_PATH = path.join(app.getPath('userData'), SECRET_STORAGE_POLICY_FILE)
+// Independent of the policy file itself — see readSecretStoragePolicy's doc
+// comment on why "the policy file disappeared" needs a durability signal that
+// doesn't live inside the same file that can disappear.
+const SECRET_STORAGE_LAST_ON_MARKER_PATH = path.join(app.getPath('userData'), SECRET_STORAGE_LAST_ON_MARKER_FILE)
 
 const _secretStoragePolicyIo = {
   readText: () => fs.readFileSync(SECRET_STORAGE_POLICY_PATH, 'utf8'),
@@ -8433,6 +8447,24 @@ const _secretStoragePolicyIo = {
           error instanceof Error ? error.message : String(error)
         }`
       )
+    }
+  },
+  // The marker's mere PRESENCE means "last deliberate write was ON" — its
+  // content is irrelevant, only existence is checked, so a truncated/corrupt
+  // marker file still correctly answers "yes, it existed" rather than needing
+  // its own corruption-handling ladder for a one-bit signal.
+  readLastKnownOn: () => fs.existsSync(SECRET_STORAGE_LAST_ON_MARKER_PATH),
+  writeLastKnownOn: (on: boolean) => {
+    if (on) {
+      writeSecretFileAtomic(SECRET_STORAGE_LAST_ON_MARKER_PATH, String(Date.now()), { encoding: 'utf8' })
+    } else {
+      try {
+        fs.rmSync(SECRET_STORAGE_LAST_ON_MARKER_PATH, { force: true })
+      } catch {
+        // Best-effort removal; a stale marker after an explicit turn-OFF just
+        // means a future disappearance of the main policy file conservatively
+        // reads as ON again, which is the safe direction to fail in.
+      }
     }
   },
   rememberLog
@@ -13724,8 +13756,22 @@ ipcMain.handle('hermes:connection-config:test', async (_event, payload) => testD
 // ── Opt-in keychain encryption for stored secrets ───────────────────────────
 // get returns the current policy without touching safeStorage; set flips it
 // and re-encodes every stored secret (see applySecretStorageEncryption).
-ipcMain.handle('hermes:secret-storage:get', async () => ({ on: secretStoragePolicy().on }))
-ipcMain.handle('hermes:secret-storage:set', async (_event: any, on: any) => applySecretStorageEncryption(on === true))
+ipcMain.handle('hermes:secret-storage:get', async () => ({
+  on: secretStoragePolicy().on,
+  secretStorageState: probeSecureTokenStorageState()
+}))
+ipcMain.handle('hermes:secret-storage:set', async (_event: any, on: any) => {
+  const result = applySecretStorageEncryption(on === true)
+
+  // Return the HONEST post-toggle state, not just the gated `on` flag — the
+  // renderer's hint needs to know immediately whether the toggle it just
+  // confirmed actually left secrets encrypted (enable can succeed at the
+  // policy level yet still read `available: false` if the keychain probe
+  // itself is flaky at exactly this instant; disable always reads as the
+  // honest "off" state). Without this, the hint stayed stale until the next
+  // unrelated getConnectionConfig() hydration.
+  return { ...result, secretStorageState: probeSecureTokenStorageState() }
+})
 
 // ── v2 connection registry IPC (multi-source) ───────────────────────────────
 // Storage-level CRUD for named agent sources. Routing/pooling consumption of

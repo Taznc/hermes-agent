@@ -100,19 +100,42 @@ test('acceptance: a truncated file from a simulated kill -9 does not lose the OT
     // silently treated it as {}, and the ensuing write for B replaced the
     // truncated bytes with a store containing ONLY B — GATEWAY A's refresh
     // token is gone forever, with no error and no log.
+    //
+    // The fix: persistNativeTokenSet must ABORT before writing anything at
+    // all once it sees a corrupted store — quarantining the bytes is not
+    // enough on its own, because "quarantine, then still write a fresh
+    // canonical store" is exactly as destructive as never quarantining (B's
+    // write would still be the only entry in the new live store). So this is
+    // the one write call in the whole suite that MUST throw and must NOT
+    // reach writeStoreText.
     const persistLogs: string[] = []
-    const persistIo = realIo(storePath, persistLogs)
+    let persistWrites = 0
 
-    persistNativeTokenSet(
-      GATEWAY_B,
-      { accessToken: 'AT-b-live', refreshToken: 'RT-b-live', expiresAt: 1, provider: 'nous', userId: 'u-b' },
-      persistIo
+    const persistIo: NativeTokenStoreIo = {
+      ...realIo(storePath, persistLogs),
+      writeStoreText: text => {
+        persistWrites += 1
+        writeSecretFileAtomic(storePath, text, { encoding: 'utf8' })
+      }
+    }
+
+    assert.throws(
+      () =>
+        persistNativeTokenSet(
+          GATEWAY_B,
+          { accessToken: 'AT-b-live', refreshToken: 'RT-b-live', expiresAt: 1, provider: 'nous', userId: 'u-b' },
+          persistIo
+        ),
+      /corrupt/i,
+      'persisting against a corrupt store must throw rather than silently succeed'
     )
 
-    // The corrupted bytes were quarantined BEFORE the new store was written —
-    // gateway A's truncated (but not-yet-lost) data still exists on disk
-    // under the quarantine path for a human/support flow to recover, rather
-    // than being silently overwritten.
+    assert.equal(persistWrites, 0, 'the corrupt-store abort must happen BEFORE any store write — B must not be written either')
+
+    // The corrupted bytes were quarantined as part of the abort — gateway A's
+    // truncated (but not-yet-lost) data still exists on disk under the
+    // quarantine path for a human/support flow to recover, rather than being
+    // silently overwritten by a "just B" store.
     assert.ok(persistLogs.some(line => line.startsWith('quarantined:')), 'corruption must be logged and quarantined')
 
     const quarantinedPath = persistLogs.find(line => line.startsWith('quarantined:'))!.slice('quarantined:'.length)
@@ -120,18 +143,18 @@ test('acceptance: a truncated file from a simulated kill -9 does not lose the OT
     assert.ok(fs.existsSync(quarantinedPath), 'the quarantined file must actually exist on disk')
     assert.equal(fs.readFileSync(quarantinedPath, 'utf8'), truncated, 'quarantined bytes are exactly what was corrupt')
 
-    // Gateway B (the one being signed in right now) must still work — refusing
-    // to trust corrupt bytes must not also refuse to serve the CURRENT request.
+    // Nothing was written to the live store path at all — it doesn't even
+    // exist anymore (quarantine renamed it aside) since the aborted write
+    // never recreated it either.
+    assert.equal(fs.existsSync(storePath), false, 'no replacement store was written over the quarantined file')
+
+    // Gateway B's sign-in must be retried by the caller (main.ts logs the
+    // thrown error and the UI can prompt again) rather than silently
+    // reporting success — loadNativeTokenSet against the now-absent path
+    // reads as a normal empty store (nothing quarantined a SECOND time).
     const reloadedB = loadNativeTokenSet(GATEWAY_B, realIo(storePath, []))
 
-    assert.equal(reloadedB?.accessToken, 'AT-b-live')
-
-    // And critically: nothing about this flow silently fabricated gateway A's
-    // tokens back into the live store — nothing recovers automatically here
-    // and nothing pretends A is still signed in either.
-    const reloadedA = loadNativeTokenSet(GATEWAY_A, realIo(storePath, []))
-
-    assert.equal(reloadedA, null, 'A is honestly signed-out, not silently resurrected with stale/wrong data')
+    assert.equal(reloadedB, null, 'B was never actually persisted, so it must not silently appear signed in')
   })
 })
 

@@ -152,9 +152,16 @@ declare global {
       testConnectionConfig: (payload: DesktopConnectionConfigInput) => Promise<DesktopConnectionTestResult>
       // Opt-in OS-keychain encryption for stored gateway secrets (default
       // off). `get` never touches the OS keychain; `set` re-encodes stored
-      // secrets and can throw when the keychain is unusable.
-      getSecretStorageEncryption: () => Promise<{ on: boolean }>
-      setSecretStorageEncryption: (on: boolean) => Promise<{ on: boolean }>
+      // secrets and can throw when the keychain is unusable. Both return the
+      // honest `secretStorageState` alongside the gated `on` flag so the
+      // renderer can update its hint immediately after a toggle instead of
+      // waiting for the next getConnectionConfig() hydration (which could
+      // otherwise show a stale hint for an enable that just succeeded, or a
+      // stale absence of the hint for a disable that just took effect).
+      getSecretStorageEncryption: () => Promise<{ on: boolean; secretStorageState?: DesktopSecretStorageState }>
+      setSecretStorageEncryption: (
+        on: boolean
+      ) => Promise<{ on: boolean; secretStorageState?: DesktopSecretStorageState }>
       // v2 multi-connection registry: named agent sources, all persisted
       // together (local + any number of remote/cloud/ssh instances).
       connections: {
