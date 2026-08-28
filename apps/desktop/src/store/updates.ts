@@ -101,6 +101,9 @@ function isUpdateToastSnoozed(): boolean {
 // v5: requires raised WebSocket frame size for large one-shot file.attach.
 // v6: requires key-addressed plugins.manage rows (keyless rows render
 //     read-only in Settings → Plugins).
+// v7: requires file.attach_open/_chunk/_commit/_abort (chunked non-image
+//     attachment upload — file.attach's whole-file base64 remains for older
+//     backends, so a v6 backend still works, just without streaming).
 const REQUIRED_BACKEND_CONTRACT = 6
 const SKEW_TOAST_ID = 'backend-contract-skew'
 // The contract check runs on every session.resume (applyRuntimeInfo), so

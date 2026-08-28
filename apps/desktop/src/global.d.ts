@@ -221,6 +221,20 @@ declare global {
       readFileDataUrl: (filePath: string) => Promise<string>
       /** Remote non-image attach: higher dedicated cap than preview/Settings default. */
       readFileDataUrlForAttach?: (filePath: string) => Promise<string>
+      /**
+       * Chunked non-image attach read: bounds main's transient memory and the
+       * per-call IPC payload to a fixed slice (ATTACHMENT_CHUNK_BYTES in
+       * electron/hardening.ts) regardless of file size, unlike
+       * readFileDataUrlForAttach's whole-file-in-memory read. Callers drive
+       * repeated calls at increasing `offset` and concatenate the returned
+       * base64 until `bytesRead < totalBytes` accounts for every byte. Absent
+       * on older shells — readFileDataUrlForAttach/readFileDataUrl remain the
+       * fallback ladder.
+       */
+      readFileChunkForAttach?: (
+        filePath: string,
+        offset: number
+      ) => Promise<{ base64: string; bytesRead: number; mimeType: string; totalBytes: number }>
       /** Settings → Chat: max size for local files loaded as data URLs (attach/preview). */
       dataUrlReadMax?: {
         get: () => Promise<{ defaultMaxMb: number; maxBytes: number; maxMb: number }>

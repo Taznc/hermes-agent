@@ -202,6 +202,7 @@ import { registerGitIpc } from './git-ipc'
 import { clearStaleGitLocks } from './gitlock'
 import { readAndConsumeHandoffResult } from './handoff-result'
 import {
+  ATTACHMENT_CHUNK_BYTES,
   ATTACHMENT_UPLOAD_DEFAULT_MAX_BYTES,
   clampDataUrlReadMaxMb,
   DATA_URL_READ_DEFAULT_MAX_MB,
@@ -209,6 +210,7 @@ import {
   DEFAULT_FETCH_TIMEOUT_MS,
   enableBasicPasswordStoreEncryption,
   encryptDesktopSecret as encryptDesktopSecretStrict,
+  readFileChunkForIpc,
   readFileDataUrlForIpc,
   resolvePersistedRemoteToken,
   resolveReadableFileForIpc,
@@ -15205,12 +15207,37 @@ ipcMain.handle('hermes:readFileDataUrl', async (_event, filePath) => {
 // Keep a finite cap so Electron + base64 memory stays bounded while archives
 // can exceed the default 16 MiB preview ceiling (and still fit the gateway
 // WebSocket frame limit after base64 expansion).
+//
+// Kept for older renderer bundles only (a packaged app can run ahead of an
+// updated preload for one version). Whole-file-in-memory + a single ~341 MiB
+// structured-clone IPC reply is exactly the freeze/OOM path t_275f8015 fixes
+// — every current caller uses hermes:readFileChunkForAttach below instead.
 ipcMain.handle('hermes:readFileDataUrlForAttach', async (_event, filePath) => {
   return readFileDataUrlForIpc(filePath, {
     maxBytes: ATTACHMENT_UPLOAD_DEFAULT_MAX_BYTES,
     mimeType: mimeTypeForPath(resolveRequestedPathForIpc(filePath, { purpose: 'Attachment upload' })),
     purpose: 'Attachment upload'
   })
+})
+
+// Chunked attachment transport: the renderer drives repeated calls at
+// increasing `offset` and concatenates the returned base64 strings itself,
+// so at no point does main hold the whole file (or its base64 expansion) in
+// one Buffer/string, and no single IPC reply exceeds ATTACHMENT_CHUNK_BYTES
+// (~8 MiB raw, ~11 MiB base64) regardless of how large the source file is.
+// Same total-size cap and path hardening as the whole-file reader; only the
+// transport shape changes.
+ipcMain.handle('hermes:readFileChunkForAttach', async (_event, filePath, offset) => {
+  return readFileChunkForIpc(
+    filePath,
+    {
+      maxBytes: ATTACHMENT_UPLOAD_DEFAULT_MAX_BYTES,
+      mimeType: mimeTypeForPath(resolveRequestedPathForIpc(filePath, { purpose: 'Attachment upload' })),
+      purpose: 'Attachment upload'
+    },
+    Number(offset) || 0,
+    ATTACHMENT_CHUNK_BYTES
+  )
 })
 
 ipcMain.handle('hermes:readFileText', async (_event, filePath) => {

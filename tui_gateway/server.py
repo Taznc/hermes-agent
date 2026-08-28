@@ -164,6 +164,16 @@ _cfg_cache: dict | None = None
 _cfg_mtime: float | None = None
 _cfg_path = None
 _session_resume_lock = threading.Lock()
+# Chunked desktop file-attach staging (file.attach_open/_chunk/_commit): each
+# entry is one in-progress upload's temp-file handle + bookkeeping, keyed by a
+# random upload_id. Guards against two racing chunk appends for the same
+# upload corrupting the staged file; does NOT hold an OS file descriptor open
+# across RPC round-trips (each chunk append opens/writes/closes), so an
+# abandoned upload never leaks a handle — only its temp file, which
+# _reap_stale_pending_uploads sweeps.
+_pending_uploads_lock = threading.Lock()
+_pending_uploads: dict[str, dict] = {}
+
 try:
     _slash_timeout = float(os.environ.get("HERMES_TUI_SLASH_TIMEOUT_S") or "45")
 except (ValueError, TypeError):
@@ -6237,7 +6247,10 @@ def _current_profile_name() -> str:
 # v5: uvicorn ws_max_size raised for one-shot base64 file.attach frames (>16 MiB).
 # v6: plugins.manage list rows carry the canonical registry key; toggles are
 #     key-addressed (keyless rows render read-only in Desktop Settings).
-DESKTOP_BACKEND_CONTRACT = 6
+# v7: adds file.attach_open/_chunk/_commit/_abort (chunked non-image
+#     attachment upload; file.attach's whole-file base64 remains for
+#     compatibility but new large-file uploads stream instead).
+DESKTOP_BACKEND_CONTRACT = 7
 
 
 def _session_usage_snapshot(session: dict | None) -> dict:
@@ -12646,7 +12659,139 @@ def _stage_session_file_attachment(
     return target.resolve(), True
 
 
-# ── Methods: respond ─────────────────────────────────────────────────
+# ── Chunked desktop file-attach staging (streams disk → gateway in bounded
+# slices instead of one whole-file base64 JSON-RPC frame) ──────────────────
+#
+# Mirrors ATTACHMENT_UPLOAD_DEFAULT_MAX_BYTES in
+# apps/desktop/electron/hardening.ts so the two ends of the transport agree on
+# the cap without importing across the language boundary.
+_FILE_ATTACH_UPLOAD_MAX_BYTES = 256 * 1024 * 1024
+# Abandoned uploads (renderer crash, network drop before attach_commit/_abort)
+# must not leak temp files or _pending_uploads entries forever. Swept
+# opportunistically from file.attach_open rather than on a background timer —
+# uploads are short-lived by nature, so "next open pays the sweep cost" is
+# simpler than another reaper thread and never leaves an unbounded backlog
+# between opens.
+_PENDING_UPLOAD_STALE_SECONDS = 3600.0
+
+
+def _reap_stale_pending_uploads() -> None:
+    """Delete tmp files + entries for uploads abandoned over an hour ago."""
+    now = time.time()
+    with _pending_uploads_lock:
+        stale_ids = [
+            upload_id
+            for upload_id, entry in _pending_uploads.items()
+            if now - entry.get("created_at", now) > _PENDING_UPLOAD_STALE_SECONDS
+        ]
+        stale_entries = [_pending_uploads.pop(upload_id) for upload_id in stale_ids]
+    for entry in stale_entries:
+        try:
+            Path(entry["tmp_path"]).unlink(missing_ok=True)
+        except Exception:
+            logger.debug("failed to reap stale pending upload tmp file", exc_info=True)
+
+
+def _open_pending_upload(session: dict, session_key: str) -> str:
+    """Create a fresh temp file for a chunked upload and register it.
+
+    Returns the new ``upload_id``. The temp file lives in the SAME directory
+    chunk data will ultimately land in (the session's ``attachments/`` dir),
+    so the final commit is a same-filesystem rename rather than a copy.
+    """
+    _reap_stale_pending_uploads()
+    upload_dir = _desktop_attachment_dir(session)
+    upload_id = uuid.uuid4().hex
+    tmp_path = upload_dir / f".upload-{upload_id}.tmp"
+    tmp_path.touch(exist_ok=False)
+    with _pending_uploads_lock:
+        _pending_uploads[upload_id] = {
+            "tmp_path": str(tmp_path),
+            "session_key": session_key,
+            "bytes_written": 0,
+            "created_at": time.time(),
+        }
+    return upload_id
+
+
+def _pending_upload_for(upload_id: str, session_key: str) -> dict | None:
+    """Look up a pending upload, scoped to the session that opened it.
+
+    Cross-session access returns ``None`` (surfaced as 4009 by callers) so one
+    session can never append to or commit another session's in-flight upload.
+    """
+    with _pending_uploads_lock:
+        entry = _pending_uploads.get(upload_id)
+    if entry is None or entry.get("session_key") != session_key:
+        return None
+    return entry
+
+
+def _append_pending_upload_chunk(upload_id: str, session_key: str, chunk: bytes) -> int:
+    """Append decoded bytes to the upload's temp file. Returns total bytes so far.
+
+    Raises ``ValueError`` on an unknown/foreign upload_id or if the cap would
+    be exceeded (the temp file is truncated back to empty first so a rejected
+    oversized upload can't be salvaged into a truncated commit).
+    """
+    entry = _pending_upload_for(upload_id, session_key)
+    if entry is None:
+        raise ValueError("unknown upload_id")
+    projected = entry["bytes_written"] + len(chunk)
+    if projected > _FILE_ATTACH_UPLOAD_MAX_BYTES:
+        raise ValueError(
+            f"file is too large ({projected} bytes; limit {_FILE_ATTACH_UPLOAD_MAX_BYTES} bytes)"
+        )
+    with open(entry["tmp_path"], "ab") as handle:
+        handle.write(chunk)
+    with _pending_uploads_lock:
+        live = _pending_uploads.get(upload_id)
+        if live is not None:
+            live["bytes_written"] = projected
+    return projected
+
+
+def _commit_pending_upload(
+    session: dict, session_key: str, upload_id: str, *, name: str, raw_path: str
+) -> Path:
+    """Finalize a chunked upload: rename its temp file into place. Removes the
+    pending-upload bookkeeping either way (success or failure) so a failed
+    commit can't be retried into a double-materialized file."""
+    with _pending_uploads_lock:
+        entry = _pending_uploads.pop(upload_id, None)
+    if entry is None or entry.get("session_key") != session_key:
+        raise ValueError("unknown upload_id")
+    tmp_path = Path(entry["tmp_path"])
+    try:
+        filename = _sanitize_attachment_name(name or Path(str(raw_path or "")).name)
+        upload_dir = _desktop_attachment_dir(session)
+        target = _unique_attachment_path(upload_dir, filename)
+        tmp_path.replace(target)
+        return target.resolve()
+    finally:
+        # replace() already moved it away on success; unlink is a no-op then.
+        # On failure the tmp file is orphaned bytes with no retry path (the
+        # entry is gone), so clean it up rather than leaking it forever.
+        try:
+            tmp_path.unlink(missing_ok=True)
+        except Exception:
+            pass
+
+
+def _abort_pending_upload(upload_id: str, session_key: str) -> bool:
+    """Discard an in-progress upload's temp file. Returns whether one existed."""
+    with _pending_uploads_lock:
+        entry = _pending_uploads.pop(upload_id, None)
+    if entry is None or entry.get("session_key") != session_key:
+        return False
+    try:
+        Path(entry["tmp_path"]).unlink(missing_ok=True)
+    except Exception:
+        logger.debug("failed to remove aborted upload tmp file", exc_info=True)
+    return True
+
+
+
 
 
 def _respond(rid, params, key, *, allow_expired=False):

@@ -1,9 +1,11 @@
 import type { AppendMessage } from '@assistant-ui/react'
 
+import type { FileAttachResponse } from '@/app/types'
 import { translateNow, type Translations } from '@/i18n'
 import type { ChatMessage } from '@/lib/chat-messages'
 import { readDesktopFileDataUrlLocalFirst } from '@/lib/desktop-fs'
 import { type CommandsCatalogLike, filterDesktopCommandsCatalog } from '@/lib/desktop-slash-commands'
+import { isMissingRpcMethod } from '@/lib/gateway-rpc'
 import { isProviderSetupErrorMessage } from '@/lib/provider-setup-errors'
 import type { ComposerAttachment } from '@/store/composer'
 
@@ -473,6 +475,117 @@ export function friendlyRemoteAttachError(err: unknown, label: string): Error {
   const cap = Number.isFinite(limitBytes) && limitBytes > 0 ? ` (max ${Math.floor(limitBytes / (1024 * 1024))} MB)` : ''
 
   return new Error(`${label} is too large to upload to the remote gateway${cap}.`)
+}
+
+/**
+ * Stage a non-image file attachment on the gateway.
+ *
+ * Prefers the chunked file.attach_open/_chunk/_commit transport: the
+ * renderer drives repeated readFileChunkForAttach + file.attach_chunk calls
+ * bounded to ATTACHMENT_CHUNK_BYTES each, so neither Electron main nor this
+ * renderer nor the gateway ever holds a whole large file (or its base64
+ * expansion) in one buffer/string — the freeze/OOM path t_275f8015 exists to
+ * close. Falls back to the whole-file file.attach + data_url transport when
+ * the desktop bridge predates readFileChunkForAttach (older Electron shells,
+ * or the web-served build, which omits the whole readFileDataUrl/
+ * readFileChunkForAttach IPC surface — see web-bridge-shim.ts) OR when the
+ * gateway itself predates file.attach_open (backend contract < 7, detected
+ * via isMissingRpcMethod on the open call).
+ *
+ * A session-not-found failure mid-stream re-runs the WHOLE upload against
+ * the recovered session (a fresh upload_id — the old one belonged to the now
+ * -dead session) rather than resuming from the last acked chunk: session
+ * recovery is rare (post sleep/wake) and correctness beats the avoided
+ * re-read, whereas the non-streamed path's "read once outside the retry"
+ * optimization only ever amortized a single whole-file read to begin with.
+ */
+export async function attachFileBytes(
+  filePath: string,
+  label: string,
+  requestGateway: GatewayRequest,
+  liveSessionId: string
+): Promise<FileAttachResponse> {
+  const chunkedReader = window.hermesDesktop?.readFileChunkForAttach
+
+  const wholeFileFallback = async (): Promise<FileAttachResponse> => {
+    const dataUrl = await readFileDataUrlForAttach(filePath)
+
+    if (!dataUrl) {
+      throw new Error(`Could not read ${label}`)
+    }
+
+    return requestGateway<FileAttachResponse>('file.attach', {
+      name: label,
+      path: filePath,
+      session_id: liveSessionId,
+      data_url: dataUrl
+    })
+  }
+
+  if (!chunkedReader) {
+    return wholeFileFallback()
+  }
+
+  let uploadId: string | undefined
+
+  try {
+    const opened = await requestGateway<{ upload_id?: string }>('file.attach_open', { session_id: liveSessionId })
+    uploadId = opened?.upload_id
+  } catch (err) {
+    // Backend predates file.attach_open (DESKTOP_BACKEND_CONTRACT < 7):
+    // fall back to the whole-file transport rather than failing the attach.
+    if (isMissingRpcMethod(err)) {
+      return wholeFileFallback()
+    }
+
+    throw err
+  }
+
+  if (!uploadId) {
+    throw new Error(`Could not start upload for ${label}`)
+  }
+
+  try {
+    let offset = 0
+    let totalBytes = Number.POSITIVE_INFINITY
+
+    while (offset < totalBytes) {
+      const chunk = await chunkedReader(filePath, offset)
+
+      if (!chunk) {
+        throw new Error(`Could not read ${label}`)
+      }
+
+      totalBytes = chunk.totalBytes
+
+      if (chunk.bytesRead > 0) {
+        await requestGateway('file.attach_chunk', {
+          session_id: liveSessionId,
+          upload_id: uploadId,
+          chunk_base64: chunk.base64
+        })
+        offset += chunk.bytesRead
+      } else if (offset < totalBytes) {
+        // Reader reported nothing new before reaching the file's known size —
+        // reading is stuck (shrunk/replaced on disk mid-upload). Bail rather
+        // than spin forever re-requesting the same offset.
+        throw new Error(`Could not read ${label}`)
+      }
+    }
+
+    return await requestGateway<FileAttachResponse>('file.attach_commit', {
+      session_id: liveSessionId,
+      upload_id: uploadId,
+      path: filePath,
+      name: label
+    })
+  } catch (err) {
+    // Best-effort: an abort failure must not mask the real upload error, and
+    // a dead/recovered session (the common trigger) makes the abort itself
+    // fail harmlessly — the gateway's stale-upload reaper cleans it up later.
+    await requestGateway('file.attach_abort', { session_id: liveSessionId, upload_id: uploadId }).catch(() => {})
+    throw err
+  }
 }
 
 export function renderCommandsCatalog(catalog: CommandsCatalogLike, copy: Translations['desktop']): string {
