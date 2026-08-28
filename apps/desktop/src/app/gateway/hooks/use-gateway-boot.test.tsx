@@ -1,6 +1,7 @@
 import { act, cleanup, render } from '@testing-library/react'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
+import { isWsAuthRejectedFailure } from '@/components/boot-failure-reauth'
 import { $desktopBoot } from '@/store/boot'
 import { closeSecondaryGateways, isActivePrimary } from '@/store/gateway'
 import { reconnectGateway } from '@/store/gateway-reconnect'
@@ -159,6 +160,15 @@ function fakeDesktop() {
       return !key || key === 'default' ? primaryConn : coderConn
     }),
     getGatewayWsUrl: vi.fn(async (conn?: { wsUrl?: string }) => conn?.wsUrl ?? primaryConn.wsUrl),
+    // /api/health probe (probeGatewayHealthOk in use-gateway-boot.ts). Tests
+    // exercising the auth-rejected classification override this per-case.
+    api: vi.fn(async ({ path }: { path: string }): Promise<unknown> => {
+      if (path === '/api/health') {
+        return { ok: true }
+      }
+
+      throw new Error(`unexpected api call: ${path}`)
+    }),
     getBootProgress: vi.fn(async () => ({
       error: null as null | string,
       fakeMode: false,
@@ -364,6 +374,66 @@ describe('useGatewayBoot remote reconnect loop (real hook, fake socket)', () => 
     expect($desktopBoot.get().error).toBeTruthy()
   })
 
+  // #t_360b3fcb: a token-mode connection with no token can never pass the
+  // server's WS credential check — every dial is refused identically. This
+  // is knowable BEFORE dialing, so the hook must fail fast with the honest
+  // auth-rejected message instead of attempting (and misreporting) a doomed
+  // WS connect.
+  it('#t_360b3fcb: a token-mode connection with no token fails fast with the auth-rejected message, never dials the socket', async () => {
+    const desktop = fakeDesktop()
+    desktop.getConnection = vi.fn(async () => ({ ...primaryConn, token: '' }))
+    ;(window as { hermesDesktop?: unknown }).hermesDesktop = desktop
+
+    render(<Harness />)
+    await flushAsync()
+
+    expect(FakeWebSocket.instances).toHaveLength(0)
+    expect($desktopBoot.get().error).toBeTruthy()
+    expect(isWsAuthRejectedFailure($desktopBoot.get().error)).toBe(true)
+  })
+
+  // #t_360b3fcb: the ambiguous case — gateway.connect() rejects with the
+  // same opaque error for "credential refused" and "host unreachable" (a
+  // browser WebSocket cannot read the HTTP status of a failed handshake).
+  // The hook must reactively probe /api/health to tell them apart.
+  it('#t_360b3fcb: a WS connect failure with a healthy /api/health is reclassified as auth-rejected, not "gateway didn\'t come up"', async () => {
+    const desktop = fakeDesktop()
+    desktop.api = vi.fn(async ({ path }: { path: string }) => {
+      if (path === '/api/health') {
+        return { ok: true }
+      }
+
+      throw new Error(`unexpected api call: ${path}`)
+    })
+    ;(window as { hermesDesktop?: unknown }).hermesDesktop = desktop
+
+    FakeWebSocket.mode = 'fail'
+    render(<Harness />)
+    await flushAsync()
+
+    expect($desktopBoot.get().error).toBeTruthy()
+    expect(isWsAuthRejectedFailure($desktopBoot.get().error)).toBe(true)
+  })
+
+  it('#t_360b3fcb: a WS connect failure with a FAILING /api/health keeps the original "gateway didn\'t come up" message', async () => {
+    const desktop = fakeDesktop()
+    desktop.api = vi.fn(async ({ path }: { path: string }): Promise<unknown> => {
+      if (path === '/api/health') {
+        throw new Error('network error')
+      }
+
+      throw new Error(`unexpected api call: ${path}`)
+    })
+    ;(window as { hermesDesktop?: unknown }).hermesDesktop = desktop
+
+    FakeWebSocket.mode = 'fail'
+    render(<Harness />)
+    await flushAsync()
+
+    expect($desktopBoot.get().error).toBeTruthy()
+    expect(isWsAuthRejectedFailure($desktopBoot.get().error)).toBe(false)
+  })
+
   it('resets the old machine context before connecting an applied gateway', async () => {
     const beforeConnectionSwitch = vi.fn()
     render(<Harness beforeConnectionSwitch={beforeConnectionSwitch} />)
@@ -384,7 +454,7 @@ describe('useGatewayBoot remote reconnect loop (real hook, fake socket)', () => 
     // so the rail kept (or, with a stale in-flight response, collapsed to)
     // the previous backend's list.
     const desktop = fakeDesktop() as ReturnType<typeof fakeDesktop> & {
-      api: ReturnType<typeof vi.fn>
+      api: (request: { path: string }) => Promise<unknown>
     }
 
     desktop.api = vi.fn(async ({ path }: { path: string }) => {
@@ -601,6 +671,7 @@ describe('useGatewayBoot remote reconnect loop (real hook, fake socket)', () => 
 
   it('resets the refresh-failure streak after a clean success, allowing a later notice to fire again', async () => {
     let shouldFail = true
+
     const refreshSessions = vi.fn(async () => {
       if (shouldFail) {
         throw new Error('refresh failed')

@@ -1,7 +1,7 @@
 import { isGatewayReauthRequired, JsonRpcGatewayError, resolveGatewayWsUrl } from '@hermes/shared'
 import { useEffect, useRef } from 'react'
 
-import { shouldApplyPostBootProgressError } from '@/components/boot-failure-reauth'
+import { shouldApplyPostBootProgressError, wsAuthRejectedMessage } from '@/components/boot-failure-reauth'
 import type { HermesConnection } from '@/global'
 import { HermesGateway } from '@/hermes'
 import { translateNow } from '@/i18n'
@@ -112,6 +112,11 @@ const BOOT_RETRY_BASE_DELAY_MS = 2_000
 // already has its own connect timeout.
 const RECONNECT_ATTEMPT_TIMEOUT_MS = 20_000
 
+// Bound for the post-connect-failure /api/health probe (see
+// probeGatewayHealthOk below). Short: this only needs to distinguish "the
+// gateway process answers HTTP" from "it doesn't", not exercise a slow route.
+const HEALTH_PROBE_TIMEOUT_MS = 5_000
+
 function withTimeout<T>(promise: Promise<T>, ms: number, message: string): Promise<T> {
   return new Promise<T>((resolve, reject) => {
     const timer = setTimeout(() => reject(new Error(message)), ms)
@@ -138,6 +143,31 @@ export function primaryRuntimeConnectionId(connection: Pick<HermesConnection, 'c
   }
 
   return connection.mode === 'local' ? 'local' : null
+}
+
+// Distinguish "the gateway process never came up" from "it's up but refused
+// the WebSocket credential" (#t_360b3fcb). A browser WebSocket cannot read
+// the HTTP status of a failed handshake — hermes_cli/web_server.py's
+// gateway_ws closes before accept() on a bad/missing token, so a 403 upgrade
+// and a genuinely dead backend both surface to the renderer as the same
+// opaque connect error. /api/health is a plain HTTP GET (no upgrade, no
+// credential requirement in loopback-token mode) that answers 200 whenever
+// the backend process is actually serving — probing it after a WS connect
+// failure tells the boot-failure overlay which message is true. Best-effort:
+// any probe failure (network error, non-2xx, timeout) means "treat this as
+// the original gateway-down failure", never a false "it's fine".
+async function probeGatewayHealthOk(desktop: NonNullable<typeof window.hermesDesktop>): Promise<boolean> {
+  try {
+    const health = await withTimeout(
+      desktop.api<{ ok?: boolean }>({ path: '/api/health', method: 'GET', timeoutMs: HEALTH_PROBE_TIMEOUT_MS }),
+      HEALTH_PROBE_TIMEOUT_MS,
+      'Timed out probing /api/health'
+    )
+
+    return health?.ok === true
+  } catch {
+    return false
+  }
 }
 
 interface GatewayBootOptions {
@@ -339,6 +369,7 @@ export function useGatewayBoot({
         // (#53902/#73082). A genuinely live turn re-asserts busy on its next
         // post-reconnect event.
         reconcileBusyStatesOnReconnect()
+
         // Resync state that may have moved on the backend while we were asleep.
         // Track repeated failures (not the odd blip on a socket that just
         // reopened) so a backend that keeps rejecting these RPCs post-reconnect
@@ -348,6 +379,7 @@ export function useGatewayBoot({
           () => true,
           () => false
         )
+
         const sessionsOk = await callbacksRef.current.refreshSessions().then(
           () => true,
           () => false
@@ -816,6 +848,24 @@ export function useGatewayBoot({
           return
         }
 
+        // Knowable BEFORE dialing the socket (#t_360b3fcb, scope item 2): a
+        // token-mode connection with no token can never pass
+        // hermes_cli/web_server.py's WS credential check — every dial would
+        // be refused with the exact same opaque "could not connect" error.
+        // The web build's web-bridge-shim.ts resolves TOKEN to '' when
+        // ?token=/localStorage/sessionStorage are all empty; surface the
+        // real cause immediately instead of hanging on a dead-end WS attempt
+        // and landing on the misleading "gateway didn't come up" overlay.
+        if (conn.authMode === 'token' && !conn.token) {
+          publish(conn)
+          failDesktopBoot(
+            wsAuthRejectedMessage('No access token was found for this session (missing ?token= link or stored credential).')
+          )
+          setSessionsLoading(false)
+
+          return
+        }
+
         setDesktopBootStep({
           phase: 'renderer.gateway.connect',
           message: translateNow('boot.steps.connectingGateway'),
@@ -917,9 +967,22 @@ export function useGatewayBoot({
             return
           }
 
-          failDesktopBoot(message)
-          notifyError(err, translateNow('boot.errors.desktopBootFailed'))
-          setSessionsLoading(false)
+          // Reactive fallback for the ambiguous case (#t_360b3fcb): a WS
+          // connect failure that isn't a confirmed reauth rejection cannot
+          // be told apart from a truly dead gateway by the browser alone
+          // (see probeGatewayHealthOk above — the 403 vs. unreachable-host
+          // failure shapes are identical to WebSocket). Probe /api/health;
+          // a 200 proves the backend is alive, so replace the misleading
+          // "gateway didn't come up" copy with the honest "reachable but the
+          // credential was refused" one instead. Any probe failure keeps the
+          // original message — never claim health when we couldn't check it.
+          const healthOk = !isGatewayReauthRequired(err) && (await probeGatewayHealthOk(desktop))
+
+          if (!cancelled) {
+            failDesktopBoot(healthOk ? wsAuthRejectedMessage(message) : message)
+            notifyError(err, translateNow('boot.errors.desktopBootFailed'))
+            setSessionsLoading(false)
+          }
         }
       }
     }

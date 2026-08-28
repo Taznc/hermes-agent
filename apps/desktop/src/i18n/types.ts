@@ -137,6 +137,9 @@ export interface Translations {
       description: string
       remoteTitle: string
       remoteDescription: string
+      wsAuthTitle: string
+      wsAuthDescription: string
+      wsAuthHint: string
       retry: string
       repairInstall: string
       useLocalGateway: string

@@ -19,6 +19,7 @@ import {
   deriveProviderShape,
   isRemoteConfig,
   isRemoteReauthFailure,
+  isWsAuthRejectedFailure,
   signInLabel,
   sshFailureMessage
 } from './boot-failure-reauth'
@@ -264,6 +265,14 @@ export function BootFailureOverlay() {
   // progress. When set, the recovery screen leads with the cloud-specific
   // guidance instead of the generic remote-failure copy (#85335).
   const cloudDown = Boolean(boot.isCloudBackendDown)
+  // Confirmed WS-credential rejection while the gateway itself answered
+  // healthy (#t_360b3fcb) — see probeGatewayHealthOk / the up-front
+  // no-token check in use-gateway-boot.ts. Distinct from remoteReauth
+  // (OAuth-specific): this covers the loopback-token / web-spike path where
+  // there is no sign-in flow to drive from here, only a fresh credential
+  // link. Checked ahead of the generic remote/local branches so the
+  // gateway-is-fine copy wins over "couldn't start".
+  const wsAuthRejected = isWsAuthRejectedFailure(boot.error)
   // The web-spike bridge (web-bridge-shim.ts) deliberately omits these
   // Electron-only capabilities, so a served-as-web-app build must not offer
   // buttons that silently no-op (repair) or route into an EmptyState
@@ -285,6 +294,17 @@ export function BootFailureOverlay() {
       localAction
     ]
     hint = copy.remoteSignInHint(label)
+  } else if (wsAuthRejected) {
+    // retryAction reloads via performWebReload() and reconnects with the
+    // exact same connection descriptor — offering it here would silently
+    // redial the identical tokenless URL into the same rejection forever,
+    // which is the dead end the card explicitly calls out (#t_360b3fcb
+    // scope item 4). There is no in-app action that can mint a fresh
+    // credential, so point at Settings when the bridge supports editing the
+    // connection (Electron token mode) and otherwise leave only the honest
+    // hint — never a button that looks actionable but isn't.
+    actions = [{ ...settingsAction, variant: 'secondary' }]
+    hint = copy.wsAuthHint
   } else if (cloudDown) {
     // A Nous Cloud agent is down — the user cannot restart the managed
     // instance and Repair is local-only. Lead with the paths that actually
@@ -388,10 +408,22 @@ export function BootFailureOverlay() {
           <ErrorIcon className="mt-0.5" size="1.25rem" />
           <div>
             <h2 className="text-[0.9375rem] font-semibold tracking-tight">
-              {remoteReauth ? copy.remoteTitle : cloudDown ? copy.cloudDownTitle : copy.title}
+              {remoteReauth
+                ? copy.remoteTitle
+                : wsAuthRejected
+                  ? copy.wsAuthTitle
+                  : cloudDown
+                    ? copy.cloudDownTitle
+                    : copy.title}
             </h2>
             <p className="mt-1 text-[0.8125rem] leading-5 text-(--ui-text-tertiary)">
-              {remoteReauth ? copy.remoteDescription : cloudDown ? copy.cloudDownDescription : copy.description}
+              {remoteReauth
+                ? copy.remoteDescription
+                : wsAuthRejected
+                  ? copy.wsAuthDescription
+                  : cloudDown
+                    ? copy.cloudDownDescription
+                    : copy.description}
             </p>
           </div>
         </div>

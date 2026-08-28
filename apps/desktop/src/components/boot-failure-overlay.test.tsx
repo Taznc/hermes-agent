@@ -178,4 +178,56 @@ describe('BootFailureOverlay', () => {
       restore()
     }
   })
+
+  // The WS-auth-rejected boot failure (#t_360b3fcb): use-gateway-boot.ts
+  // detects that the gateway answered /api/health while the WS credential
+  // was refused (or was never present) and tags the boot error with the
+  // wsAuthRejectedMessage() marker instead of the generic "could not
+  // connect" message. The overlay must show the honest "gateway is fine,
+  // sign-in required" copy, not the misleading "gateway didn't come up"
+  // title/description — this is the whole bug the card reports.
+  it('shows the honest auth-rejected copy (not "gateway didn\'t come up") for a WS credential failure', async () => {
+    const restore = stubDesktop(null)
+    $desktopBoot.set({
+      error:
+        'Hermes gateway is reachable, but the live connection was refused (missing or invalid access credential). No access token was found for this session (missing ?token= link or stored credential).',
+      fakeMode: false,
+      message: 'boot failed',
+      phase: 'renderer.error',
+      progress: 40,
+      running: false,
+      timestamp: Date.now(),
+      visible: true
+    })
+
+    try {
+      render(<BootFailureOverlay />)
+      // Must NOT show the misleading "gateway didn't come up" copy.
+      expect(screen.queryByText(/couldn't start/i)).toBeNull()
+      expect(screen.queryByText(/background gateway didn't come up/i)).toBeNull()
+      // Must show the honest sign-in-required copy naming the real cause.
+      expect(await screen.findByText(/sign-in required/i)).toBeTruthy()
+      expect(screen.getByText(/access credential was rejected/i)).toBeTruthy()
+      // Retry must not be offered: it would silently redial the identical
+      // tokenless URL into the same rejection forever (scope item 4).
+      expect(screen.queryByRole('button', { name: /^retry$/i })).toBeNull()
+    } finally {
+      restore()
+    }
+  })
+
+  it('a genuinely dead gateway (no health-probe classification applied) keeps the original "couldn\'t start" copy', () => {
+    // Regression guard: an ordinary connect failure (the health probe found
+    // nothing / never ran, e.g. main.ts's IPC-bridge-unavailable path) must
+    // still show the original overlay, not the new auth-specific one.
+    const restore = stubDesktop(null)
+
+    try {
+      render(<BootFailureOverlay />)
+      expect(screen.getByText(/couldn't start/i)).toBeTruthy()
+      expect(screen.getByRole('button', { name: /retry/i })).toBeTruthy()
+    } finally {
+      restore()
+    }
+  })
 })
