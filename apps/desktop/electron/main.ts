@@ -10540,8 +10540,11 @@ function watchDevBackendPython() {
         }
 
         if (devBackendStaleTracker.markStale()) {
+          // Log-message text only (dev-only console.log), not a real fs
+          // join — no functional effect from the missing separator
+          // normalization on any OS.
           console.log(
-            `[hermes] backend Python source changed on disk (${dir}/${filename}) — restart backend to apply`
+            `[hermes] backend Python source changed on disk (${dir}/${filename}) — restart backend to apply` // windows-footgun: ok — dev-only console.log text, not an fs path
           )
           broadcastDevBackendStale()
         }

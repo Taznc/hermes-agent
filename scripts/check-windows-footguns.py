@@ -5,6 +5,12 @@ Grep-based checker for Windows cross-platform footguns.
 Flags common patterns that break silently on Windows. Run before PRs —
 cheap, fast, catches regressions in a codebase that runs on three OSes.
 
+Covers Python (hermes_cli/, gateway/, tools/, cron/, agent/, plugins/,
+scripts/, acp_adapter/) AND the Electron/TS desktop app (apps/desktop/{src,
+electron,scripts}, *.ts/*.tsx/*.mjs) with a separate, smaller JS/TS
+ruleset — the two rule sets never cross-apply (a Python-only rule never
+scans a .ts file and vice versa).
+
 Usage:
     # Scan staged changes (default when run from a git checkout)
     python scripts/check-windows-footguns.py
@@ -24,6 +30,9 @@ Exit status:
 
 Suppress an intentional use (e.g. tests or platform-gated code) with:
     os.kill(pid, 0)  # windows-footgun: ok — only called on POSIX
+
+The JS/TS ruleset uses the same marker in JS comment style:
+    spawn('bash', args)  // windows-footgun: ok — guarded by isPosix at call site
 """
 
 from __future__ import annotations
@@ -39,15 +48,18 @@ from typing import Iterable
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 
-SUPPRESS_MARKER = re.compile(r"#\s*windows-footgun\s*:\s*ok\b", re.IGNORECASE)
+SUPPRESS_MARKER = re.compile(r"(?:#|//)\s*windows-footgun\s*:\s*ok\b", re.IGNORECASE)
 
 # Line-level guard hints. If a line contains any of these tokens, we assume
 # the programmer wrote the line in full awareness of the Windows pitfall —
 # e.g. `if hasattr(os, 'setsid'): ... os.setsid()`, or the classic
 # `getattr(signal, 'SIGKILL', signal.SIGTERM)`, or `shutil.which("wmic")`.
-# False negatives are fine here — the inline `# windows-footgun: ok` marker
-# is still the authoritative suppression. This is just to reduce the noise
-# floor on obviously-guarded lines so the signal-to-noise stays useful.
+# False negatives are fine here — the inline `# windows-footgun: ok`
+# suppression marker is still the authoritative suppression. This is just to
+# reduce the noise floor on obviously-guarded lines so the signal-to-noise
+# stays useful. Shared across the Python and JS/TS rulesets — the JS-side
+# tokens (process.platform checks, IS_WINDOWS, isPosix) are additive and
+# never match Python source.
 GUARD_HINTS = (
     "hasattr(os,",
     "hasattr(signal,",
@@ -62,6 +74,13 @@ GUARD_HINTS = (
     "if sys.platform != 'win32'",
     "IS_WINDOWS",
     "is_windows",
+    # JS/TS guard idioms.
+    "process.platform === 'win32'",
+    'process.platform === "win32"',
+    "process.platform !== 'win32'",
+    'process.platform !== "win32"',
+    "isPosix",
+    "isWindows",
 )
 
 # Dirs we never scan.
@@ -133,6 +152,16 @@ class Footgun:
     # the regex can't fully distinguish (e.g. open() where mode may contain
     # "b" for binary, or the line may have `encoding=` elsewhere).
     post_filter: "callable | None" = None
+    # Optional multi-line context check for footguns where the mitigation
+    # lives on a NEARBY line rather than the same one (e.g. an fs.watch()
+    # error handler attached a few lines below the call, or a ctrlKey check
+    # split across a multi-condition if-statement). Takes (all_lines,
+    # match_line_idx) where all_lines is the full file split on '\n' and
+    # match_line_idx is the 0-based index of the matched line. Return False
+    # to suppress (mitigation found nearby), True to keep the match flagged.
+    # Only used by the JS/TS ruleset so far — the line-based Python rules
+    # haven't needed it.
+    context_check: "callable | None" = None
 
 
 FOOTGUNS: list[Footgun] = [
@@ -434,6 +463,213 @@ FOOTGUNS: list[Footgun] = [
 ]
 
 
+# ---------------------------------------------------------------------------
+# JS/TS ruleset — apps/desktop/{src,electron,scripts} (Electron + renderer).
+#
+# The Python ruleset above only ever sees hermes_cli/gateway/tools/etc — the
+# entire Electron/TS desktop app was a blind spot (should_scan_file only
+# accepted .py/.pyw/.pyi). These rules target the JS-side footgun classes an
+# audit found that the Python rules structurally cannot catch: fs.watch()
+# without an error handler (unhandled 'error' on an EventEmitter throws —
+# Windows raises EPERM on a deleted/renamed watched dir), '\n'-only line
+# splitting on child process output (CRLF on Windows leaves a trailing '\r'),
+# process.env.HOME (Windows sets USERPROFILE, not HOME), 'darwin' ternaries
+# that silently assume "anything else is POSIX", template-literal path joins
+# with a bare '/' (breaks on backslash-separated Windows paths — though NOT
+# on URLs, which correctly always use '/'), spawn('bash'/'sh') without a
+# platform guard, and metaKey-only keyboard shortcuts with no ctrlKey
+# fallback (Windows/Linux have no Cmd key).
+#
+# Same architecture as the Python rules: regex + optional post_filter/
+# context_check, `// windows-footgun: ok` suppression (SUPPRESS_MARKER
+# accepts both # and // — see above), GUARD_HINTS shared with the Python
+# rules (isPosix/isWindows/process.platform checks apply here too).
+# ---------------------------------------------------------------------------
+
+
+def _lines_in_window(all_lines: list[str], start: int, end: int) -> str:
+    """Join all_lines[start:end] (both clamped to valid range) into one
+    blob for a cheap substring/regex search across a multi-line window."""
+    start = max(0, start)
+    end = min(len(all_lines), end)
+    return "\n".join(all_lines[start:end])
+
+
+def _fs_watch_has_nearby_error_handler(all_lines: list[str], idx: int) -> bool:
+    """True (keep flagged) unless a '.on('error'...)' or the repo's
+    guardWatcherErrors() helper appears within the next 15 lines — the
+    error handler is usually attached to the returned watcher a few
+    statements after the fs.watch(...) call, never on the same line."""
+    window = _lines_in_window(all_lines, idx, idx + 16)
+    if re.search(r"\.on\(\s*['\"]error['\"]", window):
+        return False
+    if "guardWatcherErrors" in window:
+        return False
+    return True
+
+
+def _metakey_has_nearby_ctrlkey(all_lines: list[str], idx: int) -> bool:
+    """True (keep flagged) unless ctrlKey appears within 3 lines either
+    side — catches the common case of a multi-condition if-statement
+    where metaKey and ctrlKey land on different physical lines."""
+    window = _lines_in_window(all_lines, idx - 3, idx + 4)
+    return "ctrlKey" not in window
+
+
+def _darwin_ternary_no_win32_guard_nearby(all_lines: list[str], idx: int) -> bool:
+    """True (keep flagged) unless a 'win32' check appears shortly before
+    this line — catches the common pattern where the actual Windows case
+    is handled by an early return/branch a few lines above the ternary
+    (e.g. `if (platform === 'win32') return X` followed by a plain
+    `platform === 'darwin' ? Y : Z` that only needs to disambiguate
+    mac/linux because win32 already left). A wider look-behind than
+    look-ahead since the guard precedes the ternary in every real example
+    found in this codebase."""
+    window = _lines_in_window(all_lines, idx - 10, idx + 3)
+    return "win32" not in window
+
+
+JS_FOOTGUNS: list[Footgun] = [
+    Footgun(
+        name="fs.watch() without a nearby error handler",
+        pattern=re.compile(r"\bfs\s*\.\s*watch\s*\("),
+        message=(
+            "fs.watch() with no '.on(\"error\", ...)' handler nearby: an "
+            "unhandled 'error' event on an EventEmitter throws and crashes "
+            "the whole Electron main process. Windows raises EPERM when the "
+            "watched file/directory is deleted or renamed while watched — "
+            "a routine user action (deleting a plugin folder, renaming a "
+            "previewed file), not an edge case."
+        ),
+        fix=(
+            "const watcher = fs.watch(dir, cb)\n"
+            "watcher.on('error', (err) => { watcher.close(); /* log + \n"
+            "  forget it instead of letting the throw take down main */ })"
+        ),
+        context_check=_fs_watch_has_nearby_error_handler,
+    ),
+    Footgun(
+        name="split('\\n') on child process output",
+        pattern=re.compile(r"""\.split\(\s*['"]\\n['"]\s*\)"""),
+        message=(
+            "Splitting child process stdout/stderr on a bare '\\n' leaves "
+            "a trailing '\\r' on every line when the child writes "
+            "Windows-native CRLF output (native tools like tasklist, "
+            "reg.exe, schtasks, or any Windows batch/PowerShell script). "
+            "Downstream string comparisons/parsing silently fail on the "
+            "stray '\\r'."
+        ),
+        fix="text.split(/\\r?\\n/) — or .trimEnd() each line after split.",
+        post_filter=lambda m, line: bool(
+            re.search(r"\bstdout\b|\bstderr\b", line, re.IGNORECASE)
+        ),
+    ),
+    Footgun(
+        name="process.env.HOME",
+        pattern=re.compile(r"\bprocess\.env\.HOME\b"),
+        message=(
+            "process.env.HOME is unset on Windows (Windows sets "
+            "USERPROFILE, and HOMEDRIVE + HOMEPATH separately) — a bare "
+            "read silently resolves to undefined instead of throwing, so "
+            "the bug surfaces far from this line as a broken path."
+        ),
+        fix=(
+            "Use app.getPath('home') (Electron, cross-platform) or "
+            "os.homedir() (Node stdlib, cross-platform) instead of reading "
+            "the env var directly."
+        ),
+    ),
+    Footgun(
+        name="'darwin' ternary lacking a win32 branch",
+        pattern=re.compile(r"""\bplatform\s*===\s*['"]darwin['"]\s*\?"""),
+        message=(
+            "A `platform === 'darwin' ? X : Y` ternary treats every "
+            "non-macOS platform as one bucket — Y silently has to be "
+            "correct for BOTH Linux and Windows. That's often true for "
+            "Linux and false for Windows (shell defaults, accelerator "
+            "syntax, window-level APIs). Make the Windows case explicit."
+        ),
+        fix=(
+            "platform === 'darwin' ? macValue\n"
+            "  : platform === 'win32' ? winValue\n"
+            "  : linuxValue"
+        ),
+        # Electron accelerator strings are the one legitimate exception:
+        # 'Ctrl+...' is correct on BOTH win32 and Linux (that's what
+        # CommandOrControl already encodes), so a darwin-only ternary
+        # whose else-branch is an accelerator string isn't missing a case.
+        post_filter=lambda m, line: "win32" not in line and "accelerator" not in line,
+        context_check=_darwin_ternary_no_win32_guard_nearby,
+    ),
+    Footgun(
+        name="template-literal filesystem path join with bare '/'",
+        # Named group so the post_filter can inspect the interpolated
+        # variable's name. Deliberately narrow to path-suggestive
+        # identifiers (dir/path/home/root/cwd, case-insensitive, as a
+        # substring) rather than every `${x}/` — the wider match would
+        # flag URL joins (`${base}/api/...`) as often as real fs joins,
+        # and '/' in a URL is correct on every platform.
+        pattern=re.compile(r"\$\{(?P<var>[a-zA-Z_][a-zA-Z0-9_]*)\}/(?!/)"),
+        message=(
+            "Template-literal path join with a hardcoded '/' breaks when "
+            "the interpolated value is a Windows path (backslash-"
+            "separated) — string concatenation doesn't normalize "
+            "separators the way path.join()/path.posix.join() do."
+        ),
+        fix="path.join(dir, rest) instead of `${dir}/${rest}`",
+        path_allowlist=(
+            ".test.",
+            ".spec.",
+            "/tests/",
+            "/test/",
+            # display-path.ts's entire job is producing DISPLAY strings that
+            # are ALREADY forward-slash-normalized (normalizeDisplayPath
+            # converts '\\' -> '/' first, per its own module docstring) —
+            # every `${x}/` in that file operates on already-normalized
+            # values for paint-only output, never a real fs join. Structural
+            # exception for the whole file, not a one-off suppression.
+            "src/lib/display-path.ts",
+        ),
+        # Skip URL/HTTP contexts: `request.pathname`/`.startsWith(...)` on
+        # a `pathname`/`basePath`/`url` value is a URL path, which is
+        # ALWAYS forward-slash per RFC 3986 regardless of host OS — not a
+        # filesystem join, so path.join() would be the wrong fix there.
+        post_filter=lambda m, line: (
+            bool(re.search(r"(?i)dir|path|home|root|cwd", m.group("var")))
+            and not re.search(r"(?i)pathname|basePath\b|\burl\b", line)
+        ),
+    ),
+    Footgun(
+        name="spawn('bash'|'sh') without a platform guard",
+        pattern=re.compile(r"""\bspawn\(\s*['"](?:bash|sh)['"]"""),
+        message=(
+            "spawn('bash'/'sh', ...) assumes a POSIX shell is on PATH — "
+            "Windows has neither by default (Git Bash is opt-in and not "
+            "guaranteed). Gate on process.platform or dispatch to a "
+            "PowerShell/cmd equivalent."
+        ),
+        fix=(
+            "const isPosix = process.platform !== 'win32'\n"
+            "await (isPosix ? spawnBash : spawnPowerShell)(scriptPath, args)"
+        ),
+    ),
+    Footgun(
+        name="metaKey without a ctrlKey fallback",
+        pattern=re.compile(r"\.metaKey\b"),
+        message=(
+            "A keyboard/mouse shortcut gated on metaKey (Cmd) alone has no "
+            "equivalent on Windows/Linux, which have no Cmd key — the "
+            "shortcut is silently unreachable off macOS."
+        ),
+        fix="event.metaKey || event.ctrlKey  (or isMac ? event.metaKey : event.ctrlKey)",
+        path_allowlist=(".test.", ".spec.", "/tests/", "/test/"),
+        context_check=_metakey_has_nearby_ctrlkey,
+    ),
+]
+
+JS_SUFFIXES = {".ts", ".tsx", ".mjs", ".mts", ".js", ".jsx"}
+
+
 def should_scan_file(path: Path) -> bool:
     """Return True if this file is in scope for the checker."""
     # Skip the excluded dirs
@@ -448,12 +684,30 @@ def should_scan_file(path: Path) -> bool:
     rel = path.relative_to(REPO_ROOT).as_posix()
     if rel in EXCLUDED_FILES:
         return False
-    # Only scan text files (rough heuristic — .py, .md, .sh, .ps1, .yaml, etc.)
+    # Python ruleset scope: unchanged from before this file's JS/TS rules.
     if path.suffix in {".py", ".pyw", ".pyi"}:
         return True
-    # Other file types are read but only Python-specific patterns would match;
+    # JS/TS ruleset scope: the Electron/TS desktop app only — NOT every
+    # .ts file in the repo (apps/bootstrap-installer, apps/shared, and
+    # tests-js/ are separate surfaces this checker doesn't own yet; adding
+    # them is a follow-up, not scope creep on this one). Anchored on the
+    # apps/desktop/{src,electron,scripts} prefix so a .ts file elsewhere
+    # (e.g. a config script at the repo root) isn't silently pulled in.
+    if path.suffix in JS_SUFFIXES and "apps/desktop" in rel:
+        for prefix in ("apps/desktop/src/", "apps/desktop/electron/", "apps/desktop/scripts/"):
+            if rel.startswith(prefix):
+                return True
+        return False
+    # Other file types are read but no rule in either ruleset would match;
     # that's fine and cheap to skip.
     return False
+
+
+def ruleset_for_file(path: Path) -> list[Footgun]:
+    """Return the Footgun ruleset applicable to this file's language."""
+    if path.suffix in JS_SUFFIXES:
+        return JS_FOOTGUNS
+    return FOOTGUNS
 
 
 def iter_files(paths: Iterable[Path]) -> Iterable[Path]:
@@ -513,6 +767,54 @@ def _find_unquoted_hash(line: str) -> int | None:
             return i
         i += 1
     return None
+
+
+def _find_unquoted_double_slash(line: str) -> int | None:
+    """Index of the first `//` not inside a single/double/template-literal
+    (backtick) string. JS/TS analog of ``_find_unquoted_hash`` — needed
+    because ``_strip_code`` only knows Python's ``#`` comment syntax, and
+    without this a JS comment merely MENTIONING ``fs.watch()`` in prose
+    (e.g. "// main.ts owns the actual fs.watch() calls") gets scanned as
+    if it were live code and false-positives the fs.watch rule.
+    """
+    i = 0
+    n = len(line)
+    in_s = False  # single-quote string
+    in_d = False  # double-quote string
+    in_t = False  # template-literal (backtick) string
+    while i < n:
+        c = line[i]
+        if c == "\\" and (in_s or in_d or in_t) and i + 1 < n:
+            i += 2
+            continue
+        if not in_d and not in_t and c == "'":
+            in_s = not in_s
+        elif not in_s and not in_t and c == '"':
+            in_d = not in_d
+        elif not in_s and not in_d and c == "`":
+            in_t = not in_t
+        elif c == "/" and i + 1 < n and line[i + 1] == "/" and not in_s and not in_d and not in_t:
+            return i
+        i += 1
+    return None
+
+
+def _strip_code_js(line: str) -> str:
+    """JS/TS analog of ``_strip_code``: drop a whole-line ``//`` comment or
+    a trailing ``// ...`` inline comment, respecting quote/template-literal
+    state so a ``//`` inside a string (e.g. a URL) is never mistaken for a
+    comment marker. Does not handle multi-line ``/* ... */`` block comments
+    (rare in this codebase's call-site style) — an acceptable false-negative
+    for a line-based scanner, same tradeoff the Python side makes for
+    triple-quoted strings spanning awkward structures.
+    """
+    stripped = line.lstrip()
+    if stripped.startswith("//"):
+        return ""
+    idx = _find_unquoted_double_slash(line)
+    if idx is not None:
+        return line[:idx]
+    return line
 
 
 # Subprocess method names that accept ``text=`` and are affected by the
@@ -598,48 +900,53 @@ def scan_file(path: Path, footguns: list[Footgun]) -> list[tuple[int, str, Footg
     except OSError:
         return []
     matches: list[tuple[int, str, Footgun]] = []
+    all_lines = text.splitlines()
+    is_js = path.suffix in JS_SUFFIXES
 
     # Track whether we're inside a triple-quoted string (docstring/raw block).
     # Simple state machine — handles both ''' and """, toggled by the FIRST
     # triple-quote we see; we don't try to handle nested or f-string cases.
+    # Python-only: JS/TS has no triple-quote syntax, so this stays inert
+    # there (skipped below) rather than risk a false match against JS
+    # string literals that happen to contain the same characters.
     in_triple: str | None = None  # None, "'''", or '"""'
 
-    for i, line in enumerate(text.splitlines(), start=1):
+    for i, line in enumerate(all_lines, start=1):
         # Update triple-quote state based on this line's occurrences.
         code_for_scan = line
-        if in_triple:
-            # We're inside a docstring — skip the whole line's scan.
-            # Check if it closes here.
-            if in_triple in line:
-                # Find the closing delimiter; anything after it is real code.
-                after = line.split(in_triple, 1)[1]
-                in_triple = None
-                code_for_scan = after
-            else:
-                continue
-        # Now check for docstring-open in the (possibly after-triple) portion.
-        # Scan for the first unescaped '''/""" in the current code_for_scan.
-        stripped = code_for_scan.strip()
-        for delim in ('"""', "'''"):
-            if delim in code_for_scan:
-                # Count occurrences — even count means single-line docstring,
-                # odd means we've entered a multi-line one.
-                count = code_for_scan.count(delim)
-                if count % 2 == 1:
-                    # Odd — we're now inside the triple-quoted block.
-                    # Scan only the part BEFORE the opening delimiter.
-                    before = code_for_scan.split(delim, 1)[0]
-                    code_for_scan = before
-                    in_triple = delim
-                    break
+        if not is_js:
+            if in_triple:
+                # We're inside a docstring — skip the whole line's scan.
+                # Check if it closes here.
+                if in_triple in line:
+                    # Find the closing delimiter; anything after it is real code.
+                    after = line.split(in_triple, 1)[1]
+                    in_triple = None
+                    code_for_scan = after
                 else:
-                    # Even — entire docstring fits on one line. Strip it
-                    # from the scan text to avoid matching on prose.
-                    parts = code_for_scan.split(delim)
-                    # Keep the "outside" parts (every other chunk, starting
-                    # with index 0) as code, drop the "inside" parts.
-                    code_for_scan = "".join(parts[::2])
-                    break
+                    continue
+            # Now check for docstring-open in the (possibly after-triple) portion.
+            # Scan for the first unescaped '''/""" in the current code_for_scan.
+            for delim in ('"""', "'''"):
+                if delim in code_for_scan:
+                    # Count occurrences — even count means single-line docstring,
+                    # odd means we've entered a multi-line one.
+                    count = code_for_scan.count(delim)
+                    if count % 2 == 1:
+                        # Odd — we're now inside the triple-quoted block.
+                        # Scan only the part BEFORE the opening delimiter.
+                        before = code_for_scan.split(delim, 1)[0]
+                        code_for_scan = before
+                        in_triple = delim
+                        break
+                    else:
+                        # Even — entire docstring fits on one line. Strip it
+                        # from the scan text to avoid matching on prose.
+                        parts = code_for_scan.split(delim)
+                        # Keep the "outside" parts (every other chunk, starting
+                        # with index 0) as code, drop the "inside" parts.
+                        code_for_scan = "".join(parts[::2])
+                        break
 
         if SUPPRESS_MARKER.search(line):
             continue
@@ -648,7 +955,7 @@ def scan_file(path: Path, footguns: list[Footgun]) -> list[tuple[int, str, Footg
         # the inline suppression marker is the authoritative override.
         if any(hint in line for hint in GUARD_HINTS):
             continue
-        code = _strip_code(code_for_scan)
+        code = _strip_code_js(code_for_scan) if is_js else _strip_code(code_for_scan)
         if not code.strip():
             continue
         for fg in footguns:
@@ -663,6 +970,10 @@ def scan_file(path: Path, footguns: list[Footgun]) -> list[tuple[int, str, Footg
                         continue
                 except (IndexError, AttributeError):
                     # Post-filter assumed a named group that isn't there — skip.
+                    continue
+            if fg.context_check is not None:
+                # 0-based index of this line within all_lines (i is 1-based).
+                if not fg.context_check(all_lines, i - 1):
                     continue
             matches.append((i, line.rstrip(), fg))
     return matches
@@ -698,7 +1009,10 @@ def get_diff_files(ref: str) -> list[Path]:
 
 def parse_args(argv: list[str]) -> argparse.Namespace:
     p = argparse.ArgumentParser(
-        description="Flag Windows cross-platform footguns in Python code."
+        description=(
+            "Flag Windows cross-platform footguns in Python code and the "
+            "Electron/TS desktop app."
+        )
     )
     p.add_argument(
         "paths",
@@ -709,7 +1023,10 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     p.add_argument(
         "--all",
         action="store_true",
-        help="Scan the full repository (hermes_cli/, gateway/, tools/, cron/, etc.).",
+        help=(
+            "Scan the full repository (hermes_cli/, gateway/, tools/, "
+            "cron/, etc. + apps/desktop/{src,electron,scripts})."
+        ),
     )
     p.add_argument(
         "--diff",
@@ -719,14 +1036,21 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     p.add_argument(
         "--list",
         action="store_true",
-        help="List all known footgun rules and exit.",
+        help="List all known footgun rules (both rulesets) and exit.",
     )
     return p.parse_args(argv)
 
 
 def print_rules() -> None:
     print("Known Windows footguns checked by this script:\n")
+    print("Python ruleset:\n")
     for i, fg in enumerate(FOOTGUNS, start=1):
+        print(f"{i:2}. {fg.name}")
+        print(f"    {fg.message}")
+        print(f"    Fix: {fg.fix}")
+        print()
+    print("JS/TS ruleset (apps/desktop/{src,electron,scripts}):\n")
+    for i, fg in enumerate(JS_FOOTGUNS, start=1):
         print(f"{i:2}. {fg.name}")
         print(f"    {fg.message}")
         print(f"    Fix: {fg.fix}")
@@ -749,7 +1073,10 @@ def main(argv: list[str]) -> int:
         return 0
 
     if args.all:
-        # Scan main Python packages + scripts
+        # Scan main Python packages + scripts, plus the Electron/TS desktop
+        # app (apps/desktop/{src,electron,scripts} — should_scan_file further
+        # narrows this to those three subdirs so apps/desktop/dist,
+        # apps/desktop/node_modules, apps/desktop/e2e etc. stay excluded).
         roots = [
             REPO_ROOT / "hermes_cli",
             REPO_ROOT / "gateway",
@@ -759,6 +1086,9 @@ def main(argv: list[str]) -> int:
             REPO_ROOT / "plugins",
             REPO_ROOT / "scripts",
             REPO_ROOT / "acp_adapter",
+            REPO_ROOT / "apps" / "desktop" / "src",
+            REPO_ROOT / "apps" / "desktop" / "electron",
+            REPO_ROOT / "apps" / "desktop" / "scripts",
         ]
         roots = [r for r in roots if r.exists()]
     elif args.diff:
@@ -780,7 +1110,7 @@ def main(argv: list[str]) -> int:
     files_scanned = 0
     for path in iter_files(roots):
         files_scanned += 1
-        matches = scan_file(path, FOOTGUNS)
+        matches = scan_file(path, ruleset_for_file(path))
         for lineno, line, fg in matches:
             rel = path.relative_to(REPO_ROOT).as_posix()
             print(f"{rel}:{lineno}: [{fg.name}]")
@@ -798,8 +1128,9 @@ def main(argv: list[str]) -> int:
         )
         print(
             "  If an individual match is a false positive or intentionally "
-            "platform-gated, suppress it with `# windows-footgun: ok` on "
-            "the same line.\n  Run with --list to see all rules.",
+            "platform-gated, suppress it with `# windows-footgun: ok` (or "
+            "`// windows-footgun: ok` in JS/TS) on the same line.\n"
+            "  Run with --list to see all rules.",
             file=sys.stderr,
         )
         return 1

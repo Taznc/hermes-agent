@@ -81,7 +81,13 @@ function validateSpawnNonce(spawnNonce) {
 }
 
 function ownershipDirectory(ownershipId) {
-  return `${REMOTE_LOCK_DIR}/${validateOwnershipId(ownershipId)}`
+  // Every path built in this module is a REMOTE shell path, always
+  // executed over `ssh.exec()` against a host gated to Linux/Darwin by
+  // probeRemotePlatform's SUPPORTED_REMOTE_OS check above — never a local
+  // filesystem path on the (possibly Windows) machine running Electron.
+  // '/' is the correct, only separator on every host this ever runs
+  // against, so path.join() would be the wrong tool here.
+  return `${REMOTE_LOCK_DIR}/${validateOwnershipId(ownershipId)}` // windows-footgun: ok — remote POSIX shell path (SUPPORTED_REMOTE_OS excludes win32)
 }
 
 function lockfilePath(ownershipId) {
@@ -263,7 +269,7 @@ async function probeRemoteHermesHome(ssh) {
 
 async function listRemoteHermesProfiles(ssh) {
   const home = assertSafeRemoteHome(await probeRemoteHermesHome(ssh))
-  const dir = expandRemotePath(`${home}/profiles`)
+  const dir = expandRemotePath(`${home}/profiles`) // windows-footgun: ok — remote POSIX shell path (SUPPORTED_REMOTE_OS excludes win32)
   let listing = ''
 
   try {
@@ -362,7 +368,7 @@ async function readLockfile(ssh, ownershipId) {
 async function writeLockfile(ssh, ownershipId, lock) {
   const directory = ownershipDirectory(ownershipId)
   const lpath = lockfilePath(ownershipId)
-  const temporaryPath = `${directory}/.${crypto.randomBytes(8).toString('hex')}.lock.tmp`
+  const temporaryPath = `${directory}/.${crypto.randomBytes(8).toString('hex')}.lock.tmp` // windows-footgun: ok — remote POSIX shell path (SUPPORTED_REMOTE_OS excludes win32)
   const json = JSON.stringify({ ...lock, schemaVersion: LOCKFILE_SCHEMA_VERSION })
   await ssh.exec(
     `umask 077 && mkdir -p ${expandRemotePath(directory)} && ` +

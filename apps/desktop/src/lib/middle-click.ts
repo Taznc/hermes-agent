@@ -6,8 +6,10 @@ const MIDDLE_BUTTON = 1
 /** ⌘-click (metaKey + primary button) — the Mac has no middle button, so this
  *  is the trackpad equivalent of middle-click-to-close. Guarded on metaKey so
  *  it never collides with left-click (activate/drag) or ⌃-click (macOS context
- *  menu). */
-export const isMetaClose = (event: { button: number; metaKey: boolean }) => event.button === 0 && event.metaKey
+ *  menu). Windows/Linux don't need a ctrlKey fallback here: they have a real
+ *  middle mouse button, handled separately by middleClickHandlers() below —
+ *  this is Mac-only by design, not a missing cross-platform case. */
+export const isMetaClose = (event: { button: number; metaKey: boolean }) => event.button === 0 && event.metaKey // windows-footgun: ok — Mac-only trackpad affordance; win/linux use the real middle button instead (see middleClickHandlers)
 
 /** Where the current middle press started. One pointer holds one button, so a
  *  single slot is the whole state, and it's only ever compared by identity in
