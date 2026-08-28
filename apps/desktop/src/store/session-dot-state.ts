@@ -25,9 +25,10 @@
 
 import { atom, computed } from 'nanostores'
 
-import { stableArray, stableRecord } from '@/lib/stable-array'
+import { stableArray, stableRecord, stableSet } from '@/lib/stable-array'
 
 import { $backgroundRunningSessionIds } from './composer-status'
+import { $sidebarStatusFilter } from './layout'
 import { $messagingSessions, $sessions, $unreadFinishedSessionIds, lineageAliases } from './session'
 import {
   $attentionSessionIds,
@@ -262,4 +263,36 @@ export function unreadSessionCount(
 export const $unreadSessionCount = computed(
   [$sessionDotStateById, $sessions, $messagingSessions],
   (byId, sessions, messaging) => unreadSessionCount(byId, sessions, messaging)
+)
+
+/** Sessions the sidebar's status filter excludes, as a membership set.
+ *
+ * Isolated from the general filter predicate (project/profile/PR) because
+ * this is the one leg fed by $sessionDotStateById, which republishes on
+ * every dot-state edge — several times per turn while driving parallel
+ * agents. Wrapped in `stableSet` (same discipline as `$workingSessionIds`)
+ * so the membership set keeps its reference when the status filter is off
+ * or when a dot-state edge doesn't change which sessions it excludes. A
+ * caller (e.g. the sidebar's project-tree exclusion predicate) that reads
+ * this instead of `$sessionDotStateById` directly stops recomputing its own
+ * expensive downstream memo chain on ticks that change no filter outcome. */
+let statusExcludedIds: ReadonlySet<string> = new Set()
+
+export const $sidebarStatusExcludedIds = computed(
+  [$sessionDotStateById, $sidebarStatusFilter, $sessions],
+  (byId, statusFilter, sessions) => {
+    if (!statusFilter.length) {
+      return (statusExcludedIds = stableSet(statusExcludedIds, new Set()))
+    }
+
+    const next = new Set<string>()
+
+    for (const session of sessions) {
+      if (!statusFilter.includes(sessionStatusBucket(byId[session.id]))) {
+        next.add(session.id)
+      }
+    }
+
+    return (statusExcludedIds = stableSet(statusExcludedIds, next))
+  }
 )

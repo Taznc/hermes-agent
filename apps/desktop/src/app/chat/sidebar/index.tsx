@@ -126,7 +126,7 @@ import {
   sessionPinId,
   setCurrentCwd
 } from '@/store/session'
-import { $sessionDotStateById, sessionStatusBucket } from '@/store/session-dot-state'
+import { $sidebarStatusExcludedIds } from '@/store/session-dot-state'
 import { $unconfirmedPinWrites } from '@/store/session-pin-sync'
 import { $focusedStoredSessionId, $workingSessionIds, type SplitDir } from '@/store/session-states'
 import { ackAllSessionsRead } from '@/store/session-unread'
@@ -366,7 +366,13 @@ export function ChatSidebar({
   const cardRows = useStore($sidebarCardRows)
   const listLimit = useStore($sidebarListLimit)
   const archivedSessions = useStore($archivedSessions)
-  const dotStates = useStore($sessionDotStateById)
+  // Which sessions the status filter (working/needs-input/etc) excludes.
+  // Backed by a store computed off dot-state that stableSet-guards its
+  // membership set, so a dot-state tick that doesn't change the filtered
+  // OUTCOME (the common case — most ticks touch a session already on
+  // whichever side of the filter it was) doesn't re-render this whole
+  // component and re-evaluate the project-tree memo chain below.
+  const statusExcludedIds = useStore($sidebarStatusExcludedIds)
   // The active sort key as an id order. The flat list applies it within its
   // dividers; groups apply it to their own lanes.
   const sortOrderIds = useStore($sidebarSessionRankIds)
@@ -509,7 +515,7 @@ export function ChatSidebar({
   // membership in the filtered set.
   const sessionMatchesFilters = useCallback(
     (session: SessionInfo) => {
-      if (statusFilter.length && !statusFilter.includes(sessionStatusBucket(dotStates[session.id]))) {
+      if (statusExcludedIds.has(session.id)) {
         return false
       }
 
@@ -531,7 +537,7 @@ export function ChatSidebar({
       // lands in the lane the user picked it from.
       return !projectFilter.length || projectFilter.includes(liveSessionProjectId(session, projects) ?? '')
     },
-    [statusFilter, projectFilter, profileFilter, showAllProfiles, prFilter, pullRequests, projects, dotStates]
+    [statusExcludedIds, projectFilter, profileFilter, showAllProfiles, prFilter, pullRequests, projects]
   )
 
   const filtersNarrow =
