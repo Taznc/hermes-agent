@@ -159,6 +159,13 @@ import {
   shouldRemoveAppBundle,
   uninstallArgsForMode
 } from './desktop-uninstall'
+import {
+  createDevBackendStaleTracker,
+  DEV_BACKEND_WATCH_DIRS,
+  isRelevantBackendPythonChange,
+  performDevBackendRestart,
+  shouldSupportDevBackendRestart
+} from './dev-backend-watch'
 import { describeDevCdpDecision, resolveDevCdpPort } from './dev-cdp'
 import { installEmbedReferer } from './embed-referer'
 import { createEventDeduper } from './event-dedupe'
@@ -10485,6 +10492,119 @@ ipcMain.handle('hermes:dev:restart', async () => {
   return { ok: true }
 })
 
+// ── Dev: backend Python source staleness (Phase 2.9) ────────────────────────
+// Sibling to the main-process bundle watcher above and to dev-electron-watch.mjs:
+// the renderer hot-reloads via Vite and Electron's main process gets the
+// "Restart to apply" affordance above, but nothing previously covered a
+// backend Python edit under a running `hermes serve` child — the process keeps
+// serving pre-edit code while both other layers look current. Reuses the exact
+// same "watch, mark stale, let the renderer offer a restart" shape rather than
+// inventing a new one. See dev-backend-watch.ts for the pure filtering/state
+// logic this wires up.
+const devBackendStaleTracker = createDevBackendStaleTracker()
+let devBackendPythonWatchers: fs.FSWatcher[] = []
+
+function broadcastDevBackendStale() {
+  const stale = devBackendStaleTracker.state()
+
+  for (const win of BrowserWindow.getAllWindows()) {
+    const { webContents } = win
+
+    if (webContents && !webContents.isDestroyed()) {
+      webContents.send('hermes:dev:backend-stale', { state: stale })
+    }
+  }
+}
+
+// Only meaningful when the desktop actually spawns the backend FROM this
+// source checkout (dev, local primary) — same precondition the main-process
+// bundle watcher and the dev-source backend resolution branch (~L4574) share.
+// A packaged build, or a desktop pointed at a remote/pool backend, has no
+// local `serve` process whose staleness this could describe.
+function watchDevBackendPython() {
+  if (IS_PACKAGED || !DEV_SERVER || !isHermesSourceRoot(SOURCE_REPO_ROOT)) {
+    return
+  }
+
+  for (const dir of DEV_BACKEND_WATCH_DIRS) {
+    const target = path.join(SOURCE_REPO_ROOT, dir)
+
+    if (!directoryExists(target)) {
+      continue
+    }
+
+    try {
+      const watcher = fs.watch(target, { recursive: true }, (_eventType, filename) => {
+        if (!isRelevantBackendPythonChange(filename ? String(filename) : null)) {
+          return
+        }
+
+        if (devBackendStaleTracker.markStale()) {
+          console.log(
+            `[hermes] backend Python source changed on disk (${dir}/${filename}) — restart backend to apply`
+          )
+          broadcastDevBackendStale()
+        }
+      })
+
+      devBackendPythonWatchers.push(watcher)
+    } catch (error) {
+      // Recursive fs.watch is unsupported on some Linux configurations
+      // (inotify-backed, no native recursive support pre-Node 22-on-Linux
+      // parity). Watching is a convenience; a platform that refuses it must
+      // not break dev — the affordance simply never lights up there.
+      console.warn(`[hermes] backend Python watch unavailable for ${dir}: ${error?.message || error}`)
+    }
+  }
+}
+
+app.on('before-quit', () => {
+  for (const watcher of devBackendPythonWatchers) {
+    try {
+      watcher.close()
+    } catch {
+      void 0
+    }
+  }
+
+  devBackendPythonWatchers = []
+})
+
+ipcMain.handle('hermes:dev:backend-stale', async () => ({
+  state: devBackendStaleTracker.state(),
+  // The renderer must never render this in a packaged build, and a remote
+  // primary backend isn't this process's to restart.
+  supported: shouldSupportDevBackendRestart({
+    isPackaged: IS_PACKAGED,
+    devServer: DEV_SERVER,
+    primaryIsRemote: primaryBackendIsRemote()
+  })
+}))
+
+ipcMain.handle('hermes:dev:backend-restart', async () => {
+  if (IS_PACKAGED) {
+    return { ok: false, reason: 'not-a-dev-build' }
+  }
+
+  // Offer, don't act: this handler only ever runs in response to the
+  // renderer's explicit IPC call, itself only reachable from the user
+  // clicking the statusbar affordance — never from the watcher above, which
+  // only marks state. Restart-in-place reuses the same soft primary teardown
+  // + "connection applied" signal connection-config/profile-switch already
+  // use (rehomePrimaryConnection / teardownPrimaryBackendAndWait +
+  // sendConnectionApplied), so the renderer's existing softSwitch() listener
+  // (desktop.onConnectionApplied) re-dials and restores connection, active
+  // profile, and session view — no bespoke re-home logic needed here.
+  return performDevBackendRestart({
+    tracker: devBackendStaleTracker,
+    teardownPrimaryBackend: async () => {
+      await teardownPrimaryBackendAndWait({ soft: true })
+      sendConnectionApplied()
+    },
+    notifyStateChanged: broadcastDevBackendStale
+  })
+})
+
 async function waitForBackendExit(child, timeoutMs = 5000) {
   if (!child || child.exitCode !== null || child.signalCode !== null) {
     return
@@ -16184,6 +16304,10 @@ app.whenReady().then(() => {
   // Dev only: notice when the main-process bundle is rebuilt underneath us so
   // the renderer can offer an explicit restart.
   watchDevMainBundle()
+  // Dev only: same courtesy for backend Python source (Phase 2.9) — the
+  // running `hermes serve` child has already imported agent/ tui_gateway/
+  // tools/ hermes_cli/, so an edit there needs the same explicit offer.
+  watchDevBackendPython()
 
   // Win/Linux cold start: the launching hermes:// URL is in our own argv.
   const _coldStartLink = _extractDeepLink(process.argv)
