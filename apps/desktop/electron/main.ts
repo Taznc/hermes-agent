@@ -76,6 +76,7 @@ import {
 } from './bootstrap-platform'
 import { decideBootstrapRepair } from './bootstrap-repair-guard'
 import { runBootstrap } from './bootstrap-runner'
+import { capMapSize, pruneExpiredEntries } from './bounded-cache'
 import {
   BROWSER_WINDOW_HEIGHT,
   BROWSER_WINDOW_MIN_HEIGHT,
@@ -6028,7 +6029,14 @@ function watchDirectory(rawDir) {
 // a password-provider gateway (which cannot satisfy the bearer/cookie checks
 // by design) from a real OAuth one. Any failure returns [] so callers keep the
 // strict guard — backends predating /api/auth/providers are unaffected.
+//
+// Keyed by baseUrl, which stays small in normal use (one entry per registered
+// connection), but nothing ever evicted it — a churned-through set of ad-hoc
+// remote URLs (temporary SSH tunnels, a base URL edited repeatedly in
+// Settings) would still accumulate for the life of the process. Cap it
+// defensively alongside the process's other never-evicted caches.
 const gatewayAuthProvidersCache = new Map<string, any[]>()
+const GATEWAY_AUTH_PROVIDERS_CACHE_LIMIT = 200
 
 async function gatewayAuthProviders(baseUrl, headers = {}) {
   const cached = gatewayAuthProvidersCache.get(baseUrl)
@@ -6053,6 +6061,7 @@ async function gatewayAuthProviders(baseUrl, headers = {}) {
     }
 
     gatewayAuthProvidersCache.set(baseUrl, providers)
+    capMapSize(gatewayAuthProvidersCache, GATEWAY_AUTH_PROVIDERS_CACHE_LIMIT)
   } catch {
     // Optional metadata — an unreadable list keeps the strict guard.
   }
@@ -6753,11 +6762,29 @@ function installZoomShortcuts(window) {
  *    renderer appends them to its already-open menu,
  *  - the gesture coordinates — kept for copyImageAt, which needs them.
  */
+// Keyed by webContents.id and never cleaned: every window that ever showed a
+// context menu stayed in this map for the life of the process, including
+// windows closed and reopened many times over a long session. Prune it the
+// same way foundInPageForwarders (below) prunes its own webContents-keyed
+// map — a one-shot 'destroyed' listener installed the first time a window is
+// seen — instead of leaving the entry to outlive its window.
 const lastContextMenuPoint = new Map<number, { x: number; y: number }>()
+const contextMenuPointCleanupInstalled = new Set<number>()
 
 function installContextMenuBridge(window: BrowserWindow) {
+  const webContentsId = window.webContents.id
+
+  if (!contextMenuPointCleanupInstalled.has(webContentsId)) {
+    contextMenuPointCleanupInstalled.add(webContentsId)
+
+    window.webContents.once('destroyed', () => {
+      lastContextMenuPoint.delete(webContentsId)
+      contextMenuPointCleanupInstalled.delete(webContentsId)
+    })
+  }
+
   window.webContents.on('context-menu', (_event, params) => {
-    lastContextMenuPoint.set(window.webContents.id, { x: params.x, y: params.y })
+    lastContextMenuPoint.set(webContentsId, { x: params.x, y: params.y })
 
     const suggestions = Array.isArray(params.dictionarySuggestions) ? params.dictionarySuggestions : []
 
@@ -13804,14 +13831,26 @@ const SSH_INVENTORY_RETRY_MS = 60_000
 // status probe is cached per connection with a TTL to avoid doubling roster
 // traffic; the Test button refreshes it eagerly. A missing id simply bypasses
 // the same-backend roster collapse — fully backward compatible.
+//
+// Bounded the same way as the other read-TTL'd caches above: connectionId
+// itself is small (one entry per registered connection, rarely more than a
+// handful), but a connection that gets removed and re-added under a new id
+// over a long-lived process — or the negative-TTL branch on repeated probe
+// failures — must not accumulate stale entries forever with nothing deleting
+// them. Prune-then-cap on every write, same pattern as titleCache.
 const connectionInstallIds = new Map<string, { id?: string; ts: number }>()
 const INSTALL_ID_TTL_MS = 5 * 60_000
 const INSTALL_ID_NEGATIVE_TTL_MS = 60_000
+const CONNECTION_INSTALL_ID_LIMIT = 500
 
 function rememberConnectionInstallId(connectionId: string, statusBody: any) {
   const raw = statusBody && typeof statusBody === 'object' ? statusBody.install_id : undefined
   const id = typeof raw === 'string' && raw.trim() ? raw.trim() : undefined
-  connectionInstallIds.set(connectionId, { id, ts: Date.now() })
+  const now = Date.now()
+
+  pruneExpiredEntries(connectionInstallIds, now, INSTALL_ID_TTL_MS, entry => entry.ts)
+  connectionInstallIds.set(connectionId, { id, ts: now })
+  capMapSize(connectionInstallIds, CONNECTION_INSTALL_ID_LIMIT)
 
   return id
 }
@@ -14554,8 +14593,16 @@ async function remoteSessionList(profile, searchParams) {
 // profile hint (pure lookup lives in profile-session-routing.ts). Results are
 // memoized briefly so a burst of hint-less reads (transcript + messages)
 // costs one sweep across the configured remotes.
+//
+// A busy multi-day session touches thousands of distinct session ids; the TTL
+// was honored on READ (an expired entry was simply refetched) but an expired
+// entry was never DELETED, so the map only ever grew for the life of the
+// process. Prune expired entries on every write and cap the survivors —
+// titleCache's treatment (main.ts, ~line 5296) — so this can't outgrow a
+// bounded footprint either.
 const remoteOwnerBySessionId = new Map<string, { at: number; profile: null | string }>()
 const REMOTE_OWNER_CACHE_TTL_MS = 30_000
+const REMOTE_OWNER_CACHE_LIMIT = 1000
 
 async function remoteOwnerProfileForSession(sessionId: string) {
   if (!sessionId) {
@@ -14578,7 +14625,11 @@ async function remoteOwnerProfileForSession(sessionId: string) {
     remoteSessionList(profile, params)
   ).catch(() => null)
 
-  remoteOwnerBySessionId.set(sessionId, { at: Date.now(), profile: owner })
+  const now = Date.now()
+
+  pruneExpiredEntries(remoteOwnerBySessionId, now, REMOTE_OWNER_CACHE_TTL_MS, entry => entry.at)
+  remoteOwnerBySessionId.set(sessionId, { at: now, profile: owner })
+  capMapSize(remoteOwnerBySessionId, REMOTE_OWNER_CACHE_LIMIT)
 
   return owner
 }
