@@ -1,14 +1,41 @@
 import { contextBridge, ipcRenderer, webFrame, webUtils } from 'electron'
 
-// Which translucency the OS can back. Asked synchronously because the renderer
-// needs it before its first paint, and answered by main because deciding it
-// needs `os.release()` — a sandboxed preload may only require electron, events,
-// timers and url, so importing node:os here throws before contextBridge runs
-// and takes the ENTIRE bridge down with it (window.hermesDesktop undefined =>
-// "Desktop IPC bridge is unavailable"). No reply means no glass, which degrades
-// to an ordinary opaque window rather than a page thinned over nothing.
-const translucencySupport = ipcRenderer.sendSync('hermes:translucency:support')
-const hudWindowing = ipcRenderer.sendSync('hermes:hud:windowing')
+// Which translucency the OS can back, and the HUD's windowing capabilities.
+// Both are process-constant (decided once from process.platform / os.release()
+// / argv, never per-window), so main computes them a single time and hands
+// them to every window as a `--hermes-window-caps=<json>` entry in
+// `webPreferences.additionalArguments` (see hermesWindowCapsArgument() in
+// main.ts). Reading them off argv here means the renderer's first paint never
+// blocks on a synchronous IPC round-trip to main — the whole reason this used
+// to be `ipcRenderer.sendSync`, which stalled every window in preload
+// whenever main was busy (cold boot, a slow backend probe, ...).
+//
+// A sandboxed preload may only require electron, events, timers and url, but
+// `process.argv` itself is part of the limited process object Electron still
+// exposes to sandboxed preload scripts, so this parse is safe without
+// importing node:os or node:process.
+function parseWindowCaps(): { glass?: boolean; translucency?: boolean; hud?: Record<string, unknown> } {
+  const prefix = '--hermes-window-caps='
+  const arg = process.argv.find(a => a.startsWith(prefix))
+
+  if (!arg) {
+    return {}
+  }
+
+  try {
+    return JSON.parse(decodeURIComponent(arg.slice(prefix.length))) || {}
+  } catch {
+    return {}
+  }
+}
+
+const windowCaps = parseWindowCaps()
+const translucencySupport = { glass: windowCaps.glass === true, translucency: windowCaps.translucency === true }
+
+const hudWindowing = windowCaps.hud as
+  | { clientPlacement?: boolean; controlDrag?: boolean; nativeDrag?: boolean; workspaceTransfer?: boolean }
+  | undefined
+
 const hudNativeDrag = hudWindowing?.nativeDrag === true
 
 contextBridge.exposeInMainWorld('hermesDesktop', {

@@ -1,4 +1,4 @@
-import { execFileSync, spawn } from 'node:child_process'
+import { execFile, execFileSync, spawn } from 'node:child_process'
 import crypto from 'node:crypto'
 import fs from 'node:fs'
 import http from 'node:http'
@@ -7,6 +7,7 @@ import os from 'node:os'
 import path from 'node:path'
 import tls from 'node:tls'
 import { pathToFileURL } from 'node:url'
+import { promisify } from 'node:util'
 
 import {
   app,
@@ -55,7 +56,7 @@ import {
 import { backendCommandMatches, createBackendOwnership, createBackendShutdownCoordinator } from './backend-ownership'
 import {
   canImportHermesCli,
-  execProbeSync,
+  execProbeAsync,
   PROBE_TIMEOUT_MS,
   shouldTrustHermesOverride,
   verifyHermesCli
@@ -218,7 +219,7 @@ import { applyHudElectronOverlay, promoteHudOverlay } from './hud-overlay'
 import { snapHudBounds } from './hud-snap'
 import { createHudSnapShortcut } from './hud-snap-shortcut'
 import { buildHudWindowUrl } from './hud-url'
-import { resolveHudWindowing } from './hud-windowing'
+import { hudWindowingView, resolveHudWindowing } from './hud-windowing'
 import { createLinkTitleWindow, guardLinkTitleSession, readLinkTitleWindowTitle } from './link-title-window'
 import { ensureMainWindow } from './main-window-lifecycle'
 import { createMediaProtocolHandler, MEDIA_PROTOCOL } from './media-protocol'
@@ -327,6 +328,7 @@ import {
   windowOpacityFor,
   windowOpacityOptions
 } from './translucency'
+import { updateChecksDisabled } from './update-checks-gate'
 import {
   compareApiUrl,
   parseCompareBehindCount,
@@ -334,7 +336,6 @@ import {
   resolveCommitLogSelection,
   shouldCountCommits
 } from './update-count'
-import { updateChecksDisabled } from './update-checks-gate'
 import { waitForUpdateClearance } from './update-gate'
 import { readLiveUpdateMarker, updateHandoffConflict, writeUpdateMarker } from './update-marker'
 import { isOfficialSshRemote, OFFICIAL_REPO_HTTPS_URL } from './update-remote'
@@ -409,6 +410,12 @@ const IS_PACKAGED = app.isPackaged || Boolean(process.env.HERMES_DESKTOP_IS_PACK
 const IS_MAC = process.platform === 'darwin'
 const IS_WINDOWS = process.platform === 'win32'
 const IS_WSL = isWslEnvironment()
+// Promisified execFile for every boot/connect-path probe converted off
+// execFileSync (Windows Python detection, the SSH config fingerprint, the
+// macOS updater helper repair). A single shared wrapper keeps the async
+// contract (timeout/windowsHide options, error shape) identical across call
+// sites instead of each one hand-rolling its own promisify.
+const execFileAsync = promisify(execFile)
 // Gate for the desktop self-update checker (git ls-remote/fetch against
 // origin, plus the GitHub compare API). Bridged from `desktop.
 // auto_update_checks_enabled` in config.yaml by the `hermes desktop`
@@ -427,6 +434,31 @@ const GLASS_SUPPORTED = glassSupportedOn(process.platform, os.release())
 // Clear rides setOpacity, a documented no-op on Linux, so neither mode works
 // there and Settings drops the row entirely.
 const TRANSLUCENCY_SUPPORTED = translucencySupportedOn(process.platform)
+// Process-constant window capabilities the renderer needs before its first
+// paint: translucency support (glass/vibrancy) and the HUD's windowing
+// profile (X11 vs Wayland vs native desktop). Both used to be answered by a
+// preload `ipcRenderer.sendSync`, which stalls the renderer's first script
+// on a round-trip into main -- coupling first paint to whatever main is busy
+// doing (a slow backend probe, boot). Neither value ever changes for the
+// life of the process, so we compute it once here and hand it to preload via
+// `webPreferences.additionalArguments` (see hermesWindowCapsArgument()):
+// zero IPC, no stall, same answer every window gets.
+const HUD_WINDOWING_VIEW = hudWindowingView(resolveHudWindowing(process.platform, process.env, process.argv))
+
+const WINDOW_CAPS_ARGUMENT = `--hermes-window-caps=${encodeURIComponent(
+  JSON.stringify({ glass: GLASS_SUPPORTED, translucency: TRANSLUCENCY_SUPPORTED, hud: HUD_WINDOWING_VIEW })
+)}`
+
+// Every BrowserWindow whose preload is PRELOAD_PATH must carry this so the
+// renderer's first script sees translucency/HUD capabilities without an IPC
+// round-trip. Centralized so a new window kind can't forget it.
+function withWindowCapsArgument(webPreferences: Record<string, unknown>): Record<string, unknown> {
+  return {
+    ...webPreferences,
+    additionalArguments: [...((webPreferences.additionalArguments as string[]) || []), WINDOW_CAPS_ARGUMENT]
+  }
+}
+
 const APP_ROOT = app.getAppPath()
 
 // Device-local preference: block F12 from opening DevTools.
@@ -2209,7 +2241,7 @@ function isCommandScript(command) {
   return IS_WINDOWS && /\.(cmd|bat)$/i.test(command || '')
 }
 
-function unwrapWindowsVenvHermesCommand(command, backendArgs) {
+async function unwrapWindowsVenvHermesCommand(command, backendArgs) {
   return resolveVenvHermesCommand(command, backendArgs, {
     isWindows: IS_WINDOWS,
     isCommandScript,
@@ -2235,22 +2267,51 @@ function unwrapWindowsVenvHermesCommand(command, backendArgs) {
 //
 // Fast path: read the runtime's own dashboard.py (instant, covers managed
 // installs, dev checkouts, and the Windows venv). Fallback: probe the CLI once
-// (covers a bare `hermes` resolved from PATH with no known source root). Result
-// is cached per resolved runtime so we probe at most once per backend.
-const _serveSupportCache = new Map()
+// (covers a bare `hermes` resolved from PATH with no known source root).
+//
+// Cache policy: a positive result (`supported: true`) or a source-verified
+// negative is a durable fact about this runtime's code and is cached for the
+// process lifetime. A probe-based negative is NOT durable by default -- a
+// transient probe failure (spawn error, timeout) used to latch `false`
+// forever, silently routing a perfectly modern runtime through the legacy
+// `dashboard` form until the app restarted. We only cache a probe negative
+// permanently when the process actually ran and rejected the subcommand
+// (a real "serve is unknown" exit code); anything that never got a verdict
+// from the runtime itself (ENOENT, timeout, EACCES, ...) expires after
+// SERVE_SUPPORT_NEGATIVE_TTL_MS so the next resolve gets a fresh chance.
+const _serveSupportCache = new Map<string, { supported: boolean; expiresAt: number }>()
+const SERVE_SUPPORT_NEGATIVE_TTL_MS = 60_000
 
-function backendSupportsServe(backend) {
+function isCacheableProbeFailure(err: unknown): boolean {
+  if (!err || typeof err !== 'object') {
+    return false
+  }
+
+  const e = err as { code?: unknown; killed?: boolean; signal?: string }
+
+  // execFile sets `code` to the child's numeric exit code on a real,
+  // completed invocation that exited non-zero -- that IS the runtime
+  // telling us `serve` is an unrecognized subcommand, so it's a durable
+  // fact we can cache forever. A string `code` (ENOENT, ETIMEDOUT, ...),
+  // `killed`, or a delivered `signal` means the process never got to
+  // answer -- transient, do not latch.
+  return typeof e.code === 'number' && !e.killed && !e.signal
+}
+
+async function backendSupportsServe(backend): Promise<boolean> {
   if (!backend || !backend.command) {
     return true
   }
 
   const key = `${backend.command}::${backend.root || ''}`
+  const cached = _serveSupportCache.get(key)
 
-  if (_serveSupportCache.has(key)) {
-    return _serveSupportCache.get(key)
+  if (cached && cached.expiresAt > Date.now()) {
+    return cached.supported
   }
 
-  let supported = null
+  let supported: boolean | null = null
+  let cacheableFailure = true
 
   if (backend.root) {
     try {
@@ -2266,31 +2327,34 @@ function backendSupportsServe(backend) {
       const prefix = backend.args && backend.args[0] === '-m' ? backend.args.slice(0, 2) : []
       // Same cold-Windows Python-startup class as the runtime probes
       // (#61764/#72632/#72707): `serve --help` imports at least as much as
-      // `hermes --version` (~10.5s measured cold), and a false negative here
-      // is cached for the process lifetime, silently routing a modern
-      // runtime through the legacy `dashboard` form. Share the probe budget
-      // and its timeout-only retry instead of a thinner local bound.
-      execProbeSync(backend.command, [...prefix, 'serve', '--help'], {
+      // `hermes --version` (~10.5s measured cold). Async so this never
+      // blocks the Electron main thread; share the probe budget and its
+      // timeout-only retry instead of a thinner local bound.
+      await execProbeAsync(backend.command, [...prefix, 'serve', '--help'], {
         cwd: backend.root || undefined,
         env: { ...process.env, HERMES_HOME, ...(backend.env || {}) },
         timeout: PROBE_TIMEOUT_MS,
-        stdio: 'ignore',
         // `.cmd`/`.bat` shim backends carry shell: true in their descriptor
-        // (see resolveHermesBackend step 4); execFileSync of a .cmd without
+        // (see resolveHermesBackend step 4); execFile of a .cmd without
         // shell throws EINVAL on modern Node, which the catch below would
-        // mis-cache as "serve unsupported" for the process lifetime.
+        // otherwise mis-cache as "serve unsupported" for the process lifetime
+        // (guarded against by isCacheableProbeFailure below).
         shell: Boolean(backend.shell),
         windowsHide: true
       })
       supported = true
-    } catch {
+    } catch (err) {
       supported = false
+      cacheableFailure = isCacheableProbeFailure(err)
     }
   }
 
-  _serveSupportCache.set(key, supported)
+  const expiresAt = supported === false && !cacheableFailure ? Date.now() + SERVE_SUPPORT_NEGATIVE_TTL_MS : Infinity
+
+  _serveSupportCache.set(key, { supported, expiresAt })
   rememberLog(
-    `[backend] \`serve\` ${supported ? 'supported' : 'unsupported → routing via legacy `dashboard`'} for ${backend.label || key}`
+    `[backend] \`serve\` ${supported ? 'supported' : 'unsupported → routing via legacy `dashboard`'} for ${backend.label || key}` +
+      (supported === false && !cacheableFailure ? ' (transient probe failure; will re-probe)' : '')
   )
 
   return supported
@@ -2299,8 +2363,8 @@ function backendSupportsServe(backend) {
 // Given a resolved backend whose args target `serve`, return the args the
 // runtime actually understands: unchanged when `serve` is supported, or
 // rewritten to `dashboard --no-open` for older runtimes.
-function getBackendArgsForRuntime(backend) {
-  return backendSupportsServe(backend) ? backend.args : dashboardFallbackArgs(backend.args)
+async function getBackendArgsForRuntime(backend) {
+  return (await backendSupportsServe(backend)) ? backend.args : dashboardFallbackArgs(backend.args)
 }
 
 function normalizeExecutablePathForCompare(commandPath) {
@@ -2350,7 +2414,7 @@ function isHermesSourceRoot(root) {
   return directoryExists(root) && fileExists(path.join(root, 'hermes_cli', 'main.py'))
 }
 
-function findPythonForRoot(root) {
+async function findPythonForRoot(root) {
   const override = process.env.HERMES_DESKTOP_PYTHON
 
   if (override && fileExists(override)) {
@@ -2372,7 +2436,7 @@ function findPythonForRoot(root) {
   return findSystemPython()
 }
 
-function findSystemPython() {
+async function findSystemPython() {
   if (!IS_WINDOWS) {
     // POSIX systems: PATH lookup is safe.
     for (const command of ['python3', 'python']) {
@@ -2430,33 +2494,51 @@ function findSystemPython() {
 
   // Pass 1: registry. Use `reg query` since main process doesn't have
   // a reliable in-process registry API across all electron versions.
+  // The (hive, version) probes are independent reads, so run them all
+  // concurrently (this used to be a fully synchronous serial loop that
+  // could block the main thread for the sum of every probe's latency);
+  // priority among the settled results is still HKLM-before-HKCU,
+  // lowest-version-first, exactly like the old loop order.
+  const registryCandidates: Array<{ hive: string; version: string }> = []
+
   for (const hive of ['HKLM', 'HKCU']) {
     for (const version of SUPPORTED_VERSIONS) {
+      registryCandidates.push({ hive, version })
+    }
+  }
+
+  const registryResults = await Promise.all(
+    registryCandidates.map(async ({ hive, version }) => {
       try {
-        const out = execFileSync(
+        const { stdout } = await execFileAsync(
           'reg',
           ['query', `${hive}\\SOFTWARE\\Python\\PythonCore\\${version}\\InstallPath`, '/ve', '/reg:64'],
           // Registry reads are near-instant; the bound only exists so a
-          // pathologically wedged reg.exe can't hang the synchronous boot
-          // resolver forever (this ran unbounded before).
-          hiddenWindowsChildOptions({ encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'], timeout: 5_000 })
+          // pathologically wedged reg.exe can't hang boot forever.
+          hiddenWindowsChildOptions({ encoding: 'utf8', timeout: 5_000 })
         )
 
         // Output format: "    (Default)    REG_SZ    C:\Path\To\Python\"
-        const match = out.match(/REG_SZ\s+(.+?)\s*$/m)
+        const match = String(stdout).match(/REG_SZ\s+(.+?)\s*$/m)
 
-        if (match) {
-          const installPath = match[1].trim()
-          const pythonExe = path.join(installPath, 'python.exe')
-
-          if (fileExists(pythonExe)) {
-            return pythonExe
-          }
+        if (!match) {
+          return null
         }
+
+        const pythonExe = path.join(match[1].trim(), 'python.exe')
+
+        return fileExists(pythonExe) ? pythonExe : null
       } catch {
         // Key not present — try next.
+        return null
       }
-    }
+    })
+  )
+
+  const registryHit = registryResults.find(Boolean)
+
+  if (registryHit) {
+    return registryHit
   }
 
   // Pass 2: filesystem probe of standard locations.
@@ -2482,35 +2564,41 @@ function findSystemPython() {
   // Pass 3: py.exe with explicit version flag. The launcher itself is
   // safe to invoke (no Store popup) and `py -3.13 -c "import sys;
   // print(sys.executable)"` resolves to the actual python.exe path of
-  // the requested version. We try in version-priority order so the
-  // first hit wins.
+  // the requested version. Probed concurrently; priority among settled
+  // results stays version-priority order (3.11 before 3.12 before 3.13),
+  // matching the old serial-loop's first-hit-wins semantics.
   const pyExe = findOnPath('py.exe')
 
   if (pyExe) {
-    for (const version of SUPPORTED_VERSIONS) {
-      try {
-        const out = execFileSync(
-          pyExe,
-          [`-${version}`, '-c', 'import sys; print(sys.executable)'],
-          hiddenWindowsChildOptions({
-            encoding: 'utf8',
-            stdio: ['ignore', 'pipe', 'ignore'],
-            // Bare interpreter startup — much lighter than the hermes-import
-            // probes, but still python.exe under cold cache / AV scan, so
-            // share the probe budget rather than running unbounded (this
-            // synchronous exec previously had no timeout at all).
-            timeout: PROBE_TIMEOUT_MS
-          })
-        )
+    const pyResults = await Promise.all(
+      SUPPORTED_VERSIONS.map(async version => {
+        try {
+          const { stdout } = await execFileAsync(
+            pyExe,
+            [`-${version}`, '-c', 'import sys; print(sys.executable)'],
+            hiddenWindowsChildOptions({
+              encoding: 'utf8',
+              // Bare interpreter startup — much lighter than the hermes-import
+              // probes, but still python.exe under cold cache / AV scan, so
+              // share the probe budget rather than running unbounded.
+              timeout: PROBE_TIMEOUT_MS
+            })
+          )
 
-        const candidate = out.trim()
+          const candidate = String(stdout).trim()
 
-        if (candidate && fileExists(candidate)) {
-          return candidate
+          return candidate && fileExists(candidate) ? candidate : null
+        } catch {
+          // py couldn't find that version — try next.
+          return null
         }
-      } catch {
-        // py couldn't find that version — try next.
-      }
+      })
+    )
+
+    const pyHit = pyResults.find(Boolean)
+
+    if (pyHit) {
+      return pyHit
     }
   }
 
@@ -3105,19 +3193,19 @@ function resolveUpdaterBinary() {
   return resolveStagedUpdaterBinary(HERMES_HOME, { fileExists, isWindows: IS_WINDOWS })
 }
 
-function repairMacUpdaterHelper(updater) {
+async function repairMacUpdaterHelper(updater) {
   if (!IS_MAC || !updater) {
     return
   }
 
   try {
-    execFileSync('/usr/bin/xattr', ['-cr', updater], { stdio: 'ignore' })
+    await execFileAsync('/usr/bin/xattr', ['-cr', updater])
   } catch (err) {
     rememberLog(`[updates] macOS updater helper quarantine repair skipped: ${err.message}`)
   }
 
   try {
-    execFileSync('/usr/bin/codesign', ['--verify', updater], { stdio: 'ignore' })
+    await execFileAsync('/usr/bin/codesign', ['--verify', updater])
 
     return
   } catch {
@@ -3126,7 +3214,7 @@ function repairMacUpdaterHelper(updater) {
   }
 
   try {
-    execFileSync('/usr/bin/codesign', ['--force', '--sign', '-', updater], { stdio: 'ignore' })
+    await execFileAsync('/usr/bin/codesign', ['--force', '--sign', '-', updater])
     rememberLog('[updates] repaired macOS updater helper signature')
   } catch (err) {
     rememberLog(`[updates] macOS updater helper signature repair skipped: ${err.message}`)
@@ -3648,7 +3736,7 @@ async function applyUpdates(opts: { stopSafeBlockers?: boolean } = {}) {
         'Updating Hermes — this window will close and the updater will open. Don’t reopen Hermes yourself; it restarts automatically when the update finishes.',
       percent: 100
     })
-    repairMacUpdaterHelper(updater)
+    await repairMacUpdaterHelper(updater)
 
     const updateRoot = resolveUpdateRoot()
     const { branch: configuredBranch } = readDesktopUpdateConfig()
@@ -4245,27 +4333,27 @@ function readBootstrapMarker() {
 // or a DMG launch over a prior CLI install satisfies this WITHOUT the desktop
 // ever having written the bootstrap marker -- so we must be able to recognise
 // "already installed" off the filesystem alone, not just the marker.
-function isActiveRuntimeUsable() {
+async function isActiveRuntimeUsable() {
   const venvPython = getVenvPython(VENV_ROOT)
 
   return (
     isHermesSourceRoot(ACTIVE_HERMES_ROOT) &&
     fileExists(venvPython) &&
-    canImportHermesCli(venvPython, {
+    (await canImportHermesCli(venvPython, {
       env: {
         PYTHONPATH: [ACTIVE_HERMES_ROOT, process.env.PYTHONPATH].filter(Boolean).join(path.delimiter)
       }
-    })
+    }))
   )
 }
 
-function activeRuntimeState() {
+async function activeRuntimeState() {
   // We DELIBERATELY do NOT verify that the checkout is currently at the
   // pinned commit -- users update via the in-app update path or `hermes
   // update`, which moves HEAD legitimately. The marker only attests "a
   // desktop-managed bootstrap ran here at least once"; runtime usability is
   // what decides whether we can actually launch.
-  return classifyActiveRuntime(readBootstrapMarker(), BOOTSTRAP_MARKER_SCHEMA_VERSION, isActiveRuntimeUsable())
+  return classifyActiveRuntime(readBootstrapMarker(), BOOTSTRAP_MARKER_SCHEMA_VERSION, await isActiveRuntimeUsable())
 }
 
 function writeBootstrapMarker(payload) {
@@ -4491,8 +4579,8 @@ function writeDefaultProjectDir(dir) {
   }
 }
 
-function createPythonBackend(root, label, backendArgs, options: any = {}) {
-  const python = findPythonForRoot(root)
+async function createPythonBackend(root, label, backendArgs, options: any = {}) {
+  const python = await findPythonForRoot(root)
 
   if (!python) {
     return null
@@ -4527,9 +4615,9 @@ function createPythonBackend(root, label, backendArgs, options: any = {}) {
 // canonical install location shared with the CLI installer. The venv at
 // VENV_ROOT may not exist yet on first run; bootstrap=true tells
 // ensureRuntime() to create / refresh it before launch.
-function createActiveBackend(backendArgs) {
+async function createActiveBackend(backendArgs) {
   const venvPython = getVenvPython(VENV_ROOT)
-  const command = fileExists(venvPython) ? venvPython : findSystemPython()
+  const command = fileExists(venvPython) ? venvPython : await findSystemPython()
 
   return {
     kind: 'python',
@@ -4547,13 +4635,13 @@ function createActiveBackend(backendArgs) {
   }
 }
 
-function resolveHermesBackend(backendArgs) {
+async function resolveHermesBackend(backendArgs) {
   // 1. Explicit override -- HERMES_DESKTOP_HERMES_ROOT points at a developer
   //    checkout. Honour it as-is (no bootstrap; the user is driving).
   const overrideRoot = process.env.HERMES_DESKTOP_HERMES_ROOT && path.resolve(process.env.HERMES_DESKTOP_HERMES_ROOT)
 
   if (overrideRoot && isHermesSourceRoot(overrideRoot)) {
-    const backend = createPythonBackend(overrideRoot, `Hermes source at ${overrideRoot}`, backendArgs)
+    const backend = await createPythonBackend(overrideRoot, `Hermes source at ${overrideRoot}`, backendArgs)
 
     if (backend) {
       return backend
@@ -4565,7 +4653,7 @@ function resolveHermesBackend(backendArgs) {
   //    installed `hermes` on PATH so local Python edits are actually exercised.
   //    (In dev with no checkout, SOURCE_REPO_ROOT won't pass isHermesSourceRoot.)
   if (!IS_PACKAGED && isHermesSourceRoot(SOURCE_REPO_ROOT)) {
-    const backend = createPythonBackend(SOURCE_REPO_ROOT, `Hermes source at ${SOURCE_REPO_ROOT}`, backendArgs)
+    const backend = await createPythonBackend(SOURCE_REPO_ROOT, `Hermes source at ${SOURCE_REPO_ROOT}`, backendArgs)
 
     if (backend) {
       return backend
@@ -4580,7 +4668,7 @@ function resolveHermesBackend(backendArgs) {
   //    builds could leave a healthy install behind without the marker. If the
   //    active runtime is usable, launch it directly; only fall through to
   //    bootstrap when the runtime itself is unusable.
-  const activeRuntime = activeRuntimeState()
+  const activeRuntime = await activeRuntimeState()
 
   if (activeRuntime.shouldUseActiveRuntime && !bootstrapRepairRequested) {
     if (!activeRuntime.hasValidMarker) {
@@ -4627,7 +4715,7 @@ function resolveHermesBackend(backendArgs) {
     }
 
     if (hermesCommand) {
-      const unwrapped = unwrapWindowsVenvHermesCommand(hermesCommand, backendArgs)
+      const unwrapped = await unwrapWindowsVenvHermesCommand(hermesCommand, backendArgs)
 
       if (unwrapped) {
         return unwrapped
@@ -4646,7 +4734,10 @@ function resolveHermesBackend(backendArgs) {
       // the Nix wrapper), not a discovered PATH candidate. It must not fall
       // through to the install-script bootstrap if the optional probe times
       // out under load; the pinned backend is the only valid runtime there.
-      if (shouldTrustHermesOverride(hermesOverride) || verifyHermesCli(hermesCommand, { shell: shellForProbe })) {
+      if (
+        shouldTrustHermesOverride(hermesOverride) ||
+        (await verifyHermesCli(hermesCommand, { shell: shellForProbe }))
+      ) {
         // `unwrapped` above already answered "is this a Windows venv shim?" —
         // it was null (not a shim, or its import probe failed). Do NOT re-run
         // unwrapWindowsVenvHermesCommand here: the second call repeats the
@@ -4672,7 +4763,7 @@ function resolveHermesBackend(backendArgs) {
   // 5. Last-ditch: pip-installed hermes_cli module via system Python.
   //    Same rationale as #4 -- the user installed this; we use it but don't
   //    take ownership.
-  const python = findSystemPython()
+  const python = await findSystemPython()
 
   if (python) {
     // Same smoke-test rationale as step 4: a system Python in the
@@ -4683,7 +4774,7 @@ function resolveHermesBackend(backendArgs) {
     // Verify the import works before trusting the candidate; on
     // failure, fall through to step 6 so the bootstrap runner pulls
     // a uv-managed 3.11 into %LOCALAPPDATA%\hermes\hermes-agent\venv.
-    if (canImportHermesCli(python)) {
+    if (await canImportHermesCli(python)) {
       return {
         kind: 'python',
         label: `installed hermes_cli module via ${python}`,
@@ -4834,7 +4925,7 @@ async function ensureRuntime(backend) {
 
     // Re-resolve now that the install exists. The new resolution lands in
     // step 3 (bootstrap-complete marker) and we recurse to wire venvPython.
-    return ensureRuntime(resolveHermesBackend(backend.args))
+    return ensureRuntime(await resolveHermesBackend(backend.args))
   }
 
   // bootstrap=true with a real backend (createActiveBackend path) means we
@@ -9705,7 +9796,7 @@ async function reachablePreviewUrl(rawUrl: string): Promise<string> {
   }
 }
 
-function effectiveSshConfigFingerprint(sshConfig) {
+async function effectiveSshConfigFingerprint(sshConfig) {
   const ssh =
     process.platform === 'win32'
       ? path.join(process.env.SystemRoot || 'C:\\Windows', 'System32', 'OpenSSH', 'ssh.exe')
@@ -9722,14 +9813,14 @@ function effectiveSshConfigFingerprint(sshConfig) {
   }
 
   args.push('--', sshConfig.user ? `${sshConfig.user}@${sshConfig.host}` : sshConfig.host)
-  const output = execFileSync(ssh, args, { encoding: 'utf8', timeout: 10_000, windowsHide: true })
+  const { stdout } = await execFileAsync(ssh, args, { encoding: 'utf8', timeout: 10_000, windowsHide: true })
 
-  return crypto.createHash('sha256').update(output).digest('hex')
+  return crypto.createHash('sha256').update(stdout).digest('hex')
 }
 
 async function bootstrapSshConnection(profile, sshConfig, reuseToken, source) {
   const scope = sshScopeKey(profile)
-  const effectiveConfigFingerprint = effectiveSshConfigFingerprint(sshConfig)
+  const effectiveConfigFingerprint = await effectiveSshConfigFingerprint(sshConfig)
   const resolvedConfig = { ...sshConfig, effectiveConfigFingerprint }
   const fingerprint = sshConfigFingerprint(scope, resolvedConfig)
 
@@ -10992,9 +11083,9 @@ async function spawnPoolBackend(profile, entry, opts: { forceLocal?: boolean; po
   // step 3 in hermes_cli/main.py), so the child re-homes to this profile.
   // --port 0: the OS assigns an ephemeral port; the child announces it on stdout.
   const backendArgs = ['--profile', profile, 'serve', '--host', '127.0.0.1', '--port', '0']
-  const backend = await ensureRuntime(resolveHermesBackend(backendArgs))
+  const backend = await ensureRuntime(await resolveHermesBackend(backendArgs))
   // Route old runtimes (no `serve`) through the legacy `dashboard --no-open`.
-  backend.args = getBackendArgsForRuntime(backend)
+  backend.args = await getBackendArgsForRuntime(backend)
   const hermesCwd = resolveHermesCwd()
   const webDist = resolveWebDist()
   const readyFile = backend.readyFile ? makeDashboardReadyFile() : null
@@ -11385,7 +11476,7 @@ async function startHermes() {
 
     const backend = setup.backend
     // Route old runtimes (no `serve`) through the legacy `dashboard --no-open`.
-    backend.args = getBackendArgsForRuntime(backend)
+    backend.args = await getBackendArgsForRuntime(backend)
     const hermesCwd = resolveHermesCwd()
     const webDist = resolveWebDist()
     const readyFile = backend.readyFile ? makeDashboardReadyFile() : null
@@ -11877,7 +11968,7 @@ function spawnBrowserWindow(tabId) {
     ...chatWindowSurfaceOptions(),
     icon,
     show: false,
-    webPreferences: chatWindowWebPreferences(PRELOAD_PATH)
+    webPreferences: withWindowCapsArgument(chatWindowWebPreferences(PRELOAD_PATH))
   })
 
   translucencyBackedWindows.add(win)
@@ -11969,7 +12060,7 @@ function createInstanceWindow() {
     ...chatWindowSurfaceOptions(),
     icon,
     show: false,
-    webPreferences: chatWindowWebPreferences(PRELOAD_PATH)
+    webPreferences: withWindowCapsArgument(chatWindowWebPreferences(PRELOAD_PATH))
   })
 
   instanceWindows.add(win)
@@ -12033,7 +12124,8 @@ const wakeIndicatorController = createWakeIndicatorWindowController({
   log: rememberLog,
   preloadPath: PRELOAD_PATH,
   rendererIndex: resolveRendererIndex,
-  wireWindow: window => wireCommonWindowHandlers(window, zoomWiringForWindowKind('wakeIndicator'))
+  wireWindow: window => wireCommonWindowHandlers(window, zoomWiringForWindowKind('wakeIndicator')),
+  additionalArguments: [WINDOW_CAPS_ARGUMENT]
 })
 
 // The pet overlay: a single transparent, frameless, always-on-top window that
@@ -12087,7 +12179,7 @@ function spawnPetOverlayWindow(bounds) {
     show: false,
     // Fully transparent — the renderer paints only the sprite + bubble.
     backgroundColor: '#00000000',
-    webPreferences: {
+    webPreferences: withWindowCapsArgument({
       preload: PRELOAD_PATH,
       contextIsolation: true,
       sandbox: true,
@@ -12096,7 +12188,7 @@ function spawnPetOverlayWindow(bounds) {
       // Keep the sprite animating + bubble updating while the main window is
       // minimized/blurred — the whole point of the overlay.
       backgroundThrottling: false
-    }
+    })
   })
 
   // Float above other apps and follow the user across desktops so the pet is
@@ -12538,7 +12630,7 @@ function spawnHudWindow(sessionId, profile) {
     // The full chat webPreferences — this window streams a real transcript, so
     // it needs everything a chat window needs (preload bridge, autoplay for
     // voice, the shared throttling contract).
-    webPreferences: chatWindowWebPreferences(PRELOAD_PATH)
+    webPreferences: withWindowCapsArgument(chatWindowWebPreferences(PRELOAD_PATH))
   })
 
   applyHudElectronOverlay(win, process.platform)
@@ -12756,13 +12848,13 @@ function spawnQuickEntryWindow() {
     hiddenInMissionControl: IS_MAC,
     show: false,
     backgroundColor: '#00000000',
-    webPreferences: {
+    webPreferences: withWindowCapsArgument({
       preload: PRELOAD_PATH,
       contextIsolation: true,
       sandbox: true,
       nodeIntegration: false,
       devTools: true
-    }
+    })
   })
 
   win.setAlwaysOnTop(true, IS_MAC ? 'floating' : 'screen-saver')
@@ -12928,7 +13020,7 @@ function createWindow() {
     // live answer keeps painting while the window is blurred or minimized,
     // without pinning visibilityState to 'visible' at idle. See
     // session-windows.ts and stream-throttle.ts.
-    webPreferences: chatWindowWebPreferences(PRELOAD_PATH)
+    webPreferences: withWindowCapsArgument(chatWindowWebPreferences(PRELOAD_PATH))
   })
 
   const createdMainWindow = mainWindow
@@ -13236,7 +13328,7 @@ ipcMain.handle('hermes:window:openInTerminal', async (_event, sessionId, opts) =
 
   try {
     const profile = typeof opts?.profile === 'string' ? opts.profile.trim() : ''
-    const backend = resolveHermesBackend(tuiResumeArgs(sessionId.trim(), profile || undefined))
+    const backend = await resolveHermesBackend(tuiResumeArgs(sessionId.trim(), profile || undefined))
 
     if (!backend.command) {
       return { ok: false, error: 'Hermes is not installed yet' }
@@ -14703,6 +14795,7 @@ async function handleHermesApiRequest(request) {
       requestConnectionId && !tornDownProfile
         ? await ensureRegistryBackend(requestConnectionId, routeProfile)
         : await ensureBackend(routeProfile)
+
     const timeoutMs = resolveTimeoutMs(request?.timeoutMs, DEFAULT_FETCH_TIMEOUT_MS)
 
     const url = `${connection.baseUrl}${apiRoute.requestPath}`
@@ -14769,6 +14862,7 @@ async function handleHermesApiRequest(request) {
     const routeLabel = requestConnectionId
       ? `conn=${requestConnectionId}${routeProfile ? ` profile=${routeProfile}` : ''}`
       : `pool profile=${routeProfile || 'primary'}`
+
     const status = error?.statusCode ?? error?.status
 
     console.warn(
@@ -15290,13 +15384,6 @@ app.on('before-quit', () => {
 // hold the event loop open or leak FDs past app teardown.
 app.on('will-quit', () => {
   destroyKeepaliveAgents()
-})
-
-// Answered synchronously so preload can publish the verdict before the
-// renderer's first script — see the note there on why it cannot decide this
-// itself. Registered at module scope, which runs long before any window.
-ipcMain.on('hermes:translucency:support', event => {
-  event.returnValue = { glass: GLASS_SUPPORTED, translucency: TRANSLUCENCY_SUPPORTED }
 })
 
 ipcMain.on('hermes:translucency', (_event, payload) => {
@@ -15859,7 +15946,7 @@ async function runDesktopUninstall(mode) {
   let pythonPath = null
 
   if (modeRemovesAgent(mode)) {
-    const sysPy = findSystemPython()
+    const sysPy = await findSystemPython()
 
     if (sysPy) {
       py = sysPy
@@ -16114,32 +16201,6 @@ app.whenReady().then(() => {
   // before the backend start path awaits the same single-flight promise.
   void ensureLoginShellPath()
 
-  const systemCa = installWindowsSystemCaTrust(tls)
-
-  if (systemCa.applied) {
-    rememberLog(
-      `[tls] trusting ${systemCa.systemCertificateCount} Windows system CA certificate(s) for backend connections`
-    )
-  } else if (systemCa.error) {
-    rememberLog(`[tls] could not load Windows system CA certificates: ${systemCa.error}`)
-  }
-
-  // Keyring-less Linux `--password-store=basic` support. This must run before
-  // createWindow() and anything that could touch safeStorage; the narrow
-  // platform/switch/guard semantics live in the extracted helper.
-  enableBasicPasswordStoreEncryption({
-    platform: process.platform,
-    passwordStoreSwitch: app.commandLine.getSwitchValue('password-store'),
-    safeStorageApi: safeStorage
-  })
-
-  // Keychain encryption is opt-in (default OFF). One-shot: rewrite any
-  // legacy safeStorage-encrypted secrets as plain so no later launch ever
-  // touches the OS keychain unless the user turns encryption on in
-  // Settings → Gateway. Must run before createWindow() and the first
-  // connection resolution.
-  migrateLegacyEncryptedSecretsOnce()
-
   if (IS_MAC) {
     Menu.setApplicationMenu(buildApplicationMenu())
   } else {
@@ -16153,7 +16214,6 @@ app.whenReady().then(() => {
   installRemoteHeaderRules()
   registerDeepLinkProtocol()
 
-  ensureWslWindowsFonts()
   configureSpellChecker()
   registerPowerResumeListeners()
   keepAwake.set(readPersistedKeepAwake())
@@ -16179,7 +16239,54 @@ app.whenReady().then(() => {
     screen.on('display-removed', reposition)
   }
 
+  // Construct the (hidden, show:false) BrowserWindow BEFORE the remaining
+  // synchronous boot-time probes below. `new BrowserWindow()` hands
+  // Chromium's window/renderer/GPU spin-up to OTHER OS processes -- work
+  // that used to be serialized entirely behind the sync CA-trust cert-store
+  // enumeration, the safeStorage secret-migration decrypts, and the WSL font
+  // filesystem probe. Those three are still synchronous (they gate
+  // createActiveBackend/connection resolution below, which must not race
+  // ahead of them), but now they overlap Chromium's out-of-process init
+  // instead of preceding it, so first paint lands sooner. This whenReady
+  // callback is NOT async and none of the statements between here and the
+  // end of this function await anything, so ordinary run-to-completion
+  // semantics guarantee every one of them finishes -- and so does the
+  // secret/CA setup below -- before the startHermes() promise this call
+  // kicks off gets its first microtask turn. "Before createWindow()" in the
+  // comments below now means "before the connection can use it", which this
+  // still satisfies exactly.
   createWindow()
+
+  const systemCa = installWindowsSystemCaTrust(tls)
+
+  if (systemCa.applied) {
+    rememberLog(
+      `[tls] trusting ${systemCa.systemCertificateCount} Windows system CA certificate(s) for backend connections`
+    )
+  } else if (systemCa.error) {
+    rememberLog(`[tls] could not load Windows system CA certificates: ${systemCa.error}`)
+  }
+
+  // Keyring-less Linux `--password-store=basic` support. Must run before
+  // anything that could touch safeStorage; the narrow platform/switch/guard
+  // semantics live in the extracted helper. The `password-store` command-line
+  // switch itself was already applied at module load (before `ready`), so
+  // running this after createWindow() does not reorder it relative to that.
+  enableBasicPasswordStoreEncryption({
+    platform: process.platform,
+    passwordStoreSwitch: app.commandLine.getSwitchValue('password-store'),
+    safeStorageApi: safeStorage
+  })
+
+  // Keychain encryption is opt-in (default OFF). One-shot: rewrite any
+  // legacy safeStorage-encrypted secrets as plain so no later launch ever
+  // touches the OS keychain unless the user turns encryption on in
+  // Settings → Gateway. Must run before the first connection resolution
+  // (startHermes(), kicked off inside createWindow() above, has not yielded
+  // to the event loop yet -- see the run-to-completion note above).
+  migrateLegacyEncryptedSecretsOnce()
+
+  ensureWslWindowsFonts()
 
   // Dev only: notice when the main-process bundle is rebuilt underneath us so
   // the renderer can offer an explicit restart.

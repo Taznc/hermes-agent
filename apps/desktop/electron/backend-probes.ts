@@ -33,7 +33,10 @@
  * as bootstrap-platform.ts and hardening.ts).
  */
 
-import { execFileSync } from 'node:child_process'
+import { execFile } from 'node:child_process'
+import { promisify } from 'node:util'
+
+const execFileAsync = promisify(execFile)
 
 /** Default probe budget. 5s false-negativeed healthy Windows cold starts (#61764). */
 const DEFAULT_PROBE_TIMEOUT_MS = 15_000
@@ -85,30 +88,33 @@ function isTimeoutError(err: unknown): boolean {
 }
 
 /**
- * Run execFileSync; on timeout only, retry once before failing.
+ * Run execFileAsync; on timeout only, retry once before failing. Async so a
+ * cold-cache / AV-scanned probe (measured up to ~10.5s on Windows) never
+ * blocks the Electron main-process event loop -- a synchronous probe here
+ * froze the whole app (window resize, other IPC, the renderer itself) for
+ * the full probe duration, on cold boot and on every profile spawn.
  * Non-timeout failures (ENOENT, non-zero exit) fail immediately.
  */
-function execProbeSync(
+async function execProbeAsync(
   command: string,
   args: string[],
   options: {
     cwd?: string
     env?: NodeJS.ProcessEnv
-    stdio: 'ignore'
     timeout: number
     shell?: boolean
     windowsHide?: boolean
   }
-): void {
+): Promise<void> {
   try {
-    execFileSync(command, args, options)
+    await execFileAsync(command, args, options)
   } catch (err) {
     if (!isTimeoutError(err)) {
       throw err
     }
 
     // One cold-cache / AV miss should not force hermes-setup --update (#61764).
-    execFileSync(command, args, options)
+    await execFileAsync(command, args, options)
   }
 }
 
@@ -137,27 +143,45 @@ function hermesRuntimeImportProbe() {
  * package: a broken/empty Windows launcher venv can still see the source tree
  * through PYTHONPATH but lack PyYAML, then die on the first real CLI import.
  *
+ * Async: the probe is a real subprocess spawn+cold-import that can take up
+ * to ~10s on a loaded Windows box, and running it synchronously on the
+ * Electron main thread froze the whole app (window resize, IPC, renderer)
+ * for the duration. In-flight calls for the SAME (pythonPath, env) pair are
+ * single-flighted -- the resolver's ladder can probe the same candidate from
+ * more than one caller in close succession (e.g. a profile spawn racing the
+ * primary boot), and de-duping the promise means only one subprocess runs.
+ *
  * @param {string} pythonPath - Absolute path to a python.exe / python.
  * @param {object} [opts.env] - Additional environment for the probe.
- * @returns {boolean}
+ * @returns {Promise<boolean>}
  */
-function canImportHermesCli(pythonPath: string, opts: { env?: Record<string, string> } = {}) {
+const _importProbeCache = new Map<string, Promise<boolean>>()
+
+async function canImportHermesCli(pythonPath: string, opts: { env?: Record<string, string> } = {}): Promise<boolean> {
   if (!pythonPath) {
     return false
   }
 
-  try {
-    execProbeSync(pythonPath, ['-c', hermesRuntimeImportProbe()], {
-      env: { ...process.env, ...(opts.env || {}) },
-      stdio: 'ignore',
-      timeout: PROBE_TIMEOUT_MS,
-      windowsHide: true
-    })
+  const envKey = opts.env ? JSON.stringify(Object.entries(opts.env).sort()) : ''
+  const key = `${pythonPath}::${envKey}`
+  const cached = _importProbeCache.get(key)
 
-    return true
-  } catch {
-    return false
+  if (cached) {
+    return cached
   }
+
+  const probe = execProbeAsync(pythonPath, ['-c', hermesRuntimeImportProbe()], {
+    env: { ...process.env, ...(opts.env || {}) },
+    timeout: PROBE_TIMEOUT_MS,
+    windowsHide: true
+  }).then(
+    () => true,
+    () => false
+  )
+
+  _importProbeCache.set(key, probe)
+
+  return probe
 }
 
 /**
@@ -172,13 +196,16 @@ function canImportHermesCli(pythonPath: string, opts: { env?: Record<string, str
  * here -- `--version` is the cheapest "is this binary alive" smoke
  * test that every hermes_cli entry-point has supported since 0.1.
  *
+ * Async for the same reason as canImportHermesCli (blocking main-thread
+ * exec froze the whole app); single-flighted per (command, shell) pair.
+ *
  * @param {string} hermesCommand - Resolved absolute path to a hermes
  *   executable (or an interpreter+script wrapper).
  * @param {boolean} [opts.shell] - Whether to run through a shell. For
- *   .cmd/.bat shims on Windows execFileSync needs shell:true to find
+ *   .cmd/.bat shims on Windows execFile needs shell:true to find
  *   the cmd interpreter; mirrors the same flag isCommandScript() drives
  *   in resolveHermesBackend.
- * @returns {boolean}
+ * @returns {Promise<boolean>}
  */
 /**
  * An explicit desktop backend command is a deployment contract, not a PATH
@@ -190,29 +217,38 @@ function shouldTrustHermesOverride(hermesOverride?: string) {
   return typeof hermesOverride === 'string' && hermesOverride.trim().length > 0
 }
 
-function verifyHermesCli(hermesCommand: string, opts?: { shell?: boolean }) {
+const _versionProbeCache = new Map<string, Promise<boolean>>()
+
+async function verifyHermesCli(hermesCommand: string, opts?: { shell?: boolean }): Promise<boolean> {
   if (!hermesCommand) {
     return false
   }
 
-  try {
-    execProbeSync(hermesCommand, ['--version'], {
-      stdio: 'ignore',
-      timeout: PROBE_TIMEOUT_MS,
-      shell: Boolean(opts?.shell),
-      windowsHide: true
-    })
+  const key = `${hermesCommand}::${Boolean(opts?.shell)}`
+  const cached = _versionProbeCache.get(key)
 
-    return true
-  } catch {
-    return false
+  if (cached) {
+    return cached
   }
+
+  const probe = execProbeAsync(hermesCommand, ['--version'], {
+    timeout: PROBE_TIMEOUT_MS,
+    shell: Boolean(opts?.shell),
+    windowsHide: true
+  }).then(
+    () => true,
+    () => false
+  )
+
+  _versionProbeCache.set(key, probe)
+
+  return probe
 }
 
 export {
   canImportHermesCli,
   DEFAULT_PROBE_TIMEOUT_MS,
-  execProbeSync,
+  execProbeAsync,
   hermesRuntimeImportProbe,
   PROBE_TIMEOUT_MS,
   resolveProbeTimeoutMs,

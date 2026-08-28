@@ -20,6 +20,10 @@ interface WakeIndicatorWindowOptions {
   preloadPath: string
   rendererIndex: () => string
   wireWindow: (window: BrowserWindow) => void
+  /** Extra additionalArguments entries every preloaded window must carry
+   * (currently just the window-caps JSON — see hermesWindowCapsArgument()
+   * in main.ts). Optional so this module stays testable without main.ts. */
+  additionalArguments?: string[]
 }
 
 export function createWakeIndicatorWindowController({
@@ -29,7 +33,8 @@ export function createWakeIndicatorWindowController({
   log,
   preloadPath,
   rendererIndex,
-  wireWindow
+  wireWindow,
+  additionalArguments
 }: WakeIndicatorWindowOptions) {
   let hideTimer: NodeJS.Timeout | null = null
   let state: WakeIndicatorState = 'hidden'
@@ -85,7 +90,8 @@ export function createWakeIndicatorWindowController({
         devTools: true,
         nodeIntegration: false,
         preload: preloadPath,
-        sandbox: true
+        sandbox: true,
+        ...(additionalArguments?.length ? { additionalArguments } : {})
       }
     })
 
