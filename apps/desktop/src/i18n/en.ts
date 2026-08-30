@@ -3338,6 +3338,17 @@ export const en: Translations = {
       statusRecovered: 'Recovered',
       statusDone: 'Done',
       memoryWriteNoted: 'Memory write noted',
+      memoryActions: {
+        add: { done: 'Saved a note', pending: 'Saving a note' },
+        search: { done: 'Searched memory', pending: 'Searching memory' },
+        probe: { done: 'Recalled memory', pending: 'Recalling memory' },
+        related: { done: 'Found related memory', pending: 'Finding related memory' },
+        reason: { done: 'Reasoned across memory', pending: 'Reasoning across memory' },
+        contradict: { done: 'Checked memory for conflicts', pending: 'Checking memory for conflicts' },
+        update: { done: 'Updated memory', pending: 'Updating memory' },
+        remove: { done: 'Removed from memory', pending: 'Removing from memory' },
+        list: { done: 'Listed memory', pending: 'Listing memory' }
+      },
       actions: {
         read: 'Read',
         reading: 'Reading',

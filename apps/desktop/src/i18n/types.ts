@@ -2912,6 +2912,14 @@ export interface Translations {
       statusDone: string
       /** Over-budget / rejected memory write title — not "Saved to memory". */
       memoryWriteNoted: string
+      /** Per-action memory titles, keyed by the tool's `action` argument — a
+       *  search reads as "Searching memory", a write as "Saving a note", so
+       *  the wait names what is actually happening instead of a fixed
+       *  "Saving to memory" regardless of what the call does. */
+      memoryActions: Record<
+        'add' | 'search' | 'probe' | 'related' | 'reason' | 'contradict' | 'update' | 'remove' | 'list',
+        { done: string; pending: string }
+      >
       actions: {
         read: string
         reading: string
