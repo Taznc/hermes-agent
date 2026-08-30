@@ -253,6 +253,20 @@ def list_triage_ids(*, tenant: Optional[str] = None) -> list[str]:
     """Return task ids currently in the triage column.
 
     ``tenant`` narrows the sweep; ``None`` returns every triage task.
+
+    Tasks parked in triage by the unblock-loop breaker are EXCLUDED. When a
+    task re-blocks for the same cause ``BLOCK_RECURRENCE_LIMIT`` times,
+    ``block_task`` routes it to ``triage`` so a human can decide what to do
+    with it. Triage is also this sweep's input queue, so re-specifying such a
+    task promotes it straight back to ``ready``, where it is claimed, blocks
+    on the same unsatisfiable cause, and lands in triage again — a
+    ``block_loop_detected -> specified -> promoted -> claimed -> blocked``
+    cycle that repeats every dispatcher tick and never terminates. Observed in
+    the wild at ``recurrences: 18`` against a limit of 2.
+
+    The loop breaker's whole purpose is to stop automated retries, so the
+    automation must not re-arm it. These tasks stay in triage, visible, until
+    a human resolves them.
     """
     with kb.connect_closing() as conn:
         tasks = kb.list_tasks(
@@ -261,4 +275,7 @@ def list_triage_ids(*, tenant: Optional[str] = None) -> list[str]:
             tenant=tenant,
             include_archived=False,
         )
-    return [t.id for t in tasks]
+    return [
+        t.id for t in tasks
+        if (t.block_recurrences or 0) < kb.BLOCK_RECURRENCE_LIMIT
+    ]
