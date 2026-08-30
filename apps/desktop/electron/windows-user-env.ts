@@ -12,7 +12,22 @@
 
 import { execFileSync } from 'node:child_process'
 
-type ExecFn = typeof execFileSync | ((file?: string, args?: any, options?: any) => string)
+// The exact option bag every registry read is issued with. Naming it — and
+// keeping `encoding` a string literal rather than widening to `string` — is
+// what lets an async caller write `execFileAsync(file, args, options)` and
+// land on child_process's string-returning overload. Typing options as `any`
+// (as this used to) sends overload resolution to the Buffer overload instead,
+// so the promisified result's `stdout` is a NonSharedBuffer and the call site
+// is forced into a cast that TS 5.9+ rejects outright.
+type RegQueryExecOptions = {
+  encoding: 'utf8'
+  windowsHide: boolean
+  timeout: number
+}
+
+type RegQueryExec<T> = (file: string, args: string[], options: RegQueryExecOptions) => T
+
+type ExecFn = typeof execFileSync | RegQueryExec<string>
 
 // Shared registry-read building block. `reg.exe` writes its output in the
 // CONSOLE OUTPUT CODEPAGE, not UTF-8 — for a US/Western-locale codepage this
@@ -31,9 +46,9 @@ type ExecFn = typeof execFileSync | ((file?: string, args?: any, options?: any) 
 function runRegQuery<T = string>(
   args: string[],
   {
-    exec = execFileSync as unknown as (file?: string, args?: any, options?: any) => T,
+    exec = execFileSync as unknown as RegQueryExec<T>,
     timeout = 5000
-  }: { exec?: (file?: string, args?: any, options?: any) => T; timeout?: number } = {}
+  }: { exec?: RegQueryExec<T>; timeout?: number } = {}
 ): T {
   const quoted = args.map(arg => `'${String(arg).replace(/'/g, "''")}'`).join(' ')
   const script = `[Console]::OutputEncoding = [System.Text.Encoding]::UTF8; reg ${quoted}; exit $LASTEXITCODE`
@@ -109,7 +124,7 @@ function readWindowsUserEnvVar(
 
   try {
     stdout = runRegQuery<string>(['query', 'HKCU\\Environment', '/v', name], {
-      exec: exec as (file?: string, args?: any, options?: any) => string,
+      exec: exec as RegQueryExec<string>,
       timeout: 5000
     })
   } catch {
