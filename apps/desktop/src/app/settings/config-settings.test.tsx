@@ -1,5 +1,6 @@
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
 import { cleanup, render, screen } from '@testing-library/react'
+import { StrictMode } from 'react'
 import { MemoryRouter } from 'react-router'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
@@ -82,19 +83,21 @@ vi.mock('@/store/projects', () => ({
   scanAndRecordRepos: vi.fn(async () => undefined)
 }))
 
-function renderConfigSettings(activeSectionId = 'workspace') {
+function renderConfigSettings(activeSectionId = 'workspace', wrapper: 'plain' | 'strict' = 'plain') {
   const client = new QueryClient({ defaultOptions: { queries: { retry: false } } })
   const importInputRef = { current: null }
 
-  return import('./config-settings').then(({ ConfigSettings }) =>
-    render(
+  return import('./config-settings').then(({ ConfigSettings }) => {
+    const tree = (
       <MemoryRouter>
         <QueryClientProvider client={client}>
           <ConfigSettings activeSectionId={activeSectionId} importInputRef={importInputRef} />
         </QueryClientProvider>
       </MemoryRouter>
     )
-  )
+
+    return render(wrapper === 'strict' ? <StrictMode>{tree}</StrictMode> : tree)
+  })
 }
 
 beforeEach(() => {
@@ -151,5 +154,28 @@ describe('ConfigSettings — schema fetch stalls or times out', () => {
 
     // Retry-capable error clears once the schema fetch actually succeeds.
     await vi.waitFor(() => expect(screen.queryByText('Settings failed to load')).toBeNull())
+  })
+})
+
+// Regression coverage for the shared useOnProfileSwitch fix (upstream
+// #74824): the panel must not depend on onSwitch firing exactly once at
+// mount-time for its draft to seed — Strict Mode's mandatory mount → cleanup
+// → re-mount effect replay must never be mistaken for a real profile switch
+// and must never leave the draft stuck unseeded.
+describe('ConfigSettings — Strict Mode mount replay', () => {
+  it('seeds and keeps the draft under StrictMode double-invoke, without a permanent skeleton', async () => {
+    getHermesConfigRecord.mockResolvedValue({ terminal: { cwd: '.' } })
+    getHermesConfigSchema.mockResolvedValue({
+      fields: { 'terminal.cwd': { type: 'string', description: 'Default project folder.' } },
+      category_order: []
+    })
+
+    await renderConfigSettings('workspace', 'strict')
+
+    // The field renders (draft seeded) and stays rendered — Strict Mode's
+    // second effect pass must not wipe it back to an unseeded/skeleton state.
+    expect(await screen.findByText('Working Directory')).toBeTruthy()
+    expect(document.querySelector('[data-slot="skeleton"]')).toBeNull()
+    expect(screen.queryByText('Settings failed to load')).toBeNull()
   })
 })

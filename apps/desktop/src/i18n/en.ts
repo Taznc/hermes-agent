@@ -1071,6 +1071,7 @@ export const en: Translations = {
     },
     model: {
       loading: 'Loading model configuration...',
+      loadFailed: 'Failed to load model settings',
       appliesDesc: 'Applies to new sessions. Use the model picker in the composer to hot-swap the active chat.',
       provider: 'Provider',
       model: 'Model',

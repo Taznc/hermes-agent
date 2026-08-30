@@ -411,6 +411,89 @@ describe('ModelSettings', () => {
   })
 })
 
+// Regression coverage for the ModelSettings recovery gaps (upstream #57262,
+// #63214): an unreachable provider/options probe must not (a) discard already
+// -successful auxiliary/config data, or (b) leave the page on a permanent
+// skeleton with no error/retry affordance.
+describe('ModelSettings load recovery', () => {
+  it('still renders auxiliary data when the provider options probe rejects', async () => {
+    getGlobalModelOptions.mockRejectedValueOnce(new Error('provider unreachable'))
+
+    await renderModelSettings()
+
+    // The main model and auxiliary rows came from getGlobalModelInfo /
+    // getAuxiliaryModels, which both resolved — a fail-fast Promise.all would
+    // have discarded them alongside the rejected options probe.
+    expect(await screen.findByText('Vision')).toBeTruthy()
+    // getGlobalModelOptions rejected, so the provider inventory is empty and
+    // the trigger falls back to the raw selected slug (not the "Nous" label,
+    // which only exists in provider row data that never arrived).
+    await waitFor(() => expect(screen.getAllByRole('combobox')[0].textContent).toContain('nous'))
+
+    // The provider probe's failure is still surfaced, not swallowed.
+    expect(await screen.findByText('provider unreachable')).toBeTruthy()
+  })
+
+  it('reaches a visible error + retry terminal state when every read fails on first load, and recovers on retry', async () => {
+    getGlobalModelInfo.mockRejectedValueOnce(new Error('backend unreachable'))
+    getGlobalModelOptions.mockRejectedValueOnce(new Error('backend unreachable'))
+    getAuxiliaryModels.mockRejectedValueOnce(new Error('backend unreachable'))
+    getMoaModels.mockRejectedValueOnce(new Error('backend unreachable'))
+
+    await renderModelSettings()
+
+    // Never a permanent skeleton: an explicit failure state with a retry
+    // action appears instead.
+    expect(await screen.findByText('Failed to load model settings')).toBeTruthy()
+    expect(screen.getByText('backend unreachable')).toBeTruthy()
+    const retryButton = screen.getByRole('button', { name: 'Retry' })
+
+    // Recovery: retrying with all four reads now succeeding reaches content.
+    fireEvent.click(retryButton)
+
+    await waitFor(() => expect(getGlobalModelInfo).toHaveBeenCalledTimes(2))
+    expect(await screen.findByText('Vision')).toBeTruthy()
+    expect(screen.queryByText('Failed to load model settings')).toBeNull()
+  })
+
+  it('discards a stale (out-of-order) refresh generation without touching the newer one', async () => {
+    // The initial mount's refresh() call resolves AFTER a profile switch has
+    // already bumped profileEpoch and started a second refresh() for the new
+    // profile. The stale (first) generation's result must never overwrite
+    // the newer generation's state, and must not flip loading back on.
+    let resolveStale: ((value: { model: string; provider: string }) => void) | undefined
+
+    getGlobalModelInfo.mockImplementationOnce(
+      () =>
+        new Promise(resolve => {
+          resolveStale = resolve
+        })
+    )
+    getGlobalModelInfo.mockResolvedValueOnce({ provider: 'nous', model: 'hermes-4' })
+
+    await renderModelSettings()
+
+    // Still loading — the first (stale-to-be) generation hasn't resolved yet.
+    await waitFor(() => expect(getGlobalModelInfo).toHaveBeenCalledTimes(1))
+
+    await act(async () => {
+      profileSwitchHandler?.()
+    })
+
+    await waitFor(() => expect(getGlobalModelInfo).toHaveBeenCalledTimes(2))
+    await waitFor(() => expect(screen.getAllByRole('combobox')[0].textContent).toContain('Nous'))
+
+    // Now resolve the original (stale) generation's request. It must be
+    // ignored entirely — no re-render into stale data, no stray loading flip.
+    await act(async () => {
+      resolveStale?.({ provider: 'stale-provider', model: 'stale-model' })
+    })
+
+    expect(screen.getAllByRole('combobox')[0].textContent).toContain('Nous')
+    expect(screen.queryByText(/stale-provider/)).toBeNull()
+  })
+})
+
 describe('ModelSettings MoA preset editor', () => {
   const moaConfig = () => ({
     default_preset: 'default',
