@@ -2547,7 +2547,7 @@ async function findSystemPython() {
           // Registry reads are near-instant; the bound only exists so a
           // pathologically wedged reg.exe can't hang boot forever.
           {
-            exec: async (file, args, options) => (await execFileAsync(file as string, args, options)).stdout as string,
+            exec: async (file, args, options) => (await execFileAsync(file, args, options)).stdout,
             timeout: 5_000
           }
         )
