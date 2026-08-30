@@ -457,7 +457,22 @@ def decompose_task(
 
 
 def list_triage_ids(*, tenant: Optional[str] = None) -> list[str]:
-    """Return task ids currently in the triage column."""
+    """Return task ids currently in the triage column.
+
+    Tasks parked in triage by the unblock-loop breaker are EXCLUDED. When a
+    task re-blocks for the same cause ``BLOCK_RECURRENCE_LIMIT`` times,
+    ``block_task`` routes it to ``triage`` so a human can decide what to do
+    with it. Triage is also the gateway auto-decompose sweep's input queue, so
+    re-decomposing such a task promotes it straight back to ``ready``, where
+    it is claimed, blocks on the same unsatisfiable cause, and lands in triage
+    again — a ``block_loop_detected -> specified -> promoted -> claimed ->
+    blocked`` cycle that repeats every dispatcher tick and never terminates.
+    Observed in the wild at ``recurrences: 18`` against a limit of 2.
+
+    The loop breaker's whole purpose is to stop automated retries, so the
+    automation must not re-arm it. These tasks stay in triage, visible, until
+    a human resolves them.
+    """
     with kb.connect_closing() as conn:
         rows = kb.list_tasks(
             conn,
@@ -465,4 +480,7 @@ def list_triage_ids(*, tenant: Optional[str] = None) -> list[str]:
             tenant=tenant,
             limit=1000,
         )
-    return [row.id for row in rows]
+    return [
+        row.id for row in rows
+        if (row.block_recurrences or 0) < kb.BLOCK_RECURRENCE_LIMIT
+    ]
