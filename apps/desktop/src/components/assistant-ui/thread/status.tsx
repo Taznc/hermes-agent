@@ -8,7 +8,6 @@ import { activitySignature, toolNarratesWait, TURN_QUIET_S } from '@/components/
 import { toolPresentVerb } from '@/components/assistant-ui/tool/run-summary'
 import { useElapsedSeconds } from '@/components/chat/activity-timer'
 import { ActivityTimerText } from '@/components/chat/activity-timer-text'
-import { SCAFFOLD_LABEL_CLASS } from '@/components/chat/scaffold-row'
 import { Codicon } from '@/components/ui/codicon'
 import { Loader } from '@/components/ui/loader'
 import { useI18n } from '@/i18n'
@@ -19,9 +18,18 @@ import { sessionAwaitingInput } from '@/store/prompts'
 import { sessionProviderWait } from '@/store/provider-wait'
 import { type DraftingTool, sessionDraftingTool } from '@/store/tool-drafting'
 
-// A status line is scaffolding like any other — "Editing" while the model
-// drafts a call is the same kind of line as "Explored 3 files" once it has run,
-// and reads as one continuous column only if it shares their type and colour.
+// The live activity row is NOT settled scaffolding, and treating it as such is
+// what made it unreadable. A finished tool row is a record: quiet is correct,
+// and `data-conversation-scaffold` dims it to 0.67 so the reply stays primary.
+// This row is the opposite — it exists only while the user is waiting on it,
+// and it is the only thing on screen that says the app is alive. It used to
+// carry the scaffold mark anyway, so its 64%-alpha text was multiplied to ~0.43
+// and its 9px clock to ~0.37, on the one line a waiting user goes looking for.
+//
+// So it opts out of the fade and lights itself: prose-sized text, an accent
+// edge and a faint surface tint marking it as live rather than logged. No
+// continuous animation — `StatusPulse` beats on a shared timer so the renderer
+// can still sleep between frames (see status-pulse.tsx).
 const StatusRow: FC<{ children: ReactNode; label: string } & React.ComponentPropsWithoutRef<'div'>> = ({
   children,
   label,
@@ -32,11 +40,13 @@ const StatusRow: FC<{ children: ReactNode; label: string } & React.ComponentProp
     aria-label={label}
     aria-live="polite"
     className={cn(
-      'flex min-w-0 max-w-full items-center gap-1.5 self-start leading-(--conversation-line-height)',
-      'text-(--conversation-scaffold-text)',
+      'flex min-w-0 max-w-full items-center gap-2 self-start',
+      'rounded-md border-l-2 border-(--activity-strip-edge) bg-(--activity-strip-surface)',
+      'py-1 pr-2.5 pl-2',
+      'text-[length:var(--activity-strip-font-size)] leading-5 text-(--activity-strip-text)',
       className
     )}
-    data-conversation-scaffold=""
+    data-activity-strip=""
     role="status"
     {...rest}
   >
@@ -47,8 +57,11 @@ const StatusRow: FC<{ children: ReactNode; label: string } & React.ComponentProp
 // Fixed label while auto-compaction runs — decoupled from backend status text.
 const COMPACTION_LABEL = 'Summarizing thread'
 
+// The named wait, at the strip's own size rather than the settled-tool size the
+// scaffold label class carries. Medium weight so it reads as the strip's title
+// against the lighter clock trailing it.
 const HintText: FC<{ children: ReactNode }> = ({ children }) => (
-  <span className={cn(SCAFFOLD_LABEL_CLASS, 'shimmer min-w-0 flex-1 truncate')}>{children}</span>
+  <span className="shimmer min-w-0 flex-1 truncate font-medium">{children}</span>
 )
 
 /** These indicators render inside whichever transcript mounted them, so every

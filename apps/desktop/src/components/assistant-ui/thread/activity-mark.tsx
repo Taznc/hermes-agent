@@ -51,7 +51,7 @@ export const ThreadActivityMark: FC<ThreadActivityMarkProps> = state => {
     return (
       <StatusPulse
         aria-hidden="true"
-        className="dither inline-block size-3 rounded-[2px] text-midground/80"
+        className="dither inline-block size-3.5 shrink-0 rounded-[3px] text-(--activity-strip-edge)"
         kind="opacity"
       />
     )
