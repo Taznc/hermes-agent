@@ -31,6 +31,18 @@ test('windowsQuote doubles embedded quotes', () => {
   assert.equal(windowsQuote('C:\\a "b"'), '"C:\\a ""b"""')
 })
 
+test('windowsQuote escapes a literal percent so batch does not expand %VAR%', () => {
+  assert.equal(windowsQuote('C:\\a%PATH%b'), '"C:\\a%%PATH%%b"')
+})
+
+test('windowsQuote escapes a bare trailing percent', () => {
+  assert.equal(windowsQuote('100%'), '"100%%"')
+})
+
+test('windowsQuote escapes % before doubling " so inserted quotes are not rescanned', () => {
+  assert.equal(windowsQuote('%VAR% says "hi"'), '"%%VAR%% says ""hi"""')
+})
+
 test('terminalScriptEnv drops PATH in any casing and keeps the rest', () => {
   const env = terminalScriptEnv(
     { Path: 'C:\\junk', PATH: '/junk', PYTHONPATH: '/repo', PYTHONUTF8: '1' },
