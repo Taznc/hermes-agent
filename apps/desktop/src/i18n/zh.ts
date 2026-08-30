@@ -3529,6 +3529,17 @@ export const zhAuthored: Translations = {
       statusRecovered: '已恢复',
       statusDone: '完成',
       memoryWriteNoted: '已记下记忆写入',
+      memoryActions: {
+        add: { done: '已保存笔记', pending: '正在保存笔记' },
+        search: { done: '已搜索记忆', pending: '正在搜索记忆' },
+        probe: { done: '已回忆记忆', pending: '正在回忆记忆' },
+        related: { done: '已找到相关记忆', pending: '正在查找相关记忆' },
+        reason: { done: '已跨记忆推理', pending: '正在跨记忆推理' },
+        contradict: { done: '已检查记忆冲突', pending: '正在检查记忆冲突' },
+        update: { done: '已更新记忆', pending: '正在更新记忆' },
+        remove: { done: '已从记忆中移除', pending: '正在从记忆中移除' },
+        list: { done: '已列出记忆', pending: '正在列出记忆' }
+      },
       actions: {
         read: '已读取',
         reading: '正在读取',

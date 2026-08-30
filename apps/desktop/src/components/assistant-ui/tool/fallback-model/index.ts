@@ -1273,6 +1273,24 @@ interface ToolTitleParts {
   title: string
 }
 
+const MEMORY_ACTION_KEYS = new Set([
+  'add',
+  'search',
+  'probe',
+  'related',
+  'reason',
+  'contradict',
+  'update',
+  'remove',
+  'list'
+])
+
+function isMemoryActionKey(
+  action: string
+): action is 'add' | 'contradict' | 'list' | 'probe' | 'reason' | 'related' | 'remove' | 'search' | 'update' {
+  return MEMORY_ACTION_KEYS.has(action)
+}
+
 function titlePartsFromAction(title: string, action?: string): ToolTitleParts {
   if (!action) {
     return { title }
@@ -1389,6 +1407,19 @@ function dynamicTitle(
     if (path) {
       return { title: fileEditBasename(path) }
     }
+  }
+
+  if (part.toolName === 'memory') {
+    const action = firstStringField(args, ['action'])
+
+    if (!isMemoryActionKey(action)) {
+      return fallback
+    }
+
+    const done = translateNow(`assistant.tool.memoryActions.${action}.done`)
+    const pending = translateNow(`assistant.tool.memoryActions.${action}.pending`)
+
+    return { title: verb(pending, done) }
   }
 
   return fallback
