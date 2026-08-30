@@ -13,6 +13,7 @@ export const ja = defineLocale({
     choose: '選択',
     clear: 'クリア',
     close: '閉じる',
+    undo: '元に戻す',
     collapse: '折りたたむ',
     confirm: '確認',
     connect: '接続',

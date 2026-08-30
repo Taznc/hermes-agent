@@ -41,6 +41,7 @@ export const ar = defineLocale({
     copied: 'تم النسخ',
     copy: 'نسخ',
     copyFailed: 'فشل النسخ',
+    undo: 'تراجع',
     delete: 'حذف',
     docs: 'الوثائق',
     done: 'تم',

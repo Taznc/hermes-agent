@@ -35,6 +35,7 @@ import { RemoteDisplayBanner } from '@/components/remote-display-banner'
 import { SendDiagnosticsHost } from '@/components/send-diagnostics-dialog'
 import { emitGatewayEvent } from '@/contrib/events'
 import { getLatestSessionMessages } from '@/hermes'
+import { useI18n } from '@/i18n'
 import { type ChatMessage, chatMessageText, preserveLocalAssistantErrors, toChatMessages } from '@/lib/chat-messages'
 import { isMessagingSource } from '@/lib/session-source'
 import { latestSessionTodos } from '@/lib/todos'
@@ -46,7 +47,7 @@ import { requestVoiceConversationStart } from '@/store/composer'
 import { $activeConnectionId } from '@/store/connections'
 import { $cronReviewRequest, setCronFocusJobId } from '@/store/cron'
 import { $pinnedSessionIds, pinSession, restoreWorktree, unpinSession } from '@/store/layout'
-import { notify } from '@/store/notifications'
+import { dismissNotification, notify, notifyError } from '@/store/notifications'
 import { $previewTarget } from '@/store/preview'
 import {
   $activeGatewayProfile,
@@ -79,6 +80,7 @@ import {
   setBusy,
   setMessages
 } from '@/store/session'
+import { ARCHIVE_UNDO_WINDOW_MS, archiveSessionWithUndo, undoArchive } from '@/store/session-archive-undo'
 import { requestForSessionProfile, type SessionOwnerScope } from '@/store/session-request-router'
 import { $focusedStoredSessionId, sessionTileOwnerRoute, storedSessionIdForRuntimeId } from '@/store/session-states'
 import { clearSessionTodos, setSessionTodos, todosForHydration } from '@/store/todos'
@@ -175,6 +177,7 @@ export function ContribWiring({ children }: { children: ReactNode }) {
   const queryClient = useQueryClient()
   const location = useLocation()
   const navigate = useNavigate()
+  const { t } = useI18n()
 
   const busyRef = useRef(false)
   const creatingSessionRef = useRef(false)
@@ -985,6 +988,54 @@ export function ContribWiring({ children }: { children: ReactNode }) {
     void archiveSession(sessionId)
   }, [archiveSession])
 
+  // Row-level one-click archive (#70ab279e): archives through the undo-aware
+  // state layer (instant, no confirmation) and surfaces a "Session archived —
+  // Undo" toast for the SAME 10s window the state layer opens. The toast is
+  // shown synchronously right after kicking off the archive — the state layer
+  // does its optimistic removal and starts its own undo-window timer
+  // synchronously too, before awaiting the backend PATCH — so the two windows
+  // stay in lockstep instead of the toast's clock starting late on a slow
+  // network. Toast id is keyed to the session id: archiving several sessions
+  // in quick succession stacks one toast per session (each up to the shared
+  // notification cap) rather than one toast clobbering another, and each
+  // toast's Undo button closes over its OWN session id, so it can never
+  // restore the wrong row. A failed archive drops the (now-meaningless) toast
+  // and reports the failure instead — the state layer has already rolled its
+  // optimistic removal back by the time the rejection reaches us.
+  const archiveSessionViaSidebar = useCallback(
+    (storedSessionId: string) => {
+      // Archiving the session currently on screen must also navigate away —
+      // the state layer only clears the selection atom (it doesn't own
+      // routing; see its own doc comment). Leaving the ROUTE pointed at the
+      // now-archived session trips useRouteResume's stuck-on-routed-session
+      // self-heal, which re-resumes (and so re-fetches/re-inserts) the very
+      // session this click just archived, silently undoing it.
+      if ($selectedStoredSessionId.get() === storedSessionId) {
+        startFreshSessionDraft(true)
+      }
+
+      const toastId = `archive-undo:${storedSessionId}`
+      const archived = archiveSessionWithUndo(storedSessionId)
+
+      notify({
+        action: {
+          label: t.common.undo,
+          onClick: () => void undoArchive(storedSessionId)
+        },
+        durationMs: ARCHIVE_UNDO_WINDOW_MS,
+        id: toastId,
+        kind: 'success',
+        message: t.desktop.archivedUndoMessage
+      })
+
+      void archived.catch(err => {
+        dismissNotification(toastId)
+        notifyError(err, t.desktop.archiveFailed)
+      })
+    },
+    [startFreshSessionDraft, t]
+  )
+
   // Single global listener for every rebindable hotkey plus the on-screen
   // keybind editor's capture mode (same as DesktopController).
   useKeybinds({
@@ -1022,7 +1073,7 @@ export function ContribWiring({ children }: { children: ReactNode }) {
   const nextActions: WiringActions = {
     onAddContextRef: composer.addContextRefAttachment,
     onAddUrl: url => composer.addContextRefAttachment(`@url:${formatRefValue(url)}`, url),
-    onArchiveSession: sessionId => void archiveSession(sessionId),
+    onArchiveSession: sessionId => archiveSessionViaSidebar(sessionId),
     onAttachDroppedItems: composer.attachDroppedItems,
     onAttachImageBlob: composer.attachImageBlob,
     onAttachPrCommentUrl: composer.attachPrCommentUrl,

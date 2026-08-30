@@ -89,6 +89,7 @@ export interface Translations {
     tryHint: (term: string) => string
     on: string
     off: string
+    undo: string
   }
 
   fileMenu: {
@@ -2979,6 +2980,7 @@ export interface Translations {
     deleteFailed: string
     archived: string
     archiveFailed: string
+    archivedUndoMessage: string
     cwdChangeFailed: string
     cwdStagedTitle: string
     cwdStagedMessage: string

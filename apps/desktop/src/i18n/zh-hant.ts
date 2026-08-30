@@ -13,6 +13,7 @@ export const zhHant = defineLocale({
     choose: '選擇',
     clear: '清除',
     close: '關閉',
+    undo: '復原',
     collapse: '收合',
     confirm: '確認',
     connect: '連線',

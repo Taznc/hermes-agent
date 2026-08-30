@@ -47,6 +47,7 @@ export const zhAuthored: Translations = {
     skip: '跳过',
     update: '更新',
     tryHint: term => `试试“${term}”`,
+    undo: '撤销',
     on: '开',
     off: '关'
   },
@@ -3617,6 +3618,7 @@ export const zhAuthored: Translations = {
     deleteFailed: '删除失败',
     archived: '已归档',
     archiveFailed: '归档失败',
+    archivedUndoMessage: '会话已归档',
     cwdChangeFailed: '工作目录更改失败',
     cwdStagedTitle: '工作目录已暂存',
     cwdStagedMessage: '重启桌面后端后，工作目录更改才会应用到当前活跃会话。',
