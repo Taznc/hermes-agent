@@ -72,17 +72,27 @@ describe('ResponseLoadingIndicator timer', () => {
   })
 })
 
-// The status line sits between tool rows and thinking headers, which the
-// transcript rests at a fade. Without the mark it reads a shade brighter than
-// both — the one line in the column claiming emphasis it hasn't earned.
+// The live status line was originally marked as transcript scaffolding, on the
+// reasoning that a line sitting between tool rows and thinking headers should
+// rest at the same fade rather than claim emphasis it hasn't earned. That is
+// right for a settled row and wrong for this one: it exists only while the user
+// is waiting on it, and it is the only thing on screen saying the app is alive
+// — so the emphasis IS earned, for exactly as long as the row exists.
+//
+// Carrying the mark anyway multiplied the row by 0.67 on top of its already
+// partial text alpha, which is what made it repeatedly unreadable. It now opts
+// out and lights itself; see `activity-timer-text.test.tsx` for the alpha stack.
 describe('status line', () => {
   afterEach(cleanup)
 
-  it('is marked as transcript scaffolding', () => {
+  it('is not marked as settled scaffolding, so the fade rule cannot dim it', () => {
     $activeSessionId.set('session-a')
     $turnStartedAt.set(Date.now())
     const { container } = renderIndicator()
 
-    expect(container.querySelector('[role="status"]')?.hasAttribute('data-conversation-scaffold')).toBe(true)
+    const row = container.querySelector('[role="status"]')
+
+    expect(row?.hasAttribute('data-conversation-scaffold')).toBe(false)
+    expect(row?.hasAttribute('data-activity-strip')).toBe(true)
   })
 })
