@@ -1783,6 +1783,7 @@ export const ar = defineLocale({
       copyIdFailed: 'فشل نسخ المعرف',
 
       sessionActions: 'إجراءات الجلسة',
+      archiveSession: 'أرشفة الجلسة',
       sessionRunning: 'الجلسة تعمل',
       needsInput: 'تحتاج إدخالا',
       waitingForAnswer: 'بانتظار إجابة',
