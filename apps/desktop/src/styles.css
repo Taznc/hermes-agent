@@ -473,10 +473,15 @@
        nothing else. */
     --activity-strip-font-size: 0.8125rem;
     --activity-strip-meta-font-size: 0.75rem;
-    --activity-strip-text: var(--ui-text-secondary);
-    --activity-strip-meta: color-mix(in srgb, var(--ui-base) 58%, transparent);
-    --activity-strip-edge: color-mix(in srgb, var(--ui-accent) 70%, transparent);
-    --activity-strip-surface: color-mix(in srgb, var(--ui-accent) 8%, transparent);
+    --activity-strip-text: var(--ui-text-primary);
+    --activity-strip-meta: color-mix(in srgb, var(--ui-base) 72%, transparent);
+    /* The edge and mark must contrast against the CHAT SURFACE, and `--ui-accent`
+       aliases to `--theme-midground` — the exact colour the mark already was, so
+       keying them off the accent reproduced the original faint speck at a new
+       name. Mix the accent toward the foreground so it stays theme-derived but
+       actually separates from the background on both light and dark. */
+    --activity-strip-edge: color-mix(in srgb, var(--ui-accent) 55%, var(--ui-base));
+    --activity-strip-surface: color-mix(in srgb, var(--ui-base) 7%, transparent);
     /* Gap between top-level turn blocks (prose ↔ tools ↔ thinking) — enough air
        that scaffolding reads as separate from the reply, not crammed into it. */
     --turn-block-gap: 0.75rem;
