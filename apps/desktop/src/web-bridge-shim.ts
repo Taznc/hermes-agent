@@ -153,6 +153,15 @@ function bytesToBase64(bytes: Uint8Array): string {
 // image-upload route above, but accepts any content and stores under
 // HERMES_HOME/uploads/) and hand back the absolute path; file.attach/
 // image.attach_bytes read it back from there like any other local pick.
+//
+// The staged path's basename is an internal name (timestamp/hash-prefixed —
+// see upload_chat_file in hermes_cli/web_server.py), not the name the user
+// picked or dropped. Remember that original name here, keyed by the staged
+// path, so the composer chip can show it instead of the internal basename
+// (getStagedDisplayName below). Electron never populates this map — it always
+// attaches a real local path and derives the label from that directly.
+const stagedFileDisplayNames = new Map<string, string>()
+
 async function uploadFileBuffer(bytes: Uint8Array, filename: string, mimeType?: string): Promise<string> {
   const result = await api<{ path?: string }>({
     path: '/api/chat/file-upload',
@@ -163,7 +172,13 @@ async function uploadFileBuffer(bytes: Uint8Array, filename: string, mimeType?: 
     }
   })
 
-  return result?.path ?? ''
+  const path = result?.path ?? ''
+
+  if (path && filename) {
+    stagedFileDisplayNames.set(path, filename)
+  }
+
+  return path
 }
 
 async function uploadPickedFile(file: File): Promise<string> {
@@ -451,6 +466,14 @@ const shim = {
 
     return uploadFileBuffer(bytes, filename || 'upload')
   },
+
+  // Web build only: the composer chip label should show the name the user
+  // picked/dropped, not the staged path's internal timestamp/hash basename.
+  // saveFileBuffer/selectPaths record the mapping as they stage each file;
+  // attachContextFilePath (use-composer-actions.ts) reads it back here to
+  // label the chip. Undefined on Electron — real local paths already carry
+  // their true name in the basename, so pathLabel(path) is correct there.
+  getStagedDisplayName: (path: string) => stagedFileDisplayNames.get(path),
 
   // The server-side clipboard is the HOST's, not the browser user's, so
   // reading it would attach the wrong machine's image. The DOM paste event

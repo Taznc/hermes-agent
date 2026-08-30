@@ -408,11 +408,19 @@ export function useComposerActions({
 
       for (const path of paths) {
         const rel = contextPath(path, currentCwd)
+        // Web build: selectDesktopPaths stages picked files through
+        // uploadPickedFile/saveFileBuffer, whose returned path carries an
+        // internal timestamp/hash basename (see upload_chat_file in
+        // web_server.py), not the name the user picked in the OS dialog. The
+        // bridge remembers that original name keyed by the staged path;
+        // prefer it here so the '+' → Files chip matches attachImagePath's
+        // Electron-parity behavior instead of showing the staged basename.
+        const stagedName = kind === 'file' ? window.hermesDesktop?.getStagedDisplayName?.(path) : undefined
 
         attachToMain({
           id: attachmentId(kind, rel),
           kind,
-          label: pathLabel(path),
+          label: stagedName || pathLabel(path),
           detail: rel,
           refText: `@${kind}:${formatRefValue(rel)}`,
           path
@@ -449,11 +457,19 @@ export function useComposerActions({
       }
 
       const rel = contextPath(filePath, currentCwd)
+      // Web build: a path staged through saveFileBuffer carries an internal
+      // timestamp/hash basename (see upload_chat_file in web_server.py), not
+      // the name the user picked/dropped. The bridge remembers that original
+      // name keyed by the staged path; prefer it for the chip label so the
+      // web upload path matches attachImagePath's Electron-parity behavior.
+      // Undefined (Electron, or a path never staged) falls back to the
+      // path's own basename as before.
+      const stagedName = window.hermesDesktop?.getStagedDisplayName?.(filePath)
 
       attachToMain({
         id: attachmentId('file', rel),
         kind: 'file',
-        label: pathLabel(filePath),
+        label: stagedName || pathLabel(filePath),
         detail: rel,
         refText: `@file:${formatRefValue(rel)}`,
         path: filePath

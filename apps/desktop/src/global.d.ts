@@ -274,6 +274,14 @@ declare global {
        *  to saveImageBuffer. Electron always has a real path via
        *  getPathForFile and never defines this member. */
       saveFileBuffer?: (data: ArrayBuffer | Uint8Array, filename: string) => Promise<string>
+      /** Web build only: the original filename a staged (non-image) path was
+       *  uploaded under — saveFileBuffer/selectPaths record it as they stage
+       *  each file. The staged path's own basename is an internal
+       *  timestamp/hash name (see upload_chat_file), not the name the user
+       *  picked/dropped, so the composer label must look it up here rather
+       *  than deriving it from the path. Undefined on Electron, where the
+       *  real local path's basename already is the true name. */
+      getStagedDisplayName?: (path: string) => string | undefined
       getPathForFile: (file: File) => string
       normalizePreviewTarget: (target: string, baseDir?: string) => Promise<HermesPreviewTarget | null>
       watchPreviewFile: (url: string) => Promise<HermesPreviewWatch>

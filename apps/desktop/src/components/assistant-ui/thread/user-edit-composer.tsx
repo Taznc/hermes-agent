@@ -487,10 +487,18 @@ export const UserEditComposer: FC<UserEditComposerProps> = ({ cwd, gateway, sess
         }
 
         const kind: ComposerAttachment['kind'] = isImage ? 'image' : 'file'
+        // Web build: a staged (bytes-uploaded) path's own basename is an
+        // internal timestamp/hash name assigned by the backend (see
+        // upload_chat_file/upload_chat_image), not the name the user
+        // dropped. web-bridge-shim remembers the original name for
+        // non-image files staged via saveFileBuffer; fall back to the
+        // path's basename when unavailable (Electron, or an in-place path
+        // that needed no staging).
+        const stagedName = !isImage ? window.hermesDesktop?.getStagedDisplayName?.(path) : undefined
 
         try {
           const uploaded = await uploadComposerAttachment(
-            { detail: path, id: attachmentId(kind, path), kind, label: pathLabel(path), path },
+            { detail: path, id: attachmentId(kind, path), kind, label: stagedName || pathLabel(path), path },
             { backendCwd: cwd, remote, requestGateway, sessionId, terminalBackend: $terminalBackend.get() }
           )
 
