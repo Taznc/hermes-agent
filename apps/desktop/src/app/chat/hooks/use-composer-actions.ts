@@ -536,6 +536,43 @@ export function useComposerActions({
     [attachImagePath, copy.imageAttach, copy.imageAttachFailed, copy.imageWriteFailed]
   )
 
+  /**
+   * Web-build counterpart to attachContextFilePath for a dropped/picked
+   * non-image File with no usable local path (browsers never expose one —
+   * see web-bridge-shim.ts's getPathForFile/selectPaths). Stages the raw
+   * bytes through the bridge's saveFileBuffer (defined only in the web
+   * shim; Electron always has a real path already and never defines it) and
+   * attaches the gateway-visible path it returns. No-op (returns false) on
+   * Electron so callers can fall back to the existing path-based attach.
+   */
+  const attachFileBlob = useCallback(
+    async (file: File) => {
+      const saveFileBuffer = window.hermesDesktop?.saveFileBuffer
+
+      if (!saveFileBuffer || file.size === 0) {
+        return false
+      }
+
+      try {
+        const buffer = await file.arrayBuffer()
+        const savedPath = await saveFileBuffer(new Uint8Array(buffer), file.name)
+
+        if (!savedPath) {
+          notify({ kind: 'error', title: copy.dropFiles, message: copy.imageWriteFailed })
+
+          return false
+        }
+
+        return attachContextFilePath(savedPath)
+      } catch (err) {
+        notifyError(err, copy.dropFiles)
+
+        return false
+      }
+    },
+    [attachContextFilePath, copy.dropFiles, copy.imageWriteFailed]
+  )
+
   const pickImages = useCallback(async () => {
     const paths = await selectDesktopPaths({
       title: copy.attachImages,
@@ -690,6 +727,17 @@ export function useComposerActions({
           continue
         }
 
+        // No local path at all — the web build (browsers never expose one)
+        // or an older Electron shell missing getPathForFile. Stage the raw
+        // bytes instead of dropping the file on the floor; attachFileBlob is
+        // a no-op returning false when the bridge has no saveFileBuffer
+        // (Electron, which should always have hit the branch above).
+        if (!filePath && (await attachFileBlob(file))) {
+          attached = true
+
+          continue
+        }
+
         lastFailure = `Could not attach ${file.name || 'file'}`
       }
 
@@ -699,7 +747,7 @@ export function useComposerActions({
 
       return attached
     },
-    [attachContextFilePath, attachContextFolderPath, attachImageBlob, attachImagePath, copy.dropFiles]
+    [attachContextFilePath, attachContextFolderPath, attachFileBlob, attachImageBlob, attachImagePath, copy.dropFiles]
   )
 
   const removeAttachment = useCallback(
@@ -729,6 +777,7 @@ export function useComposerActions({
     attachContextFilePath,
     attachContextFolderPath,
     attachDroppedItems,
+    attachFileBlob,
     attachImageBlob,
     attachImagePath,
     attachPrCommentUrl,

@@ -439,6 +439,13 @@ export const UserEditComposer: FC<UserEditComposerProps> = ({ cwd, gateway, sess
   // composer uses, then insert the *gateway-side* ref the agent can resolve —
   // never the raw local path (the MahmoudR remote-attach bug, which the main
   // composer fixes but this edit composer used to reproduce).
+  //
+  // The web build never has a local path at all (browsers don't expose one —
+  // see web-bridge-shim.ts's getPathForFile), so a path-only candidate here
+  // used to be silently dropped. Stage the raw File bytes through the bridge
+  // first (saveImageBuffer/saveFileBuffer — both web-shim-only; Electron
+  // always has a real path and skips straight to uploadComposerAttachment)
+  // to get a gateway-visible path before staging the attachment itself.
   const uploadOsDropRefs = useCallback(
     async (osDrops: ReturnType<typeof extractDroppedFiles>): Promise<InlineRefInput[]> => {
       if (!gateway || !sessionId) {
@@ -454,14 +461,32 @@ export const UserEditComposer: FC<UserEditComposerProps> = ({ cwd, gateway, sess
       const refs: InlineRefInput[] = []
 
       for (const candidate of osDrops) {
-        const path = candidate.path || ''
+        let path = candidate.path || ''
+        const isImage = candidate.file?.type.startsWith('image/') || isImagePath(candidate.file?.name || path)
+
+        if (!path && candidate.file) {
+          try {
+            path = isImage
+              ? await window.hermesDesktop?.saveImageBuffer(
+                  new Uint8Array(await candidate.file.arrayBuffer()),
+                  `.${candidate.file.name.split('.').pop() || 'png'}`
+                )
+              : ((await window.hermesDesktop?.saveFileBuffer?.(
+                  new Uint8Array(await candidate.file.arrayBuffer()),
+                  candidate.file.name
+                )) ?? '')
+          } catch (err) {
+            notifyError(err, t.desktop.dropFiles)
+
+            continue
+          }
+        }
 
         if (!path) {
           continue
         }
 
-        const kind: ComposerAttachment['kind'] =
-          candidate.file?.type.startsWith('image/') || isImagePath(candidate.file?.name || path) ? 'image' : 'file'
+        const kind: ComposerAttachment['kind'] = isImage ? 'image' : 'file'
 
         try {
           const uploaded = await uploadComposerAttachment(

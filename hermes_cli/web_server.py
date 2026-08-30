@@ -1641,6 +1641,7 @@ from hermes_cli.web_models import (  # noqa: F401
     AudioTranscriptionRequest,
     ManagedFileUpload,
     ChatImageUpload,
+    ChatFileUpload,
     ManagedDirectoryCreate,
     ManagedFileDelete,
     ModelAssignment,
@@ -2679,6 +2680,75 @@ async def upload_chat_image(payload: ChatImageUpload, profile: Optional[str] = N
     # _profile_scope acquires _SKILLS_PROFILE_LOCK and the body does file I/O —
     # keep both off the event loop (asyncio.to_thread copies the contextvar
     # context, so the profile override stays scoped to the worker thread).
+    return await asyncio.to_thread(_run)
+
+
+# Chat non-image files: the web build's '+' Files picker and OS drag/drop hand
+# the renderer raw File bytes with no usable filesystem path — browsers never
+# expose one, and even Electron's local path is meaningless once bytes cross
+# to a remote gateway. Stage them under HERMES_HOME/uploads/ (mirrors
+# upload_chat_image's HERMES_HOME/images/) and hand back a gateway-visible
+# path the composer attaches exactly like a local pick via file.attach. See
+# web-bridge-shim.ts's selectPaths/saveFileBuffer and
+# use-composer-actions.ts's attachFileBlob.
+#
+# Capped to _FS_DATA_URL_MAX_BYTES, not the larger _MANAGED_FILE_MAX_BYTES:
+# file.attach in remote mode reads the staged path back through
+# GET /api/fs/read-data-url, which enforces that same (smaller) cap. A bigger
+# cap here would let the upload succeed and then fail unreadable at attach.
+_CHAT_FILE_UPLOAD_MAX_BYTES = _FS_DATA_URL_MAX_BYTES
+
+
+def _sanitize_chat_upload_filename(filename: str | None) -> str:
+    candidate = Path(str(filename or "").strip()).name
+    candidate = re.sub(r"[\x00-\x1f]+", "_", candidate)
+    candidate = candidate.strip().strip(".")
+    return candidate or "upload"
+
+
+@app.post("/api/chat/file-upload")
+async def upload_chat_file(payload: ChatFileUpload, profile: Optional[str] = None):
+    """Persist a browser-provided non-image chat attachment for staging.
+
+    Mirrors ``upload_chat_image`` for arbitrary files. See the module comment
+    above ``_CHAT_FILE_UPLOAD_MAX_BYTES`` for why this exists and its cap.
+    """
+    def _run():
+        data, _mime_type = _decode_data_url(payload.data_url)
+        if len(data) > _CHAT_FILE_UPLOAD_MAX_BYTES:
+            mb = _CHAT_FILE_UPLOAD_MAX_BYTES // (1024 * 1024)
+            raise HTTPException(status_code=413, detail=f"File is too large; cap is {mb} MB")
+
+        with _profile_scope(profile) as scoped_home:
+            home = scoped_home or get_hermes_home()
+            upload_dir = Path(home) / "uploads"
+            try:
+                upload_dir.mkdir(parents=True, exist_ok=True)
+            except PermissionError:
+                raise HTTPException(status_code=403, detail="Upload directory is not writable")
+            except OSError as exc:
+                raise HTTPException(status_code=500, detail=f"Could not create upload directory: {exc}")
+
+            safe_name = _sanitize_chat_upload_filename(payload.filename)
+            stem = re.sub(r"[^A-Za-z0-9_.-]+", "_", Path(safe_name).stem).strip("._-") or "upload"
+            ext = re.sub(r"[^A-Za-z0-9.]+", "", Path(safe_name).suffix[:16])
+            ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+            target = upload_dir / f"chat_{ts}_{secrets.token_hex(4)}_{stem}{ext}"
+
+            try:
+                target.write_bytes(data)
+            except PermissionError:
+                raise HTTPException(status_code=403, detail="Upload directory is not writable")
+            except OSError as exc:
+                raise HTTPException(status_code=500, detail=f"Could not write file: {exc}")
+
+        return {
+            "ok": True,
+            "path": str(target),
+            "name": target.name,
+            "bytes": len(data),
+        }
+
     return await asyncio.to_thread(_run)
 
 

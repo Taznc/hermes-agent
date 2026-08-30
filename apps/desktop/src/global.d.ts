@@ -269,6 +269,11 @@ declare global {
       ) => () => void
       saveImageBuffer: (data: ArrayBuffer | Uint8Array, ext: string) => Promise<string>
       saveClipboardImage: () => Promise<string>
+      /** Web build only: stage a non-image File's raw bytes (no local path
+       *  available) and return a gateway-visible path, the file counterpart
+       *  to saveImageBuffer. Electron always has a real path via
+       *  getPathForFile and never defines this member. */
+      saveFileBuffer?: (data: ArrayBuffer | Uint8Array, filename: string) => Promise<string>
       getPathForFile: (file: File) => string
       normalizePreviewTarget: (target: string, baseDir?: string) => Promise<HermesPreviewTarget | null>
       watchPreviewFile: (url: string) => Promise<HermesPreviewWatch>
