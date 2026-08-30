@@ -1890,6 +1890,7 @@ export const zhHant = defineLocale({
       copyIdFailed: '無法複製工作階段 ID',
 
       sessionActions: '工作階段動作',
+      archiveSession: '封存工作階段',
       sessionRunning: '工作階段執行中',
       needsInput: '需要您的輸入',
       waitingForAnswer: '等待您的回答',

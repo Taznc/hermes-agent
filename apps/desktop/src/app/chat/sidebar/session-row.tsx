@@ -364,42 +364,75 @@ function SidebarSessionRowImpl({
   // shell column would span the card's full height and shave every line,
   // when only the header shares its line with the age and kebab.
   const actionsNode = (
-    <div className="relative z-2 flex shrink-0 items-center justify-end gap-1" data-row-actions>
-      {trailing.map(({ key, node }, index) => (
-        <span
-          className={
-            chipEndsSlot && index === trailing.length - 1 ? cn('inline-flex justify-end', TAIL_HIDES) : undefined
-          }
-          key={key}
+    <div className="flex shrink-0 items-center justify-end gap-1" data-row-actions>
+      {/* Trailing chips + kebab keep their OWN positioning context (unchanged
+          from before the archive button existed): the kebab overlays the
+          last trailing chip via `absolute right-0` relative to THIS wrapper,
+          not the outer actions cluster, so adding a sibling control below
+          cannot shift what the kebab overlays or where it lands. */}
+      <div className="relative z-2 flex items-center gap-1">
+        {trailing.map(({ key, node }, index) => (
+          <span
+            className={
+              chipEndsSlot && index === trailing.length - 1 ? cn('inline-flex justify-end', TAIL_HIDES) : undefined
+            }
+            key={key}
+          >
+            {node}
+          </span>
+        ))}
+        <SessionActionsMenu
+          onArchive={onArchive}
+          onBranch={onBranch}
+          onDelete={onDelete}
+          onPin={onPin}
+          onToggleUnread={onToggleUnread}
+          pinned={isPinned}
+          profile={session.profile}
+          sessionId={session.id}
+          title={title}
+          unread={unread}
         >
-          {node}
-        </span>
-      ))}
-      <SessionActionsMenu
-        onArchive={onArchive}
-        onBranch={onBranch}
-        onDelete={onDelete}
-        onPin={onPin}
-        onToggleUnread={onToggleUnread}
-        pinned={isPinned}
-        profile={session.profile}
-        sessionId={session.id}
-        title={title}
-        unread={unread}
-      >
+          <Button
+            aria-label={r.sessionActions}
+            className={cn(
+              'size-5 rounded-[4px] bg-transparent text-transparent transition-colors duration-100 hover:bg-(--ui-control-active-background) hover:text-foreground focus-visible:bg-(--ui-control-active-background) focus-visible:text-foreground focus-visible:ring-0 data-[state=open]:bg-(--ui-control-active-background) data-[state=open]:text-foreground group-hover:text-(--ui-text-tertiary) [&_svg]:size-3.5!',
+              trailing.length > 0 && 'absolute right-0',
+              pr && KEBAB_YIELDS
+            )}
+            size="icon"
+            variant="ghost"
+          >
+            <Codicon name="kebab-vertical" size="0.875rem" />
+          </Button>
+        </SessionActionsMenu>
+      </div>
+      {/* Row-level one-click archive (#7b52ebc2): a real, always-in-flow
+          sibling past the kebab cluster so archiving never needs a menu.
+          Unlike the kebab it never overlaps anything — it always reserves
+          its own width in the actions column, so neither it nor the title's
+          truncation point ever shifts as trailing chips or the kebab fade in
+          and out on hover. Same transparent-until-hover/focus treatment as
+          the kebab so the pair reads as one cluster. */}
+      <Tip label={r.archiveSession}>
         <Button
-          aria-label={r.sessionActions}
-          className={cn(
-            'size-5 rounded-[4px] bg-transparent text-transparent transition-colors duration-100 hover:bg-(--ui-control-active-background) hover:text-foreground focus-visible:bg-(--ui-control-active-background) focus-visible:text-foreground focus-visible:ring-0 data-[state=open]:bg-(--ui-control-active-background) data-[state=open]:text-foreground group-hover:text-(--ui-text-tertiary) [&_svg]:size-3.5!',
-            trailing.length > 0 && 'absolute right-0',
-            pr && KEBAB_YIELDS
-          )}
+          aria-label={r.archiveSession}
+          className="size-5 shrink-0 rounded-[4px] bg-transparent text-transparent transition-colors duration-100 hover:bg-(--ui-control-active-background) hover:text-foreground focus-visible:bg-(--ui-control-active-background) focus-visible:text-foreground focus-visible:ring-0 group-hover:text-(--ui-text-tertiary) [&_svg]:size-3.5!"
+          onClick={event => {
+            // The archive button is not a descendant of the row's own click
+            // target (SidebarRowBody), but stop propagation anyway per spec
+            // so archiving can never also select/resume the row even if the
+            // DOM nesting changes later.
+            event.stopPropagation()
+            triggerHaptic('selection')
+            onArchive()
+          }}
           size="icon"
           variant="ghost"
         >
-          <Codicon name="kebab-vertical" size="0.875rem" />
+          <Codicon name="archive" size="0.875rem" />
         </Button>
-      </SessionActionsMenu>
+      </Tip>
     </div>
   )
 
