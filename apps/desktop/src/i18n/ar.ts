@@ -1,6 +1,8 @@
-import { defineLocale } from './define-locale'
+import { forkAr } from './fork/ar'
+import { defineForkLocale } from './fork/merge'
 
-export const ar = defineLocale({
+// >>> FORK ANCHOR: i18n-ar <<<
+export const ar = defineForkLocale(forkAr, {
   sendDiagnostics: {
     title: 'إرسال التشخيصات إلى Nous',
     privacyNotice:
@@ -116,7 +118,6 @@ export const ar = defineLocale({
       cloudDownCheckPortal: 'التحقق من حالة البوابة',
       cloudDownDiscord: 'الحصول على مساعدة عبر Discord',
       openLogs: 'فتح السجلات',
-      openLogsFailed: 'تعذّر فتح مجلد السجلات',
       repairHint: 'يعيد الإصلاح تشغيل المثبت وقد يستغرق بضع دقائق على جهاز جديد.',
       remoteSignInHint: signInLabel =>
         `يسجّل الخروج من جلسة المتصفح البعيدة المحفوظة، ثم يفتح ${signInLabel}. استخدم البوابة المحلية للتبديل إلى الخلفية المضمنة.`,
@@ -792,7 +793,6 @@ export const ar = defineLocale({
       diagnostics: 'التشخيصات',
       diagnosticsDesc: 'اعرض desktop.log في مدير الملفات، وهذا مفيد عند فشل تشغيل البوابة.',
       openLogs: 'فتح السجلات',
-      openLogsFailed: 'تعذّر فتح مجلد السجلات',
       incompleteTitle: 'إعداد البوابة البعيدة غير مكتمل',
       incompleteSignIn: 'أدخل رابط البوابة البعيدة وسجل الدخول قبل التبديل إلى البعيد.',
       incompleteToken: 'أدخل رابط البوابة البعيدة ورمز الجلسة قبل التبديل إلى البعيد.',
@@ -1818,10 +1818,6 @@ export const ar = defineLocale({
       openInNewTab: 'فتح في تبويب جديد',
       openInSplit: 'فتح في تقسيم',
       ownedByProfile: profile => `مملوكة للملف الشخصي ${profile}`,
-      providerConfigured: family => `النموذج المُهيأ: ${family}`,
-      providerVia: family => `عبر ${family}`,
-      providerConfiguredVia: (configuredFamily, servedFamily) =>
-        `النموذج المُهيأ: ${configuredFamily}، ويُخدَم حاليًا عبر ${servedFamily}`,
       untitledChat: id => `محادثة ${id}`,
       handoffOrigin: platform => `قادمة من ${platform}`,
       renamed: 'تمت إعادة التسمية',
@@ -2863,8 +2859,7 @@ export const ar = defineLocale({
     boundaryTitle: 'تعطل جزء من الواجهة',
     boundaryDesc: 'يمكنك إعادة تحميل النافذة أو فتح السجلات لمعرفة التفاصيل.',
     reloadWindow: 'إعادة تحميل النافذة',
-    openLogs: 'فتح السجلات',
-    openLogsFailed: 'تعذّر فتح مجلد السجلات'
+    openLogs: 'فتح السجلات'
   },
   tips: {
     close: 'لا تعرض هذه النصيحة مرة أخرى',

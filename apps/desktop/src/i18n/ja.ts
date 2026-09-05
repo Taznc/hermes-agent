@@ -1,8 +1,10 @@
 import { defineFieldCopy } from '@/app/settings/field-copy'
 
-import { defineLocale } from './define-locale'
+import { forkJa } from './fork/ja'
+import { defineForkLocale } from './fork/merge'
 
-export const ja = defineLocale({
+// >>> FORK ANCHOR: i18n-ja <<<
+export const ja = defineForkLocale(forkJa, {
   common: {
     apply: '適用',
     back: '戻る',
@@ -99,7 +101,6 @@ export const ja = defineLocale({
       gatewaySettings: 'ゲートウェイ設定',
       back: '戻る',
       openLogs: 'ログを開く',
-      openLogsFailed: 'ログフォルダを開けませんでした',
       repairHint: '修復はインストーラーを再実行します。新しいマシンでは数分かかる場合があります。',
       remoteSignInHint: signInLabel =>
         `保存済みのリモートブラウザセッションからサインアウトし、${signInLabel}を開きます。代わりにバンドルされたバックエンドに切り替えるには「ローカルゲートウェイを使用」を選択してください。`,
@@ -864,7 +865,6 @@ export const ja = defineLocale({
       diagnostics: '診断',
       diagnosticsDesc: 'ファイルマネージャーで desktop.log を表示します。ゲートウェイの起動に失敗した際に役立ちます。',
       openLogs: 'ログを開く',
-      openLogsFailed: 'ログフォルダを開けませんでした',
       incompleteTitle: 'リモートゲートウェイの設定が不完全です',
       incompleteSignIn: 'リモートに切り替える前にリモート URL を入力してサインインしてください。',
       incompleteToken: 'リモートに切り替える前にリモート URL とセッショントークンを入力してください。',
@@ -2121,10 +2121,6 @@ export const ja = defineLocale({
       draftSession: '下書き — 未送信',
       handoffOrigin: platform => `${platform} から引き継ぎ`,
       ownedByProfile: profile => `プロファイル: ${profile}`,
-      providerConfigured: family => `設定済みモデル: ${family}`,
-      providerVia: family => `${family} 経由`,
-      providerConfiguredVia: (configuredFamily, servedFamily) =>
-        `設定済みモデル: ${configuredFamily}（現在は ${servedFamily} 経由で応答中）`,
       renamed: '名前を変更しました',
       renameFailed: '名前の変更に失敗しました',
       renameTitle: 'セッションの名前を変更',
@@ -3307,8 +3303,7 @@ export const ja = defineLocale({
     boundaryTitle: 'インターフェイスで問題が発生しました',
     boundaryDesc: 'ビューで予期しないエラーが発生しました。チャットと設定は安全です。',
     reloadWindow: 'ウィンドウを再読み込み',
-    openLogs: 'ログを開く',
-    openLogsFailed: 'ログフォルダを開けませんでした'
+    openLogs: 'ログを開く'
   },
 
   ui: {

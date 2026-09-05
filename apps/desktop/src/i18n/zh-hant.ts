@@ -1,8 +1,10 @@
 import { defineFieldCopy } from '@/app/settings/field-copy'
 
-import { defineLocale } from './define-locale'
+import { defineForkLocale } from './fork/merge'
+import { forkZhHant } from './fork/zh-hant'
 
-export const zhHant = defineLocale({
+// >>> FORK ANCHOR: i18n-zh-hant <<<
+export const zhHant = defineForkLocale(forkZhHant, {
   common: {
     apply: '套用',
     back: '返回',
@@ -97,7 +99,6 @@ export const zhHant = defineLocale({
       gatewaySettings: '閘道設定',
       back: '返回',
       openLogs: '開啟記錄',
-      openLogsFailed: '無法開啟日誌資料夾',
       repairHint: '修復會重新執行安裝程式，在新機器上可能需要幾分鐘。',
       remoteSignInHint: signInLabel =>
         `先登出已儲存的遠端瀏覽器工作階段，然後開啟${signInLabel}。使用本機閘道可切換至內建後端。`,
@@ -835,7 +836,6 @@ export const zhHant = defineLocale({
       diagnostics: '診斷',
       diagnosticsDesc: '在檔案管理員中顯示 desktop.log，閘道啟動失敗時很有用。',
       openLogs: '開啟記錄',
-      openLogsFailed: '無法開啟日誌資料夾',
       incompleteTitle: '遠端閘道設定不完整',
       incompleteSignIn: '切換至遠端前，請輸入遠端 URL 並完成登入。',
       incompleteToken: '切換至遠端前，請輸入遠端 URL 和工作階段 Token。',
@@ -2042,10 +2042,6 @@ export const zhHant = defineLocale({
       draftSession: '草稿 — 尚未傳送',
       handoffOrigin: platform => `從 ${platform} 轉接`,
       ownedByProfile: profile => `設定檔：${profile}`,
-      providerConfigured: family => `設定的模型：${family}`,
-      providerVia: family => `經由 ${family}`,
-      providerConfiguredVia: (configuredFamily, servedFamily) =>
-        `設定的模型：${configuredFamily}，目前經由 ${servedFamily} 提供服務`,
       renamed: '已重新命名',
       renameFailed: '重新命名失敗',
       renameTitle: '重新命名工作階段',
@@ -3121,8 +3117,7 @@ export const zhHant = defineLocale({
     boundaryTitle: '介面出現問題',
     boundaryDesc: '此檢視遇到意外錯誤。您的聊天和設定是安全的。',
     reloadWindow: '重新載入視窗',
-    openLogs: '開啟記錄',
-    openLogsFailed: '無法開啟日誌資料夾'
+    openLogs: '開啟記錄'
   },
 
   tips: {

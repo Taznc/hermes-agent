@@ -3,6 +3,7 @@ import type { TranslucencyState } from '@hermes/shared/translucency'
 
 import type { PoolLimits } from '../electron/pool-limits'
 
+import type { ForkDesktopApi, ForkSecretStorageEncryptionResult } from './fork/desktop-api'
 import type { WakeIndicatorState } from './lib/wake-indicator'
 import type {
   PetOverlayBounds,
@@ -16,7 +17,8 @@ export {}
 
 declare global {
   interface Window {
-    hermesDesktop: {
+    // >>> FORK ANCHOR: desktop-bridge-types <<<
+    hermesDesktop: ForkDesktopApi & {
       // Resolve a backend connection. Omit `profile` (or pass the primary) for
       // the window's backend; pass a named profile to lazily spawn/reuse that
       // profile's backend from the pool.
@@ -168,16 +170,9 @@ declare global {
       testConnectionConfig: (payload: DesktopConnectionConfigInput) => Promise<DesktopConnectionTestResult>
       // Opt-in OS-keychain encryption for stored gateway secrets (default
       // off). `get` never touches the OS keychain; `set` re-encodes stored
-      // secrets and can throw when the keychain is unusable. Both return the
-      // honest `secretStorageState` alongside the gated `on` flag so the
-      // renderer can update its hint immediately after a toggle instead of
-      // waiting for the next getConnectionConfig() hydration (which could
-      // otherwise show a stale hint for an enable that just succeeded, or a
-      // stale absence of the hint for a disable that just took effect).
-      getSecretStorageEncryption: () => Promise<{ on: boolean; secretStorageState?: DesktopSecretStorageState }>
-      setSecretStorageEncryption: (
-        on: boolean
-      ) => Promise<{ on: boolean; secretStorageState?: DesktopSecretStorageState }>
+      // secrets and can throw when the keychain is unusable.
+      getSecretStorageEncryption: () => Promise<ForkSecretStorageEncryptionResult>
+      setSecretStorageEncryption: (on: boolean) => Promise<ForkSecretStorageEncryptionResult>
       // v2 multi-connection registry: named agent sources, all persisted
       // together (local + any number of remote/cloud/ssh instances).
       connections: {
@@ -252,20 +247,6 @@ declare global {
       readFileDataUrl: (filePath: string) => Promise<string>
       /** Remote non-image attach: higher dedicated cap than preview/Settings default. */
       readFileDataUrlForAttach?: (filePath: string) => Promise<string>
-      /**
-       * Chunked non-image attach read: bounds main's transient memory and the
-       * per-call IPC payload to a fixed slice (ATTACHMENT_CHUNK_BYTES in
-       * electron/hardening.ts) regardless of file size, unlike
-       * readFileDataUrlForAttach's whole-file-in-memory read. Callers drive
-       * repeated calls at increasing `offset` and concatenate the returned
-       * base64 until `bytesRead < totalBytes` accounts for every byte. Absent
-       * on older shells — readFileDataUrlForAttach/readFileDataUrl remain the
-       * fallback ladder.
-       */
-      readFileChunkForAttach?: (
-        filePath: string,
-        offset: number
-      ) => Promise<{ base64: string; bytesRead: number; mimeType: string; totalBytes: number }>
       /** Settings → Chat: max size for local files loaded as data URLs (attach/preview). */
       dataUrlReadMax?: {
         get: () => Promise<{ defaultMaxMb: number; maxBytes: number; maxMb: number }>
@@ -544,23 +525,6 @@ declare global {
       cancelBootstrap: () => Promise<{ ok: boolean; cancelled: boolean }>
       onBootstrapEvent: (callback: (payload: DesktopBootstrapEvent) => void) => () => void
       getVersion: () => Promise<DesktopVersionInfo>
-      /** Dev-only: whether the built main-process bundle is newer than the
-       *  running one. `supported` is false in a packaged build. */
-      getDevMainBundleStale: () => Promise<{ stale: boolean; supported: boolean }>
-      restartForDevBundle: () => Promise<{ ok: boolean; reason?: string }>
-      onDevMainBundleStale: (callback: (payload: { stale: boolean }) => void) => () => void
-      /** Dev-only: whether backend Python source (agent/ tui_gateway/ tools/
-       *  hermes_cli/) the running `hermes serve` child already imported has
-       *  changed on disk. `supported` is false in a packaged build and when
-       *  the primary backend is remote (Phase 2.9). */
-      getDevBackendStale: () => Promise<{
-        state: 'fresh' | 'stale' | 'restarting' | 'failed'
-        supported: boolean
-      }>
-      restartDevBackend: () => Promise<{ ok: boolean; reason?: string }>
-      onDevBackendStale: (
-        callback: (payload: { state: 'fresh' | 'stale' | 'restarting' | 'failed' }) => void
-      ) => () => void
       /** Restart the app in place — loads the swapped bundle when bundleSwapPending. */
       relaunchApp?: () => Promise<void>
       getRemoteDisplayReason?: () => Promise<string | null>
@@ -643,12 +607,6 @@ export interface DesktopVersionInfo {
   bundleOutOfSync?: boolean
   /** Commits under apps/desktop/ the running bundle is missing (null unknown). */
   bundleCommitsBehind?: null | number
-  /** Build provenance from install-stamp.json; null on builds without a stamp. */
-  buildBranch?: null | string
-  buildCommit?: null | string
-  buildAt?: null | string
-  buildDirty?: boolean | null
-  buildSource?: null | string
   /** True when the bundle on disk is newer than the running process — a plain
    *  app restart (no rebuild, no installer) is enough to load it. */
   bundleSwapPending?: boolean
@@ -858,14 +816,6 @@ export interface DesktopActiveProfile {
   profile: string | null
 }
 
-// Honest, renderer-facing OS-keychain state for stored desktop secrets. See
-// the `secretStorageState` fields on DesktopConnectionConfig and
-// DesktopConnectionsRegistry for the exact semantics.
-export interface DesktopSecretStorageState {
-  available: boolean
-  policyOn: boolean
-}
-
 export interface DesktopConnectionConfig {
   envOverride: boolean
   // The saved connection mode. 'cloud' is a Hermes Cloud connection: it carries
@@ -888,16 +838,6 @@ export interface DesktopConnectionConfig {
   // only to gate the plain-text CONFIRM dialog, not to describe reality. Read
   // `secretStorageState` for the honest answer.
   secureTokenStorage: boolean
-  // The honest counterpart to `secureTokenStorage`: whether a secret saved
-  // right now would actually be OS-keychain encrypted. `policyOn` is the
-  // user's opt-in choice (Settings → "Encrypt saved secrets with the OS
-  // keychain"); `available` is only meaningful when `policyOn` is true and
-  // tells you whether the keychain itself is currently usable. Drives a
-  // one-time, non-blocking "stored without OS keychain encryption" hint —
-  // never a blocking assertion of security. Optional so a rolling app update
-  // (older Electron main, pre-release build, or a hand-crafted test fixture)
-  // that hasn't started sending it degrades to no hint rather than a crash.
-  secretStorageState?: DesktopSecretStorageState
   // Whether the currently-persisted remote token is stored with encoding
   // 'plain' (i.e. plain text on disk in connection.json), which happens when
   // the user opted in on a machine without secure storage.
@@ -1008,10 +948,6 @@ export interface DesktopConnectionsRegistry {
   // reads `true` whenever keychain encryption is opted OUT (the default); read
   // `secretStorageState` for the honest answer (see DesktopConnectionConfig).
   secureTokenStorage: boolean
-  // The honest { available, policyOn } state — see DesktopConnectionConfig's
-  // `secretStorageState` for the exact semantics. Optional for the same
-  // rolling-update / fixture-compatibility reason as there.
-  secretStorageState?: DesktopSecretStorageState
   connections: DesktopRegistryConnection[]
 }
 
