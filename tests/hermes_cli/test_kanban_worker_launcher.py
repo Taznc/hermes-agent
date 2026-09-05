@@ -3,13 +3,26 @@
 Covers the hermes-workers.slice spec (docs/rfcs/hermes-workers-slice-spec.md,
 t_cb47a946) test plan items reachable without a real systemd user session:
 fake-launcher argv construction, the strictly-optional default-``[]``
-regression pin, ``worker_unit`` persistence, the ``_classify_worker_exit``
-scope-status fallback for a worker this dispatcher process never reaped, the
-gateway-restart re-adoption host-prefix (not full-claimer) contract, and the
-termination-path routing (unit-stop vs. bare-PID kill). A systemd-gated
+regression pin, ``worker_unit`` persistence (always carrying the explicit
+``.scope`` suffix), the launcher applying even when
+``_restart_safe_worker_argv`` already rewrapped the argv, the
+``systemd-run --user`` reachability probe (fail closed on an unreachable
+bus), the gateway-restart re-adoption host-prefix (not full-claimer)
+contract, and the termination-path routing (unit-stop vs. bare-PID kill,
+with the "not loaded" + still-alive corroboration). A systemd-gated
 integration test exercising a real ``systemd-run --user --scope`` lives in
-``tests/tools/test_process_registry.py`` / the systemd-only lane described in
-the spec and is skipped when ``systemd-run`` is unavailable.
+``test_kanban_worker_launcher_systemd_live.py``.
+
+``_scope_exit_status()`` (a prior attempt at classifying a ``--scope``
+unit's exit via ``systemctl --user show -p ExecMain*``) was removed: those
+properties are never populated for a ``--scope`` unit (systemd adopts,
+never forks, the target process into it) and were proven ``None`` on live
+systemd 255 for both scopes and services. ``--scope`` is a transparent
+exec, so in the common case the worker remains a real, direct,
+waitpid-able child and the existing ``_classify_worker_exit`` path already
+classifies it with full fidelity; the narrow case where it genuinely isn't
+this process's child anymore intentionally resolves to ``"unknown"``
+rather than a fabricated verdict.
 """
 
 from __future__ import annotations
@@ -127,12 +140,15 @@ def test_worker_launcher_prefix_wraps_argv_and_appends_unit_and_separator(worker
     cmd = captured["cmd"]
     assert cmd[:2] == ["fake-launcher", "--scope"]
     unit_index = next(i for i, part in enumerate(cmd) if part.startswith("--unit="))
-    assert cmd[unit_index] == "--unit=kanban-t_launcher-run-7"
+    # The unit id always carries the explicit .scope suffix (B2): every
+    # subsequent systemctl --user query/stop must use this exact string, or
+    # it silently resolves to a same-named .service unit that never existed.
+    assert cmd[unit_index] == "--unit=kanban-t_launcher-run-7.scope"
     separator = cmd.index("--")
     assert separator > unit_index
     assert cmd[separator + 1 : separator + 4] == ["hermes", "-p", "coder"]
     # The Task object is mutated so the caller can persist worker_unit.
-    assert task.worker_unit == "kanban-t_launcher-run-7"
+    assert task.worker_unit == "kanban-t_launcher-run-7.scope"
 
 
 def test_worker_launcher_missing_binary_falls_back_to_plain_popen(worker_setup, monkeypatch):
@@ -185,7 +201,7 @@ def test_worker_unit_persisted_only_when_launcher_produces_unit(worker_setup, mo
 
         row = conn.execute("SELECT worker_pid, worker_unit FROM tasks WHERE id = ?", (task_id,)).fetchone()
         assert row["worker_pid"] == 7777
-        assert row["worker_unit"] == f"kanban-{task_id}-run-{claimed.current_run_id}"
+        assert row["worker_unit"] == f"kanban-{task_id}-run-{claimed.current_run_id}.scope"
     finally:
         conn.close()
 
@@ -205,75 +221,135 @@ def test_worker_unit_absent_for_default_spawn(tmp_path):
 
 
 # --------------------------------------------------------------------------
-# _classify_worker_exit scope-status fallback for a cold/never-reaped pid.
+# B4: the launcher must apply AFTER _restart_safe_worker_argv has already
+# rewrapped the argv, not gated on `cmd is base_cmd` identity with the
+# pre-rewrap argv (that gate made the launcher unreachable in exactly the
+# supervised-systemd-gateway topology it targets).
 # --------------------------------------------------------------------------
 
 
-def test_classify_worker_exit_falls_back_to_scope_status_when_unit_set(monkeypatch):
-    """A pid never reaped by THIS process (e.g. after a gateway restart) with a
-    ``worker_unit`` on the task row must consult ``_scope_exit_status``
-    instead of returning ``unknown``."""
-    monkeypatch.setattr(
-        kbd, "_scope_exit_status", lambda unit: ("nonzero_exit", 3) if unit == "kanban-t1-run-1" else None,
-    )
-    kind, code = kbd._classify_worker_exit(999999, "kanban-t1-run-1")
-    assert (kind, code) == ("nonzero_exit", 3)
+def test_worker_launcher_applies_even_when_restart_safe_argv_already_rewrapped(worker_setup, monkeypatch):
+    root, workspace, task = worker_setup
+    _set_worker_launcher(root, ["fake-launcher"])
+    monkeypatch.setattr("shutil.which", lambda name: "/usr/bin/fake-launcher" if name == "fake-launcher" else None)
+
+    # Simulate the supervised-gateway topology: _restart_safe_worker_argv
+    # returns a DIFFERENT list object (as it does when it really rewraps).
+    def fake_restart_safe(_task, command):
+        return ["restart-safe-wrapper", "--", *command]
+
+    monkeypatch.setattr(kbd, "_restart_safe_worker_argv", fake_restart_safe)
+
+    captured = {}
+
+    class FakeProc:
+        pid = 9999
+
+    def fake_popen(cmd, **kwargs):
+        captured["cmd"] = list(cmd)
+        return FakeProc()
+
+    monkeypatch.setattr(subprocess, "Popen", fake_popen)
+
+    pid = kbd._default_spawn(task, str(workspace))
+
+    assert pid == 9999
+    cmd = captured["cmd"]
+    # The launcher prefix must be present even though _restart_safe_worker_argv
+    # already produced a new (non-identity) argv — restart-safe wrapping
+    # first, launcher wrapping second, applied to ITS output.
+    assert cmd[0] == "fake-launcher"
+    assert "restart-safe-wrapper" in cmd
+    assert cmd.index("fake-launcher") < cmd.index("restart-safe-wrapper")
+    assert task.worker_unit == "kanban-t_launcher-run-7.scope"
 
 
-def test_classify_worker_exit_stays_unknown_without_worker_unit(monkeypatch):
-    """Regression pin: the no-launcher default keeps existing ``"unknown"``
-    behavior byte-for-byte — no worker_unit means no scope-status consult."""
-    called = []
-    monkeypatch.setattr(kbd, "_scope_exit_status", lambda unit: called.append(unit) or ("clean_exit", 0))
-    kind, code = kbd._classify_worker_exit(999999, None)
+# --------------------------------------------------------------------------
+# B3: systemd-run --user launcher entries fail CLOSED against an
+# unreachable user D-Bus, not just shutil.which() on the binary.
+# --------------------------------------------------------------------------
+
+
+def test_worker_launcher_systemd_run_user_fails_closed_without_reachable_bus(worker_setup, monkeypatch):
+    root, workspace, task = worker_setup
+    _set_worker_launcher(root, ["systemd-run", "--user", "--scope"])
+    monkeypatch.setattr("shutil.which", lambda name: "/usr/bin/systemd-run" if name == "systemd-run" else None)
+    monkeypatch.setattr(kbd, "_systemd_user_bus_reachable", lambda: False)
+
+    captured = {}
+
+    class FakeProc:
+        pid = 1111
+
+    def fake_popen(cmd, **kwargs):
+        captured["cmd"] = list(cmd)
+        return FakeProc()
+
+    monkeypatch.setattr(subprocess, "Popen", fake_popen)
+
+    pid = kbd._default_spawn(task, str(workspace))
+
+    assert pid == 1111
+    # Bus unreachable -> fails closed -> plain Popen, no launcher, no unit.
+    assert captured["cmd"][:3] == ["hermes", "-p", "coder"]
+    assert task.worker_unit is None
+
+
+def test_worker_launcher_systemd_run_user_applies_when_bus_reachable(worker_setup, monkeypatch):
+    root, workspace, task = worker_setup
+    _set_worker_launcher(root, ["systemd-run", "--user", "--scope"])
+    monkeypatch.setattr("shutil.which", lambda name: "/usr/bin/systemd-run" if name == "systemd-run" else None)
+    monkeypatch.setattr(kbd, "_systemd_user_bus_reachable", lambda: True)
+
+    captured = {}
+
+    class FakeProc:
+        pid = 2222
+
+    def fake_popen(cmd, **kwargs):
+        captured["cmd"] = list(cmd)
+        return FakeProc()
+
+    monkeypatch.setattr(subprocess, "Popen", fake_popen)
+
+    pid = kbd._default_spawn(task, str(workspace))
+
+    assert pid == 2222
+    assert captured["cmd"][:3] == ["systemd-run", "--user", "--scope"]
+    assert task.worker_unit == "kanban-t_launcher-run-7.scope"
+
+
+def test_systemd_user_bus_reachable_checks_socket_on_disk(monkeypatch, tmp_path):
+    fake_socket = tmp_path / "bus"
+    fake_socket.write_text("")
+    monkeypatch.setenv("XDG_RUNTIME_DIR", str(tmp_path))
+    monkeypatch.setenv("DBUS_SESSION_BUS_ADDRESS", f"unix:path={fake_socket}")
+
+    assert kbd._systemd_user_bus_reachable() is True
+
+    fake_socket.unlink()
+    assert kbd._systemd_user_bus_reachable() is False
+
+
+# --------------------------------------------------------------------------
+# _classify_worker_exit: no systemd fallback. A pid this process never
+# reaped resolves to "unknown" — the bounded case the sibling
+# infra-interruption classification (kanban.max_infra_interruptions) exists
+# to absorb, not a systemd-fabricated verdict.
+# --------------------------------------------------------------------------
+
+
+def test_classify_worker_exit_unknown_for_unreaped_pid():
+    kind, code = kbd._classify_worker_exit(999999)
     assert (kind, code) == ("unknown", None)
-    assert called == []
 
 
-def test_scope_exit_status_maps_systemctl_show_properties(monkeypatch):
-    monkeypatch.setattr(
-        "tools.process_registry.scope_unit_show_properties",
-        lambda unit: {"ActiveState": "inactive", "ExecMainCode": "exited", "ExecMainStatus": "0"},
-    )
-    assert kbd._scope_exit_status("kanban-t1-run-1") == ("clean_exit", 0)
-
-    monkeypatch.setattr(
-        "tools.process_registry.scope_unit_show_properties",
-        lambda unit: {
-            "ActiveState": "inactive", "ExecMainCode": "exited",
-            "ExecMainStatus": str(kb.KANBAN_RATE_LIMIT_EXIT_CODE),
-        },
-    )
-    assert kbd._scope_exit_status("kanban-t1-run-1") == ("rate_limited", kb.KANBAN_RATE_LIMIT_EXIT_CODE)
-
-    monkeypatch.setattr(
-        "tools.process_registry.scope_unit_show_properties",
-        lambda unit: {"ActiveState": "failed", "ExecMainCode": "killed", "ExecMainStatus": "9"},
-    )
-    assert kbd._scope_exit_status("kanban-t1-run-1") == ("signaled", 9)
-
-
-def test_scope_exit_status_none_while_still_running(monkeypatch):
-    monkeypatch.setattr(
-        "tools.process_registry.scope_unit_show_properties",
-        lambda unit: {"ActiveState": "active", "ExecMainCode": "", "ExecMainStatus": ""},
-    )
-    assert kbd._scope_exit_status("kanban-t1-run-1") is None
-
-
-def test_scope_exit_status_none_when_unit_gone(monkeypatch):
-    """``--collect`` self-cleans the unit shortly after exit; a query after
-    that window must return None gracefully, not raise."""
-    monkeypatch.setattr("tools.process_registry.scope_unit_show_properties", lambda unit: None)
-    assert kbd._scope_exit_status("kanban-t1-run-1") is None
-
-
-def test_reclaim_dead_workers_uses_worker_unit_fallback_for_cold_dispatcher(tmp_path, monkeypatch):
+def test_reclaim_cold_worker_unit_classifies_as_unknown_crash(tmp_path, monkeypatch):
     """End-to-end through ``_reclaim_dead_workers``: a task row carrying a
     ``worker_unit`` but with no ``_recent_worker_exits`` entry (simulating a
     cold/restarted dispatcher process that never reaped this pid itself)
-    must classify via the scope fallback, not fall into the generic
-    'unknown' -> 'crashed' path with no detail."""
+    classifies as the bounded ``"unknown"``/``crashed`` outcome — no
+    systemd-fabricated verdict is invented for it."""
     import hermes_cli.kanban_db_connect as kbc
 
     conn = kbc.connect(tmp_path / "kanban.db")
@@ -285,15 +361,11 @@ def test_reclaim_dead_workers_uses_worker_unit_fallback_for_cold_dispatcher(tmp_
         with kb.write_txn(conn):
             conn.execute(
                 "UPDATE tasks SET worker_pid = ?, worker_unit = ?, started_at = ? WHERE id = ?",
-                (fake_pid, "kanban-cold-run-1", 0, task_id),
+                (fake_pid, "kanban-cold-run-1.scope", 0, task_id),
             )
 
         monkeypatch.setattr(kb, "_pid_alive", lambda pid: False)
         monkeypatch.setattr(kb, "_resolve_crash_grace_seconds", lambda: 0)
-        monkeypatch.setattr(
-            kbd, "_scope_exit_status",
-            lambda unit: ("nonzero_exit", 3) if unit == "kanban-cold-run-1" else None,
-        )
 
         crashed = kbd.detect_crashed_workers(conn)
         assert task_id in crashed
@@ -301,8 +373,8 @@ def test_reclaim_dead_workers_uses_worker_unit_fallback_for_cold_dispatcher(tmp_
         events = kb.list_events(conn, task_id)
         crash_events = [e for e in events if e.kind == "crashed"]
         assert crash_events, "expected a crashed event"
-        assert crash_events[-1].payload.get("exit_kind") == "nonzero_exit"
-        assert crash_events[-1].payload.get("exit_code") == 3
+        # No exit_kind/exit_code stamped for an "unknown" classification.
+        assert "exit_kind" not in (crash_events[-1].payload or {})
     finally:
         conn.close()
 
@@ -368,14 +440,14 @@ def test_terminate_reclaimed_worker_uses_unit_stop_when_worker_unit_set(monkeypa
     monkeypatch.setattr(kb, "_pid_alive", lambda pid: False)
 
     info = kbd._terminate_reclaimed_worker(
-        4242, claim_lock, worker_unit="kanban-t1-run-1", stop_unit_fn=fake_stop_unit,
+        4242, claim_lock, worker_unit="kanban-t1-run-1.scope", stop_unit_fn=fake_stop_unit,
         signal_fn=lambda *a: calls["kill"].append(a),
     )
 
-    assert calls["stop_unit"] == ["kanban-t1-run-1"]
+    assert calls["stop_unit"] == ["kanban-t1-run-1.scope"]
     assert calls["kill"] == []  # bare-PID path must not fire when a unit is set
     assert info["terminated"] is True
-    assert info["worker_unit"] == "kanban-t1-run-1"
+    assert info["worker_unit"] == "kanban-t1-run-1.scope"
 
 
 def test_terminate_reclaimed_worker_uses_bare_kill_without_worker_unit(monkeypatch):
@@ -403,3 +475,27 @@ def test_terminate_reclaimed_worker_uses_bare_kill_without_worker_unit(monkeypat
     assert calls["kill"] and calls["kill"][0][0] == 4242
     assert info["terminated"] is True
     assert "worker_unit" not in info
+
+
+def test_terminate_reclaimed_worker_not_loaded_with_pid_alive_is_not_success(monkeypatch):
+    """B2 regression: ``_stop_systemd_unit`` returning True for a "not
+    loaded" unit (e.g. because the wrong unit id was queried, or the unit
+    was never actually created) must NOT be reported as a successful
+    termination when the worker PID is still alive — only the corroborated
+    pairing (stop reported success AND the PID is actually gone) counts."""
+    import socket
+
+    host = socket.gethostname() or "unknown"
+    claim_lock = f"{host}:123"
+
+    # _stop_systemd_unit says "stopped" (e.g. it read "not loaded" as success
+    # against a unit id that was never actually running), but the real
+    # worker PID is still alive — the corroborating check must catch this.
+    monkeypatch.setattr(kb, "_pid_alive", lambda pid: True)
+
+    info = kbd._terminate_reclaimed_worker(
+        4242, claim_lock, worker_unit="kanban-t1-run-1.scope", stop_unit_fn=lambda unit: True,
+    )
+
+    assert info["terminated"] is False
+    assert info["termination_attempted"] is True
