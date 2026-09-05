@@ -10,19 +10,20 @@ import path from 'node:path'
 import { app, ipcMain } from 'electron'
 import nodePty from 'node-pty'
 
-import { resolveTerminalConnection } from './connection-apply'
+import { resolveTerminalConnectionForSender } from './connection-apply'
 import { ensureSpawnHelperExecutable } from './spawn-helper-perms'
 import { SSH_BINARY_MISSING_MESSAGE } from './ssh-binary'
 import { buildInteractiveSshArgs } from './ssh-connection'
 import { createTerminalOutputBatcher } from './terminal-output-batcher'
+import { createTerminalOutputGate } from './terminal-output-gate'
 import { buildWindowsInteractiveCommand } from './windows-remote-lifecycle'
 
 export interface TerminalIpcDeps {
   isWindows: boolean
   findOnPath: (command: string) => null | string
   rememberLog: (line: string) => void
-  activeSshTerminalTarget: () => unknown
-  ensureBackend: () => Promise<unknown>
+  activeSshTerminalTarget: (webContentsId: number) => unknown
+  ensureBackend: (webContentsId: number) => Promise<unknown>
   getSshConnectionState: (scope: string) => undefined | { remotePlatform?: string }
   /** Shared System32 → PATH → Git-for-Windows ladder (see ssh-binary.ts). */
   resolveSshBinary: () => null | string
@@ -342,7 +343,8 @@ export function registerTerminalIpc({
     const cols = Math.max(2, Number.parseInt(String(payload?.cols || 80), 10) || 80)
     const rows = Math.max(2, Number.parseInt(String(payload?.rows || 24), 10) || 24)
 
-    const sshTarget = await resolveTerminalConnection(activeSshTerminalTarget, ensureBackend)
+    const sshTarget = await resolveTerminalConnectionForSender(event.sender.id, activeSshTerminalTarget, ensureBackend)
+
     const remote = Boolean(sshTarget)
     const remoteState = remote ? getSshConnectionState(sshTarget.scope) : null
 
@@ -377,9 +379,20 @@ export function registerTerminalIpc({
       event.sender.send(terminalChannel(id, suffix), payload)
     }
 
-    // Coalesce PTY output into batched sends and apply ack-based flow control
-    // (pause the pty past the high-water mark, resume once the renderer acks
-    // enough of the outstanding backlog) — see terminal-output-batcher.ts.
+    // Output pipeline: pty -> batcher -> gate -> renderer.
+    // The batcher coalesces PTY output into batched sends and applies ack-based
+    // flow control (pause the pty past the high-water mark, resume once the
+    // renderer acks enough of the outstanding backlog) — see
+    // terminal-output-batcher.ts. The gate holds everything (data AND exit)
+    // until the renderer has subscribed via hermes:terminal:attach, so output
+    // produced between `start` resolving and the listener being installed is
+    // never lost — see terminal-output-gate.ts.
+    const outputGate = createTerminalOutputGate({
+      onExitFlushed: () => forgetTerminalSession(id),
+      sendData: data => send('data', data),
+      sendExit: payload => send('exit', payload)
+    })
+
     const outputBatcher = createTerminalOutputBatcher({
       pause: () => {
         try {
@@ -395,11 +408,12 @@ export function registerTerminalIpc({
           // Process may already be gone.
         }
       },
-      send: data => send('data', data)
+      send: data => outputGate.data(data)
     })
 
     terminalSessions.set(id, {
       outputBatcher,
+      outputGate,
       pty: ptyProcess,
       webContentsId: event.sender.id,
       ...(remote ? { sshScope: sshTarget.scope, remoteCwd: String(payload?.cwd || '') } : {})
@@ -407,17 +421,30 @@ export function registerTerminalIpc({
 
     ptyProcess.onData(data => outputBatcher.push(data))
     ptyProcess.onExit(({ exitCode, signal }) => {
-      forgetTerminalSession(id)
       // Flush any output still buffered so it lands before the exit message —
       // without this a shell's final printf could be silently dropped or
-      // reordered after 'exit' reaches the renderer.
+      // reordered after 'exit' reaches the renderer. The gate then forgets the
+      // session once the exit has actually been delivered (which may be
+      // deferred until the renderer attaches).
       outputBatcher.flush()
       outputBatcher.dispose()
-      send('exit', { code: exitCode, signal: signal || null })
+      outputGate.exit({ code: exitCode, signal: signal == null ? null : String(signal) })
     })
     trackTerminalSessionForWebContents(event.sender.id, id, event.sender)
 
     return { cwd: remote ? null : cwd, id, shell: remote ? 'ssh' : name }
+  })
+
+  ipcMain.handle('hermes:terminal:attach', (event, id) => {
+    const sessionInfo = terminalSessions.get(String(id || ''))
+
+    if (!sessionInfo || sessionInfo.webContentsId !== event.sender.id) {
+      return false
+    }
+
+    sessionInfo.outputGate.attach()
+
+    return true
   })
 
   ipcMain.on('hermes:terminal:write', (_event, id, data) => {

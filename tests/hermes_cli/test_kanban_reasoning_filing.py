@@ -97,7 +97,8 @@ def test_create_with_model_and_reasoning_together(kanban_home):
 
 
 def _spawn_and_capture(monkeypatch, tmp_path, task):
-    monkeypatch.setattr(kb, "_resolve_hermes_argv", lambda: ["hermes"])
+    from hermes_cli import kanban_db_dispatch as kbd
+    monkeypatch.setattr(kbd, "_resolve_hermes_argv", lambda: ["hermes"])
     captured = {}
 
     class FakeProc:
@@ -110,7 +111,7 @@ def _spawn_and_capture(monkeypatch, tmp_path, task):
     monkeypatch.setattr(subprocess, "Popen", fake_popen)
     workspace = tmp_path / "ws"
     workspace.mkdir(exist_ok=True)
-    kb._default_spawn(task, str(workspace))
+    kbd._default_spawn(task, str(workspace))
     return captured["cmd"]
 
 

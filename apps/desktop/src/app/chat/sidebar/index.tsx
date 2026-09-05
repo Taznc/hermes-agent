@@ -36,9 +36,10 @@ import { $newChatProfile } from '@/store/profile'
 import { openProjectCreate } from '@/store/projects'
 import { openRouteTile } from '@/store/route-tiles'
 import { $sessions } from '@/store/session'
-import { $focusedStoredSessionId, type SplitDir } from '@/store/session-states'
+import { $focusedStoredSessionId } from '@/store/session-states'
 import { markSessionUnread } from '@/store/session-unread-remote'
 import { $sidebarShowSessionSections, $sidebarWorktreeGroupingActive } from '@/store/sidebar-model'
+import type { SessionInfo } from '@/types/hermes'
 
 import {
   type AppView,
@@ -50,6 +51,7 @@ import {
   SKILLS_ROUTE
 } from '../../routes'
 import type { SidebarNavItem } from '../../types'
+import { type NewSessionSplitHandler, startNewSessionDrag } from '../new-session-drag'
 
 import { SIDEBAR_SCROLL_Y } from './chrome'
 import { SidebarCronJobsSection } from './cron-jobs-section'
@@ -106,13 +108,18 @@ interface ChatSidebarProps extends React.ComponentProps<typeof Sidebar> {
   onNavigate: (item: SidebarNavItem) => void
   onLoadMoreSessions: () => Promise<void> | void
   onLoadMoreMessaging?: (platform: string) => Promise<void> | void
-  onResumeSession: (sessionId: string) => void
+  onResumeSession: (sessionId: string, session?: SessionInfo) => void
   onDeleteSession: (sessionId: string) => void
   onArchiveSession: (sessionId: string) => void
   onBranchSession: (sessionId: string) => void
   onNewSessionInWorkspace: (path: null | string) => void
-  /** Create a brand-new session and open it as a tile on `dir`. */
-  onNewSessionSplit: (dir: SplitDir) => void
+  /** Create a brand-new session and open it as a tile. `dir` is the dock edge
+   *  (or `center` to stack a tab); `anchor`/`before` optionally pin it to a
+   *  specific zone / tab-strip slot, and `cwd` pins it to a project's path —
+   *  used by the new-session drags (the "New session" row and the project "+"
+   *  buttons), which land a fresh session exactly where it's dropped. The
+   *  context-menu "Open in split" path passes just a `dir`. */
+  onNewSessionSplit: NewSessionSplitHandler
   onManageCronJob: (jobId: string) => void
   onTriggerCronJob: (jobId: string) => Promise<void>
 }
@@ -246,6 +253,8 @@ export function ChatSidebar({
         'border-(--sidebar-edge-border) bg-(--ui-sidebar-surface-background) opacity-100'
       )}
       collapsible="none"
+      data-tip-region=""
+      data-tour="sessions-sidebar"
     >
       <SidebarContent className="gap-0 overflow-hidden bg-transparent px-2.5">
         <SidebarGroup className="shrink-0 p-0 pb-2 pt-[calc(var(--titlebar-height)+0.375rem)]">
@@ -281,6 +290,9 @@ export function ChatSidebar({
                       !isInteractive &&
                         'cursor-default hover:border-transparent hover:bg-transparent hover:text-inherit'
                     )}
+                    // A tip anchored to the label points at the end of the
+                    // word; the row is what it's actually about.
+                    data-tip-region=""
                     onClick={() => {
                       // A plain new session lands in whatever profile the live
                       // gateway is on (= the active switcher context). null →
@@ -291,6 +303,25 @@ export function ChatSidebar({
                       }
 
                       onNavigate(item)
+                    }}
+                    onPointerDown={event => {
+                      // The "New session" row is a drag source too: drag it onto
+                      // a chat zone's tab strip / edge / center to create the
+                      // session exactly there (stack / split). The pointer drag
+                      // session owns the gesture — a sub-threshold release falls
+                      // through to the onClick above (ordinary new session), and
+                      // an engaged drag suppresses that click so it never
+                      // double-creates. The create callback sets $newChatProfile
+                      // itself (the suppressed click can't), so a dragged new
+                      // session lands in the same profile a click would.
+                      if (!isNewSession) {
+                        return
+                      }
+
+                      startNewSessionDrag(placement => {
+                        $newChatProfile.set(null)
+                        onNewSessionSplit(placement.dir, { anchor: placement.anchor, before: placement.before })
+                      }, event)
                     }}
                     tooltip={
                       item.keybindActionId
@@ -304,7 +335,18 @@ export function ChatSidebar({
                     type="button"
                   >
                     <item.icon className="size-4 shrink-0 text-[color-mix(in_srgb,currentColor_72%,transparent)]" />
-                    <span className="min-w-0 flex-1 truncate">{s.nav[item.id] ?? item.label}</span>
+                    {/* Shrink-to-fit, not flex-1: the label carries the row's
+                        `data-tour` handle, and anything anchored to it should
+                        land at the end of the WORD, not out at the sidebar's
+                        edge. Still truncates — `min-w-0` lets it shrink past
+                        its content when the rail is narrow — and the trailing
+                        chip's `ml-auto` was already doing the pushing that
+                        `flex-1` looked like it was for.
+                        Its own `sidebar-nav-` namespace: the overlay nav owns
+                        `nav-<id>`, and both are on screen with Settings open. */}
+                    <span className="min-w-0 truncate" data-tip-arrow-only="" data-tour={`sidebar-nav-${item.id}`}>
+                      {s.nav[item.id] ?? item.label}
+                    </span>
                     {isNewSession && (
                       <KbdGroup
                         className={cn('ml-auto opacity-55', newSessionKbdFlash && 'opacity-100!')}
@@ -394,6 +436,7 @@ export function ChatSidebar({
                   onDeleteSession={onDeleteSession}
                   onLoadMoreSessions={onLoadMoreSessions}
                   onNewSessionInWorkspace={onNewSessionInWorkspace}
+                  onNewSessionSplit={onNewSessionSplit}
                   onResumeSession={onResumeSession}
                   onToggleUnread={toggleUnread}
                 />

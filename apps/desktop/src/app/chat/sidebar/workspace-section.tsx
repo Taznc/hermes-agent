@@ -38,11 +38,11 @@ import { $sidebarFiltersActive } from '@/store/layout'
 import { $profileColors, $profileScope, normalizeProfileKey } from '@/store/profile'
 import {
   $activeProjectId,
+  $newProjectDropPlacement,
   $projects,
   $projectScope,
   $projectTree,
   $projectTreeLoading,
-  $removedSessionIds,
   $reposScanning,
   ALL_PROJECTS,
   enterProject,
@@ -65,6 +65,7 @@ import {
   markAllSessionsRead,
   setCurrentCwd
 } from '@/store/session'
+import { $removedSessionIds } from '@/store/session-removal'
 import { $workingSessionIds } from '@/store/session-states'
 import { ackAllSessionsRead } from '@/store/session-unread'
 import {
@@ -78,7 +79,9 @@ import {
 import { $sidebarSessionRankIds } from '@/store/sidebar-sort'
 import type { SessionInfo } from '@/types/hermes'
 
-import { SIDEBAR_COMPACT_FLAT, SIDEBAR_SCROLL_Y } from './chrome'
+import type { NewSessionSplitHandler } from '../new-session-drag'
+
+import { SIDEBAR_COMPACT_FLAT, SIDEBAR_SCROLL_Y, SidebarSectionAddButton } from './chrome'
 import { SidebarLoadMoreRow } from './load-more-row'
 import { orderByIds, reconcileOrderIds, resolveManualSessionOrderIds, sameIds } from './order'
 import {
@@ -88,6 +91,7 @@ import {
   ProjectBackRow,
   ProjectMenu,
   projectTreeCwd,
+  reconcileEnteredProjectSessions,
   type SidebarProjectTree,
   type SidebarSessionGroup,
   StartWorkButton,
@@ -103,11 +107,13 @@ const PROJECT_TREE_WARM_MS = 2_000
 
 interface SidebarWorkspaceSectionProps {
   activeSessionId: null | string
-  onResumeSession: (sessionId: string) => void
+  onResumeSession: (sessionId: string, session?: SessionInfo) => void
   onDeleteSession: (sessionId: string) => void
   onArchiveSession: (sessionId: string) => void
   onBranchSession: (sessionId: string) => void
   onNewSessionInWorkspace: (path: null | string) => void
+  /** See ChatSidebarProps.onNewSessionSplit — the new-session drag target. */
+  onNewSessionSplit: NewSessionSplitHandler
   onLoadMoreSessions: () => Promise<void> | void
   onToggleUnread: (sessionId: string) => void
 }
@@ -127,6 +133,7 @@ export function SidebarWorkspaceSection({
   onArchiveSession,
   onBranchSession,
   onNewSessionInWorkspace,
+  onNewSessionSplit,
   onLoadMoreSessions,
   onToggleUnread
 }: SidebarWorkspaceSectionProps) {
@@ -480,9 +487,22 @@ export function SidebarWorkspaceSection({
     [projectOverview, agentSessions, projects, removedSessionIds, sortOrderIds, listLimit]
   )
 
+  const enteredProjectOverlaySessions = useMemo(
+    () => reconcileEnteredProjectSessions(agentSessions, overviewEnteredProject?.previewSessions),
+    [agentSessions, overviewEnteredProject?.previewSessions]
+  )
+
+  // Overlay live `$sessions` onto the entered project so a just-created session
+  // (which the backend snapshot hasn't folded in yet) counts as content and
+  // renders immediately. Also carry over the overview's current preview rows:
+  // its project tree and the separately hydrated drill-in can resolve at
+  // different times, but a row visible in the overview must not disappear on
+  // entry. The backend seeds each project folder as an (empty) repo, so the
+  // overlay always has a lane to place a missing in-project session into.
   const enteredProjectContent = useMemo(
-    () => (enteredProject ? overlayLiveLanes(enteredProject, agentSessions, removedSessionIds) : undefined),
-    [enteredProject, agentSessions, removedSessionIds]
+    () =>
+      enteredProject ? overlayLiveLanes(enteredProject, enteredProjectOverlaySessions, removedSessionIds) : undefined,
+    [enteredProject, enteredProjectOverlaySessions, removedSessionIds]
   )
 
   const onEnterProject = useCallback(
@@ -730,26 +750,36 @@ export function SidebarWorkspaceSection({
               </div>
             ) : (
               <>
+                {/* The flat-list header "+" is a drag source too — the
+                    same gesture as the nav's "New session" row: drag
+                    it onto a chat zone's tab strip / edge / center to
+                    create the session exactly there. Project-overview
+                    mode drags its "+" (the "New project" button) with
+                    the project-drag variant: a drop opens the SAME
+                    project dialog, and the created project starts at
+                    the dropped spot. */}
                 {!showAllProfiles ? (
-                  <Tip label={worktreeGroupingActive ? s.projects.newButton : s.nav['new-session']}>
-                    <Button
-                      aria-label={worktreeGroupingActive ? s.projects.newButton : s.nav['new-session']}
-                      className="text-(--ui-text-tertiary) opacity-0 transition-opacity hover:bg-(--ui-control-hover-background) hover:text-foreground group-hover/section:opacity-100 focus-visible:opacity-100"
-                      onClick={event => {
-                        event.stopPropagation()
-
-                        if (worktreeGroupingActive) {
-                          openProjectCreate()
-                        } else {
-                          onNewSessionInWorkspace(null)
-                        }
-                      }}
-                      size="icon-xs"
-                      variant="ghost"
-                    >
-                      <Codicon name="add" size="0.75rem" />
-                    </Button>
-                  </Tip>
+                  <SidebarSectionAddButton
+                    ariaLabel={worktreeGroupingActive ? s.projects.newButton : s.nav['new-session']}
+                    onNewProjectDrag={
+                      worktreeGroupingActive
+                        ? {
+                            // Dragging the "New project" + arms WHERE the
+                            // project should start; the dialog flow consumes
+                            // it on create (see $newProjectDropPlacement).
+                            onArm: placement => $newProjectDropPlacement.set(placement)
+                          }
+                        : undefined
+                    }
+                    onNewSessionSplit={worktreeGroupingActive ? undefined : onNewSessionSplit}
+                    onPlainClick={() => {
+                      if (worktreeGroupingActive) {
+                        openProjectCreate()
+                      } else {
+                        onNewSessionInWorkspace(null)
+                      }
+                    }}
+                  />
                 ) : null}
               </>
             )}
@@ -763,13 +793,14 @@ export function SidebarWorkspaceSection({
             ) : undefined
           ) : undefined
         }
-        liveSessions={inProject ? agentSessions : undefined}
+        liveSessions={inProject ? enteredProjectOverlaySessions : undefined}
         manualOrderIds={agentOrderManual ? agentOrderIds : sortOrderIds}
         onArchiveSession={onArchiveSession}
         onBranchSession={onBranchSession}
         onDeleteSession={onDeleteSession}
         onEnterProject={onEnterProject}
         onNewSessionInWorkspace={onNewSessionInWorkspace}
+        onNewSessionSplit={onNewSessionSplit}
         onReorderProjects={showAllProfiles ? undefined : reorderProjects}
         onReorderSessions={showAllProfiles ? undefined : reorderSessions}
         onResumeSession={onResumeSession}

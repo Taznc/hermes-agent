@@ -14,6 +14,7 @@ export type GatewayEventName =
   | 'tool.progress'
   | 'tool.complete'
   | 'tool.generating'
+  | 'todo.updated'
   | 'clarify.request'
   | 'approval.request'
   | 'sudo.request'
@@ -224,8 +225,19 @@ export class JsonRpcGatewayClient {
 
       // Settle the in-flight dial BEFORE publishing 'closed': a state
       // subscriber may synchronously start a new dial, and settling after
-      // would abort that new generation instead of this one.
-      this.settleDial(new Error(this.options.closedErrorMessage))
+      // would abort that new generation instead of this one. A socket that
+      // never reached 'open' (abandoned mid-dial, e.g. an explicit close()
+      // on a still-connecting generation) failed to CONNECT, not a live
+      // connection going away — reject with connectErrorMessage so the
+      // caller's stale dial is distinguishable from a real teardown, and so
+      // it matches the message its own connect-timeout would have produced
+      // had the abandonment happened a moment later.
+      const dialStillPending = this.abortDial !== null
+      const closeError = new Error(
+        dialStillPending ? this.options.connectErrorMessage : this.options.closedErrorMessage
+      )
+
+      this.settleDial(closeError)
       this.socket = null
       this.stopHeartbeat()
       this.setState('closed')
@@ -326,15 +338,17 @@ export class JsonRpcGatewayClient {
 
           // Drop the half-open socket so the next connect() starts clean
           // instead of short-circuiting on a zombie 'connecting' state.
-          try {
-            socket.close()
-          } catch {
-            // ignore
+          if (this.socket === socket) {
+            try {
+              socket.close()
+            } catch {
+              // ignore
+            }
+
+            this.socket = null
+            this.setState('error')
           }
 
-          this.socket = null
-
-          this.setState('error')
           reject(new Error(this.options.connectErrorMessage))
         }, this.options.connectTimeoutMs)
       }

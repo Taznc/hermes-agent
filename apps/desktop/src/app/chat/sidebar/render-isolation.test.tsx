@@ -35,6 +35,9 @@ vi.mock('@/i18n', () => ({
           today: 'Today',
           yesterday: 'Yesterday'
         },
+        projects: {
+          toggle: (label: string, open: boolean) => `${open ? 'Hide' : 'Show'} ${label} sessions`
+        },
         statusDivider: { done: 'Done', working: 'Working' }
       }
     }
