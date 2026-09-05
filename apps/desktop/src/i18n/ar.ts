@@ -2797,6 +2797,8 @@ export const ar = defineLocale({
     deleteFailed: 'فشل الحذف',
     archived: 'تمت الأرشفة',
     archiveFailed: 'فشلت الأرشفة',
+    archivedUndoMessage: 'تمت أرشفة الجلسة',
+    undoArchiveFailed: 'فشل التراجع',
     cwdChangeFailed: 'فشل تغيير مجلد العمل',
     cwdStagedTitle: 'تم تجهيز مجلد العمل',
     cwdStagedMessage: 'سيطبق مجلد العمل على الرسالة التالية.',

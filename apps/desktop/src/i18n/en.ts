@@ -3439,6 +3439,7 @@ export const en: Translations = {
     archived: 'Archived',
     archiveFailed: 'Archive failed',
     archivedUndoMessage: 'Session archived',
+    undoArchiveFailed: 'Undo failed',
     cwdChangeFailed: 'Working directory change failed',
     cwdStagedTitle: 'Working directory staged',
     cwdStagedMessage: 'Restart the desktop backend to apply cwd changes to this active session.',

@@ -80,7 +80,7 @@ import {
   setBusy,
   setMessages
 } from '@/store/session'
-import { ARCHIVE_UNDO_WINDOW_MS, archiveSessionWithUndo, undoArchive } from '@/store/session-archive-undo'
+import { ARCHIVE_UNDO_WINDOW_MS, commitPendingArchive, undoArchive } from '@/store/session-archive-undo'
 import { requestForSessionProfile, type SessionOwnerScope } from '@/store/session-request-router'
 import { $focusedStoredSessionId, sessionTileOwnerRoute, storedSessionIdForRuntimeId } from '@/store/session-states'
 import { clearSessionTodos, setSessionTodos, todosForHydration } from '@/store/todos'
@@ -988,20 +988,23 @@ export function ContribWiring({ children }: { children: ReactNode }) {
     void archiveSession(sessionId)
   }, [archiveSession])
 
-  // Row-level one-click archive (#70ab279e): archives through the undo-aware
-  // state layer (instant, no confirmation) and surfaces a "Session archived —
-  // Undo" toast for the SAME 10s window the state layer opens. The toast is
-  // shown synchronously right after kicking off the archive — the state layer
-  // does its optimistic removal and starts its own undo-window timer
-  // synchronously too, before awaiting the backend PATCH — so the two windows
-  // stay in lockstep instead of the toast's clock starting late on a slow
-  // network. Toast id is keyed to the session id: archiving several sessions
-  // in quick succession stacks one toast per session (each up to the shared
-  // notification cap) rather than one toast clobbering another, and each
-  // toast's Undo button closes over its OWN session id, so it can never
-  // restore the wrong row. A failed archive drops the (now-meaningless) toast
-  // and reports the failure instead — the state layer has already rolled its
-  // optimistic removal back by the time the rejection reaches us.
+  // Row-level one-click archive (#70ab279e): archives through the ONE
+  // canonical `archiveSession` action (mutation fencing, unread cleanup,
+  // tile/runtime cleanup — see its doc comment) with `{ withUndo: true }`,
+  // which opens a 10s undo window in store/session-archive-undo.ts, and
+  // surfaces a "Session archived — Undo" toast for that same window. The
+  // toast is shown synchronously right after kicking off the archive — the
+  // undo bookkeeping records its window synchronously too, before the
+  // backend PATCH settles — so the two windows stay in lockstep instead of
+  // the toast's clock starting late on a slow network. Toast id is keyed to
+  // the session id: archiving several sessions in quick succession stacks
+  // one toast per session (each up to the shared notification cap, with an
+  // eviction handler that commits rather than orphans a still-live undo)
+  // rather than one toast clobbering another, and each toast's Undo button
+  // closes over its OWN session id, so it can never restore the wrong row. A
+  // failed archive drops the (now-meaningless) toast and reports the failure
+  // instead — the canonical action has already rolled its optimistic removal
+  // back by the time the rejection reaches us.
   const archiveSessionViaSidebar = useCallback(
     (storedSessionId: string) => {
       // Archiving the session currently on screen must also navigate away —
@@ -1015,17 +1018,31 @@ export function ContribWiring({ children }: { children: ReactNode }) {
       }
 
       const toastId = `archive-undo:${storedSessionId}`
-      const archived = archiveSessionWithUndo(storedSessionId)
+      // Routes through the ONE canonical archive action (mutation fencing,
+      // unread cleanup, tile/runtime cleanup — see its own doc comment) with
+      // `withUndo: true`, which additionally opens the 10s undo window this
+      // toast represents. Never a separate/forked archive path (#548d0d33,
+      // issue 2).
+      const archived = archiveSession(storedSessionId, { withUndo: true })
 
       notify({
         action: {
           label: t.common.undo,
-          onClick: () => void undoArchive(storedSessionId)
+          onClick: () =>
+            void undoArchive(storedSessionId).catch(err => {
+              notifyError(err, t.desktop.undoArchiveFailed)
+            })
         },
         durationMs: ARCHIVE_UNDO_WINDOW_MS,
         id: toastId,
         kind: 'success',
-        message: t.desktop.archivedUndoMessage
+        message: t.desktop.archivedUndoMessage,
+        // If the 4-item notification cap silently drops THIS toast (a 5th
+        // archive within the window — #548d0d33, issue 4), there is no
+        // longer any UI affordance for undoing it: commit the archive
+        // immediately instead of leaving its timer running behind a toast
+        // the user can no longer see or click.
+        onEvict: () => commitPendingArchive(storedSessionId)
       })
 
       void archived.catch(err => {
@@ -1033,7 +1050,7 @@ export function ContribWiring({ children }: { children: ReactNode }) {
         notifyError(err, t.desktop.archiveFailed)
       })
     },
-    [startFreshSessionDraft, t]
+    [archiveSession, startFreshSessionDraft, t]
   )
 
   // Single global listener for every rebindable hotkey plus the on-screen

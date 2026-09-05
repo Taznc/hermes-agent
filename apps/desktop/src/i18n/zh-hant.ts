@@ -2922,6 +2922,8 @@ export const zhHant = defineLocale({
     deleteFailed: '刪除失敗',
     archived: '已封存',
     archiveFailed: '封存失敗',
+    archivedUndoMessage: '工作階段已封存',
+    undoArchiveFailed: '復原失敗',
     cwdChangeFailed: '工作目錄變更失敗',
     cwdStagedTitle: '工作目錄已暫存',
     cwdStagedMessage: '重新啟動桌面後端後，工作目錄變更才會套用至此作用中工作階段。',

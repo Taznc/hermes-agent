@@ -2981,6 +2981,7 @@ export interface Translations {
     archived: string
     archiveFailed: string
     archivedUndoMessage: string
+    undoArchiveFailed: string
     cwdChangeFailed: string
     cwdStagedTitle: string
     cwdStagedMessage: string

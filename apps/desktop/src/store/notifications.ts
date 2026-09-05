@@ -25,6 +25,14 @@ export interface AppNotification {
   detail?: string
   action?: NotificationAction
   onDismiss?: () => void
+  /** Called when the 4-item stack cap silently drops this notification to make
+   *  room for a newer one (NOT called on a user dismiss — that's onDismiss).
+   *  Exists so a toast backing a live, still-running side effect (e.g. an
+   *  archive's undo window) can react to losing its only UI affordance —
+   *  typically by committing/cancelling that effect immediately rather than
+   *  leaving it running invisibly behind a toast the user can no longer see
+   *  or interact with. */
+  onEvict?: () => void
   createdAt: number
   placement?: NotificationPlacement
 }
@@ -40,6 +48,7 @@ export interface NotificationInput {
   detail?: string
   action?: NotificationAction
   onDismiss?: () => void
+  onEvict?: () => void
   durationMs?: number
   placement?: NotificationPlacement
 }
@@ -169,13 +178,29 @@ export function notify(input: NotificationInput): string {
     detail: input.detail,
     action: input.action,
     onDismiss: input.onDismiss,
+    onEvict: input.onEvict,
     createdAt: Date.now(),
     placement: input.placement ?? defaultPlacement(kind, input.action)
   }
 
   window.clearTimeout(timers.get(id))
   timers.delete(id)
-  $notifications.set([notification, ...$notifications.get().filter(item => item.id !== id)].slice(0, 4))
+
+  const merged = [notification, ...$notifications.get().filter(item => item.id !== id)]
+  const kept = merged.slice(0, 4)
+  const evicted = merged.slice(4)
+
+  $notifications.set(kept)
+
+  // The cap silently drops anything past the 4th — without this, a toast
+  // backing a live pending-undo timer (or any other running side effect)
+  // could vanish from the UI while its timer/effect keeps running invisibly,
+  // with no way for the user to act on it again (#548d0d33, blocking issue 4).
+  for (const item of evicted) {
+    window.clearTimeout(timers.get(item.id))
+    timers.delete(item.id)
+    item.onEvict?.()
+  }
 
   const duration = input.durationMs ?? defaultDuration(kind)
 

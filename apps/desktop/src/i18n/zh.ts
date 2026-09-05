@@ -3619,6 +3619,7 @@ export const zhAuthored: Translations = {
     archived: '已归档',
     archiveFailed: '归档失败',
     archivedUndoMessage: '会话已归档',
+    undoArchiveFailed: '撤销失败',
     cwdChangeFailed: '工作目录更改失败',
     cwdStagedTitle: '工作目录已暂存',
     cwdStagedMessage: '重启桌面后端后，工作目录更改才会应用到当前活跃会话。',

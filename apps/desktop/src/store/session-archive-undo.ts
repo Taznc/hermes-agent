@@ -4,35 +4,22 @@ import { setSessionArchived } from '@/hermes'
 import type { SessionInfo } from '@/types/hermes'
 
 import { $pinnedSessionIds } from './layout'
-import { tombstoneSessions, untombstoneSessions } from './projects'
-import {
-  $selectedStoredSessionId,
-  $sessions,
-  sessionMatchesStoredId,
-  sessionPinId,
-  setSelectedStoredSessionId,
-  setSessions
-} from './session'
+import { beginSessionMutation, endSessionMutation, tombstoneSessions, untombstoneSessions } from './projects'
+import { $sessions, sessionMatchesStoredId, sessionPinId, setSessions } from './session'
 
 // ---------------------------------------------------------------------------
-// Archive-with-undo state layer.
+// Archive-with-undo bookkeeping.
 //
-// The row-level archive icon (no confirmation dialog) needs to: archive
-// instantly, keep enough of the prior row around to put it back exactly
-// where it was, and let that reversal happen for a bounded window. This
-// module owns that bookkeeping. It reuses the SAME backend mutation every
-// other archive/unarchive path in the app already uses (`setSessionArchived`,
-// from api/sessions.ts) — there is only ever one way to flip the archived
-// flag, this just adds a client-side grace period on top of it.
-//
-// Scope: this is the STATE layer only. It manipulates the shared session
-// list (`$sessions`), the pin list, and the optimistic-eviction tombstone set
-// the same way the existing `archiveSession`/`unarchive` call sites do, so a
-// row archived through here behaves identically to one archived through the
-// tile context menu once the 10s window closes. It does not touch session
-// TILES (open split panes) — that cleanup is owned by the existing
-// `archiveSession` action in use-session-actions and is unrelated to whether
-// undo is offered, so this path intentionally leaves it alone.
+// This module owns ONLY the undo-window bookkeeping: which sessions have a
+// live 10s undo, where each one goes back on undo, and serializing a
+// session's undo write behind its own in-flight archive write. It does NOT
+// own archive semantics — those live in the ONE canonical `archiveSession`
+// action (app/session/hooks/use-session-actions/index.ts), which wraps
+// itself with `{ silent: true }` (as `archiveSessionWithUndo`) and calls
+// into `registerPendingArchiveUndo` below. Mutation fencing, unread cleanup,
+// tile closure, and runtime cleanup all still happen there exactly as they
+// do for every other archive path — this module never re-implements them
+// (previously it did, which is why review t_548d0d33 rejected the feature).
 // ---------------------------------------------------------------------------
 
 export const ARCHIVE_UNDO_WINDOW_MS = 10_000
@@ -42,20 +29,34 @@ export interface PendingArchiveUndo {
   storedSessionId: string
   /** Full row snapshot as it looked immediately before archiving. */
   session: SessionInfo
-  /** Index in `$sessions` the row lived at, for position-preserving restore. */
-  index: number
-  /** Whether the row was pinned at archive time. */
+  /** Durable (pin) id of the neighbor that should sit immediately BEFORE
+   *  this row once restored, or null when it was first / unknown. Recorded
+   *  instead of an absolute list index so two overlapping undo windows
+   *  restore in the correct RELATIVE order no matter which one is undone
+   *  first — an absolute index goes stale the moment a second archive
+   *  happens (review t_548d0d33, blocking issue 1). */
+  prevPinId: null | string
+  /** Durable (pin) id of the neighbor that should sit immediately AFTER
+   *  this row once restored, or null when it was last / unknown. Used when
+   *  `prevPinId` is not (yet) back in the list — e.g. undoing the earlier of
+   *  two concurrent archives while the later one is still pending. */
+  nextPinId: null | string
   wasPinned: boolean
   archivedAt: number
   expiresAt: number
 }
 
-/** Pending undo entries, keyed by the id passed to `archiveSessionWithUndo`.
- *  Observable so the UI (toast/snackbar) can render "N seconds left" or a
- *  stack of undoable archives without polling. */
+/** Pending undo entries, keyed by the id passed to `registerPendingArchiveUndo`.
+ *  Observable so the UI (toast/snackbar) can render a stack of undoable
+ *  archives without polling. */
 export const $pendingArchiveUndos = atom<Record<string, PendingArchiveUndo>>({})
 
 const timers = new Map<string, ReturnType<typeof setTimeout>>()
+// The archive PATCH for a session, tracked only while it may still be in
+// flight. `undoArchive` awaits this before issuing its own inverse PATCH so
+// the two writes can never apply out of order (review t_548d0d33, blocking
+// issue 3).
+const pendingWrites = new Map<string, Promise<unknown>>()
 
 function clearPendingTimer(storedSessionId: string): void {
   const timer = timers.get(storedSessionId)
@@ -66,8 +67,18 @@ function clearPendingTimer(storedSessionId: string): void {
   }
 }
 
-function dropPendingEntry(storedSessionId: string): void {
+/** Drops a pending entry (and its timer/write tracking) without touching
+ *  `$sessions`/pins — the archive itself already landed, so "committing" it
+ *  here just means forgetting the undo window, not another backend write.
+ *  Used by: the window's own timer on natural expiry, an archive that turned
+ *  out to have failed (nothing to undo), AND a notification-stack eviction
+ *  (`store/notifications.ts`'s 4-item cap), which must commit immediately
+ *  rather than leave an invisible undo timer running behind a toast the user
+ *  can no longer see (review t_548d0d33, blocking issue 4). Safe to call for
+ *  an id with no pending entry. */
+export function commitPendingArchive(storedSessionId: string): void {
   clearPendingTimer(storedSessionId)
+  pendingWrites.delete(storedSessionId)
   const current = $pendingArchiveUndos.get()
 
   if (!(storedSessionId in current)) {
@@ -101,47 +112,89 @@ function setPinned(storedSessionId: string, pinId: string, pinned: boolean): voi
   )
 }
 
+/** Where every row this module currently knows about sits — the live
+ *  `$sessions` list with any OTHER pending archive re-threaded back into its
+ *  own recorded position. Reconstructing in `archivedAt` order lets each
+ *  entry's neighbors resolve against an already-correct partial
+ *  reconstruction, so overlapping archives compose correctly no matter how
+ *  many are in flight at once. */
+function reconstructedOrder(): SessionInfo[] {
+  const pending = Object.values($pendingArchiveUndos.get()).sort((a, b) => a.archivedAt - b.archivedAt)
+  let order: SessionInfo[] = $sessions.get().slice()
+
+  for (const entry of pending) {
+    if (order.some(s => sessionMatchesStoredId(s, entry.storedSessionId))) {
+      continue
+    }
+
+    order = insertAt(order, resolveNeighborIndex(order, entry.prevPinId, entry.nextPinId), entry.session)
+  }
+
+  return order
+}
+
+/** Resolves an insertion index from recorded neighbor ids against a LIVE
+ *  list — tries the preceding neighbor first (insert right after it), then
+ *  the following neighbor (insert right before it), and falls back to the
+ *  end when neither is present (both already gone, e.g. deleted). */
+function resolveNeighborIndex(order: readonly SessionInfo[], prevPinId: null | string, nextPinId: null | string): number {
+  if (prevPinId) {
+    const idx = order.findIndex(s => sessionPinId(s) === prevPinId)
+
+    if (idx !== -1) {
+      return idx + 1
+    }
+  }
+
+  if (nextPinId) {
+    const idx = order.findIndex(s => sessionPinId(s) === nextPinId)
+
+    if (idx !== -1) {
+      return idx
+    }
+  }
+
+  return order.length
+}
+
+/** Captures `storedSessionId`'s neighbors from the full reconstructed order
+ *  (live sessions + any already-pending archives) — call this BEFORE the
+ *  optimistic removal, while the row is still present to locate. */
+export function captureArchiveNeighbors(storedSessionId: string): { nextPinId: null | string; prevPinId: null | string } {
+  const order = reconstructedOrder()
+  const idx = order.findIndex(s => sessionMatchesStoredId(s, storedSessionId))
+
+  if (idx === -1) {
+    return { nextPinId: null, prevPinId: null }
+  }
+
+  return {
+    nextPinId: idx < order.length - 1 ? sessionPinId(order[idx + 1]) : null,
+    prevPinId: idx > 0 ? sessionPinId(order[idx - 1]) : null
+  }
+}
+
 /** True while `storedSessionId` has a live undo window. Useful for the UI to
  *  decide whether to show an archive icon vs. an already-pending state. */
 export function isArchiveUndoPending(storedSessionId: string): boolean {
   return storedSessionId in $pendingArchiveUndos.get()
 }
 
-/** Archive a session immediately — no confirmation — and open a 10s window
- *  during which `undoArchive` can fully reverse it. Independent per session:
- *  archiving several sessions in quick succession gives each its own timer
- *  and pending entry, and undoing one never touches another's.
- *
- *  Resolves once the backend mutation lands. On rejection, the optimistic
- *  removal is rolled back and the pending entry is dropped (there is nothing
- *  to undo — the archive never actually happened), then the error is
- *  rethrown so the caller can surface it. */
-export async function archiveSessionWithUndo(storedSessionId: string): Promise<void> {
-  const sessions = $sessions.get()
-  const index = sessions.findIndex(session => sessionMatchesStoredId(session, storedSessionId))
-  const session = index === -1 ? undefined : sessions[index]
-
-  if (!session) {
-    return
-  }
-
-  const pinId = sessionPinId(session)
-  const wasPinned = $pinnedSessionIds.get().includes(storedSessionId) || $pinnedSessionIds.get().includes(pinId)
-  const archivedIds = [storedSessionId, session.id, session._lineage_root_id]
-  const wasSelected = $selectedStoredSessionId.get() === storedSessionId
-
-  // Instant, dialog-free removal from the active list.
-  setSessions(prev => prev.filter(s => !sessionMatchesStoredId(s, storedSessionId)))
-  tombstoneSessions(archivedIds)
-  setPinned(storedSessionId, pinId, false)
-
-  // Sane default for "archiving the open session": deselect rather than
-  // leave the primary view pointed at a row that just vanished from the
-  // list. We don't drive navigation from here (that's a UI/routing concern
-  // for the wiring layer) — just clear the stale selection.
-  if (wasSelected) {
-    setSelectedStoredSessionId(null)
-  }
+/** Opens a 10s undo window for a session the CALLER has already archived
+ *  through the canonical archive action — this never archives anything
+ *  itself. Call synchronously right after the optimistic removal (so a
+ *  second concurrent archive's `captureArchiveNeighbors` sees this one),
+ *  passing the in-flight archive write so `undoArchive` can serialize behind
+ *  it instead of racing it. */
+export function registerPendingArchiveUndo(params: {
+  nextPinId: null | string
+  prevPinId: null | string
+  session: SessionInfo
+  storedSessionId: string
+  wasPinned: boolean
+  writePromise: Promise<unknown>
+}): void {
+  const { nextPinId, prevPinId, session, storedSessionId, wasPinned, writePromise } = params
 
   clearPendingTimer(storedSessionId)
 
@@ -150,67 +203,76 @@ export async function archiveSessionWithUndo(storedSessionId: string): Promise<v
   const entry: PendingArchiveUndo = {
     archivedAt: now,
     expiresAt: now + ARCHIVE_UNDO_WINDOW_MS,
-    index,
+    nextPinId,
+    prevPinId,
     session,
     storedSessionId,
     wasPinned
   }
 
   $pendingArchiveUndos.set({ ...$pendingArchiveUndos.get(), [storedSessionId]: entry })
+  // Tracked only for undoArchive's serialization gate below — a rejection
+  // here must never surface as an unhandled rejection from this
+  // fire-and-forget tracking copy; the real rejection still propagates
+  // through the caller's own awaited promise.
+  pendingWrites.set(
+    storedSessionId,
+    writePromise.catch(() => undefined)
+  )
 
   timers.set(
     storedSessionId,
     setTimeout(() => {
       // Window closed: the archive is now permanent, just forget the entry.
       // No leaked timer — this callback is the timer's only job.
-      dropPendingEntry(storedSessionId)
+      commitPendingArchive(storedSessionId)
     }, ARCHIVE_UNDO_WINDOW_MS)
   )
-
-  try {
-    await setSessionArchived(storedSessionId, true, session.profile)
-  } catch (err) {
-    // The mutation never took — there is nothing pending to undo.
-    dropPendingEntry(storedSessionId)
-    untombstoneSessions(archivedIds)
-    setPinned(storedSessionId, pinId, wasPinned)
-
-    if (wasSelected) {
-      setSelectedStoredSessionId(storedSessionId)
-    }
-
-    setSessions(prev =>
-      prev.some(s => sessionMatchesStoredId(s, storedSessionId)) ? prev : insertAt(prev, index, session)
-    )
-
-    throw err
-  }
 }
 
-/** Undo an archive within its 10s window: restores the row to its recorded
- *  list position and pin state, and reverses the backend flag. Safe to call
- *  blind — a call after the window has expired, for an id that was never
- *  archived through this path, or a second call for one already undone, is
- *  a no-op (never throws, never double-restores). Two pending archives are
- *  independent: undoing one only ever reads/clears that id's own entry. */
+/** Drops a pending entry without restoring anything — used when the archive
+ *  it was tracking turned out to have failed (there is nothing to undo). */
+export function discardPendingArchiveUndo(storedSessionId: string): void {
+  commitPendingArchive(storedSessionId)
+}
+
+/** Undo an archive within its 10s window: restores the row to the position
+ *  implied by its recorded neighbors (order-independent — see
+ *  `PendingArchiveUndo.prevPinId`/`nextPinId`) and pin state, and reverses
+ *  the backend flag. Waits for the archive's own write to settle first, so
+ *  the two PATCHes can never apply out of order. Safe to call blind — a call
+ *  after the window has expired (checked against `expiresAt` at invocation
+ *  time, not just trusting timer-callback ordering), for an id that was
+ *  never archived through this path, or a second call for one already
+ *  undone, is a no-op (never throws, never double-restores). Two pending
+ *  archives are independent: undoing one only ever reads/clears that id's
+ *  own entry. */
 export async function undoArchive(storedSessionId: string): Promise<void> {
   const entry = $pendingArchiveUndos.get()[storedSessionId]
 
-  if (!entry) {
+  if (!entry || Date.now() > entry.expiresAt) {
     return
   }
 
   // Drop the entry (and its timer) up front so a second concurrent call —
   // or the timer firing while this await is in flight — sees nothing left
   // to act on.
-  dropPendingEntry(storedSessionId)
+  const write = pendingWrites.get(storedSessionId) ?? Promise.resolve()
+  commitPendingArchive(storedSessionId)
+
+  // Queue behind the archive PATCH: it may still be in flight, and undoing
+  // before it lands risks the server applying the two writes out of order.
+  await write
 
   const archivedIds = [entry.storedSessionId, entry.session.id, entry.session._lineage_root_id]
   const pinId = sessionPinId(entry.session)
 
+  beginSessionMutation(archivedIds)
   untombstoneSessions(archivedIds)
   setSessions(prev =>
-    prev.some(s => sessionMatchesStoredId(s, storedSessionId)) ? prev : insertAt(prev, entry.index, entry.session)
+    prev.some(s => sessionMatchesStoredId(s, storedSessionId))
+      ? prev
+      : insertAt(prev, resolveNeighborIndex(prev, entry.prevPinId, entry.nextPinId), entry.session)
   )
   setPinned(storedSessionId, pinId, entry.wasPinned)
 
@@ -223,6 +285,8 @@ export async function undoArchive(storedSessionId: string): Promise<void> {
     tombstoneSessions(archivedIds)
     setPinned(storedSessionId, pinId, false)
     throw err
+  } finally {
+    endSessionMutation(archivedIds)
   }
 }
 
@@ -236,5 +300,6 @@ export function resetArchiveUndos(): void {
   }
 
   timers.clear()
+  pendingWrites.clear()
   $pendingArchiveUndos.set({})
 }
