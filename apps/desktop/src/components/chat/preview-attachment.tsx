@@ -126,7 +126,17 @@ export function PreviewAttachment({ source = 'manual', target }: { source?: Prev
   }
 
   return (
-    <div className="flex w-full max-w-160 items-center gap-2 rounded-lg border border-(--ui-stroke-tertiary) bg-card/55 px-2.5 py-1.5 text-sm">
+    // A `<span>`, not a `<div>`: this component renders inside `<a>`/`<p>`
+    // markdown content (MarkdownLink in markdown-text.tsx, AssistantPreviewEmbeds
+    // in assistant-message.tsx, InlinePreviewDirective/InlineHtmlFrame in
+    // inline-preview-directive.tsx), and a `<div>` there is invalid HTML — the
+    // browser's parser closes the ancestor `<p>` early, which desyncs React's
+    // tree from the DOM and throws a hydration warning (#nesting-div-in-p).
+    // `flex` still gives it a block-level box (a flex container is block-level
+    // regardless of the tag), so the layout is byte-identical; only the tag
+    // changes. Same pattern MediaAttachment already uses below for its
+    // image/audio/video cards.
+    <span className="flex w-full max-w-160 items-center gap-2 rounded-lg border border-(--ui-stroke-tertiary) bg-card/55 px-2.5 py-1.5 text-sm">
       <span className="grid size-6 shrink-0 place-items-center rounded-md bg-muted/55 text-muted-foreground/85">
         <MonitorPlay className="size-3.5" />
       </span>
@@ -151,6 +161,6 @@ export function PreviewAttachment({ source = 'manual', target }: { source?: Prev
       >
         {opening ? t.preview.opening : isActive ? t.preview.hide : t.preview.openPreview}
       </button>
-    </div>
+    </span>
   )
 }
