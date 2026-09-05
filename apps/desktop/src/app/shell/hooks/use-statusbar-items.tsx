@@ -15,6 +15,7 @@ import { GlyphSpinner } from '@/components/ui/glyph-spinner'
 import { useI18n } from '@/i18n'
 import { displayPath, pathLeaf } from '@/lib/display-path'
 import { resolveForkBuildMarker } from '@/lib/fork-build-marker'
+import { statusBarGatewayHealth } from '@/lib/gateway-health-pill'
 import {
   Activity,
   AlertCircle,
@@ -28,7 +29,6 @@ import {
   Terminal,
   Zap
 } from '@/lib/icons'
-import { statusBarGatewayHealth } from '@/lib/gateway-health-pill'
 import { type RuntimeReadinessResult } from '@/lib/runtime-readiness'
 import { cacheHitLabel, contextBarLabel, LiveDuration, tokensPerSecondLabel, usageContextLabel } from '@/lib/statusbar'
 import { useStoreSelector } from '@/lib/use-session-slice'
@@ -305,6 +305,7 @@ export function useStatusbarItems({
 
   const gatewayOpen = gatewayState === 'open'
   const gatewayConnecting = gatewayState === 'connecting'
+
   const gatewayHealth = statusBarGatewayHealth({
     connectionState: gatewayState,
     copy: {
@@ -325,6 +326,7 @@ export function useStatusbarItems({
     platforms: statusSnapshot?.gateway_platforms,
     restarting: gatewayRestarting
   })
+
   const inferenceReady = gatewayOpen && inferenceStatus?.ready === true && !gatewayHealth.degraded
   const gatewayDegraded = gatewayOpen || gatewayConnecting || gatewayHealth.degraded
 
