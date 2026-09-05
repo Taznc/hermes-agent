@@ -40,6 +40,7 @@ class _DispatcherSettings:
     stale_timeout_seconds: int
     reconcile_orphans: bool
     default_assignee: Optional[str]
+    default_reviewer: Optional[str]
     max_in_progress_per_profile: Optional[int]
 
 
@@ -101,6 +102,17 @@ def _resolve_dispatcher_settings(kanban_cfg: dict, kb: Any) -> _DispatcherSettin
         logger.info("kanban dispatcher: default_assignee=%r (unassigned ready tasks "
                     "will route to this profile)", default_assignee)
 
+    # Profile that claims review-lane cards still assigned to their implementer.
+    # Empty (the schema default) keeps the legacy behavior — the review lane spawns
+    # whoever the card is already assigned to, even when that is the profile that
+    # just finished the implementation (a card that finds nothing left to do exits
+    # rc=0, scored as a protocol_violation, and parks after failure_limit).
+    default_reviewer = (kanban_cfg.get("default_reviewer") or "").strip() or None
+    if default_reviewer:
+        logger.info("kanban dispatcher: default_reviewer=%r (review cards still "
+                    "assigned to their implementer will route to this profile)",
+                    default_reviewer)
+
     return _DispatcherSettings(
         interval=interval,
         max_spawn=max_spawn,
@@ -111,6 +123,7 @@ def _resolve_dispatcher_settings(kanban_cfg: dict, kb: Any) -> _DispatcherSettin
         # reconciliation); false keeps orphans frozen for manual forensics.
         reconcile_orphans=bool(kanban_cfg.get("reconcile_orphans", True)),
         default_assignee=default_assignee,
+        default_reviewer=default_reviewer,
         # Per-profile concurrency cap: no single profile's local model / API
         # quota / browser pool gets overwhelmed by a fan-out.
         max_in_progress_per_profile=_positive_int_setting(kanban_cfg, "max_in_progress_per_profile"),

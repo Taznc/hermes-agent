@@ -58,7 +58,7 @@ def _cmd_tail(args: argparse.Namespace) -> int:
 
 
 def _cmd_dispatch(args: argparse.Namespace) -> int:
-    # Honour kanban.default_assignee, kanban.max_in_progress,
+    # Honour kanban.default_assignee, kanban.default_reviewer, kanban.max_in_progress,
     # kanban.max_in_progress_per_profile and kanban.max_spawn with the same
     # semantics as the gateway dispatch path.
     try:
@@ -66,6 +66,7 @@ def _cmd_dispatch(args: argparse.Namespace) -> int:
         _cfg = load_config()
         _kanban_cfg = _cfg.get("kanban", {}) if isinstance(_cfg, dict) else {}
         default_assignee = (_kanban_cfg.get("default_assignee") or "").strip() or None
+        default_reviewer = (_kanban_cfg.get("default_reviewer") or "").strip() or None
         max_in_progress_per_profile = kbd._positive_int(
             _kanban_cfg.get("max_in_progress_per_profile"), None
         )
@@ -79,7 +80,7 @@ def _cmd_dispatch(args: argparse.Namespace) -> int:
             cli_max if cli_max is not None else kbd._positive_int(_kanban_cfg.get("max_spawn"), None)
         )
     except Exception:
-        default_assignee = max_in_progress_per_profile = max_in_progress = None
+        default_assignee = default_reviewer = max_in_progress_per_profile = max_in_progress = None
         max_spawn = getattr(args, "max", None)
     with kbc.connect_closing() as conn:
         res = kbd.dispatch_once(
@@ -89,6 +90,7 @@ def _cmd_dispatch(args: argparse.Namespace) -> int:
             max_in_progress=max_in_progress,
             failure_limit=getattr(args, "failure_limit", kbd.DEFAULT_FAILURE_LIMIT),
             default_assignee=default_assignee,
+            default_reviewer=default_reviewer,
             max_in_progress_per_profile=max_in_progress_per_profile,
         )
     if getattr(args, "json", False):
@@ -105,6 +107,10 @@ def _cmd_dispatch(args: argparse.Namespace) -> int:
                 for (tid, who, current) in res.skipped_per_profile_capped
             ],
             "auto_assigned_default": res.auto_assigned_default,
+            "auto_assigned_reviewer": [
+                {"task_id": tid, "previous_assignee": prev, "reviewer": rev}
+                for (tid, prev, rev) in res.auto_assigned_reviewer
+            ],
         }, ascii=True)
         return 0
     print(f"Reclaimed:    {res.reclaimed}")
@@ -127,6 +133,13 @@ def _cmd_dispatch(args: argparse.Namespace) -> int:
         print(
             f"Auto-assigned to kanban.default_assignee={default_assignee!r}: "
             f"{', '.join(res.auto_assigned_default)}"
+        )
+    if res.auto_assigned_reviewer:
+        print(
+            f"Auto-assigned to kanban.default_reviewer={default_reviewer!r}: "
+            + ", ".join(
+                f"{tid} ({prev} -> {rev})" for (tid, prev, rev) in res.auto_assigned_reviewer
+            )
         )
     if res.skipped_unassigned:
         print(f"Skipped (unassigned): {', '.join(res.skipped_unassigned)}")
