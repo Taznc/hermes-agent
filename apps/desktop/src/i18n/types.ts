@@ -7,6 +7,8 @@
 
 import type { TipId } from '@/lib/tips/catalog'
 
+import type { ForkTranslations } from './fork/types'
+
 export type Locale = 'en' | 'zh' | 'zh-hant' | 'ja' | 'ar' | 'ru'
 
 export type ToolTitleKey =
@@ -50,7 +52,10 @@ interface AuxTaskCopy {
   hint: string
 }
 
-export interface Translations {
+// >>> FORK ANCHOR: i18n-types <<<
+export type Translations = ForkTranslations & UpstreamTranslations
+
+export interface UpstreamTranslations {
   common: {
     apply: string
     back: string
@@ -130,7 +135,6 @@ export interface Translations {
       desktopBootFailed: string
       gatewayConnectionLost: string
       gatewayConnectionLostDetail: string
-      gatewaySessionsStale: string
       gatewaySignInRequired: string
       ipcBridgeUnavailable: string
     }
@@ -139,16 +143,12 @@ export interface Translations {
       description: string
       remoteTitle: string
       remoteDescription: string
-      wsAuthTitle: string
-      wsAuthDescription: string
-      wsAuthHint: string
       retry: string
       repairInstall: string
       useLocalGateway: string
       gatewaySettings: string
       back: string
       openLogs: string
-      openLogsFailed: string
       repairHint: string
       remoteSignInHint: (signInLabel: string) => string
       signOutAndSignIn: string
@@ -795,17 +795,12 @@ export interface Translations {
       keychainEncryptionTitle: string
       keychainEncryptionDesc: string
       keychainEncryptionFailed: string
-      secretStorageHintTitle: string
-      secretStorageHintDesc: string
-      secretStorageHintEnable: string
-      secretStorageHintDismiss: string
       testRemote: string
       saveForRestart: string
       saveAndReconnect: string
       diagnostics: string
       diagnosticsDesc: string
       openLogs: string
-      openLogsFailed: string
       incompleteTitle: string
       incompleteSignIn: string
       incompleteToken: string
@@ -1141,10 +1136,6 @@ export interface Translations {
       deleteFailed: string
       updateDirFailed: string
       clearDirFailed: string
-      /** Phase 2.12 — `sessions.rate_limit_default_recovery` (ask | resume_at_reset). */
-      rateLimitRecoveryTitle: string
-      rateLimitRecoveryDesc: string
-      rateLimitRecoveryFailed: string
     }
     toolsets: {
       loadingConfig: string
@@ -1575,10 +1566,6 @@ export interface Translations {
       actionFailed: (name: string) => string
       running: string
       viewLog: string
-      curatorLoadFailed: string
-      memoryLoadFailed: string
-      retry: string
-      actionTailLost: string
     }
   }
 
@@ -1723,12 +1710,6 @@ export interface Translations {
     switchConnectionFailed: (name: string) => string
     manageProfiles: string
     connectGateway: string
-    switchToAgent: (profile: string, device: string) => string
-    connectToAgent: (device: string) => string
-    notConnected: string
-    agentsHeading: string
-    thisDevice: string
-    sourceUnreachable: string
     fleet: {
       allOnGateway: string
       gateway: (gateway: string) => string
@@ -2119,27 +2100,8 @@ export interface Translations {
       finishedUnread: string
       backgroundRunning: string
       draftSession: string
-      /** Phase 2.12 — "rate limited" terminal sidebar status.
-       *  `withTime` when resetAt is known, `unknown` otherwise — never
-       *  fabricate a reset time. */
-      rateLimited: {
-        withTime: (time: string) => string
-        unknown: string
-      }
       handoffOrigin: (platform: string) => string
       ownedByProfile: (profile: string) => string
-      /** Accessible name for the primary configured-model chip when the
-       *  actually-served route for the latest turn matches (the common,
-       *  no-mismatch case) — e.g. "Configured model: Claude". */
-      providerConfigured: (family: string) => string
-      /** Visible secondary text AND tooltip label shown only when the
-       *  latest completed turn's actually-served provider differs from the
-       *  configured one (e.g. after a rate-limit fallback) — e.g. "via
-       *  Codex". */
-      providerVia: (family: string) => string
-      /** Accessible name for the chip when a mismatch is showing — e.g.
-       *  "Configured model: Claude, currently served via Codex". */
-      providerConfiguredVia: (configuredFamily: string, servedFamily: string) => string
       renamed: string
       renameFailed: string
       renameTitle: string
@@ -2176,10 +2138,6 @@ export interface Translations {
     wakingProfile: (profile: string) => string
     placeholderStarting: string
     placeholderReconnecting: string
-    reconnectingBanner: string
-    catchingUpNotice: string
-    turnLostNotice: string
-    turnLostRegenerate: string
     placeholderFollowUp: string
     newSessionPlaceholders: readonly string[]
     followUpPlaceholders: readonly string[]
@@ -2950,7 +2908,6 @@ export interface Translations {
     thread: {
       loadingSession: string
       showEarlier: string
-      showEarlierFailed: string
       loadingResponse: string
       loadingLocalModel: (model: string) => string
       processingPrompt: string
@@ -2988,30 +2945,6 @@ export interface Translations {
       errorOpenDesktopLogs: string
       errorCopyDiagnostics: string
       errorSendDiagnostics: string
-      /** Phase 2.12 — rate-limit turn recovery (resetAt/fallbackAvailable). */
-      rateLimit: {
-        /** Plain-language failure message naming the provider/account. */
-        message: (provider: string) => string
-        /** Local human-readable reset time, when resetAt is present. */
-        resetsAt: (time: string) => string
-        /** Shown instead of resetsAt when resetAt is absent — never fabricate a time. */
-        resetUnknown: string
-        resumeAtReset: string
-        makeDefault: string
-        switchModelAndRetry: string
-        configureFallback: string
-        /** Small transcript/status note when the backend's mid-turn fallback
-         *  already fixed the turn — never rendered as a failure card. */
-        switchedNotice: (from: string, to: string) => string
-        countdownLabel: (seconds: number) => string
-        cancelCountdown: string
-        jobScheduled: (time: string) => string
-        jobCancel: string
-        jobCancelFailed: string
-        jobScheduleFailed: string
-        jobDuplicate: string
-        switchModelFailed: string
-      }
       filesChanged: (count: number) => string
       reviewChanges: string
       readAloudFailed: string
@@ -3032,14 +2965,6 @@ export interface Translations {
       goForward: string
       sendEdited: string
       attachingFile: string
-      /** Self-improvement review row's expandable per-action detail list
-       *  (ROADMAP.md Phase 1: Desktop transcript auditability). */
-      review: {
-        showDetails: string
-        showDetailsWithFailures: (count: number) => string
-        hideDetails: string
-        failedReason: (message: string) => string
-      }
     }
     approval: {
       gatewayDisconnected: string
@@ -3118,14 +3043,6 @@ export interface Translations {
       statusDone: string
       /** Over-budget / rejected memory write title — not "Saved to memory". */
       memoryWriteNoted: string
-      /** Per-action memory titles, keyed by the tool's `action` argument — a
-       *  search reads as "Searching memory", a write as "Saving a note", so
-       *  the wait names what is actually happening instead of a fixed
-       *  "Saving to memory" regardless of what the call does. */
-      memoryActions: Record<
-        'add' | 'search' | 'probe' | 'related' | 'reason' | 'contradict' | 'update' | 'remove' | 'list',
-        { done: string; pending: string }
-      >
       actions: {
         read: string
         reading: string
@@ -3258,7 +3175,6 @@ export interface Translations {
     boundaryDesc: string
     reloadWindow: string
     openLogs: string
-    openLogsFailed: string
   }
 
   ui: {

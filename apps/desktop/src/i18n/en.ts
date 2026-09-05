@@ -1,8 +1,11 @@
 import { FIELD_DESCRIPTIONS, FIELD_LABELS } from '@/app/settings/constants'
 
+import { forkEn } from './fork/en'
+import { withForkKeys } from './fork/merge'
 import type { Translations } from './types'
 
-export const en: Translations = {
+// >>> FORK ANCHOR: i18n-en <<<
+export const en: Translations = withForkKeys(forkEn, {
   common: {
     apply: 'Apply',
     back: 'Back',
@@ -83,7 +86,6 @@ export const en: Translations = {
       gatewayConnectionLost: 'Lost connection to the gateway',
       gatewayConnectionLostDetail:
         'Still retrying in the background. You can keep reading and drafting — open Gateway settings if this persists.',
-      gatewaySessionsStale: 'Reconnected, but sessions/settings could not refresh. Some lists may be stale.',
       gatewaySignInRequired: 'Gateway sign-in required',
       ipcBridgeUnavailable: 'Desktop IPC bridge is unavailable.'
     },
@@ -94,18 +96,12 @@ export const en: Translations = {
       remoteTitle: 'Remote gateway sign-in required',
       remoteDescription:
         'Your remote gateway session has expired. Sign in again to reconnect. Nothing here deletes your chats or settings.',
-      wsAuthTitle: 'Sign-in required',
-      wsAuthDescription:
-        "Hermes is running and responding normally — only the live connection's access credential was rejected. Nothing here deletes your chats or settings.",
-      wsAuthHint:
-        'Open the link you were given to reach this Hermes instance again (it carries a fresh credential), or ask whoever set it up for a new one.',
       retry: 'Retry',
       repairInstall: 'Repair install',
       useLocalGateway: 'Use local gateway',
       gatewaySettings: 'Gateway settings',
       back: 'Back',
       openLogs: 'Open logs',
-      openLogsFailed: 'Could not open the logs folder',
       repairHint: 'Repair re-runs the installer and can take a few minutes on a fresh machine.',
       remoteSignInHint: signInLabel =>
         `Signs out of the saved remote browser session, then opens ${signInLabel}. Use local gateway to switch to the bundled backend instead.`,
@@ -933,18 +929,12 @@ export const en: Translations = {
       keychainEncryptionDesc:
         'Off by default. When on, gateway tokens and sign-in credentials are encrypted with your system keychain (Keychain Access, GNOME Keyring, or Windows DPAPI) — your system may ask for permission or a password. When off, they are stored as plain files readable only by your user account.',
       keychainEncryptionFailed: 'Could not change secret encryption',
-      secretStorageHintTitle: 'Stored without OS keychain encryption',
-      secretStorageHintDesc:
-        'Gateway tokens and sign-in credentials are stored as plain files readable only by your user account. Enable OS keychain encryption below for stronger protection.',
-      secretStorageHintEnable: 'Enable encryption',
-      secretStorageHintDismiss: 'Dismiss',
       testRemote: 'Test remote',
       saveForRestart: 'Save for next restart',
       saveAndReconnect: 'Save and reconnect',
       diagnostics: 'Diagnostics',
       diagnosticsDesc: 'Reveal desktop.log in your file manager — useful when the gateway fails to start.',
       openLogs: 'Open logs',
-      openLogsFailed: 'Could not open the logs folder',
       incompleteTitle: 'Remote gateway incomplete',
       incompleteSignIn: 'Enter a remote URL and sign in before switching to remote.',
       incompleteToken: 'Enter a remote URL and session token before switching to remote.',
@@ -1318,11 +1308,7 @@ export const en: Translations = {
       unarchiveFailed: 'Unarchive failed',
       deleteFailed: 'Delete failed',
       updateDirFailed: 'Could not update default directory',
-      clearDirFailed: 'Could not clear default directory',
-      rateLimitRecoveryTitle: 'When a turn hits a rate limit',
-      rateLimitRecoveryDesc:
-        'Ask each time (default) always shows the failure card and lets you choose. Resume automatically starts a brief, cancelable countdown before scheduling a resume.',
-      rateLimitRecoveryFailed: 'Could not update the rate-limit recovery preference'
+      clearDirFailed: 'Could not clear default directory'
     },
     toolsets: {
       loadingConfig: 'Loading configuration',
@@ -1781,11 +1767,7 @@ export const en: Translations = {
       actionStarted: name => `${name} started — tailing log...`,
       actionFailed: name => `${name} failed to start`,
       running: 'Running...',
-      viewLog: 'Action log',
-      curatorLoadFailed: 'Could not load curator status',
-      memoryLoadFailed: 'Could not load memory data',
-      retry: 'Retry',
-      actionTailLost: 'Lost track of this task — view in activity rail'
+      viewLog: 'Action log'
     }
   },
 
@@ -2026,12 +2008,6 @@ export const en: Translations = {
     switchConnectionFailed: name => `Could not connect to ${name}`,
     manageProfiles: 'Manage profiles…',
     connectGateway: 'Manage gateways…',
-    switchToAgent: (profile: string, device: string) => `Switch to ${profile} on ${device}`,
-    connectToAgent: (device: string) => `Connect to ${device}`,
-    notConnected: 'Not connected yet',
-    agentsHeading: 'Agents & connections',
-    thisDevice: 'This device',
-    sourceUnreachable: 'Unreachable',
     fleet: {
       allOnGateway: 'All profiles on this gateway',
       gateway: gateway => `Profiles on ${gateway}`,
@@ -2478,16 +2454,8 @@ export const en: Translations = {
       finishedUnread: 'Finished — unread',
       backgroundRunning: 'Background task running',
       draftSession: 'Draft — nothing sent yet',
-      rateLimited: {
-        withTime: time => `Rate limited — retry at ${time}`,
-        unknown: 'Rate limited — reset time unknown'
-      },
       handoffOrigin: platform => `Handed off from ${platform}`,
       ownedByProfile: profile => `Profile: ${profile}`,
-      providerConfigured: family => `Configured model: ${family}`,
-      providerVia: family => `via ${family}`,
-      providerConfiguredVia: (configuredFamily, servedFamily) =>
-        `Configured model: ${configuredFamily}, currently served via ${servedFamily}`,
       renamed: 'Renamed',
       renameFailed: 'Rename failed',
       renameTitle: 'Rename session',
@@ -2524,10 +2492,6 @@ export const en: Translations = {
     wakingProfile: profile => `Waking up ${profile}…`,
     placeholderStarting: 'Starting Hermes...',
     placeholderReconnecting: 'Reconnecting to Hermes…',
-    reconnectingBanner: 'Reconnecting to Hermes — you can keep reading and typing.',
-    catchingUpNotice: 'Reconnected — catching up…',
-    turnLostNotice: 'This turn may not have completed during the disconnect.',
-    turnLostRegenerate: 'Regenerate',
     placeholderFollowUp: 'Send follow-up',
     newSessionPlaceholders: [
       'What are we building?',
@@ -3401,7 +3365,6 @@ export const en: Translations = {
     thread: {
       loadingSession: 'Loading session',
       showEarlier: 'Show earlier messages',
-      showEarlierFailed: 'Could not load earlier messages',
       loadingResponse: 'Hermes is loading a response',
       loadingLocalModel: model => `Loading ${model} into memory`,
       processingPrompt: 'Processing prompt',
@@ -3440,24 +3403,6 @@ export const en: Translations = {
       errorOpenDesktopLogs: 'Open Desktop logs',
       errorCopyDiagnostics: 'Copy error details',
       errorSendDiagnostics: 'Send diagnostics',
-      rateLimit: {
-        message: provider => `${provider || 'The provider'} is rate limiting this account.`,
-        resetsAt: time => `Retry at ${time}`,
-        resetUnknown: 'Reset time unknown',
-        resumeAtReset: 'Resume at reset',
-        makeDefault: 'Make this the default',
-        switchModelAndRetry: 'Switch model & retry',
-        configureFallback: 'Configure automatic fallback…',
-        switchedNotice: (from, to) => `Switched from ${from} to ${to} and continued`,
-        countdownLabel: seconds => `Resuming in ${seconds}s… Cancel`,
-        cancelCountdown: 'Cancel',
-        jobScheduled: time => `Resume scheduled for ${time}`,
-        jobCancel: 'Cancel resume',
-        jobCancelFailed: 'Could not cancel the scheduled resume',
-        jobScheduleFailed: 'Could not schedule the resume',
-        jobDuplicate: 'A resume is already scheduled for this turn',
-        switchModelFailed: 'Could not switch models'
-      },
       filesChanged: count => (count === 1 ? '1 file changed' : `${count} files changed`),
       reviewChanges: 'Review',
       readAloudFailed: 'Read aloud failed',
@@ -3478,13 +3423,7 @@ export const en: Translations = {
       restoreNext: 'Restore next checkpoint',
       goForward: 'Go forward',
       sendEdited: 'Send edited message',
-      attachingFile: 'Attaching…',
-      review: {
-        showDetails: 'Show details',
-        showDetailsWithFailures: count => (count === 1 ? 'Show details (1 failed)' : `Show details (${count} failed)`),
-        hideDetails: 'Hide details',
-        failedReason: message => `Failed: ${message}`
-      }
+      attachingFile: 'Attaching…'
     },
     approval: {
       gatewayDisconnected: 'Hermes gateway is not connected',
@@ -3563,17 +3502,6 @@ export const en: Translations = {
       statusRecovered: 'Recovered',
       statusDone: 'Done',
       memoryWriteNoted: 'Memory write noted',
-      memoryActions: {
-        add: { done: 'Saved a note', pending: 'Saving a note' },
-        search: { done: 'Searched memory', pending: 'Searching memory' },
-        probe: { done: 'Recalled memory', pending: 'Recalling memory' },
-        related: { done: 'Found related memory', pending: 'Finding related memory' },
-        reason: { done: 'Reasoned across memory', pending: 'Reasoning across memory' },
-        contradict: { done: 'Checked memory for conflicts', pending: 'Checking memory for conflicts' },
-        update: { done: 'Updated memory', pending: 'Updating memory' },
-        remove: { done: 'Removed from memory', pending: 'Removing from memory' },
-        list: { done: 'Listed memory', pending: 'Listing memory' }
-      },
       actions: {
         read: 'Read',
         reading: 'Reading',
@@ -3781,8 +3709,7 @@ export const en: Translations = {
     boundaryTitle: 'Something broke in the interface',
     boundaryDesc: 'The view hit an unexpected error. Your chats and settings are safe.',
     reloadWindow: 'Reload window',
-    openLogs: 'Open logs',
-    openLogsFailed: 'Could not open the logs folder'
+    openLogs: 'Open logs'
   },
 
   ui: {
@@ -3802,4 +3729,4 @@ export const en: Translations = {
       toggle: open => `${open ? 'Show' : 'Hide'} sidebar`
     }
   }
-}
+})
