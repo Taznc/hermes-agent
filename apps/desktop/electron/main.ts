@@ -171,16 +171,12 @@ import {
   shouldRemoveAppBundle,
   uninstallArgsForMode
 } from './desktop-uninstall'
-import {
-  createDevBackendStaleTracker,
-  DEV_BACKEND_WATCH_DIRS,
-  isRelevantBackendPythonChange,
-  performDevBackendRestart,
-  shouldSupportDevBackendRestart
-} from './dev-backend-watch'
 import { describeDevCdpDecision, resolveDevCdpPort } from './dev-cdp'
 import { installEmbedReferer } from './embed-referer'
 import { createEventDeduper } from './event-dedupe'
+import { registerDevRestartWatch } from './fork/dev-restart-watch'
+import { createSecretStorageIntegration } from './fork/secret-storage-integration'
+import { createWindowCapsIntegration } from './fork/window-caps'
 import {
   buildTerminalScript,
   resolveTerminalLaunch,
@@ -242,7 +238,7 @@ import { applyHudElectronOverlay, promoteHudOverlay } from './hud-overlay'
 import { snapHudBounds } from './hud-snap'
 import { createHudSnapShortcut } from './hud-snap-shortcut'
 import { buildHudWindowUrl } from './hud-url'
-import { hudWindowingView, resolveHudWindowing } from './hud-windowing'
+import { resolveHudWindowing } from './hud-windowing'
 import { createLinkTitleWindow, guardLinkTitleSession, readLinkTitleWindowTitle } from './link-title-window'
 import { ensureMainWindow } from './main-window-lifecycle'
 import {
@@ -361,7 +357,6 @@ import { attachRendererConsoleCapture, formatRendererBoundaryReport } from './re
 import {
   classifyStoredSecret,
   readSecretStoragePolicy,
-  resolveSecureTokenStorageState,
   SECRET_STORAGE_LAST_ON_MARKER_FILE,
   SECRET_STORAGE_POLICY_FILE,
   type SecretStoragePolicy,
@@ -506,30 +501,18 @@ const GLASS_SUPPORTED = glassSupportedOn(process.platform, os.release())
 // Clear rides setOpacity, a documented no-op on Linux, so neither mode works
 // there and Settings drops the row entirely.
 const TRANSLUCENCY_SUPPORTED = translucencySupportedOn(process.platform)
-// Process-constant window capabilities the renderer needs before its first
-// paint: translucency support (glass/vibrancy) and the HUD's windowing
-// profile (X11 vs Wayland vs native desktop). Both used to be answered by a
-// preload `ipcRenderer.sendSync`, which stalls the renderer's first script
-// on a round-trip into main -- coupling first paint to whatever main is busy
-// doing (a slow backend probe, boot). Neither value ever changes for the
-// life of the process, so we compute it once here and hand it to preload via
-// `webPreferences.additionalArguments` (see hermesWindowCapsArgument()):
-// zero IPC, no stall, same answer every window gets.
-const HUD_WINDOWING_VIEW = hudWindowingView(resolveHudWindowing(process.platform, process.env, process.argv))
-
-const WINDOW_CAPS_ARGUMENT = `--hermes-window-caps=${encodeURIComponent(
-  JSON.stringify({ glass: GLASS_SUPPORTED, translucency: TRANSLUCENCY_SUPPORTED, hud: HUD_WINDOWING_VIEW })
-)}`
-
-// Every BrowserWindow whose preload is PRELOAD_PATH must carry this so the
-// renderer's first script sees translucency/HUD capabilities without an IPC
-// round-trip. Centralized so a new window kind can't forget it.
-function withWindowCapsArgument(webPreferences: Record<string, unknown>): Record<string, unknown> {
-  return {
-    ...webPreferences,
-    additionalArguments: [...((webPreferences.additionalArguments as string[]) || []), WINDOW_CAPS_ARGUMENT]
-  }
-}
+// Process-constant window capabilities (translucency/glass + HUD windowing
+// profile) handed to preload via additionalArguments — computed once so the
+// renderer's first paint never stalls on an IPC round-trip. Implementation
+// and rationale live in the fork module.
+// >>> FORK ANCHOR: window-caps <<<
+const { WINDOW_CAPS_ARGUMENT, withWindowCapsArgument } = createWindowCapsIntegration({
+  glassSupported: GLASS_SUPPORTED,
+  translucencySupported: TRANSLUCENCY_SUPPORTED,
+  platform: process.platform,
+  env: process.env,
+  argv: process.argv
+})
 
 const APP_ROOT = app.getAppPath()
 
@@ -8037,45 +8020,12 @@ function _nativeTokenStorePath() {
   return path.join(app.getPath('userData'), 'native-oauth-tokens.json')
 }
 
-// The electron-coupled half of the token store: safeStorage encryption plus the
-// userData file. native-token-store.ts owns the serialization/parse round trip
-// so it can be tested without an Electron runtime.
+// The electron-coupled half of the token store lives in the fork module —
+// see fork/secret-storage-integration.ts (created at the secret-storage-io
+// anchor below; safe to call here because it is only invoked at runtime,
+// long after module evaluation).
 function _nativeTokenStoreIo(): NativeTokenStoreIo {
-  return {
-    encrypt: encryptDesktopSecret,
-    decrypt: decryptDesktopSecret,
-    readStoreText: () => fs.readFileSync(_nativeTokenStorePath(), 'utf8'),
-    // Atomic (temp file + rename, owner-only mode) via the same helper the
-    // adjacent secret-storage-policy.json write uses — a crash/power-loss/
-    // full-disk failure mid-write can now only ever leave the OLD file intact
-    // or the NEW file complete, never a truncated hybrid that reads as an
-    // empty store and silently drops every other gateway's tokens on the
-    // next persist.
-    writeStoreText: (text: string) => {
-      fs.mkdirSync(path.dirname(_nativeTokenStorePath()), { recursive: true })
-      writeSecretFileAtomic(_nativeTokenStorePath(), text, { encoding: 'utf8' })
-    },
-    // A store that fails to JSON.parse is quarantined instead of being
-    // silently treated as empty and then overwritten on the next persist —
-    // rename it aside so the corrupt bytes aren't lost to a "recoverable"
-    // read that isn't actually recoverable once the next write lands.
-    preserveCorruptStore: () => {
-      const target = _nativeTokenStorePath()
-      const quarantined = `${target}.corrupt-${Date.now()}`
-
-      try {
-        fs.renameSync(target, quarantined)
-        rememberLog(`[native-oauth] quarantined corrupt token store at ${quarantined}`)
-      } catch (error) {
-        rememberLog(
-          `[native-oauth] failed to quarantine corrupt token store: ${
-            error instanceof Error ? error.message : String(error)
-          }`
-        )
-      }
-    },
-    rememberLog
-  }
+  return secretStorageIntegration.nativeTokenStoreIo()
 }
 
 function _persistNativeTokens(baseUrl: string, tokens: NativeTokenSet | null) {
@@ -9121,46 +9071,23 @@ const SECRET_STORAGE_POLICY_PATH = path.join(app.getPath('userData'), SECRET_STO
 // doesn't live inside the same file that can disappear.
 const SECRET_STORAGE_LAST_ON_MARKER_PATH = path.join(app.getPath('userData'), SECRET_STORAGE_LAST_ON_MARKER_FILE)
 
-const _secretStoragePolicyIo = {
-  readText: () => fs.readFileSync(SECRET_STORAGE_POLICY_PATH, 'utf8'),
-  writeText: (text: string) => writeSecretFileAtomic(SECRET_STORAGE_POLICY_PATH, text, { encoding: 'utf8' }),
-  // A present-but-corrupt policy file is quarantined rather than silently
-  // treated as the OFF default — see readSecretStoragePolicy's doc comment
-  // for why "corrupt while present" and "absent" must not read the same.
-  preserveCorruptPolicy: () => {
-    const quarantined = `${SECRET_STORAGE_POLICY_PATH}.corrupt-${Date.now()}`
-
-    try {
-      fs.renameSync(SECRET_STORAGE_POLICY_PATH, quarantined)
-      rememberLog(`[secret-storage] quarantined corrupt policy file at ${quarantined}`)
-    } catch (error) {
-      rememberLog(
-        `[secret-storage] failed to quarantine corrupt policy file: ${
-          error instanceof Error ? error.message : String(error)
-        }`
-      )
-    }
-  },
-  // The marker's mere PRESENCE means "last deliberate write was ON" — its
-  // content is irrelevant, only existence is checked, so a truncated/corrupt
-  // marker file still correctly answers "yes, it existed" rather than needing
-  // its own corruption-handling ladder for a one-bit signal.
-  readLastKnownOn: () => fs.existsSync(SECRET_STORAGE_LAST_ON_MARKER_PATH),
-  writeLastKnownOn: (on: boolean) => {
-    if (on) {
-      writeSecretFileAtomic(SECRET_STORAGE_LAST_ON_MARKER_PATH, String(Date.now()), { encoding: 'utf8' })
-    } else {
-      try {
-        fs.rmSync(SECRET_STORAGE_LAST_ON_MARKER_PATH, { force: true })
-      } catch {
-        // Best-effort removal; a stale marker after an explicit turn-OFF just
-        // means a future disappearance of the main policy file conservatively
-        // reads as ON again, which is the safe direction to fail in.
-      }
-    }
-  },
+// Electron-coupled IO for the policy + native token store (atomic writes,
+// corruption quarantine, last-on marker, honest keychain probe). The policy
+// decision logic stays in secret-storage-policy.ts / native-token-store.ts;
+// the side-effect bodies live in the fork module.
+// >>> FORK ANCHOR: secret-storage-io <<<
+const secretStorageIntegration = createSecretStorageIntegration({
+  nativeTokenStorePath: _nativeTokenStorePath,
+  policyPath: SECRET_STORAGE_POLICY_PATH,
+  lastOnMarkerPath: SECRET_STORAGE_LAST_ON_MARKER_PATH,
+  encrypt: (plaintext: string) => encryptDesktopSecret(plaintext),
+  decrypt: (secret: any) => decryptDesktopSecret(secret),
+  isEncryptionAvailable: () => safeStorage.isEncryptionAvailable(),
+  secretStoragePolicy: () => secretStoragePolicy(),
   rememberLog
-}
+})
+
+const _secretStoragePolicyIo = secretStorageIntegration.secretStoragePolicyIo
 
 let _secretStoragePolicy: SecretStoragePolicy | null = null
 
@@ -9177,35 +9104,16 @@ function setSecretStoragePolicy(next: SecretStoragePolicy) {
   writeSecretStoragePolicy(_secretStoragePolicy, _secretStoragePolicyIo)
 }
 
-/**
- * Keychain availability as the renderer should see it. With encryption
- * opted out this must NOT probe safeStorage — isEncryptionAvailable() is
- * itself a keychain touch that raises the macOS dialog this feature exists
- * to avoid. We report `true` so the plain-text CONFIRMATION dialog (the
- * "your keychain is broken, opt into plaintext to continue" flow) never
- * fires: storing plaintext with the policy off is the user's chosen
- * (default) mode, not a degraded state that needs a gate.
- *
- * This does NOT mean the renderer is blind to the real state — see
- * probeSecureTokenStorageState() below, which both callers of this function
- * also read and forward honestly as `secretStorageState`.
- */
+// Gated probe (suppresses the plaintext-opt-in CONFIRM dialog while the
+// policy is off) — see the fork module for the full rationale.
 function probeSecureTokenStorage(): boolean {
-  const state = probeSecureTokenStorageState()
-
-  return state.policyOn ? state.available : true
+  return secretStorageIntegration.probeSecureTokenStorage()
 }
 
-/**
- * The full, honest answer to "is what I save right now actually OS-keychain
- * encrypted?" — `{ available, policyOn }`. Unlike probeSecureTokenStorage()
- * above (which exists only to gate the plaintext-opt-in CONFIRM dialog and
- * intentionally reads as "fine" while the policy is off), this is what the
- * renderer uses to show an honest, non-blocking "stored without OS keychain
- * encryption" hint instead of asserting security it cannot back up.
- */
+// The honest { available, policyOn } state the renderer's "stored without
+// OS keychain encryption" hint reads — see the fork module.
 function probeSecureTokenStorageState(): SecureTokenStorageState {
-  return resolveSecureTokenStorageState(secretStoragePolicy(), () => Boolean(safeStorage.isEncryptionAvailable()))
+  return secretStorageIntegration.probeSecureTokenStorageState()
 }
 
 /**
@@ -11704,263 +11612,28 @@ function broadcastConnectionsChanged(payload: { connectionId: string; reason: 'r
   }
 }
 
-// ── Dev: main-process bundle staleness ──────────────────────────────────────
-// The renderer hot-reloads through Vite, but Electron cannot hot-swap an
-// already-evaluated main process — an electron/ edit only lands on restart.
-// Rather than restarting under the user (which would destroy whatever they were
-// mid-way through), watch the built bundle and let the renderer offer an
-// explicit "Restart to apply". Dev-only: a packaged build never watches and the
-// renderer's affordance stays hidden, so release users see nothing.
-const DEV_MAIN_BUNDLE = path.join(APP_ROOT, 'dist', 'electron-main.mjs')
-const DEV_PRELOAD_BUNDLE = path.join(APP_ROOT, 'dist', 'electron-preload.js')
-
-// Sentinel exit code meaning "the dev watcher should respawn me", as opposed to
-// a real quit. Must match the value in scripts/dev-electron-watch.mjs.
-const DEV_RESTART_EXIT_CODE = 86
-
-let devMainBundleStale = false
-let devBundleWatchers: fs.FSWatcher[] = []
-
-function broadcastDevBundleStale() {
-  for (const win of BrowserWindow.getAllWindows()) {
-    const { webContents } = win
-
-    if (webContents && !webContents.isDestroyed()) {
-      webContents.send('hermes:dev:main-bundle-stale', { stale: devMainBundleStale })
-    }
+// ── Dev: main/backend staleness watchers ────────────────────────────────────
+// Dev-only "restart to apply" affordances for the Electron main-process
+// bundle and the backend Python source. The watchers, IPC handlers, and
+// lifecycle wiring live in the fork module — see fork/dev-restart-watch.ts
+// for the full rationale.
+// >>> FORK ANCHOR: dev-restart-watch <<<
+const devRestartWatch = registerDevRestartWatch({
+  appRoot: APP_ROOT,
+  isPackaged: IS_PACKAGED,
+  devServer: DEV_SERVER,
+  sourceRepoRoot: SOURCE_REPO_ROOT,
+  env: process.env,
+  app,
+  ipcMain,
+  getAllWindows: () => BrowserWindow.getAllWindows(),
+  isHermesSourceRoot,
+  directoryExists,
+  primaryBackendIsRemote: () => primaryBackendIsRemote(),
+  teardownPrimaryBackend: async () => {
+    await teardownPrimaryBackendAndWait({ soft: true })
+    sendConnectionApplied()
   }
-}
-
-function watchDevMainBundle() {
-  if (IS_PACKAGED || !DEV_SERVER) {
-    return
-  }
-
-  // Signature at boot: anything different later is a rebuild we are not running.
-  const signature = target => {
-    try {
-      const stat = fs.statSync(target)
-
-      return `${stat.size}:${stat.mtimeMs}`
-    } catch {
-      return ''
-    }
-  }
-
-  for (const target of [DEV_MAIN_BUNDLE, DEV_PRELOAD_BUNDLE]) {
-    const original = signature(target)
-
-    if (!original) {
-      continue
-    }
-
-    try {
-      // Debounced: esbuild writes in bursts, and a rebuild can touch both
-      // bundles. Once stale we stay stale — only a restart clears it.
-      let timer: NodeJS.Timeout | null = null
-
-      const watcher = fs.watch(target, () => {
-        if (devMainBundleStale) {
-          return
-        }
-
-        if (timer) {
-          clearTimeout(timer)
-        }
-
-        timer = setTimeout(() => {
-          if (!devMainBundleStale && signature(target) !== original) {
-            devMainBundleStale = true
-            console.log('[hermes] main-process bundle changed on disk — restart to apply')
-            broadcastDevBundleStale()
-          }
-        }, 150)
-      })
-
-      // The try/catch around fs.watch() only guards the SYNCHRONOUS call —
-      // it does not cover the watcher's own async 'error' event (EPERM on
-      // Windows if the dist/ dir is deleted/rebuilt mid-watch, ENOENT if a
-      // build tool briefly unlinks-then-recreates the file). Unhandled,
-      // that throws and crashes the main process same as any other
-      // fs.watch() site; dev-only doesn't make it safe to skip.
-      guardWatcherErrors(watcher, error => {
-        if (timer) {
-          clearTimeout(timer)
-          timer = null
-        }
-
-        devBundleWatchers = devBundleWatchers.filter(w => w !== watcher)
-        console.log(
-          `[hermes] dev bundle watcher error on ${target}: ${error instanceof Error ? error.message : error}`
-        )
-      })
-
-      devBundleWatchers.push(watcher)
-    } catch {
-      // Watching is a convenience; a platform that refuses it must not break dev.
-    }
-  }
-}
-
-app.on('before-quit', () => {
-  for (const watcher of devBundleWatchers) {
-    try {
-      watcher.close()
-    } catch {
-      void 0
-    }
-  }
-
-  devBundleWatchers = []
-})
-
-ipcMain.handle('hermes:dev:main-bundle-stale', async () => ({
-  stale: devMainBundleStale,
-  // The renderer must not render a restart affordance in a packaged build.
-  supported: !IS_PACKAGED && Boolean(DEV_SERVER)
-}))
-
-ipcMain.handle('hermes:dev:restart', async () => {
-  if (IS_PACKAGED) {
-    return { ok: false, reason: 'not-a-dev-build' }
-  }
-
-  // Exit with a sentinel code and let the DEV WATCHER respawn us.
-  //
-  // app.relaunch() is wrong here: it exits 0, which is indistinguishable from a
-  // real quit, so the watcher tears itself down (and `concurrently -k` kills
-  // Vite with it) while the relaunched window loads a dev server that no longer
-  // exists — a permanent blank screen. Handing the restart to the supervisor
-  // that owns the process keeps Vite up and the new window attached.
-  //
-  // Without a watcher (plain `npm run dev`), nothing respawns us, so fall back
-  // to relaunch there.
-  if (process.env.HERMES_DEV_WATCH === '1') {
-    app.exit(DEV_RESTART_EXIT_CODE)
-
-    return { ok: true }
-  }
-
-  app.relaunch()
-  app.exit(0)
-
-  return { ok: true }
-})
-
-// ── Dev: backend Python source staleness (Phase 2.9) ────────────────────────
-// Sibling to the main-process bundle watcher above and to dev-electron-watch.mjs:
-// the renderer hot-reloads via Vite and Electron's main process gets the
-// "Restart to apply" affordance above, but nothing previously covered a
-// backend Python edit under a running `hermes serve` child — the process keeps
-// serving pre-edit code while both other layers look current. Reuses the exact
-// same "watch, mark stale, let the renderer offer a restart" shape rather than
-// inventing a new one. See dev-backend-watch.ts for the pure filtering/state
-// logic this wires up.
-const devBackendStaleTracker = createDevBackendStaleTracker()
-let devBackendPythonWatchers: fs.FSWatcher[] = []
-
-function broadcastDevBackendStale() {
-  const stale = devBackendStaleTracker.state()
-
-  for (const win of BrowserWindow.getAllWindows()) {
-    const { webContents } = win
-
-    if (webContents && !webContents.isDestroyed()) {
-      webContents.send('hermes:dev:backend-stale', { state: stale })
-    }
-  }
-}
-
-// Only meaningful when the desktop actually spawns the backend FROM this
-// source checkout (dev, local primary) — same precondition the main-process
-// bundle watcher and the dev-source backend resolution branch (~L4574) share.
-// A packaged build, or a desktop pointed at a remote/pool backend, has no
-// local `serve` process whose staleness this could describe.
-function watchDevBackendPython() {
-  if (IS_PACKAGED || !DEV_SERVER || !isHermesSourceRoot(SOURCE_REPO_ROOT)) {
-    return
-  }
-
-  for (const dir of DEV_BACKEND_WATCH_DIRS) {
-    const target = path.join(SOURCE_REPO_ROOT, dir)
-
-    if (!directoryExists(target)) {
-      continue
-    }
-
-    try {
-      const watcher = fs.watch(target, { recursive: true }, (_eventType, filename) => {
-        if (!isRelevantBackendPythonChange(filename ? String(filename) : null)) {
-          return
-        }
-
-        if (devBackendStaleTracker.markStale()) {
-          // Log-message text only (dev-only console.log), not a real fs
-          // join — no functional effect from the missing separator
-          // normalization on any OS.
-          console.log(
-            `[hermes] backend Python source changed on disk (${dir}/${filename}) — restart backend to apply` // windows-footgun: ok — dev-only console.log text, not an fs path
-          )
-          broadcastDevBackendStale()
-        }
-      })
-
-      devBackendPythonWatchers.push(watcher)
-    } catch (error) {
-      // Recursive fs.watch is unsupported on some Linux configurations
-      // (inotify-backed, no native recursive support pre-Node 22-on-Linux
-      // parity). Watching is a convenience; a platform that refuses it must
-      // not break dev — the affordance simply never lights up there.
-      console.warn(`[hermes] backend Python watch unavailable for ${dir}: ${error?.message || error}`)
-    }
-  }
-}
-
-app.on('before-quit', () => {
-  for (const watcher of devBackendPythonWatchers) {
-    try {
-      watcher.close()
-    } catch {
-      void 0
-    }
-  }
-
-  devBackendPythonWatchers = []
-})
-
-ipcMain.handle('hermes:dev:backend-stale', async () => ({
-  state: devBackendStaleTracker.state(),
-  // The renderer must never render this in a packaged build, and a remote
-  // primary backend isn't this process's to restart.
-  supported: shouldSupportDevBackendRestart({
-    isPackaged: IS_PACKAGED,
-    devServer: DEV_SERVER,
-    primaryIsRemote: primaryBackendIsRemote()
-  })
-}))
-
-ipcMain.handle('hermes:dev:backend-restart', async () => {
-  if (IS_PACKAGED) {
-    return { ok: false, reason: 'not-a-dev-build' }
-  }
-
-  // Offer, don't act: this handler only ever runs in response to the
-  // renderer's explicit IPC call, itself only reachable from the user
-  // clicking the statusbar affordance — never from the watcher above, which
-  // only marks state. Restart-in-place reuses the same soft primary teardown
-  // + "connection applied" signal connection-config/profile-switch already
-  // use (rehomePrimaryConnection / teardownPrimaryBackendAndWait +
-  // sendConnectionApplied), so the renderer's existing softSwitch() listener
-  // (desktop.onConnectionApplied) re-dials and restores connection, active
-  // profile, and session view — no bespoke re-home logic needed here.
-  return performDevBackendRestart({
-    tracker: devBackendStaleTracker,
-    teardownPrimaryBackend: async () => {
-      await teardownPrimaryBackendAndWait({ soft: true })
-      sendConnectionApplied()
-    },
-    notifyStateChanged: broadcastDevBackendStale
-  })
 })
 
 async function waitForBackendExit(child, timeoutMs = 5000) {
@@ -18834,11 +18507,11 @@ app.whenReady().then(() => {
 
   // Dev only: notice when the main-process bundle is rebuilt underneath us so
   // the renderer can offer an explicit restart.
-  watchDevMainBundle()
+  devRestartWatch.watchDevMainBundle()
   // Dev only: same courtesy for backend Python source (Phase 2.9) — the
   // running `hermes serve` child has already imported agent/ tui_gateway/
   // tools/ hermes_cli/, so an edit there needs the same explicit offer.
-  watchDevBackendPython()
+  devRestartWatch.watchDevBackendPython()
 
   // Win/Linux cold start: the launching hermes:// URL is in our own argv.
   const _coldStartLink = _extractDeepLink(process.argv)
