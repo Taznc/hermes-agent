@@ -30,6 +30,7 @@ vi.mock('@/i18n', () => ({
         row: {
           ageMin: 'm',
           ageNow: 'now',
+          archiveSession: 'Archive session',
           backgroundRunning: 'Running in background',
           finishedUnread: 'Finished',
           handoffOrigin: (platform: string) => `Started on ${platform}`,
@@ -257,6 +258,54 @@ describe('SidebarSessionRow', () => {
 
     const kebab = screen.getByRole('button', { name: 'Session actions' })
     expect(tipTrigger(kebab)).toBeNull()
+  })
+
+  // Row-level one-click archive icon (#7b52ebc2): a direct, always-rendered
+  // button beside the kebab so archiving never requires opening a menu.
+  describe('row-level archive button', () => {
+    it('renders a keyboard-focusable, screen-reader-labeled archive button on every row', () => {
+      render(
+        <SidebarSessionRow
+          isPinned={false}
+          isSelected={false}
+          onArchive={noop}
+          onDelete={noop}
+          onPin={noop}
+          onResume={noop}
+          onToggleUnread={noop}
+          session={makeSession({ title: 'Archivable session' })}
+          unread={false}
+        />
+      )
+
+      const archiveButton = screen.getByRole('button', { name: 'Archive session' })
+      expect(archiveButton.tagName).toBe('BUTTON')
+      expect(archiveButton.getAttribute('tabindex')).not.toBe('-1')
+    })
+
+    it('fires onArchive exactly once on click and does not select/resume the row', () => {
+      const onArchive = vi.fn()
+      const onResume = vi.fn()
+
+      render(
+        <SidebarSessionRow
+          isPinned={false}
+          isSelected={false}
+          onArchive={onArchive}
+          onDelete={noop}
+          onPin={noop}
+          onResume={onResume}
+          onToggleUnread={noop}
+          session={makeSession({ title: 'Archivable session' })}
+          unread={false}
+        />
+      )
+
+      fireEvent.click(screen.getByRole('button', { name: 'Archive session' }))
+
+      expect(onArchive).toHaveBeenCalledTimes(1)
+      expect(onResume).not.toHaveBeenCalled()
+    })
   })
 
   // Full-title tooltip on hover (#83000-class ask): the label is a tooltip

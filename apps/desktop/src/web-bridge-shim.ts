@@ -96,6 +96,15 @@ interface SpikeReadFileTextResult {
   truncated?: boolean
 }
 
+// Structural subset of HermesSelectPathsOptions (src/global.d.ts).
+interface SpikeSelectPathsOptions {
+  title?: string
+  defaultPath?: string
+  directories?: boolean
+  multiple?: boolean
+  profile?: string
+  filters?: Array<{ name: string; extensions: string[] }>
+}
 
 // Injected at serve time by vite.config.web.ts `define` — real git provenance
 // of the checkout being served (branch/commit/dirty).
@@ -155,6 +164,113 @@ function bytesToBase64(bytes: Uint8Array): string {
   }
 
   return btoa(binary)
+}
+
+// ── Click-to-upload / drop staging for non-image files ──────────────────────
+// The '+' menu's Files action and OS drag/drop both need a way to turn browser
+// File bytes into a gateway-visible path — Electron's equivalents (native
+// dialog + webUtils.getPathForFile) have no browser counterpart. Stage the
+// bytes through the backend's generic chat file-upload route (mirrors the
+// image-upload route above, but accepts any content and stores under
+// HERMES_HOME/uploads/) and hand back the absolute path; file.attach/
+// image.attach_bytes read it back from there like any other local pick.
+//
+// The staged path's basename is an internal name (timestamp/hash-prefixed —
+// see upload_chat_file in hermes_cli/web_server.py), not the name the user
+// picked or dropped. Remember that original name here, keyed by the staged
+// path, so the composer chip can show it instead of the internal basename
+// (getStagedDisplayName below). Electron never populates this map — it always
+// attaches a real local path and derives the label from that directly.
+const stagedFileDisplayNames = new Map<string, string>()
+
+async function uploadFileBuffer(bytes: Uint8Array, filename: string, mimeType?: string): Promise<string> {
+  const result = await api<{ path?: string }>({
+    path: '/api/chat/file-upload',
+    method: 'POST',
+    body: {
+      data_url: `data:${mimeType || 'application/octet-stream'};base64,${bytesToBase64(bytes)}`,
+      filename: filename || 'upload'
+    }
+  })
+
+  const path = result?.path ?? ''
+
+  if (path && filename) {
+    stagedFileDisplayNames.set(path, filename)
+  }
+
+  return path
+}
+
+async function uploadPickedFile(file: File): Promise<string> {
+  const buffer = await file.arrayBuffer()
+
+  return uploadFileBuffer(new Uint8Array(buffer), file.name, file.type)
+}
+
+function acceptAttrFromFilters(filters?: Array<{ name: string; extensions: string[] }>): string {
+  if (!filters?.length) {
+    return ''
+  }
+
+  return filters
+    .flatMap(filter => filter.extensions)
+    .filter(Boolean)
+    .map(ext => `.${ext.replace(/^\./, '')}`)
+    .join(',')
+}
+
+// Drives a throwaway <input type=file> to get real File handles out of the
+// browser (the only picker surface a web page has). There is no 'cancel'
+// event on <input type=file>; the standard workaround is to treat the
+// window regaining focus after the native dialog closes as "done" — the
+// 'change' event (when files WERE picked) fires before that focus event in
+// every evergreen browser, and the settled guard makes the race harmless
+// either way.
+function pickBrowserFiles(options?: { multiple?: boolean; filters?: Array<{ extensions: string[]; name: string }> }): Promise<File[]> {
+  return new Promise(resolve => {
+    const input = document.createElement('input')
+
+    input.type = 'file'
+    input.style.position = 'fixed'
+    input.style.top = '-1000px'
+    input.style.left = '-1000px'
+
+    if (options?.multiple !== false) {
+      input.multiple = true
+    }
+
+    const accept = acceptAttrFromFilters(options?.filters)
+
+    if (accept) {
+      input.accept = accept
+    }
+
+    let settled = false
+
+    const finish = (files: File[]) => {
+      if (settled) {
+        return
+      }
+
+      settled = true
+      window.removeEventListener('focus', onWindowFocus)
+      input.remove()
+      resolve(files)
+    }
+
+    const onWindowFocus = () => {
+      // The native picker's own focus-return races the 'change' event in a
+      // few browsers; give 'change' a beat to win before treating this as a
+      // cancel.
+      setTimeout(() => finish(input.files ? Array.from(input.files) : []), 300)
+    }
+
+    input.addEventListener('change', () => finish(input.files ? Array.from(input.files) : []))
+    window.addEventListener('focus', onWindowFocus)
+    document.body.appendChild(input)
+    input.click()
+  })
 }
 
 function connection(profile?: string | null) {
@@ -336,7 +452,29 @@ const shim = {
   claimAmbientCue: async (_key: string) => true,
   touchBackend: async () => ({ ok: true }),
   sanitizeWorkspaceCwd: async (cwd?: null | string) => ({ cwd: cwd ?? '', sanitized: false }),
-  selectPaths: async () => [] as string[],
+  selectPaths: async (options?: SpikeSelectPathsOptions) => {
+    if (options?.directories) {
+      // No File System Access API fallback attempted here — the in-app
+      // RemoteFolderPicker dialog (browsed over the gateway's REST fs API)
+      // already handles directory selection for the web build instead of
+      // calling this bridge method. See selectDesktopPaths in
+      // lib/desktop-fs.ts, which only reaches this branch for a file pick.
+      return [] as string[]
+    }
+
+    const files = await pickBrowserFiles({ filters: options?.filters, multiple: options?.multiple !== false })
+    const paths: string[] = []
+
+    for (const file of files) {
+      try {
+        paths.push(await uploadPickedFile(file))
+      } catch (err) {
+        console.warn('[web-bridge-shim] selectPaths: could not stage picked file', file.name, err)
+      }
+    }
+
+    return paths.filter(Boolean)
+  },
   saveImageFromUrl: async (_url: string) => false,
   getPathForFile: (_file: File) => '',
 
@@ -369,6 +507,27 @@ const shim = {
 
     return result?.path ?? ''
   },
+
+  // Web-build counterpart to Electron's real filesystem path: the '+' Files
+  // action and OS drops for NON-image files have raw browser bytes and no
+  // local path (see selectPaths/getPathForFile above). Optional on the
+  // HermesDesktop type — Electron never defines it since it always has a
+  // real path already — so use-composer-actions.attachFileBlob checks for
+  // it explicitly rather than relying on `?.` (same partial-shim trap
+  // saveImageBuffer exists to close for images).
+  saveFileBuffer: async (data: ArrayBuffer | Uint8Array, filename: string) => {
+    const bytes = data instanceof Uint8Array ? data : new Uint8Array(data)
+
+    return uploadFileBuffer(bytes, filename || 'upload')
+  },
+
+  // Web build only: the composer chip label should show the name the user
+  // picked/dropped, not the staged path's internal timestamp/hash basename.
+  // saveFileBuffer/selectPaths record the mapping as they stage each file;
+  // attachContextFilePath (use-composer-actions.ts) reads it back here to
+  // label the chip. Undefined on Electron — real local paths already carry
+  // their true name in the basename, so pathLabel(path) is correct there.
+  getStagedDisplayName: (path: string) => stagedFileDisplayNames.get(path),
 
   // The server-side clipboard is the HOST's, not the browser user's, so
   // reading it would attach the wrong machine's image. The DOM paste event

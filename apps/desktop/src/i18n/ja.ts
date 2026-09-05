@@ -15,6 +15,7 @@ export const ja = defineForkLocale(forkJa, {
     choose: '選択',
     clear: 'クリア',
     close: '閉じる',
+    undo: '元に戻す',
     collapse: '折りたたむ',
     confirm: '確認',
     connect: '接続',
@@ -1005,12 +1006,12 @@ export const ja = defineForkLocale(forkJa, {
     },
     model: {
       loading: 'モデル設定を読み込み中...',
+      loadFailed: 'モデル設定の読み込みに失敗しました',
       appliesDesc:
         '新しいセッションに適用されます。コンポーザーのモデルピッカーを使ってアクティブなチャットをホットスワップできます。',
       provider: 'プロバイダー',
       model: 'モデル',
       applying: '適用中...',
-      loadFailed: 'モデルを読み込めませんでした',
       restartRequired:
         'アップデート後、このバックエンドは古いコードのままです。再起動して新しいコードを読み込んでください。',
       restartBackend: 'バックエンドを再起動',
@@ -2113,6 +2114,7 @@ export const ja = defineForkLocale(forkJa, {
       copyIdFailed: 'セッション ID をコピーできませんでした',
 
       sessionActions: 'セッションアクション',
+      archiveSession: 'セッションをアーカイブ',
       sessionRunning: 'セッション実行中',
       needsInput: '入力が必要です',
       waitingForAnswer: '回答を待っています',
@@ -3217,6 +3219,8 @@ export const ja = defineForkLocale(forkJa, {
     deleteFailed: '削除に失敗しました',
     archived: 'アーカイブしました',
     archiveFailed: 'アーカイブに失敗しました',
+    archivedUndoMessage: 'セッションをアーカイブしました',
+    undoArchiveFailed: '元に戻せませんでした',
     cwdChangeFailed: '作業ディレクトリの変更に失敗しました',
     cwdStagedTitle: '作業ディレクトリがステージングされました',
     cwdStagedMessage:

@@ -121,9 +121,6 @@ function ConfigSettingsInner({
   const savedDiscoverySignatureRef = useRef<string | undefined>(undefined)
   const [saveVersion, setSaveVersion] = useState(0)
 
-  // Seed the local draft once, the first time the shared record lands.
-  // Background refetches thereafter must not clobber in-progress edits.
-  const configSeeded = useRef(false)
   // Snapshot of the record as it was when the draft was seeded. Autosave
   // diffs the draft against this (not against disk) so a field the user
   // never touched — possibly changed out-of-band by `hermes config set`
@@ -134,22 +131,29 @@ function ConfigSettingsInner({
   // data — each save's diff+request only starts once the previous one lands.
   const saveQueueRef = useRef<Promise<void>>(Promise.resolve())
 
+  // Seed the local draft whenever it is empty and the shared record is
+  // available. The guard is the draft state itself (not a one-shot ref), so
+  // any path that clears the draft re-seeds automatically once data lands —
+  // there is no "cleared but never re-seeded" state to get stuck in. This
+  // mirrors the shared fix in useOnProfileSwitch: don't rely on a one-shot
+  // latch that a repeated effect pass (Strict Mode, or any future caller of
+  // the profile-switch handler) can desync from the data it's guarding.
+  // Background refetches while an edit is in progress still can't clobber the
+  // draft, because a non-null draft blocks the seed.
   // eslint-disable-next-line no-restricted-syntax -- legitimate non-atom ref write (see eslint rule comment)
   useEffect(() => {
-    if (loadedConfig && !configSeeded.current) {
-      configSeeded.current = true
+    if (loadedConfig && config === null) {
       configBaselineRef.current = loadedConfig
       savedDiscoverySignatureRef.current = repoDiscoveryPolicySignature(repoDiscoveryPolicyFromConfig(loadedConfig))
       setConfig(loadedConfig)
     }
-  }, [loadedConfig])
+  }, [loadedConfig, config])
 
   // A profile switch invalidates (but doesn't clear) the shared config query, so
   // the local draft would otherwise keep profile A's data and autosave it into
-  // B. Drop the seed + draft (re-seeds from B's refetch) and zero saveVersion so
+  // B. Drop the draft (re-seeds from B's refetch above) and zero saveVersion so
   // the pending debounced autosave is cancelled by its effect cleanup.
   useOnProfileSwitch(() => {
-    configSeeded.current = false
     configBaselineRef.current = null
     savedDiscoverySignatureRef.current = undefined
     setConfig(null)
