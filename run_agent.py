@@ -191,7 +191,7 @@ def _pool_may_recover_from_rate_limit(pool) -> bool:
 
     See issues #11314 and #13636.
     """
-    return pool is not None and pool.has_available() and len(pool.entries()) > 1
+    return pool is not None and pool.has_genuinely_available() and len(pool.entries()) > 1
 
 
 class _StreamErrorEvent(Exception):

@@ -941,6 +941,32 @@ class CredentialPool:
             available, _pending = self._available_entries()
             return bool(available)
 
+    def has_genuinely_available(self) -> bool:
+        """True if at least one entry is usable now WITHOUT side-effect resync.
+
+        Unlike ``has_available()``, this does not invoke ``_resync_stale_entry``
+        (which can revive an exhausted ``claude_code`` entry by re-reading the
+        credentials file mid-check).  Callers that gate an eager cross-provider
+        fallback on "is there any credential that is definitely usable right now"
+        must use this so a multi-entry pool that is fully quota-exhausted does
+        not report ``True`` just because one entry might be revived by a
+        concurrent re-auth that has not yet been validated by a real request.
+        """
+        with self._lock:
+            sole_credential = self._is_sole_credential()
+            for entry in self._entries:
+                if entry.last_status == STATUS_DEAD:
+                    continue
+                if entry.last_status != STATUS_EXHAUSTED:
+                    return True
+                # Cooldown already elapsed → entry is effectively available now
+                # even though we have not cleared it yet (clear_expired is a
+                # select-time concern, not a "may we fall back" concern).
+                exhausted_until = _exhausted_until(entry, sole_credential=sole_credential)
+                if exhausted_until is None or time.time() >= exhausted_until:
+                    return True
+            return False
+
     def next_available_at(self) -> Optional[float]:
         """Earliest epoch time (seconds) any entry re-enters rotation.
 
