@@ -98,6 +98,11 @@ apps/desktop/src/**/*.d.ts
 !apps/desktop/src/plugins/*/plugin.js
 !apps/desktop/src/global.d.ts
 !apps/desktop/src/vite-env.d.ts
+# EXCEPT fork-owned hand-written declaration modules: src/fork/ holds the
+# fork's ambient declarations (moved out of global.d.ts so upstream's file
+# keeps one anchor). These are source, not tsc output, and tsc never emits
+# into src/fork/.
+!apps/desktop/src/fork/*.d.ts
 
 # Build/debug artifacts that must never be committed
 /log.txt
