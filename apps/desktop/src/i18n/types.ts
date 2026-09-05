@@ -497,6 +497,8 @@ export interface UpstreamTranslations {
       toursDesc: string
       composerPopoutTitle: string
       composerPopoutDesc: string
+      requireModifierToOpenLinksTitle: string
+      requireModifierToOpenLinksDesc: string
       vibeHeartsTitle: string
       vibeHeartsDesc: string
       embedsTitle: string
