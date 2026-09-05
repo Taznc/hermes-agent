@@ -3300,6 +3300,7 @@ def request_review(
     conn: sqlite3.Connection, task_id: str, *, summary: Optional[str] = None,
     metadata: Optional[dict] = None, reviewer: Optional[str] = None,
     expected_run_id: Optional[int] = None, force: bool = False, with_reason: bool = False,
+    reviewer_model_override: Optional[str] = None, reviewer_provider_override: Optional[str] = None,
 ):
     """``running``/``ready`` -> ``review``; never touches block recurrence accounting.
 
@@ -3308,6 +3309,19 @@ def request_review(
     re-review defaults to the latest ``changes_requested`` provenance. A live
     claim is only cleared with proof of ownership (``expected_run_id``) or
     ``force=True``. Returns ``bool``, or ``(ok, reason)`` with ``with_reason``.
+
+    A ``model_override``/``provider_override`` pinned for the IMPLEMENTER is
+    card-scoped in storage but semantically implementation-scoped: a review
+    dispatched to a *different* profile must run that profile's own
+    configured model, never the implementer's pin (the pin silently
+    destroys cross-model review independence otherwise). When ``reviewer``
+    differs from the implementer, the implementer's override is snapshotted
+    onto the ``review_requested`` event (so ``request_changes`` can restore
+    it on the round trip back) and the task columns are cleared for the
+    review run — or set to ``reviewer_model_override``/
+    ``reviewer_provider_override`` when the caller passes an explicit
+    reviewer-specific pin. Same-profile review (reviewer == implementer) is
+    not a cross-profile leak and leaves the override untouched.
     """
 
     def _ret(ok: bool, reason: Optional[str] = None):
@@ -3315,11 +3329,15 @@ def request_review(
 
     summary = redact_review_value(summary)
     metadata = redact_review_value(metadata)
+    reviewer_model_override, reviewer_provider_override = _validate_model_override(
+        reviewer_model_override, reviewer_provider_override,
+    )
     with write_txn(conn):
         if not _parents_satisfied(conn, task_id):
             return _ret(False, "parent dependencies are not satisfied")
         trow = conn.execute(
-            "SELECT assignee, status, claim_lock, current_run_id "
+            "SELECT assignee, status, claim_lock, current_run_id, "
+            "model_override, provider_override "
             "FROM tasks WHERE id = ?", (task_id,),
         ).fetchone()
         if trow is None:
@@ -3347,10 +3365,23 @@ def request_review(
                     "malformed); pass reviewer= explicitly",
                 )
         reviewer = _canonical_assignee(reviewer)
+        # Cross-profile handoff: the implementer's model pin must not follow
+        # the card to a different profile's worker. Same-profile review
+        # (reviewer == implementer, or no reassignment at all) keeps it.
+        cross_profile = reviewer is not None and reviewer != implementer
+        implementer_model_override = trow["model_override"]
+        implementer_provider_override = trow["provider_override"]
+        override_sql = ""
+        override_params: tuple[Any, ...] = ()
+        if cross_profile:
+            override_sql = ", model_override = ?, provider_override = ?"
+            override_params = (reviewer_model_override, reviewer_provider_override)
         assignee_sql = ", assignee = ?" if reviewer is not None else ""
         run_guard = "" if expected_run_id is None else " AND current_run_id = ?"
         params: tuple[Any, ...] = (
-            *(() if reviewer is None else (reviewer,)), task_id,
+            *(() if reviewer is None else (reviewer,)),
+            *override_params,
+            task_id,
             *(() if expected_run_id is None else (int(expected_run_id),)),
         )
         cur = conn.execute(
@@ -3360,7 +3391,7 @@ def request_review(
                    claim_lock    = NULL,
                    claim_expires = NULL,
                    worker_pid    = NULL
-            """ + assignee_sql + """
+            """ + assignee_sql + override_sql + """
              WHERE id = ?
                AND status IN ('running', 'ready')
             """ + run_guard,
@@ -3374,17 +3405,17 @@ def request_review(
             conn, task_id, outcome="review_requested", status="review",
             summary=summary, metadata=metadata, synthesize=bool(summary or metadata),
         )
-        _append_event(
-            conn,
-            task_id,
-            "review_requested",
-            {
-                "summary": _first_line(summary, 400) or None,
-                "implementer": implementer,
-                "reviewer": reviewer,
-            },
-            run_id=run_id,
-        )
+        event_payload = {
+            "summary": _first_line(summary, 400) or None,
+            "implementer": implementer,
+            "reviewer": reviewer,
+        }
+        if cross_profile:
+            # Preserved (not just deleted) so request_changes can restore the
+            # implementer's pin on the round trip back — see docstring.
+            event_payload["implementer_model_override"] = implementer_model_override
+            event_payload["implementer_provider_override"] = implementer_provider_override
+        _append_event(conn, task_id, "review_requested", event_payload, run_id=run_id)
     return _ret(True)
 
 
@@ -3438,10 +3469,25 @@ def request_changes(
         requested_event = _latest_event(conn, task_id, "review_requested")
         if requested_event is None:
             return False, "no prior review_requested event"
-        implementer = _nonblank_str(_json_dict(requested_event["payload"]).get("implementer"))
+        requested_payload = _json_dict(requested_event["payload"])
+        implementer = _nonblank_str(requested_payload.get("implementer"))
         if implementer is None:
             return False, "review handoff has no valid implementer provenance"
         reviewer = _canonical_assignee(_nonblank_str(task_row["assignee"]))
+
+        # Round trip back to the implementer must not silently lose the pin
+        # that request_review snapshotted for a cross-profile handoff. The
+        # keys are only present when request_review actually cleared the
+        # columns (cross_profile=True there); a same-profile review never
+        # touched the columns, so there is nothing to restore.
+        override_sql = ""
+        override_params: tuple[Any, ...] = ()
+        if "implementer_model_override" in requested_payload:
+            override_sql = ", model_override = ?, provider_override = ?"
+            override_params = (
+                _nonblank_str(requested_payload.get("implementer_model_override")),
+                _nonblank_str(requested_payload.get("implementer_provider_override")),
+            )
 
         new_status = _landing_status_after_parents(conn, task_id)
         # consecutive_failures deliberately PRESERVED: a review transition is
@@ -3454,9 +3500,10 @@ def request_changes(
                    claim_lock = NULL,
                    claim_expires = NULL,
                    worker_pid = NULL
+            """ + override_sql + """
              WHERE id = ? AND status = 'running' AND current_run_id = ?
             """,
-            (new_status, implementer, task_id, int(current_run_id)),
+            (new_status, implementer, *override_params, task_id, int(current_run_id)),
         )
         if cur.rowcount != 1:
             return False, "task changed during review handoff"
