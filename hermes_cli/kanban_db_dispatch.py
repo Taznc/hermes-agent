@@ -131,6 +131,11 @@ class DispatchResult:
     request-changes / escalate). Neutral audit outcome — no failure counted, no breaker fed — but
     NOT auto-recoverable like a rate-limit requeue: the task lands in ``blocked`` and stays sticky
     until an explicit ``kanban_unblock`` reopens it for another reviewer."""
+    interrupted: list[str] = field(default_factory=list)
+    """Task ids classified ``infra`` (external SIGTERM/SIGKILL, startup-window dead pid, or
+    provider quota signature) this tick and requeued WITHOUT counting a failure. See
+    ``kanban.max_infra_interruptions`` — a task that keeps landing here is eventually promoted
+    into ``auto_blocked`` instead once its persistent interruption streak exceeds the cap."""
     skipped_locked: bool = False
     """True when another process held the board's dispatch lock: this tick did
     no DB writes; the lock holder is making progress on the same board."""
@@ -432,7 +437,7 @@ def enforce_max_runtime(conn: sqlite3.Connection, *, signal_fn=None) -> list[str
     host_prefix = _kb._host_prefix()
 
     rows = conn.execute(
-        "SELECT t.id, t.worker_pid, "
+        "SELECT t.id, t.worker_pid, t.current_run_id, "
         "       COALESCE(r.started_at, t.started_at) AS active_started_at, "
         "       t.max_runtime_seconds, t.claim_lock "
         "FROM tasks t "
@@ -454,6 +459,18 @@ def enforce_max_runtime(conn: sqlite3.Connection, *, signal_fn=None) -> list[str
 
         pid = int(row["worker_pid"])
         tid = row["id"]
+        # Persist the timeout-kill intent BEFORE sending any signal. This
+        # SQLite row survives a dispatcher restart between signal delivery
+        # and reap: even if THIS process dies right after signalling and a
+        # different dispatcher process reaps the worker later via
+        # detect_crashed_workers, the pending intent tells
+        # _classify_dead_worker this SIGTERM/SIGKILL was dispatcher-owned —
+        # so the path always remains an ordinary counted failure, never
+        # reclassified as an infra/external signal.
+        _kb.persist_timeout_kill_intent(
+            conn, task_id=tid, run_id=row["current_run_id"], worker_pid=pid,
+            signal=int(signal.SIGTERM),
+        )
         # SIGTERM then SIGKILL after 5 s grace; workers wanting a cleaner
         # shutdown install their own SIGTERM handler.
         killed = False
@@ -465,6 +482,10 @@ def enforce_max_runtime(conn: sqlite3.Connection, *, signal_fn=None) -> list[str
             _poll_worker_exit(pid)
             if _kb._pid_alive(pid):
                 killed = _sigkill(kill, pid)
+                _kb.persist_timeout_kill_intent(
+                    conn, task_id=tid, run_id=row["current_run_id"], worker_pid=pid,
+                    signal=int(getattr(signal, "SIGKILL", signal.SIGTERM)),
+                )
 
         error = f"elapsed {int(elapsed)}s > limit {limit}s"
         with _kb.write_txn(conn):
@@ -478,6 +499,11 @@ def enforce_max_runtime(conn: sqlite3.Connection, *, signal_fn=None) -> list[str
                 (retry_status, tid, pid, row["claim_lock"]),
             )
             if cur.rowcount == 1:
+                # This tick completed the full lifecycle (signal -> reap ->
+                # account) itself, so the intent can be consumed immediately;
+                # it only needs to survive when a DIFFERENT process reaps the
+                # worker later (handled by _classify_dead_worker instead).
+                _kb.consume_timeout_kill_intent(conn, task_id=tid, worker_pid=pid)
                 payload = {
                     "pid": pid,
                     "elapsed_seconds": int(elapsed),
@@ -748,20 +774,27 @@ class _DeadWorker:
     protocol_violation: bool = False
     rate_limited: bool = False
     review_no_verdict: bool = False
+    infra: bool = False
 
     @property
     def run_outcome(self) -> str:
         # A rate-limited requeue is recorded as ``rate_limited`` so board history doesn't show a
         # phantom crash for a quota wall; a reviewer no-verdict exit gets its own neutral outcome
-        # for the same reason (neither a crash nor a failure).
+        # for the same reason (neither a crash nor a failure); an infra death is recorded as
+        # ``interrupted`` so it never shows up as a phantom ``crashed`` run outcome either.
         if self.rate_limited:
             return "rate_limited"
         if self.review_no_verdict:
             return "review_no_verdict"
+        if self.infra:
+            return "interrupted"
         return "crashed"
 
 
-def _classify_dead_worker(pid: int, claimer: Optional[str], retry_status: str = "ready") -> _DeadWorker:
+def _classify_dead_worker(
+    conn: sqlite3.Connection, task_id: str, pid: int, claimer: Optional[str],
+    retry_status: str = "ready", *, board: Optional[str] = None,
+) -> _DeadWorker:
     """Map a dead worker's reaped exit status to its reclaim bookkeeping. ``retry_status`` is the
     run's source phase: a clean exit's handling differs by lane (see the review branch)."""
     kind, code = _classify_worker_exit(pid)
@@ -804,6 +837,55 @@ def _classify_dead_worker(pid: int, claimer: Optional[str], retry_status: str = 
             {"pid": pid, "claimer": claimer, "exit_code": code},
             rate_limited=True,
         )
+    # A pending durable timeout-kill intent means THIS dispatcher (or a
+    # predecessor that died between signal and reap) sent this SIGTERM/SIGKILL
+    # itself via enforce_max_runtime — that always remains a legit, counted
+    # failure regardless of which process ends up reaping the worker.
+    dispatcher_killed = (
+        kind == "signaled"
+        and _kb.has_pending_timeout_kill_intent(conn, task_id=task_id, worker_pid=pid)
+    )
+    if dispatcher_killed:
+        _kb.consume_timeout_kill_intent(conn, task_id=task_id, worker_pid=pid)
+    # Provider quota/429 signature in the worker's final log lines — checked
+    # for every non-signaled/non-unknown death too (nonzero_exit is the
+    # common case: an AuthError/RateLimitError bubbling up as a plain
+    # nonzero exit code instead of the dedicated EX_TEMPFAIL sentinel).
+    quota_signal_dict = _kb._detect_quota_exit_signal(task_id, board=board)
+    # Infra classification: for signaled / nonzero_exit / unknown, consult
+    # classify_infra_exit. When infra, the death does NOT count against the
+    # failure budget — it is tracked in the interruption streak instead.
+    # ``kanban.count_infra_failures=true`` restores pre-classification
+    # behaviour wholesale: every death that WOULD be infra-classified is
+    # instead routed through the ordinary legit/counted path below.
+    if kind in ("signaled", "nonzero_exit", "unknown") and not _kb._count_infra_failures_enabled():
+        infra_category, infra_reason = _kb.classify_infra_exit(
+            exit_kind=kind,
+            signal_number=code if kind == "signaled" else None,
+            dispatcher_killed=dispatcher_killed,
+            within_startup_window=(
+                kind == "unknown"
+                and _kb._dispatcher_uptime_seconds() is not None
+                and _kb._dispatcher_uptime_seconds() <= _kb._resolve_infra_startup_window_seconds()
+            ),
+            quota_signal_dict=quota_signal_dict,
+        )
+        if infra_category == "infra":
+            payload = {"pid": pid, "claimer": claimer, "reason": infra_reason}
+            if infra_reason == "quota" and quota_signal_dict:
+                payload["quota_retry_after_seconds"] = quota_signal_dict.get("retry_after_seconds")
+            error_text = (
+                f"pid {pid} {infra_reason} (infra, not counted) "
+                f"[exit_kind={kind}"
+                + (f", signal={code}" if code is not None else "")
+                + "]"
+            )
+            return _DeadWorker(
+                kind, code, error_text, "interrupted", payload,
+                infra=True,
+            )
+
+    # Legit paths: every code and signal not covered by the allowlist.
     if kind == "nonzero_exit":
         error_text = f"pid {pid} exited with code {code}"
     elif kind == "signaled":
@@ -828,6 +910,17 @@ class _CrashSweep:
     # ``(task_id, pid, claimer, protocol_violation, error_text)``: accounted
     # after the txn via ``_record_task_failure`` (needs its own write_txn).
     crash_details: list[tuple[str, int, str, bool, str]] = field(default_factory=list)
+    # ``(task_id, pid, claimer, error_text)`` for infra-classified deaths: not
+    # counted against the failure budget directly, instead bumps the per-task
+    # interruption streak (see ``_account_infra_deaths``).
+    infra_details: list[tuple[str, int, str, str]] = field(default_factory=list)
+    # Task ids classified ``infra`` this tick — surfaced via
+    # ``detect_crashed_workers._last_interrupted`` so callers (dispatch result,
+    # tests) can distinguish an infra requeue from an actual counted crash.
+    # Deliberately NOT included in ``crashed``: the public return value of
+    # ``detect_crashed_workers`` must stay crashed-only, exactly like
+    # ``rate_limited``/``review_no_verdict`` already do.
+    interrupted: list[str] = field(default_factory=list)
     # Worker-exit observer payloads, fired only after every reclaim/accounting
     # txn has committed.
     exited_hook_payloads: list[dict] = field(default_factory=list)
@@ -857,10 +950,28 @@ def _reclaim_dead_workers(conn: sqlite3.Connection) -> _CrashSweep:
 
             pid = int(row["worker_pid"])
             retry_status = _kb._retry_status_for_run(conn, row["id"])
-            dead = _classify_dead_worker(pid, row["claim_lock"], retry_status)
+            dead = _classify_dead_worker(conn, row["id"], pid, row["claim_lock"], retry_status)
             dead.event_payload["retry_status"] = retry_status
-            # A reviewer no-verdict exit parks in ``blocked`` (sticky) instead of its source phase.
-            target_status = "blocked" if dead.review_no_verdict else retry_status
+            # A quota-signature infra death with a usable (parsed + clamped)
+            # retry-after AND a resolvable non-``auto`` provider identity is
+            # parked in ``scheduled`` instead of re-queued to ``ready`` —
+            # every other same-provider task is protected from bouncing off
+            # the same 429 wall (see register_provider_backoff / _task_provider).
+            target_status = retry_status
+            if dead.review_no_verdict:
+                target_status = "blocked"
+            elif getattr(dead, "infra", False) and dead.event_payload.get("reason") == "quota":
+                retry_after = dead.event_payload.get("quota_retry_after_seconds")
+                provider = _kb._task_provider(conn, row["id"]) if _kb._provider_backoff_enabled() else None
+                if provider:
+                    until = _kb.register_provider_backoff(
+                        conn, provider=provider, retry_after=retry_after, task_id=row["id"],
+                        max_seconds=_kb._resolve_provider_backoff_max_seconds(),
+                    )
+                    if until is not None:
+                        target_status = "scheduled"
+                        dead.event_payload["provider"] = provider
+                        dead.event_payload["resume_at"] = until
             cur = conn.execute(
                 "UPDATE tasks SET status = ?, claim_lock = NULL, "
                 "claim_expires = NULL, worker_pid = NULL "
@@ -902,12 +1013,79 @@ def _reclaim_dead_workers(conn: sqlite3.Connection) -> _CrashSweep:
             elif dead.review_no_verdict:
                 # Neutral: no ``last_failure_error`` stamp, never reaches ``_record_task_failure``.
                 sweep.review_no_verdict.append(row["id"])
+            elif getattr(dead, "infra", False):
+                # Infra dead worker: does NOT enter crash_details or the failure
+                # budget, and does NOT count toward the ``crashed`` return
+                # value either — surfaced separately via ``interrupted`` /
+                # ``_last_interrupted`` so callers can see which tasks were
+                # infra-classified this tick without conflating them with
+                # actual counted crashes.
+                sweep.interrupted.append(row["id"])
+                sweep.infra_details.append(
+                    (row["id"], pid, row["claim_lock"], dead.error_text)
+                )
             else:
                 sweep.crashed.append(row["id"])
                 sweep.crash_details.append(
                     (row["id"], pid, row["claim_lock"], dead.protocol_violation, dead.error_text)
                 )
     return sweep
+
+
+def _account_infra_deaths(
+    conn: sqlite3.Connection, infra_details: list[tuple[str, int, str, str]],
+) -> list[str]:
+    """Bump the per-task interruption streak for each infra death and possibly
+    promote to a legit counted crash when ``max_infra_interruptions`` is exceeded.
+
+    Infra deaths (signaled-by-allowlist SIGTERM/SIGKILL, or unknown-within-
+    startup-window) are NOT counted in ``consecutive_failures``. Instead each
+    bump is recorded against a separate per-task streak. When the streak exceeds
+    the configured cap the task is fed to ``_record_task_failure`` as a normal
+    crashed failure so the bounded retry / circuit breaker still eventually
+    applies — the infra window only suppresses the FIRST N infrastructure
+    deaths, not forever.
+
+    Streak is reset ONLY on a non-interruption terminal outcome or an explicit
+    operator reset; a redispatch or protocol-violation retry never clears it.
+
+    Returns the task ids promoted to a counted crash this call (streak
+    exceeded the cap) — the caller removes these from the ``interrupted``
+    side-channel list since they are no longer a neutral outcome.
+    """
+    promoted: list[str] = []
+    if not infra_details:
+        return promoted
+    max_allowed = _kb._resolve_max_infra_interruptions()
+    for tid, pid, claimer, error_text in infra_details:
+        streak = _kb.increment_interruption_streak(conn, task_id=tid)
+        if streak > max_allowed:
+            # Promote to a legit counted crash: fed to the breaker exactly like
+            # a today crash. ``force_trip`` because the decision was made against
+            # the infra cap, not the normal failure counter. The streak is
+            # PRESERVED (not reset) here — only a genuine non-interruption
+            # terminal outcome or an explicit operator reset clears it, so a
+            # task that keeps dying to interruptions cannot loop through the
+            # cap forever by getting a few real successes in between.
+            _record_task_failure(
+                conn, tid,
+                error=(
+                    f"{error_text} [infra interruption streak {streak} exceeded "
+                    f"kanban.max_infra_interruptions={max_allowed}; routed through "
+                    "normal counted-failure accounting]"
+                ),
+                outcome="crashed",
+                failure_limit=max_allowed,
+                force_trip=True,
+                release_claim=False,
+                end_run=False,
+                event_payload_extra={
+                    "pid": pid, "claimer": claimer, "infra_streak": streak,
+                    "infra_streak_cap": max_allowed,
+                },
+            )
+            promoted.append(tid)
+    return promoted
 
 
 def _account_crashes(conn: sqlite3.Connection, crash_details: list) -> list[str]:
@@ -991,6 +1169,28 @@ def detect_crashed_workers(conn: sqlite3.Connection) -> list[str]:
     # Reviewer no-verdict parks: not a failure, not a crash, and (unlike rate-limited) not
     # auto-recoverable — sticky in ``blocked`` until an explicit ``kanban_unblock``.
     detect_crashed_workers._last_review_no_verdict = sweep.review_no_verdict  # type: ignore[attr-defined]
+    # Infra dead workers: bump the per-task interruption streak. When the
+    # configured cap (``max_infra_interruptions``) is exceeded the task is
+    # promoted to a legit counted crash (fed to _record_task_failure) so the
+    # bounded retry / breaker still applies — the infra window only suppresses
+    # the FIRST N infrastructure deaths, not forever.
+    promoted = _account_infra_deaths(conn, sweep.infra_details) if sweep.infra_details else []
+    detect_crashed_workers._last_interrupted = (  # type: ignore[attr-defined]
+        [tid for tid in sweep.interrupted if tid not in promoted]
+    )
+    if promoted:
+        # force_trip=True always trips inside _record_task_failure, so every
+        # promoted id auto-blocked; fold into the public auto_blocked side-
+        # channel so DispatchResult.auto_blocked reflects it too.
+        auto_blocked.extend(promoted)
+        detect_crashed_workers._last_auto_blocked = auto_blocked  # type: ignore[attr-defined]
+        # A streak-exceeded infra death is, from the caller's perspective, now
+        # an ordinary accounted crash — fold it into the public return value
+        # too so callers that only look at the return list (not the
+        # ``_last_interrupted``/``_last_auto_blocked`` side channels) still
+        # see it.
+        sweep.crashed.extend(promoted)
+
     # Fired only now, after the reclaim txn AND breaker accounting have
     # committed, so subscribers always observe fully durable board state.
     if sweep.exited_hook_payloads and _kb._kanban_observer_consumed("on_kanban_worker_exited"):
@@ -1100,13 +1300,16 @@ def _record_task_failure(
             return False
 
         # Spawn path (release_claim) is still running and also clears claim
-        # state; the timeout/crash path already did.
+        # state; the timeout/crash path already did. ``scheduled`` is included
+        # alongside ``ready``/``review`` because a quota-parked task (provider
+        # backoff) can reach this trip branch via the infra-interruption cap
+        # (_account_infra_deaths) while still sitting in ``scheduled``.
         conn.execute(
             "UPDATE tasks SET status = 'blocked', "
             + ("claim_lock = NULL, claim_expires = NULL, worker_pid = NULL, "
                if release_claim else "")
             + "consecutive_failures = ?, last_failure_error = ? "
-            "WHERE id = ? AND status IN ('running', 'ready', 'review')",
+            "WHERE id = ? AND status IN ('running', 'ready', 'review', 'scheduled')",
             (failures, error, task_id),
         )
         payload = {
@@ -1192,6 +1395,16 @@ def check_respawn_guard(
         return None
 
     now = int(time.time())
+
+    # 0. Provider-wide pause is checked first in both lanes. Unlike the
+    #    per-task rate-limit cooldown below, this protects every task
+    #    explicitly pinned to the exhausted provider while allowing other
+    #    providers (and ``provider: auto`` tasks, which can resolve
+    #    elsewhere) to continue.
+    if _kb._provider_backoff_enabled():
+        provider = _kb._task_provider(conn, task_id)
+        if provider and _kb.provider_backoff_until(conn, provider=provider) is not None:
+            return "provider_backoff"
 
     # 1. Rate-limit cooldown — see docstring for why this precedes blocker_auth.
     #    LATEST run only: a newer crash/completion supersedes the rate-limit run.
@@ -1689,6 +1902,7 @@ def _run_reclaim_phase(
     result.auto_blocked.extend(getattr(detect_crashed_workers, "_last_auto_blocked", []))
     result.rate_limited.extend(getattr(detect_crashed_workers, "_last_rate_limited", []))
     result.review_no_verdict.extend(getattr(detect_crashed_workers, "_last_review_no_verdict", []))
+    result.interrupted.extend(getattr(detect_crashed_workers, "_last_interrupted", []))
     result.timed_out = enforce_max_runtime(conn)
     result.promoted = _kb.recompute_ready(conn, failure_limit=failure_limit)
 
@@ -1819,6 +2033,10 @@ def _dispatch_once_locked(
         _kb.reap_staged_attachments(board=board)
     except Exception:
         _kb._log.debug("reap_staged_attachments failed during dispatch tick", exc_info=True)
+    # Durable provider pauses are resumed by the dispatcher itself, not an
+    # external cron: this makes restart recovery deterministic and emits one
+    # ``unblocked`` event via release_expired_provider_backoffs().
+    _kb.release_expired_provider_backoffs(conn)
     _run_reclaim_phase(
         conn, result, stale_timeout_seconds=stale_timeout_seconds,
         failure_limit=failure_limit, reconcile_orphans=reconcile_orphans,
