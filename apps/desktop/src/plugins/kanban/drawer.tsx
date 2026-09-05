@@ -55,6 +55,7 @@ import {
 } from './api'
 import { indexBoard, partitionBlockers, resolveLinks } from './deps'
 import { ModelOverrideField, overridePatch } from './model-override'
+import { resolveBlockCause, runErrorText, statusGuidance } from './status-guidance'
 import {
   type ChoiceResponse,
   columnMeta,
@@ -64,6 +65,7 @@ import {
   type KanbanBoard,
   type KanbanComment,
   type KanbanEvent,
+  type KanbanRun,
   type KanbanTask,
   type KanbanTaskDetail,
   type KanbanTaskFull,
@@ -176,6 +178,38 @@ function eventText(event: KanbanEvent, k: KanbanText): { detail?: string; label:
 
     case 'reprioritized':
       return { label: k.evtReprioritized(String(p.priority ?? '?')) }
+    case 'gave_up': {
+      const rawError = str('error')
+
+      return { label: k.evtGaveUp, detail: rawError ? runErrorText(rawError, k).primary : undefined }
+    }
+
+    case 'crashed': {
+      const rawError = str('error')
+
+      return { label: k.evtCrashed, detail: rawError ? runErrorText(rawError, k).primary : undefined }
+    }
+
+    case 'timed_out':
+      return { label: k.evtTimedOut }
+
+    case 'protocol_violation':
+      return { label: k.evtProtocolViolation }
+
+    case 'review_no_verdict':
+      return { label: k.evtReviewNoVerdict }
+
+    case 'stale':
+      return { label: k.evtStale }
+
+    case 'dependency_wait':
+      return { label: k.evtDependencyWait, detail: str('reason') ?? undefined }
+
+    case 'block_loop_detected':
+      return { label: k.evtBlockLoop, detail: str('reason') ?? undefined }
+
+    case 'held':
+      return { label: k.evtHeld, detail: str('reason') ?? undefined }
     default: {
       const detail = Object.entries(p)
         .filter(([, value]) => value != null && typeof value !== 'object')
@@ -281,41 +315,12 @@ export function ActivityRow({ group, k }: { group: ActivityGroup; k: KanbanText 
   )
 }
 
-/**
- * The dispatcher writes machine-shaped diagnostics into `run.error`
- * (`stale_lock=hermes-dev:27237`, `pid 111279 not alive`) that a human
- * cannot act on unread. Recognized shapes get a plain-language primary line;
- * the raw string stays available behind an expand toggle rather than being
- * the primary text. Unrecognized shapes fall back to showing the raw string
- * as primary — there's nothing to translate.
- */
-export function runErrorText(error: string, k: KanbanText): { primary: string; raw?: string } {
-  const staleLock = /^stale_lock=(.+)$/.exec(error)
-
-  if (staleLock) {
-    return { primary: k.runErrStaleLock, raw: error }
-  }
-
-  const notAlive = /^pid \d+ not alive$/.exec(error)
-
-  if (notAlive) {
-    return { primary: k.runErrPidNotAlive, raw: error }
-  }
-
-  const exited = /^pid \d+ exited with code (.+)$/.exec(error)
-
-  if (exited) {
-    return { primary: k.runErrPidExited(exited[1]), raw: error }
-  }
-
-  const signaled = /^pid \d+ killed by signal (.+)$/.exec(error)
-
-  if (signaled) {
-    return { primary: k.runErrPidSignaled(signaled[1]), raw: error }
-  }
-
-  return { primary: error }
-}
+// The plain-language framing for raw dispatcher diagnostics
+// (`stale_lock=...`, `pid N not alive`, ...) lives in `status-guidance.ts` so
+// the CTA banner's automatic-failure copy and this file's run-history lines
+// can never drift apart — one function, two renderers. Re-exported: some
+// tests still import it from here.
+export { runErrorText } from './status-guidance'
 
 export function RunErrorLine({ error, k }: { error: string; k: KanbanText }) {
   const [expanded, setExpanded] = useState(false)
@@ -692,6 +697,7 @@ export function CtaBanner({
   onFocusComment,
   onMove,
   onSubmitChoice,
+  runs = [],
   task
 }: {
   comments: KanbanComment[]
@@ -699,67 +705,161 @@ export function CtaBanner({
   onFocusComment: () => void
   onMove: (status: string) => void
   onSubmitChoice: (body: string, choice: ChoiceResponse) => Promise<unknown>
+  runs?: KanbanRun[]
   task: KanbanTaskFull
 }) {
   const k = useKanban()
 
-  if (task.status === 'blocked') {
-    const kind = (task.block_kind ?? null) as null | 'capability' | 'needs_input' | 'transient'
-    const blockEvent = latestBlockEvent(events)
-    const reason = blockEvent?.reason ?? null
-    // A valid ```choices fence renders clickable options instead of the plain
-    // paragraph; any missing/malformed fence falls back to today's exact
-    // plain-text + free-text-composer path (spec §5).
-    const choices = reason ? parseBlockedChoices(reason) : null
-    // needs_input reads as a literal question waiting on the user; the other
-    // kinds (capability / transient / untyped legacy) are still "blocked",
-    // just for a different reason — the icon + label change, the actions don't.
-    const icon = kind === 'needs_input' ? 'question' : kind === 'transient' ? 'sync' : 'error'
-    const tone = kind === 'transient' ? '#fbbf24' : SEVERITY_TONE.error
+  const copyLogCommand = () => {
+    void navigator.clipboard.writeText(`hermes kanban log ${task.id}`)
+    host.notify({ kind: 'info', message: k.commandCopied })
+  }
 
-    return (
-      <Banner
-        actions={
-          choices ? (
-            <Button onClick={() => onMove('ready')} size="xs" variant="outline">
+  if (task.status === 'blocked') {
+    const cause = resolveBlockCause(task, events, runs)
+
+    // C. A reviewer's claimed run exited cleanly without a verdict — never a
+    // question for the user to answer, never framed as a missing reason.
+    // The task is sticky here until an explicit unblock reopens it for
+    // another review pass (kanban_db._has_sticky_block).
+    if (cause.origin === 'review_no_verdict') {
+      return (
+        <Banner
+          actions={
+            <Button onClick={() => onMove('ready')} size="xs" variant="secondary">
               <Codicon name="debug-continue" size="0.7rem" />
-              {k.ctaUnblock}
+              {k.ctaRequeueReview}
             </Button>
-          ) : (
-            <>
-              <Button onClick={onFocusComment} size="xs" variant="secondary">
-                <Codicon name="comment" size="0.7rem" />
-                {k.ctaReply}
-              </Button>
+          }
+          icon="eye"
+          title={k.ctaReviewNoVerdictTitle}
+          tone={columnMeta('review').tone}
+        >
+          <p className="text-[0.75rem] leading-relaxed text-(--ui-text-secondary)">{k.ctaReviewNoVerdictBody}</p>
+        </Banner>
+      )
+    }
+
+    // A. A worker's own typed kanban_block(reason=...) — authoritative,
+    // shown verbatim, with the choices-fence path untouched.
+    if (cause.origin === 'manual') {
+      const kind = cause.kind
+      const blockEvent = latestBlockEvent(events)
+      const reason = cause.reason || null
+      // A valid ```choices fence renders clickable options instead of the
+      // plain paragraph; any missing/malformed fence falls back to the
+      // plain-text + free-text-composer path (spec §5).
+      const choices = reason ? parseBlockedChoices(reason) : null
+      // needs_input reads as a literal question waiting on the user; the
+      // other kinds (capability / transient / untyped legacy) are still
+      // "blocked", just for a different reason — the icon + label change,
+      // the actions don't.
+      const icon = kind === 'needs_input' ? 'question' : kind === 'transient' ? 'sync' : 'error'
+      const tone = kind === 'transient' ? '#fbbf24' : SEVERITY_TONE.error
+
+      return (
+        <Banner
+          actions={
+            choices ? (
               <Button onClick={() => onMove('ready')} size="xs" variant="outline">
                 <Codicon name="debug-continue" size="0.7rem" />
                 {k.ctaUnblock}
               </Button>
+            ) : (
+              <>
+                <Button onClick={onFocusComment} size="xs" variant="secondary">
+                  <Codicon name="comment" size="0.7rem" />
+                  {k.ctaReply}
+                </Button>
+                <Button onClick={() => onMove('ready')} size="xs" variant="outline">
+                  <Codicon name="debug-continue" size="0.7rem" />
+                  {k.ctaUnblock}
+                </Button>
+              </>
+            )
+          }
+          icon={icon}
+          title={kind ? k.blockKind[kind] : k.ctaBlockedTitle}
+          tone={tone}
+        >
+          {choices ? (
+            <>
+              {choices.prose && (
+                <p className="text-[0.75rem] leading-relaxed text-(--ui-text-secondary)">{choices.prose}</p>
+              )}
+              <ChoiceOptions
+                comments={comments}
+                onSubmit={onSubmitChoice}
+                options={choices.options}
+                prose={choices.prose}
+                questionEventId={blockEvent!.id}
+              />
             </>
-          )
-        }
-        icon={icon}
-        title={kind ? k.blockKind[kind] : k.ctaBlockedTitle}
-        tone={tone}
-      >
-        {choices ? (
+          ) : (
+            <p className="text-[0.75rem] leading-relaxed text-(--ui-text-secondary)">
+              {reason || k.ctaBlockedNoReason}
+            </p>
+          )}
+        </Banner>
+      )
+    }
+
+    // B. Automatic circuit-breaker trip (gave_up / crashed / timed_out /
+    // protocol_violation / rate_limited / stale) — this is NOT the worker
+    // omitting a reason, and NOT a question for the user: it's a structured
+    // failure with a real cause. Primary action is retry/reassign, not
+    // reply — demoted to a secondary action here.
+    if (cause.origin === 'automatic') {
+      const { primary } = runErrorText(cause.raw, k)
+
+      return (
+        <Banner
+          actions={
+            <>
+              <Button onClick={() => onMove('ready')} size="xs" variant="secondary">
+                <Codicon name="debug-continue" size="0.7rem" />
+                {k.ctaRetry}
+              </Button>
+              <Button onClick={copyLogCommand} size="xs" variant="outline">
+                <Codicon name="copy" size="0.7rem" />
+                {k.ctaCopyLogCommand}
+              </Button>
+              <Button onClick={onFocusComment} size="xs" variant="outline">
+                <Codicon name="comment" size="0.7rem" />
+                {k.ctaReply}
+              </Button>
+            </>
+          }
+          icon="error"
+          title={k.ctaBlockedAutomaticTitle}
+          tone={SEVERITY_TONE.error}
+        >
+          <p className="text-[0.75rem] leading-relaxed text-(--ui-text-secondary)">{primary}</p>
+        </Banner>
+      )
+    }
+
+    // D. No cause found anywhere (born blocked, or a legacy/direct-DB edit
+    // with zero events) — honest generic diagnostic, never fabricated.
+    return (
+      <Banner
+        actions={
           <>
-            {choices.prose && (
-              <p className="text-[0.75rem] leading-relaxed text-(--ui-text-secondary)">{choices.prose}</p>
-            )}
-            <ChoiceOptions
-              comments={comments}
-              onSubmit={onSubmitChoice}
-              options={choices.options}
-              prose={choices.prose}
-              questionEventId={blockEvent!.id}
-            />
+            <Button onClick={() => onMove('ready')} size="xs" variant="secondary">
+              <Codicon name="debug-continue" size="0.7rem" />
+              {k.ctaRetry}
+            </Button>
+            <Button onClick={copyLogCommand} size="xs" variant="outline">
+              <Codicon name="copy" size="0.7rem" />
+              {k.ctaCopyLogCommand}
+            </Button>
           </>
-        ) : (
-          <p className="text-[0.75rem] leading-relaxed text-(--ui-text-secondary)">
-            {reason || k.ctaBlockedNoReason}
-          </p>
-        )}
+        }
+        icon="error"
+        title={k.ctaBlockedTitle}
+        tone={SEVERITY_TONE.error}
+      >
+        <p className="text-[0.75rem] leading-relaxed text-(--ui-text-secondary)">{k.ctaBlockedNoReason}</p>
       </Banner>
     )
   }
@@ -1796,8 +1896,13 @@ export function TaskDrawer({
               }}
               onMove={move}
               onSubmitChoice={(body, choice) => commentMut.mutateAsync({ body, choice })}
+              runs={detail.runs}
               task={task}
             />
+
+            <p className="text-[0.71rem] leading-relaxed text-(--ui-text-tertiary)">
+              {statusGuidance(task.status, task, detail.events, detail.runs, k)}
+            </p>
 
             <div className="flex flex-col gap-1.5 opacity-80">
               <div className={FIELD_LABEL}>{k.metaSectionLabel}</div>
