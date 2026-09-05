@@ -2719,6 +2719,10 @@ DEFAULT_CONFIG = {
         # like any other crash). See
         # docs/kanban/infra-failure-classification.md.
         "count_infra_failures": False,
+        # Park a parseable provider quota 429 until its advertised retry
+        # deadline, rather than immediately re-dispatching into the same wall.
+        # The pause is provider-wide and persisted in the Kanban DB.
+        "provider_backoff": True,
         # How long (seconds) after the dispatcher process itself started a
         # "pid N not alive" discovery is presumed to be a gateway restart /
         # VM boot racing the crash check (classified "infra") rather than a

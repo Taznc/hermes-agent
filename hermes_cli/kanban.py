@@ -2039,6 +2039,7 @@ def _cmd_diagnostics(args: argparse.Namespace) -> int:
                     "title": r["title"], "status": r["status"],
                     "assignee": r["assignee"],
                 }
+        provider_backoffs = kb.active_provider_backoffs(conn)
 
     if getattr(args, "json", False):
         out_json = [
@@ -2053,7 +2054,12 @@ def _cmd_diagnostics(args: argparse.Namespace) -> int:
         return 0
 
     if not diags_by_task:
-        print("No active diagnostics on this board.")
+        if provider_backoffs:
+            print("Active provider pauses:")
+            for pause in provider_backoffs:
+                print(f"  {pause['provider']}: {pause['reason']} — resumes {_fmt_ts(pause['until'])}")
+        else:
+            print("No active diagnostics on this board.")
         return 0
 
     # Human-readable summary: grouped by task, severity-marked, with
@@ -3011,6 +3017,10 @@ def _cmd_stats(args: argparse.Namespace) -> int:
     age = stats["oldest_ready_age_seconds"]
     if age is not None:
         print(f"\nOldest ready task age: {int(age)}s")
+    if stats.get("provider_backoffs"):
+        print("\nActive provider pauses:")
+        for pause in stats["provider_backoffs"]:
+            print(f"  {pause['provider']:20s}  {pause['reason']}  resumes {_fmt_ts(pause['until'])}")
     return 0
 
 

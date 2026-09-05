@@ -1571,6 +1571,23 @@ CREATE TABLE IF NOT EXISTS kanban_notify_subs (
     PRIMARY KEY (task_id, platform, chat_id, thread_id)
 );
 
+-- Active provider-level dispatch pauses (docs/kanban/provider-backoff.md).
+-- One row per paused provider slug (``openai-codex``, ``anthropic``, ...).
+-- Populated when a worker's exit is classified as a 429/quota ``infra``
+-- death with a parseable ``retry after Ns``; consulted by
+-- ``check_respawn_guard`` before every ready/review spawn so no OTHER
+-- ready task pinned to the same provider is dispatched into the same
+-- wall. Deliberately a real table (not an in-process registry) so the
+-- pause survives a dispatcher restart -- a VM reboot mid-quota-window
+-- must not immediately re-dispatch into a wall we already proved is up.
+CREATE TABLE IF NOT EXISTS kanban_provider_backoff (
+    provider   TEXT PRIMARY KEY,
+    until      INTEGER NOT NULL,
+    reason     TEXT NOT NULL DEFAULT 'quota',
+    task_id    TEXT,
+    created_at INTEGER NOT NULL
+);
+
 CREATE INDEX IF NOT EXISTS idx_tasks_assignee_status ON tasks(assignee, status);
 CREATE INDEX IF NOT EXISTS idx_tasks_status          ON tasks(status);
 CREATE INDEX IF NOT EXISTS idx_links_child           ON task_links(child_id);
@@ -1580,6 +1597,7 @@ CREATE INDEX IF NOT EXISTS idx_events_task           ON task_events(task_id, cre
 CREATE INDEX IF NOT EXISTS idx_runs_task             ON task_runs(task_id, started_at);
 CREATE INDEX IF NOT EXISTS idx_runs_status           ON task_runs(status);
 CREATE INDEX IF NOT EXISTS idx_attachments_task      ON task_attachments(task_id, created_at);
+CREATE INDEX IF NOT EXISTS idx_provider_backoff_until ON kanban_provider_backoff(until);
 CREATE INDEX IF NOT EXISTS idx_notify_task           ON kanban_notify_subs(task_id);
 """
 
@@ -8454,6 +8472,97 @@ def _detect_quota_exit_signal(
     return {"retry_after_seconds": int(m.group(1)) if m else None}
 
 
+def _provider_backoff_enabled() -> bool:
+    """Whether provider-wide quota pauses are enabled (default true)."""
+    raw = os.environ.get("HERMES_KANBAN_PROVIDER_BACKOFF")
+    if raw is not None:
+        return raw.strip().lower() not in {"0", "false", "no", "off"}
+    try:
+        from hermes_cli.config import load_config_readonly
+        return bool((load_config_readonly().get("kanban") or {}).get("provider_backoff", True))
+    except Exception:
+        return True
+
+
+def _task_provider(conn: sqlite3.Connection, task_id: str) -> Optional[str]:
+    """Resolve a task's explicit provider, falling back to its profile config.
+
+    Reading the assignee's own config gives profile-pinned providers separate
+    pauses while deliberately leaving ``provider: auto`` unpaused: auto routing
+    may choose a healthy provider and must not be guessed as exhausted.
+    """
+    row = conn.execute(
+        "SELECT provider_override, assignee FROM tasks WHERE id = ?", (task_id,),
+    ).fetchone()
+    if not row:
+        return None
+    if row["provider_override"]:
+        return str(row["provider_override"])
+    assignee = row["assignee"]
+    if not assignee:
+        return None
+    try:
+        from hermes_constants import get_default_hermes_root
+        from hermes_cli.config import read_user_config_raw
+        root = Path(get_default_hermes_root())
+        cfg_path = root / "config.yaml" if assignee == "default" else root / "profiles" / str(assignee) / "config.yaml"
+        cfg = read_user_config_raw(cfg_path)
+        provider = (cfg.get("agent") or {}).get("provider")
+        return str(provider) if provider and provider != "auto" else None
+    except Exception:
+        return None
+
+
+def register_provider_backoff(
+    conn: sqlite3.Connection, *, provider: str, until: int, task_id: str,
+    reason: str = "quota",
+) -> None:
+    """Persist the longest known pause for a provider across dispatcher restarts."""
+    with write_txn(conn):
+        conn.execute(
+            """INSERT INTO kanban_provider_backoff(provider, until, reason, task_id, created_at)
+               VALUES (?, ?, ?, ?, ?)
+               ON CONFLICT(provider) DO UPDATE SET
+                 until=MAX(kanban_provider_backoff.until, excluded.until),
+                 reason=excluded.reason, task_id=excluded.task_id""",
+            (provider, int(until), reason, task_id, int(time.time())),
+        )
+
+
+def active_provider_backoffs(conn: sqlite3.Connection) -> list[dict]:
+    """Return active provider pauses in a stable, CLI-ready form."""
+    now = int(time.time())
+    return [dict(r) for r in conn.execute(
+        "SELECT provider, until, reason, task_id FROM kanban_provider_backoff "
+        "WHERE until > ? ORDER BY provider", (now,),
+    ).fetchall()]
+
+
+def release_expired_provider_backoffs(conn: sqlite3.Connection) -> list[str]:
+    """Resume quota-parked tasks exactly once and clear expired pause rows."""
+    now = int(time.time())
+    resumed: list[str] = []
+    with write_txn(conn):
+        expired = conn.execute(
+            "SELECT provider, until, task_id FROM kanban_provider_backoff WHERE until <= ?", (now,),
+        ).fetchall()
+        for row in expired:
+            task_id = row["task_id"]
+            if task_id:
+                cur = conn.execute(
+                    "UPDATE tasks SET status='ready' WHERE id=? AND status='scheduled'",
+                    (task_id,),
+                )
+                if cur.rowcount:
+                    _append_event(conn, task_id, "unblocked", {
+                        "reason": "provider_backoff_elapsed", "provider": row["provider"],
+                        "resume_at": int(row["until"]),
+                    })
+                    resumed.append(task_id)
+        conn.execute("DELETE FROM kanban_provider_backoff WHERE until <= ?", (now,))
+    return resumed
+
+
 def classify_infra_exit(
     *,
     exit_kind: str,
@@ -9275,6 +9384,8 @@ def detect_crashed_workers(conn: sqlite3.Connection) -> list[str]:
             rate_limited_exit = False
             infra_exit = False
             infra_reason = None
+            quota_provider = None
+            quota_resume_at = None
             if kind == "clean_exit":
                 # Worker subprocess returned 0 but its task is still
                 # ``running`` in the DB — it exited without calling
@@ -9367,6 +9478,13 @@ def detect_crashed_workers(conn: sqlite3.Connection) -> list[str]:
                         event_payload["quota_retry_after_seconds"] = quota_signal.get(
                             "retry_after_seconds"
                         )
+                        retry_after = quota_signal.get("retry_after_seconds")
+                        if retry_after and _provider_backoff_enabled():
+                            quota_provider = _task_provider(conn, row["id"])
+                            if quota_provider:
+                                quota_resume_at = int(time.time()) + int(retry_after)
+                                event_payload["provider"] = quota_provider
+                                event_payload["resume_at"] = quota_resume_at
                 else:
                     event_kind = "crashed"
                     event_payload = {"pid": pid, "claimer": row["claim_lock"]}
@@ -9374,7 +9492,7 @@ def detect_crashed_workers(conn: sqlite3.Connection) -> list[str]:
                         event_payload["exit_kind"] = kind
                         event_payload["exit_code"] = code
 
-            retry_status = _retry_status_for_run(conn, row["id"])
+            retry_status = "scheduled" if quota_resume_at is not None else _retry_status_for_run(conn, row["id"])
             event_payload["retry_status"] = retry_status
             cur = conn.execute(
                 "UPDATE tasks SET status = ?, claim_lock = NULL, "
@@ -9384,6 +9502,15 @@ def detect_crashed_workers(conn: sqlite3.Connection) -> list[str]:
                 (retry_status, row["id"], pid, row["claim_lock"]),
             )
             if cur.rowcount == 1:
+                if quota_provider and quota_resume_at is not None:
+                    conn.execute(
+                        """INSERT INTO kanban_provider_backoff(provider, until, reason, task_id, created_at)
+                           VALUES (?, ?, 'quota', ?, ?)
+                           ON CONFLICT(provider) DO UPDATE SET
+                             until=MAX(kanban_provider_backoff.until, excluded.until),
+                             reason='quota', task_id=excluded.task_id""",
+                        (quota_provider, quota_resume_at, row["id"], int(time.time())),
+                    )
                 # Rate-limited and infra requeues are a clean release, not a
                 # crash — record the run outcome accordingly so the board
                 # history doesn't show a phantom crash for a quota wall or
@@ -9869,6 +9996,19 @@ def check_respawn_guard(
         return None
 
     now = int(time.time())
+
+    # Provider-wide pause is checked first in both lanes. Unlike the legacy
+    # per-task cooldown this protects every task explicitly pinned to the
+    # exhausted provider while allowing other providers to continue.
+    if _provider_backoff_enabled():
+        provider = _task_provider(conn, task_id)
+        if provider:
+            pause = conn.execute(
+                "SELECT 1 FROM kanban_provider_backoff WHERE provider = ? AND until > ?",
+                (provider, now),
+            ).fetchone()
+            if pause:
+                return "provider_backoff"
 
     # 1. Rate-limit cooldown. The most recent run ended ``rate_limited``
     #    (quota wall) — defer while inside the cooldown window, then allow a
@@ -10359,6 +10499,10 @@ def _dispatch_once_locked(
     reap_worker_zombies()
 
     result = DispatchResult()
+    # Durable provider pauses are resumed by the dispatcher itself, not an
+    # external cron: this makes restart recovery deterministic and emits one
+    # resume event via release_expired_provider_backoffs().
+    release_expired_provider_backoffs(conn)
     result.reclaimed = release_stale_claims(conn)
     if reconcile_orphans:
         # Orphaned-card reconciliation: requeue 'running' cards whose claim
@@ -11710,6 +11854,7 @@ def board_stats(conn: sqlite3.Connection) -> dict:
         "by_status": by_status,
         "by_assignee": by_assignee,
         "oldest_ready_age_seconds": oldest_ready_age,
+        "provider_backoffs": active_provider_backoffs(conn),
         "now": now,
     }
 

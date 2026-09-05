@@ -344,7 +344,80 @@ def test_quota_log_signature_detected_from_worker_log_is_infra(
 
 
 # ---------------------------------------------------------------------------
-# 3. Config flip: kanban.count_infra_failures=true restores counting
+# 3. Provider quota backoff
+# ---------------------------------------------------------------------------
+
+
+def test_quota_429_parks_task_and_pauses_matching_provider_until_retry_deadline(
+    kanban_home, monkeypatch,
+):
+    """A parseable quota 429 parks its task and every same-provider task;
+    other providers remain dispatchable. The durable row is the restart-safe
+    source of truth and carries the explicit resume timestamp."""
+    import hermes_cli.kanban_db as _kb
+
+    now = 1_700_000_000
+    monkeypatch.setattr(_kb.time, "time", lambda: now)
+    monkeypatch.setattr(_kb, "_pid_alive", lambda _pid: False)
+    monkeypatch.setenv("HERMES_KANBAN_CRASH_GRACE_SECONDS", "0")
+
+    with kb.connect() as conn:
+        host = _kb._claimer_id().split(":", 1)[0]
+        affected = kb.create_task(
+            conn, title="quota", assignee="a", model_override="gpt", provider_override="openai-codex",
+        )
+        same_provider = kb.create_task(
+            conn, title="same", assignee="b", model_override="gpt", provider_override="openai-codex",
+        )
+        other_provider = kb.create_task(
+            conn, title="other", assignee="c", model_override="claude", provider_override="anthropic",
+        )
+        kb.claim_task(conn, affected, claimer=f"{host}:quota")
+        conn.execute("UPDATE tasks SET worker_pid=? WHERE id=?", (80100, affected))
+        conn.commit()
+        _kb._record_worker_exit(80100, _exited_status(1))
+        _kb.worker_log_path(affected).parent.mkdir(parents=True, exist_ok=True)
+        _kb.worker_log_path(affected).write_text(
+            "openai-codex provider quota exhausted (429); retry after 60s\n",
+            encoding="utf-8",
+        )
+
+        assert kb.detect_crashed_workers(conn) == []
+        assert kb.get_task(conn, affected).status == "scheduled"
+        assert kb.check_respawn_guard(conn, same_provider) == "provider_backoff"
+        assert kb.check_respawn_guard(conn, other_provider) is None
+        assert kb.active_provider_backoffs(conn) == [{
+            "provider": "openai-codex", "until": now + 60,
+            "reason": "quota", "task_id": affected,
+        }]
+        event = next(e for e in kb.list_events(conn, affected) if e.kind == "interrupted")
+        assert event.payload["provider"] == "openai-codex"
+        assert event.payload["resume_at"] == now + 60
+
+        monkeypatch.setattr(_kb.time, "time", lambda: now + 61)
+        assert kb.release_expired_provider_backoffs(conn) == [affected]
+        assert kb.get_task(conn, affected).status == "ready"
+        assert kb.check_respawn_guard(conn, same_provider) is None
+
+
+def test_provider_backoff_disabled_keeps_infra_quota_requeue_immediate(
+    kanban_home, monkeypatch,
+):
+    """The explicit feature flag restores immediate re-dispatch behavior."""
+    monkeypatch.setenv("HERMES_KANBAN_PROVIDER_BACKOFF", "false")
+    with kb.connect() as conn:
+        kb.register_provider_backoff(
+            conn, provider="openai-codex", until=9_999_999_999,
+            task_id="irrelevant", reason="quota",
+        )
+        tid = kb.create_task(
+            conn, title="unpaused", assignee="a", model_override="gpt", provider_override="openai-codex",
+        )
+        assert kb.check_respawn_guard(conn, tid) is None
+
+
+# ---------------------------------------------------------------------------
+# 4. Config flip: kanban.count_infra_failures=true restores counting
 # ---------------------------------------------------------------------------
 
 
