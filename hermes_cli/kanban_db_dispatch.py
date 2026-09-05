@@ -182,65 +182,31 @@ def _record_worker_exit(pid: int, raw_status: int) -> None:
             _recent_worker_exits.pop(_pid, None)
 
 
-def _scope_exit_status(unit_name: str) -> "Optional[tuple[str, Optional[int]]]":
-    """Exit classification for a systemd ``--user --scope`` unit, read via
-    ``systemctl --user show`` instead of ``waitpid`` — the fallback path for a
-    worker that is not (or is no longer) this process's own child, e.g. after
-    a gateway restart re-adopts a task whose worker was spawned by the
-    previous dispatcher process. Same ``(kind, code)`` shape as
-    :func:`_classify_worker_exit`: ``clean_exit``/``rate_limited``/
-    ``nonzero_exit``/``signaled``, or ``None`` when the unit's fate can't be
-    determined right now (``systemctl`` unavailable, unit already
-    ``--collect``-cleaned, or still running) — callers fall back to their own
-    ``"unknown"`` handling in that case.
-    """
-    from tools.process_registry import scope_unit_show_properties
-
-    props = scope_unit_show_properties(unit_name)
-    if not props:
-        return None
-    active_state = props.get("ActiveState", "")
-    exec_code = props.get("ExecMainCode", "")
-    raw_status = props.get("ExecMainStatus", "")
-    if active_state not in ("inactive", "failed"):
-        # Still running (or transitioning) — not a verdict yet.
-        return None
-    try:
-        status = int(raw_status)
-    except (TypeError, ValueError):
-        return None
-    if exec_code == "exited":
-        if status == 0:
-            return ("clean_exit", 0)
-        if status == _kb.KANBAN_RATE_LIMIT_EXIT_CODE:
-            return ("rate_limited", status)
-        return ("nonzero_exit", status)
-    if exec_code == "killed":
-        return ("signaled", status)
-    return None
-
-
-def _classify_worker_exit(pid: int, worker_unit: Optional[str] = None) -> "tuple[str, Optional[int]]":
+def _classify_worker_exit(pid: int) -> "tuple[str, Optional[int]]":
     """``(kind, code)`` for a reaped worker PID: ``clean_exit`` (rc 0 while
     still ``running`` = protocol violation), ``rate_limited``
     (``KANBAN_RATE_LIMIT_EXIT_CODE``, never counts as a failure),
     ``nonzero_exit``, ``signaled`` (``code`` is the signal), ``unknown`` (pid
-    not in the reap registry AND no ``worker_unit`` fallback resolved it;
-    ``code`` None).
+    not in the reap registry; ``code`` None).
 
-    When ``pid`` has no entry in ``_recent_worker_exits`` (the common case
-    for a worker this process never spawned/reaped, e.g. after a gateway
-    restart re-adopted the task) AND ``worker_unit`` names a systemd scope,
-    fall back to :func:`_scope_exit_status` before giving up with
-    ``"unknown"``. The no-launcher default (``worker_unit`` empty) keeps this
-    function's existing behavior byte-for-byte.
+    A worker launched via ``kanban.worker_launcher`` as a systemd ``--user
+    --scope`` (``--scope`` is a transparent exec, not a fork) remains a real,
+    direct, waitpid-able child of this process in the common case, so this
+    function needs no systemd involvement to classify it with full fidelity.
+    The narrow case this genuinely can't resolve — the worker is no longer
+    this process's child (e.g. a gateway restart re-adopted the task and
+    ``pid`` was never reaped by *this* process) — deliberately returns
+    ``"unknown"`` rather than querying ``systemctl --user show`` for a
+    fabricated verdict: a prior implementation tried that (``ExecMainCode``/
+    ``ExecMainStatus`` are never populated for a ``--scope`` unit — systemd
+    adopts, never forks, the target process into it — so the query was
+    provably always ``None`` on live systemd 255) and is intentionally not
+    reinstated here. The bounded ``"unknown"`` outcome is absorbed by the
+    infra-interruption classification's neutral bucket instead (see
+    ``kanban.max_infra_interruptions``) rather than invented here.
     """
     entry = _recent_worker_exits.get(int(pid))
     if entry is None:
-        if worker_unit:
-            scoped = _scope_exit_status(worker_unit)
-            if scoped is not None:
-                return scoped
         return ("unknown", None)
     raw, _ = entry
     try:
@@ -365,13 +331,20 @@ def _terminate_reclaimed_worker(
 
     When ``worker_unit`` is set (the task was spawned through a
     ``kanban.worker_launcher`` that minted a transient systemd ``--user --scope``
-    unit), termination goes through ``systemctl --user stop <unit>``
-    (``_stop_systemd_unit`` in ``tools.process_registry``, reused not
-    reinvented) INSTEAD of a bare ``os.kill`` — a scope may contain
-    double-forked descendants that a single-PID signal never reaches, and
-    ``systemd.kill(5)``'s default ``KillMode=mixed`` already SIGTERMs then
-    SIGKILLs the whole cgroup for us. The raw-PID path below remains exactly
-    as before for the default (``worker_unit`` empty) case.
+    unit — always carrying the explicit ``.scope`` suffix, see
+    ``_worker_launcher_unit_name``), termination goes through
+    ``systemctl --user stop <unit>`` (``_stop_systemd_unit`` in
+    ``tools.process_registry``, reused not reinvented) INSTEAD of a bare
+    ``os.kill`` — a scope may contain double-forked descendants that a
+    single-PID signal never reaches, and ``systemd.kill(5)``'s default
+    ``KillMode=mixed`` already SIGTERMs then SIGKILLs the whole cgroup for
+    us. ``_stop_systemd_unit`` alone is not trusted as proof of termination:
+    a "not loaded" response there could mean the unit never existed under
+    the queried name (e.g. a caller passed a suffix-less name that silently
+    resolved to an unrelated ``.service``) with the real worker still
+    alive, so ``info["terminated"]`` additionally requires the corroborating
+    ``not _kb._pid_alive(pid)`` check below. The raw-PID path below remains
+    exactly as before for the default (``worker_unit`` empty) case.
     """
     info: dict[str, Any] = {
         "prev_pid": int(pid) if pid else None,
@@ -852,13 +825,11 @@ class _DeadWorker:
 
 
 def _classify_dead_worker(
-    pid: int, claimer: Optional[str], retry_status: str = "ready", worker_unit: Optional[str] = None,
+    pid: int, claimer: Optional[str], retry_status: str = "ready",
 ) -> _DeadWorker:
     """Map a dead worker's reaped exit status to its reclaim bookkeeping. ``retry_status`` is the
-    run's source phase: a clean exit's handling differs by lane (see the review branch).
-    ``worker_unit``, when set, is consulted as a fallback classification source (see
-    ``_classify_worker_exit``) for a worker this dispatcher process never itself reaped."""
-    kind, code = _classify_worker_exit(pid, worker_unit)
+    run's source phase: a clean exit's handling differs by lane (see the review branch)."""
+    kind, code = _classify_worker_exit(pid)
     if kind == "clean_exit" and retry_status == "review":
         # A claimed reviewer run exited cleanly without approving, requesting changes, or
         # escalating. NOT a protocol violation (the implementer case below) and NOT a crash: an
@@ -951,7 +922,7 @@ def _reclaim_dead_workers(conn: sqlite3.Connection) -> _CrashSweep:
 
             pid = int(row["worker_pid"])
             retry_status = _kb._retry_status_for_run(conn, row["id"])
-            dead = _classify_dead_worker(pid, row["claim_lock"], retry_status, row["worker_unit"])
+            dead = _classify_dead_worker(pid, row["claim_lock"], retry_status)
             dead.event_payload["retry_status"] = retry_status
             # A reviewer no-verdict exit parks in ``blocked`` (sticky) instead of its source phase.
             target_status = "blocked" if dead.review_no_verdict else retry_status
@@ -2467,14 +2438,22 @@ def _worker_launcher_prefix() -> list[str]:
     that as a no-op and fall through to plain ``Popen``, keeping behaviour on
     Windows/macOS/non-systemd Linux byte-for-byte identical to today.
 
-    Fails OPEN, not closed: if the configured launcher binary can't be
-    resolved with ``shutil.which()`` (typo, uninstalled tool, launcher
-    unavailable on this host), log once and return ``[]`` so a misconfigured
-    optional knob degrades to today's spawn behaviour instead of stalling the
-    board. This is deliberately the opposite failure philosophy from
-    ``restart_safe_gateway_child_argv``'s fail-closed ``RuntimeError``: that
-    path guards an actual gateway-restart-survival contract for a narrow
-    supervised case, while this one is plain opt-in operator config.
+    Fails OPEN for a plain unresolvable binary (typo, uninstalled tool): log
+    once and return ``[]`` so a misconfigured optional knob degrades to
+    today's spawn behaviour instead of stalling the board. But for a
+    ``systemd-run --user`` launcher specifically, this fails CLOSED against
+    an unreachable user D-Bus: the gateway process's environment commonly
+    lacks ``XDG_RUNTIME_DIR``/``DBUS_SESSION_BUS_ADDRESS`` even though the
+    binary itself resolves fine via ``which()``, and letting that through
+    means every spawn using this launcher fails at ``systemd-run`` time
+    ("Failed to connect to bus: No medium found") instead of degrading —
+    see :func:`_systemd_user_bus_reachable`. This is deliberately the
+    opposite failure philosophy from ``restart_safe_gateway_child_argv``'s
+    fail-closed ``RuntimeError``: that path guards an actual
+    gateway-restart-survival contract for a narrow supervised case, while
+    this one is plain opt-in operator config that must never stall the
+    board either way — closed here means "don't use the launcher", not
+    "refuse to spawn the worker".
     """
     try:
         from hermes_cli.config import load_config
@@ -2496,13 +2475,70 @@ def _worker_launcher_prefix() -> list[str]:
             "falling back to plain Popen spawn for this worker", prefix[0],
         )
         return []
+    if os.path.basename(prefix[0]) == "systemd-run" and "--user" in prefix:
+        if not _systemd_user_bus_reachable():
+            return []
     return prefix
 
 
+def _resolve_systemd_user_bus_env() -> "tuple[str, str]":
+    """Resolve ``XDG_RUNTIME_DIR``/``DBUS_SESSION_BUS_ADDRESS`` for this
+    process's own uid, falling back to the standard ``/run/user/<uid>``
+    convention when the environment lacks them.
+
+    Same derivation as hermes-dev-infrastructure PR #22's ``getent``-based
+    playbook fix (which resolves a *different* user's uid via ``getent
+    passwd`` before building the same paths); here we already run as the
+    target uid, so ``os.getuid()`` replaces the ``getent`` lookup and the
+    path convention is identical.
+    """
+    xdg = os.environ.get("XDG_RUNTIME_DIR") or f"/run/user/{os.getuid()}"
+    bus = os.environ.get("DBUS_SESSION_BUS_ADDRESS") or f"unix:path={xdg}/bus"
+    return xdg, bus
+
+
+_SYSTEMD_USER_BUS_WARNED = False
+
+
+def _systemd_user_bus_reachable() -> bool:
+    """True if the resolved user D-Bus socket actually exists on disk.
+
+    Fails CLOSED: a ``kanban.worker_launcher`` entry that shells out to
+    ``systemd-run --user`` must never be handed to ``Popen`` when the bus is
+    unreachable — the prior guard checked only ``shutil.which()``, which
+    passes even though the gateway's stripped environment commonly has no
+    ``XDG_RUNTIME_DIR``/``DBUS_SESSION_BUS_ADDRESS``, so enabling the knob as
+    documented let ``systemd-run --user`` fail at spawn time instead of
+    degrading to a plain Popen spawn. Logs once per process, not once per
+    spawn, so a persistently-unreachable bus doesn't spam the log every tick.
+    """
+    global _SYSTEMD_USER_BUS_WARNED
+    xdg, bus = _resolve_systemd_user_bus_env()
+    socket_path = bus[len("unix:path="):] if bus.startswith("unix:path=") else os.path.join(xdg, "bus")
+    if socket_path and os.path.exists(socket_path):
+        return True
+    if not _SYSTEMD_USER_BUS_WARNED:
+        _kb._log.warning(
+            "kanban.worker_launcher configures a systemd-run --user spawn but no "
+            "reachable user D-Bus socket was found (checked %s); falling back to "
+            "plain Popen spawn for this worker until the bus becomes reachable",
+            socket_path or "<unresolved>",
+        )
+        _SYSTEMD_USER_BUS_WARNED = True
+    return False
+
+
 def _worker_launcher_unit_name(task: Task) -> str:
-    """``--unit=`` value for a launcher-wrapped worker; stable across the task's runs."""
+    """``--unit=`` value for a launcher-wrapped worker; stable across the task's runs.
+
+    Always carries the explicit ``.scope`` suffix: every later
+    ``systemctl --user`` query/stop against this unit must use the exact
+    same string ``systemd-run`` registered it under, or it silently
+    resolves to a same-named ``.service`` unit that never existed
+    (``rc=5``/"not loaded", worker left running).
+    """
     run_part = task.current_run_id if task.current_run_id is not None else "missing"
-    return f"kanban-{task.id}-run-{run_part}"
+    return f"kanban-{task.id}-run-{run_part}.scope"
 
 
 def _apply_worker_launcher(task: Task, command: list[str]) -> "tuple[list[str], Optional[str]]":
@@ -2619,22 +2655,22 @@ def _default_spawn(task: Task, workspace: str, *, board: Optional[str] = None) -
     # cgroup before startup; otherwise restarting the service kills the worker
     # that is performing the handoff.
     cmd = _restart_safe_worker_argv(task, base_cmd)
-    worker_unit: Optional[str] = None
-    if cmd is base_cmd:
-        # Not running under the managed-gateway restart-safe scope (the narrow
-        # supervised-systemd-gateway case above) — this is the only remaining
-        # place a spawn-time argv wrap can happen, so the operator's own
-        # ``kanban.worker_launcher`` (if configured) applies here. Default
-        # ``[]`` leaves ``cmd`` untouched and ``worker_unit`` None, so the
-        # Popen call below is byte-for-byte identical to before this knob
-        # existed.
-        cmd, worker_unit = _apply_worker_launcher(task, cmd)
-        # Mutating the caller's Task lets ``_dispatch_lane_task`` persist the
-        # unit name alongside the pid without widening this function's return
-        # type — custom ``spawn_fn`` test doubles that never touch this
-        # attribute leave it at its ``None`` default, so nothing observes a
-        # behavior change on the no-launcher path.
-        task.worker_unit = worker_unit
+    # ``kanban.worker_launcher`` (if configured) applies unconditionally,
+    # AFTER the restart-safe wrap above has had its chance to rewrap argv —
+    # order matters: in the supervised-systemd-gateway topology the launcher
+    # targets, ``cmd`` is already wrapped by the time we get here, so gating
+    # on `cmd is base_cmd` (identity with the pre-restart-safe-wrap argv)
+    # made the launcher unreachable in exactly the topology it exists for.
+    # Default ``[]`` leaves ``cmd`` unchanged and ``worker_unit`` None, so the
+    # Popen call below is byte-for-byte identical to before this knob
+    # existed.
+    cmd, worker_unit = _apply_worker_launcher(task, cmd)
+    # Mutating the caller's Task lets ``_dispatch_lane_task`` persist the
+    # unit name alongside the pid without widening this function's return
+    # type — custom ``spawn_fn`` test doubles that never touch this
+    # attribute leave it at its ``None`` default, so nothing observes a
+    # behavior change on the no-launcher path.
+    task.worker_unit = worker_unit
     log_f = _open_worker_log(task, board)
     try:
         proc = subprocess.Popen(  # noqa: S603 -- argv is a fixed list built above

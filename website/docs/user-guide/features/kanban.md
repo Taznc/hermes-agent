@@ -276,12 +276,21 @@ kanban:
 ```
 
 `worker_launcher` is an argv **prefix**: the dispatcher appends
-`--unit=kanban-<task_id>-run-<run_id>` and the trailing `-- <worker command>`
+`--unit=kanban-<task_id>-run-<run_id>.scope` and the trailing `-- <worker command>`
 itself, so operators supply only the launcher binary and its own flags. The
 launcher binary is resolved with `shutil.which()` at spawn time; if it can't
 be found the dispatcher logs a warning and spawns that worker with a plain
 `Popen` instead of failing the task (fail-open — a misconfigured launcher
-must never stall the board).
+must never stall the board). A `systemd-run --user` entry is additionally
+checked for a reachable user D-Bus socket (`XDG_RUNTIME_DIR`/
+`DBUS_SESSION_BUS_ADDRESS`, resolved from the process uid when absent from
+the environment — the gateway's own environment commonly lacks them); when
+the socket can't be found this also fails **closed** to a plain `Popen`
+spawn, since a `systemd-run --user` invocation with no reachable bus fails
+outright ("Failed to connect to bus") rather than degrading on its own. The
+launcher applies to whatever argv is about to be `Popen`'d — including
+after any restart-safe rewrap that already happened for a supervised
+gateway worker — never gated on argv identity.
 
 The default (`[]`) is a byte-identical no-op on Windows, macOS, and
 non-systemd Linux: there is no OS-conditional branch in core beyond the
@@ -291,14 +300,23 @@ behavior on any platform.
 When a worker is spawned through a launcher that mints a systemd `--user
 --scope` unit, the dispatcher still uses `_pid_alive()` as the primary
 liveness signal every tick (parentage-independent, so this composes with
-gateway restarts exactly like the no-launcher path); once a worker's PID
-goes dead, its exit is classified via `systemctl --user show
-<unit> -p ExecMainStatus -p ExecMainCode -p ActiveState` instead of
-`waitpid` when the PID isn't one this dispatcher process itself reaped (the
-case after a gateway restart re-adopts a task whose worker predates it).
-Termination during a reclaim also prefers `systemctl --user stop <unit>`
-over a bare PID signal in that case, since a scope may contain descendants a
-single-PID signal wouldn't reach.
+gateway restarts exactly like the no-launcher path). `--scope` is a
+transparent exec (systemd execs the target process directly into the
+scope's cgroup rather than forking a separate wrapper), so in the common
+case the spawned worker remains a real, direct, waitpid-able child of the
+dispatcher process and its exit is classified with full fidelity by the
+same `os.waitpid`-based path used for the no-launcher default — no systemd
+status query is consulted or needed. The one case this cannot resolve is
+when the worker is no longer this process's child at all (e.g. a gateway
+restart re-adopted the task and this dispatcher process never reaped that
+pid itself); that case classifies as the neutral `"unknown"` outcome,
+which the infra-interruption bucket (`kanban.max_infra_interruptions`)
+bounds rather than the dispatcher inventing a systemd-derived verdict for
+it. Termination during a reclaim prefers `systemctl --user stop <unit>`
+over a bare PID signal when a `worker_unit` is recorded, since a scope may
+contain descendants a single-PID signal wouldn't reach; that stop is only
+treated as successful once the worker's PID is corroborated as actually
+gone, never on an unqualified "unit not loaded" response alone.
 
 ### Idempotent create (for automation / webhooks)
 
