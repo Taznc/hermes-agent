@@ -3,7 +3,7 @@ import type { AppendMessage } from '@assistant-ui/react'
 import type { FileAttachResponse } from '@/app/types'
 import { translateNow, type Translations } from '@/i18n'
 import type { ChatMessage } from '@/lib/chat-messages'
-import { readDesktopFileDataUrlLocalFirst } from '@/lib/desktop-fs'
+import { isDesktopFsRemoteMode, readDesktopFileDataUrl, readDesktopFileDataUrlLocalFirst } from '@/lib/desktop-fs'
 import { type CommandsCatalogLike, filterDesktopCommandsCatalog } from '@/lib/desktop-slash-commands'
 import { isMissingRpcMethod } from '@/lib/gateway-rpc'
 import { isProviderSetupErrorMessage } from '@/lib/provider-setup-errors'
@@ -445,14 +445,28 @@ export async function readImageForRemoteAttach(
 // when the desktop bridge can't read the file (e.g. it was moved/deleted).
 // Prefer the attach-specific IPC (256 MiB) so remote uploads are not stuck on
 // the preview/Settings default; fall back for older Electron shells.
+//
+// The web build has no local bridge reader at all (window.hermesDesktop never
+// defines readFileDataUrl there — see web-bridge-shim.ts) and a picker/drop
+// path is only ever the GATEWAY's own disk, so fall back to the remote
+// /api/fs/read-data-url facade exactly like image attach does via
+// readDesktopFileDataUrlLocalFirst. A local reader that throws (moved/deleted
+// file) still returns null rather than falling back, matching the previous
+// behavior for Electron.
 export async function readFileDataUrlForAttach(filePath: string): Promise<string | null> {
   const reader = window.hermesDesktop?.readFileDataUrlForAttach ?? window.hermesDesktop?.readFileDataUrl
 
-  if (!reader) {
+  if (reader) {
+    const dataUrl = await reader(filePath)
+
+    return dataUrl || null
+  }
+
+  if (!isDesktopFsRemoteMode()) {
     return null
   }
 
-  const dataUrl = await reader(filePath)
+  const dataUrl = await readDesktopFileDataUrl(filePath)
 
   return dataUrl || null
 }
