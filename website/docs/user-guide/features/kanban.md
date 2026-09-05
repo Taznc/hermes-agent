@@ -399,9 +399,9 @@ Every profile that works kanban tasks automatically gets the worker lifecycle �
 1. On spawn, call `kanban_show()` to read title + body + parent handoffs + prior attempts + full comment thread.
 2. `cd $HERMES_KANBAN_WORKSPACE` (via the terminal tool) and do the work there.
 3. Call `kanban_heartbeat(note="...")` every few minutes during long operations. **If your work may run longer than 1 hour, call `kanban_heartbeat` at least once an hour** — the dispatcher reclaims tasks that have been running past `kanban.dispatch_stale_timeout_seconds` (default 4 h) with no heartbeat in the last hour, on the assumption the worker crashed without cleanup. A reclaim is benign (the task goes back to `ready` for re-dispatch without a failure-counter tick) but you lose your current run's progress.
-4. Complete with `kanban_complete(summary="...", metadata={...})`, or `kanban_block(reason="...")` if stuck.
+4. Complete with `kanban_complete(summary="...", metadata={...})`, `kanban_block(reason="...")` if stuck, or hand off with `kanban_request_review(summary="...")` / `kanban_request_changes(reason="...")` — all four are board-terminal for the current run.
 
-That final `kanban_complete` / `kanban_block` call is part of the worker
+That final board-terminal call is part of the worker
 protocol. If the worker process exits with status 0 while the task is still
 `running`, the dispatcher treats that as a protocol violation and emits a
 `protocol_violation` event.
@@ -410,7 +410,9 @@ protocol. If the worker process exits with status 0 while the task is still
 synthetic nudges when it detects the model is about to stop without a terminal
 board tool call. This catches the common case where the model narrates the next
 step ("Let me write the report") and stops with `finish_reason=stop`. The nudge
-reminds the model to call `kanban_complete` or `kanban_block` immediately. This
+reminds the model to call `kanban_complete`, `kanban_block`,
+`kanban_request_review`, or `kanban_request_changes` immediately — any of the
+four satisfies the guard, since each closes out the current run. This
 guard is active only for dispatcher-spawned workers (`HERMES_KANBAN_TASK` is
 set) and can be disabled with `HERMES_KANBAN_STOP_NUDGE=0`.
 

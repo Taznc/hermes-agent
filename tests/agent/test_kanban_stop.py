@@ -2,12 +2,22 @@
 
 from __future__ import annotations
 
+from types import SimpleNamespace
+
 import pytest
 
 from agent.kanban_stop import (
     build_kanban_stop_nudge,
     kanban_stop_nudge_enabled,
     session_called_kanban_terminal,
+)
+
+
+_TERMINAL_VERBS = (
+    "kanban_complete",
+    "kanban_block",
+    "kanban_request_review",
+    "kanban_request_changes",
 )
 
 
@@ -71,6 +81,72 @@ def test_no_nudge_after_kanban_complete(clear_kanban_env):
         {"role": "tool", "name": "kanban_complete", "tool_call_id": "1", "content": "done"},
     ]
     assert session_called_kanban_terminal(messages) is True
+    assert build_kanban_stop_nudge(messages=messages) is None
+
+
+@pytest.mark.parametrize("verb", _TERMINAL_VERBS)
+def test_terminal_true_for_assistant_tool_calls_dict_shape(verb):
+    """Each of the four board-terminal verbs suppresses the guard (dict tool-call shape)."""
+    messages = [
+        {
+            "role": "assistant",
+            "content": "",
+            "tool_calls": [
+                {"id": "1", "type": "function", "function": {"name": verb, "arguments": "{}"}}
+            ],
+        },
+    ]
+    assert session_called_kanban_terminal(messages) is True
+
+
+@pytest.mark.parametrize("verb", _TERMINAL_VERBS)
+def test_terminal_true_for_assistant_tool_calls_object_shape(verb):
+    """Each of the four board-terminal verbs suppresses the guard (object tool-call shape)."""
+    tool_call = SimpleNamespace(function=SimpleNamespace(name=verb))
+    messages = [
+        {"role": "assistant", "content": "", "tool_calls": [tool_call]},
+    ]
+    assert session_called_kanban_terminal(messages) is True
+
+
+@pytest.mark.parametrize("verb", _TERMINAL_VERBS)
+def test_terminal_true_for_tool_role_message(verb):
+    """A ``role: tool`` message named with each verb also suppresses the guard."""
+    messages = [
+        {"role": "tool", "name": verb, "tool_call_id": "1", "content": "ok"},
+    ]
+    assert session_called_kanban_terminal(messages) is True
+
+
+def test_terminal_false_for_non_terminal_verb():
+    """A worker that only commented (not a board-terminal action) still gets nudged."""
+    messages = [
+        {
+            "role": "assistant",
+            "content": "",
+            "tool_calls": [
+                {"id": "1", "type": "function", "function": {"name": "kanban_comment", "arguments": "{}"}}
+            ],
+        },
+        {"role": "tool", "name": "kanban_comment", "tool_call_id": "1", "content": "noted"},
+    ]
+    assert session_called_kanban_terminal(messages) is False
+
+
+@pytest.mark.parametrize("verb", ["kanban_request_review", "kanban_request_changes"])
+def test_no_nudge_after_review_lane_handoff(clear_kanban_env, verb):
+    """build_kanban_stop_nudge returns None after a correct review-lane handoff."""
+    clear_kanban_env.setenv("HERMES_KANBAN_TASK", "t_review")
+    messages = [
+        {
+            "role": "assistant",
+            "content": "",
+            "tool_calls": [
+                {"id": "1", "type": "function", "function": {"name": verb, "arguments": "{}"}}
+            ],
+        },
+        {"role": "tool", "name": verb, "tool_call_id": "1", "content": "ok"},
+    ]
     assert build_kanban_stop_nudge(messages=messages) is None
 
 
