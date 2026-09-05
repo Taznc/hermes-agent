@@ -92,6 +92,11 @@ import {
   setWorkspaceCwdOwner,
   setYoloActive
 } from '@/store/session'
+import {
+  captureArchiveNeighbors,
+  discardPendingArchiveUndo,
+  registerPendingArchiveUndo
+} from '@/store/session-archive-undo'
 import { isSessionOwnerResolutionError } from '@/store/session-owner-resolution'
 import {
   beginSessionMutation,
@@ -100,11 +105,6 @@ import {
   tombstoneSessions,
   untombstoneSessions
 } from '@/store/session-removal'
-import {
-  captureArchiveNeighbors,
-  discardPendingArchiveUndo,
-  registerPendingArchiveUndo
-} from '@/store/session-archive-undo'
 import {
   requestForSessionProfile,
   type SessionOwnerRoute,

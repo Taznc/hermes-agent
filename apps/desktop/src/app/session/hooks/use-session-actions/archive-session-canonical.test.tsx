@@ -49,9 +49,9 @@ vi.mock('@/store/session-states', async importOriginal => ({
 
 import { $pinnedSessionIds } from '@/store/layout'
 import { $notifications, clearNotifications } from '@/store/notifications'
-import { $removedSessionIds } from '@/store/session-removal'
 import { $selectedStoredSessionId, $sessions, setSessions } from '@/store/session'
 import { isArchiveUndoPending, resetArchiveUndos } from '@/store/session-archive-undo'
+import { $removedSessionIds } from '@/store/session-removal'
 
 import type { ClientSessionState } from '../../../types'
 

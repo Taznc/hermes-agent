@@ -25,7 +25,6 @@ vi.mock('@/hermes', () => ({
 
 import { $pinnedSessionIds } from '@/store/layout'
 import { $notifications, clearNotifications, notify } from '@/store/notifications'
-import { $removedSessionIds } from '@/store/session-removal'
 import { $sessions, setSessions } from '@/store/session'
 import {
   $pendingArchiveUndos,
@@ -34,6 +33,7 @@ import {
   registerPendingArchiveUndo,
   resetArchiveUndos
 } from '@/store/session-archive-undo'
+import { $removedSessionIds } from '@/store/session-removal'
 
 import { archiveUndoToastId, buildArchiveUndoToastInput } from './archive-undo-toast'
 

@@ -4,8 +4,8 @@ import { setSessionArchived } from '@/hermes'
 import type { SessionInfo } from '@/types/hermes'
 
 import { $pinnedSessionIds } from './layout'
-import { beginSessionMutation, endSessionMutation, tombstoneSessions, untombstoneSessions } from './session-removal'
 import { $sessions, sessionMatchesStoredId, sessionPinId, setSessions } from './session'
+import { beginSessionMutation, endSessionMutation, tombstoneSessions, untombstoneSessions } from './session-removal'
 
 // ---------------------------------------------------------------------------
 // Archive-with-undo bookkeeping.
