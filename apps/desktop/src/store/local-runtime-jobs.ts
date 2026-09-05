@@ -19,6 +19,18 @@ let timer: null | number = null
 let polling = false
 // Jobs we've already toasted for, so a poll race can't double-notify.
 const settledNotified = new Set<string>()
+// Bumped by resetLocalRuntimeJobsForTests() to invalidate any in-flight or
+// scheduled poll() call. A recursive `window.setTimeout` loop like this one
+// outlives its caller by design (the whole point is following a download to
+// completion across pane unmounts) — but a vitest jsdom environment is torn
+// down (globalThis.window deleted) per test FILE, not per component. Without
+// a cancellation token, a poll() awaiting its mocked getLocalModelsJobs()
+// promise when its OWNING file ends resumes later — while an unrelated file
+// is executing — and throws `ReferenceError: window is not defined` on
+// whichever test happens to be running (#t_fc026713). Every check against
+// this counter runs BEFORE touching `window`, so a stale poll always exits
+// quietly instead of racing the next file's environment.
+let generation = 0
 
 function jobsEqual(a: readonly LocalRuntimeJob[], b: readonly LocalRuntimeJob[]) {
   if (a.length !== b.length) {
@@ -76,9 +88,18 @@ function notifySettled(previous: readonly LocalRuntimeJob[], next: readonly Loca
   }
 }
 
-async function poll() {
+async function poll(pollGeneration: number) {
   try {
     const { jobs } = await getLocalModelsJobs()
+
+    // The await above is the cancellation window: a reset bumped `generation`
+    // while this call was in flight (its owning environment is gone), so
+    // applying the result — or scheduling another timer off it — would be
+    // stale work landing in whoever runs next.
+    if (pollGeneration !== generation) {
+      return
+    }
+
     const previous = $localRuntimeJobs.get()
 
     if (!jobsEqual(previous, jobs)) {
@@ -89,10 +110,21 @@ async function poll() {
     // Backend unreachable — keep the last snapshot; the next poll retries.
   }
 
+  // Re-checked post-await: cancelled during the request above, or (defensive
+  // backstop, not the primary guard — see `generation`) no `window` to
+  // schedule against. Either way stop cleanly instead of throwing into
+  // whichever caller happens to be running.
+  if (pollGeneration !== generation || typeof window === 'undefined') {
+    polling = false
+    timer = null
+
+    return
+  }
+
   const anyRunning = $localRuntimeJobs.get().some(j => j.status === 'running')
 
   if (anyRunning) {
-    timer = window.setTimeout(() => void poll(), POLL_ACTIVE_MS)
+    timer = window.setTimeout(() => void poll(pollGeneration), POLL_ACTIVE_MS)
   } else {
     polling = false
     timer = null
@@ -109,11 +141,31 @@ export function watchLocalRuntimeJobs() {
 
   polling = true
 
-  if (timer !== null) {
+  if (timer !== null && typeof window !== 'undefined') {
     window.clearTimeout(timer)
   }
 
-  void poll()
+  timer = null
+  void poll(generation)
+}
+
+/** Cancel the poll loop and drop tracked state — test isolation only (mirrors
+ *  resetLiveRuntimeTracking / resetTypingActivityTracking in
+ *  use-background-sync.ts). Bumping `generation` invalidates any poll() still
+ *  in flight so it can never reach `window` again, and clearing `timer` stops
+ *  an already-scheduled one; called globally between test files (see
+ *  vitest.setup.ts) so a poll a test's component mount started can't outlive
+ *  that file's jsdom environment. */
+export function resetLocalRuntimeJobsForTests(): void {
+  generation += 1
+
+  if (timer !== null && typeof window !== 'undefined') {
+    window.clearTimeout(timer)
+  }
+
+  timer = null
+  polling = false
+  settledNotified.clear()
 }
 
 // Selector: the running download job for a catalog model id, if any.
