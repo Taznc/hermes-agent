@@ -6,7 +6,7 @@ therefore exposes the same sanitized payload as ``/api/account-limits`` without
 putting OAuth/Codex credentials in the renderer.
 """
 
-from .method_ctx import HandlerRegistry
+from tui_gateway.method_ctx import HandlerRegistry
 
 _registry = HandlerRegistry()
 method = _registry.method
