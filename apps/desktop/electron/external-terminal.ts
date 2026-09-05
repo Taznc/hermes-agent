@@ -37,9 +37,18 @@ export function posixQuote(value: string): string {
   return `'${String(value ?? '').replaceAll("'", `'\\''`)}'`
 }
 
-/** Quote a value for a cmd.exe script line. */
+/**
+ * Quote a value for a cmd.exe BATCH script line.
+ *
+ * Doubling `"` handles embedded quotes, but batch expands `%VAR%` at parse
+ * time even INSIDE double quotes — a carried-over env value containing a
+ * literal `%` (PROMPT-style strings, URL-encoded tokens) would be expanded or
+ * silently collapsed when the .cmd runs. `%%` is the batch-file escape for a
+ * literal percent (only valid in scripts, which is all this quoter is used
+ * for — every caller writes lines into the generated .cmd launcher).
+ */
 export function windowsQuote(value: string): string {
-  return `"${String(value ?? '').replaceAll('"', '""')}"`
+  return `"${String(value ?? '').replaceAll('%', '%%').replaceAll('"', '""')}"`
 }
 
 /**
