@@ -2954,6 +2954,10 @@ export interface UpstreamTranslations {
       copyUrl: string
       copyResolvedUrl: string
     }
+    file: {
+      openPreview: string
+      openDefaultApp: string
+    }
     image: {
       copyImage: string
       copyImageAddress: string

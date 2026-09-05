@@ -3411,6 +3411,10 @@ export const en: Translations = withForkKeys(forkEn, {
       copyUrl: 'Copy URL',
       copyResolvedUrl: 'Copy resolved URL'
     },
+    file: {
+      openPreview: 'Open in preview',
+      openDefaultApp: 'Open with default app'
+    },
     image: {
       copyImage: 'Copy image',
       copyImageAddress: 'Copy image address',
