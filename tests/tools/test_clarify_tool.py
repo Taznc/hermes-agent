@@ -48,7 +48,7 @@ class TestClarifyToolChoicesValidation:
             choices_passed.extend(choices or [])
             return "picked"
 
-        many_choices = ["a", "b", "c", "d", "e", "f", "g"]
+        many_choices = ["a", "b", "c", "d", "e", "f", "g", "h", "i", "j", "k", "l"]
         clarify_tool("Pick one", choices=many_choices, callback=mock_callback)
 
         assert len(choices_passed) == MAX_CHOICES
@@ -148,9 +148,16 @@ class TestClarifySchema:
         assert CLARIFY_SCHEMA["name"] == "clarify"
 
 
-    def test_max_choices_is_four(self):
-        """MAX_CHOICES constant should be 4."""
-        assert MAX_CHOICES == 4
+    def test_max_choices_matches_schema_cap(self):
+        """The advertised schema cap must equal the enforced trim.
+
+        A behavior contract, not a snapshot of the number: the model is told a
+        limit in `maxItems` and `_clean_choices` enforces it, so the two drifting
+        apart silently truncates options the model was told it could send.
+        """
+        per_question = CLARIFY_SCHEMA["parameters"]["properties"]["questions"]["items"]
+        assert per_question["properties"]["choices"]["maxItems"] == MAX_CHOICES
+        assert MAX_CHOICES >= 2
 
 
     def test_schema_multi_select_default_false(self):
@@ -240,7 +247,7 @@ class TestClarifyToolMultiSelect:
             choices_passed.extend(choices or [])
             return "a, b, c, d"
 
-        many_choices = ["a", "b", "c", "d", "e", "f"]
+        many_choices = ["a", "b", "c", "d", "e", "f", "g", "h", "i", "j", "k", "l"]
         clarify_tool(
             "Pick some",
             choices=many_choices,
@@ -454,7 +461,9 @@ class TestClarifyBatchValidation:
         clarify_tool(
             "",
             questions=[
-                {"question": "Pick letter", "choices": ["a", "b", "c", "d", "e", "f"]},
+                {"question": "Pick letter", "choices": [
+                    "a", "b", "c", "d", "e", "f", "g", "h", "i", "j", "k", "l",
+                ]},
                 {"question": "Pick layout", "choices": [
                     {"description": "Loose layout"}, "Tight",
                 ]},
