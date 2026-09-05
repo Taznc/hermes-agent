@@ -194,38 +194,15 @@ def _sql_session_last_active_by_id(session_id_expr: str) -> str:
         f"(SELECT started_at FROM sessions _act_s WHERE _act_s.id = {session_id_expr})")
 
 
+# >>> FORK ANCHOR: served-route-columns <<< (fork Phase 2.13; bodies in hermes_fork.state_limits)
 def _sql_served_route_column(alias: str, column: str) -> str:
-    """SQL expression for the ACTUALLY-SERVED route on a session's most
-    recent completed turn (Phase 2.13 sidebar identity).
-
-    ``sessions.model`` / ``sessions.billing_provider`` are only ever the
-    FIRST accounted route (``update_token_counts`` COALESCE-backfills them —
-    see its docstring) — a silent mid-conversation fallback never rewrites
-    them, so they go stale the moment a session falls back after its first
-    successful call. ``session_model_usage`` (schema v20, per-model
-    attribution) records every distinct (model, provider) route touched by
-    the main loop (``task=''``) with a ``last_seen`` timestamp, so the
-    freshest main-loop row there IS the latest-served route. Falls back to
-    the ``sessions`` column for legacy sessions with no session_model_usage
-    rows (pre-v20, or a session that never recorded a delta) — which also
-    naturally reads as "no mismatch" against the configured route.
-
-    ``column`` must be ``"model"`` or ``"billing_provider"``.
-    """
-    return (
-        f"COALESCE(NULLIF((SELECT smu.{column} FROM session_model_usage smu "
-        f"WHERE smu.session_id = {alias}.id AND smu.task = '' "
-        f"ORDER BY smu.last_seen DESC LIMIT 1), ''), {alias}.{column})"
-    )
+    from hermes_fork.state_limits import sql_served_route_column
+    return sql_served_route_column(alias, column)
 
 
 def _sql_served_route_columns(alias: str = "s") -> str:
-    """``served_model`` + ``served_provider`` projection tail for a ``sessions {alias}`` row
-    (comma-led so it appends to an existing SELECT list)."""
-    return (
-        f",\n                    {_sql_served_route_column(alias, 'model')} AS served_model,\n"
-        f"                    {_sql_served_route_column(alias, 'billing_provider')} AS served_provider"
-    )
+    from hermes_fork.state_limits import sql_served_route_columns
+    return sql_served_route_columns(alias)
 
 
 SCHEMA_VERSION = 30
