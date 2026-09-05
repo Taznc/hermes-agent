@@ -957,6 +957,17 @@ class CredentialPool:
             for entry in self._entries:
                 if entry.last_status == STATUS_DEAD:
                     continue
+                # Structural leasability, mirroring _available_entries(): an
+                # unhydrated borrowed entry (empty runtime_api_key for an
+                # API-key row, or empty access_token for an OAuth row) cannot
+                # be leased regardless of last_status, so it must not count
+                # as "genuinely available" — a STATUS_OK borrowed row that
+                # never hydrated would otherwise mask an exhausted pool the
+                # same way resync revival did.
+                if entry.auth_type == AUTH_TYPE_API_KEY and not entry.runtime_api_key:
+                    continue
+                if entry.auth_type == AUTH_TYPE_OAUTH and not (entry.access_token or "").strip():
+                    continue
                 if entry.last_status != STATUS_EXHAUSTED:
                     return True
                 # Cooldown already elapsed → entry is effectively available now

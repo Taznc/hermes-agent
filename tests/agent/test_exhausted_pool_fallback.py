@@ -214,28 +214,32 @@ def test_resync_fools_has_available_but_not_has_genuinely():
     because the credentials file had fresh tokens, so _pool_may_recover_from_rate_limit
     returned True and suppressed the eager fallback.
 
-    We simulate this by building a pool with a claude_code-source exhausted entry,
-    then monkeypatching _resync_stale_entry to revive it (mimicking a fresh
-    credentials file read).  has_available() sees the revived entry; the new
-    has_genuinely_available() does not.
+    We build a pool with a claude_code-source exhausted entry, then monkeypatch
+    _sync_anthropic_entry_from_credentials_file to return a fresh STATUS_OK entry
+    (mimicking a credentials-file read that found new tokens).  has_available()
+    sees the revived entry; the new has_genuinely_available() does not.
     """
     future = _now() + 300
-    claude_entry = _exhausted_entry(
+    claude_entry = PooledCredential(
         id="cc-1",
+        provider="anthropic",
         source="claude_code",
+        label="cc-1",
         access_token="stale-token",
-        reset_at=future,
+        auth_type="api_key",
+        last_status=STATUS_EXHAUSTED,
+        last_status_at=future - 60,
+        last_error_reset_at=future,
+        priority=0,
+        extra={"runtime_api_key": "sk-ant-stale"},
     )
     pool = CredentialPool("anthropic", [claude_entry])
 
     # has_genuinely_available reads raw state — exhausted → False.
     assert pool.has_genuinely_available() is False
 
-    # Simulate what _available_entries does: resync revives the entry.
-    synced = pool._sync_anthropic_entry_from_credentials_file(claude_entry)
-    # If the credentials file had a DIFFERENT token, the entry would be revived.
-    # For this test we force the "tokens changed" path by monkeypatching the
-    # sync method to return a fresh STATUS_OK entry.
+    # Simulate what _available_entries does: resync revives the entry when the
+    # credentials file holds a different token than the pool's stale copy.
     fresh = PooledCredential(
         id="cc-1",
         provider="anthropic",
@@ -245,8 +249,11 @@ def test_resync_fools_has_available_but_not_has_genuinely():
         auth_type="api_key",
         last_status=STATUS_OK,
         priority=0,
+        extra={"runtime_api_key": "sk-ant-fresh"},
     )
-    pool._sync_anthropic_entry_from_credentials_file = lambda e: fresh  # type: ignore[method-assign]
+    pool._sync_anthropic_entry_from_credentials_file = (  # type: ignore[method-assign]
+        lambda e: fresh
+    )
 
     # has_available() triggers _available_entries → resync → revived entry → True.
     assert pool.has_available() is True
@@ -255,3 +262,104 @@ def test_resync_fools_has_available_but_not_has_genuinely():
     # so it still sees the exhausted entry → False.  _pool_may_recover_from_rate_limit
     # uses this path, so fallback fires immediately instead of waiting.
     assert pool.has_genuinely_available() is False
+    assert _pool_may_recover_from_rate_limit(pool) is False
+
+
+# ---------------------------------------------------------------------------
+# has_genuinely_available — unhydrated borrowed entries must not count
+# ---------------------------------------------------------------------------
+#
+# Regression (review round 1): has_genuinely_available() originally treated
+# any non-DEAD, non-EXHAUSTED entry as immediately usable, but
+# _available_entries() additionally filters entries that are structurally
+# unleasable regardless of status — an API-key entry with an empty
+# runtime_api_key, or an OAuth entry with an empty access_token. Both shapes
+# occur for borrowed rows (hermes_pkce, claude_code) that were read from disk
+# but never hydrated from their live source. Without the same filter,
+# has_genuinely_available() could report True for a pool where the only
+# non-exhausted entry is such an unhydrated placeholder — reproducing the
+# exact "fallback suppressed while every real credential is exhausted" bug
+# through a different trigger than the resync-revival path above.
+
+
+def test_unhydrated_api_key_entry_does_not_count_as_available():
+    """A STATUS_OK API-key entry with an empty runtime_api_key (unhydrated
+    borrowed row) must not make an otherwise fully-exhausted pool report
+    genuinely available."""
+    future = _now() + 300
+    exhausted = _exhausted_entry(id="cc-1", reset_at=future)
+    unhydrated = PooledCredential(
+        id="borrowed-1",
+        provider="anthropic",
+        source="hermes_pkce",
+        label="borrowed",
+        access_token=None,
+        auth_type="api_key",
+        last_status=STATUS_OK,
+        priority=1,
+    )
+    assert unhydrated.runtime_api_key == ""
+
+    pool = CredentialPool("anthropic", [exhausted, unhydrated])
+
+    assert pool.has_available() is False
+    assert pool.has_genuinely_available() is False
+    assert _pool_may_recover_from_rate_limit(pool) is False
+
+
+def test_unhydrated_oauth_entry_does_not_count_as_available():
+    """A STATUS_OK OAuth entry with a blank access_token (borrowed row that
+    failed to hydrate) must not make an otherwise fully-exhausted pool report
+    genuinely available."""
+    future = _now() + 300
+    exhausted = PooledCredential(
+        id="cc-1",
+        provider="anthropic",
+        source="claude_code",
+        label="cc-1",
+        access_token="stale",
+        auth_type="oauth",
+        last_status=STATUS_EXHAUSTED,
+        last_status_at=_now(),
+        last_error_reset_at=future,
+        priority=0,
+    )
+    unhydrated = PooledCredential(
+        id="borrowed-oauth-1",
+        provider="anthropic",
+        source="hermes_pkce",
+        label="borrowed-oauth",
+        access_token="",
+        auth_type="oauth",
+        last_status=STATUS_OK,
+        priority=1,
+    )
+
+    pool = CredentialPool("anthropic", [exhausted, unhydrated])
+
+    assert pool.has_available() is False
+    assert pool.has_genuinely_available() is False
+    assert _pool_may_recover_from_rate_limit(pool) is False
+
+
+def test_hydrated_api_key_entry_still_counts_as_available():
+    """Control: a genuinely hydrated, healthy API-key entry alongside an
+    exhausted one still permits rotation (no regression from the new guard)."""
+    future = _now() + 300
+    exhausted = _exhausted_entry(id="cc-1", reset_at=future)
+    hydrated = PooledCredential(
+        id="healthy-1",
+        provider="anthropic",
+        source="manual",
+        label="healthy",
+        access_token="sk-ant-healthy",
+        auth_type="api_key",
+        last_status=STATUS_OK,
+        priority=1,
+    )
+    assert hydrated.runtime_api_key == "sk-ant-healthy"
+
+    pool = CredentialPool("anthropic", [exhausted, hydrated])
+
+    assert pool.has_genuinely_available() is True
+    assert _pool_may_recover_from_rate_limit(pool) is True
