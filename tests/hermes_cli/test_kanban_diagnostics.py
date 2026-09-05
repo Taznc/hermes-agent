@@ -199,6 +199,88 @@ def test_stranded_in_ready_fires_when_age_exceeds_threshold():
     assert stranded[0].data["assignee"] == "demo"
 
 
+# ---------------------------------------------------------------------------
+# repeated_failures rule — threshold must track the breaker's effective limit
+#
+# _record_task_failure (kanban_db_dispatch.py) resolves its trip threshold as
+# task.max_retries if set, else the dispatcher's failure_limit. The diagnostic
+# must resolve the SAME threshold (kanban_db_dispatch.effective_failure_limit)
+# so a task the breaker already blocked can never surface zero diagnostics.
+# ---------------------------------------------------------------------------
+
+
+def test_repeated_failures_fires_when_task_max_retries_below_global_limit():
+    """Regression for the proven defect: a task with its own max_retries set
+    BELOW the global failure_limit trips the breaker at that lower count.
+    The diagnostic must still fire — this is the exact shape of live task
+    t_44ca59a3 (max_retries=1, consecutive_failures=1, global limit higher).
+    Fails on the unfixed source, which derives its threshold from
+    cfg["failure_threshold"]/failure_limit alone and never looks at
+    task.max_retries, so failures(1) < threshold(3) suppresses the rule.
+    """
+    now = int(time.time())
+    task = _task(status="blocked", consecutive_failures=1, max_retries=1,
+                 last_failure_error="pid 704578 not alive")
+    diags = kd.compute_task_diagnostics(
+        task, [], [], now=now, config={"failure_limit": 3},
+    )
+    fires = [d for d in diags if d.kind == "repeated_failures"]
+    assert len(fires) == 1, (
+        "repeated_failures must fire once a task's own max_retries has "
+        "tripped the breaker, even though consecutive_failures (1) is below "
+        "the global failure_limit (3)"
+    )
+    assert fires[0].data["consecutive_failures"] == 1
+    assert fires[0].data["failure_threshold"] == 1
+    assert fires[0].data["limit_source"] == "task"
+
+
+def test_repeated_failures_control_global_limit_path_unchanged():
+    """Control: a task with NO per-task max_retries override still gates on
+    the global failure_limit exactly as before — one failure short of the
+    limit produces nothing, reaching it produces the diagnostic."""
+    now = int(time.time())
+    short = _task(status="blocked", consecutive_failures=1, max_retries=None)
+    diags_short = kd.compute_task_diagnostics(
+        short, [], [], now=now, config={"failure_limit": 2},
+    )
+    assert not [d for d in diags_short if d.kind == "repeated_failures"]
+
+    at_limit = _task(status="blocked", consecutive_failures=2, max_retries=None)
+    diags_at_limit = kd.compute_task_diagnostics(
+        at_limit, [], [], now=now, config={"failure_limit": 2},
+    )
+    fires = [d for d in diags_at_limit if d.kind == "repeated_failures"]
+    assert len(fires) == 1
+    assert fires[0].data["failure_threshold"] == 2
+    assert fires[0].data["limit_source"] == "dispatcher"
+
+
+def test_repeated_failures_threshold_matches_breaker_effective_limit():
+    """Invariant, not a frozen literal: for any (task max_retries, dispatcher
+    failure_limit) pair, the diagnostic's resolved threshold and limit_source
+    equal kanban_db_dispatch.effective_failure_limit's own resolution — the
+    two paths cannot disagree because the diagnostic calls the same function.
+    """
+    from hermes_cli import kanban_db_dispatch as kbd
+
+    cases = [
+        (None, 2), (None, 5), (1, 2), (1, 5), (3, 2), (7, 1), (2, 2),
+    ]
+    for task_max_retries, dispatcher_limit in cases:
+        task = _task(status="blocked", max_retries=task_max_retries)
+        threshold, limit_source, _display = kd._effective_repeated_failures_threshold(
+            task, {**kd.DEFAULT_CONFIG, "failure_limit": dispatcher_limit,
+                   "failure_threshold": dispatcher_limit},
+        )
+        expected_limit, expected_source = kbd.effective_failure_limit(
+            task_max_retries, dispatcher_limit,
+        )
+        assert (threshold, limit_source) == (expected_limit, expected_source), (
+            task_max_retries, dispatcher_limit,
+        )
+
+
 
 
 # ---------------------------------------------------------------------------

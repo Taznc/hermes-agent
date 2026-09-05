@@ -96,6 +96,7 @@ export interface UpstreamTranslations {
     tryHint: (term: string) => string
     on: string
     off: string
+    undo: string
   }
 
   fileMenu: {
@@ -954,6 +955,7 @@ export interface UpstreamTranslations {
     }
     model: {
       loading: string
+      loadFailed: string
       appliesDesc: string
       provider: string
       model: string
@@ -962,7 +964,6 @@ export interface UpstreamTranslations {
       reasoning: string
       reasoningOff: string
       defaultsFailed: string
-      loadFailed: string
       restartRequired: string
       restartBackend: string
       restartingBackend: string
@@ -2094,6 +2095,10 @@ export interface UpstreamTranslations {
       openInSplit: string
       copyIdFailed: string
       sessionActions: string
+      /** Accessible name for the always-in-flow row-level archive icon button
+       *  (distinct from the kebab menu's `archive` label — this is the direct
+       *  one-click affordance on the row itself). */
+      archiveSession: string
       sessionRunning: string
       needsInput: string
       waitingForAnswer: string
@@ -3126,6 +3131,8 @@ export interface UpstreamTranslations {
     deleteFailed: string
     archived: string
     archiveFailed: string
+    archivedUndoMessage: string
+    undoArchiveFailed: string
     cwdChangeFailed: string
     cwdStagedTitle: string
     cwdStagedMessage: string

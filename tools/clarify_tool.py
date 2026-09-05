@@ -6,7 +6,7 @@ import inspect
 import json
 from typing import Dict, List, Optional, Callable
 
-MAX_CHOICES = 4  # the UI always appends an "Other (type your answer)" row
+MAX_CHOICES = 10  # the UI always appends an "Other (type your answer)" row
 MAX_QUESTIONS = 5  # independent questions per batch call
 # Canonical timeout sentinel. The CLI returns this exact text; the batch loop
 # treats it (like ``None``) as "the user walked away" and aborts remaining questions.
@@ -246,7 +246,8 @@ CLARIFY_SCHEMA = {
         "change another question, ask separately). Per question: "
         f"single-select (up to {MAX_CHOICES} choices — put your recommended "
         "option FIRST, the UI marks it '(Recommended)' and auto-appends an "
-        "'Other' free-text row), multi-select (multi_select=true), or "
+        "'Other' free-text row; offer as many real options as genuinely "
+        "distinct, not a padded list), multi-select (multi_select=true), or "
         "open-ended (omit choices). Options go ONLY in `choices`, never "
         "enumerated inside the question text (choices render as pickable "
         "rows; options written into the question are dead prose the user "

@@ -617,6 +617,34 @@ describe('ClarifyTool batch card', () => {
     expect(screen.getByText('0 of 2 answered')).toBeTruthy()
   })
 
+  it('gives each option in a question its OWN letter badge', () => {
+    renderLiveBatch()
+
+    // Guards the redesign's rename: the option map's index used to be named
+    // `index` and shadowed nothing, but the block now also takes a question
+    // `index` prop. If the two are ever conflated, every choice in a block
+    // renders the SAME badge and the letters stop meaning anything.
+    const block = document.querySelector('[data-clarify-batch-question="q0"]')
+    const badges = [...(block?.querySelectorAll('[data-choice] kbd') ?? [])].map(el => el.textContent)
+
+    expect(badges).toEqual(['A', 'B'])
+  })
+
+  it('marks a question answered once it is staged, for at-a-glance progress', () => {
+    renderLiveBatch()
+
+    const answeredQids = () =>
+      [...document.querySelectorAll('[data-clarify-batch-question][data-clarify-answered]')].map(el =>
+        el.getAttribute('data-clarify-batch-question')
+      )
+
+    expect(answeredQids()).toEqual([])
+
+    fireEvent.click(screen.getByRole('button', { name: /red/ }))
+
+    expect(answeredQids()).toEqual(['q0'])
+  })
+
   it('stages locally and keeps the single confirm disabled until all answered', async () => {
     const request = renderLiveBatch()
     const confirm = screen.getByRole('button', { name: /Confirm and continue/ })

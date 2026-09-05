@@ -50,6 +50,7 @@ export const zhAuthored: Translations = withForkKeys(forkZh, {
     skip: '跳过',
     update: '更新',
     tryHint: term => `试试“${term}”`,
+    undo: '撤销',
     on: '开',
     off: '关'
   },
@@ -1329,6 +1330,7 @@ export const zhAuthored: Translations = withForkKeys(forkZh, {
     },
     model: {
       loading: '正在加载模型配置...',
+      loadFailed: '加载模型设置失败',
       appliesDesc: '应用于新会话。可在输入框的模型选择器中临时切换当前对话。',
       provider: '提供方',
       model: '模型',
@@ -1337,7 +1339,6 @@ export const zhAuthored: Translations = withForkKeys(forkZh, {
       reasoning: '推理',
       reasoningOff: '关闭',
       defaultsFailed: '保存模型默认值失败',
-      loadFailed: '无法加载模型',
       restartRequired: '更新后此后端仍在运行旧代码。请重启以加载新代码。',
       restartBackend: '重启后端',
       restartingBackend: '正在重启后端...',
@@ -2654,6 +2655,7 @@ export const zhAuthored: Translations = withForkKeys(forkZh, {
       copyIdFailed: '无法复制会话 ID',
 
       sessionActions: '会话操作',
+      archiveSession: '归档会话',
       sessionRunning: '会话运行中',
       needsInput: '需要你输入',
       waitingForAnswer: '正在等待你的回答',
@@ -3794,6 +3796,8 @@ export const zhAuthored: Translations = withForkKeys(forkZh, {
     deleteFailed: '删除失败',
     archived: '已归档',
     archiveFailed: '归档失败',
+    archivedUndoMessage: '会话已归档',
+    undoArchiveFailed: '撤销失败',
     cwdChangeFailed: '工作目录更改失败',
     cwdStagedTitle: '工作目录已暂存',
     cwdStagedMessage: '重启桌面后端后，工作目录更改才会应用到当前活跃会话。',

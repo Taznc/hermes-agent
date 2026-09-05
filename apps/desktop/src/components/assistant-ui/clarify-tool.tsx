@@ -867,31 +867,67 @@ function ClarifyToolBatchSettled({ responses }: { responses: { question?: string
   )
 }
 
-/** One question's interactive block inside the live batch card. */
+/** One question's interactive block inside the live batch card.
+ *
+ * Each question is its own carded row rather than another run of bullets: a
+ * numbered index chip, the prompt, and the options indented beneath it. With
+ * up to `MAX_CHOICES` options per question and up to 5 questions, a flat
+ * bulleted list gave the eye nothing to anchor on — the blocks were
+ * indistinguishable and the form read as one long column of dashes. */
 function BatchQuestionBlock({
   disabled,
+  index,
   locked,
   onDraft,
   onToggle,
   question,
-  staged
+  staged,
+  total
 }: {
   disabled: boolean
+  index: number
   locked: boolean
   onDraft: (value: string) => void
   onToggle: (choice: string) => void
   question: ClarifyQuestion
   staged: { choices: string[]; draft: string }
+  total: number
 }) {
   const { t } = useI18n()
   const copy = t.assistant.clarify
   const choices = question.choices ?? []
+  const answered = staged.choices.length > 0 || Boolean(staged.draft.trim())
 
   return (
-    <div className="grid gap-1" data-clarify-batch-question={question.qid} data-locked={locked || undefined}>
+    <div
+      className={cn(
+        'grid gap-2 rounded-2xl px-3 py-2.5 transition-colors',
+        // The answered block recedes; the unanswered one keeps the accent rail,
+        // so "what still needs me" is legible at a glance instead of requiring
+        // the user to re-read every question.
+        answered ? 'bg-transparent' : 'bg-(--chrome-action-hover)/40'
+      )}
+      data-clarify-answered={answered || undefined}
+      data-clarify-batch-question={question.qid}
+      data-locked={locked || undefined}
+    >
       <div className="flex items-start gap-2">
+        <span
+          aria-hidden
+          className={cn(
+            'mt-px grid size-[1.125rem] shrink-0 place-items-center rounded-full text-[0.625rem] font-medium tabular-nums transition-colors',
+            answered
+              ? 'bg-primary text-white'
+              : 'bg-(--chrome-action-hover) text-(--ui-text-tertiary) ring-1 ring-(--ui-text-tertiary)/20'
+          )}
+        >
+          {answered ? '✓' : index + 1}
+        </span>
         <span className="flex-1 whitespace-pre-wrap font-medium leading-(--conversation-line-height)">
           {question.question}
+        </span>
+        <span className="mt-0.5 shrink-0 text-[0.625rem] tabular-nums text-(--ui-text-tertiary)">
+          {index + 1}/{total}
         </span>
         {locked ? (
           <span className="shrink-0 rounded-sm bg-(--chrome-action-hover) px-1 py-px text-[0.625rem] text-(--ui-text-tertiary)">
@@ -901,13 +937,13 @@ function BatchQuestionBlock({
       </div>
 
       {choices.length > 0 ? (
-        <div className="grid gap-px" role="group">
-          {choices.map((choice, index) => (
+        <div className="grid gap-px pl-[1.625rem]" role="group">
+          {choices.map((choice, choiceIndex) => (
             <ChoiceButton
-              char={letterFor(index)}
+              char={letterFor(choiceIndex)}
               choice={choice}
               disabled={disabled}
-              key={`${index}-${choice}`}
+              key={`${choiceIndex}-${choice}`}
               onClick={() => onToggle(choice)}
               selected={staged.choices.includes(choice)}
             />
@@ -1133,22 +1169,37 @@ function ClarifyToolBatchPending({ onAnswered, request }: { onAnswered: () => vo
 
   return (
     <form className="my-1.5 grid gap-4" data-clarify-batch={questions.length} onSubmit={handleSubmit}>
-      <ClarifyShell className="grid gap-3">
-        <div className="flex items-start gap-2">
-          <span className="flex-1 text-[0.6875rem] leading-4 text-(--ui-text-tertiary)">
+      <ClarifyShell className="grid gap-1.5">
+        <div className="flex items-center gap-2 px-3">
+          <MessageQuestion aria-hidden className="size-4 shrink-0 text-(--ui-text-tertiary)" />
+          <span className="flex-1 text-[0.6875rem] font-medium leading-4 text-(--ui-text-secondary)">
             {copy.questionProgress(answeredCount, questions.length)}
           </span>
-          <MessageQuestion aria-hidden className={CLARIFY_ICON_CLASS} />
+          {/* A segmented meter, not prose: with several questions the eye
+              tracks remaining work off the bar rather than re-counting. */}
+          <span aria-hidden className="flex shrink-0 items-center gap-1">
+            {questions.map((question, index) => (
+              <span
+                className={cn(
+                  'h-1 w-4 rounded-full transition-colors',
+                  stagedAnswer(question) !== null ? 'bg-primary' : 'bg-(--ui-text-tertiary)/25'
+                )}
+                key={`meter-${question.qid}-${index}`}
+              />
+            ))}
+          </span>
         </div>
-        {questions.map(question => (
+        {questions.map((question, index) => (
           <BatchQuestionBlock
             disabled={submitting}
+            index={index}
             key={question.qid}
             locked={false}
             onDraft={value => draftFor(question, value)}
             onToggle={choice => toggleChoice(question, choice)}
             question={question}
             staged={stageFor(question.qid)}
+            total={questions.length}
           />
         ))}
       </ClarifyShell>

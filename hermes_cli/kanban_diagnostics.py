@@ -352,22 +352,51 @@ def _failure_threshold(cfg: dict) -> Any:
     return cfg.get("failure_threshold", cfg.get("spawn_failure_threshold", 3))
 
 
+def _effective_repeated_failures_threshold(task, cfg: dict) -> tuple:
+    """Resolve the ``repeated_failures`` threshold the SAME way the dispatcher's circuit
+    breaker resolves its effective limit (``kanban_db_dispatch.effective_failure_limit``):
+    a task's own ``max_retries`` wins UNCONDITIONALLY over any config-derived value,
+    including an explicit ``kanban.diagnostics.failure_threshold`` override. Returns
+    ``(threshold, limit_source, failure_limit_display)`` — ``threshold`` is what
+    ``failures`` is compared against below; ``failure_limit_display`` is the value shown
+    in the diagnostic's detail text (the task override when present, else the configured
+    dispatcher limit, matching prior display behavior when there is no override).
+
+    A single shared resolver (rather than each rule deriving its own threshold from
+    ``cfg`` alone) is what keeps a task blocked by its own ``max_retries`` from ever
+    producing zero diagnostics: the breaker and the diagnostic agree by construction.
+    """
+    from hermes_cli.kanban_db_dispatch import effective_failure_limit
+
+    config_threshold = _positive_int(_failure_threshold(cfg), 3)
+    task_max_retries = _task_field(task, "max_retries")
+    threshold, limit_source = effective_failure_limit(task_max_retries, config_threshold)
+    failure_limit_display = (
+        threshold if limit_source == "task"
+        else _positive_int(cfg.get("failure_limit"), config_threshold)
+    )
+    return threshold, limit_source, failure_limit_display
+
+
 _OUTCOME_LABELS = {"spawn_failed": "spawn", "timed_out": "timeout", "crashed": "crash"}
 
 
 def _rule_repeated_failures(task, events, runs, now, cfg) -> list[Diagnostic]:
-    """``consecutive_failures`` >= cfg["failure_threshold"] (legacy key
-    ``spawn_failure_threshold``), regardless of failure mode — the kernel keeps
-    retrying and the operator must intervene. Runtime callers derive the
-    threshold from ``kanban.failure_limit`` so it doesn't lag the breaker.
+    """``consecutive_failures`` >= the SAME effective threshold the dispatcher circuit
+    breaker used to trip (``_effective_repeated_failures_threshold`` — task's own
+    ``max_retries`` wins over ``cfg["failure_threshold"]``/legacy
+    ``spawn_failure_threshold``/``cfg["failure_limit"]``), regardless of failure mode —
+    the kernel keeps retrying and the operator must intervene. A task that trips the
+    breaker via a per-task ``max_retries`` below the global limit must still fire this
+    rule; sharing the resolver with the breaker (rather than each side deriving its own
+    threshold) is what guarantees that.
 
     Exempt: done/archived (a manual done ends no run, so the streak is history)
     and running (a retry in flight must not read as a current failure; re-fires
     if it fails too)."""
     if _task_field(task, "status") in ("done", "archived", "running"):
         return []
-    threshold = _positive_int(_failure_threshold(cfg), 3)
-    failure_limit = _positive_int(cfg.get("failure_limit"), threshold)
+    threshold, limit_source, failure_limit = _effective_repeated_failures_threshold(task, cfg)
     failures = _first_field(task, "consecutive_failures", "spawn_failures", 0)
     if failures is None or failures < threshold:
         return []
@@ -421,6 +450,7 @@ def _rule_repeated_failures(task, events, runs, now, cfg) -> list[Diagnostic]:
             "last_error": last_err,
             "failure_threshold": threshold,
             "failure_limit": failure_limit,
+            "limit_source": limit_source,
         },
     )]
 
@@ -437,7 +467,8 @@ def _rule_repeated_crashes(task, events, runs, now, cfg) -> list[Diagnostic]:
     if _task_field(task, "status") in ("done", "archived", "running"):
         return []
     # Unified rule will catch this — let it handle to avoid double fire.
-    if (_task_field(task, "consecutive_failures", 0) or 0) >= int(_failure_threshold(cfg)):
+    unified_threshold, _limit_source, _failure_limit = _effective_repeated_failures_threshold(task, cfg)
+    if (_task_field(task, "consecutive_failures", 0) or 0) >= unified_threshold:
         return []
 
     threshold = int(cfg.get("crash_threshold", 2))

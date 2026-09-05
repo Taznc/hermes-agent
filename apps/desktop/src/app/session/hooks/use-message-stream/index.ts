@@ -10,6 +10,7 @@ import {
   type ChatMessagePart,
   chatMessageText,
   completeOpenTimelineParts,
+  dedupeOpenClarifyParts,
   type GatewayEventPayload,
   mergeFinalAssistantText,
   reasoningPart,
@@ -91,6 +92,10 @@ export function useMessageStream({
       seed: () => ChatMessagePart[],
       opts: {
         pending?: (message: ChatMessage) => boolean
+        /** Whole-transcript pass applied after the per-message mutation, for
+         *  invariants that can't be seen from inside one message (e.g. only one
+         *  clarify may be open per session). */
+        messages?: (messages: ChatMessage[]) => ChatMessage[]
       } = {},
       occurredAt = Date.now() / 1000
     ) => {
@@ -135,7 +140,7 @@ export function useMessageStream({
 
           return {
             ...state,
-            messages: nextMessages,
+            messages: opts.messages ? opts.messages(nextMessages) : nextMessages,
             streamId,
             sawAssistantPayload: true,
             awaitingResponse: false
@@ -484,7 +489,14 @@ export function useMessageStream({
         sessionId,
         parts => dedupeGeneratedImageEchoesInParts(upsertToolPart(parts, payload, phase, occurredAt)),
         () => upsertToolPart([], payload, phase, occurredAt),
-        { pending: m => phase !== 'complete' || (m.pending ?? false) },
+        {
+          pending: m => phase !== 'complete' || (m.pending ?? false),
+          // A clarify `tool.start` landing after its `clarify.request` row can
+          // still miss correlation and append a second open card. One clarify
+          // may be open per session, so collapse across the whole transcript
+          // right after the mutation rather than trusting per-message matching.
+          messages: payload?.name === 'clarify' ? dedupeOpenClarifyParts : undefined
+        },
         occurredAt
       )
     },

@@ -45,7 +45,8 @@ export const en: Translations = withForkKeys(forkEn, {
     update: 'Update',
     tryHint: term => `Try “${term}”`,
     on: 'On',
-    off: 'Off'
+    off: 'Off',
+    undo: 'Undo'
   },
 
   fileMenu: {
@@ -1096,6 +1097,7 @@ export const en: Translations = withForkKeys(forkEn, {
     },
     model: {
       loading: 'Loading model configuration...',
+      loadFailed: 'Failed to load model settings',
       appliesDesc: 'Applies to new sessions. Use the model picker in the composer to hot-swap the active chat.',
       provider: 'Provider',
       model: 'Model',
@@ -1104,7 +1106,6 @@ export const en: Translations = withForkKeys(forkEn, {
       reasoning: 'Reasoning',
       reasoningOff: 'Off',
       defaultsFailed: 'Failed to save model defaults',
-      loadFailed: 'Could not load models',
       restartRequired: 'This backend is running old code after an update. Restart it to load the new code.',
       restartBackend: 'Restart backend',
       restartingBackend: 'Restarting backend...',
@@ -2448,6 +2449,7 @@ export const en: Translations = withForkKeys(forkEn, {
       openInSplit: 'Open in split',
       copyIdFailed: 'Could not copy session ID',
       sessionActions: 'Session actions',
+      archiveSession: 'Archive session',
       sessionRunning: 'Session running',
       needsInput: 'Needs your input',
       waitingForAnswer: 'Waiting for your answer',
@@ -3624,6 +3626,8 @@ export const en: Translations = withForkKeys(forkEn, {
     deleteFailed: 'Delete failed',
     archived: 'Archived',
     archiveFailed: 'Archive failed',
+    archivedUndoMessage: 'Session archived',
+    undoArchiveFailed: 'Undo failed',
     cwdChangeFailed: 'Working directory change failed',
     cwdStagedTitle: 'Working directory staged',
     cwdStagedMessage: 'Restart the desktop backend to apply cwd changes to this active session.',
