@@ -796,6 +796,9 @@ elif _GATEWAY_HEALTH_TIMEOUT > _GATEWAY_HEALTH_TIMEOUT_MAX:
 
 _MANAGED_FILE_MAX_BYTES = 100 * 1024 * 1024
 _FS_DATA_URL_MAX_BYTES = 16 * 1024 * 1024
+# Chat file uploads share the read-data-url cap: a chat attachment is read back
+# through the same data-url path, so a larger upload could never be re-read.
+_CHAT_FILE_UPLOAD_MAX_BYTES = _FS_DATA_URL_MAX_BYTES
 # Multipart uploads stream to a temp file in fixed chunks and rename into
 # place: constant memory, no base64 inflation, no proxy body-size 502s (NS-501).
 _UPLOAD_CHUNK_BYTES = 1024 * 1024
