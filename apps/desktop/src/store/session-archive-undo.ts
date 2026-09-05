@@ -55,7 +55,16 @@ const timers = new Map<string, ReturnType<typeof setTimeout>>()
 // The archive PATCH for a session, tracked only while it may still be in
 // flight. `undoArchive` awaits this before issuing its own inverse PATCH so
 // the two writes can never apply out of order (review t_548d0d33, blocking
-// issue 3).
+// issue 3). Stored WITHOUT swallowing its rejection: `undoArchive` needs to
+// see whether the archive itself failed so it can abort a queued undo
+// instead of proceeding as if the archive had succeeded (review t_548d0d33
+// round 2 — a swallowed rejection here let a queued Undo fire its inverse
+// PATCH, and roll back the canonical archive's own rollback, after an
+// archive that never actually landed). The promise is safe to store
+// unhandled: the caller (`archiveSession`) already `await`s this exact same
+// promise inside its own try/catch, so a rejection is always handled there
+// even when nothing here ever reads it (e.g. the undo window simply
+// expires).
 const pendingWrites = new Map<string, Promise<unknown>>()
 
 function clearPendingTimer(storedSessionId: string): void {
@@ -211,14 +220,7 @@ export function registerPendingArchiveUndo(params: {
   }
 
   $pendingArchiveUndos.set({ ...$pendingArchiveUndos.get(), [storedSessionId]: entry })
-  // Tracked only for undoArchive's serialization gate below — a rejection
-  // here must never surface as an unhandled rejection from this
-  // fire-and-forget tracking copy; the real rejection still propagates
-  // through the caller's own awaited promise.
-  pendingWrites.set(
-    storedSessionId,
-    writePromise.catch(() => undefined)
-  )
+  pendingWrites.set(storedSessionId, writePromise)
 
   timers.set(
     storedSessionId,
@@ -240,13 +242,16 @@ export function discardPendingArchiveUndo(storedSessionId: string): void {
  *  implied by its recorded neighbors (order-independent — see
  *  `PendingArchiveUndo.prevPinId`/`nextPinId`) and pin state, and reverses
  *  the backend flag. Waits for the archive's own write to settle first, so
- *  the two PATCHes can never apply out of order. Safe to call blind — a call
- *  after the window has expired (checked against `expiresAt` at invocation
- *  time, not just trusting timer-callback ordering), for an id that was
- *  never archived through this path, or a second call for one already
- *  undone, is a no-op (never throws, never double-restores). Two pending
- *  archives are independent: undoing one only ever reads/clears that id's
- *  own entry. */
+ *  the two PATCHes can never apply out of order — and if that write itself
+ *  rejected, this is a no-op (nothing to undo; the canonical archive action
+ *  already rolled its own optimistic removal back, and this must NOT issue
+ *  the inverse PATCH or disturb that rollback — review t_548d0d33 round 2).
+ *  Safe to call blind — a call after the window has expired (checked
+ *  against `expiresAt` at invocation time, not just trusting
+ *  timer-callback ordering), for an id that was never archived through
+ *  this path, or a second call for one already undone, is a no-op (never
+ *  throws, never double-restores). Two pending archives are independent:
+ *  undoing one only ever reads/clears that id's own entry. */
 export async function undoArchive(storedSessionId: string): Promise<void> {
   const entry = $pendingArchiveUndos.get()[storedSessionId]
 
@@ -262,7 +267,22 @@ export async function undoArchive(storedSessionId: string): Promise<void> {
 
   // Queue behind the archive PATCH: it may still be in flight, and undoing
   // before it lands risks the server applying the two writes out of order.
-  await write
+  try {
+    await write
+  } catch {
+    // The archive write itself failed — there is nothing to undo. The
+    // canonical `archiveSession` catch block (use-session-actions/index.ts)
+    // already restored the row/pin and untombstoned it, and rethrows for
+    // its OWN caller to surface the failure. Proceeding past this point
+    // would optimistically "restore" an already-restored row and then fire
+    // an inverse PATCH to unarchive a session the backend never archived —
+    // and if THAT inverse PATCH also failed, the old rollback would
+    // re-remove/re-tombstone the row the canonical catch just put back,
+    // leaving the UI archived while the backend was never archived at all
+    // (review t_548d0d33 round 2, the deferred-archive-rejection case).
+    // Stop here; the archive failure is already being surfaced elsewhere.
+    return
+  }
 
   const archivedIds = [entry.storedSessionId, entry.session.id, entry.session._lineage_root_id]
   const pinId = sessionPinId(entry.session)

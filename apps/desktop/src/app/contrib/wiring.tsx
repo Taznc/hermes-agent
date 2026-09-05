@@ -80,7 +80,6 @@ import {
   setBusy,
   setMessages
 } from '@/store/session'
-import { ARCHIVE_UNDO_WINDOW_MS, commitPendingArchive, undoArchive } from '@/store/session-archive-undo'
 import { requestForSessionProfile, type SessionOwnerScope } from '@/store/session-request-router'
 import { $focusedStoredSessionId, sessionTileOwnerRoute, storedSessionIdForRuntimeId } from '@/store/session-states'
 import { clearSessionTodos, setSessionTodos, todosForHydration } from '@/store/todos'
@@ -141,6 +140,7 @@ import {
 import { TitlebarControls } from '../shell/titlebar-controls'
 import { UpdatesOverlay } from '../updates-overlay'
 
+import { archiveUndoToastId, buildArchiveUndoToastInput } from './archive-undo-toast'
 import { ContribWiringContext } from './context'
 import {
   reconcileActiveTranscript,
@@ -1017,7 +1017,7 @@ export function ContribWiring({ children }: { children: ReactNode }) {
         startFreshSessionDraft(true)
       }
 
-      const toastId = `archive-undo:${storedSessionId}`
+      const toastId = archiveUndoToastId(storedSessionId)
       // Routes through the ONE canonical archive action (mutation fencing,
       // unread cleanup, tile/runtime cleanup — see its own doc comment) with
       // `withUndo: true`, which additionally opens the 10s undo window this
@@ -1025,25 +1025,14 @@ export function ContribWiring({ children }: { children: ReactNode }) {
       // issue 2).
       const archived = archiveSession(storedSessionId, { withUndo: true })
 
-      notify({
-        action: {
-          label: t.common.undo,
-          onClick: () =>
-            void undoArchive(storedSessionId).catch(err => {
-              notifyError(err, t.desktop.undoArchiveFailed)
-            })
-        },
-        durationMs: ARCHIVE_UNDO_WINDOW_MS,
-        id: toastId,
-        kind: 'success',
-        message: t.desktop.archivedUndoMessage,
-        // If the 4-item notification cap silently drops THIS toast (a 5th
-        // archive within the window — #548d0d33, issue 4), there is no
-        // longer any UI affordance for undoing it: commit the archive
-        // immediately instead of leaving its timer running behind a toast
-        // the user can no longer see or click.
-        onEvict: () => commitPendingArchive(storedSessionId)
-      })
+      notify(
+        buildArchiveUndoToastInput({
+          message: t.desktop.archivedUndoMessage,
+          onUndoFailed: err => notifyError(err, t.desktop.undoArchiveFailed),
+          storedSessionId,
+          undoLabel: t.common.undo
+        })
+      )
 
       void archived.catch(err => {
         dismissNotification(toastId)

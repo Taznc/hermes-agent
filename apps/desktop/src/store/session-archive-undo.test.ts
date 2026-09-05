@@ -314,6 +314,81 @@ describe('undoArchive', () => {
     await expect(undoArchive('a')).rejects.toThrow('undo backend rejected')
   })
 
+  // --- Review t_548d0d33 round 2: deferred archive-rejection case ----------
+  //
+  // Undo clicked while the archive PATCH is still pending, and that archive
+  // PATCH then rejects. Before this fix, `pendingWrites` swallowed the
+  // rejection (`writePromise.catch(() => undefined)`), so `undoArchive`
+  // proceeded as if the archive had succeeded: it optimistically restored
+  // the row and fired the inverse `setSessionArchived(id, false)` PATCH —
+  // racing/duplicating the canonical archive action's own catch-block
+  // rollback, and (if that inverse PATCH also rejected) re-removing the row
+  // the canonical rollback had just restored.
+  it('does not issue an inverse PATCH and leaves the row restored when Undo is invoked before a deferred archive rejection settles', async () => {
+    setSessions([row('a')])
+
+    let rejectArchiveWrite: (err: Error) => void = () => {}
+
+    const archiveWrite = new Promise<{ ok: boolean }>((_resolve, reject) => {
+      rejectArchiveWrite = reject
+    })
+
+    patchArchived.mockImplementation((_id, archived) => (archived ? archiveWrite : Promise.resolve({ ok: true })))
+
+    // Neither awaited yet: Undo fires while the archive write is still in
+    // flight, mirroring a user clicking Undo on a slow network.
+    const archivePromise = archiveViaStore('a')
+    const undoPromise = undoArchive('a')
+
+    rejectArchiveWrite(new Error('archive backend rejected'))
+
+    await expect(archivePromise).rejects.toThrow('archive backend rejected')
+    // undoArchive treats a failed archive write as "nothing to undo" — it
+    // must resolve quietly rather than reject or act.
+    await expect(undoPromise).resolves.toBeUndefined()
+
+    // No inverse PATCH was ever sent for a write that never actually
+    // archived anything — only the original (failed) archive attempt hit
+    // the backend.
+    expect(patchArchived).toHaveBeenCalledTimes(1)
+    expect(patchArchived).toHaveBeenCalledWith('a', true, undefined)
+    // The canonical archive's own rollback (mirrored by archiveViaStore's
+    // catch) restored the row — undoArchive must not have disturbed it.
+    expect($sessions.get().map(s => s.id)).toEqual(['a'])
+    expect(isArchiveUndoPending('a')).toBe(false)
+  })
+
+  // Combination case: the archive itself DOES land, but the deferred undo's
+  // own inverse PATCH then fails too. This must still roll back exactly as
+  // the non-deferred case does (see "rolls the optimistic restore back if
+  // the backend rejects the undo" above) — the fix for the case above must
+  // not accidentally suppress a genuine inverse-PATCH failure.
+  it('rolls back the optimistic restore when a deferred undo issues its inverse PATCH and that one also fails', async () => {
+    setSessions([row('a')])
+
+    let resolveArchiveWrite: (value: { ok: boolean }) => void = () => {}
+
+    const archiveWrite = new Promise<{ ok: boolean }>(resolve => {
+      resolveArchiveWrite = resolve
+    })
+
+    patchArchived.mockImplementation((_id, archived) =>
+      archived ? archiveWrite : Promise.reject(new Error('inverse PATCH rejected'))
+    )
+
+    const archivePromise = archiveViaStore('a')
+    const undoPromise = undoArchive('a')
+
+    resolveArchiveWrite({ ok: true })
+    await archivePromise
+
+    await expect(undoPromise).rejects.toThrow('inverse PATCH rejected')
+
+    // Undo's own rollback re-removes the row it had optimistically
+    // restored, leaving the UI in the archived state the backend agrees on.
+    expect($sessions.get().map(s => s.id)).toEqual([])
+  })
+
   // --- Review t_548d0d33, blocking issue 4: notification-cap eviction ------
   it('commitPendingArchive (eviction path) drops the pending entry and cancels its timer without touching $sessions', async () => {
     setSessions([row('a'), row('b')])
