@@ -174,6 +174,7 @@ import {
 import { describeDevCdpDecision, resolveDevCdpPort } from './dev-cdp'
 import { installEmbedReferer } from './embed-referer'
 import { createEventDeduper } from './event-dedupe'
+import { registerAttachmentStreamIpc } from './fork/attachment-stream-ipc'
 import { registerDevRestartWatch } from './fork/dev-restart-watch'
 import { repairStoredProfile } from './fork/profile-repair'
 import { freshRemoteTokenWsUrl, mintWsTicketWithStaticToken } from './fork/remote-auth'
@@ -214,7 +215,6 @@ import { registerGitIpc } from './git-ipc'
 import { clearStaleGitLocks } from './gitlock'
 import { readAndConsumeHandoffResult } from './handoff-result'
 import {
-  ATTACHMENT_CHUNK_BYTES,
   ATTACHMENT_UPLOAD_DEFAULT_MAX_BYTES,
   clampDataUrlReadMaxMb,
   DATA_URL_READ_DEFAULT_MAX_MB,
@@ -222,7 +222,6 @@ import {
   DEFAULT_FETCH_TIMEOUT_MS,
   enableBasicPasswordStoreEncryption,
   encryptDesktopSecret as encryptDesktopSecretStrict,
-  readFileChunkForIpc,
   readFileDataUrlForIpc,
   resolvePersistedRemoteToken,
   resolveReadableFileForIpc,
@@ -17004,24 +17003,13 @@ ipcMain.handle('hermes:readFileDataUrlForAttach', async (_event, filePath) => {
   })
 })
 
-// Chunked attachment transport: the renderer drives repeated calls at
-// increasing `offset` and concatenates the returned base64 strings itself,
-// so at no point does main hold the whole file (or its base64 expansion) in
-// one Buffer/string, and no single IPC reply exceeds ATTACHMENT_CHUNK_BYTES
-// (~8 MiB raw, ~11 MiB base64) regardless of how large the source file is.
-// Same total-size cap and path hardening as the whole-file reader; only the
-// transport shape changes.
-ipcMain.handle('hermes:readFileChunkForAttach', async (_event, filePath, offset) => {
-  return readFileChunkForIpc(
-    filePath,
-    {
-      maxBytes: ATTACHMENT_UPLOAD_DEFAULT_MAX_BYTES,
-      mimeType: mimeTypeForPath(resolveRequestedPathForIpc(filePath, { purpose: 'Attachment upload' })),
-      purpose: 'Attachment upload'
-    },
-    Number(offset) || 0,
-    ATTACHMENT_CHUNK_BYTES
-  )
+// Chunked attachment transport — bounded per-chunk IPC replies instead of a
+// whole-file base64 string; implementation and rationale in the fork module.
+// >>> FORK ANCHOR: attachment-stream-ipc <<<
+registerAttachmentStreamIpc({
+  ipcMain,
+  resolveRequestedPath: (filePath, options) => resolveRequestedPathForIpc(filePath, options),
+  mimeTypeForPath
 })
 
 ipcMain.handle('hermes:readFileText', async (_event, filePath) => {
