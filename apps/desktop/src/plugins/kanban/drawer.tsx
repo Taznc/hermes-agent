@@ -1033,16 +1033,18 @@ export const isImageAttachment = (a: KanbanAttachment) => (a.content_type ?? '')
  *  crash (#cae4c2ba acceptance: broken/missing images handled gracefully). */
 export function ImageThumb({
   attachment,
+  board,
   onOpen
 }: {
   attachment: KanbanAttachment
+  board?: string
   onOpen: (filename: string, src: string) => void
 }) {
   const k = useKanban()
   const [decodeFailed, setDecodeFailed] = useState(false)
 
   const { data, isError, isLoading } = useQuery({
-    queryFn: () => fetchAttachmentDataUrl(attachment.id),
+    queryFn: () => fetchAttachmentDataUrl(attachment.id, board),
     queryKey: ['kanban', 'attachment-data-url', attachment.id],
     retry: false,
     staleTime: Infinity
@@ -1082,9 +1084,11 @@ export function ImageThumb({
  *  a lightbox. */
 export function ImagesSection({
   attachments,
+  board,
   onOpen
 }: {
   attachments: KanbanAttachment[]
+  board?: string
   onOpen: (filename: string, src: string) => void
 }) {
   const k = useKanban()
@@ -1097,7 +1101,7 @@ export function ImagesSection({
     <Section label={k.images(attachments.length)}>
       <div className="flex flex-wrap gap-2">
         {attachments.map(attachment => (
-          <ImageThumb attachment={attachment} key={attachment.id} onOpen={onOpen} />
+          <ImageThumb attachment={attachment} board={board} key={attachment.id} onOpen={onOpen} />
         ))}
       </div>
     </Section>
@@ -1168,12 +1172,12 @@ function AttachmentsSection({
 // behind an explicit click + disclaimer since it makes a model call. The
 // control keeps a stable footprint (spinner swaps in place) so there's no
 // layout jump when it runs.
-function EstimateSection({ id }: { id: string }) {
+function EstimateSection({ board, id }: { board?: string; id: string }) {
   const k = useKanban()
   const [result, setResult] = useState<null | TaskEstimate>(null)
 
   const est = useMutation({
-    mutationFn: () => estimateTask(id),
+    mutationFn: () => estimateTask(id, board),
     onError: err => host.notify({ kind: 'error', message: errText(err) }),
     onSuccess: r => {
       if (r.ok) {
@@ -1528,11 +1532,18 @@ const MAX_LOG_TAIL_BYTES = 1_048_576 // 1 MiB — well under the backend's 2 MiB
 const FAILED_OUTCOMES = ['crashed', 'failed', 'timed_out', 'gave_up']
 
 export function TaskDrawer({
+  board: taskBoard,
   columns,
   id,
   onClose,
   onOpen
 }: {
+  /** The card's own board, from the caller's board cache — REQUIRED to route
+   *  every fetch/mutation correctly in All Boards mode, where `$boardSlug` is
+   *  the `'*'` sentinel and cannot resolve a real board on its own. `undefined`
+   *  in single-board mode (byte-identical to the pre-existing behavior: every
+   *  call falls through to `$boardSlug`). */
+  board?: string
   columns: string[]
   id: null | string
   onClose: () => void
@@ -1546,7 +1557,7 @@ export function TaskDrawer({
   // Socket-invalidated (bindApi); the interval is only the socketless heartbeat.
   const { data: detail, error } = useQuery({
     enabled: !!id,
-    queryFn: () => fetchTask(id!),
+    queryFn: () => fetchTask(id!, taskBoard),
     queryKey: taskKey(slug, id ?? ''),
     refetchInterval: 30_000
   })
@@ -1564,7 +1575,7 @@ export function TaskDrawer({
 
   const { data: log } = useQuery({
     enabled: !!id,
-    queryFn: () => fetchLog(id!, logTail),
+    queryFn: () => fetchLog(id!, logTail, taskBoard),
     queryKey: logKey(slug, id ?? '', logTail),
     refetchInterval: running ? 3_000 : 15_000
   })
@@ -1589,7 +1600,7 @@ export function TaskDrawer({
   // Optimistic status change against the task cache; rolls back + toasts on a
   // rejected transition (the backend enforces the workflow).
   const moveMut = useMutation({
-    mutationFn: (status: string) => patchTask(id!, { status }),
+    mutationFn: (status: string) => patchTask(id!, { status }, taskBoard),
     onMutate: async status => {
       await qc.cancelQueries({ queryKey: taskKey(slug, id!) })
       const previous = qc.getQueryData<KanbanTaskDetail>(taskKey(slug, id!))
@@ -1620,7 +1631,8 @@ export function TaskDrawer({
     )
 
   const commentMut = useMutation({
-    mutationFn: ({ body, choice }: { body: string; choice?: ChoiceResponse }) => addComment(id!, body, choice),
+    mutationFn: ({ body, choice }: { body: string; choice?: ChoiceResponse }) =>
+      addComment(id!, body, choice, taskBoard),
     onError: err => host.notify({ kind: 'error', message: errText(err) }),
     onSuccess: invalidate
   })
@@ -1630,8 +1642,8 @@ export function TaskDrawer({
   // replacement for the block → comment → unblock dance.
   const requeueMut = useMutation({
     mutationFn: async (body: string) => {
-      await addComment(id!, body)
-      await reclaimTask(id!)
+      await addComment(id!, body, undefined, taskBoard)
+      await reclaimTask(id!, taskBoard)
     },
     onError: err => host.notify({ kind: 'error', message: errText(err) }),
     onSuccess: () => {
@@ -1643,18 +1655,22 @@ export function TaskDrawer({
   // Priority-only PATCH — never touches status/title/body/assignee, so a
   // failed toggle can't be mistaken for a bigger write going wrong.
   const priorityMut = useMutation({
-    mutationFn: (priority: number) => patchTask(id!, { priority }),
+    mutationFn: (priority: number) => patchTask(id!, { priority }, taskBoard),
     onError: err => host.notify({ kind: 'error', message: errText(err) }),
     onSuccess: invalidate
   })
 
   const uploadMut = useMutation({
     mutationFn: async (file: File) =>
-      uploadAttachment(id!, {
-        bytes: await file.arrayBuffer(),
-        contentType: file.type || undefined,
-        filename: file.name
-      }),
+      uploadAttachment(
+        id!,
+        {
+          bytes: await file.arrayBuffer(),
+          contentType: file.type || undefined,
+          filename: file.name
+        },
+        taskBoard
+      ),
     onError: err => host.notify({ kind: 'error', message: errText(err) }),
     onSuccess: invalidate
   })
@@ -1738,11 +1754,11 @@ export function TaskDrawer({
                     {k.copyTitle}
                   </DropdownMenuItem>
                   <DropdownMenuSeparator />
-                  <DropdownMenuItem onSelect={mutate(() => patchTask(task.id, { status: 'archived' }), onClose)}>
+                  <DropdownMenuItem onSelect={mutate(() => patchTask(task.id, { status: 'archived' }, taskBoard), onClose)}>
                     <Codicon name="archive" size="0.85rem" />
                     {k.archive}
                   </DropdownMenuItem>
-                  <DropdownMenuItem className="text-destructive" onSelect={mutate(() => deleteTask(task.id), onClose)}>
+                  <DropdownMenuItem className="text-destructive" onSelect={mutate(() => deleteTask(task.id, taskBoard), onClose)}>
                     <Codicon name="trash" size="0.85rem" />
                     {k.delete}
                   </DropdownMenuItem>
@@ -1805,7 +1821,7 @@ export function TaskDrawer({
                 <MetaRow label={k.assignee}>
                   <AssigneeMenu
                     current={task.assignee}
-                    onReassign={profile => void mutate(() => reassignTask(task.id, profile))()}
+                    onReassign={profile => void mutate(() => reassignTask(task.id, profile, taskBoard))()}
                   />
                 </MetaRow>
                 {typeof task.priority === 'number' && <MetaRow label={k.metaPriority}>{task.priority}</MetaRow>}
@@ -1818,7 +1834,7 @@ export function TaskDrawer({
                 )}
                 <MetaRow label={k.model}>
                   <ModelOverrideField
-                    onChange={next => void mutate(() => patchTask(task.id, overridePatch(next)))()}
+                    onChange={next => void mutate(() => patchTask(task.id, overridePatch(next), taskBoard))()}
                     value={{
                       effort: task.reasoning_effort ?? '',
                       model: task.model_override ?? '',
@@ -1840,13 +1856,16 @@ export function TaskDrawer({
 
             {task.diagnostics && task.diagnostics.length > 0 && (
               <Section label={k.diagnosticsN(task.diagnostics.length)}>
-                <Diagnostics items={task.diagnostics} onReclaim={() => void mutate(() => reclaimTask(task.id))()} />
+                <Diagnostics items={task.diagnostics} onReclaim={() => void mutate(() => reclaimTask(task.id, taskBoard))()} />
               </Section>
             )}
 
-            <DescriptionSection body={task.body} onSave={body => void mutate(() => patchTask(task.id, { body }))()} />
+            <DescriptionSection
+              body={task.body}
+              onSave={body => void mutate(() => patchTask(task.id, { body }, taskBoard))()}
+            />
 
-            <EstimateSection id={task.id} />
+            <EstimateSection board={taskBoard} id={task.id} />
 
             {task.result && (
               <Section label={k.result}>
@@ -1862,9 +1881,9 @@ export function TaskDrawer({
 
             <DependenciesSection
               detail={detail}
-              onLink={parentId => void mutate(() => linkTasks(parentId, task.id))()}
+              onLink={parentId => void mutate(() => linkTasks(parentId, task.id, taskBoard))()}
               onOpen={onOpen}
-              onUnlink={(parentId, childId) => void mutate(() => unlinkTasks(parentId, childId))()}
+              onUnlink={(parentId, childId) => void mutate(() => unlinkTasks(parentId, childId, taskBoard))()}
               slug={slug}
               task={task}
             />
@@ -1989,7 +2008,11 @@ export function TaskDrawer({
               </Section>
             )}
 
-            <ImagesSection attachments={detail.attachments.filter(isImageAttachment)} onOpen={(filename, src) => setLightbox({ filename, src })} />
+            <ImagesSection
+              attachments={detail.attachments.filter(isImageAttachment)}
+              board={taskBoard}
+              onOpen={(filename, src) => setLightbox({ filename, src })}
+            />
 
             <AttachmentsSection
               attachments={detail.attachments.filter(a => !isImageAttachment(a))}

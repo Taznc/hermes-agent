@@ -30,7 +30,7 @@ import {
   useValue
 } from '@hermes/plugin-sdk'
 
-import { $boardSlug, bindApi, boardKey, fetchBoard } from './api'
+import { $boardSlug, ALL_BOARDS, bindApi, boardKey, fetchAllBoards, fetchBoard } from './api'
 import { KanbanBoardPage } from './board'
 import { KANBAN_LOCALES } from './i18n'
 import { $newTaskLane, useKanban } from './ui'
@@ -41,10 +41,14 @@ import { $newTaskLane, useKanban } from './ui'
 function KanbanCount() {
   const k = useKanban()
   const slug = useValue($boardSlug)
+  const isAllBoards = slug === ALL_BOARDS
 
   // Socket-invalidated like the page (same cache); slow socketless heartbeat.
+  // In All Boards mode this must fetch the consolidated view too — falling
+  // through to fetchBoard would silently show a single (arbitrary) board's
+  // count while the switcher reads "All Boards".
   const { data: board } = useQuery({
-    queryFn: () => fetchBoard(false),
+    queryFn: () => (isAllBoards ? fetchAllBoards(false) : fetchBoard(false)),
     queryKey: boardKey(slug, false),
     refetchInterval: 60_000
   })

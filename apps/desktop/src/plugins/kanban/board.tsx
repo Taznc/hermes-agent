@@ -66,9 +66,11 @@ import {
 import {
   $boardSlug,
   $collapsedLanes,
+  $hiddenBoards,
   $introDismissed,
   $lanesByProfile,
   addRoadmapIdea,
+  ALL_BOARDS,
   boardKey,
   BOARDS_KEY,
   bulkTasks,
@@ -76,6 +78,7 @@ import {
   deleteStagedAttachment,
   deleteTask,
   estimateNew,
+  fetchAllBoards,
   fetchAttachmentDataUrl,
   fetchBoard,
   fetchBoards,
@@ -89,7 +92,7 @@ import { blockerStand, buildGraph, type DependencyGraph, downstreamOf, focusSets
 import { TaskDrawer } from './drawer'
 import { EMPTY_OVERRIDE, ModelOverrideField, overrideCreateFields, type TaskModelOverride } from './model-override'
 import { OrchestrationPanel } from './orchestration'
-import { columnMeta, type KanbanBoard, type KanbanTask, type TaskEstimate } from './types'
+import { type BoardAllInfo, columnMeta, type KanbanBoard, type KanbanTask, type TaskEstimate } from './types'
 import {
   $newTaskLane,
   ago,
@@ -183,6 +186,7 @@ interface DependencyView {
 }
 
 const EMPTY_IDS: ReadonlySet<string> = new Set<string>()
+const EMPTY_BOARD_INFO: readonly BoardAllInfo[] = []
 
 // Module-level constant so the context default keeps a stable identity across
 // renders (a fresh object here would re-render every consumer for nothing).
@@ -199,6 +203,18 @@ const NO_DEPENDENCIES: DependencyView = {
 const DependencyContext = createContext<DependencyView>(NO_DEPENDENCIES)
 
 const useDependencies = () => useContext(DependencyContext)
+
+// ── board attribution (All Boards mode only) ──────────────────────────────────
+
+/** Per-board display chrome (name/color/icon), keyed by slug — populated only
+ *  in the consolidated All Boards view so `Card` can render a board badge.
+ *  `null` in single-board mode: cards never need attribution against
+ *  themselves, and `Card` skips the badge entirely when this is null.
+ *  Exported so `BoardBadge` is testable by wrapping it in a provider without
+ *  mounting the whole page. */
+export const BoardInfoContext = createContext<Map<string, BoardAllInfo> | null>(null)
+
+const useBoardInfo = () => useContext(BoardInfoContext)
 
 type FocusRole = 'downstream' | 'focused' | 'upstream'
 
@@ -254,11 +270,11 @@ function Meta({ children, className, icon }: { children: ReactNode; className?: 
  *  URL only once mounted (cards off-screen never pay the fetch); a fetch or
  *  decode failure quietly hides the thumbnail rather than showing a broken
  *  image icon on a card. */
-function CardThumb({ attachmentId }: { attachmentId: number | string }) {
+function CardThumb({ attachmentId, board }: { attachmentId: number | string; board?: string }) {
   const [broken, setBroken] = useState(false)
 
   const { data } = useQuery({
-    queryFn: () => fetchAttachmentDataUrl(attachmentId),
+    queryFn: () => fetchAttachmentDataUrl(attachmentId, board),
     queryKey: ['kanban', 'attachment-data-url', attachmentId],
     retry: false,
     staleTime: Infinity
@@ -445,6 +461,35 @@ function CardFooter({ arc, task }: { arc: ArcState | null; task: KanbanTask }) {
   )
 }
 
+// ── board attribution badge (All Boards mode only) ────────────────────────────
+
+/** A small board-name chip on a card, shown ONLY in the consolidated All
+ *  Boards view (`useBoardInfo()` is null in single-board mode, so this
+ *  renders nothing there — same chrome/tokens as every other card meta,
+ *  tinted with the board's own color when it set one). */
+function BoardBadge({ task }: { task: KanbanTask }) {
+  const boards = useBoardInfo()
+  const slug = task.board
+
+  if (!boards || !slug) {
+    return null
+  }
+
+  const info = boards.get(slug)
+  const label = task.board_name || info?.name || slug
+  const tone = info?.color || 'var(--ui-text-tertiary)'
+
+  return (
+    <span
+      className="inline-flex w-fit shrink-0 items-center gap-1 rounded-[3px] px-1 py-px text-[0.6rem] font-medium"
+      style={{ backgroundColor: `color-mix(in srgb, ${tone} 14%, transparent)`, color: tone }}
+    >
+      {info?.icon && <Codicon name={info.icon} size="0.65rem" />}
+      <span className="truncate">{label}</span>
+    </span>
+  )
+}
+
 export function Card({
   columns,
   onDelete,
@@ -622,10 +667,13 @@ export function Card({
           >
             {task.title || task.id}
           </span>
+          <BoardBadge task={task} />
           {summary && (
             <span className="line-clamp-2 text-[0.6875rem] leading-snug text-(--ui-text-tertiary)">{summary}</span>
           )}
-          {task.image_attachment_id != null && <CardThumb attachmentId={task.image_attachment_id} />}
+          {task.image_attachment_id != null && (
+            <CardThumb attachmentId={task.image_attachment_id} board={task.board ?? undefined} />
+          )}
           <CardFooter arc={arc} task={task} />
         </div>
       </ContextMenuTrigger>
@@ -1011,7 +1059,9 @@ export function NewTaskDialog({
       }
 
       const previewUrl = URL.createObjectURL(blob)
-      const filename = blob.name || `pasted-image-${Date.now()}.${(blob.type.split('/')[1] || 'png').replace('jpeg', 'jpg')}`
+
+      const filename =
+        blob.name || `pasted-image-${Date.now()}.${(blob.type.split('/')[1] || 'png').replace('jpeg', 'jpg')}`
 
       setUploadingImages(count => count + 1)
 
@@ -1142,7 +1192,10 @@ export function NewTaskDialog({
               </span>
               <div className="flex flex-wrap gap-2">
                 {pendingImages.map(image => (
-                  <div className="group relative h-16 w-16 overflow-hidden rounded-md border border-(--ui-border)" key={image.token}>
+                  <div
+                    className="group relative h-16 w-16 overflow-hidden rounded-md border border-(--ui-border)"
+                    key={image.token}
+                  >
                     <img alt={image.filename} className="h-full w-full object-cover" src={image.previewUrl} />
                     <Button
                       aria-label={k.removeImage}
@@ -1513,11 +1566,13 @@ export function IdeaCaptureDialog({ onClose, open }: { onClose: () => void; open
  */
 function SelectionBar({
   columns,
+  index,
   onClear,
   onDone,
   selected
 }: {
   columns: string[]
+  index: Map<string, KanbanTask>
   onClear: () => void
   onDone: (failed: string[]) => void
   selected: ReadonlySet<string>
@@ -1539,8 +1594,34 @@ function SelectionBar({
     onDone(failed.map(f => f.id))
   }
 
+  // Group the selection by its OWN board (populated only in All Boards mode;
+  // single-board mode's tasks carry no `board`, so everything lands in one
+  // group under `undefined` — byte-identical to the pre-existing single call).
+  // `/tasks/bulk` is a single-board endpoint, so a selection spanning boards
+  // fans out to one call per board rather than sending a foreign id.
+  const byBoard = (ids: string[]): Map<string | undefined, string[]> => {
+    const groups = new Map<string | undefined, string[]>()
+
+    for (const id of ids) {
+      const taskBoard = index.get(id)?.board ?? undefined
+      const bucket = groups.get(taskBoard)
+
+      bucket ? bucket.push(id) : groups.set(taskBoard, [id])
+    }
+
+    return groups
+  }
+
   const bulk = useMutation({
-    mutationFn: (patch: Record<string, unknown>) => bulkTasks([...selected], patch),
+    mutationFn: async (patch: Record<string, unknown>) => {
+      const groups = byBoard([...selected])
+
+      const results = await Promise.all(
+        [...groups.entries()].map(([taskBoard, ids]) => bulkTasks(ids, patch, taskBoard))
+      )
+
+      return { results: results.flatMap(r => r.results) }
+    },
     onError: err => host.notify({ kind: 'error', message: errText(err) }),
     onSuccess: data => finish(data.results.filter(r => !r.ok))
   })
@@ -1549,7 +1630,7 @@ function SelectionBar({
   const bulkDelete = useMutation({
     mutationFn: async () => {
       const ids = [...selected]
-      const settled = await Promise.allSettled(ids.map(id => deleteTask(id)))
+      const settled = await Promise.allSettled(ids.map(id => deleteTask(id, index.get(id)?.board ?? undefined)))
 
       return ids.flatMap((id, i) => {
         const result = settled[i]
@@ -1637,21 +1718,120 @@ function SelectionBar({
   )
 }
 
+// ── All Boards chrome (filter chips + degraded-state notice) ─────────────────
+
+/** Chip row toggling each contributing board on/off client-side (all on by
+ *  default). Rendered only in All Boards mode — board-specific affordances
+ *  stay confined to this component rather than sprinkled through the header. */
+export function BoardFilterChips({
+  boards,
+  hidden,
+  onToggle
+}: {
+  boards: readonly BoardAllInfo[]
+  hidden: Record<string, boolean>
+  onToggle: (slug: string) => void
+}) {
+  const k = useKanban()
+
+  if (boards.length === 0) {
+    return null
+  }
+
+  return (
+    <div className="flex shrink-0 flex-wrap items-center gap-1.5 px-4 pb-2">
+      {boards.map(info => {
+        const isHidden = Boolean(hidden[info.slug])
+
+        return (
+          <button
+            aria-label={k.toggleBoard(info.name)}
+            aria-pressed={!isHidden}
+            className={cn(
+              'inline-flex items-center gap-1 rounded-full border px-2 py-0.5 text-[0.6875rem] font-medium transition-colors',
+              isHidden ? 'border-(--ui-stroke-tertiary) text-(--ui-text-quaternary) opacity-50' : 'border-transparent'
+            )}
+            key={info.slug}
+            onClick={() => onToggle(info.slug)}
+            style={
+              isHidden
+                ? undefined
+                : {
+                    backgroundColor: `color-mix(in srgb, ${info.color || 'var(--ui-text-tertiary)'} 14%, transparent)`,
+                    color: info.color || 'var(--ui-text-secondary)'
+                  }
+            }
+            type="button"
+          >
+            {info.icon && <Codicon name={info.icon} size="0.7rem" />}
+            {info.name}
+            <span className="tabular-nums opacity-70">{info.task_count}</span>
+          </button>
+        )
+      })}
+    </div>
+  )
+}
+
+/** Degraded-state banner: a board that failed to load in the consolidated
+ *  fetch must not blank the whole view — name it and move on. Renders
+ *  nothing when there are no errors, so the caller can mount it
+ *  unconditionally in All Boards mode. */
+export function BoardsErrorNotice({ errors }: { errors?: Array<{ board: string; detail: string }> }) {
+  const k = useKanban()
+
+  if (!errors || errors.length === 0) {
+    return null
+  }
+
+  return (
+    <div className="mx-4 mb-2 flex shrink-0 items-center gap-2 rounded-lg bg-(--ui-bg-quinary) px-3 py-1.5 text-[0.6875rem] text-amber-500">
+      <Codicon className="shrink-0" name="warning" size="0.8rem" />
+      <span className="min-w-0 truncate">{k.boardsFailedNotice(errors.map(e => e.board).join(', '))}</span>
+    </div>
+  )
+}
+
 // ── page ─────────────────────────────────────────────────────────────────────
 
 export function KanbanBoardPage() {
   const k = useKanban()
   const qc = useQueryClient()
   const slug = useValue($boardSlug)
+  const isAllBoards = slug === ALL_BOARDS
   const [archived, setArchived] = useState(false)
 
-  // Live updates ride the events socket (bindApi); this interval is only the
-  // slow heartbeat for socketless paths (OAuth remotes, dropped connections).
+  // Live updates ride the events socket (bindApi) in single-board mode; the
+  // consolidated view has no live fan-out yet (a named follow-on card) so it
+  // relies solely on this poll. Either way this interval is the fallback.
   const { data: board, error } = useQuery({
-    queryFn: () => fetchBoard(archived),
+    queryFn: () => (isAllBoards ? fetchAllBoards(archived) : fetchBoard(archived)),
     queryKey: boardKey(slug, archived),
     refetchInterval: 60_000
   })
+
+  // Per-board display chrome for the consolidated view — badge tint/icon and
+  // the filter chip row. Empty outside All Boards mode (board?.boards is only
+  // ever populated by fetchAllBoards).
+  const boardInfoList = board?.boards ?? EMPTY_BOARD_INFO
+  const boardInfoMap = useMemo(() => new Map(boardInfoList.map(info => [info.slug, info])), [boardInfoList])
+
+  // Client-side board visibility toggle (all on by default; persisted
+  // alongside $collapsedLanes). Boards the payload didn't return (renamed,
+  // deleted) fall out naturally since they never render a chip or a card.
+  const hiddenBoards = useValue($hiddenBoards)
+
+  const toggleBoardVisible = (slugToToggle: string) => {
+    const next = { ...hiddenBoards }
+
+    if (next[slugToToggle]) {
+      delete next[slugToToggle]
+    } else {
+      next[slugToToggle] = true
+    }
+
+    $hiddenBoards.set(next)
+  }
 
   const [openId, setOpenId] = useState<null | string>(null)
   const [addStatus, setAddStatus] = useState<null | string>(null)
@@ -1797,6 +1977,8 @@ export function KanbanBoardPage() {
   )
 
   // Client-side filters, mirroring the dashboard (search over title/body/id).
+  // In All Boards mode, a hidden-board chip also drops that board's cards —
+  // client-side only, since the server always returns every board.
   const filtered = useMemo(() => {
     if (!board) {
       return null
@@ -1807,15 +1989,17 @@ export function KanbanBoardPage() {
     const keep = (task: KanbanTask) =>
       (!q || `${task.title} ${task.body ?? ''} ${task.id}`.toLowerCase().includes(q)) &&
       (!tenant || task.tenant === tenant) &&
-      (!assignee || task.assignee === assignee)
+      (!assignee || task.assignee === assignee) &&
+      !(isAllBoards && task.board && hiddenBoards[task.board])
 
     return { ...board, columns: board.columns.map(col => ({ ...col, tasks: col.tasks.filter(keep) })) }
-  }, [board, search, tenant, assignee])
+  }, [board, search, tenant, assignee, isAllBoards, hiddenBoards])
 
   const total = filtered?.columns.reduce((sum, col) => sum + col.tasks.length, 0) ?? 0
 
   const moveMut = useMutation({
-    mutationFn: ({ id, status }: { id: string; status: string }) => patchTask(id, { status }),
+    mutationFn: ({ id, status, board: taskBoard }: { id: string; status: string; board?: string }) =>
+      patchTask(id, { status }, taskBoard),
     onMutate: async ({ id, status }) => {
       await qc.cancelQueries({ queryKey: boardKey(slug, archived) })
       const previous = qc.getQueryData<KanbanBoard>(boardKey(slug, archived))
@@ -1840,8 +2024,8 @@ export function KanbanBoardPage() {
   })
 
   const deleteMut = useMutation({
-    mutationFn: (id: string) => deleteTask(id),
-    onMutate: async id => {
+    mutationFn: ({ id, board: taskBoard }: { id: string; board?: string }) => deleteTask(id, taskBoard),
+    onMutate: async ({ id }) => {
       await qc.cancelQueries({ queryKey: boardKey(slug, archived) })
       const previous = qc.getQueryData<KanbanBoard>(boardKey(slug, archived))
 
@@ -1851,7 +2035,7 @@ export function KanbanBoardPage() {
 
       return { previous }
     },
-    onError: (err, _id, context) => {
+    onError: (err, _vars, context) => {
       if (context?.previous) {
         qc.setQueryData(boardKey(slug, archived), context.previous)
       }
@@ -1865,7 +2049,8 @@ export function KanbanBoardPage() {
   // any other field — so a rejected write can't be mistaken for a bigger
   // failure, and the optimistic patch below is safe to apply in isolation.
   const priorityMut = useMutation({
-    mutationFn: ({ id, priority }: { id: string; priority: number }) => patchTask(id, { priority }),
+    mutationFn: ({ id, priority, board: taskBoard }: { id: string; priority: number; board?: string }) =>
+      patchTask(id, { priority }, taskBoard),
     onMutate: async ({ id, priority }) => {
       await qc.cancelQueries({ queryKey: boardKey(slug, archived) })
       const previous = qc.getQueryData<KanbanBoard>(boardKey(slug, archived))
@@ -1889,7 +2074,8 @@ export function KanbanBoardPage() {
     }
   })
 
-  const onTogglePriority = (id: string, next: boolean) => priorityMut.mutate({ id, priority: next ? HIGH_PRIORITY : 0 })
+  const onTogglePriority = (id: string, next: boolean) =>
+    priorityMut.mutate({ board: index.get(id)?.board ?? undefined, id, priority: next ? HIGH_PRIORITY : 0 })
 
   const onMove = (id: string, status: string) => {
     const task = board?.columns.flatMap(col => col.tasks).find(candidate => candidate.id === id)
@@ -1904,7 +2090,7 @@ export function KanbanBoardPage() {
       return
     }
 
-    moveMut.mutate({ id, status })
+    moveMut.mutate({ board: task.board ?? undefined, id, status })
   }
 
   const errorMessage = error ? errText(error) : null
@@ -1981,148 +2167,163 @@ export function KanbanBoardPage() {
 
   return (
     <DependencyContext.Provider value={dependencies}>
-      <div className="relative flex h-full flex-col overflow-hidden bg-(--ui-surface-background)">
-        {/* Page-owned titlebar chrome: exists exactly while this page is mounted. */}
-        <Contribute area={TITLEBAR_AREAS.center} id="kanban:board-switcher">
-          <BoardSwitcher />
-        </Contribute>
+      <BoardInfoContext.Provider value={isAllBoards ? boardInfoMap : null}>
+        <div className="relative flex h-full flex-col overflow-hidden bg-(--ui-surface-background)">
+          {/* Page-owned titlebar chrome: exists exactly while this page is mounted. */}
+          <Contribute area={TITLEBAR_AREAS.center} id="kanban:board-switcher">
+            <BoardSwitcher />
+          </Contribute>
 
-        <header className="flex shrink-0 flex-wrap items-center gap-2 px-4 py-2">
-          <h1 className="text-sm font-semibold text-foreground">{k.title}</h1>
-          <span className="rounded-full bg-(--ui-bg-quaternary) px-1.5 py-px text-[0.625rem] tabular-nums text-(--ui-text-tertiary)">
-            {total}
-          </span>
-          {board && (
-            <FilterMenu
-              archived={archived}
-              assignee={assignee}
-              board={board}
-              onArchived={setArchived}
-              onAssignee={setAssignee}
-              onTenant={setTenant}
-              tenant={tenant}
-            />
-          )}
-          <SearchField aria-label={k.filterCards} onChange={setSearch} placeholder={k.filterCards} value={search} />
-          <div className="ml-auto flex items-center gap-1">
-            <Tip label={k.ideaTitle}>
-              <Button aria-label={k.ideaTitle} onClick={() => setIdeaOpen(true)} size="icon-xs" variant="ghost">
-                <Codicon name="lightbulb" size="0.85rem" />
-              </Button>
-            </Tip>
-            <Tip label={k.orchestrationSettings}>
-              <Button
-                aria-label={k.orchestrationSettings}
-                className={cn(settingsOpen && 'bg-(--ui-control-active-background) text-foreground')}
-                onClick={() => setSettingsOpen(!settingsOpen)}
-                size="icon-xs"
-                variant="ghost"
-              >
-                <Codicon name="organization" size="0.85rem" />
-              </Button>
-            </Tip>
-            <Button onClick={() => setAddStatus('triage')} size="sm">
-              <Codicon name="add" size="0.8rem" />
-              {k.newTask}
-            </Button>
-          </div>
-        </header>
-
-        {settingsOpen && <OrchestrationPanel />}
-
-        {board && <Intro />}
-
-        {/* Focus-mode hint. Only while a trace is live, so the board chrome is
-          unchanged in the common case. Its own row rather than an overlay:
-          the board is dimmed underneath and an overlay would compete with the
-          selection bar for the same corner. */}
-        {focused && (
-          <div className="mx-4 mb-2 flex shrink-0 items-center gap-2 rounded-lg bg-(--ui-bg-quinary) px-3 py-1.5 text-[0.6875rem] text-(--ui-text-secondary)">
-            <Codicon className="shrink-0 text-(--ui-text-tertiary)" name="references" size="0.8rem" />
-            <span className="min-w-0 truncate">{k.depFocusHint}</span>
-            <Button className="ml-auto shrink-0" onClick={() => setFocused(null)} size="xs" variant="ghost">
-              <Codicon name="close" size="0.7rem" />
-              {k.depClearFocus}
-            </Button>
-          </div>
-        )}
-
-        {errorMessage && !board ? (
-          <div className="grid flex-1 place-items-center">
-            <ErrorState title={errorMessage} />
-          </div>
-        ) : !filtered ? (
-          <div className="grid flex-1 place-items-center">
-            <Loader type="lemniscate-bloom" />
-          </div>
-        ) : total === 0 ? (
-          <div className="grid flex-1 place-items-center px-4 text-center">
-            <div className="flex flex-col items-center gap-2">
-              <Codicon className="text-(--ui-text-quaternary)" name="project" size="1.25rem" />
-              <p className="text-xs text-(--ui-text-tertiary)">
-                {search || tenant || assignee ? k.noMatch : k.noTasks}
-              </p>
-              <Button className="mt-0.5" onClick={() => setAddStatus('triage')} size="sm" variant="outline">
-                <Codicon name="add" size="0.75rem" />
+          <header className="flex shrink-0 flex-wrap items-center gap-2 px-4 py-2">
+            <h1 className="text-sm font-semibold text-foreground">{k.title}</h1>
+            <span className="rounded-full bg-(--ui-bg-quaternary) px-1.5 py-px text-[0.625rem] tabular-nums text-(--ui-text-tertiary)">
+              {total}
+            </span>
+            {board && (
+              <FilterMenu
+                archived={archived}
+                assignee={assignee}
+                board={board}
+                onArchived={setArchived}
+                onAssignee={setAssignee}
+                onTenant={setTenant}
+                tenant={tenant}
+              />
+            )}
+            <SearchField aria-label={k.filterCards} onChange={setSearch} placeholder={k.filterCards} value={search} />
+            <div className="ml-auto flex items-center gap-1">
+              <Tip label={k.ideaTitle}>
+                <Button aria-label={k.ideaTitle} onClick={() => setIdeaOpen(true)} size="icon-xs" variant="ghost">
+                  <Codicon name="lightbulb" size="0.85rem" />
+                </Button>
+              </Tip>
+              <Tip label={k.orchestrationSettings}>
+                <Button
+                  aria-label={k.orchestrationSettings}
+                  className={cn(settingsOpen && 'bg-(--ui-control-active-background) text-foreground')}
+                  onClick={() => setSettingsOpen(!settingsOpen)}
+                  size="icon-xs"
+                  variant="ghost"
+                >
+                  <Codicon name="organization" size="0.85rem" />
+                </Button>
+              </Tip>
+              <Button onClick={() => setAddStatus('triage')} size="sm">
+                <Codicon name="add" size="0.8rem" />
                 {k.newTask}
               </Button>
             </div>
-          </div>
-        ) : (
-          <div
-            className={cn('flex flex-1 gap-2 overflow-x-auto px-4 pt-1 pb-3', grabbing && 'cursor-grabbing')}
-            // Clicking the board background clears the trace — the gaps between
-            // lanes, a lane's padding, a lane header, empty column space. Keyed
-            // off "the click did not land on a card" rather than a strict
-            // `currentTarget` check, which would only catch the thin gutters.
-            // Cards are the draggable nodes (same vocabulary useGrabScroll uses),
-            // so a click on a card — including its own trace button — is left to
-            // the card's own handler.
-            onClickCapture={event => {
-              if (focused && !(event.target as HTMLElement).closest('[draggable="true"]')) {
-                setFocused(null)
-              }
-            }}
-            onMouseDown={onMouseDown}
-            ref={lanesRef}
-          >
-            {filtered.columns.map(col => {
-              const auto = boardHasWork && col.tasks.length === 0
+          </header>
 
-              return (
-                <Column
-                  collapsed={laneOverrides[col.name] ?? auto}
-                  column={col}
-                  columns={columnNames}
-                  key={col.name}
-                  onAdd={setAddStatus}
-                  onDelete={id => deleteMut.mutate(id)}
-                  onDropTask={onMove}
-                  onMove={onMove}
-                  onOpen={setOpenId}
-                  onToggle={() => toggleLane(col.name, auto)}
-                  onTogglePriority={onTogglePriority}
-                  onToggleSelect={toggleSelect}
-                  selected={selected}
-                />
-              )
-            })}
-          </div>
-        )}
+          {settingsOpen && <OrchestrationPanel />}
 
-        {selected.size > 0 && (
-          <SelectionBar
+          {board && <Intro />}
+
+          {isAllBoards && (
+            <BoardFilterChips boards={boardInfoList} hidden={hiddenBoards} onToggle={toggleBoardVisible} />
+          )}
+
+          {isAllBoards && <BoardsErrorNotice errors={board?.errors} />}
+
+          {/* Focus-mode hint. Only while a trace is live, so the board chrome is
+          unchanged in the common case. Its own row rather than an overlay:
+          the board is dimmed underneath and an overlay would compete with the
+          selection bar for the same corner. */}
+          {focused && (
+            <div className="mx-4 mb-2 flex shrink-0 items-center gap-2 rounded-lg bg-(--ui-bg-quinary) px-3 py-1.5 text-[0.6875rem] text-(--ui-text-secondary)">
+              <Codicon className="shrink-0 text-(--ui-text-tertiary)" name="references" size="0.8rem" />
+              <span className="min-w-0 truncate">{k.depFocusHint}</span>
+              <Button className="ml-auto shrink-0" onClick={() => setFocused(null)} size="xs" variant="ghost">
+                <Codicon name="close" size="0.7rem" />
+                {k.depClearFocus}
+              </Button>
+            </div>
+          )}
+
+          {errorMessage && !board ? (
+            <div className="grid flex-1 place-items-center">
+              <ErrorState title={errorMessage} />
+            </div>
+          ) : !filtered ? (
+            <div className="grid flex-1 place-items-center">
+              <Loader type="lemniscate-bloom" />
+            </div>
+          ) : total === 0 ? (
+            <div className="grid flex-1 place-items-center px-4 text-center">
+              <div className="flex flex-col items-center gap-2">
+                <Codicon className="text-(--ui-text-quaternary)" name="project" size="1.25rem" />
+                <p className="text-xs text-(--ui-text-tertiary)">
+                  {search || tenant || assignee ? k.noMatch : k.noTasks}
+                </p>
+                <Button className="mt-0.5" onClick={() => setAddStatus('triage')} size="sm" variant="outline">
+                  <Codicon name="add" size="0.75rem" />
+                  {k.newTask}
+                </Button>
+              </div>
+            </div>
+          ) : (
+            <div
+              className={cn('flex flex-1 gap-2 overflow-x-auto px-4 pt-1 pb-3', grabbing && 'cursor-grabbing')}
+              // Clicking the board background clears the trace — the gaps between
+              // lanes, a lane's padding, a lane header, empty column space. Keyed
+              // off "the click did not land on a card" rather than a strict
+              // `currentTarget` check, which would only catch the thin gutters.
+              // Cards are the draggable nodes (same vocabulary useGrabScroll uses),
+              // so a click on a card — including its own trace button — is left to
+              // the card's own handler.
+              onClickCapture={event => {
+                if (focused && !(event.target as HTMLElement).closest('[draggable="true"]')) {
+                  setFocused(null)
+                }
+              }}
+              onMouseDown={onMouseDown}
+              ref={lanesRef}
+            >
+              {filtered.columns.map(col => {
+                const auto = boardHasWork && col.tasks.length === 0
+
+                return (
+                  <Column
+                    collapsed={laneOverrides[col.name] ?? auto}
+                    column={col}
+                    columns={columnNames}
+                    key={col.name}
+                    onAdd={setAddStatus}
+                    onDelete={id => deleteMut.mutate({ board: index.get(id)?.board ?? undefined, id })}
+                    onDropTask={onMove}
+                    onMove={onMove}
+                    onOpen={setOpenId}
+                    onToggle={() => toggleLane(col.name, auto)}
+                    onTogglePriority={onTogglePriority}
+                    onToggleSelect={toggleSelect}
+                    selected={selected}
+                  />
+                )
+              })}
+            </div>
+          )}
+
+          {selected.size > 0 && (
+            <SelectionBar
+              columns={columnNames}
+              index={index}
+              onClear={() => setSelected(new Set())}
+              onDone={failed => setSelected(new Set(failed))}
+              selected={selected}
+            />
+          )}
+
+          <NewTaskDialog onClose={() => setAddStatus(null)} parents={parentOptions} target={addStatus} />
+          <IdeaCaptureDialog onClose={() => setIdeaOpen(false)} open={ideaOpen} />
+          <TaskDrawer
+            board={openId ? (index.get(openId)?.board ?? undefined) : undefined}
             columns={columnNames}
-            onClear={() => setSelected(new Set())}
-            onDone={failed => setSelected(new Set(failed))}
-            selected={selected}
+            id={openId}
+            onClose={() => setOpenId(null)}
+            onOpen={setOpenId}
           />
-        )}
-
-        <NewTaskDialog onClose={() => setAddStatus(null)} parents={parentOptions} target={addStatus} />
-        <IdeaCaptureDialog onClose={() => setIdeaOpen(false)} open={ideaOpen} />
-        <TaskDrawer columns={columnNames} id={openId} onClose={() => setOpenId(null)} onOpen={setOpenId} />
-      </div>
+        </div>
+      </BoardInfoContext.Provider>
     </DependencyContext.Provider>
   )
 }
