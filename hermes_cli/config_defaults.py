@@ -1689,6 +1689,46 @@ DEFAULT_CONFIG = {
         # Auto-block after this many consecutive non-success attempts (spawn_failed, timed_out,
         # crashed) for the same task/profile. Reassignment resets the streak.
         "failure_limit": 2,
+        # When false (default), worker deaths classified as "infra" — an external
+        # SIGTERM/SIGKILL the dispatcher did not send itself, a dead pid discovered
+        # inside the dispatcher's own startup window (gateway restart / VM boot), or a
+        # provider 429/quota signature — do NOT increment consecutive_failures and are
+        # recorded as `interrupted` instead of `crashed`/`gave_up`, so a restart or a
+        # multi-hour quota window can't burn the failure budget. Set true to restore
+        # pre-classification behaviour (every such death counts like any other crash).
+        # The exact signal allowlist: only SIGTERM and SIGKILL are neutral; SIGABRT,
+        # SIGSEGV, SIGPIPE, and every other signal use the ordinary counted failure
+        # path. See docs/kanban/infra-failure-classification.md.
+        "count_infra_failures": False,
+        # How long (seconds) after the dispatcher process itself started a "pid N not
+        # alive" discovery is presumed to be a gateway restart / VM boot racing the
+        # crash check (classified "infra") rather than a genuine mid-life crash
+        # (classified "legit", counts as today). Only consulted when
+        # count_infra_failures is false. Overridable via
+        # HERMES_KANBAN_INFRA_STARTUP_WINDOW_SECONDS.
+        "infra_startup_window_seconds": 120,
+        # Provider-wide quota-backoff parking (default true). When a worker dies with a
+        # provider 429/quota signature in its log, every same-provider task is parked in
+        # "scheduled" until the retry-after deadline, rather than re-spawning immediately
+        # and bouncing off the same quota wall. provider_override: false avoids parking
+        # entirely. Pauses are provider-scoped and durable across dispatcher restarts.
+        "provider_backoff": True,
+        # Maximum seconds a provider backoff pause may last. retry-after values above
+        # this cap are clamped to it and an operator-visible diagnostic is recorded. A
+        # malformed/missing/nonpositive retry-after does NOT create a provider pause —
+        # it follows the bounded interruption policy (max_infra_interruptions) instead.
+        # Default 24h. Parse only positive base-10 integer retry-after values.
+        "provider_backoff_max_seconds": 86400,
+        # Max consecutive infra interruptions (external SIGTERM/SIGKILL, startup-window
+        # dead pid, quota signature including malformed/missing retry-after) before the
+        # task is routed through normal counted failure accounting. Default 3; minimum
+        # effective value 1. The streak is persistent per task, is incremented for every
+        # otherwise-neutral infra path, and is reset only on a genuine non-interruption
+        # terminal outcome or an explicit operator reset/unblock — never merely because
+        # a task is redispatched. On exceeding the cap the task records an operator-
+        # visible reason/event and the streak is preserved so repeated interruption
+        # cannot evade the normal failure budget.
+        "max_infra_interruptions": 3,
         # Worker stdout/stderr log rotation at spawn time (2 MiB + one backup). Raise to keep more
         # early failure evidence from long-running workers.
         "worker_log_rotate_bytes": 2 * 1024 * 1024,
@@ -2786,6 +2826,19 @@ OPTIONAL_ENV_VARS = {
     "SUDO_PASSWORD": _setting(
         "Sudo password for terminal commands requiring root access; set to an explicit empty "
         "string to try empty without prompting", "Sudo password", None, password=True),
+    # Dispatcher infra-failure classification overrides (non-secret behavioral — allowed as
+    # env bridges for the gateway-embedded dispatcher tick loop and the standalone daemon;
+    # the config.yaml equivalents are the primary surface).
+    "HERMES_KANBAN_COUNT_INFRA_FAILURES": _setting(
+        "When set to true/false, overrides kanban.count_infra_failures (restores counted "
+        "behaviour for infra deaths when true).", "Count infra failures", "false"),
+    "HERMES_KANBAN_PROVIDER_BACKOFF": _setting(
+        "When set to true/false, overrides kanban.provider_backoff (disables provider "
+        "quota parking when false).", "Provider backoff", "true"),
+    "HERMES_KANBAN_INFRA_STARTUP_WINDOW_SECONDS": _setting(
+        "Overrides kanban.infra_startup_window_seconds (seconds after dispatcher start during "
+        "which a dead-pid discovery is presumed to be a restart).", "Infra startup window (s)",
+        "120"),
     # HERMES_TOOL_PROGRESS_MODE (deprecated; use display.tool_progress) is intentionally NOT listed:
     # this dict feeds user-facing surfaces (dashboard keys page, setup checklists), so deprecated
     # knobs stay in config._EXTRA_ENV_KEYS only. HERMES_TOOL_PROGRESS is unsupported.
