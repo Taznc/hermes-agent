@@ -175,6 +175,8 @@ import { describeDevCdpDecision, resolveDevCdpPort } from './dev-cdp'
 import { installEmbedReferer } from './embed-referer'
 import { createEventDeduper } from './event-dedupe'
 import { registerDevRestartWatch } from './fork/dev-restart-watch'
+import { repairStoredProfile } from './fork/profile-repair'
+import { freshRemoteTokenWsUrl, mintWsTicketWithStaticToken } from './fork/remote-auth'
 import { createSecretStorageIntegration } from './fork/secret-storage-integration'
 import { createWindowCapsIntegration } from './fork/window-caps'
 import { findWindowsSystemPython } from './fork/windows-paths'
@@ -319,8 +321,7 @@ import {
   localProfilePoolKeys,
   ProfileDeletionGate,
   profileNameFromDeleteRequest,
-  resolveRouteProfile,
-  resolveStoredDesktopProfile
+  resolveRouteProfile
 } from './profile-delete-routing'
 import { migrateActiveProfileIfMissing as migrateActiveProfileIfMissingPure } from './profile-migration'
 import { prepareProfileRenameLifecycle, profileRenameFromRequest } from './profile-rename-routing'
@@ -8261,28 +8262,13 @@ async function saveGatewayFileViaDataUrl(
 // Transient transport blips (brief host unreachable, 5xx, timeouts) are retried
 // a few times before failing — those 1-3s flaps were promoting into the
 // full-screen "couldn't start" lockout on reconnect.
-async function mintGatewayWsTicket(baseUrl, headers = {}, staticToken = null) {
+async function mintGatewayWsTicket(baseUrl, headers = {}, staticToken: string | null = null) {
   return withTransientRetries(async () => {
-    // Token-auth remotes: a gated dashboard rejects the legacy `?token=` query
-    // param on the WS upgrade (403) — only a minted ticket is accepted — but it
-    // DOES accept that same token as a bearer on the mint endpoint. Without this
-    // rung a basic-auth/token backend can pass every HTTP check and still never
-    // open /api/ws.
+    // Token-auth remotes: the static session token is accepted as a bearer on
+    // the mint endpoint (fork rung — see fork/remote-auth.ts).
+    // >>> FORK ANCHOR: remote-auth-static-ticket <<<
     if (staticToken) {
-      const body = (await fetchJson(`${baseUrl}/api/auth/ws-ticket`, null, {
-        method: 'POST',
-        timeoutMs: 8_000,
-        bearer: staticToken,
-        headers
-      })) as any
-
-      const ticket = body?.ticket
-
-      if (!ticket || typeof ticket !== 'string') {
-        throw new Error('Gateway did not return a WS ticket.')
-      }
-
-      return ticket
+      return mintWsTicketWithStaticToken(baseUrl, headers, staticToken, { fetchJson })
     }
 
     // Native flow: mint the ticket with the bearer token, no cookie involved.
@@ -8345,22 +8331,14 @@ async function freshGatewayWsUrl(profile) {
     return wsUrl
   }
 
-  // Remote token-auth: a gated dashboard refuses the legacy `?token=` param on
-  // the WS upgrade, so trade the token for a single-use ticket. Local backends
-  // are ungated and have no mint endpoint — the cached wsUrl is correct there,
-  // and a mint failure falls back to it.
+  // Remote token-auth: trade the static token for a single-use ticket, with
+  // the cached wsUrl as fallback (fork rung — see fork/remote-auth.ts).
+  // >>> FORK ANCHOR: remote-auth-token-ws-url <<<
   if (connection.mode === 'remote' && connection.token) {
-    try {
-      const ticket = await mintGatewayWsTicket(
-        connection.baseUrl,
-        connection.headers,
-        connection.token
-      )
-
-      return buildGatewayWsUrlWithTicket(connection.baseUrl, ticket)
-    } catch {
-      return connection.wsUrl
-    }
+    return freshRemoteTokenWsUrl(connection, {
+      mintTicket: mintGatewayWsTicket,
+      buildTicketUrl: buildGatewayWsUrlWithTicket
+    })
   }
 
   // Local/ungated: the cached wsUrl already carries the (long-lived) token.
@@ -9722,54 +9700,28 @@ async function saveRegistryConnection(input: any = {}) {
 
 // Returns the desktop's chosen profile name, or null when unset. "default" is
 // a valid stored value (pins the root HERMES_HOME explicitly); null means "no
-// preference" and preserves the legacy launch (no --profile flag).
-//
-// A stored name must also still EXIST on this machine. The preference outlives
-// the profile it names: deleting a profile elsewhere, syncing this file between
-// machines, or restoring a backup all leave a name here with no directory
-// behind it. Because every profile-scoped consumer funnels through this
-// function -- primaryProfileKey(), the `hermes:profile:get` IPC the renderer
-// adopts at boot, and the backend launch path -- an unvalidated name routes
-// EVERY profile-scoped REST call (config, env, model info, schema, sessions)
-// at a profile the backend will never have. Each one 404s
-// ("Profile 'x' does not exist."), nothing self-heals, and the app retries
-// forever.
-//
-// Format validation alone cannot catch that: `claudeprimary` is a perfectly
-// well-formed name for a profile that isn't here. Validate existence at the
-// same boundary the local spawn guard uses (assertLocalProfileCanStart), then
-// self-heal by clearing the dead preference so the next read is clean and the
-// app falls back to the default profile instead of looping.
+// preference" and preserves the legacy launch (no --profile flag). A stored
+// name must also still EXIST on this machine; the validation + self-heal
+// rationale lives in fork/profile-repair.ts.
+// >>> FORK ANCHOR: profile-repair <<<
 function readActiveDesktopProfile() {
-  let stored = ''
+  return repairStoredProfile({
+    readStoredProfile: () => {
+      try {
+        const raw = fs.readFileSync(DESKTOP_PROFILE_CONFIG_PATH, 'utf8')
+        const parsed = JSON.parse(raw)
 
-  try {
-    const raw = fs.readFileSync(DESKTOP_PROFILE_CONFIG_PATH, 'utf8')
-    const parsed = JSON.parse(raw)
-    stored = parsed && typeof parsed.profile === 'string' ? parsed.profile : ''
-  } catch {
-    // Missing or malformed → no preference.
-  }
-
-  const resolved = resolveStoredDesktopProfile(
-    stored,
-    key => PROFILE_NAME_RE.test(key),
-    key => directoryExists(path.join(HERMES_HOME, 'profiles', key))
-  )
-
-  // A well-formed name that resolved to nothing means the profile is gone (a
-  // malformed/absent file yields an empty `stored` and is not worth logging).
-  if (!resolved && stored.trim()) {
-    rememberLog(`Stored desktop profile "${stored.trim()}" no longer exists — falling back to the default profile`)
-
-    try {
-      writeActiveDesktopProfile(null)
-    } catch {
-      // Best-effort self-heal: a read-only userData dir still falls back.
-    }
-  }
-
-  return resolved
+        return parsed && typeof parsed.profile === 'string' ? parsed.profile : ''
+      } catch {
+        // Missing or malformed → no preference.
+        return ''
+      }
+    },
+    isValidProfileName: key => PROFILE_NAME_RE.test(key),
+    profileDirectoryExists: key => directoryExists(path.join(HERMES_HOME, 'profiles', key)),
+    clearStoredProfile: () => void writeActiveDesktopProfile(null),
+    rememberLog
+  })
 }
 
 function writeActiveDesktopProfile(name) {
