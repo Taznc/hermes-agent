@@ -1,45 +1,19 @@
 import { contextBridge, ipcRenderer, webFrame, webUtils } from 'electron'
 
-// Which translucency the OS can back, and the HUD's windowing capabilities.
-// Both are process-constant (decided once from process.platform / os.release()
-// / argv, never per-window), so main computes them a single time and hands
-// them to every window as a `--hermes-window-caps=<json>` entry in
-// `webPreferences.additionalArguments` (see hermesWindowCapsArgument() in
-// main.ts). Reading them off argv here means the renderer's first paint never
-// blocks on a synchronous IPC round-trip to main — the whole reason this used
-// to be `ipcRenderer.sendSync`, which stalled every window in preload
-// whenever main was busy (cold boot, a slow backend probe, ...).
-//
-// A sandboxed preload may only require electron, events, timers and url, but
-// `process.argv` itself is part of the limited process object Electron still
-// exposes to sandboxed preload scripts, so this parse is safe without
-// importing node:os or node:process.
-function parseWindowCaps(): { glass?: boolean; translucency?: boolean; hud?: Record<string, unknown> } {
-  const prefix = '--hermes-window-caps='
-  const arg = process.argv.find(a => a.startsWith(prefix))
+import { createForkPreloadApi, parseForkWindowCaps } from './fork/preload-bridge'
 
-  if (!arg) {
-    return {}
-  }
+// >>> FORK ANCHOR: window-caps-argv <<<
+const windowCaps = parseForkWindowCaps()
 
-  try {
-    return JSON.parse(decodeURIComponent(arg.slice(prefix.length))) || {}
-  } catch {
-    return {}
-  }
-}
-
-const windowCaps = parseWindowCaps()
 const translucencySupport = { glass: windowCaps.glass === true, translucency: windowCaps.translucency === true }
-
-const hudWindowing = windowCaps.hud as
-  | { clientPlacement?: boolean; controlDrag?: boolean; nativeDrag?: boolean; solid?: boolean; workspaceTransfer?: boolean }
-  | undefined
+const hudWindowing = windowCaps.hud
 
 const hudNativeDrag = hudWindowing?.nativeDrag === true
 const launchFlags = ipcRenderer.sendSync('hermes:launch-flags')
 
 contextBridge.exposeInMainWorld('hermesDesktop', {
+  // >>> FORK ANCHOR: desktop-preload-bridge <<<
+  ...createForkPreloadApi(ipcRenderer),
   glassSupported: translucencySupport?.glass === true,
   translucencySupported: translucencySupport?.translucency === true,
   // Launch-flag fact: the app was started with --local, so the renderer may
@@ -260,7 +234,6 @@ contextBridge.exposeInMainWorld('hermesDesktop', {
   readWindowBelow: () => ipcRenderer.invoke('hermes:window:readBelow'),
   readFileDataUrl: filePath => ipcRenderer.invoke('hermes:readFileDataUrl', filePath),
   readFileDataUrlForAttach: filePath => ipcRenderer.invoke('hermes:readFileDataUrlForAttach', filePath),
-  readFileChunkForAttach: (filePath, offset) => ipcRenderer.invoke('hermes:readFileChunkForAttach', filePath, offset),
   dataUrlReadMax: {
     get: () => ipcRenderer.invoke('hermes:data-url-read-max:get'),
     set: maxMb => ipcRenderer.invoke('hermes:data-url-read-max:set', maxMb)
@@ -522,27 +495,6 @@ contextBridge.exposeInMainWorld('hermesDesktop', {
     return () => ipcRenderer.removeListener('hermes:bootstrap:event', listener)
   },
   getVersion: () => ipcRenderer.invoke('hermes:version'),
-  // Dev-only: is the built main-process bundle newer than the running one?
-  // `supported` is false in a packaged build so the UI stays hidden there.
-  getDevMainBundleStale: () => ipcRenderer.invoke('hermes:dev:main-bundle-stale'),
-  restartForDevBundle: () => ipcRenderer.invoke('hermes:dev:restart'),
-  onDevMainBundleStale: callback => {
-    const listener = (_event, payload) => callback(payload)
-    ipcRenderer.on('hermes:dev:main-bundle-stale', listener)
-
-    return () => ipcRenderer.removeListener('hermes:dev:main-bundle-stale', listener)
-  },
-  // Dev-only: has backend Python source the running `hermes serve` child
-  // already imported changed on disk (agent/ tui_gateway/ tools/ hermes_cli/)?
-  // `supported` is false in a packaged build and against a remote primary.
-  getDevBackendStale: () => ipcRenderer.invoke('hermes:dev:backend-stale'),
-  restartDevBackend: () => ipcRenderer.invoke('hermes:dev:backend-restart'),
-  onDevBackendStale: callback => {
-    const listener = (_event, payload) => callback(payload)
-    ipcRenderer.on('hermes:dev:backend-stale', listener)
-
-    return () => ipcRenderer.removeListener('hermes:dev:backend-stale', listener)
-  },
   relaunchApp: () => ipcRenderer.invoke('hermes:app:relaunch'),
   getRemoteDisplayReason: () => ipcRenderer.invoke('hermes:get-remote-display-reason'),
   uninstall: {
