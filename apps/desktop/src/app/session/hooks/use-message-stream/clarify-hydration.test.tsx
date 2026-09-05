@@ -295,6 +295,95 @@ describe('clarify.request stream hydration', () => {
     expect($clarifyRequests.get()[SID]?.questions).toHaveLength(2)
   })
 
+  it('merges a BATCH tool.start that ALSO carries a top-level question', () => {
+    mountStream()
+
+    // THE field bug (2026-09-05): the model passed a batch-level `question`
+    // heading alongside `questions`. tool.start then keyed on the heading
+    // while clarify.request — whose batch wire shape has no top-level
+    // question — keyed on the joined question texts, so the two never matched
+    // and TWO identical interactive cards mounted.
+    toolStart({
+      args: {
+        question: 'Scoping the fork-delta inventory',
+        questions: [{ question: 'Drink?' }, { question: 'Productive when?' }]
+      },
+      name: 'clarify',
+      tool_id: 'call-batch-heading'
+    })
+    clarifyRequest({
+      questions: [
+        { qid: 'q0', question: 'Drink?' },
+        { qid: 'q1', question: 'Productive when?' }
+      ],
+      request_id: 'req-batch-heading'
+    })
+
+    expect(clarifyParts()).toHaveLength(1)
+  })
+
+  it('merges a heading-carrying batch when tool.start lands AFTER the request', () => {
+    mountStream()
+
+    clarifyRequest({
+      questions: [
+        { qid: 'q0', question: 'Drink?' },
+        { qid: 'q1', question: 'Productive when?' }
+      ],
+      request_id: 'req-heading-late'
+    })
+    toolStart({
+      args: {
+        question: 'Scoping the fork-delta inventory',
+        questions: [{ question: 'Drink?' }, { question: 'Productive when?' }]
+      },
+      name: 'clarify',
+      tool_id: 'call-heading-late'
+    })
+
+    expect(clarifyParts()).toHaveLength(1)
+  })
+
+  it('collapses to ONE open card even when correlation finds nothing in common', () => {
+    mountStream()
+
+    // The invariant backstop: only one clarify can block a session at a time,
+    // so two open rows are always a correlation miss, never real state. Even
+    // with zero overlapping args the card must not mount twice.
+    toolStart({ args: { question: 'totally unrelated text' }, name: 'clarify', tool_id: 'call-mismatch' })
+    clarifyRequest({
+      questions: [
+        { qid: 'q0', question: 'Drink?' },
+        { qid: 'q1', question: 'Productive when?' }
+      ],
+      request_id: 'req-mismatch'
+    })
+
+    expect(clarifyParts()).toHaveLength(1)
+  })
+
+  it('settles the surviving card when tool.complete arrives with the provider id', () => {
+    mountStream()
+
+    // Dedupe must not orphan the completion: the survivor inherits the
+    // provider tool id, so tool.complete (keyed by that id) still lands.
+    toolStart({ args: { question: 'unrelated heading' }, name: 'clarify', tool_id: 'call-survivor' })
+    clarifyRequest({
+      questions: [{ qid: 'q0', question: 'Drink?' }],
+      request_id: 'req-survivor'
+    })
+    toolComplete({
+      args: { questions: [{ question: 'Drink?' }] },
+      name: 'clarify',
+      result: { responses: [{ question: 'Drink?', user_response: 'Coffee' }] },
+      tool_id: 'call-survivor'
+    })
+
+    const parts = clarifyParts()
+    expect(parts).toHaveLength(1)
+    expect(parts[0]).toHaveProperty('result')
+  })
+
   it('does not duplicate when the batch clarify.request arrives before tool.start', () => {
     mountStream()
 
