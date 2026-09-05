@@ -969,7 +969,6 @@ export interface Translations {
       reasoning: string
       reasoningOff: string
       defaultsFailed: string
-      loadFailed: string
       restartRequired: string
       restartBackend: string
       restartingBackend: string

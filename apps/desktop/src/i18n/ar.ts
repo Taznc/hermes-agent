@@ -877,7 +877,6 @@ export const ar = defineLocale({
       reasoning: 'الاستدلال',
       reasoningOff: 'إيقاف',
       defaultsFailed: 'فشل حفظ افتراضيات النموذج',
-      loadFailed: 'تعذر تحميل النماذج',
       restartRequired: 'بعد التحديث ما زال هذا الخلفية يشغّل كودا قديما. أعد تشغيله لتحميل الكود الجديد.',
       restartBackend: 'إعادة تشغيل الخلفية',
       restartingBackend: 'جار إعادة تشغيل الخلفية...',

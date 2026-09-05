@@ -1346,7 +1346,6 @@ export const zhAuthored: Translations = {
       reasoning: '推理',
       reasoningOff: '关闭',
       defaultsFailed: '保存模型默认值失败',
-      loadFailed: '无法加载模型',
       restartRequired: '更新后此后端仍在运行旧代码。请重启以加载新代码。',
       restartBackend: '重启后端',
       restartingBackend: '正在重启后端...',

@@ -1116,7 +1116,6 @@ export const en: Translations = {
       reasoning: 'Reasoning',
       reasoningOff: 'Off',
       defaultsFailed: 'Failed to save model defaults',
-      loadFailed: 'Could not load models',
       restartRequired: 'This backend is running old code after an update. Restart it to load the new code.',
       restartBackend: 'Restart backend',
       restartingBackend: 'Restarting backend...',

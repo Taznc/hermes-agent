@@ -976,7 +976,6 @@ export const zhHant = defineLocale({
       provider: '提供方',
       model: '模型',
       applying: '套用中...',
-      loadFailed: '無法載入模型',
       restartRequired: '更新後此後端仍在執行舊程式碼。請重新啟動以載入新程式碼。',
       restartBackend: '重新啟動後端',
       restartingBackend: '正在重新啟動後端...',

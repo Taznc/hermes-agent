@@ -1012,7 +1012,6 @@ export const ja = defineLocale({
       provider: 'プロバイダー',
       model: 'モデル',
       applying: '適用中...',
-      loadFailed: 'モデルを読み込めませんでした',
       restartRequired:
         'アップデート後、このバックエンドは古いコードのままです。再起動して新しいコードを読み込んでください。',
       restartBackend: 'バックエンドを再起動',
