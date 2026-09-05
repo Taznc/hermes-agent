@@ -960,6 +960,7 @@ export interface Translations {
     }
     model: {
       loading: string
+      loadFailed: string
       appliesDesc: string
       provider: string
       model: string

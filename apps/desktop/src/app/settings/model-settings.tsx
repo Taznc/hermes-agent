@@ -34,6 +34,7 @@ import { startManualLocalEndpoint, startManualOnboarding, startManualProviderOAu
 
 import { hermesConfigCacheWriter, invalidateHermesConfig, useHermesConfigRecord } from '../hooks/use-config-record'
 import { useOnProfileSwitch } from '../hooks/use-on-profile-switch'
+import { PanelEmpty } from '../overlays/panel'
 
 import { CONTROL_TEXT } from './constants'
 import { getNested, setNested } from './helpers'
@@ -248,47 +249,83 @@ export function ModelSettings({ onMainModelChanged, scopeProfile }: ModelSetting
       setError('')
       setSkewRestart(false)
 
+      // Settled, not all-or-nothing: an unreachable provider/options probe
+      // must not discard already-successful auxiliary/config data (upstream
+      // #57262, #63214). Each read is published independently below, and a
+      // failure surfaces as a visible error rather than silently wiping the
+      // other three. MoA keeps its pre-existing soft-fail (not configured is
+      // not an error) by simply not counting toward `failures`.
+      const [modelInfoResult, modelOptionsResult, auxiliaryResult, moaResult] = await Promise.allSettled([
+        getGlobalModelInfo(scopeProfile),
+        getGlobalModelOptions(undefined, scopeProfile),
+        getAuxiliaryModels(scopeProfile),
+        getMoaModels(scopeProfile)
+      ])
+
+      // A newer profile epoch already claimed the view — this generation's
+      // result (success or failure) belongs to a profile the user has left.
+      // Bail without touching loading/error/data: the newer refresh() call
+      // that bumped the epoch owns reaching a terminal state for the view
+      // the user is actually looking at now.
+      if (profileEpoch.current !== epoch) {
+        return
+      }
+
       try {
-        const [modelInfo, modelOptions, auxiliaryModels, moaModels] = await Promise.all([
-          getGlobalModelInfo(scopeProfile),
-          getGlobalModelOptions(undefined, scopeProfile),
-          getAuxiliaryModels(scopeProfile),
-          getMoaModels(scopeProfile).catch(() => null)
-        ])
+        if (modelInfoResult.status === 'fulfilled') {
+          const modelInfo = modelInfoResult.value
 
-        if (profileEpoch.current !== epoch) {
-          return
+          setMainModel({ model: modelInfo.model, provider: modelInfo.provider })
+
+          if (replaceSelection) {
+            setSelectedProvider(modelInfo.provider)
+            setSelectedModel(modelInfo.model)
+          } else {
+            setSelectedProvider(prev => prev || modelInfo.provider)
+            setSelectedModel(prev => prev || modelInfo.model)
+          }
+
+          // The config record loads via its own shared query; a model switch
+          // can change it server-side (aux slots), so nudge that cache to
+          // refetch.
+          void invalidateHermesConfig(scopeProfile)
         }
 
-        setMainModel({ model: modelInfo.model, provider: modelInfo.provider })
-        setProviders(modelOptions.providers || [])
+        if (modelOptionsResult.status === 'fulfilled') {
+          setProviders(modelOptionsResult.value.providers || [])
+        }
 
-        if (replaceSelection) {
-          setSelectedProvider(modelInfo.provider)
-          setSelectedModel(modelInfo.model)
+        if (auxiliaryResult.status === 'fulfilled') {
+          setAuxiliary(auxiliaryResult.value)
+        }
+
+        if (moaResult.status === 'fulfilled') {
+          const moaModels = moaResult.value
+
+          setMoa(moaModels)
+
+          if (moaModels) {
+            setSelectedMoaPreset(prev => (prev && moaModels.presets[prev] ? prev : moaModels.default_preset))
+          }
         } else {
-          setSelectedProvider(prev => prev || modelInfo.provider)
-          setSelectedModel(prev => prev || modelInfo.model)
+          setMoa(null)
         }
 
-        setAuxiliary(auxiliaryModels)
-        setMoa(moaModels)
+        // MoA is intentionally excluded — an unconfigured/failed MoA probe has
+        // always degraded to `null` silently, matching its prior `.catch(() =>
+        // null)` behavior; it is not a user-facing error for this page.
+        const failed = [modelInfoResult, modelOptionsResult, auxiliaryResult].find(
+          (result): result is PromiseRejectedResult => result.status === 'rejected'
+        )
 
-        if (moaModels) {
-          setSelectedMoaPreset(prev => (prev && moaModels.presets[prev] ? prev : moaModels.default_preset))
-        }
-
-        // The config record loads via its own shared query; a model switch can
-        // change it server-side (aux slots), so nudge that cache to refetch.
-        void invalidateHermesConfig(scopeProfile)
-      } catch (err) {
-        if (profileEpoch.current === epoch) {
-          setCaughtError(err, m.loadFailed)
+        if (failed) {
+          setCaughtError(failed.reason, m.loadFailed)
         }
       } finally {
-        if (profileEpoch.current === epoch) {
-          setLoading(false)
-        }
+        // Every generation that reaches this point (i.e. wasn't superseded
+        // above) always ends in a terminal state — content, a visible error,
+        // or both — never a permanent skeleton.
+        setLoading(false)
       }
     },
     [m.loadFailed, scopeProfile, setCaughtError]
@@ -819,8 +856,29 @@ export function ModelSettings({ onMainModelChanged, scopeProfile }: ModelSetting
     }
   }, [m.restartFailed, refresh, scopeProfile, setCaughtError])
 
-  if (loading && !mainModel) {
+  if (loading && !mainModel && !error) {
     return <ModelSettingsSkeleton />
+  }
+
+  // The initial load never got a main model AND ended in an error: every read
+  // failed (or the one read the rest of the page depends on did), so there is
+  // nothing meaningful to render. Surface an explicit retry instead of either
+  // a permanent skeleton or a blank/broken page — loading is guaranteed false
+  // here (see the `finally` in refresh()), so this is a real terminal state,
+  // never a transient flash.
+  if (!loading && !mainModel && error) {
+    return (
+      <PanelEmpty
+        action={
+          <Button onClick={() => void refresh()} size="sm">
+            {t.common.retry}
+          </Button>
+        }
+        description={error}
+        icon="error"
+        title={m.loadFailed}
+      />
+    )
   }
 
   return (

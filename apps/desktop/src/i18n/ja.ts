@@ -1006,6 +1006,7 @@ export const ja = defineLocale({
     },
     model: {
       loading: 'モデル設定を読み込み中...',
+      loadFailed: 'モデル設定の読み込みに失敗しました',
       appliesDesc:
         '新しいセッションに適用されます。コンポーザーのモデルピッカーを使ってアクティブなチャットをホットスワップできます。',
       provider: 'プロバイダー',
