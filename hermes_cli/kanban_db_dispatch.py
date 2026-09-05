@@ -32,6 +32,21 @@ if TYPE_CHECKING:
 # dispatcher parks the task in ``blocked`` with a reason — prevents retry storms.
 DEFAULT_FAILURE_LIMIT = 2
 
+
+def effective_failure_limit(task_max_retries: Optional[Any], failure_limit: int) -> tuple:
+    """Circuit-breaker threshold precedence: a task's own ``max_retries`` wins over the
+    dispatcher-level ``failure_limit``. Returns ``(effective_limit, limit_source)`` where
+    ``limit_source`` is ``"task"`` or ``"dispatcher"`` — the same value recorded in the
+    ``gave_up`` event payload (see ``_record_task_failure``).
+
+    Single source of truth for this precedence: ``kanban_diagnostics._rule_repeated_failures``
+    imports this function so the diagnostic's threshold can never drift from the breaker's.
+    """
+    if task_max_retries is not None:
+        return int(task_max_retries), "task"
+    return int(failure_limit), "dispatcher"
+
+
 # Worker log files larger than this at spawn time are rotated.
 DEFAULT_LOG_ROTATE_BYTES = 2 * 1024 * 1024   # 2 MiB
 DEFAULT_LOG_BACKUP_COUNT = 1
@@ -1065,10 +1080,7 @@ def _record_task_failure(
 
         # Per-task override wins over caller-supplied and default thresholds.
         task_override = _kb._row_get(row, "max_retries")
-        if task_override is not None:
-            effective_limit, limit_source = int(task_override), "task"
-        else:
-            effective_limit, limit_source = int(failure_limit), "dispatcher"
+        effective_limit, limit_source = effective_failure_limit(task_override, failure_limit)
 
         if not (force_trip or failures >= effective_limit):
             if release_claim:
