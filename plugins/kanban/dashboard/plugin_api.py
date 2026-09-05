@@ -275,6 +275,70 @@ def _links_for(conn: sqlite3.Connection, task_id: str) -> dict[str, list[str]]:
 
 # --- GET /board -------------------------------------------------------------
 
+def _board_payload(
+    conn: sqlite3.Connection, *, tenant: Optional[str], include_archived: bool,
+    workflow_template_id: Optional[str], current_step_key: Optional[str],
+) -> dict[str, Any]:
+    """Build one board's grouped-by-status payload: link/comment/progress rollups,
+    diagnostics, latest summaries, tenant/assignee facets, latest_event_id. This IS
+    ``GET /board``'s response shape (byte-for-byte — existing dashboard/desktop clients
+    depend on it); ``get_board`` is a thin wrapper and ``GET /board/all`` calls this once
+    per board and re-attributes/merges the results, never duplicating the rollup logic.
+    """
+    tasks = kanban_db.list_tasks(
+        conn, tenant=tenant, include_archived=include_archived,
+        workflow_template_id=workflow_template_id, current_step_key=current_step_key)
+    # Link / comment / progress rollups are each one aggregate query rather than N per-task lookups.
+    link_counts: dict[str, dict[str, int]] = {}
+    # The same rows are kept as an explicit edge list so the UI can highlight a card's whole
+    # dependency chain without N per-task round-trips.
+    link_edges: list[list[str]] = []
+    for row in conn.execute("SELECT parent_id, child_id FROM task_links").fetchall():
+        link_counts.setdefault(row["parent_id"], {"parents": 0, "children": 0})["children"] += 1
+        link_counts.setdefault(row["child_id"], {"parents": 0, "children": 0})["parents"] += 1
+        link_edges.append([row["parent_id"], row["child_id"]])
+    # First image attachment per task for the card thumbnail indicator (one aggregate query; the
+    # drawer fetches the full attachments list via GET /tasks/:id).
+    first_image_attachment: dict[str, int] = {
+        r["task_id"]: r["min_id"] for r in conn.execute(
+            "SELECT task_id, MIN(id) AS min_id FROM task_attachments "
+            "WHERE content_type LIKE 'image/%' GROUP BY task_id")}
+    comment_counts: dict[str, int] = {
+        r["task_id"]: r["n"] for r in conn.execute("SELECT task_id, COUNT(*) AS n FROM task_comments GROUP BY task_id")}
+    progress: dict[str, dict[str, int]] = {}  # per parent: children done / total, rendered as "N/M"
+    for row in conn.execute(
+        "SELECT l.parent_id AS pid, t.status AS cstatus FROM task_links l JOIN tasks t ON t.id = l.child_id").fetchall():
+        p = progress.setdefault(row["pid"], {"done": 0, "total": 0})
+        p["total"] += 1
+        p["done"] += row["cstatus"] == "done"
+    diagnostics_per_task = _compute_task_diagnostics(conn, task_ids=None)
+    latest_event_id = conn.execute("SELECT COALESCE(MAX(id), 0) AS m FROM task_events").fetchone()["m"]
+    columns: dict[str, list[dict]] = {c: [] for c in BOARD_COLUMNS}
+    if include_archived:
+        columns["archived"] = []
+    # One window-function query for latest summaries (avoids N+1); cards get a
+    # truncated preview, the full text comes from /tasks/:id.
+    summary_map = kanban_db.latest_summaries(conn, [t.id for t in tasks])
+    for t in tasks:
+        full = summary_map.get(t.id)
+        d = _task_dict(t, latest_summary=(full[:_CARD_SUMMARY_PREVIEW_CHARS] if full else None))
+        d["link_counts"] = link_counts.get(t.id, {"parents": 0, "children": 0})
+        d["comment_count"] = comment_counts.get(t.id, 0)
+        d["image_attachment_id"] = first_image_attachment.get(t.id)
+        d["progress"] = progress.get(t.id)  # None when the task has no children
+        _attach_diagnostics(d, diagnostics_per_task.get(t.id))
+        columns[t.status if t.status in columns else "todo"].append(d)
+
+    # Per-column ordering (priority DESC, created_at ASC) comes from list_tasks.
+    tenants = [r["tenant"] for r in conn.execute("SELECT DISTINCT tenant FROM tasks WHERE tenant IS NOT NULL ORDER BY tenant")]
+    assignees = [r["assignee"] for r in conn.execute(
+        "SELECT DISTINCT assignee FROM tasks WHERE assignee IS NOT NULL AND status != 'archived' ORDER BY assignee")]
+    return {
+        "columns": [{"name": name, "tasks": columns[name]} for name in columns], "tenants": tenants,
+        "assignees": assignees, "link_edges": link_edges, "latest_event_id": int(latest_event_id),
+        "now": int(time.time())}
+
+
 @router.get("/board")
 def get_board(
     tenant: Optional[str] = Query(None, description="Filter to a single tenant"),
@@ -285,58 +349,101 @@ def get_board(
     """Full board grouped by status column; omitting ``board`` uses the active board
     (``HERMES_KANBAN_BOARD`` env → on-disk ``current`` pointer → ``default``)."""
     with _board_conn(board) as (board, conn):
-        tasks = kanban_db.list_tasks(
+        return _board_payload(
             conn, tenant=tenant, include_archived=include_archived,
             workflow_template_id=workflow_template_id, current_step_key=current_step_key)
-        # Link / comment / progress rollups are each one aggregate query rather than N per-task lookups.
-        link_counts: dict[str, dict[str, int]] = {}
-        # The same rows are kept as an explicit edge list so the UI can highlight a card's whole
-        # dependency chain without N per-task round-trips.
-        link_edges: list[list[str]] = []
-        for row in conn.execute("SELECT parent_id, child_id FROM task_links").fetchall():
-            link_counts.setdefault(row["parent_id"], {"parents": 0, "children": 0})["children"] += 1
-            link_counts.setdefault(row["child_id"], {"parents": 0, "children": 0})["parents"] += 1
-            link_edges.append([row["parent_id"], row["child_id"]])
-        # First image attachment per task for the card thumbnail indicator (one aggregate query; the
-        # drawer fetches the full attachments list via GET /tasks/:id).
-        first_image_attachment: dict[str, int] = {
-            r["task_id"]: r["min_id"] for r in conn.execute(
-                "SELECT task_id, MIN(id) AS min_id FROM task_attachments "
-                "WHERE content_type LIKE 'image/%' GROUP BY task_id")}
-        comment_counts: dict[str, int] = {
-            r["task_id"]: r["n"] for r in conn.execute("SELECT task_id, COUNT(*) AS n FROM task_comments GROUP BY task_id")}
-        progress: dict[str, dict[str, int]] = {}  # per parent: children done / total, rendered as "N/M"
-        for row in conn.execute(
-            "SELECT l.parent_id AS pid, t.status AS cstatus FROM task_links l JOIN tasks t ON t.id = l.child_id").fetchall():
-            p = progress.setdefault(row["pid"], {"done": 0, "total": 0})
-            p["total"] += 1
-            p["done"] += row["cstatus"] == "done"
-        diagnostics_per_task = _compute_task_diagnostics(conn, task_ids=None)
-        latest_event_id = conn.execute("SELECT COALESCE(MAX(id), 0) AS m FROM task_events").fetchone()["m"]
-        columns: dict[str, list[dict]] = {c: [] for c in BOARD_COLUMNS}
-        if include_archived:
-            columns["archived"] = []
-        # One window-function query for latest summaries (avoids N+1); cards get a
-        # truncated preview, the full text comes from /tasks/:id.
-        summary_map = kanban_db.latest_summaries(conn, [t.id for t in tasks])
-        for t in tasks:
-            full = summary_map.get(t.id)
-            d = _task_dict(t, latest_summary=(full[:_CARD_SUMMARY_PREVIEW_CHARS] if full else None))
-            d["link_counts"] = link_counts.get(t.id, {"parents": 0, "children": 0})
-            d["comment_count"] = comment_counts.get(t.id, 0)
-            d["image_attachment_id"] = first_image_attachment.get(t.id)
-            d["progress"] = progress.get(t.id)  # None when the task has no children
-            _attach_diagnostics(d, diagnostics_per_task.get(t.id))
-            columns[t.status if t.status in columns else "todo"].append(d)
 
-        # Per-column ordering (priority DESC, created_at ASC) comes from list_tasks.
-        tenants = [r["tenant"] for r in conn.execute("SELECT DISTINCT tenant FROM tasks WHERE tenant IS NOT NULL ORDER BY tenant")]
-        assignees = [r["assignee"] for r in conn.execute(
-            "SELECT DISTINCT assignee FROM tasks WHERE assignee IS NOT NULL AND status != 'archived' ORDER BY assignee")]
-        return {
-            "columns": [{"name": name, "tasks": columns[name]} for name in columns], "tenants": tenants,
-            "assignees": assignees, "link_edges": link_edges, "latest_event_id": int(latest_event_id),
-            "now": int(time.time())}
+
+# --- GET /board/all — consolidated multi-board view --------------------------
+
+def _fetch_board_payload(
+    slug: str, *, tenant: Optional[str], include_archived: bool,
+    workflow_template_id: Optional[str], current_step_key: Optional[str],
+) -> dict[str, Any]:
+    """Open *slug* with the board pinned context-locally (``_with_board_pinned`` /
+    ``scoped_current_board``), never the process-global ``HERMES_KANBAN_BOARD`` env var —
+    concurrent ``/board/all`` requests iterating different boards would cross-write it."""
+    def _run() -> dict[str, Any]:
+        with closing(_conn(board=slug)) as conn:
+            return _board_payload(
+                conn, tenant=tenant, include_archived=include_archived,
+                workflow_template_id=workflow_template_id, current_step_key=current_step_key)
+    return _with_board_pinned(slug, _run)
+
+
+@router.get("/board/all")
+def get_all_boards(
+    tenant: Optional[str] = Query(None, description="Filter to a single tenant"),
+    include_archived: bool = Query(False),
+    boards: Optional[str] = Query(None, description="Comma-separated board slugs to restrict to (default: every board)"),
+    workflow_template_id: Optional[str] = Query(None, description="Restrict to tasks using this workflow template id"),
+    current_step_key: Optional[str] = Query(None, description="Restrict to tasks at this workflow step key")):
+    """Cards from every board merged into the standard status columns, each task tagged
+    ``board``/``board_name`` (task ids are only unique per board — clients key on the pair).
+
+    A single corrupt/locked board DB must not 500 the whole view: each board is fetched in
+    its own try/except, a failure omits that board's tasks and records it in ``errors``
+    instead. Ordering within a column keeps each board's own ``priority DESC, created_at
+    ASC`` and merges across boards on that same key — board is a tiebreaker, never a
+    primary grouping.
+    """
+    all_meta = kanban_db.list_boards(include_archived=False)
+    wanted: Optional[set[str]] = {s.strip() for s in boards.split(",") if s.strip()} if boards else None
+    proj_map = _projects_by_id()
+
+    merged_columns: dict[str, list[dict]] = {c: [] for c in BOARD_COLUMNS}
+    if include_archived:
+        merged_columns["archived"] = []
+    board_infos: list[dict[str, Any]] = []
+    all_tenants: set[str] = set()
+    all_assignees: set[str] = set()
+    link_edges: list[dict[str, str]] = []
+    cursors: dict[str, int] = {}
+    errors: list[dict[str, str]] = []
+
+    for meta in all_meta:
+        slug = meta["slug"]
+        if wanted is not None and slug not in wanted:
+            continue
+        display_name = meta.get("name") or slug
+        proj = proj_map.get(meta.get("project_id")) if meta.get("project_id") else None
+        info: dict[str, Any] = {
+            "slug": slug, "name": display_name, "color": meta.get("color") or "",
+            "icon": meta.get("icon") or "", "project_name": (proj.name if proj else None), "task_count": 0}
+        try:
+            payload = _fetch_board_payload(
+                slug, tenant=tenant, include_archived=include_archived,
+                workflow_template_id=workflow_template_id, current_step_key=current_step_key)
+        except Exception as exc:
+            log.warning("kanban board/all: board %r failed: %s", slug, exc)
+            errors.append({"board": slug, "detail": str(exc)})
+            board_infos.append(info)
+            continue
+        task_count = 0
+        for col in payload["columns"]:
+            bucket = merged_columns.setdefault(col["name"], [])
+            for t in col["tasks"]:
+                t["board"] = slug
+                t["board_name"] = display_name
+                bucket.append(t)
+                task_count += 1
+        info["task_count"] = task_count
+        board_infos.append(info)
+        all_tenants.update(payload["tenants"])
+        all_assignees.update(payload["assignees"])
+        for parent_id, child_id in payload["link_edges"]:
+            link_edges.append({"board": slug, "parent": parent_id, "child": child_id})
+        cursors[slug] = payload["latest_event_id"]
+
+    # Merge stably on each board's own ordering key; board only breaks a tie because sort()
+    # is stable and boards are iterated in list_boards() order, so we never group by board.
+    for tasks in merged_columns.values():
+        tasks.sort(key=lambda d: (-(d.get("priority") or 0), d.get("created_at") or 0))
+
+    return {
+        "columns": [{"name": name, "tasks": merged_columns[name]} for name in merged_columns],
+        "boards": board_infos, "tenants": sorted(all_tenants), "assignees": sorted(all_assignees),
+        "link_edges": link_edges, "cursors": cursors, "errors": errors, "now": int(time.time())}
 
 
 # --- GET /tasks/:id ---------------------------------------------------------
