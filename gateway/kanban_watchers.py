@@ -1251,6 +1251,15 @@ class GatewayKanbanWatchersMixin:
             logger.warning("kanban dispatcher: kanban_db not importable; dispatcher disabled")
             return
 
+        # Mark this process as a real dispatcher loop, starting now. Feeds
+        # the infra-death startup-window rule (docs/kanban/
+        # infra-failure-classification.md): a "pid N not alive" discovered
+        # shortly after THIS marker is presumed to be a gateway restart
+        # racing the crash check, not a genuine crash. One-shot CLI
+        # invocations and tests that never call this stay on today's
+        # behaviour (every dead-pid discovery is a legit crash).
+        _kb.mark_dispatcher_process_started()
+
         # Single-dispatcher backstop. dispatch_in_gateway defaults to true, so a
         # new profile gateway (or a same-profile restart race) can silently
         # start a second dispatcher; concurrent dispatchers double reclaim

@@ -452,6 +452,60 @@ def _resolve_crash_grace_seconds() -> int:
     return DEFAULT_CRASH_GRACE_SECONDS
 
 
+def _resolve_infra_startup_window_seconds() -> int:
+    """Return the infra-classification startup window in seconds.
+
+    Reads ``HERMES_KANBAN_INFRA_STARTUP_WINDOW_SECONDS`` from the
+    environment; falls back to ``DEFAULT_INFRA_STARTUP_WINDOW_SECONDS``
+    when absent, empty, non-integer, or negative. A value of 0 disables
+    the startup-window infra classification (every dead-pid discovery is
+    ``legit``) — useful for tests.
+    """
+    raw = os.environ.get(
+        "HERMES_KANBAN_INFRA_STARTUP_WINDOW_SECONDS", ""
+    ).strip()
+    if raw:
+        try:
+            parsed = int(raw)
+        except ValueError:
+            parsed = -1
+        if parsed >= 0:
+            return parsed
+    try:
+        from hermes_cli.config import load_config
+        cfg = load_config() or {}
+        raw_cfg = (cfg.get("kanban") or {}).get(
+            "infra_startup_window_seconds"
+        )
+        if raw_cfg is not None:
+            parsed_cfg = int(raw_cfg)
+            if parsed_cfg >= 0:
+                return parsed_cfg
+    except Exception:
+        pass
+    return DEFAULT_INFRA_STARTUP_WINDOW_SECONDS
+
+
+def _count_infra_failures_enabled() -> bool:
+    """Return ``kanban.count_infra_failures`` (default ``False``).
+
+    When true, restores pre-classification behaviour: every ``infra`` exit
+    is instead accounted as ``legit`` (counts against the failure budget,
+    recorded as ``crashed``/``timed_out`` like before this feature).
+    Overridable via ``HERMES_KANBAN_COUNT_INFRA_FAILURES`` for tests
+    (``"1"``/``"true"``/``"yes"`` = true; anything else false).
+    """
+    raw_env = os.environ.get("HERMES_KANBAN_COUNT_INFRA_FAILURES", "").strip().lower()
+    if raw_env:
+        return raw_env in ("1", "true", "yes", "on")
+    try:
+        from hermes_cli.config import load_config
+        cfg = load_config() or {}
+        return bool((cfg.get("kanban") or {}).get("count_infra_failures", False))
+    except Exception:
+        return False
+
+
 def _resolve_rate_limit_cooldown_seconds() -> int:
     """Return the rate-limit requeue cooldown in seconds.
 
@@ -8168,6 +8222,14 @@ class DispatchResult:
     (EX_TEMPFAIL sentinel exit) and were released back to ``ready`` WITHOUT
     counting a failure. These never trip the circuit breaker — a long quota
     window just makes the task bounce cheaply until the window clears."""
+    interrupted: list[str] = field(default_factory=list)
+    """Task ids whose worker death was classified ``infra`` by
+    :func:`classify_infra_exit` (external signal, startup-window dead pid,
+    or a quota signature the EX_TEMPFAIL sentinel didn't catch) and were
+    released back to ``ready`` WITHOUT counting a failure. See
+    docs/kanban/infra-failure-classification.md. Empty whenever
+    ``kanban.count_infra_failures`` is true (that setting restores today's
+    behaviour, so these deaths land in ``crashed`` instead)."""
     skipped_locked: bool = False
     """True when this tick was skipped because another process already held
     the board's dispatch lock (issue #35240). A losing dispatcher does no
@@ -8260,6 +8322,185 @@ def _classify_worker_exit(pid: int) -> "tuple[str, Optional[int]]":
     except Exception:
         pass
     return ("unknown", None)
+
+
+# ---------------------------------------------------------------------------
+# Infra-death classification (docs/kanban/infra-failure-classification.md)
+#
+# The failure budget (kanban.failure_limit / --max-retries) exists to stop
+# the dispatcher thrashing on a task that keeps failing for reasons the
+# WORKER caused. It was never meant to punish a task whose worker was
+# killed by something external — a gateway restart, a VM reboot, or a
+# provider quota wall. The functions below classify a reaped worker death
+# as "infra" (does not count) or "legit" (counts exactly like today).
+# ---------------------------------------------------------------------------
+
+# Default window (seconds) after this dispatcher PROCESS started during
+# which a "pid N not alive" discovery (no reap record at all — the
+# ``unknown`` exit_kind) is presumed to be a gateway restart / VM boot
+# racing the crash check, rather than a genuine mid-life crash. Mirrors
+# ``DEFAULT_CRASH_GRACE_SECONDS`` in spirit but measures dispatcher uptime,
+# not worker age. Overridable via ``kanban.infra_startup_window_seconds``.
+DEFAULT_INFRA_STARTUP_WINDOW_SECONDS = 120
+
+# Env var the REAL dispatcher entry points (the gateway-embedded tick loop
+# in ``gateway/kanban_watchers.py`` and ``hermes kanban daemon``) set ONCE,
+# to their own process start time, immediately on startup. Deliberately NOT
+# derived from module-import time: many short-lived processes import this
+# module (one-shot ``hermes kanban dispatch``, ad-hoc scripts, every test in
+# this file) without ever being "the dispatcher that just restarted", and a
+# freshly-imported module is indistinguishable from a freshly-restarted
+# dispatcher if we used import time as the signal — that would make EVERY
+# dead-pid discovery in a short test process look like a startup-window
+# restart. Requiring an explicit marker keeps the default behaviour (no env
+# var set) identical to pre-classification code for anyone not running
+# through the real dispatcher loops, and lets those loops opt in accurately.
+_DISPATCHER_STARTED_AT_ENV = "HERMES_KANBAN_DISPATCHER_STARTED_AT"
+
+
+def mark_dispatcher_process_started() -> None:
+    """Record THIS process as a real dispatcher loop, starting now.
+
+    Call once, as early as possible, from the gateway-embedded dispatcher
+    tick loop and from ``hermes kanban daemon``. Idempotent-ish: calling it
+    again just moves "now" forward, so only call it at genuine process
+    startup, not per-tick.
+    """
+    os.environ[_DISPATCHER_STARTED_AT_ENV] = repr(time.time())
+
+
+def _dispatcher_uptime_seconds() -> "Optional[float]":
+    """Seconds since :func:`mark_dispatcher_process_started` was called.
+
+    Returns ``None`` when no real dispatcher loop has marked itself in this
+    process — the common case for one-shot CLI invocations, ad-hoc scripts,
+    and every test that doesn't opt in — so the startup-window infra rule
+    never fires for them (identical to pre-classification behaviour).
+    """
+    raw = os.environ.get(_DISPATCHER_STARTED_AT_ENV, "").strip()
+    if not raw:
+        return None
+    try:
+        started_at = float(raw)
+    except ValueError:
+        return None
+    return max(0.0, time.time() - started_at)
+
+# Dispatcher-owned kill-intent registry: populated by ``enforce_max_runtime``
+# and ``_terminate_reclaimed_worker`` immediately before they send
+# SIGTERM/SIGKILL to a pid, so a later reap tick — even on a different
+# dispatcher process, e.g. after a restart — can tell "we killed this" apart
+# from "something else killed this" for the ``signaled`` exit_kind. Same
+# bounded-registry shape as ``_recent_worker_exits``.
+_DISPATCHER_KILL_INTENT_TTL_SECONDS = 600
+_dispatcher_kill_intents: "dict[int, float]" = {}
+
+
+def _mark_dispatcher_kill_intent(pid: Optional[int]) -> None:
+    """Record that THIS dispatcher is about to signal ``pid`` itself.
+
+    Call this immediately before ``os.kill``/``signal_fn`` in any
+    dispatcher-owned termination path. Never raises.
+    """
+    if not pid or pid <= 0:
+        return
+    now = time.time()
+    _dispatcher_kill_intents[int(pid)] = now
+    if len(_dispatcher_kill_intents) > 256:
+        cutoff = now - _DISPATCHER_KILL_INTENT_TTL_SECONDS
+        for _pid in [
+            p for p, t in _dispatcher_kill_intents.items() if t < cutoff
+        ]:
+            _dispatcher_kill_intents.pop(_pid, None)
+
+
+def _was_dispatcher_killed(pid: Optional[int]) -> bool:
+    """True when THIS dispatcher recently sent ``pid`` its own kill signal."""
+    if not pid or pid <= 0:
+        return False
+    ts = _dispatcher_kill_intents.get(int(pid))
+    if ts is None:
+        return False
+    return (time.time() - ts) < _DISPATCHER_KILL_INTENT_TTL_SECONDS
+
+
+# Provider quota/429 signature as emitted by ``hermes_cli/auth.py`` (Codex
+# OAuth refresh path) and any future provider adapter that raises the same
+# shape of message. This catches quota deaths that slip past the existing
+# EX_TEMPFAIL sentinel (``KANBAN_RATE_LIMIT_EXIT_CODE``) — e.g. an AuthError
+# raised deep in a call stack that bubbles up as a crash or dead-pid instead
+# of a clean ``sys.exit(75)``.
+_QUOTA_EXIT_LOG_RE = re.compile(r"quota exhausted \(429\)", re.IGNORECASE)
+_QUOTA_RETRY_AFTER_RE = re.compile(r"retry after (\d+)s", re.IGNORECASE)
+
+
+def _detect_quota_exit_signal(
+    task_id: str, *, board: Optional[str] = None, tail_bytes: int = 8000,
+) -> "Optional[dict]":
+    """Scan the worker's final log lines for a provider quota/429 signature.
+
+    Returns ``{"retry_after_seconds": int | None}`` when the signature is
+    found, else ``None``. Never raises — log I/O errors (missing file,
+    already rotated, permission issue) are swallowed so a logging problem
+    can never break crash reclaim.
+    """
+    try:
+        log_text = read_worker_log(task_id, tail_bytes=tail_bytes, board=board)
+    except Exception:
+        return None
+    if not log_text or not _QUOTA_EXIT_LOG_RE.search(log_text):
+        return None
+    m = _QUOTA_RETRY_AFTER_RE.search(log_text)
+    return {"retry_after_seconds": int(m.group(1)) if m else None}
+
+
+def classify_infra_exit(
+    *,
+    exit_kind: str,
+    dispatcher_killed: bool = False,
+    within_startup_window: bool = False,
+    quota_signal: bool = False,
+) -> "tuple[str, str]":
+    """Pure classifier: is a reaped worker death "infra" or "legit"?
+
+    Returns ``(category, reason)``. ``category`` is ``"infra"`` (does not
+    count against the failure budget — the task re-queues to ``ready``
+    immediately) or ``"legit"`` (counts exactly like today). Takes plain
+    facts, not database/process state, so it is trivially unit-testable
+    without any DB or subprocess fixtures — see
+    ``tests/hermes_cli/test_kanban_db.py``.
+
+    Priority order (first match wins):
+
+    1. A provider quota/429 signature in the worker's log — ``infra``,
+       regardless of how the process actually exited. A quota AuthError can
+       surface as ``nonzero_exit``, ``signaled``, or ``unknown`` depending
+       on where in the call stack it was raised.
+    2. ``signaled`` deaths: ``infra`` unless the dispatcher's own
+       kill-intent registry shows THIS dispatcher sent that signal (its own
+       ``--max-runtime`` timeout kill, or a reclaim-path termination) —
+       that remains a legit, deliberately-accounted action.
+    3. ``unknown`` (no reap record at all — the "pid N not alive" path):
+       ``infra`` only within the dispatcher's own startup window, which is
+       the signature of a gateway restart / VM boot racing the crash check,
+       not a task-caused crash.
+    4. Everything else — ``nonzero_exit``, ``clean_exit``, ``rate_limited``,
+       or ``unknown``/``signaled`` outside the rules above — is ``legit``,
+       unchanged from today's behaviour. This is the explicit regression
+       guard: a plain nonzero exit and an iteration-budget timeout (which
+       never even reaches this classifier — see the module docstring in
+       docs/kanban/infra-failure-classification.md) can never be
+       reclassified as ``infra``.
+    """
+    if quota_signal:
+        return ("infra", "quota")
+    if exit_kind == "signaled":
+        if dispatcher_killed:
+            return ("legit", "dispatcher_kill")
+        return ("infra", "external_signal")
+    if exit_kind == "unknown" and within_startup_window:
+        return ("infra", "startup_window")
+    return ("legit", exit_kind or "unknown")
 
 
 def reap_worker_zombies() -> "list[int]":
@@ -8380,6 +8621,10 @@ def _terminate_reclaimed_worker(
         return info
 
     info["termination_attempted"] = True
+    # Mark BEFORE signaling: this is our own accounted kill, so a later
+    # reap tick must classify it as ``legit`` (dispatcher_kill) even if it
+    # observes the death asynchronously (e.g. after a dispatcher restart).
+    _mark_dispatcher_kill_intent(pid)
     try:
         kill(int(pid), signal.SIGTERM)
     except ProcessLookupError:
@@ -8572,6 +8817,10 @@ def enforce_max_runtime(
             os.kill if hasattr(os, "kill") else None
         )
         if kill is not None:
+            # Mark BEFORE signaling: this is our own accounted kill, so a
+            # later reap tick must classify it as ``legit`` (dispatcher_kill)
+            # even if it observes the death asynchronously.
+            _mark_dispatcher_kill_intent(pid)
             try:
                 kill(pid, signal.SIGTERM)
             except (ProcessLookupError, OSError):
@@ -8927,7 +9176,7 @@ def _protocol_violation_streak(conn: sqlite3.Connection, task_id: str) -> int:
     ).fetchall()
     for row in rows:
         outcome = row["outcome"] or ""
-        if outcome == "rate_limited":
+        if outcome in ("rate_limited", "interrupted"):
             continue
         if outcome == "crashed":
             is_violation = False
@@ -8978,6 +9227,15 @@ def detect_crashed_workers(conn: sqlite3.Connection) -> list[str]:
     """
     crashed: list[str] = []
     rate_limited: list[str] = []
+    interrupted: list[str] = []
+    count_infra_failures = _count_infra_failures_enabled()
+    infra_startup_window = _resolve_infra_startup_window_seconds()
+    _uptime = _dispatcher_uptime_seconds()
+    within_startup_window = (
+        _uptime is not None
+        and infra_startup_window > 0
+        and _uptime < infra_startup_window
+    )
     # Per-crash details collected inside the main txn, used after it
     # closes to run ``_record_task_failure`` (which needs its own
     # write_txn so can't nest). ``protocol_violation`` flags the
@@ -9015,6 +9273,8 @@ def detect_crashed_workers(conn: sqlite3.Connection) -> list[str]:
             pid = int(row["worker_pid"])
             kind, code = _classify_worker_exit(pid)
             rate_limited_exit = False
+            infra_exit = False
+            infra_reason = None
             if kind == "clean_exit":
                 # Worker subprocess returned 0 but its task is still
                 # ``running`` in the DB — it exited without calling
@@ -9064,17 +9324,55 @@ def detect_crashed_workers(conn: sqlite3.Connection) -> list[str]:
                 }
             else:
                 protocol_violation = False
+                # Infra-death classification (docs/kanban/infra-failure-
+                # classification.md): a SIGKILL/SIGTERM we did not send
+                # ourselves, a dead pid discovered inside our own startup
+                # window (gateway restart / VM boot), or a provider 429/quota
+                # signature the EX_TEMPFAIL sentinel didn't catch, does NOT
+                # count against the failure budget. ``kanban.
+                # count_infra_failures: true`` restores pre-classification
+                # behaviour by simply never treating any of these as infra.
+                quota_signal = None
+                if not count_infra_failures:
+                    quota_signal = _detect_quota_exit_signal(row["id"])
+                category, infra_reason = classify_infra_exit(
+                    exit_kind=kind,
+                    dispatcher_killed=_was_dispatcher_killed(pid),
+                    within_startup_window=within_startup_window,
+                    quota_signal=quota_signal is not None,
+                )
+                infra_exit = (not count_infra_failures) and category == "infra"
                 if kind == "nonzero_exit":
                     error_text = f"pid {pid} exited with code {code}"
                 elif kind == "signaled":
                     error_text = f"pid {pid} killed by signal {code}"
                 else:
                     error_text = f"pid {pid} not alive"
-                event_kind = "crashed"
-                event_payload = {"pid": pid, "claimer": row["claim_lock"]}
-                if code is not None and kind != "unknown":
-                    event_payload["exit_kind"] = kind
-                    event_payload["exit_code"] = code
+                if infra_exit:
+                    error_text = (
+                        f"{error_text} — infra death ({infra_reason}), "
+                        f"requeued without counting a failure"
+                    )
+                    if quota_signal and quota_signal.get("retry_after_seconds"):
+                        error_text += (
+                            f"; retry after {quota_signal['retry_after_seconds']}s"
+                        )
+                    event_kind = "interrupted"
+                    event_payload = {
+                        "pid": pid,
+                        "claimer": row["claim_lock"],
+                        "reason": infra_reason,
+                    }
+                    if quota_signal:
+                        event_payload["quota_retry_after_seconds"] = quota_signal.get(
+                            "retry_after_seconds"
+                        )
+                else:
+                    event_kind = "crashed"
+                    event_payload = {"pid": pid, "claimer": row["claim_lock"]}
+                    if code is not None and kind != "unknown":
+                        event_payload["exit_kind"] = kind
+                        event_payload["exit_code"] = code
 
             retry_status = _retry_status_for_run(conn, row["id"])
             event_payload["retry_status"] = retry_status
@@ -9086,10 +9384,16 @@ def detect_crashed_workers(conn: sqlite3.Connection) -> list[str]:
                 (retry_status, row["id"], pid, row["claim_lock"]),
             )
             if cur.rowcount == 1:
-                # Rate-limited requeues are a clean release, not a crash —
-                # record the run outcome as ``rate_limited`` so the board
-                # history doesn't show a phantom crash for a quota wall.
-                _run_outcome = "rate_limited" if rate_limited_exit else "crashed"
+                # Rate-limited and infra requeues are a clean release, not a
+                # crash — record the run outcome accordingly so the board
+                # history doesn't show a phantom crash for a quota wall or
+                # an external kill/restart.
+                if rate_limited_exit:
+                    _run_outcome = "rate_limited"
+                elif infra_exit:
+                    _run_outcome = "interrupted"
+                else:
+                    _run_outcome = "crashed"
                 run_id = _end_run(
                     conn, row["id"],
                     outcome=_run_outcome, status=_run_outcome,
@@ -9122,6 +9426,16 @@ def detect_crashed_workers(conn: sqlite3.Connection) -> list[str]:
                         (error_text[:500], row["id"]),
                     )
                     rate_limited.append(row["id"])
+                elif infra_exit:
+                    # Infra death: released to ``ready`` above like every
+                    # other path here, and deliberately WITHOUT calling
+                    # ``_record_task_failure`` — that's the entire point of
+                    # this classification (docs/kanban/
+                    # infra-failure-classification.md). No last_failure_error
+                    # stamp either: unlike a quota wall this isn't a reason
+                    # to defer the next respawn, so the task is immediately
+                    # eligible again on the very next tick.
+                    interrupted.append(row["id"])
                 else:
                     if protocol_violation:
                         # Stamp the failure error now: a below-budget
@@ -9231,6 +9545,10 @@ def detect_crashed_workers(conn: sqlite3.Connection) -> list[str]:
     # Same side-channel for rate-limited requeues — these did NOT count a
     # failure and are NOT crashes, so they stay out of the ``crashed`` return.
     detect_crashed_workers._last_rate_limited = rate_limited  # type: ignore[attr-defined]
+    # Same side-channel for infra-death requeues (docs/kanban/
+    # infra-failure-classification.md) — these also did NOT count a failure
+    # and are NOT crashes.
+    detect_crashed_workers._last_interrupted = interrupted  # type: ignore[attr-defined]
     # Worker-lifecycle observer (RFC #58548): exit events are tick-derived
     # from this reclaim pass — fired only now, after the main reclaim txn
     # AND the breaker accounting above have committed, so subscribers always
@@ -10067,6 +10385,14 @@ def _dispatch_once_locked(
     )
     if _crash_rate_limited:
         result.rate_limited.extend(_crash_rate_limited)
+    # Infra-death requeues (external kill, startup-window dead pid, or a
+    # quota signature — docs/kanban/infra-failure-classification.md), no
+    # failure counted. Surface for telemetry / tests / dashboard.
+    _crash_interrupted = getattr(
+        detect_crashed_workers, "_last_interrupted", []
+    )
+    if _crash_interrupted:
+        result.interrupted.extend(_crash_interrupted)
     result.timed_out = enforce_max_runtime(conn)
     result.promoted = recompute_ready(conn, failure_limit=failure_limit)
 

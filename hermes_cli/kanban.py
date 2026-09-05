@@ -2744,6 +2744,8 @@ def _cmd_dispatch(args: argparse.Namespace) -> int:
             "stale": res.stale,
             "auto_blocked": res.auto_blocked,
             "promoted": res.promoted,
+            "rate_limited": res.rate_limited,
+            "interrupted": res.interrupted,
             "spawned": [
                 {"task_id": tid, "assignee": who, "workspace": ws}
                 for (tid, who, ws) in res.spawned
@@ -2761,6 +2763,9 @@ def _cmd_dispatch(args: argparse.Namespace) -> int:
     print(f"Crashed:      {len(res.crashed)}")
     if res.crashed:
         print(f"  {', '.join(res.crashed)}")
+    print(f"Interrupted:  {len(res.interrupted)}")
+    if res.interrupted:
+        print(f"  {', '.join(res.interrupted)}")
     print(f"Timed out:    {len(res.timed_out)}")
     if res.timed_out:
         print(f"  {', '.join(res.timed_out)}")
@@ -2836,6 +2841,10 @@ def _cmd_daemon(args: argparse.Namespace) -> int:
     # Make sure the DB exists before printing "started" so the user sees the
     # correct DB path and any init error surfaces immediately.
     kb.init_db()
+    # Mark this process as a real dispatcher loop (docs/kanban/
+    # infra-failure-classification.md startup-window rule) — same reasoning
+    # as the gateway-embedded loop in gateway/kanban_watchers.py.
+    kb.mark_dispatcher_process_started()
 
     pidfile = getattr(args, "pidfile", None)
     if pidfile:

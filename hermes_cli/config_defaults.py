@@ -2708,6 +2708,24 @@ DEFAULT_CONFIG = {
         # same task/profile (spawn_failed, timed_out, or crashed). Reassignment
         # resets the streak for the new profile.
         "failure_limit": 2,
+        # When false (default), worker deaths classified as "infra" — an
+        # external SIGKILL/SIGTERM the dispatcher did not send itself, a
+        # dead pid discovered inside the dispatcher's own startup window
+        # (gateway restart / VM boot), or a provider 429/quota signature —
+        # do NOT increment consecutive_failures and are recorded as
+        # `interrupted` instead of `crashed`/`gave_up`, so a restart or a
+        # multi-hour quota window can't burn the failure budget. Set true
+        # to restore pre-classification behaviour (every such death counts
+        # like any other crash). See
+        # docs/kanban/infra-failure-classification.md.
+        "count_infra_failures": False,
+        # How long (seconds) after the dispatcher process itself started a
+        # "pid N not alive" discovery is presumed to be a gateway restart /
+        # VM boot racing the crash check (classified "infra") rather than a
+        # genuine mid-life crash (classified "legit", counts as today).
+        # Only consulted when count_infra_failures is false. Also
+        # overridable via HERMES_KANBAN_INFRA_STARTUP_WINDOW_SECONDS.
+        "infra_startup_window_seconds": 120,
         # Worker stdout/stderr logs rotate at spawn time. Defaults preserve
         # the historical 2 MiB + one-backup behavior; long-running workers can
         # raise these to keep more early failure evidence.
