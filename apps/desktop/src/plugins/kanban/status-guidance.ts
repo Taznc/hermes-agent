@@ -198,6 +198,7 @@ export interface StatusGuidanceDeps extends RunErrorTextDeps {
   guideBlockedAutomatic: (cause: string) => string
   guideBlockedGeneric: string
   guideBlockedReviewNoVerdict: string
+  guideBlockedUnknown: string
   guideDone: string
   guideOnHold: string
   guideReadyQueued: string
@@ -226,8 +227,13 @@ const GUIDANCE_RESOLVERS: Record<string, (task: KanbanTaskFull, events: KanbanEv
   blocked: (task, events, runs, k) => {
     const cause = resolveBlockCause(task, events, runs)
 
+    // A. Manual block: the banner above already shows the worker's own
+    // words (verbatim, or parsed into clickable options with the fence
+    // stripped) — this line's job is the NEXT ACTION, not a second copy of
+    // the reason, so it never re-prints `cause.reason` (and never risks
+    // leaking raw ```choices fence syntax the banner deliberately strips).
     if (cause.origin === 'manual') {
-      return cause.reason || k.guideBlockedGeneric
+      return k.guideBlockedGeneric
     }
 
     if (cause.origin === 'automatic') {
@@ -238,7 +244,10 @@ const GUIDANCE_RESOLVERS: Record<string, (task: KanbanTaskFull, events: KanbanEv
       return k.guideBlockedReviewNoVerdict
     }
 
-    return k.guideBlockedGeneric
+    // D. No cause found anywhere — honest generic, matching the banner's
+    // "cause unknown" framing exactly. Must NOT be `guideBlockedGeneric`:
+    // that copy asserts "needs your input", a cause this state doesn't have.
+    return k.guideBlockedUnknown
   },
 
   done: (_task, _events, _runs, k) => k.guideDone,
