@@ -14,6 +14,7 @@ import path from 'node:path'
 import { afterEach, beforeEach, expect, test } from 'vitest'
 
 import { ATTACHMENT_CHUNK_BYTES } from '../hardening'
+
 import { registerAttachmentStreamIpc } from './attachment-stream-ipc'
 
 let dir: string

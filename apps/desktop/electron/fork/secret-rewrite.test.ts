@@ -9,6 +9,7 @@
 import { expect, test } from 'vitest'
 
 import { SAFE_STORAGE_ENCODING } from '../hardening'
+
 import {
   applySecretStorageEncryption,
   migrateLegacyEncryptedSecretsOnce,

@@ -8,6 +8,7 @@
 import { expect, test } from 'vitest'
 
 import { hudWindowingView, resolveHudWindowing } from '../hud-windowing'
+
 import { createWindowCapsIntegration } from './window-caps'
 
 function integration(overrides: Partial<Parameters<typeof createWindowCapsIntegration>[0]> = {}) {

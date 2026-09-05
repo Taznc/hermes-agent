@@ -174,19 +174,6 @@ import {
 import { describeDevCdpDecision, resolveDevCdpPort } from './dev-cdp'
 import { installEmbedReferer } from './embed-referer'
 import { createEventDeduper } from './event-dedupe'
-import { registerAttachmentStreamIpc } from './fork/attachment-stream-ipc'
-import { registerDevRestartWatch } from './fork/dev-restart-watch'
-import { repairStoredProfile } from './fork/profile-repair'
-import { freshRemoteTokenWsUrl, mintWsTicketWithStaticToken } from './fork/remote-auth'
-import {
-  applySecretStorageEncryption as applySecretStorageEncryptionFork,
-  migrateLegacyEncryptedSecretsOnce as migrateLegacyEncryptedSecretsOnceFork,
-  rewriteAllStoredSecrets as rewriteAllStoredSecretsFork,
-  type SecretRewriteDeps
-} from './fork/secret-rewrite'
-import { createSecretStorageIntegration } from './fork/secret-storage-integration'
-import { createWindowCapsIntegration } from './fork/window-caps'
-import { findWindowsSystemPython } from './fork/windows-paths'
 import {
   buildTerminalScript,
   resolveTerminalLaunch,
@@ -203,6 +190,20 @@ import {
   stopFind
 } from './find-in-page'
 import { createFirstRunSetupGate } from './first-run-setup-gate'
+import { registerAttachmentStreamIpc } from './fork/attachment-stream-ipc'
+import { registerDevRestartWatch } from './fork/dev-restart-watch'
+import { repairStoredProfile } from './fork/profile-repair'
+import { freshRemoteTokenWsUrl, mintWsTicketWithStaticToken } from './fork/remote-auth'
+import {
+  applySecretStorageEncryption as applySecretStorageEncryptionFork,
+  migrateLegacyEncryptedSecretsOnce as migrateLegacyEncryptedSecretsOnceFork,
+  rewriteAllStoredSecrets as rewriteAllStoredSecretsFork,
+  type SecretRewriteDeps
+} from './fork/secret-rewrite'
+import { createSecretStorageIntegration } from './fork/secret-storage-integration'
+import { updateChecksDisabled } from './fork/update-checks-gate'
+import { createWindowCapsIntegration } from './fork/window-caps'
+import { findWindowsSystemPython } from './fork/windows-paths'
 import { registerFsIpc } from './fs-ipc'
 import {
   filenameFromContentDisposition,
@@ -400,7 +401,6 @@ import {
   windowOpacityFor,
   windowOpacityOptions
 } from './translucency'
-import { updateChecksDisabled } from './fork/update-checks-gate'
 import {
   compareApiUrl,
   parseCompareBehindCount,
@@ -508,6 +508,7 @@ const GLASS_SUPPORTED = glassSupportedOn(process.platform, os.release())
 // Clear rides setOpacity, a documented no-op on Linux, so neither mode works
 // there and Settings drops the row entirely.
 const TRANSLUCENCY_SUPPORTED = translucencySupportedOn(process.platform)
+
 // Process-constant window capabilities (translucency/glass + HUD windowing
 // profile) handed to preload via additionalArguments — computed once so the
 // renderer's first paint never stalls on an IPC round-trip. Implementation
