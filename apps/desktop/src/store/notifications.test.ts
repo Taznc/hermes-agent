@@ -1,6 +1,6 @@
-import { beforeEach, expect, test } from 'vitest'
+import { beforeEach, expect, test, vi } from 'vitest'
 
-import { $notifications, clearNotifications, isDiskFullErrorMessage, notifyError } from './notifications'
+import { $notifications, clearNotifications, dismissNotification, isDiskFullErrorMessage, notify, notifyError } from './notifications'
 
 beforeEach(() => {
   clearNotifications()
@@ -54,4 +54,42 @@ test('session storage write failure is treated as disk-full class', () => {
   )
 
   expect(lastMessage()).toMatch(/Disk full/i)
+})
+
+// Regression for review t_548d0d33, blocking issue 4: the 4-item stack cap
+// must not silently orphan a live pending-undo timer behind a toast the
+// user can no longer see or click.
+test('a 5th notification within the cap evicts the oldest and fires its onEvict callback', () => {
+  const onEvict = vi.fn()
+
+  notify({ id: 'toast-1', kind: 'success', message: 'one', onEvict })
+  notify({ id: 'toast-2', kind: 'success', message: 'two' })
+  notify({ id: 'toast-3', kind: 'success', message: 'three' })
+  notify({ id: 'toast-4', kind: 'success', message: 'four' })
+
+  expect(onEvict).not.toHaveBeenCalled()
+  expect($notifications.get().map(n => n.id)).toEqual(['toast-4', 'toast-3', 'toast-2', 'toast-1'])
+
+  // A 5th toast pushes the stack past the cap — toast-1 (oldest, at the
+  // back) is evicted and must have its onEvict fired exactly once so any
+  // live side effect it represents (e.g. an archive's undo window) commits
+  // immediately instead of running invisibly.
+  notify({ id: 'toast-5', kind: 'success', message: 'five' })
+
+  expect($notifications.get().map(n => n.id)).toEqual(['toast-5', 'toast-4', 'toast-3', 'toast-2'])
+  expect(onEvict).toHaveBeenCalledTimes(1)
+})
+
+test('a user dismiss does not fire onEvict (only onDismiss)', () => {
+  const onEvict = vi.fn()
+  const onDismiss = vi.fn()
+
+  const id = notify({ kind: 'success', message: 'one', onDismiss, onEvict })
+
+  // Regular dismissal path (e.g. the toast's own timeout or close button)
+  // never routes through the cap-eviction handler.
+  dismissNotification(id)
+
+  expect(onDismiss).toHaveBeenCalledTimes(1)
+  expect(onEvict).not.toHaveBeenCalled()
 })
