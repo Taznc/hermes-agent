@@ -1734,6 +1734,22 @@ DEFAULT_CONFIG = {
         # On boards that never archive, the notifier GC purges subscriptions for tasks done with no
         # activity for this many days so stale rows aren't scanned forever. 0 = off.
         "done_sub_retention_days": 30,
+        # Argv PREFIX prepended to every spawned worker command. Empty list (default) = today's
+        # plain `subprocess.Popen(argv, ...)` on every platform (Windows, macOS, non-systemd
+        # Linux) — byte-identical behaviour, nothing to configure. When non-empty, the dispatcher
+        # appends `--unit=kanban-<task_id>-run-<run_id>` and the trailing `-- <argv>` itself;
+        # operators supply only the launcher binary + its own flags, e.g.:
+        #   worker_launcher: ["systemd-run", "--user", "--scope", "--slice=hermes-workers.slice",
+        #                      "--collect", "--property", "MemoryAccounting=yes",
+        #                      "--property", "MemoryHigh=1073741824", "--property", "MemoryMax=2147483648"]
+        # This decouples a worker's lifetime/cgroup from the dispatching gateway process (a gateway
+        # restart no longer kills in-flight kanban workers) on hosts that opt in. The launcher
+        # binary is resolved with `shutil.which()` at spawn time; if it can't be found the
+        # dispatcher logs a warning and falls back to the `[]` (plain Popen) behaviour for that
+        # spawn rather than failing the task. Linux/systemd-specific in practice; never
+        # OS-conditioned in code — an operator who sets this on Windows/macOS just gets a
+        # `FileNotFoundError`-driven fallback.
+        "worker_launcher": [],
     },
     # Bot Mode cross-connection relay (tools/bot_relay.py): envelopes queued by message_agent for
     # agents on other connections wait in an on-disk outbox until the Desktop drains them.

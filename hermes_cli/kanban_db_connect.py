@@ -802,6 +802,12 @@ _LATER_TASK_COLUMNS = (
     # Typed block reason (VALID_BLOCK_KINDS); NULL = generic human blocker.
     ("block_kind", "block_kind TEXT"),
     ("block_recurrences", "block_recurrences INTEGER NOT NULL DEFAULT 0"),
+    # Transient systemd --user --scope unit name for this task's active/most-recent worker, set
+    # only when kanban.worker_launcher's argv resulted in a --unit= flag being appended. NULL for
+    # the default plain-Popen spawn path. Durable handle so a COLD dispatcher process (e.g. after a
+    # gateway restart) can still query the worker's exit status by unit name via `systemctl --user
+    # show`, since it has no in-memory _recent_worker_exits entry for a worker it never spawned.
+    ("worker_unit", "worker_unit TEXT"),
 )
 
 _NOTIFY_SUB_COLUMNS = (
