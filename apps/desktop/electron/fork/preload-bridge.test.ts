@@ -58,6 +58,7 @@ describe('createForkPreloadApi', () => {
     const api = createForkPreloadApi(fakeIpc() as never)
 
     expect(Object.keys(api).sort()).toEqual(EXPECTED)
+
     for (const key of EXPECTED) {
       expect(typeof (api as Record<string, unknown>)[key]).toBe('function')
     }

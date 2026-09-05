@@ -101,6 +101,7 @@ export function createForkPreloadApi(ipcRenderer: IpcRenderer) {
     onDevBackendStale: (callback: (payload: { state: 'fresh' | 'stale' | 'restarting' | 'failed' }) => void) => {
       const listener = (_event: unknown, payload: { state: 'fresh' | 'stale' | 'restarting' | 'failed' }) =>
         callback(payload)
+
       ipcRenderer.on('hermes:dev:backend-stale', listener)
 
       return () => ipcRenderer.removeListener('hermes:dev:backend-stale', listener)

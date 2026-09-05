@@ -3,6 +3,7 @@ import type { TranslucencyState } from '@hermes/shared/translucency'
 
 import type { PoolLimits } from '../electron/pool-limits'
 
+import type { ForkDesktopApi, ForkSecretStorageEncryptionResult } from './fork/desktop-api'
 import type { WakeIndicatorState } from './lib/wake-indicator'
 import type {
   PetOverlayBounds,
@@ -12,13 +13,11 @@ import type {
 } from './store/pet-overlay'
 import type { QuickEntryStatePush, QuickEntryStatus, QuickEntrySubmitPayload } from './store/quick-entry'
 
-// >>> FORK ANCHOR: desktop-bridge-types <<<
-import type { ForkDesktopApi, ForkSecretStorageEncryptionResult } from './fork/desktop-api'
-
 export {}
 
 declare global {
   interface Window {
+    // >>> FORK ANCHOR: desktop-bridge-types <<<
     hermesDesktop: ForkDesktopApi & {
       // Resolve a backend connection. Omit `profile` (or pass the primary) for
       // the window's backend; pass a named profile to lazily spawn/reuse that
