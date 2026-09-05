@@ -37,7 +37,7 @@ import {
   openDomContextMenu,
   openTerminalContextMenu
 } from './store'
-import { isWebUrl, resolveDomTarget } from './target'
+import { isWebUrl, nativeContextMenuHandled, resolveDomTarget } from './target'
 
 /** Marks a surface that owns PLAIN right-clicks itself (the user-message
  *  reaction bubble). Owned targets inside it — links, images, editables,
@@ -618,10 +618,14 @@ export function AppContextMenu() {
   const open = useStore($contextMenu)
 
   useEffect(() => {
-    // stopPropagation beats other renderer handlers; preventDefault is never
-    // called because Chromium emits the main-process context-menu event (the
-    // spellcheck + image-coordinate source) only for unprevented gestures —
-    // and with no Menu.popup anywhere, "default" means no menu at all.
+    // stopPropagation beats other renderer handlers in every shell.
+    // preventDefault is conditional on nativeContextMenuHandled(): in
+    // Electron, "default" is a main-process context-menu event this app
+    // handles without popping a native menu (see target.ts for the sentinel
+    // and why), so skipping preventDefault there costs nothing and keeps
+    // that forward alive. In a plain browser there is no main process —
+    // "default" IS Chromium's own context menu, so it must be prevented or
+    // it paints on top of this one.
     const onContextMenu = (event: MouseEvent) => {
       const element = event.target instanceof Element ? event.target : null
 
@@ -640,6 +644,11 @@ export function AppContextMenu() {
 
       if (terminal) {
         event.stopPropagation()
+
+        if (!nativeContextMenuHandled()) {
+          event.preventDefault()
+        }
+
         openTerminalContextMenu(event.clientX, event.clientY, terminal)
 
         return
@@ -655,6 +664,11 @@ export function AppContextMenu() {
       }
 
       event.stopPropagation()
+
+      if (!nativeContextMenuHandled()) {
+        event.preventDefault()
+      }
+
       openDomContextMenu(event.clientX, event.clientY, target)
     }
 

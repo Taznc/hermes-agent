@@ -398,6 +398,40 @@ describe('AppContextMenu', () => {
     expect(await screen.findByText('Settings')).toBeTruthy()
   })
 
+  it('prevents the native context menu when the Electron bridge is missing (web build)', async () => {
+    // No contextMenuEdit on the bridge — mirrors web-bridge-shim.ts, which
+    // deliberately omits it. In a plain browser tab "unprevented" IS
+    // Chromium's own context menu, so this DOM listener must suppress it or
+    // it paints on top of the app's own menu (the regression this guards).
+    installBridge()
+    mountMenu()
+    const host = attach('<div><p>plain chrome</p></div>')
+
+    const event = fireEvent.contextMenu(host.querySelector('p')!)
+
+    expect(event).toBe(false) // fireEvent returns false when preventDefault() was called
+  })
+
+  it('does NOT prevent the native context menu when the Electron bridge is present', async () => {
+    // contextMenuEdit present — the real Electron preload bridge. Preventing
+    // default here would suppress the ONLY signal (Chromium's own
+    // main-process context-menu event) that carries spellcheck facts and
+    // image coordinates to `electron/main.ts`, since Electron never calls
+    // `Menu.popup` on it.
+    const contextMenuEdit = vi.fn().mockResolvedValue(undefined)
+
+    installBridge({ contextMenuEdit: contextMenuEdit as unknown as Window['hermesDesktop']['contextMenuEdit'] })
+    mountMenu()
+    const host = attach('<div><p>plain chrome</p></div>')
+
+    const event = fireEvent.contextMenu(host.querySelector('p')!)
+
+    expect(event).toBe(true) // fireEvent returns true when preventDefault() was NOT called
+    // The app's own menu still opens — stopPropagation and preventDefault
+    // are independent switches.
+    expect(await screen.findByText('Settings')).toBeTruthy()
+  })
+
   it('skips plain right-clicks inside a skip-marked surface, but not links in it', async () => {
     installBridge()
     mountMenu()
@@ -435,11 +469,14 @@ describe('AppContextMenu', () => {
       selectAll: vi.fn()
     })
 
-    fireEvent.contextMenu(host.querySelector('canvas')!)
+    const event = fireEvent.contextMenu(host.querySelector('canvas')!)
 
     expect(await screen.findByText('Copy')).toBeTruthy()
     expect(screen.getByText('Paste')).toBeTruthy()
     expect(screen.getByText('Select all')).toBeTruthy()
+    // No contextMenuEdit on the bridge (web build stand-in) — the terminal
+    // branch must prevent the native menu too, not just the DOM branch.
+    expect(event).toBe(false)
     unregister()
   })
 

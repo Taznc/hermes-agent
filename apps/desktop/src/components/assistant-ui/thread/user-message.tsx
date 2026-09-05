@@ -1,6 +1,7 @@
 import { ActionBarPrimitive, BranchPickerPrimitive, MessagePrimitive, useAuiState } from '@assistant-ui/react'
 import { type FC, type ReactNode, useCallback, useEffect, useRef, useState } from 'react'
 
+import { nativeContextMenuHandled } from '@/app/context-menu/target'
 import { DirectiveContent } from '@/components/assistant-ui/directive-text'
 import { messageAttachmentRefs, messageContentText } from '@/components/assistant-ui/thread/content'
 import { ReactionBadge, ReactionPicker } from '@/components/assistant-ui/thread/message-reactions'
@@ -464,7 +465,21 @@ export const UserMessage: FC<{
                   // but only when there's nothing selected. A live highlight
                   // keeps the native Copy menu (and ⌘C) instead of the picker.
                   readOnly || !reactionsEnabled
-                    ? undefined
+                    ? // The picker is unavailable and this element carries
+                      // `data-context-menu-skip`, so the shared AppContextMenu
+                      // deliberately leaves a bare (non-owned) right-click here
+                      // unhandled — same as it always did. In Electron that
+                      // still resolves to "no menu" (main never calls
+                      // `Menu.popup`); in a browser tab "unhandled" IS
+                      // Chromium's own native menu, so it must be suppressed
+                      // explicitly to match. A selection inside the bubble
+                      // makes the target "owned", so AppContextMenu takes the
+                      // whole gesture over before this handler ever runs.
+                      event => {
+                        if (!nativeContextMenuHandled()) {
+                          event.preventDefault()
+                        }
+                      }
                     : event => {
                         if (hasTextSelection()) {
                           return
