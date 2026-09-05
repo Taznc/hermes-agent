@@ -167,14 +167,65 @@ def _record_worker_exit(pid: int, raw_status: int) -> None:
             _recent_worker_exits.pop(_pid, None)
 
 
-def _classify_worker_exit(pid: int) -> "tuple[str, Optional[int]]":
+def _scope_exit_status(unit_name: str) -> "Optional[tuple[str, Optional[int]]]":
+    """Exit classification for a systemd ``--user --scope`` unit, read via
+    ``systemctl --user show`` instead of ``waitpid`` — the fallback path for a
+    worker that is not (or is no longer) this process's own child, e.g. after
+    a gateway restart re-adopts a task whose worker was spawned by the
+    previous dispatcher process. Same ``(kind, code)`` shape as
+    :func:`_classify_worker_exit`: ``clean_exit``/``rate_limited``/
+    ``nonzero_exit``/``signaled``, or ``None`` when the unit's fate can't be
+    determined right now (``systemctl`` unavailable, unit already
+    ``--collect``-cleaned, or still running) — callers fall back to their own
+    ``"unknown"`` handling in that case.
+    """
+    from tools.process_registry import scope_unit_show_properties
+
+    props = scope_unit_show_properties(unit_name)
+    if not props:
+        return None
+    active_state = props.get("ActiveState", "")
+    exec_code = props.get("ExecMainCode", "")
+    raw_status = props.get("ExecMainStatus", "")
+    if active_state not in ("inactive", "failed"):
+        # Still running (or transitioning) — not a verdict yet.
+        return None
+    try:
+        status = int(raw_status)
+    except (TypeError, ValueError):
+        return None
+    if exec_code == "exited":
+        if status == 0:
+            return ("clean_exit", 0)
+        if status == _kb.KANBAN_RATE_LIMIT_EXIT_CODE:
+            return ("rate_limited", status)
+        return ("nonzero_exit", status)
+    if exec_code == "killed":
+        return ("signaled", status)
+    return None
+
+
+def _classify_worker_exit(pid: int, worker_unit: Optional[str] = None) -> "tuple[str, Optional[int]]":
     """``(kind, code)`` for a reaped worker PID: ``clean_exit`` (rc 0 while
     still ``running`` = protocol violation), ``rate_limited``
     (``KANBAN_RATE_LIMIT_EXIT_CODE``, never counts as a failure),
     ``nonzero_exit``, ``signaled`` (``code`` is the signal), ``unknown`` (pid
-    not in the reap registry; ``code`` None)."""
+    not in the reap registry AND no ``worker_unit`` fallback resolved it;
+    ``code`` None).
+
+    When ``pid`` has no entry in ``_recent_worker_exits`` (the common case
+    for a worker this process never spawned/reaped, e.g. after a gateway
+    restart re-adopted the task) AND ``worker_unit`` names a systemd scope,
+    fall back to :func:`_scope_exit_status` before giving up with
+    ``"unknown"``. The no-launcher default (``worker_unit`` empty) keeps this
+    function's existing behavior byte-for-byte.
+    """
     entry = _recent_worker_exits.get(int(pid))
     if entry is None:
+        if worker_unit:
+            scoped = _scope_exit_status(worker_unit)
+            if scoped is not None:
+                return scoped
         return ("unknown", None)
     raw, _ = entry
     try:
@@ -292,8 +343,21 @@ def _terminate_reclaimed_worker(
     claim_lock: Optional[str],
     *,
     signal_fn=None,
+    worker_unit: Optional[str] = None,
+    stop_unit_fn=None,
 ) -> dict[str, Any]:
-    """Best-effort host-local worker termination for reclaim paths."""
+    """Best-effort host-local worker termination for reclaim paths.
+
+    When ``worker_unit`` is set (the task was spawned through a
+    ``kanban.worker_launcher`` that minted a transient systemd ``--user --scope``
+    unit), termination goes through ``systemctl --user stop <unit>``
+    (``_stop_systemd_unit`` in ``tools.process_registry``, reused not
+    reinvented) INSTEAD of a bare ``os.kill`` — a scope may contain
+    double-forked descendants that a single-PID signal never reaches, and
+    ``systemd.kill(5)``'s default ``KillMode=mixed`` already SIGTERMs then
+    SIGKILLs the whole cgroup for us. The raw-PID path below remains exactly
+    as before for the default (``worker_unit`` empty) case.
+    """
     info: dict[str, Any] = {
         "prev_pid": int(pid) if pid else None,
         "host_local": False,
@@ -306,6 +370,15 @@ def _terminate_reclaimed_worker(
     if not str(claim_lock).startswith(_kb._host_prefix()):
         return info
     info["host_local"] = True
+
+    if worker_unit:
+        info["worker_unit"] = worker_unit
+        info["termination_attempted"] = True
+        if stop_unit_fn is None:
+            from tools.process_registry import _stop_systemd_unit as stop_unit_fn
+        stopped = bool(stop_unit_fn(worker_unit))
+        info["terminated"] = stopped and not _kb._pid_alive(pid)
+        return info
 
     kill = _kill_fn(signal_fn)
     if kill is None:
@@ -471,7 +544,7 @@ def enforce_max_runtime(conn: sqlite3.Connection, *, signal_fn=None) -> list[str
             retry_status = _kb._retry_status_for_run(conn, tid)
             cur = conn.execute(
                 "UPDATE tasks SET status = ?, claim_lock = NULL, "
-                "claim_expires = NULL, worker_pid = NULL, "
+                "claim_expires = NULL, worker_pid = NULL, worker_unit = NULL, "
                 "last_heartbeat_at = NULL "
                 "WHERE id = ? AND status = 'running' "
                 "  AND worker_pid = ? AND claim_lock IS ?",
@@ -534,7 +607,7 @@ def detect_stale_running(
     reclaimed: list[str] = []
 
     rows = conn.execute(
-        "SELECT t.id, t.worker_pid, t.last_heartbeat_at, t.claim_lock, "
+        "SELECT t.id, t.worker_pid, t.worker_unit, t.last_heartbeat_at, t.claim_lock, "
         "       COALESCE(r.started_at, t.started_at) AS active_started_at "
         "FROM tasks t "
         "LEFT JOIN task_runs r ON r.id = t.current_run_id "
@@ -557,7 +630,9 @@ def detect_stale_running(
         tid = row["id"]
         lock = row["claim_lock"] or ""
 
-        termination = _kb._terminate_reclaimed_worker(pid, lock, signal_fn=signal_fn)
+        termination = _kb._terminate_reclaimed_worker(
+            pid, lock, signal_fn=signal_fn, worker_unit=row["worker_unit"],
+        )
 
         # Never release a claim while our own worker is still alive: that would
         # spawn a duplicate beside it. Hold the claim and retry next tick.
@@ -572,7 +647,7 @@ def detect_stale_running(
             retry_status = _kb._retry_status_for_run(conn, tid)
             cur = conn.execute(
                 "UPDATE tasks SET status = ?, claim_lock = NULL, "
-                "claim_expires = NULL, worker_pid = NULL, "
+                "claim_expires = NULL, worker_pid = NULL, worker_unit = NULL, "
                 "last_heartbeat_at = NULL "
                 "WHERE id = ? AND status = 'running' "
                 "  AND claim_lock IS ?",
@@ -637,7 +712,7 @@ def reconcile_orphaned_running(conn: sqlite3.Connection) -> list[str]:
         with _kb.write_txn(conn):
             cur = conn.execute(
                 "UPDATE tasks SET status = 'ready', claim_lock = NULL, "
-                "claim_expires = NULL, worker_pid = NULL, "
+                "claim_expires = NULL, worker_pid = NULL, worker_unit = NULL, "
                 "last_heartbeat_at = NULL "
                 "WHERE id = ? AND status = 'running' "
                 "  AND claim_lock IS ? AND claim_expires IS ?",
@@ -761,10 +836,14 @@ class _DeadWorker:
         return "crashed"
 
 
-def _classify_dead_worker(pid: int, claimer: Optional[str], retry_status: str = "ready") -> _DeadWorker:
+def _classify_dead_worker(
+    pid: int, claimer: Optional[str], retry_status: str = "ready", worker_unit: Optional[str] = None,
+) -> _DeadWorker:
     """Map a dead worker's reaped exit status to its reclaim bookkeeping. ``retry_status`` is the
-    run's source phase: a clean exit's handling differs by lane (see the review branch)."""
-    kind, code = _classify_worker_exit(pid)
+    run's source phase: a clean exit's handling differs by lane (see the review branch).
+    ``worker_unit``, when set, is consulted as a fallback classification source (see
+    ``_classify_worker_exit``) for a worker this dispatcher process never itself reaped."""
+    kind, code = _classify_worker_exit(pid, worker_unit)
     if kind == "clean_exit" and retry_status == "review":
         # A claimed reviewer run exited cleanly without approving, requesting changes, or
         # escalating. NOT a protocol violation (the implementer case below) and NOT a crash: an
@@ -838,7 +917,7 @@ def _reclaim_dead_workers(conn: sqlite3.Connection) -> _CrashSweep:
     sweep = _CrashSweep()
     with _kb.write_txn(conn):
         rows = conn.execute(
-            "SELECT id, worker_pid, claim_lock, started_at, assignee "
+            "SELECT id, worker_pid, worker_unit, claim_lock, started_at, assignee "
             "FROM tasks "
             "WHERE status = 'running' AND worker_pid IS NOT NULL"
         ).fetchall()
@@ -857,13 +936,13 @@ def _reclaim_dead_workers(conn: sqlite3.Connection) -> _CrashSweep:
 
             pid = int(row["worker_pid"])
             retry_status = _kb._retry_status_for_run(conn, row["id"])
-            dead = _classify_dead_worker(pid, row["claim_lock"], retry_status)
+            dead = _classify_dead_worker(pid, row["claim_lock"], retry_status, row["worker_unit"])
             dead.event_payload["retry_status"] = retry_status
             # A reviewer no-verdict exit parks in ``blocked`` (sticky) instead of its source phase.
             target_status = "blocked" if dead.review_no_verdict else retry_status
             cur = conn.execute(
                 "UPDATE tasks SET status = ?, claim_lock = NULL, "
-                "claim_expires = NULL, worker_pid = NULL "
+                "claim_expires = NULL, worker_pid = NULL, worker_unit = NULL "
                 "WHERE id = ? AND status = 'running' "
                 "  AND worker_pid = ? AND claim_lock IS ?",
                 (target_status, row["id"], pid, row["claim_lock"]),
@@ -1075,7 +1154,7 @@ def _record_task_failure(
                 # Spawn path: restore the claimed source phase + clear claim.
                 conn.execute(
                     "UPDATE tasks SET status = ?, claim_lock = NULL, "
-                    "claim_expires = NULL, worker_pid = NULL, "
+                    "claim_expires = NULL, worker_pid = NULL, worker_unit = NULL, "
                     "consecutive_failures = ?, last_failure_error = ? "
                     "WHERE id = ? AND status = 'running'",
                     (retry_status, failures, error, task_id),
@@ -1103,7 +1182,7 @@ def _record_task_failure(
         # state; the timeout/crash path already did.
         conn.execute(
             "UPDATE tasks SET status = 'blocked', "
-            + ("claim_lock = NULL, claim_expires = NULL, worker_pid = NULL, "
+            + ("claim_lock = NULL, claim_expires = NULL, worker_pid = NULL, worker_unit = NULL, "
                if release_claim else "")
             + "consecutive_failures = ?, last_failure_error = ? "
             "WHERE id = ? AND status IN ('running', 'ready', 'review')",
@@ -1142,14 +1221,29 @@ def _record_task_failure(
         return True
 
 
-def _set_worker_pid(conn: sqlite3.Connection, task_id: str, pid: int) -> None:
-    """Record the spawned child's pid + emit a ``spawned`` event carrying it."""
+def _set_worker_pid(
+    conn: sqlite3.Connection, task_id: str, pid: int, *, worker_unit: Optional[str] = None,
+) -> None:
+    """Record the spawned child's pid (+ launcher unit name, when set) and emit
+    a ``spawned`` event carrying both. ``worker_unit`` is only non-None when
+    ``kanban.worker_launcher`` produced a ``--unit=`` scope for this spawn;
+    absent (NULL) for the default plain-Popen path.
+    """
     with _kb.write_txn(conn):
-        conn.execute("UPDATE tasks SET worker_pid = ? WHERE id = ?", (int(pid), task_id))
+        if worker_unit:
+            conn.execute(
+                "UPDATE tasks SET worker_pid = ?, worker_unit = ? WHERE id = ?",
+                (int(pid), worker_unit, task_id),
+            )
+        else:
+            conn.execute("UPDATE tasks SET worker_pid = ? WHERE id = ?", (int(pid), task_id))
         run_id = _kb._current_run_id(conn, task_id)
         if run_id is not None:
             conn.execute("UPDATE task_runs SET worker_pid = ? WHERE id = ?", (int(pid), run_id))
-        _kb._append_event(conn, task_id, "spawned", {"pid": int(pid)}, run_id=run_id)
+        payload: dict[str, Any] = {"pid": int(pid)}
+        if worker_unit:
+            payload["worker_unit"] = worker_unit
+        _kb._append_event(conn, task_id, "spawned", payload, run_id=run_id)
 
 
 def _clear_failure_counter(conn: sqlite3.Connection, task_id: str) -> None:
@@ -1620,7 +1714,7 @@ def _dispatch_lane_task(
     try:
         pid = _call_spawn_fn(spawn_fn if spawn_fn is not None else _default_spawn, claimed, str(workspace), board)
         if pid:
-            _set_worker_pid(conn, claimed.id, int(pid))
+            _set_worker_pid(conn, claimed.id, int(pid), worker_unit=claimed.worker_unit)
         # Fires AFTER the PID (when reported) is durably persisted. Best-effort.
         _kb._fire_worker_spawned_hook(conn, claimed, str(workspace), pid, board=board)
         # consecutive_failures is deliberately NOT reset here: resetting on
@@ -2211,6 +2305,70 @@ def _restart_safe_worker_argv(task: Task, command: list[str]) -> list[str]:
     )
 
 
+def _worker_launcher_prefix() -> list[str]:
+    """Resolve ``kanban.worker_launcher`` from config.
+
+    Empty list (the default) means "no launcher" — every caller must treat
+    that as a no-op and fall through to plain ``Popen``, keeping behaviour on
+    Windows/macOS/non-systemd Linux byte-for-byte identical to today.
+
+    Fails OPEN, not closed: if the configured launcher binary can't be
+    resolved with ``shutil.which()`` (typo, uninstalled tool, launcher
+    unavailable on this host), log once and return ``[]`` so a misconfigured
+    optional knob degrades to today's spawn behaviour instead of stalling the
+    board. This is deliberately the opposite failure philosophy from
+    ``restart_safe_gateway_child_argv``'s fail-closed ``RuntimeError``: that
+    path guards an actual gateway-restart-survival contract for a narrow
+    supervised case, while this one is plain opt-in operator config.
+    """
+    try:
+        from hermes_cli.config import load_config
+
+        cfg = load_config().get("kanban") or {}
+    except Exception:
+        return []
+    raw = cfg.get("worker_launcher") or []
+    if not isinstance(raw, (list, tuple)):
+        return []
+    prefix = [str(p) for p in raw if p]
+    if not prefix:
+        return []
+    import shutil
+
+    if shutil.which(prefix[0]) is None:
+        _kb._log.warning(
+            "kanban.worker_launcher binary %r not found on PATH; "
+            "falling back to plain Popen spawn for this worker", prefix[0],
+        )
+        return []
+    return prefix
+
+
+def _worker_launcher_unit_name(task: Task) -> str:
+    """``--unit=`` value for a launcher-wrapped worker; stable across the task's runs."""
+    run_part = task.current_run_id if task.current_run_id is not None else "missing"
+    return f"kanban-{task.id}-run-{run_part}"
+
+
+def _apply_worker_launcher(task: Task, command: list[str]) -> "tuple[list[str], Optional[str]]":
+    """Prepend ``kanban.worker_launcher`` (when configured and resolvable) to *command*.
+
+    Returns ``(argv, worker_unit)``. ``worker_unit`` is the unit name minted
+    via an appended ``--unit=<name>`` flag when the launcher fired, else
+    ``None`` — the default/no-launcher path, where ``argv`` is ``command``
+    unchanged. The operator supplies only the launcher binary + its own
+    flags in config; the dispatcher appends ``--unit=<name>`` and the
+    trailing ``-- <command>`` itself so every launcher invocation carries a
+    traceable, task-scoped unit name without the operator hand-typing it.
+    """
+    prefix = _worker_launcher_prefix()
+    if not prefix:
+        return command, None
+    unit_name = _worker_launcher_unit_name(task)
+    argv = [*prefix, f"--unit={unit_name}", "--", *command]
+    return argv, unit_name
+
+
 def _default_spawn(task: Task, workspace: str, *, board: Optional[str] = None) -> Optional[int]:
     """Fire-and-forget ``hermes -p <profile> chat -q ...`` subprocess.
 
@@ -2301,11 +2459,27 @@ def _default_spawn(task: Task, workspace: str, *, board: Optional[str] = None) -
     # older hermes builds on PATH that predate the flag's precedence.
     env.pop("HERMES_TUI", None)
 
-    cmd = _worker_argv(task, profile_arg, env.get("HERMES_HOME"))
+    base_cmd = _worker_argv(task, profile_arg, env.get("HERMES_HOME"))
     # A worker spawned by a managed systemd gateway must leave the gateway's
     # cgroup before startup; otherwise restarting the service kills the worker
     # that is performing the handoff.
-    cmd = _restart_safe_worker_argv(task, cmd)
+    cmd = _restart_safe_worker_argv(task, base_cmd)
+    worker_unit: Optional[str] = None
+    if cmd is base_cmd:
+        # Not running under the managed-gateway restart-safe scope (the narrow
+        # supervised-systemd-gateway case above) — this is the only remaining
+        # place a spawn-time argv wrap can happen, so the operator's own
+        # ``kanban.worker_launcher`` (if configured) applies here. Default
+        # ``[]`` leaves ``cmd`` untouched and ``worker_unit`` None, so the
+        # Popen call below is byte-for-byte identical to before this knob
+        # existed.
+        cmd, worker_unit = _apply_worker_launcher(task, cmd)
+        # Mutating the caller's Task lets ``_dispatch_lane_task`` persist the
+        # unit name alongside the pid without widening this function's return
+        # type — custom ``spawn_fn`` test doubles that never touch this
+        # attribute leave it at its ``None`` default, so nothing observes a
+        # behavior change on the no-launcher path.
+        task.worker_unit = worker_unit
     log_f = _open_worker_log(task, board)
     try:
         proc = subprocess.Popen(  # noqa: S603 -- argv is a fixed list built above
