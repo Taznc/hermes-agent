@@ -171,13 +171,6 @@ import {
   shouldRemoveAppBundle,
   uninstallArgsForMode
 } from './desktop-uninstall'
-import {
-  createDevBackendStaleTracker,
-  DEV_BACKEND_WATCH_DIRS,
-  isRelevantBackendPythonChange,
-  performDevBackendRestart,
-  shouldSupportDevBackendRestart
-} from './dev-backend-watch'
 import { describeDevCdpDecision, resolveDevCdpPort } from './dev-cdp'
 import { installEmbedReferer } from './embed-referer'
 import { createEventDeduper } from './event-dedupe'
@@ -197,6 +190,20 @@ import {
   stopFind
 } from './find-in-page'
 import { createFirstRunSetupGate } from './first-run-setup-gate'
+import { registerAttachmentStreamIpc } from './fork/attachment-stream-ipc'
+import { registerDevRestartWatch } from './fork/dev-restart-watch'
+import { repairStoredProfile } from './fork/profile-repair'
+import { freshRemoteTokenWsUrl, mintWsTicketWithStaticToken } from './fork/remote-auth'
+import {
+  applySecretStorageEncryption as applySecretStorageEncryptionFork,
+  migrateLegacyEncryptedSecretsOnce as migrateLegacyEncryptedSecretsOnceFork,
+  rewriteAllStoredSecrets as rewriteAllStoredSecretsFork,
+  type SecretRewriteDeps
+} from './fork/secret-rewrite'
+import { createSecretStorageIntegration } from './fork/secret-storage-integration'
+import { updateChecksDisabled } from './fork/update-checks-gate'
+import { createWindowCapsIntegration } from './fork/window-caps'
+import { findWindowsSystemPython } from './fork/windows-paths'
 import { registerFsIpc } from './fs-ipc'
 import {
   filenameFromContentDisposition,
@@ -215,7 +222,6 @@ import { registerGitIpc } from './git-ipc'
 import { clearStaleGitLocks } from './gitlock'
 import { readAndConsumeHandoffResult } from './handoff-result'
 import {
-  ATTACHMENT_CHUNK_BYTES,
   ATTACHMENT_UPLOAD_DEFAULT_MAX_BYTES,
   clampDataUrlReadMaxMb,
   DATA_URL_READ_DEFAULT_MAX_MB,
@@ -223,7 +229,6 @@ import {
   DEFAULT_FETCH_TIMEOUT_MS,
   enableBasicPasswordStoreEncryption,
   encryptDesktopSecret as encryptDesktopSecretStrict,
-  readFileChunkForIpc,
   readFileDataUrlForIpc,
   resolvePersistedRemoteToken,
   resolveReadableFileForIpc,
@@ -242,7 +247,7 @@ import { applyHudElectronOverlay, promoteHudOverlay } from './hud-overlay'
 import { snapHudBounds } from './hud-snap'
 import { createHudSnapShortcut } from './hud-snap-shortcut'
 import { buildHudWindowUrl } from './hud-url'
-import { hudWindowingView, resolveHudWindowing } from './hud-windowing'
+import { resolveHudWindowing } from './hud-windowing'
 import { createLinkTitleWindow, guardLinkTitleSession, readLinkTitleWindowTitle } from './link-title-window'
 import { ensureMainWindow } from './main-window-lifecycle'
 import {
@@ -322,8 +327,7 @@ import {
   localProfilePoolKeys,
   ProfileDeletionGate,
   profileNameFromDeleteRequest,
-  resolveRouteProfile,
-  resolveStoredDesktopProfile
+  resolveRouteProfile
 } from './profile-delete-routing'
 import { migrateActiveProfileIfMissing as migrateActiveProfileIfMissingPure } from './profile-migration'
 import { prepareProfileRenameLifecycle, profileRenameFromRequest } from './profile-rename-routing'
@@ -361,7 +365,6 @@ import { attachRendererConsoleCapture, formatRendererBoundaryReport } from './re
 import {
   classifyStoredSecret,
   readSecretStoragePolicy,
-  resolveSecureTokenStorageState,
   SECRET_STORAGE_LAST_ON_MARKER_FILE,
   SECRET_STORAGE_POLICY_FILE,
   type SecretStoragePolicy,
@@ -398,7 +401,6 @@ import {
   windowOpacityFor,
   windowOpacityOptions
 } from './translucency'
-import { updateChecksDisabled } from './update-checks-gate'
 import {
   compareApiUrl,
   parseCompareBehindCount,
@@ -470,7 +472,7 @@ import {
   writeSandboxMarker
 } from './windows-sandbox-fallback'
 import { installWindowsSystemCaTrust } from './windows-system-ca'
-import { readWindowsUserEnvVar, runRegQuery } from './windows-user-env'
+import { readWindowsUserEnvVar } from './windows-user-env'
 import { isPackagedInstallPath as isPackagedInstallPathUnderRoots } from './workspace-cwd'
 import { readWslWindowsClipboardImage } from './wsl-clipboard-image'
 import { resolvePickerDefaultPath, setActiveGatewayProfile, setWslBridgeProfileState } from './wsl-path-bridge'
@@ -506,30 +508,19 @@ const GLASS_SUPPORTED = glassSupportedOn(process.platform, os.release())
 // Clear rides setOpacity, a documented no-op on Linux, so neither mode works
 // there and Settings drops the row entirely.
 const TRANSLUCENCY_SUPPORTED = translucencySupportedOn(process.platform)
-// Process-constant window capabilities the renderer needs before its first
-// paint: translucency support (glass/vibrancy) and the HUD's windowing
-// profile (X11 vs Wayland vs native desktop). Both used to be answered by a
-// preload `ipcRenderer.sendSync`, which stalls the renderer's first script
-// on a round-trip into main -- coupling first paint to whatever main is busy
-// doing (a slow backend probe, boot). Neither value ever changes for the
-// life of the process, so we compute it once here and hand it to preload via
-// `webPreferences.additionalArguments` (see hermesWindowCapsArgument()):
-// zero IPC, no stall, same answer every window gets.
-const HUD_WINDOWING_VIEW = hudWindowingView(resolveHudWindowing(process.platform, process.env, process.argv))
 
-const WINDOW_CAPS_ARGUMENT = `--hermes-window-caps=${encodeURIComponent(
-  JSON.stringify({ glass: GLASS_SUPPORTED, translucency: TRANSLUCENCY_SUPPORTED, hud: HUD_WINDOWING_VIEW })
-)}`
-
-// Every BrowserWindow whose preload is PRELOAD_PATH must carry this so the
-// renderer's first script sees translucency/HUD capabilities without an IPC
-// round-trip. Centralized so a new window kind can't forget it.
-function withWindowCapsArgument(webPreferences: Record<string, unknown>): Record<string, unknown> {
-  return {
-    ...webPreferences,
-    additionalArguments: [...((webPreferences.additionalArguments as string[]) || []), WINDOW_CAPS_ARGUMENT]
-  }
-}
+// Process-constant window capabilities (translucency/glass + HUD windowing
+// profile) handed to preload via additionalArguments — computed once so the
+// renderer's first paint never stalls on an IPC round-trip. Implementation
+// and rationale live in the fork module.
+// >>> FORK ANCHOR: window-caps <<<
+const { WINDOW_CAPS_ARGUMENT, withWindowCapsArgument } = createWindowCapsIntegration({
+  glassSupported: GLASS_SUPPORTED,
+  translucencySupported: TRANSLUCENCY_SUPPORTED,
+  platform: process.platform,
+  env: process.env,
+  argv: process.argv
+})
 
 const APP_ROOT = app.getAppPath()
 
@@ -883,8 +874,9 @@ const HERMES_HOME = resolveHermesHome()
 // rung read directly from HERMES_HOME/config.yaml — that's why this has to
 // come after resolveHermesHome() rather than sit with the other early
 // launch-arg gates above. Also short-circuits unconditionally on
-// HERMES_DEV=1 — see update-checks-gate.ts for the full rationale. Default
-// is checks ON — this only ever narrows behavior, never widens it.
+// HERMES_DEV=1 — see fork/update-checks-gate.ts for the full rationale.
+// Default is checks ON — this only ever narrows behavior, never widens it.
+// >>> FORK ANCHOR: update-checks <<<
 const UPDATE_CHECKS_DISABLED = updateChecksDisabled(process.env, {
   configPath: path.join(HERMES_HOME, 'config.yaml')
 })
@@ -2720,174 +2712,16 @@ async function findSystemPython() {
     return null
   }
 
-  // Windows: PATH-based detection has TWO landmines we have to dodge.
-  //
-  //  (1) The Microsoft Store "Python stub" lives at
-  //      %LOCALAPPDATA%\Microsoft\WindowsApps\python.exe and is on PATH
-  //      by default on modern Windows. It's a redirector that opens the
-  //      Store window if no Store Python is installed. Running it for
-  //      `-m venv` would either succeed (real Store install — fine) or
-  //      pop the Store dialog (bad UX during boot).
-  //  (2) `py.exe` (Python launcher) is missing from per-user installs
-  //      that didn't check the launcher option, so PATH-only checks
-  //      miss real Python 3.13 installs (user-reported case).
-  //
-  // We also restrict ourselves to Python 3.11–3.13. 3.14 is the latest
-  // CPython but several Hermes deps (notably pywinpty's Rust-built
-  // windows_x86_64_msvc crate) don't yet publish 3.14 wheels, and
-  // `pip install -e .` falls back to source-build, which fails without
-  // a Rust toolchain. install.ps1 sidesteps this by pinning to 3.11
-  // via uv; until we add the same uv-managed Python pathway here, the
-  // simplest fix is to refuse 3.14 detection and let the NSIS prereq
-  // page offer to install 3.11 alongside.
-  //
-  // Strategy: probe in three passes, in order from most-precise to
-  // least-precise, and ONLY use PATH lookup as a last resort after
-  // confirming the candidate isn't the WindowsApps redirector.
-  //
-  //  Pass 1: PEP 514 registry — every standards-compliant Python
-  //          installer registers itself at SOFTWARE\Python\PythonCore.
-  //          The MS Store stub does NOT register here, so a hit means
-  //          a real Python install. Versions are explicit so we
-  //          inherently filter 3.14 out.
-  //  Pass 2: Filesystem probe of standard install locations
-  //          (Program Files, LocalAppData\Programs\Python). Same
-  //          version filtering by directory name.
-  //  Pass 3: PATH lookup of `py.exe` (the launcher itself never
-  //          triggers the Store) — but call it with a version flag so
-  //          we resolve to a SPECIFIC supported version, not whatever
-  //          py.exe's default is (which on a 3.14-only box would be
-  //          3.14).
-
-  const SUPPORTED_VERSIONS = ['3.11', '3.12', '3.13']
-  const SUPPORTED_VERSIONS_NO_DOT = ['311', '312', '313']
-
-  // Pass 1: registry. Use `reg query` (through the shared PowerShell/UTF-8
-  // wrapper — see windows-user-env.ts's runRegQuery) since main process
-  // doesn't have a reliable in-process registry API across all electron
-  // versions, and reg.exe's raw output is in the console codepage: a
-  // straight `execFileSync('reg', ...)` + utf8 decode mangles any
-  // non-ASCII byte, which for `InstallPath` values under a CJK-named
-  // Program Files/user directory means the resolved python.exe path comes
-  // back mojibake'd and fileExists() below silently (and wrongly) fails.
-  // The (hive, version) probes are independent reads, so run them all
-  // concurrently (this used to be a fully synchronous serial loop that
-  // could block the main thread for the sum of every probe's latency);
-  // priority among the settled results is still HKLM-before-HKCU,
-  // lowest-version-first, exactly like the old loop order.
-  const registryCandidates: Array<{ hive: string; version: string }> = []
-
-
-  for (const hive of ['HKLM', 'HKCU']) {
-    for (const version of SUPPORTED_VERSIONS) {
-      registryCandidates.push({ hive, version })
-    }
-  }
-
-  const registryResults = await Promise.all(
-    registryCandidates.map(async ({ hive, version }) => {
-      try {
-        const stdout = await runRegQuery<Promise<string>>(
-          ['query', `${hive}\\SOFTWARE\\Python\\PythonCore\\${version}\\InstallPath`, '/ve', '/reg:64'],
-          // Registry reads are near-instant; the bound only exists so a
-          // pathologically wedged reg.exe can't hang boot forever.
-          {
-            exec: async (file, args, options) => (await execFileAsync(file, args, options)).stdout,
-            timeout: 5_000
-          }
-        )
-
-        // Output format: "    (Default)    REG_SZ    C:\Path\To\Python\"
-        const match = String(stdout).match(/REG_SZ\s+(.+?)\s*$/m)
-
-        if (!match) {
-          return null
-        }
-
-        const pythonExe = path.join(match[1].trim(), 'python.exe')
-
-        return fileExists(pythonExe) ? pythonExe : null
-      } catch {
-        // Key not present — try next.
-        return null
-      }
-    })
-  )
-
-  const registryHit = registryResults.find(Boolean)
-
-  if (registryHit) {
-    return registryHit
-  }
-
-  // Pass 2: filesystem probe of standard locations.
-  const programFiles = process.env['ProgramFiles'] || 'C:\\Program Files'
-  const localAppData = process.env.LOCALAPPDATA || ''
-
-  for (const versionDir of SUPPORTED_VERSIONS_NO_DOT) {
-    const systemWide = path.join(programFiles, `Python${versionDir}`, 'python.exe')
-
-    if (fileExists(systemWide)) {
-      return systemWide
-    }
-
-    if (localAppData) {
-      const perUser = path.join(localAppData, 'Programs', 'Python', `Python${versionDir}`, 'python.exe')
-
-      if (fileExists(perUser)) {
-        return perUser
-      }
-    }
-  }
-
-  // Pass 3: py.exe with explicit version flag. The launcher itself is
-  // safe to invoke (no Store popup) and `py -3.13 -c "import sys;
-  // print(sys.executable)"` resolves to the actual python.exe path of
-  // the requested version. Probed concurrently; priority among settled
-  // results stays version-priority order (3.11 before 3.12 before 3.13),
-  // matching the old serial-loop's first-hit-wins semantics.
-  const pyExe = findOnPath('py.exe')
-
-  if (pyExe) {
-    const pyResults = await Promise.all(
-      SUPPORTED_VERSIONS.map(async version => {
-        try {
-          const { stdout } = await execFileAsync(
-            pyExe,
-            [`-${version}`, '-c', 'import sys; print(sys.executable)'],
-            hiddenWindowsChildOptions({
-              encoding: 'utf8',
-              // Bare interpreter startup — much lighter than the hermes-import
-              // probes, but still python.exe under cold cache / AV scan, so
-              // share the probe budget rather than running unbounded.
-              timeout: PROBE_TIMEOUT_MS
-            })
-          )
-
-          const candidate = String(stdout).trim()
-
-          return candidate && fileExists(candidate) ? candidate : null
-        } catch {
-          // py couldn't find that version — try next.
-          return null
-        }
-      })
-    )
-
-    const pyHit = pyResults.find(Boolean)
-
-    if (pyHit) {
-      return pyHit
-    }
-  }
-
-  // We deliberately do NOT fall back to plain `python.exe` on PATH.
-  // Without a way to verify the version safely (running `python -V`
-  // risks the Microsoft Store popup), accepting whatever's there
-  // could land us on 3.14 and trigger the Rust-build-from-source
-  // failure. Better to return null and let the NSIS prereq page
-  // offer to install a known-good 3.11 via winget.
-  return null
+  // Windows: the registry/filesystem/py.exe probe ladder (Store-stub and
+  // 3.14 avoidance, CJK-safe registry reads) lives in the fork module.
+  // >>> FORK ANCHOR: windows-python-probe <<<
+  return findWindowsSystemPython({
+    env: process.env,
+    fileExists,
+    findOnPath,
+    execFileAsync,
+    probeTimeoutMs: PROBE_TIMEOUT_MS
+  })
 }
 
 // findGitBash — locate bash.exe on Windows. Resolves HERMES_GIT_BASH_PATH
@@ -8037,45 +7871,12 @@ function _nativeTokenStorePath() {
   return path.join(app.getPath('userData'), 'native-oauth-tokens.json')
 }
 
-// The electron-coupled half of the token store: safeStorage encryption plus the
-// userData file. native-token-store.ts owns the serialization/parse round trip
-// so it can be tested without an Electron runtime.
+// The electron-coupled half of the token store lives in the fork module —
+// see fork/secret-storage-integration.ts (created at the secret-storage-io
+// anchor below; safe to call here because it is only invoked at runtime,
+// long after module evaluation).
 function _nativeTokenStoreIo(): NativeTokenStoreIo {
-  return {
-    encrypt: encryptDesktopSecret,
-    decrypt: decryptDesktopSecret,
-    readStoreText: () => fs.readFileSync(_nativeTokenStorePath(), 'utf8'),
-    // Atomic (temp file + rename, owner-only mode) via the same helper the
-    // adjacent secret-storage-policy.json write uses — a crash/power-loss/
-    // full-disk failure mid-write can now only ever leave the OLD file intact
-    // or the NEW file complete, never a truncated hybrid that reads as an
-    // empty store and silently drops every other gateway's tokens on the
-    // next persist.
-    writeStoreText: (text: string) => {
-      fs.mkdirSync(path.dirname(_nativeTokenStorePath()), { recursive: true })
-      writeSecretFileAtomic(_nativeTokenStorePath(), text, { encoding: 'utf8' })
-    },
-    // A store that fails to JSON.parse is quarantined instead of being
-    // silently treated as empty and then overwritten on the next persist —
-    // rename it aside so the corrupt bytes aren't lost to a "recoverable"
-    // read that isn't actually recoverable once the next write lands.
-    preserveCorruptStore: () => {
-      const target = _nativeTokenStorePath()
-      const quarantined = `${target}.corrupt-${Date.now()}`
-
-      try {
-        fs.renameSync(target, quarantined)
-        rememberLog(`[native-oauth] quarantined corrupt token store at ${quarantined}`)
-      } catch (error) {
-        rememberLog(
-          `[native-oauth] failed to quarantine corrupt token store: ${
-            error instanceof Error ? error.message : String(error)
-          }`
-        )
-      }
-    },
-    rememberLog
-  }
+  return secretStorageIntegration.nativeTokenStoreIo()
 }
 
 function _persistNativeTokens(baseUrl: string, tokens: NativeTokenSet | null) {
@@ -8467,28 +8268,13 @@ async function saveGatewayFileViaDataUrl(
 // Transient transport blips (brief host unreachable, 5xx, timeouts) are retried
 // a few times before failing — those 1-3s flaps were promoting into the
 // full-screen "couldn't start" lockout on reconnect.
-async function mintGatewayWsTicket(baseUrl, headers = {}, staticToken = null) {
+async function mintGatewayWsTicket(baseUrl, headers = {}, staticToken: string | null = null) {
   return withTransientRetries(async () => {
-    // Token-auth remotes: a gated dashboard rejects the legacy `?token=` query
-    // param on the WS upgrade (403) — only a minted ticket is accepted — but it
-    // DOES accept that same token as a bearer on the mint endpoint. Without this
-    // rung a basic-auth/token backend can pass every HTTP check and still never
-    // open /api/ws.
+    // Token-auth remotes: the static session token is accepted as a bearer on
+    // the mint endpoint (fork rung — see fork/remote-auth.ts).
+    // >>> FORK ANCHOR: remote-auth-static-ticket <<<
     if (staticToken) {
-      const body = (await fetchJson(`${baseUrl}/api/auth/ws-ticket`, null, {
-        method: 'POST',
-        timeoutMs: 8_000,
-        bearer: staticToken,
-        headers
-      })) as any
-
-      const ticket = body?.ticket
-
-      if (!ticket || typeof ticket !== 'string') {
-        throw new Error('Gateway did not return a WS ticket.')
-      }
-
-      return ticket
+      return mintWsTicketWithStaticToken(baseUrl, headers, staticToken, { fetchJson })
     }
 
     // Native flow: mint the ticket with the bearer token, no cookie involved.
@@ -8551,22 +8337,14 @@ async function freshGatewayWsUrl(profile) {
     return wsUrl
   }
 
-  // Remote token-auth: a gated dashboard refuses the legacy `?token=` param on
-  // the WS upgrade, so trade the token for a single-use ticket. Local backends
-  // are ungated and have no mint endpoint — the cached wsUrl is correct there,
-  // and a mint failure falls back to it.
+  // Remote token-auth: trade the static token for a single-use ticket, with
+  // the cached wsUrl as fallback (fork rung — see fork/remote-auth.ts).
+  // >>> FORK ANCHOR: remote-auth-token-ws-url <<<
   if (connection.mode === 'remote' && connection.token) {
-    try {
-      const ticket = await mintGatewayWsTicket(
-        connection.baseUrl,
-        connection.headers,
-        connection.token
-      )
-
-      return buildGatewayWsUrlWithTicket(connection.baseUrl, ticket)
-    } catch {
-      return connection.wsUrl
-    }
+    return freshRemoteTokenWsUrl(connection, {
+      mintTicket: mintGatewayWsTicket,
+      buildTicketUrl: buildGatewayWsUrlWithTicket
+    })
   }
 
   // Local/ungated: the cached wsUrl already carries the (long-lived) token.
@@ -9121,46 +8899,23 @@ const SECRET_STORAGE_POLICY_PATH = path.join(app.getPath('userData'), SECRET_STO
 // doesn't live inside the same file that can disappear.
 const SECRET_STORAGE_LAST_ON_MARKER_PATH = path.join(app.getPath('userData'), SECRET_STORAGE_LAST_ON_MARKER_FILE)
 
-const _secretStoragePolicyIo = {
-  readText: () => fs.readFileSync(SECRET_STORAGE_POLICY_PATH, 'utf8'),
-  writeText: (text: string) => writeSecretFileAtomic(SECRET_STORAGE_POLICY_PATH, text, { encoding: 'utf8' }),
-  // A present-but-corrupt policy file is quarantined rather than silently
-  // treated as the OFF default — see readSecretStoragePolicy's doc comment
-  // for why "corrupt while present" and "absent" must not read the same.
-  preserveCorruptPolicy: () => {
-    const quarantined = `${SECRET_STORAGE_POLICY_PATH}.corrupt-${Date.now()}`
-
-    try {
-      fs.renameSync(SECRET_STORAGE_POLICY_PATH, quarantined)
-      rememberLog(`[secret-storage] quarantined corrupt policy file at ${quarantined}`)
-    } catch (error) {
-      rememberLog(
-        `[secret-storage] failed to quarantine corrupt policy file: ${
-          error instanceof Error ? error.message : String(error)
-        }`
-      )
-    }
-  },
-  // The marker's mere PRESENCE means "last deliberate write was ON" — its
-  // content is irrelevant, only existence is checked, so a truncated/corrupt
-  // marker file still correctly answers "yes, it existed" rather than needing
-  // its own corruption-handling ladder for a one-bit signal.
-  readLastKnownOn: () => fs.existsSync(SECRET_STORAGE_LAST_ON_MARKER_PATH),
-  writeLastKnownOn: (on: boolean) => {
-    if (on) {
-      writeSecretFileAtomic(SECRET_STORAGE_LAST_ON_MARKER_PATH, String(Date.now()), { encoding: 'utf8' })
-    } else {
-      try {
-        fs.rmSync(SECRET_STORAGE_LAST_ON_MARKER_PATH, { force: true })
-      } catch {
-        // Best-effort removal; a stale marker after an explicit turn-OFF just
-        // means a future disappearance of the main policy file conservatively
-        // reads as ON again, which is the safe direction to fail in.
-      }
-    }
-  },
+// Electron-coupled IO for the policy + native token store (atomic writes,
+// corruption quarantine, last-on marker, honest keychain probe). The policy
+// decision logic stays in secret-storage-policy.ts / native-token-store.ts;
+// the side-effect bodies live in the fork module.
+// >>> FORK ANCHOR: secret-storage-io <<<
+const secretStorageIntegration = createSecretStorageIntegration({
+  nativeTokenStorePath: _nativeTokenStorePath,
+  policyPath: SECRET_STORAGE_POLICY_PATH,
+  lastOnMarkerPath: SECRET_STORAGE_LAST_ON_MARKER_PATH,
+  encrypt: (plaintext: string) => encryptDesktopSecret(plaintext),
+  decrypt: (secret: any) => decryptDesktopSecret(secret),
+  isEncryptionAvailable: () => safeStorage.isEncryptionAvailable(),
+  secretStoragePolicy: () => secretStoragePolicy(),
   rememberLog
-}
+})
+
+const _secretStoragePolicyIo = secretStorageIntegration.secretStoragePolicyIo
 
 let _secretStoragePolicy: SecretStoragePolicy | null = null
 
@@ -9177,222 +8932,49 @@ function setSecretStoragePolicy(next: SecretStoragePolicy) {
   writeSecretStoragePolicy(_secretStoragePolicy, _secretStoragePolicyIo)
 }
 
-/**
- * Keychain availability as the renderer should see it. With encryption
- * opted out this must NOT probe safeStorage — isEncryptionAvailable() is
- * itself a keychain touch that raises the macOS dialog this feature exists
- * to avoid. We report `true` so the plain-text CONFIRMATION dialog (the
- * "your keychain is broken, opt into plaintext to continue" flow) never
- * fires: storing plaintext with the policy off is the user's chosen
- * (default) mode, not a degraded state that needs a gate.
- *
- * This does NOT mean the renderer is blind to the real state — see
- * probeSecureTokenStorageState() below, which both callers of this function
- * also read and forward honestly as `secretStorageState`.
- */
+// Gated probe (suppresses the plaintext-opt-in CONFIRM dialog while the
+// policy is off) — see the fork module for the full rationale.
 function probeSecureTokenStorage(): boolean {
-  const state = probeSecureTokenStorageState()
-
-  return state.policyOn ? state.available : true
+  return secretStorageIntegration.probeSecureTokenStorage()
 }
 
-/**
- * The full, honest answer to "is what I save right now actually OS-keychain
- * encrypted?" — `{ available, policyOn }`. Unlike probeSecureTokenStorage()
- * above (which exists only to gate the plaintext-opt-in CONFIRM dialog and
- * intentionally reads as "fine" while the policy is off), this is what the
- * renderer uses to show an honest, non-blocking "stored without OS keychain
- * encryption" hint instead of asserting security it cannot back up.
- */
+// The honest { available, policyOn } state the renderer's "stored without
+// OS keychain encryption" hint reads — see the fork module.
 function probeSecureTokenStorageState(): SecureTokenStorageState {
-  return resolveSecureTokenStorageState(secretStoragePolicy(), () => Boolean(safeStorage.isEncryptionAvailable()))
+  return secretStorageIntegration.probeSecureTokenStorageState()
 }
 
-/**
- * Rewrite every stored desktop secret (v1 connection.json token/headers +
- * per-profile overrides, v2 registry connections, native OAuth token store)
- * through `reencode`. Returns true when any store was rewritten. Shared by
- * the one-shot legacy migration and the Settings encryption toggle.
- */
+// Bulk secret re-encoding (shared rewrite walker + one-shot legacy migration
+// + the Settings encryption toggle) lives in the fork module; this deps
+// object is the only seam it needs. See fork/secret-rewrite.ts.
+// >>> FORK ANCHOR: secret-rewrite <<<
+const _secretRewriteDeps: SecretRewriteDeps = {
+  readDesktopConnectionConfig: () => readDesktopConnectionConfig(),
+  writeDesktopConnectionConfig: config => writeDesktopConnectionConfig(config),
+  readDesktopConnectionsRegistry: () => readDesktopConnectionsRegistry(),
+  writeDesktopConnectionsRegistry: registry => writeDesktopConnectionsRegistry(registry),
+  nativeTokenStoreIo: () => _nativeTokenStoreIo(),
+  secretStoragePolicy: () => secretStoragePolicy(),
+  setSecretStoragePolicy: next => setSecretStoragePolicy(next),
+  decryptDesktopSecret: secret => decryptDesktopSecret(secret),
+  encryptSecretStrict: value => encryptDesktopSecretStrict(value, safeStorage),
+  isEncryptionAvailable: () => Boolean(safeStorage.isEncryptionAvailable()),
+  rememberLog
+}
+
 function rewriteAllStoredSecrets(shouldRewrite: (secret: any) => boolean, reencode: (secret: any) => any): boolean {
-  let touched = false
-
-  const rewriteBlock = (block: any) => {
-    if (!block || typeof block !== 'object') {
-      return block
-    }
-
-    const next = { ...block, ...(block.token ? { token: reencode(block.token) } : {}) }
-
-    if (block.headers && typeof block.headers === 'object') {
-      next.headers = Object.fromEntries(Object.entries(block.headers).map(([k, v]) => [k, reencode(v)]))
-    }
-
-    return next
-  }
-
-  const blockNeedsRewrite = (o: any) =>
-    shouldRewrite(o?.token) ||
-    Object.values(o?.headers && typeof o.headers === 'object' ? o.headers : {}).some(shouldRewrite)
-
-  // v1 connection.json.
-  const config = readDesktopConnectionConfig()
-
-  if (blockNeedsRewrite(config.remote) || Object.values(config.profiles || {}).some(blockNeedsRewrite)) {
-    touched = true
-    writeDesktopConnectionConfig({
-      ...config,
-      remote: rewriteBlock(config.remote),
-      profiles: Object.fromEntries(Object.entries(config.profiles || {}).map(([k, v]) => [k, rewriteBlock(v)]))
-    })
-  }
-
-  // v2 connections.json registry.
-  const registry = readDesktopConnectionsRegistry()
-
-  if (registry.connections?.some(blockNeedsRewrite)) {
-    touched = true
-    writeDesktopConnectionsRegistry({ ...registry, connections: registry.connections.map(rewriteBlock) })
-  }
-
-  // Native OAuth token store: baseUrl → blob.
-  const io = _nativeTokenStoreIo()
-
-  try {
-    const store = JSON.parse(io.readStoreText())
-
-    if (store && typeof store === 'object' && !Array.isArray(store)) {
-      const entries = Object.entries(store)
-
-      if (entries.some(([, v]) => shouldRewrite(v))) {
-        touched = true
-        io.writeStoreText(JSON.stringify(Object.fromEntries(entries.map(([k, v]) => [k, reencode(v)]))))
-      }
-    }
-  } catch {
-    // Missing/corrupt native token store: nothing to rewrite.
-  }
-
-  return touched
+  return rewriteAllStoredSecretsFork(_secretRewriteDeps, shouldRewrite, reencode)
 }
 
-/**
- * One-shot legacy migration: builds before the opt-in policy wrote every
- * secret as a safeStorage blob. With encryption now defaulting OFF, decrypt
- * each stored blob once and rewrite it as plain so no future launch touches
- * the keychain. Marked `migrated` whether or not every blob decrypts — a
- * broken keychain costs at most ONE prompt (this pass), never one per
- * launch; blobs that would not decrypt are left in place and simply read as
- * absent from then on (classifyStoredSecret → 'drop'), so opting encryption
- * back ON later can still recover them on a healthy keychain.
- *
- * Runs before createWindow() so every later read sees the final encodings.
- */
+// One-shot legacy migration — see fork/secret-rewrite.ts. Runs before
+// createWindow() so every later read sees the final encodings.
 function migrateLegacyEncryptedSecretsOnce() {
-  const policy = secretStoragePolicy()
-
-  if (policy.on || policy.migrated) {
-    return
-  }
-
-  const needsMigration = (secret: any) => classifyStoredSecret(secret, policy) === 'migrate'
-
-  const reencode = (secret: any) => {
-    if (!needsMigration(secret)) {
-      return secret
-    }
-
-    const plaintext = decryptDesktopSecret(secret)
-
-    // Undecryptable now (locked/absent keychain): keep the blob for a
-    // potential future opt-in, but post-migration reads treat it as unset.
-    return plaintext ? { encoding: 'plain', value: plaintext } : secret
-  }
-
-  let touchedKeychain = false
-
-  try {
-    touchedKeychain = rewriteAllStoredSecrets(needsMigration, reencode)
-  } catch (error) {
-    const detail = error instanceof Error ? error.message : String(error)
-
-    rememberLog(`[secret-storage] legacy migration pass failed: ${detail}`)
-  }
-
-  setSecretStoragePolicy({ on: false, migrated: true })
-
-  if (touchedKeychain) {
-    rememberLog('[secret-storage] migrated legacy keychain-encrypted secrets to opt-out storage (one-shot pass)')
-  }
+  migrateLegacyEncryptedSecretsOnceFork(_secretRewriteDeps)
 }
 
-/**
- * Settings → Gateway toggle: flip keychain-backed encryption and re-encode
- * every stored secret to match. Turning ON encrypts plain blobs through
- * strict safeStorage (throws loudly when the keychain is unusable — the
- * toggle stays off and the renderer shows the error). Turning OFF decrypts
- * back to plain; this is user-initiated, so a keychain prompt here is
- * expected and acceptable.
- */
+// Settings → Gateway toggle — see fork/secret-rewrite.ts.
 function applySecretStorageEncryption(on: boolean) {
-  const enable = on === true
-
-  if (secretStoragePolicy().on === enable) {
-    return { on: enable }
-  }
-
-  if (enable) {
-    const needsEncrypt = (secret: any) => secret?.encoding === 'plain' && Boolean(secret.value)
-
-    // Probe FIRST so an unusable keychain fails before any store is touched.
-    if (
-      !(() => {
-        try {
-          return Boolean(safeStorage.isEncryptionAvailable())
-        } catch {
-          return false
-        }
-      })()
-    ) {
-      throw new Error(
-        'OS keychain encryption is unavailable on this machine, so stored gateway secrets cannot be encrypted.'
-      )
-    }
-
-    setSecretStoragePolicy({ on: true, migrated: true })
-
-    try {
-      rewriteAllStoredSecrets(needsEncrypt, secret =>
-        needsEncrypt(secret) ? encryptDesktopSecretStrict(String(secret.value), safeStorage) : secret
-      )
-    } catch (error) {
-      // Encryption failed midway: revert the policy so reads keep working
-      // against whatever encodings are on disk (mixed stores read fine —
-      // decryptDesktopSecret handles both encodings under either policy).
-      setSecretStoragePolicy({ on: false, migrated: true })
-      throw error
-    }
-
-    return { on: true }
-  }
-
-  // Turning OFF: decrypt everything back to plain while the keychain is
-  // still readable, then flip the policy.
-  const needsDecrypt = (secret: any) => secret?.encoding === SAFE_STORAGE_ENCODING
-
-  rewriteAllStoredSecrets(needsDecrypt, (secret: any) => {
-    if (!needsDecrypt(secret)) {
-      return secret
-    }
-
-    const plaintext = decryptDesktopSecret(secret)
-
-    return plaintext ? { encoding: 'plain', value: plaintext } : secret
-  })
-
-  setSecretStoragePolicy({ on: false, migrated: true })
-
-  return { on: false }
+  return applySecretStorageEncryptionFork(_secretRewriteDeps, on, SAFE_STORAGE_ENCODING)
 }
 
 function encryptDesktopSecret(value, options = {}) {
@@ -9970,54 +9552,28 @@ async function saveRegistryConnection(input: any = {}) {
 
 // Returns the desktop's chosen profile name, or null when unset. "default" is
 // a valid stored value (pins the root HERMES_HOME explicitly); null means "no
-// preference" and preserves the legacy launch (no --profile flag).
-//
-// A stored name must also still EXIST on this machine. The preference outlives
-// the profile it names: deleting a profile elsewhere, syncing this file between
-// machines, or restoring a backup all leave a name here with no directory
-// behind it. Because every profile-scoped consumer funnels through this
-// function -- primaryProfileKey(), the `hermes:profile:get` IPC the renderer
-// adopts at boot, and the backend launch path -- an unvalidated name routes
-// EVERY profile-scoped REST call (config, env, model info, schema, sessions)
-// at a profile the backend will never have. Each one 404s
-// ("Profile 'x' does not exist."), nothing self-heals, and the app retries
-// forever.
-//
-// Format validation alone cannot catch that: `claudeprimary` is a perfectly
-// well-formed name for a profile that isn't here. Validate existence at the
-// same boundary the local spawn guard uses (assertLocalProfileCanStart), then
-// self-heal by clearing the dead preference so the next read is clean and the
-// app falls back to the default profile instead of looping.
+// preference" and preserves the legacy launch (no --profile flag). A stored
+// name must also still EXIST on this machine; the validation + self-heal
+// rationale lives in fork/profile-repair.ts.
+// >>> FORK ANCHOR: profile-repair <<<
 function readActiveDesktopProfile() {
-  let stored = ''
+  return repairStoredProfile({
+    readStoredProfile: () => {
+      try {
+        const raw = fs.readFileSync(DESKTOP_PROFILE_CONFIG_PATH, 'utf8')
+        const parsed = JSON.parse(raw)
 
-  try {
-    const raw = fs.readFileSync(DESKTOP_PROFILE_CONFIG_PATH, 'utf8')
-    const parsed = JSON.parse(raw)
-    stored = parsed && typeof parsed.profile === 'string' ? parsed.profile : ''
-  } catch {
-    // Missing or malformed → no preference.
-  }
-
-  const resolved = resolveStoredDesktopProfile(
-    stored,
-    key => PROFILE_NAME_RE.test(key),
-    key => directoryExists(path.join(HERMES_HOME, 'profiles', key))
-  )
-
-  // A well-formed name that resolved to nothing means the profile is gone (a
-  // malformed/absent file yields an empty `stored` and is not worth logging).
-  if (!resolved && stored.trim()) {
-    rememberLog(`Stored desktop profile "${stored.trim()}" no longer exists — falling back to the default profile`)
-
-    try {
-      writeActiveDesktopProfile(null)
-    } catch {
-      // Best-effort self-heal: a read-only userData dir still falls back.
-    }
-  }
-
-  return resolved
+        return parsed && typeof parsed.profile === 'string' ? parsed.profile : ''
+      } catch {
+        // Missing or malformed → no preference.
+        return ''
+      }
+    },
+    isValidProfileName: key => PROFILE_NAME_RE.test(key),
+    profileDirectoryExists: key => directoryExists(path.join(HERMES_HOME, 'profiles', key)),
+    clearStoredProfile: () => void writeActiveDesktopProfile(null),
+    rememberLog
+  })
 }
 
 function writeActiveDesktopProfile(name) {
@@ -11704,263 +11260,28 @@ function broadcastConnectionsChanged(payload: { connectionId: string; reason: 'r
   }
 }
 
-// ── Dev: main-process bundle staleness ──────────────────────────────────────
-// The renderer hot-reloads through Vite, but Electron cannot hot-swap an
-// already-evaluated main process — an electron/ edit only lands on restart.
-// Rather than restarting under the user (which would destroy whatever they were
-// mid-way through), watch the built bundle and let the renderer offer an
-// explicit "Restart to apply". Dev-only: a packaged build never watches and the
-// renderer's affordance stays hidden, so release users see nothing.
-const DEV_MAIN_BUNDLE = path.join(APP_ROOT, 'dist', 'electron-main.mjs')
-const DEV_PRELOAD_BUNDLE = path.join(APP_ROOT, 'dist', 'electron-preload.js')
-
-// Sentinel exit code meaning "the dev watcher should respawn me", as opposed to
-// a real quit. Must match the value in scripts/dev-electron-watch.mjs.
-const DEV_RESTART_EXIT_CODE = 86
-
-let devMainBundleStale = false
-let devBundleWatchers: fs.FSWatcher[] = []
-
-function broadcastDevBundleStale() {
-  for (const win of BrowserWindow.getAllWindows()) {
-    const { webContents } = win
-
-    if (webContents && !webContents.isDestroyed()) {
-      webContents.send('hermes:dev:main-bundle-stale', { stale: devMainBundleStale })
-    }
+// ── Dev: main/backend staleness watchers ────────────────────────────────────
+// Dev-only "restart to apply" affordances for the Electron main-process
+// bundle and the backend Python source. The watchers, IPC handlers, and
+// lifecycle wiring live in the fork module — see fork/dev-restart-watch.ts
+// for the full rationale.
+// >>> FORK ANCHOR: dev-restart-watch <<<
+const devRestartWatch = registerDevRestartWatch({
+  appRoot: APP_ROOT,
+  isPackaged: IS_PACKAGED,
+  devServer: DEV_SERVER,
+  sourceRepoRoot: SOURCE_REPO_ROOT,
+  env: process.env,
+  app,
+  ipcMain,
+  getAllWindows: () => BrowserWindow.getAllWindows(),
+  isHermesSourceRoot,
+  directoryExists,
+  primaryBackendIsRemote: () => primaryBackendIsRemote(),
+  teardownPrimaryBackend: async () => {
+    await teardownPrimaryBackendAndWait({ soft: true })
+    sendConnectionApplied()
   }
-}
-
-function watchDevMainBundle() {
-  if (IS_PACKAGED || !DEV_SERVER) {
-    return
-  }
-
-  // Signature at boot: anything different later is a rebuild we are not running.
-  const signature = target => {
-    try {
-      const stat = fs.statSync(target)
-
-      return `${stat.size}:${stat.mtimeMs}`
-    } catch {
-      return ''
-    }
-  }
-
-  for (const target of [DEV_MAIN_BUNDLE, DEV_PRELOAD_BUNDLE]) {
-    const original = signature(target)
-
-    if (!original) {
-      continue
-    }
-
-    try {
-      // Debounced: esbuild writes in bursts, and a rebuild can touch both
-      // bundles. Once stale we stay stale — only a restart clears it.
-      let timer: NodeJS.Timeout | null = null
-
-      const watcher = fs.watch(target, () => {
-        if (devMainBundleStale) {
-          return
-        }
-
-        if (timer) {
-          clearTimeout(timer)
-        }
-
-        timer = setTimeout(() => {
-          if (!devMainBundleStale && signature(target) !== original) {
-            devMainBundleStale = true
-            console.log('[hermes] main-process bundle changed on disk — restart to apply')
-            broadcastDevBundleStale()
-          }
-        }, 150)
-      })
-
-      // The try/catch around fs.watch() only guards the SYNCHRONOUS call —
-      // it does not cover the watcher's own async 'error' event (EPERM on
-      // Windows if the dist/ dir is deleted/rebuilt mid-watch, ENOENT if a
-      // build tool briefly unlinks-then-recreates the file). Unhandled,
-      // that throws and crashes the main process same as any other
-      // fs.watch() site; dev-only doesn't make it safe to skip.
-      guardWatcherErrors(watcher, error => {
-        if (timer) {
-          clearTimeout(timer)
-          timer = null
-        }
-
-        devBundleWatchers = devBundleWatchers.filter(w => w !== watcher)
-        console.log(
-          `[hermes] dev bundle watcher error on ${target}: ${error instanceof Error ? error.message : error}`
-        )
-      })
-
-      devBundleWatchers.push(watcher)
-    } catch {
-      // Watching is a convenience; a platform that refuses it must not break dev.
-    }
-  }
-}
-
-app.on('before-quit', () => {
-  for (const watcher of devBundleWatchers) {
-    try {
-      watcher.close()
-    } catch {
-      void 0
-    }
-  }
-
-  devBundleWatchers = []
-})
-
-ipcMain.handle('hermes:dev:main-bundle-stale', async () => ({
-  stale: devMainBundleStale,
-  // The renderer must not render a restart affordance in a packaged build.
-  supported: !IS_PACKAGED && Boolean(DEV_SERVER)
-}))
-
-ipcMain.handle('hermes:dev:restart', async () => {
-  if (IS_PACKAGED) {
-    return { ok: false, reason: 'not-a-dev-build' }
-  }
-
-  // Exit with a sentinel code and let the DEV WATCHER respawn us.
-  //
-  // app.relaunch() is wrong here: it exits 0, which is indistinguishable from a
-  // real quit, so the watcher tears itself down (and `concurrently -k` kills
-  // Vite with it) while the relaunched window loads a dev server that no longer
-  // exists — a permanent blank screen. Handing the restart to the supervisor
-  // that owns the process keeps Vite up and the new window attached.
-  //
-  // Without a watcher (plain `npm run dev`), nothing respawns us, so fall back
-  // to relaunch there.
-  if (process.env.HERMES_DEV_WATCH === '1') {
-    app.exit(DEV_RESTART_EXIT_CODE)
-
-    return { ok: true }
-  }
-
-  app.relaunch()
-  app.exit(0)
-
-  return { ok: true }
-})
-
-// ── Dev: backend Python source staleness (Phase 2.9) ────────────────────────
-// Sibling to the main-process bundle watcher above and to dev-electron-watch.mjs:
-// the renderer hot-reloads via Vite and Electron's main process gets the
-// "Restart to apply" affordance above, but nothing previously covered a
-// backend Python edit under a running `hermes serve` child — the process keeps
-// serving pre-edit code while both other layers look current. Reuses the exact
-// same "watch, mark stale, let the renderer offer a restart" shape rather than
-// inventing a new one. See dev-backend-watch.ts for the pure filtering/state
-// logic this wires up.
-const devBackendStaleTracker = createDevBackendStaleTracker()
-let devBackendPythonWatchers: fs.FSWatcher[] = []
-
-function broadcastDevBackendStale() {
-  const stale = devBackendStaleTracker.state()
-
-  for (const win of BrowserWindow.getAllWindows()) {
-    const { webContents } = win
-
-    if (webContents && !webContents.isDestroyed()) {
-      webContents.send('hermes:dev:backend-stale', { state: stale })
-    }
-  }
-}
-
-// Only meaningful when the desktop actually spawns the backend FROM this
-// source checkout (dev, local primary) — same precondition the main-process
-// bundle watcher and the dev-source backend resolution branch (~L4574) share.
-// A packaged build, or a desktop pointed at a remote/pool backend, has no
-// local `serve` process whose staleness this could describe.
-function watchDevBackendPython() {
-  if (IS_PACKAGED || !DEV_SERVER || !isHermesSourceRoot(SOURCE_REPO_ROOT)) {
-    return
-  }
-
-  for (const dir of DEV_BACKEND_WATCH_DIRS) {
-    const target = path.join(SOURCE_REPO_ROOT, dir)
-
-    if (!directoryExists(target)) {
-      continue
-    }
-
-    try {
-      const watcher = fs.watch(target, { recursive: true }, (_eventType, filename) => {
-        if (!isRelevantBackendPythonChange(filename ? String(filename) : null)) {
-          return
-        }
-
-        if (devBackendStaleTracker.markStale()) {
-          // Log-message text only (dev-only console.log), not a real fs
-          // join — no functional effect from the missing separator
-          // normalization on any OS.
-          console.log(
-            `[hermes] backend Python source changed on disk (${dir}/${filename}) — restart backend to apply` // windows-footgun: ok — dev-only console.log text, not an fs path
-          )
-          broadcastDevBackendStale()
-        }
-      })
-
-      devBackendPythonWatchers.push(watcher)
-    } catch (error) {
-      // Recursive fs.watch is unsupported on some Linux configurations
-      // (inotify-backed, no native recursive support pre-Node 22-on-Linux
-      // parity). Watching is a convenience; a platform that refuses it must
-      // not break dev — the affordance simply never lights up there.
-      console.warn(`[hermes] backend Python watch unavailable for ${dir}: ${error?.message || error}`)
-    }
-  }
-}
-
-app.on('before-quit', () => {
-  for (const watcher of devBackendPythonWatchers) {
-    try {
-      watcher.close()
-    } catch {
-      void 0
-    }
-  }
-
-  devBackendPythonWatchers = []
-})
-
-ipcMain.handle('hermes:dev:backend-stale', async () => ({
-  state: devBackendStaleTracker.state(),
-  // The renderer must never render this in a packaged build, and a remote
-  // primary backend isn't this process's to restart.
-  supported: shouldSupportDevBackendRestart({
-    isPackaged: IS_PACKAGED,
-    devServer: DEV_SERVER,
-    primaryIsRemote: primaryBackendIsRemote()
-  })
-}))
-
-ipcMain.handle('hermes:dev:backend-restart', async () => {
-  if (IS_PACKAGED) {
-    return { ok: false, reason: 'not-a-dev-build' }
-  }
-
-  // Offer, don't act: this handler only ever runs in response to the
-  // renderer's explicit IPC call, itself only reachable from the user
-  // clicking the statusbar affordance — never from the watcher above, which
-  // only marks state. Restart-in-place reuses the same soft primary teardown
-  // + "connection applied" signal connection-config/profile-switch already
-  // use (rehomePrimaryConnection / teardownPrimaryBackendAndWait +
-  // sendConnectionApplied), so the renderer's existing softSwitch() listener
-  // (desktop.onConnectionApplied) re-dials and restores connection, active
-  // profile, and session view — no bespoke re-home logic needed here.
-  return performDevBackendRestart({
-    tracker: devBackendStaleTracker,
-    teardownPrimaryBackend: async () => {
-      await teardownPrimaryBackendAndWait({ soft: true })
-      sendConnectionApplied()
-    },
-    notifyStateChanged: broadcastDevBackendStale
-  })
 })
 
 async function waitForBackendExit(child, timeoutMs = 5000) {
@@ -17535,24 +16856,13 @@ ipcMain.handle('hermes:readFileDataUrlForAttach', async (_event, filePath) => {
   })
 })
 
-// Chunked attachment transport: the renderer drives repeated calls at
-// increasing `offset` and concatenates the returned base64 strings itself,
-// so at no point does main hold the whole file (or its base64 expansion) in
-// one Buffer/string, and no single IPC reply exceeds ATTACHMENT_CHUNK_BYTES
-// (~8 MiB raw, ~11 MiB base64) regardless of how large the source file is.
-// Same total-size cap and path hardening as the whole-file reader; only the
-// transport shape changes.
-ipcMain.handle('hermes:readFileChunkForAttach', async (_event, filePath, offset) => {
-  return readFileChunkForIpc(
-    filePath,
-    {
-      maxBytes: ATTACHMENT_UPLOAD_DEFAULT_MAX_BYTES,
-      mimeType: mimeTypeForPath(resolveRequestedPathForIpc(filePath, { purpose: 'Attachment upload' })),
-      purpose: 'Attachment upload'
-    },
-    Number(offset) || 0,
-    ATTACHMENT_CHUNK_BYTES
-  )
+// Chunked attachment transport — bounded per-chunk IPC replies instead of a
+// whole-file base64 string; implementation and rationale in the fork module.
+// >>> FORK ANCHOR: attachment-stream-ipc <<<
+registerAttachmentStreamIpc({
+  ipcMain,
+  resolveRequestedPath: (filePath, options) => resolveRequestedPathForIpc(filePath, options),
+  mimeTypeForPath
 })
 
 ipcMain.handle('hermes:readFileText', async (_event, filePath) => {
@@ -18834,11 +18144,11 @@ app.whenReady().then(() => {
 
   // Dev only: notice when the main-process bundle is rebuilt underneath us so
   // the renderer can offer an explicit restart.
-  watchDevMainBundle()
+  devRestartWatch.watchDevMainBundle()
   // Dev only: same courtesy for backend Python source (Phase 2.9) — the
   // running `hermes serve` child has already imported agent/ tui_gateway/
   // tools/ hermes_cli/, so an edit there needs the same explicit offer.
-  watchDevBackendPython()
+  devRestartWatch.watchDevBackendPython()
 
   // Win/Linux cold start: the launching hermes:// URL is in our own argv.
   const _coldStartLink = _extractDeepLink(process.argv)
