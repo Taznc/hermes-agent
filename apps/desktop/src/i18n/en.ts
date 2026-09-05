@@ -42,7 +42,8 @@ export const en: Translations = {
     update: 'Update',
     tryHint: term => `Try “${term}”`,
     on: 'On',
-    off: 'Off'
+    off: 'Off',
+    undo: 'Undo'
   },
 
   fileMenu: {
@@ -2472,6 +2473,7 @@ export const en: Translations = {
       openInSplit: 'Open in split',
       copyIdFailed: 'Could not copy session ID',
       sessionActions: 'Session actions',
+      archiveSession: 'Archive session',
       sessionRunning: 'Session running',
       needsInput: 'Needs your input',
       waitingForAnswer: 'Waiting for your answer',
@@ -3696,6 +3698,8 @@ export const en: Translations = {
     deleteFailed: 'Delete failed',
     archived: 'Archived',
     archiveFailed: 'Archive failed',
+    archivedUndoMessage: 'Session archived',
+    undoArchiveFailed: 'Undo failed',
     cwdChangeFailed: 'Working directory change failed',
     cwdStagedTitle: 'Working directory staged',
     cwdStagedMessage: 'Restart the desktop backend to apply cwd changes to this active session.',

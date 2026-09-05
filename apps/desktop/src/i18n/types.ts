@@ -91,6 +91,7 @@ export interface Translations {
     tryHint: (term: string) => string
     on: string
     off: string
+    undo: string
   }
 
   fileMenu: {
@@ -2113,6 +2114,10 @@ export interface Translations {
       openInSplit: string
       copyIdFailed: string
       sessionActions: string
+      /** Accessible name for the always-in-flow row-level archive icon button
+       *  (distinct from the kebab menu's `archive` label — this is the direct
+       *  one-click affordance on the row itself). */
+      archiveSession: string
       sessionRunning: string
       needsInput: string
       waitingForAnswer: string
@@ -3209,6 +3214,8 @@ export interface Translations {
     deleteFailed: string
     archived: string
     archiveFailed: string
+    archivedUndoMessage: string
+    undoArchiveFailed: string
     cwdChangeFailed: string
     cwdStagedTitle: string
     cwdStagedMessage: string
