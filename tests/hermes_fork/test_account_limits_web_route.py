@@ -4,7 +4,7 @@ import asyncio
 from datetime import datetime, timezone
 
 from agent.account_usage import AccountUsageSnapshot
-from hermes_cli.web_routers import analytics as web_server
+from hermes_fork.account_limits import routes as web_server
 
 
 def test_account_limits_route_uses_worker_and_serializes_safe_accounts(monkeypatch):

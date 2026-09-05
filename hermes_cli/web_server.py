@@ -964,6 +964,9 @@ app.include_router(_tools_routes.router)
 app.include_router(_analytics_routes.router)
 app.include_router(_chat_ws_routes.router)
 app.include_router(_dashboard_ui_routes.router)
+# >>> FORK ANCHOR: account-limits-route <<<
+from hermes_fork.account_limits.routes import router as _fork_account_limits_router  # noqa: E402
+app.include_router(_fork_account_limits_router)
 
 # Plugin API routes and the dashboard auth routes (/login, /auth/*, /api/auth/*)
 # mount before the SPA catch-all so /{full_path:path} doesn't swallow them. Auth
@@ -1605,7 +1608,8 @@ _PLUGIN_COMPAT_LAZY = {
     'fs_read_text': ('hermes_cli.web_routers.files', 'fs_read_text'),
     'fs_write_text': ('hermes_cli.web_routers.files', 'fs_write_text'),
     'gateway_drain': ('hermes_cli.web_routers.actions', 'gateway_drain'),
-    'get_account_limits': ('hermes_cli.web_routers.analytics', 'get_account_limits'),
+    # >>> FORK ANCHOR: account-limits-compat <<<
+    'get_account_limits': ('hermes_fork.account_limits.routes', 'get_account_limits'),
     'gateway_ws': ('hermes_cli.web_routers.chat_ws', 'gateway_ws'),
     'get_action_status': ('hermes_cli.web_routers.actions', 'get_action_status'),
     'get_active_profile_endpoint': ('hermes_cli.web_routers.profiles', 'get_active_profile_endpoint'),
