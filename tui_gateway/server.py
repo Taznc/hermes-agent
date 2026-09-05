@@ -100,13 +100,6 @@ _cfg_cache: dict | None = None
 _cfg_mtime: float | None = None
 _cfg_path = None
 _session_resume_lock = threading.Lock()
-# Chunked desktop file-attach staging (file.attach_open/_chunk/_commit): each entry is one
-# in-progress upload's temp-file path + bookkeeping, keyed by a random upload_id. Guards two racing
-# chunk appends for the same upload; does NOT hold an OS handle open across RPC round-trips (each
-# chunk append opens/writes/closes), so an abandoned upload leaks only its temp file, which
-# _reap_stale_pending_uploads sweeps. Helpers live in prompt_attachments.py.
-_pending_uploads_lock = threading.Lock()
-_pending_uploads: dict[str, dict] = {}
 _SLASH_WORKER_TIMEOUT_S = max(5.0, env_float("HERMES_TUI_SLASH_TIMEOUT_S", 45.0))
 
 def _ws_orphan_setting(env_var: str, cfg_key: str, default: float) -> float:
@@ -174,9 +167,6 @@ _LONG_HANDLERS = frozenset({
     "profiles.list", "profiles.set_asset", "bot_relay.roster.sync", "bot_relay.outbox.drain",
     "bot_relay.deliver", "bot_relay.reply", "image.generate", "projects.discover_repos",
     "projects.record_repos", "projects.for_cwd", "projects.tree", "projects.project_sessions",
-    # projects.scan_repos walks this backend's own disk (bounded, but thousands of stat calls on a
-    # cold FS); account_limits.get makes synchronous provider HTTP requests — never on the WS reader.
-    "projects.scan_repos", "account_limits.get",
     "setup.runtime_check", "setup.status", "voice.toggle", "voice.record", "voice.tts", "wake.start",
     "wake.status", "session.active_list", "session.branch", "session.compress", "session.list",
     "session.resume", "session.workspace.move", "shell.exec", "skills.manage", "slash.exec",
@@ -3255,7 +3245,7 @@ from . import (  # noqa: E402
     methods_config_set as _methods_config_set, methods_images as _methods_images,
     methods_profiles as _methods_profiles, methods_prompt as _methods_prompt, methods_session as _methods_session,
     methods_tools as _methods_tools, prompt_turn as _prompt_turn, billing_view as _billing_view,
-    methods_projects as _methods_projects, methods_account_limits as _methods_account_limits)
+    methods_projects as _methods_projects)
 
 for _m in (
     _session_reaper, _session_lifecycle, _session_workdir, _compute_host_bridge, _model_switch,
@@ -3264,6 +3254,10 @@ for _m in (
     _methods_complete_helpers, _methods_slash, _methods_voice, _methods_browser,
     _methods_browser_control, _methods_session, _methods_prompt, _methods_config,
     _methods_config_set, _methods_complete, _methods_tools, _methods_profiles, _methods_images,
-    _methods_bot_relay, _prompt_turn, _billing_view, _methods_projects, _methods_account_limits):
+    _methods_bot_relay, _prompt_turn, _billing_view, _methods_projects):
     _m.register(sys.modules[__name__])
 del _m
+
+# >>> FORK ANCHOR: gateway-fork-methods <<<
+from hermes_fork.gateway import register_fork_gateway_methods as _register_fork_gateway_methods  # noqa: E402
+_register_fork_gateway_methods(sys.modules[__name__])

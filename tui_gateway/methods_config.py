@@ -74,37 +74,6 @@ def _(rid, params: dict) -> dict:
         return _ok(rid, {"repos": repos, "accepted": accepted, "discovery_policy": policy})
 
 
-@_projects_handler("projects.scan_repos")
-def _(rid, params: dict) -> dict:
-    """Walk THIS backend's own filesystem for git repos (``tui_gateway.repo_scan``), persist, and
-    return the merged repo list — the server-side sibling of ``projects.record_repos`` for remote
-    gateways whose Projects sidebar the desktop's local crawl can never populate. The policy is
-    resolved server-side (the roots are this machine's); an optional ``discovery_policy`` param is
-    only a staleness check — a mismatch refuses the scan rather than persisting a stale result."""
-    from hermes_cli import projects_db as pdb
-    from .repo_scan import scan_repos_on_disk
-    policy = _repo_discovery_policy()
-    policy_key = _repo_discovery_policy_key(policy)
-    incoming = params.get("discovery_policy")
-    # No policy sent means "use whatever this backend is configured for" — the honest default for
-    # a remote scan, since the client cannot know the remote machine's roots.
-    policy_matches = (not isinstance(incoming, dict)
-                      or _repo_discovery_policy_key(_repo_discovery_policy(incoming)) == policy_key)
-    accepted = bool(policy["enabled"] and policy_matches)
-    pairs: list[tuple[str, str | None]] = []
-    if accepted:  # a disabled policy must not touch the filesystem at all
-        pairs = [(root, label) for root, label in scan_repos_on_disk(policy) if not _is_repo_junk(root)]
-    with pdb.connect_closing() as conn:
-        _reconcile_repo_discovery(pdb, conn, policy, policy_key)
-        if accepted:
-            pdb.record_discovered_repos(conn, pairs, replace=True, policy_key=policy_key)
-        elif not policy["enabled"]:
-            pdb.clear_discovered_repos(conn, policy_key=policy_key)
-    with _profile_db(params) as db:
-        repos = [] if db is None else _discover_repos_payload(db, include_cached=policy["enabled"])
-        return _ok(rid, {"repos": repos, "accepted": accepted, "discovery_policy": policy})
-
-
 def _stamped_project_tree(db, params, **kwargs):
     """``_build_project_tree`` + profile stamping shared by the two tree RPCs."""
     from tui_gateway.project_tree import stamp_profile
