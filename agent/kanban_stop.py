@@ -1,7 +1,9 @@
-"""Turn-end guard for kanban workers, which must end with ``kanban_complete`` or
-``kanban_block``. Some models narrate the next step and stop with no tool calls;
-Hermes treats that as a clean exit → ``rc=0`` → dispatcher ``protocol_violation``.
-Policy-only: return a bounded synthetic nudge so the loop continues instead of exiting.
+"""Turn-end guard for kanban workers, which must end with a *board-terminal*
+tool: ``kanban_complete``, ``kanban_block``, ``kanban_request_review``, or
+``kanban_request_changes``. Some models narrate the next step and stop with no
+tool calls; Hermes treats that as a clean exit → ``rc=0`` → dispatcher
+``protocol_violation``. Policy-only: return a bounded synthetic nudge so the
+loop continues instead of exiting.
 """
 
 from __future__ import annotations
@@ -10,7 +12,18 @@ import os
 from typing import Any, Iterable, Optional
 
 
-_TERMINAL_KANBAN_TOOLS = frozenset({"kanban_complete", "kanban_block"})
+# Board-terminal tools: calling any of these ends the worker's run cleanly.
+# kanban_request_review (implementer -> review) and kanban_request_changes
+# (reviewer -> implementer) are handoffs, not blockers, but they close the
+# CURRENT run exactly like complete/block do — a session that already called
+# one looks identical, from the stop guard's point of view, to one that
+# called kanban_complete.
+_TERMINAL_KANBAN_TOOLS = frozenset({
+    "kanban_complete",
+    "kanban_block",
+    "kanban_request_review",
+    "kanban_request_changes",
+})
 
 _DEFAULT_MAX_ATTEMPTS = 2
 
@@ -66,11 +79,14 @@ def build_kanban_stop_nudge(
         "terminal state for the board.\n\n"
         f"Task `{tid}` is still `running`. Ending now without a board tool "
         "causes a protocol violation (clean exit with no "
-        "`kanban_complete` / `kanban_block`).\n\n"
+        "`kanban_complete` / `kanban_block` / `kanban_request_review` / "
+        "`kanban_request_changes`).\n\n"
         "Do this immediately in your next response — do not narrate intent:\n"
         "1. Finish any remaining deliverable (write the required file(s) now).\n"
-        "2. Call `kanban_complete(summary=..., artifacts=[...])` if the work "
-        "is done, OR `kanban_block(reason=...)` if you are blocked.\n\n"
+        "2. Call `kanban_complete(summary=..., artifacts=[...])` if the work is "
+        "done, `kanban_block(reason=...)` if you are blocked, "
+        "`kanban_request_review(summary=...)` to hand off for review, or "
+        "`kanban_request_changes(reason=...)` if you are a reviewer sending work back.\n\n"
         "Never end a turn with only a promise of future action. Repeated "
         "protocol violations will block this task and require manual intervention.]"
     )
