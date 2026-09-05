@@ -276,6 +276,42 @@ def _stop_systemd_unit(unit_name: str) -> bool:
         return False
 
 
+def scope_unit_show_properties(unit_name: str) -> Optional[Dict[str, str]]:
+    """``systemctl --user show <unit_name> -p ExecMainStatus -p ExecMainCode -p ActiveState``.
+
+    Returns a ``{"ExecMainStatus": ..., "ExecMainCode": ..., "ActiveState": ...}`` dict of
+    raw string values, or ``None`` if ``systemctl`` is unavailable, the unit is unknown (already
+    ``--collect``-cleaned — the caller must read this promptly, before the transient scope
+    auto-removes itself), or the query otherwise failed. Best-effort, bounded timeout; never
+    raises. See hermes-workers.slice spec §1.
+    """
+    import shutil
+
+    binary = shutil.which("systemctl")
+    if binary is None:
+        return None
+    try:
+        result = subprocess.run(
+            [
+                binary, "--user", "show", unit_name,
+                "-p", "ExecMainStatus", "-p", "ExecMainCode", "-p", "ActiveState",
+            ],
+            capture_output=True, timeout=10, stdin=subprocess.DEVNULL,
+        )
+        if result.returncode != 0:
+            return None
+        out: Dict[str, str] = {}
+        for line in (result.stdout or b"").decode(errors="replace").splitlines():
+            if "=" not in line:
+                continue
+            key, _, value = line.partition("=")
+            out[key.strip()] = value.strip()
+        return out or None
+    except Exception as exc:
+        logger.debug("systemctl --user show %s failed: %s", unit_name, exc)
+        return None
+
+
 def format_uptime_short(seconds: int) -> str:
     s = max(0, int(seconds))
     if s < 60:
