@@ -159,6 +159,10 @@ export function TaskDrawer({
 
   const task = detail?.task
   const running = task?.status === 'running'
+  // The task's liveness fields summarize the card; the active attempt's own
+  // timestamp lives in the run collection and is the only honest run clock
+  // after retries or review/rework cycles.
+  const currentRun = running ? detail?.runs.find(run => run.status === 'running') : undefined
   const defaultAssignee = useDefaultAssignee()
 
   // "Show more" widens the requested tail instead of leaving a bare `...]` —
@@ -494,6 +498,12 @@ export function TaskDrawer({
                     </MetaRow>
                     {task.created_by && <MetaRow label={k.metaCreatedBy}>{task.created_by}</MetaRow>}
                     {ago(task.created_at) && <MetaRow label={k.metaCreated}>{ago(task.created_at)}</MetaRow>}
+                    {currentRun?.started_at && ago(currentRun.started_at) && (
+                      <MetaRow label={k.metaRunStarted}>{ago(currentRun.started_at)}</MetaRow>
+                    )}
+                    {running && detail.runs.length > 1 && (
+                      <MetaRow label={k.metaRun}>{k.metaRunCount(detail.runs.length)}</MetaRow>
+                    )}
                     {running && task.worker_pid ? <MetaRow label={k.metaWorkerPid}>{task.worker_pid}</MetaRow> : null}
                   </div>
                 </div>

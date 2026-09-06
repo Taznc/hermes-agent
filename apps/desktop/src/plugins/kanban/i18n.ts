@@ -149,6 +149,9 @@ type KanbanMessages = {
   metaTenant: string
   metaCreatedBy: string
   metaCreated: string
+  metaRun: string
+  metaRunStarted: string
+  metaRunCount: (n: number) => string
   metaWorkerPid: string
   readyUnassignedTitle: string
   readyUnassignedBody: string
@@ -482,6 +485,9 @@ export const en: KanbanMessages = {
   metaTenant: 'Tenant',
   metaCreatedBy: 'Created by',
   metaCreated: 'Created',
+  metaRun: 'Run',
+  metaRunStarted: 'Run started',
+  metaRunCount: n => `${n} of ${n}`,
   metaWorkerPid: 'Worker pid',
   readyUnassignedTitle: 'Ready, but unassigned — this card will never run.',
   readyUnassignedBody:
@@ -799,6 +805,9 @@ const ja: KanbanMessages = {
   metaTenant: 'テナント',
   metaCreatedBy: '作成者',
   metaCreated: '作成',
+  metaRun: '実行',
+  metaRunStarted: '実行開始',
+  metaRunCount: n => `${n} / ${n}`,
   metaWorkerPid: 'ワーカー PID',
   readyUnassignedTitle: 'Ready ですが未割り当て — このカードは実行されません。',
   readyUnassignedBody:
@@ -1114,6 +1123,9 @@ const zh: KanbanMessages = {
   metaTenant: '租户',
   metaCreatedBy: '创建者',
   metaCreated: '创建于',
+  metaRun: '运行',
+  metaRunStarted: '本次运行开始',
+  metaRunCount: n => `第 ${n} 次（共 ${n} 次）`,
   metaWorkerPid: '工作单元 PID',
   readyUnassignedTitle: '就绪但未分配 — 这张卡片永远不会运行。',
   readyUnassignedBody:
@@ -1426,6 +1438,9 @@ const zhHant: KanbanMessages = {
   metaTenant: '租戶',
   metaCreatedBy: '建立者',
   metaCreated: '建立於',
+  metaRun: '執行',
+  metaRunStarted: '本次執行開始',
+  metaRunCount: n => `第 ${n} 次（共 ${n} 次）`,
   metaWorkerPid: '工作單元 PID',
   readyUnassignedTitle: '就緒但未指派 — 這張卡片永遠不會執行。',
   readyUnassignedBody:
