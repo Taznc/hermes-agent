@@ -2635,9 +2635,15 @@ def run_daemon(
 
     Calls :func:`dispatch_once` every ``interval`` seconds; exits cleanly on
     SIGINT / SIGTERM so it is systemd-friendly. ``stop_event`` and ``on_tick``
-    are test hooks. Each tick resolves ``kanban.max_in_progress`` exactly like
-    the gateway dispatcher and ``hermes kanban dispatch`` — the standalone
-    daemon must not be the one uncapped entry point.
+    are test hooks.
+
+    Each tick resolves the caps through :func:`resolve_dispatch_caps`, the same
+    helper the gateway tick, ``hermes kanban dispatch`` and the dashboard nudge
+    use. Resolving only ``max_in_progress`` here (as this loop used to) left
+    ``max_in_progress_per_profile`` as ``None``, and ``dispatch_once`` reads an
+    omitted cap as *unlimited* — so the standalone daemon could hand one
+    profile its entire backlog while every other entry point held it to the
+    configured per-profile limit. The caps bound the HOST, not an entry point.
     """
     import threading
 
@@ -2660,12 +2666,14 @@ def run_daemon(
         try:
             # Re-resolved every tick (config load is mtime-cached) so operator
             # edits apply without a restart.
-            max_in_progress = resolve_max_in_progress(configured_max_in_progress())
+            caps = resolve_dispatch_caps()
             with contextlib.closing(_kbc.connect()) as conn:
                 res = dispatch_once(
                     conn,
-                    max_spawn=max_spawn,
-                    max_in_progress=max_in_progress,
+                    max_spawn=max_spawn if max_spawn is not None else caps.max_spawn,
+                    max_in_progress=caps.max_in_progress,
+                    max_in_progress_per_profile=caps.max_in_progress_per_profile,
+                    default_assignee=caps.default_assignee,
                     failure_limit=failure_limit,
                 )
             if on_tick is not None:

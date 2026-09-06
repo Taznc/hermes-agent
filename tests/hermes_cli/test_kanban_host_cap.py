@@ -48,6 +48,19 @@ def _fake_spawn_factory(spawns: list):
     return fake_spawn
 
 
+def _set_kanban_config(monkeypatch, kanban: dict) -> None:
+    """Drive the caps through the real config loader.
+
+    Entry points resolve caps via ``resolve_dispatch_caps``, which reads
+    ``hermes_cli.config.load_config``. Patching config (what the operator
+    writes) rather than an internal reader keeps these tests contracts about
+    configured behaviour instead of about the current call chain.
+    """
+    import hermes_cli.config as cfgmod
+
+    monkeypatch.setattr(cfgmod, "load_config", lambda *a, **k: {"kanban": dict(kanban)})
+
+
 # ---------------------------------------------------------------------------
 # 1. Standalone daemon resolves max_in_progress (P1a)
 # ---------------------------------------------------------------------------
@@ -73,7 +86,7 @@ def test_run_daemon_resolves_and_passes_max_in_progress(
 
     monkeypatch.setattr(kbd, "dispatch_once", fake_dispatch_once)
     # No explicit config → the derived default must flow through.
-    monkeypatch.setattr(kbd, "configured_max_in_progress", lambda: None)
+    _set_kanban_config(monkeypatch, {})
     monkeypatch.setattr(kbd, "derive_default_max_in_progress", lambda sample=None: 3)
 
     def on_tick(res):
@@ -85,6 +98,12 @@ def test_run_daemon_resolves_and_passes_max_in_progress(
 
 
 def test_run_daemon_explicit_config_wins(kanban_home, monkeypatch):
+    """Explicit ``kanban.max_in_progress`` beats the memory-derived default.
+
+    Driven through real config rather than by patching the internal reader:
+    the contract is "what the operator configured is what dispatch_once gets",
+    which must hold regardless of which helper the daemon resolves it with.
+    """
     captured: dict = {}
     stop = threading.Event()
 
@@ -93,7 +112,7 @@ def test_run_daemon_explicit_config_wins(kanban_home, monkeypatch):
         return kb.DispatchResult()
 
     monkeypatch.setattr(kbd, "dispatch_once", fake_dispatch_once)
-    monkeypatch.setattr(kbd, "configured_max_in_progress", lambda: 7)
+    _set_kanban_config(monkeypatch, {"max_in_progress": 7})
     monkeypatch.setattr(
         kbd, "derive_default_max_in_progress",
         lambda sample=None: pytest.fail("derived default must not be consulted"),
@@ -105,6 +124,69 @@ def test_run_daemon_explicit_config_wins(kanban_home, monkeypatch):
     kbd.run_daemon(interval=0.01, stop_event=stop, on_tick=on_tick)
 
     assert captured.get("max_in_progress") == 7
+
+
+def test_run_daemon_honours_per_profile_cap(kanban_home, monkeypatch):
+    """The daemon must forward ``max_in_progress_per_profile`` too.
+
+    ``dispatch_once`` treats an omitted cap as *unlimited*, so a daemon that
+    resolves only the global cap hands one profile its whole backlog while the
+    gateway tick, ``hermes kanban dispatch`` and the dashboard nudge all hold
+    it to the configured per-profile limit. The caps bound the host, not an
+    entry point, so every entry point must resolve the same set.
+    """
+    captured: dict = {}
+    stop = threading.Event()
+
+    def fake_dispatch_once(conn, **kwargs):
+        captured.update(kwargs)
+        return kb.DispatchResult()
+
+    monkeypatch.setattr(kbd, "dispatch_once", fake_dispatch_once)
+    _set_kanban_config(
+        monkeypatch, {"max_in_progress": 9, "max_in_progress_per_profile": 2})
+
+    def on_tick(res):
+        stop.set()
+
+    kbd.run_daemon(interval=0.01, stop_event=stop, on_tick=on_tick)
+
+    assert captured.get("max_in_progress") == 9
+    assert captured.get("max_in_progress_per_profile") == 2
+
+
+def test_run_daemon_per_profile_cap_actually_limits_spawns(
+    kanban_home, monkeypatch, all_assignees_spawnable,
+):
+    """End-to-end: with a per-profile cap of 1, a one-profile backlog of three
+    ready tasks leaves exactly one running after a tick.
+
+    Asserts the observable outcome (how many workers exist) rather than the
+    arguments passed, so it still holds if the plumbing is reshaped.
+    """
+    spawns: list = []
+    monkeypatch.setattr(kbd, "_default_spawn", _fake_spawn_factory(spawns))
+    _set_kanban_config(
+        monkeypatch, {"max_in_progress": 10, "max_in_progress_per_profile": 1})
+
+    with kbc.connect() as conn:
+        for i in range(3):
+            kb.create_task(conn, title=f"t{i}", assignee="one-profile")
+        conn.execute("UPDATE tasks SET status = 'ready'")
+        conn.commit()
+
+    stop = threading.Event()
+    kbd.run_daemon(interval=0.01, stop_event=stop,
+                   on_tick=lambda res: stop.set())
+
+    with kbc.connect() as conn:
+        running = conn.execute(
+            "SELECT COUNT(*) FROM tasks WHERE status = 'running'"
+        ).fetchone()[0]
+
+    assert running == 1, (
+        f"per-profile cap of 1 must leave 1 worker running, got {running}"
+    )
 
 
 def test_configured_max_in_progress_parsing(monkeypatch):
