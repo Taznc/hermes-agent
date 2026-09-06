@@ -324,6 +324,59 @@ def test_max_runtime_terminates_overrun_worker(kanban_home):
 
 
 
+def test_max_runtime_stops_local_worker_service_before_signalling(kanban_home, monkeypatch):
+    """An expired local transient-service worker is stopped as a cgroup first.
+
+    A foreign host's task is bookkeeping only: neither its deterministic unit
+    nor PID may be addressed by this dispatcher.
+    """
+    events: list[tuple[str, object]] = []
+    monkeypatch.setattr(kbd._kb, "_host_prefix", lambda: "local:")
+    monkeypatch.setattr(
+        "tools.process_registry._stop_systemd_unit",
+        lambda unit: events.append(("stop", unit)) or True,
+    )
+    monkeypatch.setattr(kbd._kb, "_pid_alive", lambda _pid: False)
+
+    def expired_task(conn, *, claim_lock: str, pid: int) -> tuple[str, int]:
+        tid = kb.create_task(conn, title="expired", assignee="worker", max_runtime_seconds=1)
+        claimed = kb.claim_task(conn, tid)
+        assert claimed is not None and claimed.current_run_id is not None
+        old = int(time.time()) - 30
+        with kb.write_txn(conn):
+            conn.execute(
+                "UPDATE tasks SET worker_pid = ?, claim_lock = ?, started_at = ? WHERE id = ?",
+                (pid, claim_lock, old, tid),
+            )
+            conn.execute(
+                "UPDATE task_runs SET started_at = ? WHERE id = ?",
+                (old, claimed.current_run_id),
+            )
+        return tid, claimed.current_run_id
+
+    conn = kbc.connect()
+    try:
+        local_id, local_run = expired_task(conn, claim_lock="local:dispatcher", pid=111_001)
+        foreign_id, foreign_run = expired_task(conn, claim_lock="foreign:dispatcher", pid=111_002)
+
+        assert kbd.enforce_max_runtime(
+            conn,
+            signal_fn=lambda pid, _sig: events.append(("signal", pid)),
+        ) == [local_id]
+
+        local_unit = f"hermes-worker-kanban-{local_id}-run-{local_run}.service"
+        assert events == [("stop", local_unit), ("signal", 111_001)]
+        timed_out = next(e for e in kb.list_events(conn, local_id) if e.kind == "timed_out")
+        assert timed_out.payload["systemd_unit"] == local_unit
+        assert timed_out.payload["systemd_unit_stopped"] is True
+        foreign = kb.get_task(conn, foreign_id)
+        assert foreign is not None
+        assert foreign.current_run_id == foreign_run
+        assert foreign.status == "running"
+    finally:
+        conn.close()
+
+
 # ---------------------------------------------------------------------------
 # Heartbeat (item 2 from the Multica audit)
 # ---------------------------------------------------------------------------

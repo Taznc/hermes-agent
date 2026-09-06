@@ -563,7 +563,7 @@ def enforce_max_runtime(conn: sqlite3.Connection, *, signal_fn=None) -> list[str
     host_prefix = _kb._host_prefix()
 
     rows = conn.execute(
-        "SELECT t.id, t.worker_pid, "
+        "SELECT t.id, t.worker_pid, t.current_run_id, "
         "       COALESCE(r.started_at, t.started_at) AS active_started_at, "
         "       t.max_runtime_seconds, t.claim_lock "
         "FROM tasks t "
@@ -585,17 +585,23 @@ def enforce_max_runtime(conn: sqlite3.Connection, *, signal_fn=None) -> list[str
 
         pid = int(row["worker_pid"])
         tid = row["id"]
-        # SIGTERM then SIGKILL after 5 s grace; workers wanting a cleaner
-        # shutdown install their own SIGTERM handler.
-        killed = False
-        kill = _kill_fn(signal_fn)
-        if kill is not None:
-            with contextlib.suppress(ProcessLookupError, OSError):
-                kill(pid, signal.SIGTERM)
-            # Short polling wait — no time.sleep on the write txn.
-            _poll_worker_exit(pid)
-            if _kb._pid_alive(pid):
-                killed = _sigkill(kill, pid)
+        run_id = row["current_run_id"]
+        systemd_unit = (
+            f"hermes-worker-kanban-{tid}-run-{run_id}.service"
+            if run_id is not None
+            else None
+        )
+        termination = _terminate_reclaimed_worker(
+            pid, row["claim_lock"], systemd_unit=systemd_unit, signal_fn=signal_fn
+        )
+        # Do not release an expired claim while its launcher/service cgroup is
+        # still alive: that would run a retry beside the timed-out worker.
+        if _worker_survived_termination(termination):
+            _defer_reclaim_for_live_worker(
+                conn, tid, row["claim_lock"], now, termination,
+                reason="max_runtime_worker_alive",
+            )
+            continue
 
         error = f"elapsed {int(elapsed)}s > limit {limit}s"
         with _kb.write_txn(conn):
@@ -613,9 +619,9 @@ def enforce_max_runtime(conn: sqlite3.Connection, *, signal_fn=None) -> list[str
                     "pid": pid,
                     "elapsed_seconds": int(elapsed),
                     "limit_seconds": limit,
-                    "sigkill": killed,
                     "retry_status": retry_status,
                 }
+                payload.update(termination)
                 run_id = _kb._end_run(
                     conn, tid, outcome="timed_out", status="timed_out",
                     error=error, metadata=payload,
@@ -632,7 +638,7 @@ def enforce_max_runtime(conn: sqlite3.Connection, *, signal_fn=None) -> list[str
                 outcome="timed_out",
                 release_claim=False,
                 end_run=False,
-                event_payload_extra={"pid": pid, "sigkill": killed, "retry_status": retry_status},
+                event_payload_extra={**termination, "retry_status": retry_status},
             )
     return timed_out
 
