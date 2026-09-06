@@ -29,8 +29,9 @@ import {
   useQuery,
   useValue
 } from '@hermes/plugin-sdk'
+import { useEffect } from 'react'
 
-import { $boardSlug, ALL_BOARDS, bindApi, boardKey, fetchAllBoards, fetchBoard } from './api'
+import { $boardSlug, ALL_BOARDS, bindApi, boardKey, fetchAllBoards, fetchBoard, primeAllBoardsSocket } from './api'
 import { KanbanBoardPage } from './board'
 import { KANBAN_LOCALES } from './i18n'
 import { $newTaskLane, useKanban } from './ui'
@@ -52,6 +53,14 @@ function KanbanCount() {
     queryKey: boardKey(slug, false),
     refetchInterval: 60_000
   })
+
+  // Idempotent per All-Boards selection (see api.ts) — safe alongside board.tsx's own call
+  // since only whichever mounts first actually opens the socket.
+  useEffect(() => {
+    if (isAllBoards && board?.cursors) {
+      primeAllBoardsSocket(board.cursors)
+    }
+  }, [isAllBoards, board?.cursors])
 
   if (!board) {
     return null

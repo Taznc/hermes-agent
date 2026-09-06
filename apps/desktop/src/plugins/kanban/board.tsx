@@ -84,6 +84,7 @@ import {
   fetchBoards,
   fetchProfiles,
   patchTask,
+  primeAllBoardsSocket,
   PROFILES_KEY,
   stageAttachment
 } from './api'
@@ -1802,13 +1803,23 @@ export function KanbanBoardPage() {
   const [archived, setArchived] = useState(false)
 
   // Live updates ride the events socket (bindApi) in single-board mode; the
-  // consolidated view has no live fan-out yet (a named follow-on card) so it
-  // relies solely on this poll. Either way this interval is the fallback.
+  // consolidated view rides the multi-board `boards=*` socket instead (primed below, once
+  // per All-Boards selection, from THIS query's own `cursors` map — no gap, no replay).
+  // Either way this interval is the fallback for a dropped/reconnecting socket.
   const { data: board, error } = useQuery({
     queryFn: () => (isAllBoards ? fetchAllBoards(archived) : fetchBoard(archived)),
     queryKey: boardKey(slug, archived),
     refetchInterval: 60_000
   })
+
+  // Prime the multi-board socket from this fetch's cursors the first time All Boards mode
+  // loads data — `primeAllBoardsSocket` no-ops on every call after the first (per selection),
+  // so this is safe to run on every render/refetch.
+  useEffect(() => {
+    if (isAllBoards && board?.cursors) {
+      primeAllBoardsSocket(board.cursors)
+    }
+  }, [isAllBoards, board?.cursors])
 
   // Per-board display chrome for the consolidated view — badge tint/icon and
   // the filter chip row. Empty outside All Boards mode (board?.boards is only
