@@ -702,9 +702,9 @@ def connect(db_path: Optional[Path] = None, *, board: Optional[str] = None) -> s
     """Open (and initialize if needed) the kanban DB. WAL is (re)enabled on
     every connection so a re-created file stays robust; the first connection
     per path auto-runs :func:`init_db`, later ones skip via
-    ``_INITIALIZED_PATHS``. Path: explicit ``db_path``, else ``board``, else
-    :func:`kanban_db_path` (``HERMES_KANBAN_DB`` -> ``HERMES_KANBAN_BOARD`` ->
-    ``<root>/kanban/current`` -> ``default``)."""
+    ``_INITIALIZED_PATHS``. Path: explicit ``db_path``; an explicit non-default
+    ``board``; otherwise :func:`kanban_db_path` (``HERMES_KANBAN_DB`` ->
+    ``HERMES_KANBAN_BOARD`` -> ``<root>/kanban/current`` -> ``default``)."""
     path = db_path if db_path is not None else _kb.kanban_db_path(board=board)
     path.parent.mkdir(parents=True, exist_ok=True)
 

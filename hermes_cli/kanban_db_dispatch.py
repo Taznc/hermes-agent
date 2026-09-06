@@ -1628,8 +1628,13 @@ def count_running_tasks_other_boards(board: Optional[str] = None) -> int:
     Boards are matched by resolved DB path, so ``HERMES_KANBAN_DB`` (pins every
     board to one file) yields 0. Fails open per board.
     """
+    # A path pin identifies one physical DB even when callers enumerate it by
+    # several board slugs. Do not turn those slugs into explicit cross-board
+    # requests here: this internal sweep has no such intent, and doing so would
+    # double-count workers (and re-enable the multiplied-cap bug).
+    pinned = bool(os.environ.get("HERMES_KANBAN_DB", "").strip())
     try:
-        current_path = str(_kb.kanban_db_path(board=board).expanduser().resolve())
+        current_path = str(_kb.kanban_db_path(board=None if pinned else board).expanduser().resolve())
     except Exception:
         current_path = None
     try:
@@ -1640,13 +1645,13 @@ def count_running_tasks_other_boards(board: Optional[str] = None) -> int:
     for meta in boards:
         slug = meta.get("slug") or _kb.DEFAULT_BOARD
         try:
-            path = _kb.kanban_db_path(board=slug).expanduser()
+            path = _kb.kanban_db_path(board=None if pinned else slug).expanduser()
             resolved = str(path.resolve())
             if current_path is not None and resolved == current_path:
                 continue
             if not path.exists():
                 continue
-            other = _kbc.connect(board=slug)
+            other = _kbc.connect(board=None if pinned else slug)
             try:
                 total += count_running_tasks(other)
             finally:
@@ -1662,10 +1667,13 @@ def count_running_tasks_by_assignee_other_boards(board: Optional[str] = None) ->
 
     Per-profile concurrency is host-wide just like ``max_in_progress``: a
     profile may be assigned work from any board, but its model/API quota is one
-    shared resource.
+    shared resource. A path pin represents one DB, so every enumerated slug
+    remains pinned for this internal sweep just as in
+    :func:`count_running_tasks_other_boards`.
     """
+    pinned = bool(os.environ.get("HERMES_KANBAN_DB", "").strip())
     try:
-        current_path = str(_kb.kanban_db_path(board=board).expanduser().resolve())
+        current_path = str(_kb.kanban_db_path(board=None if pinned else board).expanduser().resolve())
         boards = _kb.list_boards(include_archived=False)
     except Exception:
         return {}
@@ -1673,10 +1681,10 @@ def count_running_tasks_by_assignee_other_boards(board: Optional[str] = None) ->
     for meta in boards:
         slug = meta.get("slug") or _kb.DEFAULT_BOARD
         try:
-            path = _kb.kanban_db_path(board=slug).expanduser()
+            path = _kb.kanban_db_path(board=None if pinned else slug).expanduser()
             if str(path.resolve()) == current_path or not path.exists():
                 continue
-            other = _kbc.connect(board=slug)
+            other = _kbc.connect(board=None if pinned else slug)
             try:
                 rows = other.execute(
                     "SELECT assignee, COUNT(*) AS n FROM tasks "
