@@ -1337,6 +1337,77 @@ def test_diagnostics_endpoint_surfaces_blocked_hallucination(client):
 
 
 # ---------------------------------------------------------------------------
+# info-severity diagnostics must not badge a card or enter the attention
+# strip on either surface (board payload), while remaining fully visible on
+# the task-detail payload and via GET /diagnostics.
+# ---------------------------------------------------------------------------
+
+
+def _card_for(board_json, task_id):
+    for col in board_json["columns"]:
+        for t in col["tasks"]:
+            if t["id"] == task_id:
+                return t
+    raise AssertionError(f"{task_id} not found on board")
+
+
+def test_info_diagnostic_excluded_from_board_badge_and_warnings(client):
+    """A guard-held ready task with only a benign respawn_guarded (info)
+    diagnostic must show up on the board with no 'warnings' summary and no
+    'diagnostics' list -- both are what the desktop badge and the
+    dashboard's collectDiagTasks() gate on. The same diagnostic must still
+    be present on the task-detail payload."""
+    conn = kbc.connect()
+    try:
+        t = kb.create_task(conn, title="guarded", assignee="w")
+        now = int(time.time())
+        conn.execute(
+            "INSERT INTO task_events (task_id, run_id, kind, payload, created_at) "
+            "VALUES (?, NULL, 'respawn_guarded', ?, ?)",
+            (t, json.dumps({"reason": "recent_success"}), now - 30),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+    board = client.get("/api/plugins/kanban/board").json()
+    card = _card_for(board, t)
+    assert card.get("warnings") is None, card.get("warnings")
+    assert "diagnostics" not in card or not card["diagnostics"]
+
+    detail = client.get(f"/api/plugins/kanban/tasks/{t}").json()
+    kinds = [d["kind"] for d in detail["task"]["diagnostics"]]
+    assert "respawn_guarded" in kinds
+
+    diag_resp = client.get("/api/plugins/kanban/diagnostics").json()
+    assert any(row["task_id"] == t for row in diag_resp["diagnostics"])
+
+
+def test_warning_diagnostic_still_badges_board_card(client):
+    """Regression guard: a warning+ diagnostic (stranded_in_ready) must
+    still badge the card and populate 'warnings' -- info-suppression must
+    not over-suppress real signals."""
+    conn = kbc.connect()
+    try:
+        t = kb.create_task(conn, title="stranded", assignee="w")
+        now = int(time.time())
+        conn.execute(
+            "UPDATE task_events SET created_at=? WHERE task_id=? AND kind='created'",
+            (now - 3600, t),
+        )
+        conn.execute("UPDATE tasks SET created_at=? WHERE id=?", (now - 3600, t))
+        conn.commit()
+    finally:
+        conn.close()
+
+    board = client.get("/api/plugins/kanban/board").json()
+    card = _card_for(board, t)
+    assert card.get("warnings") is not None
+    assert card["warnings"]["count"] >= 1
+    assert card["warnings"]["highest_severity"] in ("warning", "error", "critical")
+
+
+# ---------------------------------------------------------------------------
 # POST /tasks/:id/specify — triage specifier endpoint
 # ---------------------------------------------------------------------------
 
