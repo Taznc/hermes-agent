@@ -1,5 +1,5 @@
-import { render, screen } from '@testing-library/react'
-import { describe, expect, it } from 'vitest'
+import { act, render, screen } from '@testing-library/react'
+import { afterEach, describe, expect, it, vi } from 'vitest'
 
 import { McpAppCard, mcpAppMessage, parseMcpAppCard } from './mcp-app-card'
 
@@ -20,6 +20,10 @@ describe('parseMcpAppCard', () => {
 })
 
 describe('McpAppCard', () => {
+  afterEach(() => {
+    vi.restoreAllMocks()
+  })
+
   it('renders self-contained HTML in an opaque script-only frame without host capabilities', () => {
     const { container } = render(<McpAppCard card={card} />)
     const frame = container.querySelector('iframe')
@@ -38,7 +42,25 @@ describe('McpAppCard', () => {
     expect(mcpAppMessage({ jsonrpc: '2.0', method: 'ui/size', params: { height: 360 }, token: 'tok', pad: 'x'.repeat(5000) }, 'tok')).toBeNull()
   })
 
-  it('ignores a valid-looking message from any window other than its iframe', () => {
+  it('ignores a valid-looking message from any window other than its iframe', async () => {
+    const mountToken = '00000000-0000-4000-8000-000000000000'
+    vi.spyOn(crypto, 'randomUUID').mockReturnValue(mountToken)
+    const { container } = render(<McpAppCard card={card} />)
+    const frame = container.querySelector('iframe') as HTMLIFrameElement
+
+    const hostileEvent = new MessageEvent('message', {
+      data: { jsonrpc: '2.0', method: 'ui/size', params: { height: 900 }, token: mountToken }
+    })
+    Object.defineProperty(hostileEvent, 'source', { value: window })
+    expect(hostileEvent.source).toBe(window)
+    await act(async () => {
+      window.dispatchEvent(hostileEvent)
+    })
+
+    expect(frame.style.height).toBe('280px')
+  })
+
+  it('rejects a message with the wrong mount token', () => {
     const { container } = render(<McpAppCard card={card} />)
     const frame = container.querySelector('iframe') as HTMLIFrameElement
     window.dispatchEvent(new MessageEvent('message', {
