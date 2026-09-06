@@ -9,7 +9,7 @@ Card: t_cb47a946 (child of t_44ca59a3). Evidence: t_f44be004 (`worker-slice-evid
 configurable launcher-prefix hook: `kanban.worker_launcher: [...]`, default `[]`
 (today's plain Popen).** When set, the dispatcher prepends the configured argv
 to the worker command before `Popen`, exactly as `_default_spawn` already does
-internally for `_restart_safe_worker_argv`/`restart_safe_gateway_child_argv`
+internally for `_restart_safe_worker_argv`/`restart_safe_supervised_child_argv`
 (option (a)-flavored: `systemd-run --user --scope --slice=hermes-workers.slice
 --unit=kanban-<task_id>-run-<run_id> --property MemoryAccounting=yes
 --property MemoryHigh=<...> --property MemoryMax=<...> -- <argv>` is the
@@ -37,7 +37,7 @@ This is option (d) in the card body, generalized to also cover the slice
   `tools/process_registry.py`'s existing `_systemd_run_user_scope_available()`
   / `_build_systemd_scope_argv()` already do for background terminal
   executors (#70716), and `kanban_db_dispatch.py`'s
-  `_restart_safe_worker_argv()`/`restart_safe_gateway_child_argv()` already
+  `_restart_safe_worker_argv()`/`restart_safe_supervised_child_argv()` already
   wraps kanban workers the same way when the process is a supervised systemd
   gateway. It is unprivileged and portable in principle, but two evidence
   gaps disqualify it as *the sole hardcoded mechanism*: (1) the user scope
@@ -302,7 +302,7 @@ match, not the current code.
                            # dispatcher itself — operators supply the prefix
                            # only, matching the shape already used internally
                            # by tools/process_registry.py's
-                           # _build_systemd_scope_argv / restart_safe_gateway_child_argv.
+                           # _build_systemd_scope_argv / restart_safe_supervised_child_argv.
   ```
   Default `[]` → `_default_spawn` behaves exactly as today: plain `Popen`,
   `start_new_session=True`, no wrapper. This is the ENTIRE fallback story —
@@ -314,7 +314,7 @@ match, not the current code.
   1. Resolve `worker_launcher[0]` via `shutil.which()`. If not found, log a
      warning once and fall back to `[]` behavior for that tick (fail open,
      not closed — a misconfigured launcher must not stop the board from
-     making progress; contrast with `restart_safe_gateway_child_argv`'s
+     making progress; contrast with `restart_safe_supervised_child_argv`'s
      fail-closed `RuntimeError`, which is deliberately stricter because it
      guards *actual* gateway-restart-survival for that one narrow supervised
      case — this new knob is opt-in operator config, so the failure

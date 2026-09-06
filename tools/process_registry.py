@@ -145,6 +145,21 @@ def _systemd_scope_cached() -> Optional[bool]:
     return None if _SYSTEMD_SCOPE_AVAILABLE is None or stale else False
 
 
+def _ensure_user_systemd_env() -> None:
+    """Populate XDG_RUNTIME_DIR / DBUS_SESSION_BUS_ADDRESS for ``systemd-run --user``.
+
+    Delegates to the gateway CLI's single implementation (it already handles a runtime dir
+    leaked from another user and an unreadable socket) rather than re-deriving the paths
+    here. Best-effort: a failure just leaves the probe to report the bus as unreachable.
+    """
+    try:
+        from hermes_cli.gateway import _ensure_user_systemd_env as _ensure
+
+        _ensure()
+    except Exception as exc:
+        logger.debug("Could not prepare the user systemd environment: %s", exc)
+
+
 def _systemd_run_user_scope_available() -> bool:
     """True if ``systemd-run --user --scope`` can create a cgroup.
     ``shutil.which`` alone is insufficient: system services and containers may lack
@@ -165,6 +180,14 @@ def _systemd_run_user_scope_available() -> bool:
             try:
                 import shutil
 
+                # `systemd-run --user` needs XDG_RUNTIME_DIR / DBUS_SESSION_BUS_ADDRESS to
+                # reach the user bus. A systemd SERVICE env has neither (verified live: the
+                # web-desktop backend's environ carries only INVOCATION_ID), so the probe
+                # would fail with "Failed to connect to bus: No medium found" and every
+                # worker would silently land in the service's own cgroup. The gateway only
+                # ever worked because an unrelated `systemctl --user` call had already
+                # populated os.environ as a side effect — make the scope path own it.
+                _ensure_user_systemd_env()
                 binary = shutil.which("systemd-run")
                 if binary:
                     # Unique unit avoids collisions; the timeout bounds D-Bus.
@@ -202,6 +225,39 @@ def _is_supervised_gateway_process() -> bool:
         return False
 
 
+def _is_systemd_service_main_process() -> bool:
+    """Whether this process is the MAIN process of a systemd service (not a descendant).
+
+    systemd stamps ``SYSTEMD_EXEC_PID`` with the pid it exec'd for the unit. Like
+    ``INVOCATION_ID`` the variable is inherited by every descendant, so the value must
+    match our own pid — that comparison is what keeps terminal children, CLI processes
+    and kanban workers themselves out, exactly as the gateway PID-file check does for
+    ``_HERMES_GATEWAY``. Systemd < 248 does not set it and reads as False.
+    """
+    exec_pid = os.environ.get("SYSTEMD_EXEC_PID", "")
+    return bool(os.environ.get("INVOCATION_ID")) and exec_pid.isdigit() and int(exec_pid) == os.getpid()
+
+
+def _is_supervised_worker_dispatcher() -> bool:
+    """Whether this process spawns children that a unit stop would kill with it.
+
+    Two topologies dispatch Hermes workers under systemd, and BOTH need their children
+    lifted out of the unit cgroup:
+
+    * ``hermes-gateway.service`` — the messaging gateway (``_is_supervised_gateway_process``).
+    * the web-desktop backend (``hermes serve``) — runs the very same kanban dispatcher
+      and cron scheduler, in a different unit with ``KillMode=control-group``. Gating on
+      "am I the gateway" left every worker it spawned unwrapped in its own cgroup, so one
+      ``systemctl stop`` SIGKILLed five in-flight workers at once.
+
+    The second arm is deliberately NOT ``_HERMES_GATEWAY=1`` on the backend: that marker
+    means "the gateway runtime is loaded in this process" and is inherited by descendants
+    that must keep restarting the gateway. Being the main process of a supervised unit is
+    the property that actually matters here, so that is what is tested.
+    """
+    return _is_supervised_gateway_process() or _is_systemd_service_main_process()
+
+
 def _build_systemd_scope_argv(shell_argv: List[str], unit_suffix: str) -> List[str]:
     """Wrap *shell_argv* in a ``systemd-run --user --scope`` invocation with its own
     memory accounting, so an OOM in the worker cannot kill the gateway cgroup.
@@ -218,32 +274,50 @@ def _build_systemd_scope_argv(shell_argv: List[str], unit_suffix: str) -> List[s
     return _systemd_scope_argv(binary, f"hermes-worker-{unit_suffix}", *shell_argv)
 
 
-def restart_safe_gateway_child_argv(
-    command: List[str], *, unit_suffix: str
-) -> List[str]:
-    """Place a managed-systemd gateway child outside the gateway cgroup.
+_USER_BUS_ENV_KEYS = ("XDG_RUNTIME_DIR", "DBUS_SESSION_BUS_ADDRESS")
 
-    Children that must survive an intentional gateway restart cannot rely on
+
+def restart_safe_supervised_child_argv(
+    command: List[str], *, unit_suffix: str, env: Optional[Dict[str, str]] = None
+) -> List[str]:
+    """Place a supervised-systemd child outside its unit's cgroup.
+
+    Children that must survive an intentional service restart cannot rely on
     ``start_new_session`` alone: systemd still kills every process in the
     service cgroup.  In that topology, require a transient user scope and fail
     closed if it cannot be established.  Standalone processes, non-systemd
     supervisors, and non-Linux hosts retain the direct command.
+
+    Applies to every supervised unit that dispatches workers, not just the
+    gateway — see :func:`_is_supervised_worker_dispatcher`.
+
+    ``env`` is the mapping the caller will hand to ``Popen``; the user-bus
+    variables are copied into it because the wrapped ``systemd-run --user``
+    binary needs them in ITS OWN environment, and a caller that snapshotted
+    ``os.environ`` before this call would otherwise exec it without them.
     """
     if not _IS_LINUX:
         return command
-    if not _is_supervised_gateway_process() or not os.environ.get("INVOCATION_ID"):
+    if not _is_supervised_worker_dispatcher():
         return command
     if not _systemd_run_user_scope_available():
         raise RuntimeError(
-            "cannot create restart-safe systemd scope for gateway child: "
+            "cannot create restart-safe systemd scope for supervised child: "
             "systemd-run --user --scope is unavailable"
         )
     scoped = _build_systemd_scope_argv(command, unit_suffix=unit_suffix)
     if scoped == command:
         raise RuntimeError(
-            "cannot create restart-safe systemd scope for gateway child: "
+            "cannot create restart-safe systemd scope for supervised child: "
             "systemd-run disappeared after the availability probe"
         )
+    if env is not None:
+        # The probe resolved these into os.environ; mirror them so the spawn
+        # reaches the same user bus the probe proved reachable.
+        for key in _USER_BUS_ENV_KEYS:
+            value = os.environ.get(key)
+            if value:
+                env[key] = value
     return scoped
 
 
@@ -759,20 +833,20 @@ class ProcessRegistry:
     def _scope_argv(self, session: ProcessSession, safe_command: str, unit_suffix: str, label: str) -> List[str]:
         """Login-shell argv for *safe_command* (parity with LocalEnvironment: rc files
         sourced, user tools on PATH), wrapped in a transient systemd scope when we are
-        the supervised gateway (own cgroup: an OOM kills only the worker, not the
-        gateway and its messaging control plane)."""
+        the main process of a supervised unit (own cgroup: an OOM kills only the worker,
+        not the service and its control plane)."""
         argv = [_find_shell(), "-lic", f"set +m; {safe_command}"]
         # This applies to both pipe mode and the PTY path above. See #70716.
-        in_supervised_gateway = _IS_LINUX and _is_supervised_gateway_process()
-        if in_supervised_gateway and _systemd_run_user_scope_available():
+        in_supervised_service = _IS_LINUX and _is_supervised_worker_dispatcher()
+        if in_supervised_service and _systemd_run_user_scope_available():
             session.systemd_unit = f"hermes-worker-{unit_suffix}.scope"
             return _build_systemd_scope_argv(argv, unit_suffix=unit_suffix)
-        if in_supervised_gateway:
+        if in_supervised_service:
             # Under a supervisor but no private cgroup: a worker OOM can still take
-            # the whole gateway down.
+            # the whole service down.
             logger.debug(
                 "%s background executor not isolated in a systemd scope "
-                "(systemd-run --user unavailable); worker shares the gateway cgroup.", label)
+                "(systemd-run --user unavailable); worker shares the service cgroup.", label)
         return argv
 
     @staticmethod
@@ -801,12 +875,16 @@ class ProcessRegistry:
             from winpty import PtyProcess as _PtyProcessCls
         else:
             from ptyprocess import PtyProcess as _PtyProcessCls
+        # Resolve the scope argv BEFORE snapshotting the env: minting a scope runs the
+        # availability probe, which is what populates XDG_RUNTIME_DIR /
+        # DBUS_SESSION_BUS_ADDRESS in os.environ. Snapshotting first would exec
+        # systemd-run without a reachable user bus.
+        pty_argv = self._scope_argv(session, safe_command, session.id, "PTY")
         pty_env = self._spawn_env(env_vars)
         # A PTY is a real TTY, so pager-happy tools (git log/diff, man) WILL page and
         # hang waiting for `q` — default them to cat, honoring any pager the user set.
         pty_env.setdefault("GIT_PAGER", "cat")
         pty_env.setdefault("PAGER", "cat")
-        pty_argv = self._scope_argv(session, safe_command, session.id, "PTY")
         pty_proc = _PtyProcessCls.spawn(pty_argv, cwd=session.cwd, env=pty_env, dimensions=(30, 120))
         session.pid = pty_proc.pid
         session.host_start_time = self._safe_host_start_time(session.pid)

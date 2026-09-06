@@ -86,7 +86,7 @@ def test_restart_safe_gateway_child_fails_closed_without_scope(monkeypatch):
     monkeypatch.setattr(process_registry, "_systemd_run_user_scope_available", lambda: False)
 
     with pytest.raises(RuntimeError, match="systemd-run --user --scope is unavailable"):
-        process_registry.restart_safe_gateway_child_argv(
+        process_registry.restart_safe_supervised_child_argv(
             ["python", "worker.py"], unit_suffix="cron-job-1"
         )
 
@@ -96,8 +96,12 @@ def test_restart_safe_gateway_child_is_unchanged_outside_managed_gateway(monkeyp
 
     command = ["python", "worker.py"]
     monkeypatch.setattr(process_registry, "_is_supervised_gateway_process", lambda: False)
+    # A CI runner may itself be a systemd service child; only the unit's MAIN process
+    # (SYSTEMD_EXEC_PID == our pid) qualifies, so clear the markers explicitly.
+    monkeypatch.delenv("INVOCATION_ID", raising=False)
+    monkeypatch.delenv("SYSTEMD_EXEC_PID", raising=False)
 
-    assert process_registry.restart_safe_gateway_child_argv(
+    assert process_registry.restart_safe_supervised_child_argv(
         command, unit_suffix="cron-job-1"
     ) is command
 
@@ -112,7 +116,7 @@ def test_restart_safe_gateway_child_never_probes_systemd_off_linux(monkeypatch):
     monkeypatch.setattr(process_registry, "_systemd_run_user_scope_available", probe)
     monkeypatch.setenv("INVOCATION_ID", "managed-service")
 
-    assert process_registry.restart_safe_gateway_child_argv(
+    assert process_registry.restart_safe_supervised_child_argv(
         command, unit_suffix="cron-job-1"
     ) is command
     probe.assert_not_called()
@@ -193,12 +197,12 @@ def test_launch_external_worker_uses_restart_safe_scope_and_acknowledges(
     monkeypatch.setattr(scheduler, "_get_hermes_home", lambda: tmp_path)
     wrapped_commands = []
 
-    def wrap(command, *, unit_suffix):
+    def wrap(command, *, unit_suffix, env=None):
         wrapped_commands.append((command, unit_suffix))
         return ["scope", "--", *command]
 
     monkeypatch.setattr(
-        "tools.process_registry.restart_safe_gateway_child_argv", wrap
+        "tools.process_registry.restart_safe_supervised_child_argv", wrap
     )
 
     class FakeProcess:
@@ -311,12 +315,12 @@ def test_launch_external_worker_stays_in_process_outside_managed_gateway(
 
     command_calls = []
 
-    def unchanged(command, *, unit_suffix):
+    def unchanged(command, *, unit_suffix, env=None):
         command_calls.append((command, unit_suffix))
         return command
 
     monkeypatch.setattr(
-        "tools.process_registry.restart_safe_gateway_child_argv", unchanged
+        "tools.process_registry.restart_safe_supervised_child_argv", unchanged
     )
     popen = Mock()
     monkeypatch.setattr(scheduler.subprocess, "Popen", popen)

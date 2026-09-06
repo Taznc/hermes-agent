@@ -2477,15 +2477,20 @@ def _open_worker_log(task: Task, board: Optional[str]):
     return open(log_path, "ab")
 
 
-def _restart_safe_worker_argv(task: Task, command: list[str]) -> list[str]:
-    """Wrap a managed-gateway worker in the shared restart-safe scope."""
-    from tools.process_registry import restart_safe_gateway_child_argv
+def _restart_safe_worker_argv(task: Task, command: list[str], env: dict[str, str] | None = None) -> list[str]:
+    """Wrap a worker spawned by a supervised systemd unit in the shared restart-safe scope.
+
+    ``env`` is the child's environment, mutated in place with the user-bus variables the
+    wrapped ``systemd-run --user`` needs — the dispatcher snapshots ``os.environ`` before
+    this call, so without it the spawn execs systemd-run with no bus and dies instantly.
+    """
+    from tools.process_registry import restart_safe_supervised_child_argv
 
     if task.current_run_id is None:
         # Outside managed systemd this is harmless, but a managed dispatch must
         # never mint an untraceable scope.  Check topology through the shared
         # helper first, using a placeholder suffix that cannot be launched.
-        scoped = restart_safe_gateway_child_argv(
+        scoped = restart_safe_supervised_child_argv(
             command, unit_suffix=f"kanban-{task.id}-run-missing"
         )
         if scoped is not command:
@@ -2495,9 +2500,10 @@ def _restart_safe_worker_argv(task: Task, command: list[str]) -> list[str]:
             )
         return command
 
-    return restart_safe_gateway_child_argv(
+    return restart_safe_supervised_child_argv(
         command,
         unit_suffix=f"kanban-{task.id}-run-{task.current_run_id}",
+        env=env,
     )
 
 
@@ -2600,10 +2606,10 @@ def _default_spawn(task: Task, workspace: str, *, board: Optional[str] = None) -
     env.pop("HERMES_TUI", None)
 
     cmd = _worker_argv(task, profile_arg, env.get("HERMES_HOME"))
-    # A worker spawned by a managed systemd gateway must leave the gateway's
-    # cgroup before startup; otherwise restarting the service kills the worker
-    # that is performing the handoff.
-    cmd = _restart_safe_worker_argv(task, cmd)
+    # A worker spawned by a supervised systemd unit must leave that unit's cgroup before
+    # startup; otherwise restarting the service kills the worker mid-task. ``env`` is
+    # passed so the scope wrapper can add the user-bus vars it needs to reach systemd.
+    cmd = _restart_safe_worker_argv(task, cmd, env)
     log_f = _open_worker_log(task, board)
     try:
         proc = subprocess.Popen(  # noqa: S603 -- argv is a fixed list built above
