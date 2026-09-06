@@ -2042,6 +2042,9 @@ class TestSystemdCgroupIsolation:
         """
         monkeypatch.setenv("INVOCATION_ID", "herdr-service-inherited-marker")
         monkeypatch.delenv("_HERMES_GATEWAY", raising=False)
+        # SYSTEMD_EXEC_PID is inherited too; a descendant's pid never matches the
+        # unit's main pid, which is what keeps this path off the scope branch.
+        monkeypatch.setenv("SYSTEMD_EXEC_PID", str(os.getpid() + 1))
         monkeypatch.setattr("tools.process_registry._find_shell", lambda: "/bin/bash")
         monkeypatch.setattr(
             "tools.process_registry._systemd_run_user_scope_available",
@@ -2089,6 +2092,7 @@ class TestSystemdCgroupIsolation:
         """
         monkeypatch.setenv("INVOCATION_ID", "inherited-systemd-marker")
         monkeypatch.setenv("_HERMES_GATEWAY", "1")
+        monkeypatch.setenv("SYSTEMD_EXEC_PID", str(os.getpid() + 1))
         monkeypatch.setattr(
             "gateway.status.get_running_pid",
             lambda *, cleanup_stale=False: os.getpid() + 1,
@@ -2525,6 +2529,186 @@ class TestSystemdCgroupIsolation:
 
         assert pr._systemd_run_user_scope_available() is False
         assert probe_runs == [], "non-Linux must not exec the probe"
+
+    @pytest.mark.linux_only
+    def test_probe_prepares_the_user_bus_environment_first(self, monkeypatch):
+        """The probe must populate XDG_RUNTIME_DIR / DBUS_SESSION_BUS_ADDRESS itself.
+
+        A systemd SERVICE environment carries neither, so ``systemd-run --user`` fails with
+        "Failed to connect to bus: No medium found" and every worker silently lands back in
+        the unit's own cgroup. The gateway path only ever worked because an unrelated
+        ``systemctl --user`` call had already mutated ``os.environ`` as a side effect.
+        """
+        import tools.process_registry as pr
+
+        monkeypatch.setattr(pr, "_SYSTEMD_SCOPE_AVAILABLE", None)
+        monkeypatch.setattr("shutil.which", lambda name: "/usr/bin/systemd-run")
+        monkeypatch.delenv("XDG_RUNTIME_DIR", raising=False)
+        monkeypatch.delenv("DBUS_SESSION_BUS_ADDRESS", raising=False)
+
+        env_at_probe = {}
+
+        def fake_run(argv, **kwargs):
+            env_at_probe["xdg"] = os.environ.get("XDG_RUNTIME_DIR")
+            return subprocess.CompletedProcess(args=argv, returncode=0)
+
+        monkeypatch.setattr("subprocess.run", fake_run)
+        monkeypatch.setattr(
+            "hermes_cli.gateway._ensure_user_systemd_env",
+            lambda: os.environ.__setitem__("XDG_RUNTIME_DIR", "/run/user/4242"),
+        )
+
+        assert pr._systemd_run_user_scope_available() is True
+        assert env_at_probe["xdg"] == "/run/user/4242", (
+            "the user-bus environment must be prepared BEFORE systemd-run is exec'd"
+        )
+
+    def test_probe_env_preparation_failure_is_not_fatal(self, monkeypatch):
+        """A broken environment helper degrades to "bus unreachable", never an exception."""
+        import tools.process_registry as pr
+
+        monkeypatch.setattr(pr, "_SYSTEMD_SCOPE_AVAILABLE", None)
+        monkeypatch.setattr(pr, "_IS_LINUX", True)
+        monkeypatch.setattr("shutil.which", lambda name: "/usr/bin/systemd-run")
+        monkeypatch.setattr(
+            "hermes_cli.gateway._ensure_user_systemd_env",
+            lambda: (_ for _ in ()).throw(RuntimeError("no runtime dir")),
+        )
+        monkeypatch.setattr(
+            "subprocess.run",
+            lambda argv, **kwargs: subprocess.CompletedProcess(args=argv, returncode=0),
+        )
+
+        assert pr._systemd_run_user_scope_available() is True
+
+
+class TestSupervisedWorkerDispatcherIdentity:
+    """``_is_supervised_worker_dispatcher`` covers BOTH units that dispatch workers.
+
+    The web-desktop backend (``hermes serve``) runs the same kanban dispatcher as the
+    gateway in a different unit with ``KillMode=control-group``. Gating on "am I the
+    gateway" left its workers unwrapped in the unit's cgroup, so one ``systemctl stop``
+    SIGKILLed five in-flight workers at once.
+    """
+
+    def test_gateway_main_process_qualifies(self, monkeypatch):
+        import tools.process_registry as pr
+
+        monkeypatch.setattr(pr, "_is_supervised_gateway_process", lambda: True)
+        monkeypatch.delenv("INVOCATION_ID", raising=False)
+        monkeypatch.delenv("SYSTEMD_EXEC_PID", raising=False)
+
+        assert pr._is_supervised_worker_dispatcher() is True
+
+    def test_non_gateway_systemd_service_main_process_qualifies(self, monkeypatch):
+        import tools.process_registry as pr
+
+        monkeypatch.setattr(pr, "_is_supervised_gateway_process", lambda: False)
+        monkeypatch.setenv("INVOCATION_ID", "webdesktop-backend")
+        monkeypatch.setenv("SYSTEMD_EXEC_PID", str(os.getpid()))
+
+        assert pr._is_supervised_worker_dispatcher() is True
+
+    def test_service_descendant_does_not_qualify(self, monkeypatch):
+        """Both markers are inherited; only the unit's own main pid may mint scopes."""
+        import tools.process_registry as pr
+
+        monkeypatch.setattr(pr, "_is_supervised_gateway_process", lambda: False)
+        monkeypatch.setenv("INVOCATION_ID", "inherited-by-every-child")
+        monkeypatch.setenv("SYSTEMD_EXEC_PID", str(os.getpid() + 1))
+
+        assert pr._is_supervised_worker_dispatcher() is False
+
+    def test_plain_cli_process_does_not_qualify(self, monkeypatch):
+        import tools.process_registry as pr
+
+        monkeypatch.setattr(pr, "_is_supervised_gateway_process", lambda: False)
+        monkeypatch.delenv("INVOCATION_ID", raising=False)
+        monkeypatch.delenv("SYSTEMD_EXEC_PID", raising=False)
+
+        assert pr._is_supervised_worker_dispatcher() is False
+
+    def test_exec_pid_without_invocation_id_does_not_qualify(self, monkeypatch):
+        """A stale/forged SYSTEMD_EXEC_PID alone is not proof of supervision."""
+        import tools.process_registry as pr
+
+        monkeypatch.setattr(pr, "_is_supervised_gateway_process", lambda: False)
+        monkeypatch.delenv("INVOCATION_ID", raising=False)
+        monkeypatch.setenv("SYSTEMD_EXEC_PID", str(os.getpid()))
+
+        assert pr._is_supervised_worker_dispatcher() is False
+
+
+class TestScopeSpawnEnvironment:
+    """The wrapped ``systemd-run --user`` needs the user-bus vars in the CHILD env.
+
+    Callers snapshot ``os.environ`` before asking for the scoped argv, so the probe's
+    late resolution of XDG_RUNTIME_DIR / DBUS_SESSION_BUS_ADDRESS never reached the
+    ``Popen`` env — systemd-run exec'd with no bus and died with
+    "Failed to connect to bus: No medium found" before the worker ever started.
+    """
+
+    @pytest.fixture()
+    def _supervised_service(self, monkeypatch):
+        import tools.process_registry as pr
+
+        monkeypatch.setattr(pr, "_IS_LINUX", True)
+        monkeypatch.setattr(pr, "_is_supervised_gateway_process", lambda: False)
+        monkeypatch.setenv("INVOCATION_ID", "supervised-unit")
+        monkeypatch.setenv("SYSTEMD_EXEC_PID", str(os.getpid()))
+        monkeypatch.setattr(pr, "_systemd_run_user_scope_available", lambda: True)
+        monkeypatch.setattr("shutil.which", lambda name: "/usr/bin/systemd-run")
+        return pr
+
+    def test_user_bus_vars_are_copied_into_the_child_env(
+        self, _supervised_service, monkeypatch
+    ):
+        pr = _supervised_service
+        monkeypatch.setenv("XDG_RUNTIME_DIR", "/run/user/4242")
+        monkeypatch.setenv("DBUS_SESSION_BUS_ADDRESS", "unix:path=/run/user/4242/bus")
+        # A pre-scope snapshot, exactly like the dispatcher's build_subprocess_env().
+        child_env = {"HERMES_HOME": "/tmp/home"}
+
+        argv = pr.restart_safe_supervised_child_argv(
+            ["hermes", "chat"], unit_suffix="kanban-t_x-run-1", env=child_env
+        )
+
+        assert argv[0] == "/usr/bin/systemd-run"
+        assert child_env["XDG_RUNTIME_DIR"] == "/run/user/4242"
+        assert child_env["DBUS_SESSION_BUS_ADDRESS"] == "unix:path=/run/user/4242/bus"
+        assert child_env["HERMES_HOME"] == "/tmp/home", "caller's own keys survive"
+
+    def test_child_env_is_untouched_when_no_scope_is_minted(self, monkeypatch):
+        """An unsupervised caller keeps a byte-identical env (no stray bus vars)."""
+        import tools.process_registry as pr
+
+        monkeypatch.setattr(pr, "_is_supervised_gateway_process", lambda: False)
+        monkeypatch.delenv("INVOCATION_ID", raising=False)
+        monkeypatch.delenv("SYSTEMD_EXEC_PID", raising=False)
+        monkeypatch.setenv("XDG_RUNTIME_DIR", "/run/user/4242")
+        child_env = {"HERMES_HOME": "/tmp/home"}
+
+        command = ["hermes", "chat"]
+        assert pr.restart_safe_supervised_child_argv(
+            command, unit_suffix="kanban-t_x-run-1", env=child_env
+        ) is command
+        assert child_env == {"HERMES_HOME": "/tmp/home"}
+
+    def test_absent_user_bus_vars_are_not_invented(
+        self, _supervised_service, monkeypatch
+    ):
+        """Nothing is written when the probe could not resolve a bus address."""
+        pr = _supervised_service
+        monkeypatch.delenv("XDG_RUNTIME_DIR", raising=False)
+        monkeypatch.delenv("DBUS_SESSION_BUS_ADDRESS", raising=False)
+        child_env = {"HERMES_HOME": "/tmp/home"}
+
+        pr.restart_safe_supervised_child_argv(
+            ["hermes", "chat"], unit_suffix="kanban-t_x-run-1", env=child_env
+        )
+
+        assert "XDG_RUNTIME_DIR" not in child_env
+        assert "DBUS_SESSION_BUS_ADDRESS" not in child_env
 
 
 class TestNotificationRedaction:
