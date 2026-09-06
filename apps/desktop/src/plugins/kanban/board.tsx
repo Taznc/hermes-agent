@@ -104,6 +104,7 @@ import {
 import { TaskDrawer } from './drawer'
 import { EMPTY_OVERRIDE, ModelOverrideField, overrideCreateFields, type TaskModelOverride } from './model-override'
 import { OrchestrationPanel } from './orchestration'
+import { PriorityPicker } from './priority-picker'
 import { type BoardAllInfo, columnMeta, type KanbanBoard, type KanbanTask, type TaskEstimate } from './types'
 import {
   $newTaskLane,
@@ -158,13 +159,6 @@ function removeCard(board: KanbanBoard, key: string): KanbanBoard {
     columns: board.columns.map(col => ({ ...col, tasks: col.tasks.filter(t => taskCardKey(t) !== key) }))
   }
 }
-
-// High-priority is a boolean affordance on top of the integer `priority`
-// field (0 = normal, 1 = high) — the backend already sorts priority DESC
-// within a column, so flipping this also pins the card to the top on the
-// next refresh without any client-side re-sort.
-const HIGH_PRIORITY = 1
-const isHighPriority = (task: KanbanTask) => typeof task.priority === 'number' && task.priority > 0
 
 function setPriorityCard(board: KanbanBoard, key: string, priority: number): KanbanBoard {
   return {
@@ -390,7 +384,15 @@ function FocusFlag({ task }: { task: KanbanTask }) {
   )
 }
 
-function CardFooter({ arc, task }: { arc: ArcState | null; task: KanbanTask }) {
+function CardFooter({
+  arc,
+  onSetPriority,
+  task
+}: {
+  arc: ArcState | null
+  onSetPriority: (priority: number) => void
+  task: KanbanTask
+}) {
   const k = useKanban()
   const created = ago(task.created_at)
   const fallback = useDefaultAssignee()
@@ -455,12 +457,13 @@ function CardFooter({ arc, task }: { arc: ArcState | null; task: KanbanTask }) {
       )}
       <FocusFlag task={task} />
       <div className="ml-auto flex min-w-0 flex-wrap items-center justify-end gap-x-2 gap-y-1">
-        {typeof task.priority === 'number' && task.priority > 0 && (
-          <span className="inline-flex items-center gap-0.5 text-amber-500">
-            <Codicon name="star-full" size="0.7rem" />
-            {task.priority > 1 ? task.priority : null}
-          </span>
-        )}
+        <span
+          onClick={event => event.stopPropagation()}
+          onMouseDown={event => event.stopPropagation()}
+          onPointerDown={event => event.stopPropagation()}
+        >
+          <PriorityPicker onChange={onSetPriority} priority={task.priority} />
+        </span>
         {task.progress && task.progress.total > 0 && (
           <Meta icon="checklist">
             {task.progress.done}/{task.progress.total}
@@ -517,8 +520,8 @@ export function Card({
   onDelete,
   onMove,
   onOpen,
+  onSetPriority,
   onToggleSelect,
-  onTogglePriority,
   selected,
   task
 }: {
@@ -529,8 +532,8 @@ export function Card({
   onDelete: (key: string) => void
   onMove: (key: string, status: string) => void
   onOpen: (key: string) => void
+  onSetPriority: (key: string, priority: number) => void
   onToggleSelect: (key: string) => void
-  onTogglePriority: (key: string, next: boolean) => void
   selected: boolean
   task: KanbanTask
 }) {
@@ -540,7 +543,6 @@ export function Card({
   const summary = task.latest_summary || task.body
   const fallback = useDefaultAssignee()
   const arc = arcState(task, fallback)
-  const highPriority = isHighPriority(task)
   const key = taskCardKey(task)
 
   const deps = useDependencies()
@@ -582,11 +584,7 @@ export function Card({
             // selected = the theme's focus color (same as a focused input).
             'transition-colors hover:bg-primary/[0.06] active:cursor-grabbing',
             selected && 'border-(--dt-composer-ring) bg-[color-mix(in_srgb,var(--dt-composer-ring)_7%,transparent)]',
-            // High priority gets a warm wash so it reads as distinct even when
-            // scanning quickly, on top of the star badge and left-border tint.
-            highPriority &&
-              !selected &&
-              'bg-[color-mix(in_srgb,#fbbf24_5%,var(--ui-bg-elevated))] hover:bg-[color-mix(in_srgb,#fbbf24_9%,var(--ui-bg-elevated))]',
+
             // Focus chain. Rings only — no layout property moves, so nothing
             // reflows and no card is re-ordered or unmounted.
             'transition-[opacity,filter,box-shadow,background-color]',
@@ -631,8 +629,7 @@ export function Card({
           style={
             {
               '--kanban-tone': meta.tone,
-              borderLeftColor: highPriority ? '#f59e0b' : meta.tone,
-              borderLeftWidth: highPriority ? '3px' : undefined
+              borderLeftColor: meta.tone
             } as CSSProperties
           }
         >
@@ -644,28 +641,10 @@ export function Card({
           {(arc === 'running' || arc === 'stale') && !dragging && !selected && (
             <span aria-hidden className={cn('kanban-arc', arc === 'stale' && 'kanban-arc--stale')} />
           )}
-          <Tip label={highPriority ? k.removeHighPriority : k.markHighPriority}>
-            <button
-              aria-label={highPriority ? k.removeHighPriority : k.markHighPriority}
-              aria-pressed={highPriority}
-              className={cn(
-                'absolute top-1.5 right-1.5 grid size-5 place-items-center rounded text-(--ui-text-quaternary) transition-opacity hover:bg-(--chrome-action-hover) hover:text-amber-500',
-                highPriority
-                  ? 'text-amber-500 opacity-100'
-                  : 'opacity-0 focus-visible:opacity-100 group-hover:opacity-100'
-              )}
-              onClick={event => {
-                event.stopPropagation()
-                onTogglePriority(key, !highPriority)
-              }}
-              type="button"
-            >
-              <Codicon name={highPriority ? 'star-full' : 'star-empty'} size="0.8rem" />
-            </button>
-          </Tip>
+
           {/* Trace this card's dependency chain. A dedicated affordance rather
               than overloading a bare click (which must keep opening the
-              drawer): it appears on hover exactly like the star above it, and
+              drawer): it appears on hover, and
               ONLY on cards that actually have a link — so it advertises where
               dependencies exist instead of adding noise to every card.
               Alt-click on the card body does the same thing for the keyboard-
@@ -676,7 +655,7 @@ export function Card({
                 aria-label={role === 'focused' ? k.depClearFocus : k.depFocusHint}
                 aria-pressed={role === 'focused'}
                 className={cn(
-                  'absolute top-1.5 right-7 grid size-5 place-items-center rounded text-(--ui-text-quaternary) transition-opacity hover:bg-(--chrome-action-hover) hover:text-foreground',
+                  'absolute top-1.5 right-1.5 grid size-5 place-items-center rounded text-(--ui-text-quaternary) transition-opacity hover:bg-(--chrome-action-hover) hover:text-foreground',
                   role === 'focused'
                     ? 'text-foreground opacity-100'
                     : 'opacity-0 focus-visible:opacity-100 group-hover:opacity-100'
@@ -694,9 +673,9 @@ export function Card({
           <span
             className={cn(
               'line-clamp-2 text-[0.8125rem] font-medium leading-snug text-foreground',
-              // Keep the title clear of the corner buttons. Static per task
-              // (a card either has links or it doesn't), so no hover thrash.
-              linked ? 'pr-11' : 'pr-5'
+              // Keep the title clear of the dependency focus affordance. Static
+              // per task, so hover never reflows the card.
+              linked && 'pr-5'
             )}
           >
             {task.title || task.id}
@@ -708,7 +687,7 @@ export function Card({
           {task.image_attachment_id != null && (
             <CardThumb attachmentId={task.image_attachment_id} board={task.board ?? undefined} />
           )}
-          <CardFooter arc={arc} task={task} />
+          <CardFooter arc={arc} onSetPriority={priority => onSetPriority(key, priority)} task={task} />
         </div>
       </ContextMenuTrigger>
       <ContextMenuContent>
@@ -720,11 +699,7 @@ export function Card({
           <Codicon name={selected ? 'close' : 'check-all'} size="0.85rem" />
           {selected ? k.deselect : k.select(formatModifierToken('mod'))}
         </ContextMenuItem>
-        <ContextMenuItem onSelect={() => onTogglePriority(key, !highPriority)}>
-          <Codicon name={highPriority ? 'star-full' : 'star-empty'} size="0.85rem" />
-          {highPriority ? k.removeHighPriority : k.markHighPriority}
-        </ContextMenuItem>
-        <ContextMenuSeparator />
+
         {columns
           .filter(name => name !== task.status && !isLockedTarget(name))
           .map(name => (
@@ -759,9 +734,9 @@ function Column({
   onDropTask,
   onMove,
   onOpen,
+  onSetPriority,
   onToggle,
   onToggleSelect,
-  onTogglePriority,
   selected
 }: {
   collapsed: boolean
@@ -773,9 +748,9 @@ function Column({
   onDropTask: (key: string, status: string) => void
   onMove: (key: string, status: string) => void
   onOpen: (key: string) => void
+  onSetPriority: (key: string, priority: number) => void
   onToggle: () => void
   onToggleSelect: (key: string) => void
-  onTogglePriority: (key: string, next: boolean) => void
   selected: ReadonlySet<string>
 }) {
   const k = useKanban()
@@ -897,7 +872,7 @@ function Column({
                     onDelete={onDelete}
                     onMove={onMove}
                     onOpen={onOpen}
-                    onTogglePriority={onTogglePriority}
+                    onSetPriority={onSetPriority}
                     onToggleSelect={onToggleSelect}
                     selected={selected.has(taskCardKey(task))}
                     task={task}
@@ -912,7 +887,7 @@ function Column({
                 onDelete={onDelete}
                 onMove={onMove}
                 onOpen={onOpen}
-                onTogglePriority={onTogglePriority}
+                onSetPriority={onSetPriority}
                 onToggleSelect={onToggleSelect}
                 selected={selected.has(taskCardKey(task))}
                 task={task}
@@ -1030,7 +1005,7 @@ export function NewTaskDialog({
   const [title, setTitle] = useState('')
   const [bodyText, setBodyText] = useState('')
   const [assignee, setAssignee] = useState('')
-  const [priority, setPriority] = useState('0')
+  const [priority, setPriority] = useState(0)
   const [skills, setSkills] = useState('')
   const [workspaceKind, setWorkspaceKind] = useState<string>(boardDefaultKind)
   // Empty = inherit the board's default project dir (backend resolves it);
@@ -1073,7 +1048,7 @@ export function NewTaskDialog({
       setTitle('')
       setBodyText('')
       setAssignee('')
-      setPriority('0')
+      setPriority(0)
       setSkills('')
       setWorkspaceKind(boardDefaultKind)
       setWorkspacePath('')
@@ -1256,7 +1231,7 @@ export function NewTaskDialog({
           // Images travel exclusively as staged tokens, never inlined into
           // `body` — the backend promotes each token into a real attachment.
           pending_attachment_tokens: pendingImages.length ? pendingImages.map(image => image.token) : undefined,
-          priority: Number(priority) || 0,
+          priority,
           skills: skillList.length ? skillList : undefined,
           title: trimmed,
           triage: isTriage,
@@ -1382,7 +1357,7 @@ export function NewTaskDialog({
 
           <div className="grid grid-cols-2 gap-3">
             <Field label={k.priority}>
-              <Input onChange={event => setPriority(event.target.value)} type="number" value={priority} />
+              <PriorityPicker onChange={setPriority} priority={priority} />
             </Field>
             <Field label={k.workspace}>
               <Select onValueChange={setWorkspaceKind} value={workspaceKind}>
@@ -2277,14 +2252,14 @@ export function KanbanBoardPage() {
 
   // Handlers take the card's `cardKey` (what `Card` hands back) and resolve
   // the (board, id) pair from it — never a bare id against the merged index.
-  const onTogglePriority = (key: string, next: boolean) => {
+  const onSetPriority = (key: string, priority: number) => {
     const task = index.get(key)
 
     if (!task) {
       return
     }
 
-    priorityMut.mutate({ board: task.board ?? undefined, id: task.id, key, priority: next ? HIGH_PRIORITY : 0 })
+    priorityMut.mutate({ board: task.board ?? undefined, id: task.id, key, priority })
   }
 
   const onMove = (key: string, status: string) => {
@@ -2514,8 +2489,8 @@ export function KanbanBoardPage() {
                     onDropTask={onMove}
                     onMove={onMove}
                     onOpen={setOpenKey}
+                    onSetPriority={onSetPriority}
                     onToggle={() => toggleLane(col.name, auto)}
-                    onTogglePriority={onTogglePriority}
                     onToggleSelect={toggleSelect}
                     selected={selected}
                   />
