@@ -27,6 +27,11 @@ export interface KanbanTask {
   started_at?: null | number
   worker_pid?: null | number
   last_heartbeat_at?: null | number
+  /** Present only in the consolidated All Boards view (GET /board/all) — the
+   *  owning board's slug + display name, so a merged card can be attributed
+   *  and every mutation can be routed back to ITS board, never the sentinel. */
+  board?: null | string
+  board_name?: null | string
 }
 
 export interface KanbanColumn {
@@ -43,6 +48,36 @@ export interface KanbanBoard {
   link_edges?: Array<[string, string]>
   latest_event_id: number
   now: number
+  /** Present only when this payload came from the consolidated All Boards
+   *  view (`fetchAllBoards`, sentinel `$boardSlug === ALL_BOARDS`) — the
+   *  per-board roster (for the filter chips + card badges), never present
+   *  on a single-board `GET /board` response. */
+  boards?: BoardAllInfo[]
+  /** Per-board `latest_event_id`, for seeding a future multi-board events
+   *  socket subscription without a gap or a replay (follow-on card). */
+  cursors?: Record<string, number>
+  /** Boards that failed to load in this consolidated fetch — the view stays
+   *  up for every board that succeeded; render this as a non-blocking notice
+   *  naming the failed boards rather than blanking the page. */
+  errors?: BoardAllError[]
+}
+
+/** One board's roster entry in the consolidated All Boards view — display
+ *  chrome (name/color/icon) plus how many live cards it contributed. */
+export interface BoardAllInfo {
+  slug: string
+  name: string
+  color: string
+  icon: string
+  project_name?: null | string
+  task_count: number
+}
+
+/** One board that failed to load in `GET /board/all` — reported instead of
+ *  failing the whole consolidated view. */
+export interface BoardAllError {
+  board: string
+  detail: string
 }
 
 /** A dependency resolved against the board cache for display: the linked

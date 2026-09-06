@@ -230,6 +230,7 @@ type KanbanMessages = {
   working: string
   // board switcher
   board: string
+  allBoards: string
   newBoard: string
   newBoardDots: string
   // Menu labels are bare verbs — the board they act on is the one named in the
@@ -257,6 +258,9 @@ type KanbanMessages = {
   projectHintPre: string
   projectHintCmd: string
   createBoard: string
+  // All Boards (consolidated view)
+  toggleBoard: (name: string) => string
+  boardsFailedNotice: (names: string) => string
   // orchestration
   orchestratorProfile: string
   defaultAssignee: string
@@ -463,9 +467,7 @@ export const en: KanbanMessages = {
   depMissing: 'not on this board',
   depMissingTip: 'This linked task was deleted, or is hidden by the current tenant/archive filter.',
   depWaitingBanner: (gating, total) =>
-    total === 1
-      ? 'Waiting on 1 blocker.'
-      : `Waiting on ${gating} of ${total} blockers.`,
+    total === 1 ? 'Waiting on 1 blocker.' : `Waiting on ${gating} of ${total} blockers.`,
   depFocusHint: 'Click a card to trace its dependency chain · Esc to clear',
   depFocusUpstream: 'blocks this',
   depFocusDownstream: 'waits on this',
@@ -508,6 +510,7 @@ export const en: KanbanMessages = {
   close: 'Close',
   working: 'working',
   board: 'Board',
+  allBoards: 'All Boards',
   newBoard: 'New board',
   newBoardDots: 'New board…',
   exportDots: 'Export…',
@@ -533,6 +536,8 @@ export const en: KanbanMessages = {
     'New tasks run in the project’s repo (a worktree per task); each task can still override its workspace at creation. Manage projects with ',
   projectHintCmd: 'hermes project',
   createBoard: 'Create board',
+  toggleBoard: name => `Toggle ${name}`,
+  boardsFailedNotice: names => `Couldn't load: ${names}`,
   orchestratorProfile: 'Orchestrator profile',
   defaultAssignee: 'Default assignee',
   defaultParen: '(default)',
@@ -660,7 +665,8 @@ const ja: KanbanMessages = {
   couldNotEstimate: '見積もりできませんでした',
   complexity: { S: '小', M: '中', L: '大' },
   ideaTitle: 'アイデアを記録',
-  ideaHint: 'ラフなロードマップのアイデアをメモ — カードではなく ROADMAP.md の Ideas リストに追加され、後でトリアージされます。',
+  ideaHint:
+    'ラフなロードマップのアイデアをメモ — カードではなく ROADMAP.md の Ideas リストに追加され、後でトリアージされます。',
   ideaPlaceholder: 'ラフなアイデア…',
   ideaSave: 'アイデアを保存',
   ideaSaving: '保存中…',
@@ -780,6 +786,7 @@ const ja: KanbanMessages = {
   close: '閉じる',
   working: '作業中',
   board: 'ボード',
+  allBoards: 'すべてのボード',
   newBoard: '新しいボード',
   newBoardDots: '新しいボード…',
   exportDots: 'エクスポート…',
@@ -805,6 +812,8 @@ const ja: KanbanMessages = {
     '新しいタスクはプロジェクトのリポジトリで実行されます（タスクごとに worktree）。各タスクは作成時にワークスペースを上書きできます。プロジェクトの管理は ',
   projectHintCmd: 'hermes project',
   createBoard: 'ボードを作成',
+  toggleBoard: name => `${name}を切り替え`,
+  boardsFailedNotice: names => `読み込めませんでした: ${names}`,
   orchestratorProfile: 'オーケストレータープロフィール',
   defaultAssignee: 'デフォルトの担当',
   defaultParen: '（既定）',
@@ -1050,6 +1059,7 @@ const zh: KanbanMessages = {
   close: '关闭',
   working: '进行中',
   board: '面板',
+  allBoards: '所有面板',
   newBoard: '新建面板',
   newBoardDots: '新建面板…',
   exportDots: '导出…',
@@ -1075,6 +1085,8 @@ const zh: KanbanMessages = {
     '新任务将在项目的仓库中运行（每个任务一个 worktree）；每个任务在创建时仍可覆盖其工作区。管理项目请使用 ',
   projectHintCmd: 'hermes project',
   createBoard: '创建面板',
+  toggleBoard: name => `切换 ${name}`,
+  boardsFailedNotice: names => `无法加载：${names}`,
   orchestratorProfile: '编排者配置档',
   defaultAssignee: '默认负责人',
   defaultParen: '（默认）',
@@ -1319,6 +1331,7 @@ const zhHant: KanbanMessages = {
   close: '關閉',
   working: '進行中',
   board: '面板',
+  allBoards: '所有面板',
   newBoard: '新增面板',
   newBoardDots: '新增面板…',
   exportDots: '匯出…',
@@ -1344,6 +1357,8 @@ const zhHant: KanbanMessages = {
     '新任務將在專案的儲存庫中執行（每個任務一個 worktree）；每個任務在建立時仍可覆寫其工作區。管理專案請使用 ',
   projectHintCmd: 'hermes project',
   createBoard: '建立面板',
+  toggleBoard: name => `切換 ${name}`,
+  boardsFailedNotice: names => `無法載入：${names}`,
   orchestratorProfile: '編排者設定檔',
   defaultAssignee: '預設負責人',
   defaultParen: '（預設）',

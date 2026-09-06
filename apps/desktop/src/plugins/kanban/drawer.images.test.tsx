@@ -93,8 +93,8 @@ describe('ImagesSection', () => {
     withClient(<ImagesSection attachments={attachments} onOpen={onOpen} />)
 
     await waitFor(() => expect(fetchAttachmentDataUrlMock).toHaveBeenCalledTimes(2))
-    expect(fetchAttachmentDataUrlMock).toHaveBeenCalledWith(1)
-    expect(fetchAttachmentDataUrlMock).toHaveBeenCalledWith(2)
+    expect(fetchAttachmentDataUrlMock).toHaveBeenCalledWith(1, undefined)
+    expect(fetchAttachmentDataUrlMock).toHaveBeenCalledWith(2, undefined)
 
     const thumbs = await screen.findAllByRole('button', { name: 'openImage' })
 
