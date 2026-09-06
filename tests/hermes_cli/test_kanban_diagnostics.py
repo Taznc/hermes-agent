@@ -200,6 +200,53 @@ def test_stranded_in_ready_fires_when_age_exceeds_threshold():
 
 
 # ---------------------------------------------------------------------------
+# respawn_guarded — surfaces the dispatcher's guard decision and suppresses
+# the misleading stranded_in_ready diagnostic while it applies.
+# ---------------------------------------------------------------------------
+
+
+def test_respawn_guarded_fires_and_suppresses_stranded_in_ready():
+    """Regression for t_535b7818: a card the dispatcher is deliberately NOT
+    spawning (respawn guard tripped) must present as a distinct
+    ``respawn_guarded`` diagnostic naming the reason — never as an
+    unexplained ``stranded_in_ready`` warning that sends the operator toward
+    the wrong fix (reassign)."""
+    now = 100_000
+    task = _task(status="ready", assignee="demo", claim_lock=None)
+    events = [
+        _event("created", ts=now - 45 * 60),
+        _event("respawn_guarded", ts=now - 40 * 60, reason="active_pr"),
+    ]
+    diags = kd.compute_task_diagnostics(task, events, [], now=now)
+
+    guarded = [d for d in diags if d.kind == "respawn_guarded"]
+    assert len(guarded) == 1
+    assert guarded[0].data["reason"] == "active_pr"
+
+    stranded = [d for d in diags if d.kind == "stranded_in_ready"]
+    assert not stranded, "a guarded card must not also present as stranded"
+
+
+def test_respawn_guarded_ignores_stale_guard_from_a_prior_ready_period():
+    """A ``respawn_guarded`` event from BEFORE the task's current entry into
+    ``ready`` (it was reclaimed/promoted/unblocked since) describes a past
+    decision, not the current one — ``stranded_in_ready`` must still fire
+    normally if nothing has guarded the CURRENT ready period."""
+    now = 100_000
+    task = _task(status="ready", assignee="demo", claim_lock=None)
+    events = [
+        _event("created", ts=now - 200 * 60),
+        _event("respawn_guarded", ts=now - 150 * 60, reason="active_pr"),
+        # Re-promoted well after the stale guard event — a fresh ready period.
+        _event("promoted", ts=now - 45 * 60),
+    ]
+    diags = kd.compute_task_diagnostics(task, events, [], now=now)
+
+    assert not [d for d in diags if d.kind == "respawn_guarded"]
+    assert [d for d in diags if d.kind == "stranded_in_ready"]
+
+
+# ---------------------------------------------------------------------------
 # repeated_failures rule — threshold must track the breaker's effective limit
 #
 # _record_task_failure (kanban_db_dispatch.py) resolves its trip threshold as
