@@ -409,7 +409,8 @@ function CardFooter({
   const meta = columnMeta(task.status)
 
   return (
-    <div className="flex min-w-0 flex-wrap items-center gap-x-2 gap-y-1 text-[0.625rem] text-(--ui-text-tertiary)">
+    <div className="grid min-w-0 grid-cols-[minmax(0,1fr)_auto] items-center gap-x-2 gap-y-1 text-[0.625rem] text-(--ui-text-tertiary)">
+      <div className="flex min-w-0 flex-wrap items-center gap-x-2 gap-y-1">
       {arc === 'queued' && attached ? (
         // WHO is coming for the card. The arc only animates once the agent is
         // actually working; while queued, the named chip carries "attached".
@@ -456,14 +457,15 @@ function CardFooter({
         </Tip>
       )}
       <FocusFlag task={task} />
-      <div className="ml-auto flex min-w-0 flex-wrap items-center justify-end gap-x-2 gap-y-1">
-        <span
-          onClick={event => event.stopPropagation()}
-          onMouseDown={event => event.stopPropagation()}
-          onPointerDown={event => event.stopPropagation()}
-        >
-          <PriorityPicker onChange={onSetPriority} priority={task.priority} />
-        </span>
+      </div>
+      <span
+        onClick={event => event.stopPropagation()}
+        onMouseDown={event => event.stopPropagation()}
+        onPointerDown={event => event.stopPropagation()}
+      >
+        <PriorityPicker onChange={onSetPriority} priority={task.priority} />
+      </span>
+      <div className="col-span-2 flex min-w-0 flex-wrap items-center justify-end gap-x-2 gap-y-1">
         {task.progress && task.progress.total > 0 && (
           <Meta icon="checklist">
             {task.progress.done}/{task.progress.total}

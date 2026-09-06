@@ -29,4 +29,10 @@ describe('PriorityPicker', () => {
 
     expect(onChange).toHaveBeenCalledWith(2)
   })
+
+  it('keeps an out-of-policy numeric value legible without making the card footer wide', () => {
+    render(<PriorityPicker onChange={vi.fn()} priority={7} />)
+
+    expect(screen.getByRole('button', { name: 'priorityCustom:7' }).textContent).toContain('P7')
+  })
 })
