@@ -3,6 +3,24 @@
 Status: spec only, no implementation in this document/card.
 Card: t_cb47a946 (child of t_44ca59a3). Evidence: t_f44be004 (`worker-slice-evidence.md`).
 
+> **Post-audit correction (t_ef6abc1a → t_5aecb402):** section 1's
+> `_scope_exit_status()` design (a `systemctl --user show -p ExecMain*`-based
+> exit-status query for a `--scope` unit) does not work — those properties
+> are never populated for a `--scope` unit (systemd adopts, never forks, the
+> target process into it), proven `None` on live systemd 255 for both scopes
+> and services. It has been removed from the implementation, not replaced
+> with a `--service`-based scheme. `--scope` is kept and is still correct:
+> it is a transparent exec, so in the common case the spawned worker remains
+> a real, direct, waitpid-able child and the pre-existing
+> `os.waitpid`/`_classify_worker_exit` path already classifies its exit with
+> full fidelity, no systemd status query needed. The narrow case where the
+> worker genuinely isn't this process's child anymore (a cold dispatcher
+> after a gateway restart) resolves to the neutral `"unknown"` outcome,
+> bounded by the sibling infra-interruption classification
+> (`kanban.max_infra_interruptions`) rather than a fabricated systemd-derived
+> verdict. See `hermes_cli/kanban_db_dispatch.py::_classify_worker_exit` for
+> the current implementation.
+
 ## 0. Chosen mechanism (up front)
 
 **Keep `subprocess.Popen`, add `start_new_session=True` (already present) plus a
@@ -11,7 +29,7 @@ configurable launcher-prefix hook: `kanban.worker_launcher: [...]`, default `[]`
 to the worker command before `Popen`, exactly as `_default_spawn` already does
 internally for `_restart_safe_worker_argv`/`restart_safe_gateway_child_argv`
 (option (a)-flavored: `systemd-run --user --scope --slice=hermes-workers.slice
---unit=kanban-<task_id>-run-<run_id> --property MemoryAccounting=yes
+--unit=kanban-<task_id>-run-<run_id>.scope --property MemoryAccounting=yes
 --property MemoryHigh=<...> --property MemoryMax=<...> -- <argv>` is the
 infra-shipped default value of that launcher on this VM, not a hardcoded
 mechanism in core).
