@@ -183,7 +183,14 @@ class TestPathResolution:
         monkeypatch.setenv("HERMES_KANBAN_DB", str(forced))
         monkeypatch.setenv("HERMES_KANBAN_PIN_HOME", str(fresh_home))
         assert kb.kanban_db_path() == forced
-        assert kb.kanban_db_path(board="ignored") == forced
+        # An EXPLICIT board still reaches across (t_05ebe370): vouching decides
+        # whether an out-of-home pin may be honored at all, not whether it may
+        # override a caller who named a board. This line previously asserted
+        # board="ignored" -> forced, which encoded the ambient-beats-explicit
+        # bug rather than this test's vouching contract.
+        assert kb.kanban_db_path(board="ignored") == (
+            fresh_home / "kanban" / "boards" / "ignored" / "kanban.db"
+        )
 
     def test_stale_env_var_db_override_is_dropped(
         self, fresh_home, tmp_path, monkeypatch, caplog,

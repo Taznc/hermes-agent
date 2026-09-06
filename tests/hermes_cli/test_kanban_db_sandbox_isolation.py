@@ -120,7 +120,12 @@ def test_out_of_home_pin_is_honored_when_vouched_for(sandbox, tmp_path, monkeypa
     monkeypatch.setenv(PIN_HOME_ENV, str(sandbox))
 
     assert kb.kanban_db_path() == forced
-    assert kb.kanban_db_path(board="ignored") == forced
+    # An EXPLICIT board still reaches across (t_05ebe370) — see the matching
+    # note in tests/hermes_cli/test_kanban_boards.py. Vouching gates whether the
+    # out-of-home pin is usable at all; it does not outrank a named board.
+    assert kb.kanban_db_path(board="ignored") == (
+        sandbox / "kanban" / "boards" / "ignored" / "kanban.db"
+    )
 
 
 def test_dropped_pin_is_not_silent(sandbox, tmp_path, monkeypatch, caplog):

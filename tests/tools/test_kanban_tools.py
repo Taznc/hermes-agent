@@ -178,7 +178,16 @@ def test_complete_orphaned_worker_gets_distinguishable_exit_signal(worker_env):
 
     conn = kbc.connect()
     try:
-        assert kb.delete_task(conn, worker_env)
+        # Manufacture the orphan state with a raw DELETE rather than
+        # kb.delete_task: t_749b0510's guard now (correctly) REFUSES to delete a
+        # 'running' row with a live worker, which is the very incident this
+        # contract exists for. The guard closes one route into the state; it does
+        # not make the state unreachable (gc/archive paths, direct DB surgery,
+        # and any row deleted before the guard shipped all still produce it), so
+        # the orphan-exit signal must still hold. Asserting through delete_task
+        # here would test the guard, not this contract.
+        with kb.write_txn(conn):
+            conn.execute("DELETE FROM tasks WHERE id = ?", (worker_env,))
         assert kb.get_task(conn, worker_env) is None
     finally:
         conn.close()
@@ -215,7 +224,11 @@ def test_heartbeat_orphaned_worker_gets_distinguishable_exit_signal(worker_env):
 
     conn = kbc.connect()
     try:
-        assert kb.delete_task(conn, worker_env)
+        # Raw DELETE for the same reason as the kanban_complete case above:
+        # t_749b0510's guard correctly refuses delete_task on a live running row.
+        with kb.write_txn(conn):
+            conn.execute("DELETE FROM tasks WHERE id = ?", (worker_env,))
+        assert kb.get_task(conn, worker_env) is None
     finally:
         conn.close()
 
