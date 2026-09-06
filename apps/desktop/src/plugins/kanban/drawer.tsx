@@ -54,10 +54,9 @@ import { CtaBanner } from './drawer_cta'
 import { groupActivity } from './drawer_events'
 import {
   AttachmentsSection,
-  DEFAULT_LOG_TAIL_BYTES,
+  FULL_LOG_TAIL_BYTES,
   ImagesSection,
   isImageAttachment,
-  MAX_LOG_TAIL_BYTES,
   WorkerLogSection
 } from './drawer_log'
 import {
@@ -165,12 +164,10 @@ export function TaskDrawer({
   const currentRun = running ? detail?.runs.find(run => run.status === 'running') : undefined
   const defaultAssignee = useDefaultAssignee()
 
-  // "Show more" widens the requested tail instead of leaving a bare `...]` —
-  // the acceptance criteria want a visible affordance, not silent truncation.
-  // Resets to the default whenever the drawer switches to a different task.
-  const [logTail, setLogTail] = useState(DEFAULT_LOG_TAIL_BYTES)
-
-  useEffect(() => setLogTail(DEFAULT_LOG_TAIL_BYTES), [id])
+  // The worker artifact is capped/rotated by the backend at this same size,
+  // so this is the entire retained log — never an arbitrary UI tail that
+  // readers need to page through.
+  const logTail = FULL_LOG_TAIL_BYTES
   // A different card starts on Overview — carrying the previous card's tab
   // over would open a log the user never asked for.
   useEffect(() => setTab('overview'), [id])
@@ -546,9 +543,8 @@ export function TaskDrawer({
             {tab === 'log' && (
               <>
                 <WorkerLogSection
+                  live={running}
                   log={log}
-                  onShowMore={() => setLogTail(t => Math.min(t * 4, MAX_LOG_TAIL_BYTES))}
-                  tail={logTail}
                 />
 
                 <ImagesSection

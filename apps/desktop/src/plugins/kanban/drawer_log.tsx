@@ -4,14 +4,16 @@
  */
 
 import { Button, Codicon, CopyButton, LogView, Tip, useQuery } from '@hermes/plugin-sdk'
-import { useRef, useState } from 'react'
+import { useEffect, useRef, useState } from 'react'
 
 import { fetchAttachmentDataUrl } from './api'
 import type { KanbanAttachment, WorkerLog } from './types'
-import { ScrollFade, Section, useKanban } from './ui'
+import { Section, useKanban } from './ui'
 
-export const DEFAULT_LOG_TAIL_BYTES = 16_384
-export const MAX_LOG_TAIL_BYTES = 1_048_576 // 1 MiB — well under the backend's 2 MiB rotation size.
+// The API caps both a single response and the active on-disk artifact at 2 MiB.
+// Requesting that ceiling once means the drawer shows every retained line instead
+// of asking readers to page through an arbitrary short tail.
+export const FULL_LOG_TAIL_BYTES = 2_000_000
 
 export const isImageAttachment = (a: KanbanAttachment) => (a.content_type ?? '').startsWith('image/')
 
@@ -156,18 +158,38 @@ export function AttachmentsSection({
   )
 }
 
-/** The worker log tail. Gets the whole tab's height rather than the old 16rem
- *  peephole — reading the log IS the reason to be on this tab. */
+/** The complete retained worker log. It follows a running worker until the
+ * reader deliberately scrolls away, then offers an explicit return-to-live
+ * control rather than hijacking the inspection position. */
 export function WorkerLogSection({
   log,
-  onShowMore,
-  tail
+  live
 }: {
   log?: WorkerLog
-  onShowMore: () => void
-  tail: number
+  live: boolean
 }) {
   const k = useKanban()
+  const scrollRef = useRef<HTMLDivElement | null>(null)
+  const stickRef = useRef(true)
+  const [following, setFollowing] = useState(true)
+  const [wrap, setWrap] = useState(true)
+
+  const jumpToLatest = () => {
+    const viewport = scrollRef.current
+
+    if (viewport) {
+      viewport.scrollTop = viewport.scrollHeight
+    }
+
+    stickRef.current = true
+    setFollowing(true)
+  }
+
+  useEffect(() => {
+    if (stickRef.current) {
+      jumpToLatest()
+    }
+  }, [log?.content])
 
   if (!log?.exists || !log.content) {
     return <p className="text-[0.75rem] text-(--ui-text-quaternary)">{k.noLogYet}</p>
@@ -175,16 +197,52 @@ export function WorkerLogSection({
 
   return (
     <Section
-      action={<CopyButton appearance="icon" buttonSize="icon-xs" buttonVariant="ghost" text={() => log.content} />}
-      label={log.truncated ? k.workerLogTail : k.workerLog}
+      action={
+        <div className="flex items-center gap-1">
+          <Button
+            aria-label={k.workerLogWrap}
+            aria-pressed={wrap}
+            onClick={() => setWrap(value => !value)}
+            size="xs"
+            variant="text"
+          >
+            {k.workerLogWrap}
+          </Button>
+          <CopyButton appearance="icon" buttonSize="icon-xs" buttonVariant="ghost" text={() => log.content} />
+        </div>
+      }
+      label={log.truncated ? k.workerLogRetained : k.workerLog}
     >
-      <ScrollFade deps={log.content.length} max="30rem">
-        <LogView className="border-0 px-0" content={log.content} numbered />
-      </ScrollFade>
-      {log.truncated && tail < MAX_LOG_TAIL_BYTES && (
-        <Button className="self-start" onClick={onShowMore} size="xs" variant="text">
-          {k.workerLogShowMore}
-        </Button>
+      <LogView
+        className="max-h-[30rem] border-0 px-0"
+        content={log.content}
+        data-kanban-worker-log="true"
+        numbered
+        onScroll={event => {
+          const viewport = event.currentTarget
+          const nextFollowing = viewport.scrollHeight - viewport.scrollTop - viewport.clientHeight < 24
+
+          stickRef.current = nextFollowing
+          setFollowing(nextFollowing)
+        }}
+        ref={scrollRef}
+        wrap={wrap}
+      />
+      {live && (
+        <div className="flex items-center justify-between gap-2 text-[0.6875rem] text-(--ui-text-secondary)">
+          <span className="flex items-center gap-1.5" data-kanban-worker-log-state={following ? 'following' : 'paused'}>
+            <span
+              className="size-1.5 rounded-full"
+              style={{ backgroundColor: following ? 'var(--theme-primary)' : 'var(--ui-text-quaternary)' }}
+            />
+            {following ? k.workerLogLive : k.workerLogPaused}
+          </span>
+          {!following && (
+            <Button onClick={jumpToLatest} size="xs" variant="textStrong">
+              {k.workerLogJumpToLatest}
+            </Button>
+          )}
+        </div>
       )}
     </Section>
   )
