@@ -56,6 +56,35 @@ def test_model_routing_defaults_disabled_and_returns_default(kanban_home):
     assert decision.reasoning_effort is None
 
 
+def test_enabled_but_unconfigured_profile_fails_closed_without_classifier_call(kanban_home, monkeypatch):
+    from hermes_cli import kanban_model_routing as kmr
+
+    (kanban_home / "config.yaml").write_text(
+        "kanban:\n  model_routing:\n    enabled: true\n",
+        encoding="utf-8",
+    )
+    calls = []
+
+    def _fake_llm(*_args, **_kwargs):
+        calls.append(("called", _args, _kwargs))
+        return type("Resp", (), {
+            "choices": [
+                type("Choice", (), {"message": type("Msg", (), {"content": '{\"route\":\"mechanical\"}'})()})()
+            ]
+        })()
+
+    monkeypatch.setattr(kmr, "_call_llm", _fake_llm)
+
+    decision = kmr.resolve_kanban_model_route(title="Tighten README", body="Narrow docs tweak")
+
+    assert calls == []
+    assert decision.route_source == "default"
+    assert decision.route_name is None
+    assert decision.model_override is None
+    assert decision.provider_override is None
+    assert decision.reasoning_effort is None
+
+
 def test_explicit_override_short_circuits_classifier_call(kanban_home, monkeypatch):
     from hermes_cli import kanban_model_routing as kmr
 

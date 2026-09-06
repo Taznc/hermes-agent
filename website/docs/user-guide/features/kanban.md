@@ -27,10 +27,13 @@ dashboard task payload include the route provenance (`route_source`, `route_name
 
 ### Create-time routing policy
 
-`kanban.model_routing` is disabled by default. When a profile turns it on, the classifier only sees
-the new card's title/body and must return either `default` or one of the configured named routes.
-Any malformed, unavailable, unsupported, or failed classification falls back to `default`, which
-means the assignee profile keeps its own model/provider/reasoning settings.
+`kanban.model_routing` is disabled by default, and its shipped defaults are deliberately inert:
+setting `enabled: true` alone cannot make a classifier call or select a route. Each profile independently
+configures its classifier provider/model and every eligible candidate route; profiles do not inherit this
+policy from the default profile. The classifier only sees the new card's title/body and must return either
+`default` or one of those configured named routes. Any malformed, unavailable, unsupported, or failed
+classification falls back to `default`, which means the assignee profile keeps its own
+model/provider/reasoning settings.
 
 Explicit task-level `model`, `provider`, and `reasoning_effort` overrides always win over routing.
 The route itself should be treated as a conservative safety gate, not a general optimizer: only
