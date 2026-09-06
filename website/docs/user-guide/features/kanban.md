@@ -1037,8 +1037,11 @@ that can actually order two workers.
 
 Scope is deliberately narrow, so declaring costs nothing:
 
-- Matching is exact per-path equality after normalization (`./a/b.ts`, `a//b.ts`
-  and `` `a/b.ts` `` are the same file). No globs, no directory prefixes.
+- Matching is exact per-path equality after normalization (`./a/b.ts`, `a//b.ts`,
+  `` `a/b.ts` `` and the residue of a bolded label are the same file). Markdown
+  spelling never splits the key: ``**hotspot:** `a/b.ts` `` and `hotspot: a/b.ts`
+  declare the same path, so an orchestrator's `Edit-Targets:` field and a
+  worker's bolded hotspot comment interoperate. No globs, no directory prefixes.
 - Only the overlapping pair is serialized — two cards naming *different* files
   in the same repo still run concurrently. It is not a repo-wide lock.
 - A card that declares nothing and has no hotspot history dispatches exactly as
@@ -1052,7 +1055,10 @@ Scope is deliberately narrow, so declaring costs nothing:
   follows it, and a line whose comma-separated items are not *all* paths is
   treated as prose rather than having its file-shaped fragments harvested. The
   worker protocol asks every card for a hotspot line, so most of them are
-  negations; mining that prose would park unrelated cards behind each other.
+  negations; mining that prose would park unrelated cards behind each other. A
+  trailing parenthetical annotation (`` `a/b.ts` (2235 lines, +235) — reason ``)
+  is dropped before that check, so an annotation's internal comma cannot make a
+  genuinely declared file look like prose.
 - A brace group is expanded into the real files it names
   (`src/i18n/{en,zh}.ts` → `src/i18n/en.ts`, `src/i18n/zh.ts`) rather than being
   comma-split into fragments, and anything still carrying glob syntax

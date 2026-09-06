@@ -56,7 +56,8 @@ _LABEL_ALTERNATION = "|".join(
 
 # "Edit-Targets: a/b.ts, c/d.tsx" — the rest of the line is the payload.
 _INLINE_RE = re.compile(
-    rf"^[ \t>*\-]*(?:\*\*)?(?:{_LABEL_ALTERNATION})(?:\*\*)?[ \t]*:[ \t]*(?P<rest>\S.*)$",
+    rf"^[ \t>*\-]*(?:\*\*)?(?:{_LABEL_ALTERNATION})(?:\*\*)?[ \t]*:[ \t]*"
+    rf"(?:\*\*[ \t]*)?(?P<rest>\S.*)$",
     re.IGNORECASE,
 )
 # "Edit targets:" alone on a line, followed by a bullet list.
@@ -66,11 +67,20 @@ _HEADING_RE = re.compile(
 )
 _BULLET_RE = re.compile(r"^[ \t>]*(?:[-*+]|\d+[.)])[ \t]+(?P<item>\S.*?)[ \t]*$")
 
-_HOTSPOT_RE = re.compile(r"^[ \t>*\-]*(?:\*\*)?hotspot(?:\*\*)?[ \t]*:[ \t]*(?P<rest>\S.*)$", re.IGNORECASE)
+_HOTSPOT_RE = re.compile(
+    r"^[ \t>*\-]*(?:\*\*)?hotspot(?:\*\*)?[ \t]*:[ \t]*(?:\*\*[ \t]*)?(?P<rest>\S.*)$",
+    re.IGNORECASE,
+)
 # A worker writes "hotspot: <path> — <reason>". The separator is an em/en dash or
 # a spaced ASCII dash; requiring the surrounding space keeps a hyphenated
 # directory name ("right-rail/preview-pane.tsx") intact.
 _HOTSPOT_REASON_RE = re.compile(r"\s+(?:[—–]|--|-)\s+")
+
+# A parenthetical annotation after a path ("(2235 lines, fork diverged +235)").
+# Its internal comma splits the payload and the resulting non-path chunk makes
+# strict mode reject the whole line, so a genuinely declared file goes unseen.
+# Dropping the annotation keeps strict mode intact without loosening it.
+_ANNOTATION_RE = re.compile(r"(?<=\S)[ \t]*\([^()]*\)")
 
 _STRIP_CHARS = "`'\"*<>()[],;:."
 
@@ -97,19 +107,51 @@ _GLOB_CHARS = "*?[]"
 _ELISION_MEMBERS = frozenset({"...", "…", "..", "etc", "etc.", "…etc"})
 
 
+def _strip_wrappers(text: str) -> str:
+    """Peel markdown/punctuation wrappers until the value stops changing.
+
+    A single ``.strip(_STRIP_CHARS)`` pass stops at the first character it does
+    not know — so ``** `a/b.py` `` (the residue of a bold ``**hotspot:**``
+    label) keeps its backtick and becomes a DIFFERENT holder key from the same
+    file written plainly. The two signals this guard is built on would then fail
+    to interoperate on the same file. Alternating strips run to a fixed point,
+    so every spelling of one path collapses to one key.
+    """
+    previous = None
+    while text != previous:
+        previous = text
+        text = text.strip().strip(_STRIP_CHARS).strip()
+    return text
+
+
+def _drop_annotations(text: str) -> str:
+    """Remove ``(...)`` annotations that FOLLOW a value.
+
+    ``hotspot: `a/b.ts` (2235 lines, fork diverged +235) — shared with ...`` is
+    real board text. The comma inside the parenthetical splits the payload, one
+    chunk is then not a path, and strict mode discards the whole line — so a
+    genuinely contended file ends up declaring nothing. Dropping the annotation
+    keeps strict mode exactly as strict; it only stops an annotation from being
+    read as a second, non-path item. A leading ``(a/b.ts)`` is left alone:
+    nothing precedes it, so it is a wrapper, not an annotation.
+    """
+    return _ANNOTATION_RE.sub("", text)
+
+
 def normalize_edit_path(raw: Optional[str]) -> str:
     """Canonical form of one declared path, or ``""`` when it isn't one.
 
     Equivalent spellings of the same file must compare equal or the guard is
-    trivially defeated by formatting: ``./a/b.ts``, ``a//b.ts`` and `` `a/b.ts` ``
-    all normalize to ``a/b.ts``. Case is preserved — these are POSIX paths.
+    trivially defeated by formatting: ``./a/b.ts``, ``a//b.ts``, `` `a/b.ts` ``
+    and ``** `a/b.ts` `` all normalize to ``a/b.ts``. Case is preserved — these
+    are POSIX paths.
 
     Rejects anything still carrying glob syntax (``*``, ``?``, ``[]``, or a
     leftover brace). Those are patterns, not paths; admitting one would let a
     fragment such as ``apps/src/i18n/{en`` become a holder key that two
     unrelated cards then "collide" on.
     """
-    text = (raw or "").strip().strip(_STRIP_CHARS).strip()
+    text = _strip_wrappers(raw or "")
     if not text or any(ch.isspace() for ch in text):
         return ""
     if any(ch in text for ch in _GLOB_CHARS) or "{" in text or "}" in text:
@@ -130,11 +172,11 @@ def is_negation(payload: Optional[str]) -> bool:
     Only the first clause is consulted: ``none. The files I touched (a.py, b.py)``
     is a negation whose trailing prose must never be mined for paths.
     """
-    text = (payload or "").strip().strip(_STRIP_CHARS).strip().lower()
+    text = _strip_wrappers(payload or "").lower()
     if not text:
         return True
     head = _HEAD_CLAUSE_RE.split(text, maxsplit=1)[0]
-    head = head.strip().strip(_STRIP_CHARS).strip()
+    head = _strip_wrappers(head)
     return head in _NEGATIONS or text in _NEGATIONS
 
 
@@ -207,7 +249,7 @@ def _split_paths(payload: str, *, strict: bool = False) -> list[str]:
     few chunks that happen to look like filenames.
     """
     out: list[str] = []
-    for chunk in _split_payload(payload):
+    for chunk in _split_payload(_drop_annotations(payload)):
         if not chunk.strip():
             continue
         candidates = expand_brace_path(chunk)
@@ -296,7 +338,10 @@ def parse_hotspot_paths(text: Optional[str]) -> list[str]:
         rest = match.group("rest")
         if is_negation(rest):
             continue
-        payload = _HOTSPOT_REASON_RE.split(rest, maxsplit=1)[0]
+        # Drop annotations BEFORE the reason split: a dash inside "(fork
+        # diverged - big)" would otherwise truncate the payload mid-parenthesis
+        # and leave an unbalanced fragment.
+        payload = _HOTSPOT_REASON_RE.split(_drop_annotations(rest), maxsplit=1)[0]
         for path in _split_paths(payload, strict=True):
             if path not in found:
                 found.append(path)
@@ -332,7 +377,7 @@ def _metadata_hotspot_paths(raw: Optional[str]) -> list[str]:
             # Accept both a bare path and the "<path> — <reason>" prose form,
             # under the same strict rule as a comment line: a value that is not
             # wholly paths is prose and contributes nothing.
-            payload = _HOTSPOT_REASON_RE.split(item, maxsplit=1)[0]
+            payload = _HOTSPOT_REASON_RE.split(_drop_annotations(item), maxsplit=1)[0]
             candidates = _split_paths(payload, strict=True) or parse_hotspot_paths(item)
             for path in candidates:
                 if path not in found:

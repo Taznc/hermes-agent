@@ -583,3 +583,123 @@ def test_dry_run_reports_serialization_without_touching_the_board(kanban_home):
         real = kbd.dispatch_once(conn, spawn_fn=_fake_spawn)
         assert real.serialized_coedit == [(second, first, PANE)]
         assert _parents(kb, conn, second) == [first]
+
+
+# --- One file, one key: markdown spelling must not split the namespace ---
+#
+# The worker protocol's own example is bolded and backticked
+# ("**hotspot:** `path` — reason"). The bold label leaves a trailing ``**`` in
+# the payload, and a single strip pass stops at the space before the backtick —
+# so the same file spelled two ways became two different holder keys and the
+# declared field could not see the emitted comment. The guard is built on those
+# two signals interoperating.
+
+_SPELLINGS = {
+    "plain": "hotspot: {p} — reason",
+    "plain_backtick": "hotspot: `{p}` — reason",
+    "bold_label": "**hotspot:** `{p}` — reason",
+    "bold_label_no_close": "**hotspot**: `{p}` — reason",
+    "bold_bullet": "- **hotspot:** `{p}` — reason",
+    "quoted": 'hotspot: "{p}" — reason',
+}
+
+
+def test_every_hotspot_spelling_yields_the_same_key(kanban_home):
+    """Regression: ``**hotspot:** `a/b.py``` yielded ``` `a/b.py ``` — a key
+    distinct from the same file written plainly."""
+    from hermes_cli import kanban_coedit as kc
+
+    keys = {name: kc.parse_hotspot_paths(tpl.format(p=PANE)) for name, tpl in _SPELLINGS.items()}
+    for name, got in keys.items():
+        assert got == [PANE], f"{name}: {got}"
+    assert kc.normalize_edit_path("** `a/b.py`") == "a/b.py"
+    assert kc.normalize_edit_path("`a/b.py`") == kc.normalize_edit_path("** `a/b.py` ")
+
+
+def test_declared_field_and_bold_hotspot_comment_interoperate(kanban_home):
+    """The two signals the guard is built on must agree on one file.
+
+    An orchestrator fills in ``Edit-Targets:`` while the running card's only
+    signal is a bold hotspot comment. Pre-fix the keys differed and both cards
+    wrote the file concurrently.
+    """
+    kb = kanban_home
+    from hermes_cli import kanban_db_connect as kbc
+    from hermes_cli import kanban_db_dispatch as kbd
+
+    with kbc.connect_closing() as conn:
+        holder = kb.create_task(conn, title="holder", assignee="alpha", body="no declared field")
+        kb.add_comment(conn, holder, "claudeprimary", f"**hotspot:** `{PANE}` — contended")
+        later = kb.create_task(conn, title="later", assignee="beta", body=_body(PANE))
+
+    with kbc.connect_closing() as conn:
+        kbd.dispatch_once(conn, spawn_fn=_fake_spawn)
+        assert _status(conn, holder) == "running"
+        assert _status(conn, later) == "todo"
+        assert _parents(kb, conn, later) == [holder]
+
+
+def test_bold_declared_field_is_read_like_the_plain_one(kanban_home):
+    """``**Edit-Targets:** `a/b.ts``` is the same declaration as the plain form."""
+    from hermes_cli import kanban_coedit as kc
+
+    assert kc.parse_declared_paths(f"**Edit-Targets:** `{PANE}`") == [PANE]
+    assert kc.parse_declared_paths(f"Edit-Targets: {PANE}") == [PANE]
+    assert kc.parse_declared_paths("**Edit-Targets:** none") == []
+
+
+# --- A parenthetical annotation must not defeat strict mode ---
+
+def test_parenthetical_annotation_does_not_hide_a_declared_path(kanban_home):
+    """Live board text: ``hotspot: `x.ts` (2235 lines, fork diverged +235) — ...``
+
+    The comma inside the annotation split the payload, the annotation chunk was
+    not a path, and all-or-nothing discarded the whole line — so one half of a
+    genuine co-edit pair declared the file and the other declared nothing.
+    """
+    from hermes_cli import kanban_coedit as kc
+
+    store = "apps/desktop/src/store/session-states.ts"
+    annotated = f"hotspot: `{store}` (2235 lines, fork diverged +235) — shared with `t_ff46207f`"
+    plain = f"hotspot: `{store}` — shared with `t_ff46207f`"
+    assert kc.parse_hotspot_paths(annotated) == [store]
+    assert kc.parse_hotspot_paths(annotated) == kc.parse_hotspot_paths(plain)
+    assert kc._metadata_hotspot_paths(
+        json.dumps({"hotspot": f"{store} (2235 lines, +235) — shared"})
+    ) == [store]
+
+
+def test_annotation_handling_does_not_loosen_strict_mode(kanban_home):
+    """Dropping annotations must not turn prose into a declaration."""
+    from hermes_cli import kanban_coedit as kc
+
+    # An annotation is not itself a path, so a line that is only an annotation
+    # still declares nothing.
+    assert kc.parse_hotspot_paths("hotspot: (2235 lines, fork diverged) — reason") == []
+    # Prose around a path is still prose.
+    assert kc.parse_hotspot_paths("hotspot: watch a/b.py (big), and c/d.py — x") == []
+    # A negation with an annotation is still a negation.
+    assert kc.parse_hotspot_paths("**hotspot:** none (nothing shared with siblings)") == []
+
+
+def test_annotated_hotspot_serializes_against_its_plain_sibling(kanban_home):
+    """End-to-end: the live pair that had to be linked by hand now serializes."""
+    kb = kanban_home
+    from hermes_cli import kanban_db_connect as kbc
+    from hermes_cli import kanban_db_dispatch as kbd
+
+    store = "apps/desktop/src/store/session-states.ts"
+    with kbc.connect_closing() as conn:
+        holder = kb.create_task(conn, title="holder", assignee="alpha", body="no field")
+        kb.add_comment(
+            conn, holder, "claudeprimary",
+            f"hotspot: `{store}` (2235 lines, fork diverged +235) — shared with the sibling card",
+        )
+        later = kb.create_task(conn, title="later", assignee="beta", body="no field")
+        kb.add_comment(conn, later, "claudeprimary", f"hotspot: `{store}` — shared")
+
+    with kbc.connect_closing() as conn:
+        kbd.dispatch_once(conn, spawn_fn=_fake_spawn)
+        assert _status(conn, holder) == "running"
+        assert _status(conn, later) == "todo"
+        assert _parents(kb, conn, later) == [holder]
