@@ -124,6 +124,22 @@ describe('tabbed task drawer', () => {
     await waitFor(() => expect(screen.getByText(/worker stdout line/)).toBeTruthy())
   })
 
+  it('keeps the Activity timeline scrollable above persistent bottom chrome', async () => {
+    fetchTaskMock.mockResolvedValue(
+      detail({ events: [{ created_at: 10, id: 1, kind: 'spawned', payload: { pid: 42 } }] })
+    )
+    fetchLogMock.mockResolvedValue({ content: '', exists: false, size_bytes: 0, truncated: false })
+
+    mount(drawer())
+    fireEvent.click(await screen.findByRole('tab', { name: /tabActivity/ }))
+
+    const panel = await screen.findByRole('tabpanel')
+
+    // The desktop status bar is persistent. The panel must retain enough
+    // scroll-end inset that the final timeline row can rise above that chrome.
+    expect(panel.parentElement?.className).toContain('pb-10')
+  })
+
   it('CTA "Reply" switches to Activity and focuses the comment composer', async () => {
     fetchTaskMock.mockResolvedValue(detail())
     fetchLogMock.mockResolvedValue({ content: '', exists: false, size_bytes: 0, truncated: false })

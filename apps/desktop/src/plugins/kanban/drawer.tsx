@@ -395,7 +395,7 @@ export function TaskDrawer({
         />
       )}
 
-      <div className="min-h-0 flex-1 overflow-y-auto px-4 py-3" data-selectable-text="true">
+      <div className="min-h-0 flex-1 overflow-y-auto px-4 py-3 pb-10" data-selectable-text="true">
         {errorMessage ? (
           <ErrorState title={errorMessage} />
         ) : !detail || !task ? (
@@ -524,7 +524,11 @@ export function TaskDrawer({
 
                 {detail.events.length > 0 ? (
                   <Section label={k.activity(detail.events.length)}>
-                    <ScrollFade deps={detail.events.length} max="22rem">
+                    {/* Activity is an audit trail, not a live terminal: retain
+                        the reader's place while it refreshes, and give a dense
+                        timeline enough room to show more than a handful of
+                        transitions at once. The Worker Log owns live-follow. */}
+                    <ScrollFade max="min(28rem, 46vh)">
                       <ul className="flex flex-col gap-1">
                         {activityGroups.map(group => (
                           <ActivityRow group={group} k={k} key={group.events[0].id} />
