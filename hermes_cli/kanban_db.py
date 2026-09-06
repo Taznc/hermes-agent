@@ -4136,6 +4136,28 @@ def archive_task(conn: sqlite3.Connection, task_id: str) -> bool:
     return True
 
 
+def unarchive_task(conn: sqlite3.Connection, task_id: str, *, status: str = "todo") -> bool:
+    """Deliberately restore an archived task and leave an auditable event.
+
+    This is the only transition out of ``archived``. ``ready`` remains subject
+    to parent gating, so reopening an archived child cannot bypass its parents.
+    """
+    if status not in {"triage", "todo", "ready"}:
+        raise ValueError("unarchived tasks must land in triage, todo, or ready")
+    target = status
+    with write_txn(conn):
+        if target == "ready" and not _parents_satisfied(conn, task_id):
+            target = "todo"
+        cur = conn.execute(
+            "UPDATE tasks SET status = ? WHERE id = ? AND status = 'archived'",
+            (target, task_id),
+        )
+        if cur.rowcount != 1:
+            return False
+        _append_event(conn, task_id, "unarchived", {"status": target})
+    return True
+
+
 def _delete_task_relations(conn: sqlite3.Connection, task_id: str) -> None:
     """Delete every row referencing ``task_id`` (schema has no ON DELETE CASCADE)."""
     conn.execute("DELETE FROM task_links WHERE parent_id = ? OR child_id = ?", (task_id, task_id))

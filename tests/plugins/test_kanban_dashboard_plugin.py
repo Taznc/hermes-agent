@@ -1053,6 +1053,55 @@ def test_bulk_archive(client):
     assert b["id"] not in ids
 
 
+def test_archived_task_reopens_only_through_evented_unarchive(client):
+    """Dashboard drag-drop uses the explicit unarchive verb, not a raw status write."""
+    task = client.post("/api/plugins/kanban/tasks", json={"title": "archived"}).json()["task"]
+    archived = client.patch(
+        f"/api/plugins/kanban/tasks/{task['id']}", json={"status": "archived"},
+    )
+    assert archived.status_code == 200, archived.text
+
+    # The generic direct writer itself cannot escape archived; the public
+    # drag-drop route below must take the explicit unarchive verb instead.
+    plugin = sys.modules["hermes_dashboard_plugin_kanban_test"]
+    with kbc.connect() as conn:
+        assert not plugin._set_status_direct(conn, task["id"], "ready")
+        assert kb.get_task(conn, task["id"]).status == "archived"
+
+    moved = client.patch(
+        f"/api/plugins/kanban/tasks/{task['id']}", json={"status": "ready"},
+    )
+    assert moved.status_code == 200, moved.text
+
+    stored = client.get(f"/api/plugins/kanban/tasks/{task['id']}").json()["task"]
+    assert stored["status"] == "ready"
+    with kbc.connect() as conn:
+        last_event = conn.execute(
+            "SELECT kind, payload FROM task_events WHERE task_id = ? ORDER BY id DESC LIMIT 1",
+            (task["id"],),
+        ).fetchone()
+        assert last_event["kind"] == "unarchived"
+        assert json.loads(last_event["payload"])["status"] == "ready"
+    # This is the durable event/status contract the dispatcher relies on: a task
+    # whose last non-heartbeat event says archived cannot be dispatchable.
+    with kbc.connect() as conn:
+        mismatches = conn.execute(
+            """
+            WITH last_event AS (
+                SELECT task_id, kind,
+                       ROW_NUMBER() OVER (PARTITION BY task_id ORDER BY id DESC) AS n
+                  FROM task_events
+                 WHERE kind != 'heartbeat'
+            )
+            SELECT COUNT(*)
+              FROM tasks t
+              JOIN last_event e ON e.task_id = t.id AND e.n = 1
+             WHERE e.kind = 'archived' AND t.status != 'archived'
+            """,
+        ).fetchone()[0]
+    assert mismatches == 0
+
+
 def test_bulk_reassign(client):
     a = client.post("/api/plugins/kanban/tasks",
                     json={"title": "a", "assignee": "old"}).json()["task"]

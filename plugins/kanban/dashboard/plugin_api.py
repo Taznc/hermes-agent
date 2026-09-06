@@ -787,10 +787,14 @@ _RUNNING_DIRECT_MSG = "Cannot set status to 'running' directly; use the dispatch
 
 
 def _drag_to(conn, task_id: str, s: str) -> bool:
-    """Drag-drop into ready/todo/triage: blocked/scheduled -> ready re-opens via ``unblock_task``;
-    leaving ``review`` goes through ``reopen_review_task`` (stale-run recovery, parent re-gate,
-    ``review_reopened`` event) instead of a raw write; ``triage`` needs no current-state query."""
-    current = kanban_db.get_task(conn, task_id) if s != "triage" else None
+    """Drag-drop into ready/todo/triage: archived cards use the explicit,
+    evented unarchive verb; blocked/scheduled -> ready re-opens via
+    ``unblock_task``; leaving ``review`` goes through ``reopen_review_task``
+    (stale-run recovery, parent re-gate, ``review_reopened`` event) instead of
+    a raw write."""
+    current = kanban_db.get_task(conn, task_id)
+    if current is not None and current.status == "archived":
+        return kanban_db.unarchive_task(conn, task_id, status=s)
     if s == "ready" and current and current.status in ("blocked", "scheduled"):
         return kanban_db.unblock_task(conn, task_id)
     if s == "ready" and current and current.status == "on_hold":
@@ -954,6 +958,10 @@ def _set_status_direct(conn: sqlite3.Connection, task_id: str, new_status: str) 
             "SELECT status, current_run_id, worker_pid, claim_lock FROM tasks WHERE id = ?", (task_id,)).fetchone()
         if prev is None:
             return False
+        # Archived is a one-way door from this path: leaving it goes through the explicit
+        # kanban_db.archive_task()/unarchive verb only, never a bare drag-drop status write.
+        if prev["status"] == "archived":
+            return False
         if prev["status"] == "running" and new_status == "ready":
             resume_status = kanban_db._retry_status_for_run(conn, task_id, prev["current_run_id"])
             if resume_status == "review":
@@ -969,7 +977,10 @@ def _set_status_direct(conn: sqlite3.Connection, task_id: str, new_status: str) 
             "  claim_lock = CASE WHEN ? = 'running' THEN claim_lock ELSE NULL END, "
             "  claim_expires = CASE WHEN ? = 'running' THEN claim_expires ELSE NULL END, "
             "  worker_pid = CASE WHEN ? = 'running' THEN worker_pid ELSE NULL END "
-            "WHERE id = ?",
+            # Defense-in-depth: the archived precondition above already returns before this
+            # point, but the WHERE clause independently blocks the CAS if that check is ever
+            # bypassed or refactored around.
+            "WHERE id = ? AND status != 'archived'",
             (effective_status,) * 4 + (task_id,))
         if cur.rowcount != 1:
             return False
