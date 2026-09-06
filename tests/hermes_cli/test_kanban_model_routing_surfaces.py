@@ -296,3 +296,25 @@ def test_idempotent_replays_skip_routing_across_create_surfaces(
     })
     assert response.status_code == 200
     assert response.json()["task"]["id"] == dashboard_id
+
+
+def test_dashboard_idempotent_replay_validates_explicit_override_before_skipping_routing(
+    kanban_home, monkeypatch, router_client
+):
+    """Invalid override pairs stay invalid even when a replay finds an existing task."""
+    created = router_client.post("/api/plugins/kanban/tasks", json={
+        "title": "Dashboard existing", "assignee": "claudeprimary", "idempotency_key": "dashboard-key",
+    })
+    assert created.status_code == 200
+
+    def _unexpected_resolver(**_kwargs):
+        raise AssertionError("idempotent replay must not classify")
+
+    monkeypatch.setattr("hermes_cli.kanban_model_routing.resolve_kanban_model_route", _unexpected_resolver)
+    replay = router_client.post("/api/plugins/kanban/tasks", json={
+        "title": "Dashboard replay", "assignee": "claudeprimary", "idempotency_key": "dashboard-key",
+        "provider_override": "openai-codex",
+    })
+
+    assert replay.status_code == 400
+    assert replay.json()["detail"] == "provider_override requires a model_override"
