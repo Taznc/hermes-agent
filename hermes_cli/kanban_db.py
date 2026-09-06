@@ -476,15 +476,54 @@ def _dir_holds_board(d: Path) -> bool:
     return (d / "board.json").exists() or (d / "kanban.db").exists()
 
 
+def _override_is_stale(override_path: Path) -> bool:
+    """True when *override_path* does not live under the currently-resolved
+    :func:`kanban_home`.
+
+    A ``HERMES_KANBAN_*`` path pin is only meaningful relative to the home it
+    was computed against. When a caller sandboxes itself the obvious way —
+    setting ``HERMES_HOME`` to a temp dir — but still inherits a
+    ``HERMES_KANBAN_DB``/``..._WORKSPACES_ROOT``/``..._ATTACHMENTS_ROOT`` pin
+    from a parent/dispatcher process, the pin no longer points anywhere under
+    the caller's own home: it is stale and must lose, or every write goes to
+    the wrong (often live/production) home instead of the sandbox the caller
+    believes it is in.
+    """
+    try:
+        home = kanban_home().resolve()
+        override_path.resolve().relative_to(home)
+        return False
+    except (ValueError, OSError):
+        return True
+
+
 def _board_path(
     env_var: Optional[str], board: Optional[str], default_parts: tuple[str, ...], leaf: str,
 ) -> Path:
     """Shared resolver: ``env_var`` override, else legacy ``<root>/<default_parts>``
-    for the ``default`` board, else ``board_dir(slug)/leaf``."""
+    for the ``default`` board, else ``board_dir(slug)/leaf``.
+
+    The override is honored only when it lives under the currently-resolved
+    :func:`kanban_home` — see :func:`_override_is_stale`. Dispatcher-spawned
+    workers are unaffected: the dispatcher injects both the path override and
+    a matching ``HERMES_HOME`` so the pin always resolves under the worker's
+    own kanban home. A stale override is dropped with a one-line warning
+    rather than silently honored.
+    """
     if env_var:
         override = os.environ.get(env_var, "").strip()
         if override:
-            return Path(override).expanduser()
+            override_path = Path(override).expanduser()
+            if _override_is_stale(override_path):
+                _log.warning(
+                    "kanban: ignoring stale %s=%r — it does not live under "
+                    "the currently-resolved kanban home (%s). HERMES_HOME "
+                    "was repointed without a matching override, so the pin "
+                    "is stale; resolving under the current home instead.",
+                    env_var, override, kanban_home(),
+                )
+            else:
+                return override_path
     slug = _normalize_board_slug(board)
     if slug is None:
         slug = get_current_board()
