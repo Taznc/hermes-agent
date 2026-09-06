@@ -725,6 +725,59 @@ def test_delete_task_removes_task_and_cascades(kanban_home):
         assert len(kb.list_runs(conn, t)) == 0
 
 
+def test_delete_task_refuses_running_task_with_active_worker(kanban_home):
+    """A ``running`` row with a live worker_pid/current_run_id must not be silently erased
+    (t_749b0510): every reclaim path (count_running_tasks, detect_crashed_workers,
+    detect_worker_timeouts, reconcile_orphaned_running) keys off the row that would vanish,
+    so deleting it orphans a worker no accounting path can ever see again."""
+    import hermes_cli.kanban_db as _kb
+    from hermes_cli import kanban_db_dispatch as _kbd
+
+    with kbc.connect() as conn:
+        host = _kb._claimer_id().split(":", 1)[0]
+        t = kb.create_task(conn, title="running-victim", assignee="alice")
+        kb.claim_task(conn, t, claimer=f"{host}:w1")
+        _kbd._set_worker_pid(conn, t, 424242)
+
+        with pytest.raises(RuntimeError):
+            kb.delete_task(conn, t)
+
+        task = kb.get_task(conn, t)
+        assert task is not None
+        assert task.status == "running"
+        assert task.worker_pid == 424242
+
+
+def test_delete_task_still_works_for_non_running_rows(kanban_home):
+    """The guard is scoped to ``running`` + an active claim/run; every other status deletes
+    exactly as before (todo/ready/done/blocked/archived all lack a live worker to orphan)."""
+    with kbc.connect() as conn:
+        t = kb.create_task(conn, title="plain-todo")
+        assert kb.delete_task(conn, t) is True
+        assert kb.get_task(conn, t) is None
+
+
+def test_count_running_tasks_never_undercounts_after_guard(kanban_home):
+    """Regression for the accounting half of t_749b0510: a ``running`` row with an active
+    claim/run can no longer simply disappear via ``delete_task`` — the delete is refused, the
+    row stays, and ``count_running_tasks`` still sees it (the old bug: the row vanished and
+    the live worker became invisible to every accounting path)."""
+    import hermes_cli.kanban_db as _kb
+    from hermes_cli import kanban_db_dispatch as _kbd
+
+    with kbc.connect() as conn:
+        host = _kb._claimer_id().split(":", 1)[0]
+        t = kb.create_task(conn, title="stubborn", assignee="alice")
+        kb.claim_task(conn, t, claimer=f"{host}:w1")
+        _kbd._set_worker_pid(conn, t, 424244)
+
+        before = _kbd.count_running_tasks(conn)
+        with pytest.raises(RuntimeError):
+            kb.delete_task(conn, t)
+        after = _kbd.count_running_tasks(conn)
+        assert after == before, "a live worker's row must still be counted after a refused delete"
+
+
 
 
 # ---------------------------------------------------------------------------

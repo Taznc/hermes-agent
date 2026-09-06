@@ -4022,7 +4022,27 @@ def delete_archived_task(conn: sqlite3.Connection, task_id: str) -> bool:
 
 
 def delete_task(conn: sqlite3.Connection, task_id: str) -> bool:
-    """Hard-delete a task and its related rows in one txn; False when not found."""
+    """Hard-delete a task and its related rows; False when not found.
+
+    Refuses (``RuntimeError``) when the row is ``running`` with an active claim/run: deleting
+    that row out from under a live worker orphans it — no reclaim path
+    (``count_running_tasks``, ``detect_crashed_workers``, ``detect_worker_timeouts``,
+    ``reconcile_orphaned_running``) can find a worker whose row is gone, because every one of
+    them starts from a ``WHERE status = 'running'`` query on a row that no longer exists
+    (t_749b0510). Matches ``delete_archived_task``'s \"two deliberate actions\" principle:
+    reclaim (``release_stale_claims``/``detect_crashed_workers``/dashboard status change) or
+    archive the task first, then delete — never delete straight out of ``running``.
+    """
+    row = conn.execute(
+        "SELECT status, worker_pid, current_run_id FROM tasks WHERE id = ?", (task_id,),
+    ).fetchone()
+    if row is None:
+        return False
+    if row["status"] == "running" and (row["worker_pid"] or row["current_run_id"]):
+        raise RuntimeError(
+            f"refusing to delete {task_id}: status='running' with an active claim/run "
+            f"(worker_pid={row['worker_pid']!r}) — reclaim or archive it first"
+        )
     with write_txn(conn):
         cur = conn.execute("DELETE FROM tasks WHERE id = ?", (task_id,))
         if cur.rowcount != 1:
