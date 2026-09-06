@@ -29,6 +29,7 @@ from gateway.kanban_watchers_dispatcher import (
     _KanbanDispatcher,
     _log_spawn_results,
     _resolve_dispatcher_settings,
+    _reload_dispatcher_settings,
 )
 
 _IMAGE_EXTS = {".png", ".jpg", ".jpeg", ".gif", ".webp"}
@@ -280,6 +281,12 @@ class GatewayKanbanWatchersMixin:
                     # See #49638.
                     if _ad_enabled:
                         await _to_thread_process_service(dispatcher.auto_decompose_tick, _ad_per_tick)
+                    # Re-read the concurrency caps for the same reason: raising
+                    # max_in_progress must not require a gateway restart, which
+                    # would SIGKILL every worker the cap is scheduling.
+                    settings = await _to_thread_process_service(
+                        _reload_dispatcher_settings, _load_config, _kb, settings)
+                    dispatcher.settings = settings
                     results = await _to_thread_process_service(dispatcher.tick_once)
                     any_spawned = _log_spawn_results(results)
                     ready_pending = await _to_thread_process_service(dispatcher.ready_nonempty)
