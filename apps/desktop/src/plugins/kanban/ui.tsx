@@ -3,8 +3,11 @@
 
 import {
   atom,
+  Button,
+  cn,
   coarseElapsed,
   Codicon,
+  CompactMarkdown,
   DropdownMenu,
   DropdownMenuContent,
   DropdownMenuItem,
@@ -13,9 +16,11 @@ import {
   profileColor,
   profileColorSoft,
   relativeTime,
+  TextTab,
+  TextTabMeta,
   useQuery
 } from '@hermes/plugin-sdk'
-import { type ReactNode, useEffect, useState } from 'react'
+import { type ReactNode, useEffect, useLayoutEffect, useRef, useState } from 'react'
 
 import { fetchOrchestration, ORCHESTRATION_KEY } from './api'
 import { columnLabel, useKanban } from './i18n'
@@ -53,6 +58,12 @@ export const LOCKED_COLUMNS = ['review', 'running', 'scheduled'] as const
 export const isLockedTarget = (name: string): boolean => (LOCKED_COLUMNS as readonly string[]).includes(name)
 
 export const shortId = (id?: null | string) => (id ?? '').replace(/^t_/, '').slice(0, 6)
+
+/** The one way this plugin tints a surface with a status/severity tone. Every
+ *  caller goes through it so "how strong is a wash" is a single decision and
+ *  the tone itself always traces back to COLUMN_META / SEVERITY_TONE — there
+ *  is no second palette and no raw color anywhere downstream. */
+export const wash = (tone: string, percent: number) => `color-mix(in srgb, ${tone} ${percent}%, transparent)`
 
 // The electron REST bridge throws `Error("409: {\"detail\":\"…\"}")`; pull out
 // the human-readable detail for a toast.
@@ -204,10 +215,10 @@ export function StatusMenu({
       <DropdownMenuTrigger asChild>
         <button
           className="inline-flex items-center gap-1.5 rounded px-2 py-1 text-[0.6875rem] font-semibold uppercase tracking-wide transition-[filter] hover:brightness-105"
-          style={{ backgroundColor: `color-mix(in srgb, ${meta.tone} 15%, transparent)`, color: meta.tone }}
+          style={{ backgroundColor: wash(meta.tone, 15), color: meta.tone }}
           type="button"
         >
-          <span className="size-1.5 rounded-full" style={{ backgroundColor: meta.tone }} />
+          <Codicon name={meta.codicon} size="0.75rem" />
           {columnLabel(k, status)}
           <Codicon name="chevron-down" size="0.7rem" />
         </button>
@@ -231,11 +242,27 @@ export function StatusMenu({
 // create dialog's Field, and the orchestration panel all read identically.
 export const FIELD_LABEL = 'text-[0.62rem] font-semibold uppercase tracking-[0.14em] text-(--ui-text-quaternary)'
 
-export function Section({ action, children, label }: { action?: ReactNode; children: ReactNode; label: string }) {
+export function Section({
+  action,
+  children,
+  label,
+  tone
+}: {
+  action?: ReactNode
+  children: ReactNode
+  label: string
+  /** Optional accent for the section's label — a tone-colored label + dot is
+   *  how a section says "this is about a blocked/failed/review state" without
+   *  wrapping itself in a box (DESIGN.md: flat, not boxed). */
+  tone?: string
+}) {
   return (
     <section className="flex flex-col gap-1.5">
       <div className="flex items-center justify-between">
-        <div className={FIELD_LABEL}>{label}</div>
+        <div className={cn(FIELD_LABEL, 'flex items-center gap-1.5')} style={tone ? { color: tone } : undefined}>
+          {tone && <span className="size-1.5 rounded-full" style={{ backgroundColor: tone }} />}
+          {label}
+        </div>
         {action}
       </div>
       {children}
@@ -260,7 +287,7 @@ export function Callout({
   return (
     <div
       className="flex flex-col gap-2 rounded-md p-2.5"
-      style={{ backgroundColor: `color-mix(in srgb, ${tone} 7%, transparent)`, borderLeft: `2px solid ${tone}` }}
+      style={{ backgroundColor: wash(tone, 7), borderLeft: `2px solid ${tone}` }}
     >
       <div className="flex items-start gap-1.5 text-[0.75rem] font-medium" style={{ color: tone }}>
         <Codicon className="mt-px shrink-0" name={icon} size="0.8rem" />
@@ -293,8 +320,8 @@ export function Banner({
     <div
       className="flex flex-col gap-2 rounded-lg border p-3"
       style={{
-        backgroundColor: `color-mix(in srgb, ${tone} 10%, transparent)`,
-        borderColor: `color-mix(in srgb, ${tone} 32%, transparent)`
+        backgroundColor: wash(tone, 10),
+        borderColor: wash(tone, 32)
       }}
     >
       <div className="flex items-center gap-2">
@@ -317,5 +344,140 @@ export function ScrollFade({ children, deps, max = '9rem' }: { children: ReactNo
     <FadeScroll deps={deps} maxHeight={max}>
       {children}
     </FadeScroll>
+  )
+}
+
+// ── tabs ─────────────────────────────────────────────────────────────────────
+
+/** One tab in the drawer's tab strip. `count` renders as the quiet meta slot
+ *  beside the label (TextTabMeta) so "Activity 71" reads as one control. */
+export interface TabSpec {
+  id: string
+  label: string
+  count?: number
+}
+
+/**
+ * The drawer's tab strip. Flat by construction: the app's `TextTab` primitive
+ * (underline-on-active, no pill, no box) sitting on a single hairline, so the
+ * strip groups the panels below it without nesting a second surface inside the
+ * drawer. Tab state belongs to the caller — this is pure presentation.
+ */
+export function TabStrip({
+  active,
+  onSelect,
+  tabs
+}: {
+  active: string
+  onSelect: (id: string) => void
+  tabs: TabSpec[]
+}) {
+  return (
+    <div className="flex items-center gap-3 border-b border-(--ui-stroke-tertiary) px-4" role="tablist">
+      {tabs.map(tab => (
+        <TextTab
+          active={active === tab.id}
+          aria-controls={`kanban-tabpanel-${tab.id}`}
+          aria-selected={active === tab.id}
+          key={tab.id}
+          onClick={() => onSelect(tab.id)}
+          role="tab"
+        >
+          {tab.label}
+          {tab.count != null && tab.count > 0 && <TextTabMeta>{tab.count}</TextTabMeta>}
+        </TextTab>
+      ))}
+    </div>
+  )
+}
+
+// ── rows ─────────────────────────────────────────────────────────────────────
+
+/**
+ * A list row carrying a tone as a left rule + the faintest possible wash. Used
+ * for run rows and activity rows so a crashed run or a block event is findable
+ * by color while the highest-volume rows (heartbeats) stay the quietest thing
+ * in the list — they resolve to a neutral tone and get no wash at all.
+ */
+export function AccentRow({
+  children,
+  className,
+  quiet = false,
+  tone
+}: {
+  children: ReactNode
+  className?: string
+  /** True for high-volume/no-meaning rows: rule only, no fill. */
+  quiet?: boolean
+  tone: string
+}) {
+  return (
+    <li
+      className={cn('rounded-r py-0.5 pl-2', className)}
+      style={{
+        backgroundColor: quiet ? undefined : wash(tone, 5),
+        borderLeft: `2px solid ${quiet ? wash(tone, 45) : tone}`
+      }}
+    >
+      {children}
+    </li>
+  )
+}
+
+// ── markdown ─────────────────────────────────────────────────────────────────
+
+/** How tall the collapsed description may grow, in `em`. ~8 lines at the
+ *  compact renderer's leading — the operator's stated ask. */
+const COLLAPSED_EM = 13
+
+/**
+ * Rendered markdown that starts clamped to ~8 lines with a Show more / Show
+ * less affordance. The toggle only appears when the content actually overflows
+ * (measured after layout), so a two-line description has no dead control.
+ *
+ * This renders — it never edits. The inline editor above it hands the user the
+ * RAW source in a Textarea; the two are deliberately different views of the
+ * same string.
+ */
+export function CollapsibleMarkdown({ text }: { text: string }) {
+  const k = useKanban()
+  const [expanded, setExpanded] = useState(false)
+  const [overflows, setOverflows] = useState(false)
+  const ref = useRef<HTMLDivElement>(null)
+
+  // Re-measure on text change: a card switch or an edit can flip a description
+  // from "fits" to "needs the toggle" without the component remounting.
+  useLayoutEffect(() => {
+    const el = ref.current
+
+    if (el) {
+      setOverflows(el.scrollHeight > el.clientHeight + 1)
+    }
+  }, [text])
+
+  useEffect(() => setExpanded(false), [text])
+
+  return (
+    <div className="flex flex-col gap-1">
+      <div
+        className="overflow-hidden"
+        ref={ref}
+        style={
+          expanded
+            ? undefined
+            : {
+                maskImage: `linear-gradient(to bottom, var(--ui-text-primary) ${COLLAPSED_EM - 2}em, transparent)`,
+                maxHeight: `${COLLAPSED_EM}em`
+              }
+        }
+      >
+        <CompactMarkdown className="text-[0.78rem] text-(--ui-text-secondary)" text={text} />
+      </div>
+      {(overflows || expanded) && (
+        <Button className="self-start" onClick={() => setExpanded(v => !v)} size="xs" variant="text">
+          {expanded ? k.showLess : k.showMore}
+        </Button>
+      )}
+    </div>
   )
 }
