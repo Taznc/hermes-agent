@@ -622,25 +622,120 @@ def test_terminate_reclaimed_worker_uses_bare_kill_without_worker_unit(monkeypat
     assert "worker_unit" not in info
 
 
-def test_terminate_reclaimed_worker_not_loaded_with_pid_alive_is_not_success(monkeypatch):
-    """B2 regression: ``_stop_systemd_unit`` returning True for a "not
-    loaded" unit (e.g. because the wrong unit id was queried, or the unit
-    was never actually created) must NOT be reported as a successful
-    termination when the worker PID is still alive — only the corroborated
-    pairing (stop reported success AND the PID is actually gone) counts."""
+def test_terminate_reclaimed_worker_not_loaded_with_pid_alive_falls_through_to_pid_kill(monkeypatch):
+    """B2 kept + BLOCKER-3 hardening: ``_stop_systemd_unit`` returning True
+    for a "not loaded" unit (e.g. because the wrong/stale unit id was
+    queried, or the unit was never actually created) must NOT be reported
+    as a successful termination purely on that basis — the corroborating
+    ``_pid_alive`` check (B2) still gates it. But it must also not give up:
+    a genuinely live worker behind a stale/wrong unit falls through to the
+    raw-PID SIGTERM/SIGKILL path instead of being declared un-terminated
+    and left to wedge the card forever (BLOCKER-3)."""
     import socket
 
     host = socket.gethostname() or "unknown"
     claim_lock = f"{host}:123"
+    calls = {"stop_unit": [], "kill": []}
+
+    def fake_stop_unit(unit_name):
+        calls["stop_unit"].append(unit_name)
+        return True
+
+    def fake_kill(pid, sig):
+        calls["kill"].append((pid, sig))
 
     # _stop_systemd_unit says "stopped" (e.g. it read "not loaded" as success
-    # against a unit id that was never actually running), but the real
-    # worker PID is still alive — the corroborating check must catch this.
+    # against a unit id that was stale/never actually running), but the real
+    # worker PID is still alive — the corroborating check catches that the
+    # unit-stop alone did not terminate it...
+    monkeypatch.setattr(kb, "_pid_alive", lambda pid: True)
+    # ...and the raw-PID path below is what actually delivers the signal.
+    monkeypatch.setattr(kbd, "_poll_worker_exit", lambda pid: True)
+
+    info = kbd._terminate_reclaimed_worker(
+        4242, claim_lock, worker_unit="kanban-t1-run-1.scope",
+        stop_unit_fn=fake_stop_unit, signal_fn=fake_kill,
+    )
+
+    assert calls["stop_unit"] == ["kanban-t1-run-1.scope"]
+    assert calls["kill"] and calls["kill"][0][0] == 4242  # PID path actually ran
+    assert info["terminated"] is True
+    assert info["termination_attempted"] is True
+
+
+def test_terminate_reclaimed_worker_unit_stop_failure_does_not_fall_through(monkeypatch):
+    """When ``_stop_systemd_unit`` itself reports failure (not "not
+    loaded", an actual stop error), there is no corroborating signal that
+    a kill would even reach the right target — stay conservative and do
+    NOT attempt the raw-PID path, unlike the stale-unit case above."""
+    import socket
+
+    host = socket.gethostname() or "unknown"
+    claim_lock = f"{host}:123"
+    calls = {"kill": []}
+
     monkeypatch.setattr(kb, "_pid_alive", lambda pid: True)
 
     info = kbd._terminate_reclaimed_worker(
-        4242, claim_lock, worker_unit="kanban-t1-run-1.scope", stop_unit_fn=lambda unit: True,
+        4242, claim_lock, worker_unit="kanban-t1-run-1.scope",
+        stop_unit_fn=lambda unit: False,
+        signal_fn=lambda *a: calls["kill"].append(a),
     )
 
+    assert calls["kill"] == []
     assert info["terminated"] is False
     assert info["termination_attempted"] is True
+
+
+# --------------------------------------------------------------------------
+# BLOCKER-3: worker_pid-clearing transitions must also clear worker_unit.
+#
+# _set_worker_pid only WRITES worker_unit when the new run produced one
+# (`if worker_unit:` — correct, so a unit-less spawn_fn test double can't
+# clobber a real unit). That means a stale worker_unit from a prior run
+# survives into a run that has no unit of its own UNLESS every verb that
+# clears worker_pid also explicitly clears worker_unit. request_review,
+# complete_task and block_task were missing that clear (reclaim_task always
+# had it correctly, per the audit's control case).
+# --------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "verb",
+    ["request_review", "complete_task", "block_task"],
+)
+def test_worker_pid_clearing_verb_also_clears_worker_unit(tmp_path, verb):
+    import hermes_cli.kanban_db_connect as kbc
+
+    conn = kbc.connect(tmp_path / "kanban.db")
+    try:
+        task_id = kb.create_task(conn, title="blocker-3 regression", assignee="coder")
+        claimed = kb.claim_task(conn, task_id)
+        assert claimed is not None
+        kbd._set_worker_pid(conn, task_id, 9999, worker_unit="kanban-stale-run-1.scope")
+
+        row = conn.execute(
+            "SELECT worker_pid, worker_unit FROM tasks WHERE id = ?", (task_id,),
+        ).fetchone()
+        assert row["worker_pid"] == 9999
+        assert row["worker_unit"] == "kanban-stale-run-1.scope"
+
+        if verb == "request_review":
+            ok = kb.request_review(conn, task_id, summary="done", expected_run_id=claimed.current_run_id)
+        elif verb == "complete_task":
+            ok = kb.complete_task(conn, task_id, result="done")
+        else:
+            ok = kb.block_task(conn, task_id, reason="blocked for regression test")
+        assert ok
+
+        row = conn.execute(
+            "SELECT worker_pid, worker_unit FROM tasks WHERE id = ?", (task_id,),
+        ).fetchone()
+        assert row["worker_pid"] is None
+        assert row["worker_unit"] is None, (
+            f"{verb} cleared worker_pid but left a stale worker_unit — this is "
+            "BLOCKER-3: the next run's _terminate_reclaimed_worker would route "
+            "through the stale unit's systemctl stop instead of a raw-PID kill."
+        )
+    finally:
+        conn.close()

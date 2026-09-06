@@ -466,8 +466,18 @@ def _terminate_reclaimed_worker(
         if stop_unit_fn is None:
             from tools.process_registry import _stop_systemd_unit as stop_unit_fn
         stopped = bool(stop_unit_fn(worker_unit))
-        info["terminated"] = stopped and not _kb._pid_alive(pid)
-        return info
+        if stopped and not _kb._pid_alive(pid):
+            info["terminated"] = True
+            return info
+        if not stopped:
+            # The unit stop itself failed (not merely "not loaded") — no
+            # corroborating signal was delivered to the pid, so don't guess.
+            info["terminated"] = False
+            return info
+        # stopped is True (systemd reports the unit stopped OR "not loaded",
+        # which _stop_systemd_unit also treats as success) but the pid is
+        # still alive: the unit was stale/wrong, so fall through to the raw
+        # PID path below instead of leaving a live worker un-reclaimable.
 
     kill = _kill_fn(signal_fn)
     if kill is None:
