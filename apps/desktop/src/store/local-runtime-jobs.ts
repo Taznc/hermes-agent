@@ -14,7 +14,7 @@ import type { LocalRuntimeJob } from '@/types/hermes'
 
 export const $localRuntimeJobs = atom<readonly LocalRuntimeJob[]>([])
 
-const POLL_ACTIVE_MS = 700
+export const POLL_ACTIVE_MS = 700
 let timer: null | number = null
 let polling = false
 // Jobs we've already toasted for, so a poll race can't double-notify.
