@@ -13,9 +13,9 @@ const card = {
 
 describe('parseMcpAppCard', () => {
   it('accepts only the bounded typed payload emitted beside a normal tool result', () => {
-    expect(parseMcpAppCard({ result: 'ordinary', mcpApp: card })).toEqual(card)
-    expect(parseMcpAppCard({ result: 'ordinary', mcpApp: { ...card, resourceUri: 'https://evil.test' } })).toBeNull()
-    expect(parseMcpAppCard({ result: 'ordinary', mcpApp: { ...card, html: 'x'.repeat(300_000) } })).toBeNull()
+    expect(parseMcpAppCard(card)).toEqual(card)
+    expect(parseMcpAppCard({ ...card, resourceUri: 'https://evil.test' })).toBeNull()
+    expect(parseMcpAppCard({ ...card, html: 'x'.repeat(300_000) })).toBeNull()
   })
 })
 

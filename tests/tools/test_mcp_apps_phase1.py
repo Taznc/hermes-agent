@@ -30,7 +30,7 @@ def test_discovery_records_only_bounded_ui_resource_uri():
     assert "invalid" not in mcp_tool._mcp_tool_ui_resources
 
 
-def test_successful_tool_call_appends_valid_html_card_without_replacing_text(monkeypatch):
+def test_successful_tool_call_keeps_card_transient_without_replacing_text(monkeypatch):
     from tools import mcp_tool
     from tools import mcp_tool_handlers as handlers
 
@@ -51,16 +51,19 @@ def test_successful_tool_call_appends_valid_html_card_without_replacing_text(mon
     with patch.dict(mcp_tool._servers, {"charts": server}), patch(
         "tools.mcp_tool_loop._run_on_mcp_loop", side_effect=run
     ):
-        payload = json.loads(handlers._make_tool_handler("charts", "chart", 10)({}))
+        result = handlers._make_tool_handler("charts", "chart", 10)({})
 
+    payload = json.loads(result)
     assert payload["result"] == "ordinary result"
-    assert {key: value for key, value in payload["mcpApp"].items() if key != "id"} == {
+    assert "mcpApp" not in payload
+    card = getattr(result, "mcp_app_card")
+    assert {key: value for key, value in card.items() if key != "id"} == {
         "serverId": "charts",
         "toolName": "chart",
         "resourceUri": "ui://charts/summary",
         "html": "<html><body>chart</body></html>",
     }
-    assert len(payload["mcpApp"]["id"]) >= 20
+    assert len(card["id"]) >= 20
     server.session.read_resource.assert_awaited_once_with("ui://charts/summary")
 
 

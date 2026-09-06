@@ -220,6 +220,12 @@ def _on_tool_complete(sid: str, tool_call_id: str, name: str, args: dict, result
         payload["result"] = json.loads(result)
     except Exception:
         payload["result"] = result
+    # An MCP App card is intentionally a live-only projection. Its text
+    # content above is the sole durable/model-facing result; this field exists
+    # only on this one completion event and is never written into a session.
+    card = getattr(result, "mcp_app_card", None)
+    if isinstance(card, dict):
+        payload["mcp_app"] = card
     summary = _tool_summary(name, result, duration_s)
     if summary:
         payload["summary"] = summary

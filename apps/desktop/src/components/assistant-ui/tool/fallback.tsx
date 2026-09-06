@@ -51,6 +51,7 @@ import { sessionApprovalRequest } from '@/store/prompts'
 import { $toolInlineDiff } from '@/store/tool-diffs'
 import { $toolRowDismissed, dismissToolRow } from '@/store/tool-dismiss'
 import { $anyToolDisclosureOpen, $toolDisclosureOpen, $toolViewMode, setToolDisclosureOpen } from '@/store/tool-view'
+import { $mcpAppCard } from '@/store/mcp-apps'
 
 import { APPROVAL_TOOLS, PendingToolApproval } from './approval'
 import {
@@ -74,7 +75,7 @@ import {
 } from './fallback-model'
 import { isToolCallPart, summarizeToolRun } from './run-summary'
 import { ToolRunTicker } from './run-ticker'
-import { McpAppCard, parseMcpAppCard } from '../mcp-app-card'
+import { McpAppCard } from '../mcp-app-card'
 
 // `true` when a ToolEntry is rendered inside an embedding wrapper that owns
 // the per-row chrome (timer / preview). The flat ToolGroupSlot sets this
@@ -374,7 +375,9 @@ function ToolEntry({ part }: ToolEntryProps) {
   // re-render every mounted tool row (the factory caches a per-id atom).
   const sideDiff = useStore($toolInlineDiff(toolCallId ?? ''))
   const inlineDiff = stripInlineDiffChrome(sideDiff) || inlineDiffFromResult(result)
-  const mcpApp = useMemo(() => parseMcpAppCard(result), [result])
+  // MCP App resources arrive only on the ephemeral live `tool.complete`
+  // projection. Stored results never populate this renderer-only atom.
+  const mcpApp = useStore($mcpAppCard(toolCallId ?? ''))
   const isFileEdit = isFileEditTool(toolName)
   const defaultOpen = Boolean(inlineDiff)
   const open = useDisclosureOpen(disclosureId, defaultOpen)

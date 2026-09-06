@@ -6,6 +6,7 @@ import { reportMcpToolResult } from '@/store/suggestion-providers/repair'
 import { invalidateSkillSuggestionIndex } from '@/store/suggestion-providers/skill'
 import { restoreSessionTodosFromSnapshot } from '@/store/todos'
 import { recordToolDiff } from '@/store/tool-diffs'
+import { recordMcpAppCard } from '@/store/mcp-apps'
 import { setSessionDraftingTool } from '@/store/tool-drafting'
 import { notifyWorkspaceChanged, toolChangedPath, toolMayMutateFiles } from '@/store/workspace-events'
 
@@ -68,6 +69,9 @@ export function handleToolEvent(ctx: GatewayEventContext): boolean {
     if (sessionId) {
       flushQueuedDeltas(sessionId)
       upsertToolCall(sessionId, toTodoPayload(payload) ?? payload, 'complete', event.type, occurredAt)
+      // This live projection is deliberately not part of the tool result, so
+      // transcript hydration cannot recreate an untrusted historical frame.
+      recordMcpAppCard(String(payload?.tool_id || ''), payload?.mcp_app)
 
       if (isActiveEvent) {
         setPetActivity({ toolRunning: false })

@@ -18,7 +18,7 @@ function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === 'object' && value !== null && !Array.isArray(value)
 }
 
-/** Parse the host-only envelope without accepting arbitrary result metadata. */
+/** Validate a bounded live-only card before an iframe is mounted. */
 export function parseMcpAppCard(value: unknown): McpAppCardPayload | null {
   if (typeof value === 'string') {
     try {
@@ -27,11 +27,11 @@ export function parseMcpAppCard(value: unknown): McpAppCardPayload | null {
       return null
     }
   }
-  if (!isRecord(value) || !isRecord(value.mcpApp)) {
+  if (!isRecord(value)) {
     return null
   }
 
-  const card = value.mcpApp
+  const card = value
   if (
     typeof card.serverId !== 'string' ||
     typeof card.id !== 'string' ||

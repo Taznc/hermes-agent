@@ -453,8 +453,24 @@ async def _read_mcp_app_card(server, server_name: str, tool_name: str) -> Option
     return {"id": secrets.token_urlsafe(18), "serverId": server_name, "toolName": tool_name, "resourceUri": uri, "html": html}
 
 
+class _McpAppToolResult(str):
+    """Ordinary model result with a live-only Desktop projection attached.
+
+    The value remains plain JSON text for the registry and persistence paths.
+    The executor carries ``mcp_app_card`` only to its immediate completion
+    callback, which is deliberately not replayed during session hydration.
+    """
+
+    mcp_app_card: dict
+
+    def __new__(cls, value: str, card: dict):
+        result = super().__new__(cls, value)
+        result.mcp_app_card = card
+        return result
+
+
 def _with_mcp_app_card(rendered: str, card: Optional[dict]) -> str:
-    """Add host-only display data without changing the established ordinary payload."""
+    """Attach a card transiently; never serialize it into a tool result."""
     if card is None:
         return rendered
     try:
@@ -463,8 +479,7 @@ def _with_mcp_app_card(rendered: str, card: Optional[dict]) -> str:
         return rendered
     if not isinstance(payload, dict) or "error" in payload:
         return rendered
-    payload["mcpApp"] = card
-    return json.dumps(payload, ensure_ascii=False)
+    return _McpAppToolResult(rendered, card)
 
 
 def _make_tool_handler(server_name: str, tool_name: str, tool_timeout: float):
