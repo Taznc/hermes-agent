@@ -481,3 +481,25 @@ def test_dollar_denominated_window_reports_its_dollars(monkeypatch):
     assert snapshot is not None
     balance = next(b for b in snapshot.balances if b.label == "Nimbus Quill")
     assert (balance.used, balance.limit, balance.remaining) == (50.0, 200.0, 150.0)
+
+
+def test_anthropic_usage_scope_dict_prefers_display_name_over_repr(monkeypatch):
+    """A scope dict with only ``display_name`` (no ``model``/``name``) must map to that
+    clean string, never fall through to a Python ``str()``-of-dict repr (the live-observed
+    Anthropic 'Weekly Scoped' window shape: {"id": None, "display_name": "Fable"})."""
+    payload = {
+        "limits": [
+            {
+                "kind": "weekly_scoped",
+                "percent": 89,
+                "resets_at": "2030-01-01T00:00:00Z",
+                "scope": {"id": None, "display_name": "Fable"},
+            }
+        ],
+    }
+    snapshot = _anthropic_snapshot(monkeypatch, payload)
+
+    assert snapshot is not None
+    assert snapshot.windows[0].scope == "Fable"
+    assert "{" not in snapshot.windows[0].scope
+    assert "display_name" not in snapshot.windows[0].scope

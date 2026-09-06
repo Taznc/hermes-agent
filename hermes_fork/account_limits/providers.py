@@ -111,6 +111,7 @@ def anthropic_usage_snapshot(payload: dict) -> AccountUsageSnapshot:
                 continue
             scope = raw.get("scope")
             if isinstance(scope, dict):
+                # Prefer the human-facing name; never fall through to a raw dict repr below.
                 scope = (scope.get("display_name") or scope.get("model") or scope.get("name")
                          or scope.get("id"))
             elif scope is not None and not isinstance(scope, str):
