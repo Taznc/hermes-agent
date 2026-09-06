@@ -4033,17 +4033,17 @@ def delete_task(conn: sqlite3.Connection, task_id: str) -> bool:
     reclaim (``release_stale_claims``/``detect_crashed_workers``/dashboard status change) or
     archive the task first, then delete — never delete straight out of ``running``.
     """
-    row = conn.execute(
-        "SELECT status, worker_pid, current_run_id FROM tasks WHERE id = ?", (task_id,),
-    ).fetchone()
-    if row is None:
-        return False
-    if row["status"] == "running" and (row["worker_pid"] or row["current_run_id"]):
-        raise RuntimeError(
-            f"refusing to delete {task_id}: status='running' with an active claim/run "
-            f"(worker_pid={row['worker_pid']!r}) — reclaim or archive it first"
-        )
     with write_txn(conn):
+        row = conn.execute(
+            "SELECT status, worker_pid, current_run_id FROM tasks WHERE id = ?", (task_id,),
+        ).fetchone()
+        if row is None:
+            return False
+        if row["status"] == "running" and (row["worker_pid"] or row["current_run_id"]):
+            raise RuntimeError(
+                f"refusing to delete {task_id}: status='running' with an active claim/run "
+                f"(worker_pid={row['worker_pid']!r}) — reclaim or archive it first"
+            )
         cur = conn.execute("DELETE FROM tasks WHERE id = ?", (task_id,))
         if cur.rowcount != 1:
             return False

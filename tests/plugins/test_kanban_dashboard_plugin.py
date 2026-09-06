@@ -21,6 +21,7 @@ from fastapi.testclient import TestClient
 
 from hermes_cli import kanban_db as kb
 from hermes_cli import kanban_db_connect as kbc
+from hermes_cli import kanban_db_dispatch as kbd
 
 
 # ---------------------------------------------------------------------------
@@ -566,6 +567,24 @@ def test_dashboard_reclaim_of_active_review_preserves_review_phase(client):
 # ---------------------------------------------------------------------------
 # DELETE /tasks/:id
 # ---------------------------------------------------------------------------
+
+def test_delete_task_refuses_running_task_with_active_worker(client):
+    """Dashboard DELETE surfaces the delete_task live-worker guard as 409 and leaves the
+    running row intact rather than orphaning the worker (t_749b0510)."""
+    t = client.post("/api/plugins/kanban/tasks", json={"title": "running-victim"}).json()["task"]
+    with kbc.connect() as conn:
+        assert kb.claim_task(conn, t["id"]) is not None
+        kbd._set_worker_pid(conn, t["id"], 424242)
+
+    response = client.delete(f"/api/plugins/kanban/tasks/{t['id']}")
+
+    assert response.status_code == 409
+    with kbc.connect() as conn:
+        survivor = kb.get_task(conn, t["id"])
+    assert survivor is not None
+    assert survivor.status == "running"
+    assert survivor.worker_pid == 424242
+
 
 def test_delete_task(client):
     t = client.post("/api/plugins/kanban/tasks", json={"title": "to-delete"}).json()["task"]

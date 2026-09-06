@@ -741,11 +741,89 @@ def test_delete_task_refuses_running_task_with_active_worker(kanban_home):
 
         with pytest.raises(RuntimeError):
             kb.delete_task(conn, t)
+        assert not conn.in_transaction, "refusal must roll back its IMMEDIATE transaction"
 
         task = kb.get_task(conn, t)
         assert task is not None
         assert task.status == "running"
         assert task.worker_pid == 424242
+
+
+def test_delete_task_guard_check_and_delete_are_atomic(kanban_home):
+    """Regression for reviewer BLOCKER-1 on t_749b0510: the guard's status/worker_pid read
+    must run INSIDE the same write_txn as the DELETE, or a concurrent claim between the
+    read and the delete reproduces the original orphan (row deleted out from under a
+    worker that started running in the gap). This interleaves a REAL concurrent
+    ``claim_task`` on a second connection, timed via a spy on ``sqlite3.Connection.execute``
+    to fire the instant the guard's SELECT has executed -- the exact TOCTOU window the
+    pre-fix code left open. Fails on the pre-fix commit (guard SELECT outside write_txn):
+    the racer's claim lands on the still-ready row before delete_task's DELETE runs, and
+    the row is deleted while 'running' with a live worker_pid, undercounting
+    count_running_tasks by one -- the reproduced orphan itself, not a settled-state check.
+    """
+    import threading
+
+    with kbc.connect() as conn:
+        t = kb.create_task(conn, title="race-target")  # status='ready', no worker yet
+
+    entered_guard = threading.Event()
+    racer_state: dict = {}
+
+    def racer():
+        assert entered_guard.wait(timeout=5), "guard SELECT never ran"
+        with kbc.connect() as conn2:
+            host = kb._claimer_id().split(":", 1)[0]
+            claimed = kb.claim_task(conn2, t, claimer=f"{host}:racer")
+            racer_state["claimed"] = claimed is not None
+            if claimed is not None:
+                kbd._set_worker_pid(conn2, t, 999999)
+
+    thread = threading.Thread(target=racer)
+    thread.start()
+    try:
+        with kbc.connect() as conn:
+            original_execute = conn.execute
+
+            def spy_execute(sql, *args, **kwargs):
+                if isinstance(sql, str) and "SELECT status, worker_pid, current_run_id FROM tasks" in sql:
+                    result = original_execute(sql, *args, **kwargs)
+                    entered_guard.set()
+                    # Give the racer thread a real window to acquire the write lock and
+                    # commit its claim before this thread proceeds. On the fixed code this
+                    # SELECT already runs inside the write_txn (holding the IMMEDIATE lock),
+                    # so the racer just times out waiting and correctly no-ops; on the
+                    # pre-fix code no lock is held yet, so the racer wins deterministically.
+                    time.sleep(0.3)
+                    return result
+                return original_execute(sql, *args, **kwargs)
+
+            conn.execute = spy_execute
+            try:
+                deleted = kb.delete_task(conn, t)
+            finally:
+                del conn.execute
+    finally:
+        thread.join(timeout=5)
+
+    assert not thread.is_alive(), "racer thread never completed"
+    with kbc.connect() as conn:
+        final = kb.get_task(conn, t)
+
+    if racer_state.get("claimed"):
+        # The racer's claim landed on the row -- it must therefore still exist,
+        # 'running', with the racer's worker_pid: delete_task must not have deleted a
+        # row a concurrent worker just started running on.
+        assert deleted is False, "delete_task must not report success on an orphaned row"
+        assert final is not None, "row deleted while a concurrent claim just landed on it: ORPHANED"
+        assert final.status == "running"
+        assert final.worker_pid == 999999
+        assert kbd.count_running_tasks(conn) >= 1
+    else:
+        # The racer's write_txn could not acquire the lock until delete_task's own
+        # write_txn (guard + DELETE, one atomic unit) had already closed -- by then the
+        # row was gone, so the racer's claim correctly no-op'd.
+        assert deleted is True
+        assert final is None
 
 
 def test_delete_task_still_works_for_non_running_rows(kanban_home):
