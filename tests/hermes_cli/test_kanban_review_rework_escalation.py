@@ -56,3 +56,26 @@ def test_first_changes_request_stays_with_implementer(all_assignees_spawnable):
 
         assert result.auto_escalated_rework == []
         assert result.spawned[0][1] == "implementer"
+
+
+def test_manual_assignment_after_second_request_overrides_auto_escalation(
+    all_assignees_spawnable,
+):
+    with kbc.connect() as conn:
+        task_id = kb.create_task(conn, title="operator-routed rework", assignee="implementer")
+        kb._append_event(conn, task_id, "changes_requested", {"reason": "first"})
+        kb._append_event(conn, task_id, "changes_requested", {"reason": "second"})
+        conn.commit()
+        assert kb.assign_task(conn, task_id, "specialist") is True
+
+        result = kbd.dispatch_once(
+            conn,
+            spawn_fn=_spawn,
+            review_rework_escalation_profile="debugger",
+        )
+
+        assert result.auto_escalated_rework == []
+        assert result.spawned[0][1] == "specialist"
+        task = kb.get_task(conn, task_id)
+        assert task is not None
+        assert task.assignee == "specialist"

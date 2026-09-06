@@ -2192,13 +2192,38 @@ def _apply_default_assignee(
     return True
 
 
-def _changes_requested_rounds(conn: sqlite3.Connection, task_id: str) -> int:
-    return int(
-        conn.execute(
-            "SELECT COUNT(*) FROM task_events WHERE task_id = ? AND kind = 'changes_requested'",
-            (task_id,),
-        ).fetchone()[0]
+def _changes_requested_state(
+    conn: sqlite3.Connection, task_id: str,
+) -> tuple[int, Optional[int]]:
+    row = conn.execute(
+        "SELECT COUNT(*) AS rounds, MAX(id) AS latest_id FROM task_events "
+        "WHERE task_id = ? AND kind = 'changes_requested'",
+        (task_id,),
+    ).fetchone()
+    return int(row["rounds"]), (
+        int(row["latest_id"]) if row["latest_id"] is not None else None
     )
+
+
+def _manually_assigned_after(
+    conn: sqlite3.Connection, task_id: str, event_id: Optional[int],
+) -> bool:
+    """Whether operator intent superseded the latest changes request."""
+    if event_id is None:
+        return False
+    row = conn.execute(
+        "SELECT id, payload FROM task_events WHERE task_id = ? AND kind = 'assigned' "
+        "ORDER BY id DESC LIMIT 1",
+        (task_id,),
+    ).fetchone()
+    if row is None or int(row["id"]) <= event_id:
+        return False
+    try:
+        payload = json.loads(row["payload"] or "{}")
+    except (TypeError, ValueError):
+        payload = {}
+    source = str(payload.get("source") or "") if isinstance(payload, dict) else ""
+    return not source.startswith("kanban.")
 
 
 def _apply_rework_escalation(
@@ -2653,14 +2678,18 @@ def _dispatch_once_locked(
             row_assignee = default_assignee
             result.auto_assigned_default.append(row["id"])
         if rework_escalation_profile and row_assignee != rework_escalation_profile:
-            changes_rounds = _changes_requested_rounds(conn, row["id"])
-            if changes_rounds >= 2 and _apply_rework_escalation(
-                conn,
-                row["id"],
-                rework_escalation_profile,
-                previous_assignee=row_assignee,
-                changes_rounds=changes_rounds,
-                dry_run=dry_run,
+            changes_rounds, latest_change_id = _changes_requested_state(conn, row["id"])
+            if (
+                changes_rounds >= 2
+                and not _manually_assigned_after(conn, row["id"], latest_change_id)
+                and _apply_rework_escalation(
+                    conn,
+                    row["id"],
+                    rework_escalation_profile,
+                    previous_assignee=row_assignee,
+                    changes_rounds=changes_rounds,
+                    dry_run=dry_run,
+                )
             ):
                 result.auto_escalated_rework.append(
                     (row["id"], row_assignee, rework_escalation_profile, changes_rounds)
