@@ -82,6 +82,7 @@ import type { SessionInfo } from '@/types/hermes'
 import type { NewSessionSplitHandler } from '../new-session-drag'
 
 import { SIDEBAR_COMPACT_FLAT, SIDEBAR_SCROLL_Y, SidebarSectionAddButton } from './chrome'
+import { SidebarFilterMenu } from './filter-menu'
 import { SidebarLoadMoreRow } from './load-more-row'
 import { orderByIds, reconcileOrderIds, resolveManualSessionOrderIds, sameIds } from './order'
 import {
@@ -781,6 +782,9 @@ export function SidebarWorkspaceSection({
                     }}
                   />
                 ) : null}
+                <div className="grid size-6 place-items-center">
+                  <SidebarFilterMenu className="text-(--ui-text-tertiary) opacity-70 transition-opacity hover:bg-(--ui-control-hover-background) hover:text-foreground hover:opacity-100 focus-visible:opacity-100" />
+                </div>
               </>
             )}
           </div>
