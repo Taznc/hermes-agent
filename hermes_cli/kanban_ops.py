@@ -58,6 +58,26 @@ def _cmd_tail(args: argparse.Namespace) -> int:
 
 
 def _cmd_dispatch(args: argparse.Namespace) -> int:
+    board = getattr(args, "board", None)
+    if getattr(args, "resume_circuit", False):
+        cleared = kbd.resume_dispatch(board)
+        if getattr(args, "json", False):
+            _print_json(cleared, ascii=True)
+        else:
+            state = cleared.get("previous") or {}
+            suffix = f" (was {state.get('reason')})" if state else " (was not paused)"
+            print(f"Dispatch circuit resumed for {board or kb.DEFAULT_BOARD}{suffix}.")
+        return 0
+    if getattr(args, "circuit_status", False):
+        state = kbd.read_dispatch_pause(board)
+        if getattr(args, "json", False):
+            _print_json({"paused": state is not None, "state": state}, ascii=True)
+        else:
+            print(f"Dispatch circuit for {board or kb.DEFAULT_BOARD}: " + (
+                f"paused ({state.get('reason')})" if state else "running"
+            ))
+        return 0
+
     # Same caps as the gateway tick and the dashboard nudge — resolved by the
     # one shared helper so a fourth entry point can't silently dispatch uncapped.
     # kanban.default_reviewer rides along on the same resolution (t_fec4c811):
@@ -80,6 +100,9 @@ def _cmd_dispatch(args: argparse.Namespace) -> int:
             default_assignee=caps.default_assignee,
             default_reviewer=caps.default_reviewer,
             max_in_progress_per_profile=caps.max_in_progress_per_profile,
+            dispatch_start_budget=caps.dispatch_start_budget,
+            dispatch_start_window_seconds=caps.dispatch_start_window_seconds,
+            review_rework_escalation_profile=caps.review_rework_escalation_profile,
         )
     if getattr(args, "json", False):
         _print_json({
@@ -99,6 +122,12 @@ def _cmd_dispatch(args: argparse.Namespace) -> int:
                 {"task_id": tid, "previous_assignee": prev, "reviewer": rev}
                 for (tid, prev, rev) in res.auto_assigned_reviewer
             ],
+            "auto_escalated_rework": [
+                {"task_id": tid, "previous_assignee": prev, "assignee": who,
+                 "changes_rounds": rounds}
+                for (tid, prev, who, rounds) in res.auto_escalated_rework
+            ],
+            "dispatch_paused": res.dispatch_paused,
         }, ascii=True)
         return 0
     print(f"Reclaimed:    {res.reclaimed}")
@@ -124,10 +153,15 @@ def _cmd_dispatch(args: argparse.Namespace) -> int:
         )
     if res.auto_assigned_reviewer:
         print(
-            f"Auto-assigned to kanban.default_reviewer={default_reviewer!r}: "
+            f"Auto-assigned to kanban.default_reviewer={caps.default_reviewer!r}: "
             + ", ".join(
                 f"{tid} ({prev} -> {rev})" for (tid, prev, rev) in res.auto_assigned_reviewer
             )
+        )
+    for tid, previous, who, rounds in res.auto_escalated_rework:
+        print(
+            f"Escalated review rework after {rounds} change requests: "
+            f"{tid} ({previous} -> {who})"
         )
     if res.skipped_unassigned:
         print(f"Skipped (unassigned): {', '.join(res.skipped_unassigned)}")
@@ -137,6 +171,11 @@ def _cmd_dispatch(args: argparse.Namespace) -> int:
         print(
             f"Skipped (non-spawnable assignee — terminal lane, OK): "
             f"{', '.join(res.skipped_nonspawnable)}"
+        )
+    if res.dispatch_paused:
+        print(
+            "Dispatch paused: " + json.dumps(res.dispatch_paused, sort_keys=True)
+            + "\nResume explicitly with: hermes kanban dispatch --resume-circuit"
         )
     return 0
 

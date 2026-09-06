@@ -1564,6 +1564,9 @@ def dispatch(dry_run: bool = Query(False), max_n: int = Query(8, alias="max"), b
             max_in_progress_per_profile=caps.max_in_progress_per_profile,
             default_assignee=caps.default_assignee,
             default_reviewer=caps.default_reviewer,
+            dispatch_start_budget=caps.dispatch_start_budget,
+            dispatch_start_window_seconds=caps.dispatch_start_window_seconds,
+            review_rework_escalation_profile=caps.review_rework_escalation_profile,
             board=board,
         )
         try:

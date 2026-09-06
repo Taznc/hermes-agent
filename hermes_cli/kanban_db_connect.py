@@ -909,6 +909,11 @@ def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
 
     # Same ordering rule as the ``tasks`` indexes above: index after column.
     conn.execute("CREATE INDEX IF NOT EXISTS idx_events_run ON task_events(run_id, id)")
+    # Dispatcher start-budget checks run every tick; avoid a full event-log scan.
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_events_kind_created "
+        "ON task_events(kind, created_at)"
+    )
 
     if _table_exists(conn, "kanban_notify_subs"):
         notify_cols = _column_names(conn, "kanban_notify_subs")
@@ -1013,6 +1018,7 @@ _REBUILD_SPECS = {
         (
             "CREATE INDEX idx_events_task ON task_events(task_id, created_at)",
             "CREATE INDEX idx_events_run ON task_events(run_id, id)",
+            "CREATE INDEX idx_events_kind_created ON task_events(kind, created_at)",
         ),
     ),
     "task_comments": (

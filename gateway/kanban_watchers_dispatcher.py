@@ -48,6 +48,9 @@ class _DispatcherSettings:
     default_assignee: Optional[str]
     default_reviewer: Optional[str]
     max_in_progress_per_profile: Optional[int]
+    dispatch_start_budget: Optional[int] = None
+    dispatch_start_window_seconds: int = 600
+    review_rework_escalation_profile: Optional[str] = None
 
 
 def _resolve_dispatcher_settings(kanban_cfg: dict, kb: Any, *, quiet: bool = False) -> _DispatcherSettings:
@@ -132,6 +135,22 @@ def _resolve_dispatcher_settings(kanban_cfg: dict, kb: Any, *, quiet: bool = Fal
                     "assigned to their implementer will route to this profile)",
                     default_reviewer)
 
+    dispatch_start_budget = _positive_int_setting(
+        kanban_cfg, "dispatch_start_budget", quiet=quiet,
+    )
+    dispatch_start_window_seconds = _positive_int_setting(
+        kanban_cfg, "dispatch_start_window_seconds", quiet=quiet,
+    ) or 600
+    if dispatch_start_budget is not None and not quiet:
+        logger.info(
+            "kanban dispatcher: start budget=%d per board per %ds (sticky pause on trip)",
+            dispatch_start_budget,
+            dispatch_start_window_seconds,
+        )
+    review_rework_escalation_profile = (
+        kanban_cfg.get("review_rework_escalation_profile") or ""
+    ).strip() or None
+
     return _DispatcherSettings(
         interval=interval,
         max_spawn=max_spawn,
@@ -147,6 +166,9 @@ def _resolve_dispatcher_settings(kanban_cfg: dict, kb: Any, *, quiet: bool = Fal
         # quota / browser pool gets overwhelmed by a fan-out.
         max_in_progress_per_profile=_positive_int_setting(
             kanban_cfg, "max_in_progress_per_profile", quiet=quiet),
+        dispatch_start_budget=dispatch_start_budget,
+        dispatch_start_window_seconds=dispatch_start_window_seconds,
+        review_rework_escalation_profile=review_rework_escalation_profile,
     )
 
 
@@ -188,7 +210,9 @@ def _reload_dispatcher_settings(
 
     fresh = replace(fresh, interval=current.interval)
     for field_name in ("max_in_progress", "max_in_progress_per_profile", "max_spawn",
-                       "failure_limit", "default_assignee"):
+                       "failure_limit", "default_assignee", "default_reviewer",
+                       "dispatch_start_budget", "dispatch_start_window_seconds",
+                       "review_rework_escalation_profile"):
         was, now = getattr(current, field_name), getattr(fresh, field_name)
         if was != now:
             logger.info("kanban dispatcher: %s changed %r -> %r (applied without restart)",

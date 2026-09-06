@@ -229,7 +229,25 @@ kanban:
   review_dispatch: true            # default: spawn the assigned profile with
                                    # the bundled sdlc-review skill. Set false
                                    # for human-only review boards.
+  dispatch_start_budget: 20        # optional: starts per board/window before
+  dispatch_start_window_seconds: 600
+  review_rework_escalation_profile: debugger  # optional: route rework after
+                                               # two changes-requested cycles
 ```
+
+`dispatch_start_budget` is a sticky safety circuit, not a concurrency cap. The
+dispatcher counts real `spawned` events independently for each board. When a
+board reaches the configured limit—or a task with a completed/archived terminal
+event appears dispatchable without a later explicit unarchive—the board stops
+starting workers while reclaim and promotion bookkeeping continue. Inspect it
+with `hermes kanban --board <slug> dispatch --circuit-status`; after investigating
+or waiting out the window, resume explicitly with `hermes kanban --board <slug>
+dispatch --resume-circuit`. Configuration is hot-reloaded by the gateway.
+
+`review_rework_escalation_profile` breaks pathological implementation/review
+loops without removing review: the first changes request returns to the original
+implementer; after the second, the next ready run is reassigned to the configured
+specialist under that profile's own model defaults.
 
 Override the config flag at runtime via `HERMES_KANBAN_DISPATCH_IN_GATEWAY=0`
 for debugging. Standard gateway supervision applies: run `hermes gateway
@@ -391,6 +409,36 @@ Keep secrets, raw logs, tokens, OAuth material, and unrelated transcripts out of
 `metadata`. Store pointers and summaries instead. If a task has no files or
 tests, say so explicitly in `summary` and use `metadata` for the evidence that
 does exist, such as source URLs, issue ids, or manual review steps.
+
+### Efficient engineering task packets
+
+Worker startup is paid context, so put discovery that is already known into the
+card instead of making every lane rediscover it. An engineering card should
+name:
+
+- the exact edit targets and ownership boundary;
+- the base branch and relevant existing commits;
+- acceptance criteria and the focused verification commands;
+- known baseline failures;
+- inherited decisions and prior reviewer findings;
+- the upstream duplicate/prior-art search result, source, and timestamp.
+
+Run the prior-art search once when the parent or orchestrator files the work.
+Children inherit that evidence and refresh it only when absent or stale. Assigned
+skills are preloaded into the worker process before its first model turn; workers
+should use that loaded content rather than spending a tool cycle loading the same
+skill again.
+
+Target one testable behavior or architectural seam per card—usually roughly one
+to four hours of agent work. Split work that crosses UI, backend, persistence,
+and deployment ownership boundaries, and always declare `Edit-Targets:` so the
+dispatcher can serialize collisions. Do not create microcards whose workspace,
+prompt, review, and handoff overhead exceeds their implementation.
+
+Use staged verification: the worker runs focused checks for its changed paths;
+the reviewer independently selects checks from the diff's risks; one explicit
+integration/release child runs the full applicable suite on the combined branch.
+Do not make every lane rerun the same unchanged full suite.
 
 ### The worker lifecycle
 
