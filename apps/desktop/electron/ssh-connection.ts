@@ -164,12 +164,15 @@ function redactSecrets(text) {
 // across reconnects so ControlMaster reuse works, short so the full path stays
 // under sun_path's 104-byte limit.
 //
-// CRITICAL (macOS): the base dir must be SHORT. os.tmpdir() on macOS is the
-// per-user `/var/folders/xx/yyyy…/T/` (~49 bytes), and OpenSSH binds a
-// TEMPORARY listener at `<ControlPath>.<16 random chars>` while establishing
-// the master — so a path that itself fits 104 still overflows at bind time. We
-// root under a short per-user base (`~/.hermes/desktop-ssh`) so even worst case
-// (~72 bytes on macOS) stays clear. Windows has no AF_UNIX sun_path limit.
+// CRITICAL: the base dir must be SHORT, independent of how long $HOME happens
+// to be. os.tmpdir() on macOS is the per-user `/var/folders/xx/yyyy…/T/` (~49
+// bytes), and OpenSSH binds a TEMPORARY listener at `<ControlPath>.<16 random
+// chars>` while establishing the master — so a path that itself fits 104 still
+// overflows at bind time. `~/.hermes/desktop-ssh` is short under an ordinary
+// $HOME, but $HOME is not bounded (e.g. a profile-scoped home like
+// `~/.hermes/profiles/<name>/home` runs ~36 bytes longer than a bare
+// `/home/<user>`) — using it unconditionally silently reintroduces the same
+// overflow the macOS fix above closed. Windows has no AF_UNIX sun_path limit.
 function controlSocketPath(user, host, port, baseDir?, identity: any = {}) {
   const dir = baseDir || defaultControlDir()
   const keyPathIdentity = path.normalize(String(identity.keyPath || ''))
@@ -194,6 +197,18 @@ function defaultControlDir() {
   // world-shared /tmp dir (no symlink-hijack surface). Created 0700 in open().
   if (process.platform === 'win32') {
     return path.join(os.tmpdir(), 'hermes-desktop-ssh')
+  }
+
+  // Prefer XDG_RUNTIME_DIR (`/run/user/<uid>` on Linux) when present: it is
+  // per-user, private by construction (mode 0700, tmpfs), and short
+  // regardless of $HOME's length — unlike `~/.hermes/desktop-ssh`, which
+  // inherits whatever $HOME happens to be (a profile-scoped home like
+  // `~/.hermes/profiles/<name>/home` is long enough to push the control
+  // socket + OpenSSH's temp-listener suffix over the 104-byte sun_path
+  // limit). Fall back to the home-rooted path only when no runtime dir is
+  // advertised (e.g. macOS, or a minimal Linux session).
+  if (process.env.XDG_RUNTIME_DIR) {
+    return path.join(process.env.XDG_RUNTIME_DIR, 'hermes-desktop-ssh')
   }
 
   return path.join(os.homedir(), '.hermes', 'desktop-ssh')
