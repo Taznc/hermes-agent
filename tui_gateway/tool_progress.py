@@ -241,8 +241,8 @@ def _on_tool_complete(sid: str, tool_call_id: str, name: str, args: dict, result
         rendered: list[str] = []
         if render_edit_diff_with_delta(name, result, function_args=args, snapshot=snapshot, print_fn=rendered.append):
             payload["inline_diff"] = "\n".join(rendered)
-    if (_tool_progress_enabled(sid) or payload.get("inline_diff") or _tool_lifecycle_required_for_ui(name)
-            or name in _TODO_TOOL_NAMES):
+    if (_tool_progress_enabled(sid) or payload.get("inline_diff") or payload.get("mcp_app")
+            or _tool_lifecycle_required_for_ui(name) or name in _TODO_TOOL_NAMES):
         _emit("tool.complete", sid, payload)
     # Task state is application data, not tool-progress chrome: a dedicated full-snapshot event lets
     # every client reconcile without parsing tool args.

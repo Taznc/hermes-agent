@@ -2,7 +2,7 @@ import { act, cleanup } from '@testing-library/react'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
 import { type MessageStreamHarness, renderMessageStream } from './test-harness'
-import { getMcpAppCard } from '@/store/mcp-apps'
+import { clearMcpAppCards, getMcpAppCard } from '@/store/mcp-apps'
 
 const SID = 'timeline-session'
 
@@ -56,7 +56,7 @@ describe('live transcript timeline events', () => {
     expect(assistant?.parts.map(part => part.timestamp)).toEqual([201.125, 202.25, 203.5])
   })
 
-  it('accepts an MCP App only from the live completion projection, not a stored result', () => {
+  it('does not remount a live MCP App when the same call id is hydrated', () => {
     const card = {
       html: '<html><body>chart</body></html>',
       id: 'x'.repeat(20),
@@ -65,13 +65,14 @@ describe('live transcript timeline events', () => {
       toolName: 'chart'
     }
 
-    event('tool.complete', 200, { mcp_app: card, name: 'mcp__charts__chart', result: { result: 'ordinary' }, tool_id: 'live-app' })
-    expect(getMcpAppCard('live-app')).toEqual(card)
+    event('tool.complete', 200, { mcp_app: card, name: 'mcp__charts__chart', result: { result: 'ordinary' }, tool_id: 'same-app' })
+    expect(getMcpAppCard(SID, 'same-app')).toEqual(card)
 
-    // Hydration rebuilds a row from its ordinary persisted result only; it
-    // cannot provide the separate live-only event field.
-    event('tool.complete', 201, { name: 'mcp__charts__chart', result: { mcpApp: card, result: 'ordinary' }, tool_id: 'hydrated-app' })
-    expect(getMcpAppCard('hydrated-app')).toBeNull()
+    // Hydration replaces the live transcript with the ordinary persisted
+    // result. It must invalidate even a reused tool id from this live turn.
+    clearMcpAppCards(SID)
+    event('tool.complete', 201, { name: 'mcp__charts__chart', result: { result: 'ordinary' }, tool_id: 'same-app' })
+    expect(getMcpAppCard(SID, 'same-app')).toBeNull()
   })
 
   it('uses the gateway event time for an error boundary', () => {

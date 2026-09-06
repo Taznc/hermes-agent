@@ -375,9 +375,12 @@ function ToolEntry({ part }: ToolEntryProps) {
   // re-render every mounted tool row (the factory caches a per-id atom).
   const sideDiff = useStore($toolInlineDiff(toolCallId ?? ''))
   const inlineDiff = stripInlineDiffChrome(sideDiff) || inlineDiffFromResult(result)
+  // The session whose transcript this row is IN, which is not necessarily the
+  // primary one: a tool row inside a session tile must read only its own card.
+  const { $cwd: $sessionCwd, $runtimeId: $sessionRuntimeId } = useSessionView()
   // MCP App resources arrive only on the ephemeral live `tool.complete`
   // projection. Stored results never populate this renderer-only atom.
-  const mcpApp = useStore($mcpAppCard(toolCallId ?? ''))
+  const mcpApp = useStore($mcpAppCard($sessionRuntimeId.get() ?? '', toolCallId ?? ''))
   const isFileEdit = isFileEditTool(toolName)
   const defaultOpen = Boolean(inlineDiff)
   const open = useDisclosureOpen(disclosureId, defaultOpen)
@@ -403,9 +406,6 @@ function ToolEntry({ part }: ToolEntryProps) {
   // detected target the old inline card did. Idempotent + dedup'd, so re-renders
   // don't churn.
   const previewTarget = view.previewTarget
-  // The session whose transcript this row is IN, which is not necessarily the
-  // primary one: a tool row inside a session tile must feed that tile's composer.
-  const { $cwd: $sessionCwd, $runtimeId: $sessionRuntimeId } = useSessionView()
 
   useEffect(() => {
     if (isPending || !previewTarget || !isPreviewableTarget(previewTarget)) {

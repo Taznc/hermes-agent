@@ -71,7 +71,7 @@ export function handleToolEvent(ctx: GatewayEventContext): boolean {
       upsertToolCall(sessionId, toTodoPayload(payload) ?? payload, 'complete', event.type, occurredAt)
       // This live projection is deliberately not part of the tool result, so
       // transcript hydration cannot recreate an untrusted historical frame.
-      recordMcpAppCard(String(payload?.tool_id || ''), payload?.mcp_app)
+      recordMcpAppCard(sessionId, String(payload?.tool_id || ''), payload?.mcp_app)
 
       if (isActiveEvent) {
         setPetActivity({ toolRunning: false })
