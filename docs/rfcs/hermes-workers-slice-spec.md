@@ -1,7 +1,101 @@
 # hermes-workers.slice — decoupling kanban worker lifetime/memory from hermes-gateway
 
 Status: spec only, no implementation in this document/card.
-Card: t_cb47a946 (child of t_44ca59a3). Evidence: t_f44be004 (`worker-slice-evidence.md`).
+Card: t_cb47a946 (child of t_44ca59a3). Evidence: t_f44be004 (`worker-slice-evidence.md`), amended by its 2026-09-06 re-verification addendum.
+
+## Revision 2 — evidence correction and normative supersession
+
+This revision is normative where it conflicts with later detail in the original
+revision. The original was written before the worker-scope implementation
+landed. Re-verification established that the shipped design uses
+`systemd-run --user --scope`; it transparently execs the worker, so scoped
+workers remain direct children of the gateway until the gateway exits.
+Accordingly, the original proposed `worker_unit` task column,
+`_scope_exit_status()` fallback, and replacement of `waitpid` are **not part
+of this specification**. `_wait_result`, named in the card body, does not
+exist in the dispatcher.
+
+The selected mechanism remains exactly option (d): a configurable launcher
+prefix with `[]` as the cross-platform default. On a systemd host, the
+supported operational prefix is the existing restart-safe user-scope launcher
+rather than a new dispatcher-owned service/unit protocol. It must mint a
+unique scope name, use `--user --scope`, supply the user D-Bus environment,
+and set the properties in this revision. `--scope` is essential: do not change
+this design to `systemd-run --service`, which would sever direct parentage and
+would need the more complicated unit-status protocol rejected above.
+
+### Corrected dispatcher/reclaim contract
+
+* `reap_worker_zombies()` and the existing raw-`waitpid(-1, WNOHANG)` exit
+  path remain the source of exit status and classification. They continue to
+  distinguish clean, rate-limited, nonzero, and signaled exits.
+* `_pid_alive()` and `_defer_reclaim_for_live_worker()` remain
+  parentage-independent and unchanged. After a gateway restart, a surviving
+  child is reparented; the next gateway must treat its persisted `worker_pid`
+  as live, not require it to be its own child.
+* Claim re-adoption is pinned to the existing hostname-prefix comparison, not
+  an exact `host:dispatcher-pid` lock match. A live worker continues writing
+  its own heartbeats during the gateway outage; a new gateway sees the live PID
+  and fresh heartbeat, leaves the task running, and does not double-dispatch.
+  When that re-adopted worker eventually exits, the ordinary next dispatcher
+  cannot recover a historical raw wait status; it follows the existing
+  dead-worker/unknown-exit reclaim path. This is an acceptable conservative
+  classification, not a reason to introduce a status-file or a second
+  supervision protocol.
+
+### Corrected systemd and infrastructure contract
+
+Install `hermes-workers.slice` in the **user manager** and explicitly place
+worker scopes under it (the live scopes are currently under `app.slice`; the
+existing inert system-manager `hermes-workers.slice` constrains nothing).
+The gateway unit or launcher must supply
+`XDG_RUNTIME_DIR=/run/user/<uid>` and
+`DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/<uid>/bus`; `Linger=yes` alone
+is insufficient. The launcher also sets each scope's `MemoryAccounting=yes`,
+`MemoryMax=4G`, and `TimeoutStopSec=30s`.
+
+The required user-unit file is:
+
+```ini
+# ~/.config/systemd/user/hermes-workers.slice
+[Unit]
+Description=Hermes kanban worker pool
+
+[Slice]
+MemoryAccounting=yes
+MemoryHigh=16G
+MemoryMax=24G
+```
+
+`MemoryHigh=16G` and `MemoryMax=24G` replace the obsolete 6G/8G proposal.
+They are based on ten retained worker-scope peaks totaling 10.28 GiB (p50
+283 MiB, maximum 3.5 GiB) with a 4 GiB per-worker ceiling and expected
+concurrency of ten: 16 GiB permits meaningful aggregate headroom above the
+observed workload, while 24 GiB is a firm aggregate boundary below the
+unbounded `user-1000.slice`. They are starting production values; reducing
+below the observed aggregate peak or deriving them from instantaneous RSS is
+invalid. The per-scope 4 GiB cap stays unchanged because the observed tail
+reached 3.5 GiB without high/max/oom events.
+
+`TimeoutStopSec=30s` belongs on every transient **scope** via the launcher,
+not on a slice (a slice is a resource-control grouping, not the worker stop
+controller). On host shutdown, systemd stops the user manager/scopes, sends
+SIGTERM, waits that scope's 30 seconds, then SIGKILLs remaining scope
+processes. `hermes-workers.slice` must have no `PartOf=`, `Requires=`, or
+ordering edge to `hermes-gateway.service`; restarting the gateway must never
+stop the slice. Host shutdown is the only lifecycle coupling.
+
+### Corrected tests
+
+Unit tests use the existing fake launcher to prove plain-Popen fallback,
+unique scope argv/property construction, raw `waitpid` classification while
+the parent is alive, and host-prefix re-adoption without double dispatch.
+A systemd-gated integration test uses a throwaway parent and real
+`systemd-run --user --scope`: assert the child is both outside the parent's
+cgroup and still a direct child before the parent exits; after parent exit,
+assert it survives and its heartbeat advances. Do not restart the real gateway.
+A separate gated check asserts `MemoryMax=4G` and `TimeoutStopSec=30s` on the
+created scope and that the scope's `Slice` is `hermes-workers.slice`.
 
 ## 0. Chosen mechanism (up front)
 
