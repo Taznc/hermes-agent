@@ -1010,6 +1010,85 @@ that have *already* happened, use the reconciliation-card pattern above with
 the `agent-merge-conflict-arbiter` optional skill; hotspot flagging is the upstream fix that keeps
 the reconciler from becoming a standing lane.
 
+### Declaring a card's edit surface (`Edit-Targets:`)
+
+Hotspot comments are a *post-hoc* signal: they only exist once a worker has
+already collided. To stop the collision happening at all, a card body can
+declare the files it intends to write, and the dispatcher serializes any two
+cards that name a common path:
+
+```
+Edit-Targets: apps/desktop/src/app/chat/right-rail/preview-pane.tsx, apps/desktop/src/lib/preview-guest.ts
+```
+
+A bullet list under an `Edit targets:` heading works too. When a card about to
+be dispatched names a path that a currently-running (or just-spawned) card
+already owns, the dispatcher does **not** block it for a human — it adds a real
+`parents=[holder]` dependency edge, so the card waits and then starts from a
+tree that already contains the holder's work. Once the holder completes the card
+promotes and dispatches normally.
+
+This exists because prose does not serialize agents. Two cards were once fanned
+out with the shared decision written into *both* bodies — "import the helper, do
+not define a second one" — and both workers still created it with different
+contents, because they ran in separate worktrees nine minutes apart and could
+not see each other. The `parents=[...]` edge is the only mechanism on the board
+that can actually order two workers.
+
+Scope is deliberately narrow, so declaring costs nothing:
+
+- Matching is exact per-path equality after normalization (`./a/b.ts`, `a//b.ts`,
+  `` `a/b.ts` `` and the residue of a bolded label are the same file). Markdown
+  spelling never splits the key: ``**hotspot:** `a/b.ts` `` and `hotspot: a/b.ts`
+  declare the same path, so an orchestrator's `Edit-Targets:` field and a
+  worker's bolded hotspot comment interoperate. No globs, no directory prefixes.
+- Only the overlapping pair is serialized — two cards naming *different* files
+  in the same repo still run concurrently. It is not a repo-wide lock.
+- A card that declares nothing and has no hotspot history dispatches exactly as
+  it did before.
+- Tenants are separate workspaces, so the same path under two tenants is not a
+  collision.
+- Emitted `hotspot:` comments and `hotspot` keys in completion metadata count as
+  a declared surface too — that signal was already in the DB and is now read
+  back rather than only being available to a human reading the board. A negated
+  line (`hotspot: none`, `hotspot: N/A`) declares nothing, however much prose
+  follows it, and a line whose comma-separated items are not *all* paths is
+  treated as prose rather than having its file-shaped fragments harvested. The
+  worker protocol asks every card for a hotspot line, so most of them are
+  negations; mining that prose would park unrelated cards behind each other. A
+  trailing parenthetical annotation (`` `a/b.ts` (2235 lines, +235) — reason ``)
+  is dropped before that check, so an annotation's internal comma cannot make a
+  genuinely declared file look like prose.
+- A brace group is expanded into the real files it names
+  (`src/i18n/{en,zh}.ts` → `src/i18n/en.ts`, `src/i18n/zh.ts`) rather than being
+  comma-split into fragments, and anything still carrying glob syntax
+  (`*`, `?`, `[]`, an unbalanced brace) is rejected outright. A fragment such as
+  `src/i18n/{en` is identical for any two cards touching that directory, so
+  admitting one would serialize them on a path that does not exist.
+- **Quoting a line is not declaring one.** A `hotspot:` or `Edit-Targets:` line
+  inside a fenced code block or a markdown blockquote is text somebody is
+  *citing as evidence about another card*, and it contributes nothing to the
+  quoting card's own edit surface. The review protocol asks reviewers to quote
+  the offending text, so without this rule documenting a parsing defect would
+  change routing: a card whose thread merely quotes a sibling's hotspot line
+  becomes the registered holder of a file it never touches, and the card that
+  genuinely edits it is parked behind it. The identical line written as ordinary
+  prose is still read normally.
+
+**The dependency edge is a lease, not a permanent dependency.** A card only
+waits while the holder is still on its way to producing the work it should start
+from. If the holder goes `blocked` or `on_hold`, the dispatcher drops the edge
+on the next tick and the parked card promotes immediately — otherwise an
+operator would have to unblock a *different* card to free it, which is exactly
+the "needs a human" routing bug this feature exists to remove. Edges an
+orchestrator or human added are left alone; only the dispatcher's own
+serialization edges are released.
+
+Deferred cards appear in the dispatch result's `serialized_coedit` bucket as
+`(task_id, holder_id, path)` and get a `serialized_coedit` event on the card, so
+`hermes kanban tail` shows why a card is waiting. Released edges appear in
+`released_coedit` as `(task_id, holder_id)` with a `coedit_released` event.
+
 ## Multi-tenant usage
 
 When one specialist fleet serves multiple businesses, tag each task with a tenant:

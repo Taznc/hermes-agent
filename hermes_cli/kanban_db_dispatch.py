@@ -215,6 +215,18 @@ class DispatchResult:
     request-changes / escalate). Neutral audit outcome — no failure counted, no breaker fed — but
     NOT auto-recoverable like a rate-limit requeue: the task lands in ``blocked`` and stays sticky
     until an explicit ``kanban_unblock`` reopens it for another reviewer."""
+    serialized_coedit: list[tuple[str, str, str]] = field(default_factory=list)
+    """``(task_id, holder_id, path)`` for cards deferred this tick because they
+    declare an edit target another running/just-spawned card already owns. The
+    card gained a real dependency edge on the holder and sits in ``todo`` until
+    it completes — NOT operator-actionable and NOT a failure: it is the board
+    serializing a co-edit that prose in two card bodies provably cannot."""
+    released_coedit: list[tuple[str, str]] = field(default_factory=list)
+    """``(task_id, holder_id)`` for serialization edges dropped this tick because
+    the holder stalled (``blocked``/``on_hold``) and will not produce the work
+    the parked card was waiting for. The edge is a lease, not a dependency —
+    without this a card would be held hostage until a human unblocked a
+    DIFFERENT card, which is the routing bug the guard exists to remove."""
     skipped_locked: bool = False
     """True when another process held the board's dispatch lock: this tick did
     no DB writes; the lock holder is making progress on the same board."""
@@ -1810,6 +1822,53 @@ def _call_spawn_fn(spawn_fn, task: Task, workspace: str, board: Optional[str]) -
         return spawn_fn(task, workspace)
 
 
+def _serialize_coedit(
+    conn: sqlite3.Connection,
+    task_id: str,
+    tenant: Optional[str],
+    paths: list[str],
+    coedit_index,
+    result: "DispatchResult",
+    *,
+    dry_run: bool,
+) -> bool:
+    """Park ``task_id`` behind whichever running card already owns one of its
+    declared edit targets. Returns True when the card was deferred.
+
+    Serialization, not blocking: the card gets a real ``parents=[holder]`` edge
+    so it waits and then starts from a tree that already contains the holder's
+    work. Blocking for a human would be a routing bug — this fleet runs
+    unattended.
+    """
+    if not paths:
+        return False
+    collision = coedit_index.holder_for(tenant, paths)
+    if collision is None:
+        return False
+    holder_id, path = collision
+    if holder_id == task_id:
+        return False
+    result.serialized_coedit.append((task_id, holder_id, path))
+    if dry_run:
+        return True
+    try:
+        # link_tasks demotes a ready child to todo and refuses a cycle, so an
+        # already-linked or circular pair degrades to "leave it alone" rather
+        # than corrupting the graph.
+        _kb.link_tasks(conn, holder_id, task_id)
+    except ValueError:
+        # Cycle or a vanished row: the edge is unsafe, so let the card dispatch
+        # normally rather than stranding it.
+        result.serialized_coedit.pop()
+        return False
+    with _kb.write_txn(conn):
+        _kb._append_event(
+            conn, task_id, "serialized_coedit",
+            {"holder": holder_id, "path": path},
+        )
+    return True
+
+
 def _dispatch_lane_task(
     conn: sqlite3.Connection,
     row: sqlite3.Row,
@@ -1824,6 +1883,8 @@ def _dispatch_lane_task(
     spawn_fn,
     per_profile_cap: Optional[int],
     per_profile_running: dict[str, int],
+    coedit_index=None,
+    coedit_paths: Optional[dict] = None,
 ) -> bool:
     """Guard, claim, resolve the workspace and spawn one ready/review row.
     Returns True when a spawn slot was consumed (real or ``dry_run``); every
@@ -1866,9 +1927,26 @@ def _dispatch_lane_task(
         if per_profile_cap is not None and name:
             per_profile_running[name] = per_profile_running.get(name, 0) + 1
 
+    # Co-edit serialization. Only the ready lane: a review card reads the branch
+    # its implementer already produced, so it is not a concurrent writer.
+    own_paths = (coedit_paths or {}).get(task_id, []) if coedit_paths else []
+    if lane == "ready" and coedit_index is not None and own_paths:
+        if _serialize_coedit(
+            conn, task_id, row["tenant"] if "tenant" in row.keys() else None,
+            own_paths, coedit_index, result, dry_run=dry_run,
+        ):
+            return False
+
+    def _claim_coedit_paths(claimed_id: str, tenant: Optional[str]) -> None:
+        """This card now owns its declared paths for the rest of the tick, so a
+        later ready row in the SAME tick serializes behind it too."""
+        if coedit_index is not None and own_paths:
+            coedit_index.claim(claimed_id, tenant, own_paths)
+
     if dry_run:
         result.spawned.append((task_id, assignee, ""))
         _count_spawn(assignee)
+        _claim_coedit_paths(task_id, row["tenant"] if "tenant" in row.keys() else None)
         return True
     claim = _kb.claim_review_task if lane == "review" else _kb.claim_task
     claimed = claim(conn, task_id, ttl_seconds=ttl_seconds)
@@ -1906,6 +1984,7 @@ def _dispatch_lane_task(
         # only on successful completion (complete_task).
         result.spawned.append((claimed.id, claimed.assignee or "", str(workspace)))
         _count_spawn(claimed.assignee)
+        _claim_coedit_paths(claimed.id, claimed.tenant)
         return True
     except Exception as exc:
         if _record_task_failure(
@@ -1968,6 +2047,10 @@ def _run_reclaim_phase(
     result.rate_limited.extend(getattr(detect_crashed_workers, "_last_rate_limited", []))
     result.review_no_verdict.extend(getattr(detect_crashed_workers, "_last_review_no_verdict", []))
     result.timed_out = enforce_max_runtime(conn)
+    # Release serialization edges whose holder stalled, BEFORE promoting: a card
+    # parked behind a now-blocked holder must be free to promote in this same
+    # tick rather than waiting for a human to unblock a different card.
+    result.released_coedit = _kc.release_stranded_coedit_edges(conn)
     result.promoted = _kb.recompute_ready(conn, failure_limit=failure_limit)
 
 
@@ -2035,7 +2118,7 @@ def _tick_spawn_budget(
 def _lane_rows(conn: sqlite3.Connection, status: str) -> list[sqlite3.Row]:
     """Unclaimed rows of one lane in dispatch order."""
     return conn.execute(
-        "SELECT id, assignee FROM tasks "
+        "SELECT id, assignee, tenant FROM tasks "
         f"WHERE status = '{status}' AND claim_lock IS NULL "
         "ORDER BY priority DESC, created_at ASC"
     ).fetchall()
@@ -2131,10 +2214,19 @@ def _dispatch_once_locked(
     per_profile_running: dict[str, int] = (
         count_running_tasks_by_assignee(conn, board) if per_profile_cap is not None else {}
     )
+    # Co-edit guard. Built only when a ready row actually declares an edit
+    # surface (or filed a hotspot), so a board that uses neither pays one cheap
+    # query and behaves exactly as before.
+    coedit_paths = _kc.edit_paths_for_tasks(conn, [row["id"] for row in ready_rows])
+    coedit_index = (
+        _kc.build_coedit_index(conn)
+        if any(coedit_paths.values()) else None
+    )
     lane_kwargs: dict[str, Any] = dict(
         dry_run=dry_run, ttl_seconds=ttl_seconds, board=board,
         failure_limit=failure_limit, spawn_fn=spawn_fn,
         per_profile_cap=per_profile_cap, per_profile_running=per_profile_running,
+        coedit_index=coedit_index, coedit_paths=coedit_paths,
     )
     default_assignee = _resolve_default_assignee(default_assignee)
     spawned = 0
@@ -2702,6 +2794,7 @@ def run_daemon(
 
 # Late-bound origin namespace (see module docstring); imported LAST so this
 # module is fully populated before ``kanban_db`` imports from it.
+from hermes_cli import kanban_coedit as _kc  # noqa: E402
 from hermes_cli import kanban_db as _kb  # noqa: E402
 from hermes_cli import kanban_db_connect as _kbc  # noqa: E402
 from hermes_cli import kanban_db_workspace as _kbw  # noqa: E402
