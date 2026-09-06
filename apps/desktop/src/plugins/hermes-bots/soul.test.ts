@@ -62,17 +62,16 @@ beforeEach(() => {
 describe('appending the protocol to an existing SOUL', () => {
   it('appends once and never duplicates', async () => {
     const { ensureMessagingProtocol } = await loadSoul()
-    const once = ensureMessagingProtocol(EXISTING_SOUL, 'default', roster)
+    const once = ensureMessagingProtocol(EXISTING_SOUL, 'default')
 
     expect(sectionCount(once)).toBe(1)
     // Identity text is never overwritten.
     expect(once).toMatch(/I am the default profile on this machine/)
-    expect(once).toMatch(/`researcher` — research specialist/)
     // The primary profile addresses itself by its callable alias.
     expect(once).toMatch(/@hermes/)
     expect(once).not.toMatch(/@default/)
 
-    const twice = ensureMessagingProtocol(once, 'default', roster)
+    const twice = ensureMessagingProtocol(once, 'default')
 
     expect(twice).toBe(once.trim())
     expect(sectionCount(twice)).toBe(1)
@@ -80,7 +79,7 @@ describe('appending the protocol to an existing SOUL', () => {
 
   it('points at the real CLI verb, not the plural that does not exist', async () => {
     const { ensureMessagingProtocol } = await loadSoul()
-    const soul = ensureMessagingProtocol('', 'default', roster)
+    const soul = ensureMessagingProtocol('', 'default')
 
     expect(soul).toMatch(/run `hermes profile list` for the LIVE/)
     expect(soul).not.toMatch(/hermes profiles list/)
@@ -89,8 +88,29 @@ describe('appending the protocol to an existing SOUL', () => {
   it('seeds an empty SOUL with the section alone', async () => {
     const { ensureMessagingProtocol } = await loadSoul()
 
-    expect(ensureMessagingProtocol('', 'ops', [])).toMatch(/^## Messaging other agents/)
-    expect(ensureMessagingProtocol('', 'ops', [])).toMatch(/- \(none yet\)/)
+    expect(ensureMessagingProtocol('', 'ops')).toMatch(/^## Messaging other agents/)
+  })
+})
+
+describe('the protocol never freezes a roster into SOUL.md', () => {
+  // SOUL.md is written once at create/backfill time and never revisited, so a
+  // teammate list baked into it goes stale the moment a profile is added,
+  // removed, or renamed — and the agent keeps reading it as authoritative,
+  // routing handoffs to profiles that no longer exist. The live
+  // `hermes profile list` instruction is the only roster source that survives.
+  it('names no teammate from the roster it is handed', async () => {
+    const { ensureMessagingProtocol, composeSoul } = await loadSoul()
+
+    const appended = ensureMessagingProtocol(EXISTING_SOUL, 'default')
+    const composed = composeSoul({ customSoul: '', description: 'D', name: 'newbot', title: 'T' })
+
+    for (const soul of [appended, composed]) {
+      expect(soul).toMatch(/run `hermes profile list` for the LIVE/)
+
+      for (const teammate of roster) {
+        expect(soul).not.toMatch(new RegExp(`- \`${teammate.name}\``))
+      }
+    }
   })
 })
 
@@ -102,11 +122,10 @@ describe('composeSoul', () => {
       customSoul: '',
       description: 'literature review',
       name: 'researcher',
-      roster,
       title: 'Researcher'
     })
 
-    const cloned = composeSoul({ customSoul: withProtocol, name: 'researcher', roster })
+    const cloned = composeSoul({ customSoul: withProtocol, name: 'researcher' })
 
     expect(sectionCount(cloned)).toBe(1)
   })
@@ -166,7 +185,7 @@ describe('the bot_mode_protocol backend capability suppresses every SOUL write',
 
     const { ensureMessagingProtocol } = await loadSoul()
 
-    expect(ensureMessagingProtocol(EXISTING_SOUL, 'default', [])).toBe(EXISTING_SOUL.trim())
+    expect(ensureMessagingProtocol(EXISTING_SOUL, 'default')).toBe(EXISTING_SOUL.trim())
   })
 
   it('issues no RPC at all from the backfill', async () => {
@@ -185,7 +204,7 @@ describe('the bot_mode_protocol backend capability suppresses every SOUL write',
 
     const { composeSoul } = await loadSoul()
 
-    expect(composeSoul({ customSoul: '', description: 'D', name: 'newbot', roster: [], title: 'T' })).not.toMatch(
+    expect(composeSoul({ customSoul: '', description: 'D', name: 'newbot', title: 'T' })).not.toMatch(
       /## Messaging other agents/
     )
   })
