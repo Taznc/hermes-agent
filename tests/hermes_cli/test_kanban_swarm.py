@@ -131,7 +131,7 @@ def test_create_swarm_graph_is_atomic_and_rolls_back_partial_build(
         writer.close()
 
 
-def test_create_swarm_applies_routing_to_every_new_card(tmp_path, monkeypatch):
+def test_create_swarm_applies_routing_before_entering_write_txn(tmp_path, monkeypatch):
     conn = kbc.connect(tmp_path / "kanban.db")
     calls: list[dict[str, object]] = []
 
@@ -144,6 +144,7 @@ def test_create_swarm_applies_routing_to_every_new_card(tmp_path, monkeypatch):
     )
 
     def _fake_resolver(**kwargs):
+        assert not conn.in_transaction, "swarm route resolution must happen before write_txn"
         calls.append(kwargs)
         return route
 

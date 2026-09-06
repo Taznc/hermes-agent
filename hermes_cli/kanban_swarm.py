@@ -180,6 +180,21 @@ def create_swarm(
     root_route = None
     if existing_root_id is None:
         root_route = resolve_kanban_model_route(title=root_title_value, body=root_body)
+    worker_routes = [
+        resolve_kanban_model_route(title=spec.title, body=(spec.body or ""))
+        for spec in worker_specs
+    ]
+    verifier_body = (
+        "Review every worker handoff and blackboard update. Gate the swarm: "
+        "complete only with metadata {\"gate\": \"pass\"} when evidence is "
+        "sufficient; otherwise block with exact missing work."
+    )
+    verifier_route = resolve_kanban_model_route(title=verifier_title, body=verifier_body)
+    synthesizer_body = (
+        "Synthesize the verified worker outputs into the final deliverable. "
+        "Do not start until the verifier has passed the gate."
+    )
+    synthesizer_route = resolve_kanban_model_route(title=synthesizer_title, body=synthesizer_body)
 
     activated = False
     with kb.write_txn(conn):
@@ -205,21 +220,6 @@ def create_swarm(
             if worker_ids and verifier_id and synthesizer_id:
                 return SwarmCreated(root, worker_ids, str(verifier_id), str(synthesizer_id))
 
-        worker_routes = [
-            resolve_kanban_model_route(title=spec.title, body=(spec.body or ""))
-            for spec in worker_specs
-        ]
-        verifier_body = (
-            "Review every worker handoff and blackboard update. Gate the swarm: "
-            "complete only with metadata {\"gate\": \"pass\"} when evidence is "
-            "sufficient; otherwise block with exact missing work."
-        )
-        verifier_route = resolve_kanban_model_route(title=verifier_title, body=verifier_body)
-        synthesizer_body = (
-            "Synthesize the verified worker outputs into the final deliverable. "
-            "Do not start until the verifier has passed the gate."
-        )
-        synthesizer_route = resolve_kanban_model_route(title=synthesizer_title, body=synthesizer_body)
         context_suffix = _swarm_context(root, goal)
         worker_ids = []
         for spec, route in zip(worker_specs, worker_routes):
