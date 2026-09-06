@@ -14,6 +14,7 @@ the settings the next tick uses, never that a particular number is the default.
 from __future__ import annotations
 
 from gateway.kanban_watchers_dispatcher import (
+    _paused_board_slugs,
     _reload_dispatcher_settings,
     _resolve_dispatcher_settings,
 )
@@ -114,3 +115,17 @@ def test_a_changed_cap_is_logged(caplog):
     assert any("max_in_progress" in r.getMessage() for r in caplog.records), (
         "an operator retuning concurrency should see it land in the log"
     )
+
+
+def test_paused_boards_are_identified_for_health_probe_exclusion():
+    class _Result:
+        def __init__(self, paused):
+            self.dispatch_paused = paused
+
+    results = [
+        ("paused", _Result({"reason": "start_budget_exceeded"})),
+        ("running", _Result(None)),
+        ("failed", None),
+    ]
+
+    assert _paused_board_slugs(results) == {"paused"}

@@ -312,7 +312,7 @@ class _KanbanDispatcher:
         """Run one dispatch_once per board. Returns (slug, result) pairs."""
         return [(slug, self.tick_once_for_board(slug)) for slug in self._board_slugs()]
 
-    def ready_nonempty(self) -> bool:
+    def ready_nonempty(self, excluded_boards: Optional[set[str]] = None) -> bool:
         """Is there a ready+assigned+unclaimed task on ANY board the dispatcher would spawn for?
 
         Control-plane lanes (e.g. ``orion-cc``) are pulled by terminals via
@@ -323,7 +323,10 @@ class _KanbanDispatcher:
         """
         kbd = _kbd()
         _review_probe = kbd.review_dispatch_enabled()
+        excluded = excluded_boards or set()
         for slug in self._board_slugs():
+            if slug in excluded:
+                continue
             conn = None
             try:
                 conn = _kbc().connect(board=slug)
@@ -392,6 +395,15 @@ class _KanbanDispatcher:
         else:
             logger.info("kanban auto-decompose [%s]: %s → single task (no fanout)", slug, tid)
         return 1
+
+
+def _paused_board_slugs(results: Optional[list]) -> set[str]:
+    """Boards intentionally held by their sticky dispatch circuit."""
+    return {
+        str(slug)
+        for slug, res in (results or [])
+        if res is not None and getattr(res, "dispatch_paused", None) is not None
+    }
 
 
 def _log_spawn_results(results: Optional[list]) -> bool:
