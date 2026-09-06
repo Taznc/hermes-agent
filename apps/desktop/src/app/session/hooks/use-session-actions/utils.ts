@@ -1734,7 +1734,17 @@ export function applyRuntimeInfo(
   reportBackendContract(info.desktop_contract)
 
   if (info.approval_mode !== undefined) {
-    reconcileApprovalModeForProfile($activeGatewayProfile.get(), info.approval_mode)
+    // Approval mode is PROFILE-scoped and the gateway already resolved it
+    // against this session's own profile, stamping that profile as
+    // `profile_name` in the same payload. Credit that name, and only from the
+    // foreground: a background tile runs in its own profile, so attributing
+    // its mode to the ambient active profile rewrote one profile's statusbar
+    // with another's setting — the cross-profile bug the gateway fix removed,
+    // reintroduced one layer up. Fall back to the active profile only for a
+    // legacy backend that sends no `profile_name`.
+    if (foreground) {
+      reconcileApprovalModeForProfile(info.profile_name || $activeGatewayProfile.get(), info.approval_mode)
+    }
   }
 
   requestDesktopOnboardingForCredentialWarning(info.credential_warning)

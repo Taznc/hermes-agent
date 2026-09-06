@@ -8450,6 +8450,38 @@ def test_session_info_approval_mode_matches_its_own_profile_name(tmp_path, monke
     assert info["yolo"] is False
 
 
+def test_session_info_reports_the_profile_its_approval_mode_belongs_to(tmp_path, monkeypatch):
+    """`profile_name` must accompany `approval_mode` on every payload.
+
+    The desktop credits the mode to `profile_name` rather than to whichever
+    profile is ambiently active, because a background tile runs in its own
+    profile. Dropping the field would silently send the renderer back to the
+    ambient-profile guess this pairing exists to remove.
+    """
+    launch_home, named_home = _profile_home_layout(
+        tmp_path, monkeypatch, launch_mode="manual", named_mode="smart"
+    )
+
+    class _Agent:
+        model = "test/model"
+        provider = "test"
+        session_id = "sid"
+        reasoning_config = None
+        service_tier = None
+
+    for home, expected_profile, expected_mode in (
+        (named_home, "work", "smart"),
+        (None, server._current_profile_name(), "manual"),
+    ):
+        session = {"cwd": str(home or launch_home), "session_key": "sid"}
+        if home is not None:
+            session["profile_home"] = str(home)
+        info = server._session_info(_Agent(), session)
+
+        assert info["profile_name"] == expected_profile
+        assert info["approval_mode"] == expected_mode
+
+
 def test_session_info_approval_mode_survives_a_failing_yolo_lookup(tmp_path, monkeypatch):
     """A failure in the session-yolo lookup must not publish a guessed mode.
 
