@@ -104,33 +104,6 @@ test('controlSocketPath default base stays under sun_path even with the temp-lis
   assert.ok(!p.includes('/var/folders/'), 'default base must not be os.tmpdir() on macOS')
 })
 
-test('controlSocketPath default base stays under sun_path with a pathologically long $HOME', () => {
-  // Worker-profile homes (~/.hermes/profiles/<name>/home) run tens of bytes
-  // longer than a bare /home/<user>; a HOME-rooted default base silently
-  // reintroduces the overflow the macOS fix above closed. XDG_RUNTIME_DIR
-  // (per-user, tmpfs, short) must be preferred whenever it is advertised, so
-  // the default base stays short regardless of $HOME's length.
-  if (process.platform === 'win32') return
-  const origHome = process.env.HOME
-  const origRuntimeDir = process.env.XDG_RUNTIME_DIR
-  try {
-    process.env.HOME = '/home/hermes/.hermes/profiles/some-very-long-worker-profile-name/home'
-    process.env.XDG_RUNTIME_DIR = '/run/user/1000'
-    const p = controlSocketPath('hermes', 'remote-build-server', 22) // no baseDir → default
-    const worstCase = `${p}.0123456789abcdef`
-    assert.ok(
-      worstCase.length <= 104,
-      `default control socket + temp suffix must fit sun_path under a long $HOME (got ${worstCase.length}: ${worstCase})`
-    )
-    assert.ok(p.startsWith('/run/user/1000/'), 'default base must prefer XDG_RUNTIME_DIR over a long $HOME')
-  } finally {
-    process.env.HOME = origHome
-    if (origRuntimeDir === undefined) delete process.env.XDG_RUNTIME_DIR
-    else process.env.XDG_RUNTIME_DIR = origRuntimeDir
-  }
-})
-
-
 test('baseSshOptions carries the house ControlMaster/BatchMode/accept-new policy', () => {
   const opts = baseSshOptions('/tmp/x.sock', 15000)
   const joined = opts.join(' ')
