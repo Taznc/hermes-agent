@@ -85,6 +85,45 @@ def test_enabled_but_unconfigured_profile_fails_closed_without_classifier_call(k
     assert decision.reasoning_effort is None
 
 
+@pytest.mark.parametrize(
+    "routes",
+    [
+        {},
+        {"mechanical": {"provider": "openai-codex", "model": "gpt-5.4-mini"}},
+        {"mechanical": {"provider": "openai-codex", "model": "gpt-5.4-mini", "reasoning_effort": "invalid"}},
+    ],
+)
+def test_profile_without_complete_supported_candidate_fails_closed_before_classifier_call(
+    kanban_home, monkeypatch, routes,
+):
+    from hermes_cli import kanban_model_routing as kmr
+
+    calls = []
+
+    def _fake_llm(*_args, **_kwargs):
+        calls.append(("called", _args, _kwargs))
+        return type("Resp", (), {
+            "choices": [
+                type("Choice", (), {"message": type("Msg", (), {"content": '{\"route\":\"mechanical\"}'})()})()
+            ]
+        })()
+
+    config = _routing_config()
+    config["kanban"]["model_routing"]["routes"] = routes
+    monkeypatch.setattr(kmr, "_call_llm", _fake_llm)
+
+    decision = kmr.resolve_kanban_model_route(
+        title="Tighten README", body="Narrow docs tweak", config=config,
+    )
+
+    assert calls == []
+    assert decision.route_source == "default"
+    assert decision.route_name is None
+    assert decision.model_override is None
+    assert decision.provider_override is None
+    assert decision.reasoning_effort is None
+
+
 def test_explicit_override_short_circuits_classifier_call(kanban_home, monkeypatch):
     from hermes_cli import kanban_model_routing as kmr
 

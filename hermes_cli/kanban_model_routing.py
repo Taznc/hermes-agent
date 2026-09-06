@@ -129,6 +129,13 @@ def _route_from_config(config: dict, route_name: str) -> tuple[Optional[str], Op
     return provider, model, reasoning_effort
 
 
+def _has_complete_configured_candidate(config: dict) -> bool:
+    return any(
+        all(value is not None for value in _route_from_config(config, route_name))
+        for route_name in _SUPPORTED_ROUTES
+    )
+
+
 def _default_decision() -> KanbanModelRouteDecision:
     return KanbanModelRouteDecision(_DEFAULT_ROUTE_NAME, None, None, None, None)
 
@@ -168,6 +175,8 @@ def resolve_kanban_model_route(
     classifier_provider = _normalize_text(classifier_cfg.get("provider"))
     classifier_model = _normalize_text(classifier_cfg.get("model"))
     if not classifier_provider or not classifier_model:
+        return _default_decision()
+    if not _has_complete_configured_candidate(config):
         return _default_decision()
 
     max_input_tokens = classifier_cfg.get("max_input_tokens", DEFAULT_CLASSIFIER_MAX_INPUT_TOKENS)
