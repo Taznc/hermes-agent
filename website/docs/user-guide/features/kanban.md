@@ -1010,6 +1010,49 @@ that have *already* happened, use the reconciliation-card pattern above with
 the `agent-merge-conflict-arbiter` optional skill; hotspot flagging is the upstream fix that keeps
 the reconciler from becoming a standing lane.
 
+### Declaring a card's edit surface (`Edit-Targets:`)
+
+Hotspot comments are a *post-hoc* signal: they only exist once a worker has
+already collided. To stop the collision happening at all, a card body can
+declare the files it intends to write, and the dispatcher serializes any two
+cards that name a common path:
+
+```
+Edit-Targets: apps/desktop/src/app/chat/right-rail/preview-pane.tsx, apps/desktop/src/lib/preview-guest.ts
+```
+
+A bullet list under an `Edit targets:` heading works too. When a card about to
+be dispatched names a path that a currently-running (or just-spawned) card
+already owns, the dispatcher does **not** block it for a human — it adds a real
+`parents=[holder]` dependency edge, so the card waits and then starts from a
+tree that already contains the holder's work. Once the holder completes the card
+promotes and dispatches normally.
+
+This exists because prose does not serialize agents. Two cards were once fanned
+out with the shared decision written into *both* bodies — "import the helper, do
+not define a second one" — and both workers still created it with different
+contents, because they ran in separate worktrees nine minutes apart and could
+not see each other. The `parents=[...]` edge is the only mechanism on the board
+that can actually order two workers.
+
+Scope is deliberately narrow, so declaring costs nothing:
+
+- Matching is exact per-path equality after normalization (`./a/b.ts`, `a//b.ts`
+  and `` `a/b.ts` `` are the same file). No globs, no directory prefixes.
+- Only the overlapping pair is serialized — two cards naming *different* files
+  in the same repo still run concurrently. It is not a repo-wide lock.
+- A card that declares nothing and has no hotspot history dispatches exactly as
+  it did before.
+- Tenants are separate workspaces, so the same path under two tenants is not a
+  collision.
+- Emitted `hotspot:` comments and `hotspot` keys in completion metadata count as
+  a declared surface too — that signal was already in the DB and is now read
+  back rather than only being available to a human reading the board.
+
+Deferred cards appear in the dispatch result's `serialized_coedit` bucket as
+`(task_id, holder_id, path)` and get a `serialized_coedit` event on the card, so
+`hermes kanban tail` shows why a card is waiting.
+
 ## Multi-tenant usage
 
 When one specialist fleet serves multiple businesses, tag each task with a tenant:
