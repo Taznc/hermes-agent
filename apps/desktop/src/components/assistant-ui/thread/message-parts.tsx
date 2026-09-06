@@ -6,7 +6,7 @@ import {
   useMessagePartReasoning
 } from '@assistant-ui/react'
 import { useStore } from '@nanostores/react'
-import { type ComponentProps, type FC, type ReactNode, useEffect, useRef, useState } from 'react'
+import { type ComponentProps, type FC, type ReactNode, useEffect, useMemo, useRef, useState } from 'react'
 
 import { ClarifyTool } from '@/components/assistant-ui/clarify-tool'
 import { MarkdownText, MarkdownTextContent } from '@/components/assistant-ui/markdown-text'
@@ -19,9 +19,13 @@ import { formatElapsed, useElapsedSeconds, useMeasuredDuration } from '@/compone
 import { ActivityTimerText } from '@/components/chat/activity-timer-text'
 import { GeneratedImage } from '@/components/chat/generated-image-result'
 import { SCAFFOLD_LABEL_CLASS, SCAFFOLD_META_CLASS, ScaffoldRow } from '@/components/chat/scaffold-row'
+import { ErrorBoundary } from '@/components/error-boundary'
+import { useContributions } from '@/contrib'
+import { ContribRender } from '@/contrib/react/boundary'
 import { useI18n } from '@/i18n'
 import { generatedImageFromResult } from '@/lib/generated-images'
 import { separateGluedReasoningBlocks } from '@/lib/reasoning-blocks'
+import { resolveToolRenderer, TOOL_RENDERERS_AREA, type ToolRendererContribution } from '@/lib/tool-renderers'
 import { useEnterAnimation } from '@/lib/use-enter-animation'
 import { cn } from '@/lib/utils'
 import { $reasoningCollapsedByDefault } from '@/store/reasoning-disclosure'
@@ -62,7 +66,14 @@ const DelegateToolPart: FC<TimelineToolCallProps> = props => {
   )
 }
 
-const ChainToolFallback: FC<TimelineToolCallProps> = props => {
+/**
+ * The core tool-rendering chain: today's exact `if (toolName === ...)`
+ * ladder, unmoved. This is the fallback `ChainToolFallback` below degrades to
+ * when no plugin claims a tool name AND when a plugin's own renderer throws —
+ * so it must stay reachable and byte-identical on its own, never assume a
+ * `toolRenderers` lookup already ran.
+ */
+const CoreChainToolFallback: FC<TimelineToolCallProps> = props => {
   // todo parts are hoisted to a dedicated panel above the message content.
   if (props.toolName === 'todo') {
     return null
@@ -109,6 +120,69 @@ const ChainToolFallback: FC<TimelineToolCallProps> = props => {
   }
 
   return <ToolFallback {...props} />
+}
+
+/**
+ * The plugin seam: consult the `toolRenderers` registry FIRST; on no match
+ * it falls straight through to `CoreChainToolFallback`, unchanged. This is
+ * the whole safety argument for "no plugin registered => byte-identical
+ * behavior" — a no-op registry lookup, then the exact same chain as before.
+ *
+ * A throwing plugin renderer degrades to `CoreChainToolFallback` instead of a
+ * generic error card: the tool still renders, just with core's own chrome —
+ * the difference between a plugin bug and a broken transcript row.
+ */
+const ChainToolFallback: FC<TimelineToolCallProps> = props => {
+  const contributions = useContributions(TOOL_RENDERERS_AREA)
+  const resolved = useMemo(() => resolveToolRenderer(contributions, props.toolName), [contributions, props.toolName])
+
+  // `props` carries a fresh addResult/resume/respondToApproval closure on
+  // every render (assistant-ui's contract), so memoizing renderResolved on
+  // `props` itself would remount the plugin's card every tick. Keep the
+  // latest props in a ref instead — assigned during render, the established
+  // latest-value pattern in this codebase (`use-enter-animation.ts`), never
+  // inside a useEffect — so the render callback's identity only changes when
+  // the RESOLVED renderer does.
+  const propsRef = useRef(props)
+  propsRef.current = props
+
+  const renderResolved = useMemo(() => {
+    if (!resolved) {
+      return null
+    }
+
+    const render = resolved.render
+
+    return () => render(propsRef.current)
+  }, [resolved])
+
+  // An ErrorBoundary latches its caught error for the life of the instance, so
+  // the boundary is keyed to the RESOLVED renderer's identity rather than
+  // mounted once per tool. `tool-renderers.ts` promises that re-registering a
+  // claim (a plugin reload or update) supersedes the earlier one; without this
+  // a renderer that threw once would keep the tool pinned to core's row even
+  // after a working renderer took its place under the same contribution id.
+  const generationRef = useRef(0)
+  const lastRenderRef = useRef<ToolRendererContribution['render'] | undefined>(undefined)
+
+  if (resolved?.render !== lastRenderRef.current) {
+    lastRenderRef.current = resolved?.render
+    generationRef.current += 1
+  }
+
+  if (!resolved || !renderResolved) {
+    return <CoreChainToolFallback {...props} />
+  }
+
+  return (
+    <ErrorBoundary
+      fallback={() => <CoreChainToolFallback {...props} />}
+      key={`${resolved.id}#${generationRef.current}`}
+      label={`toolRenderers:${resolved.id}`}
+    >
+      <ContribRender render={renderResolved} />
+    </ErrorBoundary>
+  )
 }
 
 type TimelineTextPartProps = TextMessagePartProps & { completedAt?: number; timestamp?: number }
