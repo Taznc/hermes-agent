@@ -1655,6 +1655,58 @@ def count_running_tasks_by_assignee_other_boards(board: Optional[str] = None) ->
     return counts
 
 
+def count_running_tasks_by_assignee(conn: sqlite3.Connection, board: Optional[str] = None) -> dict[str, int]:
+    """Host-wide running-worker counts per assignee: this board's rows plus every
+    other board's (:func:`count_running_tasks_by_assignee_other_boards`).
+
+    Single source of truth for "how many workers does profile X have in flight
+    right now" — both the dispatcher's per-profile cap enforcement and
+    diagnostics' concurrency-aware ``stranded_in_ready`` rule read this so they
+    can never drift into two counters that disagree.
+    """
+    counts = count_running_tasks_by_assignee_other_boards(board)
+    for prow in conn.execute(
+        "SELECT assignee, COUNT(*) AS n FROM tasks "
+        "WHERE status = 'running' AND assignee IS NOT NULL "
+        "GROUP BY assignee"
+    ):
+        assignee = prow["assignee"]
+        counts[assignee] = counts.get(assignee, 0) + int(prow["n"])
+    return counts
+
+
+def total_running_tasks(conn: sqlite3.Connection, board: Optional[str] = None) -> int:
+    """Host-wide running-worker count: this board's rows (:func:`count_running_tasks`)
+    plus every other board's (:func:`count_running_tasks_other_boards`).
+
+    Shared so the dispatcher's ``max_in_progress`` enforcement and diagnostics'
+    concurrency-aware rules agree on the same number.
+    """
+    return count_running_tasks(conn) + count_running_tasks_other_boards(board)
+
+
+def concurrency_snapshot(conn: sqlite3.Connection, board: Optional[str] = None,
+                          *, kanban_cfg: Optional[dict] = None) -> dict:
+    """Host concurrency snapshot for concurrency-aware diagnostics.
+
+    Resolves the same caps (:func:`resolve_dispatch_caps`) and running-task
+    counts (:func:`total_running_tasks` / :func:`count_running_tasks_by_assignee`)
+    the dispatcher itself uses to enforce ``kanban.max_in_progress`` /
+    ``kanban.max_in_progress_per_profile``. Callers (dashboard/CLI diagnostics)
+    pass the result into ``kanban_diagnostics.compute_task_diagnostics(...,
+    concurrency=...)`` so ``stranded_in_ready`` can tell "queued behind a full
+    pipe" from "actually stuck" without reimplementing a second counter that
+    can drift from the enforcer.
+    """
+    caps = resolve_dispatch_caps(kanban_cfg)
+    return {
+        "max_in_progress": caps.max_in_progress,
+        "max_in_progress_per_profile": caps.max_in_progress_per_profile,
+        "total_running": total_running_tasks(conn, board),
+        "running_by_assignee": count_running_tasks_by_assignee(conn, board),
+    }
+
+
 def _memory_pressure_level(sample: Optional[Mapping[str, Any]] = None) -> str:
     """Classify system memory pressure: ok/elevated/critical/unknown.
 
@@ -2076,18 +2128,9 @@ def _dispatch_once_locked(
         isinstance(max_in_progress_per_profile, int)
         and max_in_progress_per_profile > 0
     ) else None
-    per_profile_running: dict[str, int] = {}
-    if per_profile_cap is not None:
-        per_profile_running = count_running_tasks_by_assignee_other_boards(board)
-        for prow in conn.execute(
-            "SELECT assignee, COUNT(*) AS n FROM tasks "
-            "WHERE status = 'running' AND assignee IS NOT NULL "
-            "GROUP BY assignee"
-        ):
-            assignee = prow["assignee"]
-            per_profile_running[assignee] = (
-                per_profile_running.get(assignee, 0) + int(prow["n"])
-            )
+    per_profile_running: dict[str, int] = (
+        count_running_tasks_by_assignee(conn, board) if per_profile_cap is not None else {}
+    )
     lane_kwargs: dict[str, Any] = dict(
         dry_run=dry_run, ttl_seconds=ttl_seconds, board=board,
         failure_limit=failure_limit, spawn_fn=spawn_fn,

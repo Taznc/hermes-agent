@@ -275,6 +275,45 @@ def test_max_spawn_stays_per_board(kanban_home, all_assignees_spawnable):
 
 
 # ---------------------------------------------------------------------------
+# concurrency_snapshot — shared counter for diagnostics' stranded_in_ready
+#
+# The dispatcher and kanban_diagnostics must never disagree on "is the board
+# at capacity right now": concurrency_snapshot reuses the SAME counting
+# helpers dispatch_once itself calls (count_running_tasks /
+# count_running_tasks_other_boards / count_running_tasks_by_assignee), so
+# there is exactly one implementation of "how many workers are running".
+# ---------------------------------------------------------------------------
+
+
+def test_concurrency_snapshot_reflects_real_running_counts(kanban_home, all_assignees_spawnable):
+    """Total running + per-assignee running must match what dispatch_once's
+    own cap enforcement would compute, across boards."""
+    kb.create_board("second")
+    with kbc.connect(board="second") as conn:
+        other_running = kb.create_task(conn, title="already-running", assignee="alice")
+        assert kb.claim_task(conn, other_running) is not None
+
+    with kbc.connect() as conn:
+        here_running = kb.create_task(conn, title="also-running", assignee="bob")
+        assert kb.claim_task(conn, here_running) is not None
+        snap = kbd.concurrency_snapshot(conn, kanban_cfg={"max_in_progress": 5, "max_in_progress_per_profile": 3})
+
+    assert snap["max_in_progress"] == 5
+    assert snap["max_in_progress_per_profile"] == 3
+    assert snap["total_running"] == 2  # one on this board, one on "second"
+    assert snap["running_by_assignee"] == {"alice": 1, "bob": 1}
+
+
+def test_concurrency_snapshot_uses_memory_derived_default_when_unset(kanban_home, monkeypatch):
+    """With no explicit kanban.max_in_progress, the snapshot must resolve the
+    SAME memory-derived default dispatch_once uses — never hardcode 6."""
+    monkeypatch.setattr(kbd, "derive_default_max_in_progress", lambda sample=None: 9)
+    with kbc.connect() as conn:
+        snap = kbd.concurrency_snapshot(conn, kanban_cfg={})
+    assert snap["max_in_progress"] == 9
+
+
+# ---------------------------------------------------------------------------
 # 3. Review lane cannot be starved by a sustained ready backlog (P2)
 # ---------------------------------------------------------------------------
 

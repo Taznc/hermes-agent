@@ -733,6 +733,15 @@ def _rule_stranded_in_ready(task, events, runs, now, cfg) -> list[Diagnostic]:
     one, and the two diagnostics recommend opposite remedies — showing both
     would point the operator at "reassign" for a card that isn't actually
     stuck on assignment.
+
+    Concurrency-aware: a board sitting at ``kanban.max_in_progress`` (or the
+    card's assignee sitting at ``kanban.max_in_progress_per_profile``) is
+    correctly queued behind a full pipe, not stranded — there is no operator
+    action to take, so the diagnostic is suppressed entirely rather than
+    emitted at a downgraded severity. ``cfg["_concurrency"]`` (see
+    :func:`hermes_cli.kanban_db_dispatch.concurrency_snapshot`) carries the
+    SAME counts/caps the dispatcher itself enforces, so this can never drift
+    from the real cap check.
     """
     threshold_seconds = float(cfg.get("stranded_threshold_seconds", 30 * 60))
     if _task_field(task, "status") != "ready":
@@ -743,6 +752,17 @@ def _rule_stranded_in_ready(task, events, runs, now, cfg) -> list[Diagnostic]:
     assignee = _task_field(task, "assignee") or ""
     if not assignee.strip():
         return []
+
+    concurrency = cfg.get("_concurrency")
+    if isinstance(concurrency, dict):
+        global_cap = concurrency.get("max_in_progress")
+        if global_cap is not None and concurrency.get("total_running", 0) >= global_cap:
+            return []  # host is at its concurrency cap: queued, not stranded
+        profile_cap = concurrency.get("max_in_progress_per_profile")
+        if profile_cap is not None:
+            running_by_assignee = concurrency.get("running_by_assignee") or {}
+            if running_by_assignee.get(assignee, 0) >= profile_cap:
+                return []  # this assignee is at its per-profile cap: queued, not stranded
 
     # Most recent event that put the task into ready; with none (old task /
     # truncated events) fall back to created_at — over-flagging an ancient
@@ -862,14 +882,25 @@ def compute_task_diagnostics(
     now: Optional[int] = None,
     config: Optional[dict] = None,
     graph: Optional[dict] = None,
+    concurrency: Optional[dict] = None,
 ) -> list[Diagnostic]:
     """Run every rule for one task; critical first, then error, warning; ties
-    broken by most-recent ``last_seen_at``."""
+    broken by most-recent ``last_seen_at``.
+
+    ``concurrency`` (see :func:`hermes_cli.kanban_db_dispatch.concurrency_snapshot`)
+    carries the host's resolved ``kanban.max_in_progress`` /
+    ``max_in_progress_per_profile`` caps and current running-task counts, so
+    ``_rule_stranded_in_ready`` can suppress the diagnostic when a ``ready``
+    card is correctly queued behind a full pipe rather than actually stranded.
+    Omit it (the default) to preserve the old age-only behavior — e.g. call
+    sites without a live DB connection to compute counts from."""
     now_ts = int(now if now is not None else time.time())
     config = config or {}
     cfg = {**DEFAULT_CONFIG, **config}
     if graph is not None:
         cfg["_graph"] = graph
+    if concurrency is not None:
+        cfg["_concurrency"] = concurrency
     if not _has_explicit_threshold(config) and "failure_limit" in config:
         cfg["failure_threshold"] = _positive_int(
             config.get("failure_limit"), DEFAULT_CONFIG["failure_threshold"],
