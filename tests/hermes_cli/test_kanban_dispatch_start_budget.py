@@ -139,6 +139,36 @@ def test_explicit_unarchive_is_not_treated_as_terminal_replay(
         assert (task_id, "recent_success") in result.respawn_guarded
 
 
+def test_descendant_invalidation_is_not_treated_as_terminal_replay(
+    all_assignees_spawnable,
+):
+    board = "parent-reopen"
+    with kbc.connect(board=board) as conn:
+        task_id = kb.create_task(conn, title="invalidated child", assignee="worker")
+        assert kb.claim_task(conn, task_id) is not None
+        assert kb.complete_task(conn, task_id, result="finished") is True
+        with kb.write_txn(conn):
+            conn.execute("UPDATE tasks SET status = 'ready' WHERE id = ?", (task_id,))
+            kb._append_event(
+                conn,
+                task_id,
+                "descendant_invalidated",
+                {"parent_id": "parent"},
+            )
+
+        result = kbd.dispatch_once(
+            conn,
+            board=board,
+            spawn_fn=_spawn,
+            dispatch_start_budget=20,
+            dispatch_start_window_seconds=600,
+        )
+
+        assert result.dispatch_paused is None
+        assert result.spawned == []
+        assert (task_id, "recent_success") in result.respawn_guarded
+
+
 def test_unreadable_pause_state_fails_closed_until_explicit_resume(
     all_assignees_spawnable,
 ):

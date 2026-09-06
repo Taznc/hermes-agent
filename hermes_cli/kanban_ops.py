@@ -90,9 +90,10 @@ def _cmd_dispatch(args: argparse.Namespace) -> int:
     # and enforced by dispatch_once regardless of what --max asks for.
     cli_max = getattr(args, "max", None)
     max_spawn = cli_max if cli_max is not None else caps.max_spawn
-    with kbc.connect_closing() as conn:
+    with kbc.connect_closing(board=board) as conn:
         res = kbd.dispatch_once(
             conn,
+            board=board,
             dry_run=args.dry_run,
             max_spawn=max_spawn,
             max_in_progress=caps.max_in_progress,
@@ -201,9 +202,10 @@ def _cmd_daemon(args: argparse.Namespace) -> int:
     if not getattr(args, "force", False):
         return _err(_DAEMON_DEPRECATED, 2)
 
+    board = getattr(args, "board", None)
     # Init before printing "started" so the DB path is right and init errors
     # surface immediately.
-    kb.init_db()
+    kb.init_db(board=board)
 
     pidfile = getattr(args, "pidfile", None)
     if pidfile:
@@ -231,7 +233,7 @@ def _cmd_daemon(args: argparse.Namespace) -> int:
         """Is there a ready+assigned+unclaimed task the dispatcher would spawn for?
         Control-plane lanes pulled via ``claim_task`` are correctly idle, not stuck."""
         try:
-            with kbc.connect_closing() as conn:
+            with kbc.connect_closing(board=board) as conn:
                 return kbd.has_spawnable_ready(conn)
         except Exception:
             return False
@@ -275,6 +277,7 @@ def _cmd_daemon(args: argparse.Namespace) -> int:
             interval=args.interval,
             max_spawn=args.max,
             failure_limit=getattr(args, "failure_limit", kbd.DEFAULT_FAILURE_LIMIT),
+            board=board,
             on_tick=_on_tick,
         )
     finally:

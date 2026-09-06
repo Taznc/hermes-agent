@@ -79,3 +79,29 @@ def test_manual_assignment_after_second_request_overrides_auto_escalation(
         task = kb.get_task(conn, task_id)
         assert task is not None
         assert task.assignee == "specialist"
+
+
+def test_completed_reopened_card_does_not_reuse_historical_rework_rounds(
+    all_assignees_spawnable,
+):
+    with kbc.connect() as conn:
+        task_id = kb.create_task(conn, title="new work epoch", assignee="implementer")
+        kb._append_event(conn, task_id, "changes_requested", {"reason": "first"})
+        kb._append_event(conn, task_id, "changes_requested", {"reason": "second"})
+        conn.commit()
+        assert kb.claim_task(conn, task_id) is not None
+        assert kb.complete_task(conn, task_id, summary="old work complete") is True
+        with kb.write_txn(conn):
+            conn.execute("UPDATE tasks SET status = 'ready' WHERE id = ?", (task_id,))
+            kb._append_event(conn, task_id, "status", {"status": "ready"})
+
+        result = kbd.dispatch_once(
+            conn,
+            spawn_fn=_spawn,
+            review_rework_escalation_profile="debugger",
+        )
+
+        assert result.auto_escalated_rework == []
+        task = kb.get_task(conn, task_id)
+        assert task is not None
+        assert task.assignee == "implementer"

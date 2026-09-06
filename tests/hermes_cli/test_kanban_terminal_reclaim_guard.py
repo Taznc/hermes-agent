@@ -109,6 +109,19 @@ def test_dashboard_reopen_to_ready_is_still_claimable(conn):
     assert result.status == "running"
 
 
+def test_explicit_unarchive_to_ready_is_still_claimable(conn):
+    tid = kb.create_task(conn, title="reopened from archive", assignee="w")
+    assert kb.claim_task(conn, tid, claimer="host:A") is not None
+    assert kb.complete_task(conn, tid, summary="done") is True
+    assert kb.archive_task(conn, tid) is True
+    assert kb.unarchive_task(conn, tid, status="ready") is True
+
+    result = kb.claim_task(conn, tid, claimer="host:B")
+
+    assert result is not None
+    assert result.status == "running"
+
+
 def test_review_reopen_path_unaffected_by_terminal_guard(conn):
     """A task that was never completed (plain ready -> running) is untouched
     by the new guard — no 'completed' event exists at all."""

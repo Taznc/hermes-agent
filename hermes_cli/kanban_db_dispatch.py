@@ -1880,20 +1880,16 @@ def _recent_dispatch_starts(
 
 
 def _terminal_card_replay_ids(conn: sqlite3.Connection) -> list[str]:
-    """Dispatchable cards whose latest terminal transition was not unarchived."""
+    """Dispatchable cards with terminal completion but no sanctioned reopen."""
     rows = conn.execute(
-        "SELECT t.id FROM tasks AS t "
-        "JOIN task_events AS e ON e.id = ("
-        "  SELECT e2.id FROM task_events AS e2 "
-        "  WHERE e2.task_id = t.id "
-        "    AND e2.kind IN ('completed', 'archived', 'unarchived') "
-        "  ORDER BY e2.id DESC LIMIT 1"
-        ") "
-        "WHERE t.status IN ('ready', 'review') "
-        "  AND e.kind IN ('completed', 'archived') "
-        "ORDER BY t.created_at, t.id"
+        "SELECT id FROM tasks WHERE status IN ('ready', 'review') "
+        "ORDER BY created_at, id"
     ).fetchall()
-    return [str(row["id"]) for row in rows]
+    return [
+        str(row["id"])
+        for row in rows
+        if _kb._terminal_completion_without_reopen(conn, str(row["id"])) is not None
+    ]
 
 
 def dispatch_once(
@@ -2197,8 +2193,11 @@ def _changes_requested_state(
 ) -> tuple[int, Optional[int]]:
     row = conn.execute(
         "SELECT COUNT(*) AS rounds, MAX(id) AS latest_id FROM task_events "
-        "WHERE task_id = ? AND kind = 'changes_requested'",
-        (task_id,),
+        "WHERE task_id = ? AND kind = 'changes_requested' "
+        "AND id > COALESCE(("
+        "  SELECT MAX(id) FROM task_events WHERE task_id = ? AND kind = 'completed'"
+        "), 0)",
+        (task_id, task_id),
     ).fetchone()
     return int(row["rounds"]), (
         int(row["latest_id"]) if row["latest_id"] is not None else None
@@ -3220,6 +3219,7 @@ def run_daemon(
     interval: float = 60.0,
     max_spawn: Optional[int] = None,
     failure_limit: int = DEFAULT_FAILURE_LIMIT,
+    board: Optional[str] = None,
     stop_event=None,
     on_tick=None,
 ) -> None:
@@ -3259,9 +3259,10 @@ def run_daemon(
             # Re-resolved every tick (config load is mtime-cached) so operator
             # edits apply without a restart.
             caps = resolve_dispatch_caps()
-            with contextlib.closing(_kbc.connect()) as conn:
+            with contextlib.closing(_kbc.connect(board=board)) as conn:
                 res = dispatch_once(
                     conn,
+                    board=board,
                     max_spawn=max_spawn if max_spawn is not None else caps.max_spawn,
                     max_in_progress=caps.max_in_progress,
                     max_in_progress_per_profile=caps.max_in_progress_per_profile,
