@@ -1977,6 +1977,24 @@ class TestSystemdCgroupIsolation:
         # The session must record the unit name so kill_process can stop it.
         assert session.systemd_unit == f"hermes-worker-{session.id}.scope"
 
+    def test_scope_argv_assigns_worker_slice_and_resource_guards(self, monkeypatch):
+        """Every restart-safe worker scope joins the worker slice with its guards."""
+        import tools.process_registry as pr
+
+        monkeypatch.setattr(pr, "_worker_memory_max_bytes", lambda: 4 * 1024**3)
+
+        argv = pr._systemd_scope_argv(
+            "/usr/bin/systemd-run",
+            "hermes-worker-kanban-contract",
+            "/bin/true",
+        )
+
+        assert "--slice=hermes-workers.slice" in argv
+        assert "--property=MemoryHigh=3G" in argv
+        assert "--property=TimeoutStopSec=30s" in argv
+        assert "MemoryMax=4294967296" in argv
+        assert argv[argv.index("--") + 1:] == ["/bin/true"]
+
     def test_falls_back_when_systemd_run_unavailable(self, registry, monkeypatch, _gateway_identity):
         """Under a supervisor but without systemd-run, fall back to the
         legacy ``start_new_session=True`` path (worker shares the gateway

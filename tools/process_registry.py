@@ -129,8 +129,11 @@ def _systemd_scope_argv(binary: str, unit_name: str, *argv: str) -> List[str]:
     ``--collect`` self-cleans the scope after exit; ``--unit`` names it for systemctl."""
     return [
         binary, "--user", "--scope", "--quiet", "--unit", unit_name, "--collect",
+        "--slice=hermes-workers.slice",
         "--property", "MemoryAccounting=yes",
+        "--property=MemoryHigh=3G",
         "--property", f"MemoryMax={_worker_memory_max_bytes()}",
+        "--property=TimeoutStopSec=30s",
         "--property", "OOMPolicy=kill",
         "--", *argv,
     ]
