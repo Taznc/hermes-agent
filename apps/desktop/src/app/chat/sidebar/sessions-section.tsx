@@ -379,20 +379,6 @@ export function SidebarSessionsSection({
     [renderRow]
   )
 
-  // Same as `renderRows`, but with date dividers folded in — used for
-  // entered-project lanes so a lane spanning multiple days reads
-  // chronologically, matching the flat recents list.
-  const renderRowsDated = useCallback(
-    (items: SessionInfo[]) => {
-      const entries = flattenSessionsWithBranches(items)
-
-      const rows = grouping === 'date' ? groupEntriesByRecency(entries) : toSessionRows(entries)
-
-      return hideCollapsedGroupRows(rows, isListGroupOpen).map(row => renderListRow(row, false))
-    },
-    [grouping, isListGroupOpen, renderListRow]
-  )
-
   // Flat recents as list rows: grouped by recency when enabled, plain otherwise.
   // The hand-picked order is then applied INSIDE each date group, so dragging a
   // row ranks it among its own day's chats instead of freezing the whole list
@@ -408,8 +394,27 @@ export function SidebarSessionsSection({
     return manualOrderIds?.length ? orderRowsWithinGroups(rows, manualOrderIds) : rows
   }, [grouping, displayEntries, liveTurnIdSet, manualOrderIds, statusDividerLabels])
 
+  const archiveDateGroup = useCallback(
+    (rows: readonly SidebarListRow[], key: string) => {
+      let insideGroup = false
+
+      for (const row of rows) {
+        if (row.kind === 'divider') {
+          if (insideGroup) {
+            break
+          }
+
+          insideGroup = row.key === key
+        } else if (insideGroup) {
+          onArchiveSession(row.entry.session.id)
+        }
+      }
+    },
+    [onArchiveSession]
+  )
+
   const dividerAction = useCallback(
-    (key: string, label: string) => {
+    (key: string, label: string, rows: readonly SidebarListRow[] = flatRows) => {
       if (grouping !== 'date') {
         return newSessionDividerAction
       }
@@ -418,27 +423,35 @@ export function SidebarSessionsSection({
         <>
           <SidebarDateDividerArchiveButton
             ariaLabel={`${t.sidebar.row.archiveSession}: ${label}`}
-            onArchive={() => {
-              let insideGroup = false
-
-              for (const row of flatRows) {
-                if (row.kind === 'divider') {
-                  if (insideGroup) {
-                    break
-                  }
-
-                  insideGroup = row.key === key
-                } else if (insideGroup) {
-                  onArchiveSession(row.entry.session.id)
-                }
-              }
-            }}
+            onArchive={() => archiveDateGroup(rows, key)}
           />
           {newSessionDividerAction}
         </>
       )
     },
-    [flatRows, grouping, newSessionDividerAction, onArchiveSession, t]
+    [archiveDateGroup, flatRows, grouping, newSessionDividerAction, t]
+  )
+
+  // Same as `renderRows`, but with date dividers folded in — used for
+  // entered-project lanes so a lane spanning multiple days reads
+  // chronologically, matching the flat recents list. These dividers receive
+  // the same archive action as the main recents list, scoped to this lane.
+  const renderRowsDated = useCallback(
+    (items: SessionInfo[]) => {
+      const entries = flattenSessionsWithBranches(items)
+      const rows = grouping === 'date' ? groupEntriesByRecency(entries) : toSessionRows(entries)
+
+      return hideCollapsedGroupRows(rows, isListGroupOpen).map(row =>
+        renderListRow(
+          row,
+          false,
+          row.kind === 'divider'
+            ? dividerAction(row.key, 'label' in row ? row.label : sessionBucketLabel(row.bucket, dividerLabels), rows)
+            : undefined
+        )
+      )
+    },
+    [dividerAction, dividerLabels, grouping, isListGroupOpen, renderListRow]
   )
 
   // Closed date/status buckets keep their divider and drop the sessions under

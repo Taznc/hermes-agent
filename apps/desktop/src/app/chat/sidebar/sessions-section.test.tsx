@@ -218,4 +218,59 @@ describe('SidebarSessionsSection memoization & virtualizer stability', () => {
     expect(onArchiveSession).toHaveBeenNthCalledWith(2, 'yesterday-b')
     vi.useRealTimers()
   })
+
+  it('renders the archive action for date dividers inside an entered project', () => {
+    vi.useFakeTimers()
+    vi.setSystemTime(new Date('2026-09-06T16:00:00Z'))
+    const onArchiveSession = vi.fn()
+
+    render(
+      <SidebarSessionsSection
+        activeSessionId={null}
+        emptyState={<div>Empty</div>}
+        grouping="date"
+        label="Sessions"
+        onArchiveSession={onArchiveSession}
+        onDeleteSession={noop}
+        onResumeSession={noop}
+        onToggle={noop}
+        onTogglePin={noop}
+        onToggleUnread={noop}
+        open={true}
+        pinned={false}
+        projectContent={{
+          id: 'home',
+          isNoProject: true,
+          label: 'Home',
+          path: null,
+          repos: [
+            {
+              groups: [
+                {
+                  id: 'home-lane',
+                  label: 'Home',
+                  path: null,
+                  sessions: [
+                    makeSession('today', Date.parse('2026-09-06T15:00:00Z') / 1000),
+                    makeSession('yesterday', Date.parse('2026-09-05T15:00:00Z') / 1000)
+                  ]
+                }
+              ],
+              id: 'home-repo',
+              label: 'Home',
+              path: null,
+              sessionCount: 2
+            }
+          ],
+          sessionCount: 2
+        }}
+        sessions={[]}
+      />
+    )
+
+    fireEvent.click(screen.getByRole('button', { name: 'Archive session: Yesterday' }))
+
+    expect(onArchiveSession).toHaveBeenCalledExactlyOnceWith('yesterday')
+    vi.useRealTimers()
+  })
 })
