@@ -205,6 +205,40 @@ def _dispatch_tick_lock(db_path: Path):
                 handle.close()
 
 
+@contextlib.contextmanager
+def _host_dispatch_cap_lock():
+    """Non-blocking host-wide reservation lock for shared dispatch caps.
+
+    Board locks protect SQLite writes.  Host caps instead read every board, so
+    budget calculation through claim must be serialized across boards whenever
+    either host-wide cap is active.
+    """
+    try:
+        lock_path = _kb.kanban_home() / "kanban" / ".dispatch-host-cap.lock"
+        lock_path.parent.mkdir(parents=True, exist_ok=True)
+        handle = lock_path.open("a+b")
+    except OSError:
+        # Preserve the existing dispatch-lock fail-open behavior when a lock
+        # probe itself cannot run (for example a read-only diagnostic mount).
+        yield True
+        return
+    acquired = False
+    try:
+        try:
+            acquired = _try_lock_nb(handle)
+        except (OSError, AttributeError):
+            acquired = False
+        yield acquired
+    finally:
+        try:
+            if acquired:
+                _unlock(handle)
+        except (OSError, AttributeError):
+            pass
+        finally:
+            handle.close()
+
+
 # Periodic explicit WAL checkpoint from the dispatcher tick: a passive
 # autocheckpoint can be starved on a busy multi-process board (any open reader
 # snapshot blocks the WAL reset), letting -wal grow between gateway restarts.
@@ -668,9 +702,9 @@ def connect(db_path: Optional[Path] = None, *, board: Optional[str] = None) -> s
     """Open (and initialize if needed) the kanban DB. WAL is (re)enabled on
     every connection so a re-created file stays robust; the first connection
     per path auto-runs :func:`init_db`, later ones skip via
-    ``_INITIALIZED_PATHS``. Path: explicit ``db_path``, else ``board``, else
-    :func:`kanban_db_path` (``HERMES_KANBAN_DB`` -> ``HERMES_KANBAN_BOARD`` ->
-    ``<root>/kanban/current`` -> ``default``)."""
+    ``_INITIALIZED_PATHS``. Path: explicit ``db_path``; an explicit non-default
+    ``board``; otherwise :func:`kanban_db_path` (``HERMES_KANBAN_DB`` ->
+    ``HERMES_KANBAN_BOARD`` -> ``<root>/kanban/current`` -> ``default``)."""
     path = db_path if db_path is not None else _kb.kanban_db_path(board=board)
     path.parent.mkdir(parents=True, exist_ok=True)
 
@@ -875,6 +909,11 @@ def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
 
     # Same ordering rule as the ``tasks`` indexes above: index after column.
     conn.execute("CREATE INDEX IF NOT EXISTS idx_events_run ON task_events(run_id, id)")
+    # Dispatcher start-budget checks run every tick; avoid a full event-log scan.
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_events_kind_created "
+        "ON task_events(kind, created_at)"
+    )
 
     if _table_exists(conn, "kanban_notify_subs"):
         notify_cols = _column_names(conn, "kanban_notify_subs")
@@ -979,6 +1018,7 @@ _REBUILD_SPECS = {
         (
             "CREATE INDEX idx_events_task ON task_events(task_id, created_at)",
             "CREATE INDEX idx_events_run ON task_events(run_id, id)",
+            "CREATE INDEX idx_events_kind_created ON task_events(kind, created_at)",
         ),
     ),
     "task_comments": (

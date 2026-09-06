@@ -332,6 +332,8 @@ export const BOT_CHAT_SESSION_HYDRATION_TIMEOUT_MS = 60_000
 let openSessionGeneration = 0
 
 export interface PluginOpenSessionOptions {
+  /** A short-lived caller may abandon its selection while the owner socket dials. */
+  isCurrent?: () => boolean
   awaitHydration?: boolean
   expectHistory?: boolean
   /** Always request a sequenced session.resume after the open, even when the
@@ -858,6 +860,7 @@ export const host = {
 
     const openingStillCurrent = () =>
       generation === openSessionGeneration &&
+      (options.isCurrent?.() ?? true) &&
       (options.workspaceMode !== 'bots' ||
         ($workspaceMode.get() === 'bots' && $workspaceOwnerKey.get() === (options.workspaceOwnerKey ?? null)))
 
@@ -969,10 +972,10 @@ export const host = {
 
           const intent = options.intent ?? 'in-place'
 
-          if (options.workspaceMode === 'bots') {
+          if (options.workspaceMode) {
             openSession(storedSessionId, navigate, intent, {
               ownerRoute: ownerRoute ?? undefined,
-              workspaceMode: 'bots',
+              workspaceMode: options.workspaceMode,
               workspaceOwnerKey: options.workspaceOwnerKey,
               ...(options.tabTitle ? { workspaceTabTitle: options.tabTitle } : {})
             })
@@ -1487,6 +1490,11 @@ export type { TitlebarTool } from '@/app/shell/titlebar-controls'
  *  builds without it would route the pin to the ACTIVE gateway. Bot Mode's
  *  Advanced section is the reference consumer. */
 export { SkillsView } from '@/app/skills'
+/** The compact Streamdown preset core uses for tool detail bodies — tighter
+ *  typography, tokenized fences/tables, external links routed through the
+ *  host. Prefer it over raw `Streamdown` for small in-panel prose so every
+ *  surface renders markdown identically. */
+export { CompactMarkdown } from '@/components/chat/compact-markdown'
 /** THE full MCP tab core Settings renders — per-server enable + OAuth sign-in
  *  + API-key setup + live probes, not a checkbox list. Route-decoupled so it
  *  renders anywhere (a plugin dialog); pass a live `gateway` (see
@@ -1569,6 +1577,10 @@ export { Separator } from '@/components/ui/separator'
 export { Skeleton } from '@/components/ui/skeleton'
 export { Switch } from '@/components/ui/switch'
 export { Tabs, TabsList, TabsTrigger } from '@/components/ui/tabs'
+/** The flat text tab row (underline-on-active, no pill box) core uses for
+ *  in-panel tab strips. `TextTabMeta` is the quiet count/detail slot beside a
+ *  tab's label. Pair with `Tabs` only if you want the boxed segmented look. */
+export { TextTab, TextTabMeta } from '@/components/ui/text-tab'
 export { Textarea } from '@/components/ui/textarea'
 export { Tip, Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from '@/components/ui/tooltip'
 export type { GatewayEventListener } from '@/contrib/events'
@@ -1694,6 +1706,14 @@ export {
  *  suffix. `relativeTime` is the bidirectional Intl form ("in 14 hr") — use it
  *  for a scheduled next-run, not for an age. */
 export { type AgoLabels, coarseElapsed, fmtDateTime, fmtDayTime, formatAgo, relativeTime } from '@/lib/time'
+/** Claim ONE tool's transcript card by name — core's hardcoded chain
+ *  (`clarify`, `setup_mcp`, `delegate_task`, `image_generate`, ...) consults
+ *  this registry first and falls through to its own rendering unchanged when
+ *  nothing claims the name. Last registration for a `toolName` wins, so a
+ *  plugin reload or update supersedes its own earlier claim without first
+ *  disposing it. A throwing `render` degrades to core's card for that tool,
+ *  never a blank transcript. */
+export { type ResolvedToolRenderer, resolveToolRenderer, TOOL_RENDERERS_AREA, type ToolRendererContribution } from '@/lib/tool-renderers'
 /** The transcript as a contribution area: register a named `::directive{...}`
  *  and the model can render your component inline in assistant messages. */
 export {

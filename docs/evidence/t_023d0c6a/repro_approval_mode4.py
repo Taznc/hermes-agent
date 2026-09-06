@@ -53,7 +53,11 @@ print("named  profile home :", named_home, "(approvals.mode: smart)")
 print()
 
 print("=== what each profile's config ACTUALLY says ===")
-from tools.approval import _get_approval_mode
+try:
+    # Canonical home since the approval-gate decomposition.
+    from tools.approval_context import _get_approval_mode
+except ImportError:  # pragma: no cover - pre-decomposition trees
+    from tools.approval import _get_approval_mode
 from hermes_constants import reset_hermes_home_override, set_hermes_home_override
 
 print("launch  _get_approval_mode() ->", _get_approval_mode())
@@ -65,14 +69,15 @@ finally:
 
 print()
 print("=== what the Desktop statusbar receives ===")
-print("The renderer sends NO profile param (store/approval-mode.ts:56):")
+print("The unscoped read the renderer USED to send (pre-fix, store/approval-mode.ts:56)")
+print("still answers for the launch profile — that is correct, it named no profile:")
 resp = server.handle_request(
     {"jsonrpc": "2.0", "id": "1", "method": "config.get", "params": {"key": "approvals.mode"}}
 )
 print("  config.get{key:approvals.mode}                 ->", resp.get("result"))
 
 print()
-print("Even if it DID send one, config.get is not @_profile_scoped:")
+print("And the scoped read the renderer NOW sends is honored (this was the bug):")
 resp2 = server.handle_request(
     {
         "jsonrpc": "2.0",

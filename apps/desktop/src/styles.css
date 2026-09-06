@@ -1248,6 +1248,7 @@ button {
 input,
 textarea,
 [contenteditable]:not([contenteditable='false']),
+[data-slot='aui_thread-content'],
 [data-slot='aui_user-message-root'],
 [data-slot='aui_assistant-message-content'],
 [data-slot='aui_system-message-root'],
@@ -1263,13 +1264,31 @@ button,
   user-select: none;
 }
 
-/* User bubbles are <button>s (click → edit), so the rule above would kill
-   drag-to-select and leave ⌘C with nothing to grab. Message text stays
-   selectable; chrome controls outside the bubble keep user-select: none. */
+/* The transcript is a document, so it selects like one: a drag from an
+   assistant reply through a tool result into the next prompt must yield ONE
+   continuous selection that ⌘C copies whole. The body-level
+   `user-select: none` (the app is chrome, not a page) plus the
+   `button`/`[role=button]` rule above would otherwise punch unselectable
+   holes through it — user bubbles are <button>s (click → edit), tool cards
+   and reasoning disclosures are buttons/summaries — and Chromium drops
+   `user-select: none` runs from the copied text, so a drag across a turn
+   silently lost the parts it crossed.
+
+   Text inside the thread wins; the interactive chrome that carries no prose
+   (icon action bars, the reaction slot, the emoji picker, the sticky
+   scroll-to-latest pill) opts back out below so a stray drag on a control
+   doesn't paint a selection. */
+[data-slot='aui_thread-content'] *,
 [data-slot='aui_user-message-root'] button,
 [data-slot='aui_user-message-root'] [role='button'] {
   -webkit-user-select: text;
   user-select: text;
+}
+
+[data-slot='aui_thread-content'] :is([data-slot='aui_msg-actions'], [data-slot='aui_msg-reactions'], img, picture, video, canvas, svg),
+[data-slot='aui_thread-content'] :is([data-slot='aui_msg-actions'], [data-slot='aui_msg-reactions']) * {
+  -webkit-user-select: none;
+  user-select: none;
 }
 
 img,

@@ -11,7 +11,7 @@ import contextlib
 import os
 import sqlite3
 import time
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, replace
 from typing import Any, Optional
 
 from gateway.kanban_watchers_common import _board_slugs, _positive_int_setting, logger
@@ -31,7 +31,13 @@ _CORRUPT_DB_MARKERS = ("file is not a database", "database disk image is malform
 
 @dataclass
 class _DispatcherSettings:
-    """``kanban.*`` dispatch settings, read once at boot (restart to apply)."""
+    """``kanban.*`` dispatch settings.
+
+    ``interval`` is the one field still fixed at boot: it is the loop's own
+    sleep cadence, read before the loop starts. Everything else is re-read
+    every tick by :func:`_resolve_dispatcher_settings` (see the concurrency
+    note there), so a cap change applies on the next tick.
+    """
 
     interval: float
     max_spawn: Any
@@ -40,11 +46,28 @@ class _DispatcherSettings:
     stale_timeout_seconds: int
     reconcile_orphans: bool
     default_assignee: Optional[str]
+    default_reviewer: Optional[str]
     max_in_progress_per_profile: Optional[int]
+    dispatch_start_budget: Optional[int] = None
+    dispatch_start_window_seconds: int = 600
+    review_rework_escalation_profile: Optional[str] = None
 
 
-def _resolve_dispatcher_settings(kanban_cfg: dict, kb: Any) -> _DispatcherSettings:
-    """Parse and log the dispatcher settings in their established order."""
+def _resolve_dispatcher_settings(kanban_cfg: dict, kb: Any, *, quiet: bool = False) -> _DispatcherSettings:
+    """Parse and log the dispatcher settings in their established order.
+
+    Called once at boot and then on EVERY dispatcher tick, so concurrency caps
+    (``max_in_progress``, ``max_in_progress_per_profile``) apply without a
+    gateway restart. That matters here more than for most settings: restarting
+    the gateway to change a cap SIGKILLs every in-flight worker and discards
+    its uncommitted worktree, so "restart to retune" costs exactly the work the
+    caps exist to schedule. Same reasoning as ``kanban.auto_decompose``
+    (#49638), which is re-read per tick for the same reason.
+
+    ``quiet`` (set by the per-tick caller) suppresses the steady-state INFO
+    lines so a re-read every 60s does not flood the log; invalid-value warnings
+    are always emitted.
+    """
     try:
         interval = float(kanban_cfg.get("dispatch_interval_seconds", 60) or 60)
     except (ValueError, TypeError):
@@ -54,15 +77,15 @@ def _resolve_dispatcher_settings(kanban_cfg: dict, kb: Any) -> _DispatcherSettin
     interval = max(interval, 1.0)  # sanity floor — tighter than this is a footgun
 
     max_spawn = kanban_cfg.get("max_spawn")
-    if max_spawn is not None:
+    if max_spawn is not None and not quiet:
         logger.info("kanban dispatcher: max_spawn=%s", max_spawn)
 
     # Cap simultaneously running tasks so slow workers don't pile up and time
     # out. Explicit config wins; otherwise a memory-derived default (unbounded
     # fan-out swap-thrashes small hosts), or None where total memory can't be read.
-    max_in_progress = _positive_int_setting(kanban_cfg, "max_in_progress")
+    max_in_progress = _positive_int_setting(kanban_cfg, "max_in_progress", quiet=quiet)
     effective_max_in_progress = _kbd().resolve_max_in_progress(max_in_progress)
-    if max_in_progress is None and effective_max_in_progress is not None:
+    if max_in_progress is None and effective_max_in_progress is not None and not quiet:
         logger.info(
             "kanban dispatcher: kanban.max_in_progress unset; using "
             "memory-derived default max_in_progress=%d "
@@ -97,9 +120,36 @@ def _resolve_dispatcher_settings(kanban_cfg: dict, kb: Any) -> _DispatcherSettin
     # (#27145). Empty string (the schema default) means "no fallback, keep skipping" — backward-compatible
     # with existing installs.
     default_assignee = (kanban_cfg.get("default_assignee") or "").strip() or None
-    if default_assignee:
+    if default_assignee and not quiet:
         logger.info("kanban dispatcher: default_assignee=%r (unassigned ready tasks "
                     "will route to this profile)", default_assignee)
+
+    # Profile that claims review-lane cards still assigned to their implementer.
+    # Empty (the schema default) keeps the legacy behavior — the review lane spawns
+    # whoever the card is already assigned to, even when that is the profile that
+    # just finished the implementation (a card that finds nothing left to do exits
+    # rc=0, scored as a protocol_violation, and parks after failure_limit).
+    default_reviewer = (kanban_cfg.get("default_reviewer") or "").strip() or None
+    if default_reviewer:
+        logger.info("kanban dispatcher: default_reviewer=%r (review cards still "
+                    "assigned to their implementer will route to this profile)",
+                    default_reviewer)
+
+    dispatch_start_budget = _positive_int_setting(
+        kanban_cfg, "dispatch_start_budget", quiet=quiet,
+    )
+    dispatch_start_window_seconds = _positive_int_setting(
+        kanban_cfg, "dispatch_start_window_seconds", quiet=quiet,
+    ) or 600
+    if dispatch_start_budget is not None and not quiet:
+        logger.info(
+            "kanban dispatcher: start budget=%d per board per %ds (sticky pause on trip)",
+            dispatch_start_budget,
+            dispatch_start_window_seconds,
+        )
+    review_rework_escalation_profile = (
+        kanban_cfg.get("review_rework_escalation_profile") or ""
+    ).strip() or None
 
     return _DispatcherSettings(
         interval=interval,
@@ -111,10 +161,63 @@ def _resolve_dispatcher_settings(kanban_cfg: dict, kb: Any) -> _DispatcherSettin
         # reconciliation); false keeps orphans frozen for manual forensics.
         reconcile_orphans=bool(kanban_cfg.get("reconcile_orphans", True)),
         default_assignee=default_assignee,
+        default_reviewer=default_reviewer,
         # Per-profile concurrency cap: no single profile's local model / API
         # quota / browser pool gets overwhelmed by a fan-out.
-        max_in_progress_per_profile=_positive_int_setting(kanban_cfg, "max_in_progress_per_profile"),
+        max_in_progress_per_profile=_positive_int_setting(
+            kanban_cfg, "max_in_progress_per_profile", quiet=quiet),
+        dispatch_start_budget=dispatch_start_budget,
+        dispatch_start_window_seconds=dispatch_start_window_seconds,
+        review_rework_escalation_profile=review_rework_escalation_profile,
     )
+
+
+def _reload_dispatcher_settings(
+    load_config: Any, kb: Any, current: _DispatcherSettings
+) -> _DispatcherSettings:
+    """Re-read ``kanban.*`` from config for the next tick.
+
+    Fails safe: any config read error keeps ``current`` rather than silently
+    reverting to defaults — a transient unreadable config must never widen a
+    cap the operator deliberately tightened. ``interval`` is preserved from
+    ``current`` because the loop's sleep cadence is fixed at boot; letting it
+    drift here would desynchronise the running loop from the value it sleeps on.
+    Changes are logged so the operator can see a retune land.
+    """
+    try:
+        cfg = load_config()
+    except Exception:
+        logger.warning("kanban dispatcher: config re-read failed; keeping current settings")
+        return current
+    if not isinstance(cfg, dict):
+        # A non-mapping config is malformed, not "an empty config". Treating it
+        # as {} would resolve every cap to its default — i.e. silently WIDEN a
+        # cap the operator tightened, which is the one direction a reload must
+        # never fail in.
+        logger.warning("kanban dispatcher: config re-read returned %s, not a mapping; "
+                       "keeping current settings", type(cfg).__name__)
+        return current
+    kanban_cfg = cfg.get("kanban", {})
+    if not isinstance(kanban_cfg, dict):
+        logger.warning("kanban dispatcher: kanban config section is %s, not a mapping; "
+                       "keeping current settings", type(kanban_cfg).__name__)
+        return current
+    try:
+        fresh = _resolve_dispatcher_settings(kanban_cfg, kb, quiet=True)
+    except Exception:
+        logger.warning("kanban dispatcher: settings re-parse failed; keeping current settings")
+        return current
+
+    fresh = replace(fresh, interval=current.interval)
+    for field_name in ("max_in_progress", "max_in_progress_per_profile", "max_spawn",
+                       "failure_limit", "default_assignee", "default_reviewer",
+                       "dispatch_start_budget", "dispatch_start_window_seconds",
+                       "review_rework_escalation_profile"):
+        was, now = getattr(current, field_name), getattr(fresh, field_name)
+        if was != now:
+            logger.info("kanban dispatcher: %s changed %r -> %r (applied without restart)",
+                        field_name, was, now)
+    return fresh
 
 
 class _KanbanDispatcher:
@@ -209,7 +312,7 @@ class _KanbanDispatcher:
         """Run one dispatch_once per board. Returns (slug, result) pairs."""
         return [(slug, self.tick_once_for_board(slug)) for slug in self._board_slugs()]
 
-    def ready_nonempty(self) -> bool:
+    def ready_nonempty(self, excluded_boards: Optional[set[str]] = None) -> bool:
         """Is there a ready+assigned+unclaimed task on ANY board the dispatcher would spawn for?
 
         Control-plane lanes (e.g. ``orion-cc``) are pulled by terminals via
@@ -220,7 +323,10 @@ class _KanbanDispatcher:
         """
         kbd = _kbd()
         _review_probe = kbd.review_dispatch_enabled()
+        excluded = excluded_boards or set()
         for slug in self._board_slugs():
+            if slug in excluded:
+                continue
             conn = None
             try:
                 conn = _kbc().connect(board=slug)
@@ -289,6 +395,15 @@ class _KanbanDispatcher:
         else:
             logger.info("kanban auto-decompose [%s]: %s → single task (no fanout)", slug, tid)
         return 1
+
+
+def _paused_board_slugs(results: Optional[list]) -> set[str]:
+    """Boards intentionally held by their sticky dispatch circuit."""
+    return {
+        str(slug)
+        for slug, res in (results or [])
+        if res is not None and getattr(res, "dispatch_paused", None) is not None
+    }
 
 
 def _log_spawn_results(results: Optional[list]) -> bool:

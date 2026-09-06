@@ -48,6 +48,19 @@ def _fake_spawn_factory(spawns: list):
     return fake_spawn
 
 
+def _set_kanban_config(monkeypatch, kanban: dict) -> None:
+    """Drive the caps through the real config loader.
+
+    Entry points resolve caps via ``resolve_dispatch_caps``, which reads
+    ``hermes_cli.config.load_config``. Patching config (what the operator
+    writes) rather than an internal reader keeps these tests contracts about
+    configured behaviour instead of about the current call chain.
+    """
+    import hermes_cli.config as cfgmod
+
+    monkeypatch.setattr(cfgmod, "load_config", lambda *a, **k: {"kanban": dict(kanban)})
+
+
 # ---------------------------------------------------------------------------
 # 1. Standalone daemon resolves max_in_progress (P1a)
 # ---------------------------------------------------------------------------
@@ -73,7 +86,7 @@ def test_run_daemon_resolves_and_passes_max_in_progress(
 
     monkeypatch.setattr(kbd, "dispatch_once", fake_dispatch_once)
     # No explicit config → the derived default must flow through.
-    monkeypatch.setattr(kbd, "configured_max_in_progress", lambda: None)
+    _set_kanban_config(monkeypatch, {})
     monkeypatch.setattr(kbd, "derive_default_max_in_progress", lambda sample=None: 3)
 
     def on_tick(res):
@@ -84,7 +97,44 @@ def test_run_daemon_resolves_and_passes_max_in_progress(
     assert captured.get("max_in_progress") == 3
 
 
+def test_run_daemon_uses_nondefault_board_for_connection_and_dispatch(
+    kanban_home, monkeypatch,
+):
+    board = "secondary"
+    kb.init_db(board=board)
+    captured: dict = {}
+    stop = threading.Event()
+
+    def fake_dispatch_once(conn, **kwargs):
+        captured["board"] = kwargs.get("board")
+        captured["db_path"] = Path(
+            conn.execute("PRAGMA database_list").fetchone()[2]
+        ).resolve()
+        return kb.DispatchResult()
+
+    monkeypatch.setattr(kbd, "dispatch_once", fake_dispatch_once)
+
+    def on_tick(res):
+        stop.set()
+
+    kbd.run_daemon(
+        interval=0.01,
+        board=board,
+        stop_event=stop,
+        on_tick=on_tick,
+    )
+
+    assert captured["board"] == board
+    assert captured["db_path"] == kb.kanban_db_path(board).resolve()
+
+
 def test_run_daemon_explicit_config_wins(kanban_home, monkeypatch):
+    """Explicit ``kanban.max_in_progress`` beats the memory-derived default.
+
+    Driven through real config rather than by patching the internal reader:
+    the contract is "what the operator configured is what dispatch_once gets",
+    which must hold regardless of which helper the daemon resolves it with.
+    """
     captured: dict = {}
     stop = threading.Event()
 
@@ -93,7 +143,7 @@ def test_run_daemon_explicit_config_wins(kanban_home, monkeypatch):
         return kb.DispatchResult()
 
     monkeypatch.setattr(kbd, "dispatch_once", fake_dispatch_once)
-    monkeypatch.setattr(kbd, "configured_max_in_progress", lambda: 7)
+    _set_kanban_config(monkeypatch, {"max_in_progress": 7})
     monkeypatch.setattr(
         kbd, "derive_default_max_in_progress",
         lambda sample=None: pytest.fail("derived default must not be consulted"),
@@ -105,6 +155,69 @@ def test_run_daemon_explicit_config_wins(kanban_home, monkeypatch):
     kbd.run_daemon(interval=0.01, stop_event=stop, on_tick=on_tick)
 
     assert captured.get("max_in_progress") == 7
+
+
+def test_run_daemon_honours_per_profile_cap(kanban_home, monkeypatch):
+    """The daemon must forward ``max_in_progress_per_profile`` too.
+
+    ``dispatch_once`` treats an omitted cap as *unlimited*, so a daemon that
+    resolves only the global cap hands one profile its whole backlog while the
+    gateway tick, ``hermes kanban dispatch`` and the dashboard nudge all hold
+    it to the configured per-profile limit. The caps bound the host, not an
+    entry point, so every entry point must resolve the same set.
+    """
+    captured: dict = {}
+    stop = threading.Event()
+
+    def fake_dispatch_once(conn, **kwargs):
+        captured.update(kwargs)
+        return kb.DispatchResult()
+
+    monkeypatch.setattr(kbd, "dispatch_once", fake_dispatch_once)
+    _set_kanban_config(
+        monkeypatch, {"max_in_progress": 9, "max_in_progress_per_profile": 2})
+
+    def on_tick(res):
+        stop.set()
+
+    kbd.run_daemon(interval=0.01, stop_event=stop, on_tick=on_tick)
+
+    assert captured.get("max_in_progress") == 9
+    assert captured.get("max_in_progress_per_profile") == 2
+
+
+def test_run_daemon_per_profile_cap_actually_limits_spawns(
+    kanban_home, monkeypatch, all_assignees_spawnable,
+):
+    """End-to-end: with a per-profile cap of 1, a one-profile backlog of three
+    ready tasks leaves exactly one running after a tick.
+
+    Asserts the observable outcome (how many workers exist) rather than the
+    arguments passed, so it still holds if the plumbing is reshaped.
+    """
+    spawns: list = []
+    monkeypatch.setattr(kbd, "_default_spawn", _fake_spawn_factory(spawns))
+    _set_kanban_config(
+        monkeypatch, {"max_in_progress": 10, "max_in_progress_per_profile": 1})
+
+    with kbc.connect() as conn:
+        for i in range(3):
+            kb.create_task(conn, title=f"t{i}", assignee="one-profile")
+        conn.execute("UPDATE tasks SET status = 'ready'")
+        conn.commit()
+
+    stop = threading.Event()
+    kbd.run_daemon(interval=0.01, stop_event=stop,
+                   on_tick=lambda res: stop.set())
+
+    with kbc.connect() as conn:
+        running = conn.execute(
+            "SELECT COUNT(*) FROM tasks WHERE status = 'running'"
+        ).fetchone()[0]
+
+    assert running == 1, (
+        f"per-profile cap of 1 must leave 1 worker running, got {running}"
+    )
 
 
 def test_configured_max_in_progress_parsing(monkeypatch):
@@ -188,6 +301,73 @@ def test_count_running_tasks_other_boards_fails_open(
     assert kbd.count_running_tasks_other_boards() == 0
 
 
+def test_host_cap_allows_only_one_concurrent_cross_board_dispatch(
+    kanban_home, all_assignees_spawnable, monkeypatch,
+):
+    """A host cap is an atomic reservation across board-local ticks.
+
+    Both boards start their budget calculation together.  Without a host-wide
+    lock they each observe the sole free slot and both claim; with it, one tick
+    runs and the other skips instead of exceeding the configured cap.
+    """
+    kb.create_board("second")
+    original_budget = kbd._tick_spawn_budget
+    rendezvous = threading.Barrier(2)
+
+    def synchronized_budget(*args, **kwargs):
+        try:
+            rendezvous.wait(timeout=0.2)
+        except threading.BrokenBarrierError:
+            # The host lock correctly prevents the second tick from entering.
+            pass
+        return original_budget(*args, **kwargs)
+
+    monkeypatch.setattr(kbd, "_tick_spawn_budget", synchronized_budget)
+    spawns: list[str] = []
+    start = threading.Barrier(2)
+
+    def dispatch(board: str) -> None:
+        with kbc.connect(board=board) as conn:
+            kb.create_task(conn, title=f"ready-{board}", assignee="alice")
+            start.wait(timeout=2)
+            kbd.dispatch_once(
+                conn, spawn_fn=_fake_spawn_factory(spawns), max_in_progress=1, board=board,
+            )
+
+    workers = [threading.Thread(target=dispatch, args=(board,)) for board in ("default", "second")]
+    for worker in workers:
+        worker.start()
+    for worker in workers:
+        worker.join(timeout=3)
+
+    assert all(not worker.is_alive() for worker in workers)
+    assert len(spawns) == 1
+
+
+def test_per_profile_cap_counts_running_workers_on_other_boards(
+    kanban_home, all_assignees_spawnable,
+):
+    """A profile's cap applies to the host, not merely the current board."""
+    kb.create_board("second")
+    with kbc.connect(board="second") as conn:
+        busy = kb.create_task(conn, title="already-running", assignee="alice")
+        assert kb.claim_task(conn, busy) is not None
+
+    spawns: list = []
+    with kbc.connect() as conn:
+        kb.create_task(conn, title="must-wait", assignee="alice")
+        result = kbd.dispatch_once(
+            conn,
+            spawn_fn=_fake_spawn_factory(spawns),
+            max_in_progress=2,
+            max_in_progress_per_profile=1,
+        )
+
+    assert spawns == []
+    assert len(result.skipped_per_profile_capped) == 1
+    assert result.skipped_per_profile_capped[0][1:] == ("alice", 1)
+
+
 def test_max_spawn_stays_per_board(kanban_home, all_assignees_spawnable):
     """``max_spawn`` keeps its historical per-board semantics."""
     kb.create_board("second")
@@ -205,6 +385,45 @@ def test_max_spawn_stays_per_board(kanban_home, all_assignees_spawnable):
     # The other board's worker does NOT count against max_spawn.
     assert len(spawns) == 1
     assert len(res.spawned) == 1
+
+
+# ---------------------------------------------------------------------------
+# concurrency_snapshot — shared counter for diagnostics' stranded_in_ready
+#
+# The dispatcher and kanban_diagnostics must never disagree on "is the board
+# at capacity right now": concurrency_snapshot reuses the SAME counting
+# helpers dispatch_once itself calls (count_running_tasks /
+# count_running_tasks_other_boards / count_running_tasks_by_assignee), so
+# there is exactly one implementation of "how many workers are running".
+# ---------------------------------------------------------------------------
+
+
+def test_concurrency_snapshot_reflects_real_running_counts(kanban_home, all_assignees_spawnable):
+    """Total running + per-assignee running must match what dispatch_once's
+    own cap enforcement would compute, across boards."""
+    kb.create_board("second")
+    with kbc.connect(board="second") as conn:
+        other_running = kb.create_task(conn, title="already-running", assignee="alice")
+        assert kb.claim_task(conn, other_running) is not None
+
+    with kbc.connect() as conn:
+        here_running = kb.create_task(conn, title="also-running", assignee="bob")
+        assert kb.claim_task(conn, here_running) is not None
+        snap = kbd.concurrency_snapshot(conn, kanban_cfg={"max_in_progress": 5, "max_in_progress_per_profile": 3})
+
+    assert snap["max_in_progress"] == 5
+    assert snap["max_in_progress_per_profile"] == 3
+    assert snap["total_running"] == 2  # one on this board, one on "second"
+    assert snap["running_by_assignee"] == {"alice": 1, "bob": 1}
+
+
+def test_concurrency_snapshot_uses_memory_derived_default_when_unset(kanban_home, monkeypatch):
+    """With no explicit kanban.max_in_progress, the snapshot must resolve the
+    SAME memory-derived default dispatch_once uses — never hardcode 6."""
+    monkeypatch.setattr(kbd, "derive_default_max_in_progress", lambda sample=None: 9)
+    with kbc.connect() as conn:
+        snap = kbd.concurrency_snapshot(conn, kanban_cfg={})
+    assert snap["max_in_progress"] == 9
 
 
 # ---------------------------------------------------------------------------

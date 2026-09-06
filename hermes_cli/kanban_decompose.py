@@ -67,12 +67,22 @@ Rules:
   - Prefer parallelism. If two tasks can be done independently, give
     them no parents so the dispatcher fans them out at once.
   - Use 2-6 tasks for normal work. Don't create 20 tiny tasks. Don't
-    cram everything into 1 task.
+    cram everything into 1 task. Scope each implementation child to one
+    coherent behavior or ownership boundary that a worker can usually finish
+    in 1-4 hours; do not split mechanical steps into separate cards.
   - Pick assignees from the roster by matching the task to the profile's
     DESCRIPTION (not just the name). When nothing matches well, use null
     and the system will route to the default_assignee.
   - Each child task body is what a fresh worker will read with no other
-    context — be specific about goal, approach, and acceptance criteria.
+    context. Keep it compact but include: in-scope behavior, out-of-scope
+    boundaries, constraints/decisions, an "Edit-Targets:" line, focused tests,
+    acceptance criteria, and the evidence expected in the handoff.
+  - Never give parallel children overlapping Edit-Targets. If two children
+    must modify the same file, merge them into one coherent child or add a real
+    parent dependency so the edits are serialized.
+  - If the original task already records an upstream/prior-art search result,
+    pass that result into relevant children. Do not ask every child to repeat
+    the same discovery search.
 
 When the task is genuinely a single unit of work (no useful decomposition),
 return:

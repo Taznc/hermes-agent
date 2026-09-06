@@ -683,6 +683,35 @@ describe('overlayLiveLanes', () => {
     expect(overlaid.sessionCount).toBe(1)
   })
 
+  it('never places an archived live session into a project lane', () => {
+    // Regression: after a bulk archive, a stale `$sessions` entry (e.g.
+    // resolved by a background tile's title backfill) can still carry
+    // `archived: true` into the overlay. overlayRepoLanes/overlayHomeLane must
+    // drop it exactly like a removed/deleted row, not place it in the tree.
+    const project = projectNode({
+      id: '/www/app',
+      isAuto: true,
+      repos: [{ id: '/www/app', label: 'app', path: '/www/app', sessionCount: 0, groups: [] }]
+    })
+
+    const live = [makeCwdSession('/www/app', { archived: true, id: 'stale-archived', git_branch: 'main' })]
+
+    const overlaid = overlayLiveLanes(project, live)
+
+    expect(overlaid.repos.flatMap(repo => repo.groups.flatMap(g => g.sessions))).toEqual([])
+    expect(overlaid.sessionCount).toBe(0)
+  })
+
+  it('evicts an archived live session even from Home (isNoProject lane)', () => {
+    const home = homeNode([])
+    const live = [makeCwdSession(null, { archived: true, id: 'stale-archived' })]
+
+    const overlaid = overlayLiveLanes(home, live)
+
+    expect(overlaid.repos[0].groups[0].sessions).toEqual([])
+    expect(overlaid.sessionCount).toBe(0)
+  })
+
   it('keeps cwd-less repo sessions visible in both the overview and project drill-in', () => {
     const project = projectNode({
       id: '/www/app',
@@ -1095,6 +1124,27 @@ describe('overlayLivePreviews', () => {
     const previews = overlayLivePreviews([project], live, [], 3)
 
     expect(previews['/www/app'].map(s => s.id)).toEqual(['fresh', 'old'])
+  })
+
+  it('drops an archived row from both the live cache and the backend preview snapshot', () => {
+    // Regression: PROJECTS lanes kept showing archived sessions after a bulk
+    // archive. The backend tree already excludes archived rows, so this
+    // guards the desktop-only merge path where a stale `live` entry or a
+    // preview snapshot captured just before the archive completed could
+    // reintroduce one.
+    const project = projectNode({
+      id: '/www/app',
+      previewSessions: [
+        makeCwdSession('/www/app', { archived: true, id: 'archived-preview', started_at: 1, last_active: 1 }),
+        makeCwdSession('/www/app', { id: 'kept', started_at: 2, last_active: 2 })
+      ]
+    })
+
+    const live = [makeCwdSession('/www/app', { archived: true, id: 'archived-live', started_at: 3, last_active: 3 })]
+
+    const previews = overlayLivePreviews([project], live, [], 3)
+
+    expect(previews['/www/app'].map(s => s.id)).toEqual(['kept'])
   })
 
   it('evicts a deleted session from a project preview (snapshot + live)', () => {

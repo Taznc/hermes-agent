@@ -20,7 +20,7 @@ import {
 } from '@hermes/plugin-sdk'
 import { useState } from 'react'
 
-import { $lastRoster, ROSTER_KEY } from './data'
+import { ROSTER_KEY } from './data'
 import { labeled, ResizableFrame } from './dialog-parts'
 import { useBots } from './i18n'
 import { McpSetupButton } from './mcp-setup'
@@ -553,7 +553,7 @@ export async function applyAdvancedConfig(bot: RosterRow, state: AdvancedConfigS
   const applied: Record<string, boolean> = {}
 
   if (state.dirtySoul) {
-    payload.soul = ensureMessagingProtocol(state.soul, bot.name, $lastRoster.get())
+    payload.soul = ensureMessagingProtocol(state.soul, bot.name)
   }
 
   if (state.dirtyModel) {

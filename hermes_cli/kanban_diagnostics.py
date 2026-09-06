@@ -5,7 +5,10 @@ A ``Diagnostic`` carries a **kind** (canonical code the UI/tests match on), a
 buttons and the CLI as hints. Rules are stateless and read-only over
 (task, events, runs, optional graph); callers compute on demand. Only
 operator-fixable signals (not a one-off provider 502); every diagnostic has a
-recovery action and auto-clears when the failure mode resolves.
+recovery action and auto-clears when the failure mode resolves. Exception:
+``respawn_guarded`` is informational, not operator-fixable — it exists to
+correct ``stranded_in_ready`` rather than to demand an action (see
+``_rule_stranded_in_ready``).
 """
 
 from __future__ import annotations
@@ -16,8 +19,11 @@ import json
 import time
 
 
-# Least → most urgent; sorted outputs put critical first.
-SEVERITY_ORDER = ("warning", "error", "critical")
+# Least → most urgent; sorted outputs put critical first. "info" is the
+# self-clearing/no-action-needed rung (currently only respawn_guarded) —
+# below "warning" so it never outranks an operator-fixable signal and is
+# excluded by any --severity warning-or-above filter.
+SEVERITY_ORDER = ("info", "warning", "error", "critical")
 
 
 def severity_at_or_above(severity: Optional[str], threshold: Optional[str]) -> bool:
@@ -652,12 +658,246 @@ def _rule_block_unblock_cycling(task, events, runs, now, cfg) -> list[Diagnostic
     )]
 
 
+# --- Respawn guard (dispatcher's own "why not spawn" reasoning) -----------
+
+# Guard reasons that are benign and self-clearing: the dispatcher declined to
+# spawn on purpose and the situation resolves without operator action.
+# ``blocker_auth`` is excluded — it genuinely needs a human to fix
+# credentials/quota. ``rate_limit_cooldown`` clears in
+# DEFAULT_RATE_LIMIT_COOLDOWN_SECONDS; ``recent_success`` in
+# _RESPAWN_GUARD_SUCCESS_WINDOW; ``active_pr`` in _RESPAWN_GUARD_PR_WINDOW
+# (see kanban_db_dispatch.py).
+_RESPAWN_GUARD_BENIGN_REASONS = frozenset({"recent_success", "active_pr", "rate_limit_cooldown"})
+
+# Human-facing copy per benign guard reason: (title, detail-template).
+# ``{window}`` is filled in by the rule from the guard's own clearing window.
+_RESPAWN_GUARD_COPY = {
+    "recent_success": (
+        "Recently completed — dispatcher is holding off on a re-spawn",
+        "This task completed successfully within the last {window}, so the dispatcher is "
+        "deliberately not re-spawning it (a fresh completion is treated as proof the work is "
+        "done, not as a task that needs another worker). This is normal and self-clearing: "
+        "if you deliberately want another run, drag/promote or reclaim the task, which lifts "
+        "the guard immediately.",
+    ),
+    "active_pr": (
+        "Open PR — dispatcher is holding off to avoid a duplicate",
+        "A worker already opened a pull request for this task within the last {window}. "
+        "Re-spawning now would risk a second, duplicate PR for the same work — that is exactly "
+        "what this guard exists to prevent. This is normal and self-clearing: review/merge the "
+        "existing PR, or comment/reclaim if a fresh attempt is genuinely needed.",
+    ),
+    "rate_limit_cooldown": (
+        "Rate-limited — dispatcher is in the cooldown window",
+        "The last run for this task ended rate-limited, so the dispatcher is waiting out a "
+        "cooldown before retrying (bouncing off the same quota wall every tick would waste a "
+        "worker slot). This is normal and self-clearing: it will retry automatically once the "
+        "cooldown window ({window}) elapses.",
+    ),
+}
+
+# Human-facing copy for the one operator-fixable reason, ``blocker_auth``, and
+# a generic fallback for any reason this module doesn't otherwise know about
+# (kept at ``warning`` so an unrecognized reason never silently disappears).
+_REASON_DETAIL = {
+    "blocker_auth": "The dispatcher saw a quota/auth-flavored error and is deferring "
+                    "immediate retries; the breaker will trip once the failure count "
+                    "reaches the limit.",
+}
+
+
+def _respawn_guard_staleness_seconds(cfg: dict) -> float:
+    """A guard event is trusted as the CURRENT reason for a stall only within
+    a few dispatcher ticks of "now" — old enough and the situation may have
+    changed (guard lifted, task genuinely abandoned since). 3x the tick
+    interval tolerates a slow/busy dispatcher without treating an hours-old
+    guard as still active."""
+    interval = cfg.get("dispatch_interval_seconds", DEFAULT_CONFIG["dispatch_interval_seconds"])
+    try:
+        interval = float(interval)
+    except (TypeError, ValueError):
+        interval = DEFAULT_CONFIG["dispatch_interval_seconds"]
+    if interval <= 0:
+        interval = DEFAULT_CONFIG["dispatch_interval_seconds"]
+    return interval * 3
+
+
+def _latest_respawn_guard_event(events: Iterable[Any], since_ts: int = 0) -> Optional[Any]:
+    """Most recent ``respawn_guarded`` event at or after ``since_ts``, or
+    ``None``.
+
+    Guard events strictly before ``since_ts`` belong to a PRIOR ready period
+    (the task has since been reclaimed/promoted/unblocked) and must not be
+    read as "still guarded" — only a guard stamped after the task's current
+    entry into ready reflects what is holding it right now. Pass the default
+    ``since_ts=0`` to get the latest guard event of any age.
+    """
+    latest = None
+    latest_ts = -1
+    for ev in events:
+        if _event_kind(ev) != "respawn_guarded":
+            continue
+        ts = _event_ts(ev)
+        if ts < since_ts:
+            continue
+        if ts >= latest_ts:
+            latest, latest_ts = ev, ts
+    return latest
+
+
+def _format_guard_window(seconds: int) -> str:
+    if seconds >= 3600:
+        hours = seconds / 3600
+        return f"{hours:.0f}h" if hours == int(hours) else f"{hours:.1f}h"
+    return f"{max(1, seconds // 60)}m"
+
+
+def _respawn_guard_reason_window_seconds(reason: str) -> Optional[int]:
+    """The guard's own clearing window for ``reason``, sourced from
+    ``kanban_db_dispatch`` (single source of truth — this must never drift
+    from the values ``check_respawn_guard`` actually enforces). Local import
+    mirrors ``_effective_repeated_failures_threshold`` (avoids an import
+    cycle at module load)."""
+    from hermes_cli import kanban_db as _kb_mod
+    from hermes_cli import kanban_db_dispatch as kbd
+
+    if reason == "recent_success":
+        return kbd._RESPAWN_GUARD_SUCCESS_WINDOW
+    if reason == "active_pr":
+        return kbd._RESPAWN_GUARD_PR_WINDOW
+    if reason == "rate_limit_cooldown":
+        try:
+            return _kb_mod._resolve_rate_limit_cooldown_seconds()
+        except Exception:
+            return kbd.DEFAULT_RATE_LIMIT_COOLDOWN_SECONDS
+    return None
+
+
+def _rule_respawn_guarded(task, events, runs, now, cfg) -> list[Diagnostic]:
+    """Surfaces the dispatcher's ``respawn_guarded`` decision directly, so a
+    guarded card never presents merely as ``stranded_in_ready``: the two need
+    OPPOSITE operator actions (guarded: inspect/clear the guard input —
+    unrelated PR comment, stale success record; stranded: reassign / check
+    the worker pool). Without this rule the guard reason is invisible outside
+    ``hermes kanban tail``, and the age-based stranded diagnostic actively
+    misleads by blaming a misspelled assignee or dead worker pool instead.
+
+    Severity splits by reason: ``recent_success`` / ``active_pr`` /
+    ``rate_limit_cooldown`` are the dispatcher working as designed, not a
+    fault, and render at ``info`` so they never badge a card or join "needs
+    attention" (an unclaimed-looking task that's actually fine). ``blocker_auth``
+    IS an operator-fixable problem and is deliberately NOT surfaced here — it
+    stays exclusively inside ``_rule_stranded_in_ready`` (with the true cause
+    and actions that fix credentials) so it is never lost, downgraded, or
+    duplicated across two diagnostics. Any other/unknown reason still renders
+    here at ``warning`` as a fail-safe so it is never silently lost.
+
+    For ``reason="active_pr"`` specifically, the action set contains nothing
+    that could trigger a respawn (no ``reassign``, no ``unblock``) — that is
+    the exact failure this diagnostic exists to prevent.
+
+    Only a guard event from the task's CURRENT ready period, within
+    ``_respawn_guard_staleness_seconds`` of ``now``, is trusted (see
+    ``_latest_respawn_guard_event``).
+    """
+    if _task_field(task, "status") != "ready":
+        return []
+    if _task_field(task, "claim_lock"):
+        return []
+    last_ready_ts = _latest_event_ts(events, {"created", "promoted", "reclaimed", "unblocked"})
+    if last_ready_ts == 0:
+        last_ready_ts = int(_task_field(task, "created_at", default=0) or 0)
+    guard_ev = _latest_respawn_guard_event(events, since_ts=last_ready_ts)
+    if guard_ev is None:
+        return []
+    guard_ts = _event_ts(guard_ev)
+    if (now - guard_ts) > _respawn_guard_staleness_seconds(cfg):
+        return []
+    reason = _parse_payload(guard_ev).get("reason")
+    if reason is None or reason == "blocker_auth":
+        # blocker_auth is real and operator-fixable; _rule_stranded_in_ready
+        # is the sole diagnostic for it (correct cause + actions), so this
+        # rule stays silent rather than duplicating/conflicting with it.
+        return []
+
+    task_id = _task_field(task, "id")
+    actions: list[DiagnosticAction] = []
+
+    if reason in _RESPAWN_GUARD_BENIGN_REASONS:
+        title, detail_template = _RESPAWN_GUARD_COPY[reason]
+        try:
+            window_seconds = _respawn_guard_reason_window_seconds(reason)
+        except Exception:
+            window_seconds = None
+        window_str = _format_guard_window(window_seconds) if window_seconds else "its window"
+        detail = detail_template.format(window=window_str)
+        if reason == "active_pr":
+            # No reassign/unblock/reclaim here — any of those would defeat
+            # the very guard this diagnostic is reporting on (duplicate-PR risk).
+            actions.append(_cli_hint("Check dispatcher status", "hermes kanban diagnostics"))
+            if task_id:
+                actions.append(_cli_hint(
+                    f"Review comments for the PR link: hermes kanban show {task_id}",
+                    f"hermes kanban show {task_id}", suggested=True))
+        else:
+            actions.append(_cli_hint("Check dispatcher status", "hermes kanban diagnostics"))
+        return [Diagnostic(
+            kind="respawn_guarded", severity="info",
+            title=title, detail=detail, actions=actions,
+            first_seen_at=guard_ts, last_seen_at=guard_ts, count=1,
+            data={"reason": reason, "guard_event_at": guard_ts},
+        )]
+
+    detail = _REASON_DETAIL.get(reason, f"The dispatcher is deferring this task ({reason}).")
+    return [Diagnostic(
+        kind="respawn_guarded", severity="warning",
+        title=f"Held by respawn guard: {reason}",
+        detail=detail + " This is NOT the same problem as a stranded/unclaimed task — "
+               "reassigning will not clear it.",
+        actions=[_cli_hint("Check dispatcher status", "hermes kanban diagnostics")],
+        first_seen_at=guard_ts, last_seen_at=guard_ts, count=1,
+        data={"reason": reason, "guard_event_at": guard_ts},
+    )]
+
+
 def _rule_stranded_in_ready(task, events, runs, now, cfg) -> list[Diagnostic]:
     """Assigned, unclaimed, ``ready`` for >= cfg["stranded_threshold_seconds"]
     (default 30 min). Deliberately age-based and identity-agnostic so it
     catches typo'd assignees, deleted profiles, and down external worker
     pools alike without a registry to curate. Unassigned tasks are excluded —
-    the dispatcher's ``skipped_unassigned`` already covers them."""
+    the dispatcher's ``skipped_unassigned`` already covers them.
+
+    Suppressed while an active ``respawn_guarded`` event explains the lack of
+    a claim (see ``_rule_respawn_guarded``): a guarded card is not a stranded
+    one, and the two diagnostics recommend opposite remedies — showing both
+    would point the operator at "reassign" for a card that isn't actually
+    stuck on assignment.
+
+    Concurrency-aware: a board sitting at ``kanban.max_in_progress`` (or the
+    card's assignee sitting at ``kanban.max_in_progress_per_profile``) is
+    correctly queued behind a full pipe, not stranded — there is no operator
+    action to take, so the diagnostic is suppressed entirely rather than
+    emitted at a downgraded severity. ``cfg["_concurrency"]`` (see
+    :func:`hermes_cli.kanban_db_dispatch.concurrency_snapshot`) carries the
+    SAME counts/caps the dispatcher itself enforces, so this can never drift
+    from the real cap check.
+
+    Before blaming a missing/misnamed worker, this also consults the latest
+    ``respawn_guarded`` event (the dispatcher's own reason for declining to
+    spawn — write-only until now). A RECENT guard (within
+    ``_respawn_guard_staleness_seconds``) changes the outcome:
+
+    - ``recent_success`` / ``active_pr`` / ``rate_limit_cooldown`` are benign
+      and self-clearing — this rule stays silent and ``_rule_respawn_guarded``
+      reports them at informational severity instead.
+    - ``blocker_auth`` IS operator-fixable, so this rule still fires, but with
+      the true cause (quota/auth) and an action that fixes credentials rather
+      than ``reassign`` (which would just respawn into the same wall).
+
+    A STALE guard event (older than the staleness window) is ignored — it must
+    never mask a task that is genuinely stranded now. With no guard event at
+    all, behavior is unchanged from before this fix.
+    """
     threshold_seconds = float(cfg.get("stranded_threshold_seconds", 30 * 60))
     if _task_field(task, "status") != "ready":
         return []
@@ -667,6 +907,17 @@ def _rule_stranded_in_ready(task, events, runs, now, cfg) -> list[Diagnostic]:
     assignee = _task_field(task, "assignee") or ""
     if not assignee.strip():
         return []
+
+    concurrency = cfg.get("_concurrency")
+    if isinstance(concurrency, dict):
+        global_cap = concurrency.get("max_in_progress")
+        if global_cap is not None and concurrency.get("total_running", 0) >= global_cap:
+            return []  # host is at its concurrency cap: queued, not stranded
+        profile_cap = concurrency.get("max_in_progress_per_profile")
+        if profile_cap is not None:
+            running_by_assignee = concurrency.get("running_by_assignee") or {}
+            if running_by_assignee.get(assignee, 0) >= profile_cap:
+                return []  # this assignee is at its per-profile cap: queued, not stranded
 
     # Most recent event that put the task into ready; with none (old task /
     # truncated events) fall back to created_at — over-flagging an ancient
@@ -690,6 +941,47 @@ def _rule_stranded_in_ready(task, events, runs, now, cfg) -> list[Diagnostic]:
     else:
         severity = "warning"
 
+    guard_reason = None
+    guard_ev = _latest_respawn_guard_event(events, since_ts=last_ready_ts)
+    if guard_ev is not None and (now - _event_ts(guard_ev)) <= _respawn_guard_staleness_seconds(cfg):
+        guard_reason = _parse_payload(guard_ev).get("reason")
+
+    if guard_reason in _RESPAWN_GUARD_BENIGN_REASONS:
+        # The dispatcher deliberately held this task back for a benign,
+        # self-clearing reason. "Nothing has claimed it" would be false —
+        # _rule_respawn_guarded already reports the real reason.
+        return []
+
+    if guard_reason == "blocker_auth":
+        assignee_display = assignee
+        last_err = _task_field(task, "last_failure_error")
+        err_snippet = _error_snippet(last_err)
+        actions = [
+            _cli_hint(f"Verify profile: hermes -p {assignee_display} doctor",
+                     f"hermes -p {assignee_display} doctor", suggested=True),
+            _cli_hint(f"Fix profile auth: hermes -p {assignee_display} auth",
+                     f"hermes -p {assignee_display} auth"),
+        ]
+        detail = (
+            f"This task has been ready for {age_str}, but the dispatcher is deliberately holding "
+            f"it back, not failing to find it: the last recorded error looks like a quota/auth "
+            f"problem" + (f" ({err_snippet})" if err_snippet else "") + f". Re-spawning immediately "
+            f"would just hit the same wall. Fix credentials/quota for {assignee_display!r}, then "
+            f"reclaim or unblock the task to retry."
+        )
+        return [Diagnostic(
+            kind="stranded_in_ready", severity=severity,
+            title=f"Ready for {age_str}, blocked on auth/quota",
+            detail=detail,
+            actions=actions,
+            first_seen_at=last_ready_ts, last_seen_at=last_ready_ts, count=1,
+            data={"ready_since": last_ready_ts, "age_seconds": int(age_seconds),
+                  "assignee": assignee, "threshold_seconds": int(threshold_seconds),
+                  "respawn_guard_reason": "blocker_auth"},
+        )]
+
+    # No (recent) guard explains the stall — the original, identity-agnostic
+    # signal stands: assignee typo, deleted profile, or a down worker pool.
     actions = [
         DiagnosticAction(kind="reassign", label="Reassign to a different worker",
                          payload={"current_assignee": assignee}),
@@ -719,6 +1011,7 @@ _RULES: list[RuleFn] = [
     _rule_review_dependency_deadlock,
     _rule_stuck_in_blocked,
     _rule_block_unblock_cycling,
+    _rule_respawn_guarded,
     _rule_stranded_in_ready,
 ]
 
@@ -734,6 +1027,10 @@ DEFAULT_CONFIG = {
     # Below 30 min the signal is dominated by tasks about to be claimed on
     # the next dispatcher tick.
     "stranded_threshold_seconds": 30 * 60,
+    # Matches kanban.dispatch_interval_seconds. Only used to decide whether a
+    # respawn_guarded event is recent enough to trust as the active reason a
+    # ready-lane task hasn't been claimed (see _respawn_guard_staleness_seconds).
+    "dispatch_interval_seconds": 60,
 }
 
 
@@ -749,6 +1046,10 @@ def config_from_kanban_config(kanban_cfg: Optional[dict]) -> dict:
     diag_cfg = dict(kanban_cfg.get("diagnostics") or {})
     diag_cfg.setdefault(
         "failure_limit", kanban_cfg.get("failure_limit", DEFAULT_CONFIG["failure_threshold"]),
+    )
+    diag_cfg.setdefault(
+        "dispatch_interval_seconds",
+        kanban_cfg.get("dispatch_interval_seconds", DEFAULT_CONFIG["dispatch_interval_seconds"]),
     )
     if not _has_explicit_threshold(diag_cfg):
         diag_cfg["failure_threshold"] = diag_cfg["failure_limit"]
@@ -782,14 +1083,25 @@ def compute_task_diagnostics(
     now: Optional[int] = None,
     config: Optional[dict] = None,
     graph: Optional[dict] = None,
+    concurrency: Optional[dict] = None,
 ) -> list[Diagnostic]:
     """Run every rule for one task; critical first, then error, warning; ties
-    broken by most-recent ``last_seen_at``."""
+    broken by most-recent ``last_seen_at``.
+
+    ``concurrency`` (see :func:`hermes_cli.kanban_db_dispatch.concurrency_snapshot`)
+    carries the host's resolved ``kanban.max_in_progress`` /
+    ``max_in_progress_per_profile`` caps and current running-task counts, so
+    ``_rule_stranded_in_ready`` can suppress the diagnostic when a ``ready``
+    card is correctly queued behind a full pipe rather than actually stranded.
+    Omit it (the default) to preserve the old age-only behavior — e.g. call
+    sites without a live DB connection to compute counts from."""
     now_ts = int(now if now is not None else time.time())
     config = config or {}
     cfg = {**DEFAULT_CONFIG, **config}
     if graph is not None:
         cfg["_graph"] = graph
+    if concurrency is not None:
+        cfg["_concurrency"] = concurrency
     if not _has_explicit_threshold(config) and "failure_limit" in config:
         cfg["failure_threshold"] = _positive_int(
             config.get("failure_limit"), DEFAULT_CONFIG["failure_threshold"],

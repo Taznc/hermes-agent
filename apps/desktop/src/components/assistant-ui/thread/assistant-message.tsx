@@ -22,7 +22,7 @@ import { MESSAGE_PARTS_COMPONENTS } from '@/components/assistant-ui/thread/messa
 import { ReactionPicker } from '@/components/assistant-ui/thread/message-reactions'
 import { ResponseLoadingIndicator, TurnActivityIndicator } from '@/components/assistant-ui/thread/status'
 import { MessageTimelineTimestamp } from '@/components/assistant-ui/thread/timeline-timestamp'
-import { useMessageReactions, useTapbackDoubleClick } from '@/components/assistant-ui/thread/use-message-reactions'
+import { useMessageReactions } from '@/components/assistant-ui/thread/use-message-reactions'
 import { AGENT_MESSAGE_RE } from '@/components/assistant-ui/thread/user-message'
 import { TooltipIconButton } from '@/components/assistant-ui/tooltip-icon-button'
 import { formatElapsed } from '@/components/chat/activity-timer'
@@ -220,10 +220,6 @@ const AssistantMessageBody: FC<AssistantMessageProps & { collapsedNotice?: null 
   const [initiallyRunning] = useState(() => messageRuntime.getState().status?.type === 'running')
   const enterRef = useEnterAnimation(initiallyRunning, `assistant-message:${messageId}`)
 
-  // Double-click the reply to heart it (iMessage). Undefined while reactions
-  // are off, so the root carries no listener at all.
-  const onDoubleClick = useTapbackDoubleClick(messageId, 'assistant')
-
   return (
     <MessagePrimitive.Root
       className={cn(
@@ -232,10 +228,6 @@ const AssistantMessageBody: FC<AssistantMessageProps & { collapsedNotice?: null 
       )}
       data-role="assistant"
       data-slot="aui_assistant-message-root"
-      // Collapsed inter-agent rows never carried the tapback listener; keeping
-      // that exact truth table means gating it on the notice rather than on
-      // whether the hook returned a handler.
-      onDoubleClick={collapsedNotice ? undefined : onDoubleClick}
       ref={enterRef}
     >
       {collapsedNotice ?? (

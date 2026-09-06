@@ -15,6 +15,7 @@ import { GlyphSpinner } from '@/components/ui/glyph-spinner'
 import { useI18n } from '@/i18n'
 import { displayPath, pathLeaf } from '@/lib/display-path'
 import { resolveForkBuildMarker } from '@/lib/fork-build-marker'
+import { statusBarGatewayHealth } from '@/lib/gateway-health-pill'
 import {
   Activity,
   AlertCircle,
@@ -22,17 +23,15 @@ import {
   Command,
   FolderOpen,
   Globe,
-  Hash,
   Layers3,
   Loader2,
   Terminal,
   Zap
 } from '@/lib/icons'
-import { runtimeReadinessDisplay, type RuntimeReadinessResult } from '@/lib/runtime-readiness'
+import { type RuntimeReadinessResult } from '@/lib/runtime-readiness'
 import { cacheHitLabel, contextBarLabel, LiveDuration, tokensPerSecondLabel, usageContextLabel } from '@/lib/statusbar'
 import { useStoreSelector } from '@/lib/use-session-slice'
 import { cn } from '@/lib/utils'
-import { resolveVersionStatus } from '@/lib/version-status'
 import { copyFilePath, revealFile } from '@/store/file-actions'
 import { revealFileInTree } from '@/store/layout'
 import { $activeGatewayProfile } from '@/store/profile'
@@ -54,14 +53,7 @@ import { $focusedRuntimeId, $focusedSessionState, $focusedStoredSessionId } from
 import { $statusbarHiddenIds } from '@/store/statusbar-prefs'
 import { $subagentsBySession, activeSubagentCount, failedSubagentCount } from '@/store/subagents'
 import { $gatewayRestarting } from '@/store/system-actions'
-import {
-  $backendUpdateApply,
-  $backendUpdateStatus,
-  $desktopVersion,
-  $updateApply,
-  $updateStatus,
-  openUpdateOverlayFor
-} from '@/store/updates'
+import { $desktopVersion } from '@/store/updates'
 import { $webReloadPending, performWebReload } from '@/store/web-reload'
 import type { StatusResponse, UsageStats } from '@/types/hermes'
 
@@ -134,10 +126,7 @@ export function useStatusbarItems({
     Object.values(bySession).reduce((sum, items) => sum + failedSubagentCount(items), 0)
   )
 
-  const updateStatus = useStore($updateStatus)
-  const updateApply = useStore($updateApply)
-  const backendUpdateStatus = useStore($backendUpdateStatus)
-  const backendUpdateApply = useStore($backendUpdateApply)
+
   const desktopVersion = useStore($desktopVersion)
   const connection = useStore($connection)
 
@@ -304,113 +293,48 @@ export function useStatusbarItems({
 
   const gatewayOpen = gatewayState === 'open'
   const gatewayConnecting = gatewayState === 'connecting'
-  const inferenceReady = gatewayOpen && inferenceStatus?.ready === true
-  const gatewayDegraded = gatewayOpen || gatewayConnecting
-  const readinessDisplay = runtimeReadinessDisplay(inferenceStatus)
 
-  const gatewayDetail = gatewayOpen
-    ? {
-        checking: copy.gatewayChecking,
-        needs_setup: copy.gatewayNeedsSetup,
-        ready: copy.gatewayReady,
-        unavailable: copy.gatewayUnavailable
-      }[readinessDisplay]
-    : gatewayConnecting
-      ? copy.gatewayConnecting
-      : copy.gatewayOffline
+  const gatewayHealth = useMemo(
+    () =>
+      statusBarGatewayHealth({
+        connectionState: gatewayState,
+        copy: {
+          backend: copy.backend,
+          checking: copy.gatewayChecking,
+          connecting: copy.gatewayConnecting,
+          messagingDegraded: copy.messagingDegraded,
+          messagingStopped: copy.messagingStopped,
+          needsSetup: copy.gatewayNeedsSetup,
+          offline: copy.gatewayOffline,
+          ready: copy.gatewayReady,
+          restarting: copy.gatewayRestarting,
+          unavailable: copy.gatewayUnavailable
+        },
+        inferenceStatus,
+        messagingRunning: statusSnapshot?.gateway_running,
+        messagingState: statusSnapshot?.gateway_state,
+        platforms: statusSnapshot?.gateway_platforms,
+        restarting: gatewayRestarting
+      }),
+    [
+      gatewayState,
+      copy,
+      inferenceStatus,
+      statusSnapshot?.gateway_running,
+      statusSnapshot?.gateway_state,
+      statusSnapshot?.gateway_platforms,
+      gatewayRestarting
+    ]
+  )
+
+  const inferenceReady = gatewayOpen && inferenceStatus?.ready === true && !gatewayHealth.degraded
+  const gatewayDegraded = gatewayOpen || gatewayConnecting || gatewayHealth.degraded
 
   const gatewayClassName = inferenceReady
     ? undefined
     : gatewayDegraded
       ? 'text-amber-600 hover:text-amber-600'
       : 'text-destructive hover:text-destructive'
-
-  const clientVersionItem = useMemo<StatusbarItem>(() => {
-    const applying = updateApply.applying || updateApply.stage === 'restart'
-
-    const status = resolveVersionStatus({
-      applying,
-      applyMessage: updateApply.message,
-      behind: updateStatus?.behind ?? 0,
-      branch: updateStatus?.branch,
-      copy,
-      remote: connection?.mode === 'remote',
-      restarting: updateApply.stage === 'restart',
-      sha: updateStatus?.currentSha?.slice(0, 7) ?? null,
-      target: 'client',
-      updateAvailable: updateStatus?.updateAvailable,
-      version: desktopVersion?.appVersion
-    })
-
-    return {
-      className: status.hasUpdate ? 'text-primary hover:text-primary' : undefined,
-      detail: status.detail,
-      hidden: status.unknown,
-      icon: applying ? <Loader2 className="size-3 animate-spin" /> : <Hash className="size-3" />,
-      id: 'version-client',
-      label: status.label,
-      // Update state is not a preference: hiding it is how a user misses that
-      // their client is behind. Listed in the menu, but locked on.
-      lockedVisible: true,
-      onSelect: () => openUpdateOverlayFor('client'),
-      title: status.tooltip,
-      toggleLabel: copy.toggleVersion,
-      variant: 'action'
-    }
-  }, [
-    desktopVersion?.appVersion,
-    connection?.mode,
-    copy,
-    updateApply.applying,
-    updateApply.message,
-    updateApply.stage,
-    updateStatus?.behind,
-    updateStatus?.branch,
-    updateStatus?.currentSha,
-    updateStatus?.updateAvailable
-  ])
-
-  const backendVersionItem = useMemo<StatusbarItem | null>(() => {
-    if (connection?.mode !== 'remote') {
-      return null
-    }
-
-    const applying = backendUpdateApply.applying || backendUpdateApply.stage === 'restart'
-
-    const status = resolveVersionStatus({
-      applying,
-      applyMessage: backendUpdateApply.message,
-      behind: backendUpdateStatus?.behind ?? 0,
-      copy,
-      remote: true,
-      restarting: backendUpdateApply.stage === 'restart',
-      target: 'backend',
-      updateAvailable: backendUpdateStatus?.updateAvailable,
-      version: statusSnapshot?.version
-    })
-
-    return {
-      className: status.hasUpdate ? 'text-primary hover:text-primary' : undefined,
-      hidden: status.unknown,
-      icon: applying ? <Loader2 className="size-3 animate-spin" /> : <Hash className="size-3" />,
-      id: 'version-backend',
-      label: status.label,
-      lockedVisible: true,
-      onSelect: () => openUpdateOverlayFor('backend'),
-      title: status.tooltip,
-      toggleLabel: copy.toggleBackendVersion,
-      variant: 'action'
-    }
-  }, [
-    connection?.mode,
-    statusSnapshot?.version,
-    backendUpdateStatus?.behind,
-    backendUpdateStatus?.updateAvailable,
-    backendUpdateApply.applying,
-    backendUpdateApply.message,
-    backendUpdateApply.stage,
-    copy
-  ])
 
   // Unofficial/local build marker. Deliberately loud (amber, uppercase) and
   // pinned leftmost: its whole job is to make "am I running my own build?"
@@ -632,7 +556,7 @@ export function useStatusbarItems({
       },
       {
         className: gatewayRestarting ? undefined : gatewayClassName,
-        detail: gatewayRestarting ? copy.gatewayRestarting : gatewayDetail,
+        detail: gatewayHealth.detail,
         hidden: botsShowing,
         icon: gatewayRestarting ? (
           <GlyphSpinner ariaLabel={copy.gatewayRestarting} className="size-3" />
@@ -642,12 +566,12 @@ export function useStatusbarItems({
           <AlertCircle className="size-3" />
         ),
         id: 'gateway-health',
-        label: copy.gateway,
+        label: gatewayHealth.label,
         menuClassName: 'w-72',
         menuContent: gatewayMenuContent,
-        // Tip only when there's a real status reason — not "gateway status" restating the label.
-        title: inferenceStatus?.reason || undefined,
-        toggleLabel: copy.gateway,
+        // Tip only when there's a real status reason — not a restatement of the label.
+        title: gatewayHealth.title || inferenceStatus?.reason || undefined,
+        toggleLabel: copy.backend,
         variant: 'menu'
       },
       {
@@ -743,7 +667,7 @@ export function useStatusbarItems({
       fileMenu.revealInSidebar,
       gatewayMenuContent,
       gatewayClassName,
-      gatewayDetail,
+      gatewayHealth,
       gatewayRestarting,
       inferenceReady,
       inferenceStatus?.reason,
@@ -825,17 +749,13 @@ export function useStatusbarItems({
         title: terminalShowing ? copy.hideTerminal : copy.showTerminal,
         toggleLabel: copy.toggleTerminal,
         variant: 'action'
-      },
-      clientVersionItem,
-      ...(backendVersionItem ? [backendVersionItem] : [])
+      }
     ],
     [
       approvalModeItem,
-      backendVersionItem,
       busy,
       cacheHit,
       chatOpen,
-      clientVersionItem,
       contextBar,
       contextBreakdown,
       contextBreakdownLoading,

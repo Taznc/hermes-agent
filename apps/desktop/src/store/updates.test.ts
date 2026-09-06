@@ -201,6 +201,11 @@ describe('reportBackendContract', () => {
   it('warns when the backend is behind (or reports no contract)', () => {
     reportBackendContract(undefined)
     expect(notifySpy).toHaveBeenCalledTimes(1)
+    expect(notifySpy.mock.calls[0]?.[0]).toMatchObject({
+      id: 'backend-contract-skew',
+      kind: 'warning'
+    })
+    expect(notifySpy.mock.calls[0]?.[0]).not.toHaveProperty('action')
     reportBackendContract(1)
     expect(notifySpy).toHaveBeenCalledTimes(2)
   })

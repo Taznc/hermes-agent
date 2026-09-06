@@ -10,6 +10,7 @@ import { reconcileApprovalModeForProfile } from '@/store/approval-mode'
 import { requestDesktopOnboardingForCredentialWarning } from '@/store/onboarding'
 import { $activeGatewayProfile, $profiles, normalizeProfileKey } from '@/store/profile'
 import { $projectTree } from '@/store/projects'
+import { forgetSessionPullRequest } from '@/store/pull-requests'
 import {
   $cronSessions,
   $currentCwd,
@@ -35,6 +36,7 @@ import {
   setYoloActive
 } from '@/store/session'
 import type { SessionProfileRoute } from '@/store/session-request-router'
+import { forgetConfirmedMissingSessionUnread } from '@/store/session-unread'
 
 // Re-exported for the many session-actions/tile call sites that already import
 // it from here; the canonical definition lives in @/store/session.
@@ -1545,12 +1547,22 @@ export function __resetSessionProbeCache(): void {
   inFlightSessionProbes.clear()
 }
 
+function isConfirmedSessionNotFound(error: unknown): boolean {
+  const message = error instanceof Error ? error.message : String(error ?? '')
+
+  // `getSession()` reports HTTP failures through Electron as `404: ...`; keep
+  // the resource check too, so a missing route on an older backend is never
+  // mistaken for proof that this particular session was deleted.
+  return /(?:^|:\s*)404(?:\s*:|\b)/.test(message) && /session not found/i.test(message)
+}
+
 async function probeStoredSessionAcrossProfiles(storedSessionId: string): Promise<SessionInfo | undefined> {
   // Direct by-id on the active profile — one row lookup, no list scan. Electron
   // routes an unscoped GET to the primary backend, which may not own the
   // active profile. A 404 there used to skip that profile in the probes below,
   // so the session was never found.
   const activeKey = normalizeProfileKey($activeGatewayProfile.get())
+  let everyProbeConfirmedMissing = true
 
   try {
     const session = await getSession(storedSessionId, activeKey)
@@ -1564,7 +1576,8 @@ async function probeStoredSessionAcrossProfiles(storedSessionId: string): Promis
     negativeSessionProbes.delete(storedSessionId)
 
     return session
-  } catch {
+  } catch (error) {
+    everyProbeConfirmedMissing &&= isConfirmedSessionNotFound(error)
     // Not on the active profile — fall through to the cross-profile probe.
   }
 
@@ -1596,6 +1609,7 @@ async function probeStoredSessionAcrossProfiles(storedSessionId: string): Promis
 
       return session
     } catch (error) {
+      everyProbeConfirmedMissing &&= isConfirmedSessionNotFound(error)
       // A plain 404 just means the id isn't on this profile — try the next.
       // "no longer exists" / "is being deleted" is the spawn guard telling us
       // the profile itself is gone; remember it so later lookups skip it.
@@ -1604,6 +1618,15 @@ async function probeStoredSessionAcrossProfiles(storedSessionId: string): Promis
   }
 
   negativeSessionProbes.set(storedSessionId, Date.now())
+
+  if (everyProbeConfirmedMissing) {
+    // This is the only point where a missing id is proven rather than merely
+    // absent from the current profile or page. Retire client-only caches now;
+    // doing it earlier could erase state for a session still being created on a
+    // different profile.
+    forgetSessionPullRequest(storedSessionId)
+    forgetConfirmedMissingSessionUnread(storedSessionId)
+  }
 
   return undefined
 }
@@ -1734,7 +1757,17 @@ export function applyRuntimeInfo(
   reportBackendContract(info.desktop_contract)
 
   if (info.approval_mode !== undefined) {
-    reconcileApprovalModeForProfile($activeGatewayProfile.get(), info.approval_mode)
+    // Approval mode is PROFILE-scoped and the gateway already resolved it
+    // against this session's own profile, stamping that profile as
+    // `profile_name` in the same payload. Credit that name, and only from the
+    // foreground: a background tile runs in its own profile, so attributing
+    // its mode to the ambient active profile rewrote one profile's statusbar
+    // with another's setting — the cross-profile bug the gateway fix removed,
+    // reintroduced one layer up. Fall back to the active profile only for a
+    // legacy backend that sends no `profile_name`.
+    if (foreground) {
+      reconcileApprovalModeForProfile(info.profile_name || $activeGatewayProfile.get(), info.approval_mode)
+    }
   }
 
   requestDesktopOnboardingForCredentialWarning(info.credential_warning)

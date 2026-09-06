@@ -139,7 +139,6 @@ import {
   titlebarToolsWidthCss
 } from '../shell/titlebar'
 import { TitlebarControls } from '../shell/titlebar-controls'
-import { UpdatesOverlay } from '../updates-overlay'
 
 import { archiveUndoToastId, buildArchiveUndoToastInput } from './archive-undo-toast'
 import { ContribWiringContext } from './context'
@@ -1272,7 +1271,7 @@ export function ContribWiring({ children }: { children: ReactNode }) {
         ownerConnectionId={activeConnectionId || undefined}
         profile={activeGatewayProfile}
       />
-      <UpdatesOverlay />
+
       <GatewayConnectingOverlay />
       <BootFailureOverlay />
       <CommandPalette />

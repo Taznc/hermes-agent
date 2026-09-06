@@ -1,10 +1,17 @@
-// Regression for the web-served desktop double context menu: right-clicking a
-// user message bubble with reactions disabled used to fall all the way
-// through to an unhandled contextmenu event (the reaction bubble has no local
-// handler in that state, and AppContextMenu's own capture-phase listener
-// deliberately skips `data-context-menu-skip` surfaces). In Electron that
-// silently resolves to "no menu" (main never calls Menu.popup); in a plain
-// browser tab it IS Chromium's native context menu.
+// Right-clicking a user message bubble with reactions disabled must produce a
+// USABLE menu — the one that carries Copy / Copy message.
+//
+// History: the bubble used to claim the gesture unconditionally via
+// `data-context-menu-skip` (that attr tells AppContextMenu's capture-phase
+// listener to stand down so the reaction picker can own touch-and-hold). With
+// reactions OFF there is no picker to protect, so the gesture fell through to
+// nothing: in Electron that silently resolves to "no menu" (main never calls
+// Menu.popup), and in a plain browser tab it was Chromium's own native menu
+// painting over the app. Either way the user could not copy their own prompt
+// from the menu.
+//
+// The bubble now stamps the skip attr ONLY while the picker can actually open,
+// so a reactions-off right-click reaches the shared menu like any other text.
 import { AssistantRuntimeProvider, type ThreadMessage, useExternalStoreRuntime } from '@assistant-ui/react'
 import { cleanup, fireEvent, render, screen } from '@testing-library/react'
 import { afterEach, describe, expect, it, vi } from 'vitest'
@@ -39,33 +46,31 @@ afterEach(() => {
   $reactionsEnabled.set(false)
 })
 
-describe('user message bubble contextmenu with reactions disabled', () => {
-  it('prevents the native menu when the Electron bridge is missing (web build)', async () => {
+describe('user message bubble contextmenu', () => {
+  it('does not claim the gesture when the reaction picker cannot open', async () => {
     $reactionsEnabled.set(false)
     render(<Harness />)
 
-    const bubble = (await screen.findByText('plain chat text')).closest('[data-context-menu-skip]')
+    const text = await screen.findByText('plain chat text')
 
-    expect(bubble).toBeTruthy()
-
-    const event = fireEvent.contextMenu(bubble!)
-
-    expect(event).toBe(false) // fireEvent returns false when preventDefault() was called
+    // No skip marker => AppContextMenu handles this right-click and can offer
+    // Copy message. (The marker returning would strand the gesture.)
+    expect(text.closest('[data-context-menu-skip]')).toBeNull()
   })
 
-  it('does NOT prevent the native menu when the Electron bridge is present', async () => {
-    $reactionsEnabled.set(false)
+  it('claims the gesture for the picker while reactions are on', async () => {
+    $reactionsEnabled.set(true)
     desktopWindow.hermesDesktop = {
       contextMenuEdit: vi.fn().mockResolvedValue(undefined)
     } as unknown as Window['hermesDesktop']
     render(<Harness />)
 
-    const bubble = (await screen.findByText('plain chat text')).closest('[data-context-menu-skip]')
+    const text = await screen.findByText('plain chat text')
+    const bubble = text.closest('[data-context-menu-skip]')
 
     expect(bubble).toBeTruthy()
 
-    const event = fireEvent.contextMenu(bubble!)
-
-    expect(event).toBe(true) // fireEvent returns true when preventDefault() was NOT called
+    // The picker gesture preventDefaults; fireEvent returns false in that case.
+    expect(fireEvent.contextMenu(bubble!)).toBe(false)
   })
 })
