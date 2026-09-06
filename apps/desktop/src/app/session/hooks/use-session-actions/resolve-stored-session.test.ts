@@ -3,9 +3,12 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import type * as HermesModule from '@/hermes'
 import { getSession } from '@/hermes'
 import { __resetMissingProfiles } from '@/lib/profile-liveness'
+import { $pinnedSessionIds } from '@/store/layout'
 import { $activeGatewayProfile, $profiles } from '@/store/profile'
 import { $projectTree } from '@/store/projects'
+import { $prBranchBySession, $prScannedSessions } from '@/store/pull-requests'
 import { $cronSessions, $messagingSessions, $sessions } from '@/store/session'
+import { $sessionSeenCounts, $unreadFinishedMarkers } from '@/store/session-unread'
 import type { SessionInfo } from '@/types/hermes'
 
 import { __resetSessionProbeCache, cachedSessionRow, resolveSessionProfile, resolveStoredSession } from './utils'
@@ -27,6 +30,11 @@ describe('resolveStoredSession profile ownership', () => {
     $messagingSessions.set([])
     $sessions.set([])
     $projectTree.set([])
+    $pinnedSessionIds.set([])
+    $prBranchBySession.set({})
+    $prScannedSessions.set([])
+    $sessionSeenCounts.set({})
+    $unreadFinishedMarkers.set({})
     $profiles.set(profiles('default', 'meta'))
     $activeGatewayProfile.set('meta')
     mockGetSession.mockReset()
@@ -42,6 +50,11 @@ describe('resolveStoredSession profile ownership', () => {
     $messagingSessions.set([])
     $sessions.set([])
     $projectTree.set([])
+    $pinnedSessionIds.set([])
+    $prBranchBySession.set({})
+    $prScannedSessions.set([])
+    $sessionSeenCounts.set({})
+    $unreadFinishedMarkers.set({})
     $profiles.set([])
     $activeGatewayProfile.set('default')
   })
@@ -216,6 +229,63 @@ describe('resolveStoredSession profile ownership', () => {
     await expect(resolveStoredSession('stuck')).resolves.toBeUndefined()
 
     expect(mockGetSession).toHaveBeenCalledTimes(afterFirst)
+  })
+
+  it('prunes client-only caches only after every profile rejects the stored id', async () => {
+    $sessionSeenCounts.set({ default: { keep: 1, stuck: 2 }, meta: { stuck: 3 } })
+    $unreadFinishedMarkers.set({ default: ['keep', 'stuck'], meta: ['stuck'] })
+    $prScannedSessions.set(['keep', 'stuck'])
+    $prBranchBySession.set({ keep: 'repo\nkeep', stuck: 'repo\nstuck' })
+    // Pins reconcile against their backend row and are not a resolver cache.
+    $pinnedSessionIds.set(['stuck'])
+    mockGetSession.mockRejectedValue(new Error('404: Session not found'))
+
+    await expect(resolveStoredSession('stuck')).resolves.toBeUndefined()
+
+    expect($sessionSeenCounts.get()).toEqual({ default: { keep: 1 } })
+    expect($unreadFinishedMarkers.get()).toEqual({ default: ['keep'] })
+    expect($prScannedSessions.get()).toEqual(['keep'])
+    expect($prBranchBySession.get()).toEqual({ keep: 'repo\nkeep' })
+    expect($pinnedSessionIds.get()).toEqual(['stuck'])
+  })
+
+  it('does not prune client caches when any profile probe is not a confirmed session 404', async () => {
+    const seen = { default: { stuck: 2 }, meta: { stuck: 3 } }
+    const markers = { default: ['stuck'], meta: ['stuck'] }
+    const scanned = ['stuck']
+    const branches = { stuck: 'repo\nstuck' }
+    $sessionSeenCounts.set(seen)
+    $unreadFinishedMarkers.set(markers)
+    $prScannedSessions.set(scanned)
+    $prBranchBySession.set(branches)
+    mockGetSession.mockRejectedValueOnce(new Error('500: gateway temporarily unavailable'))
+    mockGetSession.mockRejectedValueOnce(new Error('404: Session not found'))
+
+    await expect(resolveStoredSession('stuck')).resolves.toBeUndefined()
+
+    expect($sessionSeenCounts.get()).toEqual(seen)
+    expect($unreadFinishedMarkers.get()).toEqual(markers)
+    expect($prScannedSessions.get()).toEqual(scanned)
+    expect($prBranchBySession.get()).toEqual(branches)
+  })
+
+  it('does not prune client caches when a profile resolves the stored id', async () => {
+    const seen = { default: { live: 2 } }
+    const markers = { default: ['live'] }
+    const scanned = ['live']
+    const branches = { live: 'repo\nlive' }
+    $sessionSeenCounts.set(seen)
+    $unreadFinishedMarkers.set(markers)
+    $prScannedSessions.set(scanned)
+    $prBranchBySession.set(branches)
+    mockGetSession.mockResolvedValueOnce(session({ id: 'live', profile: 'meta' }))
+
+    await expect(resolveStoredSession('live')).resolves.toMatchObject({ id: 'live' })
+
+    expect($sessionSeenCounts.get()).toEqual(seen)
+    expect($unreadFinishedMarkers.get()).toEqual(markers)
+    expect($prScannedSessions.get()).toEqual(scanned)
+    expect($prBranchBySession.get()).toEqual(branches)
   })
 
   // It is a TTL, not a blacklist: once the window lapses the id is probed
