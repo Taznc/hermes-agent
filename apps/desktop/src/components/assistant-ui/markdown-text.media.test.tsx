@@ -79,3 +79,48 @@ describe('MarkdownImage media routing', () => {
     expect(container.querySelector('audio')).toBeNull()
   })
 })
+
+// Regression for the <div>-in-<p> hydration error (React: "In HTML, <div>
+// cannot be a descendant of <p>. This will cause a hydration error."):
+// MarkdownLink is the registered `a` renderer, so a MEDIA: href inside a
+// markdown paragraph renders its MediaAttachment/PreviewAttachment card as a
+// CHILD of MarkdownParagraph's real <p>. A block-level <div> there is invalid
+// HTML — the browser's parser closes the <p> early and desyncs React's tree
+// from the DOM. These cards must emit inline-safe (non-<div>) markup.
+describe('MEDIA: link paragraph nesting', () => {
+  afterEach(cleanup)
+
+  it('does not nest a <div> for a non-media MEDIA: file link (PreviewAttachment)', async () => {
+    const errorSpy = vi.spyOn(console, 'error').mockImplementation(() => undefined)
+
+    const { container } = render(
+      <MarkdownTextContent isRunning={false} text="Wrote it: [archive](#media:%2Ftmp%2Farchive.zip)" />
+    )
+
+    await screen.findByText('archive.zip')
+    expect(container.querySelector('p div')).toBeNull()
+
+    for (const call of errorSpy.mock.calls) {
+      expect(String(call[0])).not.toMatch(/cannot be a descendant of/i)
+    }
+
+    errorSpy.mockRestore()
+  })
+
+  it('does not nest a <div> for a bare non-media filesystem link (MediaAttachment)', async () => {
+    const errorSpy = vi.spyOn(console, 'error').mockImplementation(() => undefined)
+
+    const { container } = render(
+      <MarkdownTextContent isRunning={false} text="Recorded: [clip](/tmp/session.mp4) just now." />
+    )
+
+    await waitFor(() => expect(container.querySelector('video')).not.toBeNull())
+    expect(container.querySelector('p div')).toBeNull()
+
+    for (const call of errorSpy.mock.calls) {
+      expect(String(call[0])).not.toMatch(/cannot be a descendant of/i)
+    }
+
+    errorSpy.mockRestore()
+  })
+})

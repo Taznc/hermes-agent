@@ -20,8 +20,8 @@ function normalizeToolMatchValue(value: string): string {
   return normalize(value)
 }
 
-function collectToolMatchValues(query: string, context: string, preview: string): string[] {
-  return [...new Set([query, context, preview].map(normalizeToolMatchValue).filter(Boolean))]
+function collectToolMatchValues(...values: string[]): string[] {
+  return [...new Set(values.map(normalizeToolMatchValue).filter(Boolean))]
 }
 
 function recordFromUnknown(value: unknown): Record<string, unknown> | null {
@@ -88,14 +88,17 @@ function toolPayloadMatchValues(payload: GatewayEventPayload | undefined): strin
   // row (the model's tool_call_id) so the two ids don't produce a duplicate
   // clarify card — same correlation ClarifyToolPending uses for request↔args.
   // `server` is setup_mcp's identifying arg, for the identical reason.
-  const query =
-    firstStringField(payloadArgs, ['search_term', 'query', 'question', 'server', 'command', 'code', 'path']) ||
-    batchClarifyMatchValue(payloadArgs.questions)
+  const query = firstStringField(payloadArgs, ['search_term', 'query', 'question', 'server', 'command', 'code', 'path'])
 
   const context = typeof payload?.context === 'string' ? payload.context.trim() : ''
   const preview = typeof payload?.preview === 'string' ? payload.preview.trim() : ''
 
-  return collectToolMatchValues(query, context, preview)
+  // BOTH keys, never one-or-the-other: a batch clarify may carry a top-level
+  // `question` heading alongside `questions`, while the `clarify.request` wire
+  // shape for the same batch carries only `questions`. Emitting just the first
+  // non-empty key made those two sides disagree (heading vs joined questions),
+  // so they never matched and the card mounted twice.
+  return collectToolMatchValues(query, context, preview, batchClarifyMatchValue(payloadArgs.questions))
 }
 
 /**
@@ -134,14 +137,13 @@ function toolPartMatchValues(part: ChatMessagePart): string[] {
 
   const args = part.args as Record<string, unknown>
 
-  const query =
-    firstStringField(args, ['search_term', 'query', 'question', 'server', 'command', 'code', 'path']) ||
-    batchClarifyMatchValue(args.questions)
+  const query = firstStringField(args, ['search_term', 'query', 'question', 'server', 'command', 'code', 'path'])
 
   const context = typeof args.context === 'string' ? args.context.trim() : ''
   const preview = typeof args.preview === 'string' ? args.preview.trim() : ''
 
-  return collectToolMatchValues(query, context, preview)
+  // Both keys, mirroring `toolPayloadMatchValues` — see the note there.
+  return collectToolMatchValues(query, context, preview, batchClarifyMatchValue(args.questions))
 }
 
 function hasToolMatchOverlap(left: string[], right: string[]): boolean {
@@ -405,6 +407,84 @@ function skippedClarifyResult(part: Extract<ChatMessagePart, { type: 'tool-call'
   }
 }
 
+/**
+ * Collapse every open clarify row down to one.
+ *
+ * The backend blocks on a single `clarify.respond` at a time, so a session can
+ * have AT MOST one unanswered clarify — a second open row is always a
+ * correlation miss (a `tool.start` id and a `clarify.request` id that failed to
+ * match), never real state. Correlation is still the primary fix; this is the
+ * invariant backstop so a future payload shape we haven't seen degrades to one
+ * card instead of two.
+ *
+ * The LAST open row wins and inherits the provider tool id when it has one, so
+ * `tool.complete` (keyed by that id) still settles the surviving card. A
+ * message left with no parts is dropped.
+ */
+export function dedupeOpenClarifyParts(messages: ChatMessage[]): ChatMessage[] {
+  const open: PendingClarifyLocation[] = []
+
+  for (let messageIndex = 0; messageIndex < messages.length; messageIndex += 1) {
+    const { parts } = messages[messageIndex]
+
+    for (let partIndex = 0; partIndex < parts.length; partIndex += 1) {
+      const part = parts[partIndex]
+
+      if (part.type === 'tool-call' && part.toolName === 'clarify' && part.result === undefined) {
+        open.push({ messageIndex, partIndex })
+      }
+    }
+  }
+
+  if (open.length < 2) {
+    return messages
+  }
+
+  const keep = open[open.length - 1]
+  const keepPart = messages[keep.messageIndex].parts[keep.partIndex]
+
+  // A synthetic request-id row can outlive the provider's `tool.start` row.
+  // Carry the provider id (and any richer args) onto the survivor so the
+  // later `tool.complete`, which is keyed by that id, still lands.
+  const donor = open
+    .slice(0, -1)
+    .map(({ messageIndex, partIndex }) => messages[messageIndex].parts[partIndex])
+    .find(part => part.type === 'tool-call' && !(part.toolCallId ?? 'live-tool:').startsWith('live-tool:'))
+
+  const survivor =
+    keepPart.type === 'tool-call' && donor?.type === 'tool-call' && keepPart.toolCallId?.startsWith('live-tool:')
+      ? { ...keepPart, toolCallId: donor.toolCallId }
+      : keepPart
+
+  const dropped = new Set(open.slice(0, -1).map(({ messageIndex, partIndex }) => `${messageIndex}:${partIndex}`))
+  const next: ChatMessage[] = []
+
+  for (let messageIndex = 0; messageIndex < messages.length; messageIndex += 1) {
+    const message = messages[messageIndex]
+    const parts = message.parts.filter((_, partIndex) => !dropped.has(`${messageIndex}:${partIndex}`))
+
+    if (messageIndex === keep.messageIndex) {
+      const survivorIndex = parts.indexOf(keepPart)
+
+      if (survivorIndex >= 0 && survivor !== keepPart) {
+        parts[survivorIndex] = survivor
+      }
+    }
+
+    if (parts.length === message.parts.length) {
+      next.push(survivor !== keepPart && messageIndex === keep.messageIndex ? { ...message, parts } : message)
+
+      continue
+    }
+
+    if (parts.length > 0) {
+      next.push({ ...message, parts })
+    }
+  }
+
+  return next
+}
+
 /** Mark one pending clarify as timed out/settled without ending a later phase
  * of the same assistant turn. `keepMessageRunning` keeps the containing message
  * open for subsequent deltas while the clarify part itself becomes settled. */
@@ -501,27 +581,32 @@ export function restorePendingClarifyToolCall(
   occurredAt = Date.now() / 1000
 ): PendingClarifyProjection {
   const clarifyPayload = { ...payload, name: 'clarify' }
-  const location = findPendingClarifyLocation(messages, clarifyPayload)
+  // Invariant backstop: only one clarify can be open at a time, so collapse any
+  // stragglers BEFORE locating the row to re-arm. Without this a correlation
+  // miss leaves the older open row on screen next to the re-armed one — the
+  // duplicated card users actually saw.
+  const deduped = dedupeOpenClarifyParts(messages)
+  const location = findPendingClarifyLocation(deduped, clarifyPayload)
 
   if (location) {
-    const message = messages[location.messageIndex]
+    const message = deduped[location.messageIndex]
 
     if (message.pending) {
-      return { messages, streamId: message.id }
+      return { messages: deduped, streamId: message.id }
     }
 
-    const next = [...messages]
+    const next = [...deduped]
     next[location.messageIndex] = { ...message, pending: true }
 
     return { messages: next, streamId: message.id }
   }
 
   const parts = upsertToolPart([], clarifyPayload, 'running', occurredAt)
-  const tailIndex = messages.findLastIndex(message => !message.hidden)
-  const tail = messages[tailIndex]
+  const tailIndex = deduped.findLastIndex(message => !message.hidden)
+  const tail = deduped[tailIndex]
 
   if (tail?.role === 'assistant') {
-    const next = [...messages]
+    const next = [...deduped]
     next[tailIndex] = {
       ...tail,
       parts: [...completeOpenStreamParts(tail.parts, occurredAt), ...parts],
@@ -535,7 +620,7 @@ export function restorePendingClarifyToolCall(
 
   return {
     messages: [
-      ...messages,
+      ...deduped,
       {
         id: streamId,
         role: 'assistant',

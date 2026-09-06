@@ -82,6 +82,7 @@ import { NEW_CHAT_ROUTE, sessionRoute } from '../../routes'
 import type { ClientSessionState } from '../../types'
 
 import { useSessionActions } from './use-session-actions'
+import { __resetSessionProbeCache } from './use-session-actions/utils'
 import { useSessionStateCache } from './use-session-state-cache'
 
 vi.mock('@/hermes', async importOriginal => ({
@@ -117,6 +118,16 @@ vi.mock('@/components/pane-shell/tree/store', async importOriginal => ({
   noteActiveTreeGroup: vi.fn(),
   revealTreePane: vi.fn()
 }))
+
+// The cross-profile session probe's negative/in-flight cache is module state
+// shared across every describe block in this file (see
+// resolve-stored-session.test.ts) — a 404 recorded resolving one stored id in
+// an earlier test would otherwise short-circuit a later test's lookup of the
+// same id, which is exactly what leaked `profile: 'work'` between the branch
+// tests here.
+beforeEach(() => {
+  __resetSessionProbeCache()
+})
 
 const RUNTIME_SESSION_ID = 'rt-new-001'
 

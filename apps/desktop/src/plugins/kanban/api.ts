@@ -46,6 +46,13 @@ let os: null | PluginOs = null
 /** Selected board slug ('' = the server's current board). Persisted. */
 export const $boardSlug = atom<string>('')
 
+/** Sentinel `$boardSlug` value for the consolidated "All Boards" view — never
+ *  a real board slug (board slugs are filesystem-safe identifiers that never
+ *  contain `*`), so it can't collide with an on-disk board. Every call site
+ *  that reaches the server MUST route around this value explicitly (see
+ *  `fetchAllBoards`, `withExplicitBoard`) rather than send it as `?board=*`. */
+export const ALL_BOARDS = '*'
+
 /** Whether the "how this board works" intro was dismissed. Persisted. */
 export const $introDismissed = atom<boolean>(false)
 
@@ -57,10 +64,18 @@ export const $lanesByProfile = atom<boolean>(false)
  *  auto: empty lanes collapse to a rail, occupied lanes expand. Persisted. */
 export const $collapsedLanes = atom<Record<string, boolean>>({})
 
+/** Board VISIBILITY overrides for the All Boards filter chip row (true =
+ *  hidden). Absence means visible — a newly appearing board defaults to
+ *  shown. Persisted, same shape/pattern as `$collapsedLanes`. Client-side
+ *  only: the server always returns every board's cards, this just filters
+ *  what's rendered. */
+export const $hiddenBoards = atom<Record<string, boolean>>({})
+
 const BOARD_SLUG_KEY = 'boardSlug'
 const INTRO_KEY = 'introDismissed'
 const LANES_KEY = 'lanesByProfile'
 const COLLAPSED_KEY = 'collapsedLanes'
+const HIDDEN_BOARDS_KEY = 'hiddenBoards'
 
 /** One live `task_events` frame → precise cache invalidation: the board, plus
  *  each touched task's detail. The polls (8s board / 4s drawer) stay as the
@@ -96,7 +111,9 @@ interface Persisted<T> {
 /** Bind the plugin's doors at register time and return a disposer the host
  *  runs on unload/disable — so nothing (store sync, socket) survives a toggle
  *  or duplicates on re-enable. The events socket is pinned to a board at
- *  handshake, so a board switch closes + reopens it. */
+ *  handshake, so a board switch closes + reopens it. The All Boards sentinel
+ *  has no live-events fan-out yet (a named follow-on card) — the socket
+ *  simply stays closed while it's selected; the board still polls. */
 export function bindApi(
   r: Rest,
   storage: PluginStorage,
@@ -118,12 +135,16 @@ export function bindApi(
   persist($introDismissed, INTRO_KEY, false)
   persist($lanesByProfile, LANES_KEY, false)
   persist($collapsedLanes, COLLAPSED_KEY, {})
+  persist($hiddenBoards, HIDDEN_BOARDS_KEY, {})
 
   let close: (() => void) | null = null
 
   const open = (slug: string) => {
     close?.()
-    close = socket(slug ? `/events?board=${encodeURIComponent(slug)}` : '/events', data => onEventsFrame(slug, data))
+    close =
+      slug === ALL_BOARDS
+        ? null
+        : socket(slug ? `/events?board=${encodeURIComponent(slug)}` : '/events', data => onEventsFrame(slug, data))
   }
 
   open($boardSlug.get())
@@ -145,10 +166,32 @@ function call<T>(path: string, opts?: PluginRestOptions): Promise<T> {
   return rest ? rest<T>(path, opts) : Promise.reject(new Error('kanban api not ready'))
 }
 
-/** Append the selected board (and other params) to a path. */
+/** Append the selected board (and other params) to a path. Never emits the
+ *  All Boards sentinel as a literal `board=*` — the backend has no such
+ *  board, so that would 400/404 on every mutation fired while the sentinel is
+ *  selected. Falling through to "no board param" resolves server-side to the
+ *  active board, which is a safe default for any call site not yet migrated
+ *  to pass an explicit board (see `withExplicitBoard`). */
 function withBoard(path: string, params: Record<string, string> = {}): string {
   const search = new URLSearchParams(params)
   const slug = $boardSlug.get()
+
+  if (slug && slug !== ALL_BOARDS) {
+    search.set('board', slug)
+  }
+
+  const qs = search.toString()
+
+  return qs ? `${path}?${qs}` : path
+}
+
+/** Like `withBoard`, but the board comes from the CALLER, never the
+ *  `$boardSlug` atom — the explicit-board escape hatch every mutation the
+ *  consolidated All Boards view can reach must use, so a write always lands
+ *  on the card's own board, never the sentinel. Empty string means "no board
+ *  param" (server falls back to its active board), matching `withBoard`. */
+function withExplicitBoard(path: string, slug: string, params: Record<string, string> = {}): string {
+  const search = new URLSearchParams(params)
 
   if (slug) {
     search.set('board', slug)
@@ -157,6 +200,15 @@ function withBoard(path: string, params: Record<string, string> = {}): string {
   const qs = search.toString()
 
   return qs ? `${path}?${qs}` : path
+}
+
+/** Route a board-scoped path: an explicit `board` (even '') pins the request
+ *  to that board; `undefined` (the default on every existing call site) keeps
+ *  today's behavior of reading `$boardSlug`. This is the seam every mutation
+ *  helper below uses so single-board call sites are byte-for-byte unchanged
+ *  while all-boards call sites can pass a card's own board explicitly. */
+function boardPath(path: string, board: string | undefined, params?: Record<string, string>): string {
+  return board === undefined ? withBoard(path, params) : withExplicitBoard(path, board, params)
 }
 
 // ── query keys (all board-scoped so switching boards is a clean cache miss) ──
@@ -174,13 +226,21 @@ export const ORCHESTRATION_KEY = ['kanban', 'orchestration'] as const
 export const fetchBoard = (archived: boolean) =>
   call<KanbanBoard>(withBoard('/board', archived ? { include_archived: 'true' } : {}))
 
-export const fetchTask = (id: string) => call<KanbanTaskDetail>(withBoard(`/tasks/${id}`))
+/** The consolidated All Boards view — merges every board's cards into the
+ *  standard status columns, each task tagged `board`/`board_name`. Deliberately
+ *  bypasses `withBoard`/`$boardSlug`: `GET /board/all` has no `board` query
+ *  param (it takes `boards=<csv>` to RESTRICT the set, which this always-fetch-
+ *  everything call never sends). */
+export const fetchAllBoards = (archived: boolean) =>
+  call<KanbanBoard>(`/board/all${archived ? '?include_archived=true' : ''}`)
+
+export const fetchTask = (id: string, board?: string) => call<KanbanTaskDetail>(boardPath(`/tasks/${id}`, board))
 
 /** Worker stdout/stderr tail (16 KiB by default; the drawer's "show more"
  *  affordance requests a larger tail instead of leaving truncation
  *  unexplained). */
-export const fetchLog = (id: string, tailBytes = 16384) =>
-  call<WorkerLog>(withBoard(`/tasks/${id}/log`, { tail: String(tailBytes) }))
+export const fetchLog = (id: string, tailBytes = 16384, board?: string) =>
+  call<WorkerLog>(boardPath(`/tasks/${id}/log`, board, { tail: String(tailBytes) }))
 
 export const fetchBoards = () => call<BoardsResponse>('/boards')
 
@@ -199,82 +259,112 @@ export const fetchOrchestration = () => call<OrchestrationSettings>('/orchestrat
 // is lock-guarded and ~1ms when there's nothing to do, so over-nudging is
 // free; failures are non-events (the periodic tick still exists).
 let nudgeTimer: null | ReturnType<typeof setTimeout> = null
+// The set of explicit boards (plus a `true` marker for "use $boardSlug") that
+// have a write pending since the last nudge fired — so a debounced burst of
+// all-boards writes across several real boards nudges every one of them,
+// never just the last board that happened to settle the timer.
+const pendingNudgeBoards = new Set<string | true>()
 
-function autoNudge(): void {
+function autoNudge(board?: string): void {
+  pendingNudgeBoards.add(board ?? true)
+
   if (nudgeTimer != null) {
     clearTimeout(nudgeTimer)
   }
 
   nudgeTimer = setTimeout(() => {
     nudgeTimer = null
-    nudgeDispatcher().catch(() => undefined)
+    const boards = [...pendingNudgeBoards]
+    pendingNudgeBoards.clear()
+
+    for (const board of boards) {
+      nudgeDispatcher(board === true ? undefined : board).catch(() => undefined)
+    }
   }, 400)
 }
 
 /** Resolve the write, then kick the dispatcher. Rejections pass through. */
-function nudged<T>(write: Promise<T>): Promise<T> {
+function nudged<T>(write: Promise<T>, board?: string): Promise<T> {
   return write.then(value => {
-    autoNudge()
+    autoNudge(board)
 
     return value
   })
 }
 
-export const patchTask = (id: string, patch: Record<string, unknown>) =>
-  nudged(call(withBoard(`/tasks/${id}`), { method: 'PATCH', body: patch }))
+export const patchTask = (id: string, patch: Record<string, unknown>, board?: string) =>
+  nudged(call(boardPath(`/tasks/${id}`, board), { method: 'PATCH', body: patch }), board)
 
 export const createTask = (body: Record<string, unknown>) =>
   nudged(call<{ task: KanbanTask | null; warning?: string }>(withBoard('/tasks'), { method: 'POST', body }))
 
 // Deleting can unblock dependants (a gone parent no longer gates), so it
 // nudges too.
-export const deleteTask = (id: string) => nudged(call(withBoard(`/tasks/${id}`), { method: 'DELETE' }))
+export const deleteTask = (id: string, board?: string) =>
+  nudged(call(boardPath(`/tasks/${id}`, board), { method: 'DELETE' }), board)
 
 /** One patch, many ids — independent per-id application; returns per-id
- *  outcomes so the UI can toast partial failures. */
-export const bulkTasks = (ids: string[], patch: Record<string, unknown>) =>
+ *  outcomes so the UI can toast partial failures. `board` pins every id in
+ *  ONE call to the same board; a selection spanning multiple boards (only
+ *  possible in the All Boards view) must be grouped by board and called once
+ *  per group by the caller — the backend endpoint is single-board. */
+export const bulkTasks = (ids: string[], patch: Record<string, unknown>, board?: string) =>
   nudged(
-    call<{ results: Array<{ id: string; ok: boolean; error?: string }> }>(withBoard('/tasks/bulk'), {
+    call<{ results: Array<{ id: string; ok: boolean; error?: string }> }>(boardPath('/tasks/bulk', board), {
       method: 'POST',
       body: { ids, ...patch }
-    })
+    }),
+    board
   )
 
 /** `choice`, when present, is the clicked multiple-choice option — see
  *  docs/design/blocked-callout-multiple-choice-spec.md. Optional so every
  *  free-text reply keeps sending exactly the payload it always has. */
-export const addComment = (id: string, body: string, choice?: ChoiceResponse) =>
-  call(withBoard(`/tasks/${id}/comments`), { method: 'POST', body: { author: 'desktop', body, choice: choice ?? null } })
+export const addComment = (id: string, body: string, choice?: ChoiceResponse, board?: string) =>
+  call(boardPath(`/tasks/${id}/comments`, board), {
+    method: 'POST',
+    body: { author: 'desktop', body, choice: choice ?? null }
+  })
 
-export const reassignTask = (id: string, profile: string) =>
-  nudged(call(withBoard(`/tasks/${id}/reassign`), { method: 'POST', body: { profile, reclaim_first: true } }))
+export const reassignTask = (id: string, profile: string, board?: string) =>
+  nudged(
+    call(boardPath(`/tasks/${id}/reassign`, board), { method: 'POST', body: { profile, reclaim_first: true } }),
+    board
+  )
 
-export const reclaimTask = (id: string) => nudged(call(withBoard(`/tasks/${id}/reclaim`), { method: 'POST', body: {} }))
+export const reclaimTask = (id: string, board?: string) =>
+  nudged(call(boardPath(`/tasks/${id}/reclaim`, board), { method: 'POST', body: {} }), board)
 
 /** Create a dependency edge: `parentId` BLOCKS `childId`. Nudges, because a
- *  new gate can change what the dispatcher is allowed to spawn. */
-export const linkTasks = (parentId: string, childId: string) =>
-  nudged(call(withBoard('/links'), { method: 'POST', body: { parent_id: parentId, child_id: childId } }))
+ *  new gate can change what the dispatcher is allowed to spawn. `board`
+ *  should be the CHILD's board (the task the drawer is open on) — a link only
+ *  makes sense between tasks the backend can see from one board's DB. */
+export const linkTasks = (parentId: string, childId: string, board?: string) =>
+  nudged(call(boardPath('/links', board), { method: 'POST', body: { parent_id: parentId, child_id: childId } }), board)
 
 /** Cut a dependency edge. Nudges: removing the last gate on a todo task can
  *  promote it to ready immediately. */
-export const unlinkTasks = (parentId: string, childId: string) =>
+export const unlinkTasks = (parentId: string, childId: string, board?: string) =>
   nudged(
-    call(withBoard('/links', { parent_id: parentId, child_id: childId }), {
+    call(boardPath('/links', board, { parent_id: parentId, child_id: childId }), {
       method: 'DELETE'
-    })
+    }),
+    board
   )
 
-export const uploadAttachment = (id: string, upload: { filename: string; contentType?: string; bytes: ArrayBuffer }) =>
-  call(withBoard(`/tasks/${id}/attachments`), { method: 'POST', upload })
+export const uploadAttachment = (
+  id: string,
+  upload: { filename: string; contentType?: string; bytes: ArrayBuffer },
+  board?: string
+) => call(boardPath(`/tasks/${id}/attachments`, board), { method: 'POST', upload })
 
 /** Fetch an attachment's bytes as a base64 data URL — the desktop plugin
  *  host has no authenticated `<img src>` door of its own (REST goes over
  *  the Electron IPC bridge, JSON only), so rendering a pasted image inline
  *  in the drawer needs the bytes delivered as a data URL rather than a URL
  *  to point an `<img>` at. */
-export const fetchAttachmentDataUrl = (id: number | string) =>
-  call<{ data_url: string; content_type: string; size: number }>(withBoard(`/attachments/${id}/data-url`))
+export const fetchAttachmentDataUrl = (id: number | string, board?: string) =>
+  call<{ data_url: string; content_type: string; size: number }>(boardPath(`/attachments/${id}/data-url`, board))
 
 /** Upload a pasted image before the task exists (new-task dialog paste flow).
  *  Returns a `token` that travels in `pending_attachment_tokens` on
@@ -295,8 +385,8 @@ export const createBoard = (slug: string, name: string, projectId?: string) =>
 
 /** Rough auxiliary-model estimate for a task (tokens + complexity). Makes a
  *  model call — gate behind an explicit user action + disclaimer. */
-export const estimateTask = (id: string) =>
-  call<TaskEstimate>(withBoard(`/tasks/${id}/estimate`), { method: 'POST', body: {} })
+export const estimateTask = (id: string, board?: string) =>
+  call<TaskEstimate>(boardPath(`/tasks/${id}/estimate`, board), { method: 'POST', body: {} })
 
 /** Estimate from typed title/body before a task exists (create dialog). */
 export const estimateNew = (title: string, body: string) =>
@@ -323,14 +413,15 @@ export const exportBoard = (slug: string, output: string) =>
 export const importBoard = (archive: string) =>
   call<BoardImportResult>('/boards/import', { method: 'POST', body: { archive } })
 
-export const nudgeDispatcher = () => call<{ spawned?: unknown[] }>(withBoard('/dispatch'), { method: 'POST', body: {} })
+export const nudgeDispatcher = (board?: string) =>
+  call<{ spawned?: unknown[] }>(boardPath('/dispatch', board), { method: 'POST', body: {} })
 
 /** Append a free-typed idea to the board's roadmap `## Ideas` inbox
  *  (Phase 2.15). Never rejects on a roadmap-unavailable outcome — the
  *  backend is fail-open by contract — so callers branch on `ok`/`reason`
  *  rather than a thrown error, matching `estimateNew`'s shape. */
-export const addRoadmapIdea = (text: string, sourceId?: string) =>
-  call<{ ok: boolean; reason?: null | string }>(withBoard('/roadmap/idea'), {
+export const addRoadmapIdea = (text: string, sourceId?: string, board?: string) =>
+  call<{ ok: boolean; reason?: null | string }>(boardPath('/roadmap/idea', board), {
     method: 'POST',
     body: { text, ...(sourceId ? { source_id: sourceId } : {}) }
   })

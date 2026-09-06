@@ -30,6 +30,8 @@ import { dropSessionState, publishSessionState } from '@/store/session-states'
 import { $wakeWord, resetWakeWordState } from '@/store/wake-word'
 import type { SessionInfo } from '@/types/hermes'
 
+import { __resetSessionProbeCache } from '../use-session-actions/utils'
+
 import { clearSingleFlightSessionResumeState } from './single-flight-resume'
 import { SESSION_COMPRESS_TIMEOUT_MS } from './slash'
 import type { SubmitTextOptions } from './utils'
@@ -38,9 +40,13 @@ import { uploadComposerAttachment, usePromptActions } from '.'
 
 // Suites in this file reuse the same stored-id constants. The module-level
 // single-flight resume map (and drift-recovery cache) would otherwise leak a
-// never-settling in-flight promise from one test into the next.
+// never-settling in-flight promise from one test into the next. The
+// cross-profile session probe's negative/in-flight cache is the same class of
+// module state (see resolve-stored-session.test.ts) — a 404 recorded by one
+// test would otherwise short-circuit a later test's lookup of the same id.
 beforeEach(() => {
   clearSingleFlightSessionResumeState()
+  __resetSessionProbeCache()
 })
 
 vi.mock('@/hermes', () => ({

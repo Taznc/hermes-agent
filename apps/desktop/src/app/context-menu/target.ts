@@ -60,3 +60,27 @@ export function resolveDomTarget(element: Element | null): ContextMenuDomTarget 
 export function isWebUrl(url: string): boolean {
   return /^https?:\/\//i.test(url)
 }
+
+/**
+ * Whether Electron's main process will emit its own `context-menu` event for
+ * this gesture — the sole reason it is ever safe to leave a `contextmenu`
+ * event unprevented.
+ *
+ * Chromium reports spellcheck facts and image coordinates to the HOST
+ * process only when the renderer's `contextmenu` event is NOT prevented, and
+ * in Electron the app never calls `Menu.popup` on that report — so an
+ * unprevented gesture there costs nothing and preserves the forward (see
+ * `electron/main.ts`'s `context-menu` handler). In a plain browser tab there
+ * is no host process: "unprevented" IS Chromium's own native context menu,
+ * so leaving it unprevented paints Chromium's menu on top of this app's.
+ *
+ * The Electron preload bridge exposes `contextMenuEdit` (and its
+ * `contextMenuSpellcheck`/`onContextMenuSpellcheck` siblings); the web
+ * build's `web-bridge-shim.ts` deliberately omits all three (there is no
+ * host-side edit command to route to — the browser handles editing
+ * natively). Their presence is therefore the natural sentinel for "is the
+ * Electron main-process context-menu bridge actually here".
+ */
+export function nativeContextMenuHandled(): boolean {
+  return typeof window.hermesDesktop?.contextMenuEdit === 'function'
+}
