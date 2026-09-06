@@ -136,7 +136,7 @@ class TestWorkerLauncherSystemdIntegration:
             assert receipt.exists(), "worker did not start inside the scope in time"
             import json
 
-            worker_pid = json.loads(receipt.read_text())["pid"]
+            worker_pid = json.loads(receipt.read_text(encoding="utf-8"))["pid"]
 
             # Kill the stand-in "gateway" — the scope must survive (it's not
             # in the stand-in's cgroup/process-tree ownership).
