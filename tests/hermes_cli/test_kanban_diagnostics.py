@@ -200,6 +200,90 @@ def test_stranded_in_ready_fires_when_age_exceeds_threshold():
 
 
 # ---------------------------------------------------------------------------
+# stranded_in_ready — concurrency-aware (board/profile at capacity is queued,
+# not stranded; the operator has no action to take, so the rule must not fire)
+# ---------------------------------------------------------------------------
+
+
+def test_stranded_in_ready_suppressed_when_board_at_global_cap():
+    """A board saturated at kanban.max_in_progress is healthy and busy, not
+    stranded: this is the exact false-positive from the bug report (t_ff7c7888
+    sat in ready with 6/6 workers alive and got flagged as if the dispatcher
+    were down). No operator action exists, so the diagnostic must not fire."""
+    now = 100_000
+    task = _task(status="ready", assignee="demo", claim_lock=None)
+    events = [_event("created", ts=now - 65 * 60)]  # well past the 30 min threshold
+    concurrency = {
+        "max_in_progress": 6, "max_in_progress_per_profile": None,
+        "total_running": 6, "running_by_assignee": {},
+    }
+    diags = kd.compute_task_diagnostics(task, events, [], now=now, concurrency=concurrency)
+    assert not [d for d in diags if d.kind == "stranded_in_ready"]
+
+
+def test_stranded_in_ready_still_fires_when_a_slot_is_free():
+    """Same age, but the host has headroom: a genuinely unclaimed task past
+    the threshold with capacity to run it IS worth flagging — the rule must
+    keep working when the board isn't at cap."""
+    now = 100_000
+    task = _task(status="ready", assignee="demo", claim_lock=None)
+    events = [_event("created", ts=now - 65 * 60)]
+    concurrency = {
+        "max_in_progress": 6, "max_in_progress_per_profile": None,
+        "total_running": 3, "running_by_assignee": {},
+    }
+    diags = kd.compute_task_diagnostics(task, events, [], now=now, concurrency=concurrency)
+    stranded = [d for d in diags if d.kind == "stranded_in_ready"]
+    assert len(stranded) == 1
+
+
+def test_stranded_in_ready_suppressed_when_assignees_per_profile_cap_saturated():
+    """A per-profile cap can saturate for one assignee while the global cap
+    still has headroom (other profiles are the ones filling it). The card
+    for the saturated assignee must not fire even though a global slot is
+    technically free."""
+    now = 100_000
+    task = _task(status="ready", assignee="alice", claim_lock=None)
+    events = [_event("created", ts=now - 65 * 60)]
+    concurrency = {
+        "max_in_progress": 10, "max_in_progress_per_profile": 4,
+        "total_running": 5,  # global headroom: 5 < 10
+        "running_by_assignee": {"alice": 4, "bob": 1},  # alice alone is at her cap
+    }
+    diags = kd.compute_task_diagnostics(task, events, [], now=now, concurrency=concurrency)
+    assert not [d for d in diags if d.kind == "stranded_in_ready"]
+
+
+def test_stranded_in_ready_fires_for_a_different_assignee_under_the_cap():
+    """The per-profile cap suppression is scoped to the saturated assignee
+    only — a sibling card assigned to a profile with headroom must still be
+    flaggable."""
+    now = 100_000
+    task = _task(status="ready", assignee="bob", claim_lock=None)
+    events = [_event("created", ts=now - 65 * 60)]
+    concurrency = {
+        "max_in_progress": 10, "max_in_progress_per_profile": 4,
+        "total_running": 5,
+        "running_by_assignee": {"alice": 4, "bob": 1},
+    }
+    diags = kd.compute_task_diagnostics(task, events, [], now=now, concurrency=concurrency)
+    stranded = [d for d in diags if d.kind == "stranded_in_ready"]
+    assert len(stranded) == 1
+
+
+def test_stranded_in_ready_ignores_missing_concurrency_snapshot():
+    """No concurrency context (e.g. a low-level caller with no live DB
+    connection) preserves the old age-only behavior rather than silently
+    suppressing everything."""
+    now = 100_000
+    task = _task(status="ready", assignee="demo", claim_lock=None)
+    events = [_event("created", ts=now - 65 * 60)]
+    diags = kd.compute_task_diagnostics(task, events, [], now=now)
+    stranded = [d for d in diags if d.kind == "stranded_in_ready"]
+    assert len(stranded) == 1
+
+
+# ---------------------------------------------------------------------------
 # repeated_failures rule — threshold must track the breaker's effective limit
 #
 # _record_task_failure (kanban_db_dispatch.py) resolves its trip threshold as
