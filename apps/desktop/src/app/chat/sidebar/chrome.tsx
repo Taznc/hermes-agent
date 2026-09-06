@@ -195,7 +195,7 @@ export function SidebarDateDividerArchiveButton({
     <Tip label={ariaLabel}>
       <Button
         aria-label={ariaLabel}
-        className="size-5 rounded-[4px] bg-transparent text-transparent transition-colors duration-100 hover:bg-(--ui-control-active-background) hover:text-foreground focus-visible:bg-(--ui-control-active-background) focus-visible:text-foreground focus-visible:ring-0 group-hover/workspace:text-(--ui-text-tertiary) [&_svg]:size-3.5!"
+        className="grid size-4 shrink-0 place-items-center rounded-sm bg-transparent text-(--ui-text-quaternary) opacity-0 transition-opacity hover:bg-(--ui-control-hover-background) hover:text-foreground group-hover/workspace:opacity-100 focus-visible:opacity-100"
         onClick={event => {
           event.stopPropagation()
           onArchive()
