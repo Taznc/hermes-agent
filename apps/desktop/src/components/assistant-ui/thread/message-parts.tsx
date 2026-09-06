@@ -25,7 +25,7 @@ import { ContribRender } from '@/contrib/react/boundary'
 import { useI18n } from '@/i18n'
 import { generatedImageFromResult } from '@/lib/generated-images'
 import { separateGluedReasoningBlocks } from '@/lib/reasoning-blocks'
-import { resolveToolRenderer, TOOL_RENDERERS_AREA } from '@/lib/tool-renderers'
+import { resolveToolRenderer, TOOL_RENDERERS_AREA, type ToolRendererContribution } from '@/lib/tool-renderers'
 import { useEnterAnimation } from '@/lib/use-enter-animation'
 import { cn } from '@/lib/utils'
 import { $reasoningCollapsedByDefault } from '@/store/reasoning-disclosure'
@@ -139,10 +139,10 @@ const ChainToolFallback: FC<TimelineToolCallProps> = props => {
   // `props` carries a fresh addResult/resume/respondToApproval closure on
   // every render (assistant-ui's contract), so memoizing renderResolved on
   // `props` itself would remount the plugin's card every tick. Keep the
-  // latest props in a ref instead — assigned during render, matching the
-  // established pattern elsewhere in this codebase (accent/picker.tsx,
-  // use-resize-observer.ts), never inside a useEffect — so the render
-  // callback's identity only changes when the RESOLVED renderer does.
+  // latest props in a ref instead — assigned during render, the established
+  // latest-value pattern in this codebase (`use-enter-animation.ts`), never
+  // inside a useEffect — so the render callback's identity only changes when
+  // the RESOLVED renderer does.
   const propsRef = useRef(props)
   propsRef.current = props
 
@@ -156,12 +156,30 @@ const ChainToolFallback: FC<TimelineToolCallProps> = props => {
     return () => render(propsRef.current)
   }, [resolved])
 
+  // An ErrorBoundary latches its caught error for the life of the instance, so
+  // the boundary is keyed to the RESOLVED renderer's identity rather than
+  // mounted once per tool. `tool-renderers.ts` promises that re-registering a
+  // claim (a plugin reload or update) supersedes the earlier one; without this
+  // a renderer that threw once would keep the tool pinned to core's row even
+  // after a working renderer took its place under the same contribution id.
+  const generationRef = useRef(0)
+  const lastRenderRef = useRef<ToolRendererContribution['render'] | undefined>(undefined)
+
+  if (resolved?.render !== lastRenderRef.current) {
+    lastRenderRef.current = resolved?.render
+    generationRef.current += 1
+  }
+
   if (!resolved || !renderResolved) {
     return <CoreChainToolFallback {...props} />
   }
 
   return (
-    <ErrorBoundary fallback={() => <CoreChainToolFallback {...props} />} label={`toolRenderers:${resolved.id}`}>
+    <ErrorBoundary
+      fallback={() => <CoreChainToolFallback {...props} />}
+      key={`${resolved.id}#${generationRef.current}`}
+      label={`toolRenderers:${resolved.id}`}
+    >
       <ContribRender render={renderResolved} />
     </ErrorBoundary>
   )

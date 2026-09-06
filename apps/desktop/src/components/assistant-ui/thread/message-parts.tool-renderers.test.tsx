@@ -129,6 +129,39 @@ describe('toolRenderers: a throwing plugin renderer degrades to the core row', (
 
     consoleError.mockRestore()
   })
+
+  it('recovers when a working renderer replaces the thrower under the same id', () => {
+    const consoleError = vi.spyOn(console, 'error').mockImplementation(() => {})
+
+    // Registering by the SAME id is the documented supersede path (a plugin
+    // reload or hot update). An error boundary latches its caught error for
+    // the life of its instance, so this pins that a replaced renderer is
+    // actually given a chance to paint instead of the tool staying stuck on
+    // core's row until the message unmounts.
+    disposers.push(
+      contributeRenderer('demo:boom', {
+        toolName: PLAIN_TOOL,
+        render: () => {
+          throw new Error('plugin renderer exploded')
+        }
+      })
+    )
+
+    const { rerender } = render(<Fallback {...baseProps()} />)
+
+    disposers.push(
+      contributeRenderer('demo:boom', {
+        toolName: PLAIN_TOOL,
+        render: () => <span data-testid="plugin-card">fixed</span>
+      })
+    )
+
+    rerender(<Fallback {...baseProps()} />)
+
+    expect(screen.getByTestId('plugin-card')).toBeTruthy()
+
+    consoleError.mockRestore()
+  })
 })
 
 describe('toolRenderers: no plugin registered — the core chain is untouched', () => {
