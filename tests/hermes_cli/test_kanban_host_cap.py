@@ -188,6 +188,73 @@ def test_count_running_tasks_other_boards_fails_open(
     assert kbd.count_running_tasks_other_boards() == 0
 
 
+def test_host_cap_allows_only_one_concurrent_cross_board_dispatch(
+    kanban_home, all_assignees_spawnable, monkeypatch,
+):
+    """A host cap is an atomic reservation across board-local ticks.
+
+    Both boards start their budget calculation together.  Without a host-wide
+    lock they each observe the sole free slot and both claim; with it, one tick
+    runs and the other skips instead of exceeding the configured cap.
+    """
+    kb.create_board("second")
+    original_budget = kbd._tick_spawn_budget
+    rendezvous = threading.Barrier(2)
+
+    def synchronized_budget(*args, **kwargs):
+        try:
+            rendezvous.wait(timeout=0.2)
+        except threading.BrokenBarrierError:
+            # The host lock correctly prevents the second tick from entering.
+            pass
+        return original_budget(*args, **kwargs)
+
+    monkeypatch.setattr(kbd, "_tick_spawn_budget", synchronized_budget)
+    spawns: list[str] = []
+    start = threading.Barrier(2)
+
+    def dispatch(board: str) -> None:
+        with kbc.connect(board=board) as conn:
+            kb.create_task(conn, title=f"ready-{board}", assignee="alice")
+            start.wait(timeout=2)
+            kbd.dispatch_once(
+                conn, spawn_fn=_fake_spawn_factory(spawns), max_in_progress=1, board=board,
+            )
+
+    workers = [threading.Thread(target=dispatch, args=(board,)) for board in ("default", "second")]
+    for worker in workers:
+        worker.start()
+    for worker in workers:
+        worker.join(timeout=3)
+
+    assert all(not worker.is_alive() for worker in workers)
+    assert len(spawns) == 1
+
+
+def test_per_profile_cap_counts_running_workers_on_other_boards(
+    kanban_home, all_assignees_spawnable,
+):
+    """A profile's cap applies to the host, not merely the current board."""
+    kb.create_board("second")
+    with kbc.connect(board="second") as conn:
+        busy = kb.create_task(conn, title="already-running", assignee="alice")
+        assert kb.claim_task(conn, busy) is not None
+
+    spawns: list = []
+    with kbc.connect() as conn:
+        kb.create_task(conn, title="must-wait", assignee="alice")
+        result = kbd.dispatch_once(
+            conn,
+            spawn_fn=_fake_spawn_factory(spawns),
+            max_in_progress=2,
+            max_in_progress_per_profile=1,
+        )
+
+    assert spawns == []
+    assert len(result.skipped_per_profile_capped) == 1
+    assert result.skipped_per_profile_capped[0][1:] == ("alice", 1)
+
+
 def test_max_spawn_stays_per_board(kanban_home, all_assignees_spawnable):
     """``max_spawn`` keeps its historical per-board semantics."""
     kb.create_board("second")

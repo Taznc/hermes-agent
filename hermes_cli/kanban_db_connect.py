@@ -205,6 +205,40 @@ def _dispatch_tick_lock(db_path: Path):
                 handle.close()
 
 
+@contextlib.contextmanager
+def _host_dispatch_cap_lock():
+    """Non-blocking host-wide reservation lock for shared dispatch caps.
+
+    Board locks protect SQLite writes.  Host caps instead read every board, so
+    budget calculation through claim must be serialized across boards whenever
+    either host-wide cap is active.
+    """
+    try:
+        lock_path = _kb.kanban_home() / "kanban" / ".dispatch-host-cap.lock"
+        lock_path.parent.mkdir(parents=True, exist_ok=True)
+        handle = lock_path.open("a+b")
+    except OSError:
+        # Preserve the existing dispatch-lock fail-open behavior when a lock
+        # probe itself cannot run (for example a read-only diagnostic mount).
+        yield True
+        return
+    acquired = False
+    try:
+        try:
+            acquired = _try_lock_nb(handle)
+        except (OSError, AttributeError):
+            acquired = False
+        yield acquired
+    finally:
+        try:
+            if acquired:
+                _unlock(handle)
+        except (OSError, AttributeError):
+            pass
+        finally:
+            handle.close()
+
+
 # Periodic explicit WAL checkpoint from the dispatcher tick: a passive
 # autocheckpoint can be starved on a busy multi-process board (any open reader
 # snapshot blocks the WAL reset), letting -wal grow between gateway restarts.
