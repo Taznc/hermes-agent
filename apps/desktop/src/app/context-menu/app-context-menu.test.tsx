@@ -24,6 +24,7 @@ const desktopWindow = window as unknown as { hermesDesktop?: Window['hermesDeskt
 function installBridge(partial: Partial<Window['hermesDesktop']> = {}) {
   desktopWindow.hermesDesktop = {
     openExternal: vi.fn().mockResolvedValue(undefined),
+    revealPath: vi.fn().mockResolvedValue(true),
     writeClipboard: vi.fn().mockResolvedValue(undefined),
     ...partial
   } as unknown as Window['hermesDesktop']
@@ -257,6 +258,19 @@ describe('AppContextMenu', () => {
   it('hides the local-only file verbs on a remote gateway', async () => {
     $connection.set({ mode: 'remote' } as never)
     installBridge()
+    mountMenu()
+    const host = attach('<a href="/srv/data/notes.txt">/srv/data/notes.txt</a>')
+
+    fireEvent.contextMenu(host.querySelector('a')!)
+
+    expect(await screen.findByText('Open in preview')).toBeTruthy()
+    expect(screen.getByText('Copy path')).toBeTruthy()
+    expect(screen.queryByText('Open with default app')).toBeNull()
+    expect(screen.queryByText(/Reveal in Finder|Reveal in File Explorer|Open containing folder/)).toBeNull()
+  })
+
+  it('hides native-only file verbs when the web bridge has no file-manager capability', async () => {
+    installBridge({ revealPath: undefined })
     mountMenu()
     const host = attach('<a href="/srv/data/notes.txt">/srv/data/notes.txt</a>')
 

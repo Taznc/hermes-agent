@@ -19,7 +19,7 @@ import { type MenuKit, renderActionItem } from '@/components/ui/actions-menu'
 import { FileTypeIcon } from '@/components/ui/file-type-icon'
 import { ToolIcon } from '@/components/ui/tool-icon'
 import { translateNow } from '@/i18n'
-import { isDesktopFsRemoteMode } from '@/lib/desktop-fs'
+import { canUseNativeFileActions } from '@/lib/desktop-fs'
 import { openExternalLink } from '@/lib/external-link'
 import { openPreviewTargetInBrowser } from '@/lib/local-preview'
 import { copyFilePath, revealFile } from '@/store/file-actions'
@@ -110,10 +110,10 @@ function browserTabMenuPrefix(tabId: string) {
 
   // A file tab: the verbs a file gets everywhere else in the app (the file
   // tree, a chat path link) — open it outside Hermes, reveal it, copy its
-  // path. Reveal and default-app need the file on THIS disk, so they are
-  // hidden on a remote gateway; copy path works everywhere.
+  // File verbs need the file on the Electron host plus the native file-manager
+  // bridge. Remote gateways and the web desktop retain only Copy path.
   if (kind === 'file') {
-    const localFs = !isDesktopFsRemoteMode()
+    const localFs = canUseNativeFileActions()
 
     return (kit: MenuKit) => {
       const path = fileTabPath(tabId)

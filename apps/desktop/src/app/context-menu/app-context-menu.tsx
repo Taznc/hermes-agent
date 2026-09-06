@@ -18,7 +18,7 @@ import {
   DropdownMenuTrigger
 } from '@/components/ui/dropdown-menu'
 import { type Translations, useI18n } from '@/i18n'
-import { isDesktopFsRemoteMode } from '@/lib/desktop-fs'
+import { canUseNativeFileActions } from '@/lib/desktop-fs'
 import { hostPathLabel, hudForcesNativeLinks, normalizeExternalUrl, openExternalLink } from '@/lib/external-link'
 import { formatCombo } from '@/lib/keybinds/combo'
 import { normalizeOrLocalPreviewTarget } from '@/lib/local-preview'
@@ -144,7 +144,7 @@ function domSections(open: Extract<OpenContextMenu, { kind: 'dom' }>, t: Transla
   // path as its href. It is a file on the AGENT's machine, so the verbs are
   // file verbs — preview, default app, reveal, copy path — not browser ones.
   const linkIsFile = Boolean(linkUrl) && !linkIsWeb && isFileMediaPath(linkUrl)
-  const localFs = !isDesktopFsRemoteMode()
+  const localFs = canUseNativeFileActions()
   const imageIsWeb = isWebUrl(target.imageUrl)
   const openInApp = !hudForcesNativeLinks()
   const showResolvedCopy = linkIsWeb && isRemoteGateway() && isLoopbackUrl(linkUrl)

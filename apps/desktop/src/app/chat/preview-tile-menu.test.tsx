@@ -136,6 +136,18 @@ describe('preview tab menu — file tab', () => {
     expect(screen.queryByText('Open in external')).toBeNull()
     expect(screen.queryByText(/Reveal in Finder|Reveal in File Explorer|Open containing folder/)).toBeNull()
   })
+  it('keeps only copy path when the web bridge has no native file-manager capability', async () => {
+    installBridge({ revealPath: undefined })
+    openPreview(fileTarget('/srv/data/notes.txt'), 'file-browser')
+
+    const tabId = $previewTabs.get()[0]!.id
+
+    mountPrefix(tabId)
+
+    expect(await screen.findByText('Copy path')).toBeTruthy()
+    expect(screen.queryByText('Open in external')).toBeNull()
+    expect(screen.queryByText(/Reveal in Finder|Reveal in File Explorer|Open containing folder/)).toBeNull()
+  })
 })
 
 describe('preview tab menu — browser tab', () => {
