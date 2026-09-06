@@ -278,11 +278,19 @@ def _warnings_summary_from_diagnostics(diagnostics: list[dict]) -> Optional[dict
     return {"count": count, "kinds": kinds, "latest_at": latest, "highest_severity": highest_sev}
 
 
-def _attach_diagnostics(task_d: dict, diags: Optional[list[dict]]) -> None:
-    """Full list in the payload (drawer renders without a second round-trip); card badge gets the summary."""
-    if diags:
+def _attach_diagnostics(task_d: dict, diags: Optional[list[dict]], *, include_full: bool = True) -> None:
+    """Card badge / attention-strip summary only from ``warning``+ diagnostics -- an ``info``
+    diagnostic (e.g. respawn_guarded) must never badge a card or join "needs attention".
+    ``include_full`` controls whether the raw ``diagnostics`` list (all severities, consumed by
+    the desktop drawer and the dashboard's collectDiagTasks) is included: True for the
+    task-detail payload, False for the board payload, since a bare non-empty list there would
+    re-trigger the attention strip regardless of ``warnings``."""
+    if not diags:
+        return
+    if include_full:
         task_d["diagnostics"] = diags
-        task_d["warnings"] = _warnings_summary_from_diagnostics(diags)
+    warning_plus = [d for d in diags if kd.severity_at_or_above(d.get("severity"), "warning")]
+    task_d["warnings"] = _warnings_summary_from_diagnostics(warning_plus)
 
 
 def _links_for(conn: sqlite3.Connection, task_id: str) -> dict[str, list[str]]:
@@ -346,7 +354,7 @@ def _board_payload(
         d["comment_count"] = comment_counts.get(t.id, 0)
         d["image_attachment_id"] = first_image_attachment.get(t.id)
         d["progress"] = progress.get(t.id)  # None when the task has no children
-        _attach_diagnostics(d, diagnostics_per_task.get(t.id))
+        _attach_diagnostics(d, diagnostics_per_task.get(t.id), include_full=False)
         columns[t.status if t.status in columns else "todo"].append(d)
 
     # Per-column ordering (priority DESC, created_at ASC) comes from list_tasks.
@@ -1091,7 +1099,7 @@ def bulk_update(payload: BulkTaskBody, board: Optional[str] = Query(None)):
 @router.get("/diagnostics")
 def list_diagnostics(
     board: Optional[str] = _BOARD_Q,
-    severity: Optional[str] = Query(None, description="Filter by severity: warning|error|critical")):
+    severity: Optional[str] = Query(None, description="Filter by severity: info|warning|error|critical")):
     """Tasks with an active diagnostic, highest severity first then most recent; also
     consumed by ``hermes kanban diagnostics`` when the dashboard runs."""
     with _board_conn(board) as (board, conn):

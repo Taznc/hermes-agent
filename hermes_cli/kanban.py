@@ -442,7 +442,7 @@ def _cmd_list(args: argparse.Namespace) -> int:
 
 def _print_diagnostics(diags, indent: str, *, with_kind: bool) -> None:
     """Shared human rendering for ``show`` and ``diagnostics`` (suggested actions only)."""
-    sev_marker = {"warning": "⚠", "error": "!!", "critical": "!!!"}
+    sev_marker = {"info": "i", "warning": "⚠", "error": "!!", "critical": "!!!"}
     for d in diags:
         head = f"{d.kind}: {d.title}" if with_kind else d.title
         print(f"{indent}{sev_marker.get(d.severity, '?')} [{d.severity}] {head}")
