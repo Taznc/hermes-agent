@@ -17,12 +17,14 @@ import { describe, expect, it } from 'vitest'
 import {
   blockerStand,
   buildGraph,
+  cardKey,
   type DependencyGraph,
   downstreamOf,
   focusSets,
   GATING_CLEARED,
   indexBoard,
   isGating,
+  parseCardKey,
   partitionBlockers,
   resolveLinks,
   upstreamOf
@@ -749,5 +751,122 @@ describe('a diamond dependency: A blocks B and C; B and C block D', () => {
 
     expect(satisfied.map(row => row.id)).toEqual(['b'])
     expect(gating.map(row => row.id)).toEqual(['c'])
+  })
+})
+
+/**
+ * All Boards mode: task ids are only unique PER BOARD (`GET /board/all`'s own
+ * docstring says clients must key on the pair), and this index drives mutation
+ * routing — `index.get(key)?.board` decides which board's DB a delete or a
+ * status patch lands in. Keying by bare id would collapse two same-id cards
+ * onto one row and send the survivor's board for both.
+ *
+ * Single-board payloads carry no `board` at all, so every assertion above
+ * still describes that mode unchanged; these tests describe the merged one.
+ */
+describe('cardKey / board+id identity (All Boards mode)', () => {
+  /** A merged payload: two boards, each with a card sharing the id `t_dup`. */
+  const merged = (): KanbanBoard => ({
+    assignees: [],
+    columns: [
+      {
+        name: 'todo',
+        tasks: [
+          { board: 'shipping', board_name: 'Shipping', id: 't_dup', status: 'todo', title: 'Shipping copy' },
+          { board: 'homelab', board_name: 'Homelab', id: 't_dup', status: 'running', title: 'Homelab copy' },
+          { board: 'homelab', board_name: 'Homelab', id: 't_solo', status: 'todo', title: 'Only on homelab' }
+        ]
+      }
+    ],
+    latest_event_id: 1,
+    now: 1_700_000_000,
+    tenants: []
+  })
+
+  it('a bare id and a board+id key are different keys', () => {
+    expect(cardKey('t_dup', 'homelab')).not.toBe('t_dup')
+    expect(cardKey('t_dup', 'shipping')).not.toBe(cardKey('t_dup', 'homelab'))
+  })
+
+  it('no board (single-board mode) keys by the bare id, unchanged', () => {
+    expect(cardKey('t_dup')).toBe('t_dup')
+    expect(cardKey('t_dup', null)).toBe('t_dup')
+    expect(cardKey('t_dup', '')).toBe('t_dup')
+  })
+
+  it('round-trips a key back to its board and id', () => {
+    expect(parseCardKey(cardKey('t_dup', 'homelab'))).toEqual({ board: 'homelab', id: 't_dup' })
+    expect(parseCardKey('t_dup')).toEqual({ id: 't_dup' })
+  })
+
+  it('two cards sharing an id across boards both survive the index', () => {
+    const index = indexBoard(merged())
+
+    expect(index.size).toBe(3)
+    expect(index.get(cardKey('t_dup', 'shipping'))?.title).toBe('Shipping copy')
+    expect(index.get(cardKey('t_dup', 'homelab'))?.title).toBe('Homelab copy')
+  })
+
+  it("each duplicate keeps its OWN board, so a mutation can't be misrouted", () => {
+    const index = indexBoard(merged())
+
+    expect(index.get(cardKey('t_dup', 'shipping'))?.board).toBe('shipping')
+    expect(index.get(cardKey('t_dup', 'homelab'))?.board).toBe('homelab')
+  })
+
+  it('a bare id no longer resolves in a merged index (the pair is required)', () => {
+    expect(indexBoard(merged()).get('t_dup')).toBeUndefined()
+  })
+
+  it('resolveLinks scoped to a board picks that board\u2019s row, not the other one', () => {
+    const index = indexBoard(merged())
+
+    expect(resolveLinks(['t_dup'], index, 'homelab')[0]).toMatchObject({ status: 'running', missing: false })
+    expect(resolveLinks(['t_dup'], index, 'shipping')[0]).toMatchObject({ status: 'todo', missing: false })
+  })
+
+  it('resolveLinks flags an id absent from THIS board as missing, not borrowed', () => {
+    const index = indexBoard(merged())
+
+    // `t_solo` exists only on homelab; resolving it against shipping must not
+    // silently hand back the homelab row.
+    expect(resolveLinks(['t_solo'], index, 'shipping')[0].missing).toBe(true)
+    expect(resolveLinks(['t_solo'], index, 'homelab')[0].missing).toBe(false)
+  })
+
+  it('builds the chain from /board/all object edges, keyed per board', () => {
+    const board = merged()
+
+    board.link_edges = [
+      { board: 'homelab', child: 't_solo', parent: 't_dup' },
+      { board: 'shipping', child: 't_dup', parent: 't_ship_parent' }
+    ]
+
+    const graph = buildGraph(board)
+
+    // homelab's t_dup blocks homelab's t_solo...
+    expect([...downstreamOf(graph, cardKey('t_dup', 'homelab'))]).toEqual([cardKey('t_solo', 'homelab')])
+    // ...and shipping's same-id card is blocked BY something, not blocking.
+    expect([...downstreamOf(graph, cardKey('t_dup', 'shipping'))]).toEqual([])
+    expect([...upstreamOf(graph, cardKey('t_dup', 'shipping'))]).toEqual([cardKey('t_ship_parent', 'shipping')])
+  })
+
+  it('single-board tuple edges still build a bare-id chain (unchanged)', () => {
+    const graph = buildGraph(makeBoard([['a', 'todo'], ['b', 'todo']], [['a', 'b']]))
+
+    expect([...downstreamOf(graph, 'a')]).toEqual(['b'])
+    expect([...upstreamOf(graph, 'b')]).toEqual(['a'])
+  })
+
+  it('tolerates a malformed object edge rather than throwing', () => {
+    const board = merged()
+
+    board.link_edges = [
+      { board: 'homelab', child: '', parent: 't_dup' },
+      null,
+      { board: 'homelab', child: 't_solo', parent: 't_dup' }
+    ] as KanbanBoard['link_edges']
+
+    expect([...downstreamOf(buildGraph(board), cardKey('t_dup', 'homelab'))]).toEqual([cardKey('t_solo', 'homelab')])
   })
 })

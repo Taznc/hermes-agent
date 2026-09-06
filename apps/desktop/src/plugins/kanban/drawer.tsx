@@ -1499,6 +1499,7 @@ function DependencyPicker({
  * degraded state — those rows render as `missing` and can still be cut.
  */
 function DependenciesSection({
+  board: taskBoard,
   detail,
   onLink,
   onOpen,
@@ -1506,6 +1507,10 @@ function DependenciesSection({
   slug,
   task
 }: {
+  /** The card's own board (All Boards mode), from the caller's board cache.
+   *  NOT derivable from `detail` — `GET /tasks/:id` returns the task row as
+   *  stored, and a board slug is not a column on it. */
+  board?: string
   detail: KanbanTaskDetail
   onLink: (parentId: string) => void
   onOpen: (id: string) => void
@@ -1526,8 +1531,11 @@ function DependenciesSection({
     qc.getQueriesData<KanbanBoard>({ queryKey: ['kanban', 'board', slug] }).find(([, data]) => !!data)?.[1]
 
   const index = useMemo(() => indexBoard(board), [board])
-  const blockers = resolveLinks(detail.links.parents, index)
-  const dependants = resolveLinks(detail.links.children, index)
+  // Links live within ONE board, so every id in `detail.links` belongs to this
+  // task's board — resolve against that board's rows, not a same-id card from
+  // somewhere else in the merged All Boards index.
+  const blockers = resolveLinks(detail.links.parents, index, taskBoard)
+  const dependants = resolveLinks(detail.links.children, index, taskBoard)
   const { gating, satisfied } = partitionBlockers(blockers)
   // Headers earn their place only when the split is real.
   const split = gating.length > 0 && satisfied.length > 0
@@ -1535,8 +1543,17 @@ function DependenciesSection({
   const candidates = useMemo(() => {
     const linked = new Set([task.id, ...detail.links.parents, ...detail.links.children])
 
-    return [...index.values()].filter(candidate => !linked.has(candidate.id))
-  }, [detail.links.children, detail.links.parents, index, task.id])
+    return [...index.values()].filter(
+      candidate =>
+        // In All Boards mode `index` is the MERGED cache, so an unfiltered list
+        // offers foreign-board cards the write can never link: `linkTasks` pins
+        // the request to the child's board and the backend rejects an id its DB
+        // has never seen (400 "unknown task(s)"). Offer only same-board cards.
+        // In single-board mode neither side carries a `board`, so this compares
+        // undefined to undefined and every candidate stays offered.
+        (candidate.board ?? undefined) === taskBoard && !linked.has(candidate.id)
+    )
+  }, [detail.links.children, detail.links.parents, index, task.id, taskBoard])
 
   return (
     <Section label={k.dependencies}>
@@ -1985,6 +2002,7 @@ export function TaskDrawer({
             )}
 
             <DependenciesSection
+              board={taskBoard}
               detail={detail}
               onLink={parentId => void mutate(() => linkTasks(parentId, task.id, taskBoard))()}
               onOpen={onOpen}

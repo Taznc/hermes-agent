@@ -295,8 +295,15 @@ function nudged<T>(write: Promise<T>, board?: string): Promise<T> {
 export const patchTask = (id: string, patch: Record<string, unknown>, board?: string) =>
   nudged(call(boardPath(`/tasks/${id}`, board), { method: 'PATCH', body: patch }), board)
 
-export const createTask = (body: Record<string, unknown>) =>
-  nudged(call<{ task: KanbanTask | null; warning?: string }>(withBoard('/tasks'), { method: 'POST', body }))
+/** `board` pins the new task to a specific board. Required from the
+ *  consolidated All Boards view: without it `withBoard` drops the sentinel and
+ *  the server silently creates the card on whatever board happens to be
+ *  ACTIVE, with nothing in the UI saying which. */
+export const createTask = (body: Record<string, unknown>, board?: string) =>
+  nudged(
+    call<{ task: KanbanTask | null; warning?: string }>(boardPath('/tasks', board), { method: 'POST', body }),
+    board
+  )
 
 // Deleting can unblock dependants (a gone parent no longer gates), so it
 // nudges too.
@@ -368,14 +375,19 @@ export const fetchAttachmentDataUrl = (id: number | string, board?: string) =>
 
 /** Upload a pasted image before the task exists (new-task dialog paste flow).
  *  Returns a `token` that travels in `pending_attachment_tokens` on
- *  `createTask` and is promoted into a real attachment server-side. */
-export const stageAttachment = (upload: { filename: string; contentType?: string; bytes: ArrayBuffer }) =>
-  call<{ attachment: StagedAttachment }>(withBoard('/attachments/staged'), { method: 'POST', upload })
+ *  `createTask` and is promoted into a real attachment server-side. Staged
+ *  blobs live in the TARGET board's own staging DB, so `board` must match the
+ *  board the task will be created on or the token won't resolve at promotion. */
+export const stageAttachment = (
+  upload: { filename: string; contentType?: string; bytes: ArrayBuffer },
+  board?: string
+) => call<{ attachment: StagedAttachment }>(boardPath('/attachments/staged', board), { method: 'POST', upload })
 
 /** Remove a staged (pre-submit) image — used by the remove (×) button and by
- *  best-effort cleanup when the new-task dialog closes without submitting. */
-export const deleteStagedAttachment = (token: string) =>
-  call(withBoard(`/attachments/staged/${encodeURIComponent(token)}`), { method: 'DELETE' })
+ *  best-effort cleanup when the new-task dialog closes without submitting.
+ *  `board` must be the board the token was staged against. */
+export const deleteStagedAttachment = (token: string, board?: string) =>
+  call(boardPath(`/attachments/staged/${encodeURIComponent(token)}`, board), { method: 'DELETE' })
 
 export const createBoard = (slug: string, name: string, projectId?: string) =>
   call<{ board: { slug: string } }>('/boards', {
