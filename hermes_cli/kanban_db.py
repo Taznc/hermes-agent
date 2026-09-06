@@ -5165,7 +5165,8 @@ def schedule_task(
                SET status       = 'scheduled',
                    claim_lock   = NULL,
                    claim_expires= NULL,
-                   worker_pid   = NULL
+                   worker_pid   = NULL,
+                   worker_unit  = NULL
              WHERE id = ?
                AND status IN ('todo', 'ready', 'running', 'blocked')
         """
@@ -5197,7 +5198,8 @@ def hold_task(
                SET status       = 'on_hold',
                    claim_lock   = NULL,
                    claim_expires= NULL,
-                   worker_pid   = NULL
+                   worker_pid   = NULL,
+                   worker_unit  = NULL
              WHERE id = ?
                AND status IN ('todo', 'triage', 'ready', 'running', 'blocked', 'scheduled')
         """
