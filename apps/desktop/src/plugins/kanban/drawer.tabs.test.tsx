@@ -163,4 +163,63 @@ describe('tabbed task drawer', () => {
 
     expect(editor.value).toBe(LONG_MARKDOWN)
   })
+
+  it('separates a running attempt age from the card creation age and surfaces a retry count', async () => {
+    const now = Math.floor(Date.now() / 1000)
+    const base = detail()
+
+    fetchTaskMock.mockResolvedValue(
+      detail({
+        runs: [
+          { ended_at: now - 3_600, id: 1, started_at: now - 4_200, status: 'crashed' },
+          { id: 2, started_at: now - 60, status: 'running' }
+        ],
+        task: { ...base.task, created_at: now - 14_400, started_at: now - 60, status: 'running', worker_pid: 42 }
+      })
+    )
+    fetchLogMock.mockResolvedValue({ content: '', exists: false, size_bytes: 0, truncated: false })
+
+    mount(drawer())
+
+    await screen.findByText('metaCreated')
+    expect(screen.getByText('metaRunStarted')).toBeTruthy()
+    expect(screen.getByText('metaRunCount')).toBeTruthy()
+  })
+
+  it('does not add a retry count to a running card with only one run', async () => {
+    const now = Math.floor(Date.now() / 1000)
+    const base = detail()
+
+    fetchTaskMock.mockResolvedValue(
+      detail({
+        runs: [{ id: 1, started_at: now - 60, status: 'running' }],
+        task: { ...base.task, created_at: now - 14_400, started_at: now - 60, status: 'running', worker_pid: 42 }
+      })
+    )
+    fetchLogMock.mockResolvedValue({ content: '', exists: false, size_bytes: 0, truncated: false })
+
+    mount(drawer())
+
+    await screen.findByText('metaCreated')
+    expect(screen.getByText('metaRunStarted')).toBeTruthy()
+    expect(screen.queryByText('metaRunCount')).toBeNull()
+  })
+
+  it('does not show a live run-start row on a terminal card', async () => {
+    const now = Math.floor(Date.now() / 1000)
+    const base = detail()
+
+    fetchTaskMock.mockResolvedValue(
+      detail({
+        runs: [{ ended_at: now - 30, id: 1, started_at: now - 60, status: 'completed' }],
+        task: { ...base.task, created_at: now - 14_400, status: 'done' }
+      })
+    )
+    fetchLogMock.mockResolvedValue({ content: '', exists: false, size_bytes: 0, truncated: false })
+
+    mount(drawer())
+
+    await screen.findByText('metaCreated')
+    expect(screen.queryByText('metaRunStarted')).toBeNull()
+  })
 })
