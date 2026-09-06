@@ -2928,6 +2928,7 @@ export interface UpstreamTranslations {
       refresh: string
       moreActions: string
       branchNewChat: string
+      copyMessage: string
       react: string
       dismissError: string
       /** Layer titles for the structured error card (agent/error_surface.py).

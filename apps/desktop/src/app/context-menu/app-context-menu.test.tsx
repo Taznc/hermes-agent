@@ -91,6 +91,25 @@ describe('resolveDomTarget', () => {
 
     expect(resolveDomTarget(host.querySelector('a')).dialogPortalContainer).toBe(dialog)
   })
+
+  it('resolves the enclosing chat message so the menu can copy it whole', () => {
+    const host = attach(
+      '<div data-slot="aui_assistant-message-content"><p>first line</p><p>second line</p></div>' +
+        '<div data-slot="aui_user-message-root"><span>my prompt</span></div>' +
+        '<p>loose text outside any message</p>'
+    )
+
+    const inAssistant = resolveDomTarget(host.querySelector('[data-slot="aui_assistant-message-content"] p'))
+    const inUser = resolveDomTarget(host.querySelector('[data-slot="aui_user-message-root"] span'))
+    const outside = resolveDomTarget(host.querySelector('div + div + p'))
+
+    // The whole message, from a click on one line inside it.
+    expect(inAssistant.messageText).toContain('first line')
+    expect(inAssistant.messageText).toContain('second line')
+    expect(inUser.messageText).toBe('my prompt')
+    // Text that is not a chat message offers no Copy message.
+    expect(outside.messageText).toBe('')
+  })
 })
 
 describe('AppContextMenu', () => {
