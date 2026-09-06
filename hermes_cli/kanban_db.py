@@ -3531,7 +3531,7 @@ def request_review(
     claim is only cleared with proof of ownership (``expected_run_id``) or
     ``force=True``. Returns ``bool``, or ``(ok, reason)`` with ``with_reason``.
 
-    A ``model_override``/``provider_override`` pinned for the IMPLEMENTER is
+    A ``model_override``/``provider_override``/``reasoning_effort`` pinned for the IMPLEMENTER is
     card-scoped in storage but semantically implementation-scoped: a review
     dispatched to a *different* profile must run that profile's own
     configured model, never the implementer's pin (the pin silently
@@ -3558,7 +3558,7 @@ def request_review(
             return _ret(False, "parent dependencies are not satisfied")
         trow = conn.execute(
             "SELECT assignee, status, claim_lock, current_run_id, "
-            "model_override, provider_override "
+            "model_override, provider_override, reasoning_effort "
             "FROM tasks WHERE id = ?", (task_id,),
         ).fetchone()
         if trow is None:
@@ -3592,11 +3592,12 @@ def request_review(
         cross_profile = reviewer is not None and reviewer != implementer
         implementer_model_override = trow["model_override"]
         implementer_provider_override = trow["provider_override"]
+        implementer_reasoning_effort = trow["reasoning_effort"]
         override_sql = ""
         override_params: tuple[Any, ...] = ()
         if cross_profile:
-            override_sql = ", model_override = ?, provider_override = ?"
-            override_params = (reviewer_model_override, reviewer_provider_override)
+            override_sql = ", model_override = ?, provider_override = ?, reasoning_effort = ?"
+            override_params = (reviewer_model_override, reviewer_provider_override, None)
         assignee_sql = ", assignee = ?" if reviewer is not None else ""
         run_guard = "" if expected_run_id is None else " AND current_run_id = ?"
         params: tuple[Any, ...] = (
@@ -3636,6 +3637,8 @@ def request_review(
             # implementer's pin on the round trip back — see docstring.
             event_payload["implementer_model_override"] = implementer_model_override
             event_payload["implementer_provider_override"] = implementer_provider_override
+            if implementer_reasoning_effort is not None:
+                event_payload["implementer_reasoning_effort"] = implementer_reasoning_effort
         _append_event(conn, task_id, "review_requested", event_payload, run_id=run_id)
     return _ret(True)
 
@@ -3715,18 +3718,32 @@ def request_changes(
             assigned_payload = _json_dict(assigned_event["payload"])
             if (
                 assigned_payload.get("source") == "kanban.default_reviewer"
-                and "implementer_model_override" in assigned_payload
+                and (
+                    "implementer_model_override" in assigned_payload
+                    or "implementer_reasoning_effort" in assigned_payload
+                )
             ):
                 override_payload = assigned_payload
 
-        override_sql = ""
-        override_params: tuple[Any, ...] = ()
+        override_sets: list[str] = []
+        override_params_list: list[Any] = []
         if "implementer_model_override" in override_payload:
-            override_sql = ", model_override = ?, provider_override = ?"
-            override_params = (
-                _nonblank_str(override_payload.get("implementer_model_override")),
-                _nonblank_str(override_payload.get("implementer_provider_override")),
+            override_sets.extend(["model_override = ?", "provider_override = ?"])
+            override_params_list.extend(
+                [
+                    _nonblank_str(override_payload.get("implementer_model_override")),
+                    _nonblank_str(override_payload.get("implementer_provider_override")),
+                ]
             )
+        if "implementer_reasoning_effort" in override_payload:
+            override_sets.append("reasoning_effort = ?")
+            override_params_list.append(
+                normalize_reasoning_effort(override_payload.get("implementer_reasoning_effort"))
+            )
+        override_sql = ""
+        if override_sets:
+            override_sql = ", " + ", ".join(override_sets)
+        override_params: tuple[Any, ...] = tuple(override_params_list)
 
         new_status = _landing_status_after_parents(conn, task_id)
         # consecutive_failures deliberately PRESERVED: a review transition is
@@ -3887,9 +3904,9 @@ def unblock_task(conn: sqlite3.Connection, task_id: str) -> bool:
 
 def reopen_review_task(conn: sqlite3.Connection, task_id: str) -> bool:
     """``review`` -> ``ready``/``todo`` so the implementer re-runs on the new
-    comments; restores the implementer from the ``review_requested`` event.
-    Preserves ``consecutive_failures`` and the block loop counter (review is
-    not a block; only :func:`complete_task` clears them)."""
+    comments; restores the implementer's model/provider/reasoning pin from the
+    latest review handoff. Preserves ``consecutive_failures`` and the block loop
+    counter (review is not a block; only :func:`complete_task` clears them)."""
     now = int(time.time())
     with write_txn(conn):
         _reclaim_dangling_run(
@@ -3900,13 +3917,46 @@ def reopen_review_task(conn: sqlite3.Connection, task_id: str) -> bool:
         review_event = _latest_event(conn, task_id, "review_requested")
         handoff = _json_dict(_row_get(review_event, "payload"))
         implementer = _nonblank_str(handoff.get("implementer"))
-        params: tuple[Any, ...] = (new_status, *((implementer,) if implementer else ()), task_id)
+        assigned_event = _latest_event(conn, task_id, "assigned")
+        if (
+            assigned_event is not None
+            and int(assigned_event["id"]) > int(review_event["id"])
+        ):
+            assigned_payload = _json_dict(assigned_event["payload"])
+            if (
+                assigned_payload.get("source") == "kanban.default_reviewer"
+                and (
+                    "implementer_model_override" in assigned_payload
+                    or "implementer_reasoning_effort" in assigned_payload
+                )
+            ):
+                handoff = assigned_payload
+        override_sets: list[str] = []
+        override_params_list: list[Any] = []
+        if "implementer_model_override" in handoff:
+            override_sets.extend(["model_override = ?", "provider_override = ?"])
+            override_params_list.extend(
+                [
+                    _nonblank_str(handoff.get("implementer_model_override")),
+                    _nonblank_str(handoff.get("implementer_provider_override")),
+                ]
+            )
+        if "implementer_reasoning_effort" in handoff:
+            override_sets.append("reasoning_effort = ?")
+            override_params_list.append(normalize_reasoning_effort(handoff.get("implementer_reasoning_effort")))
+        params: tuple[Any, ...] = (
+            new_status,
+            *((implementer,) if implementer else ()),
+            *override_params_list,
+            task_id,
+        )
         cur = conn.execute(
             # consecutive_failures deliberately PRESERVED: review reopen is not
             # a success signal; only complete_task resets the breaker (#35072).
             "UPDATE tasks SET status = ?, current_run_id = NULL, "
             "claim_lock = NULL, claim_expires = NULL, worker_pid = NULL "
             + (", assignee = ?" if implementer else "")
+            + (", " + ", ".join(override_sets) if override_sets else "")
             + " WHERE id = ? AND status = 'review'",
             params,
         )

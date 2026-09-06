@@ -172,3 +172,87 @@ def test_route_provenance_survives_review_roundtrip(kanban_home, routing_decisio
         assert reviewed is not None
         assert reviewed.route_source == "mechanical"
         assert reviewed.route_name == "mechanical"
+
+
+def test_routing_classifier_runs_only_on_create_across_lifecycle(
+    kanban_home, routing_decision, monkeypatch
+):
+    calls: list[dict] = []
+
+    def _fake_resolver(**kwargs):
+        calls.append(kwargs)
+        return routing_decision
+
+    monkeypatch.setattr("hermes_cli.kanban_model_routing.resolve_kanban_model_route", _fake_resolver)
+
+    cli_args = Namespace(
+        workspace=None,
+        branch=None,
+        max_runtime=None,
+        max_retries=None,
+        title="Lifecycle routing",
+        body="compact docs tweak",
+        assignee="claudeprimary",
+        created_by="tester",
+        tenant=None,
+        priority=0,
+        parent=[],
+        triage=False,
+        idempotency_key=None,
+        skills=[],
+        model_override=None,
+        provider_override=None,
+        reasoning_effort=None,
+        goal_mode=False,
+        goal_max_turns=None,
+        initial_status="running",
+        json=False,
+    )
+    assert kanban_cli._cmd_create(cli_args) == 0
+    task = _latest_task_by_title("Lifecycle routing")
+    assert len(calls) == 1
+    assert task.route_source == "mechanical"
+    assert task.reasoning_effort == "medium"
+
+    with kbc.connect() as conn:
+        claimed = kb.claim_task(conn, task.id)
+        assert claimed is not None
+
+        conn.execute("UPDATE tasks SET claim_expires = 0 WHERE id = ?", (task.id,))
+        assert kb.release_stale_claims(conn) == 1
+        assert len(calls) == 1
+
+        retried = kb.claim_task(conn, task.id)
+        assert retried is not None
+        assert kb.request_review(
+            conn,
+            task.id,
+            summary="ready for review",
+            reviewer="reviewer",
+            expected_run_id=retried.current_run_id,
+        ) is True
+        assert len(calls) == 1
+
+        reviewed = kb.claim_review_task(conn, task.id)
+        assert reviewed is not None
+        ok, implementer = kb.request_changes(
+            conn, task.id, reason="needs another pass", expected_run_id=reviewed.current_run_id,
+        )
+        assert ok is True
+        assert implementer == "claudeprimary"
+        assert len(calls) == 1
+
+        assert kb.block_task(conn, task.id, reason="pause") is True
+        assert kb.unblock_task(conn, task.id) is True
+        assert len(calls) == 1
+
+        retried_again = kb.claim_task(conn, task.id)
+        assert retried_again is not None
+        assert kb.request_review(
+            conn,
+            task.id,
+            summary="re-review",
+            reviewer="reviewer",
+            expected_run_id=retried_again.current_run_id,
+        ) is True
+        assert len(calls) == 1

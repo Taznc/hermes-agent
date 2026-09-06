@@ -2107,13 +2107,13 @@ def _apply_default_reviewer(
     This IS a cross-profile handoff exactly like an explicit
     ``kanban_request_review(reviewer=...)`` — the reassigned reviewer must
     run its own profile's model, never the implementer's pin. So
-    ``model_override``/``provider_override`` are cleared here too (mirroring
-    ``kanban_db.request_review``'s ``cross_profile`` branch), and the
-    implementer's values are snapshotted onto the SAME event this function
-    already writes so ``request_changes`` can restore them on the round trip
-    back (it reads the latest ``assigned`` event's
-    ``implementer_model_override``/``implementer_provider_override`` the
-    same way it reads a ``review_requested`` event's).
+    ``model_override``/``provider_override``/``reasoning_effort`` are cleared
+    here too (mirroring ``kanban_db.request_review``'s ``cross_profile``
+    branch), and the implementer's values are snapshotted onto the SAME event
+    this function already writes so ``request_changes`` can restore them on the
+    round trip back (it reads the latest ``assigned`` event's
+    ``implementer_model_override``/``implementer_provider_override`` the same
+    way it reads a ``review_requested`` event's).
 
     ``dry_run`` reports without writing. Returns False when the write failed
     or the row was no longer a ``review`` row to reassign (status changed
@@ -2124,16 +2124,17 @@ def _apply_default_reviewer(
     try:
         with _kb.write_txn(conn):
             row = conn.execute(
-                "SELECT model_override, provider_override FROM tasks WHERE id = ?",
+                "SELECT model_override, provider_override, reasoning_effort FROM tasks WHERE id = ?",
                 (task_id,),
             ).fetchone()
             if row is None:
                 return False
             implementer_model_override = row["model_override"]
             implementer_provider_override = row["provider_override"]
+            implementer_reasoning_effort = row["reasoning_effort"]
             cur = conn.execute(
-                "UPDATE tasks SET assignee = ?, model_override = NULL, provider_override = NULL "
-                "WHERE id = ? AND status = 'review'",
+                "UPDATE tasks SET assignee = ?, model_override = NULL, provider_override = NULL, "
+                "reasoning_effort = NULL WHERE id = ? AND status = 'review'",
                 (reviewer, task_id),
             )
             if cur.rowcount != 1:
@@ -2149,6 +2150,8 @@ def _apply_default_reviewer(
             if implementer_model_override is not None or implementer_provider_override is not None:
                 payload["implementer_model_override"] = implementer_model_override
                 payload["implementer_provider_override"] = implementer_provider_override
+            if implementer_reasoning_effort is not None:
+                payload["implementer_reasoning_effort"] = implementer_reasoning_effort
             _kb._append_event(conn, task_id, "assigned", payload)
     except Exception:
         _kb._log.debug(

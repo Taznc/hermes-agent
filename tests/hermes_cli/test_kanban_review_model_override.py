@@ -76,6 +76,7 @@ def test_cross_profile_review_does_not_inherit_implementer_model(
         tid = kb.create_task(
             conn, title="impl", assignee="claudeprimary",
             model_override="claude-opus-5", provider_override="anthropic",
+            reasoning_effort="medium",
         )
         claimed = kb.claim_task(conn, tid)
         assert kb.request_review(
@@ -89,11 +90,13 @@ def test_cross_profile_review_does_not_inherit_implementer_model(
         # DB columns are cleared for the cross-profile review run.
         assert t.model_override is None
         assert t.provider_override is None
+        assert t.reasoning_effort is None
 
         review_run = kb.claim_review_task(conn, tid)
         assert review_run is not None
         assert review_run.model_override is None
         assert review_run.provider_override is None
+        assert review_run.reasoning_effort is None
 
         cmd = _spawn_and_capture(monkeypatch, tmp_path, review_run)
         model, provider = _model_flags(cmd)
@@ -113,6 +116,7 @@ def test_request_changes_restores_implementer_override(
         tid = kb.create_task(
             conn, title="impl", assignee="claudeprimary",
             model_override="claude-opus-5", provider_override="anthropic",
+            reasoning_effort="medium",
         )
         claimed = kb.claim_task(conn, tid)
         assert kb.request_review(
@@ -122,6 +126,7 @@ def test_request_changes_restores_implementer_override(
 
         review_run = kb.claim_review_task(conn, tid)
         assert review_run is not None
+        assert review_run.reasoning_effort is None
         ok, implementer = kb.request_changes(
             conn, tid, reason="needs work", expected_run_id=review_run.current_run_id,
         )
@@ -132,6 +137,7 @@ def test_request_changes_restores_implementer_override(
         assert t.assignee == "claudeprimary"
         assert t.model_override == "claude-opus-5", "implementer's pin must be restored"
         assert t.provider_override == "anthropic"
+        assert t.reasoning_effort == "medium"
 
         # And the restored pin actually reaches the worker argv on reclaim.
         reclaimed = kb.claim_task(conn, tid, claimer="claudeprimary:retry")
@@ -239,6 +245,7 @@ def test_same_profile_review_keeps_override(
         tid = kb.create_task(
             conn, title="impl", assignee="claudeprimary",
             model_override="claude-opus-5", provider_override="anthropic",
+            reasoning_effort="ultra",
         )
         claimed = kb.claim_task(conn, tid)
         # Explicit self-review: reviewer == implementer.
@@ -250,9 +257,11 @@ def test_same_profile_review_keeps_override(
         assert t.assignee == "claudeprimary"
         assert t.model_override == "claude-opus-5"
         assert t.provider_override == "anthropic"
+        assert t.reasoning_effort == "ultra"
 
         review_run = kb.claim_review_task(conn, tid)
         assert review_run.model_override == "claude-opus-5"
+        assert review_run.reasoning_effort == "ultra"
         cmd = _spawn_and_capture(monkeypatch, tmp_path, review_run)
         model, provider = _model_flags(cmd)
         assert model == "claude-opus-5"
