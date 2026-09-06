@@ -2767,6 +2767,11 @@ export const zhHant = defineForkLocale(forkZhHant, {
       address: '網址',
       addressPlaceholder: '輸入網址',
       blankPageBody: '在上方輸入網址開始瀏覽，或請 Hermes 開啟頁面。',
+      noGuestTitle: '頁面會在瀏覽器分頁中開啟',
+      noGuestBody:
+        '此版本的 Hermes 在瀏覽器中執行，無法在窗格內嵌入其他網站。在上方輸入網址，Hermes 會在新的瀏覽器分頁中開啟。',
+      noGuestOpen: url => `在瀏覽器分頁中開啟 ${url}`,
+      openBlocked: '瀏覽器封鎖了新分頁。請為此頁面允許彈出視窗後再試一次。',
       finishedRestarting: message => `Hermes 已完成預覽伺服器重新啟動${message ? `：${message}` : ''}`,
       failedRestarting: message => `伺服器重新啟動失敗：${message}`,
       unknownError: '未知錯誤',

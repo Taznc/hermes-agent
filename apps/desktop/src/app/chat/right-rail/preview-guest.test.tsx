@@ -17,7 +17,7 @@ import { closeRightRail, openPreview, type PreviewTarget } from '@/store/preview
 import { $connection, $selectedStoredSessionId } from '@/store/session'
 
 import { actOnActivePreview } from './preview-act'
-import { activePreviewGuestMissing, previewGuestSupported } from './preview-guest'
+import { activePreviewGuestMissing, openInBrowserTab, previewGuestSupported } from './preview-guest'
 import { activePreviewInput } from './preview-input'
 import { PreviewPane } from './preview-pane'
 import { readActivePreview } from './preview-reader'
@@ -28,6 +28,8 @@ vi.mock('./real-profile-consent-dialog', () => ({
 }))
 
 const PAGE_URL = 'http://localhost:5174'
+
+const desktopWindow = window as unknown as { hermesDesktop?: Window['hermesDesktop'] }
 
 function urlTarget(): PreviewTarget {
   return { kind: 'url', label: 'Browser', source: PAGE_URL, url: PAGE_URL }
@@ -221,5 +223,65 @@ describe('preview agent tools with an Electron guest', () => {
       url: `${PAGE_URL}/app`
     })
     expect(page?.note).toBeUndefined()
+  })
+})
+
+/**
+ * The predicate and the tab-opener as UNITS — the two cases above prove them
+ * through the mounted pane, these pin the module's own contract (what the probe
+ * refuses to look at, and each rung of the open ladder including its failure).
+ */
+describe('previewGuestSupported', () => {
+  afterEach(() => {
+    cleanup()
+    vi.restoreAllMocks()
+    delete desktopWindow.hermesDesktop
+  })
+
+  // The probe answers "can this document host a guest", never "who launched
+  // me" — a UA/hostname/platform test would go stale the day the web build
+  // gains a real guest, and lies today for anyone spoofing either.
+  it('ignores the user agent and the hostname', () => {
+    vi.spyOn(navigator, 'userAgent', 'get').mockReturnValue(
+      'Mozilla/5.0 (X11; Linux x86_64) HermesDesktop/1.0 Electron/38.0.0'
+    )
+    desktopWindow.hermesDesktop = { platform: 'darwin' } as unknown as Window['hermesDesktop']
+
+    expect(previewGuestSupported()).toBe(false)
+  })
+})
+
+describe('openInBrowserTab', () => {
+  afterEach(() => {
+    cleanup()
+    vi.restoreAllMocks()
+    delete desktopWindow.hermesDesktop
+  })
+
+  it('prefers the app bridge, which is the top-level-tab route in both builds', async () => {
+    const openExternal = vi.fn(async () => undefined)
+    const open = vi.spyOn(window, 'open')
+    desktopWindow.hermesDesktop = { openExternal } as unknown as Window['hermesDesktop']
+
+    await openInBrowserTab('https://google.com', 'blocked')
+
+    expect(openExternal).toHaveBeenCalledWith('https://google.com')
+    expect(open).not.toHaveBeenCalled()
+  })
+
+  it('falls back to window.open with the opener severed when no bridge is installed', async () => {
+    const open = vi.spyOn(window, 'open').mockReturnValue({} as Window)
+
+    await openInBrowserTab('https://google.com', 'blocked')
+
+    expect(open).toHaveBeenCalledWith('https://google.com', '_blank', 'noopener,noreferrer')
+  })
+
+  // A popup blocker returns null. That is a real failure the user has to see,
+  // not something to swallow into another silent no-op.
+  it('rejects with the caller-supplied copy when the browser blocks the tab', async () => {
+    vi.spyOn(window, 'open').mockReturnValue(null)
+
+    await expect(openInBrowserTab('https://google.com', 'Allow pop-ups.')).rejects.toThrow('Allow pop-ups.')
   })
 })
