@@ -52,6 +52,7 @@ describe('local-runtime-jobs poll cancellation', () => {
   // unrelated test (the moving-failure bug this test exists to prevent).
   it('an in-flight poll cancelled mid-request never applies its result', async () => {
     let releaseResponse: (jobs: readonly LocalRuntimeJob[]) => void = () => {}
+
     const inFlight = new Promise<{ jobs: readonly LocalRuntimeJob[] }>(resolve => {
       releaseResponse = jobs => resolve({ jobs })
     })
