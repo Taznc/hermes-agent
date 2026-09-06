@@ -2807,6 +2807,10 @@ export interface UpstreamTranslations {
       address: string
       addressPlaceholder: string
       blankPageBody: string
+      noGuestTitle: string
+      noGuestBody: string
+      noGuestOpen: (url: string) => string
+      openBlocked: string
       finishedRestarting: (message?: string) => string
       failedRestarting: (message: string) => string
       unknownError: string

@@ -13,8 +13,9 @@
  */
 
 import { $rightRailActiveTabId } from '@/store/layout'
-import { $previewTabs } from '@/store/preview'
+import { $previewTabs, type PreviewTarget } from '@/store/preview'
 
+import { PREVIEW_NO_GUEST_READ, previewGuestSupported } from './preview-guest'
 import { nudgeOverlay } from './preview-nudge'
 
 export interface PreviewReadOptions {
@@ -75,6 +76,23 @@ function windowText(
   return { ...base, end: to, start: from, text: text.slice(from, to), total_chars: total }
 }
 
+/** Why this tab has no live text, in words the agent can act on. The URL arm is
+ *  two different facts wearing one shape: an Electron pane whose guest is still
+ *  booting is worth retrying, while a build with no guest engine at all will
+ *  never answer — and telling the second one to "retry in a moment" is how a
+ *  missing capability got reported as a slow one. */
+function identityNote(kind: PreviewTarget['kind']): string {
+  if (kind === 'file') {
+    return 'File preview — read the file itself with read_file.'
+  }
+
+  if (kind === 'artifact') {
+    return 'Generated artifact — its content is in the conversation that produced it.'
+  }
+
+  return previewGuestSupported() ? 'The page has not finished loading — retry in a moment.' : PREVIEW_NO_GUEST_READ
+}
+
 /** Read the ACTIVE preview tab. Null only when no tab is open at all. */
 export async function readActivePreview(opts: PreviewReadOptions = {}): Promise<PreviewReadResult | null> {
   const tabs = $previewTabs.get()
@@ -109,18 +127,14 @@ export async function readActivePreview(opts: PreviewReadOptions = {}): Promise<
     }
   }
 
-  // No live webview behind the tab (a file peek, an artifact, or a page still
-  // booting): answer with the tab's identity so the agent knows what's on
-  // screen and which of its own tools reads the content directly.
+  // No live webview behind the tab (a file peek, an artifact, a page still
+  // booting, or a build with no guest engine at all): answer with the tab's
+  // identity so the agent knows what's on screen and which of its own tools
+  // reaches that content.
   return windowText(
     {
       kind: target.kind,
-      note:
-        target.kind === 'file'
-          ? 'File preview — read the file itself with read_file.'
-          : target.kind === 'artifact'
-            ? 'Generated artifact — its content is in the conversation that produced it.'
-            : 'The page has not finished loading — retry in a moment.',
+      note: identityNote(target.kind),
       path: target.path,
       title: target.label,
       url: target.url

@@ -2869,6 +2869,11 @@ export const ja = defineForkLocale(forkJa, {
       address: 'アドレス',
       addressPlaceholder: 'アドレスを入力',
       blankPageBody: '上のアドレス欄に入力するか、Hermes にページを開くよう頼んでください。',
+      noGuestTitle: 'ページはブラウザーのタブで開きます',
+      noGuestBody:
+        'このビルドの Hermes はブラウザー上で動作するため、他のサイトをペイン内に埋め込めません。上にアドレスを入力すると、Hermes が新しいブラウザータブで開きます。',
+      noGuestOpen: url => `${url} をブラウザーのタブで開く`,
+      openBlocked: 'ブラウザーが新しいタブをブロックしました。このページのポップアップを許可してからもう一度お試しください。',
       finishedRestarting: message =>
         `Hermes がプレビューサーバーの再起動を完了しました${message ? `: ${message}` : ''}`,
       failedRestarting: message => `サーバーの再起動に失敗しました: ${message}`,

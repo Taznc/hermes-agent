@@ -65,6 +65,7 @@ import {
 import { type ConsoleEntry } from './preview-console-state'
 import { previewConsoleState } from './preview-console-store'
 import { LocalFilePreview, PreviewEmptyState } from './preview-file'
+import { openInBrowserTab, previewGuestSupported } from './preview-guest'
 import { type PreviewInputEvent, registerPreviewInput } from './preview-input'
 import { PREVIEW_BROWSER_ATTR, registerPreviewNav } from './preview-nav'
 import { registerPreviewPageReader } from './preview-reader'
@@ -281,6 +282,12 @@ export function PreviewPane({ embedded = false, onRestartServer, reloadRequest =
   const isWebPreview =
     target.kind !== 'artifact' &&
     (target.kind === 'url' || (target.previewKind === 'html' && target.renderMode !== 'source'))
+
+  // Can this renderer actually host an in-pane guest? Electron yes; the
+  // web-served build no, where `<webview>` is an inert unknown element. Probed
+  // once per pane so the render, the effects, and the bar all branch off one
+  // answer.
+  const guestSupported = useMemo(() => previewGuestSupported(), [])
 
   const isRemoteHtmlTarget =
     target.kind === 'file' && target.previewKind === 'html' && Boolean(target.dataUrl || target.transient)
@@ -691,6 +698,23 @@ export function PreviewPane({ embedded = false, onRestartServer, reloadRequest =
   const navigateTo = useCallback(
     (url: string) => {
       setLoadError(null)
+
+      // No guest to navigate: this is the web build, where `<webview>` is an
+      // inert element. The address still works — it just opens as a normal
+      // top-level tab, the same route the pane's external-open affordance
+      // takes. No reach probe on this path: that opens an SSH forward in
+      // Electron's main process, which is exactly what does not exist here,
+      // and the tab loads on the user's own machine either way.
+      if (!guestSupported) {
+        setCurrentUrl(url)
+        setLoading(false)
+        void openInBrowserTab(url, copy.openBlocked).catch((error: unknown) =>
+          notifyError(error, t.preview.unavailable)
+        )
+
+        return
+      }
+
       // The reach probe below is a round-trip of its own, and `did-start-loading`
       // can't fire until it resolves — so own the loading state from the moment
       // we accept the address, or the bar sits idle over a request in flight.
@@ -715,7 +739,7 @@ export function PreviewPane({ embedded = false, onRestartServer, reloadRequest =
           setLoading(false)
         })
     },
-    [copy.unreachableDescription]
+    [copy.openBlocked, copy.unreachableDescription, guestSupported, t.preview.unavailable]
   )
 
   const goBack = useCallback(() => {
@@ -737,20 +761,30 @@ export function PreviewPane({ embedded = false, onRestartServer, reloadRequest =
   // Gestures that land on the app's chrome (⌘R from the address bar, a mouse
   // button over the frame). A gesture made INSIDE the page is answered by main
   // against the focused guest — this renderer can't see into a webview.
+  //
+  // All four registries below publish channels INTO the guest page, so they
+  // are only meaningful where a guest exists. Registering them without one
+  // would hand the agent's preview tools handles that answer every call with a
+  // failure — worse than reporting no live preview at all.
   useEffect(() => {
-    if (!isWebPreview || isRemoteHtml || !tabId) {
+    if (!isWebPreview || isRemoteHtml || !tabId || !guestSupported) {
       return
     }
 
     return registerPreviewNav(tabId, { back: goBack, forward: goForward, reload: reloadPreview })
-  }, [goBack, goForward, isRemoteHtml, isWebPreview, reloadPreview, tabId])
+  }, [goBack, goForward, guestSupported, isRemoteHtml, isWebPreview, reloadPreview, tabId])
 
   // Publish the PAGE reader for this tab (the read_preview tool): extract the
   // rendered page's title + visible text from the webview. innerText (not
   // textContent) so hidden nodes and script/style bodies stay out, matching
   // what the user actually sees.
+  //
+  // A build with no guest engine registers nothing at all. Registering a reader
+  // that can only throw is the failure this guard exists to prevent: the tool
+  // would answer "the page has not finished loading — retry" forever, which
+  // reads as a slow page rather than an absent capability.
   useEffect(() => {
-    if (!isWebPreview || !tabId) {
+    if (!isWebPreview || !tabId || !guestSupported) {
       return
     }
 
@@ -768,13 +802,13 @@ export function PreviewPane({ embedded = false, onRestartServer, reloadRequest =
         ...guestPage(webview)
       }
     })
-  }, [isWebPreview, tabId])
+  }, [guestSupported, isWebPreview, tabId])
 
   // Publish the SCRIPT runner for this tab: the one channel into the guest
   // page, shared by the tour tool (injected driver.js walkthroughs) and the
   // drive_preview tool (clicking, typing, scrolling the page the user sees).
   useEffect(() => {
-    if (!isWebPreview || !tabId) {
+    if (!isWebPreview || !tabId || !guestSupported) {
       return
     }
 
@@ -787,14 +821,14 @@ export function PreviewPane({ embedded = false, onRestartServer, reloadRequest =
 
       return webview.executeJavaScript(code)
     })
-  }, [isWebPreview, tabId])
+  }, [guestSupported, isWebPreview, tabId])
 
   // Publish the INPUT channel for this tab. Same idea as the script runner, but
   // it carries real Chromium input rather than script — the agent's clicks and
   // keystrokes arrive as trusted events, so the page hovers, focuses and reacts
   // exactly as it would under a human hand.
   useEffect(() => {
-    if (!isWebPreview || isRemoteHtml || !tabId) {
+    if (!isWebPreview || isRemoteHtml || !tabId || !guestSupported) {
       return
     }
 
@@ -813,7 +847,7 @@ export function PreviewPane({ embedded = false, onRestartServer, reloadRequest =
         webview.sendInputEvent(event)
       }
     })
-  }, [isRemoteHtml, isWebPreview, tabId])
+  }, [guestSupported, isRemoteHtml, isWebPreview, tabId])
 
   // eslint-disable-next-line no-restricted-syntax -- legitimate non-atom ref write (see eslint rule comment)
   useEffect(() => {
@@ -1014,7 +1048,7 @@ export function PreviewPane({ embedded = false, onRestartServer, reloadRequest =
     consoleState.reset()
     setLoading(true)
 
-    if (!isWebPreview || isRemoteHtml) {
+    if (!isWebPreview || isRemoteHtml || !guestSupported) {
       setLoading(false)
 
       return
@@ -1235,7 +1269,7 @@ export function PreviewPane({ embedded = false, onRestartServer, reloadRequest =
       webview.remove()
       setAnnotate(session => (session.mode ? { ...endAnnotateMode(session), stack: emptyAnnotateStack() } : session))
     }
-  }, [appendConsoleEntry, consoleState, copy, isRemoteHtml, isWebPreview, tabId, target.kind, target.url])
+  }, [appendConsoleEntry, consoleState, copy, guestSupported, isRemoteHtml, isWebPreview, tabId, target.kind, target.url])
 
   return (
     <aside
@@ -1284,6 +1318,12 @@ export function PreviewPane({ embedded = false, onRestartServer, reloadRequest =
         )}
 
         {isWebPreview && !isRemoteHtml && (
+          /* Annotate, console and DevTools all act THROUGH the guest
+             (capturePreview needs getWebContentsId; the console panel is fed by
+             `console-message`; DevTools is openDevTools()). Without a guest they
+             are hidden rather than left as buttons that do nothing. Back /
+             Forward stay mounted but permanently disabled: `history` can only be
+             set from guest events. */
           <PreviewBrowserBar
             annotateMode={annotate.mode}
             canGoBack={history.back}
@@ -1298,17 +1338,20 @@ export function PreviewPane({ embedded = false, onRestartServer, reloadRequest =
             onNavigate={navigateTo}
             onOpenExternal={
               !isBrowserWindow() && !canOpenBrowserWindow()
-                ? () => void window.hermesDesktop?.openExternal(currentUrl)
+                ? () =>
+                    void openInBrowserTab(currentUrl, copy.openBlocked).catch((error: unknown) =>
+                      notifyError(error, t.preview.unavailable)
+                    )
                 : undefined
             }
             onPopIn={isBrowserWindow() ? () => window.close() : undefined}
             onPopOut={
               isBrowserWindow() || !tabId || !canOpenBrowserWindow() ? undefined : () => popOutBrowserTab(tabId)
             }
-            onReload={reloadPreview}
-            onToggleAnnotate={toggleAnnotate}
-            onToggleConsole={() => consoleState.setOpen(open => !open)}
-            onToggleDevTools={toggleDevTools}
+            onReload={guestSupported ? reloadPreview : undefined}
+            onToggleAnnotate={guestSupported ? toggleAnnotate : undefined}
+            onToggleConsole={guestSupported ? () => consoleState.setOpen(open => !open) : undefined}
+            onToggleDevTools={guestSupported ? toggleDevTools : undefined}
             url={currentUrl}
           />
         )}
@@ -1343,10 +1386,25 @@ export function PreviewPane({ embedded = false, onRestartServer, reloadRequest =
             ) : (
               <LocalFilePreview reloadKey={localReloadKey} target={target} />
             ))}
-          {isBlankPage && (
+          {isBlankPage && guestSupported && (
             <div className="absolute inset-0 grid bg-background">
               <PanelEmpty description={copy.blankPageBody} icon="globe" />
             </div>
+          )}
+          {/* No guest: say so, and keep a working action. The address bar above
+              still normalizes and opens URLs; this restates that in the pane
+              the user is looking at (and gives the current address a button)
+              instead of leaving an empty rectangle that reads as broken. */}
+          {isWebPreview && !isRemoteHtml && !guestSupported && !loadError && (
+            <PreviewEmptyState
+              body={copy.noGuestBody}
+              primaryAction={
+                currentUrl && !/^about:blank\/?$/i.test(currentUrl)
+                  ? { label: copy.noGuestOpen(compactUrl(currentUrl)), onClick: () => navigateTo(currentUrl) }
+                  : undefined
+              }
+              title={copy.noGuestTitle}
+            />
           )}
           {loadError && (
             <PreviewLoadError
@@ -1376,7 +1434,7 @@ export function PreviewPane({ embedded = false, onRestartServer, reloadRequest =
             />
           ) : null}
 
-          {isWebPreview && !isRemoteHtml && consoleOpen && (
+          {isWebPreview && !isRemoteHtml && guestSupported && consoleOpen && (
             <PreviewConsolePanel
               consoleBodyRef={consoleBodyRef}
               consoleShouldStickRef={consoleShouldStickRef}

@@ -97,8 +97,15 @@ describe('scheduleResumeAtReset', () => {
     const payload = mockCreateCronJob.mock.calls[0][0]
     expect(payload.schedule).toBe(new Date(resetAt * 1000).toISOString())
     expect(payload.name).toBe('hermes-rate-limit-resume:msg-1')
-    expect(payload.prompt).toContain('sess-1')
-    // No secrets/transcript content — just a session id + instruction.
+    expect(payload.resume_session_id).toBe('sess-1')
+    expect(payload.prompt).toBe('Retry the last failed turn now that the provider rate limit has reset.')
+    // Session targeting is structural, not an English request to a fresh cron session.
+    expect(payload.prompt).not.toContain('Resume Hermes session')
+    // resume_session_id requires an agent job, not a monitor/no_agent mode.
+    expect(payload).not.toHaveProperty('no_agent')
+    expect(payload).not.toHaveProperty('monitor_script')
+    expect(payload).not.toHaveProperty('monitor_url')
+    // No secrets/transcript content — just a retry instruction.
     expect(payload.prompt).not.toMatch(/api[-_]?key/i)
 
     expect($scheduledResumeJobs.get()['msg-1']).toEqual({ jobId: 'job-1', resetAt })
