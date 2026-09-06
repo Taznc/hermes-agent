@@ -1464,7 +1464,6 @@ _PLUGIN_COMPAT_LAZY = {
     'BackupRequest': ('hermes_cli.web_models', 'BackupRequest'),
     'BulkDeleteSessions': ('hermes_cli.web_models', 'BulkDeleteSessions'),
     'CONFIG_SCHEMA': ('hermes_cli.web_server_config', 'CONFIG_SCHEMA'),
-    'ChatFileUpload': ('hermes_cli.web_models', 'ChatFileUpload'),
     'ChatImageUpload': ('hermes_cli.web_models', 'ChatImageUpload'),
     'ConfigUpdate': ('hermes_cli.web_models', 'ConfigUpdate'),
     'CredentialPoolAdd': ('hermes_cli.web_models', 'CredentialPoolAdd'),
@@ -1602,18 +1601,13 @@ _PLUGIN_COMPAT_LAZY = {
     'find_provider_entry': ('hermes_cli.config', 'find_provider_entry'),
     'format_docker_update_message': ('hermes_cli.config', 'format_docker_update_message'),
     'fs_default_cwd': ('hermes_cli.web_routers.files', 'fs_default_cwd'),
-    'fs_desktop_plugins_root': ('hermes_cli.web_routers.files', 'fs_desktop_plugins_root'),
-    'fs_agent_plugins_root': ('hermes_cli.web_routers.files', 'fs_agent_plugins_root'),
     'fs_download': ('hermes_cli.web_routers.files', 'fs_download'),
     'fs_git_root': ('hermes_cli.web_routers.files', 'fs_git_root'),
     'fs_list': ('hermes_cli.web_routers.files', 'fs_list'),
     'fs_read_data_url': ('hermes_cli.web_routers.files', 'fs_read_data_url'),
-    'fs_read_plugin_source': ('hermes_cli.web_routers.files', 'fs_read_plugin_source'),
     'fs_read_text': ('hermes_cli.web_routers.files', 'fs_read_text'),
     'fs_write_text': ('hermes_cli.web_routers.files', 'fs_write_text'),
     'gateway_drain': ('hermes_cli.web_routers.actions', 'gateway_drain'),
-    # >>> FORK ANCHOR: account-limits-compat <<<
-    'get_account_limits': ('hermes_fork.account_limits.routes', 'get_account_limits'),
     'gateway_ws': ('hermes_cli.web_routers.chat_ws', 'gateway_ws'),
     'get_action_status': ('hermes_cli.web_routers.actions', 'get_action_status'),
     'get_active_profile_endpoint': ('hermes_cli.web_routers.profiles', 'get_active_profile_endpoint'),
@@ -1818,7 +1812,6 @@ _PLUGIN_COMPAT_LAZY = {
     'update_profile_soul': ('hermes_cli.web_routers.profiles', 'update_profile_soul'),
     'update_skill_content': ('hermes_cli.web_routers.skills', 'update_skill_content'),
     'update_skills_hub': ('hermes_cli.web_routers.skills', 'update_skills_hub'),
-    'upload_chat_file': ('hermes_cli.web_routers.files', 'upload_chat_file'),
     'upload_chat_image': ('hermes_cli.web_routers.files', 'upload_chat_image'),
     'upload_managed_file': ('hermes_cli.web_routers.files', 'upload_managed_file'),
     'upload_managed_file_stream': ('hermes_cli.web_routers.files', 'upload_managed_file_stream'),
@@ -1829,6 +1822,9 @@ _PLUGIN_COMPAT_LAZY = {
     'windows_hide_flags': ('hermes_cli._subprocess_compat', 'windows_hide_flags'),
     'write_platform_config_field': ('hermes_cli.config', 'write_platform_config_field'),
 }
+# >>> FORK ANCHOR: plugin-compat <<<
+from hermes_fork.web_compat import FORK_PLUGIN_COMPAT_LAZY
+_PLUGIN_COMPAT_LAZY.update(FORK_PLUGIN_COMPAT_LAZY)
 
 
 def __getattr__(name):  # PEP 562 — lazy so no import cycles
