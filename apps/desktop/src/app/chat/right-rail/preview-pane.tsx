@@ -65,6 +65,7 @@ import {
 import { type ConsoleEntry } from './preview-console-state'
 import { previewConsoleState } from './preview-console-store'
 import { LocalFilePreview, PreviewEmptyState } from './preview-file'
+import { previewGuestSupported } from './preview-guest'
 import { type PreviewInputEvent, registerPreviewInput } from './preview-input'
 import { PREVIEW_BROWSER_ATTR, registerPreviewNav } from './preview-nav'
 import { registerPreviewPageReader } from './preview-reader'
@@ -737,8 +738,13 @@ export function PreviewPane({ embedded = false, onRestartServer, reloadRequest =
   // Gestures that land on the app's chrome (⌘R from the address bar, a mouse
   // button over the frame). A gesture made INSIDE the page is answered by main
   // against the focused guest — this renderer can't see into a webview.
+  //
+  // Guest-gated like the other registrations: back/forward/reload all call
+  // methods on the webview element, so with no guest this handle would accept
+  // every history verb and do nothing, which is a silent miss for both the
+  // user's ⌘R and drive_preview's nav actions.
   useEffect(() => {
-    if (!isWebPreview || isRemoteHtml || !tabId) {
+    if (!isWebPreview || isRemoteHtml || !tabId || !previewGuestSupported()) {
       return
     }
 
@@ -749,8 +755,13 @@ export function PreviewPane({ embedded = false, onRestartServer, reloadRequest =
   // rendered page's title + visible text from the webview. innerText (not
   // textContent) so hidden nodes and script/style bodies stay out, matching
   // what the user actually sees.
+  //
+  // A build with no guest engine registers nothing at all. Registering a reader
+  // that can only throw is the failure this guard exists to prevent: the tool
+  // would answer "the page has not finished loading — retry" forever, which
+  // reads as a slow page rather than an absent capability.
   useEffect(() => {
-    if (!isWebPreview || !tabId) {
+    if (!isWebPreview || !tabId || !previewGuestSupported()) {
       return
     }
 
@@ -774,7 +785,7 @@ export function PreviewPane({ embedded = false, onRestartServer, reloadRequest =
   // page, shared by the tour tool (injected driver.js walkthroughs) and the
   // drive_preview tool (clicking, typing, scrolling the page the user sees).
   useEffect(() => {
-    if (!isWebPreview || !tabId) {
+    if (!isWebPreview || !tabId || !previewGuestSupported()) {
       return
     }
 
@@ -794,7 +805,7 @@ export function PreviewPane({ embedded = false, onRestartServer, reloadRequest =
   // keystrokes arrive as trusted events, so the page hovers, focuses and reacts
   // exactly as it would under a human hand.
   useEffect(() => {
-    if (!isWebPreview || isRemoteHtml || !tabId) {
+    if (!isWebPreview || isRemoteHtml || !tabId || !previewGuestSupported()) {
       return
     }
 
