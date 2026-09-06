@@ -205,14 +205,32 @@ def _placeholders(ids: list) -> str:
     return ",".join(["?"] * len(ids))
 
 
-def _compute_task_diagnostics(conn: sqlite3.Connection, task_ids: Optional[list[str]] = None) -> dict[str, list[dict]]:
+def _compute_task_diagnostics(
+    conn: sqlite3.Connection, task_ids: Optional[list[str]] = None, *, board: Optional[str] = None,
+) -> dict[str, list[dict]]:
     """``{task_id: [diagnostic_dict, ...]}`` (tasks with none omitted) via three aggregate
-    queries (tasks, events, runs) — slurps the board; paginate if profiling shows a hotspot."""
+    queries (tasks, events, runs) — slurps the board; paginate if profiling shows a hotspot.
+
+    ``board`` must be the SAME resolved slug ``conn`` was opened against (the caller's
+    ``_board_conn``/``_conn`` resolution) so the concurrency snapshot's "other boards"
+    total excludes the right board rather than falling back to the process's active-board
+    default, which can differ under ``GET /board/all`` or an explicit ``?board=`` query.
+    """
     from hermes_cli.config import load_config
 
     if task_ids is not None and not task_ids:
         return {}
-    diag_config = kd.config_from_runtime_config(load_config())
+    raw_config = load_config()
+    diag_config = kd.config_from_runtime_config(raw_config)
+    kanban_cfg = raw_config.get("kanban") if isinstance(raw_config, dict) else None
+    # Same caps/counts the dispatcher enforces (kanban_db_dispatch.concurrency_snapshot)
+    # so `stranded_in_ready` can suppress itself when the board is correctly at capacity
+    # instead of drifting from the real cap check with a second counter.
+    try:
+        concurrency = kbd.concurrency_snapshot(
+            conn, board=board, kanban_cfg=kanban_cfg if isinstance(kanban_cfg, dict) else None)
+    except Exception:
+        concurrency = None
     if task_ids is not None:
         rows = conn.execute(f"SELECT * FROM tasks WHERE id IN ({_placeholders(task_ids)})", tuple(task_ids)).fetchall()
     else:
@@ -235,7 +253,8 @@ def _compute_task_diagnostics(conn: sqlite3.Connection, task_ids: Optional[list[
     for r in rows:
         tid = r["id"]
         diags = kd.compute_task_diagnostics(
-            r, events_by_task[tid], runs_by_task[tid], config=diag_config, graph=graph_by_task.get(tid))
+            r, events_by_task[tid], runs_by_task[tid], config=diag_config,
+            graph=graph_by_task.get(tid), concurrency=concurrency)
         if diags:
             out[tid] = [d.to_dict() for d in diags]
     return out
@@ -278,6 +297,7 @@ def _links_for(conn: sqlite3.Connection, task_id: str) -> dict[str, list[str]]:
 def _board_payload(
     conn: sqlite3.Connection, *, tenant: Optional[str], include_archived: bool,
     workflow_template_id: Optional[str], current_step_key: Optional[str],
+    board: Optional[str] = None,
 ) -> dict[str, Any]:
     """Build one board's grouped-by-status payload: link/comment/progress rollups,
     diagnostics, latest summaries, tenant/assignee facets, latest_event_id. This IS
@@ -311,7 +331,7 @@ def _board_payload(
         p = progress.setdefault(row["pid"], {"done": 0, "total": 0})
         p["total"] += 1
         p["done"] += row["cstatus"] == "done"
-    diagnostics_per_task = _compute_task_diagnostics(conn, task_ids=None)
+    diagnostics_per_task = _compute_task_diagnostics(conn, task_ids=None, board=board)
     latest_event_id = conn.execute("SELECT COALESCE(MAX(id), 0) AS m FROM task_events").fetchone()["m"]
     columns: dict[str, list[dict]] = {c: [] for c in BOARD_COLUMNS}
     if include_archived:
@@ -351,7 +371,7 @@ def get_board(
     with _board_conn(board) as (board, conn):
         return _board_payload(
             conn, tenant=tenant, include_archived=include_archived,
-            workflow_template_id=workflow_template_id, current_step_key=current_step_key)
+            workflow_template_id=workflow_template_id, current_step_key=current_step_key, board=board)
 
 
 # --- GET /board/all — consolidated multi-board view --------------------------
@@ -367,7 +387,7 @@ def _fetch_board_payload(
         with closing(_conn(board=slug)) as conn:
             return _board_payload(
                 conn, tenant=tenant, include_archived=include_archived,
-                workflow_template_id=workflow_template_id, current_step_key=current_step_key)
+                workflow_template_id=workflow_template_id, current_step_key=current_step_key, board=slug)
     return _with_board_pinned(slug, _run)
 
 
@@ -465,7 +485,7 @@ def get_task(
         links = _links_for(conn, task_id)
         child_summaries = kanban_db.latest_summaries(conn, links["children"])
         children = filter(None, (kanban_db.get_task(conn, cid) for cid in links["children"]))
-        _attach_diagnostics(task_d, _compute_task_diagnostics(conn, task_ids=[task_id]).get(task_id) or [])
+        _attach_diagnostics(task_d, _compute_task_diagnostics(conn, task_ids=[task_id], board=board).get(task_id) or [])
         return {
             "task": task_d,
             "comments": [asdict(c) for c in kanban_db.list_comments(conn, task_id)],
@@ -1075,7 +1095,7 @@ def list_diagnostics(
     """Tasks with an active diagnostic, highest severity first then most recent; also
     consumed by ``hermes kanban diagnostics`` when the dashboard runs."""
     with _board_conn(board) as (board, conn):
-        diags_by_task = _compute_task_diagnostics(conn, task_ids=None)
+        diags_by_task = _compute_task_diagnostics(conn, task_ids=None, board=board)
         if severity and diags_by_task:
             diags_by_task = {
                 tid: keep
@@ -1937,10 +1957,15 @@ def set_orchestration_settings(payload: OrchestrationSettingsBody):
     return get_orchestration_settings()  # callers re-render from the resolved state
 
 
-# --- WebSocket: /events?since=<event_id>&board=<slug> ------------------------
+# --- WebSocket: /events?since=<event_id>&board=<slug>  (or ?boards=<csv|*>&cursors=<json>) --
 
 # Event tail poll interval: WAL + 300 ms polling is the simplest robust approach (negligible CPU).
 _EVENT_POLL_SECONDS = 0.3
+
+# Cap the number of boards one socket tails — an unbounded ``boards=*`` on a fleet with many
+# boards would open that many SQLite connections on a single request. The dashboard has a
+# handful of boards in practice; this is a safety rail, not a tuned limit.
+_MAX_TAILED_BOARDS = 25
 
 
 def _int_param(ws: WebSocket, name: str) -> int:
@@ -1955,6 +1980,50 @@ def _ws_board(raw: Optional[str]) -> Optional[str]:
         return kanban_db._normalize_board_slug(raw) if raw else None
     except ValueError:
         return None
+
+
+def _ws_boards_param(raw: Optional[str]) -> Optional[list[str]]:
+    """Resolve ``?boards=`` into an ordered, deduped, capped slug list, or ``None`` when the
+    param is absent (selecting the legacy single-board path). ``boards=*`` means every board
+    currently on disk; a CSV list is normalized/filtered the same way a single ``board=`` is."""
+    if raw is None:
+        return None
+    if raw.strip() == "*":
+        slugs = [meta["slug"] for meta in kanban_db.list_boards(include_archived=False)]
+    else:
+        slugs = []
+        for part in raw.split(","):
+            try:
+                normed = kanban_db._normalize_board_slug(part)
+            except ValueError:
+                normed = None
+            if normed and normed not in slugs:
+                slugs.append(normed)
+    if len(slugs) > _MAX_TAILED_BOARDS:
+        log.warning("kanban /events: boards=%r requested %d boards, capping to %d", raw, len(slugs), _MAX_TAILED_BOARDS)
+        slugs = slugs[:_MAX_TAILED_BOARDS]
+    return slugs
+
+
+def _ws_cursors_param(raw: Optional[str]) -> dict[str, int]:
+    """Parse the per-board cursor seed map. Malformed/missing input degrades to ``{}`` (every
+    board starts from 0) rather than failing the handshake — a bad seed costs a one-time replay,
+    never a broken connection."""
+    if not raw:
+        return {}
+    try:
+        parsed = json.loads(raw)
+    except Exception:
+        return {}
+    if not isinstance(parsed, dict):
+        return {}
+    out: dict[str, int] = {}
+    for key, value in parsed.items():
+        try:
+            out[str(key)] = int(value)
+        except (TypeError, ValueError):
+            continue
+    return out
 
 
 class _EventTail:
@@ -2004,12 +2073,100 @@ class _EventTail:
             self._executor.shutdown(wait=True, cancel_futures=True)
 
 
+class _MultiEventTail:
+    """Multi-board ``task_events`` tailer for the ``boards=`` fan-out path (consolidated All
+    Boards view). Holds one thread-affine SQLite connection PER requested board, but all of
+    them are opened/polled/closed on the SAME single-worker executor the single-board
+    ``_EventTail`` uses — one executor for the whole socket, never a pool per board.
+
+    A board that raises mid-poll (locked/corrupt DB) is isolated: its connection is dropped
+    and that board is skipped on every subsequent poll, so one bad board never kills the
+    stream for the others — mirroring ``GET /board/all``'s per-board try/except."""
+
+    def __init__(self, boards: list[str]) -> None:
+        self._boards = boards
+        self._conns: dict[str, sqlite3.Connection] = {}
+        self._dead: set[str] = set()  # boards that errored; skipped on later polls
+        self._executor: Optional[ThreadPoolExecutor] = None
+
+    def _fetch_one(self, board: str, cursor: int) -> tuple[int, list[dict]]:
+        conn = self._conns.get(board)
+        if conn is None:
+            conn = kbc.connect(board=board)
+            self._conns[board] = conn
+        rows = conn.execute(
+            "SELECT id, task_id, run_id, kind, payload, created_at "
+            "FROM task_events WHERE id > ? ORDER BY id ASC LIMIT 200",
+            (cursor,)).fetchall()
+        out: list[dict] = []
+        for r in rows:
+            try:
+                payload = json.loads(r["payload"]) if r["payload"] else None
+            except Exception:
+                payload = None
+            out.append({**dict(r), "payload": payload, "board": board})
+        return (rows[-1]["id"] if rows else cursor), out
+
+    def _fetch_all(self, cursors: dict[str, int]) -> tuple[dict[str, int], list[dict]]:
+        """Runs on the single worker thread: poll every live board in turn."""
+        events: list[dict] = []
+        new_cursors = dict(cursors)
+        for board in self._boards:
+            if board in self._dead:
+                continue
+            try:
+                new_cursor, board_events = self._fetch_one(board, cursors.get(board, 0))
+            except Exception as exc:
+                log.warning("kanban /events: board %r failed mid-stream, dropping it from this socket: %s", board, exc)
+                self._dead.add(board)
+                conn = self._conns.pop(board, None)
+                if conn is not None:
+                    try:
+                        conn.close()
+                    except Exception:
+                        pass
+                continue
+            new_cursors[board] = new_cursor
+            events.extend(board_events)
+        return new_cursors, events
+
+    def _close_all(self) -> None:
+        for conn in self._conns.values():
+            try:
+                conn.close()
+            except Exception:
+                pass
+        self._conns.clear()
+
+    async def poll(self, cursors: dict[str, int]) -> tuple[dict[str, int], list[dict]]:
+        if self._executor is None:
+            self._executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="kanban-events")
+        return await asyncio.get_running_loop().run_in_executor(self._executor, self._fetch_all, cursors)
+
+    async def shutdown(self) -> None:
+        if self._executor is None:
+            return
+        try:
+            await asyncio.get_running_loop().run_in_executor(self._executor, self._close_all)
+        except Exception as exc:
+            log.warning("Kanban multi-board event stream connection cleanup failed: %s", exc)
+        finally:
+            self._executor.shutdown(wait=True, cancel_futures=True)
+
+
 @router.websocket("/events")
 async def stream_events(ws: WebSocket):
     if not _ws_upgrade_authorized(ws):
         await ws.close(code=http_status.WS_1008_POLICY_VIOLATION)
         return
     await ws.accept()
+    # ``boards=`` selects the NEW multi-board fan-out path, kept entirely separate from the
+    # legacy single-board loop below so that loop's frame shape never changes for existing
+    # clients that never send ``boards=``.
+    boards = _ws_boards_param(ws.query_params.get("boards"))
+    if boards is not None:
+        await _stream_events_multi(ws, boards)
+        return
     # Board is pinned at the handshake; the UI opens a new WS on board change
     # rather than reconciling two cursors mid-stream.
     tail = _EventTail(_ws_board(ws.query_params.get("board")))
@@ -2033,6 +2190,40 @@ async def stream_events(ws: WebSocket):
         return  # normal shutdown; CancelledError is a BaseException the handler below wouldn't quiet
     except Exception as exc:  # never crash the dashboard worker
         log.warning("Kanban event stream error: %s", exc)
+        try:
+            await ws.close()
+        except Exception:
+            pass
+    finally:
+        await tail.shutdown()
+
+
+async def _stream_events_multi(ws: WebSocket, boards: list[str]) -> None:
+    """``boards=<csv>`` / ``boards=*`` fan-out: tails N boards on this ONE socket. Cursors seed
+    from ``?cursors=<json>`` (the ``/board/all`` payload's ``cursors`` map — resumes exactly
+    where the initial fetch ended, no gap, no replay). Frame shape is the new contract
+    ``{"events": [{"board": ..., ...}], "cursors": {...}}``; kept in its own loop rather than
+    retrofitted into the single-board one above so that one's byte-identical frame is never at
+    risk of drifting."""
+    tail = _MultiEventTail(boards)
+    cursors = _ws_cursors_param(ws.query_params.get("cursors"))
+    try:
+        while True:
+            try:
+                msg = await asyncio.wait_for(ws.receive(), timeout=_EVENT_POLL_SECONDS)
+                if msg["type"] == "websocket.disconnect":
+                    return
+            except asyncio.TimeoutError:
+                pass  # no client message — poll the DBs
+            cursors, events = await tail.poll(cursors)
+            if events:
+                await ws.send_json({"events": events, "cursors": cursors})
+    except WebSocketDisconnect:
+        return
+    except asyncio.CancelledError:
+        return  # normal shutdown; CancelledError is a BaseException the handler below wouldn't quiet
+    except Exception as exc:  # never crash the dashboard worker
+        log.warning("Kanban multi-board event stream error: %s", exc)
         try:
             await ws.close()
         except Exception:

@@ -29,19 +29,40 @@ import {
   useQuery,
   useValue
 } from '@hermes/plugin-sdk'
+import { useEffect, useRef } from 'react'
 
-import { $boardSlug, ALL_BOARDS, bindApi, boardKey, fetchAllBoards, fetchBoard } from './api'
+import { $boardSlug, ALL_BOARDS, bindApi, boardKey, fetchAllBoards, fetchBoard, primeAllBoardsSocket } from './api'
 import { KanbanBoardPage } from './board'
 import { KANBAN_LOCALES } from './i18n'
 import { $newTaskLane, useKanban } from './ui'
 
 // Live "N running / ready" pill — one glance at fleet activity from anywhere,
-// clicks through to the board. Shares the board query (one cache, one poll with
+// toggles the board. Shares the board query (one cache, one poll with
 // the page); hidden when nothing is in flight (or unloaded).
-function KanbanCount() {
+export function KanbanCount() {
   const k = useKanban()
   const slug = useValue($boardSlug)
   const isAllBoards = slug === ALL_BOARDS
+
+  const previousRoute = useRef({
+    connectionId: host.state.connectionId.get(),
+    path: '#/',
+    profile: host.state.profile.get()
+  })
+
+  const toggleBoard = () => {
+    const profile = host.state.profile.get()
+    const connectionId = host.state.connectionId.get()
+    const path = window.location.hash || '#/'
+
+    if (path.split('?')[0] === '#/kanban') {
+      const previous = previousRoute.current
+      host.navigate(previous.profile === profile && previous.connectionId === connectionId ? previous.path : '/')
+    } else {
+      previousRoute.current = { connectionId, path, profile }
+      host.navigate('/kanban')
+    }
+  }
 
   // Socket-invalidated like the page (same cache); slow socketless heartbeat.
   // In All Boards mode this must fetch the consolidated view too — falling
@@ -52,6 +73,14 @@ function KanbanCount() {
     queryKey: boardKey(slug, false),
     refetchInterval: 60_000
   })
+
+  // Idempotent per All-Boards selection (see api.ts) — safe alongside board.tsx's own call
+  // since only whichever mounts first actually opens the socket.
+  useEffect(() => {
+    if (isAllBoards && board?.cursors) {
+      primeAllBoardsSocket(board.cursors)
+    }
+  }, [isAllBoards, board?.cursors])
 
   if (!board) {
     return null
@@ -71,7 +100,7 @@ function KanbanCount() {
           'inline-flex h-full items-center gap-1 rounded-none px-1.5 text-[0.6875rem] tabular-nums transition-colors',
           'text-(--ui-text-tertiary) hover:bg-(--chrome-action-hover) hover:text-foreground'
         )}
-        onClick={() => host.navigate('/kanban')}
+        onClick={toggleBoard}
         type="button"
       >
         <Codicon name="project" size="0.7rem" />

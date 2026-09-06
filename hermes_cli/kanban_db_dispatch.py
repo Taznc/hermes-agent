@@ -82,9 +82,77 @@ DEFAULT_RATE_LIMIT_COOLDOWN_SECONDS = 300  # 5 minutes
 _RESPAWN_GUARD_PR_WINDOW = 86400  # 24 hours
 
 _RESPAWN_GUARD_PR_URL_RE = re.compile(
-    r"https?://github\.com/[^/\s]+/[^/\s]+/pull/\d+",
+    r"https?://github\.com/(?P<owner>[^/\s]+)/(?P<repo>[^/\s]+?)/pull/\d+",
     re.IGNORECASE,
 )
+
+# Parses an owner/repo out of any git remote URL flavor (https, ssh, git@).
+_REMOTE_OWNER_REPO_RE = re.compile(
+    r"github\.com[:/]+(?P<owner>[^/\s]+)/(?P<repo>[^/\s]+?)(?:\.git)?/?$",
+    re.IGNORECASE,
+)
+
+
+def _repo_slug_from_remote_url(url: str) -> Optional[str]:
+    m = _REMOTE_OWNER_REPO_RE.search((url or "").strip())
+    return f"{m.group('owner')}/{m.group('repo')}".lower() if m else None
+
+
+def _git_remote_repo_slug(repo_path: str, *, timeout: float = 3.0) -> Optional[str]:
+    """``owner/repo`` for *repo_path*'s ``origin`` remote, or ``None`` (missing dir,
+    not a git repo, no remote, or a slow/failing git call — always fail open)."""
+    try:
+        if not repo_path or not os.path.isdir(repo_path):
+            return None
+        out = subprocess.run(
+            ["git", "-C", repo_path, "remote", "get-url", "origin"],
+            capture_output=True, text=True, timeout=timeout, check=False,
+        )
+    except Exception:
+        return None
+    if out.returncode != 0:
+        return None
+    return _repo_slug_from_remote_url(out.stdout)
+
+
+def _task_own_repo_slug(conn: sqlite3.Connection, task_id: str) -> Optional[str]:
+    """Best-effort ``owner/repo`` this task's own work targets, or ``None`` when it
+    cannot be determined (e.g. a scratch workspace with no code) — callers must
+    treat ``None`` as "unknown", never as "no repo, so any PR URL counts".
+
+    Resolution order: the task's linked project's primary folder (first-class,
+    survives a scratch/dir workspace), else the task's own ``worktree``
+    workspace path. Never raises — a missing/renamed project, an unreadable
+    projects.db, or a failing ``git`` call all fall through to ``None``.
+    """
+    row = conn.execute(
+        "SELECT workspace_kind, workspace_path, project_id FROM tasks WHERE id = ?",
+        (task_id,),
+    ).fetchone()
+    if row is None:
+        return None
+    project_id = row["project_id"]
+    if project_id:
+        try:
+            from hermes_cli import projects_db as _projects_db
+            with _projects_db.connect() as pconn:
+                project = _projects_db.get_project(pconn, project_id)
+            if project is not None:
+                primary = project.primary_path or next(
+                    (f.path for f in project.folders if f.is_primary),
+                    project.folders[0].path if project.folders else None,
+                )
+                if primary:
+                    slug = _git_remote_repo_slug(primary)
+                    if slug:
+                        return slug
+        except Exception:
+            pass
+    if row["workspace_kind"] == "worktree" and row["workspace_path"]:
+        slug = _git_remote_repo_slug(row["workspace_path"])
+        if slug:
+            return slug
+    return None
 
 
 @dataclass
@@ -136,7 +204,8 @@ class DispatchResult:
     respawn_guarded: list[tuple[str, str]] = field(default_factory=list)
     """``(task_id, reason)`` skipped by the respawn guard: ``"blocker_auth"``
     (quota/auth error — also auto-blocked), ``"recent_success"`` (completed run
-    within guard window), ``"active_pr"`` (GitHub PR URL in a recent comment)."""
+    within guard window), ``"active_pr"`` (own-assignee's own-repo GitHub PR
+    URL in a recent comment; scoping rules: :func:`check_respawn_guard`)."""
     rate_limited: list[str] = field(default_factory=list)
     """Task ids whose workers bailed on a provider rate-limit / quota wall
     (EX_TEMPFAIL sentinel exit) and were released to ``ready`` WITHOUT counting
@@ -1192,12 +1261,14 @@ def check_respawn_guard(
     (quota/auth pattern; the breaker still trips eventually), then for the
     ready lane only ``"recent_success"`` (completed run within the window, unless
     a re-queue event arrived after it — a deliberate re-run) and ``"active_pr"``
-    (PR URL in a recent comment; re-spawning risks a duplicate PR). The review
-    lane skips the last two: they are the *inputs* to a review handoff. Stale /
-    dead claim locks are NOT a guard reason — the reclaim passes own those.
+    (a GitHub PR URL, from a comment AUTHORED BY this task's own assignee, whose
+    owner/repo matches this task's own repo when that repo is resolvable —
+    re-spawning risks a duplicate PR). The review lane skips the last two: they
+    are the *inputs* to a review handoff. Stale / dead claim locks are NOT a
+    guard reason — the reclaim passes own those.
     """
     row = conn.execute(
-        "SELECT last_failure_error FROM tasks WHERE id = ?",
+        "SELECT last_failure_error, assignee FROM tasks WHERE id = ?",
         (task_id,),
     ).fetchone()
     if row is None:
@@ -1261,13 +1332,34 @@ def check_respawn_guard(
             return "recent_success"
 
     # 4. GitHub PR URL in a recent comment — prior worker already opened a PR.
+    #    Two independent scopes must BOTH hold, because either alone still lets
+    #    an unrelated PR guard the card:
+    #      - Author: only a comment from THIS task's own assignee (a worker who
+    #        actually ran on this card) counts. A human/orchestrator/reviewer
+    #        note quoting a PR for context (prior art, "see also") never guards
+    #        — it isn't proof this card opened anything.
+    #      - Repo: when the task's own repo is resolvable (project link or a
+    #        worktree workspace's origin remote), the cited PR's owner/repo
+    #        must match it. A worker's own comment linking an unrelated repo's
+    #        PR (e.g. quoting an upstream issue while researching prior art)
+    #        still must not guard. When the repo can't be determined (e.g. a
+    #        scratch board-only task with no code) this scope is skipped —
+    #        author-scoping alone is enough signal there.
+    assignee = row["assignee"]
+    own_repo_slug = _task_own_repo_slug(conn, task_id)
     pr_cutoff = now - _RESPAWN_GUARD_PR_WINDOW
     for c in conn.execute(
-        "SELECT body FROM task_comments WHERE task_id = ? AND created_at >= ?",
+        "SELECT author, body FROM task_comments WHERE task_id = ? AND created_at >= ?",
         (task_id, pr_cutoff),
     ).fetchall():
-        if c["body"] and _RESPAWN_GUARD_PR_URL_RE.search(c["body"]):
-            return "active_pr"
+        if not c["body"] or not assignee or c["author"] != assignee:
+            continue
+        for match in _RESPAWN_GUARD_PR_URL_RE.finditer(c["body"]):
+            if own_repo_slug is None:
+                return "active_pr"
+            cited_slug = f"{match.group('owner')}/{match.group('repo')}".lower()
+            if cited_slug == own_repo_slug:
+                return "active_pr"
 
     return None
 
@@ -1561,6 +1653,58 @@ def count_running_tasks_by_assignee_other_boards(board: Optional[str] = None) ->
         except Exception:
             continue
     return counts
+
+
+def count_running_tasks_by_assignee(conn: sqlite3.Connection, board: Optional[str] = None) -> dict[str, int]:
+    """Host-wide running-worker counts per assignee: this board's rows plus every
+    other board's (:func:`count_running_tasks_by_assignee_other_boards`).
+
+    Single source of truth for "how many workers does profile X have in flight
+    right now" — both the dispatcher's per-profile cap enforcement and
+    diagnostics' concurrency-aware ``stranded_in_ready`` rule read this so they
+    can never drift into two counters that disagree.
+    """
+    counts = count_running_tasks_by_assignee_other_boards(board)
+    for prow in conn.execute(
+        "SELECT assignee, COUNT(*) AS n FROM tasks "
+        "WHERE status = 'running' AND assignee IS NOT NULL "
+        "GROUP BY assignee"
+    ):
+        assignee = prow["assignee"]
+        counts[assignee] = counts.get(assignee, 0) + int(prow["n"])
+    return counts
+
+
+def total_running_tasks(conn: sqlite3.Connection, board: Optional[str] = None) -> int:
+    """Host-wide running-worker count: this board's rows (:func:`count_running_tasks`)
+    plus every other board's (:func:`count_running_tasks_other_boards`).
+
+    Shared so the dispatcher's ``max_in_progress`` enforcement and diagnostics'
+    concurrency-aware rules agree on the same number.
+    """
+    return count_running_tasks(conn) + count_running_tasks_other_boards(board)
+
+
+def concurrency_snapshot(conn: sqlite3.Connection, board: Optional[str] = None,
+                          *, kanban_cfg: Optional[dict] = None) -> dict:
+    """Host concurrency snapshot for concurrency-aware diagnostics.
+
+    Resolves the same caps (:func:`resolve_dispatch_caps`) and running-task
+    counts (:func:`total_running_tasks` / :func:`count_running_tasks_by_assignee`)
+    the dispatcher itself uses to enforce ``kanban.max_in_progress`` /
+    ``kanban.max_in_progress_per_profile``. Callers (dashboard/CLI diagnostics)
+    pass the result into ``kanban_diagnostics.compute_task_diagnostics(...,
+    concurrency=...)`` so ``stranded_in_ready`` can tell "queued behind a full
+    pipe" from "actually stuck" without reimplementing a second counter that
+    can drift from the enforcer.
+    """
+    caps = resolve_dispatch_caps(kanban_cfg)
+    return {
+        "max_in_progress": caps.max_in_progress,
+        "max_in_progress_per_profile": caps.max_in_progress_per_profile,
+        "total_running": total_running_tasks(conn, board),
+        "running_by_assignee": count_running_tasks_by_assignee(conn, board),
+    }
 
 
 def _memory_pressure_level(sample: Optional[Mapping[str, Any]] = None) -> str:
@@ -1984,18 +2128,9 @@ def _dispatch_once_locked(
         isinstance(max_in_progress_per_profile, int)
         and max_in_progress_per_profile > 0
     ) else None
-    per_profile_running: dict[str, int] = {}
-    if per_profile_cap is not None:
-        per_profile_running = count_running_tasks_by_assignee_other_boards(board)
-        for prow in conn.execute(
-            "SELECT assignee, COUNT(*) AS n FROM tasks "
-            "WHERE status = 'running' AND assignee IS NOT NULL "
-            "GROUP BY assignee"
-        ):
-            assignee = prow["assignee"]
-            per_profile_running[assignee] = (
-                per_profile_running.get(assignee, 0) + int(prow["n"])
-            )
+    per_profile_running: dict[str, int] = (
+        count_running_tasks_by_assignee(conn, board) if per_profile_cap is not None else {}
+    )
     lane_kwargs: dict[str, Any] = dict(
         dry_run=dry_run, ttl_seconds=ttl_seconds, board=board,
         failure_limit=failure_limit, spawn_fn=spawn_fn,
@@ -2508,9 +2643,15 @@ def run_daemon(
 
     Calls :func:`dispatch_once` every ``interval`` seconds; exits cleanly on
     SIGINT / SIGTERM so it is systemd-friendly. ``stop_event`` and ``on_tick``
-    are test hooks. Each tick resolves ``kanban.max_in_progress`` exactly like
-    the gateway dispatcher and ``hermes kanban dispatch`` — the standalone
-    daemon must not be the one uncapped entry point.
+    are test hooks.
+
+    Each tick resolves the caps through :func:`resolve_dispatch_caps`, the same
+    helper the gateway tick, ``hermes kanban dispatch`` and the dashboard nudge
+    use. Resolving only ``max_in_progress`` here (as this loop used to) left
+    ``max_in_progress_per_profile`` as ``None``, and ``dispatch_once`` reads an
+    omitted cap as *unlimited* — so the standalone daemon could hand one
+    profile its entire backlog while every other entry point held it to the
+    configured per-profile limit. The caps bound the HOST, not an entry point.
     """
     import threading
 
@@ -2533,12 +2674,14 @@ def run_daemon(
         try:
             # Re-resolved every tick (config load is mtime-cached) so operator
             # edits apply without a restart.
-            max_in_progress = resolve_max_in_progress(configured_max_in_progress())
+            caps = resolve_dispatch_caps()
             with contextlib.closing(_kbc.connect()) as conn:
                 res = dispatch_once(
                     conn,
-                    max_spawn=max_spawn,
-                    max_in_progress=max_in_progress,
+                    max_spawn=max_spawn if max_spawn is not None else caps.max_spawn,
+                    max_in_progress=caps.max_in_progress,
+                    max_in_progress_per_profile=caps.max_in_progress_per_profile,
+                    default_assignee=caps.default_assignee,
                     failure_limit=failure_limit,
                 )
             if on_tick is not None:

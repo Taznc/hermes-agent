@@ -100,9 +100,10 @@ description: "Hermes Agent 使用的所有环境变量完整参考"
 | `HERMES_DISABLE_WINDOWS_UTF8` | **仅 Windows。** 设为 `1` 可禁用 UTF-8 stdio shim（`configure_windows_stdio()`），回退到控制台的本地代码页。用于排查编码问题；正常操作中极少需要 |
 | `HERMES_KANBAN_HOME` | 覆盖锚定 kanban 看板（数据库 + 工作区 + 工作日志）的共享 Hermes 根目录。回退到 `get_default_hermes_root()`（任意活动 profile 的父目录）。适用于测试和非常规部署 |
 | `HERMES_KANBAN_BOARD` | 为当前进程固定活动 kanban 看板。优先于 `~/.hermes/kanban/current`；调度器将其注入工作进程子进程环境，使工作进程无法看到其他看板上的任务。默认为 `default`。slug 验证：小写字母数字 + 连字符 + 下划线，1-64 字符 |
-| `HERMES_KANBAN_DB` | 直接固定 kanban 数据库文件路径（优先于 `HERMES_KANBAN_BOARD` 和 `HERMES_KANBAN_HOME`）。调度器将其注入工作进程子进程环境（连同 `HERMES_KANBAN_PIN_HOME`），使 profile 工作进程收敛到调度器的看板 |
-| `HERMES_KANBAN_PIN_HOME` | 调度器注入 `HERMES_KANBAN_DB` 时一并写入的来源标记：该固定值所基于的 kanban home。当进程重新声明了*不同的* home（`HERMES_HOME` / `HERMES_KANBAN_HOME`）时，带标记的固定值被视为过期继承而被忽略，并发出警告——这正是探针或测试脚本能够真正沙箱化、而不会静默打开线上看板的原因。手动设置的固定值不带标记，始终生效 |
-| `HERMES_KANBAN_WORKSPACES_ROOT` | 直接固定 kanban 工作区根目录（工作区最高优先级；优先于 `HERMES_KANBAN_HOME`）。调度器将其注入工作进程子进程环境 |
+| `HERMES_KANBAN_DB` | 直接固定 kanban 数据库文件路径（优先于 `HERMES_KANBAN_BOARD` 和 `HERMES_KANBAN_HOME`）。调度器将其注入工作进程子进程环境（连同 `HERMES_KANBAN_PIN_HOME`），使 profile 工作进程收敛到调度器的看板。仅当它解析到当前生效的 kanban home（`HERMES_KANBAN_HOME` / `get_default_hermes_root()`）之下，或由 `HERMES_KANBAN_PIN_HOME` 背书时才生效；基于*不同* home 计算出的固定值（例如脚本把 `HERMES_HOME` 重指向沙箱却未清除此变量而继承来的值）会被丢弃并发出警告，而不是静默地把写入重定向到错误的 home |
+| `HERMES_KANBAN_PIN_HOME` | 声明某个 `HERMES_KANBAN_*` 路径固定值所适用的 kanban home，从而允许固定值有意指向当前 home *之外*（例如看板不在所解析 home 之下的 symlink / Docker 布局）。调度器会在注入固定值时一并写入。当进程重新声明了不同的 home（`HERMES_HOME` / `HERMES_KANBAN_HOME`）时该标记不再匹配，继承而来的固定值随即被丢弃——这正是探针或测试脚本能够真正沙箱化、而不会静默打开线上看板的原因 |
+| `HERMES_KANBAN_WORKSPACES_ROOT` | 直接固定 kanban 工作区根目录（优先于 `HERMES_KANBAN_HOME`）。调度器将其注入工作进程子进程环境。与 `HERMES_KANBAN_DB` 具有相同的过期固定值保护 |
+| `HERMES_KANBAN_ATTACHMENTS_ROOT` | 直接固定 kanban 附件根目录（优先于 `HERMES_KANBAN_HOME`）。与 `HERMES_KANBAN_DB` 具有相同的过期固定值保护 |
 | `HERMES_KANBAN_DISPATCH_IN_GATEWAY` | `kanban.dispatch_in_gateway` 的运行时覆盖。设为 `0`、`false`、`no` 或 `off` 可阻止 gateway 启动内嵌 Kanban 调度器；任何其他非空值则启用。适用于独立调度器进程拥有看板的场景。 |
 
 ## 提供商认证（OAuth）

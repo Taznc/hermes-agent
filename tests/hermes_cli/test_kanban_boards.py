@@ -100,19 +100,71 @@ class TestPathResolution:
         assert p == fresh_home / "kanban" / "boards" / "atm10-server" / "kanban.db"
 
 
-    def test_env_var_db_override_wins_when_vouched_for(self, fresh_home, tmp_path, monkeypatch):
-        """``HERMES_KANBAN_DB`` pins the file regardless of board= arg.
+    def test_env_var_db_override_wins_when_under_current_home(
+        self, fresh_home, monkeypatch,
+    ):
+        """``HERMES_KANBAN_DB`` pins the file regardless of board= arg, as
+        long as it lives under the currently-resolved kanban home — the
+        dispatcher's happy path, where it computes the override against its
+        own home before spawning the worker. See
+        ``test_stale_env_var_db_override_is_dropped`` for the case where the
+        override was computed against a DIFFERENT (e.g. production) home."""
+        forced = fresh_home / "kanban" / "boards" / "hermes-fork" / "kanban.db"
+        forced.parent.mkdir(parents=True)
+        monkeypatch.setenv("HERMES_KANBAN_DB", str(forced))
+        assert kb.kanban_db_path() == forced
+        assert kb.kanban_db_path(board="ignored") == forced
 
-        A pin OUTSIDE the current kanban home now has to say so via
-        ``HERMES_KANBAN_PIN_HOME``: an unvouched out-of-home pin is
-        indistinguishable from the stale inherited env that let sandboxed probes
-        drive the live board (see ``test_kanban_db_sandbox_isolation.py``).
+    def test_env_var_db_override_outside_home_wins_when_vouched_for(
+        self, fresh_home, tmp_path, monkeypatch,
+    ):
+        """An out-of-home pin is honored only when it declares its intent.
+
+        Symlink/Docker layouts legitimately put the board outside the home the
+        process resolves. Containment alone cannot tell that apart from the
+        stale inherited env that let sandboxed probes drive the live board, so
+        ``HERMES_KANBAN_PIN_HOME`` names the home the caller is running under.
         """
         forced = tmp_path / "custom.db"
         monkeypatch.setenv("HERMES_KANBAN_DB", str(forced))
         monkeypatch.setenv("HERMES_KANBAN_PIN_HOME", str(fresh_home))
         assert kb.kanban_db_path() == forced
         assert kb.kanban_db_path(board="ignored") == forced
+
+    def test_stale_env_var_db_override_is_dropped(
+        self, fresh_home, tmp_path, monkeypatch, caplog,
+    ):
+        """Regression for the live-board leak: a probe that sandboxes itself via
+        HERMES_HOME must not still resolve HERMES_KANBAN_DB against a DIFFERENT
+        (e.g. production) home it inherited from a parent/dispatcher process.
+
+        Simulates exactly the footgun in the bug report: the caller repoints
+        HERMES_HOME to its own sandbox but a stale HERMES_KANBAN_DB, computed
+        against a different home, is still sitting in the environment.
+        """
+        stale_production_db = tmp_path / "other-home" / "kanban.db"
+        stale_production_db.parent.mkdir(parents=True)
+        monkeypatch.setenv("HERMES_KANBAN_DB", str(stale_production_db))
+        # fresh_home already points HERMES_HOME at a sandbox unrelated to
+        # stale_production_db's parent, mirroring the sandboxed-probe setup.
+        import logging
+        with caplog.at_level(logging.WARNING, logger="hermes_cli.kanban_db"):
+            resolved = kb.kanban_db_path()
+        assert resolved == fresh_home / "kanban.db"
+        assert resolved != stale_production_db
+        assert any("stale" in rec.message for rec in caplog.records)
+
+    def test_stale_env_var_applies_to_workspaces_and_attachments_roots(
+        self, fresh_home, tmp_path, monkeypatch,
+    ):
+        """The fix is in the shared resolver, so every sibling using
+        ``_board_path`` (not just ``kanban_db_path``) drops a stale pin."""
+        stale = tmp_path / "other-home" / "workspaces"
+        stale.parent.mkdir(parents=True)
+        monkeypatch.setenv("HERMES_KANBAN_WORKSPACES_ROOT", str(stale))
+        monkeypatch.setenv("HERMES_KANBAN_ATTACHMENTS_ROOT", str(stale))
+        assert kb.workspaces_root() == fresh_home / "kanban" / "workspaces"
+        assert kb.attachments_root() == fresh_home / "kanban" / "attachments"
 
 
 # ---------------------------------------------------------------------------

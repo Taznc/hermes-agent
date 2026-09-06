@@ -1162,4 +1162,13 @@ def detect_dangerous_command(command: str) -> tuple:
         return (True, description, description)
     if _is_shell_token_spliced_gateway_lifecycle(command):
         return (True, _GATEWAY_LIFECYCLE_SPLICE_DESCRIPTION, _GATEWAY_LIFECYCLE_SPLICE_DESCRIPTION)
+    # Target-resolving pass, last because it is the only one that reads /proc: the text
+    # patterns above cannot classify `kill -TERM <pid>` (a bare number carries no dangerous
+    # keyword), yet signalling a Hermes unit's MainPID kills the fleet exactly as
+    # `systemctl restart` would. See tools/hermes_service_guard.py. Imported inside the
+    # function because that module imports the word/command-start helpers from this one.
+    from tools.hermes_service_guard import detect_hermes_service_stop
+    is_service_stop, service_desc = detect_hermes_service_stop(command)
+    if is_service_stop:
+        return (True, service_desc, service_desc)
     return (False, None, None)
