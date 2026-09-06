@@ -370,6 +370,7 @@ def _cmd_create(args: argparse.Namespace) -> int:
         model_override, provider_override = kb._validate_model_override(
             getattr(args, "model_override", None), getattr(args, "provider_override", None),
         )
+        reasoning_effort = kb.normalize_reasoning_effort(getattr(args, "reasoning_effort", None))
     except ValueError as exc:
         return _err(f"kanban: {exc}", 2)
     with kbc.connect_closing() as conn:
@@ -382,7 +383,7 @@ def _cmd_create(args: argparse.Namespace) -> int:
             routing = resolve_kanban_model_route(
                 title=args.title, body=args.body,
                 explicit_model=model_override, explicit_provider=provider_override,
-                explicit_reasoning_effort=getattr(args, "reasoning_effort", None),
+                explicit_reasoning_effort=reasoning_effort,
             )
             task_id = kb.create_task(
                 conn, title=args.title, body=args.body, assignee=args.assignee,

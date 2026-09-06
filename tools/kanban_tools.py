@@ -894,7 +894,8 @@ def _handle_create(args: dict, **kw) -> str:
     _check(model_override or not provider_override, "'provider' requires 'model' to be set as well")
     # Per-task thinking depth, independent of model/provider — create_task() validates it, so an
     # invalid level raises ValueError and surfaces as a tool_error rather than a silent fallback.
-    reasoning_effort = args.get("reasoning_effort")
+    from hermes_cli import kanban_db
+    reasoning_effort = kanban_db.normalize_reasoning_effort(args.get("reasoning_effort"))
     parents = _coerce_str_list(args.get("parents") or [], "parents", "task ids")
     with _board(args.get("board")) as (kb, conn):
         existing = kb.get_task_by_idempotency_key(conn, args.get("idempotency_key"))

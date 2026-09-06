@@ -318,3 +318,41 @@ def test_dashboard_idempotent_replay_validates_explicit_override_before_skipping
 
     assert replay.status_code == 400
     assert replay.json()["detail"] == "provider_override requires a model_override"
+
+
+def test_idempotent_replays_validate_reasoning_effort_before_skipping_routing(
+    kanban_home, monkeypatch, router_client
+):
+    """Malformed explicit reasoning stays rejected without consuming classifier work."""
+    with kbc.connect() as conn:
+        kb.create_task(conn, title="CLI existing", assignee="claudeprimary", idempotency_key="cli-key")
+        kb.create_task(conn, title="Tool existing", assignee="claudeprimary", idempotency_key="tool-key")
+        kb.create_task(
+            conn, title="Dashboard existing", assignee="claudeprimary", idempotency_key="dashboard-key"
+        )
+
+    def _unexpected_resolver(**_kwargs):
+        raise AssertionError("invalid idempotent replay must not classify")
+
+    monkeypatch.setattr("hermes_cli.kanban_model_routing.resolve_kanban_model_route", _unexpected_resolver)
+    cli_args = Namespace(
+        workspace=None, branch=None, max_runtime=None, max_retries=None,
+        title="CLI replay", body="unchanged", assignee="claudeprimary", created_by="tester",
+        tenant=None, priority=0, parent=[], triage=False, idempotency_key="cli-key", skills=[],
+        model_override=None, provider_override=None, reasoning_effort="not-a-level", goal_mode=False,
+        goal_max_turns=None, initial_status="running", json=False,
+    )
+    assert kanban_cli._cmd_create(cli_args) == 2
+
+    tool_payload = json.loads(kanban_tools._handle_create({
+        "title": "Tool replay", "body": "unchanged", "assignee": "claudeprimary",
+        "idempotency_key": "tool-key", "reasoning_effort": "not-a-level",
+    }))
+    assert "reasoning_effort must be one of" in tool_payload["error"]
+
+    replay = router_client.post("/api/plugins/kanban/tasks", json={
+        "title": "Dashboard replay", "body": "unchanged", "assignee": "claudeprimary",
+        "idempotency_key": "dashboard-key", "reasoning_effort": "not-a-level",
+    })
+    assert replay.status_code == 400
+    assert "reasoning_effort must be one of" in replay.json()["detail"]

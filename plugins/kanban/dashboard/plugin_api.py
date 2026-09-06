@@ -539,6 +539,7 @@ def create_task(payload: CreateTaskBody, board: Optional[str] = Query(None)):
         # Keep established explicit-override validation ahead of the idempotent
         # fast path, which otherwise skips the DB create validation entirely.
         kanban_db._validate_model_override(payload.model_override, payload.provider_override)
+        kanban_db.normalize_reasoning_effort(payload.reasoning_effort)
         # An idempotent replay must return its existing route without consuming
         # another classifier invocation.
         existing = kanban_db.get_task_by_idempotency_key(conn, payload.idempotency_key)
