@@ -100,10 +100,17 @@ class TestPathResolution:
         assert p == fresh_home / "kanban" / "boards" / "atm10-server" / "kanban.db"
 
 
-    def test_env_var_db_override_still_wins(self, fresh_home, tmp_path, monkeypatch):
-        """``HERMES_KANBAN_DB`` pins the file regardless of board= arg."""
+    def test_env_var_db_override_wins_when_vouched_for(self, fresh_home, tmp_path, monkeypatch):
+        """``HERMES_KANBAN_DB`` pins the file regardless of board= arg.
+
+        A pin OUTSIDE the current kanban home now has to say so via
+        ``HERMES_KANBAN_PIN_HOME``: an unvouched out-of-home pin is
+        indistinguishable from the stale inherited env that let sandboxed probes
+        drive the live board (see ``test_kanban_db_sandbox_isolation.py``).
+        """
         forced = tmp_path / "custom.db"
         monkeypatch.setenv("HERMES_KANBAN_DB", str(forced))
+        monkeypatch.setenv("HERMES_KANBAN_PIN_HOME", str(fresh_home))
         assert kb.kanban_db_path() == forced
         assert kb.kanban_db_path(board="ignored") == forced
 
