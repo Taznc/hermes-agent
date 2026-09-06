@@ -466,7 +466,7 @@ def test_worker_launcher_systemd_run_user_applies_when_bus_reachable(worker_setu
 
 def test_systemd_user_bus_reachable_checks_socket_on_disk(monkeypatch, tmp_path):
     fake_socket = tmp_path / "bus"
-    fake_socket.write_text("")
+    fake_socket.write_text("", encoding="utf-8")
     monkeypatch.setenv("XDG_RUNTIME_DIR", str(tmp_path))
     monkeypatch.setenv("DBUS_SESSION_BUS_ADDRESS", f"unix:path={fake_socket}")
 
