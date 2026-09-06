@@ -205,14 +205,32 @@ def _placeholders(ids: list) -> str:
     return ",".join(["?"] * len(ids))
 
 
-def _compute_task_diagnostics(conn: sqlite3.Connection, task_ids: Optional[list[str]] = None) -> dict[str, list[dict]]:
+def _compute_task_diagnostics(
+    conn: sqlite3.Connection, task_ids: Optional[list[str]] = None, *, board: Optional[str] = None,
+) -> dict[str, list[dict]]:
     """``{task_id: [diagnostic_dict, ...]}`` (tasks with none omitted) via three aggregate
-    queries (tasks, events, runs) — slurps the board; paginate if profiling shows a hotspot."""
+    queries (tasks, events, runs) — slurps the board; paginate if profiling shows a hotspot.
+
+    ``board`` must be the SAME resolved slug ``conn`` was opened against (the caller's
+    ``_board_conn``/``_conn`` resolution) so the concurrency snapshot's "other boards"
+    total excludes the right board rather than falling back to the process's active-board
+    default, which can differ under ``GET /board/all`` or an explicit ``?board=`` query.
+    """
     from hermes_cli.config import load_config
 
     if task_ids is not None and not task_ids:
         return {}
-    diag_config = kd.config_from_runtime_config(load_config())
+    raw_config = load_config()
+    diag_config = kd.config_from_runtime_config(raw_config)
+    kanban_cfg = raw_config.get("kanban") if isinstance(raw_config, dict) else None
+    # Same caps/counts the dispatcher enforces (kanban_db_dispatch.concurrency_snapshot)
+    # so `stranded_in_ready` can suppress itself when the board is correctly at capacity
+    # instead of drifting from the real cap check with a second counter.
+    try:
+        concurrency = kbd.concurrency_snapshot(
+            conn, board=board, kanban_cfg=kanban_cfg if isinstance(kanban_cfg, dict) else None)
+    except Exception:
+        concurrency = None
     if task_ids is not None:
         rows = conn.execute(f"SELECT * FROM tasks WHERE id IN ({_placeholders(task_ids)})", tuple(task_ids)).fetchall()
     else:
@@ -235,7 +253,8 @@ def _compute_task_diagnostics(conn: sqlite3.Connection, task_ids: Optional[list[
     for r in rows:
         tid = r["id"]
         diags = kd.compute_task_diagnostics(
-            r, events_by_task[tid], runs_by_task[tid], config=diag_config, graph=graph_by_task.get(tid))
+            r, events_by_task[tid], runs_by_task[tid], config=diag_config,
+            graph=graph_by_task.get(tid), concurrency=concurrency)
         if diags:
             out[tid] = [d.to_dict() for d in diags]
     return out
@@ -278,6 +297,7 @@ def _links_for(conn: sqlite3.Connection, task_id: str) -> dict[str, list[str]]:
 def _board_payload(
     conn: sqlite3.Connection, *, tenant: Optional[str], include_archived: bool,
     workflow_template_id: Optional[str], current_step_key: Optional[str],
+    board: Optional[str] = None,
 ) -> dict[str, Any]:
     """Build one board's grouped-by-status payload: link/comment/progress rollups,
     diagnostics, latest summaries, tenant/assignee facets, latest_event_id. This IS
@@ -311,7 +331,7 @@ def _board_payload(
         p = progress.setdefault(row["pid"], {"done": 0, "total": 0})
         p["total"] += 1
         p["done"] += row["cstatus"] == "done"
-    diagnostics_per_task = _compute_task_diagnostics(conn, task_ids=None)
+    diagnostics_per_task = _compute_task_diagnostics(conn, task_ids=None, board=board)
     latest_event_id = conn.execute("SELECT COALESCE(MAX(id), 0) AS m FROM task_events").fetchone()["m"]
     columns: dict[str, list[dict]] = {c: [] for c in BOARD_COLUMNS}
     if include_archived:
@@ -351,7 +371,7 @@ def get_board(
     with _board_conn(board) as (board, conn):
         return _board_payload(
             conn, tenant=tenant, include_archived=include_archived,
-            workflow_template_id=workflow_template_id, current_step_key=current_step_key)
+            workflow_template_id=workflow_template_id, current_step_key=current_step_key, board=board)
 
 
 # --- GET /board/all — consolidated multi-board view --------------------------
@@ -367,7 +387,7 @@ def _fetch_board_payload(
         with closing(_conn(board=slug)) as conn:
             return _board_payload(
                 conn, tenant=tenant, include_archived=include_archived,
-                workflow_template_id=workflow_template_id, current_step_key=current_step_key)
+                workflow_template_id=workflow_template_id, current_step_key=current_step_key, board=slug)
     return _with_board_pinned(slug, _run)
 
 
@@ -465,7 +485,7 @@ def get_task(
         links = _links_for(conn, task_id)
         child_summaries = kanban_db.latest_summaries(conn, links["children"])
         children = filter(None, (kanban_db.get_task(conn, cid) for cid in links["children"]))
-        _attach_diagnostics(task_d, _compute_task_diagnostics(conn, task_ids=[task_id]).get(task_id) or [])
+        _attach_diagnostics(task_d, _compute_task_diagnostics(conn, task_ids=[task_id], board=board).get(task_id) or [])
         return {
             "task": task_d,
             "comments": [asdict(c) for c in kanban_db.list_comments(conn, task_id)],
@@ -1075,7 +1095,7 @@ def list_diagnostics(
     """Tasks with an active diagnostic, highest severity first then most recent; also
     consumed by ``hermes kanban diagnostics`` when the dashboard runs."""
     with _board_conn(board) as (board, conn):
-        diags_by_task = _compute_task_diagnostics(conn, task_ids=None)
+        diags_by_task = _compute_task_diagnostics(conn, task_ids=None, board=board)
         if severity and diags_by_task:
             diags_by_task = {
                 tid: keep
