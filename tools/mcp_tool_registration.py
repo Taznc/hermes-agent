@@ -7,6 +7,7 @@ import logging
 from dataclasses import dataclass
 from types import SimpleNamespace
 from typing import TYPE_CHECKING, Any, Callable, Dict, Iterable, List, Optional
+from urllib.parse import urlsplit
 from tools.mcp_tool_common import _parse_boolish, _core, _resolve_tool_timeout, mcp_field
 from tools import mcp_tool_handlers as _handlers
 from tools import mcp_tool_schema as _schema
@@ -54,6 +55,31 @@ def _record_tool_trust_metadata(server_name: str, config: dict, tools: List[Any]
         _core._server_trust_levels[server_name] = _normalize_server_trust((config or {}).get("trust"))
         hints = _core._tool_read_only_hints.setdefault(server_name, {})
         hints.update({t.name: _annotation_read_only_hint(t) for t in tools if getattr(t, "name", None)})
+
+
+def _ui_resource_uri(mcp_tool: Any) -> Optional[str]:
+    """Return one bounded official MCP Apps ``ui://`` URI, else None."""
+    meta = mcp_field(mcp_tool, "meta", "_meta")
+    ui = meta.get("ui") if isinstance(meta, dict) else None
+    uri = ui.get("resourceUri") if isinstance(ui, dict) else None
+    if not isinstance(uri, str) or not uri or len(uri) > 2048 or any(ord(char) < 32 for char in uri):
+        return None
+    try:
+        parsed = urlsplit(uri)
+    except ValueError:
+        return None
+    return uri if parsed.scheme == "ui" else None
+
+
+def _record_tool_ui_metadata(server_name: str, tools: List[Any]) -> None:
+    """Retain only validated UI resource declarations for this connected server."""
+    resources = {tool.name: uri for tool in tools if getattr(tool, "name", None)
+                 for uri in [_ui_resource_uri(tool)] if uri is not None}
+    with _core._lock:
+        if resources:
+            _core._mcp_tool_ui_resources[server_name] = resources
+        else:
+            _core._mcp_tool_ui_resources.pop(server_name, None)
 
 
 def _track_mcp_tool_server(tool_name: str, server_name: str) -> None:
@@ -292,6 +318,7 @@ def _register_server_tools(name: str, server: "MCPServerTask", config: dict) -> 
     ``toolsets.TOOLSETS``; lossy normalization collisions (``read-file``/``read_file``) fail closed."""
     should_register = _make_tool_filter(name, config)
     _record_tool_trust_metadata(name, config, server._tools)
+    _record_tool_ui_metadata(name, server._tools)
     candidates = _tool_candidates(name, server._tools, should_register, server.tool_timeout)
     candidates += _utility_candidates(name, _select_utility_schemas(name, server, config), server.tool_timeout)
     registered = _register_candidates(

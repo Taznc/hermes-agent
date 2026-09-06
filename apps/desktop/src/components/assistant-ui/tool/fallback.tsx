@@ -74,6 +74,7 @@ import {
 } from './fallback-model'
 import { isToolCallPart, summarizeToolRun } from './run-summary'
 import { ToolRunTicker } from './run-ticker'
+import { McpAppCard, parseMcpAppCard } from '../mcp-app-card'
 
 // `true` when a ToolEntry is rendered inside an embedding wrapper that owns
 // the per-row chrome (timer / preview). The flat ToolGroupSlot sets this
@@ -373,6 +374,7 @@ function ToolEntry({ part }: ToolEntryProps) {
   // re-render every mounted tool row (the factory caches a per-id atom).
   const sideDiff = useStore($toolInlineDiff(toolCallId ?? ''))
   const inlineDiff = stripInlineDiffChrome(sideDiff) || inlineDiffFromResult(result)
+  const mcpApp = useMemo(() => parseMcpAppCard(result), [result])
   const isFileEdit = isFileEditTool(toolName)
   const defaultOpen = Boolean(inlineDiff)
   const open = useDisclosureOpen(disclosureId, defaultOpen)
@@ -471,6 +473,7 @@ function ToolEntry({ part }: ToolEntryProps) {
     view.stderr ||
     view.terminalCommand ||
     view.terminalExitCode !== undefined ||
+    mcpApp !== null ||
     toolViewMode === 'technical'
   )
 
@@ -707,6 +710,7 @@ function ToolEntry({ part }: ToolEntryProps) {
                 )}
               </div>
             ))}
+          {mcpApp && <McpAppCard card={mcpApp} />}
           {toolViewMode === 'technical' && <ToolPayloadDisclosure args={part.args} result={part.result} />}
         </div>
       )}

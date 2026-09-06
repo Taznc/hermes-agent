@@ -6,6 +6,7 @@ import asyncio
 import contextvars
 import inspect
 import json
+import secrets
 import time
 from contextlib import asynccontextmanager
 from types import SimpleNamespace
@@ -416,6 +417,56 @@ def _render_call_tool_result(result, server_name: str) -> str:
         return json.dumps({"result": text_result}, ensure_ascii=False)
 
 
+_MCP_APP_HTML_MAX_CHARS = 256 * 1024
+
+
+def _mcp_app_html(resource) -> Optional[str]:
+    """Accept exactly one bounded text/html resource response for the opaque frame."""
+    contents = getattr(resource, "contents", None)
+    if not isinstance(contents, (list, tuple)) or len(contents) != 1:
+        return None
+    content = contents[0]
+    html = getattr(content, "text", None)
+    mime = mcp_field(content, "mime_type", "mimeType")
+    if not isinstance(html, str) or not html or len(html) > _MCP_APP_HTML_MAX_CHARS:
+        return None
+    if not isinstance(mime, str) or mime.lower().split(";", 1)[0].strip() != "text/html":
+        return None
+    normalized = html.lstrip().lower()
+    if "<html" not in normalized or "</html>" not in normalized:
+        return None
+    return html
+
+
+async def _read_mcp_app_card(server, server_name: str, tool_name: str) -> Optional[dict]:
+    """Read only the discovery-time URI; read failures never alter the tool result."""
+    uri = _core._mcp_tool_ui_resources.get(server_name, {}).get(tool_name)
+    if uri is None:
+        return None
+    try:
+        html = _mcp_app_html(await server.session.read_resource(uri))
+    except Exception:
+        logger.debug("MCP Apps resource read failed for %s/%s", server_name, tool_name, exc_info=True)
+        return None
+    if html is None:
+        return None
+    return {"id": secrets.token_urlsafe(18), "serverId": server_name, "toolName": tool_name, "resourceUri": uri, "html": html}
+
+
+def _with_mcp_app_card(rendered: str, card: Optional[dict]) -> str:
+    """Add host-only display data without changing the established ordinary payload."""
+    if card is None:
+        return rendered
+    try:
+        payload = json.loads(rendered)
+    except (TypeError, ValueError):
+        return rendered
+    if not isinstance(payload, dict) or "error" in payload:
+        return rendered
+    payload["mcpApp"] = card
+    return json.dumps(payload, ensure_ascii=False)
+
+
 def _make_tool_handler(server_name: str, tool_name: str, tool_timeout: float):
     """Sync registry handler (``handler(args_dict, **kwargs) -> str``) calling an MCP tool via the background loop."""
     op = f"tools/call {tool_name}"
@@ -436,9 +487,11 @@ def _make_tool_handler(server_name: str, tool_name: str, tool_timeout: float):
                     result = await _call_tool_racing_stdio_death(server, server_name, tool_name, args)
                 finally:
                     server._pending_call_context = None
+                card = (None if mcp_field(result, "is_error", "isError", False)
+                        else await _read_mcp_app_card(server, server_name, tool_name))
             if getattr(server, "_mark_session_proven", None) is not None:  # round-trip done: transport healthy
                 server._mark_session_proven()
-            return _render_call_tool_result(result, server_name)
+            return _with_mcp_app_card(_render_call_tool_result(result, server_name), card)
 
         def _on_failure(exc):
             _core._bump_server_error(server_name)
