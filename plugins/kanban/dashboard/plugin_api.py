@@ -536,6 +536,15 @@ class CreateTaskBody(BaseModel):
 @router.post("/tasks")
 def create_task(payload: CreateTaskBody, board: Optional[str] = Query(None)):
     with _board_conn(board) as (board, conn), _value_error_400():
+        # An idempotent replay must return its existing route without consuming
+        # another classifier invocation.
+        existing = kanban_db.get_task_by_idempotency_key(conn, payload.idempotency_key)
+        if existing is not None:
+            return {
+                "task": _task_dict(existing),
+                "attachments": [],
+                "attachment_warnings": [],
+            }
         # CreateTaskBody field names match create_task's keyword parameters.
         from hermes_cli.kanban_model_routing import resolve_kanban_model_route
 

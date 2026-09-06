@@ -131,8 +131,10 @@ def test_create_swarm_graph_is_atomic_and_rolls_back_partial_build(
         writer.close()
 
 
-def test_create_swarm_applies_routing_before_entering_write_txn(tmp_path, monkeypatch):
-    conn = kbc.connect(tmp_path / "kanban.db")
+def test_create_swarm_resolves_every_route_before_any_topology_is_visible(tmp_path, monkeypatch):
+    db_path = tmp_path / "kanban.db"
+    conn = kbc.connect(db_path)
+    reader = kbc.connect(db_path)
     calls: list[dict[str, object]] = []
 
     route = KanbanModelRouteDecision(
@@ -144,6 +146,8 @@ def test_create_swarm_applies_routing_before_entering_write_txn(tmp_path, monkey
     )
 
     def _fake_resolver(**kwargs):
+        assert not conn.in_transaction
+        assert reader.execute("SELECT COUNT(*) FROM tasks").fetchone()[0] == 0
         calls.append(kwargs)
         return route
 
@@ -188,6 +192,38 @@ def test_create_swarm_applies_routing_before_entering_write_txn(tmp_path, monkey
         assert verifier.status == "todo"
         assert synthesizer.status == "todo"
     finally:
+        reader.close()
+        conn.close()
+
+
+def test_create_swarm_classifier_failure_leaves_no_partial_topology(tmp_path, monkeypatch):
+    db_path = tmp_path / "kanban.db"
+    conn = kbc.connect(db_path)
+    reader = kbc.connect(db_path)
+    calls = 0
+
+    def _failing_resolver(**_kwargs):
+        nonlocal calls
+        calls += 1
+        assert reader.execute("SELECT COUNT(*) FROM tasks").fetchone()[0] == 0
+        if calls == 3:
+            raise RuntimeError("classifier unavailable")
+        return KanbanModelRouteDecision("default", None, None, None, None)
+
+    monkeypatch.setattr("hermes_cli.kanban_model_routing.resolve_kanban_model_route", _failing_resolver)
+    try:
+        with pytest.raises(RuntimeError, match="classifier unavailable"):
+            create_swarm(
+                conn,
+                goal="Never expose a partial swarm.",
+                workers=[SwarmWorkerSpec(profile="researcher", title="Research", body="Find proof")],
+                verifier_assignee="reviewer",
+                synthesizer_assignee="writer",
+            )
+        assert calls == 3
+        assert reader.execute("SELECT COUNT(*) FROM tasks").fetchone()[0] == 0
+    finally:
+        reader.close()
         conn.close()
 
 

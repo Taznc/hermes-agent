@@ -16,7 +16,6 @@ notifier, slash command and dispatcher keep working without a new service.
 from __future__ import annotations
 
 from dataclasses import asdict, dataclass, field
-import contextlib
 import json
 import sqlite3
 import time
@@ -178,6 +177,7 @@ def create_swarm(
         "immediately so parallel workers can start while it remains the "
         f"shared blackboard and audit anchor.\n\nGoal:\n{goal}"
     )
+    planned_root_id = existing_root_id or kb._new_task_id()
     root_route = None
     if existing_root_id is None:
         root_route = resolve_kanban_model_route(title=root_title_value, body=root_body)
@@ -190,10 +190,20 @@ def create_swarm(
         "Synthesize the verified worker outputs into the final deliverable. "
         "Do not start until the verifier has passed the gate."
     )
-
+    context_suffix = _swarm_context(planned_root_id, goal)
+    worker_bodies = [(spec.body or "") + context_suffix for spec in worker_specs]
+    verifier_body_with_context = verifier_body + context_suffix
+    synthesizer_body_with_context = synthesizer_body + context_suffix
+    worker_routes = [
+        resolve_kanban_model_route(title=spec.title, body=body)
+        for spec, body in zip(worker_specs, worker_bodies)
+    ]
+    verifier_route = resolve_kanban_model_route(title=verifier_title, body=verifier_body_with_context)
+    synthesizer_route = resolve_kanban_model_route(
+        title=synthesizer_title, body=synthesizer_body_with_context
+    )
 
     activated = False
-    root_committed = False
     root: Optional[str] = None
     created: Optional[SwarmCreated] = None
     try:
@@ -205,6 +215,7 @@ def create_swarm(
                 assignee=created_by,
                 priority=priority,
                 idempotency_key=idempotency_key,
+                task_id=planned_root_id,
                 initial_status="blocked",
                 **({} if root_route is None else _route_task_kwargs(root_route)),
                 created_by=created_by,
@@ -219,22 +230,6 @@ def create_swarm(
                 synthesizer_id = existing_after_root.get("synthesizer_id")
                 if worker_ids and verifier_id and synthesizer_id:
                     return SwarmCreated(root, worker_ids, str(verifier_id), str(synthesizer_id))
-
-        root_committed = True
-        context_suffix = _swarm_context(root, goal)
-        worker_bodies = [(spec.body or "") + context_suffix for spec in worker_specs]
-        verifier_body_with_context = verifier_body + context_suffix
-        synthesizer_body_with_context = synthesizer_body + context_suffix
-        worker_routes = [
-            resolve_kanban_model_route(title=spec.title, body=body)
-            for spec, body in zip(worker_specs, worker_bodies)
-        ]
-        verifier_route = resolve_kanban_model_route(title=verifier_title, body=verifier_body_with_context)
-        synthesizer_route = resolve_kanban_model_route(
-            title=synthesizer_title, body=synthesizer_body_with_context
-        )
-
-        with kb.write_txn(conn):
             worker_ids = []
             for spec, body, route in zip(worker_specs, worker_bodies, worker_routes):
                 worker_ids.append(
@@ -315,15 +310,8 @@ def create_swarm(
             )
         return created
     except Exception:
-        if root_committed:
-            cleanup_ids: list[str] = []
-            if created is not None:
-                cleanup_ids.extend([created.synthesizer_id, created.verifier_id, *reversed(created.worker_ids)])
-            if root is not None:
-                cleanup_ids.append(root)
-            for task_id in cleanup_ids:
-                with contextlib.suppress(Exception):
-                    kb.delete_task(conn, task_id)
+        # Every topology write shares the transaction above, so a classifier or
+        # construction error cannot expose a partial swarm.
         raise
 
 

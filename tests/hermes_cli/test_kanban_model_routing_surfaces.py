@@ -256,3 +256,43 @@ def test_routing_classifier_runs_only_on_create_across_lifecycle(
             expected_run_id=retried_again.current_run_id,
         ) is True
         assert len(calls) == 1
+
+
+def test_idempotent_replays_skip_routing_across_create_surfaces(
+    kanban_home, monkeypatch, router_client
+):
+    """An existing idempotency key must return without spending a classifier call."""
+    with kbc.connect() as conn:
+        cli_id = kb.create_task(conn, title="CLI existing", assignee="claudeprimary", idempotency_key="cli-key")
+        tool_id = kb.create_task(conn, title="Tool existing", assignee="claudeprimary", idempotency_key="tool-key")
+        dashboard_id = kb.create_task(
+            conn, title="Dashboard existing", assignee="claudeprimary", idempotency_key="dashboard-key"
+        )
+
+    def _unexpected_resolver(**_kwargs):
+        raise AssertionError("idempotent replay must not classify")
+
+    monkeypatch.setattr("hermes_cli.kanban_model_routing.resolve_kanban_model_route", _unexpected_resolver)
+    cli_args = Namespace(
+        workspace=None, branch=None, max_runtime=None, max_retries=None,
+        title="CLI replay", body="unchanged", assignee="claudeprimary", created_by="tester",
+        tenant=None, priority=0, parent=[], triage=False, idempotency_key="cli-key", skills=[],
+        model_override=None, provider_override=None, reasoning_effort=None, goal_mode=False,
+        goal_max_turns=None, initial_status="running", json=False,
+    )
+    assert kanban_cli._cmd_create(cli_args) == 0
+    assert _latest_task_by_title("CLI existing").id == cli_id
+
+    tool_payload = json.loads(kanban_tools._handle_create({
+        "title": "Tool replay", "body": "unchanged", "assignee": "claudeprimary",
+        "idempotency_key": "tool-key",
+    }))
+    assert tool_payload["ok"] is True
+    assert tool_payload["task_id"] == tool_id
+
+    response = router_client.post("/api/plugins/kanban/tasks", json={
+        "title": "Dashboard replay", "body": "unchanged", "assignee": "claudeprimary",
+        "idempotency_key": "dashboard-key",
+    })
+    assert response.status_code == 200
+    assert response.json()["task"]["id"] == dashboard_id

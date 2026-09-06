@@ -1420,7 +1420,7 @@ def create_task(
     workspace_kind: str = "scratch", workspace_path: Optional[str] = None,
     branch_name: Optional[str] = None, tenant: Optional[str] = None, priority: int = 0,
     parents: Iterable[str] = (), triage: bool = False, idempotency_key: Optional[str] = None,
-    max_runtime_seconds: Optional[int] = None, skills: Optional[Iterable[str]] = None,
+    task_id: Optional[str] = None, max_runtime_seconds: Optional[int] = None, skills: Optional[Iterable[str]] = None,
     max_retries: Optional[int] = None, model_override: Optional[str] = None,
     provider_override: Optional[str] = None, reasoning_effort: Optional[str] = None,
     route_source: Optional[str] = None, route_name: Optional[str] = None,
@@ -1433,7 +1433,8 @@ def create_task(
     Status: ``ready`` unless a parent is not ``done`` (``todo``); ``triage=True``
     forces ``triage``; ``initial_status="blocked"`` parks it for human ops.
     ``idempotency_key``: an existing non-archived task with the key is returned
-    instead of a duplicate. ``max_runtime_seconds``: cap before the dispatcher
+    instead of a duplicate. ``task_id`` reserves a caller-generated identifier
+    for atomic graph construction. ``max_runtime_seconds``: cap before the dispatcher
     SIGTERMs and re-queues. ``model_override``/``provider_override`` pin the
     worker model (provider requires model); ``reasoning_effort`` is independent.
     ``route_source``/``route_name`` capture create-time routing provenance for
@@ -1458,6 +1459,11 @@ def create_task(
     if branch_name and workspace_kind != "worktree":
         raise ValueError("branch_name is only valid for worktree workspaces")
 
+    if task_id is not None:
+        task_id = str(task_id).strip()
+        if not task_id:
+            raise ValueError("task_id must not be empty")
+
     # A project-scoped board anchors every new task to its project's repo
     # (deterministic worktree + branch) without each surface repeating it.
     if project_id is None:
@@ -1474,14 +1480,9 @@ def create_task(
 
     # Idempotency check BEFORE the write txn (no lock held); a concurrent-create
     # race may insert twice, the next lookup stabilises on the newest.
-    if idempotency_key:
-        row = conn.execute(
-            "SELECT id FROM tasks WHERE idempotency_key = ? "
-            "AND status != 'archived' "
-            "ORDER BY created_at DESC LIMIT 1", (idempotency_key,),
-        ).fetchone()
-        if row:
-            return row["id"]
+    existing = get_task_by_idempotency_key(conn, idempotency_key)
+    if existing is not None:
+        return existing.id
 
     now = int(time.time())
 
@@ -1492,9 +1493,12 @@ def create_task(
         if board_default:
             workspace_path = str(board_default)
 
-    # Retry once on the extremely unlikely id collision.
-    for attempt in range(2):
-        task_id = _new_task_id()
+    # Retry once on the extremely unlikely generated-id collision. A graph
+    # builder may reserve an id before route preflight, so never silently
+    # substitute a different id for an explicit reservation.
+    requested_task_id = task_id
+    for attempt in range(1 if requested_task_id is not None else 2):
+        task_id = requested_task_id or _new_task_id()
         try:
             # allow_nested: graph builders compose create_task under one outer
             # commit so the dispatcher never sees a half-built graph.
@@ -1559,7 +1563,7 @@ def create_task(
                 _inherit_notify_subs(conn, task_id, parents, created_at=now)
             return task_id
         except sqlite3.IntegrityError:
-            if attempt == 1:
+            if requested_task_id is not None or attempt == 1:
                 raise
     raise RuntimeError("unreachable")
 
@@ -1659,6 +1663,20 @@ def _inherit_notify_subs(
 
 def get_task(conn: sqlite3.Connection, task_id: str) -> Optional[Task]:
     row = conn.execute("SELECT * FROM tasks WHERE id = ?", (task_id,)).fetchone()
+    return Task.from_row(row) if row else None
+
+
+def get_task_by_idempotency_key(
+    conn: sqlite3.Connection, idempotency_key: Optional[str]
+) -> Optional[Task]:
+    """Return the newest active task for an idempotent create replay."""
+    if not idempotency_key:
+        return None
+    row = conn.execute(
+        "SELECT * FROM tasks WHERE idempotency_key = ? AND status != 'archived' "
+        "ORDER BY created_at DESC LIMIT 1",
+        (idempotency_key,),
+    ).fetchone()
     return Task.from_row(row) if row else None
 
 
