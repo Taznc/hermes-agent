@@ -162,6 +162,63 @@ def test_anthropic_usage_maps_self_describing_limits_without_known_kind(monkeypa
     assert snapshot.balances[0].limit == 10.0
 
 
+def test_anthropic_usage_maps_dict_scope_with_only_display_name_and_id(monkeypatch):
+    """Regression for a real live-data bug: a dict scope carrying only
+    ``id``/``display_name`` (not ``model``/``name``) must resolve to the
+    readable display name, never fall through to a stringified dict repr."""
+    payload = {
+        "limits": [
+            {
+                "kind": "weekly_scoped",
+                "percent": 48,
+                "severity": "normal",
+                "is_active": True,
+                "resets_at": "2030-01-01T00:00:00Z",
+                "scope": {"id": None, "display_name": "Fable"},
+            }
+        ],
+    }
+    snapshot = _anthropic_snapshot(monkeypatch, payload)
+
+    assert snapshot is not None
+    assert snapshot.windows[0].scope == "Fable"
+
+
+@pytest.mark.parametrize(
+    "scope_value",
+    [
+        {"id": None, "display_name": "Fable"},
+        {"id": "acct_1"},
+        {},
+        {"id": None, "display_name": None},
+        ["not", "a", "mapping"],
+        object(),
+    ],
+)
+def test_dict_or_non_string_scope_never_leaks_a_python_repr(monkeypatch, scope_value):
+    """Invariant, not a snapshot of today's key set: whatever shape a raw
+    ``scope`` field takes, the resolved window's ``scope`` string must never
+    contain a dict/object repr's tell-tale ``{`` or ``'`` characters."""
+    payload = {
+        "limits": [
+            {
+                "kind": "weekly_scoped",
+                "percent": 48,
+                "severity": "normal",
+                "is_active": True,
+                "resets_at": "2030-01-01T00:00:00Z",
+                "scope": scope_value,
+            }
+        ],
+    }
+    snapshot = _anthropic_snapshot(monkeypatch, payload)
+
+    assert snapshot is not None
+    scope = snapshot.windows[0].scope
+    if scope is not None:
+        assert "{" not in scope and "'" not in scope
+
+
 def test_anthropic_usage_keeps_unknown_top_level_window(monkeypatch):
     payload = {
         "tangelo": {"utilization": 0.37, "resets_at": "2030-01-01T00:00:00Z"},
