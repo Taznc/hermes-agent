@@ -16,6 +16,7 @@ notifier, slash command and dispatcher keep working without a new service.
 from __future__ import annotations
 
 from dataclasses import asdict, dataclass, field
+import contextlib
 import json
 import sqlite3
 import time
@@ -192,29 +193,34 @@ def create_swarm(
 
 
     activated = False
-    with kb.write_txn(conn):
-        root = kb.create_task(
-            conn,
-            title=root_title_value,
-            body=root_body,
-            assignee=created_by,
-            priority=priority,
-            idempotency_key=idempotency_key,
-            initial_status="blocked",
-            **({} if root_route is None else _route_task_kwargs(root_route)),
-            created_by=created_by,
-            tenant=tenant,
-            workspace_kind=workspace_kind,
-            workspace_path=workspace_path,
-        )
-        existing_after_root = latest_blackboard(conn, root).get("topology")
-        if isinstance(existing_after_root, dict):
-            worker_ids = [str(x) for x in existing_after_root.get("worker_ids", []) if x]
-            verifier_id = existing_after_root.get("verifier_id")
-            synthesizer_id = existing_after_root.get("synthesizer_id")
-            if worker_ids and verifier_id and synthesizer_id:
-                return SwarmCreated(root, worker_ids, str(verifier_id), str(synthesizer_id))
+    root_committed = False
+    root: Optional[str] = None
+    created: Optional[SwarmCreated] = None
+    try:
+        with kb.write_txn(conn):
+            root = kb.create_task(
+                conn,
+                title=root_title_value,
+                body=root_body,
+                assignee=created_by,
+                priority=priority,
+                idempotency_key=idempotency_key,
+                initial_status="blocked",
+                **({} if root_route is None else _route_task_kwargs(root_route)),
+                created_by=created_by,
+                tenant=tenant,
+                workspace_kind=workspace_kind,
+                workspace_path=workspace_path,
+            )
+            existing_after_root = latest_blackboard(conn, root).get("topology")
+            if isinstance(existing_after_root, dict):
+                worker_ids = [str(x) for x in existing_after_root.get("worker_ids", []) if x]
+                verifier_id = existing_after_root.get("verifier_id")
+                synthesizer_id = existing_after_root.get("synthesizer_id")
+                if worker_ids and verifier_id and synthesizer_id:
+                    return SwarmCreated(root, worker_ids, str(verifier_id), str(synthesizer_id))
 
+        root_committed = True
         context_suffix = _swarm_context(root, goal)
         worker_bodies = [(spec.body or "") + context_suffix for spec in worker_specs]
         verifier_body_with_context = verifier_body + context_suffix
@@ -223,91 +229,102 @@ def create_swarm(
             resolve_kanban_model_route(title=spec.title, body=body)
             for spec, body in zip(worker_specs, worker_bodies)
         ]
-        verifier_route = resolve_kanban_model_route(
-            title=verifier_title, body=verifier_body_with_context
-        )
+        verifier_route = resolve_kanban_model_route(title=verifier_title, body=verifier_body_with_context)
         synthesizer_route = resolve_kanban_model_route(
             title=synthesizer_title, body=synthesizer_body_with_context
         )
-        worker_ids = []
-        for spec, body, route in zip(worker_specs, worker_bodies, worker_routes):
-            worker_ids.append(
-                kb.create_task(
-                    conn,
-                    title=spec.title,
-                    body=body,
-                    assignee=spec.profile,
-                    parents=[root],
-                    priority=spec.priority or priority,
-                    skills=spec.skills or None,
-                    max_runtime_seconds=spec.max_runtime_seconds,
-                    **_route_task_kwargs(route),
-                    created_by=created_by,
-                    tenant=tenant,
-                    workspace_kind=workspace_kind,
-                    workspace_path=workspace_path,
-                )
-            )
-        verifier = kb.create_task(
-            conn,
-            title=verifier_title,
-            body=verifier_body_with_context,
-            assignee=verifier_assignee,
-            parents=worker_ids,
-            priority=priority,
-            skills=["requesting-code-review"],
-            **_route_task_kwargs(verifier_route),
-            created_by=created_by,
-            tenant=tenant,
-            workspace_kind=workspace_kind,
-            workspace_path=workspace_path,
-        )
-        synthesizer = kb.create_task(
-            conn,
-            title=synthesizer_title,
-            body=synthesizer_body_with_context,
-            assignee=synthesizer_assignee,
-            parents=[verifier],
-            priority=priority,
-            skills=["humanizer"],
-            **_route_task_kwargs(synthesizer_route),
-            created_by=created_by,
-            tenant=tenant,
-            workspace_kind=workspace_kind,
-            workspace_path=workspace_path,
-        )
 
-        created = SwarmCreated(root, worker_ids, verifier, synthesizer)
-        post_blackboard_update(conn, root, author=created_by, key="topology", value=created.as_dict() | {"goal": goal})
-        root_row = kb.get_task(conn, root)
-        if root_row is not None and root_row.status == "blocked":
-            if not _activate_root_inline(
+        with kb.write_txn(conn):
+            worker_ids = []
+            for spec, body, route in zip(worker_specs, worker_bodies, worker_routes):
+                worker_ids.append(
+                    kb.create_task(
+                        conn,
+                        title=spec.title,
+                        body=body,
+                        assignee=spec.profile,
+                        parents=[root],
+                        priority=spec.priority or priority,
+                        skills=spec.skills or None,
+                        max_runtime_seconds=spec.max_runtime_seconds,
+                        **_route_task_kwargs(route),
+                        created_by=created_by,
+                        tenant=tenant,
+                        workspace_kind=workspace_kind,
+                        workspace_path=workspace_path,
+                    )
+                )
+            verifier = kb.create_task(
                 conn,
-                root,
+                title=verifier_title,
+                body=verifier_body_with_context,
+                assignee=verifier_assignee,
+                parents=worker_ids,
+                priority=priority,
+                skills=["requesting-code-review"],
+                **_route_task_kwargs(verifier_route),
+                created_by=created_by,
+                tenant=tenant,
+                workspace_kind=workspace_kind,
+                workspace_path=workspace_path,
+            )
+            synthesizer = kb.create_task(
+                conn,
+                title=synthesizer_title,
+                body=synthesizer_body_with_context,
+                assignee=synthesizer_assignee,
+                parents=[verifier],
+                priority=priority,
+                skills=["humanizer"],
+                **_route_task_kwargs(synthesizer_route),
+                created_by=created_by,
+                tenant=tenant,
+                workspace_kind=workspace_kind,
+                workspace_path=workspace_path,
+            )
+
+            created = SwarmCreated(root, worker_ids, verifier, synthesizer)
+            post_blackboard_update(conn, root, author=created_by, key="topology", value=created.as_dict() | {"goal": goal})
+            root_row = kb.get_task(conn, root)
+            if root_row is not None and root_row.status == "blocked":
+                if not _activate_root_inline(
+                    conn,
+                    root,
+                    summary=activation_summary,
+                    metadata={
+                        "kind": "kanban_swarm_v1",
+                        "goal": goal.strip(),
+                        "worker_count": len(created.worker_ids),
+                    },
+                ):
+                    raise RuntimeError("could not activate the completed swarm topology")
+                activated = True
+        if activated:
+            # After commit: recompute_ready opens its own txn and must never run
+            # under an open write_txn.
+            kb.recompute_ready(conn)
+            root_task = kb.get_task(conn, created.root_id)
+            run = kb.latest_run(conn, created.root_id)
+            kb._fire_kanban_lifecycle_hook(
+                "kanban_task_completed",
+                created.root_id,
+                board=kb.get_current_board(),
+                assignee=root_task.assignee if root_task else None,
+                run_id=run.id if run else None,
                 summary=activation_summary,
-                metadata={
-                    "kind": "kanban_swarm_v1",
-                    "goal": goal.strip(),
-                    "worker_count": len(created.worker_ids),
-                },
-            ):
-                raise RuntimeError("could not activate the completed swarm topology")
-            activated = True
-    if activated:
-        # After commit: recompute_ready opens its own txn and must never run
-        # under an open write_txn.
-        kb.recompute_ready(conn)
-        root = kb.get_task(conn, created.root_id)
-        run = kb.latest_run(conn, created.root_id)
-        kb._fire_kanban_lifecycle_hook(
-            "kanban_task_completed",
-            created.root_id,
-            board=kb.get_current_board(),
-            assignee=root.assignee if root else None,
-            run_id=run.id if run else None,
-            summary=activation_summary,
-        )
-    return created
+            )
+        return created
+    except Exception:
+        if root_committed:
+            cleanup_ids: list[str] = []
+            if created is not None:
+                cleanup_ids.extend([created.synthesizer_id, created.verifier_id, *reversed(created.worker_ids)])
+            if root is not None:
+                cleanup_ids.append(root)
+            for task_id in cleanup_ids:
+                with contextlib.suppress(Exception):
+                    kb.delete_task(conn, task_id)
+        raise
 
 
 def post_blackboard_update(conn: sqlite3.Connection, root_id: str, *, author: str, key: str, value: Any) -> int:
