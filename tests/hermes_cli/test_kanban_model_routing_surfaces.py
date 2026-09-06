@@ -1,0 +1,174 @@
+"""Kanban model-routing integration tests across create surfaces."""
+
+from __future__ import annotations
+
+import json
+from pathlib import Path
+from argparse import Namespace
+
+import pytest
+from fastapi import FastAPI
+from fastapi.testclient import TestClient
+
+from hermes_cli import kanban_db as kb
+from hermes_cli import kanban_db_connect as kbc
+from hermes_cli import kanban as kanban_cli
+from hermes_cli.kanban_model_routing import KanbanModelRouteDecision
+from tools import kanban_tools
+from plugins.kanban.dashboard import plugin_api
+
+
+@pytest.fixture
+def kanban_home(tmp_path, monkeypatch):
+    home = tmp_path / ".hermes"
+    home.mkdir()
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    monkeypatch.setattr(Path, "home", lambda: tmp_path)
+    return home
+
+
+@pytest.fixture
+def routing_decision():
+    return KanbanModelRouteDecision(
+        route_source="mechanical",
+        route_name="mechanical",
+        model_override="gpt-5.4-mini",
+        provider_override="openai-codex",
+        reasoning_effort="medium",
+    )
+
+
+@pytest.fixture
+def router_client(kanban_home):
+    app = FastAPI()
+    app.include_router(plugin_api.router, prefix="/api/plugins/kanban")
+    return TestClient(app)
+
+
+def _latest_task_by_title(title: str):
+    with kbc.connect() as conn:
+        row = conn.execute(
+            "SELECT * FROM tasks WHERE title = ? ORDER BY created_at DESC, id DESC LIMIT 1",
+            (title,),
+        ).fetchone()
+        assert row is not None
+        return kb.Task.from_row(row)
+
+
+def test_create_paths_share_routing_and_show_provenance(
+    kanban_home, routing_decision, monkeypatch, router_client, capsys
+):
+    calls: list[dict] = []
+
+    def _fake_resolver(**kwargs):
+        calls.append(kwargs)
+        return routing_decision
+
+    monkeypatch.setattr("hermes_cli.kanban_model_routing.resolve_kanban_model_route", _fake_resolver)
+
+    cli_args = Namespace(
+        workspace=None,
+        branch=None,
+        max_runtime=None,
+        max_retries=None,
+        title="CLI task",
+        body="compact docs tweak",
+        assignee="claudeprimary",
+        created_by="tester",
+        tenant=None,
+        priority=0,
+        parent=[],
+        triage=False,
+        idempotency_key=None,
+        skills=[],
+        model_override=None,
+        provider_override=None,
+        reasoning_effort=None,
+        goal_mode=False,
+        goal_max_turns=None,
+        initial_status="running",
+        json=False,
+    )
+    assert kanban_cli._cmd_create(cli_args) == 0
+    cli_task = _latest_task_by_title("CLI task")
+    assert cli_task.model_override == "gpt-5.4-mini"
+    assert cli_task.provider_override == "openai-codex"
+    assert cli_task.reasoning_effort == "medium"
+    assert cli_task.route_source == "mechanical"
+    assert cli_task.route_name == "mechanical"
+
+    tool_response = kanban_tools._handle_create({
+        "title": "Tool task",
+        "body": "compact docs tweak",
+        "assignee": "claudeprimary",
+        "model": None,
+        "provider": None,
+        "reasoning_effort": None,
+    })
+    tool_payload = json.loads(tool_response)
+    assert tool_payload["ok"] is True
+    tool_task = _latest_task_by_title("Tool task")
+    assert tool_task.route_source == "mechanical"
+    assert tool_task.route_name == "mechanical"
+    assert tool_task.reasoning_effort == "medium"
+
+    response = router_client.post(
+        "/api/plugins/kanban/tasks",
+        json={
+            "title": "Dashboard task",
+            "body": "compact docs tweak",
+            "assignee": "claudeprimary",
+        },
+    )
+    assert response.status_code == 200
+    dashboard_task = response.json()["task"]
+    assert dashboard_task["route_source"] == "mechanical"
+    assert dashboard_task["route_name"] == "mechanical"
+    assert dashboard_task["reasoning_effort"] == "medium"
+
+    assert len(calls) == 3
+    for call in calls:
+        assert set(call) == {
+            "title",
+            "body",
+            "explicit_model",
+            "explicit_provider",
+            "explicit_reasoning_effort",
+        }
+        assert call["body"] == "compact docs tweak"
+
+    capsys.readouterr()
+    show_args = Namespace(task_id=cli_task.id, json=True, filter_runs=None)
+    assert kanban_cli._cmd_show(show_args) == 0
+    show_payload = json.loads(capsys.readouterr().out)
+    assert show_payload["task"]["route_source"] == "mechanical"
+    assert show_payload["task"]["route_name"] == "mechanical"
+    assert show_payload["task"]["reasoning_effort"] == "medium"
+
+
+def test_route_provenance_survives_review_roundtrip(kanban_home, routing_decision):
+    with kbc.connect() as conn:
+        task_id = kb.create_task(
+            conn,
+            title="Round-trip provenance",
+            body="keep this route stable",
+            assignee="claudeprimary",
+            route_source=routing_decision.route_source,
+            route_name=routing_decision.route_name,
+            model_override=routing_decision.model_override,
+            provider_override=routing_decision.provider_override,
+            reasoning_effort=routing_decision.reasoning_effort,
+        )
+        task = kb.get_task(conn, task_id)
+        assert task is not None
+        assert task.route_source == "mechanical"
+        kb.claim_task(conn, task_id)
+        task = kb.get_task(conn, task_id)
+        assert task is not None
+        run_id = task.current_run_id
+        assert run_id is not None
+        assert kb.request_review(conn, task_id, summary="ready", expected_run_id=run_id, reviewer="reviewer")
+        reviewed = kb.get_task(conn, task_id)
+        assert reviewed is not None
+        assert reviewed.route_source == "mechanical"
+        assert reviewed.route_name == "mechanical"

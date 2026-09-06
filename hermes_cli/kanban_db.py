@@ -841,6 +841,8 @@ class Task:
     model_override: Optional[str] = None
     provider_override: Optional[str] = None  # provider ``model_override`` belongs to
     reasoning_effort: Optional[str] = None   # VALID_REASONING_EFFORTS | "none"; NULL = profile's
+    route_source: Optional[str] = None       # explicit | default | selected route name
+    route_name: Optional[str] = None          # selected route id (if any)
     # Breaker trip count; None -> ``kanban.failure_limit`` -> DEFAULT_FAILURE_LIMIT.
     max_retries: Optional[int] = None
     # ``/goal``-style loop: a judge re-checks each turn IN THE SAME SESSION until
@@ -880,7 +882,7 @@ _TASK_REQUIRED_COLUMNS = (
 _TASK_OPTIONAL_COLUMNS = (
     "branch_name", "project_id", "tenant", "result", "idempotency_key", "worker_pid",
     "max_runtime_seconds", "last_heartbeat_at", "current_run_id", "workflow_template_id",
-    "current_step_key", "max_retries", "session_id",
+    "current_step_key", "max_retries", "session_id", "route_source", "route_name",
 )
 # Text columns where "" is stored/read as "not set".
 _TASK_EMPTY_IS_NULL_COLUMNS = (
@@ -1078,6 +1080,12 @@ CREATE TABLE IF NOT EXISTS tasks (
     -- passes --reasoning <level> so the worker runs at that depth regardless
     -- of the profile's agent.reasoning_effort. NULL = profile setting.
     reasoning_effort     TEXT,
+    -- Create-time routing provenance. route_source records whether the card
+    -- used the explicit override, the default profile model, or a selected
+    -- named route; route_name is the selected route id when route_source is
+    -- a named route. NULL = legacy boards / pre-feature rows.
+    route_source         TEXT,
+    route_name           TEXT,
     -- Per-task override for the consecutive-failure circuit breaker.
     -- The value is the failure count at which the breaker trips — e.g.
     -- ``max_retries=1`` blocks on the first failure. NULL (the common
@@ -1415,6 +1423,7 @@ def create_task(
     max_runtime_seconds: Optional[int] = None, skills: Optional[Iterable[str]] = None,
     max_retries: Optional[int] = None, model_override: Optional[str] = None,
     provider_override: Optional[str] = None, reasoning_effort: Optional[str] = None,
+    route_source: Optional[str] = None, route_name: Optional[str] = None,
     goal_mode: bool = False, goal_max_turns: Optional[int] = None, initial_status: str = "running",
     session_id: Optional[str] = None, board: Optional[str] = None, project_id: Optional[str] = None,
     project_source_task_id: Optional[str] = None,
@@ -1427,6 +1436,8 @@ def create_task(
     instead of a duplicate. ``max_runtime_seconds``: cap before the dispatcher
     SIGTERMs and re-queues. ``model_override``/``provider_override`` pin the
     worker model (provider requires model); ``reasoning_effort`` is independent.
+    ``route_source``/``route_name`` capture create-time routing provenance for
+    audit/UI surfaces and never affect dispatch after creation.
     ``project_source_task_id``: cross-profile fallback when ``project_id`` is not
     in the active profile's projects.db — see ``_resolve_project_link``.
     """
@@ -1505,9 +1516,9 @@ def create_task(
                         branch_name, project_id, tenant, idempotency_key,
                         max_runtime_seconds,
                         skills, max_retries, model_override, provider_override,
-                        reasoning_effort,
+                        reasoning_effort, route_source, route_name,
                         goal_mode, goal_max_turns, session_id
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         task_id, title.strip(), body, assignee, task_status, priority,
@@ -1516,6 +1527,7 @@ def create_task(
                         _opt_int(max_runtime_seconds),
                         json.dumps(skills_list) if skills_list is not None else None,
                         _opt_int(max_retries), model_override, provider_override, reasoning_effort,
+                        route_source, route_name,
                         1 if goal_mode else 0, _opt_int(goal_max_turns), session_id,
                     ),
                 )
@@ -1538,6 +1550,9 @@ def create_task(
                         "goal_mode": bool(goal_mode) or None,
                         "model_override": model_override,
                         "provider_override": provider_override,
+                        "reasoning_effort": reasoning_effort,
+                        "route_source": route_source,
+                        "route_name": route_name,
                     },
                 )
                 # ACK-edge: the originating channel hears a child BLOCK, not just the fan-in.

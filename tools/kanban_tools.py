@@ -356,16 +356,20 @@ def _opt_int(value: Any, default: Optional[int] = None) -> Optional[int]:
 _TASK_FIELDS = tuple(
     "id title body assignee status tenant priority workspace_kind workspace_path created_by "
     "created_at started_at completed_at result current_run_id model_override "
-    "provider_override".split())
+    "provider_override reasoning_effort route_source route_name".split())
 _TASK_SUMMARY_FIELDS = tuple(
     "id title assignee status priority tenant workspace_kind workspace_path project_id created_by "
-    "created_at started_at completed_at current_run_id model_override provider_override".split())
+    "created_at started_at completed_at current_run_id model_override provider_override reasoning_effort "
+    "route_source route_name".split())
 _RUN_FIELDS = tuple("id profile status outcome summary error metadata started_at ended_at".split())
 _COMMENT_FIELDS = ("author", "body", "created_at")
 _EVENT_FIELDS = ("kind", "payload", "created_at", "run_id")
 _ATTACHMENT_FIELDS = tuple(
     "id filename content_type size uploaded_by stored_path created_at".split())
-_CREATED_FIELDS = ("status", "workspace_kind", "workspace_path", "project_id")
+_CREATED_FIELDS = (
+    "status", "workspace_kind", "workspace_path", "project_id",
+    "model_override", "provider_override", "reasoning_effort", "route_source", "route_name",
+)
 
 
 def _fields(obj: Any, names: tuple[str, ...]) -> dict[str, Any]:
@@ -894,6 +898,15 @@ def _handle_create(args: dict, **kw) -> str:
     # Per-task thinking depth, independent of model/provider — create_task() validates it, so an
     # invalid level raises ValueError and surfaces as a tool_error rather than a silent fallback.
     reasoning_effort = args.get("reasoning_effort")
+    from hermes_cli.kanban_model_routing import resolve_kanban_model_route
+    routing = resolve_kanban_model_route(
+        title=str(title).strip(), body=args.get("body"),
+        explicit_model=model_override, explicit_provider=provider_override,
+        explicit_reasoning_effort=reasoning_effort,
+    )
+    model_override, provider_override, reasoning_effort = (
+        routing.model_override, routing.provider_override, routing.reasoning_effort,
+    )
     parents = _coerce_str_list(args.get("parents") or [], "parents", "task ids")
     with _board(args.get("board")) as (kb, conn):
         if project_id is None and workspace_kind is None and workspace_path is None:
@@ -912,6 +925,7 @@ def _handle_create(args: dict, **kw) -> str:
             max_runtime_seconds=_opt_int(args.get("max_runtime_seconds")), skills=skills,
             model_override=model_override, provider_override=provider_override,
             reasoning_effort=reasoning_effort,
+            route_source=routing.route_source, route_name=routing.route_name,
             goal_mode=goal_mode, goal_max_turns=_opt_int(args.get("goal_max_turns")),
             initial_status=str(args.get("initial_status") or "running"),
             created_by=os.environ.get("HERMES_PROFILE") or "worker", session_id=session_id)

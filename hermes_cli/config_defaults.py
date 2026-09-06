@@ -1703,6 +1703,24 @@ DEFAULT_CONFIG = {
         # implementer. "" = keep the card's own assignee (legacy behavior). Set this on
         # boards where review must never route back to the profile that did the work.
         "default_reviewer": "",
+        # Opt-in create-time model routing for Kanban tasks. Disabled by default.
+        # The classifier inspects only the card title/body and must choose one of
+        # the configured routes, or "default" to keep the profile's own model.
+        "model_routing": {
+            "enabled": False,
+            "classifier": {
+                "provider": "openai-codex",
+                "model": "gpt-5.4-mini",
+                "max_input_tokens": 8000,
+            },
+            "routes": {
+                "mechanical": {
+                    "provider": "openai-codex",
+                    "model": "gpt-5.4-mini",
+                    "reasoning_effort": "medium",
+                },
+            },
+        },
         # Global cap: positive int = the HOST never has more than N tasks 'running' across all
         # boards and both dispatch lanes. None = ~MemTotal / 512 MiB clamped to [2, 8]; where
         # MemTotal is unreadable (macOS/Windows) None means no cap.
