@@ -184,6 +184,8 @@ type KanbanMessages = {
   guideReview: string
   guideDone: string
   guideBlockedGeneric: string
+  guideBlockedManualCapability: string
+  guideBlockedManualTransient: string
   guideBlockedAutomatic: (cause: string) => string
   guideBlockedReviewNoVerdict: string
   guideBlockedUnknown: string
@@ -498,9 +500,11 @@ export const en: KanbanMessages = {
   guideReview: 'A reviewer is checking the completed work — approve or send back above.',
   guideDone: 'Settled — completed, and any dependent cards are now unblocked.',
   guideBlockedGeneric: 'Needs your input — reply in comments, or unblock to send it back to the queue.',
+  guideBlockedManualCapability: 'A missing capability is blocking this — resolve it, then reassign or unblock to retry.',
+  guideBlockedManualTransient: 'A transient failure blocked this — it may clear on its own; unblock to retry.',
   guideBlockedAutomatic: cause => `${cause} Inspect the worker log, then retry or reassign.`,
   guideBlockedReviewNoVerdict: 'The reviewer exited without a verdict. Requeue it for another review pass.',
-  guideBlockedUnknown: 'No cause is recorded for this block. Check the worker log, or reassign to retry.',
+  guideBlockedUnknown: 'Inspect the worker log, then retry or reassign it.',
   choicesGroupLabel: 'Choose an option',
   choiceSubmitError: 'Could not submit your answer. Try again.',
   choiceRetry: 'Retry',
@@ -802,9 +806,11 @@ const ja: KanbanMessages = {
   guideReview: 'レビュアーが完了した作業を確認中です — 上で承認するか差し戻してください。',
   guideDone: '解決済み — 完了しており、依存する子カードはブロック解除されています。',
   guideBlockedGeneric: 'あなたの対応が必要です — コメントで返信するか、ブロック解除してキューに戻してください。',
+  guideBlockedManualCapability: '不足している機能がブロックの原因です — 解消してから、再割り当てするかブロック解除して再試行してください。',
+  guideBlockedManualTransient: '一時的な失敗によりブロックされました — 自然に解消することがあります。ブロック解除して再試行してください。',
   guideBlockedAutomatic: cause => `${cause} ワーカーログを確認し、再試行するか再割り当てしてください。`,
   guideBlockedReviewNoVerdict: 'レビュアーが判定なしで終了しました。もう一度レビューへ再キューしてください。',
-  guideBlockedUnknown: 'このブロックには原因が記録されていません。ワーカーログを確認するか、再割り当てして再試行してください。',
+  guideBlockedUnknown: 'ワーカーログを確認し、再試行するか再割り当てしてください。',
   choicesGroupLabel: 'オプションを選択してください',
   choiceSubmitError: '回答を送信できませんでした。もう一度お試しください。',
   choiceRetry: '再試行',
@@ -1102,9 +1108,11 @@ const zh: KanbanMessages = {
   guideReview: '审查者正在检查已完成的工作 — 请在上方批准或退回。',
   guideDone: '已解决 — 已完成，其依赖的卡片现已解除阻塞。',
   guideBlockedGeneric: '需要你的输入 — 在评论中回复，或解除阻塞将其送回队列。',
+  guideBlockedManualCapability: '缺少某项能力导致受阻 — 请先解决，再重新分配或解除阻塞以重试。',
+  guideBlockedManualTransient: '一次临时性失败导致受阻 — 可能会自行恢复；解除阻塞以重试。',
   guideBlockedAutomatic: cause => `${cause} 请查看工作单元日志，然后重试或重新分配。`,
   guideBlockedReviewNoVerdict: '审查者退出时没有给出结论。请重新排队进行另一轮审查。',
-  guideBlockedUnknown: '此次受阻没有记录原因。请查看工作单元日志，或重新分配以重试。',
+  guideBlockedUnknown: '请查看工作单元日志，然后重试或重新分配。',
   choicesGroupLabel: '请选择一个选项',
   choiceSubmitError: '无法提交你的回答，请重试。',
   choiceRetry: '重试',
@@ -1400,9 +1408,11 @@ const zhHant: KanbanMessages = {
   guideReview: '審查者正在檢查已完成的工作 — 請在上方核准或退回。',
   guideDone: '已解決 — 已完成，其相依的卡片現已解除封鎖。',
   guideBlockedGeneric: '需要你的輸入 — 在留言中回覆，或解除封鎖將其送回佇列。',
+  guideBlockedManualCapability: '缺少某項能力導致受阻 — 請先解決，再重新指派或解除封鎖以重試。',
+  guideBlockedManualTransient: '一次暫時性失敗導致受阻 — 可能會自行恢復；解除封鎖以重試。',
   guideBlockedAutomatic: cause => `${cause} 請查看工作單元日誌，然後重試或重新指派。`,
   guideBlockedReviewNoVerdict: '審查者結束時沒有給出結論。請重新排隊進行另一輪審查。',
-  guideBlockedUnknown: '此次受阻沒有記錄原因。請查看工作單元日誌，或重新指派以重試。',
+  guideBlockedUnknown: '請查看工作單元日誌，然後重試或重新指派。',
   choicesGroupLabel: '請選擇一個選項',
   choiceSubmitError: '無法送出你的回答，請再試一次。',
   choiceRetry: '重試',

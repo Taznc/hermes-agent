@@ -197,6 +197,8 @@ export interface StatusGuidanceDeps extends RunErrorTextDeps {
   guideBlockLoop: (reason: string) => string
   guideBlockedAutomatic: (cause: string) => string
   guideBlockedGeneric: string
+  guideBlockedManualCapability: string
+  guideBlockedManualTransient: string
   guideBlockedReviewNoVerdict: string
   guideBlockedUnknown: string
   guideDone: string
@@ -232,7 +234,21 @@ const GUIDANCE_RESOLVERS: Record<string, (task: KanbanTaskFull, events: KanbanEv
     // stripped) — this line's job is the NEXT ACTION, not a second copy of
     // the reason, so it never re-prints `cause.reason` (and never risks
     // leaking raw ```choices fence syntax the banner deliberately strips).
+    // The next action differs by `cause.kind`: `needs_input` (or no typed
+    // kind) really is a question for a human — reply/unblock is right.
+    // `capability` and `transient` are NOT "needs your input": the data
+    // already names a different next step (retry once available / wait
+    // out the flake), so asserting "needs your input" there would be the
+    // same false-framing class as defect 1, one branch over.
     if (cause.origin === 'manual') {
+      if (cause.kind === 'capability') {
+        return k.guideBlockedManualCapability
+      }
+
+      if (cause.kind === 'transient') {
+        return k.guideBlockedManualTransient
+      }
+
       return k.guideBlockedGeneric
     }
 
@@ -244,9 +260,13 @@ const GUIDANCE_RESOLVERS: Record<string, (task: KanbanTaskFull, events: KanbanEv
       return k.guideBlockedReviewNoVerdict
     }
 
-    // D. No cause found anywhere — honest generic, matching the banner's
-    // "cause unknown" framing exactly. Must NOT be `guideBlockedGeneric`:
-    // that copy asserts "needs your input", a cause this state doesn't have.
+    // D. No cause found anywhere — the banner already states the diagnosis
+    // ("no cause is recorded") and offers Retry/Copy-log; this line must be
+    // the distinct next-action (inspect the log, then retry/reassign), not
+    // a second copy of the banner body — that duplication is exactly the
+    // anti-pattern defect 2 removed from the manual arm. Must NOT be
+    // `guideBlockedGeneric` either: that copy asserts "needs your input",
+    // a cause this state doesn't have.
     return k.guideBlockedUnknown
   },
 
