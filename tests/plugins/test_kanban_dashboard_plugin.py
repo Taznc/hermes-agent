@@ -1361,6 +1361,14 @@ def test_info_diagnostic_excluded_from_board_badge_and_warnings(client):
     try:
         t = kb.create_task(conn, title="guarded", assignee="w")
         now = int(time.time())
+        # Backdate the task's own 'created' event so the respawn_guarded event
+        # below (fired 30s ago) falls inside the task's CURRENT ready period --
+        # _rule_respawn_guarded only trusts a guard event at or after the most
+        # recent created/promoted/reclaimed/unblocked event.
+        conn.execute(
+            "UPDATE task_events SET created_at=? WHERE task_id=? AND kind='created'",
+            (now - 3600, t),
+        )
         conn.execute(
             "INSERT INTO task_events (task_id, run_id, kind, payload, created_at) "
             "VALUES (?, NULL, 'respawn_guarded', ?, ?)",

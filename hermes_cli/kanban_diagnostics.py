@@ -786,8 +786,11 @@ def _rule_respawn_guarded(task, events, runs, now, cfg) -> list[Diagnostic]:
     ``rate_limit_cooldown`` are the dispatcher working as designed, not a
     fault, and render at ``info`` so they never badge a card or join "needs
     attention" (an unclaimed-looking task that's actually fine). ``blocker_auth``
-    IS an operator-fixable problem and stays at ``warning``; any other/unknown
-    reason also stays at ``warning`` as a fail-safe so it is never silently lost.
+    IS an operator-fixable problem and is deliberately NOT surfaced here — it
+    stays exclusively inside ``_rule_stranded_in_ready`` (with the true cause
+    and actions that fix credentials) so it is never lost, downgraded, or
+    duplicated across two diagnostics. Any other/unknown reason still renders
+    here at ``warning`` as a fail-safe so it is never silently lost.
 
     For ``reason="active_pr"`` specifically, the action set contains nothing
     that could trigger a respawn (no ``reassign``, no ``unblock``) — that is
@@ -811,7 +814,10 @@ def _rule_respawn_guarded(task, events, runs, now, cfg) -> list[Diagnostic]:
     if (now - guard_ts) > _respawn_guard_staleness_seconds(cfg):
         return []
     reason = _parse_payload(guard_ev).get("reason")
-    if reason is None:
+    if reason is None or reason == "blocker_auth":
+        # blocker_auth is real and operator-fixable; _rule_stranded_in_ready
+        # is the sole diagnostic for it (correct cause + actions), so this
+        # rule stays silent rather than duplicating/conflicting with it.
         return []
 
     task_id = _task_field(task, "id")

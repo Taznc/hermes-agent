@@ -210,12 +210,14 @@ def test_respawn_guarded_fires_and_suppresses_stranded_in_ready():
     spawning (respawn guard tripped) must present as a distinct
     ``respawn_guarded`` diagnostic naming the reason — never as an
     unexplained ``stranded_in_ready`` warning that sends the operator toward
-    the wrong fix (reassign)."""
+    the wrong fix (reassign). The guard event must be within the staleness
+    window (see ``_respawn_guard_staleness_seconds``) to be trusted as the
+    CURRENT reason for the stall."""
     now = 100_000
     task = _task(status="ready", assignee="demo", claim_lock=None)
     events = [
         _event("created", ts=now - 45 * 60),
-        _event("respawn_guarded", ts=now - 40 * 60, reason="active_pr"),
+        _event("respawn_guarded", ts=now - 30, reason="active_pr"),
     ]
     diags = kd.compute_task_diagnostics(task, events, [], now=now)
 
