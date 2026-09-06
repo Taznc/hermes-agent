@@ -407,7 +407,7 @@ function CardFooter({ arc, task }: { arc: ArcState | null; task: KanbanTask }) {
   const meta = columnMeta(task.status)
 
   return (
-    <div className="flex items-center gap-2 whitespace-nowrap text-[0.625rem] text-(--ui-text-tertiary)">
+    <div className="flex min-w-0 flex-wrap items-center gap-x-2 gap-y-1 text-[0.625rem] text-(--ui-text-tertiary)">
       {arc === 'queued' && attached ? (
         // WHO is coming for the card. The arc only animates once the agent is
         // actually working; while queued, the named chip carries "attached".
@@ -422,7 +422,7 @@ function CardFooter({ arc, task }: { arc: ArcState | null; task: KanbanTask }) {
                   : k.autoAssignTip(attached)
           }
         >
-          <span className="inline-flex min-w-0 cursor-help items-center gap-1 font-medium" style={{ color: meta.tone }}>
+          <span className="inline-flex min-w-0 max-w-full cursor-help items-center gap-1 font-medium" style={{ color: meta.tone }}>
             <Avatar name={attached} size="1.125rem" />
             <span className="truncate">
               {!task.assignee && '→ '}
@@ -454,7 +454,7 @@ function CardFooter({ arc, task }: { arc: ArcState | null; task: KanbanTask }) {
         </Tip>
       )}
       <FocusFlag task={task} />
-      <div className="ml-auto flex min-w-0 shrink items-center gap-2">
+      <div className="ml-auto flex min-w-0 flex-wrap items-center justify-end gap-x-2 gap-y-1">
         {typeof task.priority === 'number' && task.priority > 0 && (
           <span className="inline-flex items-center gap-0.5 text-amber-500">
             <Codicon name="star-full" size="0.7rem" />
@@ -577,7 +577,7 @@ export function Card({
       <ContextMenuTrigger asChild>
         <div
           className={cn(
-            'group relative flex cursor-grab flex-col gap-2 rounded-md border border-(--ui-stroke-tertiary) border-l-2 bg-(--ui-bg-elevated) p-2.5',
+            'group relative flex min-w-0 cursor-grab flex-col gap-2 overflow-hidden rounded-md border border-(--ui-stroke-tertiary) border-l-2 bg-(--ui-bg-elevated) p-2.5',
             // Hover matches the provider-picker rows: a quiet primary fill;
             // selected = the theme's focus color (same as a focused input).
             'transition-colors hover:bg-primary/[0.06] active:cursor-grabbing',
@@ -862,7 +862,7 @@ function Column({
   return (
     <div
       {...dragHandlers}
-      className={cn('group/col flex h-full w-64 shrink-0 flex-col rounded-lg p-2 transition-colors', wash)}
+      className={cn('group/col flex h-full w-64 min-w-0 shrink-0 flex-col rounded-lg p-2 transition-colors', wash)}
     >
       <header className="mb-1.5 flex h-5 items-center gap-1.5 px-1">
         <span className="size-1.5 rounded-full" style={{ backgroundColor: meta.tone }} />
@@ -881,7 +881,7 @@ function Column({
           <Codicon name="chevron-left" size="0.75rem" />
         </button>
       </header>
-      <div className="relative flex min-h-0 flex-1 flex-col gap-2 overflow-y-auto">
+      <div className="relative flex min-h-0 min-w-0 flex-1 flex-col gap-2 overflow-x-hidden overflow-y-auto">
         {lanes
           ? lanes.map(([assignee, tasks]) => (
               <div className="flex flex-col gap-2" key={assignee}>
@@ -2478,7 +2478,7 @@ export function KanbanBoardPage() {
             </div>
           ) : (
             <div
-              className={cn('flex flex-1 gap-2 overflow-x-auto px-4 pt-1 pb-3', grabbing && 'cursor-grabbing')}
+              className={cn('flex min-w-0 flex-1 gap-2 overflow-x-auto px-4 pt-1 pb-3', grabbing && 'cursor-grabbing')}
               // Clicking the board background clears the trace — the gaps between
               // lanes, a lane's padding, a lane header, empty column space. Keyed
               // off "the click did not land on a card" rather than a strict
