@@ -115,12 +115,32 @@ class TestPathResolution:
         assert kb.workspaces_root(board="target") == (
             fresh_home / "kanban" / "boards" / "target" / "workspaces"
         )
-        # The CLI represents ``--board target`` as a context-local explicit
-        # override, so it must have the same precedence as ``board=target``.
-        with kb.scoped_current_board("target"):
+        # The CLI represents ``--board target`` as a dedicated explicit override
+        # (`scoped_explicit_board`), so it must have the same precedence as
+        # ``board=target``.
+        with kb.scoped_explicit_board("target"):
             assert kb.kanban_db_path() == (
                 fresh_home / "kanban" / "boards" / "target" / "kanban.db"
             )
+
+    def test_implicit_current_board_scope_does_not_beat_env_path_pin(
+        self, fresh_home, tmp_path, monkeypatch,
+    ):
+        """``scoped_current_board`` alone (no explicit-board override) is used by
+        callers with no board opinion of their own — the dashboard's
+        ``_with_board_pinned`` pins ``default`` on every unparameterised request,
+        and the watchers scope ``HERMES_KANBAN_BOARD`` per tick. Neither may
+        discard an inherited ``HERMES_KANBAN_DB``/``HERMES_KANBAN_WORKSPACES_ROOT``
+        pin: that would split writes (which land on the pin) from slug-addressed
+        reads (which would land on a different, empty file).
+        """
+        pinned_db = tmp_path / "pinned" / "kanban.db"
+        monkeypatch.setenv("HERMES_KANBAN_DB", str(pinned_db))
+
+        assert kb.kanban_db_path(board="default") == pinned_db
+        with kb.scoped_current_board("default"):
+            assert kb.kanban_db_path() == pinned_db
+        assert kb.kanban_db_path() == pinned_db
 
 
 # ---------------------------------------------------------------------------
@@ -334,6 +354,32 @@ class TestCLI:
         assert slugs == ["default"]
         assert data[0]["is_current"] is True
 
+
+    def test_board_flag_beats_inherited_db_pin_via_cli(self, tmp_path):
+        """A dispatched worker's DB pin remains the no-flag default, but must not
+        swallow the operator's explicit ``--board`` target.
+
+        This exercises the real CLI scope rather than the lower-level resolver:
+        the former bug set only ``scoped_current_board``, which is intentionally
+        still implicit, so a pin made the command silently write to ``source``.
+        """
+        env = {"HERMES_HOME": str(tmp_path)}
+        assert _cli(["boards", "create", "source"], env_extra=env).returncode == 0
+        assert _cli(["boards", "create", "target"], env_extra=env).returncode == 0
+        pinned_db = tmp_path / "kanban" / "boards" / "source" / "kanban.db"
+        pinned_env = {**env, "HERMES_KANBAN_DB": str(pinned_db)}
+
+        created = _cli(
+            ["--board", "target", "create", "Target task", "--assignee", "dev"],
+            env_extra=pinned_env,
+        )
+        assert created.returncode == 0, created.stderr
+
+        target = _cli(["--board", "target", "list", "--json"], env_extra=pinned_env)
+        inherited = _cli(["list", "--json"], env_extra=pinned_env)
+        assert target.returncode == inherited.returncode == 0
+        assert [task["title"] for task in json.loads(target.stdout)] == ["Target task"]
+        assert json.loads(inherited.stdout) == []
 
     def test_per_board_task_isolation_via_cli(self, tmp_path):
         env = {"HERMES_HOME": str(tmp_path)}

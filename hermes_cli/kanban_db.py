@@ -2,8 +2,10 @@
 
 Lives under the shared Hermes root: ``default`` board DB at ``<root>/kanban.db`` (pre-boards
 back-compat), other boards at ``<root>/kanban/boards/<slug>/``; a worker on one board never sees
-another. Board resolution: ``board=`` arg > ``HERMES_KANBAN_BOARD`` > ``HERMES_KANBAN_DB`` (pins the
-file path) > ``<root>/kanban/current`` > ``default``; the dispatcher injects these into workers.
+another. Board resolution: an explicit ``board=`` argument (or ``hermes kanban --board <slug>``,
+via :func:`scoped_explicit_board`) always wins; otherwise ``HERMES_KANBAN_DB`` (pins the file
+path; the dispatcher injects this into every worker) > ``HERMES_KANBAN_BOARD`` /
+:func:`scoped_current_board` > ``<root>/kanban/current`` > ``default``.
 Concurrency: WAL + ``BEGIN IMMEDIATE`` + compare-and-swap on ``tasks.status``/``claim_lock`` —
 SQLite serializes writers so one claimer wins, losers see zero rows (no retries, no distributed
 locks). Schema: tasks, task_links, task_comments, task_events, task_runs, attachments, notify subs.
@@ -356,6 +358,31 @@ def scoped_current_board(slug: str):
         _CURRENT_BOARD_OVERRIDE.reset(token)
 
 
+_EXPLICIT_BOARD_OVERRIDE: ContextVar[str | None] = ContextVar(
+    "hermes_kanban_explicit_board_override", default=None,
+)
+
+
+@contextlib.contextmanager
+def scoped_explicit_board(slug: str):
+    """Pin a caller-EXPLICIT board (``hermes kanban --board <slug>``) so it outranks
+    an inherited ``HERMES_KANBAN_DB``/``HERMES_KANBAN_WORKSPACES_ROOT`` pin in
+    :func:`_board_path`.
+
+    Deliberately distinct from :func:`scoped_current_board`: that ContextVar is also
+    set implicitly by non-CLI callers with no board opinion of their own (the
+    dashboard's ``_with_board_pinned`` pins ``default`` on every unparameterised
+    request; the watchers set ``HERMES_KANBAN_BOARD``/scope it per tick) — those
+    callers must keep losing to an inherited path pin exactly like a bare no-argument
+    call would. Only a genuine explicit override belongs here.
+    """
+    token: Token[str | None] = _EXPLICIT_BOARD_OVERRIDE.set(slug)
+    try:
+        yield
+    finally:
+        _EXPLICIT_BOARD_OVERRIDE.reset(token)
+
+
 # Slug = directory name: strict enough to stop traversal / separators, loose
 # enough for kebab-case. Display names (spaces, emoji) live in board.json.
 _BOARD_SLUG_RE = re.compile(r"^[a-z0-9][a-z0-9\-_]{0,63}$")
@@ -483,15 +510,24 @@ def _board_path(
 
     ``env_var`` pins the dispatcher's board for callers that omit ``board``.
     It is ambient state, so it must not redirect an explicit cross-board
-    operation such as ``hermes kanban --board <slug> ...``.
+    operation such as ``hermes kanban --board <slug> ...``. A no-argument call
+    (including one made under the shared, also-implicit ``scoped_current_board``
+    scope used by the dashboard/watchers) must resolve exactly as it did before
+    this override existed: the env pin still wins there. An explicit
+    ``DEFAULT_BOARD`` is likewise not a "different board" to reach across to —
+    it is the ambient fallback slug, so it defers to the pin exactly like
+    ``board=None`` would.
     """
     slug = _normalize_board_slug(board)
-    # ``hermes kanban --board`` records its explicit CLI argument in this
-    # context-local scope. Treat it like a direct ``board=`` argument rather
-    # than letting a worker's inherited file pin silently discard it.
+    # ``hermes kanban --board`` records its explicit CLI argument in a dedicated
+    # context-local scope (`scoped_explicit_board`). Treat it like a direct
+    # ``board=`` argument rather than letting a worker's inherited file pin
+    # silently discard it. This is intentionally NOT `_CURRENT_BOARD_OVERRIDE` —
+    # that ContextVar is also set implicitly by callers with no board opinion of
+    # their own (dashboard/watchers), which must keep losing to the pin.
     if slug is None:
-        slug = _normalize_board_slug(_CURRENT_BOARD_OVERRIDE.get())
-    if slug is None and env_var:
+        slug = _normalize_board_slug(_EXPLICIT_BOARD_OVERRIDE.get())
+    if (slug is None or slug == DEFAULT_BOARD) and env_var:
         override = os.environ.get(env_var, "").strip()
         if override:
             return Path(override).expanduser()
