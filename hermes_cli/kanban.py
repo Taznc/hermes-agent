@@ -156,8 +156,13 @@ def kanban_command(args: argparse.Namespace) -> int:
     if action == "boards":
         return _dispatch_boards(args)
 
-    # `--board <slug>` pins HERMES_KANBAN_BOARD for the duration of this call so it inherits the
-    # exact resolution the dispatcher uses for workers.
+    # `--board <slug>` pins the board for the duration of this call so it inherits the exact
+    # resolution the dispatcher uses for workers. Two scopes, deliberately: `scoped_current_board`
+    # keeps `get_current_board()`/`board_exists()` consistent for this call, while
+    # `scoped_explicit_board` is the ONLY thing that outranks an inherited `HERMES_KANBAN_DB`/
+    # `HERMES_KANBAN_WORKSPACES_ROOT` pin in `_board_path` — it must not be reused by implicit
+    # callers (dashboard, watchers) that also scope `scoped_current_board` with no board opinion
+    # of their own.
     board_override = getattr(args, "board", None)
     board_scope = contextlib.nullcontext()
     if board_override:
@@ -172,7 +177,13 @@ def kanban_command(args: argparse.Namespace) -> int:
         if normed != kb.DEFAULT_BOARD and not kb.board_exists(normed):
             return _err(f"kanban: board {normed!r} does not exist. "
                         f"Create it with `hermes kanban boards create {normed}`.")
-        board_scope = kb.scoped_current_board(normed)
+
+        @contextlib.contextmanager
+        def _explicit_board_scope(slug: str = normed):
+            with kb.scoped_current_board(slug), kb.scoped_explicit_board(slug):
+                yield
+
+        board_scope = _explicit_board_scope()
 
     with board_scope:
         # `repair` dispatches BEFORE auto-init: on a corrupt DB init_db() itself raises
@@ -442,7 +453,7 @@ def _cmd_list(args: argparse.Namespace) -> int:
 
 def _print_diagnostics(diags, indent: str, *, with_kind: bool) -> None:
     """Shared human rendering for ``show`` and ``diagnostics`` (suggested actions only)."""
-    sev_marker = {"warning": "⚠", "error": "!!", "critical": "!!!"}
+    sev_marker = {"info": "i", "warning": "⚠", "error": "!!", "critical": "!!!"}
     for d in diags:
         head = f"{d.kind}: {d.title}" if with_kind else d.title
         print(f"{indent}{sev_marker.get(d.severity, '?')} [{d.severity}] {head}")
@@ -483,6 +494,14 @@ def _cmd_show(args: argparse.Namespace) -> int:
         latest_summary = kb.latest_summary(conn, args.task_id)
         if not want_json:
             graph = kb.task_graph_context(conn, task.id)
+            # Same caps/counts the dispatcher enforces, so `stranded_in_ready` can
+            # tell "queued behind a full pipe" from "actually stuck" (kanban_diagnostics).
+            try:
+                concurrency = kbd.concurrency_snapshot(conn, kanban_cfg=_kanban_config())
+            except Exception:
+                concurrency = None
+        else:
+            concurrency = None
 
     if want_json:
         _print_json({
@@ -522,7 +541,7 @@ def _cmd_show(args: argparse.Namespace) -> int:
 
     # Diagnostics up top so CLI users see distress signals before scrolling.
     from hermes_cli import kanban_diagnostics as kd
-    diags = kd.compute_task_diagnostics(task, events, runs, graph=graph)
+    diags = kd.compute_task_diagnostics(task, events, runs, graph=graph, concurrency=concurrency)
     if diags:
         print(f"\n  Diagnostics ({len(diags)}):")
         _print_diagnostics(diags, "    ", with_kind=False)
@@ -642,9 +661,18 @@ def _cmd_diagnostics(args: argparse.Namespace) -> int:
     # relies on the gateway-embedded dispatcher.
     from hermes_cli.config import load_config
 
-    diag_config = kd.config_from_runtime_config(load_config())
+    raw_config = load_config()
+    diag_config = kd.config_from_runtime_config(raw_config)
+    kanban_cfg = raw_config.get("kanban") if isinstance(raw_config, dict) else None
 
     with kbc.connect_closing() as conn:
+        # Same caps/counts the dispatcher enforces, so `stranded_in_ready` can tell
+        # "queued behind a full pipe" from "actually stuck" without a second counter.
+        try:
+            concurrency = kbd.concurrency_snapshot(
+                conn, kanban_cfg=kanban_cfg if isinstance(kanban_cfg, dict) else None)
+        except Exception:
+            concurrency = None
         # Either one-task mode or fleet mode.
         if getattr(args, "task", None):
             task = kb.get_task(conn, args.task)
@@ -652,7 +680,7 @@ def _cmd_diagnostics(args: argparse.Namespace) -> int:
                 return _err(f"no such task: {args.task}")
             diags_by_task = {args.task: kd.compute_task_diagnostics(
                 task, kb.list_events(conn, args.task), kb.list_runs(conn, args.task),
-                graph=kb.task_graph_context(conn, args.task), config=diag_config)}
+                graph=kb.task_graph_context(conn, args.task), config=diag_config, concurrency=concurrency)}
         else:
             # Fleet mode: pull all non-archived tasks + their events/runs.
             rows = list(conn.execute("SELECT * FROM tasks WHERE status != 'archived'").fetchall())
@@ -665,7 +693,8 @@ def _cmd_diagnostics(args: argparse.Namespace) -> int:
                 for r in rows:
                     tid = r["id"]
                     dl = kd.compute_task_diagnostics(r, ev_by.get(tid, []), run_by.get(tid, []),
-                                                     graph=graph_by.get(tid), config=diag_config)
+                                                     graph=graph_by.get(tid), config=diag_config,
+                                                     concurrency=concurrency)
                     if dl:
                         diags_by_task[tid] = dl
 

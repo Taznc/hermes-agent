@@ -1,4 +1,4 @@
-import { beforeEach, describe, expect, it } from 'vitest'
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
 import { $rightRailActiveTabId, selectRightRailTab } from '@/store/layout'
 import { closeRightRail, openPreview, type PreviewTarget } from '@/store/preview'
@@ -11,6 +11,27 @@ function urlTarget(url: string): PreviewTarget {
 
 function fileTarget(path: string): PreviewTarget {
   return { kind: 'file', label: path, path, previewKind: 'text', source: path, url: `file://${path}` }
+}
+
+/** Say "this build has an Electron guest" for the length of a test.
+ *
+ *  jsdom is a plain browser document, so `<webview>` has no `loadURL` — which
+ *  is exactly the WEB build's situation, not Electron's. A URL tab with no
+ *  reader means two different things in the two builds ("the guest is still
+ *  booting, retry" vs "there is no guest and never will be"), so a test about
+ *  the booting case has to declare which build it is standing in. */
+function withElectronGuest() {
+  const create = document.createElement.bind(document)
+
+  vi.spyOn(document, 'createElement').mockImplementation(((tag: string, options?: ElementCreationOptions) => {
+    const element = create(tag, options)
+
+    if (String(tag).toLowerCase() === 'webview') {
+      Object.assign(element, { loadURL: () => undefined })
+    }
+
+    return element
+  }) as typeof document.createElement)
 }
 
 describe('readActivePreview (read_preview tool)', () => {
@@ -34,6 +55,10 @@ describe('readActivePreview (read_preview tool)', () => {
     cleanups = []
     closeRightRail()
     window.localStorage.clear()
+  })
+
+  afterEach(() => {
+    vi.restoreAllMocks()
   })
 
   it('answers null when nothing is open, so the tool reports it cleanly', async () => {
@@ -89,6 +114,7 @@ describe('readActivePreview (read_preview tool)', () => {
   })
 
   it('answers identity + retry note for a Browser tab whose pane is not mounted', async () => {
+    withElectronGuest()
     openPreview(urlTarget('https://example.com'), 'tool-result')
 
     expect(await readActivePreview()).toMatchObject({
@@ -97,6 +123,18 @@ describe('readActivePreview (read_preview tool)', () => {
       text: '',
       url: 'https://example.com'
     })
+  })
+
+  it('tells the agent the truth when the build has no guest engine at all', async () => {
+    // No withElectronGuest(): jsdom IS the web build's document. Same tab, same
+    // absent reader as the test above — the answer has to differ, because
+    // "retry in a moment" describes a capability that will never arrive.
+    openPreview(urlTarget('https://example.com'), 'tool-result')
+
+    const result = await readActivePreview()
+
+    expect(result?.note).not.toContain('retry')
+    expect(result?.note).toContain('web_extract')
   })
 
   it('answers a file tab with its identity and points at read_file', async () => {
@@ -118,6 +156,7 @@ describe('readActivePreview (read_preview tool)', () => {
   })
 
   it('falls back to the identity answer when the reader throws (webview booting)', async () => {
+    withElectronGuest()
     openPreview(urlTarget('https://example.com'), 'tool-result')
     register($rightRailActiveTabId.get()!, async () => {
       throw new Error('webview gone')

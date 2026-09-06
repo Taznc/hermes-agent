@@ -10,6 +10,7 @@ deny), ``_check_binary_document_write``, ``_check_protected_instruction_write``
 
 import fnmatch
 import os
+import sys
 from pathlib import Path
 
 from tools.binary_extensions import has_opaque_document_extension, is_pdf_path
@@ -173,6 +174,32 @@ def _protected_instruction_reason(filepath: str, task_id: str = "default",
 
 _APPROVAL_UNAVAILABLE = "requires approval but the approval subsystem is unavailable."
 _NO_HUMAN = "requires approval but no interactive user or gateway is present to approve it."
+# Distinct from _NO_HUMAN: this fires when a callback IS registered but cannot actually
+# reach a person (single-query / cron / unattended contexts — see _stdin_is_interactive).
+_NO_CHANNEL = (
+    "requires approval but no approval channel is reachable in this session (single-query, "
+    "cron, or unattended run with no interactive terminal and no gateway listener). This is a "
+    "structural limit of this session, not a temporary condition — retrying will fail "
+    "identically. A human must apply this change directly (edit the file, or run the same "
+    "edit from a real interactive terminal session where someone can answer the prompt)."
+)
+
+
+def _stdin_is_interactive() -> bool:
+    """True when stdin is a real interactive terminal a human could type into.
+
+    Single-query (``-q``) mode installs the CLI's queue-based modal approval callback via
+    ``_install_tool_callbacks()`` even though no ``prompt_toolkit`` ``Application`` ever
+    runs in that mode (``-q`` skips ``cli.run()``) — the callback is registered but nothing
+    ever drains its response queue, so awaiting it always times out, whether or not a human
+    is at the keyboard. Checking stdin directly (rather than trusting "a callback is
+    registered") is what lets a genuinely interactive ``-q`` invocation still work while a
+    headless one (kanban worker, cron, piped stdin) fails immediately instead of hanging.
+    """
+    try:
+        return bool(sys.stdin) and sys.stdin.isatty()
+    except Exception:
+        return False
 
 
 def _request_protected_instruction_approval(reasons: list[str], task_id: str = "default") -> str | None:
@@ -198,7 +225,10 @@ def _request_protected_instruction_approval(reasons: list[str], task_id: str = "
 
     try:
         import tools.approval as _approval
-        from tools.approval_context import get_current_session_key
+        from tools.approval_context import (
+            get_current_session_key, _is_cron_approval_context,
+            _is_single_query_approval_context, _is_unattended_platform_approval_context,
+        )
         from tools.approval_gateway_wait import _await_gateway_decision
         from tools.approval_prompt import prompt_dangerous_approval
     except Exception:
@@ -225,6 +255,18 @@ def _request_protected_instruction_approval(reasons: list[str], task_id: str = "
         if decision.get("notify_failed"):
             return blocked.format(why="requires approval but the approval request could not be delivered.")
         choice, timed = decision.get("choice"), not decision.get("resolved")
+    elif _is_single_query_approval_context() or _is_cron_approval_context() \
+            or _is_unattended_platform_approval_context():
+        # No gateway listener AND a context where no live TUI loop can be driving the CLI's
+        # modal callback even if one happens to be registered (-q installs it but never runs
+        # the Application that would answer it). Fail instantly instead of awaiting a doomed
+        # callback — unless stdin is a real terminal, in which case a plain synchronous
+        # input() prompt (approval_prompt.py's non-callback fallback) genuinely works.
+        if not _stdin_is_interactive():
+            return blocked.format(why=_NO_CHANNEL)
+        choice = prompt_dangerous_approval(
+            display, description, allow_permanent=False, allow_session=False, approval_callback=None)
+        timed = choice == "timeout"
     else:
         # CLI surface: per-thread approval callback (prompt_toolkit panel).
         try:

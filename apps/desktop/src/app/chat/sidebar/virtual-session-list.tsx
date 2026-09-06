@@ -38,8 +38,8 @@ export interface VirtualSessionListProps {
   /** Render every session row as the three-line inbox card. */
   card?: boolean
   className?: string
-  /** Hover-revealed control for date dividers (the group-level "+"). */
-  dividerAction?: React.ReactNode
+  /** Hover-revealed controls for each date divider (group-level actions). */
+  dividerAction?: (key: string, label: string) => React.ReactNode
   /** Collapse/expand the sessions under a date or status divider. */
   dividerToggle?: {
     ariaLabel: (label: string, open: boolean) => string
@@ -139,7 +139,7 @@ export const VirtualSessionList: FC<VirtualSessionListProps> = ({
       return (
         <div data-index={virtualItem.index} key={row.key} ref={virtualizer.measureElement} style={itemStyle}>
           <SidebarDateDivider
-            action={dividerAction}
+            action={dividerAction?.(row.key, label)}
             label={label}
             toggle={
               dividerToggle

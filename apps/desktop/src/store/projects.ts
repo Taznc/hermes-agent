@@ -619,8 +619,30 @@ interface RepoScanState {
 const repoScanStates = new WeakMap<HermesGateway, RepoScanState>()
 const scanningGatewayGenerations = new WeakMap<HermesGateway, number>()
 
+// This subscription is registered once, at module load, and stays alive for
+// the life of the process — including every OTHER test file's process/worker
+// reuses (vitest keeps projects.ts's module-scope state alive across the
+// files that share a worker). Nanostores calls a fresh subscriber immediately
+// with the atom's current value, so the very first test file to import this
+// module (however indirectly, e.g. through use-background-sync.ts) runs this
+// callback synchronously against WHATEVER '@/store/gateway' resolves to for
+// that file — including a partial `vi.mock` that never intended to exercise
+// repo-scan state and doesn't export `activeGateway`. Swallow that the same
+// way a torn-down/unconfigured gateway is already handled below (no gateway
+// == not scanning) instead of letting an unrelated file's incomplete mock
+// throw an unhandled rejection into whichever test happens to be running
+// (#t_fc026713 — same "unowned work outliving its owning environment" class
+// as the local-runtime-jobs poll loop; this half of it isn't a timer, but a
+// permanent subscription with the identical failure shape).
 function syncReposScanning(): void {
-  const gateway = activeGateway()
+  let gateway: HermesGateway | null = null
+
+  try {
+    gateway = activeGateway()
+  } catch {
+    gateway = null
+  }
+
   $reposScanning.set(Boolean(gateway && scanningGatewayGenerations.has(gateway)))
 }
 

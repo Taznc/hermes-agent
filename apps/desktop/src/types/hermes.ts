@@ -774,6 +774,11 @@ export interface SessionRuntimeInfo {
   install_warning?: string
   model?: string
   personality?: string
+  /** Profile this payload answers for. The gateway resolves profile-scoped
+   *  fields (notably {@link approval_mode}) against the SESSION's own profile,
+   *  so consumers must credit this name rather than the ambient active
+   *  profile — the two differ for any background or non-focused session. */
+  profile_name?: string
   provider?: string
   reasoning_effort?: string
   running?: boolean

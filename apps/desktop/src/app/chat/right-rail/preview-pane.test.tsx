@@ -3,9 +3,17 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
 import { onComposerAttachImagesRequest } from '@/app/chat/composer/focus'
 import { $connection, $selectedStoredSessionId } from '@/store/session'
+import { installWebviewGuest } from '@/test/webview-guest'
 
 import { forgetPreviewConsole, previewConsoleState } from './preview-console-store'
 import { PreviewPane } from './preview-pane'
+
+// Every test below is the ELECTRON branch: the pane only builds a guest where
+// `<webview>` actually upgrades to something with `loadURL`. jsdom leaves it
+// inert (that is the WEB build's shape, covered in preview-pane-web.test.tsx),
+// so define the element for real and let the pane's capability probe run
+// against it. Module scope, not beforeEach: the registration is permanent.
+installWebviewGuest()
 
 // The consent dialog has its own test file and needs a QueryClientProvider;
 // these tests exercise the pane's console/watch/webview wiring, not the

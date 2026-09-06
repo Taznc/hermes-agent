@@ -24,7 +24,6 @@ import { reachablePreviewUrl } from '@/lib/preview-reach'
 import { openCommandPalette } from '@/store/command-palette'
 import { openPreview } from '@/store/preview'
 import { toggleStatusbarVisible } from '@/store/statusbar-prefs'
-import { requestActiveUpdate } from '@/store/updates'
 import { canOpenNewWindow, openNewWindow } from '@/store/windows'
 
 import { navigateToWorkspacePage, NEW_CHAT_ROUTE, SETTINGS_ROUTE } from '../routes'
@@ -359,15 +358,30 @@ function domSections(open: Extract<OpenContextMenu, { kind: 'dom' }>, t: Transla
         shortcut={EDIT_SHORTCUTS.selectAll}
       />
     ])
-  } else if (target.selectionText) {
-    sections.push([
-      <Item
-        icon="copy"
-        key="selection-copy"
-        label={t.common.copy}
-        onSelect={() => void writeClipboardText(target.selectionText)}
-      />
-    ])
+  } else if (target.selectionText || target.messageText) {
+    // Selection first (what you highlighted is what you meant), then the whole
+    // message as the no-selection fallback — right-click a reply, Copy message,
+    // done, without dragging across a long answer.
+    sections.push(
+      [
+        target.selectionText ? (
+          <Item
+            icon="copy"
+            key="selection-copy"
+            label={t.common.copy}
+            onSelect={() => void writeClipboardText(target.selectionText)}
+          />
+        ) : null,
+        target.messageText ? (
+          <Item
+            icon="copy"
+            key="message-copy"
+            label={t.assistant.thread.copyMessage}
+            onSelect={() => void writeClipboardText(target.messageText)}
+          />
+        ) : null
+      ].filter(Boolean)
+    )
   }
 
   return sections
@@ -588,14 +602,6 @@ function shellSections({ navigate, t }: ShellVerbs): ReactNode[][] {
         label={t.commandCenter.settings}
         onSelect={() => navigateToWorkspacePage(navigate, SETTINGS_ROUTE)}
       />
-    ],
-    [
-      <Item
-        icon="cloud-download"
-        key="shell-update"
-        label={t.commandCenter.updateHermes}
-        onSelect={requestActiveUpdate}
-      />
     ]
   ]
 }
@@ -655,6 +661,11 @@ export function AppContextMenu() {
       }
 
       const target = resolveDomTarget(element)
+      // Message text alone is deliberately NOT "owned": the user bubble's
+      // reaction picker claims bare right-clicks via the skip attr, and only a
+      // link/image/editable/selection outranks it. An assistant message is in
+      // no skip region, so it falls through and gets the DOM menu (which now
+      // carries Copy message) without this check.
       const owned = Boolean(target.linkUrl || target.onImage || target.editable || target.selectionText)
 
       // The reaction bubble owns bare right-clicks; a link inside it still

@@ -58,38 +58,52 @@ def _cmd_tail(args: argparse.Namespace) -> int:
 
 
 def _cmd_dispatch(args: argparse.Namespace) -> int:
-    # Honour kanban.default_assignee, kanban.max_in_progress,
-    # kanban.max_in_progress_per_profile and kanban.max_spawn with the same
-    # semantics as the gateway dispatch path.
-    try:
-        from hermes_cli.config import load_config
-        _cfg = load_config()
-        _kanban_cfg = _cfg.get("kanban", {}) if isinstance(_cfg, dict) else {}
-        default_assignee = (_kanban_cfg.get("default_assignee") or "").strip() or None
-        max_in_progress_per_profile = kbd._positive_int(
-            _kanban_cfg.get("max_in_progress_per_profile"), None
-        )
-        # Memory-derived default when unset — same fallback the gateway applies.
-        max_in_progress = kbd.resolve_max_in_progress(
-            kbd._positive_int(_kanban_cfg.get("max_in_progress"), None)
-        )
-        # CLI --max is the more explicit signal, so it wins over kanban.max_spawn.
-        cli_max = getattr(args, "max", None)
-        max_spawn = (
-            cli_max if cli_max is not None else kbd._positive_int(_kanban_cfg.get("max_spawn"), None)
-        )
-    except Exception:
-        default_assignee = max_in_progress_per_profile = max_in_progress = None
-        max_spawn = getattr(args, "max", None)
-    with kbc.connect_closing() as conn:
+    board = getattr(args, "board", None)
+    if getattr(args, "resume_circuit", False):
+        cleared = kbd.resume_dispatch(board)
+        if getattr(args, "json", False):
+            _print_json(cleared, ascii=True)
+        else:
+            state = cleared.get("previous") or {}
+            suffix = f" (was {state.get('reason')})" if state else " (was not paused)"
+            print(f"Dispatch circuit resumed for {board or kb.DEFAULT_BOARD}{suffix}.")
+        return 0
+    if getattr(args, "circuit_status", False):
+        state = kbd.read_dispatch_pause(board)
+        if getattr(args, "json", False):
+            _print_json({"paused": state is not None, "state": state}, ascii=True)
+        else:
+            print(f"Dispatch circuit for {board or kb.DEFAULT_BOARD}: " + (
+                f"paused ({state.get('reason')})" if state else "running"
+            ))
+        return 0
+
+    # Same caps as the gateway tick and the dashboard nudge — resolved by the
+    # one shared helper so a fourth entry point can't silently dispatch uncapped.
+    # kanban.default_reviewer rides along on the same resolution (t_fec4c811):
+    # the CLI dispatch path must route review-lane cards exactly like the
+    # gateway tick, or `hermes kanban dispatch` leaves them self-assigned.
+    caps = kbd.resolve_dispatch_caps()
+    # CLI --max is the more explicit operator signal, so it wins over
+    # kanban.max_spawn. Not clamped: unlike the dashboard's query string this
+    # is a local operator command, and max_in_progress is passed through below
+    # and enforced by dispatch_once regardless of what --max asks for.
+    cli_max = getattr(args, "max", None)
+    max_spawn = cli_max if cli_max is not None else caps.max_spawn
+    with kbc.connect_closing(board=board) as conn:
         res = kbd.dispatch_once(
             conn,
+            board=board,
             dry_run=args.dry_run,
             max_spawn=max_spawn,
-            max_in_progress=max_in_progress,
+            max_in_progress=caps.max_in_progress,
             failure_limit=getattr(args, "failure_limit", kbd.DEFAULT_FAILURE_LIMIT),
-            default_assignee=default_assignee,
-            max_in_progress_per_profile=max_in_progress_per_profile,
+            default_assignee=caps.default_assignee,
+            default_reviewer=caps.default_reviewer,
+            max_in_progress_per_profile=caps.max_in_progress_per_profile,
+            dispatch_start_budget=caps.dispatch_start_budget,
+            dispatch_start_window_seconds=caps.dispatch_start_window_seconds,
+            review_rework_escalation_profile=caps.review_rework_escalation_profile,
         )
     if getattr(args, "json", False):
         _print_json({
@@ -105,6 +119,16 @@ def _cmd_dispatch(args: argparse.Namespace) -> int:
                 for (tid, who, current) in res.skipped_per_profile_capped
             ],
             "auto_assigned_default": res.auto_assigned_default,
+            "auto_assigned_reviewer": [
+                {"task_id": tid, "previous_assignee": prev, "reviewer": rev}
+                for (tid, prev, rev) in res.auto_assigned_reviewer
+            ],
+            "auto_escalated_rework": [
+                {"task_id": tid, "previous_assignee": prev, "assignee": who,
+                 "changes_rounds": rounds}
+                for (tid, prev, who, rounds) in res.auto_escalated_rework
+            ],
+            "dispatch_paused": res.dispatch_paused,
         }, ascii=True)
         return 0
     print(f"Reclaimed:    {res.reclaimed}")
@@ -125,8 +149,20 @@ def _cmd_dispatch(args: argparse.Namespace) -> int:
         print(f"  - {tid}  ->  {who}  @ {ws or '-'}{tag}")
     if res.auto_assigned_default:
         print(
-            f"Auto-assigned to kanban.default_assignee={default_assignee!r}: "
+            f"Auto-assigned to kanban.default_assignee={caps.default_assignee!r}: "
             f"{', '.join(res.auto_assigned_default)}"
+        )
+    if res.auto_assigned_reviewer:
+        print(
+            f"Auto-assigned to kanban.default_reviewer={caps.default_reviewer!r}: "
+            + ", ".join(
+                f"{tid} ({prev} -> {rev})" for (tid, prev, rev) in res.auto_assigned_reviewer
+            )
+        )
+    for tid, previous, who, rounds in res.auto_escalated_rework:
+        print(
+            f"Escalated review rework after {rounds} change requests: "
+            f"{tid} ({previous} -> {who})"
         )
     if res.skipped_unassigned:
         print(f"Skipped (unassigned): {', '.join(res.skipped_unassigned)}")
@@ -136,6 +172,11 @@ def _cmd_dispatch(args: argparse.Namespace) -> int:
         print(
             f"Skipped (non-spawnable assignee — terminal lane, OK): "
             f"{', '.join(res.skipped_nonspawnable)}"
+        )
+    if res.dispatch_paused:
+        print(
+            "Dispatch paused: " + json.dumps(res.dispatch_paused, sort_keys=True)
+            + "\nResume explicitly with: hermes kanban dispatch --resume-circuit"
         )
     return 0
 
@@ -161,9 +202,10 @@ def _cmd_daemon(args: argparse.Namespace) -> int:
     if not getattr(args, "force", False):
         return _err(_DAEMON_DEPRECATED, 2)
 
+    board = getattr(args, "board", None)
     # Init before printing "started" so the DB path is right and init errors
     # surface immediately.
-    kb.init_db()
+    kb.init_db(board=board)
 
     pidfile = getattr(args, "pidfile", None)
     if pidfile:
@@ -191,7 +233,7 @@ def _cmd_daemon(args: argparse.Namespace) -> int:
         """Is there a ready+assigned+unclaimed task the dispatcher would spawn for?
         Control-plane lanes pulled via ``claim_task`` are correctly idle, not stuck."""
         try:
-            with kbc.connect_closing() as conn:
+            with kbc.connect_closing(board=board) as conn:
                 return kbd.has_spawnable_ready(conn)
         except Exception:
             return False
@@ -235,6 +277,7 @@ def _cmd_daemon(args: argparse.Namespace) -> int:
             interval=args.interval,
             max_spawn=args.max,
             failure_limit=getattr(args, "failure_limit", kbd.DEFAULT_FAILURE_LIMIT),
+            board=board,
             on_tick=_on_tick,
         )
     finally:

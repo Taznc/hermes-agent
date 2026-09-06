@@ -32,6 +32,20 @@ import * as hermes from '@/hermes'
 
 const mocked = vi.mocked(hermes)
 
+// The default implementation vi.mock() gives getLocalModelsJobs above — echo
+// the store so a poll can't wipe a job a test staged directly into
+// $localRuntimeJobs. A few tests below override it with .mockResolvedValue
+// (not ...Once) to script a specific poll sequence; that call REPLACES the
+// mock's implementation permanently — vi.clearAllMocks() in the shared
+// afterEach only clears call history, not implementation — so without
+// restoring it here every later test's watchLocalRuntimeJobs() poll would
+// keep hitting that stale scripted response instead of the store.
+const defaultGetLocalModelsJobsImpl: typeof hermes.getLocalModelsJobs = async () => {
+  const { $localRuntimeJobs: jobs } = await import('@/store/local-runtime-jobs')
+
+  return { jobs: [...jobs.get()] }
+}
+
 const BASE_STATUS: LocalModelsStatus = {
   enabled: true,
   tag: 'b10290',
@@ -127,7 +141,10 @@ beforeEach(() => {
   mocked.getLocalModelsStatus.mockResolvedValue(BASE_STATUS)
   mocked.getLocalHardware.mockResolvedValue(BASE_HARDWARE)
   mocked.getLocalCatalog.mockResolvedValue({ models: [FITTING_MODEL, SPILLED_MODEL, REFUSED_MODEL] })
-  mocked.getLocalModelsJobs.mockResolvedValue({ jobs: [] })
+  // Re-pinned every test: a prior test may have overridden this with
+  // .mockResolvedValue to script a specific poll sequence, which replaces the
+  // implementation permanently (vi.clearAllMocks() only clears call history).
+  mocked.getLocalModelsJobs.mockImplementation(defaultGetLocalModelsJobsImpl)
   $localRuntimeJobs.set([])
 })
 

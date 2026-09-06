@@ -1,7 +1,9 @@
-import type { ComponentProps, ElementType, FC } from 'react'
-import { memo } from 'react'
+import type { ComponentProps, ElementType, FC, ReactElement, ReactNode } from 'react'
+import { Children, memo } from 'react'
 import { Streamdown } from 'streamdown'
 
+import { CopyButton } from '@/components/ui/copy-button'
+import { useI18n } from '@/i18n'
 import { ExternalLink } from '@/lib/external-link'
 import { cn } from '@/lib/utils'
 
@@ -78,6 +80,50 @@ function MarkdownTable({ className, ...rest }: ComponentProps<'table'>) {
   )
 }
 
+// Fenced code inside a tool's detail body — a `patch`/`terminal` result that
+// happens to be markdown, or a fenced block an assistant reply embeds inside
+// its own tool-result prose. Reads the raw string handed down by the
+// `code` element rather than the rendered node (`textContent` would pick up
+// nothing extra here since Streamdown emits plain text children, but staying
+// consistent with the transcript's own fenced-block copy avoids drift if a
+// future language renderer injects spans).
+function rawCodeText(children: ReactNode): string {
+  if (typeof children === 'string') {
+    return children
+  }
+
+  if (Array.isArray(children)) {
+    return children.filter((child): child is string => typeof child === 'string').join('')
+  }
+
+  return ''
+}
+
+function MarkdownPre({ children, className, ...rest }: ComponentProps<'pre'>) {
+  const { t } = useI18n()
+  const codeElement = Children.count(children) === 1 ? (Children.only(children) as ReactElement) : null
+  const raw = codeElement ? rawCodeText((codeElement.props as { children?: ReactNode }).children) : ''
+  const trimmed = raw.replace(/\n$/, '')
+
+  return (
+    <div className="group/compact-code relative mb-2 last:mb-0">
+      <pre className={cn(TAG_CLASSES.pre, 'mb-0', className)} {...rest}>
+        {children}
+      </pre>
+      {trimmed && (
+        <CopyButton
+          appearance="inline"
+          className="absolute right-1 top-1 z-10 h-5 gap-0 rounded-md bg-background/70 px-1 opacity-0 transition-opacity group-hover/compact-code:opacity-100 focus-visible:opacity-100"
+          iconClassName="size-2.5"
+          label={t.assistant.tool.copyCode}
+          showLabel={false}
+          text={trimmed}
+        />
+      )}
+    </div>
+  )
+}
+
 const COMPONENTS = {
   a: MarkdownAnchor,
   blockquote: tagged('blockquote'),
@@ -90,7 +136,7 @@ const COMPONENTS = {
   li: tagged('li'),
   ol: tagged('ol'),
   p: tagged('p'),
-  pre: tagged('pre'),
+  pre: MarkdownPre,
   table: MarkdownTable,
   td: tagged('td'),
   th: tagged('th'),

@@ -164,6 +164,79 @@ def test_complete_retry_with_empty_created_cards_succeeds(worker_env):
         conn.close()
 
 
+def test_complete_orphaned_worker_gets_distinguishable_exit_signal(worker_env):
+    """When this worker's own board row is deleted out from under it
+    (t_749b0510's exact incident — delete_task on a live 'running' row),
+    kanban_complete must return a distinguishable ``orphaned: true`` field
+    instead of the same generic "unknown id or already terminal" error a
+    plain typo would produce. That is the actionable clean-exit signal
+    requested by t_963c89a2 item 3.
+    """
+    from hermes_cli import kanban_db as kb
+    from hermes_cli import kanban_db_connect as kbc
+    from tools import kanban_tools as kt
+
+    conn = kbc.connect()
+    try:
+        # Manufacture the orphan state with a raw DELETE rather than
+        # kb.delete_task: t_749b0510's guard now (correctly) REFUSES to delete a
+        # 'running' row with a live worker, which is the very incident this
+        # contract exists for. The guard closes one route into the state; it does
+        # not make the state unreachable (gc/archive paths, direct DB surgery,
+        # and any row deleted before the guard shipped all still produce it), so
+        # the orphan-exit signal must still hold. Asserting through delete_task
+        # here would test the guard, not this contract.
+        with kb.write_txn(conn):
+            conn.execute("DELETE FROM tasks WHERE id = ?", (worker_env,))
+        assert kb.get_task(conn, worker_env) is None
+    finally:
+        conn.close()
+
+    out = json.loads(kt._handle_complete({"summary": "trying to land after being orphaned"}))
+    assert out.get("orphaned") is True, out
+    assert out.get("task_id") == worker_env
+    assert out.get("error")
+
+
+def test_complete_bogus_task_id_is_not_reported_as_orphaned(monkeypatch, worker_env):
+    """A plain wrong/hallucinated id (never a real row) must NOT get the
+    orphan signal — only a task that this worker was actually scoped to via
+    HERMES_KANBAN_TASK and that is now provably gone counts as orphaned."""
+    from tools import kanban_tools as kt
+
+    monkeypatch.setenv("HERMES_KANBAN_TASK", worker_env)
+    out = json.loads(kt._handle_complete({
+        "task_id": "t_neverexisted0",
+        "summary": "should not be treated as an orphan",
+    }))
+    assert out.get("error")
+    assert "orphaned" not in out
+
+
+def test_heartbeat_orphaned_worker_gets_distinguishable_exit_signal(worker_env):
+    """Same orphan-exit contract for kanban_heartbeat: today's fleet incident
+    (t_749b0510's comment thread) showed a heartbeat on a deleted task
+    returning a silent False with nothing actionable — this must now be a
+    structured ``orphaned: true`` the worker can act on to stop."""
+    from hermes_cli import kanban_db as kb
+    from hermes_cli import kanban_db_connect as kbc
+    from tools import kanban_tools as kt
+
+    conn = kbc.connect()
+    try:
+        # Raw DELETE for the same reason as the kanban_complete case above:
+        # t_749b0510's guard correctly refuses delete_task on a live running row.
+        with kb.write_txn(conn):
+            conn.execute("DELETE FROM tasks WHERE id = ?", (worker_env,))
+        assert kb.get_task(conn, worker_env) is None
+    finally:
+        conn.close()
+
+    out = json.loads(kt._handle_heartbeat({"note": "still alive?"}))
+    assert out.get("orphaned") is True, out
+    assert out.get("task_id") == worker_env
+
+
 def test_complete_goal_mode_rejected_by_judge(monkeypatch, tmp_path):
     """Goal-mode tasks must pass the auxiliary judge before completion.
     Regression for #38367: workers bypassing the judge via early kanban_complete."""

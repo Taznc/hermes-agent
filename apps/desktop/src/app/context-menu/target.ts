@@ -16,6 +16,8 @@ export interface ContextMenuDomTarget {
   linkUrl: string
   /** Source URL of the clicked image, when the click landed on one. */
   imageUrl: string
+  /** Text of the enclosing chat message, when the click landed in one. */
+  messageText: string
   /** True when the click landed on an `<img>` (imageUrl may still be empty
    *  for a broken image; Copy image works through coordinates either way). */
   onImage: boolean
@@ -39,11 +41,18 @@ function editableFrom(element: Element | null): HTMLElement | null {
   return host instanceof HTMLElement && host.isContentEditable ? host : null
 }
 
+/** The chat message the click landed in, if any. Assistant replies expose their
+ *  rendered body; user prompts their bubble root. Both are `data-slot` hooks the
+ *  transcript already stamps, so this needs no new markup. */
+const MESSAGE_BODY_SELECTOR =
+  '[data-slot="aui_assistant-message-content"], [data-slot="aui_user-message-root"], [data-slot="aui_system-message-root"]'
+
 export function resolveDomTarget(element: Element | null): ContextMenuDomTarget {
   const anchor = element?.closest('a[href]')
   const dialogContent = element?.closest('[data-slot="dialog-content"]')
   const image = element?.closest('img')
   const linkUrl = anchor?.getAttribute('href')?.trim() ?? ''
+  const messageBody = element?.closest(MESSAGE_BODY_SELECTOR)
 
   return {
     dialogPortalContainer: dialogContent instanceof HTMLElement ? dialogContent : null,
@@ -51,6 +60,11 @@ export function resolveDomTarget(element: Element | null): ContextMenuDomTarget 
     // A placeholder anchor is not a link the menu can act on.
     linkUrl: linkUrl === '#' ? '' : linkUrl,
     imageUrl: image instanceof HTMLImageElement ? image.currentSrc || image.src : '',
+    // `innerText` respects rendered line breaks (so a copied reply keeps its
+    // paragraphs); `textContent` is the fallback for environments that don't
+    // implement it, where it is the same string minus the layout awareness.
+    messageText:
+      messageBody instanceof HTMLElement ? (messageBody.innerText ?? messageBody.textContent ?? '').trim() : '',
     onImage: Boolean(image),
     selectionText: window.getSelection()?.toString().trim() ?? ''
   }

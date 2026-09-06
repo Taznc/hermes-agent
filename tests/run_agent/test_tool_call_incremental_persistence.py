@@ -100,6 +100,33 @@ def _durable_messages(db_path: Path, session_id: str) -> list[dict]:
         restarted_db.close()
 
 
+def test_transient_mcp_app_card_is_not_persisted_but_reaches_live_completion_callback(tmp_path):
+    """An MCP App is a live Desktop projection, never model/session history."""
+    from tools.mcp_tool_handlers import _McpAppToolResult
+
+    agent = _make_agent()
+    db_path = tmp_path / "state.db"
+    session_id = "mcp-live-card-session"
+    db = _attach_real_session_db(agent, db_path, session_id)
+    tool_call = _mock_tool_call(call_id="mcp-live-card")
+    messages: list = []
+    card = {"id": "x" * 20, "html": "<html><body>x</body></html>", "resourceUri": "ui://x"}
+    completed = MagicMock()
+    agent.tool_complete_callback = completed
+
+    try:
+        with patch("model_tools.handle_function_call", return_value=_McpAppToolResult('{"result":"ordinary"}', card)):
+            agent._execute_tool_calls_sequential(SimpleNamespace(content="", tool_calls=[tool_call]), messages, "task-1")
+    finally:
+        db.close()
+
+    assert messages[-1]["content"] == '{"result":"ordinary"}'
+    live_result = completed.call_args.args[3]
+    assert getattr(live_result, "mcp_app_card") == card
+    durable = _durable_messages(db_path, session_id)
+    assert durable[-1]["content"] == '{"result":"ordinary"}'
+
+
 def _durable_roles(db_path: Path, session_id: str) -> list[str]:
     return [message["role"] for message in _durable_messages(db_path, session_id)]
 

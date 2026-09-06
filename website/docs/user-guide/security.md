@@ -58,6 +58,28 @@ The full set of keys:
 | **manual** | Always prompt the user for approval on dangerous commands. |
 | **off** | Disable all approval checks — equivalent to running with `--yolo`. All commands execute without prompts. |
 
+`manual` is also the **fail-safe**, which is worth knowing when reading a mode
+off a UI. An unrecognized `approvals.mode` value resolves to `manual` with a
+warning rather than silently disabling the gate, so a session displaying
+`manual` when you configured something else is the signature of a value that
+failed to resolve — not of a default being applied. The default for a profile
+with no `approvals` block is `smart`.
+
+### Approval mode is per-profile
+
+`approvals.mode` is [profile](./profiles.md)-scoped configuration, not
+conversation state. Nothing persists a per-session mode: each profile reads its
+own `config.yaml`, and changing the mode takes effect on the next guard check
+without rebuilding the agent or its system prompt.
+
+This matters most on Desktop, where **one backend serves every profile**. A
+surface that asks for a profile's approval mode must name that profile, because
+the backend's ambient home belongs to whichever profile launched it. Every
+`session.info` payload reports `approval_mode` alongside the `profile_name` it
+was resolved for, so the two always describe the same profile — a background
+session running in another profile never rewrites the focused profile's
+displayed mode.
+
 :::warning
 Setting `approvals.mode: off` disables all safety prompts. Use only in trusted environments (CI/CD, containers, etc.).
 :::

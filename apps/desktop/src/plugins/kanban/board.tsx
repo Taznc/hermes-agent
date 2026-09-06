@@ -66,9 +66,11 @@ import {
 import {
   $boardSlug,
   $collapsedLanes,
+  $hiddenBoards,
   $introDismissed,
   $lanesByProfile,
   addRoadmapIdea,
+  ALL_BOARDS,
   boardKey,
   BOARDS_KEY,
   bulkTasks,
@@ -76,20 +78,34 @@ import {
   deleteStagedAttachment,
   deleteTask,
   estimateNew,
+  fetchAllBoards,
   fetchAttachmentDataUrl,
   fetchBoard,
   fetchBoards,
   fetchProfiles,
   patchTask,
+  primeAllBoardsSocket,
   PROFILES_KEY,
   stageAttachment
 } from './api'
 import { BoardSwitcher } from './board-switcher'
-import { blockerStand, buildGraph, type DependencyGraph, downstreamOf, focusSets, indexBoard, upstreamOf } from './deps'
+import {
+  blockerStand,
+  buildGraph,
+  cardKey,
+  type DependencyGraph,
+  downstreamOf,
+  focusSets,
+  indexBoard,
+  parseCardKey,
+  taskCardKey,
+  upstreamOf
+} from './deps'
 import { TaskDrawer } from './drawer'
 import { EMPTY_OVERRIDE, ModelOverrideField, overrideCreateFields, type TaskModelOverride } from './model-override'
 import { OrchestrationPanel } from './orchestration'
-import { columnMeta, type KanbanBoard, type KanbanTask, type TaskEstimate } from './types'
+import { PriorityPicker } from './priority-picker'
+import { type BoardAllInfo, columnMeta, type KanbanBoard, type KanbanTask, type TaskEstimate } from './types'
 import {
   $newTaskLane,
   ago,
@@ -111,13 +127,13 @@ import {
 
 // ── optimistic board edits (reconciled by the follow-up refresh) ─────────────
 
-function moveCard(board: KanbanBoard, id: string, toStatus: string): KanbanBoard {
+function moveCard(board: KanbanBoard, key: string, toStatus: string): KanbanBoard {
   let moved: KanbanTask | undefined
 
   const columns = board.columns.map(col => ({
     ...col,
     tasks: col.tasks.filter(task => {
-      if (task.id !== id) {
+      if (taskCardKey(task) !== key) {
         return true
       }
 
@@ -137,23 +153,19 @@ function moveCard(board: KanbanBoard, id: string, toStatus: string): KanbanBoard
   }
 }
 
-function removeCard(board: KanbanBoard, id: string): KanbanBoard {
-  return { ...board, columns: board.columns.map(col => ({ ...col, tasks: col.tasks.filter(t => t.id !== id) })) }
+function removeCard(board: KanbanBoard, key: string): KanbanBoard {
+  return {
+    ...board,
+    columns: board.columns.map(col => ({ ...col, tasks: col.tasks.filter(t => taskCardKey(t) !== key) }))
+  }
 }
 
-// High-priority is a boolean affordance on top of the integer `priority`
-// field (0 = normal, 1 = high) — the backend already sorts priority DESC
-// within a column, so flipping this also pins the card to the top on the
-// next refresh without any client-side re-sort.
-const HIGH_PRIORITY = 1
-const isHighPriority = (task: KanbanTask) => typeof task.priority === 'number' && task.priority > 0
-
-function setPriorityCard(board: KanbanBoard, id: string, priority: number): KanbanBoard {
+function setPriorityCard(board: KanbanBoard, key: string, priority: number): KanbanBoard {
   return {
     ...board,
     columns: board.columns.map(col => ({
       ...col,
-      tasks: col.tasks.map(task => (task.id === id ? { ...task, priority } : task))
+      tasks: col.tasks.map(task => (taskCardKey(task) === key ? { ...task, priority } : task))
     }))
   }
 }
@@ -161,12 +173,15 @@ function setPriorityCard(board: KanbanBoard, id: string, priority: number): Kanb
 // ── dependency view (graph + focus), shared by every card ────────────────────
 
 /**
- * The board's dependency adjacency, its id→task index, and the current focus,
- * handed to cards through context rather than threaded as props: `Column`
- * already carries a dozen callbacks, and every card needs the same three
- * objects. The graph and index are built ONCE per board payload up in
+ * The board's dependency adjacency, its cardKey→task index, and the current
+ * focus, handed to cards through context rather than threaded as props:
+ * `Column` already carries a dozen callbacks, and every card needs the same
+ * three objects. The graph and index are built ONCE per board payload up in
  * `KanbanBoardPage` — rebuilding them per card would be O(cards × edges) on
  * every render.
+ *
+ * Every id-shaped value here is a `cardKey` (board + id in All Boards mode,
+ * bare id in single-board mode), because task ids are only unique per board.
  *
  * `hasEdges` is the capability probe for an older backend that sends
  * `link_counts` but not `link_edges`: without edges we can still show honest
@@ -178,11 +193,12 @@ interface DependencyView {
   graph: DependencyGraph
   hasEdges: boolean
   index: Map<string, KanbanTask>
-  onFocus: (id: string) => void
+  onFocus: (key: string) => void
   upstream: ReadonlySet<string>
 }
 
 const EMPTY_IDS: ReadonlySet<string> = new Set<string>()
+const EMPTY_BOARD_INFO: readonly BoardAllInfo[] = []
 
 // Module-level constant so the context default keeps a stable identity across
 // renders (a fresh object here would re-render every consumer for nothing).
@@ -200,26 +216,41 @@ const DependencyContext = createContext<DependencyView>(NO_DEPENDENCIES)
 
 const useDependencies = () => useContext(DependencyContext)
 
+// ── board attribution (All Boards mode only) ──────────────────────────────────
+
+/** Per-board display chrome (name/color/icon), keyed by slug — populated only
+ *  in the consolidated All Boards view so `Card` can render a board badge.
+ *  `null` in single-board mode: cards never need attribution against
+ *  themselves, and `Card` skips the badge entirely when this is null.
+ *  Exported so `BoardBadge` is testable by wrapping it in a provider without
+ *  mounting the whole page. */
+export const BoardInfoContext = createContext<Map<string, BoardAllInfo> | null>(null)
+
+const useBoardInfo = () => useContext(BoardInfoContext)
+
 type FocusRole = 'downstream' | 'focused' | 'upstream'
 
-/** Where a card sits relative to the focused one. `null` while nothing is
- *  focused AND for unrelated cards — callers tell them apart via `focused`. */
-function focusRole(deps: DependencyView, id: string): FocusRole | null {
+/** Where a card sits relative to the focused one, by `cardKey`. `null` while
+ *  nothing is focused AND for unrelated cards — callers tell them apart via
+ *  `focused`. */
+function focusRole(deps: DependencyView, key: string): FocusRole | null {
   if (!deps.focused) {
     return null
   }
 
-  if (deps.focused === id) {
+  if (deps.focused === key) {
     return 'focused'
   }
 
-  return deps.upstream.has(id) ? 'upstream' : deps.downstream.has(id) ? 'downstream' : null
+  return deps.upstream.has(key) ? 'upstream' : deps.downstream.has(key) ? 'downstream' : null
 }
 
 /** Does this card have any link at all — i.e. is focusing it meaningful? */
 function hasDependencies(deps: DependencyView, task: KanbanTask): boolean {
   if (deps.hasEdges) {
-    return upstreamOf(deps.graph, task.id).length > 0 || downstreamOf(deps.graph, task.id).length > 0
+    const key = taskCardKey(task)
+
+    return upstreamOf(deps.graph, key).length > 0 || downstreamOf(deps.graph, key).length > 0
   }
 
   return Boolean(task.link_counts && (task.link_counts.parents > 0 || task.link_counts.children > 0))
@@ -254,11 +285,11 @@ function Meta({ children, className, icon }: { children: ReactNode; className?: 
  *  URL only once mounted (cards off-screen never pay the fetch); a fetch or
  *  decode failure quietly hides the thumbnail rather than showing a broken
  *  image icon on a card. */
-function CardThumb({ attachmentId }: { attachmentId: number | string }) {
+function CardThumb({ attachmentId, board }: { attachmentId: number | string; board?: string }) {
   const [broken, setBroken] = useState(false)
 
   const { data } = useQuery({
-    queryFn: () => fetchAttachmentDataUrl(attachmentId),
+    queryFn: () => fetchAttachmentDataUrl(attachmentId, board),
     queryKey: ['kanban', 'attachment-data-url', attachmentId],
     retry: false,
     staleTime: Infinity
@@ -296,10 +327,11 @@ function CardThumb({ attachmentId }: { attachmentId: number | string }) {
 function DependencyChips({ task }: { task: KanbanTask }) {
   const k = useKanban()
   const deps = useDependencies()
-  const stand = blockerStand(deps.graph, deps.index, task.id)
+  const key = taskCardKey(task)
+  const stand = blockerStand(deps.graph, deps.index, key)
 
   const blockedBy = deps.hasEdges ? stand.total : (task.link_counts?.parents ?? 0)
-  const blocks = deps.hasEdges ? downstreamOf(deps.graph, task.id).length : (task.link_counts?.children ?? 0)
+  const blocks = deps.hasEdges ? downstreamOf(deps.graph, key).length : (task.link_counts?.children ?? 0)
   const clear = deps.hasEdges && blockedBy > 0 && stand.gating === 0 && PROMOTABLE_STATUSES.has(task.status)
 
   return (
@@ -334,7 +366,7 @@ function DependencyChips({ task }: { task: KanbanTask }) {
 function FocusFlag({ task }: { task: KanbanTask }) {
   const k = useKanban()
   const deps = useDependencies()
-  const role = focusRole(deps, task.id)
+  const role = focusRole(deps, taskCardKey(task))
 
   if (role !== 'downstream' && role !== 'upstream') {
     return null
@@ -352,7 +384,15 @@ function FocusFlag({ task }: { task: KanbanTask }) {
   )
 }
 
-function CardFooter({ arc, task }: { arc: ArcState | null; task: KanbanTask }) {
+function CardFooter({
+  arc,
+  onSetPriority,
+  task
+}: {
+  arc: ArcState | null
+  onSetPriority: (priority: number) => void
+  task: KanbanTask
+}) {
   const k = useKanban()
   const created = ago(task.created_at)
   const fallback = useDefaultAssignee()
@@ -369,7 +409,8 @@ function CardFooter({ arc, task }: { arc: ArcState | null; task: KanbanTask }) {
   const meta = columnMeta(task.status)
 
   return (
-    <div className="flex items-center gap-2 whitespace-nowrap text-[0.625rem] text-(--ui-text-tertiary)">
+    <div className="grid min-w-0 grid-cols-[minmax(0,1fr)_auto] items-center gap-x-2 gap-y-1 text-[0.625rem] text-(--ui-text-tertiary)">
+      <div className="flex min-w-0 flex-wrap items-center gap-x-2 gap-y-1">
       {arc === 'queued' && attached ? (
         // WHO is coming for the card. The arc only animates once the agent is
         // actually working; while queued, the named chip carries "attached".
@@ -384,7 +425,7 @@ function CardFooter({ arc, task }: { arc: ArcState | null; task: KanbanTask }) {
                   : k.autoAssignTip(attached)
           }
         >
-          <span className="inline-flex min-w-0 cursor-help items-center gap-1 font-medium" style={{ color: meta.tone }}>
+          <span className="inline-flex min-w-0 max-w-full cursor-help items-center gap-1 font-medium" style={{ color: meta.tone }}>
             <Avatar name={attached} size="1.125rem" />
             <span className="truncate">
               {!task.assignee && '→ '}
@@ -416,13 +457,15 @@ function CardFooter({ arc, task }: { arc: ArcState | null; task: KanbanTask }) {
         </Tip>
       )}
       <FocusFlag task={task} />
-      <div className="ml-auto flex min-w-0 shrink items-center gap-2">
-        {typeof task.priority === 'number' && task.priority > 0 && (
-          <span className="inline-flex items-center gap-0.5 text-amber-500">
-            <Codicon name="star-full" size="0.7rem" />
-            {task.priority > 1 ? task.priority : null}
-          </span>
-        )}
+      </div>
+      <span
+        onClick={event => event.stopPropagation()}
+        onMouseDown={event => event.stopPropagation()}
+        onPointerDown={event => event.stopPropagation()}
+      >
+        <PriorityPicker onChange={onSetPriority} priority={task.priority} />
+      </span>
+      <div className="col-span-2 flex min-w-0 flex-wrap items-center justify-end gap-x-2 gap-y-1">
         {task.progress && task.progress.total > 0 && (
           <Meta icon="checklist">
             {task.progress.done}/{task.progress.total}
@@ -445,22 +488,54 @@ function CardFooter({ arc, task }: { arc: ArcState | null; task: KanbanTask }) {
   )
 }
 
+// ── board attribution badge (All Boards mode only) ────────────────────────────
+
+/** A small board-name chip on a card, shown ONLY in the consolidated All
+ *  Boards view (`useBoardInfo()` is null in single-board mode, so this
+ *  renders nothing there — same chrome/tokens as every other card meta,
+ *  tinted with the board's own color when it set one). */
+function BoardBadge({ task }: { task: KanbanTask }) {
+  const boards = useBoardInfo()
+  const slug = task.board
+
+  if (!boards || !slug) {
+    return null
+  }
+
+  const info = boards.get(slug)
+  const label = task.board_name || info?.name || slug
+  const tone = info?.color || 'var(--ui-text-tertiary)'
+
+  return (
+    <span
+      className="inline-flex w-fit shrink-0 items-center gap-1 rounded-[3px] px-1 py-px text-[0.6rem] font-medium"
+      style={{ backgroundColor: `color-mix(in srgb, ${tone} 14%, transparent)`, color: tone }}
+    >
+      {info?.icon && <Codicon name={info.icon} size="0.65rem" />}
+      <span className="truncate">{label}</span>
+    </span>
+  )
+}
+
 export function Card({
   columns,
   onDelete,
   onMove,
   onOpen,
+  onSetPriority,
   onToggleSelect,
-  onTogglePriority,
   selected,
   task
 }: {
   columns: string[]
-  onDelete: (id: string) => void
-  onMove: (id: string, status: string) => void
-  onOpen: (id: string) => void
-  onToggleSelect: (id: string) => void
-  onTogglePriority: (id: string, next: boolean) => void
+  /** Every callback receives this card's `cardKey` (board + id in All Boards
+   *  mode, bare id in single-board mode) — a bare id is ambiguous across
+   *  boards and would let one card's action route to another board's row. */
+  onDelete: (key: string) => void
+  onMove: (key: string, status: string) => void
+  onOpen: (key: string) => void
+  onSetPriority: (key: string, priority: number) => void
+  onToggleSelect: (key: string) => void
   selected: boolean
   task: KanbanTask
 }) {
@@ -470,10 +545,10 @@ export function Card({
   const summary = task.latest_summary || task.body
   const fallback = useDefaultAssignee()
   const arc = arcState(task, fallback)
-  const highPriority = isHighPriority(task)
+  const key = taskCardKey(task)
 
   const deps = useDependencies()
-  const role = focusRole(deps, task.id)
+  const role = focusRole(deps, key)
   // Dimmed = a focus is active and this card is on neither end of it. Purely a
   // class swap: the card keeps its position, its identity, and its subtree.
   const dimmed = Boolean(deps.focused) && role === null
@@ -484,8 +559,13 @@ export function Card({
   // the board-header free-typed capture already established (IdeaCaptureDialog
   // above): success and roadmap-unavailable get distinct feedback, and this
   // never touches the task query cache since it isn't a board mutation.
+  //
+  // The card's OWN board is passed explicitly: roadmap-sync maps each board
+  // slug to a DIFFERENT ROADMAP file, and without it the backend falls back to
+  // the ACTIVE board — so in All Boards mode the idea would be appended to the
+  // wrong file on disk, silently, under a success toast.
   const sendIdeaMut = useMutation({
-    mutationFn: () => addRoadmapIdea(task.title, task.id),
+    mutationFn: () => addRoadmapIdea(task.title, task.id, task.board ?? undefined),
     onSuccess: ({ ok, reason }) => {
       if (ok) {
         host.notify({ kind: 'success', message: k.ideaSaved })
@@ -506,11 +586,7 @@ export function Card({
             // selected = the theme's focus color (same as a focused input).
             'transition-colors hover:bg-primary/[0.06] active:cursor-grabbing',
             selected && 'border-(--dt-composer-ring) bg-[color-mix(in_srgb,var(--dt-composer-ring)_7%,transparent)]',
-            // High priority gets a warm wash so it reads as distinct even when
-            // scanning quickly, on top of the star badge and left-border tint.
-            highPriority &&
-              !selected &&
-              'bg-[color-mix(in_srgb,#fbbf24_5%,var(--ui-bg-elevated))] hover:bg-[color-mix(in_srgb,#fbbf24_9%,var(--ui-bg-elevated))]',
+
             // Focus chain. Rings only — no layout property moves, so nothing
             // reflows and no card is re-ordered or unmounted.
             'transition-[opacity,filter,box-shadow,background-color]',
@@ -523,7 +599,7 @@ export function Card({
           draggable
           onClick={event => {
             if (event.metaKey || event.ctrlKey) {
-              onToggleSelect(task.id)
+              onToggleSelect(key)
 
               return
             }
@@ -532,17 +608,20 @@ export function Card({
             // the hover button starts. Bare click still opens the drawer.
             if (event.altKey) {
               if (linked) {
-                deps.onFocus(task.id)
+                deps.onFocus(key)
               }
 
               return
             }
 
-            onOpen(task.id)
+            onOpen(key)
           }}
           onDragEnd={() => setDragging(false)}
           onDragStart={event => {
-            event.dataTransfer.setData('text/plain', task.id)
+            // The drag payload is the cardKey, not the bare id: a drop handler
+            // resolving a bare id against the merged All Boards index could
+            // land on a same-id card from another board.
+            event.dataTransfer.setData('text/plain', key)
             event.dataTransfer.effectAllowed = 'move'
             // Snapshot the drag image before dimming the source, so the ghost
             // stays a solid card (dimming first would bake 40% into it).
@@ -552,8 +631,7 @@ export function Card({
           style={
             {
               '--kanban-tone': meta.tone,
-              borderLeftColor: highPriority ? '#f59e0b' : meta.tone,
-              borderLeftWidth: highPriority ? '3px' : undefined
+              borderLeftColor: meta.tone
             } as CSSProperties
           }
         >
@@ -565,28 +643,10 @@ export function Card({
           {(arc === 'running' || arc === 'stale') && !dragging && !selected && (
             <span aria-hidden className={cn('kanban-arc', arc === 'stale' && 'kanban-arc--stale')} />
           )}
-          <Tip label={highPriority ? k.removeHighPriority : k.markHighPriority}>
-            <button
-              aria-label={highPriority ? k.removeHighPriority : k.markHighPriority}
-              aria-pressed={highPriority}
-              className={cn(
-                'absolute top-1.5 right-1.5 grid size-5 place-items-center rounded text-(--ui-text-quaternary) transition-opacity hover:bg-(--chrome-action-hover) hover:text-amber-500',
-                highPriority
-                  ? 'text-amber-500 opacity-100'
-                  : 'opacity-0 focus-visible:opacity-100 group-hover:opacity-100'
-              )}
-              onClick={event => {
-                event.stopPropagation()
-                onTogglePriority(task.id, !highPriority)
-              }}
-              type="button"
-            >
-              <Codicon name={highPriority ? 'star-full' : 'star-empty'} size="0.8rem" />
-            </button>
-          </Tip>
+
           {/* Trace this card's dependency chain. A dedicated affordance rather
               than overloading a bare click (which must keep opening the
-              drawer): it appears on hover exactly like the star above it, and
+              drawer): it appears on hover, and
               ONLY on cards that actually have a link — so it advertises where
               dependencies exist instead of adding noise to every card.
               Alt-click on the card body does the same thing for the keyboard-
@@ -597,14 +657,14 @@ export function Card({
                 aria-label={role === 'focused' ? k.depClearFocus : k.depFocusHint}
                 aria-pressed={role === 'focused'}
                 className={cn(
-                  'absolute top-1.5 right-7 grid size-5 place-items-center rounded text-(--ui-text-quaternary) transition-opacity hover:bg-(--chrome-action-hover) hover:text-foreground',
+                  'absolute top-1.5 right-1.5 grid size-5 place-items-center rounded text-(--ui-text-quaternary) transition-opacity hover:bg-(--chrome-action-hover) hover:text-foreground',
                   role === 'focused'
                     ? 'text-foreground opacity-100'
                     : 'opacity-0 focus-visible:opacity-100 group-hover:opacity-100'
                 )}
                 onClick={event => {
                   event.stopPropagation()
-                  deps.onFocus(task.id)
+                  deps.onFocus(key)
                 }}
                 type="button"
               >
@@ -615,38 +675,37 @@ export function Card({
           <span
             className={cn(
               'line-clamp-2 text-[0.8125rem] font-medium leading-snug text-foreground',
-              // Keep the title clear of the corner buttons. Static per task
-              // (a card either has links or it doesn't), so no hover thrash.
-              linked ? 'pr-11' : 'pr-5'
+              // Keep the title clear of the dependency focus affordance. Static
+              // per task, so hover never reflows the card.
+              linked && 'pr-5'
             )}
           >
             {task.title || task.id}
           </span>
+          <BoardBadge task={task} />
           {summary && (
             <span className="line-clamp-2 text-[0.6875rem] leading-snug text-(--ui-text-tertiary)">{summary}</span>
           )}
-          {task.image_attachment_id != null && <CardThumb attachmentId={task.image_attachment_id} />}
-          <CardFooter arc={arc} task={task} />
+          {task.image_attachment_id != null && (
+            <CardThumb attachmentId={task.image_attachment_id} board={task.board ?? undefined} />
+          )}
+          <CardFooter arc={arc} onSetPriority={priority => onSetPriority(key, priority)} task={task} />
         </div>
       </ContextMenuTrigger>
       <ContextMenuContent>
-        <ContextMenuItem onSelect={() => onOpen(task.id)}>
+        <ContextMenuItem onSelect={() => onOpen(key)}>
           <Codicon name="link-external" size="0.85rem" />
           {k.open}
         </ContextMenuItem>
-        <ContextMenuItem onSelect={() => onToggleSelect(task.id)}>
+        <ContextMenuItem onSelect={() => onToggleSelect(key)}>
           <Codicon name={selected ? 'close' : 'check-all'} size="0.85rem" />
           {selected ? k.deselect : k.select(formatModifierToken('mod'))}
         </ContextMenuItem>
-        <ContextMenuItem onSelect={() => onTogglePriority(task.id, !highPriority)}>
-          <Codicon name={highPriority ? 'star-full' : 'star-empty'} size="0.85rem" />
-          {highPriority ? k.removeHighPriority : k.markHighPriority}
-        </ContextMenuItem>
-        <ContextMenuSeparator />
+
         {columns
           .filter(name => name !== task.status && !isLockedTarget(name))
           .map(name => (
-            <ContextMenuItem key={name} onSelect={() => onMove(task.id, name)}>
+            <ContextMenuItem key={name} onSelect={() => onMove(key, name)}>
               <span className="size-2 rounded-full" style={{ backgroundColor: columnMeta(name).tone }} />
               {k.moveTo(columnLabel(k, name))}
             </ContextMenuItem>
@@ -657,7 +716,7 @@ export function Card({
           {k.sendToRoadmap}
         </ContextMenuItem>
         <ContextMenuSeparator />
-        <ContextMenuItem onSelect={() => onDelete(task.id)} variant="destructive">
+        <ContextMenuItem onSelect={() => onDelete(key)} variant="destructive">
           <Codicon name="trash" size="0.85rem" />
           {k.delete}
         </ContextMenuItem>
@@ -677,22 +736,23 @@ function Column({
   onDropTask,
   onMove,
   onOpen,
+  onSetPriority,
   onToggle,
   onToggleSelect,
-  onTogglePriority,
   selected
 }: {
   collapsed: boolean
   column: { name: string; tasks: KanbanTask[] }
   columns: string[]
   onAdd: (status: string) => void
-  onDelete: (id: string) => void
-  onDropTask: (id: string, status: string) => void
-  onMove: (id: string, status: string) => void
-  onOpen: (id: string) => void
+  /** Card callbacks take a `cardKey`, not a bare id — see `Card`. */
+  onDelete: (key: string) => void
+  onDropTask: (key: string, status: string) => void
+  onMove: (key: string, status: string) => void
+  onOpen: (key: string) => void
+  onSetPriority: (key: string, priority: number) => void
   onToggle: () => void
-  onToggleSelect: (id: string) => void
-  onTogglePriority: (id: string, next: boolean) => void
+  onToggleSelect: (key: string) => void
   selected: ReadonlySet<string>
 }) {
   const k = useKanban()
@@ -810,13 +870,13 @@ function Column({
                 {tasks.map(task => (
                   <Card
                     columns={columns}
-                    key={task.id}
+                    key={taskCardKey(task)}
                     onDelete={onDelete}
                     onMove={onMove}
                     onOpen={onOpen}
-                    onTogglePriority={onTogglePriority}
+                    onSetPriority={onSetPriority}
                     onToggleSelect={onToggleSelect}
-                    selected={selected.has(task.id)}
+                    selected={selected.has(taskCardKey(task))}
                     task={task}
                   />
                 ))}
@@ -825,13 +885,13 @@ function Column({
           : column.tasks.map(task => (
               <Card
                 columns={columns}
-                key={task.id}
+                key={taskCardKey(task)}
                 onDelete={onDelete}
                 onMove={onMove}
                 onOpen={onOpen}
-                onTogglePriority={onTogglePriority}
+                onSetPriority={onSetPriority}
                 onToggleSelect={onToggleSelect}
-                selected={selected.has(task.id)}
+                selected={selected.has(taskCardKey(task))}
                 task={task}
               />
             ))}
@@ -876,12 +936,19 @@ function Field({ children, label }: { children: ReactNode; label: string }) {
 // One image pasted into the new-task dialog before the task exists — staged
 // server-side immediately (see api.ts's stageAttachment), previewed locally
 // via an object URL, and promoted into a real attachment on submit via its
-// `token`.
+// `token`. `blob` is kept so a board switch in All Boards mode can re-stage
+// the same bytes against the newly chosen board (staged blobs live in the
+// target board's own staging DB, so a token from board A never promotes on
+// board B).
 interface PendingImage {
   token: string
   filename: string
   previewUrl: string
   size: number
+  blob: Blob
+  /** The board this token is staged against ('' = the server's active board,
+   *  matching `boardPath`'s "no board param" fallback). */
+  board: string
 }
 
 export function NewTaskDialog({
@@ -890,7 +957,11 @@ export function NewTaskDialog({
   target
 }: {
   onClose: () => void
-  parents: Array<{ id: string; title: string }>
+  /** Candidate parent tasks. Each carries its own `board` in All Boards mode
+   *  (absent in single-board mode) so the picker can offer only parents on the
+   *  board the new card will actually be created on — a link across boards is
+   *  rejected by the backend, which owns one board's DB per request. */
+  parents: Array<{ id: string; title: string; board?: null | string }>
   target: null | string
 }) {
   const k = useKanban()
@@ -907,15 +978,36 @@ export function NewTaskDialog({
   // board switcher's "Board settings…".
   const selectedSlug = useValue($boardSlug)
   const { data: boards } = useQuery({ queryKey: BOARDS_KEY, queryFn: fetchBoards, staleTime: 30_000 })
-  const currentBoard = boards?.boards.find(b => b.slug === (selectedSlug || boards.current))
+
+  // In All Boards mode `$boardSlug` is the sentinel, which resolves to NO
+  // board on the wire — the server would then silently create the card on
+  // whatever board is active. So the dialog asks: an explicit picker, defaulted
+  // to the server's own current board, and the chosen slug is threaded through
+  // every write below (create, the follow-up status patch, and image staging).
+  const isAllBoards = selectedSlug === ALL_BOARDS
+  const [targetBoard, setTargetBoard] = useState('')
+  // The board every write in this dialog goes to. Outside All Boards mode this
+  // stays `undefined`, so `boardPath` falls through to `$boardSlug` exactly as
+  // it always did — single-board behavior is byte-for-byte unchanged.
+  const writeBoard = isAllBoards ? targetBoard : undefined
+  const effectiveSlug = isAllBoards ? targetBoard : selectedSlug || boards?.current || ''
+  const currentBoard = boards?.boards.find(b => b.slug === (effectiveSlug || boards.current))
   const boardDefaultKind = currentBoard?.default_workspace_kind || 'scratch'
   const boardDefaultDir = currentBoard?.default_workdir || ''
+
+  // Parents must live on the board the card is created on — the backend link
+  // write sees one board's DB. In single-board mode nothing carries a `board`
+  // and every option stays offered, exactly as before.
+  const parentOptions = useMemo(
+    () => (isAllBoards ? parents.filter(option => (option.board ?? '') === targetBoard) : parents),
+    [isAllBoards, parents, targetBoard]
+  )
 
   const isTriage = target === 'triage'
   const [title, setTitle] = useState('')
   const [bodyText, setBodyText] = useState('')
   const [assignee, setAssignee] = useState('')
-  const [priority, setPriority] = useState('0')
+  const [priority, setPriority] = useState(0)
   const [skills, setSkills] = useState('')
   const [workspaceKind, setWorkspaceKind] = useState<string>(boardDefaultKind)
   // Empty = inherit the board's default project dir (backend resolves it);
@@ -958,7 +1050,7 @@ export function NewTaskDialog({
       setTitle('')
       setBodyText('')
       setAssignee('')
-      setPriority('0')
+      setPriority(0)
       setSkills('')
       setWorkspaceKind(boardDefaultKind)
       setWorkspacePath('')
@@ -973,6 +1065,18 @@ export function NewTaskDialog({
     }
   }, [target, boardDefaultKind])
 
+  // Default the All Boards picker to the server's own current board, so the
+  // pre-selected target matches what a single-board create would have done —
+  // the difference is that it is now VISIBLE and changeable, never silent.
+  // Only while the dialog is open, and only until the user picks something.
+  const serverCurrent = boards?.current ?? ''
+
+  useEffect(() => {
+    if (target && isAllBoards && !targetBoard && serverCurrent) {
+      setTargetBoard(serverCurrent)
+    }
+  }, [target, isAllBoards, targetBoard, serverCurrent])
+
   // Best-effort cleanup for images pasted but never submitted: revoke the
   // local object URLs (avoid leaking blob: refs) and delete the staged
   // blobs server-side. Not required for correctness — the TTL reaper cleans
@@ -981,7 +1085,7 @@ export function NewTaskDialog({
   const cleanupPending = () => {
     for (const image of pendingImagesRef.current) {
       URL.revokeObjectURL(image.previewUrl)
-      deleteStagedAttachment(image.token).catch(() => undefined)
+      deleteStagedAttachment(image.token, image.board || undefined).catch(() => undefined)
     }
   }
 
@@ -989,6 +1093,20 @@ export function NewTaskDialog({
     cleanupPending()
     onClose()
   }
+
+  /** Stage one image's bytes against `board` and return the pending row. */
+  const stageImage = (blob: Blob, filename: string, previewUrl: string, board: string) =>
+    blob
+      .arrayBuffer()
+      .then(bytes => stageAttachment({ bytes, contentType: blob.type || undefined, filename }, board || undefined))
+      .then(({ attachment }) => ({
+        blob,
+        board,
+        filename: attachment.filename,
+        previewUrl,
+        size: attachment.size,
+        token: attachment.token
+      }))
 
   // Paste handler: pull image items off the clipboard, upload each straight
   // to the staging endpoint (before Create is ever clicked), and show a
@@ -1011,19 +1129,14 @@ export function NewTaskDialog({
       }
 
       const previewUrl = URL.createObjectURL(blob)
-      const filename = blob.name || `pasted-image-${Date.now()}.${(blob.type.split('/')[1] || 'png').replace('jpeg', 'jpg')}`
+
+      const filename =
+        blob.name || `pasted-image-${Date.now()}.${(blob.type.split('/')[1] || 'png').replace('jpeg', 'jpg')}`
 
       setUploadingImages(count => count + 1)
 
-      blob
-        .arrayBuffer()
-        .then(bytes => stageAttachment({ bytes, contentType: blob.type || undefined, filename }))
-        .then(({ attachment }) => {
-          setPendingImages(images => [
-            ...images,
-            { filename: attachment.filename, previewUrl, size: attachment.size, token: attachment.token }
-          ])
-        })
+      stageImage(blob, filename, previewUrl, writeBoard ?? '')
+        .then(image => setPendingImages(images => [...images, image]))
         .catch(err => {
           URL.revokeObjectURL(previewUrl)
           host.notify({ kind: 'error', message: `${k.imagePasteFailed}: ${errText(err)}` })
@@ -1031,6 +1144,38 @@ export function NewTaskDialog({
         .finally(() => setUploadingImages(count => count - 1))
     }
   }
+
+  // A staged blob lives in ITS board's staging DB, so switching the target
+  // board after pasting would leave the token unresolvable at promotion —
+  // the image would vanish from the created card with only a warning. Re-stage
+  // the bytes we still hold against the new board and drop the old token.
+  useEffect(() => {
+    if (!target || !isAllBoards || !targetBoard) {
+      return
+    }
+
+    const stale = pendingImagesRef.current.filter(image => image.board !== targetBoard)
+
+    if (stale.length === 0) {
+      return
+    }
+
+    for (const image of stale) {
+      setUploadingImages(count => count + 1)
+
+      stageImage(image.blob, image.filename, image.previewUrl, targetBoard)
+        .then(restaged => {
+          deleteStagedAttachment(image.token, image.board || undefined).catch(() => undefined)
+          setPendingImages(images => images.map(candidate => (candidate.token === image.token ? restaged : candidate)))
+        })
+        .catch(err => host.notify({ kind: 'error', message: `${k.imagePasteFailed}: ${errText(err)}` }))
+        .finally(() => setUploadingImages(count => count - 1))
+    }
+    // `stageImage` closes over nothing that changes per render besides the
+    // board it is passed explicitly; re-running on every render would re-stage
+    // in a loop. Keyed strictly on the board actually switching.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [target, isAllBoards, targetBoard])
 
   const removePendingImage = (token: string) => {
     const image = pendingImages.find(candidate => candidate.token === token)
@@ -1040,13 +1185,29 @@ export function NewTaskDialog({
     }
 
     setPendingImages(images => images.filter(candidate => candidate.token !== token))
-    deleteStagedAttachment(token).catch(() => undefined)
+    deleteStagedAttachment(token, image?.board || undefined).catch(() => undefined)
   }
+
+  // A parent chosen before the board switched now belongs to another board and
+  // would be rejected as a link target. Drop it rather than sending it.
+  useEffect(() => {
+    if (parent && !parentOptions.some(option => option.id === parent)) {
+      setParent('')
+    }
+  }, [parent, parentOptions])
 
   const submit = async () => {
     const trimmed = title.trim()
 
     if (!trimmed || !target || busy) {
+      return
+    }
+
+    // Never create without a resolved board in All Boards mode: the sentinel
+    // carries no board and the server would pick the active one silently.
+    if (isAllBoards && !targetBoard) {
+      setError(k.pickBoard)
+
       return
     }
 
@@ -1061,26 +1222,31 @@ export function NewTaskDialog({
 
       // create() derives status (triage flag → 'triage', else 'ready'); move to
       // the requested column when they differ, so a per-column add lands right.
-      const { task, warning } = await createTask({
-        assignee: assignee === PARKED ? undefined : assignee || resolvedDefault,
-        body: bodyText.trim() || undefined,
-        goal_mode: goalMode,
-        parents: parent ? [parent] : undefined,
-        // Images travel exclusively as staged tokens, never inlined into
-        // `body` — the backend promotes each token into a real attachment.
-        pending_attachment_tokens: pendingImages.length ? pendingImages.map(image => image.token) : undefined,
-        priority: Number(priority) || 0,
-        skills: skillList.length ? skillList : undefined,
-        title: trimmed,
-        triage: isTriage,
-        workspace_kind: workspaceKind,
-        ...overrideCreateFields(modelOverride),
-        // Empty → backend inherits the board's default project dir.
-        workspace_path: workspaceKind !== 'scratch' && workspacePath.trim() ? workspacePath.trim() : undefined
-      })
+      // `writeBoard` pins BOTH writes to the board the user picked; it is
+      // `undefined` outside All Boards mode, where `$boardSlug` still decides.
+      const { task, warning } = await createTask(
+        {
+          assignee: assignee === PARKED ? undefined : assignee || resolvedDefault,
+          body: bodyText.trim() || undefined,
+          goal_mode: goalMode,
+          parents: parent ? [parent] : undefined,
+          // Images travel exclusively as staged tokens, never inlined into
+          // `body` — the backend promotes each token into a real attachment.
+          pending_attachment_tokens: pendingImages.length ? pendingImages.map(image => image.token) : undefined,
+          priority,
+          skills: skillList.length ? skillList : undefined,
+          title: trimmed,
+          triage: isTriage,
+          workspace_kind: workspaceKind,
+          ...overrideCreateFields(modelOverride),
+          // Empty → backend inherits the board's default project dir.
+          workspace_path: workspaceKind !== 'scratch' && workspacePath.trim() ? workspacePath.trim() : undefined
+        },
+        writeBoard
+      )
 
       if (task && task.status !== target) {
-        await patchTask(task.id, { status: target })
+        await patchTask(task.id, { status: target }, writeBoard)
       }
 
       // Dispatcher-presence warning ("this ready task will sit idle") — not an
@@ -1115,6 +1281,27 @@ export function NewTaskDialog({
           <DialogTitle>{target ? k.newTaskIn(columnLabel(k, target)) : k.newTask}</DialogTitle>
         </DialogHeader>
         <div className="flex max-h-[min(72vh,44rem)] flex-col gap-3 overflow-y-auto pr-0.5">
+          {/* All Boards mode has no implied board — ask, defaulted to the
+              server's current one, rather than letting the create resolve
+              silently to whatever board happens to be active. */}
+          {isAllBoards && (
+            <Field label={k.board}>
+              <Select onValueChange={setTargetBoard} value={targetBoard}>
+                <SelectTrigger>
+                  <SelectValue placeholder={k.pickBoard} />
+                </SelectTrigger>
+                <SelectContent>
+                  {(boards?.boards ?? []).map(option => (
+                    <SelectItem key={option.slug} value={option.slug}>
+                      {option.name || option.slug}
+                      {option.slug === serverCurrent ? k.boardDefaultSuffix : ''}
+                    </SelectItem>
+                  ))}
+                </SelectContent>
+              </Select>
+              <span className="text-[0.625rem] text-(--ui-text-quaternary)">{k.pickBoardHint}</span>
+            </Field>
+          )}
           <Input
             autoFocus
             onChange={event => setTitle(event.target.value)}
@@ -1142,7 +1329,10 @@ export function NewTaskDialog({
               </span>
               <div className="flex flex-wrap gap-2">
                 {pendingImages.map(image => (
-                  <div className="group relative h-16 w-16 overflow-hidden rounded-md border border-(--ui-border)" key={image.token}>
+                  <div
+                    className="group relative h-16 w-16 overflow-hidden rounded-md border border-(--ui-border)"
+                    key={image.token}
+                  >
                     <img alt={image.filename} className="h-full w-full object-cover" src={image.previewUrl} />
                     <Button
                       aria-label={k.removeImage}
@@ -1169,7 +1359,7 @@ export function NewTaskDialog({
 
           <div className="grid grid-cols-2 gap-3">
             <Field label={k.priority}>
-              <Input onChange={event => setPriority(event.target.value)} type="number" value={priority} />
+              <PriorityPicker onChange={setPriority} priority={priority} />
             </Field>
             <Field label={k.workspace}>
               <Select onValueChange={setWorkspaceKind} value={workspaceKind}>
@@ -1229,7 +1419,7 @@ export function NewTaskDialog({
             <span className="text-[0.625rem] text-(--ui-text-quaternary)">{k.modelHint}</span>
           </Field>
 
-          {parents.length > 0 && (
+          {parentOptions.length > 0 && (
             <Field label={k.parent}>
               <Select onValueChange={v => setParent(v === NO_PARENT ? '' : v)} value={parent || NO_PARENT}>
                 <SelectTrigger>
@@ -1237,7 +1427,7 @@ export function NewTaskDialog({
                 </SelectTrigger>
                 <SelectContent>
                   <SelectItem value={NO_PARENT}>{k.noParent}</SelectItem>
-                  {parents.map(option => (
+                  {parentOptions.map(option => (
                     <SelectItem key={option.id} value={option.id}>
                       {option.title || option.id}
                     </SelectItem>
@@ -1297,7 +1487,10 @@ export function NewTaskDialog({
           <Button onClick={handleClose} variant="text">
             {k.cancel}
           </Button>
-          <Button disabled={!title.trim() || busy || uploadingImages > 0} onClick={() => void submit()}>
+          <Button
+            disabled={!title.trim() || busy || uploadingImages > 0 || (isAllBoards && !targetBoard)}
+            onClick={() => void submit()}
+          >
             {busy ? k.creating : k.createTask}
           </Button>
         </DialogFooter>
@@ -1513,11 +1706,14 @@ export function IdeaCaptureDialog({ onClose, open }: { onClose: () => void; open
  */
 function SelectionBar({
   columns,
+  index,
   onClear,
   onDone,
   selected
 }: {
   columns: string[]
+  /** cardKey→task (see `indexBoard`); `selected` holds cardKeys. */
+  index: Map<string, KanbanTask>
   onClear: () => void
   onDone: (failed: string[]) => void
   selected: ReadonlySet<string>
@@ -1526,7 +1722,7 @@ function SelectionBar({
   const qc = useQueryClient()
   const { data: roster } = useQuery({ queryKey: PROFILES_KEY, queryFn: fetchProfiles, staleTime: 60_000 })
 
-  const finish = (failed: Array<{ error?: string; id: string }>) => {
+  const finish = (failed: Array<{ error?: string; key: string }>) => {
     void qc.invalidateQueries({ queryKey: ['kanban', 'board'] })
 
     if (failed.length > 0) {
@@ -1536,11 +1732,50 @@ function SelectionBar({
       })
     }
 
-    onDone(failed.map(f => f.id))
+    onDone(failed.map(f => f.key))
+  }
+
+  // Group the selection by its OWN board (populated only in All Boards mode;
+  // single-board mode's tasks carry no `board`, so everything lands in one
+  // group under `undefined` — byte-identical to the pre-existing single call).
+  // `/tasks/bulk` is a single-board endpoint, so a selection spanning boards
+  // fans out to one call per board rather than sending a foreign id.
+  //
+  // Selection holds `cardKey`s; the wire wants bare ids, so each group carries
+  // both and the per-id results are mapped back to their key by the pair.
+  const byBoard = (keys: string[]): Map<string | undefined, string[]> => {
+    const groups = new Map<string | undefined, string[]>()
+
+    for (const key of keys) {
+      const taskBoard = index.get(key)?.board ?? parseCardKey(key).board ?? undefined
+      const bucket = groups.get(taskBoard)
+
+      bucket ? bucket.push(key) : groups.set(taskBoard, [key])
+    }
+
+    return groups
   }
 
   const bulk = useMutation({
-    mutationFn: (patch: Record<string, unknown>) => bulkTasks([...selected], patch),
+    mutationFn: async (patch: Record<string, unknown>) => {
+      const groups = byBoard([...selected])
+
+      const results = await Promise.all(
+        [...groups.entries()].map(async ([taskBoard, keys]) => {
+          const { results } = await bulkTasks(
+            keys.map(key => parseCardKey(key).id),
+            patch,
+            taskBoard
+          )
+
+          // The backend answers per bare id; re-attach the board so a failure
+          // is reported against the exact card the user selected.
+          return results.map(row => ({ ...row, key: cardKey(row.id, taskBoard) }))
+        })
+      )
+
+      return { results: results.flat() }
+    },
     onError: err => host.notify({ kind: 'error', message: errText(err) }),
     onSuccess: data => finish(data.results.filter(r => !r.ok))
   })
@@ -1548,13 +1783,20 @@ function SelectionBar({
   // No bulk-delete on the backend — fan out per id, same partial-failure story.
   const bulkDelete = useMutation({
     mutationFn: async () => {
-      const ids = [...selected]
-      const settled = await Promise.allSettled(ids.map(id => deleteTask(id)))
+      const keys = [...selected]
 
-      return ids.flatMap((id, i) => {
+      const settled = await Promise.allSettled(
+        keys.map(key => {
+          const { board: keyBoard, id } = parseCardKey(key)
+
+          return deleteTask(id, index.get(key)?.board ?? keyBoard ?? undefined)
+        })
+      )
+
+      return keys.flatMap((key, i) => {
         const result = settled[i]
 
-        return result.status === 'rejected' ? [{ error: errText(result.reason), id }] : []
+        return result.status === 'rejected' ? [{ error: errText(result.reason), key }] : []
       })
     },
     onSuccess: finish
@@ -1637,23 +1879,133 @@ function SelectionBar({
   )
 }
 
+// ── All Boards chrome (filter chips + degraded-state notice) ─────────────────
+
+/** Chip row toggling each contributing board on/off client-side (all on by
+ *  default). Rendered only in All Boards mode — board-specific affordances
+ *  stay confined to this component rather than sprinkled through the header. */
+export function BoardFilterChips({
+  boards,
+  hidden,
+  onToggle
+}: {
+  boards: readonly BoardAllInfo[]
+  hidden: Record<string, boolean>
+  onToggle: (slug: string) => void
+}) {
+  const k = useKanban()
+
+  if (boards.length === 0) {
+    return null
+  }
+
+  return (
+    <div className="flex shrink-0 flex-wrap items-center gap-1.5 px-4 pb-2">
+      {boards.map(info => {
+        const isHidden = Boolean(hidden[info.slug])
+
+        return (
+          <button
+            aria-label={k.toggleBoard(info.name)}
+            aria-pressed={!isHidden}
+            className={cn(
+              'inline-flex items-center gap-1 rounded-full border px-2 py-0.5 text-[0.6875rem] font-medium transition-colors',
+              isHidden ? 'border-(--ui-stroke-tertiary) text-(--ui-text-quaternary) opacity-50' : 'border-transparent'
+            )}
+            key={info.slug}
+            onClick={() => onToggle(info.slug)}
+            style={
+              isHidden
+                ? undefined
+                : {
+                    backgroundColor: `color-mix(in srgb, ${info.color || 'var(--ui-text-tertiary)'} 14%, transparent)`,
+                    color: info.color || 'var(--ui-text-secondary)'
+                  }
+            }
+            type="button"
+          >
+            {info.icon && <Codicon name={info.icon} size="0.7rem" />}
+            {info.name}
+            <span className="tabular-nums opacity-70">{info.task_count}</span>
+          </button>
+        )
+      })}
+    </div>
+  )
+}
+
+/** Degraded-state banner: a board that failed to load in the consolidated
+ *  fetch must not blank the whole view — name it and move on. Renders
+ *  nothing when there are no errors, so the caller can mount it
+ *  unconditionally in All Boards mode. */
+export function BoardsErrorNotice({ errors }: { errors?: Array<{ board: string; detail: string }> }) {
+  const k = useKanban()
+
+  if (!errors || errors.length === 0) {
+    return null
+  }
+
+  return (
+    <div className="mx-4 mb-2 flex shrink-0 items-center gap-2 rounded-lg bg-(--ui-bg-quinary) px-3 py-1.5 text-[0.6875rem] text-amber-500">
+      <Codicon className="shrink-0" name="warning" size="0.8rem" />
+      <span className="min-w-0 truncate">{k.boardsFailedNotice(errors.map(e => e.board).join(', '))}</span>
+    </div>
+  )
+}
+
 // ── page ─────────────────────────────────────────────────────────────────────
 
 export function KanbanBoardPage() {
   const k = useKanban()
   const qc = useQueryClient()
   const slug = useValue($boardSlug)
+  const isAllBoards = slug === ALL_BOARDS
   const [archived, setArchived] = useState(false)
 
-  // Live updates ride the events socket (bindApi); this interval is only the
-  // slow heartbeat for socketless paths (OAuth remotes, dropped connections).
+  // Live updates ride the events socket (bindApi) in single-board mode; the
+  // consolidated view rides the multi-board `boards=*` socket instead (primed below, once
+  // per All-Boards selection, from THIS query's own `cursors` map — no gap, no replay).
+  // Either way this interval is the fallback for a dropped/reconnecting socket.
   const { data: board, error } = useQuery({
-    queryFn: () => fetchBoard(archived),
+    queryFn: () => (isAllBoards ? fetchAllBoards(archived) : fetchBoard(archived)),
     queryKey: boardKey(slug, archived),
     refetchInterval: 60_000
   })
 
-  const [openId, setOpenId] = useState<null | string>(null)
+  // Prime the multi-board socket from this fetch's cursors the first time All Boards mode
+  // loads data — `primeAllBoardsSocket` no-ops on every call after the first (per selection),
+  // so this is safe to run on every render/refetch.
+  useEffect(() => {
+    if (isAllBoards && board?.cursors) {
+      primeAllBoardsSocket(board.cursors)
+    }
+  }, [isAllBoards, board?.cursors])
+
+  // Per-board display chrome for the consolidated view — badge tint/icon and
+  // the filter chip row. Empty outside All Boards mode (board?.boards is only
+  // ever populated by fetchAllBoards).
+  const boardInfoList = board?.boards ?? EMPTY_BOARD_INFO
+  const boardInfoMap = useMemo(() => new Map(boardInfoList.map(info => [info.slug, info])), [boardInfoList])
+
+  // Client-side board visibility toggle (all on by default; persisted
+  // alongside $collapsedLanes). Boards the payload didn't return (renamed,
+  // deleted) fall out naturally since they never render a chip or a card.
+  const hiddenBoards = useValue($hiddenBoards)
+
+  const toggleBoardVisible = (slugToToggle: string) => {
+    const next = { ...hiddenBoards }
+
+    if (next[slugToToggle]) {
+      delete next[slugToToggle]
+    } else {
+      next[slugToToggle] = true
+    }
+
+    $hiddenBoards.set(next)
+  }
+
+  // The open drawer's card, as a `cardKey` (board + id in All Boards mode).
+  const [openKey, setOpenKey] = useState<null | string>(null)
   const [addStatus, setAddStatus] = useState<null | string>(null)
   const [ideaOpen, setIdeaOpen] = useState(false)
   const [settingsOpen, setSettingsOpen] = useState(false)
@@ -1700,7 +2052,7 @@ export function KanbanBoardPage() {
       return
     }
 
-    const alive = new Set(board.columns.flatMap(col => col.tasks.map(task => task.id)))
+    const alive = new Set(board.columns.flatMap(col => col.tasks.map(taskCardKey)))
 
     setSelected(prev => {
       const kept = [...prev].filter(id => alive.has(id))
@@ -1774,7 +2126,7 @@ export function KanbanBoardPage() {
   // single keypress and Esc always dismisses one layer at a time, innermost
   // first. Same shape as the selection handler.
   useEffect(() => {
-    if (!focused || openId || addStatus || selected.size > 0) {
+    if (!focused || openKey || addStatus || selected.size > 0) {
       return
     }
 
@@ -1787,16 +2139,21 @@ export function KanbanBoardPage() {
     window.addEventListener('keydown', onKey)
 
     return () => window.removeEventListener('keydown', onKey)
-  }, [focused, openId, addStatus, selected.size])
+  }, [focused, openKey, addStatus, selected.size])
 
   const columnNames = board?.columns.map(col => col.name) ?? []
 
   const parentOptions = useMemo(
-    () => board?.columns.flatMap(col => col.tasks).map(task => ({ id: task.id, title: task.title })) ?? [],
+    () =>
+      board?.columns
+        .flatMap(col => col.tasks)
+        .map(task => ({ board: task.board ?? undefined, id: task.id, title: task.title })) ?? [],
     [board]
   )
 
   // Client-side filters, mirroring the dashboard (search over title/body/id).
+  // In All Boards mode, a hidden-board chip also drops that board's cards —
+  // client-side only, since the server always returns every board.
   const filtered = useMemo(() => {
     if (!board) {
       return null
@@ -1807,21 +2164,26 @@ export function KanbanBoardPage() {
     const keep = (task: KanbanTask) =>
       (!q || `${task.title} ${task.body ?? ''} ${task.id}`.toLowerCase().includes(q)) &&
       (!tenant || task.tenant === tenant) &&
-      (!assignee || task.assignee === assignee)
+      (!assignee || task.assignee === assignee) &&
+      !(isAllBoards && task.board && hiddenBoards[task.board])
 
     return { ...board, columns: board.columns.map(col => ({ ...col, tasks: col.tasks.filter(keep) })) }
-  }, [board, search, tenant, assignee])
+  }, [board, search, tenant, assignee, isAllBoards, hiddenBoards])
 
   const total = filtered?.columns.reduce((sum, col) => sum + col.tasks.length, 0) ?? 0
 
+  // Every mutation below takes the card's `cardKey` (`key`) for the optimistic
+  // cache edit and the bare `id` + `board` for the wire, so a same-id card on
+  // another board can never be patched, deleted, or re-prioritized by mistake.
   const moveMut = useMutation({
-    mutationFn: ({ id, status }: { id: string; status: string }) => patchTask(id, { status }),
-    onMutate: async ({ id, status }) => {
+    mutationFn: ({ id, status, board: taskBoard }: { key: string; id: string; status: string; board?: string }) =>
+      patchTask(id, { status }, taskBoard),
+    onMutate: async ({ key, status }) => {
       await qc.cancelQueries({ queryKey: boardKey(slug, archived) })
       const previous = qc.getQueryData<KanbanBoard>(boardKey(slug, archived))
 
       if (previous) {
-        qc.setQueryData(boardKey(slug, archived), moveCard(previous, id, status))
+        qc.setQueryData(boardKey(slug, archived), moveCard(previous, key, status))
       }
 
       return { previous }
@@ -1840,18 +2202,18 @@ export function KanbanBoardPage() {
   })
 
   const deleteMut = useMutation({
-    mutationFn: (id: string) => deleteTask(id),
-    onMutate: async id => {
+    mutationFn: ({ id, board: taskBoard }: { key: string; id: string; board?: string }) => deleteTask(id, taskBoard),
+    onMutate: async ({ key }) => {
       await qc.cancelQueries({ queryKey: boardKey(slug, archived) })
       const previous = qc.getQueryData<KanbanBoard>(boardKey(slug, archived))
 
       if (previous) {
-        qc.setQueryData(boardKey(slug, archived), removeCard(previous, id))
+        qc.setQueryData(boardKey(slug, archived), removeCard(previous, key))
       }
 
       return { previous }
     },
-    onError: (err, _id, context) => {
+    onError: (err, _vars, context) => {
       if (context?.previous) {
         qc.setQueryData(boardKey(slug, archived), context.previous)
       }
@@ -1865,13 +2227,14 @@ export function KanbanBoardPage() {
   // any other field — so a rejected write can't be mistaken for a bigger
   // failure, and the optimistic patch below is safe to apply in isolation.
   const priorityMut = useMutation({
-    mutationFn: ({ id, priority }: { id: string; priority: number }) => patchTask(id, { priority }),
-    onMutate: async ({ id, priority }) => {
+    mutationFn: ({ id, priority, board: taskBoard }: { key: string; id: string; priority: number; board?: string }) =>
+      patchTask(id, { priority }, taskBoard),
+    onMutate: async ({ key, priority }) => {
       await qc.cancelQueries({ queryKey: boardKey(slug, archived) })
       const previous = qc.getQueryData<KanbanBoard>(boardKey(slug, archived))
 
       if (previous) {
-        qc.setQueryData(boardKey(slug, archived), setPriorityCard(previous, id, priority))
+        qc.setQueryData(boardKey(slug, archived), setPriorityCard(previous, key, priority))
       }
 
       return { previous }
@@ -1889,10 +2252,20 @@ export function KanbanBoardPage() {
     }
   })
 
-  const onTogglePriority = (id: string, next: boolean) => priorityMut.mutate({ id, priority: next ? HIGH_PRIORITY : 0 })
+  // Handlers take the card's `cardKey` (what `Card` hands back) and resolve
+  // the (board, id) pair from it — never a bare id against the merged index.
+  const onSetPriority = (key: string, priority: number) => {
+    const task = index.get(key)
 
-  const onMove = (id: string, status: string) => {
-    const task = board?.columns.flatMap(col => col.tasks).find(candidate => candidate.id === id)
+    if (!task) {
+      return
+    }
+
+    priorityMut.mutate({ board: task.board ?? undefined, id: task.id, key, priority })
+  }
+
+  const onMove = (key: string, status: string) => {
+    const task = index.get(key)
 
     if (!task || task.status === status) {
       return
@@ -1904,10 +2277,15 @@ export function KanbanBoardPage() {
       return
     }
 
-    moveMut.mutate({ id, status })
+    moveMut.mutate({ board: task.board ?? undefined, id: task.id, key, status })
   }
 
   const errorMessage = error ? errText(error) : null
+
+  // The board the open drawer's card belongs to. Read from the index while the
+  // card is present, falling back to the key itself so a refresh that drops
+  // the row mid-view can't strand the drawer's writes on the wrong board.
+  const openBoard = openKey ? (index.get(openKey)?.board ?? parseCardKey(openKey).board) : undefined
 
   // Grab-to-scrub the lane strip (shared primitive, same as the dashboard's pan).
   const lanesRef = useRef<HTMLDivElement>(null)
@@ -1981,148 +2359,177 @@ export function KanbanBoardPage() {
 
   return (
     <DependencyContext.Provider value={dependencies}>
-      <div className="relative flex h-full flex-col overflow-hidden bg-(--ui-surface-background)">
-        {/* Page-owned titlebar chrome: exists exactly while this page is mounted. */}
-        <Contribute area={TITLEBAR_AREAS.center} id="kanban:board-switcher">
-          <BoardSwitcher />
-        </Contribute>
+      <BoardInfoContext.Provider value={isAllBoards ? boardInfoMap : null}>
+        <div className="relative flex h-full flex-col overflow-hidden bg-(--ui-surface-background)">
+          {/* Page-owned titlebar chrome: exists exactly while this page is mounted. */}
+          <Contribute area={TITLEBAR_AREAS.center} id="kanban:board-switcher">
+            <BoardSwitcher />
+          </Contribute>
 
-        <header className="flex shrink-0 flex-wrap items-center gap-2 px-4 py-2">
-          <h1 className="text-sm font-semibold text-foreground">{k.title}</h1>
-          <span className="rounded-full bg-(--ui-bg-quaternary) px-1.5 py-px text-[0.625rem] tabular-nums text-(--ui-text-tertiary)">
-            {total}
-          </span>
-          {board && (
-            <FilterMenu
-              archived={archived}
-              assignee={assignee}
-              board={board}
-              onArchived={setArchived}
-              onAssignee={setAssignee}
-              onTenant={setTenant}
-              tenant={tenant}
-            />
-          )}
-          <SearchField aria-label={k.filterCards} onChange={setSearch} placeholder={k.filterCards} value={search} />
-          <div className="ml-auto flex items-center gap-1">
-            <Tip label={k.ideaTitle}>
-              <Button aria-label={k.ideaTitle} onClick={() => setIdeaOpen(true)} size="icon-xs" variant="ghost">
-                <Codicon name="lightbulb" size="0.85rem" />
-              </Button>
-            </Tip>
-            <Tip label={k.orchestrationSettings}>
-              <Button
-                aria-label={k.orchestrationSettings}
-                className={cn(settingsOpen && 'bg-(--ui-control-active-background) text-foreground')}
-                onClick={() => setSettingsOpen(!settingsOpen)}
-                size="icon-xs"
-                variant="ghost"
-              >
-                <Codicon name="organization" size="0.85rem" />
-              </Button>
-            </Tip>
-            <Button onClick={() => setAddStatus('triage')} size="sm">
-              <Codicon name="add" size="0.8rem" />
-              {k.newTask}
-            </Button>
-          </div>
-        </header>
-
-        {settingsOpen && <OrchestrationPanel />}
-
-        {board && <Intro />}
-
-        {/* Focus-mode hint. Only while a trace is live, so the board chrome is
-          unchanged in the common case. Its own row rather than an overlay:
-          the board is dimmed underneath and an overlay would compete with the
-          selection bar for the same corner. */}
-        {focused && (
-          <div className="mx-4 mb-2 flex shrink-0 items-center gap-2 rounded-lg bg-(--ui-bg-quinary) px-3 py-1.5 text-[0.6875rem] text-(--ui-text-secondary)">
-            <Codicon className="shrink-0 text-(--ui-text-tertiary)" name="references" size="0.8rem" />
-            <span className="min-w-0 truncate">{k.depFocusHint}</span>
-            <Button className="ml-auto shrink-0" onClick={() => setFocused(null)} size="xs" variant="ghost">
-              <Codicon name="close" size="0.7rem" />
-              {k.depClearFocus}
-            </Button>
-          </div>
-        )}
-
-        {errorMessage && !board ? (
-          <div className="grid flex-1 place-items-center">
-            <ErrorState title={errorMessage} />
-          </div>
-        ) : !filtered ? (
-          <div className="grid flex-1 place-items-center">
-            <Loader type="lemniscate-bloom" />
-          </div>
-        ) : total === 0 ? (
-          <div className="grid flex-1 place-items-center px-4 text-center">
-            <div className="flex flex-col items-center gap-2">
-              <Codicon className="text-(--ui-text-quaternary)" name="project" size="1.25rem" />
-              <p className="text-xs text-(--ui-text-tertiary)">
-                {search || tenant || assignee ? k.noMatch : k.noTasks}
-              </p>
-              <Button className="mt-0.5" onClick={() => setAddStatus('triage')} size="sm" variant="outline">
-                <Codicon name="add" size="0.75rem" />
+          <header className="flex shrink-0 flex-wrap items-center gap-2 px-4 py-2">
+            <h1 className="text-sm font-semibold text-foreground">{k.title}</h1>
+            <span className="rounded-full bg-(--ui-bg-quaternary) px-1.5 py-px text-[0.625rem] tabular-nums text-(--ui-text-tertiary)">
+              {total}
+            </span>
+            {board && (
+              <FilterMenu
+                archived={archived}
+                assignee={assignee}
+                board={board}
+                onArchived={setArchived}
+                onAssignee={setAssignee}
+                onTenant={setTenant}
+                tenant={tenant}
+              />
+            )}
+            <SearchField aria-label={k.filterCards} onChange={setSearch} placeholder={k.filterCards} value={search} />
+            <div className="ml-auto flex items-center gap-1">
+              <Tip label={k.ideaTitle}>
+                <Button aria-label={k.ideaTitle} onClick={() => setIdeaOpen(true)} size="icon-xs" variant="ghost">
+                  <Codicon name="lightbulb" size="0.85rem" />
+                </Button>
+              </Tip>
+              <Tip label={k.orchestrationSettings}>
+                <Button
+                  aria-label={k.orchestrationSettings}
+                  className={cn(settingsOpen && 'bg-(--ui-control-active-background) text-foreground')}
+                  onClick={() => setSettingsOpen(!settingsOpen)}
+                  size="icon-xs"
+                  variant="ghost"
+                >
+                  <Codicon name="organization" size="0.85rem" />
+                </Button>
+              </Tip>
+              <Button onClick={() => setAddStatus('triage')} size="sm">
+                <Codicon name="add" size="0.8rem" />
                 {k.newTask}
               </Button>
             </div>
-          </div>
-        ) : (
-          <div
-            className={cn('flex flex-1 gap-2 overflow-x-auto px-4 pt-1 pb-3', grabbing && 'cursor-grabbing')}
-            // Clicking the board background clears the trace — the gaps between
-            // lanes, a lane's padding, a lane header, empty column space. Keyed
-            // off "the click did not land on a card" rather than a strict
-            // `currentTarget` check, which would only catch the thin gutters.
-            // Cards are the draggable nodes (same vocabulary useGrabScroll uses),
-            // so a click on a card — including its own trace button — is left to
-            // the card's own handler.
-            onClickCapture={event => {
-              if (focused && !(event.target as HTMLElement).closest('[draggable="true"]')) {
-                setFocused(null)
-              }
-            }}
-            onMouseDown={onMouseDown}
-            ref={lanesRef}
-          >
-            {filtered.columns.map(col => {
-              const auto = boardHasWork && col.tasks.length === 0
+          </header>
 
-              return (
-                <Column
-                  collapsed={laneOverrides[col.name] ?? auto}
-                  column={col}
-                  columns={columnNames}
-                  key={col.name}
-                  onAdd={setAddStatus}
-                  onDelete={id => deleteMut.mutate(id)}
-                  onDropTask={onMove}
-                  onMove={onMove}
-                  onOpen={setOpenId}
-                  onToggle={() => toggleLane(col.name, auto)}
-                  onTogglePriority={onTogglePriority}
-                  onToggleSelect={toggleSelect}
-                  selected={selected}
-                />
-              )
-            })}
-          </div>
-        )}
+          {settingsOpen && <OrchestrationPanel />}
 
-        {selected.size > 0 && (
-          <SelectionBar
+          {board && <Intro />}
+
+          {isAllBoards && (
+            <BoardFilterChips boards={boardInfoList} hidden={hiddenBoards} onToggle={toggleBoardVisible} />
+          )}
+
+          {isAllBoards && <BoardsErrorNotice errors={board?.errors} />}
+
+          {/* Focus-mode hint. Only while a trace is live, so the board chrome is
+          unchanged in the common case. Its own row rather than an overlay:
+          the board is dimmed underneath and an overlay would compete with the
+          selection bar for the same corner. */}
+          {focused && (
+            <div className="mx-4 mb-2 flex shrink-0 items-center gap-2 rounded-lg bg-(--ui-bg-quinary) px-3 py-1.5 text-[0.6875rem] text-(--ui-text-secondary)">
+              <Codicon className="shrink-0 text-(--ui-text-tertiary)" name="references" size="0.8rem" />
+              <span className="min-w-0 truncate">{k.depFocusHint}</span>
+              <Button className="ml-auto shrink-0" onClick={() => setFocused(null)} size="xs" variant="ghost">
+                <Codicon name="close" size="0.7rem" />
+                {k.depClearFocus}
+              </Button>
+            </div>
+          )}
+
+          {errorMessage && !board ? (
+            <div className="grid flex-1 place-items-center">
+              <ErrorState title={errorMessage} />
+            </div>
+          ) : !filtered ? (
+            <div className="grid flex-1 place-items-center">
+              <Loader type="lemniscate-bloom" />
+            </div>
+          ) : total === 0 ? (
+            <div className="grid flex-1 place-items-center px-4 text-center">
+              <div className="flex flex-col items-center gap-2">
+                <Codicon className="text-(--ui-text-quaternary)" name="project" size="1.25rem" />
+                <p className="text-xs text-(--ui-text-tertiary)">
+                  {search || tenant || assignee ? k.noMatch : k.noTasks}
+                </p>
+                <Button className="mt-0.5" onClick={() => setAddStatus('triage')} size="sm" variant="outline">
+                  <Codicon name="add" size="0.75rem" />
+                  {k.newTask}
+                </Button>
+              </div>
+            </div>
+          ) : (
+            <div
+              // This is the board's sole vertical flex child. `min-h-0` lets it
+              // yield space to the page chrome (including the status bar)
+              // instead of extending underneath it on a short viewport.
+              className={cn('flex min-h-0 flex-1 gap-2 overflow-x-auto px-4 pt-1 pb-3', grabbing && 'cursor-grabbing')}
+              // Clicking the board background clears the trace — the gaps between
+              // lanes, a lane's padding, a lane header, empty column space. Keyed
+              // off "the click did not land on a card" rather than a strict
+              // `currentTarget` check, which would only catch the thin gutters.
+              // Cards are the draggable nodes (same vocabulary useGrabScroll uses),
+              // so a click on a card — including its own trace button — is left to
+              // the card's own handler.
+              onClickCapture={event => {
+                if (focused && !(event.target as HTMLElement).closest('[draggable="true"]')) {
+                  setFocused(null)
+                }
+              }}
+              onMouseDown={onMouseDown}
+              ref={lanesRef}
+            >
+              {filtered.columns.map(col => {
+                const auto = boardHasWork && col.tasks.length === 0
+
+                return (
+                  <Column
+                    collapsed={laneOverrides[col.name] ?? auto}
+                    column={col}
+                    columns={columnNames}
+                    key={col.name}
+                    onAdd={setAddStatus}
+                    onDelete={key => {
+                      const task = index.get(key)
+
+                      if (task) {
+                        deleteMut.mutate({ board: task.board ?? undefined, id: task.id, key })
+                      }
+                    }}
+                    onDropTask={onMove}
+                    onMove={onMove}
+                    onOpen={setOpenKey}
+                    onSetPriority={onSetPriority}
+                    onToggle={() => toggleLane(col.name, auto)}
+                    onToggleSelect={toggleSelect}
+                    selected={selected}
+                  />
+                )
+              })}
+            </div>
+          )}
+
+          {selected.size > 0 && (
+            <SelectionBar
+              columns={columnNames}
+              index={index}
+              onClear={() => setSelected(new Set())}
+              onDone={failed => setSelected(new Set(failed))}
+              selected={selected}
+            />
+          )}
+
+          <NewTaskDialog onClose={() => setAddStatus(null)} parents={parentOptions} target={addStatus} />
+          <IdeaCaptureDialog onClose={() => setIdeaOpen(false)} open={ideaOpen} />
+          {/* The drawer speaks bare task ids (its detail payload's `links` are
+              plain ids on ONE board), so translate at this boundary: the open
+              card's board comes from the index, and a navigation out of a
+              dependency row re-keys onto that same board — links never cross
+              boards, so the target is always a sibling. */}
+          <TaskDrawer
+            board={openBoard}
             columns={columnNames}
-            onClear={() => setSelected(new Set())}
-            onDone={failed => setSelected(new Set(failed))}
-            selected={selected}
+            id={openKey ? (index.get(openKey)?.id ?? parseCardKey(openKey).id) : null}
+            onClose={() => setOpenKey(null)}
+            onOpen={id => setOpenKey(cardKey(id, openBoard))}
           />
-        )}
-
-        <NewTaskDialog onClose={() => setAddStatus(null)} parents={parentOptions} target={addStatus} />
-        <IdeaCaptureDialog onClose={() => setIdeaOpen(false)} open={ideaOpen} />
-        <TaskDrawer columns={columnNames} id={openId} onClose={() => setOpenId(null)} onOpen={setOpenId} />
-      </div>
+        </div>
+      </BoardInfoContext.Provider>
     </DependencyContext.Provider>
   )
 }

@@ -27,6 +27,11 @@ export interface KanbanTask {
   started_at?: null | number
   worker_pid?: null | number
   last_heartbeat_at?: null | number
+  /** Present only in the consolidated All Boards view (GET /board/all) — the
+   *  owning board's slug + display name, so a merged card can be attributed
+   *  and every mutation can be routed back to ITS board, never the sentinel. */
+  board?: null | string
+  board_name?: null | string
 }
 
 export interface KanbanColumn {
@@ -38,11 +43,54 @@ export interface KanbanBoard {
   columns: KanbanColumn[]
   tenants: string[]
   assignees: string[]
-  /** Every dependency edge on the board as `[parent_id, child_id]` — the
-   *  parent BLOCKS the child. Absent on older backends, so always guard. */
-  link_edges?: Array<[string, string]>
+  /** Every dependency edge on the board — the parent BLOCKS the child.
+   *  Absent on older backends, so always guard. Two shapes, one per endpoint:
+   *  single-board `GET /board` sends `[parent_id, child_id]` tuples, while the
+   *  consolidated `GET /board/all` sends `{board, parent, child}` objects so
+   *  each edge carries the board its two ids belong to (ids are only unique
+   *  per board). `buildGraph` in deps.ts normalizes both. */
+  link_edges?: Array<[string, string] | BoardAllLinkEdge>
   latest_event_id: number
   now: number
+  /** Present only when this payload came from the consolidated All Boards
+   *  view (`fetchAllBoards`, sentinel `$boardSlug === ALL_BOARDS`) — the
+   *  per-board roster (for the filter chips + card badges), never present
+   *  on a single-board `GET /board` response. */
+  boards?: BoardAllInfo[]
+  /** Per-board `latest_event_id`, for seeding a future multi-board events
+   *  socket subscription without a gap or a replay (follow-on card). */
+  cursors?: Record<string, number>
+  /** Boards that failed to load in this consolidated fetch — the view stays
+   *  up for every board that succeeded; render this as a non-blocking notice
+   *  naming the failed boards rather than blanking the page. */
+  errors?: BoardAllError[]
+}
+
+/** One board's roster entry in the consolidated All Boards view — display
+ *  chrome (name/color/icon) plus how many live cards it contributed. */
+export interface BoardAllInfo {
+  slug: string
+  name: string
+  color: string
+  icon: string
+  project_name?: null | string
+  task_count: number
+}
+
+/** One board that failed to load in `GET /board/all` — reported instead of
+ *  failing the whole consolidated view. */
+export interface BoardAllError {
+  board: string
+  detail: string
+}
+
+/** One dependency edge from `GET /board/all`. Both ids belong to `board` —
+ *  links only ever exist within one board's DB — which is what lets the
+ *  merged client index key the chain on the (board, id) pair. */
+export interface BoardAllLinkEdge {
+  board: string
+  parent: string
+  child: string
 }
 
 /** A dependency resolved against the board cache for display: the linked
@@ -68,7 +116,7 @@ export interface DiagnosticAction {
 /** One active distress signal on a task (kanban_diagnostics.Diagnostic). */
 export interface Diagnostic {
   kind: string
-  severity: 'critical' | 'error' | 'warning'
+  severity: 'critical' | 'error' | 'warning' | 'info'
   title: string
   detail: string
   actions: DiagnosticAction[]
@@ -280,5 +328,57 @@ export const columnMeta = (name: string) =>
 export const SEVERITY_TONE: Record<Diagnostic['severity'], string> = {
   critical: 'var(--destructive, #f87171)',
   error: 'var(--destructive, #f87171)',
-  warning: '#fbbf24'
+  warning: '#fbbf24',
+  info: 'var(--ui-text-tertiary, #60a5fa)'
 }
+
+/** Run outcome → row tone. Every value resolves through COLUMN_META or
+ *  SEVERITY_TONE, so a run row reads the same color the board would give the
+ *  same state — no second palette to keep in sync. Unknown outcomes stay
+ *  neutral rather than borrowing a meaning they don't have. */
+const OUTCOME_TONE: Record<string, string> = {
+  blocked: COLUMN_META.blocked.tone,
+  changes_requested: COLUMN_META.review.tone,
+  completed: COLUMN_META.running.tone,
+  crashed: SEVERITY_TONE.error,
+  failed: SEVERITY_TONE.error,
+  gave_up: SEVERITY_TONE.error,
+  review_requested: COLUMN_META.review.tone,
+  timed_out: SEVERITY_TONE.error
+}
+
+export const outcomeTone = (outcome?: null | string): string =>
+  OUTCOME_TONE[outcome ?? ''] ?? 'var(--ui-text-quaternary)'
+
+/** Activity event kind → dot tone. Deliberately sparse: only kinds a human
+ *  scans for get color. `heartbeat` is the highest-volume kind by an order of
+ *  magnitude, so it is absent here and falls through to the quietest value —
+ *  coloring it would turn the feed into noise. Failure kinds are tinted
+ *  destructive precisely because they are what you scroll a long event feed
+ *  looking for. */
+const EVENT_TONE: Record<string, string> = {
+  block_loop_detected: COLUMN_META.blocked.tone,
+  blocked: COLUMN_META.blocked.tone,
+  changes_requested: COLUMN_META.review.tone,
+  claimed: COLUMN_META.ready.tone,
+  commented: 'var(--ui-text-secondary)',
+  completed: COLUMN_META.running.tone,
+  crashed: SEVERITY_TONE.error,
+  dependency_wait: COLUMN_META.todo.tone,
+  gave_up: SEVERITY_TONE.error,
+  held: COLUMN_META.on_hold.tone,
+  interrupted: SEVERITY_TONE.warning,
+  promoted: COLUMN_META.ready.tone,
+  protocol_violation: SEVERITY_TONE.error,
+  reclaimed: COLUMN_META.review.tone,
+  respawn_guarded: SEVERITY_TONE.warning,
+  review_no_verdict: COLUMN_META.review.tone,
+  review_requested: COLUMN_META.review.tone,
+  scheduled: COLUMN_META.scheduled.tone,
+  spawned: COLUMN_META.ready.tone,
+  stale: SEVERITY_TONE.warning,
+  timed_out: SEVERITY_TONE.error,
+  unblocked: COLUMN_META.review.tone
+}
+
+export const eventTone = (kind: string): string => EVENT_TONE[kind] ?? 'var(--ui-text-quaternary)'

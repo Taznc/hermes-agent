@@ -39,10 +39,16 @@ interface PreviewBrowserBarProps {
   onOpenExternal?: () => void
   onPopIn?: () => void
   onPopOut?: () => void
-  onReload: () => void
+  /** Omitted where there is no guest: the page lives in a real browser tab,
+   *  which reloads itself; a reload button here would act on nothing. */
+  onReload?: () => void
   onToggleAnnotate?: () => void
-  onToggleConsole: () => void
-  onToggleDevTools: () => void
+  /** Omitted where there is no guest to read a console from (the web build):
+   *  the panel it toggles is fed by the webview's `console-message` event, so
+   *  the button would be a control over nothing. */
+  onToggleConsole?: () => void
+  /** Omitted for the same reason — DevTools is `webview.openDevTools()`. */
+  onToggleDevTools?: () => void
   /** The page's CURRENT address (it moves as the user navigates), not the
    *  target the tab was opened with. */
   url: string
@@ -158,11 +164,13 @@ export function PreviewBrowserBar({
         label={copy.goForward}
         onSelect={onForward}
       />
-      <PaneStripGlyph
-        icon={<Codicon name="refresh" size="0.8125rem" spinning={loading} />}
-        label={copy.reload}
-        onSelect={onReload}
-      />
+      {onReload ? (
+        <PaneStripGlyph
+          icon={<Codicon name="refresh" size="0.8125rem" spinning={loading} />}
+          label={copy.reload}
+          onSelect={onReload}
+        />
+      ) : null}
       {/* The copy control lives INSIDE the field, on its right edge — the
           same pre-faded inline icon code blocks use, not a toolbar button.
           It copies what the field shows: on a remote gateway, that is the
@@ -261,18 +269,22 @@ export function PreviewBrowserBar({
           onSelect={onOpenExternal}
         />
       ) : null}
-      <PaneStripGlyph
-        active={consoleOpen}
-        icon={<Codicon name="terminal" size="0.8125rem" />}
-        label={consoleOpen ? copy.hideConsole : copy.showConsole}
-        onSelect={onToggleConsole}
-      />
-      <PaneStripGlyph
-        active={devToolsOpen}
-        icon={<Codicon name="bug" size="0.8125rem" />}
-        label={devToolsOpen ? copy.hideDevTools : copy.openDevTools}
-        onSelect={onToggleDevTools}
-      />
+      {onToggleConsole ? (
+        <PaneStripGlyph
+          active={consoleOpen}
+          icon={<Codicon name="terminal" size="0.8125rem" />}
+          label={consoleOpen ? copy.hideConsole : copy.showConsole}
+          onSelect={onToggleConsole}
+        />
+      ) : null}
+      {onToggleDevTools ? (
+        <PaneStripGlyph
+          active={devToolsOpen}
+          icon={<Codicon name="bug" size="0.8125rem" />}
+          label={devToolsOpen ? copy.hideDevTools : copy.openDevTools}
+          onSelect={onToggleDevTools}
+        />
+      ) : null}
     </div>
   )
 }

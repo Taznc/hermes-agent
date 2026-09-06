@@ -51,6 +51,7 @@ import { sessionApprovalRequest } from '@/store/prompts'
 import { $toolInlineDiff } from '@/store/tool-diffs'
 import { $toolRowDismissed, dismissToolRow } from '@/store/tool-dismiss'
 import { $anyToolDisclosureOpen, $toolDisclosureOpen, $toolViewMode, setToolDisclosureOpen } from '@/store/tool-view'
+import { $mcpAppCard } from '@/store/mcp-apps'
 
 import { APPROVAL_TOOLS, PendingToolApproval } from './approval'
 import {
@@ -74,6 +75,7 @@ import {
 } from './fallback-model'
 import { isToolCallPart, summarizeToolRun } from './run-summary'
 import { ToolRunTicker } from './run-ticker'
+import { McpAppCard } from '../mcp-app-card'
 
 // `true` when a ToolEntry is rendered inside an embedding wrapper that owns
 // the per-row chrome (timer / preview). The flat ToolGroupSlot sets this
@@ -373,6 +375,12 @@ function ToolEntry({ part }: ToolEntryProps) {
   // re-render every mounted tool row (the factory caches a per-id atom).
   const sideDiff = useStore($toolInlineDiff(toolCallId ?? ''))
   const inlineDiff = stripInlineDiffChrome(sideDiff) || inlineDiffFromResult(result)
+  // The session whose transcript this row is IN, which is not necessarily the
+  // primary one: a tool row inside a session tile must read only its own card.
+  const { $cwd: $sessionCwd, $runtimeId: $sessionRuntimeId } = useSessionView()
+  // MCP App resources arrive only on the ephemeral live `tool.complete`
+  // projection. Stored results never populate this renderer-only atom.
+  const mcpApp = useStore($mcpAppCard($sessionRuntimeId.get() ?? '', toolCallId ?? ''))
   const isFileEdit = isFileEditTool(toolName)
   const defaultOpen = Boolean(inlineDiff)
   const open = useDisclosureOpen(disclosureId, defaultOpen)
@@ -398,9 +406,6 @@ function ToolEntry({ part }: ToolEntryProps) {
   // detected target the old inline card did. Idempotent + dedup'd, so re-renders
   // don't churn.
   const previewTarget = view.previewTarget
-  // The session whose transcript this row is IN, which is not necessarily the
-  // primary one: a tool row inside a session tile must feed that tile's composer.
-  const { $cwd: $sessionCwd, $runtimeId: $sessionRuntimeId } = useSessionView()
 
   useEffect(() => {
     if (isPending || !previewTarget || !isPreviewableTarget(previewTarget)) {
@@ -471,6 +476,7 @@ function ToolEntry({ part }: ToolEntryProps) {
     view.stderr ||
     view.terminalCommand ||
     view.terminalExitCode !== undefined ||
+    mcpApp !== null ||
     toolViewMode === 'technical'
   )
 
@@ -614,7 +620,11 @@ function ToolEntry({ part }: ToolEntryProps) {
             />
           )}
           {part.toolName === 'terminal' && toolViewMode !== 'technical' && (
-            <TerminalTranscript command={view.terminalCommand} exitCode={view.terminalExitCode} />
+            <TerminalTranscript
+              command={view.terminalCommand}
+              copyLabel={copy.copyCommand}
+              exitCode={view.terminalExitCode}
+            />
           )}
           {view.imageUrl && (
             <div className="max-w-72 overflow-hidden rounded-[0.25rem] border border-(--ui-stroke-tertiary)">
@@ -707,6 +717,7 @@ function ToolEntry({ part }: ToolEntryProps) {
                 )}
               </div>
             ))}
+          {mcpApp && <McpAppCard card={mcpApp} />}
           {toolViewMode === 'technical' && <ToolPayloadDisclosure args={part.args} result={part.result} />}
         </div>
       )}
@@ -716,16 +727,24 @@ function ToolEntry({ part }: ToolEntryProps) {
 
 interface TerminalTranscriptProps {
   command?: string
+  copyLabel: string
   exitCode?: number
 }
 
-function TerminalTranscript({ command, exitCode }: TerminalTranscriptProps) {
+// The command line is the one thing in a terminal card worth copying on its
+// own — separately from the whole-card copy button, which prefers stdout/
+// stderr once the command has produced substantial output (toolCopyPayload).
+// A long command wrapped across several lines still has to come back as the
+// exact source string, so this copies `command` directly rather than reading
+// the rendered `<code>` back via textContent (which would pick up the
+// synthetic leading `$ ` prompt glyph).
+function TerminalTranscript({ command, copyLabel, exitCode }: TerminalTranscriptProps) {
   if (!command && exitCode === undefined) {
     return null
   }
 
   return (
-    <div className="flex min-w-0 items-center gap-2 rounded-[0.25rem] border border-(--ui-stroke-tertiary) bg-(--ui-bg-quinary) px-2 py-1.5 font-mono text-[0.7rem] leading-relaxed">
+    <div className="group/terminal-transcript flex min-w-0 items-center gap-2 rounded-[0.25rem] border border-(--ui-stroke-tertiary) bg-(--ui-bg-quinary) px-2 py-1.5 font-mono text-[0.7rem] leading-relaxed">
       {command && (
         <code className="min-w-0 flex-1 whitespace-pre-wrap wrap-anywhere text-(--ui-text-secondary)">
           <span aria-hidden className="select-none text-(--ui-accent-secondary)">
@@ -733,6 +752,18 @@ function TerminalTranscript({ command, exitCode }: TerminalTranscriptProps) {
           </span>
           {command}
         </code>
+      )}
+      {command && (
+        <CopyButton
+          appearance="icon"
+          buttonSize="icon-xs"
+          className="shrink-0 text-(--ui-text-tertiary) opacity-0 transition-opacity group-hover/terminal-transcript:opacity-100 focus-visible:opacity-100"
+          iconClassName="size-3"
+          label={copyLabel}
+          side="top"
+          stopPropagation
+          text={command}
+        />
       )}
       {exitCode !== undefined && (
         <span

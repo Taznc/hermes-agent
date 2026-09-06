@@ -1,7 +1,6 @@
 import { ActionBarPrimitive, BranchPickerPrimitive, MessagePrimitive, useAuiState } from '@assistant-ui/react'
 import { type FC, type ReactNode, useCallback, useEffect, useRef, useState } from 'react'
 
-import { nativeContextMenuHandled } from '@/app/context-menu/target'
 import { DirectiveContent } from '@/components/assistant-ui/directive-text'
 import { messageAttachmentRefs, messageContentText } from '@/components/assistant-ui/thread/content'
 import { ReactionBadge, ReactionPicker } from '@/components/assistant-ui/thread/message-reactions'
@@ -25,6 +24,21 @@ export function hasTextSelection(): boolean {
   const selection = window.getSelection()
 
   return Boolean(selection && !selection.isCollapsed && selection.toString().length > 0)
+}
+
+/**
+ * True when this click is part of a text-selection gesture, so the bubble's
+ * own action (open the editor / toggle the clamp) must stand down.
+ *
+ * Two cases, and the second is the one a plain `hasTextSelection()` misses:
+ * a finished drag-select leaves a live highlight, but a DOUBLE-click's
+ * word-select is applied by the browser AFTER the second `click` dispatches —
+ * at handler time the selection still reads collapsed. `detail >= 2` catches
+ * the double/triple click by the gesture itself, so double-clicking a word in
+ * your own prompt selects it for copying instead of opening the edit composer.
+ */
+export function isSelectionClick(event: { detail: number }): boolean {
+  return event.detail >= 2 || hasTextSelection()
 }
 
 export function StickyHumanMessageContainer({
@@ -459,27 +473,17 @@ export const UserMessage: FC<{
                 // attr below) so this handler keeps the picker gesture; a
                 // link/image/selection inside the bubble still gets the app
                 // menu, and this handler's selection guard keeps ⌘C flows.
-                data-context-menu-skip=""
+                // Stamped ONLY while the picker can actually open: with
+                // reactions off there is no gesture to protect, so the bubble
+                // stops claiming right-click and the shared menu takes it —
+                // that is where Copy message lives.
+                data-context-menu-skip={readOnly || !reactionsEnabled ? undefined : ''}
                 onContextMenu={
                   // Right-click is the desktop stand-in for iOS touch-and-hold —
                   // but only when there's nothing selected. A live highlight
                   // keeps the native Copy menu (and ⌘C) instead of the picker.
                   readOnly || !reactionsEnabled
-                    ? // The picker is unavailable and this element carries
-                      // `data-context-menu-skip`, so the shared AppContextMenu
-                      // deliberately leaves a bare (non-owned) right-click here
-                      // unhandled — same as it always did. In Electron that
-                      // still resolves to "no menu" (main never calls
-                      // `Menu.popup`); in a browser tab "unhandled" IS
-                      // Chromium's own native menu, so it must be suppressed
-                      // explicitly to match. A selection inside the bubble
-                      // makes the target "owned", so AppContextMenu takes the
-                      // whole gesture over before this handler ever runs.
-                      event => {
-                        if (!nativeContextMenuHandled()) {
-                          event.preventDefault()
-                        }
-                      }
+                    ? undefined
                     : event => {
                         if (hasTextSelection()) {
                           return
@@ -497,10 +501,11 @@ export const UserMessage: FC<{
                     aria-expanded={bodyClamped ? expanded : undefined}
                     aria-label={bodyClamped ? (expanded ? t.common.collapse : copy.expandMessage) : undefined}
                     className={cn(bubbleClassName, !bodyClamped && 'cursor-default')}
-                    onClick={() => {
+                    onClick={event => {
                       // Drag-select ends on mouseup→click; don't collapse the
-                      // clamp just because the highlight finished.
-                      if (hasTextSelection() || !bodyClamped) {
+                      // clamp just because the highlight finished. A multi-click
+                      // is a selection gesture too (see isSelectionClick).
+                      if (isSelectionClick(event) || !bodyClamped) {
                         return
                       }
 
@@ -521,7 +526,7 @@ export const UserMessage: FC<{
                       aria-label={copy.editMessage}
                       className={bubbleClassName}
                       onClick={event => {
-                        if (hasTextSelection()) {
+                        if (isSelectionClick(event)) {
                           event.preventDefault()
                           event.stopPropagation()
 
@@ -530,8 +535,8 @@ export const UserMessage: FC<{
 
                         triggerHaptic('selection')
                       }}
-                      onPointerDown={() => {
-                        if (hasTextSelection()) {
+                      onPointerDown={event => {
+                        if (isSelectionClick(event)) {
                           return
                         }
 

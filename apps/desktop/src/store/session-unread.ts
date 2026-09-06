@@ -357,6 +357,67 @@ export function forgetSessionUnread(
   }
 }
 
+/**
+ * Forget unread state only after the resolver has exhausted every profile for
+ * an id. Unlike {@link forgetSessionUnread}, this deliberately removes every
+ * profile bucket: that would be unsafe for an ordinary delete because ids are
+ * profile-local, but an all-profile miss proves no same-id session survives.
+ */
+export function forgetConfirmedMissingSessionUnread(storedSessionId: string): void {
+  const id = storedSessionId.trim()
+
+  if (!id) {
+    return
+  }
+
+  const seen = $sessionSeenCounts.get()
+  const nextSeen: SeenCounts = {}
+  let changedSeen = false
+
+  for (const [profile, bucket] of Object.entries(seen)) {
+    const kept = Object.fromEntries(Object.entries(bucket).filter(([candidate]) => candidate !== id))
+
+    if (Object.keys(kept).length !== Object.keys(bucket).length) {
+      changedSeen = true
+    }
+
+    if (Object.keys(kept).length) {
+      nextSeen[profile] = kept
+    }
+  }
+
+  if (changedSeen) {
+    $sessionSeenCounts.set(nextSeen)
+  }
+
+  const markers = $unreadFinishedMarkers.get()
+  const nextMarkers: Markers = {}
+  let changedMarkers = false
+
+  for (const [profile, bucket] of Object.entries(markers)) {
+    const kept = bucket.filter(candidate => candidate !== id)
+
+    if (kept.length !== bucket.length) {
+      changedMarkers = true
+    }
+
+    if (kept.length) {
+      nextMarkers[profile] = kept
+    }
+  }
+
+  if (changedMarkers) {
+    $unreadFinishedMarkers.set(nextMarkers)
+  }
+
+  const transient = $unreadFinishedSessionIds.get()
+  const remainingTransient = transient.filter(candidate => candidate !== id)
+
+  if (remainingTransient.length !== transient.length) {
+    $unreadFinishedSessionIds.set(remainingTransient)
+  }
+}
+
 /** Seed/refresh watermarks from freshly loaded lists: the SELECTED session
  *  tracks its live count (it's on screen — nothing there is unread), and a
  *  session never seen before seeds at its current count instead of lighting

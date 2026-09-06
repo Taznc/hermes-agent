@@ -124,6 +124,92 @@ describe('CtaBanner', () => {
     expect(screen.getByText('ctaBlockedNoReason')).toBeTruthy()
   })
 
+  it('automatic circuit-breaker (gave_up) failure: intelligible cause, retry action, no "needs your input"', () => {
+    // The demonstrated card, t_44ca59a3: status=blocked, block_kind=NULL,
+    // event tail is crashed -> gave_up{error:'pid 704578 not alive'} — no
+    // blocked/block_loop_detected event at all.
+    const task = baseTask({
+      block_kind: null,
+      last_failure_error: 'pid 704578 not alive',
+      status: 'blocked'
+    })
+
+    const events: KanbanEvent[] = [
+      { created_at: 0, id: 1, kind: 'crashed', payload: { error: 'pid 704578 not alive' } },
+      { created_at: 1, id: 2, kind: 'gave_up', payload: { error: 'pid 704578 not alive' } }
+    ]
+
+    render(
+      <CtaBanner comments={[]} events={events} onFocusComment={vi.fn()} onMove={vi.fn()} onSubmitChoice={vi.fn()} task={task} />
+    )
+
+    // Never the false "did not record a reason" / "needs your input" copy.
+    expect(screen.queryByText('ctaBlockedNoReason')).toBeNull()
+    expect(screen.queryByText('ctaBlockedTitle')).toBeNull()
+    // The real cause, humanized by runErrorText, is shown.
+    expect(screen.getByText('runErrPidNotAlive')).toBeTruthy()
+    expect(screen.getByText('ctaBlockedAutomaticTitle')).toBeTruthy()
+    // Retry is present; Reply exists but is not the only/primary action.
+    expect(screen.getByText('ctaRetry')).toBeTruthy()
+  })
+
+  it('automatic failure falls back to task.last_failure_error when no gave_up event is present', () => {
+    const task = baseTask({ block_kind: null, last_failure_error: 'pid 9 not alive', status: 'blocked' })
+
+    render(
+      <CtaBanner comments={[]} events={[]} onFocusComment={vi.fn()} onMove={vi.fn()} onSubmitChoice={vi.fn()} task={task} />
+    )
+
+    expect(screen.getByText('runErrPidNotAlive')).toBeTruthy()
+    expect(screen.getByText('ctaBlockedAutomaticTitle')).toBeTruthy()
+  })
+
+  it('reviewer exited with no verdict: neutral copy, requeue action, never a question', () => {
+    const task = baseTask({ block_kind: null, status: 'blocked' })
+    const events: KanbanEvent[] = [{ created_at: 0, id: 1, kind: 'review_no_verdict', payload: { pid: 1 } }]
+
+    render(
+      <CtaBanner comments={[]} events={events} onFocusComment={vi.fn()} onMove={vi.fn()} onSubmitChoice={vi.fn()} task={task} />
+    )
+
+    expect(screen.getByText('ctaReviewNoVerdictTitle')).toBeTruthy()
+    expect(screen.getByText('ctaRequeueReview')).toBeTruthy()
+    expect(screen.queryByText('ctaBlockedTitle')).toBeNull()
+  })
+
+  it('precedence: manual block AFTER an earlier gave_up resolves to manual, not automatic', () => {
+    const task = baseTask({ block_kind: 'needs_input', status: 'blocked' })
+
+    const events: KanbanEvent[] = [
+      { created_at: 0, id: 1, kind: 'gave_up', payload: { error: 'pid 1 not alive' } },
+      { created_at: 1, id: 2, kind: 'blocked', payload: { reason: 'Which key?' } }
+    ]
+
+    render(
+      <CtaBanner comments={[]} events={events} onFocusComment={vi.fn()} onMove={vi.fn()} onSubmitChoice={vi.fn()} task={task} />
+    )
+
+    expect(screen.getByText('Which key?')).toBeTruthy()
+    expect(screen.queryByText('ctaBlockedAutomaticTitle')).toBeNull()
+  })
+
+  it('precedence: manual block, unblocked, then a later gave_up resolves to automatic', () => {
+    const task = baseTask({ block_kind: 'needs_input', last_failure_error: null, status: 'blocked' })
+
+    const events: KanbanEvent[] = [
+      { created_at: 0, id: 1, kind: 'blocked', payload: { reason: 'Which key?' } },
+      { created_at: 1, id: 2, kind: 'unblocked', payload: null },
+      { created_at: 2, id: 3, kind: 'gave_up', payload: { error: 'pid 2 not alive' } }
+    ]
+
+    render(
+      <CtaBanner comments={[]} events={events} onFocusComment={vi.fn()} onMove={vi.fn()} onSubmitChoice={vi.fn()} task={task} />
+    )
+
+    expect(screen.getByText('ctaBlockedAutomaticTitle')).toBeTruthy()
+    expect(screen.queryByText('Which key?')).toBeNull()
+  })
+
   it('review: offers Approve (-> done) and Send back (-> ready)', () => {
     const task = baseTask({ status: 'review' })
     const onMove = vi.fn()

@@ -1107,76 +1107,11 @@ class TestWebServerEndpoints:
 
     # ── POST /api/chat/image-upload (browser clipboard/drop images) ─────
 
-    # ── POST /api/chat/file-upload (browser +Files picker / OS file drop) ──
-
-    def test_post_chat_file_upload_requires_auth(self):
-        from hermes_cli.web_server import _SESSION_HEADER_NAME
-
-        resp = self.client.post(
-            "/api/chat/file-upload",
-            json={"data_url": "data:text/plain;base64,aGVsbG8=", "filename": "notes.txt"},
-            headers={_SESSION_HEADER_NAME: "wrong-token"},
-        )
-        assert resp.status_code == 401
-
-    def test_post_chat_file_upload_stages_bytes_under_uploads_dir(self):
-        from hermes_constants import get_hermes_home
-
-        resp = self.client.post(
-            "/api/chat/file-upload",
-            json={"data_url": "data:text/plain;base64,aGVsbG8gd29ybGQ=", "filename": "notes.txt"},
-        )
-
-        assert resp.status_code == 200
-        data = resp.json()
-        assert data["ok"] is True
-        assert data["bytes"] == len(b"hello world")
-
-        stored = Path(data["path"])
-        assert stored.exists()
-        assert stored.read_bytes() == b"hello world"
-        assert stored.parent == get_hermes_home() / "uploads"
-        # Filename is sanitized/namespaced, but the original stem + extension
-        # survive so the staged file is still recognizable.
-        assert stored.name.endswith("_notes.txt")
-
-    def test_post_chat_file_upload_sanitizes_path_traversal_in_filename(self):
-        resp = self.client.post(
-            "/api/chat/file-upload",
-            json={"data_url": "data:text/plain;base64,eA==", "filename": "../../etc/passwd"},
-        )
-
-        assert resp.status_code == 200
-        stored = Path(resp.json()["path"])
-        # Only the basename survives; no path components from the client name
-        # can escape HERMES_HOME/uploads/.
-        assert stored.parent.name == "uploads"
-        assert ".." not in stored.name
-
-    def test_post_chat_file_upload_rejects_oversized_payload(self):
-        from hermes_cli import web_server as ws
-
-        oversized = b"x" * (ws._CHAT_FILE_UPLOAD_MAX_BYTES + 1)
-        import base64 as _b64
-
-        resp = self.client.post(
-            "/api/chat/file-upload",
-            json={
-                "data_url": f"data:application/octet-stream;base64,{_b64.b64encode(oversized).decode()}",
-                "filename": "big.bin",
-            },
-        )
-
-        assert resp.status_code == 413
-
-    def test_post_chat_file_upload_rejects_non_data_url_payload(self):
-        resp = self.client.post(
-            "/api/chat/file-upload",
-            json={"data_url": "not-a-data-url", "filename": "notes.txt"},
-        )
-
-        assert resp.status_code == 400
-
+    # POST /api/chat/file-upload (browser +Files picker / OS file drop) tests
+    # live in tests/hermes_fork/test_chat_file_upload.py: it's a fork-owned
+    # feature (hermes_fork.account_limits-style anchor pattern for tests, see
+    # docs/fork-anchor-extraction.md rule 10), so it doesn't need to sit in
+    # this upstream-shared file.
 
 
 

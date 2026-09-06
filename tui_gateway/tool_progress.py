@@ -220,6 +220,12 @@ def _on_tool_complete(sid: str, tool_call_id: str, name: str, args: dict, result
         payload["result"] = json.loads(result)
     except Exception:
         payload["result"] = result
+    # An MCP App card is intentionally a live-only projection. Its text
+    # content above is the sole durable/model-facing result; this field exists
+    # only on this one completion event and is never written into a session.
+    card = getattr(result, "mcp_app_card", None)
+    if isinstance(card, dict):
+        payload["mcp_app"] = card
     summary = _tool_summary(name, result, duration_s)
     if summary:
         payload["summary"] = summary
@@ -235,8 +241,8 @@ def _on_tool_complete(sid: str, tool_call_id: str, name: str, args: dict, result
         rendered: list[str] = []
         if render_edit_diff_with_delta(name, result, function_args=args, snapshot=snapshot, print_fn=rendered.append):
             payload["inline_diff"] = "\n".join(rendered)
-    if (_tool_progress_enabled(sid) or payload.get("inline_diff") or _tool_lifecycle_required_for_ui(name)
-            or name in _TODO_TOOL_NAMES):
+    if (_tool_progress_enabled(sid) or payload.get("inline_diff") or payload.get("mcp_app")
+            or _tool_lifecycle_required_for_ui(name) or name in _TODO_TOOL_NAMES):
         _emit("tool.complete", sid, payload)
     # Task state is application data, not tool-progress chrome: a dedicated full-snapshot event lets
     # every client reconcile without parsing tool args.

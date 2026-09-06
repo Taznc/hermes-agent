@@ -32,6 +32,7 @@ import {
 } from 'electron'
 
 import { classifyActiveRuntime } from './active-runtime-state'
+import { createAgentOverviewReader, gatherOverviewBackends } from './agent-overview'
 import { destroyKeepaliveAgents, downloadAgentFor, jsonAgentFor, withRetry } from './api-transport'
 import { appIconCandidates, resolveAppIcon } from './app-icon'
 import { stopBackendChild as stopBackendChildImpl, stopBackendTreesForUpdate } from './backend-child'
@@ -6812,25 +6813,6 @@ async function showPluginCompatNoticeOnce() {
   }
 }
 
-function sendOpenUpdatesRequested() {
-  if (!mainWindow || mainWindow.isDestroyed()) {
-    return
-  }
-
-  const { webContents } = mainWindow
-
-  if (!webContents || webContents.isDestroyed()) {
-    return
-  }
-
-  webContents.send('hermes:open-updates')
-
-  if (!mainWindow.isVisible()) {
-    mainWindow.show()
-  }
-
-  mainWindow.focus()
-}
 
 // Push titlebar/fullscreen chrome state to a window's renderer. Defaults to the
 // primary, but any full chat window (primary or a secondary "instance" peer)
@@ -6858,22 +6840,11 @@ function sendWindowStateChanged(nextIsFullscreen?: boolean, target = mainWindow)
 function buildApplicationMenu() {
   const template = []
 
-  const checkForUpdatesItem = {
-    // Update checks are disabled (desktop.auto_update_checks_enabled: false
-    // in config.yaml, or HERMES_DESKTOP_DISABLE_UPDATE_CHECKS) — clicking
-    // this still opens the updates panel, which reports the same
-    // 'update-checks-disabled' reason, but the label says so up front instead
-    // of looking like a normal, functional menu item.
-    label: UPDATE_CHECKS_DISABLED ? 'Check for Updates… (disabled)' : 'Check for Updates…',
-    click: () => sendOpenUpdatesRequested()
-  }
-
   if (IS_MAC) {
     template.push({
       label: APP_NAME,
       submenu: [
         { label: `About ${APP_NAME}`, click: () => showAboutPanelFresh() },
-        checkForUpdatesItem,
         { type: 'separator' },
         { role: 'services' },
         { type: 'separator' },
@@ -6984,11 +6955,6 @@ function buildApplicationMenu() {
     submenu: IS_MAC
       ? [{ role: 'minimize' }, { role: 'zoom' }, { role: 'front' }]
       : [{ role: 'minimize' }, { role: 'close' }]
-  })
-  template.push({
-    label: 'Help',
-    role: 'help',
-    submenu: [checkForUpdatesItem]
   })
 
   return Menu.buildFromTemplate(template)
@@ -15664,6 +15630,93 @@ async function enumerateRegistryAgentSources(registry = readDesktopConnectionsRe
     })
   )
 }
+
+const readAgentOverview = createAgentOverviewReader<any>()
+
+// Credential-free local profile discovery for the overview: a directory
+// listing under HERMES_HOME/profiles, never a backend spawn. Mirrors the
+// SSH roster probe's contract (names only, 'default' implied).
+function readLocalProfileInventory(): null | string[] {
+  if (!directoryExists(HERMES_HOME)) {
+    return null
+  }
+
+  const profilesDir = path.join(HERMES_HOME, 'profiles')
+  const names = new Set<string>(['default'])
+
+  try {
+    if (directoryExists(profilesDir)) {
+      for (const entry of fs.readdirSync(profilesDir, { withFileTypes: true })) {
+        if (entry.isDirectory() && PROFILE_NAME_RE.test(entry.name) && !entry.name.endsWith('.rollback-old')) {
+          names.add(entry.name)
+        }
+      }
+    }
+  } catch {
+    // Unreadable profiles dir: the local source still reports 'default'.
+  }
+
+  return [...names]
+}
+
+ipcMain.handle('hermes:agents:overview', async (_event, options) => {
+  const registry = readDesktopConnectionsRegistry()
+
+  const promises = [
+    backendConnectionState.getPromise(),
+    ...[...backendPool.values()].map(entry => entry.connectionPromise)
+  ].filter(Boolean)
+
+  const pooled = await gatherOverviewBackends(promises, descriptor => resolvedConnectionId(registry, descriptor))
+
+  return readAgentOverview(
+    {
+      sources: registry.connections,
+      pooled,
+      discoverParked: async connectionId => {
+        const source = registry.connections.find(entry => entry.id === connectionId)
+
+        if (source?.kind === 'local') {
+          return (readLocalProfileInventory() ?? []).map(name => ({ name }))
+        }
+
+        if (source?.kind === 'ssh') {
+          // Reuse the roster's TTL/cached credential-free directory probe. No
+          // ensureRegistryBackend / profile activation on this read-only path.
+          await probeSshProfileInventory(source)
+
+          return (sshRosterCache.get(connectionId) ?? []).map(name => ({ name }))
+        }
+
+        return []
+      },
+      // URL/cloud discovery builds an HTTP descriptor only. In particular do NOT
+      // use ensureRegistryBackend: its primary fallback may start a runtime.
+      connect: async connectionId => {
+        const source = registry.connections.find(entry => entry.id === connectionId)
+
+        if (!source || (source.kind !== 'remote' && source.kind !== 'cloud')) {
+          return []
+        }
+
+        return [
+          await buildRemoteConnection(
+            source.url,
+            normAuthMode(source.authMode),
+            source.authMode === 'oauth' ? null : decryptDesktopSecret(source.token),
+            `registry:${source.id}`,
+            undefined,
+            source.kind === 'cloud' ? 'cloud' : 'url',
+            undefined,
+            source.headers
+          )
+        ]
+      },
+      fetch: (descriptor, requestPath) => getJsonForBackend(descriptor, requestPath, { timeoutMs: 8_000 })
+    },
+    { force: options?.force === true }
+  )
+})
 
 ipcMain.handle('hermes:agents:roster', async () => {
   const registry = readDesktopConnectionsRegistry()

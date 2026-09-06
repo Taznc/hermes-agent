@@ -18,12 +18,14 @@ import { cn } from '@/lib/utils'
 // shared default so the other call sites are untouched).
 export interface LogViewProps extends Omit<ComponentProps<'div'>, 'children'> {
   numbered?: boolean
+  /** Let numbered rows wrap at word boundaries instead of horizontally scrolling. */
+  wrap?: boolean
   /** Raw log text for numbered mode (children is ignored in that mode). */
   content?: string
   children?: ComponentProps<'div'>['children']
 }
 
-export function LogView({ children, className, content, numbered, ...props }: LogViewProps) {
+export function LogView({ children, className, content, numbered, wrap = false, ...props }: LogViewProps) {
   if (numbered) {
     const lines = (content ?? '').split('\n')
 
@@ -44,11 +46,15 @@ export function LogView({ children, className, content, numbered, ...props }: Lo
         data-selectable-text="true"
         {...props}
       >
-        {/* `max-content` on the text column (not 1fr) lets the grid grow past
-         *  the container so the OUTER `overflow-auto` scrolls horizontally
-         *  instead of wrapping — the alignment-preserving behavior the card
-         *  asked for. */}
-        <div className="inline-grid min-w-full grid-cols-[auto_max-content] gap-x-2.5 px-2.5 py-1.5">
+        {/* `max-content` preserves raw terminal alignment when wrapping is
+         * disabled; the opt-in readable mode keeps the line-number gutter and
+         * lets the text column occupy the available width. */}
+        <div
+          className={cn(
+            'min-w-full gap-x-2.5 px-2.5 py-1.5',
+            wrap ? 'grid grid-cols-[auto_minmax(0,1fr)]' : 'inline-grid grid-cols-[auto_max-content]'
+          )}
+        >
           {lines.map((line, index) => (
             <Fragment key={index}>
               <span
@@ -58,7 +64,9 @@ export function LogView({ children, className, content, numbered, ...props }: Lo
               >
                 {index + 1}
               </span>
-              <span className="whitespace-pre">{line.length > 0 ? line : '\u00a0'}</span>
+              <span className={wrap ? 'whitespace-pre-wrap break-words' : 'whitespace-pre'}>
+                {line.length > 0 ? line : '\u00a0'}
+              </span>
             </Fragment>
           ))}
         </div>

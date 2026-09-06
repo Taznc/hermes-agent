@@ -56,7 +56,6 @@ describe('useDesktopIntegrations', () => {
     // plain object to window.hermesDesktop rather than using vi.spyOn.
     desktopWindow.hermesDesktop = {
       setPreviewShortcutActive: vi.fn(),
-      onOpenUpdatesRequested: vi.fn(),
       onFocusSession: vi.fn(),
       onNotificationAction: vi.fn(),
       onNotificationActivate: vi.fn(),

@@ -1127,12 +1127,35 @@ def _load_cfg_raw() -> dict:
         p = _active_config_path()
         mtime = p.stat().st_mtime if p.exists() else None
         with _cfg_lock:
-            if _cfg_cache is not None and _cfg_mtime == mtime and _cfg_path == p:
-                return copy.deepcopy(_cfg_cache)
+            # Take only a REFERENCE under the lock, then copy outside it. The
+            # cached dict is immutable by construction (every writer installs a
+            # freshly-built private snapshot and never mutates one in place), so
+            # a reader that grabbed the old object still walks a consistent
+            # graph after a concurrent swap. Deep-copying while holding the lock
+            # turned this ~1us pointer read into a ~90us critical section that
+            # every other config read had to queue behind — a convoy that
+            # starved the hermes-change-watcher thread and, through it, the
+            # asyncio accept loop (backend stays "active (running)" while
+            # connections pile up unaccepted in the socket's Recv-Q).
+            cached = (
+                _cfg_cache
+                if (_cfg_cache is not None and _cfg_mtime == mtime and _cfg_path == p)
+                else None
+            )
+        if cached is not None:
+            return copy.deepcopy(cached)
         from hermes_cli.config import read_user_config_raw
         data = read_user_config_raw(p) if p.exists() else {}
-        with _cfg_lock:  # cache the RAW config: _save_cfg writes _cfg_cache back to disk
-            _cfg_cache, _cfg_mtime, _cfg_path = copy.deepcopy(data), mtime, p
+        # Cache the RAW user config (no managed overlay) so _save_cfg, which
+        # writes _cfg_cache back to disk, never persists managed values into
+        # the user's file. The managed overlay is applied on every return
+        # path instead (read-side only). Built OUTSIDE the lock, then installed
+        # with a bare reference swap, so the critical section stays O(1).
+        snapshot = copy.deepcopy(data)
+        with _cfg_lock:
+            _cfg_cache = snapshot
+            _cfg_mtime = mtime
+            _cfg_path = p
         return data
     return {}
 
@@ -1171,12 +1194,20 @@ def _save_cfg(cfg: dict):
     # Comment-, ordering- and Unicode-preserving write (a plain safe_dump clobbered hand-written configs);
     # fails closed on an unreadable existing config.yaml like atomic_config_write.
     atomic_roundtrip_yaml_save(path, cfg)
+    # Snapshot the caller's dict (they keep mutating theirs) and stat the file
+    # BEFORE taking the lock: both are expensive relative to the swap, and
+    # holding _cfg_lock across them convoys every concurrent config reader.
+    # The installed object is private to the cache and never mutated in place,
+    # which is what lets _load_cfg_raw copy it outside the lock.
+    snapshot = copy.deepcopy(cfg)
+    try:
+        mtime = path.stat().st_mtime
+    except Exception:
+        mtime = None
     with _cfg_lock:
-        _cfg_cache, _cfg_path = copy.deepcopy(cfg), path
-        try:
-            _cfg_mtime = path.stat().st_mtime
-        except Exception:
-            _cfg_mtime = None
+        _cfg_cache = snapshot
+        _cfg_path = path
+        _cfg_mtime = mtime
 
 
 def _session_for_key(session_key: str) -> dict | None:

@@ -257,7 +257,7 @@ _SPECS = [
         _RECLAIM_REASON,
     ], help="Reassign a task to a different profile, optionally reclaiming first"),
     _cmd("diagnostics", [
-        _arg("--severity", choices=["warning", "error", "critical"],
+        _arg("--severity", choices=["info", "warning", "error", "critical"],
              help="Only show diagnostics at or above this severity"),
         _arg("--task", help="Only show diagnostics for one task id"),
         _json_flag(help="Emit JSON (structured) instead of the default human table"),
@@ -358,6 +358,10 @@ _SPECS = [
     _cmd("dispatch", [
         _arg("--dry-run", action="store_true", help="Don't actually spawn processes; just print what would happen"),
         _arg("--max", type=int, help="Cap number of spawns this pass"),
+        _arg("--resume-circuit", action="store_true",
+             help="Clear this board's sticky start-budget/replay pause and exit"),
+        _arg("--circuit-status", action="store_true",
+             help="Show this board's sticky dispatch-circuit state and exit"),
         _arg("--failure-limit", type=int, default=kbd.DEFAULT_FAILURE_LIMIT,
              help=f"Auto-block a task after this many consecutive non-success attempts "
                   f"(spawn_failed, timed_out, or crashed; default: {kbd.DEFAULT_FAILURE_LIMIT})"),
