@@ -476,54 +476,26 @@ def _dir_holds_board(d: Path) -> bool:
     return (d / "board.json").exists() or (d / "kanban.db").exists()
 
 
-def _override_is_stale(override_path: Path) -> bool:
-    """True when *override_path* does not live under the currently-resolved
-    :func:`kanban_home`.
-
-    A ``HERMES_KANBAN_*`` path pin is only meaningful relative to the home it
-    was computed against. When a caller sandboxes itself the obvious way —
-    setting ``HERMES_HOME`` to a temp dir — but still inherits a
-    ``HERMES_KANBAN_DB``/``..._WORKSPACES_ROOT``/``..._ATTACHMENTS_ROOT`` pin
-    from a parent/dispatcher process, the pin no longer points anywhere under
-    the caller's own home: it is stale and must lose, or every write goes to
-    the wrong (often live/production) home instead of the sandbox the caller
-    believes it is in.
-    """
-    try:
-        home = kanban_home().resolve()
-        override_path.resolve().relative_to(home)
-        return False
-    except (ValueError, OSError):
-        return True
-
-
 def _board_path(
     env_var: Optional[str], board: Optional[str], default_parts: tuple[str, ...], leaf: str,
 ) -> Path:
     """Shared resolver: ``env_var`` override, else legacy ``<root>/<default_parts>``
     for the ``default`` board, else ``board_dir(slug)/leaf``.
 
-    The override is honored only when it lives under the currently-resolved
-    :func:`kanban_home` — see :func:`_override_is_stale`. Dispatcher-spawned
-    workers are unaffected: the dispatcher injects both the path override and
-    a matching ``HERMES_HOME`` so the pin always resolves under the worker's
-    own kanban home. A stale override is dropped with a one-line warning
-    rather than silently honored.
+    The override is honored only when :func:`_pin_is_honored` accepts it. The
+    guard lives here rather than in one caller so every sibling resolver
+    (:func:`kanban_db_path`, :func:`workspaces_root`, :func:`attachments_root`)
+    is covered by construction — the dispatcher injects a pin for each of them,
+    so guarding only the DB left a sandboxed probe still writing into the live
+    board's workspaces tree.
     """
     if env_var:
         override = os.environ.get(env_var, "").strip()
         if override:
             override_path = Path(override).expanduser()
-            if _override_is_stale(override_path):
-                _log.warning(
-                    "kanban: ignoring stale %s=%r — it does not live under "
-                    "the currently-resolved kanban home (%s). HERMES_HOME "
-                    "was repointed without a matching override, so the pin "
-                    "is stale; resolving under the current home instead.",
-                    env_var, override, kanban_home(),
-                )
-            else:
+            if _pin_is_honored(override_path):
                 return override_path
+            _warn_dropped_pin(env_var, override)
     slug = _normalize_board_slug(board)
     if slug is None:
         slug = get_current_board()
@@ -532,9 +504,79 @@ def _board_path(
     return board_dir(slug) / leaf
 
 
+def _resolve_for_containment(path: Path) -> Path:
+    """Resolve symlinks/``..`` without requiring the path to exist."""
+    try:
+        return path.expanduser().resolve()
+    except OSError:
+        return path.expanduser().absolute()
+
+
+# The kanban home a ``HERMES_KANBAN_*`` path pin is valid under. The dispatcher
+# stamps its own home beside the pins it injects; anyone hand-setting an
+# out-of-home pin on purpose sets it to the home they are running under.
+#
+# Containment alone cannot tell an inherited pin from a deliberate one, and a
+# stamp alone cannot protect against pins written before it existed — so the two
+# compose: a pin inside the current home is always fine, and a pin OUTSIDE it is
+# honored only while the stamp names the home this process actually declares.
+# An inherited stamp cannot fake that, because re-declaring the home is exactly
+# what makes the stamp disagree.
+KANBAN_PIN_HOME_ENV = "HERMES_KANBAN_PIN_HOME"
+
+
+def _pin_is_honored(pin: Path) -> bool:
+    """Should a ``HERMES_KANBAN_*`` path override be used?
+
+    ``True`` when the pin resolves under the current :func:`kanban_home`
+    (the dispatcher's happy path), or when it is explicitly vouched for by a
+    :data:`KANBAN_PIN_HOME_ENV` stamp naming that same home.
+    """
+    home = _resolve_for_containment(kanban_home())
+    resolved = _resolve_for_containment(pin)
+    if resolved == home or home in resolved.parents:
+        return True
+    stamped = os.environ.get(KANBAN_PIN_HOME_ENV, "").strip()
+    return bool(stamped) and _resolve_for_containment(Path(stamped)) == home
+
+
+# Warn once per (env var, pin, home): these resolvers are called on every
+# dispatch tick, and a repeating warning would bury the one that matters.
+_warned_dropped_pins: set[tuple[str, str, str]] = set()
+
+
+def _warn_dropped_pin(env_var: str, pin: str) -> None:
+    """Surface an ignored out-of-home pin.
+
+    The breach this guards was silent — a probe believed it was sandboxed while
+    writing production — so dropping the pin quietly would just move the silence.
+    """
+    key = (env_var, pin, str(kanban_home()))
+    if key in _warned_dropped_pins:
+        return
+    _warned_dropped_pins.add(key)
+    _log.warning(
+        "ignoring %s=%s: it resolves outside this process's kanban home (%s), so it is stale "
+        "inherited env rather than intent. Resolving under the current home instead. To pin a "
+        "path outside the home on purpose, set %s to that home.",
+        env_var,
+        pin,
+        kanban_home(),
+        KANBAN_PIN_HOME_ENV,
+    )
+
+
 def kanban_db_path(board: Optional[str] = None) -> Path:
     """``kanban.db`` path: ``HERMES_KANBAN_DB`` pins it (injected into workers);
-    ``default`` -> ``<root>/kanban.db`` (back-compat), else the board dir."""
+    ``default`` -> ``<root>/kanban.db`` (back-compat), else the board dir.
+
+    The pin is dropped once it no longer resolves under this process's kanban
+    home (``HERMES_HOME`` / ``HERMES_KANBAN_HOME``) and is not vouched for by
+    ``HERMES_KANBAN_PIN_HOME``. The dispatcher puts a pin in EVERY worker env,
+    so without this a probe/test script that sandboxes itself the documented way
+    kept a production pin and silently drove the live board — that breach
+    reverted 137 archives and left fixture cards in a real board.
+    """
     return _board_path("HERMES_KANBAN_DB", board, ("kanban.db",), "kanban.db")
 
 

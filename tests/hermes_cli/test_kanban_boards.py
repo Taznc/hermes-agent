@@ -115,6 +115,22 @@ class TestPathResolution:
         assert kb.kanban_db_path() == forced
         assert kb.kanban_db_path(board="ignored") == forced
 
+    def test_env_var_db_override_outside_home_wins_when_vouched_for(
+        self, fresh_home, tmp_path, monkeypatch,
+    ):
+        """An out-of-home pin is honored only when it declares its intent.
+
+        Symlink/Docker layouts legitimately put the board outside the home the
+        process resolves. Containment alone cannot tell that apart from the
+        stale inherited env that let sandboxed probes drive the live board, so
+        ``HERMES_KANBAN_PIN_HOME`` names the home the caller is running under.
+        """
+        forced = tmp_path / "custom.db"
+        monkeypatch.setenv("HERMES_KANBAN_DB", str(forced))
+        monkeypatch.setenv("HERMES_KANBAN_PIN_HOME", str(fresh_home))
+        assert kb.kanban_db_path() == forced
+        assert kb.kanban_db_path(board="ignored") == forced
+
     def test_stale_env_var_db_override_is_dropped(
         self, fresh_home, tmp_path, monkeypatch, caplog,
     ):
