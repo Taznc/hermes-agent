@@ -330,3 +330,54 @@ export const SEVERITY_TONE: Record<Diagnostic['severity'], string> = {
   error: 'var(--destructive, #f87171)',
   warning: '#fbbf24'
 }
+
+/** Run outcome → row tone. Every value resolves through COLUMN_META or
+ *  SEVERITY_TONE, so a run row reads the same color the board would give the
+ *  same state — no second palette to keep in sync. Unknown outcomes stay
+ *  neutral rather than borrowing a meaning they don't have. */
+const OUTCOME_TONE: Record<string, string> = {
+  blocked: COLUMN_META.blocked.tone,
+  changes_requested: COLUMN_META.review.tone,
+  completed: COLUMN_META.running.tone,
+  crashed: SEVERITY_TONE.error,
+  failed: SEVERITY_TONE.error,
+  gave_up: SEVERITY_TONE.error,
+  review_requested: COLUMN_META.review.tone,
+  timed_out: SEVERITY_TONE.error
+}
+
+export const outcomeTone = (outcome?: null | string): string =>
+  OUTCOME_TONE[outcome ?? ''] ?? 'var(--ui-text-quaternary)'
+
+/** Activity event kind → dot tone. Deliberately sparse: only kinds a human
+ *  scans for get color. `heartbeat` is the highest-volume kind by an order of
+ *  magnitude, so it is absent here and falls through to the quietest value —
+ *  coloring it would turn the feed into noise. Failure kinds are tinted
+ *  destructive precisely because they are what you scroll a long event feed
+ *  looking for. */
+const EVENT_TONE: Record<string, string> = {
+  block_loop_detected: COLUMN_META.blocked.tone,
+  blocked: COLUMN_META.blocked.tone,
+  changes_requested: COLUMN_META.review.tone,
+  claimed: COLUMN_META.ready.tone,
+  commented: 'var(--ui-text-secondary)',
+  completed: COLUMN_META.running.tone,
+  crashed: SEVERITY_TONE.error,
+  dependency_wait: COLUMN_META.todo.tone,
+  gave_up: SEVERITY_TONE.error,
+  held: COLUMN_META.on_hold.tone,
+  interrupted: SEVERITY_TONE.warning,
+  promoted: COLUMN_META.ready.tone,
+  protocol_violation: SEVERITY_TONE.error,
+  reclaimed: COLUMN_META.review.tone,
+  respawn_guarded: SEVERITY_TONE.warning,
+  review_no_verdict: COLUMN_META.review.tone,
+  review_requested: COLUMN_META.review.tone,
+  scheduled: COLUMN_META.scheduled.tone,
+  spawned: COLUMN_META.ready.tone,
+  stale: SEVERITY_TONE.warning,
+  timed_out: SEVERITY_TONE.error,
+  unblocked: COLUMN_META.review.tone
+}
+
+export const eventTone = (kind: string): string => EVENT_TONE[kind] ?? 'var(--ui-text-quaternary)'
