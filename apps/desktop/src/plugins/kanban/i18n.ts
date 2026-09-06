@@ -261,9 +261,13 @@ type KanbanMessages = {
   runErrRaw: string
   workerLog: string
   workerLogTail: string
-  /** "Show more" affordance under a truncated worker log — widens the tail
-   *  instead of leaving a bare unexplained `...`. */
-  workerLogShowMore: string
+  /** The active artifact was capped/rotated by the worker; this tells the
+   * reader it is seeing every retained byte, not a UI-paginated tail. */
+  workerLogRetained: string
+  workerLogLive: string
+  workerLogPaused: string
+  workerLogWrap: string
+  workerLogJumpToLatest: string
   attachments: (n: number) => string
   noAttachments: string
   uploadAttachment: string
@@ -593,7 +597,11 @@ export const en: KanbanMessages = {
   runErrRaw: 'Raw diagnostic',
   workerLog: 'Worker log',
   workerLogTail: 'Worker log · tail',
-  workerLogShowMore: 'Show more',
+  workerLogRetained: 'Worker log · retained',
+  workerLogLive: 'Live · following',
+  workerLogPaused: 'Live · paused',
+  workerLogWrap: 'Wrap lines',
+  workerLogJumpToLatest: 'Jump to latest',
   attachments: n => `Attachments · ${n}`,
   noAttachments: 'No attachments yet.',
   uploadAttachment: 'Upload attachment',
@@ -915,7 +923,11 @@ const ja: KanbanMessages = {
   runErrRaw: '生の診断情報',
   workerLog: 'ワーカーログ',
   workerLogTail: 'ワーカーログ・末尾',
-  workerLogShowMore: 'もっと見る',
+  workerLogRetained: 'ワーカーログ・保持済み',
+  workerLogLive: 'ライブ・追従中',
+  workerLogPaused: 'ライブ・一時停止中',
+  workerLogWrap: '行を折り返す',
+  workerLogJumpToLatest: '最新へ移動',
   attachments: n => `添付・${n}`,
   noAttachments: 'まだ添付はありません。',
   uploadAttachment: '添付をアップロード',
@@ -1233,7 +1245,11 @@ const zh: KanbanMessages = {
   runErrRaw: '原始诊断信息',
   workerLog: '工作单元日志',
   workerLogTail: '工作单元日志・末尾',
-  workerLogShowMore: '显示更多',
+  workerLogRetained: '工作单元日志・已保留',
+  workerLogLive: '实时・跟随中',
+  workerLogPaused: '实时・已暂停',
+  workerLogWrap: '换行显示',
+  workerLogJumpToLatest: '跳至最新',
   attachments: n => `附件・${n}`,
   noAttachments: '暂无附件。',
   uploadAttachment: '上传附件',
@@ -1550,7 +1566,11 @@ const zhHant: KanbanMessages = {
   runErrRaw: '原始診斷資訊',
   workerLog: '工作單元日誌',
   workerLogTail: '工作單元日誌・末尾',
-  workerLogShowMore: '顯示更多',
+  workerLogRetained: '工作單元日誌・已保留',
+  workerLogLive: '即時・跟隨中',
+  workerLogPaused: '即時・已暫停',
+  workerLogWrap: '換行顯示',
+  workerLogJumpToLatest: '跳至最新',
   attachments: n => `附件・${n}`,
   noAttachments: '尚無附件。',
   uploadAttachment: '上傳附件',
