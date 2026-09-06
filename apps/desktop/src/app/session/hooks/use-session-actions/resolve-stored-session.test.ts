@@ -249,6 +249,26 @@ describe('resolveStoredSession profile ownership', () => {
     expect($pinnedSessionIds.get()).toEqual(['stuck'])
   })
 
+  it('does not prune client caches when any profile probe is not a confirmed session 404', async () => {
+    const seen = { default: { stuck: 2 }, meta: { stuck: 3 } }
+    const markers = { default: ['stuck'], meta: ['stuck'] }
+    const scanned = ['stuck']
+    const branches = { stuck: 'repo\nstuck' }
+    $sessionSeenCounts.set(seen)
+    $unreadFinishedMarkers.set(markers)
+    $prScannedSessions.set(scanned)
+    $prBranchBySession.set(branches)
+    mockGetSession.mockRejectedValueOnce(new Error('500: gateway temporarily unavailable'))
+    mockGetSession.mockRejectedValueOnce(new Error('404: Session not found'))
+
+    await expect(resolveStoredSession('stuck')).resolves.toBeUndefined()
+
+    expect($sessionSeenCounts.get()).toEqual(seen)
+    expect($unreadFinishedMarkers.get()).toEqual(markers)
+    expect($prScannedSessions.get()).toEqual(scanned)
+    expect($prBranchBySession.get()).toEqual(branches)
+  })
+
   it('does not prune client caches when a profile resolves the stored id', async () => {
     const seen = { default: { live: 2 } }
     const markers = { default: ['live'] }

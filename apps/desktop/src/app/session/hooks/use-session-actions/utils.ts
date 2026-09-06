@@ -1547,12 +1547,22 @@ export function __resetSessionProbeCache(): void {
   inFlightSessionProbes.clear()
 }
 
+function isConfirmedSessionNotFound(error: unknown): boolean {
+  const message = error instanceof Error ? error.message : String(error ?? '')
+
+  // `getSession()` reports HTTP failures through Electron as `404: ...`; keep
+  // the resource check too, so a missing route on an older backend is never
+  // mistaken for proof that this particular session was deleted.
+  return /(?:^|:\s*)404(?:\s*:|\b)/.test(message) && /session not found/i.test(message)
+}
+
 async function probeStoredSessionAcrossProfiles(storedSessionId: string): Promise<SessionInfo | undefined> {
   // Direct by-id on the active profile — one row lookup, no list scan. Electron
   // routes an unscoped GET to the primary backend, which may not own the
   // active profile. A 404 there used to skip that profile in the probes below,
   // so the session was never found.
   const activeKey = normalizeProfileKey($activeGatewayProfile.get())
+  let everyProbeConfirmedMissing = true
 
   try {
     const session = await getSession(storedSessionId, activeKey)
@@ -1566,7 +1576,8 @@ async function probeStoredSessionAcrossProfiles(storedSessionId: string): Promis
     negativeSessionProbes.delete(storedSessionId)
 
     return session
-  } catch {
+  } catch (error) {
+    everyProbeConfirmedMissing &&= isConfirmedSessionNotFound(error)
     // Not on the active profile — fall through to the cross-profile probe.
   }
 
@@ -1598,6 +1609,7 @@ async function probeStoredSessionAcrossProfiles(storedSessionId: string): Promis
 
       return session
     } catch (error) {
+      everyProbeConfirmedMissing &&= isConfirmedSessionNotFound(error)
       // A plain 404 just means the id isn't on this profile — try the next.
       // "no longer exists" / "is being deleted" is the spawn guard telling us
       // the profile itself is gone; remember it so later lookups skip it.
@@ -1606,12 +1618,15 @@ async function probeStoredSessionAcrossProfiles(storedSessionId: string): Promis
   }
 
   negativeSessionProbes.set(storedSessionId, Date.now())
-  // This is the only point where a missing id is proven rather than merely
-  // absent from the current profile or page. Retire client-only caches now;
-  // doing it earlier could erase state for a session still being created on a
-  // different profile.
-  forgetSessionPullRequest(storedSessionId)
-  forgetConfirmedMissingSessionUnread(storedSessionId)
+
+  if (everyProbeConfirmedMissing) {
+    // This is the only point where a missing id is proven rather than merely
+    // absent from the current profile or page. Retire client-only caches now;
+    // doing it earlier could erase state for a session still being created on a
+    // different profile.
+    forgetSessionPullRequest(storedSessionId)
+    forgetConfirmedMissingSessionUnread(storedSessionId)
+  }
 
   return undefined
 }
