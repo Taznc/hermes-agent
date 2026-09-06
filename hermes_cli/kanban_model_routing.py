@@ -18,7 +18,7 @@ from hermes_cli.kanban_db import normalize_reasoning_effort
 logger = logging.getLogger(__name__)
 
 try:  # Imported lazily elsewhere too; keep the module usable in tests.
-    from agent.auxiliary_client import call_llm as _call_llm
+    from agent.auxiliary_client import call_llm_single_attempt as _call_llm
 except Exception:  # pragma: no cover - import guard
     _call_llm = None
 
@@ -192,7 +192,7 @@ def resolve_kanban_model_route(
             messages=messages,
             temperature=0,
             max_tokens=32,
-            response_format={"type": "json_object"},
+            extra_body={"response_format": {"type": "json_object"}},
         )
         content = response.choices[0].message.content
     except Exception as exc:

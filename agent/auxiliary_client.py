@@ -7076,6 +7076,7 @@ def _call_llm_impl(
     timeout: float = None, extra_body: dict = None, reasoning_config: Optional[dict] = None,
     extra_headers: Optional[Dict[str, str]] = None, api_mode: str = None, stream: bool = False,
     stream_options: dict = None, route_info: Optional[Dict[str, str]] = None,
+    single_attempt: bool = False,
 ) -> Any:
     """Centralized synchronous LLM call: resolve provider/model, auth, kwargs, fallbacks.
     task: aux task whose provider:model comes from config (ignored if provider set); api_mode
@@ -7125,6 +7126,8 @@ def _call_llm_impl(
             ),
             task, **validate_kw,
         )
+    if single_attempt:
+        return _primary(provider=request_provider, base_url=req.base_info)
     try:
         # Bounded same-provider retry (exponential backoff, auxiliary.transient_retries) for
         # transient blips before escalating to fallback — a dropped connection shouldn't
@@ -7163,6 +7166,62 @@ def _call_llm_impl(
         if result is _RERAISE_ORIGINAL:
             raise
         return result
+
+
+@_relay_auxiliary_call
+def call_llm_single_attempt(
+    task: str = None, *, provider: str = None, model: str = None, base_url: str = None,
+    api_key: str = None, main_runtime: Optional[Dict[str, Any]] = None, messages: list,
+    temperature: Optional[float] = None, max_tokens: int = None, tools: list = None,
+    timeout: float = None, extra_body: dict = None, reasoning_config: Optional[dict] = None,
+    extra_headers: Optional[Dict[str, str]] = None, api_mode: str = None, stream: bool = False,
+    stream_options: dict = None, route_info: Optional[Dict[str, str]] = None,
+    latency_info: Optional[Dict[str, int]] = None,
+) -> Any:
+    """Run one auxiliary LLM request with no retry or fallback ladder.
+
+    Used by bounded classifiers that must fail closed rather than escalating
+    across retry/fallback policy.
+    """
+    queue_started_at = time.monotonic()
+    semaphore = _acquire_sync_aux_semaphore(task)
+    if semaphore is not None:
+        semaphore.acquire()
+    request_started_at = time.monotonic()
+    if latency_info is not None:
+        latency_info["queue_wait_ms"] = _elapsed_ms(queue_started_at, request_started_at)
+    prior_progress_hook = getattr(_aux_progress, "hook", None)
+    try:
+        with (
+            aux_progress_hook(
+                prior_progress_hook
+                if callable(prior_progress_hook)
+                else ((lambda: None) if latency_info is not None else None)
+            ),
+            _aux_thread_local_hook(_aux_dispatch, functools.partial(
+                _stamp_latency_once, latency_info, "provider_dispatch_ms", request_started_at)),
+            _aux_thread_local_hook(_aux_provider_response, functools.partial(
+                _stamp_latency_once, latency_info, "time_to_first_progress_ms", request_started_at)),
+        ):
+            response = _call_llm_impl(
+                task=task, provider=provider, model=model, base_url=base_url, api_key=api_key,
+                main_runtime=main_runtime, messages=messages, temperature=temperature,
+                max_tokens=max_tokens, tools=tools, timeout=timeout, extra_body=extra_body,
+                reasoning_config=reasoning_config, extra_headers=extra_headers, api_mode=api_mode,
+                stream=stream, stream_options=stream_options, route_info=route_info,
+                single_attempt=True,
+            )
+        if stream and semaphore is not None:
+            stream_semaphore = semaphore
+            semaphore = None
+            return _release_sync_semaphore_after_stream(response, stream_semaphore)
+        return response
+    finally:
+        if latency_info is not None:
+            latency_info["summary_generation_ms"] = _elapsed_ms(request_started_at)
+        if semaphore is not None:
+            semaphore.release()
+
 
 
 def _coerce_llm_message(response):

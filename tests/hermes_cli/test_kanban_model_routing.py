@@ -139,6 +139,41 @@ def test_classifier_failure_fails_closed_to_default(kanban_home, monkeypatch):
     assert decision.reasoning_effort is None
 
 
+def test_retryable_classifier_failure_uses_exactly_one_model_call_and_fails_closed(
+    kanban_home, monkeypatch,
+):
+    from agent import auxiliary_client as aux
+    from hermes_cli import kanban_model_routing as kmr
+
+    calls = []
+
+    def _fake_relay(*_args, **_kwargs):
+        calls.append(("called", _args, _kwargs))
+        raise ConnectionResetError("temporary transport failure")
+
+    monkeypatch.setattr(aux, "_relay_sync_completion", _fake_relay)
+    monkeypatch.setattr(aux, "_resolve_task_provider_model", lambda *args, **kwargs: (
+        "openai-codex", "gpt-5.4-mini", None, None, None,
+    ))
+    monkeypatch.setattr(aux, "_get_cached_client", lambda *args, **kwargs: (
+        type("FakeClient", (), {"chat": type("Chat", (), {"completions": type("Completions", (), {})()})()})(),
+        "gpt-5.4-mini",
+    ))
+
+    decision = kmr.resolve_kanban_model_route(
+        title="Update docs",
+        body="Small mechanical edit",
+        config=_routing_config(enabled=True),
+    )
+
+    assert len(calls) == 1
+    assert decision.route_source == "default"
+    assert decision.route_name is None
+    assert decision.model_override is None
+    assert decision.provider_override is None
+    assert decision.reasoning_effort is None
+
+
 def test_safe_classifier_selects_mechanical_route_with_one_model_call(kanban_home, monkeypatch):
     from hermes_cli import kanban_model_routing as kmr
 
