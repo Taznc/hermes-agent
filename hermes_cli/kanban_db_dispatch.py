@@ -184,6 +184,11 @@ class DispatchResult:
     """Unassigned task ids that had ``kanban.default_assignee`` applied this
     tick before spawning, so telemetry/CLI/dashboard can show the dispatcher
     acting on the fallback rule rather than explicit assignments."""
+    auto_assigned_reviewer: list[tuple[str, str, str]] = field(default_factory=list)
+    """``(task_id, previous_assignee, reviewer)`` triples for review-lane cards
+    still owned by their implementer that ``kanban.default_reviewer`` reassigned
+    this tick — the auto-review counterpart to ``auto_assigned_default``, so
+    telemetry/CLI/dashboard can show the implementer->reviewer handoff."""
     skipped_nonspawnable: list[str] = field(default_factory=list)
     """Ready task ids whose assignee names a control-plane lane (e.g. a Claude
     Code terminal like ``orion-cc``), not a Hermes profile. Expected steady-state
@@ -1530,6 +1535,11 @@ class DispatchCaps:
     max_in_progress_per_profile: Optional[int]
     max_spawn: Optional[int]
     default_assignee: Optional[str]
+    # kanban.default_reviewer rides on the same shared resolution as the caps:
+    # every dispatch_once entry point must route review-lane cards identically,
+    # and an entry point that resolves caps but not the reviewer would silently
+    # leave review cards self-assigned to their implementer.
+    default_reviewer: Optional[str] = None
 
 
 def resolve_dispatch_caps(kanban_cfg: Optional[dict] = None) -> DispatchCaps:
@@ -1570,6 +1580,7 @@ def resolve_dispatch_caps(kanban_cfg: Optional[dict] = None) -> DispatchCaps:
         ),
         max_spawn=_positive_int_or_none(kanban_cfg.get("max_spawn")),
         default_assignee=(kanban_cfg.get("default_assignee") or "").strip() or None,
+        default_reviewer=(kanban_cfg.get("default_reviewer") or "").strip() or None,
     )
 
 
@@ -1765,6 +1776,7 @@ def dispatch_once(
     stale_timeout_seconds: int = 0,
     board: Optional[str] = None,
     default_assignee: Optional[str] = None,
+    default_reviewer: Optional[str] = None,
     max_in_progress_per_profile: Optional[int] = None,
     reconcile_orphans: bool = True,
 ) -> DispatchResult:
@@ -1788,6 +1800,7 @@ def dispatch_once(
             stale_timeout_seconds=stale_timeout_seconds,
             board=board,
             default_assignee=default_assignee,
+            default_reviewer=default_reviewer,
             max_in_progress_per_profile=max_in_progress_per_profile,
             reconcile_orphans=reconcile_orphans,
         )
@@ -2041,6 +2054,103 @@ def _apply_default_assignee(
     return True
 
 
+def _review_row_implementer_owned(
+    conn: sqlite3.Connection, task_id: str,
+) -> bool:
+    """True when a review-lane row is still owned by the profile that
+    IMPLEMENTED it — the only state ``kanban.default_reviewer`` may touch.
+
+    A bare ``row_assignee != default_reviewer`` inequality can't tell "still
+    the implementer, never routed" apart from "explicitly routed to a real
+    reviewer that just isn't the config's pick" — the latter must never be
+    overridden, whether the routing came from ``kanban_request_review(
+    reviewer=...)`` on the first pass or from ``_prior_reviewer`` provenance
+    on a re-review. The latest ``review_requested`` event's ``reviewer``
+    field is the single source of truth for that distinction: ``None``/
+    absent means the row is still sitting on the implementer's own name
+    (request_review only sets ``reviewer`` in the payload when a handoff was
+    actually decided — see ``kanban_db.request_review``); anything else
+    means a reviewer was deliberately chosen and must stick.
+    """
+    event = _kb._latest_event(conn, task_id, "review_requested")
+    if event is None:
+        # No provenance at all (e.g. a legacy row created before this event
+        # existed) — nothing on record distinguishes implementer-owned from
+        # explicitly-routed, so treat it as implementer-owned (today's
+        # upgrade-safety behavior: the row is eligible for reassignment).
+        return True
+    payload = _kb._json_dict(_kb._row_get(event, "payload"))
+    reviewer = payload.get("reviewer")
+    return not (isinstance(reviewer, str) and reviewer.strip())
+
+
+def _apply_default_reviewer(
+    conn: sqlite3.Connection, task_id: str, reviewer: str, *, previous_assignee: str, dry_run: bool,
+) -> bool:
+    """Reassign a review-lane row still owned by its implementer to ``reviewer``.
+
+    Mirrors :func:`_apply_default_assignee`: mutates the row (not just the
+    in-memory dispatch view) so board state stays honest — the card is now
+    legitimately owned by the auto-assigned reviewer, not "assigned to the
+    implementer but secretly routed elsewhere". The event payload records
+    both sides of the handoff (``previous_assignee`` / ``reviewer`` /
+    ``source``) so the audit trail shows implementer->reviewer provenance.
+
+    This IS a cross-profile handoff exactly like an explicit
+    ``kanban_request_review(reviewer=...)`` — the reassigned reviewer must
+    run its own profile's model, never the implementer's pin. So
+    ``model_override``/``provider_override`` are cleared here too (mirroring
+    ``kanban_db.request_review``'s ``cross_profile`` branch), and the
+    implementer's values are snapshotted onto the SAME event this function
+    already writes so ``request_changes`` can restore them on the round trip
+    back (it reads the latest ``assigned`` event's
+    ``implementer_model_override``/``implementer_provider_override`` the
+    same way it reads a ``review_requested`` event's).
+
+    ``dry_run`` reports without writing. Returns False when the write failed
+    or the row was no longer a ``review`` row to reassign (status changed
+    between read and write — never appends a phantom handoff event).
+    """
+    if dry_run:
+        return True
+    try:
+        with _kb.write_txn(conn):
+            row = conn.execute(
+                "SELECT model_override, provider_override FROM tasks WHERE id = ?",
+                (task_id,),
+            ).fetchone()
+            if row is None:
+                return False
+            implementer_model_override = row["model_override"]
+            implementer_provider_override = row["provider_override"]
+            cur = conn.execute(
+                "UPDATE tasks SET assignee = ?, model_override = NULL, provider_override = NULL "
+                "WHERE id = ? AND status = 'review'",
+                (reviewer, task_id),
+            )
+            if cur.rowcount != 1:
+                # Row left 'review' between read and write (claimed by
+                # another dispatcher, reopened, etc.) — no handoff happened,
+                # so no event should claim one did.
+                return False
+            payload: dict[str, Any] = {
+                "assignee": reviewer,
+                "previous_assignee": previous_assignee,
+                "source": "kanban.default_reviewer",
+            }
+            if implementer_model_override is not None or implementer_provider_override is not None:
+                payload["implementer_model_override"] = implementer_model_override
+                payload["implementer_provider_override"] = implementer_provider_override
+            _kb._append_event(conn, task_id, "assigned", payload)
+    except Exception:
+        _kb._log.debug(
+            "kanban dispatch: failed to apply default_reviewer=%r to task %s",
+            reviewer, task_id, exc_info=True,
+        )
+        return False
+    return True
+
+
 def _run_reclaim_phase(
     conn: sqlite3.Connection,
     result: DispatchResult,
@@ -2166,6 +2276,32 @@ def _resolve_default_assignee(default_assignee: Optional[str]) -> Optional[str]:
     return name
 
 
+def _resolve_default_reviewer(default_reviewer: Optional[str]) -> Optional[str]:
+    """``kanban.default_reviewer`` when it names a real, installed profile.
+
+    Unlike :func:`_resolve_default_assignee` (which only fills a BLANK
+    assignee, so trusting an unimportable ``profiles`` module is safe — the
+    downstream ``profile_exists`` check in the dispatch lane still catches a
+    bad name before spawn), this value OVERWRITES a real assignee. The same
+    ``profiles`` import failure that disables THIS guard also disables that
+    downstream safety net (``_profile_exists_fn`` returns ``None`` for the
+    identical reason), so nothing would be left to catch a typo'd profile
+    name replacing the implementer's — it would spawn a nonspawnable profile
+    instead of falling back. Fail CLOSED here: an unimportable ``profiles``
+    module or a profile that provably does not exist both resolve to
+    ``None`` so the review loop falls back to the card's own assignee rather
+    than overwriting it on unverified trust.
+    """
+    name = (default_reviewer or "").strip() or None
+    if not name:
+        return None
+    try:
+        from hermes_cli.profiles import profile_exists
+    except Exception:
+        return None
+    return name if profile_exists(name) else None
+
+
 # The dispatch lock has been released here. Fire the tick observer strictly OUTSIDE the single-writer
 # critical section (#56066 sweeper finding / #64231 disposition): a slow subscriber must never extend the
 # lock hold and stall a sibling dispatcher's tick.
@@ -2181,6 +2317,7 @@ def _dispatch_once_locked(
     stale_timeout_seconds: int = 0,
     board: Optional[str] = None,
     default_assignee: Optional[str] = None,
+    default_reviewer: Optional[str] = None,
     max_in_progress_per_profile: Optional[int] = None,
     reconcile_orphans: bool = True,
 ) -> DispatchResult:
@@ -2244,6 +2381,7 @@ def _dispatch_once_locked(
         coedit_index=coedit_index, coedit_paths=coedit_paths,
     )
     default_assignee = _resolve_default_assignee(default_assignee)
+    default_reviewer = _resolve_default_reviewer(default_reviewer)
     spawned = 0
     for row in ready_rows:
         if ready_budget is not None and spawned >= ready_budget:
@@ -2269,10 +2407,34 @@ def _dispatch_once_locked(
     for row in review_rows:
         if spawn_budget is not None and spawned >= spawn_budget:
             break
-        if not row["assignee"]:
+        row_assignee = row["assignee"]
+        if not row_assignee:
             result.skipped_unassigned.append(row["id"])
             continue
-        if _dispatch_lane_task(conn, row, row["assignee"], result, lane="review", **lane_kwargs):
+        # kanban.default_reviewer: a review-lane card still owned by its
+        # implementer never finds anything to do — the worker exits clean
+        # (rc=0) and the dispatcher scores it a protocol_violation, parking
+        # the card after failure_limit. When a different, real profile is
+        # configured AND the row is still owned by its implementer (no
+        # explicit reviewer= was ever routed for it), reassign the row
+        # (mirrors default_assignee's mutate-the-row honesty) and dispatch
+        # under the reviewer instead. Unset / same-as-assignee /
+        # missing-profile / already-explicitly-routed all fall through
+        # unchanged — never fail the tick over a misconfigured reviewer, and
+        # never override a worker's own reviewer= choice (including one
+        # re-routed by _prior_reviewer provenance on a re-review).
+        if (
+            default_reviewer
+            and default_reviewer != row_assignee
+            and _review_row_implementer_owned(conn, row["id"])
+        ):
+            if _apply_default_reviewer(
+                conn, row["id"], default_reviewer,
+                previous_assignee=row_assignee, dry_run=dry_run,
+            ):
+                result.auto_assigned_reviewer.append((row["id"], row_assignee, default_reviewer))
+                row_assignee = default_reviewer
+        if _dispatch_lane_task(conn, row, row_assignee, result, lane="review", **lane_kwargs):
             spawned += 1
     return result
 
@@ -2795,6 +2957,7 @@ def run_daemon(
                     max_in_progress=caps.max_in_progress,
                     max_in_progress_per_profile=caps.max_in_progress_per_profile,
                     default_assignee=caps.default_assignee,
+                    default_reviewer=caps.default_reviewer,
                     failure_limit=failure_limit,
                 )
             if on_tick is not None:

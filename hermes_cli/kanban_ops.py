@@ -60,6 +60,9 @@ def _cmd_tail(args: argparse.Namespace) -> int:
 def _cmd_dispatch(args: argparse.Namespace) -> int:
     # Same caps as the gateway tick and the dashboard nudge — resolved by the
     # one shared helper so a fourth entry point can't silently dispatch uncapped.
+    # kanban.default_reviewer rides along on the same resolution (t_fec4c811):
+    # the CLI dispatch path must route review-lane cards exactly like the
+    # gateway tick, or `hermes kanban dispatch` leaves them self-assigned.
     caps = kbd.resolve_dispatch_caps()
     # CLI --max is the more explicit operator signal, so it wins over
     # kanban.max_spawn. Not clamped: unlike the dashboard's query string this
@@ -75,6 +78,7 @@ def _cmd_dispatch(args: argparse.Namespace) -> int:
             max_in_progress=caps.max_in_progress,
             failure_limit=getattr(args, "failure_limit", kbd.DEFAULT_FAILURE_LIMIT),
             default_assignee=caps.default_assignee,
+            default_reviewer=caps.default_reviewer,
             max_in_progress_per_profile=caps.max_in_progress_per_profile,
         )
     if getattr(args, "json", False):
@@ -91,6 +95,10 @@ def _cmd_dispatch(args: argparse.Namespace) -> int:
                 for (tid, who, current) in res.skipped_per_profile_capped
             ],
             "auto_assigned_default": res.auto_assigned_default,
+            "auto_assigned_reviewer": [
+                {"task_id": tid, "previous_assignee": prev, "reviewer": rev}
+                for (tid, prev, rev) in res.auto_assigned_reviewer
+            ],
         }, ascii=True)
         return 0
     print(f"Reclaimed:    {res.reclaimed}")
@@ -113,6 +121,13 @@ def _cmd_dispatch(args: argparse.Namespace) -> int:
         print(
             f"Auto-assigned to kanban.default_assignee={caps.default_assignee!r}: "
             f"{', '.join(res.auto_assigned_default)}"
+        )
+    if res.auto_assigned_reviewer:
+        print(
+            f"Auto-assigned to kanban.default_reviewer={default_reviewer!r}: "
+            + ", ".join(
+                f"{tid} ({prev} -> {rev})" for (tid, prev, rev) in res.auto_assigned_reviewer
+            )
         )
     if res.skipped_unassigned:
         print(f"Skipped (unassigned): {', '.join(res.skipped_unassigned)}")

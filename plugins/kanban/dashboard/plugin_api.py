@@ -1563,6 +1563,7 @@ def dispatch(dry_run: bool = Query(False), max_n: int = Query(8, alias="max"), b
             max_in_progress=caps.max_in_progress,
             max_in_progress_per_profile=caps.max_in_progress_per_profile,
             default_assignee=caps.default_assignee,
+            default_reviewer=caps.default_reviewer,
             board=board,
         )
         try:
