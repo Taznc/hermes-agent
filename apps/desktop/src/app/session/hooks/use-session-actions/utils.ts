@@ -10,6 +10,7 @@ import { reconcileApprovalModeForProfile } from '@/store/approval-mode'
 import { requestDesktopOnboardingForCredentialWarning } from '@/store/onboarding'
 import { $activeGatewayProfile, $profiles, normalizeProfileKey } from '@/store/profile'
 import { $projectTree } from '@/store/projects'
+import { forgetSessionPullRequest } from '@/store/pull-requests'
 import {
   $cronSessions,
   $currentCwd,
@@ -35,6 +36,7 @@ import {
   setYoloActive
 } from '@/store/session'
 import type { SessionProfileRoute } from '@/store/session-request-router'
+import { forgetConfirmedMissingSessionUnread } from '@/store/session-unread'
 
 // Re-exported for the many session-actions/tile call sites that already import
 // it from here; the canonical definition lives in @/store/session.
@@ -1604,6 +1606,12 @@ async function probeStoredSessionAcrossProfiles(storedSessionId: string): Promis
   }
 
   negativeSessionProbes.set(storedSessionId, Date.now())
+  // This is the only point where a missing id is proven rather than merely
+  // absent from the current profile or page. Retire client-only caches now;
+  // doing it earlier could erase state for a session still being created on a
+  // different profile.
+  forgetSessionPullRequest(storedSessionId)
+  forgetConfirmedMissingSessionUnread(storedSessionId)
 
   return undefined
 }
