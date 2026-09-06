@@ -478,6 +478,69 @@ def test_active_pr_guard_skipped_for_review_lane_but_defers_ready_lane(
         ) == "rate_limit_cooldown"
 
 
+def test_active_pr_guard_ignores_unrelated_repo_and_non_worker_comments(
+    kanban_home: Path, monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+) -> None:
+    """Regression for t_535b7818: any GitHub PR URL in any comment used to
+    guard the task, so a research note quoting an upstream/unrelated repo's
+    PR (or a human/orchestrator comment) permanently blocked dispatch even
+    though this task never opened a PR of its own.
+
+    Both scopes must independently fail to guard:
+    * A PR URL for a DIFFERENT repo than this task's own worktree remote,
+      posted by the task's own assignee -> no guard.
+    * A PR URL for THIS task's own repo, but posted by someone other than
+      the task's own assignee (a human/orchestrator "see also" note) ->
+      no guard.
+    * A PR URL for THIS task's own repo, posted by the task's own assignee
+      -> guard fires (control, proves the scoping isn't simply disabled).
+    """
+    import subprocess
+
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    subprocess.run(["git", "init", "-b", "main", str(repo)], check=True, capture_output=True)
+    subprocess.run(
+        ["git", "-C", str(repo), "remote", "add", "origin",
+         "https://github.com/acme-corp/widgets.git"],
+        check=True, capture_output=True,
+    )
+
+    with kbc.connect() as conn:
+        # Unrelated-repo PR cited by the task's OWN assignee.
+        unrelated_id = kb.create_task(
+            conn, title="unrelated repo PR cited", assignee="worker",
+            workspace_kind="worktree", workspace_path=str(repo), branch_name="wt/unrelated",
+        )
+        kb.add_comment(
+            conn, unrelated_id, author="worker",
+            body="See prior art: https://github.com/NousResearch/hermes-agent/pull/79523",
+        )
+        assert kbd.check_respawn_guard(conn, unrelated_id) is None
+
+        # Own-repo PR cited by someone who is NOT this task's assignee.
+        wrong_author_id = kb.create_task(
+            conn, title="own repo PR but not by assignee", assignee="worker",
+            workspace_kind="worktree", workspace_path=str(repo), branch_name="wt/wrongauth",
+        )
+        kb.add_comment(
+            conn, wrong_author_id, author="reviewer",
+            body="For context, see https://github.com/acme-corp/widgets/pull/9",
+        )
+        assert kbd.check_respawn_guard(conn, wrong_author_id) is None
+
+        # Control: own-repo PR cited BY this task's own assignee still guards.
+        own_id = kb.create_task(
+            conn, title="own repo PR by own assignee", assignee="worker",
+            workspace_kind="worktree", workspace_path=str(repo), branch_name="wt/own",
+        )
+        kb.add_comment(
+            conn, own_id, author="worker",
+            body="Opened https://github.com/acme-corp/widgets/pull/42 for review.",
+        )
+        assert kbd.check_respawn_guard(conn, own_id) == "active_pr"
+
+
 def test_review_dispatch_preserves_task_skills_and_adds_reviewer_skill(
     kanban_home: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
