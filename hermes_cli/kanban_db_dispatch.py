@@ -477,6 +477,21 @@ def heartbeat_worker(
     Liveness signal orthogonal to the PID check: a worker whose forked child
     (train loop, crawl) is stuck can still have a live Python process.
     Returns False if the task is not running or its claim expired.
+
+    ``False`` is deliberately ONE return value for two different situations
+    this function cannot itself distinguish: ``task_id`` was never real (a
+    typo/hallucinated id), or ``task_id`` WAS real and its row is now gone —
+    an orphaned worker, e.g. because ``delete_task`` ran against a live
+    ``running`` row before the guard in t_749b0510 existed, or via any other
+    path that drops a row out from under its worker. Telling those apart
+    needs the CALLER's own identity (only the worker itself knows whether
+    ``task_id`` is the task it was spawned for), so that distinction is made
+    one layer up, in the ``kanban_heartbeat``/``kanban_complete`` tool
+    handlers (``tools/kanban_tools.py:_orphan_or_lifecycle_error``), which
+    return a structured ``orphaned: true`` field instead of a plain error
+    when the vanished id matches the calling worker's own ``HERMES_KANBAN_TASK``.
+    An orphaned worker should treat that field as "stop calling kanban tools
+    and end this turn" rather than retrying.
     """
     now = int(time.time())
     with _kb.write_txn(conn):

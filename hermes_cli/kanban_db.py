@@ -2851,16 +2851,28 @@ def _verify_created_cards(
     """Partition ``claimed_ids`` into (verified, phantom). Verified = the row
     exists AND ``created_by`` is the completing task's assignee or id, OR the
     card is linked as its child (created elsewhere, attached by the worker).
-    Never mutates."""
+    Never mutates.
+
+    ``completing_task_id``'s OWN row may already be gone — ``delete_task``
+    wipes the tasks/task_links/task_events rows in one txn, so a worker whose
+    card was deleted out from under it (t_749b0510) still needs to be able to
+    attest to cards it genuinely created. This used to bail out entirely
+    ("the completing task is gone, so nothing resolves") and reported a real
+    card as phantom purely because the CALLER's row vanished, not because the
+    claim was false. Only the ``completing_assignee`` comparison and the
+    linked-children lookup actually need that row; the ``created_by ==
+    completing_task_id`` identity check (the id string itself, never a join
+    through the vanished row) is unaffected and must still run.
+    """
     ordered = list(dict.fromkeys(str(x).strip() for x in (claimed_ids or []) if str(x).strip()))
     if not ordered:
         return [], []
 
     row = conn.execute("SELECT assignee FROM tasks WHERE id = ?", (completing_task_id,)).fetchone()
-    if row is None:
-        # Completing task not found — nothing resolves.
-        return [], ordered
-    completing_assignee = row["assignee"]
+    # None when the completing task's own row is gone (orphaned worker) — the
+    # assignee-based trust check below is simply skipped, not treated as
+    # "nothing can be verified".
+    completing_assignee = row["assignee"] if row is not None else None
 
     # Batch-fetch existence + created_by in one query.
     placeholders = ",".join(["?"] * len(ordered))
@@ -2930,6 +2942,14 @@ def complete_task(
     ``created_cards`` are verified first — a phantom id raises
     :class:`HallucinatedCardsError` after an auditable event; afterwards the
     prose is scanned for unresolvable ``t_<hex>`` refs (advisory event only).
+
+    Like :func:`kanban_db_dispatch.heartbeat_worker`, a plain ``False``
+    return does not distinguish a bogus/already-terminal ``task_id`` from an
+    orphaned worker whose own row was deleted mid-run (t_749b0510) — the
+    tool-handler layer (``tools/kanban_tools.py:_orphan_or_lifecycle_error``)
+    makes that call using the caller's own ``HERMES_KANBAN_TASK`` identity,
+    which this DB layer cannot see, and surfaces a distinguishable
+    ``orphaned: true`` field a worker should treat as a clean-exit signal.
     """
     now = int(time.time())
     # Cheap pre-check; re-checked inside the txn to close the parent-reopen race.
