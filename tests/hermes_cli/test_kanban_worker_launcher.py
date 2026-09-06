@@ -265,6 +265,151 @@ def test_worker_launcher_applies_even_when_restart_safe_argv_already_rewrapped(w
 
 
 # --------------------------------------------------------------------------
+# Re-audit BLOCKER-1: B4's identity-gate removal makes the launcher wrap
+# argv that _restart_safe_worker_argv has ALREADY wrapped in a real
+# `systemd-run --user --scope`. If the launcher itself is ALSO a
+# `systemd-run --user --scope` entry, nesting a second one is not a
+# stronger wrap: `--scope` is a transparent exec, so the outer invocation
+# execs straight into the inner one and only the INNER unit ever registers
+# with systemd. The persisted `worker_unit` must track a unit that
+# genuinely exists, never the phantom outer name.
+# --------------------------------------------------------------------------
+
+
+def test_worker_launcher_skips_redundant_outer_scope_when_already_scope_wrapped(worker_setup, monkeypatch):
+    root, workspace, task = worker_setup
+    _set_worker_launcher(root, ["systemd-run", "--user", "--scope"])
+    monkeypatch.setattr("shutil.which", lambda name: "/usr/bin/systemd-run" if name == "systemd-run" else None)
+    monkeypatch.setattr(kbd, "_systemd_user_bus_reachable", lambda: True)
+
+    # Simulate the supervised-gateway topology where _restart_safe_worker_argv
+    # has already produced a real systemd-run --user --scope invocation.
+    inner_unit = "kanban-t_launcher-run-7.scope"
+
+    def fake_restart_safe(_task, command):
+        return [
+            "systemd-run", "--user", "--scope", "--quiet", "--unit", inner_unit,
+            "--collect", "--", *command,
+        ]
+
+    monkeypatch.setattr(kbd, "_restart_safe_worker_argv", fake_restart_safe)
+
+    captured = {}
+
+    class FakeProc:
+        pid = 3131
+
+    def fake_popen(cmd, **kwargs):
+        captured["cmd"] = list(cmd)
+        return FakeProc()
+
+    monkeypatch.setattr(subprocess, "Popen", fake_popen)
+
+    pid = kbd._default_spawn(task, str(workspace))
+
+    assert pid == 3131
+    cmd = captured["cmd"]
+    # Exactly one `systemd-run --user --scope` invocation in the argv, not
+    # nested two deep -- there is only one "systemd-run" token at all.
+    assert cmd.count("systemd-run") == 1
+    # worker_unit must be the REAL (inner) unit, which genuinely registers,
+    # not a fabricated outer name that would resolve LoadState=not-found.
+    assert task.worker_unit == inner_unit
+
+
+def test_apply_worker_launcher_skips_double_scope_directly():
+    task = _make_task(current_run_id=7)
+    already_wrapped = [
+        "systemd-run", "--user", "--scope", "--quiet", "--unit",
+        "kanban-t_launcher-run-7.scope", "--collect", "--", "hermes", "-p", "coder",
+    ]
+
+    import hermes_cli.kanban_db_dispatch as kbd_module
+
+    orig_prefix = kbd_module._worker_launcher_prefix
+    try:
+        kbd_module._worker_launcher_prefix = lambda: ["systemd-run", "--user", "--scope"]
+        argv, unit = kbd_module._apply_worker_launcher(task, already_wrapped)
+    finally:
+        kbd_module._worker_launcher_prefix = orig_prefix
+
+    assert argv is already_wrapped  # no rewrap at all -- pure pass-through
+    assert unit == "kanban-t_launcher-run-7.scope"
+    assert argv.count("systemd-run") == 1
+
+
+# --------------------------------------------------------------------------
+# Re-audit BLOCKER-2: a resolved `systemd-run --user` launcher entry must
+# carry XDG_RUNTIME_DIR/DBUS_SESSION_BUS_ADDRESS into the SPAWNED CHILD's
+# own environment, not just pass the reachability check against the
+# spawning process's environment and then discard the resolved values.
+# --------------------------------------------------------------------------
+
+
+def test_worker_launcher_env_overrides_only_for_systemd_run_user():
+    assert kbd._worker_launcher_env_overrides([]) == {}
+    assert kbd._worker_launcher_env_overrides(["fake-launcher"]) == {}
+    overrides = kbd._worker_launcher_env_overrides(["systemd-run", "--user", "--scope"])
+    assert set(overrides) == {"XDG_RUNTIME_DIR", "DBUS_SESSION_BUS_ADDRESS"}
+
+
+def test_worker_launcher_systemd_run_user_injects_bus_env_into_child(worker_setup, monkeypatch):
+    root, workspace, task = worker_setup
+    _set_worker_launcher(root, ["systemd-run", "--user", "--scope"])
+    monkeypatch.setattr("shutil.which", lambda name: "/usr/bin/systemd-run" if name == "systemd-run" else None)
+    monkeypatch.setattr(kbd, "_systemd_user_bus_reachable", lambda: True)
+    monkeypatch.setattr(
+        kbd, "_resolve_systemd_user_bus_env",
+        lambda: ("/run/user/4242", "unix:path=/run/user/4242/bus"),
+    )
+    # Simulate the gateway's actually-stripped environment (#B3's premise):
+    # neither bus var present before the spawn.
+    monkeypatch.delenv("XDG_RUNTIME_DIR", raising=False)
+    monkeypatch.delenv("DBUS_SESSION_BUS_ADDRESS", raising=False)
+
+    captured = {}
+
+    class FakeProc:
+        pid = 4141
+
+    def fake_popen(cmd, **kwargs):
+        captured["cmd"] = list(cmd)
+        captured["env"] = kwargs.get("env") or {}
+        return FakeProc()
+
+    monkeypatch.setattr(subprocess, "Popen", fake_popen)
+
+    pid = kbd._default_spawn(task, str(workspace))
+
+    assert pid == 4141
+    assert captured["env"].get("XDG_RUNTIME_DIR") == "/run/user/4242"
+    assert captured["env"].get("DBUS_SESSION_BUS_ADDRESS") == "unix:path=/run/user/4242/bus"
+
+
+def test_default_spawn_no_launcher_does_not_inject_bus_env(worker_setup, monkeypatch):
+    """Default `[]` path: no bus vars are force-injected -- byte-identical to before."""
+    root, workspace, task = worker_setup
+    monkeypatch.delenv("XDG_RUNTIME_DIR", raising=False)
+    monkeypatch.delenv("DBUS_SESSION_BUS_ADDRESS", raising=False)
+
+    captured = {}
+
+    class FakeProc:
+        pid = 5151
+
+    def fake_popen(cmd, **kwargs):
+        captured["env"] = kwargs.get("env") or {}
+        return FakeProc()
+
+    monkeypatch.setattr(subprocess, "Popen", fake_popen)
+
+    kbd._default_spawn(task, str(workspace))
+
+    assert "XDG_RUNTIME_DIR" not in captured["env"]
+    assert "DBUS_SESSION_BUS_ADDRESS" not in captured["env"]
+
+
+# --------------------------------------------------------------------------
 # B3: systemd-run --user launcher entries fail CLOSED against an
 # unreachable user D-Bus, not just shutil.which() on the binary.
 # --------------------------------------------------------------------------
