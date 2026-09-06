@@ -8,6 +8,7 @@
  */
 import { describe, expect, it } from 'vitest'
 
+import { KANBAN_LOCALES } from './i18n'
 import { resolveBlockCause, runErrorText, statusGuidance, type StatusGuidanceDeps } from './status-guidance'
 import { COLUMN_META, type KanbanEvent, type KanbanRun, type KanbanTaskFull } from './types'
 
@@ -20,7 +21,10 @@ const k: StatusGuidanceDeps = {
   guideBlockLoop: reason => `guideBlockLoop(${reason})`,
   guideBlockedAutomatic: cause => `guideBlockedAutomatic(${cause})`,
   guideBlockedGeneric: 'guideBlockedGeneric',
+  guideBlockedManualCapability: 'guideBlockedManualCapability',
+  guideBlockedManualTransient: 'guideBlockedManualTransient',
   guideBlockedReviewNoVerdict: 'guideBlockedReviewNoVerdict',
+  guideBlockedUnknown: 'guideBlockedUnknown',
   guideDone: 'guideDone',
   guideOnHold: 'guideOnHold',
   guideReadyQueued: 'guideReadyQueued',
@@ -124,6 +128,77 @@ describe('resolveBlockCause — fallback chain', () => {
     const task = baseTask({ last_failure_error: null })
 
     expect(resolveBlockCause(task, [], [])).toEqual({ origin: 'unknown' })
+  })
+})
+
+describe('statusGuidance — blocked with unknown cause is honest, never a fabricated question', () => {
+  it('a blocked task with no cause anywhere resolves to the unknown-cause copy, not guideBlockedGeneric', () => {
+    const task = baseTask({ block_kind: null, last_failure_error: null })
+
+    const guidance = statusGuidance('blocked', task, [], [], k)
+
+    expect(guidance).toBe('guideBlockedUnknown')
+    expect(guidance).not.toBe('guideBlockedGeneric')
+  })
+
+  it('guideBlockedUnknown is a distinct next-action line in every locale, never a copy of the banner body (ctaBlockedNoReason) — the banner already states the diagnosis, this line must state the action', () => {
+    for (const [locale, bundle] of Object.entries(KANBAN_LOCALES)) {
+      expect(bundle.guideBlockedUnknown, `locale "${locale}"`).not.toBe(bundle.ctaBlockedNoReason)
+    }
+  })
+})
+
+describe('statusGuidance — a manual block never echoes the raw reason (defect: choices-fence dump)', () => {
+  it('a manual block with a plain-text reason gets next-action guidance, not the reason text', () => {
+    const task = baseTask({ block_kind: 'needs_input' })
+    const events = [event('blocked', { reason: 'Which key should we use?' })]
+
+    const guidance = statusGuidance('blocked', task, events, [], k)
+
+    expect(guidance).toBe('guideBlockedGeneric')
+    expect(guidance).not.toContain('Which key should we use?')
+  })
+
+  it('a manual block whose reason carries a ```choices fence never leaks the fence or its JSON', () => {
+    const task = baseTask({ block_kind: 'needs_input' })
+
+    const reason =
+      'Pick a path forward:\n\n```choices\n[\n  {"key": "A", "label": "Option A - do the thing"},\n  {"key": "B", "label": "Option B - do the other thing"}\n]\n```'
+
+    const events = [event('blocked', { reason })]
+
+    const guidance = statusGuidance('blocked', task, events, [], k)
+
+    expect(guidance).not.toContain('```')
+    expect(guidance).not.toContain('"key"')
+    expect(guidance).not.toContain('Option A')
+  })
+
+  it('a manual block with an empty reason still gets sensible reply/unblock guidance (no regression)', () => {
+    const task = baseTask({ block_kind: null })
+    const events = [event('blocked', { reason: '' })]
+
+    expect(statusGuidance('blocked', task, events, [], k)).toBe('guideBlockedGeneric')
+  })
+
+  it('a manual block with block_kind "capability" gets the capability-specific next action, not "needs your input"', () => {
+    const task = baseTask({ block_kind: 'capability' })
+    const events = [event('blocked', { reason: 'Missing an API key for this provider.' })]
+
+    const guidance = statusGuidance('blocked', task, events, [], k)
+
+    expect(guidance).toBe('guideBlockedManualCapability')
+    expect(guidance).not.toBe('guideBlockedGeneric')
+  })
+
+  it('a manual block with block_kind "transient" gets the transient-specific next action, not "needs your input"', () => {
+    const task = baseTask({ block_kind: 'transient' })
+    const events = [event('blocked', { reason: 'A flaky network call failed.' })]
+
+    const guidance = statusGuidance('blocked', task, events, [], k)
+
+    expect(guidance).toBe('guideBlockedManualTransient')
+    expect(guidance).not.toBe('guideBlockedGeneric')
   })
 })
 

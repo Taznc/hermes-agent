@@ -184,8 +184,11 @@ type KanbanMessages = {
   guideReview: string
   guideDone: string
   guideBlockedGeneric: string
+  guideBlockedManualCapability: string
+  guideBlockedManualTransient: string
   guideBlockedAutomatic: (cause: string) => string
   guideBlockedReviewNoVerdict: string
+  guideBlockedUnknown: string
   // Structured multiple-choice question rendering (blocked-callout options).
   choicesGroupLabel: string
   choiceSubmitError: string
@@ -261,7 +264,6 @@ type KanbanMessages = {
   working: string
   // board switcher
   board: string
-  allBoards: string
   newBoard: string
   newBoardDots: string
   // Menu labels are bare verbs — the board they act on is the one named in the
@@ -289,14 +291,6 @@ type KanbanMessages = {
   projectHintPre: string
   projectHintCmd: string
   createBoard: string
-  // All Boards (consolidated view)
-  toggleBoard: (name: string) => string
-  boardsFailedNotice: (names: string) => string
-  /** New-task dialog board picker, shown only under the All Boards sentinel:
-   *  the view has no implied board, so the target is asked for rather than
-   *  resolved silently to whichever board happens to be active. */
-  pickBoard: string
-  pickBoardHint: string
   // orchestration
   orchestratorProfile: string
   defaultAssignee: string
@@ -506,8 +500,11 @@ export const en: KanbanMessages = {
   guideReview: 'A reviewer is checking the completed work — approve or send back above.',
   guideDone: 'Settled — completed, and any dependent cards are now unblocked.',
   guideBlockedGeneric: 'Needs your input — reply in comments, or unblock to send it back to the queue.',
+  guideBlockedManualCapability: 'A missing capability is blocking this — resolve it, then reassign or unblock to retry.',
+  guideBlockedManualTransient: 'A transient failure blocked this — it may clear on its own; unblock to retry.',
   guideBlockedAutomatic: cause => `${cause} Inspect the worker log, then retry or reassign.`,
   guideBlockedReviewNoVerdict: 'The reviewer exited without a verdict. Requeue it for another review pass.',
+  guideBlockedUnknown: 'Inspect the worker log, then retry or reassign it.',
   choicesGroupLabel: 'Choose an option',
   choiceSubmitError: 'Could not submit your answer. Try again.',
   choiceRetry: 'Retry',
@@ -532,7 +529,9 @@ export const en: KanbanMessages = {
   depMissing: 'not on this board',
   depMissingTip: 'This linked task was deleted, or is hidden by the current tenant/archive filter.',
   depWaitingBanner: (gating, total) =>
-    total === 1 ? 'Waiting on 1 blocker.' : `Waiting on ${gating} of ${total} blockers.`,
+    total === 1
+      ? 'Waiting on 1 blocker.'
+      : `Waiting on ${gating} of ${total} blockers.`,
   depFocusHint: 'Click a card to trace its dependency chain · Esc to clear',
   depFocusUpstream: 'blocks this',
   depFocusDownstream: 'waits on this',
@@ -575,7 +574,6 @@ export const en: KanbanMessages = {
   close: 'Close',
   working: 'working',
   board: 'Board',
-  allBoards: 'All Boards',
   newBoard: 'New board',
   newBoardDots: 'New board…',
   exportDots: 'Export…',
@@ -601,10 +599,6 @@ export const en: KanbanMessages = {
     'New tasks run in the project’s repo (a worktree per task); each task can still override its workspace at creation. Manage projects with ',
   projectHintCmd: 'hermes project',
   createBoard: 'Create board',
-  toggleBoard: name => `Toggle ${name}`,
-  boardsFailedNotice: names => `Couldn't load: ${names}`,
-  pickBoard: 'Pick a board',
-  pickBoardHint: 'The board this task is created on.',
   orchestratorProfile: 'Orchestrator profile',
   defaultAssignee: 'Default assignee',
   defaultParen: '(default)',
@@ -732,8 +726,7 @@ const ja: KanbanMessages = {
   couldNotEstimate: '見積もりできませんでした',
   complexity: { S: '小', M: '中', L: '大' },
   ideaTitle: 'アイデアを記録',
-  ideaHint:
-    'ラフなロードマップのアイデアをメモ — カードではなく ROADMAP.md の Ideas リストに追加され、後でトリアージされます。',
+  ideaHint: 'ラフなロードマップのアイデアをメモ — カードではなく ROADMAP.md の Ideas リストに追加され、後でトリアージされます。',
   ideaPlaceholder: 'ラフなアイデア…',
   ideaSave: 'アイデアを保存',
   ideaSaving: '保存中…',
@@ -813,8 +806,11 @@ const ja: KanbanMessages = {
   guideReview: 'レビュアーが完了した作業を確認中です — 上で承認するか差し戻してください。',
   guideDone: '解決済み — 完了しており、依存する子カードはブロック解除されています。',
   guideBlockedGeneric: 'あなたの対応が必要です — コメントで返信するか、ブロック解除してキューに戻してください。',
+  guideBlockedManualCapability: '不足している機能がブロックの原因です — 解消してから、再割り当てするかブロック解除して再試行してください。',
+  guideBlockedManualTransient: '一時的な失敗によりブロックされました — 自然に解消することがあります。ブロック解除して再試行してください。',
   guideBlockedAutomatic: cause => `${cause} ワーカーログを確認し、再試行するか再割り当てしてください。`,
   guideBlockedReviewNoVerdict: 'レビュアーが判定なしで終了しました。もう一度レビューへ再キューしてください。',
+  guideBlockedUnknown: 'ワーカーログを確認し、再試行するか再割り当てしてください。',
   choicesGroupLabel: 'オプションを選択してください',
   choiceSubmitError: '回答を送信できませんでした。もう一度お試しください。',
   choiceRetry: '再試行',
@@ -882,7 +878,6 @@ const ja: KanbanMessages = {
   close: '閉じる',
   working: '作業中',
   board: 'ボード',
-  allBoards: 'すべてのボード',
   newBoard: '新しいボード',
   newBoardDots: '新しいボード…',
   exportDots: 'エクスポート…',
@@ -908,10 +903,6 @@ const ja: KanbanMessages = {
     '新しいタスクはプロジェクトのリポジトリで実行されます（タスクごとに worktree）。各タスクは作成時にワークスペースを上書きできます。プロジェクトの管理は ',
   projectHintCmd: 'hermes project',
   createBoard: 'ボードを作成',
-  toggleBoard: name => `${name}を切り替え`,
-  boardsFailedNotice: names => `読み込めませんでした: ${names}`,
-  pickBoard: 'ボードを選択',
-  pickBoardHint: 'このタスクを作成するボード。',
   orchestratorProfile: 'オーケストレータープロフィール',
   defaultAssignee: 'デフォルトの担当',
   defaultParen: '（既定）',
@@ -1117,8 +1108,11 @@ const zh: KanbanMessages = {
   guideReview: '审查者正在检查已完成的工作 — 请在上方批准或退回。',
   guideDone: '已解决 — 已完成，其依赖的卡片现已解除阻塞。',
   guideBlockedGeneric: '需要你的输入 — 在评论中回复，或解除阻塞将其送回队列。',
+  guideBlockedManualCapability: '缺少某项能力导致受阻 — 请先解决，再重新分配或解除阻塞以重试。',
+  guideBlockedManualTransient: '一次临时性失败导致受阻 — 可能会自行恢复；解除阻塞以重试。',
   guideBlockedAutomatic: cause => `${cause} 请查看工作单元日志，然后重试或重新分配。`,
   guideBlockedReviewNoVerdict: '审查者退出时没有给出结论。请重新排队进行另一轮审查。',
+  guideBlockedUnknown: '请查看工作单元日志，然后重试或重新分配。',
   choicesGroupLabel: '请选择一个选项',
   choiceSubmitError: '无法提交你的回答，请重试。',
   choiceRetry: '重试',
@@ -1185,7 +1179,6 @@ const zh: KanbanMessages = {
   close: '关闭',
   working: '进行中',
   board: '面板',
-  allBoards: '所有面板',
   newBoard: '新建面板',
   newBoardDots: '新建面板…',
   exportDots: '导出…',
@@ -1211,10 +1204,6 @@ const zh: KanbanMessages = {
     '新任务将在项目的仓库中运行（每个任务一个 worktree）；每个任务在创建时仍可覆盖其工作区。管理项目请使用 ',
   projectHintCmd: 'hermes project',
   createBoard: '创建面板',
-  toggleBoard: name => `切换 ${name}`,
-  boardsFailedNotice: names => `无法加载：${names}`,
-  pickBoard: '选择面板',
-  pickBoardHint: '此任务将创建在该面板上。',
   orchestratorProfile: '编排者配置档',
   defaultAssignee: '默认负责人',
   defaultParen: '（默认）',
@@ -1419,8 +1408,11 @@ const zhHant: KanbanMessages = {
   guideReview: '審查者正在檢查已完成的工作 — 請在上方核准或退回。',
   guideDone: '已解決 — 已完成，其相依的卡片現已解除封鎖。',
   guideBlockedGeneric: '需要你的輸入 — 在留言中回覆，或解除封鎖將其送回佇列。',
+  guideBlockedManualCapability: '缺少某項能力導致受阻 — 請先解決，再重新指派或解除封鎖以重試。',
+  guideBlockedManualTransient: '一次暫時性失敗導致受阻 — 可能會自行恢復；解除封鎖以重試。',
   guideBlockedAutomatic: cause => `${cause} 請查看工作單元日誌，然後重試或重新指派。`,
   guideBlockedReviewNoVerdict: '審查者結束時沒有給出結論。請重新排隊進行另一輪審查。',
+  guideBlockedUnknown: '請查看工作單元日誌，然後重試或重新指派。',
   choicesGroupLabel: '請選擇一個選項',
   choiceSubmitError: '無法送出你的回答，請再試一次。',
   choiceRetry: '重試',
@@ -1487,7 +1479,6 @@ const zhHant: KanbanMessages = {
   close: '關閉',
   working: '進行中',
   board: '面板',
-  allBoards: '所有面板',
   newBoard: '新增面板',
   newBoardDots: '新增面板…',
   exportDots: '匯出…',
@@ -1513,10 +1504,6 @@ const zhHant: KanbanMessages = {
     '新任務將在專案的儲存庫中執行（每個任務一個 worktree）；每個任務在建立時仍可覆寫其工作區。管理專案請使用 ',
   projectHintCmd: 'hermes project',
   createBoard: '建立面板',
-  toggleBoard: name => `切換 ${name}`,
-  boardsFailedNotice: names => `無法載入：${names}`,
-  pickBoard: '選擇面板',
-  pickBoardHint: '此任務將建立在該面板上。',
   orchestratorProfile: '編排者設定檔',
   defaultAssignee: '預設負責人',
   defaultParen: '（預設）',
