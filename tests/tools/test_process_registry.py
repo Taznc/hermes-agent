@@ -1914,11 +1914,14 @@ class TestSystemdCgroupIsolation:
     def test_wraps_in_systemd_scope_when_supervisor_and_available(
         self, registry, monkeypatch, _gateway_identity
     ):
-        """Under a supervisor with systemd-run available, the spawn argv is
-        wrapped in ``systemd-run --user --scope --unit=hermes-worker-<id>``."""
+        """Under a supervisor, a transient service preserves tracking and joins the worker slice."""
         fake_popen, captured = self._fake_popen_capture()
 
         monkeypatch.setattr("tools.process_registry._find_shell", lambda: "/bin/bash")
+        monkeypatch.setattr(
+            "tools.process_registry._worker_memory_max_bytes",
+            lambda: 4 * 1024 * 1024 * 1024,
+        )
         monkeypatch.setattr(
             "tools.process_registry._systemd_run_user_scope_available",
             lambda: True,
@@ -1940,27 +1943,28 @@ class TestSystemdCgroupIsolation:
         argv = captured["argv"]
         assert argv[0] == "/usr/bin/systemd-run", argv
         assert "--user" in argv
-        assert "--scope" in argv
+        assert "--scope" not in argv
+        assert "--pipe" in argv
         assert "--quiet" in argv, (
             "systemd-run argv must include --quiet (#70716 gap #3)"
         )
         assert "--unit" in argv
         unit_idx = argv.index("--unit")
-        assert argv[unit_idx + 1].startswith("hermes-worker-"), argv
-        assert argv[unit_idx + 1] == f"hermes-worker-{session.id}", (
-            argv
-        )  # _build_systemd_scope_argv uses bare name
+        assert argv[unit_idx + 1] == f"hermes-worker-{session.id}", argv
         properties = [
-            argv[index + 1]
-            for index, value in enumerate(argv[:-1])
-            if value == "--property"
+            value.partition("=")[2]
+            if value.startswith("--property=")
+            else argv[index + 1]
+            for index, value in enumerate(argv)
+            if value.startswith("--property=") or value == "--property"
         ]
-        assert "MemoryAccounting=yes" in properties
-        assert "OOMPolicy=kill" in properties
-        memory_max = next(
-            value for value in properties if value.startswith("MemoryMax=")
-        )
-        assert int(memory_max.split("=", 1)[1]) > 0
+        assert {
+            "MemoryAccounting=yes",
+            "MemoryHigh=3G",
+            f"MemoryMax={4 * 1024 * 1024 * 1024}",
+            "TimeoutStopSec=30s",
+            "OOMPolicy=kill",
+        }.issubset(properties)
         # The original shell command must still be present at the tail,
         # after the ``--`` separator that prevents systemd-run from
         # interpreting command flags as its own.
@@ -1975,7 +1979,7 @@ class TestSystemdCgroupIsolation:
         # (and the scoped worker below it) a private session.
         assert captured["start_new_session"] is True
         # The session must record the unit name so kill_process can stop it.
-        assert session.systemd_unit == f"hermes-worker-{session.id}.scope"
+        assert session.systemd_unit == f"hermes-worker-{session.id}.service"
 
     def test_falls_back_when_systemd_run_unavailable(self, registry, monkeypatch, _gateway_identity):
         """Under a supervisor but without systemd-run, fall back to the
@@ -2163,7 +2167,7 @@ class TestSystemdCgroupIsolation:
 
         stop_unit.assert_called_once()
         assert stop_unit.call_args.args[0].startswith("hermes-worker-proc_")
-        assert stop_unit.call_args.args[0].endswith(".scope")
+        assert stop_unit.call_args.args[0].endswith(".service")
         killpg.assert_not_called()
 
     def test_pty_spawn_is_wrapped_in_systemd_scope(self, registry, monkeypatch, _gateway_identity):
@@ -2191,11 +2195,12 @@ class TestSystemdCgroupIsolation:
 
         argv = pty_spawn.call_args.args[0]
         assert argv[0] == "/usr/bin/systemd-run"
-        assert "--scope" in argv
+        assert "--scope" not in argv
+        assert "--pipe" in argv
         assert "--unit" in argv
         assert "--" in argv
         assert argv[-3:] == ["/bin/bash", "-lic", "set +m; codex"]
-        assert session.systemd_unit == f"hermes-worker-{session.id}.scope"
+        assert session.systemd_unit == f"hermes-worker-{session.id}.service"
 
     def test_pty_spawn_failure_reaps_scope_before_distinct_pipe_fallback(
         self, registry, monkeypatch, _gateway_identity
@@ -2243,13 +2248,13 @@ class TestSystemdCgroupIsolation:
         assert [event[0] for event in events] == ["pty", "stop", "pipe"]
         stopped_unit = events[1][1]
         fallback_argv = events[2][1]
-        assert stopped_unit == f"hermes-worker-{session.id}.scope"
+        assert stopped_unit == f"hermes-worker-{session.id}.service"
         unit_idx = fallback_argv.index("--unit")
         assert fallback_argv[unit_idx + 1] == (
             f"hermes-worker-{session.id}-pipe-fallback"
         )
         assert session.systemd_unit == (
-            f"hermes-worker-{session.id}-pipe-fallback.scope"
+            f"hermes-worker-{session.id}-pipe-fallback.service"
         )
 
     def test_pty_spawn_failure_does_not_fallback_when_scope_reap_fails(

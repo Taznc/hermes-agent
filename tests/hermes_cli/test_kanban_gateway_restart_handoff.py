@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import os
+import signal
 import subprocess
 import sys
 import time
@@ -79,7 +80,10 @@ def test_managed_gateway_worker_is_spawned_in_restart_safe_scope(
     monkeypatch.setattr("shutil.which", lambda name: "/usr/bin/systemd-run")
 
     assert kbd._default_spawn(task, str(workspace)) == 4242
-    assert captured_cmd[:4] == ["/usr/bin/systemd-run", "--user", "--scope", "--quiet"]
+    assert captured_cmd[:3] == ["/usr/bin/systemd-run", "--user", "--quiet"]
+    assert "--scope" not in captured_cmd
+    assert "--pipe" in captured_cmd
+    assert "--slice=hermes-workers.slice" in captured_cmd
     unit_index = captured_cmd.index("--unit")
     assert captured_cmd[unit_index + 1] == "hermes-worker-kanban-t_candidate_restart-run-23"
     assert "MemoryMax=536870912" in captured_cmd
@@ -89,6 +93,31 @@ def test_managed_gateway_worker_is_spawned_in_restart_safe_scope(
     assert captured_env["HERMES_KANBAN_TASK"] == task.id
     assert captured_env["HERMES_KANBAN_RUN_ID"] == "23"
     assert "ANTHROPIC_API_KEY" not in captured_env
+
+
+@pytest.mark.linux_only
+def test_reclaim_stops_the_deterministic_worker_service_before_signalling(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    stopped: list[str] = []
+    signals: list[tuple[int, int]] = []
+    monkeypatch.setattr(kbd._kb, "_host_prefix", lambda: "host:")
+    monkeypatch.setattr(
+        "tools.process_registry._stop_systemd_unit",
+        lambda unit: stopped.append(unit) or True,
+    )
+
+    result = kbd._terminate_reclaimed_worker(
+        4242,
+        "host:dispatcher",
+        systemd_unit="hermes-worker-kanban-t_candidate_restart-run-23.service",
+        signal_fn=lambda pid, sig: signals.append((pid, sig)) or (_ for _ in ()).throw(ProcessLookupError()),
+    )
+
+    assert stopped == ["hermes-worker-kanban-t_candidate_restart-run-23.service"]
+    assert signals == [(4242, signal.SIGTERM)]
+    assert result["systemd_unit_stopped"] is True
+    assert result["terminated"] is True
 
 
 @pytest.mark.linux_only
@@ -172,7 +201,11 @@ def test_backend_supervised_worker_is_spawned_in_restart_safe_scope(
     monkeypatch.setattr("shutil.which", lambda name: "/usr/bin/systemd-run")
 
     assert kbd._default_spawn(task, str(workspace)) == 4244
-    assert captured_cmd[:4] == ["/usr/bin/systemd-run", "--user", "--scope", "--quiet"]
+    assert captured_cmd[:3] == ["/usr/bin/systemd-run", "--user", "--quiet"]
+    assert "--scope" not in captured_cmd
+    assert "--pipe" in captured_cmd
+    assert "--slice=hermes-workers.slice" in captured_cmd
+    assert f"--working-directory={workspace}" in captured_cmd
     unit_index = captured_cmd.index("--unit")
     assert captured_cmd[unit_index + 1] == "hermes-worker-kanban-t_candidate_restart-run-23"
     separator = captured_cmd.index("--")
@@ -258,11 +291,14 @@ def test_real_user_systemd_scope_preserves_worker_context(
 
     assert receipt.exists()
     payload = json.loads(receipt.read_text(encoding="utf-8"))
-    assert payload["pid"] == pid
+    assert payload["pid"] != pid  # systemd-run stays attached with --pipe; service owns the worker.
     assert payload["cwd"] == str(workspace)
     assert payload["task"] == task.id
     assert payload["run"] == "23"
-    assert ".scope" in payload["cgroup"]
+    assert (
+        "/hermes.slice/hermes-workers.slice/"
+        "hermes-worker-kanban-t_candidate_restart-run-23.service"
+    ) in payload["cgroup"]
     assert "hermes-gateway.service" not in payload["cgroup"]
 
 
@@ -271,7 +307,7 @@ def test_real_backend_supervised_worker_leaves_the_unit_cgroup(
     worker_setup: tuple[Path, kb.Task], monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """End-to-end proof for the web-desktop backend topology: a real worker spawned by a
-    supervised NON-gateway unit lands in its own ``.scope``, never in ``.service``.
+    supervised NON-gateway unit lands in its own transient service.
 
     The gateway arm above cannot catch this regression — it forces
     ``_is_supervised_gateway_process`` True, which is exactly the predicate that was wrong.
@@ -283,8 +319,8 @@ def test_real_backend_supervised_worker_leaves_the_unit_cgroup(
 
     workspace, task = worker_setup
     # A distinct task/run id: the gateway E2E above mints
-    # `hermes-worker-kanban-t_candidate_restart-run-23.scope`, and `--collect` reaps a
-    # transient scope only shortly after exit — reusing the name races that teardown and
+    # `hermes-worker-kanban-t_candidate_restart-run-23.service`, and `--collect` reaps a
+    # transient service only shortly after exit — reusing the name races that teardown and
     # systemd-run fails with "unit already exists".
     task.id = "t_backend_restart"
     task.current_run_id = 24
@@ -308,10 +344,10 @@ def test_real_backend_supervised_worker_leaves_the_unit_cgroup(
 
     assert receipt.exists()
     payload = json.loads(receipt.read_text(encoding="utf-8"))
-    assert payload["pid"] == pid
+    assert payload["pid"] != pid
     cgroup = payload["cgroup"].strip()
-    # The LEAF cgroup is the worker's own transient scope; the incident had the leaf be
+    # The LEAF cgroup is the worker's own transient service; the incident had the leaf be
     # the dispatching unit's own service cgroup (`/system.slice/hermes-*.service`).
     leaf = cgroup.rsplit("/", 1)[-1]
-    assert leaf == "hermes-worker-kanban-t_backend_restart-run-24.scope", cgroup
-    assert "/system.slice/" not in cgroup, cgroup
+    assert leaf == "hermes-worker-kanban-t_backend_restart-run-24.service", cgroup
+    assert "/hermes.slice/hermes-workers.slice/" in cgroup, cgroup

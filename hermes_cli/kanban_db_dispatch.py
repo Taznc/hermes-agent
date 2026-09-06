@@ -400,6 +400,7 @@ def _terminate_reclaimed_worker(
     pid: Optional[int],
     claim_lock: Optional[str],
     *,
+    systemd_unit: Optional[str] = None,
     signal_fn=None,
 ) -> dict[str, Any]:
     """Best-effort host-local worker termination for reclaim paths."""
@@ -409,12 +410,18 @@ def _terminate_reclaimed_worker(
         "termination_attempted": False,
         "terminated": False,
         "sigkill": False,
+        "systemd_unit": systemd_unit,
+        "systemd_unit_stopped": False,
     }
     if not pid or pid <= 0 or not claim_lock:
         return info
     if not str(claim_lock).startswith(_kb._host_prefix()):
         return info
     info["host_local"] = True
+    if systemd_unit:
+        from tools.process_registry import _stop_systemd_unit
+
+        info["systemd_unit_stopped"] = _stop_systemd_unit(systemd_unit)
 
     kill = _kill_fn(signal_fn)
     if kill is None:
@@ -556,7 +563,7 @@ def enforce_max_runtime(conn: sqlite3.Connection, *, signal_fn=None) -> list[str
     host_prefix = _kb._host_prefix()
 
     rows = conn.execute(
-        "SELECT t.id, t.worker_pid, "
+        "SELECT t.id, t.worker_pid, t.current_run_id, "
         "       COALESCE(r.started_at, t.started_at) AS active_started_at, "
         "       t.max_runtime_seconds, t.claim_lock "
         "FROM tasks t "
@@ -578,17 +585,23 @@ def enforce_max_runtime(conn: sqlite3.Connection, *, signal_fn=None) -> list[str
 
         pid = int(row["worker_pid"])
         tid = row["id"]
-        # SIGTERM then SIGKILL after 5 s grace; workers wanting a cleaner
-        # shutdown install their own SIGTERM handler.
-        killed = False
-        kill = _kill_fn(signal_fn)
-        if kill is not None:
-            with contextlib.suppress(ProcessLookupError, OSError):
-                kill(pid, signal.SIGTERM)
-            # Short polling wait — no time.sleep on the write txn.
-            _poll_worker_exit(pid)
-            if _kb._pid_alive(pid):
-                killed = _sigkill(kill, pid)
+        run_id = row["current_run_id"]
+        systemd_unit = (
+            f"hermes-worker-kanban-{tid}-run-{run_id}.service"
+            if run_id is not None
+            else None
+        )
+        termination = _terminate_reclaimed_worker(
+            pid, row["claim_lock"], systemd_unit=systemd_unit, signal_fn=signal_fn
+        )
+        # Do not release an expired claim while its launcher/service cgroup is
+        # still alive: that would run a retry beside the timed-out worker.
+        if _worker_survived_termination(termination):
+            _defer_reclaim_for_live_worker(
+                conn, tid, row["claim_lock"], now, termination,
+                reason="max_runtime_worker_alive",
+            )
+            continue
 
         error = f"elapsed {int(elapsed)}s > limit {limit}s"
         with _kb.write_txn(conn):
@@ -606,9 +619,9 @@ def enforce_max_runtime(conn: sqlite3.Connection, *, signal_fn=None) -> list[str
                     "pid": pid,
                     "elapsed_seconds": int(elapsed),
                     "limit_seconds": limit,
-                    "sigkill": killed,
                     "retry_status": retry_status,
                 }
+                payload.update(termination)
                 run_id = _kb._end_run(
                     conn, tid, outcome="timed_out", status="timed_out",
                     error=error, metadata=payload,
@@ -625,7 +638,7 @@ def enforce_max_runtime(conn: sqlite3.Connection, *, signal_fn=None) -> list[str
                 outcome="timed_out",
                 release_claim=False,
                 end_run=False,
-                event_payload_extra={"pid": pid, "sigkill": killed, "retry_status": retry_status},
+                event_payload_extra={**termination, "retry_status": retry_status},
             )
     return timed_out
 
@@ -658,7 +671,7 @@ def detect_stale_running(
     reclaimed: list[str] = []
 
     rows = conn.execute(
-        "SELECT t.id, t.worker_pid, t.last_heartbeat_at, t.claim_lock, "
+        "SELECT t.id, t.worker_pid, t.current_run_id, t.last_heartbeat_at, t.claim_lock, "
         "       COALESCE(r.started_at, t.started_at) AS active_started_at "
         "FROM tasks t "
         "LEFT JOIN task_runs r ON r.id = t.current_run_id "
@@ -681,7 +694,15 @@ def detect_stale_running(
         tid = row["id"]
         lock = row["claim_lock"] or ""
 
-        termination = _kb._terminate_reclaimed_worker(pid, lock, signal_fn=signal_fn)
+        run_id = row["current_run_id"]
+        systemd_unit = (
+            f"hermes-worker-kanban-{tid}-run-{run_id}.service"
+            if run_id is not None
+            else None
+        )
+        termination = _kb._terminate_reclaimed_worker(
+            pid, lock, systemd_unit=systemd_unit, signal_fn=signal_fn
+        )
 
         # Never release a claim while our own worker is still alive: that would
         # spawn a duplicate beside it. Hold the claim and retry next tick.
@@ -3054,7 +3075,13 @@ def _open_worker_log(task: Task, board: Optional[str]):
     return open(log_path, "ab")
 
 
-def _restart_safe_worker_argv(task: Task, command: list[str], env: dict[str, str] | None = None) -> list[str]:
+def _restart_safe_worker_argv(
+    task: Task,
+    command: list[str],
+    env: dict[str, str] | None = None,
+    working_directory: str | None = None,
+    service_environment: dict[str, str] | None = None,
+) -> list[str]:
     """Wrap a worker spawned by a supervised systemd unit in the shared restart-safe scope.
 
     ``env`` is the child's environment, mutated in place with the user-bus variables the
@@ -3081,6 +3108,8 @@ def _restart_safe_worker_argv(task: Task, command: list[str], env: dict[str, str
         command,
         unit_suffix=f"kanban-{task.id}-run-{task.current_run_id}",
         env=env,
+        working_directory=working_directory,
+        service_environment=service_environment,
     )
 
 
@@ -3186,7 +3215,25 @@ def _default_spawn(task: Task, workspace: str, *, board: Optional[str] = None) -
     # A worker spawned by a supervised systemd unit must leave that unit's cgroup before
     # startup; otherwise restarting the service kills the worker mid-task. ``env`` is
     # passed so the scope wrapper can add the user-bus vars it needs to reach systemd.
-    cmd = _restart_safe_worker_argv(task, cmd, env)
+    service_environment = {
+        key: value
+        for key, value in env.items()
+        if key in {
+            "HERMES_HOME", "HERMES_TENANT", "HERMES_KANBAN_TASK",
+            "HERMES_KANBAN_WORKSPACE", "HERMES_SESSION_SOURCE", "TERMINAL_CWD",
+            "HERMES_KANBAN_BRANCH", "HERMES_KANBAN_RUN_ID", "HERMES_KANBAN_CLAIM_LOCK",
+            "HERMES_KANBAN_GOAL_MODE", "HERMES_KANBAN_GOAL_MAX_TURNS", "TERMINAL_TIMEOUT",
+            "TERMINAL_MAX_FOREGROUND_TIMEOUT", "HERMES_KANBAN_DB", "HERMES_KANBAN_PIN_HOME",
+            "HERMES_KANBAN_WORKSPACES_ROOT", "HERMES_KANBAN_BOARD", "HERMES_PROFILE",
+        }
+    }
+    cmd = _restart_safe_worker_argv(
+        task,
+        cmd,
+        env,
+        workspace if os.path.isdir(workspace) else None,
+        service_environment,
+    )
     log_f = _open_worker_log(task, board)
     try:
         proc = subprocess.Popen(  # noqa: S603 -- argv is a fixed list built above

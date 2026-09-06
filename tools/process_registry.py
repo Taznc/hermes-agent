@@ -26,7 +26,7 @@ _IS_LINUX = platform.system() == "Linux"
 from tools.environments.local import _find_shell, _resolve_safe_cwd, _sanitize_subprocess_env
 from hermes_cli._subprocess_compat import windows_hide_flags
 from dataclasses import dataclass, field
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Mapping, Optional
 
 from hermes_cli.config import get_hermes_home
 
@@ -124,19 +124,38 @@ def _worker_memory_max_bytes() -> int:
     return min(override_bound, safe_bound) if override_bound else safe_bound
 
 
-def _systemd_scope_argv(binary: str, unit_name: str, *argv: str) -> List[str]:
-    """``systemd-run --user --scope`` argv shared by the probe and real spawns.
-    ``--collect`` self-cleans the scope after exit; ``--unit`` names it for systemctl."""
-    return [
-        binary, "--user", "--scope", "--quiet", "--unit", unit_name, "--collect",
+def _systemd_scope_argv(
+    binary: str,
+    unit_name: str,
+    *argv: str,
+    working_directory: Optional[str] = None,
+    environment: Optional[Mapping[str, str]] = None,
+) -> List[str]:
+    """``systemd-run`` argv for a transient user service in the worker slice.
+
+    Transient scopes requested through the user manager are placed in ``app.slice``
+    by systemd 255 even with ``--slice``. A service is placed correctly, and
+    ``--pipe`` keeps the launcher attached so existing output/process lifecycle
+    tracking continues to observe the worker rather than an early-exiting wrapper.
+    """
+    result = [
+        binary, "--user", "--quiet", "--unit", unit_name, "--collect", "--pipe",
         "--slice=hermes-workers.slice",
         "--property", "MemoryAccounting=yes",
         "--property=MemoryHigh=3G",
         "--property", f"MemoryMax={_worker_memory_max_bytes()}",
         "--property=TimeoutStopSec=30s",
         "--property", "OOMPolicy=kill",
-        "--", *argv,
     ]
+    if working_directory:
+        result.append(f"--working-directory={working_directory}")
+    if environment:
+        result.extend(
+            f"--setenv={key}={value}"
+            for key, value in environment.items()
+            if "\x00" not in key and "\x00" not in value
+        )
+    return [*result, "--", *argv]
 
 
 def _systemd_scope_cached() -> Optional[bool]:
@@ -261,7 +280,13 @@ def _is_supervised_worker_dispatcher() -> bool:
     return _is_supervised_gateway_process() or _is_systemd_service_main_process()
 
 
-def _build_systemd_scope_argv(shell_argv: List[str], unit_suffix: str) -> List[str]:
+def _build_systemd_scope_argv(
+    shell_argv: List[str],
+    unit_suffix: str,
+    *,
+    working_directory: Optional[str] = None,
+    environment: Optional[Mapping[str, str]] = None,
+) -> List[str]:
     """Wrap *shell_argv* in a ``systemd-run --user --scope`` invocation with its own
     memory accounting, so an OOM in the worker cannot kill the gateway cgroup.
 
@@ -274,14 +299,22 @@ def _build_systemd_scope_argv(shell_argv: List[str], unit_suffix: str) -> List[s
     if binary is None:
         # Caller should have probed availability; never pass None into Popen anyway.
         return shell_argv
-    return _systemd_scope_argv(binary, f"hermes-worker-{unit_suffix}", *shell_argv)
+    return _systemd_scope_argv(
+        binary,
+        f"hermes-worker-{unit_suffix}",
+        *shell_argv,
+        working_directory=working_directory,
+        environment=environment,
+    )
 
 
 _USER_BUS_ENV_KEYS = ("XDG_RUNTIME_DIR", "DBUS_SESSION_BUS_ADDRESS")
 
 
 def restart_safe_supervised_child_argv(
-    command: List[str], *, unit_suffix: str, env: Optional[Dict[str, str]] = None
+    command: List[str], *, unit_suffix: str, env: Optional[Dict[str, str]] = None,
+    working_directory: Optional[str] = None,
+    service_environment: Optional[Mapping[str, str]] = None,
 ) -> List[str]:
     """Place a supervised-systemd child outside its unit's cgroup.
 
@@ -308,7 +341,12 @@ def restart_safe_supervised_child_argv(
             "cannot create restart-safe systemd scope for supervised child: "
             "systemd-run --user --scope is unavailable"
         )
-    scoped = _build_systemd_scope_argv(command, unit_suffix=unit_suffix)
+    scoped = _build_systemd_scope_argv(
+        command,
+        unit_suffix=unit_suffix,
+        working_directory=working_directory,
+        environment=service_environment,
+    )
     if scoped == command:
         raise RuntimeError(
             "cannot create restart-safe systemd scope for supervised child: "
@@ -842,8 +880,10 @@ class ProcessRegistry:
         # This applies to both pipe mode and the PTY path above. See #70716.
         in_supervised_service = _IS_LINUX and _is_supervised_worker_dispatcher()
         if in_supervised_service and _systemd_run_user_scope_available():
-            session.systemd_unit = f"hermes-worker-{unit_suffix}.scope"
-            return _build_systemd_scope_argv(argv, unit_suffix=unit_suffix)
+            session.systemd_unit = f"hermes-worker-{unit_suffix}.service"
+            return _build_systemd_scope_argv(
+                argv, unit_suffix=unit_suffix, working_directory=session.cwd
+            )
         if in_supervised_service:
             # Under a supervisor but no private cgroup: a worker OOM can still take
             # the whole service down.
