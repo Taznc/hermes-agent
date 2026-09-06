@@ -2490,11 +2490,79 @@ def _resolve_systemd_user_bus_env() -> "tuple[str, str]":
     playbook fix (which resolves a *different* user's uid via ``getent
     passwd`` before building the same paths); here we already run as the
     target uid, so ``os.getuid()`` replaces the ``getent`` lookup and the
-    path convention is identical.
+    path convention is identical. Reuses ``hermes_cli.gateway``'s
+    ``_runtime_dir_is_ours`` guard so a leaked ``XDG_RUNTIME_DIR`` from
+    another user (e.g. a root shell where the env still points at
+    ``/run/user/0``, #86558) is never trusted as our own bus directory.
     """
-    xdg = os.environ.get("XDG_RUNTIME_DIR") or f"/run/user/{os.getuid()}"
+    from hermes_cli.gateway import _runtime_dir_is_ours
+
+    uid = os.getuid()  # windows-footgun: ok — POSIX systemd helper, never invoked on Windows
+    xdg = os.environ.get("XDG_RUNTIME_DIR")
+    fallback = f"/run/user/{uid}"
+    if not xdg or not _runtime_dir_is_ours(xdg):
+        xdg = fallback if _runtime_dir_is_ours(fallback) else (xdg or fallback)
     bus = os.environ.get("DBUS_SESSION_BUS_ADDRESS") or f"unix:path={xdg}/bus"
     return xdg, bus
+
+
+def _is_systemd_user_scope_prefix(prefix: list[str]) -> bool:
+    """True if *prefix* is a ``systemd-run --user`` (optionally ``--scope``) launcher entry."""
+    return bool(prefix) and os.path.basename(prefix[0]) == "systemd-run" and "--user" in prefix
+
+
+def _worker_launcher_env_overrides(prefix: list[str]) -> dict[str, str]:
+    """Extra env vars a resolved ``kanban.worker_launcher`` prefix needs on the spawned child.
+
+    ``_systemd_user_bus_reachable`` resolves ``XDG_RUNTIME_DIR``/
+    ``DBUS_SESSION_BUS_ADDRESS`` to decide whether a ``systemd-run --user``
+    launcher entry is usable, but ``systemd-run --user`` itself finds the
+    bus via its OWN process environment at spawn time — resolving the
+    values for the reachability check and then discarding them meant the
+    check could pass (the uid fallback resolves a real, reachable socket)
+    while the actual spawn still failed with "Failed to connect to bus:
+    No medium found", because the child's environment (built by
+    ``build_subprocess_env``, which may already have stripped these vars)
+    never received them. Only fires for a ``systemd-run --user`` launcher
+    entry; every other launcher configuration (or the default ``[]``) is
+    untouched.
+    """
+    if not _is_systemd_user_scope_prefix(prefix):
+        return {}
+    xdg, bus = _resolve_systemd_user_bus_env()
+    return {"XDG_RUNTIME_DIR": xdg, "DBUS_SESSION_BUS_ADDRESS": bus}
+
+
+def _cmd_is_systemd_user_scope_wrapped(command: list[str]) -> bool:
+    """True if *command* is already a ``systemd-run --user --scope`` invocation.
+
+    Used to detect the supervised-gateway topology where
+    ``_restart_safe_worker_argv`` has already placed the worker in its own
+    transient user scope before ``kanban.worker_launcher`` gets a chance to
+    run (B4's order-dependent application) — nesting a second ``--scope``
+    around an already-scoped argv is a no-op wrapper: ``--scope`` is a
+    transparent exec, so the outer invocation execs straight into the
+    inner one and only the inner unit ever registers with systemd, leaving
+    the OUTER (persisted) unit name permanently unresolvable.
+    """
+    if not command or os.path.basename(command[0]) != "systemd-run":
+        return False
+    return "--user" in command and "--scope" in command
+
+
+def _extract_unit_from_systemd_scope_argv(command: list[str]) -> Optional[str]:
+    """Recover the registered unit id (always carrying the ``.scope`` suffix,
+    matching the convention ``systemd-run`` itself uses to register a
+    ``--scope`` unit) from a ``systemd-run --user --scope --unit ...`` argv.
+    """
+    for i, part in enumerate(command):
+        if part == "--unit" and i + 1 < len(command):
+            value = command[i + 1]
+            return value if value.endswith(".scope") else f"{value}.scope"
+        if part.startswith("--unit="):
+            value = part[len("--unit="):]
+            return value if value.endswith(".scope") else f"{value}.scope"
+    return None
 
 
 _SYSTEMD_USER_BUS_WARNED = False
@@ -2551,10 +2619,26 @@ def _apply_worker_launcher(task: Task, command: list[str]) -> "tuple[list[str], 
     flags in config; the dispatcher appends ``--unit=<name>`` and the
     trailing ``-- <command>`` itself so every launcher invocation carries a
     traceable, task-scoped unit name without the operator hand-typing it.
+
+    Double-scope guard: in the supervised-gateway topology,
+    ``_restart_safe_worker_argv`` may have already wrapped *command* in its
+    own ``systemd-run --user --scope``. If the resolved launcher prefix is
+    ALSO a ``systemd-run --user --scope`` invocation, nesting a second one
+    around the first is not a stronger wrap — ``--scope`` is a transparent
+    exec, so the outer ``systemd-run`` execs straight into the inner one
+    and only the INNER unit ever registers with systemd; the outer
+    (persisted) unit name would be permanently unresolvable
+    (``LoadState=not-found``), defeating every termination path that
+    depends on ``tasks.worker_unit`` actually existing. In that case, skip
+    the redundant outer wrap and track the ALREADY-REAL inner unit instead
+    — the worker is still isolated in exactly one scope, and
+    ``worker_unit`` still refers to a unit that genuinely exists.
     """
     prefix = _worker_launcher_prefix()
     if not prefix:
         return command, None
+    if _is_systemd_user_scope_prefix(prefix) and _cmd_is_systemd_user_scope_wrapped(command):
+        return command, _extract_unit_from_systemd_scope_argv(command)
     unit_name = _worker_launcher_unit_name(task)
     argv = [*prefix, f"--unit={unit_name}", "--", *command]
     return argv, unit_name
@@ -2665,6 +2749,17 @@ def _default_spawn(task: Task, workspace: str, *, board: Optional[str] = None) -
     # Popen call below is byte-for-byte identical to before this knob
     # existed.
     cmd, worker_unit = _apply_worker_launcher(task, cmd)
+    # BLOCKER-2 fix: a resolved `systemd-run --user` launcher entry needs
+    # XDG_RUNTIME_DIR/DBUS_SESSION_BUS_ADDRESS in the SPAWNED CHILD's own
+    # environment — `_systemd_user_bus_reachable()` only decides whether the
+    # launcher is usable, it does not propagate the values it resolved into
+    # `env` (which `build_subprocess_env` may already have stripped them
+    # from). Without this, the reachability check can pass (the uid
+    # fallback resolves a real, reachable socket) while the real spawn
+    # still fails with "Failed to connect to bus: No medium found". A no-op
+    # for every other launcher configuration, including the default `[]`.
+    prefix_for_env = _worker_launcher_prefix()
+    env.update(_worker_launcher_env_overrides(prefix_for_env))
     # Mutating the caller's Task lets ``_dispatch_lane_task`` persist the
     # unit name alongside the pid without widening this function's return
     # type — custom ``spawn_fn`` test doubles that never touch this

@@ -38,6 +38,34 @@ from hermes_cli import kanban_db as kb
 from hermes_cli import kanban_db_dispatch as kbd
 
 
+def _ensure_user_bus_env_for_test() -> None:
+    """Inject XDG_RUNTIME_DIR/DBUS_SESSION_BUS_ADDRESS into THIS process's
+    environment when absent, using the same resolution
+    ``kanban_db_dispatch._resolve_systemd_user_bus_env`` uses for a real
+    worker spawn.
+
+    B5 history (round 2): the mandated test runner (``scripts/run_tests.sh``)
+    execs every file under a hermetic ``env -i`` for CI parity, which strips
+    both bus variables even on a host where ``systemd-run --user --scope``
+    demonstrably works — so this file silently skipped all 4 tests under
+    that runner while a bare, forbidden ``pytest`` invocation (which inherits
+    the real shell environment) made them pass, reproducing the exact
+    false-green shape B5 was originally filed for. The probe AND the real
+    spawn both resolve the bus from THIS process's environment, so setting
+    it here (mirroring the production fix in ``_worker_launcher_env_overrides``)
+    makes the test genuinely exercise the real mechanism under the hermetic
+    runner instead of masking the gap with a looser one.
+    """
+    if os.environ.get("XDG_RUNTIME_DIR") and os.environ.get("DBUS_SESSION_BUS_ADDRESS"):
+        return
+    xdg, bus = kbd._resolve_systemd_user_bus_env()
+    os.environ.setdefault("XDG_RUNTIME_DIR", xdg)
+    os.environ.setdefault("DBUS_SESSION_BUS_ADDRESS", bus)
+
+
+_ensure_user_bus_env_for_test()
+
+
 def _systemd_user_scope_available() -> bool:
     from tools import process_registry
 
