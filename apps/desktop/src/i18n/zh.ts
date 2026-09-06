@@ -3447,6 +3447,11 @@ export const zhAuthored: Translations = withForkKeys(forkZh, {
       address: '地址',
       addressPlaceholder: '输入地址',
       blankPageBody: '在上方输入地址开始浏览，或让 Hermes 打开一个页面。',
+      noGuestTitle: '页面将在浏览器标签页中打开',
+      noGuestBody:
+        '此版本的 Hermes 在浏览器中运行，无法在面板内嵌入其他网站。在上方输入地址，Hermes 会在新的浏览器标签页中打开它。',
+      noGuestOpen: url => `在浏览器标签页中打开 ${url}`,
+      openBlocked: '浏览器阻止了新标签页。请为此页面允许弹出窗口后重试。',
       finishedRestarting: message => `Hermes 已完成预览服务器重启${message ? `: ${message}` : ''}`,
       failedRestarting: message => `服务器重启失败：${message}`,
       unknownError: '未知错误',
