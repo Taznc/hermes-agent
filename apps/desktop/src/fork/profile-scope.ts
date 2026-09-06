@@ -69,7 +69,26 @@ export function forkScopeChangedBackend(previous: string, next: string): boolean
  * the module graph acyclic at import.
  */
 export function wipeForkScopedSessionLists(): void {
-  void import('@/store/gateway-switch').then(m => {
-    m.wipeSessionListsForGatewaySwitch()
-  })
+  void import('@/store/gateway-switch')
+    .then(m => {
+      m.wipeSessionListsForGatewaySwitch()
+    })
+    .catch(err => {
+      // Best-effort cleanup: a failure here (e.g. a torn-down/partially
+      // mocked dependency in a test, or a genuinely broken store during a
+      // real switch) must not become an unhandled rejection. This import is
+      // deliberately fire-and-forget (see the module-cycle note above), so
+      // there is no caller left to catch it — an uncaught rejection here
+      // doesn't surface at the site that logically owns it; it surfaces
+      // async, in whatever code (often an unrelated test file) happens to be
+      // running when the promise settles (#t_fc026713 — same "unowned async
+      // work outliving its trigger" class as the local-runtime-jobs poll
+      // loop and store/projects.ts's syncReposScanning subscription). Wiping
+      // the previous backend's session rows is a nice-to-have during a
+      // switch — the next refresh reconciles the list regardless — so
+      // swallowing here is the correct behavior, not just the safe one.
+      if (import.meta.env.DEV) {
+        console.error('wipeForkScopedSessionLists failed', err)
+      }
+    })
 }

@@ -21,7 +21,33 @@ export const GATING_CLEARED: ReadonlySet<string> = new Set(['done', 'archived'])
 
 export const isGating = (status: string): boolean => !GATING_CLEARED.has(status)
 
-/** Flatten every column into one id→task index. */
+/** A card's identity is the (board, id) PAIR, never the bare id. `GET
+ *  /board/all` says so outright — *"task ids are only unique per board —
+ *  clients key on the pair"* — and the merged All Boards index drives
+ *  mutation routing, so two cards sharing an id must not collapse onto one
+ *  board's row (that is the one path that could send a delete to the wrong
+ *  board's DB).
+ *
+ *  In single-board mode a task carries no `board`, so the key IS the bare id
+ *  and every single-board path is byte-for-byte unchanged. The separator is
+ *  NUL because a board slug is a filesystem-safe identifier that can never
+ *  contain one, so no (board, id) pair can be spelled two ways. */
+export const cardKey = (id: string, board?: null | string): string => (board ? `${board}\u0000${id}` : id)
+
+/** `cardKey` for a task that already knows its own board. */
+export const taskCardKey = (task: Pick<KanbanTask, 'board' | 'id'>): string => cardKey(task.id, task.board)
+
+/** Split a `cardKey` back into its parts, so a surface holding only a key
+ *  (the open-drawer pointer, a focused card) can still route by board without
+ *  a second index lookup that a refresh may have invalidated. */
+export function parseCardKey(key: string): { board?: string; id: string } {
+  const at = key.indexOf('\u0000')
+
+  return at === -1 ? { id: key } : { board: key.slice(0, at), id: key.slice(at + 1) }
+}
+
+/** Flatten every column into one cardKey→task index (see `cardKey`: the key
+ *  is `board + id` in All Boards mode, the bare id in single-board mode). */
 export function indexBoard(board: KanbanBoard | undefined): Map<string, KanbanTask> {
   const index = new Map<string, KanbanTask>()
 
@@ -31,19 +57,25 @@ export function indexBoard(board: KanbanBoard | undefined): Map<string, KanbanTa
 
   for (const column of board.columns) {
     for (const task of column.tasks) {
-      index.set(task.id, task)
+      index.set(taskCardKey(task), task)
     }
   }
 
   return index
 }
 
-/** Resolve raw link ids against the board index. Ids the board doesn't have
- *  still produce a row (flagged `missing`) — a dangling link is exactly the
- *  thing the user needs to see so they can cut it. */
-export function resolveLinks(ids: string[], index: Map<string, KanbanTask>): ResolvedLink[] {
+/** Resolve raw link ids against the board index. `board` scopes the lookup to
+ *  the linked task's own board — links only ever exist within one board, so a
+ *  drawer open on a `homelab` card resolves its blocker ids against `homelab`
+ *  rows even while the merged All Boards index also holds a same-id card from
+ *  somewhere else. Omit it in single-board mode (keys are bare ids there).
+ *
+ *  Ids the board doesn't have still produce a row (flagged `missing`) — a
+ *  dangling link is exactly the thing the user needs to see so they can cut
+ *  it. */
+export function resolveLinks(ids: string[], index: Map<string, KanbanTask>, board?: null | string): ResolvedLink[] {
   return ids.map(id => {
-    const task = index.get(id)
+    const task = index.get(cardKey(id, board))
 
     return task
       ? { id, title: task.title, status: task.status, assignee: task.assignee, missing: false }
@@ -70,7 +102,11 @@ export function partitionBlockers(links: ResolvedLink[]): { gating: ResolvedLink
 }
 
 /** Adjacency built once per board payload, then shared by every card.
- *  `blockedBy`: who gates this task. `blocking`: who waits on it. */
+ *  `blockedBy`: who gates this task. `blocking`: who waits on it.
+ *
+ *  Both maps are keyed by `cardKey` (board + id in All Boards mode, bare id
+ *  in single-board mode) and hold `cardKey`s, so a chain never crosses from
+ *  one board's card onto a same-id card from another board. */
 export interface DependencyGraph {
   blockedBy: Map<string, string[]>
   blocking: Map<string, string[]>
@@ -78,21 +114,46 @@ export interface DependencyGraph {
 
 const EMPTY: readonly string[] = []
 
+/** Normalize one `link_edges` row to `[parentKey, childKey]`, or null when the
+ *  row is unusable. Two wire shapes exist and both are supported here rather
+ *  than at every call site:
+ *
+ *  - single-board `GET /board`: `[parent_id, child_id]` — no board, bare ids;
+ *  - consolidated `GET /board/all`: `{board, parent, child}` — the owning
+ *    board travels with the edge, and links only ever exist WITHIN a board.
+ *
+ *  Silently dropping the object form (the old `Array.isArray` guard did) left
+ *  the All Boards view with `hasEdges === true` and an empty graph, so every
+ *  card claimed zero blockers and focus mode lit nothing. */
+function edgeKeys(edge: unknown): null | [string, string] {
+  if (Array.isArray(edge)) {
+    const [parent, child] = edge
+
+    return parent && child ? [cardKey(parent as string), cardKey(child as string)] : null
+  }
+
+  if (edge && typeof edge === 'object') {
+    const { board, child, parent } = edge as { board?: null | string; child?: string; parent?: string }
+
+    return parent && child ? [cardKey(parent, board), cardKey(child, board)] : null
+  }
+
+  return null
+}
+
 export function buildGraph(board: KanbanBoard | undefined): DependencyGraph {
   const blockedBy = new Map<string, string[]>()
   const blocking = new Map<string, string[]>()
 
   for (const edge of board?.link_edges ?? []) {
     // Defensive: tolerate a malformed row rather than throwing mid-render.
-    if (!Array.isArray(edge) || edge.length < 2) {
+    const keys = edgeKeys(edge)
+
+    if (!keys) {
       continue
     }
 
-    const [parent, child] = edge
-
-    if (!parent || !child) {
-      continue
-    }
+    const [parent, child] = keys
 
     const parents = blockedBy.get(child)
     parents ? parents.push(parent) : blockedBy.set(child, [parent])
@@ -104,9 +165,9 @@ export function buildGraph(board: KanbanBoard | undefined): DependencyGraph {
   return { blockedBy, blocking }
 }
 
-export const upstreamOf = (graph: DependencyGraph, id: string): readonly string[] => graph.blockedBy.get(id) ?? EMPTY
+export const upstreamOf = (graph: DependencyGraph, key: string): readonly string[] => graph.blockedBy.get(key) ?? EMPTY
 
-export const downstreamOf = (graph: DependencyGraph, id: string): readonly string[] => graph.blocking.get(id) ?? EMPTY
+export const downstreamOf = (graph: DependencyGraph, key: string): readonly string[] => graph.blocking.get(key) ?? EMPTY
 
 /** How a card's blockers stand, for the footer chips. `total` counts links,
  *  `gating` counts the ones not yet done — so `total > 0 && gating === 0` is
@@ -119,9 +180,9 @@ export interface BlockerStand {
 export function blockerStand(
   graph: DependencyGraph,
   index: Map<string, KanbanTask>,
-  id: string
+  key: string
 ): BlockerStand {
-  const parents = upstreamOf(graph, id)
+  const parents = upstreamOf(graph, key)
   let gating = 0
 
   for (const parent of parents) {
@@ -141,10 +202,10 @@ export function blockerStand(
  *  everything, which defeats the point of dimming. */
 export function focusSets(
   graph: DependencyGraph,
-  id: string
+  key: string
 ): { upstream: Set<string>; downstream: Set<string> } {
   return {
-    upstream: new Set(upstreamOf(graph, id)),
-    downstream: new Set(downstreamOf(graph, id))
+    upstream: new Set(upstreamOf(graph, key)),
+    downstream: new Set(downstreamOf(graph, key))
   }
 }

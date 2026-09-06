@@ -1957,10 +1957,15 @@ def set_orchestration_settings(payload: OrchestrationSettingsBody):
     return get_orchestration_settings()  # callers re-render from the resolved state
 
 
-# --- WebSocket: /events?since=<event_id>&board=<slug> ------------------------
+# --- WebSocket: /events?since=<event_id>&board=<slug>  (or ?boards=<csv|*>&cursors=<json>) --
 
 # Event tail poll interval: WAL + 300 ms polling is the simplest robust approach (negligible CPU).
 _EVENT_POLL_SECONDS = 0.3
+
+# Cap the number of boards one socket tails — an unbounded ``boards=*`` on a fleet with many
+# boards would open that many SQLite connections on a single request. The dashboard has a
+# handful of boards in practice; this is a safety rail, not a tuned limit.
+_MAX_TAILED_BOARDS = 25
 
 
 def _int_param(ws: WebSocket, name: str) -> int:
@@ -1975,6 +1980,50 @@ def _ws_board(raw: Optional[str]) -> Optional[str]:
         return kanban_db._normalize_board_slug(raw) if raw else None
     except ValueError:
         return None
+
+
+def _ws_boards_param(raw: Optional[str]) -> Optional[list[str]]:
+    """Resolve ``?boards=`` into an ordered, deduped, capped slug list, or ``None`` when the
+    param is absent (selecting the legacy single-board path). ``boards=*`` means every board
+    currently on disk; a CSV list is normalized/filtered the same way a single ``board=`` is."""
+    if raw is None:
+        return None
+    if raw.strip() == "*":
+        slugs = [meta["slug"] for meta in kanban_db.list_boards(include_archived=False)]
+    else:
+        slugs = []
+        for part in raw.split(","):
+            try:
+                normed = kanban_db._normalize_board_slug(part)
+            except ValueError:
+                normed = None
+            if normed and normed not in slugs:
+                slugs.append(normed)
+    if len(slugs) > _MAX_TAILED_BOARDS:
+        log.warning("kanban /events: boards=%r requested %d boards, capping to %d", raw, len(slugs), _MAX_TAILED_BOARDS)
+        slugs = slugs[:_MAX_TAILED_BOARDS]
+    return slugs
+
+
+def _ws_cursors_param(raw: Optional[str]) -> dict[str, int]:
+    """Parse the per-board cursor seed map. Malformed/missing input degrades to ``{}`` (every
+    board starts from 0) rather than failing the handshake — a bad seed costs a one-time replay,
+    never a broken connection."""
+    if not raw:
+        return {}
+    try:
+        parsed = json.loads(raw)
+    except Exception:
+        return {}
+    if not isinstance(parsed, dict):
+        return {}
+    out: dict[str, int] = {}
+    for key, value in parsed.items():
+        try:
+            out[str(key)] = int(value)
+        except (TypeError, ValueError):
+            continue
+    return out
 
 
 class _EventTail:
@@ -2024,12 +2073,100 @@ class _EventTail:
             self._executor.shutdown(wait=True, cancel_futures=True)
 
 
+class _MultiEventTail:
+    """Multi-board ``task_events`` tailer for the ``boards=`` fan-out path (consolidated All
+    Boards view). Holds one thread-affine SQLite connection PER requested board, but all of
+    them are opened/polled/closed on the SAME single-worker executor the single-board
+    ``_EventTail`` uses — one executor for the whole socket, never a pool per board.
+
+    A board that raises mid-poll (locked/corrupt DB) is isolated: its connection is dropped
+    and that board is skipped on every subsequent poll, so one bad board never kills the
+    stream for the others — mirroring ``GET /board/all``'s per-board try/except."""
+
+    def __init__(self, boards: list[str]) -> None:
+        self._boards = boards
+        self._conns: dict[str, sqlite3.Connection] = {}
+        self._dead: set[str] = set()  # boards that errored; skipped on later polls
+        self._executor: Optional[ThreadPoolExecutor] = None
+
+    def _fetch_one(self, board: str, cursor: int) -> tuple[int, list[dict]]:
+        conn = self._conns.get(board)
+        if conn is None:
+            conn = kbc.connect(board=board)
+            self._conns[board] = conn
+        rows = conn.execute(
+            "SELECT id, task_id, run_id, kind, payload, created_at "
+            "FROM task_events WHERE id > ? ORDER BY id ASC LIMIT 200",
+            (cursor,)).fetchall()
+        out: list[dict] = []
+        for r in rows:
+            try:
+                payload = json.loads(r["payload"]) if r["payload"] else None
+            except Exception:
+                payload = None
+            out.append({**dict(r), "payload": payload, "board": board})
+        return (rows[-1]["id"] if rows else cursor), out
+
+    def _fetch_all(self, cursors: dict[str, int]) -> tuple[dict[str, int], list[dict]]:
+        """Runs on the single worker thread: poll every live board in turn."""
+        events: list[dict] = []
+        new_cursors = dict(cursors)
+        for board in self._boards:
+            if board in self._dead:
+                continue
+            try:
+                new_cursor, board_events = self._fetch_one(board, cursors.get(board, 0))
+            except Exception as exc:
+                log.warning("kanban /events: board %r failed mid-stream, dropping it from this socket: %s", board, exc)
+                self._dead.add(board)
+                conn = self._conns.pop(board, None)
+                if conn is not None:
+                    try:
+                        conn.close()
+                    except Exception:
+                        pass
+                continue
+            new_cursors[board] = new_cursor
+            events.extend(board_events)
+        return new_cursors, events
+
+    def _close_all(self) -> None:
+        for conn in self._conns.values():
+            try:
+                conn.close()
+            except Exception:
+                pass
+        self._conns.clear()
+
+    async def poll(self, cursors: dict[str, int]) -> tuple[dict[str, int], list[dict]]:
+        if self._executor is None:
+            self._executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="kanban-events")
+        return await asyncio.get_running_loop().run_in_executor(self._executor, self._fetch_all, cursors)
+
+    async def shutdown(self) -> None:
+        if self._executor is None:
+            return
+        try:
+            await asyncio.get_running_loop().run_in_executor(self._executor, self._close_all)
+        except Exception as exc:
+            log.warning("Kanban multi-board event stream connection cleanup failed: %s", exc)
+        finally:
+            self._executor.shutdown(wait=True, cancel_futures=True)
+
+
 @router.websocket("/events")
 async def stream_events(ws: WebSocket):
     if not _ws_upgrade_authorized(ws):
         await ws.close(code=http_status.WS_1008_POLICY_VIOLATION)
         return
     await ws.accept()
+    # ``boards=`` selects the NEW multi-board fan-out path, kept entirely separate from the
+    # legacy single-board loop below so that loop's frame shape never changes for existing
+    # clients that never send ``boards=``.
+    boards = _ws_boards_param(ws.query_params.get("boards"))
+    if boards is not None:
+        await _stream_events_multi(ws, boards)
+        return
     # Board is pinned at the handshake; the UI opens a new WS on board change
     # rather than reconciling two cursors mid-stream.
     tail = _EventTail(_ws_board(ws.query_params.get("board")))
@@ -2053,6 +2190,40 @@ async def stream_events(ws: WebSocket):
         return  # normal shutdown; CancelledError is a BaseException the handler below wouldn't quiet
     except Exception as exc:  # never crash the dashboard worker
         log.warning("Kanban event stream error: %s", exc)
+        try:
+            await ws.close()
+        except Exception:
+            pass
+    finally:
+        await tail.shutdown()
+
+
+async def _stream_events_multi(ws: WebSocket, boards: list[str]) -> None:
+    """``boards=<csv>`` / ``boards=*`` fan-out: tails N boards on this ONE socket. Cursors seed
+    from ``?cursors=<json>`` (the ``/board/all`` payload's ``cursors`` map — resumes exactly
+    where the initial fetch ended, no gap, no replay). Frame shape is the new contract
+    ``{"events": [{"board": ..., ...}], "cursors": {...}}``; kept in its own loop rather than
+    retrofitted into the single-board one above so that one's byte-identical frame is never at
+    risk of drifting."""
+    tail = _MultiEventTail(boards)
+    cursors = _ws_cursors_param(ws.query_params.get("cursors"))
+    try:
+        while True:
+            try:
+                msg = await asyncio.wait_for(ws.receive(), timeout=_EVENT_POLL_SECONDS)
+                if msg["type"] == "websocket.disconnect":
+                    return
+            except asyncio.TimeoutError:
+                pass  # no client message — poll the DBs
+            cursors, events = await tail.poll(cursors)
+            if events:
+                await ws.send_json({"events": events, "cursors": cursors})
+    except WebSocketDisconnect:
+        return
+    except asyncio.CancelledError:
+        return  # normal shutdown; CancelledError is a BaseException the handler below wouldn't quiet
+    except Exception as exc:  # never crash the dashboard worker
+        log.warning("Kanban multi-board event stream error: %s", exc)
         try:
             await ws.close()
         except Exception:

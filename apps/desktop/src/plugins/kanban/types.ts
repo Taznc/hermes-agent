@@ -43,9 +43,13 @@ export interface KanbanBoard {
   columns: KanbanColumn[]
   tenants: string[]
   assignees: string[]
-  /** Every dependency edge on the board as `[parent_id, child_id]` — the
-   *  parent BLOCKS the child. Absent on older backends, so always guard. */
-  link_edges?: Array<[string, string]>
+  /** Every dependency edge on the board — the parent BLOCKS the child.
+   *  Absent on older backends, so always guard. Two shapes, one per endpoint:
+   *  single-board `GET /board` sends `[parent_id, child_id]` tuples, while the
+   *  consolidated `GET /board/all` sends `{board, parent, child}` objects so
+   *  each edge carries the board its two ids belong to (ids are only unique
+   *  per board). `buildGraph` in deps.ts normalizes both. */
+  link_edges?: Array<[string, string] | BoardAllLinkEdge>
   latest_event_id: number
   now: number
   /** Present only when this payload came from the consolidated All Boards
@@ -78,6 +82,15 @@ export interface BoardAllInfo {
 export interface BoardAllError {
   board: string
   detail: string
+}
+
+/** One dependency edge from `GET /board/all`. Both ids belong to `board` —
+ *  links only ever exist within one board's DB — which is what lets the
+ *  merged client index key the chain on the (board, id) pair. */
+export interface BoardAllLinkEdge {
+  board: string
+  parent: string
+  child: string
 }
 
 /** A dependency resolved against the board cache for display: the linked

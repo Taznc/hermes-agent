@@ -116,7 +116,8 @@ describe('new-task dialog: paste-to-upload images', () => {
 
     await waitFor(() => expect(stageAttachmentMock).toHaveBeenCalledTimes(1))
     expect(stageAttachmentMock).toHaveBeenCalledWith(
-      expect.objectContaining({ contentType: 'image/png', filename: 'screenshot.png' })
+      expect.objectContaining({ contentType: 'image/png', filename: 'screenshot.png' }),
+      undefined
     )
 
     // Preview thumbnail rendered from the staged attachment.
@@ -161,7 +162,9 @@ describe('new-task dialog: paste-to-upload images', () => {
 
     fireEvent.click(screen.getByLabelText('removeImage'))
 
-    expect(deleteStagedAttachmentMock).toHaveBeenCalledWith('st_1')
+    // Second arg is the board the token was staged against — undefined in
+    // single-board mode, where the server resolves its own current board.
+    expect(deleteStagedAttachmentMock).toHaveBeenCalledWith('st_1', undefined)
     await waitFor(() => expect(screen.queryByAltText('screenshot.png')).toBeNull())
   })
 

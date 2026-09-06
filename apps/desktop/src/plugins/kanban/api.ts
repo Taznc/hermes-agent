@@ -42,6 +42,13 @@ type Socket = (path: string, onMessage: (data: unknown) => void) => () => void
 
 let rest: null | Rest = null
 let os: null | PluginOs = null
+let socketDoor: null | Socket = null
+let closeEventsSocket: (() => void) | null = null
+// Whether the multi-board `boards=*` socket has been opened for the CURRENT All Boards
+// session (reset whenever `$boardSlug` changes). Guards against re-opening on every 60s
+// poll refetch — the socket already advances its own cursor live; reseeding from a stale
+// fetch would reset it backwards and could re-fire notifications for already-seen events.
+let allBoardsPrimed = false
 
 /** Selected board slug ('' = the server's current board). Persisted. */
 export const $boardSlug = atom<string>('')
@@ -100,6 +107,46 @@ function onEventsFrame(slug: string, data: unknown): void {
   void onKanbanEventsFrame(slug, events).catch(() => undefined)
 }
 
+/** The multi-board twin of `onEventsFrame`, for frames from the `boards=*` socket (the
+ *  consolidated All Boards view). Each event on the frame carries its OWN `board` field (see
+ *  the backend's `_MultiEventTail`), so per-task cache invalidation and per-board notification
+ *  baselines route correctly even though every card in this view shares one query cache entry
+ *  keyed on the `ALL_BOARDS` sentinel (matching how `board.tsx`/`drawer.tsx` key their queries
+ *  in this mode — see `taskKey(ALL_BOARDS, id)` in `drawer.tsx`). */
+function onEventsFrameMulti(data: unknown): void {
+  const events = (data as { events?: CompletionEvent[] })?.events
+
+  if (!events?.length) {
+    return
+  }
+
+  void queryClient.invalidateQueries({ queryKey: boardKey(ALL_BOARDS, false) })
+  void queryClient.invalidateQueries({ queryKey: boardKey(ALL_BOARDS, true) })
+  void queryClient.invalidateQueries({ queryKey: BOARDS_KEY })
+
+  const byBoard = new Map<string, CompletionEvent[]>()
+
+  for (const event of events) {
+    if (event.task_id) {
+      void queryClient.invalidateQueries({ queryKey: taskKey(ALL_BOARDS, event.task_id) })
+    }
+
+    if (event.board) {
+      const bucket = byBoard.get(event.board) ?? []
+
+      bucket.push(event)
+      byBoard.set(event.board, bucket)
+    }
+  }
+
+  // Notify per-board: `onKanbanEventsFrame`'s baseline/cursor tracking is keyed by board slug,
+  // so a merged frame is split back apart before it's fed in — never notify against the '*'
+  // sentinel itself, which has no baseline (`onKanbanEventsFrame` suppresses empty slugs).
+  for (const [board, boardEvents] of byBoard) {
+    void onKanbanEventsFrame(board, boardEvents).catch(() => undefined)
+  }
+}
+
 // A persisted, subscribable atom (the structural slice we need — avoids
 // importing nanostore's type just to describe one).
 interface Persisted<T> {
@@ -110,10 +157,10 @@ interface Persisted<T> {
 
 /** Bind the plugin's doors at register time and return a disposer the host
  *  runs on unload/disable — so nothing (store sync, socket) survives a toggle
- *  or duplicates on re-enable. The events socket is pinned to a board at
- *  handshake, so a board switch closes + reopens it. The All Boards sentinel
- *  has no live-events fan-out yet (a named follow-on card) — the socket
- *  simply stays closed while it's selected; the board still polls. */
+ *  or duplicates on re-enable. The single-board events socket is pinned to a
+ *  board at handshake, so a board switch closes + reopens it. The All Boards
+ *  sentinel opens the MULTI-board socket (`boards=*`) instead, seeded from
+ *  `/board/all`'s `cursors` map via `primeAllBoardsSocket` — see `board.tsx`. */
 export function bindApi(
   r: Rest,
   storage: PluginStorage,
@@ -122,6 +169,7 @@ export function bindApi(
 ): () => void {
   rest = r
   os = notifyDoors?.os ?? null
+  socketDoor = socket
   bindCompletionNotify(r, notifyDoors?.t, notifyDoors?.os)
   const unsubs: Array<() => void> = []
 
@@ -137,13 +185,16 @@ export function bindApi(
   persist($collapsedLanes, COLLAPSED_KEY, {})
   persist($hiddenBoards, HIDDEN_BOARDS_KEY, {})
 
-  let close: (() => void) | null = null
-
   const open = (slug: string) => {
-    close?.()
-    close =
+    // A board switch (including into/out of the sentinel) always invalidates any prior
+    // priming — the next All Boards selection must re-seed its cursors from a fresh
+    // `/board/all` fetch, never resume the OLD selection's cursor map.
+    allBoardsPrimed = false
+    closeEventsSocket?.()
+
+    closeEventsSocket =
       slug === ALL_BOARDS
-        ? null
+        ? null // opened lazily once fetchAllBoards resolves — see primeAllBoardsSocket
         : socket(slug ? `/events?board=${encodeURIComponent(slug)}` : '/events', data => onEventsFrame(slug, data))
   }
 
@@ -152,10 +203,35 @@ export function bindApi(
 
   return () => {
     unsubs.forEach(unsub => unsub())
-    close?.()
+    closeEventsSocket?.()
+    closeEventsSocket = null
+    socketDoor = null
+    allBoardsPrimed = false
     rest = null
     os = null
   }
+}
+
+/** Open the multi-board events socket for the All Boards view, seeded from the `cursors` map
+ *  `GET /board/all` returned — so the socket resumes exactly where that fetch ended, no gap,
+ *  no replay (the decided design in the WS follow-on card). Idempotent per All-Boards
+ *  session, guarded by `allBoardsPrimed`: safe to call on every poll refetch (`board.tsx` does),
+ *  but only the FIRST call after selecting the sentinel actually opens a socket — reseeding on
+ *  every poll would reset the live cursor backwards to that poll's snapshot and could re-fire
+ *  notifications for events the socket already delivered. `bindApi`'s `open()` resets the guard
+ *  whenever the board selection changes, so the next `ALL_BOARDS` selection primes fresh.
+ *  No-op outside All Boards mode or before `bindApi` has bound a socket door. */
+export function primeAllBoardsSocket(cursors: Record<string, number>): void {
+  if (allBoardsPrimed || $boardSlug.get() !== ALL_BOARDS || !socketDoor) {
+    return
+  }
+
+  allBoardsPrimed = true
+  closeEventsSocket?.()
+  closeEventsSocket = socketDoor(
+    `/events?boards=*&cursors=${encodeURIComponent(JSON.stringify(cursors))}`,
+    onEventsFrameMulti
+  )
 }
 
 /** The plugin's OS door, for components too deep to be handed `ctx`. Null
@@ -295,8 +371,15 @@ function nudged<T>(write: Promise<T>, board?: string): Promise<T> {
 export const patchTask = (id: string, patch: Record<string, unknown>, board?: string) =>
   nudged(call(boardPath(`/tasks/${id}`, board), { method: 'PATCH', body: patch }), board)
 
-export const createTask = (body: Record<string, unknown>) =>
-  nudged(call<{ task: KanbanTask | null; warning?: string }>(withBoard('/tasks'), { method: 'POST', body }))
+/** `board` pins the new task to a specific board. Required from the
+ *  consolidated All Boards view: without it `withBoard` drops the sentinel and
+ *  the server silently creates the card on whatever board happens to be
+ *  ACTIVE, with nothing in the UI saying which. */
+export const createTask = (body: Record<string, unknown>, board?: string) =>
+  nudged(
+    call<{ task: KanbanTask | null; warning?: string }>(boardPath('/tasks', board), { method: 'POST', body }),
+    board
+  )
 
 // Deleting can unblock dependants (a gone parent no longer gates), so it
 // nudges too.
@@ -368,14 +451,19 @@ export const fetchAttachmentDataUrl = (id: number | string, board?: string) =>
 
 /** Upload a pasted image before the task exists (new-task dialog paste flow).
  *  Returns a `token` that travels in `pending_attachment_tokens` on
- *  `createTask` and is promoted into a real attachment server-side. */
-export const stageAttachment = (upload: { filename: string; contentType?: string; bytes: ArrayBuffer }) =>
-  call<{ attachment: StagedAttachment }>(withBoard('/attachments/staged'), { method: 'POST', upload })
+ *  `createTask` and is promoted into a real attachment server-side. Staged
+ *  blobs live in the TARGET board's own staging DB, so `board` must match the
+ *  board the task will be created on or the token won't resolve at promotion. */
+export const stageAttachment = (
+  upload: { filename: string; contentType?: string; bytes: ArrayBuffer },
+  board?: string
+) => call<{ attachment: StagedAttachment }>(boardPath('/attachments/staged', board), { method: 'POST', upload })
 
 /** Remove a staged (pre-submit) image — used by the remove (×) button and by
- *  best-effort cleanup when the new-task dialog closes without submitting. */
-export const deleteStagedAttachment = (token: string) =>
-  call(withBoard(`/attachments/staged/${encodeURIComponent(token)}`), { method: 'DELETE' })
+ *  best-effort cleanup when the new-task dialog closes without submitting.
+ *  `board` must be the board the token was staged against. */
+export const deleteStagedAttachment = (token: string, board?: string) =>
+  call(boardPath(`/attachments/staged/${encodeURIComponent(token)}`, board), { method: 'DELETE' })
 
 export const createBoard = (slug: string, name: string, projectId?: string) =>
   call<{ board: { slug: string } }>('/boards', {
