@@ -6,19 +6,12 @@
  *
  * "Resume at reset" schedules a ONE-SHOT cron job via the existing
  * ISO-timestamp `createCronJob` path (cron/jobs.py already turns an ISO
- * schedule into `repeat: 1`) rather than inventing a new timer. What that
- * job's action can actually DO today is limited: cron has no "resume this
- * exact session and retry its last turn" primitive yet (see the linked
- * backend follow-up card, t_35e7ea9f) — every job spawns its own fresh
- * agent session. Until that seam lands, the scheduled job's prompt is an
- * honest, session-scoped instruction ("resume session <id>, retry the last
- * turn") that a capable agent run can act on; the card and this module never
- * claim a guaranteed resume, only that a job was scheduled for the given
- * time. `attach_to_session` is left on so that, for sessions whose origin
- * IS resolvable (messaging platforms), the run's own output still lands
- * back in the right place — for a bare local Desktop session (no
- * platform/chat_id origin) that mirroring is a no-op, matching current
- * backend capability rather than pretending otherwise.
+ * schedule into `repeat: 1`) rather than inventing a new timer. Its
+ * `resume_session_id` targets the failed session, so cron resumes that exact
+ * session and submits the retry instruction there instead of spawning a
+ * separate cron conversation. The resumed session's transcript is the real
+ * deliverable; cron suppresses its own redundant delivery, so this job does
+ * not need `attach_to_session`.
  */
 
 import { atom } from 'nanostores'
@@ -27,6 +20,8 @@ import { createCronJob, deleteCronJob, getCronJobs, getHermesConfigRecord, saveH
 import type { CronJob, CronJobCreatePayload, HermesConfigRecord } from '@/types/hermes'
 
 import { clearSessionRateLimited, markSessionRateLimited } from './session-dot-state'
+
+const RESUME_RETRY_PROMPT = 'Retry the last failed turn now that the provider rate limit has reset.'
 
 export type RateLimitDefaultRecovery = 'ask' | 'resume_at_reset'
 
@@ -149,11 +144,8 @@ export async function scheduleResumeAtReset(
     schedule: iso,
     name: resumeJobName(messageId),
     deliver: 'local',
-    prompt:
-      `Resume Hermes session ${sessionId}: its last turn ended on a provider rate ` +
-      'limit and the reset window has now passed. If a resume/continue capability ' +
-      'is available for that exact session, use it to retry the last turn; ' +
-      'otherwise note plainly that this session still needs a manual resume.'
+    prompt: RESUME_RETRY_PROMPT,
+    resume_session_id: sessionId
   }
 
   const job = await createCronJob(payload)
