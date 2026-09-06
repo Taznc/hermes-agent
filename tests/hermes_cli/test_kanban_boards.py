@@ -100,12 +100,27 @@ class TestPathResolution:
         assert p == fresh_home / "kanban" / "boards" / "atm10-server" / "kanban.db"
 
 
-    def test_env_var_db_override_still_wins(self, fresh_home, tmp_path, monkeypatch):
-        """``HERMES_KANBAN_DB`` pins the file regardless of board= arg."""
-        forced = tmp_path / "custom.db"
-        monkeypatch.setenv("HERMES_KANBAN_DB", str(forced))
-        assert kb.kanban_db_path() == forced
-        assert kb.kanban_db_path(board="ignored") == forced
+    def test_explicit_board_beats_env_path_pin(self, fresh_home, tmp_path, monkeypatch):
+        """An explicit board must not be redirected by a worker's inherited pin."""
+        pinned_db = tmp_path / "pinned" / "kanban.db"
+        pinned_workspaces = tmp_path / "pinned" / "workspaces"
+        monkeypatch.setenv("HERMES_KANBAN_DB", str(pinned_db))
+        monkeypatch.setenv("HERMES_KANBAN_WORKSPACES_ROOT", str(pinned_workspaces))
+
+        assert kb.kanban_db_path() == pinned_db
+        assert kb.workspaces_root() == pinned_workspaces
+        assert kb.kanban_db_path(board="target") == (
+            fresh_home / "kanban" / "boards" / "target" / "kanban.db"
+        )
+        assert kb.workspaces_root(board="target") == (
+            fresh_home / "kanban" / "boards" / "target" / "workspaces"
+        )
+        # The CLI represents ``--board target`` as a context-local explicit
+        # override, so it must have the same precedence as ``board=target``.
+        with kb.scoped_current_board("target"):
+            assert kb.kanban_db_path() == (
+                fresh_home / "kanban" / "boards" / "target" / "kanban.db"
+            )
 
 
 # ---------------------------------------------------------------------------

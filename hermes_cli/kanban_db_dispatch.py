@@ -1587,8 +1587,8 @@ def count_running_tasks_other_boards(board: Optional[str] = None) -> int:
 
     Caps bound the HOST, but each board's tick only sees its own DB; without
     this a derived cap of N gets multiplied by the number of active boards.
-    Boards are matched by resolved DB path, so ``HERMES_KANBAN_DB`` (pins every
-    board to one file) yields 0. Fails open per board.
+    Boards are matched by resolved DB path. An explicit board slug always resolves
+    to that board, even when this process inherited ``HERMES_KANBAN_DB``.
     """
     try:
         current_path = str(_kb.kanban_db_path(board=board).expanduser().resolve())
