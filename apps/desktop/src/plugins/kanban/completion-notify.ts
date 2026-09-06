@@ -39,6 +39,10 @@ export interface CompletionEvent {
   task_id?: string
   kind?: string
   payload?: Record<string, unknown> | null
+  /** Present only on frames from the multi-board ``/events?boards=`` socket (the consolidated
+   *  All Boards view) — the event's OWN board, so notifications can baseline per-board instead
+   *  of against the `'*'` sentinel. Absent on the single-board socket. */
+  board?: string
 }
 
 type ToastKind = 'error' | 'success' | 'warning'
