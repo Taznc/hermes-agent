@@ -30,6 +30,7 @@
 import { host, type PluginOs, type PluginRestOptions, type PluginTranslate } from '@hermes/plugin-sdk'
 
 import { en } from './i18n'
+import { runErrorText } from './status-guidance'
 
 type Rest = <T>(path: string, opts?: PluginRestOptions) => Promise<T>
 
@@ -154,7 +155,9 @@ function notifyOne(kind: string, spec: { titleKey: string; toast: ToastKind }, e
         : ''
 
   const detail = [taskId, artifactText].filter(Boolean).join(' · ')
-  const title = t(spec.titleKey)
+  // gave_up carries its structured cause in `payload.error` — humanize it
+  // (runErrorText) the same way the drawer does, instead of a bare "gave up".
+  const title = kind === 'gave_up' ? t('notify.gaveUpTitle', body ? runErrorText(body, en).primary : undefined) : t(spec.titleKey)
   const message = body || taskId || title
   host.notify({
     kind: spec.toast,
