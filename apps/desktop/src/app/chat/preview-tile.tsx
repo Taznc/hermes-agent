@@ -110,8 +110,9 @@ function browserTabMenuPrefix(tabId: string) {
 
   // A file tab: the verbs a file gets everywhere else in the app (the file
   // tree, a chat path link) — open it outside Hermes, reveal it, copy its
-  // File verbs need the file on the Electron host plus the native file-manager
-  // bridge. Remote gateways and the web desktop retain only Copy path.
+  // path. File verbs need the file on the Electron host plus the native
+  // file-manager bridge. Remote gateways and the web desktop retain only
+  // Copy path.
   if (kind === 'file') {
     const localFs = canUseNativeFileActions()
 

@@ -7,7 +7,7 @@ import { ContextMenu, ContextMenuTrigger, HERMES_CONTEXT_MENU_TRIGGER_ATTR } fro
 import { Dialog, DialogContent, DialogTitle } from '@/components/ui/dialog'
 import { formatCombo } from '@/lib/keybinds/combo'
 import { $previewTabs, closeRightRail } from '@/store/preview'
-import { $connection } from '@/store/session'
+import { $connection, __setKnownHomeDirForTest } from '@/store/session'
 
 import { AppContextMenu } from './app-context-menu'
 import {
@@ -55,6 +55,7 @@ afterEach(() => {
   vi.restoreAllMocks()
   document.body.innerHTML = ''
   delete desktopWindow.hermesDesktop
+  __setKnownHomeDirForTest('')
 })
 
 describe('resolveDomTarget', () => {
@@ -253,6 +254,56 @@ describe('AppContextMenu', () => {
     fireEvent.click(await screen.findByText('Copy path'))
 
     await waitFor(() => expect(writeClipboard).toHaveBeenCalledWith('~/todo.md'))
+  })
+
+  // Regression for #103951's round-2 follow-up: `~` must be expanded to a
+  // real path renderer-side BEFORE a `file:` URL is built for Open with
+  // default app, and Reveal must receive the same expanded path — not the
+  // literal `~/…` shell shorthand `shell.showItemInFolder` cannot expand.
+  it('expands ~/ to a usable path for both Open with default app and Reveal', async () => {
+    const openExternal = vi.fn().mockResolvedValue(undefined)
+    const revealPath = vi.fn().mockResolvedValue(true)
+
+    __setKnownHomeDirForTest('/home/rae')
+    installBridge({
+      openExternal: openExternal as unknown as Window['hermesDesktop']['openExternal'],
+      revealPath: revealPath as unknown as Window['hermesDesktop']['revealPath']
+    })
+    mountMenu()
+    const host = attach('<a href="~/todo.md">~/todo.md</a>')
+
+    fireEvent.contextMenu(host.querySelector('a')!)
+    fireEvent.click(await screen.findByText('Open with default app'))
+    await waitFor(() => expect(openExternal).toHaveBeenCalledWith('file:///home/rae/todo.md'))
+
+    fireEvent.contextMenu(host.querySelector('a')!)
+    fireEvent.click(await screen.findByText(/Reveal in Finder|Reveal in File Explorer|Open containing folder/))
+    await waitFor(() => expect(revealPath).toHaveBeenCalledWith('/home/rae/todo.md'))
+  })
+
+  // Regression for #103951's round-2 follow-up: a `file://` href must be
+  // percent-DECODED, not string-stripped, so Reveal and Copy path receive a
+  // real filesystem path for names with spaces/non-ASCII characters.
+  it('decodes a percent-encoded file:// href for Reveal and Copy path', async () => {
+    const revealPath = vi.fn().mockResolvedValue(true)
+    const writeClipboard = vi.fn().mockResolvedValue(undefined)
+
+    installBridge({
+      revealPath: revealPath as unknown as Window['hermesDesktop']['revealPath'],
+      writeClipboard: writeClipboard as unknown as Window['hermesDesktop']['writeClipboard']
+    })
+    mountMenu()
+    const host = attach(
+      '<a href="file:///tmp/my%20report.md">file:///tmp/my%20report.md</a>'
+    )
+
+    fireEvent.contextMenu(host.querySelector('a')!)
+    fireEvent.click(await screen.findByText(/Reveal in Finder|Reveal in File Explorer|Open containing folder/))
+    await waitFor(() => expect(revealPath).toHaveBeenCalledWith('/tmp/my report.md'))
+
+    fireEvent.contextMenu(host.querySelector('a')!)
+    fireEvent.click(await screen.findByText('Copy path'))
+    await waitFor(() => expect(writeClipboard).toHaveBeenCalledWith('/tmp/my report.md'))
   })
 
   it('hides the local-only file verbs on a remote gateway', async () => {

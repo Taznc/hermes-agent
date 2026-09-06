@@ -64,7 +64,7 @@ function joinPath(base: string, rel: string) {
   return `${base.replace(/\/+$/, '')}/${rel.replace(/^\.?\//, '')}`
 }
 
-function pathToFileUrl(path: string) {
+export function pathToFileUrl(path: string) {
   const isWindowsUnc = path.startsWith('\\\\')
   const normalized = isWindowsUnc || /^[a-z]:[\\/]/i.test(path) ? path.replace(/\\/g, '/') : path
 
@@ -78,6 +78,53 @@ function pathToFileUrl(path: string) {
   }
 
   return `file://${encoded.startsWith('/') ? encoded : `/${encoded}`}`
+}
+
+/**
+ * The single resolver for a chat-link href naming a file: plain `/abs`,
+ * `~/…`, or `file://…` (percent-encoded). Every file verb — Open with
+ * default app, Reveal, Copy path — must derive its path through this, not
+ * a per-call-site strip/encode, or the shapes drift out of sync (#103951
+ * follow-up: `~` reaching the URL host, `file://` paths staying encoded).
+ *
+ * `~` is expanded HERE, renderer-side, before any `file:` URL is built —
+ * it must never reach the host position of a `file:` URL (`new
+ * URL('file://~/x').host === '~'`, which `fileURLToPath` rejects on every
+ * OS). Expansion needs a home directory; the renderer has no `os.homedir()`
+ * so the caller supplies one (`window.hermesDesktop`'s reported home, when
+ * available) — with no home known, `~/…` is left as a literal leading
+ * segment rather than silently mis-resolving into `process.cwd()`-relative.
+ */
+export interface ChatLinkPath {
+  /** The raw on-disk path — what Reveal and Copy path act on. */
+  path: string
+  /** The `file:` URL built from `path` — what Open-with-default-app hands
+   *  the OS (via `openExternal`). */
+  url: string
+}
+
+export function resolveChatLinkPath(href: string, homeDir?: null | string): ChatLinkPath {
+  const raw = href.trim()
+
+  if (/^file:\/\//i.test(raw)) {
+    let decoded: string
+
+    try {
+      decoded = decodeURIComponent(new URL(raw).pathname)
+    } catch {
+      decoded = raw.replace(/^file:\/\//i, '')
+    }
+
+    return { path: decoded, url: pathToFileUrl(decoded) }
+  }
+
+  if (raw === '~' || raw.startsWith('~/')) {
+    const expanded = homeDir ? `${homeDir.replace(/\/+$/, '')}${raw.slice(1)}` : raw
+
+    return { path: expanded, url: pathToFileUrl(expanded) }
+  }
+
+  return { path: raw, url: pathToFileUrl(raw) }
 }
 
 export function validatedRemoteHtmlDataUrl(value: string): string | null {

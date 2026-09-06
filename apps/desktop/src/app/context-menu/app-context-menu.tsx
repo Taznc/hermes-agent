@@ -21,13 +21,14 @@ import { type Translations, useI18n } from '@/i18n'
 import { canUseNativeFileActions } from '@/lib/desktop-fs'
 import { hostPathLabel, hudForcesNativeLinks, normalizeExternalUrl, openExternalLink } from '@/lib/external-link'
 import { formatCombo } from '@/lib/keybinds/combo'
-import { normalizeOrLocalPreviewTarget } from '@/lib/local-preview'
+import { normalizeOrLocalPreviewTarget, resolveChatLinkPath } from '@/lib/local-preview'
 import { isFileMediaPath, isRemoteGateway } from '@/lib/media'
 import { reachablePreviewUrl } from '@/lib/preview-reach'
 import { openCommandPalette } from '@/store/command-palette'
 import { copyFilePath, revealFile } from '@/store/file-actions'
 import { notifyError } from '@/store/notifications'
 import { openPreview } from '@/store/preview'
+import { getKnownHomeDir } from '@/store/session'
 import { toggleStatusbarVisible } from '@/store/statusbar-prefs'
 import { canOpenNewWindow, openNewWindow } from '@/store/windows'
 
@@ -202,7 +203,7 @@ function domSections(open: Extract<OpenContextMenu, { kind: 'dom' }>, t: Transla
   }
 
   if (linkIsFile) {
-    const filePath = linkUrl.replace(/^file:\/\//i, '')
+    const { path: filePath, url: fileUrl } = resolveChatLinkPath(linkUrl, getKnownHomeDir())
 
     const openInPreview = async () => {
       try {
@@ -217,13 +218,6 @@ function domSections(open: Extract<OpenContextMenu, { kind: 'dom' }>, t: Transla
         notifyError(error, t.preview.unavailable)
       }
     }
-
-    const fileUrl = /^file:/i.test(linkUrl)
-      ? linkUrl
-      : `file://${linkUrl
-          .split('/')
-          .map(part => encodeURIComponent(part))
-          .join('/')}`
 
     sections.push(
       [
