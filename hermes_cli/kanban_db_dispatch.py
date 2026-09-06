@@ -2444,6 +2444,11 @@ def _default_spawn(task: Task, workspace: str, *, board: Optional[str] = None) -
     # Pin the board DB + workspaces root so the worker's kanban paths still
     # match after `hermes -p` rewrites HERMES_HOME (symlink / Docker layouts).
     env["HERMES_KANBAN_DB"] = str(_kb.kanban_db_path(board=board))
+    # Provenance stamp: which kanban home the pin above was computed under. A
+    # worker (or a probe it writes) that re-declares HERMES_HOME/
+    # HERMES_KANBAN_HOME then gets its sandbox honored instead of silently
+    # keeping this production pin — see kanban_db.kanban_db_path().
+    env[_kb.KANBAN_DB_PIN_HOME_ENV] = str(_kb.kanban_home())
     env["HERMES_KANBAN_WORKSPACES_ROOT"] = str(_kb.workspaces_root(board=board))
     _retag_legacy_worker_sessions(env["HERMES_KANBAN_WORKSPACES_ROOT"])
     # Board slug — defense-in-depth pin if a path is resolved without the

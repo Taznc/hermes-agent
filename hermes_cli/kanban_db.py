@@ -493,9 +493,77 @@ def _board_path(
     return board_dir(slug) / leaf
 
 
+def _resolve_for_containment(path: Path) -> Path:
+    """Resolve symlinks/``..`` without requiring the path to exist."""
+    try:
+        return path.expanduser().resolve()
+    except OSError:
+        return path.expanduser().absolute()
+
+
+# Provenance stamp for the dispatcher-injected DB pin: the kanban home the pin
+# was computed under. It is what lets kanban_db_path() tell an INHERITED pin
+# (safe to drop when the home moves) from a hand-set one (explicit intent).
+KANBAN_DB_PIN_HOME_ENV = "HERMES_KANBAN_DB_HOME"
+
+
+def _inherited_pin_is_stale(override: str) -> bool:
+    """Is ``override`` a dispatcher-injected pin whose home no longer applies?
+
+    ``True`` only when the pin carries a provenance stamp AND the current
+    :func:`kanban_home` disagrees with it. An unstamped pin is somebody typing
+    it on purpose and is always honored.
+    """
+    stamped = os.environ.get(KANBAN_DB_PIN_HOME_ENV, "").strip()
+    if not stamped:
+        return False
+    return _resolve_for_containment(Path(stamped)) != _resolve_for_containment(kanban_home())
+
+
+# Warn once per (pin, home) pair: kanban_db_path() is called on every dispatch
+# tick, and a repeating warning would bury the one that matters.
+_warned_dropped_pins: set[tuple[str, str]] = set()
+
+
+def _warn_dropped_db_pin(override: str, fallback: Path) -> None:
+    """Surface an ignored stale ``HERMES_KANBAN_DB``.
+
+    The breach this guards was silent — a probe believed it was sandboxed while
+    writing production — so dropping the pin quietly would just move the silence.
+    """
+    key = (override, str(kanban_home()))
+    if key in _warned_dropped_pins:
+        return
+    _warned_dropped_pins.add(key)
+    _log.warning(
+        "ignoring inherited HERMES_KANBAN_DB=%s: it was injected for kanban home %s but this "
+        "process declares %s, so it is stale inherited env rather than intent. Using %s. "
+        "Unset %s (or set it to the new home) to pin that file on purpose.",
+        override,
+        os.environ.get(KANBAN_DB_PIN_HOME_ENV, ""),
+        kanban_home(),
+        fallback,
+        KANBAN_DB_PIN_HOME_ENV,
+    )
+
+
 def kanban_db_path(board: Optional[str] = None) -> Path:
     """``kanban.db`` path: ``HERMES_KANBAN_DB`` pins it (injected into workers);
-    ``default`` -> ``<root>/kanban.db`` (back-compat), else the board dir."""
+    ``default`` -> ``<root>/kanban.db`` (back-compat), else the board dir.
+
+    A pin the dispatcher injected is dropped once the process re-declares its
+    kanban home (``HERMES_HOME`` / ``HERMES_KANBAN_HOME``). The dispatcher puts
+    the pin in EVERY worker env, so without this a probe/test script that
+    sandboxes itself the documented way kept a production pin and silently drove
+    the live board — that breach reverted 137 archives and left fixture cards in
+    a real board. A hand-set pin (no ``HERMES_KANBAN_DB_HOME`` stamp) is intent
+    and still wins outright.
+    """
+    override = os.environ.get("HERMES_KANBAN_DB", "").strip()
+    if override and _inherited_pin_is_stale(override):
+        fallback = _board_path(None, board, ("kanban.db",), "kanban.db")
+        _warn_dropped_db_pin(override, fallback)
+        return fallback
     return _board_path("HERMES_KANBAN_DB", board, ("kanban.db",), "kanban.db")
 
 

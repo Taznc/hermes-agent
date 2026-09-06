@@ -1087,6 +1087,9 @@ class TestSharedBoardPaths:
 
         env = captured["env"]
         assert env["HERMES_KANBAN_DB"] == str(default_home / "kanban.db")
+        # Provenance stamp so a worker that re-declares its home doesn't keep
+        # this pin and silently drive the live board (test_kanban_db_sandbox_isolation).
+        assert env["HERMES_KANBAN_DB_HOME"] == str(kb.kanban_home())
         assert env["HERMES_KANBAN_WORKSPACES_ROOT"] == str(
             default_home / "kanban" / "workspaces"
         )
