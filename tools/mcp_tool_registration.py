@@ -68,7 +68,7 @@ def _ui_resource_uri(mcp_tool: Any) -> Optional[str]:
         parsed = urlsplit(uri)
     except ValueError:
         return None
-    return uri if parsed.scheme == "ui" else None
+    return uri if uri.startswith("ui://") and parsed.scheme == "ui" else None
 
 
 def _record_tool_ui_metadata(server_name: str, tools: List[Any]) -> None:

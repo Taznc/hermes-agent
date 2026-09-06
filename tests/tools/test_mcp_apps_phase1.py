@@ -29,6 +29,39 @@ def test_discovery_records_only_bounded_ui_resource_uri():
     _record_tool_ui_metadata("invalid", [_tool("bad", "https://example.test/app")])
     assert "invalid" not in mcp_tool._mcp_tool_ui_resources
 
+    _record_tool_ui_metadata("malformed", [_tool("bad", "ui:malformed")])
+    assert "malformed" not in mcp_tool._mcp_tool_ui_resources
+
+
+def test_malformed_ui_declaration_keeps_ordinary_result_without_resource_read():
+    from tools import mcp_tool
+    from tools import mcp_tool_handlers as handlers
+    from tools.mcp_tool_registration import _record_tool_ui_metadata
+
+    server = SimpleNamespace(session=SimpleNamespace(), _rpc_lock=None, _pending_call_context=None)
+    server.session.call_tool = AsyncMock(return_value=_result())
+    server.session.read_resource = AsyncMock(return_value=_resource())
+    mcp_tool._mcp_tool_ui_resources.clear()
+    _record_tool_ui_metadata("charts", [_tool("chart", "ui:malformed")])
+
+    def run(coro_or_factory, timeout=30):
+        coro = coro_or_factory() if callable(coro_or_factory) else coro_or_factory
+        loop = asyncio.new_event_loop()
+        try:
+            server._rpc_lock = asyncio.Lock()
+            return loop.run_until_complete(coro)
+        finally:
+            loop.close()
+
+    with patch.dict(mcp_tool._servers, {"charts": server}), patch(
+        "tools.mcp_tool_loop._run_on_mcp_loop", side_effect=run
+    ):
+        result = handlers._make_tool_handler("charts", "chart", 10)({})
+
+    assert json.loads(result) == {"result": "ordinary result"}
+    assert not hasattr(result, "mcp_app_card")
+    server.session.read_resource.assert_not_awaited()
+
 
 def test_successful_tool_call_keeps_card_transient_without_replacing_text(monkeypatch):
     from tools import mcp_tool
