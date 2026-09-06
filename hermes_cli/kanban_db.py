@@ -2435,6 +2435,35 @@ def _claim_and_open_run(
     return run_id
 
 
+def _terminal_completion_without_reopen(conn: sqlite3.Connection, task_id: str) -> Optional[int]:
+    """The task's last ``completed`` event id iff nothing legitimately reopened
+    the task since (returns ``None`` when it's fine to claim).
+
+    Every sanctioned path off ``done`` appends a ``status`` event in the SAME
+    transaction as the status write: dashboard PATCH/drag-drop
+    (``_set_status_direct``) and parent-reopen invalidation
+    (``invalidate_descendants_for_parent_reopen``, which also appends
+    ``descendant_invalidated`` first). So a ``completed`` event with neither
+    kind after it means ``tasks.status`` disagrees with the terminal outcome
+    recorded in the event log WITHOUT a recorded reason — a stale
+    claim/reclaim race, manual SQL, or a DB restore, not a real reopen. The
+    completed run is the authority in that case; the row must not be claimed.
+    """
+    row = conn.execute(
+        "SELECT id FROM task_events WHERE task_id = ? AND kind = 'completed' "
+        "ORDER BY id DESC LIMIT 1", (task_id,),
+    ).fetchone()
+    if row is None:
+        return None
+    completed_event_id = row["id"]
+    reopened = conn.execute(
+        "SELECT 1 FROM task_events WHERE task_id = ? AND id > ? "
+        "AND kind IN ('status', 'descendant_invalidated') LIMIT 1",
+        (task_id, completed_event_id),
+    ).fetchone()
+    return None if reopened else completed_event_id
+
+
 def claim_task(
     conn: sqlite3.Connection, task_id: str, *, ttl_seconds: Optional[int] = None,
     claimer: Optional[str] = None,
@@ -2457,6 +2486,29 @@ def claim_task(
                 "WHERE id = ? AND status = 'ready'", (task_id,),
             )
             _append_event(conn, task_id, "claim_rejected", {"reason": "parents_not_done"})
+            return None
+        # A card with a terminal ``completed`` event and no recorded reopen is
+        # never re-dispatched, no matter how ``tasks.status`` got back to
+        # 'ready' — self-heal the desync back to 'done' instead of spawning a
+        # duplicate worker on already-finished work.
+        stale_completed_event_id = _terminal_completion_without_reopen(conn, task_id)
+        if stale_completed_event_id is not None:
+            cur = conn.execute(
+                "UPDATE tasks SET status = 'done', claim_lock = NULL, "
+                "claim_expires = NULL, worker_pid = NULL "
+                "WHERE id = ? AND status = 'ready'", (task_id,),
+            )
+            if cur.rowcount == 1:
+                _append_event(
+                    conn, task_id, "terminal_reclaim_rejected",
+                    {
+                        "completed_event_id": stale_completed_event_id,
+                        "reason": (
+                            "task already completed with no recorded reopen; "
+                            "status desync healed back to done instead of re-dispatching"
+                        ),
+                    },
+                )
             return None
         # Close a leaked prior run so the CAS below doesn't strand it.
         _reclaim_dangling_run(
