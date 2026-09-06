@@ -1065,6 +1065,15 @@ Scope is deliberately narrow, so declaring costs nothing:
   (`*`, `?`, `[]`, an unbalanced brace) is rejected outright. A fragment such as
   `src/i18n/{en` is identical for any two cards touching that directory, so
   admitting one would serialize them on a path that does not exist.
+- **Quoting a line is not declaring one.** A `hotspot:` or `Edit-Targets:` line
+  inside a fenced code block or a markdown blockquote is text somebody is
+  *citing as evidence about another card*, and it contributes nothing to the
+  quoting card's own edit surface. The review protocol asks reviewers to quote
+  the offending text, so without this rule documenting a parsing defect would
+  change routing: a card whose thread merely quotes a sibling's hotspot line
+  becomes the registered holder of a file it never touches, and the card that
+  genuinely edits it is parked behind it. The identical line written as ordinary
+  prose is still read normally.
 
 **The dependency edge is a lease, not a permanent dependency.** A card only
 waits while the holder is still on its way to producing the work it should start

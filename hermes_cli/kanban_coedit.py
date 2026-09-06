@@ -55,22 +55,32 @@ _LABEL_ALTERNATION = "|".join(
 )
 
 # "Edit-Targets: a/b.ts, c/d.tsx" — the rest of the line is the payload.
+#
+# None of these leading character classes admit ``>``: a blockquote line is
+# somebody quoting another card, never a declaration of this card's own edit
+# surface (see ``_declarative_lines``).
 _INLINE_RE = re.compile(
-    rf"^[ \t>*\-]*(?:\*\*)?(?:{_LABEL_ALTERNATION})(?:\*\*)?[ \t]*:[ \t]*"
+    rf"^[ \t*\-]*(?:\*\*)?(?:{_LABEL_ALTERNATION})(?:\*\*)?[ \t]*:[ \t]*"
     rf"(?:\*\*[ \t]*)?(?P<rest>\S.*)$",
     re.IGNORECASE,
 )
 # "Edit targets:" alone on a line, followed by a bullet list.
 _HEADING_RE = re.compile(
-    rf"^[ \t>*\-#]*(?:\*\*)?(?:{_LABEL_ALTERNATION})(?:\*\*)?[ \t]*:?[ \t]*$",
+    rf"^[ \t*\-#]*(?:\*\*)?(?:{_LABEL_ALTERNATION})(?:\*\*)?[ \t]*:?[ \t]*$",
     re.IGNORECASE,
 )
-_BULLET_RE = re.compile(r"^[ \t>]*(?:[-*+]|\d+[.)])[ \t]+(?P<item>\S.*?)[ \t]*$")
+_BULLET_RE = re.compile(r"^[ \t]*(?:[-*+]|\d+[.)])[ \t]+(?P<item>\S.*?)[ \t]*$")
 
 _HOTSPOT_RE = re.compile(
-    r"^[ \t>*\-]*(?:\*\*)?hotspot(?:\*\*)?[ \t]*:[ \t]*(?:\*\*[ \t]*)?(?P<rest>\S.*)$",
+    r"^[ \t*\-]*(?:\*\*)?hotspot(?:\*\*)?[ \t]*:[ \t]*(?:\*\*[ \t]*)?(?P<rest>\S.*)$",
     re.IGNORECASE,
 )
+
+# A fenced code block opener/closer: three or more backticks or tildes, with an
+# optional info string on the opening fence.
+_FENCE_RE = re.compile(r"^[ \t]*(?P<fence>`{3,}|~{3,})[ \t]*(?P<info>\S.*)?$")
+# A markdown blockquote line ("> hotspot: ..."), including nested "> > ".
+_BLOCKQUOTE_RE = re.compile(r"^[ \t]*>")
 # A worker writes "hotspot: <path> — <reason>". The separator is an em/en dash or
 # a spaced ASCII dash; requiring the surrounding space keeps a hyphenated
 # directory name ("right-rail/preview-pane.tsx") intact.
@@ -268,19 +278,68 @@ def _split_paths(payload: str, *, strict: bool = False) -> list[str]:
     return out
 
 
+def _declarative_lines(text: str) -> "list[tuple[int, str]]":
+    """``(index, line)`` for lines that speak for THIS card, quotes excluded.
+
+    A hotspot or ``Edit-Targets:`` line inside a fenced code block or a markdown
+    blockquote is text the commenter is *citing as evidence about another card*
+    — the review protocol asks reviewers to quote the offending line, so quoted
+    hotspot lines are the reviewer's common case in exactly the way negations
+    are the worker's. Read literally, a card whose thread merely quotes somebody
+    else's hotspot becomes the registered holder of a file it never touches, and
+    a sibling that really edits that file is parked behind it. That happened on
+    this feature's own card: a review comment quoting another card's line made a
+    dispatcher card the holder of a desktop store module.
+
+    Documenting a parsing defect must not change routing, so quoted lines are
+    dropped before either parser sees them.
+
+    Indented (four-space) code blocks are deliberately NOT treated as quotes:
+    that indentation is indistinguishable from a list continuation, and guessing
+    wrong there would silently drop a genuine declaration. Fences and
+    blockquotes are unambiguous.
+    """
+    out: list[tuple[int, str]] = []
+    fence: Optional[str] = None
+    for index, line in enumerate(text.splitlines()):
+        marker = _FENCE_RE.match(line)
+        if marker:
+            token = marker.group("fence")
+            if fence is None:
+                # An info string ("```python") only ever opens a fence.
+                fence = token
+                continue
+            # A fence closes on the same character, at least as long, and with
+            # nothing after it.
+            if token[0] == fence[0] and len(token) >= len(fence) and not marker.group("info"):
+                fence = None
+            continue
+        if fence is not None:
+            continue
+        if _BLOCKQUOTE_RE.match(line):
+            continue
+        out.append((index, line))
+    return out
+
+
 def parse_declared_paths(body: Optional[str]) -> list[str]:
     """Paths a card body declares up front, in first-seen order.
 
     Accepts the inline form (``Edit-Targets: a/b.ts, c/d.tsx``) and the heading
     plus bullet-list form. A body with no such field yields ``[]`` — that is the
-    common case and it must stay a no-op.
+    common case and it must stay a no-op. A body that merely *quotes* another
+    card's declaration also yields ``[]`` (see ``_declarative_lines``).
     """
     if not body:
         return []
     found: list[str] = []
+    eligible = dict(_declarative_lines(body))
     lines = body.splitlines()
     index = 0
     while index < len(lines):
+        if index not in eligible:
+            index += 1
+            continue
         line = lines[index]
         inline = _INLINE_RE.match(line)
         if inline:
@@ -296,8 +355,9 @@ def parse_declared_paths(body: Optional[str]) -> list[str]:
         if _HEADING_RE.match(line):
             index += 1
             # Consume the bullet list that follows, tolerating blank lines
-            # between the heading and the first bullet.
-            while index < len(lines):
+            # between the heading and the first bullet. A quoted line ends the
+            # list rather than contributing to it.
+            while index < len(lines) and index in eligible:
                 nxt = lines[index]
                 if not nxt.strip():
                     index += 1
@@ -324,14 +384,16 @@ def parse_hotspot_paths(text: Optional[str]) -> list[str]:
     ("none. The three files I touched (a.py, b.py) showed no collision"). Mining
     that prose serializes two unrelated cards — a much worse failure than
     missing a genuine hotspot, because a card the operator never asked to gate
-    stops moving. So: a negated line contributes nothing, and a line whose
+    stops moving. So: a negated line contributes nothing, a line whose
     comma-separated chunks are not ALL paths contributes nothing rather than
-    donating the chunks that happen to look like filenames.
+    donating the chunks that happen to look like filenames, and a line the
+    comment merely QUOTES (fenced or blockquoted) is not this card's
+    declaration at all.
     """
     if not text:
         return []
     found: list[str] = []
-    for line in text.splitlines():
+    for _index, line in _declarative_lines(text):
         match = _HOTSPOT_RE.match(line)
         if not match:
             continue

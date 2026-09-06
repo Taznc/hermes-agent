@@ -703,3 +703,135 @@ def test_annotated_hotspot_serializes_against_its_plain_sibling(kanban_home):
         assert _status(conn, holder) == "running"
         assert _status(conn, later) == "todo"
         assert _parents(kb, conn, later) == [holder]
+
+
+# --- Quoting context: citing a hotspot line is not declaring one ---
+#
+# The review protocol asks a reviewer to quote the offending text as evidence,
+# so quoted hotspot lines are the reviewer's common case in exactly the way
+# negations are the worker's. Read literally, the guard makes review prose
+# load-bearing on dispatch: documenting a parsing defect by quoting it changes
+# routing. This actually happened on this feature's own card — a review comment
+# quoting another card's line made a dispatcher card the registered holder of
+# ``apps/desktop/src/store/session-states.ts``, a file it never touches.
+
+_STORE = "apps/desktop/src/store/session-states.ts"
+
+_FENCED_REVIEW_COMMENT = f"""\
+Same root as the blocker — validating the parser only against inputs it was
+designed for. Live text from `t_6ad2d803`:
+
+```
+hotspot: `{_STORE}` (2235 lines, fork diverged +235) — shared with `t_ff46207f`
+  head:   '`{_STORE}` (2235 lines, ...)'
+```
+
+Please add a test for it.
+"""
+
+_BLOCKQUOTED_REVIEW_COMMENT = f"""\
+Your own handoff comment on this very card is the example:
+
+> hotspot: `{_STORE}` — shared with the sibling card
+
+That line is evidence, not a declaration.
+"""
+
+
+def test_quoted_hotspot_line_declares_nothing(kanban_home):
+    """A hotspot line inside a fence or a blockquote is a citation about some
+    OTHER card; the identical line in prose is this card's own declaration."""
+    from hermes_cli import kanban_coedit as kc
+
+    assert kc.parse_hotspot_paths(_FENCED_REVIEW_COMMENT) == [], (
+        "a hotspot line quoted inside a code fence is evidence about another "
+        "card, not this card's edit surface"
+    )
+    assert kc.parse_hotspot_paths(_BLOCKQUOTED_REVIEW_COMMENT) == [], (
+        "a blockquoted hotspot line is a citation, not a declaration"
+    )
+    # Discrimination: the SAME line unquoted is still read.
+    assert kc.parse_hotspot_paths(f"hotspot: `{_STORE}` — shared") == [_STORE]
+    # A fence that opens after a real declaration must not retroactively hide it.
+    mixed = f"hotspot: `{_STORE}` — real\n\n```\nhotspot: `other/file.ts` — quoted\n```\n"
+    assert kc.parse_hotspot_paths(mixed) == [_STORE]
+    # Tildes fence too, and a nested blockquote is still a quote.
+    assert kc.parse_hotspot_paths(f"~~~\nhotspot: `{_STORE}` — x\n~~~\n") == []
+    assert kc.parse_hotspot_paths(f"> > hotspot: `{_STORE}` — x") == []
+
+
+def test_quoted_declared_field_declares_nothing(kanban_home):
+    """The same rule on the declared signal: a body quoting another card's
+    ``Edit-Targets:`` block does not inherit it as its own edit surface."""
+    from hermes_cli import kanban_coedit as kc
+
+    fenced = f"The sibling card's body says:\n\n```\nEdit-Targets: {_STORE}\n```\n"
+    quoted = f"The sibling card's body says:\n\n> Edit-Targets: {_STORE}\n"
+    assert kc.parse_declared_paths(fenced) == []
+    assert kc.parse_declared_paths(quoted) == []
+    # Discrimination: unquoted, it is a declaration.
+    assert kc.parse_declared_paths(f"Edit-Targets: {_STORE}") == [_STORE]
+    # The heading + bullet-list form is quoted the same way.
+    quoted_list = f"Cited from the other card:\n\n> Edit targets:\n> - {_STORE}\n"
+    assert kc.parse_declared_paths(quoted_list) == []
+    assert kc.parse_declared_paths(f"Edit targets:\n- {_STORE}\n") == [_STORE]
+
+
+def test_a_card_that_only_quotes_a_hotspot_does_not_park_the_real_editor(kanban_home):
+    """End-to-end, the live scenario: a card whose ONLY hotspot text is a quote
+    must not become a holder and must not park the card that really edits it.
+
+    Run for both quoting forms — a fenced block (a reviewer pasting evidence)
+    and a blockquote (a reviewer citing a line inline).
+    """
+    kb = kanban_home
+    from hermes_cli import kanban_db_connect as kbc
+    from hermes_cli import kanban_db_dispatch as kbd
+
+    for label, comment in (
+        ("fenced", _FENCED_REVIEW_COMMENT),
+        ("blockquote", _BLOCKQUOTED_REVIEW_COMMENT),
+    ):
+        with kbc.connect_closing() as conn:
+            quoter = kb.create_task(
+                conn, title=f"dispatcher card ({label})", assignee="alpha", body="no field"
+            )
+            kb.add_comment(conn, quoter, "reviewer", comment)
+            editor = kb.create_task(
+                conn, title=f"real editor ({label})", assignee="beta", body=_body(_STORE)
+            )
+
+        with kbc.connect_closing() as conn:
+            res = kbd.dispatch_once(conn, spawn_fn=_fake_spawn)
+            assert _status(conn, quoter) == "running", label
+            assert _status(conn, editor) == "running", (
+                f"[{label}] a card that merely quoted somebody else's hotspot line "
+                "must not hold the path against the card that genuinely edits it"
+            )
+            assert _parents(kb, conn, editor) == [], label
+        assert res.serialized_coedit == [], label
+
+        # Clear the lane so the next form starts from a quiet board.
+        with kbc.connect_closing() as conn:
+            kb.complete_task(conn, quoter, summary="done")
+            kb.complete_task(conn, editor, summary="done")
+
+
+def test_a_card_that_really_declares_the_path_still_serializes(kanban_home):
+    """Control for the test above, same file and same second card: when the
+    holder's hotspot line is its OWN (not quoted), serialization still fires."""
+    kb = kanban_home
+    from hermes_cli import kanban_db_connect as kbc
+    from hermes_cli import kanban_db_dispatch as kbd
+
+    with kbc.connect_closing() as conn:
+        holder = kb.create_task(conn, title="real holder", assignee="alpha", body="no field")
+        kb.add_comment(conn, holder, "claudeprimary", f"hotspot: `{_STORE}` — genuinely contended")
+        editor = kb.create_task(conn, title="real editor", assignee="beta", body=_body(_STORE))
+
+    with kbc.connect_closing() as conn:
+        res = kbd.dispatch_once(conn, spawn_fn=_fake_spawn)
+        assert _status(conn, holder) == "running"
+        assert _status(conn, editor) == "todo"
+        assert _parents(kb, conn, editor) == [holder]
+    assert (editor, holder, _STORE) in res.serialized_coedit
