@@ -855,6 +855,42 @@ def test_count_running_tasks_never_undercounts_after_guard(kanban_home):
         after = _kbd.count_running_tasks(conn)
         assert after == before, "a live worker's row must still be counted after a refused delete"
 
+def test_verify_created_cards_survives_orphaned_completing_task(kanban_home):
+    """Reproduces the t_749b0510 false-negative: task A creates task B
+    (``created_by=A``), A's OWN row is then deleted out from under it
+    (simulating the orphan from delete_task on a running row), and A still
+    needs to be able to attest to B in a subsequent completed_cards check.
+
+    Before the fix, ``_verify_created_cards`` bailed out the instant
+    ``completing_task_id``'s row was missing and reported EVERY claimed id
+    as phantom — including one the caller demonstrably created — which is
+    exactly backwards for an integrity check whose only job is catching
+    invented ids.
+    """
+    with kbc.connect() as conn:
+        task_a = kb.create_task(conn, title="orphan-to-be", assignee="alice")
+        task_b = kb.create_task(
+            conn, title="real child created by A", assignee="bob", created_by=task_a,
+        )
+
+        # Simulate the t_749b0510 incident: A's own row vanishes mid-run
+        # (delete_task on a running task, or any other path that drops it).
+        assert kb.delete_task(conn, task_a)
+        assert kb.get_task(conn, task_a) is None
+
+        verified, phantom = kb._verify_created_cards(conn, task_a, [task_b])
+        assert verified == [task_b], (
+            f"task B ({task_b}), genuinely created_by=task_a, must verify even "
+            f"though A's own row is gone — got verified={verified} phantom={phantom}"
+        )
+        assert phantom == []
+
+        # A truly invented id must still be rejected — the orphan case must
+        # not turn into "everything passes" once the caller's row is gone.
+        verified2, phantom2 = kb._verify_created_cards(conn, task_a, ["t_totallyfakeid00"])
+        assert verified2 == []
+        assert phantom2 == ["t_totallyfakeid00"]
+
 
 
 
