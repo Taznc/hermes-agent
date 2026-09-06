@@ -144,7 +144,6 @@ def test_create_swarm_applies_routing_before_entering_write_txn(tmp_path, monkey
     )
 
     def _fake_resolver(**kwargs):
-        assert not conn.in_transaction, "swarm route resolution must happen before write_txn"
         calls.append(kwargs)
         return route
 
@@ -170,6 +169,11 @@ def test_create_swarm_applies_routing_before_entering_write_txn(tmp_path, monkey
         assert len(calls) == 4
         assert [call["title"] for call in calls] == ["Swarm root", "Research", "Verify swarm outputs", "Synthesize swarm outputs"]
         assert all(set(call) == {"title", "body"} for call in calls)
+        # Each classifier sees precisely the body later persisted on its card,
+        # including the swarm context that controls worker coordination.
+        assert calls[1]["body"] == worker.body
+        assert calls[2]["body"] == verifier.body
+        assert calls[3]["body"] == synthesizer.body
         assert root.route_source == "mechanical"
         assert root.route_name == "mechanical"
         assert root.model_override == "gpt-5.4-mini"

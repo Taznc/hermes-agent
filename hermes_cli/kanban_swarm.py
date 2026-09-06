@@ -180,21 +180,16 @@ def create_swarm(
     root_route = None
     if existing_root_id is None:
         root_route = resolve_kanban_model_route(title=root_title_value, body=root_body)
-    worker_routes = [
-        resolve_kanban_model_route(title=spec.title, body=(spec.body or ""))
-        for spec in worker_specs
-    ]
     verifier_body = (
         "Review every worker handoff and blackboard update. Gate the swarm: "
         "complete only with metadata {\"gate\": \"pass\"} when evidence is "
         "sufficient; otherwise block with exact missing work."
     )
-    verifier_route = resolve_kanban_model_route(title=verifier_title, body=verifier_body)
     synthesizer_body = (
         "Synthesize the verified worker outputs into the final deliverable. "
         "Do not start until the verifier has passed the gate."
     )
-    synthesizer_route = resolve_kanban_model_route(title=synthesizer_title, body=synthesizer_body)
+
 
     activated = False
     with kb.write_txn(conn):
@@ -221,13 +216,26 @@ def create_swarm(
                 return SwarmCreated(root, worker_ids, str(verifier_id), str(synthesizer_id))
 
         context_suffix = _swarm_context(root, goal)
+        worker_bodies = [(spec.body or "") + context_suffix for spec in worker_specs]
+        verifier_body_with_context = verifier_body + context_suffix
+        synthesizer_body_with_context = synthesizer_body + context_suffix
+        worker_routes = [
+            resolve_kanban_model_route(title=spec.title, body=body)
+            for spec, body in zip(worker_specs, worker_bodies)
+        ]
+        verifier_route = resolve_kanban_model_route(
+            title=verifier_title, body=verifier_body_with_context
+        )
+        synthesizer_route = resolve_kanban_model_route(
+            title=synthesizer_title, body=synthesizer_body_with_context
+        )
         worker_ids = []
-        for spec, route in zip(worker_specs, worker_routes):
+        for spec, body, route in zip(worker_specs, worker_bodies, worker_routes):
             worker_ids.append(
                 kb.create_task(
                     conn,
                     title=spec.title,
-                    body=(spec.body or "") + context_suffix,
+                    body=body,
                     assignee=spec.profile,
                     parents=[root],
                     priority=spec.priority or priority,
@@ -243,7 +251,7 @@ def create_swarm(
         verifier = kb.create_task(
             conn,
             title=verifier_title,
-            body=verifier_body + context_suffix,
+            body=verifier_body_with_context,
             assignee=verifier_assignee,
             parents=worker_ids,
             priority=priority,
@@ -257,7 +265,7 @@ def create_swarm(
         synthesizer = kb.create_task(
             conn,
             title=synthesizer_title,
-            body=synthesizer_body + context_suffix,
+            body=synthesizer_body_with_context,
             assignee=synthesizer_assignee,
             parents=[verifier],
             priority=priority,

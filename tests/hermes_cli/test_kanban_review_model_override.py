@@ -233,6 +233,25 @@ def test_no_override_card_unaffected(kanban_home: Path) -> None:
         assert t2.provider_override is None
 
 
+def test_reopen_legacy_review_without_review_requested_preserves_assignee_and_pin(kanban_home: Path) -> None:
+    with kbc.connect() as conn:
+        tid = kb.create_task(
+            conn, title="legacy review", assignee="builder",
+            model_override="gpt-5.6", provider_override="openai-codex", reasoning_effort="medium",
+        )
+        with kb.write_txn(conn):
+            conn.execute("UPDATE tasks SET status = 'review' WHERE id = ?", (tid,))
+
+        assert kb.reopen_review_task(conn, tid) is True
+        task = kb.get_task(conn, tid)
+        assert task is not None
+        assert task.status == "ready"
+        assert task.assignee == "builder"
+        assert task.model_override == "gpt-5.6"
+        assert task.provider_override == "openai-codex"
+        assert task.reasoning_effort == "medium"
+
+
 # ---------------------------------------------------------------------------
 # 5. Same-profile review keeps the override — not a cross-profile leak
 # ---------------------------------------------------------------------------

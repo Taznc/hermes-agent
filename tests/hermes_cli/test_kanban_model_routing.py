@@ -90,6 +90,8 @@ def test_explicit_override_short_circuits_classifier_call(kanban_home, monkeypat
         "not json",
         "mechanical",
         json.dumps({"route": "bogus"}),
+        json.dumps({"route": "MECHANICAL"}),
+        json.dumps({"route": " mechanical "}),
         json.dumps({"name": "mechanical"}),
         json.dumps({"route": "mechanical", "confidence": 1}),
     ],
@@ -183,6 +185,27 @@ def test_retryable_classifier_failure_uses_exactly_one_model_call_and_fails_clos
     assert decision.reasoning_effort is None
 
 
+def test_classifier_single_attempt_avoids_progress_stream_fallback(kanban_home, monkeypatch):
+    from agent import auxiliary_client as aux
+
+    calls = []
+
+    class _Completions:
+        def create(self, **kwargs):
+            calls.append(kwargs)
+            return type("Resp", (), {"choices": [type("Choice", (), {"message": type("Msg", (), {"content": "ok"})()})()]})()
+
+    client = type("Client", (), {"chat": type("Chat", (), {"completions": _Completions()})()})()
+    monkeypatch.setattr(aux, "_resolve_task_provider_model", lambda *_args, **_kwargs: ("openai-codex", "gpt-5.4-mini", None, None, None))
+    monkeypatch.setattr(aux, "_get_cached_client", lambda *_args, **_kwargs: (client, "gpt-5.4-mini"))
+    monkeypatch.setattr(aux, "_relay_sync_completion", lambda _client, kwargs, **meta: meta["create"](kwargs))
+    monkeypatch.setattr(aux, "_create_with_progress", lambda *_args, **_kwargs: pytest.fail("stream fallback used"))
+
+    aux.call_llm_single_attempt(provider="openai-codex", model="gpt-5.4-mini", messages=[{"role": "user", "content": "classify"}])
+
+    assert len(calls) == 1
+
+
 def test_safe_classifier_selects_mechanical_route_with_one_model_call(kanban_home, monkeypatch):
     from hermes_cli import kanban_model_routing as kmr
 
@@ -210,3 +233,18 @@ def test_safe_classifier_selects_mechanical_route_with_one_model_call(kanban_hom
     assert decision.model_override == "gpt-5.4-mini"
     assert decision.provider_override == "openai-codex"
     assert decision.reasoning_effort == "medium"
+
+
+def test_malformed_route_reasoning_fails_closed(kanban_home, monkeypatch):
+    from hermes_cli import kanban_model_routing as kmr
+
+    class _Resp:
+        choices = [type("Choice", (), {"message": type("Msg", (), {"content": '{"route":"mechanical"}'})()})()]
+
+    monkeypatch.setattr(kmr, "_call_llm", lambda **_kwargs: _Resp())
+    config = _routing_config()
+    config["kanban"]["model_routing"]["routes"]["mechanical"]["reasoning_effort"] = {"bad": "value"}
+
+    decision = kmr.resolve_kanban_model_route(title="Docs", body="Tiny edit", config=config)
+
+    assert decision.route_source == "default"

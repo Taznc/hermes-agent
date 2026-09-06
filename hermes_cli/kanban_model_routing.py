@@ -108,7 +108,6 @@ def _parse_classifier_route(content: Any) -> Optional[str]:
     route = parsed.get("route")
     if not isinstance(route, str):
         return None
-    route = route.strip().lower()
     if route == _DEFAULT_ROUTE_NAME or route in _SUPPORTED_ROUTES:
         return route
     return None
@@ -121,7 +120,10 @@ def _route_from_config(config: dict, route_name: str) -> tuple[Optional[str], Op
         return None, None, None
     provider = _normalize_text(route_cfg.get("provider"))
     model = _normalize_text(route_cfg.get("model"))
-    reasoning_effort = normalize_reasoning_effort(route_cfg.get("reasoning_effort"))
+    try:
+        reasoning_effort = normalize_reasoning_effort(route_cfg.get("reasoning_effort"))
+    except (TypeError, ValueError):
+        return None, None, None
     if not provider or not model or reasoning_effort is None:
         return None, None, None
     return provider, model, reasoning_effort

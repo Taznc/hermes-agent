@@ -3915,11 +3915,12 @@ def reopen_review_task(conn: sqlite3.Connection, task_id: str) -> bool:
         )
         new_status = _landing_status_after_parents(conn, task_id)
         review_event = _latest_event(conn, task_id, "review_requested")
-        handoff = _json_dict(_row_get(review_event, "payload"))
+        handoff = _json_dict(_row_get(review_event, "payload")) if review_event is not None else {}
         implementer = _nonblank_str(handoff.get("implementer"))
         assigned_event = _latest_event(conn, task_id, "assigned")
         if (
             assigned_event is not None
+            and review_event is not None
             and int(assigned_event["id"]) > int(review_event["id"])
         ):
             assigned_payload = _json_dict(assigned_event["payload"])

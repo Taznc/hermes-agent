@@ -7118,10 +7118,14 @@ def _call_llm_impl(
         return _validate_llm_response(
             _relay_sync_completion(
                 client, kwargs, provider=request_provider, api_mode=req.resolved_api_mode,
-                create=lambda request: _create_with_progress(
-                    client, request, task,
-                    force_stream=_provider_requires_stream(
-                        request_provider, req.base_info or req.resolved_base_url),
+                create=(
+                    (lambda request: client.chat.completions.create(**request))
+                    if single_attempt
+                    else lambda request: _create_with_progress(
+                        client, request, task,
+                        force_stream=_provider_requires_stream(
+                            request_provider, req.base_info or req.resolved_base_url),
+                    )
                 ),
             ),
             task, **validate_kw,
