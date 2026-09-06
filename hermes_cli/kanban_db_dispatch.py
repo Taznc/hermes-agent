@@ -1792,12 +1792,14 @@ def _memory_pressure_level(sample: Optional[Mapping[str, Any]] = None) -> str:
         return "unknown"
 
 
-_DISPATCH_PAUSE_FILENAME = "dispatch-pause.json"
-
-
 def _dispatch_pause_path(board: Optional[str]) -> Path:
-    """Board-local sticky circuit state (separate from display metadata)."""
-    return _kb.board_dir(board) / _DISPATCH_PAUSE_FILENAME
+    """Sticky circuit state beside the resolved board database.
+
+    Deriving this from :func:`kanban_db_path` preserves ``HERMES_KANBAN_DB``
+    sandbox/path-pin isolation. A test or worker pinned to another database must
+    never trip or resume the live board's circuit.
+    """
+    return _kb.kanban_db_path(board).with_suffix(".dispatch-pause.json")
 
 
 def read_dispatch_pause(board: Optional[str] = None) -> Optional[dict[str, Any]]:

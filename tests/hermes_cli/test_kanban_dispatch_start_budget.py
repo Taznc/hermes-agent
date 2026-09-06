@@ -157,3 +157,14 @@ def test_unreadable_pause_state_fails_closed_until_explicit_resume(
     resumed = kbd.resume_dispatch(board)
     assert resumed["was_paused"] is True
     assert kbd.read_dispatch_pause(board) is None
+
+
+def test_pause_state_follows_database_path_pin(monkeypatch):
+    live_path = kbd._dispatch_pause_path(None)
+    sandbox_db = kb.kanban_home() / "sandbox" / "isolated.db"
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(sandbox_db))
+
+    sandbox_pause = kbd._dispatch_pause_path(None)
+
+    assert sandbox_pause == sandbox_db.with_suffix(".dispatch-pause.json")
+    assert sandbox_pause != live_path
