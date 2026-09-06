@@ -2280,8 +2280,11 @@ def _gave_up_was_force_tripped(conn: sqlite3.Connection, task_id: str) -> bool:
 def _latest_event(
     conn: sqlite3.Connection, task_id: str, kind: str, run_id: Optional[int] = None,
 ) -> Optional[sqlite3.Row]:
-    """Newest ``task_events`` row of ``kind`` (optionally scoped to one run)."""
-    sql = "SELECT payload FROM task_events WHERE task_id = ? AND kind = ?"
+    """Newest ``task_events`` row of ``kind`` (optionally scoped to one run).
+    ``id`` is included alongside ``payload`` so callers that need to order
+    two different event kinds relative to each other (e.g. deciding which of
+    two audit trails is the more recent handoff) don't need a second query."""
+    sql = "SELECT id, payload FROM task_events WHERE task_id = ? AND kind = ?"
     params: tuple[Any, ...] = (task_id, kind)
     if run_id is not None:
         sql += " AND run_id = ?"
@@ -3476,17 +3479,35 @@ def request_changes(
         reviewer = _canonical_assignee(_nonblank_str(task_row["assignee"]))
 
         # Round trip back to the implementer must not silently lose the pin
-        # that request_review snapshotted for a cross-profile handoff. The
-        # keys are only present when request_review actually cleared the
-        # columns (cross_profile=True there); a same-profile review never
-        # touched the columns, so there is nothing to restore.
+        # that a cross-profile handoff snapshotted — from EITHER an explicit
+        # request_review(reviewer=...) (snapshot lives on this
+        # review_requested event) OR a kanban.default_reviewer auto-assign
+        # (the dispatcher's _apply_default_reviewer cannot rewrite this
+        # immutable review_requested row, so it snapshots onto a LATER
+        # "assigned" event instead — see kanban_db_dispatch.py). Pick
+        # whichever event carries the override snapshot and happened last;
+        # a same-profile review that never cleared the columns has neither,
+        # so there is nothing to restore.
+        override_payload = requested_payload
+        assigned_event = _latest_event(conn, task_id, "assigned")
+        if (
+            assigned_event is not None
+            and int(assigned_event["id"]) > int(requested_event["id"])
+        ):
+            assigned_payload = _json_dict(assigned_event["payload"])
+            if (
+                assigned_payload.get("source") == "kanban.default_reviewer"
+                and "implementer_model_override" in assigned_payload
+            ):
+                override_payload = assigned_payload
+
         override_sql = ""
         override_params: tuple[Any, ...] = ()
-        if "implementer_model_override" in requested_payload:
+        if "implementer_model_override" in override_payload:
             override_sql = ", model_override = ?, provider_override = ?"
             override_params = (
-                _nonblank_str(requested_payload.get("implementer_model_override")),
-                _nonblank_str(requested_payload.get("implementer_provider_override")),
+                _nonblank_str(override_payload.get("implementer_model_override")),
+                _nonblank_str(override_payload.get("implementer_provider_override")),
             )
 
         new_status = _landing_status_after_parents(conn, task_id)

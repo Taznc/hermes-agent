@@ -1676,6 +1676,36 @@ def _apply_default_assignee(
     return True
 
 
+def _review_row_implementer_owned(
+    conn: sqlite3.Connection, task_id: str,
+) -> bool:
+    """True when a review-lane row is still owned by the profile that
+    IMPLEMENTED it — the only state ``kanban.default_reviewer`` may touch.
+
+    A bare ``row_assignee != default_reviewer`` inequality can't tell "still
+    the implementer, never routed" apart from "explicitly routed to a real
+    reviewer that just isn't the config's pick" — the latter must never be
+    overridden, whether the routing came from ``kanban_request_review(
+    reviewer=...)`` on the first pass or from ``_prior_reviewer`` provenance
+    on a re-review. The latest ``review_requested`` event's ``reviewer``
+    field is the single source of truth for that distinction: ``None``/
+    absent means the row is still sitting on the implementer's own name
+    (request_review only sets ``reviewer`` in the payload when a handoff was
+    actually decided — see ``kanban_db.request_review``); anything else
+    means a reviewer was deliberately chosen and must stick.
+    """
+    event = _kb._latest_event(conn, task_id, "review_requested")
+    if event is None:
+        # No provenance at all (e.g. a legacy row created before this event
+        # existed) — nothing on record distinguishes implementer-owned from
+        # explicitly-routed, so treat it as implementer-owned (today's
+        # upgrade-safety behavior: the row is eligible for reassignment).
+        return True
+    payload = _kb._json_dict(_kb._row_get(event, "payload"))
+    reviewer = payload.get("reviewer")
+    return not (isinstance(reviewer, str) and reviewer.strip())
+
+
 def _apply_default_reviewer(
     conn: sqlite3.Connection, task_id: str, reviewer: str, *, previous_assignee: str, dry_run: bool,
 ) -> bool:
@@ -1687,24 +1717,53 @@ def _apply_default_reviewer(
     implementer but secretly routed elsewhere". The event payload records
     both sides of the handoff (``previous_assignee`` / ``reviewer`` /
     ``source``) so the audit trail shows implementer->reviewer provenance.
-    ``dry_run`` reports without writing. Returns False when the write failed.
+
+    This IS a cross-profile handoff exactly like an explicit
+    ``kanban_request_review(reviewer=...)`` — the reassigned reviewer must
+    run its own profile's model, never the implementer's pin. So
+    ``model_override``/``provider_override`` are cleared here too (mirroring
+    ``kanban_db.request_review``'s ``cross_profile`` branch), and the
+    implementer's values are snapshotted onto the SAME event this function
+    already writes so ``request_changes`` can restore them on the round trip
+    back (it reads the latest ``assigned`` event's
+    ``implementer_model_override``/``implementer_provider_override`` the
+    same way it reads a ``review_requested`` event's).
+
+    ``dry_run`` reports without writing. Returns False when the write failed
+    or the row was no longer a ``review`` row to reassign (status changed
+    between read and write — never appends a phantom handoff event).
     """
     if dry_run:
         return True
     try:
         with _kb.write_txn(conn):
-            conn.execute(
-                "UPDATE tasks SET assignee = ? WHERE id = ? AND status = 'review'",
+            row = conn.execute(
+                "SELECT model_override, provider_override FROM tasks WHERE id = ?",
+                (task_id,),
+            ).fetchone()
+            if row is None:
+                return False
+            implementer_model_override = row["model_override"]
+            implementer_provider_override = row["provider_override"]
+            cur = conn.execute(
+                "UPDATE tasks SET assignee = ?, model_override = NULL, provider_override = NULL "
+                "WHERE id = ? AND status = 'review'",
                 (reviewer, task_id),
             )
-            _kb._append_event(
-                conn, task_id, "assigned",
-                {
-                    "assignee": reviewer,
-                    "previous_assignee": previous_assignee,
-                    "source": "kanban.default_reviewer",
-                },
-            )
+            if cur.rowcount != 1:
+                # Row left 'review' between read and write (claimed by
+                # another dispatcher, reopened, etc.) — no handoff happened,
+                # so no event should claim one did.
+                return False
+            payload: dict[str, Any] = {
+                "assignee": reviewer,
+                "previous_assignee": previous_assignee,
+                "source": "kanban.default_reviewer",
+            }
+            if implementer_model_override is not None or implementer_provider_override is not None:
+                payload["implementer_model_override"] = implementer_model_override
+                payload["implementer_provider_override"] = implementer_provider_override
+            _kb._append_event(conn, task_id, "assigned", payload)
     except Exception:
         _kb._log.debug(
             "kanban dispatch: failed to apply default_reviewer=%r to task %s",
@@ -1838,21 +1897,27 @@ def _resolve_default_assignee(default_assignee: Optional[str]) -> Optional[str]:
 def _resolve_default_reviewer(default_reviewer: Optional[str]) -> Optional[str]:
     """``kanban.default_reviewer`` when it names a real, installed profile.
 
-    Same guard as :func:`_resolve_default_assignee`: an unimportable profiles
-    module trusts the operator's config (a missing profile is then caught by
-    the downstream ``profile_exists`` check in the dispatch lane); a profile
-    that provably does not exist resolves to ``None`` so the review loop
-    falls back to the card's own assignee rather than stranding it.
+    Unlike :func:`_resolve_default_assignee` (which only fills a BLANK
+    assignee, so trusting an unimportable ``profiles`` module is safe — the
+    downstream ``profile_exists`` check in the dispatch lane still catches a
+    bad name before spawn), this value OVERWRITES a real assignee. The same
+    ``profiles`` import failure that disables THIS guard also disables that
+    downstream safety net (``_profile_exists_fn`` returns ``None`` for the
+    identical reason), so nothing would be left to catch a typo'd profile
+    name replacing the implementer's — it would spawn a nonspawnable profile
+    instead of falling back. Fail CLOSED here: an unimportable ``profiles``
+    module or a profile that provably does not exist both resolve to
+    ``None`` so the review loop falls back to the card's own assignee rather
+    than overwriting it on unverified trust.
     """
     name = (default_reviewer or "").strip() or None
-    if name:
-        try:
-            from hermes_cli.profiles import profile_exists
-            if not profile_exists(name):
-                return None
-        except Exception:
-            pass
-    return name
+    if not name:
+        return None
+    try:
+        from hermes_cli.profiles import profile_exists
+    except Exception:
+        return None
+    return name if profile_exists(name) else None
 
 
 # The dispatch lock has been released here. Fire the tick observer strictly OUTSIDE the single-writer
@@ -1964,11 +2029,19 @@ def _dispatch_once_locked(
         # implementer never finds anything to do — the worker exits clean
         # (rc=0) and the dispatcher scores it a protocol_violation, parking
         # the card after failure_limit. When a different, real profile is
-        # configured, reassign the row (mirrors default_assignee's mutate-
-        # the-row honesty) and dispatch under the reviewer instead. Unset /
-        # same-as-assignee / missing-profile all fall through unchanged —
-        # never fail the tick over a misconfigured reviewer.
-        if default_reviewer and default_reviewer != row_assignee:
+        # configured AND the row is still owned by its implementer (no
+        # explicit reviewer= was ever routed for it), reassign the row
+        # (mirrors default_assignee's mutate-the-row honesty) and dispatch
+        # under the reviewer instead. Unset / same-as-assignee /
+        # missing-profile / already-explicitly-routed all fall through
+        # unchanged — never fail the tick over a misconfigured reviewer, and
+        # never override a worker's own reviewer= choice (including one
+        # re-routed by _prior_reviewer provenance on a re-review).
+        if (
+            default_reviewer
+            and default_reviewer != row_assignee
+            and _review_row_implementer_owned(conn, row["id"])
+        ):
             if _apply_default_reviewer(
                 conn, row["id"], default_reviewer,
                 previous_assignee=row_assignee, dry_run=dry_run,
