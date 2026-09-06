@@ -1228,6 +1228,7 @@ CREATE INDEX IF NOT EXISTS idx_links_child           ON task_links(child_id);
 CREATE INDEX IF NOT EXISTS idx_links_parent          ON task_links(parent_id);
 CREATE INDEX IF NOT EXISTS idx_comments_task         ON task_comments(task_id, created_at);
 CREATE INDEX IF NOT EXISTS idx_events_task           ON task_events(task_id, created_at);
+CREATE INDEX IF NOT EXISTS idx_events_kind_created   ON task_events(kind, created_at);
 CREATE INDEX IF NOT EXISTS idx_runs_task             ON task_runs(task_id, started_at);
 CREATE INDEX IF NOT EXISTS idx_runs_status           ON task_runs(status);
 CREATE INDEX IF NOT EXISTS idx_attachments_task      ON task_attachments(task_id, created_at);
@@ -2573,13 +2574,14 @@ def _terminal_completion_without_reopen(conn: sqlite3.Connection, task_id: str) 
     """The task's last ``completed`` event id iff nothing legitimately reopened
     the task since (returns ``None`` when it's fine to claim).
 
-    Every sanctioned path off ``done`` appends a ``status`` event in the SAME
+    Every sanctioned path off ``done`` appends a reopen event in the SAME
     transaction as the status write: dashboard PATCH/drag-drop
-    (``_set_status_direct``) and parent-reopen invalidation
+    (``_set_status_direct``), explicit archive restore (``unarchive_task``),
+    and parent-reopen invalidation
     (``invalidate_descendants_for_parent_reopen``, which also appends
-    ``descendant_invalidated`` first). So a ``completed`` event with neither
-    kind after it means ``tasks.status`` disagrees with the terminal outcome
-    recorded in the event log WITHOUT a recorded reason — a stale
+    ``descendant_invalidated`` first). So a ``completed`` event with none of
+    those kinds after it means ``tasks.status`` disagrees with the terminal
+    outcome recorded in the event log WITHOUT a recorded reason — a stale
     claim/reclaim race, manual SQL, or a DB restore, not a real reopen. The
     completed run is the authority in that case; the row must not be claimed.
     """
@@ -2592,7 +2594,7 @@ def _terminal_completion_without_reopen(conn: sqlite3.Connection, task_id: str) 
     completed_event_id = row["id"]
     reopened = conn.execute(
         "SELECT 1 FROM task_events WHERE task_id = ? AND id > ? "
-        "AND kind IN ('status', 'descendant_invalidated') LIMIT 1",
+        "AND kind IN ('status', 'unarchived', 'descendant_invalidated') LIMIT 1",
         (task_id, completed_event_id),
     ).fetchone()
     return None if reopened else completed_event_id

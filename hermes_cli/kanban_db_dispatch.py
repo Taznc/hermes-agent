@@ -8,6 +8,7 @@ late-bound via ``_kb`` (import-cycle breaking) so monkeypatching
 from __future__ import annotations
 
 import contextlib
+import json
 import os
 import re
 import signal
@@ -189,6 +190,9 @@ class DispatchResult:
     still owned by their implementer that ``kanban.default_reviewer`` reassigned
     this tick — the auto-review counterpart to ``auto_assigned_default``, so
     telemetry/CLI/dashboard can show the implementer->reviewer handoff."""
+    auto_escalated_rework: list[tuple[str, str, str, int]] = field(default_factory=list)
+    """``(task_id, previous_assignee, escalation_profile, changes_rounds)`` for
+    ready cards routed to a specialist after repeated requested-change cycles."""
     skipped_nonspawnable: list[str] = field(default_factory=list)
     """Ready task ids whose assignee names a control-plane lane (e.g. a Claude
     Code terminal like ``orion-cc``), not a Hermes profile. Expected steady-state
@@ -239,6 +243,10 @@ class DispatchResult:
     """Memory pressure that restricted this tick: ``"critical"`` (no new
     workers), ``"elevated"`` (at most one), ``None`` (no restriction).
     Reclaim/promotion bookkeeping still ran; deferred tasks stay queued."""
+    dispatch_paused: Optional[dict[str, Any]] = None
+    """Sticky per-board start-budget circuit state. While present, reclaim and
+    promotion still run but no new workers spawn until an operator explicitly
+    resumes the board."""
 
 
 # Bounded registry of recently-reaped worker exits, filled by the reap loop in
@@ -1540,6 +1548,9 @@ class DispatchCaps:
     # and an entry point that resolves caps but not the reviewer would silently
     # leave review cards self-assigned to their implementer.
     default_reviewer: Optional[str] = None
+    dispatch_start_budget: Optional[int] = None
+    dispatch_start_window_seconds: int = 600
+    review_rework_escalation_profile: Optional[str] = None
 
 
 def resolve_dispatch_caps(kanban_cfg: Optional[dict] = None) -> DispatchCaps:
@@ -1581,6 +1592,15 @@ def resolve_dispatch_caps(kanban_cfg: Optional[dict] = None) -> DispatchCaps:
         max_spawn=_positive_int_or_none(kanban_cfg.get("max_spawn")),
         default_assignee=(kanban_cfg.get("default_assignee") or "").strip() or None,
         default_reviewer=(kanban_cfg.get("default_reviewer") or "").strip() or None,
+        dispatch_start_budget=_positive_int_or_none(
+            kanban_cfg.get("dispatch_start_budget")
+        ),
+        dispatch_start_window_seconds=_positive_int(
+            kanban_cfg.get("dispatch_start_window_seconds"), 600,
+        ),
+        review_rework_escalation_profile=(
+            kanban_cfg.get("review_rework_escalation_profile") or ""
+        ).strip() or None,
     )
 
 
@@ -1772,6 +1792,106 @@ def _memory_pressure_level(sample: Optional[Mapping[str, Any]] = None) -> str:
         return "unknown"
 
 
+def _dispatch_pause_path(board: Optional[str]) -> Path:
+    """Sticky circuit state beside the resolved board database.
+
+    Deriving this from :func:`kanban_db_path` preserves ``HERMES_KANBAN_DB``
+    sandbox/path-pin isolation. A test or worker pinned to another database must
+    never trip or resume the live board's circuit.
+    """
+    return _kb.kanban_db_path(board).with_suffix(".dispatch-pause.json")
+
+
+def read_dispatch_pause(board: Optional[str] = None) -> Optional[dict[str, Any]]:
+    """Return the board's sticky dispatch pause, if any.
+
+    A malformed/unreadable sentinel fails closed. The operator can always clear
+    it with :func:`resume_dispatch`; silently treating it as absent would make a
+    partially written safety state widen dispatch.
+    """
+    path = _dispatch_pause_path(board)
+    try:
+        if not path.exists():
+            return None
+        raw = json.loads(path.read_text(encoding="utf-8"))
+        if not isinstance(raw, dict) or not raw.get("reason"):
+            raise ValueError("pause state must be an object with a reason")
+        return raw
+    except FileNotFoundError:
+        return None
+    except Exception as exc:
+        return {
+            "reason": "pause_state_unreadable",
+            "detail": str(exc),
+            "path": str(path),
+        }
+
+
+def _write_dispatch_pause(
+    board: Optional[str], reason: str, **details: Any,
+) -> dict[str, Any]:
+    """Atomically engage a sticky per-board dispatch pause."""
+    current = read_dispatch_pause(board)
+    if current is not None:
+        return current
+    state: dict[str, Any] = {
+        "reason": reason,
+        "paused_at": int(time.time()),
+        **details,
+    }
+    path = _dispatch_pause_path(board)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_name(f".{path.name}.{os.getpid()}.tmp")
+    try:
+        tmp.write_text(json.dumps(state, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+        os.replace(tmp, path)
+    finally:
+        with contextlib.suppress(FileNotFoundError):
+            tmp.unlink()
+    _kb._log.warning(
+        "kanban dispatch paused for board %s: %s (%s)",
+        board or _kb.DEFAULT_BOARD,
+        reason,
+        details,
+    )
+    return state
+
+
+def resume_dispatch(board: Optional[str] = None) -> dict[str, Any]:
+    """Explicitly clear a board's sticky start-budget/replay circuit."""
+    _kb._assert_not_delegated_child_mutation()
+    path = _dispatch_pause_path(board)
+    previous = read_dispatch_pause(board)
+    with contextlib.suppress(FileNotFoundError):
+        path.unlink()
+    return {"was_paused": previous is not None, "previous": previous}
+
+
+def _recent_dispatch_starts(
+    conn: sqlite3.Connection, *, window_seconds: int, now: Optional[int] = None,
+) -> int:
+    cutoff = int(now if now is not None else time.time()) - window_seconds
+    return int(
+        conn.execute(
+            "SELECT COUNT(*) FROM task_events WHERE kind = 'spawned' AND created_at >= ?",
+            (cutoff,),
+        ).fetchone()[0]
+    )
+
+
+def _terminal_card_replay_ids(conn: sqlite3.Connection) -> list[str]:
+    """Dispatchable cards with terminal completion but no sanctioned reopen."""
+    rows = conn.execute(
+        "SELECT id FROM tasks WHERE status IN ('ready', 'review') "
+        "ORDER BY created_at, id"
+    ).fetchall()
+    return [
+        str(row["id"])
+        for row in rows
+        if _kb._terminal_completion_without_reopen(conn, str(row["id"])) is not None
+    ]
+
+
 def dispatch_once(
     conn: sqlite3.Connection,
     *,
@@ -1786,6 +1906,9 @@ def dispatch_once(
     default_assignee: Optional[str] = None,
     default_reviewer: Optional[str] = None,
     max_in_progress_per_profile: Optional[int] = None,
+    dispatch_start_budget: Optional[int] = None,
+    dispatch_start_window_seconds: int = 600,
+    review_rework_escalation_profile: Optional[str] = None,
     reconcile_orphans: bool = True,
 ) -> DispatchResult:
     """Run one dispatcher tick under the board's single-writer lock.
@@ -1810,6 +1933,9 @@ def dispatch_once(
             default_assignee=default_assignee,
             default_reviewer=default_reviewer,
             max_in_progress_per_profile=max_in_progress_per_profile,
+            dispatch_start_budget=dispatch_start_budget,
+            dispatch_start_window_seconds=dispatch_start_window_seconds,
+            review_rework_escalation_profile=review_rework_escalation_profile,
             reconcile_orphans=reconcile_orphans,
         )
 
@@ -2057,6 +2183,97 @@ def _apply_default_assignee(
         _kb._log.debug(
             "kanban dispatch: failed to apply default_assignee=%r to task %s",
             assignee, task_id, exc_info=True,
+        )
+        return False
+    return True
+
+
+def _changes_requested_state(
+    conn: sqlite3.Connection, task_id: str,
+) -> tuple[int, Optional[int]]:
+    row = conn.execute(
+        "SELECT COUNT(*) AS rounds, MAX(id) AS latest_id FROM task_events "
+        "WHERE task_id = ? AND kind = 'changes_requested' "
+        "AND id > COALESCE(("
+        "  SELECT MAX(id) FROM task_events WHERE task_id = ? AND kind = 'completed'"
+        "), 0)",
+        (task_id, task_id),
+    ).fetchone()
+    return int(row["rounds"]), (
+        int(row["latest_id"]) if row["latest_id"] is not None else None
+    )
+
+
+def _manually_assigned_after(
+    conn: sqlite3.Connection, task_id: str, event_id: Optional[int],
+) -> bool:
+    """Whether operator intent superseded the latest changes request."""
+    if event_id is None:
+        return False
+    row = conn.execute(
+        "SELECT id, payload FROM task_events WHERE task_id = ? AND kind = 'assigned' "
+        "ORDER BY id DESC LIMIT 1",
+        (task_id,),
+    ).fetchone()
+    if row is None or int(row["id"]) <= event_id:
+        return False
+    try:
+        payload = json.loads(row["payload"] or "{}")
+    except (TypeError, ValueError):
+        payload = {}
+    source = str(payload.get("source") or "") if isinstance(payload, dict) else ""
+    return not source.startswith("kanban.")
+
+
+def _apply_rework_escalation(
+    conn: sqlite3.Connection,
+    task_id: str,
+    escalation_profile: str,
+    *,
+    previous_assignee: str,
+    changes_rounds: int,
+    dry_run: bool,
+) -> bool:
+    """Route repeated review rework to a specialist under its own model route."""
+    if dry_run:
+        return True
+    try:
+        with _kb.write_txn(conn):
+            row = conn.execute(
+                "SELECT model_override, provider_override, reasoning_effort "
+                "FROM tasks WHERE id = ? AND status = 'ready' AND assignee = ?",
+                (task_id, previous_assignee),
+            ).fetchone()
+            if row is None:
+                return False
+            cur = conn.execute(
+                "UPDATE tasks SET assignee = ?, model_override = NULL, "
+                "provider_override = NULL, reasoning_effort = NULL "
+                "WHERE id = ? AND status = 'ready' AND assignee = ?",
+                (escalation_profile, task_id, previous_assignee),
+            )
+            if cur.rowcount != 1:
+                return False
+            _kb._append_event(
+                conn,
+                task_id,
+                "assigned",
+                {
+                    "assignee": escalation_profile,
+                    "previous_assignee": previous_assignee,
+                    "changes_rounds": changes_rounds,
+                    "source": "kanban.review_rework_escalation_profile",
+                    "previous_model_override": row["model_override"],
+                    "previous_provider_override": row["provider_override"],
+                    "previous_reasoning_effort": row["reasoning_effort"],
+                },
+            )
+    except Exception:
+        _kb._log.debug(
+            "kanban dispatch: failed to escalate review rework for task %s to %r",
+            task_id,
+            escalation_profile,
+            exc_info=True,
         )
         return False
     return True
@@ -2327,6 +2544,9 @@ def _dispatch_once_locked(
     default_assignee: Optional[str] = None,
     default_reviewer: Optional[str] = None,
     max_in_progress_per_profile: Optional[int] = None,
+    dispatch_start_budget: Optional[int] = None,
+    dispatch_start_window_seconds: int = 600,
+    review_rework_escalation_profile: Optional[str] = None,
     reconcile_orphans: bool = True,
 ) -> DispatchResult:
     """One dispatcher tick: reclaim stale/crashed running tasks, promote
@@ -2347,6 +2567,54 @@ def _dispatch_once_locked(
     may_spawn, spawn_budget = _tick_spawn_budget(
         conn, result, max_spawn=max_spawn, max_in_progress=max_in_progress, board=board,
     )
+
+    # A tripped board still performs reclaim/promotion bookkeeping above, but
+    # never starts another model session until an operator explicitly resumes.
+    existing_pause = read_dispatch_pause(board)
+    if existing_pause is not None:
+        result.dispatch_paused = existing_pause
+        return result
+
+    start_budget = _positive_int_or_none(dispatch_start_budget)
+    start_window = _positive_int(dispatch_start_window_seconds, 600)
+    if start_budget is not None:
+        replay_ids = _terminal_card_replay_ids(conn)
+        if replay_ids:
+            result.dispatch_paused = {
+                "reason": "terminal_card_replay",
+                "task_ids": replay_ids,
+            }
+            if not dry_run:
+                result.dispatch_paused = _write_dispatch_pause(
+                    board, "terminal_card_replay", task_ids=replay_ids,
+                )
+            return result
+
+        recent_starts = _recent_dispatch_starts(
+            conn, window_seconds=start_window,
+        )
+        if recent_starts >= start_budget:
+            result.dispatch_paused = {
+                "reason": "start_budget_exceeded",
+                "recent_starts": recent_starts,
+                "budget": start_budget,
+                "window_seconds": start_window,
+            }
+            if not dry_run:
+                result.dispatch_paused = _write_dispatch_pause(
+                    board,
+                    "start_budget_exceeded",
+                    recent_starts=recent_starts,
+                    budget=start_budget,
+                    window_seconds=start_window,
+                )
+            return result
+
+        # A single tick must not overshoot the sliding budget. The board trips
+        # immediately after consuming the final slot below.
+        remaining_starts = start_budget - recent_starts
+        spawn_budget = min(spawn_budget, remaining_starts) if spawn_budget is not None else remaining_starts
+
     if not may_spawn:
         return result
 
@@ -2390,6 +2658,9 @@ def _dispatch_once_locked(
     )
     default_assignee = _resolve_default_assignee(default_assignee)
     default_reviewer = _resolve_default_reviewer(default_reviewer)
+    rework_escalation_profile = _resolve_default_reviewer(
+        review_rework_escalation_profile
+    )
     spawned = 0
     for row in ready_rows:
         if ready_budget is not None and spawned >= ready_budget:
@@ -2405,6 +2676,24 @@ def _dispatch_once_locked(
                 continue
             row_assignee = default_assignee
             result.auto_assigned_default.append(row["id"])
+        if rework_escalation_profile and row_assignee != rework_escalation_profile:
+            changes_rounds, latest_change_id = _changes_requested_state(conn, row["id"])
+            if (
+                changes_rounds >= 2
+                and not _manually_assigned_after(conn, row["id"], latest_change_id)
+                and _apply_rework_escalation(
+                    conn,
+                    row["id"],
+                    rework_escalation_profile,
+                    previous_assignee=row_assignee,
+                    changes_rounds=changes_rounds,
+                    dry_run=dry_run,
+                )
+            ):
+                result.auto_escalated_rework.append(
+                    (row["id"], row_assignee, rework_escalation_profile, changes_rounds)
+                )
+                row_assignee = rework_escalation_profile
         if _dispatch_lane_task(conn, row, row_assignee, result, lane="ready", **lane_kwargs):
             spawned += 1
 
@@ -2444,6 +2733,17 @@ def _dispatch_once_locked(
                 row_assignee = default_reviewer
         if _dispatch_lane_task(conn, row, row_assignee, result, lane="review", **lane_kwargs):
             spawned += 1
+
+    if start_budget is not None and spawned and not dry_run:
+        recent_starts = _recent_dispatch_starts(conn, window_seconds=start_window)
+        if recent_starts >= start_budget:
+            result.dispatch_paused = _write_dispatch_pause(
+                board,
+                "start_budget_exceeded",
+                recent_starts=recent_starts,
+                budget=start_budget,
+                window_seconds=start_window,
+            )
     return result
 
 
@@ -2919,6 +3219,7 @@ def run_daemon(
     interval: float = 60.0,
     max_spawn: Optional[int] = None,
     failure_limit: int = DEFAULT_FAILURE_LIMIT,
+    board: Optional[str] = None,
     stop_event=None,
     on_tick=None,
 ) -> None:
@@ -2958,14 +3259,18 @@ def run_daemon(
             # Re-resolved every tick (config load is mtime-cached) so operator
             # edits apply without a restart.
             caps = resolve_dispatch_caps()
-            with contextlib.closing(_kbc.connect()) as conn:
+            with contextlib.closing(_kbc.connect(board=board)) as conn:
                 res = dispatch_once(
                     conn,
+                    board=board,
                     max_spawn=max_spawn if max_spawn is not None else caps.max_spawn,
                     max_in_progress=caps.max_in_progress,
                     max_in_progress_per_profile=caps.max_in_progress_per_profile,
                     default_assignee=caps.default_assignee,
                     default_reviewer=caps.default_reviewer,
+                    dispatch_start_budget=caps.dispatch_start_budget,
+                    dispatch_start_window_seconds=caps.dispatch_start_window_seconds,
+                    review_rework_escalation_profile=caps.review_rework_escalation_profile,
                     failure_limit=failure_limit,
                 )
             if on_tick is not None:
