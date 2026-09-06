@@ -652,12 +652,97 @@ def _rule_block_unblock_cycling(task, events, runs, now, cfg) -> list[Diagnostic
     )]
 
 
+def _latest_respawn_guard_reason(events: Iterable[Any], since_ts: int) -> Optional[str]:
+    """The reason of the most recent ``respawn_guarded`` event at or after
+    ``since_ts`` (the task's current ready-since timestamp), or ``None``.
+
+    Guard events strictly before ``since_ts`` belong to a PRIOR ready period
+    (the task has since been reclaimed/promoted/unblocked) and must not be
+    read as "still guarded" — only a guard stamped after the task's current
+    entry into ready reflects what is holding it right now.
+    """
+    latest_ts, latest_reason = 0, None
+    for ev in events:
+        if _event_kind(ev) != "respawn_guarded":
+            continue
+        ts = _event_ts(ev)
+        if ts < since_ts or ts < latest_ts:
+            continue
+        reason = _parse_payload(ev).get("reason")
+        if reason:
+            latest_ts, latest_reason = ts, reason
+    return latest_reason
+
+
+def _rule_respawn_guarded(task, events, runs, now, cfg) -> list[Diagnostic]:
+    """Surfaces the dispatcher's ``respawn_guarded`` decision directly, so a
+    guarded card never presents merely as ``stranded_in_ready``: the two need
+    OPPOSITE operator actions (guarded: inspect/clear the guard input —
+    unrelated PR comment, stale success record; stranded: reassign / check
+    the worker pool). Without this rule the guard reason is invisible outside
+    ``hermes kanban tail``, and the age-based stranded diagnostic actively
+    misleads by blaming a misspelled assignee or dead worker pool instead.
+    """
+    if _task_field(task, "status") != "ready":
+        return []
+    if _task_field(task, "claim_lock"):
+        return []
+    last_ready_ts = _latest_event_ts(events, {"created", "promoted", "reclaimed", "unblocked"})
+    if last_ready_ts == 0:
+        last_ready_ts = int(_task_field(task, "created_at", default=0) or 0)
+    reason = _latest_respawn_guard_reason(events, last_ready_ts)
+    if reason is None:
+        return []
+    last_guard_ts = _latest_event_ts(
+        (ev for ev in events if _parse_payload(ev).get("reason") == reason), {"respawn_guarded"},
+    ) or now
+    _REASON_DETAIL = {
+        "blocker_auth": "The dispatcher saw a quota/auth-flavored error and is deferring "
+                        "immediate retries; the breaker will trip once the failure count "
+                        "reaches the limit.",
+        "recent_success": "A run completed successfully within the guard window and no "
+                           "re-queue event has arrived since; the dispatcher assumes this "
+                           "task is already done and is not spawning a duplicate.",
+        "rate_limit_cooldown": "The latest run hit a provider rate limit; the dispatcher is "
+                                "waiting out the configured cooldown before retrying.",
+        "active_pr": "A comment from this task's own assignee cites a GitHub PR URL for "
+                     "this task's own repo; the dispatcher assumes a prior worker already "
+                     "opened a PR and is not spawning a duplicate.",
+    }
+    return [Diagnostic(
+        kind="respawn_guarded", severity="warning",
+        title=f"Held by respawn guard: {reason}",
+        detail=_REASON_DETAIL.get(reason, f"The dispatcher is deferring this task ({reason}).") +
+               " This is NOT the same problem as a stranded/unclaimed task — reassigning will "
+               "not clear it.",
+        actions=[_cli_hint("Check dispatcher status", "hermes kanban diagnostics")],
+        first_seen_at=last_guard_ts, last_seen_at=last_guard_ts, count=1,
+        data={"reason": reason},
+    )]
+
+
 def _rule_stranded_in_ready(task, events, runs, now, cfg) -> list[Diagnostic]:
     """Assigned, unclaimed, ``ready`` for >= cfg["stranded_threshold_seconds"]
     (default 30 min). Deliberately age-based and identity-agnostic so it
     catches typo'd assignees, deleted profiles, and down external worker
     pools alike without a registry to curate. Unassigned tasks are excluded —
-    the dispatcher's ``skipped_unassigned`` already covers them."""
+    the dispatcher's ``skipped_unassigned`` already covers them.
+
+    Suppressed while an active ``respawn_guarded`` event explains the lack of
+    a claim (see ``_rule_respawn_guarded``): a guarded card is not a stranded
+    one, and the two diagnostics recommend opposite remedies — showing both
+    would point the operator at "reassign" for a card that isn't actually
+    stuck on assignment.
+
+    Concurrency-aware: a board sitting at ``kanban.max_in_progress`` (or the
+    card's assignee sitting at ``kanban.max_in_progress_per_profile``) is
+    correctly queued behind a full pipe, not stranded — there is no operator
+    action to take, so the diagnostic is suppressed entirely rather than
+    emitted at a downgraded severity. ``cfg["_concurrency"]`` (see
+    :func:`hermes_cli.kanban_db_dispatch.concurrency_snapshot`) carries the
+    SAME counts/caps the dispatcher itself enforces, so this can never drift
+    from the real cap check.
+    """
     threshold_seconds = float(cfg.get("stranded_threshold_seconds", 30 * 60))
     if _task_field(task, "status") != "ready":
         return []
@@ -668,6 +753,17 @@ def _rule_stranded_in_ready(task, events, runs, now, cfg) -> list[Diagnostic]:
     if not assignee.strip():
         return []
 
+    concurrency = cfg.get("_concurrency")
+    if isinstance(concurrency, dict):
+        global_cap = concurrency.get("max_in_progress")
+        if global_cap is not None and concurrency.get("total_running", 0) >= global_cap:
+            return []  # host is at its concurrency cap: queued, not stranded
+        profile_cap = concurrency.get("max_in_progress_per_profile")
+        if profile_cap is not None:
+            running_by_assignee = concurrency.get("running_by_assignee") or {}
+            if running_by_assignee.get(assignee, 0) >= profile_cap:
+                return []  # this assignee is at its per-profile cap: queued, not stranded
+
     # Most recent event that put the task into ready; with none (old task /
     # truncated events) fall back to created_at — over-flagging an ancient
     # task beats missing a stranded one.
@@ -675,6 +771,9 @@ def _rule_stranded_in_ready(task, events, runs, now, cfg) -> list[Diagnostic]:
     if last_ready_ts == 0:
         last_ready_ts = int(_task_field(task, "created_at", default=0) or 0)
     if last_ready_ts == 0:
+        return []
+
+    if _latest_respawn_guard_reason(events, last_ready_ts) is not None:
         return []
 
     age_seconds = now - last_ready_ts
@@ -719,6 +818,7 @@ _RULES: list[RuleFn] = [
     _rule_review_dependency_deadlock,
     _rule_stuck_in_blocked,
     _rule_block_unblock_cycling,
+    _rule_respawn_guarded,
     _rule_stranded_in_ready,
 ]
 
@@ -782,14 +882,25 @@ def compute_task_diagnostics(
     now: Optional[int] = None,
     config: Optional[dict] = None,
     graph: Optional[dict] = None,
+    concurrency: Optional[dict] = None,
 ) -> list[Diagnostic]:
     """Run every rule for one task; critical first, then error, warning; ties
-    broken by most-recent ``last_seen_at``."""
+    broken by most-recent ``last_seen_at``.
+
+    ``concurrency`` (see :func:`hermes_cli.kanban_db_dispatch.concurrency_snapshot`)
+    carries the host's resolved ``kanban.max_in_progress`` /
+    ``max_in_progress_per_profile`` caps and current running-task counts, so
+    ``_rule_stranded_in_ready`` can suppress the diagnostic when a ``ready``
+    card is correctly queued behind a full pipe rather than actually stranded.
+    Omit it (the default) to preserve the old age-only behavior — e.g. call
+    sites without a live DB connection to compute counts from."""
     now_ts = int(now if now is not None else time.time())
     config = config or {}
     cfg = {**DEFAULT_CONFIG, **config}
     if graph is not None:
         cfg["_graph"] = graph
+    if concurrency is not None:
+        cfg["_concurrency"] = concurrency
     if not _has_explicit_threshold(config) and "failure_limit" in config:
         cfg["failure_threshold"] = _positive_int(
             config.get("failure_limit"), DEFAULT_CONFIG["failure_threshold"],
