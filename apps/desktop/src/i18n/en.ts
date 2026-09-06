@@ -3258,6 +3258,11 @@ export const en: Translations = withForkKeys(forkEn, {
       address: 'Address',
       addressPlaceholder: 'Enter address',
       blankPageBody: 'Type an address above to browse, or ask Hermes to open a page.',
+      noGuestTitle: 'Pages open in a browser tab',
+      noGuestBody:
+        'This build of Hermes runs in your browser, which cannot embed another site in the pane. Enter an address above and Hermes opens it in a new browser tab.',
+      noGuestOpen: url => `Open ${url} in a browser tab`,
+      openBlocked: 'Your browser blocked the new tab. Allow pop-ups for this page, then try again.',
       finishedRestarting: message => `Hermes finished restarting the preview server${message ? `: ${message}` : ''}`,
       failedRestarting: message => `Server restart failed: ${message}`,
       unknownError: 'unknown error',

@@ -2427,6 +2427,11 @@ export const ar = defineForkLocale(forkAr, {
       address: 'العنوان',
       addressPlaceholder: 'أدخل العنوان',
       blankPageBody: 'اكتب عنوانًا في الأعلى للتصفح، أو اطلب من Hermes فتح صفحة.',
+      noGuestTitle: 'تُفتح الصفحات في علامة تبويب بالمتصفح',
+      noGuestBody:
+        'يعمل هذا الإصدار من Hermes داخل متصفحك، ولا يمكنه تضمين موقع آخر في اللوحة. اكتب عنوانًا في الأعلى وسيفتحه Hermes في علامة تبويب جديدة بالمتصفح.',
+      noGuestOpen: url => `فتح ${url} في علامة تبويب بالمتصفح`,
+      openBlocked: 'حظر متصفحك علامة التبويب الجديدة. اسمح بالنوافذ المنبثقة لهذه الصفحة ثم أعد المحاولة.',
       finishedRestarting: message => `أنهى Hermes إعادة تشغيل خادم المعاينة${message ? `: ${message}` : ''}`,
       failedRestarting: message => `فشلت إعادة تشغيل الخادم: ${message}`,
       unknownError: 'خطأ غير معروف',
