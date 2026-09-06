@@ -183,6 +183,32 @@ export function SidebarDateDivider({
   )
 }
 
+/** Hover-revealed archive control for every session in a date bucket. */
+export function SidebarDateDividerArchiveButton({
+  ariaLabel,
+  onArchive
+}: {
+  ariaLabel: string
+  onArchive: () => void
+}) {
+  return (
+    <Tip label={ariaLabel}>
+      <Button
+        aria-label={ariaLabel}
+        className="grid size-4 shrink-0 place-items-center rounded-sm bg-transparent text-(--ui-text-quaternary) opacity-0 transition-opacity hover:bg-(--ui-control-hover-background) hover:text-foreground group-hover/workspace:opacity-100 focus-visible:opacity-100"
+        onClick={event => {
+          event.stopPropagation()
+          onArchive()
+        }}
+        size="icon"
+        variant="ghost"
+      >
+        <Codicon name="archive" size="0.875rem" />
+      </Button>
+    </Tip>
+  )
+}
+
 /** Outer grid — sole owner of row height and of the trailing inset. The
  *  `actions` slot is marked `data-row-actions` so a row-wide drag gesture can
  *  exclude it with one selector: it holds real controls, never grab surface.

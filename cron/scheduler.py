@@ -3253,12 +3253,12 @@ def _wait_for_external_cron_worker(
 
 
 def _launch_external_cron_worker(job: dict) -> bool:
-    """Launch *job* outside a managed gateway cgroup when required.
+    """Launch *job* outside its supervising unit's cgroup when required.
 
-    Returns ``False`` when the caller is not a managed systemd gateway and the
-    existing in-process path should be used.  In managed topology, failure to
-    establish the transient scope raises: falling back would recreate the
-    restart interruption this handoff exists to prevent.
+    Returns ``False`` when the caller is not the main process of a supervised
+    systemd unit and the existing in-process path should be used.  In managed
+    topology, failure to establish the transient scope raises: falling back
+    would recreate the restart interruption this handoff exists to prevent.
     """
     execution_id = str(job["execution_id"])
     job_id = str(job["id"])
@@ -3277,12 +3277,18 @@ def _launch_external_cron_worker(job: dict) -> bool:
 
     from agent.secret_scope import is_multiplex_active
     from tools.environments.local import build_subprocess_env
-    from tools.process_registry import restart_safe_gateway_child_argv
+    from tools.process_registry import restart_safe_supervised_child_argv
 
     multiplex_active = is_multiplex_active()
-    scoped_command = restart_safe_gateway_child_argv(
+    worker_env = build_subprocess_env(
+        scrub_secrets=multiplex_active,
+        inherit_profile_home=True,
+        extra={"HERMES_HOME": str(_get_hermes_home().resolve())},
+    )
+    scoped_command = restart_safe_supervised_child_argv(
         command,
         unit_suffix=f"cron-{job_id}-exec-{execution_id}",
+        env=worker_env,
     )
     if scoped_command == command:
         return False
@@ -3314,11 +3320,6 @@ def _launch_external_cron_worker(job: dict) -> bool:
         payload_path.unlink(missing_ok=True)
         raise
 
-    worker_env = build_subprocess_env(
-        scrub_secrets=multiplex_active,
-        inherit_profile_home=True,
-        extra={"HERMES_HOME": str(_get_hermes_home().resolve())},
-    )
     try:
         process = subprocess.Popen(
             scoped_command,

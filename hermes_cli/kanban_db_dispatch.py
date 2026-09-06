@@ -8,6 +8,7 @@ late-bound via ``_kb`` (import-cycle breaking) so monkeypatching
 from __future__ import annotations
 
 import contextlib
+import json
 import os
 import re
 import signal
@@ -184,6 +185,14 @@ class DispatchResult:
     """Unassigned task ids that had ``kanban.default_assignee`` applied this
     tick before spawning, so telemetry/CLI/dashboard can show the dispatcher
     acting on the fallback rule rather than explicit assignments."""
+    auto_assigned_reviewer: list[tuple[str, str, str]] = field(default_factory=list)
+    """``(task_id, previous_assignee, reviewer)`` triples for review-lane cards
+    still owned by their implementer that ``kanban.default_reviewer`` reassigned
+    this tick — the auto-review counterpart to ``auto_assigned_default``, so
+    telemetry/CLI/dashboard can show the implementer->reviewer handoff."""
+    auto_escalated_rework: list[tuple[str, str, str, int]] = field(default_factory=list)
+    """``(task_id, previous_assignee, escalation_profile, changes_rounds)`` for
+    ready cards routed to a specialist after repeated requested-change cycles."""
     skipped_nonspawnable: list[str] = field(default_factory=list)
     """Ready task ids whose assignee names a control-plane lane (e.g. a Claude
     Code terminal like ``orion-cc``), not a Hermes profile. Expected steady-state
@@ -215,6 +224,18 @@ class DispatchResult:
     request-changes / escalate). Neutral audit outcome — no failure counted, no breaker fed — but
     NOT auto-recoverable like a rate-limit requeue: the task lands in ``blocked`` and stays sticky
     until an explicit ``kanban_unblock`` reopens it for another reviewer."""
+    serialized_coedit: list[tuple[str, str, str]] = field(default_factory=list)
+    """``(task_id, holder_id, path)`` for cards deferred this tick because they
+    declare an edit target another running/just-spawned card already owns. The
+    card gained a real dependency edge on the holder and sits in ``todo`` until
+    it completes — NOT operator-actionable and NOT a failure: it is the board
+    serializing a co-edit that prose in two card bodies provably cannot."""
+    released_coedit: list[tuple[str, str]] = field(default_factory=list)
+    """``(task_id, holder_id)`` for serialization edges dropped this tick because
+    the holder stalled (``blocked``/``on_hold``) and will not produce the work
+    the parked card was waiting for. The edge is a lease, not a dependency —
+    without this a card would be held hostage until a human unblocked a
+    DIFFERENT card, which is the routing bug the guard exists to remove."""
     skipped_locked: bool = False
     """True when another process held the board's dispatch lock: this tick did
     no DB writes; the lock holder is making progress on the same board."""
@@ -222,6 +243,10 @@ class DispatchResult:
     """Memory pressure that restricted this tick: ``"critical"`` (no new
     workers), ``"elevated"`` (at most one), ``None`` (no restriction).
     Reclaim/promotion bookkeeping still ran; deferred tasks stay queued."""
+    dispatch_paused: Optional[dict[str, Any]] = None
+    """Sticky per-board start-budget circuit state. While present, reclaim and
+    promotion still run but no new workers spawn until an operator explicitly
+    resumes the board."""
 
 
 # Bounded registry of recently-reaped worker exits, filled by the reap loop in
@@ -477,6 +502,21 @@ def heartbeat_worker(
     Liveness signal orthogonal to the PID check: a worker whose forked child
     (train loop, crawl) is stuck can still have a live Python process.
     Returns False if the task is not running or its claim expired.
+
+    ``False`` is deliberately ONE return value for two different situations
+    this function cannot itself distinguish: ``task_id`` was never real (a
+    typo/hallucinated id), or ``task_id`` WAS real and its row is now gone —
+    an orphaned worker, e.g. because ``delete_task`` ran against a live
+    ``running`` row before the guard in t_749b0510 existed, or via any other
+    path that drops a row out from under its worker. Telling those apart
+    needs the CALLER's own identity (only the worker itself knows whether
+    ``task_id`` is the task it was spawned for), so that distinction is made
+    one layer up, in the ``kanban_heartbeat``/``kanban_complete`` tool
+    handlers (``tools/kanban_tools.py:_orphan_or_lifecycle_error``), which
+    return a structured ``orphaned: true`` field instead of a plain error
+    when the vanished id matches the calling worker's own ``HERMES_KANBAN_TASK``.
+    An orphaned worker should treat that field as "stop calling kanban tools
+    and end this turn" rather than retrying.
     """
     now = int(time.time())
     with _kb.write_txn(conn):
@@ -1503,6 +1543,14 @@ class DispatchCaps:
     max_in_progress_per_profile: Optional[int]
     max_spawn: Optional[int]
     default_assignee: Optional[str]
+    # kanban.default_reviewer rides on the same shared resolution as the caps:
+    # every dispatch_once entry point must route review-lane cards identically,
+    # and an entry point that resolves caps but not the reviewer would silently
+    # leave review cards self-assigned to their implementer.
+    default_reviewer: Optional[str] = None
+    dispatch_start_budget: Optional[int] = None
+    dispatch_start_window_seconds: int = 600
+    review_rework_escalation_profile: Optional[str] = None
 
 
 def resolve_dispatch_caps(kanban_cfg: Optional[dict] = None) -> DispatchCaps:
@@ -1543,6 +1591,16 @@ def resolve_dispatch_caps(kanban_cfg: Optional[dict] = None) -> DispatchCaps:
         ),
         max_spawn=_positive_int_or_none(kanban_cfg.get("max_spawn")),
         default_assignee=(kanban_cfg.get("default_assignee") or "").strip() or None,
+        default_reviewer=(kanban_cfg.get("default_reviewer") or "").strip() or None,
+        dispatch_start_budget=_positive_int_or_none(
+            kanban_cfg.get("dispatch_start_budget")
+        ),
+        dispatch_start_window_seconds=_positive_int(
+            kanban_cfg.get("dispatch_start_window_seconds"), 600,
+        ),
+        review_rework_escalation_profile=(
+            kanban_cfg.get("review_rework_escalation_profile") or ""
+        ).strip() or None,
     )
 
 
@@ -1590,8 +1648,13 @@ def count_running_tasks_other_boards(board: Optional[str] = None) -> int:
     Boards are matched by resolved DB path, so ``HERMES_KANBAN_DB`` (pins every
     board to one file) yields 0. Fails open per board.
     """
+    # A path pin identifies one physical DB even when callers enumerate it by
+    # several board slugs. Do not turn those slugs into explicit cross-board
+    # requests here: this internal sweep has no such intent, and doing so would
+    # double-count workers (and re-enable the multiplied-cap bug).
+    pinned = bool(os.environ.get("HERMES_KANBAN_DB", "").strip())
     try:
-        current_path = str(_kb.kanban_db_path(board=board).expanduser().resolve())
+        current_path = str(_kb.kanban_db_path(board=None if pinned else board).expanduser().resolve())
     except Exception:
         current_path = None
     try:
@@ -1602,13 +1665,13 @@ def count_running_tasks_other_boards(board: Optional[str] = None) -> int:
     for meta in boards:
         slug = meta.get("slug") or _kb.DEFAULT_BOARD
         try:
-            path = _kb.kanban_db_path(board=slug).expanduser()
+            path = _kb.kanban_db_path(board=None if pinned else slug).expanduser()
             resolved = str(path.resolve())
             if current_path is not None and resolved == current_path:
                 continue
             if not path.exists():
                 continue
-            other = _kbc.connect(board=slug)
+            other = _kbc.connect(board=None if pinned else slug)
             try:
                 total += count_running_tasks(other)
             finally:
@@ -1624,10 +1687,13 @@ def count_running_tasks_by_assignee_other_boards(board: Optional[str] = None) ->
 
     Per-profile concurrency is host-wide just like ``max_in_progress``: a
     profile may be assigned work from any board, but its model/API quota is one
-    shared resource.
+    shared resource. A path pin represents one DB, so every enumerated slug
+    remains pinned for this internal sweep just as in
+    :func:`count_running_tasks_other_boards`.
     """
+    pinned = bool(os.environ.get("HERMES_KANBAN_DB", "").strip())
     try:
-        current_path = str(_kb.kanban_db_path(board=board).expanduser().resolve())
+        current_path = str(_kb.kanban_db_path(board=None if pinned else board).expanduser().resolve())
         boards = _kb.list_boards(include_archived=False)
     except Exception:
         return {}
@@ -1635,10 +1701,10 @@ def count_running_tasks_by_assignee_other_boards(board: Optional[str] = None) ->
     for meta in boards:
         slug = meta.get("slug") or _kb.DEFAULT_BOARD
         try:
-            path = _kb.kanban_db_path(board=slug).expanduser()
+            path = _kb.kanban_db_path(board=None if pinned else slug).expanduser()
             if str(path.resolve()) == current_path or not path.exists():
                 continue
-            other = _kbc.connect(board=slug)
+            other = _kbc.connect(board=None if pinned else slug)
             try:
                 rows = other.execute(
                     "SELECT assignee, COUNT(*) AS n FROM tasks "
@@ -1726,6 +1792,106 @@ def _memory_pressure_level(sample: Optional[Mapping[str, Any]] = None) -> str:
         return "unknown"
 
 
+def _dispatch_pause_path(board: Optional[str]) -> Path:
+    """Sticky circuit state beside the resolved board database.
+
+    Deriving this from :func:`kanban_db_path` preserves ``HERMES_KANBAN_DB``
+    sandbox/path-pin isolation. A test or worker pinned to another database must
+    never trip or resume the live board's circuit.
+    """
+    return _kb.kanban_db_path(board).with_suffix(".dispatch-pause.json")
+
+
+def read_dispatch_pause(board: Optional[str] = None) -> Optional[dict[str, Any]]:
+    """Return the board's sticky dispatch pause, if any.
+
+    A malformed/unreadable sentinel fails closed. The operator can always clear
+    it with :func:`resume_dispatch`; silently treating it as absent would make a
+    partially written safety state widen dispatch.
+    """
+    path = _dispatch_pause_path(board)
+    try:
+        if not path.exists():
+            return None
+        raw = json.loads(path.read_text(encoding="utf-8"))
+        if not isinstance(raw, dict) or not raw.get("reason"):
+            raise ValueError("pause state must be an object with a reason")
+        return raw
+    except FileNotFoundError:
+        return None
+    except Exception as exc:
+        return {
+            "reason": "pause_state_unreadable",
+            "detail": str(exc),
+            "path": str(path),
+        }
+
+
+def _write_dispatch_pause(
+    board: Optional[str], reason: str, **details: Any,
+) -> dict[str, Any]:
+    """Atomically engage a sticky per-board dispatch pause."""
+    current = read_dispatch_pause(board)
+    if current is not None:
+        return current
+    state: dict[str, Any] = {
+        "reason": reason,
+        "paused_at": int(time.time()),
+        **details,
+    }
+    path = _dispatch_pause_path(board)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_name(f".{path.name}.{os.getpid()}.tmp")
+    try:
+        tmp.write_text(json.dumps(state, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+        os.replace(tmp, path)
+    finally:
+        with contextlib.suppress(FileNotFoundError):
+            tmp.unlink()
+    _kb._log.warning(
+        "kanban dispatch paused for board %s: %s (%s)",
+        board or _kb.DEFAULT_BOARD,
+        reason,
+        details,
+    )
+    return state
+
+
+def resume_dispatch(board: Optional[str] = None) -> dict[str, Any]:
+    """Explicitly clear a board's sticky start-budget/replay circuit."""
+    _kb._assert_not_delegated_child_mutation()
+    path = _dispatch_pause_path(board)
+    previous = read_dispatch_pause(board)
+    with contextlib.suppress(FileNotFoundError):
+        path.unlink()
+    return {"was_paused": previous is not None, "previous": previous}
+
+
+def _recent_dispatch_starts(
+    conn: sqlite3.Connection, *, window_seconds: int, now: Optional[int] = None,
+) -> int:
+    cutoff = int(now if now is not None else time.time()) - window_seconds
+    return int(
+        conn.execute(
+            "SELECT COUNT(*) FROM task_events WHERE kind = 'spawned' AND created_at >= ?",
+            (cutoff,),
+        ).fetchone()[0]
+    )
+
+
+def _terminal_card_replay_ids(conn: sqlite3.Connection) -> list[str]:
+    """Dispatchable cards with terminal completion but no sanctioned reopen."""
+    rows = conn.execute(
+        "SELECT id FROM tasks WHERE status IN ('ready', 'review') "
+        "ORDER BY created_at, id"
+    ).fetchall()
+    return [
+        str(row["id"])
+        for row in rows
+        if _kb._terminal_completion_without_reopen(conn, str(row["id"])) is not None
+    ]
+
+
 def dispatch_once(
     conn: sqlite3.Connection,
     *,
@@ -1738,7 +1904,11 @@ def dispatch_once(
     stale_timeout_seconds: int = 0,
     board: Optional[str] = None,
     default_assignee: Optional[str] = None,
+    default_reviewer: Optional[str] = None,
     max_in_progress_per_profile: Optional[int] = None,
+    dispatch_start_budget: Optional[int] = None,
+    dispatch_start_window_seconds: int = 600,
+    review_rework_escalation_profile: Optional[str] = None,
     reconcile_orphans: bool = True,
 ) -> DispatchResult:
     """Run one dispatcher tick under the board's single-writer lock.
@@ -1761,7 +1931,11 @@ def dispatch_once(
             stale_timeout_seconds=stale_timeout_seconds,
             board=board,
             default_assignee=default_assignee,
+            default_reviewer=default_reviewer,
             max_in_progress_per_profile=max_in_progress_per_profile,
+            dispatch_start_budget=dispatch_start_budget,
+            dispatch_start_window_seconds=dispatch_start_window_seconds,
+            review_rework_escalation_profile=review_rework_escalation_profile,
             reconcile_orphans=reconcile_orphans,
         )
 
@@ -1810,6 +1984,53 @@ def _call_spawn_fn(spawn_fn, task: Task, workspace: str, board: Optional[str]) -
         return spawn_fn(task, workspace)
 
 
+def _serialize_coedit(
+    conn: sqlite3.Connection,
+    task_id: str,
+    tenant: Optional[str],
+    paths: list[str],
+    coedit_index,
+    result: "DispatchResult",
+    *,
+    dry_run: bool,
+) -> bool:
+    """Park ``task_id`` behind whichever running card already owns one of its
+    declared edit targets. Returns True when the card was deferred.
+
+    Serialization, not blocking: the card gets a real ``parents=[holder]`` edge
+    so it waits and then starts from a tree that already contains the holder's
+    work. Blocking for a human would be a routing bug — this fleet runs
+    unattended.
+    """
+    if not paths:
+        return False
+    collision = coedit_index.holder_for(tenant, paths)
+    if collision is None:
+        return False
+    holder_id, path = collision
+    if holder_id == task_id:
+        return False
+    result.serialized_coedit.append((task_id, holder_id, path))
+    if dry_run:
+        return True
+    try:
+        # link_tasks demotes a ready child to todo and refuses a cycle, so an
+        # already-linked or circular pair degrades to "leave it alone" rather
+        # than corrupting the graph.
+        _kb.link_tasks(conn, holder_id, task_id)
+    except ValueError:
+        # Cycle or a vanished row: the edge is unsafe, so let the card dispatch
+        # normally rather than stranding it.
+        result.serialized_coedit.pop()
+        return False
+    with _kb.write_txn(conn):
+        _kb._append_event(
+            conn, task_id, "serialized_coedit",
+            {"holder": holder_id, "path": path},
+        )
+    return True
+
+
 def _dispatch_lane_task(
     conn: sqlite3.Connection,
     row: sqlite3.Row,
@@ -1824,6 +2045,8 @@ def _dispatch_lane_task(
     spawn_fn,
     per_profile_cap: Optional[int],
     per_profile_running: dict[str, int],
+    coedit_index=None,
+    coedit_paths: Optional[dict] = None,
 ) -> bool:
     """Guard, claim, resolve the workspace and spawn one ready/review row.
     Returns True when a spawn slot was consumed (real or ``dry_run``); every
@@ -1866,9 +2089,26 @@ def _dispatch_lane_task(
         if per_profile_cap is not None and name:
             per_profile_running[name] = per_profile_running.get(name, 0) + 1
 
+    # Co-edit serialization. Only the ready lane: a review card reads the branch
+    # its implementer already produced, so it is not a concurrent writer.
+    own_paths = (coedit_paths or {}).get(task_id, []) if coedit_paths else []
+    if lane == "ready" and coedit_index is not None and own_paths:
+        if _serialize_coedit(
+            conn, task_id, row["tenant"] if "tenant" in row.keys() else None,
+            own_paths, coedit_index, result, dry_run=dry_run,
+        ):
+            return False
+
+    def _claim_coedit_paths(claimed_id: str, tenant: Optional[str]) -> None:
+        """This card now owns its declared paths for the rest of the tick, so a
+        later ready row in the SAME tick serializes behind it too."""
+        if coedit_index is not None and own_paths:
+            coedit_index.claim(claimed_id, tenant, own_paths)
+
     if dry_run:
         result.spawned.append((task_id, assignee, ""))
         _count_spawn(assignee)
+        _claim_coedit_paths(task_id, row["tenant"] if "tenant" in row.keys() else None)
         return True
     claim = _kb.claim_review_task if lane == "review" else _kb.claim_task
     claimed = claim(conn, task_id, ttl_seconds=ttl_seconds)
@@ -1906,6 +2146,7 @@ def _dispatch_lane_task(
         # only on successful completion (complete_task).
         result.spawned.append((claimed.id, claimed.assignee or "", str(workspace)))
         _count_spawn(claimed.assignee)
+        _claim_coedit_paths(claimed.id, claimed.tenant)
         return True
     except Exception as exc:
         if _record_task_failure(
@@ -1947,6 +2188,194 @@ def _apply_default_assignee(
     return True
 
 
+def _changes_requested_state(
+    conn: sqlite3.Connection, task_id: str,
+) -> tuple[int, Optional[int]]:
+    row = conn.execute(
+        "SELECT COUNT(*) AS rounds, MAX(id) AS latest_id FROM task_events "
+        "WHERE task_id = ? AND kind = 'changes_requested' "
+        "AND id > COALESCE(("
+        "  SELECT MAX(id) FROM task_events WHERE task_id = ? AND kind = 'completed'"
+        "), 0)",
+        (task_id, task_id),
+    ).fetchone()
+    return int(row["rounds"]), (
+        int(row["latest_id"]) if row["latest_id"] is not None else None
+    )
+
+
+def _manually_assigned_after(
+    conn: sqlite3.Connection, task_id: str, event_id: Optional[int],
+) -> bool:
+    """Whether operator intent superseded the latest changes request."""
+    if event_id is None:
+        return False
+    row = conn.execute(
+        "SELECT id, payload FROM task_events WHERE task_id = ? AND kind = 'assigned' "
+        "ORDER BY id DESC LIMIT 1",
+        (task_id,),
+    ).fetchone()
+    if row is None or int(row["id"]) <= event_id:
+        return False
+    try:
+        payload = json.loads(row["payload"] or "{}")
+    except (TypeError, ValueError):
+        payload = {}
+    source = str(payload.get("source") or "") if isinstance(payload, dict) else ""
+    return not source.startswith("kanban.")
+
+
+def _apply_rework_escalation(
+    conn: sqlite3.Connection,
+    task_id: str,
+    escalation_profile: str,
+    *,
+    previous_assignee: str,
+    changes_rounds: int,
+    dry_run: bool,
+) -> bool:
+    """Route repeated review rework to a specialist under its own model route."""
+    if dry_run:
+        return True
+    try:
+        with _kb.write_txn(conn):
+            row = conn.execute(
+                "SELECT model_override, provider_override, reasoning_effort "
+                "FROM tasks WHERE id = ? AND status = 'ready' AND assignee = ?",
+                (task_id, previous_assignee),
+            ).fetchone()
+            if row is None:
+                return False
+            cur = conn.execute(
+                "UPDATE tasks SET assignee = ?, model_override = NULL, "
+                "provider_override = NULL, reasoning_effort = NULL "
+                "WHERE id = ? AND status = 'ready' AND assignee = ?",
+                (escalation_profile, task_id, previous_assignee),
+            )
+            if cur.rowcount != 1:
+                return False
+            _kb._append_event(
+                conn,
+                task_id,
+                "assigned",
+                {
+                    "assignee": escalation_profile,
+                    "previous_assignee": previous_assignee,
+                    "changes_rounds": changes_rounds,
+                    "source": "kanban.review_rework_escalation_profile",
+                    "previous_model_override": row["model_override"],
+                    "previous_provider_override": row["provider_override"],
+                    "previous_reasoning_effort": row["reasoning_effort"],
+                },
+            )
+    except Exception:
+        _kb._log.debug(
+            "kanban dispatch: failed to escalate review rework for task %s to %r",
+            task_id,
+            escalation_profile,
+            exc_info=True,
+        )
+        return False
+    return True
+
+
+def _review_row_implementer_owned(
+    conn: sqlite3.Connection, task_id: str,
+) -> bool:
+    """True when a review-lane row is still owned by the profile that
+    IMPLEMENTED it — the only state ``kanban.default_reviewer`` may touch.
+
+    A bare ``row_assignee != default_reviewer`` inequality can't tell "still
+    the implementer, never routed" apart from "explicitly routed to a real
+    reviewer that just isn't the config's pick" — the latter must never be
+    overridden, whether the routing came from ``kanban_request_review(
+    reviewer=...)`` on the first pass or from ``_prior_reviewer`` provenance
+    on a re-review. The latest ``review_requested`` event's ``reviewer``
+    field is the single source of truth for that distinction: ``None``/
+    absent means the row is still sitting on the implementer's own name
+    (request_review only sets ``reviewer`` in the payload when a handoff was
+    actually decided — see ``kanban_db.request_review``); anything else
+    means a reviewer was deliberately chosen and must stick.
+    """
+    event = _kb._latest_event(conn, task_id, "review_requested")
+    if event is None:
+        # No provenance at all (e.g. a legacy row created before this event
+        # existed) — nothing on record distinguishes implementer-owned from
+        # explicitly-routed, so treat it as implementer-owned (today's
+        # upgrade-safety behavior: the row is eligible for reassignment).
+        return True
+    payload = _kb._json_dict(_kb._row_get(event, "payload"))
+    reviewer = payload.get("reviewer")
+    return not (isinstance(reviewer, str) and reviewer.strip())
+
+
+def _apply_default_reviewer(
+    conn: sqlite3.Connection, task_id: str, reviewer: str, *, previous_assignee: str, dry_run: bool,
+) -> bool:
+    """Reassign a review-lane row still owned by its implementer to ``reviewer``.
+
+    Mirrors :func:`_apply_default_assignee`: mutates the row (not just the
+    in-memory dispatch view) so board state stays honest — the card is now
+    legitimately owned by the auto-assigned reviewer, not "assigned to the
+    implementer but secretly routed elsewhere". The event payload records
+    both sides of the handoff (``previous_assignee`` / ``reviewer`` /
+    ``source``) so the audit trail shows implementer->reviewer provenance.
+
+    This IS a cross-profile handoff exactly like an explicit
+    ``kanban_request_review(reviewer=...)`` — the reassigned reviewer must
+    run its own profile's model, never the implementer's pin. So
+    ``model_override``/``provider_override`` are cleared here too (mirroring
+    ``kanban_db.request_review``'s ``cross_profile`` branch), and the
+    implementer's values are snapshotted onto the SAME event this function
+    already writes so ``request_changes`` can restore them on the round trip
+    back (it reads the latest ``assigned`` event's
+    ``implementer_model_override``/``implementer_provider_override`` the
+    same way it reads a ``review_requested`` event's).
+
+    ``dry_run`` reports without writing. Returns False when the write failed
+    or the row was no longer a ``review`` row to reassign (status changed
+    between read and write — never appends a phantom handoff event).
+    """
+    if dry_run:
+        return True
+    try:
+        with _kb.write_txn(conn):
+            row = conn.execute(
+                "SELECT model_override, provider_override FROM tasks WHERE id = ?",
+                (task_id,),
+            ).fetchone()
+            if row is None:
+                return False
+            implementer_model_override = row["model_override"]
+            implementer_provider_override = row["provider_override"]
+            cur = conn.execute(
+                "UPDATE tasks SET assignee = ?, model_override = NULL, provider_override = NULL "
+                "WHERE id = ? AND status = 'review'",
+                (reviewer, task_id),
+            )
+            if cur.rowcount != 1:
+                # Row left 'review' between read and write (claimed by
+                # another dispatcher, reopened, etc.) — no handoff happened,
+                # so no event should claim one did.
+                return False
+            payload: dict[str, Any] = {
+                "assignee": reviewer,
+                "previous_assignee": previous_assignee,
+                "source": "kanban.default_reviewer",
+            }
+            if implementer_model_override is not None or implementer_provider_override is not None:
+                payload["implementer_model_override"] = implementer_model_override
+                payload["implementer_provider_override"] = implementer_provider_override
+            _kb._append_event(conn, task_id, "assigned", payload)
+    except Exception:
+        _kb._log.debug(
+            "kanban dispatch: failed to apply default_reviewer=%r to task %s",
+            reviewer, task_id, exc_info=True,
+        )
+        return False
+    return True
+
+
 def _run_reclaim_phase(
     conn: sqlite3.Connection,
     result: DispatchResult,
@@ -1968,6 +2397,10 @@ def _run_reclaim_phase(
     result.rate_limited.extend(getattr(detect_crashed_workers, "_last_rate_limited", []))
     result.review_no_verdict.extend(getattr(detect_crashed_workers, "_last_review_no_verdict", []))
     result.timed_out = enforce_max_runtime(conn)
+    # Release serialization edges whose holder stalled, BEFORE promoting: a card
+    # parked behind a now-blocked holder must be free to promote in this same
+    # tick rather than waiting for a human to unblock a different card.
+    result.released_coedit = _kc.release_stranded_coedit_edges(conn)
     result.promoted = _kb.recompute_ready(conn, failure_limit=failure_limit)
 
 
@@ -2035,7 +2468,7 @@ def _tick_spawn_budget(
 def _lane_rows(conn: sqlite3.Connection, status: str) -> list[sqlite3.Row]:
     """Unclaimed rows of one lane in dispatch order."""
     return conn.execute(
-        "SELECT id, assignee FROM tasks "
+        "SELECT id, assignee, tenant FROM tasks "
         f"WHERE status = '{status}' AND claim_lock IS NULL "
         "ORDER BY priority DESC, created_at ASC"
     ).fetchall()
@@ -2068,6 +2501,32 @@ def _resolve_default_assignee(default_assignee: Optional[str]) -> Optional[str]:
     return name
 
 
+def _resolve_default_reviewer(default_reviewer: Optional[str]) -> Optional[str]:
+    """``kanban.default_reviewer`` when it names a real, installed profile.
+
+    Unlike :func:`_resolve_default_assignee` (which only fills a BLANK
+    assignee, so trusting an unimportable ``profiles`` module is safe — the
+    downstream ``profile_exists`` check in the dispatch lane still catches a
+    bad name before spawn), this value OVERWRITES a real assignee. The same
+    ``profiles`` import failure that disables THIS guard also disables that
+    downstream safety net (``_profile_exists_fn`` returns ``None`` for the
+    identical reason), so nothing would be left to catch a typo'd profile
+    name replacing the implementer's — it would spawn a nonspawnable profile
+    instead of falling back. Fail CLOSED here: an unimportable ``profiles``
+    module or a profile that provably does not exist both resolve to
+    ``None`` so the review loop falls back to the card's own assignee rather
+    than overwriting it on unverified trust.
+    """
+    name = (default_reviewer or "").strip() or None
+    if not name:
+        return None
+    try:
+        from hermes_cli.profiles import profile_exists
+    except Exception:
+        return None
+    return name if profile_exists(name) else None
+
+
 # The dispatch lock has been released here. Fire the tick observer strictly OUTSIDE the single-writer
 # critical section (#56066 sweeper finding / #64231 disposition): a slow subscriber must never extend the
 # lock hold and stall a sibling dispatcher's tick.
@@ -2083,7 +2542,11 @@ def _dispatch_once_locked(
     stale_timeout_seconds: int = 0,
     board: Optional[str] = None,
     default_assignee: Optional[str] = None,
+    default_reviewer: Optional[str] = None,
     max_in_progress_per_profile: Optional[int] = None,
+    dispatch_start_budget: Optional[int] = None,
+    dispatch_start_window_seconds: int = 600,
+    review_rework_escalation_profile: Optional[str] = None,
     reconcile_orphans: bool = True,
 ) -> DispatchResult:
     """One dispatcher tick: reclaim stale/crashed running tasks, promote
@@ -2104,6 +2567,54 @@ def _dispatch_once_locked(
     may_spawn, spawn_budget = _tick_spawn_budget(
         conn, result, max_spawn=max_spawn, max_in_progress=max_in_progress, board=board,
     )
+
+    # A tripped board still performs reclaim/promotion bookkeeping above, but
+    # never starts another model session until an operator explicitly resumes.
+    existing_pause = read_dispatch_pause(board)
+    if existing_pause is not None:
+        result.dispatch_paused = existing_pause
+        return result
+
+    start_budget = _positive_int_or_none(dispatch_start_budget)
+    start_window = _positive_int(dispatch_start_window_seconds, 600)
+    if start_budget is not None:
+        replay_ids = _terminal_card_replay_ids(conn)
+        if replay_ids:
+            result.dispatch_paused = {
+                "reason": "terminal_card_replay",
+                "task_ids": replay_ids,
+            }
+            if not dry_run:
+                result.dispatch_paused = _write_dispatch_pause(
+                    board, "terminal_card_replay", task_ids=replay_ids,
+                )
+            return result
+
+        recent_starts = _recent_dispatch_starts(
+            conn, window_seconds=start_window,
+        )
+        if recent_starts >= start_budget:
+            result.dispatch_paused = {
+                "reason": "start_budget_exceeded",
+                "recent_starts": recent_starts,
+                "budget": start_budget,
+                "window_seconds": start_window,
+            }
+            if not dry_run:
+                result.dispatch_paused = _write_dispatch_pause(
+                    board,
+                    "start_budget_exceeded",
+                    recent_starts=recent_starts,
+                    budget=start_budget,
+                    window_seconds=start_window,
+                )
+            return result
+
+        # A single tick must not overshoot the sliding budget. The board trips
+        # immediately after consuming the final slot below.
+        remaining_starts = start_budget - recent_starts
+        spawn_budget = min(spawn_budget, remaining_starts) if spawn_budget is not None else remaining_starts
+
     if not may_spawn:
         return result
 
@@ -2131,12 +2642,25 @@ def _dispatch_once_locked(
     per_profile_running: dict[str, int] = (
         count_running_tasks_by_assignee(conn, board) if per_profile_cap is not None else {}
     )
+    # Co-edit guard. Built only when a ready row actually declares an edit
+    # surface (or filed a hotspot), so a board that uses neither pays one cheap
+    # query and behaves exactly as before.
+    coedit_paths = _kc.edit_paths_for_tasks(conn, [row["id"] for row in ready_rows])
+    coedit_index = (
+        _kc.build_coedit_index(conn)
+        if any(coedit_paths.values()) else None
+    )
     lane_kwargs: dict[str, Any] = dict(
         dry_run=dry_run, ttl_seconds=ttl_seconds, board=board,
         failure_limit=failure_limit, spawn_fn=spawn_fn,
         per_profile_cap=per_profile_cap, per_profile_running=per_profile_running,
+        coedit_index=coedit_index, coedit_paths=coedit_paths,
     )
     default_assignee = _resolve_default_assignee(default_assignee)
+    default_reviewer = _resolve_default_reviewer(default_reviewer)
+    rework_escalation_profile = _resolve_default_reviewer(
+        review_rework_escalation_profile
+    )
     spawned = 0
     for row in ready_rows:
         if ready_budget is not None and spawned >= ready_budget:
@@ -2152,6 +2676,24 @@ def _dispatch_once_locked(
                 continue
             row_assignee = default_assignee
             result.auto_assigned_default.append(row["id"])
+        if rework_escalation_profile and row_assignee != rework_escalation_profile:
+            changes_rounds, latest_change_id = _changes_requested_state(conn, row["id"])
+            if (
+                changes_rounds >= 2
+                and not _manually_assigned_after(conn, row["id"], latest_change_id)
+                and _apply_rework_escalation(
+                    conn,
+                    row["id"],
+                    rework_escalation_profile,
+                    previous_assignee=row_assignee,
+                    changes_rounds=changes_rounds,
+                    dry_run=dry_run,
+                )
+            ):
+                result.auto_escalated_rework.append(
+                    (row["id"], row_assignee, rework_escalation_profile, changes_rounds)
+                )
+                row_assignee = rework_escalation_profile
         if _dispatch_lane_task(conn, row, row_assignee, result, lane="ready", **lane_kwargs):
             spawned += 1
 
@@ -2162,11 +2704,46 @@ def _dispatch_once_locked(
     for row in review_rows:
         if spawn_budget is not None and spawned >= spawn_budget:
             break
-        if not row["assignee"]:
+        row_assignee = row["assignee"]
+        if not row_assignee:
             result.skipped_unassigned.append(row["id"])
             continue
-        if _dispatch_lane_task(conn, row, row["assignee"], result, lane="review", **lane_kwargs):
+        # kanban.default_reviewer: a review-lane card still owned by its
+        # implementer never finds anything to do — the worker exits clean
+        # (rc=0) and the dispatcher scores it a protocol_violation, parking
+        # the card after failure_limit. When a different, real profile is
+        # configured AND the row is still owned by its implementer (no
+        # explicit reviewer= was ever routed for it), reassign the row
+        # (mirrors default_assignee's mutate-the-row honesty) and dispatch
+        # under the reviewer instead. Unset / same-as-assignee /
+        # missing-profile / already-explicitly-routed all fall through
+        # unchanged — never fail the tick over a misconfigured reviewer, and
+        # never override a worker's own reviewer= choice (including one
+        # re-routed by _prior_reviewer provenance on a re-review).
+        if (
+            default_reviewer
+            and default_reviewer != row_assignee
+            and _review_row_implementer_owned(conn, row["id"])
+        ):
+            if _apply_default_reviewer(
+                conn, row["id"], default_reviewer,
+                previous_assignee=row_assignee, dry_run=dry_run,
+            ):
+                result.auto_assigned_reviewer.append((row["id"], row_assignee, default_reviewer))
+                row_assignee = default_reviewer
+        if _dispatch_lane_task(conn, row, row_assignee, result, lane="review", **lane_kwargs):
             spawned += 1
+
+    if start_budget is not None and spawned and not dry_run:
+        recent_starts = _recent_dispatch_starts(conn, window_seconds=start_window)
+        if recent_starts >= start_budget:
+            result.dispatch_paused = _write_dispatch_pause(
+                board,
+                "start_budget_exceeded",
+                recent_starts=recent_starts,
+                budget=start_budget,
+                window_seconds=start_window,
+            )
     return result
 
 
@@ -2477,15 +3054,20 @@ def _open_worker_log(task: Task, board: Optional[str]):
     return open(log_path, "ab")
 
 
-def _restart_safe_worker_argv(task: Task, command: list[str]) -> list[str]:
-    """Wrap a managed-gateway worker in the shared restart-safe scope."""
-    from tools.process_registry import restart_safe_gateway_child_argv
+def _restart_safe_worker_argv(task: Task, command: list[str], env: dict[str, str] | None = None) -> list[str]:
+    """Wrap a worker spawned by a supervised systemd unit in the shared restart-safe scope.
+
+    ``env`` is the child's environment, mutated in place with the user-bus variables the
+    wrapped ``systemd-run --user`` needs — the dispatcher snapshots ``os.environ`` before
+    this call, so without it the spawn execs systemd-run with no bus and dies instantly.
+    """
+    from tools.process_registry import restart_safe_supervised_child_argv
 
     if task.current_run_id is None:
         # Outside managed systemd this is harmless, but a managed dispatch must
         # never mint an untraceable scope.  Check topology through the shared
         # helper first, using a placeholder suffix that cannot be launched.
-        scoped = restart_safe_gateway_child_argv(
+        scoped = restart_safe_supervised_child_argv(
             command, unit_suffix=f"kanban-{task.id}-run-missing"
         )
         if scoped is not command:
@@ -2495,9 +3077,10 @@ def _restart_safe_worker_argv(task: Task, command: list[str]) -> list[str]:
             )
         return command
 
-    return restart_safe_gateway_child_argv(
+    return restart_safe_supervised_child_argv(
         command,
         unit_suffix=f"kanban-{task.id}-run-{task.current_run_id}",
+        env=env,
     )
 
 
@@ -2579,6 +3162,14 @@ def _default_spawn(task: Task, workspace: str, *, board: Optional[str] = None) -
     # Pin the board DB + workspaces root so the worker's kanban paths still
     # match after `hermes -p` rewrites HERMES_HOME (symlink / Docker layouts).
     env["HERMES_KANBAN_DB"] = str(_kb.kanban_db_path(board=board))
+    # Vouch for the pins above: names the kanban home they were computed under.
+    # They normally resolve INSIDE that home and need no vouching, but symlink /
+    # Docker layouts can put the board outside the home the worker resolves, and
+    # without this the containment guard in kanban_db._pin_is_honored() would
+    # drop a legitimate pin. A worker (or a probe it writes) that re-declares
+    # HERMES_HOME/HERMES_KANBAN_HOME makes this stamp disagree, so its sandbox
+    # is honored instead of the production pin — see kanban_db._board_path().
+    env[_kb.KANBAN_PIN_HOME_ENV] = str(_kb.kanban_home())
     env["HERMES_KANBAN_WORKSPACES_ROOT"] = str(_kb.workspaces_root(board=board))
     _retag_legacy_worker_sessions(env["HERMES_KANBAN_WORKSPACES_ROOT"])
     # Board slug — defense-in-depth pin if a path is resolved without the
@@ -2592,10 +3183,10 @@ def _default_spawn(task: Task, workspace: str, *, board: Optional[str] = None) -
     env.pop("HERMES_TUI", None)
 
     cmd = _worker_argv(task, profile_arg, env.get("HERMES_HOME"))
-    # A worker spawned by a managed systemd gateway must leave the gateway's
-    # cgroup before startup; otherwise restarting the service kills the worker
-    # that is performing the handoff.
-    cmd = _restart_safe_worker_argv(task, cmd)
+    # A worker spawned by a supervised systemd unit must leave that unit's cgroup before
+    # startup; otherwise restarting the service kills the worker mid-task. ``env`` is
+    # passed so the scope wrapper can add the user-bus vars it needs to reach systemd.
+    cmd = _restart_safe_worker_argv(task, cmd, env)
     log_f = _open_worker_log(task, board)
     try:
         proc = subprocess.Popen(  # noqa: S603 -- argv is a fixed list built above
@@ -2628,6 +3219,7 @@ def run_daemon(
     interval: float = 60.0,
     max_spawn: Optional[int] = None,
     failure_limit: int = DEFAULT_FAILURE_LIMIT,
+    board: Optional[str] = None,
     stop_event=None,
     on_tick=None,
 ) -> None:
@@ -2667,13 +3259,18 @@ def run_daemon(
             # Re-resolved every tick (config load is mtime-cached) so operator
             # edits apply without a restart.
             caps = resolve_dispatch_caps()
-            with contextlib.closing(_kbc.connect()) as conn:
+            with contextlib.closing(_kbc.connect(board=board)) as conn:
                 res = dispatch_once(
                     conn,
+                    board=board,
                     max_spawn=max_spawn if max_spawn is not None else caps.max_spawn,
                     max_in_progress=caps.max_in_progress,
                     max_in_progress_per_profile=caps.max_in_progress_per_profile,
                     default_assignee=caps.default_assignee,
+                    default_reviewer=caps.default_reviewer,
+                    dispatch_start_budget=caps.dispatch_start_budget,
+                    dispatch_start_window_seconds=caps.dispatch_start_window_seconds,
+                    review_rework_escalation_profile=caps.review_rework_escalation_profile,
                     failure_limit=failure_limit,
                 )
             if on_tick is not None:
@@ -2688,6 +3285,7 @@ def run_daemon(
 
 # Late-bound origin namespace (see module docstring); imported LAST so this
 # module is fully populated before ``kanban_db`` imports from it.
+from hermes_cli import kanban_coedit as _kc  # noqa: E402
 from hermes_cli import kanban_db as _kb  # noqa: E402
 from hermes_cli import kanban_db_connect as _kbc  # noqa: E402
 from hermes_cli import kanban_db_workspace as _kbw  # noqa: E402

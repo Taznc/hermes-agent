@@ -21,6 +21,7 @@ from fastapi.testclient import TestClient
 
 from hermes_cli import kanban_db as kb
 from hermes_cli import kanban_db_connect as kbc
+from hermes_cli import kanban_db_dispatch as kbd
 
 
 # ---------------------------------------------------------------------------
@@ -567,6 +568,24 @@ def test_dashboard_reclaim_of_active_review_preserves_review_phase(client):
 # DELETE /tasks/:id
 # ---------------------------------------------------------------------------
 
+def test_delete_task_refuses_running_task_with_active_worker(client):
+    """Dashboard DELETE surfaces the delete_task live-worker guard as 409 and leaves the
+    running row intact rather than orphaning the worker (t_749b0510)."""
+    t = client.post("/api/plugins/kanban/tasks", json={"title": "running-victim"}).json()["task"]
+    with kbc.connect() as conn:
+        assert kb.claim_task(conn, t["id"]) is not None
+        kbd._set_worker_pid(conn, t["id"], 424242)
+
+    response = client.delete(f"/api/plugins/kanban/tasks/{t['id']}")
+
+    assert response.status_code == 409
+    with kbc.connect() as conn:
+        survivor = kb.get_task(conn, t["id"])
+    assert survivor is not None
+    assert survivor.status == "running"
+    assert survivor.worker_pid == 424242
+
+
 def test_delete_task(client):
     t = client.post("/api/plugins/kanban/tasks", json={"title": "to-delete"}).json()["task"]
     r = client.delete(f"/api/plugins/kanban/tasks/{t['id']}")
@@ -1053,6 +1072,55 @@ def test_bulk_archive(client):
     assert b["id"] not in ids
 
 
+def test_archived_task_reopens_only_through_evented_unarchive(client):
+    """Dashboard drag-drop uses the explicit unarchive verb, not a raw status write."""
+    task = client.post("/api/plugins/kanban/tasks", json={"title": "archived"}).json()["task"]
+    archived = client.patch(
+        f"/api/plugins/kanban/tasks/{task['id']}", json={"status": "archived"},
+    )
+    assert archived.status_code == 200, archived.text
+
+    # The generic direct writer itself cannot escape archived; the public
+    # drag-drop route below must take the explicit unarchive verb instead.
+    plugin = sys.modules["hermes_dashboard_plugin_kanban_test"]
+    with kbc.connect() as conn:
+        assert not plugin._set_status_direct(conn, task["id"], "ready")
+        assert kb.get_task(conn, task["id"]).status == "archived"
+
+    moved = client.patch(
+        f"/api/plugins/kanban/tasks/{task['id']}", json={"status": "ready"},
+    )
+    assert moved.status_code == 200, moved.text
+
+    stored = client.get(f"/api/plugins/kanban/tasks/{task['id']}").json()["task"]
+    assert stored["status"] == "ready"
+    with kbc.connect() as conn:
+        last_event = conn.execute(
+            "SELECT kind, payload FROM task_events WHERE task_id = ? ORDER BY id DESC LIMIT 1",
+            (task["id"],),
+        ).fetchone()
+        assert last_event["kind"] == "unarchived"
+        assert json.loads(last_event["payload"])["status"] == "ready"
+    # This is the durable event/status contract the dispatcher relies on: a task
+    # whose last non-heartbeat event says archived cannot be dispatchable.
+    with kbc.connect() as conn:
+        mismatches = conn.execute(
+            """
+            WITH last_event AS (
+                SELECT task_id, kind,
+                       ROW_NUMBER() OVER (PARTITION BY task_id ORDER BY id DESC) AS n
+                  FROM task_events
+                 WHERE kind != 'heartbeat'
+            )
+            SELECT COUNT(*)
+              FROM tasks t
+              JOIN last_event e ON e.task_id = t.id AND e.n = 1
+             WHERE e.kind = 'archived' AND t.status != 'archived'
+            """,
+        ).fetchone()[0]
+    assert mismatches == 0
+
+
 def test_bulk_reassign(client):
     a = client.post("/api/plugins/kanban/tasks",
                     json={"title": "a", "assignee": "old"}).json()["task"]
@@ -1334,6 +1402,85 @@ def test_diagnostics_endpoint_surfaces_blocked_hallucination(client):
     assert row["diagnostics"][0]["kind"] == "hallucinated_cards"
     assert row["diagnostics"][0]["severity"] == "error"
     assert "t_ffff00001234" in row["diagnostics"][0]["data"]["phantom_ids"]
+
+
+# ---------------------------------------------------------------------------
+# info-severity diagnostics must not badge a card or enter the attention
+# strip on either surface (board payload), while remaining fully visible on
+# the task-detail payload and via GET /diagnostics.
+# ---------------------------------------------------------------------------
+
+
+def _card_for(board_json, task_id):
+    for col in board_json["columns"]:
+        for t in col["tasks"]:
+            if t["id"] == task_id:
+                return t
+    raise AssertionError(f"{task_id} not found on board")
+
+
+def test_info_diagnostic_excluded_from_board_badge_and_warnings(client):
+    """A guard-held ready task with only a benign respawn_guarded (info)
+    diagnostic must show up on the board with no 'warnings' summary and no
+    'diagnostics' list -- both are what the desktop badge and the
+    dashboard's collectDiagTasks() gate on. The same diagnostic must still
+    be present on the task-detail payload."""
+    conn = kbc.connect()
+    try:
+        t = kb.create_task(conn, title="guarded", assignee="w")
+        now = int(time.time())
+        # Backdate the task's own 'created' event so the respawn_guarded event
+        # below (fired 30s ago) falls inside the task's CURRENT ready period --
+        # _rule_respawn_guarded only trusts a guard event at or after the most
+        # recent created/promoted/reclaimed/unblocked event.
+        conn.execute(
+            "UPDATE task_events SET created_at=? WHERE task_id=? AND kind='created'",
+            (now - 3600, t),
+        )
+        conn.execute(
+            "INSERT INTO task_events (task_id, run_id, kind, payload, created_at) "
+            "VALUES (?, NULL, 'respawn_guarded', ?, ?)",
+            (t, json.dumps({"reason": "recent_success"}), now - 30),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+    board = client.get("/api/plugins/kanban/board").json()
+    card = _card_for(board, t)
+    assert card.get("warnings") is None, card.get("warnings")
+    assert "diagnostics" not in card or not card["diagnostics"]
+
+    detail = client.get(f"/api/plugins/kanban/tasks/{t}").json()
+    kinds = [d["kind"] for d in detail["task"]["diagnostics"]]
+    assert "respawn_guarded" in kinds
+
+    diag_resp = client.get("/api/plugins/kanban/diagnostics").json()
+    assert any(row["task_id"] == t for row in diag_resp["diagnostics"])
+
+
+def test_warning_diagnostic_still_badges_board_card(client):
+    """Regression guard: a warning+ diagnostic (stranded_in_ready) must
+    still badge the card and populate 'warnings' -- info-suppression must
+    not over-suppress real signals."""
+    conn = kbc.connect()
+    try:
+        t = kb.create_task(conn, title="stranded", assignee="w")
+        now = int(time.time())
+        conn.execute(
+            "UPDATE task_events SET created_at=? WHERE task_id=? AND kind='created'",
+            (now - 3600, t),
+        )
+        conn.execute("UPDATE tasks SET created_at=? WHERE id=?", (now - 3600, t))
+        conn.commit()
+    finally:
+        conn.close()
+
+    board = client.get("/api/plugins/kanban/board").json()
+    card = _card_for(board, t)
+    assert card.get("warnings") is not None
+    assert card["warnings"]["count"] >= 1
+    assert card["warnings"]["highest_severity"] in ("warning", "error", "critical")
 
 
 # ---------------------------------------------------------------------------

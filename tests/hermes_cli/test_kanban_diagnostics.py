@@ -210,12 +210,14 @@ def test_respawn_guarded_fires_and_suppresses_stranded_in_ready():
     spawning (respawn guard tripped) must present as a distinct
     ``respawn_guarded`` diagnostic naming the reason — never as an
     unexplained ``stranded_in_ready`` warning that sends the operator toward
-    the wrong fix (reassign)."""
+    the wrong fix (reassign). The guard event must be within the staleness
+    window (see ``_respawn_guard_staleness_seconds``) to be trusted as the
+    CURRENT reason for the stall."""
     now = 100_000
     task = _task(status="ready", assignee="demo", claim_lock=None)
     events = [
         _event("created", ts=now - 45 * 60),
-        _event("respawn_guarded", ts=now - 40 * 60, reason="active_pr"),
+        _event("respawn_guarded", ts=now - 30, reason="active_pr"),
     ]
     diags = kd.compute_task_diagnostics(task, events, [], now=now)
 
@@ -328,6 +330,142 @@ def test_stranded_in_ready_ignores_missing_concurrency_snapshot():
     diags = kd.compute_task_diagnostics(task, events, [], now=now)
     stranded = [d for d in diags if d.kind == "stranded_in_ready"]
     assert len(stranded) == 1
+
+
+# ---------------------------------------------------------------------------
+# respawn_guarded — reproduces the live bug: a guard-held ready task must not
+# be misreported as "assignee misspelled" with a reassign action that would
+# defeat the guard (duplicate PR risk for reason=active_pr).
+# ---------------------------------------------------------------------------
+
+
+def _make_ready_with_guard(now, *, guard_reason, guard_age_seconds, ready_age_seconds=1.6 * 3600,
+                            last_failure_error=None, task_id="t_4d5dc14e"):
+    task = _task(
+        id=task_id, status="ready", assignee="claudecode", claim_lock=None,
+        last_failure_error=last_failure_error,
+    )
+    events = [_event("created", ts=now - int(ready_age_seconds))]
+    if guard_reason is not None:
+        events.append(_event("respawn_guarded", ts=now - guard_age_seconds, reason=guard_reason))
+    return task, events
+
+
+@pytest.mark.parametrize("reason", ["recent_success", "active_pr", "rate_limit_cooldown"])
+def test_respawn_guarded_benign_reason_suppresses_stranded_and_emits_info(reason):
+    """The live bug: a task holding a benign, recent guard must NOT produce
+    stranded_in_ready (misleading assignee/profile/pool text at escalating
+    severity) — it must instead surface the real reason via the informational
+    respawn_guarded diagnostic."""
+    now = 100_000
+    task, events = _make_ready_with_guard(now, guard_reason=reason, guard_age_seconds=30)
+    diags = kd.compute_task_diagnostics(task, events, [], now=now)
+    kinds = {d.kind for d in diags}
+    assert "stranded_in_ready" not in kinds, (
+        f"guard reason {reason!r} must suppress the misleading stranded_in_ready diagnostic"
+    )
+    guarded = [d for d in diags if d.kind == "respawn_guarded"]
+    assert len(guarded) == 1
+    assert guarded[0].severity == "info"
+    assert guarded[0].data["reason"] == reason
+
+
+def test_respawn_guarded_active_pr_never_recommends_a_respawn_action():
+    """Requirement 3: for reason=active_pr the action set must contain
+    nothing that triggers a respawn (no reassign, no unblock)."""
+    now = 100_000
+    task, events = _make_ready_with_guard(now, guard_reason="active_pr", guard_age_seconds=30)
+    diags = kd.compute_task_diagnostics(task, events, [], now=now)
+    guarded = [d for d in diags if d.kind == "respawn_guarded"]
+    assert len(guarded) == 1
+    action_kinds = {a.kind for a in guarded[0].actions}
+    assert "reassign" not in action_kinds
+    assert "unblock" not in action_kinds
+    assert "reclaim" not in action_kinds
+
+
+def test_respawn_guarded_blocker_auth_stays_a_real_diagnostic_with_correct_cause():
+    """Requirement 4: blocker_auth IS operator-fixable and must stay inside
+    stranded_in_ready with the TRUE cause (auth/quota) and actions that fix
+    credentials — never the false assignee/profile/pool text, never a bare
+    reassign that just respawns into the same wall."""
+    now = 100_000
+    task, events = _make_ready_with_guard(
+        now, guard_reason="blocker_auth", guard_age_seconds=30,
+        last_failure_error="401 unauthorized: invalid api key",
+    )
+    diags = kd.compute_task_diagnostics(task, events, [], now=now)
+    stranded = [d for d in diags if d.kind == "stranded_in_ready"]
+    assert len(stranded) == 1
+    assert "misspelled" not in stranded[0].detail
+    assert "worker pool" not in stranded[0].detail
+    assert stranded[0].data.get("respawn_guard_reason") == "blocker_auth"
+    action_kinds = {a.kind for a in stranded[0].actions}
+    assert "reassign" not in action_kinds
+    # No separate respawn_guarded diagnostic for blocker_auth — it is not benign.
+    assert not [d for d in diags if d.kind == "respawn_guarded"]
+
+
+def test_genuinely_stranded_task_with_no_guard_event_fires_at_full_severity():
+    """Regression guard: with no respawn_guarded event at all, behavior is
+    byte-for-byte unchanged from before this fix — the identity-agnostic
+    stranded_in_ready diagnostic still fires with the original detail text
+    and a reassign action."""
+    now = 100_000
+    task = _task(id="t_genuine1", status="ready", assignee="typo3d", claim_lock=None)
+    events = [_event("created", ts=now - int(1.6 * 3600))]
+    diags = kd.compute_task_diagnostics(task, events, [], now=now)
+    stranded = [d for d in diags if d.kind == "stranded_in_ready"]
+    assert len(stranded) == 1
+    assert stranded[0].severity == "error"
+    assert "misspelled" in stranded[0].detail
+    assert any(a.kind == "reassign" for a in stranded[0].actions)
+    assert not [d for d in diags if d.kind == "respawn_guarded"]
+
+
+def test_stale_guard_event_does_not_mask_a_genuine_strand():
+    """Requirement 5 (the regression this fix must not introduce): a guard
+    event from hours ago must NOT suppress stranded_in_ready on a task that
+    is genuinely stranded now. The staleness window is a few dispatcher
+    ticks (default dispatch_interval_seconds=60 => 180s); 6h is far past it."""
+    now = 100_000
+    task, events = _make_ready_with_guard(
+        now, guard_reason="active_pr", guard_age_seconds=6 * 3600,
+    )
+    diags = kd.compute_task_diagnostics(task, events, [], now=now)
+    stranded = [d for d in diags if d.kind == "stranded_in_ready"]
+    assert len(stranded) == 1, (
+        "a stale guard event must not blind stranded_in_ready to a real strand"
+    )
+    assert stranded[0].severity == "error"
+    assert any(a.kind == "reassign" for a in stranded[0].actions)
+    # The stale guard must also not manufacture a misleading "still guarded" info diagnostic.
+    assert not [d for d in diags if d.kind == "respawn_guarded"]
+
+
+def test_respawn_guarded_ignores_non_ready_tasks():
+    """The dispatcher only guards ready/review-lane spawns; a guard event
+    replayed against a task that has since moved on (e.g. done) must not
+    resurrect an info diagnostic."""
+    now = 100_000
+    task = _task(id="t_done1", status="done", assignee="claudecode")
+    events = [_event("respawn_guarded", ts=now - 30, reason="active_pr")]
+    diags = kd.compute_task_diagnostics(task, events, [], now=now)
+    assert not [d for d in diags if d.kind == "respawn_guarded"]
+
+
+def test_respawn_guarded_window_text_matches_dispatcher_constants():
+    """The human-facing window text is sourced from the same constants the
+    dispatcher's check_respawn_guard enforces (kanban_db_dispatch), not a
+    hardcoded/independent literal that could drift."""
+    from hermes_cli import kanban_db_dispatch as kbd
+
+    now = 100_000
+    task, events = _make_ready_with_guard(now, guard_reason="active_pr", guard_age_seconds=30)
+    diags = kd.compute_task_diagnostics(task, events, [], now=now)
+    guarded = [d for d in diags if d.kind == "respawn_guarded"][0]
+    expected_hours = kbd._RESPAWN_GUARD_PR_WINDOW // 3600
+    assert f"{expected_hours}h" in guarded.detail
 
 
 # ---------------------------------------------------------------------------

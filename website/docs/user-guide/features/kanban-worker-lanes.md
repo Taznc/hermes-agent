@@ -36,6 +36,7 @@ For Hermes profile lanes, the dispatcher's `_default_spawn` runs `hermes -p <ass
 |---|---|
 | `HERMES_KANBAN_TASK` | the task id the worker is operating on |
 | `HERMES_KANBAN_DB` | absolute path to the per-board SQLite file |
+| `HERMES_KANBAN_PIN_HOME` | the kanban home those pins are valid under (a probe/test that re-declares a different `HERMES_HOME` gets its own sandbox instead of the live board) |
 | `HERMES_KANBAN_BOARD` | board slug |
 | `HERMES_KANBAN_WORKSPACES_ROOT` | root of the board's workspace tree |
 | `HERMES_KANBAN_WORKSPACE` | absolute path to *this* task's workspace |

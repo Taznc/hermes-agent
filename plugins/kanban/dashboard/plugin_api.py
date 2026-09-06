@@ -278,11 +278,19 @@ def _warnings_summary_from_diagnostics(diagnostics: list[dict]) -> Optional[dict
     return {"count": count, "kinds": kinds, "latest_at": latest, "highest_severity": highest_sev}
 
 
-def _attach_diagnostics(task_d: dict, diags: Optional[list[dict]]) -> None:
-    """Full list in the payload (drawer renders without a second round-trip); card badge gets the summary."""
-    if diags:
+def _attach_diagnostics(task_d: dict, diags: Optional[list[dict]], *, include_full: bool = True) -> None:
+    """Card badge / attention-strip summary only from ``warning``+ diagnostics -- an ``info``
+    diagnostic (e.g. respawn_guarded) must never badge a card or join "needs attention".
+    ``include_full`` controls whether the raw ``diagnostics`` list (all severities, consumed by
+    the desktop drawer and the dashboard's collectDiagTasks) is included: True for the
+    task-detail payload, False for the board payload, since a bare non-empty list there would
+    re-trigger the attention strip regardless of ``warnings``."""
+    if not diags:
+        return
+    if include_full:
         task_d["diagnostics"] = diags
-        task_d["warnings"] = _warnings_summary_from_diagnostics(diags)
+    warning_plus = [d for d in diags if kd.severity_at_or_above(d.get("severity"), "warning")]
+    task_d["warnings"] = _warnings_summary_from_diagnostics(warning_plus)
 
 
 def _links_for(conn: sqlite3.Connection, task_id: str) -> dict[str, list[str]]:
@@ -346,7 +354,7 @@ def _board_payload(
         d["comment_count"] = comment_counts.get(t.id, 0)
         d["image_attachment_id"] = first_image_attachment.get(t.id)
         d["progress"] = progress.get(t.id)  # None when the task has no children
-        _attach_diagnostics(d, diagnostics_per_task.get(t.id))
+        _attach_diagnostics(d, diagnostics_per_task.get(t.id), include_full=False)
         columns[t.status if t.status in columns else "todo"].append(d)
 
     # Per-column ordering (priority DESC, created_at ASC) comes from list_tasks.
@@ -779,10 +787,14 @@ _RUNNING_DIRECT_MSG = "Cannot set status to 'running' directly; use the dispatch
 
 
 def _drag_to(conn, task_id: str, s: str) -> bool:
-    """Drag-drop into ready/todo/triage: blocked/scheduled -> ready re-opens via ``unblock_task``;
-    leaving ``review`` goes through ``reopen_review_task`` (stale-run recovery, parent re-gate,
-    ``review_reopened`` event) instead of a raw write; ``triage`` needs no current-state query."""
-    current = kanban_db.get_task(conn, task_id) if s != "triage" else None
+    """Drag-drop into ready/todo/triage: archived cards use the explicit,
+    evented unarchive verb; blocked/scheduled -> ready re-opens via
+    ``unblock_task``; leaving ``review`` goes through ``reopen_review_task``
+    (stale-run recovery, parent re-gate, ``review_reopened`` event) instead of
+    a raw write."""
+    current = kanban_db.get_task(conn, task_id)
+    if current is not None and current.status == "archived":
+        return kanban_db.unarchive_task(conn, task_id, status=s)
     if s == "ready" and current and current.status in ("blocked", "scheduled"):
         return kanban_db.unblock_task(conn, task_id)
     if s == "ready" and current and current.status == "on_hold":
@@ -915,7 +927,9 @@ def update_task(task_id: str, payload: UpdateTaskBody, board: Optional[str] = Qu
 @router.delete("/tasks/{task_id}")
 def delete_task(task_id: str, board: Optional[str] = Query(None)):
     with _board_conn(board) as (board, conn):
-        if not kanban_db.delete_task(conn, task_id):
+        with _map_errors(409, RuntimeError):
+            deleted = kanban_db.delete_task(conn, task_id)
+        if not deleted:
             raise HTTPException(status_code=404, detail=f"task {task_id} not found")
         return {"deleted": True, "task_id": task_id}
 
@@ -946,6 +960,10 @@ def _set_status_direct(conn: sqlite3.Connection, task_id: str, new_status: str) 
             "SELECT status, current_run_id, worker_pid, claim_lock FROM tasks WHERE id = ?", (task_id,)).fetchone()
         if prev is None:
             return False
+        # Archived is a one-way door from this path: leaving it goes through the explicit
+        # kanban_db.archive_task()/unarchive verb only, never a bare drag-drop status write.
+        if prev["status"] == "archived":
+            return False
         if prev["status"] == "running" and new_status == "ready":
             resume_status = kanban_db._retry_status_for_run(conn, task_id, prev["current_run_id"])
             if resume_status == "review":
@@ -961,7 +979,10 @@ def _set_status_direct(conn: sqlite3.Connection, task_id: str, new_status: str) 
             "  claim_lock = CASE WHEN ? = 'running' THEN claim_lock ELSE NULL END, "
             "  claim_expires = CASE WHEN ? = 'running' THEN claim_expires ELSE NULL END, "
             "  worker_pid = CASE WHEN ? = 'running' THEN worker_pid ELSE NULL END "
-            "WHERE id = ?",
+            # Defense-in-depth: the archived precondition above already returns before this
+            # point, but the WHERE clause independently blocks the CAS if that check is ever
+            # bypassed or refactored around.
+            "WHERE id = ? AND status != 'archived'",
             (effective_status,) * 4 + (task_id,))
         if cur.rowcount != 1:
             return False
@@ -1091,7 +1112,7 @@ def bulk_update(payload: BulkTaskBody, board: Optional[str] = Query(None)):
 @router.get("/diagnostics")
 def list_diagnostics(
     board: Optional[str] = _BOARD_Q,
-    severity: Optional[str] = Query(None, description="Filter by severity: warning|error|critical")):
+    severity: Optional[str] = Query(None, description="Filter by severity: info|warning|error|critical")):
     """Tasks with an active diagnostic, highest severity first then most recent; also
     consumed by ``hermes kanban diagnostics`` when the dashboard runs."""
     with _board_conn(board) as (board, conn):
@@ -1542,6 +1563,10 @@ def dispatch(dry_run: bool = Query(False), max_n: int = Query(8, alias="max"), b
             max_in_progress=caps.max_in_progress,
             max_in_progress_per_profile=caps.max_in_progress_per_profile,
             default_assignee=caps.default_assignee,
+            default_reviewer=caps.default_reviewer,
+            dispatch_start_budget=caps.dispatch_start_budget,
+            dispatch_start_window_seconds=caps.dispatch_start_window_seconds,
+            review_rework_escalation_profile=caps.review_rework_escalation_profile,
             board=board,
         )
         try:

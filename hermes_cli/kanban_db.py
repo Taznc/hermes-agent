@@ -2,8 +2,10 @@
 
 Lives under the shared Hermes root: ``default`` board DB at ``<root>/kanban.db`` (pre-boards
 back-compat), other boards at ``<root>/kanban/boards/<slug>/``; a worker on one board never sees
-another. Board resolution: ``board=`` arg > ``HERMES_KANBAN_BOARD`` > ``HERMES_KANBAN_DB`` (pins the
-file path) > ``<root>/kanban/current`` > ``default``; the dispatcher injects these into workers.
+another. Board resolution: an explicit ``board=`` argument (or ``hermes kanban --board <slug>``,
+via :func:`scoped_explicit_board`) always wins; otherwise ``HERMES_KANBAN_DB`` (pins the file
+path; the dispatcher injects this into every worker) > ``HERMES_KANBAN_BOARD`` /
+:func:`scoped_current_board` > ``<root>/kanban/current`` > ``default``.
 Concurrency: WAL + ``BEGIN IMMEDIATE`` + compare-and-swap on ``tasks.status``/``claim_lock`` —
 SQLite serializes writers so one claimer wins, losers see zero rows (no retries, no distributed
 locks). Schema: tasks, task_links, task_comments, task_events, task_runs, attachments, notify subs.
@@ -356,6 +358,31 @@ def scoped_current_board(slug: str):
         _CURRENT_BOARD_OVERRIDE.reset(token)
 
 
+_EXPLICIT_BOARD_OVERRIDE: ContextVar[str | None] = ContextVar(
+    "hermes_kanban_explicit_board_override", default=None,
+)
+
+
+@contextlib.contextmanager
+def scoped_explicit_board(slug: str):
+    """Pin a caller-EXPLICIT board (``hermes kanban --board <slug>``) so it outranks
+    an inherited ``HERMES_KANBAN_DB``/``HERMES_KANBAN_WORKSPACES_ROOT`` pin in
+    :func:`_board_path`.
+
+    Deliberately distinct from :func:`scoped_current_board`: that ContextVar is also
+    set implicitly by non-CLI callers with no board opinion of their own (the
+    dashboard's ``_with_board_pinned`` pins ``default`` on every unparameterised
+    request; the watchers set ``HERMES_KANBAN_BOARD``/scope it per tick) — those
+    callers must keep losing to an inherited path pin exactly like a bare no-argument
+    call would. Only a genuine explicit override belongs here.
+    """
+    token: Token[str | None] = _EXPLICIT_BOARD_OVERRIDE.set(slug)
+    try:
+        yield
+    finally:
+        _EXPLICIT_BOARD_OVERRIDE.reset(token)
+
+
 # Slug = directory name: strict enough to stop traversal / separators, loose
 # enough for kebab-case. Display names (spaces, emoji) live in board.json.
 _BOARD_SLUG_RE = re.compile(r"^[a-z0-9][a-z0-9\-_]{0,63}$")
@@ -476,55 +503,49 @@ def _dir_holds_board(d: Path) -> bool:
     return (d / "board.json").exists() or (d / "kanban.db").exists()
 
 
-def _override_is_stale(override_path: Path) -> bool:
-    """True when *override_path* does not live under the currently-resolved
-    :func:`kanban_home`.
-
-    A ``HERMES_KANBAN_*`` path pin is only meaningful relative to the home it
-    was computed against. When a caller sandboxes itself the obvious way —
-    setting ``HERMES_HOME`` to a temp dir — but still inherits a
-    ``HERMES_KANBAN_DB``/``..._WORKSPACES_ROOT``/``..._ATTACHMENTS_ROOT`` pin
-    from a parent/dispatcher process, the pin no longer points anywhere under
-    the caller's own home: it is stale and must lose, or every write goes to
-    the wrong (often live/production) home instead of the sandbox the caller
-    believes it is in.
-    """
-    try:
-        home = kanban_home().resolve()
-        override_path.resolve().relative_to(home)
-        return False
-    except (ValueError, OSError):
-        return True
-
-
 def _board_path(
     env_var: Optional[str], board: Optional[str], default_parts: tuple[str, ...], leaf: str,
 ) -> Path:
-    """Shared resolver: ``env_var`` override, else legacy ``<root>/<default_parts>``
-    for the ``default`` board, else ``board_dir(slug)/leaf``.
+    """Shared resolver: an explicit ``board`` wins over an inherited ``env_var``
+    pin; otherwise the pin, else legacy ``<root>/<default_parts>`` for the
+    ``default`` board, else ``board_dir(slug)/leaf``.
 
-    The override is honored only when it lives under the currently-resolved
-    :func:`kanban_home` — see :func:`_override_is_stale`. Dispatcher-spawned
-    workers are unaffected: the dispatcher injects both the path override and
-    a matching ``HERMES_HOME`` so the pin always resolves under the worker's
-    own kanban home. A stale override is dropped with a one-line warning
-    rather than silently honored.
+    Two independent guards compose here, and both must hold.
+
+    Precedence (t_05ebe370): ``env_var`` pins the dispatcher's board for callers
+    that omit ``board``. It is ambient state, so it must not redirect an
+    explicit cross-board operation such as ``hermes kanban --board <slug> ...``.
+    A no-argument call (including one made under the shared, also-implicit
+    ``scoped_current_board`` scope used by the dashboard/watchers) must resolve
+    exactly as it did before this override existed: the env pin still wins
+    there. An explicit ``DEFAULT_BOARD`` is likewise not a "different board" to
+    reach across to — it is the ambient fallback slug, so it defers to the pin
+    exactly like ``board=None`` would.
+
+    Containment (t_029c5ee7): even when the pin does apply, it is honored only
+    when :func:`_pin_is_honored` accepts it. That guard lives here rather than
+    in one caller so every sibling resolver (:func:`kanban_db_path`,
+    :func:`workspaces_root`, :func:`attachments_root`) is covered by
+    construction — the dispatcher injects a pin for each of them, so guarding
+    only the DB left a sandboxed probe still writing into the live board's
+    workspaces tree.
     """
-    if env_var:
+    slug = _normalize_board_slug(board)
+    # ``hermes kanban --board`` records its explicit CLI argument in a dedicated
+    # context-local scope (`scoped_explicit_board`). Treat it like a direct
+    # ``board=`` argument rather than letting a worker's inherited file pin
+    # silently discard it. This is intentionally NOT `_CURRENT_BOARD_OVERRIDE` —
+    # that ContextVar is also set implicitly by callers with no board opinion of
+    # their own (dashboard/watchers), which must keep losing to the pin.
+    if slug is None:
+        slug = _normalize_board_slug(_EXPLICIT_BOARD_OVERRIDE.get())
+    if (slug is None or slug == DEFAULT_BOARD) and env_var:
         override = os.environ.get(env_var, "").strip()
         if override:
             override_path = Path(override).expanduser()
-            if _override_is_stale(override_path):
-                _log.warning(
-                    "kanban: ignoring stale %s=%r — it does not live under "
-                    "the currently-resolved kanban home (%s). HERMES_HOME "
-                    "was repointed without a matching override, so the pin "
-                    "is stale; resolving under the current home instead.",
-                    env_var, override, kanban_home(),
-                )
-            else:
+            if _pin_is_honored(override_path):
                 return override_path
-    slug = _normalize_board_slug(board)
+            _warn_dropped_pin(env_var, override)
     if slug is None:
         slug = get_current_board()
     if slug == DEFAULT_BOARD:
@@ -532,9 +553,80 @@ def _board_path(
     return board_dir(slug) / leaf
 
 
+def _resolve_for_containment(path: Path) -> Path:
+    """Resolve symlinks/``..`` without requiring the path to exist."""
+    try:
+        return path.expanduser().resolve()
+    except OSError:
+        return path.expanduser().absolute()
+
+
+# The kanban home a ``HERMES_KANBAN_*`` path pin is valid under. The dispatcher
+# stamps its own home beside the pins it injects; anyone hand-setting an
+# out-of-home pin on purpose sets it to the home they are running under.
+#
+# Containment alone cannot tell an inherited pin from a deliberate one, and a
+# stamp alone cannot protect against pins written before it existed — so the two
+# compose: a pin inside the current home is always fine, and a pin OUTSIDE it is
+# honored only while the stamp names the home this process actually declares.
+# An inherited stamp cannot fake that, because re-declaring the home is exactly
+# what makes the stamp disagree.
+KANBAN_PIN_HOME_ENV = "HERMES_KANBAN_PIN_HOME"
+
+
+def _pin_is_honored(pin: Path) -> bool:
+    """Should a ``HERMES_KANBAN_*`` path override be used?
+
+    ``True`` when the pin resolves under the current :func:`kanban_home`
+    (the dispatcher's happy path), or when it is explicitly vouched for by a
+    :data:`KANBAN_PIN_HOME_ENV` stamp naming that same home.
+    """
+    home = _resolve_for_containment(kanban_home())
+    resolved = _resolve_for_containment(pin)
+    if resolved == home or home in resolved.parents:
+        return True
+    stamped = os.environ.get(KANBAN_PIN_HOME_ENV, "").strip()
+    return bool(stamped) and _resolve_for_containment(Path(stamped)) == home
+
+
+# Warn once per (env var, pin, home): these resolvers are called on every
+# dispatch tick, and a repeating warning would bury the one that matters.
+_warned_dropped_pins: set[tuple[str, str, str]] = set()
+
+
+def _warn_dropped_pin(env_var: str, pin: str) -> None:
+    """Surface an ignored out-of-home pin.
+
+    The breach this guards was silent — a probe believed it was sandboxed while
+    writing production — so dropping the pin quietly would just move the silence.
+    """
+    key = (env_var, pin, str(kanban_home()))
+    if key in _warned_dropped_pins:
+        return
+    _warned_dropped_pins.add(key)
+    _log.warning(
+        "ignoring %s=%s: it resolves outside this process's kanban home (%s), so it is stale "
+        "inherited env rather than intent. Resolving under the current home instead. To pin a "
+        "path outside the home on purpose, set %s to that home.",
+        env_var,
+        pin,
+        kanban_home(),
+        KANBAN_PIN_HOME_ENV,
+    )
+
+
 def kanban_db_path(board: Optional[str] = None) -> Path:
-    """``kanban.db`` path: ``HERMES_KANBAN_DB`` pins it (injected into workers);
-    ``default`` -> ``<root>/kanban.db`` (back-compat), else the board dir."""
+    """``kanban.db`` path: an explicit ``board`` wins; otherwise
+    ``HERMES_KANBAN_DB`` pins it (injected into workers). ``default`` keeps
+    ``<root>/kanban.db`` (back-compat), else the board dir.
+
+    The pin is dropped once it no longer resolves under this process's kanban
+    home (``HERMES_HOME`` / ``HERMES_KANBAN_HOME``) and is not vouched for by
+    ``HERMES_KANBAN_PIN_HOME``. The dispatcher puts a pin in EVERY worker env,
+    so without this a probe/test script that sandboxes itself the documented way
+    kept a production pin and silently drove the live board — that breach
+    reverted 137 archives and left fixture cards in a real board.
+    """
     return _board_path("HERMES_KANBAN_DB", board, ("kanban.db",), "kanban.db")
 
 
@@ -1136,6 +1228,7 @@ CREATE INDEX IF NOT EXISTS idx_links_child           ON task_links(child_id);
 CREATE INDEX IF NOT EXISTS idx_links_parent          ON task_links(parent_id);
 CREATE INDEX IF NOT EXISTS idx_comments_task         ON task_comments(task_id, created_at);
 CREATE INDEX IF NOT EXISTS idx_events_task           ON task_events(task_id, created_at);
+CREATE INDEX IF NOT EXISTS idx_events_kind_created   ON task_events(kind, created_at);
 CREATE INDEX IF NOT EXISTS idx_runs_task             ON task_runs(task_id, started_at);
 CREATE INDEX IF NOT EXISTS idx_runs_status           ON task_runs(status);
 CREATE INDEX IF NOT EXISTS idx_attachments_task      ON task_attachments(task_id, created_at);
@@ -2319,8 +2412,11 @@ def _gave_up_was_force_tripped(conn: sqlite3.Connection, task_id: str) -> bool:
 def _latest_event(
     conn: sqlite3.Connection, task_id: str, kind: str, run_id: Optional[int] = None,
 ) -> Optional[sqlite3.Row]:
-    """Newest ``task_events`` row of ``kind`` (optionally scoped to one run)."""
-    sql = "SELECT payload FROM task_events WHERE task_id = ? AND kind = ?"
+    """Newest ``task_events`` row of ``kind`` (optionally scoped to one run).
+    ``id`` is included alongside ``payload`` so callers that need to order
+    two different event kinds relative to each other (e.g. deciding which of
+    two audit trails is the more recent handoff) don't need a second query."""
+    sql = "SELECT id, payload FROM task_events WHERE task_id = ? AND kind = ?"
     params: tuple[Any, ...] = (task_id, kind)
     if run_id is not None:
         sql += " AND run_id = ?"
@@ -2474,6 +2570,36 @@ def _claim_and_open_run(
     return run_id
 
 
+def _terminal_completion_without_reopen(conn: sqlite3.Connection, task_id: str) -> Optional[int]:
+    """The task's last ``completed`` event id iff nothing legitimately reopened
+    the task since (returns ``None`` when it's fine to claim).
+
+    Every sanctioned path off ``done`` appends a reopen event in the SAME
+    transaction as the status write: dashboard PATCH/drag-drop
+    (``_set_status_direct``), explicit archive restore (``unarchive_task``),
+    and parent-reopen invalidation
+    (``invalidate_descendants_for_parent_reopen``, which also appends
+    ``descendant_invalidated`` first). So a ``completed`` event with none of
+    those kinds after it means ``tasks.status`` disagrees with the terminal
+    outcome recorded in the event log WITHOUT a recorded reason — a stale
+    claim/reclaim race, manual SQL, or a DB restore, not a real reopen. The
+    completed run is the authority in that case; the row must not be claimed.
+    """
+    row = conn.execute(
+        "SELECT id FROM task_events WHERE task_id = ? AND kind = 'completed' "
+        "ORDER BY id DESC LIMIT 1", (task_id,),
+    ).fetchone()
+    if row is None:
+        return None
+    completed_event_id = row["id"]
+    reopened = conn.execute(
+        "SELECT 1 FROM task_events WHERE task_id = ? AND id > ? "
+        "AND kind IN ('status', 'unarchived', 'descendant_invalidated') LIMIT 1",
+        (task_id, completed_event_id),
+    ).fetchone()
+    return None if reopened else completed_event_id
+
+
 def claim_task(
     conn: sqlite3.Connection, task_id: str, *, ttl_seconds: Optional[int] = None,
     claimer: Optional[str] = None,
@@ -2496,6 +2622,29 @@ def claim_task(
                 "WHERE id = ? AND status = 'ready'", (task_id,),
             )
             _append_event(conn, task_id, "claim_rejected", {"reason": "parents_not_done"})
+            return None
+        # A card with a terminal ``completed`` event and no recorded reopen is
+        # never re-dispatched, no matter how ``tasks.status`` got back to
+        # 'ready' — self-heal the desync back to 'done' instead of spawning a
+        # duplicate worker on already-finished work.
+        stale_completed_event_id = _terminal_completion_without_reopen(conn, task_id)
+        if stale_completed_event_id is not None:
+            cur = conn.execute(
+                "UPDATE tasks SET status = 'done', claim_lock = NULL, "
+                "claim_expires = NULL, worker_pid = NULL "
+                "WHERE id = ? AND status = 'ready'", (task_id,),
+            )
+            if cur.rowcount == 1:
+                _append_event(
+                    conn, task_id, "terminal_reclaim_rejected",
+                    {
+                        "completed_event_id": stale_completed_event_id,
+                        "reason": (
+                            "task already completed with no recorded reopen; "
+                            "status desync healed back to done instead of re-dispatching"
+                        ),
+                    },
+                )
             return None
         # Close a leaked prior run so the CAS below doesn't strand it.
         _reclaim_dangling_run(
@@ -2809,16 +2958,28 @@ def _verify_created_cards(
     """Partition ``claimed_ids`` into (verified, phantom). Verified = the row
     exists AND ``created_by`` is the completing task's assignee or id, OR the
     card is linked as its child (created elsewhere, attached by the worker).
-    Never mutates."""
+    Never mutates.
+
+    ``completing_task_id``'s OWN row may already be gone — ``delete_task``
+    wipes the tasks/task_links/task_events rows in one txn, so a worker whose
+    card was deleted out from under it (t_749b0510) still needs to be able to
+    attest to cards it genuinely created. This used to bail out entirely
+    ("the completing task is gone, so nothing resolves") and reported a real
+    card as phantom purely because the CALLER's row vanished, not because the
+    claim was false. Only the ``completing_assignee`` comparison and the
+    linked-children lookup actually need that row; the ``created_by ==
+    completing_task_id`` identity check (the id string itself, never a join
+    through the vanished row) is unaffected and must still run.
+    """
     ordered = list(dict.fromkeys(str(x).strip() for x in (claimed_ids or []) if str(x).strip()))
     if not ordered:
         return [], []
 
     row = conn.execute("SELECT assignee FROM tasks WHERE id = ?", (completing_task_id,)).fetchone()
-    if row is None:
-        # Completing task not found — nothing resolves.
-        return [], ordered
-    completing_assignee = row["assignee"]
+    # None when the completing task's own row is gone (orphaned worker) — the
+    # assignee-based trust check below is simply skipped, not treated as
+    # "nothing can be verified".
+    completing_assignee = row["assignee"] if row is not None else None
 
     # Batch-fetch existence + created_by in one query.
     placeholders = ",".join(["?"] * len(ordered))
@@ -2888,6 +3049,14 @@ def complete_task(
     ``created_cards`` are verified first — a phantom id raises
     :class:`HallucinatedCardsError` after an auditable event; afterwards the
     prose is scanned for unresolvable ``t_<hex>`` refs (advisory event only).
+
+    Like :func:`kanban_db_dispatch.heartbeat_worker`, a plain ``False``
+    return does not distinguish a bogus/already-terminal ``task_id`` from an
+    orphaned worker whose own row was deleted mid-run (t_749b0510) — the
+    tool-handler layer (``tools/kanban_tools.py:_orphan_or_lifecycle_error``)
+    makes that call using the caller's own ``HERMES_KANBAN_TASK`` identity,
+    which this DB layer cannot see, and surfaces a distinguishable
+    ``orphaned: true`` field a worker should treat as a clean-exit signal.
     """
     now = int(time.time())
     # Cheap pre-check; re-checked inside the txn to close the parent-reopen race.
@@ -3515,17 +3684,35 @@ def request_changes(
         reviewer = _canonical_assignee(_nonblank_str(task_row["assignee"]))
 
         # Round trip back to the implementer must not silently lose the pin
-        # that request_review snapshotted for a cross-profile handoff. The
-        # keys are only present when request_review actually cleared the
-        # columns (cross_profile=True there); a same-profile review never
-        # touched the columns, so there is nothing to restore.
+        # that a cross-profile handoff snapshotted — from EITHER an explicit
+        # request_review(reviewer=...) (snapshot lives on this
+        # review_requested event) OR a kanban.default_reviewer auto-assign
+        # (the dispatcher's _apply_default_reviewer cannot rewrite this
+        # immutable review_requested row, so it snapshots onto a LATER
+        # "assigned" event instead — see kanban_db_dispatch.py). Pick
+        # whichever event carries the override snapshot and happened last;
+        # a same-profile review that never cleared the columns has neither,
+        # so there is nothing to restore.
+        override_payload = requested_payload
+        assigned_event = _latest_event(conn, task_id, "assigned")
+        if (
+            assigned_event is not None
+            and int(assigned_event["id"]) > int(requested_event["id"])
+        ):
+            assigned_payload = _json_dict(assigned_event["payload"])
+            if (
+                assigned_payload.get("source") == "kanban.default_reviewer"
+                and "implementer_model_override" in assigned_payload
+            ):
+                override_payload = assigned_payload
+
         override_sql = ""
         override_params: tuple[Any, ...] = ()
-        if "implementer_model_override" in requested_payload:
+        if "implementer_model_override" in override_payload:
             override_sql = ", model_override = ?, provider_override = ?"
             override_params = (
-                _nonblank_str(requested_payload.get("implementer_model_override")),
-                _nonblank_str(requested_payload.get("implementer_provider_override")),
+                _nonblank_str(override_payload.get("implementer_model_override")),
+                _nonblank_str(override_payload.get("implementer_provider_override")),
             )
 
         new_status = _landing_status_after_parents(conn, task_id)
@@ -4042,6 +4229,28 @@ def archive_task(conn: sqlite3.Connection, task_id: str) -> bool:
     return True
 
 
+def unarchive_task(conn: sqlite3.Connection, task_id: str, *, status: str = "todo") -> bool:
+    """Deliberately restore an archived task and leave an auditable event.
+
+    This is the only transition out of ``archived``. ``ready`` remains subject
+    to parent gating, so reopening an archived child cannot bypass its parents.
+    """
+    if status not in {"triage", "todo", "ready"}:
+        raise ValueError("unarchived tasks must land in triage, todo, or ready")
+    target = status
+    with write_txn(conn):
+        if target == "ready" and not _parents_satisfied(conn, task_id):
+            target = "todo"
+        cur = conn.execute(
+            "UPDATE tasks SET status = ? WHERE id = ? AND status = 'archived'",
+            (target, task_id),
+        )
+        if cur.rowcount != 1:
+            return False
+        _append_event(conn, task_id, "unarchived", {"status": target})
+    return True
+
+
 def _delete_task_relations(conn: sqlite3.Connection, task_id: str) -> None:
     """Delete every row referencing ``task_id`` (schema has no ON DELETE CASCADE)."""
     conn.execute("DELETE FROM task_links WHERE parent_id = ? OR child_id = ?", (task_id, task_id))
@@ -4061,8 +4270,28 @@ def delete_archived_task(conn: sqlite3.Connection, task_id: str) -> bool:
 
 
 def delete_task(conn: sqlite3.Connection, task_id: str) -> bool:
-    """Hard-delete a task and its related rows in one txn; False when not found."""
+    """Hard-delete a task and its related rows; False when not found.
+
+    Refuses (``RuntimeError``) when the row is ``running`` with an active claim/run: deleting
+    that row out from under a live worker orphans it — no reclaim path
+    (``count_running_tasks``, ``detect_crashed_workers``, ``detect_worker_timeouts``,
+    ``reconcile_orphaned_running``) can find a worker whose row is gone, because every one of
+    them starts from a ``WHERE status = 'running'`` query on a row that no longer exists
+    (t_749b0510). Matches ``delete_archived_task``'s \"two deliberate actions\" principle:
+    reclaim (``release_stale_claims``/``detect_crashed_workers``/dashboard status change) or
+    archive the task first, then delete — never delete straight out of ``running``.
+    """
     with write_txn(conn):
+        row = conn.execute(
+            "SELECT status, worker_pid, current_run_id FROM tasks WHERE id = ?", (task_id,),
+        ).fetchone()
+        if row is None:
+            return False
+        if row["status"] == "running" and (row["worker_pid"] or row["current_run_id"]):
+            raise RuntimeError(
+                f"refusing to delete {task_id}: status='running' with an active claim/run "
+                f"(worker_pid={row['worker_pid']!r}) — reclaim or archive it first"
+            )
         cur = conn.execute("DELETE FROM tasks WHERE id = ?", (task_id,))
         if cur.rowcount != 1:
             return False

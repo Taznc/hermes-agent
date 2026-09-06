@@ -97,6 +97,37 @@ def test_run_daemon_resolves_and_passes_max_in_progress(
     assert captured.get("max_in_progress") == 3
 
 
+def test_run_daemon_uses_nondefault_board_for_connection_and_dispatch(
+    kanban_home, monkeypatch,
+):
+    board = "secondary"
+    kb.init_db(board=board)
+    captured: dict = {}
+    stop = threading.Event()
+
+    def fake_dispatch_once(conn, **kwargs):
+        captured["board"] = kwargs.get("board")
+        captured["db_path"] = Path(
+            conn.execute("PRAGMA database_list").fetchone()[2]
+        ).resolve()
+        return kb.DispatchResult()
+
+    monkeypatch.setattr(kbd, "dispatch_once", fake_dispatch_once)
+
+    def on_tick(res):
+        stop.set()
+
+    kbd.run_daemon(
+        interval=0.01,
+        board=board,
+        stop_event=stop,
+        on_tick=on_tick,
+    )
+
+    assert captured["board"] == board
+    assert captured["db_path"] == kb.kanban_db_path(board).resolve()
+
+
 def test_run_daemon_explicit_config_wins(kanban_home, monkeypatch):
     """Explicit ``kanban.max_in_progress`` beats the memory-derived default.
 

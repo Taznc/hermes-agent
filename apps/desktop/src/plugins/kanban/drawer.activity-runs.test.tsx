@@ -11,6 +11,7 @@ import type { ReactElement } from 'react'
 import { afterEach, describe, expect, it, vi } from 'vitest'
 
 import { ActivityRow, groupActivity, RunErrorLine, runErrorText } from './drawer'
+import { RunRow } from './drawer_activity'
 import { useKanban } from './i18n'
 import type { KanbanEvent } from './types'
 
@@ -156,6 +157,14 @@ describe('runErrorText', () => {
     const result = runErrorText('some unexpected worker error', k)
     expect(result.primary).toBe('some unexpected worker error')
     expect(result.raw).toBeUndefined()
+  })
+})
+
+describe('run rows', () => {
+  it('renders a duration from each run start and end timestamps', () => {
+    render(withK(k => <RunRow k={k} run={{ ended_at: 1_080, id: 1, started_at: 1_020, status: 'completed' }} />))
+
+    expect(screen.getByText('1m')).toBeTruthy()
   })
 })
 

@@ -67,9 +67,11 @@ type KanbanMessages = {
   removeImage: string
   imagePasteFailed: string
   priority: string
-  markHighPriority: string
-  removeHighPriority: string
-  highPriorityTip: string
+  priorityCritical: string
+  priorityHigh: string
+  priorityNormal: string
+  priorityLow: string
+  priorityCustom: (value: number) => string
   workspace: string
   boardDefaultSuffix: string
   workspaceOverride: string
@@ -149,6 +151,9 @@ type KanbanMessages = {
   metaTenant: string
   metaCreatedBy: string
   metaCreated: string
+  metaRun: string
+  metaRunStarted: string
+  metaRunCount: (n: number) => string
   metaWorkerPid: string
   readyUnassignedTitle: string
   readyUnassignedBody: string
@@ -198,6 +203,16 @@ type KanbanMessages = {
   editDescription: string
   cancelEdit: string
   noDescription: string
+  /** Collapsed-description affordance (Overview tab). */
+  showMore: string
+  showLess: string
+  /** Drawer tab strip — Overview / Activity / Log. */
+  tabOverview: string
+  tabActivity: string
+  tabLog: string
+  /** Empty states for the two non-Overview tabs. */
+  noActivityYet: string
+  noLogYet: string
   result: string
   latestSummary: string
   dependencies: string
@@ -246,9 +261,13 @@ type KanbanMessages = {
   runErrRaw: string
   workerLog: string
   workerLogTail: string
-  /** "Show more" affordance under a truncated worker log — widens the tail
-   *  instead of leaving a bare unexplained `...`. */
-  workerLogShowMore: string
+  /** The active artifact was capped/rotated by the worker; this tells the
+   * reader it is seeing every retained byte, not a UI-paginated tail. */
+  workerLogRetained: string
+  workerLogLive: string
+  workerLogPaused: string
+  workerLogWrap: string
+  workerLogJumpToLatest: string
   attachments: (n: number) => string
   noAttachments: string
   uploadAttachment: string
@@ -391,9 +410,11 @@ export const en: KanbanMessages = {
   removeImage: 'Remove image',
   imagePasteFailed: 'Could not upload pasted image',
   priority: 'Priority',
-  markHighPriority: 'Mark high priority',
-  removeHighPriority: 'Remove high priority',
-  highPriorityTip: 'High priority — claimed and shown first in its column.',
+  priorityCritical: 'Critical',
+  priorityHigh: 'High',
+  priorityNormal: 'Normal',
+  priorityLow: 'Low',
+  priorityCustom: value => `Custom (${value})`,
   workspace: 'Workspace',
   boardDefaultSuffix: ' · board default',
   workspaceOverride: 'Workspace path (optional override)',
@@ -472,6 +493,9 @@ export const en: KanbanMessages = {
   metaTenant: 'Tenant',
   metaCreatedBy: 'Created by',
   metaCreated: 'Created',
+  metaRun: 'Run',
+  metaRunStarted: 'Run started',
+  metaRunCount: n => `${n} of ${n}`,
   metaWorkerPid: 'Worker pid',
   readyUnassignedTitle: 'Ready, but unassigned — this card will never run.',
   readyUnassignedBody:
@@ -522,6 +546,13 @@ export const en: KanbanMessages = {
   editDescription: 'Edit description',
   cancelEdit: 'Cancel edit',
   noDescription: 'No description yet.',
+  showMore: 'Show more',
+  showLess: 'Show less',
+  tabOverview: 'Overview',
+  tabActivity: 'Activity',
+  tabLog: 'Log',
+  noActivityYet: 'No activity yet.',
+  noLogYet: 'No worker log yet.',
   result: 'Result',
   latestSummary: 'Latest summary',
   dependencies: 'Dependencies',
@@ -566,7 +597,11 @@ export const en: KanbanMessages = {
   runErrRaw: 'Raw diagnostic',
   workerLog: 'Worker log',
   workerLogTail: 'Worker log · tail',
-  workerLogShowMore: 'Show more',
+  workerLogRetained: 'Worker log · retained',
+  workerLogLive: 'Live · following',
+  workerLogPaused: 'Live · paused',
+  workerLogWrap: 'Wrap lines',
+  workerLogJumpToLatest: 'Jump to latest',
   attachments: n => `Attachments · ${n}`,
   noAttachments: 'No attachments yet.',
   uploadAttachment: 'Upload attachment',
@@ -701,9 +736,11 @@ const ja: KanbanMessages = {
   removeImage: '画像を削除',
   imagePasteFailed: '貼り付けた画像をアップロードできませんでした',
   priority: '優先度',
-  markHighPriority: '優先度を高に設定',
-  removeHighPriority: '優先度の高設定を解除',
-  highPriorityTip: '優先度高 — このタスクを最初に取得・列の先頭に表示します。',
+  priorityCritical: '緊急',
+  priorityHigh: '高',
+  priorityNormal: '通常',
+  priorityLow: '低',
+  priorityCustom: value => `カスタム (${value})`,
   workspace: 'ワークスペース',
   boardDefaultSuffix: '・ボード既定',
   workspaceOverride: 'ワークスペースパス（任意の上書き）',
@@ -782,6 +819,9 @@ const ja: KanbanMessages = {
   metaTenant: 'テナント',
   metaCreatedBy: '作成者',
   metaCreated: '作成',
+  metaRun: '実行',
+  metaRunStarted: '実行開始',
+  metaRunCount: n => `${n} / ${n}`,
   metaWorkerPid: 'ワーカー PID',
   readyUnassignedTitle: 'Ready ですが未割り当て — このカードは実行されません。',
   readyUnassignedBody:
@@ -832,6 +872,13 @@ const ja: KanbanMessages = {
   editDescription: '説明を編集',
   cancelEdit: '編集をキャンセル',
   noDescription: 'まだ説明はありません。',
+  showMore: 'もっと見る',
+  showLess: '折りたたむ',
+  tabOverview: '概要',
+  tabActivity: 'アクティビティ',
+  tabLog: 'ログ',
+  noActivityYet: 'まだアクティビティはありません。',
+  noLogYet: 'まだワーカーログはありません。',
   result: '結果',
   latestSummary: '最新のサマリー',
   dependencies: '依存関係',
@@ -876,7 +923,11 @@ const ja: KanbanMessages = {
   runErrRaw: '生の診断情報',
   workerLog: 'ワーカーログ',
   workerLogTail: 'ワーカーログ・末尾',
-  workerLogShowMore: 'もっと見る',
+  workerLogRetained: 'ワーカーログ・保持済み',
+  workerLogLive: 'ライブ・追従中',
+  workerLogPaused: 'ライブ・一時停止中',
+  workerLogWrap: '行を折り返す',
+  workerLogJumpToLatest: '最新へ移動',
   attachments: n => `添付・${n}`,
   noAttachments: 'まだ添付はありません。',
   uploadAttachment: '添付をアップロード',
@@ -1010,9 +1061,11 @@ const zh: KanbanMessages = {
   removeImage: '移除图片',
   imagePasteFailed: '无法上传粘贴的图片',
   priority: '优先级',
-  markHighPriority: '标记为高优先级',
-  removeHighPriority: '取消高优先级',
-  highPriorityTip: '高优先级 — 会被优先领取，并显示在所在列的最前面。',
+  priorityCritical: '紧急',
+  priorityHigh: '高',
+  priorityNormal: '普通',
+  priorityLow: '低',
+  priorityCustom: value => `自定义 (${value})`,
   workspace: '工作区',
   boardDefaultSuffix: '・面板默认',
   workspaceOverride: '工作区路径（可选覆盖）',
@@ -1090,6 +1143,9 @@ const zh: KanbanMessages = {
   metaTenant: '租户',
   metaCreatedBy: '创建者',
   metaCreated: '创建于',
+  metaRun: '运行',
+  metaRunStarted: '本次运行开始',
+  metaRunCount: n => `第 ${n} 次（共 ${n} 次）`,
   metaWorkerPid: '工作单元 PID',
   readyUnassignedTitle: '就绪但未分配 — 这张卡片永远不会运行。',
   readyUnassignedBody:
@@ -1139,6 +1195,13 @@ const zh: KanbanMessages = {
   editDescription: '编辑描述',
   cancelEdit: '取消编辑',
   noDescription: '暂无描述。',
+  showMore: '显示更多',
+  showLess: '收起',
+  tabOverview: '概览',
+  tabActivity: '活动',
+  tabLog: '日志',
+  noActivityYet: '暂无活动。',
+  noLogYet: '暂无工作单元日志。',
   result: '结果',
   latestSummary: '最新摘要',
   dependencies: '依赖关系',
@@ -1182,7 +1245,11 @@ const zh: KanbanMessages = {
   runErrRaw: '原始诊断信息',
   workerLog: '工作单元日志',
   workerLogTail: '工作单元日志・末尾',
-  workerLogShowMore: '显示更多',
+  workerLogRetained: '工作单元日志・已保留',
+  workerLogLive: '实时・跟随中',
+  workerLogPaused: '实时・已暂停',
+  workerLogWrap: '换行显示',
+  workerLogJumpToLatest: '跳至最新',
   attachments: n => `附件・${n}`,
   noAttachments: '暂无附件。',
   uploadAttachment: '上传附件',
@@ -1315,9 +1382,11 @@ const zhHant: KanbanMessages = {
   removeImage: '移除圖片',
   imagePasteFailed: '無法上傳貼上的圖片',
   priority: '優先順序',
-  markHighPriority: '標記為高優先順序',
-  removeHighPriority: '取消高優先順序',
-  highPriorityTip: '高優先順序 — 會被優先領取，並顯示在所在欄的最前面。',
+  priorityCritical: '緊急',
+  priorityHigh: '高',
+  priorityNormal: '一般',
+  priorityLow: '低',
+  priorityCustom: value => `自訂 (${value})`,
   workspace: '工作區',
   boardDefaultSuffix: '・面板預設',
   workspaceOverride: '工作區路徑（選填覆寫）',
@@ -1395,6 +1464,9 @@ const zhHant: KanbanMessages = {
   metaTenant: '租戶',
   metaCreatedBy: '建立者',
   metaCreated: '建立於',
+  metaRun: '執行',
+  metaRunStarted: '本次執行開始',
+  metaRunCount: n => `第 ${n} 次（共 ${n} 次）`,
   metaWorkerPid: '工作單元 PID',
   readyUnassignedTitle: '就緒但未指派 — 這張卡片永遠不會執行。',
   readyUnassignedBody:
@@ -1444,6 +1516,13 @@ const zhHant: KanbanMessages = {
   editDescription: '編輯描述',
   cancelEdit: '取消編輯',
   noDescription: '尚無描述。',
+  showMore: '顯示更多',
+  showLess: '收合',
+  tabOverview: '總覽',
+  tabActivity: '活動',
+  tabLog: '日誌',
+  noActivityYet: '尚無活動。',
+  noLogYet: '尚無工作單元日誌。',
   result: '結果',
   latestSummary: '最新摘要',
   dependencies: '相依關係',
@@ -1487,7 +1566,11 @@ const zhHant: KanbanMessages = {
   runErrRaw: '原始診斷資訊',
   workerLog: '工作單元日誌',
   workerLogTail: '工作單元日誌・末尾',
-  workerLogShowMore: '顯示更多',
+  workerLogRetained: '工作單元日誌・已保留',
+  workerLogLive: '即時・跟隨中',
+  workerLogPaused: '即時・已暫停',
+  workerLogWrap: '換行顯示',
+  workerLogJumpToLatest: '跳至最新',
   attachments: n => `附件・${n}`,
   noAttachments: '尚無附件。',
   uploadAttachment: '上傳附件',

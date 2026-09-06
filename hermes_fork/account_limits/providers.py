@@ -111,7 +111,11 @@ def anthropic_usage_snapshot(payload: dict) -> AccountUsageSnapshot:
                 continue
             scope = raw.get("scope")
             if isinstance(scope, dict):
-                scope = scope.get("model") or scope.get("name")
+                # Prefer the human-facing name; never fall through to a raw dict repr below.
+                scope = (scope.get("display_name") or scope.get("model") or scope.get("name")
+                         or scope.get("id"))
+            elif scope is not None and not isinstance(scope, str):
+                scope = None
             windows.append(AccountUsageWindow(
                 label=_title_case_slug(raw.get("kind")) or "Usage limit", used_percent=_pct(used),
                 reset_at=_parse_dt(raw.get("resets_at")),

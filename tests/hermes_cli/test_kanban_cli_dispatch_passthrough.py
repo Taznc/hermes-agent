@@ -8,6 +8,7 @@ operator footgun that only manifests in long-running setups.
 from __future__ import annotations
 
 import argparse
+import contextlib
 import os
 import sys
 import tempfile
@@ -94,5 +95,47 @@ def test_cli_max_flag_overrides_config_max_spawn(isolated_kanban_home, monkeypat
     assert captured.get("max_spawn") == 2, (
         f"CLI --max=2 must override config kanban.max_spawn=10; got {captured.get('max_spawn')!r}"
     )
+
+
+def test_cli_dispatch_passes_nondefault_board_to_connection_and_dispatch(
+    isolated_kanban_home, monkeypatch,
+):
+    from hermes_cli import kanban as kb_cli
+    from hermes_cli import kanban_db
+    from hermes_cli import kanban_db_dispatch as kbd
+    from hermes_cli import kanban_ops
+
+    captured = {}
+
+    @contextlib.contextmanager
+    def fake_connect_closing(*, board=None):
+        captured["connection_board"] = board
+        yield object()
+
+    monkeypatch.setattr(kanban_ops.kbc, "connect_closing", fake_connect_closing)
+    monkeypatch.setattr(
+        kbd,
+        "dispatch_once",
+        lambda conn, **kwargs: (
+            captured.update({"dispatch_board": kwargs.get("board")}),
+            kanban_db.DispatchResult(),
+        )[1],
+    )
+
+    args = argparse.Namespace(
+        board="secondary",
+        dry_run=True,
+        max=None,
+        failure_limit=2,
+        json=False,
+        resume_circuit=False,
+        circuit_status=False,
+    )
+    assert kb_cli._cmd_dispatch(args) == 0
+
+    assert captured == {
+        "connection_board": "secondary",
+        "dispatch_board": "secondary",
+    }
 
 

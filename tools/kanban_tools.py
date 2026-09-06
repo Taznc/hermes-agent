@@ -141,6 +141,53 @@ def _require_task_id(args: dict) -> str:
     return tid
 
 
+def _task_id_is_env_scoped(args: dict, tid: str) -> bool:
+    """True when ``tid`` was resolved from ``HERMES_KANBAN_TASK`` rather than
+    an explicit ``args["task_id"]`` — i.e. this call is a dispatcher-spawned
+    worker acting on ITS OWN assigned task, not an arbitrary/model-typed id.
+
+    This is the signal the orphan-exit contract below is built on: the board
+    row for a deleted task carries no tombstone (``delete_task`` wipes
+    tasks/task_links/task_events in one txn — see t_749b0510), so nothing in
+    the DB can tell "this id never existed" from "this id existed and was
+    deleted out from under its own worker". But the CALLING PROCESS knows
+    which task it was spawned for (the dispatcher pins ``HERMES_KANBAN_TASK``
+    at spawn time), so a vanished row that is also this worker's own env task
+    id is conclusively an orphan, never a typo.
+    """
+    return not args.get("task_id") and os.environ.get("HERMES_KANBAN_TASK") == tid
+
+
+def _orphan_or_lifecycle_error(
+    kb, conn, tid: str, args: dict, tool_name: str, detail: str,
+) -> str:
+    """Build the tool_error for a failed lifecycle call (heartbeat/complete/
+    block) that could not act on ``tid``.
+
+    Distinguishes, as a queryable/testable contract rather than a message
+    string: ``orphaned=True`` when this worker's own row is provably gone
+    (see :func:`_task_id_is_env_scoped`) — the worker should stop calling
+    kanban tools and end its turn, since nothing it does can reach the board
+    again — from an ordinary failure (bogus id, wrong status, race) which
+    stays retryable exactly as before. We do not raise a new exception type
+    across the tool-dispatch boundary (``tools/AGENTS.md``: handlers return
+    JSON; ``_kanban_handler`` is the single funnel for structured errors) —
+    a distinguishable field in the existing JSON error payload is the
+    smallest-footprint way to make this decidable by the calling agent
+    without adding a bespoke control-flow path through model_tools.py that
+    every other tool-error consumer would then need to special-case.
+    """
+    orphaned = _task_id_is_env_scoped(args, tid) and kb.get_task(conn, tid) is None
+    if orphaned:
+        return tool_error(
+            f"{tool_name}: task {tid} no longer exists on the board (its row was deleted "
+            f"while you were running — see t_749b0510). You are an orphaned worker: no "
+            f"kanban tool can reach this task again. Stop calling kanban tools for {tid} "
+            f"and end your turn now; nothing further you do can be recorded.",
+            orphaned=True, task_id=tid)
+    return tool_error(detail, task_id=tid)
+
+
 def _own_task_env(task_id: str, var: str) -> Optional[str]:
     """``$var`` only when this worker is scoped to ``task_id``; else None."""
     return os.environ.get(var) if os.environ.get("HERMES_KANBAN_TASK") == task_id else None
@@ -587,7 +634,14 @@ def _handle_complete(args: dict, **kw) -> str:
                 f"in-flight (no state change). Retry kanban_complete with the same "
                 f"summary/metadata and either drop these ids from created_cards, or pass "
                 f"created_cards=[] to skip the card-claim check entirely.")
-        _check(ok, f"could not complete {tid} (unknown id or already terminal)")
+        if not ok:
+            # See _orphan_or_lifecycle_error / t_963c89a2: complete_task() False
+            # is otherwise indistinguishable between "wrong id" and "your own
+            # row was deleted while you were running" (t_749b0510) — the
+            # latter needs a signal the worker can act on to stop, not retry.
+            return _orphan_or_lifecycle_error(
+                kb, conn, tid, args, "kanban_complete",
+                f"could not complete {tid} (unknown id or already terminal)")
         run = kb.latest_run(conn, tid)
         return _ok(task_id=tid, run_id=run.id if run else None)
 
@@ -619,7 +673,10 @@ def _handle_block(args: dict, **kw) -> str:
                f"finished or cannot proceed for another reason, call kanban_complete instead — "
                f"the completion judge will evaluate it.")
         ok = kb.block_task(conn, tid, reason=reason, kind=kind, expected_run_id=_worker_run_id(tid))
-        _check(ok, f"could not block {tid} (unknown id or not in running/ready)")
+        if not ok:
+            return _orphan_or_lifecycle_error(
+                kb, conn, tid, args, "kanban_block",
+                f"could not block {tid} (unknown id or not in running/ready)")
         return _ok_landed(kb, conn, tid, "blocked", block_kind=kind)
 
 
@@ -674,7 +731,14 @@ def _handle_heartbeat(args: dict, **kw) -> str:
         kb.heartbeat_claim(conn, tid, claimer=os.environ.get("HERMES_KANBAN_CLAIM_LOCK"))
         ok = kbd.heartbeat_worker(
             conn, tid, note=args.get("note"), expected_run_id=_worker_run_id(tid))
-        _check(ok, f"could not heartbeat {tid} (unknown id or not running)")
+        if not ok:
+            # See _orphan_or_lifecycle_error: a worker whose own row was
+            # deleted mid-run (t_749b0510) gets a distinguishable
+            # ``orphaned: true`` field instead of an identical-looking
+            # "unknown id or not running" it can only retry forever.
+            return _orphan_or_lifecycle_error(
+                kb, conn, tid, args, "kanban_heartbeat",
+                f"could not heartbeat {tid} (unknown id or not running)")
         return _ok(task_id=tid)
 
 

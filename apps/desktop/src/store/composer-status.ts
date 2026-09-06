@@ -27,6 +27,8 @@ export type StatusItemState = 'done' | 'failed' | 'running'
 export type StatusItemType = 'background' | 'goal' | 'subagent' | 'todo'
 
 export interface ComposerStatusItem {
+  /** background process: working directory reported by the process registry. */
+  cwd?: string
   /** background: non-zero exit shown inline when failed. */
   exitCode?: number
   /** subagent: active tool label shown on the right. */
@@ -38,10 +40,14 @@ export interface ComposerStatusItem {
   id: string
   /** background process: captured stdout/stderr tail for the inline viewer. */
   output?: string
+  /** background process: host PID reported by the process registry. */
+  pid?: number
   /** subagent: its own stored session id — row click opens that session window
    *  (livestreamed by the gateway's child-session mirror). */
   sessionId?: string
   state: StatusItemState
+  /** background process: local timer origin reconstructed from registry uptime. */
+  startedAt?: number
   title: string
   /** todo: the full four-state status driving the row's checkmark glyph. */
   todoStatus?: TodoStatus
@@ -192,11 +198,13 @@ const sameStatusItem = (a: ComposerStatusItem, b: ComposerStatusItem) =>
   a.state === b.state &&
   a.title === b.title &&
   a.output === b.output &&
+  a.cwd === b.cwd &&
   a.exitCode === b.exitCode &&
   a.currentTool === b.currentTool &&
   a.goalStatus === b.goalStatus &&
   a.todoStatus === b.todoStatus &&
   a.depth === b.depth &&
+  a.pid === b.pid &&
   a.sessionId === b.sessionId
 
 const stabilizeItems = (prev: ComposerStatusItem[] | undefined, next: ComposerStatusItem[]): ComposerStatusItem[] => {
@@ -292,10 +300,13 @@ const writeBackground = (sid: string, items: ComposerStatusItem[]) => {
 // `tui_gateway` process.list entry (tools/process_registry.list_sessions + output_tail).
 interface GatewayProcessEntry {
   command?: string
+  cwd?: string
   exit_code?: number
   output_tail?: string
+  pid?: number
   session_id?: string
   status?: string
+  uptime_seconds?: number
 }
 
 const toBackgroundItem = (proc: GatewayProcessEntry): ComposerStatusItem => {
@@ -303,17 +314,25 @@ const toBackgroundItem = (proc: GatewayProcessEntry): ComposerStatusItem => {
   const exitCode = typeof proc.exit_code === 'number' ? proc.exit_code : undefined
 
   return {
+    cwd: proc.cwd || undefined,
     exitCode,
     id: proc.session_id ?? '',
     output: proc.output_tail || undefined,
+    pid: typeof proc.pid === 'number' ? proc.pid : undefined,
     state: exited ? (exitCode ? 'failed' : 'done') : 'running',
+    startedAt: typeof proc.uptime_seconds === 'number' ? Date.now() - proc.uptime_seconds * 1_000 : undefined,
     title: (proc.command ?? '').split('\n')[0]!.trim() || 'background process',
     type: 'background'
   }
 }
 
 const sameItem = (a: ComposerStatusItem, b: ComposerStatusItem) =>
-  a.state === b.state && a.title === b.title && a.output === b.output && a.exitCode === b.exitCode
+  a.state === b.state &&
+  a.title === b.title &&
+  a.output === b.output &&
+  a.cwd === b.cwd &&
+  a.exitCode === b.exitCode &&
+  a.pid === b.pid
 
 /**
  * Layout-stable sync of the registry snapshot into the store: existing rows

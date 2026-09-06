@@ -1490,6 +1490,11 @@ export type { TitlebarTool } from '@/app/shell/titlebar-controls'
  *  builds without it would route the pin to the ACTIVE gateway. Bot Mode's
  *  Advanced section is the reference consumer. */
 export { SkillsView } from '@/app/skills'
+/** The compact Streamdown preset core uses for tool detail bodies — tighter
+ *  typography, tokenized fences/tables, external links routed through the
+ *  host. Prefer it over raw `Streamdown` for small in-panel prose so every
+ *  surface renders markdown identically. */
+export { CompactMarkdown } from '@/components/chat/compact-markdown'
 /** THE full MCP tab core Settings renders — per-server enable + OAuth sign-in
  *  + API-key setup + live probes, not a checkbox list. Route-decoupled so it
  *  renders anywhere (a plugin dialog); pass a live `gateway` (see
@@ -1572,6 +1577,10 @@ export { Separator } from '@/components/ui/separator'
 export { Skeleton } from '@/components/ui/skeleton'
 export { Switch } from '@/components/ui/switch'
 export { Tabs, TabsList, TabsTrigger } from '@/components/ui/tabs'
+/** The flat text tab row (underline-on-active, no pill box) core uses for
+ *  in-panel tab strips. `TextTabMeta` is the quiet count/detail slot beside a
+ *  tab's label. Pair with `Tabs` only if you want the boxed segmented look. */
+export { TextTab, TextTabMeta } from '@/components/ui/text-tab'
 export { Textarea } from '@/components/ui/textarea'
 export { Tip, Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from '@/components/ui/tooltip'
 export type { GatewayEventListener } from '@/contrib/events'

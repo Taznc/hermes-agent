@@ -229,7 +229,25 @@ kanban:
   review_dispatch: true            # default: spawn the assigned profile with
                                    # the bundled sdlc-review skill. Set false
                                    # for human-only review boards.
+  dispatch_start_budget: 20        # optional: starts per board/window before
+  dispatch_start_window_seconds: 600
+  review_rework_escalation_profile: debugger  # optional: route rework after
+                                               # two changes-requested cycles
 ```
+
+`dispatch_start_budget` is a sticky safety circuit, not a concurrency cap. The
+dispatcher counts real `spawned` events independently for each board. When a
+board reaches the configured limit—or a task with a completed/archived terminal
+event appears dispatchable without a later explicit unarchive—the board stops
+starting workers while reclaim and promotion bookkeeping continue. Inspect it
+with `hermes kanban --board <slug> dispatch --circuit-status`; after investigating
+or waiting out the window, resume explicitly with `hermes kanban --board <slug>
+dispatch --resume-circuit`. Configuration is hot-reloaded by the gateway.
+
+`review_rework_escalation_profile` breaks pathological implementation/review
+loops without removing review: the first changes request returns to the original
+implementer; after the second, the next ready run is reassigned to the configured
+specialist under that profile's own model defaults.
 
 Override the config flag at runtime via `HERMES_KANBAN_DISPATCH_IN_GATEWAY=0`
 for debugging. Standard gateway supervision applies: run `hermes gateway
@@ -391,6 +409,36 @@ Keep secrets, raw logs, tokens, OAuth material, and unrelated transcripts out of
 `metadata`. Store pointers and summaries instead. If a task has no files or
 tests, say so explicitly in `summary` and use `metadata` for the evidence that
 does exist, such as source URLs, issue ids, or manual review steps.
+
+### Efficient engineering task packets
+
+Worker startup is paid context, so put discovery that is already known into the
+card instead of making every lane rediscover it. An engineering card should
+name:
+
+- the exact edit targets and ownership boundary;
+- the base branch and relevant existing commits;
+- acceptance criteria and the focused verification commands;
+- known baseline failures;
+- inherited decisions and prior reviewer findings;
+- the upstream duplicate/prior-art search result, source, and timestamp.
+
+Run the prior-art search once when the parent or orchestrator files the work.
+Children inherit that evidence and refresh it only when absent or stale. Assigned
+skills are preloaded into the worker process before its first model turn; workers
+should use that loaded content rather than spending a tool cycle loading the same
+skill again.
+
+Target one testable behavior or architectural seam per card—usually roughly one
+to four hours of agent work. Split work that crosses UI, backend, persistence,
+and deployment ownership boundaries, and always declare `Edit-Targets:` so the
+dispatcher can serialize collisions. Do not create microcards whose workspace,
+prompt, review, and handoff overhead exceeds their implementation.
+
+Use staged verification: the worker runs focused checks for its changed paths;
+the reviewer independently selects checks from the diff's risks; one explicit
+integration/release child runs the full applicable suite on the combined branch.
+Do not make every lane rerun the same unchanged full suite.
 
 ### The worker lifecycle
 
@@ -1009,6 +1057,85 @@ cheaper than reconciling every future collision it would cause. For conflicts
 that have *already* happened, use the reconciliation-card pattern above with
 the `agent-merge-conflict-arbiter` optional skill; hotspot flagging is the upstream fix that keeps
 the reconciler from becoming a standing lane.
+
+### Declaring a card's edit surface (`Edit-Targets:`)
+
+Hotspot comments are a *post-hoc* signal: they only exist once a worker has
+already collided. To stop the collision happening at all, a card body can
+declare the files it intends to write, and the dispatcher serializes any two
+cards that name a common path:
+
+```
+Edit-Targets: apps/desktop/src/app/chat/right-rail/preview-pane.tsx, apps/desktop/src/lib/preview-guest.ts
+```
+
+A bullet list under an `Edit targets:` heading works too. When a card about to
+be dispatched names a path that a currently-running (or just-spawned) card
+already owns, the dispatcher does **not** block it for a human — it adds a real
+`parents=[holder]` dependency edge, so the card waits and then starts from a
+tree that already contains the holder's work. Once the holder completes the card
+promotes and dispatches normally.
+
+This exists because prose does not serialize agents. Two cards were once fanned
+out with the shared decision written into *both* bodies — "import the helper, do
+not define a second one" — and both workers still created it with different
+contents, because they ran in separate worktrees nine minutes apart and could
+not see each other. The `parents=[...]` edge is the only mechanism on the board
+that can actually order two workers.
+
+Scope is deliberately narrow, so declaring costs nothing:
+
+- Matching is exact per-path equality after normalization (`./a/b.ts`, `a//b.ts`,
+  `` `a/b.ts` `` and the residue of a bolded label are the same file). Markdown
+  spelling never splits the key: ``**hotspot:** `a/b.ts` `` and `hotspot: a/b.ts`
+  declare the same path, so an orchestrator's `Edit-Targets:` field and a
+  worker's bolded hotspot comment interoperate. No globs, no directory prefixes.
+- Only the overlapping pair is serialized — two cards naming *different* files
+  in the same repo still run concurrently. It is not a repo-wide lock.
+- A card that declares nothing and has no hotspot history dispatches exactly as
+  it did before.
+- Tenants are separate workspaces, so the same path under two tenants is not a
+  collision.
+- Emitted `hotspot:` comments and `hotspot` keys in completion metadata count as
+  a declared surface too — that signal was already in the DB and is now read
+  back rather than only being available to a human reading the board. A negated
+  line (`hotspot: none`, `hotspot: N/A`) declares nothing, however much prose
+  follows it, and a line whose comma-separated items are not *all* paths is
+  treated as prose rather than having its file-shaped fragments harvested. The
+  worker protocol asks every card for a hotspot line, so most of them are
+  negations; mining that prose would park unrelated cards behind each other. A
+  trailing parenthetical annotation (`` `a/b.ts` (2235 lines, +235) — reason ``)
+  is dropped before that check, so an annotation's internal comma cannot make a
+  genuinely declared file look like prose.
+- A brace group is expanded into the real files it names
+  (`src/i18n/{en,zh}.ts` → `src/i18n/en.ts`, `src/i18n/zh.ts`) rather than being
+  comma-split into fragments, and anything still carrying glob syntax
+  (`*`, `?`, `[]`, an unbalanced brace) is rejected outright. A fragment such as
+  `src/i18n/{en` is identical for any two cards touching that directory, so
+  admitting one would serialize them on a path that does not exist.
+- **Quoting a line is not declaring one.** A `hotspot:` or `Edit-Targets:` line
+  inside a fenced code block or a markdown blockquote is text somebody is
+  *citing as evidence about another card*, and it contributes nothing to the
+  quoting card's own edit surface. The review protocol asks reviewers to quote
+  the offending text, so without this rule documenting a parsing defect would
+  change routing: a card whose thread merely quotes a sibling's hotspot line
+  becomes the registered holder of a file it never touches, and the card that
+  genuinely edits it is parked behind it. The identical line written as ordinary
+  prose is still read normally.
+
+**The dependency edge is a lease, not a permanent dependency.** A card only
+waits while the holder is still on its way to producing the work it should start
+from. If the holder goes `blocked` or `on_hold`, the dispatcher drops the edge
+on the next tick and the parked card promotes immediately — otherwise an
+operator would have to unblock a *different* card to free it, which is exactly
+the "needs a human" routing bug this feature exists to remove. Edges an
+orchestrator or human added are left alone; only the dispatcher's own
+serialization edges are released.
+
+Deferred cards appear in the dispatch result's `serialized_coedit` bucket as
+`(task_id, holder_id, path)` and get a `serialized_coedit` event on the card, so
+`hermes kanban tail` shows why a card is waiting. Released edges appear in
+`released_coedit` as `(task_id, holder_id)` with a `coedit_released` event.
 
 ## Multi-tenant usage
 

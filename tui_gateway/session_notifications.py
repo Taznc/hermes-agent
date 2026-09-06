@@ -5,8 +5,12 @@ desktop UI wiring, HUD surface note. Bodies are rebound onto server.py's globals
 from __future__ import annotations
 
 import contextlib
+from typing import TYPE_CHECKING
 
 from .method_ctx import bind_module
+
+if TYPE_CHECKING:
+    from .server import _block
 
 
 def _notif_locked_sessions(fn, default):
@@ -320,9 +324,34 @@ def _collect_kanban_notifications(session: dict) -> list:
     return [t for slug in unique.values() for t in _kb_poll_board(_kb, slug, session_key)]
 
 
+_KANBAN_WAKE_TIMEOUT_SECONDS = 10
+_KANBAN_WAKE_CONTINUE = "Continue now"
+_KANBAN_WAKE_SKIP = "Skip this update"
+
+
+def _confirm_kanban_wake(sid: str, count: int) -> bool:
+    """Offer a newly idle chat a brief chance to suppress a Kanban follow-up.
+
+    The event cursor has already advanced, so declining is an acknowledgement rather
+    than a retry loop. A timeout preserves the established hands-off workflow.
+    """
+    summary = "update" if count == 1 else f"{count} updates"
+    answer = _block(
+        "clarify.request", sid,
+        {"question": (f"Kanban {summary} arrived. Hermes will investigate in "
+                      f"{_KANBAN_WAKE_TIMEOUT_SECONDS} seconds unless you skip it."),
+         "choices": [_KANBAN_WAKE_CONTINUE, _KANBAN_WAKE_SKIP]},
+        timeout=_KANBAN_WAKE_TIMEOUT_SECONDS)
+    return answer != _KANBAN_WAKE_SKIP
+
+
 def _notif_poll_kanban(sid: str, session: dict) -> None:
-    """One kanban poll: emit new texts, buffer them, and run the buffered batch as a turn if idle. Events are
-    cursor-claimed (never re-queued), so they wait in the buffer instead of dropping the agent turn."""
+    """One kanban poll: announce new events and guard the automatic follow-up.
+
+    Events are cursor-claimed (never re-queued). When an idle session would be
+    woken, the Desktop/TUI clarify card gives the user ten seconds to cancel;
+    accepting or timing out retains the previous automatic agent turn.
+    """
     try:
         texts = _collect_kanban_notifications(session)
     except Exception as exc:
@@ -336,6 +365,9 @@ def _notif_poll_kanban(sid: str, session: dict) -> None:
         return
     with session["history_lock"]:
         batch, session["_kanban_pending"] = list(session.get("_kanban_pending") or []), []
+    if not _confirm_kanban_wake(sid, len(batch)):
+        _notif_release_turn(session)
+        return
     with contextlib.suppress(Exception):
         _notif_submit(f"__notif__{int(time.time() * 1000)}", sid, session, "\n".join(batch), "kanban notification dispatch failed")
 

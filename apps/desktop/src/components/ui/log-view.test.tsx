@@ -57,6 +57,15 @@ describe('LogView numbered mode', () => {
     expect(container.innerHTML).not.toContain('break-words')
   })
 
+  it('can opt into readable wrapped lines without losing the numbered gutter', () => {
+    const longCommand = '.venv/bin/pip install -q --disable-pip-version-check -e .[dev]'
+    const { container } = render(<LogView content={longCommand} numbered wrap />)
+
+    expect(screen.getByText('1')).toBeTruthy()
+    expect(container.querySelector('span.whitespace-pre-wrap')?.textContent).toBe(longCommand)
+    expect(container.innerHTML).toContain('grid-cols-[auto_minmax(0,1fr)]')
+  })
+
   it('preserves data-selectable-text on the numbered root', () => {
     const { container } = render(<LogView content="line one" numbered />)
     const root = container.firstElementChild as HTMLElement

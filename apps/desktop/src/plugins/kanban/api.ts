@@ -312,9 +312,8 @@ export const fetchAllBoards = (archived: boolean) =>
 
 export const fetchTask = (id: string, board?: string) => call<KanbanTaskDetail>(boardPath(`/tasks/${id}`, board))
 
-/** Worker stdout/stderr tail (16 KiB by default; the drawer's "show more"
- *  affordance requests a larger tail instead of leaving truncation
- *  unexplained). */
+/** Worker stdout/stderr tail. Callers may request the 2 MiB API ceiling, which
+ * matches the retained active-log rotation limit. */
 export const fetchLog = (id: string, tailBytes = 16384, board?: string) =>
   call<WorkerLog>(boardPath(`/tasks/${id}/log`, board, { tail: String(tailBytes) }))
 

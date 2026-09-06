@@ -13,6 +13,44 @@ async function loadShim(): Promise<{ api: <T>(request: Record<string, unknown>) 
     .hermesDesktop
 }
 
+describe('web-bridge-shim reload trap re-entrancy guard', () => {
+  afterEach(() => {
+    Reflect.deleteProperty(window as unknown as Record<string, unknown>, '__hermesWebReloadTrapInstalled')
+    Reflect.deleteProperty(window, 'hermesDesktop')
+    vi.unstubAllGlobals()
+  })
+
+  it('a second module evaluation does not re-trap window.location.reload', async () => {
+    // jsdom's real window.location.reload is a non-configurable own
+    // property, so Object.defineProperty on it throws even here — the exact
+    // failure mode web-bridge-shim.ts's try/catch exists to survive. Stub a
+    // configurable location so the trap can actually install, matching a
+    // real browser where `reload` IS configurable.
+    const originalReload = vi.fn()
+    vi.stubGlobal('location', { ...window.location, reload: originalReload })
+
+    vi.resetModules()
+    const webReload = await import('./store/web-reload')
+    const registerSpy = vi.spyOn(webReload, 'registerNativeWebReload')
+
+    await import('./web-bridge-shim')
+    const reloadAfterFirstInstall = window.location.reload
+
+    expect(registerSpy).toHaveBeenCalledTimes(1)
+    expect(reloadAfterFirstInstall).not.toBe(originalReload)
+    expect((window as unknown as Record<string, unknown>).__hermesWebReloadTrapInstalled).toBe(true)
+
+    // A fresh module instance (mirrors Vite HMR re-evaluating this file
+    // without a real page navigation) must be a no-op: it must not throw,
+    // and it must not re-capture the already-trapped reload as "native".
+    vi.resetModules()
+    await expect(import('./web-bridge-shim')).resolves.toBeDefined()
+
+    expect(registerSpy).toHaveBeenCalledTimes(1)
+    expect(window.location.reload).toBe(reloadAfterFirstInstall)
+  })
+})
+
 describe('web-bridge-shim api() default timeout', () => {
   let fetchMock: ReturnType<typeof vi.fn>
 
