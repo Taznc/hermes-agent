@@ -1,4 +1,4 @@
-import { cleanup, render } from '@testing-library/react'
+import { cleanup, fireEvent, render, screen } from '@testing-library/react'
 import type * as React from 'react'
 import { afterEach, describe, expect, it, vi } from 'vitest'
 
@@ -20,7 +20,9 @@ vi.mock('@/i18n', () => ({
           older: 'Older',
           today: 'Today',
           yesterday: 'Yesterday'
-        }
+        },
+        projects: { toggle: (label: string, open: boolean) => `${open ? 'Hide' : 'Show'} ${label}` },
+        row: { archiveSession: 'Archive session' }
       }
     }
   })
@@ -180,5 +182,40 @@ describe('SidebarSessionsSection memoization & virtualizer stability', () => {
 
     const thirdRowsRef = mockVirtualListPropsHistory[2].rows
     expect(thirdRowsRef).not.toBe(secondRowsRef)
+  })
+
+  it('archives only the sessions beneath the clicked date divider', () => {
+    vi.useFakeTimers()
+    vi.setSystemTime(new Date('2026-09-06T16:00:00Z'))
+    const onArchiveSession = vi.fn()
+
+    render(
+      <SidebarSessionsSection
+        activeSessionId={null}
+        emptyState={<div>Empty</div>}
+        grouping="date"
+        label="Sessions"
+        onArchiveSession={onArchiveSession}
+        onDeleteSession={noop}
+        onResumeSession={noop}
+        onToggle={noop}
+        onTogglePin={noop}
+        onToggleUnread={noop}
+        open={true}
+        pinned={false}
+        sessions={[
+          makeSession('today', Date.parse('2026-09-06T15:00:00Z') / 1000),
+          makeSession('yesterday-a', Date.parse('2026-09-05T15:00:00Z') / 1000),
+          makeSession('yesterday-b', Date.parse('2026-09-05T14:00:00Z') / 1000)
+        ]}
+      />
+    )
+
+    fireEvent.click(screen.getByRole('button', { name: 'Archive session: Yesterday' }))
+
+    expect(onArchiveSession).toHaveBeenCalledTimes(2)
+    expect(onArchiveSession).toHaveBeenNthCalledWith(1, 'yesterday-a')
+    expect(onArchiveSession).toHaveBeenNthCalledWith(2, 'yesterday-b')
+    vi.useRealTimers()
   })
 })

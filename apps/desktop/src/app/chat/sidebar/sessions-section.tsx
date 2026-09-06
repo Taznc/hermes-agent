@@ -29,7 +29,7 @@ import {
 import { sessionPinId } from '@/store/session'
 import { $liveTurnSessionIds } from '@/store/session-dot-state'
 
-import { SidebarDateDivider, SidebarSectionMeta } from './chrome'
+import { SidebarDateDivider, SidebarDateDividerArchiveButton, SidebarSectionMeta } from './chrome'
 import { mergeVisibleReorder, orderRowsWithinGroups, reorderableRowIds } from './order'
 import {
   EnteredProjectContent,
@@ -314,25 +314,28 @@ export function SidebarSessionsSection({
   // exactly there; a sub-threshold release stays the ordinary click. The ONE
   // element here feeds both the plain and the virtualized list paths, so this
   // single wiring covers every date-divider "+" on screen.
-  const dividerAction =
-    grouping === 'date' && onNewSessionInWorkspace ? (
-      <WorkspaceAddButton
-        label={t.sidebar.nav['new-session']}
-        onClick={() => onNewSessionInWorkspace(null)}
-        onPointerDown={
-          onNewSessionSplit
-            ? event => {
-                startNewSessionDrag(placement => {
-                  onNewSessionSplit(placement.dir, {
-                    anchor: placement.anchor,
-                    before: placement.before
-                  })
-                }, event)
-              }
-            : undefined
-        }
-      />
-    ) : null
+  const newSessionDividerAction = useMemo(
+    () =>
+      grouping === 'date' && onNewSessionInWorkspace ? (
+        <WorkspaceAddButton
+          label={t.sidebar.nav['new-session']}
+          onClick={() => onNewSessionInWorkspace(null)}
+          onPointerDown={
+            onNewSessionSplit
+              ? event => {
+                  startNewSessionDrag(placement => {
+                    onNewSessionSplit(placement.dir, {
+                      anchor: placement.anchor,
+                      before: placement.before
+                    })
+                  }, event)
+                }
+              : undefined
+          }
+        />
+      ) : null,
+    [grouping, onNewSessionInWorkspace, onNewSessionSplit, t]
+  )
 
   const dividerToggle = useMemo(
     () => ({
@@ -404,6 +407,39 @@ export function SidebarSessionsSection({
 
     return manualOrderIds?.length ? orderRowsWithinGroups(rows, manualOrderIds) : rows
   }, [grouping, displayEntries, liveTurnIdSet, manualOrderIds, statusDividerLabels])
+
+  const dividerAction = useCallback(
+    (key: string, label: string) => {
+      if (grouping !== 'date') {
+        return newSessionDividerAction
+      }
+
+      return (
+        <>
+          <SidebarDateDividerArchiveButton
+            ariaLabel={`${t.sidebar.row.archiveSession}: ${label}`}
+            onArchive={() => {
+              let insideGroup = false
+
+              for (const row of flatRows) {
+                if (row.kind === 'divider') {
+                  if (insideGroup) {
+                    break
+                  }
+
+                  insideGroup = row.key === key
+                } else if (insideGroup) {
+                  onArchiveSession(row.entry.session.id)
+                }
+              }
+            }}
+          />
+          {newSessionDividerAction}
+        </>
+      )
+    },
+    [flatRows, grouping, newSessionDividerAction, onArchiveSession, t]
+  )
 
   // Closed date/status buckets keep their divider and drop the sessions under
   // it. Same array when nothing is collapsed so the virtualizer's rows ref
@@ -567,11 +603,27 @@ export function SidebarSessionsSection({
   } else if (sessionsDraggable) {
     inner = (
       <ReorderableList ids={sortableRowIds} onReorder={persistSessionOrder} sensors={dndSensors}>
-        {visibleRows.map(row => renderListRow(row, true, dividerAction))}
+        {visibleRows.map(row =>
+          renderListRow(
+            row,
+            true,
+            row.kind === 'divider'
+              ? dividerAction(row.key, 'label' in row ? row.label : sessionBucketLabel(row.bucket, dividerLabels))
+              : undefined
+          )
+        )}
       </ReorderableList>
     )
   } else {
-    inner = visibleRows.map(row => renderListRow(row, false, dividerAction))
+    inner = visibleRows.map(row =>
+      renderListRow(
+        row,
+        false,
+        row.kind === 'divider'
+          ? dividerAction(row.key, 'label' in row ? row.label : sessionBucketLabel(row.bucket, dividerLabels))
+          : undefined
+      )
+    )
   }
 
   // The virtualizer owns its own scroller, so suppress the wrapper's overflow
