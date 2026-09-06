@@ -198,6 +198,16 @@ type KanbanMessages = {
   editDescription: string
   cancelEdit: string
   noDescription: string
+  /** Collapsed-description affordance (Overview tab). */
+  showMore: string
+  showLess: string
+  /** Drawer tab strip — Overview / Activity / Log. */
+  tabOverview: string
+  tabActivity: string
+  tabLog: string
+  /** Empty states for the two non-Overview tabs. */
+  noActivityYet: string
+  noLogYet: string
   result: string
   latestSummary: string
   dependencies: string
@@ -522,6 +532,13 @@ export const en: KanbanMessages = {
   editDescription: 'Edit description',
   cancelEdit: 'Cancel edit',
   noDescription: 'No description yet.',
+  showMore: 'Show more',
+  showLess: 'Show less',
+  tabOverview: 'Overview',
+  tabActivity: 'Activity',
+  tabLog: 'Log',
+  noActivityYet: 'No activity yet.',
+  noLogYet: 'No worker log yet.',
   result: 'Result',
   latestSummary: 'Latest summary',
   dependencies: 'Dependencies',
@@ -832,6 +849,13 @@ const ja: KanbanMessages = {
   editDescription: '説明を編集',
   cancelEdit: '編集をキャンセル',
   noDescription: 'まだ説明はありません。',
+  showMore: 'もっと見る',
+  showLess: '折りたたむ',
+  tabOverview: '概要',
+  tabActivity: 'アクティビティ',
+  tabLog: 'ログ',
+  noActivityYet: 'まだアクティビティはありません。',
+  noLogYet: 'まだワーカーログはありません。',
   result: '結果',
   latestSummary: '最新のサマリー',
   dependencies: '依存関係',
@@ -1139,6 +1163,13 @@ const zh: KanbanMessages = {
   editDescription: '编辑描述',
   cancelEdit: '取消编辑',
   noDescription: '暂无描述。',
+  showMore: '显示更多',
+  showLess: '收起',
+  tabOverview: '概览',
+  tabActivity: '活动',
+  tabLog: '日志',
+  noActivityYet: '暂无活动。',
+  noLogYet: '暂无工作单元日志。',
   result: '结果',
   latestSummary: '最新摘要',
   dependencies: '依赖关系',
@@ -1444,6 +1475,13 @@ const zhHant: KanbanMessages = {
   editDescription: '編輯描述',
   cancelEdit: '取消編輯',
   noDescription: '尚無描述。',
+  showMore: '顯示更多',
+  showLess: '收合',
+  tabOverview: '總覽',
+  tabActivity: '活動',
+  tabLog: '日誌',
+  noActivityYet: '尚無活動。',
+  noLogYet: '尚無工作單元日誌。',
   result: '結果',
   latestSummary: '最新摘要',
   dependencies: '相依關係',
