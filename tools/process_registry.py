@@ -125,12 +125,20 @@ def _worker_memory_max_bytes() -> int:
 
 
 def _systemd_scope_argv(binary: str, unit_name: str, *argv: str) -> List[str]:
-    """``systemd-run --user --scope`` argv shared by the probe and real spawns.
-    ``--collect`` self-cleans the scope after exit; ``--unit`` names it for systemctl."""
+    """``systemd-run`` argv for a transient user service in the worker slice.
+
+    Transient scopes requested through the user manager are placed in ``app.slice``
+    by systemd 255 even with ``--slice``. A service is placed correctly, and
+    ``--pipe`` keeps the launcher attached so existing output/process lifecycle
+    tracking continues to observe the worker rather than an early-exiting wrapper.
+    """
     return [
-        binary, "--user", "--scope", "--quiet", "--unit", unit_name, "--collect",
+        binary, "--user", "--quiet", "--unit", unit_name, "--collect", "--pipe",
+        "--slice=hermes-workers.slice",
         "--property", "MemoryAccounting=yes",
+        "--property", "MemoryHigh=3G",
         "--property", f"MemoryMax={_worker_memory_max_bytes()}",
+        "--property", "TimeoutStopSec=30s",
         "--property", "OOMPolicy=kill",
         "--", *argv,
     ]
@@ -765,7 +773,7 @@ class ProcessRegistry:
         # This applies to both pipe mode and the PTY path above. See #70716.
         in_supervised_gateway = _IS_LINUX and _is_supervised_gateway_process()
         if in_supervised_gateway and _systemd_run_user_scope_available():
-            session.systemd_unit = f"hermes-worker-{unit_suffix}.scope"
+            session.systemd_unit = f"hermes-worker-{unit_suffix}.service"
             return _build_systemd_scope_argv(argv, unit_suffix=unit_suffix)
         if in_supervised_gateway:
             # Under a supervisor but no private cgroup: a worker OOM can still take

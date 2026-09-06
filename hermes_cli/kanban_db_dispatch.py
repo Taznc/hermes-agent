@@ -306,6 +306,7 @@ def _terminate_reclaimed_worker(
     pid: Optional[int],
     claim_lock: Optional[str],
     *,
+    systemd_unit: Optional[str] = None,
     signal_fn=None,
 ) -> dict[str, Any]:
     """Best-effort host-local worker termination for reclaim paths."""
@@ -315,12 +316,18 @@ def _terminate_reclaimed_worker(
         "termination_attempted": False,
         "terminated": False,
         "sigkill": False,
+        "systemd_unit": systemd_unit,
+        "systemd_unit_stopped": False,
     }
     if not pid or pid <= 0 or not claim_lock:
         return info
     if not str(claim_lock).startswith(_kb._host_prefix()):
         return info
     info["host_local"] = True
+    if systemd_unit:
+        from tools.process_registry import _stop_systemd_unit
+
+        info["systemd_unit_stopped"] = _stop_systemd_unit(systemd_unit)
 
     kill = _kill_fn(signal_fn)
     if kill is None:
@@ -549,7 +556,7 @@ def detect_stale_running(
     reclaimed: list[str] = []
 
     rows = conn.execute(
-        "SELECT t.id, t.worker_pid, t.last_heartbeat_at, t.claim_lock, "
+        "SELECT t.id, t.worker_pid, t.current_run_id, t.last_heartbeat_at, t.claim_lock, "
         "       COALESCE(r.started_at, t.started_at) AS active_started_at "
         "FROM tasks t "
         "LEFT JOIN task_runs r ON r.id = t.current_run_id "
@@ -572,7 +579,15 @@ def detect_stale_running(
         tid = row["id"]
         lock = row["claim_lock"] or ""
 
-        termination = _kb._terminate_reclaimed_worker(pid, lock, signal_fn=signal_fn)
+        run_id = row["current_run_id"]
+        systemd_unit = (
+            f"hermes-worker-kanban-{tid}-run-{run_id}.service"
+            if run_id is not None
+            else None
+        )
+        termination = _kb._terminate_reclaimed_worker(
+            pid, lock, systemd_unit=systemd_unit, signal_fn=signal_fn
+        )
 
         # Never release a claim while our own worker is still alive: that would
         # spawn a duplicate beside it. Hold the claim and retry next tick.
