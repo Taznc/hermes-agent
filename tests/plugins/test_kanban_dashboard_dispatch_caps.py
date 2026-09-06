@@ -94,10 +94,10 @@ def client(kanban_home):
     return TestClient(app)
 
 
-def _seed_ready(count: int, assignee: str = "claudeprimary") -> list[str]:
-    """Create *count* ready, assigned, unclaimed tasks."""
+def _seed_ready(count: int, assignee: str = "claudeprimary", board: str | None = None) -> list[str]:
+    """Create *count* ready, assigned, unclaimed tasks on ``board``."""
     ids = []
-    with kbc.connect_closing() as conn:
+    with kbc.connect_closing(board=board) as conn:
         for i in range(count):
             ids.append(kb.create_task(conn, title=f"task-{i}", assignee=assignee))
         conn.execute("UPDATE tasks SET status = 'ready' WHERE status = 'todo'")
@@ -180,6 +180,27 @@ def test_nudge_cannot_exceed_per_profile_cap(client, configured, spawns):
     assert len(spawns) == 2, (
         f"nudge spawned {len(spawns)} for one profile against a per-profile cap of 2"
     )
+
+
+def test_nudge_respects_per_profile_cap_consumed_on_another_board(client, configured, spawns):
+    """A dashboard nudge sees a profile already running on another board."""
+    kb.create_board("second")
+    _seed_ready(1, assignee="claudeprimary", board="second")
+    with kbc.connect_closing(board="second") as conn:
+        task_id = conn.execute("SELECT id FROM tasks").fetchone()[0]
+        conn.execute(
+            "UPDATE tasks SET status='running', claim_lock=?, worker_pid=? WHERE id=?",
+            (f"{kb._host_prefix()}1", 1, task_id),
+        )
+        conn.commit()
+    _seed_ready(1, assignee="claudeprimary")
+    configured(max_in_progress=2, max_in_progress_per_profile=1)
+
+    response = client.post("/api/plugins/kanban/dispatch?max=8")
+
+    assert response.status_code == 200
+    assert spawns == []
+    assert response.json()["skipped_per_profile_capped"][0][1:] == ["claudeprimary", 1]
 
 
 def test_per_profile_cap_is_per_profile_not_global(client, configured, spawns):

@@ -1527,6 +1527,42 @@ def count_running_tasks_other_boards(board: Optional[str] = None) -> int:
     return total
 
 
+def count_running_tasks_by_assignee_other_boards(board: Optional[str] = None) -> dict[str, int]:
+    """Return running-worker counts per assignee on every board except ``board``.
+
+    Per-profile concurrency is host-wide just like ``max_in_progress``: a
+    profile may be assigned work from any board, but its model/API quota is one
+    shared resource.
+    """
+    try:
+        current_path = str(_kb.kanban_db_path(board=board).expanduser().resolve())
+        boards = _kb.list_boards(include_archived=False)
+    except Exception:
+        return {}
+    counts: dict[str, int] = {}
+    for meta in boards:
+        slug = meta.get("slug") or _kb.DEFAULT_BOARD
+        try:
+            path = _kb.kanban_db_path(board=slug).expanduser()
+            if str(path.resolve()) == current_path or not path.exists():
+                continue
+            other = _kbc.connect(board=slug)
+            try:
+                rows = other.execute(
+                    "SELECT assignee, COUNT(*) AS n FROM tasks "
+                    "WHERE status = 'running' AND assignee IS NOT NULL GROUP BY assignee"
+                )
+                for row in rows:
+                    assignee = row["assignee"]
+                    counts[assignee] = counts.get(assignee, 0) + int(row["n"])
+            finally:
+                with contextlib.suppress(Exception):
+                    other.close()
+        except Exception:
+            continue
+    return counts
+
+
 def _memory_pressure_level(sample: Optional[Mapping[str, Any]] = None) -> str:
     """Classify system memory pressure: ok/elevated/critical/unknown.
 
@@ -1585,21 +1621,33 @@ def dispatch_once(
             reconcile_orphans=reconcile_orphans,
         )
 
+    needs_host_cap_lock = (
+        max_in_progress is not None or max_in_progress_per_profile is not None
+    )
     try:
         db_path = _kb.kanban_db_path(board=board)
     except Exception:
-        # Must not lose the tick — fall through to an unguarded dispatch.
-        result = _locked_tick()
-        _kb._fire_dispatch_tick_hook(result, board=board, dry_run=dry_run)
-        return result
-    with _kbc._dispatch_tick_lock(db_path) as held:
-        if not held:
+        # Preserve dispatch availability when the board path cannot be resolved.
+        db_path = None
+
+    host_lock = (
+        _kbc._host_dispatch_cap_lock()
+        if needs_host_cap_lock else contextlib.nullcontext(True)
+    )
+    with host_lock as host_held:
+        if not host_held:
             result = DispatchResult(skipped_locked=True)
-        else:
+        elif db_path is None:
             result = _locked_tick()
-            # Still under the dispatch lock: periodic PASSIVE WAL checkpoint.
-            _kbc._maybe_checkpoint_wal(conn, db_path)
-    # Lock released. Fire the tick observer strictly OUTSIDE the critical
+        else:
+            with _kbc._dispatch_tick_lock(db_path) as board_held:
+                if not board_held:
+                    result = DispatchResult(skipped_locked=True)
+                else:
+                    result = _locked_tick()
+                    # Still under the board dispatch lock: periodic PASSIVE WAL checkpoint.
+                    _kbc._maybe_checkpoint_wal(conn, db_path)
+    # Locks released. Fire the tick observer strictly OUTSIDE the critical
     # section: a slow subscriber must never stall a sibling dispatcher's tick.
     _kb._fire_dispatch_tick_hook(result, board=board, dry_run=dry_run)
     return result
@@ -1938,12 +1986,16 @@ def _dispatch_once_locked(
     ) else None
     per_profile_running: dict[str, int] = {}
     if per_profile_cap is not None:
+        per_profile_running = count_running_tasks_by_assignee_other_boards(board)
         for prow in conn.execute(
             "SELECT assignee, COUNT(*) AS n FROM tasks "
             "WHERE status = 'running' AND assignee IS NOT NULL "
             "GROUP BY assignee"
         ):
-            per_profile_running[prow["assignee"]] = int(prow["n"])
+            assignee = prow["assignee"]
+            per_profile_running[assignee] = (
+                per_profile_running.get(assignee, 0) + int(prow["n"])
+            )
     lane_kwargs: dict[str, Any] = dict(
         dry_run=dry_run, ttl_seconds=ttl_seconds, board=board,
         failure_limit=failure_limit, spawn_fn=spawn_fn,
