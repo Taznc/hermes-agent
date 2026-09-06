@@ -94,6 +94,23 @@ export function pathToFileUrl(path: string) {
  * so the caller supplies one (`window.hermesDesktop`'s reported home, when
  * available) — with no home known, `~/…` is left as a literal leading
  * segment rather than silently mis-resolving into `process.cwd()`-relative.
+ *
+ * `~` expansion is further gated on the path actually naming THIS machine's
+ * filesystem (`isLocalHost`, defaulted from `!isDesktopFsRemoteMode()`). On
+ * a remote gateway the reported home dir is always the LOCAL Electron
+ * host's (`app.getPath('home')`), never the remote backend's — expanding
+ * there would put a real-looking but wrong-machine path on the clipboard.
+ * Remote mode already hides every other file verb (`canUseNativeFileActions`),
+ * so Copy path is the only one reachable here, and it must stay portable:
+ * copy the literal `~/…` back.
+ *
+ * A `file://` href whose host is non-empty and not `localhost` is likewise
+ * untrustworthy: `new URL(raw).pathname` silently drops the host, so
+ * `file://~/todo.md` would resolve to `/todo.md` — a real-looking but
+ * entirely different file. A host of exactly `~` is the one shape chat
+ * links can produce (from a `~/…` href re-wrapped as `file://`) and is
+ * routed back through the tilde branch; any other host returns the raw
+ * href untouched rather than fabricate a truncated path.
  */
 export interface ChatLinkPath {
   /** The raw on-disk path — what Reveal and Copy path act on. */
@@ -103,14 +120,47 @@ export interface ChatLinkPath {
   url: string
 }
 
-export function resolveChatLinkPath(href: string, homeDir?: null | string): ChatLinkPath {
+export function resolveChatLinkPath(
+  href: string,
+  homeDir?: null | string,
+  isLocalHost: boolean = !isDesktopFsRemoteMode()
+): ChatLinkPath {
   const raw = href.trim()
 
   if (/^file:\/\//i.test(raw)) {
+    let parsed: URL | null
+
+    try {
+      parsed = new URL(raw)
+    } catch {
+      parsed = null
+    }
+
+    const host = parsed?.host ?? ''
+
+    if (host && host !== 'localhost') {
+      if (host === '~') {
+        let tildePath = '/'
+
+        try {
+          tildePath = decodeURIComponent(parsed!.pathname)
+        } catch {
+          tildePath = parsed!.pathname
+        }
+
+        return resolveChatLinkPath(`~${tildePath}`, homeDir, isLocalHost)
+      }
+
+      // Any other non-empty host cannot be trusted: `.pathname` would
+      // silently drop it and hand every verb a truncated, WRONG path.
+      // Fail closed — return the href untouched rather than fabricate one.
+      return { path: raw, url: raw }
+    }
+
     let decoded: string
 
     try {
-      decoded = decodeURIComponent(new URL(raw).pathname)
+      decoded = decodeURIComponent((parsed ?? new URL(raw)).pathname)
     } catch {
       decoded = raw.replace(/^file:\/\//i, '')
     }
@@ -119,7 +169,7 @@ export function resolveChatLinkPath(href: string, homeDir?: null | string): Chat
   }
 
   if (raw === '~' || raw.startsWith('~/')) {
-    const expanded = homeDir ? `${homeDir.replace(/\/+$/, '')}${raw.slice(1)}` : raw
+    const expanded = isLocalHost && homeDir ? `${homeDir.replace(/\/+$/, '')}${raw.slice(1)}` : raw
 
     return { path: expanded, url: pathToFileUrl(expanded) }
   }

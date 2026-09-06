@@ -306,6 +306,43 @@ describe('AppContextMenu', () => {
     await waitFor(() => expect(writeClipboard).toHaveBeenCalledWith('/tmp/my report.md'))
   })
 
+  // Reviewer round-2 defect 1: on a remote gateway, `~` must NOT be expanded
+  // with the LOCAL Electron host's home dir — that names a different
+  // machine's filesystem. Copy path is the only file verb remote mode
+  // offers, and it must stay portable: copy the literal `~/…` back.
+  it('does not expand ~ with the local home dir on a remote gateway', async () => {
+    const writeClipboard = vi.fn().mockResolvedValue(undefined)
+
+    $connection.set({ mode: 'remote' } as never)
+    __setKnownHomeDirForTest('/home/localuser')
+    installBridge({ writeClipboard: writeClipboard as unknown as Window['hermesDesktop']['writeClipboard'] })
+    mountMenu()
+    const host = attach('<a href="~/todo.md">~/todo.md</a>')
+
+    fireEvent.contextMenu(host.querySelector('a')!)
+    fireEvent.click(await screen.findByText('Copy path'))
+
+    await waitFor(() => expect(writeClipboard).toHaveBeenCalledWith('~/todo.md'))
+  })
+
+  // Reviewer round-2 defect 2: `file://~/todo.md` (a shape both linkify
+  // regexes match) must not resolve via `new URL(raw).pathname`, which
+  // discards the `~` host and yields a truncated, WRONG path (`/todo.md`).
+  // It must route through the tilde-expansion branch instead.
+  it('expands a file://~/… href to the home path, not a truncated one', async () => {
+    const revealPath = vi.fn().mockResolvedValue(true)
+
+    __setKnownHomeDirForTest('/home/rae')
+    installBridge({ revealPath: revealPath as unknown as Window['hermesDesktop']['revealPath'] })
+    mountMenu()
+    const host = attach('<a href="file://~/todo.md">file://~/todo.md</a>')
+
+    fireEvent.contextMenu(host.querySelector('a')!)
+    fireEvent.click(await screen.findByText(/Reveal in Finder|Reveal in File Explorer|Open containing folder/))
+
+    await waitFor(() => expect(revealPath).toHaveBeenCalledWith('/home/rae/todo.md'))
+  })
+
   it('hides the local-only file verbs on a remote gateway', async () => {
     $connection.set({ mode: 'remote' } as never)
     installBridge()
