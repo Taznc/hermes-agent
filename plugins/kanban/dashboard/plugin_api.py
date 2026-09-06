@@ -1504,9 +1504,26 @@ def get_task_log(task_id: str, tail: Optional[int] = Query(None, ge=1, le=2_000_
 
 @router.post("/dispatch")
 def dispatch(dry_run: bool = Query(False), max_n: int = Query(8, alias="max"), board: Optional[str] = Query(None)):
-    """Dispatch nudge so the UI doesn't wait out the 60 s dispatcher tick."""
+    """Dispatch nudge so the UI doesn't wait out the 60 s dispatcher tick.
+
+    Resolves the same ``kanban.*`` caps the gateway tick and the CLI use.
+    Without them this endpoint spawns uncapped: ``dispatch_once`` reads an
+    omitted cap as unlimited, and the desktop fires this on a debounce after
+    every board edit, so clicking around the board could push the host well
+    past ``kanban.max_in_progress``. ``?max=`` is clamped rather than trusted —
+    it is a browser-supplied ceiling, not an override of the host's.
+    """
+    caps = kbd.resolve_dispatch_caps()
     with _board_conn(board) as (board, conn):
-        result = kbd.dispatch_once(conn, dry_run=dry_run, max_spawn=max_n, board=board)
+        result = kbd.dispatch_once(
+            conn,
+            dry_run=dry_run,
+            max_spawn=kbd.clamp_requested_max_spawn(max_n, caps),
+            max_in_progress=caps.max_in_progress,
+            max_in_progress_per_profile=caps.max_in_progress_per_profile,
+            default_assignee=caps.default_assignee,
+            board=board,
+        )
         try:
             return asdict(result)  # DispatchResult is a dataclass
         except TypeError:

@@ -1399,6 +1399,80 @@ def configured_max_in_progress() -> Optional[int]:
     return ival if ival >= 1 else None
 
 
+@dataclass(frozen=True)
+class DispatchCaps:
+    """Resolved ``kanban.*`` concurrency settings for one ``dispatch_once`` call.
+
+    ``max_in_progress`` is already routed through :func:`resolve_max_in_progress`,
+    so it carries the memory-derived default when config leaves it unset.
+    """
+
+    max_in_progress: Optional[int]
+    max_in_progress_per_profile: Optional[int]
+    max_spawn: Optional[int]
+    default_assignee: Optional[str]
+
+
+def resolve_dispatch_caps(kanban_cfg: Optional[dict] = None) -> DispatchCaps:
+    """Resolve the concurrency caps every ``dispatch_once`` entry point must honour.
+
+    The caps bound the HOST, so they cannot be a property of one entry point:
+    the gateway's periodic tick, ``hermes kanban dispatch`` and the dashboard's
+    ``POST /dispatch`` nudge all spawn real workers against the same CPU and
+    memory. An entry point that skips this resolution does not merely dispatch
+    "differently" — it dispatches *uncapped*, because ``dispatch_once`` treats
+    ``None`` as unlimited. Keeping the parsing here means adding a fourth caller
+    cannot reintroduce that gap by omission.
+
+    Reads config itself when *kanban_cfg* is None. Fails open to all-``None``
+    only on a config-read error, which is the pre-existing behaviour of every
+    caller — a broken config must not wedge dispatch entirely.
+    """
+    if kanban_cfg is None:
+        try:
+            from hermes_cli.config import load_config
+
+            cfg = load_config()
+            kanban_cfg = cfg.get("kanban", {}) if isinstance(cfg, dict) else {}
+        except Exception:
+            _kb._log.warning(
+                "kanban dispatch: config unreadable; proceeding without configured caps"
+            )
+            kanban_cfg = {}
+    if not isinstance(kanban_cfg, dict):
+        kanban_cfg = {}
+
+    return DispatchCaps(
+        max_in_progress=resolve_max_in_progress(
+            _positive_int_or_none(kanban_cfg.get("max_in_progress"))
+        ),
+        max_in_progress_per_profile=_positive_int_or_none(
+            kanban_cfg.get("max_in_progress_per_profile")
+        ),
+        max_spawn=_positive_int_or_none(kanban_cfg.get("max_spawn")),
+        default_assignee=(kanban_cfg.get("default_assignee") or "").strip() or None,
+    )
+
+
+def clamp_requested_max_spawn(
+    requested: Optional[int], caps: "DispatchCaps"
+) -> Optional[int]:
+    """Narrow a caller-supplied request to the resolved HOST cap; never widen.
+
+    Only for values that arrive from outside the operator's config — the
+    dashboard nudge reads ``?max=`` straight off a query string, so an
+    unclamped value lets a hand-crafted ``?max=99`` ask for more than the host
+    allows. Clamps against ``max_in_progress`` alone: ``max_spawn`` is a
+    separate per-board axis that ``dispatch_once`` enforces on its own, and
+    folding it in here would silently tighten a cap the operator set
+    deliberately.
+
+    ``None`` on either side means that side imposes no bound.
+    """
+    bounds = [b for b in (requested, caps.max_in_progress) if b is not None]
+    return min(bounds) if bounds else None
+
+
 def count_running_tasks(conn: sqlite3.Connection) -> int:
     """Number of tasks in ``status='running'``.
 
@@ -1915,6 +1989,23 @@ def _positive_int(value: Any, default: int, *, minimum: int = 1) -> int:
     except (TypeError, ValueError):
         return default
     return parsed if parsed >= minimum else default
+
+
+def _positive_int_or_none(value: Any) -> Optional[int]:
+    """Parse an optional positive-int cap; ``None`` when unset, invalid, or < 1.
+
+    Distinct from :func:`_positive_int` because for a *cap*, "absent" and
+    "zero" are not the same as "fall back to a default": ``None`` means
+    unbounded and must stay distinguishable from a real number all the way
+    into ``dispatch_once``.
+    """
+    if value is None:
+        return None
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError):
+        return None
+    return parsed if parsed >= 1 else None
 
 
 def worker_log_rotation_config(kanban_cfg: Optional[dict] = None) -> tuple[int, int]:
