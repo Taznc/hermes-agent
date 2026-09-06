@@ -92,13 +92,6 @@ def _classifier_prompt(title: str, body: Optional[str], *, max_input_tokens: int
 def _parse_classifier_route(content: Any) -> Optional[str]:
     if content is None:
         return None
-    if isinstance(content, dict):
-        for key in ("route", "selected_route", "name"):
-            value = content.get(key)
-            if isinstance(value, str):
-                route = value.strip().lower()
-                return route or None
-        return None
     if not isinstance(content, str):
         content = str(content)
     text = content.strip()
@@ -107,15 +100,17 @@ def _parse_classifier_route(content: Any) -> Optional[str]:
     try:
         parsed = json.loads(text)
     except Exception:
-        parsed = None
-    if isinstance(parsed, dict):
-        return _parse_classifier_route(parsed)
-    if isinstance(parsed, str):
-        route = parsed.strip().lower()
-        return route or None
-    lowered = text.lower()
-    if lowered in {"default", "mechanical"}:
-        return lowered
+        return None
+    if not isinstance(parsed, dict):
+        return None
+    if set(parsed) != {"route"}:
+        return None
+    route = parsed.get("route")
+    if not isinstance(route, str):
+        return None
+    route = route.strip().lower()
+    if route == _DEFAULT_ROUTE_NAME or route in _SUPPORTED_ROUTES:
+        return route
     return None
 
 

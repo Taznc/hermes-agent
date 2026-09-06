@@ -84,7 +84,16 @@ def test_explicit_override_short_circuits_classifier_call(kanban_home, monkeypat
     assert decision.reasoning_effort == "high"
 
 
-@pytest.mark.parametrize("content", ["not json", json.dumps({"route": "bogus"})])
+@pytest.mark.parametrize(
+    "content",
+    [
+        "not json",
+        "mechanical",
+        json.dumps({"route": "bogus"}),
+        json.dumps({"name": "mechanical"}),
+        json.dumps({"route": "mechanical", "confidence": 1}),
+    ],
+)
 def test_malformed_classifier_output_fails_closed_to_default(kanban_home, monkeypatch, content):
     from hermes_cli import kanban_model_routing as kmr
 
