@@ -68,7 +68,7 @@ export interface DiagnosticAction {
 /** One active distress signal on a task (kanban_diagnostics.Diagnostic). */
 export interface Diagnostic {
   kind: string
-  severity: 'critical' | 'error' | 'warning'
+  severity: 'critical' | 'error' | 'warning' | 'info'
   title: string
   detail: string
   actions: DiagnosticAction[]
@@ -280,5 +280,6 @@ export const columnMeta = (name: string) =>
 export const SEVERITY_TONE: Record<Diagnostic['severity'], string> = {
   critical: 'var(--destructive, #f87171)',
   error: 'var(--destructive, #f87171)',
-  warning: '#fbbf24'
+  warning: '#fbbf24',
+  info: 'var(--ui-text-tertiary, #60a5fa)'
 }
