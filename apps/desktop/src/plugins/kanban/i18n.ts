@@ -67,9 +67,11 @@ type KanbanMessages = {
   removeImage: string
   imagePasteFailed: string
   priority: string
-  markHighPriority: string
-  removeHighPriority: string
-  highPriorityTip: string
+  priorityCritical: string
+  priorityHigh: string
+  priorityNormal: string
+  priorityLow: string
+  priorityCustom: (value: number) => string
   workspace: string
   boardDefaultSuffix: string
   workspaceOverride: string
@@ -404,9 +406,11 @@ export const en: KanbanMessages = {
   removeImage: 'Remove image',
   imagePasteFailed: 'Could not upload pasted image',
   priority: 'Priority',
-  markHighPriority: 'Mark high priority',
-  removeHighPriority: 'Remove high priority',
-  highPriorityTip: 'High priority — claimed and shown first in its column.',
+  priorityCritical: 'Critical',
+  priorityHigh: 'High',
+  priorityNormal: 'Normal',
+  priorityLow: 'Low',
+  priorityCustom: value => `Custom (${value})`,
   workspace: 'Workspace',
   boardDefaultSuffix: ' · board default',
   workspaceOverride: 'Workspace path (optional override)',
@@ -724,9 +728,11 @@ const ja: KanbanMessages = {
   removeImage: '画像を削除',
   imagePasteFailed: '貼り付けた画像をアップロードできませんでした',
   priority: '優先度',
-  markHighPriority: '優先度を高に設定',
-  removeHighPriority: '優先度の高設定を解除',
-  highPriorityTip: '優先度高 — このタスクを最初に取得・列の先頭に表示します。',
+  priorityCritical: '緊急',
+  priorityHigh: '高',
+  priorityNormal: '通常',
+  priorityLow: '低',
+  priorityCustom: value => `カスタム (${value})`,
   workspace: 'ワークスペース',
   boardDefaultSuffix: '・ボード既定',
   workspaceOverride: 'ワークスペースパス（任意の上書き）',
@@ -1043,9 +1049,11 @@ const zh: KanbanMessages = {
   removeImage: '移除图片',
   imagePasteFailed: '无法上传粘贴的图片',
   priority: '优先级',
-  markHighPriority: '标记为高优先级',
-  removeHighPriority: '取消高优先级',
-  highPriorityTip: '高优先级 — 会被优先领取，并显示在所在列的最前面。',
+  priorityCritical: '紧急',
+  priorityHigh: '高',
+  priorityNormal: '普通',
+  priorityLow: '低',
+  priorityCustom: value => `自定义 (${value})`,
   workspace: '工作区',
   boardDefaultSuffix: '・面板默认',
   workspaceOverride: '工作区路径（可选覆盖）',
@@ -1358,9 +1366,11 @@ const zhHant: KanbanMessages = {
   removeImage: '移除圖片',
   imagePasteFailed: '無法上傳貼上的圖片',
   priority: '優先順序',
-  markHighPriority: '標記為高優先順序',
-  removeHighPriority: '取消高優先順序',
-  highPriorityTip: '高優先順序 — 會被優先領取，並顯示在所在欄的最前面。',
+  priorityCritical: '緊急',
+  priorityHigh: '高',
+  priorityNormal: '一般',
+  priorityLow: '低',
+  priorityCustom: value => `自訂 (${value})`,
   workspace: '工作區',
   boardDefaultSuffix: '・面板預設',
   workspaceOverride: '工作區路徑（選填覆寫）',

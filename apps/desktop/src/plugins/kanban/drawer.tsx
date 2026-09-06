@@ -27,7 +27,6 @@ import {
   ErrorState,
   host,
   Loader,
-  Tip,
   useMutation,
   useQuery,
   useQueryClient,
@@ -71,6 +70,7 @@ import {
   MetaRow
 } from './drawer_overview'
 import { ModelOverrideField, overridePatch } from './model-override'
+import { PriorityPicker } from './priority-picker'
 import { statusGuidance } from './status-guidance'
 import { type ChoiceResponse, columnMeta, type KanbanTaskDetail, SEVERITY_TONE } from './types'
 import {
@@ -254,8 +254,7 @@ export function TaskDrawer({
     }
   })
 
-  // Priority-only PATCH — never touches status/title/body/assignee, so a
-  // failed toggle can't be mistaken for a bigger write going wrong.
+  // Priority-only PATCH — never touches status/title/body/assignee.
   const priorityMut = useMutation({
     mutationFn: (priority: number) => patchTask(id!, { priority }, taskBoard),
     onError: err => host.notify({ kind: 'error', message: errText(err) }),
@@ -341,18 +340,6 @@ export function TaskDrawer({
                 </DropdownMenuTrigger>
                 <DropdownMenuContent align="end">
                   <DropdownMenuItem
-                    onSelect={() =>
-                      void priorityMut.mutate(typeof task.priority === 'number' && task.priority > 0 ? 0 : 1)
-                    }
-                  >
-                    <Codicon
-                      name={typeof task.priority === 'number' && task.priority > 0 ? 'star-full' : 'star-empty'}
-                      size="0.85rem"
-                    />
-                    {typeof task.priority === 'number' && task.priority > 0 ? k.removeHighPriority : k.markHighPriority}
-                  </DropdownMenuItem>
-                  <DropdownMenuSeparator />
-                  <DropdownMenuItem
                     onSelect={() => {
                       void navigator.clipboard.writeText(task.id)
                       host.notify({ kind: 'info', message: k.copiedId(task.id) })
@@ -393,17 +380,7 @@ export function TaskDrawer({
           </div>
         </div>
         {task && (
-          <h2
-            className="flex items-center gap-1.5 text-sm leading-snug font-semibold text-foreground"
-            data-selectable-text="true"
-          >
-            {typeof task.priority === 'number' && task.priority > 0 && (
-              <Tip label={k.highPriorityTip}>
-                <span className="shrink-0" style={{ color: columnMeta('review').tone }}>
-                  <Codicon name="star-full" size="0.8rem" />
-                </span>
-              </Tip>
-            )}
+          <h2 className="text-sm leading-snug font-semibold text-foreground" data-selectable-text="true">
             {task.title || task.id}
           </h2>
         )}
@@ -475,7 +452,9 @@ export function TaskDrawer({
                         onReassign={profile => void mutate(() => reassignTask(task.id, profile, taskBoard))()}
                       />
                     </MetaRow>
-                    {typeof task.priority === 'number' && <MetaRow label={k.metaPriority}>{task.priority}</MetaRow>}
+                    <MetaRow label={k.metaPriority}>
+                      <PriorityPicker onChange={priority => priorityMut.mutate(priority)} priority={task.priority} />
+                    </MetaRow>
                     {task.tenant && <MetaRow label={k.metaTenant}>{task.tenant}</MetaRow>}
                     {task.workspace_path && (
                       <MetaRow
