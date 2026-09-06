@@ -306,26 +306,38 @@ export function useStatusbarItems({
   const gatewayOpen = gatewayState === 'open'
   const gatewayConnecting = gatewayState === 'connecting'
 
-  const gatewayHealth = statusBarGatewayHealth({
-    connectionState: gatewayState,
-    copy: {
-      backend: copy.backend,
-      checking: copy.gatewayChecking,
-      connecting: copy.gatewayConnecting,
-      messagingDegraded: copy.messagingDegraded,
-      messagingStopped: copy.messagingStopped,
-      needsSetup: copy.gatewayNeedsSetup,
-      offline: copy.gatewayOffline,
-      ready: copy.gatewayReady,
-      restarting: copy.gatewayRestarting,
-      unavailable: copy.gatewayUnavailable
-    },
-    inferenceStatus,
-    messagingRunning: statusSnapshot?.gateway_running,
-    messagingState: statusSnapshot?.gateway_state,
-    platforms: statusSnapshot?.gateway_platforms,
-    restarting: gatewayRestarting
-  })
+  const gatewayHealth = useMemo(
+    () =>
+      statusBarGatewayHealth({
+        connectionState: gatewayState,
+        copy: {
+          backend: copy.backend,
+          checking: copy.gatewayChecking,
+          connecting: copy.gatewayConnecting,
+          messagingDegraded: copy.messagingDegraded,
+          messagingStopped: copy.messagingStopped,
+          needsSetup: copy.gatewayNeedsSetup,
+          offline: copy.gatewayOffline,
+          ready: copy.gatewayReady,
+          restarting: copy.gatewayRestarting,
+          unavailable: copy.gatewayUnavailable
+        },
+        inferenceStatus,
+        messagingRunning: statusSnapshot?.gateway_running,
+        messagingState: statusSnapshot?.gateway_state,
+        platforms: statusSnapshot?.gateway_platforms,
+        restarting: gatewayRestarting
+      }),
+    [
+      gatewayState,
+      copy,
+      inferenceStatus,
+      statusSnapshot?.gateway_running,
+      statusSnapshot?.gateway_state,
+      statusSnapshot?.gateway_platforms,
+      gatewayRestarting
+    ]
+  )
 
   const inferenceReady = gatewayOpen && inferenceStatus?.ready === true && !gatewayHealth.degraded
   const gatewayDegraded = gatewayOpen || gatewayConnecting || gatewayHealth.degraded

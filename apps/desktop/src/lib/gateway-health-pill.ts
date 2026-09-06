@@ -40,8 +40,9 @@ export interface GatewayHealthPill {
   title?: string
 }
 
-const HEALTHY_PLATFORM_STATES = new Set(['connected'])
+const HEALTHY_PLATFORM_STATES = new Set(['connected', 'running', 'ok'])
 const IGNORED_PLATFORM_STATES = new Set(['disabled', 'not_configured', 'not configured'])
+const IN_FLIGHT_PLATFORM_STATES = new Set(['connecting', 'retrying', 'starting'])
 
 function platformLeaf(id: string): string {
   const sep = id.lastIndexOf(':')
@@ -54,7 +55,12 @@ function unhealthyPlatformNames(platforms: GatewayHealthPillInput['platforms']):
     .filter(([, platform]) => {
       const state = (platform?.state || '').trim().toLowerCase()
 
-      return Boolean(state) && !HEALTHY_PLATFORM_STATES.has(state) && !IGNORED_PLATFORM_STATES.has(state)
+      return (
+        Boolean(state) &&
+        !HEALTHY_PLATFORM_STATES.has(state) &&
+        !IGNORED_PLATFORM_STATES.has(state) &&
+        !IN_FLIGHT_PLATFORM_STATES.has(state)
+      )
     })
     .map(([id]) => platformLeaf(id))
 }

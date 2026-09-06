@@ -66,4 +66,26 @@ describe('statusBarGatewayHealth', () => {
     expect(discordDown.detail).toBe(copy.messagingDegraded('discord'))
     expect(discordDown.degraded).toBe(true)
   })
+
+  it('treats a platform mid-connect as in-flight, not a failure, and only degrades once terminal', () => {
+    const connecting = statusBarGatewayHealth({
+      ...openReady,
+      messagingRunning: true,
+      messagingState: 'running',
+      platforms: { discord: { state: 'connecting' } }
+    })
+
+    expect(connecting.degraded).toBe(false)
+    expect(connecting.detail).toBe(copy.ready)
+
+    const fatal = statusBarGatewayHealth({
+      ...openReady,
+      messagingRunning: true,
+      messagingState: 'running',
+      platforms: { discord: { state: 'fatal' } }
+    })
+
+    expect(fatal.degraded).toBe(true)
+    expect(fatal.detail).toBe(copy.messagingDegraded('discord'))
+  })
 })
