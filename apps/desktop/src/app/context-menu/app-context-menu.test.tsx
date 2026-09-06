@@ -94,6 +94,17 @@ describe('resolveDomTarget', () => {
 })
 
 describe('AppContextMenu', () => {
+  it('does not expose an upstream-update action from bare shell right-clicks', async () => {
+    installBridge()
+    mountMenu()
+    const host = attach('<div>empty shell</div>')
+
+    fireEvent.contextMenu(host)
+
+    expect(await screen.findByText('Settings')).toBeTruthy()
+    expect(screen.queryByText('Update Hermes')).toBeNull()
+  })
+
   it('opens the link menu on a chat link right-click', async () => {
     installBridge()
     mountMenu()

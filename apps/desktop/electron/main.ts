@@ -6812,25 +6812,6 @@ async function showPluginCompatNoticeOnce() {
   }
 }
 
-function sendOpenUpdatesRequested() {
-  if (!mainWindow || mainWindow.isDestroyed()) {
-    return
-  }
-
-  const { webContents } = mainWindow
-
-  if (!webContents || webContents.isDestroyed()) {
-    return
-  }
-
-  webContents.send('hermes:open-updates')
-
-  if (!mainWindow.isVisible()) {
-    mainWindow.show()
-  }
-
-  mainWindow.focus()
-}
 
 // Push titlebar/fullscreen chrome state to a window's renderer. Defaults to the
 // primary, but any full chat window (primary or a secondary "instance" peer)
@@ -6858,22 +6839,11 @@ function sendWindowStateChanged(nextIsFullscreen?: boolean, target = mainWindow)
 function buildApplicationMenu() {
   const template = []
 
-  const checkForUpdatesItem = {
-    // Update checks are disabled (desktop.auto_update_checks_enabled: false
-    // in config.yaml, or HERMES_DESKTOP_DISABLE_UPDATE_CHECKS) — clicking
-    // this still opens the updates panel, which reports the same
-    // 'update-checks-disabled' reason, but the label says so up front instead
-    // of looking like a normal, functional menu item.
-    label: UPDATE_CHECKS_DISABLED ? 'Check for Updates… (disabled)' : 'Check for Updates…',
-    click: () => sendOpenUpdatesRequested()
-  }
-
   if (IS_MAC) {
     template.push({
       label: APP_NAME,
       submenu: [
         { label: `About ${APP_NAME}`, click: () => showAboutPanelFresh() },
-        checkForUpdatesItem,
         { type: 'separator' },
         { role: 'services' },
         { type: 'separator' },
@@ -6984,11 +6954,6 @@ function buildApplicationMenu() {
     submenu: IS_MAC
       ? [{ role: 'minimize' }, { role: 'zoom' }, { role: 'front' }]
       : [{ role: 'minimize' }, { role: 'close' }]
-  })
-  template.push({
-    label: 'Help',
-    role: 'help',
-    submenu: [checkForUpdatesItem]
   })
 
   return Menu.buildFromTemplate(template)
