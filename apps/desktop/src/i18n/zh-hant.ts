@@ -2875,6 +2875,7 @@ export const zhHant = defineForkLocale(forkZhHant, {
       refresh: '重新整理',
       moreActions: '更多動作',
       branchNewChat: '在新聊天中分支',
+      copyMessage: '複製訊息',
       react: '回應',
       dismissError: '关闭错误',
       errorLayers: {

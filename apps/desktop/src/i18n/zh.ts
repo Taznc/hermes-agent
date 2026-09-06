@@ -3570,6 +3570,7 @@ export const zhAuthored: Translations = withForkKeys(forkZh, {
       refresh: '刷新',
       moreActions: '更多操作',
       branchNewChat: '在新对话中分支',
+      copyMessage: '复制消息',
       react: '回应',
       dismissError: '关闭错误',
       errorLayers: {

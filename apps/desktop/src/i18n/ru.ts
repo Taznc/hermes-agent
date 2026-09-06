@@ -3381,6 +3381,7 @@ export const ru = defineLocale({
       refresh: 'Обновить',
       moreActions: 'Ещё действия',
       branchNewChat: 'Ветка в новый чат',
+      copyMessage: 'Копировать сообщение',
       react: 'Реакция',
       dismissError: 'Скрыть ошибку',
       filesChanged: count => `${count} ${RU_PLURAL(count, 'файл изменён', 'файла изменено', 'файлов изменено')}`,
