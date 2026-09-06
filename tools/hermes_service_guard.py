@@ -33,7 +33,8 @@ from pathlib import Path
 from typing import Callable, Iterable, Optional
 
 from tools.approval_detection import (
-    _deobfuscate_shell_word_for_detection, _iter_shell_command_starts, _read_shell_word)
+    _deobfuscate_shell_word_for_detection, _iter_shell_command_starts,
+    _literal_command_substitution_output, _read_shell_word)
 
 logger = logging.getLogger("tools.approval")
 
@@ -55,10 +56,19 @@ _SYSTEMCTL_VALUE_OPTIONS = frozenset({
 
 # Wrappers that hand execution to their argument tail; without peeling them
 # `sudo systemctl restart hermes-gateway` presents `sudo` as the executable.
+#
+# `then`/`do`/`else`/`elif` are shell COMPOUND-STATEMENT keywords, not programs, but they sit
+# in the executable slot exactly like a wrapper does: `if true; then kill -9 <pid>; fi` puts
+# `then` where `_command_parts` looks for the command word, and the walk stops there unless
+# it is peeled the same way `sudo`/`env` are. `case`'s `WORD)` pattern-close is peeled
+# separately by `_peel_case_pattern` (its syntax isn't a single leading word). `xargs` hands
+# its stdin-derived argument list to the command in its own argument tail
+# (`echo <pid> | xargs kill -9`), so it is peeled the same way; see `_preceding_pipe_source_pid`
+# for how the piped-in pid itself is recovered.
 _TRANSPARENT_PREFIXES = frozenset({
     "sudo", "doas", "env", "nohup", "setsid", "nice", "ionice", "stdbuf", "timeout",
     "exec", "command", "builtin", "eatmydata", "pkexec", "su", "runuser", "setpriv",
-    "systemd-run", "nsenter", "unshare",
+    "systemd-run", "nsenter", "unshare", "then", "do", "else", "elif", "xargs",
 })
 
 # Wrapper options consuming the next token (same rationale as _SYSTEMCTL_VALUE_OPTIONS).
@@ -74,6 +84,10 @@ _PREFIX_VALUE_OPTIONS = {
     "runuser": frozenset({"-u", "--user", "-s", "--shell", "-g", "--group"}),
     "systemd-run": frozenset({"-u", "--unit", "-p", "--property", "-E", "--setenv", "--slice", "--uid", "--gid"}),
     "nsenter": frozenset({"-t", "--target", "-S", "--setuid", "-G", "--setgid", "-r", "--root", "-w", "--wd"}),
+    "xargs": frozenset({
+        "-I", "-L", "-l", "-n", "-P", "-s", "-a", "-d", "-E", "--replace", "--max-lines",
+        "--max-args", "--max-procs", "--arg-file", "--delimiter", "--eof",
+    }),
 }
 # Wrappers whose first non-option operand is a VALUE, not the command (`timeout 60 systemctl ...`).
 _PREFIX_OPERANDS = {"timeout": 1}
@@ -140,14 +154,17 @@ def _shell_words_at(command: str, start: int) -> list[str]:
     return words
 
 
-def _peel_prefixes(words: list[str], index: int) -> int:
-    """Index of the command a wrapper chain actually executes."""
+def _peel_prefixes(words: list[str], index: int) -> tuple[int, bool]:
+    """Index of the command a wrapper chain actually executes, plus whether ``xargs`` was
+    one of the peeled wrappers (its target arrives via stdin, not its own argument tail)."""
+    saw_xargs = False
     for _ in range(_MAX_PREFIX_PEELS):
         if index >= len(words):
-            return index
+            return index, saw_xargs
         name = _executable_name(words[index])
         if name not in _TRANSPARENT_PREFIXES:
-            return index
+            return index, saw_xargs
+        saw_xargs = saw_xargs or name == "xargs"
         value_options = _PREFIX_VALUE_OPTIONS.get(name, frozenset())
         index += 1
         while index < len(words):
@@ -165,18 +182,18 @@ def _peel_prefixes(words: list[str], index: int) -> int:
         for _ in range(_PREFIX_OPERANDS.get(name, 0)):
             if index < len(words) and not words[index].startswith("-"):
                 index += 1
-    return index
+    return index, saw_xargs
 
 
-def _command_parts(words: list[str]) -> tuple[Optional[str], list[str]]:
-    """Split leading ``VAR=value`` assignments and wrappers off -> (executable, args)."""
+def _command_parts(words: list[str]) -> tuple[Optional[str], list[str], bool]:
+    """Split leading ``VAR=value`` assignments and wrappers off -> (executable, args, saw_xargs)."""
     index = 0
     while index < len(words) and _ENV_ASSIGNMENT_RE.match(words[index]):
         index += 1
-    index = _peel_prefixes(words, index)
+    index, saw_xargs = _peel_prefixes(words, index)
     if index >= len(words):
-        return None, []
-    return words[index], words[index + 1:]
+        return None, [], saw_xargs
+    return words[index], words[index + 1:], saw_xargs
 
 
 def _systemctl_units(args: list[str]) -> tuple[Optional[str], list[str]]:
@@ -235,6 +252,25 @@ def _kill_target_pids(args: list[str]) -> list[int]:
     return pids
 
 
+def _preceding_pipe_stage_pids(command: str, start: int) -> list[int]:
+    """Numeric pid ``xargs`` would append to its command, from the pipe stage before ``start``.
+
+    ``echo <pid> | xargs kill -9`` never puts the pid in ``kill``'s own argument tail — xargs
+    reads it from stdin and appends it. Only a literal, non-executing producer (``echo``/
+    ``printf`` with a single simple literal argument, mirroring
+    ``_literal_command_substitution_output``) is resolved; anything more dynamic (a pipeline
+    reading real process state) yields no pid rather than guessing.
+    """
+    pipe_index = command.rfind("|", 0, start)
+    if pipe_index == -1 or (pipe_index > 0 and command[pipe_index - 1] == "|"):
+        return []
+    earlier_starts = [s for s in _iter_shell_command_starts(command) if s <= pipe_index]
+    stage_start = max(earlier_starts) if earlier_starts else 0
+    stage_text = command[stage_start:pipe_index].strip()
+    literal = _literal_command_substitution_output(stage_text)
+    return [abs(int(literal))] if literal is not None and _NUMERIC_TARGET_RE.match(literal) else []
+
+
 def _human_instruction(unit: str) -> str:
     return f"a human must run `sudo systemctl restart {unit}` in a terminal outside the agent"
 
@@ -242,7 +278,7 @@ def _human_instruction(unit: str) -> str:
 def _iter_findings(command: str, resolve_pid_unit: _PidUnitResolver) -> Iterable[str]:
     """Yield a description for each in-scope Hermes-service-stopping command found."""
     for start in sorted(set(_iter_shell_command_starts(command))):
-        executable, args = _command_parts(_shell_words_at(command, start))
+        executable, args, saw_xargs = _command_parts(_shell_words_at(command, start))
         if executable is None:
             continue
         name = _executable_name(executable)
@@ -255,7 +291,9 @@ def _iter_findings(command: str, resolve_pid_unit: _PidUnitResolver) -> Iterable
                     yield (f"systemctl {verb} of Hermes service {unit} "
                            f"(kills the running agent fleet; {_human_instruction(unit)})")
         elif name == "kill":
-            for pid in _kill_target_pids(args):
+            target_args = args + [str(pid) for pid in _preceding_pipe_stage_pids(command, start)] \
+                if saw_xargs else args
+            for pid in _kill_target_pids(target_args):
                 unit = resolve_pid_unit(pid)
                 if unit and is_hermes_unit(unit):
                     yield (f"signalling pid {pid}, which is Hermes service {unit} "

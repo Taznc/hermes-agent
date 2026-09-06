@@ -982,6 +982,7 @@ def _iter_shell_command_starts(command: str):
 
     def scan(start: int, end: int) -> None:
         skip = -1
+        paren_depth = 0
         for kind, i, j, quote in _scan_shell(command, start, end, subst="uq", stop_unterminated=True):
             if kind == "subst":
                 # Record a nested $(...)/backtick command start and scan its body.
@@ -991,10 +992,21 @@ def _iter_shell_command_starts(command: str):
             elif kind == "char" and quote is None and i != skip:
                 if command[i] in "({;\n":
                     starts.append(i + 1)
+                    paren_depth += command[i] == "("
                 elif command[i] in "&|":
                     repeated = i + 1 < end and command[i + 1] == command[i]
                     skip = i + 1 if repeated else skip
                     starts.append(i + 1 + repeated)
+                elif command[i] == ")":
+                    # A `)` that closes a real `(subshell)` group is not a new command
+                    # start (whatever follows is an argument/operator of the OUTER
+                    # command, e.g. `$(cmd) arg`). A `)` with no matching opener is a
+                    # `case WORD)` pattern terminator instead, and shell runs the case
+                    # arm's commands starting right after it.
+                    if paren_depth > 0:
+                        paren_depth -= 1
+                    else:
+                        starts.append(i + 1)
 
     scan(0, len(command))
     # First occurrence wins (dict order), so a start is yielded once even when several openers map to it.

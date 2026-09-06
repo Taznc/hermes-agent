@@ -119,6 +119,49 @@ def test_kill_signal_operand_is_not_treated_as_a_target():
     assert detect("kill -9 880")[0]           # 880 = hermes backend, in scope
 
 
+# --- shell compound statements around kill --------------------------------------------------
+# A determined agent can reach the same fleet-killing `kill -9 <pid>` inside a shell
+# compound statement, where the guard's word walk previously stopped on the shell KEYWORD
+# (`then`, `do`, ...) instead of reaching `kill`. Same in-scope/out-of-scope contract as the
+# plain spelling, just wrapped.
+
+@pytest.mark.parametrize("command", [
+    "if true; then kill -9 880; fi",
+    "for i in 1; do kill -9 880; done",
+    "while false; do kill -9 880; done",
+    "case x in x) kill -9 880;; esac",
+    "echo 880 | xargs kill -9",
+    "printf 880 | xargs -n1 kill -9",
+])
+def test_compound_statement_spellings_reach_the_same_verdict(command):
+    """The compound-statement wrapper must not let the walk stop before reaching `kill`."""
+    assert detect(command)[0]
+
+
+@pytest.mark.parametrize("command", [
+    "if true; then kill -9 5669; fi",
+    "for i in 1; do kill -9 5669; done",
+    "while false; do kill -9 5669; done",
+    "case x in x) kill -9 5669;; esac",
+    "echo 5669 | xargs kill -9",
+])
+def test_compound_statement_spellings_keep_out_of_scope_targets_allowed(command):
+    """Wrapping an unrelated pid in a compound statement must not manufacture a false positive."""
+    assert not detect(command)[0]
+
+
+@pytest.mark.parametrize("command", [
+    "if true; then echo hi; fi",
+    "for i in 1 2; do echo $i; done",
+    "while false; do systemctl status hermes-gateway; done",
+    "case x in y) echo no;; esac",
+    "echo hello | xargs echo",
+])
+def test_compound_statements_around_benign_commands_stay_allowed(command):
+    """The new keyword/xargs peeling must not turn every compound statement into a finding."""
+    assert not detect(command)[0]
+
+
 # --- integration with the real detector ----------------------------------------------------
 
 def test_guard_is_reachable_through_the_real_dangerous_command_detector():
