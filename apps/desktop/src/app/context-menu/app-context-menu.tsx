@@ -24,7 +24,6 @@ import { reachablePreviewUrl } from '@/lib/preview-reach'
 import { openCommandPalette } from '@/store/command-palette'
 import { openPreview } from '@/store/preview'
 import { toggleStatusbarVisible } from '@/store/statusbar-prefs'
-import { requestActiveUpdate } from '@/store/updates'
 import { canOpenNewWindow, openNewWindow } from '@/store/windows'
 
 import { navigateToWorkspacePage, NEW_CHAT_ROUTE, SETTINGS_ROUTE } from '../routes'
@@ -602,14 +601,6 @@ function shellSections({ navigate, t }: ShellVerbs): ReactNode[][] {
         key="shell-settings"
         label={t.commandCenter.settings}
         onSelect={() => navigateToWorkspacePage(navigate, SETTINGS_ROUTE)}
-      />
-    ],
-    [
-      <Item
-        icon="cloud-download"
-        key="shell-update"
-        label={t.commandCenter.updateHermes}
-        onSelect={requestActiveUpdate}
       />
     ]
   ]

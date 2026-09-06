@@ -145,8 +145,8 @@ function isInstallMethodToastSnoozed(): boolean {
 /**
  * Guard against a desktop GUI talking to a backend that predates its contract
  * (e.g. a bb/gui-built app pointed at a `main` checkout). Rather than failing
- * cryptically downstream, surface a warning with a one-click align that runs
- * the normal update flow (which self-heals to the right branch).
+ * cryptically downstream, surface a compatibility warning. Desktop must not
+ * offer an upstream-update action from this normal session lifecycle path.
  *
  * Runs on every session open; closing the toast snoozes it for a cooldown so it
  * doesn't nag on every thread switch.
@@ -166,13 +166,6 @@ export function reportBackendContract(contract: number | undefined): void {
   }
 
   notify({
-    action: {
-      label: translateNow('notifications.updateHermes'),
-      onClick: () => {
-        snoozeSkewToast()
-        void applyBackendUpdate()
-      }
-    },
     durationMs: 0,
     id: SKEW_TOAST_ID,
     kind: 'warning',
