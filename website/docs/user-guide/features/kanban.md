@@ -1047,11 +1047,32 @@ Scope is deliberately narrow, so declaring costs nothing:
   collision.
 - Emitted `hotspot:` comments and `hotspot` keys in completion metadata count as
   a declared surface too — that signal was already in the DB and is now read
-  back rather than only being available to a human reading the board.
+  back rather than only being available to a human reading the board. A negated
+  line (`hotspot: none`, `hotspot: N/A`) declares nothing, however much prose
+  follows it, and a line whose comma-separated items are not *all* paths is
+  treated as prose rather than having its file-shaped fragments harvested. The
+  worker protocol asks every card for a hotspot line, so most of them are
+  negations; mining that prose would park unrelated cards behind each other.
+- A brace group is expanded into the real files it names
+  (`src/i18n/{en,zh}.ts` → `src/i18n/en.ts`, `src/i18n/zh.ts`) rather than being
+  comma-split into fragments, and anything still carrying glob syntax
+  (`*`, `?`, `[]`, an unbalanced brace) is rejected outright. A fragment such as
+  `src/i18n/{en` is identical for any two cards touching that directory, so
+  admitting one would serialize them on a path that does not exist.
+
+**The dependency edge is a lease, not a permanent dependency.** A card only
+waits while the holder is still on its way to producing the work it should start
+from. If the holder goes `blocked` or `on_hold`, the dispatcher drops the edge
+on the next tick and the parked card promotes immediately — otherwise an
+operator would have to unblock a *different* card to free it, which is exactly
+the "needs a human" routing bug this feature exists to remove. Edges an
+orchestrator or human added are left alone; only the dispatcher's own
+serialization edges are released.
 
 Deferred cards appear in the dispatch result's `serialized_coedit` bucket as
 `(task_id, holder_id, path)` and get a `serialized_coedit` event on the card, so
-`hermes kanban tail` shows why a card is waiting.
+`hermes kanban tail` shows why a card is waiting. Released edges appear in
+`released_coedit` as `(task_id, holder_id)` with a `coedit_released` event.
 
 ## Multi-tenant usage
 

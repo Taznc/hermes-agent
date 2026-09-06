@@ -152,6 +152,12 @@ class DispatchResult:
     card gained a real dependency edge on the holder and sits in ``todo`` until
     it completes — NOT operator-actionable and NOT a failure: it is the board
     serializing a co-edit that prose in two card bodies provably cannot."""
+    released_coedit: list[tuple[str, str]] = field(default_factory=list)
+    """``(task_id, holder_id)`` for serialization edges dropped this tick because
+    the holder stalled (``blocked``/``on_hold``) and will not produce the work
+    the parked card was waiting for. The edge is a lease, not a dependency —
+    without this a card would be held hostage until a human unblocked a
+    DIFFERENT card, which is the routing bug the guard exists to remove."""
     skipped_locked: bool = False
     """True when another process held the board's dispatch lock: this tick did
     no DB writes; the lock holder is making progress on the same board."""
@@ -1897,6 +1903,10 @@ def _run_reclaim_phase(
     result.rate_limited.extend(getattr(detect_crashed_workers, "_last_rate_limited", []))
     result.review_no_verdict.extend(getattr(detect_crashed_workers, "_last_review_no_verdict", []))
     result.timed_out = enforce_max_runtime(conn)
+    # Release serialization edges whose holder stalled, BEFORE promoting: a card
+    # parked behind a now-blocked holder must be free to promote in this same
+    # tick rather than waiting for a human to unblock a different card.
+    result.released_coedit = _kc.release_stranded_coedit_edges(conn)
     result.promoted = _kb.recompute_ready(conn, failure_limit=failure_limit)
 
 

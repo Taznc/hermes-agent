@@ -238,6 +238,12 @@ def test_metadata_hotspot_shapes(kanban_home):
     assert kc._metadata_hotspot_paths('{"summary": "no hotspot key"}') == []
     assert kc._metadata_hotspot_paths("not json") == []
     assert kc._metadata_hotspot_paths(None) == []
+    # Completion metadata carries the same negation-plus-prose shape a comment
+    # does, and must be read with the same strictness.
+    assert kc._metadata_hotspot_paths(
+        '{"hotspots": ["none. touched a.py, b.py, c.py"]}'
+    ) == []
+    assert kc._metadata_hotspot_paths('{"hotspot": "N/A"}') == []
 
 
 def test_two_tenants_naming_the_same_path_are_not_coediting(kanban_home):
@@ -293,3 +299,287 @@ def test_hotspot_comment_parsing_keeps_hyphenated_paths_intact(kanban_home):
     assert kc.parse_hotspot_paths("hotspot: a/b-c.ts -- reason") == ["a/b-c.ts"]
     assert kc.parse_hotspot_paths("hotspot: a/b-c.ts") == ["a/b-c.ts"]
     assert kc.parse_hotspot_paths("not a hotspot line") == []
+
+
+# --- The negated hotspot line: the common case, not an edge case ---
+#
+# The worker protocol asks EVERY card for a hotspot line, so the overwhelmingly
+# common value on a real board is a negation followed by prose that names files.
+# Harvesting paths out of that prose parks two unrelated cards behind each other.
+
+# Verbatim shape of a real handoff comment on this board.
+NEGATED_HOTSPOT = (
+    "**hotspot:** none. The three files I touched (`kanban_db_dispatch.py`, "
+    "`kanban_coedit.py`, `prompt_builder.py`) showed no collision with sibling "
+    "branches — though `hermes_cli/kanban_db_dispatch.py` is a plausible future "
+    "hotspot."
+)
+
+
+def test_negated_hotspot_line_declares_nothing(kanban_home):
+    """A negation contributes no paths, however much prose follows it.
+
+    Regression: the parser kept the text left of the first dash and comma-split
+    it, so the file list inside the explanation became declared paths.
+    """
+    from hermes_cli import kanban_coedit as kc
+
+    assert kc.parse_hotspot_paths(NEGATED_HOTSPOT) == []
+    for line in (
+        "hotspot: none",
+        "hotspot: N/A",
+        "hotspot: n/a — nothing shared",
+        "hotspot: none. touched agent/turn_loop.py and agent/prompt_builder.py",
+        "hotspot: no collisions, agent/turn_loop.py is stable",
+        "**hotspot:** None.",
+    ):
+        assert kc.parse_hotspot_paths(line) == [], line
+    # And the negation must not be mistaken for a path in its own right:
+    # "N/A" contains a slash, so a bare path check accepts it.
+    assert kc.normalize_edit_path("N/A") == "N/A"  # shape-wise it IS path-like
+    assert kc.parse_hotspot_paths("hotspot: N/A") == []  # ...but never declared
+
+
+def test_hotspot_prose_that_merely_mentions_files_declares_nothing(kanban_home):
+    """A non-negated hotspot line is still all-or-nothing: if the chunks are not
+    all paths it is prose, and prose must not donate the chunks that happen to
+    look like filenames."""
+    from hermes_cli import kanban_coedit as kc
+
+    assert kc.parse_hotspot_paths(
+        "hotspot: three branches keep touching a/b.py, so watch it"
+    ) == []
+    # The leak this closes: with a reason dash present, the pre-fix parser kept
+    # the left side and comma-split it, so the one chunk that happened to be a
+    # bare path was harvested while the prose chunk was silently dropped.
+    assert kc.parse_hotspot_paths(
+        "hotspot: watch a/b.py, c/d.py — two branches collided"
+    ) == []
+    # The real form still works.
+    assert kc.parse_hotspot_paths("hotspot: a/b.py, c/d.py — three branches") == [
+        "a/b.py", "c/d.py",
+    ]
+
+
+def test_two_cards_with_negated_hotspot_comments_run_concurrently(kanban_home):
+    """End-to-end criterion 4: routine protocol-mandated hotspot comments must
+    not serialize two unrelated cards.
+
+    Pre-fix both cards yielded ``kanban_coedit.py`` from the prose inside their
+    negations and the second was parked behind the first.
+    """
+    kb = kanban_home
+    from hermes_cli import kanban_db_connect as kbc
+    from hermes_cli import kanban_db_dispatch as kbd
+
+    with kbc.connect_closing() as conn:
+        a = kb.create_task(conn, title="a", assignee="alpha", body="unrelated work")
+        b = kb.create_task(conn, title="b", assignee="beta", body="also unrelated")
+        for task in (a, b):
+            kb.add_comment(conn, task, "claudeprimary", NEGATED_HOTSPOT)
+
+    with kbc.connect_closing() as conn:
+        res = kbd.dispatch_once(conn, spawn_fn=_fake_spawn)
+        assert _status(conn, a) == "running"
+        assert _status(conn, b) == "running", (
+            "a card whose only hotspot line is a negation must dispatch exactly "
+            "as it does today"
+        )
+        assert _parents(kb, conn, b) == []
+    assert res.serialized_coedit == []
+
+
+def test_brace_globs_expand_instead_of_truncating(kanban_home):
+    """Real board text carries brace expansions. A comma split cuts them into
+    fragments (``apps/desktop/src/i18n/{en``) that are identical across any two
+    cards touching that directory — a collision on a path that does not exist.
+    """
+    from hermes_cli import kanban_coedit as kc
+
+    assert kc.expand_brace_path("apps/i18n/{en,zh}.ts") == [
+        "apps/i18n/en.ts", "apps/i18n/zh.ts",
+    ]
+    # An elision member is not a filename and must not become one.
+    assert kc.expand_brace_path("apps/i18n/{en,...}.ts") == ["apps/i18n/en.ts"]
+    # Unbalanced braces yield nothing rather than a fragment.
+    assert kc.expand_brace_path("apps/i18n/{en") == []
+    assert kc.expand_brace_path("ar}.ts") == []
+
+    paths = kc.parse_hotspot_paths(
+        "hotspot: apps/desktop/src/i18n/{en,types,zh}.ts — shared with sibling"
+    )
+    assert paths == [
+        "apps/desktop/src/i18n/en.ts",
+        "apps/desktop/src/i18n/types.ts",
+        "apps/desktop/src/i18n/zh.ts",
+    ]
+    assert not any("{" in p or "}" in p for p in paths)
+
+
+def test_brace_prefix_fragments_never_become_a_holder_key(kanban_home):
+    """Two cards naming DIFFERENT files must not collide on a shared truncation
+    artifact.
+
+    This is the live-board shape: both bodies start their brace group with the
+    same member, so a comma split hands both cards the identical fragment
+    ``apps/i18n/{en`` — a path that does not exist — while the real files
+    (``en.ts`` vs ``en.json``) do not overlap at all.
+    """
+    kb = kanban_home
+    from hermes_cli import kanban_coedit as kc
+    from hermes_cli import kanban_db_connect as kbc
+    from hermes_cli import kanban_db_dispatch as kbd
+
+    a_decl, b_decl = "apps/i18n/{en,fr}.ts", "apps/i18n/{en,de}.json"
+    # The two declarations share no real file...
+    assert not (set(kc.expand_brace_path(a_decl)) & set(kc.expand_brace_path(b_decl)))
+
+    with kbc.connect_closing() as conn:
+        a = kb.create_task(conn, title="a", assignee="alpha", body=_body(a_decl))
+        b = kb.create_task(conn, title="b", assignee="beta", body=_body(b_decl))
+
+    with kbc.connect_closing() as conn:
+        res = kbd.dispatch_once(conn, spawn_fn=_fake_spawn)
+        # ...so neither may be parked behind the other.
+        assert _status(conn, a) == "running"
+        assert _status(conn, b) == "running"
+        assert _parents(kb, conn, b) == []
+    assert res.serialized_coedit == []
+
+
+def test_brace_globs_that_share_a_real_file_do_serialize(kanban_home):
+    """Discrimination for the test above: expansion must still find a genuine
+    overlap, on the real per-file name rather than on a fragment."""
+    kb = kanban_home
+    from hermes_cli import kanban_db_connect as kbc
+    from hermes_cli import kanban_db_dispatch as kbd
+
+    with kbc.connect_closing() as conn:
+        a = kb.create_task(
+            conn, title="a", assignee="alpha", body=_body("apps/i18n/{en,fr}.ts"),
+        )
+        b = kb.create_task(
+            conn, title="b", assignee="beta", body=_body("apps/i18n/{fr,de}.ts"),
+        )
+
+    with kbc.connect_closing() as conn:
+        res = kbd.dispatch_once(conn, spawn_fn=_fake_spawn)
+        assert _status(conn, b) == "todo"
+        assert _parents(kb, conn, b) == [a]
+    assert res.serialized_coedit == [(b, a, "apps/i18n/fr.ts")]
+
+
+def test_a_glob_pattern_is_never_a_holder_key(kanban_home):
+    """Matching is exact per-path equality, so a pattern cannot be a key — it
+    would claim files it does not name."""
+    from hermes_cli import kanban_coedit as kc
+
+    for pattern in ("apps/**/*.ts", "apps/src/*.tsx", "apps/src/a?.ts"):
+        assert kc.normalize_edit_path(pattern) == "", pattern
+
+
+# --- Stranding: the edge is a lease, not a permanent dependency ---
+
+
+def test_serialized_card_is_released_when_its_holder_blocks(kanban_home):
+    """The guard must not recreate the routing bug it exists to remove.
+
+    ``recompute_ready`` promotes only when every parent is ``done``, so a holder
+    that goes ``blocked`` would park the co-editing card until a human unblocked
+    a DIFFERENT card. The serialization edge is therefore released as soon as
+    the holder stops being on its way to producing the work.
+    """
+    kb = kanban_home
+    from hermes_cli import kanban_db_connect as kbc
+    from hermes_cli import kanban_db_dispatch as kbd
+
+    with kbc.connect_closing() as conn:
+        holder = kb.create_task(conn, title="holder", assignee="alpha", body=_body(PANE))
+        parked = kb.create_task(conn, title="parked", assignee="beta", body=_body(PANE))
+        kbd.dispatch_once(conn, spawn_fn=_fake_spawn)
+        assert _status(conn, parked) == "todo"
+        assert _parents(kb, conn, parked) == [holder]
+
+        kb.block_task(conn, holder, reason="needs a human decision", kind="needs_input")
+
+    with kbc.connect_closing() as conn:
+        res = kbd.dispatch_once(conn, spawn_fn=_fake_spawn)
+        assert _parents(kb, conn, parked) == [], (
+            "a dispatcher-added serialization edge must not outlive the holder's "
+            "ability to complete — the parked card is hostage to an unrelated block"
+        )
+        assert _status(conn, parked) == "running"
+    assert (parked, holder) in res.released_coedit
+    assert [s[0] for s in res.spawned] == [parked]
+
+
+def test_release_leaves_an_orchestrator_authored_edge_alone(kanban_home):
+    """Only edges the dispatcher itself added are leases. A dependency an
+    orchestrator or human expressed is real work ordering and survives a block.
+    """
+    kb = kanban_home
+    from hermes_cli import kanban_db_connect as kbc
+    from hermes_cli import kanban_db_dispatch as kbd
+
+    with kbc.connect_closing() as conn:
+        holder = kb.create_task(conn, title="holder", assignee="alpha", body=_body(PANE))
+        parked = kb.create_task(conn, title="parked", assignee="beta", body=_body(PANE))
+        kbd.dispatch_once(conn, spawn_fn=_fake_spawn)
+        assert _parents(kb, conn, parked) == [holder]
+        # An orchestrator independently declares the same dependency. link_tasks
+        # appends a second ``linked`` event with no ``serialized_coedit`` beside
+        # it, so the edge is no longer solely the dispatcher's.
+        kb.link_tasks(conn, holder, parked)
+        kb.block_task(conn, holder, reason="needs a human", kind="needs_input")
+
+    with kbc.connect_closing() as conn:
+        res = kbd.dispatch_once(conn, spawn_fn=_fake_spawn)
+        assert _parents(kb, conn, parked) == [holder]
+        assert _status(conn, parked) == "todo"
+    assert res.released_coedit == []
+
+
+def test_release_does_not_fire_while_the_holder_is_still_working(kanban_home):
+    """Discrimination: a holder that is merely still ``running`` has not stalled,
+    and the parked card must keep waiting for its work."""
+    kb = kanban_home
+    from hermes_cli import kanban_db_connect as kbc
+    from hermes_cli import kanban_db_dispatch as kbd
+
+    with kbc.connect_closing() as conn:
+        holder = kb.create_task(conn, title="holder", assignee="alpha", body=_body(PANE))
+        parked = kb.create_task(conn, title="parked", assignee="beta", body=_body(PANE))
+        kbd.dispatch_once(conn, spawn_fn=_fake_spawn)
+
+    with kbc.connect_closing() as conn:
+        res = kbd.dispatch_once(conn, spawn_fn=_fake_spawn)
+        assert _status(conn, holder) == "running"
+        assert _parents(kb, conn, parked) == [holder]
+        assert _status(conn, parked) == "todo"
+    assert res.released_coedit == []
+
+
+def test_dry_run_reports_serialization_without_touching_the_board(kanban_home):
+    """A dry-run tick simulates the serialization it would perform: it reports
+    the pair but writes no edge, so an operator preview cannot mutate the graph.
+    """
+    kb = kanban_home
+    from hermes_cli import kanban_db_connect as kbc
+    from hermes_cli import kanban_db_dispatch as kbd
+
+    with kbc.connect_closing() as conn:
+        first = kb.create_task(conn, title="first", assignee="alpha", body=_body(PANE))
+        second = kb.create_task(conn, title="second", assignee="beta", body=_body(PANE))
+
+    with kbc.connect_closing() as conn:
+        res = kbd.dispatch_once(conn, spawn_fn=_fake_spawn, dry_run=True)
+        assert res.serialized_coedit == [(second, first, PANE)]
+        assert _status(conn, first) == "ready"
+        assert _status(conn, second) == "ready"
+        assert _parents(kb, conn, second) == []
+
+    # The real tick that follows produces the same pairing it predicted.
+    with kbc.connect_closing() as conn:
+        real = kbd.dispatch_once(conn, spawn_fn=_fake_spawn)
+        assert real.serialized_coedit == [(second, first, PANE)]
+        assert _parents(kb, conn, second) == [first]

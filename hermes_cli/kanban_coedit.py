@@ -66,13 +66,35 @@ _HEADING_RE = re.compile(
 )
 _BULLET_RE = re.compile(r"^[ \t>]*(?:[-*+]|\d+[.)])[ \t]+(?P<item>\S.*?)[ \t]*$")
 
-_HOTSPOT_RE = re.compile(r"^[ \t>*\-]*hotspot[ \t]*:[ \t]*(?P<rest>\S.*)$", re.IGNORECASE)
+_HOTSPOT_RE = re.compile(r"^[ \t>*\-]*(?:\*\*)?hotspot(?:\*\*)?[ \t]*:[ \t]*(?P<rest>\S.*)$", re.IGNORECASE)
 # A worker writes "hotspot: <path> — <reason>". The separator is an em/en dash or
 # a spaced ASCII dash; requiring the surrounding space keeps a hyphenated
 # directory name ("right-rail/preview-pane.tsx") intact.
 _HOTSPOT_REASON_RE = re.compile(r"\s+(?:[—–]|--|-)\s+")
 
 _STRIP_CHARS = "`'\"*<>()[],;:."
+
+# The worker protocol asks EVERY card for a hotspot line, so the overwhelmingly
+# common value is a negation — usually followed by prose that happens to name
+# files ("none. The three files I touched (a.py, b.py) showed no collision").
+# Mining that prose parks two unrelated cards behind each other, which is worse
+# than missing a real hotspot: a false negative costs nothing, a false
+# serialization stalls a card the operator never asked to gate.
+_NEGATIONS = frozenset(
+    {
+        "none", "no", "n/a", "na", "nil", "nope", "nothing", "not applicable",
+        "none yet", "none known", "none found", "none identified", "none observed",
+        "no collision", "no collisions", "no overlap", "no overlaps",
+        "no hotspot", "no hotspots", "no conflict", "no conflicts",
+    }
+)
+# First clause of a payload: everything before the first sentence/list break.
+_HEAD_CLAUSE_RE = re.compile(r"[.;,]|\s+(?:[—–]|--|-)\s+")
+# Glob metacharacters other than braces. Matching is exact per-path equality, so
+# a pattern can never be a holder key — it would claim files it does not name.
+_GLOB_CHARS = "*?[]"
+# Brace members that are an elision, not a filename: "{en,types,...}.ts".
+_ELISION_MEMBERS = frozenset({"...", "…", "..", "etc", "etc.", "…etc"})
 
 
 def normalize_edit_path(raw: Optional[str]) -> str:
@@ -81,9 +103,16 @@ def normalize_edit_path(raw: Optional[str]) -> str:
     Equivalent spellings of the same file must compare equal or the guard is
     trivially defeated by formatting: ``./a/b.ts``, ``a//b.ts`` and `` `a/b.ts` ``
     all normalize to ``a/b.ts``. Case is preserved — these are POSIX paths.
+
+    Rejects anything still carrying glob syntax (``*``, ``?``, ``[]``, or a
+    leftover brace). Those are patterns, not paths; admitting one would let a
+    fragment such as ``apps/src/i18n/{en`` become a holder key that two
+    unrelated cards then "collide" on.
     """
     text = (raw or "").strip().strip(_STRIP_CHARS).strip()
     if not text or any(ch.isspace() for ch in text):
+        return ""
+    if any(ch in text for ch in _GLOB_CHARS) or "{" in text or "}" in text:
         return ""
     # A bare word is prose, not a path; require a directory separator or a suffix.
     if "/" not in text and "." not in text:
@@ -95,13 +124,105 @@ def normalize_edit_path(raw: Optional[str]) -> str:
     return text
 
 
-def _split_paths(payload: str) -> list[str]:
-    """Normalized paths from one comma/semicolon/pipe-separated payload."""
+def is_negation(payload: Optional[str]) -> bool:
+    """True when a declared/hotspot payload says "nothing here".
+
+    Only the first clause is consulted: ``none. The files I touched (a.py, b.py)``
+    is a negation whose trailing prose must never be mined for paths.
+    """
+    text = (payload or "").strip().strip(_STRIP_CHARS).strip().lower()
+    if not text:
+        return True
+    head = _HEAD_CLAUSE_RE.split(text, maxsplit=1)[0]
+    head = head.strip().strip(_STRIP_CHARS).strip()
+    return head in _NEGATIONS or text in _NEGATIONS
+
+
+def expand_brace_path(text: str) -> list[str]:
+    """Expand ``a/{x,y}.ts`` into ``['a/x.ts', 'a/y.ts']``; ``[]`` if unbalanced.
+
+    Real board text carries brace expansions
+    (``apps/desktop/src/i18n/{en,types,zh}.ts``). A naive comma split cuts them
+    into fragments — ``apps/desktop/src/i18n/{en`` and ``zh}.ts`` — and the
+    prefix fragment is identical for any two cards touching that directory, so
+    they serialize on a path that does not exist. Expanding yields the real
+    per-file names, which then compare exactly like any other path; an
+    unbalanced brace yields nothing rather than a fragment.
+    """
+    if "{" not in text and "}" not in text:
+        return [text]
+    if text.count("{") != text.count("}"):
+        return []
+    start = text.find("{")
+    depth = 0
+    end = -1
+    for pos in range(start, len(text)):
+        if text[pos] == "{":
+            depth += 1
+        elif text[pos] == "}":
+            depth -= 1
+            if depth == 0:
+                end = pos
+                break
+    if end < 0:
+        # A '}' precedes the first '{' ("ar}.ts{"): not a brace group.
+        return []
+    prefix, body, suffix = text[:start], text[start + 1:end], text[end + 1:]
     out: list[str] = []
-    for chunk in re.split(r"[,;|]", payload):
-        path = normalize_edit_path(chunk)
-        if path and path not in out:
-            out.append(path)
+    for member in body.split(","):
+        member = member.strip()
+        if not member or member.lower() in _ELISION_MEMBERS:
+            continue
+        for expanded in expand_brace_path(prefix + member + suffix):
+            if expanded not in out:
+                out.append(expanded)
+    return out
+
+
+def _split_payload(payload: str) -> list[str]:
+    """Split on ``,``/``;``/``|`` that are OUTSIDE a brace group."""
+    parts: list[str] = []
+    buf: list[str] = []
+    depth = 0
+    for ch in payload:
+        if ch == "{":
+            depth += 1
+        elif ch == "}":
+            depth = max(depth - 1, 0)
+        elif ch in ",;|" and depth == 0:
+            parts.append("".join(buf))
+            buf = []
+            continue
+        buf.append(ch)
+    parts.append("".join(buf))
+    return parts
+
+
+def _split_paths(payload: str, *, strict: bool = False) -> list[str]:
+    """Normalized paths from one separated payload, brace groups kept intact.
+
+    ``strict`` makes one non-path chunk reject the WHOLE payload. Hotspot lines
+    use it: the protocol asks every worker for one, so a line whose chunks are
+    not all paths is prose and must contribute nothing rather than donating the
+    few chunks that happen to look like filenames.
+    """
+    out: list[str] = []
+    for chunk in _split_payload(payload):
+        if not chunk.strip():
+            continue
+        candidates = expand_brace_path(chunk)
+        if not candidates:
+            if strict:
+                return []
+            continue
+        for candidate in candidates:
+            path = normalize_edit_path(candidate)
+            if not path:
+                if strict:
+                    return []
+                continue
+            if path not in out:
+                out.append(path)
     return out
 
 
@@ -121,9 +242,13 @@ def parse_declared_paths(body: Optional[str]) -> list[str]:
         line = lines[index]
         inline = _INLINE_RE.match(line)
         if inline:
-            for path in _split_paths(inline.group("rest")):
-                if path not in found:
-                    found.append(path)
+            rest = inline.group("rest")
+            # "Edit-Targets: none" is a declaration that there is nothing to
+            # serialize on, not a path called "none"/"N/A".
+            if not is_negation(rest):
+                for path in _split_paths(rest):
+                    if path not in found:
+                        found.append(path)
             index += 1
             continue
         if _HEADING_RE.match(line):
@@ -138,9 +263,11 @@ def parse_declared_paths(body: Optional[str]) -> list[str]:
                 bullet = _BULLET_RE.match(nxt)
                 if not bullet:
                     break
-                for path in _split_paths(bullet.group("item")):
-                    if path not in found:
-                        found.append(path)
+                item = bullet.group("item")
+                if not is_negation(item):
+                    for path in _split_paths(item):
+                        if path not in found:
+                            found.append(path)
                 index += 1
             continue
         index += 1
@@ -148,7 +275,17 @@ def parse_declared_paths(body: Optional[str]) -> list[str]:
 
 
 def parse_hotspot_paths(text: Optional[str]) -> list[str]:
-    """Paths from ``hotspot: <path> — <reason>`` lines in a comment body."""
+    """Paths from ``hotspot: <path> — <reason>`` lines in a comment body.
+
+    Deliberately strict. The worker protocol asks EVERY card for a hotspot line,
+    so most lines on the board are negations followed by explanatory prose
+    ("none. The three files I touched (a.py, b.py) showed no collision"). Mining
+    that prose serializes two unrelated cards — a much worse failure than
+    missing a genuine hotspot, because a card the operator never asked to gate
+    stops moving. So: a negated line contributes nothing, and a line whose
+    comma-separated chunks are not ALL paths contributes nothing rather than
+    donating the chunks that happen to look like filenames.
+    """
     if not text:
         return []
     found: list[str] = []
@@ -156,8 +293,11 @@ def parse_hotspot_paths(text: Optional[str]) -> list[str]:
         match = _HOTSPOT_RE.match(line)
         if not match:
             continue
-        payload = _HOTSPOT_REASON_RE.split(match.group("rest"), maxsplit=1)[0]
-        for path in _split_paths(payload):
+        rest = match.group("rest")
+        if is_negation(rest):
+            continue
+        payload = _HOTSPOT_REASON_RE.split(rest, maxsplit=1)[0]
+        for path in _split_paths(payload, strict=True):
             if path not in found:
                 found.append(path)
     return found
@@ -187,9 +327,13 @@ def _metadata_hotspot_paths(raw: Optional[str]) -> list[str]:
         for item in items:
             if not isinstance(item, str):
                 continue
-            # Accept both a bare path and the "<path> — <reason>" prose form.
+            if is_negation(item):
+                continue
+            # Accept both a bare path and the "<path> — <reason>" prose form,
+            # under the same strict rule as a comment line: a value that is not
+            # wholly paths is prose and contributes nothing.
             payload = _HOTSPOT_REASON_RE.split(item, maxsplit=1)[0]
-            candidates = _split_paths(payload) or parse_hotspot_paths(item)
+            candidates = _split_paths(payload, strict=True) or parse_hotspot_paths(item)
             for path in candidates:
                 if path not in found:
                     found.append(path)
@@ -297,3 +441,97 @@ def build_coedit_index(conn: sqlite3.Connection) -> CoeditIndex:
     for task_id in sorted(tenants):
         index.claim(task_id, tenants[task_id], paths_by_task.get(task_id, []))
     return index
+
+
+# A holder in one of these statuses will not reach ``done`` under its own power:
+# it is waiting on a human. Anything else (todo/ready/running/review/scheduled/
+# triage) is still moving through the pipeline, and ``done``/``archived`` already
+# satisfy ``recompute_ready``, so only these strand a parked card.
+_STALLED_HOLDER_STATUSES = ("blocked", "on_hold")
+
+
+def _edge_event_counts(
+    conn: sqlite3.Connection, child_id: str, holder_id: str
+) -> tuple[int, int]:
+    """``(linked_count, serialized_count)`` for the ``holder -> child`` edge.
+
+    Payloads are JSON-decoded rather than pattern-matched: a ``LIKE`` on
+    serialized JSON breaks the moment the encoder's spacing changes.
+    """
+    linked = serialized = 0
+    for row in conn.execute(
+        "SELECT kind, payload FROM task_events WHERE task_id = ? "
+        "AND kind IN ('linked', 'serialized_coedit')", (child_id,),
+    ):
+        try:
+            payload = json.loads(row["payload"] or "{}")
+        except (TypeError, ValueError):
+            continue
+        if not isinstance(payload, dict):
+            continue
+        if row["kind"] == "linked" and payload.get("parent") == holder_id:
+            linked += 1
+        elif row["kind"] == "serialized_coedit" and payload.get("holder") == holder_id:
+            serialized += 1
+    return linked, serialized
+
+
+def _coedit_edge_is_ours(conn: sqlite3.Connection, child_id: str, holder_id: str) -> bool:
+    """True when the dispatcher is the ONLY author of the ``holder -> child`` edge.
+
+    ``link_tasks`` appends a ``linked`` event for every link it makes, and the
+    guard appends exactly one ``serialized_coedit`` beside each link it made. If
+    an orchestrator or a human also linked this pair, there is a ``linked``
+    event with no ``serialized_coedit`` to account for it — that edge expresses
+    a real dependency and releasing it would drop work ordering the board asked
+    for. Count-equality is the conservative reading: when in doubt, keep it.
+    """
+    linked, serialized = _edge_event_counts(conn, child_id, holder_id)
+    return serialized > 0 and linked == serialized
+
+
+def release_stranded_coedit_edges(conn: sqlite3.Connection) -> list:
+    """Drop dispatcher-added serialization edges whose holder has stalled.
+
+    The guard's whole argument is that "needs a human" is a routing bug for an
+    unattended fleet. A permanent edge would recreate exactly that: a holder
+    that goes ``blocked`` (or is auto-blocked by the breaker after failing)
+    holds an unrelated card hostage until an operator unblocks a *different*
+    card. ``recompute_ready`` promotes only when every parent is done, so
+    nothing else would ever free it.
+
+    So the edge is a lease, not a dependency: it lasts exactly as long as the
+    holder is still on its way to producing the work the parked card should
+    start from. Returns ``(child_id, holder_id)`` for each edge released.
+    """
+    from hermes_cli import kanban_db as _kb
+
+    placeholders = ",".join("?" for _ in _STALLED_HOLDER_STATUSES)
+    rows = conn.execute(
+        "SELECT DISTINCT e.task_id AS child_id, l.parent_id AS holder_id, "
+        "holder.status AS holder_status "
+        "FROM task_events e "
+        "JOIN task_links l ON l.child_id = e.task_id "
+        "JOIN tasks holder ON holder.id = l.parent_id "
+        "JOIN tasks child ON child.id = e.task_id "
+        "WHERE e.kind = 'serialized_coedit' "
+        f"AND holder.status IN ({placeholders}) "
+        "AND child.status NOT IN ('done', 'archived') "
+        "ORDER BY e.task_id, l.parent_id",
+        _STALLED_HOLDER_STATUSES,
+    ).fetchall()
+    released: list = []
+    for row in rows:
+        child_id, holder_id = row["child_id"], row["holder_id"]
+        if not _coedit_edge_is_ours(conn, child_id, holder_id):
+            continue
+        # unlink_tasks appends the ``unlinked`` event and re-runs
+        # ``recompute_ready``, so the freed card promotes in this same tick.
+        if _kb.unlink_tasks(conn, holder_id, child_id):
+            with _kb.write_txn(conn):
+                _kb._append_event(
+                    conn, child_id, "coedit_released",
+                    {"holder": holder_id, "holder_status": row["holder_status"]},
+                )
+            released.append((child_id, holder_id))
+    return released
