@@ -11,6 +11,7 @@ import { cleanup, fireEvent, render, screen, waitFor } from '@testing-library/re
 import type { ReactNode } from 'react'
 import { afterEach, beforeAll, beforeEach, describe, expect, it, vi } from 'vitest'
 
+import { $boardSlug, ALL_BOARDS } from './api'
 import { Card } from './board'
 import type { KanbanTask } from './types'
 
@@ -45,6 +46,7 @@ beforeEach(() => {
 
 afterEach(() => {
   cleanup()
+  $boardSlug.set('')
 })
 
 const task: KanbanTask = {
@@ -90,11 +92,45 @@ describe('Card — send to roadmap ideas (Phase 2.15 follow-up)', () => {
     fireEvent.click(screen.getByText('sendToRoadmap'))
 
     await waitFor(() => expect(addRoadmapIdea).toHaveBeenCalledTimes(1))
-    expect(addRoadmapIdea).toHaveBeenCalledWith(task.title, task.id)
 
-    const [, , ...rest] = addRoadmapIdea.mock.calls[0]
-    expect(rest).toHaveLength(0)
+    const [text, sourceId, ...rest] = addRoadmapIdea.mock.calls[0]
+
+    expect(text).toBe(task.title)
+    expect(sourceId).toBe(task.id)
+    // Only the optional board may follow — never the body, and never more.
+    expect(rest).toHaveLength(1)
     expect(JSON.stringify(addRoadmapIdea.mock.calls[0])).not.toContain('Sensitive internal notes')
+  })
+
+  // Board routing (t_70f6ac4e #1). POST /roadmap/idea falls back to the ACTIVE
+  // board when no board is sent, and roadmap-sync maps each slug to a
+  // DIFFERENT file — so an idea from an All Boards card must carry that card's
+  // own board or it is appended to the wrong ROADMAP on disk, silently.
+  it("carries the card's OWN board, never the all-boards sentinel", async () => {
+    addRoadmapIdea.mockResolvedValue({ ok: true, reason: null })
+    $boardSlug.set(ALL_BOARDS)
+    renderCard({ board: 'homelab', board_name: 'Homelab' })
+
+    await openMenu()
+    fireEvent.click(screen.getByText('sendToRoadmap'))
+
+    await waitFor(() => expect(addRoadmapIdea).toHaveBeenCalledTimes(1))
+
+    const [, , board] = addRoadmapIdea.mock.calls[0]
+
+    expect(board).toBe('homelab')
+    expect(board).not.toBe(ALL_BOARDS)
+  })
+
+  it('single-board mode sends no board (server resolves its own current board)', async () => {
+    addRoadmapIdea.mockResolvedValue({ ok: true, reason: null })
+    renderCard()
+
+    await openMenu()
+    fireEvent.click(screen.getByText('sendToRoadmap'))
+
+    await waitFor(() => expect(addRoadmapIdea).toHaveBeenCalledTimes(1))
+    expect(addRoadmapIdea.mock.calls[0][2]).toBeUndefined()
   })
 
   it('on success: notifies with the shared ideaSaved message', async () => {

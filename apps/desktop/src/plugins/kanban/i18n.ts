@@ -261,6 +261,11 @@ type KanbanMessages = {
   // All Boards (consolidated view)
   toggleBoard: (name: string) => string
   boardsFailedNotice: (names: string) => string
+  /** New-task dialog board picker, shown only under the All Boards sentinel:
+   *  the view has no implied board, so the target is asked for rather than
+   *  resolved silently to whichever board happens to be active. */
+  pickBoard: string
+  pickBoardHint: string
   // orchestration
   orchestratorProfile: string
   defaultAssignee: string
@@ -538,6 +543,8 @@ export const en: KanbanMessages = {
   createBoard: 'Create board',
   toggleBoard: name => `Toggle ${name}`,
   boardsFailedNotice: names => `Couldn't load: ${names}`,
+  pickBoard: 'Pick a board',
+  pickBoardHint: 'The board this task is created on.',
   orchestratorProfile: 'Orchestrator profile',
   defaultAssignee: 'Default assignee',
   defaultParen: '(default)',
@@ -814,6 +821,8 @@ const ja: KanbanMessages = {
   createBoard: 'ボードを作成',
   toggleBoard: name => `${name}を切り替え`,
   boardsFailedNotice: names => `読み込めませんでした: ${names}`,
+  pickBoard: 'ボードを選択',
+  pickBoardHint: 'このタスクを作成するボード。',
   orchestratorProfile: 'オーケストレータープロフィール',
   defaultAssignee: 'デフォルトの担当',
   defaultParen: '（既定）',
@@ -1087,6 +1096,8 @@ const zh: KanbanMessages = {
   createBoard: '创建面板',
   toggleBoard: name => `切换 ${name}`,
   boardsFailedNotice: names => `无法加载：${names}`,
+  pickBoard: '选择面板',
+  pickBoardHint: '此任务将创建在该面板上。',
   orchestratorProfile: '编排者配置档',
   defaultAssignee: '默认负责人',
   defaultParen: '（默认）',
@@ -1359,6 +1370,8 @@ const zhHant: KanbanMessages = {
   createBoard: '建立面板',
   toggleBoard: name => `切換 ${name}`,
   boardsFailedNotice: names => `無法載入：${names}`,
+  pickBoard: '選擇面板',
+  pickBoardHint: '此任務將建立在該面板上。',
   orchestratorProfile: '編排者設定檔',
   defaultAssignee: '預設負責人',
   defaultParen: '（預設）',
