@@ -127,6 +127,16 @@ import {
 
 // ── optimistic board edits (reconciled by the follow-up refresh) ─────────────
 
+/** Read a plugin deep link from the hash without taking a router dependency.
+ *  Kanban's page is also mounted directly in focused component tests and in
+ *  embedders, where a React Router context is deliberately absent. */
+function notificationRouteSearch(): string {
+  const hash = window.location.hash
+  const query = hash.indexOf('?')
+
+  return query === -1 ? '' : hash.slice(query)
+}
+
 function moveCard(board: KanbanBoard, key: string, toStatus: string): KanbanBoard {
   let moved: KanbanTask | undefined
 
@@ -1959,6 +1969,7 @@ export function KanbanBoardPage() {
   const k = useKanban()
   const qc = useQueryClient()
   const slug = useValue($boardSlug)
+  const [routeSearch, setRouteSearch] = useState(notificationRouteSearch)
   const isAllBoards = slug === ALL_BOARDS
   const [archived, setArchived] = useState(false)
 
@@ -2017,6 +2028,32 @@ export function KanbanBoardPage() {
   // state, never a persisted store: a reload should not resurrect a trace the
   // user started three sessions ago.
   const [focused, setFocused] = useState<null | string>(null)
+
+  useEffect(() => {
+    const onHashChange = () => setRouteSearch(notificationRouteSearch())
+
+    window.addEventListener('hashchange', onHashChange)
+
+    return () => window.removeEventListener('hashchange', onHashChange)
+  }, [])
+
+  // Terminal-event notifications link directly to a card. The event belongs
+  // to a specific board even if the user has since switched views, so adopt
+  // that board before opening the existing detail drawer rather than landing
+  // them on a generic Kanban page that makes them hunt for the id.
+  useEffect(() => {
+    const params = new URLSearchParams(routeSearch)
+    const targetBoard = params.get('board')?.trim()
+    const targetTask = params.get('task')?.trim()
+
+    if (targetBoard && targetBoard !== ALL_BOARDS && targetBoard !== $boardSlug.get()) {
+      $boardSlug.set(targetBoard)
+    }
+
+    if (targetTask) {
+      setOpenKey(targetTask)
+    }
+  }, [routeSearch])
 
   // A new-task request raised from outside the page (⌘⌥N, the palette row).
   // The command navigates here and parks the lane; the page picks it up on

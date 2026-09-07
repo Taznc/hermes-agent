@@ -122,7 +122,7 @@ function TopCenterStack({
       aria-label={copy.region}
       className={cn(
         REGION_BASE,
-        'left-1/2 top-[calc(var(--titlebar-height,34px)+0.75rem)] w-[min(40rem,calc(100%-2rem))] -translate-x-1/2 flex-col'
+        'left-1/2 top-[calc(var(--titlebar-height,34px)+0.75rem)] w-[min(32rem,calc(100%-2rem))] -translate-x-1/2 flex-col'
       )}
       role="region"
     >
@@ -234,10 +234,17 @@ function NotificationItem({ notification }: { notification: AppNotification }) {
           </AlertTitle>
         )}
         <AlertDescription className="col-start-auto">
-          <p className="m-0 max-w-prose wrap-break-word leading-relaxed text-(--ui-text-secondary)">
+          <p
+            className={cn(
+              'm-0 max-w-prose wrap-break-word leading-relaxed text-(--ui-text-secondary)',
+              notification.contextCard && 'line-clamp-3'
+            )}
+            data-notification-message={notification.contextCard ? 'contextual' : undefined}
+          >
             {renderMessage(notification.message, accent)}
           </p>
           {notification.meta && <p className="m-0 text-xs text-muted-foreground tabular-nums">{notification.meta}</p>}
+          {notification.contextCard && <NotificationContextCard card={notification.contextCard} />}
           {hasDetail && <NotificationDetail detail={notification.detail || ''} />}
           {notification.action && (
             <Button
@@ -266,6 +273,35 @@ function NotificationItem({ notification }: { notification: AppNotification }) {
         <Codicon name="close" size="0.875rem" />
       </Button>
     </Alert>
+  )
+}
+
+/**
+ * The toast-level equivalent of an object's compact card: deliberately quiet
+ * and bounded, but visibly separate from the event that caused the notice.
+ * The notification explains what happened; this block mirrors the affected
+ * object's own card (name, summary, then quiet status/ID) so a terminal event
+ * does not degrade into an opaque identifier.
+ */
+function NotificationContextCard({ card }: { card: NonNullable<AppNotification['contextCard']> }) {
+  if (!card.title && !card.eyebrow && !card.summary && !card.meta) {
+    return null
+  }
+
+  return (
+    <div
+      className="mt-2 grid gap-1 rounded-lg border border-(--ui-stroke-tertiary) border-l-2 bg-(--ui-bg-elevated) px-2.5 py-2"
+      data-notification-context-card="true"
+    >
+      {card.title && <p className="m-0 wrap-break-word text-[0.8125rem] leading-5 font-medium text-foreground">{card.title}</p>}
+      {card.summary && <p className="m-0 line-clamp-2 wrap-break-word text-xs leading-relaxed text-(--ui-text-secondary)">{card.summary}</p>}
+      {(card.eyebrow || card.meta) && (
+        <div className="flex min-w-0 items-center justify-between gap-2 text-[0.6875rem] text-(--ui-text-tertiary)">
+          {card.eyebrow && <span className="min-w-0 truncate font-medium">{card.eyebrow}</span>}
+          {card.meta && <span className="shrink-0 font-mono text-[0.625rem] text-(--ui-text-quaternary)">{card.meta}</span>}
+        </div>
+      )}
+    </div>
   )
 }
 

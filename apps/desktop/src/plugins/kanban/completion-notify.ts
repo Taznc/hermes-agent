@@ -34,6 +34,17 @@ import { runErrorText } from './status-guidance'
 
 type Rest = <T>(path: string, opts?: PluginRestOptions) => Promise<T>
 
+/** The compact card slice needed to make a terminal event intelligible. The
+ *  socket event deliberately stays small, so resolve this from the existing
+ *  task-detail endpoint rather than growing another event payload contract. */
+interface NotificationTask {
+  assignee?: null | string
+  body?: null | string
+  latest_summary?: null | string
+  status?: null | string
+  title?: null | string
+}
+
 export interface CompletionEvent {
   id?: unknown
   task_id?: string
@@ -140,9 +151,45 @@ function bodyFor(kind: string, ev: CompletionEvent): string {
   return ''
 }
 
-function notifyOne(kind: string, spec: { titleKey: string; toast: ToastKind }, ev: CompletionEvent): void {
+function statusLabel(status: string): string {
+  const key = `col.${status}.label`
+  const translated = t(key)
+
+  return translated === key ? status : translated
+}
+
+async function fetchTask(slug: string, taskId: string): Promise<NotificationTask | null> {
+  if (!taskId) {
+    return null
+  }
+
+  try {
+    const params = new URLSearchParams({ board: slug })
+    const response = await rest!<{ task?: NotificationTask }>(`/tasks/${encodeURIComponent(taskId)}?${params}`)
+
+    return response.task ?? null
+  } catch {
+    // Notification delivery must remain useful when a card was deleted or an
+    // older server lacks this detail endpoint. The event payload below is the
+    // compatible fallback.
+    return null
+  }
+}
+
+function cardRoute(slug: string, taskId: string): string {
+  const params = new URLSearchParams({ board: slug, task: taskId })
+
+  return `/kanban?${params}`
+}
+
+async function notifyOne(slug: string, kind: string, spec: { titleKey: string; toast: ToastKind }, ev: CompletionEvent): Promise<void> {
   const taskId = (ev.task_id ?? '').trim()
   const body = bodyFor(kind, ev)
+  const task = await fetchTask(slug, taskId)
+  const cardTitle = trimmed(task?.title)
+  const taskResult = trimmed(task?.latest_summary)
+  const taskBody = trimmed(task?.body)
+  const taskSummary = taskResult || taskBody
 
   const artifacts =
     kind === 'completed' && Array.isArray(ev.payload?.artifacts)
@@ -158,24 +205,45 @@ function notifyOne(kind: string, spec: { titleKey: string; toast: ToastKind }, e
         ? t('notify.artifacts', artifacts.length)
         : ''
 
-  const detail = [taskId, artifactText].filter(Boolean).join(' · ')
+  // The toast explains the event in a bounded first paragraph. Its context
+  // block then follows the board card's own hierarchy: name, card summary,
+  // quiet status/assignee + a clearly-labelled task id. That keeps a verbose
+  // worker handoff readable without burying the object under a raw id.
+  const summary = body || taskSummary
+  const cardSummary = kind === 'completed' ? taskResult || taskBody : taskBody && taskBody !== summary ? taskBody : ''
+  const cardEyebrow = task ? [task.status ? statusLabel(task.status) : '', trimmed(task.assignee)].filter(Boolean).join(' · ') : ''
+  const cardMeta = task && taskId ? `Task ID: ${taskId}` : ''
+  // A short event sentence is already visible. Details earn their disclosure
+  // only when they preserve an otherwise-clamped worker handoff or artifacts;
+  // never render an empty-looking expander that contains only an opaque id.
+  const detail = [body.length > 240 ? body : '', artifactText].filter(Boolean).join(' · ')
   // gave_up carries its structured cause in `payload.error` — humanize it
   // (runErrorText) the same way the drawer does, instead of a bare "gave up".
   const title = kind === 'gave_up' ? t('notify.gaveUpTitle', body ? runErrorText(body, en).primary : undefined) : t(spec.titleKey)
-  const message = body || taskId || title
+  const message = summary || cardTitle || taskId || title
   host.notify({
     kind: spec.toast,
     title,
     message,
+    ...(cardTitle || cardEyebrow || cardSummary || cardMeta
+      ? {
+          contextCard: {
+            ...(cardTitle ? { title: cardTitle } : {}),
+            ...(cardEyebrow ? { eyebrow: cardEyebrow } : {}),
+            ...(cardSummary ? { summary: cardSummary } : {}),
+            ...(cardMeta ? { meta: cardMeta } : {})
+          }
+        }
+      : {}),
     ...(detail ? { detail } : {}),
-    action: { label: t('notify.openKanban'), onClick: () => host.navigate('/kanban') }
+    action: { label: t('notify.openCard'), onClick: () => host.navigate(cardRoute(slug, taskId)) }
   })
 
   // Native OS notification — the desktop shell fires it only while the user
   // is away from Hermes (the toast above covers the foreground case). Isolated:
   // a missing/broken shell must not mark the toast as unfired.
   try {
-    osDoor?.notify({ title, body: [message, detail].filter(Boolean).join('\n') })
+    osDoor?.notify({ title, body: [message, cardTitle, cardEyebrow, cardSummary, detail].filter(Boolean).join('\n') })
   } catch {
     /* swallowed */
   }
@@ -210,7 +278,7 @@ export async function onKanbanEventsFrame(slug: string, events?: CompletionEvent
 
     if (spec) {
       try {
-        notifyOne(ev.kind!, spec, ev)
+        await notifyOne(slug, ev.kind!, spec, ev)
         fired = true
       } catch {
         /* swallowed */

@@ -9,6 +9,23 @@ export interface NotificationAction {
   onClick: () => void
 }
 
+/**
+ * A compact record shown beneath a notification's message. It gives callers
+ * that report a background object (a Kanban card, import, deployment, etc.)
+ * a stable, scannable context block without turning the toast API into a
+ * feature-specific renderer.
+ */
+export interface NotificationContextCard {
+  /** Object name — e.g. the affected task, deployment, or import. */
+  title?: string
+  /** Quiet state line, such as "Done · reviewer". */
+  eyebrow?: string
+  /** The most useful short outcome or description. */
+  summary?: string
+  /** Stable identifiers or other low-priority metadata. */
+  meta?: string
+}
+
 export type NotificationPlacement = 'default' | 'bottom-right'
 
 export interface AppNotification {
@@ -20,6 +37,8 @@ export interface AppNotification {
   accentColor?: string
   /** Secondary detail line rendered below the message, muted (e.g. "$220.00 cap"). */
   meta?: string
+  /** Compact object context, styled as a small card inside the toast. */
+  contextCard?: NotificationContextCard
   title?: string
   message: string
   detail?: string
@@ -43,6 +62,7 @@ export interface NotificationInput {
   icon?: string
   accentColor?: string
   meta?: string
+  contextCard?: NotificationContextCard
   title?: string
   message: string
   detail?: string
@@ -181,6 +201,7 @@ export function notify(input: NotificationInput): string {
     icon: input.icon,
     accentColor: input.accentColor,
     meta: input.meta,
+    contextCard: input.contextCard,
     title: input.title,
     message: input.message,
     detail: input.detail,

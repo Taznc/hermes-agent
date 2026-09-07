@@ -234,10 +234,15 @@ describe('ClarifyTool help controls', () => {
     fireEvent.click(screen.getByRole('button', { name: 'Why? staging' }))
 
     await waitFor(() => expect(request).toHaveBeenCalledTimes(2))
-    expect(request).toHaveBeenNthCalledWith(1, 'clarify.explain', { request_id: 'request-1', version: 1 })
+    expect(request).toHaveBeenNthCalledWith(1, 'clarify.explain', {
+      request_id: 'request-1',
+      session_id: 'session-1',
+      version: 1
+    })
     expect(request).toHaveBeenNthCalledWith(2, 'clarify.explain', {
       choice: 'staging',
       request_id: 'request-1',
+      session_id: 'session-1',
       version: 1
     })
     expect(screen.getByRole('button', { name: /Continue/ }).getAttribute('disabled')).not.toBeNull()
@@ -258,6 +263,7 @@ describe('ClarifyTool help controls', () => {
         choice: 'staging',
         follow_up: 'What changes after deployment?',
         request_id: 'request-1',
+        session_id: 'session-1',
         version: 1
       })
     })
@@ -919,6 +925,67 @@ describe('ClarifyTool owner routing', () => {
       expect(gatewayMocks.requestGatewayForAgent).toHaveBeenCalledTimes(1)
     })
     expectOwnerCall(1, { answer: 'staging', request_id: 'request-1' })
+    expect(ambient).not.toHaveBeenCalled()
+  })
+
+  it('sends help through the owner socket with the pending runtime session id', async () => {
+    const ambient = armCrossProfileOwner()
+
+    setClarifyRequest({
+      choices: ['staging', 'production'],
+      multiSelect: false,
+      question: 'Which deployment target?',
+      requestId: 'request-help',
+      sessionId: 'session-a'
+    })
+    renderClarify(<ClarifyTool {...liveClarifyProps()} />)
+
+    fireEvent.click(screen.getByRole('button', { name: 'Why? Which deployment target?' }))
+
+    await waitFor(() => expect(gatewayMocks.requestGatewayForAgent).toHaveBeenCalledTimes(1))
+    expect(gatewayMocks.requestGatewayForAgent).toHaveBeenCalledWith(
+      OWNER_CONNECTION_ID,
+      OWNER_PROFILE,
+      'clarify.explain',
+      {
+        request_id: 'request-help',
+        session_id: 'session-a',
+        version: 1
+      }
+    )
+    expect(ambient).not.toHaveBeenCalled()
+  })
+
+  it('keeps the pending choice intact when its owner rejects stale help', async () => {
+    const ambient = armCrossProfileOwner()
+    gatewayMocks.requestGatewayForAgent.mockRejectedValueOnce(new Error('session not found'))
+
+    setClarifyRequest({
+      choices: ['staging', 'production'],
+      multiSelect: false,
+      question: 'Which deployment target?',
+      requestId: 'request-help',
+      sessionId: 'session-a'
+    })
+    renderClarify(<ClarifyTool {...liveClarifyProps()} />)
+
+    const choice = screen.getByRole('button', { name: /^[A-Z]staging/ })
+    fireEvent.click(choice)
+    fireEvent.click(screen.getByRole('button', { name: 'Why? staging' }))
+
+    await waitFor(() => expect(gatewayMocks.requestGatewayForAgent).toHaveBeenCalledTimes(1))
+    expect(gatewayMocks.requestGatewayForAgent).toHaveBeenCalledWith(
+      OWNER_CONNECTION_ID,
+      OWNER_PROFILE,
+      'clarify.explain',
+      expect.objectContaining({ choice: 'staging', request_id: 'request-help', session_id: 'session-a' })
+    )
+    expect(
+      await screen.findByText('This clarification is no longer available. Return to the conversation and try again.')
+    ).toBeTruthy()
+    expect(screen.queryByText('session not found')).toBeNull()
+    expect(choice.getAttribute('aria-pressed')).toBe('true')
+    expect((screen.getByRole('button', { name: /Continue/ }) as HTMLButtonElement).disabled).toBe(false)
     expect(ambient).not.toHaveBeenCalled()
   })
 
