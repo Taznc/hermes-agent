@@ -485,6 +485,13 @@ def _schedule_ws_orphan_reap(sid: str, *, delay_s: float | None = None) -> None:
                 reschedule_delay = _WS_ORPHAN_REAP_GRACE_S
             elif not current.get("running"):
                 session = _pop_session_by_id(sid)
+            elif _has_pending_clarify_request(sid):
+                # A clarify card is still actionable user work. Its request id
+                # stays in the gateway registry, so the reconnect path can
+                # replay the same card (including staged batch answers). Do
+                # not convert a transient renderer detach into an empty reply.
+                logger.debug("client_gone sid=%s action=defer (clarify pending)", sid)
+                reschedule_delay = _WS_ORPHAN_REAP_GRACE_S
             elif not current.get("_client_gone_interrupt_requested") and _ws_orphan_turn_activity_is_fresh(current):
                 # Client-absent but producing: keep running detached (the sentinel buffers emits), re-check each grace.
                 logger.debug("client_gone sid=%s action=defer (turn activity fresh; stale threshold %.0fs)",

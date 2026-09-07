@@ -2,7 +2,7 @@ import { useStore } from '@nanostores/react'
 import { type MutableRefObject, useCallback, useEffect, useRef } from 'react'
 import type { NavigateFunction } from 'react-router'
 
-import { NO_PROJECT_ID } from '@/app/chat/sidebar/projects/workspace-groups'
+import { isHomeProjectId } from '@/app/chat/sidebar/projects/workspace-groups'
 import { graftRefreshedTailOntoBackfill } from '@/app/chat/transcript-backfill'
 import { revealTreePane } from '@/components/pane-shell/tree/store'
 import { setWorkspaceScope } from '@/components/pane-shell/workspace-scope'
@@ -551,7 +551,7 @@ export function useSessionActions({
         // Home is an explicit detached scope: do not let a stale live cwd from
         // the previously selected project leak into this new session (#84220).
         const workspaceTarget = $newChatWorkspaceTarget.get()
-        const homeScope = $projectScope.get() === NO_PROJECT_ID
+        const homeScope = isHomeProjectId($projectScope.get())
 
         const cwd =
           workspaceTarget === null || (workspaceTarget === undefined && homeScope)

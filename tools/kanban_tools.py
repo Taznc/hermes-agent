@@ -11,6 +11,7 @@ import functools
 import json
 import logging
 import os
+import re
 import time
 from contextlib import contextmanager
 from typing import Any, Callable, Optional
@@ -337,6 +338,24 @@ def _require_text(args: dict, name: str, message: Optional[str] = None) -> Any:
     return value
 
 
+# A blocked card is a board surface a human scans, not a log file. Cap the
+# PROSE of a block reason so cards stay readable; fenced blocks (```cmd
+# copy-paste commands, ```choices option sets) are excluded from the count
+# because they are exactly the structured payloads we want workers to send.
+_BLOCK_REASON_PROSE_LIMIT = 700
+_FENCE_RE = re.compile(r"```[a-zA-Z]*\s*[\s\S]*?```")
+
+
+def _check_block_reason_brevity(reason: str) -> None:
+    prose = _FENCE_RE.sub("", reason)
+    _check(
+        len(prose) <= _BLOCK_REASON_PROSE_LIMIT,
+        f"reason prose is {len(prose)} chars (limit {_BLOCK_REASON_PROSE_LIMIT}). A blocked card "
+        "must be scannable: line 1 = the one-sentence ask; an exact unblock command goes in a "
+        "```cmd fence (not counted); diagnosis and history go in kanban_comment first, then "
+        "re-call kanban_block with the short ask.")
+
+
 _BOOL_WORDS = {"true": True, "1": True, "yes": True, "false": False, "0": False, "no": False}
 
 
@@ -656,6 +675,7 @@ def _handle_block(args: dict, **kw) -> str:
     tid = _worker_guard("kanban_block", args)
     reason = _redact(
         _require_text(args, "reason", "reason is required — explain what input you need"))
+    _check_block_reason_brevity(str(reason))
     kind = args.get("kind")
     with _board(args.get("board")) as (kb, conn):
         _check(kind is None or kind in kb.VALID_BLOCK_KINDS,
