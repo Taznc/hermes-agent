@@ -1257,9 +1257,10 @@ def review_claim_env(monkeypatch, tmp_path):
     monkeypatch.setattr(_Path, "home", lambda: tmp_path)
 
     from hermes_cli import kanban_db as kb
+    from hermes_cli import kanban_db_connect as kbc
     kb._INITIALIZED_PATHS.clear()
     kb.init_db()
-    conn = kb.connect()
+    conn = kbc.connect()
     try:
         tid = kb.create_task(conn, title="reviewer-escalation-test", assignee="builder")
         implementation = kb.claim_task(conn, tid, claimer="builder:1")
@@ -1283,6 +1284,7 @@ def test_reviewer_escalates_via_real_kanban_block_tool(review_claim_env):
     is a legal terminal action, distinct from an implementer's block."""
     from tools import kanban_tools as kt
     from hermes_cli import kanban_db as kb
+    from hermes_cli import kanban_db_connect as kbc
 
     out = kt._handle_block({
         "reason": "needs_input: maintainer decision required",
@@ -1292,7 +1294,7 @@ def test_reviewer_escalates_via_real_kanban_block_tool(review_claim_env):
     assert d["ok"] is True
     assert d["status"] == "blocked"
 
-    conn = kb.connect()
+    conn = kbc.connect()
     try:
         blocked = kb.get_task(conn, review_claim_env)
         assert blocked is not None

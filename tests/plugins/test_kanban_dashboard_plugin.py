@@ -417,6 +417,43 @@ def test_reopening_parent_demotes_ready_child(client):
     assert child_after_reopen["status"] == "todo"
 
 
+def test_dashboard_unarchives_parent_and_regates_children(client):
+    """The archived-card reopen route retracts completion and released work."""
+    parent = client.post("/api/plugins/kanban/tasks", json={"title": "p"}).json()["task"]
+    assert client.patch(
+        f"/api/plugins/kanban/tasks/{parent['id']}", json={"status": "done"},
+    ).status_code == 200
+    assert client.patch(
+        f"/api/plugins/kanban/tasks/{parent['id']}", json={"status": "archived"},
+    ).status_code == 200
+
+    released = client.post(
+        "/api/plugins/kanban/tasks", json={"title": "released", "parents": [parent["id"]]},
+    ).json()["task"]
+    assert released["status"] == "ready"
+
+    assert client.patch(
+        f"/api/plugins/kanban/tasks/{parent['id']}", json={"status": "todo"},
+    ).status_code == 200
+    reopened = client.get(
+        f"/api/plugins/kanban/tasks/{parent['id']}"
+    ).json()["task"]
+    assert reopened["completed_at"] is None
+    released_after_reopen = client.get(
+        f"/api/plugins/kanban/tasks/{released['id']}"
+    ).json()["task"]
+    assert released_after_reopen["status"] == "todo"
+
+    assert client.patch(
+        f"/api/plugins/kanban/tasks/{parent['id']}", json={"status": "archived"},
+    ).status_code == 200
+
+    child = client.post(
+        "/api/plugins/kanban/tasks", json={"title": "must remain gated", "parents": [parent["id"]]},
+    ).json()["task"]
+    assert child["status"] == "todo"
+
+
 def test_reopening_parent_retracts_review_and_blocks_approval(client):
     with kbc.connect() as conn:
         parent_id = kb.create_task(conn, title="parent", assignee="planner")
@@ -632,7 +669,7 @@ def test_add_comment_with_choice(client):
     """
     t = client.post("/api/plugins/kanban/tasks", json={"title": "x"}).json()["task"]
     tid = t["id"]
-    conn = kb.connect()
+    conn = kbc.connect()
     try:
         assert kb.block_task(
             conn, tid,
@@ -1121,6 +1158,29 @@ def test_archived_task_reopens_only_through_evented_unarchive(client):
     assert mismatches == 0
 
 
+def test_bulk_archive_completed_parent_preserves_child_promotion(client):
+    parent = client.post("/api/plugins/kanban/tasks", json={"title": "completed parent"}).json()["task"]
+    sibling = client.post("/api/plugins/kanban/tasks", json={"title": "active sibling"}).json()["task"]
+    assert client.post(
+        "/api/plugins/kanban/tasks/bulk", json={"ids": [parent["id"]], "status": "done"},
+    ).status_code == 200
+    child = client.post(
+        "/api/plugins/kanban/tasks",
+        json={"title": "child", "parents": [parent["id"], sibling["id"]]},
+    ).json()["task"]
+    assert child["status"] == "todo"
+
+    archived = client.post(
+        "/api/plugins/kanban/tasks/bulk", json={"ids": [parent["id"]], "archive": True},
+    )
+    assert archived.status_code == 200
+    assert archived.json()["results"] == [{"id": parent["id"], "ok": True}]
+    assert client.post(
+        "/api/plugins/kanban/tasks/bulk", json={"ids": [sibling["id"]], "status": "done"},
+    ).status_code == 200
+    assert client.get(f"/api/plugins/kanban/tasks/{child['id']}").json()["task"]["status"] == "ready"
+
+
 def test_bulk_reassign(client):
     a = client.post("/api/plugins/kanban/tasks",
                     json={"title": "a", "assignee": "old"}).json()["task"]
@@ -1555,7 +1615,7 @@ def test_board_link_edges_empty_when_no_links(client):
     missing `link_edges` as "older backend, degrade gracefully", so silently
     omitting it on an unlinked board would flip the UI into fallback mode.
     """
-    with kb.connect() as conn:
+    with kbc.connect() as conn:
         kb.create_task(conn, title="lonely", assignee="alice")
 
     body = client.get("/api/plugins/kanban/board").json()
@@ -1569,7 +1629,7 @@ def test_board_link_edges_are_parent_child_pairs(client):
     focus) keys off this ordering, so an inversion here would be silent and
     would corrupt every consumer. Pin the direction down explicitly.
     """
-    with kb.connect() as conn:
+    with kbc.connect() as conn:
         parent_id = kb.create_task(conn, title="blocker", assignee="alice")
         child_id = kb.create_task(
             conn, title="blocked", assignee="bob", parents=[parent_id],
@@ -1586,7 +1646,7 @@ def test_board_link_edges_are_parent_child_pairs(client):
 
 def test_board_link_edges_cover_fan_in_and_fan_out(client):
     """A diamond (A blocks B and C; B and C block D) round-trips completely."""
-    with kb.connect() as conn:
+    with kbc.connect() as conn:
         a = kb.create_task(conn, title="A", assignee="alice")
         b = kb.create_task(conn, title="B", assignee="alice", parents=[a])
         c = kb.create_task(conn, title="C", assignee="alice", parents=[a])
@@ -1610,7 +1670,7 @@ def test_board_link_edges_survive_completion(client):
     The desktop's "blockers clear" chip needs the edge to still be there after
     the blocker finishes — that is exactly the state it renders.
     """
-    with kb.connect() as conn:
+    with kbc.connect() as conn:
         parent_id = kb.create_task(conn, title="blocker", assignee="alice")
         child_id = kb.create_task(
             conn, title="blocked", assignee="bob", parents=[parent_id],
@@ -1628,7 +1688,7 @@ def test_board_link_edges_survive_completion(client):
 
 def test_board_link_edges_drop_after_unlink(client):
     """DELETE /links removes the edge from the next board payload."""
-    with kb.connect() as conn:
+    with kbc.connect() as conn:
         parent_id = kb.create_task(conn, title="blocker", assignee="alice")
         child_id = kb.create_task(
             conn, title="blocked", assignee="bob", parents=[parent_id],
@@ -1685,7 +1745,7 @@ def test_archive_done_preflight_and_mutation_stay_on_one_board(client):
     assert result["skipped_count"] == 0
     assert result["failures"] == []
 
-    with kb.connect() as conn:
+    with kbc.connect() as conn:
         assert kb.get_task(conn, done_here).status == "archived"
         assert kb.get_task(conn, active_here).status != "archived"
     with kbc.connect(board="other") as conn:
@@ -1739,5 +1799,5 @@ def test_archive_done_skips_card_that_leaves_done_before_its_atomic_archive(clie
     assert response.json()["archived_count"] == 0
     assert response.json()["skipped_count"] == 1
     assert response.json()["failures"] == []
-    with kb.connect() as conn:
+    with kbc.connect() as conn:
         assert kb.get_task(conn, task_id).status == "todo"

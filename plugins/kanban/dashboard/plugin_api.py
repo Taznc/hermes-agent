@@ -1036,18 +1036,21 @@ def delete_task(task_id: str, board: Optional[str] = Query(None)):
 
 
 def _parents_blocking_ready(conn: sqlite3.Connection, task_id: str) -> list:
-    """Parent rows (id, title, status) not ``done`` that block promotion to ``ready``.
+    """Unsatisfied parent rows that block promotion to ``ready``.
 
     Used to enrich the 409 response from :func:`update_task` so the dashboard can show an actionable toast
     (#26744) instead of a silent no-op. Returns ``[]`` when nothing blocks the transition (e.g. no parents,
-    or all parents already done).
+    or all parents have satisfied their dependency edges).
     """
     rows = conn.execute(
-        "SELECT t.id, t.title, t.status FROM tasks t "
+        "SELECT t.id, t.title, t.status, t.completed_at FROM tasks t "
         "JOIN task_links l ON l.parent_id = t.id "
-        "WHERE l.child_id = ? AND t.status != 'done'",
+        "WHERE l.child_id = ?",
         (task_id,)).fetchall()
-    return [{"id": r["id"], "title": r["title"], "status": r["status"]} for r in rows]
+    return [
+        {"id": r["id"], "title": r["title"], "status": r["status"]}
+        for r in rows if not kanban_db._parent_dependency_satisfied(r)
+    ]
 
 
 def _set_status_direct(conn: sqlite3.Connection, task_id: str, new_status: str) -> bool:
@@ -1077,6 +1080,7 @@ def _set_status_direct(conn: sqlite3.Connection, task_id: str, new_status: str) 
         reopening_satisfied_parent = prev["status"] in {"done", "archived"} and effective_status not in {"done", "archived"}
         cur = conn.execute(
             "UPDATE tasks SET status = ?, "
+            "  completed_at = CASE WHEN ? IN ('done', 'archived') THEN completed_at ELSE NULL END, "
             "  claim_lock = CASE WHEN ? = 'running' THEN claim_lock ELSE NULL END, "
             "  claim_expires = CASE WHEN ? = 'running' THEN claim_expires ELSE NULL END, "
             "  worker_pid = CASE WHEN ? = 'running' THEN worker_pid ELSE NULL END "
@@ -1084,7 +1088,7 @@ def _set_status_direct(conn: sqlite3.Connection, task_id: str, new_status: str) 
             # point, but the WHERE clause independently blocks the CAS if that check is ever
             # bypassed or refactored around.
             "WHERE id = ? AND status != 'archived'",
-            (effective_status,) * 4 + (task_id,))
+            (effective_status,) * 5 + (task_id,))
         if cur.rowcount != 1:
             return False
         run_id = None

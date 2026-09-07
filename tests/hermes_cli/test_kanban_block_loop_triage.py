@@ -29,6 +29,7 @@ from pathlib import Path
 import pytest
 
 from hermes_cli import kanban_db as kb
+from hermes_cli import kanban_db_connect as kbc
 from hermes_cli import kanban_decompose as decomp
 from hermes_cli import kanban_specify as spec
 
@@ -59,7 +60,7 @@ def _drive_into_loop_breaker(conn, task_id: str, *, kind: str = "needs_input") -
 
 def test_block_task_parks_repeat_offender_in_triage(kanban_home):
     """Precondition: the breaker really does route to triage, not blocked."""
-    with kb.connect_closing() as conn:
+    with kbc.connect_closing() as conn:
         tid = kb.create_task(conn, title="unsatisfiable", assignee="worker")
         _drive_into_loop_breaker(conn, tid)
 
@@ -78,7 +79,7 @@ def test_triage_sweeps_skip_loop_broken_tasks(kanban_home, list_triage_ids):
 
     Otherwise the automation re-promotes it and the loop restarts.
     """
-    with kb.connect_closing() as conn:
+    with kbc.connect_closing() as conn:
         looped = kb.create_task(conn, title="unsatisfiable", assignee="worker")
         _drive_into_loop_breaker(conn, looped)
 
@@ -98,7 +99,7 @@ def test_triage_sweeps_still_return_ordinary_triage_tasks(
     A normal triage card (a rough idea filed by a human) has no block history
     and must still be picked up.
     """
-    with kb.connect_closing() as conn:
+    with kbc.connect_closing() as conn:
         fresh = kb.create_task(conn, title="rough idea", triage=True)
         assert kb.get_task(conn, fresh).status == "triage"
 
@@ -112,7 +113,7 @@ def test_triage_sweeps_still_return_ordinary_triage_tasks(
 )
 def test_sweeps_return_fresh_and_skip_looped_together(kanban_home, list_triage_ids):
     """Both kinds of card coexist in triage; only the looped one is skipped."""
-    with kb.connect_closing() as conn:
+    with kbc.connect_closing() as conn:
         fresh = kb.create_task(conn, title="rough idea", triage=True)
         looped = kb.create_task(conn, title="unsatisfiable", assignee="worker")
         _drive_into_loop_breaker(conn, looped)
@@ -128,7 +129,7 @@ def test_task_below_limit_is_not_skipped(kanban_home):
     A task that blocked once and was unblocked has a recurrence count below
     the limit — it is ordinary work, not a loop, and must not be filtered.
     """
-    with kb.connect_closing() as conn:
+    with kbc.connect_closing() as conn:
         tid = kb.create_task(conn, title="blocked once", assignee="worker")
         kb.block_task(conn, tid, reason="one off", kind="needs_input")
         kb.unblock_task(conn, tid)
