@@ -627,6 +627,13 @@ export interface ReviewActionRecord {
   success: boolean
   /** The tool's own success/error message. */
   message: string
+  /** Newer backends' explicit terminal outcome; absent on older backends. */
+  state?: 'completed' | 'no_op' | 'skipped' | 'declined' | 'failed'
+  /** Short user-facing explanation with source content redacted. */
+  reason?: string
+  /** Bounded, generic before/after description with source content redacted. */
+  change_summary?: string
+  /** Deprecated raw previews from older backends. Never emitted by new backends. */
   content_preview?: string
   old_preview?: string
   new_preview?: string

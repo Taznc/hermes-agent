@@ -29,47 +29,54 @@ const OPERATION_ICON: Record<string, string> = {
   remove: 'trash'
 }
 
-/** One row inside the expanded self-improvement detail list. */
+/** One compact, individually expandable review record. */
 function ReviewActionRow({ action }: { action: ReviewActionRecord }) {
   const { t } = useI18n()
   const copy = t.assistant.thread.review
+  const [open, setOpen] = useState(false)
+  const state = action.state ?? (action.success ? 'completed' : 'failed')
   const icon = OPERATION_ICON[action.operation] ?? 'circle'
-  const skillLabel = action.skill_name ? `${action.label} "${action.skill_name}"` : action.label
+  const target = action.skill_name ? `${action.label} “${action.skill_name}”` : action.label
+  const stateLabel = copy.state(state)
+  const hasSafeDetail = Boolean(action.change_summary || action.reason)
 
   return (
-    <li className="flex min-w-0 items-start gap-1.5 py-0.5">
-      <span className="flex h-(--conversation-line-height) w-3 shrink-0 items-center justify-center">
-        <Codicon
-          className={action.success ? 'text-(--ui-text-tertiary)' : 'text-destructive'}
-          name={action.success ? icon : 'warning'}
-          size="0.75rem"
-        />
-      </span>
-      <span className="min-w-0 wrap-anywhere text-[0.6875rem] leading-5 text-muted-foreground/80">
-        <span className="font-medium text-muted-foreground">{skillLabel}</span>
-        {action.old_preview !== undefined && action.new_preview !== undefined ? (
-          <>
-            {': "'}
-            {action.old_preview}
-            {'" → "'}
-            {action.new_preview}
-            {'"'}
-          </>
-        ) : action.content_preview !== undefined ? (
-          <>
-            {': '}
-            {action.content_preview}
-          </>
-        ) : action.old_preview !== undefined ? (
-          <>
-            {': '}
-            {action.old_preview}
-          </>
-        ) : null}
-        {!action.success && action.message && (
-          <span className="block text-destructive/90">{copy.failedReason(action.message)}</span>
-        )}
-      </span>
+    <li className="min-w-0 py-0.5">
+      <button
+        aria-expanded={open}
+        aria-label={open ? copy.hideRecordDetails : copy.showRecordDetails(target)}
+        className="flex min-w-0 items-start gap-1.5 bg-transparent text-left"
+        onClick={() => setOpen(value => !value)}
+        type="button"
+      >
+        <span className="flex h-(--conversation-line-height) w-3 shrink-0 items-center justify-center">
+          <Codicon
+            className={state === 'failed' ? 'text-destructive' : 'text-(--ui-text-tertiary)'}
+            name={state === 'failed' ? 'warning' : icon}
+            size="0.75rem"
+          />
+        </span>
+        <span className="min-w-0 wrap-anywhere text-[0.6875rem] leading-5 text-muted-foreground/80">
+          <span className="font-medium text-muted-foreground">
+            {copy.recordSummary(target, action.operation, stateLabel)}
+          </span>
+        </span>
+        <DisclosureCaret className="mt-1 shrink-0 text-muted-foreground/55" open={open} size="0.625rem" />
+      </button>
+      {open && (
+        <div className="ml-4.5 mt-0.5 min-w-0 wrap-anywhere text-[0.6875rem] leading-5 text-muted-foreground/70">
+          {hasSafeDetail ? (
+            <>
+              {action.change_summary && <p>{action.change_summary}</p>}
+              {action.reason && (
+                <p className={state === 'failed' ? 'text-destructive/90' : undefined}>{action.reason}</p>
+              )}
+            </>
+          ) : (
+            <p>{copy.legacyDetail}</p>
+          )}
+        </div>
+      )}
     </li>
   )
 }
@@ -85,7 +92,10 @@ function ReviewActionsDisclosure({ actions }: { actions: ReviewActionRecord[] })
   const { t } = useI18n()
   const copy = t.assistant.thread.review
   const [open, setOpen] = useState(false)
-  const failedCount = actions.filter(action => !action.success).length
+
+  const failedCount = actions.filter(
+    action => (action.state ?? (action.success ? 'completed' : 'failed')) === 'failed'
+  ).length
 
   return (
     <span className="ml-1 inline-flex items-center align-middle">
@@ -116,6 +126,7 @@ function ReviewActionsDisclosure({ actions }: { actions: ReviewActionRecord[] })
 
 export const SystemMessage: FC = () => {
   const text = useAuiState(s => messageContentText(s.message.content))
+
   const reviewActions = useAuiState(s => {
     const custom = (s.message.metadata?.custom ?? {}) as { reviewActions?: ReviewActionRecord[] }
 

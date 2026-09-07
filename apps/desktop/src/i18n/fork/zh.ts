@@ -92,7 +92,13 @@ export const forkZh: ForkTranslations = {
         showDetails: '显示详情',
         showDetailsWithFailures: count => `显示详情（${count} 项失败）`,
         hideDetails: '隐藏详情',
-        failedReason: message => `失败：${message}`
+        hideRecordDetails: '隐藏记录详情',
+        legacyDetail: '此旧版 Hermes 不提供详情。',
+        recordSummary: (target, operation, state) => `${target} · ${operation} · ${state}`,
+        showRecordDetails: target => `显示${target}审查详情`,
+        state: state =>
+          ({ completed: '已完成', declined: '已拒绝', failed: '失败', no_op: '无更改', skipped: '已跳过' })[state] ??
+          '已完成'
       }
     },
     tool: {
