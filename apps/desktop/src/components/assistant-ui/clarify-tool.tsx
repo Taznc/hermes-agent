@@ -284,6 +284,11 @@ function ClarifyHelpControls({
             ...(custom ? { follow_up: custom } : {}),
             ...(questionId ? { question_id: questionId } : {}),
             request_id: request.requestId,
+            // Owner routing selects the right gateway connection, but the
+            // clarify RPC itself resolves its pending request by runtime id.
+            // Without this wire field `_sess()` sees an empty session and
+            // rejects the otherwise-correct owner request as "session not found".
+            session_id: request.sessionId,
             version: 1
           }
         )
