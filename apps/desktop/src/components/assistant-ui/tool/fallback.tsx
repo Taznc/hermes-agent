@@ -46,12 +46,14 @@ import { AlertCircle, CheckCircle2 } from '@/lib/icons'
 import { normalize } from '@/lib/text'
 import { useEnterAnimation } from '@/lib/use-enter-animation'
 import { cn } from '@/lib/utils'
+import { $mcpAppCard } from '@/store/mcp-apps'
 import { recordPreviewArtifact } from '@/store/preview-status'
 import { sessionApprovalRequest } from '@/store/prompts'
 import { $toolInlineDiff } from '@/store/tool-diffs'
 import { $toolRowDismissed, dismissToolRow } from '@/store/tool-dismiss'
 import { $anyToolDisclosureOpen, $toolDisclosureOpen, $toolViewMode, setToolDisclosureOpen } from '@/store/tool-view'
-import { $mcpAppCard } from '@/store/mcp-apps'
+
+import { McpAppCard } from '../mcp-app-card'
 
 import { APPROVAL_TOOLS, PendingToolApproval } from './approval'
 import {
@@ -75,7 +77,6 @@ import {
 } from './fallback-model'
 import { isToolCallPart, summarizeToolRun } from './run-summary'
 import { ToolRunTicker } from './run-ticker'
-import { McpAppCard } from '../mcp-app-card'
 
 // `true` when a ToolEntry is rendered inside an embedding wrapper that owns
 // the per-row chrome (timer / preview). The flat ToolGroupSlot sets this
@@ -476,7 +477,6 @@ function ToolEntry({ part }: ToolEntryProps) {
     view.stderr ||
     view.terminalCommand ||
     view.terminalExitCode !== undefined ||
-    mcpApp !== null ||
     toolViewMode === 'technical'
   )
 
@@ -548,18 +548,19 @@ function ToolEntry({ part }: ToolEntryProps) {
   }
 
   return (
-    <div
-      className={cn(
-        'group/tool-block min-w-0 max-w-full overflow-hidden text-[length:var(--conversation-tool-font-size)] text-(--ui-text-tertiary)',
-        open && TOOL_EXPANDED_SHELL_CLASS
-      )}
-      data-conversation-scaffold=""
-      data-file-edit={isFileEdit && open ? '' : undefined}
-      data-slot="tool-block"
-      data-tool-open={open ? '' : undefined}
-      data-tool-row=""
-      ref={enterRef}
-    >
+    <>
+      <div
+        className={cn(
+          'group/tool-block min-w-0 max-w-full overflow-hidden text-[length:var(--conversation-tool-font-size)] text-(--ui-text-tertiary)',
+          open && TOOL_EXPANDED_SHELL_CLASS
+        )}
+        data-conversation-scaffold=""
+        data-file-edit={isFileEdit && open ? '' : undefined}
+        data-slot="tool-block"
+        data-tool-open={open ? '' : undefined}
+        data-tool-row=""
+        ref={enterRef}
+      >
       <div className={cn(open && 'border-b border-(--ui-stroke-tertiary) px-2 py-1.5')}>
         <DisclosureRow
           action={dismissAction}
@@ -717,11 +718,16 @@ function ToolEntry({ part }: ToolEntryProps) {
                 )}
               </div>
             ))}
-          {mcpApp && <McpAppCard card={mcpApp} />}
           {toolViewMode === 'technical' && <ToolPayloadDisclosure args={part.args} result={part.result} />}
         </div>
       )}
-    </div>
+      </div>
+      {mcpApp && (
+        <div className="mt-1.5" data-slot="mcp-app-card">
+          <McpAppCard card={mcpApp} />
+        </div>
+      )}
+    </>
   )
 }
 
