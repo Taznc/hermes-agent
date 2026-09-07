@@ -682,12 +682,14 @@ def collect_background_review_actions(
     operations into one opaque line.
 
     Each record has: ``target`` ("memory" | "user" | "skill"), ``label``
-    (display string), ``operation`` (the tool's ``action`` — "add",
-    "replace", "remove", "create", "patch", "edit", or "unknown"),
-    ``success`` (bool), ``message`` (the tool's own success/error string),
-    and, when available, ``content_preview`` / ``old_preview`` /
-    ``new_preview`` truncated the same way the compact summary is.
-    Skill records also carry ``skill_name`` when known.
+    (display string), ``operation`` (the tool's ``action``), legacy
+    ``success``/``message`` fields, and explicit ``state`` ("completed",
+    "no_op", "skipped", "declined", or "failed"), ``reason``, and bounded
+    redacted ``change_summary`` fields.  Raw tool arguments, source content,
+    tool output, and review reasoning are intentionally never serialized.
+    Skill records carry only the existing narrow ``skill_name`` identifier
+    when known; no inspect descriptor is emitted because this transport does
+    not grant a content-reading capability.
 
     Mirrors ``summarize_background_review_actions``'s prior-snapshot
     de-duplication (issue #14944) and its ``notification_mode`` gate: mode
@@ -740,13 +742,50 @@ def collect_background_review_actions(
                 "new_string": args.get("new_string", ""),
             }
 
-    max_preview = 120
-    max_short_preview = 80
-    max_remove_preview = 60
+    def _outcome(data: Dict[str, Any], success: bool) -> str:
+        """Return a public terminal state without publishing tool output.
 
-    def _preview(text: Any, limit: int) -> str:
-        text = text if isinstance(text, str) else ""
-        return text[:limit] + ("…" if len(text) > limit else "")
+        Review tool replies and arguments can contain the very memory/profile/skill
+        text that this event is meant to explain.  Only recognize a small, stable
+        vocabulary from an explicit result field or conventional status wording;
+        callers receive a generic state and reason, never that source text.
+        """
+        for key in ("outcome", "state", "result", "status"):
+            value = str(data.get(key) or "").lower().replace("-", "_").replace(" ", "_")
+            if value in {"completed", "no_op", "skipped", "declined", "failed"}:
+                return value
+        text = " ".join(str(data.get(key) or "") for key in ("message", "error")).lower()
+        if any(word in text for word in ("declined", "denied", "not approved")):
+            return "declined"
+        if "skip" in text:
+            return "skipped"
+        if any(phrase in text for phrase in ("no change", "no changes", "unchanged", "already up to date", "no-op")):
+            return "no_op"
+        return "completed" if success else "failed"
+
+    def _safe_reason(target_label: str, operation: str, outcome: str) -> str:
+        noun = target_label.lower()
+        if outcome == "completed":
+            return f"{noun} {operation} completed."
+        if outcome == "no_op":
+            return f"No {noun} change was needed."
+        if outcome == "skipped":
+            return f"{target_label} review action was skipped."
+        if outcome == "declined":
+            return f"{target_label} review action was declined."
+        return f"{target_label} {operation} did not complete."
+
+    def _change_summary(operation: str, outcome: str) -> str:
+        """Bounded before/after description which cannot contain saved content."""
+        if outcome != "completed":
+            return "No stored content was changed."
+        if operation in {"add", "create"}:
+            return "Before: no new record. After: record added."
+        if operation in {"replace", "patch", "edit"}:
+            return "Before: prior record. After: updated record."
+        if operation == "remove":
+            return "Before: existing record. After: record removed."
+        return "Review action completed; stored content is redacted."
 
     records: List[Dict[str, Any]] = []
     for msg in review_messages or []:
@@ -776,7 +815,6 @@ def collect_background_review_actions(
             data = {}
 
         success = bool(data.get("success"))
-        raw_message = data.get("message") or data.get("error") or ""
         is_skill = detail.get("tool") == "skill_manage"
         target = data.get("target", "") or detail.get("target", "")
 
@@ -787,59 +825,38 @@ def collect_background_review_actions(
         else:
             label = "Memory"
 
-        base: Dict[str, Any] = {
-            "target": "skill" if is_skill else (target or "memory"),
-            "label": label,
-            "success": success,
-            "message": str(raw_message),
-        }
-        if is_skill and detail.get("name"):
-            base["skill_name"] = detail["name"]
-
         action = detail.get("action", "") or "unknown"
         operations = detail.get("operations")
         operations = operations if isinstance(operations, list) else []
+        target_name = "skill" if is_skill else (target or "memory")
 
-        if is_skill:
-            change_raw = data.get("_change")
-            change: dict = change_raw if isinstance(change_raw, dict) else {}
-            old_string = change.get("old", "") or detail.get("old_string", "")
-            new_string = change.get("new", "") or detail.get("new_string", "")
-            description = change.get("description", "")
-            record = dict(base)
-            record["operation"] = action
-            if old_string or new_string:
-                record["old_preview"] = _preview(old_string, max_short_preview)
-                record["new_preview"] = _preview(new_string, max_short_preview)
-            if description:
-                record["content_preview"] = str(description)
-            records.append(record)
-        elif operations:
+        def _record(operation: str) -> Dict[str, Any]:
+            outcome = _outcome(data, success)
+            record: Dict[str, Any] = {
+                "target": target_name,
+                "label": label,
+                "operation": operation,
+                # Kept for legacy consumers; new clients should render state/reason.
+                "success": outcome == "completed",
+                "message": _safe_reason(label, operation, outcome),
+                "state": outcome,
+                "reason": _safe_reason(label, operation, outcome),
+                "change_summary": _change_summary(operation, outcome),
+            }
+            if is_skill and detail.get("name"):
+                record["skill_name"] = detail["name"]
+            return record
+
+        if operations and not is_skill:
             # Batch ``memory`` call — one record per sub-operation so each
             # add/replace/remove within the batch is individually visible.
             for op in operations:
                 if not isinstance(op, dict):
                     continue
                 op_act = op.get("action", "") or "unknown"
-                record = dict(base)
-                record["operation"] = op_act
-                op_content = op.get("content") or ""
-                op_old = op.get("old_text") or ""
-                if op_content:
-                    record["content_preview"] = _preview(op_content, max_preview)
-                if op_old:
-                    record["old_preview"] = _preview(op_old, max_remove_preview)
-                records.append(record)
+                records.append(_record(op_act))
         else:
-            record = dict(base)
-            record["operation"] = action
-            content = detail.get("content", "")
-            old_text = detail.get("old_text", "")
-            if content:
-                record["content_preview"] = _preview(content, max_preview)
-            if old_text:
-                record["old_preview"] = _preview(old_text, max_remove_preview)
-            records.append(record)
+            records.append(_record(action))
 
     return records
 
