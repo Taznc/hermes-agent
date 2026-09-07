@@ -26,6 +26,9 @@ import type {
   BoardMeta,
   BoardsResponse,
   ChoiceResponse,
+  DispatchPauseResult,
+  DispatchResumeResult,
+  DispatchStatus,
   KanbanBoard,
   KanbanProfile,
   KanbanProject,
@@ -310,6 +313,8 @@ export const BOARDS_KEY = ['kanban', 'boards'] as const
 export const PROFILES_KEY = ['kanban', 'profiles'] as const
 export const PROJECTS_KEY = ['kanban', 'projects'] as const
 export const ORCHESTRATION_KEY = ['kanban', 'orchestration'] as const
+/** Board-scoped: a pause is per board, so switching boards must be a cache miss. */
+export const dispatchStatusKey = (slug: string) => ['kanban', 'dispatch-status', slug] as const
 
 // ── reads ─────────────────────────────────────────────────────────────────────
 
@@ -542,6 +547,20 @@ export const addRoadmapIdea = (text: string, sourceId?: string, board?: string) 
 
 export const saveOrchestration = (patch: Record<string, unknown>) =>
   call<OrchestrationSettings>('/orchestration', { method: 'PUT', body: patch })
+
+/** Dispatch pause circuit for the maintenance-drain control. `running_count`
+ *  is the "is it safe to restart yet" signal — pausing fences NEW dispatch
+ *  only, so an operator watches this reach 0 before restarting a service whose
+ *  cgroup would otherwise SIGKILL those workers. */
+export const fetchDispatchStatus = () => call<DispatchStatus>(withBoard('/dispatch/status'))
+
+/** Refusal is a 200 with `paused: false` (a dispatch tick owns the board
+ *  lock), NOT an error — callers must branch on `paused`, never assume the
+ *  board drained just because the request resolved. */
+export const pauseDispatch = (note?: null | string) =>
+  call<DispatchPauseResult>(withBoard('/dispatch/pause'), { method: 'POST', body: { note: note ?? null } })
+
+export const resumeDispatch = () => call<DispatchResumeResult>(withBoard('/dispatch/resume'), { method: 'POST' })
 
 export const saveProfileDescription = (name: string, description: string) =>
   call(`/profiles/${encodeURIComponent(name)}`, { method: 'PATCH', body: { description } })

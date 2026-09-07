@@ -17,16 +17,22 @@ import {
   Switch,
   useMutation,
   useQuery,
-  useQueryClient
+  useQueryClient,
+  useValue
 } from '@hermes/plugin-sdk'
 import { useState } from 'react'
 
 import {
+  $boardSlug,
   autoDescribeProfile,
+  dispatchStatusKey,
+  fetchDispatchStatus,
   fetchOrchestration,
   fetchProfiles,
   ORCHESTRATION_KEY,
+  pauseDispatch,
   PROFILES_KEY,
+  resumeDispatch,
   saveOrchestration,
   saveProfileDescription
 } from './api'
@@ -34,6 +40,95 @@ import type { KanbanProfile } from './types'
 import { errText, FIELD_LABEL, useKanban } from './ui'
 
 const DEFAULT_SENTINEL = '__default__'
+
+/**
+ * Pause / drain / resume dispatch for the selected board.
+ *
+ * Workers run inside the gateway's cgroup, so restarting it while any are
+ * running SIGKILLs them and discards uncommitted worktree progress. Pausing
+ * fences only NEW claims and spawns — it never kills a live worker — so the
+ * running count is the actual "is it safe to restart yet" signal, and it is
+ * the prominent thing here.
+ *
+ * Board-scoped: `api.ts`'s `withBoard` pins every call to `$boardSlug`. The
+ * All Boards sentinel resolves to the server's active board rather than
+ * fanning out; a multi-board pause is deliberately out of scope for now.
+ */
+export function DispatchPauseControl() {
+  const k = useKanban()
+  const qc = useQueryClient()
+  const slug = useValue($boardSlug)
+
+  // Same 8s cadence the board's own drawer-adjacent polls use: while draining,
+  // the operator is watching this number, so a 60s settings cadence is too slow.
+  const { data: status } = useQuery({
+    queryFn: fetchDispatchStatus,
+    queryKey: dispatchStatusKey(slug),
+    refetchInterval: 8_000
+  })
+
+  const refresh = () => void qc.invalidateQueries({ queryKey: dispatchStatusKey(slug) })
+
+  const pause = useMutation({
+    mutationFn: () => pauseDispatch(),
+    onError: err => host.notify({ kind: 'error', message: errText(err) }),
+    onSuccess: result => {
+      // A refusal arrives as a normal 200 with `paused: false` (a dispatch tick
+      // owns the board lock). Reporting it as success would tell the operator a
+      // board is draining when it is still claiming work.
+      if (!result.paused) {
+        host.notify({ kind: 'warning', message: k.pauseBusy })
+      }
+
+      refresh()
+    }
+  })
+
+  const resume = useMutation({
+    mutationFn: resumeDispatch,
+    onError: err => host.notify({ kind: 'error', message: errText(err) }),
+    onSuccess: refresh
+  })
+
+  if (!status) {
+    return null
+  }
+
+  const running = status.running_count
+  const busy = pause.isPending || resume.isPending
+
+  return (
+    <div className="flex flex-col gap-1.5">
+      <span className={FIELD_LABEL}>{k.dispatchControl}</span>
+      <div className="flex flex-wrap items-center gap-3">
+        {status.paused ? (
+          <Button disabled={busy} onClick={() => resume.mutate()} size="xs" variant="outline">
+            <Codicon name="play" size="0.8rem" />
+            {k.resumeDispatch}
+          </Button>
+        ) : (
+          <Button disabled={busy} onClick={() => pause.mutate()} size="xs" variant="outline">
+            <Codicon name="debug-pause" size="0.8rem" />
+            {k.pauseDispatch}
+          </Button>
+        )}
+        {status.paused ? (
+          <span
+            className="text-[0.75rem] font-medium"
+            style={{ color: running === 0 ? 'var(--ui-text-positive)' : 'var(--ui-text-warning)' }}
+          >
+            {running === 0 ? k.safeToRestart : k.draining(running)}
+          </span>
+        ) : (
+          <span className="text-[0.75rem] text-(--ui-text-secondary)">{k.dispatchRunning}</span>
+        )}
+      </div>
+      {/* The server renders the pause record (reason, who, when, note) so CLI,
+          REST, and this panel can never drift into three phrasings of it. */}
+      <p className="text-[0.6875rem] text-(--ui-text-quaternary)">{status.message ?? k.pauseHint}</p>
+    </div>
+  )
+}
 
 function ProfilePicker({
   label,
@@ -170,6 +265,8 @@ export function OrchestrationPanel() {
           {k.autoDecompose}
         </label>
       </div>
+
+      <DispatchPauseControl />
 
       <div className="flex flex-col gap-1.5">
         <span className={FIELD_LABEL}>{k.profileDescriptions}</span>
