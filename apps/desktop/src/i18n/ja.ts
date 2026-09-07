@@ -335,6 +335,7 @@ export const ja = defineForkLocale(forkJa, {
       testSent:
         'テストを送信しました。表示されない場合は、OS の通知許可と集中モード／おやすみモードを確認してください。',
       testUnsupported: 'このシステムはネイティブ通知に対応していません。',
+      testDenied: 'このサイトの通知がブロックされています。ブラウザのサイト設定で許可してから、もう一度お試しください。',
       completionSoundTitle: '完了サウンド',
       completionSoundDesc: 'エージェントのターン終了時に再生されます。プリセットを選んでここで試聴できます。',
       completionSoundPreview: '試聴'
