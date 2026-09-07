@@ -470,6 +470,22 @@ const homeNode = (sessions: SessionInfo[]): SidebarProjectTree =>
     sessionCount: sessions.length
   })
 
+// Another profile's Home as the all-profiles fan-out emits it: same synthetic
+// shape, but re-keyed to `__no_project__::<profile>` so it can sit beside ours.
+const foreignHomeNode = (profile: string, sessions: SessionInfo[]): SidebarProjectTree => {
+  const id = `${NO_PROJECT_ID}::${profile}`
+  const label = `Home · ${profile}`
+
+  return projectNode({
+    id,
+    isNoProject: true,
+    label,
+    path: null,
+    repos: [{ id, label, path: null, sessionCount: sessions.length, groups: [lane({ id, label, sessions })] }],
+    sessionCount: sessions.length
+  })
+}
+
 describe('liveSessionProjectId', () => {
   it('maps a brand-new (unpersisted) session to its auto project (the repo root)', () => {
     expect(liveSessionProjectId(makeCwdSession('/www/app'), [])).toBe('/www/app')
@@ -710,6 +726,31 @@ describe('overlayLiveLanes', () => {
 
     expect(overlaid.repos[0].groups[0].sessions).toEqual([])
     expect(overlaid.sessionCount).toBe(0)
+  })
+
+  it('never injects this client’s detached sessions into ANOTHER profile’s Home', () => {
+    // In all-profiles mode each profile gets its own Home bucket, keyed
+    // `__no_project__::<profile>`. A foreign bucket's rows come from that
+    // profile's own store; our live detached chats belong in OUR Home. Pushing
+    // them into a foreign lane is the cross-profile bleed the scoped id fixes.
+    const foreignHome = foreignHomeNode('worker', [])
+    const live = [makeCwdSession(null, { id: 'my-detached-chat' })]
+
+    const overlaid = overlayLiveLanes(foreignHome, live)
+
+    expect(overlaid.repos[0].groups[0].sessions).toEqual([])
+    expect(overlaid.sessionCount).toBe(0)
+  })
+
+  it('keeps a foreign Home’s own rows on the scoped id when overlaying', () => {
+    // The overlay rebuilds the lane; rebuilding it on the bare NO_PROJECT_ID
+    // would re-merge the bucket back into the user's Home one level down.
+    const owned = makeCwdSession(null, { id: 'worker-row' })
+    const overlaid = overlayLiveLanes(foreignHomeNode('worker', [owned]), [])
+
+    expect(overlaid.repos[0].id).toBe('__no_project__::worker')
+    expect(overlaid.repos[0].groups[0].id).toBe('__no_project__::worker')
+    expect(overlaid.repos[0].groups[0].sessions.map(s => s.id)).toEqual(['worker-row'])
   })
 
   it('keeps cwd-less repo sessions visible in both the overview and project drill-in', () => {

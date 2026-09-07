@@ -2,6 +2,7 @@ import { atom } from 'nanostores'
 
 import type { NewSessionPlacement } from '@/app/chat/new-session-drag'
 import {
+  isHomeProjectId,
   liveSessionProjectId,
   NO_PROJECT_ID,
   type SidebarProjectTree
@@ -153,7 +154,9 @@ export function resolveNewSessionCwd(): string {
 
   // Inside Home, "no folder" is the point: a new chat must stay detached rather
   // than silently attaching to the configured default dir and leaving Home.
-  if (scope === NO_PROJECT_ID) {
+  // Any profile's Home counts — in all-profiles mode a foreign bucket is keyed
+  // `__no_project__::<profile>`, and it is just as folder-less as our own.
+  if (isHomeProjectId(scope)) {
     return ''
   }
 
