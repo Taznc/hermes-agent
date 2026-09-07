@@ -96,7 +96,19 @@ export const forkEn: ForkTranslations = {
         showDetails: 'Show details',
         showDetailsWithFailures: count => (count === 1 ? 'Show details (1 failed)' : `Show details (${count} failed)`),
         hideDetails: 'Hide details',
-        failedReason: message => `Failed: ${message}`
+        hideRecordDetails: 'Hide record details',
+        legacyDetail: 'Details are unavailable from this older Hermes version.',
+        target: target => ({ memory: 'Memory', skill: 'Skill', user: 'User profile' })[target] ?? 'Review item',
+        operation: operation =>
+          ({ add: 'Add', create: 'Create', edit: 'Edit', patch: 'Update', remove: 'Remove', replace: 'Replace' })[
+            operation
+          ] ?? 'Update',
+        recordSummary: (target, operation, state) => `${target} · ${operation} · ${state}`,
+        showRecordDetails: target => `Show ${target} review details`,
+        state: state =>
+          ({ completed: 'Completed', declined: 'Declined', failed: 'Failed', no_op: 'No change', skipped: 'Skipped' })[
+            state
+          ] ?? 'Completed'
       }
     },
     tool: {

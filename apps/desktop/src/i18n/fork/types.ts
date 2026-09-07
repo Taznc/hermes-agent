@@ -112,7 +112,13 @@ export interface ForkTranslations {
         showDetails: string
         showDetailsWithFailures: (count: number) => string
         hideDetails: string
-        failedReason: (message: string) => string
+        hideRecordDetails: string
+        legacyDetail: string
+        target: (target: string) => string
+        operation: (operation: string) => string
+        recordSummary: (target: string, operation: string, state: string) => string
+        showRecordDetails: (target: string) => string
+        state: (state: string) => string
       }
     }
     tool: {
