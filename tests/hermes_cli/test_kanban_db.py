@@ -2430,3 +2430,121 @@ def test_lane_board_is_completely_inert(kanban_home, all_assignees_spawnable, mo
     assert [tuple(r) for r in after_rows] == [tuple(r) for r in before_rows]
     assert after_events == before_events
     assert after_runs == before_runs
+
+
+def test_spawn_to_ready_is_parent_gated_and_never_bogus_ready(
+    kanban_home, all_assignees_spawnable,
+):
+    """``spawn --to ready`` under an unfinished parent must land in ``todo``.
+
+    Every other entry into ``ready`` (unblock/promote/unarchive/dashboard) consults the parent
+    gate first. ``_lane_transition`` was a bare status CAS, so a lane card rendered as ``ready``
+    until the next dispatcher tick, where ``claim_task`` refused it with ``claim_rejected
+    {parents_not_done}`` and knocked it back to ``todo``. Assert the landing AND the absence of
+    that self-correction on the first tick — the event is what proves nothing had to be undone.
+    """
+    def fake_spawn(task, workspace, board=None):  # pragma: no cover - must never be called
+        raise AssertionError(f"dispatcher spawned a parent-gated card: {task.id}")
+
+    with kbc.connect_closing() as conn:
+        epic = kb.create_task(conn, title="epic", assignee="alice")
+        child = kb.create_task(
+            conn, title="gated child", assignee="alice", lane="roadmap", parents=(epic,),
+        )
+
+        assert kb.spawn_roadmap_task(conn, child, to="ready") is True
+        assert kb.get_task(conn, child).status == "todo"
+
+        spawn_events = [e for e in kb.list_events(conn, child) if e.kind == "spawned_from_roadmap"]
+        assert len(spawn_events) == 1
+        # The operator asked for ``ready``; the audit trail keeps both the request and the
+        # gated landing rather than silently rewriting one into the other.
+        assert spawn_events[0].payload == {"status": "todo", "requested_status": "ready"}
+
+        kbd.dispatch_once(conn, spawn_fn=fake_spawn)
+        assert [e.kind for e in kb.list_events(conn, child)].count("claim_rejected") == 0
+        assert kb.get_task(conn, child).status == "todo"
+
+        # The gate defers the landing, it does not cancel it: the card promotes normally
+        # once the parent finishes.
+        kb.complete_task(conn, epic, summary="done")
+        kb.recompute_ready(conn)
+        assert kb.get_task(conn, child).status == "ready"
+
+
+def test_spawn_to_ready_ungated_when_parents_are_done(kanban_home):
+    """The gate only defers — a satisfied (or absent) parent still lands directly in ``ready``
+    with the plain payload, so the common case keeps its existing contract."""
+    with kbc.connect_closing() as conn:
+        epic = kb.create_task(conn, title="epic", assignee="alice")
+        kb.complete_task(conn, epic, summary="done")
+        child = kb.create_task(
+            conn, title="child", assignee="alice", lane="roadmap", parents=(epic,),
+        )
+        assert kb.spawn_roadmap_task(conn, child, to="ready") is True
+        assert kb.get_task(conn, child).status == "ready"
+        spawned = [e for e in kb.list_events(conn, child) if e.kind == "spawned_from_roadmap"]
+        assert spawned[0].payload == {"status": "ready"}
+
+
+def test_spawn_to_triage_ignores_the_parent_gate(kanban_home):
+    """``triage`` is not a parent-gated status: an unfinished parent must not divert a
+    re-specify request into ``todo``, where no decomposer sweep would ever see it."""
+    with kbc.connect_closing() as conn:
+        epic = kb.create_task(conn, title="epic", assignee="alice")
+        child = kb.create_task(
+            conn, title="child", assignee="alice", lane="roadmap", parents=(epic,),
+        )
+        assert kb.spawn_roadmap_task(conn, child) is True
+        assert kb.get_task(conn, child).status == "triage"
+        spawned = [e for e in kb.list_events(conn, child) if e.kind == "spawned_from_roadmap"]
+        assert spawned[0].payload == {"status": "triage"}
+
+
+@pytest.mark.parametrize("lane", ["idea", "roadmap"])
+def test_unarchive_from_a_lane_records_the_wishlist_exit(kanban_home, lane):
+    """archive + unarchive is the second route out of a lane into live work; it must leave the
+    same ``spawned_from_roadmap`` audit mark ``spawn_roadmap_task`` does, or the wishlist->work
+    trail is skippable by taking the quieter path."""
+    with kbc.connect_closing() as conn:
+        tid = kb.create_task(conn, title="wish", assignee="alice", lane=lane)
+        assert kb.archive_task(conn, tid) is True
+        # The pre-archive status is what makes the exit recognisable later.
+        archived = [e for e in kb.list_events(conn, tid) if e.kind == "archived"]
+        assert archived[-1].payload["from_status"] == lane
+
+        assert kb.unarchive_task(conn, tid, status="ready") is True
+        assert kb.get_task(conn, tid).status == "ready"
+        kinds = [e.kind for e in kb.list_events(conn, tid)]
+        assert kinds.count("unarchived") == 1
+        assert kinds.count("spawned_from_roadmap") == 1
+        exit_event = [e for e in kb.list_events(conn, tid) if e.kind == "spawned_from_roadmap"][0]
+        assert exit_event.payload == {"status": "ready", "via": "unarchive"}
+
+
+def test_unarchive_of_ordinary_work_is_not_a_lane_exit(kanban_home):
+    """Only a card archived FROM a lane gets the wishlist audit event; ordinary work
+    round-tripping through the archive must not be mislabelled as a roadmap spawn."""
+    with kbc.connect_closing() as conn:
+        tid = kb.create_task(conn, title="real work", assignee="alice")
+        kb.archive_task(conn, tid)
+        kb.unarchive_task(conn, tid, status="ready")
+        kinds = [e.kind for e in kb.list_events(conn, tid)]
+        assert "spawned_from_roadmap" not in kinds
+
+
+@pytest.mark.parametrize("lane", ["idea", "roadmap"])
+def test_idempotency_key_ignores_lane_cards(kanban_home, lane):
+    """A lane card must not answer an idempotent create replay. It is not live work (it sits in
+    ``NON_ACTIVE_STATUSES`` beside ``archived``), so matching it would suppress the real task the
+    replay was meant to create and return a wishlist id to the caller instead."""
+    with kbc.connect_closing() as conn:
+        wish = kb.create_task(conn, title="wish", lane=lane, idempotency_key="k1")
+        assert kb.get_task_by_idempotency_key(conn, "k1") is None
+
+        real = kb.create_task(conn, title="real", assignee="alice", idempotency_key="k1")
+        assert real != wish
+        assert kb.get_task(conn, real).status == "ready"
+        # The live task still deduplicates its own replays.
+        assert kb.create_task(conn, title="real again", assignee="alice",
+                              idempotency_key="k1") == real

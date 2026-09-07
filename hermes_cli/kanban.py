@@ -1052,11 +1052,13 @@ def _cmd_unhold(args: argparse.Namespace) -> int:
                            lambda tid: f"cannot unhold {tid} (not on hold?)")
 
 
-def _lane_bulk(args: argparse.Namespace, verb: str, apply, ok_label: str) -> int:
+def _lane_bulk(args: argparse.Namespace, verb: str, apply, ok_label: Optional[str]) -> int:
     """Shared body for ``refine``/``demote``/``spawn``: apply a lane transition per id.
 
     A refused transition raises ``ValueError`` from the DB layer naming ``from -> to``; that
-    message is the useful one, so print it per-id and keep going instead of aborting the batch."""
+    message is the useful one, so print it per-id and keep going instead of aborting the batch.
+    ``ok_label=None`` means ``apply`` already printed its own success line (``spawn`` does: its
+    landing is parent-gated and therefore not known until after the write)."""
     ids, rc = _require_ids(args)
     if rc:
         return rc
@@ -1070,7 +1072,8 @@ def _lane_bulk(args: argparse.Namespace, verb: str, apply, ok_label: str) -> int
                 print(f"kanban {verb}: {exc}", file=sys.stderr)
                 continue
             if moved:
-                print(f"{ok_label} {tid}")
+                if ok_label is not None:
+                    print(f"{ok_label} {tid}")
             else:
                 failed = True
                 print(f"cannot {verb} {tid} (status changed concurrently?)", file=sys.stderr)
@@ -1090,9 +1093,20 @@ def _cmd_demote(args: argparse.Namespace) -> int:
 def _cmd_spawn(args: argparse.Namespace) -> int:
     """Roadmap -> triage (default) or ready."""
     to = getattr(args, "to", "triage")
-    return _lane_bulk(
-        args, "spawn", lambda conn, tid: kb.spawn_roadmap_task(conn, tid, to=to), f"Spawned to {to}",
-    )
+
+    def apply(conn, tid) -> bool:
+        if not kb.spawn_roadmap_task(conn, tid, to=to):
+            return False
+        # ``ready`` is parent-gated, so the card may legitimately have landed in ``todo``.
+        # Report where it actually went; a fixed "Spawned to ready" would misreport it.
+        landed = kb.get_task(conn, tid)
+        if landed is not None and landed.status != to:
+            print(f"Spawned to {landed.status} {tid} (parents unfinished; requested {to})")
+            return True
+        print(f"Spawned to {to} {tid}")
+        return True
+
+    return _lane_bulk(args, "spawn", apply, None)
 
 
 def _cmd_request_review(args: argparse.Namespace) -> int:
