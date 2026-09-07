@@ -211,7 +211,7 @@ async def _discover_and_register_server(name: str, config: dict) -> List[str]:
         task_cancelling = task.cancelling() if task is not None and hasattr(task, "cancelling") else 0
         if (server is not None and server._error is not None and task is not None
                 and not task.done() and not task_cancelling):
-            # Recoverable park: the run task self-probes, so adopt it for shutdown/revival.
+            # Recoverable park: retain the run task for shutdown and explicit revival.
             _adopt_server(name, server)
         elif server is not None:
             await server.shutdown()
@@ -230,9 +230,12 @@ async def _discover_and_register_server(name: str, config: dict) -> List[str]:
 
 
 def _select_new_servers(servers: Dict[str, dict]) -> Dict[str, dict]:
-    """Pick connect candidates (enabled, not connected/connecting/lazy, not in backoff) and
-    refresh per-server bookkeeping. Known servers without a live session are parked or
-    mid-reconnect with tools deregistered, so nothing else can nudge them: signal a reconnect."""
+    """Pick connect candidates and refresh per-server bookkeeping.
+
+    Known servers without a live session are parked or mid-reconnect with
+    tools deregistered. Repeated discovery must not override that parked
+    state; only a changed server config is an intentional recovery request.
+    """
     with _core._lock:
         connecting = set(_core._server_connecting)
         # Only attempt servers that aren't already connected (or currently connecting) and are enabled.
@@ -242,8 +245,11 @@ def _select_new_servers(servers: Dict[str, dict]) -> Dict[str, dict]:
             k: v for k, v in servers.items()
             if k not in _core._servers and k not in connecting and k not in _core._lazy_server_configs
             and _enabled(v) and not _connect_cooldown_active(k)}
-        stale_cached = [_core._servers[k] for k in servers
-                        if k in _core._servers and getattr(_core._servers[k], "session", None) is None]
+        stale_cached = [
+            (name, _core._servers[name], config)
+            for name, config in servers.items()
+            if name in _core._servers and getattr(_core._servers[name], "session", None) is None
+        ]
         _core._server_connecting.update(new_servers)
         for srv_name in new_servers:
             _core._server_connect_errors.pop(srv_name, None)
@@ -253,8 +259,11 @@ def _select_new_servers(servers: Dict[str, dict]) -> Dict[str, dict]:
                 _core._parallel_safe_servers.add(srv_name)
             else:
                 _core._parallel_safe_servers.discard(srv_name)
-    for srv in stale_cached:
-        _loop._signal_reconnect(srv)
+    for name, server, config in stale_cached:
+        if getattr(server, "_config", None) != config:
+            server._config = config
+            logger.info("MCP server '%s': configuration changed while parked; requesting reconnect", name)
+            _loop._signal_reconnect(server)
     return new_servers
 
 

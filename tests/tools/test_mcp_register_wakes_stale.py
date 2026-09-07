@@ -1,10 +1,8 @@
-"""New sessions must wake parked/stale cached MCP servers immediately.
+"""Parked MCP servers revive only after an intentional lifecycle request.
 
-Regression for #50170: after a keepalive failure parks a server, its tools
-are deregistered — so a NEW agent session starting up saw the tools silently
-absent and had no way to trigger recovery until the next timed self-probe
-(up to _PARKED_RETRY_INTERVAL later). register_mcp_servers now nudges any
-cached entry whose session is None via _signal_reconnect.
+Repeated discovery runs (including cron ticks) must not reconnect a parked
+server whose configuration is unchanged. A configuration change is an
+intentional recovery request and wakes the retained task.
 """
 
 import pytest
@@ -31,6 +29,7 @@ def test_register_wakes_stale_cached_server(monkeypatch, tmp_path):
 
         def __init__(self, name):
             self.name = name
+            self._config = {"url": "http://127.0.0.1:9/mcp"}
             self._reconnect_event = _Event(name)
             self._registered_tool_names: list[str] = []
 
@@ -55,8 +54,14 @@ def test_register_wakes_stale_cached_server(monkeypatch, tmp_path):
         })
         # Both cached → no new connections attempted; existing names returned.
         assert "healthy-srv__tool" in result
-        # The parked (session=None) entry got a reconnect nudge; the healthy
-        # one was left alone.
+        # Repeated discovery with the same config does not override a parked
+        # server's explicit-reconnect gate.
+        assert woken == []
+
+        _mcp_discovery.register_mcp_servers({
+            "parked-srv": {"url": "http://127.0.0.1:10/mcp"},
+            "healthy-srv": {"url": "http://127.0.0.1:9/mcp"},
+        })
         assert woken == ["parked-srv"]
     finally:
         mcp_tool._servers.pop("parked-srv", None)

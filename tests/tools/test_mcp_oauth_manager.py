@@ -365,6 +365,33 @@ def test_bridge_forwards_requests_and_poisons_on_token_endpoint_400(
     assert not (d / "srv.client.json").exists()
     assert provider._initialized is False
     assert provider.context.client_info is None
+
+
+@pytest.mark.asyncio
+async def test_cross_task_close_of_pending_auth_flow_has_no_lock_owner_error(tmp_path, monkeypatch):
+    """Closing a pending SDK auth flow from a different task must finish cleanly.
+
+    HTTPX may finalize an abandoned auth generator outside the task that drove
+    its request. The provider uses a semaphore for the SDK's context lock so
+    cleanup preserves mutual exclusion without AnyIO's task-owner requirement.
+    """
+    from mcp.client.auth.oauth2 import OAuthClientProvider
+
+    async def fake_base_flow(self, request):
+        async with self.context.lock:
+            yield request
+
+    monkeypatch.setattr(OAuthClientProvider, "async_auth_flow", fake_base_flow)
+    provider = _provider_with_token_endpoint(
+        tmp_path, {}, "https://idp.example.com/oauth/token", monkeypatch
+    )
+    assert provider is not None
+    flow = provider.async_auth_flow(object())
+    await flow.__anext__()
+
+    await asyncio.wait_for(asyncio.create_task(flow.aclose()), timeout=1)
+
+
 @pytest.mark.asyncio
 async def test_manager_provider_token_exchange_includes_dcr_secret(tmp_path, monkeypatch):
     """The manager provider path applies the same Supabase DCR secret fix."""

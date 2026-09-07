@@ -1,10 +1,8 @@
-"""Tests for the parked-server self-probe revival path (#57129).
+"""Tests for parked-server revival.
 
-Parking deregisters a server's tools, so no tool call can reach the
-circuit-breaker half-open probe or ``_signal_reconnect`` — the only
-things that set ``_reconnect_event``. The parked wait must therefore be
-timed: the run task wakes on ``_PARKED_RETRY_INTERVAL`` and attempts one
-revival probe on its own.
+Parking deregisters a server's tools. A genuinely parked server must remain
+dormant until an explicit lifecycle request sets ``_reconnect_event``; it must
+not turn a remote outage into an indefinite background reconnect loop.
 """
 
 import asyncio
@@ -43,18 +41,14 @@ def test_revival_discovery_registers_tools_while_ready_is_cleared(monkeypatch):
 
 
 @pytest.mark.no_isolate
-def test_parked_server_self_probes_and_revives(monkeypatch, tmp_path):
-    """A parked server must revive on its own once the backend recovers,
-    without any explicit _reconnect_event.set()."""
+def test_parked_server_waits_for_explicit_reconnect_before_revival(monkeypatch, tmp_path):
+    """A parked server makes no automatic reconnect attempts, but a manual signal revives it."""
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
 
     from tools import mcp_tool
     from tools.mcp_tool import MCPServerTask
 
     monkeypatch.setattr(mcp_tool, "_MAX_RECONNECT_RETRIES", 1)
-    # Keep the self-probe cadence tiny so the test is fast.
-    monkeypatch.setattr(mcp_tool, "_PARKED_RETRY_INTERVAL", 0.05)
-
     _real_sleep = asyncio.sleep
 
     async def _fast_sleep(_delay, *a, **kw):
@@ -113,16 +107,25 @@ def test_parked_server_self_probes_and_revives(monkeypatch, tmp_path):
         assert state["deregistered"] >= 1, "server never parked"
         assert not run_task.done(), "run task exited instead of parking"
 
-        # The backend comes back. NOTHING sets _reconnect_event — revival
-        # must come from the timed self-probe alone.
+        # The backend comes back, but no operator, credential refresh, or
+        # configuration reload asks the parked server to reconnect. Waiting
+        # across the former self-probe interval must not touch transport.
         state["backend_up"] = True
+        parked_transport_calls = state["transport_calls"]
+        await _real_sleep(0.16)
+        assert state["transport_calls"] == parked_transport_calls, (
+            "parked server attempted reconnect without an explicit lifecycle request"
+        )
+        assert task.session is None
+
+        # An explicit reconnect still wakes the retained task and restores its tools.
+        task._reconnect_event.set()
         for _ in range(200):
             await _real_sleep(0.01)
             if task.session is not None:
                 break
-
         assert task.session is not None, (
-            "parked server never self-probed back to life "
+            "parked server did not revive after an explicit reconnect "
             f"(transport_calls={state['transport_calls']})"
         )
         assert state["revived_registration"] >= 1, (
