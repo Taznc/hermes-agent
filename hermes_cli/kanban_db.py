@@ -4898,6 +4898,36 @@ def _insert_decomposed_child(
     return new_id
 
 
+def _clear_satisfied_outgoing_links(conn: sqlite3.Connection, task_id: str) -> list[str]:
+    """Drop the child edges an archived task can never gate again.
+
+    A completed task's dependency edge is satisfied *permanently* —
+    :func:`_parent_dependency_satisfied` keys off ``completed_at``, which only
+    the completion lifecycle writes, so no future state re-gates the child.
+    Keeping the row past that point is pure debt: an archived parent is absent
+    from the board payload, so every surface that resolves links against the
+    active view (the Desktop drawer's ``resolveLinks``) can only report it as an
+    unresolvable — and therefore conservatively still-gating — blocker.
+
+    An archived task WITHOUT ``completed_at`` was withdrawn, not finished; its
+    edges stay so the child keeps showing a real block. Edges where ``task_id``
+    is the CHILD are dependency history belonging to the surviving parent and
+    are never touched here. Returns the child ids whose edges were removed.
+    """
+    row = conn.execute("SELECT status, completed_at FROM tasks WHERE id = ?", (task_id,)).fetchone()
+    if row is None or not _parent_dependency_satisfied(row):
+        return []
+    children = [
+        r["child_id"]
+        for r in conn.execute(
+            "SELECT child_id FROM task_links WHERE parent_id = ? ORDER BY child_id", (task_id,),
+        ).fetchall()
+    ]
+    if children:
+        conn.execute("DELETE FROM task_links WHERE parent_id = ?", (task_id,))
+    return children
+
+
 def archive_task(
     conn: sqlite3.Connection, task_id: str, *, expected_status: Optional[str] = None,
 ) -> bool:
@@ -4925,7 +4955,11 @@ def archive_task(
             conn, task_id, outcome="reclaimed", status="reclaimed",
             summary="task archived with run still active",
         )
-        _append_event(conn, task_id, "archived", None, run_id=run_id)
+        cleared_children = _clear_satisfied_outgoing_links(conn, task_id)
+        payload: Optional[dict[str, Any]] = (
+            {"cleared_child_links": cleared_children} if cleared_children else None
+        )
+        _append_event(conn, task_id, "archived", payload, run_id=run_id)
     # Completed parents preserve their dependency satisfaction after archival;
     # incomplete archived parents remain gated. Re-evaluate children now either way.
     recompute_ready(conn)
@@ -4954,6 +4988,11 @@ def unarchive_task(conn: sqlite3.Connection, task_id: str, *, status: str = "tod
         if archived is None or archived["status"] != "archived":
             return False
         reopening_satisfied_parent = _parent_dependency_satisfied(archived)
+        # Note: archival already deleted this task's outgoing (parent_id) edges
+        # when it was completed, so the invalidation sweep below only reaches
+        # children linked AFTER that archive. Reopened work re-gates via
+        # invalidate_descendants_for_parent_reopen; the cleared edges are gone
+        # for good and are not resurrected here.
         if target == "ready" and not _parents_satisfied(conn, task_id):
             target = "todo"
         cur = conn.execute(
