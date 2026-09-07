@@ -181,9 +181,15 @@ KANBAN_BLOCK_SCHEMA = _schema(
     {
         "task_id": _prop("string", _DESC_TASK_ID_DEFAULT),
         "reason": _prop("string", (
-                "What you need answered or what stopped you, in one or "
-                "two sentences. Don't paste the whole conversation; the "
-                "human has the board and can ask follow-ups via comments."
+                "The ask, written for a human scanning a board card — NOT a "
+                "status report. Line 1: ONE sentence naming exactly what you "
+                "need to get unblocked. If a shell command would unblock you "
+                "(restart a service, grant access, install a credential), put "
+                "the exact copy-pasteable command in a ```cmd fence — the "
+                "board renders it with a copy button. Diagnosis, history, and "
+                "what you tried go in kanban_comment BEFORE you block; prose "
+                "here is capped (~700 chars, fenced blocks excluded) and "
+                "longer reasons are rejected."
         )),
         "kind": {
             "type": "string",
