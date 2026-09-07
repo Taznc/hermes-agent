@@ -235,7 +235,11 @@ describe('ClarifyTool help controls', () => {
 
     await waitFor(() => expect(request).toHaveBeenCalledTimes(2))
     expect(request).toHaveBeenNthCalledWith(1, 'clarify.explain', { request_id: 'request-1', version: 1 })
-    expect(request).toHaveBeenNthCalledWith(2, 'clarify.explain', { choice: 'staging', request_id: 'request-1', version: 1 })
+    expect(request).toHaveBeenNthCalledWith(2, 'clarify.explain', {
+      choice: 'staging',
+      request_id: 'request-1',
+      version: 1
+    })
     expect(screen.getByRole('button', { name: /Continue/ }).getAttribute('disabled')).not.toBeNull()
   })
 
@@ -270,13 +274,17 @@ describe('ClarifyTool help controls', () => {
     fireEvent.keyDown(why, { key: 'Enter' })
     fireEvent.click(why)
 
-    await waitFor(() => expect(request).toHaveBeenCalledWith('clarify.explain', expect.objectContaining({ choice: 'staging' })))
+    await waitFor(() =>
+      expect(request).toHaveBeenCalledWith('clarify.explain', expect.objectContaining({ choice: 'staging' }))
+    )
     expect(choice.getAttribute('aria-pressed')).toBe('false')
   })
 
   it('keeps a batch draft and staged selection while question help fails and is retried', async () => {
     const request = renderLiveBatch()
-    request.mockRejectedValueOnce(new Error('backend unavailable')).mockResolvedValueOnce({ explanation_id: 'retry-help' })
+    request
+      .mockRejectedValueOnce(new Error('backend unavailable'))
+      .mockResolvedValueOnce({ explanation_id: 'retry-help' })
 
     fireEvent.click(screen.getByRole('button', { name: /^[A-Z]red/ }))
     fireEvent.change(screen.getByPlaceholderText('Type your answer…'), { target: { value: 'packet' } })
@@ -318,9 +326,7 @@ describe('ClarifyTool help controls', () => {
     expect(details.open).toBe(true)
     expect(screen.getByText('Production affects customer traffic.')).toBeTruthy()
   })
-
 })
-
 
 describe('readClarifyResult', () => {
   it('reads question + user_response from the tool JSON payload', () => {

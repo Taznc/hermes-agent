@@ -121,18 +121,38 @@ describe('clarify store', () => {
 
   it('keeps out-of-order repeated help responses correlated to their own follow-ups', () => {
     setClarifyRequest(clarify('session-a', 'req-a'))
-    updateClarifyHelp('req-a', 'session-a', 'local-old', { choice: 'staging', followUp: 'old question', status: 'loading' })
-    updateClarifyHelp('req-a', 'session-a', 'local-new', { choice: 'staging', followUp: 'new question', status: 'loading' })
+    updateClarifyHelp('req-a', 'session-a', 'local-old', {
+      choice: 'staging',
+      followUp: 'old question',
+      status: 'loading'
+    })
+    updateClarifyHelp('req-a', 'session-a', 'local-new', {
+      choice: 'staging',
+      followUp: 'new question',
+      status: 'loading'
+    })
     // A newer request completes first. Its content must not acquire the old request's metadata.
-    updateClarifyHelp('req-a', 'session-a', 'explain-new', { choice: 'staging', content: 'new answer', followUp: '', status: 'complete' })
+    updateClarifyHelp('req-a', 'session-a', 'explain-new', {
+      choice: 'staging',
+      content: 'new answer',
+      followUp: '',
+      status: 'complete'
+    })
     reconcileClarifyHelp('req-a', 'session-a', 'local-new', 'explain-new')
-    updateClarifyHelp('req-a', 'session-a', 'explain-old', { choice: 'staging', content: 'old answer', followUp: '', status: 'complete' })
+    updateClarifyHelp('req-a', 'session-a', 'explain-old', {
+      choice: 'staging',
+      content: 'old answer',
+      followUp: '',
+      status: 'complete'
+    })
     reconcileClarifyHelp('req-a', 'session-a', 'local-old', 'explain-old')
 
-    expect($clarifyRequests.get()['session-a']?.help).toEqual(expect.objectContaining({
-      'explain-new': expect.objectContaining({ content: 'new answer', followUp: 'new question' }),
-      'explain-old': expect.objectContaining({ content: 'old answer', followUp: 'old question' })
-    }))
+    expect($clarifyRequests.get()['session-a']?.help).toEqual(
+      expect.objectContaining({
+        'explain-new': expect.objectContaining({ content: 'new answer', followUp: 'new question' }),
+        'explain-old': expect.objectContaining({ content: 'old answer', followUp: 'old question' })
+      })
+    )
   })
 
   it('retains help for the exact tool row after its pending request settles', () => {

@@ -194,7 +194,7 @@ export function reconcileClarifyHelp(
 }
 
 export function settledClarifyHelp(requestId: string | null): Record<string, ClarifyHelp> {
-  return requestId ? $settledClarifyHelp.get()[requestId] ?? {} : {}
+  return requestId ? ($settledClarifyHelp.get()[requestId] ?? {}) : {}
 }
 
 export function settledClarifyHelpForToolCall(toolCallId: string): Record<string, ClarifyHelp> {

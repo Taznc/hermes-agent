@@ -234,7 +234,13 @@ function KeyBadge({ char, preview, selected }: { char: string; preview?: boolean
   )
 }
 
-function ClarifyHelpControls({ choice, questionId, request, target, targetLabel }: {
+function ClarifyHelpControls({
+  choice,
+  questionId,
+  request,
+  target,
+  targetLabel
+}: {
   choice?: string
   questionId?: string
   request: ClarifyRequest | null
@@ -251,60 +257,121 @@ function ClarifyHelpControls({ choice, questionId, request, target, targetLabel 
     [choice, questionId, request?.help]
   )
 
-  const requestHelp = useCallback(async (custom = '') => {
-    if (!request || !gateway) {
-      setError('Help is unavailable while the connection is offline.')
+  const requestHelp = useCallback(
+    async (custom = '') => {
+      if (!request || !gateway) {
+        setError('Help is unavailable while the connection is offline.')
 
-      return
-    }
-
-    const localId = `local-${++clarifyHelpLocalSequence}`
-    setError('')
-    updateClarifyHelp(request.requestId, request.sessionId, localId, {
-      choice,
-      followUp: custom,
-      questionId,
-      status: 'loading'
-    })
-
-    try {
-      const response = await requestForOwnedSession(
-        request.sessionId,
-        gateway.request.bind(gateway) as typeof gateway.request,
-        'clarify.explain',
-        {
-          ...(choice ? { choice: bareChoice(choice) } : {}),
-          ...(custom ? { follow_up: custom } : {}),
-          ...(questionId ? { question_id: questionId } : {}),
-          request_id: request.requestId,
-          version: 1
-        }
-      )
-      const explanationId =
-        typeof response === 'object' && response !== null && typeof (response as Record<string, unknown>).explanation_id === 'string'
-          ? (response as Record<string, string>).explanation_id
-          : ''
-
-      if (explanationId) {
-        reconcileClarifyHelp(request.requestId, request.sessionId, localId, explanationId)
+        return
       }
-    } catch (cause) {
-      const message = cause instanceof Error ? cause.message : 'Help request failed.'
-      updateClarifyHelp(request.requestId, request.sessionId, localId, { choice, error: message, followUp: custom, questionId, status: 'error' })
-    }
-  }, [choice, gateway, questionId, request])
+
+      const localId = `local-${++clarifyHelpLocalSequence}`
+      setError('')
+      updateClarifyHelp(request.requestId, request.sessionId, localId, {
+        choice,
+        followUp: custom,
+        questionId,
+        status: 'loading'
+      })
+
+      try {
+        const response = await requestForOwnedSession(
+          request.sessionId,
+          gateway.request.bind(gateway) as typeof gateway.request,
+          'clarify.explain',
+          {
+            ...(choice ? { choice: bareChoice(choice) } : {}),
+            ...(custom ? { follow_up: custom } : {}),
+            ...(questionId ? { question_id: questionId } : {}),
+            request_id: request.requestId,
+            version: 1
+          }
+        )
+        const explanationId =
+          typeof response === 'object' &&
+          response !== null &&
+          typeof (response as Record<string, unknown>).explanation_id === 'string'
+            ? (response as Record<string, string>).explanation_id
+            : ''
+
+        if (explanationId) {
+          reconcileClarifyHelp(request.requestId, request.sessionId, localId, explanationId)
+        }
+      } catch (cause) {
+        const message = cause instanceof Error ? cause.message : 'Help request failed.'
+        updateClarifyHelp(request.requestId, request.sessionId, localId, {
+          choice,
+          error: message,
+          followUp: custom,
+          questionId,
+          status: 'error'
+        })
+      }
+    },
+    [choice, gateway, questionId, request]
+  )
 
   return (
     <div className="grid gap-1" data-clarify-help-target={target}>
       <div className="flex items-center gap-1">
-        <Button aria-label={`Why? ${targetLabel}`} onClick={() => void requestHelp()} size="xs" type="button" variant="text">Why?</Button>
-        <Button aria-controls={`clarify-help-${target}`} aria-expanded={askOpen} aria-label={`Ask about ${targetLabel}`} onClick={() => setAskOpen(open => !open)} size="xs" type="button" variant="text">Ask</Button>
+        <Button
+          aria-label={`Why? ${targetLabel}`}
+          onClick={() => void requestHelp()}
+          size="xs"
+          type="button"
+          variant="text"
+        >
+          Why?
+        </Button>
+        <Button
+          aria-controls={`clarify-help-${target}`}
+          aria-expanded={askOpen}
+          aria-label={`Ask about ${targetLabel}`}
+          onClick={() => setAskOpen(open => !open)}
+          size="xs"
+          type="button"
+          variant="text"
+        >
+          Ask
+        </Button>
       </div>
       {askOpen || help.length > 0 || error ? (
         <div className="grid gap-1 rounded-md bg-(--chrome-action-hover)/40 p-2 text-sm" id={`clarify-help-${target}`}>
-          {help.map(item => item.status === 'loading' ? <span key={item.explanationId} role="status">Getting help…</span> : item.content ? <p key={item.explanationId}>{item.content}</p> : item.error ? <p className="text-destructive" key={item.explanationId}>{item.error}</p> : null)}
+          {help.map(item =>
+            item.status === 'loading' ? (
+              <span key={item.explanationId} role="status">
+                Getting help…
+              </span>
+            ) : item.content ? (
+              <p key={item.explanationId}>{item.content}</p>
+            ) : item.error ? (
+              <p className="text-destructive" key={item.explanationId}>
+                {item.error}
+              </p>
+            ) : null
+          )}
           {error ? <p className="text-destructive">{error}</p> : null}
-          {askOpen ? <div className="flex gap-1"><Textarea aria-label={`Follow-up for ${target}`} className="min-h-0" onChange={event => setFollowUp(event.target.value)} placeholder="Ask a follow-up…" rows={1} size="sm" value={followUp} /><Button disabled={!followUp.trim()} onClick={() => void requestHelp(followUp.trim())} size="xs" type="button">Send</Button></div> : null}
+          {askOpen ? (
+            <div className="flex gap-1">
+              <Textarea
+                aria-label={`Follow-up for ${target}`}
+                className="min-h-0"
+                onChange={event => setFollowUp(event.target.value)}
+                placeholder="Ask a follow-up…"
+                rows={1}
+                size="sm"
+                value={followUp}
+              />
+              <Button
+                disabled={!followUp.trim()}
+                onClick={() => void requestHelp(followUp.trim())}
+                size="xs"
+                type="button"
+              >
+                Send
+              </Button>
+            </div>
+          ) : null}
         </div>
       ) : null}
     </div>
@@ -389,7 +456,7 @@ export const ClarifyTool = (props: ToolCallMessagePartProps) => {
 
   if (props.result !== undefined) {
     const requestId = toolRequestIds[props.toolCallId]
-    const help = lastRequest.current?.help ?? (requestId ? settledHelp[requestId] ?? {} : {})
+    const help = lastRequest.current?.help ?? (requestId ? (settledHelp[requestId] ?? {}) : {})
 
     return <ClarifyToolSettled {...props} help={help} />
   }
@@ -404,7 +471,16 @@ function ClarifyHelpDetails({ help }: { help: Record<string, ClarifyHelp> }) {
     return null
   }
 
-  return <details className="text-sm text-(--ui-text-secondary)"><summary>Help requested</summary><div className="mt-1 grid gap-1">{entries.map(item => <p key={item.explanationId}>{item.content}</p>)}</div></details>
+  return (
+    <details className="text-sm text-(--ui-text-secondary)">
+      <summary>Help requested</summary>
+      <div className="mt-1 grid gap-1">
+        {entries.map(item => (
+          <p key={item.explanationId}>{item.content}</p>
+        ))}
+      </div>
+    </details>
+  )
 }
 
 function ClarifyToolSettled({ help, ...props }: ToolCallMessagePartProps & { help: Record<string, ClarifyHelp> }) {
@@ -417,7 +493,11 @@ function ClarifyToolSettled({ help, ...props }: ToolCallMessagePartProps & { hel
   return <ClarifyToolSingleSettled {...props} help={help} />
 }
 
-function ClarifyToolSingleSettled({ args, help, result }: ToolCallMessagePartProps & { help: Record<string, ClarifyHelp> }) {
+function ClarifyToolSingleSettled({
+  args,
+  help,
+  result
+}: ToolCallMessagePartProps & { help: Record<string, ClarifyHelp> }) {
   const { t } = useI18n()
   const copy = t.assistant.clarify
   const fromArgs = useMemo(() => readClarifyArgs(args), [args])
@@ -874,7 +954,12 @@ function ClarifyToolSinglePending({
                   onClick={() => selectChoice(choice, index)}
                   selected={selectedChoices.includes(choice)}
                 />
-                <ClarifyHelpControls choice={bareChoice(choice)} request={matchingRequest} target={`choice-${index}`} targetLabel={bareChoice(choice)} />
+                <ClarifyHelpControls
+                  choice={bareChoice(choice)}
+                  request={matchingRequest}
+                  target={`choice-${index}`}
+                  targetLabel={bareChoice(choice)}
+                />
               </div>
             ))}
             <label
@@ -950,7 +1035,13 @@ function ClarifyToolSinglePending({
 // ─── Batch (multi-question) clarify ─────────────────────────────────────────
 
 /** Settled batch card: every question with its locked (or absent) answer. */
-function ClarifyToolBatchSettled({ help, responses }: { help: Record<string, ClarifyHelp>; responses: { question?: string; answer?: string | string[] }[] }) {
+function ClarifyToolBatchSettled({
+  help,
+  responses
+}: {
+  help: Record<string, ClarifyHelp>
+  responses: { question?: string; answer?: string | string[] }[]
+}) {
   const { t } = useI18n()
   const copy = t.assistant.clarify
 
@@ -1058,7 +1149,12 @@ function BatchQuestionBlock({
           </span>
         ) : null}
       </div>
-      <ClarifyHelpControls questionId={question.qid} request={request} target={`question-${question.qid}`} targetLabel={question.question} />
+      <ClarifyHelpControls
+        questionId={question.qid}
+        request={request}
+        target={`question-${question.qid}`}
+        targetLabel={question.question}
+      />
 
       {choices.length > 0 ? (
         <div className="grid gap-px pl-[1.625rem]" role="group">
@@ -1071,7 +1167,13 @@ function BatchQuestionBlock({
                 onClick={() => onToggle(choice)}
                 selected={staged.choices.includes(choice)}
               />
-              <ClarifyHelpControls choice={bareChoice(choice)} questionId={question.qid} request={request} target={`choice-${question.qid}-${choiceIndex}`} targetLabel={bareChoice(choice)} />
+              <ClarifyHelpControls
+                choice={bareChoice(choice)}
+                questionId={question.qid}
+                request={request}
+                target={`choice-${question.qid}-${choiceIndex}`}
+                targetLabel={bareChoice(choice)}
+              />
             </div>
           ))}
           <label className={cn(OPTION_ROW_CLASS, 'items-center')}>
