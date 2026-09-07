@@ -2143,3 +2143,217 @@ def test_bare_connect_does_not_close_on_context_exit(tmp_path):
     # Still usable after with-block exit (the leak).
     conn.execute("SELECT 1").fetchone()
     conn.close()  # explicit close to avoid leaking THIS test
+
+
+# ---------------------------------------------------------------------------
+# Roadmap lanes (idea / roadmap) — inert wishlist statuses
+# ---------------------------------------------------------------------------
+
+
+def test_lane_creation_lands_in_lane_without_assignee(kanban_home):
+    """``lane`` parks the card in the wishlist and makes ``assignee`` optional:
+    nothing dispatches a lane card, so demanding an assignee would be noise."""
+    with kbc.connect_closing() as conn:
+        idea = kb.create_task(conn, title="wishlist item", lane="idea")
+        road = kb.create_task(conn, title="agreed item", lane="roadmap")
+        assert kb.get_task(conn, idea).status == "idea"
+        assert kb.get_task(conn, idea).assignee is None
+        assert kb.get_task(conn, road).status == "roadmap"
+
+
+def test_lane_beats_parent_gating(kanban_home):
+    """An epic child in a lane must stay in the lane, never land in ``todo`` where the
+    promotion sweep would pick it up once the parent finished."""
+    with kbc.connect_closing() as conn:
+        epic = kb.create_task(conn, title="epic", assignee="alice")
+        child = kb.create_task(conn, title="child", lane="roadmap", parents=(epic,))
+        assert kb.get_task(conn, child).status == "roadmap"
+        kb.complete_task(conn, epic, summary="done")
+        kb.recompute_ready(conn)
+        # Parent is done; a ``todo`` child would have been promoted. The lane card is not.
+        assert kb.get_task(conn, child).status == "roadmap"
+
+
+@pytest.mark.parametrize("kwargs", [
+    {"triage": True},
+    {"initial_status": "blocked"},
+])
+def test_lane_conflicts_with_other_landing_flags(kanban_home, kwargs):
+    """``lane``/``triage``/``initial_status`` are three answers to one question; silently
+    picking one would put a wishlist card in the work queue or vice versa."""
+    with kbc.connect_closing() as conn:
+        with pytest.raises(ValueError, match="mutually exclusive"):
+            kb.create_task(conn, title="x", assignee="alice", lane="idea", **kwargs)
+
+
+def test_invalid_lane_rejected(kanban_home):
+    with kbc.connect_closing() as conn:
+        with pytest.raises(ValueError, match="lane must be one of"):
+            kb.create_task(conn, title="x", lane="backlog")
+
+
+def test_refine_demote_spawn_round_trip_with_events(kanban_home):
+    """The three lane verbs move the card and leave an auditable event each."""
+    with kbc.connect_closing() as conn:
+        tid = kb.create_task(conn, title="wishlist item", lane="idea")
+
+        assert kb.refine_task(conn, tid) is True
+        assert kb.get_task(conn, tid).status == "roadmap"
+
+        assert kb.demote_task(conn, tid) is True
+        assert kb.get_task(conn, tid).status == "idea"
+
+        kb.refine_task(conn, tid)
+        assert kb.spawn_roadmap_task(conn, tid) is True
+        assert kb.get_task(conn, tid).status == "triage"
+
+        kinds = [e.kind for e in kb.list_events(conn, tid)]
+        assert kinds.count("refined") == 2
+        assert kinds.count("demoted") == 1
+        assert kinds.count("spawned_from_roadmap") == 1
+
+
+def test_spawn_defaults_to_triage_and_ready_opts_out(kanban_home):
+    """Default landing is ``triage`` so auto-decompose re-specifies first; ``ready`` is
+    the explicit opt-out."""
+    with kbc.connect_closing() as conn:
+        a = kb.create_task(conn, title="a", lane="roadmap")
+        b = kb.create_task(conn, title="b", lane="roadmap")
+        kb.spawn_roadmap_task(conn, a)
+        kb.spawn_roadmap_task(conn, b, to="ready")
+        assert kb.get_task(conn, a).status == "triage"
+        assert kb.get_task(conn, b).status == "ready"
+
+        with pytest.raises(ValueError, match="spawn target must be one of"):
+            kb.spawn_roadmap_task(conn, kb.create_task(conn, title="c", lane="roadmap"), to="done")
+
+
+@pytest.mark.parametrize("live_status", [
+    "triage", "todo", "ready", "blocked", "on_hold", "scheduled", "review", "done", "running",
+])
+@pytest.mark.parametrize("verb", ["refine", "demote", "spawn"])
+def test_no_live_status_can_enter_a_lane(kanban_home, live_status, verb):
+    """The wishlist is entry-at-creation only. Every live status is refused with a
+    ValueError naming the attempted from->to, so the existing unblock/hold habits can
+    never park real work in the wishlist."""
+    apply = {
+        "refine": kb.refine_task,
+        "demote": kb.demote_task,
+        "spawn": kb.spawn_roadmap_task,
+    }[verb]
+    with kbc.connect_closing() as conn:
+        tid = kb.create_task(conn, title="live work", assignee="alice")
+        _set_task_status(conn, tid, live_status)
+        with pytest.raises(ValueError, match=f"{live_status!r} -> "):
+            apply(conn, tid)
+        assert kb.get_task(conn, tid).status == live_status
+
+
+def test_idea_cannot_spawn_directly(kanban_home):
+    """An idea must be refined before it can execute — spawning one is refused."""
+    with kbc.connect_closing() as conn:
+        tid = kb.create_task(conn, title="raw idea", lane="idea")
+        with pytest.raises(ValueError, match="'idea' -> 'triage'"):
+            kb.spawn_roadmap_task(conn, tid)
+        assert kb.get_task(conn, tid).status == "idea"
+
+
+@pytest.mark.parametrize("lane", ["idea", "roadmap"])
+def test_every_live_mutator_refuses_a_lane_card(kanban_home, lane):
+    """Table-driven transition matrix: no existing lifecycle mutator may move a lane card.
+    Each returns False (its status-guarded UPDATE matches nothing) rather than corrupting
+    the wishlist."""
+    with kbc.connect_closing() as conn:
+        def fresh() -> str:
+            return kb.create_task(conn, title="wish", lane=lane)
+
+        assert kb.promote_task(conn, fresh(), actor="op")[0] is False
+        assert kb.hold_task(conn, fresh()) is False
+        assert kb.unhold_task(conn, fresh()) is False
+        assert kb.schedule_task(conn, fresh()) is False
+        assert kb.block_task(conn, fresh(), reason="r") is False
+        assert kb.unblock_task(conn, fresh()) is False
+        assert kb.request_review(conn, fresh(), summary="s") is False
+        assert kb.complete_task(conn, fresh(), summary="s") is False
+        assert kb.claim_task(conn, fresh()) is None
+
+
+@pytest.mark.parametrize("lane", ["idea", "roadmap"])
+def test_archive_allowed_from_a_lane(kanban_home, lane):
+    """Dropping a wishlist item is always allowed."""
+    with kbc.connect_closing() as conn:
+        tid = kb.create_task(conn, title="drop me", lane=lane)
+        assert kb.archive_task(conn, tid) is True
+        assert kb.get_task(conn, tid).status == "archived"
+
+
+def test_board_stats_reports_lanes_but_excludes_them_from_active(kanban_home):
+    """Lane cards are visible in ``by_status`` but are not live work: a board holding only
+    wishlist items must report zero active."""
+    with kbc.connect_closing() as conn:
+        for i in range(3):
+            kb.create_task(conn, title=f"idea {i}", lane="idea")
+        for i in range(2):
+            kb.create_task(conn, title=f"road {i}", lane="roadmap")
+        stats = kb.board_stats(conn)
+        assert stats["by_status"]["idea"] == 3
+        assert stats["by_status"]["roadmap"] == 2
+        assert stats["roadmap_total"] == 5
+        assert stats["active_total"] == 0
+
+        kb.create_task(conn, title="real work", assignee="alice")
+        assert kb.board_stats(conn)["active_total"] == 1
+
+
+def test_lanes_are_listed_by_default(kanban_home):
+    """Inert does not mean hidden: the lanes still show up in the default listing."""
+    with kbc.connect_closing() as conn:
+        kb.create_task(conn, title="wish", lane="idea")
+        assert [t.status for t in kb.list_tasks(conn)] == ["idea"]
+        assert [t.title for t in kb.list_tasks(conn, status="roadmap")] == []
+
+
+def test_lane_board_is_completely_inert(kanban_home, all_assignees_spawnable, monkeypatch):
+    """The load-bearing guarantee: a board of nothing but lane cards must survive a full
+    dispatcher tick, both triage sweeps and ``recompute_ready`` with ZERO events and zero
+    row changes. This is the regression guard against a future ``status IN (...)`` whitelist
+    quietly gaining one of the lane names."""
+    from hermes_cli import kanban_decompose, kanban_specify
+
+    def fake_spawn(task, workspace, board=None):  # pragma: no cover - must never be called
+        raise AssertionError(f"dispatcher spawned a lane card: {task.id}")
+
+    with kbc.connect_closing() as conn:
+        for i in range(50):
+            kb.create_task(conn, title=f"idea {i}", lane="idea", assignee="alice")
+            kb.create_task(conn, title=f"road {i}", lane="roadmap", assignee="alice")
+
+        before_rows = conn.execute(
+            "SELECT id, status, assignee, claim_lock, worker_pid, current_run_id FROM tasks "
+            "ORDER BY id"
+        ).fetchall()
+        before_events = conn.execute("SELECT COUNT(*) AS n FROM task_events").fetchone()["n"]
+        before_runs = conn.execute("SELECT COUNT(*) AS n FROM task_runs").fetchone()["n"]
+
+        res = kbd.dispatch_once(conn, spawn_fn=fake_spawn)
+        promoted = kb.recompute_ready(conn)
+        triage_decompose = kanban_decompose.list_triage_ids()
+        triage_specify = kanban_specify.list_triage_ids()
+
+        after_rows = conn.execute(
+            "SELECT id, status, assignee, claim_lock, worker_pid, current_run_id FROM tasks "
+            "ORDER BY id"
+        ).fetchall()
+        after_events = conn.execute("SELECT COUNT(*) AS n FROM task_events").fetchone()["n"]
+        after_runs = conn.execute("SELECT COUNT(*) AS n FROM task_runs").fetchone()["n"]
+
+    assert not res.spawned and not res.crashed and not res.timed_out and not res.stale
+    assert not res.auto_blocked and not res.reclaimed and res.promoted == 0
+    assert promoted == 0
+    # The sweeps select status='triage'; a lane id appearing here means a lane leaked into
+    # the auto-decompose/specify input queue.
+    assert triage_decompose == []
+    assert triage_specify == []
+    assert [tuple(r) for r in after_rows] == [tuple(r) for r in before_rows]
+    assert after_events == before_events
+    assert after_runs == before_runs

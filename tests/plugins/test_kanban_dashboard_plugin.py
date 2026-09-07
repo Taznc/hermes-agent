@@ -1801,3 +1801,177 @@ def test_archive_done_skips_card_that_leaves_done_before_its_atomic_archive(clie
     assert response.json()["failures"] == []
     with kbc.connect() as conn:
         assert kb.get_task(conn, task_id).status == "todo"
+
+
+# ---------------------------------------------------------------------------
+# Roadmap lanes — columns, drag-drop transitions, POST /roadmap/idea
+# ---------------------------------------------------------------------------
+
+
+def test_board_renders_lane_columns_after_the_live_ones(client):
+    """The lanes are real columns (a status missing from BOARD_COLUMNS gets mis-bucketed
+    into ``todo``), and they trail every live column."""
+    r = client.get("/api/plugins/kanban/board")
+    names = [c["name"] for c in r.json()["columns"]]
+    assert names[-2:] == ["idea", "roadmap"]
+    assert names.index("done") < names.index("idea")
+
+
+def test_lane_card_is_bucketed_into_its_own_column(client):
+    with kbc.connect() as conn:
+        tid = kb.create_task(conn, title="wishlist item", lane="idea")
+    columns = {c["name"]: c["tasks"] for c in client.get("/api/plugins/kanban/board").json()["columns"]}
+    assert [t["id"] for t in columns["idea"]] == [tid]
+    assert columns["todo"] == []
+
+
+def test_patch_status_drags_between_lanes(client):
+    """Dragging idea <-> roadmap goes through refine/demote, leaving their events."""
+    with kbc.connect() as conn:
+        tid = kb.create_task(conn, title="wish", lane="idea")
+
+    r = client.patch(f"/api/plugins/kanban/tasks/{tid}", json={"status": "roadmap"})
+    assert r.status_code == 200, r.text
+    r = client.patch(f"/api/plugins/kanban/tasks/{tid}", json={"status": "idea"})
+    assert r.status_code == 200, r.text
+
+    with kbc.connect() as conn:
+        assert kb.get_task(conn, tid).status == "idea"
+        kinds = [e.kind for e in kb.list_events(conn, tid)]
+    assert "refined" in kinds and "demoted" in kinds
+
+
+def test_patch_status_dragging_roadmap_to_ready_spawns_it(client):
+    """Dragging a roadmap card into the work queue is an authorization, so it records
+    ``spawned_from_roadmap`` rather than a bare status write."""
+    with kbc.connect() as conn:
+        tid = kb.create_task(conn, title="wish", lane="roadmap")
+
+    r = client.patch(f"/api/plugins/kanban/tasks/{tid}", json={"status": "ready"})
+    assert r.status_code == 200, r.text
+    with kbc.connect() as conn:
+        assert kb.get_task(conn, tid).status == "ready"
+        assert "spawned_from_roadmap" in [e.kind for e in kb.list_events(conn, tid)]
+
+
+def test_patch_status_dragging_live_work_into_a_lane_is_a_400(client):
+    """The wishlist is entry-at-creation only; the refusal names the attempted from->to
+    so the UI can render an actionable toast."""
+    with kbc.connect() as conn:
+        tid = kb.create_task(conn, title="real work", assignee="alice")
+
+    r = client.patch(f"/api/plugins/kanban/tasks/{tid}", json={"status": "idea"})
+    assert r.status_code == 400, r.text
+    assert "-> 'idea'" in r.json()["detail"]
+    with kbc.connect() as conn:
+        assert kb.get_task(conn, tid).status == "ready"
+
+
+def test_bulk_lane_refusal_is_per_task_not_a_batch_abort(client):
+    """A refused lane move records its error on that entry and lets the rest proceed."""
+    with kbc.connect() as conn:
+        good = kb.create_task(conn, title="wish", lane="idea")
+        bad = kb.create_task(conn, title="real work", assignee="alice")
+
+    r = client.post(
+        "/api/plugins/kanban/tasks/bulk",
+        json={"ids": [good, bad], "status": "roadmap"},
+    )
+    assert r.status_code == 200, r.text
+    results = {e["id"]: e for e in r.json()["results"]}
+    assert results[good]["ok"] is True
+    assert results[bad]["ok"] is False
+    assert "-> 'roadmap'" in results[bad]["error"]
+
+    with kbc.connect() as conn:
+        assert kb.get_task(conn, good).status == "roadmap"
+        assert kb.get_task(conn, bad).status == "ready"
+
+
+def test_roadmap_idea_endpoint_creates_an_idea_card(client):
+    """The dashboard idea inbox now writes to the board, not ROADMAP.md — and the
+    ``{ok, reason}`` response shape is unchanged so shipped Desktop callers keep working."""
+    r = client.post("/api/plugins/kanban/roadmap/idea", json={"text": "Add a dark mode toggle"})
+    assert r.status_code == 200, r.text
+    assert r.json() == {"ok": True, "reason": None}
+
+    with kbc.connect() as conn:
+        tasks = kb.list_tasks(conn, status="idea")
+    assert [t.title for t in tasks] == ["Add a dark mode toggle"]
+    assert tasks[0].assignee is None
+
+
+def test_roadmap_idea_records_source_card_provenance(client):
+    with kbc.connect() as conn:
+        source = kb.create_task(conn, title="origin card", assignee="alice")
+
+    r = client.post(
+        "/api/plugins/kanban/roadmap/idea",
+        json={"text": "Split this out", "source_id": source},
+    )
+    assert r.status_code == 200, r.text
+    with kbc.connect() as conn:
+        idea = kb.list_tasks(conn, status="idea")[0]
+    assert source in (idea.body or "")
+
+
+def test_roadmap_idea_rejects_a_non_card_source_id(client):
+    """Provenance must match the canonical task-id shape, so a hostile value never
+    reaches the DB."""
+    r = client.post(
+        "/api/plugins/kanban/roadmap/idea",
+        json={"text": "An idea", "source_id": "t_evil\n<!-- injected -->"},
+    )
+    assert r.status_code == 422
+    with kbc.connect() as conn:
+        assert kb.list_tasks(conn, status="idea") == []
+
+
+def test_roadmap_idea_oversized_text_is_a_400_and_writes_nothing(client):
+    from hermes_dashboard_plugin_kanban_test import _ROADMAP_IDEA_MAX_LEN  # type: ignore
+
+    r = client.post(
+        "/api/plugins/kanban/roadmap/idea", json={"text": "x" * (_ROADMAP_IDEA_MAX_LEN + 1)},
+    )
+    assert r.status_code == 400
+    with kbc.connect() as conn:
+        assert kb.list_tasks(conn, status="idea") == []
+
+
+def test_roadmap_idea_at_max_length_is_stored_intact(client):
+    """A ``{"ok": true}`` must never mean part of the typed text was discarded."""
+    from hermes_dashboard_plugin_kanban_test import _ROADMAP_IDEA_MAX_LEN  # type: ignore
+
+    text = "y" * _ROADMAP_IDEA_MAX_LEN
+    r = client.post("/api/plugins/kanban/roadmap/idea", json={"text": text})
+    assert r.status_code == 200, r.text
+    with kbc.connect() as conn:
+        assert kb.list_tasks(conn, status="idea")[0].title == text
+
+
+def test_roadmap_idea_empty_text_is_fail_open_not_a_card(client):
+    r = client.post("/api/plugins/kanban/roadmap/idea", json={"text": "   \n\t  "})
+    assert r.status_code == 200
+    assert r.json() == {"ok": False, "reason": "empty_idea"}
+    with kbc.connect() as conn:
+        assert kb.list_tasks(conn, status="idea") == []
+
+
+def test_roadmap_idea_never_500s_when_the_write_fails(client, monkeypatch):
+    """Fail-open at the endpoint boundary: a broken capture must not take down the dialog."""
+    def boom(*a, **kw):
+        raise RuntimeError("db exploded")
+
+    monkeypatch.setattr(kb, "create_task", boom)
+    r = client.post("/api/plugins/kanban/roadmap/idea", json={"text": "An idea"})
+    assert r.status_code == 200
+    assert r.json() == {"ok": False, "reason": "roadmap_unavailable"}
+
+
+def test_roadmap_idea_unknown_board_is_a_404(client):
+    r = client.post(
+        "/api/plugins/kanban/roadmap/idea",
+        json={"text": "An idea"},
+        params={"board": "totally-unknown-board"},
+    )
+    assert r.status_code == 404
