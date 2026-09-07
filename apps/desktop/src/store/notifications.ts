@@ -16,6 +16,8 @@ export interface NotificationAction {
  * feature-specific renderer.
  */
 export interface NotificationContextCard {
+  /** Object name — e.g. the affected task, deployment, or import. */
+  title?: string
   /** Quiet state line, such as "Done · reviewer". */
   eyebrow?: string
   /** The most useful short outcome or description. */
