@@ -4057,30 +4057,60 @@ def _kanban_worker_result_exit_code(cli: "HermesCLI", result: Any) -> int:
         except Exception as exc:
             logger.debug("host quota circuit publication failed: %s", exc)
 
-    if not isinstance(result, Mapping) or not result.get("failed"):
-        return 0
-    if task_id and result.get("failure_reason") in ("rate_limit", "billing"):
-        # This run-scoped marker lets the reaper distinguish a validated
-        # deadline (neutral EX_TEMPFAIL) from a missing/malformed one (bounded
-        # infra interruption). It intentionally reuses the host publisher's
-        # structured-result parser instead of classifying error prose here.
-        if quota_published:
-            # Run-scoped, non-secret acknowledgement consumed by the reaper.
-            # It prevents the same observation being republished from the
-            # configured task route after the worker published its actual
-            # fallback provider.
-            print("host quota circuit published.", file=sys.stderr)
-        if quota_retry_after is None:
-            print("quota exhausted (429); retry deadline missing or malformed.", file=sys.stderr)
-        else:
-            print(f"quota exhausted (429); retry after {quota_retry_after}s.", file=sys.stderr)
-        try:
-            from hermes_cli.kanban_db import KANBAN_RATE_LIMIT_EXIT_CODE
+    if isinstance(result, Mapping) and result.get("failed"):
+        if task_id and result.get("failure_reason") in ("rate_limit", "billing"):
+            # This run-scoped marker lets the reaper distinguish a validated
+            # deadline (neutral EX_TEMPFAIL) from a missing/malformed one (bounded
+            # infra interruption). It intentionally reuses the host publisher's
+            # structured-result parser instead of classifying error prose here.
+            if quota_published:
+                # Run-scoped, non-secret acknowledgement consumed by the reaper.
+                # It prevents the same observation being republished from the
+                # configured task route after the worker published its actual
+                # fallback provider.
+                print("host quota circuit published.", file=sys.stderr)
+            if quota_retry_after is None:
+                print("quota exhausted (429); retry deadline missing or malformed.", file=sys.stderr)
+            else:
+                print(f"quota exhausted (429); retry after {quota_retry_after}s.", file=sys.stderr)
+            try:
+                from hermes_cli.kanban_db import KANBAN_RATE_LIMIT_EXIT_CODE
 
-            return KANBAN_RATE_LIMIT_EXIT_CODE
-        except Exception:
-            pass
-    return 1
+                return KANBAN_RATE_LIMIT_EXIT_CODE
+            except Exception:
+                pass
+        return 1
+
+    # The agent-side stop gate normally gets two chances to elicit a terminal
+    # tool call. If a text stop still reaches this boundary, record the missing
+    # lifecycle outcome while this worker still owns its run; do not wait for
+    # the dispatcher to infer an otherwise-successful rc=0 after reaping.
+    raw_run_id = (os.environ.get("HERMES_KANBAN_RUN_ID") or "").strip()
+    try:
+        expected_run_id = int(raw_run_id) if raw_run_id else None
+    except ValueError:
+        expected_run_id = None
+    if task_id and expected_run_id is not None:
+        try:
+            from hermes_cli import kanban_db_connect as _kbc
+            from hermes_cli import kanban_db_dispatch as _kbd
+
+            with _kbc.connect_closing(board=os.environ.get("HERMES_KANBAN_BOARD") or None) as conn:
+                recovery = _kbd.finalize_clean_worker_exit_without_report(
+                    conn, task_id, expected_run_id=expected_run_id,
+                )
+            if recovery is not None:
+                print(
+                    "kanban worker ended without a terminal lifecycle call; "
+                    f"recorded {recovery} before exit.",
+                    file=sys.stderr,
+                )
+                return 1
+        except Exception as exc:
+            # The reaper remains a conservative fallback if the early write
+            # cannot be made (e.g. a transient SQLite failure).
+            logger.debug("kanban clean-exit boundary recording failed: %s", exc)
+    return 0
 
 
 def _run_kanban_goal_loop_q(cli: "HermesCLI", first_response: str) -> None:

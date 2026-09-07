@@ -1461,7 +1461,79 @@ def test_clean_exit_protocol_violation_allows_only_one_blind_retry(kanban_home):
         gave_up = [event for event in kb.list_events(conn, tid) if event.kind == "gave_up"]
         assert len(gave_up) == 1
         assert (gave_up[0].payload or {}).get("protocol_violations") == 2
-        assert kbd._PROTOCOL_VIOLATION_FAILURE_LIMIT == 2
+    finally:
+        conn.close()
+
+
+def test_worker_boundary_parks_completion_handoff_without_blind_rerun(kanban_home, monkeypatch):
+    """A clean worker result parks a credible same-run handoff before process exit."""
+    import cli as cli_module
+
+    conn = kbc.connect()
+    try:
+        tid = kb.create_task(conn, title="recover-handoff", assignee="worker")
+        claimed = kb.claim_task(conn, tid)
+        assert claimed is not None and claimed.current_run_id is not None
+        kb.add_comment(
+            conn,
+            tid,
+            author="worker",
+            body=(
+                "Implementation complete. Commit deadbeef; focused regression tests "
+                "passed; diff is ready for review."
+            ),
+        )
+        monkeypatch.setenv("HERMES_KANBAN_TASK", tid)
+        monkeypatch.setenv("HERMES_KANBAN_BOARD", "default")
+        monkeypatch.setenv("HERMES_KANBAN_RUN_ID", str(claimed.current_run_id))
+
+        exit_code = cli_module._kanban_worker_result_exit_code(
+            SimpleNamespace(agent=SimpleNamespace(provider="test")),
+            {"failed": False, "final_response": "done"},
+        )
+
+        assert exit_code == 1
+        current = kb.get_task(conn, tid)
+        assert current is not None and current.status == "blocked"
+        assert "verify/recover prior work" in (current.last_failure_error or "")
+        kinds = [event.kind for event in kb.list_events(conn, tid)]
+        assert "protocol_violation" in kinds
+        assert "blocked" in kinds
+    finally:
+        conn.close()
+
+
+def test_worker_boundary_allows_one_no_evidence_recovery_then_blocks(kanban_home, monkeypatch):
+    """No handoff evidence gets exactly one recovery run, never an endless clean rerun."""
+    import cli as cli_module
+
+    conn = kbc.connect()
+    try:
+        tid = kb.create_task(conn, title="bounded-worker-boundary", assignee="worker")
+        monkeypatch.setenv("HERMES_KANBAN_TASK", tid)
+        monkeypatch.setenv("HERMES_KANBAN_BOARD", "default")
+        worker_cli = SimpleNamespace(agent=SimpleNamespace(provider="test"))
+
+        first = kb.claim_task(conn, tid)
+        assert first is not None and first.current_run_id is not None
+        monkeypatch.setenv("HERMES_KANBAN_RUN_ID", str(first.current_run_id))
+        assert cli_module._kanban_worker_result_exit_code(
+            worker_cli, {"failed": False, "final_response": "done"}
+        ) == 1
+        after_first = kb.get_task(conn, tid)
+        assert after_first is not None and after_first.status == "ready"
+
+        second = kb.claim_task(conn, tid)
+        assert second is not None and second.current_run_id is not None
+        monkeypatch.setenv("HERMES_KANBAN_RUN_ID", str(second.current_run_id))
+        assert cli_module._kanban_worker_result_exit_code(
+            worker_cli, {"failed": False, "final_response": "done"}
+        ) == 1
+        after_second = kb.get_task(conn, tid)
+        assert after_second is not None and after_second.status == "blocked"
+        gave_up = [event for event in kb.list_events(conn, tid) if event.kind == "gave_up"]
+        assert len(gave_up) == 1
+        assert (gave_up[0].payload or {}).get("protocol_violations") == 2
     finally:
         conn.close()
 
