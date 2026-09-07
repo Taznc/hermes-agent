@@ -12,6 +12,7 @@ import { Codicon } from '@/components/ui/codicon'
 import { Loader } from '@/components/ui/loader'
 import { getLocalModelsStatus } from '@/hermes'
 import { useI18n } from '@/i18n'
+import type { ThreadActivityPhase } from '@/lib/thread-activity'
 import { cn } from '@/lib/utils'
 import { $backgroundResume } from '@/store/background-delegation'
 import { sessionCompacting } from '@/store/compaction'
@@ -200,6 +201,36 @@ function useThreadSessionStatus() {
 // Long enough that a tool whose arguments arrive in a few frames never gets to
 // strobe a label, short enough that a real wait is named almost immediately.
 const DRAFTING_REVEAL_MS = 200
+const TERMINAL_ACTIVITY_MS = 2_000
+
+/** Keep a resolved activity visible long enough to be read. The row owns this
+ * purely presentational state: backend errors retain their existing rendering.
+ * Hidden/minimized windows do not wake for a terminal animation; the static
+ * success/failure glyph remains when the renderer is visible again. */
+function useTerminalActivity(working: boolean, failed: boolean): ThreadActivityPhase | null {
+  const [wasWorking, setWasWorking] = useState(working)
+  const [terminal, setTerminal] = useState<ThreadActivityPhase | null>(null)
+
+  useEffect(() => {
+    if (working) {
+      setWasWorking(true)
+      setTerminal(null)
+
+      return
+    }
+
+    if (!wasWorking) {
+      return
+    }
+
+    setWasWorking(false)
+    const terminalPhase = failed ? 'failure' : 'success'
+    setTerminal(terminalPhase)
+    window.setTimeout(() => setTerminal(current => (current === terminalPhase ? null : current)), TERMINAL_ACTIVITY_MS)
+  }, [failed, wasWorking, working])
+
+  return terminal
+}
 
 /**
  * What to call the wait, if it deserves a name. Compaction outranks a draft —
@@ -348,8 +379,15 @@ export const TurnActivityIndicator: FC = () => {
   // turn of a fresh chat — so the row can't wait for the store to catch up.
   const messageRunning = useAuiState(s => s.message.status?.type === 'running')
 
+  const recoverablyFailed = useAuiState(s => {
+    const type = (s.message.status as { type?: string } | undefined)?.type
+
+    return type === 'error' || type === 'incomplete'
+  })
+
   // Renderer-synthesized load bar (see ResponseLoadingIndicator).
   const working = busy || messageRunning
+  const terminal = useTerminalActivity(working, recoverablyFailed)
   const localLoad = useLocalModelLoad(working && !hint && !toolNarrating)
 
   useEffect(() => {
@@ -379,21 +417,24 @@ export const TurnActivityIndicator: FC = () => {
     compacting ? turnStartedAt : (quietSince ?? drafting?.since ?? turnStartedAt)
   )
 
-  if (!active) {
+  if (!active && !terminal) {
     return null
   }
 
+  const phase: ThreadActivityPhase = terminal ?? (compacting ? 'compacting' : hint ? 'working' : 'quiet')
+  const label = terminal === 'failure' ? 'Work needs attention' : terminal === 'success' ? 'Work complete' : hint || 'Hermes is working'
+
   return (
-    <StatusRow data-slot="aui_turn-activity" label={hint || 'Hermes is working'}>
+    <StatusRow data-slot="aui_turn-activity" data-terminal-activity={terminal ?? undefined} label={label}>
       <ThreadActivityMark
         elapsedSeconds={elapsed}
         hint={hint}
-        phase={compacting ? 'compacting' : hint ? 'working' : 'thinking'}
+        phase={phase}
         slot="turn"
       />
-      {hint ? (
+      {!terminal && hint ? (
         <WaitHint hint={hint} />
-      ) : localLoad ? (
+      ) : !terminal && localLoad ? (
         <ProgressHint label={t.assistant.thread.loadingLocalModel(localLoad.model)} percent={localLoad.percent} />
       ) : null}
       <ActivityTimerText seconds={elapsed} />

@@ -103,9 +103,7 @@ describe('the turn timer covers the gaps, not just the streaming', () => {
     expect(container.querySelector('[data-slot="aui_turn-activity"]')).toBeNull()
   })
 
-  it('stops when the session stops working', () => {
-    $busy.set(false)
-
+  it('keeps a completed operation visible briefly before settling the row away', () => {
     const { container } = render(
       <Harness
         messages={[userMessage('u1', 'do the thing'), assistant('a1', [{ type: 'text', text: 'Done.' }], false)]}
@@ -113,7 +111,17 @@ describe('the turn timer covers the gaps, not just the streaming', () => {
     )
 
     act(() => vi.advanceTimersByTime(7_000))
+    expect(container.querySelector('[data-slot="aui_turn-activity"]')).not.toBeNull()
 
+    act(() => $busy.set(false))
+
+    expect(container.querySelector('[data-terminal-activity="success"]')).not.toBeNull()
+    expect(container.querySelector('[data-activity-mark="success"]')).not.toBeNull()
+
+    act(() => vi.advanceTimersByTime(1_999))
+    expect(container.querySelector('[data-terminal-activity="success"]')).not.toBeNull()
+
+    act(() => vi.advanceTimersByTime(1))
     expect(container.querySelector('[data-slot="aui_turn-activity"]')).toBeNull()
   })
 })

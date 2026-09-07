@@ -32,11 +32,14 @@ export const THREAD_ACTIVITY_AREA = 'thread.activity'
  *                 pre-first-token spinner, or a quiet gap between tool calls).
  * - `working`   — the wait is named (`hint` is non-empty): a tool is being
  *                 drafted, or the provider told us what it is doing.
+ * - `quiet`     — a streaming turn has gone quiet between visible updates.
  * - `compacting`— auto-compaction owns the whole turn; `hint` is the fixed
  *                 compaction label and `elapsedSeconds` counts the turn, not
  *                 the gap.
+ * - `success` / `failure` — a terminal, recoverable outcome held briefly so
+ *                 the live row does not simply vanish when work resolves.
  */
-export type ThreadActivityPhase = 'thinking' | 'working' | 'compacting'
+export type ThreadActivityPhase = 'thinking' | 'working' | 'quiet' | 'compacting' | 'success' | 'failure'
 
 /** State handed to a `thread.activity` contribution's `render`. */
 export interface ThreadActivityState {

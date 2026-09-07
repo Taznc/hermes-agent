@@ -4,11 +4,12 @@ import { StatusPulse } from '@/components/ui/status-pulse'
 import { type Contribution, useContributions } from '@/contrib'
 import { ContribBoundary, ContribRender } from '@/contrib/react/boundary'
 import { useMediaQuery } from '@/hooks/use-media-query'
+import { AlertTriangle, Brain, Check, iconSize, Layers3, Pause, Wrench } from '@/lib/icons'
 import { THREAD_ACTIVITY_AREA, type ThreadActivityContribution, type ThreadActivityState } from '@/lib/thread-activity'
 
 /**
  * The transcript's active-work mark. Renders the registered `thread.activity`
- * contribution when one exists, and the core dither pulse when none does.
+ * contribution when one exists, and the core phase-aware mark when none does.
  *
  * Two properties this slot must never trade away, because the row around it is
  * what makes the app honest about working:
@@ -25,6 +26,24 @@ import { THREAD_ACTIVITY_AREA, type ThreadActivityContribution, type ThreadActiv
  * a state that says motion is fine when it isn't.
  */
 export type ThreadActivityMarkProps = Omit<ThreadActivityState, 'reducedMotion'>
+
+const CORE_MARKS = {
+  compacting: Layers3,
+  failure: AlertTriangle,
+  quiet: Pause,
+  success: Check,
+  thinking: Brain,
+  working: Wrench
+} as const
+
+const CORE_MARK_LABELS = {
+  compacting: 'Compacting',
+  failure: 'Work needs attention',
+  quiet: 'Waiting for the next update',
+  success: 'Work complete',
+  thinking: 'Thinking',
+  working: 'Working'
+} as const
 
 export const ThreadActivityMark: FC<ThreadActivityMarkProps> = state => {
   const contributions = useContributions(THREAD_ACTIVITY_AREA)
@@ -48,12 +67,19 @@ export const ThreadActivityMark: FC<ThreadActivityMarkProps> = state => {
   )
 
   if (!match || !renderMark) {
+    const Icon = CORE_MARKS[phase]
+
     return (
-      <StatusPulse
+      <span
         aria-hidden="true"
-        className="dither inline-block size-3.5 shrink-0 rounded-[3px] text-(--activity-strip-edge)"
-        kind="opacity"
-      />
+        className="relative inline-flex size-3.5 shrink-0 items-center justify-center text-(--activity-strip-edge)"
+        data-activity-mark={phase}
+        data-reduced-motion={reducedMotion ? '' : undefined}
+        data-state-label={CORE_MARK_LABELS[phase]}
+      >
+        <StatusPulse aria-hidden="true" className="absolute inset-0 rounded-sm bg-current/20" kind="opacity" />
+        <Icon className={iconSize.sm} />
+      </span>
     )
   }
 
