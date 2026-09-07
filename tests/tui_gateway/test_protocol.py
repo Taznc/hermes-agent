@@ -517,6 +517,115 @@ def test_clarify_batch_state_cleared_after_resolution(server):
         assert rid not in server._pending
 
 
+def test_clarify_explain_emits_question_help_without_resolving_pending_request(capture, monkeypatch):
+    """Clarify help is a read-only side channel: it never changes the blocking answer state."""
+    server, buf = capture
+    session = {"history": [{"role": "user", "content": "Deploy the app"}], "history_lock": threading.Lock()}
+    server._sessions["s1"] = session
+    ev = threading.Event()
+    with server._prompt_lock:
+        server._pending["clarify-1"] = ("s1", ev)
+        server._pending_prompt_payloads["clarify-1"] = ("clarify.request", {
+            "request_id": "clarify-1", "questions": [
+                {"qid": "target", "question": "Where should this deploy?", "choices": ["staging", "production"]},
+                {"qid": "window", "question": "When?", "choices": ["now", "later"]},
+            ],
+        })
+        server._batch_clarify["clarify-1"] = {"qids": ["target", "window"], "answers": {"window": "later"}}
+    try:
+        monkeypatch.setattr(server, "_spawn_clarify_explanation", lambda *args: "Use staging first.")
+        response = server.handle_request({"id": "help", "method": "clarify.explain", "params": {
+            "version": 1, "session_id": "s1", "request_id": "clarify-1", "question_id": "target",
+            "choice": "staging", "follow_up": "Why is this recommended?",
+        }})
+        assert response["result"] == {
+            "version": 1, "status": "complete", "explanation_id": response["result"]["explanation_id"],
+            "request_id": "clarify-1", "question_id": "target", "choice": "staging",
+        }
+        emitted = json.loads(buf.getvalue())
+        assert emitted["params"]["type"] == "clarify.explanation"
+        assert emitted["params"]["session_id"] == "s1"
+        assert emitted["params"]["payload"] == {
+            "explanation_id": response["result"]["explanation_id"], "request_id": "clarify-1",
+            "question_id": "target", "choice": "staging", "content": "Use staging first.",
+        }
+        with server._prompt_lock:
+            assert server._pending["clarify-1"] == ("s1", ev)
+            assert server._batch_clarify["clarify-1"]["answers"] == {"window": "later"}
+            assert "clarify-1" not in server._answers
+        assert not ev.is_set()
+    finally:
+        with server._prompt_lock:
+            server._pending.pop("clarify-1", None)
+            server._pending_prompt_payloads.pop("clarify-1", None)
+            server._batch_clarify.pop("clarify-1", None)
+
+
+def test_clarify_explain_rejects_expired_or_other_session_request(server, monkeypatch):
+    """The request id remains owned by its live clarification; it cannot leak across sessions."""
+    server._sessions.update({"owner": {"history": [], "history_lock": threading.Lock()},
+                             "other": {"history": [], "history_lock": threading.Lock()}})
+    ev = threading.Event()
+    with server._prompt_lock:
+        server._pending["owned"] = ("owner", ev)
+        server._pending_prompt_payloads["owned"] = ("clarify.request", {
+            "request_id": "owned", "question": "Continue?", "choices": ["yes", "no"]})
+    monkeypatch.setattr(server, "_spawn_clarify_explanation", lambda *args: "unused")
+    try:
+        other = server.handle_request({"id": "other", "method": "clarify.explain", "params": {
+            "session_id": "other", "request_id": "owned"}})
+        expired = server.handle_request({"id": "expired", "method": "clarify.explain", "params": {
+            "session_id": "owner", "request_id": "gone"}})
+        assert other["error"]["code"] == 4009
+        assert expired["error"]["code"] == 4009
+        assert not ev.is_set()
+    finally:
+        with server._prompt_lock:
+            server._pending.pop("owned", None)
+            server._pending_prompt_payloads.pop("owned", None)
+
+
+def test_clarify_explain_drops_result_if_clarification_resolves_during_generation(capture, monkeypatch):
+    """An in-flight explanation cannot revive a request interrupted while its no-tool helper runs."""
+    server, buf = capture
+    server._sessions["s1"] = {"history": [], "history_lock": threading.Lock()}
+    ev = threading.Event()
+    with server._prompt_lock:
+        server._pending["clarify-race"] = ("s1", ev)
+        server._pending_prompt_payloads["clarify-race"] = ("clarify.request", {
+            "request_id": "clarify-race", "question": "Continue?", "choices": ["yes", "no"]})
+
+    def resolve_while_generating(*_args):
+        with server._prompt_lock:
+            server._pending.pop("clarify-race", None)
+            server._pending_prompt_payloads.pop("clarify-race", None)
+        return "too late"
+
+    monkeypatch.setattr(server, "_spawn_clarify_explanation", resolve_while_generating)
+    response = server.handle_request({"id": "race", "method": "clarify.explain", "params": {
+        "session_id": "s1", "request_id": "clarify-race"}})
+    assert response["error"]["code"] == 4009
+    assert buf.getvalue() == ""
+    assert not ev.is_set()
+
+
+def test_clarify_explain_uses_compute_host_pending_snapshot(capture, monkeypatch):
+    """Turn-isolated sessions serve help from their relay-owned clarify snapshot without proxying an answer."""
+    server, buf = capture
+    server._sessions["isolated"] = {
+        "history": [], "history_lock": threading.Lock(), "_compute_host_pending_clarify": {
+            "request_id": "host-rid", "question": "Which region?", "choices": ["us-east", "eu-west"],
+        },
+    }
+    monkeypatch.setattr(server, "_spawn_clarify_explanation", lambda *args: "Choose the closest region.")
+    response = server.handle_request({"id": "host-help", "method": "clarify.explain", "params": {
+        "session_id": "isolated", "request_id": "host-rid", "choice": "eu-west"}})
+    assert response["result"]["request_id"] == "host-rid"
+    assert response["result"]["choice"] == "eu-west"
+    assert json.loads(buf.getvalue())["params"]["payload"]["content"] == "Choose the closest region."
+    assert server._sessions["isolated"]["_compute_host_pending_clarify"]["request_id"] == "host-rid"
+
+
 def test_clarify_block_helper_builds_batch_payload(capture):
     """_clarify_block forwards only wire fields (qid/question/choices/
     multi_select) — the tool-side normalized entries carry extra keys the

@@ -1074,6 +1074,132 @@ def _(rid, params: dict) -> dict:
 # popped) while the card is still visible; a late answer must not surface the raw 4009.
 
 
+_CLARIFY_EXPLAIN_VERSION = 1
+
+
+def _clarify_explain_snapshot(sid: str, request_id: str) -> dict | None:
+    """Copy the live clarify payload owned by ``sid`` without touching its Event or answers.
+
+    The snapshot is checked again after generation: no stale explanation is emitted if an
+    answer, interruption, or timeout resolved the clarification in the meantime. Explanations
+    are intentionally not replayed on reconnect; a client can request help again while the
+    clarification itself remains live and is the sole authoritative state.
+    """
+    with _prompt_lock:
+        entry = _pending.get(request_id)
+        if entry is not None and entry[0] == sid:
+            event, payload = _pending_prompt_payloads.get(request_id, ("", {}))
+            if event == "clarify.request" and isinstance(payload, dict):
+                snapshot = dict(payload)
+                if (batch := _batch_clarify.get(request_id)) is not None and batch["answers"]:
+                    snapshot["answers"] = dict(batch["answers"])
+                return snapshot
+    # Turn-isolated sessions keep the authoritative Event in the compute host. The parent
+    # owns only this read-only mirror, updated by relay on request/expire and cleared on turn end.
+    session = _sessions.get(sid)
+    if session is not None:
+        with session.get("history_lock", threading.Lock()):
+            mirrored = session.get("_compute_host_pending_clarify")
+            if isinstance(mirrored, dict) and mirrored.get("request_id") == request_id:
+                return dict(mirrored)
+    return None
+
+
+def _clarify_explain_target(rid, snapshot: dict, params: dict):
+    """Validate an optional question/choice target against the exact pending wire payload."""
+    raw_question_id = params.get("question_id")
+    if raw_question_id is not None and (not isinstance(raw_question_id, str) or not raw_question_id):
+        return None, None, _err(rid, 4004, "question_id must be a non-empty string")
+    question_id = raw_question_id or ""
+    choice = params.get("choice")
+    if choice is not None and not isinstance(choice, str):
+        return None, None, _err(rid, 4004, "choice must be a string")
+    raw_questions = snapshot.get("questions")
+    entries = ([q for q in raw_questions if isinstance(q, dict)] if isinstance(raw_questions, list)
+               else [{"qid": "", "question": snapshot.get("question", ""), "choices": snapshot.get("choices")}])
+    selected = None
+    if question_id:
+        selected = next((q for q in entries if str(q.get("qid") or "") == question_id), None)
+        if selected is None:
+            return None, None, _err(rid, 4002, f"unknown question_id {question_id!r}")
+    elif choice is not None:
+        if len(entries) != 1:
+            return None, None, _err(rid, 4004, "question_id required when targeting a batch choice")
+        selected = entries[0]
+    if choice is not None and selected is not None:
+        choices = selected.get("choices")
+        if not isinstance(choices, list) or choice not in choices:
+            return None, None, _err(rid, 4002, "choice is not offered by the target question")
+    return selected, choice, None
+
+
+def _clarify_explain_prompt(snapshot: dict, selected: dict | None, choice: str | None, follow_up: str) -> str:
+    """Build data-only instructions for the existing tool-denied side-question runner."""
+    questions = snapshot.get("questions")
+    if not isinstance(questions, list):
+        questions = [{"question": snapshot.get("question", ""), "choices": snapshot.get("choices")}]
+    scope = selected if selected is not None else {"questions": questions}
+    return (
+        "Explain a pending clarification concisely for the user. Use only the question, "
+        "offered choices, and conversation context. Do not answer the clarification, continue "
+        "the main task, expose private reasoning, or claim facts not in context.\n\n"
+        f"Pending clarification: {json.dumps(scope, ensure_ascii=False)}\n"
+        f"Target choice: {choice or '(overall question)'}\n"
+        f"User follow-up: {follow_up or '(none)'}")
+
+
+def _spawn_clarify_explanation(session: dict, prompt: str) -> str:
+    """Run a bounded, tool-denied side question against a history snapshot.
+
+    ``answer_side_question`` forks with an empty thread tool whitelist (or uses its no-tool
+    one-shot fallback), so it cannot execute tools, persist a transcript turn, invoke approvals,
+    or mutate the blocked main turn. The 180-second helper timeout bounds this RPC.
+    """
+    from agent.side_question import answer_side_question
+    agent = session.get("agent")
+    history = list(getattr(agent, "_session_messages", None) or session.get("history") or [])
+    main_runtime = {k: getattr(agent, k, None) for k in ("model", "provider", "base_url", "api_key", "api_mode")}
+    return answer_side_question(prompt, history, parent_agent=agent, main_runtime=main_runtime, timeout=180.0)
+
+
+@method("clarify.explain")
+def _(rid, params: dict) -> dict:
+    """Return non-terminal help for a pending clarification; answers still use clarify.respond."""
+    version = params.get("version", _CLARIFY_EXPLAIN_VERSION)
+    if isinstance(version, bool) or not isinstance(version, int) or version != _CLARIFY_EXPLAIN_VERSION:
+        return _err(rid, 4004, f"unsupported clarify.explain version {version!r}")
+    session, err = _sess(params, rid)
+    if err:
+        return err
+    request_id = params.get("request_id")
+    if not isinstance(request_id, str) or not request_id:
+        return _err(rid, 4006, "request_id required")
+    follow_up = params.get("follow_up", "")
+    if not isinstance(follow_up, str):
+        return _err(rid, 4004, "follow_up must be a string")
+    sid = str(params.get("session_id") or "")
+    snapshot = _clarify_explain_snapshot(sid, request_id)
+    if snapshot is None:
+        return _err(rid, 4009, "no live clarify request for this session")
+    selected, choice, target_err = _clarify_explain_target(rid, snapshot, params)
+    if target_err is not None:
+        return target_err
+    explanation_id = uuid.uuid4().hex
+    try:
+        content = _spawn_clarify_explanation(
+            session, _clarify_explain_prompt(snapshot, selected, choice, follow_up)).strip()
+    except Exception as exc:
+        return _err(rid, 5018, f"clarify explanation failed: {exc}")
+    if _clarify_explain_snapshot(sid, request_id) is None:
+        return _err(rid, 4009, "clarify request expired before explanation completed")
+    correlation = {"explanation_id": explanation_id, "request_id": request_id,
+                   **({"question_id": str(selected.get("qid") or "")}
+                   if selected is not None and selected.get("qid") else {}),
+                   **({"choice": choice} if choice is not None else {})}
+    _emit("clarify.explanation", sid, {**correlation, "content": content})
+    return _ok(rid, {"version": _CLARIFY_EXPLAIN_VERSION, "status": "complete", **correlation})
+
+
 @method("clarify.respond")
 def _(rid, params: dict) -> dict:
     if proxied := _respond_compute_host_clarify(rid, params):
