@@ -138,6 +138,11 @@ def _update_compute_host_clarify_snapshot(sid: str, session: dict, params: dict,
         elif question_id and isinstance(result.get("remaining"), list):
             pending["answers"] = {**(pending.get("answers") or {}),
                                   question_id: str(params.get("answer") or "")}
+            note = str(params.get("note") or "")
+            if note:
+                pending.setdefault("notes", {})[question_id] = note
+            elif (notes := pending.get("notes")) is not None:
+                notes.pop(question_id, None)
             if not result["remaining"]:
                 session.pop("_compute_host_pending_clarify", None)
 
@@ -164,6 +169,9 @@ def _respond_compute_host_clarify(rid: str, params: dict) -> dict | None:
     result = response.get("result")
     if not isinstance(result, dict):
         return _err(rid, 5019, "compute-host clarify response returned an invalid result")
+    note = str(params.get("note") or "")
+    if note and "note" not in result:
+        result = {**result, "note": note}
     _update_compute_host_clarify_snapshot(sid, session, params, result)
     return _ok(rid, result)
 
