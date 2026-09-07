@@ -32,6 +32,38 @@ export const forkJa: TranslationOverrides = {
       openLogsFailed: 'ログフォルダを開けませんでした'
     }
   },
+  composer: {
+    recommend: {
+      trigger: 'おすすめ',
+      presetLabel: 'おすすめの基準',
+      presets: {
+        balanced: 'バランス',
+        save_codex: 'Codex を温存',
+        best_quality: '品質優先'
+      },
+      presetUnsaved: 'このバックエンドでは保存されません — 今回のセッションのみ有効です。',
+      resultsLabel: 'モデルのおすすめ',
+      privacy:
+        '現在の下書きと添付ファイル名のみを確認します。会話履歴、ファイルの内容、プロジェクトファイルは送信されません。',
+      pending: '確認中…',
+      apply: '適用',
+      applyFailed: '適用できませんでした — 再試行するか、手動でモデルを選択してください。',
+      retry: '再試行',
+      failed: 'おすすめの取得に失敗しました。',
+      unavailable: '利用できるおすすめがありません。設定でおすすめ用ルーターを構成してください。',
+      unsupported: 'この Hermes バックエンドはおすすめ機能に対応していません。',
+      draftTooLong: 'この下書きは長すぎて確認できません。',
+      tooManyAttachments: '添付ファイルが多すぎて確認できません（最大 32 件）。',
+      attachmentUnsupported: '添付ファイル名が長すぎて確認できません。',
+      availability: {
+        failed: '空き状況の確認に失敗',
+        fresh: '最新',
+        stale: '空き状況が古い可能性',
+        unavailable: '利用不可',
+        unsupported: '空き状況は不明'
+      }
+    }
+  },
   settings: {
     gateway: {
       openLogsFailed: 'ログフォルダを開けませんでした'

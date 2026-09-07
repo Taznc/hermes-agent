@@ -1394,6 +1394,20 @@ export function ChatBar({
                       {controls}
                     </div>
                   </div>
+                  {/* >>> FORK ANCHOR: composer-model-recommendation <<<
+                      Flat row under the input — inside the composer surface, so
+                      it is not a card sitting on a card, and it wraps with the
+                      surface at narrow widths. The draft is read through a
+                      getter off the live DOM (the same source Enter uses), never
+                      a captured render value, so the recommendation always
+                      evaluates exactly what is on screen. Nothing renders until
+                      the owner supplies the seam. */}
+                  {state.model.recommendRender?.({
+                    attachments,
+                    disabled,
+                    getDraft: () =>
+                      editorRef.current ? composerPlainText(editorRef.current) : draftRef.current
+                  })}
                   <ContribSlot area={COMPOSER_AREAS.bottom} />
                 </div>
               </div>

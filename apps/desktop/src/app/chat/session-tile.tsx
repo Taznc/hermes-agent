@@ -31,6 +31,8 @@ import { $layoutTree, closeTreePane, moveTreePane, setTreeGroupTabStrip } from '
 import { $workspaceOwnerLabels, workspaceOwnerTitle } from '@/components/pane-shell/workspace-scope'
 import { Button } from '@/components/ui/button'
 import { ConfirmDialog } from '@/components/ui/confirm-dialog'
+// >>> FORK ANCHOR: composer-model-recommendation <<<
+import { ComposerRecommendForView } from '@/fork/composer-recommend'
 import { transcribeAudio } from '@/hermes'
 import { useI18n } from '@/i18n'
 import type { ChatMessage } from '@/lib/chat-messages'
@@ -65,6 +67,7 @@ import type { SessionInfo } from '@/types/hermes'
 
 import type { SessionDragPayload } from './composer/inline-refs'
 import { type ComposerScope, ComposerScopeProvider } from './composer/scope'
+import type { ComposerRecommendContext } from './composer/types'
 import { useComposerActions } from './hooks/use-composer-actions'
 import { paneMirror } from './pane-mirror'
 import { SessionDraftTitle } from './session-draft-title'
@@ -295,6 +298,35 @@ function TileChat({
     ]
   )
 
+  // >>> FORK ANCHOR: composer-model-recommendation <<<
+  // A tile's own recommendation surface, routed through this tile's gateway
+  // and its own `selectModel` — the session id comes from the tile's
+  // SessionView inside ComposerRecommendForView, so Apply lands on THIS
+  // runtime and never on the primary (which may be mid-turn).
+  const recommendRender = useMemo(
+    () =>
+      gatewayOpen
+        ? (ctx: ComposerRecommendContext) => (
+            <ComposerRecommendForView
+              attachments={ctx.attachments}
+              disabled={ctx.disabled}
+              getDraft={ctx.getDraft}
+              onSelectModel={selectModel}
+              profile={ownerRoute?.targetProfile || ownerRoute?.profile || activeGatewayProfile}
+              requestGateway={requestTileGateway}
+            />
+          )
+        : undefined,
+    [
+      activeGatewayProfile,
+      gatewayOpen,
+      ownerRoute?.profile,
+      ownerRoute?.targetProfile,
+      requestTileGateway,
+      selectModel
+    ]
+  )
+
   return (
     <SessionViewProvider value={view}>
       <ComposerScopeProvider value={scope}>
@@ -325,6 +357,7 @@ function TileChat({
           onThreadMessagesChange={actions.handleThreadMessagesChange}
           onToggleSelectedPin={noop}
           onTranscribeAudio={tileTranscribeAudio}
+          recommendRender={recommendRender}
           requestModelOptionsForOwner={requestTileGateway}
         />
       </ComposerScopeProvider>

@@ -76,6 +76,28 @@ export interface ForkTranslations {
     catchingUpNotice: string
     turnLostNotice: string
     turnLostRegenerate: string
+    /** Manual, advisory model-recommendation flow (`model_recommendation.get`). */
+    recommend: {
+      trigger: string
+      presetLabel: string
+      presets: { balanced: string; save_codex: string; best_quality: string }
+      presetUnsaved: string
+      resultsLabel: string
+      /** States the FINAL privacy boundary: draft + attachment metadata only. */
+      privacy: string
+      pending: string
+      apply: string
+      applyFailed: string
+      retry: string
+      failed: string
+      unavailable: string
+      unsupported: string
+      draftTooLong: string
+      tooManyAttachments: string
+      attachmentUnsupported: string
+      /** Never render `fresh` — only a non-live state is worth saying. */
+      availability: { failed: string; fresh: string; stale: string; unavailable: string; unsupported: string }
+    }
   }
   assistant: {
     thread: {

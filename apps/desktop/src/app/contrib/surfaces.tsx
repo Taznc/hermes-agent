@@ -13,12 +13,15 @@ import { Navigate, Route, Routes, useParams } from 'react-router'
 
 import { ContribBoundary, ContribRender } from '@/contrib/react/boundary'
 import { useContributions } from '@/contrib/react/use-contributions'
+// >>> FORK ANCHOR: composer-model-recommendation <<<
+import { ComposerRecommendForView } from '@/fork/composer-recommend'
 import { $activeConnectionId } from '@/store/connections'
 import { $gateway } from '@/store/gateway'
 import { $activeGatewayProfile } from '@/store/profile'
 import { $freshDraftReady, $gatewayState } from '@/store/session'
 
 import { ChatView } from '../chat'
+import type { ComposerRecommendContext } from '../chat/composer/types'
 import { ChatSidebar } from '../chat/sidebar'
 import { TerminalPaneChrome } from '../right-sidebar/terminal/chrome'
 import { contributedRoutes, NEW_CHAT_ROUTE, ROUTES_AREA, sessionRoute } from '../routes'
@@ -140,6 +143,29 @@ export const ChatRoutesSurface = memo(function ChatRoutesSurface({
 
   const chatActions = useMemo(() => latestChatActions(actions), [actions])
 
+  // >>> FORK ANCHOR: composer-model-recommendation <<<
+  // Built here for the same reason `modelMenuContent` is: the recommendation
+  // call and the Apply write are gateway operations, so they belong to whoever
+  // owns this view's route (profile + request + the session-aware selectModel),
+  // not to the composer. The composer contributes only the live draft and the
+  // attachment chips, which arrive as the render argument.
+  const recommendRender = useMemo(
+    () =>
+      gatewayState === 'open'
+        ? (ctx: ComposerRecommendContext) => (
+            <ComposerRecommendForView
+              attachments={ctx.attachments}
+              disabled={ctx.disabled}
+              getDraft={ctx.getDraft}
+              onSelectModel={actions.selectModel}
+              profile={activeGatewayProfile}
+              requestGateway={actions.requestGateway}
+            />
+          )
+        : undefined,
+    [actions, activeGatewayProfile, gatewayState]
+  )
+
   const chatView = (
     <ChatView
       gateway={gateway}
@@ -147,6 +173,7 @@ export const ChatRoutesSurface = memo(function ChatRoutesSurface({
       modelMenuContent={modelMenuContent}
       modelOptionsOwnerConnectionId={activeConnectionId || undefined}
       modelOptionsProfile={activeGatewayProfile}
+      recommendRender={recommendRender}
       requestModelOptionsForOwner={actions.requestGateway}
       {...chatActions}
     />
