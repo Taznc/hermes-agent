@@ -85,7 +85,10 @@ def test_restart_safe_gateway_child_fails_closed_without_scope(monkeypatch):
     monkeypatch.setenv("INVOCATION_ID", "managed-service")
     monkeypatch.setattr(process_registry, "_systemd_run_user_scope_available", lambda: False)
 
-    with pytest.raises(RuntimeError, match="systemd-run --user --scope is unavailable"):
+    with pytest.raises(
+        process_registry.RestartSafeScopeUnavailable,
+        match="systemd-run --user --scope is unavailable",
+    ):
         process_registry.restart_safe_supervised_child_argv(
             ["python", "worker.py"], unit_suffix="cron-job-1"
         )

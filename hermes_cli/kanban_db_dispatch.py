@@ -1900,25 +1900,27 @@ def _dispatch_pause_path(board: Optional[str]) -> Path:
 def read_dispatch_pause(board: Optional[str] = None) -> Optional[dict[str, Any]]:
     """Return the board's sticky dispatch pause, if any.
 
-    A malformed/unreadable sentinel fails closed. The operator can always clear
-    it with :func:`resume_dispatch`; silently treating it as absent would make a
-    partially written safety state widen dispatch.
+    JSON and the SQLite fallback are both authoritative. Unreadable state fails
+    closed; silently treating a damaged safety record as absent widens dispatch.
     """
+    from hermes_cli.kanban_db_dispatch_circuit import read_pause
+
     path = _dispatch_pause_path(board)
     try:
-        if not path.exists():
-            return None
-        raw = json.loads(path.read_text(encoding="utf-8"))
+        try:
+            text = path.read_text(encoding="utf-8")
+        except FileNotFoundError:
+            return read_pause(_kb.kanban_db_path(board))
+        raw = json.loads(text)
         if not isinstance(raw, dict) or not raw.get("reason"):
             raise ValueError("pause state must be an object with a reason")
         return raw
-    except FileNotFoundError:
-        return None
     except Exception as exc:
         return {
             "reason": "pause_state_unreadable",
             "detail": str(exc),
             "path": str(path),
+            "recovery": "repair dispatch-pause storage, then run `hermes kanban dispatch --resume-circuit`",
         }
 
 
@@ -1954,6 +1956,8 @@ def _write_dispatch_pause(
 
 def resume_dispatch(board: Optional[str] = None) -> dict[str, Any]:
     """Explicitly clear a board's sticky dispatch circuit after operator repair."""
+    from hermes_cli.kanban_db_dispatch_circuit import clear_pause
+
     _kb._assert_not_delegated_child_mutation()
     db_path = _kb.kanban_db_path(board=board)
     # The pause check and its removal must share the dispatch tick's board lock.
@@ -1971,6 +1975,9 @@ def resume_dispatch(board: Optional[str] = None) -> dict[str, Any]:
         previous = read_dispatch_pause(board)
         with contextlib.suppress(FileNotFoundError):
             path.unlink()
+        # Clear SQLite last: if this fails, the durable fallback still fences
+        # the next tick. Both stores are cleared under the board lock.
+        clear_pause(db_path)
     return {"was_paused": previous is not None, "previous": previous, "resumed": True}
 
 
@@ -2019,9 +2026,9 @@ def _defer_for_shared_launcher_prerequisite(
         event_kind = "dispatch_circuit_tripped"
     except Exception as pause_error:
         # A failure to persist the normal sentinel must never strand the
-        # already-claimed trigger or charge its task-local budget. This tick
-        # fails closed in memory, records the persistence defect in the board,
-        # and requires the same explicit operator recovery after storage repair.
+        # already-claimed trigger or charge its task-local budget. Persist the
+        # fallback in SQLite with the run receipt so later ticks/restarts see
+        # it too, independently of the triggering task's lifecycle.
         state = {
             "reason": "pause_persistence_failed",
             "fault_code": fault_code,
@@ -2029,7 +2036,7 @@ def _defer_for_shared_launcher_prerequisite(
             "error": error,
             "tripped_at": tripped_at,
             "pause_error": str(pause_error)[:500],
-            "recovery": "repair dispatch-pause storage, then run `hermes kanban dispatch --resume-circuit`",
+            "recovery": "repair dispatch-pause storage and the user scope prerequisite, then run `hermes kanban dispatch --resume-circuit`",
         }
         event_kind = "dispatch_circuit_persistence_failed"
     # The durable pause is authoritative for later ticks, but this tick must
@@ -2037,6 +2044,10 @@ def _defer_for_shared_launcher_prerequisite(
     # compare-and-swap below.
     result.dispatch_paused = state
     with _kb.write_txn(conn):
+        if event_kind == "dispatch_circuit_persistence_failed":
+            from hermes_cli.kanban_db_dispatch_circuit import persist_pause
+
+            persist_pause(conn, state)
         row = conn.execute(
             "SELECT current_run_id FROM tasks WHERE id = ? AND status = 'running'",
             (task.id,),
