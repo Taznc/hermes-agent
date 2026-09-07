@@ -610,8 +610,9 @@ export interface MessageReaction {
  * `actions` array alongside the compact summary text, so Desktop's
  * self-improvement transcript row can expand into the individual
  * add/replace/remove/create/patch/edit calls the review made — including
- * calls that FAILED (e.g. a write that would exceed the memory char
- * budget) — instead of collapsing everything into one opaque line.
+ * terminal no-op/skipped/declined/failed outcomes — instead of collapsing
+ * everything into one opaque line. Detail is intentionally redacted: it
+ * never carries stored memory/profile/skill text or raw tool output.
  * ROADMAP.md Phase 1 (Desktop transcript auditability). Field names mirror
  * the backend's snake_case wire shape, matching the rest of this file's
  * gateway-projected types.
@@ -627,6 +628,13 @@ export interface ReviewActionRecord {
   success: boolean
   /** The tool's own success/error message. */
   message: string
+  /** Newer backends' explicit terminal outcome; absent on older backends. */
+  state?: 'completed' | 'no_op' | 'skipped' | 'declined' | 'failed'
+  /** Short user-facing explanation with source content redacted. */
+  reason?: string
+  /** Bounded, generic before/after description with source content redacted. */
+  change_summary?: string
+  /** Deprecated raw previews from older backends. Never emitted by new backends. */
   content_preview?: string
   old_preview?: string
   new_preview?: string

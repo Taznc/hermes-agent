@@ -141,6 +141,37 @@ def test_review_summary_callback_survives_agent_without_attribute(server, monkey
     # If we got here, _init_session swallowed the AttributeError gracefully.
 
 
+def test_review_summary_callback_serializes_redacted_new_contract(server, monkeypatch):
+    monkeypatch.setattr(server, "_SlashWorker", lambda *a, **kw: object())
+    monkeypatch.setattr(server, "_wire_callbacks", lambda sid: None)
+    monkeypatch.setattr(server, "_notify_session_boundary", lambda *a, **kw: None)
+    monkeypatch.setattr(server, "_session_info", lambda agent, session=None: {"model": "m"})
+    monkeypatch.setattr(server, "_load_show_reasoning", lambda: False)
+    monkeypatch.setattr(server, "_load_tool_progress_mode", lambda: "all")
+    emits: list = []
+    monkeypatch.setattr(server, "_emit", lambda *args: emits.append(args))
+
+    class Agent:
+        model = "fake/model"
+        background_review_callback = None
+        background_review_detail_callback = None
+
+    agent = Agent()
+    server._init_session("sid-safe", "session-key", agent, [], cols=80)
+    emits.clear()
+    record = {
+        "target": "user", "label": "User profile", "operation": "replace",
+        "success": False, "message": "User profile replace did not complete.",
+        "state": "failed", "reason": "User profile replace did not complete.",
+        "change_summary": "No stored content was changed.",
+    }
+    callback = agent.background_review_detail_callback
+    assert callable(callback)
+    callback("💾 Self-improvement review: User profile update", [record])
+
+    assert emits == [("review.summary", "sid-safe", {"text": "💾 Self-improvement review: User profile update", "actions": [record]})]
+
+
 @pytest.mark.parametrize(
     "raw,expected",
     [

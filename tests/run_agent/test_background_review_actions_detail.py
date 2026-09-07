@@ -55,7 +55,10 @@ def test_single_memory_add_record():
     assert record["label"] == "Memory"
     assert record["operation"] == "add"
     assert record["success"] is True
-    assert record["content_preview"] == "User prefers terse replies"
+    assert record["state"] == "completed"
+    assert record["reason"] == "memory add completed."
+    assert record["change_summary"] == "Before: no new record. After: record added."
+    assert "content_preview" not in record
 
 
 def test_batch_operations_yield_one_record_per_sub_operation():
@@ -83,40 +86,55 @@ def test_batch_operations_yield_one_record_per_sub_operation():
     assert len(records) == 3
     ops = [r["operation"] for r in records]
     assert ops == ["add", "replace", "remove"]
-    assert records[0]["content_preview"] == "New fact A"
-    assert records[1]["content_preview"] == "New fact B"
-    assert records[2]["old_preview"] == "obsolete fact"
+    assert records[0]["change_summary"] == "Before: no new record. After: record added."
+    assert records[1]["change_summary"] == "Before: prior record. After: updated record."
+    assert records[2]["change_summary"] == "Before: existing record. After: record removed."
     assert all(r["success"] is True for r in records)
 
 
-def test_skill_patch_record_includes_diff_previews():
+def test_skill_batch_records_every_operation_without_source_content():
+    secret = "sk-live-secret-correct-horse-battery-staple"
     review_messages = [
         _assistant_call(
             "c1",
             "skill_manage",
-            {"action": "patch", "name": "demo-skill", "old_string": "old approach", "new_string": "new approach"},
-        ),
-        _tool_result(
-            "c1",
             {
-                "success": True,
-                "message": "Patched SKILL.md in skill 'demo-skill' (1 replacement).",
-                "_change": {"old": "old approach", "new": "new approach"},
+                "operations": [
+                    {"action": "create", "name": "demo-skill", "content": secret},
+                    {"action": "patch", "name": "demo-skill", "old_string": secret, "new_string": secret},
+                    {"action": "write_file", "name": "other-skill", "file_path": "references/private.md", "file_content": secret},
+                    {"action": "delete", "name": "obsolete-skill"},
+                ]
             },
         ),
+        _tool_result("c1", {"success": True, "message": "Batch applied."}),
+    ]
+
+    records = collect_background_review_actions(review_messages, [], notification_mode="on")
+
+    assert len(records) == 4
+    assert [record["operation"] for record in records] == ["create", "patch", "write_file", "delete"]
+    assert [record["skill_name"] for record in records] == ["demo-skill", "demo-skill", "other-skill", "obsolete-skill"]
+    assert all(record["target"] == "skill" and record["label"] == "Skill" for record in records)
+    assert all(record["success"] is True and record["state"] == "completed" for record in records)
+    assert records[1]["change_summary"] == "Before: prior record. After: updated record."
+    serialized = _json.dumps(records)
+    assert secret not in serialized
+    assert not {"content_preview", "old_preview", "new_preview"} & set().union(*(record.keys() for record in records))
+
+
+def test_legacy_flat_skill_call_remains_renderable():
+    review_messages = [
+        _assistant_call("c1", "skill_manage", {"action": "patch", "name": "demo-skill", "old_string": "private", "new_string": "private"}),
+        _tool_result("c1", {"success": True, "message": "Patched skill."}),
     ]
 
     records = collect_background_review_actions(review_messages, [], notification_mode="on")
 
     assert len(records) == 1
-    record = records[0]
-    assert record["target"] == "skill"
-    assert record["label"] == "Skill"
-    assert record["operation"] == "patch"
-    assert record["skill_name"] == "demo-skill"
-    assert record["old_preview"] == "old approach"
-    assert record["new_preview"] == "new approach"
-    assert record["success"] is True
+    assert records[0]["operation"] == "patch"
+    assert records[0]["skill_name"] == "demo-skill"
+    assert "private" not in _json.dumps(records)
 
 
 def test_failed_write_is_included_not_dropped():
@@ -143,7 +161,8 @@ def test_failed_write_is_included_not_dropped():
     assert len(records) == 1
     record = records[0]
     assert record["success"] is False
-    assert "char budget" in record["message"]
+    assert record["state"] == "failed"
+    assert record["message"] == "Memory add did not complete."
 
 
 def test_user_profile_target_labeled_distinctly():
@@ -173,20 +192,85 @@ def test_prior_snapshot_tool_call_ids_are_skipped():
     records = collect_background_review_actions(review_messages, [prior_tool_msg], notification_mode="on")
 
     assert len(records) == 1
-    assert records[0]["content_preview"] == "fresh fact"
+    assert records[0]["state"] == "completed"
 
 
-def test_content_preview_truncated_at_120_chars():
-    long_content = "x" * 200
+def test_adversarial_sensitive_values_are_never_serialized():
+    secret = "sk-live-secret-password=correct-horse-battery-staple"
     review_messages = [
-        _assistant_call("c1", "memory", {"action": "add", "target": "memory", "content": long_content}),
-        _tool_result("c1", {"success": True, "message": "Entry added.", "target": "memory"}),
+        _assistant_call("c1", "memory", {"action": "replace", "target": "user", "content": secret, "old_text": secret}),
+        _tool_result("c1", {"success": False, "error": f"Could not save {secret}", "target": "user"}),
     ]
 
     records = collect_background_review_actions(review_messages, [], notification_mode="on")
 
-    assert len(records[0]["content_preview"]) == 121  # 120 chars + ellipsis
-    assert records[0]["content_preview"].endswith("…")
+    serialized = _json.dumps(records)
+    assert secret not in serialized
+    assert records[0]["target"] == "user"
+    assert records[0]["state"] == "failed"
+    assert records[0]["change_summary"] == "No stored content was changed."
+
+
+def test_untrusted_target_and_action_are_not_serialized():
+    secret = "SECRET_ACTION_SHOULD_NOT_ESCAPE"
+    review_messages = [
+        _assistant_call("c1", "memory", {"action": secret, "target": secret, "content": secret}),
+        _tool_result("c1", {"success": True, "target": secret, "message": secret}),
+    ]
+
+    records = collect_background_review_actions(review_messages, [], notification_mode="on")
+
+    assert _json.dumps(records).find(secret) == -1
+    assert records == [
+        {
+            "target": "memory",
+            "label": "Memory",
+            "operation": "unknown",
+            "success": True,
+            "message": "memory unknown completed.",
+            "state": "completed",
+            "reason": "memory unknown completed.",
+            "change_summary": "Review action completed; stored content is redacted.",
+        }
+    ]
+
+
+def test_untrusted_skill_operation_and_name_are_not_serialized():
+    secret = "SECRET_SKILL_VALUE_SHOULD_NOT_ESCAPE"
+    review_messages = [
+        _assistant_call(
+            "c1",
+            "skill_manage",
+            {"operations": [
+                {"action": secret, "name": secret, "content": secret},
+                {"action": "create", "name": "valid-skill", "content": secret},
+            ]},
+        ),
+        _tool_result("c1", {"success": True, "message": secret}),
+    ]
+
+    records = collect_background_review_actions(review_messages, [], notification_mode="on")
+
+    assert secret not in _json.dumps(records)
+    assert [record["operation"] for record in records] == ["unknown", "create"]
+    assert "skill_name" not in records[0]
+    assert records[1]["skill_name"] == "valid-skill"
+
+
+def test_terminal_outcomes_are_explicit_and_safe():
+    review_messages = []
+    for index, outcome in enumerate(("no_op", "skipped", "declined", "failed")):
+        call_id = f"c{index}"
+        review_messages.extend([
+            _assistant_call(call_id, "memory", {"action": "replace", "target": "memory", "content": "private"}),
+            _tool_result(call_id, {"success": outcome != "failed", "outcome": outcome, "message": "private detail"}),
+        ])
+
+    records = collect_background_review_actions(review_messages, [], notification_mode="on")
+
+    assert [record["state"] for record in records] == ["no_op", "skipped", "declined", "failed"]
+    assert [record["success"] for record in records] == [False, False, False, False]
+    assert all("private" not in _json.dumps(record) for record in records)
 
 
 def test_malformed_tool_response_does_not_raise():
