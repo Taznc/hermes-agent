@@ -1037,14 +1037,26 @@ describe('ClarifyTool batch card', () => {
   })
 
   it('uses plain Enter to advance a batch draft without creating a newline', () => {
-    renderLiveBatch()
+    const request = renderLiveBatch()
 
     const colorDraft = screen.getByPlaceholderText('Other (type your answer)')
     fireEvent.change(colorDraft, { target: { value: 'green' } })
-    fireEvent.keyDown(colorDraft, { key: 'Enter' })
 
+    expect(fireEvent.keyDown(colorDraft, { key: 'Enter' })).toBe(false)
     expect((colorDraft as HTMLTextAreaElement).value).toBe('green')
     expect(document.activeElement).toBe(screen.getByPlaceholderText('Type your answer…'))
+    expect(request).not.toHaveBeenCalled()
+  })
+
+  it('cancels plain Enter in an empty batch draft without submitting or moving focus', () => {
+    const request = renderLiveBatch()
+    const colorDraft = screen.getByPlaceholderText('Other (type your answer)')
+    colorDraft.focus()
+
+    expect(fireEvent.keyDown(colorDraft, { key: 'Enter' })).toBe(false)
+    expect((colorDraft as HTMLTextAreaElement).value).toBe('')
+    expect(document.activeElement).toBe(colorDraft)
+    expect(request).not.toHaveBeenCalled()
   })
 
   it('does not cancel Shift+Enter so the browser can insert a newline in a batch draft', () => {
@@ -1055,6 +1067,54 @@ describe('ClarifyTool batch card', () => {
 
     expect(fireEvent.keyDown(colorDraft, { key: 'Enter', shiftKey: true })).toBe(true)
     expect((colorDraft as HTMLTextAreaElement).value).toBe('green')
+  })
+
+  it('saves a batch note and advances to the next unanswered question on plain Enter', () => {
+    const request = renderLiveBatch()
+    fireEvent.click(screen.getByRole('button', { name: /^[A-Z]red/ }))
+    fireEvent.click(screen.getByRole('button', { name: 'Add note for red' }))
+    const note = screen.getByRole('textbox', { name: 'Note for red' })
+    fireEvent.change(note, { target: { value: 'Keep this note.' } })
+
+    expect(fireEvent.keyDown(note, { key: 'Enter' })).toBe(false)
+    expect((note as HTMLTextAreaElement).value).toBe('Keep this note.')
+    expect(document.activeElement).toBe(screen.getByPlaceholderText('Type your answer…'))
+    expect(request).not.toHaveBeenCalled()
+  })
+
+  it('leaves Shift+Enter and IME Enter in a batch note to the browser', () => {
+    const request = renderLiveBatch()
+    fireEvent.click(screen.getByRole('button', { name: /^[A-Z]red/ }))
+    fireEvent.click(screen.getByRole('button', { name: 'Add note for red' }))
+    const note = screen.getByRole('textbox', { name: 'Note for red' })
+    fireEvent.change(note, { target: { value: 'Keep this note.' } })
+
+    expect(fireEvent.keyDown(note, { key: 'Enter', shiftKey: true })).toBe(true)
+    expect(fireEvent.keyDown(note, { isComposing: true, key: 'Enter' })).toBe(true)
+    expect(request).not.toHaveBeenCalled()
+  })
+
+  it('confirms a ready batch from note Enter and includes the note once', async () => {
+    const request = renderLiveBatch()
+    fireEvent.click(screen.getByRole('button', { name: /^[A-Z]red/ }))
+    fireEvent.click(screen.getByRole('button', { name: 'Add note for red' }))
+    const note = screen.getByRole('textbox', { name: 'Note for red' })
+    fireEvent.change(note, { target: { value: 'Keep this note.' } })
+    fireEvent.change(screen.getByPlaceholderText('Type your answer…'), { target: { value: 'Release' } })
+
+    expect(fireEvent.keyDown(note, { key: 'Enter' })).toBe(false)
+    await waitFor(() => expect(request).toHaveBeenCalledTimes(2))
+    expect(request).toHaveBeenNthCalledWith(1, 'clarify.respond', {
+      answer: 'red',
+      note: 'Keep this note.',
+      question_id: 'q0',
+      request_id: 'request-batch'
+    })
+    expect(request).toHaveBeenNthCalledWith(2, 'clarify.respond', {
+      answer: 'Release',
+      question_id: 'q1',
+      request_id: 'request-batch'
+    })
   })
 
   it('confirm sends every per-question lock in order and completes the batch', async () => {

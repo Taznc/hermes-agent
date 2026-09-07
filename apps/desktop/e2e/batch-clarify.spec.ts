@@ -157,6 +157,24 @@ test.describe('batch clarify card', () => {
       )
       .toBe(true)
     await fixture!.app.evaluate(({ BrowserWindow }) => {
+      BrowserWindow.getAllWindows()[0].setSize(720, 1400)
+    })
+    await expect
+      .poll(() =>
+        batchCard.evaluate(form => {
+          const bounds = form.getBoundingClientRect()
+
+          return bounds.top >= -1 && bounds.bottom <= window.innerHeight + 1
+        })
+      )
+      .toBe(true)
+    await expect(firstQuestion.getByText(BATCH_CLARIFY_QUESTIONS[0].question)).toBeVisible()
+    await expect(followUp).toBeVisible()
+    await test.info().attach('clarify-card-narrow-open-ask', {
+      body: await page.screenshot(),
+      contentType: 'image/png'
+    })
+    await fixture!.app.evaluate(({ BrowserWindow }) => {
       BrowserWindow.getAllWindows()[0].setSize(1220, 900)
     })
     await page.evaluate(() => {
