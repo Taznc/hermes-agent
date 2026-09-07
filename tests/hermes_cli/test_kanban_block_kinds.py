@@ -51,6 +51,26 @@ def _make_running_again(conn, tid):
     assert kb.claim_task(conn, tid, claimer="worker") is not None
 
 
+def test_initial_block_records_deliberate_reason_while_parent_gated_creation_is_todo(kanban_home: Path) -> None:
+    """Explicit creation gates are auditable; ordinary parent waits use todo."""
+    with kbc.connect_closing() as conn:
+        gated = kb.create_task(
+            conn, title="operator gate", initial_status="blocked",
+            body="Precondition: obtain approval.",
+        )
+        event = kb.list_events(conn, gated)[-1]
+
+        assert event.kind == "blocked"
+        assert event.payload == {
+            "intentional_initial_block": True,
+            "reason": "This task was deliberately created blocked. Check the card precondition and description before unblocking.",
+        }
+
+        parent = kb.create_task(conn, title="unfinished parent")
+        child = kb.create_task(conn, title="dependent child", parents=[parent])
+        assert kb.get_task(conn, child).status == "todo"
+
+
 # ---------------------------------------------------------------------------
 # Loop breaker
 # ---------------------------------------------------------------------------

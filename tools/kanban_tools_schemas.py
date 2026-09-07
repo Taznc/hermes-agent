@@ -428,10 +428,11 @@ KANBAN_CREATE_SCHEMA = _schema(
             "type": "string",
             "enum": ["running", "blocked"],
             "description": (
-                "Initial card status. Use 'blocked' for tasks that "
-                "require immediate human ops (R3 gate) to skip the "
-                "brief running-to-blocked transition. Defaults to "
-                "'running', which preserves the usual dispatch path."
+                "Initial card status. Use 'blocked' only for tasks that "
+                "need an immediate human-ops gate (R3). A task waiting only "
+                "on parent links must use the default: it lands in todo and "
+                "auto-promotes. Defaults to 'running', which preserves the "
+                "usual dispatch path."
             ),
         },
         "skills": {

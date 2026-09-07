@@ -114,6 +114,48 @@ describe('CtaBanner', () => {
     expect(onMove).toHaveBeenCalledWith('ready')
   })
 
+  it('initially blocked: identifies the deliberate creation gate without treating it as a worker failure', () => {
+    const task = baseTask({ status: 'blocked', block_kind: null })
+
+    render(
+      <CtaBanner
+        comments={[]}
+        events={[
+          {
+            ...blockedEvent('Check the card precondition.'),
+            payload: { intentional_initial_block: true, reason: 'Check the card precondition.' }
+          }
+        ]}
+        onFocusComment={vi.fn()}
+        onMove={vi.fn()}
+        onSubmitChoice={vi.fn()}
+        task={task}
+      />
+    )
+
+    expect(screen.getByText('ctaInitialBlockTitle')).toBeTruthy()
+    expect(screen.queryByText('ctaBlockedTitle')).toBeNull()
+    expect(screen.getByText('Check the card precondition.')).toBeTruthy()
+  })
+
+  it('automatic block: retains the ordinary blocked classification', () => {
+    const task = baseTask({ status: 'blocked', block_kind: null })
+
+    render(
+      <CtaBanner
+        comments={[]}
+        events={[blockedEvent('The worker process disappeared unexpectedly.')]}
+        onFocusComment={vi.fn()}
+        onMove={vi.fn()}
+        onSubmitChoice={vi.fn()}
+        task={task}
+      />
+    )
+
+    expect(screen.getByText('ctaBlockedTitle')).toBeTruthy()
+    expect(screen.queryByText('ctaInitialBlockTitle')).toBeNull()
+  })
+
   it('blocked with no reason recorded: falls back to explanatory copy', () => {
     const task = baseTask({ status: 'blocked', block_kind: null })
 

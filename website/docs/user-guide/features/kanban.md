@@ -215,6 +215,14 @@ hermes kanban stats
 
 When the dispatcher picks up `t_abcd` and spawns the `researcher` profile, the very first thing that worker's model does is call `kanban_show()` to read its task. It doesn't run `hermes kanban show t_abcd`.
 
+### Creation gates and dependency gates
+
+Use an explicit initial `blocked` status only when a card deliberately needs an
+operator precondition before any work can begin. Creation records that decision
+and directs readers to the card's precondition/body; it is not a worker failure.
+For work that merely waits for parent cards, create it normally with its parent
+links. It enters `todo` and promotes automatically after its parents complete.
+
 ### Gateway-embedded dispatcher (default)
 
 The dispatcher runs inside the gateway process. Nothing to install, no
