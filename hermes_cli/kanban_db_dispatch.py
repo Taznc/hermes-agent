@@ -3784,6 +3784,90 @@ def _open_worker_log(task: Task, board: Optional[str]):
     return log_f
 
 
+def _worker_log_stamper_argv(log_path: Path) -> list[str]:
+    """argv for the standalone per-line timestamp filter.
+
+    Invoked by absolute script path with this interpreter, so it needs neither
+    the ``hermes_cli`` package on ``PYTHONPATH`` nor an external binary.
+    """
+    from hermes_cli import kanban_log_stamp
+
+    return [sys.executable, os.path.abspath(kanban_log_stamp.__file__), str(log_path)]
+
+
+def _start_worker_log_stamper(
+    task: Task, log_path: Path
+) -> "Optional[tuple[Any, int]]":
+    """Start the timestamp filter and return ``(proc, write_fd)``, or None.
+
+    The worker's stdout/stderr is wired to ``write_fd`` instead of straight to
+    the log file; the filter on the other end stamps each line and appends it.
+
+    The filter is spawned through the SAME restart-safe path as the worker
+    (own session, and its own transient systemd scope when this dispatcher is
+    supervised). That is load-bearing, not defensive: left inside a supervised
+    dispatcher's cgroup, ``systemctl restart`` would kill the filter, close the
+    read end of the pipe, and SIGPIPE a live worker that was supposed to
+    survive the restart.
+
+    Returns None — and the caller falls back to today's byte-for-byte raw
+    ``stdout=log_f`` spawn — whenever the filter cannot be established. A
+    logging refinement must never stall the board or endanger a worker.
+    """
+    if task.current_run_id is None:
+        # Mirrors _restart_safe_worker_argv: never mint an untraceable scope.
+        return None
+    try:
+        argv = _worker_log_stamper_argv(log_path)
+    except Exception:
+        return None
+    stamper_env = dict(os.environ)
+    try:
+        from tools.process_registry import restart_safe_supervised_child_argv
+
+        argv = restart_safe_supervised_child_argv(
+            argv,
+            unit_suffix=f"kanban-log-{task.id}-run-{task.current_run_id}",
+            env=stamper_env,
+        )
+    except Exception as exc:
+        _kb._log.warning(
+            "kanban: could not place the worker-log timestamp filter for %s in a "
+            "restart-safe scope (%s); logging this run without timestamps",
+            task.id, exc,
+        )
+        return None
+    try:
+        read_fd, write_fd = os.pipe()
+    except OSError:
+        return None
+    try:
+        proc = subprocess.Popen(  # noqa: S603 -- argv is a fixed list built above
+            argv,
+            stdin=read_fd,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            env=stamper_env,
+            start_new_session=True,
+            creationflags=subprocess.CREATE_NO_WINDOW if _kb._IS_WINDOWS else 0,
+        )
+    except Exception as exc:
+        with contextlib.suppress(OSError):
+            os.close(read_fd)
+        with contextlib.suppress(OSError):
+            os.close(write_fd)
+        _kb._log.warning(
+            "kanban: worker-log timestamp filter failed to start for %s (%s); "
+            "logging this run without timestamps", task.id, exc,
+        )
+        return None
+    # Only the filter needs the read end; holding a copy here would keep the
+    # pipe from ever reaching EOF.
+    with contextlib.suppress(OSError):
+        os.close(read_fd)
+    return proc, write_fd
+
+
 def _restart_safe_worker_argv(
     task: Task,
     command: list[str],
@@ -4173,12 +4257,19 @@ def _default_spawn(task: Task, workspace: str, *, board: Optional[str] = None) -
     task.worker_unit = launcher_unit or restart_safe_unit
     env.update(_worker_launcher_env_overrides(prefix))
     log_f = _open_worker_log(task, board)
+    # Per-line wall-clock timestamps: the worker writes into a pipe whose other
+    # end is a standalone filter process that stamps each line and appends it to
+    # the same log file. ``stamper`` is None when the filter could not be
+    # started, in which case the worker's fd goes straight to the log exactly as
+    # it did before timestamps existed.
+    stamper = _start_worker_log_stamper(task, Path(log_f.name))
+    worker_stdout = stamper[1] if stamper else log_f
     try:
         proc = subprocess.Popen(  # noqa: S603 -- argv is a fixed list built above
             cmd,
             cwd=workspace if os.path.isdir(workspace) else None,
             stdin=subprocess.DEVNULL,
-            stdout=log_f,
+            stdout=worker_stdout,
             stderr=subprocess.STDOUT,
             env=env,
             start_new_session=True,
@@ -4186,12 +4277,26 @@ def _default_spawn(task: Task, workspace: str, *, board: Optional[str] = None) -
         )
     except FileNotFoundError:
         log_f.close()
+        if stamper:
+            with contextlib.suppress(OSError):
+                os.close(stamper[1])
         raise RuntimeError(
             "`hermes` executable not found on PATH. "
             "Install Hermes Agent or activate its venv before running the kanban dispatcher."
         )
-    # Intentionally NOT closing log_f: the child keeps writing after return;
-    # the OS-level FD stays open in the child until it exits.
+    if stamper:
+        # The worker now owns the only writing end of the pipe; this copy must
+        # go or the filter never sees EOF and never exits. ``log_f`` likewise:
+        # with the filter appending, this process holding the file open serves
+        # nothing.
+        with contextlib.suppress(OSError):
+            os.close(stamper[1])
+        log_f.close()
+    # Intentionally NOT closing log_f in the un-stamped path: the child keeps
+    # writing after return; the OS-level FD stays open in the child until it
+    # exits. The stamped path preserves that survival property through the
+    # filter process, which is spawned into its own session/scope for exactly
+    # this reason.
     return proc.pid
 
 
