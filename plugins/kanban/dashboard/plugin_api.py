@@ -1981,6 +1981,7 @@ def list_profile_roster():
         profiles = profiles_mod.list_profiles()
     return {"profiles": [
         {"name": p.name, "is_default": bool(p.is_default), "model": p.model or "", "provider": p.provider or "",
+         "reasoning_effort": p.reasoning_effort or "",
          "description": p.description or "", "description_auto": bool(p.description_auto),
          "skill_count": int(p.skill_count or 0)}
         for p in profiles]}

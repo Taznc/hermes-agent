@@ -359,7 +359,7 @@ _SPECS = [
         _arg("--dry-run", action="store_true", help="Don't actually spawn processes; just print what would happen"),
         _arg("--max", type=int, help="Cap number of spawns this pass"),
         _arg("--resume-circuit", action="store_true",
-             help="Clear this board's manual safety pause (or rate-limit status) and exit"),
+             help="Clear this board's dispatch pause after operator recovery and exit"),
         _arg("--circuit-status", action="store_true",
              help="Show this board's rate-limit or manual dispatch-safety state and exit"),
         _arg("--failure-limit", type=int, default=kbd.DEFAULT_FAILURE_LIMIT,

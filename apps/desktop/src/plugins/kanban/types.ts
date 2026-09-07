@@ -303,6 +303,12 @@ export interface KanbanProfile {
   is_default: boolean
   description: string
   description_auto: boolean
+  /** The profile's own configured model/provider/depth — what a worker
+   *  actually runs when the task carries no override. Empty = unset
+   *  (provider defaults) or an older backend that doesn't report them. */
+  model?: string
+  provider?: string
+  reasoning_effort?: string
 }
 
 /** Column presentation — codicon + tone only. Labels + help live in i18n

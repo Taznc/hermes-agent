@@ -69,7 +69,14 @@ def _cmd_dispatch(args: argparse.Namespace) -> int:
         cleared = kbd.resume_dispatch(board)
         if getattr(args, "json", False):
             _print_json(cleared, ascii=True)
-        else:
+        if not cleared.get("resumed", True):
+            if not getattr(args, "json", False):
+                print(
+                    f"Dispatch circuit for {board or kb.DEFAULT_BOARD} was not resumed: "
+                    "a dispatch tick is in progress; repair then retry --resume-circuit."
+                )
+            return 1
+        if not getattr(args, "json", False):
             state = cleared.get("previous") or {}
             suffix = f" (was {state.get('reason')})" if state else " (was not paused)"
             print(f"Dispatch circuit resumed for {board or kb.DEFAULT_BOARD}{suffix}.")

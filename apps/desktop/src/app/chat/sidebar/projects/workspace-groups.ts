@@ -119,6 +119,25 @@ export const DEFAULT_BRANCH_LABEL = 'main'
 export const NO_PROJECT_ID = '__no_project__'
 
 /**
+ * Home is a catch-all, not a folder, so it does NOT fold across profiles the way
+ * a shared checkout does: the all-profiles fan-out re-keys a non-default
+ * profile's bucket to `__no_project__::<profile>` (see `_scope_home_to_profile`
+ * in `hermes_cli/web_routers/profiles.py`). Without that, a worker profile's
+ * cwd-less provisioning chatter sits in the user's own Home, where archiving it
+ * looks like a no-op. `default` keeps the bare id so scope/new-session
+ * behaviour keyed on `NO_PROJECT_ID` is unchanged for the common case.
+ */
+export const homeProjectId = (profile?: null | string): string => {
+  const name = (profile ?? '').trim()
+
+  return !name || name === 'default' ? NO_PROJECT_ID : `${NO_PROJECT_ID}::${name}`
+}
+
+/** True for the Home bucket of ANY profile — never compare against `NO_PROJECT_ID` alone. */
+export const isHomeProjectId = (id?: null | string): boolean =>
+  id === NO_PROJECT_ID || (id ?? '').startsWith(`${NO_PROJECT_ID}::`)
+
+/**
  * A session with nowhere to be placed: no cwd and no recorded repo root. These
  * are the rows the Home bucket owns, and the only ones the live overlay can
  * hand it — a row WITH a cwd that the backend still couldn't place (junk root,
@@ -653,7 +672,13 @@ function overlayHomeLane(
   removed: ReadonlySet<string>
 ): SidebarProjectTree {
   const lane = project.repos[0]?.groups[0]
-  const detached = live.filter(session => isDetachedSession(session) && !removed.has(session.id) && !isLiveArchived(session))
+  // Another profile's Home owns rows THIS client's live list never carries, so
+  // only the launch profile's bucket absorbs detached live sessions; a foreign
+  // Home stays exactly as its own store reported it.
+  const ownsLive = project.id === NO_PROJECT_ID
+  const detached = ownsLive
+    ? live.filter(session => isDetachedSession(session) && !removed.has(session.id) && !isLiveArchived(session))
+    : []
   const kept = (lane?.sessions ?? []).filter(session => !removed.has(session.id))
 
   if (!detached.length && kept.length === (lane?.sessions.length ?? 0)) {
@@ -661,11 +686,11 @@ function overlayHomeLane(
   }
 
   const sessions = detached.reduce(upsertSession, kept)
-  const nextLane = { id: NO_PROJECT_ID, label: project.label, path: null, sessions }
+  const nextLane = { id: project.id, label: project.label, path: null, sessions }
 
   return {
     ...project,
-    repos: [{ id: NO_PROJECT_ID, label: project.label, path: null, groups: [nextLane], sessionCount: sessions.length }],
+    repos: [{ id: project.id, label: project.label, path: null, groups: [nextLane], sessionCount: sessions.length }],
     sessionCount: sessions.length
   }
 }
@@ -797,6 +822,9 @@ export function overlayLivePreviews(
       continue
     }
 
+    // A detached live row belongs to THIS client's own Home. Foreign profiles'
+    // Home buckets get their rows from their own store's snapshot, never from
+    // the local live list (`homeProjectId` keys those separately).
     const projectId =
       liveSessionProjectId(session, explicitProjects) ?? (isDetachedSession(session) ? NO_PROJECT_ID : null)
 
