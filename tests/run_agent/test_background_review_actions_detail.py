@@ -103,6 +103,7 @@ def test_skill_batch_records_every_operation_without_source_content():
                     {"action": "create", "name": "demo-skill", "content": secret},
                     {"action": "patch", "name": "demo-skill", "old_string": secret, "new_string": secret},
                     {"action": "write_file", "name": "other-skill", "file_path": "references/private.md", "file_content": secret},
+                    {"action": "delete", "name": "obsolete-skill"},
                 ]
             },
         ),
@@ -111,9 +112,9 @@ def test_skill_batch_records_every_operation_without_source_content():
 
     records = collect_background_review_actions(review_messages, [], notification_mode="on")
 
-    assert len(records) == 3
-    assert [record["operation"] for record in records] == ["create", "patch", "write_file"]
-    assert [record["skill_name"] for record in records] == ["demo-skill", "demo-skill", "other-skill"]
+    assert len(records) == 4
+    assert [record["operation"] for record in records] == ["create", "patch", "write_file", "delete"]
+    assert [record["skill_name"] for record in records] == ["demo-skill", "demo-skill", "other-skill", "obsolete-skill"]
     assert all(record["target"] == "skill" and record["label"] == "Skill" for record in records)
     assert all(record["success"] is True and record["state"] == "completed" for record in records)
     assert records[1]["change_summary"] == "Before: prior record. After: updated record."
@@ -208,6 +209,52 @@ def test_adversarial_sensitive_values_are_never_serialized():
     assert records[0]["target"] == "user"
     assert records[0]["state"] == "failed"
     assert records[0]["change_summary"] == "No stored content was changed."
+
+
+def test_untrusted_target_and_action_are_not_serialized():
+    secret = "SECRET_ACTION_SHOULD_NOT_ESCAPE"
+    review_messages = [
+        _assistant_call("c1", "memory", {"action": secret, "target": secret, "content": secret}),
+        _tool_result("c1", {"success": True, "target": secret, "message": secret}),
+    ]
+
+    records = collect_background_review_actions(review_messages, [], notification_mode="on")
+
+    assert _json.dumps(records).find(secret) == -1
+    assert records == [
+        {
+            "target": "memory",
+            "label": "Memory",
+            "operation": "unknown",
+            "success": True,
+            "message": "memory unknown completed.",
+            "state": "completed",
+            "reason": "memory unknown completed.",
+            "change_summary": "Review action completed; stored content is redacted.",
+        }
+    ]
+
+
+def test_untrusted_skill_operation_and_name_are_not_serialized():
+    secret = "SECRET_SKILL_VALUE_SHOULD_NOT_ESCAPE"
+    review_messages = [
+        _assistant_call(
+            "c1",
+            "skill_manage",
+            {"operations": [
+                {"action": secret, "name": secret, "content": secret},
+                {"action": "create", "name": "valid-skill", "content": secret},
+            ]},
+        ),
+        _tool_result("c1", {"success": True, "message": secret}),
+    ]
+
+    records = collect_background_review_actions(review_messages, [], notification_mode="on")
+
+    assert secret not in _json.dumps(records)
+    assert [record["operation"] for record in records] == ["unknown", "create"]
+    assert "skill_name" not in records[0]
+    assert records[1]["skill_name"] == "valid-skill"
 
 
 def test_terminal_outcomes_are_explicit_and_safe():

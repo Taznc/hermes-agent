@@ -11,6 +11,7 @@ import copy
 import json
 import logging
 import os
+import re
 import threading
 from contextlib import contextmanager, suppress
 from dataclasses import dataclass, field
@@ -816,7 +817,11 @@ def collect_background_review_actions(
 
         success = bool(data.get("success"))
         is_skill = detail.get("tool") == "skill_manage"
-        target = data.get("target", "") or detail.get("target", "")
+        # Never expose target or operation values received from a tool call or
+        # response. They are untrusted text just like the stored content this
+        # record deliberately redacts.
+        requested_target = detail.get("target")
+        target = "user" if not is_skill and requested_target == "user" else "memory"
 
         if is_skill:
             label = "Skill"
@@ -825,7 +830,20 @@ def collect_background_review_actions(
         else:
             label = "Memory"
 
-        action = detail.get("action", "") or "unknown"
+        memory_operations = {"add", "replace", "remove"}
+        skill_operations = {"create", "patch", "delete", "write_file", "remove_file"}
+        allowed_operations = skill_operations if is_skill else memory_operations
+
+        def _safe_operation(value: Any) -> str:
+            return value if isinstance(value, str) and value in allowed_operations else "unknown"
+
+        def _safe_skill_name(value: Any) -> Optional[str]:
+            """Return only a schema-shaped public skill identifier."""
+            if isinstance(value, str) and re.fullmatch(r"[a-z0-9][a-z0-9_-]{0,63}", value):
+                return value
+            return None
+
+        action = _safe_operation(detail.get("action"))
         operations = detail.get("operations")
         operations = operations if isinstance(operations, list) else []
         target_name = "skill" if is_skill else (target or "memory")
@@ -844,7 +862,9 @@ def collect_background_review_actions(
                 "change_summary": _change_summary(operation, outcome),
             }
             if is_skill and isinstance(skill_name, str) and skill_name:
-                record["skill_name"] = skill_name
+                safe_name = _safe_skill_name(skill_name)
+                if safe_name:
+                    record["skill_name"] = safe_name
             return record
 
         if operations:
@@ -854,7 +874,7 @@ def collect_background_review_actions(
             for op in operations:
                 if not isinstance(op, dict):
                     continue
-                op_act = op.get("action", "") or "unknown"
+                op_act = _safe_operation(op.get("action"))
                 records.append(_record(op_act, op.get("name") if is_skill else None))
         else:
             records.append(_record(action, detail.get("name") if is_skill else None))
