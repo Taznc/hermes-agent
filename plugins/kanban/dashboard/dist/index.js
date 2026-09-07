@@ -1287,6 +1287,7 @@
           },
         }) : null,
         h(OrchestrationPanel, null),
+        h(QuotaCircuitBanner, null),
         h(AttentionStrip, {
           boardData,
           onOpen: setSelectedTaskId,
@@ -1359,6 +1360,66 @@
           requestDialog: function (req) { return kanbanDialogs.request(req); },
         }) : null,
       ),
+    );
+  }
+
+  // -------------------------------------------------------------------------
+  // Host quota circuit — shared across every board/profile on this machine.
+  // -------------------------------------------------------------------------
+
+  function QuotaCircuitBanner() {
+    const [circuits, setCircuits] = useState([]);
+    const [message, setMessage] = useState("");
+
+    const load = useCallback(function () {
+      return SDK.fetchJSON(`${API}/quota-circuits`).then(function (payload) {
+        setCircuits((payload && payload.circuits) || []);
+      }).catch(function (err) {
+        setMessage("Quota diagnostics unavailable: " + (err.message || String(err)));
+      });
+    }, []);
+
+    useEffect(function () {
+      load();
+      const timer = setInterval(load, 30000);
+      return function () { clearInterval(timer); };
+    }, [load]);
+
+    const clearCircuit = function (group) {
+      setMessage("");
+      SDK.fetchJSON(`${API}/quota-circuits/${encodeURIComponent(group)}`, {
+        method: "DELETE",
+      }).then(function () {
+        setMessage("Quota circuit cleared.");
+        load();
+      }).catch(function (err) {
+        setMessage("Clear failed: " + (err.message || String(err)));
+      });
+    };
+
+    if (circuits.length === 0 && !message) return null;
+    return h("div", { className: "hermes-kanban-quota-circuits", role: "status" },
+      h("div", { className: "hermes-kanban-quota-title" },
+        "Host quota circuit active — matching account budget groups are deferred"),
+      circuits.map(function (circuit) {
+        return h("div", { className: "hermes-kanban-quota-row", key: circuit.group },
+          h("div", { className: "hermes-kanban-quota-detail" },
+            h("strong", null, circuit.group),
+            " · " + circuit.reason,
+            " · First observed " + new Date(circuit.first_observed_at * 1000).toLocaleString(),
+            " · Last observed " + new Date(circuit.last_observed_at * 1000).toLocaleString(),
+            " · Next eligible " + new Date(circuit.next_eligible_at * 1000).toLocaleString(),
+            " · Boards deferred " + circuit.boards_deferred,
+            " · Cards deferred " + circuit.cards_deferred,
+          ),
+          h("button", {
+            type: "button",
+            className: "hermes-kanban-quota-clear",
+            onClick: function () { clearCircuit(circuit.group); },
+          }, "Clear circuit"),
+        );
+      }),
+      message ? h("div", { className: "hermes-kanban-quota-message" }, message) : null,
     );
   }
 

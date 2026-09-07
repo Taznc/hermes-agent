@@ -4103,6 +4103,21 @@ def _run_quiet_single_query(cli, effective_query):
     # without this sync it would point at the ended parent after compression.
     _sync_cli_session_id_from_agent(cli)
     response = result.get("final_response", "") if isinstance(result, dict) else str(result)
+    # Publish a verified account/budget deadline to the host-wide Kanban
+    # circuit before this process emits EX_TEMPFAIL and before a board-local
+    # reaper can observe the exit. The helper is inert for non-quota results,
+    # unmapped routes, and malformed/missing deadlines.
+    if os.environ.get("HERMES_KANBAN_TASK"):
+        try:
+            from hermes_cli.kanban_quota_circuit import publish_worker_quota_result
+            publish_worker_quota_result(
+                result,
+                task_id=os.environ.get("HERMES_KANBAN_TASK"),
+                board=os.environ.get("HERMES_KANBAN_BOARD"),
+                provider=getattr(cli.agent, "provider", None),
+            )
+        except Exception as _quota_publish_exc:
+            logger.debug("host quota circuit publication failed: %s", _quota_publish_exc)
     # Surface backend errors that produced no visible output (e.g. invalid model slug
     # -> provider 4xx) on stderr so piped stdout stays clean.
     if (

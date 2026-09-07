@@ -164,6 +164,48 @@ as `infra` (bumping the interruption streak) but never parks a task in
 `scheduled`, so a quota signature with no usable backoff cannot loop the
 dispatcher indefinitely without ever reaching the interruption cap.
 
+## Host-wide account/budget circuits
+
+Per-board provider backoff cannot protect another board, and a provider name
+is not an account identity. The optional host circuit therefore has no inferred
+default. Configure opaque, non-secret budget-group labels explicitly:
+
+```yaml
+kanban:
+  quota_budget_groups:
+    primary-wallet:
+      providers: [openai-codex]
+      profiles: [implementer, reviewer]
+  quota_resume_spread_seconds: 30
+```
+
+A pinned route matches only when both its provider and profile are listed; `*`
+is accepted only when deliberately configured. For `provider=auto`, every group
+configured for the profile is a candidate: dispatch is allowed only while at
+least one candidate is healthy, then the worker publishes the provider it
+actually selected before its machine-readable `EX_TEMPFAIL` exit. An automatic
+route with no configured candidates remains outside this circuit. Do not put
+email addresses, account IDs, keys, tokens, or vendor subscription identifiers
+in group names. The dispatcher and dashboard expose only a stable
+`budget-<hash>` handle.
+
+The first quota event with a valid retry deadline is recorded in
+`<kanban-home>/kanban/quota-circuits.db`, outside every board DB. SQLite
+`BEGIN IMMEDIATE`, WAL, and an upsert serialize concurrent board dispatchers;
+simultaneous observations extend one row and do not affect task failure
+budgets. Matching ready and review routes are guarded across all boards while
+unrelated groups continue. At the deadline one dispatcher atomically acquires
+a recovery probe; remaining matching starts are held for
+`quota_resume_spread_seconds`. A renewed quota signal extends the same circuit;
+otherwise it self-clears after the spread to avoid a cross-board restart burst.
+In-flight workers are never killed.
+
+The dashboard's host quota banner shows the opaque group, reason, first/last
+observation, next eligible time, and deferred board/card counts. Its **Clear
+circuit** button is the manual override. `GET /api/plugins/kanban/quota-circuits`
+and `DELETE /api/plugins/kanban/quota-circuits/{budget-handle}` provide the same
+sanitized diagnostic/control surface.
+
 ## Config keys
 
 * `kanban.count_infra_failures` (bool, default `false`) — when `true`,
@@ -181,7 +223,14 @@ dispatcher indefinitely without ever reaching the interruption cap.
   classify as `infra` and bump the interruption streak, they just never
   reach `scheduled`). Overridable via `HERMES_KANBAN_PROVIDER_BACKOFF`.
 * `kanban.provider_backoff_max_seconds` (int, default `86400`) — cap on
-  a single provider pause; larger `retry after Ns` values are clamped.
+  both a single per-board provider pause and a host budget-group circuit;
+  larger `retry after Ns` values are clamped.
+* `kanban.quota_budget_groups` (mapping, default `{}`) — explicit opaque
+  budget-group labels mapped to `providers` and `profiles`. Empty disables
+  host-wide grouping rather than conflating independent accounts.
+* `kanban.quota_resume_spread_seconds` (int, default `30`) — delay after the
+  first post-deadline recovery probe before the remaining matching routes are
+  released.
 
 ## Upstream-ability
 

@@ -1719,6 +1719,22 @@ DEFAULT_CONFIG = {
         # it follows the bounded interruption policy (max_infra_interruptions) instead.
         # Default 24h. Parse only positive base-10 integer retry-after values.
         "provider_backoff_max_seconds": 86400,
+        # Optional host-wide account/budget quota circuits. Empty by default:
+        # provider names are not account identities, and credential selection
+        # happens inside the worker. Operators explicitly map opaque, non-secret
+        # group labels to provider/profile routes, for example:
+        # quota_budget_groups:
+        #   primary-wallet:
+        #     providers: [openai-codex]
+        #     profiles: [implementer, reviewer]
+        # A route matches both lists; `*` is accepted only when written. Auto
+        # routes must list `auto` explicitly and may list multiple candidate
+        # groups, dispatching only while at least one remains healthy.
+        "quota_budget_groups": {},
+        # At a circuit deadline, admit one probe globally, then hold other
+        # matching starts this many seconds. A renewed quota event extends the
+        # circuit; otherwise the circuit clears automatically after the spread.
+        "quota_resume_spread_seconds": 30,
         # Max consecutive infra interruptions (external SIGTERM/SIGKILL, startup-window
         # dead pid, quota signature including malformed/missing retry-after) before the
         # task is routed through normal counted failure accounting. Default 3; minimum
