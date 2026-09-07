@@ -6,6 +6,17 @@ under the shared Kanban home so separate board dispatchers coordinate before
 starting workers.  Account identity is never inferred from a provider name:
 operators explicitly assign opaque, non-secret budget-group labels to
 provider/profile routes.
+
+Lifecycle of one circuit row:
+
+* ``paused`` — ``next_eligible_at`` is in the future; every matching start on
+  every board is deferred.
+* ``recovering`` — the deadline passed.  Exactly one dispatcher wins the
+  recovery probe; every later matching start takes a serialized slot
+  (``next_slot_at``, advanced by the resume spread per admission) so recovery
+  is metered host-wide instead of bursting.  The row auto-clears once no
+  further start has been admitted for a full recovery window.  A renewed
+  quota failure re-arms it as ``paused``.
 """
 from __future__ import annotations
 
@@ -19,6 +30,11 @@ from typing import Any, Mapping, Optional
 
 _log = logging.getLogger(__name__)
 _DEFAULT_RESUME_SPREAD_SECONDS = 30
+# A recovering circuit disarms once no matching start has been admitted for
+# this many spreads: contenders that never got observed during the pause
+# (another board's dispatcher had not ticked yet) are still metered, while a
+# drained backlog does not keep the group throttled forever.
+_RECOVERY_IDLE_SPREADS = 4
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS quota_circuits (
     budget_group       TEXT PRIMARY KEY,
@@ -27,7 +43,8 @@ CREATE TABLE IF NOT EXISTS quota_circuits (
     first_observed_at  INTEGER NOT NULL,
     last_observed_at   INTEGER NOT NULL,
     observations       INTEGER NOT NULL DEFAULT 1,
-    resume_probe_at    INTEGER
+    resume_probe_at    INTEGER,
+    next_slot_at       INTEGER
 );
 CREATE TABLE IF NOT EXISTS quota_circuit_sources (
     budget_group TEXT NOT NULL,
@@ -63,6 +80,9 @@ def _connect() -> sqlite3.Connection:
     conn.execute("PRAGMA busy_timeout=30000")
     conn.execute("PRAGMA journal_mode=WAL")
     conn.executescript(_SCHEMA)
+    columns = {row["name"] for row in conn.execute("PRAGMA table_info(quota_circuits)")}
+    if "next_slot_at" not in columns:
+        conn.execute("ALTER TABLE quota_circuits ADD COLUMN next_slot_at INTEGER")
     return conn
 
 
@@ -86,20 +106,23 @@ def sanitized_group_label(group: str) -> str:
     return f"budget-{digest}"
 
 
+def _kanban_config() -> Mapping[str, Any]:
+    try:
+        from hermes_cli.config import load_config_readonly
+
+        value = (load_config_readonly() or {}).get("kanban") or {}
+    except Exception:
+        return {}
+    return value if isinstance(value, Mapping) else {}
+
+
 def configured_budget_groups() -> Mapping[str, Any]:
     """Read explicit ``kanban.quota_budget_groups`` configuration.
 
     No inferred default is intentional: a provider can serve many independent
     wallets, and provider-wide grouping would suppress healthy accounts.
     """
-    try:
-        from hermes_cli.config import load_config_readonly
-
-        value = ((load_config_readonly() or {}).get("kanban") or {}).get(
-            "quota_budget_groups", {}
-        )
-    except Exception:
-        return {}
+    value = _kanban_config().get("quota_budget_groups", {})
     return value if isinstance(value, Mapping) else {}
 
 
@@ -159,10 +182,10 @@ def resolve_task_budget_groups(
 
     A pinned route matches only when both its provider and profile are listed
     (``*`` is accepted explicitly). For ``provider=auto``, every explicitly
-    mapped group for the profile is a candidate: dispatch proceeds only while
-    at least one is unpaused, and the worker publishes the provider it actually
-    selected. A pinned provider with overlapping groups is ambiguous and fails
-    closed to no group.
+    mapped group for the profile is a candidate; :func:`task_quota_guard`
+    then admits the task only when runtime resolution provably lands on an
+    unpaused candidate. A pinned provider with overlapping groups is
+    ambiguous and fails closed to no group.
     """
     provider, profile = _task_route(conn, task_id)
     if not provider or not profile:
@@ -197,6 +220,38 @@ def resolve_task_budget_group(
     return groups[0] if len(groups) == 1 else None
 
 
+def _profile_home(profile: str) -> Path:
+    from hermes_constants import get_default_hermes_root
+
+    root = Path(get_default_hermes_root())
+    return root if profile == "default" else root / "profiles" / profile
+
+
+def predict_auto_provider(profile: str) -> Optional[str]:
+    """Predict which provider ``provider=auto`` resolves to for ``profile``.
+
+    Runs the worker's own resolution ladder (:func:`hermes_cli.auth.resolve_provider`)
+    under the profile's Hermes home, so the answer reflects that profile's
+    config, ``.env`` and OAuth state rather than the dispatcher's. Returns
+    ``None`` when resolution fails or is unavailable; callers treat that as
+    unprovable and fail closed.
+    """
+    from hermes_constants import reset_hermes_home_override, set_hermes_home_override
+
+    token = set_hermes_home_override(_profile_home(profile))
+    try:
+        from hermes_cli.auth import resolve_provider
+
+        provider = resolve_provider("auto")
+    except Exception as exc:
+        _log.debug("kanban quota circuit: auto resolution for %s failed: %s", profile, exc)
+        return None
+    finally:
+        reset_hermes_home_override(token)
+    provider = str(provider or "").strip().lower()
+    return provider or None
+
+
 def _clamped_delay(retry_after: Optional[int], max_seconds: int) -> Optional[int]:
     if isinstance(retry_after, bool) or not isinstance(retry_after, int) or retry_after <= 0:
         return None
@@ -224,14 +279,15 @@ def register_quota_circuit(
         conn.execute(
             """INSERT INTO quota_circuits(
                    budget_group, next_eligible_at, reason, first_observed_at,
-                   last_observed_at, observations, resume_probe_at
-               ) VALUES (?, ?, ?, ?, ?, 1, NULL)
+                   last_observed_at, observations, resume_probe_at, next_slot_at
+               ) VALUES (?, ?, ?, ?, ?, 1, NULL, NULL)
                ON CONFLICT(budget_group) DO UPDATE SET
                    next_eligible_at = MAX(quota_circuits.next_eligible_at, excluded.next_eligible_at),
                    reason = excluded.reason,
                    last_observed_at = excluded.last_observed_at,
                    observations = quota_circuits.observations + 1,
-                   resume_probe_at = NULL""",
+                   resume_probe_at = NULL,
+                   next_slot_at = NULL""",
             (group, until, str(reason or "quota"), observed_at, observed_at),
         )
         conn.execute(
@@ -244,7 +300,7 @@ def register_quota_circuit(
         row = conn.execute(
             "SELECT * FROM quota_circuits WHERE budget_group = ?", (group,)
         ).fetchone()
-    return _public_state(dict(row), boards_deferred=0, cards_deferred=0)
+    return _public_state(dict(row), boards_deferred=0, cards_deferred=0, now=observed_at)
 
 
 def publish_worker_quota_result(
@@ -323,15 +379,15 @@ def publish_worker_quota_result(
 
 def _resume_spread_seconds() -> int:
     try:
-        from hermes_cli.config import load_config_readonly
-
-        raw = ((load_config_readonly() or {}).get("kanban") or {}).get(
-            "quota_resume_spread_seconds", _DEFAULT_RESUME_SPREAD_SECONDS
-        )
-        value = int(raw)
+        value = int(_kanban_config().get("quota_resume_spread_seconds", _DEFAULT_RESUME_SPREAD_SECONDS))
         return max(1, value)
     except Exception:
         return _DEFAULT_RESUME_SPREAD_SECONDS
+
+
+def _recovery_window_seconds() -> int:
+    """Idle time after the last granted slot before a recovering circuit clears."""
+    return _resume_spread_seconds() * _RECOVERY_IDLE_SPREADS
 
 
 def _record_deferral(
@@ -348,6 +404,126 @@ def _record_deferral(
     )
 
 
+def _drop_deferral(conn: sqlite3.Connection, group: str, task_id: str) -> None:
+    """An admitted card no longer counts as deferred demand."""
+    conn.execute(
+        "DELETE FROM quota_circuit_deferrals WHERE budget_group = ? AND task_id = ?",
+        (group, task_id),
+    )
+
+
+def _delete_group(conn: sqlite3.Connection, group: str) -> None:
+    conn.execute("DELETE FROM quota_circuits WHERE budget_group = ?", (group,))
+    conn.execute("DELETE FROM quota_circuit_sources WHERE budget_group = ?", (group,))
+    conn.execute("DELETE FROM quota_circuit_deferrals WHERE budget_group = ?", (group,))
+
+
+def _sweep_finished(conn: sqlite3.Connection, now: int) -> None:
+    """Drop recovering rows whose serialized recovery has gone idle.
+
+    A row is finished once the deadline passed, the probe went out and the
+    last granted slot expired a full recovery window ago with no further
+    admission. Rows in the ``paused`` state are never swept here — only
+    expiry, a manual clear or a completed recovery ends a pause.
+    """
+    rows = conn.execute(
+        """SELECT budget_group FROM quota_circuits
+           WHERE next_eligible_at <= ? AND resume_probe_at IS NOT NULL
+             AND COALESCE(next_slot_at, resume_probe_at + ?) + ? <= ?""",
+        (now, _resume_spread_seconds(), _recovery_window_seconds(), now),
+    ).fetchall()
+    for row in rows:
+        _delete_group(conn, str(row["budget_group"]))
+
+
+def _guard_group(
+    host: sqlite3.Connection,
+    group: str,
+    task_id: str,
+    now: int,
+    *,
+    consume: bool,
+) -> Optional[str]:
+    """Return the guard reason for one group, granting a probe/slot when ``consume``."""
+    row = host.execute(
+        "SELECT * FROM quota_circuits WHERE budget_group = ?", (group,)
+    ).fetchone()
+    if row is None:
+        return None
+    if int(row["next_eligible_at"]) > now:
+        return "host_quota_circuit"
+    spread = _resume_spread_seconds()
+    probe_at = row["resume_probe_at"]
+    if probe_at is None:
+        if not consume:
+            return None
+        updated = host.execute(
+            "UPDATE quota_circuits SET resume_probe_at = ?, next_slot_at = ? "
+            "WHERE budget_group = ? AND resume_probe_at IS NULL",
+            (now, now + spread, group),
+        )
+        if updated.rowcount:
+            _drop_deferral(host, group, task_id)
+            return None
+        row = host.execute(
+            "SELECT * FROM quota_circuits WHERE budget_group = ?", (group,)
+        ).fetchone()
+        probe_at = row["resume_probe_at"]
+    slot_at = row["next_slot_at"]
+    slot_at = int(probe_at) + spread if slot_at is None else int(slot_at)
+    if slot_at > now:
+        return "host_quota_resume_spread"
+    if not consume:
+        return None
+    # Serialized recovery: this admission owns the current slot; the next
+    # matching start anywhere on the host waits one more spread. The row is
+    # swept only after the last granted slot has been idle for a full
+    # recovery window, so contenders on a board whose dispatcher has not
+    # ticked yet are still metered rather than admitted in a burst.
+    host.execute(
+        "UPDATE quota_circuits SET next_slot_at = ? WHERE budget_group = ?",
+        (now + spread, group),
+    )
+    _drop_deferral(host, group, task_id)
+    return None
+
+
+def _auto_guard(
+    host: sqlite3.Connection,
+    candidates: list[str],
+    provider_groups: Mapping[str, list[str]],
+    profile: str,
+    task_id: str,
+    now: int,
+    *,
+    consume: bool,
+) -> tuple[Optional[str], list[str]]:
+    """Guard an ``auto`` route against its candidate groups.
+
+    Auto may start only when the worker's own resolution ladder provably
+    lands on a provider whose mapped group is unpaused. Unmapped or failed
+    resolution while any candidate is paused fails closed — a proven-empty
+    wallet must never be hammered by an unpinned route. Returns the guard
+    reason and the groups that deferred the task.
+    """
+    active = [
+        group for group in candidates
+        if host.execute(
+            "SELECT 1 FROM quota_circuits WHERE budget_group = ?", (group,)
+        ).fetchone()
+    ]
+    if not active:
+        return None, []
+    provider = predict_auto_provider(profile)
+    resolved = provider_groups.get(provider or "", [])
+    if len(resolved) != 1:
+        # Unresolvable, unmapped, or ambiguous: cannot prove an unpaused route.
+        return "host_quota_circuit", active
+    group = resolved[0]
+    reason = _guard_group(host, group, task_id, now, consume=consume)
+    return reason, ([group] if reason else [])
+
+
 def task_quota_guard(
     conn: sqlite3.Connection,
     task_id: str,
@@ -357,100 +533,73 @@ def task_quota_guard(
 ) -> Optional[str]:
     """Return a host circuit guard reason for a task, or ``None``.
 
-    At expiry, one dispatcher atomically receives a probe lease. Other matching
-    starts remain spread for a short grace period. If no renewed quota failure
-    extends the circuit, the row auto-clears after that period.
+    While paused, every matching start defers. At expiry one dispatcher
+    atomically receives the recovery probe; afterwards admissions are
+    serialized host-wide, one per resume spread, until the deferred demand
+    drains. ``consume_probe=False`` (dry runs) only peeks.
     """
+    provider, profile = _task_route(conn, task_id)
     groups = resolve_task_budget_groups(conn, task_id)
-    if not groups:
+    if not groups or not provider or not profile:
         return None
     now = int(time.time())
-    spread = _resume_spread_seconds()
-    blocked_reasons: list[str] = []
     with _write_conn() as host:
-        for group in groups:
-            row = host.execute(
-                "SELECT * FROM quota_circuits WHERE budget_group = ?", (group,)
-            ).fetchone()
-            if row is None:
-                # An auto route may have several explicit candidates. Any
-                # healthy candidate means the worker can route elsewhere.
-                return None
-            until = int(row["next_eligible_at"])
-            probe_at = row["resume_probe_at"]
-            if until > now:
-                blocked_reasons.append("host_quota_circuit")
-                continue
-            if probe_at is None:
-                if consume_probe:
-                    updated = host.execute(
-                        "UPDATE quota_circuits SET resume_probe_at = ? "
-                        "WHERE budget_group = ? AND resume_probe_at IS NULL",
-                        (now, group),
-                    )
-                    if updated.rowcount:
-                        return None
-                    probe_at = host.execute(
-                        "SELECT resume_probe_at FROM quota_circuits WHERE budget_group = ?",
-                        (group,),
-                    ).fetchone()[0]
-                else:
-                    return None
-            if int(probe_at) + spread > now:
-                blocked_reasons.append("host_quota_resume_spread")
-                continue
-            host.execute("DELETE FROM quota_circuits WHERE budget_group = ?", (group,))
-            host.execute("DELETE FROM quota_circuit_sources WHERE budget_group = ?", (group,))
-            host.execute("DELETE FROM quota_circuit_deferrals WHERE budget_group = ?", (group,))
-            return None
-
-        if blocked_reasons:
-            # Record one opaque aggregate; raw group names never enter board
-            # events or API payloads.
-            for group in groups:
-                if host.execute(
-                    "SELECT 1 FROM quota_circuits WHERE budget_group = ?", (group,)
-                ).fetchone():
-                    _record_deferral(host, group, str(board or "default"), task_id, now)
-            return (
-                "host_quota_resume_spread"
-                if all(r == "host_quota_resume_spread" for r in blocked_reasons)
-                else "host_quota_circuit"
+        _sweep_finished(host, now)
+        if provider == "auto":
+            configured = configured_budget_groups()
+            provider_groups: dict[str, list[str]] = {}
+            for raw_group, selectors in configured.items():
+                if not isinstance(selectors, Mapping):
+                    continue
+                for candidate in _string_set(selectors.get("providers")) - {"*"}:
+                    provider_groups.setdefault(candidate, []).append(str(raw_group).strip())
+            reason, deferred_by = _auto_guard(
+                host, groups, provider_groups, profile, task_id, now, consume=consume_probe,
             )
-    return None
+        else:
+            reason = _guard_group(host, groups[0], task_id, now, consume=consume_probe)
+            deferred_by = [groups[0]] if reason else []
+        if reason is not None:
+            # Raw group names never enter board events or API payloads; the
+            # deferral rows feed the sanitized diagnostics and recovery metering.
+            # Recorded for peeks too — a dry run observing a deferred card is a
+            # real observation, and stale demand ages out on its own.
+            for group in deferred_by:
+                _record_deferral(host, group, str(board or "default"), task_id, now)
+        return reason
 
 
-def _public_state(row: Mapping[str, Any], *, boards_deferred: int, cards_deferred: int) -> dict:
+def _public_state(
+    row: Mapping[str, Any], *, boards_deferred: int, cards_deferred: int, now: int,
+) -> dict:
+    until = int(row["next_eligible_at"])
+    probe_at = row.get("resume_probe_at")
+    slot_at = row.get("next_slot_at")
+    if until > now or probe_at is None:
+        state = "paused"
+        next_eligible = until
+    else:
+        state = "recovering"
+        next_eligible = max(now, int(slot_at)) if slot_at is not None else until
     return {
         "group": sanitized_group_label(str(row["budget_group"])),
+        "state": state,
         "reason": str(row["reason"]),
         "first_observed_at": int(row["first_observed_at"]),
         "last_observed_at": int(row["last_observed_at"]),
-        "next_eligible_at": int(row["next_eligible_at"]),
+        "next_eligible_at": next_eligible,
         "observations": int(row["observations"]),
-        "resume_probe_at": (
-            int(row["resume_probe_at"]) if row.get("resume_probe_at") is not None else None
-        ),
+        "resume_probe_at": int(probe_at) if probe_at is not None else None,
         "boards_deferred": int(boards_deferred),
         "cards_deferred": int(cards_deferred),
     }
 
 
 def list_quota_circuits(*, now: Optional[int] = None) -> list[dict]:
-    """Return sanitized active/recovery diagnostics and purge expired rows."""
+    """Return sanitized active/recovery diagnostics and purge finished rows."""
     current = int(time.time()) if now is None else int(now)
-    spread = _resume_spread_seconds()
     with _write_conn() as conn:
-        expired = conn.execute(
-            "SELECT budget_group FROM quota_circuits "
-            "WHERE resume_probe_at IS NOT NULL AND resume_probe_at + ? <= ?",
-            (spread, current),
-        ).fetchall()
-        for expired_row in expired:
-            group = expired_row["budget_group"]
-            conn.execute("DELETE FROM quota_circuits WHERE budget_group = ?", (group,))
-            conn.execute("DELETE FROM quota_circuit_sources WHERE budget_group = ?", (group,))
-            conn.execute("DELETE FROM quota_circuit_deferrals WHERE budget_group = ?", (group,))
+        _sweep_finished(conn, current)
         rows = conn.execute("SELECT * FROM quota_circuits ORDER BY first_observed_at").fetchall()
         result: list[dict] = []
         for row in rows:
@@ -461,7 +610,10 @@ def list_quota_circuits(*, now: Optional[int] = None) -> list[dict]:
             ).fetchone()
             result.append(
                 _public_state(
-                    dict(row), boards_deferred=int(counts[0]), cards_deferred=int(counts[1])
+                    dict(row),
+                    boards_deferred=int(counts[0]),
+                    cards_deferred=int(counts[1]),
+                    now=current,
                 )
             )
         return result
@@ -479,7 +631,5 @@ def clear_quota_circuit(group_handle: str) -> bool:
         )
         if group is None:
             return False
-        conn.execute("DELETE FROM quota_circuits WHERE budget_group = ?", (group,))
-        conn.execute("DELETE FROM quota_circuit_sources WHERE budget_group = ?", (group,))
-        conn.execute("DELETE FROM quota_circuit_deferrals WHERE budget_group = ?", (group,))
+        _delete_group(conn, group)
         return True

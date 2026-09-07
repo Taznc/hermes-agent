@@ -4,6 +4,7 @@ from __future__ import annotations
 import os
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -50,6 +51,11 @@ def _task(board: str, *, profile: str, provider: str) -> str:
             model_override="test-model",
             provider_override=provider,
         )
+
+
+def _guard(board: str, task_id: str, *, consume: bool = True):
+    with kbc.connect(board=board) as conn:
+        return kqc.task_quota_guard(conn, task_id, board=board, consume_probe=consume)
 
 
 def test_budget_group_resolution_is_explicit_and_diagnostics_are_opaque(quota_home):
@@ -111,6 +117,7 @@ def test_one_board_quota_event_guards_matching_routes_on_every_board(quota_home,
     circuit = circuits[0]
     assert circuit["group"].startswith("budget-")
     assert circuit["reason"] == "quota"
+    assert circuit["state"] == "paused"
     assert circuit["first_observed_at"] == 1_000
     assert circuit["last_observed_at"] == 1_000
     assert circuit["boards_deferred"] == 1
@@ -136,14 +143,132 @@ def test_expiry_allows_one_probe_then_spreads_remaining_starts(quota_home, monke
         assert kbd.check_respawn_guard(
             conn, second, board="second", consume_host_probe=True,
         ) == "host_quota_resume_spread"
+    assert kqc.list_quota_circuits(now=1_010)[0]["state"] == "recovering"
 
     monkeypatch.setattr(kqc.time, "time", lambda: 1_041)
     with kbc.connect(board="second") as conn:
         assert kbd.check_respawn_guard(
             conn, second, board="second", consume_host_probe=True,
         ) is None
-    assert kqc.list_quota_circuits(now=1_041) == []
+    # Metering stays armed for the recovery window after the last granted
+    # slot, then the row clears on its own.
+    window = kqc._recovery_window_seconds()
+    assert len(kqc.list_quota_circuits(now=1_071 + window - 1)) == 1
+    assert kqc.list_quota_circuits(now=1_071 + window) == []
     assert kqc.clear_quota_circuit(kqc.sanitized_group_label("primary-wallet")) is False
+
+
+def test_post_probe_recovery_serializes_contending_cards_across_boards(quota_home, monkeypatch):
+    """Five cards on two boards contend at the post-probe boundary: exactly one
+    start per spread window, host-wide, until the contenders drain. The cards
+    were never observed during the pause, so metering cannot depend on
+    previously recorded demand."""
+    monkeypatch.setattr(kqc, "configured_budget_groups", lambda: BUDGET_GROUPS)
+    boards = ["default", "second", "default", "second", "default", "second"]
+    tasks = [_task(b, profile="implementer", provider="openai-codex") for b in boards]
+    kqc.register_quota_circuit(
+        "primary-wallet", retry_after=10, board="default", task_id=tasks[0],
+        reason="rate_limit", max_seconds=3600, now=2_000,
+    )
+    monkeypatch.setattr(kqc.time, "time", lambda: 2_005)
+    assert _guard(boards[0], tasks[0]) == "host_quota_circuit"
+
+    monkeypatch.setattr(kqc.time, "time", lambda: 2_010)
+    assert _guard(boards[0], tasks[0]) is None  # the single recovery probe
+
+    waiting = list(zip(boards[1:], tasks[1:]))
+    admitted: list[str] = []
+
+    def contend(now: int) -> list:
+        monkeypatch.setattr(kqc.time, "time", lambda: now)
+        outcomes = []
+        for board, task_id in list(waiting):
+            outcome = _guard(board, task_id)
+            outcomes.append(outcome)
+            if outcome is None:
+                # A real dispatcher claims the admitted card; it stops contending.
+                waiting.remove((board, task_id))
+                admitted.append(task_id)
+        return outcomes
+
+    for now in (2_041, 2_041, 2_050, 2_071, 2_101, 2_131, 2_161):
+        outcomes = contend(now)
+        assert outcomes.count(None) <= 1, (now, outcomes)
+        for outcome in outcomes:
+            assert outcome in (None, "host_quota_resume_spread"), (now, outcome)
+    # Every contender was admitted exactly once across the serialized slots.
+    assert sorted(admitted) == sorted(tasks[1:])
+    assert waiting == []
+    assert kqc.list_quota_circuits(now=2_161)[0]["state"] == "recovering"
+    # The last slot was granted at 2_161; the meter stays armed for one
+    # recovery window past it, then the circuit clears and starts are
+    # unmetered again.
+    settle = 2_161 + kqc._resume_spread_seconds() + kqc._recovery_window_seconds()
+    assert len(kqc.list_quota_circuits(now=settle - 1)) == 1
+    assert kqc.list_quota_circuits(now=settle) == []
+    monkeypatch.setattr(kqc.time, "time", lambda: settle)
+    assert [_guard(b, t) for b, t in zip(boards, tasks)] == [None] * 6
+
+
+def test_dry_run_guard_peeks_without_consuming_probe_or_slot(quota_home, monkeypatch):
+    monkeypatch.setattr(kqc, "configured_budget_groups", lambda: BUDGET_GROUPS)
+    task = _task("default", profile="implementer", provider="openai-codex")
+    kqc.register_quota_circuit(
+        "primary-wallet", retry_after=10, board="default", task_id=task,
+        reason="quota", max_seconds=100, now=1_000,
+    )
+    monkeypatch.setattr(kqc.time, "time", lambda: 1_010)
+    assert _guard("default", task, consume=False) is None
+    assert _guard("default", task, consume=False) is None
+    assert kqc.list_quota_circuits(now=1_010)[0]["state"] == "paused"
+
+
+def test_auto_route_fails_closed_unless_resolution_avoids_paused_group(quota_home, monkeypatch):
+    monkeypatch.setattr(kqc, "configured_budget_groups", lambda: BUDGET_GROUPS)
+    auto_task = _task("default", profile="implementer", provider="auto")
+    kqc.register_quota_circuit(
+        "primary-wallet", retry_after=300, board="default", task_id=auto_task,
+        reason="rate_limit", max_seconds=3600, now=1_000,
+    )
+    monkeypatch.setattr(kqc.time, "time", lambda: 1_001)
+
+    # A merely configured backup does not admit auto while resolution keeps
+    # choosing the paused provider — repeated starts cannot hammer it.
+    monkeypatch.setattr(kqc, "predict_auto_provider", lambda _profile: "openai-codex")
+    for _ in range(3):
+        assert _guard("default", auto_task) == "host_quota_circuit"
+    # Unprovable resolution fails closed.
+    monkeypatch.setattr(kqc, "predict_auto_provider", lambda _profile: None)
+    assert _guard("default", auto_task) == "host_quota_circuit"
+    assert kqc.list_quota_circuits(now=1_001)[0]["cards_deferred"] == 1
+    # Resolution to an unpaused mapped provider dispatches.
+    monkeypatch.setattr(kqc, "predict_auto_provider", lambda _profile: "anthropic")
+    assert _guard("default", auto_task) is None
+    # No circuit at all means no resolver call is needed.
+    assert kqc.clear_quota_circuit(kqc.sanitized_group_label("primary-wallet"))
+    monkeypatch.setattr(kqc, "predict_auto_provider", lambda _profile: pytest.fail("unused"))
+    assert _guard("default", auto_task) is None
+
+
+def test_auto_prediction_runs_resolver_under_profile_home(quota_home, monkeypatch):
+    seen: list[str] = []
+
+    def fake_resolve(requested=None, **_kw):
+        from hermes_constants import get_hermes_home
+        seen.append(str(get_hermes_home()))
+        assert requested == "auto"
+        return "anthropic"
+
+    from hermes_cli import auth
+    monkeypatch.setattr(auth, "resolve_provider", fake_resolve)
+    assert kqc.predict_auto_provider("implementer") == "anthropic"
+    assert seen == [str(quota_home / "profiles" / "implementer")]
+
+    def broken(requested=None, **_kw):
+        raise RuntimeError("no provider configured")
+
+    monkeypatch.setattr(auth, "resolve_provider", broken)
+    assert kqc.predict_auto_provider("implementer") is None
 
 
 def test_worker_publishes_structured_deadline_before_tempfail_reap(quota_home, monkeypatch):
@@ -173,14 +298,37 @@ def test_worker_publishes_structured_deadline_before_tempfail_reap(quota_home, m
     assert len(kqc.list_quota_circuits(now=5_001)) == 1
 
 
-def test_quiet_cli_publishes_quota_before_tempfail_exit():
-    import inspect
+def test_quiet_cli_publishes_quota_circuit_then_exits_tempfail(quota_home, monkeypatch, capsys):
     import cli as cli_module
 
-    source = inspect.getsource(cli_module._run_quiet_single_query)
-    publish = source.index("publish_worker_quota_result")
-    exit_call = source.index("sys.exit(_exit_code)")
-    assert publish < exit_call
+    monkeypatch.setattr(kqc, "configured_budget_groups", lambda: BUDGET_GROUPS)
+    task_id = _task("default", profile="implementer", provider="auto")
+    monkeypatch.setenv("HERMES_KANBAN_TASK", task_id)
+    monkeypatch.setenv("HERMES_KANBAN_BOARD", "default")
+    monkeypatch.delenv("HERMES_KANBAN_GOAL_MODE", raising=False)
+    monkeypatch.setattr(kqc.time, "time", lambda: 6_000)
+    result = {
+        "failed": True,
+        "failure_reason": "rate_limit",
+        "error": "usage_limit_reached",
+        "final_response": "",
+        "reset_at": 6_300.0,
+    }
+    agent = SimpleNamespace(
+        run_conversation=lambda **_kw: result,
+        session_id="s1",
+        provider="openai-codex",
+    )
+    cli = SimpleNamespace(agent=agent, session_id="s1", conversation_history=[])
+
+    with pytest.raises(SystemExit) as exc:
+        cli_module._run_quiet_single_query(cli, "work kanban task")
+    assert exc.value.code == kb.KANBAN_RATE_LIMIT_EXIT_CODE
+    assert "usage_limit_reached" in capsys.readouterr().err
+    circuits = kqc.list_quota_circuits(now=6_001)
+    assert len(circuits) == 1
+    assert circuits[0]["reason"] == "rate_limit"
+    assert circuits[0]["next_eligible_at"] == 6_300
 
 
 def test_machine_readable_tempfail_opens_host_circuit_without_failure_budget(
@@ -279,8 +427,29 @@ def test_diagnostics_sweep_expired_probe_without_another_matching_task(quota_hom
         assert kqc.task_quota_guard(
             conn, source, board="default", consume_probe=True,
         ) is None
-    assert kqc.list_quota_circuits(now=4_032) == []
+    settle = 4_001 + kqc._resume_spread_seconds() + kqc._recovery_window_seconds()
+    assert kqc.list_quota_circuits(now=settle) == []
     assert kqc.clear_quota_circuit(kqc.sanitized_group_label("primary-wallet")) is False
+
+
+def test_recovery_meter_disarms_after_idle_window_even_with_stale_deferrals(quota_home, monkeypatch):
+    """A card deferred during the pause that then vanished (blocked/deleted)
+    must not keep the group metered forever: after the recovery window with
+    no further admissions the circuit clears on its own."""
+    monkeypatch.setattr(kqc, "configured_budget_groups", lambda: BUDGET_GROUPS)
+    source = _task("default", profile="implementer", provider="openai-codex")
+    vanished = _task("second", profile="reviewer", provider="openai-codex")
+    kqc.register_quota_circuit(
+        "primary-wallet", retry_after=10, board="default", task_id=source,
+        reason="quota", max_seconds=100, now=1_000,
+    )
+    monkeypatch.setattr(kqc.time, "time", lambda: 1_005)
+    assert _guard("second", vanished) == "host_quota_circuit"
+    monkeypatch.setattr(kqc.time, "time", lambda: 1_010)
+    assert _guard("default", source) is None
+    settle = 1_010 + kqc._resume_spread_seconds() + kqc._recovery_window_seconds()
+    assert len(kqc.list_quota_circuits(now=settle - 1)) == 1
+    assert kqc.list_quota_circuits(now=settle) == []
 
 
 def test_default_config_requires_explicit_groups_and_spreads_resume():
