@@ -319,9 +319,13 @@ def test_block_and_respond(capture):
     ["secret.request", "sudo.request", "clarify.request", "terminal.read.request"],
 )
 def test_sensitive_prompt_timeout_emits_expiry(capture, event):
+    """Clarify timeouts keep their reason; other sensitive bridges retain their empty legacy result."""
+    from tools.clarify_tool import TIMEOUT_RESPONSE
+
     server, buf = capture
 
-    assert server._block(event, "s1", {}, timeout=0) == ""
+    expected = TIMEOUT_RESPONSE if event == "clarify.request" else ""
+    assert server._block(event, "s1", {}, timeout=0) == expected
 
     messages = [json.loads(line) for line in buf.getvalue().splitlines()]
     request, expiry = [message["params"] for message in messages]

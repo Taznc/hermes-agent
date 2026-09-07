@@ -12,6 +12,9 @@ MAX_QUESTIONS = 5  # independent questions per batch call
 # treats it (like ``None``) as "the user walked away" and aborts remaining questions.
 TIMEOUT_RESPONSE = ("The user did not provide a response within the time limit. "
                     "Use your best judgement to make the choice and proceed.")
+# Canonical cancellation sentinel.  A deliberate UI Skip remains ``""``; a
+# stopped turn must survive the gateway bridge as a separately readable result.
+CANCELLED_RESPONSE = "The user stopped the turn before providing a response."
 # Applied to the first choice here (not per-surface) so every adapter renders it identically.
 RECOMMENDED_LABEL = "(Recommended)"
 _UNAVAILABLE = "Clarify tool is not available in this execution context."
@@ -101,6 +104,10 @@ def _is_timeout(raw) -> bool:
     return raw is None or (isinstance(raw, str) and raw.strip() == TIMEOUT_RESPONSE)
 
 
+def _is_cancelled(raw) -> bool:
+    return isinstance(raw, str) and raw.strip() == CANCELLED_RESPONSE
+
+
 # ============================================================================= Batch (multi-question)
 # support — issue #18450 =============================================================================
 def _normalize_questions(questions) -> tuple:
@@ -136,10 +143,11 @@ def _normalize_questions(questions) -> tuple:
     return normalized, None
 
 
-def _batch_result(normalized: List[dict], answers: dict, notes: dict, timed_out: bool) -> str:
+def _batch_result(normalized: List[dict], answers: dict, notes: dict, timed_out: bool,
+                  cancelled: bool = False) -> str:
     """Batch result JSON; unanswered -> "" and optional notes stay on their response rows.
-    The top-level ``timed_out`` flag (present only when true) tells the agent whether blanks are
-    deliberate skips or the user walking away."""
+    The top-level ``timed_out`` / ``cancelled`` flags (each present only when true) tell the agent
+    whether blanks are deliberate skips, a expired deadline, or the user stopping the turn."""
     responses = []
     for entry in normalized:
         raw = answers.get(entry["qid"])
@@ -154,6 +162,8 @@ def _batch_result(normalized: List[dict], answers: dict, notes: dict, timed_out:
     result: Dict[str, object] = {"responses": responses}
     if timed_out:
         result["timed_out"] = True
+    if cancelled:
+        result["cancelled"] = True
     return json.dumps(result, ensure_ascii=False)
 
 
@@ -168,23 +178,29 @@ def _run_batch(normalized: List[dict], callback, question: str) -> str:
     answers: dict = {}
     notes: dict = {}
     timed_out = False
+    cancelled = False
     if _accepts_kwarg(callback, "questions"):
         raw = callback(question, None, questions=normalized)
         timed_out = _is_timeout(raw)
+        cancelled = _is_cancelled(raw)
         if isinstance(raw, str):
-            raw = _json_as(raw, dict)  # the sentinel is not JSON -> None, timed_out stays True
+            raw = _json_as(raw, dict)  # terminal sentinels are not JSON; their flags stay set.
         if isinstance(raw, dict):
             answers = dict(raw.get("answers") or {})
             notes = dict(raw.get("notes") or {})
             timed_out = bool(raw.get("timed_out"))
-        return _batch_result(normalized, answers, notes, timed_out)
+            cancelled = bool(raw.get("cancelled"))
+        return _batch_result(normalized, answers, notes, timed_out, cancelled)
     for entry in normalized:
         raw = _invoke_callback(callback, entry["question"], entry["choices"], entry["multi_select"])
         if _is_timeout(raw):
             timed_out = True
             break
+        if _is_cancelled(raw):
+            cancelled = True
+            break
         answers[entry["qid"]] = raw
-    return _batch_result(normalized, answers, notes, timed_out)
+    return _batch_result(normalized, answers, notes, timed_out, cancelled)
 
 
 def clarify_tool(question: str, choices: Optional[List[str]] = None, multi_select: bool = False,
@@ -199,7 +215,9 @@ def clarify_tool(question: str, choices: Optional[List[str]] = None, multi_selec
     string. Has no effect when ``choices`` is omitted. questions:    Up to 5 independent questions asked as
     one batch (issue #18450). When present (non-empty), the single ``question``/``choices``/``multi_select``
     parameters are ignored and the result JSON is ``{"responses": [...]}`` (plus ``"timed_out": true`` when
-    the user stopped answering partway). callback:     Platform-provided function that handles the actual UI
+    the user stopped answering partway, or ``"cancelled": true`` when the user stops the turn).
+    Single-question results keep their historic fields and add the same terminal reason flag only
+    when applicable. callback:     Platform-provided function that handles the actual UI
     interaction. A single callback may return either a legacy answer or ``{"answer": answer,
     "note": note?}``; batch-capable platforms additionally accept a ``questions`` keyword and
     receive the normalized list in one call; platforms without it are looped one question at a
@@ -234,14 +252,24 @@ def clarify_tool(question: str, choices: Optional[List[str]] = None, multi_selec
         raw_response = _invoke_callback(callback, question, shown, multi_select)
     except Exception as exc:
         return tool_error(f"Failed to get user input: {exc}")
+    timed_out = _is_timeout(raw_response)
+    cancelled = _is_cancelled(raw_response)
     note = None
     if isinstance(raw_response, dict):
         note = raw_response.get("note")
         raw_response = raw_response.get("answer", "")
-    result = {"question": question, "choices_offered": choices,
-              "user_response": _clean_answer(raw_response, multi_select and choices is not None)}
+    result: Dict[str, object] = {
+        "question": question,
+        "choices_offered": choices,
+        "user_response": "" if timed_out or cancelled else _clean_answer(
+            raw_response, multi_select and choices is not None),
+    }
     if note:
         result["note"] = note
+    if timed_out:
+        result["timed_out"] = True
+    if cancelled:
+        result["cancelled"] = True
     return json.dumps(result, ensure_ascii=False)
 
 
@@ -267,9 +295,10 @@ CLARIFY_SCHEMA = {
         "enumerated inside the question text (choices render as pickable "
         "rows; options written into the question are dead prose the user "
         "can't click). Result: {responses: [...]} in question order (plus "
-        "timed_out=true if the user stopped part-way). Prefer deciding "
-        "low-stakes questions yourself; don't use this for dangerous-command "
-        "confirmation (the terminal tool handles that)."
+        "timed_out=true on a deadline or cancelled=true when the user stops "
+        "the turn). Prefer deciding low-stakes questions yourself; don't use "
+        "this for dangerous-command confirmation (the terminal tool handles "
+        "that)."
     ),
     "parameters": {
         "type": "object",

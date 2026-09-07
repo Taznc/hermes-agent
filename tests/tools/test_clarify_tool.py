@@ -615,6 +615,21 @@ class TestClarifyBatchDispatch:
         assert result["responses"][0]["user_response"] == "kept"
         assert result["responses"][1]["user_response"] == ""
 
+    def test_batch_cancelled_flag_is_distinct_from_timeout_and_skip(self):
+        """A stopped turn must not be indistinguishable from deliberately skipping every row."""
+        from tools.clarify_tool import CANCELLED_RESPONSE
+
+        def cb(question, choices, multi_select=False, questions=None):
+            return CANCELLED_RESPONSE
+
+        result = json.loads(clarify_tool(
+            "", questions=[{"question": "One?"}, {"question": "Two?"}], callback=cb,
+        ))
+
+        assert result["cancelled"] is True
+        assert "timed_out" not in result
+        assert [row["user_response"] for row in result["responses"]] == ["", ""]
+
     def test_batch_empty_response_is_skip_not_timeout(self):
         """A cancel-all resolves every answer empty with no timed_out flag."""
         def cb(question, choices, multi_select=False, questions=None):
@@ -700,6 +715,25 @@ class TestClarifyBatchDispatch:
             "Color?", choices=["red", "blue"], callback=cb,
         ))
         assert set(result.keys()) == {"question", "choices_offered", "user_response"}
+
+    def test_single_cancel_and_timeout_are_distinct_from_deliberate_skip(self):
+        """Only an actual Skip has an answered-empty result without a terminal reason."""
+        from tools.clarify_tool import CANCELLED_RESPONSE, TIMEOUT_RESPONSE
+
+        def result_for(raw):
+            return json.loads(clarify_tool("Continue?", callback=lambda *_args: raw))
+
+        skipped = result_for("")
+        cancelled = result_for(CANCELLED_RESPONSE)
+        timed_out = result_for(TIMEOUT_RESPONSE)
+
+        assert skipped == {
+            "question": "Continue?", "choices_offered": None, "user_response": "",
+        }
+        assert cancelled["user_response"] == "" and cancelled["cancelled"] is True
+        assert "timed_out" not in cancelled
+        assert timed_out["user_response"] == "" and timed_out["timed_out"] is True
+        assert "cancelled" not in timed_out
 
 
 class TestRegistryBatchPassThrough:

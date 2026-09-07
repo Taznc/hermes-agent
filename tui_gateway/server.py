@@ -27,6 +27,7 @@ from hermes_constants import (
 from hermes_cli.env_loader import load_hermes_dotenv
 from utils import is_truthy_value
 from tools.environments.local import hermes_subprocess_env
+from tools.clarify_tool import CANCELLED_RESPONSE, TIMEOUT_RESPONSE
 from agent.replay_cleanup import sanitize_replay_history
 from agent.compaction_display import project_compaction_message_for_display  # noqa: F401
 from agent.skill_commands import describe_skill_invocation  # noqa: F401
@@ -648,6 +649,17 @@ def _pending_clarify_request_payload(sid: str) -> dict | None:
             pending = session.get("_compute_host_pending_clarify")
             return dict(pending) if isinstance(pending, dict) else None
     return None
+
+
+def _has_pending_clarify_request(sid: str) -> bool:
+    """Whether ``sid`` owns a still-answerable clarify bridge request.
+
+    The request registry is the authority during a transport gap. Compute-host
+    sessions retain the same authority in their pending mirror. A detached
+    renderer can resume and replay either form; treating it as an abandoned
+    turn would turn the user-visible card into an implicit empty response.
+    """
+    return _pending_clarify_request_payload(sid) is not None
 
 
 def _pending_approval_request_payload(session_key: str) -> dict | None:
@@ -1297,8 +1309,12 @@ def _block(event: str, sid: str, payload: dict, timeout: float | None = 300, bat
                 batch_notes = dict(batch_state.get("notes") or {})
     expire = lambda: _emit(f"{event.removesuffix('.request')}.expire", sid, {"request_id": rid})
     if batch_qids is not None:
-        # Cancel-all (respond with no question_id) resolves via _answers with "" — a plain cancel, not a partial result.
+        # Deliberate UI Skip/cancel-all keeps the historic empty bridge value;
+        # an interrupted turn gets a reason-aware result that clarify_tool
+        # projects as ``cancelled`` rather than an answered blank.
         if answer_present:
+            if answer == CANCELLED_RESPONSE:
+                return json.dumps({"answers": batch_answers or {}, "cancelled": True}, ensure_ascii=False)
             return answer
         result: dict[str, object] = {"answers": batch_answers or {}}
         if batch_notes:
@@ -1308,8 +1324,11 @@ def _block(event: str, sid: str, payload: dict, timeout: float | None = 300, bat
             result["timed_out"] = True
             expire()
         return json.dumps(result, ensure_ascii=False)
-    if not answered and not answer_present and event in _EXPIRING_REQUESTS:
-        expire()
+    if not answered and not answer_present:
+        if event in _EXPIRING_REQUESTS:
+            expire()
+        if event == "clarify.request":
+            return TIMEOUT_RESPONSE
     return answer
 
 
@@ -1377,12 +1396,14 @@ def _tour_request(sid: str, payload: dict) -> str:
 
 
 def _clear_pending(sid: str | None = None) -> None:
-    """Release pending prompts with an empty answer: only *sid*'s (session.interrupt must not cancel other
-    sessions' prompts), or every one when *sid* is None (shutdown)."""
+    """Release pending prompts: only *sid*'s (session.interrupt must not cancel other sessions' prompts),
+    or every one when *sid* is None (shutdown).  Clarify stops carry a cancellation sentinel so they never
+    masquerade as a deliberate UI Skip at the tool-result seam."""
     with _prompt_lock:
         for rid, (owner_sid, ev) in list(_pending.items()):
             if sid is None or owner_sid == sid:
-                _answers[rid] = ""
+                event = _pending_prompt_payloads.get(rid, ("", {}))[0]
+                _answers[rid] = CANCELLED_RESPONSE if event == "clarify.request" else ""
                 ev.set()
 
 
