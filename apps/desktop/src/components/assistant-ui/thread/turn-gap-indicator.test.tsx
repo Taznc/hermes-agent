@@ -7,6 +7,7 @@ import { act, cleanup, render, screen } from '@testing-library/react'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
 import { __resetElapsedTimerRegistryForTests } from '@/components/chat/activity-timer'
+import { I18nProvider } from '@/i18n'
 import { $activeSessionId, $busy, $messages, $turnStartedAt } from '@/store/session'
 
 import { stubThreadEnvironment, ThreadRuntime, userMessage } from '../test-utils'
@@ -36,10 +37,12 @@ const toolCall = (toolName: string, settled: boolean) => ({
   ...(settled ? { result: 'ok' } : {})
 })
 
-const Harness = ({ messages }: { messages: ThreadMessage[] }) => (
-  <ThreadRuntime messages={messages}>
-    <Thread />
-  </ThreadRuntime>
+const Harness = ({ locale = 'en', messages }: { locale?: 'en' | 'ja'; messages: ThreadMessage[] }) => (
+  <I18nProvider configClient={null} initialLocale={locale}>
+    <ThreadRuntime messages={messages}>
+      <Thread />
+    </ThreadRuntime>
+  </I18nProvider>
 )
 
 const timerText = (value: string) => screen.getAllByText((_, node) => node?.textContent === value)
@@ -117,6 +120,7 @@ describe('the turn timer covers the gaps, not just the streaming', () => {
 
     expect(container.querySelector('[data-terminal-activity="success"]')).not.toBeNull()
     expect(container.querySelector('[data-activity-mark="success"]')).not.toBeNull()
+    expect(container.querySelector('[data-terminal-activity="success"]')?.getAttribute('aria-label')).toBe('Work complete')
 
     act(() => vi.advanceTimersByTime(1_999))
     expect(container.querySelector('[data-terminal-activity="success"]')).not.toBeNull()
@@ -146,6 +150,35 @@ describe('the turn timer covers the gaps, not just the streaming', () => {
     expect(container.querySelector('[data-slot="aui_turn-activity"]')).toBeNull()
   })
 
+  it('does not duplicate a fatal error with a terminal failure activity row', () => {
+    const fatalMessages = [
+      userMessage('u1', 'do the thing'),
+      {
+        ...assistant('a1', [{ type: 'text', text: 'The operation failed.' }], false),
+        status: { type: 'error', error: new Error('fatal') }
+      } as unknown as ThreadMessage
+    ]
+
+    const { container } = render(<Harness messages={fatalMessages} />)
+
+    act(() => vi.advanceTimersByTime(7_000))
+    act(() => $busy.set(false))
+
+    expect(container.querySelector('[data-terminal-activity="failure"]')).toBeNull()
+  })
+
+  it('localizes the terminal activity status label', () => {
+    const messages = [userMessage('u1', 'do the thing'), assistant('a1', [{ type: 'text', text: 'Done.' }], false)]
+    const { container } = render(<Harness locale="ja" messages={messages} />)
+
+    act(() => vi.advanceTimersByTime(7_000))
+    act(() => $busy.set(false))
+
+    expect(container.querySelector('[data-terminal-activity="success"]')?.getAttribute('aria-label')).toBe(
+      '作業が完了しました'
+    )
+  })
+
   it('retains a recoverable failure briefly before settling the row away', () => {
     const failedMessages = [
       userMessage('u1', 'do the thing'),
@@ -162,6 +195,9 @@ describe('the turn timer covers the gaps, not just the streaming', () => {
 
     expect(container.querySelector('[data-terminal-activity="failure"]')).not.toBeNull()
     expect(container.querySelector('[data-activity-mark="failure"]')).not.toBeNull()
+    expect(container.querySelector('[data-terminal-activity="failure"]')?.getAttribute('aria-label')).toBe(
+      'Work needs attention'
+    )
 
     act(() => vi.advanceTimersByTime(1_999))
     expect(container.querySelector('[data-terminal-activity="failure"]')).not.toBeNull()

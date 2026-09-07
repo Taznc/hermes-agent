@@ -80,6 +80,8 @@ export interface ForkTranslations {
   assistant: {
     thread: {
       showEarlierFailed: string
+      workComplete: string
+      workNeedsAttention: string
       /** Phase 2.12 — rate-limit turn recovery (resetAt/fallbackAvailable). */
       rateLimit: {
         /** Plain-language failure message naming the provider/account. */

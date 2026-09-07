@@ -392,7 +392,7 @@ export const TurnActivityIndicator: FC = () => {
   const recoverablyFailed = useAuiState(s => {
     const type = (s.message.status as { type?: string } | undefined)?.type
 
-    return type === 'error' || type === 'incomplete'
+    return type === 'incomplete'
   })
 
   // Renderer-synthesized load bar (see ResponseLoadingIndicator).
@@ -432,7 +432,13 @@ export const TurnActivityIndicator: FC = () => {
   }
 
   const phase: ThreadActivityPhase = terminal ?? (compacting ? 'compacting' : hint ? 'working' : 'quiet')
-  const label = terminal === 'failure' ? 'Work needs attention' : terminal === 'success' ? 'Work complete' : hint || 'Hermes is working'
+
+  const label =
+    terminal === 'failure'
+      ? t.assistant.thread.workNeedsAttention
+      : terminal === 'success'
+        ? t.assistant.thread.workComplete
+        : hint || 'Hermes is working'
 
   return (
     <StatusRow data-slot="aui_turn-activity" data-terminal-activity={terminal ?? undefined} label={label}>

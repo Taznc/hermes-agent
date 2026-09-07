@@ -22,6 +22,12 @@ export const forkJa: TranslationOverrides = {
         `設定済みモデル: ${configuredFamily}（現在は ${servedFamily} 経由で応答中）`
     }
   },
+  assistant: {
+    thread: {
+      workComplete: '作業が完了しました',
+      workNeedsAttention: '作業に対応が必要です'
+    }
+  },
   errors: {
     openLogsFailed: 'ログフォルダを開けませんでした'
   }

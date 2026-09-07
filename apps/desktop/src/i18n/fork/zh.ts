@@ -70,6 +70,8 @@ export const forkZh: ForkTranslations = {
   assistant: {
     thread: {
       showEarlierFailed: '无法加载更早的消息',
+      workComplete: '工作已完成',
+      workNeedsAttention: '工作需要关注',
       rateLimit: {
         message: provider => `${provider || 'The provider'} is rate limiting this account.`,
         resetsAt: time => `Retry at ${time}`,
