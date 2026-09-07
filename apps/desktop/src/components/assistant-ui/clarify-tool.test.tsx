@@ -457,7 +457,7 @@ describe('ClarifyTool keyboard navigation', () => {
 })
 
 describe('ClarifyTool recommended option', () => {
-  it('dims the (Recommended) label and answers with the choice the backend sent', async () => {
+  it('badges the (Recommended) label and answers with the choice the backend sent', async () => {
     const request = vi.fn().mockResolvedValue({ ok: true })
 
     $activeSessionId.set('session-1')
@@ -473,8 +473,12 @@ describe('ClarifyTool recommended option', () => {
 
     const recommended = screen.getByRole('button', { name: /staging/ })
 
-    // The label rides in its own muted span so the option text still reads first.
-    expect(recommended.querySelector('.text-\\(--ui-text-tertiary\\)')?.textContent).toBe('(Recommended)')
+    // The label rides in its own marked span so the option text reads first.
+    // Assert the data hook, not the CSS class — styling is free to change.
+    const badge = recommended.querySelector('[data-recommended]')
+    expect(badge?.textContent).toBe('Recommended')
+    // ...and only the recommended row carries one.
+    expect(screen.getByRole('button', { name: /production/ }).querySelector('[data-recommended]')).toBeNull()
 
     fireEvent.click(recommended)
     fireEvent.keyDown(window, { key: 'Enter' })
