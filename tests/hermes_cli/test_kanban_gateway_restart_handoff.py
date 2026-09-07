@@ -8,12 +8,36 @@ import signal
 import subprocess
 import sys
 import time
+import uuid
 from pathlib import Path
 
 import pytest
 
 from hermes_cli import kanban_db as kb
 from hermes_cli import kanban_db_dispatch as kbd
+
+
+@pytest.fixture(autouse=True)
+def _placement_gives_no_answer(monkeypatch: pytest.MonkeyPatch):
+    """State this file's PLACEMENT input: "the kernel says nothing".
+
+    Every in-process test here simulates a topology through IDENTITY —
+    ``INVOCATION_ID`` / ``SYSTEMD_EXEC_PID`` / ``_is_supervised_gateway_process`` — which
+    is data a test can set. Placement is not: ``_scope_needed_by_cgroup_placement`` reads
+    the TEST RUNNER's own real cgroup, so leaving it live would let the verdict be decided
+    by wherever the suite happens to run (inside a ``hermes-worker-*`` scope it reads
+    "already isolated"; inside a supervised ``hermes-*`` unit it reads "wrap this").
+    Pinning it to ``None`` — a cgroup-v1 host, or a container that hides
+    ``/proc/self/cgroup`` — makes these exercise the identity fallback deterministically
+    on any host.
+
+    ``test_real_descendant_of_a_supervised_unit_leaves_the_unit_cgroup`` is unaffected by
+    design: it does its work in a subprocess inside its own transient unit, which reads
+    its own real cgroup rather than this process's patched module.
+    """
+    monkeypatch.setattr(
+        "tools.process_registry._scope_needed_by_cgroup_placement", lambda: None
+    )
 
 
 @pytest.fixture
@@ -239,8 +263,14 @@ def test_systemd_service_descendant_keeps_direct_worker_spawn(
 ) -> None:
     """``INVOCATION_ID``/``SYSTEMD_EXEC_PID`` are inherited by every descendant.
 
-    A terminal child or a nested CLI under a supervised unit must NOT mint scopes — only
-    the unit's own main process does, which is why the pid comparison exists.
+    This pins the IDENTITY fallback, which is what decides on a host where cgroup
+    placement gives no answer (cgroup v1, or a container that hides
+    ``/proc/self/cgroup``): the markers alone are not evidence, so a nested CLI under
+    an arbitrary unit must not mint scopes.
+
+    On a cgroup-v2 host a descendant of a SUPERVISED HERMES unit is wrapped instead,
+    by placement — that is the leak this fix closes, and it is asserted by
+    ``test_real_descendant_of_a_supervised_unit_leaves_the_unit_cgroup`` below.
     """
     workspace, task = worker_setup
     captured_cmd: list[str] = []
@@ -351,3 +381,80 @@ def test_real_backend_supervised_worker_leaves_the_unit_cgroup(
     leaf = cgroup.rsplit("/", 1)[-1]
     assert leaf == "hermes-worker-kanban-t_backend_restart-run-24.service", cgroup
     assert "/hermes.slice/hermes-workers.slice/" in cgroup, cgroup
+
+
+@pytest.mark.linux_only
+def test_real_descendant_of_a_supervised_unit_leaves_the_unit_cgroup(
+    tmp_path: Path,
+) -> None:
+    """The card's core regression, reproduced by genuinely creating the topology.
+
+    A dispatch tick that runs in a DESCENDANT of a supervised unit's main process sees
+    ``INVOCATION_ID`` and ``SYSTEMD_EXEC_PID`` (both inherited) but its own pid differs,
+    so identity answered False and ``_default_spawn`` ``Popen``'d the worker straight into
+    the unit's cgroup with no log line. One such leaked worker measured 1853 MiB against
+    ``hermes-webdesktop-backend.service``'s 3G ``MemoryHigh``.
+
+    Nothing here is simulated. The probe body runs inside a THROWAWAY transient unit
+    (``hermes-webdesktop-backend-probe-<hex>.service`` in ``app.slice`` — a real
+    Hermes-named unit cgroup outside ``hermes-workers.slice``, so placement reads it
+    exactly as it reads the live backend) and ``fork()``s, which is the only way to obtain
+    a true descendant: cgroup membership is kernel-maintained, so a test process cannot
+    talk itself into another unit's cgroup. No live unit is touched, and the probe asserts
+    its kanban board is sandboxed before it spawns anything.
+
+    The assertion compares the worker's cgroup LEAF against the unit this run should have
+    minted, not a substring — a child that merely inherited a scoped dispatcher's cgroup
+    would still match ``hermes-worker-*`` — and separately against the dispatching
+    process's own cgroup, which is what the leak made them share.
+    """
+    from tools import process_registry
+
+    if not process_registry._systemd_run_user_scope_available():
+        pytest.skip("systemd-run --user --scope is unavailable on this host")
+
+    repo_root = Path(__file__).resolve().parents[2]
+    probe = Path(__file__).with_name("_supervised_unit_descendant_probe.py")
+    probe_root = tmp_path / "probe"
+    # A supervised-unit NAME (`is_hermes_unit` is prefix-based) placed in app.slice, i.e.
+    # outside the worker slice — the shape of a unit that dispatches workers.
+    unit = f"hermes-webdesktop-backend-probe-{uuid.uuid4().hex[:8]}"
+    completed = subprocess.run(
+        [
+            "systemd-run", "--user", "--quiet", "--collect", "--pipe",
+            f"--unit={unit}", "--slice=app.slice",
+            f"--working-directory={repo_root}",
+            f"--setenv=HERMES_PROBE_ROOT={probe_root}",
+            f"--setenv=PYTHONPATH={repo_root}",
+            sys.executable, str(probe),
+        ],
+        capture_output=True,
+        text=True,
+        timeout=120,
+        check=False,
+    )
+
+    result_file = probe_root / "result.json"
+    assert result_file.exists(), (
+        f"probe produced no result (rc={completed.returncode})\n"
+        f"stdout: {completed.stdout}\nstderr: {completed.stderr}"
+    )
+    result = json.loads(result_file.read_text(encoding="utf-8"))
+    assert "error" not in result, result["error"]
+
+    # The topology is the real one, not an assumption: a Hermes unit's cgroup, and a
+    # process that is a descendant of its main pid rather than the main pid itself.
+    assert result["invocation_id_present"] is True
+    assert result["systemd_exec_pid"] == str(result["unit_pid"])
+    assert result["descendant_pid"] != result["unit_pid"]
+    assert result["identity"] is False, (
+        "the identity predicate must be False here — that is what made this leak silent"
+    )
+    assert result["placement"] is True, result["unit_cgroup"]
+
+    # The worker landed in the unit this run should have minted, NOT in the cgroup of the
+    # process that dispatched it (which is precisely what the leak looked like).
+    assert result["worker_leaf"] == result["expected_leaf"], result["worker_cgroup"]
+    assert "/hermes-workers.slice/" in result["worker_cgroup"], result["worker_cgroup"]
+    assert result["worker_shares_parent_cgroup"] is False
+    assert unit not in result["worker_cgroup"], result["worker_cgroup"]
