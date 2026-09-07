@@ -830,7 +830,7 @@ def collect_background_review_actions(
         operations = operations if isinstance(operations, list) else []
         target_name = "skill" if is_skill else (target or "memory")
 
-        def _record(operation: str) -> Dict[str, Any]:
+        def _record(operation: str, skill_name: Any = None) -> Dict[str, Any]:
             outcome = _outcome(data, success)
             record: Dict[str, Any] = {
                 "target": target_name,
@@ -843,20 +843,21 @@ def collect_background_review_actions(
                 "reason": _safe_reason(label, operation, outcome),
                 "change_summary": _change_summary(operation, outcome),
             }
-            if is_skill and detail.get("name"):
-                record["skill_name"] = detail["name"]
+            if is_skill and isinstance(skill_name, str) and skill_name:
+                record["skill_name"] = skill_name
             return record
 
-        if operations and not is_skill:
-            # Batch ``memory`` call — one record per sub-operation so each
-            # add/replace/remove within the batch is individually visible.
+        if operations:
+            # Both memory and the schema-advertised skill_manage shape are batches.
+            # Publish one redacted record per operation, retaining only a narrow skill
+            # identifier for skill operations; never expose operation source fields.
             for op in operations:
                 if not isinstance(op, dict):
                     continue
                 op_act = op.get("action", "") or "unknown"
-                records.append(_record(op_act))
+                records.append(_record(op_act, op.get("name") if is_skill else None))
         else:
-            records.append(_record(action))
+            records.append(_record(action, detail.get("name") if is_skill else None))
 
     return records
 

@@ -92,35 +92,48 @@ def test_batch_operations_yield_one_record_per_sub_operation():
     assert all(r["success"] is True for r in records)
 
 
-def test_skill_patch_record_includes_diff_previews():
+def test_skill_batch_records_every_operation_without_source_content():
+    secret = "sk-live-secret-correct-horse-battery-staple"
     review_messages = [
         _assistant_call(
             "c1",
             "skill_manage",
-            {"action": "patch", "name": "demo-skill", "old_string": "old approach", "new_string": "new approach"},
-        ),
-        _tool_result(
-            "c1",
             {
-                "success": True,
-                "message": "Patched SKILL.md in skill 'demo-skill' (1 replacement).",
-                "_change": {"old": "old approach", "new": "new approach"},
+                "operations": [
+                    {"action": "create", "name": "demo-skill", "content": secret},
+                    {"action": "patch", "name": "demo-skill", "old_string": secret, "new_string": secret},
+                    {"action": "write_file", "name": "other-skill", "file_path": "references/private.md", "file_content": secret},
+                ]
             },
         ),
+        _tool_result("c1", {"success": True, "message": "Batch applied."}),
+    ]
+
+    records = collect_background_review_actions(review_messages, [], notification_mode="on")
+
+    assert len(records) == 3
+    assert [record["operation"] for record in records] == ["create", "patch", "write_file"]
+    assert [record["skill_name"] for record in records] == ["demo-skill", "demo-skill", "other-skill"]
+    assert all(record["target"] == "skill" and record["label"] == "Skill" for record in records)
+    assert all(record["success"] is True and record["state"] == "completed" for record in records)
+    assert records[1]["change_summary"] == "Before: prior record. After: updated record."
+    serialized = _json.dumps(records)
+    assert secret not in serialized
+    assert not {"content_preview", "old_preview", "new_preview"} & set().union(*(record.keys() for record in records))
+
+
+def test_legacy_flat_skill_call_remains_renderable():
+    review_messages = [
+        _assistant_call("c1", "skill_manage", {"action": "patch", "name": "demo-skill", "old_string": "private", "new_string": "private"}),
+        _tool_result("c1", {"success": True, "message": "Patched skill."}),
     ]
 
     records = collect_background_review_actions(review_messages, [], notification_mode="on")
 
     assert len(records) == 1
-    record = records[0]
-    assert record["target"] == "skill"
-    assert record["label"] == "Skill"
-    assert record["operation"] == "patch"
-    assert record["skill_name"] == "demo-skill"
-    assert record["success"] is True
-    assert record["state"] == "completed"
-    assert record["change_summary"] == "Before: prior record. After: updated record."
-    assert not {"content_preview", "old_preview", "new_preview"} & record.keys()
+    assert records[0]["operation"] == "patch"
+    assert records[0]["skill_name"] == "demo-skill"
+    assert "private" not in _json.dumps(records)
 
 
 def test_failed_write_is_included_not_dropped():
