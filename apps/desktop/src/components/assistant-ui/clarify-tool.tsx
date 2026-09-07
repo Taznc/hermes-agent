@@ -22,6 +22,7 @@ import { Kbd } from '@/components/ui/kbd'
 import { Textarea } from '@/components/ui/textarea'
 import { Tip } from '@/components/ui/tooltip'
 import { useI18n } from '@/i18n'
+import { ClarifyMarkdown, renderClarifyInline } from '@/lib/clarify-markdown'
 import { triggerHaptic } from '@/lib/haptics'
 import { CircleLetterA, Loader2, MessageQuestion } from '@/lib/icons'
 import { visibleClarifyCard } from '@/lib/keybinds/composer-focus-keys'
@@ -196,16 +197,18 @@ const letterFor = (index: number): string => String.fromCharCode(65 + index)
 
 // The backend tags the agent's preferred option (`mark_recommended`); the card
 // renders the label in tertiary text so the option itself still reads first.
+// Choices are validated newline-free (normalizeChoices), so inline rendering
+// (bold/code, no block/list splitting) is all a choice ever needs.
 function ChoiceLabel({ choice }: { choice: string }) {
   const bare = bareChoice(choice)
 
   if (bare === choice) {
-    return <>{choice}</>
+    return <>{renderClarifyInline(choice)}</>
   }
 
   return (
     <>
-      {bare} <span className="text-(--ui-text-tertiary)">{RECOMMENDED_LABEL}</span>
+      {renderClarifyInline(bare)} <span className="text-(--ui-text-tertiary)">{RECOMMENDED_LABEL}</span>
     </>
   )
 }
@@ -372,7 +375,7 @@ function ClarifyHelpControls({
                 Getting help…
               </span>
             ) : item.content ? (
-              <p key={item.explanationId}>{item.content}</p>
+              <ClarifyMarkdown key={item.explanationId} text={item.content} />
             ) : item.error ? (
               <p className="text-destructive" key={item.explanationId}>
                 {item.error}
@@ -557,7 +560,7 @@ function ClarifyHelpDetails({ help }: { help: Record<string, ClarifyHelp> }) {
       <summary>Help requested</summary>
       <div className="mt-1 grid gap-1">
         {entries.map(item => (
-          <p key={item.explanationId}>{item.content}</p>
+          <ClarifyMarkdown key={item.explanationId} text={item.content ?? ''} />
         ))}
       </div>
     </details>
@@ -611,23 +614,25 @@ function ClarifyToolSingleSettled({
     <ClarifyShell className="my-1.5 grid gap-1.5" data-clarify-settled="">
       {question ? (
         <ClarifyLine icon={MessageQuestion}>
-          <span className="whitespace-pre-wrap font-medium leading-(--conversation-line-height)">{question}</span>
+          <div className="font-medium leading-(--conversation-line-height)">
+            <ClarifyMarkdown text={question} />
+          </div>
         </ClarifyLine>
       ) : null}
       {answerText ? (
         <ClarifyLine icon={CircleLetterA}>
           <div className="grid gap-0.5">
             <span className="text-[0.6875rem] font-medium text-(--ui-text-tertiary)">{copy.selected}</span>
-            <p
+            <div
               className={cn(
-                'whitespace-pre-wrap leading-(--conversation-line-height)',
+                'leading-(--conversation-line-height)',
                 error ? 'text-destructive' : 'text-(--ui-text-secondary)',
                 skipped && 'italic text-(--ui-text-tertiary)'
               )}
               data-clarify-answer=""
             >
-              {answerText}
-            </p>
+              <ClarifyMarkdown text={answerText} />
+            </div>
           </div>
         </ClarifyLine>
       ) : null}
@@ -635,9 +640,9 @@ function ClarifyToolSingleSettled({
         <ClarifyLine icon={CircleLetterA}>
           <div className="grid gap-0.5">
             <span className="text-[0.6875rem] font-medium text-(--ui-text-tertiary)">{copy.note}</span>
-            <p className="whitespace-pre-wrap leading-(--conversation-line-height) text-(--ui-text-secondary)">
-              {note}
-            </p>
+            <div className="leading-(--conversation-line-height) text-(--ui-text-secondary)">
+              <ClarifyMarkdown text={note} />
+            </div>
           </div>
         </ClarifyLine>
       ) : null}
@@ -1057,9 +1062,9 @@ function ClarifyToolSinglePending({
     >
       <ClarifyShell className="grid gap-2">
         <div className="flex items-start gap-2">
-          <span className="flex-1 whitespace-pre-wrap font-medium leading-(--conversation-line-height)">
-            {question}
-          </span>
+          <div className="flex-1 font-medium leading-(--conversation-line-height)">
+            <ClarifyMarkdown text={question} />
+          </div>
           <MessageQuestion aria-hidden className="mt-px size-4 shrink-0 text-(--ui-text-tertiary)" />
         </div>
         <ClarifyHelpControls request={matchingRequest} target="question" targetLabel={question} />
@@ -1210,32 +1215,32 @@ function ClarifyToolBatchSettled({
           <div className="grid gap-1" key={`${index}-${row.question ?? ''}`}>
             {row.question ? (
               <ClarifyLine icon={MessageQuestion}>
-                <span className="whitespace-pre-wrap font-medium leading-(--conversation-line-height)">
-                  {row.question}
-                </span>
+                <div className="font-medium leading-(--conversation-line-height)">
+                  <ClarifyMarkdown text={row.question} />
+                </div>
               </ClarifyLine>
             ) : null}
             <ClarifyLine icon={CircleLetterA}>
               <div className="grid gap-0.5">
                 <span className="text-[0.6875rem] font-medium text-(--ui-text-tertiary)">{copy.selected}</span>
-                <p
+                <div
                   className={cn(
-                    'whitespace-pre-wrap leading-(--conversation-line-height)',
+                    'leading-(--conversation-line-height)',
                     blank ? 'italic text-(--ui-text-tertiary)' : 'text-(--ui-text-secondary)'
                   )}
                   data-clarify-answer=""
                 >
-                  {blank ? copy.skipped : answer}
-                </p>
+                  {blank ? copy.skipped : <ClarifyMarkdown text={answer} />}
+                </div>
               </div>
             </ClarifyLine>
             {row.note?.trim() ? (
               <ClarifyLine icon={CircleLetterA}>
                 <div className="grid gap-0.5">
                   <span className="text-[0.6875rem] font-medium text-(--ui-text-tertiary)">{copy.note}</span>
-                  <p className="whitespace-pre-wrap leading-(--conversation-line-height) text-(--ui-text-secondary)">
-                    {row.note}
-                  </p>
+                  <div className="leading-(--conversation-line-height) text-(--ui-text-secondary)">
+                    <ClarifyMarkdown text={row.note} />
+                  </div>
                 </div>
               </ClarifyLine>
             ) : null}
@@ -1311,9 +1316,9 @@ function BatchQuestionBlock({
         >
           {answered ? '✓' : index + 1}
         </span>
-        <span className="flex-1 whitespace-pre-wrap font-medium leading-(--conversation-line-height)">
-          {question.question}
-        </span>
+        <div className="flex-1 font-medium leading-(--conversation-line-height)">
+          <ClarifyMarkdown text={question.question} />
+        </div>
         <span className="mt-0.5 shrink-0 text-[0.625rem] tabular-nums text-(--ui-text-tertiary)">
           {index + 1}/{total}
         </span>
