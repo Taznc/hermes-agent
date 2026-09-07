@@ -58,12 +58,16 @@ const timers = new Map<string, number>()
 
 export const $notifications = atom<AppNotification[]>([])
 
-function defaultDuration(kind: NotificationKind) {
-  if (kind === 'error' || kind === 'warning') {
+function defaultDuration(kind: NotificationKind, action?: NotificationAction) {
+  // A recovery action must never disappear before the person can read and use
+  // it. Errors and warnings are already persistent for the same reason.
+  if (kind === 'error' || kind === 'warning' || action) {
     return 0
   }
 
-  return 5_000
+  // Routine confirmation still gets out of the way, but five seconds is too
+  // brief to read a complete sentence while continuing the task at hand.
+  return 8_000
 }
 
 // Only interruptions worth a top-center toast: errors, warnings, and anything
@@ -206,7 +210,7 @@ export function notify(input: NotificationInput): string {
     item.onEvict?.()
   }
 
-  const duration = input.durationMs ?? defaultDuration(kind)
+  const duration = input.durationMs ?? defaultDuration(kind, input.action)
 
   if (duration > 0) {
     timers.set(
