@@ -54,7 +54,7 @@ class ComputeHost:
     # frame ``type`` -> handler method name (resolved per call so monkeypatches take effect).
     _FRAME_HANDLERS: dict[str, str] = {
         "turn.start": "_handle_turn_start", "interrupt": "_handle_interrupt",
-        "respond": "_handle_respond", "reload_mcp": "_handle_reload_mcp",
+        "respond": "_handle_respond", "explain": "_handle_explain", "reload_mcp": "_handle_reload_mcp",
         "control": "_handle_control", "shutdown": "_handle_shutdown"}
 
     def __init__(
@@ -200,6 +200,20 @@ class ComputeHost:
             response = server._methods["clarify.respond"](request_id, params)
             self._reply("respond.ack", sid, request_id, response=response)
         self._guarded(frame, "respond.error", body)
+
+    def _handle_explain(self, frame: dict[str, Any]) -> None:
+        """Generate help where the pending clarification and live history are owned."""
+        def body(server: Any, sid: str, request_id: Any) -> None:
+            params = frame.get("params")
+            error = ("session not found" if sid not in server._sessions
+                     else "explain params must be an object" if not isinstance(params, dict)
+                     else None)
+            if error:
+                self._reply("explain.error", sid, request_id, message=error)
+                return
+            response = server._methods["clarify.explain"](request_id, params)
+            self._reply("explain.ack", sid, request_id, response=response)
+        self._guarded(frame, "explain.error", body)
 
     def _run_real_turn(self, frame: dict[str, Any]) -> None:
         sid = str(frame.get("sid") or "")

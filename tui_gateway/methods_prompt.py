@@ -1165,7 +1165,7 @@ def _spawn_clarify_explanation(session: dict, prompt: str) -> str:
 @method("clarify.explain")
 def _(rid, params: dict) -> dict:
     """Return non-terminal help for a pending clarification; answers still use clarify.respond."""
-    version = params.get("version", _CLARIFY_EXPLAIN_VERSION)
+    version = params.get("version")
     if isinstance(version, bool) or not isinstance(version, int) or version != _CLARIFY_EXPLAIN_VERSION:
         return _err(rid, 4004, f"unsupported clarify.explain version {version!r}")
     session, err = _sess(params, rid)
@@ -1184,6 +1184,8 @@ def _(rid, params: dict) -> dict:
     selected, choice, target_err = _clarify_explain_target(rid, snapshot, params)
     if target_err is not None:
         return target_err
+    if proxied := _explain_compute_host_clarify(rid, sid, session, params):
+        return proxied
     explanation_id = uuid.uuid4().hex
     try:
         content = _spawn_clarify_explanation(

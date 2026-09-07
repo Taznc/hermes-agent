@@ -82,6 +82,61 @@ def test_compute_host_routes_clarify_response_to_child_pending_registry(monkeypa
         server._sessions.pop(sid, None)
         host.close()
 
+
+def test_compute_host_routes_clarify_explanation_to_child_live_session(monkeypatch):
+    """Help runs in the child, which owns the pending Event and non-mirrored history."""
+    out = io.StringIO()
+    host = ComputeHost(stdout=out, heartbeat_secs=0)
+    sid = "host-explain"
+    live_history = [{"role": "user", "content": "host-only context"}]
+    server._sessions[sid] = {"history": live_history, "history_lock": threading.Lock()}
+    calls = []
+    monkeypatch.setitem(
+        server._methods,
+        "clarify.explain",
+        lambda rid, params: calls.append((rid, dict(params), server._sessions[sid]["history"])) or {
+            "result": {"status": "complete", "explanation_id": "host-help"}},
+    )
+
+    try:
+        host._handle_explain({
+            "sid": sid, "request_id": "relay-explain",
+            "params": {"version": 1, "request_id": "clarify-request", "choice": "yes"},
+        })
+        assert calls == [(
+            "relay-explain", {"version": 1, "request_id": "clarify-request", "choice": "yes"},
+            live_history,
+        )]
+        frame = _json_lines(out)[-1]
+        assert frame["type"] == "explain.ack"
+        assert frame["sid"] == sid
+        assert frame["request_id"] == "relay-explain"
+        assert frame["response"] == {"result": {"status": "complete", "explanation_id": "host-help"}}
+    finally:
+        server._sessions.pop(sid, None)
+        host.close()
+
+
+def test_supervisor_explain_delivers_host_ack(monkeypatch, tmp_path):
+    """The supervisor recognizes the dedicated explanation frame, not a control mutation."""
+    supervisor = HostSupervisor(registry_path=tmp_path / "host.json", autostart=False)
+    monkeypatch.setattr(supervisor, "start", lambda: None)
+    sent = []
+
+    def send(frame):
+        sent.append(dict(frame))
+        supervisor._handle_host_frame({
+            "type": "explain.ack", "request_id": frame["request_id"], "sid": frame["sid"],
+            "response": {"result": {"status": "complete", "explanation_id": "help-1"}},
+        })
+
+    monkeypatch.setattr(supervisor, "_send_frame", send)
+    result = supervisor.explain("s1", {"version": 1, "request_id": "clarify-1"})
+    assert result["response"]["result"]["explanation_id"] == "help-1"
+    assert sent[0]["type"] == "explain"
+    assert sent[0]["params"] == {"version": 1, "request_id": "clarify-1"}
+
+
 def test_mutator_route_table_matches_prd_inventory():
     assert MUTATOR_ROUTE_TABLE == {
         "prompt.submit": "turn-path",
