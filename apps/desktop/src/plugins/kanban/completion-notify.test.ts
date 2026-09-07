@@ -41,7 +41,7 @@ type NotifyInput = {
   kind?: string
   meta?: string
   detail?: string
-  contextCard?: { eyebrow?: string; meta?: string; summary?: string }
+  contextCard?: { eyebrow?: string; meta?: string; summary?: string; title?: string }
   action?: { label: string; onClick: () => void }
 }
 
@@ -327,7 +327,7 @@ describe('ambiguous alias', () => {
 })
 
 describe('notification content', () => {
-  it('zero artifacts: task identity only', async () => {
+  it('zero artifacts stays compact instead of exposing an id-only Details expander', async () => {
     const m = await loadModule()
     m.bindCompletionNotify(makeRest(() => 100) as never)
 
@@ -337,7 +337,6 @@ describe('notification content', () => {
       kind: 'success',
       title: 'Task completed',
       message: 'Done',
-      detail: 't101',
       action: { label: 'Open card', onClick: expect.any(Function) }
     })
   })
@@ -350,7 +349,7 @@ describe('notification content', () => {
       ev(101, 'completed', { summary: 'Done', artifacts: ['/work/x/out/report.md'] })
     ])
 
-    expect(lastNotify().detail).toBe('t101 · report.md')
+    expect(lastNotify().detail).toBe('report.md')
   })
 
   it('multiple artifacts: "<N> artifacts"', async () => {
@@ -361,7 +360,7 @@ describe('notification content', () => {
       ev(101, 'completed', { summary: 'Done', artifacts: ['/a/1.md', '/b/2.md', '/c/3.md'] })
     ])
 
-    expect(lastNotify().detail).toBe('t101 · 3 artifacts')
+    expect(lastNotify().detail).toBe('3 artifacts')
   })
 
   it('malformed payload does not crash: null payload, non-array artifacts, non-string summary', async () => {
@@ -377,7 +376,7 @@ describe('notification content', () => {
     // All three are unseen completions; none may throw.
     expect(hostMock.notify).toHaveBeenCalledTimes(3)
     expect(lastNotify().message).toBe('ok')
-    expect(lastNotify().detail).toBe('t103 · ok.md')
+    expect(lastNotify().detail).toBe('ok.md')
   })
 
   it('shows the card title and metadata, then opens that exact card', async () => {
@@ -408,13 +407,16 @@ describe('notification content', () => {
 
     const input = lastNotify()
     expect(input).toMatchObject({
-      detail: 't101 · Landed with focused coverage',
       kind: 'success',
-      message: 'Make Kanban notifications readable',
-      meta: 'Worker result',
+      message: 'Worker result',
       title: 'Task completed'
     })
-    expect(input.contextCard).toEqual({ eyebrow: 'Done · reviewer', meta: 't101', summary: 'Landed with focused coverage' })
+    expect(input.contextCard).toEqual({
+      eyebrow: 'Done · reviewer',
+      meta: 'Task ID: t101',
+      summary: 'Landed with focused coverage',
+      title: 'Make Kanban notifications readable'
+    })
     expect(input.action?.label).toBe('Open card')
     input.action?.onClick()
     expect(hostMock.navigate).toHaveBeenCalledWith('/kanban?board=smoke&task=t101')
@@ -453,8 +455,7 @@ describe('terminal kinds beyond completed', () => {
     expect(lastNotify()).toMatchObject({
       kind: 'warning',
       title: 'Task blocked — needs your input',
-      message: 'needs API key',
-      detail: 't101'
+      message: 'needs API key'
     })
   })
 
@@ -510,7 +511,7 @@ describe('native OS door', () => {
     expect(os.notify).toHaveBeenCalledTimes(1)
     expect(os.notify.mock.calls[0][0]).toEqual({
       title: 'Task blocked — needs your input',
-      body: 'needs input\nt101'
+      body: 'needs input'
     })
   })
 
@@ -569,7 +570,7 @@ describe('i18n routing', () => {
 
     expect(lastNotify()).toMatchObject({
       title: 'タスク完了',
-      detail: 't101 · 成果物 2 件',
+      detail: '成果物 2 件',
       action: { label: 'カードを開く', onClick: expect.any(Function) }
     })
   })

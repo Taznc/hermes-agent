@@ -79,7 +79,8 @@ describe('toast titles', () => {
       contextCard: {
         eyebrow: 'Done · reviewer',
         summary: 'Landed with focused coverage',
-        meta: 't101'
+        meta: 'Task ID: t101',
+        title: 'Make Kanban notifications readable'
       }
     })
 
@@ -89,11 +90,18 @@ describe('toast titles', () => {
       </I18nProvider>
     )
 
-    const card = screen.getByText('Done · reviewer').closest('[data-notification-context-card="true"]')
+    const titleNodes = screen.getAllByText('Make Kanban notifications readable')
+
+    const card = titleNodes.find(node => node.closest('[data-notification-context-card="true"]'))?.closest(
+      '[data-notification-context-card="true"]'
+    )
 
     expect(card).toBeTruthy()
     expect(card?.textContent).toContain('Done · reviewer')
     expect(card?.textContent).toContain('Landed with focused coverage')
-    expect(card?.textContent).toContain('t101')
+    expect(card?.textContent).toContain('Task ID: t101')
+
+    const message = titleNodes.find(node => node.matches('p[data-notification-message]'))
+    expect(message?.className).toMatch(/\bline-clamp-3\b/)
   })
 })

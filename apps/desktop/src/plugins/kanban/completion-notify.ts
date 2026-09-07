@@ -187,7 +187,9 @@ async function notifyOne(slug: string, kind: string, spec: { titleKey: string; t
   const body = bodyFor(kind, ev)
   const task = await fetchTask(slug, taskId)
   const cardTitle = trimmed(task?.title)
-  const taskSummary = trimmed(task?.latest_summary) || trimmed(task?.body)
+  const taskResult = trimmed(task?.latest_summary)
+  const taskBody = trimmed(task?.body)
+  const taskSummary = taskResult || taskBody
 
   const artifacts =
     kind === 'completed' && Array.isArray(ev.payload?.artifacts)
@@ -203,26 +205,35 @@ async function notifyOne(slug: string, kind: string, spec: { titleKey: string; t
         ? t('notify.artifacts', artifacts.length)
         : ''
 
-  // The toast deliberately follows the board card's hierarchy: terminal
-  // outcome first, card title second, and a quiet metadata line. A task id is
-  // still available in Details, but no longer the only answer to "what was
-  // that notification about?".
+  // The toast explains the event in a bounded first paragraph. Its context
+  // block then follows the board card's own hierarchy: name, card summary,
+  // quiet status/assignee + a clearly-labelled task id. That keeps a verbose
+  // worker handoff readable without burying the object under a raw id.
   const summary = body || taskSummary
-  const cardSummary = taskSummary && taskSummary !== summary ? taskSummary : ''
+  const cardSummary = kind === 'completed' ? taskResult || taskBody : taskBody && taskBody !== summary ? taskBody : ''
   const cardEyebrow = task ? [task.status ? statusLabel(task.status) : '', trimmed(task.assignee)].filter(Boolean).join(' · ') : ''
-  const cardMeta = task ? taskId : ''
-  const detail = [taskId, taskSummary && taskSummary !== summary ? taskSummary : '', artifactText].filter(Boolean).join(' · ')
+  const cardMeta = task && taskId ? `Task ID: ${taskId}` : ''
+  // A short event sentence is already visible. Details earn their disclosure
+  // only when they preserve an otherwise-clamped worker handoff or artifacts;
+  // never render an empty-looking expander that contains only an opaque id.
+  const detail = [body.length > 240 ? body : '', artifactText].filter(Boolean).join(' · ')
   // gave_up carries its structured cause in `payload.error` — humanize it
   // (runErrorText) the same way the drawer does, instead of a bare "gave up".
   const title = kind === 'gave_up' ? t('notify.gaveUpTitle', body ? runErrorText(body, en).primary : undefined) : t(spec.titleKey)
-  const message = cardTitle || summary || taskId || title
+  const message = summary || cardTitle || taskId || title
   host.notify({
     kind: spec.toast,
     title,
     message,
-    ...(summary && summary !== message ? { meta: summary } : {}),
-    ...(cardEyebrow || cardSummary || cardMeta
-      ? { contextCard: { ...(cardEyebrow ? { eyebrow: cardEyebrow } : {}), ...(cardSummary ? { summary: cardSummary } : {}), ...(cardMeta ? { meta: cardMeta } : {}) } }
+    ...(cardTitle || cardEyebrow || cardSummary || cardMeta
+      ? {
+          contextCard: {
+            ...(cardTitle ? { title: cardTitle } : {}),
+            ...(cardEyebrow ? { eyebrow: cardEyebrow } : {}),
+            ...(cardSummary ? { summary: cardSummary } : {}),
+            ...(cardMeta ? { meta: cardMeta } : {})
+          }
+        }
       : {}),
     ...(detail ? { detail } : {}),
     action: { label: t('notify.openCard'), onClick: () => host.navigate(cardRoute(slug, taskId)) }
@@ -232,7 +243,7 @@ async function notifyOne(slug: string, kind: string, spec: { titleKey: string; t
   // is away from Hermes (the toast above covers the foreground case). Isolated:
   // a missing/broken shell must not mark the toast as unfired.
   try {
-    osDoor?.notify({ title, body: [message, summary && summary !== message ? summary : '', cardEyebrow, cardSummary, detail].filter(Boolean).join('\n') })
+    osDoor?.notify({ title, body: [message, cardTitle, cardEyebrow, cardSummary, detail].filter(Boolean).join('\n') })
   } catch {
     /* swallowed */
   }
