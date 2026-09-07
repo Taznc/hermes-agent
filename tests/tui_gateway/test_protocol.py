@@ -392,22 +392,23 @@ def test_clarify_batch_resolves_when_all_questions_locked(capture):
 
     first = server.handle_request({
         "id": "a1", "method": "clarify.respond",
-        "params": {"request_id": rid, "question_id": "q1", "answer": "beta"},
+        "params": {"request_id": rid, "question_id": "q1", "answer": "beta", "note": "beta note"},
     })
-    assert first["result"]["status"] == "ok"
-    assert first["result"]["remaining"] == ["q0"]
+    assert first["result"] == {"status": "ok", "remaining": ["q0"], "note": "beta note"}
     assert thread.is_alive()  # one question left — still blocking
 
     second = server.handle_request({
         "id": "a2", "method": "clarify.respond",
-        "params": {"request_id": rid, "question_id": "q0", "answer": "alpha"},
+        "params": {"request_id": rid, "question_id": "q0", "answer": "alpha", "note": "alpha note"},
     })
-    assert second["result"]["status"] == "ok"
-    assert second["result"]["remaining"] == []
+    assert second["result"] == {"status": "ok", "remaining": [], "note": "alpha note"}
 
     thread.join(timeout=5)
     assert not thread.is_alive()
-    assert json.loads(box["answer"]) == {"answers": {"q0": "alpha", "q1": "beta"}}
+    assert json.loads(box["answer"]) == {
+        "answers": {"q0": "alpha", "q1": "beta"},
+        "notes": {"q0": "alpha note", "q1": "beta note"},
+    }
 
 
 def test_clarify_batch_answer_update_overwrites_before_completion(server):
@@ -415,19 +416,20 @@ def test_clarify_batch_answer_update_overwrites_before_completion(server):
 
     server.handle_request({
         "id": "a1", "method": "clarify.respond",
-        "params": {"request_id": rid, "question_id": "q0", "answer": "first"},
+        "params": {"request_id": rid, "question_id": "q0", "answer": "first", "note": "first note"},
     })
     server.handle_request({
         "id": "a2", "method": "clarify.respond",
-        "params": {"request_id": rid, "question_id": "q0", "answer": "changed"},
+        "params": {"request_id": rid, "question_id": "q0", "answer": "changed", "note": "changed note"},
     })
     server.handle_request({
         "id": "a3", "method": "clarify.respond",
-        "params": {"request_id": rid, "question_id": "q1", "answer": "done"},
+        "params": {"request_id": rid, "question_id": "q1", "answer": "done", "note": "done note"},
     })
 
     thread.join(timeout=5)
     assert json.loads(box["answer"])["answers"]["q0"] == "changed"
+    assert json.loads(box["answer"])["notes"]["q0"] == "changed note"
 
 
 def test_clarify_batch_empty_answer_is_a_locked_skip(server):
