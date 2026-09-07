@@ -430,6 +430,7 @@ export interface UpstreamTranslations {
       testBody: string
       testSent: string
       testUnsupported: string
+      testDenied: string
       completionSoundTitle: string
       completionSoundDesc: string
       completionSoundPreview: string

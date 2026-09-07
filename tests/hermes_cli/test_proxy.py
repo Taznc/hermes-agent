@@ -328,6 +328,12 @@ class CodexResponsesFakeAdapter(FakeAdapter):
         return True
 
 
+class CodexRestrictedParamsFakeAdapter(CodexResponsesFakeAdapter):
+    @property
+    def unsupported_responses_params(self):
+        return frozenset({"max_output_tokens", "temperature", "top_p"})
+
+
 async def _start_runner(app: "web.Application"):
     """Spin up an aiohttp app on an ephemeral localhost port. Returns (runner, base_url)."""
     runner = web.AppRunner(app, access_log=None)
@@ -1000,6 +1006,120 @@ def test_server_materializes_codex_sse_for_non_streaming_responses_client():
             assert captured["body"]["stream"] is True
             assert body["status"] == "completed"
             assert body["output"][0]["content"][0]["text"] == "HINDSIGHT_PROXY_OK"
+        finally:
+            await proxy_runner.cleanup()
+            await upstream_runner.cleanup()
+
+    asyncio.run(run())
+
+
+def test_server_drops_only_upstream_unsupported_responses_params():
+    """Sampling params the upstream rejects are stripped; everything else survives.
+
+    Hindsight's Responses client always sends ``max_output_tokens``, which the
+    ChatGPT-subscription Codex upstream answers 400 for. The proxy drops the
+    declared set and must leave the rest of the payload — including reasoning
+    and tool_choice — untouched.
+    """
+
+    async def run():
+        captured: Dict[str, Any] = {}
+
+        async def responses(request):
+            captured["body"] = await request.json()
+            response = {
+                "id": "resp_1",
+                "object": "response",
+                "status": "completed",
+                "output": [
+                    {
+                        "type": "message",
+                        "role": "assistant",
+                        "content": [{"type": "output_text", "text": "OK"}],
+                    }
+                ],
+            }
+            stream = web.StreamResponse(
+                status=200, headers={"Content-Type": "text/event-stream"}
+            )
+            await stream.prepare(request)
+            await stream.write(
+                b"event: response.completed\ndata: "
+                + json.dumps(
+                    {"type": "response.completed", "response": response}
+                ).encode()
+                + b"\n\n"
+            )
+            await stream.write_eof()
+            return stream
+
+        upstream = web.Application()
+        upstream.router.add_post("/v1/responses", responses)
+        upstream_runner, upstream_base = await _start_runner(upstream)
+        adapter = CodexRestrictedParamsFakeAdapter(
+            f"{upstream_base}/v1", allowed=["/responses"]
+        )
+        proxy_runner, proxy_base = await _start_runner(create_app(adapter))
+        try:
+            async with aiohttp.ClientSession() as session:
+                async with session.post(
+                    f"{proxy_base}/v1/responses",
+                    json={
+                        "model": "gpt-6-astra",
+                        "input": [],
+                        "store": False,
+                        "max_output_tokens": 16000,
+                        "temperature": 0.2,
+                        "top_p": 0.9,
+                        "tool_choice": "auto",
+                        "reasoning": {"effort": "medium"},
+                    },
+                ) as resp:
+                    assert resp.status == 200
+
+            sent = captured["body"]
+            for dropped in ("max_output_tokens", "temperature", "top_p"):
+                assert dropped not in sent
+            assert sent["tool_choice"] == "auto"
+            assert sent["reasoning"] == {"effort": "medium"}
+            assert sent["store"] is False
+            assert sent["model"] == "gpt-6-astra"
+            # Stream materialization still applies alongside param stripping.
+            assert sent["stream"] is True
+        finally:
+            await proxy_runner.cleanup()
+            await upstream_runner.cleanup()
+
+    asyncio.run(run())
+
+
+def test_default_adapter_forwards_responses_params_unchanged():
+    """Param stripping is opt-in: an adapter with no declared set forwards verbatim."""
+
+    async def run():
+        captured: Dict[str, Any] = {"requests": []}
+        upstream_runner, upstream_base = await _start_runner(
+            _build_fake_upstream(captured)
+        )
+        adapter = FakeAdapter(f"{upstream_base}/v1", allowed=["/responses"])
+        proxy_runner, proxy_base = await _start_runner(create_app(adapter))
+        try:
+            async with aiohttp.ClientSession() as session:
+                async with session.post(
+                    f"{proxy_base}/v1/responses",
+                    json={
+                        "model": "gpt-5.6-sol",
+                        "input": [],
+                        "max_output_tokens": 512,
+                        "temperature": 0.4,
+                    },
+                ) as resp:
+                    await resp.read()
+
+            sent = json.loads(captured["requests"][0]["body"])
+            assert sent["max_output_tokens"] == 512
+            assert sent["temperature"] == 0.4
+            assert "stream" not in sent
         finally:
             await proxy_runner.cleanup()
             await upstream_runner.cleanup()

@@ -1699,6 +1699,62 @@ def dispatch(dry_run: bool = Query(False), max_n: int = Query(8, alias="max"), b
             return {"result": str(result)}
 
 
+# --- Dispatch pause circuit (maintenance drain) ------------------------------
+
+class DispatchPauseBody(BaseModel):
+    note: Optional[str] = None
+
+
+@router.get("/dispatch/status")
+def dispatch_status(board: Optional[str] = _BOARD_Q):
+    """Pause state + the board's live running count, for the drain indicator.
+
+    ``running_count`` is the "is it safe to restart yet" signal: pausing fences
+    NEW dispatch only, so an operator watches this reach 0 before restarting a
+    service whose cgroup would otherwise SIGKILL those workers.
+    """
+    with _board_conn(board) as (board, conn):
+        state = kbd.read_dispatch_pause(board)
+        running = int(kanban_db.board_stats(conn)["by_status"].get("running", 0))
+    return {
+        "paused": state is not None,
+        "state": state,
+        "running_count": running,
+        "message": kbd.dispatch_pause_message(state, board=board) if state else None,
+    }
+
+
+def _dispatch_target_board(board: Optional[str]) -> str:
+    """Resolve the board a pause/resume acts on to an explicit slug.
+
+    An omitted param must land on the *current* board, exactly as
+    ``GET /dispatch/status`` reads it: the Desktop's board switcher stores
+    "the active board" as an empty slug, so the default UI path arrives here
+    with no ``board`` at all. Leaving that as ``None`` under
+    ``_with_board_pinned`` would pin ``DEFAULT_BOARD`` and pause a board the
+    operator is not looking at, while status kept reporting the real one —
+    a silent no-op right before a gateway restart. An explicit slug is still
+    validated and used verbatim, so board isolation is unchanged.
+    """
+    return _resolve_board(board) or kanban_db.get_current_board()
+
+
+@router.post("/dispatch/pause")
+def dispatch_pause(payload: Optional[DispatchPauseBody] = None, board: Optional[str] = _BOARD_Q):
+    """Stop claiming/spawning on this board so it can drain. Never kills a worker."""
+    target = _dispatch_target_board(board)
+    return _with_board_pinned(
+        target, lambda: kbd.pause_dispatch(target, note=(payload.note if payload else None)),
+    )
+
+
+@router.post("/dispatch/resume")
+def dispatch_resume(board: Optional[str] = _BOARD_Q):
+    """Clear this board's pause — the same entry point `--resume-circuit` uses."""
+    target = _dispatch_target_board(board)
+    return _with_board_pinned(target, lambda: kbd.resume_dispatch(target))
+
+
 @router.get("/model-options")
 def model_options():
     """Providers + curated models for the override dropdown via ``inventory.build_models_payload``

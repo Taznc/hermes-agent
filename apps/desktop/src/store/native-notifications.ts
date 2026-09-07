@@ -387,18 +387,35 @@ export async function respondToApprovalAction(sessionId: null | string, actionId
   }
 }
 
-// Settings "send test" — bypasses gating. Returns whether the OS accepted it so
-// the panel can flag a silent permission failure instead of looking dead.
-export async function sendTestNativeNotification(title: string, body: string): Promise<boolean> {
+// Settings "send test" — bypasses gating. Returns whether the OS accepted it,
+// plus WHY not when it didn't, so the panel can tell a genuine permission
+// denial apart from "this platform has no native notifications at all"
+// instead of one flat, unhelpful failure message.
+export type TestNotificationResult = { ok: true } | { ok: false; reason: 'denied' | 'unsupported' }
+
+export async function sendTestNativeNotification(title: string, body: string): Promise<TestNotificationResult> {
   const bridge = window.hermesDesktop
 
   if (!bridge?.notify) {
-    return false
+    return { ok: false, reason: 'unsupported' }
   }
 
   try {
-    return await bridge.notify({ body, kind: 'turnDone', title })
+    const ok = await bridge.notify({ body, kind: 'turnDone', title })
+
+    if (ok) {
+      return { ok: true }
+    }
+
+    // notify() returning false with a permission query available (web build)
+    // means either the platform lacks notifications entirely, or the user
+    // (or a prior browser prompt) denied them — tell those apart so Settings
+    // can point at "check OS/browser permissions" only when that is actually
+    // the fix.
+    const permission = await bridge.getNotificationPermission?.()
+
+    return { ok: false, reason: permission === 'denied' ? 'denied' : 'unsupported' }
   } catch {
-    return false
+    return { ok: false, reason: 'unsupported' }
   }
 }
