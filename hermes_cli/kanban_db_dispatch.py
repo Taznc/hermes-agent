@@ -902,12 +902,11 @@ def _error_fingerprint(error_text: str) -> str:
     return fp.lower().strip()
 
 
-# ~96% of "clean exit without a terminal tool call" tasks complete on a later
-# run, so a protocol violation gets a bounded retry before the breaker trips.
-# The budget is a violation-only STREAK (``_protocol_violation_streak``),
-# independent of ``consecutive_failures``: other failure kinds neither consume
-# nor extend it. Per-task ``max_retries`` overrides it.
-_PROTOCOL_VIOLATION_FAILURE_LIMIT = 3
+# A clean exit gets exactly one recovery run: the next worker sees the durable
+# prior-run error and can report work that already completed. A second identical
+# clean exit is a reporting gap, not evidence that a third full execution is
+# worthwhile, so the dispatcher force-blocks it for an explicit decision.
+_PROTOCOL_VIOLATION_FAILURE_LIMIT = 2
 
 # Closed runs to walk when counting the streak; it trips at a handful anyway.
 _PROTOCOL_VIOLATION_SCAN_LIMIT = 50

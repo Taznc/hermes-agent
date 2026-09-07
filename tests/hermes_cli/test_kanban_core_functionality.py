@@ -1403,22 +1403,19 @@ def test_protocol_violation_budget_not_consumed_by_other_failures(kanban_home):
         assert task.status == "ready"
         assert task.consecutive_failures == 1
 
-        # Two violations after it: streak 1 and 2 — both retry, unified
-        # counter untouched. (Pre-fix: the crash consumed the budget and the
-        # violations blocked well before three of them happened.)
-        for i, pid in enumerate((991001, 991002)):
-            _drive_protocol_violation(conn, tid, pid)
-            task = kb.get_task(conn, tid)
-            assert task.status == "ready", (
-                f"violation {i + 1} after a crash must still retry, "
-                f"got {task.status}"
-            )
-            assert task.consecutive_failures == 1, (
-                "below-budget violations must not tick the unified counter"
-            )
+        # One violation after it: streak 1 retries; the unified counter stays
+        # untouched. (The prior real crash must not consume this separate
+        # protocol-violation budget.)
+        _drive_protocol_violation(conn, tid, 991001)
+        task = kb.get_task(conn, tid)
+        assert task is not None
+        assert task.status == "ready"
+        assert task.consecutive_failures == 1, (
+            "the first protocol violation must not tick the unified counter"
+        )
 
-        # Third consecutive violation: streak hits the bound — blocked.
-        _drive_protocol_violation(conn, tid, 991003)
+        # Second consecutive violation: streak hits the bound — blocked.
+        _drive_protocol_violation(conn, tid, 991002)
         task = kb.get_task(conn, tid)
         assert task.status == "blocked"
         gave_up = [e for e in kb.list_events(conn, tid) if e.kind == "gave_up"]
@@ -1437,6 +1434,36 @@ def test_protocol_violation_budget_not_consumed_by_other_failures(kanban_home):
 
 
 
+
+
+def test_clean_exit_protocol_violation_allows_only_one_blind_retry(kanban_home):
+    """A clean exit without a lifecycle report gets one recovery run, then blocks.
+
+    The first exit releases the task with the prior-run error so the next worker
+    can verify and report any already-finished work. A second identical clean
+    exit is not evidence that the task needs another full execution: it must
+    leave a durable ``gave_up`` record and stay blocked for an operator.
+    """
+    conn = kbc.connect()
+    try:
+        tid = kb.create_task(conn, title="bounded-clean-exit", assignee="worker")
+
+        _drive_protocol_violation(conn, tid, 991101)
+        first = kb.get_task(conn, tid)
+        assert first is not None
+        assert first.status == "ready"
+        assert "without calling kanban_complete" in (first.last_failure_error or "")
+
+        _drive_protocol_violation(conn, tid, 991102)
+        second = kb.get_task(conn, tid)
+        assert second is not None
+        assert second.status == "blocked"
+        gave_up = [event for event in kb.list_events(conn, tid) if event.kind == "gave_up"]
+        assert len(gave_up) == 1
+        assert (gave_up[0].payload or {}).get("protocol_violations") == 2
+        assert kbd._PROTOCOL_VIOLATION_FAILURE_LIMIT == 2
+    finally:
+        conn.close()
 
 
 def test_notify_sub_starts_caught_up_on_active_task(kanban_home):
