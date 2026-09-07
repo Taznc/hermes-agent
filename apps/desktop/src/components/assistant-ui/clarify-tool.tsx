@@ -65,6 +65,25 @@ interface ClarifyResult {
 // Distinct even when multiple help controls are activated in one event-loop turn.
 let clarifyHelpLocalSequence = 0
 
+function clarifyHelpErrorMessage(cause: unknown): string {
+  const message = cause instanceof Error ? cause.message : ''
+  const normalized = message.toLowerCase()
+
+  if (
+    /session (?:not found|expired|gone)|clarification (?:not found|expired|gone)|owner.*(?:unknown|unavailable)/.test(
+      normalized
+    )
+  ) {
+    return 'This clarification is no longer available. Return to the conversation and try again.'
+  }
+
+  if (/offline|connection (?:closed|lost|unavailable)|network/.test(normalized)) {
+    return 'Help is temporarily unavailable. Check your connection and try again.'
+  }
+
+  return message || 'Help request failed. Try again.'
+}
+
 function stringField(row: Record<string, unknown>, ...keys: string[]): string | undefined {
   for (const key of keys) {
     const value = row[key]
@@ -284,9 +303,15 @@ function ClarifyHelpControls({
             ...(custom ? { follow_up: custom } : {}),
             ...(questionId ? { question_id: questionId } : {}),
             request_id: request.requestId,
+            // Owner routing selects the right gateway connection, but the
+            // clarify RPC itself resolves its pending request by runtime id.
+            // Without this wire field `_sess()` sees an empty session and
+            // rejects the otherwise-correct owner request as "session not found".
+            session_id: request.sessionId,
             version: 1
           }
         )
+
         const explanationId =
           typeof response === 'object' &&
           response !== null &&
@@ -298,10 +323,9 @@ function ClarifyHelpControls({
           reconcileClarifyHelp(request.requestId, request.sessionId, localId, explanationId)
         }
       } catch (cause) {
-        const message = cause instanceof Error ? cause.message : 'Help request failed.'
         updateClarifyHelp(request.requestId, request.sessionId, localId, {
           choice,
-          error: message,
+          error: clarifyHelpErrorMessage(cause),
           followUp: custom,
           questionId,
           status: 'error'
