@@ -297,10 +297,61 @@ def _attach_diagnostics(task_d: dict, diags: Optional[list[dict]], *, include_fu
 
 
 def _links_for(conn: sqlite3.Connection, task_id: str) -> dict[str, list[str]]:
-    """Return {'parents': [...], 'children': [...]} for a task."""
+    """Return {'parents': [...], 'children': [...]} for a task.
+
+    A parent that is archived AND has satisfied its dependency edge is omitted.
+    It can never gate this task again (``_parent_dependency_satisfied`` keys off
+    ``completed_at``, which only the completion lifecycle writes) and it is
+    absent from every default board view, so the drawer's ``resolveLinks`` can
+    only report it as unresolvable -- which ``partitionBlockers`` counts as
+    still-gating by design. Keeping it paints a permanent "waiting on blocker"
+    banner naming a task the user cannot see or act on.
+
+    Unlike the board payload this filter is not view-scoped: ``GET /tasks/:id``
+    takes no ``include_archived``, so it drops what NO default view can resolve
+    rather than what one particular view happens to omit. A parent id with no
+    task row at all (a genuinely deleted task) is preserved and keeps gating --
+    a dangling link is exactly what the user needs to see so they can cut it.
+    """
     def _ids(col: str, other: str) -> list[str]:
         return [r[col] for r in conn.execute(f"SELECT {col} FROM task_links WHERE {other} = ? ORDER BY {col}", (task_id,))]
-    return {"parents": _ids("parent_id", "child_id"), "children": _ids("child_id", "parent_id")}
+    parents = _ids("parent_id", "child_id")
+    if parents:
+        rows = conn.execute(
+            "SELECT id, status, completed_at FROM tasks WHERE id IN (" + ",".join("?" * len(parents)) + ")",
+            parents).fetchall()
+        cleared = {
+            r["id"] for r in rows
+            if r["status"] == "archived" and kanban_db._parent_dependency_satisfied(r)}
+        parents = [p for p in parents if p not in cleared]
+    return {"parents": parents, "children": _ids("child_id", "parent_id")}
+
+
+def _unresolvable_satisfied_parents(conn: sqlite3.Connection, visible_ids: set[str]) -> set[str]:
+    """Parent ids a board payload lists edges for but cannot render a card for,
+    and which provably no longer gate anyone.
+
+    The desktop resolves every edge endpoint against the payload's OWN task
+    index (``indexBoard``/``resolveLinks`` in ``apps/desktop/src/plugins/kanban/
+    deps.ts``) and treats an id it cannot find as still-gating -- deliberately,
+    since the backend link exists and may still be enforced. That default is
+    right for a deleted parent and wrong for a completed-then-archived one,
+    which the default ``include_archived=False`` fetch omits while its edge
+    survives. The result is a card stuck "waiting on a blocker" with no
+    resolvable reason until someone unlinks it by hand.
+
+    Only edges satisfying BOTH halves are dropped, so the safety default holds
+    everywhere it should: a parent that is merely archived without ever
+    completing (withdrawn, not finished) still gates, a parent whose row is gone
+    entirely still gates, and a satisfied parent that IS in this payload keeps
+    its edge -- that is the "blockers clear" state the desktop renders in green.
+    """
+    rows = conn.execute(
+        "SELECT DISTINCT t.id AS id, t.status AS status, t.completed_at AS completed_at "
+        "FROM tasks t JOIN task_links l ON l.parent_id = t.id").fetchall()
+    return {
+        r["id"] for r in rows
+        if r["id"] not in visible_ids and kanban_db._parent_dependency_satisfied(r)}
 
 
 # --- GET /board -------------------------------------------------------------
@@ -324,7 +375,14 @@ def _board_payload(
     # The same rows are kept as an explicit edge list so the UI can highlight a card's whole
     # dependency chain without N per-task round-trips.
     link_edges: list[list[str]] = []
+    # An edge whose parent this payload cannot render, but which no longer gates anyone, is
+    # dropped from BOTH rollups: the desktop reads `link_edges` when it has them and falls back
+    # to the `link_counts` numbers when it doesn't, so filtering only one of the two would still
+    # leave a phantom "blocked by 1" chip on the card. See _unresolvable_satisfied_parents.
+    cleared_parents = _unresolvable_satisfied_parents(conn, {t.id for t in tasks})
     for row in conn.execute("SELECT parent_id, child_id FROM task_links").fetchall():
+        if row["parent_id"] in cleared_parents:
+            continue
         link_counts.setdefault(row["parent_id"], {"parents": 0, "children": 0})["children"] += 1
         link_counts.setdefault(row["child_id"], {"parents": 0, "children": 0})["parents"] += 1
         link_edges.append([row["parent_id"], row["child_id"]])
