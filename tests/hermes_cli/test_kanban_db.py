@@ -1566,6 +1566,76 @@ def test_unarchiving_completed_parent_clears_evidence_and_regates_children(kanba
         assert still_gated is not None and still_gated.status == "todo"
 
 
+def test_archiving_completed_parent_clears_only_its_satisfied_child_edges(kanban_home):
+    """Archival deletes edges it satisfied forever; it keeps every other edge.
+
+    A completed parent's dependency is satisfied permanently (``completed_at``
+    is durable), so its outgoing edge can never gate again — but surfaces that
+    resolve links against the active board cannot see the archived parent and
+    conservatively report the leftover row as an unresolved blocker. Archival
+    therefore drops those rows, and ONLY those: an archived-incomplete parent
+    was withdrawn and must keep gating, and edges where the archived task is
+    the child belong to the surviving parent's history.
+    """
+    with kbc.connect() as conn:
+        def parent_edges(task_id: str) -> list[str]:
+            return [
+                r[0] for r in conn.execute(
+                    "SELECT child_id FROM task_links WHERE parent_id = ? ORDER BY child_id",
+                    (task_id,),
+                ).fetchall()
+            ]
+
+        def child_edges(task_id: str) -> list[str]:
+            return [
+                r[0] for r in conn.execute(
+                    "SELECT parent_id FROM task_links WHERE child_id = ? ORDER BY parent_id",
+                    (task_id,),
+                ).fetchall()
+            ]
+
+        # Completed parent: its outgoing edge is satisfied for good.
+        # The grandparent completes (but is NOT archived) so `completed` is
+        # itself completable while keeping a real incoming edge on the board.
+        grandparent = kb.create_task(conn, title="grandparent")
+        completed = kb.create_task(conn, title="completed parent", parents=[grandparent])
+        released = kb.create_task(conn, title="released child", parents=[completed])
+        assert parent_edges(completed) == [released]
+        assert kb.complete_task(conn, grandparent)
+
+        assert kb.complete_task(conn, completed)
+        assert kb.archive_task(conn, completed)
+        assert parent_edges(completed) == [], (
+            "archiving a completed parent must delete the satisfied edge so the "
+            "child stops reporting an unresolvable blocker"
+        )
+        # Criterion 3: the archived task's own incoming edge is history on the
+        # surviving grandparent and must survive untouched.
+        assert child_edges(completed) == [grandparent]
+        assert parent_edges(grandparent) == [completed]
+        freed = kb.get_task(conn, released)
+        assert freed is not None and freed.status == "ready"
+        assert any(
+            event.kind == "archived" and (event.payload or {}).get("cleared_child_links") == [released]
+            for event in kb.list_events(conn, completed)
+        ), "the cleared edges must be auditable on the archived event"
+
+        # Withdrawn parent: never completed, so the edge stays and keeps gating.
+        withdrawn = kb.create_task(conn, title="withdrawn parent")
+        blocked = kb.create_task(conn, title="still blocked", parents=[withdrawn])
+        assert kb.archive_task(conn, withdrawn)
+        assert parent_edges(withdrawn) == [blocked], (
+            "an archived-incomplete parent is withdrawn, not satisfied: its edge "
+            "must remain so the child keeps showing a real blocker"
+        )
+        gated = kb.get_task(conn, blocked)
+        assert gated is not None and gated.status == "todo"
+        assert kb._parents_satisfied(conn, blocked) is False
+        ok, reason = kb.promote_task(conn, blocked, actor="operator")
+        assert ok is False and withdrawn in (reason or "")
+        assert kb.claim_task(conn, blocked, claimer="worker") is None
+
+
 
 # ---------------------------------------------------------------------------
 # _add_column_if_missing / _migrate_add_optional_columns idempotency (#21708)
