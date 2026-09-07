@@ -648,6 +648,17 @@ def _pending_clarify_request_payload(sid: str) -> dict | None:
     return None
 
 
+def _has_pending_clarify_request(sid: str) -> bool:
+    """Whether ``sid`` owns a still-answerable clarify bridge request.
+
+    The request registry is the authority during a transport gap. Compute-host
+    sessions retain the same authority in their pending mirror. A detached
+    renderer can resume and replay either form; treating it as an abandoned
+    turn would turn the user-visible card into an implicit empty response.
+    """
+    return _pending_clarify_request_payload(sid) is not None
+
+
 def _pending_approval_request_payload(session_key: str) -> dict | None:
     """Read the oldest unresolved approval in a session, if there is one."""
     try:

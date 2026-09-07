@@ -5013,6 +5013,114 @@ def test_ws_orphan_reap_interrupts_in_process_turn(monkeypatch):
         server._sessions.pop("inline-sid", None)
 
 
+def test_ws_orphan_reap_keeps_pending_clarify_answerable_for_reconnect(monkeypatch):
+    """A detached clarify is user work, not an abandoned turn: keep its exact
+    request live so a reconnect can replay and deliberately resolve it."""
+    callbacks = []
+    interrupted = []
+    result = {}
+
+    class _Timer:
+        def __init__(self, _delay, callback):
+            callbacks.append(callback)
+
+        def start(self):
+            return None
+
+    class _LiveThread:
+        def is_alive(self):
+            return True
+
+    session = _session(
+        agent=types.SimpleNamespace(interrupt=lambda: interrupted.append("interrupted")),
+        transport=server._detached_ws_transport,
+        running=True,
+        _run_thread=_LiveThread(),
+    )
+    server._sessions["clarify-sid"] = session
+    monkeypatch.setattr(server, "_WS_ORPHAN_REAP_GRACE_S", 0.01)
+    monkeypatch.setattr(server.threading, "Timer", _Timer)
+    monkeypatch.setattr(server, "_emit", lambda *_args, **_kwargs: None)
+
+    worker = threading.Thread(
+        target=lambda: result.setdefault(
+            "answer", server._block("clarify.request", "clarify-sid", {"question": "Continue?"}, timeout=5)
+        )
+    )
+    worker.start()
+    try:
+        deadline = time.monotonic() + 1
+        while len(server._pending) != 1 and time.monotonic() < deadline:
+            time.sleep(0.01)
+        assert len(server._pending) == 1
+        request_id = next(iter(server._pending))
+
+        server._schedule_ws_orphan_reap("clarify-sid")
+        callbacks.pop(0)()
+
+        # The disconnect must not turn a visible pending card into an implicit
+        # empty response. Its same request id remains replayable only to owner.
+        assert interrupted == []
+        assert worker.is_alive()
+        assert server._pending_clarify_request_payload("clarify-sid") == {
+            "question": "Continue?", "request_id": request_id
+        }
+        assert server._pending_clarify_request_payload("other-sid") is None
+
+        response = server.handle_request(
+            {"id": "answer", "method": "clarify.respond", "params": {"request_id": request_id, "answer": "yes"}}
+        )
+        assert response["result"] == {"status": "ok"}
+        worker.join(timeout=1)
+        assert result["answer"] == "yes"
+    finally:
+        if server._pending:
+            server._clear_pending(None)
+        worker.join(timeout=1)
+        server._sessions.pop("clarify-sid", None)
+
+
+def test_ws_orphan_reap_preserves_compute_host_pending_clarify(monkeypatch):
+    """The compute-host mirror is equally authoritative during a renderer reconnect."""
+    callbacks = []
+    interrupted = []
+
+    class _Timer:
+        def __init__(self, _delay, callback):
+            callbacks.append(callback)
+
+        def start(self):
+            return None
+
+    class _Supervisor:
+        def interrupt(self, sid, *, request_id=None):
+            interrupted.append((sid, request_id))
+
+    session = _session(
+        agent=None,
+        transport=server._detached_ws_transport,
+        running=True,
+        _compute_host_active=True,
+        _compute_host_pending_clarify={"question": "Continue?", "request_id": "host-request"},
+    )
+    server._sessions["compute-clarify-sid"] = session
+    monkeypatch.setattr(server, "_WS_ORPHAN_REAP_GRACE_S", 0.01)
+    monkeypatch.setattr(server.threading, "Timer", _Timer)
+    monkeypatch.setattr(server, "_get_compute_host_supervisor", lambda _cfg=None: _Supervisor())
+    monkeypatch.setattr(server, "_load_cfg", lambda: {"dashboard": {"turn_isolation": True}})
+
+    try:
+        server._schedule_ws_orphan_reap("compute-clarify-sid")
+        callbacks.pop(0)()
+
+        assert interrupted == []
+        assert server._pending_clarify_request_payload("compute-clarify-sid") == {
+            "question": "Continue?", "request_id": "host-request"
+        }
+    finally:
+        server._sessions.pop("compute-clarify-sid", None)
+
+
 def test_ws_disconnect_running_sidecar_still_closes_without_orphan_timer(monkeypatch):
     closed = []
     scheduled = []
