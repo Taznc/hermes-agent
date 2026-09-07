@@ -337,7 +337,7 @@ def build_gateway_parser(
     proxy_start.add_argument(
         "--provider",
         default="nous",
-        help="Upstream provider: codex, nous, or xai (default: nous). See `hermes proxy providers`.",
+        help="Upstream provider: claude-code, codex, nous, or xai (default: nous). See `hermes proxy providers`.",
     )
     proxy_start.add_argument(
         "--host",
@@ -361,6 +361,7 @@ def build_gateway_parser(
             "must be a regular owner-only file (mode 0600 on POSIX)."
         ),
     )
+
 
     proxy_subparsers.add_parser("status", help="Show which proxy upstreams are ready")
     proxy_subparsers.add_parser(

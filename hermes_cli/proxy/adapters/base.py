@@ -80,6 +80,11 @@ class UpstreamAdapter(ABC):
         _ = failed_credential, status_code
         return None
 
+    @property
+    def transforms_openai_chat(self) -> bool:
+        """Whether ``/chat/completions`` needs a provider-specific wire bridge."""
+        return False
+
     def describe(self) -> str:
         """One-line status summary for ``proxy status``."""
         try:

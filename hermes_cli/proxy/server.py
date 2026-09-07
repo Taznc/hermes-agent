@@ -14,6 +14,7 @@ from __future__ import annotations
 import asyncio
 import hmac
 import ipaddress
+import json
 import logging
 import signal
 from typing import Optional
@@ -160,6 +161,51 @@ async def _open_upstream_request(
     return session, response
 
 
+async def _handle_claude_chat(request: "web.Request", cred: UpstreamCredential, body: bytes) -> "web.StreamResponse":
+    """Run the non-passthrough Claude Code wire bridge without logging its body."""
+    from hermes_cli.proxy.claude_translate import prepare_chat_request, response_to_openai, stream_events
+    try:
+        payload = json.loads(body)
+        if not isinstance(payload, dict):
+            raise ValueError("request body must be a JSON object")
+        headers, outbound = prepare_chat_request(payload)
+    except (UnicodeDecodeError, ValueError, json.JSONDecodeError) as exc:
+        return _json_error(400, f"Invalid OpenAI chat completion request: {exc}", code="invalid_request_error")
+    headers["Authorization"] = f"{cred.token_type} {cred.bearer}"
+    headers["Content-Type"] = "application/json"
+    session = aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=None, sock_connect=15, sock_read=300))
+    try:
+        upstream = await session.post(f"{cred.base_url.rstrip('/')}/messages", data=outbound, headers=headers)
+    except (aiohttp.ClientError, asyncio.TimeoutError) as exc:
+        await session.close()
+        return _json_error(502, f"upstream connection failed: {exc}", code="upstream_unreachable")
+    if not payload.get("stream"):
+        try:
+            raw = await upstream.json(content_type=None)
+            if upstream.status >= 400:
+                return web.json_response(raw, status=upstream.status)
+            return web.json_response(response_to_openai(raw), status=upstream.status)
+        finally:
+            upstream.release()
+            await session.close()
+    response = web.StreamResponse(status=upstream.status, headers={"Content-Type": "text/event-stream", "Cache-Control": "no-cache"})
+    await response.prepare(request)
+    try:
+        if upstream.status >= 400:
+            await response.write(b"data: " + await upstream.read() + b"\n\n")
+        else:
+            model = str(payload.get("model") or "claude")
+            async for line in upstream.content:
+                for frame in stream_events([line], model, final=False):
+                    await response.write(frame)
+            await response.write(b"data: [DONE]\n\n")
+    finally:
+        upstream.release()
+        await session.close()
+    await response.write_eof()
+    return response
+
+
 async def _stream_upstream_response(
     request: "web.Request",
     upstream_resp,
@@ -274,6 +320,9 @@ def create_app(
         # need to forward large multipart uploads we'll switch to streaming
         # the request body too.
         body = await request.read()
+
+        if getattr(adapter, "transforms_openai_chat", False) and rel_path == "/chat/completions":
+            return await _handle_claude_chat(request, cred, body)
 
         timeout = aiohttp.ClientTimeout(total=None, sock_connect=15, sock_read=300)
 

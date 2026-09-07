@@ -74,6 +74,7 @@ hermes proxy providers
 
 Currently shipped:
 
+- `claude-code` — locally logged-in Claude Code subscription; Chat Completions are translated to Anthropic Messages
 - `openai-codex` (`codex` alias) — OpenAI Codex / ChatGPT OAuth, Responses API only
 - `nous` — Nous Portal
 - `xai` — xAI / Grok OAuth
@@ -206,6 +207,34 @@ INFERENCE_TEXT_MODEL=Hermes-4-70B
 Same pattern works for Open WebUI, LobeChat, NextChat, or any other
 OpenAI-compatible client.
 
+## Configuring Hindsight through a private tunnel
+
+Keep the proxy loopback-bound on the dev VM; do not copy `auth.json`, Claude
+Code credentials, or any subscription token into the Hindsight container or
+`docker-host`. Start it with:
+
+```bash
+hermes proxy start --provider claude-code --host 127.0.0.1 --port 8645
+```
+
+From `docker-host`, create an authenticated private tunnel to the dev VM (for
+example, `ssh -N -L 8645:127.0.0.1:8645 hermes@dev-vm`). Configure Hindsight's
+OpenAI-compatible provider to use the tunnel endpoint and a non-empty dummy
+key:
+
+```yaml
+provider: openai
+base_url: http://127.0.0.1:8645/v1
+api_key: proxy-client-placeholder
+model: claude-sonnet-4-6
+```
+
+The placeholder is only required by OpenAI-compatible clients; the proxy
+ignores it and resolves the Claude Code subscription locally. Do not bind the
+proxy to `0.0.0.0` for this deployment. Verify a non-streaming, streaming, and
+tool-call completion through the proxy before applying this configuration to a
+running Hindsight deployment.
+
 ## Exposing on LAN
 
 By default the proxy binds `127.0.0.1` (localhost only). To let other
@@ -242,8 +271,10 @@ The proxy is intentionally minimal. Per request:
 4. Forward the request body verbatim, replacing `Authorization` with the upstream bearer
 5. Stream the response back unchanged (SSE preserved)
 
-No transformation. No logging of request bodies. No agent loop. The
-proxy is a credential-attaching pass-through.
+OpenAI-compatible upstreams are forwarded unchanged. Non-compatible subscription
+providers may use a narrow, documented wire translation (Claude Code translates
+Chat Completions to Anthropic Messages). There is no request-body logging and no
+agent loop.
 
 ## Future: more OAuth providers
 
