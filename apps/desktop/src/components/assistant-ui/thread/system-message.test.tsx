@@ -2,6 +2,7 @@ import { AssistantRuntimeProvider, type ThreadMessage, useExternalStoreRuntime }
 import { cleanup, fireEvent, render, screen } from '@testing-library/react'
 import { afterEach, describe, expect, it } from 'vitest'
 
+import { I18nProvider } from '@/i18n'
 import { $displayTimestamps } from '@/store/display-timestamps'
 import type { ReviewActionRecord } from '@/types/hermes'
 
@@ -74,7 +75,15 @@ describe('system message timestamp text separation', () => {
 // metadata.custom.reactions — see chat-runtime.ts's toRuntimeMessage.
 // ---------------------------------------------------------------------------
 
-function ReviewHarness({ reviewActions, text }: { reviewActions: ReviewActionRecord[]; text: string }) {
+function ReviewHarness({
+  reviewActions,
+  text,
+  locale = 'en'
+}: {
+  reviewActions: ReviewActionRecord[]
+  text: string
+  locale?: 'en' | 'ja' | 'zh' | 'zh-hant'
+}) {
   const message = {
     id: 'system-review-1',
     role: 'system',
@@ -90,9 +99,11 @@ function ReviewHarness({ reviewActions, text }: { reviewActions: ReviewActionRec
   })
 
   return (
-    <AssistantRuntimeProvider runtime={runtime}>
-      <Thread />
-    </AssistantRuntimeProvider>
+    <I18nProvider configClient={null} initialLocale={locale}>
+      <AssistantRuntimeProvider runtime={runtime}>
+        <Thread />
+      </AssistantRuntimeProvider>
+    </I18nProvider>
   )
 }
 
@@ -163,11 +174,24 @@ describe('self-improvement review expandable detail', () => {
 
     fireEvent.click(screen.getByRole('button', { name: /show details/i }))
 
-    expect(screen.getByText('Memory · add · Completed')).toBeTruthy()
-    expect(screen.getByText('User profile · replace · No change')).toBeTruthy()
-    expect(screen.getByText('Skill “demo” · patch · Skipped')).toBeTruthy()
-    expect(screen.getByText('Memory · remove · Declined')).toBeTruthy()
-    expect(screen.getByText('Memory · add · Failed')).toBeTruthy()
+    expect(screen.getByText('Memory · Add · Completed')).toBeTruthy()
+    expect(screen.getByText('User profile · Replace · No change')).toBeTruthy()
+    expect(screen.getByText('Skill “demo” · Update · Skipped')).toBeTruthy()
+    expect(screen.getByText('Memory · Remove · Declined')).toBeTruthy()
+    expect(screen.getByText('Memory · Add · Failed')).toBeTruthy()
+  })
+
+  it.each([
+    ['ja', 'メモリ · 追加 · 完了'],
+    ['zh', '记忆 · 添加 · 已完成'],
+    ['zh-hant', '記憶 · 新增 · 已完成']
+  ] as const)('localizes trusted target and operation vocabulary for %s', (locale, expected) => {
+    render(
+      <ReviewHarness locale={locale} reviewActions={[reviewActions[0]]} text="💾 Self-improvement review: updated" />
+    )
+
+    fireEvent.click(screen.getByRole('button', { name: /詳細|显示|顯示/i }))
+    expect(screen.getByText(expected)).toBeTruthy()
   })
 
   it('expands one record with only the producer-provided redacted detail', () => {
@@ -206,10 +230,10 @@ describe('self-improvement review expandable detail', () => {
     render(<ReviewHarness reviewActions={[reviewActions[0]]} text="💾 Self-improvement review: Memory updated" />)
 
     fireEvent.click(screen.getByRole('button', { name: /show details/i }))
-    expect(screen.getByText('Memory · add · Completed')).toBeTruthy()
+    expect(screen.getByText('Memory · Add · Completed')).toBeTruthy()
 
     fireEvent.click(screen.getByRole('button', { name: /hide details/i }))
-    expect(screen.queryByText('Memory · add · Completed')).toBeFalsy()
+    expect(screen.queryByText('Memory · Add · Completed')).toBeFalsy()
   })
 
   it('renders no expand toggle when a review row has no structured actions', () => {

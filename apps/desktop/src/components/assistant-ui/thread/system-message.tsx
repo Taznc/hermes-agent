@@ -36,7 +36,9 @@ function ReviewActionRow({ action }: { action: ReviewActionRecord }) {
   const [open, setOpen] = useState(false)
   const state = action.state ?? (action.success ? 'completed' : 'failed')
   const icon = OPERATION_ICON[action.operation] ?? 'circle'
-  const target = action.skill_name ? `${action.label} “${action.skill_name}”` : action.label
+  const targetLabel = copy.target(action.target)
+  const target = action.skill_name ? `${targetLabel} “${action.skill_name}”` : targetLabel
+  const operation = copy.operation(action.operation)
   const stateLabel = copy.state(state)
   const hasSafeDetail = Boolean(action.change_summary || action.reason)
 
@@ -57,9 +59,7 @@ function ReviewActionRow({ action }: { action: ReviewActionRecord }) {
           />
         </span>
         <span className="min-w-0 wrap-anywhere text-[0.6875rem] leading-5 text-muted-foreground/80">
-          <span className="font-medium text-muted-foreground">
-            {copy.recordSummary(target, action.operation, stateLabel)}
-          </span>
+          <span className="font-medium text-muted-foreground">{copy.recordSummary(target, operation, stateLabel)}</span>
         </span>
         <DisclosureCaret className="mt-1 shrink-0 text-muted-foreground/55" open={open} size="0.625rem" />
       </button>

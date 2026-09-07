@@ -96,6 +96,11 @@ export const forkEn: ForkTranslations = {
         hideDetails: 'Hide details',
         hideRecordDetails: 'Hide record details',
         legacyDetail: 'Details are unavailable from this older Hermes version.',
+        target: target => ({ memory: 'Memory', skill: 'Skill', user: 'User profile' })[target] ?? 'Review item',
+        operation: operation =>
+          ({ add: 'Add', create: 'Create', edit: 'Edit', patch: 'Update', remove: 'Remove', replace: 'Replace' })[
+            operation
+          ] ?? 'Update',
         recordSummary: (target, operation, state) => `${target} · ${operation} · ${state}`,
         showRecordDetails: target => `Show ${target} review details`,
         state: state =>
