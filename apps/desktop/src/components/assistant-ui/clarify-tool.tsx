@@ -28,12 +28,14 @@ import { visibleClarifyCard } from '@/lib/keybinds/composer-focus-keys'
 import { cn } from '@/lib/utils'
 import {
   bareChoice,
+  type ClarifyHelp,
   type ClarifyQuestion,
   type ClarifyRequest,
   clearClarifyRequest,
   normalizeChoices,
   RECOMMENDED_LABEL,
   sessionClarifyRequest,
+  updateClarifyHelp,
   warnDroppedChoices
 } from '@/store/clarify'
 import { $gateway } from '@/store/gateway'
@@ -225,6 +227,77 @@ function KeyBadge({ char, preview, selected }: { char: string; preview?: boolean
   )
 }
 
+function ClarifyHelpControls({ choice, questionId, request, target }: {
+  choice?: string
+  questionId?: string
+  request: ClarifyRequest | null
+  target: string
+}) {
+  const gateway = useStore($gateway)
+  const [askOpen, setAskOpen] = useState(false)
+  const [followUp, setFollowUp] = useState('')
+  const [error, setError] = useState('')
+
+  const help = useMemo(
+    () => Object.values(request?.help ?? {}).filter(item => item.questionId === questionId && item.choice === choice),
+    [choice, questionId, request?.help]
+  )
+
+  const requestHelp = useCallback(async (custom = '') => {
+    if (!request || !gateway) {
+      setError('Help is unavailable while the connection is offline.')
+
+      return
+    }
+
+    const localId = `local-${Date.now()}`
+    setError('')
+    updateClarifyHelp(request.requestId, request.sessionId, localId, {
+      choice,
+      followUp: custom,
+      questionId,
+      status: 'loading'
+    })
+
+    try {
+      await requestForOwnedSession(
+        request.sessionId,
+        gateway.request.bind(gateway) as typeof gateway.request,
+        'clarify.explain',
+        {
+          ...(choice ? { choice: bareChoice(choice) } : {}),
+          ...(custom ? { follow_up: custom } : {}),
+          ...(questionId ? { question_id: questionId } : {}),
+          request_id: request.requestId,
+          version: 1
+        }
+      )
+    } catch (cause) {
+      const message = cause instanceof Error ? cause.message : 'Help request failed.'
+      setError(message)
+      updateClarifyHelp(request.requestId, request.sessionId, localId, { choice, error: message, followUp: custom, questionId, status: 'error' })
+    }
+  }, [choice, gateway, questionId, request])
+
+  const controlLabel = choice ? 'choice' : 'question'
+
+  return (
+    <div className="grid gap-1" data-clarify-help-target={target}>
+      <div className="flex items-center gap-1">
+        <Button aria-label={`Why? ${controlLabel}`} onClick={() => void requestHelp()} size="xs" type="button" variant="text">Why?</Button>
+        <Button aria-controls={`clarify-help-${target}`} aria-expanded={askOpen} aria-label={`Ask about ${controlLabel}`} onClick={() => setAskOpen(open => !open)} size="xs" type="button" variant="text">Ask</Button>
+      </div>
+      {askOpen || help.length > 0 || error ? (
+        <div className="grid gap-1 rounded-md bg-(--chrome-action-hover)/40 p-2 text-sm" id={`clarify-help-${target}`}>
+          {help.map(item => item.status === 'loading' ? <span key={item.explanationId} role="status">Getting help…</span> : item.content ? <p key={item.explanationId}>{item.content}</p> : item.error ? <p className="text-destructive" key={item.explanationId}>{item.error}</p> : null)}
+          {error ? <p className="text-destructive">{error}</p> : null}
+          {askOpen ? <div className="flex gap-1"><Textarea aria-label={`Follow-up for ${target}`} className="min-h-0" onChange={event => setFollowUp(event.target.value)} placeholder="Ask a follow-up…" rows={1} size="sm" value={followUp} /><Button disabled={!followUp.trim()} onClick={() => void requestHelp(followUp.trim())} size="xs" type="button">Send</Button></div> : null}
+        </div>
+      ) : null}
+    </div>
+  )
+}
+
 /** A letter-badged option row. Shared by the live pending card (where a click
  * selects an answer) and the settled skip card (where a click drafts a
  * follow-up), so both stay visually identical. */
@@ -283,25 +356,44 @@ function ChoiceButton({
 }
 
 export const ClarifyTool = (props: ToolCallMessagePartProps) => {
-  // Answered → settled Q&A (ToolFallback collapsed the answer away).
+  // Keep the request association through the brief clear → tool.complete gap so
+  // in-place help can remain on the settled card without a transcript message.
+  const sessionId = useStore(useSessionView().$runtimeId)
+  const request = useStore(useMemo(() => sessionClarifyRequest(sessionId), [sessionId]))
+  const lastRequest = useRef<ClarifyRequest | null>(null)
+
+  if (request) {
+    lastRequest.current = request
+  }
+
   if (props.result !== undefined) {
-    return <ClarifyToolSettled {...props} />
+    return <ClarifyToolSettled {...props} help={lastRequest.current?.help ?? {}} />
   }
 
   return <ClarifyToolPending {...props} />
 }
 
-function ClarifyToolSettled(props: ToolCallMessagePartProps) {
+function ClarifyHelpDetails({ help }: { help: Record<string, ClarifyHelp> }) {
+  const entries = Object.values(help).filter(item => item.content)
+
+  if (entries.length === 0) {
+    return null
+  }
+
+  return <details className="text-sm text-(--ui-text-secondary)"><summary>Help requested</summary><div className="mt-1 grid gap-1">{entries.map(item => <p key={item.explanationId}>{item.content}</p>)}</div></details>
+}
+
+function ClarifyToolSettled({ help, ...props }: ToolCallMessagePartProps & { help: Record<string, ClarifyHelp> }) {
   const batch = readClarifyBatchResult(props.result)
 
   if (batch.responses.length > 0) {
-    return <ClarifyToolBatchSettled responses={batch.responses} />
+    return <ClarifyToolBatchSettled help={help} responses={batch.responses} />
   }
 
-  return <ClarifyToolSingleSettled {...props} />
+  return <ClarifyToolSingleSettled {...props} help={help} />
 }
 
-function ClarifyToolSingleSettled({ args, result }: ToolCallMessagePartProps) {
+function ClarifyToolSingleSettled({ args, help, result }: ToolCallMessagePartProps & { help: Record<string, ClarifyHelp> }) {
   const { t } = useI18n()
   const copy = t.assistant.clarify
   const fromArgs = useMemo(() => readClarifyArgs(args), [args])
@@ -364,6 +456,7 @@ function ClarifyToolSingleSettled({ args, result }: ToolCallMessagePartProps) {
           <p className="px-1.5 pt-0.5 text-[0.6875rem] leading-4 text-(--ui-text-tertiary)">{copy.lateAnswerHint}</p>
         </div>
       ) : null}
+      <ClarifyHelpDetails help={help} />
     </ClarifyShell>
   )
 }
@@ -742,20 +835,23 @@ function ClarifyToolSinglePending({
           </span>
           <MessageQuestion aria-hidden className="mt-px size-4 shrink-0 text-(--ui-text-tertiary)" />
         </div>
+        <ClarifyHelpControls request={matchingRequest} target="question" />
 
         {hasChoices ? (
           <div className="grid gap-px" role="group">
             {choices.map((choice, index) => (
-              <ChoiceButton
-                active={activeIndex === index}
-                char={letterFor(index)}
-                choice={choice}
-                disabled={submitting || !ready}
-                key={`${index}-${choice}`}
-                keyShortcuts={`${letterFor(index)} ${index + 1}`}
-                onClick={() => selectChoice(choice, index)}
-                selected={selectedChoices.includes(choice)}
-              />
+              <div className="grid grid-cols-[minmax(0,1fr)_auto] items-start" key={`${index}-${choice}`}>
+                <ChoiceButton
+                  active={activeIndex === index}
+                  char={letterFor(index)}
+                  choice={choice}
+                  disabled={submitting || !ready}
+                  keyShortcuts={`${letterFor(index)} ${index + 1}`}
+                  onClick={() => selectChoice(choice, index)}
+                  selected={selectedChoices.includes(choice)}
+                />
+                <ClarifyHelpControls choice={bareChoice(choice)} request={matchingRequest} target={`choice ${bareChoice(choice)}`} />
+              </div>
             ))}
             <label
               className={cn(
@@ -830,7 +926,7 @@ function ClarifyToolSinglePending({
 // ─── Batch (multi-question) clarify ─────────────────────────────────────────
 
 /** Settled batch card: every question with its locked (or absent) answer. */
-function ClarifyToolBatchSettled({ responses }: { responses: { question?: string; answer?: string | string[] }[] }) {
+function ClarifyToolBatchSettled({ help, responses }: { help: Record<string, ClarifyHelp>; responses: { question?: string; answer?: string | string[] }[] }) {
   const { t } = useI18n()
   const copy = t.assistant.clarify
 
@@ -863,6 +959,7 @@ function ClarifyToolBatchSettled({ responses }: { responses: { question?: string
           </div>
         )
       })}
+      <ClarifyHelpDetails help={help} />
     </ClarifyShell>
   )
 }
@@ -881,6 +978,7 @@ function BatchQuestionBlock({
   onDraft,
   onToggle,
   question,
+  request,
   staged,
   total
 }: {
@@ -890,6 +988,7 @@ function BatchQuestionBlock({
   onDraft: (value: string) => void
   onToggle: (choice: string) => void
   question: ClarifyQuestion
+  request: ClarifyRequest | null
   staged: { choices: string[]; draft: string }
   total: number
 }) {
@@ -935,18 +1034,21 @@ function BatchQuestionBlock({
           </span>
         ) : null}
       </div>
+      <ClarifyHelpControls questionId={question.qid} request={request} target={`question ${index + 1}`} />
 
       {choices.length > 0 ? (
         <div className="grid gap-px pl-[1.625rem]" role="group">
           {choices.map((choice, choiceIndex) => (
-            <ChoiceButton
-              char={letterFor(choiceIndex)}
-              choice={choice}
-              disabled={disabled}
-              key={`${choiceIndex}-${choice}`}
-              onClick={() => onToggle(choice)}
-              selected={staged.choices.includes(choice)}
-            />
+            <div className="grid grid-cols-[minmax(0,1fr)_auto] items-start" key={`${choiceIndex}-${choice}`}>
+              <ChoiceButton
+                char={letterFor(choiceIndex)}
+                choice={choice}
+                disabled={disabled}
+                onClick={() => onToggle(choice)}
+                selected={staged.choices.includes(choice)}
+              />
+              <ClarifyHelpControls choice={bareChoice(choice)} questionId={question.qid} request={request} target={`choice ${bareChoice(choice)} in question ${index + 1}`} />
+            </div>
           ))}
           <label className={cn(OPTION_ROW_CLASS, 'items-center')}>
             <KeyBadge char={letterFor(choices.length)} selected={Boolean(staged.draft.trim())} />
@@ -1198,6 +1300,7 @@ function ClarifyToolBatchPending({ onAnswered, request }: { onAnswered: () => vo
             onDraft={value => draftFor(question, value)}
             onToggle={choice => toggleChoice(question, choice)}
             question={question}
+            request={request}
             staged={stageFor(question.qid)}
             total={questions.length}
           />

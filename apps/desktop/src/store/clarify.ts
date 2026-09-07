@@ -11,7 +11,18 @@ export interface ClarifyQuestion {
   multiSelect: boolean
 }
 
+export interface ClarifyHelp {
+  choice?: string
+  content?: string
+  error?: string
+  explanationId: string
+  followUp: string
+  questionId?: string
+  status: 'complete' | 'error' | 'loading'
+}
+
 export interface ClarifyRequest {
+  help?: Record<string, ClarifyHelp>
   requestId: string
   question: string
   choices: string[] | null
@@ -117,6 +128,31 @@ const keyFor = (sessionId: string | null | undefined): string => sessionId ?? ''
 
 export const $clarifyRequests = atom<Record<string, ClarifyRequest>>({})
 
+/** Help is renderer-owned presentation state, retained after its pending request
+ * settles so the original tool card can expose it without making a transcript turn. */
+export const $settledClarifyHelp = atom<Record<string, Record<string, ClarifyHelp>>>({})
+
+export function updateClarifyHelp(
+  requestId: string,
+  sessionId: string | null | undefined,
+  explanationId: string,
+  update: Omit<ClarifyHelp, 'explanationId'>
+): void {
+  const key = keyFor(sessionId)
+  const current = $clarifyRequests.get()[key]
+
+  if (!current || current.requestId !== requestId) {
+    return
+  }
+
+  const help = { ...(current.help ?? {}), [explanationId]: { explanationId, ...update } }
+  $clarifyRequests.set({ ...$clarifyRequests.get(), [key]: { ...current, help } })
+}
+
+export function settledClarifyHelp(requestId: string | null): Record<string, ClarifyHelp> {
+  return requestId ? $settledClarifyHelp.get()[requestId] ?? {} : {}
+}
+
 // The clarify request for the currently-viewed session. The inline ClarifyTool
 // only ever mounts inside the active session's transcript, so it reads this
 // focus-scoped view rather than reaching into the whole map.
@@ -150,6 +186,10 @@ export function clearClarifyRequest(requestId?: string, sessionId?: string | nul
     const next = { ...requests }
     delete next[key]
     $clarifyRequests.set(next)
+
+    if (current.help && Object.keys(current.help).length > 0) {
+      $settledClarifyHelp.set({ ...$settledClarifyHelp.get(), [current.requestId]: current.help })
+    }
 
     return
   }

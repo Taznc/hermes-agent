@@ -114,6 +114,11 @@ export type GatewayEventPayload = {
   // answers (qid → locked answer) rides along on reconnect replay only.
   questions?: unknown
   answers?: Record<string, unknown>
+  // clarify.explanation (non-terminal help correlated to the pending request)
+  explanation_id?: string
+  question_id?: string
+  choice?: string
+  content?: string
   // mcp.setup.request (setup_mcp tool — inline MCP consent card)
   server?: string
   action?: string

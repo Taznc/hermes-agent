@@ -226,6 +226,22 @@ describe('ClarifyTool choice selection', () => {
   })
 })
 
+describe('ClarifyTool help controls', () => {
+  it('routes question and choice help without changing the staged answer', async () => {
+    const { request } = renderLiveClarify()
+
+    fireEvent.click(screen.getByRole('button', { name: 'Why? question' }))
+    fireEvent.click(screen.getAllByRole('button', { name: 'Why? choice' })[0])
+
+    await waitFor(() => expect(request).toHaveBeenCalledTimes(2))
+    expect(request).toHaveBeenNthCalledWith(1, 'clarify.explain', { request_id: 'request-1', version: 1 })
+    expect(request).toHaveBeenNthCalledWith(2, 'clarify.explain', { choice: 'staging', request_id: 'request-1', version: 1 })
+    expect(screen.getByRole('button', { name: /Continue/ }).getAttribute('disabled')).not.toBeNull()
+  })
+
+})
+
+
 describe('readClarifyResult', () => {
   it('reads question + user_response from the tool JSON payload', () => {
     expect(
