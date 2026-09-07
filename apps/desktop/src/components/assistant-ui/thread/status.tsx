@@ -224,10 +224,20 @@ function useTerminalActivity(working: boolean, failed: boolean): ThreadActivityP
     }
 
     setWasWorking(false)
-    const terminalPhase = failed ? 'failure' : 'success'
-    setTerminal(terminalPhase)
-    window.setTimeout(() => setTerminal(current => (current === terminalPhase ? null : current)), TERMINAL_ACTIVITY_MS)
+    setTerminal(failed ? 'failure' : 'success')
   }, [failed, wasWorking, working])
+
+  useEffect(() => {
+    if (!terminal) {
+      return
+    }
+
+    const id = window.setTimeout(() => setTerminal(null), TERMINAL_ACTIVITY_MS)
+
+    // A new operation clears `terminal`, which cleans up its old deadline;
+    // the later operation then receives its own full terminal interval.
+    return () => window.clearTimeout(id)
+  }, [terminal])
 
   return terminal
 }

@@ -124,4 +124,49 @@ describe('the turn timer covers the gaps, not just the streaming', () => {
     act(() => vi.advanceTimersByTime(1))
     expect(container.querySelector('[data-slot="aui_turn-activity"]')).toBeNull()
   })
+
+  it('does not let an earlier completion truncate a later completion', () => {
+    const messages = [userMessage('u1', 'do the thing'), assistant('a1', [{ type: 'text', text: 'Done.' }], false)]
+    const { container } = render(<Harness messages={messages} />)
+
+    act(() => vi.advanceTimersByTime(7_000))
+    act(() => $busy.set(false))
+    expect(container.querySelector('[data-terminal-activity="success"]')).not.toBeNull()
+
+    act(() => vi.advanceTimersByTime(1_000))
+    act(() => $busy.set(true))
+    act(() => vi.advanceTimersByTime(7_000))
+    act(() => $busy.set(false))
+    expect(container.querySelector('[data-terminal-activity="success"]')).not.toBeNull()
+
+    act(() => vi.advanceTimersByTime(1_001))
+    expect(container.querySelector('[data-terminal-activity="success"]')).not.toBeNull()
+
+    act(() => vi.advanceTimersByTime(999))
+    expect(container.querySelector('[data-slot="aui_turn-activity"]')).toBeNull()
+  })
+
+  it('retains a recoverable failure briefly before settling the row away', () => {
+    const failedMessages = [
+      userMessage('u1', 'do the thing'),
+      {
+        ...assistant('a1', [{ type: 'text', text: 'Could not finish.' }], false),
+        status: { type: 'incomplete' }
+      } as ThreadMessage
+    ]
+
+    const { container } = render(<Harness messages={failedMessages} />)
+
+    act(() => vi.advanceTimersByTime(7_000))
+    act(() => $busy.set(false))
+
+    expect(container.querySelector('[data-terminal-activity="failure"]')).not.toBeNull()
+    expect(container.querySelector('[data-activity-mark="failure"]')).not.toBeNull()
+
+    act(() => vi.advanceTimersByTime(1_999))
+    expect(container.querySelector('[data-terminal-activity="failure"]')).not.toBeNull()
+
+    act(() => vi.advanceTimersByTime(1))
+    expect(container.querySelector('[data-slot="aui_turn-activity"]')).toBeNull()
+  })
 })
