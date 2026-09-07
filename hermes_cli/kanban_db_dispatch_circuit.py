@@ -17,6 +17,9 @@ from typing import Any
 from hermes_cli import kanban_db_connect as kbc
 
 
+_SQLITE_FALLBACK_REASONS = frozenset({"pause_persistence_failed"})
+
+
 def _has_pause_table(conn: sqlite3.Connection) -> bool:
     return conn.execute(
         "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'dispatch_pause'"
@@ -37,11 +40,15 @@ def read_pause(db_path: Path) -> dict[str, Any] | None:
     state = json.loads(row[0])
     if not isinstance(state, dict) or not state.get("reason"):
         raise ValueError("SQLite pause state must be an object with a reason")
+    if state["reason"] not in _SQLITE_FALLBACK_REASONS:
+        raise ValueError("SQLite pause state must describe a sticky systemic fault")
     return state
 
 
 def persist_pause(conn: sqlite3.Connection, state: dict[str, Any]) -> None:
     """Caller holds the board tick lock and the triggering run's write transaction."""
+    if state.get("reason") not in _SQLITE_FALLBACK_REASONS:
+        raise ValueError("SQLite fallback is reserved for sticky systemic faults")
     conn.execute(
         "CREATE TABLE IF NOT EXISTS dispatch_pause ("
         "id INTEGER PRIMARY KEY CHECK (id = 1), state TEXT NOT NULL)"

@@ -37,6 +37,20 @@ import type {
   WorkerLog
 } from './types'
 
+export interface ArchiveDonePreflight {
+  done_count: number
+  scope: { kind: 'all_boards' | 'board'; label: string; board?: string }
+}
+
+export interface ArchiveDoneResult {
+  scope: ArchiveDonePreflight['scope']
+  archived_count: number
+  boards: string[]
+  candidate_count: number
+  failures: Array<{ board: string; error: string; task_id: string }>
+  skipped_count: number
+}
+
 type Rest = <T>(path: string, opts?: PluginRestOptions) => Promise<T>
 type Socket = (path: string, onMessage: (data: unknown) => void) => () => void
 
@@ -325,6 +339,19 @@ export const fetchProfiles = () => call<{ profiles: KanbanProfile[] }>('/profile
 export const fetchProjects = () => call<{ projects: KanbanProject[] }>('/projects')
 
 export const fetchOrchestration = () => call<OrchestrationSettings>('/orchestration')
+
+/** Completed-card archive uses the dashboard's two established scope forms:
+ * an individual board, or `boards=*` for the existing consolidated view.
+ * It deliberately does not route the All Boards sentinel through `withBoard`.
+ */
+function archiveDonePath(path: string): string {
+  return $boardSlug.get() === ALL_BOARDS ? `${path}?boards=*` : withBoard(path)
+}
+
+export const fetchArchiveDonePreflight = () =>
+  call<ArchiveDonePreflight>(archiveDonePath('/tasks/archive-done/preflight'))
+
+export const archiveDone = () => call<ArchiveDoneResult>(archiveDonePath('/tasks/archive-done'), { method: 'POST' })
 
 // ── writes ────────────────────────────────────────────────────────────────────
 

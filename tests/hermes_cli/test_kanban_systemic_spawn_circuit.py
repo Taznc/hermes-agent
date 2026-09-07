@@ -401,6 +401,65 @@ def test_sqlite_fallback_cannot_be_resumed_by_corruption_or_failed_delete(
     assert kbd.read_dispatch_pause(board) is None
 
 
+def test_sqlite_systemic_pause_wins_over_a_coexisting_start_budget_cooldown(
+    kanban_home, all_assignees_spawnable,
+):
+    """A cooldown sentinel cannot hide or auto-clear a sticky SQLite outage."""
+    from hermes_cli import kanban_db_dispatch_circuit as circuit
+
+    board = "sticky-over-cooldown"
+    sticky = {
+        "reason": "pause_persistence_failed",
+        "fault_code": "systemd_user_scope_unavailable",
+        "tripped_at": 123,
+        "recovery": "repair both prerequisites, then resume explicitly",
+    }
+    cooldown = {
+        "reason": "start_budget_exceeded",
+        "recent_starts": 1,
+        "budget": 1,
+        "window_seconds": 10,
+        "next_eligible_at": 1,
+    }
+    pause_path = kbd._dispatch_pause_path(board)
+    calls: list[str] = []
+
+    with kbc.connect_closing(board=board) as conn:
+        task_id = kb.create_task(conn, title="must remain queued", assignee="worker")
+        with kbc.write_txn(conn):
+            circuit.persist_pause(conn, sticky)
+        pause_path.write_text(json.dumps(cooldown), encoding="utf-8")
+
+        stopped = kbd.dispatch_once(
+            conn,
+            board=board,
+            spawn_fn=lambda task, *_a, **_k: calls.append(task.id) or 4242,
+            dispatch_start_budget=1,
+            dispatch_start_window_seconds=10,
+        )
+
+    assert stopped.spawned == []
+    assert calls == []
+    assert stopped.dispatch_paused == sticky
+    assert kbd.read_dispatch_pause(board) == sticky
+
+    # Explicit recovery clears both stores. The now-empty fallback table does
+    # not interfere with normal cooldown expiry on the next tick.
+    assert kbd.resume_dispatch(board)["resumed"] is True
+    pause_path.write_text(json.dumps(cooldown), encoding="utf-8")
+    with kbc.connect_closing(board=board) as conn:
+        resumed = kbd.dispatch_once(
+            conn,
+            board=board,
+            spawn_fn=lambda task, *_a, **_k: calls.append(task.id) or 4242,
+            dispatch_start_budget=1,
+            dispatch_start_window_seconds=10,
+        )
+
+    assert calls == [task_id]
+    assert [task_id for task_id, _who, _workspace in resumed.spawned] == [task_id]
+
+
 def test_resume_refuses_to_delete_pause_while_a_dispatch_tick_holds_the_board_lock(
     kanban_home,
 ):

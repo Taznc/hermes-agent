@@ -1219,6 +1219,56 @@ CREATE TABLE IF NOT EXISTS staged_attachments (
 );
 CREATE INDEX IF NOT EXISTS idx_staged_created ON staged_attachments(created_at);
 
+-- Dispatcher-owned timeout-kill intents: persisted, task/run-scoped record that
+-- THIS dispatcher intends to (or has) signal a worker for max-runtime expiry. Unlike
+-- the in-memory _dispatcher_kill_intents dict, this survives a dispatcher restart
+-- between signal delivery and reap, so the path always remains an ordinary counted
+-- failure even when the reap happens on a different process. Entries are consumed
+-- (deleted) by final accounting once the outcome is resolved.
+CREATE TABLE IF NOT EXISTS kanban_timeout_kill_intents (
+    id            INTEGER PRIMARY KEY AUTOINCREMENT,
+    task_id       TEXT    NOT NULL,
+    run_id        INTEGER,
+    worker_pid    INTEGER NOT NULL,
+    signal        INTEGER NOT NULL,
+    created_at    INTEGER NOT NULL,
+    consumed_at   INTEGER
+);
+CREATE INDEX IF NOT EXISTS idx_timeout_kill_task ON kanban_timeout_kill_intents(task_id, run_id);
+CREATE INDEX IF NOT EXISTS idx_timeout_kill_consumed ON kanban_timeout_kill_intents(consumed_at);
+
+CREATE TABLE IF NOT EXISTS kanban_provider_backoff_tasks (
+    provider    TEXT NOT NULL,
+    task_id     TEXT NOT NULL,
+    PRIMARY KEY(provider, task_id)
+);
+CREATE INDEX IF NOT EXISTS idx_provider_backoff_tasks_task ON kanban_provider_backoff_tasks(task_id);
+
+-- Persistent per-task consecutive interruption streak. Incremented for every
+-- otherwise-neutral infra path (external allowed signal, startup-window dead PID,
+-- quota signature including malformed/missing retry-after). On exceeding
+-- kanban.max_infra_interruptions the task is routed through normal counted failure
+-- accounting. Reset only on a genuine non-interruption terminal outcome or an explicit
+-- operator reset/unblock — never merely because a task is redispatched.
+CREATE TABLE IF NOT EXISTS kanban_interruption_streaks (
+    task_id               TEXT PRIMARY KEY,
+    streak                INTEGER NOT NULL DEFAULT 0,
+    last_interrupted_at   INTEGER,
+    reset_at              INTEGER,
+    created_at            INTEGER NOT NULL
+);
+
+-- Provider-wide quota backoff pauses: durable across dispatcher restarts. One row per
+-- provider; the until timestamp is the MAX across all tasks that registered a pause for
+-- that provider (ON CONFLICT ... DO UPDATE SET until=MAX(...)).
+CREATE TABLE IF NOT EXISTS kanban_provider_backoff (
+    provider    TEXT PRIMARY KEY,
+    until       INTEGER NOT NULL,
+    reason      TEXT NOT NULL,
+    task_id     TEXT NOT NULL,
+    created_at  INTEGER NOT NULL
+);
+
 -- Subscription from a gateway source (platform + chat + thread) to a
 -- task. The gateway's kanban-notifier watcher tails task_events and
 -- pushes ``completed`` / ``blocked`` / ``spawn_auto_blocked`` events to
@@ -1251,6 +1301,504 @@ CREATE INDEX IF NOT EXISTS idx_runs_status           ON task_runs(status);
 CREATE INDEX IF NOT EXISTS idx_attachments_task      ON task_attachments(task_id, created_at);
 CREATE INDEX IF NOT EXISTS idx_notify_task           ON kanban_notify_subs(task_id);
 """
+
+
+# --- ID generation ---
+
+# --- Infra failure classification ---
+
+def _count_infra_failures_enabled() -> bool:
+    """kanban.count_infra_failures (default false) or HERMES_KANBAN_COUNT_INFRA_FAILURES.
+
+    When true, restores pre-classification behaviour: every infra-eligible death
+    (external allowed signal, startup-window dead pid, quota signature) is
+    treated as an ordinary counted failure instead of a neutral interruption.
+    """
+    raw = os.environ.get("HERMES_KANBAN_COUNT_INFRA_FAILURES", "").strip().lower()
+    if raw:
+        return raw not in {"0", "false", "no", "off"}
+    try:
+        from hermes_cli.config import load_config_readonly
+        return bool((load_config_readonly() or {}).get("kanban", {}).get("count_infra_failures", False))
+    except Exception:
+        return False
+
+
+def _resolve_infra_startup_window_seconds() -> int:
+    """kanban.infra_startup_window_seconds (default 120) or HERMES_KANBAN_INFRA_STARTUP_WINDOW_SECONDS."""
+    raw = os.environ.get("HERMES_KANBAN_INFRA_STARTUP_WINDOW_SECONDS", "").strip()
+    if raw:
+        try:
+            v = int(raw)
+            if v >= 0:
+                return v
+        except ValueError:
+            pass
+    try:
+        from hermes_cli.config import load_config_readonly
+        cfg = (load_config_readonly() or {}).get("kanban", {})
+        v = cfg.get("infra_startup_window_seconds")
+        if isinstance(v, int) and v >= 0:
+            return v
+    except Exception:
+        pass
+    return 120
+
+
+def _resolve_max_infra_interruptions() -> int:
+    """kanban.max_infra_interruptions (default 3, min effective 1) or env override."""
+    raw = os.environ.get("HERMES_KANBAN_MAX_INFRA_INTERRUPTIONS", "").strip()
+    if raw:
+        try:
+            v = int(raw)
+            if v >= 1:
+                return v
+        except ValueError:
+            pass
+    try:
+        from hermes_cli.config import load_config_readonly
+        cfg = (load_config_readonly() or {}).get("kanban", {})
+        v = cfg.get("max_infra_interruptions")
+        if isinstance(v, int) and v >= 1:
+            return v
+    except Exception:
+        pass
+    return 3
+
+
+def _resolve_provider_backoff_max_seconds() -> int:
+    """kanban.provider_backoff_max_seconds (default 86400) or env override."""
+    raw = os.environ.get("HERMES_KANBAN_PROVIDER_BACKOFF_MAX_SECONDS", "").strip()
+    if raw:
+        try:
+            v = int(raw)
+            if v >= 1:
+                return v
+        except ValueError:
+            pass
+    try:
+        from hermes_cli.config import load_config_readonly
+        cfg = (load_config_readonly() or {}).get("kanban", {})
+        v = cfg.get("provider_backoff_max_seconds")
+        if isinstance(v, int) and v >= 1:
+            return v
+    except Exception:
+        pass
+    return 86400
+
+
+def classify_infra_exit(
+    *,
+    exit_kind: str,
+    signal_number: Optional[int] = None,
+    dispatcher_killed: bool = False,
+    within_startup_window: bool = False,
+    quota_signal: Optional[bool] = None,
+    quota_signal_dict: Optional[dict] = None,
+) -> tuple[str, str]:
+    """Pure classifier: is a reaped worker death "infra" or "legit"?
+
+    Returns ``(category, reason)``. ``category`` is ``"infra"`` (does not count
+    against the failure budget) or ``"legit"`` (counts exactly like today).
+
+    Signal numbers treated as infra (external) when the dispatcher did NOT send
+    them. Only SIGTERM and SIGKILL are on the allowlist. Every other signal
+    (SIGABRT, SIGSEGV, SIGPIPE, etc.) is a legit crash regardless of source,
+    because those indicate a crashed process, not a cleanly-terminated one.
+
+    Quota/429 signature detection is run-scoped. It may classify a non-signal
+    exit as infra, but cannot override a signaled exit's dispatcher ownership
+    or explicit signal allowlist result.
+    """
+    # 1. Signaled: infra ONLY for SIGTERM/SIGKILL when the dispatcher did NOT
+    #    send that signal. All other signals are legit. A dispatcher-owned kill
+    #    (its own max-runtime timeout) is always legit.
+    if exit_kind == "signaled":
+        if signal_number is not None and not _is_infra_signal(signal_number):
+            return ("legit", f"signal_{signal_number}")
+        if dispatcher_killed:
+            return ("legit", "dispatcher_kill")
+        return ("infra", "external_signal")
+    # 2. A quota log can explain a non-signal failure, but never overrides a
+    # dispatcher-owned termination or a non-allowlisted crash signal.
+    if quota_signal_dict or quota_signal:
+        return ("infra", "quota")
+    # 3. Unknown (no reap record - "pid N not alive"): infra only within the
+    #    dispatcher's own startup window.
+    if exit_kind == "unknown" and within_startup_window:
+        return ("infra", "startup_window")
+    # 4. Everything else is legit.
+    return ("legit", exit_kind or "unknown")
+
+
+# Signal numbers treated as "infra" (external) when the dispatcher did NOT send them.
+# Only SIGTERM and SIGKILL are on the allowlist. Every other signal (SIGABRT, SIGSEGV,
+# SIGPIPE, etc.) is a legit crash regardless of source, because those indicate a
+# crashed process, not a cleanly-terminated one.
+def _is_infra_signal(signum: int) -> bool:
+    """Return True when signum is in the explicit infra signal allowlist (SIGTERM, SIGKILL)."""
+    try:
+        import signal as _signal
+    except ImportError:
+        return False
+    return signum in frozenset({
+        getattr(_signal, "SIGTERM", 15),
+        getattr(_signal, "SIGKILL", 9),
+    })
+
+
+# --- Timeout kill intent persistence ( durable across restarts ) ---
+
+# Track whether THIS dispatcher process sent a signal to a worker PID, so
+# classify_infra_exit can distinguish the dispatcher's own max-runtime kill
+# (legit, counted) from an external SIGTERM/SIGKILL (infra, not counted).
+_DISPATCHER_STARTED_AT_ENV = "HERMES_KANBAN_DISPATCHER_STARTED_AT"
+_DISPATCHER_KILL_INTENTS: dict[int, int] = {}  # pid -> signal_number
+
+
+def mark_dispatcher_process_started() -> None:
+    """Record that this process is a real dispatcher loop. Called once at startup."""
+    os.environ[_DISPATCHER_STARTED_AT_ENV] = repr(time.time())
+
+
+def _dispatcher_uptime_seconds() -> Optional[float]:
+    """Seconds since mark_dispatcher_process_started() was called, or None."""
+    raw = os.environ.get(_DISPATCHER_STARTED_AT_ENV, "").strip()
+    if not raw:
+        return None
+    try:
+        started = float(raw)
+    except ValueError:
+        return None
+    return max(0.0, time.time() - started)
+
+
+def _was_dispatcher_killed(pid: int) -> bool:
+    """True when THIS dispatcher previously marked a kill-intent for this PID."""
+    return pid in _DISPATCHER_KILL_INTENTS
+
+
+def persist_timeout_kill_intent(
+    conn: sqlite3.Connection,
+    *,
+    task_id: str,
+    run_id: Optional[int],
+    worker_pid: int,
+    signal: int,
+) -> None:
+    """Persist a dispatcher-owned timeout-kill intent before sending the signal.
+
+    This survives a dispatcher restart between signal delivery and reap, so the path
+    always remains an ordinary counted failure. Call IMMEDIATELY before os.kill /
+    signal_fn in enforce_max_runtime and _terminate_reclaimed_worker.
+    """
+    with write_txn(conn, allow_nested=True):
+        _clear_expired_timeout_kill_intents(conn)
+        cur = conn.execute(
+            "UPDATE kanban_timeout_kill_intents SET signal = ?, created_at = ? "
+            "WHERE task_id = ? AND run_id IS ? AND worker_pid = ? AND consumed_at IS NULL",
+            (int(signal), int(time.time()), task_id, run_id, int(worker_pid)),
+        )
+        if cur.rowcount == 0:
+            conn.execute(
+                "INSERT INTO kanban_timeout_kill_intents(task_id, run_id, worker_pid, signal, created_at) "
+                "VALUES (?, ?, ?, ?, ?)",
+                (task_id, run_id, int(worker_pid), int(signal), int(time.time())),
+            )
+
+
+_TIMEOUT_KILL_INTENT_TTL_SECONDS = 24 * 60 * 60
+
+
+def _clear_expired_timeout_kill_intents(conn: sqlite3.Connection) -> int:
+    cutoff = int(time.time()) - _TIMEOUT_KILL_INTENT_TTL_SECONDS
+    cur = conn.execute(
+        "DELETE FROM kanban_timeout_kill_intents WHERE created_at < ?", (cutoff,),
+    )
+    return cur.rowcount
+
+
+def consume_timeout_kill_intent(
+    conn: sqlite3.Connection, *, task_id: str, run_id: Optional[int], worker_pid: int,
+) -> bool:
+    """Delete every pending timeout intent for one task/run/pid identity."""
+    with write_txn(conn, allow_nested=True):
+        _clear_expired_timeout_kill_intents(conn)
+        cur = conn.execute(
+            "DELETE FROM kanban_timeout_kill_intents "
+            "WHERE task_id = ? AND run_id IS ? AND worker_pid = ? AND consumed_at IS NULL",
+            (task_id, run_id, int(worker_pid)),
+        )
+        return cur.rowcount > 0
+
+
+def has_pending_timeout_kill_intent(
+    conn: sqlite3.Connection, *, task_id: str, run_id: Optional[int], worker_pid: int,
+) -> bool:
+    """True only for an unexpired intent belonging to this exact task/run/pid."""
+    cutoff = int(time.time()) - _TIMEOUT_KILL_INTENT_TTL_SECONDS
+    row = conn.execute(
+        "SELECT 1 FROM kanban_timeout_kill_intents "
+        "WHERE task_id = ? AND run_id IS ? AND worker_pid = ? "
+        "AND consumed_at IS NULL AND created_at >= ? LIMIT 1",
+        (task_id, run_id, int(worker_pid), cutoff),
+    ).fetchone()
+    return row is not None
+
+
+def clear_consumed_timeout_kill_intents(conn: sqlite3.Connection) -> int:
+    """Clear stale timeout intents during normal dispatcher operation."""
+    with write_txn(conn, allow_nested=True):
+        return _clear_expired_timeout_kill_intents(conn)
+
+
+# --- Interruption streak persistence ---
+
+def increment_interruption_streak(conn: sqlite3.Connection, *, task_id: str) -> int:
+    """Increment the per-task interruption streak. Returns the new streak value.
+
+    Creates the row if it does not exist (first interruption).
+    """
+    now = int(time.time())
+    with write_txn(conn, allow_nested=True):
+        conn.execute(
+            "INSERT INTO kanban_interruption_streaks(task_id, streak, last_interrupted_at, created_at) "
+            "VALUES (?, 1, ?, ?) "
+            "ON CONFLICT(task_id) DO UPDATE SET "
+            "streak = streak + 1, "
+            "last_interrupted_at = ?",
+            (task_id, now, now, now),
+        )
+        return conn.execute(
+            "SELECT streak FROM kanban_interruption_streaks WHERE task_id = ?",
+            (task_id,),
+        ).fetchone()[0]
+
+
+def read_interruption_streak(conn: sqlite3.Connection, *, task_id: str) -> int:
+    """Return the current interruption streak for a task (0 if no row / no interruptions)."""
+    row = conn.execute(
+        "SELECT streak FROM kanban_interruption_streaks WHERE task_id = ?",
+        (task_id,),
+    ).fetchone()
+    return int(row[0]) if row else 0
+
+
+def reset_interruption_streak(conn: sqlite3.Connection, *, task_id: str) -> None:
+    """Reset the interruption streak to 0. Called on non-interruption terminal outcomes or operator reset."""
+    with write_txn(conn, allow_nested=True):
+        conn.execute(
+            "UPDATE kanban_interruption_streaks SET streak = 0, reset_at = ? WHERE task_id = ?",
+            (int(time.time()), task_id),
+        )
+
+
+def delete_interruption_streak(conn: sqlite3.Connection, *, task_id: str) -> None:
+    """Remove the interruption-streak row (e.g. on task deletion)."""
+    with write_txn(conn, allow_nested=True):
+        conn.execute("DELETE FROM kanban_interruption_streaks WHERE task_id = ?", (task_id,))
+
+
+# --- Provider backoff with max cap ---
+
+# Provider quota/429 signature as emitted by ``hermes_cli/auth.py`` (Codex
+# OAuth refresh path) and any future provider adapter that raises the same
+# shape of message. This catches quota deaths that slip past the existing
+# EX_TEMPFAIL sentinel (``KANBAN_RATE_LIMIT_EXIT_CODE``) — e.g. an AuthError
+# raised deep in a call stack that bubbles up as a crash or dead-pid instead
+# of a clean ``sys.exit(75)``.
+_QUOTA_EXIT_LOG_RE = re.compile(r"quota exhausted \(429\)", re.IGNORECASE)
+_QUOTA_RETRY_AFTER_RE = re.compile(r"retry after ([0-9]+)s\b", re.IGNORECASE)
+
+
+def worker_log_run_marker(run_id: int) -> str:
+    return f"--- hermes-kanban-run:{int(run_id)} ---\n"
+
+
+def _detect_quota_exit_signal(
+    task_id: str, *, run_id: Optional[int], board: Optional[str] = None, tail_bytes: int = 8000,
+) -> Optional[dict]:
+    """Scan the worker's final log lines for a provider quota/429 signature.
+
+    Returns ``{"retry_after_seconds": int | None}`` when the signature is
+    found, else ``None``. Never raises — log I/O errors (missing file,
+    already rotated, permission issue) are swallowed so a logging problem
+    can never break crash reclaim.
+    """
+    try:
+        log_text = read_worker_log(task_id, tail_bytes=tail_bytes, board=board)
+    except Exception:
+        return None
+    if run_id is None or not log_text:
+        return None
+    marker = worker_log_run_marker(run_id)
+    if marker not in log_text:
+        return None
+    log_text = log_text.rsplit(marker, 1)[1]
+    if not _QUOTA_EXIT_LOG_RE.search(log_text):
+        return None
+    m = _QUOTA_RETRY_AFTER_RE.search(log_text)
+    return {"retry_after_seconds": _parse_retry_after(m.group(1)) if m else None}
+
+def _parse_retry_after(text: Optional[str]) -> Optional[int]:
+    """Parse a retry-after value: only positive base-10 integer. Returns None for malformed/missing/nonpositive."""
+    if not text:
+        return None
+    s = str(text).strip()
+    if not s:
+        return None
+    if not re.fullmatch(r"[0-9]+", s):
+        return None
+    v = int(s)
+    if v <= 0:
+        return None
+    return v
+
+
+def _clamp_retry_after(retry_after: Optional[int], max_seconds: int) -> tuple[Optional[int], Optional[str]]:
+    """Clamp a parsed retry-after to the configured max. Returns (clamped_value, diagnostic_or_None).
+
+    A malformed/missing/nonpositive retry_after returns (None, None) — it does NOT create a
+    provider pause; it follows the bounded interruption policy instead.
+    """
+    if retry_after is None or retry_after <= 0:
+        return None, None
+    if retry_after > max_seconds:
+        return max_seconds, f"retry-after {retry_after}s clamped to provider_backoff_max_seconds={max_seconds}s"
+    return retry_after, None
+
+
+def register_provider_backoff(
+    conn: sqlite3.Connection,
+    *,
+    provider: str,
+    retry_after: Optional[int],
+    task_id: str,
+    max_seconds: int,
+) -> Optional[int]:
+    """Register a provider backoff pause. Returns the effective until timestamp, or None if no pause.
+
+    Only a valid, positive retry-after creates a provider pause. Malformed/missing/nonpositive
+    retry-after returns None (the task follows the bounded interruption policy instead).
+    The pause is durable across dispatcher restarts and clamped to max_seconds.
+    """
+    clamped, diagnostic = _clamp_retry_after(retry_after, max_seconds)
+    if clamped is None:
+        # No usable retry-after — no provider pause. The task will be handled by the
+        # interruption streak policy instead.
+        return None
+
+    until = int(time.time()) + clamped
+    with write_txn(conn, allow_nested=True):
+        conn.execute(
+            """INSERT INTO kanban_provider_backoff(provider, until, reason, task_id, created_at)
+               VALUES (?, ?, 'quota', ?, ?)
+               ON CONFLICT(provider) DO UPDATE SET
+                 until = MAX(kanban_provider_backoff.until, excluded.until),
+                 reason = excluded.reason,
+                 task_id = excluded.task_id""",
+            (provider, until, task_id, int(time.time())),
+        )
+        conn.execute(
+            "INSERT OR IGNORE INTO kanban_provider_backoff_tasks(provider, task_id) VALUES (?, ?)",
+            (provider, task_id),
+        )
+    return until
+
+
+def active_provider_backoffs(conn: sqlite3.Connection) -> list[dict]:
+    """Return active provider pauses in a stable, CLI-ready form."""
+    now = int(time.time())
+    return [dict(r) for r in conn.execute(
+        "SELECT provider, until, reason, task_id FROM kanban_provider_backoff WHERE until > ? ORDER BY provider",
+        (now,),
+    ).fetchall()]
+
+
+def release_expired_provider_backoffs(conn: sqlite3.Connection) -> list[str]:
+    """Resume quota-parked tasks exactly once and clear expired pause rows."""
+    now = int(time.time())
+    resumed = []
+    with write_txn(conn, allow_nested=True):
+        expired = conn.execute(
+            "SELECT provider, until FROM kanban_provider_backoff WHERE until <= ?",
+            (now,),
+        ).fetchall()
+        for row in expired:
+            task_rows = conn.execute(
+                "SELECT task_id FROM kanban_provider_backoff_tasks WHERE provider = ?",
+                (row["provider"],),
+            ).fetchall()
+            for task_row in task_rows:
+                task_id = task_row["task_id"]
+                cur = conn.execute(
+                    "UPDATE tasks SET status='ready' WHERE id=? AND status='scheduled'",
+                    (task_id,),
+                )
+                if cur.rowcount:
+                    _append_event(conn, task_id, "unblocked", {
+                        "reason": "provider_backoff_elapsed",
+                        "provider": row["provider"],
+                        "resume_at": int(row["until"]),
+                    })
+                    resumed.append(task_id)
+            conn.execute(
+                "DELETE FROM kanban_provider_backoff_tasks WHERE provider = ?", (row["provider"],),
+            )
+        conn.execute("DELETE FROM kanban_provider_backoff WHERE until <= ?", (now,))
+    return resumed
+
+
+def provider_backoff_until(conn: sqlite3.Connection, *, provider: str) -> Optional[int]:
+    """Return the active backoff-until timestamp for a provider, or None."""
+    row = conn.execute(
+        "SELECT until FROM kanban_provider_backoff WHERE provider = ? AND until > ?",
+        (provider, int(time.time())),
+    ).fetchone()
+    return int(row["until"]) if row else None
+
+
+def _provider_backoff_enabled() -> bool:
+    """Whether provider-wide quota pauses are enabled (default true)."""
+    raw = os.environ.get("HERMES_KANBAN_PROVIDER_BACKOFF", "").strip().lower()
+    if raw:
+        return raw not in {"0", "false", "no", "off", ""}
+    try:
+        from hermes_cli.config import load_config_readonly
+        return bool((load_config_readonly().get("kanban") or {}).get("provider_backoff", True))
+    except Exception:
+        return True
+
+
+def _task_provider(conn: sqlite3.Connection, task_id: str) -> Optional[str]:
+    """Resolve a task's explicit provider, falling back to its profile config.
+
+    Reading the assignee's own config gives profile-pinned providers separate pauses while
+    deliberately leaving ``provider: auto`` unpaused: auto routing may choose a healthy
+    provider and must not be guessed as exhausted.
+    """
+    row = conn.execute(
+        "SELECT provider_override, assignee FROM tasks WHERE id = ?", (task_id,),
+    ).fetchone()
+    if not row:
+        return None
+    if row["provider_override"]:
+        provider = str(row["provider_override"]).strip()
+        return provider if provider and provider != "auto" else None
+    assignee = row["assignee"]
+    if not assignee:
+        return None
+    try:
+        from hermes_constants import get_default_hermes_root
+        from hermes_cli.config import read_user_config_raw
+        root = Path(get_default_hermes_root())
+        cfg_path = root / "config.yaml" if assignee == "default" else root / "profiles" / str(assignee) / "config.yaml"
+        cfg = read_user_config_raw(cfg_path)
+        provider = (cfg.get("agent") or {}).get("provider")
+        p = str(provider).strip() if provider else None
+        return p if p and p != "auto" else None
+    except Exception:
+        return None
 
 
 # --- ID generation ---
@@ -3153,6 +3701,15 @@ def complete_task(
             params = (*params, int(expected_run_id))
         if conn.execute(sql, params).rowcount != 1:
             return False
+        # A genuine completion is one of the two allowed resets for the
+        # persistent infra-interruption streak (see docs/kanban/
+        # infra-failure-classification.md) — never a bare redispatch. Inlined
+        # (not via reset_interruption_streak) because we are already inside
+        # this function's own write_txn and that helper opens its own.
+        conn.execute(
+            "UPDATE kanban_interruption_streaks SET streak = 0, reset_at = ? WHERE task_id = ?",
+            (now, task_id),
+        )
         if isinstance(metadata, dict):
             _stage_completion_artifacts(conn, task_id, metadata, now)
         run_id = _end_run(
@@ -3942,6 +4499,16 @@ def unblock_task(conn: sqlite3.Connection, task_id: str) -> bool:
         )
         if cur.rowcount != 1:
             return False
+        # An explicit operator unblock is one of the two allowed resets for the
+        # persistent infra-interruption streak (the other is a genuine
+        # non-interruption terminal outcome, e.g. complete_task) — never a bare
+        # redispatch, which must leave the streak intact. Inlined (not via
+        # reset_interruption_streak) because we are already inside this
+        # function's own write_txn and that helper opens its own.
+        conn.execute(
+            "UPDATE kanban_interruption_streaks SET streak = 0, reset_at = ? WHERE task_id = ?",
+            (now, task_id),
+        )
         _append_event(
             conn, task_id, "unblocked",
             (
@@ -4322,13 +4889,26 @@ def _insert_decomposed_child(
     return new_id
 
 
-def archive_task(conn: sqlite3.Connection, task_id: str) -> bool:
+def archive_task(
+    conn: sqlite3.Connection, task_id: str, *, expected_status: Optional[str] = None,
+) -> bool:
+    """Archive one task while optionally requiring its status at write time.
+
+    ``expected_status`` lets a batch action select candidates optimistically but
+    still refuse a task that left that status before this transaction acquired
+    the write lock. The normal single-card archive remains status-agnostic.
+    """
     with write_txn(conn):
-        cur = conn.execute(
+        sql = (
             "UPDATE tasks SET status = 'archived', "
             "    claim_lock = NULL, claim_expires = NULL, worker_pid = NULL, worker_unit = NULL "
-            "WHERE id = ? AND status != 'archived'", (task_id,),
+            "WHERE id = ? AND status != 'archived'"
         )
+        params: list[str] = [task_id]
+        if expected_status is not None:
+            sql += " AND status = ?"
+            params.append(expected_status)
+        cur = conn.execute(sql, params)
         if cur.rowcount != 1:
             return False
         # Archived mid-run (dashboard): close the run so history isn't orphaned.
