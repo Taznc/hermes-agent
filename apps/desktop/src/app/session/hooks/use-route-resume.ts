@@ -3,7 +3,7 @@ import { type MutableRefObject, useEffect, useRef } from 'react'
 import { isNewChatRoute } from '@/app/routes'
 import { type SessionResumeRequest, setResumeExhaustedSessionId } from '@/store/session'
 import type { SessionProfileRoute } from '@/store/session-request-router'
-import { markSelectionRestore } from '@/store/session-states'
+import { focusOpenSession, markSelectionRestore } from '@/store/session-states'
 
 interface RouteResumeOptions {
   activeSessionId: string | null
@@ -14,8 +14,8 @@ interface RouteResumeOptions {
   gatewayState: string | undefined
   locationPathname: string
   /** A session route created solely to clear a workspace page behind a focused
-   * tile. Its tile remains the foreground surface, so it must not be resumed
-   * into main (which would close that tile). */
+   * tile. The tile remains this history entry's foreground target: replay must
+   * re-front it, never resume it into main (which would close the tile). */
   preserveSessionTile?: boolean
   resumeSession: (sessionId: string, focus: boolean, ownerRoute?: SessionProfileRoute) => Promise<unknown>
   // Stored-session id whose most recent resume failed terminally (set by
@@ -125,7 +125,7 @@ export function useRouteResume({
     seenGatewayStateRef.current = true
     wasGatewayOpenRef.current = gatewayOpen
 
-    if (currentView !== 'chat' || !gatewayOpen) {
+    if (currentView !== 'chat') {
       return
     }
 
@@ -135,8 +135,14 @@ export function useRouteResume({
       // (and the page/sidebar selection clears), but routing it through main
       // would deliberately close the tile in resumeSession. The wiring proves
       // the tile still exists before setting this flag; if it closes, the flag
-      // drops and an ordinary route resume is available again.
-      if (preserveSessionTile) {
+      // drops and an ordinary route resume is available again. Re-front it on
+      // every visit to this history entry: Kanban fronts `workspace`, so Back
+      // must actively restore the tile rather than merely suppressing resume.
+      if (preserveSessionTile && focusOpenSession(routedSessionId) === 'tile') {
+        return
+      }
+
+      if (!gatewayOpen) {
         return
       }
 
@@ -209,6 +215,7 @@ export function useRouteResume({
     }
 
     if (
+      gatewayOpen &&
       isNewChatRoute(locationPathname) &&
       !creatingSessionRef.current &&
       (selectedStoredSessionId || activeSessionId || !freshDraftReady) &&

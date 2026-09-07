@@ -4,14 +4,14 @@ import { afterEach, describe, expect, it, vi } from 'vitest'
 
 import { $resumeExhaustedSessionId, setResumeExhaustedSessionId } from '@/store/session'
 import type { SessionProfileRoute } from '@/store/session-request-router'
-import { markSelectionRestore } from '@/store/session-states'
+import { focusOpenSession, markSelectionRestore } from '@/store/session-states'
 
 import { useRouteResume } from './use-route-resume'
 
 // The hook only arms the boot-restore one-shot; the listener consuming it lives
 // in the real store (covered by session-states.test.ts). Mock the module so the
 // store's side effects (persistence listeners) stay out of this harness.
-vi.mock('@/store/session-states', () => ({ markSelectionRestore: vi.fn() }))
+vi.mock('@/store/session-states', () => ({ focusOpenSession: vi.fn(), markSelectionRestore: vi.fn() }))
 
 interface HarnessProps {
   activeSessionId: null | string
@@ -49,6 +49,7 @@ describe('useRouteResume', () => {
   afterEach(() => {
     cleanup()
     vi.restoreAllMocks()
+    vi.mocked(focusOpenSession).mockReset()
   })
 
   it('does not re-resume the old session during a /:sid -> /new transition', () => {
@@ -270,12 +271,16 @@ describe('useRouteResume', () => {
       startFreshSessionDraft
     }
 
+    vi.mocked(focusOpenSession).mockReturnValue('tile')
+
     const { rerender } = render(<RouteResumeHarness {...props} preserveSessionTile />)
 
     expect(resumeSession).not.toHaveBeenCalled()
+    expect(focusOpenSession).toHaveBeenCalledWith('tile-session')
 
     // Closing the tile removes the preservation proof. The unchanged session
     // route then resumes into main through the ordinary recovery path.
+    vi.mocked(focusOpenSession).mockReturnValue(null)
     rerender(<RouteResumeHarness {...props} preserveSessionTile={false} />)
 
     expect(resumeSession).toHaveBeenCalledWith('tile-session', true)
