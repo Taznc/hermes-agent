@@ -142,10 +142,13 @@ class MCPServerRunMixin:
                      "rebuilding transport.", self.name, revival_reason)
         return False
 
-    async def _prepare_run(self, config: dict) -> bool:
-        """Bind config, build sampling/elicitation handlers, validate HTTP. False when the server
-        must not start (bad remote URL / non-MCP endpoint: fail fast with ``_error`` set and
-        ``_ready`` fired instead of burning the reconnect ladder inside the SDK's httpx layer)."""
+    def _bind_config(self, config: dict) -> None:
+        """Rebind every transport-derived setting before an intentional revival.
+
+        Discovery invokes this before signalling a parked task whose configuration changed;
+        setting only ``_config`` would leave auth, lifecycle, and approval handlers from the
+        prior connection active on the next transport attempt.
+        """
         self._config = config
         self.tool_timeout = _resolve_tool_timeout(config)
         self._auth_type = (config.get("auth") or "").lower().strip()
@@ -161,6 +164,12 @@ class MCPServerRunMixin:
         elicitation_config = config.get("elicitation", {})
         self._elicitation = (_sampling.ElicitationHandler(self.name, elicitation_config, owner=self)
                              if elicitation_config.get("enabled", True) and _core._MCP_ELICITATION_TYPES else None)
+
+    async def _prepare_run(self, config: dict) -> bool:
+        """Bind config and validate HTTP. False when the server must not start (bad remote URL /
+        non-MCP endpoint: fail fast with ``_error`` set and ``_ready`` fired instead of burning
+        the reconnect ladder inside the SDK's httpx layer)."""
+        self._bind_config(config)
         if "url" in config and "command" in config:
             logger.warning("MCP server '%s' has both 'url' and 'command' in config. Using HTTP transport "
                            "('url'). Remove 'command' to silence this warning.", self.name)

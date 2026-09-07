@@ -46,9 +46,14 @@ def test_parked_server_waits_for_explicit_reconnect_before_revival(monkeypatch, 
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
 
     from tools import mcp_tool
+    from tools.mcp_tool_loop import reconnect_mcp_server
     from tools.mcp_tool import MCPServerTask
 
     monkeypatch.setattr(mcp_tool, "_MAX_RECONNECT_RETRIES", 1)
+    # The base implementation self-probes after 300s.  Override that old
+    # scheduler seam so this contract fails quickly on base, while
+    # ``raising=False`` also supports the new implementation which removed it.
+    monkeypatch.setattr(mcp_tool, "_PARKED_RETRY_INTERVAL", 0.05, raising=False)
     _real_sleep = asyncio.sleep
 
     async def _fast_sleep(_delay, *a, **kw):
@@ -96,6 +101,7 @@ def test_parked_server_waits_for_explicit_reconnect_before_revival(monkeypatch, 
 
         task = _Task("srv")
         task._registered_tool_names = ["srv__tool"]
+        monkeypatch.setitem(mcp_tool._servers, task.name, task)
 
         run_task = asyncio.ensure_future(task.run({"command": "x"}))
 
@@ -109,17 +115,19 @@ def test_parked_server_waits_for_explicit_reconnect_before_revival(monkeypatch, 
 
         # The backend comes back, but no operator, credential refresh, or
         # configuration reload asks the parked server to reconnect. Waiting
-        # across the former self-probe interval must not touch transport.
+        # across the old self-probe interval must not touch transport.
         state["backend_up"] = True
         parked_transport_calls = state["transport_calls"]
         await _real_sleep(0.16)
-        assert state["transport_calls"] == parked_transport_calls, (
+        assert parked_transport_calls == 2
+        assert state["transport_calls"] == 2, (
             "parked server attempted reconnect without an explicit lifecycle request"
         )
         assert task.session is None
 
-        # An explicit reconnect still wakes the retained task and restores its tools.
-        task._reconnect_event.set()
+        # The production explicit-reconnect API still wakes the retained task
+        # and restores its tools.
+        assert reconnect_mcp_server("srv") is True
         for _ in range(200):
             await _real_sleep(0.01)
             if task.session is not None:
@@ -133,10 +141,12 @@ def test_parked_server_waits_for_explicit_reconnect_before_revival(monkeypatch, 
         )
 
         task._shutdown_event.set()
-        task._reconnect_event.set()
+        assert reconnect_mcp_server("srv") is True
         try:
             await asyncio.wait_for(run_task, timeout=15)
         except (asyncio.TimeoutError, asyncio.CancelledError, Exception):
             run_task.cancel()
+        finally:
+            mcp_tool._servers.pop(task.name, None)
 
     asyncio.run(_scenario())

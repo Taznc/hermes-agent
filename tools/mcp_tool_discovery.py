@@ -261,7 +261,7 @@ def _select_new_servers(servers: Dict[str, dict]) -> Dict[str, dict]:
                 _core._parallel_safe_servers.discard(srv_name)
     for name, server, config in stale_cached:
         if getattr(server, "_config", None) != config:
-            server._config = config
+            server._bind_config(config)
             logger.info("MCP server '%s': configuration changed while parked; requesting reconnect", name)
             _loop._signal_reconnect(server)
     return new_servers

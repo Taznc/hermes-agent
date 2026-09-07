@@ -33,6 +33,9 @@ def test_register_wakes_stale_cached_server(monkeypatch, tmp_path):
             self._reconnect_event = _Event(name)
             self._registered_tool_names: list[str] = []
 
+        def _bind_config(self, config):
+            self._config = config
+
     class _Alive:
         session = object()
 

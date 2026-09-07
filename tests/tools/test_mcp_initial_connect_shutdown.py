@@ -119,7 +119,12 @@ def test_initial_connect_failure_revives_same_registered_server_after_config_cha
     created = []
     backend_up = threading.Event()
     revived = threading.Event()
-    state = {"transport_calls": 0, "tool_calls": 0, "connect_timeouts": []}
+    state = {
+        "transport_calls": 0,
+        "tool_calls": 0,
+        "connect_timeouts": [],
+        "bound_settings": [],
+    }
     mock_registry = ToolRegistry()
 
     class _Session:
@@ -140,6 +145,7 @@ def test_initial_connect_failure_revives_same_registered_server_after_config_cha
             assert mcp_tool._connect_server_claim.get() is None
             state["transport_calls"] += 1
             state["connect_timeouts"].append(config["connect_timeout"])
+            state["bound_settings"].append((self._auth_type, self._idle_timeout_seconds))
             if not backend_up.is_set():
                 raise ConnectionError("backend still booting")
 
@@ -165,7 +171,11 @@ def test_initial_connect_failure_revives_same_registered_server_after_config_cha
     monkeypatch.setattr(registry_module, "registry", mock_registry)
 
     config = {
-        "recovering": {"command": "unused", "connect_timeout": 5}
+        "recovering": {
+            "command": "unused",
+            "connect_timeout": 5,
+            "idle_timeout_seconds": 10,
+        }
     }
 
     try:
@@ -181,7 +191,12 @@ def test_initial_connect_failure_revives_same_registered_server_after_config_cha
 
         backend_up.set()
         _mcp_discovery.register_mcp_servers({
-            "recovering": {"command": "unused", "connect_timeout": 6}
+            "recovering": {
+                "command": "unused",
+                "connect_timeout": 6,
+                "auth": "oauth",
+                "idle_timeout_seconds": 23,
+            }
         })
 
         assert revived.wait(timeout=5), "cached parked server did not revive after config change"
@@ -191,6 +206,7 @@ def test_initial_connect_failure_revives_same_registered_server_after_config_cha
             assert "recovering" not in mcp_tool._server_connect_errors
         assert state["transport_calls"] == 2
         assert state["connect_timeouts"] == [5, 6]
+        assert state["bound_settings"] == [("", 10.0), ("oauth", 23.0)]
         assert server.session is not None
         assert server._error is None
 
