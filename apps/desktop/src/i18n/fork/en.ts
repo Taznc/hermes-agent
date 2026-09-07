@@ -85,10 +85,14 @@ export const forkEn: ForkTranslations = {
       presetUnsaved: 'Not saved on this backend — applies to this session only.',
       resultsLabel: 'Model recommendations',
       privacy:
-        'Checks your current draft and attachment names only. Conversation history, file contents, and project files are never sent.',
+        'Checks your current draft and your attachments’ names and types only. Conversation history, file contents, and project files are never sent.',
       pending: 'Checking…',
       apply: 'Apply',
       applyUnconfirmed: 'Not applied yet — confirm the switch, or pick a model manually.',
+      applyFailed:
+        'That switch did not go through. You are still on your previous model — try again or pick one manually.',
+      applyUnrestored:
+        'That switch did not finish, and the previous model could not be restored. Check the model menu before sending.',
       retry: 'Try again',
       failed: 'The recommendation check failed.',
       unavailable: 'No recommendation is available. Configure a recommendation router in settings to enable this.',

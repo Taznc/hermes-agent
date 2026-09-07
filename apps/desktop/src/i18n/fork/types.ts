@@ -95,6 +95,14 @@ export interface ForkTranslations {
       /** Shown when the selection path did not apply outright — usually a
        *  pending expensive-model confirmation, never a claim of failure. */
       applyUnconfirmed: string
+      /** The selection path FAILED. Distinct from `applyUnconfirmed`: there is
+       *  nothing left to confirm, and the previous model is still in use
+       *  because the switch was rolled back (or never took effect). */
+      applyFailed: string
+      /** The switch failed AND the gateway refused the compensation, so the
+       *  backend may be left on the new model. Never claims a rollback that
+       *  did not happen — points the user at the model menu to verify. */
+      applyUnrestored: string
       retry: string
       failed: string
       unavailable: string

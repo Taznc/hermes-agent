@@ -38,10 +38,25 @@ interface ModelSwitchResponse {
   deferred?: boolean
 }
 
+/** How a switch that failed AFTER the model write left the backend. */
+export type ModelSelectionRecovery = 'not_needed' | 'restore_failed' | 'restored'
+
+/**
+ * How a `confirmation_pending` outcome eventually resolved. A confirmation is
+ * a SUSPENDED decision, not a terminal answer: a surface that told the user to
+ * confirm has to be able to replace that guidance once they do, so the pending
+ * outcome carries the promise of its own settlement.
+ *
+ * `superseded` is neither success nor failure — the user made a newer choice,
+ * the staleness guard dismissed the prompt, and nothing was sent.
+ */
+export type ConfirmationSettlement =
+  { kind: 'applied' } | { kind: 'failed'; recovery: ModelSelectionRecovery } | { kind: 'superseded' }
+
 export type ModelSelectionOutcome =
   | { kind: 'applied' }
-  | { kind: 'confirmation_pending' }
-  | { kind: 'failed'; recovery: 'not_needed' | 'restore_failed' | 'restored' }
+  | { kind: 'confirmation_pending'; settled: Promise<ConfirmationSettlement> }
+  | { kind: 'failed'; recovery: ModelSelectionRecovery }
 
 export interface RecommendedModelSelection extends ModelSelection {
   sessionId: null | string
@@ -378,6 +393,20 @@ export function useModelControls({
         if (result?.confirm_required) {
           rollbackSelection()
           let confirmedRestoreFailed = false
+          // What the post-confirm compensation did, when it ran at all. Null
+          // means the confirmed switch never reached the effort write, so a
+          // failure is a plain refusal with nothing to compensate.
+          let confirmedRecovery: ModelSelectionRecovery | null = null
+
+          // The confirmation's own settlement. The executor runs synchronously,
+          // so `settleConfirmation` is assigned before any callback below can
+          // fire; `resolve` is idempotent, so the first terminal event wins and
+          // a later one is a no-op rather than a contradiction.
+          let settleConfirmation!: (settlement: ConfirmationSettlement) => void
+
+          const settled = new Promise<ConfirmationSettlement>(resolve => {
+            settleConfirmation = resolve
+          })
 
           // ONE shared applier for guarded switches (#95293): the same
           // confirm flow the Bots editor routes through — never fork this
@@ -386,19 +415,32 @@ export function useModelControls({
             confirmLabel: t.common.confirm,
             confirmMessage: result.confirm_message,
             failureMessage: copy.modelSwitchFailed,
-            finish: finishSwitch,
+            finish: confirmedResult => {
+              finishSwitch(confirmedResult)
+              settleConfirmation({ kind: 'applied' })
+            },
             // Staleness guard — the warning can linger while the user picks
             // a different model or switches sessions. Clicking Confirm must
             // not clobber the newer choice: bail if the live state no longer
             // matches the snapshot this notification was created for.
-            isStale: () =>
-              touchesPrimary
+            isStale: () => {
+              const stale = touchesPrimary
                 ? $activeSessionId.get() !== liveSessionId ||
                   $currentModel.get() !== prevModel ||
                   $currentProvider.get() !== prevProvider
                 : !liveSessionId ||
                   $sessionStates.get()[liveSessionId]?.model !== prevModel ||
-                  $sessionStates.get()[liveSessionId]?.provider !== prevProvider,
+                  $sessionStates.get()[liveSessionId]?.provider !== prevProvider
+
+              if (stale) {
+                // Nothing was sent and nothing failed: the user simply moved
+                // on. A caller showing confirm guidance must drop it without
+                // reporting an error that never happened.
+                settleConfirmation({ kind: 'superseded' })
+              }
+
+              return stale
+            },
             repaint: () => {
               paintSelection()
               cacheSelection(selection.provider, selection.model)
@@ -414,6 +456,7 @@ export function useModelControls({
                   await requestEffort()
                 } catch (err) {
                   confirmedRestoreFailed = !(await restorePreviousModel())
+                  confirmedRecovery = confirmedRestoreFailed ? 'restore_failed' : 'restored'
 
                   if (confirmedRestoreFailed) {
                     paintAcceptedModelWithPreviousEffort()
@@ -429,10 +472,12 @@ export function useModelControls({
               if (!confirmedRestoreFailed) {
                 rollbackSelection()
               }
+
+              settleConfirmation({ kind: 'failed', recovery: confirmedRecovery ?? 'not_needed' })
             }
           })
 
-          return { kind: 'confirmation_pending' }
+          return { kind: 'confirmation_pending', settled }
         }
 
         // >>> FORK ANCHOR: composer-model-recommendation <<<

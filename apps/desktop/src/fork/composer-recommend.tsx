@@ -4,6 +4,7 @@ import { useCallback, useEffect, useId, useLayoutEffect, useMemo, useRef, useSta
 import { useSessionView } from '@/app/chat/session-view'
 import type {
   ModelSelectionOutcome,
+  ModelSelectionRecovery,
   RecommendedModelSelection
 } from '@/app/session/hooks/use-model-controls'
 import { Button } from '@/components/ui/button'
@@ -46,6 +47,7 @@ export interface ComposerRecommendProps {
 
 type ApplyState =
   | { kind: 'applying'; row: string }
+  | { kind: 'failed'; recovery: ModelSelectionRecovery; row: string }
   | { kind: 'idle'; row?: string }
   | { kind: 'unconfirmed'; row: string }
 
@@ -291,6 +293,10 @@ export function ComposerRecommend({
     }
 
     const key = rowKey(row)
+    // Every paint below belongs to THIS attempt in THIS workspace. A profile
+    // or gateway change bumps the epoch, so a late answer about a workspace
+    // the user already left cannot repaint anything here.
+    const epoch = requestEpochRef.current
 
     setApply({ kind: 'applying', row: key })
 
@@ -305,10 +311,57 @@ export function ComposerRecommend({
       sessionId
     })
 
-    if (outcome.kind !== 'applied') {
-      setApply({ kind: 'unconfirmed', row: key })
-    } else {
+    if (requestEpochRef.current !== epoch) {
+      return
+    }
+
+    // A failure and a pending confirmation are DIFFERENT events. Telling a
+    // user to "confirm the switch" when the selection path already failed
+    // sends them looking for a prompt that does not exist.
+    if (outcome.kind === 'failed') {
+      setApply({ kind: 'failed', recovery: outcome.recovery, row: key })
+
+      return
+    }
+
+    if (outcome.kind !== 'confirmation_pending') {
       setApply({ kind: 'idle', row: key })
+      setOpen(false)
+
+      return
+    }
+
+    setApply({ kind: 'unconfirmed', row: key })
+
+    // A confirmation is a SUSPENDED decision, not a terminal answer. Once the
+    // user answers it, the "confirm the switch" guidance is stale in every
+    // direction — settled-applied means it is done, settled-failed means there
+    // is nothing left to confirm. Waiting for the settlement is what keeps
+    // this surface honest after the fact.
+    const settlement = await outcome.settled
+
+    if (requestEpochRef.current !== epoch) {
+      return
+    }
+
+    // Only replace state this attempt still owns: the user may have applied a
+    // different row (or re-applied this one) while the confirmation sat open.
+    setApply(current => {
+      if (current.kind !== 'unconfirmed' || current.row !== key) {
+        return current
+      }
+
+      if (settlement.kind === 'failed') {
+        return { kind: 'failed', recovery: settlement.recovery, row: key }
+      }
+
+      // `superseded` is neither: the user made a newer choice and the applier
+      // dismissed the prompt without sending anything. Drop the guidance
+      // without inventing a failure.
+      return { kind: 'idle', row: key }
+    })
+
+    if (settlement.kind === 'applied') {
       setOpen(false)
     }
   }
@@ -524,6 +577,24 @@ export function ComposerRecommend({
                     ) : null}
                     {apply.kind === 'unconfirmed' && apply.row === key ? (
                       <span data-testid="composer-recommend-apply-unconfirmed">{copy.applyUnconfirmed}</span>
+                    ) : null}
+                    {/* Two distinct honest reports, never one blurred message:
+                        a rolled-back failure leaves the previous model in use,
+                        while a refused compensation may have left the backend
+                        on the new one and must say so instead of claiming a
+                        rollback the gateway rejected. */}
+                    {apply.kind === 'failed' && apply.row === key && apply.recovery !== 'restore_failed' ? (
+                      <span className="min-w-0 basis-full break-words" data-testid="composer-recommend-apply-failed">
+                        {copy.applyFailed}
+                      </span>
+                    ) : null}
+                    {apply.kind === 'failed' && apply.row === key && apply.recovery === 'restore_failed' ? (
+                      <span
+                        className="min-w-0 basis-full break-words"
+                        data-testid="composer-recommend-apply-unrestored"
+                      >
+                        {copy.applyUnrestored}
+                      </span>
                     ) : null}
                   </div>
                 )
