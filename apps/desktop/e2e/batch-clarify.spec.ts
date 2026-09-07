@@ -12,10 +12,9 @@
  * clarify.request event → renderer, against the mock inference server.
  */
 
-import { expect, test } from './test'
-
 import { type MockBackendFixture, setupMockBackend, waitForAppReady } from './fixtures'
 import { BATCH_CLARIFY_QUESTIONS, BATCH_CLARIFY_TRIGGER } from './mock-server'
+import { expect, test } from './test'
 
 let fixture: MockBackendFixture | null = null
 
@@ -63,10 +62,16 @@ test.describe('batch clarify card', () => {
     await expect(confirmButton).toContainText('Confirm and continue')
     await expect(confirmButton).toBeDisabled()
 
-    await batchCard.getByRole('button', { name: /Coffee/ }).click()
+    await batchCard
+      .locator('[data-choice]')
+      .filter({ hasText: /Coffee/ })
+      .click()
     await expect(confirmButton).toBeDisabled()
 
-    await batchCard.getByRole('button', { name: /Morning/ }).click()
+    await batchCard
+      .locator('[data-choice]')
+      .filter({ hasText: /Morning/ })
+      .click()
     await expect(confirmButton).toBeEnabled()
 
     // ONE confirm submits the whole batch.
