@@ -35,6 +35,7 @@ from hermes_cli import kanban_db_notify as kbn
 from hermes_cli import kanban_db_dispatch as kbd
 from hermes_cli import kanban_db_workspace as kbw
 from hermes_cli import kanban_diagnostics as kd
+from hermes_cli import kanban_quota_circuit as kqc
 from hermes_cli.kanban_db import KANBAN_ATTACHMENT_MAX_BYTES, _collision_free_path, _safe_attachment_name
 
 log = logging.getLogger(__name__)
@@ -167,9 +168,11 @@ def _errors_to_500(prefix: str) -> Iterator[None]:
 # Dashboard columns, left-to-right ("archived" is a filter toggle, not a column). Keep in
 # sync with kanban_db.VALID_STATUSES — a status missing here gets mis-bucketed into ``todo``.
 # ``on_hold`` is the human-initiated shelf/pause column — distinct from ``blocked`` (worker needs
-# input) and ``scheduled`` (waiting on time).
+# input) and ``scheduled`` (waiting on time). ``idea``/``roadmap`` are the inert wishlist lanes:
+# real columns the UI renders, but no automation ever selects them, so they trail the live ones.
 BOARD_COLUMNS: list[str] = [
     "triage", "todo", "scheduled", "ready", "running", "blocked", "on_hold", "review", "done",
+    "idea", "roadmap",
 ]
 
 _CARD_SUMMARY_PREVIEW_CHARS = 200
@@ -294,10 +297,61 @@ def _attach_diagnostics(task_d: dict, diags: Optional[list[dict]], *, include_fu
 
 
 def _links_for(conn: sqlite3.Connection, task_id: str) -> dict[str, list[str]]:
-    """Return {'parents': [...], 'children': [...]} for a task."""
+    """Return {'parents': [...], 'children': [...]} for a task.
+
+    A parent that is archived AND has satisfied its dependency edge is omitted.
+    It can never gate this task again (``_parent_dependency_satisfied`` keys off
+    ``completed_at``, which only the completion lifecycle writes) and it is
+    absent from every default board view, so the drawer's ``resolveLinks`` can
+    only report it as unresolvable -- which ``partitionBlockers`` counts as
+    still-gating by design. Keeping it paints a permanent "waiting on blocker"
+    banner naming a task the user cannot see or act on.
+
+    Unlike the board payload this filter is not view-scoped: ``GET /tasks/:id``
+    takes no ``include_archived``, so it drops what NO default view can resolve
+    rather than what one particular view happens to omit. A parent id with no
+    task row at all (a genuinely deleted task) is preserved and keeps gating --
+    a dangling link is exactly what the user needs to see so they can cut it.
+    """
     def _ids(col: str, other: str) -> list[str]:
         return [r[col] for r in conn.execute(f"SELECT {col} FROM task_links WHERE {other} = ? ORDER BY {col}", (task_id,))]
-    return {"parents": _ids("parent_id", "child_id"), "children": _ids("child_id", "parent_id")}
+    parents = _ids("parent_id", "child_id")
+    if parents:
+        rows = conn.execute(
+            "SELECT id, status, completed_at FROM tasks WHERE id IN (" + ",".join("?" * len(parents)) + ")",
+            parents).fetchall()
+        cleared = {
+            r["id"] for r in rows
+            if r["status"] == "archived" and kanban_db._parent_dependency_satisfied(r)}
+        parents = [p for p in parents if p not in cleared]
+    return {"parents": parents, "children": _ids("child_id", "parent_id")}
+
+
+def _unresolvable_satisfied_parents(conn: sqlite3.Connection, visible_ids: set[str]) -> set[str]:
+    """Parent ids a board payload lists edges for but cannot render a card for,
+    and which provably no longer gate anyone.
+
+    The desktop resolves every edge endpoint against the payload's OWN task
+    index (``indexBoard``/``resolveLinks`` in ``apps/desktop/src/plugins/kanban/
+    deps.ts``) and treats an id it cannot find as still-gating -- deliberately,
+    since the backend link exists and may still be enforced. That default is
+    right for a deleted parent and wrong for a completed-then-archived one,
+    which the default ``include_archived=False`` fetch omits while its edge
+    survives. The result is a card stuck "waiting on a blocker" with no
+    resolvable reason until someone unlinks it by hand.
+
+    Only edges satisfying BOTH halves are dropped, so the safety default holds
+    everywhere it should: a parent that is merely archived without ever
+    completing (withdrawn, not finished) still gates, a parent whose row is gone
+    entirely still gates, and a satisfied parent that IS in this payload keeps
+    its edge -- that is the "blockers clear" state the desktop renders in green.
+    """
+    rows = conn.execute(
+        "SELECT DISTINCT t.id AS id, t.status AS status, t.completed_at AS completed_at "
+        "FROM tasks t JOIN task_links l ON l.parent_id = t.id").fetchall()
+    return {
+        r["id"] for r in rows
+        if r["id"] not in visible_ids and kanban_db._parent_dependency_satisfied(r)}
 
 
 # --- GET /board -------------------------------------------------------------
@@ -321,7 +375,14 @@ def _board_payload(
     # The same rows are kept as an explicit edge list so the UI can highlight a card's whole
     # dependency chain without N per-task round-trips.
     link_edges: list[list[str]] = []
+    # An edge whose parent this payload cannot render, but which no longer gates anyone, is
+    # dropped from BOTH rollups: the desktop reads `link_edges` when it has them and falls back
+    # to the `link_counts` numbers when it doesn't, so filtering only one of the two would still
+    # leave a phantom "blocked by 1" chip on the card. See _unresolvable_satisfied_parents.
+    cleared_parents = _unresolvable_satisfied_parents(conn, {t.id for t in tasks})
     for row in conn.execute("SELECT parent_id, child_id FROM task_links").fetchall():
+        if row["parent_id"] in cleared_parents:
+            continue
         link_counts.setdefault(row["parent_id"], {"parents": 0, "children": 0})["children"] += 1
         link_counts.setdefault(row["child_id"], {"parents": 0, "children": 0})["parents"] += 1
         link_edges.append([row["parent_id"], row["child_id"]])
@@ -891,10 +952,15 @@ def _drag_to(conn, task_id: str, s: str) -> bool:
     evented unarchive verb; blocked/scheduled -> ready re-opens via
     ``unblock_task``; leaving ``review`` goes through ``reopen_review_task``
     (stale-run recovery, parent re-gate, ``review_reopened`` event) instead of
-    a raw write."""
+    a raw write; a ``roadmap`` card being dragged into the work queue is an
+    authorization, so it goes through ``spawn_roadmap_task`` for the
+    ``spawned_from_roadmap`` event (and ``idea`` is refused there — an idea must be
+    refined first, which the DB layer states in its ValueError)."""
     current = kanban_db.get_task(conn, task_id)
     if current is not None and current.status == "archived":
         return kanban_db.unarchive_task(conn, task_id, status=s)
+    if current is not None and current.status in kanban_db.ROADMAP_LANE_STATUSES:
+        return kanban_db.spawn_roadmap_task(conn, task_id, to=s)
     if s == "ready" and current and current.status in ("blocked", "scheduled"):
         return kanban_db.unblock_task(conn, task_id)
     if s == "ready" and current and current.status == "on_hold":
@@ -902,6 +968,14 @@ def _drag_to(conn, task_id: str, s: str) -> bool:
     if current is not None and current.status == "review":
         return kanban_db.reopen_review_task(conn, task_id)
     return _set_status_direct(conn, task_id, s)
+
+
+def _drag_to_lane(conn, task_id: str, lane: str) -> bool:
+    """Drag-drop INTO a wishlist lane. Only the two intra-lane moves exist (``idea -> roadmap``
+    refine, ``roadmap -> idea`` demote); dragging live work into the wishlist raises ValueError
+    from the DB layer and surfaces as a 400 naming the attempted from->to."""
+    return (kanban_db.refine_task(conn, task_id) if lane == "roadmap"
+            else kanban_db.demote_task(conn, task_id))
 
 
 # Status verb dispatch shared by PATCH /tasks/{id} and POST /tasks/bulk: (conn, task_id,
@@ -916,7 +990,9 @@ _STATUS_HANDLERS: dict[str, Any] = {
         conn, tid, summary=p.summary, metadata=p.metadata, reviewer=(p.assignee or None), force=True),
     "ready": lambda conn, tid, p: _drag_to(conn, tid, "ready"),
     "todo": lambda conn, tid, p: _drag_to(conn, tid, "todo"),
-    "triage": lambda conn, tid, p: _drag_to(conn, tid, "triage")}
+    "triage": lambda conn, tid, p: _drag_to(conn, tid, "triage"),
+    "idea": lambda conn, tid, p: _drag_to_lane(conn, tid, "idea"),
+    "roadmap": lambda conn, tid, p: _drag_to_lane(conn, tid, "roadmap")}
 
 
 def _apply_status(conn, task_id: str, s: str, p, unknown_detail: str) -> bool:
@@ -964,7 +1040,10 @@ def _patch_status(conn, task_id: str, payload: UpdateTaskBody, review_assignee_d
     if s == "archived":
         ok = kanban_db.archive_task(conn, task_id)
     else:
-        with _map_errors(400, _StatusRejected):
+        # ValueError is the roadmap-lane layer refusing a transition; its message names the
+        # attempted from->to, which is exactly what the UI toast should say, so surface it as a
+        # 400 rather than letting it fall through to the generic 409.
+        with _map_errors(400, _StatusRejected, ValueError):
             ok = _apply_status(conn, task_id, s, payload, f"unknown status: {s}")
         if s == "review" and ok and review_assignee_deferred and not payload.assignee:
             ok = kanban_db.assign_task(conn, task_id, None)
@@ -1168,8 +1247,13 @@ def _bulk_apply_one(conn, tid: str, payload: BulkTaskBody, board: Optional[str],
         entry.update(ok=False, error="archive refused")
     if payload.status is not None and not payload.archive:
         s = payload.status
-        if not _apply_status(conn, tid, s, payload, f"unknown status {s!r}"):
-            entry.update(ok=False, error=f"transition to {s!r} refused")
+        try:
+            if not _apply_status(conn, tid, s, payload, f"unknown status {s!r}"):
+                entry.update(ok=False, error=f"transition to {s!r} refused")
+        except ValueError as exc:
+            # Roadmap-lane refusal: record the from->to message per task, matching how every
+            # other per-task refusal in this bulk loop is reported instead of aborting the batch.
+            entry.update(ok=False, error=str(exc))
     if payload.assignee is not None:
         try:
             ok = (kanban_db.reassign_task(conn, tid, payload.assignee or None, reclaim_first=True) if payload.reclaim_first
@@ -1462,59 +1546,50 @@ def _run_estimate(title: str, body: Optional[str]) -> dict:
         "rationale": str(parsed.get("rationale") or "").strip() or None, "model": model}
 
 
-# --- POST /roadmap/idea — capture a free-typed roadmap idea into the roadmap-sync plugin's managed
-# "## Ideas" inbox. The ONLY roadmap writer reachable from this router: it delegates the file
-# mutation to roadmap_sync.append_idea_for_board(), which owns the flock + atomic-write path, so
-# there is exactly one roadmap writer with its own locking.
+# --- POST /roadmap/idea — capture a free-typed roadmap idea as an ``idea`` card on the resolved
+# board. Previously this appended to the roadmap-sync plugin's markdown "## Ideas" inbox; the
+# board is now the system of record for the wishlist (the inert ``idea`` lane), and the roadmap
+# document is rendered FROM those cards. The response shape is unchanged so the shipped Desktop
+# callers (api.ts ``addRoadmapIdea``, IdeaCaptureDialog, the per-card "send to roadmap ideas"
+# action) keep working without a client change.
 
-# Mirrors the plugin's own bound (roadmap-sync's _IDEA_MAX_LEN) so an oversized paste gets a clean
-# 400 instead of a silent truncation. MUST stay equal to the plugin's cap: its sanitizer never
-# lengthens text, so any input at or under this bound is guaranteed to be stored in full.
+# Bound on captured text. Kept at the markdown inbox's old cap so an oversized paste still gets a
+# clean 400 instead of landing a wall of text as a card title.
 _ROADMAP_IDEA_MAX_LEN = 300
-
-
-def _load_roadmap_sync_module():
-    """Best-effort import of the roadmap-sync plugin's module via the SAME plugin loader/registry
-    the agent core uses (same enable/disable gate, same directory resolution). ``None`` on ANY
-    failure — the caller treats that as "roadmap unavailable" and degrades, never raises."""
-    try:
-        from hermes_cli.plugins import get_plugin_manager
-        loaded = get_plugin_manager()._plugins.get("roadmap-sync")
-        if loaded is None or not getattr(loaded, "enabled", False):
-            return None
-        return getattr(loaded, "module", None)
-    except Exception:
-        return None
 
 
 class RoadmapIdeaBody(BaseModel):
     text: str
     # Optional provenance when captured from an existing card. Validated against the CANONICAL
     # kanban task-id shape (``"t_" + 8 lowercase hex``) so provenance on a value that didn't come
-    # from the board is rejected with a 422; the plugin keeps its own broader allowlist for
-    # future non-HTTP callers.
+    # from the board is rejected with a 422.
     source_id: Optional[str] = Field(default=None, pattern=r"^t_[0-9a-f]{8}$")
 
 
 @router.post("/roadmap/idea")
 def append_roadmap_idea(payload: RoadmapIdeaBody, board: Optional[str] = Query(None)):
-    """Append one idea to the active board's roadmap ``## Ideas`` inbox. Never a 5xx for a
-    missing/misconfigured roadmap (fail-open): ``{"ok": true}`` or ``{"ok": false, "reason"}``.
-    Only the length pre-check lives here (a real 400 so a megabyte paste never reaches the writer);
-    empty text is left to the plugin's sanitizer so one place defines "empty" for every caller."""
-    text = payload.text or ""
-    if len(text) > _ROADMAP_IDEA_MAX_LEN:
+    """Capture one idea as an ``idea`` card on the active board. Never a 5xx (fail-open):
+    ``{"ok": true}`` or ``{"ok": false, "reason"}``. ``roadmap_unavailable`` now means only
+    "no board could be resolved". Empty text is rejected here (the card title cannot be blank);
+    the length pre-check stays a real 400 so a megabyte paste never reaches the DB."""
+    text = (payload.text or "").strip()
+    if len(payload.text or "") > _ROADMAP_IDEA_MAX_LEN:
         raise HTTPException(status_code=400, detail=f"idea text exceeds {_ROADMAP_IDEA_MAX_LEN} characters")
+    if not text:
+        return {"ok": False, "reason": "empty_idea"}
     slug = _resolve_board(board) or kanban_db.get_current_board()
-    module = _load_roadmap_sync_module()
-    if module is None:
+    if not slug:
         return {"ok": False, "reason": "roadmap_unavailable"}
+    # Provenance lives in the body, not the title: the title is what renders in the roadmap.
+    body = f"Captured from the dashboard idea inbox.\n\nSource card: {payload.source_id}" if payload.source_id else None
     try:
-        ok, reason = module.append_idea_for_board(slug, text, source_id=(payload.source_id or None))
+        with _board_conn(slug) as (_slug, conn):
+            kanban_db.create_task(
+                conn, title=text, body=body, created_by="dashboard", lane="idea", board=_slug)
     except Exception:
-        # Fail-open at the endpoint boundary too — a version mismatch with roadmap-sync must not 500.
+        # Fail-open at the endpoint boundary: a capture failure must never 500 the dialog.
         return {"ok": False, "reason": "roadmap_unavailable"}
-    return {"ok": bool(ok), "reason": None if ok else reason}
+    return {"ok": True, "reason": None}
 
 
 # --- Plugin config ----------------------------------------------------------
@@ -1647,6 +1722,21 @@ def get_task_log(task_id: str, tail: Optional[int] = Query(None, ge=1, le=2_000_
         "size_bytes": size, "content": content or "", "truncated": bool(tail and size > tail)}
 
 
+@router.get("/quota-circuits")
+def quota_circuits():
+    """Sanitized host-wide quota state shared by every Kanban board."""
+    circuits = kqc.list_quota_circuits()
+    return {"active": bool(circuits), "circuits": circuits}
+
+
+@router.delete("/quota-circuits/{group_handle}")
+def clear_quota_circuit(group_handle: str):
+    """Manually clear one circuit by its opaque dashboard handle."""
+    if not kqc.clear_quota_circuit(group_handle):
+        raise HTTPException(status_code=404, detail="quota circuit not found")
+    return {"cleared": True, "group": group_handle}
+
+
 @router.post("/dispatch")
 def dispatch(dry_run: bool = Query(False), max_n: int = Query(8, alias="max"), board: Optional[str] = Query(None)):
     """Dispatch nudge so the UI doesn't wait out the 60 s dispatcher tick.
@@ -1681,6 +1771,62 @@ def dispatch(dry_run: bool = Query(False), max_n: int = Query(8, alias="max"), b
             return payload
         except TypeError:
             return {"result": str(result)}
+
+
+# --- Dispatch pause circuit (maintenance drain) ------------------------------
+
+class DispatchPauseBody(BaseModel):
+    note: Optional[str] = None
+
+
+@router.get("/dispatch/status")
+def dispatch_status(board: Optional[str] = _BOARD_Q):
+    """Pause state + the board's live running count, for the drain indicator.
+
+    ``running_count`` is the "is it safe to restart yet" signal: pausing fences
+    NEW dispatch only, so an operator watches this reach 0 before restarting a
+    service whose cgroup would otherwise SIGKILL those workers.
+    """
+    with _board_conn(board) as (board, conn):
+        state = kbd.read_dispatch_pause(board)
+        running = int(kanban_db.board_stats(conn)["by_status"].get("running", 0))
+    return {
+        "paused": state is not None,
+        "state": state,
+        "running_count": running,
+        "message": kbd.dispatch_pause_message(state, board=board) if state else None,
+    }
+
+
+def _dispatch_target_board(board: Optional[str]) -> str:
+    """Resolve the board a pause/resume acts on to an explicit slug.
+
+    An omitted param must land on the *current* board, exactly as
+    ``GET /dispatch/status`` reads it: the Desktop's board switcher stores
+    "the active board" as an empty slug, so the default UI path arrives here
+    with no ``board`` at all. Leaving that as ``None`` under
+    ``_with_board_pinned`` would pin ``DEFAULT_BOARD`` and pause a board the
+    operator is not looking at, while status kept reporting the real one —
+    a silent no-op right before a gateway restart. An explicit slug is still
+    validated and used verbatim, so board isolation is unchanged.
+    """
+    return _resolve_board(board) or kanban_db.get_current_board()
+
+
+@router.post("/dispatch/pause")
+def dispatch_pause(payload: Optional[DispatchPauseBody] = None, board: Optional[str] = _BOARD_Q):
+    """Stop claiming/spawning on this board so it can drain. Never kills a worker."""
+    target = _dispatch_target_board(board)
+    return _with_board_pinned(
+        target, lambda: kbd.pause_dispatch(target, note=(payload.note if payload else None)),
+    )
+
+
+@router.post("/dispatch/resume")
+def dispatch_resume(board: Optional[str] = _BOARD_Q):
+    """Clear this board's pause — the same entry point `--resume-circuit` uses."""
+    target = _dispatch_target_board(board)
+    return _with_board_pinned(target, lambda: kbd.resume_dispatch(target))
 
 
 @router.get("/model-options")
@@ -1965,6 +2111,7 @@ def list_profile_roster():
         profiles = profiles_mod.list_profiles()
     return {"profiles": [
         {"name": p.name, "is_default": bool(p.is_default), "model": p.model or "", "provider": p.provider or "",
+         "reasoning_effort": p.reasoning_effort or "",
          "description": p.description or "", "description_auto": bool(p.description_auto),
          "skill_count": int(p.skill_count or 0)}
         for p in profiles]}

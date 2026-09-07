@@ -1380,6 +1380,19 @@ class _CodexCompletionsAdapter:
         # headers via the SDK kwarg — forward them.
         if isinstance(kwargs.get("extra_headers"), dict) and kwargs["extra_headers"]:
             resp_kwargs["extra_headers"] = dict(kwargs["extra_headers"])
+        response_format = kwargs.get("response_format")
+        if isinstance(response_format, dict) and response_format.get("type") == "json_schema":
+            json_schema = response_format.get("json_schema")
+            if not isinstance(json_schema, dict):
+                raise ValueError("Codex structured output requires a JSON schema object")
+            name = json_schema.get("name")
+            schema = json_schema.get("schema")
+            if not isinstance(name, str) or not name or not isinstance(schema, dict):
+                raise ValueError("Codex structured output requires named JSON schema")
+            resp_kwargs["text"] = {"format": {
+                "type": "json_schema", "name": name, "schema": schema,
+                "strict": json_schema.get("strict") is True,
+            }}
         # The Codex endpoint rejects max_output_tokens/temperature (400) — omit.
         extra_body = kwargs.get("extra_body") or {}
         if isinstance(extra_body, dict):

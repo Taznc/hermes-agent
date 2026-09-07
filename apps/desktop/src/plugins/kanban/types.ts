@@ -297,12 +297,52 @@ export interface OrchestrationSettings {
   resolved_default_assignee: string
 }
 
+/** GET /dispatch/status — the pause circuit plus the drain signal. */
+export interface DispatchStatus {
+  paused: boolean
+  /** Raw circuit record: `reason` is `operator_paused` for a maintenance
+   *  drain, or a fault code for a systemic circuit. Null when running. */
+  state: null | {
+    reason: string
+    paused_at?: number
+    paused_by?: string
+    note?: null | string
+    [key: string]: unknown
+  }
+  /** Workers still running on this board — 0 means safe to restart. */
+  running_count: number
+  /** Server-rendered human status; null when the board is not paused. */
+  message: null | string
+}
+
+/** POST /dispatch/pause. `paused: false` is a REFUSAL (a dispatch tick owns
+ *  the board lock), delivered as a normal 200 — never treat it as success. */
+export interface DispatchPauseResult {
+  paused: boolean
+  state: DispatchStatus['state']
+  reason?: string
+}
+
+/** POST /dispatch/resume. */
+export interface DispatchResumeResult {
+  resumed: boolean
+  was_paused: boolean
+  previous?: DispatchStatus['state']
+  reason?: string
+}
+
 /** GET /profiles — the roster the decomposer routes across. */
 export interface KanbanProfile {
   name: string
   is_default: boolean
   description: string
   description_auto: boolean
+  /** The profile's own configured model/provider/depth — what a worker
+   *  actually runs when the task carries no override. Empty = unset
+   *  (provider defaults) or an older backend that doesn't report them. */
+  model?: string
+  provider?: string
+  reasoning_effort?: string
 }
 
 /** Column presentation — codicon + tone only. Labels + help live in i18n

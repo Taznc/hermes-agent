@@ -623,7 +623,7 @@ def release_stranded_coedit_edges(conn: sqlite3.Connection) -> list:
         "JOIN tasks child ON child.id = e.task_id "
         "WHERE e.kind = 'serialized_coedit' "
         f"AND holder.status IN ({placeholders}) "
-        "AND child.status NOT IN ('done', 'archived') "
+        "AND child.status NOT IN ('done', 'archived', 'idea', 'roadmap') "
         "ORDER BY e.task_id, l.parent_id",
         _STALLED_HOLDER_STATUSES,
     ).fetchall()

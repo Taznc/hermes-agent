@@ -656,6 +656,8 @@ DEFAULT_CONFIG = {
             "trace": "disabled",         # "enabled" | "disabled" | "enabled_full"
         },
     },
+    # >>> FORK ANCHOR: model-recommendation-preset <<<
+    "model_recommendation": {"preset": "balanced"},
     # Auxiliary model config — provider/model per side task. provider "auto" = auto-detect;
     # empty model = provider's default aux model; all tasks fall back to
     # openrouter:google/gemini-3-flash-preview when the configured provider is unavailable.
@@ -724,6 +726,9 @@ DEFAULT_CONFIG = {
         "triage_specifier": _aux(120),
         "kanban_decomposer": _aux(180),
         "profile_describer": _aux(60),   # 1-2 sentence profile blurb; short, cheap
+        # Desktop advisory-only router. Inert until provider and model are explicitly configured;
+        # it is intentionally absent from the model-assignment slot inventory.
+        "model_recommendation": _aux(30),
         "goal_judge": _aux(60),          # /goal satisfaction + contract drafting; JSON calls
         # Curator skill-usage review can take minutes on reasoning models (umbrellas over hundreds
         # of skills); route cheaper via `hermes model` → auxiliary → Curator.
@@ -1719,6 +1724,30 @@ DEFAULT_CONFIG = {
         # it follows the bounded interruption policy (max_infra_interruptions) instead.
         # Default 24h. Parse only positive base-10 integer retry-after values.
         "provider_backoff_max_seconds": 86400,
+        # Optional host-wide account/budget quota circuits. Configure this only
+        # in the shared/default Hermes home's config.yaml; dispatchers and
+        # profile-scoped workers read that one authoritative host policy.
+        # Empty by default:
+        # provider names are not account identities, and credential selection
+        # happens inside the worker. Operators explicitly map opaque, non-secret
+        # group labels to provider/profile routes, for example:
+        # quota_budget_groups:
+        #   primary-wallet:
+        #     providers: [openai-codex]
+        #     profiles: [implementer, reviewer]
+        # A route matches both lists; `*` is accepted only when written. A task
+        # with provider `auto` is a candidate for every group mapped to its
+        # profile: the dispatcher predicts the provider the worker's own
+        # resolution ladder will choose for the explicit `provider=auto`
+        # request it is spawned with, and starts it only when that provider
+        # maps to an unpaused group. Unpredictable or unmapped resolution fails
+        # closed while any candidate group is paused.
+        "quota_budget_groups": {},
+        # At a circuit deadline, admit one recovery probe host-wide, then admit
+        # at most one further matching start per this many seconds until no
+        # start has been admitted for four such windows. A renewed quota event
+        # re-arms the circuit.
+        "quota_resume_spread_seconds": 30,
         # Max consecutive infra interruptions (external SIGTERM/SIGKILL, startup-window
         # dead pid, quota signature including malformed/missing retry-after) before the
         # task is routed through normal counted failure accounting. Default 3; minimum

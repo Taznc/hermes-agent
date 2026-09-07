@@ -297,6 +297,41 @@ describe('sendTestNativeNotification', () => {
     sendTestNativeNotification('Hermes', 'works')
     expect(notify).toHaveBeenCalledTimes(1)
   })
+
+  it('reports { ok: true } when the bridge accepts the notification', async () => {
+    notify.mockResolvedValueOnce(true)
+    const result = await sendTestNativeNotification('Hermes', 'works')
+    expect(result).toEqual({ ok: true })
+  })
+
+  it('reports reason "unsupported" when the bridge has no notify method at all', async () => {
+    desktopWindow.hermesDesktop = {} as unknown as Window['hermesDesktop']
+    const result = await sendTestNativeNotification('Hermes', 'works')
+    expect(result).toEqual({ ok: false, reason: 'unsupported' })
+  })
+
+  it('reports reason "denied" when notify() fails and permission is denied (web build)', async () => {
+    notify.mockResolvedValueOnce(false)
+    const getNotificationPermission = vi.fn().mockResolvedValue('denied')
+    desktopWindow.hermesDesktop = { getNotificationPermission, notify } as unknown as Window['hermesDesktop']
+    const result = await sendTestNativeNotification('Hermes', 'works')
+    expect(result).toEqual({ ok: false, reason: 'denied' })
+  })
+
+  it('reports reason "unsupported" when notify() fails and permission is not denied', async () => {
+    notify.mockResolvedValueOnce(false)
+    const getNotificationPermission = vi.fn().mockResolvedValue('unsupported')
+    desktopWindow.hermesDesktop = { getNotificationPermission, notify } as unknown as Window['hermesDesktop']
+    const result = await sendTestNativeNotification('Hermes', 'works')
+    expect(result).toEqual({ ok: false, reason: 'unsupported' })
+  })
+
+  it('reports reason "unsupported" when notify() fails and the bridge has no permission query (Electron)', async () => {
+    notify.mockResolvedValueOnce(false)
+    desktopWindow.hermesDesktop = { notify } as unknown as Window['hermesDesktop']
+    const result = await sendTestNativeNotification('Hermes', 'works')
+    expect(result).toEqual({ ok: false, reason: 'unsupported' })
+  })
 })
 
 describe('$activeSessionId wiring', () => {
