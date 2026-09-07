@@ -3710,7 +3710,13 @@ export const zhAuthored: Translations = withForkKeys(forkZh, {
       questionProgress: (answered, total) => `已回答 ${answered}/${total}`,
       lateAnswer: (question, choice) => `关于"${question}" — 我的回答: ${choice}`,
       lateAnswerTip: '将此回答起草为后续消息',
-      lateAnswerHint: '此问题已不再等待回答。选择一个选项会将其起草为后续消息。'
+      lateAnswerHint: '此问题已不再等待回答。选择一个选项会将其起草为后续消息。',
+      addNote: '添加备注',
+      addNoteFor: label => `为${label}添加备注`,
+      note: '备注',
+      noteFor: label => `${label}的备注`,
+      notePlaceholder: '添加可选备注…',
+      selected: '已选择'
     },
     mcpSetup: {
       installTitle: server => `添加 ${server} MCP 服务器？`,

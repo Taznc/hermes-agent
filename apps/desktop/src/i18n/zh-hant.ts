@@ -3009,7 +3009,13 @@ export const zhHant = defineForkLocale(forkZhHant, {
       questionProgress: (answered, total) => `已回答 ${answered}/${total}`,
       lateAnswer: (question, choice) => `關於「${question}」 — 我的回答: ${choice}`,
       lateAnswerTip: '將此回答起草為後續訊息',
-      lateAnswerHint: '此問題已不再等待回答。選擇一個選項會將其起草為後續訊息。'
+      lateAnswerHint: '此問題已不再等待回答。選擇一個選項會將其起草為後續訊息。',
+      addNote: '新增註記',
+      addNoteFor: label => `為${label}新增註記`,
+      note: '註記',
+      noteFor: label => `${label}的註記`,
+      notePlaceholder: '新增選用註記…',
+      selected: '已選擇'
     },
     tool: {
       copyCode: '複製程式碼',

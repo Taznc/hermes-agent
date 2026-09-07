@@ -59,6 +59,7 @@ interface ClarifyArgs {
 interface ClarifyResult {
   question?: string
   answer?: string
+  note?: string
   error?: string
 }
 
@@ -146,6 +147,7 @@ interface ClarifyBatchResponse {
   id?: string
   question?: string
   answer?: string | string[]
+  note?: string
 }
 
 /** Parse batch clarify tool JSON (`responses` array + optional timed_out). */
@@ -166,6 +168,7 @@ export function readClarifyBatchResult(result: unknown): {
     return {
       answer: Array.isArray(answer) ? answer.map(String) : typeof answer === 'string' ? answer : undefined,
       id: stringField(item, 'id'),
+      note: stringField(item, 'note'),
       question: stringField(item, 'question')
     }
   })
@@ -184,6 +187,7 @@ export function readClarifyResult(result: unknown): ClarifyResult {
   return {
     question: stringField(row, 'question'),
     answer: stringField(row, 'user_response', 'answer'),
+    note: stringField(row, 'note'),
     error: stringField(row, 'error')
   }
 }
@@ -210,7 +214,8 @@ const OPTION_ROW_CLASS =
   'flex w-full items-start gap-2 rounded-[0.25rem] px-1.5 py-1 text-left disabled:cursor-not-allowed disabled:opacity-50'
 
 // field-sizing on top of Textarea's shared chrome; kill min-h-16 for one-liners.
-const CLARIFY_TEXTAREA_CLASS = 'field-sizing-content max-h-40 min-h-0 resize-none'
+const CLARIFY_TEXTAREA_CLASS =
+  'field-sizing-content max-h-40 min-h-0 resize-none placeholder:text-(--ui-text-secondary)'
 
 const CLARIFY_SHELL_CLASS = `${WIDGET_SHELL_CLASS} text-[length:var(--conversation-text-font-size)] text-(--ui-text-primary)`
 
@@ -336,7 +341,7 @@ function ClarifyHelpControls({
   )
 
   return (
-    <div className="grid gap-1" data-clarify-help-target={target}>
+    <div className="grid min-w-0 gap-1" data-clarify-help-target={target}>
       <div className="flex items-center gap-1">
         <Button
           aria-label={`Why? ${targetLabel}`}
@@ -360,7 +365,7 @@ function ClarifyHelpControls({
         </Button>
       </div>
       {askOpen || help.length > 0 || error ? (
-        <div className="grid gap-1 rounded-md bg-(--chrome-action-hover)/40 p-2 text-sm" id={`clarify-help-${target}`}>
+        <div className="grid gap-1 border-l border-(--ui-stroke-tertiary) pl-2 text-sm" id={`clarify-help-${target}`}>
           {help.map(item =>
             item.status === 'loading' ? (
               <span key={item.explanationId} role="status">
@@ -376,28 +381,80 @@ function ClarifyHelpControls({
           )}
           {error ? <p className="text-destructive">{error}</p> : null}
           {askOpen ? (
-            <div className="flex gap-1">
+            <div className="grid gap-1" data-clarify-follow-up={target}>
               <Textarea
                 aria-label={`Follow-up for ${target}`}
-                className="min-h-0"
+                className="min-h-0 placeholder:text-(--ui-text-secondary)"
                 onChange={event => setFollowUp(event.target.value)}
                 placeholder="Ask a follow-up…"
                 rows={1}
                 size="sm"
                 value={followUp}
               />
-              <Button
-                disabled={!followUp.trim()}
-                onClick={() => void requestHelp(followUp.trim())}
-                size="xs"
-                type="button"
-              >
-                Send
-              </Button>
+              <div className="flex justify-end">
+                <Button
+                  disabled={!followUp.trim()}
+                  onClick={() => void requestHelp(followUp.trim())}
+                  size="xs"
+                  type="button"
+                >
+                  Send
+                </Button>
+              </div>
             </div>
           ) : null}
         </div>
       ) : null}
+    </div>
+  )
+}
+
+function ClarifyNoteControl({
+  disabled,
+  label,
+  note,
+  onChange,
+  onKeyDown,
+  onOpen,
+  open
+}: {
+  disabled: boolean
+  label: string
+  note: string
+  onChange: (value: string) => void
+  onKeyDown: (event: KeyboardEvent<HTMLTextAreaElement>) => void
+  onOpen: () => void
+  open: boolean
+}) {
+  const { t } = useI18n()
+  const copy = t.assistant.clarify
+
+  return (
+    <div className="ml-7 grid gap-1 border-l border-(--ui-stroke-tertiary) pl-2" data-clarify-note={label}>
+      {open ? (
+        <Textarea
+          aria-label={copy.noteFor(label)}
+          className={CLARIFY_TEXTAREA_CLASS}
+          disabled={disabled}
+          onChange={event => onChange(event.target.value)}
+          onKeyDown={onKeyDown}
+          placeholder={copy.notePlaceholder}
+          rows={1}
+          size="sm"
+          value={note}
+        />
+      ) : (
+        <Button
+          aria-label={copy.addNoteFor(label)}
+          disabled={disabled}
+          onClick={onOpen}
+          size="xs"
+          type="button"
+          variant="text"
+        >
+          {copy.addNote}
+        </Button>
+      )}
     </div>
   )
 }
@@ -529,6 +586,7 @@ function ClarifyToolSingleSettled({
 
   const question = fromResult.question || fromArgs.question || ''
   const answer = fromResult.answer
+  const note = fromResult.note
   const error = fromResult.error
   const skipped = !error && answer !== undefined && !answer.trim()
   const answerText = error || (skipped ? copy.skipped : (answer ?? '').trim())
@@ -558,16 +616,29 @@ function ClarifyToolSingleSettled({
       ) : null}
       {answerText ? (
         <ClarifyLine icon={CircleLetterA}>
-          <p
-            className={cn(
-              'whitespace-pre-wrap leading-(--conversation-line-height)',
-              error ? 'text-destructive' : 'text-(--ui-text-secondary)',
-              skipped && 'italic text-(--ui-text-tertiary)'
-            )}
-            data-clarify-answer=""
-          >
-            {answerText}
-          </p>
+          <div className="grid gap-0.5">
+            <span className="text-[0.6875rem] font-medium text-(--ui-text-tertiary)">{copy.selected}</span>
+            <p
+              className={cn(
+                'whitespace-pre-wrap leading-(--conversation-line-height)',
+                error ? 'text-destructive' : 'text-(--ui-text-secondary)',
+                skipped && 'italic text-(--ui-text-tertiary)'
+              )}
+              data-clarify-answer=""
+            >
+              {answerText}
+            </p>
+          </div>
+        </ClarifyLine>
+      ) : null}
+      {note?.trim() ? (
+        <ClarifyLine icon={CircleLetterA}>
+          <div className="grid gap-0.5">
+            <span className="text-[0.6875rem] font-medium text-(--ui-text-tertiary)">{copy.note}</span>
+            <p className="whitespace-pre-wrap leading-(--conversation-line-height) text-(--ui-text-secondary)">
+              {note}
+            </p>
+          </div>
         </ClarifyLine>
       ) : null}
       {skipped && choices.length > 0 ? (
@@ -659,7 +730,11 @@ function ClarifyToolSinglePending({
   const multiSelect = hasChoices && Boolean(matchingRequest?.multiSelect ?? fromArgs.multiSelect)
 
   const [draft, setDraft] = useState('')
+  const [note, setNote] = useState('')
+  const [noteAnchor, setNoteAnchor] = useState<string | null>(null)
+  const [noteOpen, setNoteOpen] = useState(false)
   const [submitting, setSubmitting] = useState(false)
+  const submittingRef = useRef(false)
   const [selectedChoices, setSelectedChoices] = useState<string[]>([])
   // The keyboard cursor. Indices 0..choices.length-1 are the options; the
   // trailing index (=== choices.length) is the "Other" free-text row.
@@ -679,7 +754,11 @@ function ClarifyToolSinglePending({
   const loading = !ready && !submitting && !question
 
   const respond = useCallback(
-    async (answer: string) => {
+    async (answer: string, responseNote?: string) => {
+      if (submittingRef.current) {
+        return
+      }
+
       if (!ready || !matchingRequest) {
         notifyError(new Error(copy.notReady), copy.sendFailed)
 
@@ -692,6 +771,7 @@ function ClarifyToolSinglePending({
         return
       }
 
+      submittingRef.current = true
       setSubmitting(true)
 
       try {
@@ -707,8 +787,9 @@ function ClarifyToolSinglePending({
           gateway.request.bind(gateway) as typeof gateway.request,
           'clarify.respond',
           {
-            request_id: matchingRequest.requestId,
-            answer
+            answer,
+            ...(responseNote?.trim() ? { note: responseNote.trim() } : {}),
+            request_id: matchingRequest.requestId
           }
         )
         triggerHaptic('submit')
@@ -717,6 +798,7 @@ function ClarifyToolSinglePending({
         // tool.complete lands next → ClarifyToolSettled.
       } catch (error) {
         notifyError(error, copy.sendFailed)
+        submittingRef.current = false
         setSubmitting(false)
       }
     },
@@ -741,15 +823,31 @@ function ClarifyToolSinglePending({
       // Picking a choice and typing are mutually exclusive answers.
       setDraft('')
       setSelectedChoices(selected => {
+        let next: string[]
+
         if (!multiSelect) {
-          return [choice]
+          next = [choice]
+        } else {
+          next = selected.includes(choice) ? selected.filter(value => value !== choice) : [...selected, choice]
         }
 
-        return selected.includes(choice) ? selected.filter(value => value !== choice) : [...selected, choice]
+        setNoteAnchor(anchor => {
+          if (next.length === 0) {
+            return null
+          }
+
+          if (anchor && next.includes(anchor)) {
+            return anchor
+          }
+
+          return noteOpen ? next[0] : null
+        })
+
+        return next
       })
       setActiveIndex(index)
     },
-    [multiSelect]
+    [multiSelect, noteOpen]
   )
 
   // Keep the cursor in range when the choice set changes (never past "Other").
@@ -777,9 +875,9 @@ function ClarifyToolSinglePending({
 
   const submitAnswer = useCallback(() => {
     if (pendingAnswer) {
-      void respond(pendingAnswer)
+      void respond(pendingAnswer, note)
     }
-  }, [pendingAnswer, respond])
+  }, [note, pendingAnswer, respond])
 
   const activateActive = useCallback(() => {
     const choice = choices[activeIndex]
@@ -937,6 +1035,7 @@ function ClarifyToolSinglePending({
     // both look selected.
     if (value.trim()) {
       setSelectedChoices([])
+      setNoteAnchor(null)
     }
   }
 
@@ -967,25 +1066,43 @@ function ClarifyToolSinglePending({
 
         {hasChoices ? (
           <div className="grid gap-px" role="group">
-            {choices.map((choice, index) => (
-              <div className="grid grid-cols-[minmax(0,1fr)_auto] items-start" key={`${index}-${choice}`}>
-                <ChoiceButton
-                  active={activeIndex === index}
-                  char={letterFor(index)}
-                  choice={choice}
-                  disabled={submitting || !ready}
-                  keyShortcuts={`${letterFor(index)} ${index + 1}`}
-                  onClick={() => selectChoice(choice, index)}
-                  selected={selectedChoices.includes(choice)}
-                />
-                <ClarifyHelpControls
-                  choice={bareChoice(choice)}
-                  request={matchingRequest}
-                  target={`choice-${index}`}
-                  targetLabel={bareChoice(choice)}
-                />
-              </div>
-            ))}
+            {choices.map((choice, index) => {
+              const selected = selectedChoices.includes(choice)
+
+              return (
+                <div className="grid gap-1" key={`${index}-${choice}`}>
+                  <ChoiceButton
+                    active={activeIndex === index}
+                    char={letterFor(index)}
+                    choice={choice}
+                    disabled={submitting || !ready}
+                    keyShortcuts={`${letterFor(index)} ${index + 1}`}
+                    onClick={() => selectChoice(choice, index)}
+                    selected={selected}
+                  />
+                  <ClarifyHelpControls
+                    choice={bareChoice(choice)}
+                    request={matchingRequest}
+                    target={`choice-${index}`}
+                    targetLabel={bareChoice(choice)}
+                  />
+                  {selected && (!noteOpen || noteAnchor === choice) ? (
+                    <ClarifyNoteControl
+                      disabled={submitting || !ready}
+                      label={bareChoice(choice)}
+                      note={note}
+                      onChange={setNote}
+                      onKeyDown={handleTextareaKey}
+                      onOpen={() => {
+                        setNoteAnchor(choice)
+                        setNoteOpen(true)
+                      }}
+                      open={noteOpen && noteAnchor === choice}
+                    />
+                  ) : null}
+                </div>
+              )
+            })}
             <label
               className={cn(
                 OPTION_ROW_CLASS,
@@ -1019,6 +1136,20 @@ function ClarifyToolSinglePending({
                 value={draft}
               />
             </label>
+            {trimmedDraft ? (
+              <ClarifyNoteControl
+                disabled={submitting || !ready}
+                label={copy.other}
+                note={note}
+                onChange={setNote}
+                onKeyDown={handleTextareaKey}
+                onOpen={() => {
+                  setNoteAnchor(null)
+                  setNoteOpen(true)
+                }}
+                open={noteOpen}
+              />
+            ) : null}
           </div>
         ) : (
           <Textarea
@@ -1064,7 +1195,7 @@ function ClarifyToolBatchSettled({
   responses
 }: {
   help: Record<string, ClarifyHelp>
-  responses: { question?: string; answer?: string | string[] }[]
+  responses: { question?: string; answer?: string | string[]; note?: string }[]
 }) {
   const { t } = useI18n()
   const copy = t.assistant.clarify
@@ -1085,16 +1216,29 @@ function ClarifyToolBatchSettled({
               </ClarifyLine>
             ) : null}
             <ClarifyLine icon={CircleLetterA}>
-              <p
-                className={cn(
-                  'whitespace-pre-wrap leading-(--conversation-line-height)',
-                  blank ? 'italic text-(--ui-text-tertiary)' : 'text-(--ui-text-secondary)'
-                )}
-                data-clarify-answer=""
-              >
-                {blank ? copy.skipped : answer}
-              </p>
+              <div className="grid gap-0.5">
+                <span className="text-[0.6875rem] font-medium text-(--ui-text-tertiary)">{copy.selected}</span>
+                <p
+                  className={cn(
+                    'whitespace-pre-wrap leading-(--conversation-line-height)',
+                    blank ? 'italic text-(--ui-text-tertiary)' : 'text-(--ui-text-secondary)'
+                  )}
+                  data-clarify-answer=""
+                >
+                  {blank ? copy.skipped : answer}
+                </p>
+              </div>
             </ClarifyLine>
+            {row.note?.trim() ? (
+              <ClarifyLine icon={CircleLetterA}>
+                <div className="grid gap-0.5">
+                  <span className="text-[0.6875rem] font-medium text-(--ui-text-tertiary)">{copy.note}</span>
+                  <p className="whitespace-pre-wrap leading-(--conversation-line-height) text-(--ui-text-secondary)">
+                    {row.note}
+                  </p>
+                </div>
+              </ClarifyLine>
+            ) : null}
           </div>
         )
       })}
@@ -1115,6 +1259,9 @@ function BatchQuestionBlock({
   index,
   locked,
   onDraft,
+  onFieldKeyDown,
+  onNote,
+  onNoteOpen,
   onToggle,
   question,
   request,
@@ -1125,10 +1272,13 @@ function BatchQuestionBlock({
   index: number
   locked: boolean
   onDraft: (value: string) => void
+  onNote: (value: string) => void
+  onNoteOpen: (choice: string | null) => void
   onToggle: (choice: string) => void
+  onFieldKeyDown: (event: KeyboardEvent<HTMLTextAreaElement>) => void
   question: ClarifyQuestion
   request: ClarifyRequest | null
-  staged: { choices: string[]; draft: string }
+  staged: { choices: string[]; draft: string; note: string; noteAnchor: string | null; noteOpen: boolean }
   total: number
 }) {
   const { t } = useI18n()
@@ -1182,42 +1332,70 @@ function BatchQuestionBlock({
 
       {choices.length > 0 ? (
         <div className="grid gap-px pl-[1.625rem]" role="group">
-          {choices.map((choice, choiceIndex) => (
-            <div className="grid grid-cols-[minmax(0,1fr)_auto] items-start" key={`${choiceIndex}-${choice}`}>
-              <ChoiceButton
-                char={letterFor(choiceIndex)}
-                choice={choice}
-                disabled={disabled}
-                onClick={() => onToggle(choice)}
-                selected={staged.choices.includes(choice)}
-              />
-              <ClarifyHelpControls
-                choice={bareChoice(choice)}
-                questionId={question.qid}
-                request={request}
-                target={`choice-${question.qid}-${choiceIndex}`}
-                targetLabel={bareChoice(choice)}
-              />
-            </div>
-          ))}
+          {choices.map((choice, choiceIndex) => {
+            const selected = staged.choices.includes(choice)
+
+            return (
+              <div className="grid gap-1" key={`${choiceIndex}-${choice}`}>
+                <ChoiceButton
+                  char={letterFor(choiceIndex)}
+                  choice={choice}
+                  disabled={disabled}
+                  onClick={() => onToggle(choice)}
+                  selected={selected}
+                />
+                <ClarifyHelpControls
+                  choice={bareChoice(choice)}
+                  questionId={question.qid}
+                  request={request}
+                  target={`choice-${question.qid}-${choiceIndex}`}
+                  targetLabel={bareChoice(choice)}
+                />
+                {selected && (!staged.noteOpen || staged.noteAnchor === choice) ? (
+                  <ClarifyNoteControl
+                    disabled={disabled}
+                    label={bareChoice(choice)}
+                    note={staged.note}
+                    onChange={onNote}
+                    onKeyDown={onFieldKeyDown}
+                    onOpen={() => onNoteOpen(choice)}
+                    open={staged.noteOpen && staged.noteAnchor === choice}
+                  />
+                ) : null}
+              </div>
+            )
+          })}
           <label className={cn(OPTION_ROW_CLASS, 'items-center')}>
             <KeyBadge char={letterFor(choices.length)} selected={Boolean(staged.draft.trim())} />
             <Textarea
               className={CLARIFY_TEXTAREA_CLASS}
               disabled={disabled}
               onChange={event => onDraft(event.target.value)}
+              onKeyDown={onFieldKeyDown}
               placeholder={copy.other}
               rows={1}
               size="sm"
               value={staged.draft}
             />
           </label>
+          {staged.draft.trim() ? (
+            <ClarifyNoteControl
+              disabled={disabled}
+              label={copy.other}
+              note={staged.note}
+              onChange={onNote}
+              onKeyDown={onFieldKeyDown}
+              onOpen={() => onNoteOpen(null)}
+              open={staged.noteOpen}
+            />
+          ) : null}
         </div>
       ) : (
         <Textarea
           className={CLARIFY_TEXTAREA_CLASS}
           disabled={disabled}
           onChange={event => onDraft(event.target.value)}
+          onKeyDown={onFieldKeyDown}
           placeholder={copy.placeholder}
           rows={1}
           size="sm"
@@ -1228,7 +1406,7 @@ function BatchQuestionBlock({
   )
 }
 
-const emptyStage = { choices: [] as string[], draft: '' }
+const emptyStage = { choices: [] as string[], draft: '', note: '', noteAnchor: null as string | null, noteOpen: false }
 
 /** Live batch card: all questions at once, staged locally, ONE confirm.
  * Picks and drafts stay in component state — nothing reaches the server
@@ -1244,17 +1422,23 @@ function ClarifyToolBatchPending({ onAnswered, request }: { onAnswered: () => vo
 
   // qids only exist on the gateway request — args are a hydration-race
   // fallback for display, never answerable (no ids to respond with).
-  const questions = request?.questions ?? []
+  const questions = useMemo(() => request?.questions ?? [], [request?.questions])
   const ready = Boolean(request?.requestId) && questions.length > 0
 
-  const [staged, setStaged] = useState<Record<string, { choices: string[]; draft: string }>>({})
+  const [staged, setStaged] = useState<
+    Record<string, { choices: string[]; draft: string; note: string; noteAnchor: string | null; noteOpen: boolean }>
+  >({})
+
   const [submitting, setSubmitting] = useState(false)
+  const submittingRef = useRef(false)
+  const formRef = useRef<HTMLFormElement | null>(null)
 
   // Reconnect replay: answers the server already locked (an earlier window's
   // partial progress) pre-stage their questions so the restored card shows
   // them selected instead of blank.
   useEffect(() => {
     const lockedAnswers = request?.lockedAnswers
+    const lockedNotes = request?.lockedNotes
 
     if (!lockedAnswers) {
       return
@@ -1286,16 +1470,25 @@ function ClarifyToolBatchPending({ onAnswered, request }: { onAnswered: () => vo
         }
 
         const matchedChoices = options.filter(choice => replayedAnswers.includes(bareChoice(choice)))
+        const note = lockedNotes?.[question.qid] ?? ''
         next[question.qid] =
-          matchedChoices.length > 0 ? { choices: matchedChoices, draft: '' } : { choices: [], draft: answer }
+          matchedChoices.length > 0
+            ? {
+                ...emptyStage,
+                choices: matchedChoices,
+                note,
+                noteAnchor: note ? matchedChoices[0] : null,
+                noteOpen: Boolean(note)
+              }
+            : { ...emptyStage, draft: answer, note, noteOpen: Boolean(note) }
       }
 
       return next
     })
-    // eslint-disable-next-line react-hooks/exhaustive-deps -- keyed by the replay map only
-  }, [request?.lockedAnswers])
+    // eslint-disable-next-line react-hooks/exhaustive-deps -- keyed by the replay maps only
+  }, [request?.lockedAnswers, request?.lockedNotes])
 
-  const stageFor = (qid: string) => staged[qid] ?? emptyStage
+  const stageFor = useCallback((qid: string) => staged[qid] ?? emptyStage, [staged])
 
   const stagedAnswer = useCallback(
     (question: ClarifyQuestion): string | null => {
@@ -1316,12 +1509,17 @@ function ClarifyToolBatchPending({ onAnswered, request }: { onAnswered: () => vo
   const allStaged = answeredCount === questions.length
 
   const confirmAll = useCallback(async () => {
+    if (submittingRef.current) {
+      return
+    }
+
     if (!request || !gateway) {
       notifyError(new Error(request ? copy.gatewayDisconnected : copy.notReady), copy.sendFailed)
 
       return
     }
 
+    submittingRef.current = true
     setSubmitting(true)
 
     try {
@@ -1335,6 +1533,7 @@ function ClarifyToolBatchPending({ onAnswered, request }: { onAnswered: () => vo
       // held this batch, which would leave the owner blocked.
       for (const question of questions) {
         const answer = stagedAnswer(question)
+        const note = stageFor(question.qid).note.trim()
 
         await requestForOwnedSession<{ ok?: boolean }>(
           request.sessionId,
@@ -1342,6 +1541,7 @@ function ClarifyToolBatchPending({ onAnswered, request }: { onAnswered: () => vo
           'clarify.respond',
           {
             answer: answer ?? '',
+            ...(note ? { note } : {}),
             question_id: question.qid,
             request_id: request.requestId
           }
@@ -1354,9 +1554,10 @@ function ClarifyToolBatchPending({ onAnswered, request }: { onAnswered: () => vo
       clearClarifyRequest(request.requestId, request.sessionId)
     } catch (error) {
       notifyError(error, copy.sendFailed)
+      submittingRef.current = false
       setSubmitting(false)
     }
-  }, [copy, gateway, onAnswered, questions, request, stagedAnswer])
+  }, [copy, gateway, onAnswered, questions, request, stageFor, stagedAnswer])
 
   const toggleChoice = useCallback((question: ClarifyQuestion, choice: string) => {
     setStaged(current => {
@@ -1368,13 +1569,74 @@ function ClarifyToolBatchPending({ onAnswered, request }: { onAnswered: () => vo
           : [...stage.choices, choice]
         : [choice]
 
-      return { ...current, [question.qid]: { choices: next, draft: '' } }
+      return {
+        ...current,
+        [question.qid]: {
+          ...stage,
+          choices: next,
+          draft: '',
+          noteAnchor:
+            next.length === 0
+              ? null
+              : stage.noteAnchor && next.includes(stage.noteAnchor)
+                ? stage.noteAnchor
+                : stage.noteOpen
+                  ? next[0]
+                  : null
+        }
+      }
     })
   }, [])
 
   const draftFor = useCallback((question: ClarifyQuestion, value: string) => {
-    setStaged(current => ({ ...current, [question.qid]: { choices: [], draft: value } }))
+    setStaged(current => {
+      const stage = current[question.qid] ?? emptyStage
+
+      return { ...current, [question.qid]: { ...stage, choices: [], draft: value, noteAnchor: null } }
+    })
   }, [])
+
+  const noteFor = useCallback((question: ClarifyQuestion, value: string) => {
+    setStaged(current => {
+      const stage = current[question.qid] ?? emptyStage
+
+      return { ...current, [question.qid]: { ...stage, note: value } }
+    })
+  }, [])
+
+  const openNoteFor = useCallback((question: ClarifyQuestion, choice: string | null) => {
+    setStaged(current => {
+      const stage = current[question.qid] ?? emptyStage
+
+      return { ...current, [question.qid]: { ...stage, noteAnchor: choice, noteOpen: true } }
+    })
+  }, [])
+
+  const handleBatchFieldKey = useCallback(
+    (question: ClarifyQuestion, event: KeyboardEvent<HTMLTextAreaElement>) => {
+      if (event.nativeEvent.isComposing || event.key !== 'Enter' || event.shiftKey) {
+        return
+      }
+
+      event.preventDefault()
+
+      if (!stagedAnswer(question)) {
+        return
+      }
+
+      const currentIndex = questions.findIndex(item => item.qid === question.qid)
+      const next = questions.slice(currentIndex + 1).find(item => stagedAnswer(item) === null)
+
+      if (next) {
+        const block = formRef.current?.querySelector(`[data-clarify-batch-question="${next.qid}"]`)
+
+        ;(block?.querySelector<HTMLElement>('[data-choice], textarea') ?? null)?.focus()
+      } else if (allStaged) {
+        void confirmAll()
+      }
+    },
+    [allStaged, confirmAll, questions, stagedAnswer]
+  )
 
   const cancelAll = useCallback(async () => {
     if (!request) {
@@ -1420,7 +1682,7 @@ function ClarifyToolBatchPending({ onAnswered, request }: { onAnswered: () => vo
   }
 
   return (
-    <form className="my-1.5 grid gap-4" data-clarify-batch={questions.length} onSubmit={handleSubmit}>
+    <form className="my-1.5 grid gap-4" data-clarify-batch={questions.length} onSubmit={handleSubmit} ref={formRef}>
       <ClarifyShell className="grid gap-1.5">
         <div className="flex items-center gap-2 px-3">
           <MessageQuestion aria-hidden className="size-4 shrink-0 text-(--ui-text-tertiary)" />
@@ -1448,6 +1710,9 @@ function ClarifyToolBatchPending({ onAnswered, request }: { onAnswered: () => vo
             key={question.qid}
             locked={false}
             onDraft={value => draftFor(question, value)}
+            onFieldKeyDown={event => handleBatchFieldKey(question, event)}
+            onNote={value => noteFor(question, value)}
+            onNoteOpen={choice => openNoteFor(question, choice)}
             onToggle={choice => toggleChoice(question, choice)}
             question={question}
             request={request}
