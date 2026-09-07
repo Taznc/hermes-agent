@@ -558,7 +558,12 @@ export function Card({
   const k = useKanban()
   const [dragging, setDragging] = useState(false)
   const meta = columnMeta(task.status)
-  const summary = task.latest_summary || task.body
+  // For a blocked card `latest_summary` IS the worker's block reason, which
+  // may carry ```cmd / ```choices fences meant for the drawer's structured
+  // rendering — on the 2-line card preview those are noise, so strip fences
+  // and collapse whitespace to keep the preview to the prose ask.
+  const rawSummary = task.latest_summary || task.body
+  const summary = rawSummary ? rawSummary.replace(/```[a-zA-Z]*\s*[\s\S]*?```/g, ' ').replace(/\s+/g, ' ').trim() : rawSummary
   const fallback = useDefaultAssignee()
   const arc = arcState(task, fallback)
   const key = taskCardKey(task)
