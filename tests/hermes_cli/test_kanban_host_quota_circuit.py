@@ -282,6 +282,59 @@ def test_auto_route_ignores_same_provider_group_for_unrelated_profile(quota_home
     assert circuit[0]["state"] == "paused"
 
 
+def test_auto_route_matches_profile_scoped_wildcard_provider(quota_home, monkeypatch):
+    groups = {
+        "exhausted-implementer": {
+            "providers": ["openai-codex"],
+            "profiles": ["implementer"],
+        },
+        "healthy-implementer-wildcard": {
+            "providers": ["*"],
+            "profiles": ["implementer"],
+        },
+    }
+    monkeypatch.setattr(kqc, "configured_budget_groups", lambda: groups)
+    auto_task = _task("default", profile="implementer", provider="auto")
+    kqc.register_quota_circuit(
+        "exhausted-implementer", retry_after=300, board="default", task_id=auto_task,
+        reason="rate_limit", max_seconds=3600, now=1_000,
+    )
+    monkeypatch.setattr(kqc.time, "time", lambda: 1_001)
+    monkeypatch.setattr(kqc, "predict_auto_provider", lambda _profile: "anthropic")
+
+    assert _guard("default", auto_task) is None
+    circuit = kqc.list_quota_circuits(now=1_001)
+    assert len(circuit) == 1
+    assert circuit[0]["state"] == "paused"
+
+
+def test_auto_route_fails_closed_when_exact_and_wildcard_groups_overlap(quota_home, monkeypatch):
+    groups = {
+        "exhausted-implementer": {
+            "providers": ["openai-codex"],
+            "profiles": ["implementer"],
+        },
+        "healthy-implementer-exact": {
+            "providers": ["anthropic"],
+            "profiles": ["implementer"],
+        },
+        "healthy-implementer-wildcard": {
+            "providers": ["*"],
+            "profiles": ["implementer"],
+        },
+    }
+    monkeypatch.setattr(kqc, "configured_budget_groups", lambda: groups)
+    auto_task = _task("default", profile="implementer", provider="auto")
+    kqc.register_quota_circuit(
+        "exhausted-implementer", retry_after=300, board="default", task_id=auto_task,
+        reason="rate_limit", max_seconds=3600, now=1_000,
+    )
+    monkeypatch.setattr(kqc.time, "time", lambda: 1_001)
+    monkeypatch.setattr(kqc, "predict_auto_provider", lambda _profile: "anthropic")
+
+    assert _guard("default", auto_task) == "host_quota_circuit"
+
+
 def test_repeated_dispatch_ticks_never_start_auto_task_on_paused_provider(quota_home, monkeypatch):
     """End to end through ``dispatch_once``: an auto card whose profile keeps
     resolving to the exhausted provider is never spawned across many ticks,

@@ -521,7 +521,10 @@ def _auto_guard(
     if not active:
         return None, []
     provider = predict_auto_provider(profile)
-    resolved = provider_groups.get(provider or "", [])
+    resolved = sorted(
+        set(provider_groups.get(provider or "", []))
+        | set(provider_groups.get("*", []))
+    )
     if len(resolved) != 1:
         # Unresolvable, unmapped, or ambiguous: cannot prove an unpaused route.
         return "host_quota_circuit", active
@@ -559,7 +562,7 @@ def task_quota_guard(
                 group = str(raw_group).strip()
                 if group not in candidate_groups or not isinstance(selectors, Mapping):
                     continue
-                for candidate in _string_set(selectors.get("providers")) - {"*"}:
+                for candidate in _string_set(selectors.get("providers")):
                     provider_groups.setdefault(candidate, []).append(group)
             reason, deferred_by = _auto_guard(
                 host, groups, provider_groups, profile, task_id, now, consume=consume_probe,
