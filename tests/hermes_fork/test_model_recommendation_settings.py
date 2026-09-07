@@ -161,6 +161,10 @@ def test_unwritable_config_is_not_replaced_and_errors_do_not_echo_contents(profi
     (None, "save_codex"),
     ("PRIVATE-MANAGED-SECTION", "balanced"),
     ({}, "save_codex"),
+    # A managed subtree pins ``model_recommendation.preset.future``: the user's scalar preset
+    # cannot become effective, so acknowledging a write would be an ineffective write.
+    ({"preset": {"future": "pinned"}}, "balanced"),
+    ({"preset": {"future": {"deeper": "pinned"}}, "other": "sibling"}, "balanced"),
 ])
 def test_managed_preset_or_parent_rejects_write_without_changing_effective_read(
     profiles, tmp_path, monkeypatch, section, effective,
@@ -247,27 +251,53 @@ def test_literal_dotted_preset_key_rejects_write_without_reinterpreting_config(p
         "model_recommendation: &unused {preset: balanced}\nunrelated: {enabled: true}\n",
         id="unreferenced-target-anchor",
     ),
+    pytest.param(
+        "&root\nmodel_recommendation: {preset: balanced}\nunrelated: *root\n",
+        id="root-anchor-sibling-alias",
+    ),
+    pytest.param(
+        "&root\nmodel_recommendation: {preset: balanced}\nunrelated:\n  nested: *root\n",
+        id="root-anchor-nested-alias",
+    ),
+    pytest.param(
+        "&root\nmodel_recommendation: {preset: balanced}\nunrelated: [*root]\n",
+        id="root-anchor-sequence-alias",
+    ),
+    pytest.param(
+        "&root\nmodel_recommendation: {preset: balanced}\nunrelated:\n  <<: *root\n  enabled: true\n",
+        id="root-anchor-merge-alias",
+    ),
+    pytest.param(
+        "&root\nmodel_recommendation: {preset: balanced}\nunrelated: {enabled: true}\n",
+        id="unreferenced-root-anchor",
+    ),
 ])
 def test_shared_or_anchored_preset_target_rejects_save_without_mutating_config(profiles, text):
     path = profiles["alpha"] / "config.yaml"
     path.write_text("# Preserve shared settings\n" + text, encoding="utf-8")
     expected = {"value": "balanced", "profile": "alpha"}
     assert rpc("config.get", key=KEY, profile="alpha")["result"] == expected
-    unrelated = read_user_config_raw(path)["unrelated"]
+    # Aliases to the root make the loaded document self-referential, so compare
+    # the serialized effective document rather than recursing through dict equality.
+    unrelated = yaml.safe_dump(read_user_config_raw(path)["unrelated"])
     before = {p: p.read_bytes() for p in profiles["default"].rglob("*") if p.is_file()}
 
     response = rpc("config.set", key=KEY, profile="alpha", value="best_quality")
 
     # Reload effective YAML: merge references need not retain object identity
     # in PyYAML, but mutating their ruamel source still changes unrelated values.
-    assert read_user_config_raw(path)["unrelated"] == unrelated, response
+    assert yaml.safe_dump(read_user_config_raw(path)["unrelated"]) == unrelated, response
     assert response.get("error") == {"code": 5001, "message": "Could not save model recommendation preset"}, response
     assert rpc("config.get", key=KEY, profile="alpha")["result"] == expected
     assert {p: p.read_bytes() for p in profiles["default"].rglob("*") if p.is_file()} == before
 
 
-@pytest.mark.parametrize("root_merge", [False, True])
-def test_unrelated_yaml_aliases_do_not_prevent_an_independent_preset_save(profiles, root_merge):
+@pytest.mark.parametrize("target", [
+    pytest.param("model_recommendation: {preset: balanced}\n", id="plain-target"),
+    pytest.param("model_recommendation: {preset: balanced}\n<<: *shared\n", id="root-merges-unrelated-anchor"),
+    pytest.param("model_recommendation:\n  <<: *shared\n  enabled: true\n", id="target-merges-unrelated-anchor"),
+])
+def test_unrelated_yaml_aliases_do_not_prevent_an_independent_preset_save(profiles, target):
     path = profiles["alpha"] / "config.yaml"
     text = (
         "# Preserve unrelated aliases\n"
@@ -275,10 +305,7 @@ def test_unrelated_yaml_aliases_do_not_prevent_an_independent_preset_save(profil
         "sibling: *shared\n"
         "nested:\n  copy: *shared\n"
         "merged:\n  <<: *shared\n  enabled: true\n"
-        "model_recommendation: {preset: balanced}\n"
-    )
-    if root_merge:
-        text += "<<: *shared\n"
+    ) + target
     path.write_text(text, encoding="utf-8")
     original = read_user_config_raw(path)
     before = {p: p.read_bytes() for p in profiles["default"].rglob("*") if p.is_file()}
@@ -287,7 +314,8 @@ def test_unrelated_yaml_aliases_do_not_prevent_an_independent_preset_save(profil
 
     assert response.get("result") == {"key": KEY, "value": "best_quality", "profile": "alpha"}, response
     assert rpc("config.get", key=KEY, profile="alpha")["result"] == {"value": "best_quality", "profile": "alpha"}
-    assert read_user_config_raw(path) == {**original, "model_recommendation": {"preset": "best_quality"}}
+    assert read_user_config_raw(path) == {
+        **original, "model_recommendation": {**original["model_recommendation"], "preset": "best_quality"}}
     saved = path.read_text(encoding="utf-8")
     assert "# Preserve unrelated aliases" in saved
     assert "&shared" in saved and "*shared" in saved and "<<:" in saved

@@ -34,6 +34,39 @@ def _profile_type_guard(server, handler):
     return guarded
 
 
+def _managed_conflict() -> bool:
+    """True when the managed layer pins the preset, its parent, or any descendant.
+
+    Managed keys flatten to leaves, so a pinned subtree such as
+    ``model_recommendation: {preset: {future: x}}`` appears only as
+    ``model_recommendation.preset.future`` — yet it still overrides the user's
+    scalar preset on read, so acknowledging a write would be ineffective.
+    """
+    if is_managed():
+        return True
+    return any(
+        key == KEY or key == "model_recommendation" or key.startswith(KEY + ".")
+        for key in managed_scope.managed_config_keys()
+    )
+
+
+def _anchored_or_shared_target(document) -> bool:
+    """True when writing ``model_recommendation.preset`` could reach unrelated settings.
+
+    PyYAML flattens aliases and merge keys, so a target mapping reachable through
+    an anchor on itself or on any ancestor (here: the document root) is shared
+    with every alias site; an unanchored target supplied by a root merge is the
+    merge source's mapping. Anchors are rejected even when currently unreferenced:
+    the writer keeps them, so a later alias would silently start sharing.
+    """
+    if document.anchor.value is not None:
+        return True
+    target = document.get("model_recommendation")
+    if target is None:
+        return False
+    return target.anchor.value is not None or "model_recommendation" not in dict(document.non_merged_items())
+
+
 def register(server) -> None:
     def get_preset(params: dict) -> dict:
         name, home = _selected_profile(params)
@@ -61,7 +94,7 @@ def register(server) -> None:
             return server._err(rid, 4002, str(exc))
         try:
             with _CONFIG_LOCK:
-                if is_managed() or managed_scope.is_key_managed(KEY) or managed_scope.is_key_managed("model_recommendation"):
+                if _managed_conflict():
                     raise ValueError("model recommendation preset is managed")
                 path = home / "config.yaml"
                 raw = require_readable_config_before_write(path)
@@ -70,15 +103,10 @@ def register(server) -> None:
                     raise ValueError("literal model_recommendation.preset key prevents a nested preset write")
                 if "model_recommendation" in raw and not isinstance(raw["model_recommendation"], dict):
                     raise ValueError("model_recommendation must be a mapping before writing a preset")
-                # Inspect the writer's graph: PyYAML flattens merge references.
-                # Even an unanchored target inherited from a root merge is shared.
+                # Inspect the writer's own graph rather than the flattened PyYAML view.
                 _, document = _roundtrip_load(path)
                 assert document is not None  # _roundtrip_load returns a mapping even for missing files.
-                target = document.get("model_recommendation")
-                if target is not None and (
-                    target.anchor.value is not None
-                    or "model_recommendation" not in dict(document.non_merged_items())
-                ):
+                if _anchored_or_shared_target(document):
                     raise ValueError("anchored or merged model_recommendation mapping prevents an isolated preset write")
                 # Fresh raw, single-key round trip: never persist defaults,
                 # expanded secrets, managed values, or a stale whole-file cache.

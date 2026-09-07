@@ -4,8 +4,18 @@
 
 ## Request
 
+`profile` (optional) selects the profile whose router configuration and
+provider inventory serve the request. Omitted, `null` or blank means the
+gateway's launch profile, exactly as before; `"default"` (any casing) means
+the default profile. An explicitly supplied profile that is a non-string,
+fails profile-name validation, is unknown, or has been deleted is rejected
+with JSON-RPC code `4002` BEFORE any router or provider call, and never falls
+back to the launch profile: the unsent draft must not reach a router that a
+different profile configured. The rejection message contains no draft text.
+
 ```json
 {
+  "profile": "work",
   "draft": "Complete unsent composer text",
   "attachments": [{"name": "brief.pdf", "mime_type": "application/pdf", "size": 42, "kind": "file"}],
   "policy": "balanced"
@@ -109,22 +119,28 @@ Profile and failure rules:
   returns `5001` with `Could not save model recommendation preset`. There is no
   fallback write to a different profile. A successful write acknowledges only
   after persistence; a new read/reload sees it without restarting.
-- Managed-scope pins on `model_recommendation.preset` or its parent
-  `model_recommendation` section, and the existing package-managed config
-  write-lock, reject saves before mutation with the same sanitized `5001`
-  save error. Reads still use the effective gateway configuration, including
-  managed values; a rejected save never silently persists an ineffective value.
+- Managed-scope pins on `model_recommendation.preset`, its parent
+  `model_recommendation` section, or ANY descendant key beneath the preset
+  (a pinned subtree such as `model_recommendation: {preset: {future: x}}`),
+  and the existing package-managed config write-lock, reject saves before
+  mutation with the same sanitized `5001` save error. Reads still use the
+  effective gateway configuration, including managed values; a rejected save
+  never silently persists an ineffective value.
 - An existing literal top-level YAML key `model_recommendation.preset` also
   rejects saves before mutation with that `5001` save error, whether or not the
   nested `model_recommendation: {preset: ...}` setting exists. The literal key
   is not reinterpreted, migrated, deleted or overwritten.
-- An anchored `model_recommendation` mapping, or one supplied by a root YAML
-  `<<` merge, rejects saves before mutation with the same sanitized `5001`
-  save error and leaves the file byte-for-byte unchanged. The round-trip writer
-  would otherwise mutate shared alias/merge sources and unrelated effective
-  settings. This guard conservatively rejects even an unreferenced anchor on
-  the target mapping. Reads remain supported; unrelated anchors, aliases and
-  merges do not prevent saving an independent, explicitly defined target.
+- An anchored `model_recommendation` mapping, an anchored document root (any
+  `&anchor` on the top-level mapping, whose aliases would carry the preset into
+  sibling, nested, sequence or `<<` merge sites), or a target supplied by a
+  root YAML `<<` merge, rejects saves before mutation with the same sanitized
+  `5001` save error and leaves the file byte-for-byte unchanged. The round-trip
+  writer would otherwise mutate shared alias/merge sources and unrelated
+  effective settings. This guard conservatively rejects even an unreferenced
+  anchor on the target or root mapping. Reads remain supported; unrelated
+  anchors, aliases and merges (including a target that itself `<<`-merges an
+  unrelated anchor) do not prevent saving an independent, explicitly defined
+  target.
 - Reads return only `value` and `profile`, never router configuration. Writes
   ignore unrelated request fields; only the preset is persisted. Do not send
   draft text or recommendation results to the settings methods.

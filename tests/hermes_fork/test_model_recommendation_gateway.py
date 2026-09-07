@@ -6,6 +6,8 @@ from pathlib import Path
 import threading
 from types import SimpleNamespace
 
+import pytest
+
 from agent.account_usage import AccountUsageSnapshot
 from hermes_cli.config_defaults import DEFAULT_CONFIG
 from hermes_fork.model_recommendation import service
@@ -92,12 +94,25 @@ def test_gateway_transport_uses_only_configured_authenticated_candidates_and_doe
     assert session["model_override"] == {"provider": "before"}
 
 
-def test_gateway_transport_binds_the_requested_profile_home(monkeypatch, tmp_path):
-    profile_home = tmp_path / "profiles" / "draft-review"
-    profile_home.mkdir(parents=True)
-    seen = {}
+def _sandbox_profiles(monkeypatch, tmp_path, *names):
+    """Real profile directories under a sandboxed HOME (profile roots are HOME-anchored)."""
+    root = tmp_path / ".hermes"
+    monkeypatch.setattr(Path, "home", lambda: tmp_path)
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.setenv("GH_CONFIG_DIR", str(tmp_path / ".config" / "gh"))
+    monkeypatch.setenv("HERMES_HOME", str(root))
+    monkeypatch.setattr(srv, "_hermes_home", root)
+    root.mkdir(parents=True, exist_ok=True)
+    homes = {name: root / "profiles" / name for name in names}
+    for home in homes.values():
+        home.mkdir(parents=True)
+    return root, homes
 
-    monkeypatch.setattr(srv, "_profile_home", lambda profile: profile_home if profile == "draft-review" else None)
+
+def test_gateway_transport_binds_the_requested_profile_home(monkeypatch, tmp_path):
+    _root, homes = _sandbox_profiles(monkeypatch, tmp_path, "draft-review")
+    profile_home = homes["draft-review"]
+    seen = {}
 
     def fake_recommend(**_kwargs):
         from hermes_constants import get_hermes_home
@@ -114,6 +129,59 @@ def test_gateway_transport_binds_the_requested_profile_home(monkeypatch, tmp_pat
 
     assert envelope["result"]["status"] == "unavailable"
     assert seen["home"] == profile_home
+
+
+@pytest.mark.parametrize("profile", [
+    pytest.param("missing", id="unknown-profile"),
+    pytest.param("Missing-Profile", id="mixed-case-unknown-profile"),
+    pytest.param("../outside", id="invalid-name"),
+    pytest.param("removed", id="tombstoned-profile"),
+    pytest.param(["draft-review"], id="non-string"),
+])
+def test_explicit_invalid_profile_is_rejected_before_any_router_call(monkeypatch, tmp_path, profile):
+    from hermes_constants import mark_named_profile_deleted
+
+    _root, homes = _sandbox_profiles(monkeypatch, tmp_path, "draft-review", "removed")
+    mark_named_profile_deleted(homes["removed"])
+    calls = []
+
+    def fake_recommend(**kwargs):
+        from hermes_constants import get_hermes_home
+
+        calls.append(get_hermes_home())
+        return service.unavailable()
+
+    monkeypatch.setattr(service, "recommend", fake_recommend)
+    envelope = srv.handle_request({
+        "id": 4,
+        "method": "model_recommendation.get",
+        "params": {"profile": profile, "draft": "PRIVATE-DRAFT", "attachments": [], "policy": "best_quality"},
+    })
+
+    # Fail closed: an explicitly named profile that does not resolve must never fall back to
+    # the launch profile's router configuration — that would send the unsent draft elsewhere.
+    assert envelope.get("error", {}).get("code") == 4002, envelope
+    assert "PRIVATE-DRAFT" not in json.dumps(envelope)
+    assert calls == []
+
+
+def test_omitted_and_launch_profile_requests_keep_running_against_launch_home(monkeypatch, tmp_path):
+    root, _homes = _sandbox_profiles(monkeypatch, tmp_path, "draft-review")
+    seen = []
+
+    def fake_recommend(**_kwargs):
+        from hermes_constants import get_hermes_home
+
+        seen.append(get_hermes_home())
+        return service.unavailable()
+
+    monkeypatch.setattr(service, "recommend", fake_recommend)
+    for params in ({"draft": "Draft"}, {"draft": "Draft", "profile": None}, {"draft": "Draft", "profile": ""},
+                   {"draft": "Draft", "profile": " "}, {"draft": "Draft", "profile": "default"},
+                   {"draft": "Draft", "profile": "DEFAULT"}):
+        envelope = srv.handle_request({"id": 5, "method": "model_recommendation.get", "params": params})
+        assert envelope["result"]["status"] == "unavailable", (params, envelope)
+    assert seen == [root] * 6
 
 
 def test_gateway_dispatch_uses_temporary_profile_config_and_real_candidate_discovery(monkeypatch, tmp_path):
