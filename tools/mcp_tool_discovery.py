@@ -234,7 +234,8 @@ def _select_new_servers(servers: Dict[str, dict]) -> Dict[str, dict]:
 
     Known servers without a live session are parked or mid-reconnect with
     tools deregistered. Repeated discovery must not override that parked
-    state; only a changed server config is an intentional recovery request.
+    state; only a changed, enabled server config is an intentional recovery
+    request.
     """
     with _core._lock:
         connecting = set(_core._server_connecting)
@@ -262,8 +263,11 @@ def _select_new_servers(servers: Dict[str, dict]) -> Dict[str, dict]:
     for name, server, config in stale_cached:
         if getattr(server, "_config", None) != config:
             server._bind_config(config)
-            logger.info("MCP server '%s': configuration changed while parked; requesting reconnect", name)
-            _loop._signal_reconnect(server)
+            if _enabled(config):
+                logger.info("MCP server '%s': configuration changed while parked; requesting reconnect", name)
+                _loop._signal_reconnect(server)
+            else:
+                logger.info("MCP server '%s': configuration changed while parked; remaining disabled", name)
     return new_servers
 
 
