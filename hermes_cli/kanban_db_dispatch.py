@@ -1025,14 +1025,49 @@ def _classify_dead_worker(
             protocol_violation=True,
         )
     if kind == "rate_limited":
-        # Quota wall — NOT a task failure. Release to the source phase and do
-        # NOT count a failure so a long quota window can't trip the breaker.
+        # EX_TEMPFAIL is already a machine-readable quota outcome. When the
+        # current run log also carries the reviewed quota signature/deadline,
+        # preserve that parsed payload so both per-board and host circuits can
+        # register on the first observation. Missing/malformed deadlines must
+        # use the existing bounded interruption accounting; treating every
+        # EX_TEMPFAIL as neutral would retry forever without advancing either
+        # the interruption streak or the ordinary failure budget.
+        run_id = _kb._current_run_id(conn, task_id)
+        quota_signal = _kb._detect_quota_exit_signal(
+            task_id, run_id=run_id, board=board,
+        )
+        payload = {"pid": pid, "claimer": claimer, "exit_code": code}
+        retry_after = quota_signal.get("retry_after_seconds") if quota_signal else None
+        if retry_after is not None:
+            payload["reason"] = "quota"
+            payload["quota_retry_after_seconds"] = retry_after
+            if quota_signal and quota_signal.get("host_circuit_published"):
+                payload["host_circuit_published"] = True
+            # Validated quota wall — NOT a task failure. Release to the source
+            # phase and do not count a failure while its finite pause is active.
+            return _DeadWorker(
+                kind, code,
+                f"pid {pid} exited rate-limited (quota wall) — requeued without counting a failure",
+                "rate_limited",
+                payload,
+                rate_limited=True,
+            )
+
+        # The sentinel proves the result category, but not a finite recovery
+        # window. Reuse the reviewed quota classifier and interruption streak
+        # instead of entering the indefinitely neutral rate_limited path.
+        _category, reason = _kb.classify_infra_exit(
+            exit_kind="nonzero_exit", quota_signal=True,
+        )
+        payload["reason"] = reason
+        payload["quota_retry_after_seconds"] = None
         return _DeadWorker(
             kind, code,
-            f"pid {pid} exited rate-limited (quota wall) — requeued without counting a failure",
-            "rate_limited",
-            {"pid": pid, "claimer": claimer, "exit_code": code},
-            rate_limited=True,
+            f"pid {pid} exited rate-limited without a valid retry deadline "
+            "(bounded infra interruption)",
+            "interrupted",
+            payload,
+            infra=True,
         )
     # A pending durable timeout-kill intent means THIS dispatcher (or a
     # predecessor that died between signal and reap) sent this SIGTERM/SIGKILL
@@ -1074,6 +1109,8 @@ def _classify_dead_worker(
             payload = {"pid": pid, "claimer": claimer, "reason": infra_reason}
             if infra_reason == "quota" and quota_signal_dict:
                 payload["quota_retry_after_seconds"] = quota_signal_dict.get("retry_after_seconds")
+                if quota_signal_dict.get("host_circuit_published"):
+                    payload["host_circuit_published"] = True
             error_text = (
                 f"pid {pid} {infra_reason} (infra, not counted) "
                 f"[exit_kind={kind}"
@@ -1126,7 +1163,9 @@ class _CrashSweep:
     exited_hook_payloads: list[dict] = field(default_factory=list)
 
 
-def _reclaim_dead_workers(conn: sqlite3.Connection) -> _CrashSweep:
+def _reclaim_dead_workers(
+    conn: sqlite3.Connection, *, board: Optional[str] = None,
+) -> _CrashSweep:
     """Release every host-local ``running`` task whose worker PID is dead."""
     sweep = _CrashSweep()
     with _kb.write_txn(conn):
@@ -1150,7 +1189,9 @@ def _reclaim_dead_workers(conn: sqlite3.Connection) -> _CrashSweep:
 
             pid = int(row["worker_pid"])
             retry_status = _kb._retry_status_for_run(conn, row["id"])
-            dead = _classify_dead_worker(conn, row["id"], pid, row["claim_lock"], retry_status)
+            dead = _classify_dead_worker(
+                conn, row["id"], pid, row["claim_lock"], retry_status, board=board,
+            )
             dead.event_payload["retry_status"] = retry_status
             # A quota-signature infra death with a usable (parsed + clamped)
             # retry-after AND a resolvable non-``auto`` provider identity is
@@ -1160,8 +1201,30 @@ def _reclaim_dead_workers(conn: sqlite3.Connection) -> _CrashSweep:
             target_status = retry_status
             if dead.review_no_verdict:
                 target_status = "blocked"
-            elif getattr(dead, "infra", False) and dead.event_payload.get("reason") == "quota":
+            elif (
+                (getattr(dead, "infra", False) or dead.rate_limited)
+                and dead.event_payload.get("reason") == "quota"
+            ):
                 retry_after = dead.event_payload.get("quota_retry_after_seconds")
+                # Host-wide protection is account/budget scoped and therefore
+                # only activates for an explicit non-secret route mapping. It
+                # shares the reviewed quota classifier and deadline parser
+                # above; no second classifier or provider-wide inference.
+                from hermes_cli import kanban_quota_circuit as _kqc
+
+                budget_group = _kqc.resolve_task_budget_group(conn, row["id"])
+                if budget_group and not dead.event_payload.get("host_circuit_published"):
+                    circuit = _kqc.register_quota_circuit(
+                        budget_group,
+                        retry_after=retry_after,
+                        board=board or _kb.get_current_board(),
+                        task_id=row["id"],
+                        reason="quota",
+                        max_seconds=_kb._resolve_provider_backoff_max_seconds(),
+                    )
+                    if circuit is not None:
+                        dead.event_payload["budget_group"] = circuit["group"]
+                        dead.event_payload["host_resume_at"] = circuit["next_eligible_at"]
                 provider = _kb._task_provider(conn, row["id"]) if _kb._provider_backoff_enabled() else None
                 if provider:
                     until = _kb.register_provider_backoff(
@@ -1198,6 +1261,19 @@ def _reclaim_dead_workers(conn: sqlite3.Connection) -> _CrashSweep:
                 "outcome": dead.run_outcome,
                 "retry_status": retry_status,
             })
+            if (
+                dead.infra
+                and dead.kind == "rate_limited"
+                and dead.event_payload.get("reason") == "quota"
+                and dead.event_payload.get("quota_retry_after_seconds") is None
+            ):
+                # A rejected deadline supersedes any quota-wall text from the
+                # prior run. Leaving that stale text makes blocker_auth stop the
+                # bounded interruption sequence after its first increment.
+                conn.execute(
+                    "UPDATE tasks SET last_failure_error = NULL WHERE id = ?",
+                    (row["id"],),
+                )
             if dead.rate_limited or dead.protocol_violation:
                 # Stamp last_failure_error WITHOUT touching ``consecutive_failures``:
                 # a rate-limited requeue must show ``check_respawn_guard`` a quota
@@ -1348,7 +1424,9 @@ def _account_crashes(conn: sqlite3.Connection, crash_details: list) -> list[str]
     return auto_blocked
 
 
-def detect_crashed_workers(conn: sqlite3.Connection) -> list[str]:
+def detect_crashed_workers(
+    conn: sqlite3.Connection, *, board: Optional[str] = None,
+) -> list[str]:
     """Reclaim ``running`` tasks whose worker PID is no longer alive.
 
     Restores the source phase immediately (no waiting for the claim TTL), for
@@ -1358,7 +1436,7 @@ def detect_crashed_workers(conn: sqlite3.Connection) -> list[str]:
     wall, released WITHOUT counting a failure and surfaced via the
     ``_last_rate_limited`` attribute (the return stays crashed-only).
     """
-    sweep = _reclaim_dead_workers(conn)
+    sweep = _reclaim_dead_workers(conn, board=board)
     # Outside the main txn: account each crash and maybe trip the breaker.
     auto_blocked = _account_crashes(conn, sweep.crash_details) if sweep.crash_details else []
     # Side-channel attributes keep the public ``list[str]`` return stable;
@@ -1583,7 +1661,12 @@ def _clear_failure_counter(conn: sqlite3.Connection, task_id: str) -> None:
 
 
 def check_respawn_guard(
-    conn: sqlite3.Connection, task_id: str, *, lane: str = "ready",
+    conn: sqlite3.Connection,
+    task_id: str,
+    *,
+    lane: str = "ready",
+    board: Optional[str] = None,
+    consume_host_probe: bool = False,
 ) -> Optional[str]:
     """Return a guard reason if ``task_id`` should NOT be re-spawned, else None.
 
@@ -1610,7 +1693,20 @@ def check_respawn_guard(
 
     now = int(time.time())
 
-    # 0. Provider-wide pause is checked first in both lanes. Unlike the
+    # 0. Host-wide account/budget circuit. It is inert unless the operator
+    # explicitly mapped this provider/profile route to an opaque group.
+    from hermes_cli import kanban_quota_circuit as _kqc
+
+    host_guard = _kqc.task_quota_guard(
+        conn,
+        task_id,
+        board=board,
+        consume_probe=consume_host_probe,
+    )
+    if host_guard is not None:
+        return host_guard
+
+    # 0a. Per-board provider-wide pause is checked next in both lanes. Unlike the
     #    per-task rate-limit cooldown below, this protects every task
     #    explicitly pinned to the exhausted provider while allowing other
     #    providers (and ``provider: auto`` tasks, which can resolve
@@ -2635,7 +2731,13 @@ def _dispatch_lane_task(
         if current >= per_profile_cap:
             result.skipped_per_profile_capped.append((task_id, assignee, current))
             return False
-    guard_reason = check_respawn_guard(conn, task_id, lane=lane)
+    guard_reason = check_respawn_guard(
+        conn,
+        task_id,
+        lane=lane,
+        board=board,
+        consume_host_probe=not dry_run,
+    )
     if guard_reason is not None:
         result.respawn_guarded.append((task_id, guard_reason))
         # Event so ``hermes kanban tail`` shows why the task looks stuck.
@@ -2960,6 +3062,7 @@ def _run_reclaim_phase(
     stale_timeout_seconds: int,
     failure_limit: int,
     reconcile_orphans: bool,
+    board: Optional[str] = None,
 ) -> None:
     """Reclaim stale/orphaned/crashed/timed-out running tasks, then promote."""
     reap_worker_zombies()
@@ -2967,7 +3070,7 @@ def _run_reclaim_phase(
     if reconcile_orphans:
         result.reconciled_orphans = reconcile_orphaned_running(conn)
     result.stale = detect_stale_running(conn, stale_timeout_seconds=stale_timeout_seconds)
-    result.crashed = detect_crashed_workers(conn)
+    result.crashed = detect_crashed_workers(conn, board=board)
     # Side-channel attributes (see detect_crashed_workers); rate-limited tasks
     # went back to ``ready`` and the respawn guard defers them until quota clears.
     result.auto_blocked.extend(getattr(detect_crashed_workers, "_last_auto_blocked", []))
@@ -3146,6 +3249,7 @@ def _dispatch_once_locked(
     _run_reclaim_phase(
         conn, result, stale_timeout_seconds=stale_timeout_seconds,
         failure_limit=failure_limit, reconcile_orphans=reconcile_orphans,
+        board=board,
     )
     may_spawn, spawn_budget = _tick_spawn_budget(
         conn, result, max_spawn=max_spawn, max_in_progress=max_in_progress, board=board,

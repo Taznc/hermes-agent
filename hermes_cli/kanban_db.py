@@ -1609,6 +1609,7 @@ def delete_interruption_streak(conn: sqlite3.Connection, *, task_id: str) -> Non
 # of a clean ``sys.exit(75)``.
 _QUOTA_EXIT_LOG_RE = re.compile(r"quota exhausted \(429\)", re.IGNORECASE)
 _QUOTA_RETRY_AFTER_RE = re.compile(r"retry after ([0-9]+)s\b", re.IGNORECASE)
+_HOST_QUOTA_PUBLISHED_LOG_RE = re.compile(r"host quota circuit published\.", re.IGNORECASE)
 
 
 def worker_log_run_marker(run_id: int) -> str:
@@ -1638,7 +1639,10 @@ def _detect_quota_exit_signal(
     if not _QUOTA_EXIT_LOG_RE.search(log_text):
         return None
     m = _QUOTA_RETRY_AFTER_RE.search(log_text)
-    return {"retry_after_seconds": _parse_retry_after(m.group(1)) if m else None}
+    result = {"retry_after_seconds": _parse_retry_after(m.group(1)) if m else None}
+    if _HOST_QUOTA_PUBLISHED_LOG_RE.search(log_text):
+        result["host_circuit_published"] = True
+    return result
 
 def _parse_retry_after(text: Optional[str]) -> Optional[int]:
     """Parse a retry-after value: only positive base-10 integer. Returns None for malformed/missing/nonpositive."""

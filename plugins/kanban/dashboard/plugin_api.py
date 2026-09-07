@@ -35,6 +35,7 @@ from hermes_cli import kanban_db_notify as kbn
 from hermes_cli import kanban_db_dispatch as kbd
 from hermes_cli import kanban_db_workspace as kbw
 from hermes_cli import kanban_diagnostics as kd
+from hermes_cli import kanban_quota_circuit as kqc
 from hermes_cli.kanban_db import KANBAN_ATTACHMENT_MAX_BYTES, _collision_free_path, _safe_attachment_name
 
 log = logging.getLogger(__name__)
@@ -1703,6 +1704,21 @@ def get_task_log(task_id: str, tail: Optional[int] = Query(None, ge=1, le=2_000_
     return {
         "task_id": task_id, "path": str(log_path), "exists": content is not None,
         "size_bytes": size, "content": content or "", "truncated": bool(tail and size > tail)}
+
+
+@router.get("/quota-circuits")
+def quota_circuits():
+    """Sanitized host-wide quota state shared by every Kanban board."""
+    circuits = kqc.list_quota_circuits()
+    return {"active": bool(circuits), "circuits": circuits}
+
+
+@router.delete("/quota-circuits/{group_handle}")
+def clear_quota_circuit(group_handle: str):
+    """Manually clear one circuit by its opaque dashboard handle."""
+    if not kqc.clear_quota_circuit(group_handle):
+        raise HTTPException(status_code=404, detail="quota circuit not found")
+    return {"cleared": True, "group": group_handle}
 
 
 @router.post("/dispatch")
