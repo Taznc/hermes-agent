@@ -90,8 +90,23 @@ def _git_out(cwd: Path, *args: str, timeout: int = 30) -> Optional[str]:
 
 VALID_STATUSES = {
     "triage", "todo", "scheduled", "ready", "running", "blocked", "on_hold", "review", "done", "archived",
+    "idea", "roadmap",
 }
 VALID_INITIAL_STATUSES = {"running", "blocked"}
+
+# Wishlist lanes: a card parked here is INERT BY CONSTRUCTION. No sweep, dispatcher query,
+# promotion pass, decomposer, specifier, ``recompute_ready`` or stale/crash reaper may ever
+# select one, because every one of those selects an explicit status whitelist that omits both.
+# ``idea`` is rough capture, ``roadmap`` is hashed out with the operator but still NOT authorized
+# to execute. Cards enter a lane only at creation (``create_task(lane=...)``) so the existing
+# ``block``/``hold`` habits can never park live work in the wishlist; they leave through
+# ``spawn_roadmap_task`` (roadmap -> triage/ready) or ``archive_task``.
+ROADMAP_LANE_STATUSES = frozenset({"idea", "roadmap"})
+
+# Statuses that are not live work for health/cost purposes (board "active" aggregates, the
+# dispatcher-stuck heuristic, stale-age checks, workspace retention). The lanes sit beside
+# ``archived`` here: visible on the board, but never counted as work in flight.
+NON_ACTIVE_STATUSES = frozenset({"archived"}) | ROADMAP_LANE_STATUSES
 
 # Typed block reasons (routing in ``_route_block``); ``None`` = legacy un-typed.
 VALID_BLOCK_KINDS = {"dependency", "needs_input", "capability", "transient"}
@@ -1988,7 +2003,7 @@ def create_task(
     route_source: Optional[str] = None, route_name: Optional[str] = None,
     goal_mode: bool = False, goal_max_turns: Optional[int] = None, initial_status: str = "running",
     session_id: Optional[str] = None, board: Optional[str] = None, project_id: Optional[str] = None,
-    project_source_task_id: Optional[str] = None,
+    project_source_task_id: Optional[str] = None, lane: Optional[str] = None,
 ) -> str:
     """Create a task (optionally under ``parents``); returns its id.
 
@@ -2005,12 +2020,17 @@ def create_task(
     audit/UI surfaces and never affect dispatch after creation.
     ``project_source_task_id``: cross-profile fallback when ``project_id`` is not
     in the active profile's projects.db — see ``_resolve_project_link``.
+    ``lane``: ``"idea"``/``"roadmap"`` parks the card in an inert wishlist lane
+    (``ROADMAP_LANE_STATUSES``) that no automation ever selects; mutually exclusive
+    with ``triage`` and with a non-default ``initial_status``, and ``assignee`` is
+    optional there (nothing dispatches a lane card).
     """
     model_override, provider_override = _validate_model_override(model_override, provider_override)
     reasoning_effort = normalize_reasoning_effort(reasoning_effort)
     assignee = _canonical_assignee(assignee)
     if not title or not title.strip():
         raise ValueError("title is required")
+    lane = _validate_lane(lane, triage=triage, initial_status=initial_status)
     if initial_status not in VALID_INITIAL_STATUSES:
         raise ValueError(f"initial_status must be one of {sorted(VALID_INITIAL_STATUSES)}")
     if workspace_kind not in VALID_WORKSPACE_KINDS:
@@ -2067,7 +2087,7 @@ def create_task(
             # allow_nested: graph builders compose create_task under one outer
             # commit so the dispatcher never sees a half-built graph.
             with write_txn(conn, allow_nested=True):
-                task_status = _initial_task_status(conn, parents, initial_status, triage)
+                task_status = _initial_task_status(conn, parents, initial_status, triage, lane)
                 # Project worktree: fresh dir under the repo + deterministic
                 # branch, instead of the random ``wt/<id>`` worker fallback.
                 if project_obj is not None and workspace_kind == "worktree":
@@ -2121,6 +2141,7 @@ def create_task(
                         "reasoning_effort": reasoning_effort,
                         "route_source": route_source,
                         "route_name": route_name,
+                        "lane": lane,
                     },
                 )
                 if initial_status == "blocked":
@@ -2149,16 +2170,41 @@ def _board_meta_for(board: Optional[str]) -> dict:
     return read_board_metadata(board if board else get_current_board())
 
 
+def _validate_lane(
+    lane: Optional[str], *, triage: bool = False, initial_status: str = "running",
+) -> Optional[str]:
+    """Normalize a roadmap lane for ``create_task``: ``None`` or one of
+    ``ROADMAP_LANE_STATUSES``. Rejects combining a lane with ``triage`` or an explicit
+    ``initial_status`` — those are three different answers to "where does this card land",
+    and silently picking one would put live work in the wishlist (or vice versa)."""
+    if lane is None:
+        return None
+    lane = str(lane).strip()
+    if lane not in ROADMAP_LANE_STATUSES:
+        raise ValueError(f"lane must be one of {sorted(ROADMAP_LANE_STATUSES)}, got {lane!r}")
+    if triage:
+        raise ValueError("lane and triage are mutually exclusive")
+    if initial_status != "running":
+        raise ValueError(f"lane and initial_status={initial_status!r} are mutually exclusive")
+    return lane
+
+
 def _initial_task_status(
     conn: sqlite3.Connection, parents: tuple[str, ...], initial_status: str, triage: bool,
+    lane: Optional[str] = None,
 ) -> str:
-    """Status for a new task: ``blocked``/``triage`` when parked by the caller,
-    else ``ready`` unless a parent is unsatisfied (-> ``todo``). Parent ids are
-    validated in every mode (even triage) so link rows never dangle."""
+    """Status for a new task: a roadmap ``lane`` / ``blocked`` / ``triage`` when parked by the
+    caller, else ``ready`` unless a parent is unsatisfied (-> ``todo``). Parent ids are
+    validated in every mode (even triage) so link rows never dangle.
+
+    A lane wins over parent gating on purpose: an ``idea``/``roadmap`` card linked under an epic
+    must stay in its lane, never land in ``todo`` where the promotion sweep would pick it up."""
     if parents:
         missing = _missing_task_ids(conn, parents)
         if missing:
             raise ValueError(f"unknown parent task(s): {', '.join(missing)}")
+    if lane is not None:
+        return lane
     if initial_status == "blocked":
         return "blocked"
     if triage:
@@ -5127,6 +5173,79 @@ def hold_task(
         return True
 
 
+# --- Roadmap lanes (idea / roadmap) ---
+#
+# The lanes are inert: nothing selects them, so the ONLY way a card leaves one is an explicit
+# operator verb here (or ``archive_task``). Every transition is a status-guarded CAS inside
+# ``write_txn`` mirroring ``hold_task``'s shape, and a refused transition raises ``ValueError``
+# naming the attempted from->to so a caller never has to guess why nothing moved.
+
+# Allowed lane transitions, ``from -> {to, ...}``. Deliberately one-directional out of the
+# wishlist: no live status may move INTO a lane (a card enters only at creation), so the existing
+# ``unblock``/``hold`` habits can never park real work here and ``on_hold`` keeps its meaning.
+ROADMAP_LANE_TRANSITIONS: dict[str, frozenset[str]] = {
+    "idea": frozenset({"roadmap", "archived"}),
+    "roadmap": frozenset({"triage", "ready", "idea", "archived"}),
+}
+
+# Where ``spawn_roadmap_task`` may land a card. ``triage`` is the default: the operator's standing
+# decision is to always let auto_decompose re-specify/split a roadmap item before it executes.
+ROADMAP_SPAWN_TARGETS = frozenset({"triage", "ready"})
+
+
+def _lane_transition(
+    conn: sqlite3.Connection, task_id: str, *, to: str, event: str,
+    payload: Optional[dict] = None,
+) -> bool:
+    """Move ``task_id`` out of a roadmap lane into ``to``, appending ``event``.
+
+    Raises ``ValueError`` naming ``from -> to`` when the task's current status may not make this
+    move (including every live status, which can never enter a lane). Returns ``False`` only when
+    the row vanished mid-transaction."""
+    with write_txn(conn):
+        row = conn.execute("SELECT status FROM tasks WHERE id = ?", (task_id,)).fetchone()
+        if row is None:
+            raise ValueError(f"unknown task {task_id}")
+        current = row["status"]
+        if to not in ROADMAP_LANE_TRANSITIONS.get(current, frozenset()):
+            raise ValueError(
+                f"invalid roadmap lane transition for {task_id}: {current!r} -> {to!r} "
+                f"(allowed from {current!r}: "
+                f"{sorted(ROADMAP_LANE_TRANSITIONS.get(current, frozenset())) or 'nothing'})"
+            )
+        cur = conn.execute(
+            "UPDATE tasks SET status = ? WHERE id = ? AND status = ?", (to, task_id, current),
+        )
+        if cur.rowcount != 1:
+            return False
+        _append_event(conn, task_id, event, payload)
+        return True
+
+
+def refine_task(conn: sqlite3.Connection, task_id: str) -> bool:
+    """``idea -> roadmap``: the item has been hashed out with the operator. Still inert —
+    refining authorizes nothing, it only says the shape is agreed."""
+    return _lane_transition(conn, task_id, to="roadmap", event="refined")
+
+
+def demote_task(conn: sqlite3.Connection, task_id: str) -> bool:
+    """``roadmap -> idea``: send a hashed-out item back to rough capture."""
+    return _lane_transition(conn, task_id, to="idea", event="demoted")
+
+
+def spawn_roadmap_task(conn: sqlite3.Connection, task_id: str, *, to: str = "triage") -> bool:
+    """``roadmap -> triage`` (default) or ``ready``: authorize the item to execute.
+
+    ``triage`` is the default so auto_decompose gets to re-specify/split it first; ``to="ready"``
+    is the explicit opt-out for an item that is already a single well-formed task. This is the
+    only path from the wishlist into live work — ``idea`` must be refined first."""
+    if to not in ROADMAP_SPAWN_TARGETS:
+        raise ValueError(f"spawn target must be one of {sorted(ROADMAP_SPAWN_TARGETS)}, got {to!r}")
+    return _lane_transition(
+        conn, task_id, to=to, event="spawned_from_roadmap", payload={"status": to},
+    )
+
+
 def unhold_task(conn: sqlite3.Connection, task_id: str) -> bool:
     """Resume an ``on_hold`` task to its safe resumable phase. Mirrors :func:`unblock_task`:
     re-gates on parent completion (``todo`` if any parent isn't done, else ``ready``/``review``),
@@ -5372,7 +5491,11 @@ def _ctx_comments(lines: list[str], comments: list[Comment], now: int) -> None:
 # --- Stats + SLA helpers ---
 
 def board_stats(conn: sqlite3.Connection) -> dict:
-    """Per-status + per-assignee counts and the oldest ``ready`` age (staleness signal)."""
+    """Per-status + per-assignee counts and the oldest ``ready`` age (staleness signal).
+
+    ``by_status`` reports the roadmap lanes (they are real cards on the board), but they are
+    excluded from ``active_total`` — a wishlist item is not work in flight, so it must not make
+    a quiet board look busy to any health/cost rule that asks "is anything live?"."""
     by_status: dict[str, int] = {}
     for row in conn.execute(
         "SELECT status, COUNT(*) AS n FROM tasks "
@@ -5394,6 +5517,12 @@ def board_stats(conn: sqlite3.Connection) -> dict:
     return {
         "by_status": by_status,
         "by_assignee": by_assignee,
+        "active_total": sum(
+            n for s, n in by_status.items() if s not in NON_ACTIVE_STATUSES
+        ),
+        "roadmap_total": sum(
+            n for s, n in by_status.items() if s in ROADMAP_LANE_STATUSES
+        ),
         "oldest_ready_age_seconds": oldest_ready_age,
         "now": now,
     }

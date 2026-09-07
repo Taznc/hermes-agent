@@ -168,9 +168,11 @@ def _errors_to_500(prefix: str) -> Iterator[None]:
 # Dashboard columns, left-to-right ("archived" is a filter toggle, not a column). Keep in
 # sync with kanban_db.VALID_STATUSES — a status missing here gets mis-bucketed into ``todo``.
 # ``on_hold`` is the human-initiated shelf/pause column — distinct from ``blocked`` (worker needs
-# input) and ``scheduled`` (waiting on time).
+# input) and ``scheduled`` (waiting on time). ``idea``/``roadmap`` are the inert wishlist lanes:
+# real columns the UI renders, but no automation ever selects them, so they trail the live ones.
 BOARD_COLUMNS: list[str] = [
     "triage", "todo", "scheduled", "ready", "running", "blocked", "on_hold", "review", "done",
+    "idea", "roadmap",
 ]
 
 _CARD_SUMMARY_PREVIEW_CHARS = 200
@@ -892,10 +894,15 @@ def _drag_to(conn, task_id: str, s: str) -> bool:
     evented unarchive verb; blocked/scheduled -> ready re-opens via
     ``unblock_task``; leaving ``review`` goes through ``reopen_review_task``
     (stale-run recovery, parent re-gate, ``review_reopened`` event) instead of
-    a raw write."""
+    a raw write; a ``roadmap`` card being dragged into the work queue is an
+    authorization, so it goes through ``spawn_roadmap_task`` for the
+    ``spawned_from_roadmap`` event (and ``idea`` is refused there — an idea must be
+    refined first, which the DB layer states in its ValueError)."""
     current = kanban_db.get_task(conn, task_id)
     if current is not None and current.status == "archived":
         return kanban_db.unarchive_task(conn, task_id, status=s)
+    if current is not None and current.status in kanban_db.ROADMAP_LANE_STATUSES:
+        return kanban_db.spawn_roadmap_task(conn, task_id, to=s)
     if s == "ready" and current and current.status in ("blocked", "scheduled"):
         return kanban_db.unblock_task(conn, task_id)
     if s == "ready" and current and current.status == "on_hold":
@@ -903,6 +910,14 @@ def _drag_to(conn, task_id: str, s: str) -> bool:
     if current is not None and current.status == "review":
         return kanban_db.reopen_review_task(conn, task_id)
     return _set_status_direct(conn, task_id, s)
+
+
+def _drag_to_lane(conn, task_id: str, lane: str) -> bool:
+    """Drag-drop INTO a wishlist lane. Only the two intra-lane moves exist (``idea -> roadmap``
+    refine, ``roadmap -> idea`` demote); dragging live work into the wishlist raises ValueError
+    from the DB layer and surfaces as a 400 naming the attempted from->to."""
+    return (kanban_db.refine_task(conn, task_id) if lane == "roadmap"
+            else kanban_db.demote_task(conn, task_id))
 
 
 # Status verb dispatch shared by PATCH /tasks/{id} and POST /tasks/bulk: (conn, task_id,
@@ -917,7 +932,9 @@ _STATUS_HANDLERS: dict[str, Any] = {
         conn, tid, summary=p.summary, metadata=p.metadata, reviewer=(p.assignee or None), force=True),
     "ready": lambda conn, tid, p: _drag_to(conn, tid, "ready"),
     "todo": lambda conn, tid, p: _drag_to(conn, tid, "todo"),
-    "triage": lambda conn, tid, p: _drag_to(conn, tid, "triage")}
+    "triage": lambda conn, tid, p: _drag_to(conn, tid, "triage"),
+    "idea": lambda conn, tid, p: _drag_to_lane(conn, tid, "idea"),
+    "roadmap": lambda conn, tid, p: _drag_to_lane(conn, tid, "roadmap")}
 
 
 def _apply_status(conn, task_id: str, s: str, p, unknown_detail: str) -> bool:
@@ -965,7 +982,10 @@ def _patch_status(conn, task_id: str, payload: UpdateTaskBody, review_assignee_d
     if s == "archived":
         ok = kanban_db.archive_task(conn, task_id)
     else:
-        with _map_errors(400, _StatusRejected):
+        # ValueError is the roadmap-lane layer refusing a transition; its message names the
+        # attempted from->to, which is exactly what the UI toast should say, so surface it as a
+        # 400 rather than letting it fall through to the generic 409.
+        with _map_errors(400, _StatusRejected, ValueError):
             ok = _apply_status(conn, task_id, s, payload, f"unknown status: {s}")
         if s == "review" and ok and review_assignee_deferred and not payload.assignee:
             ok = kanban_db.assign_task(conn, task_id, None)
@@ -1169,8 +1189,13 @@ def _bulk_apply_one(conn, tid: str, payload: BulkTaskBody, board: Optional[str],
         entry.update(ok=False, error="archive refused")
     if payload.status is not None and not payload.archive:
         s = payload.status
-        if not _apply_status(conn, tid, s, payload, f"unknown status {s!r}"):
-            entry.update(ok=False, error=f"transition to {s!r} refused")
+        try:
+            if not _apply_status(conn, tid, s, payload, f"unknown status {s!r}"):
+                entry.update(ok=False, error=f"transition to {s!r} refused")
+        except ValueError as exc:
+            # Roadmap-lane refusal: record the from->to message per task, matching how every
+            # other per-task refusal in this bulk loop is reported instead of aborting the batch.
+            entry.update(ok=False, error=str(exc))
     if payload.assignee is not None:
         try:
             ok = (kanban_db.reassign_task(conn, tid, payload.assignee or None, reclaim_first=True) if payload.reclaim_first
@@ -1463,59 +1488,50 @@ def _run_estimate(title: str, body: Optional[str]) -> dict:
         "rationale": str(parsed.get("rationale") or "").strip() or None, "model": model}
 
 
-# --- POST /roadmap/idea — capture a free-typed roadmap idea into the roadmap-sync plugin's managed
-# "## Ideas" inbox. The ONLY roadmap writer reachable from this router: it delegates the file
-# mutation to roadmap_sync.append_idea_for_board(), which owns the flock + atomic-write path, so
-# there is exactly one roadmap writer with its own locking.
+# --- POST /roadmap/idea — capture a free-typed roadmap idea as an ``idea`` card on the resolved
+# board. Previously this appended to the roadmap-sync plugin's markdown "## Ideas" inbox; the
+# board is now the system of record for the wishlist (the inert ``idea`` lane), and the roadmap
+# document is rendered FROM those cards. The response shape is unchanged so the shipped Desktop
+# callers (api.ts ``addRoadmapIdea``, IdeaCaptureDialog, the per-card "send to roadmap ideas"
+# action) keep working without a client change.
 
-# Mirrors the plugin's own bound (roadmap-sync's _IDEA_MAX_LEN) so an oversized paste gets a clean
-# 400 instead of a silent truncation. MUST stay equal to the plugin's cap: its sanitizer never
-# lengthens text, so any input at or under this bound is guaranteed to be stored in full.
+# Bound on captured text. Kept at the markdown inbox's old cap so an oversized paste still gets a
+# clean 400 instead of landing a wall of text as a card title.
 _ROADMAP_IDEA_MAX_LEN = 300
-
-
-def _load_roadmap_sync_module():
-    """Best-effort import of the roadmap-sync plugin's module via the SAME plugin loader/registry
-    the agent core uses (same enable/disable gate, same directory resolution). ``None`` on ANY
-    failure — the caller treats that as "roadmap unavailable" and degrades, never raises."""
-    try:
-        from hermes_cli.plugins import get_plugin_manager
-        loaded = get_plugin_manager()._plugins.get("roadmap-sync")
-        if loaded is None or not getattr(loaded, "enabled", False):
-            return None
-        return getattr(loaded, "module", None)
-    except Exception:
-        return None
 
 
 class RoadmapIdeaBody(BaseModel):
     text: str
     # Optional provenance when captured from an existing card. Validated against the CANONICAL
     # kanban task-id shape (``"t_" + 8 lowercase hex``) so provenance on a value that didn't come
-    # from the board is rejected with a 422; the plugin keeps its own broader allowlist for
-    # future non-HTTP callers.
+    # from the board is rejected with a 422.
     source_id: Optional[str] = Field(default=None, pattern=r"^t_[0-9a-f]{8}$")
 
 
 @router.post("/roadmap/idea")
 def append_roadmap_idea(payload: RoadmapIdeaBody, board: Optional[str] = Query(None)):
-    """Append one idea to the active board's roadmap ``## Ideas`` inbox. Never a 5xx for a
-    missing/misconfigured roadmap (fail-open): ``{"ok": true}`` or ``{"ok": false, "reason"}``.
-    Only the length pre-check lives here (a real 400 so a megabyte paste never reaches the writer);
-    empty text is left to the plugin's sanitizer so one place defines "empty" for every caller."""
-    text = payload.text or ""
-    if len(text) > _ROADMAP_IDEA_MAX_LEN:
+    """Capture one idea as an ``idea`` card on the active board. Never a 5xx (fail-open):
+    ``{"ok": true}`` or ``{"ok": false, "reason"}``. ``roadmap_unavailable`` now means only
+    "no board could be resolved". Empty text is rejected here (the card title cannot be blank);
+    the length pre-check stays a real 400 so a megabyte paste never reaches the DB."""
+    text = (payload.text or "").strip()
+    if len(payload.text or "") > _ROADMAP_IDEA_MAX_LEN:
         raise HTTPException(status_code=400, detail=f"idea text exceeds {_ROADMAP_IDEA_MAX_LEN} characters")
+    if not text:
+        return {"ok": False, "reason": "empty_idea"}
     slug = _resolve_board(board) or kanban_db.get_current_board()
-    module = _load_roadmap_sync_module()
-    if module is None:
+    if not slug:
         return {"ok": False, "reason": "roadmap_unavailable"}
+    # Provenance lives in the body, not the title: the title is what renders in the roadmap.
+    body = f"Captured from the dashboard idea inbox.\n\nSource card: {payload.source_id}" if payload.source_id else None
     try:
-        ok, reason = module.append_idea_for_board(slug, text, source_id=(payload.source_id or None))
+        with _board_conn(slug) as (_slug, conn):
+            kanban_db.create_task(
+                conn, title=text, body=body, created_by="dashboard", lane="idea", board=_slug)
     except Exception:
-        # Fail-open at the endpoint boundary too — a version mismatch with roadmap-sync must not 500.
+        # Fail-open at the endpoint boundary: a capture failure must never 500 the dialog.
         return {"ok": False, "reason": "roadmap_unavailable"}
-    return {"ok": bool(ok), "reason": None if ok else reason}
+    return {"ok": True, "reason": None}
 
 
 # --- Plugin config ----------------------------------------------------------

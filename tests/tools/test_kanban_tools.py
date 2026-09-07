@@ -1340,3 +1340,106 @@ def test_reviewer_escalates_via_real_kanban_block_tool(review_claim_env):
         assert resumed.status == "review"
     finally:
         conn.close()
+
+
+# ---------------------------------------------------------------------------
+# Roadmap lanes — kanban_create(lane=...) and the kanban_roadmap tool
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture
+def orchestrator_env(monkeypatch, tmp_path):
+    """An orchestrator profile: isolated HERMES_HOME, no HERMES_KANBAN_TASK, so the
+    orchestrator-gated lane tools are reachable."""
+    monkeypatch.delenv("HERMES_KANBAN_TASK", raising=False)
+    home = tmp_path / ".hermes"
+    home.mkdir()
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    monkeypatch.setenv("HERMES_PROFILE", "orchestrator")
+    monkeypatch.delenv("HERMES_SESSION_ID", raising=False)
+    from pathlib import Path as _P
+    monkeypatch.setattr(_P, "home", lambda: tmp_path)
+
+    from hermes_cli import kanban_db as kb
+    kb._INITIALIZED_PATHS.clear()
+    kb.init_db()
+    return home
+
+
+@pytest.mark.parametrize("lane", ["idea", "roadmap"])
+def test_tool_create_lane_needs_no_assignee(orchestrator_env, lane):
+    """A wishlist card never dispatches, so the tool drops the assignee requirement
+    that exists to stop work parking unassigned in ready forever."""
+    from tools import kanban_tools as kt
+    d = json.loads(kt._handle_create({"title": "wishlist item", "lane": lane}))
+    assert d["ok"] is True
+    assert d["status"] == lane
+
+    from hermes_cli import kanban_db as kb
+    from hermes_cli import kanban_db_connect as kbc
+    with kbc.connect_closing() as conn:
+        assert kb.get_task(conn, d["task_id"]).assignee is None
+
+
+def test_tool_create_still_requires_assignee_without_a_lane(orchestrator_env):
+    """The relaxation is scoped to lane cards — real work still needs an assignee."""
+    from tools import kanban_tools as kt
+    d = json.loads(kt._handle_create({"title": "real work"}))
+    assert d.get("ok") is not True
+    assert "assignee is required" in d.get("error", "")
+
+
+def test_tool_create_rejects_an_unknown_lane(orchestrator_env):
+    from tools import kanban_tools as kt
+    d = json.loads(kt._handle_create({"title": "x", "lane": "backlog"}))
+    assert d.get("ok") is not True
+    assert "lane must be" in d.get("error", "")
+
+
+def test_tool_roadmap_refine_demote_spawn(orchestrator_env):
+    """The action-style lane tool moves a card through both lanes and into triage."""
+    from tools import kanban_tools as kt
+    tid = json.loads(kt._handle_create({"title": "wish", "lane": "idea"}))["task_id"]
+
+    assert json.loads(kt._handle_roadmap({"task_id": tid, "action": "refine"}))["status"] == "roadmap"
+    assert json.loads(kt._handle_roadmap({"task_id": tid, "action": "demote"}))["status"] == "idea"
+    kt._handle_roadmap({"task_id": tid, "action": "refine"})
+    assert json.loads(kt._handle_roadmap({"task_id": tid, "action": "spawn"}))["status"] == "triage"
+
+
+def test_tool_roadmap_spawn_to_ready(orchestrator_env):
+    from tools import kanban_tools as kt
+    tid = json.loads(kt._handle_create({"title": "wish", "lane": "roadmap"}))["task_id"]
+    d = json.loads(kt._handle_roadmap({"task_id": tid, "action": "spawn", "to": "ready"}))
+    assert d["status"] == "ready"
+
+
+def test_tool_roadmap_refuses_live_work_and_says_why(orchestrator_env):
+    """A refused lane move surfaces the DB layer's from->to message as a tool error and
+    leaves the live card untouched."""
+    from tools import kanban_tools as kt
+    tid = json.loads(kt._handle_create({"title": "real work", "assignee": "peer"}))["task_id"]
+    d = json.loads(kt._handle_roadmap({"task_id": tid, "action": "refine"}))
+    assert d.get("ok") is not True
+    assert "-> 'roadmap'" in d.get("error", "")
+
+    from hermes_cli import kanban_db as kb
+    from hermes_cli import kanban_db_connect as kbc
+    with kbc.connect_closing() as conn:
+        assert kb.get_task(conn, tid).status == "ready"
+
+
+def test_tool_roadmap_is_orchestrator_only(worker_env):
+    """A dispatcher-spawned task worker must not be able to move wishlist cards."""
+    from hermes_cli import kanban_db as kb
+    from hermes_cli import kanban_db_connect as kbc
+    with kbc.connect_closing() as conn:
+        tid = kb.create_task(conn, title="wish", lane="idea")
+
+    from tools import kanban_tools as kt
+    d = json.loads(kt._handle_roadmap({"task_id": tid, "action": "refine"}))
+    assert d.get("ok") is not True
+    assert "orchestrator-only" in d.get("error", "") or "refusing to mutate" in d.get("error", "")
+
+    with kbc.connect_closing() as conn:
+        assert kb.get_task(conn, tid).status == "idea"
