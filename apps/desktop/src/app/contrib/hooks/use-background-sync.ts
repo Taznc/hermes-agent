@@ -7,7 +7,6 @@ import { preserveLocalAssistantErrors, sealOpenToolParts, toChatMessages } from 
 import { createClientSessionState } from '@/lib/chat-runtime'
 import { sessionMessagesSignature } from '@/lib/session-signatures'
 import { $changeEventsAvailable, $cronChangeTick, $sessionsChangeTick } from '@/store/live-sync'
-import { clearMcpAppCards } from '@/store/mcp-apps'
 import { $onBattery, batteryPollInterval } from '@/store/power'
 import { refreshActiveProfile } from '@/store/profile'
 import { refreshProjectTree } from '@/store/projects'
@@ -185,7 +184,6 @@ export async function reconcileTileTranscripts({
       signatureRef.current.set(signatureKey, signature)
       const messages = toChatMessages(latest.messages)
 
-      clearMcpAppCards(runtimeSessionId)
       updateSessionState(
         runtimeSessionId,
         state => ({
@@ -267,7 +265,6 @@ export async function reconcileActiveTranscript({
     signatureRef.current.set(signatureKey, signature)
     const messages = toChatMessages(latest.messages)
 
-    clearMcpAppCards(runtimeSessionId)
     updateSessionState(
       runtimeSessionId,
       state => ({
