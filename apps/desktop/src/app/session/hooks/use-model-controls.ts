@@ -13,12 +13,14 @@ import {
   $activeSessionId,
   $currentModel,
   $currentProvider,
+  $currentReasoningEffort,
   getComposerSelectionGeneration,
   getCurrentModelSource,
   markComposerSelectionManual,
   setCurrentModel,
   setCurrentModelSource,
-  setCurrentProvider
+  setCurrentProvider,
+  setCurrentReasoningEffort
 } from '@/store/session'
 import { $sessionStates, sessionTileDelegate } from '@/store/session-states'
 import type { ModelOptionsResponse } from '@/types/hermes'
@@ -34,6 +36,15 @@ interface ModelSwitchResponse {
   confirm_message?: string
   confirm_required?: boolean
   deferred?: boolean
+}
+
+export type ModelSelectionOutcome =
+  | { kind: 'applied' }
+  | { kind: 'confirmation_pending' }
+  | { kind: 'failed'; recovery: 'not_needed' | 'restore_failed' | 'restored' }
+
+export interface RecommendedModelSelection extends ModelSelection {
+  sessionId: null | string
 }
 
 export function useModelControls({
@@ -180,13 +191,9 @@ export function useModelControls({
     [cacheOwnerConnectionId, cacheProfile, queryClient]
   )
 
-  // Returns whether the switch was applied so callers can await it before
-  // applying follow-up changes. `true` means applied (or deferred/busy-queued
-  // for the next turn). `false` means NOT applied — either pending
-  // confirmation (warning with Confirm action already shown, pill rolled back)
-  // or a real failure (error toast). Callers must NOT treat `false` as a
-  // generic failure: for `pending` the gateway intentionally returned
-  // `confirm_required` and no error should be surfaced.
+  // The internal path returns a discriminated outcome so the recommendation
+  // surface can distinguish a pending confirmation from a real failure. The
+  // legacy `selectModel` adapter below preserves the model picker's boolean API.
   // The composer model is plain UI state: with no live session it's just
   // stored (and shipped on the next session.create); with one it's scoped to
   // that session via config.set. It NEVER writes the profile default — that
@@ -197,8 +204,8 @@ export function useModelControls({
   // primary `$activeSessionId` is used (overlay / legacy callers). A tile
   // switch must not touch the primary globals — and must not be blocked by a
   // busy primary turn.
-  const selectModel = useCallback(
-    async (selection: ModelSelection): Promise<boolean> => {
+  const selectModelWithOutcome = useCallback(
+    async (selection: ModelSelection, forceSessionScope = false): Promise<ModelSelectionOutcome> => {
       const primaryRuntimeId = $activeSessionId.get()
       const liveSessionId = 'sessionId' in selection ? (selection.sessionId ?? null) : primaryRuntimeId
       const touchesPrimary = !liveSessionId || liveSessionId === primaryRuntimeId
@@ -212,6 +219,21 @@ export function useModelControls({
       const prevSource = getCurrentModelSource()
       const liveGatewayProfile = cacheProfile || $activeGatewayProfile.get()
 
+      // >>> FORK ANCHOR: composer-model-recommendation <<<
+      // Effort snapshot for the SAME surface the model switch targets, so an
+      // optional effort rides the switch's own scoping and rollback.
+      const prevEffort = touchesPrimary
+        ? $currentReasoningEffort.get()
+        : ($sessionStates.get()[liveSessionId!]?.reasoningEffort ?? '')
+
+      const paintEffort = (effort: string) => {
+        if (touchesPrimary) {
+          setCurrentReasoningEffort(effort)
+        } else if (liveSessionId) {
+          sessionTileDelegate()?.updateSession(liveSessionId, state => ({ ...state, reasoningEffort: effort }))
+        }
+      }
+
       const paintSelection = () => {
         if (touchesPrimary) {
           setCurrentModel(selection.model)
@@ -224,6 +246,11 @@ export function useModelControls({
             model: selection.model,
             provider: selection.provider
           }))
+        }
+
+        // >>> FORK ANCHOR: composer-model-recommendation <<<
+        if (selection.effort !== undefined) {
+          paintEffort(selection.effort)
         }
       }
 
@@ -244,6 +271,11 @@ export function useModelControls({
           }))
         }
 
+        // >>> FORK ANCHOR: composer-model-recommendation <<<
+        if (selection.effort !== undefined) {
+          paintEffort(prevEffort)
+        }
+
         cacheSelection(prevProvider, prevModel)
       }
 
@@ -253,7 +285,7 @@ export function useModelControls({
       // No live session yet: the pick is pure UI state. session.create reads
       // $currentModel/$currentProvider and applies it as that session's override.
       if (!liveSessionId) {
-        return true
+        return { kind: 'applied' }
       }
 
       // The PRIMARY profile's main agent lets the gateway decide persistence
@@ -264,13 +296,15 @@ export function useModelControls({
       // no longer silently rewrites config.yaml (#90235); Settings → Model
       // remains the explicit "set as default" door.
       //
-      // Two things stay --session, deliberately:
+      // Three things stay --session, deliberately:
       //  - a SECONDARY chat tile: picking a model there must not rewrite the
       //    profile default (the cross-session-contamination guard).
       //  - MoA (mixture-of-agents) presets: a transient orchestration choice
       //    that must never become the persisted global gateway default.
+      //  - composer recommendations: advisory choices that are absolute
+      //    session overrides and must never alter profile defaults.
       const isSessionOnlyPreset = (selection.provider || '').toLowerCase() === 'moa'
-      const scope = touchesPrimary && !isSessionOnlyPreset ? '' : ' --session'
+      const scope = forceSessionScope || !touchesPrimary || isSessionOnlyPreset ? ' --session' : ''
 
       const requestSwitch = (confirmExpensiveModel = false) =>
         requestGateway<ModelSwitchResponse>('config.set', {
@@ -279,6 +313,51 @@ export function useModelControls({
           value: `${selection.model} --provider ${selection.provider}${scope}`,
           ...(confirmExpensiveModel ? { confirm_expensive_model: true } : {})
         })
+
+      // The gateway has no atomic model+effort method. If the model write wins
+      // and the effort write fails, restore the previous model with one bounded
+      // session-scoped compensation. The prior model already ran in this exact
+      // session, so confirming it cannot introduce a new expensive-model risk.
+      const restorePreviousModel = async (): Promise<boolean> => {
+        if (!prevModel || !prevProvider) {
+          return false
+        }
+
+        try {
+          const restored = await requestGateway<ModelSwitchResponse>('config.set', {
+            confirm_expensive_model: true,
+            key: 'model',
+            session_id: liveSessionId,
+            value: `${prevModel} --provider ${prevProvider} --session`
+          })
+
+          return !restored?.confirm_required
+        } catch {
+          return false
+        }
+      }
+
+      const paintAcceptedModelWithPreviousEffort = () => {
+        paintSelection()
+        paintEffort(prevEffort)
+        cacheSelection(selection.provider, selection.model)
+        void queryClient.invalidateQueries({
+          queryKey: modelOptionsQueryKey(liveGatewayProfile, liveSessionId, cacheOwnerConnectionId)
+        })
+      }
+
+      // >>> FORK ANCHOR: composer-model-recommendation <<<
+      // The effort half of a combined selection. Always session-scoped (that
+      // is what `config.set reasoning` with a session_id means) and always
+      // AFTER the model switch is accepted, so a rejected/confirm-pending
+      // switch never leaves the session on a new effort for an old model.
+      const requestEffort = async () => {
+        if (selection.effort === undefined) {
+          return
+        }
+
+        await requestGateway('config.set', { key: 'reasoning', session_id: liveSessionId, value: selection.effort })
+      }
 
       const finishSwitch = (result: ModelSwitchResponse | undefined) => {
         // A pick made DURING a turn is queued by the gateway and applied at the
@@ -298,6 +377,8 @@ export function useModelControls({
 
         if (result?.confirm_required) {
           rollbackSelection()
+          let confirmedRestoreFailed = false
+
           // ONE shared applier for guarded switches (#95293): the same
           // confirm flow the Bots editor routes through — never fork this
           // logic per surface.
@@ -322,16 +403,63 @@ export function useModelControls({
               paintSelection()
               cacheSelection(selection.provider, selection.model)
             },
-            requestConfirmed: () => requestSwitch(true),
-            rollback: rollbackSelection
+            requestConfirmed: async () => {
+              const confirmed = await requestSwitch(true)
+
+              // >>> FORK ANCHOR: composer-model-recommendation <<<
+              // Only once the guarded model is genuinely accepted. A second
+              // confirm_required is treated as a failure by the shared applier.
+              if (!confirmed?.confirm_required) {
+                try {
+                  await requestEffort()
+                } catch (err) {
+                  confirmedRestoreFailed = !(await restorePreviousModel())
+
+                  if (confirmedRestoreFailed) {
+                    paintAcceptedModelWithPreviousEffort()
+                  }
+
+                  throw err
+                }
+              }
+
+              return confirmed
+            },
+            rollback: () => {
+              if (!confirmedRestoreFailed) {
+                rollbackSelection()
+              }
+            }
           })
 
-          return false
+          return { kind: 'confirmation_pending' }
+        }
+
+        // >>> FORK ANCHOR: composer-model-recommendation <<<
+        // The model write already succeeded. If effort fails, restore the
+        // backend model too — repainting local atoms alone creates split-brain.
+        try {
+          await requestEffort()
+        } catch (err) {
+          const restored = await restorePreviousModel()
+
+          if (restored) {
+            rollbackSelection()
+          } else {
+            // Never repaint the old model and claim rollback when the gateway
+            // refused it. Keep the accepted model visible at the previous
+            // effort and trigger authoritative reconciliation.
+            paintAcceptedModelWithPreviousEffort()
+          }
+
+          notifyError(err, copy.modelSwitchFailed)
+
+          return { kind: 'failed', recovery: restored ? 'restored' : 'restore_failed' }
         }
 
         finishSwitch(result)
 
-        return true
+        return { kind: 'applied' }
       } catch (err) {
         // An OLDER gateway refuses a mid-turn switch outright (4009) instead of
         // deferring it. Don't punish the user for a backend they haven't
@@ -339,13 +467,13 @@ export function useModelControls({
         // what the NEXT turn runs anyway. Current gateways never take this
         // path — they answer `deferred`.
         if (isBusySessionModelSwitch(err)) {
-          return true
+          return { kind: 'applied' }
         }
 
         rollbackSelection()
         notifyError(err, copy.modelSwitchFailed)
 
-        return false
+        return { kind: 'failed', recovery: 'not_needed' }
       }
     },
     [
@@ -359,5 +487,16 @@ export function useModelControls({
     ]
   )
 
-  return { applySavedMainModel, refreshCurrentModel, selectModel }
+  const selectModel = useCallback(
+    async (selection: ModelSelection): Promise<boolean> =>
+      (await selectModelWithOutcome(selection)).kind === 'applied',
+    [selectModelWithOutcome]
+  )
+
+  const selectRecommendedModel = useCallback(
+    (selection: RecommendedModelSelection): Promise<ModelSelectionOutcome> => selectModelWithOutcome(selection, true),
+    [selectModelWithOutcome]
+  )
+
+  return { applySavedMainModel, refreshCurrentModel, selectModel, selectRecommendedModel }
 }

@@ -65,7 +65,47 @@ export const forkZh: ForkTranslations = {
     reconnectingBanner: '正在重新连接 Hermes — 你仍可以阅读和输入。',
     catchingUpNotice: '已重新连接 — 正在追上进度…',
     turnLostNotice: '此次对话在断线期间可能未完成。',
-    turnLostRegenerate: '重新生成'
+    turnLostRegenerate: '重新生成',
+    recommend: {
+      trigger: '推荐',
+      presetLabel: '推荐偏好',
+      presets: {
+        balanced: '均衡',
+        save_codex: '节省 Codex',
+        best_quality: '最佳质量'
+      },
+      presetDescriptions: {
+        balanced: '均衡：以合理成本获得良好效果。',
+        save_codex: '节省 Codex：优先选择其他路由，让 Codex 额度更持久。',
+        best_quality: '最佳质量：无论成本如何都选择最强路由。'
+      },
+      presetLoading: '正在加载你的偏好…',
+      presetUnsaved: '此后端未保存该设置 — 仅在本次会话生效。',
+      resultsLabel: '模型推荐',
+      privacy: '仅检查当前草稿与附件名称。对话历史、文件内容和项目文件都不会发送。',
+      pending: '正在检查…',
+      apply: '应用',
+      applyUnconfirmed: '尚未应用 — 请确认此切换，或手动选择模型。',
+      retry: '重试',
+      failed: '推荐检查失败。',
+      unavailable: '暂无可用推荐。请在设置中配置推荐路由以启用此功能。',
+      unsupported: '此 Hermes 后端不支持推荐功能。',
+      stale: '你的草稿已更改，这些推荐不再适用。',
+      refresh: '重新检查',
+      emptyDraft: '请先写下草稿，然后再检查。',
+      draftTooLong: '此草稿过长，无法检查。',
+      tooManyAttachments: '附件过多，无法检查（最多 32 个）。',
+      attachmentUnsupported: '附件名称过长，无法检查。',
+      availability: {
+        failed: '可用性检查失败',
+        fresh: '实时',
+        stale: '可用性数据已过期',
+        unavailable: '不可用',
+        unsupported: '可用性未知'
+      },
+      limitReached: '已达上限',
+      notAllowed: '你的方案不支持此路由'
+    }
   },
   assistant: {
     thread: {
