@@ -250,11 +250,50 @@ def test_auto_route_fails_closed_unless_resolution_avoids_paused_group(quota_hom
     assert _guard("default", auto_task) is None
 
 
+def test_auto_route_ignores_same_provider_group_for_unrelated_profile(quota_home, monkeypatch):
+    groups = {
+        "exhausted-implementer": {
+            "providers": ["openai-codex"],
+            "profiles": ["implementer"],
+        },
+        "healthy-implementer": {
+            "providers": ["anthropic"],
+            "profiles": ["implementer"],
+        },
+        "healthy-reviewer": {
+            "providers": ["anthropic"],
+            "profiles": ["reviewer"],
+        },
+    }
+    monkeypatch.setattr(kqc, "configured_budget_groups", lambda: groups)
+    auto_task = _task("default", profile="implementer", provider="auto")
+    kqc.register_quota_circuit(
+        "exhausted-implementer", retry_after=300, board="default", task_id=auto_task,
+        reason="rate_limit", max_seconds=3600, now=1_000,
+    )
+    monkeypatch.setattr(kqc.time, "time", lambda: 1_001)
+    monkeypatch.setattr(kqc, "predict_auto_provider", lambda _profile: "anthropic")
+
+    # The implementer's healthy Anthropic account is unambiguous within that
+    # profile. A reviewer's independent Anthropic account must not block it.
+    assert _guard("default", auto_task) is None
+    circuit = kqc.list_quota_circuits(now=1_001)
+    assert len(circuit) == 1
+    assert circuit[0]["state"] == "paused"
+
+
 def test_repeated_dispatch_ticks_never_start_auto_task_on_paused_provider(quota_home, monkeypatch):
     """End to end through ``dispatch_once``: an auto card whose profile keeps
     resolving to the exhausted provider is never spawned across many ticks,
     while a sibling auto card whose profile resolves elsewhere spawns."""
-    monkeypatch.setattr(kqc, "configured_budget_groups", lambda: BUDGET_GROUPS)
+    groups = {
+        **BUDGET_GROUPS,
+        "reviewer-backup-wallet": {
+            "providers": ["anthropic"],
+            "profiles": ["reviewer"],
+        },
+    }
+    monkeypatch.setattr(kqc, "configured_budget_groups", lambda: groups)
     monkeypatch.setattr(kbd, "_memory_pressure_level", lambda: "unknown")
     from hermes_cli import profiles
     monkeypatch.setattr(profiles, "profile_exists", lambda _name: True)

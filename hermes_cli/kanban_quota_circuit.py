@@ -554,11 +554,13 @@ def task_quota_guard(
         if provider == "auto":
             configured = configured_budget_groups()
             provider_groups: dict[str, list[str]] = {}
+            candidate_groups = set(groups)
             for raw_group, selectors in configured.items():
-                if not isinstance(selectors, Mapping):
+                group = str(raw_group).strip()
+                if group not in candidate_groups or not isinstance(selectors, Mapping):
                     continue
                 for candidate in _string_set(selectors.get("providers")) - {"*"}:
-                    provider_groups.setdefault(candidate, []).append(str(raw_group).strip())
+                    provider_groups.setdefault(candidate, []).append(group)
             reason, deferred_by = _auto_guard(
                 host, groups, provider_groups, profile, task_id, now, consume=consume_probe,
             )
