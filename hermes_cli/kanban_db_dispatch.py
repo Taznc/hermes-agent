@@ -2269,11 +2269,14 @@ def resume_dispatch(board: Optional[str] = None) -> dict[str, Any]:
             }
         path = _dispatch_pause_path(board)
         previous = read_dispatch_pause(board)
+        # Clear SQLite first. A JSON-only circuit must remain authoritative if
+        # fallback cleanup fails; unlinking it first would silently re-arm the
+        # next tick even though this explicit recovery returned an error.
+        # Conversely, if the later unlink fails, the JSON sentinel still
+        # fences dispatch. Both stores are cleared under the board lock.
+        clear_pause(db_path)
         with contextlib.suppress(FileNotFoundError):
             path.unlink()
-        # Clear SQLite last: if this fails, the durable fallback still fences
-        # the next tick. Both stores are cleared under the board lock.
-        clear_pause(db_path)
     return {"was_paused": previous is not None, "previous": previous, "resumed": True}
 
 

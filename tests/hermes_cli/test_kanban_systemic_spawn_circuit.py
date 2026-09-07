@@ -356,6 +356,45 @@ print(json.dumps(result.dispatch_paused))
     assert len(repaired.spawned) == 1
 
 
+def test_json_only_pause_survives_failed_sqlite_clear(
+    kanban_home, all_assignees_spawnable, monkeypatch,
+):
+    """A failed explicit resume must retain the sole authoritative sentinel."""
+    from hermes_cli import kanban_db_dispatch_circuit as circuit
+
+    board = "json-only-failed-resume"
+    state = kbd._write_dispatch_pause(
+        board,
+        "restart_safe_scope_unavailable",
+        fault_code="systemd_user_scope_unavailable",
+        recovery="repair then explicitly resume",
+    )
+    with kbc.connect_closing(board=board) as conn:
+        task_id = kb.create_task(conn, title="must remain queued", assignee="worker")
+        conn.commit()
+
+    def fail_clear(_db_path):
+        raise OSError("simulated SQLite recovery write failure")
+
+    monkeypatch.setattr(circuit, "clear_pause", fail_clear)
+    with pytest.raises(OSError, match="simulated SQLite recovery write failure"):
+        kbd.resume_dispatch(board)
+
+    assert kbd.read_dispatch_pause(board) == state
+    with kbc.connect_closing(board=board) as conn:
+        stopped = kbd.dispatch_once(
+            conn,
+            board=board,
+            spawn_fn=lambda *_a, **_k: pytest.fail("failed resume must not re-arm dispatch"),
+        )
+        task = kb.get_task(conn, task_id)
+
+    assert stopped.dispatch_paused == state
+    assert task is not None
+    assert task.status == "ready"
+    assert task.consecutive_failures == 0
+
+
 def test_sqlite_fallback_cannot_be_resumed_by_corruption_or_failed_delete(
     kanban_home, all_assignees_spawnable, monkeypatch,
 ):
