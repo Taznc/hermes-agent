@@ -16,6 +16,8 @@
  */
 
 import {
+  $paneWidthOverride,
+  cn,
   Codicon,
   Dialog,
   DialogContent,
@@ -27,12 +29,13 @@ import {
   ErrorState,
   host,
   Loader,
+  setPaneWidthOverride,
   useMutation,
   useQuery,
   useQueryClient,
   useValue
 } from '@hermes/plugin-sdk'
-import { useEffect, useMemo, useState } from 'react'
+import { type PointerEvent as ReactPointerEvent, useEffect, useMemo, useState } from 'react'
 
 import {
   $boardSlug,
@@ -111,6 +114,29 @@ type TabId = 'activity' | 'log' | 'overview'
  */
 const FOCUS_COMMENT_ATTEMPTS = 10
 
+/**
+ * Drawer width sash. The Log tab carries raw shell output, and 26rem wraps it
+ * to shreds — so the drawer's left edge is a drag handle, the same interaction
+ * the shell's column seam and the docked detail pane already use, persisted
+ * through the same pane store so a width chosen once survives reopens and
+ * restarts. Drag geometry is inverted from the shell's rail: this drawer is
+ * anchored right, so pulling LEFT widens it.
+ */
+const DRAWER_PANE_ID = 'kanban.taskDrawer'
+/** The authored 26rem default, in px — the width the class paints when no
+ *  override is stored, and the drag's starting point on a first drag. */
+const DRAWER_DEFAULT_WIDTH_PX = 416
+const DRAWER_MIN_WIDTH_PX = 384
+const DRAWER_MAX_VW = 0.68
+
+/** Clamp to [24rem, 68vw], with the ceiling floored at the minimum so a window
+ *  narrower than 24rem can't invert the range and pin the drawer to a sliver. */
+function clampDrawerWidth(px: number) {
+  const max = Math.max(DRAWER_MIN_WIDTH_PX, Math.round(window.innerWidth * DRAWER_MAX_VW))
+
+  return Math.min(max, Math.max(DRAWER_MIN_WIDTH_PX, Math.round(px)))
+}
+
 function focusCommentInput(attemptsLeft = FOCUS_COMMENT_ATTEMPTS): void {
   const el = document.querySelector<HTMLElement>('[data-kanban-comment-input="true"]')
 
@@ -151,6 +177,39 @@ export function TaskDrawer({
   // Tab selection is pure presentation and belongs to this component — a
   // global store would make one drawer's tab leak into the next card.
   const [tab, setTab] = useState<TabId>('overview')
+  // Drawer width: persisted override (undefined = the authored w-[26rem]).
+  const widthOverride = useValue($paneWidthOverride(DRAWER_PANE_ID))
+  const [resizing, setResizing] = useState(false)
+
+  const startResize = (event: ReactPointerEvent<HTMLDivElement>) => {
+    if (event.button !== 0) {
+      return
+    }
+
+    event.preventDefault()
+    const startX = event.clientX
+    const startWidth = widthOverride ?? DRAWER_DEFAULT_WIDTH_PX
+    setResizing(true)
+
+    // Right-anchored: leftward pointer travel is negative dx but MORE width.
+    const onMove = (move: globalThis.PointerEvent) =>
+      setPaneWidthOverride(DRAWER_PANE_ID, clampDrawerWidth(startWidth + (startX - move.clientX)))
+
+    // Same teardown contract as the shell's sashes: pointercancel (window
+    // drag-out, touch cancel, system gesture) ends the drag exactly like
+    // pointerup, with explicit cross-removal of both — `{ once: true }`
+    // wouldn't remove the sibling path.
+    const onUp = () => {
+      window.removeEventListener('pointermove', onMove)
+      window.removeEventListener('pointerup', onUp)
+      window.removeEventListener('pointercancel', onUp)
+      setResizing(false)
+    }
+
+    window.addEventListener('pointermove', onMove)
+    window.addEventListener('pointerup', onUp)
+    window.addEventListener('pointercancel', onUp)
+  }
 
   // Socket-invalidated (bindApi); the interval is only the socketless heartbeat.
   const { data: detail, error } = useQuery({
@@ -329,7 +388,26 @@ export function TaskDrawer({
   }
 
   return (
-    <div className="absolute inset-y-0 right-0 z-20 flex w-[26rem] flex-col border-l border-(--ui-stroke-tertiary) bg-(--ui-bg-elevated) duration-150 ease-out animate-in fade-in slide-in-from-right-4">
+    <div
+      className="absolute inset-y-0 right-0 z-20 flex w-[26rem] flex-col border-l border-(--ui-stroke-tertiary) bg-(--ui-bg-elevated) duration-150 ease-out animate-in fade-in slide-in-from-right-4"
+      style={widthOverride !== undefined ? { width: `${widthOverride}px` } : undefined}
+    >
+      {/* Left-edge drag sash — widen the drawer to read the Log tab, double-
+          click to fall back to the authored 26rem. */}
+      <div
+        className="group/vsash absolute inset-y-0 left-0 z-10 w-1 -translate-x-1/2 cursor-col-resize"
+        data-kanban-drawer-sash="true"
+        onDoubleClick={() => setPaneWidthOverride(DRAWER_PANE_ID, undefined)}
+        onPointerDown={startResize}
+      >
+        <div
+          className={cn(
+            'absolute inset-y-0 left-1/2 w-px -translate-x-1/2 transition-colors',
+            resizing ? 'bg-(--ui-stroke-secondary)' : 'group-hover/vsash:bg-(--ui-stroke-secondary)'
+          )}
+        />
+      </div>
+
       {/* Status-colored header band — the card's state is the first thing the
           eye lands on, and it's the same tone the board's column uses. */}
       <header
