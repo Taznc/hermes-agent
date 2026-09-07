@@ -131,8 +131,14 @@ def _availability_payload(providers: set[str]) -> dict[str, dict[str, Any]]:
 def discover_eligible_candidates() -> list[dict[str, Any]]:
     """Return validated configured/authenticated inventory routes, never credentials."""
     from hermes_cli.inventory import build_model_options_payload, load_picker_context
+    from hermes_cli.providers import HERMES_OVERLAYS
 
-    payload = build_model_options_payload(load_picker_context(), explicit_only=True)
+    context = load_picker_context()
+    payload = build_model_options_payload(context, explicit_only=True)
+    configured_providers = {
+        str(provider).strip().lower() for provider in context.user_providers
+        if str(provider).strip()
+    }
     candidates: list[dict[str, Any]] = []
     for row in payload.get("providers") or []:
         if not isinstance(row, dict) or row.get("authenticated") is not True:
@@ -140,10 +146,18 @@ def discover_eligible_candidates() -> list[dict[str, Any]]:
         provider = str(row.get("slug") or "").strip().lower()
         if not provider or provider == "moa":
             continue
+        # The Desktop picker permits zero-setup/keyless rows, but an advisory router must only
+        # assess a provider the profile explicitly configured.
+        if getattr(HERMES_OVERLAYS.get(provider), "keyless", False) and provider not in configured_providers:
+            continue
+        unavailable_models = {
+            model for model in (row.get("unavailable_models") or [])
+            if isinstance(model, str)
+        }
         capabilities = row.get("capabilities") if isinstance(row.get("capabilities"), dict) else {}
         pricing = row.get("pricing") if isinstance(row.get("pricing"), dict) else {}
         for model in row.get("models") or []:
-            if not isinstance(model, str) or not model.strip():
+            if not isinstance(model, str) or not model.strip() or model in unavailable_models:
                 continue
             caps = capabilities.get(model) if isinstance(capabilities.get(model), dict) else {}
             price = pricing.get(model) if isinstance(pricing.get(model), dict) else {}
@@ -216,7 +230,7 @@ def _parse_router_output(raw: str, candidates: list[dict[str, Any]]) -> dict[str
         if (not isinstance(provider, str) or not isinstance(model, str) or provider in seen
                 or (provider, model) not in routes or effort not in EFFORTS
                 or not isinstance(item.get("reason"), str) or len(item["reason"]) > 240
-                or not isinstance(item.get("quality"), int) or not 0 <= item["quality"] <= 100
+                or type(item.get("quality")) is not int or not 0 <= item["quality"] <= 100
                 or not isinstance(item.get("materially_advantageous"), bool)):
             return None
         candidate = routes[(provider, model)]

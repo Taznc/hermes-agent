@@ -1,6 +1,9 @@
 from __future__ import annotations
 
 from datetime import datetime, timedelta, timezone
+import json
+from pathlib import Path
+import threading
 from types import SimpleNamespace
 
 from agent.account_usage import AccountUsageSnapshot
@@ -113,6 +116,70 @@ def test_gateway_transport_binds_the_requested_profile_home(monkeypatch, tmp_pat
     assert seen["home"] == profile_home
 
 
+def test_gateway_dispatch_uses_temporary_profile_config_and_real_candidate_discovery(monkeypatch, tmp_path):
+    profile_home = tmp_path / ".hermes" / "profiles" / "draft-review"
+    profile_home.mkdir(parents=True)
+    (profile_home / "config.yaml").write_text(
+        "providers:\n"
+        "  anthropic:\n"
+        "    models: [profile-only-test-model]\n"
+        "auxiliary:\n"
+        "  model_recommendation:\n"
+        "    provider: anthropic\n"
+        "    model: claude-3-5-haiku-latest\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(Path, "home", lambda: tmp_path)
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / ".hermes"))
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "test-only-key")
+    captured = []
+
+    def router_response(_router, messages):
+        captured.extend(messages)
+        request = json.loads(messages[1]["content"])
+        selected = {}
+        for candidate in request["candidates"]:
+            selected.setdefault(candidate["provider"], candidate)
+        return json.dumps({
+            "task_risk": "low", "ambiguous": False,
+            "recommendations": [{
+                "provider": candidate["provider"], "model": candidate["model"], "effort": "none",
+                "reason": "Adequate", "quality": 50, "materially_advantageous": False,
+            } for candidate in selected.values()],
+        })
+
+    monkeypatch.setattr(service, "_run_router_once", router_response)
+
+    class RecordingTransport:
+        def __init__(self):
+            self.responses = []
+            self.done = threading.Event()
+
+        def write(self, response):
+            self.responses.append(response)
+            self.done.set()
+            return True
+
+        def close(self):
+            return None
+
+    transport = RecordingTransport()
+    assert srv.dispatch({
+        "id": "profile-transport", "method": "model_recommendation.get",
+        "params": {"profile": "draft-review", "draft": "Assess this draft", "attachments": []},
+    }, transport=transport) is None
+    assert transport.done.wait(timeout=5)
+
+    assert transport.responses[0]["result"]["status"] == "ok", transport.responses
+    candidate_routes = {(candidate["provider"], candidate["model"])
+                        for candidate in json.loads(captured[1]["content"])["candidates"]}
+    assert {provider for provider, _model in candidate_routes} == {"anthropic"}
+    assert ("anthropic", "profile-only-test-model") in candidate_routes
+    providers = [item["provider"] for item in transport.responses[0]["result"]["recommendations"]]
+    assert "anthropic" in providers
+    assert "Assess this draft" in captured[1]["content"]
+
+
 def test_invalid_router_configuration_is_explicitly_unavailable(monkeypatch):
     monkeypatch.setattr(
         "hermes_cli.config.load_config",
@@ -123,7 +190,7 @@ def test_invalid_router_configuration_is_explicitly_unavailable(monkeypatch):
 
 
 def test_candidate_discovery_filters_to_authenticated_configured_routes(monkeypatch):
-    monkeypatch.setattr("hermes_cli.inventory.load_picker_context", lambda: object())
+    monkeypatch.setattr("hermes_cli.inventory.load_picker_context", lambda: SimpleNamespace(user_providers={}))
     monkeypatch.setattr(
         "hermes_cli.inventory.build_model_options_payload",
         lambda *_args, **_kwargs: {
@@ -143,15 +210,33 @@ def test_candidate_discovery_filters_to_authenticated_configured_routes(monkeypa
     }]
 
 
+def test_candidate_discovery_excludes_models_marked_unavailable_by_inventory(monkeypatch):
+    monkeypatch.setattr("hermes_cli.inventory.load_picker_context", lambda: SimpleNamespace(user_providers={}))
+    monkeypatch.setattr(
+        "hermes_cli.inventory.build_model_options_payload",
+        lambda *_args, **_kwargs: {
+            "providers": [{
+                "slug": "anthropic", "authenticated": True,
+                "models": ["available", "locked"], "unavailable_models": ["locked"],
+                "capabilities": {"available": {"reasoning": True}, "locked": {"reasoning": True}},
+            }],
+        },
+    )
+
+    assert [candidate["model"] for candidate in service.discover_eligible_candidates()] == ["available"]
+
+
 def test_policy_presets_rank_the_same_eligible_routes_differently():
-    parsed = service._parse_router_output(_router_output(), CANDIDATES)
+    candidates = [{**candidate, "cost": "paid_or_unknown"} for candidate in CANDIDATES]
+    candidates[1]["cost"] = "free"
+    parsed = service._parse_router_output(_router_output(), candidates)
     assert parsed is not None
 
     balanced = service.rank_recommendations(parsed, {}, "balanced")
     save_codex = service.rank_recommendations(parsed, {}, "save_codex")
     best_quality = service.rank_recommendations(parsed, {}, "best_quality")
 
-    assert balanced[0]["provider"] == "anthropic"
+    assert balanced[0]["provider"] == "openai-codex"
     assert save_codex[0]["provider"] == "anthropic"
     assert best_quality[0]["provider"] == "openai-codex"
 
@@ -186,6 +271,24 @@ def test_router_is_a_single_direct_call_with_strict_structured_output(monkeypatc
     assert calls[0]["response_format"]["json_schema"]["strict"] is True
 
 
+def test_codex_adapter_translates_router_schema_to_responses_output_format():
+    from agent.auxiliary_client import _CodexCompletionsAdapter
+
+    adapter = _CodexCompletionsAdapter(SimpleNamespace(base_url="https://api.openai.com/v1"), "gpt-5.3-codex")
+    responses_kwargs, _model, _timeout = adapter._build_responses_kwargs({
+        "model": "gpt-5.3-codex",
+        "messages": [{"role": "system", "content": "Return JSON"}, {"role": "user", "content": "Draft"}],
+        "response_format": {"type": "json_schema", "json_schema": service._OUTPUT_SCHEMA},
+    })
+
+    assert responses_kwargs["text"]["format"] == {
+        "type": "json_schema",
+        "name": "model_recommendations",
+        "schema": service._OUTPUT_SCHEMA["schema"],
+        "strict": True,
+    }
+
+
 def test_malformed_router_output_fails_closed(monkeypatch):
     _configure_router(monkeypatch, output='{"recommendations": []}')
 
@@ -196,6 +299,12 @@ def test_malformed_router_output_fails_closed(monkeypatch):
         "reason": "Model recommendation router returned invalid structured output.",
         "recommendations": [],
     }
+
+
+def test_router_output_with_boolean_quality_fails_closed():
+    invalid = _router_output().replace('"quality":60', '"quality":true')
+
+    assert service._parse_router_output(invalid, CANDIDATES) is None
 
 
 def test_router_input_contains_draft_and_safe_attachment_metadata_only(monkeypatch):
