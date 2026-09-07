@@ -4035,6 +4035,54 @@ def _interrupt_agent_for_signal(agent, signum) -> None:
         pass  # never block signal handling
 
 
+def _kanban_worker_result_exit_code(cli: "HermesCLI", result: Any) -> int:
+    """Publish one Kanban turn result and return its automation exit code."""
+    task_id = (os.environ.get("HERMES_KANBAN_TASK") or "").strip()
+    quota_retry_after = None
+    quota_published = False
+    if task_id:
+        try:
+            from hermes_cli.kanban_quota_circuit import (
+                publish_worker_quota_result,
+                quota_result_retry_after_seconds,
+            )
+
+            quota_retry_after = quota_result_retry_after_seconds(result)
+            quota_published = publish_worker_quota_result(
+                result,
+                task_id=task_id,
+                board=os.environ.get("HERMES_KANBAN_BOARD"),
+                provider=getattr(cli.agent, "provider", None),
+            ) is not None
+        except Exception as exc:
+            logger.debug("host quota circuit publication failed: %s", exc)
+
+    if not isinstance(result, Mapping) or not result.get("failed"):
+        return 0
+    if task_id and result.get("failure_reason") in ("rate_limit", "billing"):
+        # This run-scoped marker lets the reaper distinguish a validated
+        # deadline (neutral EX_TEMPFAIL) from a missing/malformed one (bounded
+        # infra interruption). It intentionally reuses the host publisher's
+        # structured-result parser instead of classifying error prose here.
+        if quota_published:
+            # Run-scoped, non-secret acknowledgement consumed by the reaper.
+            # It prevents the same observation being republished from the
+            # configured task route after the worker published its actual
+            # fallback provider.
+            print("host quota circuit published.", file=sys.stderr)
+        if quota_retry_after is None:
+            print("quota exhausted (429); retry deadline missing or malformed.", file=sys.stderr)
+        else:
+            print(f"quota exhausted (429); retry after {quota_retry_after}s.", file=sys.stderr)
+        try:
+            from hermes_cli.kanban_db import KANBAN_RATE_LIMIT_EXIT_CODE
+
+            return KANBAN_RATE_LIMIT_EXIT_CODE
+        except Exception:
+            pass
+    return 1
+
+
 def _run_kanban_goal_loop_q(cli: "HermesCLI", first_response: str) -> None:
     """Drive a kanban goal_mode worker through ``goals.run_kanban_goal_loop`` after its first turn.
 
@@ -4065,9 +4113,16 @@ def _run_kanban_goal_loop_q(cli: "HermesCLI", first_response: str) -> None:
     def _run_turn(prompt: str) -> str:
         result = cli.agent.run_conversation(user_message=prompt, conversation_history=cli.conversation_history)
         _sync_cli_session_id_from_agent(cli)
-        resp = result.get("final_response", "") if isinstance(result, dict) else str(result)
+        exit_code = _kanban_worker_result_exit_code(cli, result)
+        resp = result.get("final_response", "") if isinstance(result, Mapping) else str(result)
         if resp:
             print(resp)
+        if exit_code:
+            if not resp and isinstance(result, Mapping) and result.get("error"):
+                print(f"Error: {result['error']}", file=sys.stderr)
+            # SystemExit is deliberately not caught by goals.run_kanban_goal_loop's
+            # Exception boundary: a terminal model failure must stop continuations.
+            raise SystemExit(exit_code)
         return resp or ""
 
     def _task_status() -> "str | None":
@@ -4102,11 +4157,15 @@ def _run_quiet_single_query(cli, effective_query):
     # The exit line below reports session_id to stderr for automation wrappers;
     # without this sync it would point at the ended parent after compression.
     _sync_cli_session_id_from_agent(cli)
-    response = result.get("final_response", "") if isinstance(result, dict) else str(result)
+    response = result.get("final_response", "") if isinstance(result, Mapping) else str(result)
+    # Every Kanban turn, including goal-mode continuations, uses this same
+    # publication and exit-code path.  Publication happens before EX_TEMPFAIL
+    # so a sibling board can observe the host circuit before its next start.
+    _exit_code = _kanban_worker_result_exit_code(cli, result)
     # Surface backend errors that produced no visible output (e.g. invalid model slug
     # -> provider 4xx) on stderr so piped stdout stays clean.
     if (
-        not response and isinstance(result, dict) and result.get("error")
+        not response and isinstance(result, Mapping) and result.get("error")
         and (result.get("failed") or result.get("partial"))
     ):
         print(f"Error: {result['error']}", file=sys.stderr)
@@ -4115,9 +4174,13 @@ def _run_quiet_single_query(cli, effective_query):
 
     # Kanban goal_mode: keep working in THIS session until a judge agrees the card is
     # done, the worker terminates it, or the turn budget runs out (sticky block).
-    if os.environ.get("HERMES_KANBAN_GOAL_MODE") == "1":
+    if _exit_code == 0 and os.environ.get("HERMES_KANBAN_GOAL_MODE") == "1":
         try:
             _run_kanban_goal_loop_q(cli, response)
+        except SystemExit as _goal_exit:
+            # A continuation hit a terminal model failure. Preserve the quiet
+            # wrapper's session-id footer, then exit with that turn's code.
+            _exit_code = _int_or(_goal_exit.code, 1)
         except Exception as _goal_exc:
             logger.debug("kanban goal loop failed: %s", _goal_exc)
 
@@ -4126,15 +4189,6 @@ def _run_quiet_single_query(cli, effective_query):
     # Exit code 0/1 for automation wrappers. Kanban workers that failed purely on
     # rate-limit/billing exit with the EX_TEMPFAIL sentinel so the dispatcher releases
     # the task without counting a failure (a quota window must not trip the breaker).
-    _exit_code = 0
-    if isinstance(result, dict) and result.get("failed"):
-        _exit_code = 1
-        if os.environ.get("HERMES_KANBAN_TASK") and result.get("failure_reason") in ("rate_limit", "billing"):
-            try:
-                from hermes_cli.kanban_db import KANBAN_RATE_LIMIT_EXIT_CODE as _RL_CODE
-                _exit_code = _RL_CODE
-            except Exception:
-                _exit_code = 1
     sys.exit(_exit_code)
 
 

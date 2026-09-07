@@ -1504,6 +1504,37 @@
   color: #ff8b6b;
   border: 1px solid rgba(255, 107, 61, 0.3);
 }
+/* ---- Host quota circuit --------------------------------------------- */
+.hermes-kanban-quota-circuits {
+  display: flex;
+  flex-direction: column;
+  gap: 0.45rem;
+  padding: 0.7rem 0.85rem;
+  border: 1px solid rgba(255, 158, 59, 0.45);
+  border-radius: var(--radius);
+  background: rgba(255, 158, 59, 0.09);
+  color: var(--color-foreground);
+  font-size: 0.75rem;
+}
+.hermes-kanban-quota-title { font-weight: 700; }
+.hermes-kanban-quota-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.75rem;
+}
+.hermes-kanban-quota-detail { line-height: 1.45; }
+.hermes-kanban-quota-clear {
+  flex: 0 0 auto;
+  padding: 0.25rem 0.6rem;
+  border: 1px solid rgba(255, 158, 59, 0.5);
+  border-radius: 0.3rem;
+  background: rgba(255, 158, 59, 0.15);
+  cursor: pointer;
+}
+.hermes-kanban-quota-clear:hover { background: rgba(255, 158, 59, 0.25); }
+.hermes-kanban-quota-message { color: var(--color-muted-foreground); }
+
 /* ---- Partial failure highlight --------------------------------------- */
 .hermes-kanban-card--failed :where(.hermes-kanban-card-content) {
   box-shadow: 0 0 0 2px var(--color-destructive, #d14a4a) inset,
