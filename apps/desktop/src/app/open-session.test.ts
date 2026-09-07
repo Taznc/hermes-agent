@@ -128,13 +128,13 @@ describe('openSession', () => {
     expect(navigate).toHaveBeenCalledWith('/c/s1')
   })
 
-  it('in-place routes away from a full page when it fronts an already-open tile', () => {
+  it('in-place clears a full page while preserving an already-open tile', () => {
     focusOpenSession.mockReturnValue('tile')
     workspaceIsPageGet.mockReturnValue(true)
 
     openSession('s1', navigate)
 
-    expect(navigate).toHaveBeenCalledWith('/c/s1')
+    expect(navigate).toHaveBeenCalledWith('/c/s1', { state: { preserveSessionTile: true } })
     expect(openSessionTile).not.toHaveBeenCalled()
   })
 
