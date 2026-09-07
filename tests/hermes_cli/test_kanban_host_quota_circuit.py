@@ -381,6 +381,42 @@ def test_repeated_dispatch_ticks_never_start_auto_task_on_paused_provider(quota_
     assert spawned.count(healthy) == 4
 
 
+@pytest.mark.parametrize(
+    ("paused_group", "expected_guard"),
+    [
+        ("primary-wallet", "host_quota_circuit"),
+        ("backup-wallet", None),
+    ],
+    ids=("actual-auto-provider-paused", "profile-provider-paused"),
+)
+def test_auto_prediction_matches_explicit_auto_passed_to_worker(
+    quota_home, monkeypatch, paused_group, expected_guard,
+):
+    """The admission prediction must resolve the explicit ``--provider auto``
+    argument used by the worker, not the profile's configured provider."""
+    from hermes_cli import auth, runtime_provider
+
+    monkeypatch.setattr(kqc, "configured_budget_groups", lambda: BUDGET_GROUPS)
+    (quota_home / "profiles" / "implementer").mkdir(parents=True)
+    auto_task = _task("default", profile="implementer", provider="auto")
+    kqc.register_quota_circuit(
+        paused_group, retry_after=300, board="default", task_id=auto_task,
+        reason="rate_limit", max_seconds=3_600, now=1_000,
+    )
+    monkeypatch.setattr(kqc.time, "time", lambda: 1_001)
+    requested_args: list[object] = []
+
+    def resolve_requested(requested=None):
+        requested_args.append(requested)
+        return "auto" if requested == "auto" else "anthropic"
+
+    monkeypatch.setattr(runtime_provider, "resolve_requested_provider", resolve_requested)
+    monkeypatch.setattr(auth, "resolve_provider", lambda requested: "openai-codex")
+
+    assert _guard("default", auto_task) == expected_guard
+    assert requested_args == ["auto"]
+
+
 def test_auto_prediction_runs_resolver_under_profile_home(quota_home, monkeypatch):
     monkeypatch.delenv("HERMES_INFERENCE_PROVIDER", raising=False)
     (quota_home / "profiles" / "implementer").mkdir(parents=True)
@@ -397,13 +433,16 @@ def test_auto_prediction_runs_resolver_under_profile_home(quota_home, monkeypatc
     assert kqc.predict_auto_provider("implementer") == "anthropic"
     assert seen == [str(quota_home / "profiles" / "implementer")]
 
-    # A profile whose config pins model.provider is resolved from that config,
-    # exactly as the worker's own startup does.
+    # An explicit ``provider=auto`` worker request deliberately bypasses a
+    # profile's configured provider, exactly like the dispatch argv.
     pinned_home = quota_home / "profiles" / "pinned"
     pinned_home.mkdir(parents=True)
     (pinned_home / "config.yaml").write_text("model:\n  provider: openai-codex\n", encoding="utf-8")
-    assert kqc.predict_auto_provider("pinned") == "openai-codex"
-    assert len(seen) == 1
+    assert kqc.predict_auto_provider("pinned") == "anthropic"
+    assert seen == [
+        str(quota_home / "profiles" / "implementer"),
+        str(quota_home / "profiles" / "pinned"),
+    ]
 
     def broken(requested=None, **_kw):
         raise RuntimeError("no provider configured")
@@ -581,12 +620,12 @@ def test_goal_mode_turn_two_quota_publishes_and_exits_tempfail(
     [{}, {"reset_at": "not-a-deadline", "retry_after_seconds": "30"}],
     ids=("missing", "malformed"),
 )
-def test_machine_quota_without_valid_deadline_uses_bounded_interruption_policy(
+def test_machine_quota_without_valid_deadline_clears_stale_quota_error_and_uses_bounded_policy(
     quota_home, monkeypatch, deadline_fields,
 ):
     """A structured quota failure without a usable deadline may interrupt a
-    few runs, but it must eventually reach the existing infra-interruption
-    breaker instead of remaining an indefinitely neutral EX_TEMPFAIL loop."""
+    few runs, but it must clear stale quota guard text and eventually reach the
+    existing infra-interruption breaker instead of looping forever."""
     import cli as cli_module
 
     monkeypatch.setattr(kqc, "configured_budget_groups", lambda: BUDGET_GROUPS)
@@ -607,6 +646,13 @@ def test_machine_quota_without_valid_deadline_uses_bounded_interruption_policy(
 
     with kbc.connect(board="default") as conn:
         host = kb._claimer_id().split(":", 1)[0]
+        with kb.write_txn(conn):
+            conn.execute(
+                "UPDATE tasks SET last_failure_error=? WHERE id=?",
+                ("pid 93399 exited rate-limited (quota wall) — requeued", task_id),
+            )
+        assert kbd.check_respawn_guard(conn, task_id, board="default") == "blocker_auth"
+
         for attempt, pid in enumerate((93400, 93401, 93402), start=1):
             claimed = kb.claim_task(conn, task_id, claimer=f"{host}:w{attempt}")
             assert claimed is not None
@@ -631,6 +677,7 @@ def test_machine_quota_without_valid_deadline_uses_bounded_interruption_policy(
                 assert task.status == "ready"
                 assert task.consecutive_failures == 0
                 assert kb.read_interruption_streak(conn, task_id=task_id) == attempt
+                assert kbd.check_respawn_guard(conn, task_id, board="default") is None
             else:
                 assert crashed == [task_id]
                 assert task.status == "blocked"
@@ -683,6 +730,62 @@ def test_machine_readable_tempfail_opens_host_circuit_without_failure_budget(
         assert current is not None and current.consecutive_failures == 0
         assert kb.read_interruption_streak(conn, task_id=task_id) == 0
     assert len(kqc.list_quota_circuits(now=8_001)) == 1
+
+
+def test_worker_quota_observation_is_not_republished_by_reaper(
+    quota_home, monkeypatch,
+):
+    """A worker's actual-provider publication is authoritative for its run;
+    reaping the same EX_TEMPFAIL must not extend or double-count it."""
+    import cli as cli_module
+
+    monkeypatch.setattr(kqc, "configured_budget_groups", lambda: BUDGET_GROUPS)
+    monkeypatch.setattr(kbd, "_pid_alive", lambda _pid: False)
+    monkeypatch.setenv("HERMES_KANBAN_CRASH_GRACE_SECONDS", "0")
+    monkeypatch.setattr(kqc.time, "time", lambda: 1_000)
+    with kbc.connect(board="default") as conn:
+        task_id = kb.create_task(
+            conn,
+            title="single quota observation",
+            assignee="implementer",
+            model_override="test-model",
+            provider_override="openai-codex",
+        )
+        task = kb.claim_task(conn, task_id)
+        assert task is not None
+        with kb.write_txn(conn):
+            conn.execute("UPDATE tasks SET worker_pid=? WHERE id=?", (91235, task_id))
+        monkeypatch.setenv("HERMES_KANBAN_TASK", task_id)
+        monkeypatch.setenv("HERMES_KANBAN_BOARD", "default")
+        result = {
+            "failed": True,
+            "failure_reason": "rate_limit",
+            "error": "usage_limit_reached",
+            "retry_after_seconds": 120,
+        }
+        worker_cli = SimpleNamespace(agent=SimpleNamespace(provider="openai-codex"))
+        worker_stderr = io.StringIO()
+        with contextlib.redirect_stderr(worker_stderr):
+            exit_code = cli_module._kanban_worker_result_exit_code(worker_cli, result)
+        assert exit_code == kb.KANBAN_RATE_LIMIT_EXIT_CODE
+        with kbd._open_worker_log(task, "default") as log:
+            log.write(worker_stderr.getvalue().encode())
+
+        first = kqc.list_quota_circuits(now=1_000)
+        assert len(first) == 1
+        assert first[0]["next_eligible_at"] == 1_120
+        assert first[0]["observations"] == 1
+
+        # Reaping happens later. Reusing the relative retry marker here used to
+        # extend the deadline to 1_180 and count this same observation twice.
+        monkeypatch.setattr(kqc.time, "time", lambda: 1_060)
+        kbd._record_worker_exit(91235, exit_code << 8)
+        assert kbd.detect_crashed_workers(conn, board="default") == []
+
+    final = kqc.list_quota_circuits(now=1_060)
+    assert len(final) == 1
+    assert final[0]["next_eligible_at"] == 1_120
+    assert final[0]["observations"] == 1
 
 
 def test_simultaneous_failures_register_one_circuit_without_card_failures(

@@ -1738,7 +1738,8 @@ DEFAULT_CONFIG = {
         # A route matches both lists; `*` is accepted only when written. A task
         # with provider `auto` is a candidate for every group mapped to its
         # profile: the dispatcher predicts the provider the worker's own
-        # resolution ladder will choose and starts it only when that provider
+        # resolution ladder will choose for the explicit `provider=auto`
+        # request it is spawned with, and starts it only when that provider
         # maps to an unpaused group. Unpredictable or unmapped resolution fails
         # closed while any candidate group is paused.
         "quota_budget_groups": {},

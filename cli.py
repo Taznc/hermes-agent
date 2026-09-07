@@ -4039,6 +4039,7 @@ def _kanban_worker_result_exit_code(cli: "HermesCLI", result: Any) -> int:
     """Publish one Kanban turn result and return its automation exit code."""
     task_id = (os.environ.get("HERMES_KANBAN_TASK") or "").strip()
     quota_retry_after = None
+    quota_published = False
     if task_id:
         try:
             from hermes_cli.kanban_quota_circuit import (
@@ -4047,12 +4048,12 @@ def _kanban_worker_result_exit_code(cli: "HermesCLI", result: Any) -> int:
             )
 
             quota_retry_after = quota_result_retry_after_seconds(result)
-            publish_worker_quota_result(
+            quota_published = publish_worker_quota_result(
                 result,
                 task_id=task_id,
                 board=os.environ.get("HERMES_KANBAN_BOARD"),
                 provider=getattr(cli.agent, "provider", None),
-            )
+            ) is not None
         except Exception as exc:
             logger.debug("host quota circuit publication failed: %s", exc)
 
@@ -4063,6 +4064,12 @@ def _kanban_worker_result_exit_code(cli: "HermesCLI", result: Any) -> int:
         # deadline (neutral EX_TEMPFAIL) from a missing/malformed one (bounded
         # infra interruption). It intentionally reuses the host publisher's
         # structured-result parser instead of classifying error prose here.
+        if quota_published:
+            # Run-scoped, non-secret acknowledgement consumed by the reaper.
+            # It prevents the same observation being republished from the
+            # configured task route after the worker published its actual
+            # fallback provider.
+            print("host quota circuit published.", file=sys.stderr)
         if quota_retry_after is None:
             print("quota exhausted (429); retry deadline missing or malformed.", file=sys.stderr)
         else:

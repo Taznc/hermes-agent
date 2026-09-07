@@ -188,12 +188,15 @@ A pinned route matches only when both its provider and profile are listed; `*`
 is accepted only when deliberately configured. For `provider=auto`, every group
 configured for the profile is a candidate. While any candidate is paused the
 dispatcher predicts the provider the worker's own startup ladder will choose
-(the profile's `model.provider`, then `hermes_cli.auth.resolve_provider` under
-that profile's home) and starts the task only when that provider maps to an
+(the explicit `provider=auto` request the dispatcher passes on the worker
+command line, then `hermes_cli.auth.resolve_provider` under that profile's
+home) and starts the task only when that provider maps to an
 unpaused group; a prediction that fails, resolves to an unmapped provider, or
 lands on the paused group defers the task, so `auto` can never hammer a
 proven-empty wallet. The worker then publishes the provider it actually
-selected before its machine-readable `EX_TEMPFAIL` exit. An automatic route
+selected before its machine-readable `EX_TEMPFAIL` exit, and marks that
+publication in its run log so reaping the same exit never republishes the
+observation from the configured task route. An automatic route
 with no configured candidates remains outside this circuit. Do not put email
 addresses, account IDs, keys, tokens, or vendor subscription identifiers in
 group names. The dispatcher and dashboard expose only a stable `budget-<hash>`

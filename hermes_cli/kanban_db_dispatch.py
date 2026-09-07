@@ -1041,6 +1041,8 @@ def _classify_dead_worker(
         if retry_after is not None:
             payload["reason"] = "quota"
             payload["quota_retry_after_seconds"] = retry_after
+            if quota_signal and quota_signal.get("host_circuit_published"):
+                payload["host_circuit_published"] = True
             # Validated quota wall — NOT a task failure. Release to the source
             # phase and do not count a failure while its finite pause is active.
             return _DeadWorker(
@@ -1107,6 +1109,8 @@ def _classify_dead_worker(
             payload = {"pid": pid, "claimer": claimer, "reason": infra_reason}
             if infra_reason == "quota" and quota_signal_dict:
                 payload["quota_retry_after_seconds"] = quota_signal_dict.get("retry_after_seconds")
+                if quota_signal_dict.get("host_circuit_published"):
+                    payload["host_circuit_published"] = True
             error_text = (
                 f"pid {pid} {infra_reason} (infra, not counted) "
                 f"[exit_kind={kind}"
@@ -1209,7 +1213,7 @@ def _reclaim_dead_workers(
                 from hermes_cli import kanban_quota_circuit as _kqc
 
                 budget_group = _kqc.resolve_task_budget_group(conn, row["id"])
-                if budget_group:
+                if budget_group and not dead.event_payload.get("host_circuit_published"):
                     circuit = _kqc.register_quota_circuit(
                         budget_group,
                         retry_after=retry_after,
@@ -1257,6 +1261,19 @@ def _reclaim_dead_workers(
                 "outcome": dead.run_outcome,
                 "retry_status": retry_status,
             })
+            if (
+                dead.infra
+                and dead.kind == "rate_limited"
+                and dead.event_payload.get("reason") == "quota"
+                and dead.event_payload.get("quota_retry_after_seconds") is None
+            ):
+                # A rejected deadline supersedes any quota-wall text from the
+                # prior run. Leaving that stale text makes blocker_auth stop the
+                # bounded interruption sequence after its first increment.
+                conn.execute(
+                    "UPDATE tasks SET last_failure_error = NULL WHERE id = ?",
+                    (row["id"],),
+                )
             if dead.rate_limited or dead.protocol_violation:
                 # Stamp last_failure_error WITHOUT touching ``consecutive_failures``:
                 # a rate-limited requeue must show ``check_respawn_guard`` a quota
