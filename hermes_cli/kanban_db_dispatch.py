@@ -3292,34 +3292,34 @@ def _worker_launcher_env_overrides(prefix: list[str]) -> dict[str, str]:
 
 
 def _cmd_is_systemd_user_scope_wrapped(command: list[str]) -> bool:
-    """True if *command* is already a ``systemd-run --user --scope`` invocation.
+    """True if *command* is a systemd-run user scope invocation.
 
-    Used to detect the supervised-gateway topology where
-    ``_restart_safe_worker_argv`` has already placed the worker in its own
-    transient user scope before ``kanban.worker_launcher`` gets a chance to
-    run (B4's order-dependent application) — nesting a second ``--scope``
-    around an already-scoped argv is a no-op wrapper: ``--scope`` is a
-    transparent exec, so the outer invocation execs straight into the
-    inner one and only the inner unit ever registers with systemd, leaving
-    the OUTER (persisted) unit name permanently unresolvable.
+    ``systemd-run --pipe`` implicitly creates a scope on current systemd, so
+    recognize that form as well as an explicit ``--scope``.  The shared
+    restart-safe helper deliberately uses ``--pipe`` to preserve the child's
+    stdio, and its unit is still registered as ``.scope``.
     """
     if not command or os.path.basename(command[0]) != "systemd-run":
         return False
-    return "--user" in command and "--scope" in command
+    return "--user" in command and ("--scope" in command or "--pipe" in command)
 
 
 def _extract_unit_from_systemd_scope_argv(command: list[str]) -> Optional[str]:
-    """Recover the registered unit id (always carrying the ``.scope`` suffix,
-    matching the convention ``systemd-run`` itself uses to register a
-    ``--scope`` unit) from a ``systemd-run --user --scope --unit ...`` argv.
+    """Recover the registered unit id from a systemd-run user invocation.
+
+    Explicit ``--scope`` registers ``.scope``; the restart-safe helper's
+    ``--pipe`` form instead registers a transient ``.service``.  Persist the
+    suffix systemd will actually create so later ``systemctl --user`` calls
+    address the same live unit.
     """
+    suffix = ".scope" if "--scope" in command else ".service"
     for i, part in enumerate(command):
         if part == "--unit" and i + 1 < len(command):
             value = command[i + 1]
-            return value if value.endswith(".scope") else f"{value}.scope"
+            return value if value.endswith((".scope", ".service")) else f"{value}{suffix}"
         if part.startswith("--unit="):
             value = part[len("--unit="):]
-            return value if value.endswith(".scope") else f"{value}.scope"
+            return value if value.endswith((".scope", ".service")) else f"{value}{suffix}"
     return None
 
 
@@ -3523,12 +3523,21 @@ def _default_spawn(task: Task, workspace: str, *, board: Optional[str] = None) -
         workspace if os.path.isdir(workspace) else None,
         service_environment,
     )
-    # Apply the optional configured launcher after the restart-safe wrapper.  A
+    # A supervised dispatcher already creates a real restart-safe scope even
+    # with worker_launcher=[]; retain its exact registered name for later
+    # reaping.  A configured launcher may replace that scope with its own,
+    # except when it recognizes the existing systemd scope and returns it.
+    restart_safe_unit = (
+        _extract_unit_from_systemd_scope_argv(cmd)
+        if _cmd_is_systemd_user_scope_wrapped(cmd)
+        else None
+    )
+    # Apply the optional configured launcher after the restart-safe wrapper. A
     # systemd scope prefix recognizes an existing scope and preserves its real
-    # unit instead of nesting a non-existent outer unit.  The default [] path
-    # remains an argv and environment no-op.
+    # unit instead of nesting a non-existent outer unit.
     prefix = _worker_launcher_prefix()
-    cmd, task.worker_unit = _apply_worker_launcher(task, cmd)
+    cmd, launcher_unit = _apply_worker_launcher(task, cmd)
+    task.worker_unit = launcher_unit or restart_safe_unit
     env.update(_worker_launcher_env_overrides(prefix))
     log_f = _open_worker_log(task, board)
     try:

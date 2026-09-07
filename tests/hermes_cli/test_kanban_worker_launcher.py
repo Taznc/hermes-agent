@@ -338,6 +338,29 @@ def test_apply_worker_launcher_skips_double_scope_directly():
     assert argv.count("systemd-run") == 1
 
 
+def test_default_spawn_persists_real_restart_safe_scope_without_launcher(worker_setup, monkeypatch):
+    """A supervised dispatcher scope remains reclaimable when worker_launcher is unset."""
+    _root, workspace, task = worker_setup
+    inner_unit = "hermes-worker-kanban-t_launcher-run-7.service"
+    monkeypatch.setattr(
+        kbd,
+        "_restart_safe_worker_argv",
+        lambda _task, command, *_args: [
+            "systemd-run", "--user", "--quiet", "--unit", inner_unit.removesuffix(".scope"),
+            "--collect", "--pipe", "--", *command,
+        ],
+    )
+    monkeypatch.setattr(kbd, "_worker_launcher_prefix", lambda: [])
+
+    class FakeProc:
+        pid = 3132
+
+    monkeypatch.setattr(subprocess, "Popen", lambda *_args, **_kwargs: FakeProc())
+
+    assert kbd._default_spawn(task, str(workspace)) == 3132
+    assert task.worker_unit == inner_unit
+
+
 # --------------------------------------------------------------------------
 # Re-audit BLOCKER-2: a resolved `systemd-run --user` launcher entry must
 # carry XDG_RUNTIME_DIR/DBUS_SESSION_BUS_ADDRESS into the SPAWNED CHILD's
