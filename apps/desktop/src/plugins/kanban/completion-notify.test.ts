@@ -39,7 +39,9 @@ type NotifyInput = {
   message: string
   title?: string
   kind?: string
+  meta?: string
   detail?: string
+  contextCard?: { eyebrow?: string; meta?: string; summary?: string }
   action?: { label: string; onClick: () => void }
 }
 
@@ -336,7 +338,7 @@ describe('notification content', () => {
       title: 'Task completed',
       message: 'Done',
       detail: 't101',
-      action: { label: 'Open Kanban', onClick: expect.any(Function) }
+      action: { label: 'Open card', onClick: expect.any(Function) }
     })
   })
 
@@ -378,16 +380,44 @@ describe('notification content', () => {
     expect(lastNotify().detail).toBe('t103 · ok.md')
   })
 
-  it('Open Kanban action navigates to the native /kanban page', async () => {
-    const m = await loadModule()
-    m.bindCompletionNotify(makeRest(() => 100) as never)
+  it('shows the card title and metadata, then opens that exact card', async () => {
+    const rest = vi.fn(async (path: string) => {
+      if (path.startsWith('/board')) {
+        return { latest_event_id: 100 }
+      }
 
-    await m.onKanbanEventsFrame('smoke', [ev(101, 'completed', { summary: 'Done' })])
+      if (path === '/tasks/t101?board=smoke') {
+        return {
+          task: {
+            assignee: 'reviewer',
+            body: 'Fallback task description',
+            latest_summary: 'Landed with focused coverage',
+            status: 'done',
+            title: 'Make Kanban notifications readable'
+          }
+        }
+      }
+
+      throw new Error(`unexpected rest call: ${path}`)
+    })
+
+    const m = await loadModule()
+    m.bindCompletionNotify(rest as never)
+
+    await m.onKanbanEventsFrame('smoke', [ev(101, 'completed', { summary: 'Worker result' })])
 
     const input = lastNotify()
-    expect(input.action?.label).toBe('Open Kanban')
+    expect(input).toMatchObject({
+      detail: 't101 · Landed with focused coverage',
+      kind: 'success',
+      message: 'Make Kanban notifications readable',
+      meta: 'Worker result',
+      title: 'Task completed'
+    })
+    expect(input.contextCard).toEqual({ eyebrow: 'Done · reviewer', meta: 't101', summary: 'Landed with focused coverage' })
+    expect(input.action?.label).toBe('Open card')
     input.action?.onClick()
-    expect(hostMock.navigate).toHaveBeenCalledWith('/kanban')
+    expect(hostMock.navigate).toHaveBeenCalledWith('/kanban?board=smoke&task=t101')
   })
 })
 
@@ -521,8 +551,8 @@ describe('i18n routing', () => {
         return 'タスク完了'
       }
 
-      if (key === 'notify.openKanban') {
-        return 'かんばんを開く'
+      if (key === 'notify.openCard') {
+        return 'カードを開く'
       }
 
       if (key === 'notify.artifacts') {
@@ -540,7 +570,7 @@ describe('i18n routing', () => {
     expect(lastNotify()).toMatchObject({
       title: 'タスク完了',
       detail: 't101 · 成果物 2 件',
-      action: { label: 'かんばんを開く', onClick: expect.any(Function) }
+      action: { label: 'カードを開く', onClick: expect.any(Function) }
     })
   })
 
