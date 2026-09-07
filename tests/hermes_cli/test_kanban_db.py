@@ -1484,6 +1484,88 @@ def test_unlink_tasks_triggers_recompute_ready(kanban_home):
         )
 
 
+def test_archived_completed_parents_satisfy_every_dependency_gate(kanban_home):
+    """Only a completed task remains dependency-satisfying after archival.
+
+    Completion is durable in ``completed_at``; bare archival instead means the
+    parent was withdrawn and must keep its children gated until the edge is
+    explicitly removed.
+    """
+    with kbc.connect() as conn:
+        def task_status(task_id: str) -> str:
+            task = kb.get_task(conn, task_id)
+            assert task is not None
+            return task.status
+
+        completed = kb.create_task(conn, title="completed parent")
+        assert kb.complete_task(conn, completed)
+        assert kb.archive_task(conn, completed)
+
+        # Creation and linking accept an archived parent only after completion.
+        child_after_archive = kb.create_task(
+            conn, title="created after completed parent archived", parents=[completed],
+        )
+        assert task_status(child_after_archive) == "ready"
+        linked_child = kb.create_task(conn, title="link completed archived parent")
+        kb.link_tasks(conn, completed, linked_child)
+        assert task_status(linked_child) == "ready"
+
+        # An active sibling still gates until it completes; then recompute_ready
+        # (the dispatcher repair/promotion path) recognizes the archived-completed parent.
+        active = kb.create_task(conn, title="active sibling")
+        waiting_child = kb.create_task(
+            conn, title="wait for active sibling", parents=[completed, active],
+        )
+        assert task_status(waiting_child) == "todo"
+        assert kb.complete_task(conn, active)
+        assert task_status(waiting_child) == "ready"
+
+        # A manually archived incomplete task is cancelled/withdrawn, not a
+        # completion signal. Every gate and the manual diagnostic must agree.
+        withdrawn = kb.create_task(conn, title="withdrawn parent")
+        assert kb.archive_task(conn, withdrawn)
+        mixed_child = kb.create_task(
+            conn, title="mixed parents", parents=[completed, active, withdrawn],
+        )
+        assert task_status(mixed_child) == "todo"
+        ok, reason = kb.promote_task(conn, mixed_child, actor="operator")
+        assert ok is False
+        assert withdrawn in (reason or "")
+        assert kb.claim_task(conn, mixed_child, claimer="worker") is None
+
+        # Explicitly removing the withdrawn edge is the policy-approved repair.
+        assert kb.unlink_tasks(conn, withdrawn, mixed_child)
+        assert task_status(mixed_child) == "ready"
+
+
+def test_unarchiving_completed_parent_clears_evidence_and_regates_children(kanban_home):
+    """Archived completion only satisfies dependencies until the work is reopened."""
+    with kbc.connect() as conn:
+        parent = kb.create_task(conn, title="completed parent")
+        assert kb.complete_task(conn, parent)
+        assert kb.archive_task(conn, parent)
+
+        child = kb.create_task(conn, title="released child", parents=[parent])
+        released = kb.get_task(conn, child)
+        assert released is not None and released.status == "ready"
+
+        assert kb.unarchive_task(conn, parent, status="todo")
+        reopened = kb.get_task(conn, parent)
+        assert reopened is not None
+        assert reopened.completed_at is None
+        regated = kb.get_task(conn, child)
+        assert regated is not None and regated.status == "todo"
+        assert any(
+            event.kind == "descendant_invalidated"
+            for event in kb.list_events(conn, child)
+        )
+
+        assert kb.archive_task(conn, parent)
+        later_child = kb.create_task(conn, title="still gated", parents=[parent])
+        still_gated = kb.get_task(conn, later_child)
+        assert still_gated is not None and still_gated.status == "todo"
+
+
 
 # ---------------------------------------------------------------------------
 # _add_column_if_missing / _migrate_add_optional_columns idempotency (#21708)

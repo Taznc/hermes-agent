@@ -1601,8 +1601,8 @@ def _initial_task_status(
     conn: sqlite3.Connection, parents: tuple[str, ...], initial_status: str, triage: bool,
 ) -> str:
     """Status for a new task: ``blocked``/``triage`` when parked by the caller,
-    else ``ready`` unless a parent is not yet ``done`` (-> ``todo``). Parent ids
-    are validated in every mode (even triage) so link rows never dangle."""
+    else ``ready`` unless a parent is unsatisfied (-> ``todo``). Parent ids are
+    validated in every mode (even triage) so link rows never dangle."""
     if parents:
         missing = _missing_task_ids(conn, parents)
         if missing:
@@ -1613,12 +1613,23 @@ def _initial_task_status(
         return "triage"
     if parents:
         rows = conn.execute(
-            "SELECT status FROM tasks WHERE id IN "
+            "SELECT status, completed_at FROM tasks WHERE id IN "
             "(" + ",".join("?" * len(parents)) + ")", parents,
         ).fetchall()
-        if any(r["status"] != "done" for r in rows):
+        if any(not _parent_dependency_satisfied(r) for r in rows):
             return "todo"
     return "ready"
+
+
+def _parent_dependency_satisfied(parent: Mapping[str, Any]) -> bool:
+    """Whether a parent has satisfied its dependency edge.
+
+    ``completed_at`` is written only by the completion lifecycle. It preserves
+    that evidence when completed work is later archived, without treating a
+    manually archived incomplete task as successful.
+    """
+    status = parent["status"]
+    return status == "done" or (status == "archived" and parent["completed_at"] is not None)
 
 
 def _project_branch_name(project_obj: Any, task_id: str, title: Optional[str]) -> Optional[str]:
@@ -1837,8 +1848,9 @@ def link_tasks(conn: sqlite3.Connection, parent_id: str, child_id: str) -> None:
         if _would_cycle(conn, parent_id, child_id):
             raise ValueError(f"linking {parent_id} -> {child_id} would create a cycle")
         _link(conn, parent_id, child_id)
-        # If child was ready but parent is not yet done, demote child to todo.
-        if _task_status(conn, parent_id) != "done":
+        # Re-gate every edge, including archived parents whose completion
+        # evidence was absent, before a ready child can be claimed.
+        if not _parents_satisfied(conn, child_id):
             conn.execute(
                 "UPDATE tasks SET status = 'todo' WHERE id = ? AND status = 'ready'", (child_id,),
             )
@@ -2501,7 +2513,7 @@ def _resume_status_from_events(conn: sqlite3.Connection, task_id: str) -> str:
 
 
 def recompute_ready(conn: sqlite3.Connection, failure_limit: int = None) -> int:
-    """Promote ``todo``/``blocked`` tasks whose parents are all done/archived;
+    """Promote ``todo``/``blocked`` tasks whose parents are satisfied;
     returns the count. Opens its own IMMEDIATE txn — call OUTSIDE any write txn.
 
     ``blocked`` is skipped when sticky (explicit ``kanban_block``) or when
@@ -2531,11 +2543,11 @@ def recompute_ready(conn: sqlite3.Connection, failure_limit: int = None) -> int:
                 # must not fall through to the threshold re-check below.
                 continue
             parents = conn.execute(
-                "SELECT t.status FROM tasks t "
+                "SELECT t.status, t.completed_at FROM tasks t "
                 "JOIN task_links l ON l.parent_id = t.id "
                 "WHERE l.child_id = ?", (task_id,),
             ).fetchall()
-            if all(p["status"] in ("done", "archived") for p in parents):
+            if all(_parent_dependency_satisfied(p) for p in parents):
                 resume_status = _resume_status_from_events(conn, task_id)
                 if cur_status == "blocked":
                     # At the breaker limit, no auto-recovery (else block ->
@@ -2569,15 +2581,12 @@ def recompute_ready(conn: sqlite3.Connection, failure_limit: int = None) -> int:
 # --- Claim / complete / block ---
 
 def _parents_satisfied(conn: sqlite3.Connection, task_id: str) -> bool:
-    """Return whether every direct parent is terminal for dependency gating."""
-    return conn.execute(
-        # Check if this task has children that still need the workspace. If any child is not yet
-        # done/archived, defer cleanup so the child can read handoff artifacts from the workspace (#33774).
-        "SELECT 1 FROM task_links l "
-        "JOIN tasks p ON p.id = l.parent_id "
-        "WHERE l.child_id = ? "
-        "AND p.status NOT IN ('done', 'archived') LIMIT 1", (task_id,),
-    ).fetchone() is None
+    """Return whether every direct parent has satisfied its dependency edge."""
+    parents = conn.execute(
+        "SELECT p.status, p.completed_at FROM task_links l "
+        "JOIN tasks p ON p.id = l.parent_id WHERE l.child_id = ?", (task_id,),
+    ).fetchall()
+    return all(_parent_dependency_satisfied(parent) for parent in parents)
 
 
 def _claim_and_open_run(
@@ -3851,11 +3860,11 @@ def promote_task(
 
     if not force:
         parents = conn.execute(
-            "SELECT t.id, t.status FROM tasks t "
+            "SELECT t.id, t.status, t.completed_at FROM tasks t "
             "JOIN task_links l ON l.parent_id = t.id "
             "WHERE l.child_id = ?", (task_id,),
         ).fetchall()
-        unsatisfied = [p["id"] for p in parents if p["status"] not in ("done", "archived")]
+        unsatisfied = [p["id"] for p in parents if not _parent_dependency_satisfied(p)]
         if unsatisfied:
             return False, (
                 f"unsatisfied parent dependencies: "
@@ -4350,7 +4359,8 @@ def archive_task(
             summary="task archived with run still active",
         )
         _append_event(conn, task_id, "archived", None, run_id=run_id)
-    # ``archived`` parents no longer block children; promote them now.
+    # Completed parents preserve their dependency satisfaction after archival;
+    # incomplete archived parents remain gated. Re-evaluate children now either way.
     recompute_ready(conn)
     # Reap the workspace on archive too (never-completed tasks kept it forever).
     _cleanup_workspace(conn, task_id)
@@ -4362,20 +4372,38 @@ def unarchive_task(conn: sqlite3.Connection, task_id: str, *, status: str = "tod
 
     This is the only transition out of ``archived``. ``ready`` remains subject
     to parent gating, so reopening an archived child cannot bypass its parents.
+    Reopening archived-completed work also clears its completion evidence and
+    atomically retracts descendants that relied on that evidence. Any running
+    descendant is terminated only after the invalidation audit trail commits.
     """
     if status not in {"triage", "todo", "ready"}:
         raise ValueError("unarchived tasks must land in triage, todo, or ready")
     target = status
+    terminations: list[tuple[Optional[int], Optional[str], Optional[str]]] = []
     with write_txn(conn):
+        archived = conn.execute(
+            "SELECT status, completed_at FROM tasks WHERE id = ?", (task_id,),
+        ).fetchone()
+        if archived is None or archived["status"] != "archived":
+            return False
+        reopening_satisfied_parent = _parent_dependency_satisfied(archived)
         if target == "ready" and not _parents_satisfied(conn, task_id):
             target = "todo"
         cur = conn.execute(
-            "UPDATE tasks SET status = ? WHERE id = ? AND status = 'archived'",
+            "UPDATE tasks SET status = ?, completed_at = NULL "
+            "WHERE id = ? AND status = 'archived'",
             (target, task_id),
         )
         if cur.rowcount != 1:
             return False
         _append_event(conn, task_id, "unarchived", {"status": target})
+        if reopening_satisfied_parent:
+            result = invalidate_descendants_for_parent_reopen(
+                conn, task_id, author="operator",
+            )
+            terminations.extend(result["terminations"])
+    for pid, claim_lock, worker_unit in terminations:
+        _terminate_reclaimed_worker(pid, claim_lock, worker_unit=worker_unit)
     return True
 
 
