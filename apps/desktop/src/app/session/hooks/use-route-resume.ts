@@ -135,11 +135,19 @@ export function useRouteResume({
       // (and the page/sidebar selection clears), but routing it through main
       // would deliberately close the tile in resumeSession. The wiring proves
       // the tile still exists before setting this flag; if it closes, the flag
-      // drops and an ordinary route resume is available again. Re-front it on
-      // every visit to this history entry: Kanban fronts `workspace`, so Back
+      // drops and an ordinary route resume is available again. Re-front it only
+      // when this history entry is visited: Kanban fronts `workspace`, so Back
       // must actively restore the tile rather than merely suppressing resume.
-      if (preserveSessionTile && focusOpenSession(routedSessionId) === 'tile') {
-        return
+      // Other dependencies (resume requests, gateway state, session data) also
+      // re-run this effect; they must not let an old route steal focus from a
+      // newer explicit sidebar selection.
+      if (preserveSessionTile) {
+        if (!pathnameChanged || focusOpenSession(routedSessionId) === 'tile') {
+          return
+        }
+
+        // The tile vanished between validation and this effect. Fall through
+        // to the ordinary main-session resume path.
       }
 
       if (!gatewayOpen) {

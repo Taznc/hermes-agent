@@ -1,6 +1,6 @@
 import { useStore } from '@nanostores/react'
 import { act, cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react'
-import { useEffect, useRef } from 'react'
+import { useEffect, useRef, useState } from 'react'
 import { createMemoryRouter, RouterProvider, useLocation, useNavigate } from 'react-router'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
@@ -8,7 +8,15 @@ import { findGroupOfPane, group } from '@/components/pane-shell/tree/model'
 import { $layoutTree, noteActiveTreeGroup } from '@/components/pane-shell/tree/store'
 import { SidebarProvider } from '@/components/ui/sidebar'
 import { registry } from '@/contrib/registry'
-import { $activeSessionId, $selectedStoredSessionId, $sessions, sessionMatchesStoredId, setSessions } from '@/store/session'
+import {
+  $activeSessionId,
+  $selectedStoredSessionId,
+  $sessionResumeRequest,
+  $sessions,
+  requestSessionResume,
+  sessionMatchesStoredId,
+  setSessions
+} from '@/store/session'
 import { $focusedStoredSessionId, $sessionTiles } from '@/store/session-states'
 
 import { ChatSidebar } from './chat/sidebar'
@@ -63,8 +71,22 @@ vi.mock('./chat/sidebar/search-section', () => ({ SidebarSearchSection: () => nu
 vi.mock('./chat/sidebar/section-states', () => ({ SidebarBlankState: () => null }))
 vi.mock('./chat/sidebar/split-submenu', () => ({ CONTEXT_SPLIT_KIT: {}, SplitSubmenu: () => null }))
 vi.mock('./chat/sidebar/workspace-section', () => ({
-  SidebarWorkspaceSection: ({ activeSessionId }: { activeSessionId: null | string }) => (
-    <output data-testid="sidebar-active-session">{activeSessionId ?? ''}</output>
+  SidebarWorkspaceSection: ({
+    activeSessionId,
+    onResumeSession
+  }: {
+    activeSessionId: null | string
+    onResumeSession: (sessionId: string) => void
+  }) => (
+    <>
+      <output data-testid="sidebar-active-session">{activeSessionId ?? ''}</output>
+      <button onClick={() => onResumeSession('s1')} type="button">
+        Open session s1
+      </button>
+      <button onClick={() => onResumeSession('s2')} type="button">
+        Open session s2
+      </button>
+    </>
   )
 }))
 
@@ -87,6 +109,7 @@ function NavigationHarness() {
   const navigate = useNavigate()
   const activeSessionId = useStore($activeSessionId)
   const selectedStoredSessionId = useStore($selectedStoredSessionId)
+  const sessionResumeRequest = useStore($sessionResumeRequest)
   const sessionTiles = useStore($sessionTiles)
   const sessions = useStore($sessions)
   const layoutTree = useStore($layoutTree)
@@ -95,6 +118,7 @@ function NavigationHarness() {
   const selectedStoredSessionIdRef = useRef(selectedStoredSessionId)
   const runtimeIdByStoredSessionIdRef = useRef(new Map<string, string>())
   const creatingSessionRef = useRef(false)
+  const [gatewayState, setGatewayState] = useState<'closed' | 'open'>('open')
 
   activeSessionIdRef.current = activeSessionId
   selectedStoredSessionIdRef.current = selectedStoredSessionId
@@ -120,7 +144,7 @@ function NavigationHarness() {
     creatingSessionRef,
     currentView: appViewForPath(location.pathname),
     freshDraftReady: false,
-    gatewayState: 'open',
+    gatewayState,
     locationPathname: location.pathname,
     preserveSessionTile,
     resumeExhaustedSessionId: null,
@@ -130,7 +154,7 @@ function NavigationHarness() {
     runtimeIdByStoredSessionIdRef,
     selectedStoredSessionId,
     selectedStoredSessionIdRef,
-    sessionResumeRequest: null,
+    sessionResumeRequest,
     startFreshSessionDraft: noop
   })
 
@@ -150,14 +174,21 @@ function NavigationHarness() {
         }}
         onNewSessionInWorkspace={noop}
         onNewSessionSplit={noop}
-        onResumeSession={sessionId => openSession(sessionId, navigate)}
+        onResumeSession={sessionId => {
+          requestSessionResume(sessionId)
+          openSession(sessionId, navigate)
+        }}
         onTriggerCronJob={() => Promise.resolve()}
       />
-      <button onClick={() => openSession('s1', navigate)} type="button">
-        Open session s1
+      <button onClick={() => setGatewayState('closed')} type="button">
+        Close gateway
+      </button>
+      <button onClick={() => setGatewayState('open')} type="button">
+        Open gateway
       </button>
       <output data-testid="location">{`${location.pathname}${location.search}`}</output>
       <output data-testid="view">{appViewForPath(location.pathname)}</output>
+      <output data-testid="gateway-state">{gatewayState}</output>
       <output data-testid="foreground">{foreground(location.pathname)}</output>
       <output data-testid="focused-session">{$focusedStoredSessionId.get() ?? ''}</output>
       <output data-testid="tile-layout">
@@ -186,7 +217,11 @@ describe('Kanban -> sidebar session navigation', () => {
       render: () => null
     })
     resumeSession.mockClear()
-    setSessions([{ id: 's1', title: 'Session one' } as never])
+    setSessions([
+      { id: 's1', title: 'Session one' } as never,
+      { id: 's2', title: 'Session two' } as never
+    ])
+    $sessionResumeRequest.set(null)
     $activeSessionId.set(null)
     $selectedStoredSessionId.set(null)
     $sessionTiles.set([
@@ -196,9 +231,16 @@ describe('Kanban -> sidebar session navigation', () => {
         dir: 'center',
         storedSessionId: 's1',
         workspaceMode: 'sessions'
+      },
+      {
+        anchor: 'workspace',
+        before: null,
+        dir: 'center',
+        storedSessionId: 's2',
+        workspaceMode: 'sessions'
       }
     ])
-    $layoutTree.set(group(['workspace', 'session-tile:s1'], { active: 'session-tile:s1', id: 'main' }))
+    $layoutTree.set(group(['workspace', 'session-tile:s1', 'session-tile:s2'], { active: 'session-tile:s1', id: 'main' }))
     noteActiveTreeGroup('main')
     $workspaceIsPage.set(false)
   })
@@ -206,6 +248,7 @@ describe('Kanban -> sidebar session navigation', () => {
   afterEach(() => {
     cleanup()
     disposeRoute()
+    $sessionResumeRequest.set(null)
     setSessions([])
     $activeSessionId.set(null)
     $selectedStoredSessionId.set(null)
@@ -319,7 +362,70 @@ describe('Kanban -> sidebar session navigation', () => {
         before: null,
         dir: 'center',
         storedSessionId: 's1'
+      }),
+      expect.objectContaining({
+        anchor: 'workspace',
+        before: null,
+        dir: 'center',
+        storedSessionId: 's2'
       })
+    ])
+  })
+
+  it('keeps a later sidebar selection authoritative across background updates', async () => {
+    const router = createMemoryRouter([{ path: '*', element: <NavigationHarness /> }], {
+      initialEntries: ['/kanban?board=shipping']
+    })
+
+    render(<RouterProvider router={router} />)
+
+    await waitFor(() => expect(screen.getByTestId('foreground').textContent).toBe('kanban'))
+
+    fireEvent.click(screen.getByRole('button', { name: 'Open session s1' }))
+
+    await waitFor(() => {
+      expect(screen.getByTestId('location').textContent).toBe('/s1')
+      expect(screen.getByTestId('foreground').textContent).toBe('chat:s1')
+      expect(screen.getByTestId('sidebar-active-session').textContent).toBe('s1')
+    })
+
+    const tileLayoutBefore = JSON.parse(screen.getByTestId('tile-layout').textContent ?? '{}')
+
+    // Match the production sidebar callback: publish the resume request first,
+    // then focus/open the clicked session. Because s2 is already tiled,
+    // openSession keeps the existing /s1 history entry and only changes focus.
+    fireEvent.click(screen.getByRole('button', { name: 'Open session s2' }))
+
+    await waitFor(() => {
+      expect(screen.getByTestId('location').textContent).toBe('/s1')
+      expect(screen.getByTestId('foreground').textContent).toBe('chat:s2')
+      expect(screen.getByTestId('sidebar-active-session').textContent).toBe('s2')
+      expect(JSON.parse(screen.getByTestId('tile-layout').textContent ?? '{}')).toEqual({
+        ...tileLayoutBefore,
+        active: 'session-tile:s2'
+      })
+    })
+
+    // A background gateway transition re-runs route resume but is not a route
+    // visit, so it must not reassert the stale s1 history target.
+    fireEvent.click(screen.getByRole('button', { name: 'Close gateway' }))
+
+    await waitFor(() => {
+      expect(screen.getByTestId('gateway-state').textContent).toBe('closed')
+      expect(screen.getByTestId('foreground').textContent).toBe('chat:s2')
+    })
+
+    fireEvent.click(screen.getByRole('button', { name: 'Open gateway' }))
+
+    await waitFor(() => {
+      expect(screen.getByTestId('gateway-state').textContent).toBe('open')
+      expect(screen.getByTestId('foreground').textContent).toBe('chat:s2')
+      expect(screen.getByTestId('sidebar-active-session').textContent).toBe('s2')
+    })
+    expect(resumeSession).not.toHaveBeenCalled()
+    expect($sessionTiles.get()).toEqual([
+      expect.objectContaining({ storedSessionId: 's1' }),
+      expect.objectContaining({ storedSessionId: 's2' })
     ])
   })
 })
