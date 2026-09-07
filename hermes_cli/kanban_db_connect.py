@@ -829,6 +829,8 @@ _LATER_TASK_COLUMNS = (
     ("model_override", "model_override TEXT"),
     ("provider_override", "provider_override TEXT"),
     ("reasoning_effort", "reasoning_effort TEXT"),
+    ("route_source", "route_source TEXT"),
+    ("route_name", "route_name TEXT"),
     # Ralph-style goal loop toggle; 0 = classic single-shot worker.
     ("goal_mode", "goal_mode INTEGER NOT NULL DEFAULT 0"),
     ("goal_max_turns", "goal_max_turns INTEGER"),

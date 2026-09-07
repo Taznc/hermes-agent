@@ -366,27 +366,48 @@ def _cmd_create(args: argparse.Namespace) -> int:
     if max_retries is not None and max_retries < 1:
         return _err(f"kanban: --max-retries must be >= 1 (got {max_retries}); "
                     "use 1 to trip on the first failure.", 2)
-    with kbc.connect_closing() as conn:
-        task_id = kb.create_task(
-            conn, title=args.title, body=args.body, assignee=args.assignee,
-            created_by=args.created_by or _profile_author(),
-            workspace_kind=ws_kind, workspace_path=ws_path, branch_name=branch_name,
-            project_id=getattr(args, "project", None), tenant=args.tenant, priority=args.priority,
-            parents=tuple(args.parent or ()), triage=bool(getattr(args, "triage", False)),
-            idempotency_key=getattr(args, "idempotency_key", None),
-            max_runtime_seconds=max_runtime, skills=getattr(args, "skills", None) or None,
-            max_retries=max_retries, model_override=getattr(args, "model_override", None),
-            provider_override=getattr(args, "provider_override", None),
-            reasoning_effort=getattr(args, "reasoning_effort", None),
-            goal_mode=bool(getattr(args, "goal_mode", False)),
-            goal_max_turns=getattr(args, "goal_max_turns", None),
-            initial_status=getattr(args, "initial_status", "running"),
+    try:
+        model_override, provider_override = kb._validate_model_override(
+            getattr(args, "model_override", None), getattr(args, "provider_override", None),
         )
-        task = kb.get_task(conn, task_id)
+        reasoning_effort = kb.normalize_reasoning_effort(getattr(args, "reasoning_effort", None))
+    except ValueError as exc:
+        return _err(f"kanban: {exc}", 2)
+    with kbc.connect_closing() as conn:
+        existing = kb.get_task_by_idempotency_key(conn, getattr(args, "idempotency_key", None))
+        if existing is not None:
+            task = existing
+        else:
+            from hermes_cli.kanban_model_routing import resolve_kanban_model_route
+
+            routing = resolve_kanban_model_route(
+                title=args.title, body=args.body,
+                explicit_model=model_override, explicit_provider=provider_override,
+                explicit_reasoning_effort=reasoning_effort,
+            )
+            task_id = kb.create_task(
+                conn, title=args.title, body=args.body, assignee=args.assignee,
+                created_by=args.created_by or _profile_author(),
+                workspace_kind=ws_kind, workspace_path=ws_path, branch_name=branch_name,
+                project_id=getattr(args, "project", None), tenant=args.tenant, priority=args.priority,
+                parents=tuple(args.parent or ()), triage=bool(getattr(args, "triage", False)),
+                idempotency_key=getattr(args, "idempotency_key", None),
+                max_runtime_seconds=max_runtime, skills=getattr(args, "skills", None) or None,
+                max_retries=max_retries, model_override=routing.model_override,
+                provider_override=routing.provider_override,
+                reasoning_effort=routing.reasoning_effort,
+                route_source=routing.route_source, route_name=routing.route_name,
+                goal_mode=bool(getattr(args, "goal_mode", False)),
+                goal_max_turns=getattr(args, "goal_max_turns", None),
+                initial_status=getattr(args, "initial_status", "running"),
+            )
+            task = kb.get_task(conn, task_id)
+    if task is None:
+        return _err("kanban: created task could not be read back", 1)
     if getattr(args, "json", False):
         _print_json(_task_to_dict(task))
     else:
-        print(f"Created {task_id}  ({task.status}, assignee={task.assignee or '-'})")
+        print(f"Created {task.id}  ({task.status}, assignee={task.assignee or '-'})")
         # Warn only for ready+assigned tasks that would sit without a dispatcher (triage/todo idle
         # by design, unassigned can't dispatch); skipped under --json so stdout stays parseable.
         if task.status == "ready" and task.assignee:
@@ -528,6 +549,11 @@ def _cmd_show(args: argparse.Namespace) -> int:
     if task.model_override:
         _prov = f" (provider: {task.provider_override})" if task.provider_override else ""
         field("model", f"{task.model_override}{_prov}")
+    if task.reasoning_effort:
+        field("reasoning", task.reasoning_effort)
+    if task.route_source:
+        route = task.route_name or task.route_source
+        field("route", route)
     # Effective retry threshold (task > config > default) explains auto-blocks.
     if task.max_retries is not None:
         print(f"  max-retries: {task.max_retries} (task)")

@@ -841,6 +841,8 @@ class Task:
     model_override: Optional[str] = None
     provider_override: Optional[str] = None  # provider ``model_override`` belongs to
     reasoning_effort: Optional[str] = None   # VALID_REASONING_EFFORTS | "none"; NULL = profile's
+    route_source: Optional[str] = None       # explicit | default | selected route name
+    route_name: Optional[str] = None          # selected route id (if any)
     # Breaker trip count; None -> ``kanban.failure_limit`` -> DEFAULT_FAILURE_LIMIT.
     max_retries: Optional[int] = None
     # ``/goal``-style loop: a judge re-checks each turn IN THE SAME SESSION until
@@ -880,7 +882,7 @@ _TASK_REQUIRED_COLUMNS = (
 _TASK_OPTIONAL_COLUMNS = (
     "branch_name", "project_id", "tenant", "result", "idempotency_key", "worker_pid",
     "max_runtime_seconds", "last_heartbeat_at", "current_run_id", "workflow_template_id",
-    "current_step_key", "max_retries", "session_id",
+    "current_step_key", "max_retries", "session_id", "route_source", "route_name",
 )
 # Text columns where "" is stored/read as "not set".
 _TASK_EMPTY_IS_NULL_COLUMNS = (
@@ -1078,6 +1080,12 @@ CREATE TABLE IF NOT EXISTS tasks (
     -- passes --reasoning <level> so the worker runs at that depth regardless
     -- of the profile's agent.reasoning_effort. NULL = profile setting.
     reasoning_effort     TEXT,
+    -- Create-time routing provenance. route_source records whether the card
+    -- used the explicit override, the default profile model, or a selected
+    -- named route; route_name is the selected route id when route_source is
+    -- a named route. NULL = legacy boards / pre-feature rows.
+    route_source         TEXT,
+    route_name           TEXT,
     -- Per-task override for the consecutive-failure circuit breaker.
     -- The value is the failure count at which the breaker trips — e.g.
     -- ``max_retries=1`` blocks on the first failure. NULL (the common
@@ -1413,9 +1421,10 @@ def create_task(
     workspace_kind: str = "scratch", workspace_path: Optional[str] = None,
     branch_name: Optional[str] = None, tenant: Optional[str] = None, priority: int = 0,
     parents: Iterable[str] = (), triage: bool = False, idempotency_key: Optional[str] = None,
-    max_runtime_seconds: Optional[int] = None, skills: Optional[Iterable[str]] = None,
+    task_id: Optional[str] = None, max_runtime_seconds: Optional[int] = None, skills: Optional[Iterable[str]] = None,
     max_retries: Optional[int] = None, model_override: Optional[str] = None,
     provider_override: Optional[str] = None, reasoning_effort: Optional[str] = None,
+    route_source: Optional[str] = None, route_name: Optional[str] = None,
     goal_mode: bool = False, goal_max_turns: Optional[int] = None, initial_status: str = "running",
     session_id: Optional[str] = None, board: Optional[str] = None, project_id: Optional[str] = None,
     project_source_task_id: Optional[str] = None,
@@ -1427,9 +1436,12 @@ def create_task(
     and records an intentional-block reason. Parent-gated work should leave
     ``initial_status`` at its default so it enters ``todo`` and auto-promotes.
     ``idempotency_key``: an existing non-archived task with the key is returned
-    instead of a duplicate. ``max_runtime_seconds``: cap before the dispatcher
+    instead of a duplicate. ``task_id`` reserves a caller-generated identifier
+    for atomic graph construction. ``max_runtime_seconds``: cap before the dispatcher
     SIGTERMs and re-queues. ``model_override``/``provider_override`` pin the
     worker model (provider requires model); ``reasoning_effort`` is independent.
+    ``route_source``/``route_name`` capture create-time routing provenance for
+    audit/UI surfaces and never affect dispatch after creation.
     ``project_source_task_id``: cross-profile fallback when ``project_id`` is not
     in the active profile's projects.db — see ``_resolve_project_link``.
     """
@@ -1450,6 +1462,11 @@ def create_task(
     if branch_name and workspace_kind != "worktree":
         raise ValueError("branch_name is only valid for worktree workspaces")
 
+    if task_id is not None:
+        task_id = str(task_id).strip()
+        if not task_id:
+            raise ValueError("task_id must not be empty")
+
     # A project-scoped board anchors every new task to its project's repo
     # (deterministic worktree + branch) without each surface repeating it.
     if project_id is None:
@@ -1466,14 +1483,9 @@ def create_task(
 
     # Idempotency check BEFORE the write txn (no lock held); a concurrent-create
     # race may insert twice, the next lookup stabilises on the newest.
-    if idempotency_key:
-        row = conn.execute(
-            "SELECT id FROM tasks WHERE idempotency_key = ? "
-            "AND status != 'archived' "
-            "ORDER BY created_at DESC LIMIT 1", (idempotency_key,),
-        ).fetchone()
-        if row:
-            return row["id"]
+    existing = get_task_by_idempotency_key(conn, idempotency_key)
+    if existing is not None:
+        return existing.id
 
     now = int(time.time())
 
@@ -1484,9 +1496,12 @@ def create_task(
         if board_default:
             workspace_path = str(board_default)
 
-    # Retry once on the extremely unlikely id collision.
-    for attempt in range(2):
-        task_id = _new_task_id()
+    # Retry once on the extremely unlikely generated-id collision. A graph
+    # builder may reserve an id before route preflight, so never silently
+    # substitute a different id for an explicit reservation.
+    requested_task_id = task_id
+    for attempt in range(1 if requested_task_id is not None else 2):
+        task_id = requested_task_id or _new_task_id()
         try:
             # allow_nested: graph builders compose create_task under one outer
             # commit so the dispatcher never sees a half-built graph.
@@ -1508,9 +1523,9 @@ def create_task(
                         branch_name, project_id, tenant, idempotency_key,
                         max_runtime_seconds,
                         skills, max_retries, model_override, provider_override,
-                        reasoning_effort,
+                        reasoning_effort, route_source, route_name,
                         goal_mode, goal_max_turns, session_id
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         task_id, title.strip(), body, assignee, task_status, priority,
@@ -1519,6 +1534,7 @@ def create_task(
                         _opt_int(max_runtime_seconds),
                         json.dumps(skills_list) if skills_list is not None else None,
                         _opt_int(max_retries), model_override, provider_override, reasoning_effort,
+                        route_source, route_name,
                         1 if goal_mode else 0, _opt_int(goal_max_turns), session_id,
                     ),
                 )
@@ -1541,6 +1557,9 @@ def create_task(
                         "goal_mode": bool(goal_mode) or None,
                         "model_override": model_override,
                         "provider_override": provider_override,
+                        "reasoning_effort": reasoning_effort,
+                        "route_source": route_source,
+                        "route_name": route_name,
                     },
                 )
                 if initial_status == "blocked":
@@ -1560,7 +1579,7 @@ def create_task(
                 _inherit_notify_subs(conn, task_id, parents, created_at=now)
             return task_id
         except sqlite3.IntegrityError:
-            if attempt == 1:
+            if requested_task_id is not None or attempt == 1:
                 raise
     raise RuntimeError("unreachable")
 
@@ -1660,6 +1679,20 @@ def _inherit_notify_subs(
 
 def get_task(conn: sqlite3.Connection, task_id: str) -> Optional[Task]:
     row = conn.execute("SELECT * FROM tasks WHERE id = ?", (task_id,)).fetchone()
+    return Task.from_row(row) if row else None
+
+
+def get_task_by_idempotency_key(
+    conn: sqlite3.Connection, idempotency_key: Optional[str]
+) -> Optional[Task]:
+    """Return the newest active task for an idempotent create replay."""
+    if not idempotency_key:
+        return None
+    row = conn.execute(
+        "SELECT * FROM tasks WHERE idempotency_key = ? AND status != 'archived' "
+        "ORDER BY created_at DESC LIMIT 1",
+        (idempotency_key,),
+    ).fetchone()
     return Task.from_row(row) if row else None
 
 
@@ -3533,7 +3566,7 @@ def request_review(
     claim is only cleared with proof of ownership (``expected_run_id``) or
     ``force=True``. Returns ``bool``, or ``(ok, reason)`` with ``with_reason``.
 
-    A ``model_override``/``provider_override`` pinned for the IMPLEMENTER is
+    A ``model_override``/``provider_override``/``reasoning_effort`` pinned for the IMPLEMENTER is
     card-scoped in storage but semantically implementation-scoped: a review
     dispatched to a *different* profile must run that profile's own
     configured model, never the implementer's pin (the pin silently
@@ -3560,7 +3593,7 @@ def request_review(
             return _ret(False, "parent dependencies are not satisfied")
         trow = conn.execute(
             "SELECT assignee, status, claim_lock, current_run_id, "
-            "model_override, provider_override "
+            "model_override, provider_override, reasoning_effort "
             "FROM tasks WHERE id = ?", (task_id,),
         ).fetchone()
         if trow is None:
@@ -3594,11 +3627,12 @@ def request_review(
         cross_profile = reviewer is not None and reviewer != implementer
         implementer_model_override = trow["model_override"]
         implementer_provider_override = trow["provider_override"]
+        implementer_reasoning_effort = trow["reasoning_effort"]
         override_sql = ""
         override_params: tuple[Any, ...] = ()
         if cross_profile:
-            override_sql = ", model_override = ?, provider_override = ?"
-            override_params = (reviewer_model_override, reviewer_provider_override)
+            override_sql = ", model_override = ?, provider_override = ?, reasoning_effort = ?"
+            override_params = (reviewer_model_override, reviewer_provider_override, None)
         assignee_sql = ", assignee = ?" if reviewer is not None else ""
         run_guard = "" if expected_run_id is None else " AND current_run_id = ?"
         params: tuple[Any, ...] = (
@@ -3638,6 +3672,8 @@ def request_review(
             # implementer's pin on the round trip back — see docstring.
             event_payload["implementer_model_override"] = implementer_model_override
             event_payload["implementer_provider_override"] = implementer_provider_override
+            if implementer_reasoning_effort is not None:
+                event_payload["implementer_reasoning_effort"] = implementer_reasoning_effort
         _append_event(conn, task_id, "review_requested", event_payload, run_id=run_id)
     return _ret(True)
 
@@ -3717,18 +3753,32 @@ def request_changes(
             assigned_payload = _json_dict(assigned_event["payload"])
             if (
                 assigned_payload.get("source") == "kanban.default_reviewer"
-                and "implementer_model_override" in assigned_payload
+                and (
+                    "implementer_model_override" in assigned_payload
+                    or "implementer_reasoning_effort" in assigned_payload
+                )
             ):
                 override_payload = assigned_payload
 
-        override_sql = ""
-        override_params: tuple[Any, ...] = ()
+        override_sets: list[str] = []
+        override_params_list: list[Any] = []
         if "implementer_model_override" in override_payload:
-            override_sql = ", model_override = ?, provider_override = ?"
-            override_params = (
-                _nonblank_str(override_payload.get("implementer_model_override")),
-                _nonblank_str(override_payload.get("implementer_provider_override")),
+            override_sets.extend(["model_override = ?", "provider_override = ?"])
+            override_params_list.extend(
+                [
+                    _nonblank_str(override_payload.get("implementer_model_override")),
+                    _nonblank_str(override_payload.get("implementer_provider_override")),
+                ]
             )
+        if "implementer_reasoning_effort" in override_payload:
+            override_sets.append("reasoning_effort = ?")
+            override_params_list.append(
+                normalize_reasoning_effort(override_payload.get("implementer_reasoning_effort"))
+            )
+        override_sql = ""
+        if override_sets:
+            override_sql = ", " + ", ".join(override_sets)
+        override_params: tuple[Any, ...] = tuple(override_params_list)
 
         new_status = _landing_status_after_parents(conn, task_id)
         # consecutive_failures deliberately PRESERVED: a review transition is
@@ -3889,9 +3939,9 @@ def unblock_task(conn: sqlite3.Connection, task_id: str) -> bool:
 
 def reopen_review_task(conn: sqlite3.Connection, task_id: str) -> bool:
     """``review`` -> ``ready``/``todo`` so the implementer re-runs on the new
-    comments; restores the implementer from the ``review_requested`` event.
-    Preserves ``consecutive_failures`` and the block loop counter (review is
-    not a block; only :func:`complete_task` clears them)."""
+    comments; restores the implementer's model/provider/reasoning pin from the
+    latest review handoff. Preserves ``consecutive_failures`` and the block loop
+    counter (review is not a block; only :func:`complete_task` clears them)."""
     now = int(time.time())
     with write_txn(conn):
         _reclaim_dangling_run(
@@ -3900,15 +3950,49 @@ def reopen_review_task(conn: sqlite3.Connection, task_id: str) -> bool:
         )
         new_status = _landing_status_after_parents(conn, task_id)
         review_event = _latest_event(conn, task_id, "review_requested")
-        handoff = _json_dict(_row_get(review_event, "payload"))
+        handoff = _json_dict(_row_get(review_event, "payload")) if review_event is not None else {}
         implementer = _nonblank_str(handoff.get("implementer"))
-        params: tuple[Any, ...] = (new_status, *((implementer,) if implementer else ()), task_id)
+        assigned_event = _latest_event(conn, task_id, "assigned")
+        if (
+            assigned_event is not None
+            and review_event is not None
+            and int(assigned_event["id"]) > int(review_event["id"])
+        ):
+            assigned_payload = _json_dict(assigned_event["payload"])
+            if (
+                assigned_payload.get("source") == "kanban.default_reviewer"
+                and (
+                    "implementer_model_override" in assigned_payload
+                    or "implementer_reasoning_effort" in assigned_payload
+                )
+            ):
+                handoff = assigned_payload
+        override_sets: list[str] = []
+        override_params_list: list[Any] = []
+        if "implementer_model_override" in handoff:
+            override_sets.extend(["model_override = ?", "provider_override = ?"])
+            override_params_list.extend(
+                [
+                    _nonblank_str(handoff.get("implementer_model_override")),
+                    _nonblank_str(handoff.get("implementer_provider_override")),
+                ]
+            )
+        if "implementer_reasoning_effort" in handoff:
+            override_sets.append("reasoning_effort = ?")
+            override_params_list.append(normalize_reasoning_effort(handoff.get("implementer_reasoning_effort")))
+        params: tuple[Any, ...] = (
+            new_status,
+            *((implementer,) if implementer else ()),
+            *override_params_list,
+            task_id,
+        )
         cur = conn.execute(
             # consecutive_failures deliberately PRESERVED: review reopen is not
             # a success signal; only complete_task resets the breaker (#35072).
             "UPDATE tasks SET status = ?, current_run_id = NULL, "
             "claim_lock = NULL, claim_expires = NULL, worker_pid = NULL "
             + (", assignee = ?" if implementer else "")
+            + (", " + ", ".join(override_sets) if override_sets else "")
             + " WHERE id = ? AND status = 'review'",
             params,
         )

@@ -73,10 +73,14 @@ def _events(conn, tid, kind=None):
     return out
 
 
-def _make_review_task(conn, *, implementer: str = "claudeprimary") -> tuple[str, int]:
+def _make_review_task(
+    conn, *, implementer: str = "claudeprimary", reasoning_effort: str | None = None,
+) -> tuple[str, int]:
     """A task carried through running -> review via ``request_review``,
     still assigned to its implementer (auto-review's starting state)."""
-    tid = kb.create_task(conn, title="impl a feature", assignee=implementer)
+    tid = kb.create_task(
+        conn, title="impl a feature", assignee=implementer, reasoning_effort=reasoning_effort,
+    )
     kb.claim_task(conn, tid)
     run_id = kb.get_task(conn, tid).current_run_id
     ok = kb.request_review(conn, tid, summary="done", expected_run_id=run_id)
@@ -94,7 +98,7 @@ def _make_review_task(conn, *, implementer: str = "claudeprimary") -> tuple[str,
 
 def test_default_reviewer_reassigns_when_different_from_implementer(kanban_home: Path) -> None:
     with kbc.connect() as conn:
-        tid, _ = _make_review_task(conn, implementer="claudeprimary")
+        tid, _ = _make_review_task(conn, implementer="claudeprimary", reasoning_effort="ultra")
 
     with kbc.connect() as conn:
         res = kbd.dispatch_once(
@@ -109,9 +113,10 @@ def test_default_reviewer_reassigns_when_different_from_implementer(kanban_home:
 
     with kbc.connect() as conn:
         row = conn.execute(
-            "SELECT assignee FROM tasks WHERE id = ?", (tid,),
+            "SELECT assignee, reasoning_effort FROM tasks WHERE id = ?", (tid,),
         ).fetchone()
         assert row["assignee"] == "default"
+        assert row["reasoning_effort"] is None
 
         # Audit trail: an 'assigned' event with implementer->reviewer provenance.
         evs = _events(conn, tid, kind="assigned")
@@ -119,6 +124,7 @@ def test_default_reviewer_reassigns_when_different_from_implementer(kanban_home:
         assert evs[0][1]["assignee"] == "default"
         assert evs[0][1]["previous_assignee"] == "claudeprimary"
         assert evs[0][1]["source"] == "kanban.default_reviewer"
+        assert evs[0][1]["implementer_reasoning_effort"] == "ultra"
 
 
 # ---------------------------------------------------------------------------
@@ -227,7 +233,7 @@ def test_auto_assigned_reviewer_survives_request_changes_round_trip(kanban_home:
     check (kanban_db._prior_reviewer) — no "re-review has no durable
     reviewer provenance" regression."""
     with kbc.connect() as conn:
-        tid, _ = _make_review_task(conn, implementer="claudeprimary")
+        tid, _ = _make_review_task(conn, implementer="claudeprimary", reasoning_effort="ultra")
 
     with kbc.connect() as conn:
         res = kbd.dispatch_once(
@@ -242,10 +248,11 @@ def test_auto_assigned_reviewer_survives_request_changes_round_trip(kanban_home:
         # dispatcher reassigns, then immediately claims + spawns the review
         # worker in the same tick).
         row = conn.execute(
-            "SELECT status, assignee, current_run_id FROM tasks WHERE id = ?", (tid,),
+            "SELECT status, assignee, current_run_id, reasoning_effort FROM tasks WHERE id = ?", (tid,),
         ).fetchone()
         assert row["status"] == "running"
         assert row["assignee"] == "default"
+        assert row["reasoning_effort"] is None
         run_id = row["current_run_id"]
         assert run_id is not None
 
@@ -256,10 +263,11 @@ def test_auto_assigned_reviewer_survives_request_changes_round_trip(kanban_home:
         assert implementer == "claudeprimary"
 
         row = conn.execute(
-            "SELECT status, assignee FROM tasks WHERE id = ?", (tid,),
+            "SELECT status, assignee, reasoning_effort FROM tasks WHERE id = ?", (tid,),
         ).fetchone()
         assert row["status"] == "ready"
         assert row["assignee"] == "claudeprimary"
+        assert row["reasoning_effort"] == "ultra"
 
         # Implementer does another pass and re-requests review WITHOUT
         # explicitly naming a reviewer — request_review must fall back to
@@ -271,7 +279,8 @@ def test_auto_assigned_reviewer_survives_request_changes_round_trip(kanban_home:
         assert ok2 is True
 
         row2 = conn.execute(
-            "SELECT status, assignee FROM tasks WHERE id = ?", (tid,),
+            "SELECT status, assignee, reasoning_effort FROM tasks WHERE id = ?", (tid,),
         ).fetchone()
         assert row2["status"] == "review"
         assert row2["assignee"] == "default"
+        assert row2["reasoning_effort"] is None

@@ -2,6 +2,7 @@ import pytest
 
 from hermes_cli import kanban_db as kb
 from hermes_cli import kanban_db_connect as kbc
+from hermes_cli.kanban_model_routing import KanbanModelRouteDecision
 from hermes_cli.kanban_swarm import (
     SwarmWorkerSpec,
     create_swarm,
@@ -128,6 +129,186 @@ def test_create_swarm_graph_is_atomic_and_rolls_back_partial_build(
     finally:
         reader.close()
         writer.close()
+
+
+def test_create_swarm_resolves_every_route_before_any_topology_is_visible(tmp_path, monkeypatch):
+    db_path = tmp_path / "kanban.db"
+    conn = kbc.connect(db_path)
+    reader = kbc.connect(db_path)
+    calls: list[dict[str, object]] = []
+
+    route = KanbanModelRouteDecision(
+        route_source="mechanical",
+        route_name="mechanical",
+        model_override="gpt-5.4-mini",
+        provider_override="openai-codex",
+        reasoning_effort="medium",
+    )
+
+    def _fake_resolver(**kwargs):
+        assert not conn.in_transaction
+        assert reader.execute("SELECT COUNT(*) FROM tasks").fetchone()[0] == 0
+        calls.append(kwargs)
+        return route
+
+    monkeypatch.setattr("hermes_cli.kanban_model_routing.resolve_kanban_model_route", _fake_resolver)
+    try:
+        created = create_swarm(
+            conn,
+            goal="Collect evidence for the launch memo.",
+            workers=[SwarmWorkerSpec(profile="researcher", title="Research", body="Find proof")],
+            verifier_assignee="reviewer",
+            synthesizer_assignee="writer",
+            root_title="Swarm root",
+            created_by="orchestrator",
+            idempotency_key="swarm-routing-demo",
+        )
+
+        root = kb.get_task(conn, created.root_id)
+        worker = kb.get_task(conn, created.worker_ids[0])
+        verifier = kb.get_task(conn, created.verifier_id)
+        synthesizer = kb.get_task(conn, created.synthesizer_id)
+
+        assert root is not None and worker is not None and verifier is not None and synthesizer is not None
+        assert len(calls) == 4
+        assert [call["title"] for call in calls] == ["Swarm root", "Research", "Verify swarm outputs", "Synthesize swarm outputs"]
+        assert all(set(call) == {"title", "body"} for call in calls)
+        # Each classifier sees precisely the body later persisted on its card,
+        # including the swarm context that controls worker coordination.
+        assert calls[1]["body"] == worker.body
+        assert calls[2]["body"] == verifier.body
+        assert calls[3]["body"] == synthesizer.body
+        assert root.route_source == "mechanical"
+        assert root.route_name == "mechanical"
+        assert root.model_override == "gpt-5.4-mini"
+        assert worker.route_source == "mechanical"
+        assert worker.route_name == "mechanical"
+        assert verifier.route_source == "mechanical"
+        assert verifier.route_name == "mechanical"
+        assert synthesizer.route_source == "mechanical"
+        assert synthesizer.route_name == "mechanical"
+        assert root.status == "done"
+        assert worker.status == "ready"
+        assert verifier.status == "todo"
+        assert synthesizer.status == "todo"
+    finally:
+        reader.close()
+        conn.close()
+
+
+def test_create_swarm_classifier_failure_leaves_no_partial_topology(tmp_path, monkeypatch):
+    db_path = tmp_path / "kanban.db"
+    conn = kbc.connect(db_path)
+    reader = kbc.connect(db_path)
+    calls = 0
+
+    def _failing_resolver(**_kwargs):
+        nonlocal calls
+        calls += 1
+        assert reader.execute("SELECT COUNT(*) FROM tasks").fetchone()[0] == 0
+        if calls == 3:
+            raise RuntimeError("classifier unavailable")
+        return KanbanModelRouteDecision("default", None, None, None, None)
+
+    monkeypatch.setattr("hermes_cli.kanban_model_routing.resolve_kanban_model_route", _failing_resolver)
+    try:
+        with pytest.raises(RuntimeError, match="classifier unavailable"):
+            create_swarm(
+                conn,
+                goal="Never expose a partial swarm.",
+                workers=[SwarmWorkerSpec(profile="researcher", title="Research", body="Find proof")],
+                verifier_assignee="reviewer",
+                synthesizer_assignee="writer",
+            )
+        assert calls == 3
+        assert reader.execute("SELECT COUNT(*) FROM tasks").fetchone()[0] == 0
+    finally:
+        reader.close()
+        conn.close()
+
+
+def test_create_swarm_idempotent_return_skips_rerouting(tmp_path, monkeypatch):
+    conn = kbc.connect(tmp_path / "kanban.db")
+    calls: list[dict[str, object]] = []
+
+    route = KanbanModelRouteDecision(
+        route_source="mechanical",
+        route_name="mechanical",
+        model_override="gpt-5.4-mini",
+        provider_override="openai-codex",
+        reasoning_effort="medium",
+    )
+
+    def _fake_resolver(**kwargs):
+        calls.append(kwargs)
+        return route
+
+    monkeypatch.setattr("hermes_cli.kanban_model_routing.resolve_kanban_model_route", _fake_resolver)
+    try:
+        created = create_swarm(
+            conn,
+            goal="Keep the same plan.",
+            workers=[SwarmWorkerSpec(profile="researcher", title="Research", body="Find proof")],
+            verifier_assignee="reviewer",
+            synthesizer_assignee="writer",
+            root_title="Swarm root",
+            created_by="orchestrator",
+            idempotency_key="swarm-routing-idempotent",
+        )
+        first_call_count = len(calls)
+        assert first_call_count == 4
+
+        repeated = create_swarm(
+            conn,
+            goal="Keep the same plan.",
+            workers=[SwarmWorkerSpec(profile="researcher", title="Research", body="Find proof")],
+            verifier_assignee="reviewer",
+            synthesizer_assignee="writer",
+            root_title="Swarm root",
+            created_by="orchestrator",
+            idempotency_key="swarm-routing-idempotent",
+        )
+
+        assert repeated == created
+        assert len(calls) == first_call_count
+    finally:
+        conn.close()
+
+
+def test_create_swarm_rechecks_topology_after_idempotent_root_create(tmp_path, monkeypatch):
+    """A caller that raced past preflight must not append a second graph."""
+    conn = kbc.connect(tmp_path / "kanban.db")
+    try:
+        original = create_swarm(
+            conn,
+            goal="Keep exactly one graph.",
+            workers=[SwarmWorkerSpec(profile="researcher", title="Research", body="Find proof")],
+            verifier_assignee="reviewer",
+            synthesizer_assignee="writer",
+            idempotency_key="swarm-race",
+        )
+        before = conn.execute("SELECT COUNT(*) FROM tasks").fetchone()[0]
+
+        # Simulate a competing caller that did its preflight before the first
+        # caller committed. Its root create still resolves to the existing
+        # idempotency-keyed task, where topology is now available.
+        monkeypatch.setattr(
+            "hermes_cli.kanban_swarm._existing_swarm_from_idempotency_key",
+            lambda *_args, **_kwargs: (None, None),
+        )
+        repeated = create_swarm(
+            conn,
+            goal="Keep exactly one graph.",
+            workers=[SwarmWorkerSpec(profile="researcher", title="Research", body="Find proof")],
+            verifier_assignee="reviewer",
+            synthesizer_assignee="writer",
+            idempotency_key="swarm-race",
+        )
+
+        assert repeated == original
+        assert conn.execute("SELECT COUNT(*) FROM tasks").fetchone()[0] == before
+    finally:
+        conn.close()
 
 
 def test_plain_write_txn_nesting_raises_and_allow_nested_composes(tmp_path):

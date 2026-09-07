@@ -536,10 +536,37 @@ class CreateTaskBody(BaseModel):
 @router.post("/tasks")
 def create_task(payload: CreateTaskBody, board: Optional[str] = Query(None)):
     with _board_conn(board) as (board, conn), _value_error_400():
+        # Keep established explicit-override validation ahead of the idempotent
+        # fast path, which otherwise skips the DB create validation entirely.
+        kanban_db._validate_model_override(payload.model_override, payload.provider_override)
+        kanban_db.normalize_reasoning_effort(payload.reasoning_effort)
+        # An idempotent replay must return its existing route without consuming
+        # another classifier invocation.
+        existing = kanban_db.get_task_by_idempotency_key(conn, payload.idempotency_key)
+        if existing is not None:
+            return {
+                "task": _task_dict(existing),
+                "attachments": [],
+                "attachment_warnings": [],
+            }
         # CreateTaskBody field names match create_task's keyword parameters.
+        from hermes_cli.kanban_model_routing import resolve_kanban_model_route
+
+        routing = resolve_kanban_model_route(
+            title=payload.title, body=payload.body,
+            explicit_model=payload.model_override, explicit_provider=payload.provider_override,
+            explicit_reasoning_effort=payload.reasoning_effort,
+        )
+        create_kwargs = payload.model_dump(exclude={"pending_attachment_tokens"})
+        create_kwargs.update(
+            model_override=routing.model_override,
+            provider_override=routing.provider_override,
+            reasoning_effort=routing.reasoning_effort,
+            route_source=routing.route_source,
+            route_name=routing.route_name,
+        )
         task_id = kanban_db.create_task(
-            conn, created_by="dashboard", board=board,
-            **payload.model_dump(exclude={"pending_attachment_tokens"}))
+            conn, created_by="dashboard", board=board, **create_kwargs)
         task = kanban_db.get_task(conn, task_id)
         body: dict[str, Any] = {"task": _task_dict(task) if task else None}
         # Promote pasted-image attachments staged before the task existed; a stale/unknown token

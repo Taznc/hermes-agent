@@ -20,6 +20,7 @@ _TASK_DICT_FIELDS = (
     "workspace_kind", "workspace_path", "branch_name", "project_id",
     "created_by", "created_at", "started_at", "completed_at", "result",
     "skills", "max_retries", "model_override", "provider_override",
+    "reasoning_effort", "route_source", "route_name",
     "session_id", "workflow_template_id", "current_step_key",
 )
 _SHOW_RUN_FIELDS = (

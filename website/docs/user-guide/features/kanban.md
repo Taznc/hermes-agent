@@ -17,7 +17,47 @@ The board has two front doors, both backed by the same `~/.hermes/kanban.db`:
 - **Agents drive the board through a dedicated `kanban_*` toolset** — `kanban_show`, `kanban_list`, `kanban_complete`, `kanban_request_review`, `kanban_request_changes`, `kanban_block`, `kanban_heartbeat`, `kanban_comment`, `kanban_attach`, `kanban_attach_url`, `kanban_attachments`, `kanban_create`, `kanban_link`, `kanban_unblock`. The dispatcher spawns each worker with these tools already in its schema; orchestrator profiles can also enable the `kanban` toolset explicitly. The model reads and routes tasks by calling tools directly, *not* by shelling out to `hermes kanban`. See [How workers interact with the board](#how-workers-interact-with-the-board) below.
 - **You (and scripts, and cron) drive the board through `hermes kanban …`** on the CLI, `/kanban …` as a slash command, or the dashboard. These are for humans and automation — the places without a tool-calling model behind them.
 
-Both surfaces route through the same `kanban_db` layer, so reads see a consistent view and writes can't drift. The rest of this page shows CLI examples because they're easy to copy-paste, but every CLI verb has a tool-call equivalent the model uses.
+Both surfaces route through the same `kanban_db` layer, so reads see a consistent view and writes can't drift.
+
+Kanban can also auto-route new cards at create time when a profile enables `kanban.model_routing`.
+The selector looks only at the new card's title and body, stores the chosen route on the task, and
+never reruns on review, unblock, or retry transitions. The CLI's JSON `show` output and the
+dashboard task payload include the route provenance (`route_source`, `route_name`, and the resolved
+`reasoning_effort`) so you can audit how a card was classified.
+
+### Create-time routing policy
+
+`kanban.model_routing` is disabled by default, and its shipped defaults are deliberately inert:
+setting `enabled: true` alone cannot make a classifier call or select a route. Each profile independently
+configures its classifier provider/model and every eligible candidate route; profiles do not inherit this
+policy from the default profile. The classifier only sees the new card's title/body and must return either
+`default` or one of those configured named routes. Any malformed, unavailable, unsupported, or failed
+classification falls back to `default`, which means the assignee profile keeps its own
+model/provider/reasoning settings.
+
+Explicit task-level `model`, `provider`, and `reasoning_effort` overrides always win over routing.
+The route itself should be treated as a conservative safety gate, not a general optimizer: only
+configure cheap routes you are comfortable using for narrow, mechanical work.
+
+```yaml
+kanban:
+  model_routing:
+    enabled: false
+    classifier:
+      provider: openai-codex
+      model: gpt-5.4-mini
+      max_input_tokens: 8000
+    routes:
+      mechanical:
+        provider: openai-codex
+        model: gpt-5.4-mini
+        reasoning_effort: medium
+```
+
+The resolved route provenance is written back to the task row (`route_source`, `route_name`, and the
+ effective `reasoning_effort`) and stays stable across review, retry, unblock, and reclaim.
+
+The rest of this page shows CLI examples because they're easy to copy-paste, but every CLI verb has a tool-call equivalent the model uses.
 
 This is the shape that covers the workloads `delegate_task` can't:
 
