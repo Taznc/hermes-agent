@@ -38,7 +38,10 @@ _OUTPUT_SCHEMA = {
                         "model": {"type": "string"},
                         "effort": {"type": "string", "enum": list(EFFORTS)},
                         "reason": {"type": "string", "maxLength": 240},
-                        "quality": {"type": "integer", "minimum": 0, "maximum": 100},
+                        # No minimum/maximum: Anthropic's structured-output validator 400s on
+                        # numeric bounds ("properties maximum, minimum are not supported").
+                        # The 0-100 bound is enforced in _parse_router_output instead.
+                        "quality": {"type": "integer"},
                         "materially_advantageous": {"type": "boolean"},
                     },
                 },
@@ -190,21 +193,33 @@ def _router_messages(draft: str, attachments: list[dict[str, Any]], policy: str,
 
 def _run_router_once(router: dict[str, Any], messages: list[dict[str, str]]) -> str:
     """Make exactly one direct provider call: no auto route, retry, or fallback ladder."""
-    from agent.auxiliary_client import resolve_provider_client
+    from agent.auxiliary_client import _endpoint_speaks_anthropic_messages, resolve_provider_client
 
     client, resolved_model = resolve_provider_client(
         router["provider"], model=router["model"], explicit_base_url=router["base_url"],
         explicit_api_key=router["api_key"], api_mode=router["api_mode"], task="model_recommendation")
     if client is None or not resolved_model:
         raise RuntimeError("router provider is unavailable")
-    response = client.chat.completions.create(
-        model=resolved_model,
-        messages=messages,
-        temperature=0,
-        max_tokens=900,
-        timeout=router["timeout"],
-        response_format={"type": "json_schema", "json_schema": _OUTPUT_SCHEMA},
-    )
+    kwargs: dict[str, Any] = {
+        "model": resolved_model,
+        "messages": messages,
+        "temperature": 0,
+        "max_tokens": 900,
+        "timeout": router["timeout"],
+        "response_format": {"type": "json_schema", "json_schema": _OUTPUT_SCHEMA},
+    }
+    # Adaptive-thinking Claude models (Sonnet/Opus/Fable 4.6+) think by default even with no
+    # reasoning config, and that invisible thinking counts against max_tokens. This is a fixed,
+    # cheap, deterministic classification call (temperature=0) with no need for chain-of-thought,
+    # so disable it explicitly — otherwise thinking alone can consume the whole 900-token budget
+    # and truncate the JSON answer before it is written (finish_reason="length" -> unparseable
+    # output -> always "unavailable" on Claude, regardless of the schema/candidates being fine).
+    # ``_reasoning_config`` is a private kwarg only Anthropic-Messages-wire adapters understand
+    # (agent/auxiliary_client.py's own _prepare_aux_request gates it the same way); a bare
+    # OpenAI-compatible client (custom/openrouter/xai-oauth routers) would 400/TypeError on it.
+    if router["provider"] == "anthropic" or _endpoint_speaks_anthropic_messages(router["base_url"] or ""):
+        kwargs["_reasoning_config"] = {"enabled": False}
+    response = client.chat.completions.create(**kwargs)
     return str(response.choices[0].message.content or "")
 
 

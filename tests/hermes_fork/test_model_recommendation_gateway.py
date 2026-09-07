@@ -359,6 +359,52 @@ def test_router_is_a_single_direct_call_with_strict_structured_output(monkeypatc
     assert calls[0]["response_format"]["json_schema"]["strict"] is True
 
 
+def _schema_numeric_bound_paths(node, path=""):
+    """Walk a JSON schema and yield paths of any 'minimum'/'maximum' keyword."""
+    if isinstance(node, dict):
+        for key in ("minimum", "maximum"):
+            if key in node:
+                yield f"{path}.{key}"
+        for key, value in node.items():
+            yield from _schema_numeric_bound_paths(value, f"{path}.{key}")
+    elif isinstance(node, list):
+        for i, item in enumerate(node):
+            yield from _schema_numeric_bound_paths(item, f"{path}[{i}]")
+
+
+def test_output_schema_has_no_anthropic_incompatible_numeric_bounds():
+    """Anthropic's structured-output validator 400s with 'properties maximum, minimum are not
+    supported' for integer/number schema properties (confirmed live against claude-sonnet-5,
+    2026-09-07). The router's shared _OUTPUT_SCHEMA must never reintroduce minimum/maximum;
+    range checks belong in _parse_router_output instead."""
+    bounds = list(_schema_numeric_bound_paths(service._OUTPUT_SCHEMA["schema"]))
+    assert bounds == [], f"schema has Anthropic-incompatible numeric bounds: {bounds}"
+
+
+def test_run_router_once_disables_thinking_only_for_anthropic_wire(monkeypatch):
+    """Adaptive-thinking Claude models (Sonnet/Opus/Fable 4.6+) think by default even with no
+    reasoning config, and invisible thinking counts against the fixed 900-token budget — this
+    truncated real router output (finish_reason="length") and always failed closed. Disabling
+    thinking must be scoped to Anthropic-Messages-wire clients only; a plain OpenAI-compatible
+    client has no ``_reasoning_config`` kwarg and would reject it."""
+    calls = []
+
+    def create(**kwargs):
+        calls.append(kwargs)
+        return SimpleNamespace(choices=[SimpleNamespace(message=SimpleNamespace(content="{}"))])
+
+    client = SimpleNamespace(chat=SimpleNamespace(completions=SimpleNamespace(create=create)))
+    monkeypatch.setattr("agent.auxiliary_client.resolve_provider_client", lambda *args, **kwargs: (client, "router"))
+
+    service._run_router_once(
+        {"provider": "anthropic", "model": "router", "base_url": None, "api_key": None, "api_mode": None, "timeout": 20}, [])
+    assert calls[-1].get("_reasoning_config") == {"enabled": False}
+
+    service._run_router_once(
+        {"provider": "openai-codex", "model": "router", "base_url": None, "api_key": None, "api_mode": None, "timeout": 20}, [])
+    assert "_reasoning_config" not in calls[-1]
+
+
 def test_codex_adapter_translates_router_schema_to_responses_output_format():
     from agent.auxiliary_client import _CodexCompletionsAdapter
 
