@@ -16,6 +16,29 @@ from unittest.mock import Mock
 import pytest
 
 
+@pytest.fixture(autouse=True)
+def _placement_gives_no_answer(monkeypatch):
+    """State this file's PLACEMENT input: "the kernel says nothing".
+
+    The restart-safe tests here simulate topology through IDENTITY
+    (``_is_supervised_gateway_process``, ``INVOCATION_ID``, ``SYSTEMD_EXEC_PID``), which
+    is data a test can set. Placement is not: ``_scope_needed_by_cgroup_placement`` reads
+    the TEST RUNNER's own real cgroup, so leaving it live lets the verdict be decided by
+    where the suite happens to run — inside a supervised ``hermes-*`` unit it answers True
+    and wraps a command a test asserts is unwrapped; inside a ``hermes-worker-*`` scope it
+    answers "already isolated" and skips a wrap a test asserts happens.
+
+    Pinning it to ``None`` (a cgroup-v1 host, or a container that hides
+    ``/proc/self/cgroup``) makes these exercise the identity fallback deterministically on
+    any host. Placement itself is covered by
+    ``tests/tools/test_process_registry.py::TestSupervisedUnitCgroupPlacement`` and, live,
+    by ``tests/hermes_cli/test_kanban_gateway_restart_handoff.py``.
+    """
+    monkeypatch.setattr(
+        "tools.process_registry._scope_needed_by_cgroup_placement", lambda: None
+    )
+
+
 @pytest.fixture
 def execution_ledger(tmp_path, monkeypatch):
     import cron.executions as executions
@@ -83,10 +106,6 @@ def test_restart_safe_gateway_child_fails_closed_without_scope(monkeypatch):
 
     monkeypatch.setattr(process_registry, "_is_supervised_gateway_process", lambda: True)
     monkeypatch.setenv("INVOCATION_ID", "managed-service")
-    # This test simulates IDENTITY. Neutralize the cgroup-placement input so the verdict
-    # is not decided by the test runner's own real cgroup (under CI-in-a-worker-scope it
-    # reads "already isolated" and would skip the wrap this test asserts).
-    monkeypatch.setattr(process_registry, "_scope_needed_by_cgroup_placement", lambda: None)
     monkeypatch.setattr(process_registry, "_systemd_run_user_scope_available", lambda: False)
 
     with pytest.raises(
