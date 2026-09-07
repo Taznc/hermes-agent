@@ -358,6 +358,10 @@ _SPECS = [
     _cmd("dispatch", [
         _arg("--dry-run", action="store_true", help="Don't actually spawn processes; just print what would happen"),
         _arg("--max", type=int, help="Cap number of spawns this pass"),
+        _arg("--pause", nargs="*", metavar="NOTE",
+             help="Stop this board claiming/spawning new workers (running workers are "
+                  "untouched) so it can drain before a maintenance restart; optional NOTE "
+                  "is recorded on the pause. Clear it with --resume-circuit."),
         _arg("--resume-circuit", action="store_true",
              help="Clear this board's dispatch pause after operator recovery and exit"),
         _arg("--circuit-status", action="store_true",
