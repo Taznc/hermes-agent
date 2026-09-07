@@ -71,6 +71,7 @@ import {
   $lanesByProfile,
   addRoadmapIdea,
   ALL_BOARDS,
+  archiveDone,
   boardKey,
   BOARDS_KEY,
   bulkTasks,
@@ -79,6 +80,7 @@ import {
   deleteTask,
   estimateNew,
   fetchAllBoards,
+  fetchArchiveDonePreflight,
   fetchAttachmentDataUrl,
   fetchBoard,
   fetchBoards,
@@ -1963,6 +1965,71 @@ export function BoardsErrorNotice({ errors }: { errors?: Array<{ board: string; 
   )
 }
 
+/** Board-scoped completed-card cleanup. The backend remains authoritative for
+ * the candidate set: the preflight only enables the affordance and gives the
+ * confirmation its honest count, while the mutation re-checks `done` per card.
+ */
+export function ArchiveDoneControl() {
+  const k = useKanban()
+  const qc = useQueryClient()
+  const [open, setOpen] = useState(false)
+
+  const { data: preflight } = useQuery({
+    queryFn: fetchArchiveDonePreflight,
+    queryKey: ['kanban', 'archive-done', $boardSlug.get()]
+  })
+
+  const archive = useMutation({
+    mutationFn: archiveDone,
+    onError: err => host.notify({ kind: 'error', message: errText(err) }),
+    onSuccess: result => {
+      // Archive events will also invalidate through the socket, but reconcile
+      // immediately rather than waiting for that asynchronous delivery.
+      void qc.invalidateQueries({ queryKey: ['kanban', 'board'] })
+      void qc.invalidateQueries({ queryKey: BOARDS_KEY })
+      void qc.invalidateQueries({ queryKey: ['kanban', 'archive-done'] })
+      setOpen(false)
+
+      if (result.failures.length > 0 || result.skipped_count > 0) {
+        host.notify({
+          kind: 'warning',
+          message: k.archiveDonePartial(result.archived_count, result.failures.length, result.skipped_count)
+        })
+      } else {
+        host.notify({ kind: 'success', message: k.archiveDoneSuccess(result.archived_count) })
+      }
+    }
+  })
+
+  const doneCount = preflight?.done_count ?? 0
+  const disabled = !preflight || doneCount === 0 || archive.isPending
+
+  return (
+    <>
+      <Button aria-label={k.archiveDone} disabled={disabled} onClick={() => setOpen(true)} size="xs" variant="ghost">
+        <Codicon name="archive" size="0.8rem" />
+        {k.archiveDone}
+      </Button>
+      <Dialog onOpenChange={next => !archive.isPending && setOpen(next)} open={open}>
+        <DialogContent className="w-[min(28rem,94vw)]">
+          <DialogHeader>
+            <DialogTitle>{k.archiveDone}</DialogTitle>
+          </DialogHeader>
+          <p className="text-sm text-(--ui-text-secondary)">{k.archiveDoneConfirm(doneCount, preflight?.scope.label ?? '')}</p>
+          <DialogFooter>
+            <Button disabled={archive.isPending} onClick={() => setOpen(false)} variant="ghost">
+              {k.cancel}
+            </Button>
+            <Button disabled={archive.isPending} onClick={() => archive.mutate()}>
+              {k.archiveDone}
+            </Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
+    </>
+  )
+}
+
 // ── page ─────────────────────────────────────────────────────────────────────
 
 export function KanbanBoardPage() {
@@ -2421,6 +2488,7 @@ export function KanbanBoardPage() {
             )}
             <SearchField aria-label={k.filterCards} onChange={setSearch} placeholder={k.filterCards} value={search} />
             <div className="ml-auto flex items-center gap-1">
+              {board && !archived && <ArchiveDoneControl />}
               <Tip label={k.ideaTitle}>
                 <Button aria-label={k.ideaTitle} onClick={() => setIdeaOpen(true)} size="icon-xs" variant="ghost">
                   <Codicon name="lightbulb" size="0.85rem" />

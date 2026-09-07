@@ -57,6 +57,10 @@ type KanbanMessages = {
   assign: string
   unassignAction: string
   archive: string
+  archiveDone: string
+  archiveDoneConfirm: (count: number, scope: string) => string
+  archiveDonePartial: (archived: number, failed: number, skipped: number) => string
+  archiveDoneSuccess: (archived: number) => string
   clearSelection: string
   refused: string
   bulkFailed: (failed: number, total: number, err: string) => string
@@ -402,6 +406,11 @@ export const en: KanbanMessages = {
   assign: 'Assign',
   unassignAction: 'Unassign',
   archive: 'Archive',
+  archiveDone: 'Archive Done',
+  archiveDoneConfirm: (count, scope) => `Archive ${count} completed card${count === 1 ? '' : 's'} from ${scope}?`,
+  archiveDonePartial: (archived, failed, skipped) =>
+    `${archived} completed card${archived === 1 ? '' : 's'} archived; ${failed} failed and ${skipped} skipped.`,
+  archiveDoneSuccess: archived => `${archived} completed card${archived === 1 ? '' : 's'} archived.`,
   clearSelection: 'Clear selection (Esc)',
   refused: 'refused',
   bulkFailed: (failed, total, err) => `${failed} of ${total} failed — ${err}. Failed cards stay selected.`,
@@ -730,6 +739,10 @@ const ja: KanbanMessages = {
   assign: '割り当て',
   unassignAction: '割り当て解除',
   archive: 'アーカイブ',
+  archiveDone: '完了をアーカイブ',
+  archiveDoneConfirm: (count, scope) => `${scope} の完了済みカード ${count} 件をアーカイブしますか？`,
+  archiveDonePartial: (archived, failed, skipped) => `完了済みカード ${archived} 件をアーカイブ、${failed} 件失敗、${skipped} 件スキップしました。`,
+  archiveDoneSuccess: archived => `完了済みカード ${archived} 件をアーカイブしました。`,
   clearSelection: '選択をクリア（Esc）',
   refused: '拒否されました',
   bulkFailed: (failed, total, err) => `${total} 件中 ${failed} 件が失敗 — ${err}。失敗したカードは選択されたままです。`,
@@ -1057,6 +1070,10 @@ const zh: KanbanMessages = {
   assign: '分配',
   unassignAction: '取消分配',
   archive: '归档',
+  archiveDone: '归档已完成',
+  archiveDoneConfirm: (count, scope) => `要归档 ${scope} 中的 ${count} 个已完成卡片吗？`,
+  archiveDonePartial: (archived, failed, skipped) => `已归档 ${archived} 个已完成卡片；${failed} 个失败，${skipped} 个跳过。`,
+  archiveDoneSuccess: archived => `已归档 ${archived} 个已完成卡片。`,
   clearSelection: '清除选择（Esc）',
   refused: '被拒绝',
   bulkFailed: (failed, total, err) => `${total} 个中有 ${failed} 个失败 — ${err}。失败的卡片仍保持选中。`,
@@ -1380,6 +1397,10 @@ const zhHant: KanbanMessages = {
   assign: '指派',
   unassignAction: '取消指派',
   archive: '封存',
+  archiveDone: '封存已完成',
+  archiveDoneConfirm: (count, scope) => `要封存 ${scope} 中的 ${count} 個已完成卡片嗎？`,
+  archiveDonePartial: (archived, failed, skipped) => `已封存 ${archived} 個已完成卡片；${failed} 個失敗，${skipped} 個略過。`,
+  archiveDoneSuccess: archived => `已封存 ${archived} 個已完成卡片。`,
   clearSelection: '清除選取（Esc）',
   refused: '被拒絕',
   bulkFailed: (failed, total, err) => `${total} 個中有 ${failed} 個失敗 — ${err}。失敗的卡片仍保持選取。`,
