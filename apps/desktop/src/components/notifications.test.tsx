@@ -19,14 +19,14 @@ describe('toast titles', () => {
     clearNotifications()
   })
 
-  it('drops the one-line clamp so a long error title can wrap', () => {
+  it('lets a long error title wrap without creating a nested scrollbar', () => {
     const className = toastTitleClassName()
 
     expect(className).toMatch(/\bline-clamp-none\b/)
     expect(className).not.toMatch(/\bline-clamp-1\b/)
     expect(className).toMatch(/\bwhitespace-normal\b/)
-    expect(className).toContain('max-h-[4.5em]')
-    expect(className).toMatch(/\boverflow-y-auto\b/)
+    expect(className).not.toContain('max-h-[4.5em]')
+    expect(className).not.toMatch(/\boverflow-y-auto\b/)
   })
 
   it('renders the full title and body instead of truncating them', () => {
@@ -44,7 +44,31 @@ describe('toast titles', () => {
     expect(title.getAttribute('title')).toBe(LONG_TITLE)
     expect(title.className).toMatch(/\bline-clamp-none\b/)
     expect(title.className).not.toMatch(/\bline-clamp-1\b/)
-    expect(title.className).toMatch(/\boverflow-y-auto\b/)
+    expect(title.className).not.toMatch(/\boverflow-y-auto\b/)
     expect(screen.getByText(DETAIL)).toBeTruthy()
+  })
+
+  it('keeps an action notification visible until the user dismisses it', () => {
+    notify({
+      message: 'A newer build is ready to install.',
+      action: { label: 'Review update', onClick: () => undefined }
+    })
+
+    render(
+      <I18nProvider configClient={null} initialLocale="en">
+        <NotificationStack />
+      </I18nProvider>
+    )
+
+    return new Promise<void>((resolve, reject) => {
+      window.setTimeout(() => {
+        try {
+          expect(screen.getByRole('button', { name: 'Review update' })).toBeTruthy()
+          resolve()
+        } catch (error) {
+          reject(error)
+        }
+      }, 5_100)
+    })
   })
 })

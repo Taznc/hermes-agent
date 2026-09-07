@@ -478,8 +478,10 @@ def _rule_repeated_crashes(task, events, runs, now, cfg) -> list[Diagnostic]:
         return []
 
     threshold = int(cfg.get("crash_threshold", 2))
-    # Count trailing consecutive 'crashed' outcomes; a success (or manual
-    # reclaim) breaks the streak, other outcomes neither count nor break it.
+    # Count trailing consecutive 'crashed' outcomes. A later terminal workflow
+    # outcome proves the worker (or operator) resolved the prior run, so old
+    # crash history must not stay visible as an active incident. Transient
+    # non-terminal outcomes (rate limit, timeout, stale) remain neutral.
     consecutive = 0
     last_err = None
     for r in _runs_newest_first(runs):
@@ -488,7 +490,10 @@ def _rule_repeated_crashes(task, events, runs, now, cfg) -> list[Diagnostic]:
             consecutive += 1
             if last_err is None:
                 last_err = _task_field(r, "error")
-        elif outcome in {"completed", "reclaimed"}:
+        elif outcome in {
+            "completed", "reclaimed", "blocked", "scheduled", "on_hold",
+            "review_requested", "changes_requested",
+        }:
             break
     if consecutive < threshold:
         return []

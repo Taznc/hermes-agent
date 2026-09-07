@@ -27,7 +27,10 @@ const tone: Record<NotificationKind, { icon: IconComponent; iconClass: string; v
   success: { icon: CheckCircle2, iconClass: 'text-primary', variant: 'success' }
 }
 
-const STACK_SURFACE = 'pointer-events-auto border border-(--stroke-nous) bg-popover/95 shadow-nous backdrop-blur-md'
+// Keep the alert's semantic background intact instead of washing every kind
+// into the same translucent panel. The shared overlay stroke/shadow carries the
+// floating surface treatment across themes.
+const STACK_SURFACE = 'pointer-events-auto border border-(--stroke-nous) shadow-nous'
 
 function partitionNotifications(notifications: AppNotification[]) {
   const defaultStack: AppNotification[] = []
@@ -126,7 +129,12 @@ function TopCenterStack({
       <NotificationItem notification={latest} />
       {expanded && older.map(n => <NotificationItem key={n.id} notification={n} />)}
       {older.length > 0 && (
-        <div className={cn(STACK_SURFACE, 'flex min-h-8 items-center justify-between rounded-lg px-3 text-xs')}>
+        <div
+          className={cn(
+            STACK_SURFACE,
+            'flex min-h-8 items-center justify-between rounded-lg bg-popover px-3 text-xs text-popover-foreground'
+          )}
+        >
           <Button className="-ml-2" onClick={onToggleExpanded} size="xs" type="button" variant="text">
             {expanded ? copy.hide : copy.show} {copy.more(older.length)}
           </Button>
@@ -188,10 +196,10 @@ function renderMessage(message: string, accent?: string): ReactNode {
 }
 
 // AlertTitle defaults to a single-line clamp. Toast errors are often a full
-// sentence, so the toast wraps — then caps height and scrolls instead of
-// growing down the chat or clipping with an ellipsis.
+// sentence, so let the title wrap naturally rather than hiding it in a tiny
+// nested scroller or clipping it with an ellipsis.
 export function toastTitleClassName() {
-  return 'col-start-auto line-clamp-none max-h-[4.5em] overflow-y-auto overscroll-contain whitespace-normal wrap-break-word'
+  return 'col-start-auto line-clamp-none whitespace-normal wrap-break-word text-[0.8125rem] leading-5'
 }
 
 function NotificationItem({ notification }: { notification: AppNotification }) {
@@ -210,7 +218,7 @@ function NotificationItem({ notification }: { notification: AppNotification }) {
   return (
     <Alert
       aria-live={notification.kind === 'error' ? 'assertive' : 'polite'}
-      className={cn(STACK_SURFACE, 'grid-cols-[auto_minmax(0,1fr)_auto] pr-2.5')}
+      className={cn(STACK_SURFACE, 'grid-cols-[auto_minmax(0,1fr)_auto] rounded-xl pr-2.5')}
       role={notification.kind === 'error' ? 'alert' : 'status'}
       variant={styles.variant}
     >
@@ -226,17 +234,19 @@ function NotificationItem({ notification }: { notification: AppNotification }) {
           </AlertTitle>
         )}
         <AlertDescription className="col-start-auto">
-          <p className="m-0 wrap-break-word">{renderMessage(notification.message, accent)}</p>
+          <p className="m-0 max-w-prose wrap-break-word leading-relaxed text-(--ui-text-secondary)">
+            {renderMessage(notification.message, accent)}
+          </p>
           {notification.meta && <p className="m-0 text-xs text-muted-foreground tabular-nums">{notification.meta}</p>}
           {hasDetail && <NotificationDetail detail={notification.detail || ''} />}
           {notification.action && (
             <Button
-              className="mt-1.5"
+              className="mt-2"
               onClick={() => {
                 notification.action?.onClick()
                 dismissNotification(notification.id)
               }}
-              size="sm"
+              size="default"
               type="button"
               variant="default"
             >
@@ -265,7 +275,9 @@ function NotificationDetail({ detail }: { detail: string }) {
 
   return (
     <details className="mt-2 text-xs text-muted-foreground">
-      <summary className="select-none font-medium text-muted-foreground hover:text-foreground">{copy.details}</summary>
+      <summary className="cursor-pointer select-none font-medium text-muted-foreground hover:text-foreground">
+        {copy.details}
+      </summary>
       <div className="mt-1 rounded-md bg-background/65 p-2">
         <pre
           className="max-h-32 whitespace-pre-wrap wrap-break-word font-mono text-[0.6875rem] leading-relaxed"
