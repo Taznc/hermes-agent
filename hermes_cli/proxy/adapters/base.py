@@ -85,6 +85,15 @@ class UpstreamAdapter(ABC):
         """Whether ``/chat/completions`` needs a provider-specific wire bridge."""
         return False
 
+    @property
+    def materializes_responses_stream(self) -> bool:
+        """Whether non-streaming ``/responses`` calls need an SSE upstream bridge.
+
+        Codex accepts only streamed Responses requests, while some compatible
+        clients (including Hindsight) request an ordinary JSON Response.
+        """
+        return False
+
     def describe(self) -> str:
         """One-line status summary for ``proxy status``."""
         try:

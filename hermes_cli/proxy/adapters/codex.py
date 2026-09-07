@@ -47,6 +47,10 @@ class OpenAICodexAdapter(UpstreamAdapter):
         return True
 
     @property
+    def materializes_responses_stream(self) -> bool:
+        return True
+
+    @property
     def allowed_paths(self) -> FrozenSet[str]:
         return _ALLOWED_PATHS
 

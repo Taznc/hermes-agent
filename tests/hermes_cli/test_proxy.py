@@ -322,6 +322,12 @@ class ClaudeFakeAdapter(FakeAdapter):
         return True
 
 
+class CodexResponsesFakeAdapter(FakeAdapter):
+    @property
+    def materializes_responses_stream(self):
+        return True
+
+
 async def _start_runner(app: "web.Application"):
     """Spin up an aiohttp app on an ephemeral localhost port. Returns (runner, base_url)."""
     runner = web.AppRunner(app, access_log=None)
@@ -927,6 +933,73 @@ def test_server_preserves_codex_responses_sse_bytes():
                 ) as resp:
                     assert resp.status == 200
                     assert await resp.read() == b"".join(chunks)
+        finally:
+            await proxy_runner.cleanup()
+            await upstream_runner.cleanup()
+
+    asyncio.run(run())
+
+
+def test_server_materializes_codex_sse_for_non_streaming_responses_client():
+    async def run():
+        captured: Dict[str, Any] = {}
+
+        async def responses(request):
+            captured["body"] = await request.json()
+            response = {
+                "id": "resp_hindsight",
+                "object": "response",
+                "created_at": 1,
+                "model": "gpt-6-astra",
+                "status": "completed",
+                "output": [],
+            }
+            output_item = {
+                "id": "msg_hindsight",
+                "type": "message",
+                "status": "completed",
+                "role": "assistant",
+                "content": [{"type": "output_text", "text": "HINDSIGHT_PROXY_OK"}],
+            }
+            stream = web.StreamResponse(
+                status=200,
+                headers={"Content-Type": "text/event-stream"},
+            )
+            await stream.prepare(request)
+            await stream.write(
+                b"event: response.output_item.done\n"
+                + b"data: "
+                + json.dumps({"type": "response.output_item.done", "item": output_item}).encode()
+                + b"\n\n"
+            )
+            await stream.write(
+                b"event: response.completed\n"
+                + b"data: "
+                + json.dumps({"type": "response.completed", "response": response}).encode()
+                + b"\n\n"
+            )
+            await stream.write_eof()
+            return stream
+
+        upstream = web.Application()
+        upstream.router.add_post("/v1/responses", responses)
+        upstream_runner, upstream_base = await _start_runner(upstream)
+        adapter = CodexResponsesFakeAdapter(
+            f"{upstream_base}/v1", allowed=["/responses"]
+        )
+        proxy_runner, proxy_base = await _start_runner(create_app(adapter))
+        try:
+            async with aiohttp.ClientSession() as session:
+                async with session.post(
+                    f"{proxy_base}/v1/responses",
+                    json={"model": "gpt-6-astra", "input": []},
+                ) as resp:
+                    body = await resp.json()
+                    assert resp.status == 200
+                    assert resp.headers["Content-Type"].startswith("application/json")
+            assert captured["body"]["stream"] is True
+            assert body["status"] == "completed"
+            assert body["output"][0]["content"][0]["text"] == "HINDSIGHT_PROXY_OK"
         finally:
             await proxy_runner.cleanup()
             await upstream_runner.cleanup()

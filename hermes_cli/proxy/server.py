@@ -253,6 +253,63 @@ async def _stream_upstream_response(
         await session.close()
 
 
+async def _materialize_responses_stream(upstream_resp, session) -> "web.Response":
+    """Return the terminal OpenAI Response from an SSE-only upstream.
+
+    Codex's Responses API requires ``stream: true``. Hindsight uses the
+    compatible non-streaming API, so the proxy consumes the upstream event
+    stream and returns its terminal ``response.completed`` object as JSON.
+    """
+    try:
+        raw = await upstream_resp.read()
+        if upstream_resp.status >= 400:
+            return web.Response(
+                body=raw,
+                status=upstream_resp.status,
+                headers=_filter_response_headers(upstream_resp.headers),
+            )
+
+        output_items: dict[str, dict] = {}
+        for frame in raw.replace(b"\r\n", b"\n").split(b"\n\n"):
+            data_lines = [
+                line[5:].strip()
+                for line in frame.splitlines()
+                if line.startswith(b"data:")
+            ]
+            if not data_lines:
+                continue
+            try:
+                event = json.loads(b"\n".join(data_lines).decode("utf-8"))
+            except (UnicodeDecodeError, json.JSONDecodeError):
+                continue
+            if not isinstance(event, dict):
+                continue
+            if event.get("type") == "response.output_item.done":
+                item = event.get("item")
+                if isinstance(item, dict):
+                    item_id = str(item.get("id") or len(output_items))
+                    output_items[item_id] = item
+            if event.get("type") == "response.completed":
+                response = event.get("response")
+                if isinstance(response, dict):
+                    response = dict(response)
+                    if output_items:
+                        response["output"] = list(output_items.values())
+                    headers = _filter_response_headers(upstream_resp.headers)
+                    headers.pop("Content-Type", None)
+                    headers.pop("content-type", None)
+                    return web.json_response(response, status=upstream_resp.status, headers=headers)
+
+        return _json_error(
+            502,
+            "Codex stream ended without a response.completed event.",
+            code="upstream_incomplete_response",
+        )
+    finally:
+        upstream_resp.release()
+        await session.close()
+
+
 def create_app(
     adapter: UpstreamAdapter,
     *,
@@ -331,6 +388,19 @@ def create_app(
         # need to forward large multipart uploads we'll switch to streaming
         # the request body too.
         body = await request.read()
+        materialize_responses_stream = False
+        if (
+            getattr(adapter, "materializes_responses_stream", False)
+            and rel_path == "/responses"
+        ):
+            try:
+                payload = json.loads(body)
+            except (UnicodeDecodeError, json.JSONDecodeError):
+                payload = None
+            if isinstance(payload, dict) and not payload.get("stream"):
+                payload["stream"] = True
+                body = json.dumps(payload, separators=(",", ":")).encode("utf-8")
+                materialize_responses_stream = True
 
         if getattr(adapter, "transforms_openai_chat", False) and rel_path == "/chat/completions":
             return await _handle_claude_chat(request, cred, body)
@@ -427,6 +497,8 @@ def create_app(
                     return session_or_response
                 session = session_or_response
 
+        if materialize_responses_stream:
+            return await _materialize_responses_stream(upstream_resp, session)
         return await _stream_upstream_response(request, upstream_resp, session)
 
     # /health doesn't go through the upstream
