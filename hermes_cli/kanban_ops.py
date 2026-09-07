@@ -11,6 +11,7 @@ import os
 import sys
 import time
 from pathlib import Path
+from typing import Optional
 
 from hermes_cli import kanban_db as kb
 from hermes_cli import kanban_db_connect as kbc
@@ -57,6 +58,11 @@ def _cmd_tail(args: argparse.Namespace) -> int:
     return _poll_loop(args.interval, tick)
 
 
+def _dispatch_pause_message(state: dict, *, board: Optional[str] = None) -> str:
+    """Render the shared dispatcher status on the CLI surface."""
+    return kbd.dispatch_pause_message(state, board=board)
+
+
 def _cmd_dispatch(args: argparse.Namespace) -> int:
     board = getattr(args, "board", None)
     if getattr(args, "resume_circuit", False):
@@ -73,9 +79,8 @@ def _cmd_dispatch(args: argparse.Namespace) -> int:
         if getattr(args, "json", False):
             _print_json({"paused": state is not None, "state": state}, ascii=True)
         else:
-            print(f"Dispatch circuit for {board or kb.DEFAULT_BOARD}: " + (
-                f"paused ({state.get('reason')})" if state else "running"
-            ))
+            status = _dispatch_pause_message(state, board=board) if state else "running"
+            print(f"Dispatch circuit for {board or kb.DEFAULT_BOARD}: {status}")
         return 0
 
     # Same caps as the gateway tick and the dashboard nudge — resolved by the
@@ -174,10 +179,7 @@ def _cmd_dispatch(args: argparse.Namespace) -> int:
             f"{', '.join(res.skipped_nonspawnable)}"
         )
     if res.dispatch_paused:
-        print(
-            "Dispatch paused: " + json.dumps(res.dispatch_paused, sort_keys=True)
-            + "\nResume explicitly with: hermes kanban dispatch --resume-circuit"
-        )
+        print("Dispatch: " + _dispatch_pause_message(res.dispatch_paused, board=board))
     return 0
 
 

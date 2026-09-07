@@ -8,6 +8,8 @@ late-bound via ``_kb`` (import-cycle breaking) so monkeypatching
 from __future__ import annotations
 
 import contextlib
+from datetime import datetime
+from datetime import timezone
 import json
 import os
 import re
@@ -244,9 +246,9 @@ class DispatchResult:
     workers), ``"elevated"`` (at most one), ``None`` (no restriction).
     Reclaim/promotion bookkeeping still ran; deferred tasks stay queued."""
     dispatch_paused: Optional[dict[str, Any]] = None
-    """Sticky per-board start-budget circuit state. While present, reclaim and
-    promotion still run but no new workers spawn until an operator explicitly
-    resumes the board."""
+    """Current per-board dispatch stop state. Start-budget records are
+    self-expiring cooldowns; integrity/safety records remain sticky until an
+    operator explicitly resumes the board."""
 
 
 # Bounded registry of recently-reaped worker exits, filled by the reap loop in
@@ -1896,6 +1898,20 @@ def _dispatch_pause_path(board: Optional[str]) -> Path:
     return _kb.kanban_db_path(board).with_suffix(".dispatch-pause.json")
 
 
+def _valid_start_budget_pause_state(state: Mapping[str, Any]) -> bool:
+    """Recognize current and legacy cooldown records without trusting bare reasons."""
+    recent_starts = state.get("recent_starts")
+    budget = state.get("budget")
+    window_seconds = state.get("window_seconds")
+    values = (recent_starts, budget, window_seconds)
+    if any(isinstance(value, bool) or not isinstance(value, int) for value in values):
+        return False
+    assert isinstance(recent_starts, int)
+    assert isinstance(budget, int)
+    assert isinstance(window_seconds, int)
+    return recent_starts >= 0 and budget > 0 and window_seconds > 0
+
+
 def read_dispatch_pause(board: Optional[str] = None) -> Optional[dict[str, Any]]:
     """Return the board's sticky dispatch pause, if any.
 
@@ -1910,6 +1926,8 @@ def read_dispatch_pause(board: Optional[str] = None) -> Optional[dict[str, Any]]
         raw = json.loads(path.read_text(encoding="utf-8"))
         if not isinstance(raw, dict) or not raw.get("reason"):
             raise ValueError("pause state must be an object with a reason")
+        if raw["reason"] == "start_budget_exceeded" and not _valid_start_budget_pause_state(raw):
+            raise ValueError("start-budget cooldown state is missing required fields")
         return raw
     except FileNotFoundError:
         return None
@@ -1922,12 +1940,17 @@ def read_dispatch_pause(board: Optional[str] = None) -> Optional[dict[str, Any]]
 
 
 def _write_dispatch_pause(
-    board: Optional[str], reason: str, **details: Any,
+    board: Optional[str], reason: str, *, replace: bool = False, **details: Any,
 ) -> dict[str, Any]:
-    """Atomically engage a sticky per-board dispatch pause."""
+    """Atomically persist a board pause or rate-limit cooldown state."""
     current = read_dispatch_pause(board)
     if current is not None:
-        return current
+        if not replace:
+            return current
+        if current.get("reason") == reason and all(
+            current.get(key) == value for key, value in details.items()
+        ):
+            return current
     state: dict[str, Any] = {
         "reason": reason,
         "paused_at": int(time.time()),
@@ -1943,16 +1966,70 @@ def _write_dispatch_pause(
         with contextlib.suppress(FileNotFoundError):
             tmp.unlink()
     _kb._log.warning(
-        "kanban dispatch paused for board %s: %s (%s)",
+        "kanban dispatch for board %s: %s",
         board or _kb.DEFAULT_BOARD,
-        reason,
-        details,
+        dispatch_pause_message(state, board=board),
     )
     return state
 
 
+def _clear_expired_start_budget_pause(board: Optional[str]) -> None:
+    """Remove the normal cooldown only while the dispatch tick lock is held."""
+    with contextlib.suppress(FileNotFoundError):
+        _dispatch_pause_path(board).unlink()
+
+
+def _recent_dispatch_start_window(
+    conn: sqlite3.Connection, *, window_seconds: int, budget: int = 1,
+    now: Optional[int] = None,
+) -> tuple[int, Optional[int]]:
+    """Return starts in the inclusive window and the exact next eligible time.
+
+    When a live reload changes the budget, more than one in-window start may
+    need to age out before another start is legal. The required expiry is the
+    ``count - budget``-indexed start, not always the oldest one: after it
+    leaves the inclusive window, exactly ``budget - 1`` starts remain.
+    """
+    current = int(now if now is not None else time.time())
+    cutoff = current - window_seconds
+    row = conn.execute(
+        "SELECT COUNT(*) AS count FROM task_events "
+        "WHERE kind = 'spawned' AND created_at >= ?",
+        (cutoff,),
+    ).fetchone()
+    starts = int(row["count"])
+    if starts < budget:
+        return starts, None
+    expiry_row = conn.execute(
+        "SELECT created_at FROM task_events WHERE kind = 'spawned' AND created_at >= ? "
+        "ORDER BY created_at, id LIMIT 1 OFFSET ?",
+        (cutoff, starts - budget),
+    ).fetchone()
+    # The query includes the cutoff boundary, so capacity returns one second
+    # after the final required start is no longer in the measured interval.
+    return starts, int(expiry_row["created_at"]) + window_seconds + 1
+
+
+def dispatch_pause_message(state: Mapping[str, Any], *, board: Optional[str] = None) -> str:
+    """One status message for CLI, gateway-backed dashboard, and API callers."""
+    if state.get("reason") == "start_budget_exceeded":
+        next_eligible = state.get("next_eligible_at")
+        if isinstance(next_eligible, int):
+            when = datetime.fromtimestamp(next_eligible, tz=timezone.utc).isoformat()
+            return f"rate limited until {when}; dispatch resumes automatically"
+        return "rate limited; dispatch resumes automatically when capacity is available"
+    command = "hermes kanban "
+    if board:
+        command += f"--board {board} "
+    command += "dispatch --resume-circuit"
+    return (
+        f"manual intervention required ({state.get('reason', 'unknown pause')}); "
+        f"resume explicitly with: {command}"
+    )
+
+
 def resume_dispatch(board: Optional[str] = None) -> dict[str, Any]:
-    """Explicitly clear a board's sticky start-budget/replay circuit."""
+    """Explicitly clear a manual board safety pause or rate-limit status file."""
     _kb._assert_not_delegated_child_mutation()
     path = _dispatch_pause_path(board)
     previous = read_dispatch_pause(board)
@@ -1964,13 +2041,9 @@ def resume_dispatch(board: Optional[str] = None) -> dict[str, Any]:
 def _recent_dispatch_starts(
     conn: sqlite3.Connection, *, window_seconds: int, now: Optional[int] = None,
 ) -> int:
-    cutoff = int(now if now is not None else time.time()) - window_seconds
-    return int(
-        conn.execute(
-            "SELECT COUNT(*) FROM task_events WHERE kind = 'spawned' AND created_at >= ?",
-            (cutoff,),
-        ).fetchone()[0]
-    )
+    return _recent_dispatch_start_window(
+        conn, window_seconds=window_seconds, now=now,
+    )[0]
 
 
 def _terminal_card_replay_ids(conn: sqlite3.Connection) -> list[str]:
@@ -2665,30 +2738,60 @@ def _dispatch_once_locked(
         conn, result, max_spawn=max_spawn, max_in_progress=max_in_progress, board=board,
     )
 
-    # A tripped board still performs reclaim/promotion bookkeeping above, but
-    # never starts another model session until an operator explicitly resumes.
-    existing_pause = read_dispatch_pause(board)
-    if existing_pause is not None:
-        result.dispatch_paused = existing_pause
-        return result
-
     start_budget = _positive_int_or_none(dispatch_start_budget)
     start_window = _positive_int(dispatch_start_window_seconds, 600)
-    if start_budget is not None:
-        replay_ids = _terminal_card_replay_ids(conn)
-        if replay_ids:
-            result.dispatch_paused = {
-                "reason": "terminal_card_replay",
-                "task_ids": replay_ids,
-            }
-            if not dry_run:
-                result.dispatch_paused = _write_dispatch_pause(
-                    board, "terminal_card_replay", task_ids=replay_ids,
-                )
-            return result
 
-        recent_starts = _recent_dispatch_starts(
-            conn, window_seconds=start_window,
+    # A persisted integrity pause remains fail-closed. A normal start-budget
+    # record is only an observable cooldown: the database event window remains
+    # authoritative and, once capacity exists, this lock holder clears it before
+    # a lane can claim a task.
+    existing_pause = read_dispatch_pause(board)
+    if existing_pause is not None:
+        if existing_pause.get("reason") != "start_budget_exceeded":
+            result.dispatch_paused = existing_pause
+            return result
+        if start_budget is None:
+            if not dry_run:
+                _clear_expired_start_budget_pause(board)
+        else:
+            recent_starts, next_eligible_at = _recent_dispatch_start_window(
+                conn, window_seconds=start_window, budget=start_budget,
+            )
+            if recent_starts >= start_budget:
+                result.dispatch_paused = _write_dispatch_pause(
+                    board,
+                    "start_budget_exceeded",
+                    replace=True,
+                    recent_starts=recent_starts,
+                    budget=start_budget,
+                    window_seconds=start_window,
+                    next_eligible_at=next_eligible_at,
+                ) if not dry_run else {
+                    "reason": "start_budget_exceeded",
+                    "recent_starts": recent_starts,
+                    "budget": start_budget,
+                    "window_seconds": start_window,
+                    "next_eligible_at": next_eligible_at,
+                }
+                return result
+            if not dry_run:
+                _clear_expired_start_budget_pause(board)
+
+    replay_ids = _terminal_card_replay_ids(conn)
+    if replay_ids:
+        result.dispatch_paused = {
+            "reason": "terminal_card_replay",
+            "task_ids": replay_ids,
+        }
+        if not dry_run:
+            result.dispatch_paused = _write_dispatch_pause(
+                board, "terminal_card_replay", task_ids=replay_ids,
+            )
+        return result
+
+    if start_budget is not None:
+        recent_starts, next_eligible_at = _recent_dispatch_start_window(
+            conn, window_seconds=start_window, budget=start_budget,
         )
         if recent_starts >= start_budget:
             result.dispatch_paused = {
@@ -2696,6 +2799,7 @@ def _dispatch_once_locked(
                 "recent_starts": recent_starts,
                 "budget": start_budget,
                 "window_seconds": start_window,
+                "next_eligible_at": next_eligible_at,
             }
             if not dry_run:
                 result.dispatch_paused = _write_dispatch_pause(
@@ -2704,11 +2808,12 @@ def _dispatch_once_locked(
                     recent_starts=recent_starts,
                     budget=start_budget,
                     window_seconds=start_window,
+                    next_eligible_at=next_eligible_at,
                 )
             return result
 
-        # A single tick must not overshoot the sliding budget. The board trips
-        # immediately after consuming the final slot below.
+        # A single tick must not overshoot the sliding budget. The board is
+        # rate limited immediately after consuming its final slot below.
         remaining_starts = start_budget - recent_starts
         spawn_budget = min(spawn_budget, remaining_starts) if spawn_budget is not None else remaining_starts
 
@@ -2832,7 +2937,9 @@ def _dispatch_once_locked(
             spawned += 1
 
     if start_budget is not None and spawned and not dry_run:
-        recent_starts = _recent_dispatch_starts(conn, window_seconds=start_window)
+        recent_starts, next_eligible_at = _recent_dispatch_start_window(
+            conn, window_seconds=start_window, budget=start_budget,
+        )
         if recent_starts >= start_budget:
             result.dispatch_paused = _write_dispatch_pause(
                 board,
@@ -2840,6 +2947,7 @@ def _dispatch_once_locked(
                 recent_starts=recent_starts,
                 budget=start_budget,
                 window_seconds=start_window,
+                next_eligible_at=next_eligible_at,
             )
     return result
 
