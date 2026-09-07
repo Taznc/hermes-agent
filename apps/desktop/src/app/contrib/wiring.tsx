@@ -47,7 +47,6 @@ import { requestVoiceConversationStart } from '@/store/composer'
 import { $activeConnectionId } from '@/store/connections'
 import { $cronReviewRequest, setCronFocusJobId } from '@/store/cron'
 import { $pinnedSessionIds, pinSession, restoreWorktree, unpinSession } from '@/store/layout'
-import { clearMcpAppCards } from '@/store/mcp-apps'
 import { dismissNotification, notify, notifyError } from '@/store/notifications'
 import { $previewTarget } from '@/store/preview'
 import {
@@ -392,9 +391,9 @@ export function ContribWiring({ children }: { children: ReactNode }) {
       }
 
       // MCP Apps are authenticated only by a one-shot live completion event.
-      // A stored transcript may reuse a tool id, so discard its renderer-only
-      // cards before replacing this session's messages from history.
-      clearMcpAppCards(runtimeSessionId)
+      // Keep cards already admitted by that event while this same session is
+      // rehydrated: the completed transcript is what supplies their matching
+      // tool row. Stored history never creates cards on its own.
 
       const storedProfile = $sessions.get().find(session => sessionMatchesStoredId(session, storedSessionId))?.profile
 
