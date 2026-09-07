@@ -2857,7 +2857,7 @@ def _apply_rework_escalation(
 
 
 def _review_row_implementer_owned(
-    conn: sqlite3.Connection, task_id: str,
+    conn: sqlite3.Connection, task_id: str, row_assignee: str,
 ) -> bool:
     """True when a review-lane row is still owned by the profile that
     IMPLEMENTED it — the only state ``kanban.default_reviewer`` may touch.
@@ -2868,11 +2868,10 @@ def _review_row_implementer_owned(
     overridden, whether the routing came from ``kanban_request_review(
     reviewer=...)`` on the first pass or from ``_prior_reviewer`` provenance
     on a re-review. The latest ``review_requested`` event's ``reviewer``
-    field is the single source of truth for that distinction: ``None``/
-    absent means the row is still sitting on the implementer's own name
-    (request_review only sets ``reviewer`` in the payload when a handoff was
-    actually decided — see ``kanban_db.request_review``); anything else
-    means a reviewer was deliberately chosen and must stick.
+    field records whether ``request_review`` made a handoff; the payload's
+    ``implementer`` plus the current row assignee prove that the row is still
+    owned by that implementer. A later operator/dashboard reassignment must
+    win even when the original request left ``reviewer`` blank.
     """
     event = _kb._latest_event(conn, task_id, "review_requested")
     if event is None:
@@ -2883,7 +2882,10 @@ def _review_row_implementer_owned(
         return True
     payload = _kb._json_dict(_kb._row_get(event, "payload"))
     reviewer = payload.get("reviewer")
-    return not (isinstance(reviewer, str) and reviewer.strip())
+    if isinstance(reviewer, str) and reviewer.strip():
+        return False
+    implementer = payload.get("implementer")
+    return isinstance(implementer, str) and bool(implementer.strip()) and row_assignee == implementer
 
 
 def _apply_default_reviewer(
@@ -3345,7 +3347,7 @@ def _dispatch_once_locked(
         if (
             default_reviewer
             and default_reviewer != row_assignee
-            and _review_row_implementer_owned(conn, row["id"])
+            and _review_row_implementer_owned(conn, row["id"], row_assignee)
         ):
             if _apply_default_reviewer(
                 conn, row["id"], default_reviewer,

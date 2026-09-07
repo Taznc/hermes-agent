@@ -1135,12 +1135,15 @@ describe('focusedSessionNeedsRoute', () => {
     expect(focusedSessionNeedsRoute('main', true)).toBe(true)
   })
 
+  it('routes for an active tile while a full page remains selected behind it', () => {
+    expect(focusedSessionNeedsRoute('tile', true)).toBe(true)
+  })
+
   it('skips the route when the main session is already the visible chat', () => {
     expect(focusedSessionNeedsRoute('main', false)).toBe(false)
   })
 
-  it('never routes for a tile — its pane shows the chat on any route', () => {
-    expect(focusedSessionNeedsRoute('tile', true)).toBe(false)
+  it('skips the route for a tile when the workspace already shows chat', () => {
     expect(focusedSessionNeedsRoute('tile', false)).toBe(false)
   })
 })

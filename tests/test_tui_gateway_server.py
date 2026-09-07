@@ -541,26 +541,37 @@ def test_compute_host_clarify_snapshot_replays_and_proxies_batch_answers(monkeyp
             {
                 "id": "clarify-q0",
                 "method": "clarify.respond",
-                "params": {"request_id": "host-request", "question_id": "q0", "answer": "a"},
+                "params": {
+                    "request_id": "host-request",
+                    "question_id": "q0",
+                    "answer": "a",
+                    "note": "first note",
+                },
             }
         )
 
-        assert response["result"] == {"status": "ok", "remaining": ["q1"]}
+        assert response["result"] == {"status": "ok", "remaining": ["q1"], "note": "first note"}
         assert supervisor.responses == [
-            (sid, {"request_id": "host-request", "question_id": "q0", "answer": "a"}, 15.0)
+            (sid, {"request_id": "host-request", "question_id": "q0", "answer": "a", "note": "first note"}, 15.0)
         ]
         replayed = server._live_session_payload(sid, session)["pending_clarify"]
         assert replayed["answers"] == {"q0": "a"}
+        assert replayed["notes"] == {"q0": "first note"}
 
         final_response = server.handle_request(
             {
                 "id": "clarify-q1",
                 "method": "clarify.respond",
-                "params": {"request_id": "host-request", "question_id": "q1", "answer": "b"},
+                "params": {
+                    "request_id": "host-request",
+                    "question_id": "q1",
+                    "answer": "b",
+                    "note": "second note",
+                },
             }
         )
 
-        assert final_response["result"] == {"status": "ok", "remaining": []}
+        assert final_response["result"] == {"status": "ok", "remaining": [], "note": "second note"}
         assert "pending_clarify" not in server._live_session_payload(sid, session)
     finally:
         server._sessions.pop(sid, None)
@@ -5011,6 +5022,114 @@ def test_ws_orphan_reap_interrupts_in_process_turn(monkeypatch):
         assert len(callbacks) == 1
     finally:
         server._sessions.pop("inline-sid", None)
+
+
+def test_ws_orphan_reap_keeps_pending_clarify_answerable_for_reconnect(monkeypatch):
+    """A detached clarify is user work, not an abandoned turn: keep its exact
+    request live so a reconnect can replay and deliberately resolve it."""
+    callbacks = []
+    interrupted = []
+    result = {}
+
+    class _Timer:
+        def __init__(self, _delay, callback):
+            callbacks.append(callback)
+
+        def start(self):
+            return None
+
+    class _LiveThread:
+        def is_alive(self):
+            return True
+
+    session = _session(
+        agent=types.SimpleNamespace(interrupt=lambda: interrupted.append("interrupted")),
+        transport=server._detached_ws_transport,
+        running=True,
+        _run_thread=_LiveThread(),
+    )
+    server._sessions["clarify-sid"] = session
+    monkeypatch.setattr(server, "_WS_ORPHAN_REAP_GRACE_S", 0.01)
+    monkeypatch.setattr(server.threading, "Timer", _Timer)
+    monkeypatch.setattr(server, "_emit", lambda *_args, **_kwargs: None)
+
+    worker = threading.Thread(
+        target=lambda: result.setdefault(
+            "answer", server._block("clarify.request", "clarify-sid", {"question": "Continue?"}, timeout=5)
+        )
+    )
+    worker.start()
+    try:
+        deadline = time.monotonic() + 1
+        while len(server._pending) != 1 and time.monotonic() < deadline:
+            time.sleep(0.01)
+        assert len(server._pending) == 1
+        request_id = next(iter(server._pending))
+
+        server._schedule_ws_orphan_reap("clarify-sid")
+        callbacks.pop(0)()
+
+        # The disconnect must not turn a visible pending card into an implicit
+        # empty response. Its same request id remains replayable only to owner.
+        assert interrupted == []
+        assert worker.is_alive()
+        assert server._pending_clarify_request_payload("clarify-sid") == {
+            "question": "Continue?", "request_id": request_id
+        }
+        assert server._pending_clarify_request_payload("other-sid") is None
+
+        response = server.handle_request(
+            {"id": "answer", "method": "clarify.respond", "params": {"request_id": request_id, "answer": "yes"}}
+        )
+        assert response["result"] == {"status": "ok"}
+        worker.join(timeout=1)
+        assert result["answer"] == "yes"
+    finally:
+        if server._pending:
+            server._clear_pending(None)
+        worker.join(timeout=1)
+        server._sessions.pop("clarify-sid", None)
+
+
+def test_ws_orphan_reap_preserves_compute_host_pending_clarify(monkeypatch):
+    """The compute-host mirror is equally authoritative during a renderer reconnect."""
+    callbacks = []
+    interrupted = []
+
+    class _Timer:
+        def __init__(self, _delay, callback):
+            callbacks.append(callback)
+
+        def start(self):
+            return None
+
+    class _Supervisor:
+        def interrupt(self, sid, *, request_id=None):
+            interrupted.append((sid, request_id))
+
+    session = _session(
+        agent=None,
+        transport=server._detached_ws_transport,
+        running=True,
+        _compute_host_active=True,
+        _compute_host_pending_clarify={"question": "Continue?", "request_id": "host-request"},
+    )
+    server._sessions["compute-clarify-sid"] = session
+    monkeypatch.setattr(server, "_WS_ORPHAN_REAP_GRACE_S", 0.01)
+    monkeypatch.setattr(server.threading, "Timer", _Timer)
+    monkeypatch.setattr(server, "_get_compute_host_supervisor", lambda _cfg=None: _Supervisor())
+    monkeypatch.setattr(server, "_load_cfg", lambda: {"dashboard": {"turn_isolation": True}})
+
+    try:
+        server._schedule_ws_orphan_reap("compute-clarify-sid")
+        callbacks.pop(0)()
+
+        assert interrupted == []
+        assert server._pending_clarify_request_payload("compute-clarify-sid") == {
+            "question": "Continue?", "request_id": "host-request"
+        }
+    finally:
+        server._sessions.pop("compute-clarify-sid", None)
 
 
 def test_ws_disconnect_running_sidecar_still_closes_without_orphan_timer(monkeypatch):
@@ -13448,6 +13567,7 @@ def test_interrupt_only_clears_own_session_pending():
         ev_a = threading.Event()
         ev_b = threading.Event()
         server._pending["rid-a"] = ("sid_a", ev_a)
+        server._pending_prompt_payloads["rid-a"] = ("clarify.request", {"request_id": "rid-a"})
         server._pending["rid-b"] = ("sid_b", ev_b)
         server._answers.clear()
 
@@ -13461,9 +13581,11 @@ def test_interrupt_only_clears_own_session_pending():
         )
         assert resp.get("result"), f"got error: {resp.get('error')}"
 
-        # Session A's pending must be released to empty.
+        # Session A's clarify must be released as an agent-readable cancellation,
+        # never as a deliberate blank Skip.
         assert ev_a.is_set(), "sid_a pending Event should be set after interrupt"
-        assert server._answers.get("rid-a") == ""
+        from tools.clarify_tool import CANCELLED_RESPONSE
+        assert server._answers.get("rid-a") == CANCELLED_RESPONSE
 
         # Session B's pending MUST remain untouched — no cross-session blast.
         assert not ev_b.is_set(), (
@@ -13477,8 +13599,106 @@ def test_interrupt_only_clears_own_session_pending():
         server._sessions.pop("sid_b", None)
         server._pending.pop("rid-a", None)
         server._pending.pop("rid-b", None)
+        server._pending_prompt_payloads.pop("rid-a", None)
+        server._pending_prompt_payloads.pop("rid-b", None)
         server._answers.pop("rid-a", None)
         server._answers.pop("rid-b", None)
+
+
+def test_interrupt_clarify_callback_returns_cancelled_result_not_blank():
+    """The live gateway callback must carry a stop through clarify_tool's result seam."""
+    from tools.clarify_tool import clarify_tool
+
+    session = _session()
+    session["agent"] = types.SimpleNamespace(interrupt=lambda: None)
+    server._sessions["cancel-clarify"] = session
+    result = {}
+
+    worker = threading.Thread(
+        target=lambda: result.setdefault(
+            "value",
+            json.loads(clarify_tool(
+                "Continue?", callback=server._agent_cbs("cancel-clarify")["clarify_callback"],
+            )),
+        ),
+    )
+    worker.start()
+    try:
+        deadline = time.monotonic() + 1
+        while not server._pending and time.monotonic() < deadline:
+            time.sleep(0.01)
+        assert len(server._pending) == 1
+
+        response = server.handle_request({
+            "id": "stop", "method": "session.interrupt", "params": {"session_id": "cancel-clarify"},
+        })
+
+        assert response["result"]
+        worker.join(timeout=1)
+        assert result["value"]["user_response"] == ""
+        assert result["value"]["cancelled"] is True
+        assert "timed_out" not in result["value"]
+    finally:
+        server._clear_pending(None)
+        worker.join(timeout=1)
+        server._sessions.pop("cancel-clarify", None)
+
+
+def test_interrupt_batch_clarify_callback_returns_cancelled_result_not_skip():
+    """Stopping a batch preserves its explicit cancellation reason through the real callback."""
+    from tools.clarify_tool import clarify_tool
+
+    session = _session()
+    session["agent"] = types.SimpleNamespace(interrupt=lambda: None)
+    server._sessions["cancel-batch-clarify"] = session
+    result = {}
+
+    worker = threading.Thread(
+        target=lambda: result.setdefault(
+            "value",
+            json.loads(clarify_tool(
+                "",
+                questions=[{"question": "One?"}, {"question": "Two?"}],
+                callback=server._agent_cbs("cancel-batch-clarify")["clarify_callback"],
+            )),
+        ),
+    )
+    worker.start()
+    try:
+        deadline = time.monotonic() + 1
+        while not server._pending and time.monotonic() < deadline:
+            time.sleep(0.01)
+        assert len(server._pending) == 1
+
+        response = server.handle_request({
+            "id": "stop", "method": "session.interrupt", "params": {"session_id": "cancel-batch-clarify"},
+        })
+
+        assert response["result"]
+        worker.join(timeout=1)
+        assert result["value"]["cancelled"] is True
+        assert "timed_out" not in result["value"]
+        assert [row["user_response"] for row in result["value"]["responses"]] == ["", ""]
+    finally:
+        server._clear_pending(None)
+        worker.join(timeout=1)
+        server._sessions.pop("cancel-batch-clarify", None)
+
+
+def test_clarify_callback_timeout_returns_timed_out_result_not_skip(monkeypatch):
+    """The configured gateway timeout must reach the final single-question result as a timeout."""
+    from tools.clarify_tool import clarify_tool
+
+    monkeypatch.setattr(server, "_clarify_timeout_seconds", lambda: 0.01)
+    monkeypatch.setattr(server, "_emit", lambda *_args, **_kwargs: None)
+
+    result = json.loads(clarify_tool(
+        "Continue?", callback=server._agent_cbs("timeout-clarify")["clarify_callback"],
+    ))
+
+    assert result["user_response"] == ""
+    assert result["timed_out"] is True
+    assert "cancelled" not in result
 
 
 def test_interrupt_clears_multiple_own_pending():

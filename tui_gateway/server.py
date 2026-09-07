@@ -27,6 +27,7 @@ from hermes_constants import (
 from hermes_cli.env_loader import load_hermes_dotenv
 from utils import is_truthy_value
 from tools.environments.local import hermes_subprocess_env
+from tools.clarify_tool import CANCELLED_RESPONSE, TIMEOUT_RESPONSE
 from agent.replay_cleanup import sanitize_replay_history
 from agent.compaction_display import project_compaction_message_for_display  # noqa: F401
 from agent.skill_commands import describe_skill_invocation  # noqa: F401
@@ -83,9 +84,9 @@ _methods: dict[str, callable] = {}
 _pending: dict[str, tuple[str, threading.Event]] = {}
 _pending_prompt_payloads: dict[str, tuple[str, dict]] = {}
 _answers: dict[str, str] = {}
-# Batch clarify accumulators: rid → {"qids": [...], "answers": {qid: answer}}. Written by
-# clarify.respond (per-question lock, update-in-place), read out by _block on resolution/timeout
-# so locked answers survive the deadline.
+# Batch clarify accumulators: rid → {"qids": [...], "answers": {qid: answer}, "notes": {qid: note}}.
+# Written by clarify.respond (per-question lock, update-in-place), read out by _block on
+# resolution/timeout so locked answers survive the deadline.
 _batch_clarify: dict[str, dict] = {}
 _db = None
 _db_error: str | None = None
@@ -640,12 +641,25 @@ def _pending_clarify_request_payload(sid: str) -> dict | None:
             # Batch clarify: replay the answers locked so far so a reconnecting client restores its ✓ state.
             if (batch := _batch_clarify.get(rid)) is not None and batch["answers"]:
                 snapshot["answers"] = dict(batch["answers"])
+                if batch.get("notes"):
+                    snapshot["notes"] = dict(batch["notes"])
             return snapshot
     if (session := _sessions.get(sid)) is not None:
         with session.get("history_lock", threading.Lock()):
             pending = session.get("_compute_host_pending_clarify")
             return dict(pending) if isinstance(pending, dict) else None
     return None
+
+
+def _has_pending_clarify_request(sid: str) -> bool:
+    """Whether ``sid`` owns a still-answerable clarify bridge request.
+
+    The request registry is the authority during a transport gap. Compute-host
+    sessions retain the same authority in their pending mirror. A detached
+    renderer can resume and replay either form; treating it as an abandoned
+    turn would turn the user-visible card into an implicit empty response.
+    """
+    return _pending_clarify_request_payload(sid) is not None
 
 
 def _pending_approval_request_payload(session_key: str) -> dict | None:
@@ -1277,8 +1291,8 @@ def _block(event: str, sid: str, payload: dict, timeout: float | None = 300, bat
         if batch_qids:
             # Multi-question clarify: per-question answers accumulate here (update-in-place until every
             # qid is locked); locked answers survive a timeout — see the batch read-out below.
-            _batch_clarify[rid] = {"qids": list(batch_qids), "answers": {}}
-    answered, batch_answers = False, None
+            _batch_clarify[rid] = {"qids": list(batch_qids), "answers": {}, "notes": {}}
+    answered, batch_answers, batch_notes = False, None, None
     try:
         _emit(event, sid, payload)
         # Event semantics: None → wait forever (clarify_timeout <= 0; released only by a real answer or
@@ -1292,19 +1306,29 @@ def _block(event: str, sid: str, payload: dict, timeout: float | None = 300, bat
             answer = _answers.pop(rid, "")
             if (batch_state := _batch_clarify.pop(rid, None)) is not None:
                 batch_answers = dict(batch_state["answers"])
+                batch_notes = dict(batch_state.get("notes") or {})
     expire = lambda: _emit(f"{event.removesuffix('.request')}.expire", sid, {"request_id": rid})
     if batch_qids is not None:
-        # Cancel-all (respond with no question_id) resolves via _answers with "" — a plain cancel, not a partial result.
+        # Deliberate UI Skip/cancel-all keeps the historic empty bridge value;
+        # an interrupted turn gets a reason-aware result that clarify_tool
+        # projects as ``cancelled`` rather than an answered blank.
         if answer_present:
+            if answer == CANCELLED_RESPONSE:
+                return json.dumps({"answers": batch_answers or {}, "cancelled": True}, ensure_ascii=False)
             return answer
         result: dict[str, object] = {"answers": batch_answers or {}}
+        if batch_notes:
+            result["notes"] = batch_notes
         if not answered:
             # Deadline hit: keep what was locked, report the rest as absences (not skips), still expire live cards.
             result["timed_out"] = True
             expire()
         return json.dumps(result, ensure_ascii=False)
-    if not answered and not answer_present and event in _EXPIRING_REQUESTS:
-        expire()
+    if not answered and not answer_present:
+        if event in _EXPIRING_REQUESTS:
+            expire()
+        if event == "clarify.request":
+            return TIMEOUT_RESPONSE
     return answer
 
 
@@ -1372,12 +1396,14 @@ def _tour_request(sid: str, payload: dict) -> str:
 
 
 def _clear_pending(sid: str | None = None) -> None:
-    """Release pending prompts with an empty answer: only *sid*'s (session.interrupt must not cancel other
-    sessions' prompts), or every one when *sid* is None (shutdown)."""
+    """Release pending prompts: only *sid*'s (session.interrupt must not cancel other sessions' prompts),
+    or every one when *sid* is None (shutdown).  Clarify stops carry a cancellation sentinel so they never
+    masquerade as a deliberate UI Skip at the tool-result seam."""
     with _prompt_lock:
         for rid, (owner_sid, ev) in list(_pending.items()):
             if sid is None or owner_sid == sid:
-                _answers[rid] = ""
+                event = _pending_prompt_payloads.get(rid, ("", {}))[0]
+                _answers[rid] = CANCELLED_RESPONSE if event == "clarify.request" else ""
                 ev.set()
 
 
@@ -3096,6 +3122,7 @@ def _start_usage_ticker(sid: str, agent, interval: float = 1.0) -> tuple[threadi
 def _respond(rid, params, key, *, allow_expired=False):
     r = params.get("request_id", "")
     question_id = str(params.get("question_id") or "")
+    note = str(params.get("note") or "")
     with _prompt_lock:
         entry = _pending.get(r)
         if not entry:
@@ -3107,12 +3134,22 @@ def _respond(rid, params, key, *, allow_expired=False):
             if question_id not in batch["qids"]:
                 return _err(rid, 4002, f"unknown question_id {question_id!r}")
             batch["answers"][question_id] = params.get(key, "")
+            if note:
+                batch.setdefault("notes", {})[question_id] = note
+            elif (notes := batch.get("notes")) is not None:
+                notes.pop(question_id, None)
             if not (remaining := [qid for qid in batch["qids"] if qid not in batch["answers"]]):
                 ev.set()
-            return _ok(rid, {"status": "ok", "remaining": remaining})
+            result = {"status": "ok", "remaining": remaining}
+            if note:
+                result["note"] = note
+            return _ok(rid, result)
         _answers[r] = params.get(key, "")
         ev.set()
-    return _ok(rid, {"status": "ok"})
+    result = {"status": "ok"}
+    if note:
+        result["note"] = note
+    return _ok(rid, result)
 
 
 # ── Methods: tools & system ──────────────────────────────────────────
