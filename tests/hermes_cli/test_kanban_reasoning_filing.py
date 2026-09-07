@@ -23,6 +23,7 @@ import pytest
 
 from hermes_cli import kanban as kc
 from hermes_cli import kanban_db as kb
+from hermes_cli import kanban_db_connect as kbc
 
 
 @pytest.fixture
@@ -49,7 +50,7 @@ def test_create_help_shows_reasoning_flag(kanban_home):
 def test_create_with_reasoning_stores_and_dispatches(kanban_home):
     out = kc.run_slash('create "task a" --assignee worker --reasoning high')
     assert "kanban: reasoning_effort must be one of" not in out
-    with kb.connect_closing() as conn:
+    with kbc.connect_closing() as conn:
         tasks = kb.list_tasks(conn, assignee="worker")
     assert len(tasks) == 1
     assert tasks[0].reasoning_effort == "high"
@@ -57,14 +58,14 @@ def test_create_with_reasoning_stores_and_dispatches(kanban_home):
 
 def test_create_with_reasoning_none_stores_literal_none(kanban_home):
     kc.run_slash('create "task a" --assignee worker --reasoning none')
-    with kb.connect_closing() as conn:
+    with kbc.connect_closing() as conn:
         tasks = kb.list_tasks(conn, assignee="worker")
     assert tasks[0].reasoning_effort == "none"
 
 
 def test_create_without_reasoning_stores_null(kanban_home):
     kc.run_slash('create "task a" --assignee worker')
-    with kb.connect_closing() as conn:
+    with kbc.connect_closing() as conn:
         tasks = kb.list_tasks(conn, assignee="worker")
     assert tasks[0].reasoning_effort is None
 
@@ -73,7 +74,7 @@ def test_create_with_invalid_reasoning_fails_loudly(kanban_home):
     out = kc.run_slash('create "task a" --assignee worker --reasoning bogus-level')
     # Must name the valid set, not silently fall back to the profile default.
     assert "reasoning_effort must be one of" in out
-    with kb.connect_closing() as conn:
+    with kbc.connect_closing() as conn:
         tasks = kb.list_tasks(conn, assignee="worker")
     assert tasks == []
 
@@ -83,7 +84,7 @@ def test_create_with_model_and_reasoning_together(kanban_home):
         'create "task a" --assignee worker '
         "--model claude-opus-4.6 --provider anthropic --reasoning xhigh"
     )
-    with kb.connect_closing() as conn:
+    with kbc.connect_closing() as conn:
         tasks = kb.list_tasks(conn, assignee="worker")
     t = tasks[0]
     assert t.model_override == "claude-opus-4.6"
@@ -116,7 +117,7 @@ def _spawn_and_capture(monkeypatch, tmp_path, task):
 
 
 def test_dispatcher_spawns_with_both_model_and_reasoning(kanban_home, monkeypatch, tmp_path):
-    with kb.connect_closing() as conn:
+    with kbc.connect_closing() as conn:
         tid = kb.create_task(
             conn, title="t", assignee="elias",
             model_override="glm-5", provider_override="openrouter",
@@ -138,14 +139,14 @@ def test_dispatcher_spawns_with_both_model_and_reasoning(kanban_home, monkeypatc
 
 
 def test_set_model_reasoning_only_leaves_model_untouched(kanban_home):
-    with kb.connect_closing() as conn:
+    with kbc.connect_closing() as conn:
         tid = kb.create_task(
             conn, title="t", assignee="worker",
             model_override="gpt-5.6-sol", provider_override="openai",
         )
     out = kc.run_slash(f"set-model {tid} --reasoning medium")
     assert "error" not in out.lower()
-    with kb.connect_closing() as conn:
+    with kbc.connect_closing() as conn:
         t = kb.get_task(conn, tid)
     assert t.reasoning_effort == "medium"
     # Model override is untouched — a reasoning-only call must not clear it.
@@ -154,12 +155,12 @@ def test_set_model_reasoning_only_leaves_model_untouched(kanban_home):
 
 
 def test_set_model_and_reasoning_together(kanban_home):
-    with kb.connect_closing() as conn:
+    with kbc.connect_closing() as conn:
         tid = kb.create_task(conn, title="t", assignee="worker")
     kc.run_slash(
         f"set-model {tid} claude-opus-4.6 --provider anthropic --reasoning low"
     )
-    with kb.connect_closing() as conn:
+    with kbc.connect_closing() as conn:
         t = kb.get_task(conn, tid)
     assert t.model_override == "claude-opus-4.6"
     assert t.provider_override == "anthropic"
@@ -167,19 +168,19 @@ def test_set_model_and_reasoning_together(kanban_home):
 
 
 def test_set_model_reasoning_clear_falls_back_to_profile_default(kanban_home):
-    with kb.connect_closing() as conn:
+    with kbc.connect_closing() as conn:
         tid = kb.create_task(conn, title="t", assignee="worker", reasoning_effort="high")
     kc.run_slash(f"set-model {tid} --reasoning clear")
-    with kb.connect_closing() as conn:
+    with kbc.connect_closing() as conn:
         t = kb.get_task(conn, tid)
     assert t.reasoning_effort is None
 
 
 def test_set_model_reasoning_none_is_a_real_value_not_a_clear(kanban_home):
-    with kb.connect_closing() as conn:
+    with kbc.connect_closing() as conn:
         tid = kb.create_task(conn, title="t", assignee="worker", reasoning_effort="high")
     kc.run_slash(f"set-model {tid} --reasoning none")
-    with kb.connect_closing() as conn:
+    with kbc.connect_closing() as conn:
         t = kb.get_task(conn, tid)
     # "none" pins thinking OFF — it must be stored literally, not treated
     # as a clear-to-profile-default sentinel.
@@ -187,17 +188,17 @@ def test_set_model_reasoning_none_is_a_real_value_not_a_clear(kanban_home):
 
 
 def test_set_model_invalid_reasoning_fails_loudly(kanban_home):
-    with kb.connect_closing() as conn:
+    with kbc.connect_closing() as conn:
         tid = kb.create_task(conn, title="t", assignee="worker")
     out = kc.run_slash(f"set-model {tid} --reasoning bogus-level")
     assert "reasoning_effort must be one of" in out
-    with kb.connect_closing() as conn:
+    with kbc.connect_closing() as conn:
         t = kb.get_task(conn, tid)
     assert t.reasoning_effort is None
 
 
 def test_set_model_with_no_args_at_all_errors(kanban_home):
-    with kb.connect_closing() as conn:
+    with kbc.connect_closing() as conn:
         tid = kb.create_task(conn, title="t", assignee="worker")
     out = kc.run_slash(f"set-model {tid}")
     assert "requires a model" in out or "--reasoning" in out
@@ -227,7 +228,7 @@ def worker_env(monkeypatch, tmp_path):
 
     kb._INITIALIZED_PATHS.clear()
     kb.init_db()
-    with kb.connect_closing() as conn:
+    with kbc.connect_closing() as conn:
         tid = kb.create_task(conn, title="worker-test", assignee="test-worker")
         kb.claim_task(conn, tid)
     monkeypatch.setenv("HERMES_KANBAN_TASK", tid)
@@ -245,7 +246,7 @@ def test_handle_create_passes_reasoning_effort_through(worker_env):
     })
     d = json.loads(out)
     assert d["ok"] is True
-    with kb.connect_closing() as conn:
+    with kbc.connect_closing() as conn:
         child = kb.get_task(conn, d["task_id"])
     assert child.reasoning_effort == "xhigh"
 
@@ -271,6 +272,6 @@ def test_handle_create_omitted_reasoning_effort_stores_null(worker_env):
     out = kt._handle_create({"title": "child task", "assignee": "peer"})
     d = json.loads(out)
     assert d["ok"] is True
-    with kb.connect_closing() as conn:
+    with kbc.connect_closing() as conn:
         child = kb.get_task(conn, d["task_id"])
     assert child.reasoning_effort is None
