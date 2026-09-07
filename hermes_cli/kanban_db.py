@@ -1634,7 +1634,8 @@ def _task_provider(conn: sqlite3.Connection, task_id: str) -> Optional[str]:
     if not row:
         return None
     if row["provider_override"]:
-        return str(row["provider_override"]).strip() or None
+        provider = str(row["provider_override"]).strip()
+        return provider if provider and provider != "auto" else None
     assignee = row["assignee"]
     if not assignee:
         return None

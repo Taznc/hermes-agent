@@ -502,6 +502,40 @@ def test_quota_death_with_provider_parks_as_scheduled_and_registers_backoff(
         assert kbd.check_respawn_guard(conn, auto_task) != "provider_backoff"
 
 
+def test_quota_death_with_explicit_auto_provider_stays_on_interruption_path(
+    kanban_home, monkeypatch,
+):
+    """An explicit ``--provider auto`` must not create an "auto"-wide pause.
+
+    This exercises the real dead-worker reclaim path rather than only the
+    respawn guard: auto routing can choose a healthy concrete provider.
+    """
+    monkeypatch.setattr(kbd, "_pid_alive", lambda _pid: False)
+    monkeypatch.setenv("HERMES_KANBAN_CRASH_GRACE_SECONDS", "0")
+
+    with kb.connect() as conn:
+        pid = 80007
+        host = kb._claimer_id().split(":", 1)[0]
+        tid = kb.create_task(
+            conn, title="explicit-auto-quota", assignee="a",
+            model_override="test-model", provider_override="auto",
+        )
+        kb.claim_task(conn, tid, claimer=f"{host}:w1")
+        conn.execute("UPDATE tasks SET worker_pid=? WHERE id=?", (pid, tid))
+        run_id = kb._current_run_id(conn, tid)
+        assert run_id is not None
+        conn.commit()
+        kbd._record_worker_exit(pid, _exited_status(1))
+        _write_worker_run_log(tid, run_id, "quota exhausted (429); retry after 120s.\n")
+
+        crashed = kb.detect_crashed_workers(conn)
+        assert tid not in crashed
+        task = kb.get_task(conn, tid)
+        assert task is not None and task.status == "ready"
+        assert kb.provider_backoff_until(conn, provider="auto") is None
+        assert kbd.check_respawn_guard(conn, tid) != "provider_backoff"
+
+
 def test_quota_death_without_usable_retry_after_does_not_park_falls_to_interruption_policy(
     kanban_home, monkeypatch,
 ):
