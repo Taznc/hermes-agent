@@ -427,12 +427,12 @@ def _exited_status(code: int) -> int:
 
 
 
-def test_rate_limit_exit_requeues_without_counting_failure(
+def test_rate_limit_exit_with_valid_deadline_requeues_without_counting_failure(
     kanban_home, monkeypatch,
 ):
-    """A rate-limit sentinel exit releases the task to ``ready`` and leaves
-    ``consecutive_failures`` untouched — the breaker must never trip on a
-    transient throttle, even across many quota-wall hits."""
+    """A rate-limit sentinel carrying a validated finite deadline releases the
+    task to ``ready`` and leaves ``consecutive_failures`` untouched — the
+    breaker must never trip while a real quota window is active."""
     import hermes_cli.kanban_db as _kb
     from hermes_cli import kanban_db_dispatch as _kbd
 
@@ -450,13 +450,16 @@ def test_rate_limit_exit_requeues_without_counting_failure(
             # Claim to open a real run (so detect_crashed_workers can close
             # it with a rate_limited outcome), then point the claim at this
             # host + a dead pid so the crash path acts on it.
-            kb.claim_task(conn, tid, claimer=f"{host}:w{i}")
+            claimed = kb.claim_task(conn, tid, claimer=f"{host}:w{i}")
+            assert claimed is not None
             conn.execute(
                 "UPDATE tasks SET worker_pid=?, consecutive_failures=? "
                 "WHERE id=?",
                 (pid, 0, tid),
             )
             conn.commit()
+            with _kbd._open_worker_log(claimed, None) as log:
+                log.write(b"quota exhausted (429); retry after 60s.\n")
             _kbd._record_worker_exit(
                 pid, _exited_status(_kb.KANBAN_RATE_LIMIT_EXIT_CODE)
             )
