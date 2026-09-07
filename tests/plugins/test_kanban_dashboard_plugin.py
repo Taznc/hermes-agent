@@ -1649,3 +1649,95 @@ def test_board_link_edges_drop_after_unlink(client):
     assert body["link_edges"] == []
     cards = {t["id"]: t for col in body["columns"] for t in col["tasks"]}
     assert cards[child_id]["link_counts"]["parents"] == 0
+
+
+# ---------------------------------------------------------------------------
+# Archive completed cards by selected board / All Boards scope
+# ---------------------------------------------------------------------------
+
+
+def _done_task(client, title, *, board=None):
+    suffix = f"?board={board}" if board else ""
+    task = client.post(f"/api/plugins/kanban/tasks{suffix}", json={"title": title}).json()["task"]
+    response = client.patch(f"/api/plugins/kanban/tasks/{task['id']}{suffix}", json={"status": "done"})
+    assert response.status_code == 200, response.text
+    return task["id"]
+
+
+def test_archive_done_preflight_and_mutation_stay_on_one_board(client):
+    kb.create_board("other", name="Other Board")
+    done_here = _done_task(client, "done here")
+    active_here = client.post("/api/plugins/kanban/tasks", json={"title": "active here"}).json()["task"]["id"]
+    done_elsewhere = _done_task(client, "done elsewhere", board="other")
+
+    preflight = client.get("/api/plugins/kanban/tasks/archive-done/preflight")
+    assert preflight.status_code == 200, preflight.text
+    assert preflight.json() == {
+        "scope": {"board": "default", "kind": "board", "label": "Default"},
+        "done_count": 1,
+    }
+
+    archived = client.post("/api/plugins/kanban/tasks/archive-done")
+    assert archived.status_code == 200, archived.text
+    result = archived.json()
+    assert result["scope"] == preflight.json()["scope"]
+    assert result["archived_count"] == 1
+    assert result["skipped_count"] == 0
+    assert result["failures"] == []
+
+    with kb.connect() as conn:
+        assert kb.get_task(conn, done_here).status == "archived"
+        assert kb.get_task(conn, active_here).status != "archived"
+    with kbc.connect(board="other") as conn:
+        assert kb.get_task(conn, done_elsewhere).status == "done"
+
+
+def test_archive_done_all_boards_uses_existing_boards_star_scope(client):
+    kb.create_board("other", name="Other Board")
+    done_default = _done_task(client, "done default")
+    done_other = _done_task(client, "done other", board="other")
+
+    preflight = client.get("/api/plugins/kanban/tasks/archive-done/preflight?boards=*")
+    assert preflight.status_code == 200, preflight.text
+    assert preflight.json()["scope"] == {"kind": "all_boards", "label": "All Boards"}
+    assert preflight.json()["done_count"] == 2
+
+    archived = client.post("/api/plugins/kanban/tasks/archive-done?boards=*")
+    assert archived.status_code == 200, archived.text
+    assert archived.json()["archived_count"] == 2
+    with kbc.connect() as conn:
+        assert kb.get_task(conn, done_default).status == "archived"
+    with kbc.connect(board="other") as conn:
+        assert kb.get_task(conn, done_other).status == "archived"
+
+
+def test_archive_done_reports_zero_when_scope_has_no_completed_cards(client):
+    response = client.get("/api/plugins/kanban/tasks/archive-done/preflight")
+    assert response.status_code == 200, response.text
+    assert response.json()["done_count"] == 0
+
+    archived = client.post("/api/plugins/kanban/tasks/archive-done")
+    assert archived.status_code == 200, archived.text
+    assert archived.json()["archived_count"] == 0
+    assert archived.json()["skipped_count"] == 0
+    assert archived.json()["failures"] == []
+
+
+def test_archive_done_skips_card_that_leaves_done_before_its_atomic_archive(client, monkeypatch):
+    task_id = _done_task(client, "racing card")
+    original = kb.archive_task
+
+    def change_status_before_archive(conn, task_id, *, expected_status=None):
+        with kb.write_txn(conn):
+            conn.execute("UPDATE tasks SET status = 'todo' WHERE id = ?", (task_id,))
+        return original(conn, task_id, expected_status=expected_status)
+
+    monkeypatch.setattr(kb, "archive_task", change_status_before_archive)
+    response = client.post("/api/plugins/kanban/tasks/archive-done")
+
+    assert response.status_code == 200, response.text
+    assert response.json()["archived_count"] == 0
+    assert response.json()["skipped_count"] == 1
+    assert response.json()["failures"] == []
+    with kb.connect() as conn:
+        assert kb.get_task(conn, task_id).status == "todo"

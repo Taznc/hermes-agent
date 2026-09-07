@@ -4322,13 +4322,26 @@ def _insert_decomposed_child(
     return new_id
 
 
-def archive_task(conn: sqlite3.Connection, task_id: str) -> bool:
+def archive_task(
+    conn: sqlite3.Connection, task_id: str, *, expected_status: Optional[str] = None,
+) -> bool:
+    """Archive one task while optionally requiring its status at write time.
+
+    ``expected_status`` lets a batch action select candidates optimistically but
+    still refuse a task that left that status before this transaction acquired
+    the write lock. The normal single-card archive remains status-agnostic.
+    """
     with write_txn(conn):
-        cur = conn.execute(
+        sql = (
             "UPDATE tasks SET status = 'archived', "
             "    claim_lock = NULL, claim_expires = NULL, worker_pid = NULL, worker_unit = NULL "
-            "WHERE id = ? AND status != 'archived'", (task_id,),
+            "WHERE id = ? AND status != 'archived'"
         )
+        params: list[str] = [task_id]
+        if expected_status is not None:
+            sql += " AND status = ?"
+            params.append(expected_status)
+        cur = conn.execute(sql, params)
         if cur.rowcount != 1:
             return False
         # Archived mid-run (dashboard): close the run so history isn't orphaned.
