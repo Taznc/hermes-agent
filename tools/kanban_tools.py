@@ -24,7 +24,7 @@ from tools.kanban_tools_schemas import (
     KANBAN_ATTACH_URL_SCHEMA, KANBAN_ATTACHMENTS_SCHEMA, KANBAN_BLOCK_SCHEMA, KANBAN_COMMENT_SCHEMA,
     KANBAN_COMPLETE_SCHEMA, KANBAN_CREATE_SCHEMA, KANBAN_HEARTBEAT_SCHEMA, KANBAN_LINK_SCHEMA,
     KANBAN_LIST_SCHEMA, KANBAN_REQUEST_CHANGES_SCHEMA, KANBAN_REQUEST_REVIEW_SCHEMA,
-    KANBAN_SHOW_SCHEMA, KANBAN_UNBLOCK_SCHEMA)
+    KANBAN_ROADMAP_SCHEMA, KANBAN_SHOW_SCHEMA, KANBAN_UNBLOCK_SCHEMA)
 
 logger = logging.getLogger(__name__)
 
@@ -873,9 +873,15 @@ def _handle_create(args: dict, **kw) -> str:
     """Create a (child) task; orchestrator workers use this to fan out."""
     _reject_delegated_child_mutation("kanban_create")
     title = _require_text(args, "title")
+    lane = args.get("lane")
+    if lane is not None:
+        lane = str(lane).strip()
+        _check(lane in {"idea", "roadmap"}, "lane must be 'idea' or 'roadmap'")
     assignee = args.get("assignee")
-    _check(assignee, "assignee is required — name the profile that should execute this "
-                     "task (the dispatcher will only spawn tasks with an assignee)")
+    # A lane card is inert — nothing dispatches it — so an assignee is meaningless there. For
+    # real work the assignee stays mandatory: an unassigned task sits in ready forever.
+    _check(assignee or lane, "assignee is required — name the profile that should execute this "
+                             "task (the dispatcher will only spawn tasks with an assignee)")
     # Prefer the request-scoped api_server origin binding over HERMES_SESSION_ID: the env
     # var is clobbered with a subagent's internal id whenever a child agent is constructed
     # in-process, which would stamp — and later wake — the wrong session.
@@ -920,7 +926,8 @@ def _handle_create(args: dict, **kw) -> str:
             routing.model_override, routing.provider_override, routing.reasoning_effort,
         )
         new_tid = kb.create_task(
-            conn, title=str(title).strip(), body=args.get("body"), assignee=str(assignee),
+            conn, title=str(title).strip(), body=args.get("body"),
+            assignee=str(assignee) if assignee else None,
             parents=tuple(parents), tenant=args.get("tenant") or os.environ.get("HERMES_TENANT"),
             priority=_opt_int(args.get("priority"), 0),
             workspace_kind=str(workspace_kind if workspace_kind is not None else "scratch"),
@@ -932,7 +939,7 @@ def _handle_create(args: dict, **kw) -> str:
             reasoning_effort=reasoning_effort,
             route_source=routing.route_source, route_name=routing.route_name,
             goal_mode=goal_mode, goal_max_turns=_opt_int(args.get("goal_max_turns")),
-            initial_status=str(args.get("initial_status") or "running"),
+            initial_status=str(args.get("initial_status") or "running"), lane=lane,
             created_by=os.environ.get("HERMES_PROFILE") or "worker", session_id=session_id)
         landed = _fields(kb.get_task(conn, new_tid), _CREATED_FIELDS)
         return _ok(task_id=new_tid, **landed, subscribed=_maybe_auto_subscribe(conn, new_tid))
@@ -1019,6 +1026,33 @@ def _handle_unblock(args: dict, **kw) -> str:
         return _ok(task_id=tid, **_fields(kb.get_task(conn, tid), ("status",)))
 
 
+@_kanban_handler("kanban_roadmap")
+def _handle_roadmap(args: dict, **kw) -> str:
+    """Move a card between the inert roadmap lanes, or spawn it into the work queue."""
+    _reject_delegated_child_mutation("kanban_roadmap")
+    _require_orchestrator_tool("kanban_roadmap")
+    tid = args.get("task_id")
+    _check(tid, "task_id is required")
+    tid = str(tid)
+    action = str(args.get("action") or "").strip()
+    _check(action in {"refine", "demote", "spawn"},
+           "action must be one of 'refine', 'demote', 'spawn'")
+    to = str(args.get("to") or "triage").strip()
+    if action == "spawn":
+        _check(to in {"triage", "ready"}, "to must be 'triage' or 'ready'")
+    with _board(args.get("board")) as (kb, conn):
+        # An invalid transition raises ValueError naming from->to; the handler decorator turns
+        # that into a tool_error, which is the message the model needs.
+        if action == "refine":
+            moved = kb.refine_task(conn, tid)
+        elif action == "demote":
+            moved = kb.demote_task(conn, tid)
+        else:
+            moved = kb.spawn_roadmap_task(conn, tid, to=to)
+        _check(moved, f"could not {action} {tid} (status changed concurrently)")
+        return _ok(task_id=tid, action=action, **_fields(kb.get_task(conn, tid), ("status",)))
+
+
 @_kanban_handler("kanban_link")
 def _handle_link(args: dict, **kw) -> str:
     """Add a parent→child dependency edge after the fact (cycles/self-links → ValueError)."""
@@ -1034,7 +1068,7 @@ def _handle_link(args: dict, **kw) -> str:
 # --- Registration (order preserved: it is the order tools appear in the schema) ---
 
 # kanban_list / kanban_unblock route the board and are hidden from task workers.
-_ORCHESTRATOR_TOOLS = frozenset({"kanban_list", "kanban_unblock"})
+_ORCHESTRATOR_TOOLS = frozenset({"kanban_list", "kanban_unblock", "kanban_roadmap"})
 _TOOLS = (
     ("kanban_show", KANBAN_SHOW_SCHEMA, _handle_show, "📋"),
     ("kanban_list", KANBAN_LIST_SCHEMA, _handle_list, "📋"),
@@ -1049,6 +1083,7 @@ _TOOLS = (
     ("kanban_attachments", KANBAN_ATTACHMENTS_SCHEMA, _handle_attachments, "📎"),
     ("kanban_create", KANBAN_CREATE_SCHEMA, _handle_create, "➕"),
     ("kanban_unblock", KANBAN_UNBLOCK_SCHEMA, _handle_unblock, "▶"),
+    ("kanban_roadmap", KANBAN_ROADMAP_SCHEMA, _handle_roadmap, "★"),
     ("kanban_link", KANBAN_LINK_SCHEMA, _handle_link, "🔗"))
 
 for _name, _sch, _handler, _emoji in _TOOLS:
