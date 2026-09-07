@@ -187,7 +187,7 @@ describe('SidebarSessionRow running arc', () => {
     clearAllSessionStates()
   })
 
-  const arc = (container: HTMLElement) => container.querySelector('.arc-row')
+  const arc = (container: HTMLElement) => container.querySelector('.working-bar')
 
   it('paints no arc for a settled session', () => {
     const { container } = renderRow(makeSession({ title: 'Settled' }))
