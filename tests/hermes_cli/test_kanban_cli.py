@@ -250,3 +250,16 @@ def test_ls_status_filter_accepts_lane_names(kanban_home):
     assert [t["title"] for t in ideas] == ["wishlist item"]
 
 
+def test_spawn_to_ready_reports_the_gated_landing_not_the_request(kanban_home):
+    """``--to ready`` under an unfinished parent lands in ``todo``; the CLI must say where the
+    card actually went. Printing the requested "Spawned to ready" would tell the operator their
+    card is queued for dispatch when it is sitting in ``todo`` waiting on its parent."""
+    epic = json.loads(kc.run_slash('create "epic" --assignee alice --json'))["id"]
+    tid = json.loads(kc.run_slash(f'create "wish" --roadmap --parent {epic} --json'))["id"]
+
+    out = kc.run_slash(f"spawn {tid} --to ready")
+    assert "Spawned to todo" in out
+    assert "requested ready" in out
+    assert json.loads(kc.run_slash(f"show {tid} --json"))["task"]["status"] == "todo"
+
+
