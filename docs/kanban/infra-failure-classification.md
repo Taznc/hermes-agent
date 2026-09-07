@@ -46,7 +46,7 @@ correctness properties are load-bearing and independently tested:
 | Category | Meaning | Failure budget | Event kind |
 |---|---|---|---|
 | `legit` | The task itself is at fault, or the dispatcher took a deliberate, accounted action (its own `--max-runtime` kill), or a signal off the allowlist. | Counts (`consecutive_failures` += 1; may trip `gave_up`). | `crashed` / `timed_out` (unchanged) |
-| `infra` | The worker died for a reason external to the task: an *allowlisted* SIGTERM/SIGKILL the dispatcher did not send itself, a dead PID discovered inside the dispatcher's own startup window (gateway restart / VM boot), or a provider 429/quota exit with any retry-after signature (including malformed/missing). | Does NOT count directly. Bumps the persistent interruption streak; task re-queues to `ready` (or `scheduled` when a provider pause was registered) immediately. | `interrupted` |
+| `infra` | The worker died for a reason external to the task: an *allowlisted* SIGTERM/SIGKILL the dispatcher did not send itself, a dead PID discovered inside the dispatcher's own startup window (gateway restart / VM boot), or a **non-signal** provider 429/quota exit with any retry-after signature (including malformed/missing). | Does NOT count directly. Bumps the persistent interruption streak; task re-queues to `ready` (or `scheduled` when a provider pause was registered) immediately. | `interrupted` |
 | streak-exceeded `infra` | An `infra` death that pushed the per-task streak past `kanban.max_infra_interruptions`. | Counts, exactly like a `legit` crash (`force_trip` against the same breaker). | `crashed` / `gave_up` |
 | `unknown` (legacy) | Reap registry has no record and none of the infra signals matched — indistinguishable today from a genuine crash. | Counts (unchanged; this is the existing `unknown` → `crashed` path). | `crashed` |
 
@@ -64,14 +64,20 @@ function itself does no I/O.
 
 | exit_kind (from `_classify_worker_exit`) | Extra signal | Category | reason |
 |---|---|---|---|
-| any | quota/429 signature found in the worker's final log lines (`quota_signal_dict`) | `infra` | `quota` |
-| `signaled` | `signal_number` NOT in `{SIGTERM, SIGKILL}` | `legit` | `signal_<N>` (ALWAYS legit, regardless of `dispatcher_killed`) |
-| `signaled` | `signal_number` in `{SIGTERM, SIGKILL}` AND `dispatcher_killed` True (a pending or just-consumed durable timeout-kill intent exists for this task/pid) | `legit` | `dispatcher_kill` |
-| `signaled` | `signal_number` in `{SIGTERM, SIGKILL}` AND `dispatcher_killed` False | `infra` | `external_signal` |
+| `signaled` | `signal_number` NOT in `{SIGTERM, SIGKILL}` | `legit` | `signal_<N>` (ALWAYS legit, regardless of `dispatcher_killed` or quota text) |
+| `signaled` | `signal_number` in `{SIGTERM, SIGKILL}` AND `dispatcher_killed` True (a pending or just-consumed durable timeout-kill intent exists for this task/run/pid) | `legit` | `dispatcher_kill` (regardless of quota text) |
+| `signaled` | `signal_number` in `{SIGTERM, SIGKILL}` AND `dispatcher_killed` False | `infra` | `external_signal` (regardless of quota text) |
+| non-signal exit | a run-scoped quota/429 signature is found in this worker run's post-start log output (`quota_signal_dict`) | `infra` | `quota` |
 | `unknown` (no reap record — the existing `pid N not alive` path) | this process was marked as a real dispatcher loop (`mark_dispatcher_process_started()`) less than `kanban.infra_startup_window_seconds` (default 120s) ago | `infra` | `startup_window` |
 | `unknown` | not marked as a dispatcher loop, or marked more than the window ago | `legit` | `unknown` |
-| `nonzero_exit` | none of the above | `legit` | `nonzero_exit` |
+| `nonzero_exit` | no run-scoped quota/429 signature | `legit` | `nonzero_exit` |
 | `clean_exit` / `rate_limited` | n/a — untouched, existing dedicated handling | (unchanged) | n/a |
+
+The table is evaluated in order: every signaled exit is classified by the
+signal allowlist and dispatcher-owned timeout intent first. Quota attribution
+is considered only for a non-signal exit, so neither current-run quota text nor
+stale prior-run text can override a dispatcher kill or an off-allowlist crash
+signal.
 
 Regression guards (explicit, tested in
 `tests/hermes_cli/test_kanban_infra_failure_classification.py`):
