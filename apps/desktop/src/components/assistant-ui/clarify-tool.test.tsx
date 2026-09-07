@@ -310,6 +310,36 @@ describe('ClarifyTool choice selection', () => {
       })
     })
   })
+
+  it('submits the Other draft on plain Enter and cancels the newline', async () => {
+    const { request } = renderLiveClarify()
+    const other = screen.getByPlaceholderText('Other (type your answer)')
+
+    other.focus()
+    fireEvent.change(other, { target: { value: 'canary' } })
+
+    // A cancelled keydown is how the browser is told not to insert "\n".
+    expect(fireEvent.keyDown(other, { key: 'Enter' })).toBe(false)
+    await waitFor(() => {
+      expect(request).toHaveBeenCalledWith('clarify.respond', {
+        answer: 'canary',
+        request_id: 'request-1'
+      })
+    })
+  })
+
+  it('leaves Shift+Enter and IME Enter alone in the Other draft', () => {
+    const { request } = renderLiveClarify()
+    const other = screen.getByPlaceholderText('Other (type your answer)')
+
+    other.focus()
+    fireEvent.change(other, { target: { value: 'canary' } })
+
+    expect(fireEvent.keyDown(other, { key: 'Enter', shiftKey: true })).toBe(true)
+    expect(fireEvent.keyDown(other, { isComposing: true, key: 'Enter' })).toBe(true)
+    expect(request).not.toHaveBeenCalled()
+    expect((other as HTMLTextAreaElement).value).toBe('canary')
+  })
 })
 
 describe('ClarifyTool help controls', () => {
