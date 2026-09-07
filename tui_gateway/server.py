@@ -82,7 +82,7 @@ _sessions: dict[str, dict] = {}
 _methods: dict[str, callable] = {}
 _pending: dict[str, tuple[str, threading.Event]] = {}
 _pending_prompt_payloads: dict[str, tuple[str, dict]] = {}
-_answers: dict[str, str] = {}
+_answers: dict[str, Any] = {}
 # Batch clarify accumulators: rid → {"qids": [...], "answers": {qid: answer}, "notes": {qid: note}}.
 # Written by clarify.respond (per-question lock, update-in-place), read out by _block on
 # resolution/timeout so locked answers survive the deadline.
@@ -1269,7 +1269,13 @@ _EXPIRING_REQUESTS = frozenset({
 })
 
 
-def _block(event: str, sid: str, payload: dict, timeout: float | None = 300, batch_qids: list[str] | None = None) -> str:
+def _block(
+    event: str,
+    sid: str,
+    payload: dict,
+    timeout: float | None = 300,
+    batch_qids: list[str] | None = None,
+) -> Any:
     rid = uuid.uuid4().hex[:8]
     ev = threading.Event()
     with _prompt_lock:
@@ -3123,7 +3129,8 @@ def _respond(rid, params, key, *, allow_expired=False):
             if note:
                 result["note"] = note
             return _ok(rid, result)
-        _answers[r] = params.get(key, "")
+        answer = params.get(key, "")
+        _answers[r] = {"answer": answer, "note": note} if key == "answer" and note else answer
         ev.set()
     result = {"status": "ok"}
     if note:

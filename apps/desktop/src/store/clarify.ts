@@ -34,6 +34,8 @@ export interface ClarifyRequest {
   questions?: ClarifyQuestion[]
   /** Answers already locked server-side (reconnect replay): qid → answer. */
   lockedAnswers?: Record<string, string>
+  /** Notes already locked server-side (reconnect replay): qid → note. */
+  lockedNotes?: Record<string, string>
 }
 
 /**
