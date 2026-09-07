@@ -261,6 +261,37 @@ describe('ClarifyTool help controls', () => {
     expect(screen.getByRole('button', { name: /Continue/ }).hasAttribute('disabled')).toBe(true)
   })
 
+  it('keeps keyboard help activation from selecting its target choice', async () => {
+    const { request } = renderLiveClarify()
+    const choice = screen.getByRole('button', { name: /^[A-Z]staging/ })
+    const why = screen.getByRole('button', { name: 'Why? staging' })
+
+    why.focus()
+    fireEvent.keyDown(why, { key: 'Enter' })
+    fireEvent.click(why)
+
+    await waitFor(() => expect(request).toHaveBeenCalledWith('clarify.explain', expect.objectContaining({ choice: 'staging' })))
+    expect(choice.getAttribute('aria-pressed')).toBe('false')
+  })
+
+  it('keeps a batch draft and staged selection while question help fails and is retried', async () => {
+    const request = renderLiveBatch()
+    request.mockRejectedValueOnce(new Error('backend unavailable')).mockResolvedValueOnce({ explanation_id: 'retry-help' })
+
+    fireEvent.click(screen.getByRole('button', { name: /^[A-Z]red/ }))
+    fireEvent.change(screen.getByPlaceholderText('Type your answer…'), { target: { value: 'packet' } })
+    fireEvent.click(screen.getByRole('button', { name: 'Why? Color?' }))
+
+    await waitFor(() => expect(screen.getByText('backend unavailable')).toBeTruthy())
+    expect(screen.getByRole('button', { name: /^[A-Z]red/ }).getAttribute('aria-pressed')).toBe('true')
+    expect((screen.getByPlaceholderText('Type your answer…') as HTMLTextAreaElement).value).toBe('packet')
+    expect((screen.getByRole('button', { name: /Confirm and continue/ }) as HTMLButtonElement).disabled).toBe(false)
+
+    fireEvent.click(screen.getByRole('button', { name: 'Why? Color?' }))
+    await waitFor(() => expect(request).toHaveBeenCalledTimes(2))
+    expect((screen.getByPlaceholderText('Type your answer…') as HTMLTextAreaElement).value).toBe('packet')
+  })
+
   it('keeps help on the same settled tool row after the pending card remounts', () => {
     renderLiveClarify()
     updateClarifyHelp('request-1', 'session-1', 'explain-1', {

@@ -162,6 +162,37 @@ export function updateClarifyHelp(
   $clarifyRequests.set({ ...$clarifyRequests.get(), [key]: { ...current, help } })
 }
 
+export function reconcileClarifyHelp(
+  requestId: string,
+  sessionId: string | null | undefined,
+  localExplanationId: string,
+  explanationId: string
+): void {
+  const key = keyFor(sessionId)
+  const current = $clarifyRequests.get()[key]
+
+  if (!current || current.requestId !== requestId || localExplanationId === explanationId) {
+    return
+  }
+
+  const local = current.help?.[localExplanationId]
+  const received = current.help?.[explanationId]
+
+  if (!local && !received) {
+    return
+  }
+
+  const help = { ...(current.help ?? {}) }
+  delete help[localExplanationId]
+  help[explanationId] = {
+    ...(local ?? { explanationId, followUp: '', status: 'loading' as const }),
+    ...(received ?? {}),
+    explanationId,
+    followUp: local?.followUp ?? received?.followUp ?? ''
+  }
+  $clarifyRequests.set({ ...$clarifyRequests.get(), [key]: { ...current, help } })
+}
+
 export function settledClarifyHelp(requestId: string | null): Record<string, ClarifyHelp> {
   return requestId ? $settledClarifyHelp.get()[requestId] ?? {} : {}
 }

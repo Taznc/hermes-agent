@@ -35,6 +35,7 @@ import {
   type ClarifyQuestion,
   type ClarifyRequest,
   clearClarifyRequest,
+  reconcileClarifyHelp,
   normalizeChoices,
   RECOMMENDED_LABEL,
   sessionClarifyRequest,
@@ -60,6 +61,9 @@ interface ClarifyResult {
   answer?: string
   error?: string
 }
+
+// Distinct even when multiple help controls are activated in one event-loop turn.
+let clarifyHelpLocalSequence = 0
 
 function stringField(row: Record<string, unknown>, ...keys: string[]): string | undefined {
   for (const key of keys) {
@@ -254,7 +258,7 @@ function ClarifyHelpControls({ choice, questionId, request, target, targetLabel 
       return
     }
 
-    const localId = `local-${Date.now()}`
+    const localId = `local-${++clarifyHelpLocalSequence}`
     setError('')
     updateClarifyHelp(request.requestId, request.sessionId, localId, {
       choice,
@@ -264,7 +268,7 @@ function ClarifyHelpControls({ choice, questionId, request, target, targetLabel 
     })
 
     try {
-      await requestForOwnedSession(
+      const response = await requestForOwnedSession(
         request.sessionId,
         gateway.request.bind(gateway) as typeof gateway.request,
         'clarify.explain',
@@ -276,9 +280,16 @@ function ClarifyHelpControls({ choice, questionId, request, target, targetLabel 
           version: 1
         }
       )
+      const explanationId =
+        typeof response === 'object' && response !== null && typeof (response as Record<string, unknown>).explanation_id === 'string'
+          ? (response as Record<string, string>).explanation_id
+          : ''
+
+      if (explanationId) {
+        reconcileClarifyHelp(request.requestId, request.sessionId, localId, explanationId)
+      }
     } catch (cause) {
       const message = cause instanceof Error ? cause.message : 'Help request failed.'
-      setError(message)
       updateClarifyHelp(request.requestId, request.sessionId, localId, { choice, error: message, followUp: custom, questionId, status: 'error' })
     }
   }, [choice, gateway, questionId, request])
