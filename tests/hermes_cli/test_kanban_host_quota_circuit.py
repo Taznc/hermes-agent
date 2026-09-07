@@ -440,6 +440,50 @@ def test_worker_publishes_structured_deadline_before_tempfail_reap(quota_home, m
     assert len(kqc.list_quota_circuits(now=5_001)) == 1
 
 
+def test_worker_publication_reads_budget_groups_from_host_config(quota_home, monkeypatch):
+    """A worker runs under its assignee profile home, but the account map is
+    host policy and therefore lives only in the shared/default config."""
+    (quota_home / "config.yaml").write_text(
+        """kanban:
+  quota_budget_groups:
+    primary-wallet:
+      providers: [openai-codex]
+      profiles: [implementer]
+    backup-wallet:
+      providers: [anthropic]
+      profiles: [implementer]
+""",
+        encoding="utf-8",
+    )
+    profile_home = quota_home / "profiles" / "implementer"
+    profile_home.mkdir(parents=True)
+    (profile_home / "config.yaml").write_text(
+        "model:\n  provider: openai-codex\n",
+        encoding="utf-8",
+    )
+    source = _task("default", profile="implementer", provider="auto")
+
+    # Reproduce _default_spawn's worker environment: HERMES_HOME is the
+    # assignee profile, while HERMES_KANBAN_HOME remains host-wide.
+    monkeypatch.setenv("HERMES_HOME", str(profile_home))
+    published = kqc.publish_worker_quota_result(
+        {
+            "failed": True,
+            "failure_reason": "rate_limit",
+            "reset_at": 5_120.0,
+        },
+        task_id=source,
+        board="default",
+        provider="openai-codex",
+        now=5_000,
+        max_seconds=3_600,
+    )
+
+    assert published is not None
+    assert published["next_eligible_at"] == 5_120
+    assert len(kqc.list_quota_circuits(now=5_001)) == 1
+
+
 def test_quiet_cli_publishes_quota_circuit_then_exits_tempfail(quota_home, monkeypatch, capsys):
     import cli as cli_module
 
@@ -471,6 +515,63 @@ def test_quiet_cli_publishes_quota_circuit_then_exits_tempfail(quota_home, monke
     assert len(circuits) == 1
     assert circuits[0]["reason"] == "rate_limit"
     assert circuits[0]["next_eligible_at"] == 6_300
+
+
+def test_goal_mode_turn_two_quota_publishes_and_exits_tempfail(
+    quota_home, monkeypatch, capsys,
+):
+    import cli as cli_module
+    from hermes_cli import goals
+
+    monkeypatch.setattr(kqc, "configured_budget_groups", lambda: BUDGET_GROUPS)
+    task_id = _task("default", profile="implementer", provider="auto")
+    monkeypatch.setenv("HERMES_KANBAN_TASK", task_id)
+    monkeypatch.setenv("HERMES_KANBAN_BOARD", "default")
+    monkeypatch.setenv("HERMES_KANBAN_GOAL_MODE", "1")
+    monkeypatch.setattr(kqc.time, "time", lambda: 7_000)
+    monkeypatch.setattr(
+        goals,
+        "judge_goal",
+        lambda *_args, **_kwargs: ("continue", "more work", False, None, False),
+    )
+    results = iter(
+        [
+            {"failed": False, "final_response": "first turn succeeded"},
+            {
+                "failed": True,
+                "failure_reason": "rate_limit",
+                "error": "usage_limit_reached",
+                "final_response": "",
+                "reset_at": 7_300.0,
+            },
+        ]
+    )
+    calls = 0
+
+    def run_conversation(**_kwargs):
+        nonlocal calls
+        calls += 1
+        return next(results)
+
+    agent = SimpleNamespace(
+        run_conversation=run_conversation,
+        session_id="s1",
+        provider="openai-codex",
+    )
+    cli = SimpleNamespace(agent=agent, session_id="s1", conversation_history=[])
+
+    with pytest.raises(SystemExit) as exc:
+        cli_module._run_quiet_single_query(cli, "work kanban task")
+
+    assert exc.value.code == kb.KANBAN_RATE_LIMIT_EXIT_CODE
+    assert calls == 2
+    captured = capsys.readouterr()
+    assert "usage_limit_reached" in captured.err
+    assert "session_id: s1" in captured.err
+    circuits = kqc.list_quota_circuits(now=7_001)
+    assert len(circuits) == 1
+    assert circuits[0]["reason"] == "rate_limit"
+    assert circuits[0]["next_eligible_at"] == 7_300
 
 
 def test_machine_readable_tempfail_opens_host_circuit_without_failure_budget(

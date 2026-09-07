@@ -1438,6 +1438,8 @@ kanban:
   quota_resume_spread_seconds: 30
 ```
 
+Put these keys in the shared/default Hermes home's `config.yaml`. They are one host policy: assignee profile configs do not need to duplicate them, and profile-scoped workers read the same mapping when publishing a quota result.
+
 Do not use account IDs, email addresses, keys, or tokens as group labels. A machine-readable quota failure with a valid deadline opens one host-level SQLite circuit for the matching group. For `provider=auto`, every group configured for the profile is a candidate; while any candidate is paused, the dispatcher predicts the provider the worker's own resolution ladder will pick under that profile's home and starts the task only when that provider maps to an unpaused group — an unpredictable or unmapped resolution fails closed, so `auto` never re-hits an exhausted wallet. The worker publishes the actual selected provider before `EX_TEMPFAIL`. New matching ready/review starts on every board are deferred; in-flight workers and unrelated groups continue. At expiry one recovery probe is admitted, then further matching starts are serialized host-wide to at most one per `quota_resume_spread_seconds` until recovery goes idle. The dashboard shows only an opaque `budget-<hash>` handle with state (`paused`/`recovering`), reason, observation times, next eligibility, and deferred board/card counts, plus a manual **Clear circuit** control. See `docs/kanban/infra-failure-classification.md` for storage and race semantics.
 
 ### Forward compatibility

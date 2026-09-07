@@ -28,6 +28,12 @@ import time
 from pathlib import Path
 from typing import Any, Mapping, Optional
 
+from hermes_constants import (
+    get_default_hermes_root,
+    reset_hermes_home_override,
+    set_hermes_home_override,
+)
+
 _log = logging.getLogger(__name__)
 _DEFAULT_RESUME_SPREAD_SECONDS = 30
 # A recovering circuit disarms once no matching start has been admitted for
@@ -107,12 +113,24 @@ def sanitized_group_label(group: str) -> str:
 
 
 def _kanban_config() -> Mapping[str, Any]:
+    """Read host-level Kanban policy from the shared/default Hermes home.
+
+    Workers run with ``HERMES_HOME`` scoped to their assignee profile, but
+    quota budget groups coordinate accounts across profiles and therefore
+    have one authoritative host-level configuration.  Use a context-local
+    override so concurrent profile work in the same process is unaffected.
+    """
+    token = None
     try:
         from hermes_cli.config import load_config_readonly
 
+        token = set_hermes_home_override(get_default_hermes_root())
         value = (load_config_readonly() or {}).get("kanban") or {}
     except Exception:
         return {}
+    finally:
+        if token is not None:
+            reset_hermes_home_override(token)
     return value if isinstance(value, Mapping) else {}
 
 

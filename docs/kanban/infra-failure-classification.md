@@ -179,6 +179,11 @@ kanban:
   quota_resume_spread_seconds: 30
 ```
 
+This mapping and `quota_resume_spread_seconds` are host policy: configure them
+in the shared/default Hermes home's `config.yaml`. Assignee profile configs do
+not inherit or duplicate the mapping; profile-scoped workers read the same
+host policy when publishing their selected provider.
+
 A pinned route matches only when both its provider and profile are listed; `*`
 is accepted only when deliberately configured. For `provider=auto`, every group
 configured for the profile is a candidate. While any candidate is paused the

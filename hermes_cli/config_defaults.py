@@ -1724,7 +1724,10 @@ DEFAULT_CONFIG = {
         # it follows the bounded interruption policy (max_infra_interruptions) instead.
         # Default 24h. Parse only positive base-10 integer retry-after values.
         "provider_backoff_max_seconds": 86400,
-        # Optional host-wide account/budget quota circuits. Empty by default:
+        # Optional host-wide account/budget quota circuits. Configure this only
+        # in the shared/default Hermes home's config.yaml; dispatchers and
+        # profile-scoped workers read that one authoritative host policy.
+        # Empty by default:
         # provider names are not account identities, and credential selection
         # happens inside the worker. Operators explicitly map opaque, non-secret
         # group labels to provider/profile routes, for example:
