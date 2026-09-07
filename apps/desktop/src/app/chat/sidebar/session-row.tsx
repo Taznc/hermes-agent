@@ -515,6 +515,18 @@ function SidebarSessionRowImpl({
             data-stalled={dotState === 'stalled' ? '' : undefined}
           />
         )}
+        {/* Attention ring (A3): the loudest sidebar treatment, reserved for
+            the states that wait on the user. Breathing amber for a blocking
+            clarify/approval; steady orange for rate-limited (a wait, not a
+            question). Renders over the selection wash — a selected waiting
+            row still breathes. */}
+        {(dotState === 'needs-input' || dotState === 'rate-limited') && (
+          <span
+            aria-hidden="true"
+            className="attention-ring"
+            data-rate-limited={dotState === 'rate-limited' ? '' : undefined}
+          />
+        )}
         <SidebarRowBody
           // Every trailing figure lives in the actions slot, which the row
           // measures — so the title needs a gap from it and nothing else. Hover
