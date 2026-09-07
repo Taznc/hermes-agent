@@ -22,6 +22,12 @@ export const forkZhHant: TranslationOverrides = {
         `設定的模型：${configuredFamily}，目前經由 ${servedFamily} 提供服務`
     }
   },
+  assistant: {
+    thread: {
+      workComplete: '工作已完成',
+      workNeedsAttention: '工作需要處理'
+    }
+  },
   errors: {
     openLogsFailed: '無法開啟日誌資料夾'
   }

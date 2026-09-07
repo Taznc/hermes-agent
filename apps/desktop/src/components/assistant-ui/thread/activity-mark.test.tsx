@@ -34,12 +34,27 @@ afterEach(() => {
 })
 
 describe('ThreadActivityMark', () => {
-  it('renders the core dither pulse when no plugin claims the area', () => {
+  it('renders a named, phase-aware core mark when no plugin claims the area', () => {
     const { container } = render(<ThreadActivityMark elapsedSeconds={3} hint="" phase="thinking" slot="turn" />)
 
-    // The seam is invisible until something uses it: an unclaimed area must
-    // still paint the mark the transcript has always had.
-    expect(container.querySelector('.dither')).not.toBeNull()
+    expect(container.querySelector('[data-activity-mark="thinking"]')).not.toBeNull()
+    expect(container.querySelector('[data-state-label="Thinking"]')).not.toBeNull()
+  })
+
+  it.each(['thinking', 'working', 'quiet', 'compacting', 'success', 'failure'] as const)(
+    'uses a distinct semantic core state for %s',
+    phase => {
+      const { container } = render(<ThreadActivityMark elapsedSeconds={3} hint="" phase={phase} slot="turn" />)
+
+      expect(container.querySelector(`[data-activity-mark="${phase}"]`)).not.toBeNull()
+    }
+  )
+
+  it('keeps its static semantic mark when reduced motion is requested', () => {
+    setReducedMotion(true)
+    const { container } = render(<ThreadActivityMark elapsedSeconds={3} hint="" phase="working" slot="turn" />)
+
+    expect(container.querySelector('[data-reduced-motion]')).not.toBeNull()
   })
 
   it('renders a claiming plugin mark instead of the core pulse', () => {

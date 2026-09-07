@@ -72,6 +72,8 @@ export const forkEn: ForkTranslations = {
   assistant: {
     thread: {
       showEarlierFailed: 'Could not load earlier messages',
+      workComplete: 'Work complete',
+      workNeedsAttention: 'Work needs attention',
       rateLimit: {
         message: provider => `${provider || 'The provider'} is rate limiting this account.`,
         resetsAt: time => `Retry at ${time}`,
