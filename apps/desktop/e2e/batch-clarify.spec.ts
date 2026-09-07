@@ -72,19 +72,27 @@ test.describe('batch clarify card', () => {
     const placeholderContrast = await followUp.evaluate(field => {
       type Rgba = [number, number, number, number]
 
-      const parse = (value: string): Rgba => {
-        const srgb = value.match(/color\(srgb\s+([\d.]+)\s+([\d.]+)\s+([\d.]+)(?:\s*\/\s*([\d.]+))?\)/)
-        if (srgb) {
-          return [Number(srgb[1]), Number(srgb[2]), Number(srgb[3]), Number(srgb[4] ?? 1)]
-        }
+      // Computed colours arrive in whatever space the token was mixed in
+      // (rgb, color(srgb …), oklab(…) from Tailwind's color-mix). Let the
+      // canvas resolve them to sRGB bytes instead of parsing each syntax.
+      const scratch = document.createElement('canvas').getContext('2d', { willReadFrequently: true })
 
-        const rgb = value.match(/rgba?\((\d+(?:\.\d+)?)[, ]+(\d+(?:\.\d+)?)[, ]+(\d+(?:\.\d+)?)(?:[, /]+([\d.]+))?\)/)
-        if (!rgb) {
-          throw new Error(`Unsupported computed colour: ${value}`)
-        }
-
-        return [Number(rgb[1]) / 255, Number(rgb[2]) / 255, Number(rgb[3]) / 255, Number(rgb[4] ?? 1)]
+      if (!scratch) {
+        throw new Error('2D canvas unavailable for colour normalisation')
       }
+
+      const parse = (value: string): Rgba => {
+        scratch.clearRect(0, 0, 1, 1)
+        scratch.fillStyle = value
+        scratch.fillRect(0, 0, 1, 1)
+
+        const [red, green, blue, alpha] = scratch.getImageData(0, 0, 1, 1).data
+
+        // A translucent fill un-premultiplies on read, so channels stay in
+        // straight (non-premultiplied) form for the compositor below.
+        return [red / 255, green / 255, blue / 255, alpha / 255]
+      }
+
       const composite = (foreground: Rgba, background: Rgba): Rgba => {
         const alpha = foreground[3] + background[3] * (1 - foreground[3])
 
@@ -97,18 +105,23 @@ test.describe('batch clarify card', () => {
       }
 
       const ancestors: Element[] = []
+
       for (let current: Element | null = field; current; current = current.parentElement) {
         ancestors.unshift(current)
       }
+
       const background = ancestors.reduce<Rgba>(
         (painted, element) => composite(parse(getComputedStyle(element).backgroundColor), painted),
         [1, 1, 1, 1]
       )
+
       const placeholder = composite(parse(getComputedStyle(field, '::placeholder').color), background)
+
       const luminance = (color: Rgba) =>
         [color[0], color[1], color[2]]
           .map(channel => (channel <= 0.04045 ? channel / 12.92 : ((channel + 0.055) / 1.055) ** 2.4))
           .reduce((total, channel, index) => total + channel * [0.2126, 0.7152, 0.0722][index], 0)
+
       const foregroundLuminance = luminance(placeholder)
       const backgroundLuminance = luminance(background)
 
@@ -117,6 +130,7 @@ test.describe('batch clarify card', () => {
         (Math.min(foregroundLuminance, backgroundLuminance) + 0.05)
       )
     })
+
     expect(placeholderContrast).toBeGreaterThanOrEqual(4.5)
 
     await fixture!.app.evaluate(({ BrowserWindow }) => {
