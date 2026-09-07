@@ -3,13 +3,17 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import {
   $clarifyRequest,
   $clarifyRequests,
+  $settledClarifyHelp,
+  associateClarifyToolRequest,
   type ClarifyRequest,
   clearClarifyRequest,
   hasClarifyRequest,
   normalizeChoices,
   normalizeQuestions,
   setClarifyRequest,
-  skipClarifyRequest
+  settledClarifyHelpForToolCall,
+  skipClarifyRequest,
+  updateClarifyHelp
 } from './clarify'
 import { $gateway } from './gateway'
 import { $activeSessionId } from './session'
@@ -27,11 +31,13 @@ function clarify(sessionId: string | null, requestId: string): ClarifyRequest {
 describe('clarify store', () => {
   beforeEach(() => {
     $clarifyRequests.set({})
+    $settledClarifyHelp.set({})
     $activeSessionId.set(null)
   })
 
   afterEach(() => {
     $clarifyRequests.set({})
+    $settledClarifyHelp.set({})
     $activeSessionId.set(null)
   })
 
@@ -83,6 +89,22 @@ describe('clarify store', () => {
 
     expect($clarifyRequests.get()['session-a']).toBeUndefined()
     expect($clarifyRequests.get()['session-b']?.requestId).toBe('other')
+  })
+
+  it('retains help for the exact tool row after its pending request settles', () => {
+    setClarifyRequest(clarify('session-a', 'req-a'))
+    associateClarifyToolRequest('tool-a', 'req-a')
+    updateClarifyHelp('req-a', 'session-a', 'explain-a', {
+      content: 'Staging is safer for validation.',
+      followUp: '',
+      status: 'complete'
+    })
+
+    clearClarifyRequest('req-a', 'session-a')
+
+    expect(settledClarifyHelpForToolCall('tool-a')).toEqual({
+      'explain-a': expect.objectContaining({ content: 'Staging is safer for validation.' })
+    })
   })
 })
 

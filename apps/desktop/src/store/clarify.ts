@@ -132,6 +132,19 @@ export const $clarifyRequests = atom<Record<string, ClarifyRequest>>({})
  * settles so the original tool card can expose it without making a transcript turn. */
 export const $settledClarifyHelp = atom<Record<string, Record<string, ClarifyHelp>>>({})
 
+/** Associates a renderer transcript tool row with the request it rendered.
+ * The gateway's explain event intentionally exposes only request correlation;
+ * retaining this local association lets a remounted settled row find its help. */
+export const $clarifyToolRequestIds = atom<Record<string, string>>({})
+
+export function associateClarifyToolRequest(toolCallId: string, requestId: string): void {
+  if ($clarifyToolRequestIds.get()[toolCallId] === requestId) {
+    return
+  }
+
+  $clarifyToolRequestIds.set({ ...$clarifyToolRequestIds.get(), [toolCallId]: requestId })
+}
+
 export function updateClarifyHelp(
   requestId: string,
   sessionId: string | null | undefined,
@@ -151,6 +164,10 @@ export function updateClarifyHelp(
 
 export function settledClarifyHelp(requestId: string | null): Record<string, ClarifyHelp> {
   return requestId ? $settledClarifyHelp.get()[requestId] ?? {} : {}
+}
+
+export function settledClarifyHelpForToolCall(toolCallId: string): Record<string, ClarifyHelp> {
+  return settledClarifyHelp($clarifyToolRequestIds.get()[toolCallId] ?? null)
 }
 
 // The clarify request for the currently-viewed session. The inline ClarifyTool

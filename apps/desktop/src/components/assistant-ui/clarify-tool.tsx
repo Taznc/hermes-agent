@@ -27,6 +27,9 @@ import { CircleLetterA, Loader2, MessageQuestion } from '@/lib/icons'
 import { visibleClarifyCard } from '@/lib/keybinds/composer-focus-keys'
 import { cn } from '@/lib/utils'
 import {
+  $clarifyToolRequestIds,
+  $settledClarifyHelp,
+  associateClarifyToolRequest,
   bareChoice,
   type ClarifyHelp,
   type ClarifyQuestion,
@@ -227,11 +230,12 @@ function KeyBadge({ char, preview, selected }: { char: string; preview?: boolean
   )
 }
 
-function ClarifyHelpControls({ choice, questionId, request, target }: {
+function ClarifyHelpControls({ choice, questionId, request, target, targetLabel }: {
   choice?: string
   questionId?: string
   request: ClarifyRequest | null
   target: string
+  targetLabel: string
 }) {
   const gateway = useStore($gateway)
   const [askOpen, setAskOpen] = useState(false)
@@ -279,13 +283,11 @@ function ClarifyHelpControls({ choice, questionId, request, target }: {
     }
   }, [choice, gateway, questionId, request])
 
-  const controlLabel = choice ? 'choice' : 'question'
-
   return (
     <div className="grid gap-1" data-clarify-help-target={target}>
       <div className="flex items-center gap-1">
-        <Button aria-label={`Why? ${controlLabel}`} onClick={() => void requestHelp()} size="xs" type="button" variant="text">Why?</Button>
-        <Button aria-controls={`clarify-help-${target}`} aria-expanded={askOpen} aria-label={`Ask about ${controlLabel}`} onClick={() => setAskOpen(open => !open)} size="xs" type="button" variant="text">Ask</Button>
+        <Button aria-label={`Why? ${targetLabel}`} onClick={() => void requestHelp()} size="xs" type="button" variant="text">Why?</Button>
+        <Button aria-controls={`clarify-help-${target}`} aria-expanded={askOpen} aria-label={`Ask about ${targetLabel}`} onClick={() => setAskOpen(open => !open)} size="xs" type="button" variant="text">Ask</Button>
       </div>
       {askOpen || help.length > 0 || error ? (
         <div className="grid gap-1 rounded-md bg-(--chrome-action-hover)/40 p-2 text-sm" id={`clarify-help-${target}`}>
@@ -360,14 +362,25 @@ export const ClarifyTool = (props: ToolCallMessagePartProps) => {
   // in-place help can remain on the settled card without a transcript message.
   const sessionId = useStore(useSessionView().$runtimeId)
   const request = useStore(useMemo(() => sessionClarifyRequest(sessionId), [sessionId]))
+  const toolRequestIds = useStore($clarifyToolRequestIds)
+  const settledHelp = useStore($settledClarifyHelp)
   const lastRequest = useRef<ClarifyRequest | null>(null)
 
   if (request) {
     lastRequest.current = request
   }
 
+  useEffect(() => {
+    if (request) {
+      associateClarifyToolRequest(props.toolCallId, request.requestId)
+    }
+  }, [props.toolCallId, request])
+
   if (props.result !== undefined) {
-    return <ClarifyToolSettled {...props} help={lastRequest.current?.help ?? {}} />
+    const requestId = toolRequestIds[props.toolCallId]
+    const help = lastRequest.current?.help ?? (requestId ? settledHelp[requestId] ?? {} : {})
+
+    return <ClarifyToolSettled {...props} help={help} />
   }
 
   return <ClarifyToolPending {...props} />
@@ -835,7 +848,7 @@ function ClarifyToolSinglePending({
           </span>
           <MessageQuestion aria-hidden className="mt-px size-4 shrink-0 text-(--ui-text-tertiary)" />
         </div>
-        <ClarifyHelpControls request={matchingRequest} target="question" />
+        <ClarifyHelpControls request={matchingRequest} target="question" targetLabel={question} />
 
         {hasChoices ? (
           <div className="grid gap-px" role="group">
@@ -850,7 +863,7 @@ function ClarifyToolSinglePending({
                   onClick={() => selectChoice(choice, index)}
                   selected={selectedChoices.includes(choice)}
                 />
-                <ClarifyHelpControls choice={bareChoice(choice)} request={matchingRequest} target={`choice ${bareChoice(choice)}`} />
+                <ClarifyHelpControls choice={bareChoice(choice)} request={matchingRequest} target={`choice-${index}`} targetLabel={bareChoice(choice)} />
               </div>
             ))}
             <label
@@ -1034,7 +1047,7 @@ function BatchQuestionBlock({
           </span>
         ) : null}
       </div>
-      <ClarifyHelpControls questionId={question.qid} request={request} target={`question ${index + 1}`} />
+      <ClarifyHelpControls questionId={question.qid} request={request} target={`question-${question.qid}`} targetLabel={question.question} />
 
       {choices.length > 0 ? (
         <div className="grid gap-px pl-[1.625rem]" role="group">
@@ -1047,7 +1060,7 @@ function BatchQuestionBlock({
                 onClick={() => onToggle(choice)}
                 selected={staged.choices.includes(choice)}
               />
-              <ClarifyHelpControls choice={bareChoice(choice)} questionId={question.qid} request={request} target={`choice ${bareChoice(choice)} in question ${index + 1}`} />
+              <ClarifyHelpControls choice={bareChoice(choice)} questionId={question.qid} request={request} target={`choice-${question.qid}-${choiceIndex}`} targetLabel={bareChoice(choice)} />
             </div>
           ))}
           <label className={cn(OPTION_ROW_CLASS, 'items-center')}>
