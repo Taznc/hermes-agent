@@ -63,7 +63,14 @@ def _cmd_dispatch(args: argparse.Namespace) -> int:
         cleared = kbd.resume_dispatch(board)
         if getattr(args, "json", False):
             _print_json(cleared, ascii=True)
-        else:
+        if not cleared.get("resumed", True):
+            if not getattr(args, "json", False):
+                print(
+                    f"Dispatch circuit for {board or kb.DEFAULT_BOARD} was not resumed: "
+                    "a dispatch tick is in progress; repair then retry --resume-circuit."
+                )
+            return 1
+        if not getattr(args, "json", False):
             state = cleared.get("previous") or {}
             suffix = f" (was {state.get('reason')})" if state else " (was not paused)"
             print(f"Dispatch circuit resumed for {board or kb.DEFAULT_BOARD}{suffix}.")
@@ -73,9 +80,17 @@ def _cmd_dispatch(args: argparse.Namespace) -> int:
         if getattr(args, "json", False):
             _print_json({"paused": state is not None, "state": state}, ascii=True)
         else:
-            print(f"Dispatch circuit for {board or kb.DEFAULT_BOARD}: " + (
-                f"paused ({state.get('reason')})" if state else "running"
-            ))
+            if state:
+                details = [f"reason={state.get('reason')}" ]
+                if state.get("fault_code"):
+                    details.append(f"fault_code={state['fault_code']}")
+                if state.get("tripped_at") or state.get("paused_at"):
+                    details.append(f"time={state.get('tripped_at') or state.get('paused_at')}")
+                if state.get("recovery"):
+                    details.append(f"recovery={state['recovery']}")
+                print(f"Dispatch circuit for {board or kb.DEFAULT_BOARD}: paused (" + "; ".join(details) + ")")
+            else:
+                print(f"Dispatch circuit for {board or kb.DEFAULT_BOARD}: running")
         return 0
 
     # Same caps as the gateway tick and the dashboard nudge — resolved by the

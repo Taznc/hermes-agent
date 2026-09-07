@@ -896,8 +896,9 @@ def _protocol_violation_streak(conn: sqlite3.Connection, task_id: str) -> int:
     """Count the task's trailing run of clean-exit protocol violations.
 
     Walks closed runs newest-first (including the one ``detect_crashed_workers``
-    just closed). ``rate_limited`` runs are neutral and skipped (a quota wall
-    says nothing about the task); any other closed run breaks the streak, so
+    just closed). ``rate_limited`` and ``spawn_deferred`` runs are neutral and
+    skipped (a quota wall or board-wide launcher outage says nothing about the
+    task); any other closed run breaks the streak, so
     the budget counts ONLY protocol violations. Violations are recognized by the
     ``protocol_violation`` run-metadata marker, with the error text as fallback
     for runs recorded before the marker existed.
@@ -911,7 +912,7 @@ def _protocol_violation_streak(conn: sqlite3.Connection, task_id: str) -> int:
     ).fetchall()
     for row in rows:
         outcome = row["outcome"] or ""
-        if outcome == "rate_limited":
+        if outcome in {"rate_limited", "spawn_deferred"}:
             continue
         if outcome == "crashed" and (
             _kb._json_dict(row["metadata"]).get("protocol_violation")
@@ -1954,11 +1955,23 @@ def _write_dispatch_pause(
 def resume_dispatch(board: Optional[str] = None) -> dict[str, Any]:
     """Explicitly clear a board's sticky dispatch circuit after operator repair."""
     _kb._assert_not_delegated_child_mutation()
-    path = _dispatch_pause_path(board)
-    previous = read_dispatch_pause(board)
-    with contextlib.suppress(FileNotFoundError):
-        path.unlink()
-    return {"was_paused": previous is not None, "previous": previous}
+    db_path = _kb.kanban_db_path(board=board)
+    # The pause check and its removal must share the dispatch tick's board lock.
+    # Otherwise a tick can pass its check, write a fresh pause, and then have
+    # this operator action unlink that newer safety state. Refusing a contended
+    # resume makes recovery deliberate: repair, then re-run the explicit probe.
+    with _kbc._dispatch_tick_lock(db_path) as held:
+        if not held:
+            return {
+                "was_paused": read_dispatch_pause(board) is not None,
+                "resumed": False,
+                "reason": "dispatch_in_progress",
+            }
+        path = _dispatch_pause_path(board)
+        previous = read_dispatch_pause(board)
+        with contextlib.suppress(FileNotFoundError):
+            path.unlink()
+    return {"was_paused": previous is not None, "previous": previous, "resumed": True}
 
 
 def _is_shared_launcher_prerequisite_fault(exc: BaseException) -> bool:
@@ -1993,47 +2006,66 @@ def _defer_for_shared_launcher_prerequisite(
     fault_code = RestartSafeScopeUnavailable.fault_code
     error = str(exc)[:500]
     tripped_at = int(time.time())
-    state = _write_dispatch_pause(
-        board,
-        "restart_safe_scope_unavailable",
-        fault_code=fault_code,
-        trigger_task_id=task.id,
-        error=error,
-        tripped_at=tripped_at,
-        recovery="repair the user scope prerequisite, then run `hermes kanban dispatch --resume-circuit`",
-    )
+    try:
+        state = _write_dispatch_pause(
+            board,
+            "restart_safe_scope_unavailable",
+            fault_code=fault_code,
+            trigger_task_id=task.id,
+            error=error,
+            tripped_at=tripped_at,
+            recovery="repair the user scope prerequisite, then run `hermes kanban dispatch --resume-circuit`",
+        )
+        event_kind = "dispatch_circuit_tripped"
+    except Exception as pause_error:
+        # A failure to persist the normal sentinel must never strand the
+        # already-claimed trigger or charge its task-local budget. This tick
+        # fails closed in memory, records the persistence defect in the board,
+        # and requires the same explicit operator recovery after storage repair.
+        state = {
+            "reason": "pause_persistence_failed",
+            "fault_code": fault_code,
+            "trigger_task_id": task.id,
+            "error": error,
+            "tripped_at": tripped_at,
+            "pause_error": str(pause_error)[:500],
+            "recovery": "repair dispatch-pause storage, then run `hermes kanban dispatch --resume-circuit`",
+        }
+        event_kind = "dispatch_circuit_persistence_failed"
+    # The durable pause is authoritative for later ticks, but this tick must
+    # stop immediately even if a concurrent reconciliation wins the task-row
+    # compare-and-swap below.
+    result.dispatch_paused = state
     with _kb.write_txn(conn):
         row = conn.execute(
             "SELECT current_run_id FROM tasks WHERE id = ? AND status = 'running'",
             (task.id,),
         ).fetchone()
-        if row is None:
-            return
-        retry_status = _kb._retry_status_for_run(conn, task.id, row["current_run_id"])
-        cur = conn.execute(
-            "UPDATE tasks SET status = ?, claim_lock = NULL, claim_expires = NULL, "
-            "worker_pid = NULL, worker_unit = NULL WHERE id = ? AND status = 'running'",
-            (retry_status, task.id),
-        )
-        if cur.rowcount != 1:
-            return
-        run_id = _kb._end_run(
-            conn,
-            task.id,
-            outcome="spawn_deferred",
-            status="spawn_deferred",
-            error=error,
-            metadata={"fault_code": fault_code, "board_circuit": state},
-        )
-        _kb._append_event(
-            conn,
-            task.id,
-            "dispatch_circuit_tripped",
-            {"fault_code": fault_code, "board": board or _kb.DEFAULT_BOARD,
-             "tripped_at": tripped_at, "error": error, "recovery": state["recovery"]},
-            run_id=run_id,
-        )
-    result.dispatch_paused = state
+        if row is not None:
+            retry_status = _kb._retry_status_for_run(conn, task.id, row["current_run_id"])
+            cur = conn.execute(
+                "UPDATE tasks SET status = ?, claim_lock = NULL, claim_expires = NULL, "
+                "worker_pid = NULL, worker_unit = NULL WHERE id = ? AND status = 'running'",
+                (retry_status, task.id),
+            )
+            if cur.rowcount == 1:
+                run_id = _kb._end_run(
+                    conn,
+                    task.id,
+                    outcome="spawn_deferred",
+                    status="spawn_deferred",
+                    error=error,
+                    metadata={"fault_code": fault_code, "board_circuit": state},
+                )
+                _kb._append_event(
+                    conn,
+                    task.id,
+                    event_kind,
+                    {"fault_code": fault_code, "board": board or _kb.DEFAULT_BOARD,
+                     "tripped_at": tripped_at, "error": error, "recovery": state["recovery"],
+                     "pause_error": state.get("pause_error")},
+                    run_id=run_id,
+                )
 
 
 def _recent_dispatch_starts(

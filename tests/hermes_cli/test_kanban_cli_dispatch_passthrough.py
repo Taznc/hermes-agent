@@ -139,3 +139,53 @@ def test_cli_dispatch_passes_nondefault_board_to_connection_and_dispatch(
     }
 
 
+def test_cli_circuit_status_prints_fault_time_and_recovery(monkeypatch, capsys):
+    """The operator-facing status must make an existing circuit actionable."""
+    from hermes_cli import kanban as kb_cli
+    from hermes_cli import kanban_db_dispatch as kbd
+
+    monkeypatch.setattr(
+        kbd,
+        "read_dispatch_pause",
+        lambda board: {
+            "reason": "restart_safe_scope_unavailable",
+            "fault_code": "systemd_user_scope_unavailable",
+            "tripped_at": 123,
+            "recovery": "repair then resume",
+        },
+    )
+    args = argparse.Namespace(
+        board="secondary", dry_run=False, max=None, failure_limit=2, json=False,
+        resume_circuit=False, circuit_status=True,
+    )
+
+    assert kb_cli._cmd_dispatch(args) == 0
+    output = capsys.readouterr().out
+    assert "reason=restart_safe_scope_unavailable" in output
+    assert "fault_code=systemd_user_scope_unavailable" in output
+    assert "time=123" in output
+    assert "recovery=repair then resume" in output
+
+
+def test_cli_resume_returns_failure_when_a_dispatch_tick_still_owns_the_lock(monkeypatch):
+    """Automation must not mistake a contended resume for a recovered circuit."""
+    from hermes_cli import kanban as kb_cli
+    from hermes_cli import kanban_db_dispatch as kbd
+
+    monkeypatch.setattr(
+        kbd,
+        "resume_dispatch",
+        lambda board: {
+            "was_paused": True,
+            "resumed": False,
+            "reason": "dispatch_in_progress",
+        },
+    )
+    args = argparse.Namespace(
+        board="secondary", dry_run=False, max=None, failure_limit=2, json=True,
+        resume_circuit=True, circuit_status=False,
+    )
+
+    assert kb_cli._cmd_dispatch(args) == 1
+
+
