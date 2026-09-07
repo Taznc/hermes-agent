@@ -103,6 +103,7 @@ def test_compute_host_routes_clarify_explanation_to_child_live_session(monkeypat
             "sid": sid, "request_id": "relay-explain",
             "params": {"version": 1, "request_id": "clarify-request", "choice": "yes"},
         })
+        _wait_for_frame(out, lambda frame: frame.get("type") == "explain.ack")
         assert calls == [(
             "relay-explain", {"version": 1, "request_id": "clarify-request", "choice": "yes"},
             live_history,
@@ -135,6 +136,117 @@ def test_supervisor_explain_delivers_host_ack(monkeypatch, tmp_path):
     assert result["response"]["result"]["explanation_id"] == "help-1"
     assert sent[0]["type"] == "explain"
     assert sent[0]["params"] == {"version": 1, "request_id": "clarify-1"}
+
+
+def test_supervisor_keeps_concurrent_explanation_correlations_distinct(monkeypatch, tmp_path):
+    """Concurrent help frames retain their own supervisor waiter and host response."""
+    host = ComputeHost(heartbeat_secs=0)
+    supervisor = HostSupervisor(registry_path=tmp_path / "host.json", autostart=False)
+    sid = "host-concurrent-help"
+    server._sessions[sid] = {"history_lock": threading.Lock()}
+    emitted = []
+
+    def emit(frame):
+        emitted.append(dict(frame))
+        supervisor._handle_host_frame(frame)
+
+    def explain(_rid, params):
+        text = str(params["follow_up"])
+        return {"result": {"status": "complete", "explanation_id": f"help-{text}"}}
+
+    monkeypatch.setattr(host, "emit", emit)
+    monkeypatch.setattr(supervisor, "start", lambda: None)
+    monkeypatch.setattr(supervisor, "_send_frame", host.handle_frame)
+    monkeypatch.setitem(server._methods, "clarify.explain", explain)
+    try:
+        replies = {}
+        threads = [
+            threading.Thread(
+                target=lambda text=text: replies.setdefault(
+                    text, supervisor.explain(sid, {"request_id": "clarify-1", "follow_up": text}, timeout=1)),
+            )
+            for text in ("first", "second")
+        ]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join(1)
+            assert not thread.is_alive()
+        assert {reply["response"]["result"]["explanation_id"] for reply in replies.values()} == {
+            "help-first", "help-second",
+        }
+        assert len([frame for frame in emitted if frame["type"] == "explain.ack"]) == 2
+    finally:
+        server._sessions.pop(sid, None)
+        host.close()
+
+
+def test_supervisor_interrupt_cancels_inflight_host_explanation_without_late_ack(monkeypatch, tmp_path):
+    """The child reader accepts interrupt frames while its explanation worker is blocked."""
+    host = ComputeHost(heartbeat_secs=0)
+    supervisor = HostSupervisor(registry_path=tmp_path / "host.json", autostart=False)
+    sid = "host-explain-race"
+    started = threading.Event()
+    release = threading.Event()
+    emitted = []
+    server._sessions[sid] = {
+        "history": [], "history_lock": threading.Lock(), "session_key": sid, "running": False,
+    }
+    pending = threading.Event()
+    with server._prompt_lock:
+        server._pending["clarify-race"] = (sid, pending)
+        server._pending_prompt_payloads["clarify-race"] = ("clarify.request", {
+            "request_id": "clarify-race", "question": "Continue?", "choices": ["yes", "no"],
+        })
+
+    def emit(frame):
+        emitted.append(dict(frame))
+        supervisor._handle_host_frame(frame)
+
+    def explain(_session, _prompt):
+        started.set()
+        assert release.wait(2)
+        return "too late"
+
+    monkeypatch.setattr(host, "emit", emit)
+    monkeypatch.setattr(supervisor, "start", lambda: None)
+    monkeypatch.setattr(supervisor, "_send_frame", host.handle_frame)
+    monkeypatch.setattr(server, "_spawn_clarify_explanation", explain)
+    try:
+        result = {}
+        thread = threading.Thread(
+            target=lambda: result.setdefault(
+                "reply", supervisor.explain(sid, {
+                    "version": 1, "session_id": sid, "request_id": "clarify-race",
+                }, timeout=1)),
+        )
+        thread.start()
+        assert started.wait(1)
+        interrupt = threading.Thread(
+            target=lambda: supervisor.interrupt(sid, request_id="interrupt-race"),
+        )
+        interrupt.start()
+        deadline = time.monotonic() + 1
+        while time.monotonic() < deadline and not any(
+            frame["type"] == "interrupt.ack" for frame in emitted
+        ):
+            time.sleep(0.01)
+        assert any(frame["type"] == "interrupt.ack" for frame in emitted)
+        release.set()
+        interrupt.join(1)
+        assert not interrupt.is_alive()
+        thread.join(1)
+        assert not thread.is_alive()
+        assert result["reply"]["type"] == "explain.error"
+        assert [frame["type"] for frame in emitted] == ["interrupt.ack", "explain.error"]
+        assert pending.is_set()
+        assert not any(frame["type"] == "rpc" for frame in emitted)
+    finally:
+        server._sessions.pop(sid, None)
+        with server._prompt_lock:
+            server._pending.pop("clarify-race", None)
+            server._pending_prompt_payloads.pop("clarify-race", None)
+        host.close()
 
 
 def test_mutator_route_table_matches_prd_inventory():

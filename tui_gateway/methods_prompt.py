@@ -1087,7 +1087,7 @@ def _clarify_explain_snapshot(sid: str, request_id: str) -> dict | None:
     """
     with _prompt_lock:
         entry = _pending.get(request_id)
-        if entry is not None and entry[0] == sid:
+        if entry is not None and entry[0] == sid and not entry[1].is_set():
             event, payload = _pending_prompt_payloads.get(request_id, ("", {}))
             if event == "clarify.request" and isinstance(payload, dict):
                 snapshot = dict(payload)
@@ -1192,13 +1192,17 @@ def _(rid, params: dict) -> dict:
             session, _clarify_explain_prompt(snapshot, selected, choice, follow_up)).strip()
     except Exception as exc:
         return _err(rid, 5018, f"clarify explanation failed: {exc}")
-    if _clarify_explain_snapshot(sid, request_id) is None:
-        return _err(rid, 4009, "clarify request expired before explanation completed")
     correlation = {"explanation_id": explanation_id, "request_id": request_id,
                    **({"question_id": str(selected.get("qid") or "")}
                    if selected is not None and selected.get("qid") else {}),
                    **({"choice": choice} if choice is not None else {})}
-    _emit("clarify.explanation", sid, {**correlation, "content": content})
+    # Keep the final liveness check and event publication in one prompt-registry critical section:
+    # a final clarify.respond/interrupt that wins this race must not see a late help event.
+    with _prompt_lock:
+        entry = _pending.get(request_id)
+        if entry is None or entry[0] != sid or entry[1].is_set():
+            return _err(rid, 4009, "clarify request expired before explanation completed")
+        _emit("clarify.explanation", sid, {**correlation, "content": content})
     return _ok(rid, {"version": _CLARIFY_EXPLAIN_VERSION, "status": "complete", **correlation})
 
 
