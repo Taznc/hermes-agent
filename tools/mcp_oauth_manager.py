@@ -8,6 +8,7 @@ than an await + refresh round-trip."""
 from __future__ import annotations
 
 import asyncio
+import copy
 import logging
 import re
 import threading
@@ -276,16 +277,34 @@ class MCPOAuthManager:
         self._inflight_tasks: set[asyncio.Task] = set()
 
     def get_or_build_provider(self, server_name: str, server_url: str, oauth_config: Optional[dict]) -> Optional[Any]:
-        """Cached OAuth provider for ``server_name``, built on first use (rebuilt when ``server_url`` changes);
-        None if the MCP SDK's OAuth support is unavailable."""
+        """Return the cached OAuth provider, rebuilding it when its effective URL or config changes.
+
+        Rebuilding changes only in-process provider state: token files remain in the same
+        ``HermesTokenStorage`` location, while the retained entry lock, mtime, and pending-401
+        bookkeeping survive the configuration refresh.
+        """
         key = self._key(server_name)
+        effective_config = copy.deepcopy(oauth_config or {})
         with self._entries_lock:
             entry = self._entries.get(key)
             if entry is not None and entry.server_url != server_url:
                 logger.info("MCP OAuth '%s': URL changed from %s to %s, discarding cache", server_name, entry.server_url, server_url)
                 entry = None
             if entry is None:
-                entry = self._entries[key] = _ProviderEntry(server_url=server_url, oauth_config=oauth_config)
+                entry = self._entries[key] = _ProviderEntry(server_url=server_url, oauth_config=effective_config)
+            elif entry.oauth_config != effective_config and entry.provider is not None:
+                # Build against a temporary entry so a setup failure does not leave the
+                # live provider paired with credentials it was not built from.
+                replacement = _ProviderEntry(server_url=server_url, oauth_config=effective_config)
+                provider = self._build_provider(server_name, replacement)
+                entry.oauth_config = effective_config
+                entry.provider = provider
+                if provider is not None:
+                    provider._hermes_home = key[0]
+                logger.info("MCP OAuth '%s': configuration changed, rebuilt in-process provider", server_name)
+                return provider
+            elif entry.oauth_config != effective_config:
+                entry.oauth_config = effective_config
             if entry.provider is None:
                 entry.provider = self._build_provider(server_name, entry)
                 if entry.provider is not None:

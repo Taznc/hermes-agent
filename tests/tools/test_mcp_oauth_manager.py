@@ -62,6 +62,38 @@ def test_manager_restore_entry_preserves_newer_concurrent_entry(tmp_path, monkey
     assert manager.get_or_build_provider("shared", "https://new.example", {}) is new_provider
     assert new_provider is not old_provider
 
+
+def test_manager_rebuilds_same_url_provider_when_oauth_config_changes(tmp_path, monkeypatch):
+    """A config-change reconnect must not retain the old client metadata."""
+    from types import SimpleNamespace
+
+    from tools.mcp_oauth_manager import MCPOAuthManager
+
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    manager = MCPOAuthManager()
+    builds = []
+
+    def build(server_name, entry):
+        provider = SimpleNamespace()
+        builds.append((server_name, entry.oauth_config, provider))
+        return provider
+
+    monkeypatch.setattr(manager, "_build_provider", build)
+    old_config = {"client_id": "old-client", "scopes": ["read"]}
+    first = manager.get_or_build_provider("srv", "https://mcp.example/mcp", old_config)
+    unchanged = manager.get_or_build_provider("srv", "https://mcp.example/mcp", dict(old_config))
+    new_config = {"client_id": "new-client", "scopes": ["read", "write"]}
+    replaced = manager.get_or_build_provider("srv", "https://mcp.example/mcp", new_config)
+
+    assert unchanged is first
+    assert replaced is not first
+    assert [(name, config) for name, config, _ in builds] == [
+        ("srv", old_config),
+        ("srv", new_config),
+    ]
+    assert manager._entries[manager._key("srv")].oauth_config == new_config
+
+
 pytest.importorskip(
     "mcp.client.auth.oauth2",
     reason="MCP SDK 1.26.0+ required for OAuth support",
