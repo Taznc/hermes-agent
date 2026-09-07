@@ -296,11 +296,9 @@ def test_codex_adapter_selects_responses_credential_and_required_headers():
     assert credential.bearer == _jwt_with_account()
     assert credential.base_url == "https://chatgpt.com/backend-api/codex"
     assert adapter.allowed_paths == frozenset({"/responses", "/models"})
-    assert adapter.get_upstream_headers(credential) == {
-        "User-Agent": "codex_cli_rs/0.0.0 (Hermes Agent)",
-        "originator": "codex_cli_rs",
-        "ChatGPT-Account-ID": "acct-123",
-    }
+    from agent.auxiliary_client import _codex_cloudflare_headers
+
+    assert adapter.get_upstream_headers(credential) == _codex_cloudflare_headers(credential.bearer)
 
 
 def test_codex_adapter_rejects_untrusted_upstream_before_returning_bearer():
