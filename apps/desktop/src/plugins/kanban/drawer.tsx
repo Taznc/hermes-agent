@@ -80,6 +80,7 @@ import {
   CollapsibleMarkdown,
   errText,
   FIELD_LABEL,
+  IdChip,
   isLockedTarget,
   lockedReason,
   ScrollFade,
@@ -341,11 +342,7 @@ export function TaskDrawer({
           ) : (
             <span className="font-mono text-sm text-(--ui-text-tertiary)">{shortId(id)}</span>
           )}
-          {task && (
-            <span className="font-mono text-[0.625rem] text-(--ui-text-quaternary)" data-selectable-text="true">
-              {shortId(task.id)}
-            </span>
-          )}
+          {task && <IdChip className="text-[0.625rem]" id={task.id} />}
           <div className="ml-auto flex items-center gap-0.5">
             {task && (
               <DropdownMenu>

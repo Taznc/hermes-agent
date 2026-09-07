@@ -119,10 +119,10 @@ import {
   columnLabel,
   errText,
   FIELD_LABEL,
+  IdChip,
   isLockedTarget,
   lockedReason,
   RunClock,
-  shortId,
   useDefaultAssignee,
   useKanban,
   useOrchestration
@@ -498,7 +498,7 @@ function CardFooter({
         {created && !task.assignee && !unassignedReady ? (
           <span className="text-(--ui-text-quaternary)">{created}</span>
         ) : null}
-        <span className="min-w-0 truncate font-mono text-(--ui-text-quaternary)">{shortId(task.id)}</span>
+        <IdChip className="min-w-0 text-[0.6rem]" id={task.id} />
       </div>
     </div>
   )
