@@ -238,6 +238,7 @@ function NotificationItem({ notification }: { notification: AppNotification }) {
             {renderMessage(notification.message, accent)}
           </p>
           {notification.meta && <p className="m-0 text-xs text-muted-foreground tabular-nums">{notification.meta}</p>}
+          {notification.contextCard && <NotificationContextCard card={notification.contextCard} />}
           {hasDetail && <NotificationDetail detail={notification.detail || ''} />}
           {notification.action && (
             <Button
@@ -266,6 +267,29 @@ function NotificationItem({ notification }: { notification: AppNotification }) {
         <Codicon name="close" size="0.875rem" />
       </Button>
     </Alert>
+  )
+}
+
+/**
+ * The toast-level equivalent of an object's compact card: deliberately quiet
+ * and bounded, but visibly separate from the event that caused the notice.
+ * `message` remains the primary object name; this carries the context that
+ * answers "what happened to it?" without making people expand raw Details.
+ */
+function NotificationContextCard({ card }: { card: NonNullable<AppNotification['contextCard']> }) {
+  if (!card.eyebrow && !card.summary && !card.meta) {
+    return null
+  }
+
+  return (
+    <div
+      className="mt-2 grid gap-1 rounded-lg border border-(--ui-stroke-tertiary) border-l-2 bg-(--ui-bg-elevated) px-2.5 py-2"
+      data-notification-context-card="true"
+    >
+      {card.eyebrow && <p className="m-0 text-[0.6875rem] font-medium text-muted-foreground">{card.eyebrow}</p>}
+      {card.summary && <p className="m-0 line-clamp-2 wrap-break-word text-xs leading-relaxed text-(--ui-text-secondary)">{card.summary}</p>}
+      {card.meta && <p className="m-0 truncate font-mono text-[0.625rem] text-(--ui-text-quaternary)">{card.meta}</p>}
+    </div>
   )
 }
 

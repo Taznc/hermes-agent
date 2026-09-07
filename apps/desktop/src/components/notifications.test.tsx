@@ -71,4 +71,29 @@ describe('toast titles', () => {
       }, 5_100)
     })
   })
+
+  it('renders a compact context card for an object notification', () => {
+    notify({
+      title: 'Task completed',
+      message: 'Make Kanban notifications readable',
+      contextCard: {
+        eyebrow: 'Done · reviewer',
+        summary: 'Landed with focused coverage',
+        meta: 't101'
+      }
+    })
+
+    render(
+      <I18nProvider configClient={null} initialLocale="en">
+        <NotificationStack />
+      </I18nProvider>
+    )
+
+    const card = screen.getByText('Done · reviewer').closest('[data-notification-context-card="true"]')
+
+    expect(card).toBeTruthy()
+    expect(card?.textContent).toContain('Done · reviewer')
+    expect(card?.textContent).toContain('Landed with focused coverage')
+    expect(card?.textContent).toContain('t101')
+  })
 })

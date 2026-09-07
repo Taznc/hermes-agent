@@ -338,6 +338,7 @@ type KanbanMessages = {
     crashedTitle: string
     timedOutTitle: string
     openKanban: string
+    openCard: string
     artifacts: (n: number) => string
   }
 }
@@ -665,6 +666,7 @@ export const en: KanbanMessages = {
     crashedTitle: 'Worker crashed — will retry',
     timedOutTitle: 'Task timed out — will retry',
     openKanban: 'Open Kanban',
+    openCard: 'Open card',
     artifacts: (n: number) => `${n} artifacts`
   }
 }
@@ -992,6 +994,7 @@ const ja: KanbanMessages = {
     crashedTitle: 'ワーカーがクラッシュ — 再試行します',
     timedOutTitle: 'タスクがタイムアウト — 再試行します',
     openKanban: 'かんばんを開く',
+    openCard: 'カードを開く',
     artifacts: (n: number) => `成果物 ${n} 件`
   }
 }
@@ -1314,6 +1317,7 @@ const zh: KanbanMessages = {
     crashedTitle: '工作单元崩溃 — 将重试',
     timedOutTitle: '任务超时 — 将重试',
     openKanban: '打开看板',
+    openCard: '打开卡片',
     artifacts: (n: number) => `${n} 个产物`
   }
 }
@@ -1636,6 +1640,7 @@ const zhHant: KanbanMessages = {
     crashedTitle: '工作單元當機 — 將重試',
     timedOutTitle: '任務逾時 — 將重試',
     openKanban: '開啟看板',
+    openCard: '開啟卡片',
     artifacts: (n: number) => `${n} 個產物`
   }
 }
