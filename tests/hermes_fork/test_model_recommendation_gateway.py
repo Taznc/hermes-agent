@@ -130,6 +130,8 @@ def test_gateway_dispatch_uses_temporary_profile_config_and_real_candidate_disco
         encoding="utf-8",
     )
     monkeypatch.setattr(Path, "home", lambda: tmp_path)
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.setenv("GH_CONFIG_DIR", str(tmp_path / ".config" / "gh"))
     monkeypatch.setenv("HERMES_HOME", str(tmp_path / ".hermes"))
     monkeypatch.setenv("ANTHROPIC_API_KEY", "test-only-key")
     captured = []
@@ -353,3 +355,21 @@ def test_router_output_omitting_an_eligible_provider_fails_closed():
     )
 
     assert service._parse_router_output(incomplete, CANDIDATES) is None
+
+
+def test_v1_input_bounds_and_partial_metadata_remain_compatible():
+    # Python counts Unicode code points, not the renderer's UTF-16 code units.
+    assert "result" in srv.handle_request({"id": 10, "method": "model_recommendation.get",
+                                         "params": {"draft": "😀" * 100_000}})
+    for draft in ("", " \n\t", None, "a" * 100_001):
+        result = srv.handle_request({"id": 11, "method": "model_recommendation.get", "params": {"draft": draft}})
+        assert result["error"]["code"] == 4000
+    metadata = [{"name": "a" * 256, "kind": "file", "size": 2**53},
+                {"name": "b" * 257, "mime_type": None, "size": 2**53 + 1},
+                {"kind": "image", "path": "/not-forwarded"}, {}]
+    assert service._safe_attachment_metadata(metadata) == [
+        {"name": "a" * 256, "kind": "file", "size": 2**53}, {}, {"kind": "image"}, {}]
+    # Preserve the parent's first-32 cap. The consumer must refuse >32 rather
+    # than silently request advice on a partial attachment inventory.
+    assert service._safe_attachment_metadata([{"name": str(i)} for i in range(33)]) == [
+        {"name": str(i)} for i in range(32)]

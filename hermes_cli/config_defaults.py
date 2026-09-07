@@ -656,6 +656,8 @@ DEFAULT_CONFIG = {
             "trace": "disabled",         # "enabled" | "disabled" | "enabled_full"
         },
     },
+    # >>> FORK ANCHOR: model-recommendation-preset <<<
+    "model_recommendation": {"preset": "balanced"},
     # Auxiliary model config — provider/model per side task. provider "auto" = auto-detect;
     # empty model = provider's default aux model; all tasks fall back to
     # openrouter:google/gemini-3-flash-preview when the configured provider is unavailable.

@@ -72,5 +72,7 @@ def register_fork_gateway_methods(server) -> None:
     _attachment_staging.register(server)
     _account_limits_method.register(server)
     _model_recommendation_method.register(server)
+    from hermes_fork.model_recommendation import settings as recommendation_settings
+    recommendation_settings.register(server)
     bind_module(globals(), server, skip=("_", "register_fork_gateway_methods"))
     server._LONG_HANDLERS = server._LONG_HANDLERS | _FORK_LONG_HANDLERS
