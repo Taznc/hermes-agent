@@ -69,6 +69,18 @@ class TestClarifyToolChoicesValidation:
 class TestClarifyToolCallbackHandling:
     """Tests for callback error handling."""
 
+    def test_structured_single_callback_preserves_note_beside_clean_answer(self):
+        """A platform may return its canonical answer and optional note separately."""
+        def callback(question, choices):
+            return {"answer": "Rebase (Recommended)", "note": "Keep the migration commits."}
+
+        result = json.loads(clarify_tool(
+            "Which history?", choices=["Rebase", "Merge"], callback=callback,
+        ))
+
+        assert result["user_response"] == "Rebase"
+        assert result["note"] == "Keep the migration commits."
+
     def test_callback_exception_returns_error(self):
         """Should return error if callback raises exception."""
         def failing_callback(question: str, choices: Optional[List[str]]) -> str:
@@ -538,6 +550,29 @@ class TestClarifyBatchDispatch:
             "", questions=[{"question": "One?"}], callback=cb,
         ))
         assert result["responses"][0]["user_response"] == "picked"
+
+    def test_batch_callback_preserves_notes_with_matching_answers(self):
+        """Batch notes remain scoped to their response rows and answers stay canonical."""
+        def cb(question, choices, multi_select=False, questions=None):
+            return {
+                "answers": {"q0": "Rebase (Recommended)", "q1": "later"},
+                "notes": {"q0": "Keep the migration commits."},
+            }
+
+        result = json.loads(clarify_tool(
+            "",
+            questions=[
+                {"question": "Which history?", "choices": ["Rebase", "Merge"]},
+                {"question": "When?"},
+            ],
+            callback=cb,
+        ))
+
+        first, second = result["responses"]
+        assert first["user_response"] == "Rebase"
+        assert first["note"] == "Keep the migration commits."
+        assert second["user_response"] == "later"
+        assert "note" not in second
 
     def test_batch_recommended_label_stripped_per_question(self):
         def cb(question, choices, multi_select=False, questions=None):
