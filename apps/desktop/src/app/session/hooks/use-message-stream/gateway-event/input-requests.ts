@@ -7,6 +7,7 @@ import {
   normalizeChoices,
   normalizeQuestions,
   setClarifyRequest,
+  updateClarifyHelp,
   warnDroppedChoices
 } from '@/store/clarify'
 import { $gateway } from '@/store/gateway'
@@ -23,6 +24,24 @@ import type { GatewayEventContext } from './types'
 export function handleInputRequestEvent(ctx: GatewayEventContext): boolean {
   const { deps, event, payload, sessionId, occurredAt } = ctx
   const { activeSessionIdRef, sessionInterrupted, updateSessionState, upsertToolCall } = deps
+
+  if (event.type === 'clarify.explanation') {
+    const requestId = typeof payload?.request_id === 'string' ? payload.request_id : ''
+    const explanationId = typeof payload?.explanation_id === 'string' ? payload.explanation_id : ''
+    const content = typeof payload?.content === 'string' ? payload.content : ''
+
+    if (requestId && explanationId && content) {
+      updateClarifyHelp(requestId, sessionId, explanationId, {
+        choice: typeof payload?.choice === 'string' ? payload.choice : undefined,
+        content,
+        followUp: '',
+        questionId: typeof payload?.question_id === 'string' ? payload.question_id : undefined,
+        status: 'complete'
+      })
+    }
+
+    return true
+  }
 
   if (event.type === 'clarify.request') {
     // Surface the clarify tool's overlay. The Python side is blocked on

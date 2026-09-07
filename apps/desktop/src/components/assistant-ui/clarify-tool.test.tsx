@@ -9,7 +9,7 @@ import { type SessionView, SessionViewProvider } from '@/app/chat/session-view'
 import { hiddenPaneProps } from '@/components/pane-shell/pane-visibility'
 import { $activeTreeGroup, $hoveredTreeGroup } from '@/components/pane-shell/tree/store'
 import { I18nProvider } from '@/i18n'
-import { clearClarifyRequest, setClarifyRequest } from '@/store/clarify'
+import { clearClarifyRequest, setClarifyRequest, updateClarifyHelp } from '@/store/clarify'
 import { $gateway } from '@/store/gateway'
 import { $profiles } from '@/store/profile'
 import { $activeSessionId, _resetSessionOwnerHintsForTests, setSessionOwnerHint } from '@/store/session'
@@ -137,7 +137,7 @@ describe('ClarifyTool live card stays mounted across settle', () => {
   it('holds the card through the gap between answering and the settled result', async () => {
     const { request, rerender } = renderLiveClarify()
 
-    fireEvent.click(screen.getByRole('button', { name: /staging/ }))
+    fireEvent.click(screen.getByRole('button', { name: /^[A-Z]staging/ }))
     fireEvent.click(screen.getByRole('button', { name: /Continue/ }))
 
     await waitFor(() => {
@@ -178,8 +178,8 @@ describe('ClarifyTool live card stays mounted across settle', () => {
 describe('ClarifyTool choice selection', () => {
   it('selects independently, deselects and submits multi-select choices as a JSON array', async () => {
     const { request } = renderLiveClarify({ multiSelect: true })
-    const staging = screen.getByRole('button', { name: /staging/ })
-    const production = screen.getByRole('button', { name: /production/ })
+    const staging = screen.getByRole('button', { name: /^[A-Z]staging/ })
+    const production = screen.getByRole('button', { name: /^[A-Z]production/ })
 
     fireEvent.click(staging)
     fireEvent.click(production)
@@ -206,8 +206,8 @@ describe('ClarifyTool choice selection', () => {
 
   it('keeps single-select replacement and plain-string submission', async () => {
     const { request } = renderLiveClarify()
-    const staging = screen.getByRole('button', { name: /staging/ })
-    const production = screen.getByRole('button', { name: /production/ })
+    const staging = screen.getByRole('button', { name: /^[A-Z]staging/ })
+    const production = screen.getByRole('button', { name: /^[A-Z]production/ })
 
     fireEvent.click(staging)
     fireEvent.click(production)
@@ -223,6 +223,108 @@ describe('ClarifyTool choice selection', () => {
         request_id: 'request-1'
       })
     })
+  })
+})
+
+describe('ClarifyTool help controls', () => {
+  it('routes question and choice help without changing the staged answer', async () => {
+    const { request } = renderLiveClarify()
+
+    fireEvent.click(screen.getByRole('button', { name: 'Why? Which deployment target?' }))
+    fireEvent.click(screen.getByRole('button', { name: 'Why? staging' }))
+
+    await waitFor(() => expect(request).toHaveBeenCalledTimes(2))
+    expect(request).toHaveBeenNthCalledWith(1, 'clarify.explain', { request_id: 'request-1', version: 1 })
+    expect(request).toHaveBeenNthCalledWith(2, 'clarify.explain', {
+      choice: 'staging',
+      request_id: 'request-1',
+      version: 1
+    })
+    expect(screen.getByRole('button', { name: /Continue/ }).getAttribute('disabled')).not.toBeNull()
+  })
+
+  it('submits a custom follow-up in place without selecting its choice', async () => {
+    const { request } = renderLiveClarify()
+    const choice = screen.getByRole('button', { name: /^[A-Z]staging/ })
+
+    fireEvent.click(screen.getByRole('button', { name: 'Ask about staging' }))
+    fireEvent.change(screen.getByRole('textbox', { name: 'Follow-up for choice-0' }), {
+      target: { value: 'What changes after deployment?' }
+    })
+    fireEvent.click(screen.getByRole('button', { name: 'Send' }))
+
+    await waitFor(() => {
+      expect(request).toHaveBeenCalledWith('clarify.explain', {
+        choice: 'staging',
+        follow_up: 'What changes after deployment?',
+        request_id: 'request-1',
+        version: 1
+      })
+    })
+    expect(choice.getAttribute('aria-pressed')).toBe('false')
+    expect(screen.getByRole('button', { name: /Continue/ }).hasAttribute('disabled')).toBe(true)
+  })
+
+  it('keeps keyboard help activation from selecting its target choice', async () => {
+    const { request } = renderLiveClarify()
+    const choice = screen.getByRole('button', { name: /^[A-Z]staging/ })
+    const why = screen.getByRole('button', { name: 'Why? staging' })
+
+    why.focus()
+    fireEvent.keyDown(why, { key: 'Enter' })
+    fireEvent.click(why)
+
+    await waitFor(() =>
+      expect(request).toHaveBeenCalledWith('clarify.explain', expect.objectContaining({ choice: 'staging' }))
+    )
+    expect(choice.getAttribute('aria-pressed')).toBe('false')
+  })
+
+  it('keeps a batch draft and staged selection while question help fails and is retried', async () => {
+    const request = renderLiveBatch()
+    request
+      .mockRejectedValueOnce(new Error('backend unavailable'))
+      .mockResolvedValueOnce({ explanation_id: 'retry-help' })
+
+    fireEvent.click(screen.getByRole('button', { name: /^[A-Z]red/ }))
+    fireEvent.change(screen.getByPlaceholderText('Type your answer…'), { target: { value: 'packet' } })
+    fireEvent.click(screen.getByRole('button', { name: 'Why? Color?' }))
+
+    await waitFor(() => expect(screen.getByText('backend unavailable')).toBeTruthy())
+    expect(screen.getByRole('button', { name: /^[A-Z]red/ }).getAttribute('aria-pressed')).toBe('true')
+    expect((screen.getByPlaceholderText('Type your answer…') as HTMLTextAreaElement).value).toBe('packet')
+    expect((screen.getByRole('button', { name: /Confirm and continue/ }) as HTMLButtonElement).disabled).toBe(false)
+
+    fireEvent.click(screen.getByRole('button', { name: 'Why? Color?' }))
+    await waitFor(() => expect(request).toHaveBeenCalledTimes(2))
+    expect((screen.getByPlaceholderText('Type your answer…') as HTMLTextAreaElement).value).toBe('packet')
+  })
+
+  it('keeps help on the same settled tool row after the pending card remounts', () => {
+    renderLiveClarify()
+    updateClarifyHelp('request-1', 'session-1', 'explain-1', {
+      content: 'Production affects customer traffic.',
+      followUp: '',
+      status: 'complete'
+    })
+    act(() => clearClarifyRequest('request-1', 'session-1'))
+    cleanup()
+
+    renderClarify(
+      <ClarifyTool
+        {...settledClarifyProps(
+          { question: 'Which deployment target?', choices: ['staging', 'production'] },
+          { question: 'Which deployment target?', user_response: 'staging' },
+          'clarify-live'
+        )}
+      />
+    )
+
+    const details = screen.getByText('Help requested').closest('details') as HTMLDetailsElement
+    expect(details.open).toBe(false)
+    fireEvent.click(screen.getByText('Help requested'))
+    expect(details.open).toBe(true)
+    expect(screen.getByText('Production affects customer traffic.')).toBeTruthy()
   })
 })
 
@@ -373,8 +475,8 @@ describe('ClarifyTool keyboard navigation', () => {
   it('cycles through choices and Other with the arrow keys', () => {
     renderLiveClarify()
 
-    const staging = screen.getByRole('button', { name: /staging/ })
-    const production = screen.getByRole('button', { name: /production/ })
+    const staging = screen.getByRole('button', { name: /^[A-Z]staging/ })
+    const production = screen.getByRole('button', { name: /^[A-Z]production/ })
     const other = screen.getByPlaceholderText(/Other/)
 
     expect(staging.getAttribute('data-highlighted')).toBe('true')
@@ -412,7 +514,7 @@ describe('ClarifyTool keyboard navigation', () => {
 
   it('stages a highlighted multi-select choice with Enter and submits it with Continue', async () => {
     const { request } = renderLiveClarify({ multiSelect: true })
-    const production = screen.getByRole('button', { name: /production/ })
+    const production = screen.getByRole('button', { name: /^[A-Z]production/ })
 
     fireEvent.keyDown(window, { key: 'ArrowDown' })
     fireEvent.keyDown(window, { key: 'Enter' })
@@ -471,7 +573,7 @@ describe('ClarifyTool recommended option', () => {
     })
     renderClarify(<ClarifyTool {...liveClarifyProps(['staging (Recommended)', 'production'])} />)
 
-    const recommended = screen.getByRole('button', { name: /staging/ })
+    const recommended = screen.getByRole('button', { name: /^[A-Z]staging/ })
 
     // The label rides in its own muted span so the option text still reads first.
     expect(recommended.querySelector('.text-\\(--ui-text-tertiary\\)')?.textContent).toBe('(Recommended)')
@@ -640,7 +742,7 @@ describe('ClarifyTool batch card', () => {
 
     expect(answeredQids()).toEqual([])
 
-    fireEvent.click(screen.getByRole('button', { name: /red/ }))
+    fireEvent.click(screen.getByRole('button', { name: /^[A-Z]red/ }))
 
     expect(answeredQids()).toEqual(['q0'])
   })
@@ -652,7 +754,7 @@ describe('ClarifyTool batch card', () => {
     expect((confirm as HTMLButtonElement).disabled).toBe(true)
 
     // Staging a pick sends NOTHING to the server.
-    fireEvent.click(screen.getByRole('button', { name: /red/ }))
+    fireEvent.click(screen.getByRole('button', { name: /^[A-Z]red/ }))
     expect(screen.getByText('1 of 2 answered')).toBeTruthy()
     expect(request).not.toHaveBeenCalled()
     expect((confirm as HTMLButtonElement).disabled).toBe(true)
@@ -666,7 +768,7 @@ describe('ClarifyTool batch card', () => {
   it('confirm sends every per-question lock in order and completes the batch', async () => {
     const request = renderLiveBatch()
 
-    fireEvent.click(screen.getByRole('button', { name: /red/ }))
+    fireEvent.click(screen.getByRole('button', { name: /^[A-Z]red/ }))
     fireEvent.change(screen.getByPlaceholderText('Type your answer…'), { target: { value: 'packet' } })
     fireEvent.submit(document.querySelector('form') as HTMLFormElement)
 
@@ -688,8 +790,8 @@ describe('ClarifyTool batch card', () => {
   it('a staged answer stays editable before confirm', async () => {
     const request = renderLiveBatch()
 
-    fireEvent.click(screen.getByRole('button', { name: /red/ }))
-    fireEvent.click(screen.getByRole('button', { name: /blue/ }))
+    fireEvent.click(screen.getByRole('button', { name: /^[A-Z]red/ }))
+    fireEvent.click(screen.getByRole('button', { name: /^[A-Z]blue/ }))
     fireEvent.change(screen.getByPlaceholderText('Type your answer…'), { target: { value: 'packet' } })
     fireEvent.submit(document.querySelector('form') as HTMLFormElement)
 
@@ -714,8 +816,8 @@ describe('ClarifyTool batch card', () => {
   it('reselects every choice from a replayed multi-select JSON answer', () => {
     renderLiveBatch({ q0: '["red","blue"]' }, true)
 
-    expect(screen.getByRole('button', { name: /red/ }).getAttribute('aria-pressed')).toBe('true')
-    expect(screen.getByRole('button', { name: /blue/ }).getAttribute('aria-pressed')).toBe('true')
+    expect(screen.getByRole('button', { name: /^[A-Z]red/ }).getAttribute('aria-pressed')).toBe('true')
+    expect(screen.getByRole('button', { name: /^[A-Z]blue/ }).getAttribute('aria-pressed')).toBe('true')
     expect(screen.getByText('1 of 2 answered')).toBeTruthy()
   })
 
@@ -810,7 +912,7 @@ describe('ClarifyTool owner routing', () => {
     })
     renderClarify(<ClarifyTool {...liveClarifyProps()} />)
 
-    fireEvent.click(screen.getByRole('button', { name: /staging/ }))
+    fireEvent.click(screen.getByRole('button', { name: /^[A-Z]staging/ }))
     fireEvent.click(screen.getByRole('button', { name: /Continue/ }))
 
     await waitFor(() => {
@@ -836,7 +938,7 @@ describe('ClarifyTool owner routing', () => {
     })
     renderClarify(<ClarifyTool {...liveBatchProps()} />)
 
-    fireEvent.click(screen.getByRole('button', { name: /red/ }))
+    fireEvent.click(screen.getByRole('button', { name: /^[A-Z]red/ }))
     fireEvent.change(screen.getByPlaceholderText('Type your answer…'), { target: { value: 'packet' } })
     fireEvent.click(screen.getByRole('button', { name: /Confirm and continue/ }))
 

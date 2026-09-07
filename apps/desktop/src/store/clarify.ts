@@ -11,7 +11,18 @@ export interface ClarifyQuestion {
   multiSelect: boolean
 }
 
+export interface ClarifyHelp {
+  choice?: string
+  content?: string
+  error?: string
+  explanationId: string
+  followUp: string
+  questionId?: string
+  status: 'complete' | 'error' | 'loading'
+}
+
 export interface ClarifyRequest {
+  help?: Record<string, ClarifyHelp>
   requestId: string
   question: string
   choices: string[] | null
@@ -117,6 +128,79 @@ const keyFor = (sessionId: string | null | undefined): string => sessionId ?? ''
 
 export const $clarifyRequests = atom<Record<string, ClarifyRequest>>({})
 
+/** Help is renderer-owned presentation state, retained after its pending request
+ * settles so the original tool card can expose it without making a transcript turn. */
+export const $settledClarifyHelp = atom<Record<string, Record<string, ClarifyHelp>>>({})
+
+/** Associates a renderer transcript tool row with the request it rendered.
+ * The gateway's explain event intentionally exposes only request correlation;
+ * retaining this local association lets a remounted settled row find its help. */
+export const $clarifyToolRequestIds = atom<Record<string, string>>({})
+
+export function associateClarifyToolRequest(toolCallId: string, requestId: string): void {
+  if ($clarifyToolRequestIds.get()[toolCallId] === requestId) {
+    return
+  }
+
+  $clarifyToolRequestIds.set({ ...$clarifyToolRequestIds.get(), [toolCallId]: requestId })
+}
+
+export function updateClarifyHelp(
+  requestId: string,
+  sessionId: string | null | undefined,
+  explanationId: string,
+  update: Omit<ClarifyHelp, 'explanationId'>
+): void {
+  const key = keyFor(sessionId)
+  const current = $clarifyRequests.get()[key]
+
+  if (!current || current.requestId !== requestId) {
+    return
+  }
+
+  const help = { ...(current.help ?? {}), [explanationId]: { explanationId, ...update } }
+  $clarifyRequests.set({ ...$clarifyRequests.get(), [key]: { ...current, help } })
+}
+
+export function reconcileClarifyHelp(
+  requestId: string,
+  sessionId: string | null | undefined,
+  localExplanationId: string,
+  explanationId: string
+): void {
+  const key = keyFor(sessionId)
+  const current = $clarifyRequests.get()[key]
+
+  if (!current || current.requestId !== requestId || localExplanationId === explanationId) {
+    return
+  }
+
+  const local = current.help?.[localExplanationId]
+  const received = current.help?.[explanationId]
+
+  if (!local && !received) {
+    return
+  }
+
+  const help = { ...(current.help ?? {}) }
+  delete help[localExplanationId]
+  help[explanationId] = {
+    ...(local ?? { explanationId, followUp: '', status: 'loading' as const }),
+    ...(received ?? {}),
+    explanationId,
+    followUp: local?.followUp ?? received?.followUp ?? ''
+  }
+  $clarifyRequests.set({ ...$clarifyRequests.get(), [key]: { ...current, help } })
+}
+
+export function settledClarifyHelp(requestId: string | null): Record<string, ClarifyHelp> {
+  return requestId ? ($settledClarifyHelp.get()[requestId] ?? {}) : {}
+}
+
+export function settledClarifyHelpForToolCall(toolCallId: string): Record<string, ClarifyHelp> {
+  return settledClarifyHelp($clarifyToolRequestIds.get()[toolCallId] ?? null)
+}
+
 // The clarify request for the currently-viewed session. The inline ClarifyTool
 // only ever mounts inside the active session's transcript, so it reads this
 // focus-scoped view rather than reaching into the whole map.
@@ -150,6 +234,10 @@ export function clearClarifyRequest(requestId?: string, sessionId?: string | nul
     const next = { ...requests }
     delete next[key]
     $clarifyRequests.set(next)
+
+    if (current.help && Object.keys(current.help).length > 0) {
+      $settledClarifyHelp.set({ ...$settledClarifyHelp.get(), [current.requestId]: current.help })
+    }
 
     return
   }

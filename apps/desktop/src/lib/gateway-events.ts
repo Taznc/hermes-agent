@@ -25,6 +25,7 @@ function asRecord(payload: unknown): Record<string, unknown> {
 export const UNSCOPED_STREAM_EVENT_TYPES = new Set([
   'approval.request',
   'browser.progress',
+  'clarify.explanation',
   'clarify.request',
   'error',
   'mcp.setup.request',

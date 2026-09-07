@@ -36,6 +36,9 @@ const toolComplete = (payload: Record<string, unknown>) =>
 const clarifyExpire = (requestId: string) =>
   act(() => stream.handleEvent({ payload: { request_id: requestId }, session_id: SID, type: 'clarify.expire' }))
 
+const clarifyExplanation = (payload: Record<string, unknown>) =>
+  act(() => stream.handleEvent({ payload, session_id: SID, type: 'clarify.explanation' }))
+
 function clarifyParts() {
   const messages = stream.state().messages ?? []
 
@@ -76,6 +79,26 @@ describe('clarify.request stream hydration', () => {
       choices: ['yes', 'no'],
       question: 'Ship it?'
     })
+  })
+
+  it('receives explain events in the pending request without creating a transcript row', () => {
+    mountStream()
+    clarifyRequest({ choices: ['yes', 'no'], question: 'Ship it?', request_id: 'req-help' })
+    const partsBefore = clarifyParts()
+
+    clarifyExplanation({
+      choice: 'yes',
+      content: 'It releases the approved build.',
+      explanation_id: 'explain-1',
+      request_id: 'req-help'
+    })
+
+    expect($clarifyRequests.get()[SID]?.help?.['explain-1']).toMatchObject({
+      choice: 'yes',
+      content: 'It releases the approved build.',
+      status: 'complete'
+    })
+    expect(clarifyParts()).toEqual(partsBefore)
   })
 
   it('reveals a clarify prompt raised by the active session', () => {
