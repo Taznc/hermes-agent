@@ -14,6 +14,16 @@ logger = logging.getLogger(__name__)
 
 _POOL_PROVIDER = "openai-codex"
 _ALLOWED_PATHS: FrozenSet[str] = frozenset({"/responses", "/models"})
+# ChatGPT-subscription Codex answers 400 "Unsupported parameter" for these
+# standard Responses sampling fields, so the proxy drops them rather than
+# failing the request; the upstream applies its own model defaults instead.
+# VERIFIED against the live upstream 2026-09-07: service_tier, tool_choice,
+# and reasoning are accepted and must keep forwarding.
+_UNSUPPORTED_RESPONSES_PARAMS: FrozenSet[str] = frozenset({
+    "max_output_tokens",
+    "temperature",
+    "top_p",
+})
 _OWNED_HEADERS: FrozenSet[str] = frozenset({
     "User-Agent",
     "originator",
@@ -49,6 +59,10 @@ class OpenAICodexAdapter(UpstreamAdapter):
     @property
     def materializes_responses_stream(self) -> bool:
         return True
+
+    @property
+    def unsupported_responses_params(self) -> FrozenSet[str]:
+        return _UNSUPPORTED_RESPONSES_PARAMS
 
     @property
     def allowed_paths(self) -> FrozenSet[str]:
