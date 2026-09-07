@@ -204,6 +204,25 @@ describe('ClarifyTool choice selection', () => {
     })
   })
 
+  it('sends an optional note separately from the selected single answer', async () => {
+    const { request } = renderLiveClarify()
+
+    fireEvent.click(screen.getByRole('button', { name: /^[A-Z]staging/ }))
+    fireEvent.click(screen.getByRole('button', { name: 'Add note for staging' }))
+    fireEvent.change(screen.getByRole('textbox', { name: 'Note for staging' }), {
+      target: { value: 'Prefer the preview.' }
+    })
+    fireEvent.click(screen.getByRole('button', { name: /Continue/ }))
+
+    await waitFor(() => {
+      expect(request).toHaveBeenCalledWith('clarify.respond', {
+        answer: 'staging',
+        note: 'Prefer the preview.',
+        request_id: 'request-1'
+      })
+    })
+  })
+
   it('keeps single-select replacement and plain-string submission', async () => {
     const { request } = renderLiveClarify()
     const staging = screen.getByRole('button', { name: /^[A-Z]staging/ })
@@ -771,6 +790,50 @@ describe('ClarifyTool batch card', () => {
     expect((confirm as HTMLButtonElement).disabled).toBe(false)
   })
 
+  it('keeps a scoped note directly under a selected choice and sends it separately', async () => {
+    const request = renderLiveBatch()
+
+    fireEvent.click(screen.getByRole('button', { name: /^[A-Z]red/ }))
+    fireEvent.click(screen.getByRole('button', { name: 'Add note for red' }))
+
+    const note = screen.getByRole('textbox', { name: 'Note for red' })
+    expect(note.closest('[data-clarify-batch-question="q0"]')).toBeTruthy()
+    fireEvent.change(note, { target: { value: 'Use the stable palette.' } })
+    fireEvent.change(screen.getByPlaceholderText('Type your answer…'), { target: { value: 'packet' } })
+    fireEvent.submit(document.querySelector('form') as HTMLFormElement)
+
+    await waitFor(() => {
+      expect(request).toHaveBeenCalledTimes(2)
+    })
+    expect(request).toHaveBeenNthCalledWith(1, 'clarify.respond', {
+      answer: 'red',
+      note: 'Use the stable palette.',
+      question_id: 'q0',
+      request_id: 'request-batch'
+    })
+  })
+
+  it('uses plain Enter to advance a batch draft without creating a newline', () => {
+    renderLiveBatch()
+
+    const colorDraft = screen.getByPlaceholderText('Other (type your answer)')
+    fireEvent.change(colorDraft, { target: { value: 'green' } })
+    fireEvent.keyDown(colorDraft, { key: 'Enter' })
+
+    expect((colorDraft as HTMLTextAreaElement).value).toBe('green')
+    expect(document.activeElement).toBe(screen.getByPlaceholderText('Type your answer…'))
+  })
+
+  it('keeps Shift+Enter as a newline in a batch draft', () => {
+    renderLiveBatch()
+
+    const colorDraft = screen.getByPlaceholderText('Other (type your answer)')
+    fireEvent.change(colorDraft, { target: { value: 'green\nmore' } })
+    fireEvent.keyDown(colorDraft, { key: 'Enter', shiftKey: true })
+
+    expect((colorDraft as HTMLTextAreaElement).value).toBe('green\nmore')
+  })
+
   it('confirm sends every per-question lock in order and completes the batch', async () => {
     const request = renderLiveBatch()
 
@@ -860,6 +923,24 @@ describe('ClarifyTool batch card', () => {
     expect(screen.getByText('red')).toBeTruthy()
     expect(screen.getByText('Name?')).toBeTruthy()
     expect(screen.getByText('Skipped')).toBeTruthy()
+  })
+
+  it('renders settled selected answers and notes as distinct fields', () => {
+    renderClarify(
+      <ClarifyTool
+        {...settledClarifyProps(
+          batchArgs(),
+          JSON.stringify({
+            responses: [{ note: 'Use the stable palette.', question: 'Color?', user_response: 'red' }]
+          }),
+          'clarify-batch-note-settled'
+        )}
+      />
+    )
+
+    expect(screen.getByText('Selected')).toBeTruthy()
+    expect(screen.getByText('Note')).toBeTruthy()
+    expect(screen.getByText('Use the stable palette.')).toBeTruthy()
   })
 })
 

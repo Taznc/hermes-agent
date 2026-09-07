@@ -3520,7 +3520,13 @@ export const en: Translations = withForkKeys(forkEn, {
       questionProgress: (answered, total) => `${answered} of ${total} answered`,
       lateAnswer: (question, choice) => `Re: "${question}" — my answer: ${choice}`,
       lateAnswerTip: 'Draft this answer as a follow-up message',
-      lateAnswerHint: 'This prompt is no longer waiting. Pick an option to draft it as a follow-up message.'
+      lateAnswerHint: 'This prompt is no longer waiting. Pick an option to draft it as a follow-up message.',
+      addNote: 'Add note',
+      addNoteFor: label => `Add note for ${label}`,
+      note: 'Note',
+      noteFor: label => `Note for ${label}`,
+      notePlaceholder: 'Add an optional note…',
+      selected: 'Selected'
     },
     mcpSetup: {
       installTitle: server => `Add the ${server} MCP server?`,
