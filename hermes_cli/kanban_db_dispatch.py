@@ -917,8 +917,9 @@ def _protocol_violation_streak(conn: sqlite3.Connection, task_id: str) -> int:
     """Count the task's trailing run of clean-exit protocol violations.
 
     Walks closed runs newest-first (including the one ``detect_crashed_workers``
-    just closed). ``rate_limited`` runs are neutral and skipped (a quota wall
-    says nothing about the task); any other closed run breaks the streak, so
+    just closed). ``rate_limited`` and ``spawn_deferred`` runs are neutral and
+    skipped (a quota wall or board-wide launcher outage says nothing about the
+    task); any other closed run breaks the streak, so
     the budget counts ONLY protocol violations. Violations are recognized by the
     ``protocol_violation`` run-metadata marker, with the error text as fallback
     for runs recorded before the marker existed.
@@ -932,7 +933,7 @@ def _protocol_violation_streak(conn: sqlite3.Connection, task_id: str) -> int:
     ).fetchall()
     for row in rows:
         outcome = row["outcome"] or ""
-        if outcome == "rate_limited":
+        if outcome in {"rate_limited", "spawn_deferred"}:
             continue
         if outcome == "crashed" and (
             _kb._json_dict(row["metadata"]).get("protocol_violation")
@@ -2120,29 +2121,36 @@ def _valid_start_budget_pause_state(state: Mapping[str, Any]) -> bool:
 
 
 def read_dispatch_pause(board: Optional[str] = None) -> Optional[dict[str, Any]]:
-    """Return the board's sticky dispatch pause, if any.
+    """Return the board's current dispatch stop state, if any.
 
-    A malformed/unreadable sentinel fails closed. The operator can always clear
-    it with :func:`resume_dispatch`; silently treating it as absent would make a
-    partially written safety state widen dispatch.
+    The SQLite fallback exists only for a sticky systemic fault and therefore
+    takes precedence over the JSON sentinel, which may contain a self-expiring
+    start-budget cooldown. Unreadable state fails closed; silently treating a
+    damaged safety record as absent widens dispatch.
     """
+    from hermes_cli.kanban_db_dispatch_circuit import read_pause
+
     path = _dispatch_pause_path(board)
     try:
-        if not path.exists():
+        fallback = read_pause(_kb.kanban_db_path(board))
+        if fallback is not None:
+            return fallback
+        try:
+            text = path.read_text(encoding="utf-8")
+        except FileNotFoundError:
             return None
-        raw = json.loads(path.read_text(encoding="utf-8"))
+        raw = json.loads(text)
         if not isinstance(raw, dict) or not raw.get("reason"):
             raise ValueError("pause state must be an object with a reason")
         if raw["reason"] == "start_budget_exceeded" and not _valid_start_budget_pause_state(raw):
             raise ValueError("start-budget cooldown state is missing required fields")
         return raw
-    except FileNotFoundError:
-        return None
     except Exception as exc:
         return {
             "reason": "pause_state_unreadable",
             "detail": str(exc),
             "path": str(path),
+            "recovery": "repair dispatch-pause storage, then run `hermes kanban dispatch --resume-circuit`",
         }
 
 
@@ -2229,20 +2237,145 @@ def dispatch_pause_message(state: Mapping[str, Any], *, board: Optional[str] = N
     if board:
         command += f"--board {board} "
     command += "dispatch --resume-circuit"
+    details = [f"reason={state.get('reason', 'unknown pause')}"]
+    if state.get("fault_code"):
+        details.append(f"fault_code={state['fault_code']}")
+    paused_at = state.get("tripped_at") or state.get("paused_at")
+    if paused_at:
+        details.append(f"time={paused_at}")
+    if state.get("recovery"):
+        details.append(f"recovery={state['recovery']}")
     return (
-        f"manual intervention required ({state.get('reason', 'unknown pause')}); "
+        f"manual intervention required ({'; '.join(details)}); "
         f"resume explicitly with: {command}"
     )
 
 
 def resume_dispatch(board: Optional[str] = None) -> dict[str, Any]:
-    """Explicitly clear a manual board safety pause or rate-limit status file."""
+    """Explicitly clear a board safety pause or current rate-limit status."""
+    from hermes_cli.kanban_db_dispatch_circuit import clear_pause
     _kb._assert_not_delegated_child_mutation()
-    path = _dispatch_pause_path(board)
-    previous = read_dispatch_pause(board)
-    with contextlib.suppress(FileNotFoundError):
-        path.unlink()
-    return {"was_paused": previous is not None, "previous": previous}
+    db_path = _kb.kanban_db_path(board=board)
+    # The pause check and its removal must share the dispatch tick's board lock.
+    # Otherwise a tick can pass its check, write a fresh pause, and then have
+    # this operator action unlink that newer safety state. Refusing a contended
+    # resume makes recovery deliberate: repair, then re-run the explicit probe.
+    with _kbc._dispatch_tick_lock(db_path) as held:
+        if not held:
+            return {
+                "was_paused": read_dispatch_pause(board) is not None,
+                "resumed": False,
+                "reason": "dispatch_in_progress",
+            }
+        path = _dispatch_pause_path(board)
+        previous = read_dispatch_pause(board)
+        # Clear SQLite first. A JSON-only circuit must remain authoritative if
+        # fallback cleanup fails; unlinking it first would silently re-arm the
+        # next tick even though this explicit recovery returned an error.
+        # Conversely, if the later unlink fails, the JSON sentinel still
+        # fences dispatch. Both stores are cleared under the board lock.
+        clear_pause(db_path)
+        with contextlib.suppress(FileNotFoundError):
+            path.unlink()
+    return {"was_paused": previous is not None, "previous": previous, "resumed": True}
+
+
+def _is_shared_launcher_prerequisite_fault(exc: BaseException) -> bool:
+    """Whether *exc* is the one host-scoped launch fault the board can share.
+
+    The type originates exactly where the restart-safe user-scope availability
+    probe fails.  Do not broaden this to message matching: credentials,
+    workspace errors, and a disappearing launcher are task-local failures and
+    must retain the normal per-card retry semantics.
+    """
+    from tools.process_registry import RestartSafeScopeUnavailable
+
+    return isinstance(exc, RestartSafeScopeUnavailable)
+
+
+def _defer_for_shared_launcher_prerequisite(
+    conn: sqlite3.Connection,
+    task: Task,
+    exc: BaseException,
+    result: DispatchResult,
+    *,
+    board: Optional[str],
+) -> None:
+    """Release one claimed task and pause its board without charging the task.
+
+    The dispatcher lock makes the pause visible before another tick can claim a
+    sibling.  The triggering run is retained as a non-failure ``spawn_deferred``
+    receipt, while every task failure field remains untouched.
+    """
+    from tools.process_registry import RestartSafeScopeUnavailable
+
+    fault_code = RestartSafeScopeUnavailable.fault_code
+    error = str(exc)[:500]
+    tripped_at = int(time.time())
+    try:
+        state = _write_dispatch_pause(
+            board,
+            "restart_safe_scope_unavailable",
+            fault_code=fault_code,
+            trigger_task_id=task.id,
+            error=error,
+            tripped_at=tripped_at,
+            recovery="repair the user scope prerequisite, then run `hermes kanban dispatch --resume-circuit`",
+        )
+        event_kind = "dispatch_circuit_tripped"
+    except Exception as pause_error:
+        # A failure to persist the normal sentinel must never strand the
+        # already-claimed trigger or charge its task-local budget. Persist the
+        # fallback in SQLite with the run receipt so later ticks/restarts see
+        # it too, independently of the triggering task's lifecycle.
+        state = {
+            "reason": "pause_persistence_failed",
+            "fault_code": fault_code,
+            "trigger_task_id": task.id,
+            "error": error,
+            "tripped_at": tripped_at,
+            "pause_error": str(pause_error)[:500],
+            "recovery": "repair dispatch-pause storage and the user scope prerequisite, then run `hermes kanban dispatch --resume-circuit`",
+        }
+        event_kind = "dispatch_circuit_persistence_failed"
+    # The durable pause is authoritative for later ticks, but this tick must
+    # stop immediately even if a concurrent reconciliation wins the task-row
+    # compare-and-swap below.
+    result.dispatch_paused = state
+    with _kb.write_txn(conn):
+        if event_kind == "dispatch_circuit_persistence_failed":
+            from hermes_cli.kanban_db_dispatch_circuit import persist_pause
+
+            persist_pause(conn, state)
+        row = conn.execute(
+            "SELECT current_run_id FROM tasks WHERE id = ? AND status = 'running'",
+            (task.id,),
+        ).fetchone()
+        if row is not None:
+            retry_status = _kb._retry_status_for_run(conn, task.id, row["current_run_id"])
+            cur = conn.execute(
+                "UPDATE tasks SET status = ?, claim_lock = NULL, claim_expires = NULL, "
+                "worker_pid = NULL, worker_unit = NULL WHERE id = ? AND status = 'running'",
+                (retry_status, task.id),
+            )
+            if cur.rowcount == 1:
+                run_id = _kb._end_run(
+                    conn,
+                    task.id,
+                    outcome="spawn_deferred",
+                    status="spawn_deferred",
+                    error=error,
+                    metadata={"fault_code": fault_code, "board_circuit": state},
+                )
+                _kb._append_event(
+                    conn,
+                    task.id,
+                    event_kind,
+                    {"fault_code": fault_code, "board": board or _kb.DEFAULT_BOARD,
+                     "tripped_at": tripped_at, "error": error, "recovery": state["recovery"],
+                     "pause_error": state.get("pause_error")},
+                    run_id=run_id,
+                )
 
 
 def _recent_dispatch_starts(
@@ -2523,6 +2656,11 @@ def _dispatch_lane_task(
         _claim_coedit_paths(claimed.id, claimed.tenant)
         return True
     except Exception as exc:
+        if _is_shared_launcher_prerequisite_fault(exc):
+            _defer_for_shared_launcher_prerequisite(
+                conn, claimed, exc, result, board=board,
+            )
+            return False
         if _record_task_failure(
             conn, claimed.id, str(exc),
             outcome="spawn_failed", failure_limit=failure_limit, release_claim=True, end_run=True,
@@ -3111,6 +3249,8 @@ def _dispatch_once_locked(
                 row_assignee = rework_escalation_profile
         if _dispatch_lane_task(conn, row, row_assignee, result, lane="ready", **lane_kwargs):
             spawned += 1
+        if result.dispatch_paused is not None:
+            return result
 
     # A review agent (sdlc-review) approves (→ done) or requests changes
     # (→ ready/todo). Review spawns share max_spawn with ready tasks. The loop
@@ -3148,6 +3288,8 @@ def _dispatch_once_locked(
                 row_assignee = default_reviewer
         if _dispatch_lane_task(conn, row, row_assignee, result, lane="review", **lane_kwargs):
             spawned += 1
+        if result.dispatch_paused is not None:
+            return result
 
     if start_budget is not None and spawned and not dry_run:
         recent_starts, next_eligible_at = _recent_dispatch_start_window(

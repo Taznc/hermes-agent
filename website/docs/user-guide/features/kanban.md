@@ -299,6 +299,40 @@ pause. Those states report `manual intervention required` and remain stopped
 until `hermes kanban --board <slug> dispatch --resume-circuit` after the
 operator repairs or investigates the condition.
 
+#### Shared launcher prerequisite outage
+
+A failed restart-safe user-scope availability probe raises the structured
+`RestartSafeScopeUnavailable` error (`systemd_user_scope_unavailable`). This
+pauses the affected board immediately: ready and review cards keep their status
+and failure budgets, and the triggering run closes as `spawn_deferred`, not a
+task failure. Ordinary credential, configuration, or workspace errors still use
+the normal per-task retry policy; matching error text alone does not trip this
+circuit.
+
+The pause survives dispatcher restarts. Normally it is an atomic JSON sentinel
+beside the board database; if that write fails but SQLite is writable, a
+board-owned SQLite record keeps the pause authoritative. Deleting the triggering
+task or its history does not clear that fallback. Unreadable pause state also
+fails closed. Inspect the reason, fault code, time, and recovery action with:
+
+```bash
+hermes kanban --board <slug> dispatch --circuit-status
+```
+
+Repair the user-scope prerequisite and any reported pause-storage failure, then
+explicitly clear the circuit:
+
+```bash
+hermes kanban --board <slug> dispatch --resume-circuit
+```
+
+Resume clears both stores under the dispatch lock; if a tick owns the lock,
+resume refuses and must be retried. There is no timed auto-resume. If the
+prerequisite is still broken, the next attempt trips the board again before
+siblings are launched. If both JSON and SQLite persistence fail, the current
+tick stops, but durable recovery and task reconciliation cannot be guaranteed
+until storage is repaired.
+
 `review_rework_escalation_profile` breaks pathological implementation/review
 loops without removing review: the first changes request returns to the original
 implementer; after the second, the next ready run is reassigned to the configured
