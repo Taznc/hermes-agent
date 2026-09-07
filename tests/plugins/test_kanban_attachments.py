@@ -271,7 +271,7 @@ def test_attachment_data_url_missing_file_on_disk_404(client):
     )
     att_id = r.json()["attachment"]["id"]
 
-    conn = kb.connect()
+    conn = kbc.connect()
     try:
         att = kb.get_attachment(conn, att_id)
         Path(att.stored_path).unlink()
@@ -290,7 +290,7 @@ def test_attachment_data_url_oversized_returns_413(client):
     )
     att_id = r.json()["attachment"]["id"]
 
-    conn = kb.connect()
+    conn = kbc.connect()
     try:
         att = kb.get_attachment(conn, att_id)
         # Overwrite the on-disk blob past the inline-render cap without

@@ -225,7 +225,7 @@ def test_connect_migrates_legacy_task_comments_adds_choice_json(tmp_path):
     conn.commit()
     conn.close()
 
-    with kb.connect(db_path) as migrated:
+    with kbc.connect(db_path) as migrated:
         comment_columns = {
             row["name"] for row in migrated.execute("PRAGMA table_info(task_comments)")
         }
@@ -279,7 +279,7 @@ def test_create_task_defaults_to_normal_priority_and_not_on_hold(kanban_home):
     """New tasks must default to non-held, normal (0) priority — existing
     board data (and every other create_task caller) must not have to
     special-case the new fields."""
-    with kb.connect() as conn:
+    with kbc.connect() as conn:
         t = kb.create_task(conn, title="freshly created", assignee="ops")
         task = kb.get_task(conn, t)
         assert task.priority == 0
@@ -287,7 +287,7 @@ def test_create_task_defaults_to_normal_priority_and_not_on_hold(kanban_home):
 
 
 def test_hold_task_shelves_and_is_not_dispatchable(kanban_home):
-    with kb.connect() as conn:
+    with kbc.connect() as conn:
         t = kb.create_task(conn, title="shelve me", assignee="ops")
         assert kb.hold_task(conn, t, reason="waiting on budget approval") is True
         task = kb.get_task(conn, t)
@@ -306,7 +306,7 @@ def test_hold_task_shelves_and_is_not_dispatchable(kanban_home):
 def test_hold_task_closes_active_run(kanban_home):
     """Holding a running task must close its active run so attempt history
     isn't orphaned, mirroring schedule_task's run-closing behaviour."""
-    with kb.connect() as conn:
+    with kbc.connect() as conn:
         t = kb.create_task(conn, title="running then held", assignee="worker")
         kb.claim_task(conn, t)
         run_id = kb.get_task(conn, t).current_run_id
@@ -322,7 +322,7 @@ def test_hold_task_closes_active_run(kanban_home):
 
 
 def test_unhold_task_returns_to_ready_when_parents_done(kanban_home):
-    with kb.connect() as conn:
+    with kbc.connect() as conn:
         t = kb.create_task(conn, title="shelved and resumed", assignee="ops")
         assert kb.hold_task(conn, t) is True
         assert kb.get_task(conn, t).status == "on_hold"
@@ -336,7 +336,7 @@ def test_unhold_task_returns_to_ready_when_parents_done(kanban_home):
 def test_unhold_task_waits_on_incomplete_parents(kanban_home):
     """A shelved child with an unfinished parent must resume into 'todo',
     not 'ready' — never bypass the parent-completion gate."""
-    with kb.connect() as conn:
+    with kbc.connect() as conn:
         parent = kb.create_task(conn, title="parent still working", assignee="ops")
         child = kb.create_task(
             conn, title="child shelved", assignee="ops", parents=[parent],
@@ -347,7 +347,7 @@ def test_unhold_task_waits_on_incomplete_parents(kanban_home):
 
 
 def test_unhold_task_only_valid_from_on_hold(kanban_home):
-    with kb.connect() as conn:
+    with kbc.connect() as conn:
         t = kb.create_task(conn, title="not held", assignee="ops")
         assert kb.get_task(conn, t).status == "ready"
         assert kb.unhold_task(conn, t) is False
@@ -355,7 +355,7 @@ def test_unhold_task_only_valid_from_on_hold(kanban_home):
 
 def test_on_hold_is_a_recognized_status(kanban_home):
     assert "on_hold" in kb.VALID_STATUSES
-    with kb.connect() as conn:
+    with kbc.connect() as conn:
         # list_tasks(status=...) must accept it like any other column.
         t = kb.create_task(conn, title="filterable", assignee="ops")
         kb.hold_task(conn, t)
@@ -644,7 +644,7 @@ def test_add_comment_with_choice_persists_structured_answer(kanban_home):
     ``kanban_block(reason=...``choices`` fence) -> click -> comment`` wire
     contract's DB layer.
     """
-    with kb.connect() as conn:
+    with kbc.connect() as conn:
         tid = kb.create_task(conn, title="needs a decision")
         assert kb.block_task(
             conn, tid, reason="Pick one:\n```choices\n"
@@ -672,7 +672,7 @@ def test_add_comment_with_choice_persists_structured_answer(kanban_home):
 def test_add_comment_without_choice_leaves_choice_none(kanban_home):
     """Existing free-text callers (every caller before this feature) are
     unaffected — ``choice`` defaults to None and round-trips as such."""
-    with kb.connect() as conn:
+    with kbc.connect() as conn:
         tid = kb.create_task(conn, title="t")
         kb.add_comment(conn, tid, author="user", body="just a note")
         comments = kb.list_comments(conn, tid)
@@ -683,7 +683,7 @@ def test_add_comment_choice_rejects_unknown_question_event(kanban_home):
     """A ``question_event_id`` that doesn't reference a real event on this
     task is rejected (matches the spec's §6 error-handling table: server-side
     422, click never silently dropped)."""
-    with kb.connect() as conn:
+    with kbc.connect() as conn:
         tid = kb.create_task(conn, title="t")
         with pytest.raises(ValueError, match="question_event_id"):
             kb.add_comment(
@@ -697,7 +697,7 @@ def test_add_comment_choice_rejects_unknown_question_event(kanban_home):
 
 
 def test_add_comment_choice_rejects_missing_key_or_label(kanban_home):
-    with kb.connect() as conn:
+    with kbc.connect() as conn:
         tid = kb.create_task(conn, title="t")
         assert kb.block_task(conn, tid, reason="q", kind="needs_input")
         event_id = [e for e in kb.list_events(conn, tid) if e.kind == "blocked"][0].id
