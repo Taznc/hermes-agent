@@ -1,8 +1,11 @@
 import { act, cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react'
 import { afterEach, describe, expect, it, vi } from 'vitest'
 
+import { TRANSLATIONS } from '@/i18n/catalog'
 import type { ComposerAttachment } from '@/store/composer'
 import { $activeSessionId, setCurrentReasoningEffort } from '@/store/session'
+
+import { deferred } from '../test/deferred'
 
 import { ComposerRecommend } from './composer-recommend'
 
@@ -57,7 +60,9 @@ function setup(
       return OK_TWO_PROVIDERS
     })
 
-  const onSelectModel = over.onSelectModel ?? vi.fn().mockResolvedValue(true)
+  // The real contract shape. A bare `true` is the legacy boolean `selectModel`
+  // returns, not what `selectRecommendedModel` hands this surface.
+  const onSelectModel = over.onSelectModel ?? vi.fn().mockResolvedValue({ kind: 'applied' })
 
   const subscribeDraft =
     over.subscribeDraft === null
@@ -316,7 +321,10 @@ describe('Apply is scoped to the active view and never sends', () => {
   })
 
   it('does not claim failure when the switch is merely awaiting confirmation', async () => {
-    const onSelectModel = vi.fn().mockResolvedValue({ kind: 'confirmation_pending' })
+    // A confirmation that is still open: `settled` never resolves while the
+    // user has not answered the prompt.
+    const onSelectModel = vi.fn().mockResolvedValue({ kind: 'confirmation_pending', settled: new Promise(() => {}) })
+
     const { draftRef } = setup({ onSelectModel })
 
     await openResults()
@@ -328,6 +336,252 @@ describe('Apply is scoped to the active view and never sends', () => {
     // The results stay open so the user can confirm or choose another row.
     expect(screen.getByTestId('composer-recommend-panel')).toBeTruthy()
     expect(draftRef.current).toBe('Refactor the parser for me')
+  })
+})
+
+// A real failure and a pending confirmation are DIFFERENT events, and the
+// surface must not say "confirm the switch" for either a selection that
+// already failed or a confirmation that has since failed. These tests pin the
+// three shapes separately, because collapsing any two of them is exactly the
+// dishonest state this card exists to remove.
+describe('Apply failure is distinct from a pending confirmation', () => {
+  it('reports an immediate Apply failure as failed, never as awaiting confirmation', async () => {
+    const onSelectModel = vi.fn().mockResolvedValue({ kind: 'failed', recovery: 'not_needed' })
+
+    setup({ onSelectModel })
+
+    await openResults()
+    fireEvent.click(screen.getAllByTestId('composer-recommend-apply')[0])
+
+    const notice = await screen.findByTestId('composer-recommend-apply-failed')
+
+    // The load-bearing assertion: no confirm guidance for a path that already
+    // failed — there is nothing left to confirm.
+    expect(screen.queryByTestId('composer-recommend-apply-unconfirmed')).toBeNull()
+    expect(notice.textContent).toMatch(/did not|not applied|could not/i)
+    expect(notice.textContent).not.toMatch(/confirm/i)
+
+    // The recovery affordance IS the row's own Apply, left usable.
+    const applyButton = screen.getAllByTestId('composer-recommend-apply')[0] as HTMLButtonElement
+
+    expect(applyButton.disabled).toBe(false)
+    // The panel stays open: closing it would hide the failure the user needs.
+    expect(screen.getByTestId('composer-recommend-panel')).toBeTruthy()
+  })
+
+  it('says the previous model is still in use when the failure was rolled back', async () => {
+    const onSelectModel = vi.fn().mockResolvedValue({ kind: 'failed', recovery: 'restored' })
+
+    setup({ onSelectModel })
+
+    await openResults()
+    fireEvent.click(screen.getAllByTestId('composer-recommend-apply')[0])
+
+    const notice = await screen.findByTestId('composer-recommend-apply-failed')
+
+    expect(notice.textContent).toMatch(/previous model/i)
+    expect(screen.queryByTestId('composer-recommend-apply-unrestored')).toBeNull()
+  })
+
+  it('never claims a rollback the gateway refused', async () => {
+    const onSelectModel = vi.fn().mockResolvedValue({ kind: 'failed', recovery: 'restore_failed' })
+
+    setup({ onSelectModel })
+
+    await openResults()
+    fireEvent.click(screen.getAllByTestId('composer-recommend-apply')[0])
+
+    const notice = await screen.findByTestId('composer-recommend-apply-unrestored')
+
+    // An honest half-applied report: it must NOT say the previous model is
+    // still in use, because the compensation failed.
+    expect(notice.textContent).toMatch(/check|model menu|verify/i)
+    expect(screen.queryByTestId('composer-recommend-apply-failed')).toBeNull()
+  })
+
+  it('marks only the row that failed', async () => {
+    const onSelectModel = vi.fn().mockResolvedValue({ kind: 'failed', recovery: 'not_needed' })
+
+    setup({ onSelectModel })
+
+    await openResults()
+    fireEvent.click(screen.getAllByTestId('composer-recommend-apply')[1])
+
+    await screen.findByTestId('composer-recommend-apply-failed')
+
+    expect(screen.getAllByTestId('composer-recommend-apply-failed')).toHaveLength(1)
+  })
+
+  it('clears a previous failure when the row is applied again', async () => {
+    const onSelectModel = vi
+      .fn()
+      .mockResolvedValueOnce({ kind: 'failed', recovery: 'not_needed' })
+      .mockResolvedValue({ kind: 'applied' })
+
+    setup({ onSelectModel })
+
+    await openResults()
+    fireEvent.click(screen.getAllByTestId('composer-recommend-apply')[0])
+    await screen.findByTestId('composer-recommend-apply-failed')
+
+    fireEvent.click(screen.getAllByTestId('composer-recommend-apply')[0])
+
+    await waitFor(() => expect(screen.queryByTestId('composer-recommend-panel')).toBeNull())
+    expect(screen.queryByTestId('composer-recommend-apply-failed')).toBeNull()
+  })
+})
+
+// A confirmation the user answered is no longer pending. Leaving "confirm the
+// switch" on screen after the confirmed resend failed is the stale guidance
+// this card names; leaving it after the resend SUCCEEDED is just as wrong.
+describe('A settled confirmation replaces the confirm guidance', () => {
+  it('closes the surface when the confirmed switch is finally applied', async () => {
+    const settled = deferred<{ kind: 'applied' }>()
+    const onSelectModel = vi.fn().mockResolvedValue({ kind: 'confirmation_pending', settled: settled.promise })
+
+    setup({ onSelectModel })
+
+    await openResults()
+    fireEvent.click(screen.getAllByTestId('composer-recommend-apply')[0])
+    await screen.findByTestId('composer-recommend-apply-unconfirmed')
+
+    await act(async () => {
+      settled.resolve({ kind: 'applied' })
+      await settled.promise
+    })
+
+    await waitFor(() => expect(screen.queryByTestId('composer-recommend-panel')).toBeNull())
+  })
+
+  it('replaces the confirm guidance with a failure when the confirmed switch fails', async () => {
+    const settled = deferred<{ kind: 'failed'; recovery: 'not_needed' }>()
+    const onSelectModel = vi.fn().mockResolvedValue({ kind: 'confirmation_pending', settled: settled.promise })
+
+    setup({ onSelectModel })
+
+    await openResults()
+    fireEvent.click(screen.getAllByTestId('composer-recommend-apply')[0])
+    await screen.findByTestId('composer-recommend-apply-unconfirmed')
+
+    await act(async () => {
+      settled.resolve({ kind: 'failed', recovery: 'not_needed' })
+      await settled.promise
+    })
+
+    await screen.findByTestId('composer-recommend-apply-failed')
+    // The exact stale-guidance regression: the confirm prompt must be gone.
+    expect(screen.queryByTestId('composer-recommend-apply-unconfirmed')).toBeNull()
+  })
+
+  it('reports an unrestored post-confirm compensation failure honestly', async () => {
+    const settled = deferred<{ kind: 'failed'; recovery: 'restore_failed' }>()
+    const onSelectModel = vi.fn().mockResolvedValue({ kind: 'confirmation_pending', settled: settled.promise })
+
+    setup({ onSelectModel })
+
+    await openResults()
+    fireEvent.click(screen.getAllByTestId('composer-recommend-apply')[0])
+    await screen.findByTestId('composer-recommend-apply-unconfirmed')
+
+    await act(async () => {
+      settled.resolve({ kind: 'failed', recovery: 'restore_failed' })
+      await settled.promise
+    })
+
+    await screen.findByTestId('composer-recommend-apply-unrestored')
+    expect(screen.queryByTestId('composer-recommend-apply-unconfirmed')).toBeNull()
+  })
+
+  it('keeps the confirm guidance while the confirmation is genuinely still pending', async () => {
+    const settled = deferred<{ kind: 'applied' }>()
+    const onSelectModel = vi.fn().mockResolvedValue({ kind: 'confirmation_pending', settled: settled.promise })
+
+    setup({ onSelectModel })
+
+    await openResults()
+    fireEvent.click(screen.getAllByTestId('composer-recommend-apply')[0])
+
+    const notice = await screen.findByTestId('composer-recommend-apply-unconfirmed')
+
+    expect(notice.textContent).toMatch(/confirm/i)
+    expect(screen.queryByTestId('composer-recommend-apply-failed')).toBeNull()
+
+    settled.resolve({ kind: 'applied' })
+  })
+
+  it('ignores a settled confirmation that lands after the workspace changed', async () => {
+    const settled = deferred<{ kind: 'failed'; recovery: 'not_needed' }>()
+    const onSelectModel = vi.fn().mockResolvedValue({ kind: 'confirmation_pending', settled: settled.promise })
+    const { rerenderWithProfile } = setup({ onSelectModel })
+
+    await openResults()
+    fireEvent.click(screen.getAllByTestId('composer-recommend-apply')[0])
+    await screen.findByTestId('composer-recommend-apply-unconfirmed')
+
+    // The user left this workspace; a stale answer about the profile they left
+    // must not paint anything here.
+    rerenderWithProfile('home')
+
+    await act(async () => {
+      settled.resolve({ kind: 'failed', recovery: 'not_needed' })
+      await settled.promise
+    })
+
+    expect(screen.queryByTestId('composer-recommend-apply-failed')).toBeNull()
+    expect(screen.queryByTestId('composer-recommend-panel')).toBeNull()
+  })
+})
+
+// The renderer sends attachment `name` AND `kind`
+// (`recommendationAttachmentMetadata`), so copy claiming only "names" understates
+// what crosses the wire. Every locale that authors this string must describe
+// metadata honestly and keep the explicit exclusions.
+describe('Privacy disclosure matches what is actually sent', () => {
+  // Per-locale terms rather than one English regex: the contract is that each
+  // locale says BOTH fields in its own language and keeps all three
+  // exclusions, which a language-agnostic assertion cannot check.
+  const DISCLOSURE = {
+    ar: { exclusions: [/سجل المحادثة/u, /محتويات الملفات/u, /ملفات المشروع/u], sends: [/مسودت/u, /أسماء/u, /أنواع/u] },
+    en: {
+      exclusions: [/conversation history/i, /file contents/i, /project files/i],
+      sends: [/draft/i, /name/i, /type/i]
+    },
+    ja: {
+      exclusions: [/会話履歴/u, /ファイルの内容/u, /プロジェクトファイル/u],
+      sends: [/下書き/u, /名前/u, /種類/u]
+    },
+    zh: { exclusions: [/对话历史/u, /文件内容/u, /项目文件/u], sends: [/草稿/u, /名称/u, /类型/u] },
+    'zh-hant': { exclusions: [/對話紀錄/u, /檔案內容/u, /專案檔案/u], sends: [/草稿/u, /名稱/u, /類型/u] }
+  } as const
+
+  const LOCALES = Object.keys(DISCLOSURE) as (keyof typeof DISCLOSURE)[]
+
+  it.each(LOCALES)('locale "%s" discloses attachment names AND types, not names alone', locale => {
+    const privacy = TRANSLATIONS[locale].composer.recommend.privacy
+
+    expect(typeof privacy).toBe('string')
+
+    for (const term of DISCLOSURE[locale].sends) {
+      expect(privacy).toMatch(term)
+    }
+  })
+
+  it.each(LOCALES)('locale "%s" keeps all three explicit exclusions', locale => {
+    const privacy = TRANSLATIONS[locale].composer.recommend.privacy
+
+    for (const term of DISCLOSURE[locale].exclusions) {
+      expect(privacy).toMatch(term)
+    }
+  })
+
+  it('renders the disclosure on the surface itself', async () => {
+    setup()
+    await openResults()
+
+    const rendered = screen.getByTestId('composer-recommend-privacy').textContent ?? ''
+
+    expect(rendered).toMatch(/draft/i)
+    expect(rendered).toMatch(/type/i)
   })
 })
 

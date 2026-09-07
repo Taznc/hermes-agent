@@ -900,14 +900,167 @@ describe('useModelControls', () => {
 
       render(<Harness onReady={value => (controls = value)} requestGateway={requestGateway} />)
 
-      await expect(
-        controls.selectRecommendedModel({
+      const outcome = await controls.selectRecommendedModel({
+        effort: 'high',
+        model: 'claude-opus-5',
+        provider: 'anthropic',
+        sessionId: 'session-1'
+      })
+
+      expect(outcome.kind).toBe('confirmation_pending')
+    })
+
+    // A confirmation is a suspended decision, not a terminal answer. The
+    // recommendation surface has to be able to replace its "confirm the
+    // switch" guidance once the user answers, so the pending outcome carries
+    // the promise of its own resolution. These four tests pin every way that
+    // promise can settle.
+    describe('a pending confirmation settles', () => {
+      const pendingThenGateway = (...after: unknown[]) => {
+        const gateway = vi.fn().mockResolvedValueOnce({ confirm_message: 'Expensive model.', confirm_required: true })
+
+        for (const value of after) {
+          gateway.mockResolvedValueOnce(value)
+        }
+
+        return gateway.mockResolvedValue({ key: 'model' })
+      }
+
+      // Returns the settlement promise in a BOX. An `async` helper returning
+      // the promise bare would await it — this function must hand back a
+      // still-pending promise so the test can click Confirm first.
+      const confirmPending = async (controls: Controls) => {
+        const outcome = await controls.selectRecommendedModel({
           effort: 'high',
-          model: 'claude-opus-5',
-          provider: 'anthropic',
+          model: 'muse-spark-1.2',
+          provider: 'opencode-go',
           sessionId: 'session-1'
         })
-      ).resolves.toEqual({ kind: 'confirmation_pending' })
+
+        if (outcome.kind !== 'confirmation_pending') {
+          throw new Error(`expected confirmation_pending, got ${outcome.kind}`)
+        }
+
+        return { settled: outcome.settled }
+      }
+
+      const clickConfirm = async () => {
+        await act(async () => {
+          await notify.mock.calls.at(-1)?.[0]?.action?.onClick()
+        })
+      }
+
+      beforeEach(() => {
+        // `vi.restoreAllMocks()` does not clear a plain `vi.fn()`'s call
+        // history, and `notify.mock.calls.at(-1)` would otherwise pick up the
+        // notification an EARLIER test in this file created — clicking that
+        // confirm resolves someone else's switch and leaves this test's
+        // settlement promise pending forever.
+        notify.mockClear()
+        notifyError.mockClear()
+        dismissNotification.mockClear()
+
+        $activeSessionId.set('session-1')
+        setCurrentModel('fable-5')
+        setCurrentProvider('nous')
+        setCurrentReasoningEffort('low')
+      })
+
+      it('as applied once the confirmed resend and its effort both succeed', async () => {
+        const requestGateway = pendingThenGateway({ key: 'model' }, { key: 'reasoning' })
+        let controls!: Controls
+
+        render(<Harness onReady={value => (controls = value)} requestGateway={requestGateway} />)
+
+        const { settled } = await confirmPending(controls)
+
+        await clickConfirm()
+
+        await expect(settled).resolves.toEqual({ kind: 'applied' })
+        expect($currentModel.get()).toBe('muse-spark-1.2')
+      })
+
+      it('as failed when the confirmed resend is refused a second time', async () => {
+        const requestGateway = pendingThenGateway({ confirm_message: 'Expensive model.', confirm_required: true })
+        let controls!: Controls
+
+        render(<Harness onReady={value => (controls = value)} requestGateway={requestGateway} />)
+
+        const { settled } = await confirmPending(controls)
+
+        await clickConfirm()
+
+        await expect(settled).resolves.toEqual({ kind: 'failed', recovery: 'not_needed' })
+        // The switch never applied, so the previous model must still be painted.
+        expect($currentModel.get()).toBe('fable-5')
+      })
+
+      it('as failed/restored when the post-confirm effort write fails and is compensated', async () => {
+        const requestGateway = vi
+          .fn()
+          .mockResolvedValueOnce({ confirm_message: 'Expensive model.', confirm_required: true })
+          .mockResolvedValueOnce({ key: 'model' })
+          .mockRejectedValueOnce(new Error('reasoning refused'))
+          .mockResolvedValue({ key: 'model' })
+
+        let controls!: Controls
+
+        render(<Harness onReady={value => (controls = value)} requestGateway={requestGateway} />)
+
+        const { settled } = await confirmPending(controls)
+
+        await clickConfirm()
+
+        await expect(settled).resolves.toEqual({ kind: 'failed', recovery: 'restored' })
+        expect($currentModel.get()).toBe('fable-5')
+        expect($currentReasoningEffort.get()).toBe('low')
+      })
+
+      it('as failed/restore_failed when the compensation is refused too', async () => {
+        const requestGateway = vi
+          .fn()
+          .mockResolvedValueOnce({ confirm_message: 'Expensive model.', confirm_required: true })
+          .mockResolvedValueOnce({ key: 'model' })
+          .mockRejectedValueOnce(new Error('reasoning refused'))
+          .mockRejectedValue(new Error('restore refused'))
+
+        let controls!: Controls
+
+        render(<Harness onReady={value => (controls = value)} requestGateway={requestGateway} />)
+
+        const { settled } = await confirmPending(controls)
+
+        await clickConfirm()
+
+        await expect(settled).resolves.toEqual({ kind: 'failed', recovery: 'restore_failed' })
+        // Never paint a rollback the gateway refused: the accepted model stays
+        // visible at the PREVIOUS effort.
+        expect($currentModel.get()).toBe('muse-spark-1.2')
+        expect($currentReasoningEffort.get()).toBe('low')
+      })
+
+      it('as superseded when the user moved on before confirming', async () => {
+        const requestGateway = pendingThenGateway({ key: 'model' })
+        let controls!: Controls
+
+        render(<Harness onReady={value => (controls = value)} requestGateway={requestGateway} />)
+
+        const { settled } = await confirmPending(controls)
+
+        // The staleness guard's own condition: the live selection no longer
+        // matches the snapshot the confirmation was created for.
+        act(() => {
+          setCurrentModel('gpt-5.6-sol')
+          setCurrentProvider('openai-codex')
+        })
+
+        await clickConfirm()
+
+        await expect(settled).resolves.toEqual({ kind: 'superseded' })
+        expect(dismissNotification).toHaveBeenCalled()
+        // A superseded confirmation resends nothing.
+        expect(requestGateway).toHaveBeenCalledTimes(1)
+      })
     })
 
     it('applies effort to the PRIMARY composer, not through the tile delegate', async () => {
