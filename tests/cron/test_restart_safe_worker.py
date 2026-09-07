@@ -83,6 +83,10 @@ def test_restart_safe_gateway_child_fails_closed_without_scope(monkeypatch):
 
     monkeypatch.setattr(process_registry, "_is_supervised_gateway_process", lambda: True)
     monkeypatch.setenv("INVOCATION_ID", "managed-service")
+    # This test simulates IDENTITY. Neutralize the cgroup-placement input so the verdict
+    # is not decided by the test runner's own real cgroup (under CI-in-a-worker-scope it
+    # reads "already isolated" and would skip the wrap this test asserts).
+    monkeypatch.setattr(process_registry, "_scope_needed_by_cgroup_placement", lambda: None)
     monkeypatch.setattr(process_registry, "_systemd_run_user_scope_available", lambda: False)
 
     with pytest.raises(
@@ -559,6 +563,10 @@ def test_managed_gateway_restart_preserves_active_worker_and_single_side_effect(
         "from cron import scheduler\n"
         "from tools import process_registry\n"
         "process_registry._is_supervised_gateway_process = lambda: True\n"
+        # The harness simulates the gateway by IDENTITY; the subprocess's real cgroup is
+        # the test runner's, so neutralize placement or a runner already inside a worker
+        # scope reads "already isolated" and the worker never gets its own unit.
+        "process_registry._scope_needed_by_cgroup_placement = lambda: None\n"
         f"job = json.loads(pathlib.Path({str(payload)!r}).read_text())\n"
         "if not scheduler.run_one_job(job, adapters=None, loop=None):\n"
         "    raise SystemExit('worker was not isolated')\n"
