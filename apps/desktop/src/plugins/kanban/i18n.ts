@@ -57,6 +57,10 @@ type KanbanMessages = {
   assign: string
   unassignAction: string
   archive: string
+  archiveDone: string
+  archiveDoneConfirm: (count: number, scope: string) => string
+  archiveDonePartial: (archived: number, failed: number, skipped: number) => string
+  archiveDoneSuccess: (archived: number) => string
   clearSelection: string
   refused: string
   bulkFailed: (failed: number, total: number, err: string) => string
@@ -354,7 +358,10 @@ export const en: KanbanMessages = {
     scheduled: { label: 'Scheduled', help: 'Waiting for a scheduled time to arrive.' },
     ready: { label: 'Ready', help: 'Dependencies satisfied — assign a profile and the dispatcher runs it.' },
     running: { label: 'Running', help: 'Claimed by a worker — an agent is on it. Set by the dispatcher.' },
-    blocked: { label: 'Blocked', help: 'Needs a look — a worker\u2019s question, an automatic failure, or a reviewer with no verdict.' },
+    blocked: {
+      label: 'Blocked',
+      help: 'Needs a look — a worker\u2019s question, an automatic failure, or a reviewer with no verdict.'
+    },
     on_hold: { label: 'On Hold', help: 'Shelved by a human — drag back to Ready when you want it resumed.' },
     review: { label: 'Review', help: 'A review agent is checking the work. Set by the dispatcher.' },
     done: { label: 'Done', help: 'Completed; dependent children become ready.' },
@@ -402,6 +409,11 @@ export const en: KanbanMessages = {
   assign: 'Assign',
   unassignAction: 'Unassign',
   archive: 'Archive',
+  archiveDone: 'Archive Done',
+  archiveDoneConfirm: (count, scope) => `Archive ${count} completed card${count === 1 ? '' : 's'} from ${scope}?`,
+  archiveDonePartial: (archived, failed, skipped) =>
+    `${archived} completed card${archived === 1 ? '' : 's'} archived; ${failed} failed and ${skipped} skipped.`,
+  archiveDoneSuccess: archived => `${archived} completed card${archived === 1 ? '' : 's'} archived.`,
   clearSelection: 'Clear selection (Esc)',
   refused: 'refused',
   bulkFailed: (failed, total, err) => `${failed} of ${total} failed — ${err}. Failed cards stay selected.`,
@@ -536,7 +548,8 @@ export const en: KanbanMessages = {
   guideReview: 'A reviewer is checking the completed work — approve or send back above.',
   guideDone: 'Settled — completed, and any dependent cards are now unblocked.',
   guideBlockedGeneric: 'Needs your input — reply in comments, or unblock to send it back to the queue.',
-  guideBlockedManualCapability: 'A missing capability is blocking this — resolve it, then reassign or unblock to retry.',
+  guideBlockedManualCapability:
+    'A missing capability is blocking this — resolve it, then reassign or unblock to retry.',
   guideBlockedManualTransient: 'A transient failure blocked this — it may clear on its own; unblock to retry.',
   guideBlockedAutomatic: cause => `${cause} Inspect the worker log, then retry or reassign.`,
   guideBlockedReviewNoVerdict: 'The reviewer exited without a verdict. Requeue it for another review pass.',
@@ -730,6 +743,11 @@ const ja: KanbanMessages = {
   assign: '割り当て',
   unassignAction: '割り当て解除',
   archive: 'アーカイブ',
+  archiveDone: '完了をアーカイブ',
+  archiveDoneConfirm: (count, scope) => `${scope} の完了済みカード ${count} 件をアーカイブしますか？`,
+  archiveDonePartial: (archived, failed, skipped) =>
+    `完了済みカード ${archived} 件をアーカイブ、${failed} 件失敗、${skipped} 件スキップしました。`,
+  archiveDoneSuccess: archived => `完了済みカード ${archived} 件をアーカイブしました。`,
   clearSelection: '選択をクリア（Esc）',
   refused: '拒否されました',
   bulkFailed: (failed, total, err) => `${total} 件中 ${failed} 件が失敗 — ${err}。失敗したカードは選択されたままです。`,
@@ -833,7 +851,8 @@ const ja: KanbanMessages = {
   diagnosticsN: n => `診断・${n}`,
   ctaBlockedTitle: 'ブロック中 — 原因不明',
   ctaInitialBlockTitle: '作成時に意図的にブロックされました',
-  ctaBlockedNoReason: 'このブロックには原因が記録されていません。ワーカーログを確認するか、再割り当てして再試行してください。',
+  ctaBlockedNoReason:
+    'このブロックには原因が記録されていません。ワーカーログを確認するか、再割り当てして再試行してください。',
   ctaBlockedAutomaticTitle: 'ブロック中 — 自動的な失敗',
   ctaReviewNoVerdictTitle: 'レビュアーが判定なしで終了しました',
   ctaReviewNoVerdictBody:
@@ -859,13 +878,16 @@ const ja: KanbanMessages = {
   guideBlockLoop: reason => `同じ理由でブロックが繰り返され、判断のためにここへ転送されました: ${reason}`,
   guideScheduled: '予定時刻の到来を待っています。',
   guideRunning: 'エージェントが現在作業中です — 待つ以外にすることはありません。',
-  guideRunningStale: '2分以上ハートビートがありません — まもなくディスパッチャが再取得します。待つか、今すぐ再取得してください。',
+  guideRunningStale:
+    '2分以上ハートビートがありません — まもなくディスパッチャが再取得します。待つか、今すぐ再取得してください。',
   guideOnHold: '人によって保留にされました。再開したいときは Ready にドラッグしてください。',
   guideReview: 'レビュアーが完了した作業を確認中です — 上で承認するか差し戻してください。',
   guideDone: '解決済み — 完了しており、依存する子カードはブロック解除されています。',
   guideBlockedGeneric: 'あなたの対応が必要です — コメントで返信するか、ブロック解除してキューに戻してください。',
-  guideBlockedManualCapability: '不足している機能がブロックの原因です — 解消してから、再割り当てするかブロック解除して再試行してください。',
-  guideBlockedManualTransient: '一時的な失敗によりブロックされました — 自然に解消することがあります。ブロック解除して再試行してください。',
+  guideBlockedManualCapability:
+    '不足している機能がブロックの原因です — 解消してから、再割り当てするかブロック解除して再試行してください。',
+  guideBlockedManualTransient:
+    '一時的な失敗によりブロックされました — 自然に解消することがあります。ブロック解除して再試行してください。',
   guideBlockedAutomatic: cause => `${cause} ワーカーログを確認し、再試行するか再割り当てしてください。`,
   guideBlockedReviewNoVerdict: 'レビュアーが判定なしで終了しました。もう一度レビューへ再キューしてください。',
   guideBlockedUnknown: 'ワーカーログを確認し、再試行するか再割り当てしてください。',
@@ -1057,6 +1079,11 @@ const zh: KanbanMessages = {
   assign: '分配',
   unassignAction: '取消分配',
   archive: '归档',
+  archiveDone: '归档已完成',
+  archiveDoneConfirm: (count, scope) => `要归档 ${scope} 中的 ${count} 个已完成卡片吗？`,
+  archiveDonePartial: (archived, failed, skipped) =>
+    `已归档 ${archived} 个已完成卡片；${failed} 个失败，${skipped} 个跳过。`,
+  archiveDoneSuccess: archived => `已归档 ${archived} 个已完成卡片。`,
   clearSelection: '清除选择（Esc）',
   refused: '被拒绝',
   bulkFailed: (failed, total, err) => `${total} 个中有 ${failed} 个失败 — ${err}。失败的卡片仍保持选中。`,
@@ -1162,7 +1189,8 @@ const zh: KanbanMessages = {
   ctaBlockedNoReason: '此次受阻没有记录原因。请查看工作单元日志，或重新分配以重试。',
   ctaBlockedAutomaticTitle: '受阻 — 自动失败',
   ctaReviewNoVerdictTitle: '审查者退出时没有给出结论',
-  ctaReviewNoVerdictBody: '审查者的运行结束时既未批准、也未请求修改或升级 — 这是一个中立的结果，不代表工作本身失败。请重新排队进行另一轮审查。',
+  ctaReviewNoVerdictBody:
+    '审查者的运行结束时既未批准、也未请求修改或升级 — 这是一个中立的结果，不代表工作本身失败。请重新排队进行另一轮审查。',
   ctaRequeueReview: '重新排队审查',
   ctaRetry: '重试（解除阻塞）',
   ctaCopyLogCommand: '复制日志命令',
@@ -1380,6 +1408,11 @@ const zhHant: KanbanMessages = {
   assign: '指派',
   unassignAction: '取消指派',
   archive: '封存',
+  archiveDone: '封存已完成',
+  archiveDoneConfirm: (count, scope) => `要封存 ${scope} 中的 ${count} 個已完成卡片嗎？`,
+  archiveDonePartial: (archived, failed, skipped) =>
+    `已封存 ${archived} 個已完成卡片；${failed} 個失敗，${skipped} 個略過。`,
+  archiveDoneSuccess: archived => `已封存 ${archived} 個已完成卡片。`,
   clearSelection: '清除選取（Esc）',
   refused: '被拒絕',
   bulkFailed: (failed, total, err) => `${total} 個中有 ${failed} 個失敗 — ${err}。失敗的卡片仍保持選取。`,
@@ -1485,7 +1518,8 @@ const zhHant: KanbanMessages = {
   ctaBlockedNoReason: '此次受阻沒有記錄原因。請查看工作單元日誌，或重新指派以重試。',
   ctaBlockedAutomaticTitle: '受阻 — 自動失敗',
   ctaReviewNoVerdictTitle: '審查者結束時沒有給出結論',
-  ctaReviewNoVerdictBody: '審查者的執行結束時既未核准、也未請求修改或升級 — 這是一個中立的結果，不代表工作本身失敗。請重新排隊進行另一輪審查。',
+  ctaReviewNoVerdictBody:
+    '審查者的執行結束時既未核准、也未請求修改或升級 — 這是一個中立的結果，不代表工作本身失敗。請重新排隊進行另一輪審查。',
   ctaRequeueReview: '重新排隊審查',
   ctaRetry: '重試（解除封鎖）',
   ctaCopyLogCommand: '複製日誌指令',

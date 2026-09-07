@@ -38,6 +38,7 @@ import { orderProjectsByIds, sortProjectsForOverview } from '@/app/chat/sidebar/
 import {
   excludeProjectSessions,
   liveSessionProjectId,
+  NO_PROJECT_ID,
   sessionRecency,
   type SidebarProjectTree
 } from '@/app/chat/sidebar/projects/workspace-groups'
@@ -308,7 +309,14 @@ export const $sidebarProjectModel = computed(
               // through `translateNow` here matches the existing pattern in
               // store/projects.ts (`projectsStaleBackendError`) for a store
               // module needing a translated string outside a component.
-              label: project.isNoProject ? translateNow('sidebar.projects.home') : project.label,
+              // In all-profiles mode a foreign profile's Home arrives already
+              // labelled "Home · <profile>" and keyed to a scoped id — keep
+              // that label, or every bucket collapses to one indistinguishable
+              // "Home" row again.
+              label:
+                project.isNoProject && project.id === NO_PROJECT_ID
+                  ? translateNow('sidebar.projects.home')
+                  : project.label,
               repos: orderRepos(project.repos, workspaceParentOrderIds, workspaceOrderIds)
             },
             isHiddenFromProjects

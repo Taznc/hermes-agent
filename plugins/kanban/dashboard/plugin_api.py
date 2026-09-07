@@ -474,6 +474,79 @@ def get_all_boards(
         "link_edges": link_edges, "cursors": cursors, "errors": errors, "now": int(time.time())}
 
 
+# --- Completed-card archive -------------------------------------------------
+
+def _archive_done_scope(board: Optional[str], boards: Optional[str]) -> tuple[dict[str, Any], list[str]]:
+    """Resolve the dashboard's existing board scope forms for archive-done.
+
+    A concrete ``board`` keeps the operation on exactly one board. The Desktop
+    aggregate uses ``/board/all`` and its sibling fan-out representation
+    ``boards=*``; accepting that exact form here avoids inventing another
+    aggregate sentinel while making the cross-board effect explicit.
+    """
+    if board is not None and boards is not None:
+        raise HTTPException(status_code=400, detail="pass either board or boards, not both")
+    if boards is not None:
+        if boards.strip() != "*":
+            raise HTTPException(status_code=400, detail="archive-done aggregate scope requires boards=*")
+        slugs = [meta["slug"] for meta in kanban_db.list_boards(include_archived=False)]
+        return {"kind": "all_boards", "label": "All Boards"}, slugs
+
+    slug = _resolve_board(board) or kanban_db.get_current_board()
+    meta = next((item for item in kanban_db.list_boards(include_archived=False) if item["slug"] == slug), None)
+    return {"kind": "board", "board": slug, "label": (meta or {}).get("name") or slug}, [slug]
+
+
+def _done_task_count(slugs: list[str]) -> int:
+    total = 0
+    for slug in slugs:
+        with closing(_conn(board=slug)) as conn:
+            total += int(conn.execute("SELECT COUNT(*) AS n FROM tasks WHERE status = 'done'").fetchone()["n"])
+    return total
+
+
+@router.get("/tasks/archive-done/preflight")
+def archive_done_preflight(board: Optional[str] = _BOARD_Q, boards: Optional[str] = Query(None)):
+    """Count completed cards for the selected board or explicit ``boards=*`` aggregate."""
+    scope, slugs = _archive_done_scope(board, boards)
+    return {"scope": scope, "done_count": _done_task_count(slugs)}
+
+
+@router.post("/tasks/archive-done")
+def archive_done_tasks(board: Optional[str] = _BOARD_Q, boards: Optional[str] = Query(None)):
+    """Archive cards that are still ``done`` when each per-card write executes.
+
+    Each card delegates to :func:`kanban_db.archive_task` so the established
+    archive event, run cleanup, descendant recomputation, and workspace cleanup
+    semantics remain intact. Failures are isolated to their card and returned
+    for a partial-result toast rather than rolling back successful archives.
+    """
+    scope, slugs = _archive_done_scope(board, boards)
+    archived_count = skipped_count = 0
+    failures: list[dict[str, str]] = []
+    candidate_count = 0
+    for slug in slugs:
+        with closing(_conn(board=slug)) as conn:
+            task_ids = [row["id"] for row in conn.execute("SELECT id FROM tasks WHERE status = 'done'").fetchall()]
+            candidate_count += len(task_ids)
+            for task_id in task_ids:
+                try:
+                    if kanban_db.archive_task(conn, task_id, expected_status="done"):
+                        archived_count += 1
+                    else:
+                        skipped_count += 1
+                except Exception as exc:
+                    failures.append({"board": slug, "task_id": task_id, "error": str(exc)})
+    return {
+        "scope": scope,
+        "boards": slugs,
+        "candidate_count": candidate_count,
+        "archived_count": archived_count,
+        "skipped_count": skipped_count,
+        "failures": failures,
+    }
+
+
 # --- GET /tasks/:id ---------------------------------------------------------
 
 @router.get("/tasks/{task_id}")
@@ -962,18 +1035,21 @@ def delete_task(task_id: str, board: Optional[str] = Query(None)):
 
 
 def _parents_blocking_ready(conn: sqlite3.Connection, task_id: str) -> list:
-    """Parent rows (id, title, status) not ``done`` that block promotion to ``ready``.
+    """Unsatisfied parent rows that block promotion to ``ready``.
 
     Used to enrich the 409 response from :func:`update_task` so the dashboard can show an actionable toast
     (#26744) instead of a silent no-op. Returns ``[]`` when nothing blocks the transition (e.g. no parents,
-    or all parents already done).
+    or all parents have satisfied their dependency edges).
     """
     rows = conn.execute(
-        "SELECT t.id, t.title, t.status FROM tasks t "
+        "SELECT t.id, t.title, t.status, t.completed_at FROM tasks t "
         "JOIN task_links l ON l.parent_id = t.id "
-        "WHERE l.child_id = ? AND t.status != 'done'",
+        "WHERE l.child_id = ?",
         (task_id,)).fetchall()
-    return [{"id": r["id"], "title": r["title"], "status": r["status"]} for r in rows]
+    return [
+        {"id": r["id"], "title": r["title"], "status": r["status"]}
+        for r in rows if not kanban_db._parent_dependency_satisfied(r)
+    ]
 
 
 def _set_status_direct(conn: sqlite3.Connection, task_id: str, new_status: str) -> bool:
@@ -1003,6 +1079,7 @@ def _set_status_direct(conn: sqlite3.Connection, task_id: str, new_status: str) 
         reopening_satisfied_parent = prev["status"] in {"done", "archived"} and effective_status not in {"done", "archived"}
         cur = conn.execute(
             "UPDATE tasks SET status = ?, "
+            "  completed_at = CASE WHEN ? IN ('done', 'archived') THEN completed_at ELSE NULL END, "
             "  claim_lock = CASE WHEN ? = 'running' THEN claim_lock ELSE NULL END, "
             "  claim_expires = CASE WHEN ? = 'running' THEN claim_expires ELSE NULL END, "
             "  worker_pid = CASE WHEN ? = 'running' THEN worker_pid ELSE NULL END "
@@ -1010,7 +1087,7 @@ def _set_status_direct(conn: sqlite3.Connection, task_id: str, new_status: str) 
             # point, but the WHERE clause independently blocks the CAS if that check is ever
             # bypassed or refactored around.
             "WHERE id = ? AND status != 'archived'",
-            (effective_status,) * 4 + (task_id,))
+            (effective_status,) * 5 + (task_id,))
         if cur.rowcount != 1:
             return False
         run_id = None
@@ -1597,7 +1674,11 @@ def dispatch(dry_run: bool = Query(False), max_n: int = Query(8, alias="max"), b
             board=board,
         )
         try:
-            return asdict(result)  # DispatchResult is a dataclass
+            payload = asdict(result)  # DispatchResult is a dataclass
+            pause = payload.get("dispatch_paused")
+            if isinstance(pause, dict):
+                payload["dispatch_status"] = kbd.dispatch_pause_message(pause, board=board)
+            return payload
         except TypeError:
             return {"result": str(result)}
 
@@ -1884,6 +1965,7 @@ def list_profile_roster():
         profiles = profiles_mod.list_profiles()
     return {"profiles": [
         {"name": p.name, "is_default": bool(p.is_default), "model": p.model or "", "provider": p.provider or "",
+         "reasoning_effort": p.reasoning_effort or "",
          "description": p.description or "", "description_auto": bool(p.description_auto),
          "skill_count": int(p.skill_count or 0)}
         for p in profiles]}

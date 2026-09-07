@@ -23,6 +23,7 @@ from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
 from hermes_cli import kanban_db as kb
+from hermes_cli import kanban_db_connect as kbc
 
 
 # A minimal valid 1x1 PNG (transparent pixel) — real magic bytes, not just a
@@ -118,7 +119,7 @@ def test_delete_staged_attachment(kanban_home):
 
 
 def test_promote_staged_attachments_roundtrip(kanban_home):
-    conn = kb.connect()
+    conn = kbc.connect()
     try:
         task_id = kb.create_task(conn, title="paste test")
         staged = kb.stage_attachment_bytes(
@@ -156,7 +157,7 @@ def test_promote_staged_attachments_roundtrip(kanban_home):
 
 
 def test_promote_staged_attachments_unknown_token_warns(kanban_home):
-    conn = kb.connect()
+    conn = kbc.connect()
     try:
         task_id = kb.create_task(conn, title="paste test")
         promoted, warnings = kb.promote_staged_attachments(
@@ -172,7 +173,7 @@ def test_promote_staged_attachments_unknown_token_warns(kanban_home):
 
 
 def test_promote_staged_attachments_caps_per_task(kanban_home):
-    conn = kb.connect()
+    conn = kbc.connect()
     try:
         task_id = kb.create_task(conn, title="paste test")
         tokens = [
@@ -199,7 +200,7 @@ def test_reap_staged_attachments_removes_old_rows(kanban_home):
     assert blob.exists()
 
     # Backdate the row so it looks abandoned past the TTL.
-    conn = kb.connect()
+    conn = kbc.connect()
     try:
         with kb.write_txn(conn):
             conn.execute(

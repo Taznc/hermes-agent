@@ -497,6 +497,8 @@ export interface UpstreamTranslations {
       toursDesc: string
       composerPopoutTitle: string
       composerPopoutDesc: string
+      requireModifierToOpenLinksTitle: string
+      requireModifierToOpenLinksDesc: string
       vibeHeartsTitle: string
       vibeHeartsDesc: string
       embedsTitle: string
@@ -2951,6 +2953,10 @@ export interface UpstreamTranslations {
       openExternal: string
       copyUrl: string
       copyResolvedUrl: string
+    }
+    file: {
+      openPreview: string
+      openDefaultApp: string
     }
     image: {
       copyImage: string

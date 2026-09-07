@@ -307,6 +307,36 @@ def test_block_happy_path(worker_env):
         conn.close()
 
 
+def test_block_rejects_wall_of_text_reason(worker_env):
+    """A block reason is a board card, not a log file: prose beyond the cap is
+    rejected with guidance to move diagnosis into kanban_comment."""
+    from tools import kanban_tools as kt
+    wall = "Deployment detail sentence. " * 60  # far past the prose cap
+    d = json.loads(kt._handle_block({"reason": wall}))
+    assert "error" in d
+    assert "kanban_comment" in d["error"]
+    # The task must NOT have been blocked.
+    from hermes_cli import kanban_db as kb
+    from hermes_cli import kanban_db_connect as kbc
+    conn = kbc.connect()
+    try:
+        assert kb.get_task(conn, worker_env).status != "blocked"
+    finally:
+        conn.close()
+
+
+def test_block_reason_fences_do_not_count_toward_prose_cap(worker_env):
+    """```cmd / ```choices fences are the structured payloads the UI wants —
+    a long command or option set must never trip the brevity gate."""
+    from tools import kanban_tools as kt
+    reason = (
+        "Restart the service to unblock me.\n"
+        "```cmd\n" + ("x" * 900) + "\n```"
+    )
+    d = json.loads(kt._handle_block({"reason": reason}))
+    assert d.get("ok") is True
+
+
 def _make_goal_mode_worker_env(monkeypatch, tmp_path):
     """Set up an isolated HERMES_HOME with one claimed goal_mode task,
     matching the pattern used by the kanban_complete judge gate tests."""
@@ -1257,9 +1287,10 @@ def review_claim_env(monkeypatch, tmp_path):
     monkeypatch.setattr(_Path, "home", lambda: tmp_path)
 
     from hermes_cli import kanban_db as kb
+    from hermes_cli import kanban_db_connect as kbc
     kb._INITIALIZED_PATHS.clear()
     kb.init_db()
-    conn = kb.connect()
+    conn = kbc.connect()
     try:
         tid = kb.create_task(conn, title="reviewer-escalation-test", assignee="builder")
         implementation = kb.claim_task(conn, tid, claimer="builder:1")
@@ -1283,6 +1314,7 @@ def test_reviewer_escalates_via_real_kanban_block_tool(review_claim_env):
     is a legal terminal action, distinct from an implementer's block."""
     from tools import kanban_tools as kt
     from hermes_cli import kanban_db as kb
+    from hermes_cli import kanban_db_connect as kbc
 
     out = kt._handle_block({
         "reason": "needs_input: maintainer decision required",
@@ -1292,7 +1324,7 @@ def test_reviewer_escalates_via_real_kanban_block_tool(review_claim_env):
     assert d["ok"] is True
     assert d["status"] == "blocked"
 
-    conn = kb.connect()
+    conn = kbc.connect()
     try:
         blocked = kb.get_task(conn, review_claim_env)
         assert blocked is not None

@@ -106,7 +106,7 @@ They coexist: a kanban worker may call `delegate_task` internally during its run
   - `scratch` (default) — fresh tmp dir under `~/.hermes/kanban/workspaces/<id>/` (or `~/.hermes/kanban/boards/<slug>/workspaces/<id>/` on non-default boards). **Deleted when the task completes** — scratch is ephemeral by design. Files explicitly declared through `kanban_complete(artifacts=[...])` are copied into durable per-task attachment storage before cleanup; existing deliverable paths in legacy completion summaries receive the same treatment. Other scratch files are removed. A missing declared scratch artifact keeps the task in-flight so the worker can correct the path and retry. Use `worktree:` or `dir:<path>` when the whole workspace should remain available. The first time a scratch workspace is created on an install, the dispatcher logs a warning and emits a `tip_scratch_workspace` event on the task (visible via `hermes kanban show <id>`).
   - `dir:<path>` — an existing shared directory (Obsidian vault, mail ops dir, per-account folder). **Must be an absolute path.** Relative paths like `dir:../tenants/foo/` are rejected at dispatch because they'd resolve against whatever CWD the dispatcher happens to be in, which is ambiguous and a confused-deputy escape vector. The path is otherwise trusted — it's your box, your filesystem, the worker runs with your uid. This is the trusted-local-user threat model; kanban is single-host by design. **Preserved on completion.**
   - `worktree` — a git worktree under `.worktrees/<id>/` for coding tasks. Use `worktree:<path>` to pin the exact target path. Worker-side `git worktree add` creates it, using `--branch` when provided. **Preserved on completion.**
-- **Dispatcher** — a long-lived loop that, every N seconds (default 60): reclaims stale claims, reclaims crashed workers (PID gone but TTL not yet expired), promotes ready tasks, atomically claims, spawns assigned profiles. Runs **inside the gateway** by default (`kanban.dispatch_in_gateway: true`). One dispatcher sweeps all boards per tick; workers are spawned with `HERMES_KANBAN_BOARD` pinned so they can't see other boards. After `kanban.failure_limit` consecutive spawn failures on the same task (default: 2) the dispatcher auto-blocks it with the last error as the reason — prevents thrashing on tasks whose profile doesn't exist, workspace can't mount, etc.
+- **Dispatcher** — a long-lived loop that, every N seconds (default 60): reclaims stale claims, reclaims crashed workers (PID gone but TTL not yet expired), promotes ready tasks, atomically claims, spawns assigned profiles. Runs **inside the gateway** by default (`kanban.dispatch_in_gateway: true`). One dispatcher sweeps all boards per tick; workers are spawned with `HERMES_KANBAN_BOARD` pinned so they can't see other boards. After `kanban.failure_limit` consecutive spawn failures on the same task (default: 2) the dispatcher auto-blocks it with the last error as the reason — prevents thrashing on tasks whose profile doesn't exist, workspace can't mount, etc. Deaths classified as infra (external SIGTERM/SIGKILL, a startup-window dead PID, or a provider quota/429 signature) do NOT tick this counter directly — see `docs/kanban/infra-failure-classification.md` for the exact signal allowlist, the bounded `kanban.max_infra_interruptions` streak that still eventually counts a repeatedly-interrupted task, and `kanban.provider_backoff`/`kanban.provider_backoff_max_seconds` for provider-wide quota parking.
 - **Tenant** — optional string namespace *within* a board. One specialist fleet can serve multiple businesses (`--tenant business-a`) with data isolation by workspace path and memory key prefix. Tenants are a soft filter; boards are the hard isolation boundary.
 
 ## Boards (multi-project)
@@ -283,14 +283,55 @@ kanban:
                                                # two changes-requested cycles
 ```
 
-`dispatch_start_budget` is a sticky safety circuit, not a concurrency cap. The
-dispatcher counts real `spawned` events independently for each board. When a
-board reaches the configured limit—or a task with a completed/archived terminal
-event appears dispatchable without a later explicit unarchive—the board stops
-starting workers while reclaim and promotion bookkeeping continue. Inspect it
-with `hermes kanban --board <slug> dispatch --circuit-status`; after investigating
-or waiting out the window, resume explicitly with `hermes kanban --board <slug>
-dispatch --resume-circuit`. Configuration is hot-reloaded by the gateway.
+`dispatch_start_budget` is a rolling per-board start rate limit, not a
+concurrency cap or a manual circuit. The dispatcher counts real `spawned`
+events independently for each board and defers new workers after the configured
+limit. Its durable cooldown status reports `rate limited until <time>`; on the
+next gateway, CLI, or dashboard dispatch tick after the recorded start whose
+expiry restores capacity leaves the window, the status clears and exactly the
+available capacity starts automatically. This remains exact if a hot reload
+lowers the budget or expands the window. Configuration is hot-reloaded by the
+gateway.
+
+A completed/archived terminal event that appears dispatchable without a later
+explicit unarchive, or an unreadable pause-state file, is instead a safety
+pause. Those states report `manual intervention required` and remain stopped
+until `hermes kanban --board <slug> dispatch --resume-circuit` after the
+operator repairs or investigates the condition.
+
+#### Shared launcher prerequisite outage
+
+A failed restart-safe user-scope availability probe raises the structured
+`RestartSafeScopeUnavailable` error (`systemd_user_scope_unavailable`). This
+pauses the affected board immediately: ready and review cards keep their status
+and failure budgets, and the triggering run closes as `spawn_deferred`, not a
+task failure. Ordinary credential, configuration, or workspace errors still use
+the normal per-task retry policy; matching error text alone does not trip this
+circuit.
+
+The pause survives dispatcher restarts. Normally it is an atomic JSON sentinel
+beside the board database; if that write fails but SQLite is writable, a
+board-owned SQLite record keeps the pause authoritative. Deleting the triggering
+task or its history does not clear that fallback. Unreadable pause state also
+fails closed. Inspect the reason, fault code, time, and recovery action with:
+
+```bash
+hermes kanban --board <slug> dispatch --circuit-status
+```
+
+Repair the user-scope prerequisite and any reported pause-storage failure, then
+explicitly clear the circuit:
+
+```bash
+hermes kanban --board <slug> dispatch --resume-circuit
+```
+
+Resume clears both stores under the dispatch lock; if a tick owns the lock,
+resume refuses and must be retried. There is no timed auto-resume. If the
+prerequisite is still broken, the next attempt trips the board again before
+siblings are launched. If both JSON and SQLite persistence fail, the current
+tick stops, but durable recovery and task reconciliation cannot be guaranteed
+until storage is repaired.
 
 `review_rework_escalation_profile` breaks pathological implementation/review
 loops without removing review: the first changes request returns to the original
@@ -1423,10 +1464,11 @@ Every transition appends a row to `task_events`. Each row carries an optional `r
 | `heartbeat` | `{note?}` | Worker called `hermes kanban heartbeat $TASK` to signal liveness during long operations. |
 | `reclaimed` | `{stale_lock}` | Claim TTL expired without a completion; task goes back to `ready`. |
 | `crashed` | `{pid, claimer}` | Worker PID no longer alive but TTL hadn't expired yet. |
-| `timed_out` | `{pid, elapsed_seconds, limit_seconds, sigkill}` | `max_runtime_seconds` exceeded; dispatcher SIGTERM'd (then SIGKILL'd after 5 s grace) and re-queued. |
+| `interrupted` | `{pid, claimer, reason, quota_retry_after_seconds?}` | Worker died for a reason classified as infra rather than a task fault: an external SIGTERM/SIGKILL the dispatcher did not send (`reason: external_signal`), a dead PID discovered inside the dispatcher's own startup window right after a gateway restart (`reason: startup_window`), or a provider 429/quota signature in the worker log (`reason: quota`). Does NOT tick `consecutive_failures` — bumps a separate persistent per-task interruption streak instead (`kanban.max_infra_interruptions`, default 3); once that streak is exceeded the SAME kind of death is instead recorded as an ordinary `crashed` and does count. `kanban.count_infra_failures: true` disables this classification entirely (every such death always counts). See `docs/kanban/infra-failure-classification.md`. |
+| `timed_out` | `{pid, elapsed_seconds, limit_seconds, sigkill}` | `max_runtime_seconds` exceeded; dispatcher SIGTERM'd (then SIGKILL'd after 5 s grace) and re-queued. This remains a counted failure even though SIGTERM/SIGKILL are the same signals `interrupted` treats as infra elsewhere — the dispatcher persists a durable kill-intent record before signalling so its own kill is never misclassified as external, even across a dispatcher restart between the signal and the reap. |
 | `stale` | `{elapsed_seconds, last_heartbeat_at, heartbeat_age_seconds, timeout_seconds, pid, terminated}` | Task ran longer than `kanban.dispatch_stale_timeout_seconds` (default 4 h) AND no `kanban_heartbeat` arrived in the last hour. Dispatcher SIGTERM'd the host-local worker (if any), reset the task to `ready` for re-dispatch. Does NOT tick the failure counter (stale is dispatcher-side absence detection, not a worker fault). Workers running long operations should call `kanban_heartbeat` at least once an hour to avoid this. |
 | `reconciled` | `{reason, claim_lock, claim_expires, worker_pid}` | Orphaned-card reconciliation: the card was `running` with broken claim bookkeeping (`claim_lock` or `claim_expires` NULL — crash mid-claim, manual SQL, DB restore) and no live worker, so none of the TTL/crash/stale paths could ever recover it. The dispatcher requeued it to `ready` with an explanatory comment. Gated by `kanban.reconcile_orphans` in config.yaml (default `true`). |
-| `respawn_guarded` | `{reason}` | Dispatcher refused to re-spawn this ready task this tick. Reasons: `blocker_auth` (last failure was a quota/auth/429 error — wait for the rate window to reset), `recent_success` (a completed run happened in the last hour — wait for review before re-running), `active_pr` (a GitHub PR URL appears in a recent comment — a prior worker already opened a PR). The task stays in `ready`; the next tick gets another chance to spawn. If the underlying condition persists, the normal `consecutive_failures` circuit breaker will auto-block via `gave_up` after `failure_limit` failures. |
+| `respawn_guarded` | `{reason}` | Dispatcher refused to re-spawn this ready task this tick. Reasons: `blocker_auth` (last failure was a quota/auth/429 error — wait for the rate window to reset), `recent_success` (a completed run happened in the last hour — wait for review before re-running), `active_pr` (a GitHub PR URL appears in a recent comment — a prior worker already opened a PR), `provider_backoff` (the task's provider is parked after a quota/429 death elsewhere — see `kanban.provider_backoff`/`kanban.provider_backoff_max_seconds`; `provider: auto` tasks are never guarded by this reason since auto-routing can pick another provider). The task stays in `ready`; the next tick gets another chance to spawn. If the underlying condition persists, the normal `consecutive_failures` circuit breaker will auto-block via `gave_up` after `failure_limit` failures. |
 | `spawn_failed` | `{error, failures}` | One spawn attempt failed (missing PATH, workspace unmountable, …). Counter increments; task returns to `ready` for retry. |
 | `protocol_violation` | `{pid, claimer, exit_code, protocol_violation}` | Worker exited successfully while the task was still `running`, usually because it answered without calling `kanban_complete` or `kanban_block`. Emitted on every violation (the payload's `protocol_violation: true` marker is copied into the run metadata and feeds the violation-only retry budget). Below the budget — up to `_PROTOCOL_VIOLATION_FAILURE_LIMIT` (default 3) *consecutive* violations, per-task `max_retries` overriding — the task simply returns to `ready` for another attempt; when the streak reaches the bound the dispatcher also emits `gave_up` and auto-blocks. |
 | `gave_up` | `{failures, effective_limit, limit_source, error}` | Circuit breaker fired after N consecutive non-successful attempts. Task auto-blocks with the last error. The effective limit resolves as task `max_retries`, then dispatcher `failure_limit` / `kanban.failure_limit`, then the built-in default. |

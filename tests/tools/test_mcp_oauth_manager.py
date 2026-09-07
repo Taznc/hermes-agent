@@ -62,6 +62,38 @@ def test_manager_restore_entry_preserves_newer_concurrent_entry(tmp_path, monkey
     assert manager.get_or_build_provider("shared", "https://new.example", {}) is new_provider
     assert new_provider is not old_provider
 
+
+def test_manager_rebuilds_same_url_provider_when_oauth_config_changes(tmp_path, monkeypatch):
+    """A config-change reconnect must not retain the old client metadata."""
+    from types import SimpleNamespace
+
+    from tools.mcp_oauth_manager import MCPOAuthManager
+
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    manager = MCPOAuthManager()
+    builds = []
+
+    def build(server_name, entry):
+        provider = SimpleNamespace()
+        builds.append((server_name, entry.oauth_config, provider))
+        return provider
+
+    monkeypatch.setattr(manager, "_build_provider", build)
+    old_config = {"client_id": "old-client", "scopes": ["read"]}
+    first = manager.get_or_build_provider("srv", "https://mcp.example/mcp", old_config)
+    unchanged = manager.get_or_build_provider("srv", "https://mcp.example/mcp", dict(old_config))
+    new_config = {"client_id": "new-client", "scopes": ["read", "write"]}
+    replaced = manager.get_or_build_provider("srv", "https://mcp.example/mcp", new_config)
+
+    assert unchanged is first
+    assert replaced is not first
+    assert [(name, config) for name, config, _ in builds] == [
+        ("srv", old_config),
+        ("srv", new_config),
+    ]
+    assert manager._entries[manager._key("srv")].oauth_config == new_config
+
+
 pytest.importorskip(
     "mcp.client.auth.oauth2",
     reason="MCP SDK 1.26.0+ required for OAuth support",
@@ -365,6 +397,33 @@ def test_bridge_forwards_requests_and_poisons_on_token_endpoint_400(
     assert not (d / "srv.client.json").exists()
     assert provider._initialized is False
     assert provider.context.client_info is None
+
+
+@pytest.mark.asyncio
+async def test_cross_task_close_of_pending_auth_flow_has_no_lock_owner_error(tmp_path, monkeypatch):
+    """Closing a pending SDK auth flow from a different task must finish cleanly.
+
+    HTTPX may finalize an abandoned auth generator outside the task that drove
+    its request. The provider uses a semaphore for the SDK's context lock so
+    cleanup preserves mutual exclusion without AnyIO's task-owner requirement.
+    """
+    from mcp.client.auth.oauth2 import OAuthClientProvider
+
+    async def fake_base_flow(self, request):
+        async with self.context.lock:
+            yield request
+
+    monkeypatch.setattr(OAuthClientProvider, "async_auth_flow", fake_base_flow)
+    provider = _provider_with_token_endpoint(
+        tmp_path, {}, "https://idp.example.com/oauth/token", monkeypatch
+    )
+    assert provider is not None
+    flow = provider.async_auth_flow(object())
+    await flow.__anext__()
+
+    await asyncio.wait_for(asyncio.create_task(flow.aclose()), timeout=1)
+
+
 @pytest.mark.asyncio
 async def test_manager_provider_token_exchange_includes_dcr_secret(tmp_path, monkeypatch):
     """The manager provider path applies the same Supabase DCR secret fix."""

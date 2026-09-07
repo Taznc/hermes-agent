@@ -45,6 +45,13 @@ export function isDesktopFsRemoteMode() {
   return $connection.get()?.mode === 'remote'
 }
 
+/** Native file verbs require both a local backend and Electron's file-manager bridge.
+ * The web desktop can preview and copy gateway paths, but cannot reveal a path or
+ * hand it to the OS default application on the user's machine. */
+export function canUseNativeFileActions() {
+  return !isDesktopFsRemoteMode() && typeof window.hermesDesktop?.revealPath === 'function'
+}
+
 // Active profile for FS/git REST calls. Without it the Electron api bridge
 // hits the primary (local) backend even when the user switched to a remote profile.
 export function desktopFsProfile(): string | undefined {

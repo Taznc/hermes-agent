@@ -225,7 +225,7 @@ def test_connect_migrates_legacy_task_comments_adds_choice_json(tmp_path):
     conn.commit()
     conn.close()
 
-    with kb.connect(db_path) as migrated:
+    with kbc.connect(db_path) as migrated:
         comment_columns = {
             row["name"] for row in migrated.execute("PRAGMA table_info(task_comments)")
         }
@@ -279,7 +279,7 @@ def test_create_task_defaults_to_normal_priority_and_not_on_hold(kanban_home):
     """New tasks must default to non-held, normal (0) priority — existing
     board data (and every other create_task caller) must not have to
     special-case the new fields."""
-    with kb.connect() as conn:
+    with kbc.connect() as conn:
         t = kb.create_task(conn, title="freshly created", assignee="ops")
         task = kb.get_task(conn, t)
         assert task.priority == 0
@@ -287,7 +287,7 @@ def test_create_task_defaults_to_normal_priority_and_not_on_hold(kanban_home):
 
 
 def test_hold_task_shelves_and_is_not_dispatchable(kanban_home):
-    with kb.connect() as conn:
+    with kbc.connect() as conn:
         t = kb.create_task(conn, title="shelve me", assignee="ops")
         assert kb.hold_task(conn, t, reason="waiting on budget approval") is True
         task = kb.get_task(conn, t)
@@ -306,7 +306,7 @@ def test_hold_task_shelves_and_is_not_dispatchable(kanban_home):
 def test_hold_task_closes_active_run(kanban_home):
     """Holding a running task must close its active run so attempt history
     isn't orphaned, mirroring schedule_task's run-closing behaviour."""
-    with kb.connect() as conn:
+    with kbc.connect() as conn:
         t = kb.create_task(conn, title="running then held", assignee="worker")
         kb.claim_task(conn, t)
         run_id = kb.get_task(conn, t).current_run_id
@@ -322,7 +322,7 @@ def test_hold_task_closes_active_run(kanban_home):
 
 
 def test_unhold_task_returns_to_ready_when_parents_done(kanban_home):
-    with kb.connect() as conn:
+    with kbc.connect() as conn:
         t = kb.create_task(conn, title="shelved and resumed", assignee="ops")
         assert kb.hold_task(conn, t) is True
         assert kb.get_task(conn, t).status == "on_hold"
@@ -336,7 +336,7 @@ def test_unhold_task_returns_to_ready_when_parents_done(kanban_home):
 def test_unhold_task_waits_on_incomplete_parents(kanban_home):
     """A shelved child with an unfinished parent must resume into 'todo',
     not 'ready' — never bypass the parent-completion gate."""
-    with kb.connect() as conn:
+    with kbc.connect() as conn:
         parent = kb.create_task(conn, title="parent still working", assignee="ops")
         child = kb.create_task(
             conn, title="child shelved", assignee="ops", parents=[parent],
@@ -347,7 +347,7 @@ def test_unhold_task_waits_on_incomplete_parents(kanban_home):
 
 
 def test_unhold_task_only_valid_from_on_hold(kanban_home):
-    with kb.connect() as conn:
+    with kbc.connect() as conn:
         t = kb.create_task(conn, title="not held", assignee="ops")
         assert kb.get_task(conn, t).status == "ready"
         assert kb.unhold_task(conn, t) is False
@@ -355,7 +355,7 @@ def test_unhold_task_only_valid_from_on_hold(kanban_home):
 
 def test_on_hold_is_a_recognized_status(kanban_home):
     assert "on_hold" in kb.VALID_STATUSES
-    with kb.connect() as conn:
+    with kbc.connect() as conn:
         # list_tasks(status=...) must accept it like any other column.
         t = kb.create_task(conn, title="filterable", assignee="ops")
         kb.hold_task(conn, t)
@@ -644,7 +644,7 @@ def test_add_comment_with_choice_persists_structured_answer(kanban_home):
     ``kanban_block(reason=...``choices`` fence) -> click -> comment`` wire
     contract's DB layer.
     """
-    with kb.connect() as conn:
+    with kbc.connect() as conn:
         tid = kb.create_task(conn, title="needs a decision")
         assert kb.block_task(
             conn, tid, reason="Pick one:\n```choices\n"
@@ -672,7 +672,7 @@ def test_add_comment_with_choice_persists_structured_answer(kanban_home):
 def test_add_comment_without_choice_leaves_choice_none(kanban_home):
     """Existing free-text callers (every caller before this feature) are
     unaffected — ``choice`` defaults to None and round-trips as such."""
-    with kb.connect() as conn:
+    with kbc.connect() as conn:
         tid = kb.create_task(conn, title="t")
         kb.add_comment(conn, tid, author="user", body="just a note")
         comments = kb.list_comments(conn, tid)
@@ -683,7 +683,7 @@ def test_add_comment_choice_rejects_unknown_question_event(kanban_home):
     """A ``question_event_id`` that doesn't reference a real event on this
     task is rejected (matches the spec's §6 error-handling table: server-side
     422, click never silently dropped)."""
-    with kb.connect() as conn:
+    with kbc.connect() as conn:
         tid = kb.create_task(conn, title="t")
         with pytest.raises(ValueError, match="question_event_id"):
             kb.add_comment(
@@ -697,7 +697,7 @@ def test_add_comment_choice_rejects_unknown_question_event(kanban_home):
 
 
 def test_add_comment_choice_rejects_missing_key_or_label(kanban_home):
-    with kb.connect() as conn:
+    with kbc.connect() as conn:
         tid = kb.create_task(conn, title="t")
         assert kb.block_task(conn, tid, reason="q", kind="needs_input")
         event_id = [e for e in kb.list_events(conn, tid) if e.kind == "blocked"][0].id
@@ -1482,6 +1482,88 @@ def test_unlink_tasks_triggers_recompute_ready(kanban_home):
             "child should promote to ready immediately after unlink_tasks "
             "removes its last blocking dependency"
         )
+
+
+def test_archived_completed_parents_satisfy_every_dependency_gate(kanban_home):
+    """Only a completed task remains dependency-satisfying after archival.
+
+    Completion is durable in ``completed_at``; bare archival instead means the
+    parent was withdrawn and must keep its children gated until the edge is
+    explicitly removed.
+    """
+    with kbc.connect() as conn:
+        def task_status(task_id: str) -> str:
+            task = kb.get_task(conn, task_id)
+            assert task is not None
+            return task.status
+
+        completed = kb.create_task(conn, title="completed parent")
+        assert kb.complete_task(conn, completed)
+        assert kb.archive_task(conn, completed)
+
+        # Creation and linking accept an archived parent only after completion.
+        child_after_archive = kb.create_task(
+            conn, title="created after completed parent archived", parents=[completed],
+        )
+        assert task_status(child_after_archive) == "ready"
+        linked_child = kb.create_task(conn, title="link completed archived parent")
+        kb.link_tasks(conn, completed, linked_child)
+        assert task_status(linked_child) == "ready"
+
+        # An active sibling still gates until it completes; then recompute_ready
+        # (the dispatcher repair/promotion path) recognizes the archived-completed parent.
+        active = kb.create_task(conn, title="active sibling")
+        waiting_child = kb.create_task(
+            conn, title="wait for active sibling", parents=[completed, active],
+        )
+        assert task_status(waiting_child) == "todo"
+        assert kb.complete_task(conn, active)
+        assert task_status(waiting_child) == "ready"
+
+        # A manually archived incomplete task is cancelled/withdrawn, not a
+        # completion signal. Every gate and the manual diagnostic must agree.
+        withdrawn = kb.create_task(conn, title="withdrawn parent")
+        assert kb.archive_task(conn, withdrawn)
+        mixed_child = kb.create_task(
+            conn, title="mixed parents", parents=[completed, active, withdrawn],
+        )
+        assert task_status(mixed_child) == "todo"
+        ok, reason = kb.promote_task(conn, mixed_child, actor="operator")
+        assert ok is False
+        assert withdrawn in (reason or "")
+        assert kb.claim_task(conn, mixed_child, claimer="worker") is None
+
+        # Explicitly removing the withdrawn edge is the policy-approved repair.
+        assert kb.unlink_tasks(conn, withdrawn, mixed_child)
+        assert task_status(mixed_child) == "ready"
+
+
+def test_unarchiving_completed_parent_clears_evidence_and_regates_children(kanban_home):
+    """Archived completion only satisfies dependencies until the work is reopened."""
+    with kbc.connect() as conn:
+        parent = kb.create_task(conn, title="completed parent")
+        assert kb.complete_task(conn, parent)
+        assert kb.archive_task(conn, parent)
+
+        child = kb.create_task(conn, title="released child", parents=[parent])
+        released = kb.get_task(conn, child)
+        assert released is not None and released.status == "ready"
+
+        assert kb.unarchive_task(conn, parent, status="todo")
+        reopened = kb.get_task(conn, parent)
+        assert reopened is not None
+        assert reopened.completed_at is None
+        regated = kb.get_task(conn, child)
+        assert regated is not None and regated.status == "todo"
+        assert any(
+            event.kind == "descendant_invalidated"
+            for event in kb.list_events(conn, child)
+        )
+
+        assert kb.archive_task(conn, parent)
+        later_child = kb.create_task(conn, title="still gated", parents=[parent])
+        still_gated = kb.get_task(conn, later_child)
+        assert still_gated is not None and still_gated.status == "todo"
 
 
 

@@ -186,17 +186,55 @@ class TestCrossProfileProjectTree:
             "tokens": 45,
         }
 
-    def test_home_is_one_bucket_across_profiles(self, client, profiles_on_disk):
-        # Every profile builds its own unowned-sessions bucket. Merging by id is
-        # what keeps the sidebar from stacking N identical "Home" rows.
+    def test_home_stays_per_profile(self, client, profiles_on_disk):
+        # Home is a catch-all, not a folder: it holds whatever no project
+        # claimed. Folding it across profiles put a worker profile's cwd-less
+        # provisioning chatter inside the user's own Home, where archiving a row
+        # looked like a no-op (the row lives in another store, and a same-titled
+        # sibling takes its slot in the 8-row preview window). Each profile
+        # keeps its own bucket; only `default` holds the bare id the desktop
+        # keys scope/new-session behaviour on.
         for name, home in profiles_on_disk.items():
             _seed_session(home, f"{name}-chat", source="cli")
 
         payload = client.get("/api/profiles/projects/tree").json()
 
-        homes = [project for project in payload["projects"] if project["isNoProject"]]
-        assert len(homes) == 1
-        assert homes[0]["sessionCount"] == 2
+        homes = {project["id"]: project for project in payload["projects"] if project["isNoProject"]}
+        assert set(homes) == {"__no_project__", "__no_project__::worker"}
+        assert all(project["sessionCount"] == 1 for project in homes.values())
+        # The foreign bucket says whose it is; the user's own keeps the plain label.
+        assert "worker" in homes["__no_project__::worker"]["label"]
+
+    def test_foreign_home_lanes_carry_the_scoped_id(self, client, profiles_on_disk):
+        # The re-key must reach the repo/lane ids too. A lane left on the bare
+        # `__no_project__` would merge back into the user's Home one level down,
+        # reintroducing the same cross-profile bleed the project id just fixed.
+        _seed_session(profiles_on_disk["worker"], "worker-chat", source="cli")
+
+        payload = client.get("/api/profiles/projects/tree").json()
+        home = next(p for p in payload["projects"] if p["id"] == "__no_project__::worker")
+
+        assert [repo["id"] for repo in home["repos"]] == ["__no_project__::worker"]
+        assert [lane["id"] for repo in home["repos"] for lane in repo["groups"]] == [
+            "__no_project__::worker"
+        ]
+
+    def test_home_rows_are_stamped_with_their_owning_profile(self, client, profiles_on_disk):
+        # Archiving routes on the row's `profile` stamp (the PATCH body picks the
+        # target state.db). An unstamped Home row archives against the wrong
+        # store and silently no-ops.
+        for name, home in profiles_on_disk.items():
+            _seed_session(home, f"{name}-chat", source="cli")
+
+        payload = client.get("/api/profiles/projects/tree").json()
+        stamps = {
+            row["id"]: row["profile"]
+            for project in payload["projects"]
+            if project["isNoProject"]
+            for row in project["previewSessions"]
+        }
+
+        assert stamps == {"default-chat": "default", "worker-chat": "worker"}
 
     def test_each_profile_contributes_its_own_projects_db(self, client, profiles_on_disk, tmp_path):
         """Proves the per-profile scoping, not just that two trees got merged.

@@ -14,6 +14,7 @@ the settings the next tick uses, never that a particular number is the default.
 from __future__ import annotations
 
 from gateway.kanban_watchers_dispatcher import (
+    _log_spawn_results,
     _paused_board_slugs,
     _reload_dispatcher_settings,
     _resolve_dispatcher_settings,
@@ -129,3 +130,20 @@ def test_paused_boards_are_identified_for_health_probe_exclusion():
     ]
 
     assert _paused_board_slugs(results) == {"paused"}
+
+
+def test_gateway_logs_the_shared_actionable_pause_status(caplog):
+    import logging
+
+    class _Result:
+        spawned = []
+        dispatch_paused = {"reason": "terminal_card_replay"}
+
+    with caplog.at_level(logging.WARNING):
+        assert _log_spawn_results([("named-board", _Result())]) is False
+
+    assert any(
+        "manual intervention required" in record.getMessage()
+        and "--board named-board dispatch --resume-circuit" in record.getMessage()
+        for record in caplog.records
+    )

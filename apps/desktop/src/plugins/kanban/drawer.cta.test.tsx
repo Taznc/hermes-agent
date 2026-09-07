@@ -7,7 +7,7 @@
 import { cleanup, fireEvent, render, screen } from '@testing-library/react'
 import { afterEach, beforeAll, describe, expect, it, vi } from 'vitest'
 
-import { CtaBanner, latestBlockReason, parseBlockedChoices } from './drawer'
+import { CtaBanner, latestBlockReason, parseBlockedChoices, parseCmdFences } from './drawer'
 import type { KanbanEvent, KanbanTaskFull } from './types'
 
 vi.mock('@/hermes', () => ({
@@ -450,5 +450,85 @@ describe('CtaBanner with structured choices', () => {
     expect(screen.queryByRole('radiogroup')).toBeNull()
     fireEvent.click(screen.getByText('ctaReply'))
     expect(onFocusComment).toHaveBeenCalledTimes(1)
+  })
+
+  it('renders a ```cmd fence as a copy-pasteable command block, not prose', () => {
+    const task = baseTask({ status: 'blocked', block_kind: 'needs_input' })
+    const reason =
+      'Need the dev VM service restarted.\n' +
+      '```cmd\nsudo systemctl restart dev-console.service\n```\n' +
+      'The scanner blocks the worker from running systemctl itself.'
+
+    render(
+      <CtaBanner
+        comments={[]}
+        events={[blockedEvent(reason)]}
+        onFocusComment={vi.fn()}
+        onMove={vi.fn()}
+        onSubmitChoice={vi.fn()}
+        task={task}
+      />
+    )
+
+    // The command renders in a dedicated monospace block…
+    const code = screen.getByText('sudo systemctl restart dev-console.service')
+    expect(code.tagName).toBe('CODE')
+    // …the first line renders as the emphasized ask…
+    expect(screen.getByText('Need the dev VM service restarted.')).toBeTruthy()
+    // …and the trailing context renders as detail prose.
+    expect(screen.getByText(/scanner blocks the worker/)).toBeTruthy()
+  })
+
+  it('collapses a long prose-wall reason behind Show more, keeping the first line visible', () => {
+    const task = baseTask({ status: 'blocked', block_kind: 'needs_input' })
+    const wall = 'Approve the deploy plan?\n' + 'Deployment detail sentence. '.repeat(20)
+
+    render(
+      <CtaBanner
+        comments={[]}
+        events={[blockedEvent(wall)]}
+        onFocusComment={vi.fn()}
+        onMove={vi.fn()}
+        onSubmitChoice={vi.fn()}
+        task={task}
+      />
+    )
+
+    expect(screen.getByText('Approve the deploy plan?')).toBeTruthy()
+    // The detail is hidden until Show more is clicked.
+    expect(screen.queryByText(/Deployment detail sentence/)).toBeNull()
+    fireEvent.click(screen.getByText('showMore'))
+    expect(screen.getByText(/Deployment detail sentence/)).toBeTruthy()
+    fireEvent.click(screen.getByText('showLess'))
+    expect(screen.queryByText(/Deployment detail sentence/)).toBeNull()
+  })
+})
+
+describe('parseCmdFences', () => {
+  it('extracts cmd fences and removes them from the prose', () => {
+    const { commands, prose } = parseCmdFences('Ask line\n```cmd\nsystemctl restart foo\n```\ntail')
+
+    expect(commands).toEqual(['systemctl restart foo'])
+    expect(prose).toBe('Ask line\n\ntail')
+  })
+
+  it('accepts sh/bash/shell aliases and multiple fences', () => {
+    const { commands } = parseCmdFences('a\n```bash\ncmd-one\n```\nb\n```sh\ncmd-two\n```')
+
+    expect(commands).toEqual(['cmd-one', 'cmd-two'])
+  })
+
+  it('leaves non-command fences (choices) untouched', () => {
+    const text = 'q\n```choices\n[{"key":"A","label":"A"}]\n```'
+    const { commands, prose } = parseCmdFences(text)
+
+    expect(commands).toEqual([])
+    expect(prose).toBe(text)
+  })
+
+  it('drops empty fences instead of emitting empty commands', () => {
+    const { commands } = parseCmdFences('x\n```cmd\n\n```')
+
+    expect(commands).toEqual([])
   })
 })

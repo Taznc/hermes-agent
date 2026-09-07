@@ -13,6 +13,7 @@ import {
   cn,
   Codicon,
   compactNumber,
+  ConfirmDialog,
   ContextMenu,
   ContextMenuContent,
   ContextMenuItem,
@@ -71,6 +72,7 @@ import {
   $lanesByProfile,
   addRoadmapIdea,
   ALL_BOARDS,
+  archiveDone,
   boardKey,
   BOARDS_KEY,
   bulkTasks,
@@ -79,6 +81,7 @@ import {
   deleteTask,
   estimateNew,
   fetchAllBoards,
+  fetchArchiveDonePreflight,
   fetchAttachmentDataUrl,
   fetchBoard,
   fetchBoards,
@@ -421,52 +424,55 @@ function CardFooter({
   return (
     <div className="grid min-w-0 grid-cols-[minmax(0,1fr)_auto] items-center gap-x-2 gap-y-1 text-[0.625rem] text-(--ui-text-tertiary)">
       <div className="flex min-w-0 flex-wrap items-center gap-x-2 gap-y-1">
-      {arc === 'queued' && attached ? (
-        // WHO is coming for the card. The arc only animates once the agent is
-        // actually working; while queued, the named chip carries "attached".
-        <Tip
-          label={
-            task.status === 'review'
-              ? k.reviewChecking
-              : task.assignee
-                ? k.attachedTip(attached)
-                : task.status === 'triage'
-                  ? k.orchestratorTip(attached)
-                  : k.autoAssignTip(attached)
-          }
-        >
-          <span className="inline-flex min-w-0 max-w-full cursor-help items-center gap-1 font-medium" style={{ color: meta.tone }}>
-            <Avatar name={attached} size="1.125rem" />
-            <span className="truncate">
-              {!task.assignee && '→ '}
-              {attached}
+        {arc === 'queued' && attached ? (
+          // WHO is coming for the card. The arc only animates once the agent is
+          // actually working; while queued, the named chip carries "attached".
+          <Tip
+            label={
+              task.status === 'review'
+                ? k.reviewChecking
+                : task.assignee
+                  ? k.attachedTip(attached)
+                  : task.status === 'triage'
+                    ? k.orchestratorTip(attached)
+                    : k.autoAssignTip(attached)
+            }
+          >
+            <span
+              className="inline-flex min-w-0 max-w-full cursor-help items-center gap-1 font-medium"
+              style={{ color: meta.tone }}
+            >
+              <Avatar name={attached} size="1.125rem" />
+              <span className="truncate">
+                {!task.assignee && '→ '}
+                {attached}
+              </span>
             </span>
-          </span>
-        </Tip>
-      ) : task.assignee ? (
-        <Avatar name={task.assignee} size="1.125rem" />
-      ) : null}
-      {arc === 'running' && (
-        <Tip label={k.arcRunning}>
-          <span className="shrink-0 cursor-help">
-            <RunClock task={task} />
-          </span>
-        </Tip>
-      )}
-      {arc === 'stale' && (
-        <Tip label={k.arcStale}>
-          <span className="shrink-0 cursor-help font-medium text-amber-500">{k.noHeartbeat}</span>
-        </Tip>
-      )}
-      {unassignedReady && !fallback && (
-        <Tip label={k.wontRunTip}>
-          <span className="inline-flex shrink-0 cursor-help items-center gap-1 text-amber-500">
-            <Codicon name="debug-disconnect" size="0.7rem" />
-            {k.wontRun}
-          </span>
-        </Tip>
-      )}
-      <FocusFlag task={task} />
+          </Tip>
+        ) : task.assignee ? (
+          <Avatar name={task.assignee} size="1.125rem" />
+        ) : null}
+        {arc === 'running' && (
+          <Tip label={k.arcRunning}>
+            <span className="shrink-0 cursor-help">
+              <RunClock task={task} />
+            </span>
+          </Tip>
+        )}
+        {arc === 'stale' && (
+          <Tip label={k.arcStale}>
+            <span className="shrink-0 cursor-help font-medium text-amber-500">{k.noHeartbeat}</span>
+          </Tip>
+        )}
+        {unassignedReady && !fallback && (
+          <Tip label={k.wontRunTip}>
+            <span className="inline-flex shrink-0 cursor-help items-center gap-1 text-amber-500">
+              <Codicon name="debug-disconnect" size="0.7rem" />
+              {k.wontRun}
+            </span>
+          </Tip>
+        )}
+        <FocusFlag task={task} />
       </div>
       <span
         onClick={event => event.stopPropagation()}
@@ -552,7 +558,12 @@ export function Card({
   const k = useKanban()
   const [dragging, setDragging] = useState(false)
   const meta = columnMeta(task.status)
-  const summary = task.latest_summary || task.body
+  // For a blocked card `latest_summary` IS the worker's block reason, which
+  // may carry ```cmd / ```choices fences meant for the drawer's structured
+  // rendering — on the 2-line card preview those are noise, so strip fences
+  // and collapse whitespace to keep the preview to the prose ask.
+  const rawSummary = task.latest_summary || task.body
+  const summary = rawSummary ? rawSummary.replace(/```[a-zA-Z]*\s*[\s\S]*?```/g, ' ').replace(/\s+/g, ' ').trim() : rawSummary
   const fallback = useDefaultAssignee()
   const arc = arcState(task, fallback)
   const key = taskCardKey(task)
@@ -1963,6 +1974,64 @@ export function BoardsErrorNotice({ errors }: { errors?: Array<{ board: string; 
   )
 }
 
+/** Board-scoped completed-card cleanup. The backend remains authoritative for
+ * the candidate set: the preflight only enables the affordance and gives the
+ * confirmation its honest count, while the mutation re-checks `done` per card.
+ */
+export function ArchiveDoneControl() {
+  const k = useKanban()
+  const qc = useQueryClient()
+  const [open, setOpen] = useState(false)
+
+  const { data: preflight } = useQuery({
+    queryFn: fetchArchiveDonePreflight,
+    queryKey: ['kanban', 'archive-done', $boardSlug.get()]
+  })
+
+  const archive = useMutation({
+    mutationFn: archiveDone,
+    onSuccess: result => {
+      // Archive events will also invalidate through the socket, but reconcile
+      // immediately rather than waiting for that asynchronous delivery.
+      void qc.invalidateQueries({ queryKey: ['kanban', 'board'] })
+      void qc.invalidateQueries({ queryKey: BOARDS_KEY })
+      void qc.invalidateQueries({ queryKey: ['kanban', 'archive-done'] })
+
+      if (result.failures.length > 0 || result.skipped_count > 0) {
+        host.notify({
+          kind: 'warning',
+          message: k.archiveDonePartial(result.archived_count, result.failures.length, result.skipped_count)
+        })
+      } else {
+        host.notify({ kind: 'success', message: k.archiveDoneSuccess(result.archived_count) })
+      }
+    }
+  })
+
+  const doneCount = preflight?.done_count ?? 0
+  const disabled = !preflight || doneCount === 0 || archive.isPending
+
+  return (
+    <>
+      <Button aria-label={k.archiveDone} disabled={disabled} onClick={() => setOpen(true)} size="xs" variant="ghost">
+        <Codicon name="archive" size="0.8rem" />
+        {k.archiveDone}
+      </Button>
+      <ConfirmDialog
+        cancelLabel={k.cancel}
+        confirmLabel={k.archiveDone}
+        description={k.archiveDoneConfirm(doneCount, preflight?.scope.label ?? '')}
+        onClose={() => setOpen(false)}
+        onConfirm={async () => {
+          await archive.mutateAsync()
+        }}
+        open={open}
+        title={k.archiveDone}
+      />
+    </>
+  )
+}
+
 // ── page ─────────────────────────────────────────────────────────────────────
 
 export function KanbanBoardPage() {
@@ -2421,6 +2490,7 @@ export function KanbanBoardPage() {
             )}
             <SearchField aria-label={k.filterCards} onChange={setSearch} placeholder={k.filterCards} value={search} />
             <div className="ml-auto flex items-center gap-1">
+              {board && !archived && <ArchiveDoneControl />}
               <Tip label={k.ideaTitle}>
                 <Button aria-label={k.ideaTitle} onClick={() => setIdeaOpen(true)} size="icon-xs" variant="ghost">
                   <Codicon name="lightbulb" size="0.85rem" />

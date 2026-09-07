@@ -143,7 +143,7 @@ def _resolve_dispatcher_settings(kanban_cfg: dict, kb: Any, *, quiet: bool = Fal
     ) or 600
     if dispatch_start_budget is not None and not quiet:
         logger.info(
-            "kanban dispatcher: start budget=%d per board per %ds (sticky pause on trip)",
+            "kanban dispatcher: start budget=%d per board per %ds (self-expiring rate limit)",
             dispatch_start_budget,
             dispatch_start_window_seconds,
         )
@@ -410,6 +410,12 @@ def _log_spawn_results(results: Optional[list]) -> bool:
     """Log per-board spawn summaries; returns whether any board spawned."""
     any_spawned = False
     for slug, res in (results or []):
+        if res is not None and getattr(res, "dispatch_paused", None) is not None:
+            logger.warning(
+                "kanban dispatcher [%s]: %s",
+                slug,
+                _kbd().dispatch_pause_message(res.dispatch_paused, board=slug),
+            )
         if res is not None and getattr(res, "spawned", None):
             any_spawned = True
             # Quiet by default: an idle gateway stays silent.
