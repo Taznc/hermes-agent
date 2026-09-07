@@ -474,6 +474,79 @@ def get_all_boards(
         "link_edges": link_edges, "cursors": cursors, "errors": errors, "now": int(time.time())}
 
 
+# --- Completed-card archive -------------------------------------------------
+
+def _archive_done_scope(board: Optional[str], boards: Optional[str]) -> tuple[dict[str, Any], list[str]]:
+    """Resolve the dashboard's existing board scope forms for archive-done.
+
+    A concrete ``board`` keeps the operation on exactly one board. The Desktop
+    aggregate uses ``/board/all`` and its sibling fan-out representation
+    ``boards=*``; accepting that exact form here avoids inventing another
+    aggregate sentinel while making the cross-board effect explicit.
+    """
+    if board is not None and boards is not None:
+        raise HTTPException(status_code=400, detail="pass either board or boards, not both")
+    if boards is not None:
+        if boards.strip() != "*":
+            raise HTTPException(status_code=400, detail="archive-done aggregate scope requires boards=*")
+        slugs = [meta["slug"] for meta in kanban_db.list_boards(include_archived=False)]
+        return {"kind": "all_boards", "label": "All Boards"}, slugs
+
+    slug = _resolve_board(board) or kanban_db.get_current_board()
+    meta = next((item for item in kanban_db.list_boards(include_archived=False) if item["slug"] == slug), None)
+    return {"kind": "board", "board": slug, "label": (meta or {}).get("name") or slug}, [slug]
+
+
+def _done_task_count(slugs: list[str]) -> int:
+    total = 0
+    for slug in slugs:
+        with closing(_conn(board=slug)) as conn:
+            total += int(conn.execute("SELECT COUNT(*) AS n FROM tasks WHERE status = 'done'").fetchone()["n"])
+    return total
+
+
+@router.get("/tasks/archive-done/preflight")
+def archive_done_preflight(board: Optional[str] = _BOARD_Q, boards: Optional[str] = Query(None)):
+    """Count completed cards for the selected board or explicit ``boards=*`` aggregate."""
+    scope, slugs = _archive_done_scope(board, boards)
+    return {"scope": scope, "done_count": _done_task_count(slugs)}
+
+
+@router.post("/tasks/archive-done")
+def archive_done_tasks(board: Optional[str] = _BOARD_Q, boards: Optional[str] = Query(None)):
+    """Archive cards that are still ``done`` when each per-card write executes.
+
+    Each card delegates to :func:`kanban_db.archive_task` so the established
+    archive event, run cleanup, descendant recomputation, and workspace cleanup
+    semantics remain intact. Failures are isolated to their card and returned
+    for a partial-result toast rather than rolling back successful archives.
+    """
+    scope, slugs = _archive_done_scope(board, boards)
+    archived_count = skipped_count = 0
+    failures: list[dict[str, str]] = []
+    candidate_count = 0
+    for slug in slugs:
+        with closing(_conn(board=slug)) as conn:
+            task_ids = [row["id"] for row in conn.execute("SELECT id FROM tasks WHERE status = 'done'").fetchall()]
+            candidate_count += len(task_ids)
+            for task_id in task_ids:
+                try:
+                    if kanban_db.archive_task(conn, task_id, expected_status="done"):
+                        archived_count += 1
+                    else:
+                        skipped_count += 1
+                except Exception as exc:
+                    failures.append({"board": slug, "task_id": task_id, "error": str(exc)})
+    return {
+        "scope": scope,
+        "boards": slugs,
+        "candidate_count": candidate_count,
+        "archived_count": archived_count,
+        "skipped_count": skipped_count,
+        "failures": failures,
+    }
+
+
 # --- GET /tasks/:id ---------------------------------------------------------
 
 @router.get("/tasks/{task_id}")
