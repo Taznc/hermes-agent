@@ -1885,6 +1885,32 @@ class TestSystemdCgroupIsolation:
     ENTIRE gateway cgroup, taking down the messaging control plane.
     """
 
+    @pytest.fixture(autouse=True)
+    def _placement_gives_no_answer(self, monkeypatch):
+        """State this class's PLACEMENT input: "the kernel says nothing".
+
+        Every test here simulates a topology through IDENTITY — ``INVOCATION_ID`` /
+        ``SYSTEMD_EXEC_PID`` / ``_HERMES_GATEWAY`` / ``get_running_pid`` — which is data
+        a test can set. Placement is not: ``_scope_needed_by_cgroup_placement`` reads the
+        TEST RUNNER's own real cgroup, so without pinning it the verdict is decided by
+        where the suite happens to run. That is not hypothetical on this fleet: run from
+        inside a supervised ``hermes-*`` unit, five of these tests fail because placement
+        correctly answers True and the command IS wrapped, while they assert a direct
+        ``/bin/bash`` argv; run from inside a ``hermes-worker-*`` scope, the tests
+        asserting a wrap would instead read "already isolated" and silently pass for the
+        wrong reason.
+
+        Pinning it to ``None`` (a cgroup-v1 host, or a container that hides
+        ``/proc/self/cgroup``) makes this class deterministically exercise the identity
+        fallback on any host. Placement itself is covered by
+        ``TestSupervisedUnitCgroupPlacement``, and end to end — in a real supervised-unit
+        cgroup, with a real fork — by
+        ``tests/hermes_cli/test_kanban_gateway_restart_handoff.py``.
+        """
+        monkeypatch.setattr(
+            "tools.process_registry._scope_needed_by_cgroup_placement", lambda: None
+        )
+
     @pytest.fixture()
     def _gateway_identity(self, monkeypatch):
         """Opt-in: mark this test as running AS the live gateway process."""
@@ -2911,32 +2937,6 @@ class TestDescendantDispatcherFailsClosed:
         assert argv[argv.index("--") + 1:] == ["hermes", "chat"]
         assert child_env["XDG_RUNTIME_DIR"] == "/run/user/4242"
         assert child_env["DBUS_SESSION_BUS_ADDRESS"] == "unix:path=/run/user/4242/bus"
-
-
-class TestScopePlacementIsLinuxGated:
-    """macOS/Windows are unchanged: the whole scope path is behind ``_IS_LINUX``."""
-
-    def test_non_linux_returns_the_command_even_when_placement_would_say_yes(
-        self, monkeypatch
-    ):
-        import tools.process_registry as pr
-
-        monkeypatch.setattr(pr, "_IS_LINUX", False)
-        monkeypatch.setattr(
-            pr, "_read_own_cgroup_v2_path",
-            lambda: "/system.slice/hermes-webdesktop-backend.service",
-        )
-        monkeypatch.setattr(
-            pr, "_systemd_run_user_scope_available",
-            lambda: pytest.fail("non-Linux must never probe for a user scope"),
-        )
-        command = ["hermes", "chat"]
-        child_env = {"HERMES_HOME": "/tmp/home"}
-
-        assert pr.restart_safe_supervised_child_argv(
-            command, unit_suffix="kanban-t_x-run-1", env=child_env
-        ) is command
-        assert child_env == {"HERMES_HOME": "/tmp/home"}
 
 
 class TestNotificationRedaction:

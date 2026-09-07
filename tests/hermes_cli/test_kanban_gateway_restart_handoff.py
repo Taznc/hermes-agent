@@ -8,6 +8,7 @@ import signal
 import subprocess
 import sys
 import time
+import uuid
 from pathlib import Path
 
 import pytest
@@ -17,22 +18,23 @@ from hermes_cli import kanban_db_dispatch as kbd
 
 
 @pytest.fixture(autouse=True)
-def _placement_says_nothing(request: pytest.FixtureRequest, monkeypatch: pytest.MonkeyPatch):
-    """Neutralize the cgroup-PLACEMENT input for this file's identity simulations.
+def _placement_gives_no_answer(monkeypatch: pytest.MonkeyPatch):
+    """State this file's PLACEMENT input: "the kernel says nothing".
 
-    Every test here simulates a topology through ``INVOCATION_ID`` /
-    ``SYSTEMD_EXEC_PID`` / ``_is_supervised_gateway_process``. Placement, by contrast,
-    is read from the test runner's OWN real cgroup and cannot be simulated that way —
-    a suite run inside a ``hermes-worker-*`` scope reads "already isolated" and would
-    silently skip the wrap these tests assert, while a suite run inside the backend
-    unit would wrap the ones that assert a direct spawn. Pinning placement to "no
-    answer" makes these tests exercise the identity fallback deterministically on any
-    host; placement itself is covered by
-    ``tests/tools/test_process_registry.py::TestSupervisedUnitCgroupPlacement`` and by
-    the ``real_cgroup_placement``-marked test below, which opts out on purpose.
+    Every in-process test here simulates a topology through IDENTITY —
+    ``INVOCATION_ID`` / ``SYSTEMD_EXEC_PID`` / ``_is_supervised_gateway_process`` — which
+    is data a test can set. Placement is not: ``_scope_needed_by_cgroup_placement`` reads
+    the TEST RUNNER's own real cgroup, so leaving it live would let the verdict be decided
+    by wherever the suite happens to run (inside a ``hermes-worker-*`` scope it reads
+    "already isolated"; inside a supervised ``hermes-*`` unit it reads "wrap this").
+    Pinning it to ``None`` — a cgroup-v1 host, or a container that hides
+    ``/proc/self/cgroup`` — makes these exercise the identity fallback deterministically
+    on any host.
+
+    ``test_real_descendant_of_a_supervised_unit_leaves_the_unit_cgroup`` is unaffected by
+    design: it does its work in a subprocess inside its own transient unit, which reads
+    its own real cgroup rather than this process's patched module.
     """
-    if request.node.get_closest_marker("real_cgroup_placement"):
-        return
     monkeypatch.setattr(
         "tools.process_registry._scope_needed_by_cgroup_placement", lambda: None
     )
@@ -382,11 +384,10 @@ def test_real_backend_supervised_worker_leaves_the_unit_cgroup(
 
 
 @pytest.mark.linux_only
-@pytest.mark.real_cgroup_placement
 def test_real_descendant_of_a_supervised_unit_leaves_the_unit_cgroup(
-    worker_setup: tuple[Path, kb.Task], monkeypatch: pytest.MonkeyPatch
+    tmp_path: Path,
 ) -> None:
-    """The card's core regression, spawned for real through the production entry point.
+    """The card's core regression, reproduced by genuinely creating the topology.
 
     A dispatch tick that runs in a DESCENDANT of a supervised unit's main process sees
     ``INVOCATION_ID`` and ``SYSTEMD_EXEC_PID`` (both inherited) but its own pid differs,
@@ -394,52 +395,66 @@ def test_real_descendant_of_a_supervised_unit_leaves_the_unit_cgroup(
     the unit's cgroup with no log line. One such leaked worker measured 1853 MiB against
     ``hermes-webdesktop-backend.service``'s 3G ``MemoryHigh``.
 
-    The topology is reproduced without touching any live unit: this process is placed in a
-    real supervised-unit cgroup for the duration of the call by overriding the placement
-    READER (the kernel-backed input), while identity is left in its genuine descendant
-    state — ``SYSTEMD_EXEC_PID`` names some other pid. The assertion compares the child's
-    cgroup LEAF against the unit this run should have minted, not a substring: a child that
-    merely inherited a scoped dispatcher's cgroup would still match ``hermes-worker-*``.
+    Nothing here is simulated. The probe body runs inside a THROWAWAY transient unit
+    (``hermes-webdesktop-backend-probe-<hex>.service`` in ``app.slice`` — a real
+    Hermes-named unit cgroup outside ``hermes-workers.slice``, so placement reads it
+    exactly as it reads the live backend) and ``fork()``s, which is the only way to obtain
+    a true descendant: cgroup membership is kernel-maintained, so a test process cannot
+    talk itself into another unit's cgroup. No live unit is touched, and the probe asserts
+    its kanban board is sandboxed before it spawns anything.
+
+    The assertion compares the worker's cgroup LEAF against the unit this run should have
+    minted, not a substring — a child that merely inherited a scoped dispatcher's cgroup
+    would still match ``hermes-worker-*`` — and separately against the dispatching
+    process's own cgroup, which is what the leak made them share.
     """
     from tools import process_registry
 
     if not process_registry._systemd_run_user_scope_available():
         pytest.skip("systemd-run --user --scope is unavailable on this host")
 
-    workspace, task = worker_setup
-    task.id = "t_descendant_restart"
-    task.current_run_id = 25
-    receipt = workspace / "descendant-worker-receipt.json"
-    script = (
-        "import json, os, pathlib, sys, time; "
-        "pathlib.Path(sys.argv[1]).write_text(json.dumps({"
-        "'pid': os.getpid(), "
-        "'cgroup': pathlib.Path('/proc/self/cgroup').read_text()})); time.sleep(0.5)"
+    repo_root = Path(__file__).resolve().parents[2]
+    probe = Path(__file__).with_name("_supervised_unit_descendant_probe.py")
+    probe_root = tmp_path / "probe"
+    # A supervised-unit NAME (`is_hermes_unit` is prefix-based) placed in app.slice, i.e.
+    # outside the worker slice — the shape of a unit that dispatches workers.
+    unit = f"hermes-webdesktop-backend-probe-{uuid.uuid4().hex[:8]}"
+    completed = subprocess.run(
+        [
+            "systemd-run", "--user", "--quiet", "--collect", "--pipe",
+            f"--unit={unit}", "--slice=app.slice",
+            f"--working-directory={repo_root}",
+            f"--setenv=HERMES_PROBE_ROOT={probe_root}",
+            f"--setenv=PYTHONPATH={repo_root}",
+            sys.executable, str(probe),
+        ],
+        capture_output=True,
+        text=True,
+        timeout=120,
+        check=False,
     )
-    monkeypatch.setattr(kbd, "_resolve_hermes_argv", lambda: [sys.executable, "-c", script, str(receipt)])
-    # A genuine DESCENDANT: markers inherited from the unit, our pid is not the main pid.
-    monkeypatch.setenv("INVOCATION_ID", "webdesktop-backend-descendant-e2e")
-    monkeypatch.setenv("SYSTEMD_EXEC_PID", str(os.getpid() + 1))
-    monkeypatch.setattr(process_registry, "_is_supervised_gateway_process", lambda: False)
-    assert process_registry._is_supervised_worker_dispatcher() is False, (
+
+    result_file = probe_root / "result.json"
+    assert result_file.exists(), (
+        f"probe produced no result (rc={completed.returncode})\n"
+        f"stdout: {completed.stdout}\nstderr: {completed.stderr}"
+    )
+    result = json.loads(result_file.read_text(encoding="utf-8"))
+    assert "error" not in result, result["error"]
+
+    # The topology is the real one, not an assumption: a Hermes unit's cgroup, and a
+    # process that is a descendant of its main pid rather than the main pid itself.
+    assert result["invocation_id_present"] is True
+    assert result["systemd_exec_pid"] == str(result["unit_pid"])
+    assert result["descendant_pid"] != result["unit_pid"]
+    assert result["identity"] is False, (
         "the identity predicate must be False here — that is what made this leak silent"
     )
-    # Our placement, as a descendant of the backend's main process, IS the unit's cgroup.
-    monkeypatch.setattr(
-        process_registry, "_read_own_cgroup_v2_path",
-        lambda: "/system.slice/hermes-webdesktop-backend.service",
-    )
+    assert result["placement"] is True, result["unit_cgroup"]
 
-    pid = kbd._default_spawn(task, str(workspace))
-    deadline = time.monotonic() + 5
-    while not receipt.exists() and time.monotonic() < deadline:
-        time.sleep(0.05)
-
-    assert receipt.exists()
-    payload = json.loads(receipt.read_text(encoding="utf-8"))
-    assert payload["pid"] != pid
-    cgroup = payload["cgroup"].strip()
-    leaf = cgroup.rsplit("/", 1)[-1]
-    assert leaf == "hermes-worker-kanban-t_descendant_restart-run-25.service", cgroup
-    assert "/hermes.slice/hermes-workers.slice/" in cgroup, cgroup
-    assert "hermes-webdesktop-backend.service" not in cgroup, cgroup
+    # The worker landed in the unit this run should have minted, NOT in the cgroup of the
+    # process that dispatched it (which is precisely what the leak looked like).
+    assert result["worker_leaf"] == result["expected_leaf"], result["worker_cgroup"]
+    assert "/hermes-workers.slice/" in result["worker_cgroup"], result["worker_cgroup"]
+    assert result["worker_shares_parent_cgroup"] is False
+    assert unit not in result["worker_cgroup"], result["worker_cgroup"]
