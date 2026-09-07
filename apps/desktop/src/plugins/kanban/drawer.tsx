@@ -39,10 +39,12 @@ import {
   addComment,
   deleteTask,
   fetchLog,
+  fetchProfiles,
   fetchTask,
   linkTasks,
   logKey,
   patchTask,
+  PROFILES_KEY,
   reassignTask,
   reclaimTask,
   taskKey,
@@ -68,13 +70,14 @@ import {
   isAdminSummary,
   MetaRow
 } from './drawer_overview'
-import { ModelOverrideField, overridePatch } from './model-override'
+import { ModelOverrideField, overrideLabel, overridePatch } from './model-override'
 import { PriorityPicker } from './priority-picker'
 import { statusGuidance } from './status-guidance'
 import { type ChoiceResponse, columnMeta, type KanbanTaskDetail, SEVERITY_TONE } from './types'
 import {
   ago,
   Callout,
+  CollapsibleMarkdown,
   errText,
   FIELD_LABEL,
   isLockedTarget,
@@ -92,7 +95,7 @@ import {
 export { ActivityRow, RunErrorLine } from './drawer_activity'
 // Re-exported for the plugin's existing test suite and for board.tsx, which
 // import these by name. Behavior lives in the siblings; this is the door.
-export { CtaBanner, parseBlockedChoices } from './drawer_cta'
+export { CtaBanner, parseBlockedChoices, parseCmdFences } from './drawer_cta'
 export { type ActivityGroup, groupActivity, latestBlockReason, runErrorText } from './drawer_events'
 export { ImagesSection, ImageThumb, isImageAttachment } from './drawer_log'
 
@@ -163,6 +166,26 @@ export function TaskDrawer({
   // after retries or review/rework cycles.
   const currentRun = running ? detail?.runs.find(run => run.status === 'running') : undefined
   const defaultAssignee = useDefaultAssignee()
+
+  // Resolve what an un-overridden task ACTUALLY runs: the assignee profile's
+  // own configured model/provider/effort from the roster. The Model row then
+  // reads "provider: model · Effort" (muted = inherited) instead of an opaque
+  // "Profile default" that hides the real depth. Older backends without the
+  // roster fields quietly fall back to the generic copy.
+  const { data: roster } = useQuery({ queryFn: fetchProfiles, queryKey: PROFILES_KEY, staleTime: 60_000 })
+  const assigneeName = task?.assignee || defaultAssignee
+  const assigneeProfile = assigneeName ? roster?.profiles.find(p => p.name === assigneeName) : undefined
+  const resolvedInheritLabel =
+    assigneeProfile && (assigneeProfile.model || assigneeProfile.reasoning_effort)
+      ? overrideLabel(
+          {
+            effort: assigneeProfile.reasoning_effort ?? '',
+            model: assigneeProfile.model ?? '',
+            provider: assigneeProfile.provider ?? ''
+          },
+          k.modelInherit
+        )
+      : undefined
 
   // The worker artifact is capped/rotated by the backend at this same size,
   // so this is the entire retained log — never an arbitrary UI tail that
@@ -464,6 +487,7 @@ export function TaskDrawer({
                     )}
                     <MetaRow label={k.model}>
                       <ModelOverrideField
+                        inheritLabel={resolvedInheritLabel}
                         onChange={next => void mutate(() => patchTask(task.id, overridePatch(next), taskBoard))()}
                         value={{
                           effort: task.reasoning_effort ?? '',
@@ -486,15 +510,13 @@ export function TaskDrawer({
 
                 {task.result && (
                   <Section label={k.result} tone={columnMeta('done').tone}>
-                    <p className="whitespace-pre-wrap text-[0.8125rem] text-(--ui-text-secondary)">{task.result}</p>
+                    <CollapsibleMarkdown text={task.result} />
                   </Section>
                 )}
 
                 {task.latest_summary && !isAdminSummary(task.latest_summary) && (
                   <Section label={k.latestSummary}>
-                    <p className="whitespace-pre-wrap text-[0.8125rem] text-(--ui-text-secondary)">
-                      {task.latest_summary}
-                    </p>
+                    <CollapsibleMarkdown text={task.latest_summary} />
                   </Section>
                 )}
 

@@ -223,6 +223,30 @@ export function CommentComposer({
   )
 }
 
+/** Long worker comments (diagnosis dumps, handoff context) collapse to a few
+ *  lines with a Show more toggle so the thread stays scannable; the toggle
+ *  only renders when the body is actually long. */
+const COMMENT_INLINE_CHARS = 300
+
+function CommentBody({ body }: { body: string }) {
+  const k = useKanban()
+  const [expanded, setExpanded] = useState(false)
+  const long = body.length > COMMENT_INLINE_CHARS || body.split('\n').length > 4
+
+  return (
+    <div className="flex flex-col gap-0.5">
+      <p className={cn('whitespace-pre-wrap text-(--ui-text-tertiary)', long && !expanded && 'line-clamp-3')}>
+        {body}
+      </p>
+      {long && (
+        <Button className="self-start" onClick={() => setExpanded(v => !v)} size="xs" variant="text">
+          {expanded ? k.showLess : k.showMore}
+        </Button>
+      )}
+    </div>
+  )
+}
+
 /** The comment thread + composer. The composer carries the
  *  `data-kanban-comment-input` hook the CTA banner's Reply deep-link focuses,
  *  which is why this whole section must be MOUNTED (not just reachable) once
@@ -266,7 +290,7 @@ export function CommentsSection({
               <li className="text-[0.75rem]" key={comment.id}>
                 <span className="font-medium text-(--ui-text-secondary)">{comment.author}</span>
                 <span className="ml-2 text-[0.625rem] text-(--ui-text-quaternary)">{ago(comment.created_at)}</span>
-                <p className="whitespace-pre-wrap text-(--ui-text-tertiary)">{comment.body}</p>
+                <CommentBody body={comment.body} />
               </li>
             ))}
           </ul>

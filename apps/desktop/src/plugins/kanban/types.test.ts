@@ -1,5 +1,6 @@
 import { describe, expect, it } from 'vitest'
-import { SEVERITY_TONE, type Diagnostic } from './types'
+
+import { type Diagnostic, SEVERITY_TONE } from './types'
 
 describe('SEVERITY_TONE', () => {
   it('has a real, non-undefined tone for every Diagnostic severity, including info', () => {
