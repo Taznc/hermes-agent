@@ -389,18 +389,39 @@ def create_app(
         # the request body too.
         body = await request.read()
         materialize_responses_stream = False
-        if (
-            getattr(adapter, "materializes_responses_stream", False)
-            and rel_path == "/responses"
-        ):
-            try:
-                payload = json.loads(body)
-            except (UnicodeDecodeError, json.JSONDecodeError):
-                payload = None
-            if isinstance(payload, dict) and not payload.get("stream"):
-                payload["stream"] = True
-                body = json.dumps(payload, separators=(",", ":")).encode("utf-8")
-                materialize_responses_stream = True
+        if rel_path == "/responses":
+            needs_stream = bool(
+                getattr(adapter, "materializes_responses_stream", False)
+            )
+            drop_params = frozenset(
+                getattr(adapter, "unsupported_responses_params", frozenset())
+            )
+            if needs_stream or drop_params:
+                try:
+                    payload = json.loads(body)
+                except (UnicodeDecodeError, json.JSONDecodeError):
+                    payload = None
+                if isinstance(payload, dict):
+                    rewritten = False
+                    # Never log payload contents; only the parameter names,
+                    # which are fixed adapter metadata rather than user data.
+                    dropped = sorted(drop_params & payload.keys())
+                    for key in dropped:
+                        payload.pop(key, None)
+                        rewritten = True
+                    if dropped:
+                        logger.debug(
+                            "proxy: dropped upstream-unsupported /responses params: %s",
+                            ", ".join(dropped),
+                        )
+                    if needs_stream and not payload.get("stream"):
+                        payload["stream"] = True
+                        materialize_responses_stream = True
+                        rewritten = True
+                    if rewritten:
+                        body = json.dumps(payload, separators=(",", ":")).encode(
+                            "utf-8"
+                        )
 
         if getattr(adapter, "transforms_openai_chat", False) and rel_path == "/chat/completions":
             return await _handle_claude_chat(request, cred, body)

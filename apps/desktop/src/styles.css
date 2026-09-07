@@ -1258,6 +1258,73 @@ html[data-inline-link-require-modifier='true'][data-inline-link-modifier='held']
   animation-play-state: paused !important;
 }
 
+/* NEEDS-INPUT ATTENTION RING (A3): the whole row breathes amber while a
+   clarify/approval blocks the turn — the one state that is waiting on the
+   user, so it earns the loudest treatment in the sidebar. Two layers, both
+   with STATIC box-shadows: the host paints a faint resting ring + wash
+   (always visible — paused renderers, reduced motion, and screenshots still
+   read "this row wants me"), and the ::before overlay paints the bright
+   ring + outer glow with only its OPACITY animating, which composites
+   without per-frame style recalc or paint (the box-shadow itself never
+   changes). Never animate box-shadow directly — that runs on the main
+   thread, the exact cost the old traveling arc was engineered around. */
+@keyframes attention-breathe {
+  0%,
+  100% {
+    opacity: 0;
+  }
+  50% {
+    opacity: 1;
+  }
+}
+
+.attention-ring {
+  --attention-c: var(--color-amber-500);
+
+  pointer-events: none;
+  position: absolute;
+  inset: 0;
+  border-radius: var(--radius-md);
+  background: color-mix(in srgb, var(--attention-c) 8%, transparent);
+  box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--attention-c) 35%, transparent);
+}
+
+.attention-ring::before {
+  content: '';
+  position: absolute;
+  inset: 0;
+  border-radius: inherit;
+  box-shadow:
+    inset 0 0 0 1.5px color-mix(in srgb, var(--attention-c) 95%, transparent),
+    0 0 9px 1px color-mix(in srgb, var(--attention-c) 35%, transparent);
+  animation: attention-breathe 1.8s ease-in-out infinite;
+}
+
+/* Rate-limited: same ring language an octave lower — steady orange, no
+   breathing. A wait/recovery state, not a blocking prompt. */
+.attention-ring[data-rate-limited] {
+  --attention-c: var(--color-orange-500);
+
+  background: color-mix(in srgb, var(--attention-c) 6%, transparent);
+}
+
+.attention-ring[data-rate-limited]::before {
+  animation: none;
+  opacity: 0;
+}
+
+:root[data-renderer-animations-paused] .attention-ring::before {
+  animation-play-state: paused !important;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .attention-ring::before {
+    animation: none;
+    opacity: 0;
+  }
+}
+
+
 /* No focus rings, anywhere. Kills the native outline plus Tailwind's
    `focus-visible:ring-*` (a box-shadow driven by --tw-ring-*). Unlayered so it
    beats the utilities layer without !important on the outline. The composer /

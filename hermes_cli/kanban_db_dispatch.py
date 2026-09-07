@@ -2096,6 +2096,15 @@ def _memory_pressure_level(sample: Optional[Mapping[str, Any]] = None) -> str:
         return "unknown"
 
 
+OPERATOR_PAUSE_REASON = "operator_paused"
+"""Pause reason for a deliberate operator maintenance drain.
+
+Distinct from the self-expiring ``start_budget_exceeded`` cooldown and from the
+fault circuits (``restart_safe_scope_unavailable``, ``pause_persistence_failed``)
+so "why is this paused" stays a stable, machine-readable record.
+"""
+
+
 def _dispatch_pause_path(board: Optional[str]) -> Path:
     """Sticky circuit state beside the resolved board database.
 
@@ -2237,6 +2246,24 @@ def dispatch_pause_message(state: Mapping[str, Any], *, board: Optional[str] = N
     if board:
         command += f"--board {board} "
     command += "dispatch --resume-circuit"
+    if state.get("reason") == OPERATOR_PAUSE_REASON:
+        # A deliberate maintenance drain is not a fault: rendering it with the
+        # generic "manual intervention required" phrasing below would report a
+        # healthy, intentionally-stopped board as broken.
+        context = []
+        if state.get("paused_by"):
+            context.append(f"by={state['paused_by']}")
+        if isinstance(state.get("paused_at"), int):
+            context.append(
+                f"at={datetime.fromtimestamp(state['paused_at'], tz=timezone.utc).isoformat()}"
+            )
+        if state.get("note"):
+            context.append(f"note={state['note']}")
+        suffix = f" ({'; '.join(context)})" if context else ""
+        return (
+            f"paused for maintenance{suffix}; already-running workers are unaffected; "
+            f"resume with: {command}"
+        )
     details = [f"reason={state.get('reason', 'unknown pause')}"]
     if state.get("fault_code"):
         details.append(f"fault_code={state['fault_code']}")
@@ -2249,6 +2276,39 @@ def dispatch_pause_message(state: Mapping[str, Any], *, board: Optional[str] = N
         f"manual intervention required ({'; '.join(details)}); "
         f"resume explicitly with: {command}"
     )
+
+
+def pause_dispatch(board: Optional[str] = None, *, note: Optional[str] = None) -> dict[str, Any]:
+    """Deliberately stop this board claiming/spawning new workers.
+
+    The operator counterpart to :func:`resume_dispatch`, for draining a board
+    before a gateway/service restart: workers share the gateway's
+    ``KillMode=mixed`` cgroup, so restarting while any are running SIGKILLs
+    them and discards uncommitted worktree progress.
+
+    This only fences NEW dispatch — ``_dispatch_once_locked`` returns early on
+    a live pause and there is deliberately no kill/reclaim behaviour here, so
+    already-running workers keep running and can still complete or block
+    normally while the board drains.
+
+    Idempotent, and never overrides an existing pause: re-pausing returns the
+    current state untouched so the first (possibly fault-written) "why is this
+    paused" record and its recovery guidance survive.
+    """
+    _kb._assert_not_delegated_child_mutation()
+    db_path = _kb.kanban_db_path(board=board)
+    # Same discipline as resume_dispatch: a tick in flight may be about to
+    # write a fault pause of its own, and either side landing inside that
+    # window would silently clobber the other. Refusing keeps the operator
+    # action deliberate — retry once the tick finishes.
+    with _kbc._dispatch_tick_lock(db_path) as held:
+        if not held:
+            return {"paused": False, "state": None, "reason": "dispatch_in_progress"}
+        details: dict[str, Any] = {"paused_by": _kb._hook_profile_name()}
+        if note:
+            details["note"] = note
+        state = _write_dispatch_pause(board, OPERATOR_PAUSE_REASON, **details)
+    return {"paused": True, "state": state}
 
 
 def resume_dispatch(board: Optional[str] = None) -> dict[str, Any]:

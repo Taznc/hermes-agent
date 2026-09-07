@@ -333,6 +333,34 @@ siblings are launched. If both JSON and SQLite persistence fail, the current
 tick stops, but durable recovery and task reconciliation cannot be guaranteed
 until storage is repaired.
 
+#### Pausing dispatch for maintenance
+
+Workers run inside the gateway's cgroup, so restarting or updating the gateway
+while any are running kills them and discards uncommitted worktree progress.
+Pause the board first, let it drain, then restart:
+
+```bash
+hermes kanban --board <slug> dispatch --pause "gateway restart"
+hermes kanban --board <slug> stats          # watch running reach 0
+# ... restart the gateway ...
+hermes kanban --board <slug> dispatch --resume-circuit
+```
+
+`--pause` uses the same durable circuit as the safety pauses above, so it
+survives the very restart it exists for. It stops the board **claiming and
+spawning new workers only** — it never terminates a worker that is already
+running, and a running worker can still complete or block normally while the
+board drains. The optional note is recorded on the pause and shown by
+`--circuit-status`, alongside who paused it and when. Pausing an
+already-paused board is a no-op that preserves the existing record, so it can
+never overwrite a safety pause's recovery guidance. Like resume, it refuses
+(exit 1) rather than racing a dispatch tick that holds the board lock; retry a
+moment later.
+
+The Desktop Kanban board exposes the same control in its orchestration
+settings panel, with a live "N running — draining" / "0 running — safe to
+restart" indicator.
+
 `review_rework_escalation_profile` breaks pathological implementation/review
 loops without removing review: the first changes request returns to the original
 implementer; after the second, the next ready run is reassigned to the configured

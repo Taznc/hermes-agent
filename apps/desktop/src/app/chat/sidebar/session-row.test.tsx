@@ -36,6 +36,10 @@ vi.mock('@/i18n', () => ({
           handoffOrigin: (platform: string) => `Started on ${platform}`,
           messageCount: (count: number) => `${count} messages`,
           needsInput: 'Needs input',
+          rateLimited: {
+            unknown: 'Rate limited',
+            withTime: (time: string) => `Rate limited until ${time}`
+          },
           providerConfigured: (family: string) => `Configured model: ${family}`,
           providerConfiguredVia: (configuredFamily: string, servedFamily: string) =>
             `Configured model: ${configuredFamily}, currently served via ${servedFamily}`,
@@ -233,6 +237,70 @@ describe('SidebarSessionRow running arc', () => {
 
     expect(sessionTitle).toHaveBeenCalledTimes(1)
     expect(sessionTitle).toHaveBeenCalledWith(expect.objectContaining({ id: 's1' }))
+  })
+})
+
+// Attention ring (A3): the breathing amber border for a session blocked on the
+// user, and its steady orange rate-limited variant. Drives the mocked
+// $attentionSessionIds atom / the real rate-limited store the way the app does,
+// so this covers the row wiring, not just the CSS class existing.
+describe('SidebarSessionRow attention ring', () => {
+  afterEach(() => {
+    void import('@/store/session-states').then(({ $attentionSessionIds }) =>
+      ($attentionSessionIds as ReturnType<typeof atom<string[]>>).set([])
+    )
+    void import('@/store/session-dot-state').then(({ clearSessionRateLimited }) => clearSessionRateLimited('s1'))
+    clearAllSessionStates()
+  })
+
+  const ring = (container: HTMLElement) => container.querySelector('.attention-ring')
+
+  it('paints no ring for a settled session', () => {
+    const { container } = renderRow(makeSession({ title: 'Settled' }))
+
+    expect(ring(container)).toBeNull()
+  })
+
+  it('paints the breathing ring while the session needs input', async () => {
+    const { $attentionSessionIds } = await import('@/store/session-states')
+
+    act(() => {
+      ;($attentionSessionIds as ReturnType<typeof atom<string[]>>).set(['s1'])
+    })
+
+    const { container } = renderRow(makeSession({ title: 'Waiting' }))
+    const el = ring(container)
+
+    expect(el).toBeTruthy()
+    expect(el?.hasAttribute('data-rate-limited')).toBe(false)
+  })
+
+  it('paints the steady variant for a rate-limited session', async () => {
+    const { markSessionRateLimited } = await import('@/store/session-dot-state')
+
+    act(() => {
+      markSessionRateLimited('s1')
+    })
+
+    const { container } = renderRow(makeSession({ title: 'Limited' }))
+
+    expect(ring(container)?.hasAttribute('data-rate-limited')).toBe(true)
+  })
+
+  it('never paints the ring and the working bar together', async () => {
+    const { $attentionSessionIds } = await import('@/store/session-states')
+
+    // Busy AND blocked: needs-input outranks working in the dot-state
+    // priority, so the row shows the ring, not the bar.
+    publishSessionState('rt1', { ...createClientSessionState('s1'), busy: true })
+    act(() => {
+      ;($attentionSessionIds as ReturnType<typeof atom<string[]>>).set(['s1'])
+    })
+
+    const { container } = renderRow(makeSession({ title: 'Blocked' }))
+
+    expect(ring(container)).toBeTruthy()
+    expect(container.querySelector('.working-bar')).toBeNull()
   })
 })
 
