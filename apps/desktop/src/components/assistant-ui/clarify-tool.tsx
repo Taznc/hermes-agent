@@ -35,9 +35,9 @@ import {
   type ClarifyQuestion,
   type ClarifyRequest,
   clearClarifyRequest,
-  reconcileClarifyHelp,
   normalizeChoices,
   RECOMMENDED_LABEL,
+  reconcileClarifyHelp,
   sessionClarifyRequest,
   updateClarifyHelp,
   warnDroppedChoices
