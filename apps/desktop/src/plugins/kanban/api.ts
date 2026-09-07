@@ -42,7 +42,8 @@ export interface ArchiveDonePreflight {
   scope: { kind: 'all_boards' | 'board'; label: string; board?: string }
 }
 
-export interface ArchiveDoneResult extends ArchiveDonePreflight {
+export interface ArchiveDoneResult {
+  scope: ArchiveDonePreflight['scope']
   archived_count: number
   boards: string[]
   candidate_count: number
@@ -347,7 +348,8 @@ function archiveDonePath(path: string): string {
   return $boardSlug.get() === ALL_BOARDS ? `${path}?boards=*` : withBoard(path)
 }
 
-export const fetchArchiveDonePreflight = () => call<ArchiveDonePreflight>(archiveDonePath('/tasks/archive-done/preflight'))
+export const fetchArchiveDonePreflight = () =>
+  call<ArchiveDonePreflight>(archiveDonePath('/tasks/archive-done/preflight'))
 
 export const archiveDone = () => call<ArchiveDoneResult>(archiveDonePath('/tasks/archive-done'), { method: 'POST' })
 

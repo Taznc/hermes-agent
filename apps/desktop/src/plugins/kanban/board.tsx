@@ -13,6 +13,7 @@ import {
   cn,
   Codicon,
   compactNumber,
+  ConfirmDialog,
   ContextMenu,
   ContextMenuContent,
   ContextMenuItem,
@@ -423,52 +424,55 @@ function CardFooter({
   return (
     <div className="grid min-w-0 grid-cols-[minmax(0,1fr)_auto] items-center gap-x-2 gap-y-1 text-[0.625rem] text-(--ui-text-tertiary)">
       <div className="flex min-w-0 flex-wrap items-center gap-x-2 gap-y-1">
-      {arc === 'queued' && attached ? (
-        // WHO is coming for the card. The arc only animates once the agent is
-        // actually working; while queued, the named chip carries "attached".
-        <Tip
-          label={
-            task.status === 'review'
-              ? k.reviewChecking
-              : task.assignee
-                ? k.attachedTip(attached)
-                : task.status === 'triage'
-                  ? k.orchestratorTip(attached)
-                  : k.autoAssignTip(attached)
-          }
-        >
-          <span className="inline-flex min-w-0 max-w-full cursor-help items-center gap-1 font-medium" style={{ color: meta.tone }}>
-            <Avatar name={attached} size="1.125rem" />
-            <span className="truncate">
-              {!task.assignee && '→ '}
-              {attached}
+        {arc === 'queued' && attached ? (
+          // WHO is coming for the card. The arc only animates once the agent is
+          // actually working; while queued, the named chip carries "attached".
+          <Tip
+            label={
+              task.status === 'review'
+                ? k.reviewChecking
+                : task.assignee
+                  ? k.attachedTip(attached)
+                  : task.status === 'triage'
+                    ? k.orchestratorTip(attached)
+                    : k.autoAssignTip(attached)
+            }
+          >
+            <span
+              className="inline-flex min-w-0 max-w-full cursor-help items-center gap-1 font-medium"
+              style={{ color: meta.tone }}
+            >
+              <Avatar name={attached} size="1.125rem" />
+              <span className="truncate">
+                {!task.assignee && '→ '}
+                {attached}
+              </span>
             </span>
-          </span>
-        </Tip>
-      ) : task.assignee ? (
-        <Avatar name={task.assignee} size="1.125rem" />
-      ) : null}
-      {arc === 'running' && (
-        <Tip label={k.arcRunning}>
-          <span className="shrink-0 cursor-help">
-            <RunClock task={task} />
-          </span>
-        </Tip>
-      )}
-      {arc === 'stale' && (
-        <Tip label={k.arcStale}>
-          <span className="shrink-0 cursor-help font-medium text-amber-500">{k.noHeartbeat}</span>
-        </Tip>
-      )}
-      {unassignedReady && !fallback && (
-        <Tip label={k.wontRunTip}>
-          <span className="inline-flex shrink-0 cursor-help items-center gap-1 text-amber-500">
-            <Codicon name="debug-disconnect" size="0.7rem" />
-            {k.wontRun}
-          </span>
-        </Tip>
-      )}
-      <FocusFlag task={task} />
+          </Tip>
+        ) : task.assignee ? (
+          <Avatar name={task.assignee} size="1.125rem" />
+        ) : null}
+        {arc === 'running' && (
+          <Tip label={k.arcRunning}>
+            <span className="shrink-0 cursor-help">
+              <RunClock task={task} />
+            </span>
+          </Tip>
+        )}
+        {arc === 'stale' && (
+          <Tip label={k.arcStale}>
+            <span className="shrink-0 cursor-help font-medium text-amber-500">{k.noHeartbeat}</span>
+          </Tip>
+        )}
+        {unassignedReady && !fallback && (
+          <Tip label={k.wontRunTip}>
+            <span className="inline-flex shrink-0 cursor-help items-center gap-1 text-amber-500">
+              <Codicon name="debug-disconnect" size="0.7rem" />
+              {k.wontRun}
+            </span>
+          </Tip>
+        )}
+        <FocusFlag task={task} />
       </div>
       <span
         onClick={event => event.stopPropagation()}
@@ -1981,14 +1985,12 @@ export function ArchiveDoneControl() {
 
   const archive = useMutation({
     mutationFn: archiveDone,
-    onError: err => host.notify({ kind: 'error', message: errText(err) }),
     onSuccess: result => {
       // Archive events will also invalidate through the socket, but reconcile
       // immediately rather than waiting for that asynchronous delivery.
       void qc.invalidateQueries({ queryKey: ['kanban', 'board'] })
       void qc.invalidateQueries({ queryKey: BOARDS_KEY })
       void qc.invalidateQueries({ queryKey: ['kanban', 'archive-done'] })
-      setOpen(false)
 
       if (result.failures.length > 0 || result.skipped_count > 0) {
         host.notify({
@@ -2010,22 +2012,17 @@ export function ArchiveDoneControl() {
         <Codicon name="archive" size="0.8rem" />
         {k.archiveDone}
       </Button>
-      <Dialog onOpenChange={next => !archive.isPending && setOpen(next)} open={open}>
-        <DialogContent className="w-[min(28rem,94vw)]">
-          <DialogHeader>
-            <DialogTitle>{k.archiveDone}</DialogTitle>
-          </DialogHeader>
-          <p className="text-sm text-(--ui-text-secondary)">{k.archiveDoneConfirm(doneCount, preflight?.scope.label ?? '')}</p>
-          <DialogFooter>
-            <Button disabled={archive.isPending} onClick={() => setOpen(false)} variant="ghost">
-              {k.cancel}
-            </Button>
-            <Button disabled={archive.isPending} onClick={() => archive.mutate()}>
-              {k.archiveDone}
-            </Button>
-          </DialogFooter>
-        </DialogContent>
-      </Dialog>
+      <ConfirmDialog
+        cancelLabel={k.cancel}
+        confirmLabel={k.archiveDone}
+        description={k.archiveDoneConfirm(doneCount, preflight?.scope.label ?? '')}
+        onClose={() => setOpen(false)}
+        onConfirm={async () => {
+          await archive.mutateAsync()
+        }}
+        open={open}
+        title={k.archiveDone}
+      />
     </>
   )
 }
