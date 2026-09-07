@@ -136,16 +136,21 @@ def _normalize_questions(questions) -> tuple:
     return normalized, None
 
 
-def _batch_result(normalized: List[dict], answers: dict, timed_out: bool) -> str:
-    """Batch result JSON; unanswered -> "". The top-level ``timed_out`` flag (present only when
-    true) tells the agent whether blanks are deliberate skips or the user walking away."""
+def _batch_result(normalized: List[dict], answers: dict, notes: dict, timed_out: bool) -> str:
+    """Batch result JSON; unanswered -> "" and optional notes stay on their response rows.
+    The top-level ``timed_out`` flag (present only when true) tells the agent whether blanks are
+    deliberate skips or the user walking away."""
     responses = []
     for entry in normalized:
         raw = answers.get(entry["qid"])
-        responses.append({
+        note = notes.get(entry["qid"])
+        response = {
             **({"id": entry["id"]} if entry["id"] else {}),
             "question": entry["question"], "choices_offered": entry["choices_offered"],
-            "user_response": _clean_answer(raw, entry["multi_select"]) if raw else ""})
+            "user_response": _clean_answer(raw, entry["multi_select"]) if raw else ""}
+        if note:
+            response["note"] = note
+        responses.append(response)
     result: Dict[str, object] = {"responses": responses}
     if timed_out:
         result["timed_out"] = True
@@ -154,12 +159,14 @@ def _batch_result(normalized: List[dict], answers: dict, timed_out: bool) -> str
 
 def _run_batch(normalized: List[dict], callback, question: str) -> str:
     """Dispatch a validated batch. Batch-capable callbacks (``questions`` kwarg) get the
-    whole list once and reply ``{"answers": {qid: raw}, "timed_out"?}`` as a dict or JSON
-    string (the tui_gateway bridge only carries strings); any other falsy/unparseable reply
-    is a cancel-all (mirrors the single-question skip). Legacy callbacks are looped per
-    question: an empty answer is a skip, a timeout (``None`` or the sentinel) means the user
-    walked away so the loop aborts instead of pestering them; earlier answers are kept."""
+    whole list once and reply ``{"answers": {qid: raw}, "notes": {qid: note}?, "timed_out"?}``
+    as a dict or JSON string (the tui_gateway bridge only carries strings); any other
+    falsy/unparseable reply is a cancel-all (mirrors the single-question skip). Legacy callbacks
+    are looped per question: an empty answer is a skip, a timeout (``None`` or the sentinel)
+    means the user walked away so the loop aborts instead of pestering them; earlier answers are
+    kept."""
     answers: dict = {}
+    notes: dict = {}
     timed_out = False
     if _accepts_kwarg(callback, "questions"):
         raw = callback(question, None, questions=normalized)
@@ -168,15 +175,16 @@ def _run_batch(normalized: List[dict], callback, question: str) -> str:
             raw = _json_as(raw, dict)  # the sentinel is not JSON -> None, timed_out stays True
         if isinstance(raw, dict):
             answers = dict(raw.get("answers") or {})
+            notes = dict(raw.get("notes") or {})
             timed_out = bool(raw.get("timed_out"))
-        return _batch_result(normalized, answers, timed_out)
+        return _batch_result(normalized, answers, notes, timed_out)
     for entry in normalized:
         raw = _invoke_callback(callback, entry["question"], entry["choices"], entry["multi_select"])
         if _is_timeout(raw):
             timed_out = True
             break
         answers[entry["qid"]] = raw
-    return _batch_result(normalized, answers, timed_out)
+    return _batch_result(normalized, answers, notes, timed_out)
 
 
 def clarify_tool(question: str, choices: Optional[List[str]] = None, multi_select: bool = False,
@@ -192,9 +200,10 @@ def clarify_tool(question: str, choices: Optional[List[str]] = None, multi_selec
     one batch (issue #18450). When present (non-empty), the single ``question``/``choices``/``multi_select``
     parameters are ignored and the result JSON is ``{"responses": [...]}`` (plus ``"timed_out": true`` when
     the user stopped answering partway). callback:     Platform-provided function that handles the actual UI
-    interaction. Batch-capable platforms additionally accept a ``questions`` keyword and receive the
-    normalized list in one call; platforms without it are looped one question at a time. Injected by the
-    agent runner (cli.py / gateway).
+    interaction. A single callback may return either a legacy answer or ``{"answer": answer,
+    "note": note?}``; batch-capable platforms additionally accept a ``questions`` keyword and
+    receive the normalized list in one call; platforms without it are looped one question at a
+    time. Injected by the agent runner (cli.py / gateway).
     """
     if questions is not None:
         normalized, error = _normalize_questions(questions)
@@ -225,9 +234,15 @@ def clarify_tool(question: str, choices: Optional[List[str]] = None, multi_selec
         raw_response = _invoke_callback(callback, question, shown, multi_select)
     except Exception as exc:
         return tool_error(f"Failed to get user input: {exc}")
-    return json.dumps({"question": question, "choices_offered": choices,
-                       "user_response": _clean_answer(raw_response, multi_select and choices is not None)},
-                      ensure_ascii=False)
+    note = None
+    if isinstance(raw_response, dict):
+        note = raw_response.get("note")
+        raw_response = raw_response.get("answer", "")
+    result = {"question": question, "choices_offered": choices,
+              "user_response": _clean_answer(raw_response, multi_select and choices is not None)}
+    if note:
+        result["note"] = note
+    return json.dumps(result, ensure_ascii=False)
 
 
 def check_clarify_requirements() -> bool:
