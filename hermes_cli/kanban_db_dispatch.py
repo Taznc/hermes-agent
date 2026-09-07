@@ -3523,6 +3523,13 @@ def _default_spawn(task: Task, workspace: str, *, board: Optional[str] = None) -
         workspace if os.path.isdir(workspace) else None,
         service_environment,
     )
+    # Apply the optional configured launcher after the restart-safe wrapper.  A
+    # systemd scope prefix recognizes an existing scope and preserves its real
+    # unit instead of nesting a non-existent outer unit.  The default [] path
+    # remains an argv and environment no-op.
+    prefix = _worker_launcher_prefix()
+    cmd, task.worker_unit = _apply_worker_launcher(task, cmd)
+    env.update(_worker_launcher_env_overrides(prefix))
     log_f = _open_worker_log(task, board)
     try:
         proc = subprocess.Popen(  # noqa: S603 -- argv is a fixed list built above

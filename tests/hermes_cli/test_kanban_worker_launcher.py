@@ -235,7 +235,7 @@ def test_worker_launcher_applies_even_when_restart_safe_argv_already_rewrapped(w
 
     # Simulate the supervised-gateway topology: _restart_safe_worker_argv
     # returns a DIFFERENT list object (as it does when it really rewraps).
-    def fake_restart_safe(_task, command):
+    def fake_restart_safe(_task, command, *_args):
         return ["restart-safe-wrapper", "--", *command]
 
     monkeypatch.setattr(kbd, "_restart_safe_worker_argv", fake_restart_safe)
@@ -286,7 +286,7 @@ def test_worker_launcher_skips_redundant_outer_scope_when_already_scope_wrapped(
     # has already produced a real systemd-run --user --scope invocation.
     inner_unit = "kanban-t_launcher-run-7.scope"
 
-    def fake_restart_safe(_task, command):
+    def fake_restart_safe(_task, command, *_args):
         return [
             "systemd-run", "--user", "--scope", "--quiet", "--unit", inner_unit,
             "--collect", "--", *command,
