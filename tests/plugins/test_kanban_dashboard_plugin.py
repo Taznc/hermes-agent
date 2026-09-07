@@ -417,6 +417,43 @@ def test_reopening_parent_demotes_ready_child(client):
     assert child_after_reopen["status"] == "todo"
 
 
+def test_dashboard_unarchives_parent_and_regates_children(client):
+    """The archived-card reopen route retracts completion and released work."""
+    parent = client.post("/api/plugins/kanban/tasks", json={"title": "p"}).json()["task"]
+    assert client.patch(
+        f"/api/plugins/kanban/tasks/{parent['id']}", json={"status": "done"},
+    ).status_code == 200
+    assert client.patch(
+        f"/api/plugins/kanban/tasks/{parent['id']}", json={"status": "archived"},
+    ).status_code == 200
+
+    released = client.post(
+        "/api/plugins/kanban/tasks", json={"title": "released", "parents": [parent["id"]]},
+    ).json()["task"]
+    assert released["status"] == "ready"
+
+    assert client.patch(
+        f"/api/plugins/kanban/tasks/{parent['id']}", json={"status": "todo"},
+    ).status_code == 200
+    reopened = client.get(
+        f"/api/plugins/kanban/tasks/{parent['id']}"
+    ).json()["task"]
+    assert reopened["completed_at"] is None
+    released_after_reopen = client.get(
+        f"/api/plugins/kanban/tasks/{released['id']}"
+    ).json()["task"]
+    assert released_after_reopen["status"] == "todo"
+
+    assert client.patch(
+        f"/api/plugins/kanban/tasks/{parent['id']}", json={"status": "archived"},
+    ).status_code == 200
+
+    child = client.post(
+        "/api/plugins/kanban/tasks", json={"title": "must remain gated", "parents": [parent["id"]]},
+    ).json()["task"]
+    assert child["status"] == "todo"
+
+
 def test_reopening_parent_retracts_review_and_blocks_approval(client):
     with kbc.connect() as conn:
         parent_id = kb.create_task(conn, title="parent", assignee="planner")
@@ -1119,6 +1156,29 @@ def test_archived_task_reopens_only_through_evented_unarchive(client):
             """,
         ).fetchone()[0]
     assert mismatches == 0
+
+
+def test_bulk_archive_completed_parent_preserves_child_promotion(client):
+    parent = client.post("/api/plugins/kanban/tasks", json={"title": "completed parent"}).json()["task"]
+    sibling = client.post("/api/plugins/kanban/tasks", json={"title": "active sibling"}).json()["task"]
+    assert client.post(
+        "/api/plugins/kanban/tasks/bulk", json={"ids": [parent["id"]], "status": "done"},
+    ).status_code == 200
+    child = client.post(
+        "/api/plugins/kanban/tasks",
+        json={"title": "child", "parents": [parent["id"], sibling["id"]]},
+    ).json()["task"]
+    assert child["status"] == "todo"
+
+    archived = client.post(
+        "/api/plugins/kanban/tasks/bulk", json={"ids": [parent["id"]], "archive": True},
+    )
+    assert archived.status_code == 200
+    assert archived.json()["results"] == [{"id": parent["id"], "ok": True}]
+    assert client.post(
+        "/api/plugins/kanban/tasks/bulk", json={"ids": [sibling["id"]], "status": "done"},
+    ).status_code == 200
+    assert client.get(f"/api/plugins/kanban/tasks/{child['id']}").json()["task"]["status"] == "ready"
 
 
 def test_bulk_reassign(client):
