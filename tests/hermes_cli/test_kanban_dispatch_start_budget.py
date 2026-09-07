@@ -30,16 +30,18 @@ def test_resolve_dispatch_caps_includes_start_budget(monkeypatch):
     assert caps.dispatch_start_window_seconds == 600
 
 
-def test_start_budget_trips_sticky_board_pause(all_assignees_spawnable):
+def test_start_budget_cooldown_expires_and_dispatches_without_manual_resume(
+    all_assignees_spawnable,
+):
     board = "usage-guard"
     with kbc.connect(board=board) as conn:
         prior = kb.create_task(conn, title="already started", assignee="worker")
-        queued = kb.create_task(conn, title="do not start", assignee="worker")
+        queued = kb.create_task(conn, title="starts after cooldown", assignee="worker")
         kb._append_event(conn, prior, "spawned", {"pid": 1})
         conn.execute("UPDATE tasks SET status = 'on_hold' WHERE id = ?", (prior,))
         conn.commit()
 
-        result = kbd.dispatch_once(
+        limited = kbd.dispatch_once(
             conn,
             board=board,
             spawn_fn=_spawn,
@@ -47,34 +49,21 @@ def test_start_budget_trips_sticky_board_pause(all_assignees_spawnable):
             dispatch_start_window_seconds=600,
         )
 
-        assert result.spawned == []
-        assert result.dispatch_paused is not None
-        assert result.dispatch_paused["reason"] == "start_budget_exceeded"
-        assert result.dispatch_paused["recent_starts"] == 1
+        assert limited.spawned == []
+        assert limited.dispatch_paused is not None
+        assert limited.dispatch_paused["reason"] == "start_budget_exceeded"
+        assert limited.dispatch_paused["recent_starts"] == 1
+        assert limited.dispatch_paused["next_eligible_at"] > int(time.time())
         assert kb.get_task(conn, queued).status == "ready"
 
-    # Sliding-window expiry alone must not silently resume a circuit that fired.
+    # The earliest start leaving the rolling window frees exactly one slot on
+    # the next shared dispatcher tick; no --resume-circuit is required.
     with kbc.connect(board=board) as conn:
         conn.execute(
             "UPDATE task_events SET created_at = ? WHERE kind = 'spawned'",
             (int(time.time()) - 3600,),
         )
         conn.commit()
-        still_paused = kbd.dispatch_once(
-            conn,
-            board=board,
-            spawn_fn=_spawn,
-            dispatch_start_budget=1,
-            dispatch_start_window_seconds=600,
-        )
-        assert still_paused.spawned == []
-        assert still_paused.dispatch_paused["reason"] == "start_budget_exceeded"
-
-    cleared = kbd.resume_dispatch(board)
-    assert cleared["was_paused"] is True
-    assert kbd.read_dispatch_pause(board) is None
-
-    with kbc.connect(board=board) as conn:
         resumed = kbd.dispatch_once(
             conn,
             board=board,
@@ -82,7 +71,11 @@ def test_start_budget_trips_sticky_board_pause(all_assignees_spawnable):
             dispatch_start_budget=1,
             dispatch_start_window_seconds=600,
         )
+
         assert [task_id for task_id, _who, _ws in resumed.spawned] == [queued]
+        assert resumed.dispatch_paused is not None
+        assert resumed.dispatch_paused["reason"] == "start_budget_exceeded"
+        assert kbd.read_dispatch_pause(board) is not None
 
 
 def test_terminal_card_replay_violation_trips_pause_before_spawn():
@@ -113,6 +106,19 @@ def test_terminal_card_replay_violation_trips_pause_before_spawn():
         assert result.dispatch_paused["reason"] == "terminal_card_replay"
         assert result.dispatch_paused["task_ids"] == [terminal]
         assert kb.get_task(conn, terminal).status == "ready"
+
+    # A safety pause is not a cooldown: changing time cannot restart this board.
+    with kbc.connect(board=board) as conn:
+        still_paused = kbd.dispatch_once(
+            conn,
+            board=board,
+            spawn_fn=_spawn,
+            dispatch_start_budget=20,
+            dispatch_start_window_seconds=1,
+        )
+        assert still_paused.spawned == []
+        assert still_paused.dispatch_paused is not None
+        assert still_paused.dispatch_paused["reason"] == "terminal_card_replay"
 
 
 def test_explicit_unarchive_is_not_treated_as_terminal_replay(
@@ -169,6 +175,27 @@ def test_descendant_invalidation_is_not_treated_as_terminal_replay(
         assert (task_id, "recent_success") in result.respawn_guarded
 
 
+def test_malformed_start_budget_pause_state_fails_closed(all_assignees_spawnable):
+    board = "malformed-rate-limit"
+    pause_path = kbd._dispatch_pause_path(board)
+    pause_path.parent.mkdir(parents=True, exist_ok=True)
+    pause_path.write_text('{"reason": "start_budget_exceeded"}\n', encoding="utf-8")
+
+    with kbc.connect(board=board) as conn:
+        kb.create_task(conn, title="must stay queued", assignee="worker")
+        result = kbd.dispatch_once(
+            conn,
+            board=board,
+            spawn_fn=_spawn,
+            dispatch_start_budget=1,
+            dispatch_start_window_seconds=600,
+        )
+
+    assert result.spawned == []
+    assert result.dispatch_paused is not None
+    assert result.dispatch_paused["reason"] == "pause_state_unreadable"
+
+
 def test_unreadable_pause_state_fails_closed_until_explicit_resume(
     all_assignees_spawnable,
 ):
@@ -184,6 +211,13 @@ def test_unreadable_pause_state_fails_closed_until_explicit_resume(
     assert result.spawned == []
     assert result.dispatch_paused is not None
     assert result.dispatch_paused["reason"] == "pause_state_unreadable"
+
+    with kbc.connect(board=board) as conn:
+        still_paused = kbd.dispatch_once(conn, board=board, spawn_fn=_spawn)
+    assert still_paused.spawned == []
+    assert still_paused.dispatch_paused is not None
+    assert still_paused.dispatch_paused["reason"] == "pause_state_unreadable"
+
     resumed = kbd.resume_dispatch(board)
     assert resumed["was_paused"] is True
     assert kbd.read_dispatch_pause(board) is None

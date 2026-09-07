@@ -139,3 +139,28 @@ def test_cli_dispatch_passes_nondefault_board_to_connection_and_dispatch(
     }
 
 
+def test_cli_circuit_status_distinguishes_rate_limit_from_manual_pause(
+    isolated_kanban_home, monkeypatch, capsys,
+):
+    from hermes_cli import kanban as kb_cli
+    from hermes_cli import kanban_db_dispatch as kbd
+
+    args = argparse.Namespace(
+        board="secondary", resume_circuit=False, circuit_status=True, json=False,
+    )
+    monkeypatch.setattr(
+        kbd,
+        "read_dispatch_pause",
+        lambda _board: {"reason": "start_budget_exceeded", "next_eligible_at": 1_800_000_000},
+    )
+
+    assert kb_cli._cmd_dispatch(args) == 0
+    assert "rate limited until" in capsys.readouterr().out
+
+    monkeypatch.setattr(
+        kbd,
+        "read_dispatch_pause",
+        lambda _board: {"reason": "terminal_card_replay"},
+    )
+    assert kb_cli._cmd_dispatch(args) == 0
+    assert "manual intervention required" in capsys.readouterr().out

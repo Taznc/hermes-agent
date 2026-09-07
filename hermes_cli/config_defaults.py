@@ -1733,10 +1733,10 @@ DEFAULT_CONFIG = {
         # fan-out workflows that would otherwise saturate one profile's local model / API quota / browser
         # pool while leaving other profiles idle. See #21582.
         "max_in_progress_per_profile": None,
-        # Per-board worker-session start circuit. A positive integer allows at
-        # most this many `spawned` events within dispatch_start_window_seconds,
-        # then writes a sticky board pause. Reclaim/promotion continue, but new
-        # starts require `hermes kanban dispatch --resume-circuit`. None = off.
+        # Per-board worker-session rolling start rate limit. A positive integer
+        # allows at most this many `spawned` events within
+        # dispatch_start_window_seconds; queued work resumes automatically when
+        # the earliest start leaves the window. None = off.
         "dispatch_start_budget": None,
         "dispatch_start_window_seconds": 600,
         # After two reviewer changes-requested cycles, route the next rework run
