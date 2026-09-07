@@ -85,6 +85,16 @@ _DEFAULT_WORKER_MEMORY_MAX_BYTES = 1024 * 1024 * 1024
 _WORKER_MEMORY_MAX_CAP_BYTES = 4 * 1024 * 1024 * 1024
 
 
+class RestartSafeScopeUnavailable(RuntimeError):
+    """The supervised-worker scope prerequisite is unavailable on this host.
+
+    This typed boundary lets dispatchers distinguish a shared host prerequisite
+    outage from an ordinary worker-specific spawn error without parsing prose.
+    """
+
+    fault_code = "systemd_user_scope_unavailable"
+
+
 def _worker_memory_max_bytes() -> int:
     """Finite per-worker cgroup limit that can never widen host risk.
     ``TERMINAL_LOCAL_MEMORY_MAX_MB`` is honored only when it *tightens* the safe
@@ -337,7 +347,7 @@ def restart_safe_supervised_child_argv(
     if not _is_supervised_worker_dispatcher():
         return command
     if not _systemd_run_user_scope_available():
-        raise RuntimeError(
+        raise RestartSafeScopeUnavailable(
             "cannot create restart-safe systemd scope for supervised child: "
             "systemd-run --user --scope is unavailable"
         )

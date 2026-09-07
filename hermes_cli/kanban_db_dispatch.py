@@ -244,9 +244,9 @@ class DispatchResult:
     workers), ``"elevated"`` (at most one), ``None`` (no restriction).
     Reclaim/promotion bookkeeping still ran; deferred tasks stay queued."""
     dispatch_paused: Optional[dict[str, Any]] = None
-    """Sticky per-board start-budget circuit state. While present, reclaim and
+    """Sticky per-board dispatch-circuit state. While present, reclaim and
     promotion still run but no new workers spawn until an operator explicitly
-    resumes the board."""
+    resumes the board after the recorded recovery action."""
 
 
 # Bounded registry of recently-reaped worker exits, filled by the reap loop in
@@ -1952,13 +1952,88 @@ def _write_dispatch_pause(
 
 
 def resume_dispatch(board: Optional[str] = None) -> dict[str, Any]:
-    """Explicitly clear a board's sticky start-budget/replay circuit."""
+    """Explicitly clear a board's sticky dispatch circuit after operator repair."""
     _kb._assert_not_delegated_child_mutation()
     path = _dispatch_pause_path(board)
     previous = read_dispatch_pause(board)
     with contextlib.suppress(FileNotFoundError):
         path.unlink()
     return {"was_paused": previous is not None, "previous": previous}
+
+
+def _is_shared_launcher_prerequisite_fault(exc: BaseException) -> bool:
+    """Whether *exc* is the one host-scoped launch fault the board can share.
+
+    The type originates exactly where the restart-safe user-scope availability
+    probe fails.  Do not broaden this to message matching: credentials,
+    workspace errors, and a disappearing launcher are task-local failures and
+    must retain the normal per-card retry semantics.
+    """
+    from tools.process_registry import RestartSafeScopeUnavailable
+
+    return isinstance(exc, RestartSafeScopeUnavailable)
+
+
+def _defer_for_shared_launcher_prerequisite(
+    conn: sqlite3.Connection,
+    task: Task,
+    exc: BaseException,
+    result: DispatchResult,
+    *,
+    board: Optional[str],
+) -> None:
+    """Release one claimed task and pause its board without charging the task.
+
+    The dispatcher lock makes the pause visible before another tick can claim a
+    sibling.  The triggering run is retained as a non-failure ``spawn_deferred``
+    receipt, while every task failure field remains untouched.
+    """
+    from tools.process_registry import RestartSafeScopeUnavailable
+
+    fault_code = RestartSafeScopeUnavailable.fault_code
+    error = str(exc)[:500]
+    tripped_at = int(time.time())
+    state = _write_dispatch_pause(
+        board,
+        "restart_safe_scope_unavailable",
+        fault_code=fault_code,
+        trigger_task_id=task.id,
+        error=error,
+        tripped_at=tripped_at,
+        recovery="repair the user scope prerequisite, then run `hermes kanban dispatch --resume-circuit`",
+    )
+    with _kb.write_txn(conn):
+        row = conn.execute(
+            "SELECT current_run_id FROM tasks WHERE id = ? AND status = 'running'",
+            (task.id,),
+        ).fetchone()
+        if row is None:
+            return
+        retry_status = _kb._retry_status_for_run(conn, task.id, row["current_run_id"])
+        cur = conn.execute(
+            "UPDATE tasks SET status = ?, claim_lock = NULL, claim_expires = NULL, "
+            "worker_pid = NULL, worker_unit = NULL WHERE id = ? AND status = 'running'",
+            (retry_status, task.id),
+        )
+        if cur.rowcount != 1:
+            return
+        run_id = _kb._end_run(
+            conn,
+            task.id,
+            outcome="spawn_deferred",
+            status="spawn_deferred",
+            error=error,
+            metadata={"fault_code": fault_code, "board_circuit": state},
+        )
+        _kb._append_event(
+            conn,
+            task.id,
+            "dispatch_circuit_tripped",
+            {"fault_code": fault_code, "board": board or _kb.DEFAULT_BOARD,
+             "tripped_at": tripped_at, "error": error, "recovery": state["recovery"]},
+            run_id=run_id,
+        )
+    result.dispatch_paused = state
 
 
 def _recent_dispatch_starts(
@@ -2243,6 +2318,11 @@ def _dispatch_lane_task(
         _claim_coedit_paths(claimed.id, claimed.tenant)
         return True
     except Exception as exc:
+        if _is_shared_launcher_prerequisite_fault(exc):
+            _defer_for_shared_launcher_prerequisite(
+                conn, claimed, exc, result, board=board,
+            )
+            return False
         if _record_task_failure(
             conn, claimed.id, str(exc),
             outcome="spawn_failed", failure_limit=failure_limit, release_claim=True, end_run=True,
@@ -2793,6 +2873,8 @@ def _dispatch_once_locked(
                 row_assignee = rework_escalation_profile
         if _dispatch_lane_task(conn, row, row_assignee, result, lane="ready", **lane_kwargs):
             spawned += 1
+        if result.dispatch_paused is not None:
+            return result
 
     # A review agent (sdlc-review) approves (→ done) or requests changes
     # (→ ready/todo). Review spawns share max_spawn with ready tasks. The loop
@@ -2830,6 +2912,8 @@ def _dispatch_once_locked(
                 row_assignee = default_reviewer
         if _dispatch_lane_task(conn, row, row_assignee, result, lane="review", **lane_kwargs):
             spawned += 1
+        if result.dispatch_paused is not None:
+            return result
 
     if start_budget is not None and spawned and not dry_run:
         recent_starts = _recent_dispatch_starts(conn, window_seconds=start_window)
