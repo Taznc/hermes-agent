@@ -13524,6 +13524,7 @@ def test_interrupt_only_clears_own_session_pending():
         ev_a = threading.Event()
         ev_b = threading.Event()
         server._pending["rid-a"] = ("sid_a", ev_a)
+        server._pending_prompt_payloads["rid-a"] = ("clarify.request", {"request_id": "rid-a"})
         server._pending["rid-b"] = ("sid_b", ev_b)
         server._answers.clear()
 
@@ -13537,9 +13538,11 @@ def test_interrupt_only_clears_own_session_pending():
         )
         assert resp.get("result"), f"got error: {resp.get('error')}"
 
-        # Session A's pending must be released to empty.
+        # Session A's clarify must be released as an agent-readable cancellation,
+        # never as a deliberate blank Skip.
         assert ev_a.is_set(), "sid_a pending Event should be set after interrupt"
-        assert server._answers.get("rid-a") == ""
+        from tools.clarify_tool import CANCELLED_RESPONSE
+        assert server._answers.get("rid-a") == CANCELLED_RESPONSE
 
         # Session B's pending MUST remain untouched — no cross-session blast.
         assert not ev_b.is_set(), (
@@ -13553,8 +13556,106 @@ def test_interrupt_only_clears_own_session_pending():
         server._sessions.pop("sid_b", None)
         server._pending.pop("rid-a", None)
         server._pending.pop("rid-b", None)
+        server._pending_prompt_payloads.pop("rid-a", None)
+        server._pending_prompt_payloads.pop("rid-b", None)
         server._answers.pop("rid-a", None)
         server._answers.pop("rid-b", None)
+
+
+def test_interrupt_clarify_callback_returns_cancelled_result_not_blank():
+    """The live gateway callback must carry a stop through clarify_tool's result seam."""
+    from tools.clarify_tool import clarify_tool
+
+    session = _session()
+    session["agent"] = types.SimpleNamespace(interrupt=lambda: None)
+    server._sessions["cancel-clarify"] = session
+    result = {}
+
+    worker = threading.Thread(
+        target=lambda: result.setdefault(
+            "value",
+            json.loads(clarify_tool(
+                "Continue?", callback=server._agent_cbs("cancel-clarify")["clarify_callback"],
+            )),
+        ),
+    )
+    worker.start()
+    try:
+        deadline = time.monotonic() + 1
+        while not server._pending and time.monotonic() < deadline:
+            time.sleep(0.01)
+        assert len(server._pending) == 1
+
+        response = server.handle_request({
+            "id": "stop", "method": "session.interrupt", "params": {"session_id": "cancel-clarify"},
+        })
+
+        assert response["result"]
+        worker.join(timeout=1)
+        assert result["value"]["user_response"] == ""
+        assert result["value"]["cancelled"] is True
+        assert "timed_out" not in result["value"]
+    finally:
+        server._clear_pending(None)
+        worker.join(timeout=1)
+        server._sessions.pop("cancel-clarify", None)
+
+
+def test_interrupt_batch_clarify_callback_returns_cancelled_result_not_skip():
+    """Stopping a batch preserves its explicit cancellation reason through the real callback."""
+    from tools.clarify_tool import clarify_tool
+
+    session = _session()
+    session["agent"] = types.SimpleNamespace(interrupt=lambda: None)
+    server._sessions["cancel-batch-clarify"] = session
+    result = {}
+
+    worker = threading.Thread(
+        target=lambda: result.setdefault(
+            "value",
+            json.loads(clarify_tool(
+                "",
+                questions=[{"question": "One?"}, {"question": "Two?"}],
+                callback=server._agent_cbs("cancel-batch-clarify")["clarify_callback"],
+            )),
+        ),
+    )
+    worker.start()
+    try:
+        deadline = time.monotonic() + 1
+        while not server._pending and time.monotonic() < deadline:
+            time.sleep(0.01)
+        assert len(server._pending) == 1
+
+        response = server.handle_request({
+            "id": "stop", "method": "session.interrupt", "params": {"session_id": "cancel-batch-clarify"},
+        })
+
+        assert response["result"]
+        worker.join(timeout=1)
+        assert result["value"]["cancelled"] is True
+        assert "timed_out" not in result["value"]
+        assert [row["user_response"] for row in result["value"]["responses"]] == ["", ""]
+    finally:
+        server._clear_pending(None)
+        worker.join(timeout=1)
+        server._sessions.pop("cancel-batch-clarify", None)
+
+
+def test_clarify_callback_timeout_returns_timed_out_result_not_skip(monkeypatch):
+    """The configured gateway timeout must reach the final single-question result as a timeout."""
+    from tools.clarify_tool import clarify_tool
+
+    monkeypatch.setattr(server, "_clarify_timeout_seconds", lambda: 0.01)
+    monkeypatch.setattr(server, "_emit", lambda *_args, **_kwargs: None)
+
+    result = json.loads(clarify_tool(
+        "Continue?", callback=server._agent_cbs("timeout-clarify")["clarify_callback"],
+    ))
+
+    assert result["user_response"] == ""
+    assert result["timed_out"] is True
+    assert "cancelled" not in result
 
 
 def test_interrupt_clears_multiple_own_pending():
