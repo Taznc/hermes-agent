@@ -312,7 +312,10 @@ describe('ClarifyTool help controls', () => {
       />
     )
 
-    expect(screen.getByText('Help requested')).toBeTruthy()
+    const details = screen.getByText('Help requested').closest('details') as HTMLDetailsElement
+    expect(details.open).toBe(false)
+    fireEvent.click(screen.getByText('Help requested'))
+    expect(details.open).toBe(true)
     expect(screen.getByText('Production affects customer traffic.')).toBeTruthy()
   })
 
