@@ -130,6 +130,28 @@ def test_dashboard_nudge_reports_an_actionable_rate_limit(client, configured, sp
     assert "automatically" in payload["dispatch_status"]
 
 
+def test_dashboard_nudge_names_the_board_in_manual_recovery_status(client, configured, spawns):
+    board = "manual-recovery"
+    kb.create_board(board)
+    configured(
+        max_in_progress=10,
+        max_in_progress_per_profile=10,
+        dispatch_start_budget=1,
+        dispatch_start_window_seconds=600,
+    )
+    with kbc.connect_closing(board=board) as conn:
+        task_id = kb.create_task(conn, title="corrupt replay", assignee="worker")
+        conn.execute("UPDATE tasks SET status = 'ready' WHERE id = ?", (task_id,))
+        kb._append_event(conn, task_id, "completed", {})
+        conn.commit()
+
+    response = client.post(f"/api/plugins/kanban/dispatch?max=8&board={board}")
+
+    assert response.status_code == 200
+    assert "manual intervention required" in response.json()["dispatch_status"]
+    assert f"hermes kanban --board {board} dispatch --resume-circuit" in response.json()["dispatch_status"]
+
+
 # ---------------------------------------------------------------------------
 # The host-wide cap
 # ---------------------------------------------------------------------------

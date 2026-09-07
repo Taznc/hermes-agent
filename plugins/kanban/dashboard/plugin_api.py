@@ -1673,7 +1673,7 @@ def dispatch(dry_run: bool = Query(False), max_n: int = Query(8, alias="max"), b
             payload = asdict(result)  # DispatchResult is a dataclass
             pause = payload.get("dispatch_paused")
             if isinstance(pause, dict):
-                payload["dispatch_status"] = kbd.dispatch_pause_message(pause)
+                payload["dispatch_status"] = kbd.dispatch_pause_message(pause, board=board)
             return payload
         except TypeError:
             return {"result": str(result)}

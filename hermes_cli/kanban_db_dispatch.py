@@ -246,9 +246,9 @@ class DispatchResult:
     workers), ``"elevated"`` (at most one), ``None`` (no restriction).
     Reclaim/promotion bookkeeping still ran; deferred tasks stay queued."""
     dispatch_paused: Optional[dict[str, Any]] = None
-    """Sticky per-board start-budget circuit state. While present, reclaim and
-    promotion still run but no new workers spawn until an operator explicitly
-    resumes the board."""
+    """Current per-board dispatch stop state. Start-budget records are
+    self-expiring cooldowns; integrity/safety records remain sticky until an
+    operator explicitly resumes the board."""
 
 
 # Bounded registry of recently-reaped worker exits, filled by the reap loop in
@@ -1966,11 +1966,9 @@ def _write_dispatch_pause(
         with contextlib.suppress(FileNotFoundError):
             tmp.unlink()
     _kb._log.warning(
-        "kanban dispatch %s for board %s: %s (%s)",
-        "rate limited" if reason == "start_budget_exceeded" else "paused",
+        "kanban dispatch for board %s: %s",
         board or _kb.DEFAULT_BOARD,
-        reason,
-        details,
+        dispatch_pause_message(state, board=board),
     )
     return state
 
@@ -1982,24 +1980,37 @@ def _clear_expired_start_budget_pause(board: Optional[str]) -> None:
 
 
 def _recent_dispatch_start_window(
-    conn: sqlite3.Connection, *, window_seconds: int, now: Optional[int] = None,
+    conn: sqlite3.Connection, *, window_seconds: int, budget: int = 1,
+    now: Optional[int] = None,
 ) -> tuple[int, Optional[int]]:
-    """Return starts in the inclusive window and their exact next eligible time."""
+    """Return starts in the inclusive window and the exact next eligible time.
+
+    When a live reload changes the budget, more than one in-window start may
+    need to age out before another start is legal. The required expiry is the
+    ``count - budget``-indexed start, not always the oldest one: after it
+    leaves the inclusive window, exactly ``budget - 1`` starts remain.
+    """
     current = int(now if now is not None else time.time())
     cutoff = current - window_seconds
     row = conn.execute(
-        "SELECT COUNT(*) AS count, MIN(created_at) AS oldest FROM task_events "
+        "SELECT COUNT(*) AS count FROM task_events "
         "WHERE kind = 'spawned' AND created_at >= ?",
         (cutoff,),
     ).fetchone()
     starts = int(row["count"])
-    oldest = row["oldest"]
+    if starts < budget:
+        return starts, None
+    expiry_row = conn.execute(
+        "SELECT created_at FROM task_events WHERE kind = 'spawned' AND created_at >= ? "
+        "ORDER BY created_at, id LIMIT 1 OFFSET ?",
+        (cutoff, starts - budget),
+    ).fetchone()
     # The query includes the cutoff boundary, so capacity returns one second
-    # after the oldest start is no longer in the measured interval.
-    return starts, (int(oldest) + window_seconds + 1 if oldest is not None else None)
+    # after the final required start is no longer in the measured interval.
+    return starts, int(expiry_row["created_at"]) + window_seconds + 1
 
 
-def dispatch_pause_message(state: Mapping[str, Any]) -> str:
+def dispatch_pause_message(state: Mapping[str, Any], *, board: Optional[str] = None) -> str:
     """One status message for CLI, gateway-backed dashboard, and API callers."""
     if state.get("reason") == "start_budget_exceeded":
         next_eligible = state.get("next_eligible_at")
@@ -2007,9 +2018,13 @@ def dispatch_pause_message(state: Mapping[str, Any]) -> str:
             when = datetime.fromtimestamp(next_eligible, tz=timezone.utc).isoformat()
             return f"rate limited until {when}; dispatch resumes automatically"
         return "rate limited; dispatch resumes automatically when capacity is available"
+    command = "hermes kanban "
+    if board:
+        command += f"--board {board} "
+    command += "dispatch --resume-circuit"
     return (
         f"manual intervention required ({state.get('reason', 'unknown pause')}); "
-        "resume explicitly with: hermes kanban dispatch --resume-circuit"
+        f"resume explicitly with: {command}"
     )
 
 
@@ -2740,7 +2755,7 @@ def _dispatch_once_locked(
                 _clear_expired_start_budget_pause(board)
         else:
             recent_starts, next_eligible_at = _recent_dispatch_start_window(
-                conn, window_seconds=start_window,
+                conn, window_seconds=start_window, budget=start_budget,
             )
             if recent_starts >= start_budget:
                 result.dispatch_paused = _write_dispatch_pause(
@@ -2776,7 +2791,7 @@ def _dispatch_once_locked(
 
     if start_budget is not None:
         recent_starts, next_eligible_at = _recent_dispatch_start_window(
-            conn, window_seconds=start_window,
+            conn, window_seconds=start_window, budget=start_budget,
         )
         if recent_starts >= start_budget:
             result.dispatch_paused = {
@@ -2923,7 +2938,7 @@ def _dispatch_once_locked(
 
     if start_budget is not None and spawned and not dry_run:
         recent_starts, next_eligible_at = _recent_dispatch_start_window(
-            conn, window_seconds=start_window,
+            conn, window_seconds=start_window, budget=start_budget,
         )
         if recent_starts >= start_budget:
             result.dispatch_paused = _write_dispatch_pause(

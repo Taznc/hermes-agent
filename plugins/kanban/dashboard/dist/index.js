@@ -1300,7 +1300,11 @@
           search, setSearch,
           onNudgeDispatch: function () {
             SDK.fetchJSON(withBoard(`${API}/dispatch?max=8`, board), { method: "POST" })
-              .then(loadBoard)
+              .then(function (result) {
+                return loadBoard().then(function () {
+                  if (result && result.dispatch_status) setError(result.dispatch_status);
+                });
+              })
               .catch(function (e) { setError(String(e.message || e)); });
           },
           onRefresh: loadBoard,

@@ -163,4 +163,6 @@ def test_cli_circuit_status_distinguishes_rate_limit_from_manual_pause(
         lambda _board: {"reason": "terminal_card_replay"},
     )
     assert kb_cli._cmd_dispatch(args) == 0
-    assert "manual intervention required" in capsys.readouterr().out
+    output = capsys.readouterr().out
+    assert "manual intervention required" in output
+    assert "hermes kanban --board secondary dispatch --resume-circuit" in output
