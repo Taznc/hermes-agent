@@ -72,13 +72,24 @@ def test_dashboard_clear_unknown_handle_is_404(client):
     assert response.status_code == 404
 
 
-def test_dashboard_bundle_renders_quota_details_and_manual_clear():
-    bundle = (
-        Path(__file__).resolve().parents[2]
-        / "plugins" / "kanban" / "dashboard" / "dist" / "index.js"
-    ).read_text(encoding="utf-8")
-    assert "function QuotaCircuitBanner" in bundle
-    assert "Boards deferred" in bundle
-    assert "Next eligible" in bundle
-    assert "Clear circuit" in bundle
-    assert "quota-circuits/" in bundle
+def test_dashboard_reports_recovering_state_after_probe(client, monkeypatch):
+    monkeypatch.setattr(kqc.time, "time", lambda: 10_000)
+    kqc.register_quota_circuit(
+        "private-account-name", retry_after=10, board="default", task_id="t_source",
+        reason="rate_limit", max_seconds=3600,
+    )
+    monkeypatch.setattr(kqc.time, "time", lambda: 10_010)
+    monkeypatch.setattr(kqc, "configured_budget_groups", lambda: {
+        "private-account-name": {"providers": ["openai-codex"], "profiles": ["implementer"]},
+    })
+    from hermes_cli import kanban_db_connect as kbc
+    with kbc.connect(board="default") as conn:
+        task_id = kb.create_task(
+            conn, title="probe", assignee="implementer",
+            model_override="m", provider_override="openai-codex",
+        )
+        assert kqc.task_quota_guard(conn, task_id, board="default", consume_probe=True) is None
+    circuit = client.get("/api/plugins/kanban/quota-circuits").json()["circuits"][0]
+    assert circuit["state"] == "recovering"
+    assert circuit["next_eligible_at"] == 10_010 + kqc._resume_spread_seconds()
+    assert "private-account-name" not in repr(circuit)

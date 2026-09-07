@@ -230,19 +230,25 @@ def _profile_home(profile: str) -> Path:
 def predict_auto_provider(profile: str) -> Optional[str]:
     """Predict which provider ``provider=auto`` resolves to for ``profile``.
 
-    Runs the worker's own resolution ladder (:func:`hermes_cli.auth.resolve_provider`)
-    under the profile's Hermes home, so the answer reflects that profile's
-    config, ``.env`` and OAuth state rather than the dispatcher's. Returns
-    ``None`` when resolution fails or is unavailable; callers treat that as
-    unprovable and fail closed.
+    Mirrors the worker's own startup ladder — ``resolve_requested_provider``
+    (config ``model.provider`` / env) and then :func:`hermes_cli.auth.resolve_provider`
+    for a genuine ``auto`` — under the profile's Hermes home, so the answer
+    reflects that profile's config, ``.env`` and OAuth state rather than the
+    dispatcher's. The worker is spawned without ``--provider`` and inherits
+    the dispatcher environment, so it resolves from the same inputs moments
+    later. Returns ``None`` when resolution fails or is unavailable; callers
+    treat that as unprovable and fail closed.
     """
     from hermes_constants import reset_hermes_home_override, set_hermes_home_override
 
     token = set_hermes_home_override(_profile_home(profile))
     try:
         from hermes_cli.auth import resolve_provider
+        from hermes_cli.runtime_provider import resolve_requested_provider
 
-        provider = resolve_provider("auto")
+        provider = resolve_requested_provider(None)
+        if provider == "auto":
+            provider = resolve_provider("auto")
     except Exception as exc:
         _log.debug("kanban quota circuit: auto resolution for %s failed: %s", profile, exc)
         return None

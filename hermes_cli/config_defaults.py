@@ -1727,13 +1727,17 @@ DEFAULT_CONFIG = {
         #   primary-wallet:
         #     providers: [openai-codex]
         #     profiles: [implementer, reviewer]
-        # A route matches both lists; `*` is accepted only when written. Auto
-        # routes must list `auto` explicitly and may list multiple candidate
-        # groups, dispatching only while at least one remains healthy.
+        # A route matches both lists; `*` is accepted only when written. A task
+        # with provider `auto` is a candidate for every group mapped to its
+        # profile: the dispatcher predicts the provider the worker's own
+        # resolution ladder will choose and starts it only when that provider
+        # maps to an unpaused group. Unpredictable or unmapped resolution fails
+        # closed while any candidate group is paused.
         "quota_budget_groups": {},
-        # At a circuit deadline, admit one probe globally, then hold other
-        # matching starts this many seconds. A renewed quota event extends the
-        # circuit; otherwise the circuit clears automatically after the spread.
+        # At a circuit deadline, admit one recovery probe host-wide, then admit
+        # at most one further matching start per this many seconds until no
+        # start has been admitted for four such windows. A renewed quota event
+        # re-arms the circuit.
         "quota_resume_spread_seconds": 30,
         # Max consecutive infra interruptions (external SIGTERM/SIGKILL, startup-window
         # dead pid, quota signature including malformed/missing retry-after) before the

@@ -251,6 +251,8 @@ def test_auto_route_fails_closed_unless_resolution_avoids_paused_group(quota_hom
 
 
 def test_auto_prediction_runs_resolver_under_profile_home(quota_home, monkeypatch):
+    monkeypatch.delenv("HERMES_INFERENCE_PROVIDER", raising=False)
+    (quota_home / "profiles" / "implementer").mkdir(parents=True)
     seen: list[str] = []
 
     def fake_resolve(requested=None, **_kw):
@@ -264,11 +266,22 @@ def test_auto_prediction_runs_resolver_under_profile_home(quota_home, monkeypatc
     assert kqc.predict_auto_provider("implementer") == "anthropic"
     assert seen == [str(quota_home / "profiles" / "implementer")]
 
+    # A profile whose config pins model.provider is resolved from that config,
+    # exactly as the worker's own startup does.
+    pinned_home = quota_home / "profiles" / "pinned"
+    pinned_home.mkdir(parents=True)
+    (pinned_home / "config.yaml").write_text("model:\n  provider: openai-codex\n", encoding="utf-8")
+    assert kqc.predict_auto_provider("pinned") == "openai-codex"
+    assert len(seen) == 1
+
     def broken(requested=None, **_kw):
         raise RuntimeError("no provider configured")
 
     monkeypatch.setattr(auth, "resolve_provider", broken)
     assert kqc.predict_auto_provider("implementer") is None
+    # A profile whose home does not exist cannot boot a worker either;
+    # prediction reports it as unprovable rather than guessing.
+    assert kqc.predict_auto_provider("missing-profile") is None
 
 
 def test_worker_publishes_structured_deadline_before_tempfail_reap(quota_home, monkeypatch):

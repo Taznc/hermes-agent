@@ -4952,6 +4952,9 @@
   // -------------------------------------------------------------------------
 
   if (window.__HERMES_PLUGINS__ && typeof window.__HERMES_PLUGINS__.register === "function") {
+    // Sub-surfaces the host does not route to directly are reachable off the
+    // registered page so behavioral tests can mount them with a fake SDK.
+    KanbanPage.QuotaCircuitBanner = QuotaCircuitBanner;
     window.__HERMES_PLUGINS__.register("kanban", KanbanPage);
   }
 })();
