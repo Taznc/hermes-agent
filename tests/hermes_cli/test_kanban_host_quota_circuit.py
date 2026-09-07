@@ -1,6 +1,8 @@
 """Host-wide, account-scoped Kanban quota circuit contracts."""
 from __future__ import annotations
 
+import contextlib
+import io
 import os
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
@@ -574,12 +576,79 @@ def test_goal_mode_turn_two_quota_publishes_and_exits_tempfail(
     assert circuits[0]["next_eligible_at"] == 7_300
 
 
-def test_machine_readable_tempfail_opens_host_circuit_without_failure_budget(
-    quota_home, monkeypatch,
+@pytest.mark.parametrize(
+    "deadline_fields",
+    [{}, {"reset_at": "not-a-deadline", "retry_after_seconds": "30"}],
+    ids=("missing", "malformed"),
+)
+def test_machine_quota_without_valid_deadline_uses_bounded_interruption_policy(
+    quota_home, monkeypatch, deadline_fields,
 ):
+    """A structured quota failure without a usable deadline may interrupt a
+    few runs, but it must eventually reach the existing infra-interruption
+    breaker instead of remaining an indefinitely neutral EX_TEMPFAIL loop."""
+    import cli as cli_module
+
     monkeypatch.setattr(kqc, "configured_budget_groups", lambda: BUDGET_GROUPS)
     monkeypatch.setattr(kbd, "_pid_alive", lambda _pid: False)
     monkeypatch.setenv("HERMES_KANBAN_CRASH_GRACE_SECONDS", "0")
+    monkeypatch.setenv("HERMES_KANBAN_MAX_INFRA_INTERRUPTIONS", "2")
+    task_id = _task("default", profile="implementer", provider="openai-codex")
+    monkeypatch.setenv("HERMES_KANBAN_TASK", task_id)
+    monkeypatch.setenv("HERMES_KANBAN_BOARD", "default")
+    result = {
+        "failed": True,
+        "failure_reason": "rate_limit",
+        "error": "usage_limit_reached",
+        **deadline_fields,
+    }
+    agent = SimpleNamespace(provider="openai-codex")
+    worker_cli = SimpleNamespace(agent=agent)
+
+    with kbc.connect(board="default") as conn:
+        host = kb._claimer_id().split(":", 1)[0]
+        for attempt, pid in enumerate((93400, 93401, 93402), start=1):
+            claimed = kb.claim_task(conn, task_id, claimer=f"{host}:w{attempt}")
+            assert claimed is not None
+            with kb.write_txn(conn):
+                conn.execute("UPDATE tasks SET worker_pid=? WHERE id=?", (pid, task_id))
+
+            # Drive the same machine-readable result path as a quiet Kanban
+            # worker. stderr is captured because the real dispatcher redirects
+            # it into the run-scoped worker log.
+            worker_stderr = io.StringIO()
+            with contextlib.redirect_stderr(worker_stderr):
+                exit_code = cli_module._kanban_worker_result_exit_code(worker_cli, result)
+            with kbd._open_worker_log(claimed, "default") as log:
+                log.write(worker_stderr.getvalue().encode())
+            kbd._record_worker_exit(pid, exit_code << 8)
+            crashed = kbd.detect_crashed_workers(conn, board="default")
+
+            task = kb.get_task(conn, task_id)
+            assert task is not None
+            if attempt <= 2:
+                assert crashed == []
+                assert task.status == "ready"
+                assert task.consecutive_failures == 0
+                assert kb.read_interruption_streak(conn, task_id=task_id) == attempt
+            else:
+                assert crashed == [task_id]
+                assert task.status == "blocked"
+                assert task.consecutive_failures == 1
+                assert kb.read_interruption_streak(conn, task_id=task_id) == 3
+
+    assert kqc.list_quota_circuits() == []
+
+
+def test_machine_readable_tempfail_opens_host_circuit_without_failure_budget(
+    quota_home, monkeypatch,
+):
+    import cli as cli_module
+
+    monkeypatch.setattr(kqc, "configured_budget_groups", lambda: BUDGET_GROUPS)
+    monkeypatch.setattr(kbd, "_pid_alive", lambda _pid: False)
+    monkeypatch.setenv("HERMES_KANBAN_CRASH_GRACE_SECONDS", "0")
+    monkeypatch.setattr(kqc.time, "time", lambda: 8_000)
     with kbc.connect(board="default") as conn:
         task_id = kb.create_task(
             conn,
@@ -592,13 +661,28 @@ def test_machine_readable_tempfail_opens_host_circuit_without_failure_budget(
         assert task is not None
         with kb.write_txn(conn):
             conn.execute("UPDATE tasks SET worker_pid=? WHERE id=?", (91234, task_id))
+        monkeypatch.setenv("HERMES_KANBAN_TASK", task_id)
+        monkeypatch.setenv("HERMES_KANBAN_BOARD", "default")
+        result = {
+            "failed": True,
+            "failure_reason": "rate_limit",
+            "error": "usage_limit_reached",
+            "reset_at": 8_060.0,
+        }
+        worker_cli = SimpleNamespace(agent=SimpleNamespace(provider="openai-codex"))
+        worker_stderr = io.StringIO()
+        with contextlib.redirect_stderr(worker_stderr):
+            exit_code = cli_module._kanban_worker_result_exit_code(worker_cli, result)
+        assert exit_code == kb.KANBAN_RATE_LIMIT_EXIT_CODE
+        assert "quota exhausted (429); retry after 60s" in worker_stderr.getvalue()
         with kbd._open_worker_log(task, "default") as log:
-            log.write(b"quota exhausted (429); retry after 60s.\n")
-        kbd._record_worker_exit(91234, kb.KANBAN_RATE_LIMIT_EXIT_CODE << 8)
+            log.write(worker_stderr.getvalue().encode())
+        kbd._record_worker_exit(91234, exit_code << 8)
         assert kbd.detect_crashed_workers(conn, board="default") == []
         current = kb.get_task(conn, task_id)
         assert current is not None and current.consecutive_failures == 0
-    assert len(kqc.list_quota_circuits()) == 1
+        assert kb.read_interruption_streak(conn, task_id=task_id) == 0
+    assert len(kqc.list_quota_circuits(now=8_001)) == 1
 
 
 def test_simultaneous_failures_register_one_circuit_without_card_failures(

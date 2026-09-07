@@ -4038,10 +4038,15 @@ def _interrupt_agent_for_signal(agent, signum) -> None:
 def _kanban_worker_result_exit_code(cli: "HermesCLI", result: Any) -> int:
     """Publish one Kanban turn result and return its automation exit code."""
     task_id = (os.environ.get("HERMES_KANBAN_TASK") or "").strip()
+    quota_retry_after = None
     if task_id:
         try:
-            from hermes_cli.kanban_quota_circuit import publish_worker_quota_result
+            from hermes_cli.kanban_quota_circuit import (
+                publish_worker_quota_result,
+                quota_result_retry_after_seconds,
+            )
 
+            quota_retry_after = quota_result_retry_after_seconds(result)
             publish_worker_quota_result(
                 result,
                 task_id=task_id,
@@ -4054,6 +4059,14 @@ def _kanban_worker_result_exit_code(cli: "HermesCLI", result: Any) -> int:
     if not isinstance(result, Mapping) or not result.get("failed"):
         return 0
     if task_id and result.get("failure_reason") in ("rate_limit", "billing"):
+        # This run-scoped marker lets the reaper distinguish a validated
+        # deadline (neutral EX_TEMPFAIL) from a missing/malformed one (bounded
+        # infra interruption). It intentionally reuses the host publisher's
+        # structured-result parser instead of classifying error prose here.
+        if quota_retry_after is None:
+            print("quota exhausted (429); retry deadline missing or malformed.", file=sys.stderr)
+        else:
+            print(f"quota exhausted (429); retry after {quota_retry_after}s.", file=sys.stderr)
         try:
             from hermes_cli.kanban_db import KANBAN_RATE_LIMIT_EXIT_CODE
 

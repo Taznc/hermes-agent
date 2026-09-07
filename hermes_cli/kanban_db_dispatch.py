@@ -1028,24 +1028,44 @@ def _classify_dead_worker(
         # EX_TEMPFAIL is already a machine-readable quota outcome. When the
         # current run log also carries the reviewed quota signature/deadline,
         # preserve that parsed payload so both per-board and host circuits can
-        # register on the first observation. Missing/malformed deadlines keep
-        # the existing bounded cooldown path and never create a durable pause.
+        # register on the first observation. Missing/malformed deadlines must
+        # use the existing bounded interruption accounting; treating every
+        # EX_TEMPFAIL as neutral would retry forever without advancing either
+        # the interruption streak or the ordinary failure budget.
         run_id = _kb._current_run_id(conn, task_id)
         quota_signal = _kb._detect_quota_exit_signal(
             task_id, run_id=run_id, board=board,
         )
         payload = {"pid": pid, "claimer": claimer, "exit_code": code}
-        if quota_signal:
+        retry_after = quota_signal.get("retry_after_seconds") if quota_signal else None
+        if retry_after is not None:
             payload["reason"] = "quota"
-            payload["quota_retry_after_seconds"] = quota_signal.get("retry_after_seconds")
-        # Quota wall — NOT a task failure. Release to the source phase and do
-        # NOT count a failure so a long quota window can't trip the breaker.
+            payload["quota_retry_after_seconds"] = retry_after
+            # Validated quota wall — NOT a task failure. Release to the source
+            # phase and do not count a failure while its finite pause is active.
+            return _DeadWorker(
+                kind, code,
+                f"pid {pid} exited rate-limited (quota wall) — requeued without counting a failure",
+                "rate_limited",
+                payload,
+                rate_limited=True,
+            )
+
+        # The sentinel proves the result category, but not a finite recovery
+        # window. Reuse the reviewed quota classifier and interruption streak
+        # instead of entering the indefinitely neutral rate_limited path.
+        _category, reason = _kb.classify_infra_exit(
+            exit_kind="nonzero_exit", quota_signal=True,
+        )
+        payload["reason"] = reason
+        payload["quota_retry_after_seconds"] = None
         return _DeadWorker(
             kind, code,
-            f"pid {pid} exited rate-limited (quota wall) — requeued without counting a failure",
-            "rate_limited",
+            f"pid {pid} exited rate-limited without a valid retry deadline "
+            "(bounded infra interruption)",
+            "interrupted",
             payload,
-            rate_limited=True,
+            infra=True,
         )
     # A pending durable timeout-kill intent means THIS dispatcher (or a
     # predecessor that died between signal and reap) sent this SIGTERM/SIGKILL

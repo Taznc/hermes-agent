@@ -23,6 +23,7 @@ from __future__ import annotations
 import contextlib
 import hashlib
 import logging
+import math
 import sqlite3
 import time
 from pathlib import Path
@@ -327,6 +328,35 @@ def register_quota_circuit(
     return _public_state(dict(row), boards_deferred=0, cards_deferred=0, now=observed_at)
 
 
+def quota_result_retry_after_seconds(
+    result: Any, *, now: Optional[int] = None,
+) -> Optional[int]:
+    """Return the validated delay carried by a structured quota result.
+
+    This is the single parser used by both host-circuit publication and the
+    worker-log marker consumed by the existing run-scoped reaper classifier.
+    """
+    if not isinstance(result, Mapping) or not result.get("failed"):
+        return None
+    if str(result.get("failure_reason") or "") not in {"rate_limit", "billing"}:
+        return None
+    observed_at = int(time.time()) if now is None else int(now)
+    reset_at = result.get("reset_at")
+    if isinstance(reset_at, (int, float)) and not isinstance(reset_at, bool):
+        numeric_reset = float(reset_at)
+        if math.isfinite(numeric_reset):
+            delta = numeric_reset - observed_at
+            if delta > 0:
+                # Ceiling: a fractional reset must never be shortened to an
+                # already-expired integer deadline.
+                retry_after = int(delta)
+                return retry_after + (retry_after < delta)
+    raw_retry = result.get("retry_after_seconds")
+    if isinstance(raw_retry, int) and not isinstance(raw_retry, bool) and raw_retry > 0:
+        return raw_retry
+    return None
+
+
 def publish_worker_quota_result(
     result: Any,
     *,
@@ -342,31 +372,14 @@ def publish_worker_quota_result(
     retry deadline qualify. Missing/malformed deadlines deliberately return
     ``None`` so the reviewed bounded interruption policy remains authoritative.
     """
-    if not isinstance(result, Mapping) or not result.get("failed"):
+    retry_after = quota_result_retry_after_seconds(result, now=now)
+    if retry_after is None:
         return None
     reason = str(result.get("failure_reason") or "")
-    if reason not in {"rate_limit", "billing"}:
-        return None
     task_id = str(task_id or "").strip()
     if not task_id:
         return None
     observed_at = int(time.time()) if now is None else int(now)
-    retry_after: Optional[int] = None
-    reset_at = result.get("reset_at")
-    if isinstance(reset_at, (int, float)) and not isinstance(reset_at, bool):
-        delta = float(reset_at) - observed_at
-        if delta > 0:
-            # Ceiling without importing math: a fractional reset must never be
-            # shortened to an already-expired integer deadline.
-            retry_after = int(delta)
-            if retry_after < delta:
-                retry_after += 1
-    if retry_after is None:
-        raw_retry = result.get("retry_after_seconds")
-        if isinstance(raw_retry, int) and not isinstance(raw_retry, bool) and raw_retry > 0:
-            retry_after = raw_retry
-    if retry_after is None:
-        return None
 
     from hermes_cli import kanban_db as kb
     from hermes_cli import kanban_db_connect as kbc
