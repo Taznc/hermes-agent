@@ -121,6 +121,26 @@ def test_repeated_crashes_truncates_huge_tracebacks():
     assert d.detail.endswith("…") or len(d.detail) < 700
 
 
+def test_repeated_crashes_clears_after_later_terminal_block():
+    """A later explicit block proves the worker followed the terminal protocol.
+
+    Historical clean-exit violations remain useful in the run history, but they
+    must not surface as an active crash incident after the task has since been
+    correctly blocked for a real prerequisite.
+    """
+    task = _task(status="on_hold")
+    runs = [
+        _run(outcome="crashed", run_id=1, error="missing terminal call"),
+        _run(outcome="crashed", run_id=2, error="missing terminal call"),
+        _run(outcome="crashed", run_id=3, error="missing terminal call"),
+        _run(outcome="blocked", run_id=4),
+    ]
+
+    diags = kd.compute_task_diagnostics(task, [], runs)
+
+    assert not [d for d in diags if d.kind == "repeated_crashes"]
+
+
 # ---------------------------------------------------------------------------
 # Severity sorting
 # ---------------------------------------------------------------------------
