@@ -99,7 +99,7 @@ They coexist: a kanban worker may call `delegate_task` internally during its run
   (e.g. one per project, repo, or domain); see [Boards (multi-project)](#boards-multi-project)
   below. Single-project users stay on the `default` board and never see the
   word "board" outside this docs section.
-- **Task** — a row with title, optional body, one assignee (a profile name), status (`triage | todo | ready | running | blocked | review | done | archived`), optional tenant namespace, optional idempotency key (dedup for retried automation).
+- **Task** — a row with title, optional body, one assignee (a profile name), status (`triage | todo | ready | running | blocked | review | done | archived`, plus the inert `idea | roadmap` [roadmap lanes](#roadmap-lanes-idea--roadmap)), optional tenant namespace, optional idempotency key (dedup for retried automation).
 - **Link** — `task_links` row recording a parent → child dependency. The dispatcher promotes `todo → ready` when all parents are `done`.
 - **Comment** — the inter-agent protocol. Agents and humans append comments; when a worker is (re-)spawned it reads the full comment thread as part of its context.
 - **Workspace** — the directory a worker operates in. Three kinds:
@@ -108,6 +108,77 @@ They coexist: a kanban worker may call `delegate_task` internally during its run
   - `worktree` — a git worktree under `.worktrees/<id>/` for coding tasks. Use `worktree:<path>` to pin the exact target path. Worker-side `git worktree add` creates it, using `--branch` when provided. **Preserved on completion.**
 - **Dispatcher** — a long-lived loop that, every N seconds (default 60): reclaims stale claims, reclaims crashed workers (PID gone but TTL not yet expired), promotes ready tasks, atomically claims, spawns assigned profiles. Runs **inside the gateway** by default (`kanban.dispatch_in_gateway: true`). One dispatcher sweeps all boards per tick; workers are spawned with `HERMES_KANBAN_BOARD` pinned so they can't see other boards. After `kanban.failure_limit` consecutive spawn failures on the same task (default: 2) the dispatcher auto-blocks it with the last error as the reason — prevents thrashing on tasks whose profile doesn't exist, workspace can't mount, etc. Deaths classified as infra (external SIGTERM/SIGKILL, a startup-window dead PID, or a provider quota/429 signature) do NOT tick this counter directly — see `docs/kanban/infra-failure-classification.md` for the exact signal allowlist, the bounded `kanban.max_infra_interruptions` streak that still eventually counts a repeatedly-interrupted task, and `kanban.provider_backoff`/`kanban.provider_backoff_max_seconds` for provider-wide quota parking.
 - **Tenant** — optional string namespace *within* a board. One specialist fleet can serve multiple businesses (`--tenant business-a`) with data isolation by workspace path and memory key prefix. Tenants are a soft filter; boards are the hard isolation boundary.
+
+## Roadmap lanes (`idea` / `roadmap`)
+
+Every other column is eventually acted on by something — the dispatcher spawns
+`ready`, the promotion sweep moves `todo`, auto-decompose chews through
+`triage`, the reaper reclaims `running`. That leaves nowhere to write down
+"we should do this someday" without it becoming work.
+
+Two statuses exist for exactly that:
+
+- **`idea`** — rough, unrefined capture. Type a sentence and forget it.
+- **`roadmap`** — hashed out with you and agreed in shape, but **still not
+  authorized to execute**.
+
+Both are **inert by construction**. No sweep, dispatcher query, promotion
+pass, decomposer, specifier, `recompute_ready`, or stale/crash reaper selects
+them, because each of those selects an explicit list of statuses and neither
+lane name appears in any of them. A board of nothing but lane cards can run
+the dispatcher forever and nothing happens — there is a regression test that
+seeds 100 lane cards, runs a full tick plus both triage sweeps, and asserts
+zero events and zero row changes.
+
+They are also **not live work** for health and cost purposes: they are
+excluded from the active-task count in `hermes kanban stats`, from the
+"dispatcher stuck" heuristic, and from workspace-retention checks. They stay
+fully visible in `hermes kanban list` and on the dashboard.
+
+`assignee` is optional on a lane card — nothing dispatches it, so naming a
+profile would be noise.
+
+### Transitions
+
+Cards enter a lane **only at creation**. That is deliberate: it means your
+existing `block`/`hold`/`unblock` habits can never accidentally park live work
+in the wishlist, and `on_hold` (a deliberate pause of *real* work) keeps its
+meaning.
+
+| From | To | Verb |
+|---|---|---|
+| *(creation)* | `idea` | `hermes kanban create "…" --idea` |
+| *(creation)* | `roadmap` | `hermes kanban create "…" --roadmap` |
+| `idea` | `roadmap` | `hermes kanban refine <id>` |
+| `idea` | `archived` | `hermes kanban archive <id>` |
+| `roadmap` | `triage` | `hermes kanban spawn <id>` (default) |
+| `roadmap` | `ready` | `hermes kanban spawn <id> --to ready` |
+| `roadmap` | `idea` | `hermes kanban demote <id>` |
+| `roadmap` | `archived` | `hermes kanban archive <id>` |
+
+Everything else raises an error naming the attempted `from -> to`. In
+particular a live card can never be moved *into* a lane, and an `idea` cannot
+spawn directly — refine it first.
+
+**`spawn` lands in `triage` by default** so auto-decompose gets to re-specify
+or split the item before anyone works it; a roadmap note is rarely a
+well-formed task. Use `--to ready` to skip that when it already is one.
+
+Each transition appends an event (`refined`, `demoted`,
+`spawned_from_roadmap`), so the path from "idle thought" to "shipped" stays
+auditable.
+
+### Other surfaces
+
+- **Dashboard** — `idea` and `roadmap` are columns after `done`. Dragging
+  between them refines/demotes; dragging a `roadmap` card into `triage`/`ready`
+  spawns it. Dragging live work into a lane is refused with the attempted
+  transition in the error.
+- **Idea inbox** — the dashboard's idea-capture dialog and the per-card "send
+  to roadmap ideas" action create an `idea` card on the active board.
+- **Agents** — orchestrator profiles get `kanban_create(lane=...)` and
+  `kanban_roadmap(action="refine"|"demote"|"spawn")`. Dispatcher-spawned task
+  workers do not see the lane tools.
 
 ## Boards (multi-project)
 
@@ -959,6 +1030,7 @@ hermes kanban create "<title>" [--body ...] [--assignee <profile>]
                                 [--workspace scratch|worktree|worktree:<path>|dir:<path>]
                                 [--branch <name>]
                                 [--priority N] [--triage] [--idempotency-key KEY]
+                                [--idea | --roadmap]
                                 [--max-runtime 30m|2h|1d|<seconds>]
                                 [--max-retries N]
                                 [--goal] [--goal-max-turns N]
@@ -986,6 +1058,11 @@ hermes kanban complete <id>... [--result "..."]
 hermes kanban block <id> "<reason>" [--ids <id>...]
 hermes kanban unblock <id>...
 hermes kanban archive <id>...
+
+# Roadmap lanes — see "Roadmap lanes (idea / roadmap)" below:
+hermes kanban refine <id>...                           # idea -> roadmap
+hermes kanban demote <id>...                           # roadmap -> idea
+hermes kanban spawn  <id>... [--to triage|ready]       # roadmap -> work queue (default: triage)
 
 hermes kanban request-review <id> [--summary "..."] [--metadata JSON] [--reviewer PROFILE]
 hermes kanban request-changes <id> "<required changes>"               # active reviewer -> implementer
