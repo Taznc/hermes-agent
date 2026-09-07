@@ -20873,6 +20873,50 @@ def test_clarify_callback_multi_select_hint(monkeypatch):
     assert captured["payload"] == {"question": "Pick one", "choices": ["a", "b"]}
 
 
+def test_single_clarify_callback_preserves_note_through_real_response(monkeypatch):
+    """A single response keeps its optional note through the production callback."""
+    from tools.clarify_tool import clarify_tool
+
+    emitted = threading.Event()
+    payloads = []
+
+    def capture(event, sid, payload):
+        if event == "clarify.request":
+            payloads.append(payload)
+            emitted.set()
+
+    monkeypatch.setattr(server, "_emit", capture)
+    monkeypatch.setattr(server, "_clarify_timeout_seconds", lambda: 5)
+    output = {}
+    callback = server._agent_cbs("clarify-note-session")["clarify_callback"]
+
+    worker = threading.Thread(
+        target=lambda: output.setdefault(
+            "result", json.loads(clarify_tool("Color?", ["red", "blue"], callback=callback))
+        )
+    )
+    worker.start()
+    assert emitted.wait(5)
+
+    response = server.handle_request(
+        {
+            "id": "clarify-note-response",
+            "method": "clarify.respond",
+            "params": {
+                "request_id": payloads[0]["request_id"],
+                "answer": "red",
+                "note": "Keep this note.",
+            },
+        }
+    )
+    worker.join(5)
+
+    assert not worker.is_alive()
+    assert response["result"]["note"] == "Keep this note."
+    assert output["result"]["user_response"] == "red"
+    assert output["result"]["note"] == "Keep this note."
+
+
 @pytest.mark.parametrize(
     ("configured", "expected"),
     [(0, None), (-1, None), (42, 42)],

@@ -2668,7 +2668,13 @@ export const ar = defineForkLocale(forkAr, {
       continueLabel: 'متابعة',
       confirmAndContinueLabel: 'تأكيد ومتابعة',
       answeredBadge: 'تمت الإجابة',
-      questionProgress: (answered, total) => `تمت الإجابة على ${answered} من ${total}`
+      questionProgress: (answered, total) => `تمت الإجابة على ${answered} من ${total}`,
+      addNote: 'إضافة ملاحظة',
+      addNoteFor: label => `إضافة ملاحظة إلى ${label}`,
+      note: 'ملاحظة',
+      noteFor: label => `ملاحظة لـ ${label}`,
+      notePlaceholder: 'أضف ملاحظة اختيارية…',
+      selected: 'محدد'
     },
     tool: {
       copyCode: 'نسخ الكود',

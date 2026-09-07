@@ -2933,7 +2933,8 @@ export const ja = defineForkLocale(forkJa, {
       noGuestBody:
         'このビルドの Hermes はブラウザー上で動作するため、他のサイトをペイン内に埋め込めません。上にアドレスを入力すると、Hermes が新しいブラウザータブで開きます。',
       noGuestOpen: url => `${url} をブラウザーのタブで開く`,
-      openBlocked: 'ブラウザーが新しいタブをブロックしました。このページのポップアップを許可してからもう一度お試しください。',
+      openBlocked:
+        'ブラウザーが新しいタブをブロックしました。このページのポップアップを許可してからもう一度お試しください。',
       finishedRestarting: message =>
         `Hermes がプレビューサーバーの再起動を完了しました${message ? `: ${message}` : ''}`,
       failedRestarting: message => `サーバーの再起動に失敗しました: ${message}`,
@@ -3117,7 +3118,14 @@ export const ja = defineForkLocale(forkJa, {
       questionProgress: (answered, total) => `${total}問中${answered}問回答済み`,
       lateAnswer: (question, choice) => `「${question}」について — 私の回答: ${choice}`,
       lateAnswerTip: 'この回答をフォローアップメッセージとして下書きします',
-      lateAnswerHint: 'この質問はもう回答を待っていません。選択肢を選ぶとフォローアップメッセージとして下書きされます。'
+      lateAnswerHint:
+        'この質問はもう回答を待っていません。選択肢を選ぶとフォローアップメッセージとして下書きされます。',
+      addNote: 'メモを追加',
+      addNoteFor: label => `${label}にメモを追加`,
+      note: 'メモ',
+      noteFor: label => `${label}のメモ`,
+      notePlaceholder: '任意のメモを追加…',
+      selected: '選択済み'
     },
     tool: {
       copyCode: 'コードをコピー',

@@ -3068,6 +3068,12 @@ export interface UpstreamTranslations {
       lateAnswer: (question: string, choice: string) => string
       lateAnswerTip: string
       lateAnswerHint: string
+      addNote: string
+      addNoteFor: (label: string) => string
+      note: string
+      noteFor: (label: string) => string
+      notePlaceholder: string
+      selected: string
     }
     mcpSetup: {
       installTitle: (server: string) => string
