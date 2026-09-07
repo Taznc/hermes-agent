@@ -318,6 +318,15 @@
        strength, so every session on screen is marked and the one you're in
        still wins. Mixed from the active token so a theme tunes both at once. */
     --ui-row-open-background: color-mix(in srgb, var(--ui-row-active-background) 28%, transparent);
+    /* Sidebar SELECTED row (S3): a stronger wash than the shared active band,
+       plus a 1px inset accent ring — the old 8% wash alone was near-invisible
+       on dark surfaces. Scoped tokens so other active-row surfaces keep the
+       quieter band. */
+    --ui-row-selected-background: color-mix(in srgb, var(--ui-accent) 12%, transparent);
+    --ui-row-selected-ring: color-mix(in srgb, var(--ui-accent) 55%, transparent);
+    /* Sidebar WORKING row (R3): the faint always-on wash under the charging
+       bar, so a paused-animation renderer still shows a clearly lit row. */
+    --ui-row-working-background: color-mix(in srgb, var(--ui-accent) 6%, transparent);
     --ui-control-hover-background: color-mix(
       in srgb,
       var(--ui-accent) var(--theme-control-hover-accent-mix),
@@ -1180,25 +1189,8 @@ html[data-inline-link-require-modifier='true'][data-inline-link-modifier='held']
   --arc-duration: 3.27s;
 }
 
-/* Sidebar session row — a thin, clipped, single-line host, so it differs twice
-   from the default ring:
-
-   1. Flush, not outset. The sidebar scroller is `overflow-x-hidden` and rows sit
-      `gap-px` apart, so an outset ring loses its left/right runs to the clip.
-
-   2. A visible tail. `--arc-c2` defaults to `--dt-background` — invisible
-      against the sidebar. With c0 a transparent sentinel and c2 invisible, only
-      the bright c1 stop survives each pass, and the gradient has three of them:
-      three moving dots instead of an arc. Tying c2 to c1 gives each spike a
-      falloff. (`arc-nous` already overrides c2, so the hero is unaffected.) */
-.arc-border.arc-row,
-:root.dark .arc-border.arc-row {
-  --arc-standoff: 0rem;
-  --arc-c2: color-mix(in srgb, var(--arc-c1) 45%, transparent);
-}
-
-/* HUD composer — same travelling arc as a working sidebar row, 2px and pill-
-   rounded to match the bar. */
+/* Sidebar session rows paint `.working-bar` instead of an arc (see below). */
+/* HUD composer — travelling arc, 2px and pill-rounded to match the bar. */
 .arc-border.arc-composer,
 :root.dark .arc-border.arc-composer {
   --arc-width: 2px;
@@ -1212,6 +1204,58 @@ html[data-inline-link-require-modifier='true'][data-inline-link-modifier='held']
   .arc-border::before {
     animation: none;
   }
+
+  .working-bar::before {
+    animation: none;
+  }
+}
+
+/* WORKING ROW CHARGING BAR (replaces the traveling arc on sidebar rows): a
+   2px track along the row's bottom edge with an indeterminate segment gliding
+   through it. The moving part is a dim 2px line instead of a bright ring
+   circling the whole row — visible, not busy. Travel is compositor-only
+   (transform on the segment; translateX % is of the segment's own 26% width:
+   -100% parks it fully left of the track, 485% fully right of it). Stalled
+   keeps the lit track and parks the segment — still running, nothing moving. */
+@keyframes working-charge {
+  0% {
+    transform: translateX(-100%);
+  }
+  100% {
+    transform: translateX(485%);
+  }
+}
+
+.working-bar {
+  pointer-events: none;
+  position: absolute;
+  right: 0.5rem;
+  bottom: 0.125rem;
+  left: 0.5rem;
+  height: 2px;
+  overflow: hidden;
+  border-radius: 2px;
+  background: color-mix(in srgb, var(--ui-accent) 18%, transparent);
+}
+
+.working-bar::before {
+  content: '';
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  left: 0;
+  width: 26%;
+  border-radius: inherit;
+  background: var(--ui-accent);
+  animation: working-charge 2.8s ease-in-out infinite;
+}
+
+.working-bar[data-stalled]::before {
+  animation: none;
+}
+
+:root[data-renderer-animations-paused] .working-bar::before {
+  animation-play-state: paused !important;
 }
 
 /* No focus rings, anywhere. Kills the native outline plus Tailwind's

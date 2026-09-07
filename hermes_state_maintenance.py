@@ -75,7 +75,12 @@ _PRUNE_FILTERS = (
     ("min_tool_calls", "notnone", _one("COALESCE(s.tool_call_count, 0) >= ?")),
     ("max_tool_calls", "notnone", _one("COALESCE(s.tool_call_count, 0) <= ?")),
 )
-_PRUNE_FILTER_NAMES = frozenset(name for name, _, _ in _PRUNE_FILTERS) | {"archived", "include_pinned"}
+_PRUNE_FILTER_NAMES = (frozenset(name for name, _, _ in _PRUNE_FILTERS)
+                       | {"archived", "include_pinned", "include_open"})
+
+#: The bulk selector's default safety gate. Kept as a constant because
+#: :meth:`SessionMaintenanceMixin.count_open_prune_matches` inverts exactly this clause.
+_ENDED_ONLY_CLAUSE = "s.ended_at IS NOT NULL"
 
 
 class SessionMaintenanceMixin:
@@ -178,15 +183,21 @@ class SessionMaintenanceMixin:
 
     @staticmethod
     def _prune_filter_where(*, archived: Optional[bool] = None, include_pinned: bool = False,
-                            **filters) -> Tuple[str, list]:
+                            include_open: bool = False, **filters) -> Tuple[str, list]:
         """Shared WHERE clause for bulk prune/archive selection (alias ``s``): ``_PRUNE_FILTERS``
-        AND together, only ended sessions are ever candidates, ``archived`` is tri-state
-        (None = both), ``*_like`` are case-insensitive substrings, the rest exact."""
+        AND together, ``archived`` is tri-state (None = both), ``*_like`` are case-insensitive
+        substrings, the rest exact.
+
+        Only ended sessions are candidates unless ``include_open`` is set: a session the user
+        navigated away from never receives ``ended_at``, so the default gate hides exactly the rows
+        an explicit sweep wants (#85007, #90360). ``include_open`` widens the selection rather than
+        moving the gate — the clause is simply dropped, so every other predicate still applies.
+        """
         unknown = set(filters) - _PRUNE_FILTER_NAMES
         if unknown:
             raise TypeError("SessionMaintenanceMixin._prune_filter_where() got an unexpected "
                             f"keyword argument {sorted(unknown)[0]!r}")
-        clauses = ["s.ended_at IS NOT NULL"]
+        clauses = [] if include_open else [_ENDED_ONLY_CLAUSE]
         params: list = []
         for name, applies, build in _PRUNE_FILTERS:
             value = filters.get(name)
@@ -199,7 +210,8 @@ class SessionMaintenanceMixin:
         # Pinned is a durable "keep" flag: bulk prune/delete/archive exclude pinned rows unless opted in.
         if not include_pinned:
             clauses.append("COALESCE(s.pinned, 0) = 0")
-        return " AND ".join(clauses), params
+        # `include_open` + `--include-pinned` + `archived=None` can leave nothing to AND together.
+        return " AND ".join(clauses) if clauses else "1 = 1", params
 
     def _prune_where(self, older_than_days, source, filters) -> Tuple[str, list]:
         """Translate the legacy age window into the shared activity filter, then build WHERE."""
@@ -232,9 +244,15 @@ class SessionMaintenanceMixin:
 
     def count_open_prune_matches(self, older_than_days: Optional[float] = None, source: str = None,
                                  **filters) -> int:
-        """Count open sessions a matching prune skips (``ended_at`` guard inverted); visibility-only."""
+        """Count open sessions a matching prune skips (``ended_at`` guard inverted); visibility-only.
+
+        This is the report for the DEFAULT (ended-only) selection, so the ended gate is forced back
+        on regardless of ``include_open`` — with the flag set nothing is skipped and the caller has
+        no reason to ask.
+        """
+        filters["include_open"] = False
         where, params = self._prune_where(older_than_days, source, filters)
-        ended_guard = "s.ended_at IS NOT NULL"
+        ended_guard = _ENDED_ONLY_CLAUSE
         if not where.startswith(ended_guard):
             raise RuntimeError("prune filter lost its ended-session safety guard")
         open_where = f"s.ended_at IS NULL{where[len(ended_guard):]}"

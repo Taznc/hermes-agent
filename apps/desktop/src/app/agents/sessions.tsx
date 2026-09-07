@@ -17,7 +17,7 @@ import { type AgentRow, type Attention, overviewCache } from '@/store/agent-over
 import { $overviewRows } from '@/store/agent-overview-status'
 import type { SessionDotState } from '@/store/session-dot-state'
 
-import { sessionDotClassName } from '../chat/session-status-dot'
+import { SessionStatusMark } from '../chat/session-status-dot'
 import { PanelBody, PanelEmpty, PanelSectionLabel } from '../overlays/panel'
 
 import { overviewActions } from './actions'
@@ -342,7 +342,7 @@ function AgentListRow({
       onDoubleClick={onOpen}
     >
       <span className="flex h-5 shrink-0 items-center">
-        <span aria-hidden="true" className={sessionDotClassName(dotState(row))} />
+        <SessionStatusMark state={dotState(row)} />
       </span>
       <span className="flex min-w-0 flex-1 flex-col">
         <span className="flex items-baseline gap-3">
