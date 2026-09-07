@@ -541,26 +541,37 @@ def test_compute_host_clarify_snapshot_replays_and_proxies_batch_answers(monkeyp
             {
                 "id": "clarify-q0",
                 "method": "clarify.respond",
-                "params": {"request_id": "host-request", "question_id": "q0", "answer": "a"},
+                "params": {
+                    "request_id": "host-request",
+                    "question_id": "q0",
+                    "answer": "a",
+                    "note": "first note",
+                },
             }
         )
 
-        assert response["result"] == {"status": "ok", "remaining": ["q1"]}
+        assert response["result"] == {"status": "ok", "remaining": ["q1"], "note": "first note"}
         assert supervisor.responses == [
-            (sid, {"request_id": "host-request", "question_id": "q0", "answer": "a"}, 15.0)
+            (sid, {"request_id": "host-request", "question_id": "q0", "answer": "a", "note": "first note"}, 15.0)
         ]
         replayed = server._live_session_payload(sid, session)["pending_clarify"]
         assert replayed["answers"] == {"q0": "a"}
+        assert replayed["notes"] == {"q0": "first note"}
 
         final_response = server.handle_request(
             {
                 "id": "clarify-q1",
                 "method": "clarify.respond",
-                "params": {"request_id": "host-request", "question_id": "q1", "answer": "b"},
+                "params": {
+                    "request_id": "host-request",
+                    "question_id": "q1",
+                    "answer": "b",
+                    "note": "second note",
+                },
             }
         )
 
-        assert final_response["result"] == {"status": "ok", "remaining": []}
+        assert final_response["result"] == {"status": "ok", "remaining": [], "note": "second note"}
         assert "pending_clarify" not in server._live_session_payload(sid, session)
     finally:
         server._sessions.pop(sid, None)

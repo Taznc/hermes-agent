@@ -83,9 +83,9 @@ _methods: dict[str, callable] = {}
 _pending: dict[str, tuple[str, threading.Event]] = {}
 _pending_prompt_payloads: dict[str, tuple[str, dict]] = {}
 _answers: dict[str, str] = {}
-# Batch clarify accumulators: rid → {"qids": [...], "answers": {qid: answer}}. Written by
-# clarify.respond (per-question lock, update-in-place), read out by _block on resolution/timeout
-# so locked answers survive the deadline.
+# Batch clarify accumulators: rid → {"qids": [...], "answers": {qid: answer}, "notes": {qid: note}}.
+# Written by clarify.respond (per-question lock, update-in-place), read out by _block on
+# resolution/timeout so locked answers survive the deadline.
 _batch_clarify: dict[str, dict] = {}
 _db = None
 _db_error: str | None = None
@@ -640,6 +640,8 @@ def _pending_clarify_request_payload(sid: str) -> dict | None:
             # Batch clarify: replay the answers locked so far so a reconnecting client restores its ✓ state.
             if (batch := _batch_clarify.get(rid)) is not None and batch["answers"]:
                 snapshot["answers"] = dict(batch["answers"])
+                if batch.get("notes"):
+                    snapshot["notes"] = dict(batch["notes"])
             return snapshot
     if (session := _sessions.get(sid)) is not None:
         with session.get("history_lock", threading.Lock()):
@@ -1277,8 +1279,8 @@ def _block(event: str, sid: str, payload: dict, timeout: float | None = 300, bat
         if batch_qids:
             # Multi-question clarify: per-question answers accumulate here (update-in-place until every
             # qid is locked); locked answers survive a timeout — see the batch read-out below.
-            _batch_clarify[rid] = {"qids": list(batch_qids), "answers": {}}
-    answered, batch_answers = False, None
+            _batch_clarify[rid] = {"qids": list(batch_qids), "answers": {}, "notes": {}}
+    answered, batch_answers, batch_notes = False, None, None
     try:
         _emit(event, sid, payload)
         # Event semantics: None → wait forever (clarify_timeout <= 0; released only by a real answer or
@@ -1292,12 +1294,15 @@ def _block(event: str, sid: str, payload: dict, timeout: float | None = 300, bat
             answer = _answers.pop(rid, "")
             if (batch_state := _batch_clarify.pop(rid, None)) is not None:
                 batch_answers = dict(batch_state["answers"])
+                batch_notes = dict(batch_state.get("notes") or {})
     expire = lambda: _emit(f"{event.removesuffix('.request')}.expire", sid, {"request_id": rid})
     if batch_qids is not None:
         # Cancel-all (respond with no question_id) resolves via _answers with "" — a plain cancel, not a partial result.
         if answer_present:
             return answer
         result: dict[str, object] = {"answers": batch_answers or {}}
+        if batch_notes:
+            result["notes"] = batch_notes
         if not answered:
             # Deadline hit: keep what was locked, report the rest as absences (not skips), still expire live cards.
             result["timed_out"] = True
@@ -3096,6 +3101,7 @@ def _start_usage_ticker(sid: str, agent, interval: float = 1.0) -> tuple[threadi
 def _respond(rid, params, key, *, allow_expired=False):
     r = params.get("request_id", "")
     question_id = str(params.get("question_id") or "")
+    note = str(params.get("note") or "")
     with _prompt_lock:
         entry = _pending.get(r)
         if not entry:
@@ -3107,12 +3113,22 @@ def _respond(rid, params, key, *, allow_expired=False):
             if question_id not in batch["qids"]:
                 return _err(rid, 4002, f"unknown question_id {question_id!r}")
             batch["answers"][question_id] = params.get(key, "")
+            if note:
+                batch.setdefault("notes", {})[question_id] = note
+            elif (notes := batch.get("notes")) is not None:
+                notes.pop(question_id, None)
             if not (remaining := [qid for qid in batch["qids"] if qid not in batch["answers"]]):
                 ev.set()
-            return _ok(rid, {"status": "ok", "remaining": remaining})
+            result = {"status": "ok", "remaining": remaining}
+            if note:
+                result["note"] = note
+            return _ok(rid, result)
         _answers[r] = params.get(key, "")
         ev.set()
-    return _ok(rid, {"status": "ok"})
+    result = {"status": "ok"}
+    if note:
+        result["note"] = note
+    return _ok(rid, result)
 
 
 # ── Methods: tools & system ──────────────────────────────────────────
