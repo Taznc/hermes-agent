@@ -65,6 +65,25 @@ interface ClarifyResult {
 // Distinct even when multiple help controls are activated in one event-loop turn.
 let clarifyHelpLocalSequence = 0
 
+function clarifyHelpErrorMessage(cause: unknown): string {
+  const message = cause instanceof Error ? cause.message : ''
+  const normalized = message.toLowerCase()
+
+  if (
+    /session (?:not found|expired|gone)|clarification (?:not found|expired|gone)|owner.*(?:unknown|unavailable)/.test(
+      normalized
+    )
+  ) {
+    return 'This clarification is no longer available. Return to the conversation and try again.'
+  }
+
+  if (/offline|connection (?:closed|lost|unavailable)|network/.test(normalized)) {
+    return 'Help is temporarily unavailable. Check your connection and try again.'
+  }
+
+  return message || 'Help request failed. Try again.'
+}
+
 function stringField(row: Record<string, unknown>, ...keys: string[]): string | undefined {
   for (const key of keys) {
     const value = row[key]
@@ -292,6 +311,7 @@ function ClarifyHelpControls({
             version: 1
           }
         )
+
         const explanationId =
           typeof response === 'object' &&
           response !== null &&
@@ -303,10 +323,9 @@ function ClarifyHelpControls({
           reconcileClarifyHelp(request.requestId, request.sessionId, localId, explanationId)
         }
       } catch (cause) {
-        const message = cause instanceof Error ? cause.message : 'Help request failed.'
         updateClarifyHelp(request.requestId, request.sessionId, localId, {
           choice,
-          error: message,
+          error: clarifyHelpErrorMessage(cause),
           followUp: custom,
           questionId,
           status: 'error'

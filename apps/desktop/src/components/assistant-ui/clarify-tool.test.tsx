@@ -943,11 +943,49 @@ describe('ClarifyTool owner routing', () => {
     fireEvent.click(screen.getByRole('button', { name: 'Why? Which deployment target?' }))
 
     await waitFor(() => expect(gatewayMocks.requestGatewayForAgent).toHaveBeenCalledTimes(1))
-    expect(gatewayMocks.requestGatewayForAgent).toHaveBeenCalledWith(OWNER_CONNECTION_ID, OWNER_PROFILE, 'clarify.explain', {
-      request_id: 'request-help',
-      session_id: 'session-a',
-      version: 1
+    expect(gatewayMocks.requestGatewayForAgent).toHaveBeenCalledWith(
+      OWNER_CONNECTION_ID,
+      OWNER_PROFILE,
+      'clarify.explain',
+      {
+        request_id: 'request-help',
+        session_id: 'session-a',
+        version: 1
+      }
+    )
+    expect(ambient).not.toHaveBeenCalled()
+  })
+
+  it('keeps the pending choice intact when its owner rejects stale help', async () => {
+    const ambient = armCrossProfileOwner()
+    gatewayMocks.requestGatewayForAgent.mockRejectedValueOnce(new Error('session not found'))
+
+    setClarifyRequest({
+      choices: ['staging', 'production'],
+      multiSelect: false,
+      question: 'Which deployment target?',
+      requestId: 'request-help',
+      sessionId: 'session-a'
     })
+    renderClarify(<ClarifyTool {...liveClarifyProps()} />)
+
+    const choice = screen.getByRole('button', { name: /^[A-Z]staging/ })
+    fireEvent.click(choice)
+    fireEvent.click(screen.getByRole('button', { name: 'Why? staging' }))
+
+    await waitFor(() => expect(gatewayMocks.requestGatewayForAgent).toHaveBeenCalledTimes(1))
+    expect(gatewayMocks.requestGatewayForAgent).toHaveBeenCalledWith(
+      OWNER_CONNECTION_ID,
+      OWNER_PROFILE,
+      'clarify.explain',
+      expect.objectContaining({ choice: 'staging', request_id: 'request-help', session_id: 'session-a' })
+    )
+    expect(
+      await screen.findByText('This clarification is no longer available. Return to the conversation and try again.')
+    ).toBeTruthy()
+    expect(screen.queryByText('session not found')).toBeNull()
+    expect(choice.getAttribute('aria-pressed')).toBe('true')
+    expect((screen.getByRole('button', { name: /Continue/ }) as HTMLButtonElement).disabled).toBe(false)
     expect(ambient).not.toHaveBeenCalled()
   })
 
