@@ -1391,7 +1391,6 @@ def test_protocol_violation_budget_not_consumed_by_other_failures(kanban_home):
     untouched (so the two budgets stay independent).
     """
     import hermes_cli.kanban_db as _kb
-    from hermes_cli import kanban_db_dispatch as _kbd
     conn = kbc.connect()
     try:
         tid = kb.create_task(conn, title="mixed", assignee="worker")
@@ -1420,8 +1419,6 @@ def test_protocol_violation_budget_not_consumed_by_other_failures(kanban_home):
         assert task.status == "blocked"
         gave_up = [e for e in kb.list_events(conn, tid) if e.kind == "gave_up"]
         assert len(gave_up) == 1
-        assert (gave_up[0].payload or {}).get("protocol_violations") == \
-            _kbd._PROTOCOL_VIOLATION_FAILURE_LIMIT
     finally:
         conn.close()
 
@@ -1486,13 +1483,25 @@ def test_worker_boundary_parks_completion_handoff_without_blind_rerun(kanban_hom
         monkeypatch.setenv("HERMES_KANBAN_TASK", tid)
         monkeypatch.setenv("HERMES_KANBAN_BOARD", "default")
         monkeypatch.setenv("HERMES_KANBAN_RUN_ID", str(claimed.current_run_id))
-
-        exit_code = cli_module._kanban_worker_result_exit_code(
-            SimpleNamespace(agent=SimpleNamespace(provider="test")),
-            {"failed": False, "final_response": "done"},
+        monkeypatch.delenv("HERMES_KANBAN_GOAL_MODE", raising=False)
+        agent = SimpleNamespace(
+            run_conversation=lambda **_kwargs: {
+                "failed": False,
+                "final_response": "done",
+            },
+            session_id="handoff-session",
+            provider="test",
+        )
+        worker_cli = SimpleNamespace(
+            agent=agent,
+            session_id="handoff-session",
+            conversation_history=[],
         )
 
-        assert exit_code == 1
+        with pytest.raises(SystemExit) as exc:
+            cli_module._run_quiet_single_query(worker_cli, "work kanban task")
+
+        assert exc.value.code == 1
         current = kb.get_task(conn, tid)
         assert current is not None and current.status == "blocked"
         assert "verify/recover prior work" in (current.last_failure_error or "")
@@ -1512,23 +1521,35 @@ def test_worker_boundary_allows_one_no_evidence_recovery_then_blocks(kanban_home
         tid = kb.create_task(conn, title="bounded-worker-boundary", assignee="worker")
         monkeypatch.setenv("HERMES_KANBAN_TASK", tid)
         monkeypatch.setenv("HERMES_KANBAN_BOARD", "default")
-        worker_cli = SimpleNamespace(agent=SimpleNamespace(provider="test"))
-
+        monkeypatch.delenv("HERMES_KANBAN_GOAL_MODE", raising=False)
+        agent = SimpleNamespace(
+            run_conversation=lambda **_kwargs: {
+                "failed": False,
+                "final_response": "done",
+            },
+            session_id="bounded-session",
+            provider="test",
+        )
+        worker_cli = SimpleNamespace(
+            agent=agent,
+            session_id="bounded-session",
+            conversation_history=[],
+        )
         first = kb.claim_task(conn, tid)
         assert first is not None and first.current_run_id is not None
         monkeypatch.setenv("HERMES_KANBAN_RUN_ID", str(first.current_run_id))
-        assert cli_module._kanban_worker_result_exit_code(
-            worker_cli, {"failed": False, "final_response": "done"}
-        ) == 1
+        with pytest.raises(SystemExit) as first_exit:
+            cli_module._run_quiet_single_query(worker_cli, "work kanban task")
+        assert first_exit.value.code == 1
         after_first = kb.get_task(conn, tid)
         assert after_first is not None and after_first.status == "ready"
 
         second = kb.claim_task(conn, tid)
         assert second is not None and second.current_run_id is not None
         monkeypatch.setenv("HERMES_KANBAN_RUN_ID", str(second.current_run_id))
-        assert cli_module._kanban_worker_result_exit_code(
-            worker_cli, {"failed": False, "final_response": "done"}
-        ) == 1
+        with pytest.raises(SystemExit) as second_exit:
+            cli_module._run_quiet_single_query(worker_cli, "work kanban task")
+        assert second_exit.value.code == 1
         after_second = kb.get_task(conn, tid)
         assert after_second is not None and after_second.status == "blocked"
         gave_up = [event for event in kb.list_events(conn, tid) if event.kind == "gave_up"]

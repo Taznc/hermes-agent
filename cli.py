@@ -4036,7 +4036,7 @@ def _interrupt_agent_for_signal(agent, signum) -> None:
 
 
 def _kanban_worker_result_exit_code(cli: "HermesCLI", result: Any) -> int:
-    """Publish one Kanban turn result and return its automation exit code."""
+    """Publish and classify one Kanban turn without finalizing the worker."""
     task_id = (os.environ.get("HERMES_KANBAN_TASK") or "").strip()
     quota_retry_after = None
     quota_published = False
@@ -4081,10 +4081,18 @@ def _kanban_worker_result_exit_code(cli: "HermesCLI", result: Any) -> int:
                 pass
         return 1
 
+    return 0
+
+
+def _finalize_kanban_worker_process_exit(exit_code: int) -> int:
+    """Record a successful process exit that lacks a terminal Kanban report."""
+    if exit_code != 0:
+        return exit_code
+
     # The agent-side stop gate normally gets two chances to elicit a terminal
-    # tool call. If a text stop still reaches this boundary, record the missing
-    # lifecycle outcome while this worker still owns its run; do not wait for
-    # the dispatcher to infer an otherwise-successful rc=0 after reaping.
+    # tool call. If a text stop still reaches the process boundary, record the
+    # missing lifecycle outcome while this worker still owns its run.
+    task_id = (os.environ.get("HERMES_KANBAN_TASK") or "").strip()
     raw_run_id = (os.environ.get("HERMES_KANBAN_RUN_ID") or "").strip()
     try:
         expected_run_id = int(raw_run_id) if raw_run_id else None
@@ -4110,7 +4118,7 @@ def _kanban_worker_result_exit_code(cli: "HermesCLI", result: Any) -> int:
             # The reaper remains a conservative fallback if the early write
             # cannot be made (e.g. a transient SQLite failure).
             logger.debug("kanban clean-exit boundary recording failed: %s", exc)
-    return 0
+    return exit_code
 
 
 def _run_kanban_goal_loop_q(cli: "HermesCLI", first_response: str) -> None:
@@ -4213,6 +4221,11 @@ def _run_quiet_single_query(cli, effective_query):
             _exit_code = _int_or(_goal_exit.code, 1)
         except Exception as _goal_exc:
             logger.debug("kanban goal loop failed: %s", _goal_exc)
+
+    # Finalize only after the goal loop has consumed all successful nonterminal
+    # turns. Per-turn classification must not close a run before its judge can
+    # request a continuation.
+    _exit_code = _finalize_kanban_worker_process_exit(_exit_code)
 
     print(f"\nsession_id: {cli.session_id}", file=sys.stderr)
 
