@@ -410,7 +410,11 @@ export function CtaBanner({
             )
           }
           icon={icon}
-          title={kind ? k.blockKind[kind] : k.ctaBlockedTitle}
+          title={
+            blockEvent?.intentionalInitialBlock
+              ? k.ctaInitialBlockTitle
+              : kind ? k.blockKind[kind] : k.ctaBlockedTitle
+          }
           tone={tone}
         >
           {choices ? (

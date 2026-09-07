@@ -161,6 +161,7 @@ type KanbanMessages = {
   // Call-to-action banner — the top-of-drawer answer to "why is this stuck
   // and what do I do about it" for blocked/review tasks.
   ctaBlockedTitle: string
+  ctaInitialBlockTitle: string
   ctaBlockedNoReason: string
   ctaBlockedAutomaticTitle: string
   ctaReviewNoVerdictTitle: string
@@ -502,6 +503,7 @@ export const en: KanbanMessages = {
     'The dispatcher only claims Ready cards that have an assignee. Pick a profile in the Assignee field above (or set a default assignee in the orchestration settings) and it runs within a minute.',
   diagnosticsN: n => `Diagnostics · ${n}`,
   ctaBlockedTitle: 'Blocked — cause unknown',
+  ctaInitialBlockTitle: 'Deliberately blocked at creation',
   ctaBlockedNoReason: 'No cause is recorded for this block. Check the worker log, or reassign to retry.',
   ctaBlockedAutomaticTitle: 'Blocked — automatic failure',
   ctaReviewNoVerdictTitle: 'Reviewer exited without a verdict',
@@ -828,6 +830,7 @@ const ja: KanbanMessages = {
     'ディスパッチャは担当のある Ready カードのみ取得します。上の担当フィールドでプロフィールを選ぶ（またはオーケストレーション設定でデフォルトの担当を設定する）と、1分以内に実行されます。',
   diagnosticsN: n => `診断・${n}`,
   ctaBlockedTitle: 'ブロック中 — 原因不明',
+  ctaInitialBlockTitle: '作成時に意図的にブロックされました',
   ctaBlockedNoReason: 'このブロックには原因が記録されていません。ワーカーログを確認するか、再割り当てして再試行してください。',
   ctaBlockedAutomaticTitle: 'ブロック中 — 自動的な失敗',
   ctaReviewNoVerdictTitle: 'レビュアーが判定なしで終了しました',
@@ -1152,6 +1155,7 @@ const zh: KanbanMessages = {
     '调度器只领取有负责人的就绪卡片。在上面的负责人字段选择一个配置档（或在编排设置中设置默认负责人），它会在一分钟内运行。',
   diagnosticsN: n => `诊断・${n}`,
   ctaBlockedTitle: '受阻 — 原因不明',
+  ctaInitialBlockTitle: '创建时被有意阻止',
   ctaBlockedNoReason: '此次受阻没有记录原因。请查看工作单元日志，或重新分配以重试。',
   ctaBlockedAutomaticTitle: '受阻 — 自动失败',
   ctaReviewNoVerdictTitle: '审查者退出时没有给出结论',
@@ -1473,6 +1477,7 @@ const zhHant: KanbanMessages = {
     '排程器只領取有負責人的就緒卡片。在上方的負責人欄位選擇一個設定檔（或在編排設定中設定預設負責人），它會在一分鐘內執行。',
   diagnosticsN: n => `診斷・${n}`,
   ctaBlockedTitle: '受阻 — 原因不明',
+  ctaInitialBlockTitle: '建立時刻意受阻',
   ctaBlockedNoReason: '此次受阻沒有記錄原因。請查看工作單元日誌，或重新指派以重試。',
   ctaBlockedAutomaticTitle: '受阻 — 自動失敗',
   ctaReviewNoVerdictTitle: '審查者結束時沒有給出結論',

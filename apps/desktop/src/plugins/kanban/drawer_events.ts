@@ -210,14 +210,31 @@ export function latestBlockReason(events: KanbanEvent[]): null | string {
  *  stable handle that binds a clicked answer to the specific question it
  *  answers (`ChoiceResponse.question_event_id`), so a re-block with a new
  *  question can never be confused with an old, already-answered one. */
-export function latestBlockEvent(events: KanbanEvent[]): null | { id: number; reason: string } {
+export function latestBlockEvent(events: KanbanEvent[]): null | {
+  id: number
+  intentionalInitialBlock: boolean
+  reason: string
+} {
   for (let i = events.length - 1; i >= 0; i--) {
     const event = events[i]
 
     if (event.kind === 'blocked' || event.kind === 'block_loop_detected') {
       const reason = latestBlockReason([event])
 
-      return reason ? { id: event.id, reason } : null
+      const payload = event.payload
+      const parsed = typeof payload === 'string'
+        ? (() => {
+            try {
+              return JSON.parse(payload) as Record<string, unknown>
+            } catch {
+              return null
+            }
+          })()
+        : payload as Record<string, unknown> | null
+
+      return reason
+        ? { id: event.id, intentionalInitialBlock: parsed?.intentional_initial_block === true, reason }
+        : null
     }
   }
 
