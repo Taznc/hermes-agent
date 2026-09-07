@@ -250,6 +250,43 @@ def test_auto_route_fails_closed_unless_resolution_avoids_paused_group(quota_hom
     assert _guard("default", auto_task) is None
 
 
+def test_repeated_dispatch_ticks_never_start_auto_task_on_paused_provider(quota_home, monkeypatch):
+    """End to end through ``dispatch_once``: an auto card whose profile keeps
+    resolving to the exhausted provider is never spawned across many ticks,
+    while a sibling auto card whose profile resolves elsewhere spawns."""
+    monkeypatch.setattr(kqc, "configured_budget_groups", lambda: BUDGET_GROUPS)
+    monkeypatch.setattr(kbd, "_memory_pressure_level", lambda: "unknown")
+    from hermes_cli import profiles
+    monkeypatch.setattr(profiles, "profile_exists", lambda _name: True)
+    stuck = _task("default", profile="implementer", provider="auto")
+    healthy = _task("second", profile="reviewer", provider="auto")
+    kqc.register_quota_circuit(
+        "primary-wallet", retry_after=600, board="default", task_id=stuck,
+        reason="rate_limit", max_seconds=3600, now=1_000,
+    )
+    monkeypatch.setattr(kqc.time, "time", lambda: 1_001)
+    monkeypatch.setattr(
+        kqc, "predict_auto_provider",
+        lambda profile: "openai-codex" if profile == "implementer" else "anthropic",
+    )
+    spawned: list[str] = []
+    for _tick in range(4):
+        for board in ("default", "second"):
+            with kbc.connect(board=board) as conn:
+                result = kbd.dispatch_once(
+                    conn, board=board, dry_run=True, max_spawn=10,
+                    max_in_progress=10, reconcile_orphans=False,
+                )
+                spawned.extend(task_id for task_id, _who, _ws in result.spawned)
+                if board == "default":
+                    assert (stuck, "host_quota_circuit") in result.respawn_guarded
+    assert stuck not in spawned
+    # The reviewer card shares the paused candidate group but its profile's
+    # resolution lands on a provider mapped to an unpaused group, so it is
+    # admitted every tick.
+    assert spawned.count(healthy) == 4
+
+
 def test_auto_prediction_runs_resolver_under_profile_home(quota_home, monkeypatch):
     monkeypatch.delenv("HERMES_INFERENCE_PROVIDER", raising=False)
     (quota_home / "profiles" / "implementer").mkdir(parents=True)
