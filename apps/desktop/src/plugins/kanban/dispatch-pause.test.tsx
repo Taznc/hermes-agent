@@ -182,6 +182,45 @@ describe('Dispatch pause control', () => {
     expect(screen.getByRole('button', { name: 'pauseDispatch()' })).toBeTruthy()
   })
 
+  it('reports a refused resume as still paused rather than silently succeeding', async () => {
+    // Symmetric to the refused pause: the backend refuses a contended board
+    // with {resumed: false} and HTTP 200. Treating that as success would leave
+    // the operator believing a drained board is claiming work again.
+    status = { ...PAUSED }
+    rest.mockImplementation((path: string, options?: { method?: string }) => {
+      if (path.startsWith('/dispatch/status')) {
+        return Promise.resolve(status)
+      }
+
+      if (options?.method === 'POST') {
+        return Promise.resolve({ previous: PAUSED.state, reason: 'dispatch_in_progress', resumed: false, was_paused: true })
+      }
+
+      return Promise.reject(new Error('unexpected request'))
+    })
+    mount()
+
+    fireEvent.click(await screen.findByRole('button', { name: 'resumeDispatch()' }))
+
+    await waitFor(() => expect(notify).toHaveBeenCalledWith({ kind: 'warning', message: 'resumeBusy()' }))
+    expect(screen.getByRole('button', { name: 'resumeDispatch()' })).toBeTruthy()
+  })
+
+  it('offers no single-board Pause action while All Boards is selected', async () => {
+    // `withBoard` drops the All Boards sentinel, so a Pause pressed here would
+    // silently act on one hidden fallback board. The scope must be explicit
+    // rather than misrepresented.
+    $boardSlug.set('*')
+    mount()
+
+    expect(await screen.findByText('dispatchAllBoards()')).toBeTruthy()
+    expect(screen.queryByRole('button', { name: 'pauseDispatch()' })).toBeNull()
+    expect(screen.queryByRole('button', { name: 'resumeDispatch()' })).toBeNull()
+    // Not even a status poll: under the sentinel it would report some other
+    // board's state next to an All Boards heading.
+    expect(rest).not.toHaveBeenCalled()
+  })
+
   it('reports a refused pause as not paused rather than silently succeeding', async () => {
     // The backend refuses a contended board with {paused: false} and HTTP 200 —
     // an operator must never read that as a drained board.

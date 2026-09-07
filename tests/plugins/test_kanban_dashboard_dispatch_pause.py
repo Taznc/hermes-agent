@@ -185,6 +185,58 @@ def test_status_message_renders_an_operator_pause_readably(client, kanban_home):
     assert "2.7 rollout" in status["message"]
 
 
+def test_omitted_board_pauses_the_current_board_not_default(client, kanban_home):
+    """The Desktop sends no ``board`` while the active board is selected.
+
+    ``BoardSwitcher`` stores "currently active" as an empty slug, so the whole
+    default UI path arrives here with the param omitted. If pause resolved that
+    to ``default`` while status resolved it to the current board, the operator
+    would press Pause, see the board stay unpaused, and restart the gateway on
+    top of live workers.
+    """
+    kb.create_board("active-board")
+    kb.set_current_board("active-board")
+    _running("active-board", 1)
+
+    # Control: status already resolves the omission through the current-board
+    # pointer, so this count proves the three routes are compared on one board.
+    assert client.get(f"{PREFIX}/dispatch/status").json()["running_count"] == 1
+
+    paused = client.post(f"{PREFIX}/dispatch/pause", json={"note": "gateway restart"})
+
+    assert paused.status_code == 200
+    assert paused.json()["paused"] is True
+    assert client.get(f"{PREFIX}/dispatch/status").json()["paused"] is True
+    assert kbd.read_dispatch_pause("active-board") is not None
+    assert kbd.read_dispatch_pause("default") is None
+
+
+def test_omitted_board_resumes_the_current_board_not_default(client, kanban_home):
+    kb.create_board("active-board")
+    kb.set_current_board("active-board")
+    kbd.pause_dispatch("active-board", note="gateway restart")
+
+    resumed = client.post(f"{PREFIX}/dispatch/resume")
+
+    assert resumed.status_code == 200
+    assert resumed.json()["was_paused"] is True
+    assert kbd.read_dispatch_pause("active-board") is None
+    assert client.get(f"{PREFIX}/dispatch/status").json()["paused"] is False
+
+
+def test_an_explicit_board_still_wins_over_the_current_board(client, kanban_home):
+    """Resolving the omission must not weaken explicit-board isolation."""
+    kb.create_board("active-board")
+    kb.create_board("other-board")
+    kb.set_current_board("active-board")
+
+    client.post(f"{PREFIX}/dispatch/pause?board=other-board", json={})
+
+    assert kbd.read_dispatch_pause("other-board") is not None
+    assert kbd.read_dispatch_pause("active-board") is None
+    assert client.get(f"{PREFIX}/dispatch/status").json()["paused"] is False
+
+
 def test_unknown_board_is_rejected_not_silently_applied_to_the_active_board(
     client, kanban_home,
 ):

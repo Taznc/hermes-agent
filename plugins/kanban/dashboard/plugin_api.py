@@ -1708,20 +1708,35 @@ def dispatch_status(board: Optional[str] = _BOARD_Q):
     }
 
 
+def _dispatch_target_board(board: Optional[str]) -> str:
+    """Resolve the board a pause/resume acts on to an explicit slug.
+
+    An omitted param must land on the *current* board, exactly as
+    ``GET /dispatch/status`` reads it: the Desktop's board switcher stores
+    "the active board" as an empty slug, so the default UI path arrives here
+    with no ``board`` at all. Leaving that as ``None`` under
+    ``_with_board_pinned`` would pin ``DEFAULT_BOARD`` and pause a board the
+    operator is not looking at, while status kept reporting the real one —
+    a silent no-op right before a gateway restart. An explicit slug is still
+    validated and used verbatim, so board isolation is unchanged.
+    """
+    return _resolve_board(board) or kanban_db.get_current_board()
+
+
 @router.post("/dispatch/pause")
 def dispatch_pause(payload: Optional[DispatchPauseBody] = None, board: Optional[str] = _BOARD_Q):
     """Stop claiming/spawning on this board so it can drain. Never kills a worker."""
-    board = _resolve_board(board)
+    target = _dispatch_target_board(board)
     return _with_board_pinned(
-        board, lambda: kbd.pause_dispatch(board, note=(payload.note if payload else None)),
+        target, lambda: kbd.pause_dispatch(target, note=(payload.note if payload else None)),
     )
 
 
 @router.post("/dispatch/resume")
 def dispatch_resume(board: Optional[str] = _BOARD_Q):
     """Clear this board's pause — the same entry point `--resume-circuit` uses."""
-    board = _resolve_board(board)
-    return _with_board_pinned(board, lambda: kbd.resume_dispatch(board))
+    target = _dispatch_target_board(board)
+    return _with_board_pinned(target, lambda: kbd.resume_dispatch(target))
 
 
 @router.get("/model-options")

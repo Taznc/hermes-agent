@@ -24,6 +24,7 @@ import { useState } from 'react'
 
 import {
   $boardSlug,
+  ALL_BOARDS,
   autoDescribeProfile,
   dispatchStatusKey,
   fetchDispatchStatus,
@@ -50,18 +51,24 @@ const DEFAULT_SENTINEL = '__default__'
  * running count is the actual "is it safe to restart yet" signal, and it is
  * the prominent thing here.
  *
- * Board-scoped: `api.ts`'s `withBoard` pins every call to `$boardSlug`. The
- * All Boards sentinel resolves to the server's active board rather than
- * fanning out; a multi-board pause is deliberately out of scope for now.
+ * Single-board only, and it says so: `api.ts`'s `withBoard` DROPS the All
+ * Boards sentinel, so under that selection every call here would silently
+ * resolve to the server's current board — one hidden board of many, paused by
+ * a control sitting under an "All Boards" heading. A multi-board fan-out is
+ * out of scope for now, so the control renders as an explicit hint instead of
+ * an action whose target the operator cannot see. Not even the status poll
+ * runs: it would report one board's drain count as if it covered all of them.
  */
 export function DispatchPauseControl() {
   const k = useKanban()
   const qc = useQueryClient()
   const slug = useValue($boardSlug)
+  const isAllBoards = slug === ALL_BOARDS
 
   // Same 8s cadence the board's own drawer-adjacent polls use: while draining,
   // the operator is watching this number, so a 60s settings cadence is too slow.
   const { data: status } = useQuery({
+    enabled: !isAllBoards,
     queryFn: fetchDispatchStatus,
     queryKey: dispatchStatusKey(slug),
     refetchInterval: 8_000
@@ -87,8 +94,26 @@ export function DispatchPauseControl() {
   const resume = useMutation({
     mutationFn: resumeDispatch,
     onError: err => host.notify({ kind: 'error', message: errText(err) }),
-    onSuccess: refresh
+    onSuccess: result => {
+      // Symmetric to pause: a contended board refuses with `resumed: false` and
+      // HTTP 200. Silently refreshing there would leave the operator believing
+      // dispatch had restarted while the board is still fenced.
+      if (!result.resumed) {
+        host.notify({ kind: 'warning', message: k.resumeBusy })
+      }
+
+      refresh()
+    }
   })
+
+  if (isAllBoards) {
+    return (
+      <div className="flex flex-col gap-1.5">
+        <span className={FIELD_LABEL}>{k.dispatchControl}</span>
+        <p className="text-[0.6875rem] text-(--ui-text-quaternary)">{k.dispatchAllBoards}</p>
+      </div>
+    )
+  }
 
   if (!status) {
     return null
