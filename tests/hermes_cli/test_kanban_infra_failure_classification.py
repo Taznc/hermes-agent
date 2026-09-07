@@ -30,6 +30,7 @@ from pathlib import Path
 import pytest
 
 from hermes_cli import kanban_db as kb
+from hermes_cli import kanban_db_connect as kbc
 from hermes_cli import kanban_db_dispatch as kbd
 
 
@@ -165,14 +166,14 @@ def test_external_sigkill_death_is_infra_not_crash(kanban_home, monkeypatch):
     monkeypatch.setattr(kbd, "_pid_alive", lambda _pid: False)
     monkeypatch.setenv("HERMES_KANBAN_CRASH_GRACE_SECONDS", "0")
 
-    with kb.connect() as conn:
+    with kbc.connect() as conn:
         pid = 80001
         tid = _make_running_task(conn, title="external-sigkill", pid=pid)
         kbd._record_worker_exit(pid, _signaled_status(int(signal.SIGKILL)))
 
-        crashed = kb.detect_crashed_workers(conn)
+        crashed = kbd.detect_crashed_workers(conn)
         assert tid not in crashed
-        interrupted = getattr(kb.detect_crashed_workers, "_last_interrupted", [])
+        interrupted = getattr(kbd.detect_crashed_workers, "_last_interrupted", [])
         assert tid in interrupted
 
         task = kb.get_task(conn, tid)
@@ -203,7 +204,7 @@ def test_excluded_signal_death_is_a_counted_failure_reaching_gave_up(kanban_home
     monkeypatch.setattr(kbd, "_pid_alive", lambda _pid: False)
     monkeypatch.setenv("HERMES_KANBAN_CRASH_GRACE_SECONDS", "0")
 
-    with kb.connect() as conn:
+    with kbc.connect() as conn:
         host = kb._claimer_id().split(":", 1)[0]
         tid = kb.create_task(conn, title=f"excluded-signal-{int(sig)}", assignee="a")
 
@@ -213,9 +214,9 @@ def test_excluded_signal_death_is_a_counted_failure_reaching_gave_up(kanban_home
             conn.execute("UPDATE tasks SET worker_pid=? WHERE id=?", (pid, tid))
             conn.commit()
             kbd._record_worker_exit(pid, _signaled_status(int(sig)))
-            crashed = kb.detect_crashed_workers(conn)
+            crashed = kbd.detect_crashed_workers(conn)
             assert tid in crashed
-            interrupted = getattr(kb.detect_crashed_workers, "_last_interrupted", [])
+            interrupted = getattr(kbd.detect_crashed_workers, "_last_interrupted", [])
             assert tid not in interrupted
             task = kb.get_task(conn, tid)
             if i == 0:
@@ -241,7 +242,7 @@ def test_dispatcher_owned_max_runtime_kill_persists_durable_intent_and_still_cou
 
     monkeypatch.setattr(kbd, "_pid_alive", lambda _pid: False)
 
-    with kb.connect() as conn:
+    with kbc.connect() as conn:
         tid = kb.create_task(
             conn, title="overrun", assignee="worker", max_runtime_seconds=1,
         )
@@ -284,7 +285,7 @@ def test_timeout_kill_intent_survives_restart_between_signal_and_reap(kanban_hom
     monkeypatch.setattr(kbd, "_pid_alive", lambda _pid: False)
     monkeypatch.setenv("HERMES_KANBAN_CRASH_GRACE_SECONDS", "0")
 
-    with kb.connect() as conn:
+    with kbc.connect() as conn:
         tid = kb.create_task(conn, title="restart-window", assignee="worker", max_runtime_seconds=600)
         kb.claim_task(conn, tid)
         pid = 90050
@@ -307,13 +308,13 @@ def test_timeout_kill_intent_survives_restart_between_signal_and_reap(kanban_hom
 
         # A DIFFERENT dispatcher process now reaps the worker as signaled.
         kbd._record_worker_exit(pid, _signaled_status(int(signal.SIGTERM)))
-        crashed = kb.detect_crashed_workers(conn)
+        crashed = kbd.detect_crashed_workers(conn)
 
         # Despite SIGTERM being on the infra allowlist and the in-memory
         # kill-intent dict being empty, the durable SQLite intent means this
         # is still resolved as a legit, counted failure.
         assert tid in crashed
-        interrupted = getattr(kb.detect_crashed_workers, "_last_interrupted", [])
+        interrupted = getattr(kbd.detect_crashed_workers, "_last_interrupted", [])
         assert tid not in interrupted
 
         task = kb.get_task(conn, tid)
@@ -334,14 +335,14 @@ def test_dead_pid_within_startup_window_is_infra(kanban_home, monkeypatch):
     monkeypatch.setenv("HERMES_KANBAN_INFRA_STARTUP_WINDOW_SECONDS", "120")
     kb.mark_dispatcher_process_started()
     try:
-        with kb.connect() as conn:
+        with kbc.connect() as conn:
             pid = 80002
             tid = _make_running_task(conn, title="dead-pid-restart", pid=pid)
             # No _record_worker_exit call at all -> "unknown" exit_kind.
 
-            crashed = kb.detect_crashed_workers(conn)
+            crashed = kbd.detect_crashed_workers(conn)
             assert tid not in crashed
-            interrupted = getattr(kb.detect_crashed_workers, "_last_interrupted", [])
+            interrupted = getattr(kbd.detect_crashed_workers, "_last_interrupted", [])
             assert tid in interrupted
 
             task = kb.get_task(conn, tid)
@@ -360,13 +361,13 @@ def test_dead_pid_outside_startup_window_is_legit_failure(kanban_home, monkeypat
     monkeypatch.setenv("HERMES_KANBAN_CRASH_GRACE_SECONDS", "0")
     os.environ.pop(kb._DISPATCHER_STARTED_AT_ENV, None)
 
-    with kb.connect() as conn:
+    with kbc.connect() as conn:
         pid = 80003
         tid = _make_running_task(conn, title="dead-pid-crash", pid=pid)
 
-        crashed = kb.detect_crashed_workers(conn)
+        crashed = kbd.detect_crashed_workers(conn)
         assert tid in crashed
-        interrupted = getattr(kb.detect_crashed_workers, "_last_interrupted", [])
+        interrupted = getattr(kbd.detect_crashed_workers, "_last_interrupted", [])
         assert tid not in interrupted
 
         task = kb.get_task(conn, tid)
@@ -384,7 +385,7 @@ def test_quota_log_signature_detected_from_worker_log_is_infra(kanban_home, monk
     monkeypatch.setattr(kbd, "_pid_alive", lambda _pid: False)
     monkeypatch.setenv("HERMES_KANBAN_CRASH_GRACE_SECONDS", "0")
 
-    with kb.connect() as conn:
+    with kbc.connect() as conn:
         pid = 80004
         tid = _make_running_task(conn, title="quota-log", pid=pid)
         run_id = kb._current_run_id(conn, tid)
@@ -394,9 +395,9 @@ def test_quota_log_signature_detected_from_worker_log_is_infra(kanban_home, monk
             "Credentials are still valid.\nGoodbye!\n",
         )
 
-        crashed = kb.detect_crashed_workers(conn)
+        crashed = kbd.detect_crashed_workers(conn)
         assert tid not in crashed
-        interrupted = getattr(kb.detect_crashed_workers, "_last_interrupted", [])
+        interrupted = getattr(kbd.detect_crashed_workers, "_last_interrupted", [])
         assert tid in interrupted
 
         task = kb.get_task(conn, tid)
@@ -425,7 +426,7 @@ def test_provider_backoff_parses_only_positive_base10_int():
 
 
 def test_provider_backoff_clamps_to_configured_max(kanban_home):
-    with kb.connect() as conn:
+    with kbc.connect() as conn:
         # Huge retry-after is clamped to the cap, with a diagnostic recorded.
         until = kb.register_provider_backoff(
             conn, provider="anthropic", retry_after=999_999, task_id="t_x",
@@ -441,7 +442,7 @@ def test_provider_backoff_clamps_to_configured_max(kanban_home):
 
 @pytest.mark.parametrize("retry_after", [None, 0, -1])
 def test_provider_backoff_malformed_or_nonpositive_never_pauses(kanban_home, retry_after):
-    with kb.connect() as conn:
+    with kbc.connect() as conn:
         until = kb.register_provider_backoff(
             conn, provider="anthropic", retry_after=retry_after, task_id="t_x",
             max_seconds=86400,
@@ -453,7 +454,7 @@ def test_provider_backoff_malformed_or_nonpositive_never_pauses(kanban_home, ret
 def test_provider_backoff_persists_across_reconnect(kanban_home):
     """Durability across dispatcher restarts: a fresh connection still sees
     the pause and check_respawn_guard still defers on it."""
-    with kb.connect() as conn:
+    with kbc.connect() as conn:
         tid = kb.create_task(
             conn, title="paused-provider", assignee="a",
             model_override="claude-x", provider_override="anthropic",
@@ -462,7 +463,7 @@ def test_provider_backoff_persists_across_reconnect(kanban_home):
             conn, provider="anthropic", retry_after=60, task_id=tid, max_seconds=86400,
         )
 
-    with kb.connect() as conn2:
+    with kbc.connect() as conn2:
         assert kb.provider_backoff_until(conn2, provider="anthropic") is not None
         assert kbd.check_respawn_guard(conn2, tid) == "provider_backoff"
 
@@ -476,7 +477,7 @@ def test_quota_death_with_provider_parks_as_scheduled_and_registers_backoff(
     monkeypatch.setattr(kbd, "_pid_alive", lambda _pid: False)
     monkeypatch.setenv("HERMES_KANBAN_CRASH_GRACE_SECONDS", "0")
 
-    with kb.connect() as conn:
+    with kbc.connect() as conn:
         pid = 80005
         host = kb._claimer_id().split(":", 1)[0]
         tid = kb.create_task(conn, title="quota-parked", assignee="a", model_override="claude-x", provider_override="anthropic")
@@ -487,7 +488,7 @@ def test_quota_death_with_provider_parks_as_scheduled_and_registers_backoff(
         kbd._record_worker_exit(pid, _exited_status(1))
         _write_worker_run_log(tid, run_id, "quota exhausted (429); retry after 120s.\n")
 
-        crashed = kb.detect_crashed_workers(conn)
+        crashed = kbd.detect_crashed_workers(conn)
         assert tid not in crashed
         task = kb.get_task(conn, tid)
         assert task.status == "scheduled"
@@ -513,7 +514,7 @@ def test_quota_death_with_explicit_auto_provider_stays_on_interruption_path(
     monkeypatch.setattr(kbd, "_pid_alive", lambda _pid: False)
     monkeypatch.setenv("HERMES_KANBAN_CRASH_GRACE_SECONDS", "0")
 
-    with kb.connect() as conn:
+    with kbc.connect() as conn:
         pid = 80007
         host = kb._claimer_id().split(":", 1)[0]
         tid = kb.create_task(
@@ -528,7 +529,7 @@ def test_quota_death_with_explicit_auto_provider_stays_on_interruption_path(
         kbd._record_worker_exit(pid, _exited_status(1))
         _write_worker_run_log(tid, run_id, "quota exhausted (429); retry after 120s.\n")
 
-        crashed = kb.detect_crashed_workers(conn)
+        crashed = kbd.detect_crashed_workers(conn)
         assert tid not in crashed
         task = kb.get_task(conn, tid)
         assert task is not None and task.status == "ready"
@@ -545,7 +546,7 @@ def test_quota_death_without_usable_retry_after_does_not_park_falls_to_interrupt
     monkeypatch.setattr(kbd, "_pid_alive", lambda _pid: False)
     monkeypatch.setenv("HERMES_KANBAN_CRASH_GRACE_SECONDS", "0")
 
-    with kb.connect() as conn:
+    with kbc.connect() as conn:
         pid = 80006
         host = kb._claimer_id().split(":", 1)[0]
         tid = kb.create_task(conn, title="quota-no-retry-after", assignee="a", model_override="claude-x", provider_override="anthropic")
@@ -557,7 +558,7 @@ def test_quota_death_without_usable_retry_after_does_not_park_falls_to_interrupt
         # Quota signature present but NO parseable "retry after Ns".
         _write_worker_run_log(tid, run_id, "quota exhausted (429).\n")
 
-        crashed = kb.detect_crashed_workers(conn)
+        crashed = kbd.detect_crashed_workers(conn)
         assert tid not in crashed
         task = kb.get_task(conn, tid)
         # No usable retry-after -> not parked, falls back to ready via the
@@ -580,7 +581,7 @@ def test_interruption_streak_increments_across_infra_deaths_and_promotes_at_cap(
     monkeypatch.setattr(kbd, "_pid_alive", lambda _pid: False)
     monkeypatch.setenv("HERMES_KANBAN_CRASH_GRACE_SECONDS", "0")
 
-    with kb.connect() as conn:
+    with kbc.connect() as conn:
         host = kb._claimer_id().split(":", 1)[0]
         tid = kb.create_task(conn, title="repeat-interrupt", assignee="a")
 
@@ -590,7 +591,7 @@ def test_interruption_streak_increments_across_infra_deaths_and_promotes_at_cap(
             conn.execute("UPDATE tasks SET worker_pid=? WHERE id=?", (pid, tid))
             conn.commit()
             kbd._record_worker_exit(pid, _signaled_status(int(signal.SIGKILL)))
-            crashed = kb.detect_crashed_workers(conn)
+            crashed = kbd.detect_crashed_workers(conn)
             assert tid not in crashed
             task = kb.get_task(conn, tid)
             assert task.status == "ready"
@@ -603,9 +604,9 @@ def test_interruption_streak_increments_across_infra_deaths_and_promotes_at_cap(
         conn.execute("UPDATE tasks SET worker_pid=? WHERE id=?", (pid, tid))
         conn.commit()
         kbd._record_worker_exit(pid, _signaled_status(int(signal.SIGKILL)))
-        crashed = kb.detect_crashed_workers(conn)
+        crashed = kbd.detect_crashed_workers(conn)
         assert tid in crashed, "streak-exceeded infra death must be promoted to a counted crash"
-        interrupted = getattr(kb.detect_crashed_workers, "_last_interrupted", [])
+        interrupted = getattr(kbd.detect_crashed_workers, "_last_interrupted", [])
         assert tid not in interrupted
 
         task = kb.get_task(conn, tid)
@@ -628,7 +629,7 @@ def test_interruption_streak_never_resets_on_bare_redispatch(kanban_home, monkey
     monkeypatch.setattr(kbd, "_pid_alive", lambda _pid: False)
     monkeypatch.setenv("HERMES_KANBAN_CRASH_GRACE_SECONDS", "0")
 
-    with kb.connect() as conn:
+    with kbc.connect() as conn:
         host = kb._claimer_id().split(":", 1)[0]
         tid = kb.create_task(conn, title="streak-persists", assignee="a")
         pid = 82000
@@ -636,7 +637,7 @@ def test_interruption_streak_never_resets_on_bare_redispatch(kanban_home, monkey
         conn.execute("UPDATE tasks SET worker_pid=? WHERE id=?", (pid, tid))
         conn.commit()
         kbd._record_worker_exit(pid, _signaled_status(int(signal.SIGTERM)))
-        kb.detect_crashed_workers(conn)
+        kbd.detect_crashed_workers(conn)
         assert kb.read_interruption_streak(conn, task_id=tid) == 1
 
         # Redispatch: claim again, this time a plain successful completion —
@@ -650,7 +651,7 @@ def test_interruption_streak_resets_on_genuine_completion(kanban_home, monkeypat
     monkeypatch.setattr(kbd, "_pid_alive", lambda _pid: False)
     monkeypatch.setenv("HERMES_KANBAN_CRASH_GRACE_SECONDS", "0")
 
-    with kb.connect() as conn:
+    with kbc.connect() as conn:
         host = kb._claimer_id().split(":", 1)[0]
         tid = kb.create_task(conn, title="streak-reset-complete", assignee="a")
         pid = 82001
@@ -658,7 +659,7 @@ def test_interruption_streak_resets_on_genuine_completion(kanban_home, monkeypat
         conn.execute("UPDATE tasks SET worker_pid=? WHERE id=?", (pid, tid))
         conn.commit()
         kbd._record_worker_exit(pid, _signaled_status(int(signal.SIGTERM)))
-        kb.detect_crashed_workers(conn)
+        kbd.detect_crashed_workers(conn)
         assert kb.read_interruption_streak(conn, task_id=tid) == 1
 
         kb.claim_task(conn, tid, claimer=f"{host}:w2")
@@ -671,7 +672,7 @@ def test_interruption_streak_resets_on_explicit_operator_unblock(kanban_home, mo
     monkeypatch.setenv("HERMES_KANBAN_CRASH_GRACE_SECONDS", "0")
     monkeypatch.setenv("HERMES_KANBAN_MAX_INFRA_INTERRUPTIONS", "1")
 
-    with kb.connect() as conn:
+    with kbc.connect() as conn:
         host = kb._claimer_id().split(":", 1)[0]
         tid = kb.create_task(conn, title="streak-reset-unblock", assignee="a")
         for i in range(2):
@@ -680,7 +681,7 @@ def test_interruption_streak_resets_on_explicit_operator_unblock(kanban_home, mo
             conn.execute("UPDATE tasks SET worker_pid=? WHERE id=?", (pid, tid))
             conn.commit()
             kbd._record_worker_exit(pid, _signaled_status(int(signal.SIGTERM)))
-            kb.detect_crashed_workers(conn)
+            kbd.detect_crashed_workers(conn)
 
         # cap=1: the second death (streak=2 > cap 1) promotes to blocked.
         task = kb.get_task(conn, tid)
@@ -710,14 +711,14 @@ def test_count_infra_failures_true_restores_pre_classification_behaviour(kanban_
     monkeypatch.setenv("HERMES_KANBAN_CRASH_GRACE_SECONDS", "0")
     monkeypatch.setenv("HERMES_KANBAN_COUNT_INFRA_FAILURES", "true")
 
-    with kb.connect() as conn:
+    with kbc.connect() as conn:
         pid = 80007
         tid = _make_running_task(conn, title="external-sig-counted", pid=pid)
         kbd._record_worker_exit(pid, _signaled_status(int(signal.SIGKILL)))
 
-        crashed = kb.detect_crashed_workers(conn)
+        crashed = kbd.detect_crashed_workers(conn)
         assert tid in crashed
-        interrupted = getattr(kb.detect_crashed_workers, "_last_interrupted", [])
+        interrupted = getattr(kbd.detect_crashed_workers, "_last_interrupted", [])
         assert tid not in interrupted
 
         task = kb.get_task(conn, tid)
@@ -733,7 +734,7 @@ def test_provider_backoff_false_avoids_provider_parking(kanban_home, monkeypatch
     monkeypatch.setenv("HERMES_KANBAN_CRASH_GRACE_SECONDS", "0")
     monkeypatch.setenv("HERMES_KANBAN_PROVIDER_BACKOFF", "false")
 
-    with kb.connect() as conn:
+    with kbc.connect() as conn:
         pid = 80008
         host = kb._claimer_id().split(":", 1)[0]
         tid = kb.create_task(conn, title="quota-no-parking", assignee="a", model_override="claude-x", provider_override="anthropic")
@@ -744,7 +745,7 @@ def test_provider_backoff_false_avoids_provider_parking(kanban_home, monkeypatch
         kbd._record_worker_exit(pid, _exited_status(1))
         _write_worker_run_log(tid, run_id, "quota exhausted (429); retry after 120s.\n")
 
-        crashed = kb.detect_crashed_workers(conn)
+        crashed = kbd.detect_crashed_workers(conn)
         assert tid not in crashed
         task = kb.get_task(conn, tid)
         assert task.status == "ready"  # not parked, provider_backoff disabled
@@ -758,7 +759,7 @@ def test_provider_backoff_false_avoids_provider_parking(kanban_home, monkeypatch
 
 def test_iteration_budget_exhausted_still_counts_as_failure(kanban_home):
     """Iteration-budget exhaustion never reaches the infra classifier."""
-    with kb.connect() as conn:
+    with kbc.connect() as conn:
         tid = kb.create_task(conn, title="budget-exhausted", assignee="worker")
         kb.claim_task(conn, tid)
 
@@ -794,14 +795,14 @@ def test_ordinary_nonzero_exit_still_counts_as_failure(kanban_home, monkeypatch)
     monkeypatch.setenv("HERMES_KANBAN_CRASH_GRACE_SECONDS", "0")
     os.environ.pop(kb._DISPATCHER_STARTED_AT_ENV, None)
 
-    with kb.connect() as conn:
+    with kbc.connect() as conn:
         pid = 80009
         tid = _make_running_task(conn, title="plain-nonzero", pid=pid)
         kbd._record_worker_exit(pid, _exited_status(1))
 
-        crashed = kb.detect_crashed_workers(conn)
+        crashed = kbd.detect_crashed_workers(conn)
         assert tid in crashed
-        interrupted = getattr(kb.detect_crashed_workers, "_last_interrupted", [])
+        interrupted = getattr(kbd.detect_crashed_workers, "_last_interrupted", [])
         assert tid not in interrupted
 
         task = kb.get_task(conn, tid)
@@ -815,7 +816,7 @@ def test_ordinary_nonzero_exit_still_counts_as_failure(kanban_home, monkeypatch)
 def test_dispatcher_timeout_beats_quota_signature_in_its_worker_log(kanban_home, monkeypatch):
     monkeypatch.setattr(kbd, "_pid_alive", lambda _pid: False)
     monkeypatch.setenv("HERMES_KANBAN_CRASH_GRACE_SECONDS", "0")
-    with kb.connect() as conn:
+    with kbc.connect() as conn:
         pid = 90100
         tid = _make_running_task(conn, title="timeout after recovered 429", pid=pid)
         run_id = kb._current_run_id(conn, tid)
@@ -823,14 +824,14 @@ def test_dispatcher_timeout_beats_quota_signature_in_its_worker_log(kanban_home,
         kb.persist_timeout_kill_intent(conn, task_id=tid, run_id=run_id, worker_pid=pid, signal=int(signal.SIGTERM))
         kbd._kb._DISPATCHER_KILL_INTENTS.clear()
         kbd._record_worker_exit(pid, _signaled_status(int(signal.SIGTERM)))
-        assert tid in kb.detect_crashed_workers(conn)
+        assert tid in kbd.detect_crashed_workers(conn)
         assert kb.get_task(conn, tid).consecutive_failures == 1
 
 
 def test_prior_run_quota_log_cannot_neutralize_later_ordinary_crash(kanban_home, monkeypatch):
     monkeypatch.setattr(kbd, "_pid_alive", lambda _pid: False)
     monkeypatch.setenv("HERMES_KANBAN_CRASH_GRACE_SECONDS", "0")
-    with kb.connect() as conn:
+    with kbc.connect() as conn:
         pid = 90101
         tid = _make_running_task(conn, title="stale quota", pid=pid)
         first_run = kb._current_run_id(conn, tid)
@@ -845,14 +846,14 @@ def test_prior_run_quota_log_cannot_neutralize_later_ordinary_crash(kanban_home,
         conn.execute("UPDATE tasks SET worker_pid=? WHERE id=?", (pid, tid))
         conn.commit()
         kbd._record_worker_exit(pid, _exited_status(1))
-        assert tid in kb.detect_crashed_workers(conn)
+        assert tid in kbd.detect_crashed_workers(conn)
         assert kb.get_task(conn, tid).consecutive_failures == 1
 
 
 def test_escalated_timeout_intents_are_fully_consumed_and_cannot_poison_reused_pid(kanban_home, monkeypatch):
     monkeypatch.setattr(kbd, "_pid_alive", lambda _pid: False)
     monkeypatch.setenv("HERMES_KANBAN_CRASH_GRACE_SECONDS", "0")
-    with kb.connect() as conn:
+    with kbc.connect() as conn:
         pid = 90102
         tid = _make_running_task(conn, title="escalation", pid=pid)
         first_run = kb._current_run_id(conn, tid)
@@ -874,13 +875,13 @@ def test_escalated_timeout_intents_are_fully_consumed_and_cannot_poison_reused_p
         conn.execute("UPDATE tasks SET worker_pid=? WHERE id=?", (pid, tid))
         conn.commit()
         kbd._record_worker_exit(pid, _signaled_status(int(signal.SIGTERM)))
-        crashed = kb.detect_crashed_workers(conn)
+        crashed = kbd.detect_crashed_workers(conn)
         assert tid not in crashed
-        assert tid in getattr(kb.detect_crashed_workers, "_last_interrupted", [])
+        assert tid in getattr(kbd.detect_crashed_workers, "_last_interrupted", [])
 
 
 def test_expired_provider_backoff_resumes_all_parked_tasks_for_provider(kanban_home):
-    with kb.connect() as conn:
+    with kbc.connect() as conn:
         first = kb.create_task(conn, title="first", assignee="a", model_override="gpt-5", provider_override="openai")
         second = kb.create_task(conn, title="second", assignee="a", model_override="gpt-5", provider_override="openai")
         other = kb.create_task(conn, title="other", assignee="a", model_override="claude", provider_override="anthropic")
@@ -898,7 +899,7 @@ def test_expired_provider_backoff_resumes_all_parked_tasks_for_provider(kanban_h
 
 @pytest.mark.parametrize("value", ["١٢", "1_2", "0", "-1", "+1", "12.0"])
 def test_live_retry_after_parser_rejects_nonpositive_and_non_ascii_values(kanban_home, value):
-    with kb.connect() as conn:
+    with kbc.connect() as conn:
         tid = kb.create_task(conn, title="parser", assignee="a")
         kb.claim_task(conn, tid)
         run_id = kb._current_run_id(conn, tid)

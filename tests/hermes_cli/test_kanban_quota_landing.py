@@ -9,6 +9,7 @@ from pathlib import Path
 import pytest
 
 from hermes_cli import kanban_db as kb
+from hermes_cli import kanban_db_connect as kbc
 from hermes_cli import kanban_db_dispatch as kbd
 
 
@@ -53,18 +54,18 @@ def log_for_current_run(conn, tid, text):
 def quota_reap(conn, tid, pid, retry="30"):
     log_for_current_run(conn, tid, f"quota exhausted (429); retry after {retry}s.\n")
     kbd._record_worker_exit(pid, 1 << 8)
-    return kb.detect_crashed_workers(conn)
+    return kbd.detect_crashed_workers(conn)
 
 
 def test_timeout_ownership_is_committed_before_service_stop(isolated_board, monkeypatch):
     """A restart at the service-stop seam must not excuse a recovered quota run."""
-    with kb.connect() as conn:
+    with kbc.connect() as conn:
         tid, run_id = running(conn, "timeout after recovered quota", 191001, "openai")
         log_for_current_run(conn, tid, "quota exhausted (429); retry after 30s.\nRecovered; still running.\n")
 
         def stop_at_restart(unit):
             assert unit == f"hermes-worker-kanban-{tid}-run-{run_id}.service"
-            with kb.connect() as observer:
+            with kbc.connect() as observer:
                 assert kb.has_pending_timeout_kill_intent(
                     observer, task_id=tid, run_id=run_id, worker_pid=191001,
                 )
@@ -74,16 +75,16 @@ def test_timeout_ownership_is_committed_before_service_stop(isolated_board, monk
         with pytest.raises(RuntimeError, match="simulated dispatcher exit"):
             kbd.enforce_max_runtime(conn, signal_fn=lambda *_: pytest.fail("stop must precede raw signal"))
     kb._DISPATCHER_KILL_INTENTS.clear()
-    with kb.connect() as conn:
+    with kbc.connect() as conn:
         kbd._record_worker_exit(191001, int(signal.SIGTERM))
-        assert kb.detect_crashed_workers(conn) == [tid]
+        assert kbd.detect_crashed_workers(conn) == [tid]
         assert kb.get_task(conn, tid).consecutive_failures == 1
         assert kb.active_provider_backoffs(conn) == []
         assert conn.execute("SELECT COUNT(*) FROM kanban_timeout_kill_intents").fetchone()[0] == 0
 
 
 def test_old_quota_does_not_cross_production_log_run_marker(isolated_board):
-    with kb.connect() as conn:
+    with kbc.connect() as conn:
         tid, first_run = running(conn, "two actual claimed runs", 191002, "auto")
         assert quota_reap(conn, tid, 191002) == []
         assert kb.get_task(conn, tid).status == "ready"
@@ -93,7 +94,7 @@ def test_old_quota_does_not_cross_production_log_run_marker(isolated_board):
             conn.execute("UPDATE tasks SET worker_pid=? WHERE id=?", (191003, tid))
         log_for_current_run(conn, tid, "TypeError: ordinary crash in the next run\n")
         kbd._record_worker_exit(191003, 1 << 8)
-        assert kb.detect_crashed_workers(conn) == [tid]
+        assert kbd.detect_crashed_workers(conn) == [tid]
         assert kb.get_task(conn, tid).consecutive_failures == 1
         assert tid not in kbd.detect_crashed_workers._last_interrupted
 
@@ -106,7 +107,7 @@ def test_real_termination_path_escalation_keeps_one_intent(isolated_board, monke
     monkeypatch.setattr(kb, "_pid_alive", lambda pid: alive.get(pid, False))
     monkeypatch.setattr(kbd, "_poll_worker_exit", lambda _pid: False)
     delivered = []
-    with kb.connect() as conn:
+    with kbc.connect() as conn:
         tid, first_run = running(conn, "escalation then recycled pid", 191004)
 
         def deliver(pid, sig):
@@ -125,7 +126,7 @@ def test_real_termination_path_escalation_keeps_one_intent(isolated_board, monke
         with kb.write_txn(conn):
             conn.execute("UPDATE tasks SET worker_pid=? WHERE id=?", (191004, tid))
         kbd._record_worker_exit(191004, int(signal.SIGTERM))
-        assert kb.detect_crashed_workers(conn) == []
+        assert kbd.detect_crashed_workers(conn) == []
         assert kbd.detect_crashed_workers._last_interrupted == [tid]
         assert kb.get_task(conn, tid).consecutive_failures == 1
 
@@ -134,7 +135,7 @@ def test_surviving_timeout_worker_retains_claim_and_intent(isolated_board, monke
     """A failed termination must not spawn a duplicate or spend failure budget."""
     monkeypatch.setattr(kb, "_pid_alive", lambda _pid: True)
     monkeypatch.setattr(kbd, "_poll_worker_exit", lambda _pid: False)
-    with kb.connect() as conn:
+    with kbc.connect() as conn:
         tid, run_id = running(conn, "timeout worker survived", 191010)
         original = kb.get_task(conn, tid)
         delivered = []
@@ -155,7 +156,7 @@ def test_surviving_timeout_worker_retains_claim_and_intent(isolated_board, monke
 
 
 def test_dispatch_tick_cleans_old_intents_without_touching_live_identity(isolated_board):
-    with kb.connect() as conn:
+    with kbc.connect() as conn:
         with kb.write_txn(conn):
             for created_at, consumed_at in ((0, None), (0, 1), (int(time.time()), None)):
                 conn.execute(
@@ -170,7 +171,7 @@ def test_dispatch_tick_cleans_old_intents_without_touching_live_identity(isolate
 
 
 def test_dispatch_tick_resumes_all_same_provider_pauses(isolated_board):
-    with kb.connect() as conn:
+    with kbc.connect() as conn:
         parked = []
         for pid in (191006, 191007):
             tid, _ = running(conn, "same provider paused", pid, "openai")
@@ -182,7 +183,7 @@ def test_dispatch_tick_resumes_all_same_provider_pauses(isolated_board):
         assert all(kbd.check_respawn_guard(conn, tid) == "provider_backoff" for tid in parked)
         assert kbd.check_respawn_guard(conn, other) != "provider_backoff"
         assert kbd.check_respawn_guard(conn, auto) != "provider_backoff"
-    with kb.connect() as conn:
+    with kbc.connect() as conn:
         assert kb.provider_backoff_until(conn, provider="openai") is not None
         with kb.write_txn(conn):
             conn.execute("UPDATE kanban_provider_backoff SET until=0 WHERE provider='openai'")
@@ -198,7 +199,7 @@ def test_dispatch_tick_resumes_all_same_provider_pauses(isolated_board):
 
 @pytest.mark.parametrize("retry,valid", [("١٢", False), ("1_2", False), ("0", False), ("-1", False), ("+1", False), ("12.0", False), ("oops", False), ("12", True)])
 def test_retry_after_validation_reaches_real_reclaim(isolated_board, retry, valid):
-    with kb.connect() as conn:
+    with kbc.connect() as conn:
         tid, _ = running(conn, "live parser", 191008, "openai")
         assert quota_reap(conn, tid, 191008, retry) == []
         assert kb.get_task(conn, tid).status == ("scheduled" if valid else "ready")
@@ -207,7 +208,7 @@ def test_retry_after_validation_reaches_real_reclaim(isolated_board, retry, vali
 
 
 def test_explicit_auto_quota_never_creates_auto_pause(isolated_board):
-    with kb.connect() as conn:
+    with kbc.connect() as conn:
         tid, _ = running(conn, "explicit auto quota", 191009, "auto")
         assert quota_reap(conn, tid, 191009) == []
         assert kb.get_task(conn, tid).status == "ready"

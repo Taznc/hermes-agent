@@ -283,14 +283,21 @@ kanban:
                                                # two changes-requested cycles
 ```
 
-`dispatch_start_budget` is a sticky safety circuit, not a concurrency cap. The
-dispatcher counts real `spawned` events independently for each board. When a
-board reaches the configured limit—or a task with a completed/archived terminal
-event appears dispatchable without a later explicit unarchive—the board stops
-starting workers while reclaim and promotion bookkeeping continue. Inspect it
-with `hermes kanban --board <slug> dispatch --circuit-status`; after investigating
-or waiting out the window, resume explicitly with `hermes kanban --board <slug>
-dispatch --resume-circuit`. Configuration is hot-reloaded by the gateway.
+`dispatch_start_budget` is a rolling per-board start rate limit, not a
+concurrency cap or a manual circuit. The dispatcher counts real `spawned`
+events independently for each board and defers new workers after the configured
+limit. Its durable cooldown status reports `rate limited until <time>`; on the
+next gateway, CLI, or dashboard dispatch tick after the recorded start whose
+expiry restores capacity leaves the window, the status clears and exactly the
+available capacity starts automatically. This remains exact if a hot reload
+lowers the budget or expands the window. Configuration is hot-reloaded by the
+gateway.
+
+A completed/archived terminal event that appears dispatchable without a later
+explicit unarchive, or an unreadable pause-state file, is instead a safety
+pause. Those states report `manual intervention required` and remain stopped
+until `hermes kanban --board <slug> dispatch --resume-circuit` after the
+operator repairs or investigates the condition.
 
 `review_rework_escalation_profile` breaks pathological implementation/review
 loops without removing review: the first changes request returns to the original
