@@ -1,5 +1,8 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest'
 
+import type * as SessionStates from '@/store/session-states'
+import type * as WindowsStore from '@/store/windows'
+
 const focusOpenSession = vi.fn()
 const openSessionTile = vi.fn()
 const reuseBlankDraftTile = vi.fn()
@@ -8,19 +11,27 @@ const openSessionInNewWindow = vi.fn()
 const canOpenSessionWindow = vi.fn(() => true)
 const workspaceIsPageGet = vi.fn(() => false)
 
-vi.mock('@/store/session-states', () => ({
-  focusedSessionNeedsRoute: (focused: 'main' | 'tile' | null, workspaceIsPage: boolean) =>
-    !focused || (focused === 'main' && workspaceIsPage),
-  focusOpenSession: (...args: unknown[]) => focusOpenSession(...args),
-  openSessionTile: (...args: unknown[]) => openSessionTile(...args),
-  reuseBlankDraftTile: (...args: unknown[]) => reuseBlankDraftTile(...args),
-  setSessionTileWorkspaceScope: (...args: unknown[]) => setSessionTileWorkspaceScope(...args)
-}))
+vi.mock('@/store/session-states', async importOriginal => {
+  const actual = await importOriginal<typeof SessionStates>()
 
-vi.mock('@/store/windows', () => ({
-  canOpenSessionWindow: () => canOpenSessionWindow(),
-  openSessionInNewWindow: (...args: unknown[]) => openSessionInNewWindow(...args)
-}))
+  return {
+    ...actual,
+    focusOpenSession: (...args: unknown[]) => focusOpenSession(...args),
+    openSessionTile: (...args: unknown[]) => openSessionTile(...args),
+    reuseBlankDraftTile: (...args: unknown[]) => reuseBlankDraftTile(...args),
+    setSessionTileWorkspaceScope: (...args: unknown[]) => setSessionTileWorkspaceScope(...args)
+  }
+})
+
+vi.mock('@/store/windows', async importOriginal => {
+  const actual = await importOriginal<typeof WindowsStore>()
+
+  return {
+    ...actual,
+    canOpenSessionWindow: () => canOpenSessionWindow(),
+    openSessionInNewWindow: (...args: unknown[]) => openSessionInNewWindow(...args)
+  }
+})
 
 vi.mock('./routes', () => ({
   $workspaceIsPage: { get: () => workspaceIsPageGet() },
@@ -115,6 +126,16 @@ describe('openSession', () => {
     workspaceIsPageGet.mockReturnValue(true)
     openSession('s1', navigate)
     expect(navigate).toHaveBeenCalledWith('/c/s1')
+  })
+
+  it('in-place routes away from a full page when it fronts an already-open tile', () => {
+    focusOpenSession.mockReturnValue('tile')
+    workspaceIsPageGet.mockReturnValue(true)
+
+    openSession('s1', navigate)
+
+    expect(navigate).toHaveBeenCalledWith('/c/s1')
+    expect(openSessionTile).not.toHaveBeenCalled()
   })
 
   it('in-place routes when the session is not on screen', () => {

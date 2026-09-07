@@ -1870,12 +1870,13 @@ export function focusWorkspaceOwnerSessionTile(
 }
 
 /** Does a sidebar click still need to navigate after `focusOpenSession`? A miss
- *  always does. A `'main'` hit does too while the workspace pane is showing a
- *  full page (artifacts, skills, …): fronting the workspace tab doesn't put the
- *  chat back on screen — only a route change back to the session does. A tile
- *  hit never does; its pane renders the chat regardless of the route. */
+ * always does. Any hit does too while the workspace pane is showing a full page
+ * (artifacts, skills, contributed routes): a tile can paint its chat above that
+ * page, but leaving the route there keeps the stale page mounted and its
+ * sidebar row selected. A user-selected session is authoritative foreground
+ * intent, so route back to chat without relocating or closing the focused tile. */
 export function focusedSessionNeedsRoute(focused: 'main' | 'tile' | null, workspaceIsPage: boolean): boolean {
-  return !focused || (focused === 'main' && workspaceIsPage)
+  return !focused || workspaceIsPage
 }
 
 /** The open tab that's still an empty "New session" draft, if there is one.
