@@ -1712,6 +1712,141 @@ def test_board_link_edges_drop_after_unlink(client):
 
 
 # ---------------------------------------------------------------------------
+# Archived-satisfied parents must not surface as unresolvable phantom blockers
+# ---------------------------------------------------------------------------
+
+
+def _link_to_archived_parent(conn, *, completed: bool):
+    """Child linked to an ALREADY-archived parent.
+
+    Archiving a completed task deletes its outgoing edges, so this ordering --
+    link minted after the archive -- is the state that outlives that cleanup and
+    the one the payload filters have to handle. ``completed`` picks whether the
+    parent finished its work (dependency satisfied forever) or was withdrawn.
+    """
+    parent_id = kb.create_task(conn, title="blocker", assignee="alice")
+    if completed:
+        assert kb.complete_task(conn, parent_id)
+    assert kb.archive_task(conn, parent_id)
+    child_id = kb.create_task(conn, title="blocked", assignee="bob")
+    kb.link_tasks(conn, parent_id, child_id)
+    return parent_id, child_id
+
+
+def test_board_omits_edges_to_archived_completed_parents(client):
+    """A parent that finished and was archived must not gate its child's card.
+
+    The default board fetch omits archived tasks, so an edge naming one points
+    at an id the desktop's board index cannot resolve -- and an unresolvable
+    blocker is counted as GATING on purpose (deps.ts `partitionBlockers`). The
+    child would show "waiting on a blocker" forever with nothing to click.
+    Both rollups are asserted because the desktop reads `link_edges` when
+    present and falls back to `link_counts` when not; a phantom in either one
+    reaches the user.
+    """
+    with kbc.connect() as conn:
+        parent_id, child_id = _link_to_archived_parent(conn, completed=True)
+
+    body = client.get("/api/plugins/kanban/board").json()
+    ids = {t["id"] for col in body["columns"] for t in col["tasks"]}
+    assert parent_id not in ids, "precondition: default board hides archived tasks"
+
+    assert body["link_edges"] == []
+    cards = {t["id"]: t for col in body["columns"] for t in col["tasks"]}
+    assert cards[child_id]["link_counts"]["parents"] == 0
+
+    # Same contract on the drawer's own source: the "waiting on blocker" banner
+    # is fed by GET /tasks/:id links.parents, not by link_edges.
+    detail = client.get(f"/api/plugins/kanban/tasks/{child_id}").json()
+    assert detail["links"]["parents"] == []
+
+
+def test_board_keeps_edges_to_archived_parents_that_never_completed(client):
+    """The inverse: archived WITHOUT completion is a withdrawal, not success.
+
+    Nothing satisfied this dependency, so the child is genuinely still blocked
+    and both the edge and the banner must survive. This is the half that keeps
+    the fix from degenerating into "hide every archived parent".
+    """
+    with kbc.connect() as conn:
+        parent_id, child_id = _link_to_archived_parent(conn, completed=False)
+
+    body = client.get("/api/plugins/kanban/board").json()
+    assert body["link_edges"] == [[parent_id, child_id]]
+    cards = {t["id"]: t for col in body["columns"] for t in col["tasks"]}
+    assert cards[child_id]["link_counts"]["parents"] == 1
+
+    detail = client.get(f"/api/plugins/kanban/tasks/{child_id}").json()
+    assert detail["links"]["parents"] == [parent_id]
+
+
+def test_board_keeps_edges_to_satisfied_parents_it_can_render(client):
+    """A satisfied parent the payload DOES carry keeps its edge.
+
+    "Blockers clear" (the green all-clear chip) is a card with links whose
+    blockers are all resolvable and done. Dropping resolvable satisfied edges
+    would delete that state instead of fixing the phantom one, so the filter
+    must key on unresolvability, never on satisfaction alone.
+    """
+    with kbc.connect() as conn:
+        parent_id = kb.create_task(conn, title="blocker", assignee="alice")
+        child_id = kb.create_task(conn, title="blocked", assignee="bob", parents=[parent_id])
+        assert kb.complete_task(conn, parent_id)
+
+    body = client.get("/api/plugins/kanban/board").json()
+    assert body["link_edges"] == [[parent_id, child_id]]
+    cards = {t["id"]: t for col in body["columns"] for t in col["tasks"]}
+    assert cards[parent_id]["status"] == "done"
+    assert cards[child_id]["link_counts"]["parents"] == 1
+
+    # include_archived=True renders the archived parent, so its edge resolves
+    # and is kept there too -- the filter is scoped to what the view can show.
+    with kbc.connect() as conn:
+        arch_parent, arch_child = _link_to_archived_parent(conn, completed=True)
+
+    archived_body = client.get(
+        "/api/plugins/kanban/board", params={"include_archived": True}).json()
+    assert [arch_parent, arch_child] in archived_body["link_edges"]
+
+
+def test_board_keeps_edges_to_parents_that_no_longer_exist(client):
+    """A dangling edge (parent row deleted) still gates -- unchanged default.
+
+    "Unresolvable therefore still gating" is the right call when the parent is
+    genuinely gone: there is no completion evidence, and surfacing the broken
+    link is how the user learns to cut it. Only satisfied-and-archived parents
+    are exempt.
+    """
+    with kbc.connect() as conn:
+        parent_id = kb.create_task(conn, title="blocker", assignee="alice")
+        child_id = kb.create_task(conn, title="blocked", assignee="bob", parents=[parent_id])
+        conn.execute("DELETE FROM tasks WHERE id = ?", (parent_id,))
+        conn.commit()
+
+    body = client.get("/api/plugins/kanban/board").json()
+    assert body["link_edges"] == [[parent_id, child_id]]
+    cards = {t["id"]: t for col in body["columns"] for t in col["tasks"]}
+    assert cards[child_id]["link_counts"]["parents"] == 1
+
+    detail = client.get(f"/api/plugins/kanban/tasks/{child_id}").json()
+    assert detail["links"]["parents"] == [parent_id]
+
+
+def test_archived_satisfied_parent_keeps_its_own_children_listing(client):
+    """The filter is one-directional: it hides an edge from the CHILD's view of
+    its blockers, never from the archived parent's own record of what it
+    unblocked. Opening the parent (via include_archived) must still show the
+    lineage, which is the whole reason the row is kept in the DB.
+    """
+    with kbc.connect() as conn:
+        parent_id, child_id = _link_to_archived_parent(conn, completed=True)
+
+    detail = client.get(f"/api/plugins/kanban/tasks/{parent_id}").json()
+    assert detail["links"]["children"] == [child_id]
+
+
+
+# ---------------------------------------------------------------------------
 # Archive completed cards by selected board / All Boards scope
 # ---------------------------------------------------------------------------
 
