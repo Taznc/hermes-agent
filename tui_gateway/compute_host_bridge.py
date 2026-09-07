@@ -168,6 +168,32 @@ def _respond_compute_host_clarify(rid: str, params: dict) -> dict | None:
     return _ok(rid, result)
 
 
+def _explain_compute_host_clarify(rid: str, sid: str, session: dict, params: dict) -> dict | None:
+    """Proxy help to the host owning the pending Event and live conversation context."""
+    if not _session_uses_compute_host(session):
+        return None
+    try:
+        ack = _get_compute_host_supervisor().explain(sid, params, timeout=180.0)
+    except Exception as exc:
+        return _err(rid, 5018, f"compute-host clarify explanation failed: {exc}")
+    if ack.get("type") == "explain.error":
+        return _err(rid, 5018, str(ack.get("message") or "compute-host clarify explanation failed"))
+    response = ack.get("response")
+    if not isinstance(response, dict):
+        return _err(rid, 5018, "compute-host clarify explanation returned an invalid response")
+    if "error" in response:
+        error = response["error"] if isinstance(response["error"], dict) else {}
+        return _err(rid, int(error.get("code") or 5018),
+                    str(error.get("message") or "clarify explanation failed"))
+    result = response.get("result")
+    if not isinstance(result, dict):
+        return _err(rid, 5018, "compute-host clarify explanation returned an invalid result")
+    # A relayed expiry/turn end can clear the parent mirror while host generation is in flight.
+    if _clarify_explain_snapshot(sid, str(params.get("request_id") or "")) is None:
+        return _err(rid, 4009, "clarify request expired before explanation completed")
+    return _ok(rid, result)
+
+
 def _apply_compute_host_metadata_mirror(session: dict, frame: dict | None) -> None:
     """Mirror host-owned session metadata: under turn isolation the host is the only
     writer of live agent/history state, and UI reads must not build a second agent."""

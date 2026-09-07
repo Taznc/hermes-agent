@@ -54,7 +54,7 @@ class ComputeHost:
     # frame ``type`` -> handler method name (resolved per call so monkeypatches take effect).
     _FRAME_HANDLERS: dict[str, str] = {
         "turn.start": "_handle_turn_start", "interrupt": "_handle_interrupt",
-        "respond": "_handle_respond", "reload_mcp": "_handle_reload_mcp",
+        "respond": "_handle_respond", "explain": "_handle_explain", "reload_mcp": "_handle_reload_mcp",
         "control": "_handle_control", "shutdown": "_handle_shutdown"}
 
     def __init__(
@@ -72,6 +72,11 @@ class ComputeHost:
         # Future -> the ``sid`` whose turn it runs; ``shutdown`` leaves live sids unfinalized.
         self._turn_futures: dict[concurrent.futures.Future, str] = {}
         self._turn_futures_lock = threading.Lock()
+        # Explanations can wait for the bounded side-question runner. Keep their execution off
+        # the frame reader so an interrupt/respond frame can still resolve the live clarify.
+        self._explain_futures: dict[concurrent.futures.Future, tuple[str, str]] = {}
+        self._explain_futures_lock = threading.Lock()
+        self._cancelled_explain_requests: set[str] = set()
         self._transport = _HostTransport(self.emit)
         self._heartbeat_secs = (
             float(heartbeat_secs) if heartbeat_secs is not None
@@ -158,6 +163,23 @@ class ComputeHost:
         with self._turn_futures_lock:
             self._turn_futures.pop(future, None)
 
+    def _track_explain_future(self, future: concurrent.futures.Future, sid: str, request_id: str) -> None:
+        with self._explain_futures_lock:
+            self._explain_futures[future] = (sid, request_id)
+        future.add_done_callback(self._untrack_explain_future)
+
+    def _untrack_explain_future(self, future: concurrent.futures.Future) -> None:
+        with self._explain_futures_lock:
+            _sid, request_id = self._explain_futures.pop(future, ("", ""))
+            self._cancelled_explain_requests.discard(request_id)
+
+    def _cancel_explanations_for_session(self, sid: str) -> None:
+        """Suppress late acknowledgements after the owning clarify is interrupted."""
+        with self._explain_futures_lock:
+            self._cancelled_explain_requests.update(
+                request_id for future, (owner_sid, request_id) in self._explain_futures.items()
+                if owner_sid == sid and not future.done())
+
     def _handle_turn_start(self, frame: dict[str, Any]) -> None:
         future = self._executor.submit(self._run_real_turn, dict(frame))
         self._track_turn_future(future, str(frame.get("sid") or ""))
@@ -182,6 +204,7 @@ class ComputeHost:
             if session is None:
                 self._reply("interrupt.ack", sid, request_id, applied=False)
                 return
+            self._cancel_explanations_for_session(sid)
             # In the child the shared helper interrupts the local agent and releases this
             # process's pending clarify Event (the parent only has a metadata mirror).
             server._interrupt_session_turn(sid, session)
@@ -200,6 +223,32 @@ class ComputeHost:
             response = server._methods["clarify.respond"](request_id, params)
             self._reply("respond.ack", sid, request_id, response=response)
         self._guarded(frame, "respond.error", body)
+
+    def _handle_explain(self, frame: dict[str, Any]) -> None:
+        """Schedule help where the pending clarification and live history are owned."""
+        future = self._executor.submit(self._run_explain, dict(frame))
+        self._track_explain_future(
+            future, str(frame.get("sid") or ""), str(frame.get("request_id") or ""))
+
+    def _run_explain(self, frame: dict[str, Any]) -> None:
+        """Run one bounded read-only help request without blocking the control reader."""
+        def body(server: Any, sid: str, request_id: Any) -> None:
+            params = frame.get("params")
+            error = ("session not found" if sid not in server._sessions
+                     else "explain params must be an object" if not isinstance(params, dict)
+                     else None)
+            if error:
+                self._reply("explain.error", sid, request_id, message=error)
+                return
+            response = server._methods["clarify.explain"](request_id, params)
+            with self._explain_futures_lock:
+                cancelled = str(request_id or "") in self._cancelled_explain_requests
+            if cancelled:
+                self._reply("explain.error", sid, request_id,
+                            message="clarify request expired before explanation completed")
+                return
+            self._reply("explain.ack", sid, request_id, response=response)
+        self._guarded(frame, "explain.error", body)
 
     def _run_real_turn(self, frame: dict[str, Any]) -> None:
         sid = str(frame.get("sid") or "")

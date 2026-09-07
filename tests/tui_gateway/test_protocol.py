@@ -517,6 +517,195 @@ def test_clarify_batch_state_cleared_after_resolution(server):
         assert rid not in server._pending
 
 
+def test_clarify_explain_emits_question_help_without_resolving_pending_request(capture, monkeypatch):
+    """Clarify help is a read-only side channel: it never changes the blocking answer state."""
+    server, buf = capture
+    session = {"history": [{"role": "user", "content": "Deploy the app"}], "history_lock": threading.Lock()}
+    server._sessions["s1"] = session
+    ev = threading.Event()
+    with server._prompt_lock:
+        server._pending["clarify-1"] = ("s1", ev)
+        server._pending_prompt_payloads["clarify-1"] = ("clarify.request", {
+            "request_id": "clarify-1", "questions": [
+                {"qid": "target", "question": "Where should this deploy?", "choices": ["staging", "production"]},
+                {"qid": "window", "question": "When?", "choices": ["now", "later"]},
+            ],
+        })
+        server._batch_clarify["clarify-1"] = {"qids": ["target", "window"], "answers": {"window": "later"}}
+    try:
+        monkeypatch.setattr(server, "_spawn_clarify_explanation", lambda *args: "Use staging first.")
+        response = server.handle_request({"id": "help", "method": "clarify.explain", "params": {
+            "version": 1, "session_id": "s1", "request_id": "clarify-1", "question_id": "target",
+            "choice": "staging", "follow_up": "Why is this recommended?",
+        }})
+        assert response["result"] == {
+            "version": 1, "status": "complete", "explanation_id": response["result"]["explanation_id"],
+            "request_id": "clarify-1", "question_id": "target", "choice": "staging",
+        }
+        emitted = json.loads(buf.getvalue())
+        assert emitted["params"]["type"] == "clarify.explanation"
+        assert emitted["params"]["session_id"] == "s1"
+        assert emitted["params"]["payload"] == {
+            "explanation_id": response["result"]["explanation_id"], "request_id": "clarify-1",
+            "question_id": "target", "choice": "staging", "content": "Use staging first.",
+        }
+        with server._prompt_lock:
+            assert server._pending["clarify-1"] == ("s1", ev)
+            assert server._batch_clarify["clarify-1"]["answers"] == {"window": "later"}
+            assert "clarify-1" not in server._answers
+        assert not ev.is_set()
+    finally:
+        with server._prompt_lock:
+            server._pending.pop("clarify-1", None)
+            server._pending_prompt_payloads.pop("clarify-1", None)
+            server._batch_clarify.pop("clarify-1", None)
+
+
+def test_clarify_explain_rejects_expired_or_other_session_request(server, monkeypatch):
+    """The request id remains owned by its live clarification; it cannot leak across sessions."""
+    server._sessions.update({"owner": {"history": [], "history_lock": threading.Lock()},
+                             "other": {"history": [], "history_lock": threading.Lock()}})
+    ev = threading.Event()
+    with server._prompt_lock:
+        server._pending["owned"] = ("owner", ev)
+        server._pending_prompt_payloads["owned"] = ("clarify.request", {
+            "request_id": "owned", "question": "Continue?", "choices": ["yes", "no"]})
+    monkeypatch.setattr(server, "_spawn_clarify_explanation", lambda *args: "unused")
+    try:
+        other = server.handle_request({"id": "other", "method": "clarify.explain", "params": {
+            "version": 1, "session_id": "other", "request_id": "owned"}})
+        expired = server.handle_request({"id": "expired", "method": "clarify.explain", "params": {
+            "version": 1, "session_id": "owner", "request_id": "gone"}})
+        assert other["error"]["code"] == 4009
+        assert expired["error"]["code"] == 4009
+        assert not ev.is_set()
+    finally:
+        with server._prompt_lock:
+            server._pending.pop("owned", None)
+            server._pending_prompt_payloads.pop("owned", None)
+
+
+def test_clarify_explain_drops_result_if_clarification_resolves_during_generation(capture, monkeypatch):
+    """An in-flight explanation cannot revive a request interrupted while its no-tool helper runs."""
+    server, buf = capture
+    server._sessions["s1"] = {"history": [], "history_lock": threading.Lock()}
+    ev = threading.Event()
+    with server._prompt_lock:
+        server._pending["clarify-race"] = ("s1", ev)
+        server._pending_prompt_payloads["clarify-race"] = ("clarify.request", {
+            "request_id": "clarify-race", "question": "Continue?", "choices": ["yes", "no"]})
+
+    def resolve_while_generating(*_args):
+        with server._prompt_lock:
+            server._pending.pop("clarify-race", None)
+            server._pending_prompt_payloads.pop("clarify-race", None)
+        return "too late"
+
+    monkeypatch.setattr(server, "_spawn_clarify_explanation", resolve_while_generating)
+    response = server.handle_request({"id": "race", "method": "clarify.explain", "params": {
+        "version": 1, "session_id": "s1", "request_id": "clarify-race"}})
+    assert response["error"]["code"] == 4009
+    assert buf.getvalue() == ""
+    assert not ev.is_set()
+
+
+def test_clarify_explain_routes_compute_host_pending_to_its_owner(capture, monkeypatch):
+    """The parent validates only the relay snapshot; the owner generates with live context."""
+    server, buf = capture
+    calls = []
+
+    class _Supervisor:
+        def explain(self, sid, params, *, timeout=180.0):
+            calls.append((sid, dict(params), timeout))
+            return {"type": "explain.ack", "response": {"result": {
+                "version": 1, "status": "complete", "explanation_id": "host-explanation",
+                "request_id": "host-rid", "choice": "eu-west",
+            }}}
+
+    server._sessions["isolated"] = {
+        "agent": None, "_compute_host_active": True,
+        "history": [{"role": "user", "content": "parent mirror is not host context"}],
+        "history_lock": threading.Lock(), "_compute_host_pending_clarify": {
+            "request_id": "host-rid", "question": "Which region?", "choices": ["us-east", "eu-west"],
+        },
+    }
+    supervisor = _Supervisor()
+    monkeypatch.setattr(server, "_load_cfg", lambda: {"dashboard": {"turn_isolation": True}})
+    monkeypatch.setattr(server, "_get_compute_host_supervisor", lambda _cfg=None: supervisor)
+    monkeypatch.setattr(
+        server, "_spawn_clarify_explanation",
+        lambda *_args: (_ for _ in ()).throw(AssertionError("parent must not generate host help")),
+    )
+    response = server.handle_request({"id": "host-help", "method": "clarify.explain", "params": {
+        "version": 1, "session_id": "isolated", "request_id": "host-rid", "choice": "eu-west"}})
+    assert response["result"]["explanation_id"] == "host-explanation"
+    assert calls == [("isolated", {
+        "version": 1, "session_id": "isolated", "request_id": "host-rid", "choice": "eu-west",
+    }, 180.0)]
+    assert buf.getvalue() == ""
+    assert server._sessions["isolated"]["_compute_host_pending_clarify"]["request_id"] == "host-rid"
+
+
+def test_clarify_explain_requires_explicit_contract_version(server):
+    server._sessions["missing"] = {"history": [], "history_lock": threading.Lock()}
+    response = server.handle_request({"id": "missing-version", "method": "clarify.explain", "params": {
+        "session_id": "missing", "request_id": "missing",
+    }})
+    assert response["error"]["code"] == 4004
+
+
+def test_clarify_explain_repeated_requests_keep_distinct_correlations(capture, monkeypatch):
+    server, buf = capture
+    server._sessions["s1"] = {"history": [], "history_lock": threading.Lock()}
+    event = threading.Event()
+    with server._prompt_lock:
+        server._pending["repeat"] = ("s1", event)
+        server._pending_prompt_payloads["repeat"] = ("clarify.request", {
+            "request_id": "repeat", "question": "Deploy where?", "choices": ["staging", "production"]})
+    monkeypatch.setattr(server, "_spawn_clarify_explanation", lambda _session, prompt: prompt.rsplit(": ", 1)[-1])
+    try:
+        first = server.handle_request({"id": "first", "method": "clarify.explain", "params": {
+            "version": 1, "session_id": "s1", "request_id": "repeat", "choice": "staging",
+            "follow_up": "first follow-up"}})
+        second = server.handle_request({"id": "second", "method": "clarify.explain", "params": {
+            "version": 1, "session_id": "s1", "request_id": "repeat", "choice": "staging",
+            "follow_up": "second follow-up"}})
+        assert first["result"]["explanation_id"] != second["result"]["explanation_id"]
+        events = [json.loads(line)["params"]["payload"] for line in buf.getvalue().splitlines()]
+        assert [(item["explanation_id"], item["content"]) for item in events] == [
+            (first["result"]["explanation_id"], "first follow-up"),
+            (second["result"]["explanation_id"], "second follow-up"),
+        ]
+        assert not event.is_set()
+    finally:
+        with server._prompt_lock:
+            server._pending.pop("repeat", None)
+            server._pending_prompt_payloads.pop("repeat", None)
+
+
+def test_clarify_explain_drops_compute_host_ack_after_parent_turn_end(capture, monkeypatch):
+    server, buf = capture
+    session = {
+        "agent": None, "_compute_host_active": True, "history": [], "history_lock": threading.Lock(),
+        "_compute_host_pending_clarify": {"request_id": "host-race", "question": "Continue?"},
+    }
+    server._sessions["host"] = session
+
+    class _Supervisor:
+        def explain(self, _sid, _params, *, timeout=180.0):
+            with session["history_lock"]:
+                session.pop("_compute_host_pending_clarify", None)
+            return {"type": "explain.ack", "response": {"result": {
+                "version": 1, "status": "complete", "explanation_id": "late", "request_id": "host-race"}}}
+
+    monkeypatch.setattr(server, "_load_cfg", lambda: {"dashboard": {"turn_isolation": True}})
+    monkeypatch.setattr(server, "_get_compute_host_supervisor", lambda _cfg=None: _Supervisor())
+    response = server.handle_request({"id": "host-race", "method": "clarify.explain", "params": {
+        "version": 1, "session_id": "host", "request_id": "host-race"}})
+    assert response["error"]["code"] == 4009
+    assert buf.getvalue() == ""
+
+
 def test_clarify_block_helper_builds_batch_payload(capture):
     """_clarify_block forwards only wire fields (qid/question/choices/
     multi_select) — the tool-side normalized entries carry extra keys the
