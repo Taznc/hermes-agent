@@ -113,6 +113,40 @@ describe('composer recommendation seam', () => {
     await waitFor(() => expect(seen.at(-1)?.attachments.map(a => a.label)).toEqual(['brief.pdf']))
   })
 
+  it('hands the seam a draft subscription that fires on real edits', async () => {
+    let ctx: ComposerRecommendContext | null = null
+    const changes: string[] = []
+
+    renderChatBar(received => {
+      ctx = received
+
+      return <div data-testid="seam-probe" />
+    })
+
+    await screen.findByTestId('seam-probe')
+
+    // The surface must be able to notice an edit without the composer
+    // re-rendering it — the composer deliberately keeps typing out of React,
+    // so a render-time check alone can be arbitrarily stale.
+    const unsubscribe = ctx!.subscribeDraft?.(() => changes.push(ctx!.getDraft()))
+
+    expect(unsubscribe).toBeTypeOf('function')
+
+    const editor = screen.getByRole('textbox')
+
+    editor.textContent = 'a draft only this test writes'
+    fireEvent.input(editor)
+
+    await waitFor(() => expect(changes.at(-1)).toBe('a draft only this test writes'))
+
+    unsubscribe?.()
+    editor.textContent = 'and more'
+    fireEvent.input(editor)
+
+    await waitFor(() => expect(screen.getByRole('textbox').textContent).toBe('and more'))
+    expect(changes.at(-1)).toBe('a draft only this test writes')
+  })
+
   it('propagates the composer disabled state so the control cannot be used offline', async () => {
     const seen: ComposerRecommendContext[] = []
 

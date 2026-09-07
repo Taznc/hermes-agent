@@ -160,6 +160,7 @@ export const ChatRoutesSurface = memo(function ChatRoutesSurface({
               onSelectModel={actions.selectModel}
               profile={activeGatewayProfile}
               requestGateway={actions.requestGateway}
+              subscribeDraft={ctx.subscribeDraft}
             />
           )
         : undefined,

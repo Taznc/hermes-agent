@@ -314,6 +314,7 @@ function TileChat({
               onSelectModel={selectModel}
               profile={ownerRoute?.targetProfile || ownerRoute?.profile || activeGatewayProfile}
               requestGateway={requestTileGateway}
+              subscribeDraft={ctx.subscribeDraft}
             />
           )
         : undefined,

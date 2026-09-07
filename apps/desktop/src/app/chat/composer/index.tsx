@@ -246,6 +246,8 @@ export function ChatBar({
     sessionIdRef,
     setComposerText,
     stashAt,
+    // >>> FORK ANCHOR: composer-model-recommendation <<<
+    subscribeDraft,
     syncDraftFromEditor
   } = useComposerDraft({ activeQueueSessionKey, focusKey, inputDisabled, queueEditRef, sessionId })
 
@@ -1406,7 +1408,8 @@ export function ChatBar({
                     attachments,
                     disabled,
                     getDraft: () =>
-                      editorRef.current ? composerPlainText(editorRef.current) : draftRef.current
+                      editorRef.current ? composerPlainText(editorRef.current) : draftRef.current,
+                    subscribeDraft
                   })}
                   <ContribSlot area={COMPOSER_AREAS.bottom} />
                 </div>

@@ -81,22 +81,38 @@ export interface ForkTranslations {
       trigger: string
       presetLabel: string
       presets: { balanced: string; save_codex: string; best_quality: string }
+      /** Concise description of what each preset optimizes for. */
+      presetDescriptions: { balanced: string; save_codex: string; best_quality: string }
+      /** Shown INSTEAD of a selection while the profile-scoped read is pending —
+       *  painting a default would claim a stored choice that was never read. */
+      presetLoading: string
       presetUnsaved: string
       resultsLabel: string
       /** States the FINAL privacy boundary: draft + attachment metadata only. */
       privacy: string
       pending: string
       apply: string
-      applyFailed: string
+      /** Shown when the selection path did not apply outright — usually a
+       *  pending expensive-model confirmation, never a claim of failure. */
+      applyUnconfirmed: string
       retry: string
       failed: string
       unavailable: string
       unsupported: string
+      /** Results no longer describe the live draft/attachments/preset. */
+      stale: string
+      refresh: string
+      emptyDraft: string
       draftTooLong: string
       tooManyAttachments: string
       attachmentUnsupported: string
-      /** Never render `fresh` — only a non-live state is worth saying. */
+      /** Every reported state is rendered, `fresh` included: an unreported
+       *  availability and a checked-live one must not look the same. */
       availability: { failed: string; fresh: string; stale: string; unavailable: string; unsupported: string }
+      /** The backend reported this route's quota is exhausted. */
+      limitReached: string
+      /** The backend reported this route is not permitted right now. */
+      notAllowed: string
     }
   }
   assistant: {

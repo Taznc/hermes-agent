@@ -9,10 +9,12 @@ import {
   $activeSessionId,
   $currentModel,
   $currentProvider,
+  $currentReasoningEffort,
   getCurrentModelSource,
   setCurrentModel,
   setCurrentModelSource,
-  setCurrentProvider
+  setCurrentProvider,
+  setCurrentReasoningEffort
 } from '@/store/session'
 import * as SessionStates from '@/store/session-states'
 
@@ -730,5 +732,141 @@ describe('useModelControls', () => {
     expect(queryClient.getQueryData(ownerBKey)).toMatchObject({ model: 'old-b', provider: 'provider-b' })
     expect(queryClient.getQueryData(ambientAKey)).toMatchObject({ model: 'model-a', provider: 'provider-a' })
     expect(notifyError).toHaveBeenCalled()
+  })
+
+  // >>> FORK ANCHOR: composer-model-recommendation <<<
+  // A recommendation is ONE choice — provider, model and effort together — so
+  // it rides the same selection path rather than a second implementation that
+  // would have to re-derive primary-vs-tile scoping, the confirm handshake and
+  // rollback. `effort` is optional, so every existing caller is unchanged.
+  describe('selectModel with a reasoning effort', () => {
+    it('applies effort to the PRIMARY composer, not through the tile delegate', async () => {
+      $activeSessionId.set('session-1')
+      setCurrentReasoningEffort('low')
+
+      const requestGateway = vi.fn(async () => ({ key: 'model' }) as never)
+      let controls!: Controls
+
+      render(<Harness onReady={value => (controls = value)} requestGateway={requestGateway} />)
+
+      await expect(
+        controls.selectModel({ effort: 'high', model: 'claude-opus-5', provider: 'anthropic' })
+      ).resolves.toBe(true)
+
+      expect($currentReasoningEffort.get()).toBe('high')
+      expect(requestGateway).toHaveBeenCalledWith('config.set', {
+        key: 'reasoning',
+        session_id: 'session-1',
+        value: 'high'
+      })
+    })
+
+    it('applies a TILE’s effort to that tile’s slice and leaves the primary alone', async () => {
+      $activeSessionId.set('primary-1')
+      setCurrentReasoningEffort('low')
+      SessionStates.$sessionStates.set({ 'tile-9': { reasoningEffort: 'low' } as never })
+
+      const updateSession = vi.fn()
+
+      vi.spyOn(SessionStates, 'sessionTileDelegate').mockReturnValue({ updateSession } as never)
+
+      const requestGateway = vi.fn(async () => ({ key: 'model' }) as never)
+      let controls!: Controls
+
+      render(<Harness onReady={value => (controls = value)} requestGateway={requestGateway} />)
+
+      await controls.selectModel({
+        effort: 'high',
+        model: 'claude-opus-5',
+        provider: 'anthropic',
+        sessionId: 'tile-9'
+      })
+
+      expect($currentReasoningEffort.get()).toBe('low')
+      expect(requestGateway).toHaveBeenCalledWith('config.set', {
+        key: 'reasoning',
+        session_id: 'tile-9',
+        value: 'high'
+      })
+    })
+
+    it('defers effort until a guarded switch is CONFIRMED, then applies it', async () => {
+      $activeSessionId.set('session-1')
+      setCurrentModel('gpt-5.6-sol')
+      setCurrentProvider('openai-codex')
+      setCurrentReasoningEffort('low')
+
+      const requestGateway = vi
+        .fn()
+        .mockResolvedValueOnce({ confirm_message: 'Expensive model.', confirm_required: true })
+        .mockResolvedValueOnce({ key: 'model' })
+        .mockResolvedValue({ key: 'reasoning' })
+
+      let controls!: Controls
+
+      render(<Harness onReady={value => (controls = value)} requestGateway={requestGateway} />)
+
+      await expect(
+        controls.selectModel({ effort: 'high', model: 'muse-spark-1.2', provider: 'opencode-go' })
+      ).resolves.toBe(false)
+
+      // Confirmation pending: nothing applied yet, and NO reasoning write.
+      expect($currentReasoningEffort.get()).toBe('low')
+      expect(requestGateway.mock.calls.some(([, params]) => params?.key === 'reasoning')).toBe(false)
+
+      await act(async () => {
+        await notify.mock.calls.at(-1)?.[0]?.action?.onClick()
+      })
+
+      await waitFor(() => expect($currentReasoningEffort.get()).toBe('high'))
+      expect($currentModel.get()).toBe('muse-spark-1.2')
+    })
+
+    it('rolls the whole selection back when only the reasoning write fails', async () => {
+      $activeSessionId.set('session-1')
+      setCurrentModel('fable-5')
+      setCurrentProvider('nous')
+      setCurrentReasoningEffort('low')
+
+      const requestGateway = vi.fn(async (_method: string, params?: Record<string, unknown>) => {
+        if (params?.key === 'reasoning') {
+          throw new Error('reasoning rejected')
+        }
+
+        return { key: 'model' } as never
+      })
+
+      let controls!: Controls
+
+      render(<Harness onReady={value => (controls = value)} requestGateway={requestGateway} />)
+
+      // Applying a recommendation is ONE choice. A half-applied session (new
+      // model, old effort) is worse than not applying it, so it is atomic.
+      await expect(
+        controls.selectModel({ effort: 'high', model: 'claude-opus-5', provider: 'anthropic' })
+      ).resolves.toBe(false)
+
+      expect($currentReasoningEffort.get()).toBe('low')
+      expect($currentModel.get()).toBe('fable-5')
+      expect($currentProvider.get()).toBe('nous')
+      expect(notifyError).toHaveBeenCalled()
+    })
+
+    it('never writes reasoning without a live session (that would rewrite the profile default)', async () => {
+      $activeSessionId.set(null)
+      setCurrentReasoningEffort('low')
+
+      const requestGateway = vi.fn(async () => ({}) as never)
+      let controls!: Controls
+
+      render(<Harness onReady={value => (controls = value)} requestGateway={requestGateway} />)
+
+      await expect(
+        controls.selectModel({ effort: 'high', model: 'claude-opus-5', provider: 'anthropic' })
+      ).resolves.toBe(true)
+
+      expect($currentReasoningEffort.get()).toBe('high')
+      expect(requestGateway).not.toHaveBeenCalled()
+    })
   })
 })

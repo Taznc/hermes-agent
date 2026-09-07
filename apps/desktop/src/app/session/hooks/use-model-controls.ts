@@ -13,12 +13,14 @@ import {
   $activeSessionId,
   $currentModel,
   $currentProvider,
+  $currentReasoningEffort,
   getComposerSelectionGeneration,
   getCurrentModelSource,
   markComposerSelectionManual,
   setCurrentModel,
   setCurrentModelSource,
-  setCurrentProvider
+  setCurrentProvider,
+  setCurrentReasoningEffort
 } from '@/store/session'
 import { $sessionStates, sessionTileDelegate } from '@/store/session-states'
 import type { ModelOptionsResponse } from '@/types/hermes'
@@ -212,6 +214,21 @@ export function useModelControls({
       const prevSource = getCurrentModelSource()
       const liveGatewayProfile = cacheProfile || $activeGatewayProfile.get()
 
+      // >>> FORK ANCHOR: composer-model-recommendation <<<
+      // Effort snapshot for the SAME surface the model switch targets, so an
+      // optional effort rides the switch's own scoping and rollback.
+      const prevEffort = touchesPrimary
+        ? $currentReasoningEffort.get()
+        : ($sessionStates.get()[liveSessionId!]?.reasoningEffort ?? '')
+
+      const paintEffort = (effort: string) => {
+        if (touchesPrimary) {
+          setCurrentReasoningEffort(effort)
+        } else if (liveSessionId) {
+          sessionTileDelegate()?.updateSession(liveSessionId, state => ({ ...state, reasoningEffort: effort }))
+        }
+      }
+
       const paintSelection = () => {
         if (touchesPrimary) {
           setCurrentModel(selection.model)
@@ -224,6 +241,11 @@ export function useModelControls({
             model: selection.model,
             provider: selection.provider
           }))
+        }
+
+        // >>> FORK ANCHOR: composer-model-recommendation <<<
+        if (selection.effort !== undefined) {
+          paintEffort(selection.effort)
         }
       }
 
@@ -242,6 +264,11 @@ export function useModelControls({
             model: prevModel,
             provider: prevProvider
           }))
+        }
+
+        // >>> FORK ANCHOR: composer-model-recommendation <<<
+        if (selection.effort !== undefined) {
+          paintEffort(prevEffort)
         }
 
         cacheSelection(prevProvider, prevModel)
@@ -279,6 +306,19 @@ export function useModelControls({
           value: `${selection.model} --provider ${selection.provider}${scope}`,
           ...(confirmExpensiveModel ? { confirm_expensive_model: true } : {})
         })
+
+      // >>> FORK ANCHOR: composer-model-recommendation <<<
+      // The effort half of a combined selection. Always session-scoped (that
+      // is what `config.set reasoning` with a session_id means) and always
+      // AFTER the model switch is accepted, so a rejected/confirm-pending
+      // switch never leaves the session on a new effort for an old model.
+      const requestEffort = async () => {
+        if (selection.effort === undefined) {
+          return
+        }
+
+        await requestGateway('config.set', { key: 'reasoning', session_id: liveSessionId, value: selection.effort })
+      }
 
       const finishSwitch = (result: ModelSwitchResponse | undefined) => {
         // A pick made DURING a turn is queued by the gateway and applied at the
@@ -322,12 +362,31 @@ export function useModelControls({
               paintSelection()
               cacheSelection(selection.provider, selection.model)
             },
-            requestConfirmed: () => requestSwitch(true),
+            requestConfirmed: async () => {
+              const confirmed = await requestSwitch(true)
+
+              // >>> FORK ANCHOR: composer-model-recommendation <<<
+              // Only once the guarded model is genuinely accepted. A second
+              // confirm_required is treated as a failure by the shared applier,
+              // which rolls back — including the effort, via rollbackSelection.
+              if (!confirmed?.confirm_required) {
+                await requestEffort()
+              }
+
+              return confirmed
+            },
             rollback: rollbackSelection
           })
 
           return false
         }
+
+        // >>> FORK ANCHOR: composer-model-recommendation <<<
+        // Model accepted (applied or deferred); apply the effort half. A
+        // failure here rolls BOTH back — half-applying a recommendation is
+        // worse than not applying it, because the session would run a new
+        // model at the old effort with nothing on screen saying so.
+        await requestEffort()
 
         finishSwitch(result)
 

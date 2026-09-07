@@ -76,17 +76,26 @@ export const forkEn: ForkTranslations = {
         save_codex: 'Save Codex',
         best_quality: 'Best quality'
       },
+      presetDescriptions: {
+        balanced: 'Balanced: good results at a reasonable cost.',
+        save_codex: 'Save Codex: prefers other routes so Codex usage lasts longer.',
+        best_quality: 'Best quality: picks the strongest route, whatever it costs.'
+      },
+      presetLoading: 'Loading your preference…',
       presetUnsaved: 'Not saved on this backend — applies to this session only.',
       resultsLabel: 'Model recommendations',
       privacy:
         'Checks your current draft and attachment names only. Conversation history, file contents, and project files are never sent.',
       pending: 'Checking…',
       apply: 'Apply',
-      applyFailed: 'Could not apply — try again or pick a model manually.',
+      applyUnconfirmed: 'Not applied yet — confirm the switch, or pick a model manually.',
       retry: 'Try again',
       failed: 'The recommendation check failed.',
       unavailable: 'No recommendation is available. Configure a recommendation router in settings to enable this.',
       unsupported: 'This Hermes backend does not support recommendations.',
+      stale: 'Your draft changed, so these recommendations no longer apply.',
+      refresh: 'Check again',
+      emptyDraft: 'Write a draft first, then check.',
       draftTooLong: 'This draft is too long to check.',
       tooManyAttachments: 'Too many attachments to check (32 maximum).',
       attachmentUnsupported: 'An attachment name is too long to check.',
@@ -96,7 +105,9 @@ export const forkEn: ForkTranslations = {
         stale: 'stale availability',
         unavailable: 'unavailable',
         unsupported: 'availability unknown'
-      }
+      },
+      limitReached: 'limit reached',
+      notAllowed: 'not available on your plan'
     }
   },
   assistant: {

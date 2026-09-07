@@ -1,4 +1,4 @@
-import { cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react'
+import { act, cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react'
 import { afterEach, describe, expect, it, vi } from 'vitest'
 
 import type { ComposerAttachment } from '@/store/composer'
@@ -10,6 +10,7 @@ const OK_TWO_PROVIDERS = {
   policy: 'balanced',
   recommendations: [
     {
+      availability: { allowed: true, limit_reached: false, status: 'fresh' },
       capabilities: { effort_options: ['low', 'medium', 'high'], reasoning: true },
       effort: 'medium',
       model: 'gpt-5.6-terra',
@@ -35,9 +36,12 @@ function setup(
     onSelectModel?: ReturnType<typeof vi.fn>
     request?: ReturnType<typeof vi.fn>
     sessionId?: null | string
+    /** `null` simulates a composer that supplies no draft subscription. */
+    subscribeDraft?: null
   } = {}
 ) {
   const draftRef = { current: over.draft ?? 'Refactor the parser for me' }
+  const listeners = new Set<() => void>()
 
   const request =
     over.request ??
@@ -55,22 +59,51 @@ function setup(
 
   const onSelectModel = over.onSelectModel ?? vi.fn().mockResolvedValue(true)
 
-  const utils = render(
+  const subscribeDraft =
+    over.subscribeDraft === null
+      ? undefined
+      : (listener: () => void) => {
+          listeners.add(listener)
+
+          return () => listeners.delete(listener)
+        }
+
+  const surface = (profile: string, attachments: readonly ComposerAttachment[]) => (
     <ComposerRecommend
-      attachments={over.attachments ?? []}
+      attachments={attachments}
       disabled={over.disabled ?? false}
       getDraft={() => draftRef.current}
       onSelectModel={onSelectModel as never}
-      profile="work"
+      profile={profile}
       requestGateway={request as never}
       sessionId={over.sessionId ?? null}
+      subscribeDraft={subscribeDraft}
     />
   )
 
-  return { draftRef, onSelectModel, request, utils }
+  const attachments = over.attachments ?? []
+  const utils = render(surface('work', attachments))
+
+  return {
+    draftRef,
+    /** What the composer's own draft subscription does on every edit. */
+    notifyDraftChanged: () => act(() => listeners.forEach(listener => listener())),
+    onSelectModel,
+    request,
+    rerenderWithAttachments: (next: ComposerAttachment[]) => utils.rerender(surface('work', next)),
+    rerenderWithProfile: (profile: string) => utils.rerender(surface(profile, attachments)),
+    utils
+  }
 }
 
 const recommendButton = () => screen.getByTestId('composer-recommend-trigger')
+
+/** The preset the surface currently claims is selected, or null when none is. */
+const presetPressed = (): null | string =>
+  screen
+    .getAllByRole('button')
+    .find(node => node.getAttribute('aria-pressed') === 'true')
+    ?.textContent?.trim() ?? null
 
 const openResults = async () => {
   fireEvent.click(recommendButton())
@@ -180,14 +213,70 @@ describe('Recommend results surface', () => {
     expect(screen.getAllByTestId('composer-recommend-row')[1].textContent).toContain('high')
   })
 
-  it('marks a stale availability instead of presenting it as live capacity', async () => {
+  it('renders every supplied availability state, including a fresh one', async () => {
     setup()
     await openResults()
 
     const rows = screen.getAllByTestId('composer-recommend-row')
 
-    expect(rows[0].querySelector('[data-testid="composer-recommend-availability"]')).toBeNull()
+    // The card requires availability/freshness "where supplied". Suppressing
+    // `fresh` made a checked-and-live route indistinguishable from one whose
+    // availability was never reported at all.
+    expect(rows[0].querySelector('[data-testid="composer-recommend-availability"]')?.textContent).toMatch(/live/i)
     expect(rows[1].querySelector('[data-testid="composer-recommend-availability"]')?.textContent).toMatch(/stale/i)
+  })
+
+  it('says nothing about availability when the backend supplied none', async () => {
+    const request = vi.fn(async (method: string, _params?: Record<string, unknown>) => {
+      if (method === 'config.get') {
+        return { value: 'balanced' }
+      }
+
+      return {
+        policy: 'balanced',
+        recommendations: [{ model: 'gpt-5.6-terra', provider: 'openai-codex' }],
+        status: 'ok'
+      }
+    })
+
+    setup({ request })
+    await openResults()
+
+    expect(screen.queryByTestId('composer-recommend-availability')).toBeNull()
+  })
+
+  it('marks a route the backend says is not allowed, and does not offer to apply it', async () => {
+    const request = vi.fn(async (method: string, _params?: Record<string, unknown>) => {
+      if (method === 'config.get') {
+        return { value: 'balanced' }
+      }
+
+      return {
+        policy: 'balanced',
+        recommendations: [
+          {
+            availability: { allowed: false, limit_reached: true, status: 'fresh' },
+            effort: 'high',
+            model: 'claude-opus-5',
+            provider: 'anthropic'
+          },
+          { effort: 'medium', model: 'gpt-5.6-terra', provider: 'openai-codex' }
+        ],
+        status: 'ok'
+      }
+    })
+
+    const { onSelectModel } = setup({ request })
+
+    await openResults()
+
+    const rows = screen.getAllByTestId('composer-recommend-row')
+
+    expect(rows[0].textContent).toMatch(/limit/i)
+    expect(rows[0].querySelector('[data-testid="composer-recommend-apply"]')).toBeNull()
+    // The other route is unaffected — this is per-row, not a whole-panel gate.
+    expect(rows[1].querySelector('[data-testid="composer-recommend-apply"]')).toBeTruthy()
+    expect(onSelectModel).not.toHaveBeenCalled()
   })
 
   it('states the privacy boundary on the surface', async () => {
@@ -199,60 +288,48 @@ describe('Recommend results surface', () => {
 })
 
 describe('Apply is scoped to the active view and never sends', () => {
-  it('applies provider, model and effort to this session only', async () => {
-    const request = vi.fn(async (method: string, _params?: Record<string, unknown>) => {
-      if (method === 'config.get') {
-        return { profile: 'work', value: 'balanced' }
-      }
-
-      if (method === 'config.set') {
-        return { ok: true }
-      }
-
-      return OK_TWO_PROVIDERS
-    })
-
-    const { onSelectModel } = setup({ request, sessionId: 'run-7' })
+  it('applies provider, model and effort as ONE selection scoped to this view', async () => {
+    const { onSelectModel, request } = setup({ sessionId: 'run-7' })
 
     await openResults()
     fireEvent.click(screen.getAllByTestId('composer-recommend-apply')[1])
 
+    // Model AND effort go through the one session-aware selection path, so
+    // scoping, the confirm handshake and rollback are not re-implemented here.
     await waitFor(() =>
       expect(onSelectModel).toHaveBeenCalledWith({
+        effort: 'high',
         model: 'claude-opus-5',
         provider: 'anthropic',
         sessionId: 'run-7'
       })
     )
 
-    await waitFor(() =>
-      expect(
-        request.mock.calls.some(
-          ([method, params]) =>
-            method === 'config.set' &&
-            (params as Record<string, unknown>).key === 'reasoning' &&
-            (params as Record<string, unknown>).session_id === 'run-7' &&
-            (params as Record<string, unknown>).value === 'high'
-        )
-      ).toBe(true)
-    )
+    expect(onSelectModel).toHaveBeenCalledTimes(1)
 
-    // Never a global/profile-default model write.
-    expect(
-      request.mock.calls.some(
-        ([method, params]) => method === 'config.set' && (params as Record<string, unknown>).key === 'model'
-      )
-    ).toBe(false)
+    // No second write from this surface — in particular no direct reasoning
+    // write, which is what previously bypassed primary-vs-tile scoping.
+    expect(request.mock.calls.some(([method, params]) => method === 'config.set' && params?.key === 'reasoning')).toBe(
+      false
+    )
+    expect(request.mock.calls.some(([method, params]) => method === 'config.set' && params?.key === 'model')).toBe(false)
   })
 
-  it('surfaces a recovery path when the model switch fails and does not claim success', async () => {
+  it('does not claim failure when the switch is merely awaiting confirmation', async () => {
+    // `selectModel` answers false for a PENDING expensive-model confirmation
+    // as well as for a real failure, and it has already surfaced whichever it
+    // is. Saying "could not apply" next to a live Confirm action is a lie.
     const onSelectModel = vi.fn().mockResolvedValue(false)
     const { draftRef } = setup({ onSelectModel })
 
     await openResults()
     fireEvent.click(screen.getAllByTestId('composer-recommend-apply')[0])
 
-    await screen.findByTestId('composer-recommend-apply-failed')
+    const notice = await screen.findByTestId('composer-recommend-apply-unconfirmed')
+
+    expect(notice.textContent).not.toMatch(/could not|failed/i)
+    // The results stay open so the user can confirm or choose another row.
+    expect(screen.getByTestId('composer-recommend-panel')).toBeTruthy()
     expect(draftRef.current).toBe('Refactor the parser for me')
   })
 })
@@ -309,7 +386,7 @@ describe('Unavailable and failure states are explicit', () => {
 
 describe('Preset selector', () => {
   it('shows the persisted preset before a request is made', async () => {
-    const request = vi.fn(async (method: string) => {
+    const request = vi.fn(async (method: string, _params?: Record<string, unknown>) => {
       if (method === 'config.get') {
         return { profile: 'work', value: 'best_quality' }
       }
@@ -319,12 +396,47 @@ describe('Preset selector', () => {
 
     setup({ request })
 
-    await waitFor(() =>
-      expect(screen.getByTestId('composer-recommend-preset-best_quality').getAttribute('aria-pressed')).toBe('true')
-    )
+    await waitFor(() => expect(presetPressed()).toBe('Best quality'))
   })
 
-  it.each(['balanced', 'save_codex', 'best_quality'])('persists and sends the %s preset', async preset => {
+  it('describes what each preset optimizes for, not just its name', async () => {
+    const request = vi.fn(async (method: string, _params?: Record<string, unknown>) => {
+      if (method === 'config.get') {
+        return { profile: 'work', value: 'save_codex' }
+      }
+
+      return OK_TWO_PROVIDERS
+    })
+
+    setup({ request })
+
+    const description = await screen.findByTestId('composer-recommend-preset-description')
+
+    // The description must be about the SELECTED preset and say something the
+    // three-word label does not.
+    expect(description.textContent).toMatch(/Codex/)
+    expect(description.textContent!.length).toBeGreaterThan('Save Codex'.length)
+  })
+
+  it('offers the presets through the shared SegmentedControl, not a bespoke button row', async () => {
+    setup()
+
+    await waitFor(() => expect(presetPressed()).toBe('Balanced'))
+
+    const track = screen.getByRole('button', { name: 'Balanced' }).parentElement!
+    const labels = Array.from(track.querySelectorAll('button')).map(node => node.textContent?.trim())
+
+    // The primitive's own shape: one grid track holding exactly the three
+    // options, each an aria-pressed button (see components/ui/segmented-control).
+    expect(labels).toEqual(['Balanced', 'Save Codex', 'Best quality'])
+    expect(track.className).toContain('grid-flow-col')
+  })
+
+  it.each([
+    ['balanced', 'Balanced'],
+    ['save_codex', 'Save Codex'],
+    ['best_quality', 'Best quality']
+  ])('persists and sends the %s preset', async (preset, label) => {
     const request = vi.fn(async (method: string, _params?: Record<string, unknown>) => {
       if (method === 'config.get') {
         return { profile: 'work', value: 'balanced' }
@@ -339,8 +451,8 @@ describe('Preset selector', () => {
 
     setup({ request })
 
-    await waitFor(() => expect(screen.getByTestId(`composer-recommend-preset-${preset}`)).toBeTruthy())
-    fireEvent.click(screen.getByTestId(`composer-recommend-preset-${preset}`))
+    await waitFor(() => expect(screen.getByRole('button', { name: label })).toBeTruthy())
+    fireEvent.click(screen.getByRole('button', { name: label }))
 
     await waitFor(() =>
       expect(
@@ -362,7 +474,7 @@ describe('Preset selector', () => {
   })
 
   it('keeps the choice visible but reports it unsaved on a backend without the config key', async () => {
-    const request = vi.fn(async (method: string) => {
+    const request = vi.fn(async (method: string, _params?: Record<string, unknown>) => {
       if (method === 'config.get') {
         throw new Error('4002: unknown config key')
       }
@@ -372,28 +484,365 @@ describe('Preset selector', () => {
 
     setup({ request })
 
-    await waitFor(() =>
-      expect(screen.getByTestId('composer-recommend-preset-balanced').getAttribute('aria-pressed')).toBe('true')
-    )
+    await waitFor(() => expect(presetPressed()).toBe('Balanced'))
     expect(screen.getByTestId('composer-recommend-preset-unsaved')).toBeTruthy()
   })
 })
 
 describe('Keyboard and focus behaviour', () => {
-  it('closes the results on Escape without touching the draft', async () => {
+  it('closes the results on Escape pressed from the element that actually has focus', async () => {
     const { draftRef } = setup()
 
-    await openResults()
-    fireEvent.keyDown(screen.getByTestId('composer-recommend-panel'), { key: 'Escape' })
+    const trigger = recommendButton()
+
+    trigger.focus()
+    fireEvent.click(trigger)
+    await screen.findByTestId('composer-recommend-panel')
+
+    // Opening must NOT move focus (the user is composing). So Escape arrives on
+    // whatever they had focused — here the trigger — and the surface must still
+    // dismiss. Dispatching on the panel would test a path no user takes.
+    expect(document.activeElement).toBe(trigger)
+    fireEvent.keyDown(document.activeElement!, { key: 'Escape' })
 
     await waitFor(() => expect(screen.queryByTestId('composer-recommend-panel')).toBeNull())
+    expect(document.activeElement).toBe(trigger)
     expect(draftRef.current).toBe('Refactor the parser for me')
   })
 
-  it('labels the trigger semantically rather than relying on an icon tooltip', () => {
+  it('dismisses the surface INSTEAD of the composer’s own cancel gesture', async () => {
+    const composerCancel = vi.fn()
+    const draftRef = { current: 'Refactor the parser for me' }
+
+    render(
+      // The real composer listens for Escape on an ancestor (halt turn / cancel
+      // queued edit). One Escape must do exactly one thing.
+      <div onKeyDown={event => event.key === 'Escape' && composerCancel()}>
+        <ComposerRecommend
+          attachments={[]}
+          disabled={false}
+          getDraft={() => draftRef.current}
+          onSelectModel={vi.fn() as never}
+          profile="work"
+          requestGateway={vi.fn().mockResolvedValue(OK_TWO_PROVIDERS) as never}
+          sessionId={null}
+        />
+      </div>
+    )
+
+    const trigger = screen.getByTestId('composer-recommend-trigger')
+
+    trigger.focus()
+    fireEvent.click(trigger)
+    await screen.findByTestId('composer-recommend-panel')
+
+    fireEvent.keyDown(document.activeElement!, { key: 'Escape' })
+
+    await waitFor(() => expect(screen.queryByTestId('composer-recommend-panel')).toBeNull())
+    expect(composerCancel).not.toHaveBeenCalled()
+  })
+
+  it('lets Escape through to the composer when this surface has nothing open', async () => {
+    const composerCancel = vi.fn()
+    const draftRef = { current: 'Refactor the parser for me' }
+
+    render(
+      <div onKeyDown={event => event.key === 'Escape' && composerCancel()}>
+        <ComposerRecommend
+          attachments={[]}
+          disabled={false}
+          getDraft={() => draftRef.current}
+          onSelectModel={vi.fn() as never}
+          profile="work"
+          requestGateway={vi.fn().mockResolvedValue(OK_TWO_PROVIDERS) as never}
+          sessionId={null}
+        />
+      </div>
+    )
+
+    const trigger = screen.getByTestId('composer-recommend-trigger')
+
+    trigger.focus()
+    fireEvent.keyDown(trigger, { key: 'Escape' })
+
+    expect(composerCancel).toHaveBeenCalledTimes(1)
+  })
+
+  it('explains an ineligible draft in visible, keyboard-reachable text — never a native tooltip', async () => {
+    setup({ draft: 'x'.repeat(100_001) })
+
+    const trigger = recommendButton()
+    const hint = await screen.findByTestId('composer-recommend-ineligible-hint')
+
+    expect(trigger.hasAttribute('disabled')).toBe(true)
+    expect(trigger.hasAttribute('title')).toBe(false)
+    expect(trigger.getAttribute('aria-describedby')).toBe(hint.id)
+    expect(hint.textContent?.trim()).toBeTruthy()
+  })
+
+  it('labels the trigger with visible text rather than an icon tooltip', () => {
     setup()
 
-    expect(recommendButton().getAttribute('aria-label')).toBeTruthy()
     expect(recommendButton().textContent?.trim()).toBeTruthy()
+    expect(recommendButton().hasAttribute('title')).toBe(false)
+  })
+})
+
+describe('Preset resolution races (review round 1, finding 1)', () => {
+  const deferred = <T,>() => {
+    let resolve!: (value: T) => void
+    let reject!: (error: unknown) => void
+
+    const promise = new Promise<T>((res, rej) => {
+      resolve = res
+      reject = rej
+    })
+
+    return { promise, reject, resolve }
+  }
+
+  it('never sends the fallback policy while the persisted preset is still being read', async () => {
+    const read = deferred<{ value: string }>()
+
+    const request = vi.fn(async (method: string, _params?: Record<string, unknown>) => {
+      if (method === 'config.get') {
+        return read.promise
+      }
+
+      return OK_TWO_PROVIDERS
+    })
+
+    setup({ request })
+
+    // The user clicks Recommend before the profile-scoped read resolves.
+    fireEvent.click(recommendButton())
+    await Promise.resolve()
+
+    expect(request.mock.calls.some(([method]) => method === 'model_recommendation.get')).toBe(false)
+
+    read.resolve({ value: 'best_quality' })
+
+    await waitFor(() => expect(request.mock.calls.some(([m]) => m === 'model_recommendation.get')).toBe(true))
+
+    const call = request.mock.calls.find(([m]) => m === 'model_recommendation.get')
+
+    expect((call?.[1] as Record<string, unknown>).policy).toBe('best_quality')
+  })
+
+  it('claims no persisted choice until the read resolves', async () => {
+    const read = deferred<{ value: string }>()
+
+    const request = vi.fn(async (method: string, _params?: Record<string, unknown>) =>
+      method === 'config.get' ? read.promise : OK_TWO_PROVIDERS
+    )
+
+    setup({ request })
+
+    await waitFor(() => expect(screen.getByTestId('composer-recommend-preset-loading')).toBeTruthy())
+    expect(presetPressed()).toBeNull()
+
+    read.resolve({ value: 'save_codex' })
+    await waitFor(() => expect(presetPressed()).toBe('Save Codex'))
+  })
+
+  it('does not let a late read overwrite a newer user choice', async () => {
+    const read = deferred<{ value: string }>()
+
+    const request = vi.fn(async (method: string, _params?: Record<string, unknown>) =>
+      method === 'config.get' ? read.promise : { ok: true }
+    )
+
+    setup({ request })
+    await waitFor(() => expect(screen.getByTestId('composer-recommend-preset-loading')).toBeTruthy())
+
+    // The user picks while the read is still in flight.
+    fireEvent.click(screen.getByRole('button', { name: /Best quality/ }))
+    await waitFor(() => expect(presetPressed()).toBe('Best quality'))
+
+    read.resolve({ value: 'balanced' })
+    await Promise.resolve()
+    await Promise.resolve()
+
+    expect(presetPressed()).toBe('Best quality')
+  })
+
+  it('discards a read that resolves after the profile changed', async () => {
+    const workRead = deferred<{ value: string }>()
+    const homeRead = deferred<{ value: string }>()
+
+    const request = vi.fn(async (method: string, params?: Record<string, unknown>) => {
+      if (method === 'config.get') {
+        return params?.profile === 'work' ? workRead.promise : homeRead.promise
+      }
+
+      return OK_TWO_PROVIDERS
+    })
+
+    const { rerenderWithProfile } = setup({ request })
+
+    await waitFor(() => expect(screen.getByTestId('composer-recommend-preset-loading')).toBeTruthy())
+    rerenderWithProfile('home')
+    homeRead.resolve({ value: 'save_codex' })
+    await waitFor(() => expect(presetPressed()).toBe('Save Codex'))
+
+    // The abandoned profile's read lands late with a different value.
+    workRead.resolve({ value: 'best_quality' })
+    await Promise.resolve()
+    await Promise.resolve()
+
+    expect(presetPressed()).toBe('Save Codex')
+  })
+
+  it('keeps the newest write authoritative when two saves resolve out of order', async () => {
+    const first = deferred<{ ok: boolean }>()
+    const second = deferred<{ ok: boolean }>()
+    let writes = 0
+
+    const request = vi.fn(async (method: string, _params?: Record<string, unknown>) => {
+      if (method === 'config.get') {
+        return { value: 'balanced' }
+      }
+
+      if (method === 'config.set') {
+        writes += 1
+
+        return writes === 1 ? first.promise : second.promise
+      }
+
+      return OK_TWO_PROVIDERS
+    })
+
+    setup({ request })
+    await waitFor(() => expect(presetPressed()).toBe('Balanced'))
+
+    fireEvent.click(screen.getByRole('button', { name: /Save Codex/ }))
+    fireEvent.click(screen.getByRole('button', { name: /Best quality/ }))
+
+    // The SUPERSEDED write fails last; it must not roll the newer choice back.
+    second.resolve({ ok: true })
+    first.reject(new Error('write failed'))
+
+    await Promise.resolve()
+    await Promise.resolve()
+    await waitFor(() => expect(presetPressed()).toBe('Best quality'))
+    expect(screen.queryByTestId('composer-recommend-preset-unsaved')).toBeNull()
+  })
+})
+
+describe('Click-time eligibility and result freshness (review round 1, finding 2)', () => {
+  it('revalidates the live draft at click time, not only at render time', async () => {
+    const { draftRef, request } = setup()
+
+    // The composer deliberately does NOT rerender on every keystroke, so the
+    // render-time eligibility check can be arbitrarily stale. The draft grows
+    // past the documented limit without any rerender.
+    draftRef.current = 'x'.repeat(100_001)
+
+    fireEvent.click(recommendButton())
+
+    await waitFor(() => expect(screen.getByTestId('composer-recommend-ineligible')).toBeTruthy())
+    expect(request.mock.calls.some(([method]) => method === 'model_recommendation.get')).toBe(false)
+  })
+
+  it('sends the exact snapshot it validated', async () => {
+    const { draftRef, request } = setup()
+
+    draftRef.current = 'the newest text, typed after the last render'
+    fireEvent.click(recommendButton())
+
+    await waitFor(() => expect(request.mock.calls.some(([m]) => m === 'model_recommendation.get')).toBe(true))
+
+    const call = request.mock.calls.find(([m]) => m === 'model_recommendation.get')
+
+    expect((call?.[1] as Record<string, unknown>).draft).toBe('the newest text, typed after the last render')
+  })
+
+  it('marks results stale and withdraws Apply when the draft they were made for changes', async () => {
+    const { draftRef, notifyDraftChanged, onSelectModel } = setup()
+
+    await openResults()
+    expect(screen.queryByTestId('composer-recommend-stale')).toBeNull()
+    expect(screen.getAllByTestId('composer-recommend-apply').length).toBeGreaterThan(0)
+
+    draftRef.current = 'a completely different question about database indexes'
+    notifyDraftChanged()
+
+    await screen.findByTestId('composer-recommend-stale')
+    expect(screen.queryAllByTestId('composer-recommend-apply')).toHaveLength(0)
+    expect(onSelectModel).not.toHaveBeenCalled()
+  })
+
+  it('stays fresh when the draft notification carries no actual change', async () => {
+    const { notifyDraftChanged } = setup()
+
+    await openResults()
+    notifyDraftChanged()
+
+    await Promise.resolve()
+    expect(screen.queryByTestId('composer-recommend-stale')).toBeNull()
+  })
+
+  it('refuses an Apply against a draft that changed, even with no draft subscription', async () => {
+    const { draftRef, onSelectModel } = setup({ subscribeDraft: null })
+
+    await openResults()
+    draftRef.current = 'a completely different question about database indexes'
+
+    fireEvent.click(screen.getAllByTestId('composer-recommend-apply')[0])
+
+    await screen.findByTestId('composer-recommend-stale')
+    expect(onSelectModel).not.toHaveBeenCalled()
+  })
+
+  it('marks results stale when the preset they were made for changed', async () => {
+    setup()
+
+    await openResults()
+    expect(screen.queryByTestId('composer-recommend-stale')).toBeNull()
+
+    fireEvent.click(screen.getByRole('button', { name: /Best quality/ }))
+
+    await screen.findByTestId('composer-recommend-stale')
+    expect(screen.queryAllByTestId('composer-recommend-apply')).toHaveLength(0)
+  })
+
+  it('marks results stale when the attachments they were made for changed', async () => {
+    const { rerenderWithAttachments } = setup()
+
+    await openResults()
+    expect(screen.queryByTestId('composer-recommend-stale')).toBeNull()
+
+    rerenderWithAttachments([{ id: 'a1', kind: 'file', label: 'schema.sql' }])
+
+    await screen.findByTestId('composer-recommend-stale')
+  })
+
+  it('drops stale results entirely on a profile change rather than showing another profile’s answer', async () => {
+    const { rerenderWithProfile } = setup()
+
+    await openResults()
+    expect(screen.getAllByTestId('composer-recommend-row')).toHaveLength(2)
+
+    rerenderWithProfile('home')
+
+    await waitFor(() => expect(screen.queryAllByTestId('composer-recommend-row')).toHaveLength(0))
+  })
+
+  it('re-requests for the current snapshot when the user refreshes stale results', async () => {
+    const { draftRef, notifyDraftChanged, request } = setup()
+
+    await openResults()
+    draftRef.current = 'a completely different question'
+    notifyDraftChanged()
+
+    await screen.findByTestId('composer-recommend-stale')
+    fireEvent.click(screen.getByTestId('composer-recommend-refresh-stale'))
+
+    await waitFor(() => expect(screen.queryByTestId('composer-recommend-stale')).toBeNull())
+
+    const calls = request.mock.calls.filter(([m]) => m === 'model_recommendation.get')
+
+    expect((calls.at(-1)?.[1] as Record<string, unknown>).draft).toBe('a completely different question')
+    expect(screen.getAllByTestId('composer-recommend-apply').length).toBeGreaterThan(0)
   })
 })

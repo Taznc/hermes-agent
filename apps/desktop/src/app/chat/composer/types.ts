@@ -49,6 +49,10 @@ export interface ComposerRecommendContext {
   attachments: readonly ComposerAttachment[]
   disabled: boolean
   getDraft: () => string
+  /** Fires whenever the composer's draft changes. The composer keeps typing
+   *  OUT of React on purpose, so a surface that must react to an edit cannot
+   *  rely on being re-rendered; it subscribes and re-reads `getDraft()`. */
+  subscribeDraft: (listener: () => void) => () => void
 }
 
 export interface ChatBarProps {
