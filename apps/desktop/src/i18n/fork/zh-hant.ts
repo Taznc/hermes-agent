@@ -21,7 +21,9 @@ export const forkZhHant: TranslationOverrides = {
         state: state =>
           ({ completed: '已完成', declined: '已拒絕', failed: '失敗', no_op: '無變更', skipped: '已略過' })[state] ??
           '已完成'
-      }
+      },
+      workComplete: '工作已完成',
+      workNeedsAttention: '工作需要處理'
     }
   },
   boot: {
@@ -40,12 +42,6 @@ export const forkZhHant: TranslationOverrides = {
       providerVia: family => `經由 ${family}`,
       providerConfiguredVia: (configuredFamily, servedFamily) =>
         `設定的模型：${configuredFamily}，目前經由 ${servedFamily} 提供服務`
-    }
-  },
-  assistant: {
-    thread: {
-      workComplete: '工作已完成',
-      workNeedsAttention: '工作需要處理'
     }
   },
   errors: {

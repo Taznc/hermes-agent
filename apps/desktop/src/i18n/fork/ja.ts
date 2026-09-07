@@ -22,7 +22,9 @@ export const forkJa: TranslationOverrides = {
         state: state =>
           ({ completed: '完了', declined: '却下', failed: '失敗', no_op: '変更なし', skipped: 'スキップ' })[state] ??
           '完了'
-      }
+      },
+      workComplete: '作業が完了しました',
+      workNeedsAttention: '作業に対応が必要です'
     }
   },
   boot: {
@@ -41,12 +43,6 @@ export const forkJa: TranslationOverrides = {
       providerVia: family => `${family} 経由`,
       providerConfiguredVia: (configuredFamily, servedFamily) =>
         `設定済みモデル: ${configuredFamily}（現在は ${servedFamily} 経由で応答中）`
-    }
-  },
-  assistant: {
-    thread: {
-      workComplete: '作業が完了しました',
-      workNeedsAttention: '作業に対応が必要です'
     }
   },
   errors: {
