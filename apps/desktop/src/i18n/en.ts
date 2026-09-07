@@ -513,6 +513,7 @@ export const en: Translations = withForkKeys(forkEn, {
       testBody: 'Notifications are working.',
       testSent: 'Test sent. If nothing appears, check your OS notification permissions and Focus/Do Not Disturb.',
       testUnsupported: 'This system does not support native notifications.',
+      testDenied: 'Notifications are blocked for this site. Allow them in your browser\u2019s site settings, then try again.',
       completionSoundTitle: 'Completion Sound',
       completionSoundDesc: 'Plays when an agent turn finishes. Pick a preset and preview it here.',
       completionSoundPreview: 'Preview'

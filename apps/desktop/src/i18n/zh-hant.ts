@@ -325,6 +325,7 @@ export const zhHant = defineForkLocale(forkZhHant, {
       testBody: '通知運作正常。',
       testSent: '測試已傳送。若沒有出現，請檢查系統通知權限與專注模式／勿擾模式。',
       testUnsupported: '此系統不支援原生通知。',
+      testDenied: '此網站的通知已被封鎖。請在瀏覽器的網站設定中允許通知，然後再試一次。',
       completionSoundTitle: '完成提示音',
       completionSoundDesc: '代理回合結束時播放。可在此選擇預設並預覽。',
       completionSoundPreview: '預覽'
