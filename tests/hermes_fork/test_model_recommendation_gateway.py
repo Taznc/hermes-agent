@@ -226,19 +226,37 @@ def test_candidate_discovery_excludes_models_marked_unavailable_by_inventory(mon
     assert [candidate["model"] for candidate in service.discover_eligible_candidates()] == ["available"]
 
 
-def test_policy_presets_rank_the_same_eligible_routes_differently():
-    candidates = [{**candidate, "cost": "paid_or_unknown"} for candidate in CANDIDATES]
-    candidates[1]["cost"] = "free"
-    parsed = service._parse_router_output(_router_output(), candidates)
+def test_policy_presets_rank_the_same_eligible_routes_by_their_distinct_semantics():
+    candidates = [
+        {**CANDIDATES[0], "cost": "free"},
+        {**CANDIDATES[1], "cost": "free"},
+        {
+            "provider": "openai", "model": "quality-first",
+            "capabilities": {"reasoning": True, "fast": False, "effort_options": list(service.EFFORTS)},
+            "cost": "paid_or_unknown",
+        },
+    ]
+    raw = json.dumps({
+        "task_risk": "medium", "ambiguous": False,
+        "recommendations": [
+            {"provider": "anthropic", "model": "claude-fast", "effort": "medium", "reason": "Adequate", "quality": 80,
+             "materially_advantageous": False},
+            {"provider": "openai-codex", "model": "codex-strong", "effort": "high", "reason": "Strong", "quality": 90,
+             "materially_advantageous": False},
+            {"provider": "openai", "model": "quality-first", "effort": "high", "reason": "Strongest", "quality": 100,
+             "materially_advantageous": False},
+        ],
+    })
+    parsed = service._parse_router_output(raw, candidates)
     assert parsed is not None
 
     balanced = service.rank_recommendations(parsed, {}, "balanced")
     save_codex = service.rank_recommendations(parsed, {}, "save_codex")
     best_quality = service.rank_recommendations(parsed, {}, "best_quality")
 
-    assert balanced[0]["provider"] == "openai-codex"
-    assert save_codex[0]["provider"] == "anthropic"
-    assert best_quality[0]["provider"] == "openai-codex"
+    assert balanced[0]["provider"] == "openai-codex"  # cheapest adequate route
+    assert save_codex[0]["provider"] == "anthropic"  # preserves non-advantageous Codex capacity
+    assert best_quality[0]["provider"] == "openai"  # strongest eligible route
 
 
 def test_stale_and_unavailable_account_data_are_explicit(monkeypatch):
