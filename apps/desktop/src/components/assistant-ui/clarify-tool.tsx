@@ -720,6 +720,7 @@ function ClarifyToolSinglePending({
 
   const [draft, setDraft] = useState('')
   const [note, setNote] = useState('')
+  const [noteAnchor, setNoteAnchor] = useState<string | null>(null)
   const [noteOpen, setNoteOpen] = useState(false)
   const [submitting, setSubmitting] = useState(false)
   const [selectedChoices, setSelectedChoices] = useState<string[]>([])
@@ -804,11 +805,17 @@ function ClarifyToolSinglePending({
       // Picking a choice and typing are mutually exclusive answers.
       setDraft('')
       setSelectedChoices(selected => {
+        let next: string[]
+
         if (!multiSelect) {
-          return [choice]
+          next = [choice]
+        } else {
+          next = selected.includes(choice) ? selected.filter(value => value !== choice) : [...selected, choice]
         }
 
-        return selected.includes(choice) ? selected.filter(value => value !== choice) : [...selected, choice]
+        setNoteAnchor(anchor => (anchor && !next.includes(anchor) ? (next[0] ?? null) : anchor))
+
+        return next
       })
       setActiveIndex(index)
     },
@@ -1050,14 +1057,17 @@ function ClarifyToolSinglePending({
                     target={`choice-${index}`}
                     targetLabel={bareChoice(choice)}
                   />
-                  {selected ? (
+                  {selected && (!noteOpen || noteAnchor === choice) ? (
                     <ClarifyNoteControl
                       label={bareChoice(choice)}
                       note={note}
                       onChange={setNote}
                       onKeyDown={handleTextareaKey}
-                      onOpen={() => setNoteOpen(true)}
-                      open={noteOpen}
+                      onOpen={() => {
+                        setNoteAnchor(choice)
+                        setNoteOpen(true)
+                      }}
+                      open={noteOpen && noteAnchor === choice}
                     />
                   ) : null}
                 </div>
@@ -1219,12 +1229,12 @@ function BatchQuestionBlock({
   locked: boolean
   onDraft: (value: string) => void
   onNote: (value: string) => void
-  onNoteOpen: () => void
+  onNoteOpen: (choice: string) => void
   onToggle: (choice: string) => void
   onFieldKeyDown: (event: KeyboardEvent<HTMLTextAreaElement>) => void
   question: ClarifyQuestion
   request: ClarifyRequest | null
-  staged: { choices: string[]; draft: string; note: string; noteOpen: boolean }
+  staged: { choices: string[]; draft: string; note: string; noteAnchor: string | null; noteOpen: boolean }
   total: number
 }) {
   const { t } = useI18n()
@@ -1297,14 +1307,14 @@ function BatchQuestionBlock({
                   target={`choice-${question.qid}-${choiceIndex}`}
                   targetLabel={bareChoice(choice)}
                 />
-                {selected ? (
+                {selected && (!staged.noteOpen || staged.noteAnchor === choice) ? (
                   <ClarifyNoteControl
                     label={bareChoice(choice)}
                     note={staged.note}
                     onChange={onNote}
                     onKeyDown={onFieldKeyDown}
-                    onOpen={onNoteOpen}
-                    open={staged.noteOpen}
+                    onOpen={() => onNoteOpen(choice)}
+                    open={staged.noteOpen && staged.noteAnchor === choice}
                   />
                 ) : null}
               </div>
@@ -1340,7 +1350,7 @@ function BatchQuestionBlock({
   )
 }
 
-const emptyStage = { choices: [] as string[], draft: '', note: '', noteOpen: false }
+const emptyStage = { choices: [] as string[], draft: '', note: '', noteAnchor: null as string | null, noteOpen: false }
 
 /** Live batch card: all questions at once, staged locally, ONE confirm.
  * Picks and drafts stay in component state — nothing reaches the server
@@ -1360,10 +1370,11 @@ function ClarifyToolBatchPending({ onAnswered, request }: { onAnswered: () => vo
   const ready = Boolean(request?.requestId) && questions.length > 0
 
   const [staged, setStaged] = useState<
-    Record<string, { choices: string[]; draft: string; note: string; noteOpen: boolean }>
+    Record<string, { choices: string[]; draft: string; note: string; noteAnchor: string | null; noteOpen: boolean }>
   >({})
 
   const [submitting, setSubmitting] = useState(false)
+  const formRef = useRef<HTMLFormElement | null>(null)
 
   // Reconnect replay: answers the server already locked (an earlier window's
   // partial progress) pre-stage their questions so the restored card shows
@@ -1485,7 +1496,15 @@ function ClarifyToolBatchPending({ onAnswered, request }: { onAnswered: () => vo
           : [...stage.choices, choice]
         : [choice]
 
-      return { ...current, [question.qid]: { ...stage, choices: next, draft: '' } }
+      return {
+        ...current,
+        [question.qid]: {
+          ...stage,
+          choices: next,
+          draft: '',
+          noteAnchor: stage.noteAnchor && !next.includes(stage.noteAnchor) ? (next[0] ?? null) : stage.noteAnchor
+        }
+      }
     })
   }, [])
 
@@ -1505,11 +1524,11 @@ function ClarifyToolBatchPending({ onAnswered, request }: { onAnswered: () => vo
     })
   }, [])
 
-  const openNoteFor = useCallback((question: ClarifyQuestion) => {
+  const openNoteFor = useCallback((question: ClarifyQuestion, choice: string) => {
     setStaged(current => {
       const stage = current[question.qid] ?? emptyStage
 
-      return { ...current, [question.qid]: { ...stage, noteOpen: true } }
+      return { ...current, [question.qid]: { ...stage, noteAnchor: choice, noteOpen: true } }
     })
   }, [])
 
@@ -1529,7 +1548,7 @@ function ClarifyToolBatchPending({ onAnswered, request }: { onAnswered: () => vo
       const next = questions.slice(currentIndex + 1).find(item => stagedAnswer(item) === null)
 
       if (next) {
-        const block = document.querySelector(`[data-clarify-batch-question="${next.qid}"]`)
+        const block = formRef.current?.querySelector(`[data-clarify-batch-question="${next.qid}"]`)
 
         ;(block?.querySelector<HTMLElement>('[data-choice], textarea') ?? null)?.focus()
       } else if (allStaged) {
@@ -1583,7 +1602,7 @@ function ClarifyToolBatchPending({ onAnswered, request }: { onAnswered: () => vo
   }
 
   return (
-    <form className="my-1.5 grid gap-4" data-clarify-batch={questions.length} onSubmit={handleSubmit}>
+    <form className="my-1.5 grid gap-4" data-clarify-batch={questions.length} onSubmit={handleSubmit} ref={formRef}>
       <ClarifyShell className="grid gap-1.5">
         <div className="flex items-center gap-2 px-3">
           <MessageQuestion aria-hidden className="size-4 shrink-0 text-(--ui-text-tertiary)" />
@@ -1613,7 +1632,7 @@ function ClarifyToolBatchPending({ onAnswered, request }: { onAnswered: () => vo
             onDraft={value => draftFor(question, value)}
             onFieldKeyDown={event => handleBatchFieldKey(question, event)}
             onNote={value => noteFor(question, value)}
-            onNoteOpen={() => openNoteFor(question)}
+            onNoteOpen={choice => openNoteFor(question, choice)}
             onToggle={choice => toggleChoice(question, choice)}
             question={question}
             request={request}

@@ -223,6 +223,16 @@ describe('ClarifyTool choice selection', () => {
     })
   })
 
+  it('opens one scoped note editor when multiple choices are selected', () => {
+    renderLiveClarify({ multiSelect: true })
+
+    fireEvent.click(screen.getByRole('button', { name: /^[A-Z]staging/ }))
+    fireEvent.click(screen.getByRole('button', { name: /^[A-Z]production/ }))
+    fireEvent.click(screen.getByRole('button', { name: 'Add note for staging' }))
+
+    expect(screen.getAllByPlaceholderText('Add an optional note…')).toHaveLength(1)
+  })
+
   it('keeps single-select replacement and plain-string submission', async () => {
     const { request } = renderLiveClarify()
     const staging = screen.getByRole('button', { name: /^[A-Z]staging/ })
@@ -811,6 +821,67 @@ describe('ClarifyTool batch card', () => {
       question_id: 'q0',
       request_id: 'request-batch'
     })
+  })
+
+  it('keeps one scoped note editor for a batch multi-select answer', () => {
+    renderLiveBatch(undefined, true)
+
+    fireEvent.click(screen.getByRole('button', { name: /^[A-Z]red/ }))
+    fireEvent.click(screen.getByRole('button', { name: /^[A-Z]blue/ }))
+    fireEvent.click(screen.getByRole('button', { name: 'Add note for red' }))
+
+    expect(screen.getAllByPlaceholderText('Add an optional note…')).toHaveLength(1)
+  })
+
+  it('advances within its own batch card when another mounted card has the same qids', () => {
+    const request = vi.fn().mockResolvedValue({ ok: true })
+
+    const batchView = (sessionId: string): SessionView => ({
+      ...({} as SessionView),
+      $runtimeId: atom<null | string>(sessionId),
+      kind: 'tile'
+    })
+
+    $gateway.set({ request } as never)
+    setClarifyRequest({
+      choices: null,
+      multiSelect: false,
+      question: '',
+      questions: [
+        { choices: ['red', 'blue'], multiSelect: false, qid: 'q0', question: 'Background color?' },
+        { choices: null, multiSelect: false, qid: 'q1', question: 'Background name?' }
+      ],
+      requestId: 'request-background-batch',
+      sessionId: 'session-background-batch'
+    })
+    setClarifyRequest({
+      choices: null,
+      multiSelect: false,
+      question: '',
+      questions: [
+        { choices: ['red', 'blue'], multiSelect: false, qid: 'q0', question: 'Foreground color?' },
+        { choices: null, multiSelect: false, qid: 'q1', question: 'Foreground name?' }
+      ],
+      requestId: 'request-foreground-batch',
+      sessionId: 'session-foreground-batch'
+    })
+    renderClarify(
+      <>
+        <SessionViewProvider value={batchView('session-background-batch')}>
+          <ClarifyTool {...liveBatchProps()} />
+        </SessionViewProvider>
+        <SessionViewProvider value={batchView('session-foreground-batch')}>
+          <ClarifyTool {...liveBatchProps()} />
+        </SessionViewProvider>
+      </>
+    )
+
+    const drafts = screen.getAllByPlaceholderText('Other (type your answer)')
+    const nextAnswers = screen.getAllByPlaceholderText('Type your answer…')
+    fireEvent.change(drafts[1] as HTMLTextAreaElement, { target: { value: 'green' } })
+    fireEvent.keyDown(drafts[1] as HTMLTextAreaElement, { key: 'Enter' })
+
+    expect(document.activeElement).toBe(nextAnswers[1])
   })
 
   it('uses plain Enter to advance a batch draft without creating a newline', () => {
