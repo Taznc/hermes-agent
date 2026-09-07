@@ -46,6 +46,32 @@ class UpstreamAdapter(ABC):
         """Fresh credential (refreshing/rotating + persisting as needed). Raises RuntimeError when
         unauthenticated or refresh fails; the proxy then returns 401 to the client."""
 
+    @property
+    def loopback_only(self) -> bool:
+        """Whether this credential must never bind beyond loopback."""
+        return False
+
+    @property
+    def requires_client_auth(self) -> bool:
+        """Whether callers must authenticate before credentials are resolved."""
+        return False
+
+    def get_owned_upstream_header_names(self) -> frozenset[str]:
+        """Headers whose inbound client values must always be removed."""
+        return frozenset()
+
+    def get_upstream_headers(
+        self,
+        credential: UpstreamCredential,
+    ) -> dict[str, str]:
+        """Return provider-required headers in addition to Authorization.
+
+        The server applies these after filtering inbound client headers, so an
+        untrusted loopback client cannot spoof provider identity/account fields.
+        """
+        _ = credential
+        return {}
+
     def get_retry_credential(
         self, *, failed_credential: UpstreamCredential, status_code: int
     ) -> Optional[UpstreamCredential]:
@@ -53,6 +79,11 @@ class UpstreamAdapter(ABC):
         default is no retry."""
         _ = failed_credential, status_code
         return None
+
+    @property
+    def transforms_openai_chat(self) -> bool:
+        """Whether ``/chat/completions`` needs a provider-specific wire bridge."""
+        return False
 
     def describe(self) -> str:
         """One-line status summary for ``proxy status``."""
