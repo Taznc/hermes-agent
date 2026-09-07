@@ -1,7 +1,11 @@
 import { useStore } from '@nanostores/react'
-import { useCallback, useEffect, useId, useMemo, useRef, useState } from 'react'
+import { useCallback, useEffect, useId, useLayoutEffect, useMemo, useRef, useState } from 'react'
 
 import { useSessionView } from '@/app/chat/session-view'
+import type {
+  ModelSelectionOutcome,
+  RecommendedModelSelection
+} from '@/app/session/hooks/use-model-controls'
 import { Button } from '@/components/ui/button'
 import { Codicon } from '@/components/ui/codicon'
 import { SegmentedControl, type SegmentedControlOption } from '@/components/ui/segmented-control'
@@ -20,15 +24,6 @@ import { useRecommendationPresetPreference } from './use-recommendation-preset'
 
 type RequestGateway = <T>(method: string, params?: Record<string, unknown>) => Promise<T>
 
-interface ModelSelectionRequest {
-  /** Applied as part of the same selection, so scoping/confirm/rollback are
-   *  the selection path's, not a second write from here. */
-  effort?: string
-  model: string
-  provider: string
-  sessionId?: null | string
-}
-
 export interface ComposerRecommendProps {
   attachments: readonly ComposerAttachment[]
   disabled: boolean
@@ -37,7 +32,7 @@ export interface ComposerRecommendProps {
    *  structurally impossible for this surface to write it. */
   getDraft: () => string
   /** The existing session-aware model-selection path. Never reimplemented. */
-  onSelectModel: (selection: ModelSelectionRequest) => Promise<boolean> | void
+  onSelectModel: (selection: RecommendedModelSelection) => Promise<ModelSelectionOutcome>
   profile: string
   requestGateway: RequestGateway
   /** Runtime id of the surface that owns this composer (null for a draft). */
@@ -49,12 +44,6 @@ export interface ComposerRecommendProps {
   subscribeDraft?: (listener: () => void) => () => void
 }
 
-/**
- * `unconfirmed` is deliberately NOT a failure: `selectModel` answers `false`
- * both for a real failure (which it has already toasted and rolled back) and
- * for a pending expensive-model confirmation, where the switch still applies
- * if the user takes the Confirm action already on screen.
- */
 type ApplyState =
   | { kind: 'applying'; row: string }
   | { kind: 'idle'; row?: string }
@@ -226,13 +215,18 @@ export function ComposerRecommend({
     // eslint-disable-next-line react-hooks/exhaustive-deps -- draftRevision is the reactive draft input
   }, [answer, currentSnapshot, draftRevision, preset, presetReady])
 
-  // A profile change makes a previous answer meaningless rather than merely
-  // stale — it was another workspace's routing. Drop it outright.
-  useEffect(() => {
+  // A profile or gateway-route change makes both a previous answer and any
+  // suspended async click meaningless. Invalidate BEFORE ordinary effects can
+  // resume: an old click waiting on config.get must never issue a paid request
+  // into the workspace the user already left.
+  useLayoutEffect(() => {
+    requestEpochRef.current += 1
     setAnswer(null)
     setBlocked(null)
     setApply({ kind: 'idle' })
-  }, [profile])
+    setOpen(false)
+    setPending(false)
+  }, [profile, requestGateway])
 
   const stale = !!answer && !live && !pending
 
@@ -304,20 +298,17 @@ export function ComposerRecommend({
     // session-aware path, so scoping (this session, never the profile
     // default), the expensive-model confirm handshake, optimistic paint,
     // authoritative reconciliation and rollback are all upstream's.
-    const applied = await onSelectModel({
+    const outcome = await onSelectModel({
       effort: row.effort,
       model: row.model,
       provider: row.provider,
       sessionId
     })
 
-    // `false` is NOT "failed" — the selection path returns it for a pending
-    // expensive-model confirmation too, where a warning with a Confirm action
-    // is already on screen and the switch will apply if the user takes it.
-    // Painting an error there would contradict the notification next to it.
-    setApply({ kind: applied === false ? 'unconfirmed' : 'idle', row: key })
-
-    if (applied !== false) {
+    if (outcome.kind !== 'applied') {
+      setApply({ kind: 'unconfirmed', row: key })
+    } else {
+      setApply({ kind: 'idle', row: key })
       setOpen(false)
     }
   }

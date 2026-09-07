@@ -316,10 +316,7 @@ describe('Apply is scoped to the active view and never sends', () => {
   })
 
   it('does not claim failure when the switch is merely awaiting confirmation', async () => {
-    // `selectModel` answers false for a PENDING expensive-model confirmation
-    // as well as for a real failure, and it has already surfaced whichever it
-    // is. Saying "could not apply" next to a live Confirm action is a lie.
-    const onSelectModel = vi.fn().mockResolvedValue(false)
+    const onSelectModel = vi.fn().mockResolvedValue({ kind: 'confirmation_pending' })
     const { draftRef } = setup({ onSelectModel })
 
     await openResults()
@@ -844,5 +841,81 @@ describe('Click-time eligibility and result freshness (review round 1, finding 2
 
     expect((calls.at(-1)?.[1] as Record<string, unknown>).draft).toBe('a completely different question')
     expect(screen.getAllByTestId('composer-recommend-apply').length).toBeGreaterThan(0)
+  })
+})
+
+describe('Profile isolation for in-flight recommendations (review round 2, finding 1)', () => {
+  const deferred = <T,>() => {
+    let resolve!: (value: T) => void
+
+    const promise = new Promise<T>(res => {
+      resolve = res
+    })
+
+    return { promise, resolve }
+  }
+
+  it('does not resume an old-profile click after its pending preset read resolves', async () => {
+    const workRead = deferred<{ value: string }>()
+    const homeRead = deferred<{ value: string }>()
+
+    const request = vi.fn(async (method: string, params?: Record<string, unknown>) => {
+      if (method === 'config.get') {
+        return params?.profile === 'work' ? workRead.promise : homeRead.promise
+      }
+
+      return OK_TWO_PROVIDERS
+    })
+
+    const { rerenderWithProfile } = setup({ request })
+
+    fireEvent.click(recommendButton())
+    rerenderWithProfile('home')
+    homeRead.resolve({ value: 'save_codex' })
+    await waitFor(() => expect(presetPressed()).toBe('Save Codex'))
+
+    await act(async () => {
+      workRead.resolve({ value: 'best_quality' })
+      await workRead.promise
+      await Promise.resolve()
+    })
+
+    expect(
+      request.mock.calls.some(
+        ([method, params]) => method === 'model_recommendation.get' && params?.profile === 'work'
+      )
+    ).toBe(false)
+    expect(screen.queryAllByTestId('composer-recommend-row')).toHaveLength(0)
+  })
+
+  it('does not paint an old-profile recommendation response after switching profiles', async () => {
+    const workResult = deferred<typeof OK_TWO_PROVIDERS>()
+
+    const request = vi.fn(async (method: string, params?: Record<string, unknown>) => {
+      if (method === 'config.get') {
+        return { profile: params?.profile, value: 'balanced' }
+      }
+
+      return params?.profile === 'work' ? workResult.promise : OK_TWO_PROVIDERS
+    })
+
+    const { rerenderWithProfile } = setup({ request })
+
+    fireEvent.click(recommendButton())
+    await waitFor(() =>
+      expect(request.mock.calls.some(([method]) => method === 'model_recommendation.get')).toBe(true)
+    )
+    rerenderWithProfile('home')
+    fireEvent.click(recommendButton())
+    await waitFor(() => expect(screen.getAllByTestId('composer-recommend-row')).toHaveLength(2))
+
+    await act(async () => {
+      workResult.resolve(OK_TWO_PROVIDERS)
+      await workResult.promise
+      await Promise.resolve()
+    })
+
+    expect(screen.getAllByTestId('composer-recommend-row')).toHaveLength(2)
+    expect(screen.queryByTestId('composer-recommend-stale')).toBeNull()
   })
 })

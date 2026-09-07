@@ -208,7 +208,7 @@ function TileChat({
     [ownerRoute, requestGateway]
   )
 
-  const { selectModel } = useModelControls({
+  const { selectModel, selectRecommendedModel } = useModelControls({
     cacheOwnerConnectionId: ownerRoute?.connectionId || undefined,
     cacheProfile: ownerRoute?.targetProfile || ownerRoute?.profile || undefined,
     queryClient,
@@ -311,7 +311,7 @@ function TileChat({
               attachments={ctx.attachments}
               disabled={ctx.disabled}
               getDraft={ctx.getDraft}
-              onSelectModel={selectModel}
+              onSelectModel={selectRecommendedModel}
               profile={ownerRoute?.targetProfile || ownerRoute?.profile || activeGatewayProfile}
               requestGateway={requestTileGateway}
               subscribeDraft={ctx.subscribeDraft}
@@ -324,7 +324,7 @@ function TileChat({
       ownerRoute?.profile,
       ownerRoute?.targetProfile,
       requestTileGateway,
-      selectModel
+      selectRecommendedModel
     ]
   )
 

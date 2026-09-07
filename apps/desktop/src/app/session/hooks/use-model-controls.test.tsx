@@ -87,6 +87,7 @@ describe('useModelControls', () => {
     setCurrentModel('')
     setCurrentModelSource('')
     setCurrentProvider('')
+    setCurrentReasoningEffort('')
     SessionStates.$sessionStates.set({})
   })
 
@@ -98,6 +99,7 @@ describe('useModelControls', () => {
     setCurrentModel('')
     setCurrentModelSource('')
     setCurrentProvider('')
+    setCurrentReasoningEffort('')
     SessionStates.$sessionStates.set({})
   })
 
@@ -740,6 +742,174 @@ describe('useModelControls', () => {
   // would have to re-derive primary-vs-tile scoping, the confirm handshake and
   // rollback. `effort` is optional, so every existing caller is unchanged.
   describe('selectModel with a reasoning effort', () => {
+    it('forces a PRIMARY recommendation to be session-only on the wire', async () => {
+      $activeSessionId.set('session-1')
+
+      const backend = {
+        profileDefault: { model: 'fable-5', provider: 'nous' },
+        session: { model: 'fable-5', provider: 'nous' }
+      }
+
+      const requestGateway = vi.fn(async (_method: string, params?: Record<string, unknown>) => {
+        const value = String(params?.value)
+
+        const next = {
+          model: value.split(' --provider ')[0],
+          provider: value.split(' --provider ')[1].split(' --session')[0]
+        }
+
+        if (value.endsWith(' --session')) {
+          backend.session = next
+        } else {
+          backend.profileDefault = next
+        }
+
+        return { key: 'model' } as never
+      })
+
+      let controls!: Controls
+
+      render(<Harness onReady={value => (controls = value)} requestGateway={requestGateway} />)
+
+      await controls.selectRecommendedModel({
+        effort: 'high',
+        model: 'claude-opus-5',
+        provider: 'anthropic',
+        sessionId: 'session-1'
+      })
+
+      expect(requestGateway).toHaveBeenCalledWith('config.set', {
+        key: 'model',
+        session_id: 'session-1',
+        value: 'claude-opus-5 --provider anthropic --session'
+      })
+      expect(backend.profileDefault).toEqual({ model: 'fable-5', provider: 'nous' })
+      expect(backend.session).toEqual({ model: 'claude-opus-5', provider: 'anthropic' })
+    })
+
+    it('keeps a TILE recommendation session-only on the exact tile wire route', async () => {
+      $activeSessionId.set('primary-1')
+      SessionStates.$sessionStates.set({ 'tile-9': { model: 'old', provider: 'nous' } as never })
+      const requestGateway = vi.fn(async () => ({ key: 'model' }) as never)
+      const updateSession = vi.fn()
+
+      vi.spyOn(SessionStates, 'sessionTileDelegate').mockReturnValue({ updateSession } as never)
+      let controls!: Controls
+
+      render(<Harness onReady={value => (controls = value)} requestGateway={requestGateway} />)
+
+      await controls.selectRecommendedModel({
+        effort: 'medium',
+        model: 'gpt-5.6-terra',
+        provider: 'openai-codex',
+        sessionId: 'tile-9'
+      })
+
+      expect(requestGateway).toHaveBeenCalledWith('config.set', {
+        key: 'model',
+        session_id: 'tile-9',
+        value: 'gpt-5.6-terra --provider openai-codex --session'
+      })
+    })
+
+    it('returns a discriminated failure and restores backend model state when reasoning fails', async () => {
+      $activeSessionId.set('session-1')
+      setCurrentModel('fable-5')
+      setCurrentProvider('nous')
+      setCurrentReasoningEffort('low')
+      const backend = { model: 'fable-5', provider: 'nous' }
+
+      const requestGateway = vi.fn(async (_method: string, params?: Record<string, unknown>) => {
+        if (params?.key === 'reasoning') {
+          throw new Error('reasoning rejected')
+        }
+
+        const value = String(params?.value)
+        backend.model = value.split(' --provider ')[0]
+        backend.provider = value.split(' --provider ')[1].split(' --session')[0]
+
+        return { key: 'model' } as never
+      })
+
+      let controls!: Controls
+
+      render(<Harness onReady={value => (controls = value)} requestGateway={requestGateway} />)
+
+      await expect(
+        controls.selectRecommendedModel({
+          effort: 'high',
+          model: 'claude-opus-5',
+          provider: 'anthropic',
+          sessionId: 'session-1'
+        })
+      ).resolves.toEqual({ kind: 'failed', recovery: 'restored' })
+
+      expect(backend).toEqual({ model: 'fable-5', provider: 'nous' })
+      expect(requestGateway).toHaveBeenLastCalledWith('config.set', {
+        confirm_expensive_model: true,
+        key: 'model',
+        session_id: 'session-1',
+        value: 'fable-5 --provider nous --session'
+      })
+    })
+
+    it('keeps the accepted backend model visible and reports when compensation also fails', async () => {
+      $activeSessionId.set('session-1')
+      setCurrentModel('fable-5')
+      setCurrentProvider('nous')
+      setCurrentReasoningEffort('low')
+      const queryClient = new QueryClient()
+      const invalidateQueries = vi.spyOn(queryClient, 'invalidateQueries')
+      let modelWrites = 0
+
+      const requestGateway = vi.fn(async (_method: string, params?: Record<string, unknown>) => {
+        if (params?.key === 'reasoning') {
+          throw new Error('reasoning rejected')
+        }
+
+        modelWrites += 1
+
+        if (modelWrites === 2) {
+          throw new Error('restore rejected')
+        }
+
+        return { key: 'model' } as never
+      })
+
+      const { result } = renderHook(() => useModelControls({ queryClient, requestGateway }))
+
+      await expect(
+        result.current.selectRecommendedModel({
+          effort: 'high',
+          model: 'claude-opus-5',
+          provider: 'anthropic',
+          sessionId: 'session-1'
+        })
+      ).resolves.toEqual({ kind: 'failed', recovery: 'restore_failed' })
+
+      expect($currentModel.get()).toBe('claude-opus-5')
+      expect($currentProvider.get()).toBe('anthropic')
+      expect($currentReasoningEffort.get()).toBe('low')
+      expect(invalidateQueries).toHaveBeenCalled()
+    })
+
+    it('reports confirmation pending separately from a real failure', async () => {
+      $activeSessionId.set('session-1')
+      const requestGateway = vi.fn(async () => ({ confirm_message: 'Expensive model.', confirm_required: true }) as never)
+      let controls!: Controls
+
+      render(<Harness onReady={value => (controls = value)} requestGateway={requestGateway} />)
+
+      await expect(
+        controls.selectRecommendedModel({
+          effort: 'high',
+          model: 'claude-opus-5',
+          provider: 'anthropic',
+          sessionId: 'session-1'
+        })
+      ).resolves.toEqual({ kind: 'confirmation_pending' })
+    })
+
     it('applies effort to the PRIMARY composer, not through the tile delegate', async () => {
       $activeSessionId.set('session-1')
       setCurrentReasoningEffort('low')
