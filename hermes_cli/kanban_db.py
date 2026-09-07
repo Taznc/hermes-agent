@@ -1089,6 +1089,13 @@ CREATE TABLE IF NOT EXISTS kanban_timeout_kill_intents (
 CREATE INDEX IF NOT EXISTS idx_timeout_kill_task ON kanban_timeout_kill_intents(task_id, run_id);
 CREATE INDEX IF NOT EXISTS idx_timeout_kill_consumed ON kanban_timeout_kill_intents(consumed_at);
 
+CREATE TABLE IF NOT EXISTS kanban_provider_backoff_tasks (
+    provider    TEXT NOT NULL,
+    task_id     TEXT NOT NULL,
+    PRIMARY KEY(provider, task_id)
+);
+CREATE INDEX IF NOT EXISTS idx_provider_backoff_tasks_task ON kanban_provider_backoff_tasks(task_id);
+
 -- Persistent per-task consecutive interruption streak. Incremented for every
 -- otherwise-neutral infra path (external allowed signal, startup-window dead PID,
 -- quota signature including malformed/missing retry-after). On exceeding
@@ -1250,17 +1257,11 @@ def classify_infra_exit(
     (SIGABRT, SIGSEGV, SIGPIPE, etc.) is a legit crash regardless of source,
     because those indicate a crashed process, not a cleanly-terminated one.
 
-    Quota/429 signature detection: when the worker log contains "quota exhausted
-    (429)" (and optionally "retry after Ns"), the death is classified as infra
-    regardless of exit_kind. Both the legacy quota_signal=bool form and the
-    quota_signal_dict form (from _detect_quota_exit_signal) are accepted.
+    Quota/429 signature detection is run-scoped. It may classify a non-signal
+    exit as infra, but cannot override a signaled exit's dispatcher ownership
+    or explicit signal allowlist result.
     """
-    # 1. Quota/429 signature always wins.
-    if quota_signal_dict:
-        return ("infra", "quota")
-    if quota_signal:
-        return ("infra", "quota")
-    # 2. Signaled: infra ONLY for SIGTERM/SIGKILL when the dispatcher did NOT
+    # 1. Signaled: infra ONLY for SIGTERM/SIGKILL when the dispatcher did NOT
     #    send that signal. All other signals are legit. A dispatcher-owned kill
     #    (its own max-runtime timeout) is always legit.
     if exit_kind == "signaled":
@@ -1269,6 +1270,10 @@ def classify_infra_exit(
         if dispatcher_killed:
             return ("legit", "dispatcher_kill")
         return ("infra", "external_signal")
+    # 2. A quota log can explain a non-signal failure, but never overrides a
+    # dispatcher-owned termination or a non-allowlisted crash signal.
+    if quota_signal_dict or quota_signal:
+        return ("infra", "quota")
     # 3. Unknown (no reap record - "pid N not alive"): infra only within the
     #    dispatcher's own startup window.
     if exit_kind == "unknown" and within_startup_window:
@@ -1339,51 +1344,63 @@ def persist_timeout_kill_intent(
     signal_fn in enforce_max_runtime and _terminate_reclaimed_worker.
     """
     with write_txn(conn, allow_nested=True):
-        conn.execute(
-            "INSERT INTO kanban_timeout_kill_intents(task_id, run_id, worker_pid, signal, created_at) "
-            "VALUES (?, ?, ?, ?, ?)",
-            (task_id, run_id, int(worker_pid), int(signal), int(time.time())),
-        )
-
-
-def consume_timeout_kill_intent(conn: sqlite3.Connection, *, task_id: str, worker_pid: int) -> bool:
-    """Mark the oldest pending timeout-kill intent for (task_id, worker_pid) as consumed.
-
-    Returns True when an intent was found and consumed. Called by final accounting after
-    the worker has been reaped, so the path is always an ordinary counted failure.
-    """
-    with write_txn(conn, allow_nested=True):
+        _clear_expired_timeout_kill_intents(conn)
         cur = conn.execute(
-            "UPDATE kanban_timeout_kill_intents SET consumed_at = ? "
-            "WHERE id = ("
-            "  SELECT id FROM kanban_timeout_kill_intents "
-            "  WHERE task_id = ? AND worker_pid = ? AND consumed_at IS NULL "
-            "  ORDER BY id LIMIT 1"
-            ")",
-            (int(time.time()), task_id, int(worker_pid)),
+            "UPDATE kanban_timeout_kill_intents SET signal = ?, created_at = ? "
+            "WHERE task_id = ? AND run_id IS ? AND worker_pid = ? AND consumed_at IS NULL",
+            (int(signal), int(time.time()), task_id, run_id, int(worker_pid)),
         )
-        return cur.rowcount == 1
+        if cur.rowcount == 0:
+            conn.execute(
+                "INSERT INTO kanban_timeout_kill_intents(task_id, run_id, worker_pid, signal, created_at) "
+                "VALUES (?, ?, ?, ?, ?)",
+                (task_id, run_id, int(worker_pid), int(signal), int(time.time())),
+            )
 
 
-def has_pending_timeout_kill_intent(conn: sqlite3.Connection, *, task_id: str, worker_pid: int) -> bool:
-    """True when there is a pending (unconsumed) timeout-kill intent for this task/pid."""
+_TIMEOUT_KILL_INTENT_TTL_SECONDS = 24 * 60 * 60
+
+
+def _clear_expired_timeout_kill_intents(conn: sqlite3.Connection) -> int:
+    cutoff = int(time.time()) - _TIMEOUT_KILL_INTENT_TTL_SECONDS
+    cur = conn.execute(
+        "DELETE FROM kanban_timeout_kill_intents WHERE created_at < ?", (cutoff,),
+    )
+    return cur.rowcount
+
+
+def consume_timeout_kill_intent(
+    conn: sqlite3.Connection, *, task_id: str, run_id: Optional[int], worker_pid: int,
+) -> bool:
+    """Delete every pending timeout intent for one task/run/pid identity."""
+    with write_txn(conn, allow_nested=True):
+        _clear_expired_timeout_kill_intents(conn)
+        cur = conn.execute(
+            "DELETE FROM kanban_timeout_kill_intents "
+            "WHERE task_id = ? AND run_id IS ? AND worker_pid = ? AND consumed_at IS NULL",
+            (task_id, run_id, int(worker_pid)),
+        )
+        return cur.rowcount > 0
+
+
+def has_pending_timeout_kill_intent(
+    conn: sqlite3.Connection, *, task_id: str, run_id: Optional[int], worker_pid: int,
+) -> bool:
+    """True only for an unexpired intent belonging to this exact task/run/pid."""
+    cutoff = int(time.time()) - _TIMEOUT_KILL_INTENT_TTL_SECONDS
     row = conn.execute(
         "SELECT 1 FROM kanban_timeout_kill_intents "
-        "WHERE task_id = ? AND worker_pid = ? AND consumed_at IS NULL LIMIT 1",
-        (task_id, int(worker_pid)),
+        "WHERE task_id = ? AND run_id IS ? AND worker_pid = ? "
+        "AND consumed_at IS NULL AND created_at >= ? LIMIT 1",
+        (task_id, run_id, int(worker_pid), cutoff),
     ).fetchone()
     return row is not None
 
 
 def clear_consumed_timeout_kill_intents(conn: sqlite3.Connection) -> int:
-    """Clear consumed timeout-kill intents older than 24h. Returns rows deleted."""
+    """Clear stale timeout intents during normal dispatcher operation."""
     with write_txn(conn, allow_nested=True):
-        cutoff = int(time.time()) - 86400
-        cur = conn.execute(
-            "DELETE FROM kanban_timeout_kill_intents WHERE consumed_at IS NOT NULL AND created_at < ?",
-            (cutoff,),
-        )
-        return cur.rowcount
+        return _clear_expired_timeout_kill_intents(conn)
 
 
 # --- Interruption streak persistence ---
@@ -1442,11 +1459,15 @@ def delete_interruption_streak(conn: sqlite3.Connection, *, task_id: str) -> Non
 # raised deep in a call stack that bubbles up as a crash or dead-pid instead
 # of a clean ``sys.exit(75)``.
 _QUOTA_EXIT_LOG_RE = re.compile(r"quota exhausted \(429\)", re.IGNORECASE)
-_QUOTA_RETRY_AFTER_RE = re.compile(r"retry after (\d+)s", re.IGNORECASE)
+_QUOTA_RETRY_AFTER_RE = re.compile(r"retry after ([0-9]+)s\b", re.IGNORECASE)
+
+
+def worker_log_run_marker(run_id: int) -> str:
+    return f"--- hermes-kanban-run:{int(run_id)} ---\n"
 
 
 def _detect_quota_exit_signal(
-    task_id: str, *, board: Optional[str] = None, tail_bytes: int = 8000,
+    task_id: str, *, run_id: Optional[int], board: Optional[str] = None, tail_bytes: int = 8000,
 ) -> Optional[dict]:
     """Scan the worker's final log lines for a provider quota/429 signature.
 
@@ -1459,10 +1480,16 @@ def _detect_quota_exit_signal(
         log_text = read_worker_log(task_id, tail_bytes=tail_bytes, board=board)
     except Exception:
         return None
-    if not log_text or not _QUOTA_EXIT_LOG_RE.search(log_text):
+    if run_id is None or not log_text:
+        return None
+    marker = worker_log_run_marker(run_id)
+    if marker not in log_text:
+        return None
+    log_text = log_text.rsplit(marker, 1)[1]
+    if not _QUOTA_EXIT_LOG_RE.search(log_text):
         return None
     m = _QUOTA_RETRY_AFTER_RE.search(log_text)
-    return {"retry_after_seconds": int(m.group(1)) if m else None}
+    return {"retry_after_seconds": _parse_retry_after(m.group(1)) if m else None}
 
 def _parse_retry_after(text: Optional[str]) -> Optional[int]:
     """Parse a retry-after value: only positive base-10 integer. Returns None for malformed/missing/nonpositive."""
@@ -1471,10 +1498,9 @@ def _parse_retry_after(text: Optional[str]) -> Optional[int]:
     s = str(text).strip()
     if not s:
         return None
-    try:
-        v = int(s)
-    except ValueError:
+    if not re.fullmatch(r"[0-9]+", s):
         return None
+    v = int(s)
     if v <= 0:
         return None
     return v
@@ -1524,6 +1550,10 @@ def register_provider_backoff(
                  task_id = excluded.task_id""",
             (provider, until, task_id, int(time.time())),
         )
+        conn.execute(
+            "INSERT OR IGNORE INTO kanban_provider_backoff_tasks(provider, task_id) VALUES (?, ?)",
+            (provider, task_id),
+        )
     return until
 
 
@@ -1542,12 +1572,16 @@ def release_expired_provider_backoffs(conn: sqlite3.Connection) -> list[str]:
     resumed = []
     with write_txn(conn, allow_nested=True):
         expired = conn.execute(
-            "SELECT provider, until, task_id FROM kanban_provider_backoff WHERE until <= ?",
+            "SELECT provider, until FROM kanban_provider_backoff WHERE until <= ?",
             (now,),
         ).fetchall()
         for row in expired:
-            task_id = row["task_id"]
-            if task_id:
+            task_rows = conn.execute(
+                "SELECT task_id FROM kanban_provider_backoff_tasks WHERE provider = ?",
+                (row["provider"],),
+            ).fetchall()
+            for task_row in task_rows:
+                task_id = task_row["task_id"]
                 cur = conn.execute(
                     "UPDATE tasks SET status='ready' WHERE id=? AND status='scheduled'",
                     (task_id,),
@@ -1559,6 +1593,9 @@ def release_expired_provider_backoffs(conn: sqlite3.Connection) -> list[str]:
                         "resume_at": int(row["until"]),
                     })
                     resumed.append(task_id)
+            conn.execute(
+                "DELETE FROM kanban_provider_backoff_tasks WHERE provider = ?", (row["provider"],),
+            )
         conn.execute("DELETE FROM kanban_provider_backoff WHERE until <= ?", (now,))
     return resumed
 

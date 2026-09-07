@@ -518,7 +518,9 @@ def enforce_max_runtime(conn: sqlite3.Connection, *, signal_fn=None) -> list[str
                 # account) itself, so the intent can be consumed immediately;
                 # it only needs to survive when a DIFFERENT process reaps the
                 # worker later (handled by _classify_dead_worker instead).
-                _kb.consume_timeout_kill_intent(conn, task_id=tid, worker_pid=pid)
+                _kb.consume_timeout_kill_intent(
+                    conn, task_id=tid, run_id=row["current_run_id"], worker_pid=pid,
+                )
                 payload = {
                     "pid": pid,
                     "elapsed_seconds": int(elapsed),
@@ -856,17 +858,20 @@ def _classify_dead_worker(
     # predecessor that died between signal and reap) sent this SIGTERM/SIGKILL
     # itself via enforce_max_runtime — that always remains a legit, counted
     # failure regardless of which process ends up reaping the worker.
+    run_id = _kb._current_run_id(conn, task_id)
     dispatcher_killed = (
         kind == "signaled"
-        and _kb.has_pending_timeout_kill_intent(conn, task_id=task_id, worker_pid=pid)
+        and _kb.has_pending_timeout_kill_intent(
+            conn, task_id=task_id, run_id=run_id, worker_pid=pid,
+        )
     )
     if dispatcher_killed:
-        _kb.consume_timeout_kill_intent(conn, task_id=task_id, worker_pid=pid)
+        _kb.consume_timeout_kill_intent(conn, task_id=task_id, run_id=run_id, worker_pid=pid)
     # Provider quota/429 signature in the worker's final log lines — checked
     # for every non-signaled/non-unknown death too (nonzero_exit is the
     # common case: an AuthError/RateLimitError bubbling up as a plain
     # nonzero exit code instead of the dedicated EX_TEMPFAIL sentinel).
-    quota_signal_dict = _kb._detect_quota_exit_signal(task_id, board=board)
+    quota_signal_dict = _kb._detect_quota_exit_signal(task_id, run_id=run_id, board=board)
     # Infra classification: for signaled / nonzero_exit / unknown, consult
     # classify_infra_exit. When infra, the death does NOT count against the
     # failure budget — it is tracked in the interruption streak instead.
@@ -2049,6 +2054,7 @@ def _dispatch_once_locked(
     # external cron: this makes restart recovery deterministic and emits one
     # ``unblocked`` event via release_expired_provider_backoffs().
     _kb.release_expired_provider_backoffs(conn)
+    _kb.clear_consumed_timeout_kill_intents(conn)
     _run_reclaim_phase(
         conn, result, stale_timeout_seconds=stale_timeout_seconds,
         failure_limit=failure_limit, reconcile_orphans=reconcile_orphans,
@@ -2414,7 +2420,11 @@ def _open_worker_log(task: Task, board: Optional[str]):
     log_path = log_dir / f"{task.id}.log"
     rotate_bytes, backup_count = worker_log_rotation_config()
     _rotate_worker_log(log_path, rotate_bytes, backup_count)
-    return open(log_path, "ab")
+    log_f = open(log_path, "ab")
+    if task.current_run_id is not None:
+        log_f.write(_kb.worker_log_run_marker(task.current_run_id).encode("utf-8"))
+        log_f.flush()
+    return log_f
 
 
 def _restart_safe_worker_argv(task: Task, command: list[str]) -> list[str]:

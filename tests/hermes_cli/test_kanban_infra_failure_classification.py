@@ -67,6 +67,14 @@ def _make_running_task(conn, *, title: str, pid: int, host=None):
     return tid
 
 
+def _write_worker_run_log(task_id: str, run_id: int, text: str) -> None:
+    log_path = kb.worker_log_path(task_id)
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+    with log_path.open("a", encoding="utf-8") as log_f:
+        log_f.write(kb.worker_log_run_marker(run_id))
+        log_f.write(text)
+
+
 # ---------------------------------------------------------------------------
 # 1. Pure classifier — signal allowlist
 # ---------------------------------------------------------------------------
@@ -105,14 +113,19 @@ def test_classify_infra_exit_dispatcher_owned_sigterm_is_legit():
     assert (category, reason) == ("legit", "dispatcher_kill")
 
 
-def test_classify_infra_exit_quota_dict_wins_regardless_of_exit_kind():
-    """A quota/429 log signature is infra no matter how the process exited."""
-    for exit_kind in ("nonzero_exit", "signaled", "unknown", "clean_exit"):
+def test_classify_infra_exit_quota_dict_never_overrides_signal_classification():
+    """Quota context may not rewrite a signal's ownership/allowlist result."""
+    for exit_kind in ("nonzero_exit", "unknown", "clean_exit"):
         category, reason = kb.classify_infra_exit(
             exit_kind=exit_kind, quota_signal_dict={"retry_after_seconds": 30},
         )
         assert category == "infra", exit_kind
         assert reason == "quota"
+    category, reason = kb.classify_infra_exit(
+        exit_kind="signaled", signal_number=int(signal.SIGTERM),
+        quota_signal_dict={"retry_after_seconds": 30},
+    )
+    assert (category, reason) == ("infra", "external_signal")
 
 
 def test_classify_infra_exit_dead_pid_within_startup_window_is_infra():
@@ -235,6 +248,7 @@ def test_dispatcher_owned_max_runtime_kill_persists_durable_intent_and_still_cou
         kb.claim_task(conn, tid)
         pid = 90001
         conn.execute("UPDATE tasks SET worker_pid=? WHERE id=?", (pid, tid))
+        run_id = kb._current_run_id(conn, tid)
         old_started = int(time.time()) - 30
         with kb.write_txn(conn):
             conn.execute("UPDATE tasks SET started_at = ? WHERE id = ?", (old_started, tid))
@@ -250,7 +264,7 @@ def test_dispatcher_owned_max_runtime_kill_persists_durable_intent_and_still_cou
 
         # The intent was persisted BEFORE the signal and consumed by this
         # same tick's final accounting — nothing pending afterwards.
-        assert kb.has_pending_timeout_kill_intent(conn, task_id=tid, worker_pid=pid) is False
+        assert kb.has_pending_timeout_kill_intent(conn, task_id=tid, run_id=run_id, worker_pid=pid) is False
 
         task = kb.get_task(conn, tid)
         assert task.status == "ready"
@@ -283,7 +297,7 @@ def test_timeout_kill_intent_survives_restart_between_signal_and_reap(kanban_hom
         kb.persist_timeout_kill_intent(
             conn, task_id=tid, run_id=run_id, worker_pid=pid, signal=int(signal.SIGTERM),
         )
-        assert kb.has_pending_timeout_kill_intent(conn, task_id=tid, worker_pid=pid) is True
+        assert kb.has_pending_timeout_kill_intent(conn, task_id=tid, run_id=run_id, worker_pid=pid) is True
 
         # Simulate a dispatcher restart: wipe the in-memory kill-intent dict
         # (this is what actually resets on process restart) while the durable
@@ -309,7 +323,7 @@ def test_timeout_kill_intent_survives_restart_between_signal_and_reap(kanban_hom
         assert not any(e.kind == "interrupted" for e in events)
 
         # The intent is now consumed.
-        assert kb.has_pending_timeout_kill_intent(conn, task_id=tid, worker_pid=pid) is False
+        assert kb.has_pending_timeout_kill_intent(conn, task_id=tid, run_id=run_id, worker_pid=pid) is False
 
 
 def test_dead_pid_within_startup_window_is_infra(kanban_home, monkeypatch):
@@ -373,14 +387,11 @@ def test_quota_log_signature_detected_from_worker_log_is_infra(kanban_home, monk
     with kb.connect() as conn:
         pid = 80004
         tid = _make_running_task(conn, title="quota-log", pid=pid)
+        run_id = kb._current_run_id(conn, tid)
         kbd._record_worker_exit(pid, _exited_status(1))
-
-        log_path = kb.worker_log_path(tid)
-        log_path.parent.mkdir(parents=True, exist_ok=True)
-        log_path.write_text(
+        _write_worker_run_log(tid, run_id,
             "Codex provider quota exhausted (429); retry after 5841s. "
             "Credentials are still valid.\nGoodbye!\n",
-            encoding="utf-8",
         )
 
         crashed = kb.detect_crashed_workers(conn)
@@ -471,13 +482,10 @@ def test_quota_death_with_provider_parks_as_scheduled_and_registers_backoff(
         tid = kb.create_task(conn, title="quota-parked", assignee="a", model_override="claude-x", provider_override="anthropic")
         kb.claim_task(conn, tid, claimer=f"{host}:w1")
         conn.execute("UPDATE tasks SET worker_pid=? WHERE id=?", (pid, tid))
+        run_id = kb._current_run_id(conn, tid)
         conn.commit()
         kbd._record_worker_exit(pid, _exited_status(1))
-        log_path = kb.worker_log_path(tid)
-        log_path.parent.mkdir(parents=True, exist_ok=True)
-        log_path.write_text(
-            "quota exhausted (429); retry after 120s.\n", encoding="utf-8",
-        )
+        _write_worker_run_log(tid, run_id, "quota exhausted (429); retry after 120s.\n")
 
         crashed = kb.detect_crashed_workers(conn)
         assert tid not in crashed
@@ -509,12 +517,11 @@ def test_quota_death_without_usable_retry_after_does_not_park_falls_to_interrupt
         tid = kb.create_task(conn, title="quota-no-retry-after", assignee="a", model_override="claude-x", provider_override="anthropic")
         kb.claim_task(conn, tid, claimer=f"{host}:w1")
         conn.execute("UPDATE tasks SET worker_pid=? WHERE id=?", (pid, tid))
+        run_id = kb._current_run_id(conn, tid)
         conn.commit()
         kbd._record_worker_exit(pid, _exited_status(1))
-        log_path = kb.worker_log_path(tid)
-        log_path.parent.mkdir(parents=True, exist_ok=True)
         # Quota signature present but NO parseable "retry after Ns".
-        log_path.write_text("quota exhausted (429).\n", encoding="utf-8")
+        _write_worker_run_log(tid, run_id, "quota exhausted (429).\n")
 
         crashed = kb.detect_crashed_workers(conn)
         assert tid not in crashed
@@ -698,11 +705,10 @@ def test_provider_backoff_false_avoids_provider_parking(kanban_home, monkeypatch
         tid = kb.create_task(conn, title="quota-no-parking", assignee="a", model_override="claude-x", provider_override="anthropic")
         kb.claim_task(conn, tid, claimer=f"{host}:w1")
         conn.execute("UPDATE tasks SET worker_pid=? WHERE id=?", (pid, tid))
+        run_id = kb._current_run_id(conn, tid)
         conn.commit()
         kbd._record_worker_exit(pid, _exited_status(1))
-        log_path = kb.worker_log_path(tid)
-        log_path.parent.mkdir(parents=True, exist_ok=True)
-        log_path.write_text("quota exhausted (429); retry after 120s.\n", encoding="utf-8")
+        _write_worker_run_log(tid, run_id, "quota exhausted (429); retry after 120s.\n")
 
         crashed = kb.detect_crashed_workers(conn)
         assert tid not in crashed
@@ -770,3 +776,97 @@ def test_ordinary_nonzero_exit_still_counts_as_failure(kanban_home, monkeypatch)
         events = kb.list_events(conn, tid)
         assert any(e.kind == "crashed" for e in events)
         assert not any(e.kind == "interrupted" for e in events)
+
+
+def test_dispatcher_timeout_beats_quota_signature_in_its_worker_log(kanban_home, monkeypatch):
+    monkeypatch.setattr(kbd, "_pid_alive", lambda _pid: False)
+    monkeypatch.setenv("HERMES_KANBAN_CRASH_GRACE_SECONDS", "0")
+    with kb.connect() as conn:
+        pid = 90100
+        tid = _make_running_task(conn, title="timeout after recovered 429", pid=pid)
+        run_id = kb._current_run_id(conn, tid)
+        _write_worker_run_log(tid, run_id, "quota exhausted (429); retry after 30s.\n")
+        kb.persist_timeout_kill_intent(conn, task_id=tid, run_id=run_id, worker_pid=pid, signal=int(signal.SIGTERM))
+        kbd._kb._DISPATCHER_KILL_INTENTS.clear()
+        kbd._record_worker_exit(pid, _signaled_status(int(signal.SIGTERM)))
+        assert tid in kb.detect_crashed_workers(conn)
+        assert kb.get_task(conn, tid).consecutive_failures == 1
+
+
+def test_prior_run_quota_log_cannot_neutralize_later_ordinary_crash(kanban_home, monkeypatch):
+    monkeypatch.setattr(kbd, "_pid_alive", lambda _pid: False)
+    monkeypatch.setenv("HERMES_KANBAN_CRASH_GRACE_SECONDS", "0")
+    with kb.connect() as conn:
+        pid = 90101
+        tid = _make_running_task(conn, title="stale quota", pid=pid)
+        first_run = kb._current_run_id(conn, tid)
+        _write_worker_run_log(tid, first_run, "quota exhausted (429); retry after 30s.\n")
+        conn.execute(
+            "UPDATE tasks SET status='ready', current_run_id=NULL, worker_pid=NULL, "
+            "claim_lock=NULL, claim_expires=NULL WHERE id=?", (tid,),
+        )
+        conn.commit()
+        kb.claim_task(conn, tid)
+        pid = 90111
+        conn.execute("UPDATE tasks SET worker_pid=? WHERE id=?", (pid, tid))
+        conn.commit()
+        kbd._record_worker_exit(pid, _exited_status(1))
+        assert tid in kb.detect_crashed_workers(conn)
+        assert kb.get_task(conn, tid).consecutive_failures == 1
+
+
+def test_escalated_timeout_intents_are_fully_consumed_and_cannot_poison_reused_pid(kanban_home, monkeypatch):
+    monkeypatch.setattr(kbd, "_pid_alive", lambda _pid: False)
+    monkeypatch.setenv("HERMES_KANBAN_CRASH_GRACE_SECONDS", "0")
+    with kb.connect() as conn:
+        pid = 90102
+        tid = _make_running_task(conn, title="escalation", pid=pid)
+        first_run = kb._current_run_id(conn, tid)
+        for sent_signal in (signal.SIGTERM, signal.SIGKILL):
+            kb.persist_timeout_kill_intent(conn, task_id=tid, run_id=first_run, worker_pid=pid, signal=int(sent_signal))
+        assert conn.execute(
+            "SELECT COUNT(*) FROM kanban_timeout_kill_intents WHERE task_id=? AND run_id IS ? AND worker_pid=?",
+            (tid, first_run, pid),
+        ).fetchone()[0] == 1
+        assert kb.consume_timeout_kill_intent(conn, task_id=tid, run_id=first_run, worker_pid=pid)
+        assert not kb.has_pending_timeout_kill_intent(conn, task_id=tid, run_id=first_run, worker_pid=pid)
+
+        conn.execute(
+            "UPDATE tasks SET status='ready', current_run_id=NULL, worker_pid=NULL, "
+            "claim_lock=NULL, claim_expires=NULL WHERE id=?", (tid,),
+        )
+        conn.commit()
+        kb.claim_task(conn, tid)
+        conn.execute("UPDATE tasks SET worker_pid=? WHERE id=?", (pid, tid))
+        conn.commit()
+        kbd._record_worker_exit(pid, _signaled_status(int(signal.SIGTERM)))
+        crashed = kb.detect_crashed_workers(conn)
+        assert tid not in crashed
+        assert tid in getattr(kb.detect_crashed_workers, "_last_interrupted", [])
+
+
+def test_expired_provider_backoff_resumes_all_parked_tasks_for_provider(kanban_home):
+    with kb.connect() as conn:
+        first = kb.create_task(conn, title="first", assignee="a", model_override="gpt-5", provider_override="openai")
+        second = kb.create_task(conn, title="second", assignee="a", model_override="gpt-5", provider_override="openai")
+        other = kb.create_task(conn, title="other", assignee="a", model_override="claude", provider_override="anthropic")
+        auto = kb.create_task(conn, title="auto", assignee="a")
+        for task_id in (first, second, other, auto):
+            conn.execute("UPDATE tasks SET status='scheduled' WHERE id=?", (task_id,))
+        kb.register_provider_backoff(conn, provider="openai", retry_after=30, task_id=first, max_seconds=60)
+        kb.register_provider_backoff(conn, provider="openai", retry_after=30, task_id=second, max_seconds=60)
+        conn.execute("UPDATE kanban_provider_backoff SET until=0 WHERE provider='openai'")
+        conn.commit()
+        assert set(kb.release_expired_provider_backoffs(conn)) == {first, second}
+        assert kb.get_task(conn, first).status == kb.get_task(conn, second).status == "ready"
+        assert kb.get_task(conn, other).status == kb.get_task(conn, auto).status == "scheduled"
+
+
+@pytest.mark.parametrize("value", ["١٢", "1_2", "0", "-1", "+1", "12.0"])
+def test_live_retry_after_parser_rejects_nonpositive_and_non_ascii_values(kanban_home, value):
+    with kb.connect() as conn:
+        tid = kb.create_task(conn, title="parser", assignee="a")
+        kb.claim_task(conn, tid)
+        run_id = kb._current_run_id(conn, tid)
+        _write_worker_run_log(tid, run_id, f"quota exhausted (429); retry after {value}s.\n")
+        assert kb._detect_quota_exit_signal(tid, run_id=run_id) == {"retry_after_seconds": None}
