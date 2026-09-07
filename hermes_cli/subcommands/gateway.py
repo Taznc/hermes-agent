@@ -357,7 +357,7 @@ def build_gateway_parser(
         "--auth-token-file",
         default=None,
         help=(
-            "File containing the client bearer token. Required for Codex; "
+            "File containing the client bearer token. Required for Claude Code and Codex; "
             "must be a regular owner-only file (mode 0600 on POSIX)."
         ),
     )

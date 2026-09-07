@@ -240,6 +240,7 @@ from aiohttp import web  # noqa: E402
 from yarl import URL  # noqa: E402
 
 from hermes_cli.proxy.server import (  # noqa: E402
+    _handle_claude_chat,
     _open_upstream_request,
     _stream_upstream_response,
     create_app,
@@ -313,6 +314,12 @@ class FakeAdapter(UpstreamAdapter):
             base_url=self._base_url,
             expires_at="2099-01-01T00:00:00Z",
         )
+
+
+class ClaudeFakeAdapter(FakeAdapter):
+    @property
+    def transforms_openai_chat(self):
+        return True
 
 
 async def _start_runner(app: "web.Application"):
@@ -450,6 +457,58 @@ def test_cancelled_upstream_request_closes_new_client_session():
     session.close.assert_awaited_once_with()
 
 
+def test_cancelled_claude_upstream_request_closes_new_client_session():
+    session = SimpleNamespace(
+        post=AsyncMock(side_effect=asyncio.CancelledError()),
+        close=AsyncMock(),
+    )
+    request = cast(web.Request, SimpleNamespace())
+    credential = UpstreamCredential(
+        bearer="test-bearer",
+        base_url="https://api.anthropic.com/v1",
+    )
+
+    with patch(
+        "hermes_cli.proxy.server.aiohttp.ClientSession",
+        return_value=session,
+    ):
+        with pytest.raises(asyncio.CancelledError):
+            asyncio.run(
+                _handle_claude_chat(
+                    request,
+                    credential,
+                    b'{"model":"claude-sonnet-4-6","messages":[{"role":"user","content":"ping"}]}',
+                )
+            )
+    session.close.assert_awaited_once_with()
+
+
+def test_unexpected_claude_upstream_error_closes_new_client_session():
+    session = SimpleNamespace(
+        post=AsyncMock(side_effect=RuntimeError("unexpected upstream failure")),
+        close=AsyncMock(),
+    )
+    request = cast(web.Request, SimpleNamespace())
+    credential = UpstreamCredential(
+        bearer="test-bearer",
+        base_url="https://api.anthropic.com/v1",
+    )
+
+    with patch(
+        "hermes_cli.proxy.server.aiohttp.ClientSession",
+        return_value=session,
+    ):
+        with pytest.raises(RuntimeError, match="unexpected upstream failure"):
+            asyncio.run(
+                _handle_claude_chat(
+                    request,
+                    credential,
+                    b'{"model":"claude-sonnet-4-6","messages":[{"role":"user","content":"ping"}]}',
+                )
+            )
+    session.close.assert_awaited_once_with()
+
+
 def test_prepare_failure_releases_upstream_response_and_session():
     upstream = MagicMock()
     upstream.status = 200
@@ -464,6 +523,40 @@ def test_prepare_failure_releases_upstream_response_and_session():
     ):
         with pytest.raises(ConnectionResetError, match="downstream gone"):
             asyncio.run(_stream_upstream_response(request, upstream, session))
+
+    upstream.release.assert_called_once_with()
+    session.close.assert_awaited_once_with()
+
+
+def test_claude_prepare_failure_releases_upstream_response_and_session():
+    upstream = MagicMock()
+    upstream.status = 200
+    session = SimpleNamespace(
+        post=AsyncMock(return_value=upstream),
+        close=AsyncMock(),
+    )
+    request = cast(web.Request, SimpleNamespace())
+    credential = UpstreamCredential(
+        bearer="test-bearer",
+        base_url="https://api.anthropic.com/v1",
+    )
+
+    with patch(
+        "hermes_cli.proxy.server.aiohttp.ClientSession",
+        return_value=session,
+    ), patch.object(
+        web.StreamResponse,
+        "prepare",
+        new=AsyncMock(side_effect=ConnectionResetError("downstream gone")),
+    ):
+        with pytest.raises(ConnectionResetError, match="downstream gone"):
+            asyncio.run(
+                _handle_claude_chat(
+                    request,
+                    credential,
+                    b'{"model":"claude-sonnet-4-6","messages":[{"role":"user","content":"ping"}],"stream":true}',
+                )
+            )
 
     upstream.release.assert_called_once_with()
     session.close.assert_awaited_once_with()
@@ -489,6 +582,110 @@ def test_server_strips_client_auth_header():
                     await resp.read()
             assert captured["requests"][0]["auth"] == "Bearer ours"
             assert "SHOULD_NOT_LEAK" not in captured["requests"][0]["auth"]
+        finally:
+            await proxy_runner.cleanup()
+            await upstream_runner.cleanup()
+
+    asyncio.run(run())
+
+
+def test_claude_proxy_translates_chat_and_attaches_oauth_identity():
+    async def run():
+        captured: Dict[str, Any] = {}
+
+        async def messages(request):
+            captured["headers"] = dict(request.headers)
+            captured["body"] = await request.json()
+            return web.json_response({
+                "model": "claude-sonnet-4-6",
+                "stop_reason": "end_turn",
+                "content": [{"type": "text", "text": "proxy-ok"}],
+                "usage": {"input_tokens": 3, "output_tokens": 2},
+            })
+
+        upstream = web.Application()
+        upstream.router.add_post("/v1/messages", messages)
+        upstream_runner, upstream_base = await _start_runner(upstream)
+        adapter = ClaudeFakeAdapter(
+            f"{upstream_base}/v1", allowed=["/chat/completions"]
+        )
+        proxy_runner, proxy_base = await _start_runner(create_app(adapter))
+        try:
+            async with aiohttp.ClientSession() as session:
+                async with session.post(
+                    f"{proxy_base}/v1/chat/completions",
+                    json={
+                        "model": "claude-sonnet-4-6",
+                        "messages": [{"role": "user", "content": "ping"}],
+                    },
+                ) as response:
+                    body = await response.json()
+                    assert response.status == 200
+            assert body["choices"][0]["message"]["content"] == "proxy-ok"
+            assert captured["body"]["model"] == "claude-sonnet-4-6"
+            headers = {key.lower(): value for key, value in captured["headers"].items()}
+            assert headers["authorization"] == "Bearer test-bearer"
+            assert headers["anthropic-version"] == "2023-06-01"
+            assert headers["user-agent"].startswith("claude-code/")
+            assert headers["x-app"] == "cli"
+        finally:
+            await proxy_runner.cleanup()
+            await upstream_runner.cleanup()
+
+    asyncio.run(run())
+
+
+def test_claude_proxy_streams_multiple_tool_calls_with_distinct_indices():
+    """The upstream stream is one stateful sequence, even when read line-by-line."""
+    async def run():
+        async def messages(request):
+            await request.read()
+            response = web.StreamResponse(
+                status=200,
+                headers={"Content-Type": "text/event-stream"},
+            )
+            await response.prepare(request)
+            for event in (
+                b'{"type":"content_block_start","content_block":{"type":"tool_use","id":"toolu_1","name":"first"}}',
+                b'{"type":"content_block_delta","delta":{"type":"input_json_delta","partial_json":"{\\"first\\":1}"}}',
+                b'{"type":"content_block_start","content_block":{"type":"tool_use","id":"toolu_2","name":"second"}}',
+                b'{"type":"content_block_delta","delta":{"type":"input_json_delta","partial_json":"{\\"second\\":2}"}}',
+                b'{"type":"message_delta","delta":{"stop_reason":"tool_use"}}',
+            ):
+                await response.write(b"data: " + event + b"\n")
+            await response.write_eof()
+            return response
+
+        upstream = web.Application()
+        upstream.router.add_post("/v1/messages", messages)
+        upstream_runner, upstream_base = await _start_runner(upstream)
+        adapter = ClaudeFakeAdapter(
+            f"{upstream_base}/v1", allowed=["/chat/completions"]
+        )
+        proxy_runner, proxy_base = await _start_runner(create_app(adapter))
+        try:
+            async with aiohttp.ClientSession() as session:
+                async with session.post(
+                    f"{proxy_base}/v1/chat/completions",
+                    json={
+                        "model": "claude-sonnet-4-6",
+                        "messages": [{"role": "user", "content": "use both tools"}],
+                        "stream": True,
+                    },
+                ) as response:
+                    assert response.status == 200
+                    raw = await response.read()
+            chunks = [
+                json.loads(line[5:])
+                for line in raw.splitlines()
+                if line.startswith(b"data: {")
+            ]
+            tool_indices = [
+                call["index"]
+                for chunk in chunks
+                for call in chunk["choices"][0]["delta"].get("tool_calls", [])
+            ]
+            assert tool_indices == [0, 0, 1, 1]
         finally:
             await proxy_runner.cleanup()
             await upstream_runner.cleanup()

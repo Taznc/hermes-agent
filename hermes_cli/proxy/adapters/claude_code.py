@@ -17,7 +17,7 @@ from agent.anthropic_credentials import (
 )
 from hermes_cli.proxy.adapters.base import UpstreamAdapter, UpstreamCredential
 
-_ALLOWED_PATHS: FrozenSet[str] = frozenset({"/chat/completions", "/models"})
+_ALLOWED_PATHS: FrozenSet[str] = frozenset({"/chat/completions"})
 
 
 class ClaudeCodeAdapter(UpstreamAdapter):
@@ -32,6 +32,14 @@ class ClaudeCodeAdapter(UpstreamAdapter):
     @property
     def display_name(self) -> str:
         return "Claude Code subscription"
+
+    @property
+    def loopback_only(self) -> bool:
+        return True
+
+    @property
+    def requires_client_auth(self) -> bool:
+        return True
 
     @property
     def allowed_paths(self) -> FrozenSet[str]:

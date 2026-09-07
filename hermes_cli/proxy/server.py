@@ -163,12 +163,16 @@ async def _open_upstream_request(
 
 async def _handle_claude_chat(request: "web.Request", cred: UpstreamCredential, body: bytes) -> "web.StreamResponse":
     """Run the non-passthrough Claude Code wire bridge without logging its body."""
-    from hermes_cli.proxy.claude_translate import prepare_chat_request, response_to_openai, stream_events
+    from hermes_cli.proxy.claude_translate import (
+        ClaudeStreamTranslator,
+        prepare_chat_request,
+        response_to_openai,
+    )
     try:
         payload = json.loads(body)
         if not isinstance(payload, dict):
             raise ValueError("request body must be a JSON object")
-        headers, outbound = prepare_chat_request(payload)
+        headers, outbound, tool_name_map = prepare_chat_request(payload)
     except (UnicodeDecodeError, ValueError, json.JSONDecodeError) as exc:
         return _json_error(400, f"Invalid OpenAI chat completion request: {exc}", code="invalid_request_error")
     headers["Authorization"] = f"{cred.token_type} {cred.bearer}"
@@ -176,34 +180,41 @@ async def _handle_claude_chat(request: "web.Request", cred: UpstreamCredential, 
     session = aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=None, sock_connect=15, sock_read=300))
     try:
         upstream = await session.post(f"{cred.base_url.rstrip('/')}/messages", data=outbound, headers=headers)
+    except asyncio.CancelledError:
+        await session.close()
+        raise
     except (aiohttp.ClientError, asyncio.TimeoutError) as exc:
         await session.close()
         return _json_error(502, f"upstream connection failed: {exc}", code="upstream_unreachable")
+    except Exception:
+        await session.close()
+        raise
     if not payload.get("stream"):
         try:
             raw = await upstream.json(content_type=None)
             if upstream.status >= 400:
                 return web.json_response(raw, status=upstream.status)
-            return web.json_response(response_to_openai(raw), status=upstream.status)
+            return web.json_response(response_to_openai(raw, tool_name_map=tool_name_map), status=upstream.status)
         finally:
             upstream.release()
             await session.close()
     response = web.StreamResponse(status=upstream.status, headers={"Content-Type": "text/event-stream", "Cache-Control": "no-cache"})
-    await response.prepare(request)
     try:
+        await response.prepare(request)
         if upstream.status >= 400:
             await response.write(b"data: " + await upstream.read() + b"\n\n")
         else:
             model = str(payload.get("model") or "claude")
+            translator = ClaudeStreamTranslator(model, tool_name_map=tool_name_map)
             async for line in upstream.content:
-                for frame in stream_events([line], model, final=False):
+                for frame in translator.translate(line):
                     await response.write(frame)
             await response.write(b"data: [DONE]\n\n")
+        await response.write_eof()
+        return response
     finally:
         upstream.release()
         await session.close()
-    await response.write_eof()
-    return response
 
 
 async def _stream_upstream_response(
@@ -289,7 +300,7 @@ def create_app(
         return web.json_response({
             "status": "ok",
             "upstream": adapter.display_name,
-            "authenticated": adapter.is_authenticated(),
+            "authenticated": await asyncio.to_thread(adapter.is_authenticated),
         })
 
     async def handle_proxy(request: "web.Request") -> "web.StreamResponse":
@@ -310,7 +321,7 @@ def create_app(
             )
 
         try:
-            cred = adapter.get_credential()
+            cred = await asyncio.to_thread(adapter.get_credential)
         except Exception as exc:
             logger.warning("proxy: credential resolution failed: %s", exc)
             return _json_error(401, str(exc), code="upstream_auth_failed")
@@ -399,7 +410,8 @@ def create_app(
 
         if upstream_resp.status in {401, 429}:
             try:
-                retry_cred = adapter.get_retry_credential(
+                retry_cred = await asyncio.to_thread(
+                    adapter.get_retry_credential,
                     failed_credential=cred,
                     status_code=upstream_resp.status,
                 )

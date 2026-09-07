@@ -18,7 +18,7 @@ This is different from the [API server](./api-server.md):
 |---|---|---|
 | What it serves | Your agent (full toolset, memory, skills) | Raw model inference |
 | Use case | "Use Hermes as a chat backend" | "Use my Portal sub from another app" |
-| Auth | Your `API_SERVER_KEY` | Provider-specific; Codex requires an owner-only client bearer |
+| Auth | Your `API_SERVER_KEY` | Provider-specific; Claude Code and Codex require an owner-only client bearer |
 | Tool calls | Yes — the agent runs tools | No — passthrough only |
 
 Use the API server when you want the **agent** as a backend. Use the
@@ -209,12 +209,15 @@ OpenAI-compatible client.
 
 ## Configuring Hindsight through a private tunnel
 
-Keep the proxy loopback-bound on the dev VM; do not copy `auth.json`, Claude
-Code credentials, or any subscription token into the Hindsight container or
-`docker-host`. Start it with:
+Keep the proxy loopback-bound on the dev VM; do not copy `auth.json` or Claude
+Code credentials into the Hindsight container or `docker-host`. Create an
+owner-only client bearer, then start it with:
 
 ```bash
-hermes proxy start --provider claude-code --host 127.0.0.1 --port 8645
+umask 077
+python3 -c 'import secrets; print(secrets.token_urlsafe(32))' > ~/.hermes/claude-code-proxy.token
+hermes proxy start --provider claude-code --host 127.0.0.1 --port 8645 \
+  --auth-token-file ~/.hermes/claude-code-proxy.token
 ```
 
 From `docker-host`, create an authenticated private tunnel to the dev VM (for
@@ -225,15 +228,16 @@ key:
 ```yaml
 provider: openai
 base_url: http://127.0.0.1:8645/v1
-api_key: proxy-client-placeholder
+api_key: <contents of ~/.hermes/claude-code-proxy.token>
 model: claude-sonnet-4-6
 ```
 
-The placeholder is only required by OpenAI-compatible clients; the proxy
-ignores it and resolves the Claude Code subscription locally. Do not bind the
-proxy to `0.0.0.0` for this deployment. Verify a non-streaming, streaming, and
-tool-call completion through the proxy before applying this configuration to a
-running Hindsight deployment.
+The bearer is required by the proxy and must be delivered to Hindsight through
+its normal secret mechanism, not source-controlled configuration. The proxy
+resolves the Claude Code subscription locally. Do not bind the proxy to
+`0.0.0.0` for this deployment. Verify a non-streaming, streaming, and tool-call
+completion through the proxy before applying this configuration to a running
+Hindsight deployment.
 
 ## Exposing on LAN
 
@@ -249,10 +253,10 @@ subscription. The proxy has no auth of its own — it accepts any bearer.
 Use a firewall, VPN, or reverse proxy with proper auth if you expose
 this beyond your trusted network.
 
-The `openai-codex` adapter is stricter: it rejects every non-loopback bind,
-including `0.0.0.0`, and requires an owner-only client bearer even on loopback.
-Loopback alone is not an identity boundary on a multi-user host. Codex must
-remain on `127.0.0.1`, `::1`, or `localhost`.
+The `claude-code` and `openai-codex` adapters are stricter: they reject every
+non-loopback bind, including `0.0.0.0`, and require an owner-only client bearer
+even on loopback. Loopback alone is not an identity boundary on a multi-user
+host. They must remain on `127.0.0.1`, `::1`, or `localhost`.
 
 ## Rate limits
 

@@ -69,6 +69,26 @@ def test_codex_loopback_host_validation_and_cli_rejection(capsys):
     assert "loopback-only" in capsys.readouterr().err
 
 
+def test_codex_cli_rejects_unsafe_startup_before_reading_subscription_state(capsys):
+    """A rejected launch must not touch the Codex OAuth credential pool."""
+    adapter = OpenAICodexAdapter()
+    auth_check = MagicMock(return_value=True)
+    with patch("hermes_cli.proxy.cli.get_adapter", return_value=adapter), patch.object(
+        adapter, "is_authenticated", auth_check
+    ):
+        assert cmd_proxy_start(
+            SimpleNamespace(
+                provider="codex",
+                host="127.0.0.1",
+                port=8645,
+                auth_token_file=None,
+            )
+        ) == 2
+
+    auth_check.assert_not_called()
+    assert "--auth-token-file" in capsys.readouterr().err
+
+
 def test_codex_cli_requires_owner_only_client_auth_file(tmp_path, capsys):
     adapter = OpenAICodexAdapter()
     args = SimpleNamespace(

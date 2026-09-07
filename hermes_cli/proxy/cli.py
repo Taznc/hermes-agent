@@ -176,14 +176,6 @@ def cmd_proxy_start(args: Any) -> int:
         print(f"Error: {exc}", file=sys.stderr)
         return 2
 
-    if not adapter.is_authenticated():
-        auth_hint = getattr(adapter, "auth_hint", f"hermes auth add {adapter.name}")
-        print(
-            f"Not logged into {adapter.display_name}. Run `{auth_hint}` first.",
-            file=sys.stderr,
-        )
-        return 2
-
     host = getattr(args, "host", None) or DEFAULT_HOST
     port = getattr(args, "port", None) or DEFAULT_PORT
     if adapter.loopback_only and not is_loopback_host(host):
@@ -209,6 +201,14 @@ def cmd_proxy_start(args: Any) -> int:
         except (OSError, UnicodeError, ValueError) as exc:
             print(f"Error: {exc}", file=sys.stderr)
             return 2
+
+    if not adapter.is_authenticated():
+        auth_hint = getattr(adapter, "auth_hint", f"hermes auth add {adapter.name}")
+        print(
+            f"Not logged into {adapter.display_name}. Run `{auth_hint}` first.",
+            file=sys.stderr,
+        )
+        return 2
 
     client_auth_message = (
         "  Client auth:    required (bearer from owner-only token file)\n"
