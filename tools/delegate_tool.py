@@ -530,18 +530,21 @@ def _build_top_level_description() -> str:
 
 
 def _build_dispatch_mode_paragraph() -> str:
-    """How this call actually returns — a session that cannot receive a detached completion
-    (one-shot Kanban worker, stateless HTTP request, cron job) runs the batch INLINE, so
-    telling such a caller "dispatch returns immediately, do not wait" is simply false and
-    makes it plan around a handle it will never get. Session-stable, so the schema stays
-    byte-stable for the life of a conversation."""
+    """How this call actually returns, from the SAME decision the dispatcher makes
+    (``delegate_tool_dispatch.effective_dispatch_mode``). A session that cannot receive a
+    detached completion AND has no session id to wake — a one-shot Kanban worker, a
+    session-id-less HTTP request, a cron job, an orchestrator subagent — runs the batch
+    INLINE, so telling such a caller "dispatch returns immediately, do not wait" is simply
+    false and makes it plan around a handle it will never get. Session-scoped, so the schema
+    stays byte-stable for the life of a conversation; ``model_tools._tool_defs_cache_key``
+    carries the mode so a cached schema cannot leak across sessions in one process."""
     try:
-        from gateway.session_context import async_delivery_supported
+        from tools.delegate_tool_dispatch import DISPATCH_MODE_BLOCKING, effective_dispatch_mode
 
-        detached = async_delivery_supported()
+        blocking = effective_dispatch_mode() == DISPATCH_MODE_BLOCKING
     except Exception:
-        detached = True
-    if detached:
+        blocking = False
+    if not blocking:
         return (
             "Runs in the background: dispatch returns immediately with live transcript paths, and the completed "
             "result (one consolidated message, results in task order) re-enters the conversation on its own. Do NOT "
