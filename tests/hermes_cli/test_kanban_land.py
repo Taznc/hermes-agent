@@ -60,6 +60,10 @@ class Repo:
         self.clone = root / "clone"
         git(root.parent if root.exists() else root, "init", "--bare", "-b", "dev", str(self.remote))
         git(root, "clone", str(self.remote), str(self.clone))
+        # Repo-local identity: the production code path merges with the
+        # operator's own git identity, and a worktree inherits repo config.
+        git(self.clone, "config", "user.name", "T")
+        git(self.clone, "config", "user.email", "t@example.invalid")
         write(self.clone / "README.md", "base\n")
         git(self.clone, "add", "-A")
         git(self.clone, "commit", "-m", "base")
@@ -290,3 +294,201 @@ def test_source_state_refuses_a_live_worker(kanban_home, repo):
         with pytest.raises(kl.LandRefusal) as exc:
             kl.source_state(conn, task_id, remote="origin")
     assert exc.value.reason == "live_worker"
+
+
+# ---------------------------------------------------------------------------
+# Verification contract — fails closed when missing or stale
+# ---------------------------------------------------------------------------
+
+
+def test_verification_runs_the_board_configured_command_in_the_worktree(kanban_home, repo):
+    kb.write_board_metadata(None, land_verify="test -f README.md")
+    with kbc.connect() as conn:
+        task_id, path = make_approved_task(conn, repo)
+        source = kl.source_state(conn, task_id, remote="origin")
+        receipt = kl.verify(conn, task_id, source, board=None)
+    assert receipt["kind"] == "command"
+    assert receipt["ok"] is True
+    assert receipt["command"] == "test -f README.md"
+
+
+def test_verification_fails_closed_when_the_configured_command_fails(kanban_home, repo):
+    kb.write_board_metadata(None, land_verify="exit 3")
+    with kbc.connect() as conn:
+        task_id, path = make_approved_task(conn, repo)
+        source = kl.source_state(conn, task_id, remote="origin")
+        with pytest.raises(kl.LandRefusal) as exc:
+            kl.verify(conn, task_id, source, board=None)
+    assert exc.value.reason == "verification_failed"
+
+
+def test_verification_falls_back_to_the_receipt_on_the_approval_run(kanban_home, repo):
+    with kbc.connect() as conn:
+        task_id, path = make_approved_task(conn, repo)
+        source = kl.source_state(conn, task_id, remote="origin")
+        receipt = kl.verify(conn, task_id, source, board=None)
+    assert receipt["kind"] == "receipt"
+    assert receipt["sha"] == source.sha
+
+
+def test_verification_refuses_when_no_receipt_and_no_command_exist(kanban_home, repo):
+    """An approval with no verification evidence at all must not land."""
+    with kbc.connect() as conn:
+        task_id, path = make_approved_task(conn, repo)
+        conn.execute(
+            "UPDATE task_runs SET metadata = NULL WHERE task_id = ? AND outcome = 'completed'",
+            (task_id,),
+        )
+        conn.commit()
+        source = kl.source_state(conn, task_id, remote="origin")
+        with pytest.raises(kl.LandRefusal) as exc:
+            kl.verify(conn, task_id, source, board=None)
+    assert exc.value.reason == "verification_missing"
+
+
+def test_verification_refuses_a_receipt_naming_a_different_sha(kanban_home, repo):
+    """A receipt from an earlier commit does not vouch for what would land."""
+    with kbc.connect() as conn:
+        task_id, path = make_approved_task(conn, repo)
+        conn.execute(
+            "UPDATE task_runs SET metadata = ? WHERE task_id = ? AND outcome = 'completed'",
+            (json.dumps({"pre_review_gate": {"pushed": "0" * 40}}), task_id),
+        )
+        conn.commit()
+        source = kl.source_state(conn, task_id, remote="origin")
+        with pytest.raises(kl.LandRefusal) as exc:
+            kl.verify(conn, task_id, source, board=None)
+    assert exc.value.reason == "verification_stale"
+
+
+# ---------------------------------------------------------------------------
+# land_task — the full attended path, against a real bare remote
+# ---------------------------------------------------------------------------
+
+
+def test_dry_run_reports_a_verdict_and_mutates_nothing(kanban_home, repo):
+    with kbc.connect() as conn:
+        task_id, path = make_approved_task(conn, repo)
+        before_target = repo.remote_sha("dev")
+        result = kl.land_task(conn, task_id, target=("origin", "dev"), dry_run=True)
+        status_after = conn.execute(
+            "SELECT status FROM tasks WHERE id = ?", (task_id,)
+        ).fetchone()["status"]
+    assert result["verdict"] == "would_land"
+    assert result["remote"] == "origin" and result["branch"] == "dev"
+    assert result["source_sha"] == repo.remote_sha(f"wt/{task_id}")
+    assert repo.remote_sha("dev") == before_target, "dry run must not move the target"
+    assert status_after == "done", "dry run must not close the card"
+
+
+def test_landing_merges_pushes_and_reads_the_content_back(kanban_home, repo):
+    with kbc.connect() as conn:
+        task_id, path = make_approved_task(conn, repo)
+        result = kl.land_task(conn, task_id, target=("origin", "dev"))
+        task = kb.get_task(conn, task_id)
+    assert result["verdict"] == "landed"
+    assert result["target_sha"] == repo.remote_sha("dev")
+    assert result["pushed"] is True
+    assert result["readback"] == "ancestor"
+    # The reviewed content is genuinely reachable on the remote branch now.
+    git(repo.clone, "fetch", "origin", "dev")
+    files = git(repo.clone, "ls-tree", "--name-only", "origin/dev")
+    assert f"{task_id}.txt" in files.splitlines()
+    assert task.status == "archived"
+
+
+def test_landing_records_a_receipt_comment_on_the_card(kanban_home, repo):
+    with kbc.connect() as conn:
+        task_id, path = make_approved_task(conn, repo)
+        result = kl.land_task(conn, task_id, target=("origin", "dev"))
+        bodies = "\n".join(c.body for c in kb.list_comments(conn, task_id))
+    for expected in (result["source_sha"], result["target_sha"], "origin", "dev"):
+        assert expected in bodies, f"receipt must record {expected!r}"
+
+
+def test_landing_refuses_when_the_target_advanced_with_a_conflict(kanban_home, repo):
+    """Someone else changed the same file on the target between review and land."""
+    with kbc.connect() as conn:
+        task_id, path = make_approved_task(conn, repo)
+        # A conflicting commit lands on the target first.
+        other = repo.clone / ".worktrees" / "other"
+        git(repo.clone, "worktree", "add", "--detach", str(other), "origin/dev")
+        write(other / f"{task_id}.txt", "someone else's version\n")
+        git(other, "add", "-A")
+        git(other, "commit", "-m", "conflicting change")
+        git(other, "push", "origin", "HEAD:refs/heads/dev")
+
+        with pytest.raises(kl.LandRefusal) as exc:
+            kl.land_task(conn, task_id, target=("origin", "dev"))
+    assert exc.value.reason == "merge_conflict"
+
+
+def test_landing_absorbs_a_non_conflicting_target_advance(kanban_home, repo):
+    """A target that moved on unrelated files still lands, via a real merge."""
+    with kbc.connect() as conn:
+        task_id, path = make_approved_task(conn, repo)
+        other = repo.clone / ".worktrees" / "other"
+        git(repo.clone, "worktree", "add", "--detach", str(other), "origin/dev")
+        write(other / "unrelated.txt", "meanwhile\n")
+        git(other, "add", "-A")
+        git(other, "commit", "-m", "unrelated advance")
+        git(other, "push", "origin", "HEAD:refs/heads/dev")
+
+        result = kl.land_task(conn, task_id, target=("origin", "dev"))
+    git(repo.clone, "fetch", "origin", "dev")
+    files = git(repo.clone, "ls-tree", "--name-only", "origin/dev").splitlines()
+    assert result["verdict"] == "landed"
+    assert f"{task_id}.txt" in files and "unrelated.txt" in files
+
+
+def test_landing_is_idempotent_for_already_merged_work(kanban_home, repo):
+    with kbc.connect() as conn:
+        task_id, path = make_approved_task(conn, repo)
+        first = kl.land_task(conn, task_id, target=("origin", "dev"))
+        after_first = repo.remote_sha("dev")
+        second = kl.land_task(conn, task_id, target=("origin", "dev"))
+    assert first["verdict"] == "landed"
+    assert second["verdict"] == "already_landed"
+    assert repo.remote_sha("dev") == after_first, "re-run must not merge twice"
+
+
+def test_landing_recognizes_squash_equivalent_work_as_already_landed(kanban_home, repo):
+    """The content is on the target as a squashed commit, so the branch sha is
+    not an ancestor — patch equivalence must still count as landed."""
+    with kbc.connect() as conn:
+        task_id, path = make_approved_task(conn, repo)
+        other = repo.clone / ".worktrees" / "squash"
+        git(repo.clone, "worktree", "add", "--detach", str(other), "origin/dev")
+        git(other, "merge", "--squash", f"origin/wt/{task_id}")
+        git(other, "commit", "-m", f"squashed {task_id}")
+        git(other, "push", "origin", "HEAD:refs/heads/dev")
+        after_squash = repo.remote_sha("dev")
+
+        result = kl.land_task(conn, task_id, target=("origin", "dev"))
+    assert result["verdict"] == "already_landed"
+    assert result["readback"] == "patch_equivalent"
+    assert repo.remote_sha("dev") == after_squash
+
+
+def test_landing_refuses_when_the_push_is_rejected(kanban_home, repo, monkeypatch):
+    """A protected branch rejecting the push must not close or clean the card."""
+    real_git = kl.git
+
+    def fake_git(cwd, *args, **kw):
+        if args and args[0] == "push":
+            raise kl.GitError("remote rejected: protected branch")
+        return real_git(cwd, *args, **kw)
+
+    with kbc.connect() as conn:
+        task_id, path = make_approved_task(conn, repo)
+        before = repo.remote_sha("dev")
+        monkeypatch.setattr(kl, "git", fake_git)
+        with pytest.raises(kl.LandRefusal) as exc:
+            kl.land_task(conn, task_id, target=("origin", "dev"))
+        monkeypatch.undo()
+        status = conn.execute(
+            "SELECT status FROM tasks WHERE id = ?", (task_id,)
+        ).fetchone()["status"]
+    assert exc.value.reason == "push_rejected"
+    assert repo.remote_sha("dev") == before
+    assert status == "done", "a rejected push must leave the card open"
