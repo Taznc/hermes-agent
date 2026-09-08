@@ -14,11 +14,14 @@ worktree is preserved for a human rather than snapshotted blindly.
 from __future__ import annotations
 
 import contextlib
+import logging
 import os
 import subprocess
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterator, Optional
+
+_log = logging.getLogger(__name__)
 
 _GIT_TIMEOUT = 60
 
@@ -391,3 +394,149 @@ def _preserve_locked(
         ),
         branch=current,
     )
+
+
+# ---------------------------------------------------------------------------
+# Task-level entry point: ownership gating + board record
+# ---------------------------------------------------------------------------
+
+
+def _preservation_config() -> dict:
+    """``kanban.worker_preservation`` from config, or ``{}`` when unreadable.
+
+    Fails OPEN (preservation enabled) on a config error: losing a worker's
+    work because config.yaml was momentarily unparseable is the worse outcome.
+    """
+    try:
+        from hermes_cli.config import load_config
+
+        cfg = load_config()
+        section = (cfg.get("kanban", {}) or {}) if isinstance(cfg, dict) else {}
+        value = section.get("worker_preservation")
+        return value if isinstance(value, dict) else {}
+    except Exception:
+        return {}
+
+
+def _pid_alive(pid: int) -> bool:
+    """Late-bound so the dispatcher owns the one liveness implementation."""
+    from hermes_cli.kanban_db_dispatch import _pid_alive as impl
+
+    return bool(impl(pid))
+
+
+def _ownership_skip(row, expected_run_id: Optional[int]) -> Optional[PreserveResult]:
+    """Fail-closed ownership gate: ``None`` to proceed, else the skip verdict.
+
+    Two independent ways this call can be the wrong one to snapshot:
+
+    * **Stale run.** A reclaim path carrying run N must not commit work the
+      task's CURRENT run N+1 is still producing — that would attribute a live
+      worker's half-finished edits to a dead attempt.
+    * **Live worker.** While the owning PID is alive, only that process may
+      snapshot; anyone else races the worker's own editor and can capture a
+      file mid-write.
+    """
+    if expected_run_id is not None:
+        current = row["current_run_id"]
+        if current is None or int(current) != int(expected_run_id):
+            return PreserveResult(
+                status="skipped", reason="stale_run",
+                detail=f"expected run {expected_run_id}, task is on {current}",
+            )
+    pid = row["worker_pid"]
+    if pid and int(pid) != os.getpid() and _pid_alive(int(pid)):
+        return PreserveResult(
+            status="skipped", reason="worker_alive",
+            detail=f"worker pid {int(pid)} still running",
+        )
+    return None
+
+
+def _record(conn, task_id: str, result: PreserveResult, run_id: Optional[int]) -> None:
+    """Append the board-visible record of one preservation attempt.
+
+    Only outcomes a human may need to act on are recorded: a snapshot that
+    happened (with its SHA and push result) and one that refused unsafe
+    content or failed. Skips and no-ops are the common case and would be pure
+    event-log noise.
+    """
+    from hermes_cli import kanban_db as _kb
+
+    if result.status == "preserved":
+        kind, payload = "work_preserved", {
+            "commit_sha": result.commit_sha,
+            "pushed": result.pushed,
+            "push_error": result.push_error,
+            "branch": result.branch,
+        }
+    elif result.status in {"unsafe", "failed"}:
+        kind, payload = "work_preservation_failed", {
+            "status": result.status,
+            "reason": result.reason,
+            "detail": result.detail,
+            "branch": result.branch,
+        }
+    else:
+        return
+    try:
+        with _kb.write_txn(conn):
+            _kb._append_event(conn, task_id, kind, payload, run_id=run_id)
+    except Exception:
+        _log.warning("kanban: could not record %s for task %s", kind, task_id)
+
+
+def preserve_task_work(
+    conn, task_id: str, *, expected_run_id: Optional[int] = None,
+) -> PreserveResult:
+    """Preserve one task's own worktree, gated on ownership, and record it.
+
+    Safe to call from any lifecycle path and safe to call twice: a second call
+    finds nothing to preserve, and a genuinely concurrent one stands down on
+    the worktree lock. Never raises — a preservation failure must not block the
+    completion/reclaim it is attached to.
+    """
+    try:
+        return _preserve_task_work(conn, task_id, expected_run_id=expected_run_id)
+    except Exception as exc:  # never block a lifecycle transition
+        _log.warning("kanban: preservation errored for task %s: %s", task_id, exc)
+        return PreserveResult(status="failed", reason="preservation_error")
+
+
+def _preserve_task_work(
+    conn, task_id: str, *, expected_run_id: Optional[int],
+) -> PreserveResult:
+    cfg = _preservation_config()
+    if cfg.get("enabled") is False:
+        return PreserveResult(status="skipped", reason="disabled")
+    row = conn.execute(
+        "SELECT workspace_kind, workspace_path, branch_name, worker_pid, current_run_id "
+        "FROM tasks WHERE id = ?", (task_id,),
+    ).fetchone()
+    if row is None:
+        return PreserveResult(status="skipped", reason="task_not_found")
+    if row["workspace_kind"] != "worktree" or not row["workspace_path"]:
+        return PreserveResult(status="skipped", reason="not_a_worktree_workspace")
+    worktree = Path(row["workspace_path"]).expanduser()
+    if not worktree.is_dir():
+        return PreserveResult(status="skipped", reason="workspace_missing")
+    skip = _ownership_skip(row, expected_run_id)
+    if skip is not None:
+        return skip
+
+    branch = (row["branch_name"] or "").strip() or f"wt/{task_id}"
+    result = preserve_worktree(
+        worktree, branch, task_id=task_id,
+        max_file_bytes=_positive_int(cfg.get("max_file_bytes"), DEFAULT_MAX_FILE_BYTES),
+        max_total_bytes=_positive_int(cfg.get("max_total_bytes"), DEFAULT_MAX_TOTAL_BYTES),
+    )
+    _record(conn, task_id, result, row["current_run_id"])
+    return result
+
+
+def _positive_int(value, default: int) -> int:
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError):
+        return default
+    return parsed if parsed > 0 else default
