@@ -1784,6 +1784,3 @@ def test_unarchive_does_not_revive_a_link_the_operator_cut(kanban_home):
         assert _status(conn, child) == "ready"
     finally:
         conn.close()
-
-
-
