@@ -72,19 +72,15 @@ class Repo:
         git(self.clone, "push", "origin", "HEAD:refs/heads/dev")
         git(self.clone, "branch", "--set-upstream-to=origin/dev", "dev")
 
-    def task_worktree(self, task_id: str, *, content: str = "feature\n",
-                      push: bool = True, dirty: bool = False) -> Path:
+    def task_worktree(self, task_id: str, *, content: str = "feature\n") -> Path:
         branch = f"wt/{task_id}"
         path = self.clone / ".worktrees" / task_id
         git(self.clone, "worktree", "add", "-b", branch, str(path), "origin/dev")
         write(path / f"{task_id}.txt", content)
         git(path, "add", "-A")
         git(path, "commit", "-m", f"work for {task_id}")
-        if push:
-            git(path, "push", "origin", f"HEAD:refs/heads/{branch}")
-            git(path, "branch", f"--set-upstream-to=origin/{branch}", branch)
-        if dirty:
-            write(path / "scratch.txt", "uncommitted\n")
+        git(path, "push", "origin", f"HEAD:refs/heads/{branch}")
+        git(path, "branch", f"--set-upstream-to=origin/{branch}", branch)
         return path
 
     def remote_sha(self, branch: str) -> str:
@@ -290,9 +286,19 @@ def test_source_state_uses_the_pushed_branch_and_reports_its_sha(kanban_home, re
 
 
 def test_source_state_refuses_an_unpushed_branch(kanban_home, repo):
-    """Nothing to land: the commit exists only in the local worktree."""
+    """Nothing to land: the endpoint does not publish the branch at all.
+
+    Note this is checked at LAND time, not review time. The worker-preservation
+    net commits and pushes on the review handoff, so a card reaches approval
+    published; a branch can still disappear afterwards (deleted by hand, or a
+    remote that never had it), and landing must catch that rather than assume
+    what was true at review is still true.
+    """
     with kbc.connect() as conn:
-        task_id, path = make_approved_task(conn, repo, push=False)
+        task_id, path = make_approved_task(conn, repo)
+        git(repo.clone, "push", "origin", f":refs/heads/wt/{task_id}")
+        assert repo.remote_sha(f"wt/{task_id}") == ""
+
         with pytest.raises(kl.LandRefusal) as exc:
             kl.source_state(conn, task_id, remote="origin")
     assert exc.value.reason == "branch_unpushed"
@@ -302,8 +308,11 @@ def test_source_state_refuses_a_dirty_surviving_worktree(kanban_home, repo):
     """Uncommitted work in the task worktree means the pushed sha is not the
     whole change — refuse rather than land a partial diff."""
     with kbc.connect() as conn:
-        task_id, path = make_approved_task(conn, repo, dirty=True)
-        assert path.is_dir(), "dirty worktree must survive completion cleanup"
+        task_id, path = make_approved_task(conn, repo)
+        # Approval preserves the tree, so it is still here to be dirtied.
+        assert path.is_dir(), "an approved worktree must survive until landing"
+        write(path / "scratch.txt", "uncommitted\n")
+
         with pytest.raises(kl.LandRefusal) as exc:
             kl.source_state(conn, task_id, remote="origin")
     assert exc.value.reason == "dirty_worktree"
