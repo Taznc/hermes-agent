@@ -437,6 +437,32 @@ describe('Post-drain action queue', () => {
     )
   })
 
+  it('offers every allowlisted restart target, not just the first', async () => {
+    // The catalog carries one row per KIND with all its allowlisted units. A
+    // selector that only ever submitted `targets[0]` would leave every later
+    // unit in the operator's config unreachable from the Desktop.
+    status = {
+      ...status,
+      post_drain_actions: [
+        { action_kind: 'service_restart', targets: ['hermes-gateway.service', 'hermes-webdesktop.service'] },
+        { action_kind: 'reboot', targets: [] }
+      ]
+    }
+    mount()
+
+    await openAfterDrainMenu()
+
+    expect(await screen.findByRole('menuitem', { name: 'actionServiceRestart(hermes-gateway.service)' })).toBeTruthy()
+    fireEvent.click(await screen.findByRole('menuitem', { name: 'actionServiceRestart(hermes-webdesktop.service)' }))
+
+    await waitFor(() =>
+      expect(rest).toHaveBeenCalledWith('/dispatch/post-drain?board=shipping', {
+        body: { action_kind: 'service_restart', expires_in_seconds: null, target: 'hermes-webdesktop.service' },
+        method: 'POST'
+      })
+    )
+  })
+
   it('requires an explicit second step before arming a reboot', async () => {
     mount()
 

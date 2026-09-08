@@ -8,6 +8,7 @@ trigger fires without a browser connected.
 from __future__ import annotations
 
 import os
+import threading
 import time
 from pathlib import Path
 
@@ -322,14 +323,19 @@ def test_concurrent_evaluations_fire_a_queued_action_exactly_once(kanban_home, m
 
 
 def test_a_record_already_firing_is_never_re_claimed(kanban_home, recorder):
-    """The state machine, not thread timing, is what makes firing exactly-once."""
+    """The state machine, not thread timing, is what makes FIRING exactly-once.
+
+    A ``firing`` record is reconciled by a later tick (that is finding #2), but
+    reconciliation is a pure observation: the handler must never run twice.
+    """
     kbd.pause_dispatch(None)
     record = pd.queue_post_drain_action(None, action_kind="reboot")
     pd._write_post_drain_action(None, {**record, "state": pd.FIRING})
 
-    assert pd.evaluate_post_drain_action(None) is None
+    pd.evaluate_post_drain_action(None)
+    pd.evaluate_post_drain_action(None)
+
     assert recorder == []
-    assert pd.read_post_drain_action(None)["state"] == pd.FIRING
 
 
 @pytest.mark.parametrize("state", [pd.SUCCEEDED, pd.FAILED, pd.EXPIRED, pd.CANCELLED])
@@ -485,3 +491,452 @@ def test_a_tick_with_no_queued_action_is_unaffected(kanban_home, recorder):
     assert recorder == []
     assert result.dispatch_paused is not None
     assert pd.read_post_drain_action(None) is None
+
+
+# --- aggregate groups fire once, and only when every member has drained ------
+
+
+@pytest.fixture
+def two_boards(kanban_home):
+    """A second board beside ``default``, both operator-paused."""
+    kb.create_board("other")
+    kbd.pause_dispatch(None)
+    kbd.pause_dispatch("other")
+    return ("default", "other")
+
+
+def _arm_group(boards, group_id="group-1", **kwargs):
+    return [
+        pd.queue_post_drain_action(board, action_kind="reboot", group_id=group_id, **kwargs)
+        for board in boards
+    ]
+
+
+def test_an_aggregate_group_never_fires_while_any_member_board_still_runs(two_boards, recorder):
+    """The host action is one action: one busy board holds back the whole group.
+
+    Evaluating the DRAINED board must not fire, because the reboot it would
+    trigger would SIGKILL the worker still running on the sibling board — the
+    exact damage the drain wait exists to prevent.
+    """
+    _running("other", 1)
+    _arm_group(two_boards)
+
+    assert pd.evaluate_post_drain_action("default") is None
+
+    assert recorder == []
+    assert [pd.read_post_drain_action(board)["state"] for board in two_boards] == [
+        pd.WAITING, pd.WAITING,
+    ]
+
+
+def test_an_aggregate_group_fires_exactly_one_host_action_across_its_boards(two_boards, recorder):
+    """Every member drained: one invocation, and every member settles from it."""
+    _arm_group(two_boards)
+
+    pd.evaluate_post_drain_action("default")
+    pd.evaluate_post_drain_action("other")
+
+    assert recorder == ["reboot:None"]
+    assert [pd.read_post_drain_action(board)["state"] for board in two_boards] == [
+        pd.SUCCEEDED, pd.SUCCEEDED,
+    ]
+
+
+def test_an_aggregate_group_fires_once_when_the_last_board_drains(two_boards, recorder):
+    """The tick that observes the final board draining is the one that fires."""
+    _running("other", 1)
+    _arm_group(two_boards)
+
+    pd.evaluate_post_drain_action("default")
+    assert recorder == []
+
+    with kbc.connect_closing(board="other") as conn:
+        conn.execute("UPDATE tasks SET status='done', claim_lock=NULL, worker_pid=NULL")
+        conn.commit()
+
+    pd.evaluate_post_drain_action("other")
+    pd.evaluate_post_drain_action("default")
+
+    assert recorder == ["reboot:None"]
+
+
+def test_concurrent_board_ticks_fire_an_aggregate_group_exactly_once(two_boards, monkeypatch):
+    """Two boards' ticks racing one group must not each run the host action.
+
+    Deterministic like the single-board race: the winning handler blocks until
+    the losing board's tick has already returned, so "one call" cannot be an
+    artifact of the winner finishing first.
+    """
+    fired: list[str] = []
+    loser_done = threading.Event()
+    fire_entered = threading.Event()
+
+    original = pd.ACTION_HANDLERS["reboot"]
+
+    def slow_fire(record, cfg):
+        fired.append("reboot")
+        fire_entered.set()
+        loser_done.wait(timeout=20)
+
+    monkeypatch.setitem(
+        pd.ACTION_HANDLERS, "reboot",
+        type(original)(
+            kind="reboot", takes_target=False, resolve_target=original.resolve_target,
+            observe_before=lambda record, cfg: {}, fire=slow_fire,
+            observe_after=lambda record, cfg: {"state": pd.SUCCEEDED},
+        ),
+    )
+    _arm_group(two_boards)
+
+    start = threading.Barrier(2)
+    errors: list[BaseException] = []
+    finished = threading.Semaphore(0)
+
+    def tick(board):
+        try:
+            start.wait(timeout=10)
+            pd.evaluate_post_drain_action(board)
+        except BaseException as exc:  # noqa: BLE001 - surfaced by the assert below
+            errors.append(exc)
+        finally:
+            finished.release()
+
+    threads = [threading.Thread(target=tick, args=(board,)) for board in two_boards]
+    for thread in threads:
+        thread.start()
+
+    assert fire_entered.wait(timeout=20), "no board tick ever reached the handler"
+    assert finished.acquire(timeout=20), "the losing board tick never completed"
+    loser_done.set()
+    for thread in threads:
+        thread.join(timeout=30)
+
+    assert errors == []
+    assert fired == ["reboot"]
+
+
+def test_one_expired_member_expires_the_whole_aggregate_group(two_boards, recorder):
+    """A group can only fire as a unit, so one dead leg ends all of them.
+
+    Leaving the siblings ``waiting`` would strand records that can never fire
+    again, and the operator would keep reading "armed" off a dead group.
+    """
+    _arm_group(two_boards, expires_in_seconds=60)
+
+    pd.evaluate_post_drain_action("default", now=int(time.time()) + 61)
+
+    assert recorder == []
+    assert [pd.read_post_drain_action(board)["state"] for board in two_boards] == [
+        pd.EXPIRED, pd.EXPIRED,
+    ]
+
+
+def test_resuming_one_board_disarms_the_whole_aggregate_group(two_boards, recorder):
+    """Resume cancels — and for a host-wide action that means the group, not a leg."""
+    _arm_group(two_boards)
+
+    kbd.resume_dispatch("other")
+    pd.evaluate_post_drain_action("default")
+
+    assert recorder == []
+    assert pd.read_post_drain_action("other")["state"] == pd.CANCELLED
+    assert pd.read_post_drain_action("default")["state"] == pd.CANCELLED
+
+
+# --- a firing record is reconciled later, without re-firing ------------------
+
+
+@pytest.fixture
+def real_reboot_observation(monkeypatch):
+    """The REAL reboot observers, with only the destructive ``fire`` stubbed.
+
+    The generic ``recorder`` fixture replaces ``observe_after`` with an
+    unconditional success, which would make every reconciliation assertion below
+    vacuous — the epoch comparison is exactly the logic under test.
+    """
+    fired: list[str] = []
+    original = pd.ACTION_HANDLERS["reboot"]
+    monkeypatch.setitem(
+        pd.ACTION_HANDLERS, "reboot",
+        type(original)(
+            kind="reboot", takes_target=False, resolve_target=original.resolve_target,
+            observe_before=pd._reboot_observe_before,
+            fire=lambda record, cfg: fired.append("reboot"),
+            observe_after=pd._reboot_observe_after,
+            survives_execution=False,
+        ),
+    )
+    return fired
+
+
+def _firing_record_from_epoch(epoch):
+    kbd.pause_dispatch(None)
+    record = pd.queue_post_drain_action(None, action_kind="reboot")
+    return pd._write_post_drain_action(None, {
+        **record, "state": pd.FIRING, "observed_before": {"epoch": epoch},
+    })
+
+
+def test_a_firing_record_is_settled_by_a_later_tick_once_the_outcome_is_observable(
+    kanban_home, monkeypatch, real_reboot_observation,
+):
+    """The observer can be destroyed by its own action; a later tick settles it.
+
+    A reboot (or a restart of the dispatcher's own gateway) kills the process
+    that issued it, so the ``firing`` record outlives every chance to observe it
+    in-process. Reconciliation is a pure observation: it must settle the record
+    and must never invoke the handler again.
+    """
+    import gateway.drain_control as drain_control
+
+    monkeypatch.setattr(drain_control, "current_instantiation_epoch", lambda: "epoch-2")
+    _firing_record_from_epoch("epoch-1")
+
+    outcome = pd.evaluate_post_drain_action(None)
+
+    assert outcome["state"] == pd.SUCCEEDED
+    assert pd.read_post_drain_action(None)["state"] == pd.SUCCEEDED
+    assert real_reboot_observation == [], "reconciliation must observe, never re-fire"
+
+
+def test_a_firing_record_stays_firing_while_the_outcome_is_still_unobservable(
+    kanban_home, monkeypatch, real_reboot_observation,
+):
+    """No observable verdict yet: settling either way would be a guess."""
+    import gateway.drain_control as drain_control
+
+    monkeypatch.setattr(drain_control, "current_instantiation_epoch", lambda: "epoch-1")
+    _firing_record_from_epoch("epoch-1")
+
+    pd.evaluate_post_drain_action(None)
+
+    assert pd.read_post_drain_action(None)["state"] == pd.FIRING
+    assert real_reboot_observation == []
+
+
+def test_the_dispatcher_tick_reconciles_a_firing_record(
+    kanban_home, monkeypatch, real_reboot_observation,
+):
+    """Reconciliation reaches the record through the ordinary server-side tick."""
+    import gateway.drain_control as drain_control
+
+    monkeypatch.setattr(drain_control, "current_instantiation_epoch", lambda: "epoch-2")
+    _firing_record_from_epoch("epoch-1")
+
+    with kbc.connect_closing(board=None) as conn:
+        kbd.dispatch_once(conn, board=None)
+
+    assert pd.read_post_drain_action(None)["state"] == pd.SUCCEEDED
+    assert real_reboot_observation == []
+
+
+# --- cancel is serialized against the waiting -> firing claim ----------------
+
+
+def _gate_cancel_read(monkeypatch, read_started, release):
+    """Make the cancel path block between its read and its write."""
+    real_read = pd.read_post_drain_action
+
+    def gated(board=None):
+        value = real_read(board)
+        if threading.current_thread().name == "cancel-thread" and not read_started.is_set():
+            read_started.set()
+            release.wait(timeout=20)
+        return value
+
+    monkeypatch.setattr(pd, "read_post_drain_action", gated)
+    return real_read
+
+
+def test_a_cancel_that_reports_success_means_the_action_never_fired(
+    kanban_home, monkeypatch, recorder,
+):
+    """A successful safety cancel is a promise: nothing ran.
+
+    The dangerous interleaving is cancel reading ``waiting``, an evaluation
+    claiming and firing, and the cancel then writing its stale read back as
+    ``cancelled`` — reporting a cancellation of an action that has already
+    rebooted the host.
+    """
+    kbd.pause_dispatch(None)
+    pd.queue_post_drain_action(None, action_kind="reboot")
+
+    read_started = threading.Event()
+    release = threading.Event()
+    real_read = _gate_cancel_read(monkeypatch, read_started, release)
+    result: dict = {}
+
+    thread = threading.Thread(
+        target=lambda: result.update(pd.cancel_post_drain_action(None)), name="cancel-thread",
+    )
+    thread.start()
+    assert read_started.wait(timeout=20)
+
+    outcome = pd.evaluate_post_drain_action(None)
+
+    release.set()
+    thread.join(timeout=20)
+    monkeypatch.setattr(pd, "read_post_drain_action", real_read)
+
+    assert outcome is None, "the claim must not proceed while a cancel holds the board"
+    assert recorder == []
+    assert result["cancelled"] is True
+    assert pd.read_post_drain_action(None)["state"] == pd.CANCELLED
+
+
+def test_a_cancel_arriving_after_the_claim_reports_failure(kanban_home, monkeypatch):
+    """The other side of the race: the action fired, so the cancel says so."""
+    fired: list[str] = []
+    fire_entered = threading.Event()
+    release_fire = threading.Event()
+    original = pd.ACTION_HANDLERS["reboot"]
+
+    def slow_fire(record, cfg):
+        fired.append("reboot")
+        fire_entered.set()
+        release_fire.wait(timeout=20)
+
+    monkeypatch.setitem(
+        pd.ACTION_HANDLERS, "reboot",
+        type(original)(
+            kind="reboot", takes_target=False, resolve_target=original.resolve_target,
+            observe_before=lambda record, cfg: {}, fire=slow_fire,
+            observe_after=lambda record, cfg: {"state": pd.SUCCEEDED},
+        ),
+    )
+    kbd.pause_dispatch(None)
+    pd.queue_post_drain_action(None, action_kind="reboot")
+
+    thread = threading.Thread(target=lambda: pd.evaluate_post_drain_action(None))
+    thread.start()
+    assert fire_entered.wait(timeout=20)
+
+    cancelled = pd.cancel_post_drain_action(None)
+
+    release_fire.set()
+    thread.join(timeout=20)
+
+    assert fired == ["reboot"]
+    assert cancelled["cancelled"] is False
+    assert pd.read_post_drain_action(None)["state"] != pd.CANCELLED
+
+
+# --- service restart success is a strictly newer start, or it is a failure ---
+
+
+@pytest.fixture
+def unit_props(monkeypatch):
+    """Drive ``_unit_properties`` from the test instead of from systemd."""
+
+    def install(**props):
+        monkeypatch.setattr(pd, "_unit_properties", lambda unit, cfg: dict(props))
+
+    return install
+
+
+@pytest.mark.parametrize(
+    "before, after",
+    [
+        pytest.param({}, "100", id="no_baseline_at_all"),
+        pytest.param({"start_monotonic": None}, "100", id="unreadable_baseline"),
+        pytest.param({"start_monotonic": ""}, "100", id="empty_baseline"),
+        pytest.param({"start_monotonic": "200"}, "100", id="start_time_went_backwards"),
+        pytest.param({"start_monotonic": "100"}, "100", id="unit_never_restarted"),
+        pytest.param({"start_monotonic": "100"}, "not-a-number", id="unparseable_after"),
+        pytest.param({"start_monotonic": "100"}, "", id="missing_after"),
+    ],
+)
+def test_a_service_restart_without_a_strictly_newer_start_is_not_a_success(
+    kanban_home, unit_props, before, after,
+):
+    """"It came back active" is not evidence the unit was actually replaced.
+
+    A pre-observation that failed to read (so the baseline is missing) or a
+    start timestamp that did not strictly advance both mean the same thing: the
+    restart cannot be shown to have happened, so it must not be reported done.
+    """
+    unit_props(ActiveState="active", MainPID="222", ExecMainStartTimestampMonotonic=after)
+
+    verdict = pd._service_observe_after(
+        {"target": "svc", "observed_before": before}, pd.PostDrainConfig(),
+    )
+
+    assert verdict["state"] == pd.FAILED
+
+
+def test_a_service_restart_with_a_strictly_newer_start_succeeds(kanban_home, unit_props):
+    unit_props(ActiveState="active", MainPID="222", ExecMainStartTimestampMonotonic="300")
+
+    verdict = pd._service_observe_after(
+        {"target": "svc", "observed_before": {"start_monotonic": "100"}}, pd.PostDrainConfig(),
+    )
+
+    assert verdict["state"] == pd.SUCCEEDED
+
+
+def test_a_unit_that_was_inactive_before_the_restart_can_still_succeed(kanban_home, unit_props):
+    """systemd reports ``0`` for a unit that has never started; that is a real baseline."""
+    unit_props(ActiveState="active", MainPID="222", ExecMainStartTimestampMonotonic="500")
+
+    verdict = pd._service_observe_after(
+        {"target": "svc", "observed_before": {"active_state": "inactive", "start_monotonic": "0"}},
+        pd.PostDrainConfig(),
+    )
+
+    assert verdict["state"] == pd.SUCCEEDED
+
+
+def test_a_unit_that_is_not_active_after_the_restart_is_a_failure(kanban_home, unit_props):
+    unit_props(ActiveState="failed", MainPID="0", ExecMainStartTimestampMonotonic="300")
+
+    verdict = pd._service_observe_after(
+        {"target": "svc", "observed_before": {"start_monotonic": "100"}}, pd.PostDrainConfig(),
+    )
+
+    assert verdict["state"] == pd.FAILED
+
+
+# --- reboot is a host action; the service scope must not leak into it --------
+
+
+class _OkResult:
+    returncode = 0
+    stdout = ""
+    stderr = ""
+
+
+def _record_argv(monkeypatch):
+    seen: list[list[str]] = []
+
+    def fake_run(argv, **kwargs):
+        seen.append(list(argv))
+        return _OkResult()
+
+    monkeypatch.setattr(pd.subprocess, "run", fake_run)
+    return seen
+
+
+def test_reboot_never_inherits_the_user_service_restart_scope(kanban_home, monkeypatch):
+    """``systemctl --user reboot`` is not a host reboot.
+
+    ``service_restart_scope`` declares where the ALLOWLISTED UNIT lives. Reading
+    it in the reboot handler would silently turn a queued host reboot into a
+    command against the user manager, which cannot reboot anything.
+    """
+    argv_seen = _record_argv(monkeypatch)
+
+    pd._reboot_fire({}, pd.PostDrainConfig(service_restart_scope="user"))
+
+    assert argv_seen == [["systemctl", "reboot"]]
+
+
+def test_a_user_scoped_service_restart_still_uses_the_user_manager(kanban_home, monkeypatch):
+    """The scope setting keeps working for the kind that actually declares it."""
+    argv_seen = _record_argv(monkeypatch)
+
+    pd._service_fire(
+        {"target": "hermes-gateway.service"}, pd.PostDrainConfig(service_restart_scope="user"),
+    )
+
+    assert argv_seen == [["systemctl", "--user", "restart", "hermes-gateway.service"]]

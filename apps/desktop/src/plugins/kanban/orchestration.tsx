@@ -73,6 +73,25 @@ function formatRemaining(seconds: number): string {
   return rest === 0 ? `${hours}h` : `${hours}h ${rest}m`
 }
 
+/** One selectable menu entry: a kind plus, for a targeted kind, ONE unit. */
+interface PostDrainChoice {
+  actionKind: string
+  target: null | string
+}
+
+/** Flatten the catalog into the entries the menu actually offers.
+ *
+ * The backend advertises one row per KIND carrying all of its allowlisted
+ * units, so a selector that read `targets[0]` would leave every later unit in
+ * the operator's config unreachable from the Desktop. One entry per target. */
+function postDrainChoices(actions: PostDrainActionOption[]): PostDrainChoice[] {
+  return actions.flatMap<PostDrainChoice>(option =>
+    option.targets.length
+      ? option.targets.map(target => ({ actionKind: option.action_kind, target }))
+      : [{ actionKind: option.action_kind, target: null }]
+  )
+}
+
 /**
  * The "after drain" action queue, inside the dispatch panel.
  *
@@ -97,11 +116,11 @@ function PostDrainControl({
   const k = useKanban()
   // Which action is waiting on confirmation. Purely this panel's interaction
   // state — it must never survive a remount or leak into another surface.
-  const [pendingConfirm, setPendingConfirm] = useState<null | PostDrainActionOption>(null)
+  const [pendingConfirm, setPendingConfirm] = useState<null | PostDrainChoice>(null)
 
   const queue = useMutation({
-    mutationFn: (option: PostDrainActionOption) =>
-      queuePostDrainAction({ actionKind: option.action_kind, target: option.targets[0] ?? null }),
+    mutationFn: (choice: PostDrainChoice) =>
+      queuePostDrainAction({ actionKind: choice.actionKind, target: choice.target }),
     onError: err => host.notify({ kind: 'error', message: errText(err) }),
     onSettled: () => setPendingConfirm(null),
     onSuccess: onChanged
@@ -113,12 +132,13 @@ function PostDrainControl({
     onSuccess: onChanged
   })
 
-  const label = (option: PostDrainActionOption) =>
-    option.action_kind === 'service_restart' ? k.actionServiceRestart(option.targets[0] ?? '') : k.actionReboot
+  const choices = postDrainChoices(actions)
+  const label = (choice: PostDrainChoice) =>
+    choice.actionKind === 'service_restart' ? k.actionServiceRestart(choice.target ?? '') : k.actionReboot
 
   // An older backend omits the catalog entirely; render nothing rather than
   // guessing at kinds it may reject.
-  if (!actions.length && !queued) {
+  if (!choices.length && !queued) {
     return null
   }
 
@@ -172,20 +192,18 @@ function PostDrainControl({
       ) : (
         <DropdownMenu>
           <DropdownMenuTrigger asChild>
-            <Button disabled={busy || queue.isPending || !actions.length} size="xs" variant="outline">
+            <Button disabled={busy || queue.isPending || !choices.length} size="xs" variant="outline">
               <Codicon name="watch" size="0.8rem" />
               {k.queuePostDrain}
             </Button>
           </DropdownMenuTrigger>
           <DropdownMenuContent align="start">
-            {actions.map(option => (
+            {choices.map(choice => (
               <DropdownMenuItem
-                key={`${option.action_kind}:${option.targets[0] ?? ''}`}
-                onSelect={() =>
-                  option.action_kind === 'reboot' ? setPendingConfirm(option) : queue.mutate(option)
-                }
+                key={`${choice.actionKind}:${choice.target ?? ''}`}
+                onSelect={() => (choice.actionKind === 'reboot' ? setPendingConfirm(choice) : queue.mutate(choice))}
               >
-                {label(option)}
+                {label(choice)}
               </DropdownMenuItem>
             ))}
           </DropdownMenuContent>

@@ -138,11 +138,23 @@ class PostDrainAction:
 
 
 def _systemctl_argv(cfg: PostDrainConfig, *args: str) -> list[str]:
+    """Argv for a SERVICE-scoped command.
+
+    ``service_restart_scope`` declares where the allowlisted UNIT lives, so it
+    belongs only to commands about that unit. A host action (reboot) that read
+    it would silently become ``systemctl --user reboot``, which addresses the
+    user manager and cannot reboot anything.
+    """
     argv = ["systemctl"]
     if cfg.service_restart_scope == "user":
         argv.append("--user")
     argv.extend(args)
     return argv
+
+
+def _host_systemctl_argv(*args: str) -> list[str]:
+    """Argv for a command against the HOST, independent of any unit's scope."""
+    return ["systemctl", *args]
 
 
 def _unit_properties(unit: str, cfg: PostDrainConfig) -> dict[str, str]:
@@ -213,12 +225,31 @@ def _service_fire(record: Mapping[str, Any], cfg: PostDrainConfig) -> None:
         )
 
 
-def _service_observe_after(record: Mapping[str, Any], cfg: PostDrainConfig) -> dict[str, Any]:
-    """Success is a live unit whose start timestamp actually advanced.
+def _monotonic_value(raw: Any) -> Optional[int]:
+    """A systemd monotonic timestamp as an int, or None when it is not evidence.
 
-    A ``systemctl restart`` that exits 0 while the unit immediately fails, or one
-    against a unit that was never actually replaced, must not be reported as a
-    completed maintenance action.
+    Absent, empty, and unparseable all collapse to None on purpose: each means
+    the same thing for the question being asked, which is whether the unit can
+    be SHOWN to have restarted. ``0`` is a real value (a unit that had never
+    started), so it must survive this.
+    """
+    if isinstance(raw, bool) or raw is None:
+        return None
+    try:
+        return int(str(raw).strip())
+    except (TypeError, ValueError):
+        return None
+
+
+def _service_observe_after(record: Mapping[str, Any], cfg: PostDrainConfig) -> dict[str, Any]:
+    """Success is a live unit whose start timestamp STRICTLY advanced.
+
+    A ``systemctl restart`` that exits 0 while the unit immediately fails, one
+    against a unit that was never actually replaced, and one whose baseline
+    could not be read at all are all the same verdict: the restart cannot be
+    shown to have happened, so it is not reported as a completed maintenance
+    action. Only ``after > before`` is evidence — a merely DIFFERENT timestamp
+    would also accept a stale or backwards reading.
     """
     before = record.get("observed_before") or {}
     props = _unit_properties(str(record.get("target") or ""), cfg)
@@ -227,18 +258,23 @@ def _service_observe_after(record: Mapping[str, Any], cfg: PostDrainConfig) -> d
         "main_pid": props.get("MainPID"),
         "start_monotonic": props.get("ExecMainStartTimestampMonotonic"),
     }
-    started_before = before.get("start_monotonic")
-    started_after = after.get("start_monotonic")
-    restarted = bool(started_after) and started_after != started_before
+    started_before = _monotonic_value(before.get("start_monotonic"))
+    started_after = _monotonic_value(after.get("start_monotonic"))
+    restarted = (
+        started_before is not None
+        and started_after is not None
+        and started_after > started_before
+    )
     if after.get("active_state") == "active" and restarted:
         return {"state": SUCCEEDED, "observed_after": after}
     return {
         "state": FAILED,
         "observed_after": after,
         "error": (
-            f"unit did not come back active with a new start time "
+            f"unit did not come back active with a strictly newer start time "
             f"(active_state={after.get('active_state')!r}, "
-            f"start_monotonic {started_before!r} -> {started_after!r})"
+            f"start_monotonic {before.get('start_monotonic')!r} -> "
+            f"{after.get('start_monotonic')!r})"
         ),
     }
 
@@ -262,7 +298,8 @@ def _reboot_observe_before(record: Mapping[str, Any], cfg: PostDrainConfig) -> d
 
 
 def _reboot_fire(record: Mapping[str, Any], cfg: PostDrainConfig) -> None:
-    argv = _systemctl_argv(cfg, "reboot")
+    # Host action: deliberately NOT ``_systemctl_argv``. See its docstring.
+    argv = _host_systemctl_argv("reboot")
     result = subprocess.run(argv, capture_output=True, text=True, timeout=300, check=False)
     if result.returncode != 0:
         raise RuntimeError(
@@ -408,10 +445,10 @@ def queue_post_drain_action(
     return _write_post_drain_action(board, record)
 
 
-def cancel_post_drain_action(
-    board: Optional[str] = None, *, reason: str = "cancelled", now: Optional[int] = None,
+def _cancel_locked(
+    board: Optional[str], *, reason: str, now: Optional[int] = None,
 ) -> dict[str, Any]:
-    """Cancel a ``waiting`` action. A firing or already-terminal record is left alone."""
+    """Cancel a ``waiting`` action. Caller MUST already hold the board's tick lock."""
     record = read_post_drain_action(board)
     if record is None or record.get("state") != WAITING:
         return {"cancelled": False, "state": record}
@@ -424,7 +461,122 @@ def cancel_post_drain_action(
     return {"cancelled": True, "state": _write_post_drain_action(board, updated)}
 
 
+def cancel_post_drain_action(
+    board: Optional[str] = None, *, reason: str = "cancelled", now: Optional[int] = None,
+) -> dict[str, Any]:
+    """Cancel a ``waiting`` action. A firing or already-terminal record is left alone.
+
+    Serialized against the ``waiting -> firing`` claim on the board's dispatch
+    tick lock. Without that, a cancel could read ``waiting``, an evaluation
+    could claim and fire in the gap, and the cancel would then write its stale
+    read back as ``cancelled`` — reporting a cancellation of an action that had
+    already rebooted the host. Reporting ``cancelled: True`` has to mean nothing
+    ran, or it is worse than not offering cancel at all.
+
+    A contended cancel refuses rather than guessing, in the same shape
+    :func:`pause_dispatch` and :func:`resume_dispatch` already use.
+    """
+    from hermes_cli import kanban_db_connect as _kbc
+
+    db_path = _kb.kanban_db_path(board=board)
+    with _kbc._dispatch_tick_lock(db_path) as held:
+        if not held:
+            return {
+                "cancelled": False,
+                "state": read_post_drain_action(board),
+                "reason": "dispatch_in_progress",
+            }
+        return _cancel_locked(board, reason=reason, now=now)
+
+
 # --- firing on observed drain ----------------------------------------------
+
+
+def _group_members(
+    board: Optional[str], record: Mapping[str, Any],
+) -> list[tuple[Optional[str], dict[str, Any]]]:
+    """Every board armed by the same aggregate request, this one included.
+
+    Membership is by ``group_id`` in ANY state, not only the waiting ones.
+    Filtering to waiting members would let a group "fire" on the survivors after
+    a sibling was cancelled or expired — the same early-fire bug in a different
+    dress, since a host reboot fired for two boards is not made safe by one of
+    them having dropped out.
+    """
+    group_id = record.get("group_id")
+    members: list[tuple[Optional[str], dict[str, Any]]] = [(board, dict(record))]
+    if not group_id:
+        return members
+    try:
+        own_path = post_drain_path(board)
+        slugs = sorted(meta["slug"] for meta in _kb.list_boards(include_archived=False))
+    except Exception:
+        return members
+    for slug in slugs:
+        try:
+            if post_drain_path(slug) == own_path:
+                continue
+        except Exception:
+            continue
+        sibling = read_post_drain_action(slug)
+        if sibling is not None and sibling.get("group_id") == group_id:
+            members.append((slug, sibling))
+    return members
+
+
+@contextlib.contextmanager
+def _group_locks(members: list[tuple[Optional[str], dict[str, Any]]]):
+    """Hold the host reservation plus EVERY member board's dispatch tick lock.
+
+    Two separate guarantees, both required:
+
+    * the host lock makes the ACTION exactly-once — a reboot is one machine
+      event no matter how many boards armed it, so two boards' ticks racing the
+      same group must not each invoke the handler;
+    * each board lock makes that board's ``waiting -> firing`` transition
+      atomic against its own dispatcher tick and against a concurrent cancel.
+
+    Non-blocking throughout (the loser skips and retries next tick, exactly like
+    :func:`dispatch_once`), and acquired in sorted-path order so two evaluations
+    can never hold complementary halves of one group.
+    """
+    from hermes_cli import kanban_db_connect as _kbc
+
+    with contextlib.ExitStack() as stack:
+        if not stack.enter_context(_kbc._host_dispatch_cap_lock()):
+            yield False
+            return
+        try:
+            paths = sorted(
+                (str(post_drain_path(slug)), slug) for slug, _ in members
+            )
+        except Exception:
+            yield False
+            return
+        for _, slug in paths:
+            db_path = _kb.kanban_db_path(board=slug)
+            if not stack.enter_context(_kbc._dispatch_tick_lock(db_path)):
+                yield False
+                return
+        yield True
+
+
+def _settle_members(
+    members: list[tuple[Optional[str], dict[str, Any]]],
+    verdict: Mapping[str, Any],
+    *,
+    now: int,
+    only_waiting: bool = False,
+) -> dict[Optional[str], dict[str, Any]]:
+    """Write one outcome across the group, so the record set never disagrees."""
+    written: dict[Optional[str], dict[str, Any]] = {}
+    for slug, member in members:
+        if only_waiting and member.get("state") != WAITING:
+            continue
+        written[slug] = _write_post_drain_action(
+            slug, {**member, **verdict, "resolved_at": now},
+        )
+    return written
 
 
 def _board_is_operator_drained(board: Optional[str]) -> bool:
@@ -454,82 +606,177 @@ def _board_is_operator_drained(board: Optional[str]) -> bool:
                 conn.close()
 
 
-def _claim_for_firing(board: Optional[str], now: int) -> Optional[dict[str, Any]]:
-    """Transition ``waiting -> firing`` atomically, or return None.
+def _claim_group_for_firing(
+    board: Optional[str], record: Mapping[str, Any], now: int,
+) -> dict[str, Any]:
+    """Decide the whole group's next state atomically.
 
-    The exactly-once guarantee lives here. The read, the drain check and the
-    write all happen under the board's dispatch tick lock, which is the same
-    non-blocking single-writer guard :func:`dispatch_once` already serializes
-    ticks on — so a second tick racing this one either loses the lock outright
-    or observes the record already in ``firing`` and declines.
+    Returns ``{"fire": members}`` when every member was moved to ``firing``,
+    ``{"settled": record}`` when the group reached a terminal state instead, or
+    ``{}`` when there was nothing to do yet.
     """
-    from hermes_cli import kanban_db as _kbmod
-    from hermes_cli import kanban_db_connect as _kbc
+    with _group_locks(_group_members(board, record)) as held:
+        if not held:
+            return {}
+        # Re-read under the locks: the pre-lock snapshot may be stale, and a
+        # cancel or a sibling tick could have moved any member since.
+        fresh = read_post_drain_action(board)
+        if fresh is None or fresh.get("state") != WAITING:
+            return {}
+        members = _group_members(board, fresh)
 
-    db_path = _kbmod.kanban_db_path(board=board)
-    with _kbc._dispatch_tick_lock(db_path) as held:
+        # Expiry first, and for ANY member: a group can only fire as a unit, so
+        # one dead leg means the rest can never fire either. Leaving them
+        # ``waiting`` would strand records the operator still reads as armed.
+        expired = [
+            slug for slug, member in members
+            if isinstance(member.get("expires_at"), int) and now >= member["expires_at"]
+        ]
+        if expired:
+            written = _settle_members(
+                members,
+                {
+                    "state": EXPIRED,
+                    "resolution": "expired before the board drained",
+                },
+                now=now, only_waiting=True,
+            )
+            return {"settled": written.get(board)}
+
+        # A member that already left ``waiting`` (cancelled by a resume, failed,
+        # or settled) disarms the rest. For a host-wide action that is the safe
+        # direction: resuming ONE board of an armed group must not still reboot
+        # the machine out from under it.
+        settled_elsewhere = [
+            slug for slug, member in members if member.get("state") != WAITING
+        ]
+        if settled_elsewhere:
+            written = _settle_members(
+                members,
+                {
+                    "state": CANCELLED,
+                    "resolution": (
+                        "another board in this group is no longer waiting: "
+                        + ", ".join(str(slug) for slug in settled_elsewhere)
+                    ),
+                },
+                now=now, only_waiting=True,
+            )
+            return {"settled": written.get(board)}
+
+        # EVERY member must have drained. Firing while a sibling board still has
+        # a live worker is the exact damage the drain wait exists to prevent.
+        if not all(_board_is_operator_drained(slug) for slug, _ in members):
+            return {}
+
+        fired = [
+            (slug, _write_post_drain_action(slug, {**member, "state": FIRING, "fired_at": now}))
+            for slug, member in members
+        ]
+        return {"fire": fired}
+
+
+def _reconcile_firing(
+    board: Optional[str], record: Mapping[str, Any], now: int,
+) -> Optional[dict[str, Any]]:
+    """Settle a ``firing`` record from a later observation, without re-firing.
+
+    The action can destroy the process that issued it: a reboot always does, and
+    a ``service_restart`` of the dispatcher's own gateway does too. The record
+    therefore routinely outlives every chance to observe it in-process, and
+    without this it would sit in ``firing`` forever. This path only OBSERVES —
+    the handler is never invoked again, so running it on every tick is safe.
+    """
+    handler = ACTION_HANDLERS.get(str(record.get("action_kind")))
+    if handler is None:
+        return None
+    cfg = resolve_post_drain_config()
+    try:
+        verdict = handler.observe_after(record, cfg) or {}
+    except Exception as exc:
+        verdict = {"state": FAILED, "error": f"post-fire observation failed: {str(exc)[:400]}"}
+    if not verdict.get("state"):
+        # Still unobservable (same machine instantiation, unit not back yet).
+        # Settling either way here would be a guess.
+        return None
+    with _group_locks(_group_members(board, record)) as held:
         if not held:
             return None
-        record = read_post_drain_action(board)
-        if record is None or record.get("state") != WAITING:
+        fresh = read_post_drain_action(board)
+        if fresh is None or fresh.get("state") != FIRING:
             return None
-        expires_at = record.get("expires_at")
-        if isinstance(expires_at, int) and now >= expires_at:
-            return _write_post_drain_action(board, {
-                **record, "state": EXPIRED, "resolved_at": now,
-                "resolution": "expired before the board drained",
-            })
-        if not _board_is_operator_drained(board):
-            return None
-        return _write_post_drain_action(board, {
-            **record, "state": FIRING, "fired_at": now,
-        })
+        members = [
+            (slug, member) for slug, member in _group_members(board, fresh)
+            if member.get("state") == FIRING
+        ]
+        written = _settle_members(members, verdict, now=now)
+        return written.get(board)
 
 
 def evaluate_post_drain_action(
     board: Optional[str] = None, *, now: Optional[int] = None,
 ) -> Optional[dict[str, Any]]:
-    """Fire this board's queued action if the board has drained; else expire or wait.
+    """Advance this board's queued action: fire it, expire it, or settle it.
 
     Returns the record it transitioned, or None when there was nothing to do.
     Called from the dispatcher tick, so the trigger is entirely server-side: no
     browser, no dashboard poll, and no wall-clock scheduler is involved.
     """
     current = int(now if now is not None else time.time())
-    record = _claim_for_firing(board, current)
-    if record is None or record.get("state") != FIRING:
-        return record
+    record = read_post_drain_action(board)
+    if record is None:
+        return None
+    state = record.get("state")
+    if state == FIRING:
+        return _reconcile_firing(board, record, current)
+    if state != WAITING:
+        return None
 
-    handler = ACTION_HANDLERS[record["action_kind"]]
+    outcome = _claim_group_for_firing(board, record, current)
+    if "settled" in outcome:
+        return outcome["settled"]
+    members = outcome.get("fire")
+    if not members:
+        return None
+
+    own = next((member for slug, member in members if slug == board), members[0][1])
+    handler = ACTION_HANDLERS[own["action_kind"]]
     cfg = resolve_post_drain_config()
 
     # Observe-then-act: the pre-conditions are persisted BEFORE the side effect,
     # so a crash mid-action still leaves enough evidence to resolve the record.
     try:
-        record = _write_post_drain_action(board, {
-            **record, "observed_before": handler.observe_before(record, cfg),
-        })
+        observed = handler.observe_before(own, cfg)
     except Exception as exc:
-        return _write_post_drain_action(board, {
-            **record, "state": FAILED, "resolved_at": current,
-            "error": f"pre-fire observation failed: {str(exc)[:400]}",
-        })
+        written = _settle_members(
+            members,
+            {"state": FAILED, "error": f"pre-fire observation failed: {str(exc)[:400]}"},
+            now=current,
+        )
+        return written.get(board)
+    members = [
+        (slug, _write_post_drain_action(slug, {**member, "observed_before": observed}))
+        for slug, member in members
+    ]
+    own = next((member for slug, member in members if slug == board), members[0][1])
+
+    # ONE invocation for the whole group: the action is host-wide, so a group of
+    # three boards is still a single reboot.
+    try:
+        handler.fire(own, cfg)
+    except Exception as exc:
+        written = _settle_members(
+            members, {"state": FAILED, "error": str(exc)[:400]}, now=current,
+        )
+        return written.get(board)
 
     try:
-        handler.fire(record, cfg)
-    except Exception as exc:
-        return _write_post_drain_action(board, {
-            **record, "state": FAILED, "resolved_at": current, "error": str(exc)[:400],
-        })
-
-    try:
-        verdict = handler.observe_after(record, cfg) or {}
+        verdict = handler.observe_after(own, cfg) or {}
     except Exception as exc:
         verdict = {"state": FAILED, "error": f"post-fire observation failed: {str(exc)[:400]}"}
     if not verdict.get("state"):
         # No observable verdict yet (a reboot cannot watch its own success).
-        # The record stays ``firing``: claiming success here would be a guess.
-        return record
-    return _write_post_drain_action(board, {
-        **record, **verdict, "resolved_at": current,
-    })
+        # The records stay ``firing``; a later tick reconciles them.
+        return own
+    written = _settle_members(members, verdict, now=current)
+    return written.get(board, own)

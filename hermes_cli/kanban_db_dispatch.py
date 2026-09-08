@@ -2574,9 +2574,13 @@ def resume_dispatch(board: Optional[str] = None) -> dict[str, Any]:
         # action queued to fire when this board drained is no longer wanted.
         # Cancelled under the same board lock that clears the pause: resuming
         # and leaving a reboot armed would be the worst possible split outcome.
+        # ``_cancel_locked`` is the lock-HELD variant — the public
+        # ``cancel_post_drain_action`` would try to re-acquire the tick lock we
+        # are already holding, see the non-blocking guard decline against our
+        # own hold, and silently leave the action armed.
         try:
-            from hermes_cli.kanban_db_dispatch_postdrain import cancel_post_drain_action
-            cancel_post_drain_action(board, reason="dispatch resumed")
+            from hermes_cli.kanban_db_dispatch_postdrain import _cancel_locked
+            _cancel_locked(board, reason="dispatch resumed")
         except Exception:
             _kb._log.warning(
                 "kanban dispatch for board %s: could not cancel the queued post-drain action",
