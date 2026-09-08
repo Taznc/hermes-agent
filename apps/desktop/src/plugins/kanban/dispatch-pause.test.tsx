@@ -43,6 +43,8 @@ interface StatusPayload {
   all_paused?: boolean
   board_count?: number
   paused_count?: number
+  post_drain?: null | Record<string, unknown>
+  post_drain_actions?: Array<{ action_kind: string; targets: string[] }>
 }
 
 let disposeApi: () => void
@@ -583,9 +585,9 @@ describe('Post-drain action queue', () => {
     await screen.findByRole('button', { name: 'cancelPostDrain()' })
 
     const queueReads = rest.mock.calls.filter(
-      ([path, options]: [string, { method?: string } | undefined]) =>
-        path.startsWith('/dispatch/post-drain') && (options?.method ?? 'GET') === 'GET'
+      call => String(call[0]).startsWith('/dispatch/post-drain') && (call[1]?.method ?? 'GET') === 'GET'
     )
+
     expect(queueReads).toEqual([])
   })
 })
