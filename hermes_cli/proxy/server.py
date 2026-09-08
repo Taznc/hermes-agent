@@ -191,10 +191,39 @@ async def _handle_claude_chat(request: "web.Request", cred: UpstreamCredential, 
         raise
     if not payload.get("stream"):
         try:
-            raw = await upstream.json(content_type=None)
+            body_bytes = await upstream.read()
+            try:
+                raw = json.loads(body_bytes)
+            except (UnicodeDecodeError, json.JSONDecodeError):
+                raw = None
             if upstream.status >= 400:
+                # A genuine refusal keeps its status; an undecodable error body
+                # still reaches the client as JSON rather than aiohttp's 500.
+                if raw is None:
+                    return _json_error(
+                        upstream.status,
+                        "upstream returned a non-JSON error response",
+                        code="upstream_error",
+                    )
                 return web.json_response(raw, status=upstream.status)
-            return web.json_response(response_to_openai(raw, tool_name_map=tool_name_map), status=upstream.status)
+            if not isinstance(raw, dict):
+                # HTTP 200 that is not an Anthropic message object cannot be
+                # translated; surfacing it as success hands the client prose it
+                # will fail to parse with no indication the upstream misbehaved.
+                return _json_error(
+                    502,
+                    "upstream returned a success status with an unusable body",
+                    code="upstream_invalid_response",
+                )
+            try:
+                translated = response_to_openai(raw, tool_name_map=tool_name_map)
+            except ValueError:
+                return _json_error(
+                    502,
+                    "upstream returned a success status with an unusable body",
+                    code="upstream_invalid_response",
+                )
+            return web.json_response(translated, status=upstream.status)
         finally:
             upstream.release()
             await session.close()
