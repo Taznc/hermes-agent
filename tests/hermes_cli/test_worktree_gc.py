@@ -10,6 +10,7 @@ the entire value of these tests is exercising actual git verdicts):
 - patch-equivalent commits (rebase/squash-merge leak) → reap
 - live-locked tree                 → keep
 - kanban t_<hex> tree              → keep (owned by kanban gc)
+- kanban t_<hex> tree, include_kanban=True → real git verdict (the kanban gc's own opt-in)
 - branch GC: merged branch deleted, unique-commit branch kept,
   checked-out branch kept, protected names kept
 - reclaim operates ONLY on the frozen audit list (concurrent-session trap)
@@ -138,6 +139,99 @@ class TestAuditVerdicts:
         record = _verdict(records, "t_deadbeef")
         assert record.verdict == "keep"
         assert "kanban" in record.reason
+
+
+class TestKanbanOptIn:
+    """``include_kanban=True`` decides whether kanban trees are EVALUATED; it must not
+    change any verdict's meaning, and it must stay off for every attended caller."""
+
+    def test_opt_in_gives_real_verdict_for_clean_kanban_tree(self, repo):
+        _add_worktree(repo, "t_deadbeef", branch="kanban/t_deadbeef")
+        deferred = _verdict(
+            worktree_gc.audit_worktrees(str(repo), with_sizes=False), "t_deadbeef")
+        opted_in = _verdict(
+            worktree_gc.audit_worktrees(
+                str(repo), with_sizes=False, include_kanban=True), "t_deadbeef")
+        assert deferred.verdict == "keep" and "kanban" in deferred.reason
+        assert opted_in.verdict == "reap"
+        assert opted_in.reason == "clean and fully merged/pushed"
+
+    def test_opt_in_still_protects_a_kanban_tree_with_real_work(self, repo):
+        """The opt-in evaluates; it does not weaken. A dirty kanban tree is kept for the
+        same reason any other dirty tree is."""
+        tree, _ = _add_worktree(repo, "t_beefcafe", branch="kanban/t_beefcafe")
+        (tree / "README.md").write_text("edited by a running card\n")
+        record = _verdict(
+            worktree_gc.audit_worktrees(
+                str(repo), with_sizes=False, include_kanban=True), "t_beefcafe")
+        assert record.verdict == "keep"
+        assert "tracked" in record.reason
+
+    def test_opt_in_leaves_non_kanban_verdicts_alone(self, repo):
+        """Every other tree classifies identically with and without the opt-in."""
+        _add_worktree(repo, "hermes-clean")
+        dirty, _ = _add_worktree(repo, "hermes-dirty")
+        (dirty / "README.md").write_text("edited\n")
+
+        def _summary(**kwargs):
+            return {
+                r.name: (r.verdict, r.reason)
+                for r in worktree_gc.audit_worktrees(str(repo), with_sizes=False, **kwargs)
+                if not r.name.startswith("t_")
+            }
+
+        assert _summary() == _summary(include_kanban=True)
+
+    def test_reclaim_honors_opt_in_verdicts_for_kanban_trees(self, repo):
+        """``reclaim_worktrees`` acts on the verdicts of the list it is handed and has no
+        name-based rule of its own — the kanban owner's audit is authoritative."""
+        tree, branch = _add_worktree(repo, "t_deadbeef", branch="kanban/t_deadbeef")
+        records = worktree_gc.audit_worktrees(
+            str(repo), with_sizes=False, include_kanban=True)
+        actions = worktree_gc.reclaim_worktrees(str(repo), records=records)
+        assert any("removed t_deadbeef" in a for a in actions)
+        assert not tree.exists()
+        probe = subprocess.run(
+            ["git", "rev-parse", "--verify", "--quiet", branch],
+            capture_output=True, text=True, cwd=str(repo),
+        )
+        assert probe.returncode != 0, "branch should be gone with its tree"
+
+    def test_attended_prune_never_removes_a_reapable_kanban_tree(self, repo, capsys):
+        """End-to-end default behavior: `hermes worktree prune` on a repo whose kanban tree
+        WOULD be reaped under the opt-in removes nothing and reports the deferral."""
+        from types import SimpleNamespace
+
+        from hermes_cli import worktree_cmd
+
+        kanban_tree, _ = _add_worktree(repo, "t_deadbeef", branch="kanban/t_deadbeef")
+        assert _verdict(
+            worktree_gc.audit_worktrees(
+                str(repo), with_sizes=False, include_kanban=True),
+            "t_deadbeef").verdict == "reap", "fixture must be reapable under the opt-in"
+        ordinary_tree, _ = _add_worktree(repo, "hermes-clean")
+
+        rc = worktree_cmd.cmd_worktree(SimpleNamespace(
+            repo=str(repo), worktree_action="prune", dry_run=False,
+            trees_only=True, branches_only=False))
+
+        assert rc == 0
+        assert kanban_tree.exists(), "attended prune must never touch a kanban task tree"
+        assert not ordinary_tree.exists(), "attended prune still reaps its own trees"
+        assert "t_deadbeef" not in capsys.readouterr().out
+
+    def test_list_reports_kanban_deferral(self, repo, capsys):
+        from types import SimpleNamespace
+
+        from hermes_cli import worktree_cmd
+
+        _add_worktree(repo, "t_deadbeef", branch="kanban/t_deadbeef")
+        rc = worktree_cmd.cmd_worktree(SimpleNamespace(
+            repo=str(repo), worktree_action="list"))
+        assert rc == 0
+        out = capsys.readouterr().out
+        assert "t_deadbeef" in out
+        assert "kanban task tree (owned by kanban gc)" in out
 
 
 class TestReclaim:

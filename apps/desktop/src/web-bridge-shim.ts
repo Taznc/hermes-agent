@@ -1,16 +1,48 @@
 /**
- * web-bridge-shim.ts — SPIKE: browser stand-in for the Electron preload bridge.
+ * web-bridge-shim.ts — browser stand-in for the Electron preload bridge.
  *
  * Loaded by index-web.html BEFORE /src/main.tsx so window.hermesDesktop exists
- * when the renderer's module graph evaluates. Derived from the boot-path
- * inventory in /tmp/web-desktop-spike/bridge-surface.md — only the members the
- * boot path + first paint require; every omission is deliberate (call sites
- * are optional-chained or feature-gated).
+ * when the renderer's module graph evaluates.
  *
- * UNTRACKED SPIKE FILE — not part of the app. Do not commit without review.
+ * SUPPORT LEVEL: this is production code. It began as a spike ("only the
+ * members the boot path + first paint require") and its header still said
+ * "UNTRACKED SPIKE FILE — not part of the app" long after it became the
+ * bridge every web-served Desktop user actually runs. Treat it as shipped:
+ * typed, tested, reviewed like any other renderer module.
+ *
+ * WHY OMISSIONS ARE NOT SELF-JUSTIFYING: the original omissions were judged
+ * against one question — does the app boot and paint? — so a missing member
+ * is NOT evidence that the feature shouldn't exist on web; it usually means
+ * nobody evaluated it. Because nearly every call site is optional-chained,
+ * the failure mode is silent: a dead control or a permanently-empty list,
+ * never a crash. A 2026-09 audit found the Electron preload exposing 134
+ * members against 46 here, and several user-visible features dead purely for
+ * that reason while their backend routes returned 200.
+ *
+ * BEFORE ADDING A MEMBER: the shim reports `mode: 'remote'`, so
+ * `isDesktopFsRemoteMode()` is true and the fs/git surface already routes to
+ * the gateway's REST API (see desktop-fs.ts / desktop-git.ts). Check for an
+ * existing `/api/*` route before designing anything; most gaps are a thin
+ * wrapper over one, using the `api()` helper below for token + timeout parity.
+ *
+ * DELIBERATELY ABSENT (verified 2026-09; do not "fix" these): native window
+ * management and pop-outs, tray/dock, HUD, pet overlay, wake indicator, zoom,
+ * quick entry, keep-awake, deep links, battery, native context menus and
+ * spellcheck, find-in-page, installer/bootstrap, relaunch/uninstall, and
+ * recycleBackend. A browser has no equivalent, and their call sites are
+ * capability-gated so the affordance is hidden rather than broken. Gateway
+ * settings, rename/delete/reveal, and clipboard were likewise verified to
+ * degrade correctly and need no work here.
+ *
+ * Omitting a member is a legitimate choice — but make it an explicit one, and
+ * make sure the UI hides the affordance instead of offering something that
+ * silently fails. See ROADMAP.md "Phase 2.17 — Web-served Desktop bridge
+ * parity" for the audit and the outstanding gaps.
  */
 
 import { markWebReloadPending, registerNativeWebReload } from '@/store/web-reload'
+
+import { type AgentOverview, createAgentOverviewReader } from '../electron/agent-overview'
 
 // ── HMR full-reload trap (DEV only) ─────────────────────────────────────────
 // Vite's built-in HMR client calls window.location.reload() directly whenever
@@ -273,6 +305,47 @@ function pickBrowserFiles(options?: { multiple?: boolean; filters?: Array<{ exte
   })
 }
 
+// One backend: the same-origin `hermes serve` this shim's api() helper talks
+// to. `pooled` is pre-populated with a single non-empty descriptor array so
+// collectAgentOverview() short-circuits both the `connect()` round-trip and
+// the on-demand `discoverParked` branch — there's nothing to discover, this
+// IS the backend. The reader instance (and its internal 60s history cache)
+// is created once per module evaluation, mirroring Electron's module-scoped
+// `readAgentOverview` singleton in electron/main.ts.
+const AGENT_OVERVIEW_SOURCE = { id: 'web', label: 'This backend', kind: 'local' } as const
+const AGENT_OVERVIEW_POOLED = new Map<string, string[]>([[AGENT_OVERVIEW_SOURCE.id, ['web']]])
+const readAgentOverview = createAgentOverviewReader<string>()
+
+async function getAgentOverview(options?: { force?: boolean }): Promise<AgentOverview> {
+  const overview = await readAgentOverview(
+    {
+      sources: [AGENT_OVERVIEW_SOURCE],
+      pooled: AGENT_OVERVIEW_POOLED,
+      connect: async () => [],
+      fetch: (_descriptor, path) => api({ path })
+    },
+    { force: options?.force }
+  )
+
+  const [source] = overview.sources
+
+  // collectAgentOverview() folds every per-descriptor failure into a
+  // resolved, degraded source (state/errors) instead of rejecting — correct
+  // for Electron, where a multi-source overview must keep painting sources
+  // that DID answer. This shim has exactly one source, so when that source
+  // is 'offline' (never obtained any history: non-2xx, a rejected fetch, or
+  // the collector's own per-source budget expiring) there is nothing else to
+  // show. Reject so store/agent-overview.ts's existing ErrorState path
+  // fires, instead of the renderer painting a false "All quiet". Genuine
+  // partial/compatibility states ('partial', 'unsupported', 'on-demand')
+  // keep resolving, matching Electron's degraded-but-nonempty behavior.
+  if (source?.state === 'offline') {
+    throw new Error(source.error ?? source.errors[0]?.error ?? 'Agent overview backend unavailable.')
+  }
+
+  return overview
+}
+
 function connection(profile?: string | null) {
   return {
     baseUrl: BASE_URL,
@@ -357,6 +430,246 @@ async function api<T>(request: SpikeApiRequest): Promise<T> {
   }
 }
 
+// ── OS/browser notifications ────────────────────────────────────────────────
+// Electron's real bridge shows notifications via `new Notification()` in the
+// main process and wires click/action back over IPC (hermes:focus-session,
+// hermes:notification-action, hermes:notification-activate). This is the
+// browser-native equivalent:
+//   - action buttons require a ServiceWorkerRegistration.showNotification()
+//     (the plain `new Notification()` constructor silently ignores `actions`
+//     in every browser), so a tiny SW (public/notification-sw.js) is
+//     registered lazily and relays 'notificationclick' back via postMessage.
+//   - without a SW (registration fails, or the browser lacks SW support at
+//     all — e.g. Safari), degrade to a body-click-only Notification — still
+//     useful, just without buttons.
+//   - permission is asked for on first real (non-test) notify() attempt, not
+//     eagerly at load: an unprompted permission popup on first paint is a
+//     bad first impression and most browsers rate-limit/auto-deny silent
+//     permission requests made outside a user gesture.
+interface NotifyPayload {
+  actions?: { id: string; text: string; activate?: string }[]
+  activate?: string
+  body?: string
+  icon?: string
+  kind?: string
+  notifyId?: string
+  sessionId?: string
+  silent?: boolean
+  tag?: string
+  title?: string
+}
+
+interface NotificationActionPayload {
+  actionId: string
+  sessionId?: string
+}
+
+interface NotificationActivatePayload {
+  actionId?: string
+  activate?: string
+  notifyId?: string
+  tag?: string
+}
+
+type FocusSessionCallback = (sessionId: string) => void
+
+const focusSessionCallbacks = new Set<FocusSessionCallback>()
+const notificationActionCallbacks = new Set<(payload: NotificationActionPayload) => void>()
+const notificationActivateCallbacks = new Set<(payload: NotificationActivatePayload) => void>()
+
+function subscribe<T>(set: Set<T>, callback: T): () => void {
+  set.add(callback)
+
+  return () => set.delete(callback)
+}
+
+// Collapse duplicate kind+session/tag notifications the same way Electron's
+// isDuplicateNotification() does for multiple full windows — here it guards
+// against the renderer's own per-tab throttle racing a second browser tab
+// open on the same origin.
+const DEDUPE_WINDOW_MS = 4000
+const recentlyShown = new Map<string, number>()
+
+function isDuplicate(key: string): boolean {
+  const now = Date.now()
+
+  for (const [k, at] of recentlyShown) {
+    if (now - at >= DEDUPE_WINDOW_MS) {
+      recentlyShown.delete(k)
+    }
+  }
+
+  if (recentlyShown.has(key)) {
+    return true
+  }
+
+  recentlyShown.set(key, now)
+
+  return false
+}
+
+let swRegistrationPromise: Promise<ServiceWorkerRegistration | null> | null = null
+
+// Route relayed SW clicks into the same callback sets onFocusSession /
+// onNotificationAction / onNotificationActivate feed from the Electron path,
+// so use-desktop-integrations.ts needs no web-specific branch at all.
+function handleServiceWorkerMessage(event: MessageEvent) {
+  const message = event.data as { actionId?: string; data?: NotifyPayload; source?: string } | undefined
+
+  if (!message || message.source !== 'hermes-notification-sw') {
+    return
+  }
+
+  const payload = message.data ?? {}
+  const actionId = message.actionId
+
+  if (!actionId && payload.sessionId) {
+    for (const cb of focusSessionCallbacks) {cb(payload.sessionId)}
+
+    return
+  }
+
+  // Approvals keep the session-scoped action channel — mirrors main.ts's
+  // 'action' handler: sessionId present, no notifyId/activate → approval.
+  if (actionId && payload.sessionId && !payload.notifyId && !payload.activate) {
+    for (const cb of notificationActionCallbacks) {cb({ actionId, sessionId: payload.sessionId })}
+
+    return
+  }
+
+  const action = payload.actions?.find(a => a.id === actionId)
+
+  for (const cb of notificationActivateCallbacks) {
+    cb({
+      actionId,
+      activate: action?.activate ?? payload.activate,
+      notifyId: payload.notifyId,
+      tag: payload.tag
+    })
+  }
+
+  if (payload.sessionId) {
+    for (const cb of focusSessionCallbacks) {cb(payload.sessionId)}
+  }
+}
+
+async function ensureNotificationServiceWorker(): Promise<ServiceWorkerRegistration | null> {
+  if (!('serviceWorker' in navigator)) {
+    return null
+  }
+
+  if (!swRegistrationPromise) {
+    swRegistrationPromise = navigator.serviceWorker
+      .register('/notification-sw.js')
+      .catch(err => {
+        console.warn('[web-bridge-shim] notification service worker registration failed', err)
+
+        return null
+      })
+
+    navigator.serviceWorker.addEventListener('message', handleServiceWorkerMessage)
+  }
+
+  return swRegistrationPromise
+}
+
+async function getNotificationPermission(): Promise<'granted' | 'denied' | 'default' | 'unsupported'> {
+  if (typeof Notification === 'undefined') {
+    return 'unsupported'
+  }
+
+  return Notification.permission
+}
+
+async function requestNotificationPermission(): Promise<'granted' | 'denied' | 'default' | 'unsupported'> {
+  if (typeof Notification === 'undefined') {
+    return 'unsupported'
+  }
+
+  if (Notification.permission !== 'default') {
+    return Notification.permission
+  }
+
+  try {
+    return await Notification.requestPermission()
+  } catch {
+    return Notification.permission
+  }
+}
+
+async function notify(payload: NotifyPayload): Promise<boolean> {
+  if (typeof Notification === 'undefined') {
+    return false
+  }
+
+  if (isDuplicate(`${payload.kind ?? ''}:${payload.sessionId ?? payload.tag ?? ''}`)) {
+    return true
+  }
+
+  const permission = await requestNotificationPermission()
+
+  if (permission !== 'granted') {
+    return false
+  }
+
+  const actions = Array.isArray(payload.actions) ? payload.actions : []
+  const data: NotifyPayload = { ...payload }
+
+  const registration = await ensureNotificationServiceWorker()
+
+  if (registration && 'showNotification' in registration) {
+    try {
+      await registration.showNotification(payload.title || 'Hermes', {
+        body: payload.body || '',
+        silent: Boolean(payload.silent),
+        ...(payload.icon ? { icon: payload.icon } : {}),
+        tag: payload.tag || payload.sessionId || undefined,
+        data,
+        // Cast: TS DOM lib's NotificationOptions omits `actions` in some lib
+        // targets even though every evergreen browser (and the spec) supports
+        // it on SW-shown notifications.
+        ...(actions.length ? { actions: actions.map(a => ({ action: a.id, title: a.text })) } : {})
+      } as NotificationOptions)
+
+      return true
+    } catch (err) {
+      console.warn('[web-bridge-shim] showNotification via service worker failed, falling back', err)
+    }
+  }
+
+  // No SW (unsupported browser, or registration/show failed): plain
+  // Notification still delivers title/body/click, just without buttons.
+  try {
+    const plain = new Notification(payload.title || 'Hermes', {
+      body: payload.body || '',
+      silent: Boolean(payload.silent),
+      ...(payload.icon ? { icon: payload.icon } : {}),
+      tag: payload.tag || payload.sessionId || undefined
+    })
+
+    plain.onclick = () => {
+      window.focus()
+      plain.close()
+
+      if (payload.sessionId) {
+        for (const cb of focusSessionCallbacks) {cb(payload.sessionId)}
+      }
+
+      if (payload.activate || payload.notifyId) {
+        for (const cb of notificationActivateCallbacks) {
+          cb({ activate: payload.activate, notifyId: payload.notifyId, tag: payload.tag })
+        }
+      }
+    }
+
+    return true
+  } catch (err) {
+    console.warn('[web-bridge-shim] Notification constructor failed', err)
+
+    return false
+  }
+}
+
 const shim = {
   // ── boot path ────────────────────────────────────────────────────────────
   getConnection: async (profile?: string | null) => connection(profile),
@@ -373,6 +686,13 @@ const shim = {
     get: async () => ({ profile: null }),
     set: async (name: string | null) => ({ profile: name })
   },
+
+  // Sessions/agents overview (Agents → Sessions tab). Single-backend web
+  // build: one source (`AGENT_OVERVIEW_SOURCE`), the same-origin server
+  // this shim already talks to via api(). Reuses the pure collector from
+  // electron/agent-overview.ts — same pagination, 60s history cache, and
+  // missingCapability() 404/405/501 fallback Electron's IPC handler uses.
+  getAgentOverview,
 
   // ── data layer ───────────────────────────────────────────────────────────
   api,
@@ -402,7 +722,14 @@ const shim = {
 
   // ── first-render adjacents ───────────────────────────────────────────────
   onPreviewFileChanged: unsub,
-  notify: async (_payload: unknown) => false,
+  notify,
+  getNotificationPermission,
+  requestNotificationPermission,
+  onFocusSession: (callback: FocusSessionCallback) => subscribe(focusSessionCallbacks, callback),
+  onNotificationAction: (callback: (payload: NotificationActionPayload) => void) =>
+    subscribe(notificationActionCallbacks, callback),
+  onNotificationActivate: (callback: (payload: NotificationActivatePayload) => void) =>
+    subscribe(notificationActivateCallbacks, callback),
 
   // ── recovery/error surfaces ──────────────────────────────────────────────
   // The boot-failure overlay calls these with `window.hermesDesktop?.method()`

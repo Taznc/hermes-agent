@@ -11,7 +11,8 @@
 #   * Env vars blanked (conftest.py also does this, but this
 #     is belt-and-suspenders for anyone running pytest outside our
 #     conftest path — e.g. on a single file)
-#   * Proper venv activation (probes .venv, venv, then ~/.hermes/...)
+#   * Proper venv activation (an explicitly-set HERMES_PYTHON wins; then
+#     probes .venv, venv, then ~/.hermes/...)
 #
 # Usage:
 #   scripts/run_tests.sh                            # full suite
@@ -38,9 +39,9 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 
 # ── Locate python ───────────────────────────────────────────────────────────
-# Probe local venvs first; fall back to the Nix devShell's editable venv
-# (HERMES_PYTHON is exported by the devShell hook and ships [dev] extras:
-# pytest, pytest-asyncio, pytest-timeout, ruff, ty).
+# An explicitly-set HERMES_PYTHON wins outright; otherwise probe local venvs,
+# then the release venv. (HERMES_PYTHON is exported by the Nix devShell hook
+# and ships [dev] extras: pytest, pytest-asyncio, pytest-timeout, ruff, ty.)
 #
 # A candidate must have pytest INSTALLED, not merely exist. The release venv
 # at ~/.hermes/hermes-agent/venv has bin/activate but no pytest, so an
@@ -48,48 +49,64 @@ REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 # .venv — every file then died with "No module named pytest" and the run
 # reported "0 tests passed" (which reads green at a glance even though the
 # exit code is 1). Skip such a venv and keep probing instead.
+#
+# HERMES_PYTHON is probed FIRST, ahead of any directory we merely infer:
+# setting it is a deliberate operator instruction, whereas the candidates
+# below are guesses about the layout. It used to be the LAST resort, which
+# made it a silent no-op in exactly the case people set it for — a per-task
+# git worktree has no .venv of its own, so the probe fell through to the
+# release venv and graded the run against THAT venv's package set (observed
+# two minor versions behind pyproject.toml's pins) while the interpreter the
+# operator asked for was never consulted. The import guard below is what
+# keeps that promotion safe: HERMES_PYTHON may point at the RELEASE venv
+# (no pytest) when inherited from a wrapped `hermes` binary rather than the
+# devShell hook, and such a value is ignored so the probe continues.
 VENV=""
 VENV_PYTHON=""
 SKIPPED_VENVS=""
-for candidate in "$REPO_ROOT/.venv" "$REPO_ROOT/venv" "$HOME/.hermes/hermes-agent/venv"; do
-  if [ -f "$candidate/bin/activate" ]; then
-    if "$candidate/bin/python" -c 'import pytest' 2>/dev/null; then
-      VENV="$candidate"
-      VENV_PYTHON="$candidate/bin/python"
-      break
-    fi
-    SKIPPED_VENVS="$SKIPPED_VENVS $candidate"
-  fi
-  # Native Windows venv layout: python.exe and activate live under
-  # Scripts/, and there is no bin/. Anyone running this script from
-  # Git Bash / MSYS with a `python -m venv`- or uv-created venv hits
-  # this branch — without it the canonical runner refuses to start.
-  if [ -f "$candidate/Scripts/activate" ]; then
-    if "$candidate/Scripts/python.exe" -c 'import pytest' 2>/dev/null; then
-      VENV="$candidate"
-      VENV_PYTHON="$candidate/Scripts/python.exe"
-      break
-    fi
-    SKIPPED_VENVS="$SKIPPED_VENVS $candidate"
-  fi
-done
-
-if [ -n "$SKIPPED_VENVS" ]; then
-  for skipped in $SKIPPED_VENVS; do
-    echo "▶ skipping venv without pytest: $skipped" >&2
-  done
+PYTHON=""
+if [ -n "${HERMES_PYTHON:-}" ] && [ -x "$HERMES_PYTHON" ] \
+    && "$HERMES_PYTHON" -c 'import pytest' 2>/dev/null; then
+  PYTHON="$HERMES_PYTHON"
+  echo "▶ using explicitly-set HERMES_PYTHON: $PYTHON"
 fi
 
-if [ -n "$VENV" ]; then
-  PYTHON="$VENV_PYTHON"
-elif [ -n "${HERMES_PYTHON:-}" ] && [ -x "$HERMES_PYTHON" ] \
-    && "$HERMES_PYTHON" -c 'import pytest' 2>/dev/null; then
-  # Guard with an import check: HERMES_PYTHON may point at the RELEASE
-  # venv (no pytest) when inherited from a wrapped `hermes` binary rather
-  # than the devShell hook.
-  PYTHON="$HERMES_PYTHON"
-  echo "▶ no local venv — using Nix dev venv via HERMES_PYTHON: $PYTHON"
-else
+if [ -z "$PYTHON" ]; then
+  for candidate in "$REPO_ROOT/.venv" "$REPO_ROOT/venv" "$HOME/.hermes/hermes-agent/venv"; do
+    if [ -f "$candidate/bin/activate" ]; then
+      if "$candidate/bin/python" -c 'import pytest' 2>/dev/null; then
+        VENV="$candidate"
+        VENV_PYTHON="$candidate/bin/python"
+        break
+      fi
+      SKIPPED_VENVS="$SKIPPED_VENVS $candidate"
+    fi
+    # Native Windows venv layout: python.exe and activate live under
+    # Scripts/, and there is no bin/. Anyone running this script from
+    # Git Bash / MSYS with a `python -m venv`- or uv-created venv hits
+    # this branch — without it the canonical runner refuses to start.
+    if [ -f "$candidate/Scripts/activate" ]; then
+      if "$candidate/Scripts/python.exe" -c 'import pytest' 2>/dev/null; then
+        VENV="$candidate"
+        VENV_PYTHON="$candidate/Scripts/python.exe"
+        break
+      fi
+      SKIPPED_VENVS="$SKIPPED_VENVS $candidate"
+    fi
+  done
+
+  if [ -n "$SKIPPED_VENVS" ]; then
+    for skipped in $SKIPPED_VENVS; do
+      echo "▶ skipping venv without pytest: $skipped" >&2
+    done
+  fi
+
+  if [ -n "$VENV" ]; then
+    PYTHON="$VENV_PYTHON"
+  fi
+fi
+
+if [ -z "$PYTHON" ]; then
   echo "error: no virtualenv with pytest found in $REPO_ROOT/.venv or $REPO_ROOT/venv," >&2
   echo "       and HERMES_PYTHON is not a python with pytest (enter the Nix devShell or create a venv)" >&2
   if [ -n "$SKIPPED_VENVS" ]; then

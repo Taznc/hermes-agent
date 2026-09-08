@@ -26,12 +26,17 @@ import type {
   BoardMeta,
   BoardsResponse,
   ChoiceResponse,
+  DispatchPauseResult,
+  DispatchResumeResult,
+  DispatchStatus,
   KanbanBoard,
   KanbanProfile,
   KanbanProject,
   KanbanTask,
   KanbanTaskDetail,
   OrchestrationSettings,
+  PostDrainCancelResult,
+  PostDrainQueueResult,
   StagedAttachment,
   TaskEstimate,
   WorkerLog
@@ -58,6 +63,11 @@ let rest: null | Rest = null
 let os: null | PluginOs = null
 let socketDoor: null | Socket = null
 let closeEventsSocket: (() => void) | null = null
+/** Whether this backend understands the aggregate dispatch `boards=*` scope.
+ * Older managed backends ignore that query parameter and silently operate on
+ * their current board, so All Boards must fan out explicit `board=` calls when
+ * aggregate fields are absent. */
+let dispatchAggregateSupported: boolean | null = null
 // Whether the multi-board `boards=*` socket has been opened for the CURRENT All Boards
 // session (reset whenever `$boardSlug` changes). Guards against re-opening on every 60s
 // poll refetch — the socket already advances its own cursor live; reseeding from a stale
@@ -92,11 +102,22 @@ export const $collapsedLanes = atom<Record<string, boolean>>({})
  *  what's rendered. */
 export const $hiddenBoards = atom<Record<string, boolean>>({})
 
+/** Per-board visibility of the two wishlist lanes (`idea` + `roadmap`), keyed
+ *  by board slug (true = hidden). Absence means SHOWN — a board nobody has
+ *  touched shows its full structure. Persisted alongside `$collapsedLanes` /
+ *  `$hiddenBoards`; scoped per board because a wishlist is a property of one
+ *  board, not of the app: hiding a 200-card roadmap on one board must not
+ *  hide a 3-card one on another. Distinct from `$collapsedLanes`, which
+ *  renders a thin rail — this removes the lanes entirely, and their cards
+ *  drop out of the board's counts with them. */
+export const $roadmapHidden = atom<Record<string, boolean>>({})
+
 const BOARD_SLUG_KEY = 'boardSlug'
 const INTRO_KEY = 'introDismissed'
 const LANES_KEY = 'lanesByProfile'
 const COLLAPSED_KEY = 'collapsedLanes'
 const HIDDEN_BOARDS_KEY = 'hiddenBoards'
+const ROADMAP_HIDDEN_KEY = 'roadmapHidden'
 
 /** One live `task_events` frame → precise cache invalidation: the board, plus
  *  each touched task's detail. The polls (8s board / 4s drawer) stay as the
@@ -184,6 +205,7 @@ export function bindApi(
   rest = r
   os = notifyDoors?.os ?? null
   socketDoor = socket
+  dispatchAggregateSupported = null
   bindCompletionNotify(r, notifyDoors?.t, notifyDoors?.os)
   const unsubs: Array<() => void> = []
 
@@ -198,6 +220,7 @@ export function bindApi(
   persist($lanesByProfile, LANES_KEY, false)
   persist($collapsedLanes, COLLAPSED_KEY, {})
   persist($hiddenBoards, HIDDEN_BOARDS_KEY, {})
+  persist($roadmapHidden, ROADMAP_HIDDEN_KEY, {})
 
   const open = (slug: string) => {
     // A board switch (including into/out of the sentinel) always invalidates any prior
@@ -310,6 +333,8 @@ export const BOARDS_KEY = ['kanban', 'boards'] as const
 export const PROFILES_KEY = ['kanban', 'profiles'] as const
 export const PROJECTS_KEY = ['kanban', 'projects'] as const
 export const ORCHESTRATION_KEY = ['kanban', 'orchestration'] as const
+/** Board-scoped: a pause is per board, so switching boards must be a cache miss. */
+export const dispatchStatusKey = (slug: string) => ['kanban', 'dispatch-status', slug] as const
 
 // ── reads ─────────────────────────────────────────────────────────────────────
 
@@ -530,9 +555,9 @@ export const importBoard = (archive: string) =>
 export const nudgeDispatcher = (board?: string) =>
   call<{ spawned?: unknown[] }>(boardPath('/dispatch', board), { method: 'POST', body: {} })
 
-/** Append a free-typed idea to the board's roadmap `## Ideas` inbox
- *  (Phase 2.15). Never rejects on a roadmap-unavailable outcome — the
- *  backend is fail-open by contract — so callers branch on `ok`/`reason`
+/** Capture a free-typed idea as a card in the board's `idea` lane. Never
+ *  rejects on an unavailable outcome — the backend is fail-open by contract —
+ *  so callers branch on `ok`/`reason` (`empty_idea` | `roadmap_unavailable`)
  *  rather than a thrown error, matching `estimateNew`'s shape. */
 export const addRoadmapIdea = (text: string, sourceId?: string, board?: string) =>
   call<{ ok: boolean; reason?: null | string }>(boardPath('/roadmap/idea', board), {
@@ -542,6 +567,199 @@ export const addRoadmapIdea = (text: string, sourceId?: string, board?: string) 
 
 export const saveOrchestration = (patch: Record<string, unknown>) =>
   call<OrchestrationSettings>('/orchestration', { method: 'PUT', body: patch })
+
+/** Dispatch pause circuit for the maintenance-drain control. All Boards uses
+ * the backend's explicit aggregate scope (`boards=*`) when available. During a
+ * rolling Desktop/backend upgrade, older backends silently ignore `boards=*`;
+ * missing aggregate fields trigger safe explicit per-board fan-out instead. */
+function dispatchPath(path: string): string {
+  return $boardSlug.get() === ALL_BOARDS ? `${path}?boards=*` : withBoard(path)
+}
+
+function dispatchError(reason: unknown): string {
+  return reason instanceof Error ? reason.message : String(reason)
+}
+
+async function activeDispatchBoards(): Promise<string[]> {
+  return (await fetchBoards()).boards.map(board => board.slug)
+}
+
+async function fetchAllDispatchStatuses(): Promise<DispatchStatus> {
+  const slugs = await activeDispatchBoards()
+
+  const settled = await Promise.allSettled(
+    slugs.map(slug => call<DispatchStatus>(withExplicitBoard('/dispatch/status', slug)))
+  )
+
+  const boards: Array<DispatchStatus & { board: string }> = []
+  const errors: Array<{ board: string; error: string }> = []
+
+  settled.forEach((result, index) => {
+    const board = slugs[index]!
+
+    if (result.status === 'fulfilled') {
+      boards.push({ board, ...result.value })
+    } else {
+      errors.push({ board, error: dispatchError(result.reason) })
+    }
+  })
+
+  const pausedCount = boards.filter(status => status.paused).length
+  const allPaused = slugs.length > 0 && errors.length === 0 && pausedCount === slugs.length
+
+  return {
+    all_paused: allPaused,
+    board_count: slugs.length,
+    boards,
+    errors,
+    message: null,
+    paused: allPaused,
+    paused_count: pausedCount,
+    running_count: boards.reduce((total, status) => total + status.running_count, 0),
+    state: null
+  }
+}
+
+export async function fetchDispatchStatus(): Promise<DispatchStatus> {
+  if ($boardSlug.get() !== ALL_BOARDS) {
+    return call<DispatchStatus>(dispatchPath('/dispatch/status'))
+  }
+
+  const result = await call<DispatchStatus>(dispatchPath('/dispatch/status'))
+  dispatchAggregateSupported = typeof result.board_count === 'number'
+
+  return dispatchAggregateSupported ? result : fetchAllDispatchStatuses()
+}
+
+async function pauseAllDispatch(note?: null | string): Promise<DispatchPauseResult> {
+  if (dispatchAggregateSupported !== false) {
+    const result = await call<DispatchPauseResult>(dispatchPath('/dispatch/pause'), {
+      method: 'POST',
+      body: { note: note ?? null }
+    })
+
+    dispatchAggregateSupported = typeof result.board_count === 'number'
+
+    if (dispatchAggregateSupported) {
+      return result
+    }
+  }
+
+  const slugs = await activeDispatchBoards()
+
+  const settled = await Promise.allSettled(
+    slugs.map(slug =>
+      call<DispatchPauseResult>(withExplicitBoard('/dispatch/pause', slug), {
+        method: 'POST',
+        body: { note: note ?? null }
+      })
+    )
+  )
+
+  const results: Array<DispatchPauseResult & { board: string }> = []
+  const failures: Array<{ board: string; error: string }> = []
+
+  settled.forEach((result, index) => {
+    const board = slugs[index]!
+
+    if (result.status === 'fulfilled') {
+      results.push({ board, ...result.value })
+    } else {
+      failures.push({ board, error: dispatchError(result.reason) })
+    }
+  })
+
+  const pausedCount = results.filter(result => result.paused).length
+
+  return {
+    board_count: slugs.length,
+    failures,
+    paused: slugs.length > 0 && failures.length === 0 && pausedCount === slugs.length,
+    paused_count: pausedCount,
+    results,
+    state: null
+  }
+}
+
+/** Refusal is a 200 with `paused: false` (at least one dispatch tick owns its
+ * target lock), NOT an error — callers must branch on `paused`, never assume
+ * the scope drained just because the request resolved. */
+export const pauseDispatch = (note?: null | string) =>
+  $boardSlug.get() === ALL_BOARDS
+    ? pauseAllDispatch(note)
+    : call<DispatchPauseResult>(dispatchPath('/dispatch/pause'), { method: 'POST', body: { note: note ?? null } })
+
+async function resumeAllDispatch(): Promise<DispatchResumeResult> {
+  if (dispatchAggregateSupported !== false) {
+    const result = await call<DispatchResumeResult>(dispatchPath('/dispatch/resume'), { method: 'POST' })
+
+    dispatchAggregateSupported = typeof result.board_count === 'number'
+
+    if (dispatchAggregateSupported) {
+      return result
+    }
+  }
+
+  const slugs = await activeDispatchBoards()
+
+  const settled = await Promise.allSettled(
+    slugs.map(slug => call<DispatchResumeResult>(withExplicitBoard('/dispatch/resume', slug), { method: 'POST' }))
+  )
+
+  const results: Array<DispatchResumeResult & { board: string }> = []
+  const failures: Array<{ board: string; error: string }> = []
+
+  settled.forEach((result, index) => {
+    const board = slugs[index]!
+
+    if (result.status === 'fulfilled') {
+      results.push({ board, ...result.value })
+    } else {
+      failures.push({ board, error: dispatchError(result.reason) })
+    }
+  })
+
+  const resumedCount = results.filter(result => result.resumed).length
+
+  return {
+    board_count: slugs.length,
+    failures,
+    resumed: slugs.length > 0 && failures.length === 0 && resumedCount === slugs.length,
+    resumed_count: resumedCount,
+    results,
+    was_paused: results.some(result => result.was_paused)
+  }
+}
+
+export const resumeDispatch = () =>
+  $boardSlug.get() === ALL_BOARDS
+    ? resumeAllDispatch()
+    : call<DispatchResumeResult>(dispatchPath('/dispatch/resume'), { method: 'POST' })
+
+/** Queue an action to fire once the selected scope drains to 0 running.
+ *
+ * Reuses the same `dispatchPath` scope contract as pause/resume, so All Boards
+ * arms every active board under one group and a single board arms only itself.
+ * Only the intent travels here — the dispatcher tick is what fires it, with or
+ * without this dashboard still open. */
+export const queuePostDrainAction = (input: {
+  actionKind: string
+  target?: null | string
+  expiresInSeconds?: null | number
+}) =>
+  call<PostDrainQueueResult>(dispatchPath('/dispatch/post-drain'), {
+    method: 'POST',
+    body: {
+      action_kind: input.actionKind,
+      expires_in_seconds: input.expiresInSeconds ?? null,
+      target: input.target ?? null
+    }
+  })
+
+/** Cancel a waiting action. `cancelled: false` means nothing was waiting to
+ *  cancel (already firing or already settled) — not an error. */
+export const cancelPostDrainAction = () =>
+  call<PostDrainCancelResult>(dispatchPath('/dispatch/post-drain'), { method: 'DELETE' })
 
 export const saveProfileDescription = (name: string, description: string) =>
   call(`/profiles/${encodeURIComponent(name)}`, { method: 'PATCH', body: { description } })

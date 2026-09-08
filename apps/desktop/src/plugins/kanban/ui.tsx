@@ -13,6 +13,7 @@ import {
   DropdownMenuItem,
   DropdownMenuTrigger,
   FadeScroll,
+  host,
   profileColor,
   profileColorSoft,
   relativeTime,
@@ -24,7 +25,7 @@ import { type ReactNode, useEffect, useLayoutEffect, useRef, useState } from 're
 
 import { fetchOrchestration, ORCHESTRATION_KEY } from './api'
 import { columnLabel, useKanban } from './i18n'
-import { columnMeta, type KanbanTask } from './types'
+import { columnMeta, type KanbanTask, laneDropAllowed } from './types'
 
 // Plugin-scoped i18n lives in ./i18n; re-exported so components import strings
 // and chrome from one place (./ui).
@@ -58,6 +59,39 @@ export const LOCKED_COLUMNS = ['review', 'running', 'scheduled'] as const
 export const isLockedTarget = (name: string): boolean => (LOCKED_COLUMNS as readonly string[]).includes(name)
 
 export const shortId = (id?: null | string) => (id ?? '').replace(/^t_/, '').slice(0, 6)
+
+/**
+ * The FULL task id as a click-to-copy chip. `shortId` truncates (`t_44ca59a3`
+ * → `44ca59`), which made the on-card id disagree with the id used by every
+ * CLI command and agent report — this chip always shows the exact string
+ * `kanban_show`/`hermes kanban` accept, and one click puts it on the
+ * clipboard. Click never bubbles (cards/rows have their own click actions).
+ */
+export function IdChip({ className, id }: { className?: string; id: string }) {
+  const k = useKanban()
+  const [copied, setCopied] = useState(false)
+
+  return (
+    <button
+      className={cn(
+        'inline-flex min-w-0 items-center gap-1 rounded px-1 py-px font-mono text-(--ui-text-quaternary) transition-colors hover:bg-(--chrome-action-hover) hover:text-(--ui-text-secondary)',
+        className
+      )}
+      onClick={event => {
+        event.stopPropagation()
+        void navigator.clipboard.writeText(id)
+        host.notify({ kind: 'info', message: k.copiedId(id) })
+        setCopied(true)
+        window.setTimeout(() => setCopied(false), 1500)
+      }}
+      title={k.copyTaskId}
+      type="button"
+    >
+      <span className="truncate">{id}</span>
+      <Codicon className="shrink-0" name={copied ? 'check' : 'copy'} size="0.65rem" />
+    </button>
+  )
+}
 
 /** The one way this plugin tints a surface with a status/severity tone. Every
  *  caller goes through it so "how strong is a wash" is a single decision and
@@ -225,7 +259,9 @@ export function StatusMenu({
       </DropdownMenuTrigger>
       <DropdownMenuContent align="start">
         {columns
-          .filter(name => name === status || !isLockedTarget(name))
+          // Same lane predicate the board's menus and drop handler use, so the
+          // drawer can never offer a transition the backend refuses with a 400.
+          .filter(name => name === status || (!isLockedTarget(name) && laneDropAllowed(status, name)))
           .map(name => (
             <DropdownMenuItem key={name} onSelect={() => onMove(name)}>
               <span className="size-2 rounded-full" style={{ backgroundColor: columnMeta(name).tone }} />

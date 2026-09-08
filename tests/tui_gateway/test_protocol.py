@@ -2,6 +2,8 @@
 
 import io
 import json
+import os
+import subprocess
 import sys
 import threading
 import time
@@ -319,9 +321,13 @@ def test_block_and_respond(capture):
     ["secret.request", "sudo.request", "clarify.request", "terminal.read.request"],
 )
 def test_sensitive_prompt_timeout_emits_expiry(capture, event):
+    """Clarify timeouts keep their reason; other sensitive bridges retain their empty legacy result."""
+    from tools.clarify_tool import TIMEOUT_RESPONSE
+
     server, buf = capture
 
-    assert server._block(event, "s1", {}, timeout=0) == ""
+    expected = TIMEOUT_RESPONSE if event == "clarify.request" else ""
+    assert server._block(event, "s1", {}, timeout=0) == expected
 
     messages = [json.loads(line) for line in buf.getvalue().splitlines()]
     request, expiry = [message["params"] for message in messages]
@@ -392,22 +398,23 @@ def test_clarify_batch_resolves_when_all_questions_locked(capture):
 
     first = server.handle_request({
         "id": "a1", "method": "clarify.respond",
-        "params": {"request_id": rid, "question_id": "q1", "answer": "beta"},
+        "params": {"request_id": rid, "question_id": "q1", "answer": "beta", "note": "beta note"},
     })
-    assert first["result"]["status"] == "ok"
-    assert first["result"]["remaining"] == ["q0"]
+    assert first["result"] == {"status": "ok", "remaining": ["q0"], "note": "beta note"}
     assert thread.is_alive()  # one question left — still blocking
 
     second = server.handle_request({
         "id": "a2", "method": "clarify.respond",
-        "params": {"request_id": rid, "question_id": "q0", "answer": "alpha"},
+        "params": {"request_id": rid, "question_id": "q0", "answer": "alpha", "note": "alpha note"},
     })
-    assert second["result"]["status"] == "ok"
-    assert second["result"]["remaining"] == []
+    assert second["result"] == {"status": "ok", "remaining": [], "note": "alpha note"}
 
     thread.join(timeout=5)
     assert not thread.is_alive()
-    assert json.loads(box["answer"]) == {"answers": {"q0": "alpha", "q1": "beta"}}
+    assert json.loads(box["answer"]) == {
+        "answers": {"q0": "alpha", "q1": "beta"},
+        "notes": {"q0": "alpha note", "q1": "beta note"},
+    }
 
 
 def test_clarify_batch_answer_update_overwrites_before_completion(server):
@@ -415,19 +422,20 @@ def test_clarify_batch_answer_update_overwrites_before_completion(server):
 
     server.handle_request({
         "id": "a1", "method": "clarify.respond",
-        "params": {"request_id": rid, "question_id": "q0", "answer": "first"},
+        "params": {"request_id": rid, "question_id": "q0", "answer": "first", "note": "first note"},
     })
     server.handle_request({
         "id": "a2", "method": "clarify.respond",
-        "params": {"request_id": rid, "question_id": "q0", "answer": "changed"},
+        "params": {"request_id": rid, "question_id": "q0", "answer": "changed", "note": "changed note"},
     })
     server.handle_request({
         "id": "a3", "method": "clarify.respond",
-        "params": {"request_id": rid, "question_id": "q1", "answer": "done"},
+        "params": {"request_id": rid, "question_id": "q1", "answer": "done", "note": "done note"},
     })
 
     thread.join(timeout=5)
     assert json.loads(box["answer"])["answers"]["q0"] == "changed"
+    assert json.loads(box["answer"])["notes"]["q0"] == "changed note"
 
 
 def test_clarify_batch_empty_answer_is_a_locked_skip(server):
@@ -1251,6 +1259,100 @@ def test_enforce_session_cap_evicts_oldest_detached_only(server, monkeypatch):
     # 4 sessions, cap 2 -> evict 2. Only detached+idle+built are eligible, oldest
     # first; the running one and the live-transport one are exempt.
     assert evicted == ["old_detached", "new_detached"]
+
+
+@pytest.mark.parametrize("closed_transport", [False, True])
+def test_idle_reaper_rearms_missing_ws_orphan_timer(server, monkeypatch, tmp_path, closed_transport):
+    """A detached lane cannot keep its lease forever if initial timer setup was lost."""
+    from hermes_cli.active_sessions import (
+        active_session_registry_snapshot,
+        try_acquire_active_session,
+    )
+
+    home = tmp_path / ".hermes"
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    sid = "detached-without-reaper"
+    sibling_sid = "live-sibling"
+    orphan_lease, message = try_acquire_active_session(
+        session_id=sid,
+        surface="desktop",
+        config={},
+        registry_home=home,
+        track_liveness=True,
+    )
+    assert orphan_lease is not None and message is None
+    sibling_lease, message = try_acquire_active_session(
+        session_id=sibling_sid,
+        surface="desktop",
+        config={},
+        registry_home=home,
+        track_liveness=True,
+    )
+    assert sibling_lease is not None and message is None
+
+    def _session(session_key, lease, transport):
+        return {
+            "active_session_lease": lease,
+            "created_at": time.time(),
+            "history": [],
+            "history_lock": threading.Lock(),
+            "last_active": time.time(),
+            "session_key": session_key,
+            "source": "tui",
+            "transport": transport,
+        }
+
+    server._sessions.clear()
+    class ClosedTransport:
+        _closed = True
+
+    dead_transport = ClosedTransport() if closed_transport else server._detached_ws_transport
+    server._sessions.update({
+        sid: _session(sid, orphan_lease, dead_transport),
+        sibling_sid: _session(sibling_sid, sibling_lease, object()),
+    })
+    server._pending_ws_reaps.clear()
+    monkeypatch.setattr(server, "_WS_ORPHAN_REAP_GRACE_S", 0.05)
+    monkeypatch.setattr(server, "_SESSION_TTL_S", 3600.0)
+    monkeypatch.setattr(server, "_flush_dirty_sessions", lambda: 0)
+    monkeypatch.setattr(server, "_enforce_session_cap", lambda: None)
+
+    server._reap_idle_sessions()
+
+    deadline = time.monotonic() + 2.0
+    while (sid in server._sessions or not orphan_lease.released) and time.monotonic() < deadline:
+        time.sleep(0.01)
+    assert sid not in server._sessions
+    assert orphan_lease.released is True
+    assert sibling_sid in server._sessions
+    assert [entry["session_id"] for entry in active_session_registry_snapshot(home)] == [sibling_sid]
+
+    repo_root = Path(__file__).resolve().parents[2]
+    env = os.environ.copy()
+    env["HERMES_HOME"] = str(home)
+    env["PYTHONPATH"] = os.pathsep.join(
+        part for part in (str(repo_root), env.get("PYTHONPATH", "")) if part
+    )
+    successor = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            (
+                "from hermes_cli.active_sessions import try_acquire_active_session; "
+                f"lease, refusal = try_acquire_active_session(session_id={sid!r}, surface='desktop', "
+                "config={}, track_liveness=True); "
+                "assert lease is not None and refusal is None, refusal; lease.release()"
+            ),
+        ],
+        cwd=repo_root,
+        env=env,
+        stdin=subprocess.DEVNULL,
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+    assert successor.returncode == 0, successor.stderr
+    assert [entry["session_id"] for entry in active_session_registry_snapshot(home)] == [sibling_sid]
 
 
 def test_sync_session_key_after_compress_reanchors_active_session_lease(

@@ -65,6 +65,24 @@ def _dispatch_pause_message(state: dict, *, board: Optional[str] = None) -> str:
 
 def _cmd_dispatch(args: argparse.Namespace) -> int:
     board = getattr(args, "board", None)
+    pause_note = getattr(args, "pause", None)
+    if pause_note is not None:
+        paused = kbd.pause_dispatch(board, note=" ".join(pause_note).strip() or None)
+        if getattr(args, "json", False):
+            _print_json(paused, ascii=True)
+        if not paused.get("paused", False):
+            if not getattr(args, "json", False):
+                print(
+                    f"Dispatch for {board or kb.DEFAULT_BOARD} was not paused: "
+                    "a dispatch tick is in progress; retry --pause."
+                )
+            return 1
+        if not getattr(args, "json", False):
+            print(
+                f"Dispatch for {board or kb.DEFAULT_BOARD}: "
+                f"{_dispatch_pause_message(paused['state'], board=board)}"
+            )
+        return 0
     if getattr(args, "resume_circuit", False):
         cleared = kbd.resume_dispatch(board)
         if getattr(args, "json", False):
@@ -116,6 +134,7 @@ def _cmd_dispatch(args: argparse.Namespace) -> int:
             dispatch_start_budget=caps.dispatch_start_budget,
             dispatch_start_window_seconds=caps.dispatch_start_window_seconds,
             review_rework_escalation_profile=caps.review_rework_escalation_profile,
+            max_review_rounds=caps.max_review_rounds,
         )
     if getattr(args, "json", False):
         _print_json({
@@ -139,6 +158,10 @@ def _cmd_dispatch(args: argparse.Namespace) -> int:
                 {"task_id": tid, "previous_assignee": prev, "assignee": who,
                  "changes_rounds": rounds}
                 for (tid, prev, who, rounds) in res.auto_escalated_rework
+            ],
+            "blocked_review_round_cap": [
+                {"task_id": tid, "changes_rounds": rounds}
+                for (tid, rounds) in res.blocked_review_round_cap
             ],
             "dispatch_paused": res.dispatch_paused,
         }, ascii=True)
@@ -176,6 +199,11 @@ def _cmd_dispatch(args: argparse.Namespace) -> int:
             f"Escalated review rework after {rounds} change requests: "
             f"{tid} ({previous} -> {who})"
         )
+    for tid, rounds in res.blocked_review_round_cap:
+        print(
+            f"Blocked at kanban.max_review_rounds={caps.max_review_rounds} "
+            f"after {rounds} change requests: {tid}"
+        )
     if res.skipped_unassigned:
         print(f"Skipped (unassigned): {', '.join(res.skipped_unassigned)}")
     for tid, who, current in res.skipped_per_profile_capped:
@@ -185,6 +213,8 @@ def _cmd_dispatch(args: argparse.Namespace) -> int:
             f"Skipped (non-spawnable assignee — terminal lane, OK): "
             f"{', '.join(res.skipped_nonspawnable)}"
         )
+    for tid, reason in res.skill_preflight_blocked:
+        print(f"Blocked (forced skill unavailable to assignee): {tid}\n  {reason}")
     if res.dispatch_paused:
         print("Dispatch: " + _dispatch_pause_message(res.dispatch_paused, board=board))
     return 0
@@ -302,7 +332,7 @@ def _cmd_daemon(args: argparse.Namespace) -> int:
 def _cmd_watch(args: argparse.Namespace) -> int:
     """Live-stream task_events to the terminal."""
     kinds = {k.strip() for k in args.kinds.split(",") if k.strip()} if args.kinds else None
-    print("Watching kanban events. Ctrl-C to stop.", flush=True)
+    print(f"Watching kanban events (initial board '{kb.get_current_board()}'). Ctrl-C to stop.", flush=True)
     # Seed cursor at the latest id so we don't replay history.
     with kbc.connect_closing() as conn:
         cursor = int(conn.execute("SELECT COALESCE(MAX(id), 0) AS m FROM task_events").fetchone()["m"])

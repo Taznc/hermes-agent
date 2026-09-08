@@ -70,7 +70,14 @@ _TASK_ID = _arg("task_id")
 _TASK_IDS = _arg("task_ids", nargs="+")
 _SLUG = _arg("slug")
 _TENANT = _arg("--tenant", help="Tenant namespace")
-_PRIORITY = _arg("--priority", type=int, default=0, help="Priority tiebreaker")
+_PRIORITY = _arg(
+    "--priority", type=int, default=0,
+    help=(
+        "Dispatch-order tiebreaker (not capacity/preemption). "
+        "critical=2, high=1, normal=0 (default), low=-1. Other "
+        "integers are accepted and keep their relative order."
+    ),
+)
 _RECLAIM_REASON = _reason("Human-readable reason (recorded on the reclaimed event)")
 _NOTIFY_TARGET = (
     _arg("--platform", required=True),
@@ -161,6 +168,12 @@ _SPECS = [
         _PRIORITY,
         _arg("--triage", action="store_true",
              help="Park in triage — a specifier will flesh out the spec and promote to todo"),
+        _arg("--idea", action="store_true", dest="idea",
+             help="Park in the inert Idea lane (rough wishlist capture). No automation ever "
+                  "touches it and --assignee is optional. Refine it with `kanban refine`."),
+        _arg("--roadmap", action="store_true", dest="roadmap",
+             help="Park in the inert Roadmap lane (hashed out with the operator, still not "
+                  "authorized to execute). Authorize it later with `kanban spawn`."),
         _arg("--idempotency-key",
              help="Dedup key. If a non-archived task with this key exists, "
                   "its id is returned instead of creating a duplicate."),
@@ -191,6 +204,8 @@ _SPECS = [
                   "independent of --model. Accepts minimal, low, medium, high, xhigh, max, ultra, or "
                   "'none' to disable thinking; an invalid level is rejected at filing time. Omit to "
                   "inherit the profile's own agent.reasoning_effort."),
+        _arg("--completion-contract", metavar="CONTRACT",
+             help="local-only (default), OWNER/REPO for publication, or exact GitHub PR URL; required CI gates done."),
         _arg("--goal", action="store_true", dest="goal_mode",
              help="Run the worker in a goal loop: after each turn a judge checks the "
                   "response against the card title/body and, if not done, the worker "
@@ -234,7 +249,8 @@ _SPECS = [
     ], aliases=["ls"], help="List tasks"),
     _cmd("show", [_TASK_ID, _json_flag(), *_run_state_args("filter listed runs by task_runs column")],
          help="Show a task with comments + events"),
-    _cmd("assign", [_TASK_ID, _arg("profile", help="Profile name (or 'none' to unassign)")],
+    _cmd("assign", [_TASK_ID, _arg("profile", help="Profile name (or 'none' to unassign)"),
+                    _json_flag(help="Emit a machine-readable JSON error on refusal")],
          help="Assign or reassign a task"),
     _cmd("set-model", [
         _TASK_ID,
@@ -326,6 +342,14 @@ _SPECS = [
         _reason("Optional reason/note — recorded as a comment before unholding. Quote multi-word reasons."),
         _TASK_IDS,
     ], help="Take one or more tasks off On Hold, returning them to ready (or todo while parents remain open)"),
+    _cmd("refine", [_TASK_IDS], help="Promote wishlist cards from the Idea lane to the Roadmap lane"),
+    _cmd("demote", [_TASK_IDS], help="Send Roadmap cards back to the Idea lane"),
+    _cmd("spawn", [
+        _TASK_IDS,
+        _arg("--to", choices=sorted(kb.ROADMAP_SPAWN_TARGETS), default="triage",
+             help="Where the card lands (default: triage, so auto-decompose can re-specify or "
+                  "split it first; --to ready opts out)"),
+    ], help="Authorize Roadmap cards to execute, landing them in triage (default) or ready"),
     _cmd("request-review", [
         _TASK_ID,
         _arg("--summary", help="What was implemented and how it was verified — shown to the reviewer."),
@@ -358,6 +382,10 @@ _SPECS = [
     _cmd("dispatch", [
         _arg("--dry-run", action="store_true", help="Don't actually spawn processes; just print what would happen"),
         _arg("--max", type=int, help="Cap number of spawns this pass"),
+        _arg("--pause", nargs="*", metavar="NOTE",
+             help="Stop this board claiming/spawning new workers (running workers are "
+                  "untouched) so it can drain before a maintenance restart; optional NOTE "
+                  "is recorded on the pause. Clear it with --resume-circuit."),
         _arg("--resume-circuit", action="store_true",
              help="Clear this board's dispatch pause after operator recovery and exit"),
         _arg("--circuit-status", action="store_true",

@@ -147,14 +147,22 @@ export function useComposerDraft({
 
       if (editor) {
         renderComposerContents(editor, next, { trailingCommitted: true })
-        placeCaretEnd(editor)
+
+        // Selection is document-global: a keep-alive composer in a hidden tab
+        // may repaint when its background session updates, but moving its caret
+        // here steals the selection from the visible composer without changing
+        // document.activeElement. The foreground then still looks focused while
+        // printable keydowns produce no input.
+        if (paneVisible) {
+          placeCaretEnd(editor)
+        }
       }
 
       if (focus) {
         requestMainFocus()
       }
     },
-    [requestMainFocus, setComposerText]
+    [paneVisible, requestMainFocus, setComposerText]
   )
 
   const appendExternalText = useCallback(
@@ -263,9 +271,12 @@ export function useComposerDraft({
 
     if (editorRef.current) {
       renderComposerContents(editorRef.current, '')
-      placeCaretEnd(editorRef.current)
+
+      if (paneVisible) {
+        placeCaretEnd(editorRef.current)
+      }
     }
-  }, [setComposerText])
+  }, [paneVisible, setComposerText])
 
   // Read the editor's current plain text into draftRef + composer state. This
   // closes the "queued rAF flush hasn't run yet" window so scope-swap/pagehide
@@ -364,7 +375,7 @@ export function useComposerDraft({
       return false
     }
 
-    const nextDraft = insertInlineRefsIntoEditor(editor, refs)
+    const nextDraft = insertInlineRefsIntoEditor(editor, refs, { interactive: paneVisible })
 
     if (nextDraft === null) {
       return false
@@ -372,7 +383,10 @@ export function useComposerDraft({
 
     draftRef.current = nextDraft
     setComposerText(nextDraft)
-    requestMainFocus()
+
+    if (paneVisible) {
+      requestMainFocus()
+    }
 
     return true
   }
@@ -490,6 +504,18 @@ export function useComposerDraft({
     }
   }, [syncDraftFromEditor])
 
+  // >>> FORK ANCHOR: composer-model-recommendation <<<
+  // A draft-change subscription for surfaces that must REACT to an edit
+  // without being re-rendered (typing is deliberately kept out of React).
+  // It rides the same composer-runtime subscription the sync above uses, so
+  // it covers typed, pasted, IME-committed and programmatic changes alike;
+  // subscribers re-read the live text through `getDraft()` themselves, so no
+  // draft text crosses this boundary.
+  const subscribeDraft = useCallback(
+    (listener: () => void) => composerRuntime.subscribe(listener),
+    [composerRuntime]
+  )
+
   return {
     activeQueueSessionKeyRef,
     clearDraft,
@@ -506,6 +532,7 @@ export function useComposerDraft({
     sessionIdRef,
     setComposerText,
     stashAt,
+    subscribeDraft,
     syncDraftFromEditor
   }
 }

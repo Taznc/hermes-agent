@@ -100,7 +100,7 @@ def _parse_model_ids(resp: "Any") -> List[str]:
 
 def _fallback_profile_entry(profiles_mod, name: str, home: Path, *, is_default: bool,
                             has_env: bool, gateway_running: Callable[[], bool]) -> Dict[str, Any]:
-    model, provider = _safe(lambda: profiles_mod._read_config_model(home), (None, None))
+    model, provider, _effort = _safe(lambda: profiles_mod._read_config_model(home), (None, None, None))
     meta = lambda key, default: _safe(  # noqa: E731
         lambda: profiles_mod.read_profile_meta(home).get(key, default), default)
     return {
@@ -233,13 +233,17 @@ def _config_profile_scope(profile: Optional[str]):
     """Await-safe, config-only profile scope: touches ONLY the task-local HERMES_HOME
     contextvar, never the process-global skills-module attributes ``_profile_scope`` swaps
     (holding those across an ``await`` lets a concurrent request restore THIS request's dir
-    on its ``finally``). None/""/"current" = no override."""
+    on its ``finally``). None/""/"current" = no override.
+
+    Explicit names resolving to the process home retain current-profile semantics.
+    Still enter the requested home so a nested scope cannot retain another profile.
+    """
     if _is_current_profile(profile):
         yield None
         return
     profile_dir = _resolve_profile_dir(profile.strip())
     with _hermes_home_scope(profile_dir):
-        yield profile_dir
+        yield None if profile_dir.resolve() == get_process_hermes_home().resolve() else profile_dir
 
 
 # Terminal backend picker rows — GUI counterpart of terminal.backend. Keep in sync with

@@ -553,6 +553,16 @@ def test_review_dispatch_preserves_task_skills_and_adds_reviewer_skill(
         "load_config",
         lambda *args, **kwargs: {"kanban": {"review_dispatch": True}},
     )
+    # The card forces `domain-specific-review`, and a forced skill is
+    # preflighted against the assignee's own profile home — so the reviewer
+    # profile has to really exist and really have it, or this card would be
+    # building a worker that dies during initialization.
+    reviewer_skill = kanban_home / "profiles" / "reviewer" / "skills" / "domain-specific-review"
+    reviewer_skill.mkdir(parents=True)
+    (reviewer_skill / "SKILL.md").write_text(
+        '---\nname: domain-specific-review\ndescription: "Test skill."\n---\n\n# review\n',
+        encoding="utf-8",
+    )
     captured: list[list[str]] = []
 
     def spawn(task, workspace):

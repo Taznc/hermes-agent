@@ -4,6 +4,7 @@ import type { ChatView } from '../chat'
 import type { ChatSidebar } from '../chat/sidebar'
 import type { CommandCenterSection } from '../command-center'
 import type { useGatewayRequest } from '../gateway/hooks/use-gateway-request'
+import type { useModelControls } from '../session/hooks/use-model-controls'
 import type { ModelMenuPanel } from '../shell/model-menu-panel'
 
 export type GatewayRequester = ReturnType<typeof useGatewayRequest>['requestGateway']
@@ -65,6 +66,8 @@ export interface WiringActions extends SidebarActions, ChatActions {
   openAgents: () => void
   openCommandCenterSection: (section: CommandCenterSection) => void
   requestGateway: GatewayRequester
+  // >>> FORK ANCHOR: composer-model-recommendation <<<
+  selectRecommendedModel: ReturnType<typeof useModelControls>['selectRecommendedModel']
   selectModel: ComponentProps<typeof ModelMenuPanel>['onSelectModel']
   toggleCommandCenter: () => void
 }

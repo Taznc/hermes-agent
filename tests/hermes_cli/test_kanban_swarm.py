@@ -10,6 +10,38 @@ from hermes_cli.kanban_swarm import (
     post_blackboard_update,
 )
 
+# create_swarm forces `requesting-code-review` on the verifier card and
+# `humanizer` on the synthesizer card. Forced skills are preflighted against the
+# assignee's own profile home, so those two profiles must really exist and
+# really have those skills — otherwise the swarm is building cards whose workers
+# would die during initialization, which is what the preflight refuses.
+_SWARM_FORCED_SKILLS = {
+    "reviewer": ("requesting-code-review",),
+    "writer": ("humanizer",),
+}
+
+
+@pytest.fixture(autouse=True)
+def swarm_profiles(tmp_path, monkeypatch):
+    """Real profile homes for the swarm's verifier/synthesizer assignees."""
+    home = tmp_path / "hermes-home"
+    (home / "profiles").mkdir(parents=True)
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    monkeypatch.setattr("pathlib.Path.home", lambda: tmp_path)
+    import hermes_constants
+
+    monkeypatch.setattr(hermes_constants, "_default_hermes_root_memo", None, raising=False)
+    for profile, skills in _SWARM_FORCED_SKILLS.items():
+        skills_dir = home / "profiles" / profile / "skills"
+        skills_dir.mkdir(parents=True)
+        for name in skills:
+            (skills_dir / name).mkdir()
+            (skills_dir / name / "SKILL.md").write_text(
+                f"---\nname: {name}\ndescription: \"Test skill {name}.\"\n---\n\n# {name}\n",
+                encoding="utf-8",
+            )
+    return home
+
 
 def test_create_swarm_builds_parallel_workers_verifier_and_synthesizer(tmp_path):
     conn = kbc.connect(tmp_path / "kanban.db")

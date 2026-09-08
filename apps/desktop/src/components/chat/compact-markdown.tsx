@@ -1,5 +1,5 @@
-import type { ComponentProps, ElementType, FC, ReactElement, ReactNode } from 'react'
-import { Children, memo } from 'react'
+import type { ComponentProps, ElementType, FC, ReactNode } from 'react'
+import { isValidElement, memo } from 'react'
 import { Streamdown } from 'streamdown'
 
 import { CopyButton } from '@/components/ui/copy-button'
@@ -101,7 +101,7 @@ function rawCodeText(children: ReactNode): string {
 
 function MarkdownPre({ children, className, ...rest }: ComponentProps<'pre'>) {
   const { t } = useI18n()
-  const codeElement = Children.count(children) === 1 ? (Children.only(children) as ReactElement) : null
+  const codeElement = isValidElement(children) ? children : null
   const raw = codeElement ? rawCodeText((codeElement.props as { children?: ReactNode }).children) : ''
   const trimmed = raw.replace(/\n$/, '')
 

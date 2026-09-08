@@ -7,13 +7,14 @@ import { linkifyBarePaths } from '@/lib/path-refs'
 import { previewMarkdownHref } from '@/lib/preview-targets'
 import { stripPreviewTargets } from '@/lib/preview-targets'
 import { linkifySessionRefs } from '@/lib/session-refs'
+import { parseTranscriptDirective } from '@/lib/transcript-directives'
 
 const REASONING_BLOCK_RE = /<(think|thinking|reasoning|scratchpad|analysis)>[\s\S]*?<\/\1>\s*/gi
 const PREVIEW_MARKER_RE = /\[Preview:[^\]]+\]\(#preview[:/][^)]+\)/gi
 
 const FENCE_LINE_RE = /^([ \t]*)(`{3,}|~{3,})([^\n]*)$/
 const EMPTY_FENCE_BLOCK_RE = /(^|\n)[ \t]*(?:`{3,}|~{3,})[^\n]*\n[ \t]*(?:`{3,}|~{3,})[ \t]*(?=\n|$)/g
-const CODE_FENCE_SPLIT_RE = /((?:```|~~~)[\s\S]*?(?:```|~~~))/g
+const CODE_FENCE_SPLIT_RE = /((?:```|~~~)[\s\S]*?(?:```|~~~|$))/g
 const INLINE_CODE_SPLIT_RE = /(`[^`\n]+`)/g
 // Math spans as remark-math will see them: a `$$…$$` block, which may span
 // lines, or a same-line `$…$`. A delimiter escaped as `\$` is prose — that is
@@ -224,7 +225,29 @@ function rewriteProseSegment(segment: string): string {
  * dollar can't be mistaken for math.
  */
 function normalizeVisibleProse(text: string): string {
-  return text
+  // Transcript directives (`::name{...}` alone on a line) must reach the
+  // paragraph renderer byte-intact: the prose rewrites below would turn an
+  // absolute `file="/abs/path.html"` into a nested markdown link, the
+  // paragraph would stop being text-only, and the directive would render as
+  // prose instead of the plugin's widget. Mask those lines behind inert
+  // sentinels (no `/`, `$`, `:` — nothing any rewrite matches) and restore
+  // them after the pipeline. `parseTranscriptDirective` is the same parser
+  // the renderer uses, so the shield and the renderer can never disagree
+  // about what counts as a directive. Sentinel chars are Unicode private-use
+  // (U+E000) — never produced by the model, matched by no rewrite.
+  const shielded: string[] = []
+
+  const masked = text.replace(/^[ \t]*::\S[^\n]*$/gm, line => {
+    if (parseTranscriptDirective(line) === null) {
+      return line
+    }
+
+    shielded.push(line)
+
+    return `\uE000hermes-directive-${shielded.length - 1}\uE000`
+  })
+
+  const out = masked
     .split(INLINE_CODE_SPLIT_RE)
     .map(part =>
       part.startsWith('`')
@@ -235,6 +258,10 @@ function normalizeVisibleProse(text: string): string {
             .join('')
     )
     .join('')
+
+  return shielded.length === 0
+    ? out
+    : out.replace(/\uE000hermes-directive-(\d+)\uE000/g, (match, index: string) => shielded[Number(index)] ?? match)
 }
 
 function isEscapedAt(text: string, index: number): boolean {
@@ -644,34 +671,13 @@ export function preprocessMarkdown(text: string): string {
         return part
       }
 
-      // Whitespace-only segments (e.g. the `\n\n` between two adjacent
-      // fences) must NOT go through stripPreviewTargets — its internal
-      // .trim() would collapse them to '' and glue the surrounding
-      // fences together, producing things like ``````math which the
-      // markdown parser then reads as a single 6-backtick block.
-      if (!part.trim()) {
-        return part
-      }
-
-      // Preserve leading/trailing whitespace around the prose body so
-      // that fence-prose-fence sequences keep their blank-line gaps.
-      // stripPreviewTargets internally calls .trim() on its result for
-      // the benefit of its other (single-segment) callers; here we're
-      // operating on a SEGMENT of a larger document where outer
-      // whitespace is structural and must survive.
-      const leading = part.match(/^\s*/)?.[0] ?? ''
-      const trailing = part.match(/\s*$/)?.[0] ?? ''
-
       // Run only on prose segments so `$5` literals and `\(` inside code
       // blocks stay intact. The HTML-depth clamp belongs here for the same
       // reason: a fenced block renders as code and never reaches rehype-raw,
       // so escaping tags inside one would corrupt the listing for nothing.
-      const transformed = clampHtmlNestingDepth(normalizeVisibleProse(stripPreviewTargets(normalizeProseMath(part))))
-
-      return leading + transformed + trailing
+      return clampHtmlNestingDepth(normalizeVisibleProse(stripPreviewTargets(normalizeProseMath(part))))
     })
     .join('')
-    .replace(/[ \t]+\n/g, '\n')
 }
 
 /**

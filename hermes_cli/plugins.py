@@ -637,16 +637,40 @@ class PluginContext:
     @_serialized_replacement
     def register_cli_command(
         self, name: str, help: str, setup_fn: Callable, handler_fn: Callable | None = None,
-        description: str = "",
-    ) -> PluginRegistration:
-        """Register a CLI subcommand (``hermes <name> ...``). *setup_fn* receives the argparse
-        subparser; *handler_fn* becomes ``set_defaults(func=...)``."""
+        description: str = "", *, parent: str | None = None,
+    ) -> Optional[PluginRegistration]:
+        """Register a CLI subcommand; *setup_fn* receives the argparse subparser and
+        *handler_fn* becomes ``set_defaults(func=...)``.
+
+        Default (``parent=None``) registers a top-level ``hermes <name> ...``. Passing a
+        parent from ``_parser.NESTED_CLI_PARENTS`` instead nests the command under that
+        built-in command's own subparser group (``hermes kanban <name> ...``). Nesting is
+        refused — logged and ``None`` — for an unsupported parent, for a missing
+        ``handler_fn`` (the parent's dispatcher would reject the action), and, at
+        parser-attach time, for a name already taken by a built-in action.
+        """
+        if parent is not None:
+            from hermes_cli._parser import NESTED_CLI_PARENTS
+            if parent not in NESTED_CLI_PARENTS:
+                logger.warning(
+                    "Plugin '%s' tried to register CLI command '%s' under unsupported parent "
+                    "command '%s'. Supported parents: %s. Skipping.",
+                    self.manifest.name, name, parent, ", ".join(sorted(NESTED_CLI_PARENTS)))
+                return None
+            if handler_fn is None:
+                logger.warning(
+                    "Plugin '%s' tried to register nested CLI command '%s %s' without a "
+                    "handler_fn; '%s' would reject the action. Skipping.",
+                    self.manifest.name, parent, name, parent)
+                return None
         entry = {
             "name": name, "help": help, "description": description, "setup_fn": setup_fn,
             "handler_fn": handler_fn, "plugin": self.manifest.name, "plugin_key": self.plugin_id,
+            "parent": parent,
         }
-        return self._register_entry("cli_command", name, self._manager._cli_commands, entry,
-                                    "Plugin %s registered CLI command: %s", name)
+        key = name if parent is None else f"{parent} {name}"
+        return self._register_entry("cli_command", key, self._manager._cli_commands, entry,
+                                    "Plugin %s registered CLI command: %s", key)
 
     @_serialized_replacement
     def register_command(
@@ -1127,6 +1151,8 @@ class PluginManager(PluginLoaderMixin, PluginDispatchMixin, PluginLedgerMixin):
         # (matcher, callback, plugin_name), platform handler factories (lowercase platform -> list).
         self._plugins: Dict[str, LoadedPlugin] = {}
         self._hooks: Dict[str, List[Callable]] = {}
+        # Fallback hooks registered by a memory provider before general discovery.
+        self._memory_hook_registrations: Dict[Tuple[str, str], List[PluginRegistration]] = {}
         self._middleware: Dict[str, List[Callable]] = {}
         self._plugin_tool_names: Set[str] = set()
         self._plugin_platform_names: Set[str] = set()

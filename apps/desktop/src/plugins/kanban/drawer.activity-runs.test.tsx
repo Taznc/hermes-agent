@@ -166,6 +166,39 @@ describe('run rows', () => {
 
     expect(screen.getByText('1m')).toBeTruthy()
   })
+
+  it('renders model identity and usage totals when captured', () => {
+    render(withK(k => <RunRow k={k} run={{
+      api_calls: 12,
+      cache_read_tokens: 200,
+      ended_at: 1_080,
+      estimated_cost_usd: 1.23,
+      id: 1,
+      input_tokens: 1_000,
+      model: 'gpt-5.6-sol',
+      output_tokens: 500,
+      provider: 'openai',
+      reasoning_effort: 'high',
+      reasoning_tokens: 50,
+      started_at: 1_020,
+      status: 'completed',
+      tool_calls: 30
+    }} />))
+
+    expect(screen.getByText('model: gpt-5.6-sol · openai · high')).toBeTruthy()
+    expect(screen.getByText('tokens: in 1,000 · out 500 · cache 200 · reasoning 50')).toBeTruthy()
+    expect(screen.getByText('calls: API 12 · tools 30 · estimated cost: $1.2300')).toBeTruthy()
+  })
+
+  it('omits analytics lines when no values were captured', () => {
+    const { container } = render(withK(k => (
+      <RunRow k={k} run={{ ended_at: 1_080, id: 1, started_at: 1_020, status: 'completed' }} />
+    )))
+
+    expect(container.textContent).not.toContain('model:')
+    expect(container.textContent).not.toContain('tokens:')
+    expect(container.textContent).not.toContain('undefined')
+  })
 })
 
 describe('RunErrorLine', () => {

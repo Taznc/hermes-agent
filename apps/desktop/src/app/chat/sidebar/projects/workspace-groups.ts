@@ -447,6 +447,31 @@ export function liveSessionProjectId(session: SessionInfo, explicitProjects: Pro
   return repoRoot
 }
 
+/** The lane a row files under: its live project, or Home for detached (cwd-less) rows. */
+export function sessionBucketId(session: SessionInfo, explicitProjects: ProjectInfo[]): null | string {
+  return liveSessionProjectId(session, explicitProjects) ?? (isDetachedSession(session) ? NO_PROJECT_ID : null)
+}
+
+/**
+ * The ONE row-level project-filter rule the flat list and the project lanes
+ * narrow by. Detached (cwd-less) rows belong to the Home bucket
+ * (`NO_PROJECT_ID`, like the overview preview overlay) — filing them under
+ * `''` meant filtering to Home hid Home's own rows.
+ */
+export function sessionMatchesProjectFilter(
+  session: SessionInfo,
+  filter: readonly string[],
+  explicitProjects: ProjectInfo[]
+): boolean {
+  if (!filter.length) {
+    return true
+  }
+
+  const id = sessionBucketId(session, explicitProjects)
+
+  return id !== null && filter.includes(id)
+}
+
 /**
  * The color a session inherits from its owning project — the explicit project
  * whose folder is the longest prefix of the session's cwd/repo-root, when that
@@ -676,9 +701,11 @@ function overlayHomeLane(
   // only the launch profile's bucket absorbs detached live sessions; a foreign
   // Home stays exactly as its own store reported it.
   const ownsLive = project.id === NO_PROJECT_ID
+
   const detached = ownsLive
     ? live.filter(session => isDetachedSession(session) && !removed.has(session.id) && !isLiveArchived(session))
     : []
+
   const kept = (lane?.sessions ?? []).filter(session => !removed.has(session.id))
 
   if (!detached.length && kept.length === (lane?.sessions.length ?? 0)) {
@@ -825,8 +852,7 @@ export function overlayLivePreviews(
     // A detached live row belongs to THIS client's own Home. Foreign profiles'
     // Home buckets get their rows from their own store's snapshot, never from
     // the local live list (`homeProjectId` keys those separately).
-    const projectId =
-      liveSessionProjectId(session, explicitProjects) ?? (isDetachedSession(session) ? NO_PROJECT_ID : null)
+    const projectId = sessionBucketId(session, explicitProjects)
 
     if (!projectId) {
       continue

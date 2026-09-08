@@ -27,6 +27,7 @@ from hermes_constants import (
 from hermes_cli.env_loader import load_hermes_dotenv
 from utils import is_truthy_value
 from tools.environments.local import hermes_subprocess_env
+from tools.clarify_tool import CANCELLED_RESPONSE, TIMEOUT_RESPONSE
 from agent.replay_cleanup import sanitize_replay_history
 from agent.compaction_display import project_compaction_message_for_display  # noqa: F401
 from agent.skill_commands import describe_skill_invocation  # noqa: F401
@@ -82,10 +83,10 @@ _sessions: dict[str, dict] = {}
 _methods: dict[str, callable] = {}
 _pending: dict[str, tuple[str, threading.Event]] = {}
 _pending_prompt_payloads: dict[str, tuple[str, dict]] = {}
-_answers: dict[str, str] = {}
-# Batch clarify accumulators: rid → {"qids": [...], "answers": {qid: answer}}. Written by
-# clarify.respond (per-question lock, update-in-place), read out by _block on resolution/timeout
-# so locked answers survive the deadline.
+_answers: dict[str, Any] = {}
+# Batch clarify accumulators: rid → {"qids": [...], "answers": {qid: answer}, "notes": {qid: note}}.
+# Written by clarify.respond (per-question lock, update-in-place), read out by _block on
+# resolution/timeout so locked answers survive the deadline.
 _batch_clarify: dict[str, dict] = {}
 _db = None
 _db_error: str | None = None
@@ -158,6 +159,7 @@ _DETAIL_MODES = frozenset({"hidden", "collapsed", "expanded"})
 # interrupts); voice.*/wake.* = SYNCHRONOUS faster-whisper install (300s); session.workspace.move =
 # git subprocess probes on an arbitrary (maybe slow) mount.
 _LONG_HANDLERS = frozenset({
+    "session.foreign.list", "session.foreign.preview", "session.foreign.import",
     "billing.state", "subscription.state", "subscription.preview", "subscription.change", "clarify.explain",
     "subscription.resume", "subscription.upgrade", "usage.bars", "session.usage", "billing.step_up",
     "browser.manage", "cli.exec", "complete.path", "complete.slash", "llm.oneshot", "model.options",
@@ -170,6 +172,7 @@ _LONG_HANDLERS = frozenset({
     "setup.runtime_check", "setup.status", "voice.toggle", "voice.record", "voice.tts", "wake.start",
     "wake.status", "session.active_list", "session.branch", "session.compress", "session.list",
     "session.resume", "session.workspace.move", "shell.exec", "skills.manage", "slash.exec",
+    "command.dispatch",  # /goal draft invokes the auxiliary model; never block the RPC reader
 })
 
 _rpc_pool_workers = max(2, env_int("HERMES_TUI_RPC_POOL_WORKERS", 8))
@@ -458,13 +461,12 @@ def _profile_home(profile: str | None) -> Path | None:
     """Resolve a named profile's home on THIS host, or None for the launch profile."""
     if not (name := (profile or "").strip()):
         return None
-    try:
-        from hermes_cli import profiles as profiles_mod
-        home = Path(profiles_mod.get_profile_dir(name))
-    except Exception:
-        return None
-    if home.resolve() == Path(_hermes_home).resolve() or not home.exists():
-        return None  # already the launch profile (no override needed), or no such profile
+    from hermes_cli import profiles as profiles_mod
+    home = Path(profiles_mod.get_profile_dir(name))
+    if not home.is_dir():
+        raise FileNotFoundError(f"Profile '{name}' does not exist.")
+    if home.resolve() == Path(_hermes_home).resolve():
+        return None  # already the launch profile (no override needed)
     _served_profile_homes.add(home)  # the change watcher must stat every served sibling store too
     return home
 
@@ -640,12 +642,25 @@ def _pending_clarify_request_payload(sid: str) -> dict | None:
             # Batch clarify: replay the answers locked so far so a reconnecting client restores its ✓ state.
             if (batch := _batch_clarify.get(rid)) is not None and batch["answers"]:
                 snapshot["answers"] = dict(batch["answers"])
+                if batch.get("notes"):
+                    snapshot["notes"] = dict(batch["notes"])
             return snapshot
     if (session := _sessions.get(sid)) is not None:
         with session.get("history_lock", threading.Lock()):
             pending = session.get("_compute_host_pending_clarify")
             return dict(pending) if isinstance(pending, dict) else None
     return None
+
+
+def _has_pending_clarify_request(sid: str) -> bool:
+    """Whether ``sid`` owns a still-answerable clarify bridge request.
+
+    The request registry is the authority during a transport gap. Compute-host
+    sessions retain the same authority in their pending mirror. A detached
+    renderer can resume and replay either form; treating it as an abandoned
+    turn would turn the user-visible card into an implicit empty response.
+    """
+    return _pending_clarify_request_payload(sid) is not None
 
 
 def _pending_approval_request_payload(session_key: str) -> dict | None:
@@ -1267,7 +1282,13 @@ _EXPIRING_REQUESTS = frozenset({
 })
 
 
-def _block(event: str, sid: str, payload: dict, timeout: float | None = 300, batch_qids: list[str] | None = None) -> str:
+def _block(
+    event: str,
+    sid: str,
+    payload: dict,
+    timeout: float | None = 300,
+    batch_qids: list[str] | None = None,
+) -> Any:
     rid = uuid.uuid4().hex[:8]
     ev = threading.Event()
     with _prompt_lock:
@@ -1277,8 +1298,8 @@ def _block(event: str, sid: str, payload: dict, timeout: float | None = 300, bat
         if batch_qids:
             # Multi-question clarify: per-question answers accumulate here (update-in-place until every
             # qid is locked); locked answers survive a timeout — see the batch read-out below.
-            _batch_clarify[rid] = {"qids": list(batch_qids), "answers": {}}
-    answered, batch_answers = False, None
+            _batch_clarify[rid] = {"qids": list(batch_qids), "answers": {}, "notes": {}}
+    answered, batch_answers, batch_notes = False, None, None
     try:
         _emit(event, sid, payload)
         # Event semantics: None → wait forever (clarify_timeout <= 0; released only by a real answer or
@@ -1292,19 +1313,29 @@ def _block(event: str, sid: str, payload: dict, timeout: float | None = 300, bat
             answer = _answers.pop(rid, "")
             if (batch_state := _batch_clarify.pop(rid, None)) is not None:
                 batch_answers = dict(batch_state["answers"])
+                batch_notes = dict(batch_state.get("notes") or {})
     expire = lambda: _emit(f"{event.removesuffix('.request')}.expire", sid, {"request_id": rid})
     if batch_qids is not None:
-        # Cancel-all (respond with no question_id) resolves via _answers with "" — a plain cancel, not a partial result.
+        # Deliberate UI Skip/cancel-all keeps the historic empty bridge value;
+        # an interrupted turn gets a reason-aware result that clarify_tool
+        # projects as ``cancelled`` rather than an answered blank.
         if answer_present:
+            if answer == CANCELLED_RESPONSE:
+                return json.dumps({"answers": batch_answers or {}, "cancelled": True}, ensure_ascii=False)
             return answer
         result: dict[str, object] = {"answers": batch_answers or {}}
+        if batch_notes:
+            result["notes"] = batch_notes
         if not answered:
             # Deadline hit: keep what was locked, report the rest as absences (not skips), still expire live cards.
             result["timed_out"] = True
             expire()
         return json.dumps(result, ensure_ascii=False)
-    if not answered and not answer_present and event in _EXPIRING_REQUESTS:
-        expire()
+    if not answered and not answer_present:
+        if event in _EXPIRING_REQUESTS:
+            expire()
+        if event == "clarify.request":
+            return TIMEOUT_RESPONSE
     return answer
 
 
@@ -1372,12 +1403,14 @@ def _tour_request(sid: str, payload: dict) -> str:
 
 
 def _clear_pending(sid: str | None = None) -> None:
-    """Release pending prompts with an empty answer: only *sid*'s (session.interrupt must not cancel other
-    sessions' prompts), or every one when *sid* is None (shutdown)."""
+    """Release pending prompts: only *sid*'s (session.interrupt must not cancel other sessions' prompts),
+    or every one when *sid* is None (shutdown).  Clarify stops carry a cancellation sentinel so they never
+    masquerade as a deliberate UI Skip at the tool-result seam."""
     with _prompt_lock:
         for rid, (owner_sid, ev) in list(_pending.items()):
             if sid is None or owner_sid == sid:
-                _answers[rid] = ""
+                event = _pending_prompt_payloads.get(rid, ("", {}))[0]
+                _answers[rid] = CANCELLED_RESPONSE if event == "clarify.request" else ""
                 ev.set()
 
 
@@ -1956,25 +1989,8 @@ def _get_usage(agent) -> dict:
     }
     comp = getattr(agent, "context_compressor", None)
     if comp:
-        # context_used is *current-window* occupancy — never usage["total"] (cumulative: an external engine
-        # showed 1.9m/120k clamped to 100%). Falsy last_prompt_tokens emits NO gauge; the -1 "compression
-        # just ran" sentinel clamps to 0 (matches cli.py _get_status_bar_snapshot).
-        # Do NOT fall back to usage["total"] (cumulative lifetime session_total_tokens): for an external
-        # context engine that doesn't report last_prompt_tokens that substitution showed lifetime totals as
-        # the live context fill, yielding impossible readings such as 1.9m/120k clamped to 100% (#50421).
-        # Per the issue, populate context_used/percent only from a *real* current-occupancy value and "leave
-        # it unknown otherwise" — so a falsy last_prompt_tokens (0 or missing, i.e. an engine that doesn't
-        # track per-window occupancy) intentionally emits no gauge rather than a fabricated 0% or the old
-        # cumulative reading. The built-in compressor always reports a real last_prompt_tokens once a turn
-        # runs, so it is unaffected. Clamp the -1 "compression just ran, awaiting real usage" sentinel
-        # (conversation_compression.py) to 0 so the transitional turn reads as unknown (no gauge) instead of
-        # leaking context_used=-1.
-        last_prompt = max(0, getattr(comp, "last_prompt_tokens", 0) or 0)
-        ctx_max = getattr(comp, "context_length", 0) or 0
-        if ctx_max and last_prompt:
-            usage.update(
-                context_used=last_prompt, context_max=ctx_max,
-                context_percent=max(0, min(100, round(last_prompt / ctx_max * 100))))
+        from agent.context_breakdown import context_usage_fields
+        usage.update(context_usage_fields(comp))
         usage["compressions"] = getattr(comp, "compression_count", 0) or 0
     # Cache-hit ratio + rolling latency/tps (CLI status-bar parity). Omitted, not fabricated, when there is no
     # data (Codex reports no latency; zero cache reads shows no hit% rather than an alarming 0).
@@ -2337,6 +2353,9 @@ def _make_agent(
         with contextlib.suppress(Exception):
             importlib.import_module(_mod).wait_for_mcp_discovery()
     cfg = _load_cfg()
+    # Load hooks alongside the same profile config used to construct this agent.
+    from agent.shell_hooks import register_from_config
+    register_from_config(cfg)
     system_prompt = _startup_system_prompt(cfg, session_id or key)
     model, runtime = _resolve_agent_model_runtime(model_override, provider_override)
     _pr = _load_provider_routing()
@@ -2508,8 +2527,8 @@ def _claim_or_reuse_live(sid: str, session_key: str, record: dict, lease) -> tup
         if live is not None:
             if lease is not None:
                 lease.release()
-            # The winner is being reattached: a pending ws-orphan reap must not fire against the reclaimed client.
-            _cancel_ws_orphan_reap(live[0])
+            # The reap is cancelled by the guarded reuse (_reattach_refusal), not here: a rejected
+            # reattach must leave an in-flight orphan interrupt polling.
             return live
         with _sessions_lock:
             _sessions[sid] = record
@@ -2757,13 +2776,7 @@ def _live_session_payload(
         if cols is not None:
             session["cols"] = cols
         if transport is not None:
-            session["transport"] = transport
-            # Every transport that showed this session (pop-outs resume the same sid); on disconnect the last
-            # viewer becomes the transport instead of the drop sentinel.
-            session.setdefault("viewers", {})[transport] = time.time()
-            # See #83716.
-            if transport is not _detached_ws_transport:
-                _cancel_ws_orphan_reap(sid)  # the client is back — a pending ws-orphan reap must not fire
+            _rebind_live_transport(sid, session, transport)
         if touch:
             # #84417: do not re-fire the live turn's original user text from a stale server-queue
             # self-duplicate after settle.
@@ -3096,6 +3109,7 @@ def _start_usage_ticker(sid: str, agent, interval: float = 1.0) -> tuple[threadi
 def _respond(rid, params, key, *, allow_expired=False):
     r = params.get("request_id", "")
     question_id = str(params.get("question_id") or "")
+    note = str(params.get("note") or "")
     with _prompt_lock:
         entry = _pending.get(r)
         if not entry:
@@ -3107,12 +3121,23 @@ def _respond(rid, params, key, *, allow_expired=False):
             if question_id not in batch["qids"]:
                 return _err(rid, 4002, f"unknown question_id {question_id!r}")
             batch["answers"][question_id] = params.get(key, "")
+            if note:
+                batch.setdefault("notes", {})[question_id] = note
+            elif (notes := batch.get("notes")) is not None:
+                notes.pop(question_id, None)
             if not (remaining := [qid for qid in batch["qids"] if qid not in batch["answers"]]):
                 ev.set()
-            return _ok(rid, {"status": "ok", "remaining": remaining})
-        _answers[r] = params.get(key, "")
+            result = {"status": "ok", "remaining": remaining}
+            if note:
+                result["note"] = note
+            return _ok(rid, result)
+        answer = params.get(key, "")
+        _answers[r] = {"answer": answer, "note": note} if key == "answer" and note else answer
         ev.set()
-    return _ok(rid, {"status": "ok"})
+    result = {"status": "ok"}
+    if note:
+        result["note"] = note
+    return _ok(rid, result)
 
 
 # ── Methods: tools & system ──────────────────────────────────────────
@@ -3276,7 +3301,8 @@ from . import (  # noqa: E402
     methods_config_set as _methods_config_set, methods_images as _methods_images,
     methods_profiles as _methods_profiles, methods_prompt as _methods_prompt, methods_session as _methods_session,
     methods_tools as _methods_tools, prompt_turn as _prompt_turn, billing_view as _billing_view,
-    methods_projects as _methods_projects)
+    methods_projects as _methods_projects, methods_session_foreign as _methods_session_foreign,
+    methods_session_control as _methods_session_control)
 
 for _m in (
     _session_reaper, _session_lifecycle, _session_workdir, _compute_host_bridge, _model_switch,
@@ -3285,7 +3311,8 @@ for _m in (
     _methods_complete_helpers, _methods_slash, _methods_voice, _methods_browser,
     _methods_browser_control, _methods_session, _methods_prompt, _methods_config,
     _methods_config_set, _methods_complete, _methods_tools, _methods_profiles, _methods_images,
-    _methods_bot_relay, _prompt_turn, _billing_view, _methods_projects):
+    _methods_bot_relay, _prompt_turn, _billing_view, _methods_projects, _methods_session_foreign,
+    _methods_session_control):
     _m.register(sys.modules[__name__])
 del _m
 

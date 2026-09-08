@@ -13,6 +13,7 @@ from hermes_cli import kanban_db as kb
 _STATUS_ICONS = {
     "todo": "◻", "ready": "▶", "running": "●", "scheduled": "⏱",
     "blocked": "⊘", "done": "✓", "archived": "—",
+    "idea": "✎", "roadmap": "★",
 }
 
 _TASK_DICT_FIELDS = (
@@ -21,15 +22,22 @@ _TASK_DICT_FIELDS = (
     "created_by", "created_at", "started_at", "completed_at", "result",
     "skills", "max_retries", "model_override", "provider_override",
     "reasoning_effort", "route_source", "route_name",
-    "session_id", "workflow_template_id", "current_step_key",
+    "session_id", "workflow_template_id", "current_step_key", "completion_contract", "last_failure_error",
+    "created_by_task", "created_by_run",
 )
 _SHOW_RUN_FIELDS = (
     "id", "profile", "step_key", "status", "outcome", "summary", "error",
-    "metadata", "worker_pid", "started_at", "ended_at",
+    "metadata", "worker_pid", "started_at", "ended_at", "model", "provider",
+    "reasoning_effort", "model_source", "session_id", "input_tokens",
+    "output_tokens", "cache_read_tokens", "reasoning_tokens", "api_calls",
+    "tool_calls", "estimated_cost_usd",
 )
 _RUNS_RUN_FIELDS = (
     "id", "profile", "status", "outcome", "started_at", "ended_at",
-    "summary", "error", "metadata", "worker_pid", "step_key",
+    "summary", "error", "metadata", "worker_pid", "step_key", "model", "provider",
+    "reasoning_effort", "model_source", "session_id", "input_tokens",
+    "output_tokens", "cache_read_tokens", "reasoning_tokens", "api_calls",
+    "tool_calls", "estimated_cost_usd",
 )
 _ATTACHMENT_FIELDS = ("id", "filename", "content_type", "size", "uploaded_by", "stored_path", "created_at")
 
@@ -59,6 +67,23 @@ def _err(msg: str, rc: int = 1) -> int:
     return rc
 
 
+def _err_structured(args: argparse.Namespace, exc: BaseException, prefix: str = "kanban",
+                    rc: int = 1) -> int:
+    """Report *exc*, as JSON when ``--json`` was passed and it carries structure.
+
+    Automation on the ``--json`` surface must be able to key on the error code
+    instead of matching English; a plain ValueError has no structure to emit and
+    stays on the human path.
+    """
+    from hermes_cli.kanban_skill_preflight import structured_error_payload
+
+    payload = structured_error_payload(exc)
+    if payload is not None and getattr(args, "json", False):
+        _print_json(payload)
+        return rc
+    return _err(f"{prefix}: {exc}", rc)
+
+
 def _bulk_apply(ids: Iterable[str], op: Callable[[str], Any],
                 ok_msg: Callable[[str], str], fail_msg: Callable[[str], str]) -> int:
     """Run ``op(tid) -> bool`` per id, print ok/fail lines, exit 1 if any failed."""
@@ -72,11 +97,22 @@ def _bulk_apply(ids: Iterable[str], op: Callable[[str], Any],
     return 1 if failed else 0
 
 
+def _fmt_priority(priority: int) -> str:
+    """Render a known priority tier by name (``critical``/``high``/``normal``/
+    ``low``); an unrecognized integer renders as the bare number. Purely
+    cosmetic — never changes sort order."""
+    for name, value in kb.PRIORITY_LEVELS.items():
+        if value == priority:
+            return name
+    return str(priority)
+
+
 def _fmt_task_line(t: kb.Task) -> str:
     icon = _STATUS_ICONS.get(t.status, "?")
     assignee = t.assignee or "(unassigned)"
     tenant = f" [{t.tenant}]" if t.tenant else ""
-    return f"{icon} {t.id}  {t.status:8s}  {assignee:20s}{tenant}  {t.title}"
+    prio = f" ({_fmt_priority(t.priority)})" if t.priority is not None else ""
+    return f"{icon} {t.id}  {t.status:8s}  {assignee:20s}{tenant}  {t.title}{prio}"
 
 
 def _obj_dict(obj: Any, fields: tuple[str, ...]) -> dict[str, Any]:

@@ -50,6 +50,9 @@ DEFAULT_CONFIG = {
         # Turn cap. null = unlimited (default; caps caused silent mid-task truncation). Positive int
         # caps; "none"/"unlimited"/"inf"/0/-1 also mean unlimited (resolve_turn_limit).
         "max_turns": None,
+        # Optional one-time model-visible checkpoint warning before a finite turn cap is exhausted.
+        # null = off; set a ratio strictly between 0 and 1 (for example, 0.75).
+        "budget_warning_ratio": None,
         # Wall-clock budget (seconds) per run. null = off. When set: one-time wrap-up notice at 80%
         # elapsed; implicit provider stale timeouts capped to remaining budget. CLI equivalent:
         # `hermes chat --run-budget N`.
@@ -332,6 +335,10 @@ DEFAULT_CONFIG = {
         # default for images whose entrypoints must start as root (e.g. the bundled Hermes image,
         # which drops to `hermes` via s6-setuidgid). When on, SETUID/SETGID caps are omitted.
         "docker_run_as_host_user": False,
+        # Snap-packaged Docker under AppArmor (Ubuntu cloud images; LP#1908448) refuses to exec
+        # anything under `--init` or `--security-opt no-new-privileges` ("operation not
+        # permitted"). True drops those two flags; every other hardening stays. See #9730.
+        "docker_snap_compat": False,
         # Trusted profiles sharing one Docker container identity; empty = per-profile boundary.
         "docker_shared_container_key": "",
         # Keep a long-lived bash shell across execute() calls so cwd/env/shell variables survive.
@@ -596,9 +603,9 @@ DEFAULT_CONFIG = {
         # instead of dropping the middle with a "summary unavailable" placeholder; the session
         # freezes at its size until /compress (bypasses the cooldown) or /new.
         "abort_on_summary_failure": False,
-        # (Historical key name.) When True, gpt-5.4/5.5/5.6 on the ChatGPT Codex OAuth route raise
-        # their compaction trigger to 85%: Codex hard-caps them at a 272K window, so the global 50%
-        # would compact at ~136K. False = global `threshold`. Only that route; the same models via
+        # (Historical key name.) When True, gpt-5.4/5.5/5.6 and gpt-6 Astra (any slug containing
+        # "astra" without "900k") on the ChatGPT Codex OAuth route raise their compaction trigger to
+        # 85%: Codex hard-caps them at a 272K window, so the global 50% would compact at ~136K. False = global `threshold`. Only that route; the same models via
         # OpenAI direct, OpenRouter or Copilot keep the global value.
         "codex_gpt55_autoraise": True,
         # Show the one-time autoraise banner; False keeps the autoraise, hides the notice.
@@ -656,6 +663,8 @@ DEFAULT_CONFIG = {
             "trace": "disabled",         # "enabled" | "disabled" | "enabled_full"
         },
     },
+    # >>> FORK ANCHOR: model-recommendation-preset <<<
+    "model_recommendation": {"preset": "balanced"},
     # Auxiliary model config — provider/model per side task. provider "auto" = auto-detect;
     # empty model = provider's default aux model; all tasks fall back to
     # openrouter:google/gemini-3-flash-preview when the configured provider is unavailable.
@@ -691,9 +700,8 @@ DEFAULT_CONFIG = {
         # OpenAI-compatible request fields. Vision: download_timeout = image HTTP download (s).
         "vision": _aux(120, download_timeout=30),
         # web_extract and session_search no longer use an aux LLM; leftover blocks in user config
-        # are ignored. Compression: raise timeout for local models. max_output_tokens is only
-        # honored with a concrete provider/model AND ``reasoning_effort: none``; 0 = uncapped.
-        "compression": _aux(120, max_output_tokens=0),
+        # are ignored. Compression: raise timeout for local models.
+        "compression": _aux(120),
         "skills_hub": _aux(30),
         "approval": _aux(30),   # classifier — a fast/cheap model is recommended
         # /review reviewer: a full subagent on the async delegation rail, credentials resolved like
@@ -724,6 +732,9 @@ DEFAULT_CONFIG = {
         "triage_specifier": _aux(120),
         "kanban_decomposer": _aux(180),
         "profile_describer": _aux(60),   # 1-2 sentence profile blurb; short, cheap
+        # Desktop advisory-only router. Inert until provider and model are explicitly configured;
+        # it is intentionally absent from the model-assignment slot inventory.
+        "model_recommendation": _aux(30),
         "goal_judge": _aux(60),          # /goal satisfaction + contract drafting; JSON calls
         # Curator skill-usage review can take minutes on reasoning models (umbrellas over hundreds
         # of skills); route cheaper via `hermes model` → auxiliary → Curator.
@@ -1167,9 +1178,9 @@ DEFAULT_CONFIG = {
             "keyword": "jarvis",
         },
     },
-    
+
     "human_delay": {"mode": "off", "min_ms": 800, "max_ms": 2500},
-    
+
     # Context engine — how the context window is managed near the token limit. "compressor" =
     # built-in lossy summarization; or a plugin name (e.g. "lcm") installed in
     # plugins/context_engine/<name>/ or ~/.hermes/plugins/.
@@ -1205,6 +1216,11 @@ DEFAULT_CONFIG = {
     "delegation": {
         "model": "",  # e.g. "google/gemini-3-flash-preview" (empty = inherit parent)
         "provider": "",  # e.g. "openrouter" (empty = inherit parent provider + credentials)
+        # Fallback chain for delegated children (same entry format as the top-level list).
+        # For an unpinned child, null = inherit the parent chain; [] = disable fallback.
+        # A child pinned by provider, endpoint, or model gets no fallback unless this
+        # setting declares one explicitly.
+        "fallback_providers": None,
         "base_url": "",  # direct OpenAI-compatible endpoint for subagents
         "api_key": "",  # key for delegation.base_url (falls back to OPENAI_API_KEY)
         # Wire protocol for delegation.base_url: "chat_completions" | "codex_responses" |
@@ -1216,6 +1232,14 @@ DEFAULT_CONFIG = {
         # {"extra_body": {"provider": {"sort": "throughput"}}}. Explicit values win OVER
         # runtime/parent overrides (extra_body deep-merged 1 level).
         "request_overrides": {},
+        # compression_threshold_tokens: optional absolute cap on a subagent's compaction TRIGGER
+        # (not the request payload), applied as the lower of this and the child's ratio threshold.
+        # 0 (default) = no subagent-specific cap; children compact at the same 0.50 x window as the
+        # parent (500K on a 1M model). A replay of a 1,393-agent run showed 200K-400K caps within
+        # 5% of each other in cost once cache prefixes are intact, and every compaction is a
+        # chance to lose detail, so the default stays off. A token count >= 16000 enables it;
+        # other values (true, "200k") are config errors: warned and ignored.
+        "compression_threshold_tokens": 0,
         # When delegate_task narrows child toolsets, keep the parent's enabled MCP toolsets (so
         # toolsets=["web"] doesn't strip MCP). false = strict intersection.
         "inherit_mcp_toolsets": True,
@@ -1235,6 +1259,9 @@ DEFAULT_CONFIG = {
         # Max parallel children per batch AND max concurrent background delegation units; async
         # dispatches beyond it run synchronously. Floor 1, no ceiling.
         "max_concurrent_children": 10,
+        # Background fan-outs return as ONE message when the whole call finishes. true = each task
+        # (or `group`) returns on its own as it finishes — more new turns for the orchestrator.
+        "independent_completions": False,
         # Orchestrator role controls. Depth floored at 1, no ceiling; each level multiplies cost.
         "max_spawn_depth": 1,  # 1 = flat, 2 = orchestrator→leaf, 3+ = deeper
         "orchestrator_enabled": True,  # kill switch for role="orchestrator"
@@ -1292,7 +1319,7 @@ DEFAULT_CONFIG = {
                     {"provider": "openrouter", "model": "deepseek/deepseek-v4-pro"},
                 ],
                 "aggregator": {"provider": "openrouter", "model": "anthropic/claude-opus-4.8"},
-                "max_tokens": 4096,
+
                 "enabled": True,
             }
         },
@@ -1724,6 +1751,30 @@ DEFAULT_CONFIG = {
         # it follows the bounded interruption policy (max_infra_interruptions) instead.
         # Default 24h. Parse only positive base-10 integer retry-after values.
         "provider_backoff_max_seconds": 86400,
+        # Optional host-wide account/budget quota circuits. Configure this only
+        # in the shared/default Hermes home's config.yaml; dispatchers and
+        # profile-scoped workers read that one authoritative host policy.
+        # Empty by default:
+        # provider names are not account identities, and credential selection
+        # happens inside the worker. Operators explicitly map opaque, non-secret
+        # group labels to provider/profile routes, for example:
+        # quota_budget_groups:
+        #   primary-wallet:
+        #     providers: [openai-codex]
+        #     profiles: [implementer, reviewer]
+        # A route matches both lists; `*` is accepted only when written. A task
+        # with provider `auto` is a candidate for every group mapped to its
+        # profile: the dispatcher predicts the provider the worker's own
+        # resolution ladder will choose for the explicit `provider=auto`
+        # request it is spawned with, and starts it only when that provider
+        # maps to an unpaused group. Unpredictable or unmapped resolution fails
+        # closed while any candidate group is paused.
+        "quota_budget_groups": {},
+        # At a circuit deadline, admit one recovery probe host-wide, then admit
+        # at most one further matching start per this many seconds until no
+        # start has been admitted for four such windows. A renewed quota event
+        # re-arms the circuit.
+        "quota_resume_spread_seconds": 30,
         # Max consecutive infra interruptions (external SIGTERM/SIGKILL, startup-window
         # dead pid, quota signature including malformed/missing retry-after) before the
         # task is routed through normal counted failure accounting. Default 3; minimum
@@ -1784,10 +1835,65 @@ DEFAULT_CONFIG = {
         # the earliest start leaves the window. None = off.
         "dispatch_start_budget": None,
         "dispatch_start_window_seconds": 600,
+        # Maintenance actions an operator may queue to fire automatically once a
+        # PAUSED board drains to zero running workers (dashboard "after drain"
+        # selector / POST /dispatch/post-drain). The trigger is drain, never a
+        # wall clock; expiry below is a safety bound, not a schedule.
+        "post_drain": {
+            # Units `service_restart` may restart, by exact name. EMPTY BY
+            # DEFAULT: a queued action runs unattended, so which units may be
+            # restarted is an explicit local decision rather than an inherited
+            # one, and an empty list makes `service_restart` unqueueable. A
+            # request may only NAME an entry from this list — it can never
+            # supply a unit of its own. e.g. ["hermes-gateway.service"].
+            "service_restart_allowlist": [],
+            # "system" (systemctl) or "user" (systemctl --user).
+            "service_restart_scope": "system",
+            # Expiry applied when the operator does not choose one. A pause that
+            # never drains lets the action expire instead of firing hours later
+            # into a state nobody expects.
+            "default_expiry_seconds": 3600,
+            # Hard ceiling on any requested expiry (24h).
+            "max_expiry_seconds": 86400,
+        },
         # After two reviewer changes-requested cycles, route the next rework run
         # to this specialist profile under that profile's own model defaults.
         # Empty preserves the original implementer loop.
         "review_rework_escalation_profile": "",
+        # Worker preservation safety net. When a run ends (completion, review
+        # request, block, archive) or is reclaimed (stale claim, timeout, dead
+        # worker), Hermes commits any dirty work in that task's OWN git
+        # worktree onto its existing task branch and pushes it to the
+        # configured remote without force — so implementation work never
+        # remains only on the machine that produced it.
+        #
+        # It is a PRESERVATION net, not merge automation: it never merges,
+        # rebases, force-pushes, switches branches, or deletes a worktree or
+        # branch, and it never touches another task's workspace. Ownership or
+        # branch ambiguity fails closed before commit; unsafe content and git
+        # failures record a redacted ``work_preservation_failed`` event. A
+        # rejected push keeps the local commit and records ``pushed: false``.
+        # In every case cleanup retains dirty or unpushed work for a human.
+        # Only ``worktree`` workspaces are in scope; ``scratch``/``dir`` are
+        # untouched. Gitignored files are excluded by git itself.
+        "worker_preservation": {
+            # Set false for non-Git workflows or hosts with custom remotes
+            # where an automated push is unwanted. Preservation is skipped
+            # entirely; nothing else changes.
+            "enabled": True,
+            # Refuse to snapshot when any single candidate file exceeds this,
+            # or when the whole snapshot does. A safety net rescues
+            # source-sized work; larger content is a build artifact or dataset
+            # a human should place deliberately.
+            "max_file_bytes": 5 * 1024 * 1024,
+            "max_total_bytes": 20 * 1024 * 1024,
+        },
+        # Hard stop on the review<->changes_requested loop: once a card accumulates this many
+        # changes_requested events since its last completion, the dispatcher blocks it
+        # (kind="review_round_cap") instead of re-dispatching to the implementer or escalation
+        # profile. 0 = unlimited (legacy behavior). The reviewer-side round contract (sdlc-review
+        # skill) is advisory; this is the hard stop that actually bounds a runaway rework loop.
+        "max_review_rounds": 3,
         # Auto-run the decomposer on Triage tasks every tick. False = manual via `hermes kanban
         # decompose <id>` or the dashboard's Decompose button.
         "auto_decompose": True,
@@ -1907,7 +2013,7 @@ DEFAULT_CONFIG = {
         # providers: {openrouter: {url: https://example.com/my-curation.json}}.
         "providers": {},
     },
-    # Per-model metadata overrides. Fields: context_window, max_output_tokens, supports_tools,
+    # Per-model metadata overrides. Fields: context_window, supports_tools,
     # supports_vision, supports_reasoning, model_family. <provider>.<model_id> wins over
     # models.dev/OpenRouter/hardcoded defaults for the fields it sets (chain order in
     # agent/model_metadata.py). <provider>._default and top-level _default fill gaps ONLY for models
@@ -2104,10 +2210,7 @@ DEFAULT_CONFIG = {
         # Minimum hours between auto-maintenance runs (tracked in state.db state_meta, shared across
         # processes).
         "min_interval_hours": 24,
-        # Legacy ~/.hermes/sessions/session_{sid}.json snapshots rewritten every turn. state.db is
-        # canonical (superset); snapshots consumed GBs on heavy users. Enable only for an external
-        # tool that reads the JSON files directly.
-        "write_json_snapshots": False,
+
         # Notice about the compact FTS layout (reclaims ~60%+ of state.db). OPT-IN: legacy indexes
         # stay until `hermes sessions optimize-storage` runs, since the rebuild is disk-heavy on
         # large DBs. advise = `hermes update` prints a one-line notice with reclaimable size when a
@@ -2178,6 +2281,8 @@ DEFAULT_CONFIG = {
         # update checks (e.g. a local dev build/fork). `HERMES_DEV=1` disables the same checks
         # unconditionally. Does not affect `hermes update` itself (always an explicit user action).
         "check_for_updates": True,
+        # Passive version/banner checks only; explicit `hermes update --check` remains enabled.
+        "check": True,
         # Pre-update backup. quick = snapshot small critical state (pairing JSONs, cron jobs,
         # config.yaml, .env, auth.json, profile DBs) into <HERMES_HOME>/state-snapshots/, skipping
         # files >1 GiB; restore via ``/snapshot``. full = quick PLUS a ``hermes backup`` zip in
@@ -2386,6 +2491,9 @@ DEFAULT_CONFIG = {
         # gnome-libsecret|kwallet|kwallet5|kwallet6|basic force one (basic = unencrypted). Bridged
         # to HERMES_DESKTOP_PASSWORD_STORE; ignored off-Linux.
         "password_store": "auto",
+        # Linux: False preserves an existing custom XDG launcher entry; missing entries
+        # are still created. True keeps the generated entry current on each launch.
+        "manage_launcher_entry": True,
         # macOS only: code-signing identity (login-keychain cert; self-signed works) to re-sign
         # locally rebuilt apps so the Designated Requirement — and thus TCC grants — survives
         # updates. Empty = default ad-hoc identifier-pinned signing.
@@ -2405,6 +2513,15 @@ DEFAULT_CONFIG = {
         # server-issued credential lifetime (raising above it has no effect). 0 disables the
         # keepalive thread.
         "keepalive_interval_seconds": 900,
+        # anthropic_wire: which Portal route carries anthropic/* models. "chat" =
+        # /v1/chat/completions (default for now); "native" = /v1/messages, the Anthropic
+        # Messages wire (signed thinking passthrough, native cache_control scopes); "auto" =
+        # start on chat and, per session, switch to native from the first response when the
+        # Portal upstream serving the model is one where native is known clean. Native is the
+        # better wire but on the OpenRouter-served path it re-writes the previous turn's cache on
+        # 14-20% of consecutive calls in concurrent tool loops (measured 2026-09-06;
+        # NousResearch/api#227), so chat is the default until that is fixed.
+        "anthropic_wire": "chat",
     },
     # Google Vertex AI (Gemini). Auth is OAuth2 from a service-account JSON or ADC, NOT an API key;
     # the credential path lives in .env (VERTEX_CREDENTIALS_PATH / GOOGLE_APPLICATION_CREDENTIALS).
@@ -2431,7 +2548,7 @@ DEFAULT_CONFIG = {
         # Extra ports detection probes for an external llama-server (besides 8080).
         "detect_ports": [],
     },
-    "_config_version": 40,  # Config schema version - bump this when adding new required fields
+    "_config_version": 41,  # Config schema version - bump this when adding new required fields
 }
 
 
