@@ -2304,28 +2304,72 @@ describe('ClarifyTool batch staged state survives the correlation gap', () => {
     })
   })
 
-  it('keeps a staged CHOICE and its note across the same gap', () => {
-    $activeSessionId.set('session-1')
-    $gateway.set({ request: vi.fn().mockResolvedValue({ ok: true }) } as never)
-    setClarifyRequest({
-      ...parkedBatch,
-      questions: [{ choices: BURIED_CHOICES, multiSelect: false, qid: 'q0', question: BURIED_QUESTION }]
-    })
+  it('keeps a recommended choice and its note visible through request loss and replay', async () => {
+    const request = vi.fn().mockResolvedValue({ ok: true })
+    const decoratedChoices = ['Alpha (Recommended)', 'Beta']
+    const bareChoices = ['Alpha', 'Beta']
 
-    const props = uncorrelatedBatchProps()
+    const parkedRecommendedBatch = {
+      ...parkedBatch,
+      questions: [{ choices: decoratedChoices, multiSelect: false, qid: 'q0', question: BURIED_QUESTION }]
+    }
+
+    const args = { questions: [{ choices: bareChoices, question: BURIED_QUESTION }] }
+
+    const props: ToolCallMessagePartProps = {
+      ...uncorrelatedSingleProps(),
+      args,
+      argsText: JSON.stringify(args),
+      toolCallId: 'clarify-batch-draft'
+    }
+
+    $activeSessionId.set('session-1')
+    $gateway.set({ request } as never)
+    setClarifyRequest(parkedRecommendedBatch)
+
     const { rerender } = renderClarify(<ClarifyTool {...props} />)
 
-    const choice = [...document.querySelectorAll<HTMLButtonElement>('[data-choice]')][1]
-    expect(choice.hasAttribute('disabled')).toBe(false)
-    fireEvent.click(choice)
-    expect(document.querySelector('[data-clarify-answered]')).toBeTruthy()
+    // The gateway decorates the recommended option, while persisted tool args
+    // retain the bare value. Stage the real request-side value while armed.
+    const alpha = [...document.querySelectorAll<HTMLButtonElement>('[data-choice]')][0]
+    expect(alpha.disabled).toBe(false)
+    fireEvent.click(alpha)
+    fireEvent.click(screen.getByRole('button', { name: 'Add note for Alpha' }))
+    fireEvent.change(screen.getByRole('textbox', { name: 'Note for Alpha' }), {
+      target: { value: 'keep this note' }
+    })
 
+    expect(alpha.getAttribute('aria-pressed')).toBe('true')
+    expect(screen.getByRole('textbox', { name: 'Note for Alpha' })).toHaveProperty('value', 'keep this note')
+
+    // Correlation drops: the card renders from bare args, but the selected
+    // option and its open note must remain visible instead of disappearing.
     act(() => clearClarifyRequest('request-batch-draft', 'session-1'))
     rerender(clarifyTree(<ClarifyTool {...props} />))
 
-    // The pick is still visibly staged (the block stays in its answered state)
-    // even though the rendered question ids swapped to the synthetic ones.
-    expect(document.querySelector('[data-clarify-answered]')).toBeTruthy()
+    const inertAlpha = [...document.querySelectorAll<HTMLButtonElement>('[data-choice]')][0]
+    expect(inertAlpha.getAttribute('aria-pressed')).toBe('true')
+    expect(screen.getByRole('textbox', { name: 'Note for Alpha' })).toHaveProperty('value', 'keep this note')
     expect(document.querySelector('[data-clarify-restoring]')).toBeTruthy()
+
+    // The same request id replays with decorated choices. Preserve the same
+    // local state, then send the canonical bare answer and server qid.
+    act(() => setClarifyRequest(parkedRecommendedBatch))
+    rerender(clarifyTree(<ClarifyTool {...props} />))
+
+    const replayedAlpha = [...document.querySelectorAll<HTMLButtonElement>('[data-choice]')][0]
+    expect(replayedAlpha.getAttribute('aria-pressed')).toBe('true')
+    expect(screen.getByRole('textbox', { name: 'Note for Alpha' })).toHaveProperty('value', 'keep this note')
+
+    fireEvent.click(screen.getByRole('button', { name: /Confirm and continue/ }))
+
+    await waitFor(() => {
+      expect(request).toHaveBeenCalledWith('clarify.respond', {
+        answer: 'Alpha',
+        note: 'keep this note',
+        question_id: 'q0',
+        request_id: 'request-batch-draft'
+      })
+    })
   })
 })

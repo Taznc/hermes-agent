@@ -1494,7 +1494,12 @@ function BatchQuestionBlock({
       {choices.length > 0 ? (
         <div className="grid gap-px pl-[1.625rem]" role="group">
           {choices.map((choice, choiceIndex) => {
-            const selected = staged.choices.includes(choice)
+            // The gateway decorates its recommended choice for display, while
+            // persisted tool args carry the bare option. Local staged state
+            // uses the wire-answer identity so request → args-only → replay
+            // cannot make a selection (and its note) disappear.
+            const choiceId = bareChoice(choice)
+            const selected = staged.choices.includes(choiceId)
 
             return (
               <div className="grid gap-1" key={`${choiceIndex}-${choice}`}>
@@ -1512,15 +1517,15 @@ function BatchQuestionBlock({
                   target={`choice-${question.qid}-${choiceIndex}`}
                   targetLabel={bareChoice(choice)}
                 />
-                {selected && (!staged.noteOpen || staged.noteAnchor === choice) ? (
+                {selected && (!staged.noteOpen || staged.noteAnchor === choiceId) ? (
                   <ClarifyNoteControl
                     disabled={disabled}
                     label={bareChoice(choice)}
                     note={staged.note}
                     onChange={onNote}
                     onKeyDown={onFieldKeyDown}
-                    onOpen={() => onNoteOpen(choice)}
-                    open={staged.noteOpen && staged.noteAnchor === choice}
+                    onOpen={() => onNoteOpen(choiceId)}
+                    open={staged.noteOpen && staged.noteAnchor === choiceId}
                   />
                 ) : null}
               </div>
@@ -1678,7 +1683,7 @@ function ClarifyToolBatchPending({
           }
         }
 
-        const matchedChoices = options.filter(choice => replayedAnswers.includes(bareChoice(choice)))
+        const matchedChoices = options.map(bareChoice).filter(choice => replayedAnswers.includes(choice))
         const note = lockedNotes?.[question.qid] ?? ''
         next[question.stageKey] =
           matchedChoices.length > 0
@@ -1771,12 +1776,13 @@ function ClarifyToolBatchPending({
   const toggleChoice = useCallback((question: BatchRow, choice: string) => {
     setStaged(current => {
       const stage = current[question.stageKey] ?? emptyStage
+      const choiceId = bareChoice(choice)
 
       const next = question.multiSelect
-        ? stage.choices.includes(choice)
-          ? stage.choices.filter(value => value !== choice)
-          : [...stage.choices, choice]
-        : [choice]
+        ? stage.choices.includes(choiceId)
+          ? stage.choices.filter(value => value !== choiceId)
+          : [...stage.choices, choiceId]
+        : [choiceId]
 
       return {
         ...current,
@@ -1817,7 +1823,10 @@ function ClarifyToolBatchPending({
     setStaged(current => {
       const stage = current[question.stageKey] ?? emptyStage
 
-      return { ...current, [question.stageKey]: { ...stage, noteAnchor: choice, noteOpen: true } }
+      return {
+        ...current,
+        [question.stageKey]: { ...stage, noteAnchor: choice === null ? null : bareChoice(choice), noteOpen: true }
+      }
     })
   }, [])
 
