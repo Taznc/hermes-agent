@@ -436,6 +436,45 @@ hermes kanban create "nightly ops review" \
     --json
 ```
 
+### Landing an approved card (`hermes kanban land`)
+
+Once a reviewer has approved a card, `hermes kanban land` turns that approval
+into a verified merge — replacing the manual archaeology of checking the board,
+the worktree, the push state, git ancestry and the remote by hand before every
+cleanup.
+
+```bash
+# Configure the target once per board, then land by id
+hermes kanban boards set-land-target default origin/dev
+hermes kanban land t_abc
+
+# Or name it explicitly; batch and dry-run are supported
+hermes kanban land t_abc t_def --target origin/dev --dry-run --json
+```
+
+It is **attended only** — nothing runs it automatically — and every gate fails
+closed with a reason code rather than merging on an assumption:
+
+- The target is read from `--target` or the board's `land_target` and **never
+  inferred**. A repository with both a fork and an upstream configured has no
+  safe default, so with neither set the command refuses. Output always names
+  the remote and branch.
+- It requires an explicit reviewer approval (a run claimed from the `review`
+  column that completed the card — a `done` status alone is not approval), no
+  live worker, satisfied dependencies, a clean worktree, and a branch published
+  on that remote at exactly the reviewed commit.
+- It requires verification evidence for **that exact commit**: either the
+  board's `land_verify` command re-run now, or a verification receipt on the
+  approval run naming the same commit.
+- It merges in a throwaway worktree, pushes **without force**, then re-reads the
+  remote and only closes the card once the content is provably reachable there
+  (or patch-equivalent, so a squash-merged card is recognised as already
+  landed). Re-running a landing is therefore safe and idempotent.
+- `--dry-run` mutates nothing at all, not even a fetch, and `--json` returns one
+  verdict per task. In a batch, one refusal never affects another card.
+
+Full safety model and per-step recovery: `docs/kanban/landing.md` in the repo.
+
 ### Bulk CLI verbs
 
 All the lifecycle verbs accept multiple ids so you can clean up a batch

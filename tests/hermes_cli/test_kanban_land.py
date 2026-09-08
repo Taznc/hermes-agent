@@ -578,3 +578,33 @@ def test_boards_set_land_target_persists_the_configuration(kanban_home):
     )
     assert kc.kanban_command(args) == 0
     assert kb.read_board_metadata("default")["land_target"] == "origin/dev"
+
+
+def test_dry_run_does_not_even_fetch_the_remote(kanban_home, repo):
+    """"Zero mutation" includes local refs: a dry run must not write
+    remote-tracking refs either, so it can never move a reader's view."""
+    with kbc.connect() as conn:
+        task_id, path = make_approved_task(conn, repo)
+        before = git(repo.clone, "for-each-ref", "--format=%(refname) %(objectname)", "refs/remotes")
+        kl.land_task(conn, task_id, target=("origin", "dev"), dry_run=True)
+        after = git(repo.clone, "for-each-ref", "--format=%(refname) %(objectname)", "refs/remotes")
+    assert before == after
+
+
+def test_landing_refuses_a_target_branch_the_remote_does_not_publish(kanban_home, repo):
+    """Landing never creates a target branch it was not told exists."""
+    with kbc.connect() as conn:
+        task_id, path = make_approved_task(conn, repo)
+        with pytest.raises(kl.LandRefusal) as exc:
+            kl.land_task(conn, task_id, target=("origin", "no-such-branch"))
+    assert exc.value.reason == "target_unresolvable"
+    assert repo.remote_sha("no-such-branch") == ""
+
+
+def test_landing_leaves_no_staging_worktree_behind(kanban_home, repo):
+    """Every merge happens in a throwaway tree; none may survive the run."""
+    with kbc.connect() as conn:
+        task_id, path = make_approved_task(conn, repo)
+        kl.land_task(conn, task_id, target=("origin", "dev"))
+    trees = git(repo.clone, "worktree", "list")
+    assert "hermes-land-" not in trees
