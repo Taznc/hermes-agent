@@ -24,7 +24,13 @@ export const forkZh: ForkTranslations = {
         '网关 token 和登录凭据以仅当前用户可读的普通文件形式存储。可在下方启用系统钥匙串加密以获得更强保护。',
       secretStorageHintEnable: '启用加密',
       secretStorageHintDismiss: '关闭',
-      openLogsFailed: '无法打开日志文件夹'
+      openLogsFailed: '无法打开日志文件夹',
+      singleBackendTitle: '单一后端，由服务器管理',
+      singleBackendDesc: (host: string) =>
+        `此浏览器版本固定连接到 ${host} 上的单个 Hermes 后端。注册远程、SSH 或 Cloud 网关需要使用 Hermes 桌面应用。`,
+      singleBackendDescNoHost:
+        '此浏览器版本固定连接到单个 Hermes 后端。注册远程、SSH 或 Cloud 网关需要使用 Hermes 桌面应用。',
+      singleBackendDocsLink: '将桌面应用连接到多个 Hermes 实例'
     },
     sessions: {
       rateLimitRecoveryTitle: 'When a turn hits a rate limit',
