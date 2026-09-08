@@ -770,6 +770,9 @@ function ClarifyToolSinglePending({
   const ready = Boolean(matchingRequest?.requestId)
   const loading = !ready && !submitting && !question
   // Inert-but-visible: the question is legible, the controls are not yet armed.
+  // `!submitting` excludes the submit → tool.complete gap, where the request is
+  // deliberately already cleared and "you can answer in a moment" would
+  // misdescribe an answer the user just sent.
   const restoring = !ready && !submitting && Boolean(question)
 
   const respond = useCallback(
@@ -1525,7 +1528,6 @@ function ClarifyToolBatchPending({
   )
 
   const ready = Boolean(request?.requestId && request.questions?.length)
-  const restoring = questions.length > 0 && !ready
 
   const [staged, setStaged] = useState<
     Record<string, { choices: string[]; draft: string; note: string; noteAnchor: string | null; noteOpen: boolean }>
@@ -1534,6 +1536,11 @@ function ClarifyToolBatchPending({
   const [submitting, setSubmitting] = useState(false)
   const submittingRef = useRef(false)
   const formRef = useRef<HTMLFormElement | null>(null)
+
+  // Inert-but-visible: painted from args, not yet armed. Excludes the submit →
+  // tool.complete gap, where the request is deliberately already cleared and
+  // "you can answer in a moment" would be a lie about what just happened.
+  const restoring = questions.length > 0 && !ready && !submitting
 
   // Reconnect replay: answers the server already locked (an earlier window's
   // partial progress) pre-stage their questions so the restored card shows

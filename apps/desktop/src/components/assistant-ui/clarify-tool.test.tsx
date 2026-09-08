@@ -1973,4 +1973,38 @@ describe('ClarifyTool inert card owner isolation', () => {
     expect(screen.getByRole('button', { name: /Confirm and continue/ }).hasAttribute('disabled')).toBe(true)
     expect(screen.getByRole('button', { name: /Skip/ }).hasAttribute('disabled')).toBe(true)
   })
+
+  it('does not claim to be "restoring" during the submit → tool.complete gap', async () => {
+    // Caught live on the served candidate build: answering clears the request
+    // a beat before tool.complete swaps in the settled card. `!ready` is true
+    // in that window for the right reason, so a plain !ready check told the
+    // user their just-sent answer was "restoring — you can answer in a moment".
+    const request = vi.fn().mockResolvedValue({ ok: true, remaining: [] })
+
+    $activeSessionId.set('session-1')
+    $gateway.set({ request } as never)
+    setClarifyRequest({
+      choices: null,
+      multiSelect: false,
+      question: '',
+      questions: [{ choices: BURIED_CHOICES, multiSelect: false, qid: 'q0', question: BURIED_QUESTION }],
+      requestId: 'request-gap',
+      sessionId: 'session-1'
+    })
+
+    renderClarify(<ClarifyTool {...uncorrelatedBatchProps()} />)
+    expect(document.querySelector('[data-clarify-restoring]')).toBeNull()
+
+    fireEvent.click([...document.querySelectorAll<HTMLButtonElement>('[data-choice]')][0])
+    fireEvent.click(screen.getByRole('button', { name: /Confirm and continue/ }))
+
+    await waitFor(() => {
+      expect(request).toHaveBeenCalled()
+    })
+
+    // The request is cleared on success; the card holds until tool.complete.
+    await waitFor(() => {
+      expect(document.querySelector('[data-clarify-restoring]')).toBeNull()
+    })
+  })
 })
