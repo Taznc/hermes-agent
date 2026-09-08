@@ -4,7 +4,6 @@ import { type ReactNode, useEffect, useMemo, useState } from 'react'
 import { useElapsedSeconds } from '@/components/chat/activity-timer'
 import { ActivityTimerText } from '@/components/chat/activity-timer-text'
 import { usePaneVisible } from '@/components/pane-shell/pane-visibility'
-import { Codicon } from '@/components/ui/codicon'
 import { FadeText } from '@/components/ui/fade-text'
 import { GlyphSpinner } from '@/components/ui/glyph-spinner'
 import { type Translations, useI18n } from '@/i18n'
@@ -217,15 +216,10 @@ function SubagentTree({ tree }: { tree: SubagentNode[] }) {
     return () => window.clearInterval(id)
   }, [active, visible])
 
-  if (tree.length === 0) {
-    return (
-      <div className="grid place-items-center gap-3 py-12 text-center">
-        <Codicon className="text-muted-foreground/60" name="hubot" size="1.5rem" />
-        <p className="text-sm font-medium text-foreground/90">{t.agents.emptyTitle}</p>
-        <p className="max-w-md text-xs leading-relaxed text-muted-foreground/75">{t.agents.emptyDesc}</p>
-      </div>
-    )
-  }
+  // The tree.length === 0 case is handled by SpawnTreeView, which returns
+  // PanelEmpty before ever calling this component — SubagentTree is not
+  // exported and has no other caller, so there is exactly one empty-state
+  // rendering for the Spawn tree tab.
 
   const summary = [
     t.agents.agentsCount(flat.length),
