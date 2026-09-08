@@ -35,6 +35,8 @@ import type {
   KanbanTask,
   KanbanTaskDetail,
   OrchestrationSettings,
+  PostDrainCancelResult,
+  PostDrainQueueResult,
   StagedAttachment,
   TaskEstimate,
   WorkerLog
@@ -721,6 +723,31 @@ export const resumeDispatch = () =>
   $boardSlug.get() === ALL_BOARDS
     ? resumeAllDispatch()
     : call<DispatchResumeResult>(dispatchPath('/dispatch/resume'), { method: 'POST' })
+
+/** Queue an action to fire once the selected scope drains to 0 running.
+ *
+ * Reuses the same `dispatchPath` scope contract as pause/resume, so All Boards
+ * arms every active board under one group and a single board arms only itself.
+ * Only the intent travels here — the dispatcher tick is what fires it, with or
+ * without this dashboard still open. */
+export const queuePostDrainAction = (input: {
+  actionKind: string
+  target?: null | string
+  expiresInSeconds?: null | number
+}) =>
+  call<PostDrainQueueResult>(dispatchPath('/dispatch/post-drain'), {
+    method: 'POST',
+    body: {
+      action_kind: input.actionKind,
+      expires_in_seconds: input.expiresInSeconds ?? null,
+      target: input.target ?? null
+    }
+  })
+
+/** Cancel a waiting action. `cancelled: false` means nothing was waiting to
+ *  cancel (already firing or already settled) — not an error. */
+export const cancelPostDrainAction = () =>
+  call<PostDrainCancelResult>(dispatchPath('/dispatch/post-drain'), { method: 'DELETE' })
 
 export const saveProfileDescription = (name: string, description: string) =>
   call(`/profiles/${encodeURIComponent(name)}`, { method: 'PATCH', body: { description } })

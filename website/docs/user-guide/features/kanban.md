@@ -494,6 +494,31 @@ loops without removing review: the first changes request returns to the original
 implementer; after the second, the next ready run is reassigned to the configured
 specialist under that profile's own model defaults.
 
+`max_review_rounds` (default `3`, set `0` to disable) is the dispatcher's hard
+stop on that same loop: once a card accumulates this many `changes_requested`
+cycles since its last completion, the dispatcher blocks it (kind
+`review_round_cap`, visible via the card's status and its `review_round_cap`
+event in `hermes kanban show <id>`, and as a dedicated `review_round_cap`
+diagnostic — round count, cap, and last reviewer reason — in
+`hermes kanban diagnostics`) instead of re-dispatching it to the
+implementer or the escalation profile — `review_rework_escalation_profile`
+still fires first for rounds under the cap. It is a hard stop; the
+reviewer-side round-count guidance in the sdlc-review skill is advisory
+only. An operator's explicit reassignment after the last `changes_requested`
+event bypasses both mechanisms, the same escape hatch
+`review_rework_escalation_profile` already honors. A card that hits the cap
+needs an explicit `kanban unblock` to resume — the round count itself is not
+reset by unblocking, only by completion, so simply unblocking a
+still-cycling card immediately re-trips the cap on the next tick.
+
+An operator-set model/provider/reasoning override (set at task creation with
+an explicit model, or later via `kanban set-model`) survives both
+`review_rework_escalation_profile` and the round cap's handoff — only an
+override the create-time routing classifier picked (`kanban.model_routing`)
+is cleared when a card moves to the escalation profile, matching that
+profile's own model defaults the way a classifier pick already did before an
+operator ever touched the card.
+
 Override the config flag at runtime via `HERMES_KANBAN_DISPATCH_IN_GATEWAY=0`
 for debugging. Standard gateway supervision applies: run `hermes gateway
 start` directly, or wire the gateway up as a systemd user unit (see the

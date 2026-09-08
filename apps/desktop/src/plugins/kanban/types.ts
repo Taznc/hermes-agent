@@ -313,6 +313,38 @@ export interface OrchestrationSettings {
 }
 
 /** GET /dispatch/status — the pause circuit plus the drain signal. */
+
+/** A maintenance action queued to fire once the scope drains to 0 running.
+ *  The trigger is server-side (the dispatcher tick), so this record advances
+ *  whether or not this dashboard is open. */
+export interface PostDrainAction {
+  action_kind: string
+  /** Allowlisted unit for `service_restart`; null for target-less kinds. */
+  target: null | string
+  requested_by: string
+  requested_at: number
+  expires_at: number
+  /** `waiting` -> `firing` -> `succeeded | failed | expired | cancelled`. */
+  state: 'cancelled' | 'expired' | 'failed' | 'firing' | 'succeeded' | 'waiting'
+  /** Seconds until expiry, derived SERVER-side so the countdown shares the
+   *  clock that will actually expire the record. Null when unbounded. */
+  expires_in_seconds: null | number
+  /** Observed failure detail — present only in the `failed` state. */
+  error?: string
+  /** Shared by every board armed in one aggregate request. */
+  group_id?: string
+  /** Aggregate scope only: how many boards carry this action. */
+  board_count?: number
+}
+
+/** One entry the "after drain" selector may offer. Derived from the backend's
+ *  own registry + allowlist, so the UI can never offer an action that 400s. */
+export interface PostDrainActionOption {
+  action_kind: string
+  /** Allowlisted targets; empty for target-less kinds like `reboot`. */
+  targets: string[]
+}
+
 export interface DispatchStatus {
   paused: boolean
   /** Raw circuit record: `reason` is `operator_paused` for a maintenance
@@ -329,12 +361,37 @@ export interface DispatchStatus {
   running_count: number
   /** Server-rendered human status; null when running or aggregate. */
   message: null | string
+  /** The action armed for this scope, or null. Absent on older backends. */
+  post_drain?: null | PostDrainAction
+  /** Actions this host accepts. Absent on older backends (selector hidden). */
+  post_drain_actions?: PostDrainActionOption[]
   /** Aggregate-only fields returned for the explicit `boards=*` scope. */
   all_paused?: boolean
   board_count?: number
   paused_count?: number
   boards?: Array<DispatchStatus & { board: string }>
   errors?: Array<{ board: string; error: string }>
+}
+
+/** POST /dispatch/post-drain. Aggregate scope reports per-board outcomes. */
+export interface PostDrainQueueResult {
+  queued: boolean
+  state?: PostDrainAction
+  board_count?: number
+  queued_count?: number
+  group_id?: string
+  results?: Array<{ board: string; state: PostDrainAction }>
+  failures?: Array<{ board: string; error: string }>
+}
+
+/** DELETE /dispatch/post-drain. `cancelled: false` means nothing was waiting. */
+export interface PostDrainCancelResult {
+  cancelled: boolean
+  state?: null | PostDrainAction
+  board_count?: number
+  cancelled_count?: number
+  results?: Array<{ board: string; cancelled: boolean }>
+  failures?: Array<{ board: string; error: string }>
 }
 
 /** POST /dispatch/pause. `paused: false` is a REFUSAL (a dispatch tick owns

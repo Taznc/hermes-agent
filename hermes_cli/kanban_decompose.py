@@ -345,15 +345,25 @@ def decompose_task(
 def list_triage_ids(*, tenant: Optional[str] = None) -> list[str]:
     """Return task ids currently in the triage column.
 
-    Tasks parked in triage by the unblock-loop breaker are EXCLUDED: ``block_task`` routes a task
-    that re-blocked for the same cause ``BLOCK_RECURRENCE_LIMIT`` times to ``triage`` for a human.
-    Triage is also the auto-decompose sweep's input queue, so re-decomposing such a task promotes
-    it straight back to ``ready`` → claimed → blocked on the same cause → triage again, every tick
-    (seen at ``recurrences: 18`` against a limit of 2). The breaker exists to stop automated
-    retries, so the automation must not re-arm it — these stay in triage until a human resolves them."""
+    Tasks parked in triage by the unblock-loop breaker for a genuine human-decision gate
+    (``block_recurrences >= BLOCK_RECURRENCE_LIMIT`` AND ``block_kind == "needs_input"``) are
+    EXCLUDED: ``block_task`` routes a task that re-blocked for the same cause
+    ``BLOCK_RECURRENCE_LIMIT`` times to ``triage`` for a human. Triage is also the auto-decompose
+    sweep's input queue, so re-decomposing such a task promotes it straight back to ``ready`` →
+    claimed → blocked on the same cause → triage again, every tick (seen at ``recurrences: 18``
+    against a limit of 2). A ``needs_input`` cause is "a human has not made a decision yet",
+    which no amount of re-decomposition resolves, so the automation must not re-arm that loop —
+    these stay in triage until a human resolves them.
+
+    A loop-broken task whose last block kind was ``capability``/``transient``/legacy-``None`` is
+    NOT excluded: those can be genuine scope/fanout problems (the class decomposition is meant to
+    fix), so they remain visible to this sweep."""
     with kbc.connect_closing() as conn:
         rows = kb.list_tasks(conn, status="triage", tenant=tenant, limit=1000)
-    return [row.id for row in rows if (row.block_recurrences or 0) < kb.BLOCK_RECURRENCE_LIMIT]
+    return [
+        row.id for row in rows
+        if not ((row.block_recurrences or 0) >= kb.BLOCK_RECURRENCE_LIMIT and row.block_kind == "needs_input")
+    ]
 
 
 # ---- BEGIN PLUGIN-COMPAT (revert-scheduled; see COMPAT_MANIFEST.md) ----

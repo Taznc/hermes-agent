@@ -575,6 +575,75 @@ def _rule_review_dependency_deadlock(task, events, runs, now, cfg) -> list[Diagn
     )]
 
 
+def _rule_review_round_cap(task, events, runs, now, cfg) -> list[Diagnostic]:
+    """Surfaces the dispatcher's hard stop on a runaway review<->changes_requested
+    loop. ``_apply_review_round_cap`` (kanban_db_dispatch.py) blocks a card that hit
+    ``kanban.max_review_rounds`` with ``block_kind == "review_round_cap"`` and appends a
+    ``review_round_cap`` event carrying ``changes_rounds``, ``max_review_rounds``, and the
+    last reviewer ``reason`` — without a dedicated rule that event was invisible to
+    ``hermes kanban diagnostics`` even though ``hermes kanban show`` already surfaces it
+    via the generic status/event view.
+
+    Deliberately does not require the event to be the LATEST event overall (an operator
+    may have commented since) — only that it exists and the task is still blocked with
+    this block_kind, matching how ``_rule_review_dependency_deadlock`` reads its trigger
+    event.
+    """
+    if _task_field(task, "status") != "blocked":
+        return []
+    if _task_field(task, "block_kind") != "review_round_cap":
+        return []
+    cap_event = next(
+        (ev for ev in reversed(list(events)) if _event_kind(ev) == "review_round_cap"),
+        None,
+    )
+    if cap_event is None:
+        return []
+    payload = _parse_payload(cap_event)
+    changes_rounds = payload.get("changes_rounds")
+    max_review_rounds = payload.get("max_review_rounds")
+    reason = payload.get("reason")
+    blocked_at = _event_ts(cap_event) or now
+
+    task_id = _task_field(task, "id")
+    actions: list[DiagnosticAction] = []
+    if task_id:
+        actions.append(DiagnosticAction(
+            kind="unblock", label="Unblock (after deciding how to break the loop)",
+            payload={}, suggested=True,
+        ))
+        cmd = f"hermes kanban events {task_id}"
+        actions.append(_cli_hint(f"Check review history: {cmd}", cmd))
+
+    rounds_text = str(changes_rounds) if changes_rounds is not None else "the"
+    cap_text = str(max_review_rounds) if max_review_rounds is not None else "configured"
+    detail = (
+        f"This task hit {rounds_text} review→changes-requested rounds, at or above the "
+        f"configured cap of {cap_text} (kanban.max_review_rounds). The dispatcher stopped "
+        f"re-dispatching it to the implementer or the rework-escalation profile and blocked "
+        f"it instead, so the review loop cannot cycle indefinitely. "
+    )
+    if reason:
+        detail += f'Last reviewer feedback: "{reason}". '
+    detail += (
+        "Review the change history, decide the right intervention (reassign, rescope, "
+        "archive), and unblock when ready."
+    )
+
+    return [Diagnostic(
+        kind="review_round_cap", severity="error",
+        title=f"Review round cap hit ({rounds_text}/{cap_text} rounds)",
+        detail=detail,
+        actions=actions,
+        first_seen_at=blocked_at, last_seen_at=blocked_at, count=1,
+        data={
+            "changes_rounds": changes_rounds,
+            "max_review_rounds": max_review_rounds,
+            "last_reason": reason,
+        },
+    )]
+
+
 def _rule_stuck_in_blocked(task, events, runs, now, cfg) -> list[Diagnostic]:
     """Blocked for >= cfg["blocked_stale_hours"] (default 24) with no comment
     or unblock since the last ``blocked`` event."""
@@ -1014,6 +1083,7 @@ _RULES: list[RuleFn] = [
     _rule_repeated_failures,
     _rule_repeated_crashes,
     _rule_review_dependency_deadlock,
+    _rule_review_round_cap,
     _rule_stuck_in_blocked,
     _rule_block_unblock_cycling,
     _rule_respawn_guarded,
@@ -1135,6 +1205,7 @@ DIAGNOSTIC_KINDS = (
     "repeated_failures",
     "repeated_crashes",
     "review_dependency_deadlock",
+    "review_round_cap",
     "stuck_in_blocked",
     "block_unblock_cycling",
     "stranded_in_ready",

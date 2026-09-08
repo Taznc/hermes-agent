@@ -1830,10 +1830,37 @@ DEFAULT_CONFIG = {
         # the earliest start leaves the window. None = off.
         "dispatch_start_budget": None,
         "dispatch_start_window_seconds": 600,
+        # Maintenance actions an operator may queue to fire automatically once a
+        # PAUSED board drains to zero running workers (dashboard "after drain"
+        # selector / POST /dispatch/post-drain). The trigger is drain, never a
+        # wall clock; expiry below is a safety bound, not a schedule.
+        "post_drain": {
+            # Units `service_restart` may restart, by exact name. EMPTY BY
+            # DEFAULT: a queued action runs unattended, so which units may be
+            # restarted is an explicit local decision rather than an inherited
+            # one, and an empty list makes `service_restart` unqueueable. A
+            # request may only NAME an entry from this list — it can never
+            # supply a unit of its own. e.g. ["hermes-gateway.service"].
+            "service_restart_allowlist": [],
+            # "system" (systemctl) or "user" (systemctl --user).
+            "service_restart_scope": "system",
+            # Expiry applied when the operator does not choose one. A pause that
+            # never drains lets the action expire instead of firing hours later
+            # into a state nobody expects.
+            "default_expiry_seconds": 3600,
+            # Hard ceiling on any requested expiry (24h).
+            "max_expiry_seconds": 86400,
+        },
         # After two reviewer changes-requested cycles, route the next rework run
         # to this specialist profile under that profile's own model defaults.
         # Empty preserves the original implementer loop.
         "review_rework_escalation_profile": "",
+        # Hard stop on the review<->changes_requested loop: once a card accumulates this many
+        # changes_requested events since its last completion, the dispatcher blocks it
+        # (kind="review_round_cap") instead of re-dispatching to the implementer or escalation
+        # profile. 0 = unlimited (legacy behavior). The reviewer-side round contract (sdlc-review
+        # skill) is advisory; this is the hard stop that actually bounds a runaway rework loop.
+        "max_review_rounds": 3,
         # Auto-run the decomposer on Triage tasks every tick. False = manual via `hermes kanban
         # decompose <id>` or the dashboard's Decompose button.
         "auto_decompose": True,

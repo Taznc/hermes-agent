@@ -346,6 +346,21 @@ type KanbanMessages = {
   resumeAllBoards: string
   boardsPaused: (paused: number, total: number) => string
   pauseHint: string
+  /** "After drain" action queue. */
+  queuePostDrain: string
+  cancelPostDrain: string
+  actionServiceRestart: (target: string) => string
+  actionReboot: string
+  confirmRebootPrompt: string
+  confirmReboot: string
+  cancelConfirm: string
+  postDrainArmed: (action: string, running: number, remaining: string) => string
+  postDrainArmedDrained: (action: string, remaining: string) => string
+  postDrainFiring: (action: string) => string
+  postDrainSucceeded: (action: string) => string
+  postDrainFailed: (action: string, error: string) => string
+  postDrainExpired: (action: string) => string
+  postDrainCancelled: (action: string) => string
   // native/toast notifications for terminal worker events (completion-notify)
   notify: {
     completedTitle: string
@@ -697,6 +712,20 @@ export const en: KanbanMessages = {
   boardsPaused: (paused, total) => `${paused} of ${total} boards paused`,
   pauseHint:
     'Stops new workers being claimed and spawned. Workers already running are never killed — wait for the count to reach 0 before restarting the gateway.',
+  queuePostDrain: 'After drain…',
+  cancelPostDrain: 'Cancel',
+  actionServiceRestart: target => `Restart ${target}`,
+  actionReboot: 'Reboot this machine',
+  confirmRebootPrompt: 'Reboot this machine once every worker has finished?',
+  confirmReboot: 'Yes, reboot after drain',
+  cancelConfirm: 'Keep waiting',
+  postDrainArmed: (action, running, remaining) => `${action} when drained — ${running} running, expires in ${remaining}`,
+  postDrainArmedDrained: (action, remaining) => `${action} — drained, firing shortly (expires in ${remaining})`,
+  postDrainFiring: action => `${action} — running now`,
+  postDrainSucceeded: action => `${action} — done`,
+  postDrainFailed: (action, error) => `${action} failed — ${error}`,
+  postDrainExpired: action => `${action} expired before the board drained — nothing ran`,
+  postDrainCancelled: action => `${action} cancelled`,
   notify: {
     completedTitle: 'Task completed',
     blockedTitle: 'Task blocked — needs your input',
@@ -1047,6 +1076,21 @@ const ja: KanbanMessages = {
   boardsPaused: (paused, total) => `${total} 件中 ${paused} 件のボードが一時停止中`,
   pauseHint:
     '新しいワーカーの取得と起動を停止します。実行中のワーカーが強制終了されることはありません。ゲートウェイを再起動する前に、件数が 0 になるまで待ってください。',
+  queuePostDrain: '排出後に…',
+  cancelPostDrain: 'キャンセル',
+  actionServiceRestart: target => `${target} を再起動`,
+  actionReboot: 'このマシンを再起動',
+  confirmRebootPrompt: 'すべてのワーカーが完了したら、このマシンを再起動しますか？',
+  confirmReboot: 'はい、排出後に再起動',
+  cancelConfirm: '待機を続ける',
+  postDrainArmed: (action, running, remaining) =>
+    `排出後に${action} — 実行中 ${running} 件、${remaining}後に期限切れ`,
+  postDrainArmedDrained: (action, remaining) => `${action} — 排出完了、まもなく実行（${remaining}後に期限切れ）`,
+  postDrainFiring: action => `${action} — 実行中`,
+  postDrainSucceeded: action => `${action} — 完了`,
+  postDrainFailed: (action, error) => `${action}に失敗 — ${error}`,
+  postDrainExpired: action => `排出前に${action}の期限が切れました — 何も実行されていません`,
+  postDrainCancelled: action => `${action}をキャンセルしました`,
   notify: {
     completedTitle: 'タスク完了',
     blockedTitle: 'タスクがブロック中 — 入力が必要です',
@@ -1388,6 +1432,20 @@ const zh: KanbanMessages = {
   resumeAllBoards: '恢复所有面板',
   boardsPaused: (paused, total) => `${total} 个面板中有 ${paused} 个已暂停`,
   pauseHint: '停止领取和启动新的工作者。已在运行的工作者不会被终止 — 请等待计数归零后再重启网关。',
+  queuePostDrain: '排空后…',
+  cancelPostDrain: '取消',
+  actionServiceRestart: target => `重启 ${target}`,
+  actionReboot: '重启这台机器',
+  confirmRebootPrompt: '在所有工作者完成后重启这台机器？',
+  confirmReboot: '是，排空后重启',
+  cancelConfirm: '继续等待',
+  postDrainArmed: (action, running, remaining) => `排空后${action} — ${running} 个运行中，${remaining}后过期`,
+  postDrainArmedDrained: (action, remaining) => `${action} — 已排空，即将执行（${remaining}后过期）`,
+  postDrainFiring: action => `${action} — 正在执行`,
+  postDrainSucceeded: action => `${action} — 已完成`,
+  postDrainFailed: (action, error) => `${action}失败 — ${error}`,
+  postDrainExpired: action => `${action}在面板排空前已过期 — 未执行任何操作`,
+  postDrainCancelled: action => `已取消${action}`,
   notify: {
     completedTitle: '任务已完成',
     blockedTitle: '任务受阻 — 需要你的输入',
@@ -1729,6 +1787,20 @@ const zhHant: KanbanMessages = {
   resumeAllBoards: '恢復所有面板',
   boardsPaused: (paused, total) => `${total} 個面板中有 ${paused} 個已暫停`,
   pauseHint: '停止領取與啟動新的工作者。已在執行的工作者不會被終止 — 請等待計數歸零後再重啟閘道。',
+  queuePostDrain: '排空後…',
+  cancelPostDrain: '取消',
+  actionServiceRestart: target => `重啟 ${target}`,
+  actionReboot: '重新啟動這台機器',
+  confirmRebootPrompt: '在所有工作者完成後重新啟動這台機器？',
+  confirmReboot: '是，排空後重新啟動',
+  cancelConfirm: '繼續等待',
+  postDrainArmed: (action, running, remaining) => `排空後${action} — ${running} 個執行中，${remaining}後過期`,
+  postDrainArmedDrained: (action, remaining) => `${action} — 已排空，即將執行（${remaining}後過期）`,
+  postDrainFiring: action => `${action} — 正在執行`,
+  postDrainSucceeded: action => `${action} — 已完成`,
+  postDrainFailed: (action, error) => `${action}失敗 — ${error}`,
+  postDrainExpired: action => `${action}在面板排空前已過期 — 未執行任何操作`,
+  postDrainCancelled: action => `已取消${action}`,
   notify: {
     completedTitle: '任務已完成',
     blockedTitle: '任務受阻 — 需要你的輸入',
