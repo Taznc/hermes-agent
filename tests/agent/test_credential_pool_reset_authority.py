@@ -266,6 +266,36 @@ def test_reset_clears_a_credential_this_process_never_loaded(pool_env):
     assert _load().has_available() is True
 
 
+def test_the_reset_floor_survives_unrelated_auth_store_writes(pool_env):
+    """The floor is only durable if other auth.json writers preserve it.
+
+    Every writer read-modify-writes the whole store, so an unrelated command
+    (adding a credential for another provider, an OAuth token refresh) must
+    carry the floor through — otherwise reset authority silently expires at
+    the next unrelated write and the resurrection bug comes back.
+    """
+    _write_pool(
+        pool_env,
+        "openrouter",
+        [
+            _exhausted_row("cred-1", age_seconds=60, priority=0),
+            _exhausted_row("cred-2", age_seconds=30, priority=1),
+        ],
+    )
+    already_running = _load()
+    assert _load().reset_statuses_report().ok is True
+
+    from hermes_cli.auth import write_credential_pool
+
+    # An unrelated provider's pool is written afterwards.
+    write_credential_pool("anthropic", [_healthy_row("other-1")])
+
+    already_running._persist()  # the pre-reset process finally writes
+
+    for row in _read_pool(pool_env, "openrouter"):
+        assert row["last_status"] is None, "an unrelated write dropped the reset floor"
+
+
 def test_ordinary_write_still_loses_to_a_newer_disk_cooldown(pool_env, monkeypatch):
     """AC2: non-reset writes keep the pre-existing newer-disk-wins guard.
 
