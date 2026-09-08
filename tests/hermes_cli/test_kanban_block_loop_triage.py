@@ -184,18 +184,36 @@ def test_auto_decompose_tick_does_not_respecify_needs_input_loop(kanban_home, mo
     task the breaker parked on an unresolved human decision.
 
     Drives the real gateway sweep entry point (``auto_decompose_tick``) rather
-    than only ``list_triage_ids()``, so the regression covers the actual path
-    the live incident exercised: ``decompose_task`` short-circuits to
-    ``specify``-equivalent behaviour (``fanout=false``) when the aux client is
-    unavailable in tests, so a loop-broken task reaching it would still leave
-    a ``specified``/``promoted`` trail if the exclusion regressed.
+    than only ``list_triage_ids()``. In the isolated test HOME there is no aux
+    LLM client, so ``decompose_task`` normally fails outright (``ok=False``,
+    "auxiliary client unavailable") BEFORE it ever reaches ``specify_triage_task``
+    — meaning ``decomposed == 0`` and no events would hold trivially even if the
+    triage-candidate query wrongly included the looped task. That would make
+    this test vacuous: it could not fail if the exclusion regressed.
+
+    To make the guard meaningful, ``_call_aux`` is patched to return a valid
+    ``fanout=false`` reply, so *if* the looped task were ever handed to
+    ``decompose_task`` it would genuinely succeed (``specify_triage_task`` ->
+    ``triage -> todo`` -> ``recompute_ready`` -> ``todo -> ready``, emitting
+    ``specified`` then ``promoted``). With that stub in place, ``decomposed == 0``
+    and an empty event set can only mean the exclusion kept the task out of
+    ``list_triage_ids()`` in the first place — not that the aux call failed.
     """
     from gateway.kanban_watchers_dispatcher import _DispatcherSettings, _KanbanDispatcher
+    from hermes_cli import kanban_decompose as decomp
 
     with kbc.connect_closing() as conn:
         looped = kb.create_task(conn, title="unsatisfiable", assignee="worker")
         _drive_into_loop_breaker(conn, looped)
 
+    def _fake_call_aux(*args, **kwargs):
+        return (
+            '{"fanout": false, "title": "unsatisfiable (re-specified)", '
+            '"body": "still blocked on the same needs_input cause"}',
+            "",
+        )
+
+    monkeypatch.setattr(decomp, "_call_aux", _fake_call_aux)
     monkeypatch.setenv("HERMES_KANBAN_BOARD", "default")
     settings = _DispatcherSettings(
         interval=60.0, max_spawn=None, max_in_progress=None, failure_limit=3,
@@ -214,3 +232,45 @@ def test_auto_decompose_tick_does_not_respecify_needs_input_loop(kanban_home, mo
     assert "specified" not in kinds
     assert "promoted" not in kinds
     assert "decomposed" not in kinds
+
+
+def test_auto_decompose_tick_would_promote_if_exclusion_regressed(kanban_home, monkeypatch):
+    """Mutation proof for the AC2 guard above.
+
+    Forces the exact broken behaviour this card fixes — ``list_triage_ids()``
+    handing the loop-broken task straight back to the sweep — and shows that,
+    with a working aux stub, one tick genuinely re-specifies and promotes it.
+    This is what makes the previous test's ``decomposed == 0`` assertion
+    non-vacuous: it can only pass when the exclusion is actually in effect.
+    """
+    from gateway.kanban_watchers_dispatcher import _DispatcherSettings, _KanbanDispatcher
+    from hermes_cli import kanban_decompose as decomp
+
+    with kbc.connect_closing() as conn:
+        looped = kb.create_task(conn, title="unsatisfiable", assignee="worker")
+        _drive_into_loop_breaker(conn, looped)
+
+    def _fake_call_aux(*args, **kwargs):
+        return (
+            '{"fanout": false, "title": "unsatisfiable (re-specified)", '
+            '"body": "still blocked on the same needs_input cause"}',
+            "",
+        )
+
+    monkeypatch.setattr(decomp, "_call_aux", _fake_call_aux)
+    # Simulate the pre-fix candidate query: ignore the exclusion entirely.
+    monkeypatch.setattr(decomp, "list_triage_ids", lambda **kw: [looped])
+    monkeypatch.setenv("HERMES_KANBAN_BOARD", "default")
+    settings = _DispatcherSettings(
+        interval=60.0, max_spawn=None, max_in_progress=None, failure_limit=3,
+        stale_timeout_seconds=3600, reconcile_orphans=False, default_assignee=None,
+        default_reviewer=None, max_in_progress_per_profile=None,
+    )
+    dispatcher = _KanbanDispatcher(kb, settings=settings)
+    decomposed = dispatcher.auto_decompose_tick(auto_decompose_per_tick=10)
+
+    assert decomposed == 1
+    with kbc.connect_closing() as conn:
+        kinds = {e.kind for e in kb.list_events(conn, looped)}
+    assert "specified" in kinds
+    assert "promoted" in kinds
