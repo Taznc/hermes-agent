@@ -21,6 +21,7 @@ import { afterEach, describe, expect, it, vi } from 'vitest'
 
 const {
   $bindings,
+  $focusedSessionIsTile,
   $focusedStoredSessionId,
   $newChatProfile,
   $panesFlipped,
@@ -56,6 +57,7 @@ const {
 
   return {
     $bindings: fakeAtom<Record<string, unknown[]>>({}),
+    $focusedSessionIsTile: fakeAtom(false),
     $focusedStoredSessionId: fakeAtom<null | string>(null),
     $newChatProfile: fakeAtom<null | string>(null),
     $panesFlipped: fakeAtom(false),
@@ -101,7 +103,7 @@ vi.mock('@/store/profile', () => ({ $newChatProfile }))
 vi.mock('@/store/projects', () => ({ openProjectCreate: vi.fn() }))
 vi.mock('@/store/route-tiles', () => ({ openRouteTile: vi.fn() }))
 vi.mock('@/store/session', () => ({ $sessions }))
-vi.mock('@/store/session-states', () => ({ $focusedStoredSessionId }))
+vi.mock('@/store/session-states', () => ({ $focusedSessionIsTile, $focusedStoredSessionId }))
 vi.mock('@/store/session-unread-remote', () => ({ markSessionUnread: vi.fn().mockResolvedValue(undefined) }))
 // The two per-row stores that lived on the root through round 1 are
 // deliberately ABSENT from this mock — if index.tsx still imported
@@ -113,6 +115,7 @@ vi.mock('../../routes', () => ({
   ARTIFACTS_ROUTE: '/artifacts',
   CRON_ROUTE: '/cron',
   MESSAGING_ROUTE: '/messaging',
+  SESSION_IMPORT_ROUTE: '/session-import',
   SIDEBAR_NAV_AREA: 'sidebar-nav',
   SKILLS_ROUTE: '/skills'
 }))

@@ -472,7 +472,13 @@ export function toRuntimeMessage(message: ChatMessage): ThreadMessage {
       role,
       content: [textPart(text)],
       createdAt,
-      metadata: { custom: { ...timelineMeta, ...reviewMeta } }
+      metadata: {
+        custom: {
+          ...timelineMeta,
+          ...reviewMeta,
+          ...(message.asyncResult ? { asyncResult: message.asyncResult } : {})
+        }
+      }
     } as ThreadMessage
   }
 

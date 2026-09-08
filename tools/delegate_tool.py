@@ -31,7 +31,8 @@ from tools.delegate_tool_config import (  # noqa: F401
     _DEFAULT_MAX_CONCURRENT_CHILDREN, _get_child_timeout, _get_max_async_children, _get_max_concurrent_children,
     _get_max_spawn_depth, _get_orchestrator_enabled, _get_subagent_approval_callback, _get_worktree_isolation,
     _inherit_parent_capabilities, _load_config, _merge_request_overrides, _resolve_child_credential_pool,
-    _resolve_child_runtime, _resolve_delegation_credentials, _subagent_auto_approve, _subagent_auto_deny,
+    _resolve_child_runtime, _resolve_delegation_credentials,
+    _subagent_auto_approve, _subagent_auto_deny,
 )
 from tools.delegate_tool_dispatch import _Batch, _announce_batch, _capture_origin, _run_batch
 from tools.delegate_tool_progress import (  # noqa: F401
@@ -102,6 +103,54 @@ def _open_child_session_db(parent_agent) -> Any:
         return acquire(_parent_db_path) if _parent_db_path is not None else acquire()
     return None
 
+def _apply_child_cache_ttl(child) -> None:
+    """A delegated child never uses the 1h cache tier. The tier is priced for a person who steps
+    away between turns (2x write vs 1.25x for 5m, #14971); a subagent calls every few seconds for
+    minutes and is gone, so it pays the 2x on every tool result and never collects the retention.
+    Caching itself stays exactly as configured (disabled stays disabled)."""
+    if getattr(child, "_cache_ttl", None) == "1h":
+        child._cache_ttl = "5m"
+
+_CHILD_CAP_MIN = 16_000  # below this a child compresses on every call; treat as a config error
+
+
+def _child_compression_cap_tokens(raw) -> "int | None":
+    """Validated ``delegation.compression_threshold_tokens``: an int >= 16000, or None for "no cap".
+
+    Unset / ``0`` / ``false`` / ``null`` mean no subagent-specific cap: the child compacts at the
+    same ratio trigger as everyone else (0.50 x window). A bool ``true`` (YAML) would coerce to 1
+    and make every call compress; a string like ``"200k"`` would silently read as no cap. Both are
+    config errors: warn and treat as unset so a typo never changes compaction behaviour."""
+    if raw is None or raw is False or raw == 0:
+        return None
+    if isinstance(raw, bool) or not isinstance(raw, (int, float)) or int(raw) < _CHILD_CAP_MIN:
+        logger.warning(
+            "delegation.compression_threshold_tokens=%r is not a token count >= %d; ignoring it "
+            "(children keep the ratio trigger).", raw, _CHILD_CAP_MIN,
+        )
+        return None
+    return int(raw)
+
+
+def _apply_child_compression_cap(child, delegation_cfg: dict) -> None:
+    """Optional absolute cap on the child's compaction trigger, ``delegation.compression_threshold_tokens``
+    (lower of it and any global ``compression.threshold_tokens``). Off by default: a 1M-window child
+    compacts at 500K like its parent. The compressor applies the cap on first window resolution, which
+    happens after construction, so setting it here is exactly equivalent to config."""
+    from agent.context_compressor import ContextCompressor
+
+    cc = getattr(child, "context_compressor", None)
+    if not isinstance(cc, ContextCompressor):
+        return
+    cap = _child_compression_cap_tokens((delegation_cfg or {}).get("compression_threshold_tokens"))
+    if cap is None:
+        return
+    existing = cc.threshold_tokens_cap
+    cc.threshold_tokens_cap = min(cap, existing) if isinstance(existing, int) and existing > 0 else cap
+    if cc._threshold_tokens is not None:  # already resolved: re-clamp now
+        cc._apply_threshold_tokens_cap()
+
+
 def _build_child_agent(
     task_index: int,
     goal: str,
@@ -117,10 +166,14 @@ def _build_child_agent(
     override_api_key: Optional[str] = None,
     override_api_mode: Optional[str] = None,
     override_request_overrides: Optional[Dict[str, Any]] = None,
-    override_max_tokens: Optional[int] = None,
+
     # ACP transport overrides from trusted delegation config.
     override_acp_command: Optional[str] = None,
     override_acp_args: Optional[List[str]] = None,
+    # Configuration block that owns the selected provider/model route. Internal
+    # callers such as /review pass auxiliary.review here so fallback policy is
+    # not accidentally read from the general delegation block.
+    routing_cfg: Optional[Dict[str, Any]] = None,
     # Legacy; accepted for wire compat but ignored (capability is depth-derived).
     role: str = "leaf",
     # Per-spawn reasoning override, already parsed by tools.delegation_model_override.resolve_effort_override.
@@ -143,6 +196,9 @@ def _build_child_agent(
     subagent_id = f"sa-{task_index}-{_uuid.uuid4().hex[:8]}"
     parent_subagent_id = getattr(parent_agent, "_subagent_id", None)
 
+    # General delegation behavior (reasoning, compression, capabilities) stays
+    # global. Only fallback policy follows the owner of a per-call route such
+    # as auxiliary.review.
     delegation_cfg = _load_config()
     child_toolsets, child_disabled_toolsets = _resolve_child_toolsets(parent_agent, toolsets, effective_role)
     child_prompt = _build_child_system_prompt(
@@ -164,8 +220,9 @@ def _build_child_agent(
     rt = _resolve_child_runtime(
         parent_agent, delegation_cfg, parent_api_key, model=model, override_provider=override_provider,
         override_base_url=override_base_url, override_api_key=override_api_key, override_api_mode=override_api_mode,
-        override_max_tokens=override_max_tokens, override_acp_command=override_acp_command,
+        override_acp_command=override_acp_command,
         override_acp_args=override_acp_args, override_reasoning_config=override_reasoning_config,
+        routing_cfg=routing_cfg,
     )
     if override_request_overrides is not None:
         # honored whenever set, incl. the inherit branch where
@@ -198,6 +255,7 @@ def _build_child_agent(
                     release_or_close(child_session_db)
             raise
     child._print_fn = getattr(parent_agent, "_print_fn", None)
+    _apply_child_cache_ttl(child)
     if child_session_db is not None:
         child._owns_session_db = True  # released by the child's close(), never by the parent
     # Ownership transfer for the dedicated handle: the child's close() must release it (nothing else holds a
@@ -206,6 +264,7 @@ def _build_child_agent(
     child._progress_identity_ref = child_session_ref
     child._delegate_depth, child._delegate_role = child_depth, effective_role  # post-degrade role
     child._subagent_id, child._parent_subagent_id = subagent_id, parent_subagent_id
+    _apply_child_compression_cap(child, delegation_cfg)
     # Ownership chain for action=list/steer/stop; weakref so a finished parent
     # can be collected while a detached child record lingers in the registry.
     try:
@@ -285,6 +344,7 @@ def _run_single_child(
         duration = run.elapsed()
         entry = _build_result_entry(child, result, task_index, duration, schema)
         run.append_sibling_write_reminder(entry)
+        run.account_background_processes(entry)
         run.emit_complete(result, entry, duration)
         return run.attach_worktree(entry)
     except Exception as exc:
@@ -350,19 +410,21 @@ def _resolve_task_routes(
     return task_creds, task_reasoning, task_routes, None
 
 
-def _child_overrides(creds: Dict[str, Any]) -> Dict[str, Any]:
+def _child_overrides(creds: Dict[str, Any], routing_cfg: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
     return {
         "override_provider": creds["provider"], "override_base_url": creds["base_url"],
         "override_api_key": creds["api_key"], "override_api_mode": creds["api_mode"],
         "override_request_overrides": creds.get("request_overrides"),
-        "override_max_tokens": creds.get("max_output_tokens"), "override_acp_command": creds.get("command"),
+        "override_acp_command": creds.get("command"),
         "override_acp_args": creds.get("args"),
+        "routing_cfg": routing_cfg,
     }
 
 
 def _build_children(
     task_list: List[Dict[str, Any]], task_schemas: List[Optional[Dict[str, Any]]], creds: Dict[str, Any], *,
     top_role: str, max_iterations: int, parent_agent, live_deleg_id: Optional[str], live_writers: list,
+    routing_cfg: Optional[Dict[str, Any]] = None,
     task_creds: Optional[List[Dict[str, Any]]] = None, task_reasoning: Optional[List[Optional[Dict[str, Any]]]] = None,
 ) -> tuple[List[tuple], Optional[str]]:
     """Build every child on the main thread (construction is not thread-safe);
@@ -386,7 +448,7 @@ def _build_children(
                 model=_creds["model"], max_iterations=max_iterations, task_count=len(task_list),
                 parent_agent=parent_agent, role=_normalize_role(t.get("role") or top_role),
                 override_reasoning_config=(task_reasoning[i] if i < len(task_reasoning) else None),
-                **_child_overrides(_creds),
+                **_child_overrides(_creds, routing_cfg),
             )
         except ValueError as exc:
             return [], str(exc)
@@ -465,9 +527,11 @@ def delegate_task(
             max_iterations, default_max_iter,
         )
     # credentials_cfg (internal callers only, e.g. /review → auxiliary.review) is
-    # a per-call override shaped like the delegation config section.
+    # a per-call routing owner shaped like the delegation config section. Keep
+    # the route and its fallback policy together through child construction.
+    routing_cfg = credentials_cfg if credentials_cfg is not None else cfg
     try:
-        creds = _resolve_delegation_credentials(credentials_cfg if credentials_cfg else cfg, parent_agent)
+        creds = _resolve_delegation_credentials(routing_cfg, parent_agent)
     except ValueError as exc:
         # Explicit-pin preflight failures (e.g. pinned delegation.command missing from PATH) refuse the
         # spawn loudly (#80450).
@@ -496,7 +560,8 @@ def delegate_task(
 
     children, err = _build_children(
         task_list, task_schemas, creds, top_role=top_role, max_iterations=default_max_iter, parent_agent=parent_agent,
-        live_deleg_id=live_deleg_id, live_writers=live_writers, task_creds=task_creds, task_reasoning=task_reasoning,
+        live_deleg_id=live_deleg_id, live_writers=live_writers, routing_cfg=routing_cfg,
+        task_creds=task_creds, task_reasoning=task_reasoning,
     )
     if err:
         return tool_error(err)
@@ -546,10 +611,13 @@ def _build_dispatch_mode_paragraph() -> str:
         blocking = False
     if not blocking:
         return (
-            "Runs in the background: dispatch returns immediately with live transcript paths, and the completed "
-            "result (one consolidated message, results in task order) re-enters the conversation on its own. Do NOT "
-            "wait or poll; continue other work. While children run, `action` (list/steer/stop) controls them live — "
-            "steer when a transcript shows a child drifting.\n\n"
+            "Runs in the background: dispatch returns immediately with live transcript paths, and the call's "
+            "results re-enter the conversation as a new message when its subagents finish (one message per call "
+            "by default; with delegation.independent_completions each ungrouped task / `group` returns on its "
+            "own). Results are delivered only BETWEEN your turns: finish whatever does not depend on them, then "
+            "give a one-line status and END YOUR TURN. Never wait or poll on transcripts, artifact files, or CI "
+            "for a child. While children run, `action` (list/steer/stop) controls them live — steer when a "
+            "transcript shows a child drifting.\n\n"
         )
     return (
         "This session cannot receive a detached result, so the call BLOCKS until every child finishes and returns "
@@ -654,6 +722,13 @@ DELEGATE_TASK_SCHEMA = {
                             "Optional model for THIS task only, so a batch can run cheap mechanical work and one "
                             "hard reasoning task on different models. Must be a model on a provider you have "
                             "credentials for; an unknown model fails the call. Omit to inherit. See top-level 'model'.",
+                        ),
+                        "group": _p(
+                            "string",
+                            "Optional result-delivery bucket within this call (only when delegation.independent_completions "
+                            "is enabled; otherwise the whole call returns as one message). Tasks sharing a group return "
+                            "together in ONE message; ungrouped tasks return individually as each finishes. This does not "
+                            "order execution; if B needs A's output, dispatch B after A returns.",
                         ),
                         "reasoning_effort": _p(
                             "string", "Optional reasoning depth for THIS task only. See top-level 'reasoning_effort'.",

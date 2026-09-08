@@ -36,7 +36,7 @@ import { $newChatProfile } from '@/store/profile'
 import { openProjectCreate } from '@/store/projects'
 import { openRouteTile } from '@/store/route-tiles'
 import { $sessions } from '@/store/session'
-import { $focusedStoredSessionId } from '@/store/session-states'
+import { $focusedSessionIsTile, $focusedStoredSessionId } from '@/store/session-states'
 import { markSessionUnread } from '@/store/session-unread-remote'
 import { $sidebarShowSessionSections, $sidebarWorktreeGroupingActive } from '@/store/sidebar-model'
 import type { SessionInfo } from '@/types/hermes'
@@ -46,6 +46,7 @@ import {
   ARTIFACTS_ROUTE,
   CRON_ROUTE,
   MESSAGING_ROUTE,
+  SESSION_IMPORT_ROUTE,
   SIDEBAR_NAV_AREA,
   type SidebarNavContribution,
   SKILLS_ROUTE
@@ -100,6 +101,12 @@ const SIDEBAR_NAV: SidebarNavItem[] = [
     icon: props => <Codicon name="watch" {...props} />,
     route: CRON_ROUTE,
     keybindActionId: 'nav.cron'
+  },
+  {
+    id: 'session-import',
+    label: '',
+    icon: props => <Codicon name="cloud-download" {...props} />,
+    route: SESSION_IMPORT_ROUTE
   }
 ]
 
@@ -137,7 +144,7 @@ interface ChatSidebarProps extends React.ComponentProps<typeof Sidebar> {
  * at all" gate ($sidebarShowSessionSections).
  */
 export function ChatSidebar({
-  currentView,
+  currentView: routeView,
   onNavigate,
   onLoadMoreSessions,
   onLoadMoreMessaging,
@@ -187,6 +194,10 @@ export function ChatSidebar({
   // The sidebar highlight tracks the FOCUSED session — the interacted tile's
   // tab, else the main selection — so it stays 1:1 with whatever tab is active.
   const selectedSessionId = useStore($focusedStoredSessionId)
+  // Following a focused tile: its pane is a chat regardless of the ROUTE view,
+  // so the nav highlight and `activeSidebarSessionId` track the tile.
+  const focusedSessionIsTile = useStore($focusedSessionIsTile)
+  const currentView = focusedSessionIsTile ? 'chat' : routeView
   const showSessionSections = useStore($sidebarShowSessionSections)
 
   const newSessionCombo = useStore($bindings)['session.new']?.[0]
@@ -268,8 +279,9 @@ export function ChatSidebar({
                   (item.id === 'messaging' && currentView === 'messaging') ||
                   (item.id === 'artifacts' && currentView === 'artifacts') ||
                   (item.id === 'cron' && currentView === 'cron') ||
+                  (item.id === 'session-import' && currentView === 'session-import') ||
                   // Contributed rows light up at their own route.
-                  (Boolean(item.route) && pathname === item.route)
+                  (currentView === 'extension' && Boolean(item.route) && pathname === item.route)
 
                 const isNewSession = item.id === 'new-session'
 

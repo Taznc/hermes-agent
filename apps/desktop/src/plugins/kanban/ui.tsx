@@ -25,7 +25,7 @@ import { type ReactNode, useEffect, useLayoutEffect, useRef, useState } from 're
 
 import { fetchOrchestration, ORCHESTRATION_KEY } from './api'
 import { columnLabel, useKanban } from './i18n'
-import { columnMeta, type KanbanTask } from './types'
+import { columnMeta, type KanbanTask, laneDropAllowed } from './types'
 
 // Plugin-scoped i18n lives in ./i18n; re-exported so components import strings
 // and chrome from one place (./ui).
@@ -259,7 +259,9 @@ export function StatusMenu({
       </DropdownMenuTrigger>
       <DropdownMenuContent align="start">
         {columns
-          .filter(name => name === status || !isLockedTarget(name))
+          // Same lane predicate the board's menus and drop handler use, so the
+          // drawer can never offer a transition the backend refuses with a 400.
+          .filter(name => name === status || (!isLockedTarget(name) && laneDropAllowed(status, name)))
           .map(name => (
             <DropdownMenuItem key={name} onSelect={() => onMove(name)}>
               <span className="size-2 rounded-full" style={{ backgroundColor: columnMeta(name).tone }} />

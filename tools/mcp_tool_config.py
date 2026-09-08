@@ -103,9 +103,20 @@ def _build_safe_env(user_env: Optional[dict]) -> dict:
         key: value for key, value in os.environ.items()
         if key in _SAFE_ENV_KEYS or key.upper() in _SAFE_ENV_KEYS_CASE_INSENSITIVE
         or key.startswith("XDG_") or (get_secret_source is not None and get_secret_source(key))}
+    # HERMES_KANBAN_HOME rides along with the DB/board pin: it is the home those
+    # pins are resolved and containment-checked against
+    # (kanban_db._pin_is_honored). Dropping it while keeping the DB pin made an
+    # MCP stdio child silently fall back to the DEFAULT ~/.hermes board — the pin
+    # was carried but no longer honored. Deliberately NOT HERMES_KANBAN_PIN_HOME:
+    # that stamp is intent, and scrub_kanban_env strips it on purpose so an
+    # INHERITED stamp cannot vouch for a stale pin.
+    for key in ("HERMES_KANBAN_DB", "HERMES_KANBAN_BOARD", "HERMES_KANBAN_HOME"):
+        if key in os.environ:
+            env[key] = os.environ[key]
     if user_env:
         env.update(user_env)
-    return env
+    from agent.delegation_context import delegated_child_subprocess_env
+    return delegated_child_subprocess_env(env)
 
 
 def _which_with_config_pathext(command: str, path_arg, env: dict):

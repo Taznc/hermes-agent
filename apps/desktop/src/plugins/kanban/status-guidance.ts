@@ -232,9 +232,11 @@ export interface StatusGuidanceDeps extends RunErrorTextDeps {
   guideBlockedReviewNoVerdict: string
   guideBlockedUnknown: string
   guideDone: string
+  guideIdea: string
   guideOnHold: string
   guideReadyQueued: string
   guideReview: string
+  guideRoadmap: string
   guideRunning: string
   guideRunningStale: string
   guideScheduled: string
@@ -253,7 +255,10 @@ export interface StatusGuidanceDeps extends RunErrorTextDeps {
  *  read `events`/`task` for a sharper answer (e.g. the actual
  *  `block_loop_detected` reason in `triage`) but must never fabricate a
  *  cause that isn't in the data. */
-const GUIDANCE_RESOLVERS: Record<string, (task: KanbanTaskFull, events: KanbanEvent[], runs: KanbanRun[], k: StatusGuidanceDeps) => string> = {
+const GUIDANCE_RESOLVERS: Record<
+  string,
+  (task: KanbanTaskFull, events: KanbanEvent[], runs: KanbanRun[], k: StatusGuidanceDeps) => string
+> = {
   archived: (_task, _events, _runs, k) => k.col.archived?.help ?? '',
 
   blocked: (task, events, runs, k) => {
@@ -302,11 +307,19 @@ const GUIDANCE_RESOLVERS: Record<string, (task: KanbanTaskFull, events: KanbanEv
 
   done: (_task, _events, _runs, k) => k.guideDone,
 
+  // The wishlist lanes are deliberately event-blind: a lane card is not late,
+  // not stalled, and never carries an age or staleness warning — the whole
+  // point of the lane is that a large wishlist costs the reader nothing. So
+  // these are flat constants, never a resolver that scans for a "cause".
+  idea: (_task, _events, _runs, k) => k.guideIdea,
+
   on_hold: (_task, _events, _runs, k) => k.guideOnHold,
 
   ready: (task, _events, _runs, k) => (task.assignee ? k.guideReadyQueued : k.guideAssignReady),
 
   review: (_task, _events, _runs, k) => k.guideReview,
+
+  roadmap: (_task, _events, _runs, k) => k.guideRoadmap,
 
   running: (task, _events, _runs, k) => {
     const stale = task.last_heartbeat_at ? Date.now() / 1000 - task.last_heartbeat_at > 120 : false
