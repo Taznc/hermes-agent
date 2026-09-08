@@ -1833,6 +1833,34 @@ DEFAULT_CONFIG = {
         # to this specialist profile under that profile's own model defaults.
         # Empty preserves the original implementer loop.
         "review_rework_escalation_profile": "",
+        # Worker preservation safety net. When a run ends (completion, review
+        # request, block, archive) or is reclaimed (stale claim, timeout, dead
+        # worker), Hermes commits any dirty work in that task's OWN git
+        # worktree onto its existing task branch and pushes it to the
+        # configured remote without force — so implementation work never
+        # remains only on the machine that produced it.
+        #
+        # It is a PRESERVATION net, not merge automation: it never merges,
+        # rebases, force-pushes, switches branches, or deletes a worktree or
+        # branch, and it never touches another task's workspace. Ownership or
+        # branch ambiguity fails closed before commit; unsafe content and git
+        # failures record a redacted ``work_preservation_failed`` event. A
+        # rejected push keeps the local commit and records ``pushed: false``.
+        # In every case cleanup retains dirty or unpushed work for a human.
+        # Only ``worktree`` workspaces are in scope; ``scratch``/``dir`` are
+        # untouched. Gitignored files are excluded by git itself.
+        "worker_preservation": {
+            # Set false for non-Git workflows or hosts with custom remotes
+            # where an automated push is unwanted. Preservation is skipped
+            # entirely; nothing else changes.
+            "enabled": True,
+            # Refuse to snapshot when any single candidate file exceeds this,
+            # or when the whole snapshot does. A safety net rescues
+            # source-sized work; larger content is a build artifact or dataset
+            # a human should place deliberately.
+            "max_file_bytes": 5 * 1024 * 1024,
+            "max_total_bytes": 20 * 1024 * 1024,
+        },
         # Hard stop on the review<->changes_requested loop: once a card accumulates this many
         # changes_requested events since its last completion, the dispatcher blocks it
         # (kind="review_round_cap") instead of re-dispatching to the implementer or escalation
