@@ -2595,6 +2595,22 @@ def resume_dispatch(board: Optional[str] = None) -> dict[str, Any]:
             }
         path = _dispatch_pause_path(board)
         previous = read_dispatch_pause(board)
+        # The operator changed their mind about the maintenance window, so any
+        # action queued to fire when this board drained is no longer wanted.
+        # Cancelled under the same board lock that clears the pause: resuming
+        # and leaving a reboot armed would be the worst possible split outcome.
+        # ``_cancel_locked`` is the lock-HELD variant — the public
+        # ``cancel_post_drain_action`` would try to re-acquire the tick lock we
+        # are already holding, see the non-blocking guard decline against our
+        # own hold, and silently leave the action armed.
+        try:
+            from hermes_cli.kanban_db_dispatch_postdrain import _cancel_locked
+            _cancel_locked(board, reason="dispatch resumed")
+        except Exception:
+            _kb._log.warning(
+                "kanban dispatch for board %s: could not cancel the queued post-drain action",
+                board or _kb.DEFAULT_BOARD, exc_info=True,
+            )
         # Clear SQLite first. A JSON-only circuit must remain authoritative if
         # fallback cleanup fails; unlinking it first would silently re-arm the
         # next tick even though this explicit recovery returned an error.
@@ -2801,6 +2817,23 @@ def dispatch_once(
     # Locks released. Fire the tick observer strictly OUTSIDE the critical
     # section: a slow subscriber must never stall a sibling dispatcher's tick.
     _kb._fire_dispatch_tick_hook(result, board=board, dry_run=dry_run)
+    # Post-drain action queue: this is the server-side trigger, so a queued
+    # restart/reboot fires from the dispatcher's own tick with no browser open.
+    # It must run with the board tick lock RELEASED — the evaluation re-takes
+    # that same lock to claim ``waiting -> firing`` atomically, and the
+    # non-blocking guard would simply decline against our own hold. A dry run
+    # reports what a tick would do and must never fire a real side effect.
+    if not dry_run:
+        try:
+            from hermes_cli.kanban_db_dispatch_postdrain import evaluate_post_drain_action
+            evaluate_post_drain_action(board)
+        except Exception:
+            # A queue fault must never take dispatch down with it: the record
+            # stays where it is and the next tick re-evaluates.
+            _kb._log.warning(
+                "kanban dispatch for board %s: post-drain action evaluation failed",
+                board or _kb.DEFAULT_BOARD, exc_info=True,
+            )
     return result
 
 

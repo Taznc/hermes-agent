@@ -17,6 +17,7 @@ import logging
 import re
 import sqlite3
 import time
+import uuid
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import closing, contextmanager
 from dataclasses import asdict
@@ -33,6 +34,7 @@ from hermes_cli import kanban_db
 from hermes_cli import kanban_db_connect as kbc
 from hermes_cli import kanban_db_notify as kbn
 from hermes_cli import kanban_db_dispatch as kbd
+from hermes_cli import kanban_db_dispatch_postdrain as kbpd
 from hermes_cli import kanban_db_workspace as kbw
 from hermes_cli import kanban_diagnostics as kd
 from hermes_cli import kanban_quota_circuit as kqc
@@ -1801,7 +1803,44 @@ def _dispatch_status_for_board(board: Optional[str]) -> dict[str, Any]:
         "state": state,
         "running_count": running,
         "message": kbd.dispatch_pause_message(state, board=resolved) if state else None,
+        "post_drain": _post_drain_view(board),
     }
+
+
+def _post_drain_view(board: Optional[str], *, now: Optional[int] = None) -> Optional[dict[str, Any]]:
+    """The queued action as the panel renders it, or None.
+
+    ``expires_in_seconds`` is derived server-side so the countdown the operator
+    reads comes from the same clock that will actually expire the record — a
+    renderer computing it from its own clock would drift against the trigger.
+    """
+    record = kbpd.read_post_drain_action(_resolve_board(board))
+    if record is None:
+        return None
+    current = int(now if now is not None else time.time())
+    expires_at = record.get("expires_at")
+    remaining = (
+        max(0, int(expires_at) - current) if isinstance(expires_at, int) else None
+    )
+    return {**record, "expires_in_seconds": remaining}
+
+
+def _post_drain_action_catalog() -> list[dict[str, Any]]:
+    """Action kinds this host will actually accept, for the UI selector.
+
+    Derived from the same registry and config the queue route validates against,
+    so the selector can never offer an action the backend would then reject.
+    """
+    cfg = kbpd.resolve_post_drain_config()
+    catalog: list[dict[str, Any]] = []
+    for kind, handler in kbpd.ACTION_HANDLERS.items():
+        if not handler.takes_target:
+            catalog.append({"action_kind": kind, "targets": []})
+            continue
+        targets = list(cfg.service_restart_allowlist)
+        if targets:
+            catalog.append({"action_kind": kind, "targets": targets})
+    return catalog
 
 
 @router.get("/dispatch/status")
@@ -1814,7 +1853,7 @@ def dispatch_status(board: Optional[str] = _BOARD_Q, boards: Optional[str] = Que
     """
     slugs = _dispatch_board_slugs(board, boards)
     if slugs is None:
-        return _dispatch_status_for_board(board)
+        return {**_dispatch_status_for_board(board), "post_drain_actions": _post_drain_action_catalog()}
 
     statuses: list[dict[str, Any]] = []
     errors: list[dict[str, str]] = []
@@ -1835,6 +1874,41 @@ def dispatch_status(board: Optional[str] = _BOARD_Q, boards: Optional[str] = Que
         "all_paused": all_paused,
         "boards": statuses,
         "errors": errors,
+        "post_drain": _aggregate_post_drain(statuses),
+        "post_drain_actions": _post_drain_action_catalog(),
+    }
+
+
+def _aggregate_post_drain(statuses: list[dict[str, Any]]) -> Optional[dict[str, Any]]:
+    """One headline record for the aggregate scope, or None.
+
+    Per-board records stay in ``boards[]`` so outcomes are reported in isolation
+    (a restart that succeeded on one board and failed on another must not be
+    flattened into a single verdict). This headline exists only so the panel can
+    render "reboot when drained" once instead of once per board, and it reports
+    the LEAST-settled state across the group: while any board is still waiting,
+    the group has not finished.
+    """
+    records = [status["post_drain"] for status in statuses if status.get("post_drain")]
+    if not records:
+        return None
+    order = [kbpd.WAITING, kbpd.FIRING, kbpd.FAILED, kbpd.EXPIRED, kbpd.CANCELLED, kbpd.SUCCEEDED]
+
+    def rank(record: dict[str, Any]) -> int:
+        state = record.get("state")
+        return order.index(state) if state in order else len(order)
+
+    headline = min(records, key=rank)
+    remaining = [
+        record["expires_in_seconds"] for record in records
+        if isinstance(record.get("expires_in_seconds"), int)
+    ]
+    return {
+        **headline,
+        "board_count": len(records),
+        # The group can only fire once every board has drained, so the window
+        # that bounds it is the SOONEST expiry, not this one record's.
+        "expires_in_seconds": min(remaining) if remaining else None,
     }
 
 
@@ -1907,6 +1981,108 @@ def dispatch_resume(board: Optional[str] = _BOARD_Q, boards: Optional[str] = Que
         "was_paused": any(result.get("was_paused") for result in results),
         "board_count": len(slugs),
         "resumed_count": resumed_count,
+        "results": results,
+        "failures": failures,
+    }
+
+
+class PostDrainBody(BaseModel):
+    """Queue request. ``target`` may only NAME an allowlisted unit, never define one."""
+
+    action_kind: str
+    target: Optional[str] = None
+    expires_in_seconds: Optional[int] = None
+
+
+@router.post("/dispatch/post-drain")
+def dispatch_queue_post_drain(
+    payload: PostDrainBody,
+    board: Optional[str] = _BOARD_Q,
+    boards: Optional[str] = Query(None),
+):
+    """Queue an action to fire automatically once this scope drains to 0 running.
+
+    Only the INTENT is stored here. The trigger itself lives in the dispatcher
+    tick, so the action fires whether or not this dashboard — or any browser —
+    is still connected when the board finally drains.
+    """
+    slugs = _dispatch_board_slugs(board, boards)
+    requested_by = kanban_db._hook_profile_name()
+
+    def _queue(slug: Optional[str], group_id: Optional[str] = None) -> dict[str, Any]:
+        try:
+            return kbpd.queue_post_drain_action(
+                slug,
+                action_kind=payload.action_kind,
+                target=payload.target,
+                requested_by=requested_by,
+                expires_in_seconds=payload.expires_in_seconds,
+                group_id=group_id,
+            )
+        except kbpd.PostDrainActionRejected as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    if slugs is None:
+        target_board = _dispatch_target_board(board)
+        return {"queued": True, "state": _queue(target_board)}
+
+    # Validate ONCE against the shared registry/config before writing anything:
+    # a rejected request must not leave half the boards armed.
+    if payload.action_kind not in kbpd.ACTION_HANDLERS:
+        raise HTTPException(
+            status_code=400,
+            detail=f"unknown post-drain action {payload.action_kind!r}",
+        )
+    group_id = f"{int(time.time())}-{uuid.uuid4().hex[:8]}"
+    try:
+        group = kbpd.queue_post_drain_group(
+            slugs,
+            action_kind=payload.action_kind,
+            target=payload.target,
+            requested_by=requested_by,
+            expires_in_seconds=payload.expires_in_seconds,
+            group_id=group_id,
+        )
+    except kbpd.PostDrainActionRejected as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    results = [
+        {"board": slug, "state": state}
+        for slug, state in group["records"].items()
+    ]
+    failures = group["failures"]
+    return {
+        "queued": group["queued"],
+        "board_count": len(slugs),
+        "queued_count": len(results) if group["queued"] else 0,
+        "group_id": group_id,
+        "results": results,
+        "failures": failures,
+    }
+
+
+@router.delete("/dispatch/post-drain")
+def dispatch_cancel_post_drain(
+    board: Optional[str] = _BOARD_Q,
+    boards: Optional[str] = Query(None),
+):
+    """Cancel a waiting action. An action already firing is left alone."""
+    slugs = _dispatch_board_slugs(board, boards)
+    if slugs is None:
+        target_board = _dispatch_target_board(board)
+        return kbpd.cancel_post_drain_action(target_board)
+
+    results: list[dict[str, Any]] = []
+    failures: list[dict[str, str]] = []
+    for slug in slugs:
+        try:
+            results.append({"board": slug, **kbpd.cancel_post_drain_action(slug)})
+        except Exception as exc:
+            failures.append({"board": slug, "error": str(exc)})
+    cancelled_count = sum(1 for result in results if result.get("cancelled"))
+    return {
+        "cancelled": bool(slugs) and cancelled_count == len(slugs),
+        "board_count": len(slugs),
+        "cancelled_count": cancelled_count,
         "results": results,
         "failures": failures,
     }

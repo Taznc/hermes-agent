@@ -1808,6 +1808,27 @@ DEFAULT_CONFIG = {
         # the earliest start leaves the window. None = off.
         "dispatch_start_budget": None,
         "dispatch_start_window_seconds": 600,
+        # Maintenance actions an operator may queue to fire automatically once a
+        # PAUSED board drains to zero running workers (dashboard "after drain"
+        # selector / POST /dispatch/post-drain). The trigger is drain, never a
+        # wall clock; expiry below is a safety bound, not a schedule.
+        "post_drain": {
+            # Units `service_restart` may restart, by exact name. EMPTY BY
+            # DEFAULT: a queued action runs unattended, so which units may be
+            # restarted is an explicit local decision rather than an inherited
+            # one, and an empty list makes `service_restart` unqueueable. A
+            # request may only NAME an entry from this list — it can never
+            # supply a unit of its own. e.g. ["hermes-gateway.service"].
+            "service_restart_allowlist": [],
+            # "system" (systemctl) or "user" (systemctl --user).
+            "service_restart_scope": "system",
+            # Expiry applied when the operator does not choose one. A pause that
+            # never drains lets the action expire instead of firing hours later
+            # into a state nobody expects.
+            "default_expiry_seconds": 3600,
+            # Hard ceiling on any requested expiry (24h).
+            "max_expiry_seconds": 86400,
+        },
         # After two reviewer changes-requested cycles, route the next rework run
         # to this specialist profile under that profile's own model defaults.
         # Empty preserves the original implementer loop.
