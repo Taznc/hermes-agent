@@ -72,12 +72,7 @@ import { $bindings, bindingsFor } from '@/store/keybinds'
 import { $dismissedAutoProjectIds, filterVisibleProjects } from '@/store/layout'
 import { openPetGenerate } from '@/store/pet-generate'
 import { openBrowserTab } from '@/store/preview'
-import {
-  $activeGatewayConnection,
-  $activeGatewayProfile,
-  normalizeProfileKey,
-  selectAgent
-} from '@/store/profile'
+import { $activeGatewayConnection, $activeGatewayProfile, normalizeProfileKey } from '@/store/profile'
 import { $projectTree, goToProject, openFolderAsProject, requestStartWorkSession } from '@/store/projects'
 import { runGatewayRestart } from '@/store/system-actions'
 import { performWebReload } from '@/store/web-reload'
@@ -104,6 +99,7 @@ import { SECTIONS } from '../settings/constants'
 import { type SettingsSearchEntry, settingsSearchTargetQuery } from '../settings/settings-search'
 import { useSettingsSearchCatalog } from '../settings/use-settings-search'
 
+import { switchToAgentRow } from './agent-row-switch'
 import { buildAgentPaletteRows } from './agent-rows'
 import { usePaletteContributions } from './contrib'
 import { HighlightWatcher } from './highlight-watcher'
@@ -720,9 +716,10 @@ function CommandPaletteBody({ onExited }: { onExited: () => void }) {
   const contributedItems = usePaletteContributions()
 
   // Agents on every registered connection → "switch this window onto that
-  // machine". Selecting a row re-homes the app the same way the profile rail
-  // does for local profiles (sidebar, sessions, cron and new chats all follow),
-  // but dials the socket against that connection's OWN backend via selectAgent.
+  // machine". Selecting a row re-homes the app the same way the sidebar gateway
+  // selector and the fleet rail do (sidebar, sessions, cron and new chats all
+  // follow), through selectConnection's two-phase commit — see
+  // agent-row-switch.ts for why that door and not a bare activation.
   // Row selection/suppression rules live in buildAgentPaletteRows (pure).
   const agentGroup = useMemo<PaletteGroup[]>(() => {
     const rows = buildAgentPaletteRows({
@@ -746,12 +743,12 @@ function CommandPaletteBody({ onExited }: { onExited: () => void }) {
           // why a source has no agents yet, or nothing when it's just a switch.
           detail: row.needsConnect ? (row.unavailableReason ?? t.profiles.notConnected) : undefined,
           icon: row.isLocal ? Monitor : Globe,
-          id: `agent-${row.connectionId ?? 'local'}-${row.profile}`,
+          id: `agent-${row.connectionId}-${row.profile}`,
           keywords: ['agent', 'connection', 'gateway', 'switch', 'remote', row.profile, row.device, row.handle],
           label: row.needsConnect
             ? t.profiles.connectToAgent(row.device)
             : t.profiles.switchToAgent(row.profile, row.device),
-          run: () => selectAgent(row.connectionId, row.profile)
+          run: () => switchToAgentRow(row, t.profiles.switchConnectionFailed)
         }))
       }
     ]

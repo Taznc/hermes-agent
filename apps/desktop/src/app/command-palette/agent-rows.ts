@@ -1,9 +1,15 @@
+import { LOCAL_CONNECTION_ID } from '@hermes/shared'
+
 import type { DesktopAgentRoster, DesktopRosterAgent } from '@/global'
 
 /** A roster agent (or an undialed source) reduced to what a palette row needs. */
 export interface AgentPaletteRow {
-  /** null = the local pool (this device); otherwise the registry connection to dial. */
-  connectionId: null | string
+  /**
+   * The registry connection this row switches to, verbatim — `local` for this
+   * device. Never a sentinel: the row is handed straight to selectConnection,
+   * which resolves every id (local included) through the registry.
+   */
+  connectionId: string
   /** Device name — the label's subject. */
   device: string
   /** Pre-computed @name-device handle; a search keyword, not a label. */
@@ -74,18 +80,24 @@ export function buildAgentPaletteRows({
   const activeKey = normalizeProfile(activeProfile)
   const enumerated = new Set(roster.agents.map(agent => agent.connectionId))
 
-  const isActivePair = (connectionId: string, isLocal: boolean, profile: string) =>
-    (isLocal ? activeConnectionId === null : connectionId === activeConnectionId) &&
-    normalizeProfile(profile) === activeKey
+  // The window sits on the local pool either as the registry's `local` source
+  // or through the legacy profile-only door, which publishes a null connection.
+  // Both mean "this device", so normalize the ACTIVE side to the registry id
+  // and compare registry ids on both sides — the rows themselves never carry a
+  // sentinel (they are handed to selectConnection verbatim).
+  const activeKeyed = activeConnectionId ?? LOCAL_CONNECTION_ID
+
+  const isActivePair = (connectionId: string, profile: string) =>
+    connectionId === activeKeyed && normalizeProfile(profile) === activeKey
 
   const agentRows = roster.agents.map((agent: DesktopRosterAgent) => {
     const isLocal = agent.connectionKind === 'local'
 
     return {
-      connectionId: isLocal ? null : agent.connectionId,
+      connectionId: agent.connectionId,
       device: isLocal ? localLabel : agent.connectionLabel,
       handle: agent.handle,
-      isActive: isActivePair(agent.connectionId, isLocal, agent.profile),
+      isActive: isActivePair(agent.connectionId, agent.profile),
       isLocal,
       needsConnect: false,
       profile: agent.profile
@@ -101,7 +113,7 @@ export function buildAgentPaletteRows({
       connectionId: source.connectionId,
       device: source.label,
       handle: source.label,
-      isActive: isActivePair(source.connectionId, false, DEFAULT_PROFILE),
+      isActive: isActivePair(source.connectionId, DEFAULT_PROFILE),
       isLocal: false,
       needsConnect: true,
       profile: DEFAULT_PROFILE,
