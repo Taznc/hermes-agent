@@ -338,3 +338,59 @@ def test_non_git_path_is_a_safe_skip(tmp_path: Path) -> None:
 
     assert result.status == "skipped", result
     assert result.reason == "not_a_git_worktree"
+
+
+# ---------------------------------------------------------------------------
+# Concurrency
+# ---------------------------------------------------------------------------
+
+
+def test_concurrent_preservation_creates_exactly_one_safety_commit(
+    repo: Path, worktree: Path
+) -> None:
+    """Completion and reclaim can fire on the same worktree at once. The loser
+    must not stack a second snapshot commit on the winner's."""
+    import threading
+
+    (worktree / "mine.txt").write_text("mine\n", encoding="utf-8")
+    before = _head(worktree)
+    results: list[kp.PreserveResult] = []
+    start = threading.Barrier(2)
+
+    def run() -> None:
+        start.wait(timeout=10)
+        results.append(kp.preserve_worktree(worktree, "wt/t_demo"))
+
+    threads = [threading.Thread(target=run) for _ in range(2)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join(timeout=60)
+
+    assert len(results) == 2
+    statuses = sorted(r.status for r in results)
+    # One did the work; the other found nothing left or stood down on the lock.
+    assert statuses[0] in {"nothing_to_preserve", "preserved", "skipped"}
+    assert "preserved" in statuses
+    # Exactly ONE commit was added on top of the pre-race HEAD.
+    added = _git("rev-list", "--count", f"{before}..HEAD", cwd=worktree).strip()
+    assert added == "1", _git("log", "--oneline", f"{before}..HEAD", cwd=worktree)
+    for r in results:
+        if r.status == "skipped":
+            assert r.reason == "concurrent"
+
+
+def test_lock_holder_makes_a_second_caller_stand_down(
+    repo: Path, worktree: Path
+) -> None:
+    (worktree / "mine.txt").write_text("mine\n", encoding="utf-8")
+    before = _head(worktree)
+
+    with kp._preserve_lock(worktree, "t_demo") as held:
+        assert held is True
+        result = kp.preserve_worktree(worktree, "wt/t_demo", task_id="t_demo")
+
+    assert result.status == "skipped", result
+    assert result.reason == "concurrent"
+    # Fail closed: no commit while another preserver owns the worktree.
+    assert _head(worktree) == before

@@ -13,10 +13,12 @@ worktree is preserved for a human rather than snapshotted blindly.
 
 from __future__ import annotations
 
+import contextlib
+import os
 import subprocess
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Optional
+from typing import Iterator, Optional
 
 _GIT_TIMEOUT = 60
 
@@ -258,8 +260,58 @@ def _resolve_push_remote(worktree: Path, branch: str) -> Optional[str]:
     return remotes[0] if len(remotes) == 1 else None
 
 
+@contextlib.contextmanager
+def _preserve_lock(worktree: Path, task_id: Optional[str]) -> Iterator[bool]:
+    """Hold the per-worktree preservation lock, yielding whether it was taken.
+
+    Two lifecycle paths can fire on one worktree at the same instant (a worker
+    completing while the dispatcher reclaims its stale run). Without exclusion
+    both run ``git add``/``git commit`` against the SAME index and produce
+    either two snapshot commits or a corrupt index; the loser must stand down.
+
+    The lock file lives in the worktree's own git dir, so it is per-worktree
+    (never shared across tasks the way ``refs/stash`` is) and disappears with
+    the worktree. Non-blocking: a busy lock means another preserver already
+    owns this work, and waiting for it would only duplicate the outcome.
+    ``fcntl`` is POSIX-only; where it is unavailable the lock degrades to
+    "always acquired", matching the pre-existing single-preserver behaviour on
+    that platform rather than blocking preservation entirely.
+    """
+    try:
+        import fcntl
+    except ImportError:  # pragma: no cover - Windows
+        yield True
+        return
+    git_dir = _git_out(worktree, "rev-parse", "--path-format=absolute", "--git-dir")
+    if not git_dir:
+        yield True
+        return
+    name = f"hermes-kanban-preserve-{task_id or 'worktree'}.lock"
+    lock_path = Path(git_dir) / name
+    fd = None
+    try:
+        fd = os.open(str(lock_path), os.O_CREAT | os.O_RDWR, 0o600)
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError:
+            yield False
+            return
+        try:
+            yield True
+        finally:
+            with contextlib.suppress(OSError):
+                fcntl.flock(fd, fcntl.LOCK_UN)
+    except OSError:
+        yield True
+    finally:
+        if fd is not None:
+            with contextlib.suppress(OSError):
+                os.close(fd)
+
+
 def preserve_worktree(
     worktree: Path, branch: str, *,
+    task_id: Optional[str] = None,
     max_file_bytes: int = DEFAULT_MAX_FILE_BYTES,
     max_total_bytes: int = DEFAULT_MAX_TOTAL_BYTES,
 ) -> PreserveResult:
@@ -267,6 +319,19 @@ def preserve_worktree(
     worktree = Path(worktree)
     if not _is_git_worktree(worktree):
         return PreserveResult(status="skipped", reason="not_a_git_worktree")
+    with _preserve_lock(worktree, task_id) as acquired:
+        if not acquired:
+            return PreserveResult(status="skipped", reason="concurrent")
+        return _preserve_locked(
+            worktree, branch,
+            max_file_bytes=max_file_bytes, max_total_bytes=max_total_bytes,
+        )
+
+
+def _preserve_locked(
+    worktree: Path, branch: str, *, max_file_bytes: int, max_total_bytes: int,
+) -> PreserveResult:
+    """The preservation body; the caller holds the per-worktree lock."""
     current = _git_out(worktree, "branch", "--show-current")
     # Fail closed on any branch ambiguity: a detached HEAD has no branch to
     # preserve onto, and a different branch means our ownership belief about
