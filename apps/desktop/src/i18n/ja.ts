@@ -135,6 +135,7 @@ export const ja = defineForkLocale(forkJa, {
     more: count => `他 ${count} 件の通知`,
     clearAll: 'すべてクリア',
     dismiss: '通知を閉じる',
+    dismissAction: '閉じる',
     details: '詳細',
     copyDetail: '詳細をコピー',
     copyDetailFailed: '通知の詳細をコピーできませんでした',
