@@ -253,4 +253,3 @@ def test_malformed_client_public_origin_falls_through_to_reconstruction(monkeypa
         assert "javascript" not in flow.redirect_uri
         client.delete("/api/mcp/servers/r2")
         _web_server_mcp._mcp_oauth_flows.pop(body["flow_id"], None)
-
