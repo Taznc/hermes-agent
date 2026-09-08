@@ -180,6 +180,24 @@ const profile = (name: string): ProfileInfo => ({
   skill_count: 0
 })
 
+describe('host.completeMcpOAuth popup ownership', () => {
+  it('closes a caller-opened popup when catalog installation rejects before OAuth starts', async () => {
+    const popupWindow = { close: vi.fn(), closed: false }
+    vi.mocked(requestGatewayForAgent).mockRejectedValueOnce(new Error('catalog unavailable'))
+
+    await expect(
+      host.completeMcpOAuth({
+        catalogPreset: 'reports',
+        popupWindow: popupWindow as unknown as Window,
+        profile: { connectionId: 'source-a', profile: 'writer' },
+        serverName: 'reports'
+      })
+    ).rejects.toThrow('catalog unavailable')
+
+    expect(popupWindow.close).toHaveBeenCalledTimes(1)
+  })
+})
+
 afterEach(() => {
   vi.clearAllMocks()
   vi.mocked(sessionTileDelegate).mockReturnValue(null)

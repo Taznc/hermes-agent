@@ -17,8 +17,11 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
 import { setApiRequestConnection, setApiRequestProfile } from '@/api/client'
+import { requestGatewayForAgent } from '@/store/gateway'
 
 import { completeMcpDesktopOAuth, McpOAuthCancelled, openMcpOAuthPopup } from './mcp-dashboard-oauth'
+
+vi.mock('@/store/gateway', () => ({ requestGatewayForAgent: vi.fn() }))
 
 const approvedFlow = {
   flow_id: 'flow-1',
@@ -346,13 +349,35 @@ describe('completeMcpDesktopOAuth: bridge-absent, Electron (NOT web) compat path
     Reflect.deleteProperty(window, 'hermesDesktop')
   })
 
-  it('bridge-absent + explicit connectionId "local" throws the compat-upgrade message (pre-existing behavior)', async () => {
+  it('bridge-absent + explicit connectionId "local" completes through the legacy backend loopback flow', async () => {
     const { api, openMock } = bridgeAbsentElectron()
+    const loopbackRedirect = 'http://127.0.0.1:49152/callback'
+    const authorizationUrl = `https://idp.example/authorize?redirect_uri=${encodeURIComponent(loopbackRedirect)}`
+    const rpc = vi.mocked(requestGatewayForAgent)
 
-    await expect(
-      completeMcpDesktopOAuth({ serverName: 'reports', profile: { connectionId: 'local', profile: 'p' } })
-    ).rejects.toThrow('Update Hermes Desktop to support MCP OAuth callbacks.')
+    rpc.mockImplementation(async (_connection, _profile, method) => {
+      if (method.endsWith('.start')) {
+        return { ok: true, session_id: 'legacy-flow', auth_url: authorizationUrl }
+      }
 
+      return { ok: true, status: 'approved', tools: approvedFlow.tools }
+    })
+
+    const result = await completeMcpDesktopOAuth({
+      serverName: 'reports',
+      profile: { connectionId: 'local', profile: 'p' },
+      sleep: async () => {}
+    })
+
+    expect(result).toMatchObject({ status: 'approved', tools: approvedFlow.tools })
+    expect(rpc).toHaveBeenCalledWith(
+      'local',
+      'p',
+      'mcp.servers.oauth.start',
+      { name: 'reports' },
+      60_000
+    )
+    expect(window.hermesDesktop.openExternal).toHaveBeenCalledWith(authorizationUrl)
     expect(api).not.toHaveBeenCalled()
     expect(openMock).not.toHaveBeenCalled()
   })

@@ -266,24 +266,25 @@ export function McpSetupButton({ profile, entry, onDone, ensureProfile }: McpSet
 
     setPhase('busy')
     setMessage('')
-    const resolvedProfile = await resolveProfile()
-
-    if (!resolvedProfile) {
-      if (popupWindow && !popupWindow.closed) {
-        popupWindow.close()
-      }
-
-      setPhase('idle')
-
-      return
-    }
-
-    const scope = {
-      ...source,
-      profile: typeof resolvedProfile === 'object' ? resolvedProfile.profile : resolvedProfile
-    }
 
     try {
+      const resolvedProfile = await resolveProfile()
+
+      if (!resolvedProfile) {
+        if (popupWindow && !popupWindow.closed) {
+          popupWindow.close()
+        }
+
+        setPhase('idle')
+
+        return
+      }
+
+      const scope = {
+        ...source,
+        profile: typeof resolvedProfile === 'object' ? resolvedProfile.profile : resolvedProfile
+      }
+
       setPhase('oauth')
       setMessage('Complete sign-in in your browser...')
       await host.completeMcpOAuth({
@@ -302,6 +303,13 @@ export function McpSetupButton({ profile, entry, onDone, ensureProfile }: McpSet
       host.notify({ kind: 'success', message: entry.name + ' authenticated' })
       onDone?.()
     } catch (error) {
+      // Profile resolution can fail before completeMcpOAuth takes ownership of
+      // the caller-opened popup. Close idempotently so that path never strands
+      // an about:blank tab.
+      if (popupWindow && !popupWindow.closed) {
+        popupWindow.close()
+      }
+
       if (oauthEpoch.current !== epoch) {
         return
       }

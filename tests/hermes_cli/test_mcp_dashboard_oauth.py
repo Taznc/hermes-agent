@@ -1,6 +1,7 @@
 """Dashboard HTTP contract for hosted MCP OAuth."""
 
 from unittest.mock import patch
+from urllib.parse import parse_qs, urlencode, urlparse
 
 import pytest
 import hermes_cli.web_server_mcp as _web_server_mcp
@@ -170,7 +171,8 @@ def test_client_public_origin_used_when_no_dashboard_public_url(monkeypatch):
     def fake_worker(flow, cfg):
         import asyncio
 
-        asyncio.run(flow.publish_authorization_url("https://idp.example/authorize?state=s1"))
+        query = urlencode({"state": "s1", "redirect_uri": flow.redirect_uri})
+        asyncio.run(flow.publish_authorization_url(f"https://idp.example/authorize?{query}"))
 
     monkeypatch.setattr(_web_server_mcp, "_run_dashboard_mcp_oauth", fake_worker)
     with patch("hermes_cli.dashboard_auth.prefix.resolve_public_url", return_value=""):
@@ -183,9 +185,11 @@ def test_client_public_origin_used_when_no_dashboard_public_url(monkeypatch):
     body = response.json()
     flow = _web_server_mcp._mcp_oauth_flows[body["flow_id"]]
     assert flow.redirect_uri == "https://hermes-desktop-dev.jashworth.com/api/mcp/oauth/callback/reports"
+    authorization_redirect = parse_qs(urlparse(body["authorization_url"]).query)["redirect_uri"]
+    assert authorization_redirect == [flow.redirect_uri]
     # Never the loopback TestClient default base_url.
-    assert "testserver" not in flow.redirect_uri
-    assert "127.0.0.1" not in flow.redirect_uri
+    assert all("testserver" not in redirect for redirect in authorization_redirect)
+    assert all("127.0.0.1" not in redirect for redirect in authorization_redirect)
 
 
 def test_dashboard_public_url_still_wins_over_client_public_origin(monkeypatch):

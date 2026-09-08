@@ -228,26 +228,18 @@ export async function completeMcpDesktopOAuth(options: CompleteOptions): Promise
   if (!bridge) {
     // isWebBuild is an explicit build-identity flag (fork/desktop-api.d.ts),
     // set ONLY by the web shim — never inferred from bridge-member absence.
-    // That distinction matters because "no mcpOauth" means two different
-    // things: on web, no browser tab can ever host a loopback listener, so
-    // the REST/popup fallback is always correct. On an OLD Electron preload
-    // that merely predates this bridge member (bridge-absent + a REMOTE
-    // connection, or bridge-absent + explicit 'local'), the app CAN still
-    // host a real loopback listener — the pre-fix behavior (compat message
-    // for 'local', hard failure otherwise) is the correct compatibility path
-    // and must stay untouched here, not be widened into a browser popup that
-    // Electron cannot complete (no in-app browser tab to navigate).
+    // On web, no browser tab can host Electron's callback listener, so use the
+    // REST/popup flow for every connection shape. An old Electron preload has
+    // no flag: preserve its legacy split exactly — an explicitly local backend
+    // hosts the loopback listener itself, while remote/unknown connections need
+    // the newer preload bridge and fail with the compatibility message.
     if (window.hermesDesktop.isWebBuild) {
       return completeMcpBrowserOAuth(options)
     }
 
-    // A legacy null connection can resolve to a remote registry primary,
-    // where the compat message is still correct (an OLD Electron build
-    // predating the bridge, dialed at 'local'). Any other bridge-absent
-    // Electron connection (a remote gateway on an old preload) fails the
-    // same way — this restores the exact pre-fix behavior for every
-    // bridge-absent case that is not the web build.
-    throw new Error('Update Hermes Desktop to support MCP OAuth callbacks.')
+    if (scope.connectionId !== 'local') {
+      throw new Error('Update Hermes Desktop to support MCP OAuth callbacks.')
+    }
   }
 
   let listener: { id: string; redirectUri: string } | undefined
