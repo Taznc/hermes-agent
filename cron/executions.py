@@ -340,6 +340,33 @@ def finish_execution(
     return record
 
 
+def record_delivery_outcome(
+    execution_id: str, delivery_outcome: Optional[str],
+) -> Optional[Dict[str, Any]]:
+    """Attach a delivery result to an attempt that is already terminal.
+
+    Delivery is a *separate* durable outcome from the run that produced the content. The run's
+    terminal state is written before delivery begins, so a slow, failing or interrupted delivery
+    cannot rewrite a completed run as failed — and this records how that delivery went afterwards.
+    Only ``delivery_outcome`` is written; ``status``, ``error`` and ``interrupted`` are never
+    touched, which is what keeps terminal states immutable while still making the delivery fact
+    durable. Returns ``None`` when the row is absent, not terminal, or already carries an outcome.
+    """
+    with _transaction() as conn:
+        cur = conn.execute(
+            """UPDATE executions SET delivery_outcome=?
+               WHERE id=? AND status IN ('completed','failed')
+                 AND delivery_outcome IS NULL
+                 AND process_id=? AND pid=?""",
+            (delivery_outcome, str(execution_id), _PROCESS_ID, os.getpid()),
+        )
+        if cur.rowcount != 1:
+            return None
+        record = _fetch(conn, execution_id)
+    _emit_execution_state(record, delivery_outcome=delivery_outcome)
+    return record
+
+
 def recover_interrupted_executions() -> int:
     """Mark provably abandoned attempts unknown without scheduling retries."""
     now = _hermes_now().isoformat()
