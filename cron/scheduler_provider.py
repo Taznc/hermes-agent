@@ -124,10 +124,19 @@ class CronScheduler(ABC):
         return None
 
     def recover_interrupted(self) -> int:
-        """Run profile-local attempt recovery for every provider lifecycle."""
-        from cron.executions import recover_interrupted_executions
+        """Run profile-local attempt recovery for every provider lifecycle.
 
-        return recover_interrupted_executions()
+        Reconciling abandoned rows and deciding their replay are one startup step: a row recovered
+        here is exactly the occurrence whose replay must be decided, and deciding it at startup is
+        what gives a low-frequency job its lost occurrence back after a restart. The decision pass
+        is bounded and at-most-once per occurrence, so running it on every lifecycle is safe.
+        """
+        from cron.executions import recover_interrupted_executions
+        from cron.interrupted_retry import reconcile_interrupted_executions
+
+        recovered = recover_interrupted_executions()
+        reconcile_interrupted_executions()
+        return recovered
 
     @property
     def supports_force_fire(self) -> bool:

@@ -2704,15 +2704,33 @@ def run_one_job(
 
 
 _OWNERSHIP_LOST_INTERRUPTED = "Interrupted by shutdown before terminal completion."
+_DRAIN_INTERRUPTED = "Interrupted by gateway shutdown before terminal completion."
+
+
+def _record_interruption(job: dict, execution_id: str, error: str) -> None:
+    """Terminalize an interrupted attempt and raise its incident.
+
+    The ledger flag and the incident are written together because they answer the same question
+    from two surfaces: ``hermes cron history`` (what happened to this attempt) and ``hermes cron
+    incidents`` (what is broken, deduplicated). Incident recording is best-effort — the ledger
+    write is the durable part and must not be lost to a store error.
+    """
+    finish_execution(execution_id, success=False, error=error, interrupted=True)
+    _upsert_incident_for_failure(job, error)
 
 
 def _record_fire_ownership_lost(job_id: str, fire_owner: Optional[str], execution_id: str) -> None:
     """Bookkeeping after fire-claim ownership loss. A transport-level cancel (dashboard drain) is
     not a real loss — we still own the claim, so record the interruption via the owner-fenced
-    terminal write instead of leaving fire_claim/last_status stale; otherwise discard."""
+    terminal write instead of leaving fire_claim/last_status stale; otherwise discard.
+
+    The discard branch is deliberate cancellation (a replacement owner took the job), so it is
+    NOT flagged interrupted: replaying it would duplicate the run the replacement owner is doing.
+    """
     if fire_owner is not None and heartbeat_fire_claim(job_id, expected_owner=fire_owner):
         mark_job_run(job_id, False, _OWNERSHIP_LOST_INTERRUPTED, expected_fire_owner=fire_owner)
-        finish_execution(execution_id, success=False, error=_OWNERSHIP_LOST_INTERRUPTED)
+        _record_interruption(
+            {"id": job_id}, execution_id, _OWNERSHIP_LOST_INTERRUPTED)
     else:
         finish_execution(
             execution_id, success=False,
@@ -2918,9 +2936,7 @@ def _finish_interrupted_run(job: dict, execution_id: str, delivery_error: Option
         except Exception as _rec_err:
             logger.debug(
                 "Failed recording delivery_error for interrupted job %s: %s", job["id"], _rec_err)
-    finish_execution(
-        execution_id, success=False,
-        error="Interrupted by gateway shutdown before terminal completion.")
+    _record_interruption(job, execution_id, _DRAIN_INTERRUPTED)
 
 
 def _finish_completed_run(d: _RunDelivery, fire_owner: Optional[str], execution_id: str) -> bool:
@@ -3696,6 +3712,25 @@ def _maybe_reap_dead_owners() -> None:
                 _reclaimed)
     except Exception as _reap_exc:
         logger.debug("Dead-owner execution reclaim failed: %s", _reap_exc)
+    _reconcile_interrupted_occurrences()
+
+
+def _reconcile_interrupted_occurrences() -> None:
+    """Decide the replay of occurrences lost to a shutdown (bounded, at most once each).
+
+    Runs after the dead-owner reap so rows this tick just recovered are decided in the same pass;
+    a long-interval job whose occurrence was lost therefore gets it back within one reap cycle
+    rather than waiting a full period. Never raises into the tick.
+    """
+    try:
+        from cron.interrupted_retry import reconcile_interrupted_executions
+
+        _scheduled = reconcile_interrupted_executions()
+        if _scheduled:
+            logger.warning(
+                "Re-armed %d cron occurrence(s) interrupted by a shutdown", _scheduled)
+    except Exception as _retry_exc:
+        logger.debug("Interrupted-occurrence reconcile failed: %s", _retry_exc)
 
 
 def _sweep_stale_inflight_for_tick(due_jobs: list) -> None:

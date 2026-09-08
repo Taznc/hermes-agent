@@ -2187,6 +2187,9 @@ def _record_run_outcome(
         job.pop("preflight_alerted", None)
         job.pop("drift_alerted", None)
         job.pop("last_fire_error", None)
+        # Only a SUCCESSFUL run retires an outstanding interrupted-occurrence retry. Clearing it
+        # on failure too would let a retry that fails the same way re-arm itself forever.
+        job.pop("interrupted_retry", None)
         job["failure_streak"] = 0
     else:
         # Consecutive agent-failure streak; delivery failures do NOT count

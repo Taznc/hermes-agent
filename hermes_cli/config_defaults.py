@@ -1669,6 +1669,11 @@ DEFAULT_CONFIG = {
         # (long TTS audio, big exports) need more than 30s. Env: HERMES_CRON_MEDIA_SEND_TIMEOUT.
         # Keep in sync with cron.scheduler._DEFAULT_MEDIA_SEND_TIMEOUT.
         "media_send_timeout_seconds": 300,
+        # Freshness budget (minutes) for replaying an occurrence lost to a gateway/desktop
+        # shutdown. Each lost occurrence is replayed AT MOST once, and only while it is this
+        # fresh, so a restart recovers a weekly job's missed run without resurrecting week-old
+        # work. 0 disables the replay (interruptions are still recorded as incidents).
+        "interrupted_retry_max_age_minutes": 60,
     },
     # Kanban multi-agent coordination. The dispatcher ticks every N seconds, reclaims stale claims,
     # promotes dependency-satisfied todos to ready, and fires `hermes -p <assignee> chat -q ...` per

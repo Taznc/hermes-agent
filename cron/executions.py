@@ -26,6 +26,13 @@ EXECUTIONS_FILE: Optional[Path] = None
 MAX_TERMINAL_EXECUTIONS = 1000
 HANDOFF_ADOPTION_GRACE_SECONDS = 30.0
 _TERMINAL_STATES = ("completed", "failed", "unknown")
+
+# Terminal error text for an attempt whose owner process is proved gone. Kept as a module constant
+# because the incident classifier and the retry sweep both key on this exact interruption.
+RECOVERED_INTERRUPTION_ERROR = (
+    "Scheduler restarted after this execution's owner exited before a durable terminal state; "
+    "whether side effects ran is unknown."
+)
 _lock = threading.RLock()
 _PROCESS_ID = uuid.uuid4().hex
 
@@ -107,6 +114,14 @@ def _initialize_schema(conn: sqlite3.Connection) -> None:
     add_column_if_missing(
         conn, "executions", "handoff_started_at", "handoff_started_at REAL"
     )
+    # Durable interruption facts. ``interrupted`` says an attempt died to a shutdown/abandonment
+    # rather than to its own failure — a persisted fact, not a substring match on ``error``.
+    # ``retry_state`` is the at-most-once replay decision for that occurrence (NULL = undecided).
+    add_column_if_missing(
+        conn, "executions", "interrupted",
+        "interrupted INTEGER NOT NULL DEFAULT 0",
+    )
+    add_column_if_missing(conn, "executions", "retry_state", "retry_state TEXT")
     conn.execute(
         "CREATE INDEX IF NOT EXISTS idx_executions_job_claimed "
         "ON executions(job_id, claimed_at DESC, id DESC)"
@@ -255,9 +270,13 @@ def mark_execution_running(execution_id: str) -> Optional[Dict[str, Any]]:
 
 def finish_execution(
     execution_id: str, *, success: bool, error: Optional[str] = None,
-    delivery_outcome: Optional[str] = None,
+    delivery_outcome: Optional[str] = None, interrupted: bool = False,
 ) -> Optional[Dict[str, Any]]:
-    """Write a terminal result once; terminal attempts cannot be rewritten."""
+    """Write a terminal result once; terminal attempts cannot be rewritten.
+
+    ``interrupted`` records that the attempt died to a shutdown/ownership loss rather than to its
+    own failure, so the reconciler can find it without parsing ``error``.
+    """
     now = _hermes_now().isoformat()
     status = "completed" if success else "failed"
     detail = None if success else (str(error) if error else "unknown failure")
@@ -265,10 +284,11 @@ def finish_execution(
         cur = conn.execute(
             """UPDATE executions
                SET status=?, finished_at=?, error=?, handoff_pending=0,
-                   handoff_started_at=NULL
+                   handoff_started_at=NULL, interrupted=?
                WHERE id=? AND status IN ('claimed','running')
                  AND process_id=? AND pid=?""",
-            (status, now, detail, execution_id, _PROCESS_ID, os.getpid()),
+            (status, now, detail, 1 if (interrupted and not success) else 0,
+             execution_id, _PROCESS_ID, os.getpid()),
         )
         if cur.rowcount != 1:
             return None
@@ -305,14 +325,12 @@ def recover_interrupted_executions() -> int:
                 continue
             cur = conn.execute(
                 """UPDATE executions
-                   SET status='unknown', finished_at=?, error=?,
+                   SET status='unknown', finished_at=?, error=?, interrupted=1,
                        handoff_pending=0, handoff_started_at=NULL
                    WHERE id=? AND status=? AND process_id=? AND pid=?
                      AND handoff_pending=?
                      AND handoff_started_at IS ?""",
-                (now,
-                 "Scheduler restarted after this execution's owner exited before a durable "
-                 "terminal state; whether side effects ran is unknown.",
+                (now, RECOVERED_INTERRUPTION_ERROR,
                  row["id"], row["status"], row["process_id"], row["pid"],
                  row["handoff_pending"], row["handoff_started_at"]),
             )
@@ -326,6 +344,38 @@ def recover_interrupted_executions() -> int:
     for record in recovered:
         _emit_execution_state(record)
     return changed
+
+
+def list_undecided_interruptions(limit: int = 50) -> List[Dict[str, Any]]:
+    """Interrupted attempts with no replay decision yet, oldest first.
+
+    Oldest-first because the reconciler applies a freshness bound: the oldest undecided occurrence
+    is the one that decides (retry or decline) first, so a backlog drains deterministically.
+    """
+    with _transaction() as conn:
+        rows = conn.execute(
+            """SELECT * FROM executions
+               WHERE interrupted=1 AND retry_state IS NULL
+               ORDER BY claimed_at ASC, id ASC LIMIT ?""",
+            (max(1, min(int(limit), 500)),),
+        ).fetchall()
+    return [dict(row) for row in rows]
+
+
+def claim_retry_decision(execution_id: str, decision: str) -> bool:
+    """Record the one-and-only replay decision for an interrupted attempt.
+
+    The compare-and-swap on ``retry_state IS NULL`` inside the ledger transaction is what makes the
+    replay at-most-once: two reconcilers racing on one occurrence cannot both win, so a restart
+    storm can never fan one lost occurrence out into several runs.
+    """
+    with _transaction() as conn:
+        cur = conn.execute(
+            """UPDATE executions SET retry_state=?
+               WHERE id=? AND interrupted=1 AND retry_state IS NULL""",
+            (str(decision), str(execution_id)),
+        )
+        return cur.rowcount == 1
 
 
 def list_executions(

@@ -190,6 +190,7 @@ def _job_rows(job: Dict[str, Any]) -> List[tuple[str, str]]:
     monitor_source = job.get("monitor_script") or job.get("monitor_url")
     mon_state = job.get("monitor_state") or {}
     latest_execution = job.get("latest_execution") or {}
+    retry = job.get("interrupted_retry") or {}
     optional = [
         ("Skills", ", ".join(skills) if skills else ""),
         ("Script", job.get("script")),
@@ -203,7 +204,12 @@ def _job_rows(job: Dict[str, Any]) -> List[tuple[str, str]]:
          if job.get("last_status") else ""),
         ("Dispatch", _dispatch_display(job.get("last_dispatch"))),
         ("Execution", f"{latest_execution.get('status', '?')}  {latest_execution.get('id', '?')}"
-         if latest_execution else "")]
+         if latest_execution else ""),
+        # Names the ORIGINAL attempt, so the replay can be traced back to the occurrence it
+        # recovers via `hermes cron history`.
+        ("Retry", color(
+            f"replaying occurrence interrupted at {retry.get('interrupted_at', '?')} "
+            f"(attempt {retry.get('execution_id', '?')})", Colors.YELLOW) if retry else "")]
     return [
         ("Name", job.get("name", "(unnamed)")),
         ("Schedule", job.get("schedule_display", job.get("schedule", {}).get("value", "?"))),
@@ -251,6 +257,26 @@ def cron_tick():
     return 0
 
 
+_RETRY_STATE_DISPLAY = {
+    "scheduled": "retry scheduled",
+    "declined:disabled_by_config": "retry off (config)",
+    "declined:stale": "retry declined (too old)",
+    "declined:job_missing": "retry declined (job removed)",
+    "declined:disabled": "retry declined (job disabled)",
+    "declined:in_flight": "retry declined (already running)",
+    "declined:retry_outstanding": "retry declined (one already pending)",
+}
+
+
+def _execution_markers(record: Dict[str, Any]) -> str:
+    """Interruption/replay annotation for one history row, or "" for an ordinary attempt."""
+    if not record.get("interrupted"):
+        return ""
+    retry_state = record.get("retry_state")
+    decision = _RETRY_STATE_DISPLAY.get(str(retry_state), "retry undecided")
+    return color(f"  [interrupted; {decision}]", Colors.YELLOW)
+
+
 def cron_runs(job_id: Optional[str] = None, limit: int = 20):
     """Show indexed durable cron execution history."""
     from cron.executions import list_executions
@@ -261,7 +287,7 @@ def cron_runs(job_id: Optional[str] = None, limit: int = 20):
     for record in records:
         print(f"{record.get('id', '?')}  {record.get('status', '?'):<9}  "
               f"job={record.get('job_id', '?')}  source={record.get('source', '?')}  "
-              f"{record.get('claimed_at', '?')}")
+              f"{record.get('claimed_at', '?')}{_execution_markers(record)}")
         if record.get("error"):
             print(f"    {record['error']}")
 
@@ -493,6 +519,13 @@ def _cron_doctor_issues_for_job(job: Dict[str, Any]) -> List[str]:
     # "delivery_failed" = the agent run succeeded; the delivery issue below reports it.
     if last_status and last_status not in {"ok", "delivery_failed"}:
         issues.append(f"last run failed: {str(job.get('last_error') or 'unknown error').strip()}")
+    # A pending replay is not itself a fault, but it says an occurrence was LOST — the operator
+    # needs to know one is queued, and which attempt it recovers.
+    if retry := (job.get("interrupted_retry") or {}):
+        issues.append(
+            "an occurrence was interrupted by a shutdown and is queued for one retry "
+            f"(original attempt {retry.get('execution_id', '?')} at "
+            f"{retry.get('interrupted_at', '?')}); it clears on the next successful run")
     if delivery_err := str(job.get("last_delivery_error") or "").strip():
         issues.append(f"last delivery failed: {delivery_err}")
     if unverified := job.get("last_delivery_unverified"):
