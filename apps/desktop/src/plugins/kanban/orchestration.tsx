@@ -51,13 +51,10 @@ const DEFAULT_SENTINEL = '__default__'
  * running count is the actual "is it safe to restart yet" signal, and it is
  * the prominent thing here.
  *
- * Single-board only, and it says so: `api.ts`'s `withBoard` DROPS the All
- * Boards sentinel, so under that selection every call here would silently
- * resolve to the server's current board — one hidden board of many, paused by
- * a control sitting under an "All Boards" heading. A multi-board fan-out is
- * out of scope for now, so the control renders as an explicit hint instead of
- * an action whose target the operator cannot see. Not even the status poll
- * runs: it would report one board's drain count as if it covered all of them.
+ * Board scope is explicit on both paths. Single-board requests use
+ * `board=<slug>` (or the backend's active-board default); All Boards uses the
+ * backend's aggregate `boards=*` contract, which returns per-board outcomes and
+ * never resolves the sentinel to one hidden board.
  */
 export function DispatchPauseControl() {
   const k = useKanban()
@@ -68,7 +65,6 @@ export function DispatchPauseControl() {
   // Same 8s cadence the board's own drawer-adjacent polls use: while draining,
   // the operator is watching this number, so a 60s settings cadence is too slow.
   const { data: status } = useQuery({
-    enabled: !isAllBoards,
     queryFn: fetchDispatchStatus,
     queryKey: dispatchStatusKey(slug),
     refetchInterval: 8_000
@@ -106,21 +102,58 @@ export function DispatchPauseControl() {
     }
   })
 
-  if (isAllBoards) {
-    return (
-      <div className="flex flex-col gap-1.5">
-        <span className={FIELD_LABEL}>{k.dispatchControl}</span>
-        <p className="text-[0.6875rem] text-(--ui-text-quaternary)">{k.dispatchAllBoards}</p>
-      </div>
-    )
-  }
-
   if (!status) {
     return null
   }
 
   const running = status.running_count
   const busy = pause.isPending || resume.isPending
+
+  if (isAllBoards) {
+    const boardCount = status.board_count ?? 0
+    const pausedCount = status.paused_count ?? 0
+    const allPaused = status.all_paused ?? false
+
+    const scopeStatus = allPaused
+      ? running === 0
+        ? k.safeToRestart
+        : k.draining(running)
+      : pausedCount > 0
+        ? k.boardsPaused(pausedCount, boardCount)
+        : k.dispatchRunning
+
+    const scopeTone =
+      pausedCount === 0
+        ? 'var(--ui-text-secondary)'
+        : allPaused && running === 0
+          ? 'var(--ui-text-positive)'
+          : 'var(--ui-text-warning)'
+
+    return (
+      <div className="flex flex-col gap-1.5">
+        <span className={FIELD_LABEL}>{k.dispatchControl}</span>
+        <div className="flex flex-wrap items-center gap-3">
+          <Button
+            disabled={busy || allPaused || boardCount === 0}
+            onClick={() => pause.mutate()}
+            size="xs"
+            variant="outline"
+          >
+            <Codicon name="debug-pause" size="0.8rem" />
+            {k.pauseAllBoards}
+          </Button>
+          <Button disabled={busy || pausedCount === 0} onClick={() => resume.mutate()} size="xs" variant="outline">
+            <Codicon name="play" size="0.8rem" />
+            {k.resumeAllBoards}
+          </Button>
+          <span className="text-[0.75rem] font-medium" style={{ color: scopeTone }}>
+            {scopeStatus}
+          </span>
+        </div>
+        <p className="text-[0.6875rem] text-(--ui-text-quaternary)">{k.pauseHint}</p>
+      </div>
+    )
+  }
 
   return (
     <div className="flex flex-col gap-1.5">

@@ -342,7 +342,9 @@ type KanbanMessages = {
   dispatchRunning: string
   pauseBusy: string
   resumeBusy: string
-  dispatchAllBoards: string
+  pauseAllBoards: string
+  resumeAllBoards: string
+  boardsPaused: (paused: number, total: number) => string
   pauseHint: string
   // native/toast notifications for terminal worker events (completion-notify)
   notify: {
@@ -690,7 +692,9 @@ export const en: KanbanMessages = {
   dispatchRunning: 'Dispatching normally',
   pauseBusy: 'A dispatch tick is in progress — try pausing again in a moment.',
   resumeBusy: 'A dispatch tick is in progress — try resuming again in a moment.',
-  dispatchAllBoards: 'Select a single board to pause or resume its dispatch.',
+  pauseAllBoards: 'Pause all boards',
+  resumeAllBoards: 'Resume all boards',
+  boardsPaused: (paused, total) => `${paused} of ${total} boards paused`,
   pauseHint:
     'Stops new workers being claimed and spawned. Workers already running are never killed — wait for the count to reach 0 before restarting the gateway.',
   notify: {
@@ -1038,7 +1042,9 @@ const ja: KanbanMessages = {
   dispatchRunning: '通常どおりディスパッチ中',
   pauseBusy: 'ディスパッチのティック実行中です。少し待ってからもう一度お試しください。',
   resumeBusy: 'ディスパッチのティック実行中です。少し待ってから再開をお試しください。',
-  dispatchAllBoards: 'ディスパッチを一時停止・再開するには単一のボードを選択してください。',
+  pauseAllBoards: 'すべてのボードを一時停止',
+  resumeAllBoards: 'すべてのボードを再開',
+  boardsPaused: (paused, total) => `${total} 件中 ${paused} 件のボードが一時停止中`,
   pauseHint:
     '新しいワーカーの取得と起動を停止します。実行中のワーカーが強制終了されることはありません。ゲートウェイを再起動する前に、件数が 0 になるまで待ってください。',
   notify: {
@@ -1378,7 +1384,9 @@ const zh: KanbanMessages = {
   dispatchRunning: '调度正常运行中',
   pauseBusy: '正在执行一次调度周期，请稍后再试。',
   resumeBusy: '正在执行一次调度周期，请稍后再尝试恢复。',
-  dispatchAllBoards: '请选择单个看板以暂停或恢复其调度。',
+  pauseAllBoards: '暂停所有面板',
+  resumeAllBoards: '恢复所有面板',
+  boardsPaused: (paused, total) => `${total} 个面板中有 ${paused} 个已暂停`,
   pauseHint: '停止领取和启动新的工作者。已在运行的工作者不会被终止 — 请等待计数归零后再重启网关。',
   notify: {
     completedTitle: '任务已完成',
@@ -1717,7 +1725,9 @@ const zhHant: KanbanMessages = {
   dispatchRunning: '調度正常執行中',
   pauseBusy: '正在執行一次調度週期，請稍後再試。',
   resumeBusy: '正在執行一次調度週期，請稍後再嘗試恢復。',
-  dispatchAllBoards: '請選擇單一看板以暫停或恢復其調度。',
+  pauseAllBoards: '暫停所有面板',
+  resumeAllBoards: '恢復所有面板',
+  boardsPaused: (paused, total) => `${total} 個面板中有 ${paused} 個已暫停`,
   pauseHint: '停止領取與啟動新的工作者。已在執行的工作者不會被終止 — 請等待計數歸零後再重啟閘道。',
   notify: {
     completedTitle: '任務已完成',
