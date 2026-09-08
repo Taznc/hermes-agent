@@ -66,8 +66,11 @@ class ChronosCronScheduler(CronScheduler):
 
     def start(self, stop_event, *, adapters=None, loop=None, interval=60):
         """Arm all enabled jobs via NAS, then RETURN — no loop, no periodic wake (scale-to-zero)."""
-        # A new lifecycle can't prove what an interrupted process did: classify unknown, never requeue.
-        self.recover_interrupted()
+        # A new lifecycle can't prove what an interrupted process did, so the attempt is classified
+        # unknown. Replay is no longer unconditionally refused: recover_interrupted() also runs the
+        # bounded reconciler, which re-arms an eligible lost occurrence at most once (fresh, job
+        # still runnable, nothing in flight) and records a reason for every occurrence it declines.
+        self.recover_interrupted(adapters=adapters, loop=loop)
         self._reconcile_logged(logger.warning, "start()")
 
     def stop(self) -> None:
