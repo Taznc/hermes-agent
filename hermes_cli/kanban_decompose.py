@@ -266,13 +266,19 @@ def _clean_children(task_id: str, raw_tasks: list, routing: _Routing) -> tuple[l
         parents = entry.get("parents") or []
         if not isinstance(parents, list):
             parents = []
-        children.append({
+        child_entry = {
             "title": title.strip()[:200],
             "body": body.strip() if isinstance(body, str) else "",
             "assignee": chosen,
             # Drop non-int, out-of-range and self parent indices.
             "parents": [p for p in parents if isinstance(p, int) and 0 <= p < len(raw_tasks) and p != idx],
-        })
+        }
+        # Optional per-child priority override; absent/non-int -> inherit the
+        # root's priority (handled downstream in decompose_triage_task).
+        priority = entry.get("priority")
+        if isinstance(priority, int) and not isinstance(priority, bool):
+            child_entry["priority"] = priority
+        children.append(child_entry)
     return children, ""
 
 

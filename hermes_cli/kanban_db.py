@@ -94,6 +94,12 @@ VALID_STATUSES = {
 }
 VALID_INITIAL_STATUSES = {"running", "blocked"}
 
+# Canonical priority scale: a documented convention over the free ``priority``
+# INTEGER column, not a constraint. The column stays unbounded — values
+# outside this scale (already live on real boards) are accepted as-is and
+# keep their relative dispatch order; nothing here clamps or migrates them.
+PRIORITY_LEVELS: dict[str, int] = {"critical": 2, "high": 1, "normal": 0, "low": -1}
+
 # Wishlist lanes: a card parked here is INERT BY CONSTRUCTION. No sweep, dispatcher query,
 # promotion pass, decomposer, specifier, ``recompute_ready`` or stale/crash reaper may ever
 # select one, because every one of those selects an explicit status whitelist that omits both.
@@ -4866,7 +4872,7 @@ def decompose_triage_task(
     now = int(time.time())
     with write_txn(conn):
         root_row = conn.execute(
-            "SELECT id, status, tenant, workspace_kind, workspace_path "
+            "SELECT id, status, tenant, workspace_kind, workspace_path, priority "
             "FROM tasks WHERE id = ?", (task_id,),
         ).fetchone()
         if root_row is None or root_row["status"] != "triage":
@@ -4923,6 +4929,11 @@ def _insert_decomposed_child(
     and one shared checkout would put them all on the first sibling's branch
     with no lock; leaving it unset makes dispatch materialize a fresh
     ``<repo>/.worktrees/<child-id>`` per child from the board anchor.
+
+    Priority: per-child ``priority`` (int) overrides; otherwise the child
+    inherits the root's stored ``priority`` so a Critical card fanned out by
+    decompose does not silently demote every dispatchable descendant to the
+    schema default.
     """
     root_ws_kind = root_row["workspace_kind"] or "scratch"
     child_ws_kind = child.get("workspace_kind") or root_ws_kind
@@ -4934,17 +4945,20 @@ def _insert_decomposed_child(
         child_ws_path = root_row["workspace_path"]
     else:
         child_ws_path = None
+    child_priority = child.get("priority")
+    if not isinstance(child_priority, int) or isinstance(child_priority, bool):
+        child_priority = root_row["priority"]
     new_id = _new_task_id()
     body = child.get("body")
     conn.execute(
         "INSERT INTO tasks "
         "(id, title, body, assignee, status, workspace_kind, "
-        " workspace_path, tenant, created_at, created_by) "
-        "VALUES (?, ?, ?, ?, 'todo', ?, ?, ?, ?, ?)",
+        " workspace_path, tenant, created_at, created_by, priority) "
+        "VALUES (?, ?, ?, ?, 'todo', ?, ?, ?, ?, ?, ?)",
         (
             new_id, child["title"].strip(), body if isinstance(body, str) else None,
             _canonical_assignee(child.get("assignee")), child_ws_kind, child_ws_path,
-            root_row["tenant"], now, (author or "decomposer"),
+            root_row["tenant"], now, (author or "decomposer"), child_priority,
         ),
     )
     _append_event(

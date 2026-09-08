@@ -162,3 +162,44 @@ def test_decompose_returns_false_when_task_not_triage(kanban_home):
     assert "not in triage" in outcome.reason
 
 
+def test_decompose_triage_task_children_inherit_root_priority(kanban_home):
+    """AC1: decompose_triage_task inserts the root's priority for each child,
+    and a per-child ``priority`` key overrides it for that child only."""
+    with kbc.connect() as conn:
+        tid = kb.create_task(conn, title="critical work", triage=True, priority=2)
+        child_ids = kb.decompose_triage_task(
+            conn, tid, root_assignee="orchestrator",
+            children=[
+                {"title": "child a"},
+                {"title": "child b"},
+                {"title": "child c", "priority": -1},
+            ],
+            author="me",
+        )
+        assert child_ids and len(child_ids) == 3
+        rows = {cid: kb.get_task(conn, cid) for cid in child_ids}
+    assert rows[child_ids[0]].priority == 2
+    assert rows[child_ids[1]].priority == 2
+    assert rows[child_ids[2]].priority == -1
+
+
+def test_clean_children_normalizes_priority(kanban_home):
+    """AC2: ``_clean_children`` accepts and normalizes an optional integer
+    ``priority`` per child; a non-int value is dropped silently (absent key
+    downstream means inherit the root)."""
+    routing = decomp._Routing(
+        orchestrator="orchestrator", default_assignee="orchestrator",
+        auto_promote=True, roster=[], valid_names={"orchestrator"},
+    )
+    raw_tasks = [
+        {"title": "a", "priority": 2},
+        {"title": "b", "priority": "high"},  # non-int -> dropped
+        {"title": "c"},  # absent -> no key at all
+    ]
+    children, reason = decomp._clean_children("t_root", raw_tasks, routing)
+    assert reason == ""
+    assert children[0]["priority"] == 2
+    assert "priority" not in children[1]
+    assert "priority" not in children[2]
+
+
