@@ -132,8 +132,47 @@ describe('web-bridge-shim getAgentOverview', () => {
     expect(thirdCallUrl).toContain('offset=0')
   })
 
-  it('a real backend failure resolves with a degraded source, not a fake-successful empty snapshot', async () => {
-    fetchMock.mockImplementation(() => jsonResponse({ error: 'not found' }, { status: 404 }))
+  it('a rejecting fetch propagates as a rejection (AC4/AC5c: real failure)', async () => {
+    fetchMock.mockImplementation(() => Promise.reject(new Error('network unreachable')))
+
+    const { getAgentOverview } = await loadShim()
+
+    await expect(getAgentOverview()).rejects.toThrow()
+  })
+
+  it('a non-2xx response on the real route also rejects getAgentOverview({force:true})', async () => {
+    fetchMock.mockImplementation((url: URL) => {
+      // Named bogus/non-2xx route control: the mock only answers the real
+      // agent-overview route; anything else (a genuinely bogus path) 404s
+      // through the same branch, proving this isn't special-cased to the
+      // production path.
+      if (String(url).includes('/api/profiles/agent-overview')) {
+        return jsonResponse({ error: 'not found' }, { status: 404 })
+      }
+
+      return jsonResponse({ error: 'bogus-path-not-found' }, { status: 404 })
+    })
+
+    const { getAgentOverview } = await loadShim()
+
+    await expect(getAgentOverview({ force: true })).rejects.toThrow()
+  })
+
+  it('a partial read (some history, then a mid-stream failure) still resolves rather than rejecting', async () => {
+    // Distinguishes AC4's target case (the sole source never got ANY data,
+    // 'offline' -> reject) from the collector's other degraded states
+    // ('partial': got a first page, then a later page failed) which must
+    // keep resolving so the renderer can show the rows it does have.
+    let calls = 0
+    fetchMock.mockImplementation(() => {
+      calls += 1
+
+      if (calls === 1) {
+        return jsonResponse({ ...HISTORY_PAGE, total: 2 })
+      }
+
+      return Promise.reject(new Error('mid-stream failure'))
+    })
 
     const { getAgentOverview } = await loadShim()
     const overview = await getAgentOverview()
@@ -141,24 +180,7 @@ describe('web-bridge-shim getAgentOverview', () => {
     expect(overview.sources).toHaveLength(1)
     const [source] = overview.sources
 
-    // Never silently swallowed into a false "all quiet": state must not be
-    // 'ready'/complete, and it must not claim completion either.
-    expect(source.state).not.toBe('ready')
-    expect(source.complete).toBe(false)
-  })
-
-  it('a bogus control path also fails, proving the probe methodology is valid', async () => {
-    fetchMock.mockImplementation((url: URL) => {
-      if (String(url).includes('/api/profiles/agent-overview')) {
-        return jsonResponse({ error: 'nope' }, { status: 404 })
-      }
-
-      return jsonResponse({ error: 'not found' }, { status: 404 })
-    })
-
-    const { getAgentOverview } = await loadShim()
-    const overview = await getAgentOverview()
-
-    expect(overview.sources[0].state).not.toBe('ready')
+    expect(source.state).toBe('partial')
+    expect(source.sessions.length).toBeGreaterThan(0)
   })
 })

@@ -42,7 +42,7 @@
 
 import { markWebReloadPending, registerNativeWebReload } from '@/store/web-reload'
 
-import { createAgentOverviewReader } from '../electron/agent-overview'
+import { type AgentOverview, createAgentOverviewReader } from '../electron/agent-overview'
 
 // ── HMR full-reload trap (DEV only) ─────────────────────────────────────────
 // Vite's built-in HMR client calls window.location.reload() directly whenever
@@ -316,8 +316,8 @@ const AGENT_OVERVIEW_SOURCE = { id: 'web', label: 'This backend', kind: 'local' 
 const AGENT_OVERVIEW_POOLED = new Map<string, string[]>([[AGENT_OVERVIEW_SOURCE.id, ['web']]])
 const readAgentOverview = createAgentOverviewReader<string>()
 
-function getAgentOverview(options?: { force?: boolean }) {
-  return readAgentOverview(
+async function getAgentOverview(options?: { force?: boolean }): Promise<AgentOverview> {
+  const overview = await readAgentOverview(
     {
       sources: [AGENT_OVERVIEW_SOURCE],
       pooled: AGENT_OVERVIEW_POOLED,
@@ -326,6 +326,24 @@ function getAgentOverview(options?: { force?: boolean }) {
     },
     { force: options?.force }
   )
+
+  const [source] = overview.sources
+
+  // collectAgentOverview() folds every per-descriptor failure into a
+  // resolved, degraded source (state/errors) instead of rejecting — correct
+  // for Electron, where a multi-source overview must keep painting sources
+  // that DID answer. This shim has exactly one source, so when that source
+  // is 'offline' (never obtained any history: non-2xx, a rejected fetch, or
+  // the collector's own per-source budget expiring) there is nothing else to
+  // show. Reject so store/agent-overview.ts's existing ErrorState path
+  // fires, instead of the renderer painting a false "All quiet". Genuine
+  // partial/compatibility states ('partial', 'unsupported', 'on-demand')
+  // keep resolving, matching Electron's degraded-but-nonempty behavior.
+  if (source?.state === 'offline') {
+    throw new Error(source.error ?? source.errors[0]?.error ?? 'Agent overview backend unavailable.')
+  }
+
+  return overview
 }
 
 function connection(profile?: string | null) {
