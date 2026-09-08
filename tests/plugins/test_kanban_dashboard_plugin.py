@@ -1723,13 +1723,27 @@ def _link_to_archived_parent(conn, *, completed: bool):
     link minted after the archive -- is the state that outlives that cleanup and
     the one the payload filters have to handle. ``completed`` picks whether the
     parent finished its work (dependency satisfied forever) or was withdrawn.
+
+    For the ``completed=True`` half this is now a LEGACY row: ``link_tasks``
+    refuses to mint an edge against an archived-completed parent, so the row is
+    written directly here. Boards created before that change still carry these
+    rows (259 across the fleet at the time of writing) and the payload filters
+    below are what keep them from painting phantom blockers, so the state stays
+    worth pinning even though nothing mints it any more.
     """
     parent_id = kb.create_task(conn, title="blocker", assignee="alice")
     if completed:
         assert kb.complete_task(conn, parent_id)
     assert kb.archive_task(conn, parent_id)
     child_id = kb.create_task(conn, title="blocked", assignee="bob")
-    kb.link_tasks(conn, parent_id, child_id)
+    if completed:
+        conn.execute(
+            "INSERT OR IGNORE INTO task_links (parent_id, child_id) VALUES (?, ?)",
+            (parent_id, child_id),
+        )
+        conn.commit()
+    else:
+        kb.link_tasks(conn, parent_id, child_id)
     return parent_id, child_id
 
 

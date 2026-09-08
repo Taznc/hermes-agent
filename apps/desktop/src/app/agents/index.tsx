@@ -13,6 +13,8 @@ import { AGENTS_ROUTE } from '../routes'
 import { SessionOverview } from './sessions'
 import { SpawnTreeView } from './spawn-tree'
 
+export { SubagentRow } from './spawn-tree'
+
 export function AgentsView({ onClose, embedded = false }: { onClose: () => void; embedded?: boolean }) {
   const { t } = useI18n()
   const [tab, setTab] = useState<'sessions' | 'tree'>('sessions')
@@ -63,6 +65,7 @@ export function AgentsView({ onClose, embedded = false }: { onClose: () => void;
             ) : null}
           </>
         }
+        reserveActionsClearance={!embedded}
         subtitle={tab === 'sessions' ? summary || t.agents.overviewSubtitle : t.agents.subtitle}
         title={t.agents.title}
       />

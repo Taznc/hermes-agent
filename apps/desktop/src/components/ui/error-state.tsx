@@ -62,7 +62,9 @@ export function ErrorState({ children, className, description, icon, title }: Er
         )}
       </div>
 
-      {children && <div className="grid gap-2">{children}</div>}
+      {/* justify-items-center keeps actions their natural width, centered, so a
+          single Retry-style button reads as a button, not a full-bleed bar. */}
+      {children && <div className="grid justify-items-center gap-2">{children}</div>}
     </div>
   )
 }

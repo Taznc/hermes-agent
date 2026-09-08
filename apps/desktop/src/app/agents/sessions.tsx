@@ -4,7 +4,7 @@ import { useEffect, useMemo, useRef, useState } from 'react'
 import { usePaneVisible } from '@/components/pane-shell/pane-visibility'
 import { Button } from '@/components/ui/button'
 import { Codicon } from '@/components/ui/codicon'
-import { ErrorState } from '@/components/ui/error-state'
+import { ErrorBanner, ErrorState } from '@/components/ui/error-state'
 import { Loader } from '@/components/ui/loader'
 import { RowButton } from '@/components/ui/row-button'
 import { SearchField } from '@/components/ui/search-field'
@@ -178,6 +178,11 @@ export function SessionOverview({ onSummary }: { onSummary?: (summary: string) =
 
   const reset = () => setLimit(PAGE)
   const quiet = activity === 'recent' && !search.trim() && source === 'all' && profile === 'all' && provider === 'all'
+  // A hard error has nothing to fall back on and replaces the whole surface;
+  // a stale error still has retained rows (store/agent-overview.ts marks them
+  // via staleRow on failure) and only earns a compact inline notice.
+  const hardError = Boolean(error) && rows.length === 0
+  const staleError = Boolean(error) && rows.length > 0
 
   return (
     <section className="flex min-h-0 flex-1 flex-col gap-2" data-testid="agent-overview">
@@ -239,72 +244,105 @@ export function SessionOverview({ onSummary }: { onSummary?: (summary: string) =
           />
         </div>
       </div>
-      {loading ? <Loader label={a.sessionsTab} /> : null}
-      {error ? (
-        <ErrorState description={error} title={a.offline}>
-          <Button onClick={() => void overviewCache.refresh({ force: true })} size="sm" variant="secondary">
-            {a.retry}
-          </Button>
-        </ErrorState>
-      ) : null}
-      <PanelBody className="gap-3 min-[47.5rem]:gap-4">
-        <div className="flex min-h-0 min-w-0 flex-1 flex-col overflow-y-auto overscroll-contain">
-          {GROUPS.map(group => {
-            const items = shown.filter(row => row.attention === group)
-
-            return items.length > 0 ? (
-              <section aria-label={labels[group]} className="mb-3" key={group}>
-                <PanelSectionLabel className="mb-0.5 px-2">
-                  {labels[group]} · {filtered.filter(row => row.attention === group).length}
-                </PanelSectionLabel>
-                {items.map(row => (
-                  <AgentListRow
-                    active={row.key === selected}
-                    age={fmtAge(row.lastActive, clock, a)}
-                    key={row.key}
-                    multiSource={multiSource}
-                    onOpen={() => void overviewActions.open(row, () => true)}
-                    onSelect={() => setSelected(row.key)}
-                    row={row}
-                    staleLabel={row.stale ? a.stale : undefined}
-                  />
-                ))}
-              </section>
-            ) : null
-          })}
-          {!loading && filtered.length === 0 ? (
-            <PanelEmpty
-              description={quiet ? a.allQuietHint : undefined}
-              icon={quiet ? 'hubot' : 'search'}
-              title={quiet ? a.allQuiet : a.noSessions}
-            />
-          ) : null}
-          {shown.length < filtered.length ? (
-            <div className="flex items-center gap-2 px-2 py-1 text-xs text-muted-foreground">
-              <span>{a.shown(shown.length, filtered.length)}</span>
-              <Button onClick={() => setLimit(value => value + PAGE)} size="inline" variant="textStrong">
-                {a.loadMore}
+      {/* Loading, a hard error (nothing to fall back on), and content are
+          mutually exclusive — never stack an error over the list/empty
+          surface (that read as two contradictory states at once). A *stale*
+          snapshot that still has rows is not a hard error: keep showing the
+          rows (with their existing per-row "Stale ·" label) and surface the
+          failure as a compact inline notice instead of blanking the panel. */}
+      {loading ? (
+        <div className="grid min-h-0 flex-1 place-items-center">
+          <Loader label={a.sessionsTab} />
+        </div>
+      ) : hardError ? (
+        <div className="grid min-h-0 flex-1 place-items-center">
+          <ErrorState description={error} title={a.offline}>
+            <Button
+              data-testid="agent-retry"
+              onClick={() => void overviewCache.refresh({ force: true })}
+              size="sm"
+              variant="secondary"
+            >
+              {a.retry}
+            </Button>
+          </ErrorState>
+        </div>
+      ) : (
+        <>
+          {staleError ? (
+            <div className="flex shrink-0 items-start gap-2">
+              <ErrorBanner className="min-w-0 flex-1">{error}</ErrorBanner>
+              <Button
+                className="mt-0.5"
+                data-testid="agent-retry"
+                onClick={() => void overviewCache.refresh({ force: true })}
+                size="sm"
+                variant="secondary"
+              >
+                {a.retry}
               </Button>
             </div>
           ) : null}
-        </div>
-        {row ? (
-          <aside
-            className="flex min-h-0 shrink-0 flex-col overflow-y-auto overflow-x-hidden overscroll-contain min-[47.5rem]:w-72 min-[47.5rem]:border-l min-[47.5rem]:border-(--ui-stroke-tertiary) min-[47.5rem]:pl-4"
-            data-testid="agent-detail"
+          <PanelBody className="gap-3 min-[47.5rem]:gap-4">
+            <div className="flex min-h-0 min-w-0 flex-1 flex-col overflow-y-auto overscroll-contain">
+              {GROUPS.map(group => {
+                const items = shown.filter(row => row.attention === group)
+
+                return items.length > 0 ? (
+                  <section aria-label={labels[group]} className="mb-3" key={group}>
+                    <PanelSectionLabel className="mb-0.5 px-2">
+                      {labels[group]} · {filtered.filter(row => row.attention === group).length}
+                    </PanelSectionLabel>
+                    {items.map(row => (
+                      <AgentListRow
+                        active={row.key === selected}
+                        age={fmtAge(row.lastActive, clock, a)}
+                        key={row.key}
+                        multiSource={multiSource}
+                        onOpen={() => void overviewActions.open(row, () => true)}
+                        onSelect={() => setSelected(row.key)}
+                        row={row}
+                        staleLabel={row.stale ? a.stale : undefined}
+                      />
+                    ))}
+                  </section>
+                ) : null
+              })}
+              {filtered.length === 0 ? (
+                <PanelEmpty
+                  description={quiet ? a.allQuietHint : undefined}
+                  icon={quiet ? 'hubot' : 'search'}
+                  title={quiet ? a.allQuiet : a.noSessions}
+                />
+              ) : null}
+              {shown.length < filtered.length ? (
+                <div className="flex items-center gap-2 px-2 py-1 text-xs text-muted-foreground">
+                  <span>{a.shown(shown.length, filtered.length)}</span>
+                  <Button onClick={() => setLimit(value => value + PAGE)} size="inline" variant="textStrong">
+                    {a.loadMore}
+                  </Button>
+                </div>
+              ) : null}
+            </div>
+            {row ? (
+              <aside
+                className="flex min-h-0 shrink-0 flex-col overflow-y-auto overflow-x-hidden overscroll-contain min-[47.5rem]:w-72 min-[47.5rem]:border-l min-[47.5rem]:border-(--ui-stroke-tertiary) min-[47.5rem]:pl-4"
+                data-testid="agent-detail"
+              >
+                <Preview key={row.key} onClose={() => setSelected(null)} row={row} />
+              </aside>
+            ) : null}
+          </PanelBody>
+          <div
+            className="flex shrink-0 flex-wrap items-center gap-x-4 gap-y-1 border-t border-(--ui-stroke-tertiary) pt-2 text-[0.68rem] text-muted-foreground/70"
+            data-testid="agent-source-coverage"
           >
-            <Preview key={row.key} onClose={() => setSelected(null)} row={row} />
-          </aside>
-        ) : null}
-      </PanelBody>
-      <div
-        className="flex shrink-0 flex-wrap items-center gap-x-4 gap-y-1 border-t border-(--ui-stroke-tertiary) pt-2 text-[0.68rem] text-muted-foreground/70"
-        data-testid="agent-source-coverage"
-      >
-        {sources.map(item => (
-          <SourceCoverage key={item.connectionId} source={item} />
-        ))}
-      </div>
+            {sources.map(item => (
+              <SourceCoverage key={item.connectionId} source={item} />
+            ))}
+          </div>
+        </>
+      )}
     </section>
   )
 }
