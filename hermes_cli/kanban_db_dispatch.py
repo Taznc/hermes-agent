@@ -3109,10 +3109,11 @@ def _block_for_skill_preflight(
 
     Returns True when the card was refused. The refusal is deliberately NOT a
     task failure: ``block_task`` moves it out of the dispatchable lane without
-    touching ``consecutive_failures``, so a card that crash-looped before this
-    check existed resumes with a clean budget once the skill is installed and
-    the card is unblocked. ``capability`` is the honest kind — no agent can fix
-    a missing skill in another profile's home.
+    incrementing ``consecutive_failures``. If the existing failure record is the
+    worker-init ``Unknown skill(s): ...`` diagnostic from before this check
+    existed, it is cleared so the corrected card resumes with a clean budget;
+    unrelated implementation failure history is preserved. ``capability`` is
+    the honest kind — no agent can fix a missing skill in another profile's home.
     """
     from hermes_cli.kanban_skill_preflight import KanbanSkillPreflightError, preflight_task_skills
 
@@ -3133,7 +3134,8 @@ def _block_for_skill_preflight(
                 # card one bad tick from the auto-block breaker.
                 conn.execute(
                     "UPDATE tasks SET consecutive_failures = 0, last_failure_error = NULL "
-                    "WHERE id = ?", (task_id,),
+                    "WHERE id = ? AND last_failure_error GLOB 'Unknown skill(s): *'",
+                    (task_id,),
                 )
                 # Stamp the structured form onto the block event a caller can
                 # key on (CLI, dashboard, telemetry) without parsing prose.

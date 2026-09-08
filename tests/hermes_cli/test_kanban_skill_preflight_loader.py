@@ -117,6 +117,24 @@ def test_the_preflight_does_not_write_into_the_inspected_profile(kanban_home):
     assert _snapshot() == before
 
 
+def test_the_preflight_does_not_mutate_preexisting_skill_usage_metadata(kanban_home):
+    """The shadow must absorb Curator usage writes even when ``.usage.json``
+    already exists. Symlinking that file makes ``bump_use`` write through to
+    the inspected profile while a size-only tree snapshot still looks clean."""
+    from hermes_cli.kanban_skill_preflight import missing_skills_for_profile
+
+    profile_dir = _make_profile(kanban_home, "claudecode", ["github-code-review"])
+    usage = profile_dir / "skills" / ".usage.json"
+    before = (
+        '{"github-code-review":{"use_count":7,'
+        '"last_used_at":"2000-01-01T00:00:00+00:00"}}\n'
+    ).encode()
+    usage.write_bytes(before)
+
+    assert missing_skills_for_profile("claudecode", ["github-code-review"]) == []
+    assert usage.read_bytes() == before
+
+
 def test_the_shadow_home_still_honors_the_profiles_own_config(kanban_home):
     """The shadow home must not become a way to lose the profile's config: a
     skill this profile has DISABLED is still unloadable, and an external dir it
@@ -136,6 +154,93 @@ def test_the_shadow_home_still_honors_the_profiles_own_config(kanban_home):
     assert missing_skills_for_profile(
         "claudecode", ["github-code-review", "team-review"],
     ) == ["github-code-review"]
+
+
+def test_an_unreadable_profile_config_fails_closed_through_create(
+    kanban_home, monkeypatch,
+):
+    """Source-I/O failures while preparing the shadow use the same structured
+    unavailable-profile contract as lookup and subprocess failures."""
+    from hermes_cli import kanban_db, kanban_db_connect, kanban_skill_preflight
+    from hermes_cli.kanban_skill_preflight import (
+        PROFILE_UNAVAILABLE_CODE, KanbanSkillPreflightError,
+    )
+
+    profile_dir = _make_profile(kanban_home, "claudecode", ["github-code-review"])
+    config = profile_dir / "config.yaml"
+    config.write_text("skills: {}\n", encoding="utf-8")
+    original_copy2 = kanban_skill_preflight.shutil.copy2
+
+    def _deny_config(source, target, *args, **kwargs):
+        if Path(source) == config:
+            raise PermissionError("unreadable config.yaml")
+        return original_copy2(source, target, *args, **kwargs)
+
+    monkeypatch.setattr(kanban_skill_preflight.shutil, "copy2", _deny_config)
+
+    with kanban_db_connect.connect_closing() as conn:
+        kanban_db.create_board(slug="default", name="Test")
+        with pytest.raises(KanbanSkillPreflightError) as excinfo:
+            kanban_db.create_task(
+                conn, title="card", assignee="claudecode",
+                skills=["github-code-review"],
+            )
+        assert kanban_db.list_tasks(conn) == []
+    assert excinfo.value.code == PROFILE_UNAVAILABLE_CODE
+
+
+def test_an_unreadable_skills_directory_blocks_a_legacy_card_once_without_spawn(
+    kanban_home, monkeypatch,
+):
+    """A legacy/imported row is refused before claim even when the registry
+    itself cannot be enumerated: one stable capability block, no worker start,
+    and no retry/start-budget charge."""
+    from hermes_cli import (
+        kanban_db, kanban_db_connect, kanban_db_dispatch, kanban_skill_preflight,
+    )
+    from hermes_cli.kanban_skill_preflight import PROFILE_UNAVAILABLE_CODE
+    from tests.hermes_cli.test_kanban_skill_preflight import _legacy_card_with_unloadable_skill
+
+    profile_dir = _make_profile(kanban_home, "claudecode", ["github-code-review"])
+    real_skills = profile_dir / "skills"
+    spawned = []
+    with kanban_db_connect.connect_closing() as conn:
+        kanban_db.create_board(slug="default", name="Test")
+        task_id = _legacy_card_with_unloadable_skill(
+            kb=kanban_db, conn=conn, assignee="claudecode", skill="github-code-review",
+        )
+
+    original_iterdir = kanban_skill_preflight.Path.iterdir
+
+    def _deny_skills(path):
+        if path == real_skills:
+            raise PermissionError("unreadable skills directory")
+        return original_iterdir(path)
+
+    monkeypatch.setattr(kanban_skill_preflight.Path, "iterdir", _deny_skills)
+    with kanban_db_connect.connect_closing() as conn:
+        first = kanban_db_dispatch.dispatch_once(
+            conn, spawn_fn=lambda task, *a, **k: spawned.append(task.id) or 1,
+        )
+        second = kanban_db_dispatch.dispatch_once(
+            conn, spawn_fn=lambda task, *a, **k: spawned.append(task.id) or 1,
+        )
+        task = kanban_db.get_task(conn, task_id)
+        events = kanban_db.list_events(conn, task_id)
+        assert kanban_db_dispatch._recent_dispatch_starts(conn, window_seconds=600) == 0
+
+    blocks = [event for event in events if event.kind == "blocked"]
+    assert task is not None
+    assert spawned == []
+    assert first.spawned == second.spawned == []
+    assert task_id in [tid for tid, _reason in first.skill_preflight_blocked]
+    assert second.skill_preflight_blocked == []
+    assert task.status == "blocked"
+    assert task.consecutive_failures == 0
+    assert len(blocks) == 1
+    assert blocks[0].payload is not None
+    assert blocks[0].payload["code"] == PROFILE_UNAVAILABLE_CODE
+    assert [event for event in events if event.kind == "spawned"] == []
 
 
 def test_an_absent_assignee_profile_fails_closed(kanban_home):

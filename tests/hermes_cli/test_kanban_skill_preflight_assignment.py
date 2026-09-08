@@ -146,6 +146,34 @@ def test_a_preflight_block_clears_initialization_only_failure_state(kanban_home)
         assert task.last_failure_error is None
 
 
+def test_a_preflight_block_preserves_unrelated_implementation_failure_state(kanban_home):
+    """A later configuration block must not erase real implementation history;
+    only the worker-init ``Unknown skill(s): ...`` failure is stale."""
+    import json
+
+    from hermes_cli import kanban_db, kanban_db_connect, kanban_db_dispatch
+
+    _make_profile(kanban_home, "claudecode", [])
+
+    with kanban_db_connect.connect_closing() as conn:
+        kanban_db.create_board(slug="default", name="Test")
+        task_id = kanban_db.create_task(conn, title="legacy card", assignee="claudecode")
+        with kanban_db.write_txn(conn):
+            conn.execute(
+                "UPDATE tasks SET skills = ?, consecutive_failures = 2, "
+                "last_failure_error = ? WHERE id = ?",
+                (json.dumps(["still-missing"]), "implementation boom", task_id),
+            )
+
+    with kanban_db_connect.connect_closing() as conn:
+        kanban_db_dispatch.dispatch_once(conn, spawn_fn=lambda *a, **k: 1)
+        task = kanban_db.get_task(conn, task_id)
+        assert task is not None
+        assert task.status == "blocked"
+        assert task.consecutive_failures == 2
+        assert task.last_failure_error == "implementation boom"
+
+
 def test_the_corrected_card_resumes_with_no_stale_initialization_failures(kanban_home):
     """End of the incident: install the skill, unblock, and the card dispatches
     normally with a clean budget."""

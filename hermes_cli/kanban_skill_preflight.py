@@ -28,7 +28,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
-from contextlib import contextmanager, suppress
+from contextlib import contextmanager
 from pathlib import Path
 from typing import Iterable, Optional
 
@@ -159,8 +159,9 @@ def _read_only_home(profile_home: Path):
 
     So the child gets its own directory whose ``config.yaml`` is the profile's
     (skill dirs, ``external_dirs``, ``disabled`` all resolve identically) and
-    whose ``skills/`` is a real directory of symlinks to the profile's skills.
-    Reads follow the links; writes land on the temp dir and are discarded.
+    whose ``skills/`` is a real directory. Skill directories are symlinked for
+    loader fidelity, while root metadata and legacy flat skill files are
+    copied so writes such as ``bump_use`` land in the temp dir and disappear.
     ``.env`` is deliberately NOT copied: it holds secrets, and skill *readiness*
     does not affect whether a skill loads.
     """
@@ -174,10 +175,11 @@ def _read_only_home(profile_home: Path):
         real_skills = profile_home / "skills"
         if real_skills.is_dir():
             for entry in real_skills.iterdir():
-                with suppress(OSError):
-                    (shadow_skills / entry.name).symlink_to(
-                        entry, target_is_directory=entry.is_dir(),
-                    )
+                target = shadow_skills / entry.name
+                if entry.is_dir():
+                    target.symlink_to(entry, target_is_directory=True)
+                elif entry.is_file():
+                    shutil.copy2(entry, target)
         yield shadow
 
 
@@ -190,20 +192,20 @@ def _run_probe(canon: str, home: Path, names: list[str]) -> dict:
     """
     from hermes_cli.kanban_skill_probe import RESULT_PREFIX
 
-    with tempfile.TemporaryDirectory(prefix="hermes-skill-probe-cwd-") as neutral_cwd, \
-            _read_only_home(home) as shadow_home:
-        try:
+    try:
+        with tempfile.TemporaryDirectory(prefix="hermes-skill-probe-cwd-") as neutral_cwd, \
+                _read_only_home(home) as shadow_home:
             proc = subprocess.run(
                 [sys.executable, "-m", "hermes_cli.kanban_skill_probe", json.dumps(names)],
                 capture_output=True, text=True, env=_probe_env(shadow_home),
                 cwd=neutral_cwd, timeout=PROBE_TIMEOUT_SECONDS,
             )
-        except subprocess.TimeoutExpired as exc:
-            raise _unavailable(
-                canon, f"inspecting its skill registry timed out after {PROBE_TIMEOUT_SECONDS}s.",
-            ) from exc
-        except Exception as exc:
-            raise _unavailable(canon, f"its skill registry could not be inspected ({exc}).") from exc
+    except subprocess.TimeoutExpired as exc:
+        raise _unavailable(
+            canon, f"inspecting its skill registry timed out after {PROBE_TIMEOUT_SECONDS}s.",
+        ) from exc
+    except Exception as exc:
+        raise _unavailable(canon, f"its skill registry could not be inspected ({exc}).") from exc
     for line in proc.stdout.splitlines():
         if line.startswith(RESULT_PREFIX):
             try:
