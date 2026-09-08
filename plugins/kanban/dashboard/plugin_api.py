@@ -1858,6 +1858,8 @@ def dispatch(dry_run: bool = Query(False), max_n: int = Query(8, alias="max"), b
             dispatch_start_window_seconds=caps.dispatch_start_window_seconds,
             review_rework_escalation_profile=caps.review_rework_escalation_profile,
             max_review_rounds=caps.max_review_rounds,
+            priority_reserved_slots=caps.priority_reserved_slots,
+            priority_reserved_threshold=caps.priority_reserved_threshold,
             board=board,
         )
         try:

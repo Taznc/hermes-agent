@@ -559,25 +559,39 @@ def test_repeated_heartbeat_errors_cancel_after_bounded_grace(monkeypatch):
     assert calls >= 3
 
 
-def test_terminal_owner_cas_failure_marks_ledger_ownership_lost(monkeypatch):
-    """A replacement owner cannot leave the stale ledger recorded as success."""
+def test_terminal_owner_cas_failure_records_this_attempt_honestly(tmp_path, monkeypatch):
+    """A replacement owner takes the fire claim while this run is delivering.
+
+    The stale worker must not write the JOB record (that belongs to the replacement owner), but
+    its OWN ledger attempt is a separate question: this attempt really did run, save its output
+    and deliver. Since the run terminalizes before delivery begins, that result is already durable
+    and immutable by the time the owner CAS is found to have failed — so the attempt stays
+    truthfully ``completed`` instead of being relabelled a failure it did not have, and the
+    delivery outcome is attached alongside it.
+
+    Asserted against a real ledger rather than a mocked ``finish_execution``: the durable row is
+    the contract, and a call-signature assertion cannot distinguish a write that lands from one
+    the immutable terminal state refuses.
+    """
+    import cron.executions as executions
     import cron.scheduler as scheduler
-    from cron import scheduler_script as sched_script
+
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    monkeypatch.setattr(executions, "EXECUTIONS_FILE", tmp_path / "executions.db")
 
     @contextlib.contextmanager
     def owned_fence(*_args, **_kwargs):
         yield True
 
+    record = executions.create_execution("terminal-cas", source="schedule")
     job = {
         "id": "terminal-cas",
-        "execution_id": "execution-cas",
+        "execution_id": record["id"],
         "name": "terminal-cas",
         "fire_claim": {"at": "2026-07-12T12:00:00+00:00", "by": "owner"},
     }
-    finish = MagicMock()
     monkeypatch.setattr(scheduler, "heartbeat_fire_claim", lambda *args, **kwargs: True)
     monkeypatch.setattr(scheduler, "claim_dispatch", lambda *_args, **_kwargs: True)
-    monkeypatch.setattr(scheduler, "mark_execution_running", lambda *_args: {})
     monkeypatch.setattr(
         scheduler,
         "run_job",
@@ -586,16 +600,28 @@ def test_terminal_owner_cas_failure_marks_ledger_ownership_lost(monkeypatch):
     monkeypatch.setattr(scheduler, "fire_claim_fence", owned_fence, raising=False)
     monkeypatch.setattr(scheduler, "save_job_output", lambda *_args: "output.md")
     monkeypatch.setattr(scheduler, "_deliver_result", lambda *_args, **_kwargs: None)
-    monkeypatch.setattr(scheduler, "mark_job_run", lambda *_args, **_kwargs: False)
-    monkeypatch.setattr(scheduler, "finish_execution", finish)
+    # The replacement owner's claim makes this stale worker's job-store write fail closed.
+    marked = []
+    monkeypatch.setattr(
+        scheduler, "mark_job_run",
+        lambda *args, **kwargs: marked.append((args, kwargs)) or False)
 
     with patch("agent.secret_scope.set_secret_scope", return_value=None), \
          patch("agent.secret_scope.build_profile_secret_scope", return_value=None), \
          patch("agent.secret_scope.reset_secret_scope"):
         assert scheduler.run_one_job(job) is True
 
-    finish.assert_called_once_with(
-        "execution-cas",
-        success=False,
-        error="Fire claim ownership lost before terminal completion.",
-    )
+    # The job record was NOT updated by the stale worker (the CAS refused it).
+    assert marked and marked[0][1]["expected_fire_owner"] == "owner"
+
+    row = executions.get_execution(record["id"])
+    assert row is not None
+    assert row["status"] == "completed"
+    assert row["error"] is None
+    assert row["interrupted"] == 0
+    # This job carries no deliver lane, so its notice is correctly classified as suppressed —
+    # the point is that a delivery outcome is attached at all, rather than the run being
+    # relabelled a failure.
+    assert row["delivery_outcome"] == "suppressed"
+    # And it must not become a replay candidate — replaying would deliver a second time.
+    assert executions.list_undecided_interruptions() == []

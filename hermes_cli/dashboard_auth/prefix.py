@@ -128,3 +128,23 @@ def resolve_public_url() -> str:
     if not cfg_clean:
         _warn_if_malformed("dashboard.public_url in config.yaml", cfg_raw)
     return cfg_clean
+
+
+def normalise_declared_origin(raw: Optional[str]) -> str:
+    """Bare ``scheme://host[:port]`` origin (no path, query, or fragment survive), or ``""``
+    when absent/malformed. Stricter than ``_normalise_public_url`` (which permits a path,
+    matching ``dashboard.public_url``'s "URL + optional mount prefix" contract) because an
+    origin is a narrower shape: a client-declared value carrying a path/query is rejected
+    outright rather than silently truncated, since the caller is about to concatenate a
+    server-controlled suffix onto it.
+
+    Used by the MCP OAuth start route to validate a client-supplied
+    ``client_public_origin`` — see ``hermes_cli/web_routers/mcp.py``.
+    """
+    cleaned = _normalise_public_url(raw)
+    if not cleaned:
+        return ""
+    parsed = urllib.parse.urlparse(cleaned)
+    if parsed.path not in ("", "/") or parsed.query or parsed.fragment or parsed.params:
+        return ""
+    return cleaned

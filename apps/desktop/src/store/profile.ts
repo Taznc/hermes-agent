@@ -875,14 +875,7 @@ export const $profileScope = computed([$showAllProfiles, $activeGatewayProfile],
 // Switch the active context to `name`: leave "All profiles" mode, point new
 // chats at it, and swap the single live gateway onto its backend (which moves
 // $activeGatewayProfile → name, so $profileScope follows).
-//
-// `forceLocal` pins the activation to the LOCAL pool regardless of whichever
-// source is currently browsed — needed by selectAgent's explicit
-// connectionId:null case (the command palette's "this device" row), which
-// must not inherit activateOnCurrentSource's "stay on the browsed remote"
-// behavior below (#92194): that behavior is for bare rail/menu picks with no
-// explicit connection in play, not for an explicit "go local" request.
-export function selectProfile(name: string, options?: { forceLocal?: boolean }): void {
+export function selectProfile(name: string): void {
   const target = normalizeProfileKey(name)
 
   // Switching profiles (or coming back from the all-profiles browse view) starts
@@ -920,12 +913,11 @@ export function selectProfile(name: string, options?: { forceLocal?: boolean }):
   // IPC instead (#79886). Registry-source picks name ANOTHER source's
   // profiles, so only a primary-backend activation updates the startup
   // preference.
-  const forceLocal = options?.forceLocal ?? false
-  const onPrimary = forceLocal || activeGatewayConnectionId() == null
+  const onPrimary = activeGatewayConnectionId() == null
 
   const shouldRememberStartupProfile = onPrimary ? isLocalDesktopProfile(target) : Promise.resolve(false)
 
-  void Promise.all([activateOnCurrentSource(target, forceLocal), shouldRememberStartupProfile])
+  void Promise.all([activateOnCurrentSource(target), shouldRememberStartupProfile])
     .then(([, shouldRemember]) => {
       if (shouldRemember) {
         return window.hermesDesktop?.profile?.remember(target)
@@ -969,11 +961,8 @@ async function isLocalDesktopProfile(target: string): Promise<boolean> {
 // profile-only path so the main process can resolve a per-profile remote
 // override before falling back to a local backend. Default on `local` stays
 // on that source — see profilePickConnectionId.
-//
-// `forceLocal` bypasses that "current source" lookup entirely and always
-// targets the local pool — see selectProfile's doc above.
-function activateOnCurrentSource(target: string, forceLocal = false): Promise<void> {
-  const connectionId = forceLocal ? null : profilePickConnectionId(target)
+function activateOnCurrentSource(target: string): Promise<void> {
+  const connectionId = profilePickConnectionId(target)
 
   return connectionId ? ensureGatewayAgent(connectionId, target) : ensureGatewayProfile(target)
 }
@@ -982,21 +971,25 @@ function activateOnCurrentSource(target: string, forceLocal = false): Promise<vo
 // on a NAMED connection. Same user-visible contract (leave the all-profiles
 // view, point new chats at it, start fresh when the context actually changes),
 // but the swap goes through ensureGatewayAgent so the socket is dialed against
-// that connection's own backend. A null/local connectionId is delegated to
-// selectProfile with forceLocal — an explicit (connection, profile) pair
-// naming the local pool must land there, not wherever the app currently
-// happens to be browsing.
+// that connection's own backend.
+//
+// This is the IN-SOURCE door only: the fleet rail picking another profile on
+// the connection it is already enumerating. A CROSS-SOURCE switch is a
+// different operation and belongs to store/connections selectConnection, whose
+// two-phase commit severs the previous backend's session bindings before the
+// next source is published (#93937) and whose machine-context reset closes
+// terminals and drops the project tree. Doing that for a same-machine profile
+// pick would throw away rows and terminals the user is still looking at — the
+// wipe is deliberately gated on the CONNECTION half changing (fork/profile-scope).
 //
 // "Switching" is judged on the (connection, profile) PAIR, not the profile key
 // alone — re-selecting `default` on a remote source while sitting on the local
 // `default` is a real backend change, and comparing profile names alone would
 // silently skip it.
-export function selectAgent(connectionId: null | string, name: string): void {
-  const connection = (connectionId ?? '').trim() || null
+export function selectAgent(connectionId: string, name: string): void {
+  const connection = connectionId.trim()
 
   if (!connection) {
-    selectProfile(name, { forceLocal: true })
-
     return
   }
 

@@ -525,3 +525,58 @@ class TestCookiePathRespectsPrefix:
         assert "Path=/hermes" in at_cookies[0]
         assert "Secure" in at_cookies[0]
         assert "HttpOnly" in at_cookies[0]
+
+
+# ---------------------------------------------------------------------------
+# normalise_declared_origin (t_d40923b6) — the browser-declared-origin
+# validator MCP OAuth's client_public_origin query param feeds into
+# _mcp_oauth_callback_url.
+# ---------------------------------------------------------------------------
+
+
+class TestNormaliseDeclaredOrigin:
+    def test_accepts_bare_https_origin(self):
+        assert (
+            prefix_mod.normalise_declared_origin("https://hermes-desktop-dev.jashworth.com")
+            == "https://hermes-desktop-dev.jashworth.com"
+        )
+
+    def test_accepts_origin_with_port(self):
+        assert (
+            prefix_mod.normalise_declared_origin("http://127.0.0.1:5176")
+            == "http://127.0.0.1:5176"
+        )
+
+    def test_strips_trailing_slash(self):
+        assert (
+            prefix_mod.normalise_declared_origin("https://example.com/")
+            == "https://example.com"
+        )
+
+    def test_rejects_origin_with_a_path(self):
+        """An origin is bare scheme://host[:port] — a path means the caller
+        sent something else entirely (or is trying to smuggle a suffix)."""
+        assert prefix_mod.normalise_declared_origin("https://example.com/some/path") == ""
+
+    def test_rejects_origin_with_query_or_fragment(self):
+        assert prefix_mod.normalise_declared_origin("https://example.com?x=1") == ""
+        assert prefix_mod.normalise_declared_origin("https://example.com#frag") == ""
+
+    def test_rejects_non_http_scheme(self):
+        assert prefix_mod.normalise_declared_origin("javascript:alert(1)") == ""
+        assert prefix_mod.normalise_declared_origin("ftp://example.com") == ""
+
+    def test_rejects_injection_characters(self):
+        assert prefix_mod.normalise_declared_origin('https://example.com"injected') == ""
+        assert prefix_mod.normalise_declared_origin("https://example.com\nhttps://evil") == ""
+
+    def test_rejects_none_and_empty(self):
+        assert prefix_mod.normalise_declared_origin(None) == ""
+        assert prefix_mod.normalise_declared_origin("") == ""
+        assert prefix_mod.normalise_declared_origin("   ") == ""
+
+    def test_rejects_missing_scheme(self):
+        assert prefix_mod.normalise_declared_origin("example.com") == ""
+
+    def test_rejects_missing_host(self):
+        assert prefix_mod.normalise_declared_origin("https://") == ""

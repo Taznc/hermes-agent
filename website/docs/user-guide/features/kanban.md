@@ -171,12 +171,77 @@ later (`hermes kanban update <id> --priority ...`); `hermes kanban list` and
 `hermes kanban show` render a recognized tier by name, and any other integer
 by its bare number.
 
-Priority is a **dispatch-order tiebreaker only** — among tasks otherwise
-ready to run for the same assignee, higher priority is picked sooner. It does
-**not** reserve capacity, does **not** preempt a task that is already
-running, and does not affect model or reasoning-effort routing. Values
-outside the four-tier scale are accepted as-is (not clamped or migrated) and
-keep their relative order.
+Priority is a **dispatch-order tiebreaker by default** — among tasks otherwise
+ready to run for the same assignee, higher priority is picked sooner. On its
+own it does **not** reserve capacity and does **not** preempt a task that is
+already running, and it never affects model or reasoning-effort routing.
+Values outside the four-tier scale are accepted as-is (not clamped or
+migrated) and keep their relative order.
+
+#### Reserving worker slots for high-priority cards
+
+Ordering alone cannot help a Critical card when the worker pool is already
+saturated: it waits for a slot exactly as long as a Normal card would. Two
+opt-in settings give priority real scheduling power:
+
+| Key | Default | Meaning |
+|---|---|---|
+| `kanban.priority_reserved_slots` | `0` (off) | How many of a tick's ready-lane slots to hold for high-priority cards |
+| `kanban.priority_reserved_threshold` | `1` (High and above) | The priority at or above which a card draws on the reservation |
+
+**The default is off.** At `priority_reserved_slots: 0` dispatch behaves
+exactly as it always has — this changes scheduling on a live fleet, so it
+ships inert and you opt in.
+
+When it is on, below-threshold **ready** cards may consume at most
+`ready_budget - reserved` of the tick's slots, while at-or-above-threshold
+ready cards may use the full budget. A slot is only held when a qualifying
+card actually wants one this tick: unclaimed in `ready`, with an assignee that
+names a real profile. An unassigned Critical card, or one on a control-plane
+lane pulled by a terminal via `claim_task`, generates no demand and cannot
+hold a slot hostage — nothing would ever spawn into it.
+
+**Slots nobody is queued for fall through to normal work in the same tick.**
+With no qualifying ready card waiting — or fewer of them than you configured
+slots — the unclaimed remainder goes to normal work immediately, not on some
+later tick.
+
+**A slot claimed by a queued high-priority card may sit idle, deliberately.**
+When a Critical card wants a slot but cannot spawn this tick (its assignee is
+at `max_in_progress_per_profile`, a co-edit serialization is in force, a
+respawn guard is cooling down), the reservation keeps holding that slot rather
+than lending it to normal work. That is the whole point of the setting: it is
+what stops normal work from re-saturating the pool before the Critical card
+becomes eligible. It is also its cost — capacity can stand idle for as long as
+that demand exists. `hermes kanban dispatch --dry-run` reports it as
+`unused` rather than hiding it, and below-threshold work still receives
+`ready_budget - reserved`.
+
+**The review lane is separate.** `review` already reserves a slot of its own
+so a sustained ready backlog cannot starve reviews, regardless of priority.
+A high-priority card in `review` therefore does *not* additionally draw on
+this reservation, and the reserved/unused counters describe the ready-lane
+reservation only.
+
+The reservation grants **earlier access to a slot — never preemption**. It
+never reclaims, pauses, or kills a running worker to make room: reclaiming
+would discard that worker's uncommitted worktree, the same way restarting the
+gateway does. A high-priority card waits for the next slot to free naturally;
+it simply is not overtaken by normal work while waiting.
+
+It composes with, and never overrides, every existing gate. The review-lane
+reservation, `max_in_progress`, `max_in_progress_per_profile`, the
+`dispatch_start_budget` window and the memory-pressure clamp all still bind:
+a high-priority card blocked by the per-profile cap records
+`skipped_per_profile_capped` and does **not** spawn — its slot is simply held
+rather than handed to normal work. The reservation can only narrow what
+below-threshold cards may take; it never grants capacity a cap withheld.
+
+Both settings are re-read every dispatcher tick, so retuning them takes effect
+without restarting the gateway (a restart SIGKILLs every in-flight worker).
+`hermes kanban dispatch --dry-run` reports how many slots were reserved, how
+many went unused, and which normal cards were held back, so the setting is
+observable rather than invisible.
 
 When a triage card is fanned out via `decompose`, every child **inherits the
 root's priority** unless the decomposer explicitly assigns a different
@@ -639,6 +704,63 @@ hermes kanban create "nightly ops review" \
     --idempotency-key "nightly-ops-$(date -u +%Y-%m-%d)" \
     --json
 ```
+
+### Approving and landing a card (`hermes kanban approve` / `land`)
+
+A card that will be **landed** is approved with `hermes kanban approve`, not
+`complete`. Completion reaps the task worktree and its `wt/` branch on the spot,
+and that tree is exactly the evidence landing re-verifies — so approval instead
+records an explicit verdict bound to the reviewed commit and leaves the card in
+`review`, intact, awaiting the attended landing. (`complete` remains right for a
+card whose life genuinely ends at review.)
+
+```bash
+# Reviewer verdict: card stays in review, worktree and branch preserved
+hermes kanban approve t_abc
+
+# Configure the target once per board, then land by id
+hermes kanban boards set-land-target default origin/dev
+hermes kanban land t_abc
+
+# Or name it explicitly; batch and dry-run are supported
+hermes kanban land t_abc t_def --target origin/dev --dry-run --json
+```
+
+`land` turns that approval into a verified merge — replacing the manual
+archaeology of checking the board, the worktree, the push state, git ancestry
+and the remote by hand before every cleanup.
+
+It is **attended only** — nothing runs it automatically — and every gate fails
+closed with a reason code rather than merging on an assumption:
+
+- The target is read from `--target` or the board's `land_target` and **never
+  inferred**. A repository with both a fork and an upstream configured has no
+  safe default, so with neither set the command refuses. Output always names
+  the remote and branch, refusals included.
+- It requires a live `hermes kanban approve` verdict (a `done` status alone is
+  not approval, and an approval is retired by a newer `changes_requested` or a
+  newer review request), no live worker, satisfied dependencies, a clean
+  worktree, and a branch published at **exactly the approved commit** — a branch
+  that moved after review refuses, because verification is not review.
+- Fetching, pushing and reading back all address the remote's resolved **push
+  URL**, so a `pushurl` pointing at a second repository can never let it verify
+  one destination while writing another.
+- It requires verification evidence for that exact commit: either the board's
+  `land_verify` command re-run now, or a `pre_review_gate` / `verification`
+  receipt naming the same commit — read from the approval run or from the
+  review handoff, which is where the implementer's own pre-review gate lands.
+- It fetches the target, merges in a throwaway worktree, pushes **without
+  force**, then re-reads the remote and only closes the card once the content is
+  provably present there. "Already present" is judged against the target's
+  current tip, so a squash-merged card reads as already landed while
+  applied-then-reverted work correctly does not. Re-running a landing is safe
+  and idempotent.
+- `--dry-run` mutates nothing at all — no fetch, no worktree, no ref, and it
+  does not run the configured `land_verify` command either — and `--json`
+  returns one verdict per task. In a batch, one refusal never affects another
+  card.
+
+Full safety model and per-step recovery: `docs/kanban/landing.md` in the repo.
 
 ### Bulk CLI verbs
 

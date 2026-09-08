@@ -10,6 +10,19 @@ interface CompleteOptions {
   sleep?: (milliseconds: number) => Promise<void>
   maxPollFailures?: number
   timeoutMs?: number
+  /**
+   * A popup window already opened at the real user-gesture boundary (see
+   * `openMcpOAuthPopup`), for callers that must `await` something (adding a
+   * server, resolving a profile, installing a catalog preset) before they can
+   * call this function. Chromium's transient activation from a click expires
+   * across such an await, so `window.open()` called for the first time INSIDE
+   * this function can be silently blocked as an unsolicited popup — passing a
+   * handle opened synchronously in the click handler avoids that entirely.
+   * `null` means the caller already tried and the browser blocked it (skip
+   * the flow immediately, no network call); `undefined` means the caller has
+   * no await before this call and lets this function open the popup itself.
+   */
+  popupWindow?: Window | null
 }
 
 interface OAuthResult {
@@ -33,6 +46,29 @@ const defaultSleep = (milliseconds: number) => new Promise<void>(resolve => wind
 const UPDATE_BACKEND = 'Update the Hermes backend to support Desktop MCP OAuth callbacks.'
 
 /**
+ * Open the OAuth popup at the REAL user-gesture boundary. Callers whose click
+ * handler does anything async (add a server, resolve/create a profile,
+ * install a catalog preset) before reaching `completeMcpDesktopOAuth` must
+ * call this SYNCHRONOUSLY inside the click handler, before their first
+ * `await`, and pass the result through as `popupWindow` — Chromium's
+ * transient activation from the click expires across an intervening await,
+ * so a `window.open()` first attempted deep inside the OAuth helper can be
+ * silently blocked as an unsolicited popup on a slow network hop. A handler
+ * with NO await before calling completeMcpDesktopOAuth may omit this and let
+ * the helper open its own popup (undefined `popupWindow`) — both shapes are
+ * equally valid; add it wherever the click-to-call path is not synchronous.
+ */
+export function openMcpOAuthPopup(): Window | null {
+  const authWindow = window.open('about:blank', '_blank') as Window | null
+
+  if (authWindow) {
+    authWindow.opener = null
+  }
+
+  return authWindow
+}
+
+/**
  * Browser-native fallback used when window.hermesDesktop.mcpOauth is absent
  * (the web build — a browser tab cannot host a loopback HTTP listener, so
  * Electron's IPC-relayed flow does not apply here at all). The REST
@@ -51,16 +87,16 @@ async function completeMcpBrowserOAuth({
   cancelled,
   sleep = defaultSleep,
   maxPollFailures = 3,
-  timeoutMs = 360_000
+  timeoutMs = 360_000,
+  popupWindow
 }: CompleteOptions): Promise<McpOAuthFlow> {
   const deadline = Date.now() + timeoutMs
   const scope = capabilityScoped(profile)
 
-  // Open synchronously from the click handler, before the first await.
-  // Browsers otherwise classify the later navigation as an unsolicited popup
-  // and block it. Mirrors the dashboard's completeMcpDashboardOAuth
-  // (web/src/lib/mcp-dashboard-oauth.ts).
-  const authWindow = window.open('about:blank', '_blank') as Window | null
+  // Prefer a popup the caller already opened synchronously at its own click
+  // boundary (see openMcpOAuthPopup's doc comment); only open one here when
+  // the caller has no intervening await and passed nothing (undefined).
+  const authWindow = popupWindow !== undefined ? popupWindow : (window.open('about:blank', '_blank') as Window | null)
 
   if (!authWindow) {
     throw new Error('OAuth popup was blocked — allow popups for this app and retry.')
@@ -87,7 +123,14 @@ async function completeMcpBrowserOAuth({
       error: string | null
     }>({
       ...scope,
-      path: `/api/mcp/servers/${encodeURIComponent(serverName)}/auth`,
+      // client_public_origin: this tab's real public origin, so the backend
+      // can build an externally reachable OAuth callback when
+      // dashboard.public_url is unset. Without it, a same-origin `/api`
+      // proxy with changeOrigin:true (the web-served Desktop renderer's
+      // vite dev-server proxy) makes the backend see its own loopback
+      // address as request.base_url — a callback the OAuth provider could
+      // never reach. See _mcp_oauth_callback_url in hermes_cli/web_routers/mcp.py.
+      path: `/api/mcp/servers/${encodeURIComponent(serverName)}/auth?client_public_origin=${encodeURIComponent(window.location.origin)}`,
       method: 'POST'
     })
 
@@ -183,16 +226,20 @@ export async function completeMcpDesktopOAuth(options: CompleteOptions): Promise
   const bridge = window.hermesDesktop.mcpOauth
 
   if (!bridge) {
-    // A legacy null connection can resolve to a remote registry primary,
-    // where the compat message is still correct (an OLD Electron build
-    // predating the bridge, dialed at 'local'). Everywhere else — including
-    // every web-shim call, which never defines mcpOauth at all — this is the
-    // browser-native path instead of a hard failure.
-    if (scope.connectionId === 'local') {
-      throw new Error('Update Hermes Desktop to support MCP OAuth callbacks.')
+    // isWebBuild is an explicit build-identity flag (fork/desktop-api.d.ts),
+    // set ONLY by the web shim — never inferred from bridge-member absence.
+    // On web, no browser tab can host Electron's callback listener, so use the
+    // REST/popup flow for every connection shape. An old Electron preload has
+    // no flag: preserve its legacy split exactly — an explicitly local backend
+    // hosts the loopback listener itself, while remote/unknown connections need
+    // the newer preload bridge and fail with the compatibility message.
+    if (window.hermesDesktop.isWebBuild) {
+      return completeMcpBrowserOAuth(options)
     }
 
-    return completeMcpBrowserOAuth(options)
+    if (scope.connectionId !== 'local') {
+      throw new Error('Update Hermes Desktop to support MCP OAuth callbacks.')
+    }
   }
 
   let listener: { id: string; redirectUri: string } | undefined

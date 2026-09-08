@@ -482,10 +482,12 @@ def _resolve_job_reasoning_config(job: dict, cfg: dict, model: str) -> dict | No
 from cron.jobs import (
     _ensure_cron_dir, advance_next_runs, claim_dispatch, claim_job_for_fire, fire_claim_fence,
     clear_run_claim, get_due_jobs, heartbeat_fire_claim, heartbeat_run_claim, mark_job_run,
-    save_job_output, use_cron_store)
+    release_interrupted_retry_claim, save_job_output, use_cron_store)
 from cron.executions import (
-    _TERMINAL_STATES, create_execution, finish_execution, get_execution,
-    mark_execution_handoff_pending, mark_execution_running, recover_interrupted_executions)
+    _TERMINAL_STATES, create_execution, finish_execution,
+    flush_deferred_execution_projection, get_execution,
+    mark_execution_handoff_pending, mark_execution_running, record_delivery_outcome,
+    recover_interrupted_executions)
 
 # Response marker that suppresses delivery (output is still saved locally for audit).
 SILENT_MARKER = "[SILENT]"
@@ -2723,15 +2725,45 @@ def run_one_job(
 
 
 _OWNERSHIP_LOST_INTERRUPTED = "Interrupted by shutdown before terminal completion."
+_DRAIN_INTERRUPTED = "Interrupted by gateway shutdown before terminal completion."
+
+
+def _record_interruption(
+    execution_id: str, error: str, *, defer_projection: bool = False,
+) -> None:
+    """Terminalize an interrupted attempt as a durable ledger fact.
+
+    The incident is deliberately NOT raised here. Interruptions arrive from four places (this
+    drain, fire-ownership loss, dead-owner restart recovery, and rows adopted by the ledger
+    migration), and only ``cron.interrupted_retry`` sees all four — exactly once each, gated by
+    the ``retry_state`` compare-and-swap. Raising there also means the incident is written by a
+    process that is still alive, rather than by one being torn down mid-shutdown.
+
+    ``defer_projection`` is for the pre-delivery terminalization path, whose delivery outcome is
+    still unknown; see ``_terminalize_run_outcome``.
+    """
+    finish_execution(
+        execution_id, success=False, error=error, interrupted=True,
+        defer_projection=defer_projection)
 
 
 def _record_fire_ownership_lost(job_id: str, fire_owner: Optional[str], execution_id: str) -> None:
     """Bookkeeping after fire-claim ownership loss. A transport-level cancel (dashboard drain) is
     not a real loss — we still own the claim, so record the interruption via the owner-fenced
-    terminal write instead of leaving fire_claim/last_status stale; otherwise discard."""
+    terminal write instead of leaving fire_claim/last_status stale; otherwise discard.
+
+    The discard branch is deliberate cancellation (a replacement owner took the job), so it is
+    NOT flagged interrupted: replaying it would duplicate the run the replacement owner is doing.
+
+    Both ledger writes below are unconditional but not unguarded: ledger terminal states are
+    immutable, so when the run already committed its own result before delivery
+    (``_terminalize_run_outcome``) they are refused and the finished run keeps its real outcome.
+    That is what stops an ownership loss *during delivery* from re-reporting a completed run as
+    interrupted — and from making it a spurious replay candidate for ``cron.interrupted_retry``.
+    """
     if fire_owner is not None and heartbeat_fire_claim(job_id, expected_owner=fire_owner):
         mark_job_run(job_id, False, _OWNERSHIP_LOST_INTERRUPTED, expected_fire_owner=fire_owner)
-        finish_execution(execution_id, success=False, error=_OWNERSHIP_LOST_INTERRUPTED)
+        _record_interruption(execution_id, _OWNERSHIP_LOST_INTERRUPTED)
     else:
         finish_execution(
             execution_id, success=False,
@@ -2853,14 +2885,51 @@ class _RunDelivery:
     incident_acked: bool = False
     failure_incident_id: Optional[str] = None
     side_effect_ownership_lost: bool = False
+    # True once this attempt's terminal ledger row is durable. Written BEFORE delivery starts, so
+    # the bookkeeping tail attaches the delivery outcome to a finished row instead of writing the
+    # run's terminal state for the first time after delivery has already had minutes to be
+    # interrupted.
+    run_terminalized: bool = False
+
+
+def _terminalize_run_outcome(d: _RunDelivery, execution_id: str, execution_token) -> None:
+    """Commit this attempt's terminal ledger row BEFORE delivery is attempted.
+
+    The script/agent run and its delivery are two separate durable outcomes, and delivery is the
+    slow one: a Bot Chat send is a full agent turn in a subprocess
+    (``cron.bot_chat_delivery_timeout_seconds``, default 600s), during which this function used to
+    not have run yet. A shutdown drain or a fire-claim ownership loss landing in that window found
+    the row still ``running`` and wrote "Interrupted by shutdown before terminal completion" over a
+    run that had already succeeded and whose output was already saved to disk — the job then also
+    became a replay candidate for ``cron.interrupted_retry``, which would deliver a second time.
+
+    Ledger terminal states are immutable, so committing the run's own result first turns those
+    later interruption writes into no-ops rather than overwrites. ``delivery_outcome`` is attached
+    afterwards by ``_finish_completed_run`` via ``record_delivery_outcome``.
+
+    The monitoring projection is deferred with the row (``defer_projection=True``) so the attempt
+    still yields exactly ONE terminal event, emitted once its delivery outcome is known — splitting
+    the durable write must not double-count completions. ``_run_one_job_body``'s finally flushes
+    any projection no delivery outcome claimed.
+    """
+    if _is_interrupted(d.job["id"], execution_token):
+        # Peek, not consume: the RUN itself was killed mid-flight, and the compose step above has
+        # already rewritten it as an honest failure. Terminalize it as the interruption it is so
+        # the reconciler can still see it; the bookkeeping tail consumes the flag.
+        _record_interruption(execution_id, _DRAIN_INTERRUPTED, defer_projection=True)
+        d.run_terminalized = True
+        return
+    d.run_terminalized = finish_execution(
+        execution_id, success=d.success, error=d.error, defer_projection=True) is not None
 
 
 def _save_compose_deliver(
     d: _RunDelivery, fence: _FireOwnership, final_response: str, output: str, *,
-    adapters, loop, verbose: bool, execution_token,
+    adapters, loop, verbose: bool, execution_token, execution_id: str,
 ) -> None:
-    """Save output, compose the notice and deliver it (both side effects run under the fire-claim
-    fence; a lost claim raises ``_FireClaimLostDuringSideEffect`` for the caller)."""
+    """Save output, compose the notice, terminalize the run, then deliver it (both side effects run
+    under the fire-claim fence; a lost claim raises ``_FireClaimLostDuringSideEffect`` for the
+    caller)."""
     job = d.job
     with fence.side_effect_fence() as owns_output:
         if not owns_output:
@@ -2894,9 +2963,28 @@ def _save_compose_deliver(
         logger.info("Job '%s': agent returned %s — skipping delivery", job["id"], SILENT_MARKER)
         d.should_deliver = False
 
-    if d.should_deliver and fence.lost():
-        d.should_deliver = False
-        logger.warning("Job '%s': skipping delivery after fire claim ownership loss", job["id"])
+    # Empty final_response is a soft failure so last_status is not "ok". Decided here rather than in
+    # the bookkeeping tail because the ledger row is written below: the durable record must carry
+    # the same outcome the job store will.
+    if d.success and not final_response.strip():
+        d.success = False
+        d.error = (
+            "Agent completed but produced empty response "
+            "(model error, timeout, or misconfiguration)"
+        )
+
+    if fence.lost():
+        # Ownership loss is the caller's to record — leaving the row nonterminal is what lets
+        # _record_fire_ownership_lost write the honest ownership-loss result.
+        if d.should_deliver:
+            d.should_deliver = False
+            logger.warning(
+                "Job '%s': skipping delivery after fire claim ownership loss", job["id"])
+        return
+
+    # The run is finished and its output is on disk: make that durable NOW, before delivery gets
+    # its (potentially many-minute) chance to be interrupted. See _terminalize_run_outcome.
+    _terminalize_run_outcome(d, execution_id, execution_token)
 
     if not d.should_deliver:
         return
@@ -2925,9 +3013,18 @@ def _save_compose_deliver(
         logger.error("Delivery failed for job %s: %s", job["id"], de)
 
 
-def _finish_interrupted_run(job: dict, execution_id: str, delivery_error: Optional[str]) -> None:
+def _finish_interrupted_run(
+    job: dict, execution_id: str, delivery_error: Optional[str], *,
+    run_terminalized: bool = False, delivery_outcome: Optional[str] = None,
+) -> None:
     """Shutdown already wrote last_status, so mark_job_run is skipped (a second call would skip a
-    fire or auto-delete the job); an unsent notice is recorded via update_job instead."""
+    fire or auto-delete the job); an unsent notice is recorded via update_job instead.
+
+    ``run_terminalized``: the run's result was committed before delivery started, so the shutdown
+    landed during DELIVERY, not during the run. The run really did finish, so record only how its
+    notice fared; ``_record_interruption`` would be refused by the immutable terminal row anyway,
+    but it would also leave ``delivery_outcome`` unset and lose that fact.
+    """
     if delivery_error:
         try:
             # The gateway shutdown already wrote last_status for this run, so mark_job_run is skipped below
@@ -2940,18 +3037,42 @@ def _finish_interrupted_run(job: dict, execution_id: str, delivery_error: Option
         except Exception as _rec_err:
             logger.debug(
                 "Failed recording delivery_error for interrupted job %s: %s", job["id"], _rec_err)
-    finish_execution(
-        execution_id, success=False,
-        error="Interrupted by gateway shutdown before terminal completion.")
+    if run_terminalized:
+        record_delivery_outcome(execution_id, delivery_outcome)
+        return
+    _record_interruption(execution_id, _DRAIN_INTERRUPTED)
+
+
+def _delivery_outcome_for(d: _RunDelivery) -> str:
+    """Classify how this run's notice fared, from the outcome the delivery phase recorded."""
+    return _classify_delivery_outcome(
+        delivery_error=d.delivery_error,
+        delivery_queued=d.job.get("last_delivery_queued"),
+        should_deliver=d.should_deliver,
+        unresolved_origin=d.unresolved_origin,
+        # Read the lane the notice was actually routed through (failure_deliver on failure).
+        normalized_deliver=_normalize_deliver_value(
+            _delivery_lane_value(d.job, for_failure=not d.success)),
+        incident_acked=d.incident_acked,
+        success=d.success,
+    )
 
 
 def _finish_completed_run(d: _RunDelivery, fire_owner: Optional[str], execution_id: str) -> bool:
-    """mark_job_run (owner-fenced) + execution ledger row for a run that reached delivery."""
+    """mark_job_run (owner-fenced) + execution ledger row for a run that reached delivery.
+
+    The run's own terminal ledger row was already committed by ``_terminalize_run_outcome`` before
+    delivery started, so this tail only *attaches* the delivery outcome to it. A delivery failure
+    is therefore recorded as its own fact (ledger ``delivery_outcome``, job-store
+    ``last_delivery_error`` / ``last_status='delivery_failed'``) and can never rewrite the run as
+    failed or interrupted.
+    """
     job = d.job
     if not d.should_deliver and job.get("last_delivery_queued"):
         from cron.jobs import update_job
         update_job(job["id"], {"last_delivery_queued": None})
         job["last_delivery_queued"] = None
+    delivery_outcome = _delivery_outcome_for(d)
     mark_kwargs = {"delivery_error": d.delivery_error}
     if d.success and not d.delivery_error and d.should_deliver and job.get("last_delivery_queued"):
         mark_kwargs["status"] = "delivery_queued"
@@ -2961,35 +3082,47 @@ def _finish_completed_run(d: _RunDelivery, fire_owner: Optional[str], execution_
         mark_kwargs["status"] = "blocked_config"
     marked = mark_job_run(job["id"], d.success, d.error, **mark_kwargs)
     if fire_owner is not None and not marked:
-        finish_execution(
-            execution_id, success=False,
-            error="Fire claim ownership lost before terminal completion.")
+        # A replacement owner holds the fire claim, so this run's JOB-STORE bookkeeping is stale
+        # and was discarded. The ledger is a different question: if the run already terminalized,
+        # its result is durable and only the delivery outcome is still owed — the ownership-loss
+        # write below would be refused by the immutable row and would lose that fact.
+        if d.run_terminalized:
+            record_delivery_outcome(execution_id, delivery_outcome)
+        else:
+            finish_execution(
+                execution_id, success=False,
+                error="Fire claim ownership lost before terminal completion.")
         return True
-    delivery_outcome = _classify_delivery_outcome(
-        delivery_error=d.delivery_error,
-        delivery_queued=job.get("last_delivery_queued"),
-        should_deliver=d.should_deliver,
-        unresolved_origin=d.unresolved_origin,
-        # Read the lane the notice was actually routed through (failure_deliver on failure).
-        normalized_deliver=_normalize_deliver_value(_delivery_lane_value(job, for_failure=not d.success)),
-        incident_acked=d.incident_acked,
-        success=d.success,
-    )
     if delivery_outcome in ("delivered", "not_configured") and not d.success:
         # Failure ping left the process (or had a configured target): mark the incident alerted.
         _mark_incident_alerted(d.failure_incident_id)
-    finish_execution(
-        execution_id, success=d.success, error=d.error, delivery_outcome=delivery_outcome)
+    if d.run_terminalized:
+        record_delivery_outcome(execution_id, delivery_outcome)
+    else:
+        finish_execution(
+            execution_id, success=d.success, error=d.error, delivery_outcome=delivery_outcome)
     return True
 
 
 def _deliver_crash_failure(
-    job: dict, err_text: str, *, adapters, loop,
+    job: dict, err_text: str, *, adapters, loop, failure_type: Optional[str] = None,
+    incident_required: bool = False, suppress_if_alerted: bool = False,
 ) -> tuple[Optional[str], str]:
     """Failure notice for a run that raised out of run_job. Returns (delivery_error, outcome)."""
     normalized_deliver = _normalize_deliver_value(_delivery_lane_value(job, for_failure=True))
     # Same ack gate as the normal failure delivery: acked signatures stay silent here too.
-    incident_acked, failure_incident_id = _upsert_incident_for_failure(job, err_text)
+    if incident_required:
+        from cron.incidents import get_incident, upsert_incident
+
+        failure_incident_id, _ = upsert_incident(
+            job["id"], err_text, job_name=job.get("name"), failure_type=failure_type)
+        incident = get_incident(failure_incident_id)
+        incident_state = incident.get("state") if incident else None
+        incident_acked = incident_state == "closed"
+        if suppress_if_alerted and incident_state == "alerted":
+            return None, "suppressed_alerted"
+    else:
+        incident_acked, failure_incident_id = _upsert_incident_for_failure(job, err_text)
     if incident_acked:
         return None, "suppressed_acked"
     delivery_error = None
@@ -3015,7 +3148,9 @@ def _deliver_crash_failure(
         delivery_error=delivery_error, should_deliver=True, unresolved_origin=unresolved_origin,
         normalized_deliver=normalized_deliver, incident_acked=False, success=False,
         delivery_queued=job.get("last_delivery_queued"))
-    if delivery_outcome in ("delivered", "not_configured"):
+    if delivery_outcome == "delivered" or (
+        delivery_outcome == "not_configured" and not incident_required
+    ):
         _mark_incident_alerted(failure_incident_id)
     return delivery_error, delivery_outcome
 
@@ -3131,7 +3266,7 @@ def _run_one_job_body(
         try:
             _save_compose_deliver(
                 d, fence, final_response, output, adapters=adapters, loop=loop, verbose=verbose,
-                execution_token=execution_token)
+                execution_token=execution_token, execution_id=execution_id)
         except _FireClaimLostDuringSideEffect:
             d.side_effect_ownership_lost = True
         finally:
@@ -3143,13 +3278,14 @@ def _run_one_job_body(
             _record_fire_ownership_lost(job["id"], fire_owner, execution_id)
             return True
 
-        # Empty final_response is a soft failure so last_status is not "ok".
-        if d.success and not final_response.strip():
-            d.success = False
-            d.error = "Agent completed but produced empty response (model error, timeout, or misconfiguration)"
-
+        # Empty final_response was already folded into d.success/d.error before the ledger row was
+        # written (see _save_compose_deliver); re-deciding it here would disagree with the durable
+        # record.
         if _consume_interrupted_flag(job["id"], execution_token):
-            _finish_interrupted_run(job, execution_id, delivery_error)
+            _finish_interrupted_run(
+                job, execution_id, delivery_error,
+                run_terminalized=d.run_terminalized,
+                delivery_outcome=_delivery_outcome_for(d) if d.run_terminalized else None)
             return True
 
         return _finish_completed_run(d, fire_owner, execution_id)
@@ -3205,6 +3341,13 @@ def _run_one_job_body(
     finally:
         # Function-level on purpose: must scope delivery, deferred teardown, claim-loss handling and
         # bookkeeping — not just run_job. Do not move into the run block's finally.
+        # The run terminalizes before delivery but withholds its monitoring projection until the
+        # delivery outcome is known. Several exits land in between — a fire claim lost inside the
+        # delivery fence, a delivery that raised past the recorder, the BaseException tail — so
+        # flush here, where every path passes, or deferring would trade a duplicated terminal
+        # event for a dropped one. No-op once a delivery outcome claimed it.
+        if execution_id:
+            flush_deferred_execution_projection(execution_id)
         if _scope_token is not None:
             reset_secret_scope(_scope_token)
         if _terminal_scope_token is not None:
@@ -3230,20 +3373,25 @@ def _wait_for_external_cron_worker_body(
         current = get_execution(execution_id)
         return bool(current and current.get("status") in _TERMINAL_STATES)
 
-    # The worker commits its terminal row before its process exits, so exit is
-    # the correct wakeup.  Each ledger read opens a connection and re-runs
-    # schema init; polling it at 50ms for an hours-long agent run is ~72k
-    # opens/hour of pure contention with the worker's own writes.
+    # Wait on the PROCESS, never on the ledger row.  The worker commits its
+    # terminal row before it *delivers* (see ``_terminalize_run_outcome``), so a
+    # terminal row means "the run finished", not "the worker is done": a Bot
+    # Chat send is a whole agent turn and runs for minutes after it.  Returning
+    # on the row would release ``_restart_safe_waiter_job_ids`` — the guard
+    # ``mark_running_jobs_interrupted`` reads to withhold shutdown marking from
+    # exactly these jobs — and reap the handoff artifacts mid-delivery, re-arming
+    # the interruption the split terminalization exists to prevent.  Process exit
+    # is the only signal that covers the whole handoff, and it needs no new
+    # cross-process protocol.  Each ledger read also opens a connection and
+    # re-runs schema init, so polling one for an hours-long run is pure
+    # contention with the worker's own writes.
     while True:
         try:
             returncode = process.wait(timeout=1.0)
         except subprocess.TimeoutExpired:
-            if _is_terminal():
-                return True
             continue
-        # The worker can commit its terminal row and exit between the first
-        # read and wait(). Re-read the exact attempt before declaring that
-        # it died without terminalizing.
+        # The worker exited: now the row is authoritative for whether it got
+        # its result down before dying.
         if _is_terminal():
             return True
         # If the adopted worker died without terminalizing, its owner is
@@ -3729,6 +3877,25 @@ def _maybe_reap_dead_owners() -> None:
                 _reclaimed)
     except Exception as _reap_exc:
         logger.debug("Dead-owner execution reclaim failed: %s", _reap_exc)
+    _reconcile_interrupted_occurrences()
+
+
+def _reconcile_interrupted_occurrences() -> None:
+    """Decide the replay of occurrences lost to a shutdown (bounded, at most once each).
+
+    Runs after the dead-owner reap so rows this tick just recovered are decided in the same pass;
+    a long-interval job whose occurrence was lost therefore gets it back within one reap cycle
+    rather than waiting a full period. Never raises into the tick.
+    """
+    try:
+        from cron.interrupted_retry import reconcile_interrupted_executions
+
+        _scheduled = reconcile_interrupted_executions()
+        if _scheduled:
+            logger.warning(
+                "Re-armed %d cron occurrence(s) interrupted by a shutdown", _scheduled)
+    except Exception as _retry_exc:
+        logger.debug("Interrupted-occurrence reconcile failed: %s", _retry_exc)
 
 
 def _sweep_stale_inflight_for_tick(due_jobs: list) -> None:
@@ -3779,7 +3946,8 @@ def _sweep_mcp_orphans() -> None:
 def _process_due_job(job: dict, adapters, loop, verbose: bool) -> bool:
     """Run one due job via the shared ``run_one_job`` body."""
     # Claim only when the worker actually starts, so a queued lease can't expire first.
-    claimed = claim_job_for_fire(job["id"], return_job=True)
+    claimed = claim_job_for_fire(
+        job["id"], return_job=True, execution_id=job["execution_id"])
     if not claimed:
         finish_execution(
             job["execution_id"], success=False, error="Fire claim lost; execution was not started.")
@@ -3788,6 +3956,28 @@ def _process_due_job(job: dict, adapters, loop, verbose: bool) -> bool:
     claimed_job = dict(claimed) if isinstance(claimed, dict) else dict(job)
     claimed_job["execution_id"] = job["execution_id"]
     claimed_job["_scheduled_instant"] = job.get("_scheduled_instant")
+    stamp = claimed_job.get("interrupted_retry")
+    retry_of = stamp.get("execution_id") if isinstance(stamp, dict) else None
+    if retry_of:
+        from cron.executions import bind_interrupted_retry_lineage
+        lineage_error = None
+        try:
+            bound = bind_interrupted_retry_lineage(
+                job["execution_id"], job["id"], str(retry_of))
+        except Exception as exc:
+            bound = None
+            lineage_error = f"{type(exc).__name__}: {exc}"
+        if bound is None:
+            claim = claimed_job.get("fire_claim")
+            owner = claim.get("by") if isinstance(claim, dict) else None
+            if owner:
+                release_interrupted_retry_claim(
+                    job["id"], job["execution_id"], expected_fire_owner=str(owner))
+            finish_execution(
+                job["execution_id"], success=False,
+                error=("Replay lineage could not be bound before dispatch"
+                       + (f": {lineage_error}" if lineage_error else ".")))
+            return True
     return run_one_job(claimed_job, adapters=adapters, loop=loop, verbose=verbose)
 
 

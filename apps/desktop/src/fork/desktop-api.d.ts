@@ -53,6 +53,18 @@ export interface ForkSecretStorageEncryptionResult {
 /** Fork-added methods on `window.hermesDesktop`. */
 export interface ForkDesktopApi {
   /**
+   * True only on the web-served Desktop renderer (`apps/desktop/src/web-bridge-shim.ts`);
+   * absent/undefined on every real Electron preload build, including an OLD one that
+   * predates the `mcpOauth` bridge member. This is the SESSION's own build-identity signal
+   * (root AGENTS.md, "Surface capability is a property of the SESSION"), not an inference
+   * from which optional bridge members happen to be absent — an absent `mcpOauth` means two
+   * different things depending on which build is running (web: no loopback listener is ever
+   * possible; old Electron: the feature predates this bridge member but the app can still
+   * host a real loopback listener), and only an explicit flag can tell them apart. See
+   * `completeMcpDesktopOAuth` in `lib/mcp-dashboard-oauth.ts` for the one consumer.
+   */
+  isWebBuild?: boolean
+  /**
    * Chunked non-image attach read: bounds main's transient memory and the
    * per-call IPC payload to a fixed slice (ATTACHMENT_CHUNK_BYTES in
    * electron/hardening.ts) regardless of file size, unlike

@@ -252,29 +252,47 @@ export function McpSetupButton({ profile, entry, onDone, ensureProfile }: McpSet
         ? { ...profile }
         : { connectionId: host.state.connectionId.get(), profile: profile || host.state.profile.get() }
 
+    // Preserve the click's transient activation across resolveProfile()'s
+    // await (creates the profile on first setup during New Bot) — see the
+    // same pattern in components/assistant-ui/mcp-setup-tool.tsx. Only
+    // needed on the web build: completeMcpDesktopOAuth's Electron path never
+    // reads popupWindow (it drives openExternal instead), so opening one
+    // there would leak an unused about:blank browser window/tab.
+    const popupWindow = window.hermesDesktop?.isWebBuild ? (window.open('about:blank', '_blank') as Window | null) : undefined
+
+    if (popupWindow) {
+      popupWindow.opener = null
+    }
+
     setPhase('busy')
     setMessage('')
-    const resolvedProfile = await resolveProfile()
-
-    if (!resolvedProfile) {
-      setPhase('idle')
-
-      return
-    }
-
-    const scope = {
-      ...source,
-      profile: typeof resolvedProfile === 'object' ? resolvedProfile.profile : resolvedProfile
-    }
 
     try {
+      const resolvedProfile = await resolveProfile()
+
+      if (!resolvedProfile) {
+        if (popupWindow && !popupWindow.closed) {
+          popupWindow.close()
+        }
+
+        setPhase('idle')
+
+        return
+      }
+
+      const scope = {
+        ...source,
+        profile: typeof resolvedProfile === 'object' ? resolvedProfile.profile : resolvedProfile
+      }
+
       setPhase('oauth')
       setMessage('Complete sign-in in your browser...')
       await host.completeMcpOAuth({
         serverName: entry.name,
         profile: scope,
         catalogPreset: entry.fromCatalog && !entry.installed ? entry.name : undefined,
-        cancelled: () => oauthEpoch.current !== epoch
+        cancelled: () => oauthEpoch.current !== epoch,
+        popupWindow
       })
 
       if (oauthEpoch.current !== epoch) {
@@ -285,6 +303,13 @@ export function McpSetupButton({ profile, entry, onDone, ensureProfile }: McpSet
       host.notify({ kind: 'success', message: entry.name + ' authenticated' })
       onDone?.()
     } catch (error) {
+      // Profile resolution can fail before completeMcpOAuth takes ownership of
+      // the caller-opened popup. Close idempotently so that path never strands
+      // an about:blank tab.
+      if (popupWindow && !popupWindow.closed) {
+        popupWindow.close()
+      }
+
       if (oauthEpoch.current !== epoch) {
         return
       }

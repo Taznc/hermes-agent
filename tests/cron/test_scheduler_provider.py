@@ -384,7 +384,10 @@ def test_fire_due_default_claims_then_runs(monkeypatch):
     )
 
     assert InProcessCronScheduler().fire_due("j1") is True
-    assert claims == [("j1", {"return_job": True})]
+    assert len(claims) == 1
+    assert claims[0][0] == "j1"
+    assert claims[0][1]["return_job"] is True
+    assert isinstance(claims[0][1]["execution_id"], str)
     assert ran == [("j1", "exact-owner")]
 
 
@@ -438,7 +441,11 @@ def test_fire_due_forwards_manual_force_to_store_claim(monkeypatch):
     monkeypatch.setattr(sched, "run_one_job", lambda job, **kw: True)
 
     assert InProcessCronScheduler().fire_due("j1", force=True) is True
-    assert claims == [("j1", {"force": True, "return_job": True})]
+    assert len(claims) == 1
+    assert claims[0][0] == "j1"
+    assert claims[0][1]["force"] is True
+    assert claims[0][1]["return_job"] is True
+    assert isinstance(claims[0][1]["execution_id"], str)
 
 
 def test_fire_due_lost_claim_does_not_run(monkeypatch):
