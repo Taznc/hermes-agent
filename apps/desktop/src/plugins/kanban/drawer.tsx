@@ -235,6 +235,7 @@ export function TaskDrawer({
   const { data: roster } = useQuery({ queryFn: fetchProfiles, queryKey: PROFILES_KEY, staleTime: 60_000 })
   const assigneeName = task?.assignee || defaultAssignee
   const assigneeProfile = assigneeName ? roster?.profiles.find(p => p.name === assigneeName) : undefined
+
   const resolvedInheritLabel =
     assigneeProfile && (assigneeProfile.model || assigneeProfile.reasoning_effort)
       ? overrideLabel(
@@ -358,13 +359,26 @@ export function TaskDrawer({
 
   const activityGroups = useMemo(() => (detail ? groupActivity(detail.events, k) : []), [detail, k])
 
+  // Upstream made `attachments` optional on the drawer payload: an older backend
+  // omits the key entirely, which means "this backend has no attachment support"
+  // and is NOT the same as an empty list. `supportsAttachments` preserves that
+  // distinction (upstream gates its section on `Array.isArray(detail.attachments)`
+  // for the same reason) while `attachments` gives the two filtered sections a
+  // safe array to read without each guarding the shape itself.
+  const supportsAttachments = Array.isArray(detail?.attachments)
+
+  const attachments = useMemo(
+    () => (Array.isArray(detail?.attachments) ? detail.attachments : []),
+    [detail]
+  )
+
   if (!id) {
     return null
   }
 
   const errorMessage = error ? errText(error) : null
   const tone = columnMeta(task?.status ?? '').tone
-  const attachmentCount = detail?.attachments.length ?? 0
+  const attachmentCount = attachments.length
 
   const move = (status: string) => {
     if (!task || status === task.status) {
@@ -649,16 +663,18 @@ export function TaskDrawer({
                 />
 
                 <ImagesSection
-                  attachments={detail.attachments.filter(isImageAttachment)}
+                  attachments={attachments.filter(isImageAttachment)}
                   board={taskBoard}
                   onOpen={(filename, src) => setLightbox({ filename, src })}
                 />
 
-                <AttachmentsSection
-                  attachments={detail.attachments.filter(a => !isImageAttachment(a))}
-                  onUpload={file => uploadMut.mutate(file)}
-                  pending={uploadMut.isPending}
-                />
+                {supportsAttachments && (
+                  <AttachmentsSection
+                    attachments={attachments.filter(a => !isImageAttachment(a))}
+                    onUpload={file => uploadMut.mutate(file)}
+                    pending={uploadMut.isPending}
+                  />
+                )}
               </>
             )}
           </div>

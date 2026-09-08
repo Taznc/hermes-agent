@@ -47,7 +47,6 @@ import {
   ALL_PROJECTS,
   enterProject,
   exitProjectScope,
-  fetchProjectSessions,
   openProjectCreate,
   refreshProjects,
   refreshProjectTree,
@@ -98,8 +97,9 @@ import {
   StartWorkButton,
   useRepoWorktreeMap
 } from './projects'
-import { SidebarSessionSkeletons } from './section-states'
+import { SidebarLoadErrorState, SidebarSessionSkeletons } from './section-states'
 import { SidebarSessionsSection, VIRTUALIZE_THRESHOLD } from './sessions-section'
+import { useEnteredProjectSessions } from './use-entered-project-sessions'
 
 // How long after connecting to warm the project tree for someone who isn't in
 // the grouped view. Long enough that the flat list — the thing actually on
@@ -369,27 +369,12 @@ export function SidebarWorkspaceSection({
   const inProject = Boolean(overviewEnteredProject)
   const enteredProjectId = overviewEnteredProject?.id
 
-  const [enteredProjectTree, setEnteredProjectTree] = useState<SidebarProjectTree | null>(null)
-
-  useEffect(() => {
-    if (!enteredProjectId || !gatewayReady) {
-      setEnteredProjectTree(null)
-
-      return
-    }
-
-    let cancelled = false
-
-    void fetchProjectSessions(enteredProjectId).then(project => {
-      if (!cancelled) {
-        setEnteredProjectTree(project)
-      }
-    })
-
-    return () => {
-      cancelled = true
-    }
-  }, [enteredProjectId, gatewayReady, projectTree])
+  const {
+    project: enteredProjectTree,
+    failed: projectLoadFailed,
+    loading: projectLoading,
+    retry: retryProject
+  } = useEnteredProjectSessions(enteredProjectId, gatewayReady, projectTree, `${activeConnectionId}:${profileScope}`)
 
   const isHiddenFromProjects = useStore($sidebarIsHiddenFromProjects)
 
@@ -670,6 +655,7 @@ export function SidebarWorkspaceSection({
       data-sessions-mode={sessionsMode}
       data-sessions-project={inProject ? (enteredProjectId ?? undefined) : undefined}
     >
+      {inProject && projectLoadFailed && <SidebarLoadErrorState onRetry={retryProject} />}
       <SidebarSessionsSection
         activeProjectId={activeProjectId}
         activeSessionId={activeSessionId}
@@ -682,7 +668,7 @@ export function SidebarWorkspaceSection({
         )}
         dndSensors={dndSensors}
         emptyState={
-          showSessionSkeletons ? (
+          inProject && projectLoadFailed ? null : showSessionSkeletons || (inProject && projectLoading) ? (
             <SidebarSessionSkeletons />
           ) : (
             <div className="grid min-h-16 place-items-center rounded-lg px-2 text-center text-xs text-(--ui-text-tertiary)">

@@ -5,7 +5,7 @@ from __future__ import annotations
 import math
 from typing import Any, Dict, List, Literal, Optional
 
-from pydantic import BaseModel, SecretStr, field_validator
+from pydantic import BaseModel, SecretStr, StrictBool, field_validator
 
 
 class ConfigUpdate(BaseModel):
@@ -143,10 +143,8 @@ class MoaPresetPayload(_MoaReferenceControls):
     # None = temperature omitted from API calls (provider default), as for single-model agents.
     reference_temperature: Optional[float] = None
     aggregator_temperature: Optional[float] = None
-    max_tokens: int = 4096
     # Newer per-preset knobs (moa_config._normalize_preset): optional for older clients,
     # declared so GET round-trips don't erase them.
-    reference_max_tokens: Optional[int] = None
     fanout: Optional[str] = None
     enabled: bool = True
 
@@ -159,8 +157,7 @@ class MoaConfigPayload(_MoaReferenceControls):
     aggregator: MoaModelSlot = MoaModelSlot()
     reference_temperature: Optional[float] = None
     aggregator_temperature: Optional[float] = None
-    max_tokens: int = 4096
-    reference_max_tokens: Optional[int] = None
+
     fanout: Optional[str] = None
     enabled: bool = True
     profile: Optional[str] = None
@@ -287,6 +284,8 @@ class SessionPrune(BaseModel):
     dry_run: bool = False
 
 class CronJobCreate(BaseModel):
+    paused: StrictBool = False
+    paused_reason: Optional[str] = None
     prompt: str = ""
     schedule: str
     name: str = ""

@@ -22,7 +22,7 @@ _TASK_DICT_FIELDS = (
     "created_by", "created_at", "started_at", "completed_at", "result",
     "skills", "max_retries", "model_override", "provider_override",
     "reasoning_effort", "route_source", "route_name",
-    "session_id", "workflow_template_id", "current_step_key",
+    "session_id", "workflow_template_id", "current_step_key", "completion_contract", "last_failure_error",
     "created_by_task", "created_by_run",
 )
 _SHOW_RUN_FIELDS = (
