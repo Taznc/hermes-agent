@@ -2096,6 +2096,30 @@ def arm_interrupted_retry(job_id: str, stamp: Dict[str, Any]) -> str:
         return "armed"
 
 
+def claim_interrupted_retry_lineage(job_id: str, execution_id: str) -> Optional[str]:
+    """Bind ``execution_id`` to the lost occurrence it is replaying; return that occurrence's id.
+
+    Returns ``None`` when this job has no outstanding replay, or when the replay was already
+    claimed by an earlier attempt — one lost occurrence yields exactly one replay, so a later run
+    of the same job is an ordinary occurrence and must not claim to be recovering anything.
+
+    The stamp is *not* cleared here. It bounds the retry loop until a successful run and is what
+    lets ``cron list``/``doctor`` distinguish a replay that is still queued from one that has
+    already run and failed.
+    """
+    def apply(jobs, i, job):
+        stamp = job.get("interrupted_retry")
+        if not isinstance(stamp, dict) or stamp.get("replayed_by"):
+            return None
+        original = stamp.get("execution_id")
+        jobs[i] = {**job, "interrupted_retry": {
+            **stamp, "replayed_by": execution_id, "replayed_at": _hermes_now().isoformat()}}
+        save_jobs(jobs)
+        return original
+
+    return _with_job(job_id, apply)
+
+
 def _claim_is_live(claim: Any, now: datetime, ttl_seconds: float) -> bool:
     """True for a well-formed claim aged within ``[0, ttl)``: future-dated (clock/TZ skew) or
     malformed claims count as stale so they can never wedge a job."""

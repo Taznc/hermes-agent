@@ -7,6 +7,7 @@ immutable.
 
 from __future__ import annotations
 
+import logging
 import os
 import sqlite3
 import threading
@@ -19,6 +20,8 @@ from typing import Any, Dict, Iterator, List, Optional
 from cron.ledger import ledger_transaction, open_ledger, prepare_ledger
 from hermes_constants import get_hermes_home
 from hermes_time import now as _hermes_now
+
+logger = logging.getLogger(__name__)
 
 # Optional test override. Production resolves the path at transaction time so dashboard operations
 # that temporarily enter another profile cannot leak that profile's records into the import-time
@@ -108,6 +111,10 @@ def _initialize_schema(conn: sqlite3.Connection) -> None:
     ):
         _adopt_legacy_interruptions(conn)
     add_column_if_missing(conn, "executions", "retry_state", "retry_state TEXT")
+    # Lineage of a replay: the interrupted attempt this row was created to recover. Durable on the
+    # ledger because the job's ``interrupted_retry`` stamp is transient — a successful replay
+    # clears it, and history would then be unable to tell the replay from an ordinary run.
+    add_column_if_missing(conn, "executions", "retry_of", "retry_of TEXT")
     conn.execute(
         "CREATE INDEX IF NOT EXISTS idx_executions_job_claimed "
         "ON executions(job_id, claimed_at DESC, id DESC)"
@@ -179,6 +186,21 @@ def _prune_unlocked(conn: sqlite3.Connection) -> None:
     )
 
 
+def _replayed_occurrence(job_id: str, execution_id: str) -> Optional[str]:
+    """The interrupted attempt this new execution is replaying, if any.
+
+    Best-effort: an unreadable job store must never stop an attempt from being recorded, since the
+    ledger row is the durable part and the lineage is a diagnostic.
+    """
+    try:
+        from cron.jobs import claim_interrupted_retry_lineage
+
+        return claim_interrupted_retry_lineage(job_id, execution_id)
+    except Exception as exc:
+        logger.debug("Could not resolve replay lineage for %s: %s", execution_id, exc)
+        return None
+
+
 def create_execution(
     job_id: str, *, source: str, scheduled_instant: Optional[str] = None,
 ) -> Dict[str, Any]:
@@ -188,14 +210,15 @@ def create_execution(
     now = _hermes_now().isoformat()
     execution_id = uuid.uuid4().hex
     pid = os.getpid()
+    retry_of = _replayed_occurrence(str(job_id), execution_id)
     with _transaction() as conn:
         conn.execute(
             """INSERT INTO executions
                (id, job_id, source, process_id, pid, process_started_at,
-                status, claimed_at, scheduled_instant)
-               VALUES (?, ?, ?, ?, ?, ?, 'claimed', ?, ?)""",
+                status, claimed_at, scheduled_instant, retry_of)
+               VALUES (?, ?, ?, ?, ?, ?, 'claimed', ?, ?, ?)""",
             (execution_id, str(job_id), str(source), _PROCESS_ID, pid,
-             _process_start_time(pid), now, canonical_instant(scheduled_instant)),
+             _process_start_time(pid), now, canonical_instant(scheduled_instant), retry_of),
         )
         record = _fetch(conn, execution_id)
     _emit_execution_state(record)

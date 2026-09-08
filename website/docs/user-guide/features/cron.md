@@ -400,7 +400,30 @@ the next tick — **at most once**, and only when all of these hold:
 Anything else is declined *with a recorded reason* you can read in
 `hermes cron history`, so a lost occurrence is always diagnosable. While a
 retry is pending, `hermes cron list` and `hermes cron doctor` name it and the
-original attempt it recovers.
+original attempt it recovers. Once the replay has run, both surfaces say so
+instead of continuing to describe a retry as queued, and the replay's own row
+in `hermes cron history` names the occurrence it recovered:
+
+```
+7c31…  completed  job=9be64baa  source=builtin  2026-09-07T20:26:04+00:00  [replay of 2a9f…]
+```
+
+That link lives in the ledger, so it survives the successful run that clears
+the pending-retry marker.
+
+**Crash consistency.** The replay is armed before the decision is written, and
+arming an occurrence twice is a no-op. A restart in between therefore leaves
+the occurrence still undecided, and the next startup finishes the job rather
+than recording a retry that never happened. Eligibility is re-checked at the
+moment of arming, under the job-store lock, so a `hermes cron pause` or
+`remove` that lands in the middle wins: it is recorded as a declined replay,
+never undone.
+
+**Failures recorded before this shipped** are adopted the first time the
+upgraded ledger opens, so shutdown interruptions already in your history are
+reconciled and appear in `hermes cron incidents` too. Old occurrences are far
+past the freshness budget, so they are recorded as declined rather than
+replayed.
 
 **The limits.** A cron side effect may already have run before the
 interruption — Hermes cannot know — so a replayed job may repeat work it

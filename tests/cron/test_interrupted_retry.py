@@ -179,4 +179,3 @@ class TestSchedulerFlagsInterruptedAttempts:
             sched._finish_interrupted_run(job, record["id"], None)
 
         assert len(executions.list_undecided_interruptions()) == 3
-
