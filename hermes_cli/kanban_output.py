@@ -87,7 +87,7 @@ def _fmt_task_line(t: kb.Task) -> str:
     icon = _STATUS_ICONS.get(t.status, "?")
     assignee = t.assignee or "(unassigned)"
     tenant = f" [{t.tenant}]" if t.tenant else ""
-    prio = f" ({_fmt_priority(t.priority)})" if t.priority else ""
+    prio = f" ({_fmt_priority(t.priority)})" if t.priority is not None else ""
     return f"{icon} {t.id}  {t.status:8s}  {assignee:20s}{tenant}  {t.title}{prio}"
 
 

@@ -72,6 +72,20 @@ def test_kanban_show_text_renders_graph_with_open_connection(kanban_home):
     assert "Cannot operate on a closed database" not in output
 
 
+def test_list_text_renders_known_and_unknown_priority_tiers(kanban_home):
+    """AC5 regression: priority 0 (Normal, the schema default) must render as
+    the tier name, not be suppressed by truthiness — and an out-of-scale
+    value renders as the bare integer."""
+    with kbc.connect() as conn:
+        kb.create_task(conn, title="normal prio task", priority=0)
+        kb.create_task(conn, title="custom prio task", priority=90)
+
+    out = kc.run_slash("list")
+
+    assert "normalpriotask(normal)" in out.replace(" ", "")
+    assert "custompriotask(90)" in out.replace(" ", "")
+
+
 def test_board_override_is_isolated_per_concurrent_call(kanban_home, monkeypatch):
     kb.create_board("alpha")
     kb.create_board("beta")
