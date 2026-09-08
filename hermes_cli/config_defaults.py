@@ -1812,6 +1812,12 @@ DEFAULT_CONFIG = {
         # to this specialist profile under that profile's own model defaults.
         # Empty preserves the original implementer loop.
         "review_rework_escalation_profile": "",
+        # Hard stop on the review<->changes_requested loop: once a card accumulates this many
+        # changes_requested events since its last completion, the dispatcher blocks it
+        # (kind="review_round_cap") instead of re-dispatching to the implementer or escalation
+        # profile. 0 = unlimited (legacy behavior). The reviewer-side round contract (sdlc-review
+        # skill) is advisory; this is the hard stop that actually bounds a runaway rework loop.
+        "max_review_rounds": 3,
         # Auto-run the decomposer on Triage tasks every tick. False = manual via `hermes kanban
         # decompose <id>` or the dashboard's Decompose button.
         "auto_decompose": True,

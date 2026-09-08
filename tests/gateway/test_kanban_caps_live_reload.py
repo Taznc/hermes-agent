@@ -84,6 +84,21 @@ def test_other_dispatch_settings_also_track_config():
     assert after.default_assignee == "bob"
 
 
+def test_max_review_rounds_defaults_to_three_and_tracks_config():
+    before = _settings()
+    assert before.max_review_rounds == 3
+
+    after = _reload_dispatcher_settings(
+        lambda: {"kanban": {"max_review_rounds": 5}}, _KB(), before
+    )
+    assert after.max_review_rounds == 5
+
+
+def test_max_review_rounds_zero_means_unlimited():
+    settings = _settings(max_review_rounds=0)
+    assert settings.max_review_rounds == 0
+
+
 def test_reload_with_unchanged_config_is_a_no_op():
     cfg = {"kanban": {"max_in_progress": 6, "max_in_progress_per_profile": 2}}
     before = _resolve_dispatcher_settings(cfg["kanban"], _KB())

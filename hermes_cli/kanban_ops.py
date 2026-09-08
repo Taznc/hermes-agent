@@ -134,6 +134,7 @@ def _cmd_dispatch(args: argparse.Namespace) -> int:
             dispatch_start_budget=caps.dispatch_start_budget,
             dispatch_start_window_seconds=caps.dispatch_start_window_seconds,
             review_rework_escalation_profile=caps.review_rework_escalation_profile,
+            max_review_rounds=caps.max_review_rounds,
         )
     if getattr(args, "json", False):
         _print_json({
