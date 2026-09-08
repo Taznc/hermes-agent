@@ -5,7 +5,9 @@
  * model-override.test.tsx — usePluginI18n is stubbed to echo the dotted key
  * so assertions match on stable keys instead of translated English text.
  */
+import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
 import { cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react'
+import type { ReactElement } from 'react'
 import { afterEach, beforeAll, beforeEach, describe, expect, it, vi } from 'vitest'
 
 import { IdeaCaptureDialog } from './board'
@@ -41,15 +43,21 @@ afterEach(() => {
   cleanup()
 })
 
+function mount(node: ReactElement) {
+  const client = new QueryClient({ defaultOptions: { mutations: { retry: false }, queries: { retry: false } } })
+
+  return render(<QueryClientProvider client={client}>{node}</QueryClientProvider>)
+}
+
 describe('IdeaCaptureDialog', () => {
   it('renders nothing when closed', () => {
-    const { container } = render(<IdeaCaptureDialog onClose={vi.fn()} open={false} />)
+    const { container } = mount(<IdeaCaptureDialog onClose={vi.fn()} open={false} />)
 
     expect(container.querySelector('textarea')).toBeNull()
   })
 
   it('disables Save until text is typed, and clears on reopen', () => {
-    render(<IdeaCaptureDialog onClose={vi.fn()} open />)
+    mount(<IdeaCaptureDialog onClose={vi.fn()} open />)
 
     const save = screen.getByText('ideaSave').closest('button') as HTMLButtonElement
     expect(save.disabled).toBe(true)
@@ -59,7 +67,7 @@ describe('IdeaCaptureDialog', () => {
   })
 
   it('rejects whitespace-only text without calling the API', () => {
-    render(<IdeaCaptureDialog onClose={vi.fn()} open />)
+    mount(<IdeaCaptureDialog onClose={vi.fn()} open />)
 
     fireEvent.change(screen.getByPlaceholderText('ideaPlaceholder'), { target: { value: '   ' } })
     const save = screen.getByText('ideaSave').closest('button') as HTMLButtonElement
@@ -72,7 +80,7 @@ describe('IdeaCaptureDialog', () => {
     addRoadmapIdea.mockResolvedValue({ ok: true, reason: null })
     const onClose = vi.fn()
 
-    render(<IdeaCaptureDialog onClose={onClose} open />)
+    mount(<IdeaCaptureDialog onClose={onClose} open />)
     fireEvent.change(screen.getByPlaceholderText('ideaPlaceholder'), { target: { value: '  Ship dark mode  ' } })
     fireEvent.click(screen.getByText('ideaSave'))
 
@@ -88,7 +96,7 @@ describe('IdeaCaptureDialog', () => {
     addRoadmapIdea.mockResolvedValue({ ok: false, reason: 'roadmap_unavailable' })
     const onClose = vi.fn()
 
-    render(<IdeaCaptureDialog onClose={onClose} open />)
+    mount(<IdeaCaptureDialog onClose={onClose} open />)
     fireEvent.change(screen.getByPlaceholderText('ideaPlaceholder'), { target: { value: 'An idea' } })
     fireEvent.click(screen.getByText('ideaSave'))
 
@@ -101,7 +109,7 @@ describe('IdeaCaptureDialog', () => {
   it('on empty_idea: shows the empty-specific message, distinct from roadmap-unavailable', async () => {
     addRoadmapIdea.mockResolvedValue({ ok: false, reason: 'empty_idea' })
 
-    render(<IdeaCaptureDialog onClose={vi.fn()} open />)
+    mount(<IdeaCaptureDialog onClose={vi.fn()} open />)
     fireEvent.change(screen.getByPlaceholderText('ideaPlaceholder'), { target: { value: 'x' } })
     fireEvent.click(screen.getByText('ideaSave'))
 
@@ -111,7 +119,7 @@ describe('IdeaCaptureDialog', () => {
   it('on a thrown network error: shows the error and re-enables the button', async () => {
     addRoadmapIdea.mockRejectedValue(new Error('network down'))
 
-    render(<IdeaCaptureDialog onClose={vi.fn()} open />)
+    mount(<IdeaCaptureDialog onClose={vi.fn()} open />)
     fireEvent.change(screen.getByPlaceholderText('ideaPlaceholder'), { target: { value: 'An idea' } })
     fireEvent.click(screen.getByText('ideaSave'))
 
@@ -121,7 +129,7 @@ describe('IdeaCaptureDialog', () => {
 
   it('Cancel closes without calling the API', () => {
     const onClose = vi.fn()
-    render(<IdeaCaptureDialog onClose={onClose} open />)
+    mount(<IdeaCaptureDialog onClose={onClose} open />)
 
     fireEvent.click(screen.getByText('cancel'))
 

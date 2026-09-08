@@ -24,7 +24,7 @@ import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
 import { cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react'
 import { afterEach, beforeAll, beforeEach, describe, expect, it, vi } from 'vitest'
 
-import { $boardSlug, $roadmapHidden } from './api'
+import { $boardSlug, $roadmapHidden, bindApi } from './api'
 import { KanbanBoardPage } from './board'
 import type { KanbanBoard, KanbanTask } from './types'
 
@@ -42,6 +42,7 @@ vi.mock('@hermes/plugin-sdk', async () => {
 })
 
 const fetchBoardMock = vi.fn()
+const fetchAllBoardsMock = vi.fn()
 const patchTaskMock = vi.fn()
 
 vi.mock('./api', async importOriginal => {
@@ -50,7 +51,7 @@ vi.mock('./api', async importOriginal => {
   return {
     ...actual,
     deleteTask: vi.fn().mockResolvedValue({}),
-    fetchAllBoards: vi.fn(),
+    fetchAllBoards: (...args: unknown[]) => fetchAllBoardsMock(...args),
     fetchBoard: (...args: unknown[]) => fetchBoardMock(...args),
     fetchBoards: vi.fn().mockResolvedValue({ boards: [], current: 'shipping' }),
     fetchProfiles: vi.fn().mockResolvedValue({ profiles: [] }),
@@ -66,8 +67,10 @@ beforeAll(() => {
 
 beforeEach(() => {
   fetchBoardMock.mockReset()
+  fetchAllBoardsMock.mockReset()
   patchTaskMock.mockReset().mockResolvedValue({})
   $roadmapHidden.set({})
+  window.localStorage.clear()
 })
 
 afterEach(() => {
@@ -75,7 +78,34 @@ afterEach(() => {
   vi.restoreAllMocks()
   $boardSlug.set('')
   $roadmapHidden.set({})
+  window.localStorage.clear()
 })
+
+/** A real `localStorage`-backed `PluginStorage`, scoped exactly like the
+ *  plugin host's own `createPluginStorage('kanban')` — so a test that binds
+ *  through it exercises the SAME persistence path production uses, not an
+ *  in-memory stand-in that would pass even if `bindApi`'s wiring broke. */
+function localStoragePluginStorage(): Parameters<typeof bindApi>[1] {
+  const scoped = (key: string) => `hermes.plugin.kanban.${key}`
+
+  return {
+    get: (key, fallback) => {
+      const raw = window.localStorage.getItem(scoped(key))
+
+      if (raw === null) {
+        return fallback
+      }
+
+      try {
+        return JSON.parse(raw)
+      } catch {
+        return fallback
+      }
+    },
+    remove: key => window.localStorage.removeItem(scoped(key)),
+    set: (key, value) => window.localStorage.setItem(scoped(key), JSON.stringify(value))
+  }
+}
 
 function mount() {
   const client = new QueryClient({ defaultOptions: { mutations: { retry: false }, queries: { retry: false } } })
@@ -159,7 +189,7 @@ describe('lane rendering', () => {
     expect(roadmapIndex).toBeLessThan(triageIndex)
   })
 
-  it('gives lane cards the stripped chrome: no assignee avatar, no age, no summary preview', async () => {
+  it('gives lane cards the stripped chrome: no assignee avatar, no age, no summary preview, no id chip, no board badge', async () => {
     fetchBoardMock.mockResolvedValue(
       boardPayload({
         columns: [
@@ -169,6 +199,8 @@ describe('lane rendering', () => {
             tasks: [
               {
                 assignee: 'someone',
+                board: 'homelab',
+                board_name: 'Homelab',
                 body: 'A long body that would otherwise render as a preview line',
                 created_at: 1,
                 id: 't_idea',
@@ -190,6 +222,12 @@ describe('lane rendering', () => {
     // The assignee avatar carries the profile name as its title/aria; the lane
     // footer renders no assignee at all.
     expect(screen.queryByText('someone')).toBeNull()
+    // The reviewer-flagged extras: the pinned chrome contract is "title +
+    // priority + parent link only" — no id chip (`IdChip` renders the full
+    // task id as text) and no board-attribution badge, even though this
+    // fixture carries both `board`/`board_name` (the All Boards case).
+    expect(screen.queryByText('t_idea')).toBeNull()
+    expect(screen.queryByText('Homelab')).toBeNull()
   })
 
   it('offers no "new task in this lane" button — the capture dialog is the only door', async () => {
@@ -295,8 +333,18 @@ describe('roadmap visibility toggle', () => {
     expect(await screen.findByText('Rough idea card')).toBeTruthy()
   })
 
-  it('survives a remount on the same board — the persisted state is re-read', async () => {
+  it('survives a real storage rehydrate — a fresh bindApi() rereads localStorage, not the in-memory atom', async () => {
     fetchBoardMock.mockResolvedValue(boardPayload())
+
+    // Bind through the SAME persistence path production uses: bindApi's
+    // `persist()` hydrates $roadmapHidden (and $boardSlug) from storage at
+    // bind time and writes every change back to it — so the board slug is
+    // set AFTER binding, exactly like a real selection made once the plugin
+    // has loaded. A prior version of this test only remounted React while
+    // retaining the same in-memory atom, which would stay green even if
+    // bindApi's storage wiring were entirely broken.
+    const noopSocket = () => () => undefined
+    let dispose = bindApi(vi.fn().mockRejectedValue(new Error('unused')), localStoragePluginStorage(), noopSocket)
     $boardSlug.set('shipping')
 
     const view = mount()
@@ -304,11 +352,63 @@ describe('roadmap visibility toggle', () => {
     fireEvent.click(screen.getByLabelText('roadmapHideLanes'))
     await waitFor(() => expect(screen.queryByText('Rough idea card')).toBeNull())
 
+    // Confirm the write actually landed in localStorage under the plugin's
+    // real key, not just in the atom.
+    expect(JSON.parse(window.localStorage.getItem('hermes.plugin.kanban.roadmapHidden') ?? '{}')).toEqual({
+      shipping: true
+    })
+
     view.unmount()
+    dispose()
+    // Simulate an app reload: a brand-new bind, which re-hydrates every
+    // persisted atom from storage exactly as plugin load does on boot —
+    // including $boardSlug itself, so this is a genuine cold rehydrate.
+    dispose = bindApi(vi.fn().mockRejectedValue(new Error('unused')), localStoragePluginStorage(), noopSocket)
+
     mount()
 
     expect(await screen.findByLabelText('roadmapShowLanes')).toBeTruthy()
     expect(screen.queryByText('Rough idea card')).toBeNull()
+
+    dispose()
+  })
+})
+
+describe('hiding while a wishlist card is selected', () => {
+  it('prunes hidden wishlist cards out of the selection, so the SelectionBar cannot act on invisible cards', async () => {
+    fetchBoardMock.mockResolvedValue(boardPayload())
+
+    mount()
+    await screen.findByText('Rough idea card')
+
+    // Select the idea card (⌘/Ctrl-click, same gesture the board wires up).
+    fireEvent.click(screen.getByText('Rough idea card'), { ctrlKey: true })
+    expect(await screen.findByText('nSelected')).toBeTruthy()
+
+    fireEvent.click(screen.getByLabelText('roadmapHideLanes'))
+
+    // The lanes disappear AND the floating bulk bar goes with them — a
+    // selected-but-now-invisible card must not remain assign/archive/
+    // delete-able through a bar the user can no longer see the target of.
+    await waitFor(() => expect(screen.queryByText('Rough idea card')).toBeNull())
+    expect(screen.queryByText('nSelected')).toBeNull()
+  })
+
+  it('leaves a selected LIVE card untouched by the hide toggle', async () => {
+    fetchBoardMock.mockResolvedValue(boardPayload())
+
+    mount()
+    await screen.findByText('Rough idea card')
+
+    fireEvent.click(screen.getByText('Todo card'), { ctrlKey: true })
+    expect(await screen.findByText('nSelected')).toBeTruthy()
+
+    fireEvent.click(screen.getByLabelText('roadmapHideLanes'))
+
+    await waitFor(() => expect(screen.queryByText('Rough idea card')).toBeNull())
+    // The live selection survives — hiding wishlist lanes must not clear an
+    // unrelated in-progress bulk selection.
+    expect(screen.getByText('nSelected')).toBeTruthy()
   })
 })
 
@@ -445,22 +545,34 @@ describe('drag matrix', () => {
     expect(screen.queryAllByRole('menuitem')).toHaveLength(0)
   })
 
-  it('a server-side refusal rolls the card back instead of leaving a phantom', async () => {
+  it('a server-side refusal rolls the card back into its source lane and surfaces the verbatim detail', async () => {
     // The engine answers a refused lane transition with a 400 whose detail is
     // the DB layer's own `'<from>' -> '<to>'` message.
     patchTaskMock.mockRejectedValue(new Error('400 {"detail":"invalid roadmap lane transition"}'))
     fetchBoardMock.mockResolvedValue(boardPayload())
+    const notify = vi.spyOn(host, 'notify')
 
     mount()
     await openMenu('Rough idea card')
+    const ideaLaneBefore = screen.getByText('Rough idea card').closest('.group\\/col')
+
+    expect(ideaLaneBefore).toBeTruthy()
     fireEvent.click(await screen.findByText('laneRefine'))
 
     await waitFor(() => expect(patchTaskMock).toHaveBeenCalled())
 
-    // The optimistic edit is rolled back: exactly one copy of the card exists,
-    // and the counts are unchanged (a phantom would leave it in BOTH lanes or
-    // strand it in the target).
+    // The optimistic edit is rolled back: exactly one copy of the card
+    // exists, it is back inside the Ideas lane it started in (not stranded
+    // in Roadmap, the optimistic target), and the counts are unchanged.
     await waitFor(() => expect(screen.getAllByText('Rough idea card')).toHaveLength(1))
+    const ideaLaneAfter = screen.getByText('Rough idea card').closest('.group\\/col')
+
+    expect(ideaLaneAfter).toBe(ideaLaneBefore)
     expect(screen.getByText('5')).toBeTruthy()
+
+    // The server's own detail string reaches the toast verbatim — not the
+    // client-side laneDropRefused copy, which only fires for a REFUSAL this
+    // component catches before ever writing (see the drop-target case above).
+    expect(notify).toHaveBeenCalledWith({ kind: 'error', message: 'invalid roadmap lane transition' })
   })
 })

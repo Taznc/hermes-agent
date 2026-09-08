@@ -533,7 +533,6 @@ function LaneCardFooter({ onSetPriority, task }: { onSetPriority: (priority: num
 
   return (
     <div className="flex min-w-0 items-center gap-2 text-[0.625rem] text-(--ui-text-tertiary)">
-      <IdChip className="min-w-0 text-[0.6rem]" id={task.id} />
       {parents > 0 && <Meta icon="circle-slash">{parents}</Meta>}
       <span
         className="ml-auto"
@@ -599,6 +598,7 @@ export function Card({
   task: KanbanTask
 }) {
   const k = useKanban()
+  const qc = useQueryClient()
   const [dragging, setDragging] = useState(false)
   const meta = columnMeta(task.status)
   // A wishlist card is not work: no agent is coming for it, it has no runs and
@@ -633,8 +633,9 @@ export function Card({
   // Per-card "send to roadmap ideas" (Phase 2.15 follow-up). Provenance-only
   // — title + id, never the body — reusing the exact contract + toast copy
   // the board-header free-typed capture already established (IdeaCaptureDialog
-  // above): success and roadmap-unavailable get distinct feedback, and this
-  // never touches the task query cache since it isn't a board mutation.
+  // above). Success and roadmap-unavailable get distinct feedback; success also
+  // invalidates the board query prefix, since this now creates a real `idea`
+  // card on the board rather than a fire-and-log ROADMAP.md append.
   //
   // The card's OWN board is passed explicitly: roadmap-sync maps each board
   // slug to a DIFFERENT ROADMAP file, and without it the backend falls back to
@@ -645,6 +646,12 @@ export function Card({
     onSuccess: ({ ok, reason }) => {
       if (ok) {
         host.notify({ kind: 'success', message: k.ideaSaved })
+        // The backend now creates a real `idea` card (Phase 2.15 successor) —
+        // without a socket for this board (e.g. a stale connection, or the
+        // All Boards aggregate view) the new card would stay invisible until
+        // the next poll. Invalidate the board prefix so every board query
+        // (single-board and All Boards alike) refetches and reconciles it in.
+        void qc.invalidateQueries({ queryKey: ['kanban', 'board'] })
       } else {
         host.notify({ kind: 'warning', message: reason === 'empty_idea' ? k.ideaEmpty : k.ideaUnavailable })
       }
@@ -758,7 +765,7 @@ export function Card({
           >
             {task.title || task.id}
           </span>
-          <BoardBadge task={task} />
+          {!lane && <BoardBadge task={task} />}
           {summary && !lane && (
             <span className="line-clamp-2 text-[0.6875rem] leading-snug text-(--ui-text-tertiary)">{summary}</span>
           )}
@@ -1728,14 +1735,15 @@ function FilterMenu({
 
 /**
  * Free-typed roadmap idea capture — jot a rough idea straight from the board
- * into ROADMAP.md's managed `## Ideas` inbox (roadmap-sync plugin), without
- * opening an editor or filing a premature card. A rejected/unavailable
- * roadmap is reported distinctly from success (`k.ideaUnavailable` vs.
- * `k.ideaSaved`) per the card's acceptance criteria — this is a fire-and-log
- * action, not a board mutation, so it never touches the task query cache.
+ * into a card in the board's `idea` lane, without opening an editor or
+ * filing a premature card. A rejected/unavailable roadmap is reported
+ * distinctly from success (`k.ideaUnavailable` vs. `k.ideaSaved`) per the
+ * card's acceptance criteria. On success this invalidates the board query
+ * prefix so the new card shows up immediately, including in All Boards mode.
  */
 export function IdeaCaptureDialog({ onClose, open }: { onClose: () => void; open: boolean }) {
   const k = useKanban()
+  const qc = useQueryClient()
   const [text, setText] = useState('')
   const [busy, setBusy] = useState(false)
   const [error, setError] = useState<null | string>(null)
@@ -1763,10 +1771,11 @@ export function IdeaCaptureDialog({ onClose, open }: { onClose: () => void; open
 
       if (ok) {
         host.notify({ kind: 'success', message: k.ideaSaved })
+        void qc.invalidateQueries({ queryKey: ['kanban', 'board'] })
         onClose()
       } else {
-        // Distinct from a thrown error: the request succeeded, the ROADMAP
-        // write did not (unmapped board, missing file, empty after
+        // Distinct from a thrown error: the request succeeded, the idea card
+        // creation did not (missing/unavailable roadmap lane, empty after
         // sanitization) — surface it inline so the user can decide whether
         // to retry rather than silently losing the idea.
         setError(reason === 'empty_idea' ? k.ideaEmpty : k.ideaUnavailable)
@@ -2192,6 +2201,7 @@ export function KanbanBoardPage() {
 
   const toggleRoadmapHidden = () => {
     const next = { ...roadmapHiddenMap }
+    const hiding = !next[slug]
 
     if (next[slug]) {
       delete next[slug]
@@ -2200,6 +2210,26 @@ export function KanbanBoardPage() {
     }
 
     $roadmapHidden.set(next)
+
+    // Hiding the lanes must not leave an invisible card selected and
+    // bulk-actionable — the floating SelectionBar renders purely off
+    // `selected.size` and has no idea the cards it would act on just left
+    // the visible board. Prune wishlist cards out of the selection at the
+    // moment they disappear, the same way the board-membership effect below
+    // prunes cards that left entirely.
+    if (hiding && board) {
+      const laneKeys = new Set(
+        board.columns.filter(col => isRoadmapLane(col.name)).flatMap(col => col.tasks.map(taskCardKey))
+      )
+
+      if (laneKeys.size > 0) {
+        setSelected(prev => {
+          const kept = [...prev].filter(key => !laneKeys.has(key))
+
+          return kept.length === prev.size ? prev : new Set(kept)
+        })
+      }
+    }
   }
 
   const toggleBoardVisible = (slugToToggle: string) => {
@@ -2823,19 +2853,23 @@ export function KanbanBoardPage() {
           <NewTaskDialog onClose={() => setAddStatus(null)} parents={parentOptions} target={addStatus} />
           <IdeaCaptureDialog onClose={() => setIdeaOpen(false)} open={ideaOpen} />
           {/* Roadmap → Ready is the one spawn that bypasses auto-decompose, so
-              it confirms; Roadmap → Triage (the default) never asks. */}
+              it confirms; Roadmap → Triage (the default) never asks. The
+              dialog owns its own pending/done/error beat (ConfirmDialog
+              contract): `onConfirm` returns the mutation's own promise so a
+              server-side rejection surfaces inline and keeps the dialog open
+              instead of closing on a failed spawn. */}
           <ConfirmDialog
             confirmLabel={k.spawnReadyConfirm}
             description={k.spawnReadyBody}
             onClose={() => setSpawnReadyKey(null)}
-            onConfirm={() => {
+            onConfirm={async () => {
               const task = spawnReadyKey ? index.get(spawnReadyKey) : undefined
 
-              if (task) {
-                moveMut.mutate({ board: task.board ?? undefined, id: task.id, key: spawnReadyKey!, status: 'ready' })
+              if (!task) {
+                return
               }
 
-              setSpawnReadyKey(null)
+              await moveMut.mutateAsync({ board: task.board ?? undefined, id: task.id, key: spawnReadyKey!, status: 'ready' })
             }}
             open={spawnReadyKey !== null}
             title={k.spawnReadyTitle}
