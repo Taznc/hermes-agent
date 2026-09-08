@@ -701,9 +701,11 @@ function overlayHomeLane(
   // only the launch profile's bucket absorbs detached live sessions; a foreign
   // Home stays exactly as its own store reported it.
   const ownsLive = project.id === NO_PROJECT_ID
+
   const detached = ownsLive
     ? live.filter(session => isDetachedSession(session) && !removed.has(session.id) && !isLiveArchived(session))
     : []
+
   const kept = (lane?.sessions ?? []).filter(session => !removed.has(session.id))
 
   if (!detached.length && kept.length === (lane?.sessions.length ?? 0)) {

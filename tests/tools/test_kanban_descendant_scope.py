@@ -28,6 +28,13 @@ def _worker_board(tmp_path, monkeypatch):
         "HERMES_KANBAN_CLAIM_LOCK": task.claim_lock, "HOME": str(tmp_path),
     }.items():
         monkeypatch.setenv(key, value)
+    monkeypatch.setenv("HERMES_KANBAN_HOME", str(tmp_path))
+    monkeypatch.delenv("HERMES_KANBAN_PIN_HOME", raising=False)
+    # Point the kanban HOME at the same tmp dir the board lives in, so the DB pin
+    # resolves UNDER it and the fork's stale-pin guard (kanban_db._pin_is_honored)
+    # honors it on the containment arm. Setting HERMES_KANBAN_PIN_HOME instead
+    # would exercise the intent-stamp escape hatch, which scrub_kanban_env
+    # deliberately strips from descendants — the opposite of what this asserts.
     monkeypatch.delenv("HERMES_DELEGATED_CHILD_CONTEXT", raising=False)
     return conn, own, foreign
 

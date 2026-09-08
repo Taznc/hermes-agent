@@ -2243,10 +2243,17 @@ class CredentialPool(CredentialPoolAdminMixin):
                 _cleared_status_copy(e) if e.id in stale_ids else e for e in self._entries
             ]
             try:
-                # Both guards against the disk-recency merge copying a cooldown back:
-                # status_cleared_ids skips the merge for THIS write, reset_at records a
-                # durable floor that every later write from any process also honours.
-                self._persist(reset_at=reset_at, status_cleared_ids=list(stale_ids))
+                # reset_at ONLY — deliberately not status_cleared_ids. Both guard
+                # the same hazard (the disk-recency merge reading a cleared
+                # last_status_at as epoch 0 and copying a cooldown back), but
+                # status_cleared_ids skips the disk merge WHOLESALE, which would
+                # also erase a 429 another process recorded after this reset's
+                # boundary. The floor is the finer instrument: it drops cooldowns
+                # at or below reset_at and lets genuinely newer ones survive,
+                # which is the invariant test_credential_pool_reset_authority
+                # pins. Upstream's per-target reset_status() has no floor, so it
+                # still uses status_cleared_ids (credential_pool_admin.py).
+                self._persist(reset_at=reset_at)
             except Exception as exc:
                 return ResetStatusReport(requested=len(stale_ids), cleared=0, error=str(exc))
             return ResetStatusReport(

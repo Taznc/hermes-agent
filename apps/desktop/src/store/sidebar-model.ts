@@ -34,8 +34,8 @@ import { computed } from 'nanostores'
 
 import { orderByIds } from '@/app/chat/sidebar/order'
 import { filterSessionsByProfileScope } from '@/app/chat/sidebar/profile-scope'
-import { orderProjectsByIds, sortProjectsForOverview } from '@/app/chat/sidebar/projects/model'
 import { resolveLiveProjectFilter } from '@/app/chat/sidebar/project-filter'
+import { orderProjectsByIds, sortProjectsForOverview } from '@/app/chat/sidebar/projects/model'
 import {
   excludeProjectSessions,
   NO_PROJECT_ID,

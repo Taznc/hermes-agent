@@ -11,10 +11,28 @@ import { ChatRoutesSurface } from './surfaces'
 import type { WiringActions } from './types'
 
 vi.mock('@/contrib/react/use-contributions', () => ({ useContributions: vi.fn() }))
-vi.mock('@/store/connections', () => ({ $activeConnectionId: atom('local') }))
-vi.mock('@/store/gateway', () => ({ $gateway: atom<unknown>(null) }))
-vi.mock('@/store/profile', () => ({ $activeGatewayProfile: atom('default') }))
-vi.mock('@/store/session', () => ({
+// Spread the real module and override only what this surface reads — see the
+// note on the @/store/session mock below.
+vi.mock('@/store/connections', async importOriginal => ({
+  ...(await importOriginal<typeof import('@/store/connections')>()),
+  $activeConnectionId: atom('local')
+}))
+vi.mock('@/store/gateway', async importOriginal => ({
+  ...(await importOriginal<typeof import('@/store/gateway')>()),
+  $gateway: atom<unknown>(null)
+}))
+vi.mock('@/store/profile', async importOriginal => ({
+  ...(await importOriginal<typeof import('@/store/profile')>()),
+  $activeGatewayProfile: atom('default')
+}))
+// Only the two stores this surface actually reads are stubbed; everything else
+// falls through to the real module. Enumerating the whole export surface here
+// meant every upstream store added anywhere in the import graph broke this file
+// with "No <X> export is defined on the mock" — three such exports appeared in
+// one sync ($sessions, $cronSessions, $messagingSessions), none of them used by
+// the code under test.
+vi.mock('@/store/session', async importOriginal => ({
+  ...(await importOriginal<typeof import('@/store/session')>()),
   $freshDraftReady: atom(false),
   $gatewayState: atom('open')
 }))

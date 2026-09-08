@@ -235,6 +235,7 @@ export function TaskDrawer({
   const { data: roster } = useQuery({ queryFn: fetchProfiles, queryKey: PROFILES_KEY, staleTime: 60_000 })
   const assigneeName = task?.assignee || defaultAssignee
   const assigneeProfile = assigneeName ? roster?.profiles.find(p => p.name === assigneeName) : undefined
+
   const resolvedInheritLabel =
     assigneeProfile && (assigneeProfile.model || assigneeProfile.reasoning_effort)
       ? overrideLabel(
@@ -357,8 +358,14 @@ export function TaskDrawer({
   })
 
   const activityGroups = useMemo(() => (detail ? groupActivity(detail.events, k) : []), [detail, k])
-  // Upstream made `attachments` optional on the drawer payload (an older backend omits it),
-  // so normalize once here instead of guarding each of the two filtered sections.
+
+  // Upstream made `attachments` optional on the drawer payload: an older backend
+  // omits the key entirely, which means "this backend has no attachment support"
+  // and is NOT the same as an empty list. `supportsAttachments` preserves that
+  // distinction (upstream gates its section on `Array.isArray(detail.attachments)`
+  // for the same reason) while `attachments` gives the two filtered sections a
+  // safe array to read without each guarding the shape itself.
+  const supportsAttachments = Array.isArray(detail?.attachments)
   const attachments = useMemo(
     () => (Array.isArray(detail?.attachments) ? detail.attachments : []),
     [detail]
@@ -660,11 +667,13 @@ export function TaskDrawer({
                   onOpen={(filename, src) => setLightbox({ filename, src })}
                 />
 
-                <AttachmentsSection
-                  attachments={attachments.filter(a => !isImageAttachment(a))}
-                  onUpload={file => uploadMut.mutate(file)}
-                  pending={uploadMut.isPending}
-                />
+                {supportsAttachments && (
+                  <AttachmentsSection
+                    attachments={attachments.filter(a => !isImageAttachment(a))}
+                    onUpload={file => uploadMut.mutate(file)}
+                    pending={uploadMut.isPending}
+                  />
+                )}
               </>
             )}
           </div>

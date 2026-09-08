@@ -59,7 +59,10 @@ const expectOnlySelectedSession = (title: string | null) => {
     .map(label => screen.queryByText(label)?.closest('.group.row-hover'))
     .filter(row => row !== undefined)
 
-  const selectedRows = rows.filter(row => row?.className.includes('bg-(--ui-row-active-background)'))
+  // This fork renders the selected session row with `--ui-row-selected-background`
+  // (session-row.tsx) where upstream uses `--ui-row-active-background`; the fork's
+  // own token also carries a selection ring. Same behaviour, different token name.
+  const selectedRows = rows.filter(row => row?.className.includes('bg-(--ui-row-selected-background)'))
   const expected = title ? [screen.getByText(title).closest('.group.row-hover')] : []
 
   expect(selectedRows).toEqual(expected)

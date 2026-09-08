@@ -79,6 +79,16 @@ function openDrawer() {
   )
 }
 
+// This fork's drawer is TABBED (TabStrip: Overview / Activity / Log), where
+// upstream's is one flat panel. Comments live on Activity and attachments on
+// Log, so the assertions below switch tabs first. The behaviour under test —
+// a task detail payload with `attachments` absent or null must still render,
+// and must gain the upload control when a later response supplies the list —
+// is upstream's and is unchanged.
+async function selectTab(name: string) {
+  fireEvent.click(await screen.findByRole('tab', { name: new RegExp(name) }))
+}
+
 describe('task attachment compatibility', () => {
   it.each([{}, { attachments: null }])(
     'keeps older task details usable without attachment controls (%j)',
@@ -88,7 +98,11 @@ describe('task attachment compatibility', () => {
 
       expect(await screen.findByRole('heading', { name: legacyDetail.task.title })).toBeTruthy()
       expect(screen.getByText(legacyDetail.task.body!)).toBeTruthy()
+
+      await selectTab(en.tabActivity)
       expect(screen.getByText(legacyDetail.comments[0].body)).toBeTruthy()
+
+      await selectTab(en.tabLog)
       expect(screen.queryByRole('button', { name: en.uploadAttachment })).toBeNull()
       expect(screen.queryByText(en.noAttachments)).toBeNull()
 
@@ -103,6 +117,8 @@ describe('task attachment compatibility', () => {
   it('keeps upload and attachment rendering working for a supported empty list', async () => {
     detail = { ...legacyDetail, attachments: [] }
     const { container } = openDrawer()
+
+    await selectTab(en.tabLog)
     const upload = await screen.findByRole('button', { name: en.uploadAttachment })
     expect(screen.getByText(en.noAttachments)).toBeTruthy()
 

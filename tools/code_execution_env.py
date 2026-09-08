@@ -103,7 +103,15 @@ def _scrub_child_env(source_env, is_passthrough=None, is_windows=None):
     # Preserve location only when carrying the descendant fence, not for arbitrary
     # non-allowlisted HERMES_* values in otherwise ordinary execution environments.
     if scoped.get(DELEGATED_CHILD_ENV_MARKER):
-        for key in (DELEGATED_CHILD_ENV_MARKER, "HERMES_KANBAN_DB", "HERMES_KANBAN_BOARD"):
+        # HERMES_KANBAN_HOME rides along with the DB/board pin: it is the home
+        # those pins are resolved and containment-checked against
+        # (kanban_db._pin_is_honored). Dropping it while keeping the DB pin made
+        # a sandbox child silently fall back to the DEFAULT ~/.hermes board —
+        # the pin was carried but no longer honored. Deliberately NOT
+        # HERMES_KANBAN_PIN_HOME: that stamp is intent, and scrub_kanban_env
+        # strips it on purpose so an INHERITED stamp cannot vouch for a stale pin.
+        for key in (DELEGATED_CHILD_ENV_MARKER, "HERMES_KANBAN_DB", "HERMES_KANBAN_BOARD",
+                    "HERMES_KANBAN_HOME"):
             if key in scoped:
                 scrubbed[key] = scoped[key]
     return delegated_child_subprocess_env(scrubbed)

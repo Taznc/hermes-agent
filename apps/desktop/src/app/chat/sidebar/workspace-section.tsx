@@ -47,7 +47,6 @@ import {
   ALL_PROJECTS,
   enterProject,
   exitProjectScope,
-  fetchProjectSessions,
   openProjectCreate,
   refreshProjects,
   refreshProjectTree,

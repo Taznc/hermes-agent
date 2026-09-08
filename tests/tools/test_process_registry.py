@@ -2402,10 +2402,21 @@ class TestSystemdCgroupIsolation:
         assert first is True
         assert second is True
         assert len(probe_calls) == 1, "probe must run only once (cached)"
-        # The probe must not carry OOMPolicy= either: that is the argv systemd
-        # rejected on scope units and cached as "unavailable" (#102486).
+        # The probe must mint the SAME unit shape the real spawn does, so a
+        # cached "available" verdict is evidence about the argv that will
+        # actually run. This fork spawns a transient SERVICE (--pipe, no
+        # --scope) into hermes-workers.slice, and a service accepts OOMPolicy=,
+        # so the probe carries it too. Upstream drops OOMPolicy because ITS
+        # probe/spawn use --scope, where older systemd rejected it (#102486) —
+        # a constraint that does not apply to the shape minted here. Verified
+        # live on systemd 255: `systemd-run --user --pipe ... --property
+        # OOMPolicy=kill -- /bin/true` exits 0.
         probe_argv = probe_calls[0][0]
-        assert not any(
+        assert "--scope" not in probe_argv, probe_argv
+        assert any(
+            value == "--pipe" for value in probe_argv if isinstance(value, str)
+        ), probe_argv
+        assert any(
             value.startswith("OOMPolicy=") for value in probe_argv if isinstance(value, str)
         ), probe_argv
 
