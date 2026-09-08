@@ -366,6 +366,7 @@ export function TaskDrawer({
   // for the same reason) while `attachments` gives the two filtered sections a
   // safe array to read without each guarding the shape itself.
   const supportsAttachments = Array.isArray(detail?.attachments)
+
   const attachments = useMemo(
     () => (Array.isArray(detail?.attachments) ? detail.attachments : []),
     [detail]
