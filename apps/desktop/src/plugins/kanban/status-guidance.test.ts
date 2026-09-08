@@ -26,9 +26,11 @@ const k: StatusGuidanceDeps = {
   guideBlockedReviewNoVerdict: 'guideBlockedReviewNoVerdict',
   guideBlockedUnknown: 'guideBlockedUnknown',
   guideDone: 'guideDone',
+  guideIdea: 'guideIdea',
   guideOnHold: 'guideOnHold',
   guideReadyQueued: 'guideReadyQueued',
   guideReview: 'guideReview',
+  guideRoadmap: 'guideRoadmap',
   guideRunning: 'guideRunning',
   guideRunningStale: 'guideRunningStale',
   guideScheduled: 'guideScheduled',
@@ -57,7 +59,11 @@ const event = (kind: string, payload: unknown = null, id = 1, created_at = 0): K
 describe('resolveBlockCause — the anchor bug (t_44ca59a3)', () => {
   it('a gave_up event with no blocked/block_loop_detected event is read as automatic, not manual', () => {
     const task = baseTask({ block_kind: null, last_failure_error: 'pid 704578 not alive' })
-    const events = [event('crashed', { error: 'pid 704578 not alive' }), event('gave_up', { error: 'pid 704578 not alive' })]
+
+    const events = [
+      event('crashed', { error: 'pid 704578 not alive' }),
+      event('gave_up', { error: 'pid 704578 not alive' })
+    ]
 
     const cause = resolveBlockCause(task, events, [])
 
@@ -72,7 +78,11 @@ describe('resolveBlockCause — the anchor bug (t_44ca59a3)', () => {
 
   it('statusGuidance for the anchor card never reads as a missing reason', () => {
     const task = baseTask({ block_kind: null, last_failure_error: 'pid 704578 not alive' })
-    const events = [event('crashed', { error: 'pid 704578 not alive' }), event('gave_up', { error: 'pid 704578 not alive' })]
+
+    const events = [
+      event('crashed', { error: 'pid 704578 not alive' }),
+      event('gave_up', { error: 'pid 704578 not alive' })
+    ]
 
     const guidance = statusGuidance('blocked', task, events, [], k)
 
@@ -91,7 +101,12 @@ describe('resolveBlockCause — precedence is recency-ordered, not "manual alway
 
   it('manual block, unblocked, then a later gave_up resolves to automatic', () => {
     const task = baseTask({ block_kind: 'needs_input', last_failure_error: null })
-    const events = [event('blocked', { reason: 'Which key?' }), event('unblocked'), event('gave_up', { error: 'pid 2 not alive' })]
+
+    const events = [
+      event('blocked', { reason: 'Which key?' }),
+      event('unblocked'),
+      event('gave_up', { error: 'pid 2 not alive' })
+    ]
 
     expect(resolveBlockCause(task, events, [])).toEqual({ origin: 'automatic', raw: 'pid 2 not alive' })
   })
@@ -237,6 +252,25 @@ describe('statusGuidance — coverage contract', () => {
     const events = [event('block_loop_detected', { reason: 'same cause 3x' })]
 
     expect(statusGuidance('triage', task, events, [], k)).toBe('guideBlockLoop(same cause 3x)')
+  })
+
+  it('idea and roadmap resolve to their own calm guidance, not a column-help fallback', () => {
+    expect(statusGuidance('idea', baseTask({ status: 'idea' }), [], [], k)).toBe('guideIdea')
+    expect(statusGuidance('roadmap', baseTask({ status: 'roadmap' }), [], [], k)).toBe('guideRoadmap')
+  })
+
+  it('a lane card is never nagged about staleness, block history, or a missing assignee', () => {
+    const noisy = {
+      assignee: null,
+      block_kind: 'needs_input' as const,
+      last_failure_error: 'pid 704578 not alive',
+      last_heartbeat_at: 0
+    }
+
+    const events = [event('block_loop_detected', { reason: 'same cause 3x' }), event('gave_up', { error: 'boom' })]
+
+    expect(statusGuidance('idea', baseTask({ ...noisy, status: 'idea' }), events, [], k)).toBe('guideIdea')
+    expect(statusGuidance('roadmap', baseTask({ ...noisy, status: 'roadmap' }), events, [], k)).toBe('guideRoadmap')
   })
 
   it('an unknown backend status falls back to its column help', () => {

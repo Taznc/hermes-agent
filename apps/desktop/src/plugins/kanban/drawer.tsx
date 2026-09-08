@@ -19,6 +19,7 @@ import {
   $paneWidthOverride,
   cn,
   Codicon,
+  ConfirmDialog,
   Dialog,
   DialogContent,
   DropdownMenu,
@@ -180,6 +181,11 @@ export function TaskDrawer({
   // Drawer width: persisted override (undefined = the authored w-[26rem]).
   const widthOverride = useValue($paneWidthOverride(DRAWER_PANE_ID))
   const [resizing, setResizing] = useState(false)
+  // Roadmap → Ready is the one lane spawn that skips auto-decompose, so it
+  // confirms — same gate as the board's drag/menu path (`spawnReadyKey`),
+  // scoped to this single open card instead of a cardKey since the drawer
+  // only ever has one task in view.
+  const [confirmingReady, setConfirmingReady] = useState(false)
 
   const startResize = (event: ReactPointerEvent<HTMLDivElement>) => {
     if (event.button !== 0) {
@@ -253,8 +259,12 @@ export function TaskDrawer({
   // readers need to page through.
   const logTail = FULL_LOG_TAIL_BYTES
   // A different card starts on Overview — carrying the previous card's tab
-  // over would open a log the user never asked for.
-  useEffect(() => setTab('overview'), [id])
+  // over would open a log the user never asked for. A confirm bound to the
+  // PREVIOUS card must not linger open against the new one.
+  useEffect(() => {
+    setTab('overview')
+    setConfirmingReady(false)
+  }, [id])
 
   const { data: log } = useQuery({
     enabled: !!id,
@@ -391,6 +401,15 @@ export function TaskDrawer({
       return
     }
 
+    // Spawning straight to Ready skips auto-decompose, which is the standing
+    // default for a roadmap item — so it is the one lane move that asks
+    // first, same rule as the board's drag/menu path.
+    if (task.status === 'roadmap' && status === 'ready') {
+      setConfirmingReady(true)
+
+      return
+    }
+
     moveMut.mutate(status)
   }
 
@@ -467,11 +486,16 @@ export function TaskDrawer({
                     {k.copyTitle}
                   </DropdownMenuItem>
                   <DropdownMenuSeparator />
-                  <DropdownMenuItem onSelect={mutate(() => patchTask(task.id, { status: 'archived' }, taskBoard), onClose)}>
+                  <DropdownMenuItem
+                    onSelect={mutate(() => patchTask(task.id, { status: 'archived' }, taskBoard), onClose)}
+                  >
                     <Codicon name="archive" size="0.85rem" />
                     {k.archive}
                   </DropdownMenuItem>
-                  <DropdownMenuItem className="text-destructive" onSelect={mutate(() => deleteTask(task.id, taskBoard), onClose)}>
+                  <DropdownMenuItem
+                    className="text-destructive"
+                    onSelect={mutate(() => deleteTask(task.id, taskBoard), onClose)}
+                  >
                     <Codicon name="trash" size="0.85rem" />
                     {k.delete}
                   </DropdownMenuItem>
@@ -657,10 +681,7 @@ export function TaskDrawer({
 
             {tab === 'log' && (
               <>
-                <WorkerLogSection
-                  live={running}
-                  log={log}
-                />
+                <WorkerLogSection live={running} log={log} />
 
                 <ImagesSection
                   attachments={attachments.filter(isImageAttachment)}
@@ -698,6 +719,20 @@ export function TaskDrawer({
           )}
         </DialogContent>
       </Dialog>
+
+      {/* Same seam as the board's spawn-Ready confirm: `onConfirm` returns
+          the mutation's own promise, so a server-side rejection surfaces
+          inline and the dialog stays open instead of closing on failure. */}
+      <ConfirmDialog
+        confirmLabel={k.spawnReadyConfirm}
+        description={k.spawnReadyBody}
+        onClose={() => setConfirmingReady(false)}
+        onConfirm={async () => {
+          await moveMut.mutateAsync('ready')
+        }}
+        open={confirmingReady}
+        title={k.spawnReadyTitle}
+      />
     </div>
   )
 }
