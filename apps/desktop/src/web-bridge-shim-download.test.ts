@@ -113,10 +113,13 @@ describe('web-bridge-shim saveGatewayFile', () => {
     expect(createObjectURL).toHaveBeenCalledTimes(1)
 
     // Bytes reach the Blob unmangled — proves this isn't a text-mode/base64
-    // round trip that would corrupt a binary file.
+    // round trip that would corrupt a binary file. Compare the VIEWS, not the
+    // ArrayBuffers: vitest's toEqual reports two ArrayBuffers equal regardless
+    // of length or contents, so `resolves.toEqual(bytes.buffer)` asserts
+    // nothing (t_b398a331).
     const blobArg = createObjectURL.mock.calls[0][0] as Blob
 
-    await expect(blobArg.arrayBuffer()).resolves.toEqual(bytes.buffer)
+    expect(new Uint8Array(await blobArg.arrayBuffer())).toEqual(bytes)
 
     const [url, init] = downloadCall(fetchMock)
 
