@@ -3174,13 +3174,19 @@ def _has_sticky_block(conn: sqlite3.Connection, task_id: str) -> bool:
     deliberately excluded from this scan (see ``_gave_up_was_force_tripped`` for the force-tripped
     subset that IS sticky) so a synthetic/legacy ``gave_up`` appended after a genuine worker
     ``blocked`` event can never mask it — only ``unblocked`` ends a worker/operator block.
+
+    ``review_round_cap`` (the dispatcher's hard stop on a runaway
+    review<->changes_requested loop, ``kanban.max_review_rounds``) is sticky for the
+    same reason as ``review_no_verdict``: without an explicit ``kanban_unblock`` the
+    card would immediately re-trip the cap on the very next tick since the round
+    count itself never resets on unblock (only ``complete_task`` clears it).
     """
     row = conn.execute(
         "SELECT kind FROM task_events "
-        "WHERE task_id = ? AND kind IN ('blocked', 'unblocked', 'review_no_verdict') "
+        "WHERE task_id = ? AND kind IN ('blocked', 'unblocked', 'review_no_verdict', 'review_round_cap') "
         "ORDER BY id DESC LIMIT 1", (task_id,),
     ).fetchone()
-    return bool(row) and row["kind"] in ("blocked", "review_no_verdict")
+    return bool(row) and row["kind"] in ("blocked", "review_no_verdict", "review_round_cap")
 
 
 def _gave_up_was_force_tripped(conn: sqlite3.Connection, task_id: str) -> bool:
@@ -3229,7 +3235,7 @@ def _resume_status_from_events(conn: sqlite3.Connection, task_id: str) -> str:
         "'blocked', 'block_loop_detected', 'dependency_wait', 'gave_up', "
         "'unblocked', 'changes_requested', 'review_reopened', 'status', 'reclaimed', "
         "'stale', 'timed_out', 'crashed', 'spawn_failed', 'rate_limited', 'held', "
-        "'review_no_verdict'"
+        "'review_no_verdict', 'review_round_cap'"
         ") ORDER BY id DESC LIMIT 1", (task_id,),
     ).fetchone()
     payload = _json_dict(_row_get(row, "payload"))
