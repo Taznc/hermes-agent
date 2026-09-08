@@ -133,6 +133,7 @@ function PostDrainControl({
   })
 
   const choices = postDrainChoices(actions)
+
   const label = (choice: PostDrainChoice) =>
     choice.actionKind === 'service_restart' ? k.actionServiceRestart(choice.target ?? '') : k.actionReboot
 
