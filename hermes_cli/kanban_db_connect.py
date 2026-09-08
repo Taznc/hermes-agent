@@ -763,9 +763,9 @@ def _connect_inventory_safe(path: Path, *, force_init: bool = False) -> sqlite3.
     Existing named boards stay lock-free, but every SQLite open on that path is
     ``mode=rw`` (no-create). If removal wins after the existence check, the
     attempt leaves no directory or DB behind and retries with the inventory lock
-    outermost. Missing named boards take the lock immediately. Default-board and
-    explicit paths keep their legacy behavior because they are not entries in
-    ``boards_root()``.
+    outermost. Missing named boards take the lock immediately. The legacy
+    default-board path and paths outside ``boards_root()`` keep their existing
+    behavior because they are not inventory entries.
     """
     from hermes_cli.kanban_db_inventory import (
         board_inventory_lock,
