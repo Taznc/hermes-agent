@@ -124,24 +124,57 @@ def prepare_chat_request(payload: Dict[str, Any]) -> tuple[Dict[str, str], bytes
 
 def response_to_openai(message: Dict[str, Any], *, tool_name_map: Dict[str, str] | None = None) -> Dict[str, Any]:
     """Translate a completed Anthropic Message JSON to Chat Completions JSON."""
+    blocks = message.get("content")
+    if not isinstance(blocks, list) or not blocks:
+        raise ValueError("Anthropic message content must be a non-empty array")
     content, tool_calls = [], []
-    for block in message.get("content") or []:
-        if block.get("type") == "text":
-            content.append(block.get("text", ""))
-        elif block.get("type") == "tool_use":
-            tool_calls.append({"id": block.get("id") or f"call_{uuid.uuid4().hex}", "type": "function", "function": {
-                "name": (tool_name_map or {}).get(block.get("name", ""), block.get("name", "")),
-                "arguments": json.dumps(block.get("input") or {}, separators=(",", ":")),
+    for block in blocks:
+        if not isinstance(block, dict):
+            raise ValueError("Anthropic message content blocks must be objects")
+        block_type = block.get("type")
+        if block_type == "text":
+            text = block.get("text")
+            if not isinstance(text, str):
+                raise ValueError("Anthropic text blocks require string text")
+            content.append(text)
+        elif block_type == "tool_use":
+            call_id = block.get("id")
+            name = block.get("name")
+            tool_input = block.get("input")
+            if not isinstance(call_id, str) or not call_id:
+                raise ValueError("Anthropic tool_use blocks require a non-empty string id")
+            if not isinstance(name, str) or not name:
+                raise ValueError("Anthropic tool_use blocks require a non-empty string name")
+            if not isinstance(tool_input, dict):
+                raise ValueError("Anthropic tool_use blocks require an object input")
+            tool_calls.append({"id": call_id, "type": "function", "function": {
+                "name": (tool_name_map or {}).get(name, name),
+                "arguments": json.dumps(tool_input, separators=(",", ":")),
             }})
-    usage = message.get("usage") or {}
-    prompt_tokens = int(usage.get("input_tokens") or 0)
-    completion_tokens = int(usage.get("output_tokens") or 0)
-    assistant: Dict[str, Any] = {"role": "assistant", "content": "".join(content) or None}
+        else:
+            raise ValueError(f"unsupported Anthropic content block type: {block_type!r}")
+    usage = message.get("usage", {})
+    if not isinstance(usage, dict):
+        raise ValueError("Anthropic message usage must be an object")
+    token_counts = []
+    for field in ("input_tokens", "output_tokens"):
+        value = usage.get(field, 0)
+        if not isinstance(value, int) or isinstance(value, bool) or value < 0:
+            raise ValueError(f"Anthropic usage {field} must be a non-negative integer")
+        token_counts.append(value)
+    prompt_tokens, completion_tokens = token_counts
+    model = message.get("model")
+    if not isinstance(model, str) or not model:
+        raise ValueError("Anthropic message model must be a non-empty string")
+    stop_reason = message.get("stop_reason")
+    if stop_reason is not None and not isinstance(stop_reason, str):
+        raise ValueError("Anthropic message stop_reason must be a string or null")
+    assistant: Dict[str, Any] = {"role": "assistant", "content": "".join(content) if content else None}
     if tool_calls:
         assistant["tool_calls"] = tool_calls
     return {"id": "chatcmpl_" + uuid.uuid4().hex, "object": "chat.completion", "created": int(time.time()),
-            "model": message.get("model", ""), "choices": [{"index": 0, "message": assistant,
-            "finish_reason": _STOP_REASONS.get(message.get("stop_reason"), "stop")}],
+            "model": model, "choices": [{"index": 0, "message": assistant,
+            "finish_reason": _STOP_REASONS.get(stop_reason, "stop") if stop_reason is not None else "stop"}],
             "usage": {"prompt_tokens": prompt_tokens, "completion_tokens": completion_tokens,
             "total_tokens": prompt_tokens + completion_tokens}}
 

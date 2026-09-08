@@ -718,6 +718,44 @@ def test_claude_proxy_returns_structured_502_for_malformed_upstream_200(upstream
     asyncio.run(run())
 
 
+@pytest.mark.parametrize("upstream_payload", [
+    {},
+    {"content": "not-a-block-list"},
+    {"content": []},
+    {"content": [None]},
+    {"content": [{"type": "text", "text": 1}]},
+    {"content": [{"type": "tool_use", "id": None, "name": "lookup", "input": {}}]},
+    {"content": [{"type": "tool_use", "id": "toolu_1", "name": None, "input": {}}]},
+    {"content": [{"type": "tool_use", "id": "toolu_1", "name": "lookup", "input": []}]},
+    {"content": [{"type": "future_block"}]},
+    {"content": [{"type": "text", "text": "ok"}], "usage": []},
+    {"content": [{"type": "text", "text": "ok"}], "usage": {"input_tokens": "many"}},
+    {"content": [{"type": "text", "text": "ok"}], "usage": {"output_tokens": -1}},
+    {"content": [{"type": "text", "text": "ok"}], "model": []},
+    {"content": [{"type": "text", "text": "ok"}], "stop_reason": []},
+])
+def test_claude_proxy_returns_structured_502_for_invalid_anthropic_message(upstream_payload):
+    """Malformed Anthropic message fields must not escape as a plaintext 500 or null-content 200."""
+
+    async def messages(request):
+        await request.read()
+        return web.json_response(upstream_payload)
+
+    async def run():
+        status, content_type, raw = await _claude_proxy_roundtrip(
+            {
+                "model": "claude-sonnet-4-6",
+                "messages": [{"role": "user", "content": "ping"}],
+            },
+            messages,
+        )
+        assert status == 502
+        assert content_type == "application/json"
+        assert json.loads(raw)["error"]["code"] == "upstream_invalid_response"
+
+    asyncio.run(run())
+
+
 def test_claude_proxy_preserves_upstream_non_2xx_status_and_json_body():
     """A genuine upstream refusal keeps its status and payload."""
 

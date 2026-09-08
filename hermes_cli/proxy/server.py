@@ -215,7 +215,15 @@ async def _handle_claude_chat(request: "web.Request", cred: UpstreamCredential, 
                     "upstream returned a success status with an unusable body",
                     code="upstream_invalid_response",
                 )
-            return web.json_response(response_to_openai(raw, tool_name_map=tool_name_map), status=upstream.status)
+            try:
+                translated = response_to_openai(raw, tool_name_map=tool_name_map)
+            except ValueError:
+                return _json_error(
+                    502,
+                    "upstream returned a success status with an unusable body",
+                    code="upstream_invalid_response",
+                )
+            return web.json_response(translated, status=upstream.status)
         finally:
             upstream.release()
             await session.close()
