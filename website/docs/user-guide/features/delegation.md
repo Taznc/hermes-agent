@@ -127,6 +127,28 @@ When a top-level agent provides a `tasks` array, Hermes returns one background h
 
 Synchronous single-task delegation from an orchestrator runs directly without thread pool overhead.
 
+### Background vs blocking dispatch
+
+A top-level delegation is dispatched in the background **only when its result
+has somewhere to land later**. Two things can provide that: a session that
+supports detached delivery (a normal chat), or a bound session id that Hermes
+can wake by self-posting when the batch finishes (an API-server request). When
+neither holds — a one-shot Kanban worker, a session-id-less HTTP request, a
+cron job, or an orchestrator subagent that needs its workers' output inside its
+own turn — the batch runs **inline** and returns the consolidated results
+directly from the call.
+
+That single decision drives both the runtime and the `delegate_task` tool
+description, so an agent in a blocking session is never told to "dispatch and
+continue" on a call that actually blocks. The mode is a property of the
+*session*, not of the process: one Hermes process can serve a background-mode
+chat and a blocking-mode worker at the same time and each sees the correct
+description.
+
+The distinction matters for budgeting: in a blocking session the child's entire
+runtime is charged to the caller's turn, and nothing about the call returns
+early. See *Child Timeout* for the deadline that applies to that wait.
+
 ### Durable background completions
 
 When a background delegation finishes, Hermes stores its completion event in
@@ -265,6 +287,15 @@ delegation:
 ```
 
 A positive value enforces a hard wall-clock limit on each child; `0` or a negative value disables it.
+
+When the parent blocks on the call (a session that cannot receive a detached
+result — see *Background vs blocking dispatch* above), its wait is derived from
+this same setting rather than from the generic tool deadline: unbounded when
+`child_timeout_seconds` is `0`, otherwise the cap plus a short grace so the
+child's own structured timeout metadata is what surfaces. Set
+`timeouts.tools.delegate_task` if you want an explicit parent-side ceiling
+regardless. The wait stays interruptible either way — `/stop` abandons it within
+about a second.
 
 When a configured cap fires, the child's result carries structured timeout
 metadata alongside the error message so parents and hooks can distinguish a
