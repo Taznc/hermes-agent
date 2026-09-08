@@ -8,7 +8,10 @@ path; the dispatcher injects this into every worker) > ``HERMES_KANBAN_BOARD`` /
 :func:`scoped_current_board` > ``<root>/kanban/current`` > ``default``.
 Concurrency: WAL + ``BEGIN IMMEDIATE`` + compare-and-swap on ``tasks.status``/``claim_lock`` —
 SQLite serializes writers so one claimer wins, losers see zero rows (no retries, no distributed
-locks). Schema: tasks, task_links, task_comments, task_events, task_runs, attachments, notify subs.
+locks). That covers writes *within* a board; the set of boards that exist is serialized instead by
+:func:`board_inventory_lock` (``hermes_cli.kanban_db_inventory``), which every inventory mutator
+takes and which is always the OUTER lock — inventory lock, then per-board SQLite, never the reverse.
+Schema: tasks, task_links, task_comments, task_events, task_runs, attachments, notify subs.
 """
 
 from __future__ import annotations
@@ -730,34 +733,43 @@ def write_board_metadata(
     """Create/update ``board.json``; unmentioned fields are preserved, ``created_at``
     set on first write. ``project_id``/``default_workdir``/``land_target``/
     ``land_verify``: ``None`` = unchanged, "" = clear (``project_id`` is not
-    validated here)."""
+    validated here).
+
+    Held under :func:`board_inventory_lock`: writing ``board.json`` for an absent
+    slug is what makes that board appear to :func:`list_boards`, so it is an
+    inventory change even though the common case only edits an existing board.
+    The hold wraps the body in place rather than delegating to a private helper
+    with a copied signature — a copied signature silently drops any field added
+    to this one later.
+    """
     _assert_not_delegated_child_mutation()
-    slug = _slug_or_default(board)
-    meta = read_board_metadata(slug)
-    # db_path is derived on every read; never persist it into board.json.
-    meta.pop("db_path", None)
-    if name is not None:
-        meta["name"] = str(name).strip() or _default_board_display_name(slug)
-    for key, value in (("description", description), ("icon", icon), ("color", color)):
-        if value is not None:
-            meta[key] = str(value)
-    if archived is not None:
-        meta["archived"] = bool(archived)
-    for key, value in (
-        ("default_workdir", default_workdir), ("project_id", project_id),
-        ("land_target", land_target), ("land_verify", land_verify),
-    ):
-        if value is not None:
-            meta[key] = str(value) if value else None
-    if not meta.get("created_at"):
-        meta["created_at"] = int(time.time())
-    path = board_metadata_path(slug)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(
-        json.dumps(meta, indent=2, ensure_ascii=False) + "\n", encoding="utf-8",
-    )
-    meta["db_path"] = str(kanban_db_path(slug))
-    return meta
+    with board_inventory_lock():
+        slug = _slug_or_default(board)
+        meta = read_board_metadata(slug)
+        # db_path is derived on every read; never persist it into board.json.
+        meta.pop("db_path", None)
+        if name is not None:
+            meta["name"] = str(name).strip() or _default_board_display_name(slug)
+        for key, value in (("description", description), ("icon", icon), ("color", color)):
+            if value is not None:
+                meta[key] = str(value)
+        if archived is not None:
+            meta["archived"] = bool(archived)
+        for key, value in (
+            ("default_workdir", default_workdir), ("project_id", project_id),
+            ("land_target", land_target), ("land_verify", land_verify),
+        ):
+            if value is not None:
+                meta[key] = str(value) if value else None
+        if not meta.get("created_at"):
+            meta["created_at"] = int(time.time())
+        path = board_metadata_path(slug)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(
+            json.dumps(meta, indent=2, ensure_ascii=False) + "\n", encoding="utf-8",
+        )
+        meta["db_path"] = str(kanban_db_path(slug))
+        return meta
 
 
 def create_board(
@@ -765,14 +777,19 @@ def create_board(
     icon: Optional[str] = None, color: Optional[str] = None, default_workdir: Optional[str] = None,
     project_id: Optional[str] = None,
 ) -> dict:
-    """Create board dir + DB + metadata (``mkdir -p`` semantics: existing board returns its metadata)."""
+    """Create board dir + DB + metadata (``mkdir -p`` semantics: existing board returns its metadata).
+
+    Metadata and DB creation happen in ONE inventory hold so a reader holding the
+    lock never observes a metadata-only half-board.
+    """
     normed = _require_slug(slug)
-    meta = write_board_metadata(
-        normed, name=name, description=description, icon=icon, color=color,
-        default_workdir=default_workdir, project_id=project_id,
-    )
-    # Touch the DB so list_boards() sees it immediately.
-    init_db(board=normed)
+    with board_inventory_lock():
+        meta = write_board_metadata(
+            normed, name=name, description=description, icon=icon, color=color,
+            default_workdir=default_workdir, project_id=project_id,
+        )
+        # Touch the DB so list_boards() sees it immediately.
+        init_db(board=normed)
     return meta
 
 
@@ -802,37 +819,43 @@ def list_boards(*, include_archived: bool = True) -> list[dict]:
 
 def remove_board(slug: str, *, archive: bool = True) -> dict:
     """Archive (to ``boards/_archived/<slug>-<ts>/``) or delete a board;
-    ``default`` cannot be removed. Returns ``{"slug", "action", "new_path"}``."""
+    ``default`` cannot be removed. Returns ``{"slug", "action", "new_path"}``.
+
+    The existence check and the rename/rmtree are one :func:`board_inventory_lock`
+    hold, so the board cannot be recreated between them and a fleet reader never
+    enumerates a directory that is about to vanish.
+    """
     _assert_not_delegated_child_mutation()
     normed = _require_slug(slug)
     if normed == DEFAULT_BOARD:
         raise ValueError("the 'default' board cannot be removed")
-    d = board_dir(normed)
-    if not d.exists():
-        raise ValueError(f"board {normed!r} does not exist")
+    with board_inventory_lock():
+        d = board_dir(normed)
+        if not d.exists():
+            raise ValueError(f"board {normed!r} does not exist")
 
-    # If the user removed the currently-active board, revert to default.
-    if get_current_board() == normed:
-        clear_current_board()
+        # If the user removed the currently-active board, revert to default.
+        if get_current_board() == normed:
+            clear_current_board()
 
-    # A concurrent connect() after the rename recreates an empty DB file; drop
-    # the init cache first so the schema pass re-runs on it.
-    _INITIALIZED_PATHS.discard(str((d / "kanban.db").resolve()))
+        # A concurrent connect() after the rename recreates an empty DB file; drop
+        # the init cache first so the schema pass re-runs on it.
+        _INITIALIZED_PATHS.discard(str((d / "kanban.db").resolve()))
 
-    if archive:
-        archive_root = boards_root() / "_archived"
-        archive_root.mkdir(parents=True, exist_ok=True)
-        ts = int(time.time())
-        target = archive_root / f"{normed}-{ts}"
-        suffix = 1
-        while target.exists():  # rapid double-archive
-            target = archive_root / f"{normed}-{ts}-{suffix}"
-            suffix += 1
-        d.rename(target)
-        return {"slug": normed, "action": "archived", "new_path": str(target)}
-    import shutil
-    shutil.rmtree(d)
-    return {"slug": normed, "action": "deleted", "new_path": ""}
+        if archive:
+            archive_root = boards_root() / "_archived"
+            archive_root.mkdir(parents=True, exist_ok=True)
+            ts = int(time.time())
+            target = archive_root / f"{normed}-{ts}"
+            suffix = 1
+            while target.exists():  # rapid double-archive
+                target = archive_root / f"{normed}-{ts}-{suffix}"
+                suffix += 1
+            d.rename(target)
+            return {"slug": normed, "action": "archived", "new_path": str(target)}
+        import shutil
+        shutil.rmtree(d)
+        return {"slug": normed, "action": "deleted", "new_path": ""}
 
 
 # --- Data classes ---
@@ -6208,6 +6231,11 @@ def latest_summaries(conn: sqlite3.Connection, task_ids: Iterable[str]) -> dict[
 
 
 # --- Split modules (imported at the tail: they import this module as ``_kb``) ---
+from hermes_cli.kanban_db_inventory import (  # noqa: E402
+    DEFAULT_INVENTORY_LOCK_TIMEOUT_SECONDS,
+    BoardInventoryLockTimeout,
+    board_inventory_lock,
+)
 from hermes_cli.kanban_db_connect import (  # noqa: E402
     _INITIALIZED_PATHS,
     init_db,
