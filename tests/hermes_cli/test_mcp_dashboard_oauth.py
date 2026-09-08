@@ -1,6 +1,7 @@
 """Dashboard HTTP contract for hosted MCP OAuth."""
 
 from unittest.mock import patch
+from urllib.parse import parse_qs, urlencode, urlparse
 
 import pytest
 import hermes_cli.web_server_mcp as _web_server_mcp
@@ -141,3 +142,118 @@ def test_flow_status_does_not_expose_authorization_code():
     assert body["status"] == "approved"
     assert "secret-code" not in response.text
     assert "secret-state" not in response.text
+
+
+# ---------------------------------------------------------------------------
+# client_public_origin: browser-declared callback fallback (t_d40923b6).
+#
+# Behind the web-served Desktop renderer's `/api` proxy (changeOrigin: true),
+# request.base_url is the private loopback backend's own address, not
+# externally reachable — reconstruction from headers alone silently registers
+# a dead callback. The browser-native OAuth caller sends its own
+# window.location.origin as client_public_origin so the callback resolves to
+# somewhere the OAuth provider can actually redirect back to.
+# ---------------------------------------------------------------------------
+
+
+def test_client_public_origin_used_when_no_dashboard_public_url(monkeypatch):
+    """No dashboard.public_url configured (the common case for this spike
+    deployment): client_public_origin must win over request reconstruction,
+    which would otherwise resolve to the loopback backend."""
+    from hermes_cli import web_server
+
+    client = _client()
+    client.post(
+        "/api/mcp/servers",
+        json={"name": "reports", "url": "https://mcp.example/mcp", "auth": "oauth"},
+    )
+
+    def fake_worker(flow, cfg):
+        import asyncio
+
+        query = urlencode({"state": "s1", "redirect_uri": flow.redirect_uri})
+        asyncio.run(flow.publish_authorization_url(f"https://idp.example/authorize?{query}"))
+
+    monkeypatch.setattr(_web_server_mcp, "_run_dashboard_mcp_oauth", fake_worker)
+    with patch("hermes_cli.dashboard_auth.prefix.resolve_public_url", return_value=""):
+        response = client.post(
+            "/api/mcp/servers/reports/auth",
+            params={"client_public_origin": "https://hermes-desktop-dev.jashworth.com"},
+        )
+
+    assert response.status_code == 200
+    body = response.json()
+    flow = _web_server_mcp._mcp_oauth_flows[body["flow_id"]]
+    assert flow.redirect_uri == "https://hermes-desktop-dev.jashworth.com/api/mcp/oauth/callback/reports"
+    authorization_redirect = parse_qs(urlparse(body["authorization_url"]).query)["redirect_uri"]
+    assert authorization_redirect == [flow.redirect_uri]
+    # Never the loopback TestClient default base_url.
+    assert all("testserver" not in redirect for redirect in authorization_redirect)
+    assert all("127.0.0.1" not in redirect for redirect in authorization_redirect)
+
+
+def test_dashboard_public_url_still_wins_over_client_public_origin(monkeypatch):
+    """dashboard.public_url is the operator's authoritative declaration —
+    a browser-supplied origin must never override it."""
+    from hermes_cli import web_server
+
+    client = _client()
+    client.post(
+        "/api/mcp/servers",
+        json={"name": "reports", "url": "https://mcp.example/mcp", "auth": "oauth"},
+    )
+
+    def fake_worker(flow, cfg):
+        import asyncio
+
+        asyncio.run(flow.publish_authorization_url("https://idp.example/authorize?state=s1"))
+
+    monkeypatch.setattr(_web_server_mcp, "_run_dashboard_mcp_oauth", fake_worker)
+    with patch("hermes_cli.dashboard_auth.prefix.resolve_public_url", return_value="https://operator.example"):
+        response = client.post(
+            "/api/mcp/servers/reports/auth",
+            params={"client_public_origin": "https://attacker.example"},
+        )
+
+    assert response.status_code == 200
+    body = response.json()
+    flow = _web_server_mcp._mcp_oauth_flows[body["flow_id"]]
+    assert flow.redirect_uri == "https://operator.example/api/mcp/oauth/callback/reports"
+
+
+def test_malformed_client_public_origin_falls_through_to_reconstruction(monkeypatch):
+    """An injection-suspect or path-carrying client_public_origin is dropped,
+    not trusted — same posture as a malformed dashboard.public_url."""
+    from hermes_cli import web_server
+
+    client = _client()
+    client.post(
+        "/api/mcp/servers",
+        json={"name": "reports", "url": "https://mcp.example/mcp", "auth": "oauth"},
+    )
+
+    def fake_worker(flow, cfg):
+        import asyncio
+
+        asyncio.run(flow.publish_authorization_url("https://idp.example/authorize?state=s1"))
+
+    monkeypatch.setattr(_web_server_mcp, "_run_dashboard_mcp_oauth", fake_worker)
+    for bad_origin in [
+        "javascript:alert(1)",
+        "https://evil.example/some/path",
+        'https://evil.example/"injected',
+        "not-a-url",
+    ]:
+        client.post("/api/mcp/servers", json={"name": "r2", "url": "https://mcp.example/mcp", "auth": "oauth"})
+        with patch("hermes_cli.dashboard_auth.prefix.resolve_public_url", return_value=""):
+            response = client.post(
+                "/api/mcp/servers/r2/auth",
+                params={"client_public_origin": bad_origin},
+            )
+        assert response.status_code == 200
+        body = response.json()
+        flow = _web_server_mcp._mcp_oauth_flows[body["flow_id"]]
+        assert "evil.example" not in flow.redirect_uri, f"malformed origin {bad_origin!r} leaked into redirect_uri"
+        assert "javascript" not in flow.redirect_uri
+        client.delete("/api/mcp/servers/r2")
+        _web_server_mcp._mcp_oauth_flows.pop(body["flow_id"], None)

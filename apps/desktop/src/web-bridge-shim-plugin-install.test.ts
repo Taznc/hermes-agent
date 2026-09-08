@@ -162,9 +162,16 @@ describe('web-bridge-shim desktop plugin install door', () => {
   // root, or the plugin installs somewhere the loader never looks and the
   // feature silently does nothing.
   it('routes install and the post-install plugin-root scan to the SAME active profile', async () => {
-    fetchMock
-      .mockResolvedValueOnce(jsonResponse({ ok: true, pluginName: 'w', path: '/h/profiles/coder/desktop-plugins/w' }))
-      .mockResolvedValueOnce(jsonResponse({ path: '/h/profiles/coder/desktop-plugins' }))
+    const responses = [
+      jsonResponse({ ok: true, pluginName: 'w', path: '/h/profiles/coder/desktop-plugins/w' }),
+      jsonResponse({ path: '/h/profiles/coder/desktop-plugins' })
+    ]
+
+    fetchMock.mockImplementation((url: URL) =>
+      Promise.resolve(
+        String(url).includes('/api/local-models/status') ? jsonResponse({ enabled: false }) : responses.shift()
+      )
+    )
 
     const { installDesktopPlugin, desktopPluginsRoot } = await loadShim('coder')
 

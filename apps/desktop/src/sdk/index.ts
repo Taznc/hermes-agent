@@ -645,21 +645,34 @@ export const host = {
    *  installing its catalog entry first. Uses the same OAuth flow as Settings. */
   completeMcpOAuth: async (options: Parameters<typeof completeMcpDesktopOAuth>[0] & { catalogPreset?: string }) => {
     const profile = capabilityScoped(options.profile)
+    let handedToOAuth = false
 
-    if (options.catalogPreset) {
-      const added = await requestGatewayForAgent<{ ok?: boolean; error?: string }>(
-        profile.connectionId ?? null,
-        profile.profile || 'default',
-        'mcp.servers.add',
-        { name: options.serverName, preset: options.catalogPreset }
-      )
+    try {
+      if (options.catalogPreset) {
+        const added = await requestGatewayForAgent<{ ok?: boolean; error?: string }>(
+          profile.connectionId ?? null,
+          profile.profile || 'default',
+          'mcp.servers.add',
+          { name: options.serverName, preset: options.catalogPreset }
+        )
 
-      if (!added.ok) {
-        throw new Error(added.error || 'Could not add server')
+        if (!added.ok) {
+          throw new Error(added.error || 'Could not add server')
+        }
       }
-    }
 
-    return completeMcpDesktopOAuth({ ...options, profile })
+      handedToOAuth = true
+
+      return await completeMcpDesktopOAuth({ ...options, profile })
+    } catch (error) {
+      // A catalog install can fail before the OAuth helper receives the popup
+      // handle. Until that handoff, this wrapper owns caller-side cleanup.
+      if (!handedToOAuth && options.popupWindow && !options.popupWindow.closed) {
+        options.popupWindow.close()
+      }
+
+      throw error
+    }
   },
 
   /** Navigate the app router (hash routes, e.g. '/command-center?section=system'). */
@@ -1516,16 +1529,16 @@ export type { TitlebarTool } from '@/app/shell/titlebar-controls'
  *  builds without it would route the pin to the ACTIVE gateway. Bot Mode's
  *  Advanced section is the reference consumer. */
 export { SkillsView } from '@/app/skills'
-/** The compact Streamdown preset core uses for tool detail bodies — tighter
- *  typography, tokenized fences/tables, external links routed through the
- *  host. Prefer it over raw `Streamdown` for small in-panel prose so every
- *  surface renders markdown identically. */
-export { CompactMarkdown } from '@/components/chat/compact-markdown'
 /** THE full MCP tab core Settings renders — per-server enable + OAuth sign-in
  *  + API-key setup + live probes, not a checkbox list. Route-decoupled so it
  *  renders anywhere (a plugin dialog); pass a live `gateway` (see
  *  `host.getGateway()`) and an optional `profile` to scope it to one bot. */
 export { McpTab } from '@/app/skills/mcp-tab'
+/** The compact Streamdown preset core uses for tool detail bodies — tighter
+ *  typography, tokenized fences/tables, external links routed through the
+ *  host. Prefer it over raw `Streamdown` for small in-panel prose so every
+ *  surface renders markdown identically. */
+export { CompactMarkdown } from '@/components/chat/compact-markdown'
 /** The oversized Collapse lettering an empty chat is titled with — core writes
  *  "HERMES AGENT" with it, a `chat.empty` contribution writes its own name. */
 export { Wordmark } from '@/components/chat/wordmark'
