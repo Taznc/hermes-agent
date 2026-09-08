@@ -180,16 +180,16 @@ def available_skill_identifiers(profile: str) -> set[str]:
     """Skill identifiers resolvable for *profile*, under ITS home.
 
     Raises :class:`KanbanSkillPreflightError` (``PROFILE_UNAVAILABLE_CODE``)
-    when the profile cannot be authoritatively inspected — fail closed rather
-    than assume the skill is there.
+    when a profile that EXISTS cannot be authoritatively inspected — fail closed
+    rather than assume the skill is there. A profile that does not exist at all
+    is a different case; see :func:`assignee_is_inspectable`.
     """
     from hermes_constants import reset_hermes_home_override, set_hermes_home_override
 
-    from hermes_cli.profiles import get_profile_dir, normalize_profile_name, profile_exists
+    from hermes_cli.profiles import get_profile_dir, normalize_profile_name
 
     try:
         canon = normalize_profile_name(profile)
-        exists = profile_exists(canon)
         profile_home = get_profile_dir(canon)
     except Exception as exc:
         raise KanbanSkillPreflightError(
@@ -197,27 +197,44 @@ def available_skill_identifiers(profile: str) -> set[str]:
             "Skill preflight fails closed rather than assuming the skill is installed.",
             code=PROFILE_UNAVAILABLE_CODE, profile=str(profile),
         ) from exc
-    if not exists or not Path(profile_home).is_dir():
-        raise KanbanSkillPreflightError(
-            f"Cannot verify skills for assignee profile {canon!r}: its profile home "
-            f"({profile_home}) is missing or not readable, so its skill registry cannot be "
-            "inspected. Skill preflight fails closed rather than assuming the skill is "
-            f"installed. Create the profile (`hermes profile create {canon}`) or reassign the card.",
-            code=PROFILE_UNAVAILABLE_CODE, profile=canon,
-        )
     token = set_hermes_home_override(str(profile_home))
     try:
         return _available_identifiers_in_current_home()
-    except KanbanSkillPreflightError:
-        raise
     except Exception as exc:
         raise KanbanSkillPreflightError(
-            f"Cannot verify skills for assignee profile {canon!r}: {exc}. "
-            "Skill preflight fails closed rather than assuming the skill is installed.",
+            f"Cannot verify skills for assignee profile {canon!r}: its skill registry "
+            f"({profile_home}) could not be read ({exc}). Skill preflight fails closed rather "
+            "than assuming the skill is installed.",
             code=PROFILE_UNAVAILABLE_CODE, profile=canon,
         ) from exc
     finally:
         reset_hermes_home_override(token)
+
+
+def assignee_is_inspectable(profile: str) -> bool:
+    """True when *profile* is a live Hermes profile with a real home on disk.
+
+    A non-existent assignee is NOT a preflight failure. The board deliberately
+    accepts assignees that are not (yet) Hermes profiles — control-plane lanes
+    that pull work via ``claim_task``, and profiles created after the card — and
+    the dispatcher already refuses to spawn them (``skipped_nonspawnable``). No
+    worker starts, so there is no init crash for preflight to prevent, and
+    rejecting the card here would break card-then-profile ordering.
+
+    The home directory must exist too: without it there is no registry to read,
+    and an absent home already fails the worker's own ``hermes -p`` startup for
+    reasons that have nothing to do with skills. Fail-closed
+    (``PROFILE_UNAVAILABLE_CODE``) is reserved for a home that EXISTS but cannot
+    be enumerated — the case where a skill might really be there and we must not
+    pretend either way.
+    """
+    try:
+        from hermes_cli.profiles import get_profile_dir, normalize_profile_name, profile_exists
+
+        canon = normalize_profile_name(profile)
+        return bool(profile_exists(canon)) and Path(get_profile_dir(canon)).is_dir()
+    except Exception:
+        return False
 
 
 def missing_skills_for_profile(profile: str, skills: Optional[Iterable[str]]) -> list[str]:
@@ -254,6 +271,8 @@ def preflight_task_skills(profile: Optional[str], skills: Optional[Iterable[str]
         return
     wanted = [str(s).strip() for s in (skills or ()) if str(s).strip()]
     if not wanted:
+        return
+    if not assignee_is_inspectable(profile):
         return
     missing = missing_skills_for_profile(profile, wanted)
     if not missing:

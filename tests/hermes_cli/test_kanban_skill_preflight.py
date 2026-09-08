@@ -357,25 +357,57 @@ def test_disabled_skill_counts_as_unavailable(kanban_home):
 
 
 def test_unavailable_profile_registry_fails_closed_with_a_distinct_code(kanban_home):
-    """A profile that cannot be authoritatively inspected must NOT be assumed to
-    have the skill, and its diagnostic must be distinguishable from a plain
-    missing skill so an operator can tell "wrong profile" from "install this"."""
+    """A profile that EXISTS but whose skill registry cannot be read must NOT be
+    assumed to have the skill, and its diagnostic must be distinguishable from a
+    plain missing skill so an operator can tell "cannot check" from "install this"."""
+    import hermes_cli.kanban_skill_preflight as preflight_mod
     from hermes_cli import kanban_db, kanban_db_connect
     from hermes_cli.kanban_skill_preflight import (
         MISSING_CODE, PROFILE_UNAVAILABLE_CODE, KanbanSkillPreflightError,
     )
 
-    with kanban_db_connect.connect_closing() as conn:
-        kanban_db.create_board(slug="default", name="Test")
-        with pytest.raises(KanbanSkillPreflightError) as excinfo:
-            kanban_db.create_task(
-                conn, title="card", assignee="never-created",
-                skills=["github-code-review"],
-            )
+    _make_profile(kanban_home, "claudecode", ["github-code-review"])
+
+    def _boom():
+        raise OSError("permission denied")
+
+    original = preflight_mod._available_identifiers_in_current_home
+    preflight_mod._available_identifiers_in_current_home = _boom
+    try:
+        with kanban_db_connect.connect_closing() as conn:
+            kanban_db.create_board(slug="default", name="Test")
+            with pytest.raises(KanbanSkillPreflightError) as excinfo:
+                kanban_db.create_task(
+                    conn, title="card", assignee="claudecode",
+                    skills=["github-code-review"],
+                )
+    finally:
+        preflight_mod._available_identifiers_in_current_home = original
+
     error = excinfo.value
     assert error.code == PROFILE_UNAVAILABLE_CODE
     assert error.code != MISSING_CODE
-    assert "never-created" in str(error)
+    assert "claudecode" in str(error)
+    # No row written on a fail-closed refusal either.
+    with kanban_db_connect.connect_closing() as conn:
+        assert kanban_db.list_tasks(conn) == []
+
+
+def test_an_assignee_that_is_not_a_profile_is_not_rejected(kanban_home):
+    """The board deliberately accepts assignees that are not (yet) Hermes
+    profiles — control-plane lanes that pull via claim_task, and profiles
+    created after the card. The dispatcher already refuses to spawn those
+    (skipped_nonspawnable), so no worker starts and there is no init crash to
+    prevent; rejecting here would break card-then-profile ordering."""
+    from hermes_cli import kanban_db, kanban_db_connect
+
+    with kanban_db_connect.connect_closing() as conn:
+        kanban_db.create_board(slug="default", name="Test")
+        task_id = kanban_db.create_task(
+            conn, title="lane card", assignee="orion-cc", skills=["some-skill"],
+        )
+        assert kanban_db.get_task(conn, task_id).assignee == "orion-cc"
+
 
 
 def test_categorized_and_frontmatter_names_both_resolve(kanban_home):
