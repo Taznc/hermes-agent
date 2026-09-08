@@ -314,6 +314,33 @@ def test_offline_remote_still_commits_and_reports_push_failure(
     assert result.commit_sha == _head(worktree)
 
 
+def test_existing_unpushed_commit_is_pushed_when_remote_tracking_refs_are_empty(
+    repo: Path, worktree: Path
+) -> None:
+    """A remote can be CONFIGURED with no cached tracking refs (never fetched,
+    or the branch was pushed with ``--no-track``). That is ambiguous, not
+    proof nothing is unpushed — treating it as "nothing to push" silently
+    drops a real local commit."""
+    (worktree / "feature.py").write_text("value = 1\n", encoding="utf-8")
+    _git("add", "-A", cwd=worktree)
+    _git("commit", "-m", "worker commit", cwd=worktree)
+    existing = _head(worktree)
+    # Simulate "no cached tracking refs" without touching the remote itself:
+    # delete the one local remote-tracking ref for this repo's own origin.
+    _git("update-ref", "-d", "refs/remotes/origin/main", cwd=worktree, check=False)
+    assert _git(
+        "for-each-ref", "--format=%(refname)", "refs/remotes", cwd=worktree
+    ).strip() == "", "precondition: no cached remote-tracking refs"
+    assert _remote_branch_head(repo, "wt/t_demo") is None
+
+    result = kp.preserve_worktree(worktree, "wt/t_demo")
+
+    assert result.status == "preserved", result
+    assert result.pushed is True
+    assert result.commit_sha == existing
+    assert _remote_branch_head(repo, "wt/t_demo") == existing
+
+
 def test_repo_without_a_remote_commits_and_reports_no_remote(
     tmp_path: Path
 ) -> None:
@@ -337,8 +364,118 @@ def test_repo_without_a_remote_commits_and_reports_no_remote(
 
 
 # ---------------------------------------------------------------------------
-# Branch / ownership safety
+# Nested gitignore
 # ---------------------------------------------------------------------------
+
+
+def test_nested_gitignored_files_inside_an_expanded_directory_are_excluded(
+    repo: Path, worktree: Path
+) -> None:
+    """An untracked directory collapses to one ``dir/`` candidate in
+    ``git status``; expanding it must still respect a ``.gitignore`` nested
+    INSIDE that directory, not just top-level ignore rules."""
+    pkg = worktree / "pkg"
+    pkg.mkdir()
+    (pkg / ".gitignore").write_text(".env\n", encoding="utf-8")
+    (pkg / ".env").write_text("SECRET=1\n", encoding="utf-8")
+    (pkg / "safe.py").write_text("x = 1\n", encoding="utf-8")
+
+    result = kp.preserve_worktree(worktree, "wt/t_demo")
+
+    assert result.status == "preserved", result
+    files = _git("show", "--name-only", "--format=", "HEAD", cwd=worktree).split()
+    assert "pkg/safe.py" in files
+    assert "pkg/.env" not in files
+
+
+# ---------------------------------------------------------------------------
+# Credential-scan availability
+# ---------------------------------------------------------------------------
+
+
+def test_credential_scan_being_unavailable_fails_closed(
+    repo: Path, worktree: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """When the redactor dependency cannot be imported, the scan result is
+    ambiguous, not \"clean\" — a real secret must not slip through because the
+    safety dependency happened to be unavailable."""
+    (worktree / "notes.md").write_text(
+        "deploy key: ghp_" + "A" * 36 + "\n", encoding="utf-8"
+    )
+    before = _head(worktree)
+    monkeypatch.setattr(kp, "_contains_credential", lambda path: None)
+
+    result = kp.preserve_worktree(worktree, "wt/t_demo")
+
+    assert result.status == "unsafe", result
+    assert result.reason == "credential_scan_unavailable"
+    assert _head(worktree) == before
+    assert _git("status", "--porcelain", cwd=worktree).strip() != ""
+
+
+# ---------------------------------------------------------------------------
+# Push exceptions must not lose the local commit SHA
+# ---------------------------------------------------------------------------
+
+
+def test_a_git_timeout_during_push_still_reports_the_local_commit(
+    repo: Path, worktree: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A push that times out must never look like the commit never happened —
+    the local SHA is real and must survive into the result."""
+    import subprocess as _subprocess
+
+    (worktree / "mine.txt").write_text("mine\n", encoding="utf-8")
+    real_run = _subprocess.run
+
+    def _flaky_run(args, **kwargs):
+        if "push" in args:
+            raise _subprocess.TimeoutExpired(cmd=args, timeout=60)
+        return real_run(args, **kwargs)
+
+    monkeypatch.setattr(kp.subprocess, "run", _flaky_run)
+
+    result = kp.preserve_worktree(worktree, "wt/t_demo")
+
+    assert result.status == "preserved", result
+    assert result.commit_sha == _head(worktree)
+    assert result.pushed is False
+    assert result.push_error
+    assert "timed out" in result.push_error
+
+
+# ---------------------------------------------------------------------------
+# Lock: fail closed when exclusion cannot be established, self-heal on stale
+# ---------------------------------------------------------------------------
+
+
+def test_lock_fails_closed_when_the_git_dir_is_unresolvable(
+    worktree: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """If exclusion cannot even be established, proceeding unlocked IS the
+    race this guards against — it must refuse, not silently "always acquire"."""
+    monkeypatch.setattr(kp, "_git_out", lambda *a, **k: None)
+
+    with kp._preserve_lock(worktree, "t_demo") as acquired:
+        assert acquired is False
+
+
+def test_a_lock_left_by_a_dead_process_is_stolen_not_left_stuck_forever(
+    worktree: Path,
+) -> None:
+    """A lock file naming a pid that is no longer alive must not permanently
+    block preservation — this lock guards a best-effort snapshot, not
+    repository correctness, so a crashed holder's lock is reclaimable."""
+    git_dir = kp._git_out(worktree, "rev-parse", "--path-format=absolute", "--git-dir")
+    lock_path = Path(git_dir) / "hermes-kanban-preserve-t_demo.lock"
+    # A pid essentially guaranteed to be dead.
+    lock_path.write_text("999999999", encoding="utf-8")
+
+    with kp._preserve_lock(worktree, "t_demo") as acquired:
+        assert acquired is True
+
+
+
 
 
 def test_detached_head_is_refused(repo: Path, worktree: Path) -> None:

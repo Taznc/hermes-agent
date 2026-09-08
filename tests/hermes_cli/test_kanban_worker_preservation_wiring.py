@@ -45,8 +45,8 @@ def calls(monkeypatch: pytest.MonkeyPatch) -> list[tuple]:
     """Record every ``preserve_task_work`` invocation, without running it."""
     seen: list[tuple] = []
 
-    def _spy(conn, task_id, *, expected_run_id=None):
-        seen.append((task_id, expected_run_id))
+    def _spy(conn, task_id, *, expected_run_id=None, known_worker_pid=None):
+        seen.append((task_id, expected_run_id, known_worker_pid))
         return kp.PreserveResult(status="nothing_to_preserve")
 
     monkeypatch.setattr(kp, "preserve_task_work", _spy)
@@ -76,7 +76,7 @@ def test_complete_task_preserves_before_cleanup(kanban_home: Path, calls: list) 
         _task(conn, "t_c1")
         kb.complete_task(conn, "t_c1", summary="done")
 
-    assert ("t_c1", None) in [(t, r) for (t, r) in calls]
+    assert ("t_c1", None, None) in [(t, r, p) for (t, r, p) in calls]
 
 
 def test_request_review_preserves(kanban_home: Path, calls: list) -> None:
@@ -84,7 +84,7 @@ def test_request_review_preserves(kanban_home: Path, calls: list) -> None:
         _task(conn, "t_r1", run_id=None)
         kb.request_review(conn, "t_r1", summary="please review", force=True)
 
-    assert any(t == "t_r1" for (t, _) in calls)
+    assert any(t == "t_r1" for (t, _, _) in calls)
 
 
 def test_block_task_preserves(kanban_home: Path, calls: list) -> None:
@@ -92,7 +92,7 @@ def test_block_task_preserves(kanban_home: Path, calls: list) -> None:
         _task(conn, "t_b1")
         kb.block_task(conn, "t_b1", reason="need input", kind="needs_input")
 
-    assert any(t == "t_b1" for (t, _) in calls)
+    assert any(t == "t_b1" for (t, _, _) in calls)
 
 
 def test_archive_task_preserves(kanban_home: Path, calls: list) -> None:
@@ -100,7 +100,57 @@ def test_archive_task_preserves(kanban_home: Path, calls: list) -> None:
         _task(conn, "t_a1", status="ready")
         kb.archive_task(conn, "t_a1")
 
-    assert any(t == "t_a1" for (t, _) in calls)
+    assert any(t == "t_a1" for (t, _, _) in calls)
+
+
+# ---------------------------------------------------------------------------
+# Ownership pid must be captured BEFORE the lifecycle UPDATE clears it
+# ---------------------------------------------------------------------------
+
+
+def test_complete_task_passes_the_live_worker_pid_it_captured(
+    kanban_home: Path, calls: list
+) -> None:
+    """``complete_task`` clears ``worker_pid`` to NULL in its own UPDATE, so the
+    pid preservation must gate on has to be captured beforehand — otherwise a
+    completed-while-running task would look ownerless to the safety net."""
+    with kbc.connect_closing() as conn:
+        _task(conn, "t_c2", pid=555)
+        kb.complete_task(conn, "t_c2", summary="done")
+
+    assert ("t_c2", None, 555) in calls
+
+
+def test_block_task_passes_the_live_worker_pid_it_captured(
+    kanban_home: Path, calls: list
+) -> None:
+    with kbc.connect_closing() as conn:
+        _task(conn, "t_b2", pid=556)
+        kb.block_task(conn, "t_b2", reason="need input", kind="needs_input")
+
+    assert ("t_b2", None, 556) in calls
+
+
+def test_request_review_passes_the_live_worker_pid_it_captured(
+    kanban_home: Path, calls: list
+) -> None:
+    with kbc.connect_closing() as conn:
+        _task(conn, "t_r2", pid=557, run_id=None)
+        kb.request_review(conn, "t_r2", summary="please review", force=True)
+
+    assert ("t_r2", None, 557) in calls
+
+
+def test_archive_task_passes_the_live_worker_pid_it_captured(
+    kanban_home: Path, calls: list
+) -> None:
+    """Archive is status-agnostic and never terminates a running worker — the
+    captured pid is the ONLY way preservation can see it is still live."""
+    with kbc.connect_closing() as conn:
+        _task(conn, "t_a2", status="running", pid=558)
+        kb.archive_task(conn, "t_a2")
+
+    assert ("t_a2", None, 558) in calls
 
 
 # ---------------------------------------------------------------------------
@@ -115,7 +165,7 @@ def test_manual_reclaim_preserves_before_releasing_the_claim(
         _task(conn, "t_m1", lock="host:1", pid=None)
         assert kb.reclaim_task(conn, "t_m1", reason="operator") is True
 
-    assert any(t == "t_m1" for (t, _) in calls)
+    assert any(t == "t_m1" for (t, _, _) in calls)
 
 
 def test_stale_claim_release_preserves(
@@ -134,7 +184,7 @@ def test_stale_claim_release_preserves(
         conn.commit()
         kb.release_stale_claims(conn)
 
-    assert any(t == "t_s1" for (t, _) in calls)
+    assert any(t == "t_s1" for (t, _, _) in calls)
 
 
 def test_timed_out_run_preserves_with_its_own_run_id(
@@ -153,7 +203,7 @@ def test_timed_out_run_preserves_with_its_own_run_id(
         conn.commit()
         kbd.enforce_max_runtime(conn)
 
-    assert ("t_t1", 7) in calls
+    assert any(t == "t_t1" and r == 7 for (t, r, _) in calls)
 
 
 def test_dead_worker_sweep_preserves(
@@ -165,7 +215,7 @@ def test_dead_worker_sweep_preserves(
         _task(conn, "t_d1", lock=f"{kb._host_prefix()}997", pid=997, run_id=8)
         kbd._reclaim_dead_workers(conn)
 
-    assert any(t == "t_d1" for (t, _) in calls)
+    assert any(t == "t_d1" for (t, _, _) in calls)
 
 
 # ---------------------------------------------------------------------------

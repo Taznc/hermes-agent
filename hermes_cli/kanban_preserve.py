@@ -76,16 +76,34 @@ class PreserveResult:
 
 
 def _git(cwd: Path, *args: str) -> subprocess.CompletedProcess:
-    """``git -C cwd args``; never raises on a non-zero exit."""
-    return subprocess.run(
-        ["git", "-C", str(cwd), *args],
-        capture_output=True,
-        text=True,
-        encoding="utf-8",
-        errors="replace",
-        timeout=_GIT_TIMEOUT,
-        check=False,
-    )
+    """``git -C cwd args``; never raises — a timeout is folded into a non-zero
+    ``CompletedProcess`` (returncode 124, by shell convention) rather than
+    propagating ``subprocess.TimeoutExpired``. A push that times out after the
+    commit has already landed must still return a normal failed-push result
+    with the commit SHA intact; letting the exception escape here is exactly
+    what previously lost that SHA (and the whole board event) to the
+    catch-all in :func:`preserve_task_work`.
+    """
+    try:
+        return subprocess.run(
+            ["git", "-C", str(cwd), *args],
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=_GIT_TIMEOUT,
+            check=False,
+        )
+    except subprocess.TimeoutExpired as exc:
+        return subprocess.CompletedProcess(
+            args=["git", "-C", str(cwd), *args], returncode=124,
+            stdout="", stderr=f"timed out after {exc.timeout}s",
+        )
+    except OSError as exc:
+        return subprocess.CompletedProcess(
+            args=["git", "-C", str(cwd), *args], returncode=127,
+            stdout="", stderr=str(exc),
+        )
 
 
 def _git_out(cwd: Path, *args: str) -> Optional[str]:
@@ -101,12 +119,25 @@ def _has_unpushed_commits(worktree: Path) -> bool:
     Deliberately the same predicate ``_cleanup_worktree_workspace`` uses to
     refuse removal, so a successful preservation is exactly what makes cleanup
     safe. Fails SAFE toward True: unknown state means there may be work.
+
+    A remote being CONFIGURED but having no cached tracking refs (never
+    fetched, or a branch pushed with ``--no-track``) is ambiguous, not proof
+    that nothing is unpushed — only the true absence of any remote at all
+    settles that. Treating an empty ``refs/remotes`` as "nothing to push"
+    whenever a remote exists silently drops real commits (see the reviewer
+    finding on this card): a configured-but-uncached remote must still be
+    tried.
     """
+    remotes = _git(worktree, "remote")
+    if remotes.returncode != 0:
+        return True
+    if not (remotes.stdout or "").strip():
+        return False  # no remote at all: nothing to be unpushed against
     remote_refs = _git(worktree, "for-each-ref", "--format=%(refname)", "refs/remotes")
     if remote_refs.returncode != 0:
         return True
     if not (remote_refs.stdout or "").strip():
-        return False  # no remote-tracking refs: nothing to be unpushed against
+        return True  # a remote IS configured but we have no cached baseline
     unpushed = _git(worktree, "log", "--oneline", "HEAD", "--not", "--remotes")
     if unpushed.returncode != 0:
         return True
@@ -145,8 +176,18 @@ def _dirty_paths(worktree: Path) -> Optional[list[str]]:
 
 def _expand_candidates(worktree: Path, paths: list[str]) -> list[str]:
     """Expand git's directory-collapsed untracked entries (``dir/``) into the
-    real files underneath, so a guard can never be evaded by collapsing."""
+    real files underneath, so a guard can never be evaded by collapsing.
+
+    Files inside an expanded directory can themselves be gitignored (a
+    ``.gitignore`` nested inside the collapsed directory, or a pattern that
+    only matches once the directory is walked) — ``git status`` never lists
+    them as top-level candidates, but expansion can surface them as children.
+    Those are filtered out via ``git check-ignore`` so the AC's "gitignored
+    files remain excluded" holds for descendants too, not just top-level
+    entries.
+    """
     expanded: list[str] = []
+    to_check: list[str] = []
     for path in paths:
         if not path.endswith("/"):
             expanded.append(path)
@@ -157,7 +198,20 @@ def _expand_candidates(worktree: Path, paths: list[str]) -> list[str]:
             continue
         for child in sorted(base.rglob("*")):
             if child.is_file() and not child.is_symlink():
-                expanded.append(child.relative_to(worktree).as_posix())
+                to_check.append(child.relative_to(worktree).as_posix())
+    if to_check:
+        ignored_result = subprocess.run(
+            ["git", "-C", str(worktree), "check-ignore", "--stdin", "-z"],
+            input="\0".join(to_check) + "\0",
+            capture_output=True, text=True, encoding="utf-8", errors="replace",
+            timeout=_GIT_TIMEOUT, check=False,
+        )
+        ignored_set = {
+            p for p in (ignored_result.stdout or "").split("\0") if p
+        }
+        expanded.extend(p for p in to_check if p not in ignored_set)
+    else:
+        expanded.extend(to_check)
     return expanded
 
 
@@ -189,14 +243,17 @@ def _looks_like_secret_filename(path: str) -> bool:
     )
 
 
-def _contains_credential(file_path: Path) -> bool:
-    """True when the redactor finds a credential in *file_path*'s text.
+def _contains_credential(file_path: Path) -> Optional[bool]:
+    """Whether the redactor finds a credential in *file_path*'s text.
 
-    Reuses ``agent.redact`` rather than a second pattern list so the
-    preservation guard and every other Hermes safety boundary agree on what a
-    credential looks like. ``code_file=True`` keeps ordinary source constants
-    (``MAX_TOKENS=...``, test fixtures) from tripping it; prefix-matched real
-    credentials, private-key blocks and JWTs still do.
+    ``None`` means the scan could not run at all (redactor import failed) —
+    distinct from ``False`` (scanned, clean) so the caller can fail CLOSED on
+    an unavailable safety dependency instead of silently treating "could not
+    scan" as "safe". Reuses ``agent.redact`` rather than a second pattern
+    list so the preservation guard and every other Hermes safety boundary
+    agree on what a credential looks like. ``code_file=True`` keeps ordinary
+    source constants (``MAX_TOKENS=...``, test fixtures) from tripping it;
+    prefix-matched real credentials, private-key blocks and JWTs still do.
     """
     try:
         if file_path.stat().st_size > _SCAN_READ_LIMIT:
@@ -207,7 +264,7 @@ def _contains_credential(file_path: Path) -> bool:
     try:
         from agent.redact import redact_sensitive_text
     except Exception:
-        return False
+        return None
     return redact_sensitive_text(text, force=True, code_file=True) != text
 
 
@@ -246,11 +303,19 @@ def _check_content_safety(
                 status="unsafe", reason="oversized",
                 detail=f"snapshot exceeds {max_total_bytes} bytes at {rel}",
             )
-        if full.is_file() and not full.is_symlink() and _contains_credential(full):
-            return PreserveResult(
-                status="unsafe", reason="suspected_secret",
-                detail=f"{rel} contains what looks like a credential",
-            )
+        if full.is_file() and not full.is_symlink():
+            scan = _contains_credential(full)
+            if scan is None:
+                return PreserveResult(
+                    status="unsafe", reason="credential_scan_unavailable",
+                    detail=f"{rel} could not be scanned for credentials "
+                           f"(the safety dependency is unavailable)",
+                )
+            if scan:
+                return PreserveResult(
+                    status="unsafe", reason="suspected_secret",
+                    detail=f"{rel} contains what looks like a credential",
+                )
     return None
 
 
@@ -279,6 +344,51 @@ def _resolve_push_remote(worktree: Path, branch: str) -> Optional[str]:
     return remotes[0] if len(remotes) == 1 else None
 
 
+def _stale_pid_lock(lock_path: Path) -> bool:
+    """True when *lock_path* names a pid that is no longer alive (or the file
+    is unreadable/corrupt, which is treated the same as abandoned)."""
+    try:
+        content = lock_path.read_text(encoding="ascii").strip()
+        pid = int(content)
+    except (OSError, ValueError):
+        return True
+    return not _pid_alive(pid)
+
+
+def _acquire_pid_lock(lock_path: Path) -> bool:
+    """Exclusive lock via atomic file creation (``O_CREAT | O_EXCL``).
+
+    Portable across POSIX and Windows with no ``fcntl``/``msvcrt`` split —
+    both platforms make ``open(O_EXCL)`` a single atomic syscall, so there is
+    no platform branch and no degraded "always acquired" fallback. Self-
+    healing: a lock left behind by a process that has since died is stolen
+    rather than left to block preservation forever, since this lock guards a
+    best-effort snapshot, not repository correctness. The steal path has a
+    narrow TOCTOU (two callers could both observe staleness at once); the
+    worst outcome is two safety commits, never lost work, which matches the
+    existing tolerance for the concurrency guarantee on a crash-recovery edge
+    case.
+    """
+    try:
+        fd = os.open(str(lock_path), os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+    except FileExistsError:
+        if not _stale_pid_lock(lock_path):
+            return False
+        with contextlib.suppress(OSError):
+            lock_path.unlink()
+        try:
+            fd = os.open(str(lock_path), os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+        except OSError:
+            return False
+    except OSError:
+        return False
+    try:
+        os.write(fd, str(os.getpid()).encode("ascii"))
+    finally:
+        os.close(fd)
+    return True
+
+
 @contextlib.contextmanager
 def _preserve_lock(worktree: Path, task_id: Optional[str]) -> Iterator[bool]:
     """Hold the per-worktree preservation lock, yielding whether it was taken.
@@ -291,41 +401,25 @@ def _preserve_lock(worktree: Path, task_id: Optional[str]) -> Iterator[bool]:
     The lock file lives in the worktree's own git dir, so it is per-worktree
     (never shared across tasks the way ``refs/stash`` is) and disappears with
     the worktree. Non-blocking: a busy lock means another preserver already
-    owns this work, and waiting for it would only duplicate the outcome.
-    ``fcntl`` is POSIX-only; where it is unavailable the lock degrades to
-    "always acquired", matching the pre-existing single-preserver behaviour on
-    that platform rather than blocking preservation entirely.
+    owns this work, and waiting for it would only duplicate the outcome. When
+    exclusion cannot even be established (the git dir is unresolvable), that
+    fails CLOSED — proceeding unlocked is exactly the race this guards
+    against, not a safe default.
     """
-    try:
-        import fcntl
-    except ImportError:  # pragma: no cover - Windows
-        yield True
-        return
     git_dir = _git_out(worktree, "rev-parse", "--path-format=absolute", "--git-dir")
     if not git_dir:
-        yield True
+        yield False
         return
     name = f"hermes-kanban-preserve-{task_id or 'worktree'}.lock"
     lock_path = Path(git_dir) / name
-    fd = None
+    if not _acquire_pid_lock(lock_path):
+        yield False
+        return
     try:
-        fd = os.open(str(lock_path), os.O_CREAT | os.O_RDWR, 0o600)
-        try:
-            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-        except OSError:
-            yield False
-            return
-        try:
-            yield True
-        finally:
-            with contextlib.suppress(OSError):
-                fcntl.flock(fd, fcntl.LOCK_UN)
-    except OSError:
         yield True
     finally:
-        if fd is not None:
-            with contextlib.suppress(OSError):
-                os.close(fd)
+        with contextlib.suppress(OSError):
+            lock_path.unlink()
 
 
 def preserve_worktree(
@@ -441,7 +535,9 @@ def _pid_alive(pid: int) -> bool:
     return bool(impl(pid))
 
 
-def _ownership_skip(row, expected_run_id: Optional[int]) -> Optional[PreserveResult]:
+def _ownership_skip(
+    row, expected_run_id: Optional[int], *, worker_pid: Optional[int] = None,
+) -> Optional[PreserveResult]:
     """Fail-closed ownership gate: ``None`` to proceed, else the skip verdict.
 
     Two independent ways this call can be the wrong one to snapshot:
@@ -452,6 +548,15 @@ def _ownership_skip(row, expected_run_id: Optional[int]) -> Optional[PreserveRes
     * **Live worker.** While the owning PID is alive, only that process may
       snapshot; anyone else races the worker's own editor and can capture a
       file mid-write.
+
+    ``worker_pid`` lets a caller supply the pid it captured BEFORE its own
+    lifecycle UPDATE cleared ``tasks.worker_pid`` to NULL in the same
+    transaction (``complete_task``/``block_task``/``request_review``/
+    ``archive_task`` all do this) — reading the row's live column here would
+    otherwise see NULL and wrongly treat an archived-while-running task as
+    ownerless. ``None`` (the default) falls back to the row's own column,
+    which is correct for callers that preserve BEFORE clearing it (the
+    reclaim paths).
     """
     if expected_run_id is not None:
         current = row["current_run_id"]
@@ -460,7 +565,7 @@ def _ownership_skip(row, expected_run_id: Optional[int]) -> Optional[PreserveRes
                 status="skipped", reason="stale_run",
                 detail=f"expected run {expected_run_id}, task is on {current}",
             )
-    pid = row["worker_pid"]
+    pid = worker_pid if worker_pid is not None else row["worker_pid"]
     if pid and int(pid) != os.getpid() and _pid_alive(int(pid)):
         return PreserveResult(
             status="skipped", reason="worker_alive",
@@ -504,6 +609,7 @@ def _record(conn, task_id: str, result: PreserveResult, run_id: Optional[int]) -
 
 def preserve_task_work(
     conn, task_id: str, *, expected_run_id: Optional[int] = None,
+    known_worker_pid: Optional[int] = None,
 ) -> PreserveResult:
     """Preserve one task's own worktree, gated on ownership, and record it.
 
@@ -511,16 +617,61 @@ def preserve_task_work(
     finds nothing to preserve, and a genuinely concurrent one stands down on
     the worktree lock. Never raises — a preservation failure must not block the
     completion/reclaim it is attached to.
+
+    ``known_worker_pid``: pass the pid the caller captured BEFORE its own
+    lifecycle UPDATE cleared ``tasks.worker_pid`` in the same transaction
+    (``complete_task``, ``block_task``, ``request_review``, ``archive_task``
+    all clear it as part of the terminal-status write). Without this, the
+    ownership check below reads a column that already says NULL and treats
+    a still-running worker as absent — letting preservation race and commit
+    over its half-written tree. Omit it (the reclaim paths do) when the
+    caller preserves BEFORE any column clear, so the row's own value is
+    still live and correct.
+
+    A genuinely unexpected exception (not the git-timeout/OSError cases
+    ``_git`` already folds into an ordinary failed push) still needs its own
+    ``work_preservation_failed`` event: silently returning a bare ``failed``
+    result here means a human auditing the board sees nothing happened, when
+    in fact preservation ran and lost. Best-effort HEAD lookup so a commit
+    that landed before the exception is still named in the record.
     """
     try:
-        return _preserve_task_work(conn, task_id, expected_run_id=expected_run_id)
+        return _preserve_task_work(
+            conn, task_id, expected_run_id=expected_run_id,
+            known_worker_pid=known_worker_pid,
+        )
     except Exception as exc:  # never block a lifecycle transition
         _log.warning("kanban: preservation errored for task %s: %s", task_id, exc)
-        return PreserveResult(status="failed", reason="preservation_error")
+        result = PreserveResult(
+            status="failed", reason="preservation_error",
+            detail=str(exc)[:500] or None,
+            commit_sha=_best_effort_head_sha(conn, task_id),
+        )
+        with contextlib.suppress(Exception):
+            _record(conn, task_id, result, None)
+        return result
+
+
+def _best_effort_head_sha(conn, task_id: str) -> Optional[str]:
+    """The worktree's current HEAD, or ``None`` on any failure — used only to
+    enrich an already-failed record, never to make a decision."""
+    try:
+        row = conn.execute(
+            "SELECT workspace_kind, workspace_path FROM tasks WHERE id = ?", (task_id,),
+        ).fetchone()
+        if not row or row["workspace_kind"] != "worktree" or not row["workspace_path"]:
+            return None
+        worktree = Path(row["workspace_path"]).expanduser()
+        if not worktree.is_dir():
+            return None
+        return _git_out(worktree, "rev-parse", "HEAD")
+    except Exception:
+        return None
 
 
 def _preserve_task_work(
     conn, task_id: str, *, expected_run_id: Optional[int],
+    known_worker_pid: Optional[int] = None,
 ) -> PreserveResult:
     cfg = _preservation_config()
     if cfg.get("enabled") is False:
@@ -536,7 +687,20 @@ def _preserve_task_work(
     worktree = Path(row["workspace_path"]).expanduser()
     if not worktree.is_dir():
         return PreserveResult(status="skipped", reason="workspace_missing")
-    skip = _ownership_skip(row, expected_run_id)
+    # Ownership is a claim in the DB, not a fact — a corrupt or aliased row
+    # (two tasks pointing at the same workspace_path) must never let this
+    # call commit and attribute another task's live worktree to task_id. A
+    # legitimate worktree path is unique to its owning task
+    # (``<repo>/.worktrees/<task-id>``), so any OTHER row claiming the exact
+    # same path is definitionally ambiguous and this call stands down.
+    conflict = conn.execute(
+        "SELECT 1 FROM tasks WHERE workspace_kind = 'worktree' "
+        "AND workspace_path = ? AND id != ? LIMIT 1",
+        (row["workspace_path"], task_id),
+    ).fetchone()
+    if conflict is not None:
+        return PreserveResult(status="skipped", reason="workspace_path_conflict")
+    skip = _ownership_skip(row, expected_run_id, worker_pid=known_worker_pid)
     if skip is not None:
         return skip
 

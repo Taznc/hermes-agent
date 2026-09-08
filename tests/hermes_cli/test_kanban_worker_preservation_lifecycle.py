@@ -284,3 +284,115 @@ def test_disabled_by_config_is_an_explicit_skip(
     assert result.status == "skipped", result
     assert result.reason == "disabled"
     assert _git("rev-parse", "HEAD", cwd=wt).strip() == before
+
+
+# ---------------------------------------------------------------------------
+# Cross-task workspace-path aliasing must never let one task commit over
+# another task's live worktree
+# ---------------------------------------------------------------------------
+
+
+def test_two_tasks_aliasing_the_same_workspace_path_refuse_to_preserve(
+    kanban_home: Path, repo: Path
+) -> None:
+    """A corrupt or aliased row (two task ids pointing at the SAME
+    workspace_path) must never let preserving task A commit and push task B's
+    worktree while attributing the event to A."""
+    wt = _make_task(repo, task_id="t_owner")
+    (wt / "work.py").write_text("value = 1\n", encoding="utf-8")
+    with kbc.connect_closing() as conn:
+        kb.create_task(
+            conn, title="alias", assignee="worker",
+            workspace_kind="worktree", workspace_path=str(wt),
+        )
+        conn.execute(
+            "UPDATE tasks SET id = 't_alias', workspace_path = ?, branch_name = ? "
+            "WHERE title = 'alias'",
+            (str(wt), "wt/t_owner"),
+        )
+        conn.commit()
+    before = _git("rev-parse", "HEAD", cwd=wt).strip()
+
+    with kbc.connect_closing() as conn:
+        result_a = kp.preserve_task_work(conn, "t_owner")
+        result_b = kp.preserve_task_work(conn, "t_alias")
+
+    assert result_a.status == "skipped", result_a
+    assert result_a.reason == "workspace_path_conflict"
+    assert result_b.status == "skipped", result_b
+    assert result_b.reason == "workspace_path_conflict"
+    # Neither call touched the worktree.
+    assert _git("rev-parse", "HEAD", cwd=wt).strip() == before
+    assert _events("t_owner", "work_preserved") == []
+    assert _events("t_alias", "work_preserved") == []
+
+
+# ---------------------------------------------------------------------------
+# An unexpected exception must still leave an auditable record
+# ---------------------------------------------------------------------------
+
+
+def test_an_unexpected_exception_still_records_a_failed_event_with_the_sha(
+    kanban_home: Path, repo: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The commit can land locally before something unrelated blows up further
+    down; the record must still show it happened, not go silent."""
+    wt = _make_task(repo)
+    (wt / "work.py").write_text("value = 1\n", encoding="utf-8")
+
+    real_preserve_worktree = kp.preserve_worktree
+
+    def _commit_then_blow_up(worktree, branch, **kwargs):
+        result = real_preserve_worktree(worktree, branch, **kwargs)
+        raise RuntimeError("simulated unexpected failure after commit")
+
+    monkeypatch.setattr(kp, "preserve_worktree", _commit_then_blow_up)
+
+    with kbc.connect_closing() as conn:
+        result = kp.preserve_task_work(conn, "t_demo")
+
+    assert result.status == "failed", result
+    assert result.reason == "preservation_error"
+    # The commit genuinely landed; the record must name it.
+    real_head = _git("rev-parse", "HEAD", cwd=wt).strip()
+    assert result.commit_sha == real_head
+    events = _events("t_demo", "work_preservation_failed")
+    assert len(events) == 1
+    assert events[0]["status"] == "failed"
+    assert events[0]["reason"] == "preservation_error"
+
+
+# ---------------------------------------------------------------------------
+# End-to-end: archiving a RUNNING task with a live worker must not commit
+# over that worker's half-written tree — the ownership pid must be captured
+# before archive_task's own UPDATE clears tasks.worker_pid.
+# ---------------------------------------------------------------------------
+
+
+def test_archiving_a_task_with_a_live_worker_never_commits_its_worktree(
+    kanban_home: Path, repo: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """``archive_task`` is status-agnostic and — unlike complete/block/
+    request_review — never terminates a running worker first. If preservation
+    read ``tasks.worker_pid`` AFTER archive_task's own UPDATE cleared it to
+    NULL, a still-running worker's dirty tree would look ownerless and get
+    committed out from under it."""
+    wt = _make_task(repo, task_id="t_live")
+    (wt / "work.py").write_text("half-written\n", encoding="utf-8")
+    with kbc.connect_closing() as conn:
+        conn.execute(
+            "UPDATE tasks SET status = 'running', worker_pid = 424242 WHERE id = ?",
+            ("t_live",),
+        )
+        conn.commit()
+    before = _git("rev-parse", "HEAD", cwd=wt).strip()
+    monkeypatch.setattr(kp, "_pid_alive", lambda pid: pid == 424242)
+
+    with kbc.connect_closing() as conn:
+        assert kb.archive_task(conn, "t_live") is True
+
+    # No commit, no push — the live worker's tree is untouched.
+    assert _git("rev-parse", "HEAD", cwd=wt).strip() == before
+    assert _events("t_live", "work_preserved") == []
+    # And the worktree directory survives (cleanup also refuses it).
+    assert wt.is_dir()
