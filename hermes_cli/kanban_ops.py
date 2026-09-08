@@ -159,6 +159,10 @@ def _cmd_dispatch(args: argparse.Namespace) -> int:
                  "changes_rounds": rounds}
                 for (tid, prev, who, rounds) in res.auto_escalated_rework
             ],
+            "blocked_review_round_cap": [
+                {"task_id": tid, "changes_rounds": rounds}
+                for (tid, rounds) in res.blocked_review_round_cap
+            ],
             "dispatch_paused": res.dispatch_paused,
         }, ascii=True)
         return 0
@@ -194,6 +198,11 @@ def _cmd_dispatch(args: argparse.Namespace) -> int:
         print(
             f"Escalated review rework after {rounds} change requests: "
             f"{tid} ({previous} -> {who})"
+        )
+    for tid, rounds in res.blocked_review_round_cap:
+        print(
+            f"Blocked at kanban.max_review_rounds={caps.max_review_rounds} "
+            f"after {rounds} change requests: {tid}"
         )
     if res.skipped_unassigned:
         print(f"Skipped (unassigned): {', '.join(res.skipped_unassigned)}")
