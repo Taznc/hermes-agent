@@ -39,8 +39,8 @@ def _read_pool(tmp_path, provider: str) -> list[dict]:
     return payload["credential_pool"][provider]
 
 
-def _exhausted_row(cred_id: str, *, age_seconds: float, priority: int = 0) -> dict:
-    """A 429-exhausted row still inside its cooldown TTL."""
+def _healthy_row(cred_id: str, *, priority: int = 0) -> dict:
+    """A row with no cooldown/error metadata at all."""
     return {
         "id": cred_id,
         "label": cred_id,
@@ -49,6 +49,13 @@ def _exhausted_row(cred_id: str, *, age_seconds: float, priority: int = 0) -> di
         "source": "manual",
         "access_token": f"sk-{cred_id}",
         "base_url": "https://openrouter.ai/api/v1",
+    }
+
+
+def _exhausted_row(cred_id: str, *, age_seconds: float, priority: int = 0) -> dict:
+    """A 429-exhausted row still inside its cooldown TTL."""
+    return {
+        **_healthy_row(cred_id, priority=priority),
         "last_status": "exhausted",
         "last_status_at": time.time() - age_seconds,
         "last_error_code": 429,
@@ -134,6 +141,129 @@ def test_reset_does_not_erase_a_cooldown_recorded_after_the_reset_boundary(pool_
     assert row["last_status"] == "exhausted", "a post-reset 429 was erased"
     assert row["last_error_code"] == 429
     assert _load().has_available() is False
+
+
+def test_a_process_running_before_the_reset_cannot_resurrect_the_cooldown(pool_env):
+    """The reset must hold against writers that were ALREADY running.
+
+    This is the card's literal goal ("while other Hermes processes are
+    running").  A long-lived process loaded the exhausted row before the
+    operator reset; its next ordinary ``_persist()`` carries that pre-reset
+    snapshot.  Nothing about that write is newer information — the operator
+    superseded it — so it must not put the credential back in cooldown.
+    """
+    _write_pool(
+        pool_env,
+        "openrouter",
+        [
+            _exhausted_row("cred-1", age_seconds=60, priority=0),
+            _exhausted_row("cred-2", age_seconds=30, priority=1),
+        ],
+    )
+
+    already_running = _load()  # holds the pre-reset exhausted snapshot
+    assert already_running.has_available() is False
+
+    assert _load().reset_statuses_report().ok is True
+    assert [r["last_status"] for r in _read_pool(pool_env, "openrouter")] == [None, None]
+
+    already_running._persist()  # an ordinary write, later, from the stale process
+
+    for row in _read_pool(pool_env, "openrouter"):
+        assert row["last_status"] is None, "a pre-reset writer resurrected the cooldown"
+        assert row["last_error_code"] is None
+    assert _load().has_available() is True
+
+
+def test_reset_sees_a_cooldown_that_landed_after_this_process_loaded(pool_env):
+    """The reset must not decide what to clear from a stale in-memory snapshot.
+
+    The operator's shell loads a healthy pool; before ``reset`` runs, a live
+    Hermes benches the credential with a 429 and persists it.  Deciding
+    "nothing to clear" from the in-memory rows would return success while the
+    credential is still durably benched — the reset silently doing nothing,
+    which is the whole complaint.
+    """
+    healthy = _healthy_row("cred-1")
+    _write_pool(pool_env, "openrouter", [healthy])
+
+    reset_pool = _load()  # loaded BEFORE the 429 lands
+    assert reset_pool.has_available() is True
+
+    _write_pool(pool_env, "openrouter", [_exhausted_row("cred-1", age_seconds=0)])
+
+    report = reset_pool.reset_statuses_report()
+
+    assert (report.requested, report.cleared) == (1, 1)
+    assert report.ok is True
+    row = _read_pool(pool_env, "openrouter")[0]
+    assert row["last_status"] is None, "a cooldown durable at reset time was not cleared"
+    assert row["last_error_code"] is None
+    assert _load().has_available() is True
+
+
+def test_a_bench_recorded_after_the_reset_still_sticks(pool_env):
+    """The durable floor must not become a permanent do-not-bench flag.
+
+    A reset floor that suppressed cooldowns forever would let a genuinely
+    rate-limited credential be hammered indefinitely, which is exactly the
+    failure the merge guard exists to prevent.  After a reset, the very next
+    429 is newer than the floor and must persist normally.
+    """
+    _write_pool(
+        pool_env,
+        "openrouter",
+        [
+            _exhausted_row("cred-1", age_seconds=60, priority=0),
+            _exhausted_row("cred-2", age_seconds=30, priority=1),
+        ],
+    )
+    assert _load().reset_statuses_report().ok is True
+    assert _load().has_available() is True
+
+    # A live Hermes benches cred-1 again, AFTER the reset.
+    working = _load()
+    entry = next(e for e in working.entries() if e.id == "cred-1")
+    working._mark_exhausted(entry, 429)
+
+    row = next(r for r in _read_pool(pool_env, "openrouter") if r["id"] == "cred-1")
+    assert row["last_status"] == "exhausted", "the reset floor suppressed a later 429"
+    assert row["last_error_code"] == 429
+
+    # And it survives an unrelated later write from another process.
+    _load()._persist()
+    row = next(r for r in _read_pool(pool_env, "openrouter") if r["id"] == "cred-1")
+    assert row["last_status"] == "exhausted"
+
+
+def test_reset_clears_a_credential_this_process_never_loaded(pool_env):
+    """A reset covers every row of the provider, not just the ones in memory.
+
+    Another Hermes added (or re-added) a credential after the operator's shell
+    loaded its pool, and that credential is benched.  It is absent from
+    ``self._entries``, so it rides the write as a disk-only row — and
+    ``hermes auth reset <provider>`` promises the provider, not a snapshot.
+    """
+    _write_pool(pool_env, "openrouter", [_exhausted_row("cred-1", age_seconds=60)])
+    reset_pool = _load()  # only ever sees cred-1
+
+    _write_pool(
+        pool_env,
+        "openrouter",
+        [
+            _exhausted_row("cred-1", age_seconds=60, priority=0),
+            _exhausted_row("cred-2", age_seconds=45, priority=1),  # added meanwhile
+        ],
+    )
+
+    report = reset_pool.reset_statuses_report()
+
+    on_disk = {row["id"]: row for row in _read_pool(pool_env, "openrouter")}
+    assert set(on_disk) == {"cred-1", "cred-2"}, "the unknown row must not be dropped"
+    assert on_disk["cred-2"]["last_status"] is None, "a row absent from memory stayed benched"
+    assert on_disk["cred-1"]["last_status"] is None
+    assert (report.requested, report.cleared) == (2, 2)
+    assert _load().has_available() is True
 
 
 def test_ordinary_write_still_loses_to_a_newer_disk_cooldown(pool_env, monkeypatch):

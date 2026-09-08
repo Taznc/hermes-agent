@@ -881,10 +881,57 @@ _POOL_STATUS_FIELDS = (
     "last_status", "last_status_at", "last_error_code", "last_error_reason", "last_error_message",
     "last_error_reset_at")
 
+_POOL_RESET_FLOOR_KEY = "credential_pool_reset_at"
+
+
+def _pool_reset_floor(auth_store: Dict[str, Any], provider_id: str) -> Optional[float]:
+    """The instant an operator last reset *provider_id*'s pool in this store, if ever."""
+    floors = auth_store.get(_POOL_RESET_FLOOR_KEY)
+    if not isinstance(floors, dict):
+        return None
+    from agent.credential_pool import _parse_absolute_timestamp
+
+    return _parse_absolute_timestamp(floors.get(provider_id))
+
+
+def _record_pool_reset_floor(auth_store: Dict[str, Any], provider_id: str, reset_at: float) -> None:
+    """Persist *reset_at* as the provider's reset floor, advancing monotonically.
+
+    Written inside the caller's ``_auth_store_lock`` transaction, alongside the rows the reset
+    cleared, so the floor and the cleared rows land together or not at all."""
+    current = _pool_reset_floor(auth_store, provider_id)
+    if current is not None and current >= reset_at:
+        return
+    _store_section(auth_store, _POOL_RESET_FLOOR_KEY)[provider_id] = reset_at
+
+
+def _strip_superseded_cooldown(
+    entry: Dict[str, Any], provider_id: str, floor: Optional[float],
+) -> Dict[str, Any]:
+    """Drop cooldown metadata an operator reset already superseded.
+
+    ``hermes auth reset`` is authoritative for everything benched up to the floor, and the floor
+    outlives the reset process — otherwise a Hermes that loaded the exhausted row BEFORE the reset
+    resurrects it with its next ordinary write, which is exactly the "reset does nothing while
+    other processes are running" symptom. A cooldown stamped after the floor is genuinely newer
+    information and is left alone.
+
+    An undated cooldown is treated as superseded: it carries no evidence of postdating the reset,
+    and ``_mark_exhausted`` always stamps ``last_status_at``, so no live bench lands here."""
+    if floor is None or not isinstance(entry, dict):
+        return entry
+    from agent.credential_pool import STATUS_DEAD, STATUS_EXHAUSTED, _parse_absolute_timestamp
+
+    if entry.get("last_status") not in (STATUS_DEAD, STATUS_EXHAUSTED):
+        return entry
+    status_at = _parse_absolute_timestamp(entry.get("last_status_at"))
+    if status_at is not None and status_at > floor:
+        return entry
+    return {**entry, **dict.fromkeys(_POOL_STATUS_FIELDS)}
+
 
 def _merge_disk_cooldown_state(
     entry: Dict[str, Any], disk_entry: Optional[Dict[str, Any]], provider_id: str,
-    *, reset_at: Optional[float] = None,
 ) -> Dict[str, Any]:
     """Keep a newer on-disk cooldown/quarantine over a stale in-memory one.
 
@@ -892,12 +939,9 @@ def _merge_disk_cooldown_state(
     marking the same credential exhausted/dead; without this merge the later rewrite resurrects a
     rate-limited key as healthy and both processes resume hammering it.
 
-    *reset_at* is the wall-clock instant an explicit operator reset (``hermes auth reset``) cleared
-    the in-memory rows. Such a reset carries no ``last_status_at``, so the plain timestamp
-    comparison below reads it as the stalest possible write and restores the very cooldown the
-    operator asked to clear. The operator's intent is authoritative for everything recorded up to
-    that instant — and only for that: a cooldown stamped AFTER the boundary is genuinely newer
-    information and still wins."""
+    This guard only orders two *observations* of a cooldown. Operator intent is ordered separately,
+    by the durable reset floor (``_strip_superseded_cooldown``), which every writer applies after
+    this merge."""
     if not isinstance(disk_entry, dict):
         return entry
     try:
@@ -916,8 +960,6 @@ def _merge_disk_cooldown_state(
             return entry
         disk_ts = _parse_absolute_timestamp(disk_entry.get("last_status_at")) or 0.0
         mem_ts = _parse_absolute_timestamp(entry.get("last_status_at")) or 0.0
-        if reset_at is not None and disk_ts <= reset_at:
-            return entry
         if disk_ts <= mem_ts:
             return entry
         if disk_status == STATUS_EXHAUSTED:
@@ -943,11 +985,15 @@ def write_credential_pool(
     disk but missing from *entries* (added concurrently) are merged back unless in *removed_ids*,
     so a rotation/exhaustion rewrite never drops a concurrent credential.
 
-    *reset_at* marks this write as an explicit operator reset authoritative for cooldowns recorded
-    up to that instant (see ``_merge_disk_cooldown_state``)."""
+    *reset_at* marks this write as an explicit operator reset and records a durable reset floor for
+    the provider. Every write — this one and every later one, from any process — then drops
+    cooldown metadata at or below that floor (see ``_strip_superseded_cooldown``)."""
     removed = {rid for rid in (removed_ids or ()) if rid}
     with _auth_store_lock():
         auth_store = _load_auth_store()
+        if reset_at is not None:
+            _record_pool_reset_floor(auth_store, provider_id, reset_at)
+        floor = _pool_reset_floor(auth_store, provider_id)
         pool = _store_section(auth_store, "credential_pool")
         sanitized = [
             sanitize_borrowed_credential_payload(e, provider_id) if isinstance(e, dict) else e
@@ -957,13 +1003,17 @@ def write_credential_pool(
         existing_by_id = _entry_ids(existing_list)
         new_ids = set(_entry_ids(sanitized))
         merged: List[Dict[str, Any]] = [
-            _merge_disk_cooldown_state(e, existing_by_id.get(e.get("id")), provider_id, reset_at=reset_at)
+            _strip_superseded_cooldown(
+                _merge_disk_cooldown_state(e, existing_by_id.get(e.get("id")), provider_id),
+                provider_id, floor)
             if isinstance(e, dict) else e
             for e in sanitized]
         for disk_entry in existing_list:
             disk_id = disk_entry.get("id") if isinstance(disk_entry, dict) else None
             if disk_id and disk_id not in new_ids and disk_id not in removed:
-                merged.append(sanitize_borrowed_credential_payload(disk_entry, provider_id))
+                merged.append(_strip_superseded_cooldown(
+                    sanitize_borrowed_credential_payload(disk_entry, provider_id),
+                    provider_id, floor))
         pool[provider_id] = merged
         return _save_auth_store(auth_store)
 

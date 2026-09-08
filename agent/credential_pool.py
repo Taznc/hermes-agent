@@ -820,10 +820,13 @@ def _update_root_pool_rows(
     profile's singleton-prune (it has no ``.anthropic_oauth.json`` of its own)
     must not delete the root grant, so ``removed_ids`` is ignored by callers.
 
-    *reset_at* forwards an explicit operator reset boundary to the merge guard.
+    *reset_at* forwards an explicit operator reset boundary; see ``write_credential_pool``.
     """
     with _auth_store_lock(target_path=global_path):
         store = _load_auth_store(global_path)
+        if reset_at is not None:
+            auth_mod._record_pool_reset_floor(store, provider, reset_at)
+        floor = auth_mod._pool_reset_floor(store, provider)
         pool = store.get("credential_pool")
         if not isinstance(pool, dict):
             pool = {}
@@ -837,15 +840,18 @@ def _update_root_pool_rows(
             did = disk_entry.get("id") if isinstance(disk_entry, dict) else None
             incoming = incoming_by_id.get(did) if did else None
             if incoming is None:
-                merged.append(disk_entry)
-                continue
-            updated = auth_mod._merge_disk_cooldown_state(
-                incoming, disk_entry, provider, reset_at=reset_at,
-            )
+                # Not ours to update, but the operator's reset still supersedes
+                # a cooldown recorded before it.
+                updated = auth_mod._strip_superseded_cooldown(disk_entry, provider, floor)
+            else:
+                updated = auth_mod._strip_superseded_cooldown(
+                    auth_mod._merge_disk_cooldown_state(incoming, disk_entry, provider),
+                    provider, floor,
+                )
             if updated != disk_entry:
                 changed = True
             merged.append(updated)
-        if changed:
+        if changed or reset_at is not None:
             pool[provider] = merged
             _save_auth_store(store, target_path=global_path)
 
@@ -2176,32 +2182,47 @@ class CredentialPool:
     def reset_statuses_report(self) -> "ResetStatusReport":
         """Clear cooldown/error metadata and report what actually survived the write.
 
-        The in-memory clear says nothing about the store: a concurrent writer, the
-        disk/newer-state merge guard, or an unwritable auth.json can all leave rows
-        benched.  Callers report to an operator, so the counts are read back from the
-        store the pool persists to rather than from ``self._entries``.
+        Neither end of this is safe to read from ``self._entries``.  What NEEDS
+        clearing lives on disk — another Hermes may have benched a credential
+        since this process loaded — and what actually CLEARED is whatever the
+        store holds after the write, since a concurrent writer or an unwritable
+        auth.json can leave a row benched.  So the boundary is captured first,
+        then both counts come from the store.
         """
         with self._lock:
-            stale = [e for e in self._entries if e.last_status or e.last_status_at or e.last_error_code]
-            if not stale:
-                return ResetStatusReport(requested=0, cleared=0, error=None)
-            # Boundary captured BEFORE the clear: an explicit operator reset is
-            # authoritative for every cooldown recorded up to this instant, but a
-            # later one is genuinely newer information (see _merge_disk_cooldown_state).
+            # Captured BEFORE reading disk: anything benched in the window that
+            # follows is newer than the operator's intent and legitimately
+            # survives (reported as requested-but-not-cleared, never as success).
             reset_at = time.time()
-            stale_ids = {e.id for e in stale}
+            stale_ids = {e.id for e in self._entries
+                         if e.last_status or e.last_status_at or e.last_error_code}
+            stale_ids |= self._stale_ids_on_disk()
+            if not stale_ids:
+                return ResetStatusReport(requested=0, cleared=0, error=None)
             self._entries = [
                 replace(e, **_CLEAR_STATUS) if e.id in stale_ids else e for e in self._entries
             ]
             try:
                 self._persist(reset_at=reset_at)
             except Exception as exc:
-                return ResetStatusReport(requested=len(stale), cleared=0, error=str(exc))
+                return ResetStatusReport(requested=len(stale_ids), cleared=0, error=str(exc))
             return ResetStatusReport(
-                requested=len(stale),
+                requested=len(stale_ids),
                 cleared=self._durably_cleared(stale_ids),
                 error=None,
             )
+
+    def _stale_ids_on_disk(self) -> Set[str]:
+        """Ids the STORE currently shows as benched, whatever this process believes."""
+        try:
+            rows = read_credential_pool(self.provider)
+        except Exception:
+            return set()
+        return {
+            row["id"] for row in rows
+            if isinstance(row, dict) and row.get("id")
+            and any(row.get(field) for field in _CLEAR_STATUS)
+        }
 
     def _durably_cleared(self, credential_ids: Set[str]) -> int:
         """How many of *credential_ids* read back from the store with no cooldown."""
