@@ -65,6 +65,7 @@ export function AgentsView({ onClose, embedded = false }: { onClose: () => void;
             ) : null}
           </>
         }
+        reserveActionsClearance={!embedded}
         subtitle={tab === 'sessions' ? summary || t.agents.overviewSubtitle : t.agents.subtitle}
         title={t.agents.title}
       />

@@ -19,6 +19,9 @@ it('opens the same Agents route as a native pane tab, not a second floating over
   watchRouteTiles()
   const close = vi.fn()
   const overlay = render(<AgentsView onClose={close} />)
+  expect(screen.getByRole('button', { name: 'Open as tab' }).closest('header')?.getAttribute('data-actions-clearance')).toBe(
+    'true'
+  )
   fireEvent.click(screen.getByRole('button', { name: 'Open as tab' }))
   expect($routeTiles.get()).toContainEqual({ path: '/agents', dir: 'right' })
   expect(close).toHaveBeenCalledOnce()
@@ -28,6 +31,11 @@ it('opens the same Agents route as a native pane tab, not a second floating over
   await screen.findByTestId('agent-overview')
   expect(view.container.querySelector('[data-overlay-surface]')).toBeNull()
   expect(screen.queryByRole('button', { name: 'Open as tab' })).toBeNull()
+  // Embedded (route-tile) presentation has no floating overlay close X, so
+  // its header must not reserve the dead clearance that button's absence
+  // makes unnecessary.
+  const embeddedHeader = view.container.querySelector('header[data-actions-clearance]')
+  expect(embeddedHeader?.getAttribute('data-actions-clearance')).toBe('false')
   view.rerender(<PaneVisibleContext.Provider value={false}>{pane.render!()}</PaneVisibleContext.Provider>)
   view.unmount()
   closeRouteTile('/agents')
