@@ -1,5 +1,13 @@
-import type { ReactNode } from 'react'
+import {
+  Children,
+  cloneElement,
+  type ComponentProps,
+  isValidElement,
+  type ReactElement,
+  type ReactNode
+} from 'react'
 
+import { Button } from '@/components/ui/button'
 import { Codicon } from '@/components/ui/codicon'
 import { AlertTriangle } from '@/lib/icons'
 import { cn } from '@/lib/utils'
@@ -62,9 +70,26 @@ export function ErrorState({ children, className, description, icon, title }: Er
         )}
       </div>
 
-      {/* justify-items-center keeps actions their natural width, centered, so a
-          single Retry-style button reads as a button, not a full-bleed bar. */}
-      {children && <div className="grid justify-items-center gap-2">{children}</div>}
+      {/* Default grid stretch keeps arbitrary content blocks (a scrollable
+          crash log `<pre>`, status text, ...) bounded to the surface width so
+          they still own their own overflow. Only direct `Button` children —
+          the actual action controls — are pulled to their natural width and
+          centered (`justify-self-center`), so a lone Retry reads as a button
+          instead of a full-bleed bar without shrink-wrapping everything else
+          in the slot. */}
+      {children && (
+        <div className="grid gap-2">
+          {Children.map(children, child => (isButtonElement(child) ? centerButton(child) : child))}
+        </div>
+      )}
     </div>
   )
+}
+
+function isButtonElement(child: ReactNode): child is ReactElement<ComponentProps<typeof Button>> {
+  return isValidElement(child) && child.type === Button
+}
+
+function centerButton(button: ReactElement<ComponentProps<typeof Button>>) {
+  return cloneElement(button, { className: cn('justify-self-center', button.props.className) })
 }
