@@ -171,6 +171,31 @@ def test_unset_hermes_python_falls_through_dotvenv_to_venv_to_release(
     assert "skipping venv without pytest" in result.stderr
 
 
+@pytest.mark.parametrize("dotvenv", ["absent", "without-pytest"])
+def test_unset_hermes_python_prefers_repo_venv_over_release_venv(
+    sandbox: Path,
+    dotvenv: str,
+) -> None:
+    """AC2/AC3: ``venv`` outranks the release venv, not merely ``.venv``.
+
+    The other unset-HERMES_PYTHON cases can be satisfied by any order whose
+    first element is ``.venv`` and whose last is the release venv, so they
+    leave the middle candidate's rank unpinned. Here ``.venv`` cannot win and
+    BOTH remaining candidates are usable, so the selection is decided purely
+    by their relative order: swapping them in the runner turns this red.
+    """
+    home = sandbox.parent / "home"
+    if dotvenv == "without-pytest":
+        _make_venv(sandbox / ".venv", "repo-dotvenv", has_pytest=False)
+    _make_venv(sandbox / "venv", "repo-venv", has_pytest=True)
+    _make_venv(home / ".hermes" / "hermes-agent" / "venv", "release", has_pytest=True)
+
+    result = _run(sandbox, None)
+
+    assert result.returncode == 0, result.stderr
+    assert _selected(result) == "repo-venv"
+
+
 def test_hermes_python_without_pytest_is_ignored_and_probe_continues(
     sandbox: Path,
 ) -> None:
