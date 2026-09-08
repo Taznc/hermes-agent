@@ -16,8 +16,13 @@ vi.mock('@/i18n', () => ({
   })
 }))
 
-/** A real bundled skill description; skill frontmatter caps these at 60 chars,
- *  which is already far past what a 20rem row can show beside the name. */
+/** The longest description in the live installed skill corpus (111 chars) —
+ *  the case the previous three-line clamp cut at 11rem. */
+const CORPUS_MAX_DESCRIPTION =
+  'Use on any hermes-fork/customizations kanban card. Layer routing, mac/win parity, roadmap sync rules and more.'
+
+/** Deliberately past anything a skill should carry: 160 chars of multi-sentence
+ *  prose, which needs 4 lines at 20rem and 8 at 11rem. */
 const LONG_DESCRIPTION =
   'Parallel 4-agent cleanup of recent code changes across the tree, ' +
   'reviewing every diff hunk for dead code, duplication and naming drift ' +
@@ -79,16 +84,55 @@ describe('the highlighted row description is readable in full', () => {
     const text = detail(container)?.querySelector('p') as HTMLElement
 
     // Wrapping, not horizontal overflow: the block is width-constrained by the
-    // panel, breaks long words, and is capped at three lines rather than
-    // growing the panel without bound.
-    expect(text.className).toContain('line-clamp-3')
+    // panel and breaks long words. It is NOT line-clamped — a clamp is visual
+    // truncation, which is the defect this fixes.
     expect(text.className).toContain('break-words')
+    expect(text.className).not.toMatch(/line-clamp/)
+    expect(text.className).not.toContain('truncate')
     expect(text.className).not.toContain('whitespace-nowrap')
     expect(text.className).not.toContain('overflow-x')
 
     const footer = detail(container) as HTMLElement
 
-    expect(footer.className).toContain('overflow-hidden')
+    // The reserved height is a scroller, not a clip: text past four lines is
+    // reachable rather than cut.
+    expect(footer.className).toContain('overflow-y-auto')
+    expect(footer.className).toContain('overscroll-contain')
+    expect(footer.className).not.toContain('overflow-hidden')
+  })
+
+  it('leaves no description unreachable, however long, at any panel width', () => {
+    // Both the reviewer's named cases: the real 111-char corpus maximum, and
+    // 160 chars of multi-sentence prose that needs 4 lines at 20rem and 8 at
+    // 11rem. Neither may be clamped away; both must be scroll-reachable.
+    for (const description of [CORPUS_MAX_DESCRIPTION, LONG_DESCRIPTION, 'x'.repeat(600)]) {
+      const { container, unmount } = render(popover([slashItem('/skill', description)]))
+      const footer = detail(container) as HTMLElement
+      const text = footer.querySelector('p') as HTMLElement
+
+      expect(footer.textContent).toBe(description)
+      expect(text.className).not.toMatch(/line-clamp/)
+      expect(footer.className).toContain('overflow-y-auto')
+      // Height is reserved, so the panel does not grow with the text; the
+      // overflow scrolls. Both halves of that contract in one place.
+      expect(footer.className).toMatch(/h-\[[^\]]+\]/)
+      expect(footer.className).not.toMatch(/max-h-/)
+
+      unmount()
+    }
+  })
+
+  it('resets the description scroller when the highlight moves', () => {
+    const items = [slashItem('/long', LONG_DESCRIPTION), slashItem('/short', 'Short.')]
+    const { container, rerender } = render(popover(items, 0))
+    const footer = detail(container) as HTMLElement
+
+    // jsdom does no layout, so scrollTop cannot exceed 0 on its own; assigning
+    // it proves the effect clears whatever position the user scrolled to.
+    footer.scrollTop = 40
+    rerender(popover(items, 1))
+
+    expect((detail(container) as HTMLElement).scrollTop).toBe(0)
   })
 
   it('follows the highlighted index as the user arrows through the list', () => {

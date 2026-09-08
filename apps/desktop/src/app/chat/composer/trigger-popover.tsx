@@ -51,18 +51,27 @@ const ROW_CLASS = [
 const GROUP_HEADER_CLASS =
   'select-none px-2 pb-0.5 text-[0.625rem] font-semibold uppercase tracking-wider text-(--ui-text-tertiary)'
 
-/** The list scrolls; the detail footer below it does not. */
+/** The list scrolls; the detail footer below it scrolls independently. */
 const LIST_CLASS = 'min-h-0 flex-1 overflow-y-auto overscroll-contain'
 
-/** Three lines at `leading-5` (1.25rem each). Fixed rather than fit-to-content:
- *  the footer is re-rendered on every arrow key, so a height that follows the
- *  text would resize the panel under the user's cursor on each press. */
-const DETAIL_CLASS = cn('mt-1 h-[4.25rem] shrink-0 overflow-hidden px-2 pt-1.5', 'text-(--ui-text-secondary)')
+/** Four lines at `leading-5` (1.25rem each) of RESERVED height, and a scroller
+ *  rather than a clip. Fixed rather than fit-to-content because the footer is
+ *  re-rendered on every arrow key, so a height that followed the text would
+ *  resize the panel under the user's cursor on each press. Four lines holds the
+ *  longest description in the installed corpus (111 chars) whole at the panel's
+ *  20rem width; anything past that scrolls instead of being cut, so no text is
+ *  ever unreachable. `overscroll-contain` keeps a wheel gesture here from
+ *  scrolling the transcript behind the panel. */
+const DETAIL_CLASS = cn(
+  'mt-1 h-[5.5rem] shrink-0 overflow-y-auto overscroll-contain px-2 pt-1.5',
+  'text-(--ui-text-secondary)'
+)
 
-/** Descriptions are prose, so they wrap and are clamped rather than ellipsized
- *  mid-word. Beyond three lines the tail is cut — a description that long is a
- *  skill-authoring problem, not something a completion popover should grow for. */
-const DETAIL_TEXT_CLASS = 'line-clamp-3 leading-5 break-words'
+/** Descriptions are prose: they wrap at the panel width and are never clamped or
+ *  ellipsized, so every word is reachable by scrolling the block above. The
+ *  block is `aria-live`, so assistive tech gets the whole string regardless of
+ *  how much of it is painted. */
+const DETAIL_TEXT_CLASS = 'leading-5 break-words'
 
 /** A row description, from either metadata shape, normalized to a usable string. */
 function rowDescription(item: Unstable_TriggerItem): string {
@@ -112,6 +121,7 @@ export function ComposerTriggerPopover({
   const isSlash = kind === '/'
   const isEmoji = kind === ':'
   const listRef = useRef<HTMLDivElement>(null)
+  const detailRef = useRef<HTMLDivElement>(null)
   const hoverIndexRef = useRef(-1)
 
   // Only keyboard navigation should move the drawer. A hover echo already points
@@ -166,6 +176,17 @@ export function ComposerTriggerPopover({
     }
 
     list.scrollTop += Math.abs(topDelta) < Math.abs(bottomDelta) ? topDelta : bottomDelta
+  }, [activeIndex, items])
+
+  // A long description scrolled halfway must not leave the NEXT row's shorter
+  // description reading from its middle, so each new highlight starts at the top
+  // of its own text.
+  useEffect(() => {
+    const detail = detailRef.current
+
+    if (detail) {
+      detail.scrollTop = 0
+    }
   }, [activeIndex, items])
 
   let lastGroup: string | undefined
@@ -261,7 +282,7 @@ export function ComposerTriggerPopover({
         )}
       </div>
       {items.length > 0 && hasDescriptions && (
-        <div aria-live="polite" className={DETAIL_CLASS} data-slot="composer-completion-detail">
+        <div aria-live="polite" className={DETAIL_CLASS} data-slot="composer-completion-detail" ref={detailRef}>
           {activeDescription && <p className={DETAIL_TEXT_CLASS}>{activeDescription}</p>}
         </div>
       )}
