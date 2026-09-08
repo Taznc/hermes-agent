@@ -197,6 +197,8 @@ _SPECS = [
                   "independent of --model. Accepts minimal, low, medium, high, xhigh, max, ultra, or "
                   "'none' to disable thinking; an invalid level is rejected at filing time. Omit to "
                   "inherit the profile's own agent.reasoning_effort."),
+        _arg("--completion-contract", metavar="CONTRACT",
+             help="local-only (default), OWNER/REPO for publication, or exact GitHub PR URL; required CI gates done."),
         _arg("--goal", action="store_true", dest="goal_mode",
              help="Run the worker in a goal loop: after each turn a judge checks the "
                   "response against the card title/body and, if not done, the worker "

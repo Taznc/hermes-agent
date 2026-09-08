@@ -871,6 +871,7 @@ class Task:
     # Transient systemd --user --scope unit name for the active/most-recent worker; NULL when
     # kanban.worker_launcher is unset (default plain Popen spawn).
     worker_unit: Optional[str] = None
+    completion_contract: Optional[str] = None
     # Lineage: the task/run that created this task via kanban_create. NULL for CLI/dashboard
     # creates and every pre-feature row.
     created_by_task: Optional[str] = None
@@ -905,7 +906,7 @@ _TASK_OPTIONAL_COLUMNS = (
     "branch_name", "project_id", "tenant", "result", "idempotency_key", "worker_pid",
     "max_runtime_seconds", "last_heartbeat_at", "current_run_id", "workflow_template_id",
     "current_step_key", "max_retries", "session_id", "route_source", "route_name",
-    "created_by_task", "created_by_run",
+    "completion_contract", "created_by_task", "created_by_run",
 )
 # Text columns where "" is stored/read as "not set".
 _TASK_EMPTY_IS_NULL_COLUMNS = (
@@ -1354,6 +1355,7 @@ CREATE TABLE IF NOT EXISTS kanban_notify_subs (
     delivery_metadata TEXT,
     created_at    INTEGER NOT NULL,
     last_event_id INTEGER NOT NULL DEFAULT 0,
+    last_ping_event_id INTEGER NOT NULL DEFAULT 0,
     PRIMARY KEY (task_id, platform, chat_id, thread_id)
 );
 
@@ -2057,6 +2059,8 @@ def create_task(
     goal_mode: bool = False, goal_max_turns: Optional[int] = None, initial_status: str = "running",
     session_id: Optional[str] = None, board: Optional[str] = None, project_id: Optional[str] = None,
     project_source_task_id: Optional[str] = None, lane: Optional[str] = None,
+    creator_task_id: Optional[str] = None,
+    completion_contract: Optional[str] = None,
     created_by_task: Optional[str] = None, created_by_run: Optional[int] = None,
     skill_preflight: bool = True,
 ) -> str:
@@ -2073,6 +2077,8 @@ def create_task(
     worker model (provider requires model); ``reasoning_effort`` is independent.
     ``route_source``/``route_name`` capture create-time routing provenance for
     audit/UI surfaces and never affect dispatch after creation.
+    ``creator_task_id``: inherit durable session/subscriptions independently of
+    dependency edges; an explicit ``session_id`` still wins.
     ``project_source_task_id``: cross-profile fallback when ``project_id`` is not
     in the active profile's projects.db — see ``_resolve_project_link``.
     ``created_by_task``/``created_by_run``: lineage when this task was created
@@ -2082,6 +2088,10 @@ def create_task(
     with ``triage`` and with a non-default ``initial_status``, and ``assignee`` is
     optional there (nothing dispatches a lane card).
     """
+    from hermes_cli.kanban_db_graph import initial_task_state, inherit_creator_origin
+    from hermes_cli.kanban_pr_acceptance import validate_contract
+
+    completion_contract = validate_contract(completion_contract)
     model_override, provider_override = _validate_model_override(model_override, provider_override)
     reasoning_effort = normalize_reasoning_effort(reasoning_effort)
     assignee = _canonical_assignee(assignee)
@@ -2158,7 +2168,8 @@ def create_task(
             # allow_nested: graph builders compose create_task under one outer
             # commit so the dispatcher never sees a half-built graph.
             with write_txn(conn, allow_nested=True):
-                task_status = _initial_task_status(conn, parents, initial_status, triage, lane)
+                task_status, tenant = initial_task_state(
+                    conn, parents, initial_status, triage, tenant, lane)
                 # Project worktree: fresh dir under the repo + deterministic
                 # branch, instead of the random ``wt/<id>`` worker fallback.
                 if project_obj is not None and workspace_kind == "worktree":
@@ -2176,9 +2187,9 @@ def create_task(
                         max_runtime_seconds,
                         skills, max_retries, model_override, provider_override,
                         reasoning_effort, route_source, route_name,
-                        goal_mode, goal_max_turns, session_id,
+                        goal_mode, goal_max_turns, session_id, completion_contract,
                         created_by_task, created_by_run
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         task_id, title.strip(), body, assignee, task_status, priority,
@@ -2189,6 +2200,7 @@ def create_task(
                         _opt_int(max_retries), model_override, provider_override, reasoning_effort,
                         route_source, route_name,
                         1 if goal_mode else 0, _opt_int(goal_max_turns), session_id,
+                        completion_contract,
                         created_by_task, _opt_int(created_by_run),
                     ),
                 )
@@ -2202,6 +2214,7 @@ def create_task(
                         "assignee": assignee,
                         "status": task_status,
                         "parents": list(parents),
+                        "creator_task_id": creator_task_id,
                         "tenant": tenant,
                         "workspace_kind": workspace_kind,
                         "workspace_path": workspace_path,
@@ -2233,6 +2246,7 @@ def create_task(
                         },
                     )
                 # ACK-edge: the originating channel hears a child BLOCK, not just the fan-in.
+                inherit_creator_origin(conn, task_id, creator_task_id, created_at=now)
                 _inherit_notify_subs(conn, task_id, parents, created_at=now)
             return task_id
         except sqlite3.IntegrityError:
@@ -2262,36 +2276,6 @@ def _validate_lane(
     if initial_status != "running":
         raise ValueError(f"lane and initial_status={initial_status!r} are mutually exclusive")
     return lane
-
-
-def _initial_task_status(
-    conn: sqlite3.Connection, parents: tuple[str, ...], initial_status: str, triage: bool,
-    lane: Optional[str] = None,
-) -> str:
-    """Status for a new task: a roadmap ``lane`` / ``blocked`` / ``triage`` when parked by the
-    caller, else ``ready`` unless a parent is unsatisfied (-> ``todo``). Parent ids are
-    validated in every mode (even triage) so link rows never dangle.
-
-    A lane wins over parent gating on purpose: an ``idea``/``roadmap`` card linked under an epic
-    must stay in its lane, never land in ``todo`` where the promotion sweep would pick it up."""
-    if parents:
-        missing = _missing_task_ids(conn, parents)
-        if missing:
-            raise ValueError(f"unknown parent task(s): {', '.join(missing)}")
-    if lane is not None:
-        return lane
-    if initial_status == "blocked":
-        return "blocked"
-    if triage:
-        return "triage"
-    if parents:
-        rows = conn.execute(
-            "SELECT status, completed_at FROM tasks WHERE id IN "
-            "(" + ",".join("?" * len(parents)) + ")", parents,
-        ).fetchall()
-        if any(not _parent_dependency_satisfied(r) for r in rows):
-            return "todo"
-    return "ready"
 
 
 def _parent_dependency_satisfied(parent: Mapping[str, Any]) -> bool:
@@ -3923,15 +3907,21 @@ def complete_task(
     # Cheap pre-check; re-checked inside the txn to close the parent-reopen race.
     if not _parents_satisfied(conn, task_id):
         return False
+    from hermes_cli.kanban_pr_acceptance_store import prepare_acceptance, record_acceptance
     verified_cards = _gate_created_cards(conn, task_id, created_cards, summary or result)
     metadata = _merge_completion_prose_artifacts(
         conn, task_id, metadata, summary=summary, result=result,
     )
     handoff_summary = summary if summary is not None else result
+    acceptance = prepare_acceptance(conn, task_id, expected_run_id, metadata)
+    if acceptance is False:
+        return False
     with write_txn(conn):
         # Hard invariant even for human review approval: a parent may have
         # reopened while this task waited.
         if not _parents_satisfied(conn, task_id):
+            return False
+        if acceptance is not None and not record_acceptance(conn, task_id, acceptance):
             return False
         # Captured BEFORE the UPDATE below clears worker_pid: preservation's
         # ownership gate must see the pid as it was during the live run, not
@@ -5116,151 +5106,6 @@ def specify_triage_task(
     return True
 
 
-def _validate_children_graph(children: list) -> None:
-    """DB-free shape check + Kahn's cycle check on the sibling graph (a cycle
-    would deadlock every involved child in ``todo`` forever)."""
-    for idx, child in enumerate(children):
-        if not isinstance(child, dict):
-            raise ValueError(f"child[{idx}] is not a dict")
-        title = child.get("title")
-        if not isinstance(title, str) or not title.strip():
-            raise ValueError(f"child[{idx}].title is required")
-        parents_idx = child.get("parents") or []
-        if not isinstance(parents_idx, list):
-            raise ValueError(f"child[{idx}].parents must be a list")
-        for p in parents_idx:
-            if not isinstance(p, int) or p < 0 or p >= len(children):
-                raise ValueError(f"child[{idx}].parents[{p}] is not a valid index into children")
-            if p == idx:
-                raise ValueError(f"child[{idx}] cannot list itself as a parent")
-
-    in_deg = [0] * len(children)
-    adj: list[list[int]] = [[] for _ in children]
-    for i, c in enumerate(children):
-        for p in (c.get("parents") or []):
-            adj[p].append(i)
-            in_deg[i] += 1
-    queue = [i for i in range(len(children)) if in_deg[i] == 0]
-    seen = 0
-    while queue:
-        seen += 1
-        for nb in adj[queue.pop()]:
-            in_deg[nb] -= 1
-            if in_deg[nb] == 0:
-                queue.append(nb)
-    if seen != len(children):
-        raise ValueError("cyclic dependency detected in decomposed children list")
-
-
-def decompose_triage_task(
-    conn: sqlite3.Connection, task_id: str, *, root_assignee: Optional[str], children: list[dict],
-    author: Optional[str] = None, auto_promote: bool = True,
-) -> Optional[list[str]]:
-    """Fan a triage task out into children and move the root to ``todo``; the root
-    waits on every child and wakes (``ready``) when all are done.
-
-    ``children``: dicts of ``title`` (required), ``body``, ``assignee``,
-    ``parents`` (indices into this list), optional workspace overrides.
-    Returns child ids in input order, or None when the root is missing / not
-    in triage. Atomic: a malformed entry aborts the whole fan-out.
-    """
-    if not children:
-        return None
-    if root_assignee is not None:
-        root_assignee = _canonical_assignee(root_assignee)
-    _validate_children_graph(children)
-
-    # ONE txn so the fan-out is atomic; helpers that open their own write_txn
-    # (create_task, link_tasks, add_comment) must not be called in here.
-    now = int(time.time())
-    with write_txn(conn):
-        root_row = conn.execute(
-            "SELECT id, status, tenant, workspace_kind, workspace_path "
-            "FROM tasks WHERE id = ?", (task_id,),
-        ).fetchone()
-        if root_row is None or root_row["status"] != "triage":
-            return None
-        child_ids = [
-            _insert_decomposed_child(conn, task_id, root_row, child, author, now)
-            for child in children
-        ]
-        # Sibling edges within the decomposed graph.
-        for idx, child in enumerate(children):
-            for p_idx in child.get("parents") or []:
-                parent_id, child_id = child_ids[p_idx], child_ids[idx]
-                _link(conn, parent_id, child_id)
-                _append_event(conn, child_id, "linked", {"parent": parent_id, "child": child_id})
-        # Root waits for the whole graph: link it under EVERY child (simpler
-        # than computing leaves; cycle-free since the root is only ever a child).
-        for cid in child_ids:
-            _link(conn, cid, task_id)
-        # Flip the root triage -> todo, assignee -> orchestrator.
-        sets = ["status = 'todo'"]
-        params: list[Any] = []
-        if root_assignee is not None:
-            sets.append("assignee = ?")
-            params.append(root_assignee)
-        params.append(task_id)
-        conn.execute(f"UPDATE tasks SET {', '.join(sets)} WHERE id = ?", tuple(params))
-        if author and author.strip():
-            _insert_comment(
-                conn, task_id, author.strip(),
-                "Decomposed into " + ", ".join(child_ids)
-                + ". Root will wake when all children complete.",
-                now,
-            )
-        _append_event(
-            conn, task_id, "decomposed", {"child_ids": child_ids, "root_assignee": root_assignee},
-        )
-    # Outside the txn (own IMMEDIATE txn). ``auto_promote=False`` leaves the
-    # children in ``todo`` for manual-review-first workflows.
-    if auto_promote:
-        recompute_ready(conn)
-    return child_ids
-
-
-def _insert_decomposed_child(
-    conn: sqlite3.Connection, root_id: str, root_row: sqlite3.Row, child: dict,
-    author: Optional[str], now: int,
-) -> str:
-    """Insert one decomposed child as ``todo`` (linked under the root later so
-    the dispatcher only ever sees a coherent graph); returns its id.
-
-    Workspace: per-child override wins, else inherit the root's kind. Path
-    inherits only when kinds match (a 'dir' child must not point at the
-    root's worktree) and NEVER for worktrees — siblings dispatch concurrently
-    and one shared checkout would put them all on the first sibling's branch
-    with no lock; leaving it unset makes dispatch materialize a fresh
-    ``<repo>/.worktrees/<child-id>`` per child from the board anchor.
-    """
-    root_ws_kind = root_row["workspace_kind"] or "scratch"
-    child_ws_kind = child.get("workspace_kind") or root_ws_kind
-    if child.get("workspace_path"):
-        child_ws_path = child.get("workspace_path")
-    elif child_ws_kind == "worktree":
-        child_ws_path = None
-    elif child_ws_kind == root_ws_kind:
-        child_ws_path = root_row["workspace_path"]
-    else:
-        child_ws_path = None
-    new_id = _new_task_id()
-    body = child.get("body")
-    conn.execute(
-        "INSERT INTO tasks "
-        "(id, title, body, assignee, status, workspace_kind, "
-        " workspace_path, tenant, created_at, created_by) "
-        "VALUES (?, ?, ?, ?, 'todo', ?, ?, ?, ?, ?)",
-        (
-            new_id, child["title"].strip(), body if isinstance(body, str) else None,
-            _canonical_assignee(child.get("assignee")), child_ws_kind, child_ws_path,
-            root_row["tenant"], now, (author or "decomposer"),
-        ),
-    )
-    _append_event(
-        conn, new_id, "created", {"by": author or "decomposer", "from_decompose_of": root_id},
-    )
-    _inherit_notify_subs(conn, new_id, (root_id,), created_at=now)
-    return new_id
 
 
 def _clear_satisfied_outgoing_links(conn: sqlite3.Connection, task_id: str) -> list[str]:
@@ -5964,11 +5809,11 @@ def task_age(task: Task) -> dict:
 # --- Retention + garbage collection ---
 
 def gc_events(conn: sqlite3.Connection, *, older_than_seconds: int = 30 * 24 * 3600) -> int:
-    """Delete events older than the cutoff on done/archived tasks only; returns the count."""
+    """Prune old done/archived events, retaining decomposition identity until task deletion."""
     cutoff = int(time.time()) - int(older_than_seconds)
     with write_txn(conn):
         cur = conn.execute(
-            "DELETE FROM task_events WHERE created_at < ? AND task_id IN "
+            "DELETE FROM task_events WHERE created_at < ? AND kind != 'decomposed' AND task_id IN "
             "(SELECT id FROM tasks WHERE status IN ('done', 'archived'))", (cutoff,),
         )
     return int(cur.rowcount or 0)

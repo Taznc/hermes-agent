@@ -202,7 +202,7 @@ def kanban_command(args: argparse.Namespace) -> int:
             return _err(f"kanban: unknown action {action!r}", 2)
         try:
             return int(handler(args) or 0)
-        except (ValueError, RuntimeError) as exc:
+        except (ValueError, RuntimeError, PermissionError) as exc:
             return _err(f"kanban: {exc}")
 
 
@@ -227,12 +227,13 @@ _DELEGATED_CHILD_DENIED_ACTIONS: frozenset[str] = frozenset({
     "schedule", "hold", "unblock", "unhold", "promote", "archive", "dispatch", "daemon", "repair",
     "refine", "demote", "spawn",
     "heartbeat", "notify-subscribe", "notify-unsubscribe", "specify", "decompose",
+    "request-review", "request-changes", "reopen-review",
     "gc",
 })
 
 _DELEGATED_CHILD_DENIED_BOARD_ACTIONS: frozenset[str] = frozenset({
     "create", "new", "rm", "remove", "delete", "switch", "use", "rename",
-    "set-default-workdir",
+    "set-default-workdir", "import",
 })
 
 
@@ -359,6 +360,8 @@ def _cmd_create(args: argparse.Namespace) -> int:
         return _err(f"kanban: --{lane} and --triage are mutually exclusive", 2)
     if lane and getattr(args, "initial_status", "running") != "running":
         return _err(f"kanban: --{lane} and --initial-status are mutually exclusive", 2)
+    from agent.delegation_context import is_dispatcher_owned_worker_context
+
     try:
         ws_kind, ws_path = _parse_workspace_flag(args.workspace)
         branch_name = _parse_branch_flag(getattr(args, "branch", None))
@@ -408,7 +411,10 @@ def _cmd_create(args: argparse.Namespace) -> int:
                     route_source=routing.route_source, route_name=routing.route_name,
                     goal_mode=bool(getattr(args, "goal_mode", False)),
                     goal_max_turns=getattr(args, "goal_max_turns", None),
+                    completion_contract=getattr(args, "completion_contract", None),
                     initial_status=getattr(args, "initial_status", "running"),
+                    creator_task_id=(os.environ.get("HERMES_KANBAN_TASK")
+                                     if is_dispatcher_owned_worker_context() else None),
                     lane=lane,
                 )
             except ValueError as exc:  # forced-skill preflight against the assignee
@@ -872,6 +878,7 @@ def _cmd_attach(args: argparse.Namespace) -> int:
     """Attach a local file via the shared ``store_attachment_bytes`` path (same 25 MB cap and name
     sanitisation as the dashboard upload and agent tool)."""
     import mimetypes
+    _worker_run_id_for(args.task_id)
 
     src = Path(args.path).expanduser()
     if not src.is_file():
@@ -918,6 +925,9 @@ def _cmd_attach_rm(args: argparse.Namespace) -> int:
 
 
 def _worker_run_id_for(task_id: str) -> Optional[int]:
+    env_tid = os.environ.get("HERMES_KANBAN_TASK")
+    if env_tid and env_tid != task_id:
+        raise ValueError(f"worker is scoped to task {env_tid}; refusing to mutate {task_id}")
     raw = os.environ.get("HERMES_KANBAN_RUN_ID")
     if os.environ.get("HERMES_KANBAN_TASK") != task_id or not raw:
         return None
@@ -1063,6 +1073,8 @@ def _cmd_schedule(args: argparse.Namespace) -> int:
 
 
 def _cmd_unblock(args: argparse.Namespace) -> int:
+    if os.environ.get("HERMES_KANBAN_TASK"):
+        return _err("kanban unblock is orchestrator-only; workers must hand off their assigned task")
     ids, rc = _require_ids(args)
     if rc:
         return rc

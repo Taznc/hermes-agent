@@ -260,7 +260,9 @@ def _create_cron_job_sync(body: CronJobCreate, profile: Optional[str] = None):
             enabled_toolsets=_cron_string_list(body.enabled_toolsets),
             workdir=_cron_optional_text(body.workdir),
             no_agent=no_agent,
-            resume_session_id=resume_session_id)
+            resume_session_id=resume_session_id,
+            **{key: getattr(body, key) for key in ("paused", "paused_reason")
+               if key in body.model_fields_set})
     except HTTPException:
         raise
     except Exception as e:
