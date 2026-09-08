@@ -430,7 +430,11 @@ moment later.
 
 The Desktop Kanban board exposes the same control in its orchestration
 settings panel, with a live "N running — draining" / "0 running — safe to
-restart" indicator.
+restart" indicator. On **All Boards**, separate **Pause all boards** and
+**Resume all boards** actions apply the circuit to every active board and the
+indicator totals workers across that scope. Already-running workers continue;
+if one board is busy, the other board results are preserved and the control
+stays actionable for a retry.
 
 `review_rework_escalation_profile` breaks pathological implementation/review
 loops without removing review: the first changes request returns to the original

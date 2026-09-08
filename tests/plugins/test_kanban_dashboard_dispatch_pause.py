@@ -83,6 +83,26 @@ def test_status_reports_a_running_board_as_not_paused(client, kanban_home):
     assert payload["running_count"] == 2
 
 
+def test_all_boards_status_aggregates_pause_and_running_counts(client, kanban_home):
+    kb.create_board("other-board")
+    _running(None, 1)
+    _running("other-board", 2)
+    kbd.pause_dispatch("other-board", note="maintenance")
+
+    response = client.get(f"{PREFIX}/dispatch/status?boards=*")
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["board_count"] == 2
+    assert payload["paused_count"] == 1
+    assert payload["running_count"] == 3
+    assert payload["all_paused"] is False
+    assert {item["board"]: item["paused"] for item in payload["boards"]} == {
+        "default": False,
+        "other-board": True,
+    }
+
+
 def test_pause_then_status_reports_the_reason_and_drain_count(client, kanban_home):
     board = "drain-me"
     kb.create_board(board)
@@ -131,6 +151,23 @@ def test_pause_is_board_scoped(client, kanban_home):
     assert kbd.read_dispatch_pause("busy-board") is None
 
 
+def test_pause_all_boards_fences_every_active_board(client, kanban_home):
+    kb.create_board("other-board")
+
+    response = client.post(f"{PREFIX}/dispatch/pause?boards=*", json={"note": "gateway restart"})
+
+    assert response.status_code == 200
+    assert response.json()["board_count"] == 2
+    assert response.json()["paused_count"] == 2
+    assert response.json()["failures"] == []
+    default_pause = kbd.read_dispatch_pause("default")
+    other_pause = kbd.read_dispatch_pause("other-board")
+    assert default_pause is not None
+    assert other_pause is not None
+    assert default_pause["note"] == "gateway restart"
+    assert other_pause["note"] == "gateway restart"
+
+
 def test_resume_clears_the_pause_and_reports_the_previous_state(client, kanban_home):
     board = "resume-me"
     kb.create_board(board)
@@ -143,6 +180,21 @@ def test_resume_clears_the_pause_and_reports_the_previous_state(client, kanban_h
     assert resumed.json()["previous"]["reason"] == "operator_paused"
     assert client.get(f"{PREFIX}/dispatch/status?board={board}").json()["paused"] is False
     assert kbd.read_dispatch_pause(board) is None
+
+
+def test_resume_all_boards_clears_every_active_board_pause(client, kanban_home):
+    kb.create_board("other-board")
+    kbd.pause_dispatch("default")
+    kbd.pause_dispatch("other-board")
+
+    response = client.post(f"{PREFIX}/dispatch/resume?boards=*")
+
+    assert response.status_code == 200
+    assert response.json()["board_count"] == 2
+    assert response.json()["resumed_count"] == 2
+    assert response.json()["failures"] == []
+    assert kbd.read_dispatch_pause("default") is None
+    assert kbd.read_dispatch_pause("other-board") is None
 
 
 def test_pause_without_a_note_is_accepted(client, kanban_home):
