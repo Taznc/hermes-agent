@@ -1834,11 +1834,16 @@ DEFAULT_CONFIG = {
         # default) is today's behaviour: priority only orders rows inside a tick and
         # reserves no capacity. A positive int holds that many of the ready lane's
         # slots for cards at or above `priority_reserved_threshold` whenever such a
-        # card actually wants one this tick (unclaimed in ready, or spawnable in
-        # review, with an assignee that names a real profile). With no high-priority
-        # demand the held slots go to normal work in the SAME tick — the reservation
-        # never idles capacity nobody is waiting for. It grants EARLIER ACCESS to a
-        # slot, never preemption: a running worker is never reclaimed to free one.
+        # card actually wants one this tick (unclaimed in ready, with an assignee
+        # that names a real profile). READY demand only: the review lane already
+        # reserves a slot of its own, so a high-priority card in review does not
+        # additionally draw on this one. Slots nobody is queued for fall through to
+        # normal work in the SAME tick — no qualifying ready card, or fewer of them
+        # than configured slots. A slot claimed by a queued high-priority card that
+        # cannot spawn yet (per-profile cap, co-edit serialization, respawn guard) is
+        # deliberately held idle rather than lent out, and reported as `unused`.
+        # It grants EARLIER ACCESS to a slot, never preemption: a running worker is
+        # never reclaimed to free one.
         "priority_reserved_slots": 0,
         # Priority at or above which a card draws on the reservation. Default 1 =
         # High and above on the documented tier scale (critical=2, high=1, normal=0,
