@@ -9,6 +9,7 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
 interface HermesDesktopLike {
+  api: (request: { path: string }) => Promise<unknown>
   getAgentOverview: (options?: { force?: boolean }) => Promise<{
     sources: Array<{
       connectionId: string
@@ -140,22 +141,34 @@ describe('web-bridge-shim getAgentOverview', () => {
     await expect(getAgentOverview()).rejects.toThrow()
   })
 
-  it('a non-2xx response on the real route also rejects getAgentOverview({force:true})', async () => {
-    fetchMock.mockImplementation((url: URL) => {
-      // Named bogus/non-2xx route control: the mock only answers the real
-      // agent-overview route; anything else (a genuinely bogus path) 404s
-      // through the same branch, proving this isn't special-cased to the
-      // production path.
-      if (String(url).includes('/api/profiles/agent-overview')) {
-        return jsonResponse({ error: 'not found' }, { status: 404 })
-      }
+  it('executes the bogus-path 404 control through the shim api member', async () => {
+    const requestedPaths: string[] = []
 
-      return jsonResponse({ error: 'bogus-path-not-found' }, { status: 404 })
+    fetchMock.mockImplementation((url: URL) => {
+      requestedPaths.push(new URL(String(url)).pathname)
+
+      return jsonResponse({ error: 'not found' }, { status: 404 })
+    })
+
+    const { api } = await loadShim()
+
+    await expect(api({ path: '/api/profiles/agent-overview-bogus' })).rejects.toThrow('failed: 404')
+    expect(requestedPaths).toEqual(['/api/profiles/agent-overview-bogus'])
+  })
+
+  it('a real-route non-2xx response rejects getAgentOverview({force:true})', async () => {
+    const requestedPaths: string[] = []
+
+    fetchMock.mockImplementation((url: URL) => {
+      requestedPaths.push(new URL(String(url)).pathname)
+
+      return jsonResponse({ error: 'not found' }, { status: 404 })
     })
 
     const { getAgentOverview } = await loadShim()
 
     await expect(getAgentOverview({ force: true })).rejects.toThrow()
+    expect(requestedPaths).toEqual(['/api/profiles/agent-overview'])
   })
 
   it('a partial read (some history, then a mid-stream failure) still resolves rather than rejecting', async () => {
