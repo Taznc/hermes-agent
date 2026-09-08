@@ -26,7 +26,13 @@ export const forkEn: ForkTranslations = {
         'Gateway tokens and sign-in credentials are stored as plain files readable only by your user account. Enable OS keychain encryption below for stronger protection.',
       secretStorageHintEnable: 'Enable encryption',
       secretStorageHintDismiss: 'Dismiss',
-      openLogsFailed: 'Could not open the logs folder'
+      openLogsFailed: 'Could not open the logs folder',
+      singleBackendTitle: 'One backend, managed on the server',
+      singleBackendDesc: (host: string) =>
+        `This browser build is attached to a single Hermes backend on ${host}. Registering remote, SSH, or Cloud gateways requires the Hermes Desktop app.`,
+      singleBackendDescNoHost:
+        'This browser build is attached to a single Hermes backend. Registering remote, SSH, or Cloud gateways requires the Hermes Desktop app.',
+      singleBackendDocsLink: 'Connecting Desktop to many Hermes instances'
     },
     sessions: {
       rateLimitRecoveryTitle: 'When a turn hits a rate limit',

@@ -111,6 +111,14 @@
   --color-ring: var(--dt-ring);
   --color-destructive: var(--dt-destructive);
   --color-destructive-foreground: var(--dt-destructive-foreground);
+  --color-warning: var(--dt-warning);
+  --color-warning-foreground: var(--dt-warning-foreground);
+  --color-success: var(--dt-success);
+  --color-success-foreground: var(--dt-success-foreground);
+  --color-destructive-text: var(--dt-destructive-text);
+  --color-warning-text: var(--dt-warning-text);
+  --color-success-text: var(--dt-success-text);
+  --color-success-solid: var(--dt-success-solid);
 
   --color-midground: var(--dt-midground);
   --color-midground-foreground: var(--dt-midground-foreground);
@@ -439,6 +447,46 @@
     --dt-composer-ring: var(--ui-base);
     --dt-destructive: #cf2d56;
     --dt-destructive-foreground: #ffffff;
+    --dt-warning: var(--ui-yellow);
+    --dt-warning-foreground: #111111;
+    --dt-success: var(--ui-green);
+    --dt-success-foreground: #07140f;
+    /* Semantic FILL tokens above are sized for a solid surface (a stripe, a
+       filled button under its own -foreground). Reusing one on TEXT that sits
+       on that same hue's tinted surface is what made the severity titles and
+       icons illegible: both sides move together, so the ratio never opens up.
+       These -text tokens are the reading role — the theme's own hue and chroma
+       held, lightness pinned to the end of the ramp the surface is NOT on, so
+       every severity clears 4.5:1 against its own tint in both modes. One knob
+       per mode, because "away from the surface" means darker in light and
+       lighter in dark. */
+    --dt-semantic-text-l: 0.42;
+    --dt-destructive-text: oklch(from var(--dt-destructive) var(--dt-semantic-text-l) c h);
+    --dt-warning-text: oklch(from var(--dt-warning) var(--dt-semantic-text-l) c h);
+    --dt-success-text: oklch(from var(--dt-success) var(--dt-semantic-text-l) c h);
+    /* The filled Dismiss is the third role, and it has its own constraint: a
+       solid fill under a fixed -foreground. Red carries white (5.36:1) and
+       amber carries near-black (5.97:1) as-is, but the mid-lightness green
+       clears NEITHER (4.37:1 near-black, 4.30:1 white — measured on the
+       rendered button), because it sits right in the middle of the ramp where
+       both ends are equidistant. So the button role gets its own lightness,
+       pinned to where dark mode's green already sits, which makes the two
+       modes' buttons identical and lifts the label to 6.35:1. Hue and chroma
+       still come from the theme's own green, so a custom skin tracks. The
+       stripe and the surface tint keep the raw token — the approved look is
+       unchanged; only the thing with text ON it moves. */
+    --dt-success-solid: oklch(from var(--dt-success) 0.66 c h);
+    /* Fourth role: the source color the 12% surface tint is mixed FROM.
+       In light mode every fill is darker than the near-white card, so the raw
+       token already pulls the surface off it. Dark mode is not symmetric —
+       #cf222e is itself darker than the dark card, so mixing more of it moves
+       hue without moving luminance and the error toast measured 1.01:1 against
+       the card: a tint you can only see if you already know it is there. The
+       tint therefore gets its own lightness knob (see the dark block), leaving
+       the stripe, the button, and the reading text on their own tokens. */
+    --dt-destructive-tint: var(--dt-destructive);
+    --dt-warning-tint: var(--dt-warning);
+    --dt-success-tint: var(--dt-success);
     --dt-sidebar-bg: var(--ui-bg-sidebar);
     --dt-sidebar-border: var(--ui-stroke-secondary);
     /* `--user-bubble-keep` is the Settings → Appearance → Message Bubble lever
@@ -609,6 +657,22 @@
        touch — still clearly a surface, no longer the brightest thing in the
        transcript. Derived from the card so every skin follows its own seed. */
     --ui-widget-surface-background: color-mix(in srgb, var(--ui-bg-editor) 88%, #000);
+    /* Severity text runs the other way in dark: the tinted surface is dark, so
+       the reading role goes light. Same hue/chroma, opposite end of the ramp.
+       0.94 rather than the 0.88 the first pass modelled: the live theme
+       resolves --dt-destructive from its preset (#cf222e), not from --ui-red,
+       and on the lifted dark surface below that red only reaches 4.5:1 near the
+       top of the ramp. Capped at 0.94 deliberately — past that the hue washes
+       out and a "red" title reads as off-white, which defeats the whole reskin. */
+    --dt-semantic-text-l: 0.94;
+    /* Lift the TINT SOURCE (not the stripe, button, or text) so the dark
+       surface separates from the dark card. Mixing 12% of the raw #cf222e into
+       #47484a is very nearly luminance-neutral (measured 1.01:1); re-lightening
+       the hue first puts all three dark severities in the same 1.11-1.17:1 band
+       the light theme already sits in, at the same approved 12% mix. */
+    --dt-destructive-tint: oklch(from var(--dt-destructive) 0.68 c h);
+    --dt-warning-tint: oklch(from var(--dt-warning) 0.68 c h);
+    --dt-success-tint: oklch(from var(--dt-success) 0.68 c h);
   }
 
   /* ── Window glass (Settings → Appearance → Window Translucency: Glass) ──

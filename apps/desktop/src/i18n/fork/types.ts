@@ -24,6 +24,17 @@ export interface ForkTranslations {
       secretStorageHintEnable: string
       secretStorageHintDismiss: string
       openLogsFailed: string
+      /** Browser build: the host owns no connection registry, so this page can
+       *  only ever describe the one backend it is served by. Says so plainly
+       *  instead of rendering an empty "unavailable" page that reads like a
+       *  bug the user could fix. */
+      singleBackendTitle: string
+      /** With the backend's host, when the connection descriptor has one. */
+      singleBackendDesc: (host: string) => string
+      /** Host-free variant — used before the descriptor lands, or when its
+       *  baseUrl does not parse. Never paints "on undefined". */
+      singleBackendDescNoHost: string
+      singleBackendDocsLink: string
     }
     sessions: {
       /** Phase 2.12 — `sessions.rate_limit_default_recovery` (ask | resume_at_reset). */

@@ -23,6 +23,15 @@ _VALUE_FLAGS_FALLBACK: frozenset[str] = frozenset({
 })
 _OPTIONAL_VALUE_FLAGS_FALLBACK: frozenset[str] = frozenset({"-c", "--continue"})
 
+# Built-in subcommands whose own subparser group a plugin may extend via
+# ``ctx.register_cli_command(..., parent=<name>)`` (``hermes kanban <action>``).
+# Core-owned allow-list: an unlisted parent is refused at registration time so a
+# typo can never register a command that silently never parses. Lives here (not
+# in the plugin manager) because ``main`` consults it on the startup fast path,
+# where importing ``hermes_cli.plugins`` would cost the ~265ms this gate exists
+# to avoid.
+NESTED_CLI_PARENTS: frozenset[str] = frozenset({"kanban"})
+
 
 @lru_cache(maxsize=1)
 def top_level_value_flag_sets() -> tuple[frozenset[str], frozenset[str]]:

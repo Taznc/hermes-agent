@@ -123,6 +123,9 @@ let _verificationStopIndex = 0
 /** Per-server counter for the task-panel warm-resume script. */
 let _taskPanelResumeIndex = 0
 
+/** Per-server counter for the terminal-copy script. */
+let _terminalCopyIndex = 0
+
 /** User messages received by the mock, for E2E assertions on real submits. */
 const _receivedUserTexts: string[] = []
 
@@ -135,6 +138,7 @@ function resetScriptIndex(): void {
   _correctionSwitchIndex = 0
   _verificationStopIndex = 0
   _taskPanelResumeIndex = 0
+  _terminalCopyIndex = 0
   _receivedUserTexts.length = 0
 }
 
@@ -265,6 +269,24 @@ const CORRECTION_SWITCH_SCRIPT: ScriptedTurn[] = [
 ]
 
 export const CORRECTION_SWITCH_TRIGGER = 'E2E_CORRECTION_SWITCH_TRIGGER'
+
+// ─── Terminal-copy E2E (Phase 2.7 copy controls) ───────────────────────
+//
+// Exercises a real `terminal` tool call whose command contains a long flag
+// (`--disable-pip-version-check`) so the copy control test can assert the
+// on-screen `$ ...` command is byte-identical to what was actually sent,
+// wrap artifacts included.
+export const TERMINAL_COPY_TRIGGER = 'E2E_TERMINAL_COPY_TRIGGER'
+export const TERMINAL_COPY_COMMAND = '.venv/bin/pip install -q --disable-pip-version-check -e .[dev]'
+
+const TERMINAL_COPY_SCRIPT: ScriptedTurn[] = [
+  {
+    text: 'Running the install command.',
+    toolCalls: [{ name: 'terminal', args: { command: TERMINAL_COPY_COMMAND } }],
+  },
+  { text: 'Install finished.' },
+]
+
 
 /**
  * Drives a real code edit followed by two finish attempts. Hermes should add
@@ -494,6 +516,7 @@ export function startMockServer(options: MockServerOptions = {}): Promise<MockSe
           const isCorrectionSwitchTrigger = messages.some(
             message => typeof message?.content === 'string' && message.content.includes(CORRECTION_SWITCH_TRIGGER),
           )
+          const isTerminalCopyTrigger = userText.includes(TERMINAL_COPY_TRIGGER)
 
           if (isTaskPanelResumeTrigger) {
             const turn =
@@ -571,6 +594,17 @@ export function startMockServer(options: MockServerOptions = {}): Promise<MockSe
           if (isCorrectionSwitchTrigger) {
             const turn = CORRECTION_SWITCH_SCRIPT[_correctionSwitchIndex] ?? CORRECTION_SWITCH_SCRIPT[CORRECTION_SWITCH_SCRIPT.length - 1]
             _correctionSwitchIndex++
+            if (stream) {
+              streamScriptedTurn(res, model, turn)
+            } else {
+              nonStreamingScriptedTurn(res, model, turn)
+            }
+            return
+          }
+
+          if (isTerminalCopyTrigger) {
+            const turn = TERMINAL_COPY_SCRIPT[_terminalCopyIndex] ?? TERMINAL_COPY_SCRIPT[TERMINAL_COPY_SCRIPT.length - 1]
+            _terminalCopyIndex++
             if (stream) {
               streamScriptedTurn(res, model, turn)
             } else {

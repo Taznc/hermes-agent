@@ -757,6 +757,11 @@ class HindsightMemoryProvider(MemoryProvider):
         # for the queue to drain AND the server-side op(s) to complete.
         self._prefetch_waits_for_retain = cfg.get("prefetch_waits_for_retain", True)
         self._prefetch_retain_drain_timeout = float(cfg.get("prefetch_retain_drain_timeout", 10.0))
+        # How long prefetch() waits for the background recall started last turn.
+        # Must exceed the bank's real recall latency; a self-hosted bank doing CPU
+        # reranking answers in ~11 s, where the previous fixed 3.0 s silently
+        # dropped every warmed result unless the user paused before replying.
+        self._prefetch_join_timeout = float(cfg.get("prefetch_join_timeout", 15.0))
 
     def _apply_recall_settings(self, cfg: dict) -> None:
         """Recall knobs are pure config too (``{}`` yields the defaults)."""
@@ -878,7 +883,18 @@ class HindsightMemoryProvider(MemoryProvider):
         """Record indicator state (cleared on empty turns, never a stale count); format the block."""
         self._last_recall_returned, self._last_recall_count = bool(result), count if result else 0
         if not result:
-            logger.debug("Prefetch: no results available")
+            # WARNING, not debug: an empty injection is indistinguishable from
+            # "nothing relevant was stored" in the transcript, so a systematic
+            # miss (recall slower than the join budget) otherwise looks like
+            # normal operation and goes unnoticed for days. Name the knob.
+            if self._prefetch_thread and self._prefetch_thread.is_alive():
+                logger.warning(
+                    "Prefetch: recall still running after %.1fs; injecting NO memories this turn. "
+                    "Raise `prefetch_join_timeout` in hindsight/config.json above your bank's "
+                    "recall latency, or set `recall_sync: true` to recall on the reply path.",
+                    self._prefetch_join_timeout)
+            else:
+                logger.debug("Prefetch: no results available")
             return ""
         logger.debug("Prefetch: returning %d chars of context", len(result))
         header = self._recall_prompt_preamble or (
@@ -902,8 +918,19 @@ class HindsightMemoryProvider(MemoryProvider):
         if self._recall_sync:
             return self._finish_prefetch(*(("", 0) if self._recall_disabled() else self._do_recall(query)))
         # Default: the background worker's result for the previous turn (capped join).
-        self._join_prefetch(3.0, log=True)
+        # The cap must exceed real recall latency or the warmed result is never
+        # collected: a self-hosted bank reranking on CPU answers in ~11 s, so the
+        # former hardcoded 3.0 s made injection a race against how fast the user
+        # sent the next message (fast reply -> silently empty context).
+        self._join_prefetch(self._prefetch_join_timeout, log=True)
         with self._prefetch_lock:
+            # Only consume the slot once the worker is actually done. Clearing it
+            # while the thread still runs discards a recall that is about to land
+            # and makes the NEXT turn miss too.
+            if self._prefetch_thread and self._prefetch_thread.is_alive():
+                logger.debug("Prefetch: still running after %.1fs join; leaving result for the next turn",
+                             self._prefetch_join_timeout)
+                return self._finish_prefetch("", 0)
             result, count = self._prefetch_result, self._prefetch_count
             self._prefetch_result, self._prefetch_count = "", 0
         return self._finish_prefetch(result, count)

@@ -142,6 +142,7 @@ export const ar = defineForkLocale(forkAr, {
     more: count => `${count} إشعار إضافي`,
     clearAll: 'مسح الكل',
     dismiss: 'إغلاق الإشعار',
+    dismissAction: 'إغلاق',
     details: 'التفاصيل',
     copyDetail: 'نسخ التفاصيل',
     copyDetailFailed: 'تعذر نسخ تفاصيل الإشعار',
