@@ -81,6 +81,34 @@ describe('needsInput survives events unrelated to the pending prompt', () => {
     expect(stream.state().needsInput).toBe(true)
   })
 
+  it('keeps needsInput while a clarify is pending and an unrelated background tool completes', () => {
+    // A clarify-only session: no approval/sudo/secret bar, just a question the
+    // user hasn't answered. A concurrent background tool finishing is not that
+    // answer, so the indicator must survive it.
+    clarifyRequest({ choices: ['a', 'b'], question: 'Pick', request_id: 'req-bg' })
+
+    expect(stream.state().needsInput).toBe(true)
+
+    toolComplete({ name: 'terminal', tool_id: 'bg-4' })
+
+    expect(stream.state().needsInput).toBe(true)
+  })
+
+  it('ignores another session\u2019s pending clarify', () => {
+    seedNeedsInput()
+    act(() =>
+      stream.handleEvent({
+        payload: { choices: ['a', 'b'], question: 'Pick', request_id: 'req-other' },
+        session_id: 'session-other',
+        type: 'clarify.request'
+      })
+    )
+
+    toolComplete({ name: 'terminal', tool_id: 'bg-5' })
+
+    expect(stream.state().needsInput).toBe(false)
+  })
+
   it('still clears needsInput on tool.complete when nothing else is pending', () => {
     seedNeedsInput()
 
