@@ -1210,3 +1210,49 @@ def test_codex_leg_upstream_error_body_is_preserved_not_flattened():
             assert "the model is not supported" in json.loads(body)["error"]["message"]
 
     asyncio.run(run())
+
+
+def test_spoofed_route_headers_are_never_forwarded_to_the_upstream():
+    """Backends build their header set from scratch, so nothing leaks through.
+
+    The gateway's anti-loop guarantee depends on a backend never seeing
+    client-supplied route context, not merely on the gateway ignoring it.
+    """
+    seen: List[Dict[str, str]] = []
+
+    async def run():
+        async def capture(request):
+            await request.read()
+            seen.append({k.lower(): v for k, v in request.headers.items()})
+            return web.json_response(_anthropic_text_message("ok"))
+
+        upstream = web.Application()
+        upstream.router.add_post("/v1/messages", capture)
+
+        async with _Harness(
+            _claude_first(upstream, _codex_upstream())
+        ) as harness:
+            status, _, _ = await harness.post(
+                "/v1/chat/completions",
+                {"model": "m", "messages": [{"role": "user", "content": "hi"}]},
+                headers={
+                    "X-Hermes-Request-Id": "attacker-supplied",
+                    "X-Hermes-Route-Attempt": "99",
+                    "X-Hermes-Route-Visited": "claude-code,openai-codex",
+                    "X-Hermes-Route-Backend": "openai-codex",
+                    "X-Evil-Passthrough": "should-not-appear",
+                },
+            )
+            assert status == 200
+
+    asyncio.run(run())
+    upstream_headers = seen[0]
+    for name in (
+        "x-hermes-request-id",
+        "x-hermes-route-attempt",
+        "x-hermes-route-visited",
+        "x-hermes-route-backend",
+    ):
+        assert name not in upstream_headers, f"{name} leaked upstream"
+    # Not a whitelist bug either: no arbitrary client header is forwarded.
+    assert "x-evil-passthrough" not in upstream_headers
