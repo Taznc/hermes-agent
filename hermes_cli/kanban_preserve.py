@@ -115,7 +115,14 @@ def _has_unpushed_commits(worktree: Path) -> bool:
 
 def _dirty_paths(worktree: Path) -> Optional[list[str]]:
     """Paths git reports as changed (gitignored files are excluded by git
-    itself), or ``None`` when the status probe failed."""
+    itself), or ``None`` when the status probe failed.
+
+    ``--porcelain -z`` is a fixed format: two status characters, a space, then
+    the path verbatim to a NUL. Sliced by position rather than split, so a path
+    that itself begins with a space is read correctly. A rename/copy entry is
+    followed by a second record holding its ORIGINAL path, which must be
+    consumed as data and never treated as another candidate.
+    """
     result = _git(worktree, "status", "--porcelain", "-z")
     if result.returncode != 0:
         return None
@@ -126,12 +133,14 @@ def _dirty_paths(worktree: Path) -> Optional[list[str]]:
         if skip_next:
             skip_next = False
             continue
-        code, _, rest = entry.partition(" ")
-        # Rename/copy entries are followed by their source path record.
-        if code and code[0] in {"R", "C"}:
+        if len(entry) < 4:
+            continue
+        if entry[0] in {"R", "C"} or entry[1] in {"R", "C"}:
             skip_next = True
-        paths.append(rest.strip() or entry[3:].strip())
-    return [p for p in paths if p]
+        path = entry[3:]
+        if path:
+            paths.append(path)
+    return paths
 
 
 def _expand_candidates(worktree: Path, paths: list[str]) -> list[str]:
@@ -161,8 +170,15 @@ def _generated_component(path: str) -> Optional[str]:
 
 
 def _looks_like_secret_filename(path: str) -> bool:
-    name = Path(path).name
-    lowered = name.lower()
+    """True when the filename itself marks the file as credential-bearing.
+
+    The name is compared with surrounding whitespace and trailing dots removed:
+    git reports paths verbatim, so ``" id_rsa"`` and ``"id_rsa "`` are real,
+    creatable filenames that a naive exact match would wave through while the
+    file is still an SSH private key. Matching the normalized name closes that
+    evasion without altering the path used to read the file.
+    """
+    lowered = Path(path).name.strip().rstrip(".").lower()
     if lowered in _SECRET_FILE_NAMES:
         return True
     if lowered.endswith(_SECRET_FILE_SUFFIXES):

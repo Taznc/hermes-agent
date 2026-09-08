@@ -223,6 +223,48 @@ def test_oversized_file_is_refused(repo: Path, worktree: Path) -> None:
     assert _head(worktree) == before
 
 
+def test_a_staged_rename_is_preserved_and_its_source_record_is_not_a_candidate(
+    repo: Path, worktree: Path
+) -> None:
+    """``status --porcelain -z`` emits a rename as TWO records; the second is
+    the ORIGINAL path and must be consumed as data, not scanned as a file."""
+    _git("mv", "README.md", "DOCS.md", cwd=worktree)
+
+    result = kp.preserve_worktree(worktree, "wt/t_demo")
+
+    assert result.status == "preserved", result
+    files = _git("show", "--name-status", "--format=", "HEAD", cwd=worktree)
+    assert "DOCS.md" in files
+    assert _git("status", "--porcelain", cwd=worktree).strip() == ""
+
+
+def test_a_file_renamed_to_a_secret_name_is_still_refused(
+    repo: Path, worktree: Path
+) -> None:
+    _git("mv", "README.md", "id_rsa", cwd=worktree)
+
+    result = kp.preserve_worktree(worktree, "wt/t_demo")
+
+    assert result.status == "unsafe", result
+    assert result.reason == "suspected_secret"
+    assert "id_rsa" in (result.detail or "")
+
+
+def test_a_path_with_leading_whitespace_is_read_verbatim(
+    repo: Path, worktree: Path
+) -> None:
+    """``-z`` status output is NOT quoted, so the path runs verbatim from a
+    fixed offset to the NUL. Trimming it would make the guard scan the wrong
+    file — here, missing that this candidate is a credential-named one."""
+    (worktree / " id_rsa").write_text("-----BEGIN PRIVATE KEY-----\n", encoding="utf-8")
+
+    result = kp.preserve_worktree(worktree, "wt/t_demo")
+
+    assert result.status == "unsafe", result
+    assert result.reason == "suspected_secret"
+    assert "id_rsa" in (result.detail or "")
+
+
 # ---------------------------------------------------------------------------
 # Remote state
 # ---------------------------------------------------------------------------
