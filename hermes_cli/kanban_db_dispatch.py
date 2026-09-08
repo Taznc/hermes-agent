@@ -226,15 +226,19 @@ class DispatchResult:
     assignee is at ``kanban.max_in_progress_per_profile``. Picked up on a later
     tick; separate bucket so dashboards show "profile busy" vs "stuck"."""
     priority_slots_reserved: int = 0
-    """Ready-lane slots held for ``priority >= kanban.priority_reserved_threshold``
-    this tick: ``min(kanban.priority_reserved_slots, ready_budget, high_priority_demand)``.
-    0 when the feature is off (the default) or when no high-priority card wanted a
-    slot — in the latter case the budget went to normal work in this same tick."""
+    """READY-lane slots held for ``priority >= kanban.priority_reserved_threshold``
+    this tick: ``min(kanban.priority_reserved_slots, ready_budget, ready demand)``.
+    0 when the feature is off (the default) or when no qualifying READY card wanted
+    a slot — in the latter case the budget went to normal work in this same tick.
+    Describes the READY reservation ONLY: capacity the review-lane reservation
+    already protects is not counted here."""
     priority_slots_unused: int = 0
-    """Of ``priority_slots_reserved``, how many no high-priority card actually
-    spawned into. Nonzero means the reservation is holding capacity for demand that
-    exists but is not yet eligible (per-profile cap, co-edit serialization, respawn
-    guard) — the cost of the reservation, made visible rather than invisible."""
+    """Of ``priority_slots_reserved``, how many no high-priority READY card actually
+    spawned into. Nonzero means the reservation is intentionally holding capacity for
+    READY demand that exists but is not yet eligible (per-profile cap, co-edit
+    serialization, respawn guard) — the operator-approved cost of the reservation,
+    reported rather than hidden. Review spawns never decrement it: their slot came
+    from the review reservation, not this one."""
     deferred_priority_reserved: list[str] = field(default_factory=list)
     """Below-threshold ready task ids the reservation held back this tick. Without
     this a ``--dry-run`` shows a normal card simply absent from ``spawned`` with no
@@ -3641,12 +3645,8 @@ def _lane_rows(conn: sqlite3.Connection, status: str) -> list[sqlite3.Row]:
     ).fetchall()
 
 
-def _high_priority_demand(
-    ready_rows: list[sqlite3.Row],
-    review_rows: list[sqlite3.Row],
-    threshold: int,
-) -> int:
-    """How many cards actually WANT a reserved slot on this board this tick.
+def _high_priority_demand(ready_rows: list[sqlite3.Row], threshold: int) -> int:
+    """How many READY cards actually WANT a reserved slot on this board this tick.
 
     Counts rows at or above *threshold* that are plausibly spawnable — an
     assignee that names a real Hermes profile, using the same ``profile_exists``
@@ -3655,15 +3655,17 @@ def _high_priority_demand(
     on a control-plane lane that a terminal pulls via ``claim_task``, must never
     hold a worker slot hostage: nothing would ever spawn into it.
 
-    Both lanes count. A high-priority card sitting in ``review`` is real demand
-    on the SAME shared spawn budget the ready loop is about to consume, and the
-    existing review reservation holds back exactly one slot regardless of
-    priority — so without counting it, normal ready work can still take the slot
-    a Critical review card is waiting for.
+    READY ONLY, deliberately. The review lane already has its own reservation
+    (:func:`_any_spawnable_review` holds one slot back out of ``spawn_budget``
+    regardless of priority), which is sufficient for review work. Counting a
+    high-priority review row here would reserve a SECOND slot for a card already
+    protected, and — because review spawns draw on the full shared budget — the
+    net effect was to strand one slot: a Critical review card plus a normal ready
+    backlog spawned one worker total where the reviewed behaviour spawns two.
 
-    This count is what makes "reserved slots left unused by high-priority work
-    fall through to normal work in the same tick" implementable. The ready lane
-    is sorted ``priority DESC``, so by the time the loop reaches a below-threshold
+    This count is what makes "reserved slots no high-priority card is waiting for
+    fall through to normal work in the same tick" implementable. The ready lane is
+    sorted ``priority DESC``, so by the time the loop reaches a below-threshold
     row no high-priority row is left *later in the list* — testing the list would
     make the reservation vacuous at every setting. Demand, not list position, is
     the thing a normal card can be held back for.
@@ -3678,7 +3680,7 @@ def _high_priority_demand(
             return False
         return profile_exists(assignee) if profile_exists is not None else True
 
-    return sum(1 for row in (*ready_rows, *review_rows) if _wants_slot(row))
+    return sum(1 for row in ready_rows if _wants_slot(row))
 
 
 def _any_spawnable_review(review_rows: list[sqlite3.Row]) -> bool:
@@ -3906,11 +3908,15 @@ def _dispatch_once_locked(
     # A high-priority card gets earlier access to a slot, never a slot the host cap,
     # per-profile cap, start budget or memory clamp did not already grant.
     #
-    # `effective_reserved` is min(configured, ready_budget, demand):
+    # READY-LANE ONLY. `ready_budget` above already had the review lane's slot carved
+    # out of it, and that reservation is sufficient for review work; reserving a second
+    # slot for a high-priority REVIEW row double-counts one card and strands capacity.
+    #
+    # `effective_reserved` is min(configured, ready_budget, ready demand):
     #   - clamped to ready_budget so a reservation larger than the tick's budget
     #     cannot drive the normal allowance negative (it would just stall the board);
-    #   - clamped to demand so slots nobody is waiting for fall through to normal work
-    #     in THIS tick rather than idling — the never-idle-capacity rule.
+    #   - clamped to demand so slots no qualifying READY card is waiting for fall
+    #     through to normal work in THIS tick rather than idling.
     # An uncapped tick (ready_budget None = no host/board cap at all) reserves
     # nothing: there is no scarcity to arbitrate, and every row spawns regardless.
     reserved_slots = max(int(priority_reserved_slots or 0), 0)
@@ -3920,7 +3926,7 @@ def _dispatch_once_locked(
         effective_reserved = min(
             reserved_slots,
             ready_budget,
-            _high_priority_demand(ready_rows, review_rows, priority_threshold),
+            _high_priority_demand(ready_rows, priority_threshold),
         )
     result.priority_slots_reserved = effective_reserved
     # Below-threshold rows share this narrower allowance; at-or-above-threshold rows
@@ -4073,15 +4079,11 @@ def _dispatch_once_locked(
                 row_assignee = default_reviewer
         if _dispatch_lane_task(conn, row, row_assignee, result, lane="review", **lane_kwargs):
             spawned += 1
-            # Review spawns draw on the FULL shared budget, i.e. they can land in a
-            # slot the ready loop held back. Counting them here is what keeps
-            # `priority_slots_unused` honest: a Critical review card taking the held
-            # slot is the reservation working, not a slot going to waste.
-            if (row["priority"] or 0) >= priority_threshold:
-                high_priority_spawned += 1
-                result.priority_slots_unused = max(
-                    effective_reserved - high_priority_spawned, 0
-                )
+            # NOT counted against the priority reservation. `priority_slots_reserved`
+            # / `priority_slots_unused` describe the READY-lane reservation only, and
+            # a review row's own slot came from the review reservation above — folding
+            # a review spawn in here would report a held ready slot as "used" while it
+            # actually sat idle.
         if result.dispatch_paused is not None:
             return result
 

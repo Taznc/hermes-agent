@@ -193,15 +193,35 @@ opt-in settings give priority real scheduling power:
 exactly as it always has — this changes scheduling on a live fleet, so it
 ships inert and you opt in.
 
-When it is on, below-threshold cards may consume at most
+When it is on, below-threshold **ready** cards may consume at most
 `ready_budget - reserved` of the tick's slots, while at-or-above-threshold
-cards may use the full budget. A slot is only held when a high-priority card
-actually wants one this tick — unclaimed in `ready` or spawnable in `review`,
-with an assignee that names a real profile. **Reserved slots that no
-high-priority card is waiting for are handed to normal work in the same
-tick**, so the setting never idles capacity nobody is queued for. An
-unassigned Critical card, or one on a control-plane lane pulled by a terminal
-via `claim_task`, generates no demand and cannot hold a slot hostage.
+ready cards may use the full budget. A slot is only held when a qualifying
+card actually wants one this tick: unclaimed in `ready`, with an assignee that
+names a real profile. An unassigned Critical card, or one on a control-plane
+lane pulled by a terminal via `claim_task`, generates no demand and cannot
+hold a slot hostage — nothing would ever spawn into it.
+
+**Slots nobody is queued for fall through to normal work in the same tick.**
+With no qualifying ready card waiting — or fewer of them than you configured
+slots — the unclaimed remainder goes to normal work immediately, not on some
+later tick.
+
+**A slot claimed by a queued high-priority card may sit idle, deliberately.**
+When a Critical card wants a slot but cannot spawn this tick (its assignee is
+at `max_in_progress_per_profile`, a co-edit serialization is in force, a
+respawn guard is cooling down), the reservation keeps holding that slot rather
+than lending it to normal work. That is the whole point of the setting: it is
+what stops normal work from re-saturating the pool before the Critical card
+becomes eligible. It is also its cost — capacity can stand idle for as long as
+that demand exists. `hermes kanban dispatch --dry-run` reports it as
+`unused` rather than hiding it, and below-threshold work still receives
+`ready_budget - reserved`.
+
+**The review lane is separate.** `review` already reserves a slot of its own
+so a sustained ready backlog cannot starve reviews, regardless of priority.
+A high-priority card in `review` therefore does *not* additionally draw on
+this reservation, and the reserved/unused counters describe the ready-lane
+reservation only.
 
 The reservation grants **earlier access to a slot — never preemption**. It
 never reclaims, pauses, or kills a running worker to make room: reclaiming

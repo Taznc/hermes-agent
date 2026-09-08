@@ -547,6 +547,15 @@ def test_review_budget_still_bounded_by_shared_cap(
 # The reservation is the same mechanism the review lane already uses (hold a slot
 # back so a sustained backlog cannot starve a lane), keyed on priority instead of
 # lane. It grants EARLIER ACCESS to a slot and never preempts a running worker.
+#
+# Scope and tradeoff, both settled by the operator on the round-1 escalation
+# (option `allow_hold`):
+#   - READY lane only. The review lane keeps its own separate reservation; a
+#     high-priority review row does not additionally draw on this one.
+#   - Queued high-priority READY demand that is temporarily ineligible (per-profile
+#     cap, co-edit serialization, respawn guard) MAY hold capacity idle for the
+#     tick. That idle hold is the point: it is what stops normal work from
+#     re-saturating the pool before the Critical card's cap clears.
 
 
 def _capped_config(monkeypatch, **kanban):
@@ -575,38 +584,26 @@ def _park_running(conn: sqlite3.Connection, title: str, assignee: str) -> str:
     return tid
 
 
-def test_critical_card_spawns_against_a_saturated_normal_queue(
+def test_critical_ready_card_blocked_by_per_profile_cap_holds_a_slot(
     kanban_home, all_assignees_spawnable, monkeypatch,
 ):
-    """AC6 (first direction), stated literally: reserved=1, a queue of normal
-    cards, and a newly-filed Critical card gets a worker on the next tick."""
-    _capped_config(monkeypatch, priority_reserved_slots=1, priority_reserved_threshold=1)
+    """AC6, discriminating direction (on half of the on/off pair).
 
-    spawns: list = []
-    with kbc.connect() as conn:
-        for i in range(5):
-            kb.create_task(conn, title=f"normal-{i}", assignee="alice")
-        critical = kb.create_task(
-            conn, title="critical", assignee="alice", priority=2,
-        )
-        res = kbd.dispatch_once(
-            conn, spawn_fn=_fake_spawn_factory(spawns), max_in_progress=2,
-        )
+    The literal "saturated pool, Critical spawns next tick" wording is NOT a test
+    of the reservation: the ready lane is already sorted ``priority DESC``, so a
+    Critical card wins any slot that frees regardless of this setting, and such a
+    test stays green with the mechanism neutralized.
 
-    assert critical in [s[0] for s in res.spawned]
+    What the reservation actually buys is this: a Critical card whose assignee is
+    at ``max_in_progress_per_profile`` cannot spawn this tick. Without a
+    reservation, normal work immediately consumes the whole budget and
+    re-saturates the pool, so the Critical card is no closer to a slot when its
+    cap clears. With ``priority_reserved_slots=1`` its demand holds one slot back.
 
-
-def test_reservation_holds_a_slot_for_a_critical_card_blocked_by_per_profile_cap(
-    kanban_home, all_assignees_spawnable, monkeypatch,
-):
-    """The DISCRIMINATING case: a reservation that only reorders is worthless,
-    because the ready lane is already sorted priority DESC.
-
-    A Critical card whose assignee is at ``max_in_progress_per_profile`` cannot
-    spawn this tick. Without a reservation, normal work immediately consumes the
-    whole budget and re-saturates the pool, so the Critical card is no closer to
-    a slot when the cap clears. With ``priority_reserved_slots=1`` its demand
-    holds one slot back.
+    That held slot sits IDLE for the tick, which is the operator-approved tradeoff
+    for this setting (round-1 escalation, option ``allow_hold``): queued
+    high-priority READY demand that is temporarily ineligible may hold up to
+    ``priority_reserved_slots`` capacity rather than lending it to normal work.
 
     AC3 in the same assertion: the capped Critical card still records
     ``skipped_per_profile_capped`` — the reservation composes with the
@@ -634,7 +631,7 @@ def test_reservation_holds_a_slot_for_a_critical_card_blocked_by_per_profile_cap
     # card holds one, so only ONE normal card spawns.
     assert len(res.spawned) == 1
     assert res.priority_slots_reserved == 1
-    # Nothing spawned into the held slot: that is the cost, reported not hidden.
+    # Nothing spawned into the held slot: the approved idle hold, reported not hidden.
     assert res.priority_slots_unused == 1
     # AC3: the per-profile cap still binds and is still recorded as such.
     assert critical in [c[0] for c in res.skipped_per_profile_capped]
@@ -671,9 +668,16 @@ def test_same_board_spawns_one_more_normal_card_when_reservation_is_off(
 def test_unused_reserved_slots_go_to_normal_work_in_the_same_tick(
     kanban_home, all_assignees_spawnable, monkeypatch,
 ):
-    """AC2's never-idle-capacity rule: a reservation with NO high-priority card
-    waiting reserves nothing, and normal work gets the whole budget in this tick
-    — not on some later one."""
+    """The fall-through rule: with NO qualifying READY card waiting, the
+    reservation holds nothing and normal work gets the whole budget in this tick
+    — not on some later one.
+
+    Note what this does and does not promise, per the operator's ``allow_hold``
+    decision: a slot falls through when there is no qualifying READY demand (or
+    fewer qualifying cards than configured slots, see the partial-release test).
+    It is NOT lent back once a queued high-priority card has claimed it and is
+    merely ineligible this tick.
+    """
     _capped_config(monkeypatch, priority_reserved_slots=2, priority_reserved_threshold=1)
 
     spawns: list = []
@@ -758,18 +762,28 @@ def test_reservation_never_exceeds_the_tick_budget(
     assert all(s[0] for s in res.spawned)
 
 
-def test_high_priority_review_card_can_take_the_reserved_slot(
+def test_critical_review_card_is_not_double_reserved(
     kanban_home, all_assignees_spawnable, monkeypatch,
 ):
-    """A Critical card in the REVIEW lane is real demand on the same shared
-    budget, and a review spawn into a held slot counts as the reservation
-    working rather than as capacity wasted."""
+    """A high-priority REVIEW row must NOT count as priority-reservation demand.
+
+    The review lane already has its own reservation: with spawnable review work,
+    a shared budget of 2 becomes ``ready_budget=1`` so a sustained ready backlog
+    cannot starve reviews. That is sufficient for review work. An earlier draft
+    also counted the Critical review row as priority demand, which reserved a
+    SECOND slot for the same card and cut the normal allowance to 0 — the board
+    then spawned ONE worker where the reviewed behaviour spawns two, and reported
+    ``unused=0`` while a slot actually sat idle.
+
+    The contract: exactly 2 spawns (one normal ready + the review card), and the
+    priority telemetry stays 0/0 because there is no qualifying READY demand.
+    """
     _capped_config(monkeypatch, priority_reserved_slots=1, priority_reserved_threshold=1)
 
     spawns: list = []
     with kbc.connect() as conn:
-        for i in range(4):
-            kb.create_task(conn, title=f"normal-{i}", assignee="alice")
+        for i in range(3):
+            kb.create_task(conn, title=f"normal-{i}", assignee=f"worker{i}")
         review_id = kb.create_task(
             conn, title="critical-review", assignee="reviewer", priority=2,
         )
@@ -778,10 +792,58 @@ def test_high_priority_review_card_can_take_the_reserved_slot(
             conn, spawn_fn=_fake_spawn_factory(spawns), max_in_progress=2,
         )
 
-    assert review_id in [s[0] for s in res.spawned]
-    assert res.priority_slots_reserved == 1
-    # The critical review card spawned into it, so nothing was held idle.
+    spawned_ids = [s[0] for s in res.spawned]
+    assert len(spawned_ids) == 2
+    assert review_id in spawned_ids
+    # The other spawn is a normal ready card: the review reservation gave the
+    # review lane its slot, and the ready lane kept the rest of the budget.
+    assert len([t for t in spawned_ids if t != review_id]) == 1
+    # No qualifying READY demand -> no priority hold, and nothing hidden.
+    assert res.priority_slots_reserved == 0
     assert res.priority_slots_unused == 0
+    assert res.deferred_priority_reserved == []
+
+
+def test_review_spawn_does_not_mask_an_idle_ready_hold(
+    kanban_home, all_assignees_spawnable, monkeypatch,
+):
+    """AC5 telemetry stays truthful on a MIXED ready+review tick.
+
+    Both things happen in one tick here: a Critical READY card is cap-blocked and
+    holds a slot, AND a Critical REVIEW card spawns into the review lane's own
+    reserved slot. An earlier draft decremented ``priority_slots_unused`` on any
+    high-priority review spawn, so this tick reported ``unused=0`` while the held
+    ready slot really was idle — the reserved/unused pair must describe the READY
+    reservation alone, never capacity the review reservation supplied.
+    """
+    _capped_config(monkeypatch, priority_reserved_slots=1, priority_reserved_threshold=1)
+
+    spawns: list = []
+    with kbc.connect() as conn:
+        _park_running(conn, "running", "busy")
+        critical = kb.create_task(
+            conn, title="critical-ready-blocked", assignee="busy", priority=2,
+        )
+        for i in range(3):
+            kb.create_task(conn, title=f"normal-{i}", assignee=f"worker{i}")
+        review_id = kb.create_task(
+            conn, title="critical-review", assignee="reviewer", priority=2,
+        )
+        _set_task_status(conn, review_id, "review")
+        res = kbd.dispatch_once(
+            conn, spawn_fn=_fake_spawn_factory(spawns),
+            max_in_progress=3, max_in_progress_per_profile=1,
+        )
+
+    spawned_ids = [s[0] for s in res.spawned]
+    # The cap-blocked Critical ready card holds its slot and does not spawn.
+    assert critical in [c[0] for c in res.skipped_per_profile_capped]
+    assert critical not in spawned_ids
+    # Its slot went unused; the review spawn came from the review reservation and
+    # must not be credited against the ready hold.
+    assert res.priority_slots_reserved == 1
+    assert res.priority_slots_unused == 1
+    assert review_id in spawned_ids
 
 
 def test_threshold_decides_which_cards_draw_on_the_reservation(
