@@ -504,6 +504,13 @@ class _AgentPluginInstallBody(BaseModel):
     force: bool = False
     enable: bool = True
 
+class _PluginProbeBody(BaseModel):
+    identifier: str
+
+class _DesktopPluginInstallBody(BaseModel):
+    identifier: str
+    force: bool = False
+
 class _PluginProvidersPutBody(BaseModel):
     memory_provider: Optional[str] = None
     context_engine: Optional[str] = None
