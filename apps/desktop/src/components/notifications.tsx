@@ -30,13 +30,13 @@ interface Tone {
 const tone: Record<NotificationKind, Tone> = {
   error: {
     icon: AlertCircle,
-    iconClass: 'text-destructive',
+    iconClass: 'text-destructive-text',
     actionClass: 'bg-destructive text-destructive-foreground hover:bg-destructive/90',
     variant: 'destructive'
   },
   warning: {
     icon: AlertTriangle,
-    iconClass: 'text-warning',
+    iconClass: 'text-warning-text',
     actionClass: 'bg-warning text-warning-foreground hover:bg-warning/90',
     variant: 'warning'
   },
@@ -48,8 +48,8 @@ const tone: Record<NotificationKind, Tone> = {
   },
   success: {
     icon: CheckCircle2,
-    iconClass: 'text-success',
-    actionClass: 'bg-success text-success-foreground hover:bg-success/90',
+    iconClass: 'text-success-text',
+    actionClass: 'bg-success-solid text-success-foreground hover:bg-success-solid/90',
     variant: 'success'
   }
 }
