@@ -350,3 +350,74 @@ def test_terminal_run_state_is_immutable_once_delivery_starts(ledger):
 
     # At-most-once: a second delivery outcome for one attempt is refused.
     assert ledger.record_delivery_outcome(record["id"], "delivered") is None
+
+
+# ---------------------------------------------------------------------------
+# Splitting the durable write must not split the monitoring projection
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture
+def emitted_events(monkeypatch):
+    """Capture what the real ledger projects to monitoring, via the real emitter seam."""
+    from agent.monitoring import emitter
+
+    events = []
+
+    class RecordingEmitter:
+        def emit(self, event):
+            events.append(event)
+
+        def flush(self, timeout=None):
+            pass
+
+    monkeypatch.setattr(emitter, "get_emitter", lambda: RecordingEmitter())
+    return events
+
+
+def _terminal(events):
+    return [(e.status, e.delivery_outcome) for e in events if e.status in ("completed", "failed")]
+
+
+def test_one_execution_emits_exactly_one_terminal_projection_carrying_its_delivery_outcome(
+    scheduler_env, ledger, monkeypatch, emitted_events
+):
+    """``CronExecutionEvent`` carries a job key but no execution id, so a second terminal event
+    for one attempt is indistinguishable from another attempt: exporters double-count completions
+    and flush twice. Terminalizing before delivery splits the durable WRITE; it must not split
+    the projection, and the one event that survives has to carry the final delivery outcome."""
+    scheduler = scheduler_env
+    job = _script_job()
+    _claimed_execution(scheduler, ledger, job)
+
+    monkeypatch.setattr(scheduler, "run_job", _returns_script_result)
+    monkeypatch.setattr(scheduler, "_deliver_result", lambda *_a, **_kw: None)
+
+    assert scheduler.run_one_job(job) is True
+
+    assert _terminal(emitted_events) == [("completed", "delivered")]
+
+
+def test_terminal_projection_survives_a_lost_claim_that_never_records_a_delivery_outcome(
+    scheduler_env, ledger, monkeypatch, emitted_events
+):
+    """The trap in deferring the emit to ``record_delivery_outcome``: the fire claim can be lost
+    inside the DELIVERY fence, i.e. after the row terminalized, and that path never records a
+    delivery outcome at all. Deferring must not trade a duplicated terminal event for a dropped
+    one, so the run's own projection still has to leave exactly once."""
+    scheduler = scheduler_env
+    job = _script_job(fire_claim={"at": "2026-09-08T06:00:00+00:00", "by": "owner-1"})
+    execution_id = _claimed_execution(scheduler, ledger, job)
+    lost = threading.Event()
+
+    def delivery_loses_the_claim(*_a, **_kw):
+        lost.set()
+        raise scheduler._FireClaimLostDuringSideEffect
+
+    monkeypatch.setattr(scheduler, "run_job", _returns_script_result)
+    monkeypatch.setattr(scheduler, "_deliver_result", delivery_loses_the_claim)
+
+    assert scheduler.run_one_job(job, cancel_event=lost) is True
+
+    assert ledger.get_execution(execution_id)["status"] == "completed"
+    assert _terminal(emitted_events) == [("completed", None)]

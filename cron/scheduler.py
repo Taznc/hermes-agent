@@ -484,7 +484,8 @@ from cron.jobs import (
     clear_run_claim, get_due_jobs, heartbeat_fire_claim, heartbeat_run_claim, mark_job_run,
     release_interrupted_retry_claim, save_job_output, use_cron_store)
 from cron.executions import (
-    _TERMINAL_STATES, create_execution, finish_execution, get_execution,
+    _TERMINAL_STATES, create_execution, finish_execution,
+    flush_deferred_execution_projection, get_execution,
     mark_execution_handoff_pending, mark_execution_running, record_delivery_outcome,
     recover_interrupted_executions)
 
@@ -2727,7 +2728,9 @@ _OWNERSHIP_LOST_INTERRUPTED = "Interrupted by shutdown before terminal completio
 _DRAIN_INTERRUPTED = "Interrupted by gateway shutdown before terminal completion."
 
 
-def _record_interruption(execution_id: str, error: str) -> None:
+def _record_interruption(
+    execution_id: str, error: str, *, defer_projection: bool = False,
+) -> None:
     """Terminalize an interrupted attempt as a durable ledger fact.
 
     The incident is deliberately NOT raised here. Interruptions arrive from four places (this
@@ -2735,8 +2738,13 @@ def _record_interruption(execution_id: str, error: str) -> None:
     migration), and only ``cron.interrupted_retry`` sees all four — exactly once each, gated by
     the ``retry_state`` compare-and-swap. Raising there also means the incident is written by a
     process that is still alive, rather than by one being torn down mid-shutdown.
+
+    ``defer_projection`` is for the pre-delivery terminalization path, whose delivery outcome is
+    still unknown; see ``_terminalize_run_outcome``.
     """
-    finish_execution(execution_id, success=False, error=error, interrupted=True)
+    finish_execution(
+        execution_id, success=False, error=error, interrupted=True,
+        defer_projection=defer_projection)
 
 
 def _record_fire_ownership_lost(job_id: str, fire_owner: Optional[str], execution_id: str) -> None:
@@ -2898,16 +2906,21 @@ def _terminalize_run_outcome(d: _RunDelivery, execution_id: str, execution_token
     Ledger terminal states are immutable, so committing the run's own result first turns those
     later interruption writes into no-ops rather than overwrites. ``delivery_outcome`` is attached
     afterwards by ``_finish_completed_run`` via ``record_delivery_outcome``.
+
+    The monitoring projection is deferred with the row (``defer_projection=True``) so the attempt
+    still yields exactly ONE terminal event, emitted once its delivery outcome is known — splitting
+    the durable write must not double-count completions. ``_run_one_job_body``'s finally flushes
+    any projection no delivery outcome claimed.
     """
     if _is_interrupted(d.job["id"], execution_token):
         # Peek, not consume: the RUN itself was killed mid-flight, and the compose step above has
         # already rewritten it as an honest failure. Terminalize it as the interruption it is so
         # the reconciler can still see it; the bookkeeping tail consumes the flag.
-        _record_interruption(execution_id, _DRAIN_INTERRUPTED)
+        _record_interruption(execution_id, _DRAIN_INTERRUPTED, defer_projection=True)
         d.run_terminalized = True
         return
     d.run_terminalized = finish_execution(
-        execution_id, success=d.success, error=d.error) is not None
+        execution_id, success=d.success, error=d.error, defer_projection=True) is not None
 
 
 def _save_compose_deliver(
@@ -3328,6 +3341,13 @@ def _run_one_job_body(
     finally:
         # Function-level on purpose: must scope delivery, deferred teardown, claim-loss handling and
         # bookkeeping — not just run_job. Do not move into the run block's finally.
+        # The run terminalizes before delivery but withholds its monitoring projection until the
+        # delivery outcome is known. Several exits land in between — a fire claim lost inside the
+        # delivery fence, a delivery that raised past the recorder, the BaseException tail — so
+        # flush here, where every path passes, or deferring would trade a duplicated terminal
+        # event for a dropped one. No-op once a delivery outcome claimed it.
+        if execution_id:
+            flush_deferred_execution_projection(execution_id)
         if _scope_token is not None:
             reset_secret_scope(_scope_token)
         if _terminal_scope_token is not None:
@@ -3353,20 +3373,25 @@ def _wait_for_external_cron_worker_body(
         current = get_execution(execution_id)
         return bool(current and current.get("status") in _TERMINAL_STATES)
 
-    # The worker commits its terminal row before its process exits, so exit is
-    # the correct wakeup.  Each ledger read opens a connection and re-runs
-    # schema init; polling it at 50ms for an hours-long agent run is ~72k
-    # opens/hour of pure contention with the worker's own writes.
+    # Wait on the PROCESS, never on the ledger row.  The worker commits its
+    # terminal row before it *delivers* (see ``_terminalize_run_outcome``), so a
+    # terminal row means "the run finished", not "the worker is done": a Bot
+    # Chat send is a whole agent turn and runs for minutes after it.  Returning
+    # on the row would release ``_restart_safe_waiter_job_ids`` — the guard
+    # ``mark_running_jobs_interrupted`` reads to withhold shutdown marking from
+    # exactly these jobs — and reap the handoff artifacts mid-delivery, re-arming
+    # the interruption the split terminalization exists to prevent.  Process exit
+    # is the only signal that covers the whole handoff, and it needs no new
+    # cross-process protocol.  Each ledger read also opens a connection and
+    # re-runs schema init, so polling one for an hours-long run is pure
+    # contention with the worker's own writes.
     while True:
         try:
             returncode = process.wait(timeout=1.0)
         except subprocess.TimeoutExpired:
-            if _is_terminal():
-                return True
             continue
-        # The worker can commit its terminal row and exit between the first
-        # read and wait(). Re-read the exact attempt before declaring that
-        # it died without terminalizing.
+        # The worker exited: now the row is authoritative for whether it got
+        # its result down before dying.
         if _is_terminal():
             return True
         # If the adopted worker died without terminalizing, its owner is
