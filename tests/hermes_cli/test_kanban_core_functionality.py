@@ -1391,7 +1391,6 @@ def test_protocol_violation_budget_not_consumed_by_other_failures(kanban_home):
     untouched (so the two budgets stay independent).
     """
     import hermes_cli.kanban_db as _kb
-    from hermes_cli import kanban_db_dispatch as _kbd
     conn = kbc.connect()
     try:
         tid = kb.create_task(conn, title="mixed", assignee="worker")
@@ -1403,28 +1402,23 @@ def test_protocol_violation_budget_not_consumed_by_other_failures(kanban_home):
         assert task.status == "ready"
         assert task.consecutive_failures == 1
 
-        # Two violations after it: streak 1 and 2 — both retry, unified
-        # counter untouched. (Pre-fix: the crash consumed the budget and the
-        # violations blocked well before three of them happened.)
-        for i, pid in enumerate((991001, 991002)):
-            _drive_protocol_violation(conn, tid, pid)
-            task = kb.get_task(conn, tid)
-            assert task.status == "ready", (
-                f"violation {i + 1} after a crash must still retry, "
-                f"got {task.status}"
-            )
-            assert task.consecutive_failures == 1, (
-                "below-budget violations must not tick the unified counter"
-            )
+        # One violation after it: streak 1 retries; the unified counter stays
+        # untouched. (The prior real crash must not consume this separate
+        # protocol-violation budget.)
+        _drive_protocol_violation(conn, tid, 991001)
+        task = kb.get_task(conn, tid)
+        assert task is not None
+        assert task.status == "ready"
+        assert task.consecutive_failures == 1, (
+            "the first protocol violation must not tick the unified counter"
+        )
 
-        # Third consecutive violation: streak hits the bound — blocked.
-        _drive_protocol_violation(conn, tid, 991003)
+        # Second consecutive violation: streak hits the bound — blocked.
+        _drive_protocol_violation(conn, tid, 991002)
         task = kb.get_task(conn, tid)
         assert task.status == "blocked"
         gave_up = [e for e in kb.list_events(conn, tid) if e.kind == "gave_up"]
         assert len(gave_up) == 1
-        assert (gave_up[0].payload or {}).get("protocol_violations") == \
-            _kbd._PROTOCOL_VIOLATION_FAILURE_LIMIT
     finally:
         conn.close()
 
@@ -1437,6 +1431,132 @@ def test_protocol_violation_budget_not_consumed_by_other_failures(kanban_home):
 
 
 
+
+
+def test_clean_exit_protocol_violation_allows_only_one_blind_retry(kanban_home):
+    """A clean exit without a lifecycle report gets one recovery run, then blocks.
+
+    The first exit releases the task with the prior-run error so the next worker
+    can verify and report any already-finished work. A second identical clean
+    exit is not evidence that the task needs another full execution: it must
+    leave a durable ``gave_up`` record and stay blocked for an operator.
+    """
+    conn = kbc.connect()
+    try:
+        tid = kb.create_task(conn, title="bounded-clean-exit", assignee="worker")
+
+        _drive_protocol_violation(conn, tid, 991101)
+        first = kb.get_task(conn, tid)
+        assert first is not None
+        assert first.status == "ready"
+        assert "without calling kanban_complete" in (first.last_failure_error or "")
+
+        _drive_protocol_violation(conn, tid, 991102)
+        second = kb.get_task(conn, tid)
+        assert second is not None
+        assert second.status == "blocked"
+        gave_up = [event for event in kb.list_events(conn, tid) if event.kind == "gave_up"]
+        assert len(gave_up) == 1
+        assert (gave_up[0].payload or {}).get("protocol_violations") == 2
+    finally:
+        conn.close()
+
+
+def test_worker_boundary_parks_completion_handoff_without_blind_rerun(kanban_home, monkeypatch):
+    """A clean worker result parks a credible same-run handoff before process exit."""
+    import cli as cli_module
+
+    conn = kbc.connect()
+    try:
+        tid = kb.create_task(conn, title="recover-handoff", assignee="worker")
+        claimed = kb.claim_task(conn, tid)
+        assert claimed is not None and claimed.current_run_id is not None
+        kb.add_comment(
+            conn,
+            tid,
+            author="worker",
+            body=(
+                "Implementation complete. Commit deadbeef; focused regression tests "
+                "passed; diff is ready for review."
+            ),
+        )
+        monkeypatch.setenv("HERMES_KANBAN_TASK", tid)
+        monkeypatch.setenv("HERMES_KANBAN_BOARD", "default")
+        monkeypatch.setenv("HERMES_KANBAN_RUN_ID", str(claimed.current_run_id))
+        monkeypatch.delenv("HERMES_KANBAN_GOAL_MODE", raising=False)
+        agent = SimpleNamespace(
+            run_conversation=lambda **_kwargs: {
+                "failed": False,
+                "final_response": "done",
+            },
+            session_id="handoff-session",
+            provider="test",
+        )
+        worker_cli = SimpleNamespace(
+            agent=agent,
+            session_id="handoff-session",
+            conversation_history=[],
+        )
+
+        with pytest.raises(SystemExit) as exc:
+            cli_module._run_quiet_single_query(worker_cli, "work kanban task")
+
+        assert exc.value.code == 1
+        current = kb.get_task(conn, tid)
+        assert current is not None and current.status == "blocked"
+        assert "verify/recover prior work" in (current.last_failure_error or "")
+        kinds = [event.kind for event in kb.list_events(conn, tid)]
+        assert "protocol_violation" in kinds
+        assert "blocked" in kinds
+    finally:
+        conn.close()
+
+
+def test_worker_boundary_allows_one_no_evidence_recovery_then_blocks(kanban_home, monkeypatch):
+    """No handoff evidence gets exactly one recovery run, never an endless clean rerun."""
+    import cli as cli_module
+
+    conn = kbc.connect()
+    try:
+        tid = kb.create_task(conn, title="bounded-worker-boundary", assignee="worker")
+        monkeypatch.setenv("HERMES_KANBAN_TASK", tid)
+        monkeypatch.setenv("HERMES_KANBAN_BOARD", "default")
+        monkeypatch.delenv("HERMES_KANBAN_GOAL_MODE", raising=False)
+        agent = SimpleNamespace(
+            run_conversation=lambda **_kwargs: {
+                "failed": False,
+                "final_response": "done",
+            },
+            session_id="bounded-session",
+            provider="test",
+        )
+        worker_cli = SimpleNamespace(
+            agent=agent,
+            session_id="bounded-session",
+            conversation_history=[],
+        )
+        first = kb.claim_task(conn, tid)
+        assert first is not None and first.current_run_id is not None
+        monkeypatch.setenv("HERMES_KANBAN_RUN_ID", str(first.current_run_id))
+        with pytest.raises(SystemExit) as first_exit:
+            cli_module._run_quiet_single_query(worker_cli, "work kanban task")
+        assert first_exit.value.code == 1
+        after_first = kb.get_task(conn, tid)
+        assert after_first is not None and after_first.status == "ready"
+
+        second = kb.claim_task(conn, tid)
+        assert second is not None and second.current_run_id is not None
+        monkeypatch.setenv("HERMES_KANBAN_RUN_ID", str(second.current_run_id))
+        with pytest.raises(SystemExit) as second_exit:
+            cli_module._run_quiet_single_query(worker_cli, "work kanban task")
+        assert second_exit.value.code == 1
+        after_second = kb.get_task(conn, tid)
+        assert after_second is not None and after_second.status == "blocked"
+        gave_up = [event for event in kb.list_events(conn, tid) if event.kind == "gave_up"]
+        assert len(gave_up) == 1
+        assert (gave_up[0].payload or {}).get("protocol_violations") == 2
+    finally:
+        conn.close()
 
 
 def test_notify_sub_starts_caught_up_on_active_task(kanban_home):
