@@ -1779,22 +1779,60 @@ class DispatchPauseBody(BaseModel):
     note: Optional[str] = None
 
 
-@router.get("/dispatch/status")
-def dispatch_status(board: Optional[str] = _BOARD_Q):
-    """Pause state + the board's live running count, for the drain indicator.
+def _dispatch_board_slugs(board: Optional[str], boards: Optional[str]) -> Optional[list[str]]:
+    """Return the explicit active-board fan-out, or ``None`` for one board."""
+    if board is not None and boards is not None:
+        raise HTTPException(status_code=400, detail="pass either board or boards, not both")
+    if boards is None:
+        return None
+    if boards.strip() != "*":
+        raise HTTPException(status_code=400, detail="dispatch aggregate scope requires boards=*")
+    return [meta["slug"] for meta in kanban_db.list_boards(include_archived=False)]
 
-    ``running_count`` is the "is it safe to restart yet" signal: pausing fences
-    NEW dispatch only, so an operator watches this reach 0 before restarting a
-    service whose cgroup would otherwise SIGKILL those workers.
-    """
-    with _board_conn(board) as (board, conn):
-        state = kbd.read_dispatch_pause(board)
+
+def _dispatch_status_for_board(board: Optional[str]) -> dict[str, Any]:
+    with _board_conn(board) as (resolved, conn):
+        state = kbd.read_dispatch_pause(resolved)
         running = int(kanban_db.board_stats(conn)["by_status"].get("running", 0))
     return {
         "paused": state is not None,
         "state": state,
         "running_count": running,
-        "message": kbd.dispatch_pause_message(state, board=board) if state else None,
+        "message": kbd.dispatch_pause_message(state, board=resolved) if state else None,
+    }
+
+
+@router.get("/dispatch/status")
+def dispatch_status(board: Optional[str] = _BOARD_Q, boards: Optional[str] = Query(None)):
+    """Pause state + live running counts for one board or every active board.
+
+    ``running_count`` is the "is it safe to restart yet" signal: pausing fences
+    NEW dispatch only, so an operator watches this reach 0 before restarting a
+    service whose cgroup would otherwise SIGKILL those workers.
+    """
+    slugs = _dispatch_board_slugs(board, boards)
+    if slugs is None:
+        return _dispatch_status_for_board(board)
+
+    statuses: list[dict[str, Any]] = []
+    errors: list[dict[str, str]] = []
+    for slug in slugs:
+        try:
+            statuses.append({"board": slug, **_dispatch_status_for_board(slug)})
+        except Exception as exc:
+            errors.append({"board": slug, "error": str(exc)})
+    paused_count = sum(1 for status in statuses if status["paused"])
+    all_paused = bool(slugs) and paused_count == len(slugs)
+    return {
+        "paused": all_paused,
+        "state": None,
+        "message": None,
+        "board_count": len(slugs),
+        "paused_count": paused_count,
+        "running_count": sum(status["running_count"] for status in statuses),
+        "all_paused": all_paused,
+        "boards": statuses,
+        "errors": errors,
     }
 
 
@@ -1814,19 +1852,62 @@ def _dispatch_target_board(board: Optional[str]) -> str:
 
 
 @router.post("/dispatch/pause")
-def dispatch_pause(payload: Optional[DispatchPauseBody] = None, board: Optional[str] = _BOARD_Q):
-    """Stop claiming/spawning on this board so it can drain. Never kills a worker."""
-    target = _dispatch_target_board(board)
-    return _with_board_pinned(
-        target, lambda: kbd.pause_dispatch(target, note=(payload.note if payload else None)),
-    )
+def dispatch_pause(
+    payload: Optional[DispatchPauseBody] = None,
+    board: Optional[str] = _BOARD_Q,
+    boards: Optional[str] = Query(None),
+):
+    """Stop claiming/spawning on one board or every active board. Never kills a worker."""
+    slugs = _dispatch_board_slugs(board, boards)
+    note = payload.note if payload else None
+    if slugs is None:
+        target = _dispatch_target_board(board)
+        return _with_board_pinned(target, lambda: kbd.pause_dispatch(target, note=note))
+
+    results: list[dict[str, Any]] = []
+    failures: list[dict[str, str]] = []
+    for slug in slugs:
+        try:
+            result = _with_board_pinned(slug, lambda slug=slug: kbd.pause_dispatch(slug, note=note))
+            results.append({"board": slug, **result})
+        except Exception as exc:
+            failures.append({"board": slug, "error": str(exc)})
+    paused_count = sum(1 for result in results if result.get("paused"))
+    return {
+        "paused": bool(slugs) and paused_count == len(slugs),
+        "state": None,
+        "board_count": len(slugs),
+        "paused_count": paused_count,
+        "results": results,
+        "failures": failures,
+    }
 
 
 @router.post("/dispatch/resume")
-def dispatch_resume(board: Optional[str] = _BOARD_Q):
-    """Clear this board's pause — the same entry point `--resume-circuit` uses."""
-    target = _dispatch_target_board(board)
-    return _with_board_pinned(target, lambda: kbd.resume_dispatch(target))
+def dispatch_resume(board: Optional[str] = _BOARD_Q, boards: Optional[str] = Query(None)):
+    """Clear one board's pause or every active board pause."""
+    slugs = _dispatch_board_slugs(board, boards)
+    if slugs is None:
+        target = _dispatch_target_board(board)
+        return _with_board_pinned(target, lambda: kbd.resume_dispatch(target))
+
+    results: list[dict[str, Any]] = []
+    failures: list[dict[str, str]] = []
+    for slug in slugs:
+        try:
+            result = _with_board_pinned(slug, lambda slug=slug: kbd.resume_dispatch(slug))
+            results.append({"board": slug, **result})
+        except Exception as exc:
+            failures.append({"board": slug, "error": str(exc)})
+    resumed_count = sum(1 for result in results if result.get("resumed"))
+    return {
+        "resumed": bool(slugs) and resumed_count == len(slugs),
+        "was_paused": any(result.get("was_paused") for result in results),
+        "board_count": len(slugs),
+        "resumed_count": resumed_count,
+        "results": results,
+        "failures": failures,
+    }
 
 
 @router.get("/model-options")
