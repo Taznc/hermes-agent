@@ -622,7 +622,8 @@ def _record_landing(conn: sqlite3.Connection, task_id: str, result: dict, *, act
     evidence of what was landed rather than a silently-merged, still-open card.
     """
     kb.add_comment(conn, task_id, actor, _receipt_body(result))
-    if kb.get_task(conn, task_id).status != "done":
+    task = kb.get_task(conn, task_id)
+    if task is not None and task.status != "done":
         kb.complete_task(
             conn, task_id, summary=f"Landed on {result['target']} as {result['target_sha'][:12]}",
             metadata={"landing": result},
