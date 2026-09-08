@@ -755,6 +755,76 @@ def test_no_backend_is_attempted_more_than_once_and_attempts_are_bounded():
     asyncio.run(run())
 
 
+def test_a_backend_repeated_in_the_chain_is_still_attempted_only_once():
+    """The visited set, not the list shape, is what bounds attempts.
+
+    A chain can name the same *upstream* twice through two distinct adapter
+    entries; the route context must still refuse the second visit rather than
+    spending the same capped subscription twice on one client request.
+    """
+    calls: List[Dict[str, Any]] = []
+
+    async def run():
+        upstream = _anthropic_upstream(status=503, calls=calls)
+        runner, base = await _serve(upstream)
+        try:
+            adapters = [
+                _StubAdapter("claude-code", "anthropic-messages", f"{base}/v1"),
+                _StubAdapter("claude-code-alias", "anthropic-messages", f"{base}/v1"),
+            ]
+            gateway_runner, gateway_base = await _serve(
+                create_failover_app(
+                    adapters,
+                    circuit=BackendCircuit(failure_threshold=99, cooldown_seconds=0),
+                )
+            )
+            try:
+                async with aiohttp.ClientSession() as session:
+                    async with session.post(
+                        f"{gateway_base}/v1/chat/completions",
+                        json={"model": "m", "messages": [{"role": "user", "content": "hi"}]},
+                    ) as response:
+                        assert response.status == 503
+                        assert response.headers["X-Hermes-Route-Attempt"] == "2"
+            finally:
+                await gateway_runner.cleanup()
+        finally:
+            await runner.cleanup()
+
+        # Two distinct backends, exactly two upstream calls — never a third,
+        # and never a repeat of an already-visited backend.
+        assert len(calls) == 2
+
+    asyncio.run(run())
+
+
+def test_route_selection_never_loops_when_every_backend_keeps_failing():
+    """Exhaustion terminates; selection is not restarted from the top."""
+    claude_calls: List[Dict[str, Any]] = []
+    codex_calls: List[Dict[str, Any]] = []
+
+    async def run():
+        # A permissive breaker cannot mask a loop by short-circuiting.
+        circuit = BackendCircuit(failure_threshold=99, cooldown_seconds=0)
+        async with _Harness(
+            _claude_first(
+                _anthropic_upstream(status=503, calls=claude_calls),
+                _codex_upstream(status=503, calls=codex_calls),
+            ),
+            circuit=circuit,
+        ) as harness:
+            status, headers, _ = await harness.post(
+                "/v1/chat/completions",
+                {"model": "m", "messages": [{"role": "user", "content": "hi"}]},
+            )
+            assert status == 503
+            assert headers["X-Hermes-Route-Attempt"] == "2"
+        assert len(claude_calls) == 1
+        assert len(codex_calls) == 1
+
+    asyncio.run(run())
+
+
 def test_exhaustion_returns_the_last_classified_error_not_a_generic_500():
     async def run():
         async with _Harness(
@@ -978,3 +1048,113 @@ def test_a_successful_request_closes_a_previously_failing_backends_circuit():
         assert circuit.failure_count("claude-code") == 0
 
     asyncio.run(run())
+
+
+# ===========================================================================
+# AC1 — CLI: ordered chain parsing and single-provider backward compatibility
+# ===========================================================================
+
+
+def test_cli_parses_an_ordered_provider_chain():
+    from hermes_cli.proxy.cli import _resolve_backends
+
+    adapters = _resolve_backends("claude-code,openai-codex")
+    assert [adapter.name for adapter in adapters] == ["claude-code", "openai-codex"]
+
+
+def test_cli_resolves_the_codex_alias_inside_a_chain():
+    from hermes_cli.proxy.cli import _resolve_backends
+
+    adapters = _resolve_backends("claude-code, codex")
+    assert [adapter.name for adapter in adapters] == ["claude-code", "openai-codex"]
+
+
+def test_cli_single_provider_still_yields_exactly_one_backend():
+    from hermes_cli.proxy.cli import _resolve_backends
+
+    adapters = _resolve_backends("nous")
+    assert len(adapters) == 1
+    assert adapters[0].name == "nous"
+
+
+def test_cli_rejects_a_chain_that_repeats_one_provider():
+    from hermes_cli.proxy.cli import _resolve_backends
+
+    with pytest.raises(ValueError, match="more than once"):
+        _resolve_backends("claude-code,claude-code")
+
+    # The alias spelling is the same backend and must be caught too.
+    with pytest.raises(ValueError, match="more than once"):
+        _resolve_backends("codex,openai-codex")
+
+
+def test_cli_rejects_an_unknown_provider_in_a_chain():
+    from hermes_cli.proxy.cli import _resolve_backends
+
+    with pytest.raises(ValueError, match="Unknown proxy upstream provider"):
+        _resolve_backends("claude-code,not-a-provider")
+
+
+def test_cli_start_refuses_a_loopback_only_chain_on_a_public_bind_host(capsys):
+    from types import SimpleNamespace
+    from hermes_cli.proxy.cli import cmd_proxy_start
+
+    code = cmd_proxy_start(
+        SimpleNamespace(
+            provider="claude-code,openai-codex",
+            host="0.0.0.0",
+            port=8645,
+            auth_token_file=None,
+        )
+    )
+    assert code == 2
+    assert "loopback-only" in capsys.readouterr().err
+
+
+def test_cli_start_requires_a_client_token_for_a_chain_needing_auth(capsys):
+    from types import SimpleNamespace
+    from hermes_cli.proxy.cli import cmd_proxy_start
+
+    code = cmd_proxy_start(
+        SimpleNamespace(
+            provider="claude-code,openai-codex",
+            host="127.0.0.1",
+            port=8645,
+            auth_token_file=None,
+        )
+    )
+    assert code == 2
+    assert "--auth-token-file" in capsys.readouterr().err
+
+
+def test_run_server_builds_the_failover_app_for_a_chain(monkeypatch):
+    """A list reaches create_failover_app; a single adapter reaches create_app."""
+    import hermes_cli.proxy.server as server_module
+
+    built: List[str] = []
+
+    def fake_failover(adapters, **kwargs):
+        built.append("failover")
+        return web.Application()
+
+    def fake_single(adapter, **kwargs):
+        built.append("single")
+        return web.Application()
+
+    import hermes_cli.proxy.gateway as gateway_module
+
+    monkeypatch.setattr(gateway_module, "create_failover_app", fake_failover)
+    monkeypatch.setattr(server_module, "create_app", fake_single)
+
+    async def run():
+        chain = [
+            _StubAdapter("claude-code", "anthropic-messages", "http://x/v1"),
+            _StubAdapter("openai-codex", "openai-responses", "http://y/v1"),
+        ]
+        stop = asyncio.Event()
+        stop.set()
+        await server_module.run_server(chain, host="127.0.0.1", port=0, shutdown_event=stop)
+        await server_module.run_server(chain[0], host="127.0.0.1", port=0, shutdown_event=stop)
+
+    asyncio.run(run())
+    assert built == ["failover", "single"]

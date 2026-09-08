@@ -337,7 +337,11 @@ def build_gateway_parser(
     proxy_start.add_argument(
         "--provider",
         default="nous",
-        help="Upstream provider: claude-code, codex, nous, or xai (default: nous). See `hermes proxy providers`.",
+        help=(
+            "Upstream provider: claude-code, codex, nous, or xai (default: nous). "
+            "Comma-separate two or more for an ordered failover chain "
+            "(e.g. claude-code,openai-codex). See `hermes proxy providers`."
+        ),
     )
     proxy_start.add_argument(
         "--host",

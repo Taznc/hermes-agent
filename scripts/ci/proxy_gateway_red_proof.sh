@@ -26,7 +26,13 @@ restore() {
 trap restore EXIT
 
 run_suite() {
-  scripts/run_tests.sh tests/hermes_cli/test_proxy_gateway.py 2>&1 | grep -E "^=== Summary" | tail -1
+  # Both suites: the gateway integration contract AND the routing unit
+  # contract. The attempt bound is a RouteContext invariant that the visited
+  # set already makes unreachable at the gateway level, so it can only be
+  # RED-proven at the unit level — running one suite alone would score that
+  # mutation as vacuous when it is in fact covered.
+  scripts/run_tests.sh tests/hermes_cli/test_proxy_gateway.py \
+    tests/hermes_cli/test_proxy_failover.py 2>&1 | grep -E "^=== Summary" | tail -1
 }
 
 check_mutation() {

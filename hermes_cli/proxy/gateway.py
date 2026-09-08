@@ -167,12 +167,25 @@ def create_failover_app(
         last: Optional[LegOutcome] = None
         skipped: List[str] = []
 
-        for adapter in backends:
+        # Selection is driven by the route context, not by iterating the
+        # backend list: each pass asks for the next backend the contract still
+        # permits. That is what makes "at most once per backend, bounded total
+        # attempts" a property of the loop rather than of its shape.
+        while True:
+            adapter = next(
+                (
+                    candidate
+                    for candidate in backends
+                    if context.may_attempt(candidate.name)
+                ),
+                None,
+            )
+            if adapter is None:
+                break
             name = adapter.name
-            if not context.may_attempt(name):
-                continue
             if not breaker.allows(name):
                 skipped.append(name)
+                context.record_attempt(name)
                 continue
             try:
                 credential = await asyncio.to_thread(adapter.get_credential)
