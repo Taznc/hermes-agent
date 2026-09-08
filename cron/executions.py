@@ -7,6 +7,7 @@ immutable.
 
 from __future__ import annotations
 
+import logging
 import os
 import sqlite3
 import threading
@@ -14,11 +15,13 @@ import time
 import uuid
 from contextlib import contextmanager
 from pathlib import Path
-from typing import Any, Dict, Iterator, List, Optional
+from typing import Any, Callable, Dict, Iterator, List, Optional
 
 from cron.ledger import ledger_transaction, open_ledger, prepare_ledger
 from hermes_constants import get_hermes_home
 from hermes_time import now as _hermes_now
+
+logger = logging.getLogger(__name__)
 
 # Optional test override. Production resolves the path at transaction time so dashboard operations
 # that temporarily enter another profile cannot leak that profile's records into the import-time
@@ -27,8 +30,41 @@ EXECUTIONS_FILE: Optional[Path] = None
 MAX_TERMINAL_EXECUTIONS = 1000
 HANDOFF_ADOPTION_GRACE_SECONDS = 30.0
 _TERMINAL_STATES = ("completed", "failed", "unknown")
+
+# Terminal error text for an attempt whose owner process is proved gone. Kept as a module constant
+# because the incident classifier and the retry sweep both key on this exact interruption.
+RECOVERED_INTERRUPTION_ERROR = (
+    "Scheduler restarted after this execution's owner exited before a durable terminal state; "
+    "whether side effects ran is unknown."
+)
 _lock = threading.RLock()
 _PROCESS_ID = uuid.uuid4().hex
+
+# Interruption error text written before the ``interrupted`` column existed. Matching on text is
+# wrong for NEW rows (that is the whole point of the column), but it is the only evidence the
+# already-recorded rows carry, and adopting them once at migration time is what makes the failures
+# that motivated this feature visible instead of stranding them as untyped ``unknown`` history.
+_LEGACY_INTERRUPTION_ERRORS = (
+    "Interrupted by shutdown before terminal completion.",
+    "Interrupted by gateway shutdown before terminal completion.",
+    RECOVERED_INTERRUPTION_ERROR,
+)
+
+
+def _adopt_legacy_interruptions(conn: sqlite3.Connection) -> int:
+    """Backfill ``interrupted`` for pre-migration rows; returns how many were adopted.
+
+    Runs exactly once, in the transaction that adds the column, so it can never re-classify a row
+    the running code has since written. Only terminal failures are considered: a completed run is
+    never an interruption whatever its error text says.
+    """
+    placeholders = ",".join("?" for _ in _LEGACY_INTERRUPTION_ERRORS)
+    cur = conn.execute(
+        f"""UPDATE executions SET interrupted=1
+            WHERE status IN ('failed','unknown') AND error IN ({placeholders})""",
+        _LEGACY_INTERRUPTION_ERRORS,
+    )
+    return cur.rowcount or 0
 
 
 # --- executions ledger --------------------------------------------------------------------------
@@ -66,6 +102,19 @@ def _initialize_schema(conn: sqlite3.Connection) -> None:
     add_column_if_missing(
         conn, "executions", "handoff_started_at", "handoff_started_at REAL"
     )
+    # Durable interruption facts. ``interrupted`` says an attempt died to a shutdown/abandonment
+    # rather than to its own failure — a persisted fact, not a substring match on ``error``.
+    # ``retry_state`` is the at-most-once replay decision for that occurrence (NULL = undecided).
+    if add_column_if_missing(
+        conn, "executions", "interrupted",
+        "interrupted INTEGER NOT NULL DEFAULT 0",
+    ):
+        _adopt_legacy_interruptions(conn)
+    add_column_if_missing(conn, "executions", "retry_state", "retry_state TEXT")
+    # Lineage of a replay: the interrupted attempt this row was created to recover. Durable on the
+    # ledger because the job's ``interrupted_retry`` stamp is transient — a successful replay
+    # clears it, and history would then be unable to tell the replay from an ordinary run.
+    add_column_if_missing(conn, "executions", "retry_of", "retry_of TEXT")
     conn.execute(
         "CREATE INDEX IF NOT EXISTS idx_executions_job_claimed "
         "ON executions(job_id, claimed_at DESC, id DESC)"
@@ -150,14 +199,38 @@ def create_execution(
         conn.execute(
             """INSERT INTO executions
                (id, job_id, source, process_id, pid, process_started_at,
-                status, claimed_at, scheduled_instant)
-               VALUES (?, ?, ?, ?, ?, ?, 'claimed', ?, ?)""",
+                status, claimed_at, scheduled_instant, retry_of)
+               VALUES (?, ?, ?, ?, ?, ?, 'claimed', ?, ?, ?)""",
             (execution_id, str(job_id), str(source), _PROCESS_ID, pid,
-             _process_start_time(pid), now, canonical_instant(scheduled_instant)),
+             _process_start_time(pid), now, canonical_instant(scheduled_instant), None),
         )
         record = _fetch(conn, execution_id)
     _emit_execution_state(record)
     return record  # type: ignore[return-value]
+
+
+def bind_interrupted_retry_lineage(
+    execution_id: str, job_id: str, retry_of: Optional[str],
+) -> Optional[Dict[str, Any]]:
+    """Bind replay lineage only after this durable attempt won the job's fire claim.
+
+    Creating a ledger row is only admission to the ownership race. Binding before the jobs-store
+    CAS lets a losing contender consume the replay, and mutating jobs.json before the INSERT lets
+    an INSERT failure point the stamp at a nonexistent row. The winner calls this after both the
+    INSERT and fire claim are durable, but before any user side effect starts.
+    """
+    if not retry_of:
+        return get_execution(execution_id)
+    with _transaction() as conn:
+        cur = conn.execute(
+            """UPDATE executions SET retry_of=?
+               WHERE id=? AND job_id=? AND status='claimed'
+                 AND (retry_of IS NULL OR retry_of=?)""",
+            (str(retry_of), str(execution_id), str(job_id), str(retry_of)),
+        )
+        if cur.rowcount != 1:
+            return None
+        return _fetch(conn, execution_id)
 
 
 def set_execution_occurrence(execution_id: str, instant: Optional[str]) -> None:
@@ -238,9 +311,13 @@ def mark_execution_running(execution_id: str) -> Optional[Dict[str, Any]]:
 
 def finish_execution(
     execution_id: str, *, success: bool, error: Optional[str] = None,
-    delivery_outcome: Optional[str] = None,
+    delivery_outcome: Optional[str] = None, interrupted: bool = False,
 ) -> Optional[Dict[str, Any]]:
-    """Write a terminal result once; terminal attempts cannot be rewritten."""
+    """Write a terminal result once; terminal attempts cannot be rewritten.
+
+    ``interrupted`` records that the attempt died to a shutdown/ownership loss rather than to its
+    own failure, so the reconciler can find it without parsing ``error``.
+    """
     now = _hermes_now().isoformat()
     status = "completed" if success else "failed"
     detail = None if success else (str(error) if error else "unknown failure")
@@ -248,10 +325,12 @@ def finish_execution(
         cur = conn.execute(
             """UPDATE executions
                SET status=?, finished_at=?, error=?, handoff_pending=0,
-                   handoff_started_at=NULL, delivery_outcome=?
+                   handoff_started_at=NULL, delivery_outcome=?, interrupted=?
                WHERE id=? AND status IN ('claimed','running')
                  AND process_id=? AND pid=?""",
-            (status, now, detail, delivery_outcome, execution_id, _PROCESS_ID, os.getpid()),
+            (status, now, detail, delivery_outcome,
+             1 if (interrupted and not success) else 0,
+             execution_id, _PROCESS_ID, os.getpid()),
         )
         if cur.rowcount != 1:
             return None
@@ -288,14 +367,12 @@ def recover_interrupted_executions() -> int:
                 continue
             cur = conn.execute(
                 """UPDATE executions
-                   SET status='unknown', finished_at=?, error=?,
+                   SET status='unknown', finished_at=?, error=?, interrupted=1,
                        handoff_pending=0, handoff_started_at=NULL
                    WHERE id=? AND status=? AND process_id=? AND pid=?
                      AND handoff_pending=?
                      AND handoff_started_at IS ?""",
-                (now,
-                 "Scheduler restarted after this execution's owner exited before a durable "
-                 "terminal state; whether side effects ran is unknown.",
+                (now, RECOVERED_INTERRUPTION_ERROR,
                  row["id"], row["status"], row["process_id"], row["pid"],
                  row["handoff_pending"], row["handoff_started_at"]),
             )
@@ -309,6 +386,102 @@ def recover_interrupted_executions() -> int:
     for record in recovered:
         _emit_execution_state(record)
     return changed
+
+
+def list_undecided_interruptions(limit: int = 50) -> List[Dict[str, Any]]:
+    """Interrupted attempts with no replay decision yet, oldest first.
+
+    Oldest-first because the reconciler applies a freshness bound: the oldest undecided occurrence
+    is the one that decides (retry or decline) first, so a backlog drains deterministically.
+    """
+    with _transaction() as conn:
+        rows = conn.execute(
+            """SELECT * FROM executions
+               WHERE interrupted=1 AND retry_state IS NULL
+               ORDER BY claimed_at ASC, id ASC LIMIT ?""",
+            (max(1, min(int(limit), 500)),),
+        ).fetchall()
+    return [dict(row) for row in rows]
+
+
+def has_replay_of(execution_id: str) -> bool:
+    """Return whether a durable attempt already names this interrupted occurrence.
+
+    This is the recovery witness when a replay finishes and clears its transient jobs.json stamp
+    after queueing landed but before the original row's retry decision committed.
+    """
+    with _transaction() as conn:
+        row = conn.execute(
+            "SELECT 1 FROM executions WHERE retry_of=? LIMIT 1", (str(execution_id),)
+        ).fetchone()
+    return row is not None
+
+
+def claim_retry_decision(execution_id: str, decision: str) -> bool:
+    """Record the one-and-only replay decision for an interrupted attempt.
+
+    The compare-and-swap on ``retry_state IS NULL`` inside the ledger transaction is what makes the
+    replay at-most-once: two reconcilers racing on one occurrence cannot both win, so a restart
+    storm can never fan one lost occurrence out into several runs.
+    """
+    with _transaction() as conn:
+        cur = conn.execute(
+            """UPDATE executions SET retry_state=?
+               WHERE id=? AND interrupted=1 AND retry_state IS NULL""",
+            (str(decision), str(execution_id)),
+        )
+        return cur.rowcount == 1
+
+
+def finalize_retry_decision(
+    execution_id: str,
+    resolver: Callable[[sqlite3.Connection, Dict[str, Any], Callable[[str], None]], Any],
+) -> Any:
+    """Resolve one interruption while holding its ledger write transaction.
+
+    ``resolver`` may take the job/fire locks, re-check cross-store eligibility, mutate jobs.json,
+    then invoke ``commit(decision)`` before releasing those locks. A crash after either the
+    prepared or queued jobs write but before this commit leaves the row undecided; the matching
+    stamp (or a replay row's durable lineage if it already ran) makes the next sweep recoverable.
+    """
+    with _transaction() as conn:
+        row = conn.execute(
+            "SELECT * FROM executions WHERE id=? AND interrupted=1 AND retry_state IS NULL",
+            (str(execution_id),),
+        ).fetchone()
+        if row is None:
+            return None
+
+        def commit(decision: str) -> None:
+            cur = conn.execute(
+                """UPDATE executions SET retry_state=?
+                   WHERE id=? AND interrupted=1 AND retry_state IS NULL""",
+                (str(decision), str(execution_id)),
+            )
+            if cur.rowcount != 1:
+                raise RuntimeError("Interrupted cron retry decision lost its ledger ownership")
+            # Commit while the resolver still holds the job/fire locks. A pause or fire therefore
+            # orders wholly before or after the durable decision, never between store writes.
+            conn.commit()
+
+        return resolver(conn, dict(row), commit)
+
+
+def transaction_has_live_attempt(
+    conn: sqlite3.Connection, job_id: str, *, excluding: Optional[str] = None,
+) -> bool:
+    """Check claimed/running attempts using an already-held ledger transaction."""
+    params: List[Any] = [str(job_id)]
+    exclude_sql = ""
+    if excluding is not None:
+        exclude_sql = " AND id != ?"
+        params.append(str(excluding))
+    row = conn.execute(
+        "SELECT 1 FROM executions WHERE job_id=? AND status IN ('claimed','running')"
+        + exclude_sql + " LIMIT 1",
+        params,
+    ).fetchone()
+    return row is not None
 
 
 def list_executions(
