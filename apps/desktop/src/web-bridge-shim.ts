@@ -374,6 +374,137 @@ const READY_BOOT = {
   timestamp: Date.now()
 }
 
+// ── VS Code Marketplace theme search (themes.searchMarketplace) ────────────
+// Electron's counterpart (electron/vscode-marketplace.ts) runs this same
+// query from the MAIN process; the gallery API sends
+// `Access-Control-Allow-Origin: *` (verified live), so the browser can call
+// it directly with no backend proxy and no new /api/* route. Mirrors
+// searchMarketplaceThemes()'s filters/flags/icon-theme exclusion exactly so
+// results match the Electron build byte-for-byte.
+//
+// themes.fetchMarketplace (theme INSTALL — downloading + unzipping a .vsix)
+// is deliberately NOT implemented here: it needs to parse an untrusted zip
+// and raw-deflate-inflate its entries client-side, a materially bigger and
+// security-sensitive lift than this card's slice. src/themes/install.ts
+// already throws a clear, visible "only available in the desktop app" error
+// when this member is absent — an honest gap, not a silent one. Followup
+// filed for install (t_d40923b6 completion metadata).
+interface MarketplaceSearchItem {
+  extensionId: string
+  displayName: string
+  publisher: string
+  description: string
+  installs: number
+}
+
+const GALLERY_QUERY_URL = 'https://marketplace.visualstudio.com/_apis/public/gallery/extensionquery'
+
+function looksLikeIconTheme(extension: {
+  tags?: unknown
+  displayName?: unknown
+  shortDescription?: unknown
+}): boolean {
+  const tags = (Array.isArray(extension.tags) ? extension.tags : []).map(tag => String(tag).toLowerCase())
+
+  if (tags.includes('icon-theme') || tags.includes('product-icon-theme')) {
+    return true
+  }
+
+  const text = `${extension.displayName ?? ''} ${extension.shortDescription ?? ''}`.toLowerCase()
+
+  return /\b(icon theme|file icons?|product icons?|icon pack|fileicons)\b/.test(text)
+}
+
+async function searchMarketplaceThemes(query: string): Promise<MarketplaceSearchItem[]> {
+  const trimmedQuery = String(query || '').trim()
+  const pageSize = 20
+
+  // FilterType: 8=Target, 5=Category, 10=SearchText, 12=ExcludeWithFlags.
+  const criteria: Array<{ filterType: number; value: string }> = [
+    { filterType: 8, value: 'Microsoft.VisualStudio.Code' },
+    { filterType: 5, value: 'Themes' },
+    { filterType: 12, value: '4096' } // Exclude unpublished (Unpublished = 0x1000).
+  ]
+
+  if (trimmedQuery) {
+    criteria.push({ filterType: 10, value: trimmedQuery })
+  }
+
+  const res = await fetch(GALLERY_QUERY_URL, {
+    method: 'POST',
+    headers: {
+      Accept: 'application/json;api-version=3.0-preview.1',
+      'Content-Type': 'application/json'
+    },
+    body: JSON.stringify({
+      // Over-fetch so the icon-theme filter below still leaves a full page.
+      filters: [{ criteria, pageNumber: 1, pageSize: Math.min(pageSize * 2, 50), sortBy: 4, sortOrder: 0 }],
+      // IncludeStatistics (0x100) | IncludeLatestVersionOnly (0x200) | IncludeCategoryAndTags (0x4).
+      flags: 772
+    })
+  })
+
+  if (!res.ok) {
+    throw new Error(`VS Code Marketplace search failed: ${res.status}`)
+  }
+
+  const responseText = await res.text()
+  const json = responseText ? JSON.parse(responseText) : {}
+  const extensions: Array<Record<string, unknown>> = json?.results?.[0]?.extensions ?? []
+
+  return extensions
+    .filter(extension => !looksLikeIconTheme(extension))
+    .slice(0, pageSize)
+    .map(extension => {
+      const publisher = (extension.publisher ?? {}) as { publisherName?: string; displayName?: string }
+      const publisherName = publisher.publisherName ?? ''
+      const stats = Array.isArray(extension.statistics) ? extension.statistics : []
+
+      const installStat = stats.find(
+        (stat): stat is { statisticName?: string; value?: number } =>
+          Boolean(stat) && typeof stat === 'object' && (stat as { statisticName?: string }).statisticName === 'install'
+      )
+
+      return {
+        extensionId: `${publisherName}.${extension.extensionName as string}`,
+        displayName: (extension.displayName as string) || (extension.extensionName as string),
+        publisher: publisher.displayName || publisherName,
+        description: (extension.shortDescription as string) || '',
+        installs: Math.round(installStat?.value ?? 0)
+      }
+    })
+}
+
+// ── Local Models plumbing (localModelsEnabled) ──────────────────────────────
+// Electron's member is a LAUNCH-FLAG fact (--local), deliberately decoupled
+// from whether the backend actually has local models configured — see the
+// doc comment on $localModelsEnabled in store/local-models-flag.ts. The web
+// build has no launch-flag equivalent (no separate opt-in build a user
+// starts), so the only honest signal here is the backend route itself:
+// GET /api/local-models/status -> { enabled: boolean, ... }.
+//
+// $localModelsEnabled reads window.hermesDesktop?.localModelsEnabled exactly
+// ONCE at its own module-import time (matching Electron's "can't change
+// mid-session" contract), so mutating this bridge field after the fact does
+// nothing on its own — the correction below updates the store directly, the
+// same thing a real launch-flag reader would have produced had it been true
+// from the start. Safe default (false) until the async read resolves; a
+// rejecting fetch leaves the store at that safe default rather than throwing
+// unhandled.
+async function correctLocalModelsEnabledFlag(): Promise<void> {
+  try {
+    const status = await api<{ enabled?: boolean }>({ path: '/api/local-models/status' })
+
+    if (status?.enabled) {
+      const { $localModelsEnabled } = await import('@/store/local-models-flag')
+
+      $localModelsEnabled.set(true)
+    }
+  } catch (err) {
+    console.warn('[web-bridge-shim] could not read /api/local-models/status; local models stay hidden', err)
+  }
+}
+
 async function api<T>(request: SpikeApiRequest): Promise<T> {
   const url = new URL(request.path, BASE_URL)
 
@@ -905,19 +1036,29 @@ const shim = {
 
   // Module-init platform facts — force the browser answer, not the UA sniff.
   glassSupported: false,
-  translucencySupported: false
+  translucencySupported: false,
+
+  // ── theme marketplace (search only; install stays omitted, see above) ────
+  themes: {
+    searchMarketplace: searchMarketplaceThemes
+  },
+
+  // ── local models: safe default, corrected async below (no launch flag) ──
+  localModelsEnabled: false
 
   // OMITTED ON PURPOSE (consumers optional-chained/feature-gated): terminal,
   // git, petOverlay, hud, quickEntry, wakeIndicator, zoom, updates, uninstall,
-  // themes, cloud, connections, settings, findInPage*, getBootstrapState/
-  // onBootstrapEvent (must stay omitted TOGETHER), readFileDataUrl,
-  // openSessionWindow/openWindow, writeClipboard, setActiveWork,
-  // setTranslucency, battery, watchPreviewFile/watchDirectory/
-  // stopPreviewFileWatch, contextMenu*, and the REMAINING oauth*/ssh*/
-  // connection-config surfaces (getConnectionConfig stays omitted — it is the
-  // sentinel that gates Settings → Gateway and the boot-failure overlay;
-  // applyConnectionConfig + oauthLoginConnectionConfig above are the two
-  // reachable exceptions).
+  // themes.fetchMarketplace (install), installDesktopPlugin, probePluginRepo,
+  // mcpOauth (browser popup fallback lives in lib/mcp-dashboard-oauth.ts
+  // instead — no loopback listener possible from a tab), cloud, connections,
+  // settings, findInPage*, getBootstrapState/onBootstrapEvent (must stay
+  // omitted TOGETHER), readFileDataUrl, openSessionWindow/openWindow,
+  // writeClipboard, setActiveWork, setTranslucency, battery,
+  // watchPreviewFile/watchDirectory/stopPreviewFileWatch, contextMenu*, and
+  // the REMAINING oauth*/ssh*/connection-config surfaces (getConnectionConfig
+  // stays omitted — it is the sentinel that gates Settings → Gateway and the
+  // boot-failure overlay; applyConnectionConfig + oauthLoginConnectionConfig
+  // above are the two reachable exceptions).
   //
   // readFileDataUrl in particular MUST stay omitted: desktop-fs's
   // readDesktopFileDataUrlLocalFirst tries the bridge before the gateway, so
@@ -931,8 +1072,13 @@ const shim = {
   // instead of a push notification; disk plugins (account-limits included)
   // still discover and load correctly on the initial scan/poll via
   // desktopPluginsRoot/agentPluginsRoot + readDir/readPluginSource above.
-} as const
+}
 
 ;(window as unknown as { hermesDesktop: unknown }).hermesDesktop = shim
+
+// Fire-and-forget: corrects $localModelsEnabled once the backend answers.
+// Must run AFTER window.hermesDesktop is assigned (the store import chain
+// eventually reads it), and must never block first paint.
+void correctLocalModelsEnabledFlag()
 
 export {}

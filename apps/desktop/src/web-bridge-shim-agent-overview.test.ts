@@ -39,6 +39,15 @@ function jsonResponse(body: unknown, init?: { status?: number }) {
   } as Response)
 }
 
+// web-bridge-shim.ts also fires a fire-and-forget GET /api/local-models/status
+// at module load (t_d40923b6, correctLocalModelsEnabledFlag) — unrelated to
+// getAgentOverview, but it shares this file's single global fetchMock. Every
+// mock below must answer it generically without counting it as an
+// agent-overview call.
+function isLocalModelsStatusRequest(url: unknown): boolean {
+  return String(url).includes('/api/local-models/status')
+}
+
 const HISTORY_PAGE = {
   sessions: [{ id: 's1', profile: 'default', title: 'First session', message_count: 3 }],
   canonical: [],
@@ -75,6 +84,10 @@ describe('web-bridge-shim getAgentOverview', () => {
 
   it('is defined and returns sources with the rows the route reported', async () => {
     fetchMock.mockImplementation((url: URL) => {
+      if (isLocalModelsStatusRequest(url)) {
+        return jsonResponse({ enabled: false })
+      }
+
       expect(String(url)).toContain('/api/profiles/agent-overview')
 
       return jsonResponse(HISTORY_PAGE)
@@ -101,6 +114,10 @@ describe('web-bridge-shim getAgentOverview', () => {
   it('force bypasses the collector 60s history cache', async () => {
     let calls = 0
     fetchMock.mockImplementation((url: URL) => {
+      if (isLocalModelsStatusRequest(url)) {
+        return jsonResponse({ enabled: false })
+      }
+
       calls += 1
       const path = String(url)
 
@@ -122,13 +139,15 @@ describe('web-bridge-shim getAgentOverview', () => {
     // No force: cached history (<60s old) short-circuits to a live_only read.
     await getAgentOverview()
     expect(calls).toBe(2)
-    const secondCallUrl = String(fetchMock.mock.calls[1][0])
+    const agentOverviewCalls = fetchMock.mock.calls.filter(call => !isLocalModelsStatusRequest(call[0]))
+    const secondCallUrl = String(agentOverviewCalls[1][0])
     expect(secondCallUrl).toContain('live_only=true')
 
     // force: true bypasses the cache and re-reads full history from offset 0.
     await getAgentOverview({ force: true })
     expect(calls).toBe(3)
-    const thirdCallUrl = String(fetchMock.mock.calls[2][0])
+    const allAgentOverviewCalls = fetchMock.mock.calls.filter(call => !isLocalModelsStatusRequest(call[0]))
+    const thirdCallUrl = String(allAgentOverviewCalls[2][0])
     expect(thirdCallUrl).not.toContain('live_only=true')
     expect(thirdCallUrl).toContain('offset=0')
   })
@@ -145,6 +164,10 @@ describe('web-bridge-shim getAgentOverview', () => {
     const requestedPaths: string[] = []
 
     fetchMock.mockImplementation((url: URL) => {
+      if (isLocalModelsStatusRequest(url)) {
+        return jsonResponse({ enabled: false })
+      }
+
       requestedPaths.push(new URL(String(url)).pathname)
 
       return jsonResponse({ error: 'not found' }, { status: 404 })
@@ -160,6 +183,10 @@ describe('web-bridge-shim getAgentOverview', () => {
     const requestedPaths: string[] = []
 
     fetchMock.mockImplementation((url: URL) => {
+      if (isLocalModelsStatusRequest(url)) {
+        return jsonResponse({ enabled: false })
+      }
+
       requestedPaths.push(new URL(String(url)).pathname)
 
       return jsonResponse({ error: 'not found' }, { status: 404 })
@@ -177,7 +204,11 @@ describe('web-bridge-shim getAgentOverview', () => {
     // ('partial': got a first page, then a later page failed) which must
     // keep resolving so the renderer can show the rows it does have.
     let calls = 0
-    fetchMock.mockImplementation(() => {
+    fetchMock.mockImplementation((url: URL) => {
+      if (isLocalModelsStatusRequest(url)) {
+        return jsonResponse({ enabled: false })
+      }
+
       calls += 1
 
       if (calls === 1) {

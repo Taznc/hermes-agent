@@ -32,9 +32,20 @@ export class McpOAuthCancelled extends Error {
 const defaultSleep = (milliseconds: number) => new Promise<void>(resolve => window.setTimeout(resolve, milliseconds))
 const UPDATE_BACKEND = 'Update the Hermes backend to support Desktop MCP OAuth callbacks.'
 
-/** Remote gateways require the Desktop callback bridge. An explicitly local
- *  gateway can host its own loopback listener when that capability is absent. */
-export async function completeMcpDesktopOAuth({
+/**
+ * Browser-native fallback used when window.hermesDesktop.mcpOauth is absent
+ * (the web build — a browser tab cannot host a loopback HTTP listener, so
+ * Electron's IPC-relayed flow does not apply here at all). The REST
+ * `/api/mcp/servers/{name}/auth` route already tells the SERVER to host its
+ * own loopback listener when no `client_redirect_uri` is supplied — the same
+ * code path completeMcpDesktopOAuth's `!listener` branch above already
+ * exercises for a local Electron connection — so this needs no new backend
+ * route, just a browser-appropriate driver: open a popup synchronously
+ * (before the first await, so browsers don't block it as unsolicited),
+ * start the flow, navigate the popup to the authorization URL, and poll
+ * `/api/mcp/oauth/flows/{flow_id}` until it settles.
+ */
+async function completeMcpBrowserOAuth({
   serverName,
   profile,
   cancelled,
@@ -44,12 +55,144 @@ export async function completeMcpDesktopOAuth({
 }: CompleteOptions): Promise<McpOAuthFlow> {
   const deadline = Date.now() + timeoutMs
   const scope = capabilityScoped(profile)
+
+  // Open synchronously from the click handler, before the first await.
+  // Browsers otherwise classify the later navigation as an unsolicited popup
+  // and block it. Mirrors the dashboard's completeMcpDashboardOAuth
+  // (web/src/lib/mcp-dashboard-oauth.ts).
+  const authWindow = window.open('about:blank', '_blank') as Window | null
+
+  if (!authWindow) {
+    throw new Error('OAuth popup was blocked — allow popups for this app and retry.')
+  }
+
+  authWindow.opener = null
+
+  let flowId: string | undefined
+  let approved = false
+
+  const checkCancelled = () => {
+    if (cancelled?.()) {
+      throw new McpOAuthCancelled()
+    }
+  }
+
+  try {
+    checkCancelled()
+
+    const started = await window.hermesDesktop.api<{
+      flow_id: string
+      status: string
+      authorization_url: string | null
+      error: string | null
+    }>({
+      ...scope,
+      path: `/api/mcp/servers/${encodeURIComponent(serverName)}/auth`,
+      method: 'POST'
+    })
+
+    flowId = started.flow_id
+    checkCancelled()
+
+    if (started.status === 'error') {
+      throw new Error(started.error || 'MCP OAuth failed to start')
+    }
+
+    if (!started.authorization_url) {
+      throw new Error('OAuth server did not provide an authorization URL')
+    }
+
+    authWindow.location.href = started.authorization_url
+
+    let pollFailures = 0
+
+    for (;;) {
+      checkCancelled()
+
+      if (Date.now() >= deadline) {
+        throw new Error('Timed out waiting for MCP OAuth authorization')
+      }
+
+      let current: { status: string; error: string | null; tools?: McpOAuthFlow['tools'] }
+
+      try {
+        current = await window.hermesDesktop.api({
+          ...scope,
+          path: `/api/mcp/oauth/flows/${encodeURIComponent(flowId)}`
+        })
+        pollFailures = 0
+      } catch (error) {
+        if (++pollFailures >= maxPollFailures) {
+          throw error
+        }
+
+        await sleep(1000)
+
+        continue
+      }
+
+      checkCancelled()
+
+      if (current.status === 'approved') {
+        approved = true
+
+        return {
+          flow_id: flowId,
+          server_name: serverName,
+          status: 'approved',
+          authorization_url: started.authorization_url,
+          error: null,
+          tools: current.tools
+        }
+      }
+
+      if (current.status === 'error') {
+        throw new Error(current.error || 'OAuth authorization failed')
+      }
+
+      if (authWindow.closed) {
+        throw new Error('OAuth authorization window was closed before completion')
+      }
+
+      await sleep(1000)
+    }
+  } finally {
+    if (!authWindow.closed) {
+      authWindow.close()
+    }
+
+    if (flowId && !approved) {
+      await window.hermesDesktop
+        .api({ ...scope, path: `/api/mcp/oauth/flows/${encodeURIComponent(flowId)}`, method: 'DELETE' })
+        .catch(() => {
+          // Best-effort cleanup; the flow TTLs out server-side regardless.
+        })
+    }
+  }
+}
+
+/** Remote gateways require the Desktop callback bridge. An explicitly local
+ *  gateway can host its own loopback listener when that capability is absent.
+ *  On the web build the bridge namespace never exists at all — see
+ *  completeMcpBrowserOAuth above for that path. */
+export async function completeMcpDesktopOAuth(options: CompleteOptions): Promise<McpOAuthFlow> {
+  const { serverName, profile, cancelled, sleep = defaultSleep, maxPollFailures = 3, timeoutMs = 360_000 } = options
+  const deadline = Date.now() + timeoutMs
+  const scope = capabilityScoped(profile)
   const rpc = mcpOAuthRpc(scope)
   const bridge = window.hermesDesktop.mcpOauth
 
-  // A legacy null connection can resolve to a remote registry primary.
-  if (!bridge && scope.connectionId !== 'local') {
-    throw new Error('Update Hermes Desktop to support MCP OAuth callbacks.')
+  if (!bridge) {
+    // A legacy null connection can resolve to a remote registry primary,
+    // where the compat message is still correct (an OLD Electron build
+    // predating the bridge, dialed at 'local'). Everywhere else — including
+    // every web-shim call, which never defines mcpOauth at all — this is the
+    // browser-native path instead of a hard failure.
+    if (scope.connectionId === 'local') {
+      throw new Error('Update Hermes Desktop to support MCP OAuth callbacks.')
+    }
+
+    return completeMcpBrowserOAuth(options)
   }
 
   let listener: { id: string; redirectUri: string } | undefined
