@@ -130,6 +130,123 @@ class TestTheDecisionSurvivesACrashBeforeArming:
             assert executions.get_execution(record["id"])["retry_state"] == "scheduled"
             assert cron_jobs.get_job(job["id"])["interrupted_retry"]["execution_id"] == record["id"]
 
+    def test_a_crash_after_preparing_the_arm_is_recovered_on_the_next_sweep(
+        self, monkeypatch, tmp_path
+    ):
+        """If the process dies after jobs.json is prepared but before the ledger decision commits,
+        the same occurrence must resume finalization instead of being mistaken for a rival retry."""
+        _point_stores(monkeypatch, tmp_path)
+        with cron_jobs.use_cron_store(tmp_path):
+            job = cron_jobs.create_job(prompt="check", schedule="every 15m", name="prepared-gap")
+            record = _interrupt(job["id"])
+            real_finalize = executions.finalize_retry_decision
+            calls = {"count": 0}
+
+            def _crash_once(*args, **kwargs):
+                calls["count"] += 1
+                if calls["count"] == 1:
+                    raise OSError("gateway died after preparing jobs.json")
+                return real_finalize(*args, **kwargs)
+
+            monkeypatch.setattr(executions, "finalize_retry_decision", _crash_once)
+
+            assert retry.reconcile_interrupted_executions() == 0
+            prepared = cron_jobs.get_job(job["id"])["interrupted_retry"]
+            assert prepared["execution_id"] == record["id"]
+            assert prepared["state"] == "prepared"
+            assert executions.get_execution(record["id"])["retry_state"] is None
+
+            assert retry.reconcile_interrupted_executions() == 1
+            queued = cron_jobs.get_job(job["id"])["interrupted_retry"]
+            assert queued["execution_id"] == record["id"]
+            assert queued["state"] == "queued"
+
+        assert executions.get_execution(record["id"])["retry_state"] == "scheduled"
+
+    def test_a_crash_after_queueing_but_before_ledger_commit_is_recovered(
+        self, monkeypatch, tmp_path
+    ):
+        """jobs.json is the recoverable side of the cross-store handoff: if queueing lands but
+        the SQLite decision does not, the next sweep must finish that same occurrence."""
+        _point_stores(monkeypatch, tmp_path)
+        with cron_jobs.use_cron_store(tmp_path):
+            job = cron_jobs.create_job(prompt="check", schedule="every 15m", name="queued-gap")
+            record = _interrupt(job["id"])
+            real_finalize = executions.finalize_retry_decision
+            calls = {"count": 0}
+
+            def _crash_after_queueing(execution_id, resolver):
+                calls["count"] += 1
+                if calls["count"] != 1:
+                    return real_finalize(execution_id, resolver)
+                with executions._transaction() as conn:
+                    row = conn.execute(
+                        "SELECT * FROM executions WHERE id=?", (execution_id,)).fetchone()
+                    assert row is not None
+
+                    def _fail_commit(_decision):
+                        raise OSError("ledger commit failed after queueing jobs.json")
+
+                    return resolver(conn, dict(row), _fail_commit)
+
+            monkeypatch.setattr(
+                executions, "finalize_retry_decision", _crash_after_queueing)
+
+            assert retry.reconcile_interrupted_executions() == 0
+            queued = cron_jobs.get_job(job["id"])["interrupted_retry"]
+            assert queued["execution_id"] == record["id"]
+            assert queued["state"] == "queued"
+            assert executions.get_execution(record["id"])["retry_state"] is None
+
+            assert retry.reconcile_interrupted_executions() == 1
+
+        assert executions.get_execution(record["id"])["retry_state"] == "scheduled"
+
+    def test_a_replay_that_finishes_before_ledger_recovery_is_not_queued_twice(
+        self, monkeypatch, tmp_path
+    ):
+        """A second process can fire the queued retry after the jobs write but before recovery.
+        Its durable ``retry_of`` link must settle the old decision without creating another replay."""
+        from cron.scheduler_provider import InProcessCronScheduler
+
+        _point_stores(monkeypatch, tmp_path)
+        with cron_jobs.use_cron_store(tmp_path):
+            job = cron_jobs.create_job(prompt="check", schedule="every 15m", name="finished-gap")
+            record = _interrupt(job["id"])
+            real_finalize = executions.finalize_retry_decision
+            first = {"pending": True}
+
+            def _crash_after_queueing(execution_id, resolver):
+                if not first["pending"]:
+                    return real_finalize(execution_id, resolver)
+                first["pending"] = False
+                with executions._transaction() as conn:
+                    row = conn.execute(
+                        "SELECT * FROM executions WHERE id=?", (execution_id,)).fetchone()
+                    assert row is not None
+
+                    def _fail_commit(_decision):
+                        raise OSError("ledger commit failed after queueing jobs.json")
+
+                    return resolver(conn, dict(row), _fail_commit)
+
+            monkeypatch.setattr(
+                executions, "finalize_retry_decision", _crash_after_queueing)
+            assert retry.reconcile_interrupted_executions() == 0
+
+            claimed = InProcessCronScheduler().claim_fire(job["id"])
+            assert isinstance(claimed, dict)
+            replay = executions.get_execution(claimed["execution_id"])
+            assert replay["retry_of"] == record["id"]
+            executions.finish_execution(replay["id"], success=True)
+            cron_jobs.mark_job_run(job["id"], True)
+            assert cron_jobs.get_job(job["id"]).get("interrupted_retry") is None
+
+            assert retry.reconcile_interrupted_executions() == 0
+            assert cron_jobs.get_job(job["id"]).get("interrupted_retry") is None
+
+        assert executions.get_execution(record["id"])["retry_state"] == "scheduled"
+
     def test_a_scheduled_ledger_row_always_has_an_armed_job(self, monkeypatch, tmp_path):
         """The invariant stated as a contract between the two stores, checked after a sweep that
         had to retry past an injected failure."""
@@ -165,6 +282,58 @@ class TestTheDecisionSurvivesACrashBeforeArming:
 
 
 class TestPauseRacesCannotResurrectAJob:
+    def test_a_pause_after_the_arm_write_cancels_the_prepared_retry(
+        self, monkeypatch, tmp_path
+    ):
+        _point_stores(monkeypatch, tmp_path)
+        with cron_jobs.use_cron_store(tmp_path):
+            job = cron_jobs.create_job(prompt="check", schedule="every 15m", name="post-arm-pause")
+            record = _interrupt(job["id"])
+            real_arm = retry._arm_retry
+
+            def _arm_then_pause(rec):
+                outcome = real_arm(rec)
+                cron_jobs.pause_job(job["id"])
+                return outcome
+
+            monkeypatch.setattr(retry, "_arm_retry", _arm_then_pause)
+
+            assert retry.reconcile_interrupted_executions() == 0
+            refreshed = cron_jobs.get_job(job["id"])
+            assert refreshed["enabled"] is False
+            assert refreshed["state"] == "paused"
+            assert refreshed.get("manual_run_at") is None
+            assert refreshed.get("interrupted_retry") is None
+
+        assert executions.get_execution(record["id"])["retry_state"] == "declined:disabled"
+
+    def test_a_live_execution_and_fire_claim_after_decide_block_the_retry(
+        self, monkeypatch, tmp_path
+    ):
+        _point_stores(monkeypatch, tmp_path)
+        with cron_jobs.use_cron_store(tmp_path):
+            job = cron_jobs.create_job(prompt="check", schedule="every 15m", name="post-decide-live")
+            record = _interrupt(job["id"])
+            live = {}
+            real_decide = retry._decide
+
+            def _decide_then_start(rec, max_age):
+                outcome = real_decide(rec, max_age)
+                live["execution"] = executions.create_execution(job["id"], source="builtin")
+                executions.mark_execution_running(live["execution"]["id"])
+                live["claim"] = cron_jobs.claim_job_for_fire(job["id"], return_job=True)
+                return outcome
+
+            monkeypatch.setattr(retry, "_decide", _decide_then_start)
+
+            assert retry.reconcile_interrupted_executions() == 0
+            refreshed = cron_jobs.get_job(job["id"])
+            assert isinstance(live["claim"], dict)
+            assert refreshed.get("manual_run_at") is None
+            assert refreshed.get("interrupted_retry") is None
+
+        assert executions.get_execution(record["id"])["retry_state"] == "declined:in_flight"
+
     def test_a_pause_landing_after_eligibility_wins(self, monkeypatch, tmp_path):
         """Round-1 blocker 3: eligibility was read, then ``trigger_job`` re-enabled the job as a
         side effect. If the operator pauses in that gap, the pause must win — a disabled job is

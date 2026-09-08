@@ -88,7 +88,9 @@ def _job_has_live_attempt(job_id: str) -> bool:
     )
 
 
-def _raise_interruption_incident(record: Dict[str, Any]) -> None:
+def _raise_interruption_incident(
+    record: Dict[str, Any], *, adapters: Any = None, loop: Any = None,
+) -> bool:
     """Surface one interrupted occurrence in ``hermes cron incidents``.
 
     Raised here, from the ledger flag, rather than at each interruption write site: this is the
@@ -101,15 +103,36 @@ def _raise_interruption_incident(record: Dict[str, Any]) -> None:
     error text of a run killed mid-flight may name any other failure class.
     """
     from cron.executions import RECOVERED_INTERRUPTION_ERROR
-    from cron.incidents import upsert_incident
+    from cron.incidents import get_incident, upsert_incident
     from cron.jobs import get_job
 
     job_id = str(record.get("job_id") or "")
-    job = get_job(job_id) or {}
-    upsert_incident(
+    job = get_job(job_id)
+    incident_id, _ = upsert_incident(
         job_id, str(record.get("error") or RECOVERED_INTERRUPTION_ERROR),
-        job_name=job.get("name"), failure_type=INTERRUPTION_FAILURE_TYPE,
+        job_name=(job or {}).get("name"), failure_type=INTERRUPTION_FAILURE_TYPE,
     )
+    incident = get_incident(incident_id)
+    if incident and incident.get("state") in ("alerted", "closed"):
+        return True
+    if not job:
+        return True
+
+    from cron.scheduler import _deliver_crash_failure
+
+    delivery_error, outcome = _deliver_crash_failure(
+        job,
+        str(record.get("error") or RECOVERED_INTERRUPTION_ERROR),
+        adapters=adapters,
+        loop=loop,
+        failure_type=INTERRUPTION_FAILURE_TYPE,
+        incident_required=True,
+        suppress_if_alerted=True,
+    )
+    # A missing route is durable configuration, not a transient delivery failure: keep the
+    # incident detected and finish reconciliation.  A real delivery error leaves the occurrence
+    # undecided so the next sweep retries both the alert and the one-way replay decision.
+    return not delivery_error
 
 
 def _decide(record: Dict[str, Any], max_age_minutes: float) -> tuple[str, Optional[Dict[str, Any]]]:
@@ -127,7 +150,17 @@ def _decide(record: Dict[str, Any], max_age_minutes: float) -> tuple[str, Option
     # disabled/terminal job must be rejected here rather than resurrected.
     if not is_job_runnable(job) or job.get("state") in ("completed", "error"):
         return DECLINE_DISABLED, None
-    if job.get("interrupted_retry"):
+    stamp = job.get("interrupted_retry")
+    if stamp:
+        # A prior pass may have durably prepared or queued this same occurrence and died before
+        # committing its ledger decision. Resume that finalization; only another occurrence's
+        # stamp is an outstanding retry that makes this one decline.
+        if (
+            isinstance(stamp, dict)
+            and stamp.get("execution_id") == record.get("id")
+            and stamp.get("state") in ("prepared", "queued")
+        ):
+            return RETRY_SCHEDULED, job
         return DECLINE_RETRY_OUTSTANDING, None
     if _job_has_live_attempt(job_id):
         return DECLINE_IN_FLIGHT, None
@@ -158,25 +191,41 @@ _ARM_DECLINE = {
 }
 
 
-def reconcile_interrupted_executions(limit: int = 50) -> int:
+def reconcile_interrupted_executions(
+    limit: int = 50, *, adapters: Any = None, loop: Any = None,
+) -> int:
     """Decide every undecided interruption; return how many occurrences were re-armed.
 
     Safe to call on every scheduler startup and periodically: each occurrence is decided exactly
     once, and a decision is durable across restarts.
 
-    **Ordering matters.** The retry is armed BEFORE its decision is committed to the ledger, and
-    arming is idempotent for the same occurrence. A crash between the two therefore leaves the
-    occurrence still undecided — the next sweep sees it, gets ``already_armed`` back, and records
-    the decision it owed. The reverse order (the round-1 implementation) could commit
-    ``scheduled`` and then die, stranding the occurrence as decided-but-never-run, which is the
-    silent loss this whole feature exists to prevent.
+    **Ordering matters.** The job store first records a non-fireable ``prepared`` arm. Finalization
+    then re-checks eligibility under the fire fence + job lock, makes the arm ``queued``, and
+    commits the matching ledger decision before releasing either lock. A crash on either side
+    leaves the occurrence undecided and the same stamp recoverable; if another process runs it
+    before recovery, the replay row's durable lineage settles the decision without a duplicate.
+    The reverse order (the round-1 implementation) could commit ``scheduled`` and then die,
+    stranding the occurrence as decided-but-never-run, which is the silent loss this whole feature
+    exists to prevent.
     """
-    from cron.executions import claim_retry_decision, list_undecided_interruptions
+    from cron.executions import (
+        claim_retry_decision, has_replay_of, list_undecided_interruptions,
+    )
 
     max_age_minutes = _max_age_minutes()
     scheduled = 0
     for record in list_undecided_interruptions(limit=limit):
         try:
+            # Incident persistence and delivery are idempotent and precede the one-way retry
+            # decision. A transient store/delivery failure leaves the row selectable next sweep.
+            if not _raise_interruption_incident(record, adapters=adapters, loop=loop):
+                continue
+            # The retry may have run in another process after its queue write but before this
+            # occurrence's ledger commit. Its durable lineage is proof that the one bounded replay
+            # was already consumed; settle the decision without arming a duplicate.
+            if has_replay_of(str(record["id"])):
+                claim_retry_decision(str(record["id"]), RETRY_SCHEDULED)
+                continue
             if max_age_minutes <= 0:
                 decision, job = DECLINE_DISABLED_BY_CONFIG, None
             else:
@@ -187,14 +236,26 @@ def reconcile_interrupted_executions(limit: int = 50) -> int:
                 armed = outcome in ("armed", "already_armed")
                 if not armed:
                     decision = _ARM_DECLINE.get(outcome, DECLINE_DISABLED)
-            # The CAS is the at-most-once gate: losing it means another reconciler already owns
-            # this occurrence's decision, so this pass records nothing further about it.
-            if not claim_retry_decision(record["id"], decision):
+            if armed:
+                from cron.executions import (
+                    finalize_retry_decision, transaction_has_live_attempt,
+                )
+                from cron.jobs import finalize_interrupted_retry
+
+                def _resolve(conn, current, commit):
+                    return finalize_interrupted_retry(
+                        str(current.get("job_id") or ""), str(current["id"]),
+                        has_live_attempt=lambda: transaction_has_live_attempt(
+                            conn, str(current.get("job_id") or ""), excluding=str(current["id"])),
+                        commit_decision=commit,
+                    )
+
+                finalized = finalize_retry_decision(str(record["id"]), _resolve)
+                if finalized is None:
+                    continue
+                decision, job, armed = finalized
+            elif not claim_retry_decision(record["id"], decision):
                 continue
-            # Winning the CAS makes this pass the sole owner of the occurrence, so the incident is
-            # raised here — once, whatever the replay decision turned out to be. A declined
-            # occurrence is still a lost one and must be visible.
-            _raise_interruption_incident(record)
             if not armed:
                 logger.info(
                     "Cron occurrence %s for job %s was interrupted and not replayed (%s)",

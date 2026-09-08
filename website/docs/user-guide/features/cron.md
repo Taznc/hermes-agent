@@ -377,6 +377,9 @@ case so an occurrence is never lost silently.
 An interrupted attempt is recorded as interrupted in the ledger — a durable
 fact, not a guess from the error text — and raises a failure incident with type
 `interruption`, deduplicated and acknowledgeable like any other (see below).
+Its notice uses the job's normal failure-delivery route; the incident becomes
+`alerted` only after that notice is delivered, and a transient incident-store or
+delivery failure is retried before the replay decision becomes final.
 `hermes cron history` marks the attempt and says what was decided about it:
 
 ```
@@ -411,13 +414,17 @@ in `hermes cron history` names the occurrence it recovered:
 That link lives in the ledger, so it survives the successful run that clears
 the pending-retry marker.
 
-**Crash consistency.** The replay is armed before the decision is written, and
-arming an occurrence twice is a no-op. A restart in between therefore leaves
-the occurrence still undecided, and the next startup finishes the job rather
-than recording a retry that never happened. Eligibility is re-checked at the
-moment of arming, under the job-store lock, so a `hermes cron pause` or
-`remove` that lands in the middle wins: it is recorded as a declined replay,
-never undone.
+**Crash consistency.** Reconciliation first writes a recoverable `prepared`
+retry to the job store, then finalizes the ledger decision and changes that
+retry to `queued` while holding the ledger transaction, fire fence, and job
+lock. A restart at either boundary resumes the same occurrence instead of
+recording a retry that never happened or consuming a second retry. Eligibility
+is re-checked during finalization, so a live fire, `hermes cron pause`, or
+`remove` that lands after preparation wins: the prepared fields are removed and
+the replay is recorded as declined, never undone. The actual replay receives
+its durable history link only after its execution row exists and it wins fire
+ownership; if binding that link fails, the claim is released for a later
+contender.
 
 **Failures recorded before this shipped** are adopted the first time the
 upgraded ledger opens, so shutdown interruptions already in your history are

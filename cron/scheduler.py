@@ -482,7 +482,7 @@ def _resolve_job_reasoning_config(job: dict, cfg: dict, model: str) -> dict | No
 from cron.jobs import (
     _ensure_cron_dir, advance_next_runs, claim_dispatch, claim_job_for_fire, fire_claim_fence,
     clear_run_claim, get_due_jobs, heartbeat_fire_claim, heartbeat_run_claim, mark_job_run,
-    save_job_output, use_cron_store)
+    release_interrupted_retry_claim, save_job_output, use_cron_store)
 from cron.executions import (
     _TERMINAL_STATES, create_execution, finish_execution, get_execution,
     mark_execution_handoff_pending, mark_execution_running, recover_interrupted_executions)
@@ -2999,12 +2999,24 @@ def _finish_completed_run(d: _RunDelivery, fire_owner: Optional[str], execution_
 
 
 def _deliver_crash_failure(
-    job: dict, err_text: str, *, adapters, loop,
+    job: dict, err_text: str, *, adapters, loop, failure_type: Optional[str] = None,
+    incident_required: bool = False, suppress_if_alerted: bool = False,
 ) -> tuple[Optional[str], str]:
     """Failure notice for a run that raised out of run_job. Returns (delivery_error, outcome)."""
     normalized_deliver = _normalize_deliver_value(_delivery_lane_value(job, for_failure=True))
     # Same ack gate as the normal failure delivery: acked signatures stay silent here too.
-    incident_acked, failure_incident_id = _upsert_incident_for_failure(job, err_text)
+    if incident_required:
+        from cron.incidents import get_incident, upsert_incident
+
+        failure_incident_id, _ = upsert_incident(
+            job["id"], err_text, job_name=job.get("name"), failure_type=failure_type)
+        incident = get_incident(failure_incident_id)
+        incident_state = incident.get("state") if incident else None
+        incident_acked = incident_state == "closed"
+        if suppress_if_alerted and incident_state == "alerted":
+            return None, "suppressed_alerted"
+    else:
+        incident_acked, failure_incident_id = _upsert_incident_for_failure(job, err_text)
     if incident_acked:
         return None, "suppressed_acked"
     delivery_error = None
@@ -3030,7 +3042,9 @@ def _deliver_crash_failure(
         delivery_error=delivery_error, should_deliver=True, unresolved_origin=unresolved_origin,
         normalized_deliver=normalized_deliver, incident_acked=False, success=False,
         delivery_queued=job.get("last_delivery_queued"))
-    if delivery_outcome in ("delivered", "not_configured"):
+    if delivery_outcome == "delivered" or (
+        delivery_outcome == "not_configured" and not incident_required
+    ):
         _mark_incident_alerted(failure_incident_id)
     return delivery_error, delivery_outcome
 
@@ -3813,7 +3827,8 @@ def _sweep_mcp_orphans() -> None:
 def _process_due_job(job: dict, adapters, loop, verbose: bool) -> bool:
     """Run one due job via the shared ``run_one_job`` body."""
     # Claim only when the worker actually starts, so a queued lease can't expire first.
-    claimed = claim_job_for_fire(job["id"], return_job=True)
+    claimed = claim_job_for_fire(
+        job["id"], return_job=True, execution_id=job["execution_id"])
     if not claimed:
         finish_execution(
             job["execution_id"], success=False, error="Fire claim lost; execution was not started.")
@@ -3822,6 +3837,28 @@ def _process_due_job(job: dict, adapters, loop, verbose: bool) -> bool:
     claimed_job = dict(claimed) if isinstance(claimed, dict) else dict(job)
     claimed_job["execution_id"] = job["execution_id"]
     claimed_job["_scheduled_instant"] = job.get("_scheduled_instant")
+    stamp = claimed_job.get("interrupted_retry")
+    retry_of = stamp.get("execution_id") if isinstance(stamp, dict) else None
+    if retry_of:
+        from cron.executions import bind_interrupted_retry_lineage
+        lineage_error = None
+        try:
+            bound = bind_interrupted_retry_lineage(
+                job["execution_id"], job["id"], str(retry_of))
+        except Exception as exc:
+            bound = None
+            lineage_error = f"{type(exc).__name__}: {exc}"
+        if bound is None:
+            claim = claimed_job.get("fire_claim")
+            owner = claim.get("by") if isinstance(claim, dict) else None
+            if owner:
+                release_interrupted_retry_claim(
+                    job["id"], job["execution_id"], expected_fire_owner=str(owner))
+            finish_execution(
+                job["execution_id"], success=False,
+                error=("Replay lineage could not be bound before dispatch"
+                       + (f": {lineage_error}" if lineage_error else ".")))
+            return True
     return run_one_job(claimed_job, adapters=adapters, loop=loop, verbose=verbose)
 
 

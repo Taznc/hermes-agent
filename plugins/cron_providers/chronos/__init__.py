@@ -70,7 +70,7 @@ class ChronosCronScheduler(CronScheduler):
         # unknown. Replay is no longer unconditionally refused: recover_interrupted() also runs the
         # bounded reconciler, which re-arms an eligible lost occurrence at most once (fresh, job
         # still runnable, nothing in flight) and records a reason for every occurrence it declines.
-        self.recover_interrupted()
+        self.recover_interrupted(adapters=adapters, loop=loop)
         self._reconcile_logged(logger.warning, "start()")
 
     def stop(self) -> None:

@@ -2084,6 +2084,11 @@ def arm_interrupted_retry(job_id: str, stamp: Dict[str, Any]) -> str:
         if is_terminal_job(job) or not is_job_runnable(job):
             return "disabled"
         manual_run_at = _hermes_now().isoformat()
+        prepared_stamp = {
+            **stamp,
+            "state": "prepared",
+            "previous_next_run_at": job.get("next_run_at"),
+        }
         update_job(job_id, {
             "enabled": True,
             "state": "scheduled",
@@ -2091,33 +2096,83 @@ def arm_interrupted_retry(job_id: str, stamp: Dict[str, Any]) -> str:
             "paused_reason": None,
             "next_run_at": manual_run_at,
             "manual_run_at": manual_run_at,
-            "interrupted_retry": stamp,
+            "interrupted_retry": prepared_stamp,
         })
         return "armed"
 
 
-def claim_interrupted_retry_lineage(job_id: str, execution_id: str) -> Optional[str]:
-    """Bind ``execution_id`` to the lost occurrence it is replaying; return that occurrence's id.
+def _clear_prepared_interrupted_retry(job: Dict[str, Any], original_id: str) -> bool:
+    stamp = job.get("interrupted_retry")
+    if not isinstance(stamp, dict) or stamp.get("execution_id") != original_id:
+        return False
+    manual_run_at = job.get("manual_run_at")
+    if manual_run_at and job.get("next_run_at") == manual_run_at:
+        job["next_run_at"] = stamp.get("previous_next_run_at")
+    job.pop("manual_run_at", None)
+    job.pop("manual_run_prompt", None)
+    job.pop("interrupted_retry", None)
+    return True
 
-    Returns ``None`` when this job has no outstanding replay, or when the replay was already
-    claimed by an earlier attempt — one lost occurrence yields exactly one replay, so a later run
-    of the same job is an ordinary occurrence and must not claim to be recovering anything.
 
-    The stamp is *not* cleared here. It bounds the retry loop until a successful run and is what
-    lets ``cron list``/``doctor`` distinguish a replay that is still queued from one that has
-    already run and failed.
+def finalize_interrupted_retry(
+    job_id: str,
+    original_id: str,
+    *,
+    has_live_attempt: Callable[[], bool],
+    commit_decision: Callable[[str], None],
+) -> tuple[str, Optional[Dict[str, Any]], bool]:
+    """Finalize a prepared replay under the fire fence + jobs lock + caller's ledger lock.
+
+    The prepare/finalize split intentionally leaves an interleaving point where an operator pause,
+    removal, or real fire can win. Finalization then converges both stores: it removes our prepared
+    arm when eligibility was lost and commits the matching decline, or changes the stamp to
+    ``queued`` and commits ``scheduled`` before releasing either lock.
     """
-    def apply(jobs, i, job):
-        stamp = job.get("interrupted_retry")
-        if not isinstance(stamp, dict) or stamp.get("replayed_by"):
-            return None
-        original = stamp.get("execution_id")
-        jobs[i] = {**job, "interrupted_retry": {
-            **stamp, "replayed_by": execution_id, "replayed_at": _hermes_now().isoformat()}}
-        save_jobs(jobs)
-        return original
+    from cron.interrupted_retry import (
+        DECLINE_DISABLED, DECLINE_IN_FLIGHT, DECLINE_JOB_MISSING,
+        DECLINE_RETRY_OUTSTANDING, RETRY_SCHEDULED,
+    )
 
-    return _with_job(job_id, apply)
+    def locked():
+        with _jobs_lock():
+            jobs = load_jobs()
+            pair = next(((i, job) for i, job in enumerate(jobs) if job.get("id") == job_id), None)
+            if pair is None:
+                commit_decision(DECLINE_JOB_MISSING)
+                return DECLINE_JOB_MISSING, None, False
+            i, job = pair
+            stamp = job.get("interrupted_retry")
+            if not isinstance(stamp, dict) or stamp.get("execution_id") != original_id:
+                commit_decision(DECLINE_RETRY_OUTSTANDING)
+                return DECLINE_RETRY_OUTSTANDING, _normalize_job_record(job), False
+
+            runnable = not is_terminal_job(job) and is_job_runnable(job)
+            claim_live = _claim_is_live(job.get("fire_claim"), _hermes_now(), FIRE_CLAIM_TTL_SECONDS)
+            replay_started = bool(stamp.get("replayed_by"))
+            if not runnable:
+                if not replay_started and _clear_prepared_interrupted_retry(job, original_id):
+                    jobs[i] = job
+                    save_jobs(jobs)
+                commit_decision(DECLINE_DISABLED)
+                return DECLINE_DISABLED, _normalize_job_record(job), False
+            if (claim_live or has_live_attempt()) and not replay_started:
+                if _clear_prepared_interrupted_retry(job, original_id):
+                    jobs[i] = job
+                    save_jobs(jobs)
+                commit_decision(DECLINE_IN_FLIGHT)
+                return DECLINE_IN_FLIGHT, _normalize_job_record(job), False
+
+            if stamp.get("state") != "queued":
+                job["interrupted_retry"] = {**stamp, "state": "queued"}
+                jobs[i] = job
+                save_jobs(jobs)
+            commit_decision(RETRY_SCHEDULED)
+            return RETRY_SCHEDULED, _normalize_job_record(job), True
+
+    result = _under_fire_fence(job_id, locked)
+    if result is False:
+        raise RuntimeError(f"Could not acquire cron fire fence for interrupted retry {job_id}")
+    return result
 
 
 def _claim_is_live(claim: Any, now: datetime, ttl_seconds: float) -> bool:
@@ -2586,7 +2641,8 @@ def _machine_id() -> str:
 
 
 def claim_job_for_fire(
-    job_id: str, *, claim_ttl_seconds: int = FIRE_CLAIM_TTL_SECONDS, force: bool = False, return_job: bool = False,
+    job_id: str, *, claim_ttl_seconds: int = FIRE_CLAIM_TTL_SECONDS, force: bool = False,
+    return_job: bool = False, execution_id: Optional[str] = None,
 ) -> Union[bool, Dict[str, Any]]:
     """Atomically claim a job for one external 'fire' (multi-machine at-most-once); True iff THIS
     caller won (``CronScheduler.fire_due``: exactly one of N replicas runs a job). Under the
@@ -2602,6 +2658,13 @@ def claim_job_for_fire(
         # Both enabled and pause markers must clear — a half-paused record must not claim. ``force``
         # (Trigger-now on a paused job) bypasses the gate and atomically resumes the job below.
         if not force and not is_job_runnable(job):
+            return False
+        retry_stamp = job.get("interrupted_retry")
+        if (
+            isinstance(retry_stamp, dict)
+            and retry_stamp.get("state") == "prepared"
+            and job.get("manual_run_at") == job.get("next_run_at")
+        ):
             return False
         now = _hermes_now()
         if _claim_is_live(job.get("fire_claim"), now, claim_ttl_seconds):
@@ -2622,12 +2685,58 @@ def claim_job_for_fire(
         # Per-acquisition token: a process may legitimately reclaim its own stale lease, and the
         # previous runner must not heartbeat the new claim merely because hostname + PID match.
         job["fire_claim"] = {"at": now.isoformat(), "by": f"{_machine_id()}:{uuid.uuid4().hex}"}
+        if (
+            execution_id
+            and manual
+            and isinstance(retry_stamp, dict)
+            and retry_stamp.get("state") in (None, "queued")
+            and not retry_stamp.get("replayed_by")
+        ):
+            job["interrupted_retry"] = {
+                **retry_stamp,
+                "replayed_by": str(execution_id),
+                "replayed_at": now.isoformat(),
+            }
         if job.get("schedule", {}).get("kind") in {"cron", "interval"}:
             nxt = compute_next_run(job["schedule"], now.isoformat())
             if nxt:
                 job["next_run_at"] = nxt
         save_jobs(jobs)
         return dict(copy.deepcopy(job), _scheduled_instant=instant) if return_job else True
+
+    return _under_fire_fence(job_id, lambda: _with_job(job_id, apply, False))
+
+
+def release_interrupted_retry_claim(
+    job_id: str, execution_id: str, *, expected_fire_owner: str,
+) -> bool:
+    """Compensate a replay claim whose ledger lineage could not be bound.
+
+    The fire claim and ``replayed_by`` stamp are one jobs-store mutation, but SQLite lineage is a
+    separate durable store. If that second write fails, restore the manual retry to its due state
+    only when both ownership tokens still name this exact attempt. A replacement owner therefore
+    cannot be disturbed by stale compensation.
+    """
+    def apply(jobs, _i, job):
+        claim = job.get("fire_claim")
+        stamp = job.get("interrupted_retry")
+        if (
+            not isinstance(claim, dict)
+            or claim.get("by") != expected_fire_owner
+            or not isinstance(stamp, dict)
+            or stamp.get("replayed_by") != execution_id
+        ):
+            return False
+        retry_stamp = dict(stamp)
+        retry_stamp.pop("replayed_by", None)
+        retry_stamp.pop("replayed_at", None)
+        job["interrupted_retry"] = retry_stamp
+        job["fire_claim"] = None
+        manual_run_at = job.get("manual_run_at")
+        if manual_run_at:
+            job["next_run_at"] = manual_run_at
+        save_jobs(jobs)
+        return True
 
     return _under_fire_fence(job_id, lambda: _with_job(job_id, apply, False))
 

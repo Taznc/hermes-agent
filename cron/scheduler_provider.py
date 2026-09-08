@@ -123,7 +123,7 @@ class CronScheduler(ABC):
         report it as scheduled). Built-in: no-op."""
         return None
 
-    def recover_interrupted(self) -> int:
+    def recover_interrupted(self, *, adapters: Any = None, loop: Any = None) -> int:
         """Run profile-local attempt recovery for every provider lifecycle.
 
         Reconciling abandoned rows and deciding their replay are one startup step: a row recovered
@@ -135,7 +135,7 @@ class CronScheduler(ABC):
         from cron.interrupted_retry import reconcile_interrupted_executions
 
         recovered = recover_interrupted_executions()
-        reconcile_interrupted_executions()
+        reconcile_interrupted_executions(adapters=adapters, loop=loop)
         return recovered
 
     @property
@@ -157,18 +157,39 @@ class CronScheduler(ABC):
     def claim_fire(self, job_id: str, *, force: bool = False) -> dict | None:
         """Durably claim one fire + create its audit attempt. Transports call this synchronously
         before acknowledging, then pass the exact snapshot to ``fire_claimed`` off-thread."""
-        from cron.executions import create_execution, finish_execution, set_execution_occurrence
-        from cron.jobs import claim_job_for_fire
+        from cron.executions import (
+            bind_interrupted_retry_lineage, create_execution, finish_execution,
+            set_execution_occurrence,
+        )
+        from cron.jobs import claim_job_for_fire, release_interrupted_retry_claim
 
         execution = create_execution(job_id, source=self.name)
-        claim_kwargs = {"return_job": True}
+        claim_kwargs: dict[str, Any] = {"return_job": True}
+        claimed_job: Any = None
         if force:
             claim_kwargs["force"] = True
         try:
-            claimed_job = claim_job_for_fire(job_id, **claim_kwargs)
+            claimed_job = claim_job_for_fire(
+                job_id, execution_id=execution["id"], **claim_kwargs)
             if isinstance(claimed_job, dict):
                 set_execution_occurrence(execution["id"], claimed_job.get("_scheduled_instant"))
+                stamp = claimed_job.get("interrupted_retry")
+                retry_of = stamp.get("execution_id") if isinstance(stamp, dict) else None
+                if retry_of and bind_interrupted_retry_lineage(
+                    execution["id"], job_id, str(retry_of),
+                ) is None:
+                    raise RuntimeError("Cron replay lineage could not be bound before dispatch")
         except BaseException as exc:
+            if isinstance(claimed_job, dict):
+                claim = claimed_job.get("fire_claim")
+                owner = claim.get("by") if isinstance(claim, dict) else None
+                if owner:
+                    try:
+                        release_interrupted_retry_claim(
+                            job_id, execution["id"], expected_fire_owner=str(owner))
+                    except Exception:
+                        logger.exception(
+                            "Could not release replay claim after lineage failure for %s", job_id)
             finish_execution(
                 execution["id"], success=False,
                 error=f"Fire claim failed before dispatch: {type(exc).__name__}: {exc}",
@@ -399,7 +420,12 @@ class InProcessCronScheduler(CronScheduler):
             )
             return
 
-        recovered = self.recover_interrupted()
+        recovery_kwargs = {}
+        if adapters is not None:
+            recovery_kwargs["adapters"] = adapters
+        if loop is not None:
+            recovery_kwargs["loop"] = loop
+        recovered = self.recover_interrupted(**recovery_kwargs)
         if recovered:
             logger.warning(
                 "Marked %d interrupted cron execution(s) unknown after restart", recovered
@@ -481,10 +507,16 @@ class InProcessCronScheduler(CronScheduler):
         # A profile may have been deleted since this snapshot was taken; never recreate a deleted home's
         # cron workspace via the heartbeat below (#47368).
         for entry in _existing_profile_homes(profile_homes):
-            _, home = _profile_entry(entry)
+            profile_name, home = _profile_entry(entry)
             try:
                 with _profile_cron_scope(home):
-                    recovered = self.recover_interrupted()
+                    recovery_kwargs = {}
+                    recovery_adapters = tick_adapters_for(profile_name)
+                    if recovery_adapters:
+                        recovery_kwargs["adapters"] = recovery_adapters
+                    if loop is not None:
+                        recovery_kwargs["loop"] = loop
+                    recovered = self.recover_interrupted(**recovery_kwargs)
                     if recovered:
                         logger.warning(
                             "Marked %d interrupted cron execution(s) for profile at %s",

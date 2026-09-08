@@ -14,6 +14,7 @@ import cron.executions as executions
 import cron.incidents as incidents
 import cron.interrupted_retry as retry
 import cron.jobs as cron_jobs
+import cron.scheduler as scheduler
 
 
 def _point_stores(monkeypatch, tmp_path):
@@ -22,6 +23,82 @@ def _point_stores(monkeypatch, tmp_path):
 
 
 class TestRecoveryRaisesTheIncident:
+    def test_startup_recovery_delivers_and_alerts_the_incident(
+        self, monkeypatch, tmp_path, make_cron_provider
+    ):
+        _point_stores(monkeypatch, tmp_path)
+        delivered = []
+
+        def _deliver(job, content, *, adapters, loop, for_failure):
+            delivered.append((job["id"], content, adapters, loop, for_failure))
+            return None
+
+        monkeypatch.setattr(scheduler, "_deliver_result", _deliver)
+        with cron_jobs.use_cron_store(tmp_path):
+            job = cron_jobs.create_job(
+                prompt="check", schedule="every monday 9am", name="startup-alert",
+                deliver="bot-chat",
+            )
+            record = executions.create_execution(job["id"], source="builtin")
+            executions.mark_execution_running(record["id"])
+            monkeypatch.setattr(executions, "_PROCESS_ID", "replacement-gateway")
+            monkeypatch.setattr(executions, "_owner_is_live", lambda *_: False)
+
+            assert make_cron_provider().recover_interrupted(adapters="adapter", loop="loop") == 1
+
+        raised = incidents.list_incidents()
+        assert len(delivered) == 1
+        assert delivered[0][2:] == ("adapter", "loop", True)
+        assert raised[0]["state"] == "alerted"
+        assert raised[0]["failure_type"] == "interruption"
+
+    def test_unresolved_origin_does_not_claim_the_operator_was_alerted(
+        self, monkeypatch, tmp_path
+    ):
+        """Normal incident lifecycle means ``alerted`` only after a notice reaches a target."""
+        _point_stores(monkeypatch, tmp_path)
+        with cron_jobs.use_cron_store(tmp_path):
+            job = cron_jobs.create_job(
+                prompt="check", schedule="every monday 9am", name="no-origin",
+                deliver="origin",
+            )
+            record = executions.create_execution(job["id"], source="builtin")
+            executions.finish_execution(
+                record["id"], success=False,
+                error="Interrupted by shutdown before terminal completion.", interrupted=True,
+            )
+            assert retry.reconcile_interrupted_executions() == 1
+
+        raised = incidents.list_incidents()
+        assert len(raised) == 1
+        assert raised[0]["state"] == "detected"
+
+    def test_incident_store_failure_is_retried_before_the_decision_is_final(
+        self, monkeypatch, tmp_path
+    ):
+        _point_stores(monkeypatch, tmp_path)
+        with cron_jobs.use_cron_store(tmp_path):
+            job = cron_jobs.create_job(prompt="check", schedule="every 15m", name="store-retry")
+            record = executions.create_execution(job["id"], source="builtin")
+            executions.finish_execution(
+                record["id"], success=False,
+                error="Interrupted by shutdown before terminal completion.", interrupted=True,
+            )
+            real_upsert = incidents.upsert_incident
+            monkeypatch.setattr(
+                incidents, "upsert_incident",
+                lambda *_a, **_k: (_ for _ in ()).throw(OSError("store failed")),
+            )
+
+            assert retry.reconcile_interrupted_executions() == 0
+            assert executions.get_execution(record["id"])["retry_state"] is None
+
+            monkeypatch.setattr(incidents, "upsert_incident", real_upsert)
+            assert retry.reconcile_interrupted_executions() == 1
+
+        assert executions.get_execution(record["id"])["retry_state"] == "scheduled"
+        assert incidents.list_incidents()[0]["failure_type"] == "interruption"
+
     def test_startup_recovery_of_a_dead_owner_raises_an_interruption_incident(
         self, monkeypatch, tmp_path, make_cron_provider
     ):
@@ -98,8 +175,14 @@ class TestRecoveryRaisesTheIncident:
     def test_an_acknowledged_incident_stays_closed(self, monkeypatch, tmp_path):
         """Ack suppression is the ordinary incident contract and interruptions do not bypass it."""
         _point_stores(monkeypatch, tmp_path)
+        delivered = []
+        monkeypatch.setattr(
+            scheduler, "_deliver_result",
+            lambda *_a, **_k: delivered.append("sent"),
+        )
         with cron_jobs.use_cron_store(tmp_path):
-            job = cron_jobs.create_job(prompt="check", schedule="every 15m", name="acked")
+            job = cron_jobs.create_job(
+                prompt="check", schedule="every 15m", name="acked", deliver="bot-chat")
 
             def _interrupt():
                 record = executions.create_execution(job["id"], source="builtin")
@@ -110,10 +193,13 @@ class TestRecoveryRaisesTheIncident:
 
             _interrupt()
             incident_id = incidents.list_incidents()[0]["id"]
+            assert incidents.get_incident(incident_id)["state"] == "alerted"
+            assert delivered == ["sent"]
             assert incidents.ack_incident(incident_id) is True
 
             _interrupt()
 
+        assert delivered == ["sent"], "a closed incident must suppress the repeated notice"
         assert incidents.get_incident(incident_id)["state"] == "closed"
 
     def test_the_incident_is_raised_once_per_occurrence_not_once_per_sweep(
