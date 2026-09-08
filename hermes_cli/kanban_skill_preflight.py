@@ -7,16 +7,26 @@ worker then dies during initialization with ``Unknown skill(s): X`` before doing
 any work, and the dispatcher scores that as a crash — retry budget, start budget
 and the failure breaker all charged for a configuration mistake.
 
-So skills are resolved against the ASSIGNEE's home, never the caller's: this
-module installs that profile's directory as the context-local Hermes home and
-walks the same search roots the worker itself would use.
+The answer must be the worker's own, not an approximation of it. "Can this
+profile load this skill?" is decided by running the loader the worker itself
+runs (``build_preloaded_skills_prompt``) in a subprocess under that profile's
+home — see :mod:`hermes_cli.kanban_skill_probe`. A name-set approximation
+silently disagrees with it on every interesting case: qualified ``ns:skill``
+spellings, names that collide across skill dirs (the loader refuses to guess),
+and skills gated to another OS by ``platforms:``.
 
-Import-light on purpose (``agent.skill_utils`` + ``hermes_cli.profiles``): it
-runs inside ``create_task`` and on every dispatcher tick.
+When the profile cannot be inspected at all — no home, tombstoned, unreadable,
+probe failure — this fails CLOSED. Assuming a skill is present is exactly the
+mistake that produces the crash-loop this module exists to prevent.
 """
 
 from __future__ import annotations
 
+import json
+import os
+import subprocess
+import sys
+import tempfile
 from pathlib import Path
 from typing import Iterable, Optional
 
@@ -30,6 +40,10 @@ REVIEW_LANE_SKILL = "sdlc-review"
 MISSING_CODE = "kanban_skill_missing"
 PROFILE_UNAVAILABLE_CODE = "kanban_skill_profile_unavailable"
 
+# Generous for a cold import of the skills stack on a loaded box; the probe
+# itself runs in well under a second. Exceeding it means "cannot inspect".
+PROBE_TIMEOUT_SECONDS = 120
+
 
 class KanbanSkillPreflightError(ValueError):
     """A card's forced skills cannot be satisfied by its assignee profile.
@@ -37,7 +51,8 @@ class KanbanSkillPreflightError(ValueError):
     ``ValueError`` so every existing surface reports it correctly without new
     plumbing: the CLI prints it, ``tools/kanban_tools.py`` turns it into a
     ``tool_error`` without a traceback, and the dashboard router maps it to
-    HTTP 400. ``code``/``profile``/``missing`` carry the structured form.
+    HTTP 400. ``code``/``profile``/``missing`` carry the structured form, and
+    :meth:`as_dict` is the machine-readable payload those surfaces emit.
     """
 
     def __init__(self, message: str, *, code: str, profile: str, missing: tuple[str, ...] = ()):
@@ -45,6 +60,24 @@ class KanbanSkillPreflightError(ValueError):
         self.code = code
         self.profile = profile
         self.missing = tuple(missing)
+
+    def as_dict(self) -> dict:
+        """The structured error contract shared by the CLI, tool and HTTP APIs."""
+        return {
+            "error": str(self),
+            "code": self.code,
+            "profile": self.profile,
+            "missing_skills": list(self.missing),
+        }
+
+
+def structured_error_payload(exc: BaseException) -> Optional[dict]:
+    """:meth:`KanbanSkillPreflightError.as_dict` for *exc*, else ``None``.
+
+    Lets a surface add the structured fields to its error response without
+    importing the exception type or branching on it.
+    """
+    return exc.as_dict() if isinstance(exc, KanbanSkillPreflightError) else None
 
 
 def _how_to_fix(profile: str, missing: Iterable[str]) -> str:
@@ -58,201 +91,111 @@ def _how_to_fix(profile: str, missing: Iterable[str]) -> str:
     )
 
 
-def _skill_config_names(key: str) -> set[str]:
-    """A ``skills.<key>`` config list as a set of names (empty when absent)."""
-    from agent.skill_utils import _skills_cfg, parse_config_string_list
-
-    cfg = _skills_cfg()
-    if cfg is None:
-        return set()
-    return {name.strip() for name in parse_config_string_list(cfg.get(key)) if name.strip()}
-
-
-def _disabled_names() -> set[str]:
-    """Operator-disabled skill names for a CLI worker under the CURRENT home.
-
-    Read straight from config rather than via ``get_disabled_skill_names()``:
-    that resolves the platform from the *calling* process's session env, and
-    the answer we need is about a ``hermes --cli`` worker, not about us.
-    """
-    from agent.skill_utils import ESSENTIAL_SKILLS, _skills_cfg, parse_config_string_list
-
-    cfg = _skills_cfg()
-    if cfg is None:
-        return set()
-    disabled = _skill_config_names("disabled")
-    platform_disabled = (cfg.get("platform_disabled") or {}) if isinstance(cfg.get("platform_disabled"), dict) else {}
-    disabled |= {
-        name.strip()
-        for name in parse_config_string_list(platform_disabled.get("cli"))
-        if name.strip()
-    }
-    return disabled - set(ESSENTIAL_SKILLS)
-
-
-def _identifiers_for(skill_md: Path, root: Path, *, frontmatter_name: Optional[str]) -> set[str]:
-    """Every identifier ``skill_view()`` would accept for one skill file."""
-    identifiers: set[str] = set()
-    target = skill_md.parent if skill_md.name == "SKILL.md" else skill_md.with_suffix("")
-    try:
-        identifiers.add(target.relative_to(root).as_posix())
-    except ValueError:
-        pass
-    identifiers.add(target.name)
-    if frontmatter_name:
-        identifiers.add(str(frontmatter_name).strip())
-    return {i for i in identifiers if i}
-
-
-def _canonical_name(skill_md: Path, frontmatter_name: Optional[str]) -> str:
-    """The name ``skills.disabled`` is matched against."""
-    if frontmatter_name and str(frontmatter_name).strip():
-        return str(frontmatter_name).strip()
-    return (skill_md.parent if skill_md.name == "SKILL.md" else skill_md.with_suffix("")).name
-
-
-def _available_identifiers_in_current_home() -> set[str]:
-    """Identifiers resolvable under the CURRENT Hermes home, minus disabled ones.
-
-    Trusted project-local skill dirs are deliberately excluded: they depend on
-    the worker's working directory and trust config, so they are not a property
-    of the profile and must not make a card look satisfiable.
-    """
-    from agent.skill_utils import (
-        get_all_skills_dirs, is_excluded_skill_path, iter_skill_index_files, parse_frontmatter,
+def _unavailable(profile: str, detail: str) -> "KanbanSkillPreflightError":
+    return KanbanSkillPreflightError(
+        f"Cannot verify forced skills for assignee profile {profile!r}: {detail} "
+        "Skill preflight fails closed rather than assuming the skill is installed. "
+        f"Create or repair the profile (`hermes profile create {profile}`), reassign "
+        "the card to a profile that can be inspected, or drop the skill from the card.",
+        code=PROFILE_UNAVAILABLE_CODE, profile=str(profile),
     )
 
-    disabled = _disabled_names()
-    available: set[str] = set()
-    for root in get_all_skills_dirs():
-        if not root.is_dir():
-            continue
-        for skill_md in iter_skill_index_files(root, "SKILL.md"):
-            frontmatter = _safe_frontmatter(skill_md, parse_frontmatter)
-            name = frontmatter.get("name") if isinstance(frontmatter, dict) else None
-            if _canonical_name(skill_md, name) in disabled:
-                continue
-            available |= _identifiers_for(skill_md, root, frontmatter_name=name)
-        # Legacy flat ``<name>.md`` skills, the fourth form skill_view accepts.
-        for flat in root.rglob("*.md"):
-            if flat.name == "SKILL.md" or is_excluded_skill_path(flat, root=root):
-                continue
-            if _canonical_name(flat, None) in disabled:
-                continue
-            available |= _identifiers_for(flat, root, frontmatter_name=None)
-    return available
 
-
-def _safe_frontmatter(skill_md: Path, parse_frontmatter) -> dict:
-    try:
-        return parse_frontmatter(skill_md.read_text(encoding="utf-8"))[0] or {}
-    except Exception:
-        return {}
-
-
-def _lookup_forms(requested: str) -> tuple[str, ...]:
-    """Identifier spellings to try for one requested name.
-
-    ``category:name`` is the config/gateway spelling of the on-disk
-    ``category/name`` and resolves to it (``_resolve_plugin_skill`` falls
-    through that way when no plugin owns the namespace).
-    """
-    name = (requested or "").strip().lstrip("/")
-    if not name:
-        return ()
-    forms = {name}
-    namespace, _, bare = name.partition(":")
-    if bare and namespace:
-        forms.add(f"{namespace}/{bare}")
-    return tuple(forms)
-
-
-def _is_plugin_namespaced(requested: str) -> bool:
-    """True for ``plugin:skill``, whose owner can only be enumerated by loading
-    that profile's plugins — which this process must not do."""
-    from agent.skill_utils import is_valid_namespace, parse_qualified_name
-
-    namespace, bare = parse_qualified_name((requested or "").strip())
-    return bool(bare) and is_valid_namespace(namespace)
-
-
-def available_skill_identifiers(profile: str) -> set[str]:
-    """Skill identifiers resolvable for *profile*, under ITS home.
+def _profile_home(profile: str) -> tuple[str, Path]:
+    """``(canonical_name, home_dir)`` for a live, inspectable profile.
 
     Raises :class:`KanbanSkillPreflightError` (``PROFILE_UNAVAILABLE_CODE``)
-    when a profile that EXISTS cannot be authoritatively inspected — fail closed
-    rather than assume the skill is there. A profile that does not exist at all
-    is a different case; see :func:`assignee_is_inspectable`.
+    when the profile does not exist, is tombstoned, or cannot be resolved.
     """
-    from hermes_constants import reset_hermes_home_override, set_hermes_home_override
-
-    from hermes_cli.profiles import get_profile_dir, normalize_profile_name
+    from hermes_cli.profiles import get_profile_dir, normalize_profile_name, profile_exists
 
     try:
         canon = normalize_profile_name(profile)
-        profile_home = get_profile_dir(canon)
     except Exception as exc:
-        raise KanbanSkillPreflightError(
-            f"Cannot verify skills for assignee profile {profile!r}: {exc}. "
-            "Skill preflight fails closed rather than assuming the skill is installed.",
-            code=PROFILE_UNAVAILABLE_CODE, profile=str(profile),
-        ) from exc
-    token = set_hermes_home_override(str(profile_home))
+        raise _unavailable(str(profile), f"the profile name could not be resolved ({exc}).") from exc
     try:
-        return _available_identifiers_in_current_home()
+        exists = bool(profile_exists(canon))
+        home = Path(get_profile_dir(canon))
+        readable = home.is_dir()
     except Exception as exc:
-        raise KanbanSkillPreflightError(
-            f"Cannot verify skills for assignee profile {canon!r}: its skill registry "
-            f"({profile_home}) could not be read ({exc}). Skill preflight fails closed rather "
-            "than assuming the skill is installed.",
-            code=PROFILE_UNAVAILABLE_CODE, profile=canon,
-        ) from exc
-    finally:
-        reset_hermes_home_override(token)
+        raise _unavailable(canon, f"its profile registry could not be read ({exc}).") from exc
+    if not exists or not readable:
+        raise _unavailable(
+            canon,
+            f"there is no live profile home at {home} to inspect (missing, deleted or unreadable).",
+        )
+    return canon, home
 
 
-def assignee_is_inspectable(profile: str) -> bool:
-    """True when *profile* is a live Hermes profile with a real home on disk.
+def _probe_env(home: Path) -> dict:
+    """Child environment: the assignee's home, and nothing of this run's identity.
 
-    A non-existent assignee is NOT a preflight failure. The board deliberately
-    accepts assignees that are not (yet) Hermes profiles — control-plane lanes
-    that pull work via ``claim_task``, and profiles created after the card — and
-    the dispatcher already refuses to spawn them (``skipped_nonspawnable``). No
-    worker starts, so there is no init crash for preflight to prevent, and
-    rejecting the card here would break card-then-profile ordering.
-
-    The home directory must exist too: without it there is no registry to read,
-    and an absent home already fails the worker's own ``hermes -p`` startup for
-    reasons that have nothing to do with skills. Fail-closed
-    (``PROFILE_UNAVAILABLE_CODE``) is reserved for a home that EXISTS but cannot
-    be enumerated — the case where a skill might really be there and we must not
-    pretend either way.
+    ``HERMES_KANBAN_*`` is stripped so the probe is never mistaken for a
+    dispatcher-owned worker, and ``HERMES_PROFILE*`` so nothing resolves back to
+    the caller's profile.
     """
-    try:
-        from hermes_cli.profiles import get_profile_dir, normalize_profile_name, profile_exists
+    env = {
+        k: v for k, v in os.environ.items()
+        if not k.startswith(("HERMES_KANBAN_", "HERMES_PROFILE"))
+    }
+    env["HERMES_HOME"] = str(home)
+    repo_root = str(Path(__file__).resolve().parent.parent)
+    existing = env.get("PYTHONPATH")
+    env["PYTHONPATH"] = f"{repo_root}{os.pathsep}{existing}" if existing else repo_root
+    return env
 
-        canon = normalize_profile_name(profile)
-        return bool(profile_exists(canon)) and Path(get_profile_dir(canon)).is_dir()
-    except Exception:
-        return False
+
+def _run_probe(canon: str, home: Path, names: list[str]) -> dict:
+    """Load *names* under *home* in a subprocess; returns the loader's verdict.
+
+    The child runs in an empty temp directory so trusted project-local skill
+    dirs cannot make a card look satisfiable: those depend on the worker's
+    working directory and trust config, not on the profile.
+    """
+    from hermes_cli.kanban_skill_probe import RESULT_PREFIX
+
+    with tempfile.TemporaryDirectory(prefix="hermes-skill-probe-") as neutral_cwd:
+        try:
+            proc = subprocess.run(
+                [sys.executable, "-m", "hermes_cli.kanban_skill_probe", json.dumps(names)],
+                capture_output=True, text=True, env=_probe_env(home),
+                cwd=neutral_cwd, timeout=PROBE_TIMEOUT_SECONDS,
+            )
+        except subprocess.TimeoutExpired as exc:
+            raise _unavailable(
+                canon, f"inspecting its skill registry timed out after {PROBE_TIMEOUT_SECONDS}s.",
+            ) from exc
+        except Exception as exc:
+            raise _unavailable(canon, f"its skill registry could not be inspected ({exc}).") from exc
+    for line in proc.stdout.splitlines():
+        if line.startswith(RESULT_PREFIX):
+            try:
+                return json.loads(line[len(RESULT_PREFIX):])
+            except Exception as exc:
+                raise _unavailable(canon, f"its skill registry returned unreadable output ({exc}).") from exc
+    detail = (proc.stderr or proc.stdout or "").strip().splitlines()
+    raise _unavailable(
+        canon,
+        f"inspecting its skill registry failed (exit {proc.returncode}"
+        + (f": {detail[-1][:200]}" if detail else "") + ").",
+    )
 
 
 def missing_skills_for_profile(profile: str, skills: Optional[Iterable[str]]) -> list[str]:
     """Requested skills *profile* cannot load, in request order.
 
-    ``plugin:skill`` names are skipped: enumerating another profile's plugin
-    skills means discovering and importing its plugins, which this process must
-    not do on that profile's behalf.
+    The verdict comes from the real loader running under that profile's home,
+    so it covers every way a name fails to load — absent, disabled, ambiguous
+    across skill dirs, gated to another platform, or an unresolvable
+    ``namespace:skill`` — rather than only "no file with that name".
     """
     requested = [str(s).strip() for s in (skills or ()) if str(s).strip()]
-    checkable = [name for name in requested if not _is_plugin_namespaced(name)]
-    if not checkable:
+    if not requested:
         return []
-    available = available_skill_identifiers(profile)
-    return [
-        name for name in checkable
-        if not any(form in available for form in _lookup_forms(name))
-    ]
+    canon, home = _profile_home(profile)
+    verdict = _run_probe(canon, home, requested)
+    missing = {str(name) for name in verdict.get("missing") or ()}
+    return [name for name in requested if name in missing]
 
 
 def preflight_task_skills(profile: Optional[str], skills: Optional[Iterable[str]]) -> None:
@@ -264,15 +207,15 @@ def preflight_task_skills(profile: Optional[str], skills: Optional[Iterable[str]
     blocking a card because a bundled skill is absent would convert an install
     problem into a stuck board. See ``REVIEW_LANE_SKILL``.
 
-    No-ops for an unassigned card: there is no profile to validate against, and
-    the dispatcher re-runs this against whichever profile the card lands on.
+    A card that forces no skills is never inspected at all — so control-plane
+    lanes, whose assignees are not Hermes profiles, are untouched. An unassigned
+    card no-ops too: there is no profile to validate against yet, and the
+    dispatcher re-runs this against whichever profile the card lands on.
     """
-    if not profile or not str(profile).strip():
-        return
     wanted = [str(s).strip() for s in (skills or ()) if str(s).strip()]
     if not wanted:
         return
-    if not assignee_is_inspectable(profile):
+    if not profile or not str(profile).strip():
         return
     missing = missing_skills_for_profile(profile, wanted)
     if not missing:

@@ -59,6 +59,23 @@ def _err(msg: str, rc: int = 1) -> int:
     return rc
 
 
+def _err_structured(args: argparse.Namespace, exc: BaseException, prefix: str = "kanban",
+                    rc: int = 1) -> int:
+    """Report *exc*, as JSON when ``--json`` was passed and it carries structure.
+
+    Automation on the ``--json`` surface must be able to key on the error code
+    instead of matching English; a plain ValueError has no structure to emit and
+    stays on the human path.
+    """
+    from hermes_cli.kanban_skill_preflight import structured_error_payload
+
+    payload = structured_error_payload(exc)
+    if payload is not None and getattr(args, "json", False):
+        _print_json(payload)
+        return rc
+    return _err(f"{prefix}: {exc}", rc)
+
+
 def _bulk_apply(ids: Iterable[str], op: Callable[[str], Any],
                 ok_msg: Callable[[str], str], fail_msg: Callable[[str], str]) -> int:
     """Run ``op(tid) -> bool`` per id, print ok/fail lines, exit 1 if any failed."""

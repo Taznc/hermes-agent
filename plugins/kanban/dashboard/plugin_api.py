@@ -141,11 +141,18 @@ def _conflict(detail: str) -> HTTPException:
 
 @contextmanager
 def _map_errors(status: int, *types: type[BaseException]) -> Iterator[None]:
-    """Map the given exception types to ``HTTPException(status, str(exc))``."""
+    """Map the given exception types to ``HTTPException(status, str(exc))``.
+
+    A refusal carrying machine-readable fields (skill preflight) becomes a dict
+    detail with the same ``code``/``profile``/``missing_skills`` contract the
+    CLI and tool surfaces emit; everything else keeps its plain string detail.
+    """
     try:
         yield
     except types as e:
-        raise HTTPException(status_code=status, detail=str(e))
+        from hermes_cli.kanban_skill_preflight import structured_error_payload
+
+        raise HTTPException(status_code=status, detail=structured_error_payload(e) or str(e))
 
 
 _value_error_400 = partial(_map_errors, 400, ValueError)  # domain-layer validation refusals

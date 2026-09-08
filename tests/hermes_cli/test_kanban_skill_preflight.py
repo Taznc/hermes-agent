@@ -278,20 +278,15 @@ def test_dispatcher_preflight_does_not_consume_the_board_start_budget(kanban_hom
 def test_preflight_is_scoped_to_the_assignee_profile_not_the_calling_one(kanban_home):
     """Profile isolation: the skill registry consulted is the assignee's own.
     Never fall back to the caller's or the default profile's."""
-    from hermes_cli.kanban_skill_preflight import available_skill_identifiers
+    from hermes_cli.kanban_skill_preflight import missing_skills_for_profile
 
     _write_skill(kanban_home / "skills", "only-in-default")
     _make_profile(kanban_home, "alpha", ["only-in-alpha"])
     _make_profile(kanban_home, "beta", ["only-in-beta"])
 
-    alpha = available_skill_identifiers("alpha")
-    beta = available_skill_identifiers("beta")
-
-    assert "only-in-alpha" in alpha
-    assert "only-in-beta" not in alpha
-    assert "only-in-default" not in alpha
-    assert "only-in-beta" in beta
-    assert "only-in-alpha" not in beta
+    names = ["only-in-alpha", "only-in-beta", "only-in-default"]
+    assert missing_skills_for_profile("alpha", names) == ["only-in-beta", "only-in-default"]
+    assert missing_skills_for_profile("beta", names) == ["only-in-alpha", "only-in-default"]
 
 
 def test_multiple_missing_skills_are_all_named_in_one_error(kanban_home):
@@ -359,30 +354,29 @@ def test_disabled_skill_counts_as_unavailable(kanban_home):
 def test_unavailable_profile_registry_fails_closed_with_a_distinct_code(kanban_home):
     """A profile that EXISTS but whose skill registry cannot be read must NOT be
     assumed to have the skill, and its diagnostic must be distinguishable from a
-    plain missing skill so an operator can tell "cannot check" from "install this"."""
-    import hermes_cli.kanban_skill_preflight as preflight_mod
+    plain missing skill so an operator can tell "cannot check" from "install this".
+
+    Driven through the real refusal path: the profile's home is replaced by an
+    unreadable file, so the inspection genuinely cannot happen.
+    """
     from hermes_cli import kanban_db, kanban_db_connect
     from hermes_cli.kanban_skill_preflight import (
         MISSING_CODE, PROFILE_UNAVAILABLE_CODE, KanbanSkillPreflightError,
     )
 
-    _make_profile(kanban_home, "claudecode", ["github-code-review"])
+    import shutil
 
-    def _boom():
-        raise OSError("permission denied")
+    profile_dir = _make_profile(kanban_home, "claudecode", ["github-code-review"])
+    shutil.rmtree(profile_dir)
+    profile_dir.write_text("not a directory\n", encoding="utf-8")
 
-    original = preflight_mod._available_identifiers_in_current_home
-    preflight_mod._available_identifiers_in_current_home = _boom
-    try:
-        with kanban_db_connect.connect_closing() as conn:
-            kanban_db.create_board(slug="default", name="Test")
-            with pytest.raises(KanbanSkillPreflightError) as excinfo:
-                kanban_db.create_task(
-                    conn, title="card", assignee="claudecode",
-                    skills=["github-code-review"],
-                )
-    finally:
-        preflight_mod._available_identifiers_in_current_home = original
+    with kanban_db_connect.connect_closing() as conn:
+        kanban_db.create_board(slug="default", name="Test")
+        with pytest.raises(KanbanSkillPreflightError) as excinfo:
+            kanban_db.create_task(
+                conn, title="card", assignee="claudecode",
+                skills=["github-code-review"],
+            )
 
     error = excinfo.value
     assert error.code == PROFILE_UNAVAILABLE_CODE
@@ -393,35 +387,23 @@ def test_unavailable_profile_registry_fails_closed_with_a_distinct_code(kanban_h
         assert kanban_db.list_tasks(conn) == []
 
 
-def test_an_assignee_that_is_not_a_profile_is_not_rejected(kanban_home):
-    """The board deliberately accepts assignees that are not (yet) Hermes
-    profiles — control-plane lanes that pull via claim_task, and profiles
-    created after the card. The dispatcher already refuses to spawn those
-    (skipped_nonspawnable), so no worker starts and there is no init crash to
-    prevent; rejecting here would break card-then-profile ordering."""
-    from hermes_cli import kanban_db, kanban_db_connect
-
-    with kanban_db_connect.connect_closing() as conn:
-        kanban_db.create_board(slug="default", name="Test")
-        task_id = kanban_db.create_task(
-            conn, title="lane card", assignee="orion-cc", skills=["some-skill"],
-        )
-        assert kanban_db.get_task(conn, task_id).assignee == "orion-cc"
-
-
 
 def test_categorized_and_frontmatter_names_both_resolve(kanban_home):
     """A card may name a skill the way skill_view accepts it: bare directory
-    name, categorized path, or frontmatter name. None of those may be reported
-    missing when the skill is genuinely installed."""
+    name, categorized path, categorized ``category:skill``, or frontmatter
+    name. None of those may be reported missing when the skill is genuinely
+    installed — and each spelling is really resolved, not skipped."""
     from hermes_cli.kanban_skill_preflight import missing_skills_for_profile
 
     profile_dir = _make_profile(kanban_home, "claudecode", [])
     _write_skill(profile_dir / "skills", "mlops/axolotl", name="axolotl-trainer")
 
-    assert missing_skills_for_profile(
-        "claudecode", ["axolotl", "mlops/axolotl", "axolotl-trainer", "mlops:axolotl"],
-    ) == []
+    for spelling in ("axolotl", "mlops/axolotl", "axolotl-trainer", "mlops:axolotl"):
+        assert missing_skills_for_profile("claudecode", [spelling]) == [], spelling
+    # Not vacuous: the same spellings for a skill that is NOT installed are
+    # each reported missing, so a skipped name cannot masquerade as resolved.
+    for spelling in ("nosuch", "mlops/nosuch", "mlops:nosuch"):
+        assert missing_skills_for_profile("claudecode", [spelling]) == [spelling], spelling
 
 
 def test_a_card_without_forced_skills_is_never_rejected(kanban_home):
@@ -478,8 +460,3 @@ def test_the_dispatcher_injected_review_skill_is_not_preflighted(kanban_home):
     # injected it, not about the name.
     with pytest.raises(ValueError):
         preflight_task_skills("reviewer", [REVIEW_LANE_SKILL])
-
-
-
-
-

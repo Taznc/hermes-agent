@@ -23,7 +23,7 @@ from hermes_cli import kanban_db_workspace as kbw
 from hermes_cli import kanban_db_notify as kbn
 from hermes_cli import kanban_swarm as ks
 from hermes_cli.kanban_output import (
-    _ATTACHMENT_FIELDS, _RUNS_RUN_FIELDS, _SHOW_RUN_FIELDS, _bulk_apply, _err,
+    _ATTACHMENT_FIELDS, _RUNS_RUN_FIELDS, _SHOW_RUN_FIELDS, _bulk_apply, _err, _err_structured,
     _fmt_counts, _fmt_task_line, _fmt_ts, _json_out, _obj_dict, _print_json,
     _task_to_dict,
 )
@@ -385,22 +385,25 @@ def _cmd_create(args: argparse.Namespace) -> int:
                 explicit_model=model_override, explicit_provider=provider_override,
                 explicit_reasoning_effort=reasoning_effort,
             )
-            task_id = kb.create_task(
-                conn, title=args.title, body=args.body, assignee=args.assignee,
-                created_by=args.created_by or _profile_author(),
-                workspace_kind=ws_kind, workspace_path=ws_path, branch_name=branch_name,
-                project_id=getattr(args, "project", None), tenant=args.tenant, priority=args.priority,
-                parents=tuple(args.parent or ()), triage=bool(getattr(args, "triage", False)),
-                idempotency_key=getattr(args, "idempotency_key", None),
-                max_runtime_seconds=max_runtime, skills=getattr(args, "skills", None) or None,
-                max_retries=max_retries, model_override=routing.model_override,
-                provider_override=routing.provider_override,
-                reasoning_effort=routing.reasoning_effort,
-                route_source=routing.route_source, route_name=routing.route_name,
-                goal_mode=bool(getattr(args, "goal_mode", False)),
-                goal_max_turns=getattr(args, "goal_max_turns", None),
-                initial_status=getattr(args, "initial_status", "running"),
-            )
+            try:
+                task_id = kb.create_task(
+                    conn, title=args.title, body=args.body, assignee=args.assignee,
+                    created_by=args.created_by or _profile_author(),
+                    workspace_kind=ws_kind, workspace_path=ws_path, branch_name=branch_name,
+                    project_id=getattr(args, "project", None), tenant=args.tenant, priority=args.priority,
+                    parents=tuple(args.parent or ()), triage=bool(getattr(args, "triage", False)),
+                    idempotency_key=getattr(args, "idempotency_key", None),
+                    max_runtime_seconds=max_runtime, skills=getattr(args, "skills", None) or None,
+                    max_retries=max_retries, model_override=routing.model_override,
+                    provider_override=routing.provider_override,
+                    reasoning_effort=routing.reasoning_effort,
+                    route_source=routing.route_source, route_name=routing.route_name,
+                    goal_mode=bool(getattr(args, "goal_mode", False)),
+                    goal_max_turns=getattr(args, "goal_max_turns", None),
+                    initial_status=getattr(args, "initial_status", "running"),
+                )
+            except ValueError as exc:  # forced-skill preflight against the assignee
+                return _err_structured(args, exc, rc=2)
             task = kb.get_task(conn, task_id)
     if task is None:
         return _err("kanban: created task could not be read back", 1)
@@ -614,7 +617,7 @@ def _cmd_assign(args: argparse.Namespace) -> int:
         with kbc.connect_closing() as conn:
             ok = kb.assign_task(conn, args.task_id, profile)
     except ValueError as exc:  # forced-skill preflight against the new profile
-        return _err(f"kanban: {exc}", 2)
+        return _err_structured(args, exc, rc=2)
     return _ok_or_err(ok, f"no such task: {args.task_id}",
                       f"Assigned {args.task_id} to {profile or '(unassigned)'}")
 
@@ -666,7 +669,7 @@ def _cmd_reassign(args: argparse.Namespace) -> int:
         with kbc.connect_closing() as conn:
             ok = kb.reassign_task(conn, args.task_id, profile, reclaim_first=reclaim, reason=getattr(args, "reason", None))
     except ValueError as exc:  # forced-skill preflight against the new profile
-        return _err(f"kanban: {exc}", 2)
+        return _err_structured(args, exc, rc=2)
     return _ok_or_err(
         ok,
         f"cannot reassign {args.task_id} (unknown id, or still running — pass --reclaim to release first)",

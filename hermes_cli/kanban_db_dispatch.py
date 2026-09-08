@@ -2566,6 +2566,19 @@ def _dispatch_lane_task(
     skip is recorded on ``result``.
     """
     task_id = row["id"]
+    # Forced-skill preflight FIRST: a card can carry skills that never passed
+    # create-time validation (imported board, pre-check row, skill uninstalled
+    # or disabled since), and it must be refused before anything else decides
+    # this row's fate. Ahead of the non-spawnable skip on purpose — a card whose
+    # assignee has no inspectable profile home would otherwise park silently in
+    # `ready` forever with an unloadable skill nobody is told about. Ahead of
+    # the claim on purpose too: a mismatch is a configuration error, and
+    # spawning a worker that dies during init would charge the retry budget,
+    # the start budget and the failure breaker for it.
+    if _block_for_skill_preflight(
+        conn, task_id, assignee, result, dry_run=dry_run,
+    ):
+        return False
     # Non-profile assignees (control-plane lanes that pull via ``claim_task``)
     # would fail ``hermes -p <assignee>`` at startup and loop ready→crash→ready
     # forever. Bucketed apart from skipped_unassigned: the operator cannot fix
@@ -2602,16 +2615,8 @@ def _dispatch_lane_task(
         if per_profile_cap is not None and name:
             per_profile_running[name] = per_profile_running.get(name, 0) + 1
 
-    # Forced-skill preflight, defensively re-run here because a row can carry
-    # skills that never passed create-time validation: an imported board, a row
-    # written before this check existed, or a skill uninstalled/disabled since.
-    # Before the claim on purpose — a mismatch is a configuration error, and
-    # spawning a worker that dies during init instead would charge the retry
-    # budget, the start budget and the failure breaker for it.
-    if _block_for_skill_preflight(
-        conn, task_id, assignee, result, dry_run=dry_run,
-    ):
-        return False
+    # Forced-skill preflight ran at the top of this function (before the
+    # non-spawnable skip and the claim).
 
     # Co-edit serialization. Only the ready lane: a review card reads the branch
     # its implementer already produced, so it is not a concurrent writer.
@@ -2715,6 +2720,15 @@ def _block_for_skill_preflight(
         if not dry_run:
             _kb.block_task(conn, task_id, reason=reason, kind="capability")
             with _kb.write_txn(conn):
+                # Initialization-only failure state is not this card's record.
+                # A card that crash-looped on this exact misconfiguration before
+                # the preflight existed carries a nonzero streak from runs that
+                # never executed any work; leaving it would put the corrected
+                # card one bad tick from the auto-block breaker.
+                conn.execute(
+                    "UPDATE tasks SET consecutive_failures = 0, last_failure_error = NULL "
+                    "WHERE id = ?", (task_id,),
+                )
                 # Stamp the structured form onto the block event a caller can
                 # key on (CLI, dashboard, telemetry) without parsing prose.
                 conn.execute(

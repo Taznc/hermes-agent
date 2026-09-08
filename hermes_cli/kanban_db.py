@@ -1984,7 +1984,7 @@ def create_task(
     route_source: Optional[str] = None, route_name: Optional[str] = None,
     goal_mode: bool = False, goal_max_turns: Optional[int] = None, initial_status: str = "running",
     session_id: Optional[str] = None, board: Optional[str] = None, project_id: Optional[str] = None,
-    project_source_task_id: Optional[str] = None,
+    project_source_task_id: Optional[str] = None, skill_preflight: bool = True,
 ) -> str:
     """Create a task (optionally under ``parents``); returns its id.
 
@@ -2040,8 +2040,13 @@ def create_task(
     # Forced skills resolve in the ASSIGNEE's isolated profile home, not ours.
     # Validating here — before the row exists — is what keeps an unloadable
     # skill from becoming a worker that dies during init on every retry.
-    from hermes_cli.kanban_skill_preflight import preflight_task_skills
-    preflight_task_skills(assignee, skills_list)
+    # ``skill_preflight=False`` is the explicit inert path (board import, row
+    # relocation, deliberate card-before-profile ordering): the row is written
+    # unvalidated and the dispatcher's own check refuses to spawn it. It is
+    # never implicit — an assignee we cannot inspect fails closed instead.
+    if skill_preflight:
+        from hermes_cli.kanban_skill_preflight import preflight_task_skills
+        preflight_task_skills(assignee, skills_list)
 
     # Idempotency check BEFORE the write txn (no lock held); a concurrent-create
     # race may insert twice, the next lookup stabilises on the newest.
@@ -2316,6 +2321,29 @@ def list_tasks(
     return [Task.from_row(r) for r in rows]
 
 
+def _preflight_assignee_change(
+    conn: sqlite3.Connection, task_id: str, profile: Optional[str],
+) -> None:
+    """Validate *profile* against the card's stored forced skills.
+
+    Every path that moves a card to a different profile funnels through here
+    BEFORE it mutates anything: a card one profile can run is a guaranteed init
+    crash for a profile whose isolated home cannot load its skills, and the
+    create-time check cannot see a later move. Called ahead of any reclaim,
+    termination or status change so a refusal leaves the board exactly as it
+    was — a validated-too-late reassignment kills the running worker and then
+    refuses, which is strictly worse than not trying.
+    """
+    if not profile:
+        return
+    row = conn.execute("SELECT skills FROM tasks WHERE id = ?", (task_id,)).fetchone()
+    if row is None:
+        return
+    from hermes_cli.kanban_skill_preflight import preflight_task_skills
+
+    preflight_task_skills(profile, _json_or(_row_get(row, "skills")) or ())
+
+
 def assign_task(conn: sqlite3.Connection, task_id: str, profile: Optional[str]) -> bool:
     """Assign/reassign; raises RuntimeError while the task is running under a claim.
 
@@ -2337,8 +2365,7 @@ def assign_task(conn: sqlite3.Connection, task_id: str, profile: Optional[str]) 
                 "Wait for completion or reclaim the stale lock first."
             )
         if row["assignee"] != profile:
-            from hermes_cli.kanban_skill_preflight import preflight_task_skills
-            preflight_task_skills(profile, _json_or(_row_get(row, "skills")) or ())
+            _preflight_assignee_change(conn, task_id, profile)
             # The failure streak is per task/profile; a new profile starts fresh.
             conn.execute(
                 "UPDATE tasks SET assignee = ?, consecutive_failures = 0, "
@@ -3569,7 +3596,13 @@ def reassign_task(
     reason: Optional[str] = None,
 ) -> bool:
     """Reassign (None unassigns); a running task is refused unless
-    ``reclaim_first`` releases its claim — the "this profile's model is broken" path."""
+    ``reclaim_first`` releases its claim — the "this profile's model is broken" path.
+
+    The target profile is validated BEFORE any reclaim: killing the live worker
+    and only then refusing the move would leave the card worse off than not
+    calling at all.
+    """
+    _preflight_assignee_change(conn, task_id, profile)
     if reclaim_first:
         # Safe to call even if nothing to reclaim.
         reclaim_task(conn, task_id, reason=reason or "reassign")
@@ -4180,6 +4213,15 @@ def request_review(
     metadata = redact_review_value(metadata)
     reviewer_model_override, reviewer_provider_override = _validate_model_override(
         reviewer_model_override, reviewer_provider_override,
+    )
+    # A reviewer handoff reassigns the card, so it is an assignee mutation and
+    # gets the same forced-skill check: handing a skills-carrying card to a
+    # reviewer profile that cannot load them relocates the init crash to the
+    # review lane. Resolved and checked BEFORE the write txn — the check spawns
+    # a probe, which must not run holding the board's write lock, and a refusal
+    # must not have moved the card first.
+    _preflight_assignee_change(
+        conn, task_id, reviewer if reviewer is not None else _prior_reviewer(conn, task_id) or None,
     )
     with write_txn(conn):
         if not _parents_satisfied(conn, task_id):
