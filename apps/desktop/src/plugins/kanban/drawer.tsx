@@ -377,10 +377,7 @@ export function TaskDrawer({
   // safe array to read without each guarding the shape itself.
   const supportsAttachments = Array.isArray(detail?.attachments)
 
-  const attachments = useMemo(
-    () => (Array.isArray(detail?.attachments) ? detail.attachments : []),
-    [detail]
-  )
+  const attachments = useMemo(() => (Array.isArray(detail?.attachments) ? detail.attachments : []), [detail])
 
   if (!id) {
     return null

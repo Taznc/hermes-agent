@@ -764,7 +764,8 @@ export const en: KanbanMessages = {
   confirmRebootPrompt: 'Reboot this machine once every worker has finished?',
   confirmReboot: 'Yes, reboot after drain',
   cancelConfirm: 'Keep waiting',
-  postDrainArmed: (action, running, remaining) => `${action} when drained — ${running} running, expires in ${remaining}`,
+  postDrainArmed: (action, running, remaining) =>
+    `${action} when drained — ${running} running, expires in ${remaining}`,
   postDrainArmedDrained: (action, remaining) => `${action} — drained, firing shortly (expires in ${remaining})`,
   postDrainFiring: action => `${action} — running now`,
   postDrainSucceeded: action => `${action} — done`,
@@ -1142,8 +1143,7 @@ const ja: KanbanMessages = {
   confirmRebootPrompt: 'すべてのワーカーが完了したら、このマシンを再起動しますか？',
   confirmReboot: 'はい、排出後に再起動',
   cancelConfirm: '待機を続ける',
-  postDrainArmed: (action, running, remaining) =>
-    `排出後に${action} — 実行中 ${running} 件、${remaining}後に期限切れ`,
+  postDrainArmed: (action, running, remaining) => `排出後に${action} — 実行中 ${running} 件、${remaining}後に期限切れ`,
   postDrainArmedDrained: (action, remaining) => `${action} — 排出完了、まもなく実行（${remaining}後に期限切れ）`,
   postDrainFiring: action => `${action} — 実行中`,
   postDrainSucceeded: action => `${action} — 完了`,
