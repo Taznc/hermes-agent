@@ -126,7 +126,7 @@ def decompose_triage_task(
     now = int(time.time())
     with write_txn(conn):
         root_row = conn.execute(
-            "SELECT id, status, tenant, workspace_kind, workspace_path "
+            "SELECT id, status, tenant, workspace_kind, workspace_path, priority "
             "FROM tasks WHERE id = ?", (task_id,),
         ).fetchone()
         if root_row is None or root_row["status"] != "triage":
@@ -190,6 +190,9 @@ def _insert_decomposed_child(
     and one shared checkout would put them all on the first sibling's branch
     with no lock; leaving it unset makes dispatch materialize a fresh
     ``<repo>/.worktrees/<child-id>`` per child from the board anchor.
+
+    Priority: a per-child integer overrides the root; otherwise the child
+    inherits the root's stored value.
     """
     from hermes_cli.kanban_db import (
         _new_task_id, _canonical_assignee, _append_event,
@@ -205,17 +208,20 @@ def _insert_decomposed_child(
         child_ws_path = root_row["workspace_path"]
     else:
         child_ws_path = None
+    child_priority = child.get("priority")
+    if not isinstance(child_priority, int) or isinstance(child_priority, bool):
+        child_priority = root_row["priority"]
     new_id = _new_task_id()
     body = child.get("body")
     conn.execute(
         "INSERT INTO tasks "
         "(id, title, body, assignee, status, workspace_kind, "
-        " workspace_path, tenant, created_at, created_by) "
-        "VALUES (?, ?, ?, ?, 'todo', ?, ?, ?, ?, ?)",
+        " workspace_path, tenant, created_at, created_by, priority) "
+        "VALUES (?, ?, ?, ?, 'todo', ?, ?, ?, ?, ?, ?)",
         (
             new_id, child["title"].strip(), body if isinstance(body, str) else None,
             _canonical_assignee(child.get("assignee")), child_ws_kind, child_ws_path,
-            root_row["tenant"], now, (author or "decomposer"),
+            root_row["tenant"], now, (author or "decomposer"), child_priority,
         ),
     )
     _append_event(

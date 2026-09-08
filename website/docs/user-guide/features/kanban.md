@@ -162,6 +162,27 @@ They coexist: a kanban worker may call `delegate_task` internally during its run
 - **Dispatcher** — a long-lived loop that, every N seconds (default 60): reclaims stale claims, reclaims crashed workers (PID gone but TTL not yet expired), promotes ready tasks, atomically claims, spawns assigned profiles. Runs **inside the gateway** by default (`kanban.dispatch_in_gateway: true`). One dispatcher sweeps all boards per tick; workers are spawned with `HERMES_KANBAN_BOARD` pinned so they can't see other boards. After `kanban.failure_limit` consecutive spawn failures on the same task (default: 2) the dispatcher auto-blocks it with the last error as the reason — prevents thrashing on tasks whose profile doesn't exist, workspace can't mount, etc. Deaths classified as infra (external SIGTERM/SIGKILL, a startup-window dead PID, or a provider quota/429 signature) do NOT tick this counter directly — see `docs/kanban/infra-failure-classification.md` for the exact signal allowlist, the bounded `kanban.max_infra_interruptions` streak that still eventually counts a repeatedly-interrupted task, and `kanban.provider_backoff`/`kanban.provider_backoff_max_seconds` for provider-wide quota parking.
 - **Tenant** — optional string namespace *within* a board. One specialist fleet can serve multiple businesses (`--tenant business-a`) with data isolation by workspace path and memory key prefix. Tenants are a soft filter; boards are the hard isolation boundary.
 
+### Priority
+
+`tasks.priority` is a plain integer column with a documented 4-tier
+convention: `critical=2`, `high=1`, `normal=0` (the default), `low=-1`. Set it
+at creation (`hermes kanban create --priority 2` or `kanban_create(...)`) or
+later (`hermes kanban update <id> --priority ...`); `hermes kanban list` and
+`hermes kanban show` render a recognized tier by name, and any other integer
+by its bare number.
+
+Priority is a **dispatch-order tiebreaker only** — among tasks otherwise
+ready to run for the same assignee, higher priority is picked sooner. It does
+**not** reserve capacity, does **not** preempt a task that is already
+running, and does not affect model or reasoning-effort routing. Values
+outside the four-tier scale are accepted as-is (not clamped or migrated) and
+keep their relative order.
+
+When a triage card is fanned out via `decompose`, every child **inherits the
+root's priority** unless the decomposer explicitly assigns a different
+per-child priority — a Critical card does not silently demote its own
+children to Normal.
+
 ## Roadmap lanes (`idea` / `roadmap`)
 
 Every other column is eventually acted on by something — the dispatcher spawns

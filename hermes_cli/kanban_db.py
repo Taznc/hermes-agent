@@ -94,6 +94,11 @@ VALID_STATUSES = {
 }
 VALID_INITIAL_STATUSES = {"running", "blocked"}
 
+# Canonical priority scale: a documented convention over the free ``priority``
+# INTEGER column, not a constraint. Values outside the scale remain valid and
+# retain their relative dispatch order.
+PRIORITY_LEVELS: dict[str, int] = {"critical": 2, "high": 1, "normal": 0, "low": -1}
+
 # Wishlist lanes: a card parked here is INERT BY CONSTRUCTION. No sweep, dispatcher query,
 # promotion pass, decomposer, specifier, ``recompute_ready`` or stale/crash reaper may ever
 # select one, because every one of those selects an explicit status whitelist that omits both.

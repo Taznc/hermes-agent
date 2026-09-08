@@ -80,11 +80,22 @@ def _bulk_apply(ids: Iterable[str], op: Callable[[str], Any],
     return 1 if failed else 0
 
 
+def _fmt_priority(priority: int) -> str:
+    """Render a known priority tier by name (``critical``/``high``/``normal``/
+    ``low``); an unrecognized integer renders as the bare number. Purely
+    cosmetic — never changes sort order."""
+    for name, value in kb.PRIORITY_LEVELS.items():
+        if value == priority:
+            return name
+    return str(priority)
+
+
 def _fmt_task_line(t: kb.Task) -> str:
     icon = _STATUS_ICONS.get(t.status, "?")
     assignee = t.assignee or "(unassigned)"
     tenant = f" [{t.tenant}]" if t.tenant else ""
-    return f"{icon} {t.id}  {t.status:8s}  {assignee:20s}{tenant}  {t.title}"
+    prio = f" ({_fmt_priority(t.priority)})" if t.priority is not None else ""
+    return f"{icon} {t.id}  {t.status:8s}  {assignee:20s}{tenant}  {t.title}{prio}"
 
 
 def _obj_dict(obj: Any, fields: tuple[str, ...]) -> dict[str, Any]:
