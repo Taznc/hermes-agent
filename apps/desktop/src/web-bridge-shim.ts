@@ -128,6 +128,29 @@ interface SpikeReadFileTextResult {
   truncated?: boolean
 }
 
+// Wire shapes of /api/dashboard/plugins/probe and
+// /api/dashboard/desktop-plugins/install. Deliberately identical to
+// PluginProbeResult / DesktopPluginInstallResult in global.d.ts (and to what
+// electron/desktop-plugin-install.ts returns) so the backend response is
+// handed to the renderer verbatim with no translation layer to drift.
+interface SpikePluginProbeResult {
+  ok: boolean
+  agent: boolean
+  desktop: boolean
+  agentName?: null | string
+  desktopName?: null | string
+  warnings?: string[]
+  insecure?: boolean
+  error?: string
+}
+
+interface SpikeDesktopPluginInstallResult {
+  ok: boolean
+  pluginName?: string
+  path?: string
+  error?: string
+}
+
 // Structural subset of HermesSelectPathsOptions (src/global.d.ts).
 interface SpikeSelectPathsOptions {
   title?: string
@@ -719,6 +742,61 @@ const shim = {
   // 512 KiB, which would evaluate half a module).
   readPluginSource: async (filePath: string) =>
     api<SpikeReadFileTextResult>({ path: `/api/fs/read-plugin-source?path=${encodeURIComponent(filePath)}` }),
+
+  // ── plugin install door (proxied over /api/dashboard/*) ─────────────────
+  // Electron resolves these in its main process (electron/fs-ipc.ts ->
+  // electron/desktop-plugin-install.ts): clone a repo to a temp dir, report
+  // which halves it carries, and copy the desktop half into
+  // <hermes home>/desktop-plugins/<name>. There is no main process here, so
+  // both proxy to backend routes that do the same work server-side and
+  // return the same camelCase shapes global.d.ts declares.
+  //
+  // Without them PluginInstallModal degrades to its probeUnavailable /
+  // desktopUnavailable copy — honest, but the desktop half of a plugin
+  // cannot be installed from this build at all.
+  //
+  // Failures resolve to `{ok: false, error}` instead of rejecting, matching
+  // the IPC handlers: the modal calls both members without a catch, so a
+  // rejection would strand the dialog in its probing state and surface as an
+  // unhandled rejection rather than as visible copy.
+  //
+  // 90s budget: the backend's own git clone budgets 60s, so the shim's 30s
+  // default ceiling would abort a legitimate slow clone before it finished.
+  probePluginRepo: async (payload: { identifier?: string; repo?: string }) => {
+    const identifier = payload.identifier ?? payload.repo ?? ''
+
+    try {
+      return await api<SpikePluginProbeResult>({
+        path: '/api/dashboard/plugins/probe',
+        method: 'POST',
+        body: { identifier },
+        timeoutMs: 90_000
+      })
+    } catch (error) {
+      return {
+        ok: false,
+        agent: false,
+        desktop: false,
+        warnings: [] as string[],
+        insecure: false,
+        error: error instanceof Error ? error.message : String(error)
+      }
+    }
+  },
+  installDesktopPlugin: async (payload: { identifier?: string; repo?: string; force?: boolean }) => {
+    const identifier = payload.identifier ?? payload.repo ?? ''
+
+    try {
+      return await api<SpikeDesktopPluginInstallResult>({
+        path: '/api/dashboard/desktop-plugins/install',
+        method: 'POST',
+        body: { identifier, force: Boolean(payload.force) },
+        timeoutMs: 90_000
+      })
+    } catch (error) {
+      return { ok: false, error: error instanceof Error ? error.message : String(error) }
+    }
+  },
 
   // ── first-render adjacents ───────────────────────────────────────────────
   onPreviewFileChanged: unsub,
