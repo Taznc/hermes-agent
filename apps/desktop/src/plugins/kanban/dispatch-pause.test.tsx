@@ -362,3 +362,230 @@ describe('Dispatch pause control', () => {
     expect(screen.getByRole('button', { name: 'pauseDispatch()' })).toBeTruthy()
   })
 })
+
+/**
+ * The "after drain" action queue.
+ *
+ * The trigger itself is server-side (the dispatcher tick fires it with no
+ * browser connected), so these contracts are about the operator's half: queue
+ * the intent against the right scope, render what is armed alongside the live
+ * running count and time remaining, require a second step before a reboot, and
+ * never present a queued action as fired.
+ */
+describe('Post-drain action queue', () => {
+  /** Radix's dropdown trigger opens on pointerdown — a synthetic `click` alone
+   *  won't do it, so fire the full mouse sequence a real click produces (same
+   *  technique as board-switcher.test.tsx / project-menu.test.tsx, #67500). */
+  const openAfterDrainMenu = async () => {
+    const trigger = await screen.findByRole('button', { name: 'queuePostDrain()' })
+
+    fireEvent.pointerDown(trigger, { button: 0, pointerType: 'mouse' })
+    fireEvent.pointerUp(trigger, { button: 0, pointerType: 'mouse' })
+    fireEvent.click(trigger)
+  }
+
+  const ACTIONS = [
+    { action_kind: 'service_restart', targets: ['hermes-gateway.service'] },
+    { action_kind: 'reboot', targets: [] }
+  ]
+
+  const QUEUED = {
+    action_kind: 'reboot',
+    expires_in_seconds: 2_520,
+    expires_at: 1_788_802_520,
+    requested_at: 1_788_800_000,
+    requested_by: 'claudecode',
+    state: 'waiting',
+    target: null
+  }
+
+  beforeEach(() => {
+    status = { ...PAUSED, post_drain: null, post_drain_actions: ACTIONS, running_count: 3 }
+  })
+
+  it('offers the after-drain selector next to the existing pause control', async () => {
+    mount()
+
+    expect(await screen.findByRole('button', { name: 'queuePostDrain()' })).toBeTruthy()
+  })
+
+  it('only offers actions this host will actually accept', async () => {
+    // The backend rejects service_restart when no unit is allowlisted, so
+    // offering it here would render a button that can only ever 400.
+    status = { ...status, post_drain_actions: [{ action_kind: 'reboot', targets: [] }] }
+    mount()
+
+    await openAfterDrainMenu()
+
+    expect(await screen.findByRole('menuitem', { name: 'actionReboot()' })).toBeTruthy()
+    expect(screen.queryByRole('menuitem', { name: /actionServiceRestart/ })).toBeNull()
+  })
+
+  it('queues a service restart in one click', async () => {
+    mount()
+
+    await openAfterDrainMenu()
+    fireEvent.click(await screen.findByRole('menuitem', { name: 'actionServiceRestart(hermes-gateway.service)' }))
+
+    await waitFor(() =>
+      expect(rest).toHaveBeenCalledWith('/dispatch/post-drain?board=shipping', {
+        body: { action_kind: 'service_restart', expires_in_seconds: null, target: 'hermes-gateway.service' },
+        method: 'POST'
+      })
+    )
+  })
+
+  it('requires an explicit second step before arming a reboot', async () => {
+    mount()
+
+    await openAfterDrainMenu()
+    fireEvent.click(await screen.findByRole('menuitem', { name: 'actionReboot()' }))
+
+    // The first click only asks. Arming a host reboot on a single menu click is
+    // the mistake this confirmation exists to prevent.
+    expect(rest).not.toHaveBeenCalledWith(expect.stringContaining('/dispatch/post-drain'), expect.anything())
+    expect(await screen.findByText('confirmRebootPrompt()')).toBeTruthy()
+
+    fireEvent.click(await screen.findByRole('button', { name: 'confirmReboot()' }))
+
+    await waitFor(() =>
+      expect(rest).toHaveBeenCalledWith('/dispatch/post-drain?board=shipping', {
+        body: { action_kind: 'reboot', expires_in_seconds: null, target: null },
+        method: 'POST'
+      })
+    )
+  })
+
+  it('abandons an unconfirmed reboot without queueing anything', async () => {
+    mount()
+
+    await openAfterDrainMenu()
+    fireEvent.click(await screen.findByRole('menuitem', { name: 'actionReboot()' }))
+    fireEvent.click(await screen.findByRole('button', { name: 'cancelConfirm()' }))
+
+    await waitFor(() => expect(screen.queryByText('confirmRebootPrompt()')).toBeNull())
+    expect(rest).not.toHaveBeenCalledWith(expect.stringContaining('/dispatch/post-drain'), expect.anything())
+  })
+
+  it('shows the armed action with the live running count and time remaining', async () => {
+    status = { ...status, post_drain: QUEUED, running_count: 3 }
+    mount()
+
+    // One line, visible without hover: what fires, how far from firing, and
+    // how long the operator has before it expires instead.
+    expect(await screen.findByText('postDrainArmed(actionReboot(),3,42m)')).toBeTruthy()
+  })
+
+  it('reports a drained board as about to fire rather than as still waiting', async () => {
+    status = { ...status, post_drain: QUEUED, running_count: 0 }
+    mount()
+
+    expect(await screen.findByText('postDrainArmedDrained(actionReboot(),42m)')).toBeTruthy()
+  })
+
+  it('offers Cancel while an action is waiting and clears it through the scoped endpoint', async () => {
+    status = { ...status, post_drain: QUEUED }
+    mount()
+
+    fireEvent.click(await screen.findByRole('button', { name: 'cancelPostDrain()' }))
+
+    await waitFor(() =>
+      expect(rest).toHaveBeenCalledWith('/dispatch/post-drain?board=shipping', { method: 'DELETE' })
+    )
+  })
+
+  it('does not offer Cancel once the action has already fired', async () => {
+    // Cancelling is only meaningful while waiting; a fired action is history.
+    status = { ...status, post_drain: { ...QUEUED, state: 'firing' } }
+    mount()
+
+    await screen.findByText(/^postDrainFiring/)
+    expect(screen.queryByRole('button', { name: 'cancelPostDrain()' })).toBeNull()
+  })
+
+  it('reports a failed action instead of leaving the operator to assume it worked', async () => {
+    status = {
+      ...status,
+      post_drain: { ...QUEUED, error: 'unit did not come back active', state: 'failed' }
+    }
+    mount()
+
+    expect(await screen.findByText('postDrainFailed(actionReboot(),unit did not come back active)')).toBeTruthy()
+    expect(screen.queryByRole('button', { name: 'cancelPostDrain()' })).toBeNull()
+  })
+
+  it('reports an expired action as expired, never as fired', async () => {
+    status = { ...status, post_drain: { ...QUEUED, expires_in_seconds: 0, state: 'expired' } }
+    mount()
+
+    expect(await screen.findByText('postDrainExpired(actionReboot())')).toBeTruthy()
+  })
+
+  it('does not offer the selector while an action is already queued', async () => {
+    status = { ...status, post_drain: QUEUED }
+    mount()
+
+    await screen.findByRole('button', { name: 'cancelPostDrain()' })
+    expect(screen.queryByRole('button', { name: 'queuePostDrain()' })).toBeNull()
+  })
+
+  it('queues and cancels across every board while All Boards is selected', async () => {
+    $boardSlug.set('*')
+    status = { ...ALL_PAUSED, post_drain: null, post_drain_actions: ACTIONS, running_count: 3 }
+    mount()
+
+    await openAfterDrainMenu()
+    fireEvent.click(await screen.findByRole('menuitem', { name: 'actionServiceRestart(hermes-gateway.service)' }))
+
+    await waitFor(() =>
+      expect(rest).toHaveBeenCalledWith('/dispatch/post-drain?boards=*', {
+        body: { action_kind: 'service_restart', expires_in_seconds: null, target: 'hermes-gateway.service' },
+        method: 'POST'
+      })
+    )
+
+    status = { ...status, post_drain: QUEUED }
+    fireEvent.click(await screen.findByRole('button', { name: 'cancelPostDrain()' }))
+
+    await waitFor(() => expect(rest).toHaveBeenCalledWith('/dispatch/post-drain?boards=*', { method: 'DELETE' }))
+  })
+
+  it('surfaces a rejected queue request instead of showing an action as armed', async () => {
+    rest.mockImplementation((path: string, options?: { method?: string }) => {
+      if (path.startsWith('/dispatch/status')) {
+        return Promise.resolve(status)
+      }
+
+      return options?.method === 'POST'
+        ? Promise.reject(new Error('service_restart target is not in the allowlist'))
+        : Promise.reject(new Error('unexpected request'))
+    })
+    mount()
+
+    await openAfterDrainMenu()
+    fireEvent.click(await screen.findByRole('menuitem', { name: 'actionServiceRestart(hermes-gateway.service)' }))
+
+    await waitFor(() =>
+      expect(notify).toHaveBeenCalledWith({
+        kind: 'error',
+        message: 'service_restart target is not in the allowlist'
+      })
+    )
+    expect(screen.queryByRole('button', { name: 'cancelPostDrain()' })).toBeNull()
+  })
+
+  it('reuses the existing status poll rather than adding a second loop', async () => {
+    // The card is explicit: one 8s cadence for the whole panel. A dedicated
+    // queue poll would double the request rate on an idle dashboard.
+    status = { ...status, post_drain: QUEUED }
+    mount()
+
+    await screen.findByRole('button', { name: 'cancelPostDrain()' })
+
+    const queueReads = rest.mock.calls.filter(
+      ([path, options]: [string, { method?: string } | undefined]) =>
+        path.startsWith('/dispatch/post-drain') && (options?.method ?? 'GET') === 'GET'
+    )
+    expect(queueReads).toEqual([])
+  })
+})
