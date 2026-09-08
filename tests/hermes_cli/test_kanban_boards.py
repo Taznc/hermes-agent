@@ -537,6 +537,24 @@ if not str(kb.boards_root()).startswith(spec["home"]):
 if spec.get("default_timeout") is not None:
     kbi.DEFAULT_INVENTORY_LOCK_TIMEOUT_SECONDS = float(spec["default_timeout"])
 
+if spec.get("pause_after_existing_check"):
+    original_path_is_new = kbi.path_is_new_board_entry
+    paused = False
+
+    def path_is_new_with_pause(path):
+        global paused
+        result = original_path_is_new(path)
+        if not result and not paused:
+            paused = True
+            Path(spec["observed"]).write_text("existing", encoding="utf-8")
+            resume = Path(spec["resume"])
+            while not resume.exists():
+                time.sleep(0.02)
+            Path(spec["resumed"]).write_text("go", encoding="utf-8")
+        return result
+
+    kbi.path_is_new_board_entry = path_is_new_with_pause
+
 out = Path(spec["out"])
 
 
@@ -803,6 +821,65 @@ class TestBoardInventoryLock:
         finally:
             release.write_text("go", encoding="utf-8")
         assert _result(holder, holder_out)["ok"] is True
+
+    @pytest.mark.parametrize("op", ["connect", "init"])
+    def test_existing_board_open_cannot_recreate_after_concurrent_remove(
+        self, fresh_home, tmp_path, op
+    ):
+        """An existing-board fast path may race with removal, but it must not
+        recreate the board while a fleet reader holds the inventory lock.
+
+        The child pauses immediately after observing ``victim`` as existing.
+        The parent then deletes it and starts a foreign inventory-lock holder
+        before allowing the child to continue. The existing path must use a
+        no-create open, notice that its board vanished, and retry creation only
+        after the holder releases. Both direct entry points exercise the race.
+        """
+        script = _write_child_script(tmp_path)
+        kb.create_board("victim")
+        boards = fresh_home / "kanban" / "boards"
+
+        observed = tmp_path / f"{op}-observed.flag"
+        resume = tmp_path / f"{op}-resume.flag"
+        resumed = tmp_path / f"{op}-resumed.flag"
+        opener, opener_out = _spawn(
+            script, tmp_path, fresh_home, f"racing-{op}",
+            op=op, slug="victim", pause_after_existing_check=True,
+            observed=str(observed), resume=str(resume), resumed=str(resumed),
+        )
+        holder = None
+        holder_out = None
+        holder_release = tmp_path / f"{op}-holder-release.flag"
+        try:
+            _wait_for(observed, proc=opener)
+            kb.remove_board("victim", archive=False)
+            assert not (boards / "victim").exists()
+
+            holder_ready = tmp_path / f"{op}-holder-ready.flag"
+            holder, holder_out = _spawn(
+                script, tmp_path, fresh_home, f"{op}-race-holder",
+                op="hold", ready=str(holder_ready), release=str(holder_release),
+            )
+            _wait_for(holder_ready, proc=holder)
+            resume.write_text("go", encoding="utf-8")
+            _wait_for(resumed, proc=opener)
+
+            # The operation has resumed past its stale observation. Give it a
+            # loose, scheduler-safe interval to reach the lock. It must neither
+            # finish nor create even an empty visible board directory.
+            time.sleep(2.0)
+            assert opener.poll() is None, f"{op} bypassed the inventory lock"
+            assert not (boards / "victim").exists()
+            assert holder.poll() is None
+        finally:
+            resume.write_text("go", encoding="utf-8")
+            holder_release.write_text("go", encoding="utf-8")
+
+        assert holder is not None and holder_out is not None
+        assert _result(holder, holder_out)["ok"] is True
+        result = _result(opener, opener_out)
+        assert result["ok"] is True, f"{op} failed after release: {result}"
+        assert (boards / "victim" / "kanban.db").exists()
 
     def test_board_inventory_lock_times_out_without_mutating_inventory(
         self, fresh_home, tmp_path
