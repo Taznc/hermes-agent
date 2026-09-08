@@ -8,7 +8,10 @@ path; the dispatcher injects this into every worker) > ``HERMES_KANBAN_BOARD`` /
 :func:`scoped_current_board` > ``<root>/kanban/current`` > ``default``.
 Concurrency: WAL + ``BEGIN IMMEDIATE`` + compare-and-swap on ``tasks.status``/``claim_lock`` —
 SQLite serializes writers so one claimer wins, losers see zero rows (no retries, no distributed
-locks). Schema: tasks, task_links, task_comments, task_events, task_runs, attachments, notify subs.
+locks). That covers writes *within* a board; the set of boards that exist is serialized instead by
+:func:`board_inventory_lock` (``hermes_cli.kanban_db_inventory``), which every inventory mutator
+takes and which is always the OUTER lock — inventory lock, then per-board SQLite, never the reverse.
+Schema: tasks, task_links, task_comments, task_events, task_runs, attachments, notify subs.
 """
 
 from __future__ import annotations
@@ -721,8 +724,26 @@ def write_board_metadata(
 ) -> dict:
     """Create/update ``board.json``; unmentioned fields are preserved, ``created_at``
     set on first write. ``project_id``/``default_workdir``: ``None`` = unchanged,
-    "" = clear (``project_id`` is not validated here)."""
+    "" = clear (``project_id`` is not validated here).
+
+    Held under :func:`board_inventory_lock`: writing ``board.json`` for an absent
+    slug is what makes that board appear to :func:`list_boards`, so it is an
+    inventory change even though the common case only edits an existing board.
+    """
     _assert_not_delegated_child_mutation()
+    with board_inventory_lock():
+        return _write_board_metadata_locked(
+            board, name=name, description=description, icon=icon, color=color,
+            archived=archived, default_workdir=default_workdir, project_id=project_id,
+        )
+
+
+def _write_board_metadata_locked(
+    board: Optional[str], *, name: Optional[str] = None, description: Optional[str] = None,
+    icon: Optional[str] = None, color: Optional[str] = None, archived: Optional[bool] = None,
+    default_workdir: Optional[str] = None, project_id: Optional[str] = None,
+) -> dict:
+    """Body of :func:`write_board_metadata`; the caller holds the inventory lock."""
     slug = _slug_or_default(board)
     meta = read_board_metadata(slug)
     # db_path is derived on every read; never persist it into board.json.
@@ -753,14 +774,19 @@ def create_board(
     icon: Optional[str] = None, color: Optional[str] = None, default_workdir: Optional[str] = None,
     project_id: Optional[str] = None,
 ) -> dict:
-    """Create board dir + DB + metadata (``mkdir -p`` semantics: existing board returns its metadata)."""
+    """Create board dir + DB + metadata (``mkdir -p`` semantics: existing board returns its metadata).
+
+    Metadata and DB creation happen in ONE inventory hold so a reader holding the
+    lock never observes a metadata-only half-board.
+    """
     normed = _require_slug(slug)
-    meta = write_board_metadata(
-        normed, name=name, description=description, icon=icon, color=color,
-        default_workdir=default_workdir, project_id=project_id,
-    )
-    # Touch the DB so list_boards() sees it immediately.
-    init_db(board=normed)
+    with board_inventory_lock():
+        meta = write_board_metadata(
+            normed, name=name, description=description, icon=icon, color=color,
+            default_workdir=default_workdir, project_id=project_id,
+        )
+        # Touch the DB so list_boards() sees it immediately.
+        init_db(board=normed)
     return meta
 
 
@@ -790,11 +816,22 @@ def list_boards(*, include_archived: bool = True) -> list[dict]:
 
 def remove_board(slug: str, *, archive: bool = True) -> dict:
     """Archive (to ``boards/_archived/<slug>-<ts>/``) or delete a board;
-    ``default`` cannot be removed. Returns ``{"slug", "action", "new_path"}``."""
+    ``default`` cannot be removed. Returns ``{"slug", "action", "new_path"}``.
+
+    The existence check and the rename/rmtree are one :func:`board_inventory_lock`
+    hold, so the board cannot be recreated between them and a fleet reader never
+    enumerates a directory that is about to vanish.
+    """
     _assert_not_delegated_child_mutation()
     normed = _require_slug(slug)
     if normed == DEFAULT_BOARD:
         raise ValueError("the 'default' board cannot be removed")
+    with board_inventory_lock():
+        return _remove_board_locked(normed, archive=archive)
+
+
+def _remove_board_locked(normed: str, *, archive: bool) -> dict:
+    """Body of :func:`remove_board`; the caller holds the inventory lock."""
     d = board_dir(normed)
     if not d.exists():
         raise ValueError(f"board {normed!r} does not exist")
@@ -6196,6 +6233,11 @@ def latest_summaries(conn: sqlite3.Connection, task_ids: Iterable[str]) -> dict[
 
 
 # --- Split modules (imported at the tail: they import this module as ``_kb``) ---
+from hermes_cli.kanban_db_inventory import (  # noqa: E402
+    DEFAULT_INVENTORY_LOCK_TIMEOUT_SECONDS,
+    BoardInventoryLockTimeout,
+    board_inventory_lock,
+)
 from hermes_cli.kanban_db_connect import (  # noqa: E402
     _INITIALIZED_PATHS,
     init_db,
