@@ -3701,6 +3701,7 @@ export const zhAuthored: Translations = withForkKeys(forkZh, {
       gatewayDisconnected: 'Hermes 网关未连接',
       sendFailed: '无法发送澄清响应',
       loadingQuestion: '正在加载问题…',
+      restoring: '正在恢复此问题 — 稍后即可回答',
       other: '其他 (输入你的答案)',
       placeholder: '输入你的答案…',
       skip: '跳过',

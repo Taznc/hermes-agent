@@ -17,6 +17,7 @@ import { requestComposerFocus, requestComposerInsert } from '@/app/chat/composer
 import { useSessionView } from '@/app/chat/session-view'
 import { ToolFallback } from '@/components/assistant-ui/tool/fallback'
 import { WIDGET_SHELL_CLASS } from '@/components/chat/widget-shell'
+import { isElementInHiddenPane } from '@/components/pane-shell/pane-visibility'
 import { Button } from '@/components/ui/button'
 import { Kbd } from '@/components/ui/kbd'
 import { Textarea } from '@/components/ui/textarea'
@@ -678,18 +679,29 @@ function ClarifyToolPending(props: ToolCallMessagePartProps) {
   // the request and must still collapse an unanswered card.
   const [answered, setAnswered] = useState(false)
 
-  // Stopped mid-prompt with no result — don't leave a dead interactive panel.
-  // `session.info` reports running=false while clarify is blocking, so the
-  // running flag alone would remount the question as a tool row. Keep the
-  // card while a request is open or this instance already submitted.
-  if (!messageRunning && !request && !answered) {
+  // A pending clarify whose args already carry the question is ALWAYS shown as
+  // the dedicated card, never as the generic payload row. The two signals above
+  // are about the *turn* and the *gateway correlation*, not about this tool
+  // call: a reconnect drops the parked request while `session.info` reports
+  // running=false for a session blocked on clarify, and the field incident
+  // (session 20260907_234154_4b2f48) sat in exactly that state for ~55 minutes
+  // showing only expandable JSON. Falling back is right only when there is
+  // genuinely nothing to paint — no question and no questions list.
+  const hasQuestion = Boolean(fromArgs.question || fromArgs.questions?.length)
+
+  // Stopped mid-prompt with no result AND no question to show — don't leave a
+  // dead interactive panel. Keep the card while a request is open, this
+  // instance already submitted, the turn is live, or the args hold the question.
+  if (!messageRunning && !request && !answered && !hasQuestion) {
     return <ToolFallback {...props} />
   }
 
   // Batch: the gateway request carries qid-keyed questions. Args alone can't
-  // drive the form (no qids to respond with), so batch waits for the request.
+  // ANSWER the form (no qids to respond with), but they can and must still
+  // PAINT it — the batch card renders args-only questions inert until the
+  // request correlates.
   if (request?.questions?.length || fromArgs.questions) {
-    return <ClarifyToolBatchPending onAnswered={() => setAnswered(true)} request={request} />
+    return <ClarifyToolBatchPending fromArgs={fromArgs} onAnswered={() => setAnswered(true)} request={request} />
   }
 
   return <ClarifyToolSinglePending fromArgs={fromArgs} onAnswered={() => setAnswered(true)} request={request} />
@@ -750,13 +762,15 @@ function ClarifyToolSinglePending({
   // `data-clarify-choices`, i.e. the one `visibleClarifyCard()` resolves.
   const formRef = useRef<HTMLFormElement | null>(null)
 
-  // Race: tool.start fires a tick before clarify.request, so request_id
-  // arrives slightly after the tool block mounts. If the question text is
-  // already in the tool args, paint the card immediately (disabled until
-  // the request is wired) — a spinner→question swap is a layout jump for
-  // no reason. Only spin when we have nothing to show yet.
+  // Race: tool.start fires a tick before clarify.request, and a reconnect can
+  // drop the parked request entirely while the tool is still blocked. If the
+  // question text is in the tool args, paint the card immediately (inert until
+  // an OWNED request id is wired) — a spinner or, worse, a raw payload row is
+  // how a live question gets buried. Only spin when we have nothing to show.
   const ready = Boolean(matchingRequest?.requestId)
   const loading = !ready && !submitting && !question
+  // Inert-but-visible: the question is legible, the controls are not yet armed.
+  const restoring = !ready && !submitting && Boolean(question)
 
   const respond = useCallback(
     async (answer: string, responseNote?: string) => {
@@ -1025,6 +1039,47 @@ function ClarifyToolSinglePending({
     return () => window.removeEventListener('keydown', onKeyDown)
   }, [activateActive, choices, hasChoices, moveActive, ready, selectChoice, submitting])
 
+  // A question that only just became answerable needs to be reachable without
+  // hunting for it — but attention is the user's, not ours (apps/desktop
+  // AGENTS.md: "Never navigate, move focus, or open a surface because something
+  // *happened* in the background. Offer; don't hijack."). So the move is
+  // conditioned on both: this is a card the user can actually see, and nothing
+  // is focused (no composer caret, no button they tabbed to).
+  //
+  // No "already moved" latch is needed. The deps are the request identity, so
+  // the effect only re-runs when a DIFFERENT request arrives; and a re-run for
+  // the same one (StrictMode's double-invoke) finds the card itself focused and
+  // bails on the check below.
+  useEffect(() => {
+    if (!ready || !matchingRequest?.requestId) {
+      return
+    }
+
+    const card = formRef.current
+
+    // Not a card the user can see (an inactive tab keeps its layer mounted), so
+    // moving focus here would yank them to a surface they are not looking at.
+    if (!card || isElementInHiddenPane(card)) {
+      return
+    }
+
+    const active = document.activeElement as HTMLElement | null
+
+    // `body`/null means nothing owns the caret. A focused control — including
+    // the composer the user is mid-sentence in — keeps it.
+    if (active && active !== document.body && active !== document.documentElement) {
+      return
+    }
+
+    // The card REGION, not a control inside it. Focusing a choice button would
+    // announce one option instead of the question, and the card's own window
+    // keydown handler deliberately stands down while a button/field is focused
+    // — so auto-focusing a control would silently disarm arrow/letter/Enter
+    // navigation. A focused region announces the question, scrolls the card
+    // into view, and leaves Tab to reach the first control.
+    card.focus()
+  }, [matchingRequest?.requestId, ready])
+
   if (loading) {
     return (
       <ClarifyShell aria-label={copy.loadingQuestion} className="my-1.5 grid min-h-12 place-items-center" role="status">
@@ -1055,10 +1110,20 @@ function ClarifyToolSinglePending({
     // The form is the outer element so the actions can sit OUTSIDE the card and
     // still submit it — the panel holds the question, the buttons ride below it.
     <form
+      aria-label={question}
       className="my-1.5 grid gap-4"
-      data-clarify-choices={hasChoices ? choices.length : undefined}
+      // Armed only when the card can actually act on the key. An inert card
+      // that claims its shortcuts makes `clarifyCardOwnsKey` yield them away
+      // from the composer to a handler that early-returns — the keystroke is
+      // then swallowed by nobody and the user cannot type a message either.
+      data-clarify-choices={hasChoices && ready ? choices.length : undefined}
       onSubmit={handleSubmit}
       ref={formRef}
+      // Programmatic focus target only (never in the Tab order): a newly
+      // answerable question moves focus HERE so the question is announced and
+      // the card is scrolled into view, without stealing a Tab stop.
+      role="group"
+      tabIndex={-1}
     >
       <ClarifyShell className="grid gap-2">
         <div className="flex items-start gap-2">
@@ -1067,6 +1132,15 @@ function ClarifyToolSinglePending({
           </div>
           <MessageQuestion aria-hidden className="mt-px size-4 shrink-0 text-(--ui-text-tertiary)" />
         </div>
+        {restoring ? (
+          // Deliberately static text, no spinner: this state can persist for
+          // as long as the transport is down (55 minutes in the field case),
+          // and a continuous CSS animation would keep the renderer awake for
+          // all of it (DESIGN.md's no-continuous-animation invariant).
+          <div className="text-[0.6875rem] leading-4 text-(--ui-text-tertiary)" data-clarify-restoring="" role="status">
+            {copy.restoring}
+          </div>
+        ) : null}
         <ClarifyHelpControls request={matchingRequest} target="question" targetLabel={question} />
 
         {hasChoices ? (
@@ -1420,15 +1494,38 @@ const emptyStage = { choices: [] as string[], draft: '', note: '', noteAnchor: n
  * back-to-back and completes the batch. Staged answers stay editable up to
  * that moment. The per-question wire protocol is unchanged (the TUI/CLI
  * still lock incrementally); this card just batches its locks at the end. */
-function ClarifyToolBatchPending({ onAnswered, request }: { onAnswered: () => void; request: ClarifyRequest | null }) {
+function ClarifyToolBatchPending({
+  fromArgs,
+  onAnswered,
+  request
+}: {
+  fromArgs: ClarifyArgs
+  onAnswered: () => void
+  request: ClarifyRequest | null
+}) {
   const { t } = useI18n()
   const copy = t.assistant.clarify
   const gateway = useStore($gateway)
 
-  // qids only exist on the gateway request — args are a hydration-race
-  // fallback for display, never answerable (no ids to respond with).
-  const questions = useMemo(() => request?.questions ?? [], [request?.questions])
-  const ready = Boolean(request?.requestId) && questions.length > 0
+  // qids only exist on the gateway request, so an args-only card cannot be
+  // ANSWERED. It must still be PAINTED: burying the question in a spinner is
+  // the same failure as burying it in raw JSON. Synthesize display-only qids
+  // for the args fallback — they never reach the wire because `ready` is false
+  // and every control is disabled until the real request correlates.
+  const questions = useMemo(
+    () =>
+      request?.questions ??
+      (fromArgs.questions ?? []).map((entry, index) => ({
+        choices: entry.choices ?? null,
+        multiSelect: Boolean(entry.multiSelect),
+        qid: `args-${index}`,
+        question: entry.question
+      })),
+    [fromArgs.questions, request?.questions]
+  )
+
+  const ready = Boolean(request?.requestId && request.questions?.length)
+  const restoring = questions.length > 0 && !ready
 
   const [staged, setStaged] = useState<
     Record<string, { choices: string[]; draft: string; note: string; noteAnchor: string | null; noteOpen: boolean }>
@@ -1518,8 +1615,8 @@ function ClarifyToolBatchPending({ onAnswered, request }: { onAnswered: () => vo
       return
     }
 
-    if (!request || !gateway) {
-      notifyError(new Error(request ? copy.gatewayDisconnected : copy.notReady), copy.sendFailed)
+    if (!ready || !request || !gateway) {
+      notifyError(new Error(request && ready ? copy.gatewayDisconnected : copy.notReady), copy.sendFailed)
 
       return
     }
@@ -1562,7 +1659,7 @@ function ClarifyToolBatchPending({ onAnswered, request }: { onAnswered: () => vo
       submittingRef.current = false
       setSubmitting(false)
     }
-  }, [copy, gateway, onAnswered, questions, request, stageFor, stagedAnswer])
+  }, [copy, gateway, onAnswered, questions, ready, request, stageFor, stagedAnswer])
 
   const toggleChoice = useCallback((question: ClarifyQuestion, choice: string) => {
     setStaged(current => {
@@ -1644,7 +1741,7 @@ function ClarifyToolBatchPending({ onAnswered, request }: { onAnswered: () => vo
   )
 
   const cancelAll = useCallback(async () => {
-    if (!request) {
+    if (!ready || !request) {
       return
     }
 
@@ -1665,7 +1762,7 @@ function ClarifyToolBatchPending({ onAnswered, request }: { onAnswered: () => vo
     } catch {
       // The tool times out on its own; a failed skip must never block the UI.
     }
-  }, [gateway, onAnswered, request])
+  }, [gateway, onAnswered, ready, request])
 
   const handleSubmit = useCallback(
     (event: FormEvent<HTMLFormElement>) => {
@@ -1678,7 +1775,9 @@ function ClarifyToolBatchPending({ onAnswered, request }: { onAnswered: () => vo
     [allStaged, confirmAll]
   )
 
-  if (!ready) {
+  // Nothing to show at all (neither a correlated request nor args questions) —
+  // the only case where a spinner is honest.
+  if (questions.length === 0) {
     return (
       <ClarifyShell aria-label={copy.loadingQuestion} className="my-1.5 grid min-h-12 place-items-center" role="status">
         <Loader2 aria-hidden className="size-4 animate-spin text-(--ui-text-tertiary)" />
@@ -1708,9 +1807,19 @@ function ClarifyToolBatchPending({ onAnswered, request }: { onAnswered: () => vo
             ))}
           </span>
         </div>
+        {restoring ? (
+          // Painted from args only: legible, inert, and honest about why.
+          <div
+            className="px-3 text-[0.6875rem] leading-4 text-(--ui-text-tertiary)"
+            data-clarify-restoring=""
+            role="status"
+          >
+            {copy.restoring}
+          </div>
+        ) : null}
         {questions.map((question, index) => (
           <BatchQuestionBlock
-            disabled={submitting}
+            disabled={submitting || !ready}
             index={index}
             key={question.qid}
             locked={false}
@@ -1728,10 +1837,10 @@ function ClarifyToolBatchPending({ onAnswered, request }: { onAnswered: () => vo
       </ClarifyShell>
 
       <div className="flex items-center justify-end gap-1">
-        <Button disabled={submitting} onClick={() => void cancelAll()} size="xs" type="button" variant="text">
+        <Button disabled={submitting || !ready} onClick={() => void cancelAll()} size="xs" type="button" variant="text">
           {copy.skip}
         </Button>
-        <Button disabled={submitting || !allStaged} size="xs" type="submit">
+        <Button disabled={submitting || !ready || !allStaged} size="xs" type="submit">
           {submitting ? (
             <Loader2 className="size-3 animate-spin" />
           ) : (

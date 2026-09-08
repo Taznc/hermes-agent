@@ -3494,6 +3494,7 @@ export const ru = defineLocale({
       gatewayDisconnected: 'Шлюз Hermes не подключён',
       sendFailed: 'Не удалось отправить ответ на уточнение',
       loadingQuestion: 'Загрузка вопроса…',
+      restoring: 'Восстановление вопроса — скоро можно будет ответить',
       other: 'Другое (введите ответ)',
       placeholder: 'Введите ваш ответ…',
       skip: 'Пропустить',

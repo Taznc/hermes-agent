@@ -3000,6 +3000,7 @@ export const zhHant = defineForkLocale(forkZhHant, {
       gatewayDisconnected: 'Hermes 閘道未連線',
       sendFailed: '無法傳送澄清回應',
       loadingQuestion: '正在載入問題…',
+      restoring: '正在還原這個問題 — 稍後即可回答',
       other: '其他（輸入您的答案）',
       placeholder: '輸入您的答案…',
       skip: '略過',

@@ -3058,6 +3058,7 @@ export interface UpstreamTranslations {
       gatewayDisconnected: string
       sendFailed: string
       loadingQuestion: string
+      restoring: string
       other: string
       placeholder: string
       skip: string

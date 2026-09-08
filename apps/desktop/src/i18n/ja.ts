@@ -3109,6 +3109,7 @@ export const ja = defineForkLocale(forkJa, {
       gatewayDisconnected: 'Hermes ゲートウェイが接続されていません',
       sendFailed: '明確化応答を送信できませんでした',
       loadingQuestion: '質問を読み込み中…',
+      restoring: 'この質問を復元しています — まもなく回答できます',
       other: 'その他（回答を入力）',
       placeholder: '回答を入力…',
       skip: 'スキップ',

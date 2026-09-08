@@ -3518,6 +3518,7 @@ export const en: Translations = withForkKeys(forkEn, {
       gatewayDisconnected: 'Hermes gateway is not connected',
       sendFailed: 'Could not send clarify response',
       loadingQuestion: 'Loading question…',
+      restoring: 'Restoring this question — you can answer in a moment',
       other: 'Other (type your answer)',
       placeholder: 'Type your answer…',
       skip: 'Skip',

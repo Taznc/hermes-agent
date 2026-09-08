@@ -2663,6 +2663,7 @@ export const ar = defineForkLocale(forkAr, {
       gatewayDisconnected: 'البوابة غير متصلة',
       sendFailed: 'فشل الإرسال',
       loadingQuestion: 'جار تحميل السؤال...',
+      restoring: 'جارٍ استعادة هذا السؤال — يمكنك الإجابة بعد قليل',
       other: 'غير ذلك',
       placeholder: 'اكتب إجابتك...',
       skip: 'تخطي',
