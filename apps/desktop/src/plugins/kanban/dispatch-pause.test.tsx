@@ -40,6 +40,9 @@ interface StatusPayload {
   state: null | Record<string, unknown>
   running_count: number
   message: null | string
+  all_paused?: boolean
+  board_count?: number
+  paused_count?: number
 }
 
 let disposeApi: () => void
@@ -47,6 +50,26 @@ let rest: ReturnType<typeof vi.fn>
 let status: StatusPayload
 
 const RUNNING: StatusPayload = { message: null, paused: false, running_count: 2, state: null }
+
+const ALL_RUNNING: StatusPayload = {
+  all_paused: false,
+  board_count: 2,
+  message: null,
+  paused: false,
+  paused_count: 0,
+  running_count: 2,
+  state: null
+}
+
+const ALL_PAUSED: StatusPayload = {
+  all_paused: true,
+  board_count: 2,
+  message: null,
+  paused: true,
+  paused_count: 2,
+  running_count: 2,
+  state: null
+}
 
 const PAUSED: StatusPayload = {
   message: 'paused for maintenance (by=claudecode; note=gateway restart)',
@@ -63,12 +86,24 @@ beforeEach(() => {
     }
 
     if (path.startsWith('/dispatch/pause') && options?.method === 'POST') {
+      if (path.includes('boards=*')) {
+        status = { ...ALL_PAUSED }
+
+        return Promise.resolve({ board_count: 2, failures: [], paused: true, paused_count: 2, results: [] })
+      }
+
       status = { ...PAUSED }
 
       return Promise.resolve({ paused: true, state: PAUSED.state })
     }
 
     if (path.startsWith('/dispatch/resume') && options?.method === 'POST') {
+      if (path.includes('boards=*')) {
+        status = { ...ALL_RUNNING }
+
+        return Promise.resolve({ board_count: 2, failures: [], resumed: true, resumed_count: 2, results: [] })
+      }
+
       status = { ...RUNNING }
 
       return Promise.resolve({ previous: PAUSED.state, resumed: true, was_paused: true })
@@ -206,19 +241,103 @@ describe('Dispatch pause control', () => {
     expect(screen.getByRole('button', { name: 'resumeDispatch()' })).toBeTruthy()
   })
 
-  it('offers no single-board Pause action while All Boards is selected', async () => {
-    // `withBoard` drops the All Boards sentinel, so a Pause pressed here would
-    // silently act on one hidden fallback board. The scope must be explicit
-    // rather than misrepresented.
+  it('pauses and resumes every board while All Boards is selected', async () => {
     $boardSlug.set('*')
+    status = { ...ALL_RUNNING }
     mount()
 
-    expect(await screen.findByText('dispatchAllBoards()')).toBeTruthy()
-    expect(screen.queryByRole('button', { name: 'pauseDispatch()' })).toBeNull()
-    expect(screen.queryByRole('button', { name: 'resumeDispatch()' })).toBeNull()
-    // Not even a status poll: under the sentinel it would report some other
-    // board's state next to an All Boards heading.
-    expect(rest).not.toHaveBeenCalled()
+    await waitFor(() => expect(rest).toHaveBeenCalledWith('/dispatch/status?boards=*', undefined))
+    const pauseAll = await screen.findByRole('button', { name: 'pauseAllBoards()' })
+    const resumeAll = screen.getByRole('button', { name: 'resumeAllBoards()' })
+
+    expect(pauseAll.hasAttribute('disabled')).toBe(false)
+    expect(resumeAll.hasAttribute('disabled')).toBe(true)
+
+    fireEvent.click(pauseAll)
+
+    await waitFor(() =>
+      expect(rest).toHaveBeenCalledWith('/dispatch/pause?boards=*', {
+        body: { note: null },
+        method: 'POST'
+      })
+    )
+    await waitFor(() => expect(resumeAll.hasAttribute('disabled')).toBe(false))
+
+    fireEvent.click(resumeAll)
+
+    await waitFor(() => expect(rest).toHaveBeenCalledWith('/dispatch/resume?boards=*', { method: 'POST' }))
+  })
+
+  it('fans out to explicit boards when the backend predates aggregate dispatch responses', async () => {
+    $boardSlug.set('*')
+    let legacyPaused = false
+
+    rest.mockImplementation((path: string, options?: { method?: string }) => {
+      if (path === '/boards') {
+        return Promise.resolve({
+          boards: [
+            { name: 'Shipping', slug: 'shipping' },
+            { name: 'Homelab', slug: 'homelab' }
+          ],
+          current: 'shipping'
+        })
+      }
+
+      if (path === '/dispatch/status?boards=*') {
+        return Promise.resolve({ ...(legacyPaused ? PAUSED : RUNNING) })
+      }
+
+      if (path.startsWith('/dispatch/status?board=')) {
+        return Promise.resolve({ ...(legacyPaused ? PAUSED : RUNNING), running_count: 1 })
+      }
+
+      if (path === '/dispatch/pause?boards=*' && options?.method === 'POST') {
+        legacyPaused = true
+
+        return Promise.resolve({ paused: true, state: PAUSED.state })
+      }
+
+      if (path.startsWith('/dispatch/pause?board=') && options?.method === 'POST') {
+        legacyPaused = true
+
+        return Promise.resolve({ paused: true, state: PAUSED.state })
+      }
+
+      if (path.startsWith('/dispatch/resume?board=') && options?.method === 'POST') {
+        legacyPaused = false
+
+        return Promise.resolve({ resumed: true, was_paused: true })
+      }
+
+      return Promise.reject(new Error(`unexpected request: ${path}`))
+    })
+    mount()
+
+    fireEvent.click(await screen.findByRole('button', { name: 'pauseAllBoards()' }))
+
+    await waitFor(() =>
+      expect(rest).toHaveBeenCalledWith('/dispatch/pause?board=shipping', {
+        body: { note: null },
+        method: 'POST'
+      })
+    )
+    expect(rest).not.toHaveBeenCalledWith('/dispatch/pause?boards=*', expect.anything())
+    expect(rest).toHaveBeenCalledWith('/dispatch/pause?board=homelab', {
+      body: { note: null },
+      method: 'POST'
+    })
+
+    fireEvent.click(await screen.findByRole('button', { name: 'resumeAllBoards()' }))
+
+    await waitFor(() =>
+      expect(rest).toHaveBeenCalledWith('/dispatch/resume?board=shipping', {
+        method: 'POST'
+      })
+    )
+    expect(rest).not.toHaveBeenCalledWith('/dispatch/resume?boards=*', expect.anything())
+    expect(rest).toHaveBeenCalledWith('/dispatch/resume?board=homelab', {
+      method: 'POST'
+    })
   })
 
   it('reports a refused pause as not paused rather than silently succeeding', async () => {

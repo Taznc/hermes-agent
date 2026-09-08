@@ -75,12 +75,32 @@ def worker_setup(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> tuple[Path,
     return workspace, task
 
 
+# ``_default_spawn`` issues TWO Popen calls: first the worker-log timestamp
+# filter (``hermes_cli/kanban_log_stamp.py``), then the worker itself. These
+# helpers keep every assertion aimed at the intended one — an argv-accumulating
+# fake would otherwise silently mix the two.
+def _is_stamper(argv: list[str]) -> bool:
+    return any(arg.endswith("kanban_log_stamp.py") for arg in argv)
+
+
+def _worker_call(calls: list[list[str]]) -> list[str]:
+    workers = [argv for argv in calls if not _is_stamper(argv)]
+    assert len(workers) == 1, calls
+    return workers[0]
+
+
+def _stamper_call(calls: list[list[str]]) -> list[str]:
+    stampers = [argv for argv in calls if _is_stamper(argv)]
+    assert len(stampers) == 1, calls
+    return stampers[0]
+
+
 @pytest.mark.linux_only
 def test_managed_gateway_worker_is_spawned_in_restart_safe_scope(
     worker_setup: tuple[Path, kb.Task], monkeypatch: pytest.MonkeyPatch
 ) -> None:
     workspace, task = worker_setup
-    captured_cmd: list[str] = []
+    calls: list[list[str]] = []
     captured_env: dict[str, str] = {}
     captured_cwd: str | None = None
 
@@ -89,9 +109,10 @@ def test_managed_gateway_worker_is_spawned_in_restart_safe_scope(
 
     def fake_popen(cmd, **kwargs):
         nonlocal captured_cwd
-        captured_cmd.extend(cmd)
-        captured_env.update(kwargs.get("env") or {})
-        captured_cwd = kwargs.get("cwd")
+        calls.append(list(cmd))
+        if not _is_stamper(list(cmd)):
+            captured_env.update(kwargs.get("env") or {})
+            captured_cwd = kwargs.get("cwd")
         return FakeProc()
 
     monkeypatch.setenv("INVOCATION_ID", "managed-gateway-test")
@@ -104,6 +125,7 @@ def test_managed_gateway_worker_is_spawned_in_restart_safe_scope(
     monkeypatch.setattr("shutil.which", lambda name: "/usr/bin/systemd-run")
 
     assert kbd._default_spawn(task, str(workspace)) == 4242
+    captured_cmd = _worker_call(calls)
     assert captured_cmd[:3] == ["/usr/bin/systemd-run", "--user", "--quiet"]
     assert "--scope" not in captured_cmd
     assert "--pipe" in captured_cmd
@@ -117,6 +139,15 @@ def test_managed_gateway_worker_is_spawned_in_restart_safe_scope(
     assert captured_env["HERMES_KANBAN_TASK"] == task.id
     assert captured_env["HERMES_KANBAN_RUN_ID"] == "23"
     assert "ANTHROPIC_API_KEY" not in captured_env
+
+    # The log-timestamp filter needs the SAME protection, under its own unit
+    # name. Left in the gateway's cgroup it would die on `systemctl restart`,
+    # closing the read end of the pipe and SIGPIPE-ing the very worker this
+    # scope exists to keep alive.
+    stamper_cmd = _stamper_call(calls)
+    assert stamper_cmd[:3] == ["/usr/bin/systemd-run", "--user", "--quiet"]
+    stamper_unit = stamper_cmd.index("--unit")
+    assert stamper_cmd[stamper_unit + 1] == "hermes-worker-kanban-log-t_candidate_restart-run-23"
 
 
 @pytest.mark.linux_only
@@ -179,12 +210,12 @@ def test_standalone_dispatcher_keeps_direct_worker_spawn(
     worker_setup: tuple[Path, kb.Task], monkeypatch: pytest.MonkeyPatch
 ) -> None:
     workspace, task = worker_setup
-    captured_cmd: list[str] = []
+    calls: list[list[str]] = []
 
     class FakeProc:
         pid = 4243
 
-    monkeypatch.setattr(subprocess, "Popen", lambda cmd, **kwargs: captured_cmd.extend(cmd) or FakeProc())
+    monkeypatch.setattr(subprocess, "Popen", lambda cmd, **kwargs: calls.append(list(cmd)) or FakeProc())
     monkeypatch.setattr("tools.process_registry._is_supervised_gateway_process", lambda: False)
     monkeypatch.delenv("INVOCATION_ID", raising=False)
     monkeypatch.delenv("SYSTEMD_EXEC_PID", raising=False)
@@ -194,7 +225,9 @@ def test_standalone_dispatcher_keeps_direct_worker_spawn(
     )
 
     assert kbd._default_spawn(task, str(workspace)) == 4243
-    assert captured_cmd[:3] == ["hermes", "-p", "coder"]
+    assert _worker_call(calls)[:3] == ["hermes", "-p", "coder"]
+    # The log filter is likewise unwrapped here — nothing to be lifted out of.
+    assert _stamper_call(calls)[0] == sys.executable
 
 
 @pytest.mark.linux_only
@@ -209,12 +242,12 @@ def test_backend_supervised_worker_is_spawned_in_restart_safe_scope(
     unit stop SIGKILLed five in-flight workers at once.
     """
     workspace, task = worker_setup
-    captured_cmd: list[str] = []
+    calls: list[list[str]] = []
 
     class FakeProc:
         pid = 4244
 
-    monkeypatch.setattr(subprocess, "Popen", lambda cmd, **kwargs: captured_cmd.extend(cmd) or FakeProc())
+    monkeypatch.setattr(subprocess, "Popen", lambda cmd, **kwargs: calls.append(list(cmd)) or FakeProc())
     # Not the gateway — no _HERMES_GATEWAY, no gateway PID-file ownership.
     monkeypatch.setattr("tools.process_registry._is_supervised_gateway_process", lambda: False)
     # ...but the MAIN process of a supervised systemd unit, which is what matters.
@@ -225,6 +258,7 @@ def test_backend_supervised_worker_is_spawned_in_restart_safe_scope(
     monkeypatch.setattr("shutil.which", lambda name: "/usr/bin/systemd-run")
 
     assert kbd._default_spawn(task, str(workspace)) == 4244
+    captured_cmd = _worker_call(calls)
     assert captured_cmd[:3] == ["/usr/bin/systemd-run", "--user", "--quiet"]
     assert "--scope" not in captured_cmd
     assert "--pipe" in captured_cmd
@@ -234,6 +268,13 @@ def test_backend_supervised_worker_is_spawned_in_restart_safe_scope(
     assert captured_cmd[unit_index + 1] == "hermes-worker-kanban-t_candidate_restart-run-23"
     separator = captured_cmd.index("--")
     assert captured_cmd[separator + 1 : separator + 4] == ["hermes", "-p", "coder"]
+
+    # Same reasoning as the gateway arm: the log filter must leave this unit's
+    # cgroup too, or a backend restart kills it under a surviving worker.
+    stamper_cmd = _stamper_call(calls)
+    assert stamper_cmd[:3] == ["/usr/bin/systemd-run", "--user", "--quiet"]
+    stamper_unit = stamper_cmd.index("--unit")
+    assert stamper_cmd[stamper_unit + 1] == "hermes-worker-kanban-log-t_candidate_restart-run-23"
 
 
 @pytest.mark.linux_only
@@ -273,12 +314,12 @@ def test_systemd_service_descendant_keeps_direct_worker_spawn(
     ``test_real_descendant_of_a_supervised_unit_leaves_the_unit_cgroup`` below.
     """
     workspace, task = worker_setup
-    captured_cmd: list[str] = []
+    calls: list[list[str]] = []
 
     class FakeProc:
         pid = 4245
 
-    monkeypatch.setattr(subprocess, "Popen", lambda cmd, **kwargs: captured_cmd.extend(cmd) or FakeProc())
+    monkeypatch.setattr(subprocess, "Popen", lambda cmd, **kwargs: calls.append(list(cmd)) or FakeProc())
     monkeypatch.setattr("tools.process_registry._is_supervised_gateway_process", lambda: False)
     monkeypatch.setenv("INVOCATION_ID", "inherited-from-the-unit")
     monkeypatch.setenv("SYSTEMD_EXEC_PID", str(os.getpid() + 1))  # the unit's main pid, not ours
@@ -288,7 +329,8 @@ def test_systemd_service_descendant_keeps_direct_worker_spawn(
     )
 
     assert kbd._default_spawn(task, str(workspace)) == 4245
-    assert captured_cmd[:3] == ["hermes", "-p", "coder"]
+    assert _worker_call(calls)[:3] == ["hermes", "-p", "coder"]
+    assert _stamper_call(calls)[0] == sys.executable
 
 
 @pytest.mark.linux_only

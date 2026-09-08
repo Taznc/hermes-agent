@@ -2303,13 +2303,19 @@ def get_task(conn: sqlite3.Connection, task_id: str) -> Optional[Task]:
 def get_task_by_idempotency_key(
     conn: sqlite3.Connection, idempotency_key: Optional[str]
 ) -> Optional[Task]:
-    """Return the newest active task for an idempotent create replay."""
+    """Return the newest active task for an idempotent create replay.
+
+    Non-active rows (``NON_ACTIVE_STATUSES``: ``archived`` plus the wishlist lanes) never
+    match. A lane card is not live work, so letting one answer the replay would suppress the
+    real create it was meant to deduplicate — the same reason ``archived`` was excluded.
+    """
     if not idempotency_key:
         return None
+    placeholders = ", ".join("?" * len(NON_ACTIVE_STATUSES))
     row = conn.execute(
-        "SELECT * FROM tasks WHERE idempotency_key = ? AND status != 'archived' "
+        f"SELECT * FROM tasks WHERE idempotency_key = ? AND status NOT IN ({placeholders}) "
         "ORDER BY created_at DESC LIMIT 1",
-        (idempotency_key,),
+        (idempotency_key, *sorted(NON_ACTIVE_STATUSES)),
     ).fetchone()
     return Task.from_row(row) if row else None
 
@@ -4988,6 +4994,8 @@ def archive_task(
     the write lock. The normal single-card archive remains status-agnostic.
     """
     with write_txn(conn):
+        prior = conn.execute("SELECT status FROM tasks WHERE id = ?", (task_id,)).fetchone()
+        from_status = prior["status"] if prior is not None else None
         sql = (
             "UPDATE tasks SET status = 'archived', "
             "    claim_lock = NULL, claim_expires = NULL, worker_pid = NULL, worker_unit = NULL "
@@ -5006,9 +5014,12 @@ def archive_task(
             summary="task archived with run still active",
         )
         cleared_children = _clear_satisfied_outgoing_links(conn, task_id)
-        payload: Optional[dict[str, Any]] = (
-            {"cleared_child_links": cleared_children} if cleared_children else None
-        )
+        # ``from_status`` is what makes archival reversible as an audit fact: the row itself
+        # keeps no memory of where it came from, so without this ``unarchive_task`` cannot tell
+        # a former wishlist card from ordinary work and the lane exit goes unrecorded.
+        payload: dict[str, Any] = {"from_status": from_status}
+        if cleared_children:
+            payload["cleared_child_links"] = cleared_children
         _append_event(conn, task_id, "archived", payload, run_id=run_id)
     # Completed parents preserve their dependency satisfaction after archival;
     # incomplete archived parents remain gated. Re-evaluate children now either way.
@@ -5016,6 +5027,21 @@ def archive_task(
     # Reap the workspace on archive too (never-completed tasks kept it forever).
     _cleanup_workspace(conn, task_id)
     return True
+
+
+def _archived_from_status(conn: sqlite3.Connection, task_id: str) -> Optional[str]:
+    """The status this task held immediately before its most recent archival.
+
+    Read from the newest ``archived`` event's ``from_status``. Events written before that
+    field existed return ``None``: the provenance was never persisted, and guessing one
+    would fabricate audit history rather than recover it.
+    """
+    row = conn.execute(
+        "SELECT payload FROM task_events WHERE task_id = ? AND kind = 'archived' "
+        "ORDER BY id DESC LIMIT 1", (task_id,),
+    ).fetchone()
+    value = _json_dict(_row_get(row, "payload")).get("from_status")
+    return value if isinstance(value, str) else None
 
 
 def unarchive_task(conn: sqlite3.Connection, task_id: str, *, status: str = "todo") -> bool:
@@ -5026,6 +5052,10 @@ def unarchive_task(conn: sqlite3.Connection, task_id: str, *, status: str = "tod
     Reopening archived-completed work also clears its completion evidence and
     atomically retracts descendants that relied on that evidence. Any running
     descendant is terminated only after the invalidation audit trail commits.
+
+    A card archived out of a wishlist lane also gets a ``spawned_from_roadmap``
+    event here: archive+unarchive is a second, quieter route out of a lane into
+    live work, and it must leave the same audit mark the ``spawn`` verb does.
     """
     if status not in {"triage", "todo", "ready"}:
         raise ValueError("unarchived tasks must land in triage, todo, or ready")
@@ -5053,6 +5083,16 @@ def unarchive_task(conn: sqlite3.Connection, task_id: str, *, status: str = "tod
         if cur.rowcount != 1:
             return False
         _append_event(conn, task_id, "unarchived", {"status": target})
+        # A card that was archived out of a wishlist lane is leaving the lane for live work
+        # right now. ``spawn_roadmap_task`` is the only other exit and it stamps this event;
+        # archive+unarchive must not be a quieter way to make the same move. Legacy rows
+        # archived before ``from_status`` was recorded carry no lane provenance and get no
+        # event — nothing persisted it and it cannot be reconstructed.
+        if _archived_from_status(conn, task_id) in ROADMAP_LANE_STATUSES:
+            _append_event(
+                conn, task_id, "spawned_from_roadmap",
+                {"status": target, "via": "unarchive"},
+            )
         if reopening_satisfied_parent:
             result = invalidate_descendants_for_parent_reopen(
                 conn, task_id, author="operator",
@@ -5195,13 +5235,21 @@ ROADMAP_SPAWN_TARGETS = frozenset({"triage", "ready"})
 
 def _lane_transition(
     conn: sqlite3.Connection, task_id: str, *, to: str, event: str,
-    payload: Optional[dict] = None,
+    payload: Optional[dict] = None, parent_gated: bool = False,
 ) -> bool:
     """Move ``task_id`` out of a roadmap lane into ``to``, appending ``event``.
 
     Raises ``ValueError`` naming ``from -> to`` when the task's current status may not make this
     move (including every live status, which can never enter a lane). Returns ``False`` only when
-    the row vanished mid-transaction."""
+    the row vanished mid-transaction.
+
+    ``parent_gated`` routes a ``ready`` landing through ``_landing_status_after_parents``, the
+    same re-gate ``unblock_task``/``promote_task``/``unarchive_task`` use, so a lane card linked
+    under an unfinished parent lands in ``todo`` instead of rendering as bogus ``ready`` until
+    ``claim_task`` refuses it. The gate downgrades the LANDING only — ``to`` is still validated
+    against ``ROADMAP_LANE_TRANSITIONS`` first, so it can never widen what an operator may ask
+    for. Only ``ready`` is parent-gated; ``triage`` is not a gated status.
+    """
     with write_txn(conn):
         row = conn.execute("SELECT status FROM tasks WHERE id = ?", (task_id,)).fetchone()
         if row is None:
@@ -5213,8 +5261,13 @@ def _lane_transition(
                 f"(allowed from {current!r}: "
                 f"{sorted(ROADMAP_LANE_TRANSITIONS.get(current, frozenset())) or 'nothing'})"
             )
+        landing = to
+        if parent_gated and to == "ready":
+            landing = _landing_status_after_parents(conn, task_id)
+        if landing != to:
+            payload = {**(payload or {}), "status": landing, "requested_status": to}
         cur = conn.execute(
-            "UPDATE tasks SET status = ? WHERE id = ? AND status = ?", (to, task_id, current),
+            "UPDATE tasks SET status = ? WHERE id = ? AND status = ?", (landing, task_id, current),
         )
         if cur.rowcount != 1:
             return False
@@ -5238,11 +5291,17 @@ def spawn_roadmap_task(conn: sqlite3.Connection, task_id: str, *, to: str = "tri
 
     ``triage`` is the default so auto_decompose gets to re-specify/split it first; ``to="ready"``
     is the explicit opt-out for an item that is already a single well-formed task. This is the
-    only path from the wishlist into live work — ``idea`` must be refined first."""
+    only path from the wishlist into live work — ``idea`` must be refined first.
+
+    ``ready`` is parent-gated exactly as every other entry into ``ready`` is: a card whose
+    parents are unfinished lands in ``todo`` and auto-promotes later, and the
+    ``spawned_from_roadmap`` payload records both the real landing and the ``requested_status``.
+    """
     if to not in ROADMAP_SPAWN_TARGETS:
         raise ValueError(f"spawn target must be one of {sorted(ROADMAP_SPAWN_TARGETS)}, got {to!r}")
     return _lane_transition(
         conn, task_id, to=to, event="spawned_from_roadmap", payload={"status": to},
+        parent_gated=True,
     )
 
 

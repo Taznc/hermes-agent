@@ -430,7 +430,11 @@ moment later.
 
 The Desktop Kanban board exposes the same control in its orchestration
 settings panel, with a live "N running — draining" / "0 running — safe to
-restart" indicator.
+restart" indicator. On **All Boards**, separate **Pause all boards** and
+**Resume all boards** actions apply the circuit to every active board and the
+indicator totals workers across that scope. Already-running workers continue;
+if one board is busy, the other board results are preserved and the control
+stays actionable for a retry.
 
 `review_rework_escalation_profile` breaks pathological implementation/review
 loops without removing review: the first changes request returns to the original
@@ -1108,6 +1112,7 @@ hermes kanban daemon --force                           # DEPRECATED — standalo
         [--failure-limit N] [--pidfile PATH] [-v]
 hermes kanban stats [--json]                           # per-status + per-assignee counts
 hermes kanban log <id> [--tail BYTES]                  # worker log from ~/.hermes/kanban/logs/
+                                                       #   lines are prefixed `[YYYY-MM-DD HH:MM:SS] ` (local time)
 hermes kanban notify-subscribe <id>                    # gateway bridge hook (used by /kanban in the gateway)
         --platform <name> --chat-id <id> [--thread-id <id>] [--user-id <id>]
         [--chat-type dm|group|channel|thread] [--delivery-mode notify|notify+wake|wake]

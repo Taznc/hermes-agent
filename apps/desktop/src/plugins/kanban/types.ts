@@ -301,7 +301,8 @@ export interface OrchestrationSettings {
 export interface DispatchStatus {
   paused: boolean
   /** Raw circuit record: `reason` is `operator_paused` for a maintenance
-   *  drain, or a fault code for a systemic circuit. Null when running. */
+   *  drain, or a fault code for a systemic circuit. Null when running or when
+   *  this is an aggregate status. */
   state: null | {
     reason: string
     paused_at?: number
@@ -309,18 +310,28 @@ export interface DispatchStatus {
     note?: null | string
     [key: string]: unknown
   }
-  /** Workers still running on this board — 0 means safe to restart. */
+  /** Workers still running in this scope — 0 means safe to restart. */
   running_count: number
-  /** Server-rendered human status; null when the board is not paused. */
+  /** Server-rendered human status; null when running or aggregate. */
   message: null | string
+  /** Aggregate-only fields returned for the explicit `boards=*` scope. */
+  all_paused?: boolean
+  board_count?: number
+  paused_count?: number
+  boards?: Array<DispatchStatus & { board: string }>
+  errors?: Array<{ board: string; error: string }>
 }
 
 /** POST /dispatch/pause. `paused: false` is a REFUSAL (a dispatch tick owns
- *  the board lock), delivered as a normal 200 — never treat it as success. */
+ *  at least one target lock), delivered as a normal 200 — never treat it as success. */
 export interface DispatchPauseResult {
   paused: boolean
   state: DispatchStatus['state']
   reason?: string
+  board_count?: number
+  paused_count?: number
+  results?: Array<DispatchPauseResult & { board: string }>
+  failures?: Array<{ board: string; error: string }>
 }
 
 /** POST /dispatch/resume. */
@@ -329,6 +340,10 @@ export interface DispatchResumeResult {
   was_paused: boolean
   previous?: DispatchStatus['state']
   reason?: string
+  board_count?: number
+  resumed_count?: number
+  results?: Array<DispatchResumeResult & { board: string }>
+  failures?: Array<{ board: string; error: string }>
 }
 
 /** GET /profiles — the roster the decomposer routes across. */
