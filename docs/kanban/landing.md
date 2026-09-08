@@ -46,8 +46,9 @@ dispatcher will not re-spawn it either: the review lane's respawn guard returns
 `approved_awaiting_land` for a card carrying a live approval.
 
 An approved card leaves `review` in exactly three explicit ways: `land` closes
-it after a proven remote read-back, `request-changes` sends it back, or a human
-moves it.
+it after a proven remote read-back, `reopen-review` sends it back to
+implementation, or a human moves it. `request-changes` is the verdict from an
+active reviewer run; approval has already ended that run.
 
 **A card approved the old way — a reviewer calling `complete` from the review
 column — is not landable.** Its worktree was already reaped at completion, so
@@ -160,12 +161,17 @@ the reviewed one, so a receipt from an earlier round is refused as stale.
    now serves, or already fully present in it. The fetched object must be the
    same commit the read-back reported, or the proof and the record would
    describe different commits.
-8. Only then: write the receipt comment, complete the card, archive it, and let
-   the existing `_cleanup_workspace` seam reap the worktree and branch (it
-   independently re-proves the tree is clean and pushed first).
+8. Only then: complete the card with explicitly preliminary
+   `bookkeeping.state = pending` metadata, letting the existing `_cleanup_workspace`
+   seam reap the worktree and branch (it independently re-proves the tree is
+   clean and pushed first), then archive it.
+9. Observe the actual workspace and archived-card state. Atomically replace the
+   preliminary run metadata with the final receipt, append a `landing_receipt`
+   event, and write the human receipt comment. These final surfaces therefore
+   never claim cleanup or archival before those operations have succeeded.
 
-Steps 1–5 mutate nothing on the remote. Step 8 never runs without a successful
-step 7.
+Steps 1–5 mutate nothing on the remote. Steps 8–9 never run without a
+successful step 7.
 
 The merge happens in a temporary detached worktree, so the operator's own
 checkout is never moved to another branch and a served worktree can never be
@@ -233,14 +239,15 @@ re-running the same command.
 | `target_advanced` | Nothing pushed; the target moved under you | Just re-run. Landing re-fetches the new target and merges onto it. Never force-push to work around this |
 | `push_rejected` | Nothing on the remote; card still open, worktree intact | Resolve the rejection (branch protection, permissions), then re-run |
 | Crash after the push, before the receipt | Content **is** on the remote; card still open | Re-run: the read-back reports `already_landed` and finishes the bookkeeping without a second merge |
-| Crash after the receipt, before closure | Receipt comment present; card still open | Re-run: same as above |
+| Crash after completion or archive, before the final receipt | Card is done/archived with `bookkeeping.state = pending` completion metadata; no final comment or event claims cleanup | Re-run: landing recognizes the remote content and finishes archival plus the coherent final receipt without a second merge |
 | `readback_failed` — target moved during read-back | The content landed, but a competing push arrived before the proof | Re-run. The second run reads back cleanly and reports `already_landed` |
 | `readback_failed` — content genuinely absent | The push reported success but the remote does not serve the content | Do **not** re-push. Inspect the remote branch directly; this means the remote rewrote or rejected the ref silently |
 | Card closed, worktree still present | Landed; cleanup declined | Expected when the tree is dirty or holds unpushed commits. The receipt's `cleanup.workspace_removed` says so. Inspect it, then `hermes worktree prune` |
 
-The receipt comment on the card records the source branch and sha, the remote,
-branch and resolved push URL, the target sha before, the exact sha read back
-from the remote afterwards, whether a push occurred, the read-back result, the
-reviewer and approval run with the commit they approved, the verification kind,
-the landing timestamp, and the closure reason — so a landing can be audited
-after the fact without re-deriving any of it.
+The completed-run metadata, `landing_receipt` event, and receipt comment record
+the source branch and sha, the remote, branch and resolved push URL, the target
+sha before, the exact sha read back from the remote afterwards, whether a push
+occurred, the read-back result, the reviewer and approval run with the commit
+they approved, the verification kind, the landing timestamp, closure reason,
+and the observed workspace-removal/card-archive outcome — so a landing can be
+audited after the fact without re-deriving any of it.

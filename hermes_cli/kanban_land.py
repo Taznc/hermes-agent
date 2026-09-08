@@ -651,7 +651,8 @@ def land_task(
     5. Gate on verification evidence for that exact sha.
     6. Fetch the target NOW, merge in a throwaway worktree, push without force.
     7. Re-read the endpoint and prove the content is reachable there.
-    8. Only then write the receipt, close the card, and let cleanup run.
+    8. Only then close/archive the card, observe cleanup, and persist the final
+       receipt on every durable audit surface.
     """
     remote, branch = target
     verdict = approval_verdict(conn, task_id)
@@ -813,39 +814,133 @@ def _merge_in(tree: str, source: SourceState, remote: str, branch: str) -> None:
 def _record_landing(
     conn: sqlite3.Connection, task_id: str, result: dict, *, actor: str,
 ) -> dict:
-    """Write the durable landing record, then close and clean up the card.
+    """Close the card, observe cleanup, then persist one final receipt.
 
-    The receipt is written BEFORE closure so a crash between the two leaves
-    evidence of what was landed rather than a silently-merged, still-open card.
-    Returns what cleanup actually achieved, so the receipt can say so rather
-    than assume it.
+    ``complete_task`` owns the existing safe cleanup seam, so its metadata is
+    deliberately marked ``bookkeeping.state = pending``: cleanup has not
+    happened yet and claiming otherwise would turn a plan into audit evidence.
+    A crash after completion or archival is repaired by the next idempotent
+    ``land`` run, which finds that preliminary completion and finalizes it.
     """
-    kb.add_comment(conn, task_id, actor, _receipt_body(result))
     workspace = conn.execute(
         "SELECT workspace_path FROM tasks WHERE id = ?", (task_id,),
     ).fetchone()
     workspace_path = str((workspace["workspace_path"] if workspace else "") or "")
 
     task = kb.get_task(conn, task_id)
-    if task is not None and task.status != "done":
-        # Completion is what invokes the existing safe cleanup seam
-        # (``_cleanup_workspace``), which independently re-proves the tree is
-        # clean and fully pushed before removing anything.
-        kb.complete_task(
+    if task is None:
+        raise RuntimeError(f"cannot record landing for missing task {task_id}")
+
+    completion_run_id = _landing_completion_run_id(conn, task_id, result)
+    if task.status == "archived" and completion_run_id is not None:
+        finalized = _finalized_cleanup(conn, completion_run_id)
+        if finalized is not None:
+            return finalized
+    if task.status not in {"done", "archived"}:
+        preliminary = {
+            **result,
+            "bookkeeping": {"state": "pending", "cleanup_observed": False},
+        }
+        completed = kb.complete_task(
             conn, task_id,
             summary=f"Landed on {result['target']} as {result['target_sha'][:12]}",
-            metadata={"landing": result},
+            metadata={"landing": preliminary},
         )
-    kb.archive_task(conn, task_id)
-    return {
+        if not completed:
+            raise RuntimeError(f"completion failed after landing {task_id}")
+        completion_run_id = _landing_completion_run_id(conn, task_id, result)
+
+    if completion_run_id is None:
+        raise RuntimeError(f"cannot identify the completion run for landed task {task_id}")
+
+    task = kb.get_task(conn, task_id)
+    if task is not None and task.status != "archived":
+        archived = kb.archive_task(conn, task_id)
+        if not archived:
+            raise RuntimeError(f"archival failed after landing {task_id}")
+
+    task = kb.get_task(conn, task_id)
+    cleanup = {
         "workspace_path": workspace_path or None,
         "workspace_removed": bool(workspace_path) and not Path(workspace_path).exists(),
-        "card_archived": True,
+        "card_archived": task is not None and task.status == "archived",
     }
+    if not cleanup["card_archived"]:
+        raise RuntimeError(f"task {task_id} was not archived after landing")
+
+    result["cleanup"] = cleanup
+    result["bookkeeping"] = {"state": "complete", "cleanup_observed": True}
+    _persist_final_receipt(
+        conn, task_id, completion_run_id, result, actor=actor,
+    )
+    return cleanup
+
+
+def _landing_completion_run_id(
+    conn: sqlite3.Connection, task_id: str, result: dict,
+) -> Optional[int]:
+    """Find this landing's completion, including an interrupted old attempt."""
+    rows = conn.execute(
+        "SELECT id, metadata FROM task_runs WHERE task_id = ? AND outcome = 'completed' "
+        "ORDER BY id DESC", (task_id,),
+    ).fetchall()
+    for row in rows:
+        landing = kb._json_dict(row["metadata"]).get("landing")
+        if not isinstance(landing, dict):
+            continue
+        if (
+            landing.get("source_sha") == result.get("source_sha")
+            and landing.get("target") == result.get("target")
+        ):
+            return int(row["id"])
+    return None
+
+
+def _finalized_cleanup(conn: sqlite3.Connection, run_id: int) -> Optional[dict]:
+    """Return an already-final receipt's cleanup, else require repair."""
+    row = conn.execute("SELECT metadata FROM task_runs WHERE id = ?", (run_id,)).fetchone()
+    landing = kb._json_dict(row["metadata"]).get("landing") if row is not None else None
+    if not isinstance(landing, dict):
+        return None
+    bookkeeping = landing.get("bookkeeping")
+    cleanup = landing.get("cleanup")
+    if (
+        isinstance(bookkeeping, dict)
+        and bookkeeping.get("state") == "complete"
+        and isinstance(cleanup, dict)
+        and isinstance(cleanup.get("workspace_removed"), bool)
+        and cleanup.get("card_archived") is True
+    ):
+        return dict(cleanup)
+    return None
+
+
+def _persist_final_receipt(
+    conn: sqlite3.Connection, task_id: str, run_id: int, result: dict, *, actor: str,
+) -> None:
+    """Atomically publish the final run, event, and human receipt surfaces."""
+    from hermes_cli.kanban_db_connect import write_txn
+
+    with write_txn(conn):
+        row = conn.execute("SELECT metadata FROM task_runs WHERE id = ?", (run_id,)).fetchone()
+        if row is None:
+            raise RuntimeError(f"completion run {run_id} disappeared while landing {task_id}")
+        metadata = kb._json_dict(row["metadata"])
+        metadata["landing"] = result
+        if conn.execute(
+            "UPDATE task_runs SET metadata = ? WHERE id = ? AND task_id = ?",
+            (json.dumps(metadata, ensure_ascii=False), run_id, task_id),
+        ).rowcount != 1:
+            raise RuntimeError(f"completion run {run_id} changed while landing {task_id}")
+        kb._append_event(
+            conn, task_id, "landing_receipt", {"landing": result}, run_id=run_id,
+        )
+        kb.add_comment(conn, task_id, actor, _receipt_body(result))
 
 
 def _receipt_body(result: dict) -> str:
     verification = result.get("verification") or {}
+    cleanup = result.get("cleanup") or {}
     landed_at = result.get("landed_at")
     stamp = (
         time.strftime("%Y-%m-%d %H:%M:%SZ", time.gmtime(landed_at)) if landed_at else "unknown"
@@ -865,7 +960,9 @@ def _receipt_body(result: dict) -> str:
         f"- Verification: {verification.get('kind')} "
         f"({verification.get('command') or verification.get('sha', '')})",
         f"- Landed at: {stamp}",
-        f"- Closure: {result.get('closure_reason')}; card completed and archived.",
+        f"- Workspace removed: {'yes' if cleanup.get('workspace_removed') else 'no'}",
+        f"- Card archived: {'yes' if cleanup.get('card_archived') else 'no'}",
+        f"- Closure: {result.get('closure_reason')}; bookkeeping observed and recorded.",
     ])
 
 

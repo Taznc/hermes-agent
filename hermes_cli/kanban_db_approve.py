@@ -17,7 +17,8 @@ instead of adding an eleventh that every one of those surfaces must learn.
 
 The card leaves ``review`` in exactly three ways afterwards, all explicit:
 :func:`hermes_cli.kanban_land.land_task` closes it after a proven remote
-read-back, ``request_changes`` sends it back, or a human moves it.
+read-back, ``reopen-review`` sends it back to implementation, or a human moves
+it.
 """
 
 from __future__ import annotations

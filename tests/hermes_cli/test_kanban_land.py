@@ -475,6 +475,45 @@ def test_landing_records_a_receipt_comment_on_the_card(kanban_home, repo):
         assert expected in bodies, f"receipt must record {expected!r}"
 
 
+def test_final_receipt_durably_records_observed_cleanup_after_reopening_db(kanban_home, repo):
+    """The audit record must describe completed bookkeeping, not the plan that
+    existed before ``complete_task`` ran its best-effort workspace cleanup."""
+    with kbc.connect() as conn:
+        task_id, path = make_approved_task(conn, repo)
+        result = kl.land_task(conn, task_id, target=("origin", "dev"))
+
+    assert result["cleanup"] == {
+        "workspace_path": str(path),
+        "workspace_removed": True,
+        "card_archived": True,
+    }
+
+    # Reopen the database so no in-memory ``result`` mutation can satisfy the
+    # assertions: all three durable audit surfaces must carry the final facts.
+    with kbc.connect() as conn:
+        completed = conn.execute(
+            "SELECT metadata FROM task_runs WHERE task_id = ? AND outcome = 'completed' "
+            "ORDER BY id DESC LIMIT 1", (task_id,),
+        ).fetchone()
+        receipt_event = conn.execute(
+            "SELECT payload FROM task_events WHERE task_id = ? AND kind = 'landing_receipt' "
+            "ORDER BY id DESC LIMIT 1", (task_id,),
+        ).fetchone()
+        comments = kb.list_comments(conn, task_id)
+        task = kb.get_task(conn, task_id)
+
+    assert completed is not None
+    assert receipt_event is not None
+    assert task is not None
+    run_receipt = json.loads(completed["metadata"])["landing"]
+    event_receipt = json.loads(receipt_event["payload"])["landing"]
+    assert run_receipt == event_receipt
+    assert run_receipt["cleanup"] == result["cleanup"]
+    assert task.status == "archived"
+    assert any("Workspace removed: yes" in c.body for c in comments)
+    assert any("Card archived: yes" in c.body for c in comments)
+
+
 def test_landing_refuses_when_the_target_advanced_with_a_conflict(kanban_home, repo):
     """Someone else changed the same file on the target between review and land."""
     with kbc.connect() as conn:
@@ -519,6 +558,25 @@ def test_landing_is_idempotent_for_already_merged_work(kanban_home, repo):
     assert first["verdict"] == "landed"
     assert second["verdict"] == "already_landed"
     assert repo.remote_sha("dev") == after_first, "re-run must not merge twice"
+
+
+def test_idempotent_rerun_does_not_duplicate_the_final_receipt(kanban_home, repo):
+    """Once all bookkeeping is durably final, a re-run is read-only bookkeeping."""
+    with kbc.connect() as conn:
+        task_id, path = make_approved_task(conn, repo)
+        kl.land_task(conn, task_id, target=("origin", "dev"))
+        kl.land_task(conn, task_id, target=("origin", "dev"))
+        event_count = conn.execute(
+            "SELECT COUNT(*) FROM task_events WHERE task_id = ? AND kind = 'landing_receipt'",
+            (task_id,),
+        ).fetchone()[0]
+        comment_count = conn.execute(
+            "SELECT COUNT(*) FROM task_comments WHERE task_id = ? AND author = 'kanban land'",
+            (task_id,),
+        ).fetchone()[0]
+
+    assert event_count == 1
+    assert comment_count == 1
 
 
 def test_landing_recognizes_squash_equivalent_work_as_already_landed(kanban_home, repo):
