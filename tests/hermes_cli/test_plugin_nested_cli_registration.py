@@ -296,5 +296,3 @@ def test_unsupported_parent_is_refused(plugin_home: Path, tmp_path: Path):
     assert payload["no_handler"] is True, combined
     assert payload["ok"] is True, combined
     assert payload["keys"] == ["kanban act3"], combined
-
-
