@@ -1,6 +1,7 @@
 import { cleanup, fireEvent, render, screen } from '@testing-library/react'
 import { afterEach, beforeEach, describe, expect, it } from 'vitest'
 
+import { buttonVariants } from '@/components/ui/button'
 import { I18nProvider } from '@/i18n'
 import { clearNotifications, notify } from '@/store/notifications'
 
@@ -79,25 +80,25 @@ describe('toast titles', () => {
         iconClass: 'text-destructive-text',
         borderClass: 'border-l-destructive',
         backgroundToken: 'var(--dt-destructive-tint)',
-        actionClass: 'bg-destructive'
+        fillClass: 'bg-destructive'
       },
       {
         kind: 'warning' as const,
         iconClass: 'text-warning-text',
         borderClass: 'border-l-warning',
         backgroundToken: 'var(--dt-warning-tint)',
-        actionClass: 'bg-warning'
+        fillClass: 'bg-warning'
       },
       {
         kind: 'success' as const,
         iconClass: 'text-success-text',
         borderClass: 'border-l-success',
         backgroundToken: 'var(--dt-success-tint)',
-        actionClass: 'bg-success-solid'
+        fillClass: 'bg-success-solid'
       }
     ]
 
-    for (const { kind, iconClass, borderClass, backgroundToken, actionClass } of cases) {
+    for (const { kind, iconClass, borderClass, backgroundToken, fillClass } of cases) {
       notify({ kind, title: `${kind} title`, message: `${kind} message` })
 
       const view = render(
@@ -117,7 +118,7 @@ describe('toast titles', () => {
       expect(alert?.className).not.toContain('var(--dt-primary)')
       expect(icon?.classList.contains(iconClass)).toBe(true)
       expect(icon?.classList.contains('text-primary')).toBe(false)
-      expect(dismiss?.classList.contains(actionClass)).toBe(true)
+      expect(dismiss?.classList.contains(fillClass)).toBe(true)
       expect(title).toBeTruthy()
 
       view.unmount()
@@ -160,6 +161,51 @@ describe('toast titles', () => {
       expect(dismissClasses.some(c => fillRoles.includes(c))).toBe(true)
       expect(dismissClasses.some(c => c.endsWith('-text'))).toBe(false)
       expect(dismissClasses.some(c => c.endsWith('-foreground'))).toBe(true)
+
+      view.unmount()
+      clearNotifications()
+    }
+  })
+
+  // AC1 contract: `Button` owns the severity chrome. The call site selects a
+  // named variant and contributes LAYOUT only — no `bg-*`, `text-*`, or hover
+  // classes of its own. Asserted as a set difference against the primitive's
+  // own output so it stays true if a variant's declarations are retuned, and
+  // fails the moment chrome creeps back into the call site's `className`.
+  it('lets Button own every severity chrome class on Dismiss, passing only layout at the call site', () => {
+    const expected = {
+      error: 'severityError',
+      warning: 'severityWarning',
+      info: 'severityInfo',
+      success: 'severitySuccess'
+    } as const
+
+    for (const kind of ['error', 'warning', 'info', 'success'] as const) {
+      notify({ kind, title: `${kind} chrome`, message: `${kind} body` })
+
+      const view = render(
+        <I18nProvider configClient={null} initialLocale="en">
+          <NotificationStack />
+        </I18nProvider>
+      )
+
+      const dismiss = screen.getByRole('button', { name: 'Dismiss' })
+      const variant = expected[kind]
+
+      // The primitive is the source: the rendered button reports the variant it
+      // was given, and every class it wears comes from that variant's output.
+      expect(dismiss.getAttribute('data-variant')).toBe(variant)
+
+      const fromPrimitive = new Set(buttonVariants({ size: 'default', variant }).split(/\s+/).filter(Boolean))
+      const fromCallSite = [...dismiss.classList].filter(c => !fromPrimitive.has(c))
+
+      expect(fromCallSite).toEqual(['ml-auto'])
+      expect(fromCallSite.some(c => /^(bg-|text-|hover:)/.test(c))).toBe(false)
+
+      // And the chrome really is present — a variant that stopped emitting a
+      // fill would otherwise pass the difference check vacuously.
+      expect([...dismiss.classList].some(c => c.startsWith('bg-'))).toBe(true)
+      expect([...dismiss.classList].some(c => c.startsWith('hover:bg-'))).toBe(true)
 
       view.unmount()
       clearNotifications()

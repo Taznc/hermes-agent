@@ -526,16 +526,44 @@ def _build_top_level_description() -> str:
         )
     else:
         restrictions_rule = "- Children cannot call delegate_task, clarify, memory, or cronjob.\n"
-    return _DESCRIPTION_HEAD + restrictions_rule + _DESCRIPTION_TAIL
+    return _DESCRIPTION_HEAD + _build_dispatch_mode_paragraph() + _DESCRIPTION_TAIL_HEAD + restrictions_rule + _DESCRIPTION_TAIL
+
+
+def _build_dispatch_mode_paragraph() -> str:
+    """How this call actually returns, from the SAME decision the dispatcher makes
+    (``delegate_tool_dispatch.effective_dispatch_mode``). A session that cannot receive a
+    detached completion AND has no session id to wake — a one-shot Kanban worker, a
+    session-id-less HTTP request, a cron job, an orchestrator subagent — runs the batch
+    INLINE, so telling such a caller "dispatch returns immediately, do not wait" is simply
+    false and makes it plan around a handle it will never get. Session-scoped, so the schema
+    stays byte-stable for the life of a conversation; ``model_tools._tool_defs_cache_key``
+    carries the mode so a cached schema cannot leak across sessions in one process."""
+    try:
+        from tools.delegate_tool_dispatch import DISPATCH_MODE_BLOCKING, effective_dispatch_mode
+
+        blocking = effective_dispatch_mode() == DISPATCH_MODE_BLOCKING
+    except Exception:
+        blocking = False
+    if not blocking:
+        return (
+            "Runs in the background: dispatch returns immediately with live transcript paths, and the completed "
+            "result (one consolidated message, results in task order) re-enters the conversation on its own. Do NOT "
+            "wait or poll; continue other work. While children run, `action` (list/steer/stop) controls them live — "
+            "steer when a transcript shows a child drifting.\n\n"
+        )
+    return (
+        "This session cannot receive a detached result, so the call BLOCKS until every child finishes and returns "
+        "their consolidated results directly. Budget for that: a subagent routinely runs for many minutes, and that "
+        "time comes out of your own turn. Live transcript paths are in the result.\n\n"
+    )
 
 _DESCRIPTION_HEAD = (
     "Spawn subagents in isolated contexts; each gets its own conversation, terminal session, and toolset, and only its "
     "final summary returns to you. Pass every task in `tasks` — one entry spawns one subagent, several run in parallel "
     "(limit in the tasks description).\n\n"
-    "Runs in the background: dispatch returns immediately with live transcript paths, and the completed result (one "
-    "consolidated message, results in task order) re-enters the conversation on its own. Do NOT wait or poll; continue "
-    "other work. While children run, `action` (list/steer/stop) controls them live — steer when a transcript shows a "
-    "child drifting.\n\n"
+)
+
+_DESCRIPTION_TAIL_HEAD = (
     "USE FOR: reasoning-heavy subtasks, work that would flood your context with intermediate data, or independent "
     "parallel workstreams.\n"
     "DO NOT USE FOR (use these instead):\n"
