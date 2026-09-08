@@ -223,7 +223,10 @@ class ClaudeStreamTranslator:
         typ = event.get("type")
         delta: Dict[str, Any] = {}
         if typ == "content_block_delta":
-            part = event.get("delta") or {}
+            part = event.get("delta")
+            if not isinstance(part, dict):
+                yield self._invalid_response_frame()
+                return
             if part.get("type") == "text_delta":
                 text = part.get("text", "")
                 if not isinstance(text, str):
@@ -239,7 +242,10 @@ class ClaudeStreamTranslator:
                 if tool_call_index is not None:
                     delta["tool_calls"] = [{"index": tool_call_index, "function": {"arguments": part.get("partial_json", "")}}]
         elif typ == "content_block_start":
-            block = event.get("content_block") or {}
+            block = event.get("content_block")
+            if not isinstance(block, dict):
+                yield self._invalid_response_frame()
+                return
             if block.get("type") == "tool_use":
                 tool_call_index = self._call_index
                 content_index = event.get("index")
@@ -250,8 +256,14 @@ class ClaudeStreamTranslator:
                     "function": {"name": self._tool_name_map.get(block.get("name", ""), block.get("name", "")), "arguments": ""}}]
                 self._call_index += 1
         elif typ == "message_delta":
+            message_delta_raw = event.get("delta")
+            if not isinstance(message_delta_raw, dict):
+                yield self._invalid_response_frame()
+                return
+            message_delta = cast(Dict[str, Any], message_delta_raw)
             delta["content"] = ""
-            finish = _STOP_REASONS.get((event.get("delta") or {}).get("stop_reason"), "stop")
+            stop_reason = cast(str, message_delta.get("stop_reason"))
+            finish = _STOP_REASONS.get(stop_reason, "stop")
             chunk = {"id": "chatcmpl_proxy", "object": "chat.completion.chunk", "created": int(time.time()),
                      "model": self._model, "choices": [{"index": 0, "delta": delta, "finish_reason": finish}]}
             yield b"data: " + json.dumps(chunk, separators=(",", ":")).encode() + b"\n\n"

@@ -176,6 +176,9 @@ def test_claude_proxy_translates_stream_and_terminates_once():
 @pytest.mark.parametrize("malformed_event", [
     b"data: [1,2,3]\n",
     b'data: {"type":"content_block_delta","delta":{"type":"text_delta","text":99}}\n',
+    b'data: {"type":"content_block_delta","delta":"oops"}\n',
+    b'data: {"type":"content_block_start","index":0,"content_block":"oops"}\n',
+    b'data: {"type":"message_delta","delta":"oops"}\n',
 ])
 def test_claude_proxy_stream_fails_closed_with_a_terminal_error_chunk(malformed_event):
     frames = list(stream_events([
