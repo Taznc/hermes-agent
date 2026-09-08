@@ -188,21 +188,48 @@ class ClaudeStreamTranslator:
         self._call_index = 0
         self._tool_call_by_content_block: Dict[int, int] = {}
         self._active_tool_call_index: int | None = None
+        self._failed = False
+
+    def _invalid_response_frame(self) -> bytes:
+        """Emit the only useful failure signal after SSE headers are committed."""
+        self._failed = True
+        code = "upstream_invalid_response"
+        chunk = {
+            "id": "chatcmpl_proxy",
+            "object": "chat.completion.chunk",
+            "created": int(time.time()),
+            "model": self._model,
+            "choices": [],
+            "error": {
+                "message": "upstream returned a success status with an unusable body",
+                "type": code,
+                "code": code,
+            },
+        }
+        return b"data: " + json.dumps(chunk, separators=(",", ":")).encode() + b"\n\n"
 
     def translate(self, raw: bytes) -> Iterable[bytes]:
         """Translate one Anthropic SSE line while retaining tool-call position."""
-        if not raw.startswith(b"data:"):
+        if self._failed or not raw.startswith(b"data:"):
             return
         try:
-            event = json.loads(raw[5:].strip())
+            event_raw = json.loads(raw[5:].strip())
         except (UnicodeDecodeError, json.JSONDecodeError):
             return
+        if not isinstance(event_raw, dict):
+            yield self._invalid_response_frame()
+            return
+        event = cast(Any, event_raw)
         typ = event.get("type")
         delta: Dict[str, Any] = {}
         if typ == "content_block_delta":
             part = event.get("delta") or {}
             if part.get("type") == "text_delta":
-                delta["content"] = part.get("text", "")
+                text = part.get("text", "")
+                if not isinstance(text, str):
+                    yield self._invalid_response_frame()
+                    return
+                delta["content"] = text
             elif part.get("type") == "input_json_delta":
                 content_index = event.get("index")
                 tool_call_index = self._tool_call_by_content_block.get(
