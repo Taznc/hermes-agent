@@ -135,6 +135,7 @@ export const en: Translations = withForkKeys(forkEn, {
     more: count => `${count} more ${count === 1 ? 'notification' : 'notifications'}`,
     clearAll: 'Clear all',
     dismiss: 'Dismiss notification',
+    dismissAction: 'Dismiss',
     details: 'Details',
     copyDetail: 'Copy detail',
     copyDetailFailed: 'Could not copy notification detail',

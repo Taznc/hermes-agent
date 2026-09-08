@@ -77,7 +77,13 @@ export const forkZhHant: TranslationOverrides = {
   },
   settings: {
     gateway: {
-      openLogsFailed: '無法開啟日誌資料夾'
+      openLogsFailed: '無法開啟日誌資料夾',
+      singleBackendTitle: '單一後端，由伺服器管理',
+      singleBackendDesc: (host: string) =>
+        `此瀏覽器版本固定連線到 ${host} 上的單一 Hermes 後端。註冊遠端、SSH 或 Cloud 閘道需要使用 Hermes 桌面應用程式。`,
+      singleBackendDescNoHost:
+        '此瀏覽器版本固定連線到單一 Hermes 後端。註冊遠端、SSH 或 Cloud 閘道需要使用 Hermes 桌面應用程式。',
+      singleBackendDocsLink: '將桌面應用程式連線到多個 Hermes 執行個體'
     }
   },
   sidebar: {

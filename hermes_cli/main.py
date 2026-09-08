@@ -1709,6 +1709,7 @@ def cmd_chat(args):
         "ignore_rules": getattr(args, "ignore_rules", False) or safe_mode,
         "ignore_user_config": getattr(args, "ignore_user_config", False) or safe_mode,
         "compact": getattr(args, "compact", False),
+        "use_env_session_id": getattr(args, "use_env_session_id", False),
         **{k: getattr(args, k, d) for k, d in _CHAT_PASSTHROUGH},
     }
     kwargs = {k: v for k, v in kwargs.items() if v is not None}
@@ -2613,38 +2614,88 @@ _BUILTIN_SUBCOMMANDS = frozenset(
 )
 
 
-def _first_positional_argv() -> str | None:
-    """First non-flag, non-flag-value token in ``sys.argv[1:]`` (skips values of known flags).
+def _scan_positional(argv: list[str], start: int, value_flags) -> tuple[str | None, int]:
+    """``(token, next_index)`` for the first positional at/after ``start`` in ``argv``.
 
-    Not a full argparse simulation: an unknown ``--foo bar`` may classify
-    ``bar`` as positional, which at worst forces a one-time plugin discovery.
+    ``(None, len(argv))`` when there is none. Not a full argparse simulation: an
+    unknown ``--foo bar`` classifies ``bar`` as positional, which at worst forces a
+    one-time plugin discovery.
+    """
+    i = start
+    while i < len(argv):
+        tok = argv[i]
+        if tok == "--":  # everything after is positional
+            return (argv[i + 1], i + 2) if i + 1 < len(argv) else (None, len(argv))
+        if not tok.startswith("-"):
+            return tok, i + 1
+        # ``--flag=value`` is a single token; a known value flag consumes the next.
+        i += 2 if ("=" not in tok and tok in value_flags and i + 1 < len(argv)) else 1
+    return None, len(argv)
+
+
+def _first_positional_argv() -> str | None:
+    """First non-flag, non-flag-value token in ``sys.argv[1:]`` (skips values of known flags)."""
+    from hermes_cli._parser import top_level_value_flag_sets
+
+    required_value_flags, optional_value_flags = top_level_value_flag_sets()
+    return _scan_positional(sys.argv[1:], 0, required_value_flags | optional_value_flags)[0]
+
+
+def _parser_value_flags(parser) -> set[str]:
+    """Option strings on ``parser`` that consume a following token (derived, never listed)."""
+    return {
+        opt
+        for action in parser._actions
+        if action.option_strings and action.nargs != 0
+        for opt in action.option_strings
+    }
+
+
+def _nested_action_argv(parent_name: str, parent_parser) -> str | None:
+    """The action token argv requests under built-in command ``parent_name``, or None.
+
+    Scans past the parent token using the parent parser's OWN value-taking flags, so
+    ``hermes kanban --board beta list`` reads ``list`` rather than ``beta``.
     """
     from hermes_cli._parser import top_level_value_flag_sets
 
     required_value_flags, optional_value_flags = top_level_value_flag_sets()
-    value_flags = required_value_flags | optional_value_flags
     argv = sys.argv[1:]
-    i = 0
-    while i < len(argv):
-        tok = argv[i]
-        if tok == "--":  # everything after is positional
-            return argv[i + 1] if i + 1 < len(argv) else None
-        if not tok.startswith("-"):
-            return tok
-        # ``--flag=value`` is a single token; a known value flag consumes the next.
-        i += 2 if ("=" not in tok and tok in value_flags and i + 1 < len(argv)) else 1
-    return None
+    first, after = _scan_positional(argv, 0, required_value_flags | optional_value_flags)
+    if first != parent_name:
+        return None
+    return _scan_positional(argv, after, _parser_value_flags(parent_parser))[0]
 
 
-def _plugin_cli_discovery_needed() -> bool:
+def _plugin_cli_discovery_needed(parent_parsers=None) -> bool:
     """True when the CLI might be invoking a plugin-registered subcommand.
 
     False skips plugin discovery at argparse setup (~500-650ms). An unknown
     first token could be a plugin command OR a chat prompt — either way
     discovery is needed; for a prompt its cost amortizes over the agent run.
+
+    A built-in that can host plugin-contributed nested actions
+    (``_parser.NESTED_CLI_PARENTS``) is only cheap while argv names one of ITS
+    built-in actions; an unrecognised action there could be a plugin's, so
+    discovery runs. Bare ``hermes kanban`` / ``hermes kanban --help`` stay cheap —
+    plugin actions missing from a parent's ``--help`` is the same accepted
+    trade-off already made for top-level plugin commands.
     """
+    from hermes_cli._parser import NESTED_CLI_PARENTS
+
     first = _first_positional_argv()  # None = bare ``hermes`` → chat
-    return first is not None and first not in _BUILTIN_SUBCOMMANDS
+    if first is None:
+        return False
+    if first not in _BUILTIN_SUBCOMMANDS:
+        return True
+    parent_parser = (parent_parsers or {}).get(first)
+    if first not in NESTED_CLI_PARENTS or parent_parser is None:
+        return False
+    action = _nested_action_argv(first, parent_parser)
+    if action is None:
+        return False
+    action_parsers = _nested_action_subparsers(parent_parser)
+    return action_parsers is not None and action not in (action_parsers.choices or {})
 
 
 def _resolve_deferred_platform_cli_command(command_name: str | None) -> None:
@@ -3112,13 +3163,53 @@ def _attach_plugin_cli_command(subparsers, cmd_info) -> None:
         plugin_parser.set_defaults(func=cmd_info["handler_fn"])
 
 
-def _register_plugin_cli_commands(subparsers) -> None:
-    """Register plugin-provided top-level commands (each plugin builds its own argparse tree).
+def _nested_action_subparsers(parent_parser):
+    """The ``_SubParsersAction`` holding a built-in command's own actions, or None."""
+    import argparse
 
-    Skipped when the invocation targets a known built-in — eagerly importing
-    every bundled plugin module costs 500-650ms.
+    for action in parent_parser._subparsers._group_actions if parent_parser._subparsers else ():
+        if isinstance(action, argparse._SubParsersAction):
+            return action
+    return None
+
+
+def _attach_nested_plugin_cli_command(parent_parsers, cmd_info) -> None:
+    """Attach one plugin-provided nested action under its built-in parent command.
+
+    Fail-closed on a name that is already taken: the taken names come from the live
+    argparse ``choices`` mapping (built-in actions, their aliases, and any nested
+    action already attached), so a plugin can never displace a shipped action and
+    the guard cannot drift from the parser. Without it ``add_parser`` raises, and
+    the caller's broad ``except`` would silently drop EVERY nested registration —
+    including well-behaved plugins' — not just the colliding one.
     """
-    if not _plugin_cli_discovery_needed():
+    parent_name = cmd_info["parent"]
+    parent_parser = parent_parsers.get(parent_name)
+    if parent_parser is None:
+        return
+    action_parsers = _nested_action_subparsers(parent_parser)
+    if action_parsers is None:
+        return
+    name = cmd_info["name"]
+    if name in (action_parsers.choices or {}):
+        logging.getLogger(__name__).warning(
+            "Plugin '%s' tried to register nested CLI command '%s %s', but that %s action "
+            "name is already taken. Skipping.",
+            cmd_info.get("plugin"), parent_name, name, parent_name)
+        return
+    _attach_plugin_cli_command(action_parsers, cmd_info)
+
+
+def _register_plugin_cli_commands(subparsers, parent_parsers=None) -> None:
+    """Register plugin-provided commands (each plugin builds its own argparse tree).
+
+    Top-level commands attach to ``subparsers``; commands registered with a ``parent``
+    attach under that built-in command's action group (``parent_parsers`` maps a built-in
+    command name to its parser). Skipped when the invocation targets a known built-in that
+    cannot host a plugin action — eagerly importing every bundled plugin module costs
+    500-650ms.
+    """
+    if not _plugin_cli_discovery_needed(parent_parsers):
         return
     try:
         from plugins.memory import discover_plugin_cli_commands
@@ -3135,7 +3226,9 @@ def _register_plugin_cli_commands(subparsers) -> None:
         # See #54678.
         _resolve_deferred_platform_cli_command(_first_positional_argv())
         for cmd_info in get_plugin_manager()._cli_commands.values():
-            if cmd_info["name"] not in seen_plugin_commands:
+            if cmd_info.get("parent"):
+                _attach_nested_plugin_cli_command(parent_parsers or {}, cmd_info)
+            elif cmd_info["name"] not in seen_plugin_commands:
                 _attach_plugin_cli_command(subparsers, cmd_info)
     except Exception as _exc:
         logging.getLogger(__name__).debug("Plugin CLI discovery failed: %s", _exc)
@@ -3204,7 +3297,10 @@ def _build_cli_parser():
     _add_portal_parser(subparsers)
 
     from hermes_cli.kanban import build_parser as _build_kanban_parser
-    _build_kanban_parser(subparsers).set_defaults(func=cmd_kanban)
+    kanban_parser = _build_kanban_parser(subparsers)
+    kanban_parser.set_defaults(func=cmd_kanban)
+    # Built-in commands a plugin may extend with nested actions (_parser.NESTED_CLI_PARENTS).
+    nested_parents = {"kanban": kanban_parser}
 
     from hermes_cli.projects_cmd import build_parser as _build_project_parser
     _build_project_parser(subparsers).set_defaults(func=cmd_project)
@@ -3228,7 +3324,7 @@ def _build_cli_parser():
     build_bundles_parser(subparsers)
     build_plugins_parser(subparsers, cmd_plugins=cmd_plugins)
 
-    _register_plugin_cli_commands(subparsers)
+    _register_plugin_cli_commands(subparsers, nested_parents)
 
     build_curator_parser(subparsers)
     build_pets_parser(subparsers)

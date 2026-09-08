@@ -179,14 +179,23 @@ def _run_sync_with_note(batch: _Batch, reason: str) -> str:
         result["note"] = _SYNC_FALLBACK_NOTES[reason]
     return json.dumps(result, ensure_ascii=False)
 
+DISPATCH_MODE_BACKGROUND = "background"
+DISPATCH_MODE_BLOCKING = "blocking"
+
+
 def _resolve_async_wake_sid(origin_wake_sid: str) -> Optional[str]:
     """Wake target for a detached batch, or None to force synchronous execution.
 
-    Finite sessions (stateless HTTP requests, one-shot Kanban workers) cannot route a detached result back after their
-    turn/process ends — but if a raw session id is bound (the API server always binds one), gateway.wake can still
-    reach it by self-POSTing /v1/chat/completions, so only fall back to sync when there is truly no session id to
-    wake. Uses the origin captured BEFORE child construction — HERMES_SESSION_ID here would be the subagent's internal
-    id.
+    THE canonical dispatch-mode decision: ``None`` means the batch runs inline (blocking), ``""`` means detached with
+    the async registry routing the completion, and a session id means detached with a self-post wake. Every consumer
+    — this module's dispatch path and ``delegate_tool._build_dispatch_mode_paragraph``'s schema text — goes through
+    here, so what the model is told can never disagree with what the runtime does.
+
+    Finite sessions (one-shot Kanban workers, session-id-less HTTP requests) cannot route a detached result back after
+    their turn/process ends — but if a raw session id is bound (the API server binds one per request), gateway.wake
+    can still reach it by self-POSTing /v1/chat/completions, so only fall back to sync when there is truly no session
+    id to wake. Uses the origin captured BEFORE child construction — HERMES_SESSION_ID here would be the subagent's
+    internal id.
     """
     try:
         # Finite sessions cannot route a detached subagent result back to the agent after their turn/process
@@ -198,14 +207,37 @@ def _resolve_async_wake_sid(origin_wake_sid: str) -> Optional[str]:
             return ""
     except Exception:
         return ""
-    if origin_wake_sid:
-        logger.info(
-            "delegate_task: async delivery unsupported on this session, but a session id is bound (%s) — dispatching "
-            "in the background and waking the session via self-post when it completes instead of forcing synchronous "
-            "execution.", origin_wake_sid,
-        )
-        return origin_wake_sid
-    return None
+    return origin_wake_sid or None
+
+
+def effective_dispatch_mode() -> str:
+    """``"background"`` or ``"blocking"`` — the mode a top-level ``delegate_task`` gets in THIS session.
+
+    Session-scoped (ContextVars + the session's own env), so it is stable for the life of a conversation and the
+    schema text built from it cannot churn a cached prompt prefix. Two arms:
+
+    * a delegated child's own delegations are always inline — ``_model_background_value`` forces
+      ``background=False`` at depth > 0 so an orchestrator has its workers' results inside its own turn;
+    * otherwise the session capability decides, via the same ``_resolve_async_wake_sid`` the dispatcher uses.
+    """
+    try:
+        from agent.delegation_context import is_delegated_child_context
+        if is_delegated_child_context():
+            return DISPATCH_MODE_BLOCKING
+    except Exception:
+        pass
+    if _resolve_async_wake_sid(_current_origin_wake_sid()) is None:
+        return DISPATCH_MODE_BLOCKING
+    return DISPATCH_MODE_BACKGROUND
+
+
+def _current_origin_wake_sid() -> str:
+    """Session id a detached completion could wake, resolved from the live session context ("" when none)."""
+    try:
+        from tools.async_delegation import _current_origin_session_id
+        return _current_origin_session_id() or ""
+    except Exception:
+        return ""
 
 def _resolve_async_session_key(parent_agent: Any, origin_ui_session_id: str) -> tuple[str, str]:
     """``(session_key, origin_ui_session_id)`` the async registry routes completions by.
@@ -312,6 +344,12 @@ def _dispatch_background(batch: _Batch) -> str:
     if wake_sid is None:
         logger.info("delegate_task: async delivery unsupported on this session runtime; running the batch synchronously instead.")
         return _run_sync_with_note(batch, "no_async")
+    if wake_sid:
+        logger.info(
+            "delegate_task: async delivery unsupported on this session, but a session id is bound (%s) — dispatching "
+            "in the background and waking the session via self-post when it completes instead of forcing synchronous "
+            "execution.", wake_sid,
+        )
 
     parent_agent = batch.parent_agent
     session_key, origin_ui_session_id = _resolve_async_session_key(parent_agent, batch.origin_ui_session_id)

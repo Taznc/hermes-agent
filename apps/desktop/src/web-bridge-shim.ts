@@ -1,13 +1,43 @@
 /**
- * web-bridge-shim.ts — SPIKE: browser stand-in for the Electron preload bridge.
+ * web-bridge-shim.ts — browser stand-in for the Electron preload bridge.
  *
  * Loaded by index-web.html BEFORE /src/main.tsx so window.hermesDesktop exists
- * when the renderer's module graph evaluates. Derived from the boot-path
- * inventory in /tmp/web-desktop-spike/bridge-surface.md — only the members the
- * boot path + first paint require; every omission is deliberate (call sites
- * are optional-chained or feature-gated).
+ * when the renderer's module graph evaluates.
  *
- * UNTRACKED SPIKE FILE — not part of the app. Do not commit without review.
+ * SUPPORT LEVEL: this is production code. It began as a spike ("only the
+ * members the boot path + first paint require") and its header still said
+ * "UNTRACKED SPIKE FILE — not part of the app" long after it became the
+ * bridge every web-served Desktop user actually runs. Treat it as shipped:
+ * typed, tested, reviewed like any other renderer module.
+ *
+ * WHY OMISSIONS ARE NOT SELF-JUSTIFYING: the original omissions were judged
+ * against one question — does the app boot and paint? — so a missing member
+ * is NOT evidence that the feature shouldn't exist on web; it usually means
+ * nobody evaluated it. Because nearly every call site is optional-chained,
+ * the failure mode is silent: a dead control or a permanently-empty list,
+ * never a crash. A 2026-09 audit found the Electron preload exposing 134
+ * members against 46 here, and several user-visible features dead purely for
+ * that reason while their backend routes returned 200.
+ *
+ * BEFORE ADDING A MEMBER: the shim reports `mode: 'remote'`, so
+ * `isDesktopFsRemoteMode()` is true and the fs/git surface already routes to
+ * the gateway's REST API (see desktop-fs.ts / desktop-git.ts). Check for an
+ * existing `/api/*` route before designing anything; most gaps are a thin
+ * wrapper over one, using the `api()` helper below for token + timeout parity.
+ *
+ * DELIBERATELY ABSENT (verified 2026-09; do not "fix" these): native window
+ * management and pop-outs, tray/dock, HUD, pet overlay, wake indicator, zoom,
+ * quick entry, keep-awake, deep links, battery, native context menus and
+ * spellcheck, find-in-page, installer/bootstrap, relaunch/uninstall, and
+ * recycleBackend. A browser has no equivalent, and their call sites are
+ * capability-gated so the affordance is hidden rather than broken. Gateway
+ * settings, rename/delete/reveal, and clipboard were likewise verified to
+ * degrade correctly and need no work here.
+ *
+ * Omitting a member is a legitimate choice — but make it an explicit one, and
+ * make sure the UI hides the affordance instead of offering something that
+ * silently fails. See ROADMAP.md "Phase 2.17 — Web-served Desktop bridge
+ * parity" for the audit and the outstanding gaps.
  */
 
 import { markWebReloadPending, registerNativeWebReload } from '@/store/web-reload'

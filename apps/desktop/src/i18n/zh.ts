@@ -138,6 +138,7 @@ export const zhAuthored: Translations = withForkKeys(forkZh, {
     more: count => `另外 ${count} 条通知`,
     clearAll: '全部清除',
     dismiss: '关闭通知',
+    dismissAction: '关闭',
     details: '详情',
     copyDetail: '复制详情',
     copyDetailFailed: '无法复制通知详情',

@@ -141,6 +141,7 @@ export const ru = defineLocale({
       `Ещё ${count} ${count % 10 === 1 && count % 100 !== 11 ? 'уведомление' : count % 10 >= 2 && count % 10 <= 4 && (count % 100 < 12 || count % 100 > 14) ? 'уведомления' : 'уведомлений'}`,
     clearAll: 'Очистить всё',
     dismiss: 'Закрыть уведомление',
+    dismissAction: 'Закрыть',
     details: 'Подробности',
     copyDetail: 'Копировать подробность',
     copyDetailFailed: 'Не удалось скопировать подробность уведомления',

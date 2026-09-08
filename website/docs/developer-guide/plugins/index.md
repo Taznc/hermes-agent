@@ -1147,6 +1147,37 @@ def register(ctx):
 
 After registration, users can run `hermes my-plugin status`, `hermes my-plugin config`, etc.
 
+#### Nested actions under a built-in command
+
+Pass the keyword-only `parent=` to contribute an action to an existing built-in command's own subcommand group instead of adding a top-level one:
+
+```python
+def _sync(args):
+    print(f"syncing board {args.board or 'current'}")
+    return 0
+
+def _setup_sync(subparser):
+    subparser.add_argument("--board", help="Board slug to sync")
+
+def register(ctx):
+    ctx.register_cli_command(
+        name="roadmap-sync",
+        help="Sync the roadmap from the board",
+        setup_fn=_setup_sync,
+        handler_fn=_sync,
+        parent="kanban",
+    )
+```
+
+That makes `hermes kanban roadmap-sync --board my-board` (and `hermes kanban roadmap-sync --help`) work, with no change to core.
+
+| Rule | Behavior |
+|---|---|
+| Supported parents | `hermes_cli._parser.NESTED_CLI_PARENTS` — currently `kanban`. Any other parent is refused with a log warning and `None` is returned. |
+| `handler_fn` | **Required** when `parent=` is set: the parent's dispatcher rejects an action it has no handler for. |
+| Name conflicts | A name already taken by the parent (built-in action or alias) is skipped with a log warning; built-ins always win. |
+| `--help` listing | Plugin actions do not appear in the parent's `--help`, so `hermes kanban --help` stays fast — the same trade-off top-level plugin commands already make. |
+
 **Memory provider plugins** use a convention-based approach instead: add a `register_cli(subparser)` function to your plugin's `cli.py` file. The memory plugin discovery system finds it automatically — no `ctx.register_cli_command()` call needed. See the [Memory Provider Plugin guide](/developer-guide/memory-provider-plugin#adding-cli-commands) for details.
 
 **Active-provider gating:** Memory plugin CLI commands only appear when their provider is the active `memory.provider` in config. If a user hasn't set up your provider, your CLI commands won't clutter the help output.
