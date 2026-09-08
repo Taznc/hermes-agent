@@ -417,6 +417,7 @@ function activeProfileScope(): { profile?: string } {
 
   return profile && profile !== 'default' ? { profile } : {}
 }
+
 // Electron's counterpart (electron/vscode-marketplace.ts) runs this same
 // query from the MAIN process; the gallery API sends
 // `Access-Control-Allow-Origin: *` (verified live), so the browser can call
