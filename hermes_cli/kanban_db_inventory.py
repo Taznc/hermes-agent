@@ -17,9 +17,17 @@ sees a frozen inventory:
 * :func:`hermes_cli.kanban_db.remove_board` (archive and delete)
 * :func:`hermes_cli.kanban_transfer.import_board` (target-slug selection
   through final placement + metadata)
+* :func:`hermes_cli.kanban_db_connect.connect` and
+  :func:`hermes_cli.kanban_db_connect.init_db` **when, and only when, the named
+  board is absent** — their auto-init creates ``boards/<slug>/kanban.db``, which
+  is what makes that board visible to :func:`list_boards`. See
+  :func:`lock_if_board_is_new`.
 
 Reads take nothing: ``list_boards()`` / ``read_board_metadata()`` stay
-lock-free, so an unlocked reader is never blocked by an unrelated create.
+lock-free, so an unlocked reader is never blocked by an unrelated create. Nor
+is a connection to a board that already exists: opening one changes no
+inventory entry, and gating every connect on this lock would let a single
+fleet reader freeze every board read in the fleet.
 
 **Lock ordering.** The inventory lock is strictly OUTERMOST: inventory lock ->
 per-board SQLite locks (``_cross_process_init_lock``, ``BEGIN IMMEDIATE``).
@@ -153,6 +161,50 @@ def _acquire_rlock(deadline: float) -> bool:
     if remaining <= 0:
         return _INVENTORY_RLOCK.acquire(blocking=False)
     return _INVENTORY_RLOCK.acquire(timeout=remaining)
+
+
+def path_is_new_board_entry(db_path: Path) -> bool:
+    """True when opening ``db_path`` would ADD a board-directory entry.
+
+    ``connect``/``init_db`` auto-create a missing DB, so for an absent named
+    board they are inventory mutators wearing a reader's clothes — that is the
+    hole a public lock over ``create_board`` alone leaves open.
+
+    The predicate is deliberately narrow, so the hot path pays nothing and the
+    fleet is not frozen by ordinary reads:
+
+    * only ``<boards_root>/<slug>/kanban.db`` qualifies — the canonical shape of
+      an inventory entry, derived from :func:`boards_root`, never guessed. The
+      ``default`` board's legacy ``<root>/kanban.db`` and any path outside the
+      boards root (tests, tooling passing an explicit ``db_path``) are not
+      entries in that directory, so they are not gated;
+    * a directory that already holds a board (``board.json`` or ``kanban.db``,
+      i.e. exactly what :func:`list_boards` enumerates) is NOT new — connecting
+      to an existing board changes no entry and stays lock-free.
+    """
+    from hermes_cli import kanban_db as _kb
+
+    board_dir = db_path.parent
+    if db_path.name != "kanban.db" or board_dir.parent != _kb.boards_root():
+        return False
+    return not _kb._dir_holds_board(board_dir)
+
+
+@contextlib.contextmanager
+def lock_if_board_is_new(db_path: Path, timeout: Optional[float] = None) -> Iterator[None]:
+    """Hold the inventory lock while ``db_path``'s board is created; else no-op.
+
+    Fails CLOSED like every other acquisition: if the lock cannot be taken
+    within the bound, :class:`BoardInventoryLockTimeout` propagates and the
+    board is not created. That is deliberately unlike ``_cross_process_init_lock``,
+    which proceeds unlocked on timeout — re-running an idempotent schema pass is
+    safe, minting a board a fleet reader has already enumerated past is not.
+    """
+    if not path_is_new_board_entry(db_path):
+        yield
+        return
+    with board_inventory_lock(timeout):
+        yield
 
 
 def _open_lock_file(path: Path):

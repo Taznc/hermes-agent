@@ -528,6 +528,7 @@ os.environ["HERMES_KANBAN_HOME"] = spec["home"]
 
 from hermes_cli import kanban_db as kb
 from hermes_cli import kanban_db_inventory as kbi
+from hermes_cli import kanban_db_connect as kbc
 from hermes_cli import kanban_transfer as kt
 
 if not str(kb.boards_root()).startswith(spec["home"]):
@@ -566,6 +567,10 @@ try:
         kb.remove_board(spec["slug"], archive=False)
     elif op == "import":
         kt.import_board(spec["archive"])
+    elif op == "init":
+        kb.init_db(board=spec["slug"])
+    elif op == "connect":
+        kbc.connect(board=spec["slug"]).close()
     elif op == "acquire":
         with kb.board_inventory_lock(timeout=spec["timeout"]):
             pass
@@ -714,6 +719,11 @@ class TestBoardInventoryLock:
                 "archive": {"op": "archive", "slug": "to-archive"},
                 "delete": {"op": "delete", "slug": "to-delete"},
                 "import": {"op": "import", "archive": str(archive)},
+                # connect()/init_db() auto-create a missing named board, so they
+                # are inventory mutators too — a lock the direct DB entry points
+                # bypass does not freeze the inventory at all.
+                "init": {"op": "init", "slug": "init-bypass"},
+                "connect": {"op": "connect", "slug": "connect-bypass"},
             }.items():
                 mutators[label] = _spawn(script, tmp_path, fresh_home, label, **spec)
 
@@ -728,6 +738,8 @@ class TestBoardInventoryLock:
             assert not (boards / "brand-new").exists()
             assert not (boards / "source-2").exists()
             assert not (boards / "_archived").exists()
+            assert not (boards / "init-bypass" / "kanban.db").exists()
+            assert not (boards / "connect-bypass" / "kanban.db").exists()
             assert (boards / "to-archive" / "kanban.db").exists()
             assert (boards / "to-delete" / "kanban.db").exists()
         finally:
@@ -746,9 +758,51 @@ class TestBoardInventoryLock:
         assert not (boards / "to-delete").exists()
         assert (boards / "source-2" / "kanban.db").exists()
         assert (boards / "source-2" / "board.json").exists()
+        assert (boards / "init-bypass" / "kanban.db").exists()
+        assert (boards / "connect-bypass" / "kanban.db").exists()
         assert {b["slug"] for b in kb.list_boards()} == {
-            "default", "source", "source-2", "brand-new"
+            "default", "source", "source-2", "brand-new",
+            "init-bypass", "connect-bypass",
         }
+
+    def test_connecting_to_an_existing_board_stays_lock_free(
+        self, fresh_home, tmp_path
+    ):
+        """The gate is scoped to *creation*, not to every open.
+
+        Gating every ``connect`` on the inventory lock would let one fleet
+        reader freeze all board reads across the fleet — the opposite of the
+        card's read-only requirement. An existing board adds no entry, so it
+        must open while a foreign holder is mid-sweep.
+        """
+        script = _write_child_script(tmp_path)
+        kb.create_board("already-here")
+        ready, release = tmp_path / "held.flag", tmp_path / "go.flag"
+        holder, holder_out = _spawn(
+            script, tmp_path, fresh_home, "existing-holder",
+            op="hold", ready=str(ready), release=str(release),
+        )
+        try:
+            _wait_for(ready, proc=holder)
+            # Bounded well under the default: a wrongly-gated open would raise
+            # BoardInventoryLockTimeout here rather than return a connection.
+            proc, out_path = _spawn(
+                script, tmp_path, fresh_home, "existing-connect",
+                op="connect", slug="already-here", default_timeout=0.25,
+            )
+            res = _result(proc, out_path, timeout=30.0)
+            assert res["ok"] is True, f"existing-board connect was blocked: {res}"
+            # Same for the default board's legacy <root>/kanban.db.
+            proc, out_path = _spawn(
+                script, tmp_path, fresh_home, "default-connect",
+                op="connect", slug="default", default_timeout=0.25,
+            )
+            res = _result(proc, out_path, timeout=30.0)
+            assert res["ok"] is True, f"default-board connect was blocked: {res}"
+            assert holder.poll() is None
+        finally:
+            release.write_text("go", encoding="utf-8")
+        assert _result(holder, holder_out)["ok"] is True
 
     def test_board_inventory_lock_times_out_without_mutating_inventory(
         self, fresh_home, tmp_path
@@ -783,6 +837,11 @@ class TestBoardInventoryLock:
                 "archive": {"op": "archive", "slug": "keeper", "default_timeout": 0.25},
                 "delete": {"op": "delete", "slug": "keeper", "default_timeout": 0.25},
                 "import": {"op": "import", "archive": str(archive), "default_timeout": 0.25},
+                # The direct DB entry points must fail CLOSED too: proceeding
+                # unlocked here is exactly the race being guarded.
+                "init": {"op": "init", "slug": "never-inited", "default_timeout": 0.25},
+                "connect": {"op": "connect", "slug": "never-connected",
+                            "default_timeout": 0.25},
             }
             for label, spec in cases.items():
                 proc, out_path = _spawn(script, tmp_path, fresh_home, f"to-{label}", **spec)
@@ -801,6 +860,8 @@ class TestBoardInventoryLock:
         assert _slugs_on_disk(fresh_home) == before
         assert not (boards / "never-created").exists()
         assert not (boards / "also-never").exists()
+        assert not (boards / "never-inited" / "kanban.db").exists()
+        assert not (boards / "never-connected" / "kanban.db").exists()
         assert not (boards / "_archived").exists()
         assert not (boards / "exportable-2").exists()
         assert (boards / "keeper" / "board.json").exists()

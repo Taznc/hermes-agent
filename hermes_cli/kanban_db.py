@@ -699,6 +699,13 @@ def read_board_metadata(board: Optional[str] = None) -> dict:
         "default_workdir": None,
         # Project scope: new tasks inherit it (deterministic worktree + branch).
         "project_id": None,
+        # ``hermes kanban land`` target as "<remote>/<branch>". None = landing
+        # refuses unless --target is passed; the command never infers a remote,
+        # so a fork and its upstream can't be confused for one another.
+        "land_target": None,
+        # Optional shell command re-run in the task worktree before landing.
+        # None = fall back to a verification receipt on the approval run.
+        "land_verify": None,
         "created_at": None,
         "archived": False,
     }
@@ -721,52 +728,48 @@ def write_board_metadata(
     board: Optional[str], *, name: Optional[str] = None, description: Optional[str] = None,
     icon: Optional[str] = None, color: Optional[str] = None, archived: Optional[bool] = None,
     default_workdir: Optional[str] = None, project_id: Optional[str] = None,
+    land_target: Optional[str] = None, land_verify: Optional[str] = None,
 ) -> dict:
     """Create/update ``board.json``; unmentioned fields are preserved, ``created_at``
-    set on first write. ``project_id``/``default_workdir``: ``None`` = unchanged,
-    "" = clear (``project_id`` is not validated here).
+    set on first write. ``project_id``/``default_workdir``/``land_target``/
+    ``land_verify``: ``None`` = unchanged, "" = clear (``project_id`` is not
+    validated here).
 
     Held under :func:`board_inventory_lock`: writing ``board.json`` for an absent
     slug is what makes that board appear to :func:`list_boards`, so it is an
     inventory change even though the common case only edits an existing board.
+    The hold wraps the body in place rather than delegating to a private helper
+    with a copied signature — a copied signature silently drops any field added
+    to this one later.
     """
     _assert_not_delegated_child_mutation()
     with board_inventory_lock():
-        return _write_board_metadata_locked(
-            board, name=name, description=description, icon=icon, color=color,
-            archived=archived, default_workdir=default_workdir, project_id=project_id,
+        slug = _slug_or_default(board)
+        meta = read_board_metadata(slug)
+        # db_path is derived on every read; never persist it into board.json.
+        meta.pop("db_path", None)
+        if name is not None:
+            meta["name"] = str(name).strip() or _default_board_display_name(slug)
+        for key, value in (("description", description), ("icon", icon), ("color", color)):
+            if value is not None:
+                meta[key] = str(value)
+        if archived is not None:
+            meta["archived"] = bool(archived)
+        for key, value in (
+            ("default_workdir", default_workdir), ("project_id", project_id),
+            ("land_target", land_target), ("land_verify", land_verify),
+        ):
+            if value is not None:
+                meta[key] = str(value) if value else None
+        if not meta.get("created_at"):
+            meta["created_at"] = int(time.time())
+        path = board_metadata_path(slug)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(
+            json.dumps(meta, indent=2, ensure_ascii=False) + "\n", encoding="utf-8",
         )
-
-
-def _write_board_metadata_locked(
-    board: Optional[str], *, name: Optional[str] = None, description: Optional[str] = None,
-    icon: Optional[str] = None, color: Optional[str] = None, archived: Optional[bool] = None,
-    default_workdir: Optional[str] = None, project_id: Optional[str] = None,
-) -> dict:
-    """Body of :func:`write_board_metadata`; the caller holds the inventory lock."""
-    slug = _slug_or_default(board)
-    meta = read_board_metadata(slug)
-    # db_path is derived on every read; never persist it into board.json.
-    meta.pop("db_path", None)
-    if name is not None:
-        meta["name"] = str(name).strip() or _default_board_display_name(slug)
-    for key, value in (("description", description), ("icon", icon), ("color", color)):
-        if value is not None:
-            meta[key] = str(value)
-    if archived is not None:
-        meta["archived"] = bool(archived)
-    for key, value in (("default_workdir", default_workdir), ("project_id", project_id)):
-        if value is not None:
-            meta[key] = str(value) if value else None
-    if not meta.get("created_at"):
-        meta["created_at"] = int(time.time())
-    path = board_metadata_path(slug)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(
-        json.dumps(meta, indent=2, ensure_ascii=False) + "\n", encoding="utf-8",
-    )
-    meta["db_path"] = str(kanban_db_path(slug))
-    return meta
+        meta["db_path"] = str(kanban_db_path(slug))
+        return meta
 
 
 def create_board(
@@ -827,37 +830,32 @@ def remove_board(slug: str, *, archive: bool = True) -> dict:
     if normed == DEFAULT_BOARD:
         raise ValueError("the 'default' board cannot be removed")
     with board_inventory_lock():
-        return _remove_board_locked(normed, archive=archive)
+        d = board_dir(normed)
+        if not d.exists():
+            raise ValueError(f"board {normed!r} does not exist")
 
+        # If the user removed the currently-active board, revert to default.
+        if get_current_board() == normed:
+            clear_current_board()
 
-def _remove_board_locked(normed: str, *, archive: bool) -> dict:
-    """Body of :func:`remove_board`; the caller holds the inventory lock."""
-    d = board_dir(normed)
-    if not d.exists():
-        raise ValueError(f"board {normed!r} does not exist")
+        # A concurrent connect() after the rename recreates an empty DB file; drop
+        # the init cache first so the schema pass re-runs on it.
+        _INITIALIZED_PATHS.discard(str((d / "kanban.db").resolve()))
 
-    # If the user removed the currently-active board, revert to default.
-    if get_current_board() == normed:
-        clear_current_board()
-
-    # A concurrent connect() after the rename recreates an empty DB file; drop
-    # the init cache first so the schema pass re-runs on it.
-    _INITIALIZED_PATHS.discard(str((d / "kanban.db").resolve()))
-
-    if archive:
-        archive_root = boards_root() / "_archived"
-        archive_root.mkdir(parents=True, exist_ok=True)
-        ts = int(time.time())
-        target = archive_root / f"{normed}-{ts}"
-        suffix = 1
-        while target.exists():  # rapid double-archive
-            target = archive_root / f"{normed}-{ts}-{suffix}"
-            suffix += 1
-        d.rename(target)
-        return {"slug": normed, "action": "archived", "new_path": str(target)}
-    import shutil
-    shutil.rmtree(d)
-    return {"slug": normed, "action": "deleted", "new_path": ""}
+        if archive:
+            archive_root = boards_root() / "_archived"
+            archive_root.mkdir(parents=True, exist_ok=True)
+            ts = int(time.time())
+            target = archive_root / f"{normed}-{ts}"
+            suffix = 1
+            while target.exists():  # rapid double-archive
+                target = archive_root / f"{normed}-{ts}-{suffix}"
+                suffix += 1
+            d.rename(target)
+            return {"slug": normed, "action": "archived", "new_path": str(target)}
+        import shutil
+        shutil.rmtree(d)
+        return {"slug": normed, "action": "deleted", "new_path": ""}
 
 
 # --- Data classes ---

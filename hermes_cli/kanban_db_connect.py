@@ -716,6 +716,20 @@ def connect(db_path: Optional[Path] = None, *, board: Optional[str] = None) -> s
             conn.close()
             raise PermissionError("Kanban descendants require an initialized board; ask its owner to initialize it")
         return conn
+    # An ABSENT named board's auto-init creates ``boards/<slug>/kanban.db``,
+    # which is an inventory change — hold the public inventory lock across it so
+    # a fleet reader enumerating boards cannot have one appear mid-sweep. An
+    # existing board (and the default board, and an explicit db_path) is not an
+    # inventory entry being added, so it stays lock-free: gating every connect
+    # would let one reader freeze all board reads. Ordering is the documented
+    # one — inventory lock OUTSIDE the per-board SQLite locks below.
+    from hermes_cli.kanban_db_inventory import lock_if_board_is_new
+    with lock_if_board_is_new(path):
+        return _connect_initialized(path)
+
+
+def _connect_initialized(path: Path) -> sqlite3.Connection:
+    """Body of :func:`connect` from the point the board may be created."""
     path.parent.mkdir(parents=True, exist_ok=True)
 
     # Fast path: once THIS process has initialized this path, skip the
@@ -790,12 +804,18 @@ def init_db(db_path: Optional[Path] = None, *, board: Optional[str] = None) -> P
     migration pass — callers that know the on-disk schema may have drifted
     (tests writing legacy event kinds, external upgrades) use it to force it."""
     path = db_path if db_path is not None else _kb.kanban_db_path(board=board)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    # Clear the cache entry so connect() re-runs schema + migrations.
-    with _INIT_LOCK:
-        _INITIALIZED_PATHS.discard(str(path.resolve()))
-    with contextlib.closing(connect(path)):
-        pass
+    # Same inventory gate as connect(): for an absent named board this call
+    # creates the directory entry. One hold covers the mkdir, the cache reset
+    # and the schema pass (connect() re-enters it as a no-op), so a fleet reader
+    # never sees a board dir appear without its DB.
+    from hermes_cli.kanban_db_inventory import lock_if_board_is_new
+    with lock_if_board_is_new(path):
+        path.parent.mkdir(parents=True, exist_ok=True)
+        # Clear the cache entry so connect() re-runs schema + migrations.
+        with _INIT_LOCK:
+            _INITIALIZED_PATHS.discard(str(path.resolve()))
+        with contextlib.closing(connect(path)):
+            pass
     return path
 
 
