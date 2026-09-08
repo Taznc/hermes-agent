@@ -1,6 +1,6 @@
 import { atom, computed, type ReadableAtom } from 'nanostores'
 
-import { $clarifyRequest, $clarifyRequests } from './clarify'
+import { $clarifyRequest, $clarifyRequests, hasClarifyRequest } from './clarify'
 import { isSessionGone, isSessionGoneForBackgroundPolling, markSessionGone } from './runtime-gone'
 import { $activeSessionId } from './session'
 import { ambientRequestFor } from './session-gone-latch'
@@ -247,6 +247,18 @@ export const sessionBlockingPrompt = (sessionId: string | null) =>
 
     return Boolean(approvals[key] || sudos[key] || secrets[key])
   })
+
+/** True when `sessionId` is parked on ANY prompt the user still has to answer —
+ *  approval / sudo / secret *or* a clarify. Imperative twin of
+ *  `sessionAwaitingInput`, and deliberately a separate predicate from
+ *  `hasBlockingPromptRequest`: the composer needs clarify EXCLUDED (typing is a
+ *  valid answer to a clarify), while the "needs input" indicator needs it
+ *  INCLUDED (an unanswered clarify is exactly what the badge is for). Use this
+ *  wherever the question is "does the user still owe this session an answer?",
+ *  and `hasBlockingPromptRequest` only where the question is "can typed text
+ *  answer it?". */
+export const hasPendingInputRequest = (sessionId: string | null | undefined): boolean =>
+  hasBlockingPromptRequest(sessionId) || hasClarifyRequest(sessionId)
 
 /** Per-session `awaitingInput` — the tile composer's counterpart of
  *  `$activeSessionAwaitingInput` (same sources, fixed session instead of the
