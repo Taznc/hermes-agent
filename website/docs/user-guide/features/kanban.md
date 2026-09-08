@@ -681,8 +681,9 @@ closed with a reason code rather than merging on an assumption:
   URL**, so a `pushurl` pointing at a second repository can never let it verify
   one destination while writing another.
 - It requires verification evidence for that exact commit: either the board's
-  `land_verify` command re-run now, or a verification receipt on the approval
-  run naming the same commit.
+  `land_verify` command re-run now, or a `pre_review_gate` / `verification`
+  receipt naming the same commit — read from the approval run or from the
+  review handoff, which is where the implementer's own pre-review gate lands.
 - It fetches the target, merges in a throwaway worktree, pushes **without
   force**, then re-reads the remote and only closes the card once the content is
   provably present there. "Already present" is judged against the target's

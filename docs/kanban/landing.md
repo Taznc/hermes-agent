@@ -132,10 +132,17 @@ being landed**:
   (`hermes kanban boards set-land-verify default 'scripts/run_tests.sh'`), it is
   re-run now, in a throwaway detached checkout of that commit. Non-zero exit →
   `verification_failed`.
-- Otherwise the approval run's metadata must carry a receipt under
-  `pre_review_gate` or `verification`, naming the commit in one of `pushed`,
-  `sha`, `commit`, or `head`. Missing → `verification_missing`; naming a
-  different commit → `verification_stale`.
+- Otherwise a verification receipt must name the commit being landed, in one of
+  `pushed`, `sha`, `commit`, or `head`, under a `pre_review_gate` or
+  `verification` key. It is looked for on the approval run first, then on the
+  review handoff — which is where it normally lives, since the pre-review gate
+  is run and recorded by the **implementer** and a reviewer does not retype it.
+  Missing → `verification_missing`; naming a different commit →
+  `verification_stale`.
+
+Widening where the receipt may live does not widen what it proves: it must
+still name the exact commit being landed, and that commit is already pinned to
+the reviewed one, so a receipt from an earlier round is refused as stale.
 
 ## Order of operations
 

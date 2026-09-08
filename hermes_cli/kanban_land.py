@@ -521,12 +521,13 @@ def verify(
         }
 
     verdict = verdict or approval_verdict(conn, task_id)
-    sha, receipt = _receipt_sha(verdict.metadata)
+    sha, receipt, origin = _find_receipt(conn, task_id, verdict)
     if receipt is None:
         raise LandRefusal(
             "verification_missing",
             f"{task_id} carries no verification evidence: configure a board land_verify "
-            f"command, or record a {'/'.join(_RECEIPT_KEYS)} receipt on the approval run",
+            f"command, or record a {'/'.join(_RECEIPT_KEYS)} receipt on the approval or "
+            "review-handoff run",
         )
     if sha is None:
         raise LandRefusal(
@@ -541,7 +542,37 @@ def verify(
             f"{source.sha[:12]} would be landed",
         )
     return {"kind": "receipt", "ok": True, "sha": source.sha, "receipt": receipt,
-            "approval_run_id": verdict.run_id}
+            "receipt_run_id": origin, "approval_run_id": verdict.run_id}
+
+
+def _find_receipt(
+    conn: sqlite3.Connection, task_id: str, verdict: ApprovalVerdict,
+) -> tuple[Optional[str], Optional[dict], Optional[int]]:
+    """``(sha, receipt, run_id)`` — the verification receipt for this card.
+
+    Looked for on the approval run first, then on the runs that handed the card
+    to review. The second is where it actually lives: the pre-review gate is run
+    and recorded by the IMPLEMENTER on the review handoff, and a reviewer
+    approving the card does not retype it. Reading only the approval run would
+    make every real card refuse ``verification_missing``.
+
+    Widening WHERE the receipt may live does not widen WHAT it proves: the
+    caller still requires it to name the exact commit being landed, and that
+    commit is already pinned to the reviewed one by ``approval_sha_drift``. A
+    receipt from an earlier round therefore names an older sha and is refused
+    as stale.
+    """
+    sha, receipt = _receipt_sha(verdict.metadata)
+    if receipt is not None:
+        return sha, receipt, verdict.run_id
+    for row in conn.execute(
+        "SELECT id, metadata FROM task_runs WHERE task_id = ? "
+        "AND outcome = 'review_requested' ORDER BY id DESC", (task_id,),
+    ).fetchall():
+        sha, receipt = _receipt_sha(_json_dict(row["metadata"]))
+        if receipt is not None:
+            return sha, receipt, int(row["id"])
+    return None, None, None
 
 
 def _same_commit(a: str, b: str) -> bool:

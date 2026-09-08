@@ -1044,3 +1044,67 @@ def test_a_target_moving_during_readback_refuses_rather_than_record_the_wrong_sh
     assert exc.value.reason == "readback_failed"
     assert again["verdict"] == "already_landed"
     assert again["readback_sha"] == again["target_sha"] == repo.remote_sha("dev")
+
+
+def test_verification_accepts_the_implementers_pre_review_gate_receipt(kanban_home, repo):
+    """The verification receipt is produced by the IMPLEMENTER and recorded on
+    the review handoff — that is where `pre_review_gate` actually lives in
+    practice. A reviewer approving the card does not retype it, so looking only
+    at the approval run makes every real card refuse `verification_missing`.
+
+    Safety is unchanged: the receipt is accepted only when it names the exact
+    commit being landed, and that commit is already pinned to the approval.
+    """
+    with kbc.connect() as conn:
+        task_id = kb.create_task(conn, title="impl", assignee="dev-a")
+        path = repo.task_worktree(task_id)
+        conn.execute(
+            "UPDATE tasks SET workspace_kind = 'worktree', workspace_path = ?, "
+            "branch_name = ? WHERE id = ?", (str(path), f"wt/{task_id}", task_id),
+        )
+        conn.commit()
+        head = git(path, "rev-parse", "HEAD")
+
+        # Implementer hands off WITH the gate receipt, the way a worker does.
+        task = kb.claim_task(conn, task_id, claimer=f"lock-impl-{task_id}")
+        assert kb.request_review(
+            conn, task_id, summary="impl done", reviewer="reviewer",
+            expected_run_id=task.current_run_id,
+            metadata={"pre_review_gate": {"clean": True, "pushed": head}},
+        )
+        # Reviewer approves WITHOUT restating any of it.
+        assert kb.claim_review_task(conn, task_id, claimer="lock-rev") is not None
+        assert ka.approve_review_task(conn, task_id, source_sha=head)[0]
+
+        source = kl.source_state(conn, task_id, remote="origin")
+        receipt = kl.verify(conn, task_id, source, board=None)
+
+    assert receipt["kind"] == "receipt"
+    assert receipt["sha"] == head
+
+
+def test_an_implementer_receipt_for_a_different_commit_is_still_refused(kanban_home, repo):
+    """Widening where the receipt may live must not widen WHAT it proves."""
+    with kbc.connect() as conn:
+        task_id = kb.create_task(conn, title="impl", assignee="dev-a")
+        path = repo.task_worktree(task_id)
+        conn.execute(
+            "UPDATE tasks SET workspace_kind = 'worktree', workspace_path = ?, "
+            "branch_name = ? WHERE id = ?", (str(path), f"wt/{task_id}", task_id),
+        )
+        conn.commit()
+        head = git(path, "rev-parse", "HEAD")
+
+        task = kb.claim_task(conn, task_id, claimer=f"lock-impl-{task_id}")
+        assert kb.request_review(
+            conn, task_id, summary="impl done", reviewer="reviewer",
+            expected_run_id=task.current_run_id,
+            metadata={"pre_review_gate": {"pushed": "0" * 40}},
+        )
+        assert kb.claim_review_task(conn, task_id, claimer="lock-rev") is not None
+        assert ka.approve_review_task(conn, task_id, source_sha=head)[0]
+
+        source = kl.source_state(conn, task_id, remote="origin")
+        with pytest.raises(kl.LandRefusal) as exc:
+            kl.verify(conn, task_id, source, board=None)
+    assert exc.value.reason == "verification_stale"
