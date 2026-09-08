@@ -6,6 +6,7 @@ from hermes_cli import kanban as kc
 from hermes_cli import kanban_db as kb
 from hermes_cli import kanban_db_connect as kbc
 from hermes_cli import kanban_db_dispatch as kbd
+from hermes_cli import kanban_diagnostics as kd
 
 
 def _spawn(_task, _workspace, board=None):
@@ -321,3 +322,57 @@ def test_show_surfaces_review_round_cap_block(all_assignees_spawnable):
     assert "status:    blocked" in output
     assert "review_round_cap" in output
     assert "root cause unclear" in output
+
+
+def test_diagnostics_surfaces_review_round_cap_block(all_assignees_spawnable):
+    """AC3: `hermes kanban diagnostics` surfaces the review_round_cap block kind,
+    the round count, and the last `changes_requested` reason via a dedicated
+    diagnostic rule (compute_task_diagnostics returned [] before this rule
+    existed, even though the task was correctly blocked)."""
+    with kbc.connect() as conn:
+        task_id = kb.create_task(conn, title="runaway rework", assignee="implementer")
+        kb._append_event(conn, task_id, "changes_requested", {"reason": "first"})
+        kb._append_event(conn, task_id, "changes_requested", {"reason": "second"})
+        kb._append_event(conn, task_id, "changes_requested", {"reason": "third and final"})
+        conn.commit()
+
+        result = kbd.dispatch_once(conn, spawn_fn=_spawn, max_review_rounds=3)
+        assert result.blocked_review_round_cap == [(task_id, 3)]
+
+        task = kb.get_task(conn, task_id)
+        events = kb.list_events(conn, task_id)
+        runs = kb.list_runs(conn, task_id)
+
+    diags = kd.compute_task_diagnostics(task, events, runs)
+
+    matching = [d for d in diags if d.kind == "review_round_cap"]
+    assert len(matching) == 1
+    diag = matching[0]
+    assert diag.data["changes_rounds"] == 3
+    assert diag.data["max_review_rounds"] == 3
+    assert diag.data["last_reason"] == "third and final"
+
+
+def test_diagnostics_stays_empty_for_a_normal_blocked_task(all_assignees_spawnable):
+    """Negative case: a task blocked for an unrelated reason must never surface
+    the review_round_cap diagnostic (it keys off block_kind, not merely being
+    blocked with SOME review_round_cap event lying around in old history)."""
+    with kbc.connect() as conn:
+        task_id = kb.create_task(conn, title="ordinary block", assignee="implementer")
+        kb._append_event(conn, task_id, "changes_requested", {"reason": "first"})
+        kb._append_event(conn, task_id, "changes_requested", {"reason": "second"})
+        kb._append_event(conn, task_id, "changes_requested", {"reason": "third"})
+        conn.commit()
+        kbd.dispatch_once(conn, spawn_fn=_spawn, max_review_rounds=3)
+
+        # Unblock, then block again for an unrelated reason.
+        assert kb.unblock_task(conn, task_id) is True
+        assert kb.block_task(conn, task_id, reason="unrelated: waiting on credentials") is True
+
+        task = kb.get_task(conn, task_id)
+        events = kb.list_events(conn, task_id)
+        runs = kb.list_runs(conn, task_id)
+
+    diags = kd.compute_task_diagnostics(task, events, runs)
+
+    assert not any(d.kind == "review_round_cap" for d in diags)
