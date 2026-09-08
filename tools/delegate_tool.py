@@ -526,16 +526,41 @@ def _build_top_level_description() -> str:
         )
     else:
         restrictions_rule = "- Children cannot call delegate_task, clarify, memory, or cronjob.\n"
-    return _DESCRIPTION_HEAD + restrictions_rule + _DESCRIPTION_TAIL
+    return _DESCRIPTION_HEAD + _build_dispatch_mode_paragraph() + _DESCRIPTION_TAIL_HEAD + restrictions_rule + _DESCRIPTION_TAIL
+
+
+def _build_dispatch_mode_paragraph() -> str:
+    """How this call actually returns — a session that cannot receive a detached completion
+    (one-shot Kanban worker, stateless HTTP request, cron job) runs the batch INLINE, so
+    telling such a caller "dispatch returns immediately, do not wait" is simply false and
+    makes it plan around a handle it will never get. Session-stable, so the schema stays
+    byte-stable for the life of a conversation."""
+    try:
+        from gateway.session_context import async_delivery_supported
+
+        detached = async_delivery_supported()
+    except Exception:
+        detached = True
+    if detached:
+        return (
+            "Runs in the background: dispatch returns immediately with live transcript paths, and the completed "
+            "result (one consolidated message, results in task order) re-enters the conversation on its own. Do NOT "
+            "wait or poll; continue other work. While children run, `action` (list/steer/stop) controls them live — "
+            "steer when a transcript shows a child drifting.\n\n"
+        )
+    return (
+        "This session cannot receive a detached result, so the call BLOCKS until every child finishes and returns "
+        "their consolidated results directly. Budget for that: a subagent routinely runs for many minutes, and that "
+        "time comes out of your own turn. Live transcript paths are in the result.\n\n"
+    )
 
 _DESCRIPTION_HEAD = (
     "Spawn subagents in isolated contexts; each gets its own conversation, terminal session, and toolset, and only its "
     "final summary returns to you. Pass every task in `tasks` — one entry spawns one subagent, several run in parallel "
     "(limit in the tasks description).\n\n"
-    "Runs in the background: dispatch returns immediately with live transcript paths, and the completed result (one "
-    "consolidated message, results in task order) re-enters the conversation on its own. Do NOT wait or poll; continue "
-    "other work. While children run, `action` (list/steer/stop) controls them live — steer when a transcript shows a "
-    "child drifting.\n\n"
+)
+
+_DESCRIPTION_TAIL_HEAD = (
     "USE FOR: reasoning-heavy subtasks, work that would flood your context with intermediate data, or independent "
     "parallel workstreams.\n"
     "DO NOT USE FOR (use these instead):\n"
