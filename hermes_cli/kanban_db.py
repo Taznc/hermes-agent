@@ -228,7 +228,7 @@ _TICK_ACTIVITY_FIELDS = (
     "spawned", "reclaimed", "promoted", "reconciled_orphans", "crashed", "stale",
     "timed_out", "auto_blocked", "rate_limited", "review_no_verdict", "auto_assigned_default",
     "respawn_guarded", "skipped_per_profile_capped", "skipped_unassigned",
-    "skipped_nonspawnable",
+    "skipped_nonspawnable", "skill_preflight_blocked",
 )
 
 
@@ -2037,6 +2037,11 @@ def create_task(
     )
     parents = tuple(p for p in parents if p)
     skills_list = _normalize_task_skills(skills)
+    # Forced skills resolve in the ASSIGNEE's isolated profile home, not ours.
+    # Validating here — before the row exists — is what keeps an unloadable
+    # skill from becoming a worker that dies during init on every retry.
+    from hermes_cli.kanban_skill_preflight import preflight_task_skills
+    preflight_task_skills(assignee, skills_list)
 
     # Idempotency check BEFORE the write txn (no lock held); a concurrent-create
     # race may insert twice, the next lookup stabilises on the newest.
@@ -2312,11 +2317,17 @@ def list_tasks(
 
 
 def assign_task(conn: sqlite3.Connection, task_id: str, profile: Optional[str]) -> bool:
-    """Assign/reassign; raises RuntimeError while the task is running under a claim."""
+    """Assign/reassign; raises RuntimeError while the task is running under a claim.
+
+    Re-runs the forced-skill preflight against the NEW profile: a card that one
+    profile can run is a guaranteed init crash for a profile whose isolated home
+    lacks the skill, and reassignment is the other way a card acquires that
+    mismatch (the create-time check cannot see a later move).
+    """
     profile = _canonical_assignee(profile)
     with write_txn(conn):
         row = conn.execute(
-            "SELECT status, claim_lock, assignee FROM tasks WHERE id = ?", (task_id,)
+            "SELECT status, claim_lock, assignee, skills FROM tasks WHERE id = ?", (task_id,)
         ).fetchone()
         if not row:
             return False
@@ -2326,6 +2337,8 @@ def assign_task(conn: sqlite3.Connection, task_id: str, profile: Optional[str]) 
                 "Wait for completion or reclaim the stale lock first."
             )
         if row["assignee"] != profile:
+            from hermes_cli.kanban_skill_preflight import preflight_task_skills
+            preflight_task_skills(profile, _json_or(_row_get(row, "skills")) or ())
             # The failure streak is per task/profile; a new profile starts fresh.
             conn.execute(
                 "UPDATE tasks SET assignee = ?, consecutive_failures = 0, "

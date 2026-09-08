@@ -675,6 +675,18 @@ hermes kanban create "audit auth flow" \
 
 The dispatcher emits one `--skills <name>` flag per skill listed, so the worker spawns with all of them loaded on top of the auto-injected kanban guidance. The skill names must match skills that are actually installed on the assignee's profile (run `hermes skills list` to see what's available); there's no runtime install.
 
+#### Profile-scoped skill preflight
+
+Profiles have **isolated** skill registries, so a skill installed for the profile that files a card is not necessarily available to the profile that will run it. Because a forced skill that the worker cannot load kills it during initialization — before any work happens — every surface preflights the card's skills against the **assignee's own profile home**:
+
+- **Create** (`hermes kanban create`, the `kanban_create` tool, the dashboard dialog) refuses the card before writing the row, naming the profile and each missing skill.
+- **Assign / reassign** re-runs the same check against the new profile, so moving a card cannot introduce the mismatch either.
+- **The dispatcher** re-checks before claiming, which catches imported boards and rows written before this check existed. A mismatch blocks the card once with a `capability` block; no worker is spawned, and neither the retry budget nor the board's start budget is charged. Fixing the configuration and unblocking the card resumes it with a clean failure counter.
+
+The check never falls back to another profile's registry: a profile whose home cannot be inspected (missing, tombstoned, unreadable) **fails closed** with a distinct diagnostic rather than assuming the skill is present. `plugin:skill` names are the one exception — enumerating another profile's plugin-provided skills would require loading that profile's plugins, so they are not preflighted.
+
+To fix a rejected card, either install/enable the skill for that profile (`hermes -p <profile> skills list` to inspect, then install it or remove it from `skills.disabled` in that profile's `config.yaml`), or drop the skill from the card.
+
 ### Per-task model override
 
 Pin a task's worker to a specific model (and optionally provider), independent of the assignee profile's default:

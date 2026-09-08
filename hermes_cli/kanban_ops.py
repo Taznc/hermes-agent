@@ -185,6 +185,8 @@ def _cmd_dispatch(args: argparse.Namespace) -> int:
             f"Skipped (non-spawnable assignee — terminal lane, OK): "
             f"{', '.join(res.skipped_nonspawnable)}"
         )
+    for tid, reason in res.skill_preflight_blocked:
+        print(f"Blocked (forced skill unavailable to assignee): {tid}\n  {reason}")
     if res.dispatch_paused:
         print("Dispatch: " + _dispatch_pause_message(res.dispatch_paused, board=board))
     return 0
