@@ -43,6 +43,40 @@ def _wire_to_client_tool_names(payload_tools: Any, anthropic_tools: Any) -> Dict
     return {wire_name: client_name for client_name, wire_name in zip(client_names, wire_names) if wire_name}
 
 
+def _anthropic_output_format(response_format: Any) -> Dict[str, Any] | None:
+    """Translate an OpenAI ``response_format`` to an Anthropic output format.
+
+    Anthropic enforces structured output through a JSON Schema, so OpenAI's
+    schema-less ``json_object`` mode maps to the permissive ``{"type": "object"}``
+    schema.  ``text`` is OpenAI's explicit unconstrained mode and correctly
+    produces no enforcement.  Anything this bridge cannot express faithfully
+    raises instead of silently downgrading the caller to free prose.
+
+    ``agent.auxiliary_client._translate_anthropic_response_format`` performs the
+    same mapping for in-process SDK calls but drops shapes it cannot handle,
+    which is right there (a local caller keeps its own retry ladder) and wrong
+    here: a proxy client has already been told its request was accepted.
+    """
+    if response_format is None:
+        return None
+    if not isinstance(response_format, dict):
+        raise ValueError("response_format must be a JSON object")
+    kind = response_format.get("type")
+    if kind == "text":
+        return None
+    if kind == "json_object":
+        return {"type": "json_schema", "schema": {"type": "object"}}
+    if kind == "json_schema":
+        wrapper = response_format.get("json_schema")
+        schema = wrapper.get("schema") if isinstance(wrapper, dict) else None
+        if not isinstance(schema, dict):
+            raise ValueError("response_format json_schema requires a schema object")
+        # OpenAI-only wrapper keys (name/strict/description) have no Anthropic
+        # equivalent and are 400s upstream, so only the schema travels.
+        return {"type": "json_schema", "schema": schema}
+    raise ValueError(f"unsupported response_format type: {kind!r}")
+
+
 def prepare_chat_request(payload: Dict[str, Any]) -> tuple[Dict[str, str], bytes, Dict[str, str]]:
     """Return Anthropic request headers/body and wire-to-client tool-name mapping."""
     messages = payload.get("messages")
@@ -70,6 +104,11 @@ def prepare_chat_request(payload: Dict[str, Any]) -> tuple[Dict[str, str], bytes
         base_url="https://api.anthropic.com/v1",
     )
     kwargs["stream"] = bool(payload.get("stream"))
+    output_format = _anthropic_output_format(payload.get("response_format"))
+    if output_format is not None:
+        # ``output_config`` may already carry a thinking effort; only the format
+        # key belongs to the client's requested response format.
+        kwargs.setdefault("output_config", {})["format"] = output_format
     # SDK-only helpers must never cross the raw HTTP boundary.
     kwargs.pop("extra_headers", None)
     # Anthropic routes subscription OAuth by the official Claude Code identity;

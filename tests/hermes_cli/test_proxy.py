@@ -647,6 +647,191 @@ def test_claude_proxy_translates_chat_and_attaches_oauth_identity():
     asyncio.run(run())
 
 
+async def _claude_proxy_roundtrip(payload, upstream_handler):
+    """POST one payload through a Claude-bridging proxy over a fake upstream."""
+    upstream = web.Application()
+    upstream.router.add_post("/v1/messages", upstream_handler)
+    upstream_runner, upstream_base = await _start_runner(upstream)
+    adapter = ClaudeFakeAdapter(f"{upstream_base}/v1", allowed=["/chat/completions"])
+    proxy_runner, proxy_base = await _start_runner(create_app(adapter))
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.post(
+                f"{proxy_base}/v1/chat/completions", json=payload
+            ) as response:
+                return response.status, response.content_type, await response.read()
+    finally:
+        await proxy_runner.cleanup()
+        await upstream_runner.cleanup()
+
+
+def test_claude_proxy_rejects_malformed_response_format_with_structured_400():
+    """A response_format the bridge cannot honor is a client error, never a silent drop."""
+
+    async def messages(request):  # pragma: no cover - must never be reached
+        await request.read()
+        raise AssertionError("upstream must not be called for an invalid request")
+
+    async def run():
+        status, content_type, raw = await _claude_proxy_roundtrip(
+            {
+                "model": "claude-sonnet-4-6",
+                "messages": [{"role": "user", "content": "Return json."}],
+                "response_format": {"type": "json"},
+            },
+            messages,
+        )
+        assert status == 400
+        assert content_type == "application/json"
+        assert json.loads(raw)["error"]["code"] == "invalid_request_error"
+
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize("upstream_body", [
+    b"",
+    b"   ",
+    b"<html>gateway hiccup</html>",
+    b'[{"type":"text","text":"hi"}]',
+    b'"just a string"',
+    b"null",
+])
+def test_claude_proxy_returns_structured_502_for_malformed_upstream_200(upstream_body):
+    """An HTTP 200 that is not an Anthropic message object must never look like success."""
+
+    async def messages(request):
+        await request.read()
+        return web.Response(body=upstream_body, status=200, content_type="application/json")
+
+    async def run():
+        status, content_type, raw = await _claude_proxy_roundtrip(
+            {
+                "model": "claude-sonnet-4-6",
+                "messages": [{"role": "user", "content": "ping"}],
+            },
+            messages,
+        )
+        assert status == 502
+        assert content_type == "application/json"
+        assert json.loads(raw)["error"]["code"] == "upstream_invalid_response"
+
+    asyncio.run(run())
+
+
+def test_claude_proxy_preserves_upstream_non_2xx_status_and_json_body():
+    """A genuine upstream refusal keeps its status and payload."""
+
+    async def messages(request):
+        await request.read()
+        return web.json_response(
+            {"type": "error", "error": {"type": "overloaded_error", "message": "busy"}},
+            status=529,
+        )
+
+    async def run():
+        status, content_type, raw = await _claude_proxy_roundtrip(
+            {
+                "model": "claude-sonnet-4-6",
+                "messages": [{"role": "user", "content": "ping"}],
+            },
+            messages,
+        )
+        assert status == 529
+        assert content_type == "application/json"
+        assert json.loads(raw)["error"]["type"] == "overloaded_error"
+
+    asyncio.run(run())
+
+
+def test_claude_proxy_returns_json_for_a_non_json_upstream_error_body():
+    """An undecodable error body still reaches the client as JSON at the upstream status."""
+
+    async def messages(request):
+        await request.read()
+        return web.Response(body=b"<html>502 Bad Gateway</html>", status=502, content_type="text/html")
+
+    async def run():
+        status, content_type, raw = await _claude_proxy_roundtrip(
+            {
+                "model": "claude-sonnet-4-6",
+                "messages": [{"role": "user", "content": "ping"}],
+            },
+            messages,
+        )
+        assert status == 502
+        assert content_type == "application/json"
+        assert json.loads(raw)["error"]["code"] == "upstream_error"
+
+    asyncio.run(run())
+
+
+def test_claude_proxy_forwards_response_format_as_anthropic_output_config():
+    """The structured-output request Hindsight sends must reach Anthropic enforcement."""
+    captured: Dict[str, Any] = {}
+
+    async def messages(request):
+        captured["body"] = await request.json()
+        return web.json_response({
+            "model": "claude-sonnet-4-6",
+            "stop_reason": "end_turn",
+            "content": [{"type": "text", "text": '{"ok":true}'}],
+            "usage": {"input_tokens": 3, "output_tokens": 2},
+        })
+
+    async def run():
+        status, _, raw = await _claude_proxy_roundtrip(
+            {
+                "model": "claude-sonnet-4-6",
+                "messages": [{"role": "user", "content": "Return valid json only."}],
+                "response_format": {"type": "json_object"},
+            },
+            messages,
+        )
+        assert status == 200
+        assert json.loads(raw)["choices"][0]["message"]["content"] == '{"ok":true}'
+        assert captured["body"]["output_config"] == {
+            "format": {"type": "json_schema", "schema": {"type": "object"}}
+        }
+
+    asyncio.run(run())
+
+
+def test_claude_proxy_streams_text_through_a_single_done_sentinel():
+    """The streaming path stays a well-formed OpenAI SSE sequence."""
+
+    async def messages(request):
+        await request.read()
+        response = web.StreamResponse(status=200, headers={"Content-Type": "text/event-stream"})
+        await response.prepare(request)
+        for event in (
+            b'{"type":"content_block_delta","delta":{"type":"text_delta","text":"hel"}}',
+            b'{"type":"content_block_delta","delta":{"type":"text_delta","text":"lo"}}',
+            b'{"type":"message_delta","delta":{"stop_reason":"end_turn"}}',
+        ):
+            await response.write(b"data: " + event + b"\n")
+        await response.write_eof()
+        return response
+
+    async def run():
+        status, _, raw = await _claude_proxy_roundtrip(
+            {
+                "model": "claude-sonnet-4-6",
+                "messages": [{"role": "user", "content": "greet"}],
+                "stream": True,
+            },
+            messages,
+        )
+        assert status == 200
+        lines = [line for line in raw.splitlines() if line.startswith(b"data: ")]
+        assert lines[-1] == b"data: [DONE]"
+        assert sum(line == b"data: [DONE]" for line in lines) == 1
+        chunks = [json.loads(line[6:]) for line in lines if line != b"data: [DONE]"]
+        assert "".join(c["choices"][0]["delta"].get("content", "") for c in chunks) == "hello"
+        assert chunks[-1]["choices"][0]["finish_reason"] == "stop"
+
+    asyncio.run(run())
+
+
 def test_claude_proxy_streams_multiple_tool_calls_with_distinct_indices():
     """The upstream stream is one stateful sequence, even when read line-by-line."""
     async def run():
