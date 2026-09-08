@@ -2209,34 +2209,43 @@ def create_task(
                         created_by_task, _opt_int(created_by_run),
                     ),
                 )
+                # A parent that is already archived-after-completion gets no
+                # edge: it would be born permanently satisfied and could only be
+                # debt (see _born_satisfied_parents). ``initial_task_state``
+                # above already read it as satisfying, so the child's status is
+                # identical either way. The skip is recorded on the ``created``
+                # event below, mirroring ``cleared_child_links`` on ``archived``.
+                skipped_parents = _born_satisfied_parents(conn, parents)
                 for pid in parents:
+                    if pid in skipped_parents:
+                        continue
                     _link(conn, pid, task_id)
-                _append_event(
-                    conn,
-                    task_id,
-                    "created",
-                    {
-                        "assignee": assignee,
-                        "status": task_status,
-                        "parents": list(parents),
-                        "creator_task_id": creator_task_id,
-                        "tenant": tenant,
-                        "workspace_kind": workspace_kind,
-                        "workspace_path": workspace_path,
-                        "branch_name": branch_name,
-                        "project_id": project_id,
-                        "skills": list(skills_list) if skills_list else None,
-                        "goal_mode": bool(goal_mode) or None,
-                        "model_override": model_override,
-                        "provider_override": provider_override,
-                        "reasoning_effort": reasoning_effort,
-                        "route_source": route_source,
-                        "route_name": route_name,
-                        "created_by_task": created_by_task,
-                        "created_by_run": _opt_int(created_by_run),
-                        "lane": lane,
-                    },
-                )
+                created_payload: dict[str, Any] = {
+                    "assignee": assignee,
+                    "status": task_status,
+                    "parents": list(parents),
+                    "creator_task_id": creator_task_id,
+                    "tenant": tenant,
+                    "workspace_kind": workspace_kind,
+                    "workspace_path": workspace_path,
+                    "branch_name": branch_name,
+                    "project_id": project_id,
+                    "skills": list(skills_list) if skills_list else None,
+                    "goal_mode": bool(goal_mode) or None,
+                    "model_override": model_override,
+                    "provider_override": provider_override,
+                    "reasoning_effort": reasoning_effort,
+                    "route_source": route_source,
+                    "route_name": route_name,
+                    "created_by_task": created_by_task,
+                    "created_by_run": _opt_int(created_by_run),
+                    "lane": lane,
+                }
+                if skipped_parents:
+                    created_payload["skipped_parent_links"] = [
+                        p for p in parents if p in skipped_parents
+                    ]
+                _append_event(conn, task_id, "created", created_payload)
                 if initial_status == "blocked":
                     _append_event(
                         conn,
@@ -2301,6 +2310,37 @@ def _project_branch_name(project_obj: Any, task_id: str, title: Optional[str]) -
         return _pdb.branch_name_for(project_obj, task_id, title=title or "")
     except Exception:
         return None
+
+
+def _born_satisfied_parents(
+    conn: sqlite3.Connection, parent_ids: Iterable[str],
+) -> set[str]:
+    """Of ``parent_ids``, those a NEW edge could never gate for: archived AND completed.
+
+    The mirror of :func:`_clear_satisfied_outgoing_links`, which deletes such an
+    edge when the link is made first and the parent archives second. This covers
+    the reverse ordering — the parent is already archived-after-completion when
+    the edge is minted — so both orderings converge on the same board state
+    instead of one of them leaving a permanently-satisfied row behind for every
+    future surface to remember to filter.
+
+    Deliberately NARROWER than :func:`_parent_dependency_satisfied`, which is
+    also true of a plain ``done`` parent. A ``done`` parent is only
+    *provisionally* satisfied: reopening it clears ``completed_at`` and
+    ``invalidate_descendants_for_parent_reopen`` walks ``task_links`` to retract
+    the descendants that relied on it. Skipping those edges would strand every
+    child linked after its parent finished. Archival is what makes the evidence
+    permanent, because leaving ``archived`` is what clears it.
+    """
+    ids = tuple(dict.fromkeys(pid for pid in parent_ids if pid))
+    if not ids:
+        return set()
+    rows = conn.execute(
+        "SELECT id FROM tasks WHERE id IN (" + ",".join("?" * len(ids)) + ") "
+        "AND status = 'archived' AND completed_at IS NOT NULL",
+        ids,
+    ).fetchall()
+    return {r["id"] for r in rows}
 
 
 def _link(conn: sqlite3.Connection, parent_id: str, child_id: str) -> None:
@@ -2537,6 +2577,20 @@ def set_reasoning_effort(conn: sqlite3.Connection, task_id: str, effort: Optiona
 # --- Links ---
 
 def link_tasks(conn: sqlite3.Connection, parent_id: str, child_id: str) -> None:
+    """Add a parent -> child dependency edge.
+
+    An edge whose parent is already archived-after-completion is NOT minted: it
+    would be born permanently satisfied (see :func:`_born_satisfied_parents`) and
+    could only ever be debt for the surfaces that resolve links. The caller still
+    sees success — the dependency it asked for is genuinely already met — and the
+    skip is recorded as a ``link_skipped`` event so the audit trail says why no
+    edge appeared. Notify subscriptions still flow, because they express "tell me
+    about this lineage" rather than "wait for this parent".
+
+    The cycle check runs BEFORE the skip on purpose: a caller declaring a
+    circular dependency has a real graph bug worth surfacing, whether or not this
+    particular edge would have been persisted.
+    """
     if parent_id == child_id:
         raise ValueError("a task cannot depend on itself")
     with write_txn(conn):
@@ -2545,6 +2599,17 @@ def link_tasks(conn: sqlite3.Connection, parent_id: str, child_id: str) -> None:
             raise ValueError(f"unknown task(s): {', '.join(missing)}")
         if _would_cycle(conn, parent_id, child_id):
             raise ValueError(f"linking {parent_id} -> {child_id} would create a cycle")
+        if _born_satisfied_parents(conn, [parent_id]):
+            _append_event(
+                conn, child_id, "link_skipped",
+                {
+                    "parent": parent_id,
+                    "child": child_id,
+                    "reason": "parent_archived_after_completion",
+                },
+            )
+            _inherit_notify_subs(conn, child_id, (parent_id,))
+            return
         _link(conn, parent_id, child_id)
         # Re-gate every edge, including archived parents whose completion
         # evidence was absent, before a ready child can be claimed.
@@ -5128,6 +5193,9 @@ def _clear_satisfied_outgoing_links(conn: sqlite3.Connection, task_id: str) -> l
     edges stay so the child keeps showing a real block. Edges where ``task_id``
     is the CHILD are dependency history belonging to the surviving parent and
     are never touched here. Returns the child ids whose edges were removed.
+
+    Handles only the "link first, archive second" ordering; the reverse is
+    :func:`_born_satisfied_parents`, which refuses to mint the row at all.
     """
     row = conn.execute("SELECT status, completed_at FROM tasks WHERE id = ?", (task_id,)).fetchone()
     if row is None or not _parent_dependency_satisfied(row):
@@ -5141,6 +5209,59 @@ def _clear_satisfied_outgoing_links(conn: sqlite3.Connection, task_id: str) -> l
     if children:
         conn.execute("DELETE FROM task_links WHERE parent_id = ?", (task_id,))
     return children
+
+
+def _restore_skipped_child_links(conn: sqlite3.Connection, task_id: str) -> list[str]:
+    """Re-mint the edges that were skipped while ``task_id`` was satisfied.
+
+    The inverse of :func:`_born_satisfied_parents`. A skip is only correct while
+    the parent's completion evidence is permanent; reopening it withdraws that
+    evidence, and a child released on it has to start waiting again. Without
+    this, ``invalidate_descendants_for_parent_reopen`` would find nothing to
+    retract — the card would still say "waiting on this parent" to the user while
+    the board quietly let it run.
+
+    The audit trail is the record of what to restore: ``link_skipped`` on the
+    child, and ``skipped_parent_links`` on its ``created`` event. A pair carrying
+    an ``unlinked`` event is left alone — an operator who explicitly cut that
+    edge outranks a replayed skip. Returns the child ids re-linked.
+
+    Cleared edges (:func:`_clear_satisfied_outgoing_links`) are NOT restored
+    here: they are deleted rows, not deferred writes, and reviving them is
+    ``unarchive_task``'s long-standing documented non-behavior.
+    """
+    rows = conn.execute(
+        "SELECT task_id, kind, payload FROM task_events "
+        "WHERE kind IN ('link_skipped', 'created') AND payload LIKE ? ORDER BY id",
+        (f"%{task_id}%",),
+    ).fetchall()
+    candidates: list[str] = []
+    for row in rows:
+        payload = _json_dict(_row_get(row, "payload"))
+        if row["kind"] == "link_skipped":
+            matched = payload.get("parent") == task_id
+        else:
+            matched = task_id in (payload.get("skipped_parent_links") or [])
+        if matched and row["task_id"] not in candidates:
+            candidates.append(row["task_id"])
+    restored: list[str] = []
+    for child_id in candidates:
+        if conn.execute(
+            "SELECT 1 FROM task_events WHERE task_id = ? AND kind = 'unlinked' "
+            "AND payload LIKE ? LIMIT 1", (child_id, f"%{task_id}%"),
+        ).fetchone() is not None:
+            continue
+        if conn.execute("SELECT 1 FROM tasks WHERE id = ?", (child_id,)).fetchone() is None:
+            continue
+        if _would_cycle(conn, task_id, child_id):
+            continue
+        _link(conn, task_id, child_id)
+        _append_event(
+            conn, child_id, "linked",
+            {"parent": task_id, "child": child_id, "restored_from": "link_skipped"},
+        )
+        restored.append(child_id)
+    return restored
 
 
 def archive_task(
@@ -5244,10 +5365,13 @@ def unarchive_task(conn: sqlite3.Connection, task_id: str, *, status: str = "tod
             return False
         reopening_satisfied_parent = _parent_dependency_satisfied(archived)
         # Note: archival already deleted this task's outgoing (parent_id) edges
-        # when it was completed, so the invalidation sweep below only reaches
-        # children linked AFTER that archive. Reopened work re-gates via
-        # invalidate_descendants_for_parent_reopen; the cleared edges are gone
-        # for good and are not resurrected here.
+        # when it was completed, and those deleted rows are gone for good — the
+        # long-standing contract. Edges this task REFUSED to mint while it was
+        # archived-after-completion (``_born_satisfied_parents``) are different:
+        # they were deferred, not deleted, and the refusal was only correct while
+        # the completion evidence was permanent. Reopening withdraws that
+        # evidence, so those edges are re-minted from the audit trail below and
+        # the invalidation sweep then retracts the children they released.
         if target == "ready" and not _parents_satisfied(conn, task_id):
             target = "todo"
         cur = conn.execute(
@@ -5269,6 +5393,13 @@ def unarchive_task(conn: sqlite3.Connection, task_id: str, *, status: str = "tod
                 {"status": target, "via": "unarchive"},
             )
         if reopening_satisfied_parent:
+            # Restore BEFORE invalidating: the sweep walks task_links, so an
+            # edge that is not back yet is a child that silently stays released.
+            restored = _restore_skipped_child_links(conn, task_id)
+            if restored:
+                _append_event(
+                    conn, task_id, "restored_child_links", {"children": restored},
+                )
             result = invalidate_descendants_for_parent_reopen(
                 conn, task_id, author="operator",
             )

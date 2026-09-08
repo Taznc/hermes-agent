@@ -1589,3 +1589,201 @@ def test_notify_sub_starts_caught_up_on_active_task(kanban_home):
         conn.close()
 
 
+# ---------------------------------------------------------------------------
+# Dependency edges against already-satisfied archived parents
+# ---------------------------------------------------------------------------
+
+
+def _parent_edges(conn, task_id: str) -> list[str]:
+    return [
+        r[0] for r in conn.execute(
+            "SELECT child_id FROM task_links WHERE parent_id = ? ORDER BY child_id", (task_id,),
+        ).fetchall()
+    ]
+
+
+def _status(conn, task_id: str) -> str:
+    task = kb.get_task(conn, task_id)
+    assert task is not None
+    return task.status
+
+
+def test_link_against_archived_completed_parent_is_skipped_not_minted(kanban_home):
+    """An edge that would be born permanently satisfied is never persisted.
+
+    ``archive_task`` already deletes such an edge when the link is made first
+    and the parent archives second (``_clear_satisfied_outgoing_links``). The
+    reverse ordering — parent already archived-after-completion when the edge is
+    minted — used to leave a row that no gate ever consults and that every
+    link-resolving surface has to remember to filter. Both orderings must land
+    on the same board state, via BOTH mint paths (``create_task(parents=...)``
+    and ``link_tasks``), and the skip must be auditable.
+    """
+    conn = kbc.connect()
+    try:
+        parent = kb.create_task(conn, title="finished and filed away")
+        assert kb.complete_task(conn, parent)
+        assert kb.archive_task(conn, parent)
+
+        # Path 1: create_task(parents=[...]).
+        born = kb.create_task(conn, title="created under an archived parent", parents=[parent])
+        assert _parent_edges(conn, parent) == [], (
+            "create_task must not mint an edge against an archived-completed parent"
+        )
+        created = next(e for e in kb.list_events(conn, born) if e.kind == "created")
+        assert (created.payload or {}).get("skipped_parent_links") == [parent], (
+            "the skipped parent must be auditable on the created event"
+        )
+        # The dependency is genuinely met, so the child is released as usual.
+        assert _status(conn, born) == "ready"
+
+        # Path 2: link_tasks after the fact.
+        linked = kb.create_task(conn, title="linked to an archived parent")
+        kb.link_tasks(conn, parent, linked)
+        assert _parent_edges(conn, parent) == [], (
+            "link_tasks must not mint an edge against an archived-completed parent"
+        )
+        kinds = [e.kind for e in kb.list_events(conn, linked)]
+        assert "linked" not in kinds, "no edge was created, so none may be reported as linked"
+        skipped = next(e for e in kb.list_events(conn, linked) if e.kind == "link_skipped")
+        assert (skipped.payload or {}) == {
+            "parent": parent,
+            "child": linked,
+            "reason": "parent_archived_after_completion",
+        }
+        assert _status(conn, linked) == "ready"
+    finally:
+        conn.close()
+
+
+def test_archived_parent_without_completion_still_mints_a_gating_edge(kanban_home):
+    """A withdrawn parent was never satisfied: its edges are real and must gate.
+
+    The skip predicate is ``archived AND completed_at``, so an archived task that
+    never completed keeps minting genuine blockers through both paths.
+    """
+    conn = kbc.connect()
+    try:
+        withdrawn = kb.create_task(conn, title="withdrawn, never finished")
+        assert kb.archive_task(conn, withdrawn)
+
+        born = kb.create_task(conn, title="created under a withdrawn parent", parents=[withdrawn])
+        assert _parent_edges(conn, withdrawn) == [born]
+        assert _status(conn, born) == "todo"
+        assert kb._parents_satisfied(conn, born) is False
+        ok, reason = kb.promote_task(conn, born, actor="operator")
+        assert ok is False and withdrawn in (reason or "")
+
+        linked = kb.create_task(conn, title="linked to a withdrawn parent")
+        assert _status(conn, linked) == "ready"
+        kb.link_tasks(conn, withdrawn, linked)
+        assert _parent_edges(conn, withdrawn) == sorted([born, linked])
+        # Criterion 3: link_tasks' re-gate still demotes a ready child.
+        assert _status(conn, linked) == "todo"
+        assert any(e.kind == "linked" for e in kb.list_events(conn, linked))
+    finally:
+        conn.close()
+
+
+def test_done_parent_still_gets_a_real_edge_and_survives_reopen(kanban_home):
+    """A ``done`` parent is only PROVISIONALLY satisfied, so its edge is kept.
+
+    Reopening a done parent clears ``completed_at`` and retracts descendants via
+    ``invalidate_descendants_for_parent_reopen``, which walks ``task_links``.
+    Widening the skip from ``archived AND completed_at`` to the full
+    ``_parent_dependency_satisfied`` would silently strand every child linked
+    after its parent finished — this pins that it does not happen.
+    """
+    conn = kbc.connect()
+    try:
+        parent = kb.create_task(conn, title="done but not archived")
+        assert kb.complete_task(conn, parent)
+        child = kb.create_task(conn, title="linked after parent finished", parents=[parent])
+        assert _parent_edges(conn, parent) == [child], (
+            "a done (not archived) parent must keep a real edge — reopening it "
+            "has to be able to find and retract this child"
+        )
+        assert _status(conn, child) == "ready"
+
+        # The done-reopen path every surface routes through.
+        result = kb.invalidate_descendants_for_parent_reopen(
+            conn, parent, author="operator",
+        )
+        assert [entry["id"] for entry in result["invalidated"]] == [child], (
+            "reopening the parent must find and retract the child through its edge"
+        )
+        assert _status(conn, child) == "todo"
+    finally:
+        conn.close()
+
+
+def test_unarchive_restores_a_skipped_link_and_regates_the_child(kanban_home):
+    """Reopen semantics for the skipped edge — the whole point of the skip.
+
+    A skip is only correct while the parent's completion evidence is permanent.
+    Reopening the parent withdraws it, so the deferred edge is re-minted from the
+    audit trail and the child that was released on that evidence is retracted.
+    Anything less would leave a user looking at a card they believe is linked
+    while the board quietly lets it run — which is exactly the failure mode the
+    card warned about.
+    """
+    conn = kbc.connect()
+    try:
+        parent = kb.create_task(conn, title="archived, then reopened")
+        assert kb.complete_task(conn, parent)
+        assert kb.archive_task(conn, parent)
+        via_create = kb.create_task(conn, title="skipped via create", parents=[parent])
+        via_link = kb.create_task(conn, title="skipped via link")
+        kb.link_tasks(conn, parent, via_link)
+        assert _parent_edges(conn, parent) == []
+        assert _status(conn, via_create) == "ready"
+        assert _status(conn, via_link) == "ready"
+
+        assert kb.unarchive_task(conn, parent, status="todo")
+        reopened = kb.get_task(conn, parent)
+        assert reopened is not None and reopened.completed_at is None
+        assert _parent_edges(conn, parent) == sorted([via_create, via_link]), (
+            "both skip records must be replayed into real edges on reopen"
+        )
+        assert _status(conn, via_create) == "todo"
+        assert _status(conn, via_link) == "todo"
+        restored = next(
+            e for e in kb.list_events(conn, parent) if e.kind == "restored_child_links"
+        )
+        assert sorted((restored.payload or {})["children"]) == sorted([via_create, via_link])
+    finally:
+        conn.close()
+
+
+def test_unarchive_does_not_revive_a_link_the_operator_cut(kanban_home):
+    """An explicit unlink outranks a replayed skip.
+
+    The restore reads the audit trail, so without this guard reopening a parent
+    would resurrect an edge a human had deliberately removed — overturning their
+    decision with no trace.
+    """
+    conn = kbc.connect()
+    try:
+        parent = kb.create_task(conn, title="archived parent")
+        assert kb.complete_task(conn, parent)
+        assert kb.archive_task(conn, parent)
+        child = kb.create_task(conn, title="child whose edge is cut", parents=[parent])
+        # The operator cuts the (already absent) dependency: the unlink is a
+        # no-op on rows but records the intent, and that intent must stick.
+        kb.unlink_tasks(conn, parent, child)
+        conn.execute(
+            "INSERT INTO task_events (task_id, kind, payload, created_at) VALUES (?, ?, ?, ?)",
+            (child, "unlinked", json.dumps({"parent": parent, "child": child}), int(time.time())),
+        )
+        conn.commit()
+
+        assert kb.unarchive_task(conn, parent, status="todo")
+        assert _parent_edges(conn, parent) == [], (
+            "a pair the operator explicitly unlinked must not be restored"
+        )
+        assert _status(conn, child) == "ready"
+    finally:
+        conn.close()
+
+
+
