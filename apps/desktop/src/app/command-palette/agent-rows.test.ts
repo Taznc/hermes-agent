@@ -89,6 +89,19 @@ describe('buildAgentPaletteRows active identity', () => {
     expect(rows.find(row => !row.isLocal)?.isActive).toBe(false)
   })
 
+  it('marks the LOCAL row active when this device is live as the registry `local` source', () => {
+    // Two doors land the window on this device and they publish different
+    // active ids: the legacy profile-only path leaves the connection null,
+    // while a registry switch (selectConnection, which these rows now use)
+    // publishes the reserved `local` id. Both are the same machine, so the
+    // same one row must be active — otherwise switching to This device via the
+    // palette leaves no row marked and the switch looks like it did nothing.
+    const rows = build({ activeConnectionId: 'local', activeProfile: 'default' })
+
+    expect(rows.find(row => row.isLocal)?.isActive).toBe(true)
+    expect(rows.find(row => !row.isLocal)?.isActive).toBe(false)
+  })
+
   it('marks the REMOTE row active when dialed through its connection', () => {
     const rows = build({ activeConnectionId: 'hermes-dev', activeProfile: 'default' })
 
@@ -97,7 +110,7 @@ describe('buildAgentPaletteRows active identity', () => {
   })
 
   it('never marks two rows active for the same profile name across sources', () => {
-    for (const activeConnectionId of [null, 'hermes-dev']) {
+    for (const activeConnectionId of [null, 'local', 'hermes-dev']) {
       const active = build({ activeConnectionId, activeProfile: 'default' }).filter(row => row.isActive)
 
       expect(active).toHaveLength(1)
@@ -106,10 +119,13 @@ describe('buildAgentPaletteRows active identity', () => {
 })
 
 describe('buildAgentPaletteRows row shape', () => {
-  it('gives local rows a null connectionId so selectAgent takes the profile path', () => {
+  it('carries the registry connection id verbatim, local included', () => {
+    // Rows are handed straight to selectConnection, which resolves every source
+    // through the registry — including its reserved `local` entry. A null
+    // sentinel here would have to be translated back at the call site.
     const rows = build()
 
-    expect(rows.find(row => row.isLocal)?.connectionId).toBeNull()
+    expect(rows.find(row => row.isLocal)?.connectionId).toBe('local')
     expect(rows.find(row => !row.isLocal)?.connectionId).toBe('hermes-dev')
   })
 

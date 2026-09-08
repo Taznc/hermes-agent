@@ -1,7 +1,7 @@
 import { invalidateSlashCompletions } from '@/lib/slash-completion-cache'
 import { refreshBackgroundProcesses } from '@/store/composer-status'
 import { flashPetActivity, setPetActivity } from '@/store/pet'
-import { hasBlockingPromptRequest } from '@/store/prompts'
+import { hasPendingInputRequest } from '@/store/prompts'
 import { pruneDelegateFallbackSubagents, upsertSubagent } from '@/store/subagents'
 import { reportMcpToolResult } from '@/store/suggestion-providers/repair'
 import { invalidateSkillSuggestionIndex } from '@/store/suggestion-providers/skill'
@@ -90,9 +90,12 @@ export function handleToolEvent(ctx: GatewayEventContext): boolean {
       // the sidebar indicator clears as soon as it's answered, not only at
       // message.complete. But a turn can hold several prompts at once: an
       // unrelated background tool finishing must not clear the flag while an
-      // approval/sudo/secret bar is still on screen waiting on the user.
+      // approval/sudo/secret bar — or a clarify card the user hasn't answered
+      // yet — is still on screen waiting on them. Answering a clarify drops
+      // its request BEFORE the resolving tool.complete lands, so this stays
+      // the site that clears the badge on the normal path.
       updateSessionState(sessionId, state =>
-        state.needsInput && !hasBlockingPromptRequest(sessionId) ? { ...state, needsInput: false } : state
+        state.needsInput && !hasPendingInputRequest(sessionId) ? { ...state, needsInput: false } : state
       )
 
       // terminal/process tool calls are the only things that spawn or reap

@@ -3,16 +3,22 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
 import type { HermesConnection } from '@/global'
 
-// selectAgent — the registry-aware sibling of selectProfile, and the door the
-// command palette's "Agents & connections" rows go through.
+// selectAgent — the registry-aware sibling of selectProfile, and the IN-SOURCE
+// door the fleet rail uses to pick another profile on the connection it is
+// already enumerating.
 //
 // The invariant that earns this file: "am I switching?" must be judged on the
 // (connection, profile) PAIR. The same profile name commonly exists on several
 // registered sources, so comparing profile keys alone silently treats
 // local `default` → remote `default` as a no-op — the user picks their remote
 // box, nothing re-homes, and the window stays on the local backend. That is the
-// exact confusion #85731 reports from the rail, and it must not be reproduced
-// in the palette.
+// exact confusion #85731 reports from the rail.
+//
+// Cross-source switching is NOT this door: every such switch goes through
+// store/connections selectConnection's two-phase commit (see
+// app/command-palette/agent-row-switch.test.ts). selectAgent stays for the
+// same-machine profile pick, where that commit's machine-context reset would
+// close terminals and wipe session lists the user is still looking at.
 
 // A truthy resolution means "activation landed" — resolving false models a
 // disposed target, which must publish nothing.
@@ -124,18 +130,19 @@ describe('selectAgent switches on the (connection, profile) pair', () => {
     expect($freshSessionRequest.get()).toBe(before)
   })
 
-  it('tracks the active connection so a later local switch is seen as a change', async () => {
+  it('tracks the active connection so a later switch is seen as a change', async () => {
     selectAgent('hermes-dev', 'default')
     await settle()
     expect($activeGatewayConnection.get()).toBe('hermes-dev')
 
-    // Back to this device: the local pool path must clear the connection, or the
-    // next remote selection would compare against a stale id.
-    selectAgent(null, 'default')
+    // Onto the registry's own local entry: still an agent dial, and the
+    // published connection must follow, or the next selection would compare
+    // against a stale id.
+    selectAgent('local', 'default')
     await settle()
 
-    expect(ensureGatewayForProfile).toHaveBeenCalledWith('default')
-    expect($activeGatewayConnection.get()).toBeNull()
+    expect(ensureGatewayForAgent).toHaveBeenLastCalledWith('local', 'default')
+    expect($activeGatewayConnection.get()).toBe('local')
   })
 
   it('leaves the all-profiles browse view and points new chats at the target', async () => {
@@ -148,20 +155,26 @@ describe('selectAgent switches on the (connection, profile) pair', () => {
     expect($newChatProfile.get()).toBe('research')
   })
 
-  it('delegates a null/local connectionId to the plain profile path', async () => {
-    selectAgent(null, 'research')
+  it('never falls through to the local-pool profile door', async () => {
+    // The pair IS the identity. Falling back to ensureGatewayProfile here would
+    // re-home the window to this device's same-named profile — the #92194
+    // class — so an agent pick must always dial its own connection.
+    selectAgent('hermes-dev', 'research')
     await settle()
 
-    expect(ensureGatewayForProfile).toHaveBeenCalledWith('research')
-    expect(ensureGatewayForAgent).not.toHaveBeenCalled()
-    expect($activeGatewayConnection.get()).toBeNull()
+    expect(ensureGatewayForAgent).toHaveBeenCalledWith('hermes-dev', 'research')
+    expect(ensureGatewayForProfile).not.toHaveBeenCalled()
   })
 
-  it('treats a whitespace-only connectionId as local rather than dialing it', async () => {
+  it('ignores a whitespace-only connectionId rather than dialing anything', async () => {
+    // No connection means no (connection, profile) pair, so there is nothing
+    // this door can identify. It must not silently retarget the local pool:
+    // that is an authoritative write to a source the caller never named.
     selectAgent('   ', 'research')
     await settle()
 
     expect(ensureGatewayForAgent).not.toHaveBeenCalled()
-    expect(ensureGatewayForProfile).toHaveBeenCalledWith('research')
+    expect(ensureGatewayForProfile).not.toHaveBeenCalled()
+    expect($activeGatewayProfile.get()).toBe('default')
   })
 })
