@@ -162,12 +162,130 @@ def test_connect_migrates_legacy_db_before_optional_column_indexes(tmp_path):
     assert "session_id" in task_columns
     assert "tenant" in task_columns
     assert "idempotency_key" in task_columns
+    assert "created_by_task" in task_columns
+    assert "created_by_run" in task_columns
     assert "run_id" in event_columns
     # And their indexes — the regression scope of this test:
     assert "idx_tasks_session_id" in indexes
     assert "idx_tasks_tenant" in indexes
     assert "idx_tasks_idempotency" in indexes
     assert "idx_events_run" in indexes
+
+
+def test_connect_migrates_legacy_task_runs_adds_analytics_columns(tmp_path):
+    """Legacy DBs whose ``task_runs`` predates the analytics-capture columns
+
+    (model/provider/reasoning_effort/model_source/session_id/token+call
+    totals/estimated_cost_usd) migrate cleanly: the columns appear, existing
+    rows stay NULL, and a fresh insert + read-back round-trips through the
+    new columns without a schema error."""
+    db_path = tmp_path / "legacy-runs-kanban.db"
+    conn = sqlite3.connect(str(db_path))
+    conn.execute(
+        """
+        CREATE TABLE tasks (
+            id TEXT PRIMARY KEY,
+            title TEXT NOT NULL,
+            body TEXT,
+            assignee TEXT,
+            status TEXT NOT NULL,
+            priority INTEGER NOT NULL DEFAULT 0,
+            created_by TEXT,
+            created_at INTEGER NOT NULL,
+            started_at INTEGER,
+            completed_at INTEGER,
+            workspace_kind TEXT NOT NULL DEFAULT 'scratch',
+            workspace_path TEXT,
+            claim_lock TEXT,
+            claim_expires INTEGER
+        )
+        """
+    )
+    conn.execute(
+        """
+        CREATE TABLE task_events (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            task_id TEXT NOT NULL,
+            kind TEXT NOT NULL,
+            payload TEXT,
+            created_at INTEGER NOT NULL
+        )
+        """
+    )
+    # Pre-analytics-capture ``task_runs`` shape (matches the schema before
+    # this migration — no model/provider/token/session_id columns).
+    conn.execute(
+        """
+        CREATE TABLE task_runs (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            task_id TEXT NOT NULL,
+            profile TEXT,
+            step_key TEXT,
+            status TEXT NOT NULL,
+            claim_lock TEXT,
+            claim_expires INTEGER,
+            worker_pid INTEGER,
+            max_runtime_seconds INTEGER,
+            last_heartbeat_at INTEGER,
+            started_at INTEGER NOT NULL,
+            ended_at INTEGER,
+            outcome TEXT,
+            summary TEXT,
+            metadata TEXT,
+            error TEXT
+        )
+        """
+    )
+    conn.execute(
+        "INSERT INTO tasks (id, title, status, created_at) "
+        "VALUES ('legacy', 'old board task', 'ready', 1)"
+    )
+    conn.execute(
+        "INSERT INTO task_runs (task_id, status, started_at) "
+        "VALUES ('legacy', 'done', 1)"
+    )
+    conn.commit()
+    conn.close()
+
+    with kbc.connect(db_path) as migrated:
+        run_columns = {row["name"] for row in migrated.execute("PRAGMA table_info(task_runs)")}
+        for col in (
+            "model", "provider", "reasoning_effort", "model_source", "session_id",
+            "input_tokens", "output_tokens", "cache_read_tokens", "reasoning_tokens",
+            "api_calls", "tool_calls", "estimated_cost_usd",
+        ):
+            assert col in run_columns, f"missing migrated column: {col}"
+
+        # Pre-migration row survives with every new column NULL.
+        legacy_row = migrated.execute(
+            "SELECT model, provider, session_id, input_tokens, estimated_cost_usd "
+            "FROM task_runs WHERE task_id = 'legacy'"
+        ).fetchone()
+        assert tuple(legacy_row) == (None, None, None, None, None)
+
+        # A fresh insert can populate every new column and read back exactly.
+        migrated.execute(
+            "INSERT INTO task_runs ("
+            "    task_id, status, started_at, model, provider, reasoning_effort,"
+            "    model_source, session_id, input_tokens, output_tokens,"
+            "    cache_read_tokens, reasoning_tokens, api_calls, tool_calls,"
+            "    estimated_cost_usd"
+            ") VALUES ("
+            "    'legacy', 'done', 2, 'claude-sonnet-5', 'anthropic', 'high',"
+            "    'card_override', '20260101_000000_abcdef', 100, 50, 10, 5, 3, 7, 0.05"
+            ")"
+        )
+        migrated.commit()
+        row = migrated.execute(
+            "SELECT model, provider, reasoning_effort, model_source, session_id, "
+            "input_tokens, output_tokens, cache_read_tokens, reasoning_tokens, "
+            "api_calls, tool_calls, estimated_cost_usd "
+            "FROM task_runs WHERE started_at = 2"
+        ).fetchone()
+        assert tuple(row) == (
+            "claude-sonnet-5", "anthropic", "high", "card_override",
+            "20260101_000000_abcdef", 100, 50, 10, 5, 3, 7, 0.05,
+        )
 
 
 def test_connect_migrates_legacy_task_comments_adds_choice_json(tmp_path):
@@ -1210,9 +1328,8 @@ class TestSharedBoardPaths:
     ):
         # The dispatcher must pin board paths while stripping any unrelated
         # HERMES_SESSION_* identity inherited from the long-lived gateway.
-        # The one exception is HERMES_SESSION_SOURCE, which the dispatcher
-        # re-sets to its own `kanban` tag AFTER the strip — a value it owns,
-        # never one inherited from whatever the gateway last routed.
+        # It then sets its own source tag and freshly generated worker session
+        # id AFTER the strip; neither value may come from stale gateway routing.
         default_home = tmp_path / ".hermes"
         default_home.mkdir()
         self._set_home(monkeypatch, tmp_path, default_home)
@@ -1270,6 +1387,10 @@ class TestSharedBoardPaths:
                 # Re-set by the dispatcher, so what matters is that it carries
                 # the worker's own tag rather than the inherited routing value.
                 assert env[key] == "kanban"
+                continue
+            if key == "HERMES_SESSION_ID":
+                assert env[key] == getattr(task, "_worker_session_id")
+                assert env[key] != "stale-routing-value"
                 continue
             assert key not in env
 
