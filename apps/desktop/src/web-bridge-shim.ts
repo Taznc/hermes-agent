@@ -42,6 +42,8 @@
 
 import { markWebReloadPending, registerNativeWebReload } from '@/store/web-reload'
 
+import { createAgentOverviewReader } from '../electron/agent-overview'
+
 // ── HMR full-reload trap (DEV only) ─────────────────────────────────────────
 // Vite's built-in HMR client calls window.location.reload() directly whenever
 // an edited module can't Fast Refresh (any file that also exports a
@@ -301,6 +303,29 @@ function pickBrowserFiles(options?: { multiple?: boolean; filters?: Array<{ exte
     document.body.appendChild(input)
     input.click()
   })
+}
+
+// One backend: the same-origin `hermes serve` this shim's api() helper talks
+// to. `pooled` is pre-populated with a single non-empty descriptor array so
+// collectAgentOverview() short-circuits both the `connect()` round-trip and
+// the on-demand `discoverParked` branch — there's nothing to discover, this
+// IS the backend. The reader instance (and its internal 60s history cache)
+// is created once per module evaluation, mirroring Electron's module-scoped
+// `readAgentOverview` singleton in electron/main.ts.
+const AGENT_OVERVIEW_SOURCE = { id: 'web', label: 'This backend', kind: 'local' } as const
+const AGENT_OVERVIEW_POOLED = new Map<string, string[]>([[AGENT_OVERVIEW_SOURCE.id, ['web']]])
+const readAgentOverview = createAgentOverviewReader<string>()
+
+function getAgentOverview(options?: { force?: boolean }) {
+  return readAgentOverview(
+    {
+      sources: [AGENT_OVERVIEW_SOURCE],
+      pooled: AGENT_OVERVIEW_POOLED,
+      connect: async () => [],
+      fetch: (_descriptor, path) => api({ path })
+    },
+    { force: options?.force }
+  )
 }
 
 function connection(profile?: string | null) {
@@ -643,6 +668,13 @@ const shim = {
     get: async () => ({ profile: null }),
     set: async (name: string | null) => ({ profile: name })
   },
+
+  // Sessions/agents overview (Agents → Sessions tab). Single-backend web
+  // build: one source (`AGENT_OVERVIEW_SOURCE`), the same-origin server
+  // this shim already talks to via api(). Reuses the pure collector from
+  // electron/agent-overview.ts — same pagination, 60s history cache, and
+  // missingCapability() 404/405/501 fallback Electron's IPC handler uses.
+  getAgentOverview,
 
   // ── data layer ───────────────────────────────────────────────────────────
   api,
