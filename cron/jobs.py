@@ -2053,6 +2053,49 @@ def trigger_job(job_id: str, extra_prompt: Optional[str] = None) -> Optional[Dic
     })
 
 
+def arm_interrupted_retry(job_id: str, stamp: Dict[str, Any]) -> str:
+    """Atomically re-check eligibility and arm the single replay of a lost occurrence.
+
+    Returns one of ``armed``, ``already_armed``, ``outstanding``, ``disabled``, ``missing``.
+
+    Both halves of arming — the run-now fields and the ``interrupted_retry`` stamp that bounds the
+    replay to one — are written in ONE ``update_job`` call inside ONE ``_jobs_lock()`` hold, and
+    the eligibility re-read happens inside that same hold. That closes two windows the split
+    version had: persisting the run-now intent without the loop bound (a restart storm could then
+    re-arm forever), and reading a runnable job, then re-enabling it via ``trigger_job`` after an
+    operator's pause landed. A concurrent pause, removal, or rival stamp now wins outright and is
+    reported here rather than being silently undone.
+
+    ``already_armed`` is the crash-recovery answer: an earlier pass committed this same
+    occurrence's arm but died before recording its ledger decision, so the caller may finish that
+    decision instead of arming a second time.
+    """
+    with _jobs_lock():
+        job = get_job(job_id)
+        if job is None:
+            return "missing"
+        existing = job.get("interrupted_retry") or {}
+        if existing:
+            return (
+                "already_armed"
+                if existing.get("execution_id") == stamp.get("execution_id")
+                else "outstanding"
+            )
+        if is_terminal_job(job) or not is_job_runnable(job):
+            return "disabled"
+        manual_run_at = _hermes_now().isoformat()
+        update_job(job_id, {
+            "enabled": True,
+            "state": "scheduled",
+            "paused_at": None,
+            "paused_reason": None,
+            "next_run_at": manual_run_at,
+            "manual_run_at": manual_run_at,
+            "interrupted_retry": stamp,
+        })
+        return "armed"
+
+
 def _claim_is_live(claim: Any, now: datetime, ttl_seconds: float) -> bool:
     """True for a well-formed claim aged within ``[0, ttl)``: future-dated (clock/TZ skew) or
     malformed claims count as stale so they can never wedge a job."""

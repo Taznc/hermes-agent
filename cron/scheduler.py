@@ -2726,16 +2726,16 @@ _OWNERSHIP_LOST_INTERRUPTED = "Interrupted by shutdown before terminal completio
 _DRAIN_INTERRUPTED = "Interrupted by gateway shutdown before terminal completion."
 
 
-def _record_interruption(job: dict, execution_id: str, error: str) -> None:
-    """Terminalize an interrupted attempt and raise its incident.
+def _record_interruption(execution_id: str, error: str) -> None:
+    """Terminalize an interrupted attempt as a durable ledger fact.
 
-    The ledger flag and the incident are written together because they answer the same question
-    from two surfaces: ``hermes cron history`` (what happened to this attempt) and ``hermes cron
-    incidents`` (what is broken, deduplicated). Incident recording is best-effort — the ledger
-    write is the durable part and must not be lost to a store error.
+    The incident is deliberately NOT raised here. Interruptions arrive from four places (this
+    drain, fire-ownership loss, dead-owner restart recovery, and rows adopted by the ledger
+    migration), and only ``cron.interrupted_retry`` sees all four — exactly once each, gated by
+    the ``retry_state`` compare-and-swap. Raising there also means the incident is written by a
+    process that is still alive, rather than by one being torn down mid-shutdown.
     """
     finish_execution(execution_id, success=False, error=error, interrupted=True)
-    _upsert_incident_for_failure(job, error)
 
 
 def _record_fire_ownership_lost(job_id: str, fire_owner: Optional[str], execution_id: str) -> None:
@@ -2748,8 +2748,7 @@ def _record_fire_ownership_lost(job_id: str, fire_owner: Optional[str], executio
     """
     if fire_owner is not None and heartbeat_fire_claim(job_id, expected_owner=fire_owner):
         mark_job_run(job_id, False, _OWNERSHIP_LOST_INTERRUPTED, expected_fire_owner=fire_owner)
-        _record_interruption(
-            {"id": job_id}, execution_id, _OWNERSHIP_LOST_INTERRUPTED)
+        _record_interruption(execution_id, _OWNERSHIP_LOST_INTERRUPTED)
     else:
         finish_execution(
             execution_id, success=False,
@@ -2958,7 +2957,7 @@ def _finish_interrupted_run(job: dict, execution_id: str, delivery_error: Option
         except Exception as _rec_err:
             logger.debug(
                 "Failed recording delivery_error for interrupted job %s: %s", job["id"], _rec_err)
-    _record_interruption(job, execution_id, _DRAIN_INTERRUPTED)
+    _record_interruption(execution_id, _DRAIN_INTERRUPTED)
 
 
 def _finish_completed_run(d: _RunDelivery, fire_owner: Optional[str], execution_id: str) -> bool:

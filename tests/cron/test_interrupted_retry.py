@@ -112,17 +112,21 @@ class TestInterruptionFailureType:
         assert incidents._classify_failure_type("provider inference error") == "agent"
 
 
-class TestSchedulerRaisesInterruptionIncidents:
-    """The three interruption write paths must flag the ledger AND surface an incident.
+class TestSchedulerFlagsInterruptedAttempts:
+    """The three interruption write paths must flag the ledger; the reconciler raises the
+    incident from that flag (see ``test_interrupted_retry_incidents.py``).
 
     Before this, an interrupted occurrence wrote a terminal ledger row nobody classified and
-    NOTHING in ``hermes cron incidents`` — the silent-loss the card is about.
+    NOTHING in ``hermes cron incidents`` — the silent-loss the card is about. Splitting the two
+    keeps the dying process's job small and durable: it records the fact, and the surviving
+    process that reconciles the ledger is what reports it.
     """
 
     def _point(self, monkeypatch, tmp_path):
         monkeypatch.setattr(executions, "EXECUTIONS_FILE", tmp_path / "cron" / "executions.db")
+        monkeypatch.setattr(incidents, "EXECUTIONS_FILE", tmp_path / "cron" / "incidents.db")
 
-    def test_shutdown_drain_records_an_interruption_incident(self, monkeypatch, tmp_path):
+    def test_shutdown_drain_flags_the_attempt_as_interrupted(self, monkeypatch, tmp_path):
         import cron.scheduler as sched
 
         self._point(monkeypatch, tmp_path)
@@ -133,10 +137,8 @@ class TestSchedulerRaisesInterruptionIncidents:
 
         stored = executions.get_execution(record["id"])
         assert stored["interrupted"] == 1
-        raised = incidents.list_incidents()
-        assert [inc["failure_type"] for inc in raised] == ["interruption"]
-        assert raised[0]["job_id"] == "drained-job"
-        assert raised[0]["state"] == "detected"
+        assert stored["status"] == "failed"
+        assert stored["retry_state"] is None, "the replay decision belongs to the reconciler"
 
     def test_ownership_loss_under_a_held_claim_is_an_interruption(self, monkeypatch, tmp_path):
         import cron.scheduler as sched
@@ -149,7 +151,6 @@ class TestSchedulerRaisesInterruptionIncidents:
         sched._record_fire_ownership_lost("owned-job", "owner-1", record["id"])
 
         assert executions.get_execution(record["id"])["interrupted"] == 1
-        assert [inc["failure_type"] for inc in incidents.list_incidents()] == ["interruption"]
 
     def test_intentional_cancellation_is_not_an_interruption(self, monkeypatch, tmp_path):
         """A discarded stale result (replacement owner / transport cancel) is deliberate: it must
@@ -163,11 +164,12 @@ class TestSchedulerRaisesInterruptionIncidents:
         sched._record_fire_ownership_lost("cancelled-job", "stale-owner", record["id"])
 
         assert executions.get_execution(record["id"])["interrupted"] == 0
+        assert executions.list_undecided_interruptions() == []
         assert incidents.list_incidents() == []
 
-    def test_interruption_incidents_dedupe_across_repeated_shutdowns(
-        self, monkeypatch, tmp_path
-    ):
+    def test_repeated_shutdowns_leave_one_undecided_row_each(self, monkeypatch, tmp_path):
+        """Each lost occurrence is its own reconcilable row; deduplication happens in the
+        incident store, not by dropping ledger history."""
         import cron.scheduler as sched
 
         self._point(monkeypatch, tmp_path)
@@ -176,7 +178,5 @@ class TestSchedulerRaisesInterruptionIncidents:
             record = executions.create_execution(job["id"], source="builtin")
             sched._finish_interrupted_run(job, record["id"], None)
 
-        raised = incidents.list_incidents()
-        assert len(raised) == 1
-        assert raised[0]["failure_type"] == "interruption"
+        assert len(executions.list_undecided_interruptions()) == 3
 

@@ -37,6 +37,32 @@ RECOVERED_INTERRUPTION_ERROR = (
 _lock = threading.RLock()
 _PROCESS_ID = uuid.uuid4().hex
 
+# Interruption error text written before the ``interrupted`` column existed. Matching on text is
+# wrong for NEW rows (that is the whole point of the column), but it is the only evidence the
+# already-recorded rows carry, and adopting them once at migration time is what makes the failures
+# that motivated this feature visible instead of stranding them as untyped ``unknown`` history.
+_LEGACY_INTERRUPTION_ERRORS = (
+    "Interrupted by shutdown before terminal completion.",
+    "Interrupted by gateway shutdown before terminal completion.",
+    RECOVERED_INTERRUPTION_ERROR,
+)
+
+
+def _adopt_legacy_interruptions(conn: sqlite3.Connection) -> int:
+    """Backfill ``interrupted`` for pre-migration rows; returns how many were adopted.
+
+    Runs exactly once, in the transaction that adds the column, so it can never re-classify a row
+    the running code has since written. Only terminal failures are considered: a completed run is
+    never an interruption whatever its error text says.
+    """
+    placeholders = ",".join("?" for _ in _LEGACY_INTERRUPTION_ERRORS)
+    cur = conn.execute(
+        f"""UPDATE executions SET interrupted=1
+            WHERE status IN ('failed','unknown') AND error IN ({placeholders})""",
+        _LEGACY_INTERRUPTION_ERRORS,
+    )
+    return cur.rowcount or 0
+
 
 # --- executions ledger --------------------------------------------------------------------------
 
@@ -76,10 +102,11 @@ def _initialize_schema(conn: sqlite3.Connection) -> None:
     # Durable interruption facts. ``interrupted`` says an attempt died to a shutdown/abandonment
     # rather than to its own failure — a persisted fact, not a substring match on ``error``.
     # ``retry_state`` is the at-most-once replay decision for that occurrence (NULL = undecided).
-    add_column_if_missing(
+    if add_column_if_missing(
         conn, "executions", "interrupted",
         "interrupted INTEGER NOT NULL DEFAULT 0",
-    )
+    ):
+        _adopt_legacy_interruptions(conn)
     add_column_if_missing(conn, "executions", "retry_state", "retry_state TEXT")
     conn.execute(
         "CREATE INDEX IF NOT EXISTS idx_executions_job_claimed "

@@ -34,6 +34,10 @@ from hermes_time import now as _hermes_now
 logger = logging.getLogger(__name__)
 
 DEFAULT_MAX_AGE_MINUTES = 60.0
+# The explicit incident type for a shutdown interruption. Passed to ``upsert_incident`` rather
+# than left to text classification, so an interruption is never reported as the failure class its
+# half-written error text happens to mention.
+INTERRUPTION_FAILURE_TYPE = "interruption"
 # Ledger ``retry_state`` values. "scheduled" is the only one that replays; the rest are recorded
 # reasons a lost occurrence was deliberately not replayed.
 RETRY_SCHEDULED = "scheduled"
@@ -84,6 +88,30 @@ def _job_has_live_attempt(job_id: str) -> bool:
     )
 
 
+def _raise_interruption_incident(record: Dict[str, Any]) -> None:
+    """Surface one interrupted occurrence in ``hermes cron incidents``.
+
+    Raised here, from the ledger flag, rather than at each interruption write site: this is the
+    one place every interrupted row passes through exactly once (the ``retry_state`` CAS gates
+    it), so dead-owner recovery, the shutdown drain, fire-ownership loss and rows backfilled by
+    the schema migration all reach the incident store on equal terms — and none of them raises
+    twice when the reconciler runs again.
+
+    ``failure_type`` is passed explicitly: an interruption is a fact about the process, and the
+    error text of a run killed mid-flight may name any other failure class.
+    """
+    from cron.executions import RECOVERED_INTERRUPTION_ERROR
+    from cron.incidents import upsert_incident
+    from cron.jobs import get_job
+
+    job_id = str(record.get("job_id") or "")
+    job = get_job(job_id) or {}
+    upsert_incident(
+        job_id, str(record.get("error") or RECOVERED_INTERRUPTION_ERROR),
+        job_name=job.get("name"), failure_type=INTERRUPTION_FAILURE_TYPE,
+    )
+
+
 def _decide(record: Dict[str, Any], max_age_minutes: float) -> tuple[str, Optional[Dict[str, Any]]]:
     """Classify one undecided interruption. Returns ``(decision, job)``; ``job`` is set only when
     the decision is to replay."""
@@ -106,19 +134,28 @@ def _decide(record: Dict[str, Any], max_age_minutes: float) -> tuple[str, Option
     return RETRY_SCHEDULED, job
 
 
-def _arm_retry(job: Dict[str, Any], record: Dict[str, Any]) -> bool:
-    """Re-arm the lost occurrence to fire on the next tick, stamped for diagnosis."""
-    from cron.jobs import trigger_job, update_job
+def _arm_retry(record: Dict[str, Any]) -> str:
+    """Re-arm the lost occurrence to fire on the next tick, stamped for diagnosis.
 
-    job_id = job["id"]
-    if trigger_job(job_id) is None:
-        return False
-    update_job(job_id, {"interrupted_retry": {
+    Returns the ``arm_interrupted_retry`` outcome. Eligibility is re-checked inside the job-store
+    lock there, so a pause/removal/rival stamp that lands after ``_decide`` read the job wins and
+    comes back as a decline rather than being undone by this arm.
+    """
+    from cron.jobs import arm_interrupted_retry
+
+    return arm_interrupted_retry(str(record.get("job_id") or ""), {
         "execution_id": record.get("id"),
         "interrupted_at": record.get("finished_at") or record.get("claimed_at"),
         "scheduled_at": _hermes_now().isoformat(),
-    }})
-    return True
+    })
+
+
+# How an arm outcome that is not a successful arm maps onto a recorded ledger decision.
+_ARM_DECLINE = {
+    "missing": DECLINE_JOB_MISSING,
+    "disabled": DECLINE_DISABLED,
+    "outstanding": DECLINE_RETRY_OUTSTANDING,
+}
 
 
 def reconcile_interrupted_executions(limit: int = 50) -> int:
@@ -126,6 +163,13 @@ def reconcile_interrupted_executions(limit: int = 50) -> int:
 
     Safe to call on every scheduler startup and periodically: each occurrence is decided exactly
     once, and a decision is durable across restarts.
+
+    **Ordering matters.** The retry is armed BEFORE its decision is committed to the ledger, and
+    arming is idempotent for the same occurrence. A crash between the two therefore leaves the
+    occurrence still undecided — the next sweep sees it, gets ``already_armed`` back, and records
+    the decision it owed. The reverse order (the round-1 implementation) could commit
+    ``scheduled`` and then die, stranding the occurrence as decided-but-never-run, which is the
+    silent loss this whole feature exists to prevent.
     """
     from cron.executions import claim_retry_decision, list_undecided_interruptions
 
@@ -137,20 +181,29 @@ def reconcile_interrupted_executions(limit: int = 50) -> int:
                 decision, job = DECLINE_DISABLED_BY_CONFIG, None
             else:
                 decision, job = _decide(record, max_age_minutes)
-            # Claim BEFORE re-arming: losing the CAS means another reconciler owns this
-            # occurrence, and re-arming anyway would duplicate the run.
+            armed = False
+            if decision == RETRY_SCHEDULED and job is not None:
+                outcome = _arm_retry(record)
+                armed = outcome in ("armed", "already_armed")
+                if not armed:
+                    decision = _ARM_DECLINE.get(outcome, DECLINE_DISABLED)
+            # The CAS is the at-most-once gate: losing it means another reconciler already owns
+            # this occurrence's decision, so this pass records nothing further about it.
             if not claim_retry_decision(record["id"], decision):
                 continue
-            if decision != RETRY_SCHEDULED or job is None:
+            # Winning the CAS makes this pass the sole owner of the occurrence, so the incident is
+            # raised here — once, whatever the replay decision turned out to be. A declined
+            # occurrence is still a lost one and must be visible.
+            _raise_interruption_incident(record)
+            if not armed:
                 logger.info(
                     "Cron occurrence %s for job %s was interrupted and not replayed (%s)",
                     record.get("id"), record.get("job_id"), decision)
                 continue
-            if _arm_retry(job, record):
-                scheduled += 1
-                logger.warning(
-                    "Replaying cron job '%s' occurrence lost to a shutdown (attempt %s)",
-                    job.get("name") or job["id"], record.get("id"))
+            scheduled += 1
+            logger.warning(
+                "Replaying cron job '%s' occurrence lost to a shutdown (attempt %s)",
+                (job or {}).get("name") or record.get("job_id"), record.get("id"))
         except Exception as exc:
             # One malformed record must not stop the rest from being reconciled.
             logger.debug("Interrupted-retry reconcile failed for %s: %s", record.get("id"), exc)
