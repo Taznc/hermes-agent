@@ -112,8 +112,8 @@ const rows = (graph: DependencyGraph, id: string, index: Map<string, KanbanTask>
   resolveLinks([...upstreamOf(graph, id)], index)
 
 describe('gating status', () => {
-  it('clears the gate on exactly done and archived', () => {
-    expect([...GATING_CLEARED].sort()).toEqual(['archived', 'done'])
+  it('clears the gate on exactly done, archived, and the two wishlist lanes', () => {
+    expect([...GATING_CLEARED].sort()).toEqual(['archived', 'done', 'idea', 'roadmap'])
   })
 
   it('does not gate on done — the dispatcher promotion rule', () => {
@@ -122,6 +122,10 @@ describe('gating status', () => {
 
   it('does not gate on archived — it would otherwise gate forever', () => {
     expect(isGating('archived')).toBe(false)
+  })
+
+  it.each(['idea', 'roadmap'])('does not gate on %s — a wishlist card can never become work', status => {
+    expect(isGating(status)).toBe(false)
   })
 
   it.each(STILL_GATING)('still gates on %s', status => {
@@ -480,6 +484,15 @@ describe('blockerStand', () => {
 
     expect(stand).toEqual({ total: 2, gating: 0 })
     expect(stand.total > 0 && stand.gating === 0).toBe(true)
+  })
+
+  it('a wishlist-lane parent is counted but never gates — the drawer must not list it as a blocker', () => {
+    const { graph, index } = scene(
+      [['wish', 'roadmap'], ['rough', 'idea'], ['live', 'running'], ['kid', 'todo']],
+      [['wish', 'kid'], ['rough', 'kid'], ['live', 'kid']]
+    )
+
+    expect(blockerStand(graph, index, 'kid')).toEqual({ total: 3, gating: 1 })
   })
 
   it('reports NO DEPENDENCIES as total 0 — rendered differently from all-clear', () => {

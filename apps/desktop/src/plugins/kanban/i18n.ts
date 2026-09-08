@@ -16,7 +16,18 @@ type KanbanMessages = {
   newTaskCommand: string
   countTip: (running: number, ready: number) => string
   col: Record<
-    'archived' | 'blocked' | 'done' | 'on_hold' | 'ready' | 'review' | 'running' | 'scheduled' | 'todo' | 'triage',
+    | 'archived'
+    | 'blocked'
+    | 'done'
+    | 'idea'
+    | 'on_hold'
+    | 'ready'
+    | 'review'
+    | 'roadmap'
+    | 'running'
+    | 'scheduled'
+    | 'todo'
+    | 'triage',
     { label: string; help: string }
   >
   locked: { review: string; running: string; scheduled: string }
@@ -199,6 +210,25 @@ type KanbanMessages = {
   guideBlockedAutomatic: (cause: string) => string
   guideBlockedReviewNoVerdict: string
   guideBlockedUnknown: string
+  // Wishlist lanes (idea/roadmap). Calm and non-nagging by decision: these
+  // cards are not late, not stalled, and carry no age/staleness warning.
+  guideIdea: string
+  guideRoadmap: string
+  // Roadmap lane visibility toggle + the compact pill shown while hidden.
+  roadmapHideLanes: string
+  roadmapShowLanes: string
+  roadmapPill: (count: number) => string
+  // Per-card lane actions (roadmap cards only).
+  laneRefine: string
+  laneDemote: string
+  laneSpawnTriage: string
+  laneSpawnReady: string
+  spawnReadyTitle: string
+  spawnReadyBody: string
+  spawnReadyConfirm: string
+  /** Client-side invalid-drop feedback. Mirrors the DB layer's own refusal
+   *  wording so a locally-refused move and a server 400 read the same. */
+  laneDropRefused: (from: string, to: string) => string
   // Structured multiple-choice question rendering (blocked-callout options).
   choicesGroupLabel: string
   choiceSubmitError: string
@@ -376,7 +406,9 @@ export const en: KanbanMessages = {
     on_hold: { label: 'On Hold', help: 'Shelved by a human — drag back to Ready when you want it resumed.' },
     review: { label: 'Review', help: 'A review agent is checking the work. Set by the dispatcher.' },
     done: { label: 'Done', help: 'Completed; dependent children become ready.' },
-    archived: { label: 'Archived', help: 'Hidden from the default board view.' }
+    archived: { label: 'Archived', help: 'Hidden from the default board view.' },
+    idea: { label: 'Ideas', help: 'Rough capture — nothing here runs, and nothing here is late.' },
+    roadmap: { label: 'Roadmap', help: 'Hashed out but not authorized — spawn it to start work.' }
   },
   locked: {
     review: 'Review is entered by the dispatcher when a review agent takes the card.',
@@ -474,13 +506,13 @@ export const en: KanbanMessages = {
   couldNotEstimate: 'Could not estimate',
   complexity: { S: 'Small', M: 'Medium', L: 'Large' },
   ideaTitle: 'Capture idea',
-  ideaHint: 'Jot a rough roadmap idea — it lands in ROADMAP.md’s Ideas list for later triage, not as a card.',
+  ideaHint: 'Jot a rough idea — it lands as a card in the Ideas lane, ready to refine later.',
   ideaPlaceholder: 'Rough idea…',
   ideaSave: 'Save idea',
   ideaSaving: 'Saving…',
-  ideaSaved: 'Idea saved to the roadmap',
+  ideaSaved: 'Added to Ideas',
   ideaEmpty: 'Type something before saving.',
-  ideaUnavailable: 'Roadmap unavailable — the idea was not saved.',
+  ideaUnavailable: 'Could not add the idea — nothing was saved.',
   introBody:
     'You don’t run the cards — agents do. Put a card in Ready with an assignee and an agent picks it up within a minute. No assignee, no run. Triage: an agent rewrites the idea into a proper task first. Todo: waiting on other cards. Scheduled: waiting on a timer. Running and Review: the agents’ lanes, hands off. Blocked: something needs a look — open the card for what happened and what to do. Results come back on the card.',
   introGotIt: 'Got it',
@@ -565,6 +597,19 @@ export const en: KanbanMessages = {
   guideBlockedAutomatic: cause => `${cause} Inspect the worker log, then retry or reassign.`,
   guideBlockedReviewNoVerdict: 'The reviewer exited without a verdict. Requeue it for another review pass.',
   guideBlockedUnknown: 'Inspect the worker log, then retry or reassign it.',
+  guideIdea: 'Rough idea — refine it into a roadmap item when ready.',
+  guideRoadmap: 'Specified, not yet authorized — spawn to Triage to start work.',
+  roadmapHideLanes: 'Hide Ideas and Roadmap',
+  roadmapShowLanes: 'Show Ideas and Roadmap',
+  roadmapPill: count => `Roadmap · ${count}`,
+  laneRefine: 'Refine to Roadmap',
+  laneDemote: 'Demote to Ideas',
+  laneSpawnTriage: 'Spawn to Triage',
+  laneSpawnReady: 'Spawn to Ready…',
+  spawnReadyTitle: 'Spawn straight to Ready?',
+  spawnReadyBody: 'Skip auto-decompose and dispatch as-is?',
+  spawnReadyConfirm: 'Spawn to Ready',
+  laneDropRefused: (from, to) => `Can’t move a card from ${from} to ${to}.`,
   choicesGroupLabel: 'Choose an option',
   choiceSubmitError: 'Could not submit your answer. Try again.',
   choiceRetry: 'Retry',
@@ -721,7 +766,9 @@ const ja: KanbanMessages = {
     on_hold: { label: '保留', help: '人によって保留されました — 再開したい時に Ready へドラッグしてください。' },
     review: { label: 'レビュー', help: 'レビューエージェントが作業を確認中。ディスパッチャが設定します。' },
     done: { label: '完了', help: '完了。依存する子タスクが Ready になります。' },
-    archived: { label: 'アーカイブ', help: 'デフォルトのボード表示から非表示。' }
+    archived: { label: 'アーカイブ', help: 'デフォルトのボード表示から非表示。' },
+    idea: { label: 'アイデア', help: 'ラフな記録 — ここでは何も実行されず、遅延もありません。' },
+    roadmap: { label: 'ロードマップ', help: '仕様は固まっていますが未承認 — スポーンすると作業が始まります。' }
   },
   locked: {
     review: 'レビューは、レビューエージェントがカードを取得するとディスパッチャによって設定されます。',
@@ -819,14 +866,13 @@ const ja: KanbanMessages = {
   couldNotEstimate: '見積もりできませんでした',
   complexity: { S: '小', M: '中', L: '大' },
   ideaTitle: 'アイデアを記録',
-  ideaHint:
-    'ラフなロードマップのアイデアをメモ — カードではなく ROADMAP.md の Ideas リストに追加され、後でトリアージされます。',
+  ideaHint: 'ラフなアイデアをメモ — アイデアレーンのカードとして追加され、後で整えられます。',
   ideaPlaceholder: 'ラフなアイデア…',
   ideaSave: 'アイデアを保存',
   ideaSaving: '保存中…',
-  ideaSaved: 'アイデアをロードマップに保存しました',
+  ideaSaved: 'アイデアに追加しました',
   ideaEmpty: '保存する前に入力してください。',
-  ideaUnavailable: 'ロードマップが利用できません — アイデアは保存されませんでした。',
+  ideaUnavailable: 'アイデアを追加できませんでした — 保存されていません。',
   introBody:
     'カードはあなたではなくエージェントが実行します。担当を設定したカードを Ready に置くと、1分以内にエージェントが取得します。担当がなければ実行されません。トリアージ: エージェントがまずアイデアを適切なタスクに書き直します。Todo: 他のカード待ち。スケジュール: タイマー待ち。実行中とレビュー: エージェントのレーンなので手を出さないでください。ブロック: 確認が必要です — カードを開いて何が起きたか、次に何をすべきかを確認してください。結果はカードに戻ってきます。',
   introGotIt: '了解',
@@ -913,6 +959,19 @@ const ja: KanbanMessages = {
   guideBlockedAutomatic: cause => `${cause} ワーカーログを確認し、再試行するか再割り当てしてください。`,
   guideBlockedReviewNoVerdict: 'レビュアーが判定なしで終了しました。もう一度レビューへ再キューしてください。',
   guideBlockedUnknown: 'ワーカーログを確認し、再試行するか再割り当てしてください。',
+  guideIdea: 'ラフなアイデアです — 準備ができたらロードマップ項目に整えてください。',
+  guideRoadmap: '仕様は固まっていますが未承認です — トリアージへスポーンすると作業が始まります。',
+  roadmapHideLanes: 'アイデアとロードマップを非表示',
+  roadmapShowLanes: 'アイデアとロードマップを表示',
+  roadmapPill: count => `ロードマップ · ${count}`,
+  laneRefine: 'ロードマップへ整える',
+  laneDemote: 'アイデアへ戻す',
+  laneSpawnTriage: 'トリアージへスポーン',
+  laneSpawnReady: 'Ready へスポーン…',
+  spawnReadyTitle: '直接 Ready へスポーンしますか？',
+  spawnReadyBody: '自動分解をスキップしてそのままディスパッチしますか？',
+  spawnReadyConfirm: 'Ready へスポーン',
+  laneDropRefused: (from, to) => `${from} から ${to} へカードを移動できません。`,
   choicesGroupLabel: 'オプションを選択してください',
   choiceSubmitError: '回答を送信できませんでした。もう一度お試しください。',
   choiceRetry: '再試行',
@@ -1069,7 +1128,9 @@ const zh: KanbanMessages = {
     on_hold: { label: '已暂缓', help: '由人工暂缓 — 想恢复时拖回“就绪”即可。' },
     review: { label: '审查', help: '审查代理正在检查工作。由调度器设置。' },
     done: { label: '完成', help: '已完成；依赖它的子任务变为就绪。' },
-    archived: { label: '已归档', help: '从默认面板视图中隐藏。' }
+    archived: { label: '已归档', help: '从默认面板视图中隐藏。' },
+    idea: { label: '想法', help: '粗略记录 — 这里的卡片不会运行，也不存在延误。' },
+    roadmap: { label: '路线图', help: '已细化但尚未授权 — 派生后即可开始工作。' }
   },
   locked: {
     review: '审查状态由调度器在审查代理领取卡片时设置。',
@@ -1166,13 +1227,13 @@ const zh: KanbanMessages = {
   couldNotEstimate: '无法估算',
   complexity: { S: '小', M: '中', L: '大' },
   ideaTitle: '记录想法',
-  ideaHint: '记下一个粗略的路线图想法 — 它会加入 ROADMAP.md 的 Ideas 列表，而不是新建卡片，稍后再分诊。',
+  ideaHint: '记下一个粗略的想法 — 它会作为卡片加入“想法”泳道，稍后再细化。',
   ideaPlaceholder: '粗略的想法…',
   ideaSave: '保存想法',
   ideaSaving: '保存中…',
-  ideaSaved: '想法已保存到路线图',
+  ideaSaved: '已加入“想法”',
   ideaEmpty: '请先输入内容再保存。',
-  ideaUnavailable: '路线图不可用 — 想法未保存。',
+  ideaUnavailable: '无法添加想法 — 未保存任何内容。',
   introBody:
     '卡片不由你运行，而是由代理运行。把带有负责人的卡片放入“就绪”，代理会在一分钟内领取。没有负责人就不会运行。分诊：代理先把想法改写成合适的任务。待办：等待其他卡片。已排期：等待计时器。运行中与审查：这是代理的通道，请勿插手。受阻：需要关注 — 打开卡片查看发生了什么、接下来该怎么做。结果会回到卡片上。',
   introGotIt: '知道了',
@@ -1255,6 +1316,19 @@ const zh: KanbanMessages = {
   guideBlockedAutomatic: cause => `${cause} 请查看工作单元日志，然后重试或重新分配。`,
   guideBlockedReviewNoVerdict: '审查者退出时没有给出结论。请重新排队进行另一轮审查。',
   guideBlockedUnknown: '请查看工作单元日志，然后重试或重新分配。',
+  guideIdea: '一个粗略的想法 — 准备好后再细化成路线图条目。',
+  guideRoadmap: '已细化但尚未授权 — 派生到“分诊”即可开始工作。',
+  roadmapHideLanes: '隐藏“想法”和“路线图”',
+  roadmapShowLanes: '显示“想法”和“路线图”',
+  roadmapPill: count => `路线图 · ${count}`,
+  laneRefine: '细化为路线图',
+  laneDemote: '退回想法',
+  laneSpawnTriage: '派生到分诊',
+  laneSpawnReady: '派生到就绪…',
+  spawnReadyTitle: '直接派生到“就绪”？',
+  spawnReadyBody: '跳过自动分解，按原样派发？',
+  spawnReadyConfirm: '派生到就绪',
+  laneDropRefused: (from, to) => `无法把卡片从${from}移动到${to}。`,
   choicesGroupLabel: '请选择一个选项',
   choiceSubmitError: '无法提交你的回答，请重试。',
   choiceRetry: '重试',
@@ -1408,7 +1482,9 @@ const zhHant: KanbanMessages = {
     on_hold: { label: '已暫緩', help: '由人工暫緩 — 想恢復時拖回「就緒」即可。' },
     review: { label: '審查', help: '審查代理正在檢查工作。由排程器設定。' },
     done: { label: '完成', help: '已完成；相依它的子任務變為就緒。' },
-    archived: { label: '已封存', help: '從預設面板檢視中隱藏。' }
+    archived: { label: '已封存', help: '從預設面板檢視中隱藏。' },
+    idea: { label: '想法', help: '粗略記錄 — 這裡的卡片不會執行，也不存在延誤。' },
+    roadmap: { label: '路線圖', help: '已細化但尚未授權 — 派生後即可開始工作。' }
   },
   locked: {
     review: '審查狀態由排程器在審查代理領取卡片時設定。',
@@ -1505,13 +1581,13 @@ const zhHant: KanbanMessages = {
   couldNotEstimate: '無法估算',
   complexity: { S: '小', M: '中', L: '大' },
   ideaTitle: '記錄想法',
-  ideaHint: '記下一個粗略的路線圖想法 — 它會加入 ROADMAP.md 的 Ideas 清單，而不是新建卡片，稍後再分診。',
+  ideaHint: '記下一個粗略的想法 — 它會作為卡片加入「想法」泳道，稍後再細化。',
   ideaPlaceholder: '粗略的想法…',
   ideaSave: '儲存想法',
   ideaSaving: '儲存中…',
-  ideaSaved: '想法已儲存到路線圖',
+  ideaSaved: '已加入「想法」',
   ideaEmpty: '請先輸入內容再儲存。',
-  ideaUnavailable: '路線圖不可用 — 想法未儲存。',
+  ideaUnavailable: '無法新增想法 — 未儲存任何內容。',
   introBody:
     '卡片不由你執行，而是由代理執行。把有負責人的卡片放入「就緒」，代理會在一分鐘內領取。沒有負責人就不會執行。分類：代理先把想法改寫成合適的任務。待辦：等待其他卡片。已排程：等待計時器。執行中與審查：這是代理的通道，請勿插手。受阻：需要關注 — 開啟卡片查看發生了什麼、接下來該怎麼做。結果會回到卡片上。',
   introGotIt: '知道了',
@@ -1594,6 +1670,19 @@ const zhHant: KanbanMessages = {
   guideBlockedAutomatic: cause => `${cause} 請查看工作單元日誌，然後重試或重新指派。`,
   guideBlockedReviewNoVerdict: '審查者結束時沒有給出結論。請重新排隊進行另一輪審查。',
   guideBlockedUnknown: '請查看工作單元日誌，然後重試或重新指派。',
+  guideIdea: '一個粗略的想法 — 準備好後再細化成路線圖項目。',
+  guideRoadmap: '已細化但尚未授權 — 派生到「分診」即可開始工作。',
+  roadmapHideLanes: '隱藏「想法」和「路線圖」',
+  roadmapShowLanes: '顯示「想法」和「路線圖」',
+  roadmapPill: count => `路線圖 · ${count}`,
+  laneRefine: '細化為路線圖',
+  laneDemote: '退回想法',
+  laneSpawnTriage: '派生到分診',
+  laneSpawnReady: '派生到就緒…',
+  spawnReadyTitle: '直接派生到「就緒」？',
+  spawnReadyBody: '略過自動分解，按原樣派發？',
+  spawnReadyConfirm: '派生到就緒',
+  laneDropRefused: (from, to) => `無法把卡片從${from}移動到${to}。`,
   choicesGroupLabel: '請選擇一個選項',
   choiceSubmitError: '無法送出你的回答，請再試一次。',
   choiceRetry: '重試',

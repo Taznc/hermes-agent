@@ -70,6 +70,7 @@ import {
   $hiddenBoards,
   $introDismissed,
   $lanesByProfile,
+  $roadmapHidden,
   addRoadmapIdea,
   ALL_BOARDS,
   archiveDone,
@@ -108,7 +109,16 @@ import { TaskDrawer } from './drawer'
 import { EMPTY_OVERRIDE, ModelOverrideField, overrideCreateFields, type TaskModelOverride } from './model-override'
 import { OrchestrationPanel } from './orchestration'
 import { PriorityPicker } from './priority-picker'
-import { type BoardAllInfo, columnMeta, type KanbanBoard, type KanbanTask, type TaskEstimate } from './types'
+import {
+  type BoardAllInfo,
+  columnMeta,
+  isRoadmapLane,
+  type KanbanBoard,
+  type KanbanTask,
+  laneDropAllowed,
+  orderLanes,
+  type TaskEstimate
+} from './types'
 import {
   $newTaskLane,
   ago,
@@ -504,7 +514,40 @@ function CardFooter({
   )
 }
 
-// ── board attribution badge (All Boards mode only) ────────────────────────────
+/**
+ * The wishlist-lane card footer: id, priority, and the parent link only.
+ *
+ * A lane card is not work — nothing is assigned to it, no run has ever
+ * touched it, and it cannot be late — so every affordance that narrates
+ * machine activity is deliberately absent here (assignee/model badge, run
+ * clock, age, heartbeat warning, run/comment/warning counts). Rendering the
+ * full footer would make a wishlist read like a stalled backlog, which is
+ * exactly the cost the Roadmap lanes exist to avoid.
+ *
+ * Priority stays: ranking a wishlist is the one thing you actually do to it.
+ */
+function LaneCardFooter({ onSetPriority, task }: { onSetPriority: (priority: number) => void; task: KanbanTask }) {
+  const deps = useDependencies()
+  const key = taskCardKey(task)
+  const parents = deps.hasEdges ? upstreamOf(deps.graph, key).length : (task.link_counts?.parents ?? 0)
+
+  return (
+    <div className="flex min-w-0 items-center gap-2 text-[0.625rem] text-(--ui-text-tertiary)">
+      <IdChip className="min-w-0 text-[0.6rem]" id={task.id} />
+      {parents > 0 && <Meta icon="circle-slash">{parents}</Meta>}
+      <span
+        className="ml-auto"
+        onClick={event => event.stopPropagation()}
+        onMouseDown={event => event.stopPropagation()}
+        onPointerDown={event => event.stopPropagation()}
+      >
+        <PriorityPicker onChange={onSetPriority} priority={task.priority} />
+      </span>
+    </div>
+  )
+}
+
+// ── board attribution badge (All Boards mode only) ───────────────────────────
 
 /** A small board-name chip on a card, shown ONLY in the consolidated All
  *  Boards view (`useBoardInfo()` is null in single-board mode, so this
@@ -558,12 +601,24 @@ export function Card({
   const k = useKanban()
   const [dragging, setDragging] = useState(false)
   const meta = columnMeta(task.status)
+  // A wishlist card is not work: no agent is coming for it, it has no runs and
+  // no age to worry about. The presentational variant is DERIVED from the
+  // card's own status rather than threaded down as a prop, so it can never
+  // disagree with the lane the card is actually in.
+  const lane = isRoadmapLane(task.status)
   // For a blocked card `latest_summary` IS the worker's block reason, which
   // may carry ```cmd / ```choices fences meant for the drawer's structured
   // rendering — on the 2-line card preview those are noise, so strip fences
   // and collapse whitespace to keep the preview to the prose ask.
   const rawSummary = task.latest_summary || task.body
-  const summary = rawSummary ? rawSummary.replace(/```[a-zA-Z]*\s*[\s\S]*?```/g, ' ').replace(/\s+/g, ' ').trim() : rawSummary
+
+  const summary = rawSummary
+    ? rawSummary
+        .replace(/```[a-zA-Z]*\s*[\s\S]*?```/g, ' ')
+        .replace(/\s+/g, ' ')
+        .trim()
+    : rawSummary
+
   const fallback = useDefaultAssignee()
   const arc = arcState(task, fallback)
   const key = taskCardKey(task)
@@ -704,13 +759,17 @@ export function Card({
             {task.title || task.id}
           </span>
           <BoardBadge task={task} />
-          {summary && (
+          {summary && !lane && (
             <span className="line-clamp-2 text-[0.6875rem] leading-snug text-(--ui-text-tertiary)">{summary}</span>
           )}
-          {task.image_attachment_id != null && (
+          {task.image_attachment_id != null && !lane && (
             <CardThumb attachmentId={task.image_attachment_id} board={task.board ?? undefined} />
           )}
-          <CardFooter arc={arc} onSetPriority={priority => onSetPriority(key, priority)} task={task} />
+          {lane ? (
+            <LaneCardFooter onSetPriority={priority => onSetPriority(key, priority)} task={task} />
+          ) : (
+            <CardFooter arc={arc} onSetPriority={priority => onSetPriority(key, priority)} task={task} />
+          )}
         </div>
       </ContextMenuTrigger>
       <ContextMenuContent>
@@ -723,20 +782,57 @@ export function Card({
           {selected ? k.deselect : k.select(formatModifierToken('mod'))}
         </ContextMenuItem>
 
-        {columns
-          .filter(name => name !== task.status && !isLockedTarget(name))
-          .map(name => (
-            <ContextMenuItem key={name} onSelect={() => onMove(key, name)}>
-              <span className="size-2 rounded-full" style={{ backgroundColor: columnMeta(name).tone }} />
-              {k.moveTo(columnLabel(k, name))}
+        {lane && <ContextMenuSeparator />}
+        {task.status === 'idea' && (
+          <ContextMenuItem onSelect={() => onMove(key, 'roadmap')}>
+            <Codicon name="map" size="0.85rem" />
+            {k.laneRefine}
+          </ContextMenuItem>
+        )}
+        {task.status === 'roadmap' && (
+          <>
+            <ContextMenuItem onSelect={() => onMove(key, 'idea')}>
+              <Codicon name="lightbulb" size="0.85rem" />
+              {k.laneDemote}
             </ContextMenuItem>
-          ))}
+            <ContextMenuItem onSelect={() => onMove(key, 'triage')}>
+              <Codicon name="inbox" size="0.85rem" />
+              {k.laneSpawnTriage}
+            </ContextMenuItem>
+            <ContextMenuItem onSelect={() => onMove(key, 'ready')}>
+              <Codicon name="play-circle" size="0.85rem" />
+              {k.laneSpawnReady}
+            </ContextMenuItem>
+          </>
+        )}
+        {lane && (
+          <ContextMenuItem onSelect={() => onMove(key, 'archived')}>
+            <Codicon name="archive" size="0.85rem" />
+            {k.archive}
+          </ContextMenuItem>
+        )}
+
+        {!lane &&
+          columns
+            .filter(name => name !== task.status && !isLockedTarget(name) && laneDropAllowed(task.status, name))
+            .map(name => (
+              <ContextMenuItem key={name} onSelect={() => onMove(key, name)}>
+                <span className="size-2 rounded-full" style={{ backgroundColor: columnMeta(name).tone }} />
+                {k.moveTo(columnLabel(k, name))}
+              </ContextMenuItem>
+            ))}
         <ContextMenuSeparator />
-        <ContextMenuItem disabled={sendIdeaMut.isPending} onSelect={() => sendIdeaMut.mutate()}>
-          <Codicon name="lightbulb" size="0.85rem" />
-          {k.sendToRoadmap}
-        </ContextMenuItem>
-        <ContextMenuSeparator />
+        {/* Sending a lane card back to the Ideas lane it already lives in is
+            noise, so the capture action is live-cards-only. */}
+        {!lane && (
+          <>
+            <ContextMenuItem disabled={sendIdeaMut.isPending} onSelect={() => sendIdeaMut.mutate()}>
+              <Codicon name="lightbulb" size="0.85rem" />
+              {k.sendToRoadmap}
+            </ContextMenuItem>
+            <ContextMenuSeparator />
+          </>
+        )}
         <ContextMenuItem onSelect={() => onDelete(key)} variant="destructive">
           <Codicon name="trash" size="0.85rem" />
           {k.delete}
@@ -918,8 +1014,11 @@ function Column({
             ))}
         {/* Jira-style lane add — dashed, faded in on lane hover. Opacity (not
             display) so it always holds its slot and never thrashes layout.
-            Locked lanes get none: you can't create into a system state. */}
-        {!locked && (
+            Locked lanes get none: you can't create into a system state. The
+            wishlist lanes get none either — the board header's capture dialog
+            is the ONE way a card enters Ideas (there is no create-into-lane
+            endpoint, and a second capture UI was explicitly ruled out). */}
+        {!locked && !isRoadmapLane(column.name) && (
           <button
             aria-label={k.newTaskIn(label)}
             className="flex shrink-0 items-center justify-center rounded-md border border-dashed border-(--ui-stroke-secondary) py-1.5 text-(--ui-text-tertiary) opacity-0 transition-[opacity,color,border-color] group-hover/col:opacity-100 hover:border-(--ui-text-quaternary) hover:bg-(--chrome-action-hover) hover:text-foreground focus-visible:opacity-100"
@@ -1843,7 +1942,20 @@ function SelectionBar({
           </DropdownMenuTrigger>
           <DropdownMenuContent align="center">
             {columns
-              .filter(name => !isLockedTarget(name))
+              // Bulk selection can span mixed statuses. A target is safe only
+              // when the shared transition predicate accepts it for EVERY
+              // selected card. Wishlist exits stay per-card because Ready
+              // requires a confirmation and the bulk endpoint has no dialog
+              // contract for partially accepted lane spawns.
+              .filter(
+                name =>
+                  !isLockedTarget(name) &&
+                  [...selected].every(key => {
+                    const task = index.get(key)
+
+                    return Boolean(task && !isRoadmapLane(task.status) && laneDropAllowed(task.status, name))
+                  })
+              )
               .map(name => (
                 <DropdownMenuItem key={name} onSelect={() => bulk.mutate({ status: name })}>
                   <span className="size-2 rounded-full" style={{ backgroundColor: columnMeta(name).tone }} />
@@ -2072,6 +2184,24 @@ export function KanbanBoardPage() {
   // deleted) fall out naturally since they never render a chip or a card.
   const hiddenBoards = useValue($hiddenBoards)
 
+  // Wishlist-lane visibility for THIS board. Keyed by slug (the '' server-
+  // default and the All Boards sentinel are ordinary keys), absent = shown, so
+  // a board nobody has touched still shows its full structure.
+  const roadmapHiddenMap = useValue($roadmapHidden)
+  const roadmapHidden = Boolean(roadmapHiddenMap[slug])
+
+  const toggleRoadmapHidden = () => {
+    const next = { ...roadmapHiddenMap }
+
+    if (next[slug]) {
+      delete next[slug]
+    } else {
+      next[slug] = true
+    }
+
+    $roadmapHidden.set(next)
+  }
+
   const toggleBoardVisible = (slugToToggle: string) => {
     const next = { ...hiddenBoards }
 
@@ -2087,6 +2217,8 @@ export function KanbanBoardPage() {
   // The open drawer's card, as a `cardKey` (board + id in All Boards mode).
   const [openKey, setOpenKey] = useState<null | string>(null)
   const [addStatus, setAddStatus] = useState<null | string>(null)
+  // The roadmap card awaiting the "skip auto-decompose?" confirm, as a cardKey.
+  const [spawnReadyKey, setSpawnReadyKey] = useState<null | string>(null)
   const [ideaOpen, setIdeaOpen] = useState(false)
   const [settingsOpen, setSettingsOpen] = useState(false)
   const [search, setSearch] = useState('')
@@ -2260,6 +2392,14 @@ export function KanbanBoardPage() {
   // Client-side filters, mirroring the dashboard (search over title/body/id).
   // In All Boards mode, a hidden-board chip also drops that board's cards —
   // client-side only, since the server always returns every board.
+  //
+  // Two lane-specific transforms ride along, both applied HERE rather than at
+  // render time so everything downstream (the header total, the lane-phase
+  // signature, `boardHasWork`) sees one consistent view:
+  //  - the wishlist lanes are reordered leftmost, ahead of `triage`, since the
+  //    backend appends them to BOARD_COLUMNS instead;
+  //  - when hidden for this board they are dropped ENTIRELY (not collapsed to
+  //    a rail), so their cards leave the counts with them.
   const filtered = useMemo(() => {
     if (!board) {
       return null
@@ -2273,10 +2413,21 @@ export function KanbanBoardPage() {
       (!assignee || task.assignee === assignee) &&
       !(isAllBoards && task.board && hiddenBoards[task.board])
 
-    return { ...board, columns: board.columns.map(col => ({ ...col, tasks: col.tasks.filter(keep) })) }
-  }, [board, search, tenant, assignee, isAllBoards, hiddenBoards])
+    const columns = orderLanes(board.columns)
+      .filter(col => !(roadmapHidden && isRoadmapLane(col.name)))
+      .map(col => ({ ...col, tasks: col.tasks.filter(keep) }))
+
+    return { ...board, columns }
+  }, [board, search, tenant, assignee, isAllBoards, hiddenBoards, roadmapHidden])
 
   const total = filtered?.columns.reduce((sum, col) => sum + col.tasks.length, 0) ?? 0
+
+  // Card count behind the hidden-lanes pill — raw board, not `filtered` (which
+  // has already dropped them), so the pill can say how much is parked there.
+  const roadmapCount = useMemo(
+    () => board?.columns.reduce((sum, col) => (isRoadmapLane(col.name) ? sum + col.tasks.length : sum), 0) ?? 0,
+    [board]
+  )
 
   // Every mutation below takes the card's `cardKey` (`key`) for the optimistic
   // cache edit and the bare `id` + `board` for the wire, so a same-id card on
@@ -2379,6 +2530,27 @@ export function KanbanBoardPage() {
 
     if (isLockedTarget(status)) {
       host.notify({ kind: 'info', message: lockedReason(k, status) })
+
+      return
+    }
+
+    // Wishlist-lane rules, checked BEFORE the optimistic edit: the backend
+    // refuses these with a 400, and painting the move first would flash a
+    // phantom card into a lane it can never reach. `laneDropAllowed` is the
+    // same predicate the menus filter on, so the two can't drift.
+    if (!laneDropAllowed(task.status, status)) {
+      host.notify({
+        kind: 'warning',
+        message: k.laneDropRefused(columnLabel(k, task.status), columnLabel(k, status))
+      })
+
+      return
+    }
+
+    // Spawning straight to Ready skips auto-decompose, which is the standing
+    // default for a roadmap item — so it is the one lane move that asks first.
+    if (task.status === 'roadmap' && status === 'ready') {
+      setSpawnReadyKey(key)
 
       return
     }
@@ -2491,6 +2663,33 @@ export function KanbanBoardPage() {
             <SearchField aria-label={k.filterCards} onChange={setSearch} placeholder={k.filterCards} value={search} />
             <div className="ml-auto flex items-center gap-1">
               {board && !archived && <ArchiveDoneControl />}
+              {/* Wishlist-lane visibility. Hidden collapses to a compact pill
+                  carrying the parked count, so the lanes stay one click away
+                  without costing a lane's width when you don't want them. */}
+              {board &&
+                (roadmapHidden ? (
+                  <Button
+                    aria-label={k.roadmapShowLanes}
+                    className="h-6 gap-1 rounded-full px-2 text-[0.625rem] tabular-nums text-(--ui-text-tertiary)"
+                    onClick={toggleRoadmapHidden}
+                    size="xs"
+                    variant="ghost"
+                  >
+                    <Codicon name="map" size="0.7rem" />
+                    {k.roadmapPill(roadmapCount)}
+                  </Button>
+                ) : (
+                  <Tip label={k.roadmapHideLanes}>
+                    <Button
+                      aria-label={k.roadmapHideLanes}
+                      onClick={toggleRoadmapHidden}
+                      size="icon-xs"
+                      variant="ghost"
+                    >
+                      <Codicon name="map" size="0.85rem" />
+                    </Button>
+                  </Tip>
+                ))}
               <Tip label={k.ideaTitle}>
                 <Button aria-label={k.ideaTitle} onClick={() => setIdeaOpen(true)} size="icon-xs" variant="ghost">
                   <Codicon name="lightbulb" size="0.85rem" />
@@ -2623,6 +2822,24 @@ export function KanbanBoardPage() {
 
           <NewTaskDialog onClose={() => setAddStatus(null)} parents={parentOptions} target={addStatus} />
           <IdeaCaptureDialog onClose={() => setIdeaOpen(false)} open={ideaOpen} />
+          {/* Roadmap → Ready is the one spawn that bypasses auto-decompose, so
+              it confirms; Roadmap → Triage (the default) never asks. */}
+          <ConfirmDialog
+            confirmLabel={k.spawnReadyConfirm}
+            description={k.spawnReadyBody}
+            onClose={() => setSpawnReadyKey(null)}
+            onConfirm={() => {
+              const task = spawnReadyKey ? index.get(spawnReadyKey) : undefined
+
+              if (task) {
+                moveMut.mutate({ board: task.board ?? undefined, id: task.id, key: spawnReadyKey!, status: 'ready' })
+              }
+
+              setSpawnReadyKey(null)
+            }}
+            open={spawnReadyKey !== null}
+            title={k.spawnReadyTitle}
+          />
           {/* The drawer speaks bare task ids (its detail payload's `links` are
               plain ids on ONE board), so translate at this boundary: the open
               card's board comes from the index, and a navigation out of a
