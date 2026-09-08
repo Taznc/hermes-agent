@@ -196,4 +196,3 @@ def latest_approval(conn: sqlite3.Connection, task_id: str) -> Optional[Approval
         run_id=int(row["id"]), reviewer=row["profile"], summary=row["summary"],
         metadata=metadata, approved_sha=sha, approved_at=row["ended_at"],
     )
-
