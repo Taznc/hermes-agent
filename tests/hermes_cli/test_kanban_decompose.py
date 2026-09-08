@@ -15,6 +15,7 @@ import pytest
 
 from hermes_cli import kanban_db as kb
 from hermes_cli import kanban_db_connect as kbc
+from hermes_cli.kanban_db_graph import decompose_triage_task
 from hermes_cli import kanban_decompose as decomp
 
 
@@ -167,7 +168,7 @@ def test_decompose_triage_task_children_inherit_root_priority(kanban_home):
     and a per-child ``priority`` key overrides it for that child only."""
     with kbc.connect() as conn:
         tid = kb.create_task(conn, title="critical work", triage=True, priority=2)
-        child_ids = kb.decompose_triage_task(
+        child_ids = decompose_triage_task(
             conn, tid, root_assignee="orchestrator",
             children=[
                 {"title": "child a"},

@@ -22,15 +22,22 @@ _TASK_DICT_FIELDS = (
     "created_by", "created_at", "started_at", "completed_at", "result",
     "skills", "max_retries", "model_override", "provider_override",
     "reasoning_effort", "route_source", "route_name",
-    "session_id", "workflow_template_id", "current_step_key",
+    "session_id", "workflow_template_id", "current_step_key", "completion_contract", "last_failure_error",
+    "created_by_task", "created_by_run",
 )
 _SHOW_RUN_FIELDS = (
     "id", "profile", "step_key", "status", "outcome", "summary", "error",
-    "metadata", "worker_pid", "started_at", "ended_at",
+    "metadata", "worker_pid", "started_at", "ended_at", "model", "provider",
+    "reasoning_effort", "model_source", "session_id", "input_tokens",
+    "output_tokens", "cache_read_tokens", "reasoning_tokens", "api_calls",
+    "tool_calls", "estimated_cost_usd",
 )
 _RUNS_RUN_FIELDS = (
     "id", "profile", "status", "outcome", "started_at", "ended_at",
-    "summary", "error", "metadata", "worker_pid", "step_key",
+    "summary", "error", "metadata", "worker_pid", "step_key", "model", "provider",
+    "reasoning_effort", "model_source", "session_id", "input_tokens",
+    "output_tokens", "cache_read_tokens", "reasoning_tokens", "api_calls",
+    "tool_calls", "estimated_cost_usd",
 )
 _ATTACHMENT_FIELDS = ("id", "filename", "content_type", "size", "uploaded_by", "stored_path", "created_at")
 

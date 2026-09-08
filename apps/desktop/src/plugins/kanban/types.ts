@@ -136,6 +136,18 @@ export interface KanbanRun {
   worker_pid?: null | number
   started_at?: null | number
   ended_at?: null | number
+  model?: null | string
+  provider?: null | string
+  reasoning_effort?: null | string
+  model_source?: null | 'card_override' | 'profile_default' | 'routing'
+  session_id?: null | string
+  input_tokens?: null | number
+  output_tokens?: null | number
+  cache_read_tokens?: null | number
+  reasoning_tokens?: null | number
+  api_calls?: null | number
+  tool_calls?: null | number
+  estimated_cost_usd?: null | number
 }
 
 /** A structured multiple-choice answer, persisted alongside a comment's plain
@@ -215,7 +227,10 @@ export interface KanbanTaskDetail {
   task: KanbanTaskFull
   comments: KanbanComment[]
   events: KanbanEvent[]
-  attachments: KanbanAttachment[]
+  /** Kanban backends before attachments landed (#35395, May 2026) omit this
+   *  key and have no /tasks/{id}/attachments endpoints; absent/null hides the
+   *  section instead of offering uploads the backend would 404 on. */
+  attachments?: KanbanAttachment[] | null
   links: { parents: string[]; children: string[] }
   runs: KanbanRun[]
 }
@@ -298,6 +313,38 @@ export interface OrchestrationSettings {
 }
 
 /** GET /dispatch/status — the pause circuit plus the drain signal. */
+
+/** A maintenance action queued to fire once the scope drains to 0 running.
+ *  The trigger is server-side (the dispatcher tick), so this record advances
+ *  whether or not this dashboard is open. */
+export interface PostDrainAction {
+  action_kind: string
+  /** Allowlisted unit for `service_restart`; null for target-less kinds. */
+  target: null | string
+  requested_by: string
+  requested_at: number
+  expires_at: number
+  /** `waiting` -> `firing` -> `succeeded | failed | expired | cancelled`. */
+  state: 'cancelled' | 'expired' | 'failed' | 'firing' | 'succeeded' | 'waiting'
+  /** Seconds until expiry, derived SERVER-side so the countdown shares the
+   *  clock that will actually expire the record. Null when unbounded. */
+  expires_in_seconds: null | number
+  /** Observed failure detail — present only in the `failed` state. */
+  error?: string
+  /** Shared by every board armed in one aggregate request. */
+  group_id?: string
+  /** Aggregate scope only: how many boards carry this action. */
+  board_count?: number
+}
+
+/** One entry the "after drain" selector may offer. Derived from the backend's
+ *  own registry + allowlist, so the UI can never offer an action that 400s. */
+export interface PostDrainActionOption {
+  action_kind: string
+  /** Allowlisted targets; empty for target-less kinds like `reboot`. */
+  targets: string[]
+}
+
 export interface DispatchStatus {
   paused: boolean
   /** Raw circuit record: `reason` is `operator_paused` for a maintenance
@@ -314,12 +361,37 @@ export interface DispatchStatus {
   running_count: number
   /** Server-rendered human status; null when running or aggregate. */
   message: null | string
+  /** The action armed for this scope, or null. Absent on older backends. */
+  post_drain?: null | PostDrainAction
+  /** Actions this host accepts. Absent on older backends (selector hidden). */
+  post_drain_actions?: PostDrainActionOption[]
   /** Aggregate-only fields returned for the explicit `boards=*` scope. */
   all_paused?: boolean
   board_count?: number
   paused_count?: number
   boards?: Array<DispatchStatus & { board: string }>
   errors?: Array<{ board: string; error: string }>
+}
+
+/** POST /dispatch/post-drain. Aggregate scope reports per-board outcomes. */
+export interface PostDrainQueueResult {
+  queued: boolean
+  state?: PostDrainAction
+  board_count?: number
+  queued_count?: number
+  group_id?: string
+  results?: Array<{ board: string; state: PostDrainAction }>
+  failures?: Array<{ board: string; error: string }>
+}
+
+/** DELETE /dispatch/post-drain. `cancelled: false` means nothing was waiting. */
+export interface PostDrainCancelResult {
+  cancelled: boolean
+  state?: null | PostDrainAction
+  board_count?: number
+  cancelled_count?: number
+  results?: Array<{ board: string; cancelled: boolean }>
+  failures?: Array<{ board: string; error: string }>
 }
 
 /** POST /dispatch/pause. `paused: false` is a REFUSAL (a dispatch tick owns
@@ -374,11 +446,73 @@ export const COLUMN_META: Record<string, { codicon: string; tone: string }> = {
   on_hold: { codicon: 'debug-pause', tone: '#94a3b8' },
   review: { codicon: 'eye', tone: '#fbbf24' },
   done: { codicon: 'pass', tone: 'var(--ui-text-tertiary)' },
-  archived: { codicon: 'archive', tone: 'var(--ui-text-quaternary)' }
+  archived: { codicon: 'archive', tone: 'var(--ui-text-quaternary)' },
+  // The wishlist lanes. Muted on purpose: they sit UPSTREAM of the
+  // authorization line, so nothing in them is work in flight and they must
+  // never read as loud as a live lane.
+  idea: { codicon: 'lightbulb', tone: 'var(--ui-text-quaternary)' },
+  roadmap: { codicon: 'map', tone: 'var(--ui-text-tertiary)' }
 }
 
 export const columnMeta = (name: string) =>
   COLUMN_META[name] ?? { codicon: 'circle-outline', tone: 'var(--ui-text-secondary)' }
+
+/** The inert wishlist lanes, in render order (leftmost first) — they precede
+ *  `triage` because they are upstream of the authorization line. The backend
+ *  appends them to `BOARD_COLUMNS` instead (they trail the live lanes there),
+ *  so the client reorders; see `orderLanes`. Mirrors
+ *  `kanban_db.ROADMAP_LANE_STATUSES`. */
+export const ROADMAP_LANES = ['idea', 'roadmap'] as const
+
+export const isRoadmapLane = (name: string): boolean => name === 'idea' || name === 'roadmap'
+
+/**
+ * Allowed lane transitions, `from -> {to, ...}` — the client-side mirror of
+ * `kanban_db.ROADMAP_LANE_TRANSITIONS`. One-directional out of the wishlist:
+ * no live status may move INTO a lane (a card enters only at creation or via
+ * idea capture), so an existing drag habit can never park real work here.
+ */
+export const ROADMAP_LANE_TRANSITIONS: Readonly<Record<string, ReadonlySet<string>>> = {
+  idea: new Set(['roadmap', 'archived']),
+  roadmap: new Set(['triage', 'ready', 'idea', 'archived'])
+}
+
+/** Where a `roadmap` card may be spawned into (`triage` is the default — the
+ *  standing decision is to let auto-decompose re-specify it first). Mirrors
+ *  `kanban_db.ROADMAP_SPAWN_TARGETS`. */
+export const ROADMAP_SPAWN_TARGETS = ['triage', 'ready'] as const
+
+/**
+ * Whether a card in `from` may be moved to `to`, as far as the wishlist lanes
+ * are concerned. THE single predicate behind every move affordance (lane drop,
+ * card context menu, drawer status picker, bulk move bar) so they cannot drift
+ * apart, and the client's optimistic move can never paint a transition the
+ * backend will refuse with a 400.
+ *
+ * Anything not touching a lane is left alone (`true`) — lane rules are the
+ * only thing this answers; `isLockedTarget` still owns the dispatcher-owned
+ * columns.
+ */
+export const laneDropAllowed = (from: string, to: string): boolean => {
+  if (isRoadmapLane(from)) {
+    return ROADMAP_LANE_TRANSITIONS[from].has(to)
+  }
+
+  return !isRoadmapLane(to)
+}
+
+/** Lane columns first (`idea`, then `roadmap`), every other column keeping the
+ *  backend's own left-to-right order. Pure and total: a board with no lane
+ *  columns comes back untouched. */
+export function orderLanes<T extends { name: string }>(columns: readonly T[]): T[] {
+  const rank = (name: string) => {
+    const index = (ROADMAP_LANES as readonly string[]).indexOf(name)
+
+    return index === -1 ? ROADMAP_LANES.length : index
+  }
+
+  return [...columns].sort((a, b) => rank(a.name) - rank(b.name))
+}
 
 export const SEVERITY_TONE: Record<Diagnostic['severity'], string> = {
   critical: 'var(--destructive, #f87171)',

@@ -202,7 +202,7 @@ def kanban_command(args: argparse.Namespace) -> int:
             return _err(f"kanban: unknown action {action!r}", 2)
         try:
             return int(handler(args) or 0)
-        except (ValueError, RuntimeError) as exc:
+        except (ValueError, RuntimeError, PermissionError) as exc:
             return _err(f"kanban: {exc}")
 
 
@@ -227,12 +227,13 @@ _DELEGATED_CHILD_DENIED_ACTIONS: frozenset[str] = frozenset({
     "schedule", "hold", "unblock", "unhold", "promote", "archive", "dispatch", "daemon", "repair",
     "refine", "demote", "spawn",
     "heartbeat", "notify-subscribe", "notify-unsubscribe", "specify", "decompose",
+    "request-review", "request-changes", "reopen-review",
     "gc",
 })
 
 _DELEGATED_CHILD_DENIED_BOARD_ACTIONS: frozenset[str] = frozenset({
     "create", "new", "rm", "remove", "delete", "switch", "use", "rename",
-    "set-default-workdir",
+    "set-default-workdir", "import",
 })
 
 
@@ -359,6 +360,8 @@ def _cmd_create(args: argparse.Namespace) -> int:
         return _err(f"kanban: --{lane} and --triage are mutually exclusive", 2)
     if lane and getattr(args, "initial_status", "running") != "running":
         return _err(f"kanban: --{lane} and --initial-status are mutually exclusive", 2)
+    from agent.delegation_context import is_dispatcher_owned_worker_context
+
     try:
         ws_kind, ws_path = _parse_workspace_flag(args.workspace)
         branch_name = _parse_branch_flag(getattr(args, "branch", None))
@@ -407,7 +410,10 @@ def _cmd_create(args: argparse.Namespace) -> int:
                 route_source=routing.route_source, route_name=routing.route_name,
                 goal_mode=bool(getattr(args, "goal_mode", False)),
                 goal_max_turns=getattr(args, "goal_max_turns", None),
+                completion_contract=getattr(args, "completion_contract", None),
                 initial_status=getattr(args, "initial_status", "running"),
+                creator_task_id=(os.environ.get("HERMES_KANBAN_TASK")
+                                 if is_dispatcher_owned_worker_context() else None),
                 lane=lane,
             )
             task = kb.get_task(conn, task_id)
@@ -513,6 +519,42 @@ def _print_section(title: str, lines) -> None:
     print(title)
     for line in lines:
         print(line)
+
+
+def _run_analytics_lines(run: kb.Run) -> list[str]:
+    """Compact human-readable launch and usage details, omitting NULL fields."""
+    lines: list[str] = []
+    identity = [
+        value
+        for value in (run.model, run.provider, run.reasoning_effort)
+        if value is not None
+    ]
+    if identity:
+        lines.append("model: " + " · ".join(identity))
+
+    token_parts = [
+        f"{label} {int(value):,}"
+        for label, value in (
+            ("in", run.input_tokens),
+            ("out", run.output_tokens),
+            ("cache", run.cache_read_tokens),
+            ("reasoning", run.reasoning_tokens),
+        )
+        if value is not None
+    ]
+    if token_parts:
+        lines.append("tokens: " + " · ".join(token_parts))
+
+    call_parts = [
+        f"{label} {int(value):,}"
+        for label, value in (("API", run.api_calls), ("tools", run.tool_calls))
+        if value is not None
+    ]
+    if call_parts:
+        lines.append("calls: " + " · ".join(call_parts))
+    if run.estimated_cost_usd is not None:
+        lines.append(f"estimated cost: ${run.estimated_cost_usd:.4f}")
+    return lines
 
 
 def _cmd_show(args: argparse.Namespace) -> int:
@@ -621,6 +663,8 @@ def _cmd_show(args: argparse.Namespace) -> int:
             el = f"{elapsed}s" if elapsed is not None else "active"
             outcome = r.outcome or r.status or "active"
             print(f"  #{r.id:<3} {outcome:<12} @{r.profile or '-'}  {el}  {_fmt_ts(r.started_at)}")
+            for analytics_line in _run_analytics_lines(r):
+                print(f"        {analytics_line}")
             if r.summary:
                 print(f"        → {r.summary.splitlines()[0][:160]}")
             if r.error:
@@ -826,6 +870,7 @@ def _cmd_attach(args: argparse.Namespace) -> int:
     """Attach a local file via the shared ``store_attachment_bytes`` path (same 25 MB cap and name
     sanitisation as the dashboard upload and agent tool)."""
     import mimetypes
+    _worker_run_id_for(args.task_id)
 
     src = Path(args.path).expanduser()
     if not src.is_file():
@@ -872,6 +917,9 @@ def _cmd_attach_rm(args: argparse.Namespace) -> int:
 
 
 def _worker_run_id_for(task_id: str) -> Optional[int]:
+    env_tid = os.environ.get("HERMES_KANBAN_TASK")
+    if env_tid and env_tid != task_id:
+        raise ValueError(f"worker is scoped to task {env_tid}; refusing to mutate {task_id}")
     raw = os.environ.get("HERMES_KANBAN_RUN_ID")
     if os.environ.get("HERMES_KANBAN_TASK") != task_id or not raw:
         return None
@@ -1017,6 +1065,8 @@ def _cmd_schedule(args: argparse.Namespace) -> int:
 
 
 def _cmd_unblock(args: argparse.Namespace) -> int:
+    if os.environ.get("HERMES_KANBAN_TASK"):
+        return _err("kanban unblock is orchestrator-only; workers must hand off their assigned task")
     ids, rc = _require_ids(args)
     if rc:
         return rc
@@ -1309,6 +1359,8 @@ def _cmd_runs(args: argparse.Namespace) -> int:
         el = f"{elapsed}s" if elapsed < 60 else f"{elapsed // 60}m" if elapsed < 3600 else f"{elapsed / 3600:.1f}h"
         outcome = r.outcome or ("(running)" if not r.ended_at else r.status)
         print(f"{i:3d}  {outcome:12s}  {(r.profile or '-'):16s}  {el:>8s}  {_fmt_ts(r.started_at)}")
+        for analytics_line in _run_analytics_lines(r):
+            print(f"     {analytics_line}")
         if r.summary:
             print(f"     → {r.summary.splitlines()[0][:100]}")
         if r.error:

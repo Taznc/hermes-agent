@@ -173,6 +173,11 @@ def _resolve_concurrent_tool_timeout() -> float | None:
 def _flush_session_db_after_tool_progress(agent, messages: list, *, stage: str) -> bool:
     """Flush tool-call progress to the session DB before projecting it to any UI: tool side
     effects can kill/restart the process before turn-end persistence runs."""
+    from agent.turn_iteration_prep import _maybe_inject_iteration_budget_warning
+
+    # Persist exactly the checkpoint text the next model call will see, before stamping
+    # this tool result as durable. Already-written rows must never be rewritten later.
+    _maybe_inject_iteration_budget_warning(agent, messages)
     try:
         persisted = agent._flush_messages_to_session_db(messages) is not False
         if not persisted:
@@ -758,6 +763,42 @@ def _run_agent_tool_execution_middleware(
 # Sequential wait-loop poll cadence: /stop lands within ~1s even if the tool never polls is_interrupted().
 _SEQUENTIAL_INTERRUPT_POLL_SECONDS = 1.0
 
+# Slack on top of delegation.child_timeout_seconds so the child's own timeout handling
+# (structured entry, diagnostic dump, deferred close) runs and reports, rather than the
+# parent abandoning the call a moment before the child would have surfaced the reason.
+_DELEGATE_CHILD_TIMEOUT_GRACE_S = 30.0
+
+
+def _delegate_task_timeout() -> float | None:
+    """Deadline for a blocking ``delegate_task`` call, or None (unbounded).
+
+    The generic tool-batch deadline is the wrong bound here: it measures "how long may a
+    tool take" while a delegation's real bound is ``delegation.child_timeout_seconds``,
+    which is 0 (no cap) by default. Under the batch deadline the parent abandoned the call
+    at 420 s and reported ``[error]`` while the child ran on to completion and handed its
+    result to nobody — and in a Kanban worker there is no async rail to fall back to
+    (``async_delivery_supported()`` is False for one-shot workers, so a detached completion
+    would have no consumer at all).
+
+    So: ``timeouts.tools.delegate_task`` when configured, else the child's own cap plus a
+    grace window (so the CHILD's structured timeout entry surfaces instead of the parent's
+    generic abandonment message), else unbounded. Unbounded is not uninterruptible —
+    ``_poll_sequential_future`` still polls ``_interrupt_requested`` every second.
+    """
+    from agent.deadline import clamp_timeout, resolve_timeout
+
+    configured = resolve_timeout("tools.delegate_task", default=None)
+    if configured is not None:
+        return configured
+    try:
+        from tools.delegate_tool import _get_child_timeout
+
+        child_timeout = _get_child_timeout()
+    except Exception:
+        logger.debug("delegate_task deadline: child timeout lookup failed", exc_info=True)
+        return None
+    return None if child_timeout is None else clamp_timeout(child_timeout + _DELEGATE_CHILD_TIMEOUT_GRACE_S)
+
 
 def _resolve_sequential_tool_timeout() -> float | None:
     """Deadline for one sequential call: ``timeouts.tools.sequential_call``, else the
@@ -767,6 +808,15 @@ def _resolve_sequential_tool_timeout() -> float | None:
     from agent.deadline import resolve_timeout
 
     return resolve_timeout("tools.sequential_call", default=_resolve_concurrent_tool_timeout())
+
+
+def _sequential_tool_deadline(function_name: str) -> float | None:
+    """Deadline for one sequential call by tool. ``delegate_task`` resolves its own from
+    the child's cap: a subagent legitimately outlives any tool-batch bound, and unlike
+    every other tool its result is DESTROYED when the parent abandons the wait."""
+    if function_name == "delegate_task":
+        return _delegate_task_timeout()
+    return _resolve_sequential_tool_timeout()
 
 
 def _abandoned_sequential_result(agent, ref: _ToolCallRef, message: str, result_cls, **outcome) -> _ManagedToolResult:
@@ -815,7 +865,7 @@ def _run_sequential_tool_execution_middleware(
     """Run one sequential call on a worker thread under the concurrent executor's deadline.
     Interactive tools (``clarify``) own their wait via ``agent.clarify_timeout``; the
     generic deadline would report ``tool_timeout`` while the prompt is still live."""
-    timeout_s = _resolve_sequential_tool_timeout()
+    timeout_s = _sequential_tool_deadline(function_name)
     ref = _ToolCallRef(function_name, function_args, effective_task_id, tool_call_id, middleware_trace)
     kwargs = dict(ref.middleware_kwargs(), execute=execute, scope_block=scope_block, display_index=display_index)
     if function_name in _NEVER_PARALLEL_TOOLS:

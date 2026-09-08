@@ -35,6 +35,8 @@ import type {
   KanbanTask,
   KanbanTaskDetail,
   OrchestrationSettings,
+  PostDrainCancelResult,
+  PostDrainQueueResult,
   StagedAttachment,
   TaskEstimate,
   WorkerLog
@@ -100,11 +102,22 @@ export const $collapsedLanes = atom<Record<string, boolean>>({})
  *  what's rendered. */
 export const $hiddenBoards = atom<Record<string, boolean>>({})
 
+/** Per-board visibility of the two wishlist lanes (`idea` + `roadmap`), keyed
+ *  by board slug (true = hidden). Absence means SHOWN — a board nobody has
+ *  touched shows its full structure. Persisted alongside `$collapsedLanes` /
+ *  `$hiddenBoards`; scoped per board because a wishlist is a property of one
+ *  board, not of the app: hiding a 200-card roadmap on one board must not
+ *  hide a 3-card one on another. Distinct from `$collapsedLanes`, which
+ *  renders a thin rail — this removes the lanes entirely, and their cards
+ *  drop out of the board's counts with them. */
+export const $roadmapHidden = atom<Record<string, boolean>>({})
+
 const BOARD_SLUG_KEY = 'boardSlug'
 const INTRO_KEY = 'introDismissed'
 const LANES_KEY = 'lanesByProfile'
 const COLLAPSED_KEY = 'collapsedLanes'
 const HIDDEN_BOARDS_KEY = 'hiddenBoards'
+const ROADMAP_HIDDEN_KEY = 'roadmapHidden'
 
 /** One live `task_events` frame → precise cache invalidation: the board, plus
  *  each touched task's detail. The polls (8s board / 4s drawer) stay as the
@@ -207,6 +220,7 @@ export function bindApi(
   persist($lanesByProfile, LANES_KEY, false)
   persist($collapsedLanes, COLLAPSED_KEY, {})
   persist($hiddenBoards, HIDDEN_BOARDS_KEY, {})
+  persist($roadmapHidden, ROADMAP_HIDDEN_KEY, {})
 
   const open = (slug: string) => {
     // A board switch (including into/out of the sentinel) always invalidates any prior
@@ -541,9 +555,9 @@ export const importBoard = (archive: string) =>
 export const nudgeDispatcher = (board?: string) =>
   call<{ spawned?: unknown[] }>(boardPath('/dispatch', board), { method: 'POST', body: {} })
 
-/** Append a free-typed idea to the board's roadmap `## Ideas` inbox
- *  (Phase 2.15). Never rejects on a roadmap-unavailable outcome — the
- *  backend is fail-open by contract — so callers branch on `ok`/`reason`
+/** Capture a free-typed idea as a card in the board's `idea` lane. Never
+ *  rejects on an unavailable outcome — the backend is fail-open by contract —
+ *  so callers branch on `ok`/`reason` (`empty_idea` | `roadmap_unavailable`)
  *  rather than a thrown error, matching `estimateNew`'s shape. */
 export const addRoadmapIdea = (text: string, sourceId?: string, board?: string) =>
   call<{ ok: boolean; reason?: null | string }>(boardPath('/roadmap/idea', board), {
@@ -721,6 +735,31 @@ export const resumeDispatch = () =>
   $boardSlug.get() === ALL_BOARDS
     ? resumeAllDispatch()
     : call<DispatchResumeResult>(dispatchPath('/dispatch/resume'), { method: 'POST' })
+
+/** Queue an action to fire once the selected scope drains to 0 running.
+ *
+ * Reuses the same `dispatchPath` scope contract as pause/resume, so All Boards
+ * arms every active board under one group and a single board arms only itself.
+ * Only the intent travels here — the dispatcher tick is what fires it, with or
+ * without this dashboard still open. */
+export const queuePostDrainAction = (input: {
+  actionKind: string
+  target?: null | string
+  expiresInSeconds?: null | number
+}) =>
+  call<PostDrainQueueResult>(dispatchPath('/dispatch/post-drain'), {
+    method: 'POST',
+    body: {
+      action_kind: input.actionKind,
+      expires_in_seconds: input.expiresInSeconds ?? null,
+      target: input.target ?? null
+    }
+  })
+
+/** Cancel a waiting action. `cancelled: false` means nothing was waiting to
+ *  cancel (already firing or already settled) — not an error. */
+export const cancelPostDrainAction = () =>
+  call<PostDrainCancelResult>(dispatchPath('/dispatch/post-drain'), { method: 'DELETE' })
 
 export const saveProfileDescription = (name: string, description: string) =>
   call(`/profiles/${encodeURIComponent(name)}`, { method: 'PATCH', body: { description } })

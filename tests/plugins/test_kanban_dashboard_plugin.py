@@ -1943,13 +1943,13 @@ def test_archive_done_skips_card_that_leaves_done_before_its_atomic_archive(clie
 # ---------------------------------------------------------------------------
 
 
-def test_board_renders_lane_columns_after_the_live_ones(client):
+def test_board_renders_lane_columns_before_the_live_ones(client):
     """The lanes are real columns (a status missing from BOARD_COLUMNS gets mis-bucketed
-    into ``todo``), and they trail every live column."""
+    into ``todo``), and they lead every live column: capture -> refine -> authorize."""
     r = client.get("/api/plugins/kanban/board")
     names = [c["name"] for c in r.json()["columns"]]
-    assert names[-2:] == ["idea", "roadmap"]
-    assert names.index("done") < names.index("idea")
+    assert names[:2] == ["idea", "roadmap"]
+    assert names.index("roadmap") < names.index("triage")
 
 
 def test_lane_card_is_bucketed_into_its_own_column(client):

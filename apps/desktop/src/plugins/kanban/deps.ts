@@ -11,13 +11,19 @@
  *  send `link_edges`.
  */
 
-import type { KanbanBoard, KanbanTask, ResolvedLink } from './types'
+import { type KanbanBoard, type KanbanTask, type ResolvedLink, ROADMAP_LANES } from './types'
 
 /** A blocker stops gating once it reaches a terminal state. `done` is the
  *  dispatcher's own promotion rule (a child promotes when every parent is
  *  done); `archived` is treated the same way here because an archived task
- *  will never complete and would otherwise gate forever. */
-export const GATING_CLEARED: ReadonlySet<string> = new Set(['done', 'archived'])
+ *  will never complete and would otherwise gate forever.
+ *
+ *  The wishlist lanes (`idea`/`roadmap`) clear for the opposite reason: they
+ *  are INERT, not terminal. No automation ever selects them (the backend's own
+ *  `kanban_db.NON_ACTIVE_STATUSES` — used by `_ACTIVE_CHILDREN_SQL` and the
+ *  coedit stalled-holder query — excludes both), so a wishlist child can never
+ *  become work and must not read as something holding a real card up. */
+export const GATING_CLEARED: ReadonlySet<string> = new Set(['done', 'archived', ...ROADMAP_LANES])
 
 export const isGating = (status: string): boolean => !GATING_CLEARED.has(status)
 
@@ -177,11 +183,7 @@ export interface BlockerStand {
   gating: number
 }
 
-export function blockerStand(
-  graph: DependencyGraph,
-  index: Map<string, KanbanTask>,
-  key: string
-): BlockerStand {
+export function blockerStand(graph: DependencyGraph, index: Map<string, KanbanTask>, key: string): BlockerStand {
   const parents = upstreamOf(graph, key)
   let gating = 0
 
@@ -200,10 +202,7 @@ export function blockerStand(
 /** The set to keep lit when a card is focused: itself + direct neighbours.
  *  Deliberately ONE hop. Transitive closure on a busy board lights up nearly
  *  everything, which defeats the point of dimming. */
-export function focusSets(
-  graph: DependencyGraph,
-  key: string
-): { upstream: Set<string>; downstream: Set<string> } {
+export function focusSets(graph: DependencyGraph, key: string): { upstream: Set<string>; downstream: Set<string> } {
   return {
     upstream: new Set(upstreamOf(graph, key)),
     downstream: new Set(downstreamOf(graph, key))

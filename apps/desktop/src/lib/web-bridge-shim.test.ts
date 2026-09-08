@@ -92,7 +92,14 @@ const SENTINEL_GATED: Record<string, string> = {
   // Rendered ONLY by desktop-install-overlay (its remote-setup step), which
   // bails before mount unless onBootstrapEvent exists — so this form never
   // reaches its connection-config calls in the web build.
-  'components/first-run-remote-form.tsx': 'onBootstrapEvent'
+  'components/first-run-remote-form.tsx': 'onBootstrapEvent',
+  // The whole file's bridge surface is the optional `mcpOauth` NAMESPACE
+  // (global.d.ts declares it `mcpOauth?:`), aliased once and then only used
+  // inside `if (bridge)` / `if (bridge && listener)`. With the shim omitting
+  // it, a local gateway hosts its own loopback listener and a remote one
+  // throws an explicit "Update Hermes Desktop" message — neither reaches
+  // bridge.listen()/cancel(). Self-disables if the shim ever adds mcpOauth.
+  'lib/mcp-dashboard-oauth.ts': 'mcpOauth'
 }
 
 /** Files exempted by a gate that lives in ANOTHER file (the renderer). */

@@ -976,14 +976,19 @@ def _entry_ids(entries: Iterable[Any]) -> Dict[str, Dict[str, Any]]:
 
 
 def write_credential_pool(
-    provider_id: str, entries: List[Dict[str, Any]], *, removed_ids: Optional[Iterable[str]] = None,
+    provider_id: str, entries: List[Dict[str, Any]], *,
+    removed_ids: Optional[Iterable[str]] = None,
     reset_at: Optional[float] = None,
+    status_cleared_ids: Optional[Iterable[str]] = None,
 ) -> Path:
     """Persist one provider's credential pool under auth.json.
 
     Final disk-boundary sanitizer for borrowed credentials (callers may pass raw dicts). Entries on
     disk but missing from *entries* (added concurrently) are merged back unless in *removed_ids*,
-    so a rotation/exhaustion rewrite never drops a concurrent credential.
+    so a rotation/exhaustion rewrite never drops a concurrent credential. Entries in
+    *status_cleared_ids* were cleared deliberately (``hermes auth reset``) and skip the
+    recency merge, which would otherwise read their cleared ``last_status_at`` (None ->
+    epoch 0) as a stale snapshot and copy a still-binding cooldown back.
 
     *reset_at* marks this write as an explicit operator reset and records a durable reset floor for
     the provider. Every write — this one and every later one, from any process — then drops
@@ -1002,9 +1007,13 @@ def write_credential_pool(
         existing_list = existing_list if isinstance(existing_list, list) else []
         existing_by_id = _entry_ids(existing_list)
         new_ids = set(_entry_ids(sanitized))
+        status_cleared = {cid for cid in (status_cleared_ids or ()) if cid}
         merged: List[Dict[str, Any]] = [
             _strip_superseded_cooldown(
-                _merge_disk_cooldown_state(e, existing_by_id.get(e.get("id")), provider_id),
+                _merge_disk_cooldown_state(
+                    e, None if e.get("id") in status_cleared else existing_by_id.get(e.get("id")),
+                    provider_id,
+                ),
                 provider_id, floor)
             if isinstance(e, dict) else e
             for e in sanitized]

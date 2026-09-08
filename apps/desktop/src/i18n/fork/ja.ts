@@ -80,7 +80,13 @@ export const forkJa: TranslationOverrides = {
   },
   settings: {
     gateway: {
-      openLogsFailed: 'ログフォルダを開けませんでした'
+      openLogsFailed: 'ログフォルダを開けませんでした',
+      singleBackendTitle: 'バックエンドは 1 つ、サーバー側で管理',
+      singleBackendDesc: (host: string) =>
+        `このブラウザ版は ${host} 上の単一の Hermes バックエンドに固定されています。リモート・SSH・Cloud のゲートウェイを登録するには Hermes デスクトップアプリが必要です。`,
+      singleBackendDescNoHost:
+        'このブラウザ版は単一の Hermes バックエンドに固定されています。リモート・SSH・Cloud のゲートウェイを登録するには Hermes デスクトップアプリが必要です。',
+      singleBackendDocsLink: 'デスクトップを複数の Hermes インスタンスに接続する'
     }
   },
   sidebar: {

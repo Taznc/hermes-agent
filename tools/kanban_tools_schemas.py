@@ -254,6 +254,14 @@ KANBAN_REQUEST_CHANGES_SCHEMA = _schema(
                 "Specific, actionable changes the implementer must make "
                 "before requesting another review."
         )),
+        "metadata": {
+            "type": "object",
+            "description": (
+                "Optional structured facts about this review round, such "
+                "as which acceptance criteria failed or what was checked."
+            ),
+            "additionalProperties": True,
+        },
     },
     ["reason"],
 )
@@ -481,6 +489,10 @@ KANBAN_CREATE_SCHEMA = _schema(
                 "blocks the task for human review). Use this for "
                 "open-ended cards where one shot rarely finishes the "
                 "work. Defaults to false (classic single-shot worker)."
+        )),
+        "completion_contract": _prop("string", (
+            "Declare at creation: local-only (default), OWNER/REPO for PR publication, or an exact GitHub PR URL. "
+            "PR tasks cannot complete until repository-required exact-head CI passes. On publication pass metadata.published_pr."
         )),
         "goal_max_turns": _prop("integer", (
                 "Turn budget for goal_mode workers. Caps how many "
