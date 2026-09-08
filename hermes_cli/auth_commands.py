@@ -443,8 +443,21 @@ def auth_remove_command(args) -> None:
 def auth_reset_command(args) -> None:
     provider = _normalize_provider(getattr(args, "provider", ""))
     pool = load_pool(provider)
-    count = pool.reset_statuses()
-    print(f"Reset status on {count} {provider} credentials")
+    report = pool.reset_statuses_report()
+    if report.ok:
+        print(f"Reset status on {report.cleared} {provider} credentials")
+        return
+    # Never report an in-memory clear as a result: the 2026-09-07 incident printed
+    # success while both rows stayed exhausted on disk.
+    print(f"Reset only {report.cleared} of {report.requested} {provider} credentials")
+    if report.error:
+        print(f"Failed to persist the reset: {report.error}")
+    else:
+        print(
+            "The remaining rows are still in cooldown on disk — another Hermes process "
+            "may have re-recorded them. Re-run after stopping other Hermes processes."
+        )
+    raise SystemExit(1)
 
 
 def auth_status_command(args) -> None:
