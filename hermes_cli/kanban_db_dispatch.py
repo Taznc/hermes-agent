@@ -36,6 +36,10 @@ if TYPE_CHECKING:
 # dispatcher parks the task in ``blocked`` with a reason — prevents retry storms.
 DEFAULT_FAILURE_LIMIT = 2
 
+# Hard stop on the review<->changes_requested loop (kanban.max_review_rounds).
+# 0 = unlimited (legacy, pre-cap behavior).
+DEFAULT_MAX_REVIEW_ROUNDS = 3
+
 
 def effective_failure_limit(task_max_retries: Optional[Any], failure_limit: int) -> tuple:
     """Circuit-breaker threshold precedence: a task's own ``max_retries`` wins over the
@@ -196,6 +200,13 @@ class DispatchResult:
     auto_escalated_rework: list[tuple[str, str, str, int]] = field(default_factory=list)
     """``(task_id, previous_assignee, escalation_profile, changes_rounds)`` for
     ready cards routed to a specialist after repeated requested-change cycles."""
+    blocked_review_round_cap: list[tuple[str, int]] = field(default_factory=list)
+    """``(task_id, changes_rounds)`` for ready cards that hit
+    ``kanban.max_review_rounds`` and were blocked (kind ``review_round_cap``)
+    instead of being re-dispatched to the implementer or escalation profile.
+    The hard stop for the review<->changes_requested loop — checked BEFORE
+    ``auto_escalated_rework`` so a card at the cap blocks rather than getting
+    one more escalated round."""
     skipped_nonspawnable: list[str] = field(default_factory=list)
     """Ready task ids whose assignee names a control-plane lane (e.g. a Claude
     Code terminal like ``orion-cc``), not a Hermes profile. Expected steady-state
@@ -2121,6 +2132,10 @@ class DispatchCaps:
     dispatch_start_budget: Optional[int] = None
     dispatch_start_window_seconds: int = 600
     review_rework_escalation_profile: Optional[str] = None
+    # Hard stop on the review<->changes_requested loop (kanban.max_review_rounds). Always a
+    # concrete int (0 = unlimited) — unlike the Optional caps above, "not configured" and
+    # "explicitly disabled" both resolve to a number the dispatcher can compare directly.
+    max_review_rounds: int = DEFAULT_MAX_REVIEW_ROUNDS
 
 
 def resolve_dispatch_caps(kanban_cfg: Optional[dict] = None) -> DispatchCaps:
@@ -2171,6 +2186,9 @@ def resolve_dispatch_caps(kanban_cfg: Optional[dict] = None) -> DispatchCaps:
         review_rework_escalation_profile=(
             kanban_cfg.get("review_rework_escalation_profile") or ""
         ).strip() or None,
+        max_review_rounds=_nonnegative_int(
+            kanban_cfg.get("max_review_rounds"), DEFAULT_MAX_REVIEW_ROUNDS,
+        ),
     )
 
 
@@ -2758,6 +2776,7 @@ def dispatch_once(
     dispatch_start_budget: Optional[int] = None,
     dispatch_start_window_seconds: int = 600,
     review_rework_escalation_profile: Optional[str] = None,
+    max_review_rounds: Optional[int] = None,
     reconcile_orphans: bool = True,
 ) -> DispatchResult:
     """Run one dispatcher tick under the board's single-writer lock.
@@ -2785,6 +2804,7 @@ def dispatch_once(
             dispatch_start_budget=dispatch_start_budget,
             dispatch_start_window_seconds=dispatch_start_window_seconds,
             review_rework_escalation_profile=review_rework_escalation_profile,
+            max_review_rounds=max_review_rounds,
             reconcile_orphans=reconcile_orphans,
         )
 
@@ -3109,6 +3129,93 @@ def _manually_assigned_after(
     return not source.startswith("kanban.")
 
 
+def _last_changes_requested_reason(conn: sqlite3.Connection, task_id: str) -> Optional[str]:
+    """Reason text from the most recent ``changes_requested`` event, if any."""
+    event = _kb._latest_event(conn, task_id, "changes_requested")
+    if event is None:
+        return None
+    payload = _kb._json_dict(_kb._row_get(event, "payload"))
+    reason = payload.get("reason")
+    return reason if isinstance(reason, str) and reason.strip() else None
+
+
+def _apply_review_round_cap(
+    conn: sqlite3.Connection,
+    task_id: str,
+    *,
+    changes_rounds: int,
+    max_review_rounds: int,
+    dry_run: bool,
+) -> bool:
+    """Hard-stop a card that hit ``kanban.max_review_rounds``: block it instead of
+    re-dispatching to the implementer or the rework escalation profile.
+
+    This is the hard stop for the review<->changes_requested loop (the reviewer-side
+    round contract in the sdlc-review skill is advisory only). Mirrors
+    :func:`_apply_rework_escalation`'s shape: a raw UPDATE guarded by the row's
+    current status/assignee so a race (row already claimed/reassigned) is a no-op,
+    plus a durable event carrying the round count and last reviewer reason.
+    """
+    if dry_run:
+        return True
+    reason = _last_changes_requested_reason(conn, task_id)
+    try:
+        with _kb.write_txn(conn):
+            cur = conn.execute(
+                "UPDATE tasks SET status = 'blocked', block_kind = ?, claim_lock = NULL, "
+                "claim_expires = NULL, worker_pid = NULL, worker_unit = NULL "
+                "WHERE id = ? AND status = 'ready'",
+                ("review_round_cap", task_id),
+            )
+            if cur.rowcount != 1:
+                return False
+            _kb._append_event(
+                conn,
+                task_id,
+                "review_round_cap",
+                {
+                    "changes_rounds": changes_rounds,
+                    "max_review_rounds": max_review_rounds,
+                    "reason": reason,
+                },
+            )
+    except Exception:
+        _kb._log.debug(
+            "kanban dispatch: failed to apply review round cap for task %s",
+            task_id,
+            exc_info=True,
+        )
+        return False
+    return True
+
+
+def _model_override_is_operator_set(conn: sqlite3.Connection, task_id: str) -> bool:
+    """Whether the task's current model/provider/reasoning override was set by an
+    operator, as opposed to the create-time routing classifier.
+
+    An override is classifier-picked (and therefore clearable on escalation) ONLY
+    when BOTH hold: (1) no ``model_override_set``/``reasoning_effort_set`` event
+    exists for this task — those only ever come from an explicit
+    ``kb.set_model_override``/``kb.set_reasoning_effort`` call (CLI `kanban
+    set-model` or the dashboard PATCH), never from the dispatcher or the
+    create-time classifier; and (2) the task's ``created`` event recorded
+    ``route_source == "mechanical"`` — the one create-time routing decision that
+    is NOT an operator choice (``kanban_model_routing.resolve_kanban_model_route``).
+    Every other case (``route_source`` is ``"explicit"``, absent/legacy, or an
+    operator later ran ``set-model``/``set-reasoning``) is operator-set and must
+    survive rework escalation.
+    """
+    if conn.execute(
+        "SELECT 1 FROM task_events WHERE task_id = ? "
+        "AND kind IN ('model_override_set', 'reasoning_effort_set') LIMIT 1",
+        (task_id,),
+    ).fetchone() is not None:
+        return True
+    created = _kb._latest_event(conn, task_id, "created")
+    route_source = _kb._json_dict(_kb._row_get(created, "payload")).get("route_source")
+    return route_source != "mechanical"
+
+
 def _apply_rework_escalation(
     conn: sqlite3.Connection,
     task_id: str,
@@ -3118,7 +3225,14 @@ def _apply_rework_escalation(
     changes_rounds: int,
     dry_run: bool,
 ) -> bool:
-    """Route repeated review rework to a specialist under its own model route."""
+    """Route repeated review rework to a specialist under its own model route.
+
+    Preserves an operator-set model/provider/reasoning override across the
+    handoff (see :func:`_model_override_is_operator_set`) — only a create-time
+    routing-classifier pick is cleared, matching the specialist's OWN model
+    defaults the way a classifier pick already did before an operator ever
+    touched the card.
+    """
     if dry_run:
         return True
     try:
@@ -3130,12 +3244,20 @@ def _apply_rework_escalation(
             ).fetchone()
             if row is None:
                 return False
-            cur = conn.execute(
-                "UPDATE tasks SET assignee = ?, model_override = NULL, "
-                "provider_override = NULL, reasoning_effort = NULL "
-                "WHERE id = ? AND status = 'ready' AND assignee = ?",
-                (escalation_profile, task_id, previous_assignee),
-            )
+            preserve = _model_override_is_operator_set(conn, task_id)
+            if preserve:
+                cur = conn.execute(
+                    "UPDATE tasks SET assignee = ? "
+                    "WHERE id = ? AND status = 'ready' AND assignee = ?",
+                    (escalation_profile, task_id, previous_assignee),
+                )
+            else:
+                cur = conn.execute(
+                    "UPDATE tasks SET assignee = ?, model_override = NULL, "
+                    "provider_override = NULL, reasoning_effort = NULL "
+                    "WHERE id = ? AND status = 'ready' AND assignee = ?",
+                    (escalation_profile, task_id, previous_assignee),
+                )
             if cur.rowcount != 1:
                 return False
             _kb._append_event(
@@ -3150,6 +3272,7 @@ def _apply_rework_escalation(
                     "previous_model_override": row["model_override"],
                     "previous_provider_override": row["provider_override"],
                     "previous_reasoning_effort": row["reasoning_effort"],
+                    "preserved_overrides": preserve,
                 },
             )
     except Exception:
@@ -3438,13 +3561,22 @@ def _dispatch_once_locked(
     dispatch_start_budget: Optional[int] = None,
     dispatch_start_window_seconds: int = 600,
     review_rework_escalation_profile: Optional[str] = None,
+    max_review_rounds: Optional[int] = None,
     reconcile_orphans: bool = True,
 ) -> DispatchResult:
     """One dispatcher tick: reclaim stale/crashed running tasks, promote
     todo -> ready, then atomically claim each spawnable ready/review row and
     call ``spawn_fn(task, workspace_path, board) -> Optional[int]``, recording
     the PID so later ticks catch crashes before the TTL. Cap semantics:
-    :func:`_tick_spawn_budget`."""
+    :func:`_tick_spawn_budget`.
+
+    ``max_review_rounds``: ``None`` (the default every existing entry point
+    passes) resolves from live config via :func:`resolve_dispatch_caps` so
+    the round cap applies fleet-wide without every caller threading it
+    explicitly; pass a concrete int (0 = unlimited) to override.
+    """
+    if max_review_rounds is None:
+        max_review_rounds = resolve_dispatch_caps().max_review_rounds
     result = DispatchResult()
     # Sweep abandoned pre-task pasted-image uploads; best-effort — never abort the tick.
     try:
@@ -3605,11 +3737,27 @@ def _dispatch_once_locked(
                 continue
             row_assignee = default_assignee
             result.auto_assigned_default.append(row["id"])
+        # Hard round cap runs BEFORE escalation: a card that already hit the cap must block,
+        # not get re-routed to a specialist for yet another round. Manual reassignment after
+        # the last changes_requested is the same escape hatch the escalation path already
+        # honors — an operator's explicit routing decision always wins over both mechanisms.
+        changes_rounds, latest_change_id = _changes_requested_state(conn, row["id"])
+        manually_reassigned = _manually_assigned_after(conn, row["id"], latest_change_id)
+        if (
+            max_review_rounds
+            and changes_rounds >= max_review_rounds
+            and not manually_reassigned
+            and _apply_review_round_cap(
+                conn, row["id"], changes_rounds=changes_rounds,
+                max_review_rounds=max_review_rounds, dry_run=dry_run,
+            )
+        ):
+            result.blocked_review_round_cap.append((row["id"], changes_rounds))
+            continue
         if rework_escalation_profile and row_assignee != rework_escalation_profile:
-            changes_rounds, latest_change_id = _changes_requested_state(conn, row["id"])
             if (
                 changes_rounds >= 2
-                and not _manually_assigned_after(conn, row["id"], latest_change_id)
+                and not manually_reassigned
                 and _apply_rework_escalation(
                     conn,
                     row["id"],
@@ -3689,6 +3837,22 @@ def _positive_int(value: Any, default: int, *, minimum: int = 1) -> int:
     except (TypeError, ValueError):
         return default
     return parsed if parsed >= minimum else default
+
+
+def _nonnegative_int(value: Any, default: int) -> int:
+    """Parse a >= 0 int config value; ``None``/invalid/negative falls back to ``default``.
+
+    Distinct from :func:`_positive_int` because 0 is a legitimate, meaningful value here
+    (``kanban.max_review_rounds: 0`` = unlimited, an explicit operator choice) rather than
+    something that should silently fall back to the default like an out-of-range cap would.
+    """
+    if value is None:
+        return default
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError):
+        return default
+    return parsed if parsed >= 0 else default
 
 
 def _positive_int_or_none(value: Any) -> Optional[int]:
@@ -4684,6 +4848,7 @@ def run_daemon(
                     dispatch_start_budget=caps.dispatch_start_budget,
                     dispatch_start_window_seconds=caps.dispatch_start_window_seconds,
                     review_rework_escalation_profile=caps.review_rework_escalation_profile,
+                    max_review_rounds=caps.max_review_rounds,
                     failure_limit=failure_limit,
                 )
             if on_tick is not None:
