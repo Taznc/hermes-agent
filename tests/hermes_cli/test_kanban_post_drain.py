@@ -616,6 +616,60 @@ def test_concurrent_board_ticks_fire_an_aggregate_group_exactly_once(two_boards,
     assert fired == ["reboot"]
 
 
+def test_two_independent_boards_do_not_each_fire_a_host_action_at_once(two_boards, monkeypatch):
+    """Separate single-board actions still add up to ONE machine.
+
+    Board locks alone cannot see this: two boards armed independently (no shared
+    ``group_id``) hold disjoint locks, so nothing in the per-board discipline
+    stops both from rebooting the host in the same instant. The host-wide
+    reservation is what makes the second one wait and then find the machine
+    already going down.
+    """
+    fired: list[str] = []
+    fire_entered = threading.Event()
+    loser_done = threading.Event()
+    original = pd.ACTION_HANDLERS["reboot"]
+
+    def slow_fire(record, cfg):
+        fired.append("reboot")
+        fire_entered.set()
+        loser_done.wait(timeout=20)
+
+    monkeypatch.setitem(
+        pd.ACTION_HANDLERS, "reboot",
+        type(original)(
+            kind="reboot", takes_target=False, resolve_target=original.resolve_target,
+            observe_before=lambda record, cfg: {}, fire=slow_fire,
+            observe_after=lambda record, cfg: {"state": pd.SUCCEEDED},
+        ),
+    )
+    # Deliberately NO group_id: two unrelated single-board intents.
+    for board in two_boards:
+        pd.queue_post_drain_action(board, action_kind="reboot")
+
+    start = threading.Barrier(2)
+    finished = threading.Semaphore(0)
+
+    def tick(board):
+        try:
+            start.wait(timeout=10)
+            pd.evaluate_post_drain_action(board)
+        finally:
+            finished.release()
+
+    threads = [threading.Thread(target=tick, args=(board,)) for board in two_boards]
+    for thread in threads:
+        thread.start()
+
+    assert fire_entered.wait(timeout=20), "no board tick ever reached the handler"
+    assert finished.acquire(timeout=20), "the losing board tick never completed"
+    loser_done.set()
+    for thread in threads:
+        thread.join(timeout=30)
+
+    assert fired == ["reboot"]
+
+
 def test_one_expired_member_expires_the_whole_aggregate_group(two_boards, recorder):
     """A group can only fire as a unit, so one dead leg ends all of them.
 
