@@ -35,10 +35,11 @@ import { computed } from 'nanostores'
 import { orderByIds } from '@/app/chat/sidebar/order'
 import { filterSessionsByProfileScope } from '@/app/chat/sidebar/profile-scope'
 import { orderProjectsByIds, sortProjectsForOverview } from '@/app/chat/sidebar/projects/model'
+import { resolveLiveProjectFilter } from '@/app/chat/sidebar/project-filter'
 import {
   excludeProjectSessions,
-  liveSessionProjectId,
   NO_PROJECT_ID,
+  sessionMatchesProjectFilter,
   sessionRecency,
   type SidebarProjectTree
 } from '@/app/chat/sidebar/projects/workspace-groups'
@@ -120,6 +121,15 @@ export const $sidebarWorktreeGroupingActive = computed(
   (grouping, showArchived) => grouping === 'project' && !showArchived
 )
 
+/** The persisted project filter narrowed to ids the ACTIVE tree resolves. The
+ *  filter's storage is shared across profiles and outlives project deletes, so
+ *  a stale/cross-profile id must be inert rather than emptying every tier of
+ *  the sidebar (upstream #96246 / #97762). */
+export const $sidebarLiveProjectFilter = computed(
+  [$sidebarProjectFilter, $projectTree],
+  (projectFilter, projectTree) => resolveLiveProjectFilter(projectFilter, projectTree)
+)
+
 /** One predicate for the status/project/profile/PR filters, shared by the
  *  flat list (via `$sidebarVisibleSessions`) and the project lanes (via
  *  `$sidebarIsHiddenFromProjects`) so both narrow by the same rule. Republishes
@@ -128,7 +138,7 @@ export const $sidebarWorktreeGroupingActive = computed(
 export const $sidebarSessionMatchesFilters = computed(
   [
     $sidebarStatusExcludedIds,
-    $sidebarProjectFilter,
+    $sidebarLiveProjectFilter,
     $sidebarProfileFilter,
     $sidebarAllProfilesActive,
     $sidebarPrFilter,
@@ -154,14 +164,16 @@ export const $sidebarSessionMatchesFilters = computed(
       }
 
       // Same membership the sidebar groups and colors by, so a filtered row
-      // lands in the lane the user picked it from.
-      return !projectFilter.length || projectFilter.includes(liveSessionProjectId(session, projects) ?? '')
+      // lands in the lane the user picked it from. Detached rows file under the
+      // Home bucket id (same rule as the overview overlay), so filtering to
+      // Home keeps Home's own rows.
+      return sessionMatchesProjectFilter(session, projectFilter, projects)
     }
 )
 
 /** Whether any filter narrows the session pool at all. */
 export const $sidebarFiltersNarrow = computed(
-  [$sidebarStatusFilter, $sidebarProjectFilter, $sidebarPrFilter, $sidebarAllProfilesActive, $sidebarProfileFilter],
+  [$sidebarStatusFilter, $sidebarLiveProjectFilter, $sidebarPrFilter, $sidebarAllProfilesActive, $sidebarProfileFilter],
   (statusFilter, projectFilter, prFilter, showAllProfiles, profileFilter) =>
     statusFilter.length > 0 ||
     projectFilter.length > 0 ||

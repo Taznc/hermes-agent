@@ -1989,6 +1989,8 @@ class TestSystemdCgroupIsolation:
             "MemoryHigh=3G",
             f"MemoryMax={4 * 1024 * 1024 * 1024}",
             "TimeoutStopSec=30s",
+            # The fork spawns a transient SERVICE (--pipe, no --scope), which accepts OOMPolicy;
+            # upstream dropped it only because transient scopes reject it on systemd <253 (#102486).
             "OOMPolicy=kill",
         }.issubset(properties)
         # The original shell command must still be present at the tail,
@@ -2400,6 +2402,12 @@ class TestSystemdCgroupIsolation:
         assert first is True
         assert second is True
         assert len(probe_calls) == 1, "probe must run only once (cached)"
+        # The probe must not carry OOMPolicy= either: that is the argv systemd
+        # rejected on scope units and cached as "unavailable" (#102486).
+        probe_argv = probe_calls[0][0]
+        assert not any(
+            value.startswith("OOMPolicy=") for value in probe_argv if isinstance(value, str)
+        ), probe_argv
 
     def test_systemd_scope_first_probe_is_serialized(self, monkeypatch):
         """Concurrent first-use callers must wait for one definitive probe.

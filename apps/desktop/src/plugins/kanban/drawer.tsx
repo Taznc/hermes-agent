@@ -357,6 +357,12 @@ export function TaskDrawer({
   })
 
   const activityGroups = useMemo(() => (detail ? groupActivity(detail.events, k) : []), [detail, k])
+  // Upstream made `attachments` optional on the drawer payload (an older backend omits it),
+  // so normalize once here instead of guarding each of the two filtered sections.
+  const attachments = useMemo(
+    () => (Array.isArray(detail?.attachments) ? detail.attachments : []),
+    [detail]
+  )
 
   if (!id) {
     return null
@@ -364,7 +370,7 @@ export function TaskDrawer({
 
   const errorMessage = error ? errText(error) : null
   const tone = columnMeta(task?.status ?? '').tone
-  const attachmentCount = detail?.attachments.length ?? 0
+  const attachmentCount = attachments.length
 
   const move = (status: string) => {
     if (!task || status === task.status) {
@@ -649,13 +655,13 @@ export function TaskDrawer({
                 />
 
                 <ImagesSection
-                  attachments={detail.attachments.filter(isImageAttachment)}
+                  attachments={attachments.filter(isImageAttachment)}
                   board={taskBoard}
                   onOpen={(filename, src) => setLightbox({ filename, src })}
                 />
 
                 <AttachmentsSection
-                  attachments={detail.attachments.filter(a => !isImageAttachment(a))}
+                  attachments={attachments.filter(a => !isImageAttachment(a))}
                   onUpload={file => uploadMut.mutate(file)}
                   pending={uploadMut.isPending}
                 />
