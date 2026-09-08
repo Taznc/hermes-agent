@@ -2370,18 +2370,19 @@ def _pending_skipped_links(
     walk and the restore wrong.
 
     A pair is pending iff its most recent ``link_skipped`` is not settled by a
-    LATER event, ranked by the event log's own monotonic id:
+    LATER event on the child, ranked by the event log's own monotonic id: a
+    ``linked`` (the edge was materialized, including by a restore) or an
+    ``unlinked`` (an operator cut the relation). Order matters in BOTH
+    directions — an older unlink must not suppress a newer explicit relink, and
+    an older skip must not resurrect an edge that was later materialized and
+    then deleted by :func:`_clear_satisfied_outgoing_links`, whose ``linked``
+    predecessor is what settles it. A pair whose row is live, or either of whose
+    tasks is gone, is not pending either.
 
-    * ``linked`` (including a restore) — the edge was materialized;
-    * ``unlinked`` — an operator cut the relation;
-    * ``archived`` on the parent naming the child in ``cleared_child_links`` —
-      archival cleanup disposed of the materialized edge, and that deletion is
-      permanent (see :func:`_clear_satisfied_outgoing_links`).
-
-    Order matters in BOTH directions: an older unlink must not suppress a newer
-    explicit relink, and an older skip must not resurrect an edge a later
-    archive cleared. A pair whose row is live, or either of whose tasks is gone,
-    is not pending either.
+    ``linked`` is a complete record of post-skip materialization: the two
+    ``_link`` call sites that emit no such event (``create_task`` and the
+    decompose root edge) only ever link a task created in that same statement,
+    which cannot already carry a ``link_skipped``.
     """
     sql = "SELECT id, task_id, payload FROM task_events WHERE kind = 'link_skipped'"
     params: tuple[str, ...] = ()
@@ -2414,18 +2415,13 @@ def _skip_superseded(
 ) -> bool:
     """True iff an event after ``skip_id`` settled the ``parent -> child`` relation."""
     rows = conn.execute(
-        "SELECT task_id, kind, payload FROM task_events "
-        "WHERE task_id IN (?, ?) AND id > ? AND kind IN ('linked', 'unlinked', 'archived')",
-        (child_id, parent_id, int(skip_id)),
+        "SELECT payload FROM task_events "
+        "WHERE task_id = ? AND id > ? AND kind IN ('linked', 'unlinked')",
+        (child_id, int(skip_id)),
     ).fetchall()
-    for row in rows:
-        payload = _json_dict(_row_get(row, "payload"))
-        if row["kind"] == "archived":
-            if row["task_id"] == parent_id and child_id in (payload.get("cleared_child_links") or []):
-                return True
-        elif row["task_id"] == child_id and payload.get("parent") == parent_id:
-            return True
-    return False
+    return any(
+        _json_dict(_row_get(row, "payload")).get("parent") == parent_id for row in rows
+    )
 
 
 def _link(conn: sqlite3.Connection, parent_id: str, child_id: str) -> None:
