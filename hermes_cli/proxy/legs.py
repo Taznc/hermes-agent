@@ -149,8 +149,15 @@ class BackendLeg:
         except (UnicodeDecodeError, json.JSONDecodeError):
             parsed = None
         if not isinstance(parsed, dict) or "error" not in parsed:
+            detail = ""
+            if isinstance(parsed, dict):
+                # Preserve whatever the upstream did say; an opaque
+                # "HTTP 400" is unactionable for the operator.
+                detail = f": {json.dumps(parsed)[:400]}"
+            elif raw:
+                detail = f": {raw[:400].decode('utf-8', 'replace')}"
             parsed = _error_payload(
-                f"upstream returned HTTP {response.status}", "upstream_error"
+                f"upstream returned HTTP {response.status}{detail}", "upstream_error"
             )
         eligible = is_failover_status(response.status)
         return LegOutcome(
@@ -326,6 +333,10 @@ class OpenAIResponsesLeg(BackendLeg):
         # Codex accepts only streamed Responses requests; a non-streaming
         # client is served by materializing the terminal object below.
         payload["stream"] = True
+        # The ChatGPT-subscription endpoint refuses a stored response outright
+        # ({"detail":"Store must be set to false"}), so the leg states it rather
+        # than depending on the client to know a backend-specific requirement.
+        payload["store"] = False
 
         headers = {
             "Authorization": f"{credential.token_type} {credential.bearer}",

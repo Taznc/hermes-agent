@@ -1158,3 +1158,55 @@ def test_run_server_builds_the_failover_app_for_a_chain(monkeypatch):
 
     asyncio.run(run())
     assert built == ["failover", "single"]
+
+
+def test_codex_leg_sends_store_false_because_the_subscription_requires_it():
+    """The ChatGPT-subscription Responses endpoint rejects a stored response.
+
+    VERIFIED against the live upstream 2026-09-08: omitting ``store`` returns
+    400 {"detail":"Store must be set to false"} for every model the account can
+    actually use, so the leg must set it rather than relying on the client.
+    """
+    calls: List[Dict[str, Any]] = []
+
+    async def run():
+        async with _Harness(
+            _codex_first(_codex_upstream(calls=calls), _anthropic_upstream())
+        ) as harness:
+            status, _, _ = await harness.post(
+                "/v1/chat/completions",
+                {"model": "gpt-5.5", "messages": [{"role": "user", "content": "hi"}]},
+            )
+            assert status == 200
+        assert calls[0]["store"] is False
+
+    asyncio.run(run())
+
+
+def test_codex_leg_upstream_error_body_is_preserved_not_flattened():
+    """A non-OpenAI-shaped upstream error must keep its detail.
+
+    The live Codex upstream answers 400 with {"detail": "..."} rather than an
+    OpenAI ``error`` object; collapsing that to "upstream returned HTTP 400"
+    left the operator with nothing actionable.
+    """
+
+    async def run():
+        async def detail_400(request):
+            await request.read()
+            return web.json_response({"detail": "the model is not supported"}, status=400)
+
+        upstream = web.Application()
+        upstream.router.add_post("/v1/responses", detail_400)
+
+        async with _Harness(
+            _codex_first(upstream, _anthropic_upstream())
+        ) as harness:
+            status, _, body = await harness.post(
+                "/v1/chat/completions",
+                {"model": "m", "messages": [{"role": "user", "content": "hi"}]},
+            )
+            assert status == 400
+            assert "the model is not supported" in json.loads(body)["error"]["message"]
+
+    asyncio.run(run())
