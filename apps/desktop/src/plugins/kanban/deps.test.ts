@@ -143,7 +143,13 @@ describe('gating status', () => {
 
 describe('indexBoard', () => {
   it('flattens every column into one id → task index', () => {
-    const index = indexBoard(makeBoard([['a', 'todo'], ['b', 'running'], ['c', 'done']]))
+    const index = indexBoard(
+      makeBoard([
+        ['a', 'todo'],
+        ['b', 'running'],
+        ['c', 'done']
+      ])
+    )
 
     expect([...index.keys()].sort()).toEqual(['a', 'b', 'c'])
   })
@@ -163,7 +169,12 @@ describe('indexBoard', () => {
   })
 
   it('indexes tasks that sit in different columns', () => {
-    const index = indexBoard(makeBoard([['a', 'todo'], ['b', 'archived']]))
+    const index = indexBoard(
+      makeBoard([
+        ['a', 'todo'],
+        ['b', 'archived']
+      ])
+    )
 
     expect(index.get('a')?.status).toBe('todo')
     expect(index.get('b')?.status).toBe('archived')
@@ -171,7 +182,12 @@ describe('indexBoard', () => {
 })
 
 describe('resolveLinks', () => {
-  const index = indexBoard(makeBoard([['a', 'done'], ['b', 'running']]))
+  const index = indexBoard(
+    makeBoard([
+      ['a', 'done'],
+      ['b', 'running']
+    ])
+  )
 
   it('resolves a known id to its own identity', () => {
     expect(resolveLinks(['a'], index)).toEqual([
@@ -282,7 +298,13 @@ describe('partitionBlockers', () => {
 describe('buildGraph — edge direction', () => {
   // The single most consequential assertion in this file. An edge is
   // [parent, child] and the parent BLOCKS the child.
-  const { graph } = scene([['parent', 'running'], ['child', 'todo']], [['parent', 'child']])
+  const { graph } = scene(
+    [
+      ['parent', 'running'],
+      ['child', 'todo']
+    ],
+    [['parent', 'child']]
+  )
 
   it('puts the PARENT in blockedBy of the CHILD', () => {
     expect(graph.blockedBy.get('child')).toEqual(['parent'])
@@ -312,8 +334,15 @@ describe('buildGraph — edge direction', () => {
 
   it('accumulates several parents onto one child (fan-in)', () => {
     const { graph: fanIn } = scene(
-      [['p1', 'todo'], ['p2', 'todo'], ['kid', 'todo']],
-      [['p1', 'kid'], ['p2', 'kid']]
+      [
+        ['p1', 'todo'],
+        ['p2', 'todo'],
+        ['kid', 'todo']
+      ],
+      [
+        ['p1', 'kid'],
+        ['p2', 'kid']
+      ]
     )
 
     expect(fanIn.blockedBy.get('kid')).toEqual(['p1', 'p2'])
@@ -323,8 +352,15 @@ describe('buildGraph — edge direction', () => {
 
   it('accumulates several children onto one parent (fan-out)', () => {
     const { graph: fanOut } = scene(
-      [['root', 'todo'], ['c1', 'todo'], ['c2', 'todo']],
-      [['root', 'c1'], ['root', 'c2']]
+      [
+        ['root', 'todo'],
+        ['c1', 'todo'],
+        ['c2', 'todo']
+      ],
+      [
+        ['root', 'c1'],
+        ['root', 'c2']
+      ]
     )
 
     expect(fanOut.blocking.get('root')).toEqual(['c1', 'c2'])
@@ -390,7 +426,10 @@ describe('buildGraph — absent and malformed payloads', () => {
   it('still processes valid edges sitting alongside malformed ones', () => {
     const graph = buildGraph(
       makeBoard(
-        [['p', 'todo'], ['c', 'todo']],
+        [
+          ['p', 'todo'],
+          ['c', 'todo']
+        ],
         [null, ['solo'], ['', 'x'], ['y', ''], 'junk', ['p', 'c'], undefined]
       )
     )
@@ -409,7 +448,13 @@ describe('buildGraph — absent and malformed payloads', () => {
 })
 
 describe('upstreamOf / downstreamOf', () => {
-  const { graph } = scene([['p', 'todo'], ['c', 'todo']], [['p', 'c']])
+  const { graph } = scene(
+    [
+      ['p', 'todo'],
+      ['c', 'todo']
+    ],
+    [['p', 'c']]
+  )
 
   it('returns an empty array — never undefined — for an unknown id upstream', () => {
     const found = upstreamOf(graph, 'nobody')
@@ -458,8 +503,17 @@ describe('upstreamOf / downstreamOf', () => {
 describe('blockerStand', () => {
   it('reports the total and how many of them still gate', () => {
     const { graph, index } = scene(
-      [['done1', 'done'], ['done2', 'done'], ['busy', 'running'], ['kid', 'todo']],
-      [['done1', 'kid'], ['done2', 'kid'], ['busy', 'kid']]
+      [
+        ['done1', 'done'],
+        ['done2', 'done'],
+        ['busy', 'running'],
+        ['kid', 'todo']
+      ],
+      [
+        ['done1', 'kid'],
+        ['done2', 'kid'],
+        ['busy', 'kid']
+      ]
     )
 
     expect(blockerStand(graph, index, 'kid')).toEqual({ total: 3, gating: 1 })
@@ -467,8 +521,15 @@ describe('blockerStand', () => {
 
   it('counts every blocker as gating when none are terminal', () => {
     const { graph, index } = scene(
-      [['a', 'running'], ['b', 'review'], ['kid', 'todo']],
-      [['a', 'kid'], ['b', 'kid']]
+      [
+        ['a', 'running'],
+        ['b', 'review'],
+        ['kid', 'todo']
+      ],
+      [
+        ['a', 'kid'],
+        ['b', 'kid']
+      ]
     )
 
     expect(blockerStand(graph, index, 'kid')).toEqual({ total: 2, gating: 2 })
@@ -476,8 +537,15 @@ describe('blockerStand', () => {
 
   it('reports ALL CLEAR as total > 0 with gating 0 — the green promote chip', () => {
     const { graph, index } = scene(
-      [['a', 'done'], ['b', 'archived'], ['kid', 'todo']],
-      [['a', 'kid'], ['b', 'kid']]
+      [
+        ['a', 'done'],
+        ['b', 'archived'],
+        ['kid', 'todo']
+      ],
+      [
+        ['a', 'kid'],
+        ['b', 'kid']
+      ]
     )
 
     const stand = blockerStand(graph, index, 'kid')
@@ -488,8 +556,17 @@ describe('blockerStand', () => {
 
   it('a wishlist-lane parent is counted but never gates — the drawer must not list it as a blocker', () => {
     const { graph, index } = scene(
-      [['wish', 'roadmap'], ['rough', 'idea'], ['live', 'running'], ['kid', 'todo']],
-      [['wish', 'kid'], ['rough', 'kid'], ['live', 'kid']]
+      [
+        ['wish', 'roadmap'],
+        ['rough', 'idea'],
+        ['live', 'running'],
+        ['kid', 'todo']
+      ],
+      [
+        ['wish', 'kid'],
+        ['rough', 'kid'],
+        ['live', 'kid']
+      ]
     )
 
     expect(blockerStand(graph, index, 'kid')).toEqual({ total: 3, gating: 1 })
@@ -512,8 +589,15 @@ describe('blockerStand', () => {
   // tests below pin that separation down so it is not "fixed" into the helper.
   it('still reports all-clear for a DONE task whose blockers are all done', () => {
     const { graph, index } = scene(
-      [['a', 'done'], ['b', 'done'], ['subject', 'done']],
-      [['a', 'subject'], ['b', 'subject']]
+      [
+        ['a', 'done'],
+        ['b', 'done'],
+        ['subject', 'done']
+      ],
+      [
+        ['a', 'subject'],
+        ['b', 'subject']
+      ]
     )
 
     // The helper does not suppress this case; the UI is what stays quiet.
@@ -523,8 +607,15 @@ describe('blockerStand', () => {
   it('depends only on the blockers\u2019 statuses, never on the subject\u2019s own', () => {
     const stands = ['done', 'todo', 'triage', 'scheduled', 'on_hold', 'running', 'archived'].map(status => {
       const { graph, index } = scene(
-        [['a', 'done'], ['b', 'done'], ['subject', status]],
-        [['a', 'subject'], ['b', 'subject']]
+        [
+          ['a', 'done'],
+          ['b', 'done'],
+          ['subject', status]
+        ],
+        [
+          ['a', 'subject'],
+          ['b', 'subject']
+        ]
       )
 
       return blockerStand(graph, index, 'subject')
@@ -537,20 +628,41 @@ describe('blockerStand', () => {
   })
 
   it('counts a blocker missing from the board index toward gating', () => {
-    const { graph, index } = scene([['kid', 'todo'], ['a', 'done']], [['a', 'kid'], ['ghost', 'kid']])
+    const { graph, index } = scene(
+      [
+        ['kid', 'todo'],
+        ['a', 'done']
+      ],
+      [
+        ['a', 'kid'],
+        ['ghost', 'kid']
+      ]
+    )
 
     expect(blockerStand(graph, index, 'kid')).toEqual({ total: 2, gating: 1 })
   })
 
   it('never reports all-clear while a blocker is missing, even with the rest done', () => {
-    const { graph, index } = scene([['kid', 'todo'], ['a', 'done']], [['a', 'kid'], ['ghost', 'kid']])
+    const { graph, index } = scene(
+      [
+        ['kid', 'todo'],
+        ['a', 'done']
+      ],
+      [
+        ['a', 'kid'],
+        ['ghost', 'kid']
+      ]
+    )
 
     expect(blockerStand(graph, index, 'kid').gating).toBeGreaterThan(0)
   })
 
   it('ignores dependants — only blockers count', () => {
     const { graph, index } = scene(
-      [['root', 'running'], ['kid', 'todo']],
+      [
+        ['root', 'running'],
+        ['kid', 'todo']
+      ],
       [['root', 'kid']]
     )
 
@@ -572,8 +684,18 @@ describe('blockerStand', () => {
 
   it('agrees with partitionBlockers over the resolved rows, missing ids included', () => {
     const { graph, index } = scene(
-      [['kid', 'todo'], ['a', 'done'], ['b', 'running'], ['c', 'archived']],
-      [['a', 'kid'], ['b', 'kid'], ['c', 'kid'], ['ghost', 'kid']]
+      [
+        ['kid', 'todo'],
+        ['a', 'done'],
+        ['b', 'running'],
+        ['c', 'archived']
+      ],
+      [
+        ['a', 'kid'],
+        ['b', 'kid'],
+        ['c', 'kid'],
+        ['ghost', 'kid']
+      ]
     )
 
     const stand = blockerStand(graph, index, 'kid')
@@ -653,7 +775,16 @@ describe('focusSets', () => {
   })
 
   it('de-duplicates repeated neighbours into a set', () => {
-    const { graph: doubled } = scene([['p', 'todo'], ['c', 'todo']], [['p', 'c'], ['p', 'c']])
+    const { graph: doubled } = scene(
+      [
+        ['p', 'todo'],
+        ['c', 'todo']
+      ],
+      [
+        ['p', 'c'],
+        ['p', 'c']
+      ]
+    )
 
     expect(focusSets(doubled, 'c').upstream.size).toBe(1)
   })
@@ -865,7 +996,15 @@ describe('cardKey / board+id identity (All Boards mode)', () => {
   })
 
   it('single-board tuple edges still build a bare-id chain (unchanged)', () => {
-    const graph = buildGraph(makeBoard([['a', 'todo'], ['b', 'todo']], [['a', 'b']]))
+    const graph = buildGraph(
+      makeBoard(
+        [
+          ['a', 'todo'],
+          ['b', 'todo']
+        ],
+        [['a', 'b']]
+      )
+    )
 
     expect([...downstreamOf(graph, 'a')]).toEqual(['b'])
     expect([...upstreamOf(graph, 'b')]).toEqual(['a'])
