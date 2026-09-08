@@ -91,5 +91,10 @@ function isButtonElement(child: ReactNode): child is ReactElement<ComponentProps
 }
 
 function centerButton(button: ReactElement<ComponentProps<typeof Button>>) {
-  return cloneElement(button, { className: cn('justify-self-center', button.props.className) })
+  const actionProps = {
+    className: cn('justify-self-center', button.props.className),
+    'data-error-state-action': 'true'
+  }
+
+  return cloneElement(button, actionProps)
 }
