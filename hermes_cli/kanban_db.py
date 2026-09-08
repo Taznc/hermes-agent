@@ -3879,7 +3879,7 @@ def complete_task(
         # Captured BEFORE the UPDATE below clears worker_pid: preservation's
         # ownership gate must see the pid as it was during the live run, not
         # the post-clear NULL this same transaction is about to produce.
-        captured_worker_pid = _capture_worker_pid(conn, task_id)
+        captured_run_id, captured_worker_pid = _capture_worker_identity(conn, task_id)
         prior_status = _task_status(conn, task_id)
         sql = """
                 UPDATE tasks
@@ -3940,7 +3940,12 @@ def complete_task(
     # Preserve BEFORE cleanup: _cleanup_workspace only removes a worktree that
     # is clean and fully pushed, so a successful snapshot is exactly what lets
     # the worktree be reclaimed — and a refused one keeps it for a human.
-    _preserve_task_work(conn, task_id, known_worker_pid=captured_worker_pid)
+    _preserve_task_work(
+        conn,
+        task_id,
+        expected_run_id=captured_run_id,
+        known_worker_pid=captured_worker_pid,
+    )
     _cleanup_workspace(conn, task_id)
     _done_task = get_task(conn, task_id)
     if fire_lifecycle_hook:
@@ -3951,11 +3956,23 @@ def complete_task(
 _REVIEW_APPROVED_NOTE = "Review approved without additional evidence."
 
 
-def _capture_worker_pid(conn: sqlite3.Connection, task_id: str) -> Optional[int]:
-    """Read ``tasks.worker_pid`` right now, before a caller's own UPDATE
-    clears it — see :func:`_preserve_task_work`'s ``known_worker_pid``."""
-    row = conn.execute("SELECT worker_pid FROM tasks WHERE id = ?", (task_id,)).fetchone()
-    return int(row["worker_pid"]) if row and row["worker_pid"] is not None else None
+def _capture_worker_identity(
+    conn: sqlite3.Connection, task_id: str,
+) -> tuple[Optional[int], Optional[int]]:
+    """Read the active run and PID before a lifecycle UPDATE clears ownership.
+
+    Both values are required. The PID protects a still-running worker after the
+    row is cleared; the run id makes the later preservation call reject a new
+    claim that landed after this transaction committed.
+    """
+    row = conn.execute(
+        "SELECT current_run_id, worker_pid FROM tasks WHERE id = ?", (task_id,),
+    ).fetchone()
+    if row is None:
+        return None, None
+    run_id = int(row["current_run_id"]) if row["current_run_id"] is not None else None
+    worker_pid = int(row["worker_pid"]) if row["worker_pid"] is not None else None
+    return run_id, worker_pid
 
 
 def _preserve_task_work(
@@ -3969,12 +3986,10 @@ def _preserve_task_work(
     could not run, and the import lives here so the preservation module can
     import ``kanban_db`` back without a cycle.
 
-    ``known_worker_pid``: the caller's own captured pid (read BEFORE its
-    lifecycle UPDATE clears ``tasks.worker_pid``) for the lifecycle paths
-    that clear ownership columns in the same transaction that ends the run
-    (``complete_task``, ``block_task``, ``request_review``, ``archive_task``).
-    Omitted for the reclaim paths, which preserve before any column clear and
-    can rely on the row's own live value.
+    Lifecycle paths capture both ``current_run_id`` and ``worker_pid`` before
+    clearing ownership. The run id detects a new claim between the transaction
+    and this call; the PID still protects a live old worker after the row was
+    cleared. Reclaim paths preserve before clearing and use the row directly.
     """
     try:
         from hermes_cli import kanban_preserve
@@ -4288,7 +4303,7 @@ def block_task(
             return False
         # Captured BEFORE the UPDATE below clears worker_pid — see
         # complete_task's identical comment for why this matters.
-        captured_worker_pid = _capture_worker_pid(conn, task_id)
+        captured_run_id, captured_worker_pid = _capture_worker_identity(conn, task_id)
         source_status = _retry_status_for_run(conn, task_id) if cur_row["status"] == "running" else "ready"
         new_status, event_kind, set_sql, params, payload = _route_block(
             kind, reason, source_status, prev_kind=_row_get(cur_row, "block_kind"),
@@ -4323,7 +4338,12 @@ def block_task(
     # Blocking ends this run, so the worker's output must be preserved before
     # anything else can reclaim the workspace. Outside the write txn: the
     # snapshot records its own event.
-    _preserve_task_work(conn, task_id, known_worker_pid=captured_worker_pid)
+    _preserve_task_work(
+        conn,
+        task_id,
+        expected_run_id=captured_run_id,
+        known_worker_pid=captured_worker_pid,
+    )
     if dependency_lane:
         return True
     _fire_task_hook("kanban_task_blocked", blocked_task, task_id, run_id, reason=reason)
@@ -4437,6 +4457,9 @@ def request_review(
             return _ret(False, "task not found")
         # Captured BEFORE the UPDATE below clears worker_pid — see
         # complete_task's identical comment for why this matters.
+        captured_run_id = (
+            int(trow["current_run_id"]) if trow["current_run_id"] is not None else None
+        )
         captured_worker_pid = int(trow["worker_pid"]) if trow["worker_pid"] is not None else None
         # Refuse to clear a live worker's claim without proof of ownership
         # (expected_run_id) or an explicit human override (force=True).
@@ -4519,7 +4542,12 @@ def request_review(
         _append_event(conn, task_id, "review_requested", event_payload, run_id=run_id)
     # The implementation run just ended; preserve its output before the review
     # lane (or any reclaim) can touch the workspace.
-    _preserve_task_work(conn, task_id, known_worker_pid=captured_worker_pid)
+    _preserve_task_work(
+        conn,
+        task_id,
+        expected_run_id=captured_run_id,
+        known_worker_pid=captured_worker_pid,
+    )
     return _ret(True)
 
 
@@ -5216,7 +5244,7 @@ def archive_task(
         # gate must see that pid, not the NULL this same UPDATE is about to
         # write, or it would race the live worker and commit its half-written
         # tree (or let cleanup remove the worktree out from under it).
-        captured_worker_pid = _capture_worker_pid(conn, task_id)
+        captured_run_id, captured_worker_pid = _capture_worker_identity(conn, task_id)
         prior = conn.execute("SELECT status FROM tasks WHERE id = ?", (task_id,)).fetchone()
         from_status = prior["status"] if prior is not None else None
         sql = (
@@ -5250,7 +5278,12 @@ def archive_task(
     # Reap the workspace on archive too (never-completed tasks kept it forever).
     # Preservation first: archive is the last chance to rescue work from a task
     # that never completed, and cleanup will only remove what it saved.
-    _preserve_task_work(conn, task_id, known_worker_pid=captured_worker_pid)
+    _preserve_task_work(
+        conn,
+        task_id,
+        expected_run_id=captured_run_id,
+        known_worker_pid=captured_worker_pid,
+    )
     _cleanup_workspace(conn, task_id)
     return True
 

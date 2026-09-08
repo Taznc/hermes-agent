@@ -460,12 +460,37 @@ def test_lock_fails_closed_when_the_git_dir_is_unresolvable(
         assert acquired is False
 
 
-def test_a_lock_left_by_a_dead_process_is_stolen_not_left_stuck_forever(
+def test_lock_fails_closed_when_the_platform_lock_cannot_be_taken(
+    worktree: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(kp, "_try_lock_fd", lambda fd: False)
+
+    with kp._preserve_lock(worktree, "t_demo") as acquired:
+        assert acquired is False
+
+
+@pytest.mark.windows_only
+def test_windows_lock_backend_excludes_a_second_descriptor(tmp_path: Path) -> None:
+    """Run the real msvcrt locking path on the native Windows CI lane."""
+    import os
+
+    path = tmp_path / "preservation.lock"
+    first = os.open(str(path), os.O_CREAT | os.O_RDWR, 0o600)
+    second = os.open(str(path), os.O_CREAT | os.O_RDWR, 0o600)
+    try:
+        assert kp._try_lock_fd(first) is True
+        assert kp._try_lock_fd(second) is False
+    finally:
+        kp._unlock_fd(first)
+        os.close(first)
+        os.close(second)
+
+
+def test_a_lock_file_left_by_a_dead_process_is_reused(
     worktree: Path,
 ) -> None:
-    """A lock file naming a pid that is no longer alive must not permanently
-    block preservation — this lock guards a best-effort snapshot, not
-    repository correctness, so a crashed holder's lock is reclaimable."""
+    """Kernel locks auto-release on process death, so stale file contents must
+    not permanently block preservation and never require pathname replacement."""
     git_dir = kp._git_out(worktree, "rev-parse", "--path-format=absolute", "--git-dir")
     lock_path = Path(git_dir) / "hermes-kanban-preserve-t_demo.lock"
     # A pid essentially guaranteed to be dead.
@@ -473,6 +498,31 @@ def test_a_lock_left_by_a_dead_process_is_stolen_not_left_stuck_forever(
 
     with kp._preserve_lock(worktree, "t_demo") as acquired:
         assert acquired is True
+
+
+def test_stale_lock_recovery_never_unlinks_the_shared_lock_path(
+    worktree: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Stale recovery must never delete by pathname after observing old
+    contents: another caller may have replaced that path with its live claim in
+    between. OS locks auto-release on process death, so a leftover file can be
+    reused in place without any compare/delete race."""
+    git_dir = kp._git_out(worktree, "rev-parse", "--path-format=absolute", "--git-dir")
+    lock_path = Path(git_dir) / "hermes-kanban-preserve-t_demo.lock"
+    lock_path.write_text("999999999", encoding="utf-8")
+    unlinked: list[Path] = []
+    real_unlink = Path.unlink
+
+    def _track_unlink(path: Path, *args, **kwargs):
+        unlinked.append(path)
+        return real_unlink(path, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "unlink", _track_unlink)
+
+    with kp._preserve_lock(worktree, "t_demo") as acquired:
+        assert acquired is True
+
+    assert unlinked == []
 
 
 

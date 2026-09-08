@@ -342,9 +342,11 @@ def test_an_unexpected_exception_still_records_a_failed_event_with_the_sha(
 
     real_preserve_worktree = kp.preserve_worktree
 
+    secret = "ghp_" + "A" * 36
+
     def _commit_then_blow_up(worktree, branch, **kwargs):
-        result = real_preserve_worktree(worktree, branch, **kwargs)
-        raise RuntimeError("simulated unexpected failure after commit")
+        real_preserve_worktree(worktree, branch, **kwargs)
+        raise RuntimeError(f"simulated push failure with credential {secret}")
 
     monkeypatch.setattr(kp, "preserve_worktree", _commit_then_blow_up)
 
@@ -360,6 +362,10 @@ def test_an_unexpected_exception_still_records_a_failed_event_with_the_sha(
     assert len(events) == 1
     assert events[0]["status"] == "failed"
     assert events[0]["reason"] == "preservation_error"
+    assert events[0]["commit_sha"] == real_head
+    assert events[0]["pushed"] is False
+    assert events[0]["push_error"]
+    assert secret not in json.dumps(events[0])
 
 
 # ---------------------------------------------------------------------------
@@ -396,3 +402,50 @@ def test_archiving_a_task_with_a_live_worker_never_commits_its_worktree(
     assert _events("t_live", "work_preserved") == []
     # And the worktree directory survives (cleanup also refuses it).
     assert wt.is_dir()
+
+
+def test_a_new_claim_between_archive_and_preservation_blocks_the_stale_caller(
+    kanban_home: Path, repo: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The identity captured before archive clears the old claim must
+    corroborate the row read by preservation, not replace it. A new claim can
+    land after the archive transaction commits but before its preservation
+    hook runs; the stale archive caller must not snapshot that newer worker's
+    dirty tree."""
+    wt = _make_task(repo, task_id="t_reclaimed")
+    (wt / "work.py").write_text("new worker is still editing\n", encoding="utf-8")
+    with kbc.connect_closing() as conn:
+        conn.execute(
+            "UPDATE tasks SET status = 'running', current_run_id = 7, worker_pid = 111 "
+            "WHERE id = ?",
+            ("t_reclaimed",),
+        )
+        conn.commit()
+    before = _git("rev-parse", "HEAD", cwd=wt).strip()
+    real_preserve = kb._preserve_task_work
+
+    def _new_claim_then_preserve(
+        conn, task_id, *, expected_run_id=None, known_worker_pid=None
+    ):
+        conn.execute(
+            "UPDATE tasks SET status = 'running', current_run_id = 8, worker_pid = 222 "
+            "WHERE id = ?",
+            (task_id,),
+        )
+        conn.commit()
+        return real_preserve(
+            conn,
+            task_id,
+            expected_run_id=expected_run_id,
+            known_worker_pid=known_worker_pid,
+        )
+
+    monkeypatch.setattr(kb, "_preserve_task_work", _new_claim_then_preserve)
+    monkeypatch.setattr(kp, "_pid_alive", lambda pid: pid == 222)
+
+    with kbc.connect_closing() as conn:
+        assert kb.archive_task(conn, "t_reclaimed") is True
+
+    assert wt.is_dir()
+    assert _git("rev-parse", "HEAD", cwd=wt).strip() == before
+    assert _events("t_reclaimed", "work_preserved") == []

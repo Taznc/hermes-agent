@@ -55,8 +55,11 @@ been saved.
 
 ## Fail-closed rules
 
-Any ambiguity produces **no commit**, a `work_preservation_failed` event on the
-card, and a preserved worktree. The full list of refusals:
+Ownership, branch, and scope ambiguity always produces **no commit** and keeps
+the worktree. Ordinary skips are intentionally not recorded because completion
+and reclaim races make them routine; unsafe content and git failures append a
+`work_preservation_failed` event with the actionable, redacted reason. The
+full list of refusals:
 
 | Verdict | Meaning |
 |---|---|
@@ -99,14 +102,16 @@ keeps the commit; committed work is already safer than dirty work.
 
 Completion and reclaim can fire on one worktree at the same instant. Both would
 otherwise run `git add`/`git commit` against the same index and produce either
-two snapshot commits or a corrupt index. An `fcntl` lock file in the worktree's
-own git dir (`hermes-kanban-preserve-<task-id>.lock`) serializes them
+two snapshot commits or a corrupt index. A kernel-managed lock on a file in the
+worktree's own git dir (`hermes-kanban-preserve-<task-id>.lock`) serializes them
 non-blockingly: the loser returns `skipped/concurrent` and does nothing. The
 lock is per-worktree — unlike `refs/stash`, it is never shared between tasks.
 
-On platforms without `fcntl` (Windows) the lock degrades to "always acquired",
-matching the pre-existing single-preserver behaviour rather than disabling
-preservation.
+The implementation uses `fcntl.flock` on POSIX and `msvcrt.locking` on Windows.
+Both locks are tied to the open file descriptor and released by the OS if the
+process dies. A leftover lock file is reused in place; it is never unlinked or
+replaced, eliminating stale-lock pathname races. If the platform lock cannot be
+established, preservation fails closed rather than proceeding concurrently.
 
 ## What lands on the card
 
@@ -116,18 +121,22 @@ A successful snapshot appends `work_preserved`:
 {"commit_sha": "…", "pushed": true, "push_error": null, "branch": "wt/t_abc123"}
 ```
 
-A refusal appends `work_preservation_failed`:
+An unsafe snapshot or git failure appends `work_preservation_failed`:
 
 ```json
-{"status": "unsafe", "reason": "suspected_secret",
- "detail": "config/.env has a credential-bearing filename", "branch": "wt/t_abc123"}
+{"status": "failed", "reason": "preservation_error",
+ "detail": "push timed out", "commit_sha": "…", "pushed": false,
+ "push_error": "push timed out", "branch": "wt/t_abc123"}
 ```
 
-`detail` names the offending **path**, never its contents — the whole point of
-the guard is to keep credential material out of durable records.
+Free-form `detail` and `push_error` values are redacted before they reach the
+database. If redaction is unavailable, Hermes stores a generic replacement
+instead of the raw text. Unsafe-content events name the offending **path**,
+never its contents.
 
 No-ops and ordinary skips record nothing; they are the common case and would be
-pure event-log noise.
+pure event-log noise. Their fail-closed result still prevents a commit and
+leaves dirty/unpushed worktree state in place, so cleanup refuses removal.
 
 ## Configuration
 

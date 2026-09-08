@@ -9,6 +9,7 @@ ownership arguments, not that the preservation mechanism itself works (that is
 
 from __future__ import annotations
 
+import json
 import subprocess
 from pathlib import Path
 
@@ -115,30 +116,30 @@ def test_complete_task_passes_the_live_worker_pid_it_captured(
     pid preservation must gate on has to be captured beforehand — otherwise a
     completed-while-running task would look ownerless to the safety net."""
     with kbc.connect_closing() as conn:
-        _task(conn, "t_c2", pid=555)
+        _task(conn, "t_c2", run_id=75, pid=555)
         kb.complete_task(conn, "t_c2", summary="done")
 
-    assert ("t_c2", None, 555) in calls
+    assert ("t_c2", 75, 555) in calls
 
 
 def test_block_task_passes_the_live_worker_pid_it_captured(
     kanban_home: Path, calls: list
 ) -> None:
     with kbc.connect_closing() as conn:
-        _task(conn, "t_b2", pid=556)
+        _task(conn, "t_b2", run_id=76, pid=556)
         kb.block_task(conn, "t_b2", reason="need input", kind="needs_input")
 
-    assert ("t_b2", None, 556) in calls
+    assert ("t_b2", 76, 556) in calls
 
 
 def test_request_review_passes_the_live_worker_pid_it_captured(
     kanban_home: Path, calls: list
 ) -> None:
     with kbc.connect_closing() as conn:
-        _task(conn, "t_r2", pid=557, run_id=None)
+        _task(conn, "t_r2", pid=557, run_id=77)
         kb.request_review(conn, "t_r2", summary="please review", force=True)
 
-    assert ("t_r2", None, 557) in calls
+    assert ("t_r2", 77, 557) in calls
 
 
 def test_archive_task_passes_the_live_worker_pid_it_captured(
@@ -147,10 +148,10 @@ def test_archive_task_passes_the_live_worker_pid_it_captured(
     """Archive is status-agnostic and never terminates a running worker — the
     captured pid is the ONLY way preservation can see it is still live."""
     with kbc.connect_closing() as conn:
-        _task(conn, "t_a2", status="running", pid=558)
+        _task(conn, "t_a2", status="running", run_id=78, pid=558)
         kb.archive_task(conn, "t_a2")
 
-    assert ("t_a2", None, 558) in calls
+    assert ("t_a2", 78, 558) in calls
 
 
 # ---------------------------------------------------------------------------
@@ -259,3 +260,48 @@ def test_cleanup_still_refuses_a_dirty_unpushed_workspace_after_failed_preservat
     # The worktree survives: dirty and unpushed, exactly as cleanup requires.
     assert wt.is_dir()
     assert (wt / ".env").exists()
+
+
+def test_failed_push_with_zero_remote_tracking_refs_keeps_the_worktree(
+    kanban_home: Path, tmp_path: Path
+) -> None:
+    """A configured-but-offline remote with no cached tracking refs is not
+    proof that the local safety commit exists elsewhere. Completion must retain
+    the only copy instead of reaping the now-clean worktree."""
+    project = tmp_path / "project-zero-refs"
+    _git("init", "--initial-branch=main", str(project))
+    _git("config", "user.email", "t@example.com", cwd=project)
+    _git("config", "user.name", "Test", cwd=project)
+    _git("remote", "add", "origin", str(tmp_path / "offline-origin.git"), cwd=project)
+    (project / "README.md").write_text("hi\n", encoding="utf-8")
+    _git("add", "-A", cwd=project)
+    _git("commit", "-m", "init", cwd=project)
+    assert _git("for-each-ref", "refs/remotes", cwd=project).strip() == ""
+
+    wt = project / ".worktrees" / "t_zero_refs"
+    _git("worktree", "add", "-b", "wt/t_zero_refs", str(wt), "main", cwd=project)
+    (wt / "work.py").write_text("recover me\n", encoding="utf-8")
+
+    with kbc.connect_closing() as conn:
+        conn.execute(
+            "INSERT INTO tasks (id, title, assignee, status, workspace_kind, "
+            " workspace_path, branch_name, created_at) "
+            "VALUES ('t_zero_refs', 'demo', 'worker', 'running', 'worktree', ?, "
+            " 'wt/t_zero_refs', strftime('%s','now'))",
+            (str(wt),),
+        )
+        conn.commit()
+        assert kb.complete_task(conn, "t_zero_refs", summary="done") is True
+        event = conn.execute(
+            "SELECT payload FROM task_events WHERE task_id = 't_zero_refs' "
+            "AND kind = 'work_preserved' ORDER BY id DESC LIMIT 1"
+        ).fetchone()
+
+    assert event is not None
+    payload = json.loads(event["payload"])
+    assert payload["commit_sha"]
+    assert payload["pushed"] is False
+    assert payload["push_error"]
+    assert wt.is_dir()
+    assert _git("status", "--porcelain", cwd=wt).strip() == ""
+    assert _git("for-each-ref", "refs/remotes", cwd=wt).strip() == ""

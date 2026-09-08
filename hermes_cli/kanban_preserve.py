@@ -344,49 +344,52 @@ def _resolve_push_remote(worktree: Path, branch: str) -> Optional[str]:
     return remotes[0] if len(remotes) == 1 else None
 
 
-def _stale_pid_lock(lock_path: Path) -> bool:
-    """True when *lock_path* names a pid that is no longer alive (or the file
-    is unreadable/corrupt, which is treated the same as abandoned)."""
-    try:
-        content = lock_path.read_text(encoding="ascii").strip()
-        pid = int(content)
-    except (OSError, ValueError):
-        return True
-    return not _pid_alive(pid)
+def _try_lock_fd(fd: int) -> bool:
+    """Take a non-blocking process lock on ``fd`` using the host's stdlib.
 
-
-def _acquire_pid_lock(lock_path: Path) -> bool:
-    """Exclusive lock via atomic file creation (``O_CREAT | O_EXCL``).
-
-    Portable across POSIX and Windows with no ``fcntl``/``msvcrt`` split —
-    both platforms make ``open(O_EXCL)`` a single atomic syscall, so there is
-    no platform branch and no degraded "always acquired" fallback. Self-
-    healing: a lock left behind by a process that has since died is stolen
-    rather than left to block preservation forever, since this lock guards a
-    best-effort snapshot, not repository correctness. The steal path has a
-    narrow TOCTOU (two callers could both observe staleness at once); the
-    worst outcome is two safety commits, never lost work, which matches the
-    existing tolerance for the concurrency guarantee on a crash-recovery edge
-    case.
+    POSIX ``flock`` and Windows ``msvcrt.locking`` are kernel-managed locks:
+    they are released when the process/descriptor dies, so crash recovery never
+    needs to unlink and replace a shared pathname.
     """
     try:
-        fd = os.open(str(lock_path), os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
-    except FileExistsError:
-        if not _stale_pid_lock(lock_path):
-            return False
-        with contextlib.suppress(OSError):
-            lock_path.unlink()
+        import fcntl
+    except ImportError:  # Windows
         try:
-            fd = os.open(str(lock_path), os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
-        except OSError:
+            import msvcrt
+
+            if os.fstat(fd).st_size == 0:
+                os.write(fd, b"\0")
+            os.lseek(fd, 0, os.SEEK_SET)
+            locking = getattr(msvcrt, "locking")
+            lk_nblck = getattr(msvcrt, "LK_NBLCK")
+            locking(fd, lk_nblck, 1)
+            return True
+        except (ImportError, OSError, AttributeError):
             return False
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        return True
     except OSError:
         return False
+
+
+def _unlock_fd(fd: int) -> None:
+    """Release the lock acquired by :func:`_try_lock_fd`."""
     try:
-        os.write(fd, str(os.getpid()).encode("ascii"))
-    finally:
-        os.close(fd)
-    return True
+        import fcntl
+    except ImportError:  # Windows
+        try:
+            import msvcrt
+
+            os.lseek(fd, 0, os.SEEK_SET)
+            locking = getattr(msvcrt, "locking")
+            lk_unlck = getattr(msvcrt, "LK_UNLCK")
+            locking(fd, lk_unlck, 1)
+        except (ImportError, OSError, AttributeError):
+            pass
+        return
+    with contextlib.suppress(OSError):
+        fcntl.flock(fd, fcntl.LOCK_UN)
 
 
 @contextlib.contextmanager
@@ -412,14 +415,28 @@ def _preserve_lock(worktree: Path, task_id: Optional[str]) -> Iterator[bool]:
         return
     name = f"hermes-kanban-preserve-{task_id or 'worktree'}.lock"
     lock_path = Path(git_dir) / name
-    if not _acquire_pid_lock(lock_path):
+    try:
+        fd = os.open(str(lock_path), os.O_CREAT | os.O_RDWR, 0o600)
+    except OSError:
+        yield False
+        return
+    if not _try_lock_fd(fd):
+        os.close(fd)
+        yield False
+        return
+    try:
+        os.ftruncate(fd, 0)
+        os.write(fd, str(os.getpid()).encode("ascii"))
+    except OSError:
+        _unlock_fd(fd)
+        os.close(fd)
         yield False
         return
     try:
         yield True
     finally:
-        with contextlib.suppress(OSError):
-            lock_path.unlink()
+        _unlock_fd(fd)
+        os.close(fd)
 
 
 def preserve_worktree(
@@ -549,28 +566,41 @@ def _ownership_skip(
       snapshot; anyone else races the worker's own editor and can capture a
       file mid-write.
 
-    ``worker_pid`` lets a caller supply the pid it captured BEFORE its own
-    lifecycle UPDATE cleared ``tasks.worker_pid`` to NULL in the same
-    transaction (``complete_task``/``block_task``/``request_review``/
-    ``archive_task`` all do this) — reading the row's live column here would
-    otherwise see NULL and wrongly treat an archived-while-running task as
-    ownerless. ``None`` (the default) falls back to the row's own column,
-    which is correct for callers that preserve BEFORE clearing it (the
-    reclaim paths).
+    ``worker_pid`` is the PID captured BEFORE a lifecycle UPDATE clears
+    ownership. It corroborates the row rather than replacing it: if the row now
+    names a different worker, this caller is stale and must stand down. Callers
+    that preserve after a lifecycle transaction also pass the captured run id
+    as ``expected_run_id`` so a new claim is rejected even before its process
+    has started. Reclaim paths preserve before clearing and can rely on the
+    row's live values.
     """
     if expected_run_id is not None:
         current = row["current_run_id"]
-        if current is None or int(current) != int(expected_run_id):
+        observed = current if current is not None else row["latest_run_id"]
+        if observed is None or int(observed) != int(expected_run_id):
             return PreserveResult(
                 status="skipped", reason="stale_run",
-                detail=f"expected run {expected_run_id}, task is on {current}",
+                detail=f"expected run {expected_run_id}, latest task run is {observed}",
             )
-    pid = worker_pid if worker_pid is not None else row["worker_pid"]
-    if pid and int(pid) != os.getpid() and _pid_alive(int(pid)):
+    current_pid = row["worker_pid"]
+    if (
+        worker_pid is not None
+        and current_pid is not None
+        and int(worker_pid) != int(current_pid)
+    ):
         return PreserveResult(
-            status="skipped", reason="worker_alive",
-            detail=f"worker pid {int(pid)} still running",
+            status="skipped", reason="stale_run",
+            detail="the task acquired a different worker after preservation was requested",
         )
+    # A captured PID corroborates the current row; it never replaces it. Check
+    # the row first so a newer worker cannot be masked by an older lifecycle
+    # caller carrying ``known_worker_pid`` from before its transaction.
+    for pid in (current_pid, worker_pid):
+        if pid and int(pid) != os.getpid() and _pid_alive(int(pid)):
+            return PreserveResult(
+                status="skipped", reason="worker_alive",
+                detail=f"worker pid {int(pid)} still running",
+            )
     return None
 
 
@@ -588,14 +618,19 @@ def _record(conn, task_id: str, result: PreserveResult, run_id: Optional[int]) -
         kind, payload = "work_preserved", {
             "commit_sha": result.commit_sha,
             "pushed": result.pushed,
-            "push_error": result.push_error,
+            "push_error": _sanitize_event_text(result.push_error),
             "branch": result.branch,
         }
     elif result.status in {"unsafe", "failed"}:
         kind, payload = "work_preservation_failed", {
             "status": result.status,
             "reason": result.reason,
-            "detail": result.detail,
+            "detail": _sanitize_event_text(result.detail),
+            "commit_sha": result.commit_sha,
+            "pushed": False if result.pushed is None else result.pushed,
+            "push_error": _sanitize_event_text(
+                result.push_error or result.detail or result.reason
+            ),
             "branch": result.branch,
         }
     else:
@@ -605,6 +640,23 @@ def _record(conn, task_id: str, result: PreserveResult, run_id: Optional[int]) -
             _kb._append_event(conn, task_id, kind, payload, run_id=run_id)
     except Exception:
         _log.warning("kanban: could not record %s for task %s", kind, task_id)
+
+
+def _sanitize_event_text(value: Optional[str]) -> Optional[str]:
+    """Redact free-form git/exception text before it reaches durable records.
+
+    If the redactor itself is unavailable, discard the raw text rather than
+    treating an unscanned error as safe. Machine-readable ``reason`` remains
+    available to make the record actionable.
+    """
+    if not value:
+        return None
+    try:
+        from agent.redact import redact_sensitive_text
+
+        return redact_sensitive_text(str(value), force=True)[:500]
+    except Exception:
+        return "details unavailable because redaction failed"
 
 
 def preserve_task_work(
@@ -618,15 +670,12 @@ def preserve_task_work(
     the worktree lock. Never raises — a preservation failure must not block the
     completion/reclaim it is attached to.
 
-    ``known_worker_pid``: pass the pid the caller captured BEFORE its own
-    lifecycle UPDATE cleared ``tasks.worker_pid`` in the same transaction
-    (``complete_task``, ``block_task``, ``request_review``, ``archive_task``
-    all clear it as part of the terminal-status write). Without this, the
-    ownership check below reads a column that already says NULL and treats
-    a still-running worker as absent — letting preservation race and commit
-    over its half-written tree. Omit it (the reclaim paths do) when the
-    caller preserves BEFORE any column clear, so the row's own value is
-    still live and correct.
+    ``known_worker_pid`` is the PID captured before a lifecycle status write
+    clears ownership. It is checked alongside (never instead of) the current
+    row. Those callers also pass the captured active run as ``expected_run_id``;
+    together the pair rejects a new claim that lands between the lifecycle
+    transaction and this preservation call. Reclaim paths run before clearing
+    ownership and omit the captured values.
 
     A genuinely unexpected exception (not the git-timeout/OSError cases
     ``_git`` already folds into an ordinary failed push) still needs its own
@@ -641,11 +690,14 @@ def preserve_task_work(
             known_worker_pid=known_worker_pid,
         )
     except Exception as exc:  # never block a lifecycle transition
-        _log.warning("kanban: preservation errored for task %s: %s", task_id, exc)
+        safe_detail = _sanitize_event_text(str(exc))
+        _log.warning("kanban: preservation errored for task %s: %s", task_id, safe_detail)
         result = PreserveResult(
             status="failed", reason="preservation_error",
-            detail=str(exc)[:500] or None,
+            detail=safe_detail,
             commit_sha=_best_effort_head_sha(conn, task_id),
+            pushed=False,
+            push_error=safe_detail or "preservation_error",
         )
         with contextlib.suppress(Exception):
             _record(conn, task_id, result, None)
@@ -677,8 +729,11 @@ def _preserve_task_work(
     if cfg.get("enabled") is False:
         return PreserveResult(status="skipped", reason="disabled")
     row = conn.execute(
-        "SELECT workspace_kind, workspace_path, branch_name, worker_pid, current_run_id "
-        "FROM tasks WHERE id = ?", (task_id,),
+        "SELECT t.workspace_kind, t.workspace_path, t.branch_name, t.worker_pid, "
+        "t.current_run_id, "
+        "(SELECT tr.id FROM task_runs tr WHERE tr.task_id = t.id "
+        " ORDER BY tr.id DESC LIMIT 1) AS latest_run_id "
+        "FROM tasks t WHERE t.id = ?", (task_id,),
     ).fetchone()
     if row is None:
         return PreserveResult(status="skipped", reason="task_not_found")

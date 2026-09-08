@@ -1821,13 +1821,13 @@ DEFAULT_CONFIG = {
         #
         # It is a PRESERVATION net, not merge automation: it never merges,
         # rebases, force-pushes, switches branches, or deletes a worktree or
-        # branch, and it never touches another task's workspace. Anything
-        # ambiguous (detached HEAD, wrong branch, a suspected credential, an
-        # oversized/generated artifact, a rejected push) fails closed — no
-        # commit, an actionable ``work_preservation_failed`` event, and the
-        # worktree preserved for a human. Only ``worktree`` workspaces are in
-        # scope; ``scratch``/``dir`` are untouched. Gitignored files are
-        # excluded by git itself.
+        # branch, and it never touches another task's workspace. Ownership or
+        # branch ambiguity fails closed before commit; unsafe content and git
+        # failures record a redacted ``work_preservation_failed`` event. A
+        # rejected push keeps the local commit and records ``pushed: false``.
+        # In every case cleanup retains dirty or unpushed work for a human.
+        # Only ``worktree`` workspaces are in scope; ``scratch``/``dir`` are
+        # untouched. Gitignored files are excluded by git itself.
         "worker_preservation": {
             # Set false for non-Git workflows or hosts with custom remotes
             # where an automated push is unwanted. Preservation is skipped
