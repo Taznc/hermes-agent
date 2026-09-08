@@ -249,7 +249,8 @@ _SPECS = [
     ], aliases=["ls"], help="List tasks"),
     _cmd("show", [_TASK_ID, _json_flag(), *_run_state_args("filter listed runs by task_runs column")],
          help="Show a task with comments + events"),
-    _cmd("assign", [_TASK_ID, _arg("profile", help="Profile name (or 'none' to unassign)")],
+    _cmd("assign", [_TASK_ID, _arg("profile", help="Profile name (or 'none' to unassign)"),
+                    _json_flag(help="Emit a machine-readable JSON error on refusal")],
          help="Assign or reassign a task"),
     _cmd("set-model", [
         _TASK_ID,

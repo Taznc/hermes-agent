@@ -100,7 +100,9 @@ def _check(cond: Any, message: str) -> None:
 def _kanban_handler(tool_name: str) -> Callable:
     """Wrap a handler so every failure is a structured tool error. ``ValueError``
     (invalid board slug, DB validation such as cycle/self-link, ``AttachmentTooLarge``)
-    is reported without a traceback; anything else is logged with ``logger.exception``."""
+    is reported without a traceback; anything else is logged with ``logger.exception``.
+    A refusal that carries machine-readable fields (skill preflight) keeps them, so
+    the agent can act on the code rather than parse the message."""
     def deco(fn):
         @functools.wraps(fn)
         def wrapper(args: dict, **kw) -> str:
@@ -111,7 +113,11 @@ def _kanban_handler(tool_name: str) -> Callable:
             except Exception as e:
                 if not isinstance(e, ValueError):
                     logger.exception(f"{tool_name} failed")
-                return tool_error(f"{tool_name}: {e}")
+                from hermes_cli.kanban_skill_preflight import structured_error_payload
+
+                structured = structured_error_payload(e) or {}
+                structured.pop("error", None)
+                return tool_error(f"{tool_name}: {e}", **structured)
         return wrapper
     return deco
 

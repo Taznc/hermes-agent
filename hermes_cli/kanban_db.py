@@ -248,7 +248,7 @@ _TICK_ACTIVITY_FIELDS = (
     "spawned", "reclaimed", "promoted", "reconciled_orphans", "crashed", "stale",
     "timed_out", "auto_blocked", "rate_limited", "review_no_verdict", "auto_assigned_default",
     "respawn_guarded", "skipped_per_profile_capped", "skipped_unassigned",
-    "skipped_nonspawnable", "blocked_review_round_cap",
+    "skipped_nonspawnable", "skill_preflight_blocked", "blocked_review_round_cap",
 )
 
 
@@ -2067,6 +2067,7 @@ def create_task(
     creator_task_id: Optional[str] = None,
     completion_contract: Optional[str] = None,
     created_by_task: Optional[str] = None, created_by_run: Optional[int] = None,
+    skill_preflight: bool = True,
 ) -> str:
     """Create a task (optionally under ``parents``); returns its id.
 
@@ -2132,6 +2133,20 @@ def create_task(
     )
     parents = tuple(p for p in parents if p)
     skills_list = _normalize_task_skills(skills)
+    # Forced skills resolve in the ASSIGNEE's isolated profile home, not ours.
+    # Validating here — before the row exists — is what keeps an unloadable
+    # skill from becoming a worker that dies during init on every retry.
+    #
+    # Two explicit inert paths are exempt, and only these two. ``lane`` parks
+    # the card in a wishlist lane that is inert by construction (nothing
+    # dispatches it, and its skill may well be installed before anyone acts on
+    # it); ``skill_preflight=False`` is the opt-out for board import, row
+    # relocation and deliberate card-before-profile ordering. Both still face
+    # the dispatcher's own check on the way into live work, and neither is
+    # implicit — an assignee we cannot inspect fails closed rather than passing.
+    if skill_preflight and lane is None:
+        from hermes_cli.kanban_skill_preflight import preflight_task_skills
+        preflight_task_skills(assignee, skills_list)
 
     # Idempotency check BEFORE the write txn (no lock held); a concurrent-create
     # race may insert twice, the next lookup stabilises on the newest.
@@ -2416,12 +2431,41 @@ def list_tasks(
     return [Task.from_row(r) for r in rows]
 
 
+def _preflight_assignee_change(
+    conn: sqlite3.Connection, task_id: str, profile: Optional[str],
+) -> None:
+    """Validate *profile* against the card's stored forced skills.
+
+    Every path that moves a card to a different profile funnels through here
+    BEFORE it mutates anything: a card one profile can run is a guaranteed init
+    crash for a profile whose isolated home cannot load its skills, and the
+    create-time check cannot see a later move. Called ahead of any reclaim,
+    termination or status change so a refusal leaves the board exactly as it
+    was — a validated-too-late reassignment kills the running worker and then
+    refuses, which is strictly worse than not trying.
+    """
+    if not profile:
+        return
+    row = conn.execute("SELECT skills FROM tasks WHERE id = ?", (task_id,)).fetchone()
+    if row is None:
+        return
+    from hermes_cli.kanban_skill_preflight import preflight_task_skills
+
+    preflight_task_skills(profile, _json_or(_row_get(row, "skills")) or ())
+
+
 def assign_task(conn: sqlite3.Connection, task_id: str, profile: Optional[str]) -> bool:
-    """Assign/reassign; raises RuntimeError while the task is running under a claim."""
+    """Assign/reassign; raises RuntimeError while the task is running under a claim.
+
+    Re-runs the forced-skill preflight against the NEW profile: a card that one
+    profile can run is a guaranteed init crash for a profile whose isolated home
+    lacks the skill, and reassignment is the other way a card acquires that
+    mismatch (the create-time check cannot see a later move).
+    """
     profile = _canonical_assignee(profile)
     with write_txn(conn):
         row = conn.execute(
-            "SELECT status, claim_lock, assignee FROM tasks WHERE id = ?", (task_id,)
+            "SELECT status, claim_lock, assignee, skills FROM tasks WHERE id = ?", (task_id,)
         ).fetchone()
         if not row:
             return False
@@ -2431,6 +2475,7 @@ def assign_task(conn: sqlite3.Connection, task_id: str, profile: Optional[str]) 
                 "Wait for completion or reclaim the stale lock first."
             )
         if row["assignee"] != profile:
+            _preflight_assignee_change(conn, task_id, profile)
             # The failure streak is per task/profile; a new profile starts fresh.
             conn.execute(
                 "UPDATE tasks SET assignee = ?, consecutive_failures = 0, "
@@ -3738,7 +3783,13 @@ def reassign_task(
     reason: Optional[str] = None,
 ) -> bool:
     """Reassign (None unassigns); a running task is refused unless
-    ``reclaim_first`` releases its claim — the "this profile's model is broken" path."""
+    ``reclaim_first`` releases its claim — the "this profile's model is broken" path.
+
+    The target profile is validated BEFORE any reclaim: killing the live worker
+    and only then refusing the move would leave the card worse off than not
+    calling at all.
+    """
+    _preflight_assignee_change(conn, task_id, profile)
     if reclaim_first:
         # Safe to call even if nothing to reclaim.
         reclaim_task(conn, task_id, reason=reason or "reassign")
@@ -4445,6 +4496,15 @@ def request_review(
     metadata = redact_review_value(metadata)
     reviewer_model_override, reviewer_provider_override = _validate_model_override(
         reviewer_model_override, reviewer_provider_override,
+    )
+    # A reviewer handoff reassigns the card, so it is an assignee mutation and
+    # gets the same forced-skill check: handing a skills-carrying card to a
+    # reviewer profile that cannot load them relocates the init crash to the
+    # review lane. Resolved and checked BEFORE the write txn — the check spawns
+    # a probe, which must not run holding the board's write lock, and a refusal
+    # must not have moved the card first.
+    _preflight_assignee_change(
+        conn, task_id, reviewer if reviewer is not None else _prior_reviewer(conn, task_id) or None,
     )
     with write_txn(conn):
         if not _parents_satisfied(conn, task_id):

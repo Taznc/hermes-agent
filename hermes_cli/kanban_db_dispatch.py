@@ -216,6 +216,12 @@ class DispatchResult:
     """``(task_id, assignee, current_running_count)`` deferred because the
     assignee is at ``kanban.max_in_progress_per_profile``. Picked up on a later
     tick; separate bucket so dashboards show "profile busy" vs "stuck"."""
+    skill_preflight_blocked: list[tuple[str, str]] = field(default_factory=list)
+    """``(task_id, reason)`` for cards whose forced skills the assignee profile
+    cannot load. A configuration error, not a worker failure: caught BEFORE the
+    claim, so no worker is spawned, no start-budget slot is consumed and no
+    retry is counted. The card is blocked once (``capability``) and waits for a
+    human to install the skill or drop it from the card."""
     crashed: list[str] = field(default_factory=list)
     """Task ids reclaimed because their worker PID disappeared."""
     auto_blocked: list[str] = field(default_factory=list)
@@ -2953,6 +2959,19 @@ def _dispatch_lane_task(
     skip is recorded on ``result``.
     """
     task_id = row["id"]
+    # Forced-skill preflight FIRST: a card can carry skills that never passed
+    # create-time validation (imported board, pre-check row, skill uninstalled
+    # or disabled since), and it must be refused before anything else decides
+    # this row's fate. Ahead of the non-spawnable skip on purpose — a card whose
+    # assignee has no inspectable profile home would otherwise park silently in
+    # `ready` forever with an unloadable skill nobody is told about. Ahead of
+    # the claim on purpose too: a mismatch is a configuration error, and
+    # spawning a worker that dies during init would charge the retry budget,
+    # the start budget and the failure breaker for it.
+    if _block_for_skill_preflight(
+        conn, task_id, assignee, result, dry_run=dry_run,
+    ):
+        return False
     # Non-profile assignees (control-plane lanes that pull via ``claim_task``)
     # would fail ``hermes -p <assignee>`` at startup and loop ready→crash→ready
     # forever. Bucketed apart from skipped_unassigned: the operator cannot fix
@@ -2994,6 +3013,9 @@ def _dispatch_lane_task(
         # ticks re-query from the DB.
         if per_profile_cap is not None and name:
             per_profile_running[name] = per_profile_running.get(name, 0) + 1
+
+    # Forced-skill preflight ran at the top of this function (before the
+    # non-spawnable skip and the claim).
 
     # Co-edit serialization. Only the ready lane: a review card reads the branch
     # its implementer already produced, so it is not a concurrent writer.
@@ -3073,6 +3095,60 @@ def _dispatch_lane_task(
         ):
             result.auto_blocked.append(claimed.id)
         return False
+
+
+def _block_for_skill_preflight(
+    conn: sqlite3.Connection,
+    task_id: str,
+    assignee: str,
+    result: "DispatchResult",
+    *,
+    dry_run: bool,
+) -> bool:
+    """Block *task_id* when its assignee profile cannot load its forced skills.
+
+    Returns True when the card was refused. The refusal is deliberately NOT a
+    task failure: ``block_task`` moves it out of the dispatchable lane without
+    incrementing ``consecutive_failures``. If the existing failure record is the
+    worker-init ``Unknown skill(s): ...`` diagnostic from before this check
+    existed, it is cleared so the corrected card resumes with a clean budget;
+    unrelated implementation failure history is preserved. ``capability`` is
+    the honest kind — no agent can fix a missing skill in another profile's home.
+    """
+    from hermes_cli.kanban_skill_preflight import KanbanSkillPreflightError, preflight_task_skills
+
+    row = conn.execute("SELECT skills FROM tasks WHERE id = ?", (task_id,)).fetchone()
+    skills = _kb._json_or(_kb._row_get(row, "skills")) if row is not None else None
+    try:
+        preflight_task_skills(assignee, skills or ())
+    except KanbanSkillPreflightError as exc:
+        reason = str(exc)
+        result.skill_preflight_blocked.append((task_id, reason))
+        if not dry_run:
+            _kb.block_task(conn, task_id, reason=reason, kind="capability")
+            with _kb.write_txn(conn):
+                # Initialization-only failure state is not this card's record.
+                # A card that crash-looped on this exact misconfiguration before
+                # the preflight existed carries a nonzero streak from runs that
+                # never executed any work; leaving it would put the corrected
+                # card one bad tick from the auto-block breaker.
+                conn.execute(
+                    "UPDATE tasks SET consecutive_failures = 0, last_failure_error = NULL "
+                    "WHERE id = ? AND last_failure_error GLOB 'Unknown skill(s): *'",
+                    (task_id,),
+                )
+                # Stamp the structured form onto the block event a caller can
+                # key on (CLI, dashboard, telemetry) without parsing prose.
+                conn.execute(
+                    "UPDATE task_events SET payload = json_set("
+                    "  COALESCE(payload, '{}'), '$.code', ?, '$.missing_skills', json(?)"
+                    ") WHERE id = (SELECT MAX(id) FROM task_events "
+                    "              WHERE task_id = ? AND kind IN ('blocked', 'block_loop_detected'))",
+                    (exc.code, json.dumps(list(exc.missing)), task_id),
+                )
+        _kb._log.warning("kanban dispatch: %s (task %s)", reason, task_id)
+        return True
+    return False
 
 
 def _apply_default_assignee(

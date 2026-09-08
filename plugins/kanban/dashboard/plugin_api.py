@@ -144,11 +144,18 @@ def _conflict(detail: str) -> HTTPException:
 
 @contextmanager
 def _map_errors(status: int, *types: type[BaseException]) -> Iterator[None]:
-    """Map the given exception types to ``HTTPException(status, str(exc))``."""
+    """Map the given exception types to ``HTTPException(status, str(exc))``.
+
+    A refusal carrying machine-readable fields (skill preflight) becomes a dict
+    detail with the same ``code``/``profile``/``missing_skills`` contract the
+    CLI and tool surfaces emit; everything else keeps its plain string detail.
+    """
     try:
         yield
     except types as e:
-        raise HTTPException(status_code=status, detail=str(e))
+        from hermes_cli.kanban_skill_preflight import structured_error_payload
+
+        raise HTTPException(status_code=status, detail=structured_error_payload(e) or str(e))
 
 
 _value_error_400 = partial(_map_errors, 400, ValueError)  # domain-layer validation refusals
@@ -1139,7 +1146,9 @@ def update_task(task_id: str, payload: UpdateTaskBody, board: Optional[str] = Qu
         # current implementer before the task is routed to the reviewer.
         review_assignee_deferred = payload.status == "review" and payload.assignee is not None
         if payload.assignee is not None and not review_assignee_deferred:
-            with _map_errors(409, RuntimeError):
+            # ValueError -> 400: the assignee-profile skill preflight refuses a
+            # reassignment that would guarantee a worker init crash.
+            with _map_errors(409, RuntimeError), _map_errors(400, ValueError):
                 _require_ok(kanban_db.assign_task(conn, task_id, payload.assignee or None))
         if payload.status is not None:
             _patch_status(conn, task_id, payload, review_assignee_deferred)
@@ -1347,7 +1356,7 @@ def _bulk_apply_one(conn, tid: str, payload: BulkTaskBody, board: Optional[str],
                   else kanban_db.assign_task(conn, tid, payload.assignee or None))
             if not ok:
                 entry.update(ok=False, error="assign refused")
-        except RuntimeError as e:
+        except (RuntimeError, ValueError) as e:
             entry.update(ok=False, error=str(e))
     if payload.priority is not None:
         _set_priority(conn, tid, payload.priority, board)
@@ -1545,7 +1554,7 @@ class ReassignBody(BaseModel):
 def reassign_task_endpoint(task_id: str, payload: ReassignBody, board: Optional[str] = Query(None)):
     """Reassign to another profile, optionally reclaiming first
     (``hermes kanban reassign <task_id> <profile> [--reclaim]``)."""
-    with _board_conn(board) as (board, conn):
+    with _board_conn(board) as (board, conn), _value_error_400():
         ok = kanban_db.reassign_task(
             conn, task_id, payload.profile or None, reclaim_first=bool(payload.reclaim_first), reason=payload.reason)
         if not ok:
