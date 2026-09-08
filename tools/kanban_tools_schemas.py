@@ -248,6 +248,14 @@ KANBAN_REQUEST_CHANGES_SCHEMA = _schema(
                 "Specific, actionable changes the implementer must make "
                 "before requesting another review."
         )),
+        "metadata": {
+            "type": "object",
+            "description": (
+                "Optional structured facts about this review round, such "
+                "as which acceptance criteria failed or what was checked."
+            ),
+            "additionalProperties": True,
+        },
     },
     ["reason"],
 )

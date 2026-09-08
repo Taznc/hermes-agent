@@ -2547,13 +2547,14 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin, CLITuiMix
         resume: str = None,
         checkpoints: bool = False,
         pass_session_id: bool = False,
+        use_env_session_id: bool = False,
         ignore_rules: bool = False,
     ):
         """CLI args win over config; ``reasoning`` is per-run only; ``resume`` restores history from SQLite."""
         self._init_display_options(verbose, compact)
         self._init_model_routing(model, toolsets, provider, reasoning, api_key, base_url, max_turns, run_budget,
                                  checkpoints, pass_session_id, ignore_rules)
-        self._init_runtime_state(resume)
+        self._init_runtime_state(resume, use_env_session_id=use_env_session_id)
 
     def _init_display_options(self, verbose, compact):
         """Display-related config: compact/tool-progress/focus view, bells, streaming, previews, stream buffers."""
@@ -2803,7 +2804,7 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin, CLITuiMix
 
         self._fallback_model = get_fallback_chain(CLI_CONFIG)
 
-    def _init_runtime_state(self, resume):
+    def _init_runtime_state(self, resume, *, use_env_session_id=False):
         """Session store + all per-run mutable state (queues, overlays, pet/voice/status-bar fields)."""
         # A signature change across turns (/model, credential rotation) rebuilds the agent.
         self._active_agent_route_signature = None
@@ -2820,7 +2821,17 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin, CLITuiMix
         self._init_session_store()
         self._pending_title: Optional[str] = None
         self._resumed = bool(resume)
-        self.session_id = resume or f"{self.session_start.strftime('%Y%m%d_%H%M%S')}_{uuid.uuid4().hex[:6]}"
+        # Dispatcher-spawned workers opt in explicitly to a pre-generated
+        # durable id. An env var alone is ignored so nested `hermes` commands
+        # cannot accidentally resume and overwrite their parent session.
+        inherited_session_id = (
+            os.environ.get("HERMES_SESSION_ID", "").strip() if use_env_session_id else ""
+        )
+        self.session_id = (
+            resume
+            or inherited_session_id
+            or f"{self.session_start.strftime('%Y%m%d_%H%M%S')}_{uuid.uuid4().hex[:6]}"
+        )
         getattr(self, "_write_terminal_breadcrumb", lambda: None)()
 
         self._history_file = _hermes_home / ".hermes_history"
@@ -4256,7 +4267,7 @@ def _install_single_query_signal_handlers(cli):
                 _signal.signal(getattr(_signal, _name), _signal_handler_q)
 
 
-def _build_cli_from_args(model, toolsets, provider, reasoning, api_key, base_url, max_turns, run_budget, verbose, compact, resume, checkpoints, pass_session_id, ignore_rules, skills):
+def _build_cli_from_args(model, toolsets, provider, reasoning, api_key, base_url, max_turns, run_budget, verbose, compact, resume, checkpoints, pass_session_id, use_env_session_id, ignore_rules, skills):
     """Resolve the toolset list (explicit / coding posture / platform default), construct HermesCLI, and start the background skills preload."""
     toolsets_list = None
     if isinstance(toolsets, str) and toolsets:
@@ -4294,6 +4305,7 @@ def _build_cli_from_args(model, toolsets, provider, reasoning, api_key, base_url
             resume=resume,
             checkpoints=checkpoints,
             pass_session_id=pass_session_id,
+            use_env_session_id=use_env_session_id,
             ignore_rules=ignore_rules,
         )
     except ImportError as e:
@@ -4482,6 +4494,7 @@ def main(
     w: bool = False,
     checkpoints: bool = False,
     pass_session_id: bool = False,
+    use_env_session_id: bool = False,
     ignore_user_config: bool = False,
     ignore_rules: bool = False,
 ):
@@ -4541,7 +4554,8 @@ def main(
     _join_worktree = _start_worktree_setup(list_tools, list_toolsets, worktree, w)
     query = query or q
     cli = _build_cli_from_args(model, toolsets, provider, reasoning, api_key, base_url, max_turns, run_budget,
-                               verbose, compact, resume, checkpoints, pass_session_id, ignore_rules, skills)
+                               verbose, compact, resume, checkpoints, pass_session_id, use_env_session_id,
+                               ignore_rules, skills)
 
     # Join the background worktree creation before anything consumes TERMINAL_CWD.
     # A requested worktree whose setup failed aborts: never silently run without isolation.
