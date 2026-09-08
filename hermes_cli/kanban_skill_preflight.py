@@ -141,6 +141,9 @@ def _probe_env(home: Path) -> dict:
         if not k.startswith(("HERMES_KANBAN_", "HERMES_PROFILE"))
     }
     env["HERMES_HOME"] = str(home)
+    # User plugin directories are mirrored into the shadow home. Importing one
+    # must not write ``__pycache__`` through that directory symlink.
+    env["PYTHONDONTWRITEBYTECODE"] = "1"
     repo_root = str(Path(__file__).resolve().parent.parent)
     existing = env.get("PYTHONPATH")
     env["PYTHONPATH"] = f"{repo_root}{os.pathsep}{existing}" if existing else repo_root
@@ -158,10 +161,13 @@ def _read_only_home(profile_home: Path):
     is what decides staleness and archival.
 
     So the child gets its own directory whose ``config.yaml`` is the profile's
-    (skill dirs, ``external_dirs``, ``disabled`` all resolve identically) and
-    whose ``skills/`` is a real directory. Skill directories are symlinked for
-    loader fidelity, while root metadata and legacy flat skill files are
-    copied so writes such as ``bump_use`` land in the temp dir and disappear.
+    (skill dirs, ``external_dirs``, ``disabled`` all resolve identically), whose
+    ``skills/`` is a real directory, and whose user plugin registry is visible
+    to qualified ``plugin:skill`` lookups. Skill/plugin directories are
+    symlinked for loader fidelity, while root metadata and legacy flat skill
+    files are copied so writes such as ``bump_use`` land in the temp dir and
+    disappear. Bytecode writes are disabled in :func:`_probe_env` so importing a
+    symlinked plugin cannot create ``__pycache__`` in the real profile.
     ``.env`` is deliberately NOT copied: it holds secrets, and skill *readiness*
     does not affect whether a skill loads.
     """
@@ -176,6 +182,20 @@ def _read_only_home(profile_home: Path):
         if real_skills.is_dir():
             for entry in real_skills.iterdir():
                 target = shadow_skills / entry.name
+                if entry.is_dir():
+                    target.symlink_to(entry, target_is_directory=True)
+                elif entry.is_file():
+                    shutil.copy2(entry, target)
+
+        # ``plugin:skill`` resolution imports the assignee's user plugins and
+        # reads registrations from that profile-scoped registry. Keep the
+        # registry visible without making its root metadata writable through.
+        real_plugins = profile_home / "plugins"
+        if real_plugins.is_dir():
+            shadow_plugins = shadow / "plugins"
+            shadow_plugins.mkdir()
+            for entry in real_plugins.iterdir():
+                target = shadow_plugins / entry.name
                 if entry.is_dir():
                     target.symlink_to(entry, target_is_directory=True)
                 elif entry.is_file():

@@ -54,6 +54,47 @@ def test_a_missing_plugin_qualified_skill_is_reported_missing(kanban_home):
     assert missing_skills_for_profile("claudecode", ["noplugin:nothing"]) == ["noplugin:nothing"]
 
 
+def test_an_available_plugin_qualified_skill_loads_from_the_assignee_profile(kanban_home):
+    """The shadow home must preserve the assignee's plugin registry too. A
+    plugin-provided skill that the real worker can load must not be rejected as
+    missing merely because preflight moved the loader into a shadow home."""
+    from hermes_cli.kanban_skill_preflight import missing_skills_for_profile
+
+    profile_dir = _make_profile(kanban_home, "claudecode", [])
+    plugin = profile_dir / "plugins" / "demo"
+    skill = plugin / "skills" / "from-plugin"
+    skill.mkdir(parents=True)
+    (profile_dir / "config.yaml").write_text(
+        "plugins:\n  enabled:\n    - demo\n", encoding="utf-8",
+    )
+    (plugin / "plugin.yaml").write_text(
+        "name: demo\nversion: 1.0.0\ndescription: Demo plugin\n", encoding="utf-8",
+    )
+    (plugin / "__init__.py").write_text(
+        "from pathlib import Path\n"
+        "def register(ctx):\n"
+        "    ctx.register_skill(\n"
+        "        'from-plugin',\n"
+        "        Path(__file__).parent / 'skills' / 'from-plugin' / 'SKILL.md',\n"
+        "    )\n",
+        encoding="utf-8",
+    )
+    (skill / "SKILL.md").write_text(
+        "---\nname: from-plugin\ndescription: A plugin-provided test skill.\n---\nbody\n",
+        encoding="utf-8",
+    )
+    before = {
+        path.relative_to(plugin): path.read_bytes()
+        for path in plugin.rglob("*") if path.is_file()
+    }
+
+    assert missing_skills_for_profile("claudecode", ["demo:from-plugin"]) == []
+    assert {
+        path.relative_to(plugin): path.read_bytes()
+        for path in plugin.rglob("*") if path.is_file()
+    } == before
+
+
 def test_a_missing_category_qualified_skill_is_reported_missing(kanban_home):
     """``category:skill`` is a valid local spelling; when the category exists
     but the skill does not, the worker fails — preflight must too."""
