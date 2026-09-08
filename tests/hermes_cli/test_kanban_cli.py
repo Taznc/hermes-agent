@@ -72,6 +72,43 @@ def test_kanban_show_text_renders_graph_with_open_connection(kanban_home):
     assert "Cannot operate on a closed database" not in output
 
 
+def test_kanban_show_text_renders_run_analytics_when_present(kanban_home):
+    with kbc.connect_closing() as conn:
+        tid = kb.create_task(conn, title="analytics task", assignee="alice")
+        claimed = kb.claim_task(conn, tid)
+        conn.execute(
+            """
+            UPDATE task_runs
+               SET model = 'gpt-5.6-sol', provider = 'openai', reasoning_effort = 'high',
+                   input_tokens = 1000, output_tokens = 500, cache_read_tokens = 200,
+                   reasoning_tokens = 50, api_calls = 12, tool_calls = 30,
+                   estimated_cost_usd = 1.23
+             WHERE id = ?
+            """,
+            (claimed.current_run_id,),
+        )
+        conn.commit()
+
+    output = kc.run_slash(f"show {tid}")
+
+    assert "model: gpt-5.6-sol · openai · high" in output
+    assert "tokens: in 1,000 · out 500 · cache 200 · reasoning 50" in output
+    assert "calls: API 12 · tools 30" in output
+    assert "estimated cost: $1.2300" in output
+
+
+def test_kanban_show_text_omits_absent_run_analytics(kanban_home):
+    with kbc.connect_closing() as conn:
+        tid = kb.create_task(conn, title="plain task", assignee="alice")
+        kb.claim_task(conn, tid)
+
+    output = kc.run_slash(f"show {tid}")
+
+    assert "model:" not in output
+    assert "tokens:" not in output
+    assert "undefined" not in output
+
+
 def test_board_override_is_isolated_per_concurrent_call(kanban_home, monkeypatch):
     kb.create_board("alpha")
     kb.create_board("beta")

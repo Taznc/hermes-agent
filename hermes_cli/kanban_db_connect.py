@@ -855,6 +855,10 @@ _LATER_TASK_COLUMNS = (
     # gateway restart) can still query the worker's exit status by unit name via `systemctl --user
     # show`, since it has no in-memory _recent_worker_exits entry for a worker it never spawned.
     ("worker_unit", "worker_unit TEXT"),
+    # Lineage: the task/run that created this task via kanban_create. NULL for CLI/dashboard
+    # creates and every pre-feature row (kanban-analytics-capture card, AC5).
+    ("created_by_task", "created_by_task TEXT"),
+    ("created_by_run", "created_by_run INTEGER"),
 )
 
 _NOTIFY_SUB_COLUMNS = (
@@ -867,6 +871,27 @@ _NOTIFY_SUB_COLUMNS = (
     # (which prefers ``user_id_alt``). NULL is inert.
     ("user_id_alt", "user_id_alt TEXT"),
     ("delivery_metadata", "delivery_metadata TEXT"),
+)
+
+# Additive ``task_runs`` analytics-capture columns (kanban-analytics-capture
+# card, AC1). Nullable; existing rows read back NULL. Kept in lockstep with
+# SCHEMA_SQL's ``CREATE TABLE task_runs`` and ``_REBUILD_SPECS["task_runs"]``
+# — a legacy DB that never carried these columns gets them via this pass; a
+# legacy DB whose ``task_runs`` also has the pre-AUTOINCREMENT drift gets them
+# for free from the rebuilt CREATE TABLE instead (rebuild runs after this).
+_LATER_RUN_COLUMNS = (
+    ("model", "model TEXT"),
+    ("provider", "provider TEXT"),
+    ("reasoning_effort", "reasoning_effort TEXT"),
+    ("model_source", "model_source TEXT"),
+    ("session_id", "session_id TEXT"),
+    ("input_tokens", "input_tokens INTEGER"),
+    ("output_tokens", "output_tokens INTEGER"),
+    ("cache_read_tokens", "cache_read_tokens INTEGER"),
+    ("reasoning_tokens", "reasoning_tokens INTEGER"),
+    ("api_calls", "api_calls INTEGER"),
+    ("tool_calls", "tool_calls INTEGER"),
+    ("estimated_cost_usd", "estimated_cost_usd REAL"),
 )
 
 
@@ -953,6 +978,10 @@ def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
                 )
 
     if _table_exists(conn, "task_runs"):
+        run_cols = _column_names(conn, "task_runs")
+        for name, ddl in _LATER_RUN_COLUMNS:
+            if name not in run_cols:
+                _add_column_if_missing(conn, "task_runs", name, ddl)
         _backfill_legacy_inflight_runs(conn)
 
     # One-shot event-kind rename: old names still worked but were awkward on
@@ -1056,7 +1085,11 @@ _REBUILD_SPECS = {
         " worker_pid INTEGER, max_runtime_seconds INTEGER,"
         " last_heartbeat_at INTEGER, started_at INTEGER NOT NULL,"
         " ended_at INTEGER, outcome TEXT, summary TEXT, metadata TEXT,"
-        " error TEXT)",
+        " error TEXT, model TEXT, provider TEXT, reasoning_effort TEXT,"
+        " model_source TEXT, session_id TEXT, input_tokens INTEGER,"
+        " output_tokens INTEGER, cache_read_tokens INTEGER,"
+        " reasoning_tokens INTEGER, api_calls INTEGER, tool_calls INTEGER,"
+        " estimated_cost_usd REAL)",
         (
             "CREATE INDEX idx_runs_task ON task_runs(task_id, started_at)",
             "CREATE INDEX idx_runs_status ON task_runs(status)",

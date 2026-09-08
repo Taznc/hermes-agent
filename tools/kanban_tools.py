@@ -376,12 +376,16 @@ _TASK_FIELDS = tuple(
     "id title body assignee status tenant priority workspace_kind workspace_path created_by "
     "created_at started_at completed_at result current_run_id model_override "
     "provider_override reasoning_effort route_source route_name "
-    "completion_contract last_failure_error".split())
+    "completion_contract last_failure_error created_by_task created_by_run".split())
 _TASK_SUMMARY_FIELDS = tuple(
     "id title assignee status priority tenant workspace_kind workspace_path project_id created_by "
     "created_at started_at completed_at current_run_id model_override provider_override reasoning_effort "
-    "route_source route_name".split())
-_RUN_FIELDS = tuple("id profile status outcome summary error metadata started_at ended_at".split())
+    "route_source route_name created_by_task created_by_run".split())
+_RUN_FIELDS = tuple(
+    "id profile status outcome summary error metadata started_at ended_at model provider "
+    "reasoning_effort model_source session_id input_tokens output_tokens cache_read_tokens "
+    "reasoning_tokens api_calls tool_calls estimated_cost_usd".split()
+)
 _COMMENT_FIELDS = ("author", "body", "created_at")
 _EVENT_FIELDS = ("kind", "payload", "created_at", "run_id")
 _ATTACHMENT_FIELDS = tuple(
@@ -389,6 +393,7 @@ _ATTACHMENT_FIELDS = tuple(
 _CREATED_FIELDS = (
     "status", "workspace_kind", "workspace_path", "project_id",
     "model_override", "provider_override", "reasoning_effort", "route_source", "route_name",
+    "created_by_task", "created_by_run",
 )
 
 
@@ -740,9 +745,14 @@ def _handle_request_changes(args: dict, **kw) -> str:
     tid = _worker_guard("kanban_request_changes", args)
     reason = _redact(
         _require_text(args, "reason", "reason is required — describe the changes needed"))
+    metadata = args.get("metadata")
+    _require_dict_metadata(metadata)
+    if metadata is not None:
+        metadata = _redact_metadata(metadata)
+        _check(metadata is not None, "metadata could not be safely serialized")
     with _board(args.get("board")) as (kb, conn):
         ok, detail = kb.request_changes(
-            conn, tid, reason=reason, expected_run_id=_worker_run_id(tid))
+            conn, tid, reason=reason, expected_run_id=_worker_run_id(tid), metadata=metadata)
         _check(ok, f"could not request changes for {tid}: {detail or 'invalid review state'}")
         return _ok_landed(kb, conn, tid, "ready", implementer=detail)
 
@@ -969,7 +979,9 @@ def _handle_create(args: dict, **kw) -> str:
             goal_mode=goal_mode, goal_max_turns=_opt_int(args.get("goal_max_turns")),
             completion_contract=args.get("completion_contract"),
             initial_status=str(args.get("initial_status") or "running"), lane=lane,
-            created_by=os.environ.get("HERMES_PROFILE") or "worker", session_id=session_id)
+            created_by=os.environ.get("HERMES_PROFILE") or "worker", session_id=session_id,
+            created_by_task=os.environ.get("HERMES_KANBAN_TASK") or None,
+            created_by_run=_opt_int(os.environ.get("HERMES_KANBAN_RUN_ID")))
         landed = _fields(kb.get_task(conn, new_tid), _CREATED_FIELDS)
         return _ok(task_id=new_tid, **landed, subscribed=_maybe_auto_subscribe(conn, new_tid))
 

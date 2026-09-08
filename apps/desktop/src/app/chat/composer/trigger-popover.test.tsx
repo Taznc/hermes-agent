@@ -109,7 +109,7 @@ describe('ComposerTriggerPopover keyboard scrolling', () => {
 
   it('keeps keyboard navigation visible and restores the group header on wrap', () => {
     const { container, rerender } = render(popover(0))
-    const drawer = container.querySelector('[data-slot="composer-completion-drawer"]') as HTMLElement
+    const drawer = container.querySelector('[data-slot="composer-completion-list"]') as HTMLElement
     const ancestor = drawer.parentElement as HTMLElement
     const secondRow = screen.getAllByRole('button')[1]
 
@@ -133,7 +133,7 @@ describe('ComposerTriggerPopover keyboard scrolling', () => {
 
   it('uses the nearest drawer edge for upward, visible, and oversized rows', () => {
     const { container, rerender } = render(popover(0))
-    const drawer = container.querySelector('[data-slot="composer-completion-drawer"]') as HTMLElement
+    const drawer = container.querySelector('[data-slot="composer-completion-list"]') as HTMLElement
     const rows = screen.getAllByRole('button')
 
     mockDrawerViewport(drawer)
@@ -166,7 +166,7 @@ describe('ComposerTriggerPopover keyboard scrolling', () => {
     const onHover = vi.fn()
     const { container, rerender } = render(popover(0, onHover))
     const rows = screen.getAllByRole('button')
-    const drawer = container.querySelector('[data-slot="composer-completion-drawer"]') as HTMLElement
+    const drawer = container.querySelector('[data-slot="composer-completion-list"]') as HTMLElement
 
     mockDrawerViewport(drawer)
     mockRowPosition(rows[2], 311, 331)
@@ -187,7 +187,7 @@ describe('ComposerTriggerPopover keyboard scrolling', () => {
   it('does not leave a stale hover marker when the active row is hovered', () => {
     const onHover = vi.fn()
     const { container, rerender } = render(popover(1, onHover))
-    const drawer = container.querySelector('[data-slot="composer-completion-drawer"]') as HTMLElement
+    const drawer = container.querySelector('[data-slot="composer-completion-list"]') as HTMLElement
     const activeRow = screen.getAllByRole('button')[1]
 
     mockDrawerViewport(drawer)

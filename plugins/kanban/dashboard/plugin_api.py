@@ -169,10 +169,12 @@ def _errors_to_500(prefix: str) -> Iterator[None]:
 # sync with kanban_db.VALID_STATUSES — a status missing here gets mis-bucketed into ``todo``.
 # ``on_hold`` is the human-initiated shelf/pause column — distinct from ``blocked`` (worker needs
 # input) and ``scheduled`` (waiting on time). ``idea``/``roadmap`` are the inert wishlist lanes:
-# real columns the UI renders, but no automation ever selects them, so they trail the live ones.
+# real columns the UI renders, but no automation ever selects them. They LEAD the live columns
+# because the board reads left-to-right as a lifecycle: a wish is captured (idea), hashed out
+# (roadmap), and only then authorized into the work queue that starts at ``triage``.
 BOARD_COLUMNS: list[str] = [
-    "triage", "todo", "scheduled", "ready", "running", "blocked", "on_hold", "review", "done",
     "idea", "roadmap",
+    "triage", "todo", "scheduled", "ready", "running", "blocked", "on_hold", "review", "done",
 ]
 
 _CARD_SUMMARY_PREVIEW_CHARS = 200

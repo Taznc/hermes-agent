@@ -18,6 +18,7 @@ import sqlite3
 import subprocess
 import sys
 import time
+import uuid
 from dataclasses import dataclass
 from dataclasses import field
 from pathlib import Path
@@ -1767,11 +1768,13 @@ def _record_task_failure(
 
 def _set_worker_pid(
     conn: sqlite3.Connection, task_id: str, pid: int, *, worker_unit: Optional[str] = None,
+    task: Optional[Task] = None,
 ) -> None:
-    """Record the spawned child's pid (+ launcher unit name, when set) and emit
-    a ``spawned`` event carrying both. ``worker_unit`` is only non-None when
-    ``kanban.worker_launcher`` produced a ``--unit=`` scope for this spawn;
-    absent (NULL) for the default plain-Popen path.
+    """Record the spawned child's pid and immutable launch analytics.
+
+    ``worker_unit`` is only non-None when ``kanban.worker_launcher`` produced a
+    ``--unit=`` scope. Launch analytics were already persisted before spawn;
+    this event reads them back from the run so its payload is self-describing.
     """
     with _kb.write_txn(conn):
         if worker_unit:
@@ -1781,10 +1784,32 @@ def _set_worker_pid(
             )
         else:
             conn.execute("UPDATE tasks SET worker_pid = ? WHERE id = ?", (int(pid), task_id))
-        run_id = _kb._current_run_id(conn, task_id)
+        run_id = (
+            task.current_run_id
+            if task is not None and task.current_run_id is not None
+            else _kb._current_run_id(conn, task_id)
+        )
+        launch_row = (
+            conn.execute(
+                "SELECT session_id, model, provider, reasoning_effort, model_source "
+                "FROM task_runs WHERE id = ?",
+                (run_id,),
+            ).fetchone()
+            if run_id is not None
+            else None
+        )
+        analytics = {
+            key: launch_row[key] if launch_row is not None else None
+            for key in ("model", "provider", "reasoning_effort", "model_source")
+        }
+        session_id = launch_row["session_id"] if launch_row is not None else None
         if run_id is not None:
             conn.execute("UPDATE task_runs SET worker_pid = ? WHERE id = ?", (int(pid), run_id))
-        payload: dict[str, Any] = {"pid": int(pid)}
+        payload: dict[str, Any] = {
+            "pid": int(pid),
+            "session_id": session_id,
+            **analytics,
+        }
         if worker_unit:
             payload["worker_unit"] = worker_unit
         _kb._append_event(conn, task_id, "spawned", payload, run_id=run_id)
@@ -2950,9 +2975,16 @@ def _dispatch_lane_task(
         # worker's system prompt via KANBAN_GUIDANCE.
         claimed.skills = list(dict.fromkeys([*(claimed.skills or []), "sdlc-review"]))
     try:
+        # Resolve and persist before invoking either the built-in or a
+        # compatible custom spawn function. This closes the race where a very
+        # fast worker finalizes its run before the parent records its PID.
+        _prepare_worker_launch(claimed)
+        _stamp_worker_run_launch(conn, claimed)
         pid = _call_spawn_fn(spawn_fn if spawn_fn is not None else _default_spawn, claimed, str(workspace), board)
         if pid:
-            _set_worker_pid(conn, claimed.id, int(pid), worker_unit=claimed.worker_unit)
+            _set_worker_pid(
+                conn, claimed.id, int(pid), worker_unit=claimed.worker_unit, task=claimed,
+            )
         # Fires AFTER the PID (when reported) is durably persisted. Best-effort.
         _kb._fire_worker_spawned_hook(conn, claimed, str(workspace), pid, board=board)
         # consecutive_failures is deliberately NOT reset here: resetting on
@@ -3814,6 +3846,113 @@ def _worker_terminal_timeout_env(
     return str(desired)
 
 
+def _resolve_worker_run_analytics(task: Task, hermes_home: Optional[str]) -> dict[str, Optional[str]]:
+    """Resolve the launch identity recorded on one run.
+
+    Resolution is best-effort because an unreadable profile config must not
+    prevent a worker from spawning. Card pins remain authoritative; otherwise
+    the assignee profile's effective defaults are captured.
+    """
+    cfg: dict[str, Any] = {}
+    if hermes_home:
+        try:
+            from hermes_constants import reset_hermes_home_override, set_hermes_home_override
+            from hermes_cli.config import load_config
+
+            token = set_hermes_home_override(hermes_home)
+            try:
+                cfg = load_config() or {}
+            finally:
+                reset_hermes_home_override(token)
+        except Exception as exc:
+            _kb._log.debug(
+                "kanban worker: could not resolve run analytics for HERMES_HOME=%r (%s)",
+                hermes_home,
+                exc,
+            )
+
+    raw_model_cfg = cfg.get("model")
+    raw_agent_cfg = cfg.get("agent")
+    model_cfg: dict[str, Any] = raw_model_cfg if isinstance(raw_model_cfg, dict) else {}
+    agent_cfg: dict[str, Any] = raw_agent_cfg if isinstance(raw_agent_cfg, dict) else {}
+    default_model = str(model_cfg.get("default") or "").strip() or None
+    default_provider = str(model_cfg.get("provider") or "").strip() or None
+
+    if task.model_override:
+        model = str(task.model_override).strip() or None
+        provider = str(task.provider_override or "").strip() or default_provider
+        route_source = str(task.route_source or "").strip()
+        model_source = (
+            "routing"
+            if route_source and route_source not in {"explicit", "default"}
+            else "card_override"
+        )
+    else:
+        model = default_model
+        provider = default_provider
+        model_source = "profile_default"
+
+    reasoning = str(task.reasoning_effort or agent_cfg.get("reasoning_effort") or "").strip() or None
+    return {
+        "model": model,
+        "provider": provider,
+        "reasoning_effort": reasoning,
+        "model_source": model_source,
+    }
+
+
+def _prepare_worker_launch(task: Task, hermes_home: Optional[str] = None) -> None:
+    """Attach one stable session id and resolved launch identity to ``task``.
+
+    The attributes are transient transport between the dispatch path and the
+    environment builder. :func:`_stamp_worker_run_launch` persists them before
+    process creation; the spawned-event writer then reads them from the run.
+    Repeated calls are idempotent so the dispatch path and direct test helpers
+    may both prepare the same task safely.
+    """
+    if not hermes_home and task.assignee:
+        try:
+            from hermes_cli.profiles import resolve_profile_env
+
+            hermes_home = resolve_profile_env(task.assignee)
+        except Exception:
+            hermes_home = None
+    if not getattr(task, "_worker_session_id", None):
+        setattr(
+            task,
+            "_worker_session_id",
+            f"{datetime.now().strftime('%Y%m%d_%H%M%S')}_{uuid.uuid4().hex[:6]}",
+        )
+    if not getattr(task, "_worker_run_analytics", None):
+        setattr(task, "_worker_run_analytics", _resolve_worker_run_analytics(task, hermes_home))
+
+
+def _stamp_worker_run_launch(conn: sqlite3.Connection, task: Task) -> None:
+    """Persist launch identity before Popen so a fast worker cannot outrun it."""
+    run_id = task.current_run_id or _kb._current_run_id(conn, task.id)
+    if run_id is None:
+        return
+    analytics = dict(getattr(task, "_worker_run_analytics", {}) or {})
+    session_id = getattr(task, "_worker_session_id", None)
+    with _kb.write_txn(conn):
+        conn.execute(
+            """
+            UPDATE task_runs
+               SET session_id = ?, model = ?, provider = ?,
+                   reasoning_effort = ?, model_source = ?
+             WHERE id = ? AND ended_at IS NULL
+            """,
+            (
+                session_id,
+                analytics.get("model"),
+                analytics.get("provider"),
+                analytics.get("reasoning_effort"),
+                analytics.get("model_source"),
+                int(run_id),
+            ),
+        )
+
+
 def _resolve_worker_cli_toolsets(hermes_home: Optional[str]) -> Optional[list[str]]:
     """Return the assigned profile's effective CLI toolsets for a worker.
 
@@ -3880,6 +4019,10 @@ def _worker_argv(task: Task, profile_arg: str, hermes_home: Optional[str]) -> li
         # A worker must NEVER boot the interactive TUI: its no-TTY bail-out
         # exits 0 without doing the task → "protocol violation" every attempt.
         "--cli",
+        # Opt this exact worker invocation into consuming the dispatcher-pinned
+        # HERMES_SESSION_ID. An inherited env var alone must never make an
+        # ordinary nested `hermes` command resume the parent worker session.
+        "--use-env-session-id",
         # Workers run under a profile-scoped HERMES_HOME and so see that
         # profile's shell-hook allowlist; pass --accept-hooks explicitly so
         # configured hooks still register.
@@ -4303,6 +4446,8 @@ def _default_spawn(task: Task, workspace: str, *, board: Optional[str] = None) -
         # No profile dir (isolated test fixtures) — the CLI resolves it from
         # HERMES_PROFILE (set below) instead.
         pass
+    _prepare_worker_launch(task, env.get("HERMES_HOME"))
+    env["HERMES_SESSION_ID"] = str(getattr(task, "_worker_session_id"))
     if task.tenant:
         env["HERMES_TENANT"] = task.tenant
     env["HERMES_KANBAN_TASK"] = task.id
@@ -4374,7 +4519,7 @@ def _default_spawn(task: Task, workspace: str, *, board: Optional[str] = None) -
         for key, value in env.items()
         if key in {
             "HERMES_HOME", "HERMES_TENANT", "HERMES_KANBAN_TASK",
-            "HERMES_KANBAN_WORKSPACE", "HERMES_SESSION_SOURCE", "TERMINAL_CWD",
+            "HERMES_KANBAN_WORKSPACE", "HERMES_SESSION_SOURCE", "HERMES_SESSION_ID", "TERMINAL_CWD",
             "HERMES_KANBAN_BRANCH", "HERMES_KANBAN_RUN_ID", "HERMES_KANBAN_CLAIM_LOCK",
             "HERMES_KANBAN_GOAL_MODE", "HERMES_KANBAN_GOAL_MAX_TURNS", "TERMINAL_TIMEOUT",
             "TERMINAL_MAX_FOREGROUND_TIMEOUT", "HERMES_KANBAN_DB", "HERMES_KANBAN_PIN_HOME",

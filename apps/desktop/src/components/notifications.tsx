@@ -1,5 +1,5 @@
 import { useStore } from '@nanostores/react'
-import { type CSSProperties, type ReactNode, useEffect, useRef, useState } from 'react'
+import { type ComponentProps, type CSSProperties, type ReactNode, useEffect, useRef, useState } from 'react'
 import { createPortal } from 'react-dom'
 
 import { Alert, AlertDescription, AlertTitle } from '@/components/ui/alert'
@@ -19,11 +19,17 @@ import {
 } from '@/store/notifications'
 
 type ToneVariant = 'default' | 'destructive' | 'warning' | 'success'
+type ActionVariant = ComponentProps<typeof Button>['variant']
 
 interface Tone {
   icon: IconComponent
   iconClass: string
-  actionClass: string
+  /**
+   * The Dismiss button's severity chrome, owned by `Button` as a named variant.
+   * The call site selects a variant and passes no `bg-*`/`text-*`/hover classes
+   * of its own — see DESIGN.md, "Style lives in the primitive".
+   */
+  actionVariant: ActionVariant
   variant: ToneVariant
 }
 
@@ -31,25 +37,25 @@ const tone: Record<NotificationKind, Tone> = {
   error: {
     icon: AlertCircle,
     iconClass: 'text-destructive-text',
-    actionClass: 'bg-destructive text-destructive-foreground hover:bg-destructive/90',
+    actionVariant: 'severityError',
     variant: 'destructive'
   },
   warning: {
     icon: AlertTriangle,
     iconClass: 'text-warning-text',
-    actionClass: 'bg-warning text-warning-foreground hover:bg-warning/90',
+    actionVariant: 'severityWarning',
     variant: 'warning'
   },
   info: {
     icon: Info,
     iconClass: 'text-muted-foreground',
-    actionClass: 'bg-secondary text-secondary-foreground hover:bg-secondary/80',
+    actionVariant: 'severityInfo',
     variant: 'default'
   },
   success: {
     icon: CheckCircle2,
     iconClass: 'text-success-text',
-    actionClass: 'bg-success-solid text-success-foreground hover:bg-success-solid/90',
+    actionVariant: 'severitySuccess',
     variant: 'success'
   }
 }
@@ -288,11 +294,11 @@ function NotificationItem({ notification }: { notification: AppNotification }) {
               </Button>
             )}
             <Button
-              className={cn('ml-auto', styles.actionClass)}
+              className="ml-auto"
               onClick={() => dismissNotification(notification.id)}
               size="default"
               type="button"
-              variant="default"
+              variant={styles.actionVariant}
             >
               {copy.dismissAction}
             </Button>

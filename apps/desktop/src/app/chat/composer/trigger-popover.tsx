@@ -4,11 +4,10 @@ import { Fragment, useEffect, useRef } from 'react'
 import { referenceKind, referenceStyle } from '@/components/assistant-ui/reference-kinds'
 import { Codicon } from '@/components/ui/codicon'
 import { GlyphSpinner } from '@/components/ui/glyph-spinner'
-import { Tip } from '@/components/ui/tooltip'
 import { useI18n } from '@/i18n'
 import { cn } from '@/lib/utils'
 
-import { COMPLETION_DRAWER_BELOW_CLASS, COMPLETION_DRAWER_CLASS, CompletionDrawerEmpty } from './completion-drawer'
+import { COMPLETION_PANEL_BELOW_CLASS, COMPLETION_PANEL_CLASS, CompletionDrawerEmpty } from './completion-drawer'
 import type { DirectiveScope } from './text-utils'
 
 interface RowMeta {
@@ -52,6 +51,35 @@ const ROW_CLASS = [
 const GROUP_HEADER_CLASS =
   'select-none px-2 pb-0.5 text-[0.625rem] font-semibold uppercase tracking-wider text-(--ui-text-tertiary)'
 
+/** The list scrolls; the detail footer below it scrolls independently. */
+const LIST_CLASS = 'min-h-0 flex-1 overflow-y-auto overscroll-contain'
+
+/** Four lines at `leading-5` (1.25rem each) of RESERVED height, and a scroller
+ *  rather than a clip. Fixed rather than fit-to-content because the footer is
+ *  re-rendered on every arrow key, so a height that followed the text would
+ *  resize the panel under the user's cursor on each press. Four lines holds the
+ *  longest description in the installed corpus (111 chars) whole at the panel's
+ *  20rem width; anything past that scrolls instead of being cut, so no text is
+ *  ever unreachable. `overscroll-contain` keeps a wheel gesture here from
+ *  scrolling the transcript behind the panel. */
+const DETAIL_CLASS = cn(
+  'mt-1 h-[5.5rem] shrink-0 overflow-y-auto overscroll-contain px-2 pt-1.5',
+  'text-(--ui-text-secondary)'
+)
+
+/** Descriptions are prose: they wrap at the panel width and are never clamped or
+ *  ellipsized, so every word is reachable by scrolling the block above. The
+ *  block is `aria-live`, so assistive tech gets the whole string regardless of
+ *  how much of it is painted. */
+const DETAIL_TEXT_CLASS = 'leading-5 break-words'
+
+/** A row description, from either metadata shape, normalized to a usable string. */
+function rowDescription(item: Unstable_TriggerItem): string {
+  const meta = item.metadata as RowMeta | undefined
+
+  return (meta?.meta || item.description || '').trim()
+}
+
 interface ComposerTriggerPopoverProps {
   activeIndex: number
   items: readonly Unstable_TriggerItem[]
@@ -93,6 +121,7 @@ export function ComposerTriggerPopover({
   const isSlash = kind === '/'
   const isEmoji = kind === ':'
   const listRef = useRef<HTMLDivElement>(null)
+  const detailRef = useRef<HTMLDivElement>(null)
   const hoverIndexRef = useRef(-1)
 
   // Only keyboard navigation should move the drawer. A hover echo already points
@@ -149,64 +178,74 @@ export function ComposerTriggerPopover({
     list.scrollTop += Math.abs(topDelta) < Math.abs(bottomDelta) ? topDelta : bottomDelta
   }, [activeIndex, items])
 
+  // A long description scrolled halfway must not leave the NEXT row's shorter
+  // description reading from its middle, so each new highlight starts at the top
+  // of its own text.
+  useEffect(() => {
+    const detail = detailRef.current
+
+    if (detail) {
+      detail.scrollTop = 0
+    }
+  }, [activeIndex, items])
+
   let lastGroup: string | undefined
+
+  // The footer is reserved for the whole list, not per row: a block that
+  // appears only for rows that have a description would resize the panel on
+  // every arrow key. Lists whose rows carry no descriptions at all (emoji,
+  // bare paths) get no footer, so nothing reserves space for nothing.
+  const hasDescriptions = !isEmoji && items.some(item => rowDescription(item) !== '')
+  const activeDescription = hasDescriptions ? rowDescription(items[activeIndex] ?? items[0]) : ''
 
   return (
     <div
-      className={placement === 'bottom' ? COMPLETION_DRAWER_BELOW_CLASS : COMPLETION_DRAWER_CLASS}
+      className={placement === 'bottom' ? COMPLETION_PANEL_BELOW_CLASS : COMPLETION_PANEL_CLASS}
       data-slot="composer-completion-drawer"
       data-state="open"
       onMouseDown={event => event.preventDefault()}
-      ref={listRef}
-      role="listbox"
     >
-      {scope && <div className={cn(GROUP_HEADER_CLASS, 'pt-0.5')}>{referenceStyle(scope).label}</div>}
-      {items.length === 0 ? (
-        loading ? (
-          <div className="flex items-center gap-2 px-2 py-1.5 text-(--ui-text-tertiary)">
-            <GlyphSpinner ariaLabel={copy.lookupLoading} className="text-foreground/70" spinner="braille" />
-            <span>{copy.lookupLoading}</span>
-          </div>
+      <div className={LIST_CLASS} data-slot="composer-completion-list" ref={listRef} role="listbox">
+        {scope && <div className={cn(GROUP_HEADER_CLASS, 'pt-0.5')}>{referenceStyle(scope).label}</div>}
+        {items.length === 0 ? (
+          loading ? (
+            <div className="flex items-center gap-2 px-2 py-1.5 text-(--ui-text-tertiary)">
+              <GlyphSpinner ariaLabel={copy.lookupLoading} className="text-foreground/70" spinner="braille" />
+              <span>{copy.lookupLoading}</span>
+            </div>
+          ) : (
+            <CompletionDrawerEmpty title={copy.lookupNoMatches}>
+              {kind === '@' ? (
+                <>
+                  {copy.lookupTry} <span className="font-mono text-foreground/80">@file:</span> {copy.lookupOr}{' '}
+                  <span className="font-mono text-foreground/80">@folder:</span>.
+                </>
+              ) : isEmoji ? (
+                <>
+                  {copy.lookupTry} <span className="font-mono text-foreground/80">:joy:</span>.
+                </>
+              ) : (
+                <>
+                  {copy.lookupTry} <span className="font-mono text-foreground/80">/help</span>.
+                </>
+              )}
+            </CompletionDrawerEmpty>
+          )
         ) : (
-          <CompletionDrawerEmpty title={copy.lookupNoMatches}>
-            {kind === '@' ? (
-              <>
-                {copy.lookupTry} <span className="font-mono text-foreground/80">@file:</span> {copy.lookupOr}{' '}
-                <span className="font-mono text-foreground/80">@folder:</span>.
-              </>
-            ) : isEmoji ? (
-              <>
-                {copy.lookupTry} <span className="font-mono text-foreground/80">:joy:</span>.
-              </>
-            ) : (
-              <>
-                {copy.lookupTry} <span className="font-mono text-foreground/80">/help</span>.
-              </>
-            )}
-          </CompletionDrawerEmpty>
-        )
-      ) : (
-        items.map((item, index) => {
-          const meta = item.metadata as RowMeta | undefined
-          const display = meta?.display ?? (isSlash ? `/${item.label}` : item.label)
-          const description = meta?.meta || item.description
-          const group = meta?.group?.trim()
-          const showHeader = isSlash && Boolean(group) && group !== lastGroup
-          const isFirstHeader = lastGroup === undefined
-          lastGroup = group || lastGroup
-          const active = index === activeIndex
-          const refKind = referenceKind(rowKind(item, isSlash))
+          items.map((item, index) => {
+            const meta = item.metadata as RowMeta | undefined
+            const display = meta?.display ?? (isSlash ? `/${item.label}` : item.label)
+            const description = meta?.meta || item.description
+            const group = meta?.group?.trim()
+            const showHeader = isSlash && Boolean(group) && group !== lastGroup
+            const isFirstHeader = lastGroup === undefined
+            lastGroup = group || lastGroup
+            const active = index === activeIndex
+            const refKind = referenceKind(rowKind(item, isSlash))
 
-          return (
-            <Fragment key={item.id}>
-              {showHeader && <div className={cn(GROUP_HEADER_CLASS, isFirstHeader ? 'pt-0.5' : 'pt-2')}>{group}</div>}
-              <Tip
-                className="max-w-[calc(100vw-2rem)] wrap-anywhere"
-                collisionPadding={16}
-                delayDuration={400}
-                label={kind === '/' ? description : undefined}
-                sideOffset={4}
-              >
+            return (
+              <Fragment key={item.id}>
+                {showHeader && <div className={cn(GROUP_HEADER_CLASS, isFirstHeader ? 'pt-0.5' : 'pt-2')}>{group}</div>}
                 <button
                   className={ROW_CLASS}
                   data-highlighted={active ? '' : undefined}
@@ -237,10 +276,15 @@ export function ComposerTriggerPopover({
                     </>
                   )}
                 </button>
-              </Tip>
-            </Fragment>
-          )
-        })
+              </Fragment>
+            )
+          })
+        )}
+      </div>
+      {items.length > 0 && hasDescriptions && (
+        <div aria-live="polite" className={DETAIL_CLASS} data-slot="composer-completion-detail" ref={detailRef}>
+          {activeDescription && <p className={DETAIL_TEXT_CLASS}>{activeDescription}</p>}
+        </div>
       )}
     </div>
   )

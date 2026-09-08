@@ -872,6 +872,10 @@ class Task:
     # kanban.worker_launcher is unset (default plain Popen spawn).
     worker_unit: Optional[str] = None
     completion_contract: Optional[str] = None
+    # Lineage: the task/run that created this task via kanban_create. NULL for CLI/dashboard
+    # creates and every pre-feature row.
+    created_by_task: Optional[str] = None
+    created_by_run: Optional[int] = None
 
     @classmethod
     def from_row(cls, row: sqlite3.Row) -> "Task":
@@ -902,7 +906,7 @@ _TASK_OPTIONAL_COLUMNS = (
     "branch_name", "project_id", "tenant", "result", "idempotency_key", "worker_pid",
     "max_runtime_seconds", "last_heartbeat_at", "current_run_id", "workflow_template_id",
     "current_step_key", "max_retries", "session_id", "route_source", "route_name",
-    "completion_contract",
+    "completion_contract", "created_by_task", "created_by_run",
 )
 # Text columns where "" is stored/read as "not set".
 _TASK_EMPTY_IS_NULL_COLUMNS = (
@@ -931,9 +935,24 @@ class Run:
     summary: Optional[str]
     metadata: Optional[dict]
     error: Optional[str]
+    # Analytics capture — see SCHEMA_SQL's task_runs comment. All NULL on
+    # legacy rows and on any run whose spawn/finalize couldn't resolve a value.
+    model: Optional[str] = None
+    provider: Optional[str] = None
+    reasoning_effort: Optional[str] = None
+    model_source: Optional[str] = None       # card_override | profile_default | routing
+    session_id: Optional[str] = None
+    input_tokens: Optional[int] = None
+    output_tokens: Optional[int] = None
+    cache_read_tokens: Optional[int] = None
+    reasoning_tokens: Optional[int] = None
+    api_calls: Optional[int] = None
+    tool_calls: Optional[int] = None
+    estimated_cost_usd: Optional[float] = None
 
     @classmethod
     def from_row(cls, row: sqlite3.Row) -> "Run":
+        g = lambda col, default=None: _row_get(row, col, default)  # noqa: E731
         return cls(
             **{
                 col: row[col] for col in (
@@ -945,6 +964,15 @@ class Run:
             started_at=int(row["started_at"]),
             ended_at=_opt_int(row["ended_at"]),
             metadata=_json_or(row["metadata"]),
+            model=g("model"), provider=g("provider"), reasoning_effort=g("reasoning_effort"),
+            model_source=g("model_source"), session_id=g("session_id"),
+            input_tokens=_opt_int(g("input_tokens")), output_tokens=_opt_int(g("output_tokens")),
+            cache_read_tokens=_opt_int(g("cache_read_tokens")),
+            reasoning_tokens=_opt_int(g("reasoning_tokens")),
+            api_calls=_opt_int(g("api_calls")), tool_calls=_opt_int(g("tool_calls")),
+            estimated_cost_usd=(
+                float(g("estimated_cost_usd")) if g("estimated_cost_usd") is not None else None
+            ),
         )
 
 
@@ -1146,7 +1174,12 @@ CREATE TABLE IF NOT EXISTS tasks (
     -- plain-Popen spawn path. Durable handle so a cold dispatcher process (e.g. after a gateway
     -- restart) can query the worker's exit status by unit name instead of relying on an
     -- in-process waitpid registry it never populated.
-    worker_unit          TEXT
+    worker_unit          TEXT,
+    -- Lineage: the task/run that created this task via kanban_create (kanban_tools.py), so an
+    -- orchestration tree can be reconstructed without scanning every ``created`` event payload.
+    -- NULL for CLI/dashboard-originated creates and every pre-feature row.
+    created_by_task       TEXT,
+    created_by_run        INTEGER
 );
 
 CREATE TABLE IF NOT EXISTS task_links (
@@ -1201,7 +1234,26 @@ CREATE TABLE IF NOT EXISTS task_runs (
     --          gave_up | reclaimed | (null while still running)
     summary             TEXT,
     metadata            TEXT,
-    error               TEXT
+    error               TEXT,
+    -- Analytics capture (all nullable; NULL on every pre-feature row and on
+    -- any run whose spawn/finalize couldn't resolve a value). See AC1-4 of
+    -- the kanban-analytics-capture card.
+    model               TEXT,
+    provider            TEXT,
+    reasoning_effort    TEXT,
+    -- model_source: card_override | profile_default | routing
+    model_source        TEXT,
+    -- Dispatcher-generated HERMES_SESSION_ID passed to the worker, so a
+    -- crashed/timed-out run (never reaching kanban_complete) is still
+    -- joinable to its state.db session row.
+    session_id          TEXT,
+    input_tokens        INTEGER,
+    output_tokens       INTEGER,
+    cache_read_tokens   INTEGER,
+    reasoning_tokens    INTEGER,
+    api_calls           INTEGER,
+    tool_calls          INTEGER,
+    estimated_cost_usd  REAL
 );
 
 -- Files attached to a task (PDFs, images, source documents). The blob
@@ -2009,6 +2061,7 @@ def create_task(
     project_source_task_id: Optional[str] = None, lane: Optional[str] = None,
     creator_task_id: Optional[str] = None,
     completion_contract: Optional[str] = None,
+    created_by_task: Optional[str] = None, created_by_run: Optional[int] = None,
 ) -> str:
     """Create a task (optionally under ``parents``); returns its id.
 
@@ -2027,6 +2080,8 @@ def create_task(
     dependency edges; an explicit ``session_id`` still wins.
     ``project_source_task_id``: cross-profile fallback when ``project_id`` is not
     in the active profile's projects.db — see ``_resolve_project_link``.
+    ``created_by_task``/``created_by_run``: lineage when this task was created
+    by a worker via ``kanban_create`` — NULL for CLI/dashboard creates.
     ``lane``: ``"idea"``/``"roadmap"`` parks the card in an inert wishlist lane
     (``ROADMAP_LANE_STATUSES``) that no automation ever selects; mutually exclusive
     with ``triage`` and with a non-default ``initial_status``, and ``assignee`` is
@@ -2117,8 +2172,9 @@ def create_task(
                         max_runtime_seconds,
                         skills, max_retries, model_override, provider_override,
                         reasoning_effort, route_source, route_name,
-                        goal_mode, goal_max_turns, session_id, completion_contract
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        goal_mode, goal_max_turns, session_id, completion_contract,
+                        created_by_task, created_by_run
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         task_id, title.strip(), body, assignee, task_status, priority,
@@ -2130,6 +2186,7 @@ def create_task(
                         route_source, route_name,
                         1 if goal_mode else 0, _opt_int(goal_max_turns), session_id,
                         completion_contract,
+                        created_by_task, _opt_int(created_by_run),
                     ),
                 )
                 for pid in parents:
@@ -2155,6 +2212,8 @@ def create_task(
                         "reasoning_effort": reasoning_effort,
                         "route_source": route_source,
                         "route_name": route_name,
+                        "created_by_task": created_by_task,
+                        "created_by_run": _opt_int(created_by_run),
                         "lane": lane,
                     },
                 )
@@ -2916,6 +2975,68 @@ def _append_event(
     )
 
 
+def _copy_run_session_analytics(conn: sqlite3.Connection, run_id: int) -> None:
+    """Best-effort copy of one worker session's usage totals onto its run.
+
+    Session state is profile-scoped and may be missing, busy, or on an older
+    schema. Finalizing the Kanban run must always win over analytics capture, so
+    every lookup failure is reduced to one debug line and leaves the nullable
+    columns untouched.
+    """
+    row = conn.execute(
+        "SELECT profile, session_id FROM task_runs WHERE id = ?", (int(run_id),),
+    ).fetchone()
+    if row is None or not row["session_id"] or not row["profile"]:
+        return
+
+    session_id = str(row["session_id"])
+    profile = str(row["profile"])
+    state_conn: Optional[sqlite3.Connection] = None
+    try:
+        from hermes_cli.profiles import resolve_profile_env
+
+        state_path = Path(resolve_profile_env(profile)) / "state.db"
+        state_conn = sqlite3.connect(f"{state_path.resolve().as_uri()}?mode=ro", uri=True)
+        state_conn.row_factory = sqlite3.Row
+        usage = state_conn.execute(
+            """
+            SELECT input_tokens, output_tokens, cache_read_tokens,
+                   reasoning_tokens, api_call_count, tool_call_count,
+                   estimated_cost_usd
+              FROM sessions
+             WHERE id = ?
+            """,
+            (session_id,),
+        ).fetchone()
+        if usage is None:
+            raise LookupError("session row not found")
+        conn.execute(
+            """
+            UPDATE task_runs
+               SET input_tokens = ?, output_tokens = ?, cache_read_tokens = ?,
+                   reasoning_tokens = ?, api_calls = ?, tool_calls = ?,
+                   estimated_cost_usd = ?
+             WHERE id = ?
+            """,
+            (
+                usage["input_tokens"], usage["output_tokens"], usage["cache_read_tokens"],
+                usage["reasoning_tokens"], usage["api_call_count"], usage["tool_call_count"],
+                usage["estimated_cost_usd"], int(run_id),
+            ),
+        )
+    except Exception as exc:
+        _log.debug(
+            "kanban run analytics unavailable for run=%s profile=%s session=%s (%s)",
+            run_id,
+            profile,
+            session_id,
+            exc,
+        )
+    finally:
+        if state_conn is not None:
+            state_conn.close()
+
+
 def _end_run(
     conn: sqlite3.Connection, task_id: str, *, outcome: str, summary: Optional[str] = None,
     error: Optional[str] = None, metadata: Optional[dict] = None, status: Optional[str] = None,
@@ -2943,6 +3064,7 @@ def _end_run(
         """,
         (status or outcome, outcome, summary, error, _json_or_null(metadata), now, run_id),
     )
+    _copy_run_session_analytics(conn, run_id)
     conn.execute("UPDATE tasks SET current_run_id = NULL WHERE id = ?", (task_id,))
     return run_id
 
@@ -4179,6 +4301,23 @@ def redact_review_value(value: Any) -> Any:
     return value
 
 
+def _review_round(conn: sqlite3.Connection, task_id: str) -> int:
+    """1 + the count of ``changes_requested`` events since the task's last
+    ``completed`` event (or since task creation if it has never completed).
+    Computed server-side so callers cannot spoof or drift the count."""
+    completed = conn.execute(
+        "SELECT id FROM task_events WHERE task_id = ? AND kind = 'completed' "
+        "ORDER BY id DESC LIMIT 1", (task_id,),
+    ).fetchone()
+    since_id = completed["id"] if completed else 0
+    row = conn.execute(
+        "SELECT COUNT(*) AS n FROM task_events "
+        "WHERE task_id = ? AND kind = 'changes_requested' AND id > ?",
+        (task_id, since_id),
+    ).fetchone()
+    return int(row["n"]) + 1
+
+
 def request_review(
     conn: sqlite3.Connection, task_id: str, *, summary: Optional[str] = None,
     metadata: Optional[dict] = None, reviewer: Optional[str] = None,
@@ -4294,6 +4433,7 @@ def request_review(
             "summary": _first_line(summary, 400) or None,
             "implementer": implementer,
             "reviewer": reviewer,
+            "review_round": _review_round(conn, task_id),
         }
         if cross_profile:
             # Preserved (not just deleted) so request_changes can restore the
@@ -4328,13 +4468,18 @@ def _nonblank_str(value: Any) -> Optional[str]:
 
 def request_changes(
     conn: sqlite3.Connection, task_id: str, *, reason: str, expected_run_id: Optional[int] = None,
+    metadata: Optional[dict] = None,
 ) -> tuple[bool, Optional[str]]:
     """Close an active reviewer run (claimed from ``review``) and hand the task
     back to the implementer from the latest ``review_requested`` event, parent
-    gating reapplied. Returns ``(ok, implementer | reason)``."""
+    gating reapplied. Returns ``(ok, implementer | reason)``.
+
+    ``metadata`` lands on the closing run (same handoff contract as
+    :func:`request_review`) and is redacted the same way."""
     reason = str(redact_review_value(reason or "")).strip()
     if not reason:
         return False, "reason is required"
+    metadata = redact_review_value(metadata)
 
     with write_txn(conn):
         task_row = conn.execute(
@@ -4429,6 +4574,7 @@ def request_changes(
             return False, "task changed during review handoff"
         run_id = _end_run(
             conn, task_id, outcome="changes_requested", status=new_status, summary=reason,
+            metadata=metadata,
         )
         _append_event(
             conn,
@@ -4439,6 +4585,7 @@ def request_changes(
                 "implementer": implementer,
                 "reviewer": reviewer,
                 "status": new_status,
+                "review_round": _review_round(conn, task_id),
             },
             run_id=run_id,
         )

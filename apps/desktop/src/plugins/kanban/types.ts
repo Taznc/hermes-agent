@@ -136,6 +136,18 @@ export interface KanbanRun {
   worker_pid?: null | number
   started_at?: null | number
   ended_at?: null | number
+  model?: null | string
+  provider?: null | string
+  reasoning_effort?: null | string
+  model_source?: null | 'card_override' | 'profile_default' | 'routing'
+  session_id?: null | string
+  input_tokens?: null | number
+  output_tokens?: null | number
+  cache_read_tokens?: null | number
+  reasoning_tokens?: null | number
+  api_calls?: null | number
+  tool_calls?: null | number
+  estimated_cost_usd?: null | number
 }
 
 /** A structured multiple-choice answer, persisted alongside a comment's plain
