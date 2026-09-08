@@ -5,7 +5,7 @@
  * model-override.test.tsx — usePluginI18n is stubbed to echo the dotted key
  * so assertions match on stable keys instead of translated English text.
  */
-import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
+import { QueryClient, QueryClientProvider, useQuery } from '@tanstack/react-query'
 import { cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react'
 import type { ReactElement } from 'react'
 import { afterEach, beforeAll, beforeEach, describe, expect, it, vi } from 'vitest'
@@ -49,6 +49,19 @@ function mount(node: ReactElement) {
   return render(<QueryClientProvider client={client}>{node}</QueryClientProvider>)
 }
 
+function ActiveBoardQueries({
+  fetchAllBoards,
+  fetchSingleBoard
+}: {
+  fetchAllBoards: () => Promise<unknown>
+  fetchSingleBoard: () => Promise<unknown>
+}) {
+  useQuery({ queryFn: fetchSingleBoard, queryKey: ['kanban', 'board', 'shipping', false] })
+  useQuery({ queryFn: fetchAllBoards, queryKey: ['kanban', 'board', '*', false] })
+
+  return null
+}
+
 describe('IdeaCaptureDialog', () => {
   it('renders nothing when closed', () => {
     const { container } = mount(<IdeaCaptureDialog onClose={vi.fn()} open={false} />)
@@ -90,6 +103,31 @@ describe('IdeaCaptureDialog', () => {
     // content shape, but the UI shouldn't ship leading/trailing whitespace.
     expect(addRoadmapIdea).toHaveBeenCalledWith('Ship dark mode')
     expect(notify).toHaveBeenCalledWith(expect.objectContaining({ kind: 'success', message: 'ideaSaved' }))
+  })
+
+  it('on success: refetches active single-board and All Boards queries', async () => {
+    addRoadmapIdea.mockResolvedValue({ ok: true, reason: null })
+    const fetchAllBoards = vi.fn().mockResolvedValue({ columns: [] })
+    const fetchSingleBoard = vi.fn().mockResolvedValue({ columns: [] })
+
+    mount(
+      <>
+        <ActiveBoardQueries fetchAllBoards={fetchAllBoards} fetchSingleBoard={fetchSingleBoard} />
+        <IdeaCaptureDialog onClose={vi.fn()} open />
+      </>
+    )
+    await waitFor(() => {
+      expect(fetchSingleBoard).toHaveBeenCalledTimes(1)
+      expect(fetchAllBoards).toHaveBeenCalledTimes(1)
+    })
+
+    fireEvent.change(screen.getByPlaceholderText('ideaPlaceholder'), { target: { value: 'Ship dark mode' } })
+    fireEvent.click(screen.getByText('ideaSave'))
+
+    await waitFor(() => {
+      expect(fetchSingleBoard).toHaveBeenCalledTimes(2)
+      expect(fetchAllBoards).toHaveBeenCalledTimes(2)
+    })
   })
 
   it('on roadmap_unavailable: shows an inline error, does not close, does not notify success', async () => {

@@ -634,13 +634,13 @@ export function Card({
   // — title + id, never the body — reusing the exact contract + toast copy
   // the board-header free-typed capture already established (IdeaCaptureDialog
   // above). Success and roadmap-unavailable get distinct feedback; success also
-  // invalidates the board query prefix, since this now creates a real `idea`
-  // card on the board rather than a fire-and-log ROADMAP.md append.
+  // invalidates the board query prefix, since this creates a real `idea` card
+  // that every active board view must reconcile.
   //
-  // The card's OWN board is passed explicitly: roadmap-sync maps each board
-  // slug to a DIFFERENT ROADMAP file, and without it the backend falls back to
-  // the ACTIVE board — so in All Boards mode the idea would be appended to the
-  // wrong file on disk, silently, under a success toast.
+  // The card's OWN board is passed explicitly: the endpoint creates the new
+  // `idea` card in the addressed board, and without a board the backend falls
+  // back to the ACTIVE one — so in All Boards mode the card could otherwise
+  // appear on the wrong board, silently, under a success toast.
   const sendIdeaMut = useMutation({
     mutationFn: () => addRoadmapIdea(task.title, task.id, task.board ?? undefined),
     onSuccess: ({ ok, reason }) => {
@@ -2869,7 +2869,12 @@ export function KanbanBoardPage() {
                 return
               }
 
-              await moveMut.mutateAsync({ board: task.board ?? undefined, id: task.id, key: spawnReadyKey!, status: 'ready' })
+              await moveMut.mutateAsync({
+                board: task.board ?? undefined,
+                id: task.id,
+                key: spawnReadyKey!,
+                status: 'ready'
+              })
             }}
             open={spawnReadyKey !== null}
             title={k.spawnReadyTitle}

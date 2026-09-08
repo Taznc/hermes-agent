@@ -360,10 +360,21 @@ describe('roadmap visibility toggle', () => {
 
     view.unmount()
     dispose()
+    // A process reload starts from module defaults. Reset while the first
+    // binding is disposed so these cold values are NOT written back over the
+    // stored preferences; the next bind must restore both atoms from storage.
+    $boardSlug.set('')
+    $roadmapHidden.set({})
+    expect($boardSlug.get()).toBe('')
+    expect($roadmapHidden.get()).toEqual({})
+
     // Simulate an app reload: a brand-new bind, which re-hydrates every
     // persisted atom from storage exactly as plugin load does on boot —
     // including $boardSlug itself, so this is a genuine cold rehydrate.
     dispose = bindApi(vi.fn().mockRejectedValue(new Error('unused')), localStoragePluginStorage(), noopSocket)
+
+    expect($boardSlug.get()).toBe('shipping')
+    expect($roadmapHidden.get()).toEqual({ shipping: true })
 
     mount()
 
