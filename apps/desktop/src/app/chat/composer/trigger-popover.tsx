@@ -7,7 +7,7 @@ import { GlyphSpinner } from '@/components/ui/glyph-spinner'
 import { useI18n } from '@/i18n'
 import { cn } from '@/lib/utils'
 
-import { COMPLETION_DRAWER_BELOW_CLASS, COMPLETION_DRAWER_CLASS, CompletionDrawerEmpty } from './completion-drawer'
+import { COMPLETION_PANEL_BELOW_CLASS, COMPLETION_PANEL_CLASS, CompletionDrawerEmpty } from './completion-drawer'
 import type { DirectiveScope } from './text-utils'
 
 interface RowMeta {
@@ -50,6 +50,26 @@ const ROW_CLASS = [
 
 const GROUP_HEADER_CLASS =
   'select-none px-2 pb-0.5 text-[0.625rem] font-semibold uppercase tracking-wider text-(--ui-text-tertiary)'
+
+/** The list scrolls; the detail footer below it does not. */
+const LIST_CLASS = 'min-h-0 flex-1 overflow-y-auto overscroll-contain'
+
+/** Three lines at `leading-5` (1.25rem each). Fixed rather than fit-to-content:
+ *  the footer is re-rendered on every arrow key, so a height that follows the
+ *  text would resize the panel under the user's cursor on each press. */
+const DETAIL_CLASS = cn('mt-1 h-[4.25rem] shrink-0 overflow-hidden px-2 pt-1.5', 'text-(--ui-text-secondary)')
+
+/** Descriptions are prose, so they wrap and are clamped rather than ellipsized
+ *  mid-word. Beyond three lines the tail is cut — a description that long is a
+ *  skill-authoring problem, not something a completion popover should grow for. */
+const DETAIL_TEXT_CLASS = 'line-clamp-3 leading-5 break-words'
+
+/** A row description, from either metadata shape, normalized to a usable string. */
+function rowDescription(item: Unstable_TriggerItem): string {
+  const meta = item.metadata as RowMeta | undefined
+
+  return (meta?.meta || item.description || '').trim()
+}
 
 interface ComposerTriggerPopoverProps {
   activeIndex: number
@@ -150,86 +170,100 @@ export function ComposerTriggerPopover({
 
   let lastGroup: string | undefined
 
+  // The footer is reserved for the whole list, not per row: a block that
+  // appears only for rows that have a description would resize the panel on
+  // every arrow key. Lists whose rows carry no descriptions at all (emoji,
+  // bare paths) get no footer, so nothing reserves space for nothing.
+  const hasDescriptions = !isEmoji && items.some(item => rowDescription(item) !== '')
+  const activeDescription = hasDescriptions ? rowDescription(items[activeIndex] ?? items[0]) : ''
+
   return (
     <div
-      className={placement === 'bottom' ? COMPLETION_DRAWER_BELOW_CLASS : COMPLETION_DRAWER_CLASS}
+      className={placement === 'bottom' ? COMPLETION_PANEL_BELOW_CLASS : COMPLETION_PANEL_CLASS}
       data-slot="composer-completion-drawer"
       data-state="open"
       onMouseDown={event => event.preventDefault()}
-      ref={listRef}
-      role="listbox"
     >
-      {scope && <div className={cn(GROUP_HEADER_CLASS, 'pt-0.5')}>{referenceStyle(scope).label}</div>}
-      {items.length === 0 ? (
-        loading ? (
-          <div className="flex items-center gap-2 px-2 py-1.5 text-(--ui-text-tertiary)">
-            <GlyphSpinner ariaLabel={copy.lookupLoading} className="text-foreground/70" spinner="braille" />
-            <span>{copy.lookupLoading}</span>
-          </div>
-        ) : (
-          <CompletionDrawerEmpty title={copy.lookupNoMatches}>
-            {kind === '@' ? (
-              <>
-                {copy.lookupTry} <span className="font-mono text-foreground/80">@file:</span> {copy.lookupOr}{' '}
-                <span className="font-mono text-foreground/80">@folder:</span>.
-              </>
-            ) : isEmoji ? (
-              <>
-                {copy.lookupTry} <span className="font-mono text-foreground/80">:joy:</span>.
-              </>
-            ) : (
-              <>
-                {copy.lookupTry} <span className="font-mono text-foreground/80">/help</span>.
-              </>
-            )}
-          </CompletionDrawerEmpty>
-        )
-      ) : (
-        items.map((item, index) => {
-          const meta = item.metadata as RowMeta | undefined
-          const display = meta?.display ?? (isSlash ? `/${item.label}` : item.label)
-          const description = meta?.meta || item.description
-          const group = meta?.group?.trim()
-          const showHeader = isSlash && Boolean(group) && group !== lastGroup
-          const isFirstHeader = lastGroup === undefined
-          lastGroup = group || lastGroup
-          const active = index === activeIndex
-          const refKind = referenceKind(rowKind(item, isSlash))
-
-          return (
-            <Fragment key={item.id}>
-              {showHeader && <div className={cn(GROUP_HEADER_CLASS, isFirstHeader ? 'pt-0.5' : 'pt-2')}>{group}</div>}
-              <button
-                className={ROW_CLASS}
-                data-highlighted={active ? '' : undefined}
-                onClick={() => onPick(item)}
-                onMouseEnter={() => {
-                  // React bails out when hovering the already-active row. Do
-                  // not leave a marker behind for a later items refresh.
-                  hoverIndexRef.current = index === activeIndex ? -1 : index
-                  onHover(index)
-                }}
-                type="button"
-              >
-                {isEmoji ? (
-                  // The emoji is its own icon — a glyph column beside it reads
-                  // as decoration.
-                  <span className="min-w-0 shrink truncate leading-5 text-foreground">{display}</span>
-                ) : (
-                  <>
-                    <span className="grid size-4 shrink-0 place-items-center text-(--ref-color)" data-ref={refKind}>
-                      <Codicon name={referenceStyle(refKind).codicon} size="0.875rem" />
-                    </span>
-                    <span className="min-w-0 shrink truncate font-medium leading-5 text-foreground">{display}</span>
-                    {description && (
-                      <span className="min-w-0 flex-1 truncate leading-5 text-(--ui-text-tertiary)">{description}</span>
-                    )}
-                  </>
-                )}
-              </button>
-            </Fragment>
+      <div className={LIST_CLASS} data-slot="composer-completion-list" ref={listRef} role="listbox">
+        {scope && <div className={cn(GROUP_HEADER_CLASS, 'pt-0.5')}>{referenceStyle(scope).label}</div>}
+        {items.length === 0 ? (
+          loading ? (
+            <div className="flex items-center gap-2 px-2 py-1.5 text-(--ui-text-tertiary)">
+              <GlyphSpinner ariaLabel={copy.lookupLoading} className="text-foreground/70" spinner="braille" />
+              <span>{copy.lookupLoading}</span>
+            </div>
+          ) : (
+            <CompletionDrawerEmpty title={copy.lookupNoMatches}>
+              {kind === '@' ? (
+                <>
+                  {copy.lookupTry} <span className="font-mono text-foreground/80">@file:</span> {copy.lookupOr}{' '}
+                  <span className="font-mono text-foreground/80">@folder:</span>.
+                </>
+              ) : isEmoji ? (
+                <>
+                  {copy.lookupTry} <span className="font-mono text-foreground/80">:joy:</span>.
+                </>
+              ) : (
+                <>
+                  {copy.lookupTry} <span className="font-mono text-foreground/80">/help</span>.
+                </>
+              )}
+            </CompletionDrawerEmpty>
           )
-        })
+        ) : (
+          items.map((item, index) => {
+            const meta = item.metadata as RowMeta | undefined
+            const display = meta?.display ?? (isSlash ? `/${item.label}` : item.label)
+            const description = meta?.meta || item.description
+            const group = meta?.group?.trim()
+            const showHeader = isSlash && Boolean(group) && group !== lastGroup
+            const isFirstHeader = lastGroup === undefined
+            lastGroup = group || lastGroup
+            const active = index === activeIndex
+            const refKind = referenceKind(rowKind(item, isSlash))
+
+            return (
+              <Fragment key={item.id}>
+                {showHeader && <div className={cn(GROUP_HEADER_CLASS, isFirstHeader ? 'pt-0.5' : 'pt-2')}>{group}</div>}
+                <button
+                  className={ROW_CLASS}
+                  data-highlighted={active ? '' : undefined}
+                  onClick={() => onPick(item)}
+                  onMouseEnter={() => {
+                    // React bails out when hovering the already-active row. Do
+                    // not leave a marker behind for a later items refresh.
+                    hoverIndexRef.current = index === activeIndex ? -1 : index
+                    onHover(index)
+                  }}
+                  type="button"
+                >
+                  {isEmoji ? (
+                    // The emoji is its own icon — a glyph column beside it reads
+                    // as decoration.
+                    <span className="min-w-0 shrink truncate leading-5 text-foreground">{display}</span>
+                  ) : (
+                    <>
+                      <span className="grid size-4 shrink-0 place-items-center text-(--ref-color)" data-ref={refKind}>
+                        <Codicon name={referenceStyle(refKind).codicon} size="0.875rem" />
+                      </span>
+                      <span className="min-w-0 shrink truncate font-medium leading-5 text-foreground">{display}</span>
+                      {description && (
+                        <span className="min-w-0 flex-1 truncate leading-5 text-(--ui-text-tertiary)">
+                          {description}
+                        </span>
+                      )}
+                    </>
+                  )}
+                </button>
+              </Fragment>
+            )
+          })
+        )}
+      </div>
+      {items.length > 0 && hasDescriptions && (
+        <div aria-live="polite" className={DETAIL_CLASS} data-slot="composer-completion-detail">
+          {activeDescription && <p className={DETAIL_TEXT_CLASS}>{activeDescription}</p>}
+        </div>
       )}
     </div>
   )
