@@ -7,6 +7,7 @@ from hermes_cli import kanban_db as kb
 from hermes_cli import kanban_db_connect as kbc
 from hermes_cli import kanban_db_dispatch as kbd
 from hermes_cli import kanban_diagnostics as kd
+from hermes_cli.plugins import get_plugin_manager
 
 
 def _spawn(_task, _workspace, board=None):
@@ -376,3 +377,40 @@ def test_diagnostics_stays_empty_for_a_normal_blocked_task(all_assignees_spawnab
     diags = kd.compute_task_diagnostics(task, events, runs)
 
     assert not any(d.kind == "review_round_cap" for d in diags)
+
+
+def test_cap_only_tick_is_classified_as_activity_not_idle(all_assignees_spawnable):
+    """A tick whose ONLY transition is a review-round cap did real work: it
+    blocked a card. ``_TICK_ACTIVITY_FIELDS`` drives the dispatch-tick hook's
+    ``outcome``, so omitting ``blocked_review_round_cap`` reported that tick as
+    ``idle`` to every observer — the board moved but telemetry said nothing
+    happened."""
+    mgr = get_plugin_manager()
+    saved = {k: list(v) for k, v in mgr._hooks.items()}
+    ticks: list[dict] = []
+    mgr._hooks.setdefault("on_kanban_dispatch_tick", []).append(
+        lambda **kw: ticks.append(kw)
+    )
+    try:
+        with kbc.connect() as conn:
+            task_id = kb.create_task(conn, title="cap-only tick", assignee="implementer")
+            for reason in ("first", "second", "third"):
+                kb._append_event(conn, task_id, "changes_requested", {"reason": reason})
+            conn.commit()
+
+            result = kbd.dispatch_once(conn, spawn_fn=_spawn, max_review_rounds=3)
+    finally:
+        mgr._hooks = saved
+
+    # The cap is the ONLY transition, so an "ok" outcome cannot come from
+    # another counter being incidentally non-empty.
+    assert result.blocked_review_round_cap == [(task_id, 3)]
+    other_activity = {
+        field: getattr(result, field)
+        for field in kb._TICK_ACTIVITY_FIELDS
+        if field != "blocked_review_round_cap" and getattr(result, field)
+    }
+    assert other_activity == {}
+
+    assert "blocked_review_round_cap" in kb._TICK_ACTIVITY_FIELDS
+    assert [kw["outcome"] for kw in ticks] == ["ok"]

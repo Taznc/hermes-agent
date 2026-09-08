@@ -312,3 +312,55 @@ def test_spawn_to_ready_reports_the_gated_landing_not_the_request(kanban_home):
     assert json.loads(kc.run_slash(f"show {tid} --json"))["task"]["status"] == "todo"
 
 
+# ---------------------------------------------------------------------------
+# dispatch — review-round cap must be visible in both output modes
+# ---------------------------------------------------------------------------
+
+
+def _card_at_the_review_round_cap(title: str) -> str:
+    """A ready card with three ``changes_requested`` rounds — one more than the
+    default ``kanban.max_review_rounds`` allows, so the next dispatch tick caps
+    and blocks it instead of re-dispatching."""
+    with kbc.connect_closing() as conn:
+        tid = kb.create_task(conn, title=title, assignee="implementer")
+        for reason in ("first", "second", "third"):
+            kb._append_event(conn, tid, "changes_requested", {"reason": reason})
+        conn.commit()
+    return tid
+
+
+def test_dispatch_json_reports_the_review_round_cap(kanban_home):
+    """A capped card is a state change the operator must be able to see. The
+    JSON payload carried every other dispatcher transition but silently dropped
+    this one, so `hermes kanban dispatch --json` reported an empty tick while a
+    card had just been blocked."""
+    tid = _card_at_the_review_round_cap("runaway rework")
+
+    payload = json.loads(kc.run_slash("dispatch --dry-run --json"))
+
+    assert payload["blocked_review_round_cap"] == [
+        {"task_id": tid, "changes_rounds": 3}
+    ]
+    assert payload["spawned"] == []
+
+
+def test_dispatch_text_reports_the_review_round_cap(kanban_home):
+    """Same transition, human-readable mode: the line must name the card, the
+    round count, and the cap that stopped it."""
+    tid = _card_at_the_review_round_cap("runaway rework")
+
+    out = kc.run_slash("dispatch --dry-run")
+
+    assert "kanban.max_review_rounds=3" in out
+    assert "after 3 change requests" in out
+    assert tid in out
+
+
+def test_dispatch_text_stays_silent_when_nothing_was_capped(kanban_home):
+    """Negative case: the cap line is per-entry, never an unconditional header."""
+    with kbc.connect_closing() as conn:
+        kb.create_task(conn, title="ordinary card", assignee="implementer")
+
+    out = kc.run_slash("dispatch --dry-run")
+
+    assert "max_review_rounds" not in out
