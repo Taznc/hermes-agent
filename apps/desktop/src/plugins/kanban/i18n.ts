@@ -198,6 +198,11 @@ type KanbanMessages = {
   guideTodo: string
   guideTriage: string
   guideBlockLoop: (reason: string) => string
+  // Confirmation when a loop-broken triage card is dragged back into the work
+  // queue — the backend refuses the bare drag (409); this explains why.
+  blockLoopConfirmTitle: string
+  blockLoopConfirmBody: (title: string, column: string) => string
+  blockLoopConfirmAction: string
   guideScheduled: string
   guideRunning: string
   guideRunningStale: string
@@ -601,6 +606,12 @@ export const en: KanbanMessages = {
   guideTodo: 'Waiting on other cards to finish before this one becomes ready.',
   guideTriage: 'A fresh idea — a specifier agent will flesh it out into a proper task.',
   guideBlockLoop: reason => `Blocked and re-blocked for the same reason — routed here for a decision: ${reason}`,
+  blockLoopConfirmTitle: 'This card looped — answer it before resuming',
+  blockLoopConfirmBody: (title, column) =>
+    `“${title}” was parked here automatically after blocking twice on the same unanswered question. ` +
+    `Moving it to ${column} without answering that question will start the same loop again. ` +
+    `Answer it in a comment first, then confirm.`,
+  blockLoopConfirmAction: 'Resume anyway',
   guideScheduled: 'Waiting for its scheduled time to arrive.',
   guideRunning: 'An agent is actively working on this — nothing to do but wait.',
   guideRunningStale: 'No heartbeat for 2+ minutes — the dispatcher will reclaim it shortly. Wait, or reclaim now.',
@@ -978,6 +989,12 @@ const ja: KanbanMessages = {
   guideTodo: '他のカードの完了を待っています。',
   guideTriage: '生のアイデアです — スペシファイアエージェントが正式なタスクに整えます。',
   guideBlockLoop: reason => `同じ理由でブロックが繰り返され、判断のためにここへ転送されました: ${reason}`,
+  blockLoopConfirmTitle: 'このカードはループしました — 再開前に回答してください',
+  blockLoopConfirmBody: (title, column) =>
+    `「${title}」は、未回答の同じ質問で 2 回ブロックされたため自動的にここへ移動されました。` +
+    `その質問に答えないまま ${column} へ移すと、同じループが再び始まります。` +
+    `まずコメントで回答してから確定してください。`,
+  blockLoopConfirmAction: 'それでも再開する',
   guideScheduled: '予定時刻の到来を待っています。',
   guideRunning: 'エージェントが現在作業中です — 待つ以外にすることはありません。',
   guideRunningStale:
@@ -1354,6 +1371,12 @@ const zh: KanbanMessages = {
   guideTodo: '正在等待其他卡片完成后才会变为就绪。',
   guideTriage: '一个新想法 — 细化代理会将其整理成正式任务。',
   guideBlockLoop: reason => `因同一原因反复受阻并重新受阻 — 已转到此处等待决定：${reason}`,
+  blockLoopConfirmTitle: '此卡片已陷入循环 — 请先回答再恢复',
+  blockLoopConfirmBody: (title, column) =>
+    `“${title}”因同一个未回答的问题两次受阻，已被自动移到此处。` +
+    `在未回答该问题的情况下将其移到 ${column}，会再次触发同样的循环。` +
+    `请先在评论中回答，然后再确认。`,
+  blockLoopConfirmAction: '仍然恢复',
   guideScheduled: '正在等待其预定时间到来。',
   guideRunning: '有代理正在积极处理它 — 只需等待。',
   guideRunningStale: '超过 2 分钟没有心跳 — 调度器很快会重新领取。可以等待，或立即重新领取。',
@@ -1724,6 +1747,12 @@ const zhHant: KanbanMessages = {
   guideTodo: '正在等待其他卡片完成後才會變為就緒。',
   guideTriage: '一個新想法 — 細化代理會將其整理成正式任務。',
   guideBlockLoop: reason => `因同一原因反覆受阻並重新受阻 — 已轉到此處等待決定：${reason}`,
+  blockLoopConfirmTitle: '此卡片已陷入循環 — 請先回答再恢復',
+  blockLoopConfirmBody: (title, column) =>
+    `「${title}」因同一個未回答的問題兩次受阻，已被自動移到此處。` +
+    `在未回答該問題的情況下將其移到 ${column}，會再次觸發同樣的循環。` +
+    `請先在留言中回答，然後再確認。`,
+  blockLoopConfirmAction: '仍然恢復',
   guideScheduled: '正在等待其預定時間到來。',
   guideRunning: '有代理正在積極處理它 — 只需等待。',
   guideRunningStale: '超過 2 分鐘沒有心跳 — 排程器很快會重新領取。可以等待，或立即重新領取。',

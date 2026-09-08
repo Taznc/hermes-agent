@@ -109,6 +109,7 @@ import { TaskDrawer } from './drawer'
 import { EMPTY_OVERRIDE, ModelOverrideField, overrideCreateFields, type TaskModelOverride } from './model-override'
 import { OrchestrationPanel } from './orchestration'
 import { PriorityPicker } from './priority-picker'
+import { needsBlockLoopAck } from './status-guidance'
 import {
   type BoardAllInfo,
   columnMeta,
@@ -2463,8 +2464,18 @@ export function KanbanBoardPage() {
   // cache edit and the bare `id` + `board` for the wire, so a same-id card on
   // another board can never be patched, deleted, or re-prioritized by mistake.
   const moveMut = useMutation({
-    mutationFn: ({ id, status, board: taskBoard }: { key: string; id: string; status: string; board?: string }) =>
-      patchTask(id, { status }, taskBoard),
+    mutationFn: ({
+      id,
+      status,
+      board: taskBoard,
+      acknowledgeBlockLoop
+    }: {
+      key: string
+      id: string
+      status: string
+      board?: string
+      acknowledgeBlockLoop?: boolean
+    }) => patchTask(id, { status, ...(acknowledgeBlockLoop ? { acknowledge_block_loop: true } : {}) }, taskBoard),
     onMutate: async ({ key, status }) => {
       await qc.cancelQueries({ queryKey: boardKey(slug, archived) })
       const previous = qc.getQueryData<KanbanBoard>(boardKey(slug, archived))
@@ -2551,6 +2562,13 @@ export function KanbanBoardPage() {
     priorityMut.mutate({ board: task.board ?? undefined, id: task.id, key, priority })
   }
 
+  // A card the unblock-loop breaker parked in `triage` needs a deliberate
+  // confirmation before it re-enters the work queue: the backend refuses the
+  // bare drag with a 409, and this dialog is what tells the human WHY rather
+  // than surfacing that refusal as a bare error toast. Holds the pending move
+  // (never the mutation) so cancelling leaves the board exactly as it was.
+  const [pendingLoopMove, setPendingLoopMove] = useState<null | { key: string; id: string; status: string; board?: string; title: string }>(null)
+
   const onMove = (key: string, status: string) => {
     const task = index.get(key)
 
@@ -2581,6 +2599,16 @@ export function KanbanBoardPage() {
     // default for a roadmap item — so it is the one lane move that asks first.
     if (task.status === 'roadmap' && status === 'ready') {
       setSpawnReadyKey(key)
+
+      return
+    }
+
+    // Dragging a loop-broken card out of triage re-arms exactly the loop the
+    // breaker parked it to stop, so the backend refuses the bare PATCH (409).
+    // Disjoint from the roadmap branches above: this one only fires from
+    // `triage`, those only from a wishlist lane.
+    if (needsBlockLoopAck(task, status)) {
+      setPendingLoopMove({ board: task.board ?? undefined, id: task.id, key, status, title: task.title })
 
       return
     }
@@ -2878,6 +2906,23 @@ export function KanbanBoardPage() {
             }}
             open={spawnReadyKey !== null}
             title={k.spawnReadyTitle}
+          />
+          {/* Dragging a loop-broken card back into the work queue is refused by
+              the backend (409) without an explicit acknowledgment; the dialog
+              is what tells the human WHY, and its confirm re-sends the same
+              move carrying the ack. */}
+          <ConfirmDialog
+            cancelLabel={k.cancel}
+            confirmLabel={k.blockLoopConfirmAction}
+            description={k.blockLoopConfirmBody(pendingLoopMove?.title ?? '', columnLabel(k, pendingLoopMove?.status ?? ''))}
+            onClose={() => setPendingLoopMove(null)}
+            onConfirm={async () => {
+              if (pendingLoopMove) {
+                await moveMut.mutateAsync({ ...pendingLoopMove, acknowledgeBlockLoop: true })
+              }
+            }}
+            open={Boolean(pendingLoopMove)}
+            title={k.blockLoopConfirmTitle}
           />
           {/* The drawer speaks bare task ids (its detail payload's `links` are
               plain ids on ONE board), so translate at this boundary: the open

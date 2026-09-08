@@ -931,6 +931,10 @@ class UpdateTaskBody(BaseModel):
     clear_model_override: bool = False
     reasoning_effort: Optional[str] = None
     clear_reasoning_effort: bool = False
+    # Explicit second gesture for a card the unblock-loop breaker parked in triage on an
+    # unanswered ``needs_input`` question. Absent (False) is what an ordinary drag sends, so
+    # the guard is on by default and only a deliberate confirmation clears it.
+    acknowledge_block_loop: bool = False
 
 
 class BulkTaskBody(BaseModel):
@@ -949,16 +953,57 @@ class BulkTaskBody(BaseModel):
     clear_model_override: bool = False
     reasoning_effort: Optional[str] = None
     clear_reasoning_effort: bool = False
+    acknowledge_block_loop: bool = False
 
 
 class _StatusRejected(Exception):
     """A status the dashboard may not set via this path; the message is user-facing."""
 
 
+class _BlockLoopAckRequired(Exception):
+    """A loop-broken triage card needs an explicit acknowledgment, not an ordinary drag.
+
+    Surfaced as 409 (not 400): the request is well-formed, the card's *state* is what
+    refuses it, and re-sending with ``acknowledge_block_loop`` resolves it.
+    """
+
+
 _RUNNING_DIRECT_MSG = "Cannot set status to 'running' directly; use the dispatcher/claim path"
 
+# Statuses that put a card back into the dispatcher's reach. ``todo`` is here with ``ready``
+# on purpose: ``recompute_ready()`` promotes any parent-satisfied ``todo`` card to ``ready``
+# on the next tick, so guarding only ``ready`` would be bypassed by dropping the card one
+# lane to the left.
+_WORK_QUEUE_STATUSES = frozenset({"ready", "todo"})
 
-def _drag_to(conn, task_id: str, s: str) -> bool:
+_BLOCK_LOOP_ACK_MSG = (
+    "This card was parked in triage by the unblock-loop breaker after re-blocking on the same "
+    "unresolved question. Moving it back into the work queue without answering that question "
+    "restarts the loop. Answer it in a comment first, then confirm the move (the dashboard asks "
+    "for confirmation; API clients re-send with acknowledge_block_loop=true)."
+)
+
+
+def _is_block_loop_parked(
+    status: Optional[str], block_kind: Optional[str], block_recurrences: Optional[int],
+) -> bool:
+    """Is this card sitting in ``triage`` *because the loop breaker put it there* for an
+    unresolved human decision?
+
+    Scoped to ``needs_input`` exactly as ``kanban_specify``/``kanban_decompose``'s sweep
+    exclusion is: a ``capability``/``transient`` loop is a real scope problem that
+    re-specifying may genuinely fix, so those stay ordinary triage cards. Takes primitives
+    so the same predicate serves both a ``Task`` dataclass (board payload) and a raw
+    ``sqlite3.Row`` (the write path) — one definition of "what counts".
+    """
+    return (
+        status == "triage"
+        and block_kind == "needs_input"
+        and int(block_recurrences or 0) >= kanban_db.BLOCK_RECURRENCE_LIMIT
+    )
+
+
+def _drag_to(conn, task_id: str, s: str, *, acknowledge_block_loop: bool = False) -> bool:
     """Drag-drop into ready/todo/triage: archived cards use the explicit,
     evented unarchive verb; blocked/scheduled -> ready re-opens via
     ``unblock_task``; leaving ``review`` goes through ``reopen_review_task``
@@ -978,7 +1023,7 @@ def _drag_to(conn, task_id: str, s: str) -> bool:
         return kanban_db.unhold_task(conn, task_id)
     if current is not None and current.status == "review":
         return kanban_db.reopen_review_task(conn, task_id)
-    return _set_status_direct(conn, task_id, s)
+    return _set_status_direct(conn, task_id, s, acknowledge_block_loop=acknowledge_block_loop)
 
 
 def _drag_to_lane(conn, task_id: str, lane: str) -> bool:
@@ -999,8 +1044,10 @@ _STATUS_HANDLERS: dict[str, Any] = {
     "on_hold": lambda conn, tid, p: kanban_db.hold_task(conn, tid, reason=getattr(p, "block_reason", None)),
     "review": lambda conn, tid, p: kanban_db.request_review(
         conn, tid, summary=p.summary, metadata=p.metadata, reviewer=(p.assignee or None), force=True),
-    "ready": lambda conn, tid, p: _drag_to(conn, tid, "ready"),
-    "todo": lambda conn, tid, p: _drag_to(conn, tid, "todo"),
+    "ready": lambda conn, tid, p: _drag_to(
+        conn, tid, "ready", acknowledge_block_loop=getattr(p, "acknowledge_block_loop", False)),
+    "todo": lambda conn, tid, p: _drag_to(
+        conn, tid, "todo", acknowledge_block_loop=getattr(p, "acknowledge_block_loop", False)),
     "triage": lambda conn, tid, p: _drag_to(conn, tid, "triage"),
     "idea": lambda conn, tid, p: _drag_to_lane(conn, tid, "idea"),
     "roadmap": lambda conn, tid, p: _drag_to_lane(conn, tid, "roadmap")}
@@ -1054,7 +1101,9 @@ def _patch_status(conn, task_id: str, payload: UpdateTaskBody, review_assignee_d
         # ValueError is the roadmap-lane layer refusing a transition; its message names the
         # attempted from->to, which is exactly what the UI toast should say, so surface it as a
         # 400 rather than letting it fall through to the generic 409.
-        with _map_errors(400, _StatusRejected, ValueError):
+        # _BlockLoopAckRequired is a 409 instead: the payload is valid and the card's state is
+        # what refuses, so re-sending WITH the acknowledgment is the resolution.
+        with _map_errors(409, _BlockLoopAckRequired), _map_errors(400, _StatusRejected, ValueError):
             ok = _apply_status(conn, task_id, s, payload, f"unknown status: {s}")
         if s == "review" and ok and review_assignee_deferred and not payload.assignee:
             ok = kanban_db.assign_task(conn, task_id, None)
@@ -1144,21 +1193,40 @@ def _parents_blocking_ready(conn: sqlite3.Connection, task_id: str) -> list:
     ]
 
 
-def _set_status_direct(conn: sqlite3.Connection, task_id: str, new_status: str) -> bool:
+def _set_status_direct(
+    conn: sqlite3.Connection, task_id: str, new_status: str, *, acknowledge_block_loop: bool = False,
+) -> bool:
     """Direct status write for drag-drop moves without a structured verb (todo<->ready,
     running<->ready) + a ``status`` event. Leaving ``running`` closes the run as 'reclaimed'
-    so attempt history isn't orphaned; the worker is killed only AFTER the txn commits."""
+    so attempt history isn't orphaned; the worker is killed only AFTER the txn commits.
+
+    One state refuses this path outright: a card the unblock-loop breaker parked in
+    ``triage`` for an unanswered ``needs_input`` question. Every other exit from a
+    loop-broken state is a dedicated verb that a human chose deliberately, while this one
+    is reachable by an ordinary drag gesture — which is how a live board re-armed the same
+    loop three times in ~70 minutes. ``acknowledge_block_loop`` is the deliberate override
+    and is recorded as its own event; the guard lives here rather than only in
+    :func:`_drag_to` so any future caller of this raw write inherits it.
+    """
     terminations: list[tuple[Optional[int], Optional[str], Optional[str]]] = []
     effective_status = new_status
+    ack_recorded = False
     with kanban_db.write_txn(conn):
         prev = conn.execute(
-            "SELECT status, current_run_id, worker_pid, claim_lock, worker_unit FROM tasks WHERE id = ?", (task_id,)).fetchone()
+            "SELECT status, current_run_id, worker_pid, claim_lock, worker_unit, "
+            "block_kind, block_recurrences FROM tasks WHERE id = ?", (task_id,)).fetchone()
         if prev is None:
             return False
         # Archived is a one-way door from this path: leaving it goes through the explicit
         # kanban_db.archive_task()/unarchive verb only, never a bare drag-drop status write.
         if prev["status"] == "archived":
             return False
+        if new_status in _WORK_QUEUE_STATUSES and _is_block_loop_parked(
+            prev["status"], prev["block_kind"], prev["block_recurrences"],
+        ):
+            if not acknowledge_block_loop:
+                raise _BlockLoopAckRequired(_BLOCK_LOOP_ACK_MSG)
+            ack_recorded = True
         if prev["status"] == "running" and new_status == "ready":
             resume_status = kanban_db._retry_status_for_run(conn, task_id, prev["current_run_id"])
             if resume_status == "review":
@@ -1191,6 +1259,20 @@ def _set_status_direct(conn: sqlite3.Connection, task_id: str, new_status: str) 
         conn.execute(
             "INSERT INTO task_events (task_id, run_id, kind, payload, created_at) VALUES (?, ?, 'status', ?, ?)",
             (task_id, run_id, json.dumps({"status": effective_status, "requested_status": new_status}), int(time.time())))
+        if ack_recorded:
+            # Audit trail for the override, written in the SAME txn as the move it
+            # authorizes so the two can never disagree. ``block_kind`` /
+            # ``block_recurrences`` are deliberately NOT reset (mirroring
+            # ``unblock_task``): an acknowledgment resumes the card, it does not forgive
+            # its loop history, so a re-block still trips the breaker at the same count.
+            conn.execute(
+                "INSERT INTO task_events (task_id, run_id, kind, payload, created_at) "
+                "VALUES (?, ?, 'block_loop_ack', ?, ?)",
+                (task_id, run_id,
+                 json.dumps({"status": effective_status, "requested_status": new_status,
+                             "block_kind": prev["block_kind"],
+                             "recurrences": int(prev["block_recurrences"] or 0)}),
+                 int(time.time())))
         if reopening_satisfied_parent:
             # Domain-layer invalidation composes via a savepoint inside our txn and hands
             # back worker terminations to perform post-commit.
@@ -1263,9 +1345,10 @@ def _bulk_apply_one(conn, tid: str, payload: BulkTaskBody, board: Optional[str],
         try:
             if not _apply_status(conn, tid, s, payload, f"unknown status {s!r}"):
                 entry.update(ok=False, error=f"transition to {s!r} refused")
-        except ValueError as exc:
-            # Roadmap-lane refusal: record the from->to message per task, matching how every
-            # other per-task refusal in this bulk loop is reported instead of aborting the batch.
+        except (ValueError, _BlockLoopAckRequired) as exc:
+            # Roadmap-lane refusal or a loop-broken card needing acknowledgment: record the
+            # message per task, matching how every other per-task refusal in this bulk loop
+            # is reported instead of aborting the batch.
             entry.update(ok=False, error=str(exc))
     if payload.assignee is not None:
         try:

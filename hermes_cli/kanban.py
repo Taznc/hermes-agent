@@ -24,7 +24,7 @@ from hermes_cli import kanban_db_notify as kbn
 from hermes_cli import kanban_swarm as ks
 from hermes_cli.kanban_output import (
     _ATTACHMENT_FIELDS, _RUNS_RUN_FIELDS, _SHOW_RUN_FIELDS, _bulk_apply, _err, _err_structured,
-    _fmt_counts, _fmt_task_line, _fmt_ts, _json_out, _obj_dict, _print_json,
+    _fmt_counts, _fmt_priority, _fmt_task_line, _fmt_ts, _json_out, _obj_dict, _print_json,
     _task_to_dict,
 )
 from hermes_cli.kanban_boards import _dispatch_boards
@@ -603,6 +603,7 @@ def _cmd_show(args: argparse.Namespace) -> int:
     print(f"Task {task.id}: {task.title}")
     field("status", task.status)
     field("assignee", task.assignee or "-")
+    field("priority", _fmt_priority(task.priority))
     if task.tenant:
         field("tenant", task.tenant)
     field("workspace", f"{task.workspace_kind}" + (f" @ {task.workspace_path}" if task.workspace_path else ""))

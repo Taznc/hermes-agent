@@ -109,6 +109,18 @@ def test_kanban_show_text_omits_absent_run_analytics(kanban_home):
     assert "undefined" not in output
 
 
+def test_list_text_renders_known_and_unknown_priority_tiers(kanban_home):
+    """Priority 0 must render as Normal rather than vanish by truthiness."""
+    with kbc.connect() as conn:
+        kb.create_task(conn, title="normal prio task", priority=0)
+        kb.create_task(conn, title="custom prio task", priority=90)
+
+    out = kc.run_slash("list")
+
+    assert "normalpriotask(normal)" in out.replace(" ", "")
+    assert "custompriotask(90)" in out.replace(" ", "")
+
+
 def test_board_override_is_isolated_per_concurrent_call(kanban_home, monkeypatch):
     kb.create_board("alpha")
     kb.create_board("beta")
