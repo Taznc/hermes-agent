@@ -2570,6 +2570,18 @@ def resume_dispatch(board: Optional[str] = None) -> dict[str, Any]:
             }
         path = _dispatch_pause_path(board)
         previous = read_dispatch_pause(board)
+        # The operator changed their mind about the maintenance window, so any
+        # action queued to fire when this board drained is no longer wanted.
+        # Cancelled under the same board lock that clears the pause: resuming
+        # and leaving a reboot armed would be the worst possible split outcome.
+        try:
+            from hermes_cli.kanban_db_dispatch_postdrain import cancel_post_drain_action
+            cancel_post_drain_action(board, reason="dispatch resumed")
+        except Exception:
+            _kb._log.warning(
+                "kanban dispatch for board %s: could not cancel the queued post-drain action",
+                board or _kb.DEFAULT_BOARD, exc_info=True,
+            )
         # Clear SQLite first. A JSON-only circuit must remain authoritative if
         # fallback cleanup fails; unlinking it first would silently re-arm the
         # next tick even though this explicit recovery returned an error.
