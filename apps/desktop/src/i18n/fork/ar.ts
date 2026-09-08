@@ -56,7 +56,13 @@ export const forkAr: TranslationOverrides = {
   },
   settings: {
     gateway: {
-      openLogsFailed: 'تعذّر فتح مجلد السجلات'
+      openLogsFailed: 'تعذّر فتح مجلد السجلات',
+      singleBackendTitle: 'خدمة خلفية واحدة تُدار على الخادم',
+      singleBackendDesc: (host: string) =>
+        `هذه النسخة العاملة في المتصفح مرتبطة بخدمة Hermes خلفية واحدة على ${host}. يتطلب تسجيل بوابات بعيدة أو عبر SSH أو Cloud تطبيق Hermes لسطح المكتب.`,
+      singleBackendDescNoHost:
+        'هذه النسخة العاملة في المتصفح مرتبطة بخدمة Hermes خلفية واحدة. يتطلب تسجيل بوابات بعيدة أو عبر SSH أو Cloud تطبيق Hermes لسطح المكتب.',
+      singleBackendDocsLink: 'ربط تطبيق سطح المكتب بعدة نسخ من Hermes'
     }
   },
   sidebar: {
