@@ -155,6 +155,50 @@ def _cmd_boards_set_default_workdir(args: argparse.Namespace) -> int:
     return 0
 
 
+def _cmd_boards_set_land_target(args: argparse.Namespace) -> int:
+    """``hermes kanban boards set-land-target <slug> <remote>/<branch>``.
+
+    The ONLY way a board acquires a default landing target. ``hermes kanban
+    land`` never infers one, so this is what an operator sets once per board
+    instead of retyping ``--target`` (and instead of the command guessing
+    between a fork and its upstream).
+    """
+    normed, rc = _board_slug_arg(args, "set-land-target", must_exist=True)
+    if rc:
+        return rc
+    target = (args.target or "").strip()
+    if target:
+        remote, sep, branch = target.partition("/")
+        if not sep or not remote.strip() or not branch.strip():
+            return _err(
+                f"kanban boards set-land-target: {target!r} is not of the form "
+                "<remote>/<branch>", 2,
+            )
+    new_val = kb.write_board_metadata(normed, land_target=target).get("land_target")
+    if new_val:
+        print(f"Board {normed!r} landing target set to {new_val!r}.")
+    else:
+        print(f"Board {normed!r} landing target cleared "
+              "(`hermes kanban land` will require --target).")
+    return 0
+
+
+def _cmd_boards_set_land_verify(args: argparse.Namespace) -> int:
+    """Shell command re-run against the exact sha before it may be landed."""
+    normed, rc = _board_slug_arg(args, "set-land-verify", must_exist=True)
+    if rc:
+        return rc
+    new_val = kb.write_board_metadata(
+        normed, land_verify=(args.command or "").strip(),
+    ).get("land_verify")
+    if new_val:
+        print(f"Board {normed!r} landing verification command set to {new_val!r}.")
+    else:
+        print(f"Board {normed!r} landing verification command cleared "
+              "(landing falls back to the approval run's verification receipt).")
+    return 0
+
+
 def _cmd_boards_export(args: argparse.Namespace) -> int:
     from hermes_cli import kanban_transfer
     from hermes_cli.sizefmt import format_bytes
@@ -209,6 +253,8 @@ _BOARD_HANDLERS = {
     "show": _cmd_boards_show, "current": _cmd_boards_show,
     "rename": _cmd_boards_rename,
     "set-default-workdir": _cmd_boards_set_default_workdir,
+    "set-land-target": _cmd_boards_set_land_target,
+    "set-land-verify": _cmd_boards_set_land_verify,
     "export": _cmd_boards_export,
     "import": _cmd_boards_import,
 }

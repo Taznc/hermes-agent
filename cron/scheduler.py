@@ -482,7 +482,7 @@ def _resolve_job_reasoning_config(job: dict, cfg: dict, model: str) -> dict | No
 from cron.jobs import (
     _ensure_cron_dir, advance_next_runs, claim_dispatch, claim_job_for_fire, fire_claim_fence,
     clear_run_claim, get_due_jobs, heartbeat_fire_claim, heartbeat_run_claim, mark_job_run,
-    save_job_output, use_cron_store)
+    release_interrupted_retry_claim, save_job_output, use_cron_store)
 from cron.executions import (
     _TERMINAL_STATES, create_execution, finish_execution, get_execution,
     mark_execution_handoff_pending, mark_execution_running, recover_interrupted_executions)
@@ -2723,15 +2723,32 @@ def run_one_job(
 
 
 _OWNERSHIP_LOST_INTERRUPTED = "Interrupted by shutdown before terminal completion."
+_DRAIN_INTERRUPTED = "Interrupted by gateway shutdown before terminal completion."
+
+
+def _record_interruption(execution_id: str, error: str) -> None:
+    """Terminalize an interrupted attempt as a durable ledger fact.
+
+    The incident is deliberately NOT raised here. Interruptions arrive from four places (this
+    drain, fire-ownership loss, dead-owner restart recovery, and rows adopted by the ledger
+    migration), and only ``cron.interrupted_retry`` sees all four — exactly once each, gated by
+    the ``retry_state`` compare-and-swap. Raising there also means the incident is written by a
+    process that is still alive, rather than by one being torn down mid-shutdown.
+    """
+    finish_execution(execution_id, success=False, error=error, interrupted=True)
 
 
 def _record_fire_ownership_lost(job_id: str, fire_owner: Optional[str], execution_id: str) -> None:
     """Bookkeeping after fire-claim ownership loss. A transport-level cancel (dashboard drain) is
     not a real loss — we still own the claim, so record the interruption via the owner-fenced
-    terminal write instead of leaving fire_claim/last_status stale; otherwise discard."""
+    terminal write instead of leaving fire_claim/last_status stale; otherwise discard.
+
+    The discard branch is deliberate cancellation (a replacement owner took the job), so it is
+    NOT flagged interrupted: replaying it would duplicate the run the replacement owner is doing.
+    """
     if fire_owner is not None and heartbeat_fire_claim(job_id, expected_owner=fire_owner):
         mark_job_run(job_id, False, _OWNERSHIP_LOST_INTERRUPTED, expected_fire_owner=fire_owner)
-        finish_execution(execution_id, success=False, error=_OWNERSHIP_LOST_INTERRUPTED)
+        _record_interruption(execution_id, _OWNERSHIP_LOST_INTERRUPTED)
     else:
         finish_execution(
             execution_id, success=False,
@@ -2940,9 +2957,7 @@ def _finish_interrupted_run(job: dict, execution_id: str, delivery_error: Option
         except Exception as _rec_err:
             logger.debug(
                 "Failed recording delivery_error for interrupted job %s: %s", job["id"], _rec_err)
-    finish_execution(
-        execution_id, success=False,
-        error="Interrupted by gateway shutdown before terminal completion.")
+    _record_interruption(execution_id, _DRAIN_INTERRUPTED)
 
 
 def _finish_completed_run(d: _RunDelivery, fire_owner: Optional[str], execution_id: str) -> bool:
@@ -2984,12 +2999,24 @@ def _finish_completed_run(d: _RunDelivery, fire_owner: Optional[str], execution_
 
 
 def _deliver_crash_failure(
-    job: dict, err_text: str, *, adapters, loop,
+    job: dict, err_text: str, *, adapters, loop, failure_type: Optional[str] = None,
+    incident_required: bool = False, suppress_if_alerted: bool = False,
 ) -> tuple[Optional[str], str]:
     """Failure notice for a run that raised out of run_job. Returns (delivery_error, outcome)."""
     normalized_deliver = _normalize_deliver_value(_delivery_lane_value(job, for_failure=True))
     # Same ack gate as the normal failure delivery: acked signatures stay silent here too.
-    incident_acked, failure_incident_id = _upsert_incident_for_failure(job, err_text)
+    if incident_required:
+        from cron.incidents import get_incident, upsert_incident
+
+        failure_incident_id, _ = upsert_incident(
+            job["id"], err_text, job_name=job.get("name"), failure_type=failure_type)
+        incident = get_incident(failure_incident_id)
+        incident_state = incident.get("state") if incident else None
+        incident_acked = incident_state == "closed"
+        if suppress_if_alerted and incident_state == "alerted":
+            return None, "suppressed_alerted"
+    else:
+        incident_acked, failure_incident_id = _upsert_incident_for_failure(job, err_text)
     if incident_acked:
         return None, "suppressed_acked"
     delivery_error = None
@@ -3015,7 +3042,9 @@ def _deliver_crash_failure(
         delivery_error=delivery_error, should_deliver=True, unresolved_origin=unresolved_origin,
         normalized_deliver=normalized_deliver, incident_acked=False, success=False,
         delivery_queued=job.get("last_delivery_queued"))
-    if delivery_outcome in ("delivered", "not_configured"):
+    if delivery_outcome == "delivered" or (
+        delivery_outcome == "not_configured" and not incident_required
+    ):
         _mark_incident_alerted(failure_incident_id)
     return delivery_error, delivery_outcome
 
@@ -3729,6 +3758,25 @@ def _maybe_reap_dead_owners() -> None:
                 _reclaimed)
     except Exception as _reap_exc:
         logger.debug("Dead-owner execution reclaim failed: %s", _reap_exc)
+    _reconcile_interrupted_occurrences()
+
+
+def _reconcile_interrupted_occurrences() -> None:
+    """Decide the replay of occurrences lost to a shutdown (bounded, at most once each).
+
+    Runs after the dead-owner reap so rows this tick just recovered are decided in the same pass;
+    a long-interval job whose occurrence was lost therefore gets it back within one reap cycle
+    rather than waiting a full period. Never raises into the tick.
+    """
+    try:
+        from cron.interrupted_retry import reconcile_interrupted_executions
+
+        _scheduled = reconcile_interrupted_executions()
+        if _scheduled:
+            logger.warning(
+                "Re-armed %d cron occurrence(s) interrupted by a shutdown", _scheduled)
+    except Exception as _retry_exc:
+        logger.debug("Interrupted-occurrence reconcile failed: %s", _retry_exc)
 
 
 def _sweep_stale_inflight_for_tick(due_jobs: list) -> None:
@@ -3779,7 +3827,8 @@ def _sweep_mcp_orphans() -> None:
 def _process_due_job(job: dict, adapters, loop, verbose: bool) -> bool:
     """Run one due job via the shared ``run_one_job`` body."""
     # Claim only when the worker actually starts, so a queued lease can't expire first.
-    claimed = claim_job_for_fire(job["id"], return_job=True)
+    claimed = claim_job_for_fire(
+        job["id"], return_job=True, execution_id=job["execution_id"])
     if not claimed:
         finish_execution(
             job["execution_id"], success=False, error="Fire claim lost; execution was not started.")
@@ -3788,6 +3837,28 @@ def _process_due_job(job: dict, adapters, loop, verbose: bool) -> bool:
     claimed_job = dict(claimed) if isinstance(claimed, dict) else dict(job)
     claimed_job["execution_id"] = job["execution_id"]
     claimed_job["_scheduled_instant"] = job.get("_scheduled_instant")
+    stamp = claimed_job.get("interrupted_retry")
+    retry_of = stamp.get("execution_id") if isinstance(stamp, dict) else None
+    if retry_of:
+        from cron.executions import bind_interrupted_retry_lineage
+        lineage_error = None
+        try:
+            bound = bind_interrupted_retry_lineage(
+                job["execution_id"], job["id"], str(retry_of))
+        except Exception as exc:
+            bound = None
+            lineage_error = f"{type(exc).__name__}: {exc}"
+        if bound is None:
+            claim = claimed_job.get("fire_claim")
+            owner = claim.get("by") if isinstance(claim, dict) else None
+            if owner:
+                release_interrupted_retry_claim(
+                    job["id"], job["execution_id"], expected_fire_owner=str(owner))
+            finish_execution(
+                job["execution_id"], success=False,
+                error=("Replay lineage could not be bound before dispatch"
+                       + (f": {lineage_error}" if lineage_error else ".")))
+            return True
     return run_one_job(claimed_job, adapters=adapters, loop=loop, verbose=verbose)
 
 
