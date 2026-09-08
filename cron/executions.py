@@ -38,6 +38,9 @@ RECOVERED_INTERRUPTION_ERROR = (
     "whether side effects ran is unknown."
 )
 _lock = threading.RLock()
+# Attempts that committed a terminal row but withheld its monitoring projection until their
+# delivery outcome is known. Guarded by ``_lock``; see ``_claim_deferred_projection``.
+_deferred_projections: set[str] = set()
 _PROCESS_ID = uuid.uuid4().hex
 
 # Interruption error text written before the ``interrupted`` column existed. Matching on text is
@@ -152,6 +155,28 @@ def _emit_execution_state(
         emit_execution_state(record, delivery_outcome=delivery_outcome)
     except Exception:
         pass
+
+
+def _defer_execution_projection(execution_id: str) -> None:
+    """Mark an attempt as owing exactly one terminal projection."""
+    with _lock:
+        _deferred_projections.add(str(execution_id))
+
+
+def _claim_deferred_projection(execution_id: str) -> bool:
+    """Take ownership of an owed terminal projection; true for exactly one caller.
+
+    Compare-and-swap rather than a "did we already emit?" read, so at-most-once is a property of
+    this function and not of every caller having been enumerated correctly. Process-local by
+    design: the deferral only ever spans one run's own delivery, within the process that wrote
+    the row (both writers are pid-fenced anyway).
+    """
+    key = str(execution_id)
+    with _lock:
+        if key not in _deferred_projections:
+            return False
+        _deferred_projections.discard(key)
+        return True
 
 
 def _process_start_time(pid: int) -> Optional[int]:
@@ -312,11 +337,19 @@ def mark_execution_running(execution_id: str) -> Optional[Dict[str, Any]]:
 def finish_execution(
     execution_id: str, *, success: bool, error: Optional[str] = None,
     delivery_outcome: Optional[str] = None, interrupted: bool = False,
+    defer_projection: bool = False,
 ) -> Optional[Dict[str, Any]]:
     """Write a terminal result once; terminal attempts cannot be rewritten.
 
     ``interrupted`` records that the attempt died to a shutdown/ownership loss rather than to its
     own failure, so the reconciler can find it without parsing ``error``.
+
+    ``defer_projection`` commits the durable row but withholds its monitoring projection, for the
+    caller that terminalizes *before* delivery and will attach a ``delivery_outcome`` afterwards.
+    One attempt must yield exactly one terminal event: ``CronExecutionEvent`` carries no execution
+    id, so a second one is indistinguishable from another attempt and double-counts completions.
+    The deferred projection is emitted by whichever of ``record_delivery_outcome`` or
+    ``flush_deferred_execution_projection`` claims it first — see ``_claim_deferred_projection``.
     """
     now = _hermes_now().isoformat()
     status = "completed" if success else "failed"
@@ -336,8 +369,57 @@ def finish_execution(
             return None
         _prune_unlocked(conn)
         record = _fetch(conn, execution_id)
+    if defer_projection:
+        _defer_execution_projection(execution_id)
+        return record
     _emit_execution_state(record, delivery_outcome=delivery_outcome)
     return record
+
+
+def record_delivery_outcome(
+    execution_id: str, delivery_outcome: Optional[str],
+) -> Optional[Dict[str, Any]]:
+    """Attach a delivery result to an attempt that is already terminal.
+
+    Delivery is a *separate* durable outcome from the run that produced the content. The run's
+    terminal state is written before delivery begins, so a slow, failing or interrupted delivery
+    cannot rewrite a completed run as failed — and this records how that delivery went afterwards.
+    Only ``delivery_outcome`` is written; ``status``, ``error`` and ``interrupted`` are never
+    touched, which is what keeps terminal states immutable while still making the delivery fact
+    durable. Returns ``None`` when the row is absent, not terminal, or already carries an outcome.
+
+    This emits the attempt's single terminal projection, now complete with its delivery outcome,
+    but only if it claims the marker ``finish_execution(defer_projection=True)`` left behind. A row
+    that already projected cannot be made to project twice from here.
+    """
+    with _transaction() as conn:
+        cur = conn.execute(
+            """UPDATE executions SET delivery_outcome=?
+               WHERE id=? AND status IN ('completed','failed')
+                 AND delivery_outcome IS NULL
+                 AND process_id=? AND pid=?""",
+            (delivery_outcome, str(execution_id), _PROCESS_ID, os.getpid()),
+        )
+        if cur.rowcount != 1:
+            return None
+        record = _fetch(conn, execution_id)
+    if _claim_deferred_projection(execution_id):
+        _emit_execution_state(record, delivery_outcome=delivery_outcome)
+    return record
+
+
+def flush_deferred_execution_projection(execution_id: str) -> None:
+    """Emit a deferred terminal projection that no delivery outcome ever claimed.
+
+    Terminalizing before delivery splits "the row is durable" from "we know how delivery went",
+    and several exits fall in between: a lost fire claim raised from the *delivery* fence, a
+    delivery that raised past the recorder, or the outer ``BaseException`` tail. Without this,
+    deferring would trade a double-counted terminal event for a dropped one. Idempotent, and a
+    no-op for an attempt that already projected.
+    """
+    if not _claim_deferred_projection(execution_id):
+        return
+    _emit_execution_state(get_execution(execution_id))
 
 
 def recover_interrupted_executions() -> int:
