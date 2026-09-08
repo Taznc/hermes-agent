@@ -650,3 +650,86 @@ def _receipt_body(result: dict) -> str:
         f"({verification.get('command') or verification.get('sha', '')})",
         f"- Closure: content proven reachable on {result['target']}; card completed and archived.",
     ])
+
+
+# ---------------------------------------------------------------------------
+# CLI handler — batch mode isolates every task from its siblings
+# ---------------------------------------------------------------------------
+
+
+def _cmd_land(args) -> int:
+    """``hermes kanban land <task-id...> [--target R/B] [--dry-run] [--json]``."""
+    from hermes_cli import kanban_db_connect as kbc
+    from hermes_cli.kanban_output import _err, _json_out
+
+    task_ids = list(dict.fromkeys(args.task_ids or []))
+    if not task_ids:
+        return _err("kanban land: at least one task_id is required", 2)
+
+    board = getattr(args, "board", None)
+    dry_run = bool(getattr(args, "dry_run", False))
+    actor = _actor()
+
+    results: list[dict] = []
+    with kbc.connect_closing() as conn:
+        for task_id in task_ids:
+            # Per-task isolation: a refusal or an unexpected git/DB failure on
+            # one card is recorded as that card's verdict and never aborts the
+            # batch or contaminates another card's report.
+            try:
+                target = resolve_target(getattr(args, "target", None), board=board)
+                results.append(
+                    land_task(conn, task_id, target=target, dry_run=dry_run,
+                              board=board, actor=actor),
+                )
+            except LandRefusal as exc:
+                results.append(_refusal_record(task_id, args, exc.reason, exc.message, dry_run))
+            except (GitError, OSError, RuntimeError, ValueError) as exc:
+                results.append(_refusal_record(task_id, args, "error", str(exc), dry_run))
+
+    refused = [r for r in results if r["verdict"] == "refused"]
+    if not _json_out(args, results):
+        for record in results:
+            print(_land_line(record))
+    return 1 if refused else 0
+
+
+def _refusal_record(task_id: str, args, reason: str, message: str, dry_run: bool) -> dict:
+    """A refusal reported in the same shape as a success, so a batch report is
+    uniform and machine-readable."""
+    remote, branch = "", ""
+    raw = str(getattr(args, "target", None) or "")
+    if "/" in raw:
+        remote, _, branch = raw.partition("/")
+    return {
+        "task_id": task_id, "verdict": "refused", "reason": reason, "message": message,
+        "remote": remote or None, "branch": branch or None,
+        "target": raw or None, "dry_run": dry_run, "pushed": False,
+        "source_sha": None, "target_sha": None, "readback": None,
+    }
+
+
+def _land_line(record: dict) -> str:
+    """One human line per task. Always names the remote and branch."""
+    target = record.get("target") or "(no target configured)"
+    head = f"{record['task_id']}  {record['verdict']}  → {target}"
+    if record["verdict"] == "refused":
+        return f"✗ {head}\n    {record['reason']}: {record['message']}"
+    detail = (
+        f"    source {(record.get('source_sha') or '')[:12]} "
+        f"→ target {(record.get('target_sha') or '')[:12]} "
+        f"({'pushed' if record.get('pushed') else 'no push needed'}; "
+        f"read-back: {record.get('readback') or 'n/a'})"
+    )
+    return f"{'…' if record.get('dry_run') else '✓'} {head}\n{detail}"
+
+
+def _actor() -> str:
+    """Author recorded on the landing receipt comment."""
+    import os
+
+    for env in ("HERMES_PROFILE_NAME", "HERMES_PROFILE"):
+        value = os.environ.get(env)
+        if value:
+            return f"kanban land ({value})"
+    return "kanban land"

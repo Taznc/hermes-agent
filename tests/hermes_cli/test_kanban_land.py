@@ -6,6 +6,7 @@ Kanban DB; nothing here touches the developer's own repo or board.
 
 from __future__ import annotations
 
+import argparse
 import json
 import subprocess
 from pathlib import Path
@@ -492,3 +493,88 @@ def test_landing_refuses_when_the_push_is_rejected(kanban_home, repo, monkeypatc
     assert exc.value.reason == "push_rejected"
     assert repo.remote_sha("dev") == before
     assert status == "done", "a rejected push must leave the card open"
+
+
+# ---------------------------------------------------------------------------
+# CLI surface — `hermes kanban land`, batch isolation, --json
+# ---------------------------------------------------------------------------
+
+
+def run_land(*tokens) -> tuple[str, int]:
+    """Drive the real CLI entry point; returns (stdout, exit code)."""
+    import contextlib
+    import io
+
+    from hermes_cli import kanban as kc
+
+    buf = io.StringIO()
+    parser = argparse.ArgumentParser()
+    kanban_parser = kc.build_parser(parser.add_subparsers(dest="_top"))
+    args = kanban_parser.parse_args(["land", *tokens])
+    with contextlib.redirect_stdout(buf), contextlib.redirect_stderr(buf):
+        rc = kc.kanban_command(args)
+    return buf.getvalue(), rc
+
+
+def test_cli_dry_run_json_emits_a_per_task_verdict_and_mutates_nothing(kanban_home, repo):
+    with kbc.connect() as conn:
+        task_id, path = make_approved_task(conn, repo)
+    before = repo.remote_sha("dev")
+
+    out, rc = run_land(task_id, "--target", "origin/dev", "--dry-run", "--json")
+    payload = json.loads(out)
+
+    assert rc == 0
+    assert [r["task_id"] for r in payload] == [task_id]
+    assert payload[0]["verdict"] == "would_land"
+    assert payload[0]["remote"] == "origin" and payload[0]["branch"] == "dev"
+    assert repo.remote_sha("dev") == before
+
+
+def test_cli_refuses_without_a_configured_or_explicit_target(kanban_home, repo):
+    with kbc.connect() as conn:
+        task_id, path = make_approved_task(conn, repo)
+    out, rc = run_land(task_id, "--dry-run", "--json")
+    payload = json.loads(out)
+    assert rc != 0
+    assert payload[0]["verdict"] == "refused"
+    assert payload[0]["reason"] == "no_target"
+
+
+def test_cli_batch_isolates_one_refusal_from_the_others(kanban_home, repo):
+    """A refusal on one card must not abort or misreport its siblings."""
+    with kbc.connect() as conn:
+        good_id, _ = make_approved_task(conn, repo)
+        bad_id = kb.create_task(conn, title="never reviewed", assignee="dev-a")
+
+    out, rc = run_land(good_id, bad_id, "--target", "origin/dev", "--json")
+    by_id = {r["task_id"]: r for r in json.loads(out)}
+
+    assert rc != 0, "a batch containing a refusal exits non-zero"
+    assert by_id[good_id]["verdict"] == "landed"
+    assert by_id[bad_id]["verdict"] == "refused"
+    assert by_id[bad_id]["reason"] == "no_approval"
+    # The healthy card really landed despite its sibling's refusal.
+    git(repo.clone, "fetch", "origin", "dev")
+    assert f"{good_id}.txt" in git(repo.clone, "ls-tree", "--name-only", "origin/dev")
+
+
+def test_cli_uses_the_board_configured_target_and_names_it_in_output(kanban_home, repo):
+    kb.write_board_metadata(None, land_target="origin/dev")
+    with kbc.connect() as conn:
+        task_id, path = make_approved_task(conn, repo)
+    out, rc = run_land(task_id, "--dry-run")
+    assert rc == 0
+    assert "origin/dev" in out, "output must always name the remote and branch"
+
+
+def test_boards_set_land_target_persists_the_configuration(kanban_home):
+    from hermes_cli import kanban as kc
+
+    parser = argparse.ArgumentParser()
+    kanban_parser = kc.build_parser(parser.add_subparsers(dest="_top"))
+    args = kanban_parser.parse_args(
+        ["boards", "set-land-target", "default", "origin/dev"]
+    )
+    assert kc.kanban_command(args) == 0
+    assert kb.read_board_metadata("default")["land_target"] == "origin/dev"
