@@ -303,6 +303,13 @@ export const ja = defineForkLocale(forkJa, {
   },
 
   settings: {
+    plugins: {
+      installModal: {
+        installFromGit: 'Git からインストール',
+        reviewRepository: 'リポジトリを確認',
+        repoPlaceholder: 'https://github.com/owner/repo'
+      }
+    },
     closeSettings: '設定を閉じる',
     exportConfig: '設定を書き出す',
     importConfig: '設定を読み込む',
@@ -1407,6 +1414,10 @@ export const ja = defineForkLocale(forkJa, {
     liveUnavailable: 'ライブ状態は取得できません',
     inventoryUnavailable: 'このゲートウェイを更新すると、セッションとボットを表示できます。',
     historyShifted: '読み込み中にセッションが変化しました。再読み込みします。',
+    extendedTranscript: '詳細な実行ログ',
+    transcriptTruncated: '最新の 16 KiB を表示',
+    transcriptUnavailable: 'ライブログは利用できません',
+
     close: 'エージェントを閉じる',
     title: 'エージェント',
     sessionsTab: 'セッション',
@@ -1468,6 +1479,14 @@ export const ja = defineForkLocale(forkJa, {
     streaming: 'ストリーミング中',
     files: 'ファイル',
     moreFiles: count => `+${count} 件のファイル`,
+    moreAgents: count => `ほか ${count} 件のエージェント`,
+    queued: '待機中',
+    waitingActivity: 'アクティビティ待ち',
+    steer: '指示',
+    steerPlaceholder: 'このサブエージェントへの指示',
+    steerQueued: '次のチェックポイントで処理します',
+    stopRequested: '停止を要求しました',
+    requestRejected: 'サブエージェントが要求を受け付けませんでした',
     delegation: index => `委任 ${index}`,
     workers: count => `${count} ワーカー`,
     workersActive: count => `${count} アクティブ`,

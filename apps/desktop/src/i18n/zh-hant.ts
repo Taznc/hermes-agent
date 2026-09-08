@@ -294,6 +294,13 @@ export const zhHant = defineForkLocale(forkZhHant, {
   },
 
   settings: {
+    plugins: {
+      installModal: {
+        installFromGit: '從 Git 安裝',
+        reviewRepository: '檢查儲存庫',
+        repoPlaceholder: 'https://github.com/owner/repo'
+      }
+    },
     closeSettings: '關閉設定',
     exportConfig: '匯出設定',
     importConfig: '匯入設定',
@@ -1354,6 +1361,10 @@ export const zhHant = defineForkLocale(forkZhHant, {
     liveUnavailable: '即時狀態不可用',
     inventoryUnavailable: '更新此閘道以顯示其工作階段與機器人。',
     historyShifted: '讀取時對話發生了變化；正在重新整理。',
+    extendedTranscript: '完整記錄尾端',
+    transcriptTruncated: '顯示最新 16 KiB',
+    transcriptUnavailable: '即時記錄無法使用',
+
     close: '關閉代理',
     title: '智慧體',
     sessionsTab: '工作階段',
@@ -1414,6 +1425,14 @@ export const zhHant = defineForkLocale(forkZhHant, {
     streaming: '串流傳輸中',
     files: '檔案',
     moreFiles: count => `還有 ${count} 個檔案`,
+    moreAgents: count => `還有 ${count} 個子代理`,
+    queued: '排隊中',
+    waitingActivity: '等待活動',
+    steer: '引導',
+    steerPlaceholder: '此子代理的指令',
+    steerQueued: '已排隊，等待下一個檢查點',
+    stopRequested: '已請求停止',
+    requestRejected: '子代理未接受請求',
     delegation: index => `派發 ${index}`,
     workers: count => `${count} 個工作單元`,
     workersActive: count => `${count} 個活躍`,
