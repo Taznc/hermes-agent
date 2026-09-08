@@ -20,17 +20,44 @@ import {
 
 type ToneVariant = 'default' | 'destructive' | 'warning' | 'success'
 
-const tone: Record<NotificationKind, { icon: IconComponent; iconClass: string; variant: ToneVariant }> = {
-  error: { icon: AlertCircle, iconClass: 'text-destructive', variant: 'destructive' },
-  warning: { icon: AlertTriangle, iconClass: 'text-primary', variant: 'warning' },
-  info: { icon: Info, iconClass: 'text-muted-foreground', variant: 'default' },
-  success: { icon: CheckCircle2, iconClass: 'text-primary', variant: 'success' }
+interface Tone {
+  icon: IconComponent
+  iconClass: string
+  actionClass: string
+  variant: ToneVariant
 }
 
-// Keep the alert's semantic background intact instead of washing every kind
-// into the same translucent panel. The shared overlay stroke/shadow carries the
-// floating surface treatment across themes.
-const STACK_SURFACE = 'pointer-events-auto border border-(--stroke-nous) shadow-nous'
+const tone: Record<NotificationKind, Tone> = {
+  error: {
+    icon: AlertCircle,
+    iconClass: 'text-destructive',
+    actionClass: 'bg-destructive text-destructive-foreground hover:bg-destructive/90',
+    variant: 'destructive'
+  },
+  warning: {
+    icon: AlertTriangle,
+    iconClass: 'text-warning',
+    actionClass: 'bg-warning text-warning-foreground hover:bg-warning/90',
+    variant: 'warning'
+  },
+  info: {
+    icon: Info,
+    iconClass: 'text-muted-foreground',
+    actionClass: 'bg-secondary text-secondary-foreground hover:bg-secondary/80',
+    variant: 'default'
+  },
+  success: {
+    icon: CheckCircle2,
+    iconClass: 'text-success',
+    actionClass: 'bg-success text-success-foreground hover:bg-success/90',
+    variant: 'success'
+  }
+}
+
+// Preserve each alert variant's own semantic border/background instead of
+// washing every kind into one overlay treatment. The shared stack class adds
+// only the floating-surface behavior that is common across themes.
+const STACK_SURFACE = 'pointer-events-auto shadow-nous'
 
 function partitionNotifications(notifications: AppNotification[]) {
   const defaultStack: AppNotification[] = []
@@ -132,7 +159,7 @@ function TopCenterStack({
         <div
           className={cn(
             STACK_SURFACE,
-            'flex min-h-8 items-center justify-between rounded-lg bg-popover px-3 text-xs text-popover-foreground'
+            'flex min-h-8 items-center justify-between rounded-lg border border-(--stroke-nous) bg-popover px-3 text-xs text-popover-foreground'
           )}
         >
           <Button className="-ml-2" onClick={onToggleExpanded} size="xs" type="button" variant="text">
@@ -246,20 +273,30 @@ function NotificationItem({ notification }: { notification: AppNotification }) {
           {notification.meta && <p className="m-0 text-xs text-muted-foreground tabular-nums">{notification.meta}</p>}
           {notification.contextCard && <NotificationContextCard card={notification.contextCard} />}
           {hasDetail && <NotificationDetail detail={notification.detail || ''} />}
-          {notification.action && (
+          <div className="mt-2 flex w-full items-center justify-between gap-2">
+            {notification.action && (
+              <Button
+                onClick={() => {
+                  notification.action?.onClick()
+                  dismissNotification(notification.id)
+                }}
+                size="default"
+                type="button"
+                variant="default"
+              >
+                {notification.action.label}
+              </Button>
+            )}
             <Button
-              className="mt-2"
-              onClick={() => {
-                notification.action?.onClick()
-                dismissNotification(notification.id)
-              }}
+              className={cn('ml-auto', styles.actionClass)}
+              onClick={() => dismissNotification(notification.id)}
               size="default"
               type="button"
               variant="default"
             >
-              {notification.action.label}
+              {copy.dismissAction}
             </Button>
-          )}
+          </div>
         </AlertDescription>
       </div>
       <Button

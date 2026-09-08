@@ -1,4 +1,4 @@
-import { cleanup, render, screen } from '@testing-library/react'
+import { cleanup, fireEvent, render, screen } from '@testing-library/react'
 import { afterEach, beforeEach, describe, expect, it } from 'vitest'
 
 import { I18nProvider } from '@/i18n'
@@ -70,6 +70,85 @@ describe('toast titles', () => {
         }
       }, 5_100)
     })
+  })
+
+  it('uses distinct semantic treatments for error, warning, and success notifications', () => {
+    const cases = [
+      {
+        kind: 'error' as const,
+        iconClass: 'text-destructive',
+        borderClass: 'border-l-destructive',
+        backgroundToken: 'var(--dt-destructive)',
+        actionClass: 'bg-destructive'
+      },
+      {
+        kind: 'warning' as const,
+        iconClass: 'text-warning',
+        borderClass: 'border-l-warning',
+        backgroundToken: 'var(--dt-warning)',
+        actionClass: 'bg-warning'
+      },
+      {
+        kind: 'success' as const,
+        iconClass: 'text-success',
+        borderClass: 'border-l-success',
+        backgroundToken: 'var(--dt-success)',
+        actionClass: 'bg-success'
+      }
+    ]
+
+    for (const { kind, iconClass, borderClass, backgroundToken, actionClass } of cases) {
+      notify({ kind, title: `${kind} title`, message: `${kind} message` })
+
+      const view = render(
+        <I18nProvider configClient={null} initialLocale="en">
+          <NotificationStack />
+        </I18nProvider>
+      )
+
+      const alert = screen.getByText(`${kind} title`).closest('[data-slot="alert"]')
+      const icon = alert?.querySelector('svg')
+      const dismiss = [...(alert?.querySelectorAll('button') ?? [])].find(button => button.textContent === 'Dismiss')
+
+      expect(alert?.className).toContain('border-l-4')
+      expect(alert?.className).toContain(borderClass)
+      expect(alert?.className).toContain(backgroundToken)
+      expect(alert?.className).not.toContain('var(--dt-primary)')
+      expect(icon?.classList.contains(iconClass)).toBe(true)
+      expect(icon?.classList.contains('text-primary')).toBe(false)
+      expect(dismiss?.classList.contains(actionClass)).toBe(true)
+
+      view.unmount()
+      clearNotifications()
+    }
+  })
+
+  it('renders a severity-filled Dismiss action while preserving the corner close button', () => {
+    notify({
+      kind: 'success',
+      title: 'Task completed',
+      message: 'A card reached done.',
+      action: { label: 'Open card', onClick: () => undefined }
+    })
+
+    render(
+      <I18nProvider configClient={null} initialLocale="en">
+        <NotificationStack />
+      </I18nProvider>
+    )
+
+    const open = screen.getByRole('button', { name: 'Open card' })
+    const dismiss = screen.getByRole('button', { name: 'Dismiss' })
+    const cornerClose = screen.getByRole('button', { name: 'Dismiss notification' })
+    const actionRow = open.parentElement
+
+    expect(actionRow).toBe(dismiss.parentElement)
+    expect(actionRow?.className).toContain('justify-between')
+    expect(dismiss.className).toContain('bg-success')
+    expect(cornerClose).toBeTruthy()
+
+    fireEvent.click(dismiss)
+    expect(screen.queryByText('A card reached done.')).toBeNull()
   })
 
   it('renders a compact context card for an object notification', () => {

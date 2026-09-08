@@ -111,6 +111,10 @@
   --color-ring: var(--dt-ring);
   --color-destructive: var(--dt-destructive);
   --color-destructive-foreground: var(--dt-destructive-foreground);
+  --color-warning: var(--dt-warning);
+  --color-warning-foreground: var(--dt-warning-foreground);
+  --color-success: var(--dt-success);
+  --color-success-foreground: var(--dt-success-foreground);
 
   --color-midground: var(--dt-midground);
   --color-midground-foreground: var(--dt-midground-foreground);
@@ -439,6 +443,10 @@
     --dt-composer-ring: var(--ui-base);
     --dt-destructive: #cf2d56;
     --dt-destructive-foreground: #ffffff;
+    --dt-warning: var(--ui-yellow);
+    --dt-warning-foreground: #111111;
+    --dt-success: var(--ui-green);
+    --dt-success-foreground: #07140f;
     --dt-sidebar-bg: var(--ui-bg-sidebar);
     --dt-sidebar-border: var(--ui-stroke-secondary);
     /* `--user-bubble-keep` is the Settings → Appearance → Message Bubble lever

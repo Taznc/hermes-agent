@@ -179,6 +179,7 @@ export interface UpstreamTranslations {
     more: (count: number) => string
     clearAll: string
     dismiss: string
+    dismissAction: string
     details: string
     copyDetail: string
     copyDetailFailed: string
