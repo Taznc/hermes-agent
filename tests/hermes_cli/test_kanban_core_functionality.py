@@ -1634,6 +1634,12 @@ def test_link_against_archived_completed_parent_is_skipped_not_minted(kanban_hom
         assert (created.payload or {}).get("skipped_parent_links") == [parent], (
             "the skipped parent must be auditable on the created event"
         )
+        born_skip = next(e for e in kb.list_events(conn, born) if e.kind == "link_skipped")
+        assert (born_skip.payload or {}) == {
+            "parent": parent,
+            "child": born,
+            "reason": "parent_archived_after_completion",
+        }, "both mint paths must record the skip in the same machine-readable shape"
         # The dependency is genuinely met, so the child is released as usual.
         assert _status(conn, born) == "ready"
 
@@ -1758,9 +1764,11 @@ def test_unarchive_restores_a_skipped_link_and_regates_the_child(kanban_home):
 def test_unarchive_does_not_revive_a_link_the_operator_cut(kanban_home):
     """An explicit unlink outranks a replayed skip.
 
-    The restore reads the audit trail, so without this guard reopening a parent
-    would resurrect an edge a human had deliberately removed — overturning their
-    decision with no trace.
+    The restore reads the audit trail, so without this reopening a parent would
+    resurrect an edge a human had deliberately removed — overturning their
+    decision with no trace. ``unlink_tasks`` is the operator's real path and has
+    to cancel a deferred relation too: from the caller's side the dependency
+    existed and now does not, whether or not a row ever backed it.
     """
     conn = kbc.connect()
     try:
@@ -1768,19 +1776,118 @@ def test_unarchive_does_not_revive_a_link_the_operator_cut(kanban_home):
         assert kb.complete_task(conn, parent)
         assert kb.archive_task(conn, parent)
         child = kb.create_task(conn, title="child whose edge is cut", parents=[parent])
-        # The operator cuts the (already absent) dependency: the unlink is a
-        # no-op on rows but records the intent, and that intent must stick.
-        kb.unlink_tasks(conn, parent, child)
-        conn.execute(
-            "INSERT INTO task_events (task_id, kind, payload, created_at) VALUES (?, ?, ?, ?)",
-            (child, "unlinked", json.dumps({"parent": parent, "child": child}), int(time.time())),
+
+        assert kb.unlink_tasks(conn, parent, child) is True, (
+            "cutting a deferred relation is a real removal, not a no-op"
         )
-        conn.commit()
+        assert any(
+            e.kind == "unlinked" and (e.payload or {}).get("parent") == parent
+            for e in kb.list_events(conn, child)
+        )
 
         assert kb.unarchive_task(conn, parent, status="todo")
         assert _parent_edges(conn, parent) == [], (
             "a pair the operator explicitly unlinked must not be restored"
         )
         assert _status(conn, child) == "ready"
+    finally:
+        conn.close()
+
+
+def test_reverse_link_against_a_deferred_edge_is_rejected_as_a_cycle(kanban_home):
+    """A deferred edge gates the cycle check exactly as a persisted row does.
+
+    Without this, ``link_tasks(child, parent)`` succeeds because the P -> C
+    relation is only in the audit trail — and reopening P then has to choose
+    between writing a cycle and silently dropping the child. Either way the
+    caller is left believing in a link the board forgot, which is the outcome
+    this whole skip contract exists to prevent. On ``dev`` the persisted row
+    rejects the reverse link, so this pins that behavior across the change.
+    """
+    conn = kbc.connect()
+    try:
+        parent = kb.create_task(conn, title="archived, completed parent")
+        assert kb.complete_task(conn, parent)
+        assert kb.archive_task(conn, parent)
+        child = kb.create_task(conn, title="child of a deferred edge", parents=[parent])
+        assert _parent_edges(conn, parent) == []
+
+        with pytest.raises(ValueError, match="cycle"):
+            kb.link_tasks(conn, child, parent)
+
+        # Transitive: P -> C (deferred) plus C -> M (real) still blocks M -> P.
+        middle = kb.create_task(conn, title="middle", parents=[child])
+        with pytest.raises(ValueError, match="cycle"):
+            kb.link_tasks(conn, middle, parent)
+
+        # And the deferred edge is still restorable, since nothing overrode it.
+        assert kb.unarchive_task(conn, parent, status="todo")
+        assert _parent_edges(conn, parent) == [child]
+        assert _status(conn, child) == "todo"
+    finally:
+        conn.close()
+
+
+def test_archive_cleared_edge_is_not_resurrected_by_an_older_skip(kanban_home):
+    """A later archive cleanup outranks the skip that preceded it.
+
+    Sequence: skip P -> C, reopen P (restores the edge), complete + archive P
+    again (``_clear_satisfied_outgoing_links`` DELETES the edge), reopen again.
+    The second reopen must not replay the original skip: a cleared edge is a
+    deleted row, not a deferred write, and ``unarchive_task``'s contract is that
+    those are gone for good.
+    """
+    conn = kbc.connect()
+    try:
+        parent = kb.create_task(conn, title="archived twice")
+        assert kb.complete_task(conn, parent)
+        assert kb.archive_task(conn, parent)
+        child = kb.create_task(conn, title="skipped then cleared", parents=[parent])
+
+        assert kb.unarchive_task(conn, parent, status="ready")
+        assert _parent_edges(conn, parent) == [child]
+
+        assert kb.complete_task(conn, parent)
+        assert kb.archive_task(conn, parent)
+        assert _parent_edges(conn, parent) == [], "archival clears the satisfied edge"
+
+        assert kb.unarchive_task(conn, parent, status="todo")
+        assert _parent_edges(conn, parent) == [], (
+            "an edge deleted by archive cleanup stays deleted; the older skip "
+            "record must not resurrect it"
+        )
+        restored_events = [
+            e for e in kb.list_events(conn, parent) if e.kind == "restored_child_links"
+        ]
+        assert len(restored_events) == 1, "only the first reopen restored anything"
+    finally:
+        conn.close()
+
+
+def test_relink_after_an_unlink_wins_over_the_older_cut(kanban_home):
+    """The newest intent wins in both directions, not just unlink-over-skip.
+
+    Sequence: skip P -> C, operator unlinks it, then explicitly links it again
+    while P is still archived-after-completion (so the mint is skipped a second
+    time). Reopening P must honor the LATEST request and restore the edge —
+    treating the historical unlink as timeless would silently lose a dependency
+    the operator just asked for.
+    """
+    conn = kbc.connect()
+    try:
+        parent = kb.create_task(conn, title="archived parent")
+        assert kb.complete_task(conn, parent)
+        assert kb.archive_task(conn, parent)
+        child = kb.create_task(conn, title="cut then relinked", parents=[parent])
+
+        assert kb.unlink_tasks(conn, parent, child) is True
+        kb.link_tasks(conn, parent, child)
+        assert _parent_edges(conn, parent) == [], "the relink is skipped, like the first"
+
+        assert kb.unarchive_task(conn, parent, status="todo")
+        assert _parent_edges(conn, parent) == [child], (
+            "the later link is the operator's current intent and must be restored"
+        )
+        assert _status(conn, child) == "todo"
     finally:
         conn.close()

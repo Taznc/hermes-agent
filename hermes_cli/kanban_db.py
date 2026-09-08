@@ -2213,8 +2213,11 @@ def create_task(
                 # edge: it would be born permanently satisfied and could only be
                 # debt (see _born_satisfied_parents). ``initial_task_state``
                 # above already read it as satisfying, so the child's status is
-                # identical either way. The skip is recorded on the ``created``
-                # event below, mirroring ``cleared_child_links`` on ``archived``.
+                # identical either way. Each skip gets its own ``link_skipped``
+                # event — the machine-readable record both mint paths share and
+                # the one _pending_skipped_links derives from — plus a summary
+                # field on the ``created`` event below, mirroring
+                # ``cleared_child_links`` on ``archived``.
                 skipped_parents = _born_satisfied_parents(conn, parents)
                 for pid in parents:
                     if pid in skipped_parents:
@@ -2246,6 +2249,16 @@ def create_task(
                         p for p in parents if p in skipped_parents
                     ]
                 _append_event(conn, task_id, "created", created_payload)
+                # After ``created`` so the log reads in lifecycle order.
+                for pid in created_payload.get("skipped_parent_links", ()):
+                    _append_event(
+                        conn, task_id, "link_skipped",
+                        {
+                            "parent": pid,
+                            "child": task_id,
+                            "reason": "parent_archived_after_completion",
+                        },
+                    )
                 if initial_status == "blocked":
                     _append_event(
                         conn,
@@ -2341,6 +2354,78 @@ def _born_satisfied_parents(
         ids,
     ).fetchall()
     return {r["id"] for r in rows}
+
+
+def _pending_skipped_links(
+    conn: sqlite3.Connection, *, parent_id: Optional[str] = None,
+) -> list[tuple[str, str]]:
+    """The (parent, child) relations that exist only as a deferred skip record.
+
+    :func:`_born_satisfied_parents` refuses to write a row for an edge that
+    would be born permanently satisfied, so between that refusal and the
+    parent's reopening the relation lives in the audit trail rather than in
+    ``task_links``. This is the ONE definition of that set; every consumer reads
+    it here instead of re-deriving it, because two consumers derived it two
+    slightly different ways is exactly how the first round got both the cycle
+    walk and the restore wrong.
+
+    A pair is pending iff its most recent ``link_skipped`` is not settled by a
+    LATER event, ranked by the event log's own monotonic id:
+
+    * ``linked`` (including a restore) — the edge was materialized;
+    * ``unlinked`` — an operator cut the relation;
+    * ``archived`` on the parent naming the child in ``cleared_child_links`` —
+      archival cleanup disposed of the materialized edge, and that deletion is
+      permanent (see :func:`_clear_satisfied_outgoing_links`).
+
+    Order matters in BOTH directions: an older unlink must not suppress a newer
+    explicit relink, and an older skip must not resurrect an edge a later
+    archive cleared. A pair whose row is live, or either of whose tasks is gone,
+    is not pending either.
+    """
+    sql = "SELECT id, task_id, payload FROM task_events WHERE kind = 'link_skipped'"
+    params: tuple[str, ...] = ()
+    if parent_id is not None:
+        # payload matching is exact below; LIKE only narrows the scan.
+        sql += " AND payload LIKE ?"
+        params = (f"%{parent_id}%",)
+    latest: dict[tuple[str, str], int] = {}
+    for row in conn.execute(sql + " ORDER BY id", params).fetchall():
+        payload = _json_dict(_row_get(row, "payload"))
+        pid, cid = payload.get("parent"), payload.get("child") or row["task_id"]
+        if not pid or not cid or (parent_id is not None and pid != parent_id):
+            continue
+        latest[(pid, cid)] = row["id"]  # ordered by id, so the last write wins
+    pending: list[tuple[str, str]] = []
+    for (pid, cid), skip_id in latest.items():
+        if conn.execute(
+            "SELECT 1 FROM task_links WHERE parent_id = ? AND child_id = ?", (pid, cid),
+        ).fetchone() is not None:
+            continue
+        if _missing_task_ids(conn, [pid, cid]):
+            continue
+        if not _skip_superseded(conn, pid, cid, skip_id):
+            pending.append((pid, cid))
+    return sorted(pending)
+
+
+def _skip_superseded(
+    conn: sqlite3.Connection, parent_id: str, child_id: str, skip_id: int,
+) -> bool:
+    """True iff an event after ``skip_id`` settled the ``parent -> child`` relation."""
+    rows = conn.execute(
+        "SELECT task_id, kind, payload FROM task_events "
+        "WHERE task_id IN (?, ?) AND id > ? AND kind IN ('linked', 'unlinked', 'archived')",
+        (child_id, parent_id, int(skip_id)),
+    ).fetchall()
+    for row in rows:
+        payload = _json_dict(_row_get(row, "payload"))
+        if row["kind"] == "archived":
+            if row["task_id"] == parent_id and child_id in (payload.get("cleared_child_links") or []):
+                return True
+        elif row["task_id"] == child_id and payload.get("parent") == parent_id:
+            return True
+    return False
 
 
 def _link(conn: sqlite3.Connection, parent_id: str, child_id: str) -> None:
@@ -2624,7 +2709,19 @@ def link_tasks(conn: sqlite3.Connection, parent_id: str, child_id: str) -> None:
 
 
 def _would_cycle(conn: sqlite3.Connection, parent_id: str, child_id: str) -> bool:
-    """True iff ``parent_id`` is already a descendant of ``child_id``."""
+    """True iff ``parent_id`` is already a descendant of ``child_id``.
+
+    The walk spans ``task_links`` UNION the deferred relations from
+    :func:`_pending_skipped_links`. A skipped edge is a relation the caller
+    asked for and got — it is simply not materialized yet — so leaving it out
+    would let a caller declare its reverse, and reopening the parent would then
+    have to choose between a cycle and silently dropping the child. Including it
+    makes the mint-time rejection identical to the one a persisted row gives,
+    and transitivity comes free because the union is applied at every node.
+    """
+    deferred: dict[str, list[str]] = {}
+    for pid, cid in _pending_skipped_links(conn):
+        deferred.setdefault(pid, []).append(cid)
     seen = set()
     stack = [child_id]
     while stack:
@@ -2638,15 +2735,26 @@ def _would_cycle(conn: sqlite3.Connection, parent_id: str, child_id: str) -> boo
             "SELECT child_id FROM task_links WHERE parent_id = ?", (node,)
         ).fetchall()
         stack.extend(r["child_id"] for r in rows)
+        stack.extend(deferred.get(node, ()))
     return False
 
 
 def unlink_tasks(conn: sqlite3.Connection, parent_id: str, child_id: str) -> bool:
+    """Remove a parent -> child dependency, materialized or deferred.
+
+    Cancelling a deferred relation (:func:`_pending_skipped_links`) counts as a
+    removal: the caller asked for that dependency and it now no longer exists,
+    which is the same observable outcome as deleting a row. Recording the
+    ``unlinked`` event is what makes the cut stick — the restore on reopen reads
+    the same trail and treats this as the later, winning intent.
+    """
     with write_txn(conn):
         cur = conn.execute(
             "DELETE FROM task_links WHERE parent_id = ? AND child_id = ?", (parent_id, child_id),
         )
         removed = cur.rowcount > 0
+        if not removed:
+            removed = (parent_id, child_id) in _pending_skipped_links(conn, parent_id=parent_id)
         if removed:
             _append_event(conn, child_id, "unlinked", {"parent": parent_id, "child": child_id})
     if removed:
@@ -5221,40 +5329,18 @@ def _restore_skipped_child_links(conn: sqlite3.Connection, task_id: str) -> list
     retract — the card would still say "waiting on this parent" to the user while
     the board quietly let it run.
 
-    The audit trail is the record of what to restore: ``link_skipped`` on the
-    child, and ``skipped_parent_links`` on its ``created`` event. A pair carrying
-    an ``unlinked`` event is left alone — an operator who explicitly cut that
-    edge outranks a replayed skip. Returns the child ids re-linked.
+    What to restore is :func:`_pending_skipped_links`, which resolves the LATEST
+    intent per pair, so an operator's unlink, a later explicit relink, and an
+    archive that cleared the materialized edge each win over older history in
+    whatever order they happened. Returns the child ids re-linked.
 
-    Cleared edges (:func:`_clear_satisfied_outgoing_links`) are NOT restored
-    here: they are deleted rows, not deferred writes, and reviving them is
-    ``unarchive_task``'s long-standing documented non-behavior.
+    No cycle guard is needed here: :func:`_would_cycle` spans these deferred
+    relations at mint time, so no edge that would close a cycle with one of them
+    can exist. Dropping such an edge silently is exactly the failure this pairs
+    against — the caller would be left believing in a link the board forgot.
     """
-    rows = conn.execute(
-        "SELECT task_id, kind, payload FROM task_events "
-        "WHERE kind IN ('link_skipped', 'created') AND payload LIKE ? ORDER BY id",
-        (f"%{task_id}%",),
-    ).fetchall()
-    candidates: list[str] = []
-    for row in rows:
-        payload = _json_dict(_row_get(row, "payload"))
-        if row["kind"] == "link_skipped":
-            matched = payload.get("parent") == task_id
-        else:
-            matched = task_id in (payload.get("skipped_parent_links") or [])
-        if matched and row["task_id"] not in candidates:
-            candidates.append(row["task_id"])
     restored: list[str] = []
-    for child_id in candidates:
-        if conn.execute(
-            "SELECT 1 FROM task_events WHERE task_id = ? AND kind = 'unlinked' "
-            "AND payload LIKE ? LIMIT 1", (child_id, f"%{task_id}%"),
-        ).fetchone() is not None:
-            continue
-        if conn.execute("SELECT 1 FROM tasks WHERE id = ?", (child_id,)).fetchone() is None:
-            continue
-        if _would_cycle(conn, task_id, child_id):
-            continue
+    for _parent, child_id in _pending_skipped_links(conn, parent_id=task_id):
         _link(conn, task_id, child_id)
         _append_event(
             conn, child_id, "linked",
@@ -5366,12 +5452,15 @@ def unarchive_task(conn: sqlite3.Connection, task_id: str, *, status: str = "tod
         reopening_satisfied_parent = _parent_dependency_satisfied(archived)
         # Note: archival already deleted this task's outgoing (parent_id) edges
         # when it was completed, and those deleted rows are gone for good — the
-        # long-standing contract. Edges this task REFUSED to mint while it was
-        # archived-after-completion (``_born_satisfied_parents``) are different:
-        # they were deferred, not deleted, and the refusal was only correct while
-        # the completion evidence was permanent. Reopening withdraws that
-        # evidence, so those edges are re-minted from the audit trail below and
-        # the invalidation sweep then retracts the children they released.
+        # long-standing contract, and ``_pending_skipped_links`` enforces it by
+        # treating an ``archived`` event that named a child in
+        # ``cleared_child_links`` as settling that pair for good. Edges this task
+        # REFUSED to mint while it was archived-after-completion
+        # (``_born_satisfied_parents``) are different: they were deferred, not
+        # deleted, and the refusal was only correct while the completion evidence
+        # was permanent. Reopening withdraws that evidence, so those edges are
+        # re-minted from the audit trail below and the invalidation sweep then
+        # retracts the children they released.
         if target == "ready" and not _parents_satisfied(conn, task_id):
             target = "todo"
         cur = conn.execute(
