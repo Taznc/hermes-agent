@@ -24,9 +24,11 @@ from __future__ import annotations
 
 import json
 import os
+import shutil
 import subprocess
 import sys
 import tempfile
+from contextlib import contextmanager, suppress
 from pathlib import Path
 from typing import Iterable, Optional
 
@@ -145,6 +147,40 @@ def _probe_env(home: Path) -> dict:
     return env
 
 
+@contextmanager
+def _read_only_home(profile_home: Path):
+    """A throwaway home that RESOLVES like *profile_home* but absorbs its writes.
+
+    Loading a skill is not a read-only operation: it seeds the home skeleton and
+    ``SOUL.md``, and bumps that skill's Curator usage counters in
+    ``skills/.usage.json``. Filing a card must not do any of that to somebody
+    else's profile — an inspected skill would look "used" to the Curator, which
+    is what decides staleness and archival.
+
+    So the child gets its own directory whose ``config.yaml`` is the profile's
+    (skill dirs, ``external_dirs``, ``disabled`` all resolve identically) and
+    whose ``skills/`` is a real directory of symlinks to the profile's skills.
+    Reads follow the links; writes land on the temp dir and are discarded.
+    ``.env`` is deliberately NOT copied: it holds secrets, and skill *readiness*
+    does not affect whether a skill loads.
+    """
+    with tempfile.TemporaryDirectory(prefix="hermes-skill-probe-home-") as tmp:
+        shadow = Path(tmp)
+        config = profile_home / "config.yaml"
+        if config.is_file():
+            shutil.copy2(config, shadow / "config.yaml")
+        shadow_skills = shadow / "skills"
+        shadow_skills.mkdir()
+        real_skills = profile_home / "skills"
+        if real_skills.is_dir():
+            for entry in real_skills.iterdir():
+                with suppress(OSError):
+                    (shadow_skills / entry.name).symlink_to(
+                        entry, target_is_directory=entry.is_dir(),
+                    )
+        yield shadow
+
+
 def _run_probe(canon: str, home: Path, names: list[str]) -> dict:
     """Load *names* under *home* in a subprocess; returns the loader's verdict.
 
@@ -154,11 +190,12 @@ def _run_probe(canon: str, home: Path, names: list[str]) -> dict:
     """
     from hermes_cli.kanban_skill_probe import RESULT_PREFIX
 
-    with tempfile.TemporaryDirectory(prefix="hermes-skill-probe-") as neutral_cwd:
+    with tempfile.TemporaryDirectory(prefix="hermes-skill-probe-cwd-") as neutral_cwd, \
+            _read_only_home(home) as shadow_home:
         try:
             proc = subprocess.run(
                 [sys.executable, "-m", "hermes_cli.kanban_skill_probe", json.dumps(names)],
-                capture_output=True, text=True, env=_probe_env(home),
+                capture_output=True, text=True, env=_probe_env(shadow_home),
                 cwd=neutral_cwd, timeout=PROBE_TIMEOUT_SECONDS,
             )
         except subprocess.TimeoutExpired as exc:

@@ -680,10 +680,22 @@ The dispatcher emits one `--skills <name>` flag per skill listed, so the worker 
 Profiles have **isolated** skill registries, so a skill installed for the profile that files a card is not necessarily available to the profile that will run it. Because a forced skill that the worker cannot load kills it during initialization — before any work happens — every surface preflights the card's skills against the **assignee's own profile home**:
 
 - **Create** (`hermes kanban create`, the `kanban_create` tool, the dashboard dialog) refuses the card before writing the row, naming the profile and each missing skill.
-- **Assign / reassign** re-runs the same check against the new profile, so moving a card cannot introduce the mismatch either.
-- **The dispatcher** re-checks before claiming, which catches imported boards and rows written before this check existed. A mismatch blocks the card once with a `capability` block; no worker is spawned, and neither the retry budget nor the board's start budget is charged. Fixing the configuration and unblocking the card resumes it with a clean failure counter.
+- **Assign / reassign** re-runs the same check against the new profile — including the reviewer handoff, and *before* `--reclaim` releases a running worker — so moving a card cannot introduce the mismatch either.
+- **The dispatcher** re-checks before claiming, which catches imported boards and rows written before this check existed. A mismatch blocks the card once with a `capability` block; no worker is spawned, and neither the retry budget nor the board's start budget is charged. Any failure count left over from initialization-only crashes is cleared at the same time, so fixing the configuration and unblocking the card resumes it with a clean counter.
 
-The check never falls back to another profile's registry: a profile whose home cannot be inspected (missing, tombstoned, unreadable) **fails closed** with a distinct diagnostic rather than assuming the skill is present. `plugin:skill` names are the one exception — enumerating another profile's plugin-provided skills would require loading that profile's plugins, so they are not preflighted.
+The verdict comes from the **same loader the worker runs at startup**, executed under the assignee's own home, not from a list of installed skill names. That means the preflight agrees with the worker on every way a name fails to load: absent, operator-disabled, ambiguous across skill directories (the loader refuses to guess between two same-named skills), gated to another OS by a `platforms:` tag, or an unresolvable `plugin:skill` / `category:skill` spelling.
+
+The check never falls back to another profile's registry: a profile whose home cannot be inspected (missing, tombstoned, unreadable) **fails closed** with a distinct diagnostic rather than assuming the skill is present. Board import and other deliberate "write the row now, validate at dispatch" paths opt out explicitly with `create_task(..., skill_preflight=False)`; the dispatcher still refuses to spawn such a card.
+
+Every surface reports the refusal with the same machine-readable fields, so automation can key on the code instead of parsing the message:
+
+| Field | Meaning |
+| --- | --- |
+| `code` | `kanban_skill_missing`, or `kanban_skill_profile_unavailable` when the profile could not be inspected |
+| `profile` | The assignee profile the skills were resolved against |
+| `missing_skills` | The card's skills that profile cannot load |
+
+They appear as extra keys on the `kanban_*` tool's error JSON, as the `detail` object of the dashboard's HTTP 400, and on stdout from `hermes kanban create/assign/reassign --json`. Without `--json` the CLI keeps its plain-English message.
 
 To fix a rejected card, either install/enable the skill for that profile (`hermes -p <profile> skills list` to inspect, then install it or remove it from `skills.disabled` in that profile's `config.yaml`), or drop the skill from the card.
 

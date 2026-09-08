@@ -93,6 +93,51 @@ def test_a_platform_incompatible_skill_is_reported_missing(kanban_home):
     assert missing_skills_for_profile("claudecode", ["elsewhere-only"]) == ["elsewhere-only"]
 
 
+def test_the_preflight_does_not_write_into_the_inspected_profile(kanban_home):
+    """Filing a card must not mutate somebody else's profile home. Loading a
+    skill is not a read-only operation — it seeds the home skeleton plus
+    SOUL.md and bumps that skill's Curator usage counters — so the inspection
+    runs against a shadow home that resolves identically and absorbs the
+    writes. Without it, merely inspecting a skill makes it look 'used' to the
+    Curator, which is what decides staleness and archival."""
+    from hermes_cli.kanban_skill_preflight import missing_skills_for_profile
+
+    profile_dir = _make_profile(kanban_home, "claudecode", ["github-code-review"])
+
+    def _snapshot():
+        return {
+            str(p.relative_to(profile_dir)): (p.stat().st_size if p.is_file() else "<dir>")
+            for p in sorted(profile_dir.rglob("*")) if "__pycache__" not in p.parts
+        }
+
+    before = _snapshot()
+    assert missing_skills_for_profile(
+        "claudecode", ["github-code-review", "not-installed"],
+    ) == ["not-installed"]
+    assert _snapshot() == before
+
+
+def test_the_shadow_home_still_honors_the_profiles_own_config(kanban_home):
+    """The shadow home must not become a way to lose the profile's config: a
+    skill this profile has DISABLED is still unloadable, and an external dir it
+    configures is still searched."""
+    from hermes_cli.kanban_skill_preflight import missing_skills_for_profile
+
+    profile_dir = _make_profile(kanban_home, "claudecode", ["github-code-review"])
+    external = kanban_home / "shared-skills"
+    _write_skill(external, "team-review")
+    (profile_dir / "config.yaml").write_text(
+        "skills:\n"
+        "  disabled:\n    - github-code-review\n"
+        f"  external_dirs:\n    - {external}\n",
+        encoding="utf-8",
+    )
+
+    assert missing_skills_for_profile(
+        "claudecode", ["github-code-review", "team-review"],
+    ) == ["github-code-review"]
+
+
 def test_an_absent_assignee_profile_fails_closed(kanban_home):
     """A card carrying forced skills whose assignee has no profile home cannot
     be verified at all. Assuming the skill is present is exactly the failure
