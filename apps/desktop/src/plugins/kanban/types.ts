@@ -32,6 +32,13 @@ export interface KanbanTask {
    *  and every mutation can be routed back to ITS board, never the sentinel. */
   board?: null | string
   board_name?: null | string
+  /** Unblock-loop breaker state, on the CARD (not just the detail endpoint) so
+   *  the board can gate a drag without opening the drawer first.
+   *  `block_kind` is one of VALID_BLOCK_KINDS or null for a legacy/un-typed
+   *  block; `block_recurrences` counts same-cause re-blocks and, at the
+   *  backend's BLOCK_RECURRENCE_LIMIT, is what parked the card in `triage`. */
+  block_kind?: null | string
+  block_recurrences?: number
 }
 
 export interface KanbanColumn {
@@ -216,9 +223,6 @@ export interface KanbanTaskFull extends KanbanTask {
   branch_name?: null | string
   consecutive_failures?: number
   diagnostics?: Diagnostic[]
-  /** Typed reason the task is in `blocked` (one of VALID_BLOCK_KINDS) or null
-   *  for a legacy/un-typed block. Drives the CTA banner's copy. */
-  block_kind?: null | string
 }
 
 /** GET /tasks/:id — the task plus its related collections, which are SIBLINGS
