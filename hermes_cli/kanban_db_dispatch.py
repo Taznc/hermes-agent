@@ -1582,6 +1582,13 @@ def _clear_failure_counter(conn: sqlite3.Connection, task_id: str) -> None:
         )
 
 
+def _latest_review_verdict_is_approval(conn: sqlite3.Connection, task_id: str) -> bool:
+    """Whether this card carries a LIVE reviewer approval awaiting landing."""
+    from hermes_cli import kanban_db_approve as _kba
+
+    return _kba.latest_approval(conn, task_id) is not None
+
+
 def check_respawn_guard(
     conn: sqlite3.Connection, task_id: str, *, lane: str = "ready",
 ) -> Optional[str]:
@@ -1650,6 +1657,15 @@ def check_respawn_guard(
     # Review-lane spawns stop here: a recent completed run and a fresh PR URL
     # are the canonical *inputs* to a review handoff, not duplicate-work signals.
     if lane == "review":
+        # ...but an approval already IS the review's output. An approved card
+        # waits in ``review`` for an attended ``hermes kanban land`` (it is not
+        # ``done``, because closing it would reap the worktree landing must
+        # verify), so spawning another reviewer would open a second cycle on a
+        # verdict that already exists. A later ``review_requested`` — the card
+        # was sent back and re-submitted — supersedes the approval and reopens
+        # the lane, so this can never wedge a card.
+        if _latest_review_verdict_is_approval(conn, task_id):
+            return "approved_awaiting_land"
         return None
 
     # 3. Completed run within guard window. Exception: an explicit re-queue

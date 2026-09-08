@@ -355,6 +355,19 @@ _SPECS = [
              help="Override the live-claim guard: move a running, claimed "
                   "task to review even without owning its run (clears the worker's claim)."),
     ], help="Move a task to 'review' (implementation done, awaiting review) — NOT a block"),
+    _cmd("approve", [
+        _TASK_ID,
+        _arg("--sha", metavar="COMMIT",
+             help="The reviewed commit. Defaults to the task worktree's HEAD."),
+        _reason("Optional approval note recorded on the run and the event."),
+    ], help="Reviewer verdict: approve the active review, preserving the card for landing",
+       description=(
+           "Records an explicit approval bound to the exact commit reviewed, and leaves the "
+           "card in the review column awaiting `hermes kanban land`. It deliberately does "
+           "NOT complete the card: completion reaps the task worktree, and that tree — plus "
+           "the pushed branch — is the evidence landing re-verifies before it merges. Use "
+           "`hermes kanban complete` instead when a card's life genuinely ends at review."
+       )),
     _cmd("request-changes", [_TASK_ID, _arg("reason", nargs="+", help="Concrete changes required before re-review")],
          help="Reviewer verdict: return the active review run to its implementer"),
     _cmd("reopen-review", [

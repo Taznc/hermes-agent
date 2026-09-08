@@ -1,14 +1,23 @@
 """``hermes kanban land`` — attended landing of an explicitly approved review.
 
-Turns a reviewer-approved card into a verified merge to a configured target,
-a non-force push, a receipt on the card, closure, and cleanup. Every gate
-fails CLOSED: anything unproven refuses with a machine-readable reason code
-rather than merging.
+Turns a reviewer-approved card into a verified merge to a configured target, a
+non-force push, a receipt on the card, closure, and cleanup. Every gate fails
+CLOSED: anything unproven refuses with a machine-readable reason code rather
+than merging.
 
-The target is never inferred. It comes from ``--target <remote>/<branch>`` or
-from the board's ``land_target`` metadata key and from nowhere else, so an
-installation whose fork and upstream both look plausible cannot be landed to
-the wrong one by accident.
+Three rules shape the whole module, each answering a way this can go wrong:
+
+* **The target is never inferred.** It comes from ``--target <remote>/<branch>``
+  or the board's ``land_target`` and from nowhere else, so an installation whose
+  fork and upstream both look plausible cannot be landed to the wrong one.
+* **Approval binds to one commit, on the current review cycle.** Verification is
+  not review: re-running a test suite says nothing about whether a human read
+  the code. A branch that moved after approval, or a newer review cycle nobody
+  adjudicated, refuses.
+* **The push endpoint is the only endpoint.** Git lets ``remote.<n>.pushurl``
+  send writes to a different repository than fetches read from. Every read,
+  the push, and the read-back address the resolved push URL, so "we verified
+  the thing we wrote" is true by construction rather than by convention.
 """
 
 from __future__ import annotations
@@ -16,11 +25,14 @@ from __future__ import annotations
 import contextlib
 import json
 import sqlite3
+import time
+import uuid
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Optional
 
 from hermes_cli import kanban_db as kb
+from hermes_cli import kanban_db_approve as kba
 
 
 class LandRefusal(Exception):
@@ -41,8 +53,8 @@ class ApprovalVerdict:
     reviewer: Optional[str]
     summary: Optional[str]
     metadata: dict
+    approved_sha: str
     approved_at: Optional[int]
-
 
 
 def resolve_target(explicit: Optional[str], *, board: Optional[str]) -> tuple[str, str]:
@@ -85,49 +97,52 @@ def _json_dict(raw: Any) -> dict:
 
 
 def approval_verdict(conn: sqlite3.Connection, task_id: str) -> ApprovalVerdict:
-    """The newest reviewer approval on ``task_id``, or :class:`LandRefusal`.
+    """The card's LIVE reviewer approval, or :class:`LandRefusal`.
 
-    An approval is a run that BOTH completed the card and was claimed from the
-    ``review`` column — i.e. a reviewer, not the implementer, closed it. A
-    ``done`` status proves nothing on its own: an implementer completing their
-    own card produces exactly that status with no review run behind it.
+    Approval is the explicit verdict recorded by
+    :func:`hermes_cli.kanban_db_approve.approve_review_task` — a run claimed
+    from the review column that ended ``approved`` and named the commit it
+    approved. Three things are deliberately NOT approval:
 
-    A ``changes_requested`` run newer than the approval invalidates it, so a
-    stale approval from an earlier round can never be landed.
+    * a ``done`` status (an implementer completing their own card produces
+      exactly that, with no reviewer behind it);
+    * an approval older than a ``changes_requested`` verdict;
+    * an approval older than a newer ``review_requested`` — the card was
+      re-submitted, so a cycle is open that nobody has adjudicated. Landing on
+      the strength of the previous round would publish whatever the branch
+      grew since.
     """
-    rows = conn.execute(
-        "SELECT id, outcome, summary, metadata, ended_at, profile FROM task_runs "
-        "WHERE task_id = ? AND outcome IN ('completed', 'changes_requested') "
-        "ORDER BY id DESC", (task_id,),
-    ).fetchall()
-
-    for row in rows:
-        if row["outcome"] == "changes_requested":
-            raise LandRefusal(
-                "changes_requested_unresolved",
-                f"the newest review verdict on {task_id} is 'changes requested' (run "
-                f"{row['id']}); the card must be re-reviewed and approved before landing",
-            )
-        claimed = conn.execute(
-            "SELECT payload FROM task_events WHERE task_id = ? AND kind = 'claimed' "
-            "AND run_id = ? ORDER BY id DESC LIMIT 1", (task_id, int(row["id"])),
-        ).fetchone()
-        if _json_dict(claimed["payload"] if claimed else None).get("source_status") != "review":
-            # A completion that never came from the review column is the
-            # implementer closing their own card — not an approval.
-            continue
+    approval = kba.latest_approval(conn, task_id)
+    if approval is not None:
         return ApprovalVerdict(
-            run_id=int(row["id"]),
-            reviewer=row["profile"],
-            summary=row["summary"],
-            metadata=_json_dict(row["metadata"]),
-            approved_at=row["ended_at"],
+            run_id=approval.run_id, reviewer=approval.reviewer, summary=approval.summary,
+            metadata=approval.metadata, approved_sha=approval.approved_sha,
+            approved_at=approval.approved_at,
         )
 
+    # No live approval: say precisely which of the three ways it is missing, so
+    # the operator knows whether to re-review, wait, or fix the card.
+    newest = conn.execute(
+        "SELECT id, outcome FROM task_runs WHERE task_id = ? "
+        "AND outcome IN ('approved', 'changes_requested') ORDER BY id DESC LIMIT 1",
+        (task_id,),
+    ).fetchone()
+    if newest is not None and newest["outcome"] == "changes_requested":
+        raise LandRefusal(
+            "changes_requested_unresolved",
+            f"the newest review verdict on {task_id} is 'changes requested' (run "
+            f"{newest['id']}); the card must be re-reviewed and approved before landing",
+        )
+    if newest is not None and newest["outcome"] == "approved":
+        raise LandRefusal(
+            "approval_superseded",
+            f"{task_id} was approved in run {newest['id']}, but a newer review was "
+            "requested afterwards; that cycle must be approved on its own before landing",
+        )
     raise LandRefusal(
         "no_approval",
-        f"{task_id} has no reviewer approval: landing requires a run claimed from the "
-        "review column that completed the card",
+        f"{task_id} has no reviewer approval: landing requires an explicit "
+        "`hermes kanban approve` verdict from a run claimed out of the review column",
     )
 
 
@@ -164,6 +179,47 @@ def git(cwd: str, *args: str, timeout: int = 120, check: bool = True) -> str:
 
 
 @dataclass(frozen=True)
+class PushEndpoint:
+    """The single repository URL a landing reads from, writes to, and re-reads.
+
+    Git treats fetching and pushing as separate configurations: with
+    ``remote.origin.pushurl`` set, ``git push origin`` writes somewhere
+    ``git ls-remote origin`` never looks. A landing that preflights and reads
+    back through the fetch URL while pushing through the push URL verifies a
+    repository it did not write and reports success for content that landed in
+    another one. Resolving the push URL once and addressing it by URL
+    everywhere removes the split entirely.
+    """
+
+    remote: str
+    url: str
+
+
+def push_endpoint(repo_root: str, remote: str) -> PushEndpoint:
+    """The effective push URL for ``remote``, or :class:`LandRefusal`."""
+    try:
+        raw = git(repo_root, "remote", "get-url", "--push", "--all", remote, timeout=30)
+    except GitError as exc:
+        raise LandRefusal(
+            "remote_push_disabled",
+            f"remote {remote!r} has no usable push URL: {exc}",
+        ) from exc
+    urls = [u.strip() for u in raw.splitlines() if u.strip()]
+    if not urls:
+        raise LandRefusal(
+            "remote_push_disabled",
+            f"remote {remote!r} publishes no push URL, so landing cannot write to it",
+        )
+    if len(urls) > 1:
+        raise LandRefusal(
+            "remote_push_ambiguous",
+            f"remote {remote!r} has {len(urls)} push URLs ({', '.join(urls)}); landing "
+            "refuses to write to several repositories under one name",
+        )
+    return PushEndpoint(remote=remote, url=urls[0])
+
+
+@dataclass(frozen=True)
 class SourceState:
     """The exact, pushed content a landing would merge."""
 
@@ -177,12 +233,7 @@ class SourceState:
 
 def _repo_root_for(worktree: str) -> Optional[str]:
     """The main checkout backing a task worktree, whether or not the worktree
-    still exists.
-
-    Approval-time cleanup removes a clean, fully-pushed worktree, so by the
-    time landing runs the path is frequently gone. Walking up to the nearest
-    directory holding a real ``.git`` directory finds the checkout either way.
-    """
+    still exists."""
     from pathlib import Path as _Path
 
     p = _Path(worktree).expanduser()
@@ -222,14 +273,15 @@ def _remotes(cwd: str) -> list[str]:
         return []
 
 
-def _remote_branch_sha(cwd: str, remote: str, branch: str) -> Optional[str]:
-    """Read-only remote lookup: the sha ``remote`` currently publishes for
-    ``branch``, or None. Writes nothing — not even a remote-tracking ref."""
+def _remote_branch_sha(cwd: str, endpoint: str, branch: str) -> Optional[str]:
+    """Read-only lookup: the sha ``endpoint`` (a URL or remote name) currently
+    publishes for ``branch``, or None. Writes nothing — not even a
+    remote-tracking ref."""
     try:
-        out = git(cwd, "ls-remote", "--heads", remote, f"refs/heads/{branch}", timeout=60)
+        out = git(cwd, "ls-remote", "--heads", endpoint, f"refs/heads/{branch}", timeout=60)
     except GitError as exc:
         raise LandRefusal(
-            "target_unresolvable", f"cannot read remote {remote!r}: {exc}",
+            "target_unresolvable", f"cannot read remote {endpoint!r}: {exc}",
         ) from exc
     for line in out.splitlines():
         sha, _, ref = line.partition("\t")
@@ -238,14 +290,17 @@ def _remote_branch_sha(cwd: str, remote: str, branch: str) -> Optional[str]:
     return None
 
 
-def source_state(conn: sqlite3.Connection, task_id: str, *, remote: str) -> SourceState:
+def source_state(
+    conn: sqlite3.Connection, task_id: str, *, remote: str,
+    endpoint: Optional[PushEndpoint] = None,
+) -> SourceState:
     """Everything about the card's own branch, or :class:`LandRefusal`.
 
     Refuses a live worker, a workspace that is not a usable linked worktree, a
-    dirty tree, a branch whose local HEAD is not exactly what ``remote``
-    publishes, and a remote that does not carry the branch at all. The last one
-    is how "you pointed this at the wrong remote" is caught generically: the
-    check is that the work is actually THERE, not that the remote has a
+    dirty tree, a branch whose local HEAD is not exactly what the endpoint
+    publishes, and an endpoint that does not carry the branch at all. The last
+    one is how "you pointed this at the wrong remote" is caught generically:
+    the check is that the work is actually THERE, not that the remote has a
     particular name.
     """
     row = conn.execute(
@@ -285,7 +340,10 @@ def source_state(conn: sqlite3.Connection, task_id: str, *, remote: str) -> Sour
             f"{task_id}: worktree {worktree} is not on a named branch",
         )
 
-    published = _remote_branch_sha(repo_root, remote, branch)
+    # Address the PUSH endpoint, so "the branch is published where we are about
+    # to write" is what actually gets checked.
+    address = endpoint.url if endpoint is not None else remote
+    published = _remote_branch_sha(repo_root, address, branch)
     if published is None:
         # Distinguish "never pushed anywhere" from "pushed, but to a different
         # remote than the one you aimed this at" — the second is the
@@ -309,9 +367,9 @@ def source_state(conn: sqlite3.Connection, task_id: str, *, remote: str) -> Sour
             "push it before landing",
         )
 
-    # A surviving worktree still holds work: approval-time cleanup removes one
-    # only after proving it clean and fully pushed, so a tree that is still on
-    # disk must be re-checked against what the remote actually publishes.
+    # A surviving worktree still holds work. Approval deliberately preserves it
+    # (see ``kanban_db_approve``), so this is the normal case, not the
+    # exception: the tree on disk is re-checked against what the remote serves.
     if Path(worktree).is_dir():
         try:
             dirty = git(worktree, "status", "--porcelain")
@@ -363,6 +421,28 @@ def staged_checkout(repo_root: str, ref: str):
             git(repo_root, "worktree", "prune", timeout=60, check=False)
 
 
+@contextlib.contextmanager
+def fetched_ref(repo_root: str, url: str, branch: str, *, purpose: str):
+    """Fetch ``branch`` from ``url`` into a private ref and yield ``(ref, sha)``.
+
+    Two reasons this exists instead of a bare ``ls-remote``:
+
+    * ``ls-remote`` returns a sha the local object database may not HAVE. When
+      the target advanced from another clone, every later step (checkout,
+      ancestry, merge) fails with "invalid reference" against a perfectly
+      healthy remote.
+    * the ref name carries a per-run nonce, so two landings — or a landing and
+      a reader — can never observe each other's half-written proof ref.
+    """
+    ref = f"refs/hermes-land/{purpose}/{uuid.uuid4().hex}"
+    git(repo_root, "fetch", "--no-tags", url, f"+refs/heads/{branch}:{ref}", timeout=300)
+    try:
+        yield ref, git(repo_root, "rev-parse", ref, timeout=60)
+    finally:
+        with contextlib.suppress(Exception):
+            git(repo_root, "update-ref", "-d", ref, timeout=60, check=False)
+
+
 # ---------------------------------------------------------------------------
 # Verification contract — evidence that the exact source sha was tested
 # ---------------------------------------------------------------------------
@@ -388,28 +468,42 @@ def _receipt_sha(metadata: dict) -> tuple[Optional[str], Optional[dict]]:
     return None, None
 
 
+def planned_verification(board: Optional[str]) -> dict:
+    """What :func:`verify` WOULD do, computed without doing any of it.
+
+    A dry run reports this instead of running the board's command: executing
+    arbitrary configured shell is exactly the external state a dry run promises
+    not to touch.
+    """
+    command = str(kb.read_board_metadata(board).get("land_verify") or "").strip()
+    if command:
+        return {"kind": "command", "planned": True, "command": command}
+    return {"kind": "receipt", "planned": True}
+
+
 def verify(
-    conn: sqlite3.Connection, task_id: str, source: SourceState, *, board: Optional[str],
+    conn: sqlite3.Connection, task_id: str, source: SourceState, *,
+    board: Optional[str], verdict: Optional[ApprovalVerdict] = None,
 ) -> dict:
     """Prove the exact ``source.sha`` was verified, or refuse.
 
     Two accepted sources, in order:
 
-    1. The board's ``land_verify`` command, re-run now in the task worktree.
-       This is the strongest evidence and is preferred whenever configured.
+    1. The board's ``land_verify`` command, re-run now against a fresh detached
+       checkout of the exact sha being landed.
     2. Otherwise a verification receipt on the approval run's metadata, which
        must name the sha being landed.
 
-    There is deliberately no override flag: an unverifiable card is a card the
-    operator must fix, not one they can wave through.
+    Neither is a substitute for review — the caller has already bound
+    ``source.sha`` to the reviewed commit. This only answers "and does that
+    exact commit pass?". There is deliberately no override flag: an
+    unverifiable card is a card the operator must fix, not one they can wave
+    through.
     """
     command = str(kb.read_board_metadata(board).get("land_verify") or "").strip()
     if command:
         import subprocess
 
-        # Run against a fresh detached checkout of the exact sha being landed,
-        # not the task worktree: approval-time cleanup reaps that tree, and a
-        # surviving one could have drifted since it was reviewed.
         with staged_checkout(source.repo_root, source.sha) as tree:
             proc = subprocess.run(
                 command, shell=True, cwd=tree, capture_output=True,
@@ -426,7 +520,7 @@ def verify(
             "sha": source.sha, "exit_code": 0,
         }
 
-    verdict = approval_verdict(conn, task_id)
+    verdict = verdict or approval_verdict(conn, task_id)
     sha, receipt = _receipt_sha(verdict.metadata)
     if receipt is None:
         raise LandRefusal(
@@ -473,20 +567,31 @@ def _is_ancestor(cwd: str, ancestor: str, descendant: str) -> bool:
         return False
 
 
-def _patch_equivalent(cwd: str, upstream: str, head: str) -> bool:
-    """Whether every commit unique to ``head`` already exists on ``upstream`` as
-    an equivalent patch — how a squash-merged branch reads afterwards.
+def _adds_nothing_to(cwd: str, target_ref: str, source_sha: str) -> bool:
+    """Whether merging ``source_sha`` into ``target_ref`` would change nothing.
 
-    ``git cherry`` marks a commit ``-`` when an equivalent patch is upstream and
-    ``+`` when it is not, so "no ``+`` lines, at least one commit examined" is
-    exactly "this work is already there in some form".
+    This is the squash-equivalence test, and it deliberately asks about the
+    target's CURRENT TREE rather than about its history. ``git cherry`` answers
+    "did an equivalent patch ever appear upstream", which is a different and
+    much weaker question: work that was applied and then reverted still has an
+    equivalent patch in history while being absent from the tip, so cherry
+    reports it landed when the file is gone. It also misses the ordinary case
+    it exists for, because an N-commit branch squashed into one commit has no
+    per-commit patch id in common with its own squash.
+
+    Merging into the tip and comparing trees answers the question that actually
+    matters — "is the reviewed content already present, right now?" — and gets
+    the 1-commit squash, the N-commit squash, and the applied-then-reverted
+    case all correct for the same reason.
     """
     try:
-        out = git(cwd, "cherry", upstream, head, timeout=120)
+        merged_tree = git(cwd, "merge-tree", "--write-tree", target_ref, source_sha, timeout=300)
+        target_tree = git(cwd, "rev-parse", f"{target_ref}^{{tree}}", timeout=60)
     except GitError:
+        # A conflicting merge cannot be "already present"; the real merge below
+        # will report the conflict properly.
         return False
-    lines = [ln for ln in out.splitlines() if ln.strip()]
-    return bool(lines) and not any(ln.startswith("+") for ln in lines)
+    return bool(merged_tree) and merged_tree.splitlines()[0].strip() == target_tree
 
 
 def _landed_state(cwd: str, target_ref: str, source_sha: str) -> Optional[str]:
@@ -494,7 +599,7 @@ def _landed_state(cwd: str, target_ref: str, source_sha: str) -> Optional[str]:
     target, else None. This is what makes a re-run idempotent."""
     if _is_ancestor(cwd, source_sha, target_ref):
         return "ancestor"
-    if _patch_equivalent(cwd, target_ref, source_sha):
+    if _adds_nothing_to(cwd, target_ref, source_sha):
         return "patch_equivalent"
     return None
 
@@ -507,23 +612,38 @@ def land_task(
 
     Order matters and is the safety model:
 
-    1. Gate on the board's own record (approval, no live worker, deps).
-    2. Gate on git (clean, pushed, right remote).
-    3. Gate on verification evidence for the exact sha.
-    4. Re-read the target from the remote NOW, merge in a throwaway worktree,
-       push without force.
-    5. Re-read the remote again and prove the content is reachable there.
-    6. Only then write the receipt, close the card, and let cleanup run.
-
-    Nothing before step 4 mutates anything, and step 6 never runs without a
-    successful step 5 read-back.
+    1. Gate on the board's own record (live approval, no live worker, deps).
+    2. Resolve the single push endpoint every later step addresses.
+    3. Gate on git (clean, pushed, right remote) and on the approved commit.
+    4. A dry run stops here, having mutated nothing at all — no fetch, no
+       staging tree, and no configured verification command.
+    5. Gate on verification evidence for that exact sha.
+    6. Fetch the target NOW, merge in a throwaway worktree, push without force.
+    7. Re-read the endpoint and prove the content is reachable there.
+    8. Only then write the receipt, close the card, and let cleanup run.
     """
     remote, branch = target
     verdict = approval_verdict(conn, task_id)
-    source = source_state(conn, task_id, remote=remote)
-    receipt = verify(conn, task_id, source, board=board)
 
-    target_head = _remote_branch_sha(source.repo_root, remote, branch)
+    workspace_row = conn.execute(
+        "SELECT workspace_path FROM tasks WHERE id = ?", (task_id,),
+    ).fetchone()
+    repo_hint = _repo_root_for(str(workspace_row["workspace_path"] or "")) if workspace_row else None
+    endpoint = push_endpoint(repo_hint, remote) if repo_hint else None
+
+    source = source_state(conn, task_id, remote=remote, endpoint=endpoint)
+    if endpoint is None:
+        endpoint = push_endpoint(source.repo_root, remote)
+
+    if not _same_commit(verdict.approved_sha, source.sha):
+        raise LandRefusal(
+            "approval_sha_drift",
+            f"{task_id} was approved at {verdict.approved_sha[:12]} but {source.branch} now "
+            f"publishes {source.sha[:12]}; the difference was never reviewed. Re-request "
+            "review for the new commit — a passing verification is not a review.",
+        )
+
+    target_head = _remote_branch_sha(source.repo_root, endpoint.url, branch)
     if target_head is None:
         raise LandRefusal(
             "target_unresolvable",
@@ -533,63 +653,107 @@ def land_task(
 
     base: dict = {
         "task_id": task_id, "remote": remote, "branch": branch,
-        "target": f"{remote}/{branch}", "source_branch": source.branch,
-        "source_sha": source.sha, "target_sha_before": target_head,
-        "reviewer": verdict.reviewer, "approval_run_id": verdict.run_id,
-        "verification": receipt, "dry_run": bool(dry_run),
+        "target": f"{remote}/{branch}", "push_url": endpoint.url,
+        "source_branch": source.branch, "source_sha": source.sha,
+        "target_sha_before": target_head, "reviewer": verdict.reviewer,
+        "approval_run_id": verdict.run_id, "approved_sha": verdict.approved_sha,
+        "approved_at": verdict.approved_at, "dry_run": bool(dry_run),
     }
 
-    with staged_checkout(source.repo_root, target_head) as tree:
-        already = _landed_state(tree, target_head, source.sha)
-        if dry_run:
-            return {
-                **base,
-                "verdict": "already_landed" if already else "would_land",
-                "readback": already,
-                "target_sha": target_head,
-                "pushed": False,
-                "reason": None,
-            }
-        if already is None:
-            _merge_in(tree, source, remote, branch)
-            try:
-                git(tree, "push", remote, f"HEAD:refs/heads/{branch}", timeout=300)
-            except GitError as exc:
-                raise LandRefusal(
-                    "push_rejected",
-                    f"pushing {source.branch} to {remote}/{branch} was rejected "
-                    f"(landing never force-pushes): {exc}",
-                ) from exc
+    if dry_run:
+        # Zero mutation, and that includes the object database and the
+        # operator's configured shell: no fetch, no staging worktree, no ref
+        # write, no verification command, no board write. Idempotency is
+        # reported only from objects already present locally.
+        already = "ancestor" if _is_ancestor(source.repo_root, source.sha, target_head) else None
+        return {
+            **base,
+            "verdict": "already_landed" if already else "would_land",
+            "verification": planned_verification(board),
+            "readback": already, "target_sha": target_head,
+            "pushed": False, "reason": None,
+        }
 
-        # Read-back: ask the REMOTE what it now publishes, then prove the
-        # reviewed content is reachable from it. A push that reported success
-        # is not evidence; what the remote serves afterwards is.
-        landed_sha = _remote_branch_sha(source.repo_root, remote, branch)
-        if landed_sha is None:
+    receipt = verify(conn, task_id, source, board=board, verdict=verdict)
+
+    with fetched_ref(source.repo_root, endpoint.url, branch, purpose="target") as (
+        target_ref, fetched_head,
+    ):
+        with staged_checkout(source.repo_root, target_ref) as tree:
+            already = _landed_state(tree, target_ref, source.sha)
+            if already is None:
+                _merge_in(tree, source, remote, branch)
+                try:
+                    git(tree, "push", endpoint.url, f"HEAD:refs/heads/{branch}", timeout=300)
+                except GitError as exc:
+                    raise LandRefusal(
+                        _push_refusal_reason(str(exc)),
+                        f"pushing {source.branch} to {remote}/{branch} was rejected "
+                        f"(landing never force-pushes): {exc}",
+                    ) from exc
+
+    # Read-back: ask the ENDPOINT WE WROTE TO what it now publishes, then prove
+    # the reviewed content is reachable from it. A push that reported success is
+    # not evidence; what the remote serves afterwards is.
+    landed_sha = _remote_branch_sha(source.repo_root, endpoint.url, branch)
+    if landed_sha is None:
+        raise LandRefusal(
+            "readback_failed",
+            f"{remote}/{branch} no longer resolves after the push; refusing to close "
+            f"{task_id} without proof the content landed",
+        )
+    with fetched_ref(source.repo_root, endpoint.url, branch, purpose="readback") as (
+        readback_ref, readback_sha,
+    ):
+        # The proof and the recorded sha must be the same object: a target that
+        # moved between the ls-remote and the fetch would otherwise let us
+        # verify one commit and record another.
+        if readback_sha != landed_sha:
             raise LandRefusal(
                 "readback_failed",
-                f"{remote}/{branch} no longer resolves after the push; refusing to close "
-                f"{task_id} without proof the content landed",
+                f"{remote}/{branch} moved during read-back ({landed_sha[:12]} -> "
+                f"{readback_sha[:12]}); {task_id} stays open rather than record a proof "
+                "of a commit that was not the one verified",
             )
-        git(tree, "fetch", remote, f"+refs/heads/{branch}:refs/land-readback", timeout=300)
-        state = _landed_state(tree, "refs/land-readback", source.sha)
+        state = _landed_state(source.repo_root, readback_ref, source.sha)
         if state is None:
             raise LandRefusal(
                 "readback_failed",
-                f"{source.sha[:12]} is neither reachable from nor patch-equivalent to "
-                f"{remote}/{branch} at {landed_sha[:12]} after the push; {task_id} stays open",
+                f"{source.sha[:12]} is neither reachable from nor already present in "
+                f"{remote}/{branch} at {readback_sha[:12]} after the push; {task_id} stays open",
             )
 
     result = {
         **base,
         "verdict": "already_landed" if already else "landed",
-        "readback": state,
-        "target_sha": landed_sha,
-        "pushed": already is None,
-        "reason": None,
+        "verification": receipt,
+        "readback": state, "readback_sha": readback_sha,
+        "target_sha": readback_sha, "pushed": already is None,
+        "landed_at": int(time.time()), "reason": None,
+        "closure_reason": (
+            f"content proven present on {remote}/{branch} at {readback_sha[:12]} "
+            f"({state}) after remote read-back"
+        ),
     }
-    _record_landing(conn, task_id, result, actor=actor)
+    result["cleanup"] = _record_landing(conn, task_id, result, actor=actor)
     return result
+
+
+_NON_FAST_FORWARD_MARKERS = ("non-fast-forward", "fetch first", "stale info")
+
+
+def _push_refusal_reason(stderr: str) -> str:
+    """``target_advanced`` when the remote moved under us, else ``push_rejected``.
+
+    Both are refusals, but they mean different things to the operator: one says
+    "re-run me", the other says "your branch protection said no".
+    """
+    lowered = stderr.lower()
+    return (
+        "target_advanced"
+        if any(marker in lowered for marker in _NON_FAST_FORWARD_MARKERS)
+        else "push_rejected"
+    )
 
 
 def _merge_in(tree: str, source: SourceState, remote: str, branch: str) -> None:
@@ -615,41 +779,62 @@ def _merge_in(tree: str, source: SourceState, remote: str, branch: str) -> None:
         ) from exc
 
 
-def _record_landing(conn: sqlite3.Connection, task_id: str, result: dict, *, actor: str) -> None:
+def _record_landing(
+    conn: sqlite3.Connection, task_id: str, result: dict, *, actor: str,
+) -> dict:
     """Write the durable landing record, then close and clean up the card.
 
     The receipt is written BEFORE closure so a crash between the two leaves
     evidence of what was landed rather than a silently-merged, still-open card.
+    Returns what cleanup actually achieved, so the receipt can say so rather
+    than assume it.
     """
     kb.add_comment(conn, task_id, actor, _receipt_body(result))
+    workspace = conn.execute(
+        "SELECT workspace_path FROM tasks WHERE id = ?", (task_id,),
+    ).fetchone()
+    workspace_path = str((workspace["workspace_path"] if workspace else "") or "")
+
     task = kb.get_task(conn, task_id)
     if task is not None and task.status != "done":
+        # Completion is what invokes the existing safe cleanup seam
+        # (``_cleanup_workspace``), which independently re-proves the tree is
+        # clean and fully pushed before removing anything.
         kb.complete_task(
-            conn, task_id, summary=f"Landed on {result['target']} as {result['target_sha'][:12]}",
+            conn, task_id,
+            summary=f"Landed on {result['target']} as {result['target_sha'][:12]}",
             metadata={"landing": result},
         )
-    # Archival triggers the existing safe worktree/branch cleanup seam
-    # (``_cleanup_workspace``), which independently re-proves the tree is clean
-    # and fully pushed before removing anything.
     kb.archive_task(conn, task_id)
+    return {
+        "workspace_path": workspace_path or None,
+        "workspace_removed": bool(workspace_path) and not Path(workspace_path).exists(),
+        "card_archived": True,
+    }
 
 
 def _receipt_body(result: dict) -> str:
     verification = result.get("verification") or {}
+    landed_at = result.get("landed_at")
+    stamp = (
+        time.strftime("%Y-%m-%d %H:%M:%SZ", time.gmtime(landed_at)) if landed_at else "unknown"
+    )
     return "\n".join([
         f"**Landed on `{result['target']}`** ({result['verdict']})",
         "",
         f"- Source: `{result['source_branch']}` @ `{result['source_sha']}`",
         f"- Remote: `{result['remote']}`  Branch: `{result['branch']}`",
+        f"- Push endpoint: `{result.get('push_url')}`",
         f"- Target before: `{result['target_sha_before']}`",
-        f"- Target after: `{result['target_sha']}`",
+        f"- Target after (read back from the remote): `{result.get('readback_sha')}`",
         f"- Pushed: {'yes' if result['pushed'] else 'no (already present)'}",
         f"- Remote read-back: {result['readback']}",
-        f"- Reviewer: {result.get('reviewer') or 'unknown'} "
-        f"(approval run {result.get('approval_run_id')})",
+        f"- Reviewer verdict: approved by {result.get('reviewer') or 'unknown'} "
+        f"(run {result.get('approval_run_id')}) at `{result.get('approved_sha')}`",
         f"- Verification: {verification.get('kind')} "
         f"({verification.get('command') or verification.get('sha', '')})",
-        f"- Closure: content proven reachable on {result['target']}; card completed and archived.",
+        f"- Landed at: {stamp}",
+        f"- Closure: {result.get('closure_reason')}; card completed and archived.",
     ])
 
 
@@ -671,22 +856,37 @@ def _cmd_land(args) -> int:
     dry_run = bool(getattr(args, "dry_run", False))
     actor = _actor()
 
+    # Resolved ONCE, outside the per-task loop, so that every refusal record —
+    # including one from a board-configured default — can name the remote and
+    # branch it would have landed to.
+    target: Optional[tuple[str, str]] = None
+    target_refusal: Optional[LandRefusal] = None
+    try:
+        target = resolve_target(getattr(args, "target", None), board=board)
+    except LandRefusal as exc:
+        target_refusal = exc
+
     results: list[dict] = []
     with kbc.connect_closing() as conn:
         for task_id in task_ids:
             # Per-task isolation: a refusal or an unexpected git/DB failure on
             # one card is recorded as that card's verdict and never aborts the
             # batch or contaminates another card's report.
+            if target_refusal is not None:
+                results.append(_refusal_record(
+                    task_id, target, target_refusal.reason, target_refusal.message, dry_run,
+                ))
+                continue
+            assert target is not None
             try:
-                target = resolve_target(getattr(args, "target", None), board=board)
                 results.append(
                     land_task(conn, task_id, target=target, dry_run=dry_run,
                               board=board, actor=actor),
                 )
             except LandRefusal as exc:
-                results.append(_refusal_record(task_id, args, exc.reason, exc.message, dry_run))
+                results.append(_refusal_record(task_id, target, exc.reason, exc.message, dry_run))
             except (GitError, OSError, RuntimeError, ValueError) as exc:
-                results.append(_refusal_record(task_id, args, "error", str(exc), dry_run))
+                results.append(_refusal_record(task_id, target, "error", str(exc), dry_run))
 
     refused = [r for r in results if r["verdict"] == "refused"]
     if not _json_out(args, results):
@@ -695,17 +895,19 @@ def _cmd_land(args) -> int:
     return 1 if refused else 0
 
 
-def _refusal_record(task_id: str, args, reason: str, message: str, dry_run: bool) -> dict:
+def _refusal_record(
+    task_id: str, target: Optional[tuple[str, str]], reason: str, message: str, dry_run: bool,
+) -> dict:
     """A refusal reported in the same shape as a success, so a batch report is
-    uniform and machine-readable."""
-    remote, branch = "", ""
-    raw = str(getattr(args, "target", None) or "")
-    if "/" in raw:
-        remote, _, branch = raw.partition("/")
+    uniform and machine-readable. The RESOLVED target is carried in, so a
+    board-configured default is named in the output exactly like an explicit
+    ``--target`` would be."""
+    remote, branch = target if target else (None, None)
     return {
         "task_id": task_id, "verdict": "refused", "reason": reason, "message": message,
-        "remote": remote or None, "branch": branch or None,
-        "target": raw or None, "dry_run": dry_run, "pushed": False,
+        "remote": remote, "branch": branch,
+        "target": f"{remote}/{branch}" if target else None,
+        "dry_run": dry_run, "pushed": False,
         "source_sha": None, "target_sha": None, "readback": None,
     }
 

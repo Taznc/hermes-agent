@@ -226,7 +226,7 @@ _DELEGATED_CHILD_DENIED_ACTIONS: frozenset[str] = frozenset({
     "claim", "comment", "attach", "attach-rm", "complete", "edit", "block",
     "schedule", "hold", "unblock", "unhold", "promote", "archive", "dispatch", "daemon", "repair",
     "heartbeat", "notify-subscribe", "notify-unsubscribe", "specify", "decompose",
-    "gc", "land",
+    "gc", "land", "approve",
 })
 
 _DELEGATED_CHILD_DENIED_BOARD_ACTIONS: frozenset[str] = frozenset({
@@ -1309,6 +1309,13 @@ def _cmd_decompose(args: argparse.Namespace) -> int:
                              ("task_id", "ok", "reason", "fanout", "child_ids", "new_title"), _decompose_ok_line)
 
 
+def _cmd_approve(args: argparse.Namespace) -> int:
+    """Record an explicit reviewer approval, preserving the card for landing."""
+    from hermes_cli import kanban_db_approve
+
+    return kanban_db_approve.cmd_approve(args)
+
+
 def _cmd_land(args: argparse.Namespace) -> int:
     """Land approved review(s) onto the configured target (attended, fail-closed)."""
     from hermes_cli import kanban_land
@@ -1335,7 +1342,7 @@ _HANDLERS = {
     "assignees": _cmd_assignees, "notify-subscribe": _cmd_notify_subscribe,
     "notify-list": _cmd_notify_list, "notify-unsubscribe": _cmd_notify_unsubscribe,
     "context": _cmd_context, "specify": _cmd_specify, "decompose": _cmd_decompose,
-    "gc": _cmd_gc, "land": _cmd_land,
+    "gc": _cmd_gc, "land": _cmd_land, "approve": _cmd_approve,
 }
 
 
