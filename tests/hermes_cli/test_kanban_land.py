@@ -561,7 +561,7 @@ def test_landing_is_idempotent_for_already_merged_work(kanban_home, repo):
 
 
 def test_idempotent_rerun_does_not_duplicate_the_final_receipt(kanban_home, repo):
-    """Once all bookkeeping is durably final, a re-run is read-only bookkeeping."""
+    """A finalized re-run must not duplicate the durable bookkeeping surfaces."""
     with kbc.connect() as conn:
         task_id, path = make_approved_task(conn, repo)
         kl.land_task(conn, task_id, target=("origin", "dev"))
