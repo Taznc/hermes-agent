@@ -417,6 +417,9 @@ export interface UpstreamTranslations {
         sources: Record<string, string>
       }
       installModal: {
+        installFromGit: string
+        reviewRepository: string
+        repoPlaceholder: string
         title: string
         description: string
         repoLabel: string
@@ -1456,6 +1459,9 @@ export interface UpstreamTranslations {
     noPreview: string
     shown: (visible: number, total: number) => string
 
+    extendedTranscript: string
+    transcriptTruncated: string
+    transcriptUnavailable: string
     close: string
     title: string
     subtitle: string
@@ -1467,6 +1473,14 @@ export interface UpstreamTranslations {
     streaming: string
     files: string
     moreFiles: (count: number) => string
+    moreAgents: (count: number) => string
+    queued: string
+    waitingActivity: string
+    steer: string
+    steerPlaceholder: string
+    steerQueued: string
+    stopRequested: string
+    requestRejected: string
     delegation: (index: number) => string
     workers: (count: number) => string
     workersActive: (count: number) => string

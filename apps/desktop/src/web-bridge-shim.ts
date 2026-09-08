@@ -40,6 +40,7 @@
  * parity" for the audit and the outstanding gaps.
  */
 
+import { getApiRequestProfile } from '@/api/client'
 import { markWebReloadPending, registerNativeWebReload } from '@/store/web-reload'
 
 import { type AgentOverview, createAgentOverviewReader } from '../electron/agent-overview'
@@ -126,6 +127,29 @@ interface SpikeReadFileTextResult {
   path: string
   text: string
   truncated?: boolean
+}
+
+// Wire shapes of /api/dashboard/plugins/probe and
+// /api/dashboard/desktop-plugins/install. Deliberately identical to
+// PluginProbeResult / DesktopPluginInstallResult in global.d.ts (and to what
+// electron/desktop-plugin-install.ts returns) so the backend response is
+// handed to the renderer verbatim with no translation layer to drift.
+interface SpikePluginProbeResult {
+  ok: boolean
+  agent: boolean
+  desktop: boolean
+  agentName?: null | string
+  desktopName?: null | string
+  warnings?: string[]
+  insecure?: boolean
+  error?: string
+}
+
+interface SpikeDesktopPluginInstallResult {
+  ok: boolean
+  pluginName?: string
+  path?: string
+  error?: string
 }
 
 // Structural subset of HermesSelectPathsOptions (src/global.d.ts).
@@ -374,7 +398,25 @@ const READY_BOOT = {
   timestamp: Date.now()
 }
 
-// ── VS Code Marketplace theme search (themes.searchMarketplace) ────────────
+// The active API request profile, as a spreadable `api()` fragment.
+//
+// A named profile is a DIFFERENT HERMES_HOME on the same backend, so every
+// profile-scoped route below must carry it or the call silently targets the
+// serving process's own home. store/profile pushes $activeGatewayProfile into
+// api/client's request-profile state on every (connection, profile) change,
+// and this reads that same single source rather than importing the store —
+// the shim evaluates before the app's module graph, and a store import here
+// would pull the whole app in at bridge-install time.
+//
+// normalizeProfileKey turns "no profile" into the literal 'default'; the
+// backend's _is_current_profile() treats only ''/null/'current' as "my own
+// home", so 'default' is dropped here rather than sent, keeping a
+// single-profile install byte-identical to before.
+function activeProfileScope(): { profile?: string } {
+  const profile = getApiRequestProfile()
+
+  return profile && profile !== 'default' ? { profile } : {}
+}
 // Electron's counterpart (electron/vscode-marketplace.ts) runs this same
 // query from the MAIN process; the gallery API sends
 // `Access-Control-Allow-Origin: *` (verified live), so the browser can call
@@ -839,8 +881,10 @@ const shim = {
   // touch the filesystem directly, so every member proxies through the
   // backend's /api/fs/* gateway REST routes, the same seam desktop-fs.ts's
   // remote-mode branch already uses for the editor/preview file surfaces.
-  desktopPluginsRoot: async () => (await api<{ path: string }>({ path: '/api/fs/desktop-plugins-root' })).path,
-  agentPluginsRoot: async () => (await api<{ path: string }>({ path: '/api/fs/agent-plugins-root' })).path,
+  desktopPluginsRoot: async () =>
+    (await api<{ path: string }>({ path: '/api/fs/desktop-plugins-root', ...activeProfileScope() })).path,
+  agentPluginsRoot: async () =>
+    (await api<{ path: string }>({ path: '/api/fs/agent-plugins-root', ...activeProfileScope() })).path,
   readDir: async (dirPath: string) =>
     api<SpikeReadDirResult>({ path: `/api/fs/list?path=${encodeURIComponent(dirPath)}` }),
   readFileText: async (filePath: string) =>
@@ -850,6 +894,71 @@ const shim = {
   // 512 KiB, which would evaluate half a module).
   readPluginSource: async (filePath: string) =>
     api<SpikeReadFileTextResult>({ path: `/api/fs/read-plugin-source?path=${encodeURIComponent(filePath)}` }),
+
+  // ── plugin install door (proxied over /api/dashboard/*) ─────────────────
+  // Electron resolves these in its main process (electron/fs-ipc.ts ->
+  // electron/desktop-plugin-install.ts): clone a repo to a temp dir, report
+  // which halves it carries, and copy the desktop half into
+  // <hermes home>/desktop-plugins/<name>. There is no main process here, so
+  // both proxy to backend routes that do the same work server-side and
+  // return the same camelCase shapes global.d.ts declares.
+  //
+  // Without them PluginInstallModal degrades to its probeUnavailable /
+  // desktopUnavailable copy — honest, but the desktop half of a plugin
+  // cannot be installed from this build at all.
+  //
+  // Failures resolve to `{ok: false, error}` instead of rejecting, matching
+  // the IPC handlers: the modal calls both members without a catch, so a
+  // rejection would strand the dialog in its probing state and surface as an
+  // unhandled rejection rather than as visible copy.
+  //
+  // 90s budget: the backend's own git clone budgets 60s, so the shim's 30s
+  // default ceiling would abort a legitimate slow clone before it finished.
+  // The probe only clones to a temp dir and reads its shape — it touches no
+  // HERMES_HOME, so it is deliberately NOT profile-scoped. The install below
+  // is.
+  probePluginRepo: async (payload: { identifier?: string; repo?: string }) => {
+    const identifier = payload.identifier ?? payload.repo ?? ''
+
+    try {
+      return await api<SpikePluginProbeResult>({
+        path: '/api/dashboard/plugins/probe',
+        method: 'POST',
+        body: { identifier },
+        timeoutMs: 90_000
+      })
+    } catch (error) {
+      return {
+        ok: false,
+        agent: false,
+        desktop: false,
+        warnings: [] as string[],
+        insecure: false,
+        error: error instanceof Error ? error.message : String(error)
+      }
+    }
+  },
+  installDesktopPlugin: async (payload: { identifier?: string; repo?: string; force?: boolean }) => {
+    const identifier = payload.identifier ?? payload.repo ?? ''
+
+    try {
+      return await api<SpikeDesktopPluginInstallResult>({
+        path: '/api/dashboard/desktop-plugins/install',
+        method: 'POST',
+        body: { identifier, force: Boolean(payload.force) },
+        // The install writes into <HERMES_HOME>/desktop-plugins, and the scan
+        // that runs straight after it (discoverRuntimePlugins ->
+        // desktopPluginsRoot above) is profile-scoped too. Omitting the
+        // profile here would install into the serving process's own home
+        // while the scan looked in profiles/<name>/ — the plugin would appear
+        // to install and then never load.
+        ...activeProfileScope(),
+        timeoutMs: 90_000
+      })
+    } catch (error) {
+      return { ok: false, error: error instanceof Error ? error.message : String(error) }
+    }
+  },
 
   // ── first-render adjacents ───────────────────────────────────────────────
   onPreviewFileChanged: unsub,

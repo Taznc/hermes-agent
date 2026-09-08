@@ -117,6 +117,26 @@ _BOARD_SPECS = [
         _SLUG,
         _arg("path", nargs="?", help="Absolute path to use as default workdir. Omit to clear."),
     ], help="Set the default workspace path for tasks on a board"),
+    _cmd("set-land-target", [
+        _SLUG,
+        _arg("target", nargs="?", metavar="REMOTE/BRANCH",
+             help="Landing target as <remote>/<branch> (e.g. origin/dev). Omit to clear."),
+    ], help="Set the target `hermes kanban land` merges approved cards into",
+       description=(
+           "`hermes kanban land` NEVER infers a remote — a repository with both a fork and an "
+           "upstream configured has no safe default. This records the one explicit target for "
+           "the board; without it (and without --target) landing refuses."
+       )),
+    _cmd("set-land-verify", [
+        _SLUG,
+        _arg("command", nargs="?",
+             help="Shell command re-run against the exact commit before landing. Omit to clear."),
+    ], help="Set the pre-land verification command for a board",
+       description=(
+           "Run in a throwaway checkout of the exact commit being landed; a non-zero exit "
+           "refuses the landing. When unset, landing instead requires a verification receipt "
+           "on the approval run naming that same commit."
+       )),
     _cmd("export", [
         _arg("slug", nargs="?", help="Board to export (default: the current board)"),
         _arg("-o", "--output", help="Archive path (default: ./<slug>.tar.gz)"),
@@ -359,6 +379,19 @@ _SPECS = [
              help="Override the live-claim guard: move a running, claimed "
                   "task to review even without owning its run (clears the worker's claim)."),
     ], help="Move a task to 'review' (implementation done, awaiting review) — NOT a block"),
+    _cmd("approve", [
+        _TASK_ID,
+        _arg("--sha", metavar="COMMIT",
+             help="The reviewed commit. Defaults to the task worktree's HEAD."),
+        _reason("Optional approval note recorded on the run and the event."),
+    ], help="Reviewer verdict: approve the active review, preserving the card for landing",
+       description=(
+           "Records an explicit approval bound to the exact commit reviewed, and leaves the "
+           "card in the review column awaiting `hermes kanban land`. It deliberately does "
+           "NOT complete the card: completion reaps the task worktree, and that tree — plus "
+           "the pushed branch — is the evidence landing re-verifies before it merges. Use "
+           "`hermes kanban complete` instead when a card's life genuinely ends at review."
+       )),
     _cmd("request-changes", [_TASK_ID, _arg("reason", nargs="+", help="Concrete changes required before re-review")],
          help="Reviewer verdict: return the active review run to its implementer"),
     _cmd("reopen-review", [
@@ -457,6 +490,27 @@ _SPECS = [
               "routed to specialist profiles by description. Falls back "
               "to specify-style single-task promotion when the task "
               "doesn't benefit from fan-out. Uses auxiliary.kanban_decomposer."),
+    _cmd("land", [
+        _TASK_IDS,
+        _arg("--target", metavar="REMOTE/BRANCH",
+             help="Merge target as <remote>/<branch>. Overrides the board's land_target; "
+                  "required when the board has none."),
+        _arg("--dry-run", action="store_true",
+             help="Report the verdict for each task and change nothing (not even a fetch)"),
+        _json_flag(help="Emit one JSON object per task with its verdict and reason"),
+    ], help="Land approved review(s): verified merge to the configured target, then close",
+       description=(
+           "Attended, fail-closed landing. For each task it requires an explicit reviewer "
+           "approval verdict, no live worker, satisfied dependencies, a clean and pushed task "
+           "branch on the target's own remote, and verification evidence for that exact "
+           "commit. It then re-reads the target from the remote, merges in a throwaway "
+           "worktree, pushes WITHOUT force, and re-reads the remote to prove the content is "
+           "reachable (or patch-equivalent, so a squash-merged card is recognised as already "
+           "landed). Only after that read-back does it record the receipt, complete and "
+           "archive the card, and hand off to the existing safe worktree cleanup. Any gate "
+           "that cannot be proven refuses with a reason code; there is no override flag. "
+           "Batch mode isolates failures — one refusal never affects another task."
+       )),
     _cmd("gc", [
         _arg("--event-retention-days", type=int, default=30,
              help="Delete task_events older than N days for terminal tasks (default: 30)"),
