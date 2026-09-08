@@ -44,6 +44,9 @@ import { markWebReloadPending, registerNativeWebReload } from '@/store/web-reloa
 
 import { type AgentOverview, createAgentOverviewReader } from '../electron/agent-overview'
 
+import type { DesktopMarketplaceThemeResult } from './global'
+import { extractVsixThemes } from './lib/vsix-archive'
+
 // ── HMR full-reload trap (DEV only) ─────────────────────────────────────────
 // Vite's built-in HMR client calls window.location.reload() directly whenever
 // an edited module can't Fast Refresh (any file that also exports a
@@ -382,13 +385,12 @@ const READY_BOOT = {
 // searchMarketplaceThemes()'s filters/flags/icon-theme exclusion exactly so
 // results match the Electron build byte-for-byte.
 //
-// themes.fetchMarketplace (theme INSTALL — downloading + unzipping a .vsix)
-// is deliberately NOT implemented here: it needs to parse an untrusted zip
-// and raw-deflate-inflate its entries client-side, a materially bigger and
-// security-sensitive lift than this card's slice. src/themes/install.ts
-// already throws a clear, visible "only available in the desktop app" error
-// when this member is absent — an honest gap, not a silent one. Followup
-// filed for install (t_d40923b6 completion metadata).
+// themes.fetchMarketplace (theme INSTALL) is implemented below: the `.vsix`
+// CDN asset host (`<publisher>.gallerycdn.vsassets.io`) was verified to send
+// `Access-Control-Allow-Origin: *` independently of the gallery query host —
+// a separate origin, so it could not be assumed — and to expose
+// `Content-Length`, which lets the size cap be enforced before the body is
+// read. Zip parsing lives in lib/vsix-archive.ts.
 interface MarketplaceSearchItem {
   extensionId: string
   displayName: string
@@ -398,6 +400,26 @@ interface MarketplaceSearchItem {
 }
 
 const GALLERY_QUERY_URL = 'https://marketplace.visualstudio.com/_apis/public/gallery/extensionquery'
+
+/** POST an ExtensionQuery payload and return the parsed gallery response. */
+async function queryGallery(payload: unknown): Promise<Record<string, unknown>> {
+  const res = await fetch(GALLERY_QUERY_URL, {
+    body: JSON.stringify(payload),
+    headers: {
+      Accept: 'application/json;api-version=3.0-preview.1',
+      'Content-Type': 'application/json'
+    },
+    method: 'POST'
+  })
+
+  if (!res.ok) {
+    throw new Error(`VS Code Marketplace request failed: ${res.status}`)
+  }
+
+  const responseText = await res.text()
+
+  return responseText ? JSON.parse(responseText) : {}
+}
 
 function looksLikeIconTheme(extension: {
   tags?: unknown
@@ -430,27 +452,15 @@ async function searchMarketplaceThemes(query: string): Promise<MarketplaceSearch
     criteria.push({ filterType: 10, value: trimmedQuery })
   }
 
-  const res = await fetch(GALLERY_QUERY_URL, {
-    method: 'POST',
-    headers: {
-      Accept: 'application/json;api-version=3.0-preview.1',
-      'Content-Type': 'application/json'
-    },
-    body: JSON.stringify({
-      // Over-fetch so the icon-theme filter below still leaves a full page.
-      filters: [{ criteria, pageNumber: 1, pageSize: Math.min(pageSize * 2, 50), sortBy: 4, sortOrder: 0 }],
-      // IncludeStatistics (0x100) | IncludeLatestVersionOnly (0x200) | IncludeCategoryAndTags (0x4).
-      flags: 772
-    })
+  const json = await queryGallery({
+    // Over-fetch so the icon-theme filter below still leaves a full page.
+    filters: [{ criteria, pageNumber: 1, pageSize: Math.min(pageSize * 2, 50), sortBy: 4, sortOrder: 0 }],
+    // IncludeStatistics (0x100) | IncludeLatestVersionOnly (0x200) | IncludeCategoryAndTags (0x4).
+    flags: 772
   })
 
-  if (!res.ok) {
-    throw new Error(`VS Code Marketplace search failed: ${res.status}`)
-  }
-
-  const responseText = await res.text()
-  const json = responseText ? JSON.parse(responseText) : {}
-  const extensions: Array<Record<string, unknown>> = json?.results?.[0]?.extensions ?? []
+  const results = (json as { results?: Array<{ extensions?: Array<Record<string, unknown>> }> }).results
+  const extensions: Array<Record<string, unknown>> = results?.[0]?.extensions ?? []
 
   return extensions
     .filter(extension => !looksLikeIconTheme(extension))
@@ -473,6 +483,127 @@ async function searchMarketplaceThemes(query: string): Promise<MarketplaceSearch
         installs: Math.round(installStat?.value ?? 0)
       }
     })
+}
+
+// ── VS Code Marketplace theme install (themes.fetchMarketplace) ────────────
+// Mirrors electron/vscode-marketplace.ts's fetchMarketplaceThemes(): resolve
+// the latest version's `.vsix` URL through the same gallery query API, GET
+// the archive, and read out `extension/package.json` plus the color-theme
+// JSON files it names. Nothing from the archive is executed; see
+// lib/vsix-archive.ts for the security posture.
+//
+// The one Electron-vs-browser difference is the decompressor: `zlib
+// .inflateRawSync` becomes `DecompressionStream('deflate-raw')` (Chrome/Edge
+// 100+, Firefox 113+, Safari 16.4+). An older browser gets a clear thrown
+// error, which src/themes/install.ts already surfaces to the user — the same
+// honest-failure posture the absent member had, never a silent empty result.
+
+const VSIX_ASSET_TYPE = 'Microsoft.VisualStudio.Services.VSIXPackage'
+// Same ceiling as Electron's MAX_VSIX_BYTES. Themes are tiny; this is paranoia.
+const MAX_VSIX_BYTES = 40 * 1024 * 1024
+const MARKETPLACE_ID_RE = /^[\w-]+\.[\w-]+$/
+
+/** Resolve `{ displayName, vsixUrl }` for the latest version of `id`. */
+async function resolveMarketplaceExtension(id: string): Promise<{ displayName: string; vsixUrl: string }> {
+  const json = await queryGallery({
+    // FilterType 7 = ExtensionName (the full publisher.extension id).
+    filters: [{ criteria: [{ filterType: 7, value: id }], pageNumber: 1, pageSize: 1 }],
+    // IncludeFiles | IncludeVersionProperties | IncludeAssetUri |
+    // IncludeCategoryAndTags | IncludeLatestVersionOnly = 914.
+    flags: 914
+  })
+
+  const results = (json as { results?: Array<{ extensions?: Array<Record<string, unknown>> }> }).results
+  const extension = results?.[0]?.extensions?.[0]
+
+  if (!extension) {
+    throw new Error(`Extension "${id}" was not found on the Marketplace.`)
+  }
+
+  const versions = extension.versions as Array<{ files?: Array<{ assetType?: string; source?: string }> }> | undefined
+  const version = versions?.[0]
+
+  if (!version) {
+    throw new Error(`Extension "${id}" has no published versions.`)
+  }
+
+  const asset = (version.files ?? []).find(file => file.assetType === VSIX_ASSET_TYPE)
+
+  if (!asset?.source) {
+    throw new Error(`Could not find a downloadable package for "${id}".`)
+  }
+
+  return { displayName: (extension.displayName as string) || id, vsixUrl: asset.source }
+}
+
+/**
+ * Download a `.vsix`, refusing anything past MAX_VSIX_BYTES. The declared
+ * Content-Length is checked first (the CDN exposes it cross-origin, verified),
+ * but it is advisory on a cross-origin response, so the streamed body is
+ * counted as well and the read is aborted the moment it passes the cap.
+ */
+async function downloadVsix(url: string): Promise<Uint8Array> {
+  const res = await fetch(url, { method: 'GET' })
+
+  if (!res.ok) {
+    throw new Error(`Marketplace download failed (${res.status}).`)
+  }
+
+  const declared = Number(res.headers.get('content-length') ?? Number.NaN)
+
+  if (Number.isFinite(declared) && declared > MAX_VSIX_BYTES) {
+    throw new Error('Extension package exceeded the size limit.')
+  }
+
+  const reader = res.body?.getReader()
+
+  if (!reader) {
+    throw new Error('Marketplace download returned an unreadable response.')
+  }
+
+  const chunks: Uint8Array[] = []
+  let total = 0
+
+  for (;;) {
+    const { done, value } = await reader.read()
+
+    if (done) {
+      break
+    }
+
+    total += value.length
+
+    if (total > MAX_VSIX_BYTES) {
+      await reader.cancel()
+
+      throw new Error('Extension package exceeded the size limit.')
+    }
+
+    chunks.push(value)
+  }
+
+  const out = new Uint8Array(total)
+  let cursor = 0
+
+  for (const chunk of chunks) {
+    out.set(chunk, cursor)
+    cursor += chunk.length
+  }
+
+  return out
+}
+
+async function fetchMarketplaceThemes(id: string): Promise<DesktopMarketplaceThemeResult> {
+  const trimmed = String(id || '').trim()
+
+  if (!MARKETPLACE_ID_RE.test(trimmed)) {
+    throw new Error('Expected a Marketplace id like "publisher.extension".')
+  }
+
+  const { displayName, vsixUrl } = await resolveMarketplaceExtension(trimmed)
+  const themes = await extractVsixThemes(await downloadVsix(vsixUrl))
+
+  return { displayName, extensionId: trimmed, themes }
 }
 
 // ── Local Models plumbing (localModelsEnabled) ──────────────────────────────
@@ -1038,8 +1169,9 @@ const shim = {
   glassSupported: false,
   translucencySupported: false,
 
-  // ── theme marketplace (search only; install stays omitted, see above) ────
+  // ── theme marketplace (search + install) ────────────────────────────────
   themes: {
+    fetchMarketplace: fetchMarketplaceThemes,
     searchMarketplace: searchMarketplaceThemes
   },
 
@@ -1048,7 +1180,7 @@ const shim = {
 
   // OMITTED ON PURPOSE (consumers optional-chained/feature-gated): terminal,
   // git, petOverlay, hud, quickEntry, wakeIndicator, zoom, updates, uninstall,
-  // themes.fetchMarketplace (install), installDesktopPlugin, probePluginRepo,
+  // installDesktopPlugin, probePluginRepo,
   // mcpOauth (browser popup fallback lives in lib/mcp-dashboard-oauth.ts
   // instead — no loopback listener possible from a tab), cloud, connections,
   // settings, findInPage*, getBootstrapState/onBootstrapEvent (must stay
