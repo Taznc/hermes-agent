@@ -182,3 +182,84 @@ def test_run_slash_reclaim_running_task(kanban_home):
 # ---------------------------------------------------------------------------
 
 
+# ---------------------------------------------------------------------------
+# Roadmap lanes — create --idea/--roadmap plus refine/demote/spawn
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("flag,expected", [("--idea", "idea"), ("--roadmap", "roadmap")])
+def test_create_lane_flag_needs_no_assignee(kanban_home, flag, expected):
+    """``--idea``/``--roadmap`` land the card in the inert lane; no assignee required."""
+    out = kc.run_slash(f'create "wishlist item" {flag} --json')
+    payload = json.loads(out)
+    assert payload["status"] == expected
+    assert payload["assignee"] is None
+
+
+def test_create_lane_flags_are_mutually_exclusive_with_triage(kanban_home):
+    out = kc.run_slash('create "x" --idea --triage')
+    assert "mutually exclusive" in out
+    with kbc.connect_closing() as conn:
+        assert kb.list_tasks(conn) == []
+
+
+def test_refine_demote_spawn_slash_round_trip(kanban_home):
+    """The three verbs move a card through the lanes and into the work queue."""
+    tid = json.loads(kc.run_slash('create "wish" --idea --json'))["id"]
+
+    assert "Refined to roadmap" in kc.run_slash(f"refine {tid}")
+    assert json.loads(kc.run_slash(f"show {tid} --json"))["task"]["status"] == "roadmap"
+
+    assert "Demoted to idea" in kc.run_slash(f"demote {tid}")
+    assert json.loads(kc.run_slash(f"show {tid} --json"))["task"]["status"] == "idea"
+
+    kc.run_slash(f"refine {tid}")
+    assert "Spawned to triage" in kc.run_slash(f"spawn {tid}")
+    assert json.loads(kc.run_slash(f"show {tid} --json"))["task"]["status"] == "triage"
+
+
+def test_spawn_to_ready_opts_out_of_triage(kanban_home):
+    tid = json.loads(kc.run_slash('create "wish" --roadmap --json'))["id"]
+    assert "Spawned to ready" in kc.run_slash(f"spawn {tid} --to ready")
+    assert json.loads(kc.run_slash(f"show {tid} --json"))["task"]["status"] == "ready"
+
+
+def test_refine_on_live_work_reports_the_attempted_transition(kanban_home):
+    """A refused lane move names from->to so the operator sees why nothing happened, and
+    the live card is untouched."""
+    tid = json.loads(kc.run_slash('create "real work" --assignee alice --json'))["id"]
+    out = kc.run_slash(f"refine {tid}")
+    assert "'ready' -> 'roadmap'" in out
+    assert json.loads(kc.run_slash(f"show {tid} --json"))["task"]["status"] == "ready"
+
+
+def test_ls_groups_lanes_under_a_roadmap_header_after_live_work(kanban_home):
+    """Wishlist cards render below every live column so the listing still reads as
+    'what is in flight'."""
+    kc.run_slash('create "live task" --assignee alice')
+    kc.run_slash('create "wishlist item" --idea')
+    out = kc.run_slash("list")
+    assert "Roadmap (inert" in out
+    assert out.index("live task") < out.index("Roadmap (inert") < out.index("wishlist item")
+
+
+def test_ls_status_filter_accepts_lane_names(kanban_home):
+    kc.run_slash('create "wishlist item" --idea')
+    kc.run_slash('create "agreed item" --roadmap')
+    ideas = json.loads(kc.run_slash("list --status idea --json"))
+    assert [t["title"] for t in ideas] == ["wishlist item"]
+
+
+def test_spawn_to_ready_reports_the_gated_landing_not_the_request(kanban_home):
+    """``--to ready`` under an unfinished parent lands in ``todo``; the CLI must say where the
+    card actually went. Printing the requested "Spawned to ready" would tell the operator their
+    card is queued for dispatch when it is sitting in ``todo`` waiting on its parent."""
+    epic = json.loads(kc.run_slash('create "epic" --assignee alice --json'))["id"]
+    tid = json.loads(kc.run_slash(f'create "wish" --roadmap --parent {epic} --json'))["id"]
+
+    out = kc.run_slash(f"spawn {tid} --to ready")
+    assert "Spawned to todo" in out
+    assert "requested ready" in out
+    assert json.loads(kc.run_slash(f"show {tid} --json"))["task"]["status"] == "todo"
+
+

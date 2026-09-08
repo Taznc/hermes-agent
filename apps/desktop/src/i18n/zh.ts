@@ -512,6 +512,7 @@ export const zhAuthored: Translations = withForkKeys(forkZh, {
       testBody: '通知工作正常。',
       testSent: '测试已发送。如果没有出现，请检查系统通知权限和专注模式／勿扰模式。',
       testUnsupported: '此系统不支持原生通知。',
+      testDenied: '此网站的通知已被拦截。请在浏览器的网站设置中允许通知，然后重试。',
       completionSoundTitle: '完成提示音',
       completionSoundDesc: '智能体回合结束时播放。可在此选择预设并预览。',
       completionSoundPreview: '预览'
@@ -3710,7 +3711,13 @@ export const zhAuthored: Translations = withForkKeys(forkZh, {
       questionProgress: (answered, total) => `已回答 ${answered}/${total}`,
       lateAnswer: (question, choice) => `关于"${question}" — 我的回答: ${choice}`,
       lateAnswerTip: '将此回答起草为后续消息',
-      lateAnswerHint: '此问题已不再等待回答。选择一个选项会将其起草为后续消息。'
+      lateAnswerHint: '此问题已不再等待回答。选择一个选项会将其起草为后续消息。',
+      addNote: '添加备注',
+      addNoteFor: label => `为${label}添加备注`,
+      note: '备注',
+      noteFor: label => `${label}的备注`,
+      notePlaceholder: '添加可选备注…',
+      selected: '已选择'
     },
     mcpSetup: {
       installTitle: server => `添加 ${server} MCP 服务器？`,

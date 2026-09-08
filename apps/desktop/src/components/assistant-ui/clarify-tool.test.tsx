@@ -204,6 +204,92 @@ describe('ClarifyTool choice selection', () => {
     })
   })
 
+  it('sends an optional note separately from the selected single answer', async () => {
+    const { request } = renderLiveClarify()
+
+    fireEvent.click(screen.getByRole('button', { name: /^[A-Z]staging/ }))
+    fireEvent.click(screen.getByRole('button', { name: 'Add note for staging' }))
+    fireEvent.change(screen.getByRole('textbox', { name: 'Note for staging' }), {
+      target: { value: 'Prefer the preview.' }
+    })
+    fireEvent.click(screen.getByRole('button', { name: /Continue/ }))
+
+    await waitFor(() => {
+      expect(request).toHaveBeenCalledWith('clarify.respond', {
+        answer: 'staging',
+        note: 'Prefer the preview.',
+        request_id: 'request-1'
+      })
+    })
+  })
+
+  it('keeps a question note reviewable after deselecting every choice and selecting another', () => {
+    renderLiveClarify({ multiSelect: true })
+    const staging = screen.getByRole('button', { name: /^[A-Z]staging/ })
+
+    fireEvent.click(staging)
+    fireEvent.click(screen.getByRole('button', { name: 'Add note for staging' }))
+    fireEvent.change(screen.getByRole('textbox', { name: 'Note for staging' }), {
+      target: { value: 'Preserve this note.' }
+    })
+    fireEvent.click(staging)
+    fireEvent.click(screen.getByRole('button', { name: /^[A-Z]production/ }))
+
+    expect(screen.getByRole('textbox', { name: 'Note for production' })).toHaveProperty('value', 'Preserve this note.')
+  })
+
+  it('keeps a selected-answer note visible and sends it when switching to Other', async () => {
+    const { request } = renderLiveClarify()
+
+    fireEvent.click(screen.getByRole('button', { name: /^[A-Z]staging/ }))
+    fireEvent.click(screen.getByRole('button', { name: 'Add note for staging' }))
+    fireEvent.change(screen.getByRole('textbox', { name: 'Note for staging' }), {
+      target: { value: 'Keep this context.' }
+    })
+    fireEvent.change(screen.getByPlaceholderText('Other (type your answer)'), {
+      target: { value: 'Custom deployment' }
+    })
+
+    expect(screen.getByRole('textbox', { name: 'Note for Other (type your answer)' })).toHaveProperty(
+      'value',
+      'Keep this context.'
+    )
+    fireEvent.click(screen.getByRole('button', { name: /Continue/ }))
+    await waitFor(() =>
+      expect(request).toHaveBeenCalledWith('clarify.respond', {
+        answer: 'Custom deployment',
+        note: 'Keep this context.',
+        request_id: 'request-1'
+      })
+    )
+  })
+
+  it('does not submit a note twice while the first response is pending', async () => {
+    const { request } = renderLiveClarify()
+    request.mockImplementation(() => new Promise(() => {}))
+
+    fireEvent.click(screen.getByRole('button', { name: /^[A-Z]staging/ }))
+    fireEvent.click(screen.getByRole('button', { name: 'Add note for staging' }))
+    const note = screen.getByRole('textbox', { name: 'Note for staging' })
+    fireEvent.change(note, { target: { value: 'Ready.' } })
+    fireEvent.keyDown(note, { key: 'Enter' })
+    await waitFor(() => expect(request).toHaveBeenCalledTimes(1))
+
+    expect((note as HTMLTextAreaElement).disabled).toBe(true)
+    fireEvent.keyDown(note, { key: 'Enter' })
+    expect(request).toHaveBeenCalledTimes(1)
+  })
+
+  it('opens one scoped note editor when multiple choices are selected', () => {
+    renderLiveClarify({ multiSelect: true })
+
+    fireEvent.click(screen.getByRole('button', { name: /^[A-Z]staging/ }))
+    fireEvent.click(screen.getByRole('button', { name: /^[A-Z]production/ }))
+    fireEvent.click(screen.getByRole('button', { name: 'Add note for staging' }))
+
+    expect(screen.getAllByPlaceholderText('Add an optional note…')).toHaveLength(1)
+  })
+
   it('keeps single-select replacement and plain-string submission', async () => {
     const { request } = renderLiveClarify()
     const staging = screen.getByRole('button', { name: /^[A-Z]staging/ })
@@ -223,6 +309,36 @@ describe('ClarifyTool choice selection', () => {
         request_id: 'request-1'
       })
     })
+  })
+
+  it('submits the Other draft on plain Enter and cancels the newline', async () => {
+    const { request } = renderLiveClarify()
+    const other = screen.getByPlaceholderText('Other (type your answer)')
+
+    other.focus()
+    fireEvent.change(other, { target: { value: 'canary' } })
+
+    // A cancelled keydown is how the browser is told not to insert "\n".
+    expect(fireEvent.keyDown(other, { key: 'Enter' })).toBe(false)
+    await waitFor(() => {
+      expect(request).toHaveBeenCalledWith('clarify.respond', {
+        answer: 'canary',
+        request_id: 'request-1'
+      })
+    })
+  })
+
+  it('leaves Shift+Enter and IME Enter alone in the Other draft', () => {
+    const { request } = renderLiveClarify()
+    const other = screen.getByPlaceholderText('Other (type your answer)')
+
+    other.focus()
+    fireEvent.change(other, { target: { value: 'canary' } })
+
+    expect(fireEvent.keyDown(other, { key: 'Enter', shiftKey: true })).toBe(true)
+    expect(fireEvent.keyDown(other, { isComposing: true, key: 'Enter' })).toBe(true)
+    expect(request).not.toHaveBeenCalled()
+    expect((other as HTMLTextAreaElement).value).toBe('canary')
   })
 })
 
@@ -670,7 +786,11 @@ function liveBatchProps(): ToolCallMessagePartProps {
   }
 }
 
-function renderLiveBatch(lockedAnswers?: Record<string, string>, multiSelect = false) {
+function renderLiveBatch(
+  lockedAnswers?: Record<string, string>,
+  multiSelect = false,
+  lockedNotes?: Record<string, string>
+) {
   const request = vi.fn().mockResolvedValue({ ok: true, remaining: [] })
 
   $activeSessionId.set('session-1')
@@ -678,6 +798,7 @@ function renderLiveBatch(lockedAnswers?: Record<string, string>, multiSelect = f
   setClarifyRequest({
     choices: null,
     lockedAnswers,
+    lockedNotes,
     multiSelect: false,
     question: '',
     questions: [
@@ -771,6 +892,231 @@ describe('ClarifyTool batch card', () => {
     expect((confirm as HTMLButtonElement).disabled).toBe(false)
   })
 
+  it('keeps a scoped note directly under a selected choice and sends it separately', async () => {
+    const request = renderLiveBatch()
+
+    fireEvent.click(screen.getByRole('button', { name: /^[A-Z]red/ }))
+    fireEvent.click(screen.getByRole('button', { name: 'Add note for red' }))
+
+    const note = screen.getByRole('textbox', { name: 'Note for red' })
+    expect(note.closest('[data-clarify-batch-question="q0"]')).toBeTruthy()
+    fireEvent.change(note, { target: { value: 'Use the stable palette.' } })
+    fireEvent.change(screen.getByPlaceholderText('Type your answer…'), { target: { value: 'packet' } })
+    fireEvent.submit(document.querySelector('form') as HTMLFormElement)
+
+    await waitFor(() => {
+      expect(request).toHaveBeenCalledTimes(2)
+    })
+    expect(request).toHaveBeenNthCalledWith(1, 'clarify.respond', {
+      answer: 'red',
+      note: 'Use the stable palette.',
+      question_id: 'q0',
+      request_id: 'request-batch'
+    })
+  })
+
+  it('keeps one scoped note editor for a batch multi-select answer', () => {
+    renderLiveBatch(undefined, true)
+
+    fireEvent.click(screen.getByRole('button', { name: /^[A-Z]red/ }))
+    fireEvent.click(screen.getByRole('button', { name: /^[A-Z]blue/ }))
+    fireEvent.click(screen.getByRole('button', { name: 'Add note for red' }))
+
+    expect(screen.getAllByPlaceholderText('Add an optional note…')).toHaveLength(1)
+  })
+
+  it('keeps a batch note reviewable after deselecting every choice and selecting another', () => {
+    renderLiveBatch(undefined, true)
+    const red = screen.getByRole('button', { name: /^[A-Z]red/ })
+
+    fireEvent.click(red)
+    fireEvent.click(screen.getByRole('button', { name: 'Add note for red' }))
+    fireEvent.change(screen.getByRole('textbox', { name: 'Note for red' }), { target: { value: 'Keep me.' } })
+    fireEvent.click(red)
+    fireEvent.click(screen.getByRole('button', { name: /^[A-Z]blue/ }))
+
+    expect(screen.getByRole('textbox', { name: 'Note for blue' })).toHaveProperty('value', 'Keep me.')
+  })
+
+  it('keeps a batch choice note visible when the answer changes to Other', () => {
+    renderLiveBatch()
+
+    fireEvent.click(screen.getByRole('button', { name: /^[A-Z]red/ }))
+    fireEvent.click(screen.getByRole('button', { name: 'Add note for red' }))
+    fireEvent.change(screen.getByRole('textbox', { name: 'Note for red' }), { target: { value: 'Keep me.' } })
+    fireEvent.change(screen.getByPlaceholderText('Other (type your answer)'), { target: { value: 'green' } })
+
+    expect(screen.getByRole('textbox', { name: 'Note for Other (type your answer)' })).toHaveProperty(
+      'value',
+      'Keep me.'
+    )
+  })
+
+  it('preserves a replayed locked note when confirming the remaining batch answer', async () => {
+    const request = renderLiveBatch({ q0: '["red"]' }, true, { q0: 'Previously accepted note' })
+
+    expect(screen.getByRole('textbox', { name: 'Note for red' })).toHaveProperty('value', 'Previously accepted note')
+    fireEvent.change(screen.getByPlaceholderText('Type your answer…'), { target: { value: 'Release' } })
+    fireEvent.click(screen.getByRole('button', { name: /Confirm and continue/ }))
+
+    await waitFor(() => expect(request).toHaveBeenCalledTimes(2))
+    expect(request).toHaveBeenNthCalledWith(1, 'clarify.respond', {
+      answer: '["red"]',
+      note: 'Previously accepted note',
+      question_id: 'q0',
+      request_id: 'request-batch'
+    })
+  })
+
+  it('does not submit a batch note twice while confirmation is pending', async () => {
+    const request = renderLiveBatch()
+    request.mockImplementation(() => new Promise(() => {}))
+
+    fireEvent.click(screen.getByRole('button', { name: /^[A-Z]red/ }))
+    fireEvent.click(screen.getByRole('button', { name: 'Add note for red' }))
+    const note = screen.getByRole('textbox', { name: 'Note for red' })
+    fireEvent.change(note, { target: { value: 'Ready.' } })
+    fireEvent.change(screen.getByPlaceholderText('Type your answer…'), { target: { value: 'Release' } })
+    fireEvent.keyDown(note, { key: 'Enter' })
+    await waitFor(() => expect(request).toHaveBeenCalledTimes(1))
+
+    expect((note as HTMLTextAreaElement).disabled).toBe(true)
+    fireEvent.keyDown(note, { key: 'Enter' })
+    expect(request).toHaveBeenCalledTimes(1)
+  })
+
+  it('advances within its own batch card when another mounted card has the same qids', () => {
+    const request = vi.fn().mockResolvedValue({ ok: true })
+
+    const batchView = (sessionId: string): SessionView => ({
+      ...({} as SessionView),
+      $runtimeId: atom<null | string>(sessionId),
+      kind: 'tile'
+    })
+
+    $gateway.set({ request } as never)
+    setClarifyRequest({
+      choices: null,
+      multiSelect: false,
+      question: '',
+      questions: [
+        { choices: ['red', 'blue'], multiSelect: false, qid: 'q0', question: 'Background color?' },
+        { choices: null, multiSelect: false, qid: 'q1', question: 'Background name?' }
+      ],
+      requestId: 'request-background-batch',
+      sessionId: 'session-background-batch'
+    })
+    setClarifyRequest({
+      choices: null,
+      multiSelect: false,
+      question: '',
+      questions: [
+        { choices: ['red', 'blue'], multiSelect: false, qid: 'q0', question: 'Foreground color?' },
+        { choices: null, multiSelect: false, qid: 'q1', question: 'Foreground name?' }
+      ],
+      requestId: 'request-foreground-batch',
+      sessionId: 'session-foreground-batch'
+    })
+    renderClarify(
+      <>
+        <SessionViewProvider value={batchView('session-background-batch')}>
+          <ClarifyTool {...liveBatchProps()} />
+        </SessionViewProvider>
+        <SessionViewProvider value={batchView('session-foreground-batch')}>
+          <ClarifyTool {...liveBatchProps()} />
+        </SessionViewProvider>
+      </>
+    )
+
+    const drafts = screen.getAllByPlaceholderText('Other (type your answer)')
+    const nextAnswers = screen.getAllByPlaceholderText('Type your answer…')
+    fireEvent.change(drafts[1] as HTMLTextAreaElement, { target: { value: 'green' } })
+    fireEvent.keyDown(drafts[1] as HTMLTextAreaElement, { key: 'Enter' })
+
+    expect(document.activeElement).toBe(nextAnswers[1])
+  })
+
+  it('uses plain Enter to advance a batch draft without creating a newline', () => {
+    const request = renderLiveBatch()
+
+    const colorDraft = screen.getByPlaceholderText('Other (type your answer)')
+    fireEvent.change(colorDraft, { target: { value: 'green' } })
+
+    expect(fireEvent.keyDown(colorDraft, { key: 'Enter' })).toBe(false)
+    expect((colorDraft as HTMLTextAreaElement).value).toBe('green')
+    expect(document.activeElement).toBe(screen.getByPlaceholderText('Type your answer…'))
+    expect(request).not.toHaveBeenCalled()
+  })
+
+  it('cancels plain Enter in an empty batch draft without submitting or moving focus', () => {
+    const request = renderLiveBatch()
+    const colorDraft = screen.getByPlaceholderText('Other (type your answer)')
+    colorDraft.focus()
+
+    expect(fireEvent.keyDown(colorDraft, { key: 'Enter' })).toBe(false)
+    expect((colorDraft as HTMLTextAreaElement).value).toBe('')
+    expect(document.activeElement).toBe(colorDraft)
+    expect(request).not.toHaveBeenCalled()
+  })
+
+  it('does not cancel Shift+Enter so the browser can insert a newline in a batch draft', () => {
+    renderLiveBatch()
+
+    const colorDraft = screen.getByPlaceholderText('Other (type your answer)')
+    fireEvent.change(colorDraft, { target: { value: 'green' } })
+
+    expect(fireEvent.keyDown(colorDraft, { key: 'Enter', shiftKey: true })).toBe(true)
+    expect((colorDraft as HTMLTextAreaElement).value).toBe('green')
+  })
+
+  it('saves a batch note and advances to the next unanswered question on plain Enter', () => {
+    const request = renderLiveBatch()
+    fireEvent.click(screen.getByRole('button', { name: /^[A-Z]red/ }))
+    fireEvent.click(screen.getByRole('button', { name: 'Add note for red' }))
+    const note = screen.getByRole('textbox', { name: 'Note for red' })
+    fireEvent.change(note, { target: { value: 'Keep this note.' } })
+
+    expect(fireEvent.keyDown(note, { key: 'Enter' })).toBe(false)
+    expect((note as HTMLTextAreaElement).value).toBe('Keep this note.')
+    expect(document.activeElement).toBe(screen.getByPlaceholderText('Type your answer…'))
+    expect(request).not.toHaveBeenCalled()
+  })
+
+  it('leaves Shift+Enter and IME Enter in a batch note to the browser', () => {
+    const request = renderLiveBatch()
+    fireEvent.click(screen.getByRole('button', { name: /^[A-Z]red/ }))
+    fireEvent.click(screen.getByRole('button', { name: 'Add note for red' }))
+    const note = screen.getByRole('textbox', { name: 'Note for red' })
+    fireEvent.change(note, { target: { value: 'Keep this note.' } })
+
+    expect(fireEvent.keyDown(note, { key: 'Enter', shiftKey: true })).toBe(true)
+    expect(fireEvent.keyDown(note, { isComposing: true, key: 'Enter' })).toBe(true)
+    expect(request).not.toHaveBeenCalled()
+  })
+
+  it('confirms a ready batch from note Enter and includes the note once', async () => {
+    const request = renderLiveBatch()
+    fireEvent.click(screen.getByRole('button', { name: /^[A-Z]red/ }))
+    fireEvent.click(screen.getByRole('button', { name: 'Add note for red' }))
+    const note = screen.getByRole('textbox', { name: 'Note for red' })
+    fireEvent.change(note, { target: { value: 'Keep this note.' } })
+    fireEvent.change(screen.getByPlaceholderText('Type your answer…'), { target: { value: 'Release' } })
+
+    expect(fireEvent.keyDown(note, { key: 'Enter' })).toBe(false)
+    await waitFor(() => expect(request).toHaveBeenCalledTimes(2))
+    expect(request).toHaveBeenNthCalledWith(1, 'clarify.respond', {
+      answer: 'red',
+      note: 'Keep this note.',
+      question_id: 'q0',
+      request_id: 'request-batch'
+    })
+    expect(request).toHaveBeenNthCalledWith(2, 'clarify.respond', {
+      answer: 'Release',
+      question_id: 'q1',
+      request_id: 'request-batch'
+    })
+  })
+
   it('confirm sends every per-question lock in order and completes the batch', async () => {
     const request = renderLiveBatch()
 
@@ -860,6 +1206,24 @@ describe('ClarifyTool batch card', () => {
     expect(screen.getByText('red')).toBeTruthy()
     expect(screen.getByText('Name?')).toBeTruthy()
     expect(screen.getByText('Skipped')).toBeTruthy()
+  })
+
+  it('renders settled selected answers and notes as distinct fields', () => {
+    renderClarify(
+      <ClarifyTool
+        {...settledClarifyProps(
+          batchArgs(),
+          JSON.stringify({
+            responses: [{ note: 'Use the stable palette.', question: 'Color?', user_response: 'red' }]
+          }),
+          'clarify-batch-note-settled'
+        )}
+      />
+    )
+
+    expect(screen.getByText('Selected')).toBeTruthy()
+    expect(screen.getByText('Note')).toBeTruthy()
+    expect(screen.getByText('Use the stable palette.')).toBeTruthy()
   })
 })
 

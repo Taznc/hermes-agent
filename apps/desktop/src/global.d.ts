@@ -234,6 +234,10 @@ declare global {
       }
       api: <T>(request: HermesApiRequest) => Promise<T>
       notify: (payload: HermesNotification) => Promise<boolean>
+      /** Current OS/browser notification permission, when the platform exposes one
+       *  (web build only — Electron's OS notifications need no separate grant).
+       *  Absent on Electron; Settings treats a missing member as "not applicable". */
+      getNotificationPermission?: () => Promise<'granted' | 'denied' | 'default' | 'unsupported'>
       requestMicrophoneAccess: () => Promise<boolean>
       /** read_window_below tool: metadata for the OS window directly underneath this one (never pixels). */
       readWindowBelow?: () => Promise<{

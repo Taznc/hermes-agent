@@ -23,7 +23,8 @@ logger = logging.getLogger(__name__)
 # Branches never considered for deletion, in any mode.
 _PROTECTED_BRANCHES = {"main", "master", "develop", "dev", "trunk"}
 
-# Trees owned by another lifecycle (kanban dispatcher gc) — never touched.
+# Trees owned by another lifecycle (kanban dispatcher gc) — never touched, unless a caller
+# opts in with ``include_kanban=True`` because it IS that lifecycle.
 _KANBAN_RE = re.compile(r"^t_[0-9a-f]+$")
 
 # Bounded cherry probe: a branch this far ahead of upstream is a stale-base
@@ -108,10 +109,15 @@ def _archive_untracked(tree: Path, untracked: List[str]) -> Optional[Path]:
         return None
 
 
-def _classify_tree(_ops, repo_root: str, entry: Path, merge_cache, remote_heads) -> tuple[str, str, List[str]]:
-    """Return (verdict, reason, untracked) for one tree under ``.worktrees/``."""
+def _classify_tree(_ops, repo_root: str, entry: Path, merge_cache, remote_heads,
+                   *, include_kanban: bool = False) -> tuple[str, str, List[str]]:
+    """Return (verdict, reason, untracked) for one tree under ``.worktrees/``.
+
+    ``include_kanban`` only controls whether kanban task trees are EVALUATED; the verdicts
+    below are identical either way.
+    """
     path = str(entry)
-    if _KANBAN_RE.match(entry.name):
+    if not include_kanban and _KANBAN_RE.match(entry.name):
         return "keep", "kanban task tree (owned by kanban gc)", []
     if _ops._worktree_lock_is_live(repo_root, path, timeout=5) == "live":
         return "keep", "in use by a running hermes session", []
@@ -134,8 +140,14 @@ def _classify_tree(_ops, repo_root: str, entry: Path, merge_cache, remote_heads)
     return "reap", "clean and fully merged/pushed", []
 
 
-def audit_worktrees(repo_root: str, *, with_sizes: bool = True) -> List[TreeRecord]:
-    """Classify every tree under ``.worktrees/`` without mutating anything."""
+def audit_worktrees(repo_root: str, *, with_sizes: bool = True,
+                    include_kanban: bool = False) -> List[TreeRecord]:
+    """Classify every tree under ``.worktrees/`` without mutating anything.
+
+    ``include_kanban=True`` is the opt-in for the kanban dispatcher's own GC, which owns those
+    trees and needs real verdicts for them; every other caller leaves it off so ``hermes
+    worktree list/prune`` keeps deferring another lifecycle's trees.
+    """
     from hermes_cli import worktree_ops as _ops
     worktrees_dir = Path(repo_root) / ".worktrees"
     if not worktrees_dir.exists():
@@ -162,7 +174,8 @@ def audit_worktrees(repo_root: str, *, with_sizes: bool = True) -> List[TreeReco
             branch = _git(["branch", "--show-current"], cwd=str(entry), timeout=5).stdout.strip()
         except Exception:
             branch = ""
-        verdict, reason, untracked = _classify_tree(_ops, repo_root, entry, merge_cache, remote_heads)
+        verdict, reason, untracked = _classify_tree(_ops, repo_root, entry, merge_cache, remote_heads,
+                                                    include_kanban=include_kanban)
         records.append(TreeRecord(
             name=entry.name, path=str(entry), branch=branch,
             age_days=age_days, size_mb=_tree_size_mb(entry) if with_sizes else None,

@@ -7,6 +7,7 @@ Owns everything the fork adds to the gateway method table:
 
 - chunked desktop file-attach staging (``hermes_fork.attachments.staging``)
 - the sanitized account-limits RPC (``hermes_fork.account_limits.gateway_method``)
+- the profile-scoped model-recommendation RPC (``hermes_fork.model_recommendation.gateway_method``)
 - the backend-side Projects repo scan (``projects.scan_repos`` below)
 - the fork methods' ``_LONG_HANDLERS`` entries (worker-pool routing)
 """
@@ -17,6 +18,7 @@ from tui_gateway.method_ctx import HandlerRegistry, bind_module
 
 from hermes_fork.account_limits import gateway_method as _account_limits_method
 from hermes_fork.attachments import staging as _attachment_staging
+from hermes_fork.model_recommendation import gateway_method as _model_recommendation_method
 
 _registry = HandlerRegistry()
 method = _registry.method
@@ -59,8 +61,9 @@ def _(rid, params: dict) -> dict:
 
 
 # projects.scan_repos walks this backend's own disk (bounded, but thousands of stat calls on a
-# cold FS); account_limits.get makes synchronous provider HTTP requests — never on the WS reader.
-_FORK_LONG_HANDLERS = frozenset({"projects.scan_repos", "account_limits.get"})
+# cold FS); account_limits.get makes synchronous provider HTTP requests; model_recommendation.get
+# also makes one bounded direct provider request — never run any of them on the WS reader.
+_FORK_LONG_HANDLERS = frozenset({"projects.scan_repos", "account_limits.get", "model_recommendation.get"})
 
 
 def register_fork_gateway_methods(server) -> None:
@@ -68,5 +71,8 @@ def register_fork_gateway_methods(server) -> None:
     methods onto the RPC worker pool."""
     _attachment_staging.register(server)
     _account_limits_method.register(server)
+    _model_recommendation_method.register(server)
+    from hermes_fork.model_recommendation import settings as recommendation_settings
+    recommendation_settings.register(server)
     bind_module(globals(), server, skip=("_", "register_fork_gateway_methods"))
     server._LONG_HANDLERS = server._LONG_HANDLERS | _FORK_LONG_HANDLERS

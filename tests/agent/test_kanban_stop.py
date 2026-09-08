@@ -157,9 +157,10 @@ def test_no_nudge_after_review_lane_handoff(clear_kanban_env, verb):
 # ── Integration: agent nudge + dispatcher bounded retry ──────────────
 # These tests verify the two layers compose correctly: the agent-side
 # nudge fires first (up to 2 attempts), and if the worker still exits
-# without a terminal call, the dispatcher's bounded retry (streak of 3)
-# handles it.  See also tests/hermes_cli/test_kanban_core_functionality.py
-# for the dispatcher-side streak tests.
+# without a terminal call, the worker/CLI boundary parks it immediately: one
+# no-evidence recovery is allowed, while handoff evidence or the next clean
+# exit is blocked. See tests/hermes_cli/test_kanban_core_functionality.py for
+# the boundary and dispatcher-side streak tests.
 
 
 
