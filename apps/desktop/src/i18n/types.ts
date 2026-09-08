@@ -3059,6 +3059,7 @@ export interface UpstreamTranslations {
       gatewayDisconnected: string
       sendFailed: string
       loadingQuestion: string
+      restoring: string
       other: string
       placeholder: string
       skip: string
@@ -3067,6 +3068,7 @@ export interface UpstreamTranslations {
       confirmAndContinueLabel: string
       answeredBadge: string
       questionProgress: (answered: number, total: number) => string
+      questionGroup: (total: number) => string
       lateAnswer: (question: string, choice: string) => string
       lateAnswerTip: string
       lateAnswerHint: string
