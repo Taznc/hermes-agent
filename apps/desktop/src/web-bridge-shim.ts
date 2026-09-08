@@ -1038,6 +1038,13 @@ const shim = {
   glassSupported: false,
   translucencySupported: false,
 
+  // Build-identity signal — see ForkDesktopApi.isWebBuild's doc comment
+  // (fork/desktop-api.d.ts). Distinguishes "this build has no mcpOauth
+  // because it's the web shim" from "this is an OLD Electron preload that
+  // predates the mcpOauth member" — the two need opposite fallback behavior
+  // in completeMcpDesktopOAuth (lib/mcp-dashboard-oauth.ts).
+  isWebBuild: true,
+
   // ── theme marketplace (search only; install stays omitted, see above) ────
   themes: {
     searchMarketplace: searchMarketplaceThemes

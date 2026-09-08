@@ -150,6 +150,11 @@ function OAuthPicker({
   const p = t.settings.providers
   const [showAll, setShowAll] = useState(false)
   const ordered = useMemo(() => sortProviders(providers), [providers])
+  // Reactive, not $localModelsEnabled.get() — see the comment on the same
+  // pattern in app/settings/index.tsx: on web this atom starts false and is
+  // corrected asynchronously, so a mounted picker must re-render on the
+  // correction, not freeze the value it saw at mount.
+  const localModelsEnabled = useStore($localModelsEnabled)
 
   if (ordered.length === 0) {
     return null
@@ -187,7 +192,7 @@ function OAuthPicker({
       {featured && <FeaturedProviderRow onSelect={select} provider={featured} />}
       {/* Slot #2 — the no-account path, matching onboarding. Behind the
           --local launch flag like every local-models surface. */}
-      {$localModelsEnabled.get() && <LocalModelsProviderRow onClick={onWantLocalModels} />}
+      {localModelsEnabled && <LocalModelsProviderRow onClick={onWantLocalModels} />}
       {connected.length > 0 && (
         <>
           <GroupLabel>{p.connected}</GroupLabel>
@@ -352,6 +357,8 @@ export function ProvidersSettings({
 }: ProvidersSettingsProps) {
   const { t } = useI18n()
   const scopeProfile = useStore($settingsRequestProfile)
+  // Reactive re-render on the async web correction (see index.tsx comment).
+  const localModelsEnabled = useStore($localModelsEnabled)
   const { rowProps, vars } = useEnvCredentials(scopeProfile)
   const [oauthProviders, setOauthProviders] = useState<OAuthProvider[]>([])
   const [openProvider, setOpenProvider] = useState<null | string>(null)
@@ -524,7 +531,7 @@ export function ProvidersSettings({
     // Strict --local gate: without the launch flag the pane doesn't render
     // even when local models are configured — a stale ?pview=local deep link
     // (or an old shortcut) lands on the accounts view instead.
-    return $localModelsEnabled.get() ? <LocalModelsSettings /> : null
+    return localModelsEnabled ? <LocalModelsSettings /> : null
   }
 
   return (

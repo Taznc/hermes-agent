@@ -74,6 +74,13 @@ const SETTINGS_VIEWS: readonly SettingsViewId[] = [
 
 export function SettingsView({ onClose, onConfigSaved, onMainModelChanged }: SettingsPageProps) {
   const scopeProfile = useStore($settingsScopeProfile)
+  // Reactive, not $localModelsEnabled.get(): on web this atom starts false
+  // and is corrected asynchronously once GET /api/local-models/status
+  // resolves (web-bridge-shim.ts correctLocalModelsEnabledFlag). A .get()
+  // read here would freeze whatever value existed when this component last
+  // rendered, so a Settings surface already mounted when the correction
+  // lands would never reveal the nav entry until some unrelated re-render.
+  const localModelsEnabled = useStore($localModelsEnabled)
   const { t } = useI18n()
   const navigate = useNavigate()
   const { hash, pathname, search } = useLocation()
@@ -226,7 +233,7 @@ export function SettingsView({ onClose, onConfigSaved, onMainModelChanged }: Set
           // nav entry (the pane itself also refuses to render, so a stale
           // ?pview=local deep link falls back to accounts-shaped emptiness
           // rather than a hidden feature).
-          ...($localModelsEnabled.get()
+          ...(localModelsEnabled
             ? [
                 {
                   active: activeView === 'providers' && providerView === 'local',
@@ -304,7 +311,7 @@ export function SettingsView({ onClose, onConfigSaved, onMainModelChanged }: Set
         onSelect: () => setActiveView('about')
       }
     ],
-    [activeView, keysView, providerView, t, setActiveView, openProviderView, openKeysView]
+    [activeView, keysView, providerView, t, setActiveView, openProviderView, openKeysView, localModelsEnabled]
   )
 
   // Type-to-search: printable keystrokes on the Settings surface (outside any

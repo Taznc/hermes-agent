@@ -3,19 +3,22 @@
  * of completeMcpDesktopOAuth() in mcp-dashboard-oauth.ts (t_d40923b6).
  *
  * On web, window.hermesDesktop.mcpOauth is always undefined (the shim omits
- * it — a browser tab cannot host a loopback HTTP listener). Before this
- * fix, completeMcpDesktopOAuth threw "Update Hermes Desktop to support MCP
- * OAuth callbacks" unconditionally whenever bridge was absent and the scope
- * was not literally connectionId:'local' — which is exactly what mcp-setup.tsx
- * always passes on web (connectionId resolves to null there, never 'local').
- * These tests drive that exact call shape and expect a browser-native REST
- * flow (POST .../auth, GET .../oauth/flows/{id}, DELETE on cleanup) instead.
+ * it — a browser tab cannot host a loopback HTTP listener) and
+ * window.hermesDesktop.isWebBuild is always true (the shim's explicit
+ * build-identity flag — see fork/desktop-api.d.ts). completeMcpDesktopOAuth
+ * must take the browser-native REST/popup path (POST .../auth, GET
+ * .../oauth/flows/{id}, DELETE on cleanup) whenever isWebBuild is true,
+ * regardless of connectionId — the pre-fix code inferred "web" purely from
+ * an absent bridge + a non-'local' connectionId, which is exactly the shape
+ * mcp-setup.tsx always passes (connectionId resolves to null there, never
+ * 'local'), but ALSO exactly the shape a bridge-absent REMOTE Electron
+ * connection has — see the second describe block below for that regression.
  */
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
 import { setApiRequestConnection, setApiRequestProfile } from '@/api/client'
 
-import { completeMcpDesktopOAuth, McpOAuthCancelled } from './mcp-dashboard-oauth'
+import { completeMcpDesktopOAuth, McpOAuthCancelled, openMcpOAuthPopup } from './mcp-dashboard-oauth'
 
 const approvedFlow = {
   flow_id: 'flow-1',
@@ -26,6 +29,8 @@ const approvedFlow = {
   tools: [{ name: 'list_reports', description: 'List reports' }]
 }
 
+const originQuery = `client_public_origin=${encodeURIComponent(window.location.origin)}`
+
 function harness() {
   const api = vi.fn()
   const openMock = vi.fn()
@@ -34,10 +39,11 @@ function harness() {
   openMock.mockReturnValue(fakeWindow)
   vi.stubGlobal('open', openMock)
 
-  // No mcpOauth namespace at all — the web shim's actual shape.
+  // No mcpOauth namespace at all — the web shim's actual shape. isWebBuild:
+  // true is the explicit build-identity flag the shim always sets.
   Object.defineProperty(window, 'hermesDesktop', {
     configurable: true,
-    value: { api, openExternal: vi.fn() }
+    value: { api, openExternal: vi.fn(), isWebBuild: true }
   })
 
   return { api, openMock, fakeWindow }
@@ -51,7 +57,7 @@ afterEach(() => {
   Reflect.deleteProperty(window, 'hermesDesktop')
 })
 
-describe('completeMcpDesktopOAuth: browser fallback (no mcpOauth bridge)', () => {
+describe('completeMcpDesktopOAuth: browser fallback (isWebBuild, no mcpOauth bridge)', () => {
   beforeEach(() => {
     setApiRequestConnection(null)
     setApiRequestProfile('origin-profile')
@@ -61,7 +67,9 @@ describe('completeMcpDesktopOAuth: browser fallback (no mcpOauth bridge)', () =>
     const { api, openMock, fakeWindow } = harness()
 
     api.mockImplementation(async request => {
-      if (request.method === 'POST' && request.path.endsWith('/auth')) {
+      if (request.method === 'POST' && request.path.startsWith('/api/mcp/servers/reports/auth')) {
+        expect(request.path).toContain(originQuery)
+
         return { ...approvedFlow, status: 'authorization_required' }
       }
 
@@ -86,11 +94,57 @@ describe('completeMcpDesktopOAuth: browser fallback (no mcpOauth bridge)', () =>
     expect(fakeWindow.opener).toBeNull()
 
     expect(api).toHaveBeenCalledWith(
-      expect.objectContaining({ path: '/api/mcp/servers/reports/auth', method: 'POST', profile: 'origin-profile' })
+      expect.objectContaining({
+        path: expect.stringContaining('/api/mcp/servers/reports/auth?client_public_origin='),
+        method: 'POST',
+        profile: 'origin-profile'
+      })
     )
     expect(api).toHaveBeenCalledWith(
       expect.objectContaining({ path: '/api/mcp/oauth/flows/flow-1', profile: 'origin-profile' })
     )
+  })
+
+  it('reuses a caller-supplied popupWindow (pre-opened at the real click boundary) instead of opening its own', async () => {
+    const { api, openMock } = harness()
+    const preOpened = { location: { href: '' }, closed: false, opener: 'preexisting', close: vi.fn() }
+
+    api.mockImplementation(async request => {
+      if (request.method === 'POST') {
+        return { ...approvedFlow, status: 'authorization_required' }
+      }
+
+      return approvedFlow
+    })
+
+    const result = await completeMcpDesktopOAuth({
+      serverName: 'reports',
+      profile: { connectionId: null, profile: 'origin-profile' },
+      sleep: async () => {},
+      popupWindow: preOpened as unknown as Window
+    })
+
+    expect(result).toMatchObject({ status: 'approved' })
+    // No new window.open call — the caller's popup was reused as-is (opener
+    // is only nulled by openMcpOAuthPopup itself, not by the completer).
+    expect(openMock).not.toHaveBeenCalled()
+    expect(preOpened.location.href).toBe(approvedFlow.authorization_url)
+    expect(preOpened.close).toHaveBeenCalled()
+  })
+
+  it('a null popupWindow (caller already tried and was blocked) throws immediately with no network call', async () => {
+    const { api, openMock } = harness()
+
+    await expect(
+      completeMcpDesktopOAuth({
+        serverName: 'reports',
+        profile: { connectionId: null, profile: 'origin-profile' },
+        popupWindow: null
+      })
+    ).rejects.toThrow(/popup/i)
+
+    expect(openMock).not.toHaveBeenCalled()
+    expect(api).not.toHaveBeenCalled()
   })
 
   it('throws when the popup is blocked, without calling the start route', async () => {
@@ -197,6 +251,31 @@ describe('completeMcpDesktopOAuth: browser fallback (no mcpOauth bridge)', () =>
   })
 })
 
+describe('openMcpOAuthPopup', () => {
+  it('opens about:blank and nulls opener', () => {
+    const fakeWindow = { opener: 'preexisting' as unknown }
+    const openMock = vi.fn().mockReturnValue(fakeWindow)
+    vi.stubGlobal('open', openMock)
+
+    const result = openMcpOAuthPopup()
+
+    expect(openMock).toHaveBeenCalledWith('about:blank', '_blank')
+    expect(result).toBe(fakeWindow)
+    expect(fakeWindow.opener).toBeNull()
+    vi.unstubAllGlobals()
+  })
+
+  it('returns null when the popup is blocked, without throwing', () => {
+    vi.stubGlobal(
+      'open',
+      vi.fn(() => null)
+    )
+
+    expect(openMcpOAuthPopup()).toBeNull()
+    vi.unstubAllGlobals()
+  })
+})
+
 describe('completeMcpDesktopOAuth: bridge-present (Electron) behavior is untouched', () => {
   it('still takes the native-listener path when mcpOauth bridge exists, even off "local"', async () => {
     // Guards against an over-broad fix: when the Electron bridge IS present,
@@ -227,5 +306,80 @@ describe('completeMcpDesktopOAuth: bridge-present (Electron) behavior is untouch
 
     expect(listen).toHaveBeenCalled()
     expect(api).not.toHaveBeenCalled()
+    Reflect.deleteProperty(window, 'hermesDesktop')
+  })
+})
+
+describe('completeMcpDesktopOAuth: bridge-absent, Electron (NOT web) compat paths are unchanged', () => {
+  // Both of these simulate an OLD Electron preload build that predates the
+  // mcpOauth bridge member — isWebBuild is undefined (real Electron preload
+  // never sets it), matching every actual Electron build ever shipped,
+  // including this one. Neither must take the REST/popup fallback: a
+  // browser tab's window.open()/navigate trick cannot complete inside
+  // Electron's renderer the way it can in an actual browser tab, and these
+  // are exactly the two legacy shapes the pre-fix code already handled
+  // correctly by inferring "not web" from connectionId === 'local' alone —
+  // this proves the isWebBuild-based rewrite preserves both outcomes.
+  const bridgeAbsentElectron = () => {
+    const api = vi.fn(async () => {
+      throw new Error('REST fallback must not be used on a bridge-absent Electron build')
+    })
+
+    const openMock = vi.fn(() => {
+      throw new Error('window.open must not be called on a bridge-absent Electron build')
+    })
+
+    vi.stubGlobal('open', openMock)
+    Object.defineProperty(window, 'hermesDesktop', {
+      configurable: true,
+      // No mcpOauth, no isWebBuild — the exact shape of an old Electron
+      // preload build. openExternal exists because every Electron preload
+      // (old or new) defines it.
+      value: { api, openExternal: vi.fn() }
+    })
+
+    return { api, openMock }
+  }
+
+  afterEach(() => {
+    vi.unstubAllGlobals()
+    Reflect.deleteProperty(window, 'hermesDesktop')
+  })
+
+  it('bridge-absent + explicit connectionId "local" throws the compat-upgrade message (pre-existing behavior)', async () => {
+    const { api, openMock } = bridgeAbsentElectron()
+
+    await expect(
+      completeMcpDesktopOAuth({ serverName: 'reports', profile: { connectionId: 'local', profile: 'p' } })
+    ).rejects.toThrow('Update Hermes Desktop to support MCP OAuth callbacks.')
+
+    expect(api).not.toHaveBeenCalled()
+    expect(openMock).not.toHaveBeenCalled()
+  })
+
+  it('bridge-absent + a REMOTE connectionId also throws the compat-upgrade message, not a browser popup fallback', async () => {
+    // This is the exact regression: the pre-fix rewrite inferred "web" from
+    // bridge-absent + non-'local', which misclassifies THIS shape (an old
+    // Electron build talking to a remote gateway) as the web build and sent
+    // it down the REST/popup path, which cannot work inside Electron.
+    const { api, openMock } = bridgeAbsentElectron()
+
+    await expect(
+      completeMcpDesktopOAuth({ serverName: 'reports', profile: { connectionId: 'remote-gateway', profile: 'p' } })
+    ).rejects.toThrow('Update Hermes Desktop to support MCP OAuth callbacks.')
+
+    expect(api).not.toHaveBeenCalled()
+    expect(openMock).not.toHaveBeenCalled()
+  })
+
+  it('bridge-absent + no connectionId at all also throws the compat-upgrade message', async () => {
+    const { api, openMock } = bridgeAbsentElectron()
+
+    await expect(
+      completeMcpDesktopOAuth({ serverName: 'reports', profile: { profile: 'p' } })
+    ).rejects.toThrow('Update Hermes Desktop to support MCP OAuth callbacks.')
+
+    expect(api).not.toHaveBeenCalled()
+    expect(openMock).not.toHaveBeenCalled()
   })
 })
