@@ -116,6 +116,20 @@ export function RunErrorLine({ error, k }: { error: string; k: KanbanText }) {
 export function RunRow({ k, run }: { k: KanbanText; run: KanbanRun }) {
   const outcome = run.outcome ?? run.status
   const tone = outcomeTone(outcome)
+  const modelParts = [run.model, run.provider, run.reasoning_effort].filter((value): value is string => value != null)
+
+  const tokenParts = [
+    run.input_tokens != null ? `in ${run.input_tokens.toLocaleString()}` : null,
+    run.output_tokens != null ? `out ${run.output_tokens.toLocaleString()}` : null,
+    run.cache_read_tokens != null ? `cache ${run.cache_read_tokens.toLocaleString()}` : null,
+    run.reasoning_tokens != null ? `reasoning ${run.reasoning_tokens.toLocaleString()}` : null
+  ].filter((value): value is string => value != null)
+
+  const usageParts = [
+    run.api_calls != null ? `API ${run.api_calls.toLocaleString()}` : null,
+    run.tool_calls != null ? `tools ${run.tool_calls.toLocaleString()}` : null,
+    run.estimated_cost_usd != null ? `estimated cost: $${run.estimated_cost_usd.toFixed(4)}` : null
+  ].filter((value): value is string => value != null)
 
   return (
     <AccentRow className="flex flex-col gap-0.5 py-1 text-[0.71rem]" tone={tone}>
@@ -132,6 +146,15 @@ export function RunRow({ k, run }: { k: KanbanText; run: KanbanRun }) {
         )}
         <span className="ml-auto shrink-0 text-(--ui-text-quaternary)">{ago(run.ended_at ?? run.started_at)}</span>
       </div>
+      {modelParts.length > 0 && (
+        <p className="text-(--ui-text-quaternary)">model: {modelParts.join(' · ')}</p>
+      )}
+      {tokenParts.length > 0 && (
+        <p className="text-(--ui-text-quaternary)">tokens: {tokenParts.join(' · ')}</p>
+      )}
+      {usageParts.length > 0 && (
+        <p className="text-(--ui-text-quaternary)">calls: {usageParts.join(' · ')}</p>
+      )}
       {run.error ? (
         <RunErrorLine error={run.error} k={k} />
       ) : (

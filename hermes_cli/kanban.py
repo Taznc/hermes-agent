@@ -515,6 +515,42 @@ def _print_section(title: str, lines) -> None:
         print(line)
 
 
+def _run_analytics_lines(run: kb.Run) -> list[str]:
+    """Compact human-readable launch and usage details, omitting NULL fields."""
+    lines: list[str] = []
+    identity = [
+        value
+        for value in (run.model, run.provider, run.reasoning_effort)
+        if value is not None
+    ]
+    if identity:
+        lines.append("model: " + " · ".join(identity))
+
+    token_parts = [
+        f"{label} {int(value):,}"
+        for label, value in (
+            ("in", run.input_tokens),
+            ("out", run.output_tokens),
+            ("cache", run.cache_read_tokens),
+            ("reasoning", run.reasoning_tokens),
+        )
+        if value is not None
+    ]
+    if token_parts:
+        lines.append("tokens: " + " · ".join(token_parts))
+
+    call_parts = [
+        f"{label} {int(value):,}"
+        for label, value in (("API", run.api_calls), ("tools", run.tool_calls))
+        if value is not None
+    ]
+    if call_parts:
+        lines.append("calls: " + " · ".join(call_parts))
+    if run.estimated_cost_usd is not None:
+        lines.append(f"estimated cost: ${run.estimated_cost_usd:.4f}")
+    return lines
+
+
 def _cmd_show(args: argparse.Namespace) -> int:
     rsk, rc = _run_state_kwargs(args, "show")
     if rc:
@@ -620,6 +656,8 @@ def _cmd_show(args: argparse.Namespace) -> int:
             el = f"{elapsed}s" if elapsed is not None else "active"
             outcome = r.outcome or r.status or "active"
             print(f"  #{r.id:<3} {outcome:<12} @{r.profile or '-'}  {el}  {_fmt_ts(r.started_at)}")
+            for analytics_line in _run_analytics_lines(r):
+                print(f"        {analytics_line}")
             if r.summary:
                 print(f"        → {r.summary.splitlines()[0][:160]}")
             if r.error:
@@ -1308,6 +1346,8 @@ def _cmd_runs(args: argparse.Namespace) -> int:
         el = f"{elapsed}s" if elapsed < 60 else f"{elapsed // 60}m" if elapsed < 3600 else f"{elapsed / 3600:.1f}h"
         outcome = r.outcome or ("(running)" if not r.ended_at else r.status)
         print(f"{i:3d}  {outcome:12s}  {(r.profile or '-'):16s}  {el:>8s}  {_fmt_ts(r.started_at)}")
+        for analytics_line in _run_analytics_lines(r):
+            print(f"     {analytics_line}")
         if r.summary:
             print(f"     → {r.summary.splitlines()[0][:100]}")
         if r.error:
