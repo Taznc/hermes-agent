@@ -40,6 +40,15 @@ DEFAULT_FAILURE_LIMIT = 2
 # 0 = unlimited (legacy, pre-cap behavior).
 DEFAULT_MAX_REVIEW_ROUNDS = 3
 
+# High-priority slot reservation (kanban.priority_reserved_slots /
+# kanban.priority_reserved_threshold). 0 slots = the feature is OFF and dispatch is
+# byte-identical to the pre-reservation behaviour, which is the shipped default:
+# this changes scheduling on a live fleet, so the operator opts in.
+DEFAULT_PRIORITY_RESERVED_SLOTS = 0
+# 1 = High and above on the documented tier scale (critical=2, high=1, normal=0,
+# low=-1). Negative thresholds are legitimate (reserve for everything above Low).
+DEFAULT_PRIORITY_RESERVED_THRESHOLD = 1
+
 
 def effective_failure_limit(task_max_retries: Optional[Any], failure_limit: int) -> tuple:
     """Circuit-breaker threshold precedence: a task's own ``max_retries`` wins over the
@@ -216,6 +225,26 @@ class DispatchResult:
     """``(task_id, assignee, current_running_count)`` deferred because the
     assignee is at ``kanban.max_in_progress_per_profile``. Picked up on a later
     tick; separate bucket so dashboards show "profile busy" vs "stuck"."""
+    priority_slots_reserved: int = 0
+    """READY-lane slots held for ``priority >= kanban.priority_reserved_threshold``
+    this tick: ``min(kanban.priority_reserved_slots, ready_budget, ready demand)``.
+    0 when the feature is off (the default) or when no qualifying READY card wanted
+    a slot — in the latter case the budget went to normal work in this same tick.
+    Describes the READY reservation ONLY: capacity the review-lane reservation
+    already protects is not counted here."""
+    priority_slots_unused: int = 0
+    """Of ``priority_slots_reserved``, how many no high-priority READY card actually
+    spawned into. Nonzero means the reservation is intentionally holding capacity for
+    READY demand that exists but is not yet eligible (per-profile cap, co-edit
+    serialization, respawn guard) — the operator-approved cost of the reservation,
+    reported rather than hidden. Review spawns never decrement it: their slot came
+    from the review reservation, not this one."""
+    deferred_priority_reserved: list[str] = field(default_factory=list)
+    """Below-threshold ready task ids the reservation held back this tick. Without
+    this a ``--dry-run`` shows a normal card simply absent from ``spawned`` with no
+    stated reason; mirrors ``skipped_per_profile_capped`` / ``serialized_coedit``.
+    NOT operator-actionable and NOT a failure: the card dispatches on a later tick,
+    or in this one if the high-priority demand clears."""
     skill_preflight_blocked: list[tuple[str, str]] = field(default_factory=list)
     """``(task_id, reason)`` for cards whose forced skills the assignee profile
     cannot load. A configuration error, not a worker failure: caught BEFORE the
@@ -2172,6 +2201,12 @@ class DispatchCaps:
     # concrete int (0 = unlimited) — unlike the Optional caps above, "not configured" and
     # "explicitly disabled" both resolve to a number the dispatcher can compare directly.
     max_review_rounds: int = DEFAULT_MAX_REVIEW_ROUNDS
+    # High-priority slot reservation. Like max_review_rounds these are always concrete
+    # ints, because 0 slots is a real operator choice (the feature OFF) rather than
+    # "unbounded": a None here would read as "no limit on the reservation", the opposite
+    # of what an absent setting means.
+    priority_reserved_slots: int = DEFAULT_PRIORITY_RESERVED_SLOTS
+    priority_reserved_threshold: int = DEFAULT_PRIORITY_RESERVED_THRESHOLD
 
 
 def resolve_dispatch_caps(kanban_cfg: Optional[dict] = None) -> DispatchCaps:
@@ -2224,6 +2259,13 @@ def resolve_dispatch_caps(kanban_cfg: Optional[dict] = None) -> DispatchCaps:
         ).strip() or None,
         max_review_rounds=_nonnegative_int(
             kanban_cfg.get("max_review_rounds"), DEFAULT_MAX_REVIEW_ROUNDS,
+        ),
+        priority_reserved_slots=_nonnegative_int(
+            kanban_cfg.get("priority_reserved_slots"), DEFAULT_PRIORITY_RESERVED_SLOTS,
+        ),
+        priority_reserved_threshold=_any_int(
+            kanban_cfg.get("priority_reserved_threshold"),
+            DEFAULT_PRIORITY_RESERVED_THRESHOLD,
         ),
     )
 
@@ -2813,6 +2855,8 @@ def dispatch_once(
     dispatch_start_window_seconds: int = 600,
     review_rework_escalation_profile: Optional[str] = None,
     max_review_rounds: Optional[int] = None,
+    priority_reserved_slots: Optional[int] = None,
+    priority_reserved_threshold: Optional[int] = None,
     reconcile_orphans: bool = True,
 ) -> DispatchResult:
     """Run one dispatcher tick under the board's single-writer lock.
@@ -2841,6 +2885,8 @@ def dispatch_once(
             dispatch_start_window_seconds=dispatch_start_window_seconds,
             review_rework_escalation_profile=review_rework_escalation_profile,
             max_review_rounds=max_review_rounds,
+            priority_reserved_slots=priority_reserved_slots,
+            priority_reserved_threshold=priority_reserved_threshold,
             reconcile_orphans=reconcile_orphans,
         )
 
@@ -3586,12 +3632,55 @@ def _tick_spawn_budget(
 
 
 def _lane_rows(conn: sqlite3.Connection, status: str) -> list[sqlite3.Row]:
-    """Unclaimed rows of one lane in dispatch order."""
+    """Unclaimed rows of one lane in dispatch order.
+
+    ``priority`` is selected as well as sorted on: the high-priority slot
+    reservation has to classify each row against
+    ``kanban.priority_reserved_threshold`` as the loop walks it.
+    """
     return conn.execute(
-        "SELECT id, assignee, tenant FROM tasks "
+        "SELECT id, assignee, tenant, priority FROM tasks "
         f"WHERE status = '{status}' AND claim_lock IS NULL "
         "ORDER BY priority DESC, created_at ASC"
     ).fetchall()
+
+
+def _high_priority_demand(ready_rows: list[sqlite3.Row], threshold: int) -> int:
+    """How many READY cards actually WANT a reserved slot on this board this tick.
+
+    Counts rows at or above *threshold* that are plausibly spawnable — an
+    assignee that names a real Hermes profile, using the same ``profile_exists``
+    gate (and the same trust-the-operator fallback when ``profiles`` is
+    unimportable) as :func:`_any_spawnable_review`. An unassigned card, or one
+    on a control-plane lane that a terminal pulls via ``claim_task``, must never
+    hold a worker slot hostage: nothing would ever spawn into it.
+
+    READY ONLY, deliberately. The review lane already has its own reservation
+    (:func:`_any_spawnable_review` holds one slot back out of ``spawn_budget``
+    regardless of priority), which is sufficient for review work. Counting a
+    high-priority review row here would reserve a SECOND slot for a card already
+    protected, and — because review spawns draw on the full shared budget — the
+    net effect was to strand one slot: a Critical review card plus a normal ready
+    backlog spawned one worker total where the reviewed behaviour spawns two.
+
+    This count is what makes "reserved slots no high-priority card is waiting for
+    fall through to normal work in the same tick" implementable. The ready lane is
+    sorted ``priority DESC``, so by the time the loop reaches a below-threshold
+    row no high-priority row is left *later in the list* — testing the list would
+    make the reservation vacuous at every setting. Demand, not list position, is
+    the thing a normal card can be held back for.
+    """
+    profile_exists = _profile_exists_fn()
+
+    def _wants_slot(row: sqlite3.Row) -> bool:
+        if (row["priority"] or 0) < threshold:
+            return False
+        assignee = row["assignee"]
+        if not assignee:
+            return False
+        return profile_exists(assignee) if profile_exists is not None else True
+
+    return sum(1 for row in ready_rows if _wants_slot(row))
 
 
 def _any_spawnable_review(review_rows: list[sqlite3.Row]) -> bool:
@@ -3668,6 +3757,8 @@ def _dispatch_once_locked(
     dispatch_start_window_seconds: int = 600,
     review_rework_escalation_profile: Optional[str] = None,
     max_review_rounds: Optional[int] = None,
+    priority_reserved_slots: Optional[int] = None,
+    priority_reserved_threshold: Optional[int] = None,
     reconcile_orphans: bool = True,
 ) -> DispatchResult:
     """One dispatcher tick: reclaim stale/crashed running tasks, promote
@@ -3680,9 +3771,24 @@ def _dispatch_once_locked(
     passes) resolves from live config via :func:`resolve_dispatch_caps` so
     the round cap applies fleet-wide without every caller threading it
     explicitly; pass a concrete int (0 = unlimited) to override.
+
+    ``priority_reserved_slots`` / ``priority_reserved_threshold``: same
+    ``None`` -> live-config resolution, for the same reason. 0 slots (the
+    shipped default) leaves dispatch byte-identical to the pre-reservation
+    behaviour.
     """
-    if max_review_rounds is None:
-        max_review_rounds = resolve_dispatch_caps().max_review_rounds
+    if (
+        max_review_rounds is None
+        or priority_reserved_slots is None
+        or priority_reserved_threshold is None
+    ):
+        _caps = resolve_dispatch_caps()
+        if max_review_rounds is None:
+            max_review_rounds = _caps.max_review_rounds
+        if priority_reserved_slots is None:
+            priority_reserved_slots = _caps.priority_reserved_slots
+        if priority_reserved_threshold is None:
+            priority_reserved_threshold = _caps.priority_reserved_threshold
     result = DispatchResult()
     # Sweep abandoned pre-task pasted-image uploads; best-effort — never abort the tick.
     try:
@@ -3796,6 +3902,36 @@ def _dispatch_once_locked(
     ready_budget = spawn_budget
     if spawn_budget is not None and spawn_budget > 0 and _any_spawnable_review(review_rows):
         ready_budget = max(spawn_budget - 1, 0)
+    # High-priority slot reservation (kanban.priority_reserved_slots). Layered on TOP
+    # of the review reservation above and every other gate: it can only ever narrow
+    # what BELOW-threshold rows may take out of `ready_budget`, never widen anything.
+    # A high-priority card gets earlier access to a slot, never a slot the host cap,
+    # per-profile cap, start budget or memory clamp did not already grant.
+    #
+    # READY-LANE ONLY. `ready_budget` above already had the review lane's slot carved
+    # out of it, and that reservation is sufficient for review work; reserving a second
+    # slot for a high-priority REVIEW row double-counts one card and strands capacity.
+    #
+    # `effective_reserved` is min(configured, ready_budget, ready demand):
+    #   - clamped to ready_budget so a reservation larger than the tick's budget
+    #     cannot drive the normal allowance negative (it would just stall the board);
+    #   - clamped to demand so slots no qualifying READY card is waiting for fall
+    #     through to normal work in THIS tick rather than idling.
+    # An uncapped tick (ready_budget None = no host/board cap at all) reserves
+    # nothing: there is no scarcity to arbitrate, and every row spawns regardless.
+    reserved_slots = max(int(priority_reserved_slots or 0), 0)
+    priority_threshold = int(priority_reserved_threshold or 0)
+    effective_reserved = 0
+    if reserved_slots and ready_budget is not None and ready_budget > 0:
+        effective_reserved = min(
+            reserved_slots,
+            ready_budget,
+            _high_priority_demand(ready_rows, priority_threshold),
+        )
+    result.priority_slots_reserved = effective_reserved
+    # Below-threshold rows share this narrower allowance; at-or-above-threshold rows
+    # spawn against the full ready_budget.
+    normal_budget = ready_budget - effective_reserved if ready_budget is not None else None
     # Per-profile cap. Deferred tasks go to skipped_per_profile_capped, not
     # skipped_unassigned — "busy, retry later" differs from "needs routing".
     per_profile_cap = max_in_progress_per_profile if (
@@ -3829,9 +3965,25 @@ def _dispatch_once_locked(
         review_rework_escalation_profile
     )
     spawned = 0
+    high_priority_spawned = 0
+    normal_spawned = 0
     for row in ready_rows:
         if ready_budget is not None and spawned >= ready_budget:
             break
+        is_high_priority = (row["priority"] or 0) >= priority_threshold
+        if (
+            effective_reserved
+            and not is_high_priority
+            and normal_budget is not None
+            and normal_spawned >= normal_budget
+        ):
+            # The reservation binds: normal work has consumed its allowance and the
+            # rest of the budget is held for high-priority demand. Recorded rather
+            # than silently absent so `--dry-run` states WHY this card did not go.
+            # Not a break: nothing below this row in priority-DESC order can be
+            # high-priority, but continuing keeps the bucket complete for the operator.
+            result.deferred_priority_reserved.append(row["id"])
+            continue
         row_assignee = row["assignee"]
         if not row_assignee:
             # Honour kanban.default_assignee so an unassigned task doesn't
@@ -3879,8 +4031,17 @@ def _dispatch_once_locked(
                 row_assignee = rework_escalation_profile
         if _dispatch_lane_task(conn, row, row_assignee, result, lane="ready", **lane_kwargs):
             spawned += 1
+            if is_high_priority:
+                high_priority_spawned += 1
+            else:
+                normal_spawned += 1
         if result.dispatch_paused is not None:
+            result.priority_slots_unused = max(
+                effective_reserved - high_priority_spawned, 0
+            )
             return result
+
+    result.priority_slots_unused = max(effective_reserved - high_priority_spawned, 0)
 
     # A review agent (sdlc-review) approves (→ done) or requests changes
     # (→ ready/todo). Review spawns share max_spawn with ready tasks. The loop
@@ -3918,6 +4079,11 @@ def _dispatch_once_locked(
                 row_assignee = default_reviewer
         if _dispatch_lane_task(conn, row, row_assignee, result, lane="review", **lane_kwargs):
             spawned += 1
+            # NOT counted against the priority reservation. `priority_slots_reserved`
+            # / `priority_slots_unused` describe the READY-lane reservation only, and
+            # a review row's own slot came from the review reservation above — folding
+            # a review spawn in here would report a held ready slot as "used" while it
+            # actually sat idle.
         if result.dispatch_paused is not None:
             return result
 
@@ -3959,6 +4125,26 @@ def _nonnegative_int(value: Any, default: int) -> int:
     except (TypeError, ValueError):
         return default
     return parsed if parsed >= 0 else default
+
+
+def _any_int(value: Any, default: int) -> int:
+    """Parse an int config value that is meaningful at ANY sign; invalid/unset -> *default*.
+
+    Distinct from :func:`_nonnegative_int` because a negative value is legitimate here:
+    ``kanban.priority_reserved_threshold: -1`` means "reserve for Low and above" on the
+    documented tier scale, which is a coherent operator choice, not an out-of-range
+    number to be silently replaced by the default.
+    """
+    if value is None:
+        return default
+    if isinstance(value, bool):
+        # bool is an int subclass; `priority_reserved_threshold: true` is a config typo,
+        # not a request to reserve for priority >= 1.
+        return default
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return default
 
 
 def _positive_int_or_none(value: Any) -> Optional[int]:
@@ -4958,6 +5144,8 @@ def run_daemon(
                     dispatch_start_window_seconds=caps.dispatch_start_window_seconds,
                     review_rework_escalation_profile=caps.review_rework_escalation_profile,
                     max_review_rounds=caps.max_review_rounds,
+                    priority_reserved_slots=caps.priority_reserved_slots,
+                    priority_reserved_threshold=caps.priority_reserved_threshold,
                     failure_limit=failure_limit,
                 )
             if on_tick is not None:
