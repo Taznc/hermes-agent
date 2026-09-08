@@ -35,6 +35,12 @@ const ZIP64_U32 = 0xffffffff
 /** Per-entry inflated-size ceiling. Color theme JSON is tens of KB. */
 export const MAX_ENTRY_BYTES = 8 * 1024 * 1024
 
+/**
+ * Shared prefix for every older-browser capability failure, so `install.ts`
+ * surfaces one recognizable sentence however the platform falls short.
+ */
+const UNSUPPORTED_BROWSER = 'This browser cannot unpack Marketplace themes '
+
 export interface VsixThemeFile {
   contents: string
   label: string
@@ -105,13 +111,34 @@ export function readCentralDirectory(buffer: Uint8Array): Map<string, ZipEntry> 
   return records
 }
 
-/** Inflate raw-deflate bytes with the platform's own decompressor. */
-async function inflateRaw(data: Uint8Array): Promise<Uint8Array> {
+/**
+ * Build the platform decompressor, or throw the browser-capability error.
+ *
+ * Two distinct ways an older browser fails here, and both must land on the
+ * same clear message rather than a raw TypeError: the constructor can be
+ * missing outright, OR it can exist while rejecting the newer `deflate-raw`
+ * format (a Chrome 80-103 / Firefox 113-pre shape — `DecompressionStream`
+ * shipped with gzip+deflate before deflate-raw was added). Only CONSTRUCTION
+ * is guarded: a failure once bytes are flowing is a corrupt archive, not a
+ * capability gap, and must keep its own error.
+ */
+function createDeflateRawDecompressor(): TransformStream<BufferSource, Uint8Array> {
   const Decompressor = globalThis.DecompressionStream
 
   if (typeof Decompressor !== 'function') {
-    throw new Error('This browser cannot unpack Marketplace themes (DecompressionStream is unavailable).')
+    throw new Error(`${UNSUPPORTED_BROWSER}(DecompressionStream is unavailable).`)
   }
+
+  try {
+    return new Decompressor('deflate-raw')
+  } catch (cause) {
+    throw new Error(`${UNSUPPORTED_BROWSER}(DecompressionStream does not support 'deflate-raw').`, { cause })
+  }
+}
+
+/** Inflate raw-deflate bytes with the platform's own decompressor. */
+async function inflateRaw(data: Uint8Array): Promise<Uint8Array> {
+  const decompressor = createDeflateRawDecompressor()
 
   // Built from a ReadableStream rather than Blob.stream()/Response so the
   // path is identical in the browser and in the jsdom test environment.
@@ -125,7 +152,7 @@ async function inflateRaw(data: Uint8Array): Promise<Uint8Array> {
     }
   })
 
-  const reader = source.pipeThrough(new Decompressor('deflate-raw')).getReader()
+  const reader = source.pipeThrough(decompressor).getReader()
   const chunks: Uint8Array[] = []
   let total = 0
 

@@ -14,6 +14,8 @@ import { describe, expect, it, vi } from 'vitest'
 import { extractVsixThemes, MAX_ENTRY_BYTES, readCentralDirectory } from './vsix-archive'
 
 interface FixtureEntry {
+  /** Replace the deflate payload with bytes that are not valid deflate. */
+  corruptDeflate?: boolean
   /** Force `stored` (method 0) instead of deflate. */
   stored?: boolean
   name: string
@@ -35,7 +37,8 @@ function buildZip(entries: FixtureEntry[], options: { entryCount?: number } = {}
     const name = encoder.encode(entry.name)
     const raw = encoder.encode(entry.text)
     const method = entry.stored ? 0 : 8
-    const payload = entry.stored ? raw : new Uint8Array(zlib.deflateRawSync(Buffer.from(raw)))
+    const deflated = entry.stored ? raw : new Uint8Array(zlib.deflateRawSync(Buffer.from(raw)))
+    const payload = entry.corruptDeflate ? deflated.map(byte => byte ^ 0xff) : deflated
 
     const local = new Uint8Array(30 + name.length + payload.length)
     const localView = new DataView(local.buffer)
@@ -214,6 +217,46 @@ describe('extractVsixThemes', () => {
     } finally {
       globalThis.DecompressionStream = original
     }
+  })
+
+  it('surfaces the same clear error when DecompressionStream exists but rejects deflate-raw', async () => {
+    // The real shape of a mid-vintage browser: DecompressionStream shipped
+    // with gzip/deflate before 'deflate-raw' existed, so the constructor is
+    // present and throws a raw TypeError on the format we need. Feature-
+    // detecting the global alone leaks that TypeError to the user.
+    const original = globalThis.DecompressionStream
+
+    globalThis.DecompressionStream = class {
+      constructor(format: string) {
+        if (format === 'deflate-raw') {
+          throw new TypeError(`Unsupported compression format: ${format}`)
+        }
+
+        return new original(format as CompressionFormat)
+      }
+    } as unknown as typeof DecompressionStream
+
+    try {
+      await expect(extractVsixThemes(themeVsix())).rejects.toThrow(/this browser cannot unpack marketplace themes/i)
+      await expect(extractVsixThemes(themeVsix())).rejects.not.toThrow(/unsupported compression format/i)
+    } finally {
+      globalThis.DecompressionStream = original
+    }
+  })
+
+  it('keeps a real decompression failure distinct from the browser-capability error', async () => {
+    // Corrupt deflate bytes with the constructor working normally: this is a
+    // bad archive, not an old browser, and must not be relabelled as one.
+    const zip = buildZip([
+      {
+        name: 'extension/package.json',
+        text: manifest([{ label: 'Dracula', path: './themes/dracula.json', uiTheme: 'vs-dark' }])
+      },
+      { corruptDeflate: true, name: 'extension/themes/dracula.json', text: DARK_THEME }
+    ])
+
+    await expect(extractVsixThemes(zip)).rejects.toThrow()
+    await expect(extractVsixThemes(zip)).rejects.not.toThrow(/this browser cannot unpack marketplace themes/i)
   })
 
   it('never executes archive content — only package.json and the paths it names are read', async () => {
