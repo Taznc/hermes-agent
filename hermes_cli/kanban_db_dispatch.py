@@ -902,12 +902,11 @@ def _error_fingerprint(error_text: str) -> str:
     return fp.lower().strip()
 
 
-# ~96% of "clean exit without a terminal tool call" tasks complete on a later
-# run, so a protocol violation gets a bounded retry before the breaker trips.
-# The budget is a violation-only STREAK (``_protocol_violation_streak``),
-# independent of ``consecutive_failures``: other failure kinds neither consume
-# nor extend it. Per-task ``max_retries`` overrides it.
-_PROTOCOL_VIOLATION_FAILURE_LIMIT = 3
+# A clean exit gets exactly one recovery run: the next worker sees the durable
+# prior-run error and can report work that already completed. A second identical
+# clean exit is a reporting gap, not evidence that a third full execution is
+# worthwhile, so the dispatcher force-blocks it for an explicit decision.
+_PROTOCOL_VIOLATION_FAILURE_LIMIT = 2
 
 # Closed runs to walk when counting the streak; it trips at a handful anyway.
 _PROTOCOL_VIOLATION_SCAN_LIMIT = 50
@@ -945,11 +944,157 @@ def _protocol_violation_streak(conn: sqlite3.Connection, task_id: str) -> int:
     return streak
 
 
+# A comment cannot complete a task, but an assignee-authored same-attempt handoff
+# should stop a blind rerun. Require both an explicit completion claim and a
+# concrete deliverable/review signal; a bare "done" or a comment from another
+# actor remains insufficient evidence and receives the single recovery attempt.
+_COMPLETION_HANDOFF_RE = re.compile(
+    r"\b(?:implementation|work|task)\s+(?:is\s+)?complete(?:d)?\b|"
+    r"\bready\s+(?:for|to)\s+review\b|\btests?\s+passed\b",
+    re.IGNORECASE,
+)
+_COMPLETION_DELIVERABLE_RE = re.compile(
+    r"\bcommit\s+[0-9a-f]{7,40}\b|\bdiff\b|\b(?:pull request|pr)\b|"
+    r"\b(?:focused\s+|regression\s+)?tests?\s+passed\b",
+    re.IGNORECASE,
+)
+
+
+def _same_attempt_completion_handoff(
+    conn: sqlite3.Connection, task_id: str, *, assignee: Optional[str], started_at: Optional[int],
+) -> bool:
+    """Whether this worker left credible durable handoff evidence after it began."""
+    if not assignee or started_at is None:
+        return False
+    rows = conn.execute(
+        "SELECT body FROM task_comments WHERE task_id = ? AND author = ? AND created_at >= ? "
+        "ORDER BY id DESC",
+        (task_id, assignee, int(started_at)),
+    ).fetchall()
+    return any(
+        _COMPLETION_HANDOFF_RE.search(row["body"] or "")
+        and _COMPLETION_DELIVERABLE_RE.search(row["body"] or "")
+        for row in rows
+    )
+
+
+def finalize_clean_worker_exit_without_report(
+    conn: sqlite3.Connection, task_id: str, *, expected_run_id: int,
+) -> Optional[str]:
+    """Detect an rc=0 Kanban worker missing its lifecycle call before it exits.
+
+    Returns ``"recovery"`` for the one allowed no-evidence retry, ``"evidence"``
+    when an assignee handoff is parked for verification, ``"blocked"`` after the
+    bounded clean-exit streak, or ``None`` if a terminal lifecycle write already
+    won the race / this process no longer owns the run.
+    """
+    with _kb.write_txn(conn):
+        row = conn.execute(
+            "SELECT t.status, t.current_run_id, t.assignee, t.max_retries, t.consecutive_failures, "
+            "t.block_kind, t.block_recurrences, r.started_at "
+            "FROM tasks t LEFT JOIN task_runs r ON r.id = t.current_run_id "
+            "WHERE t.id = ?",
+            (task_id,),
+        ).fetchone()
+        if (
+            row is None
+            or row["status"] != "running"
+            or row["current_run_id"] is None
+            or int(row["current_run_id"]) != int(expected_run_id)
+        ):
+            return None
+
+        evidence = _same_attempt_completion_handoff(
+            conn, task_id, assignee=row["assignee"], started_at=row["started_at"],
+        )
+        prior_streak = _protocol_violation_streak(conn, task_id)
+        task_override = _kb._row_get(row, "max_retries")
+        violation_limit, limit_source = effective_failure_limit(
+            task_override, _PROTOCOL_VIOLATION_FAILURE_LIMIT,
+        )
+        streak = prior_streak + 1
+        recovery_reason = (
+            "verify/recover prior work: worker exited cleanly without a terminal Kanban call, "
+            "but its same-attempt comment contains a completion handoff. Verify the prior work and "
+            "report it via kanban_complete, kanban_request_review, or kanban_block; do not rerun it blindly."
+        )
+        error_text = recovery_reason if evidence else _PROTOCOL_VIOLATION_ERROR
+        forced_block = not evidence and streak >= violation_limit
+        run_outcome = "blocked" if evidence else "crashed"
+        run_id = _kb._end_run(
+            conn, task_id, outcome=run_outcome, status=run_outcome, error=error_text,
+            metadata={
+                "protocol_violation": True,
+                "detected_at": "worker_exit_boundary",
+                "completion_handoff_evidence": evidence,
+            },
+        )
+        _kb._append_event(
+            conn, task_id, "protocol_violation",
+            {
+                "error": error_text,
+                "protocol_violation": True,
+                "detected_at": "worker_exit_boundary",
+                "completion_handoff_evidence": evidence,
+            },
+            run_id=run_id,
+        )
+
+        if evidence:
+            new_status, event_kind, set_sql, params, payload = _kb._route_block(
+                "needs_input", recovery_reason, "ready",
+                prev_kind=_kb._row_get(row, "block_kind"),
+                prev_recurrences=int(_kb._row_get(row, "block_recurrences") or 0),
+            )
+            conn.execute(
+                "UPDATE tasks SET status = ?, claim_lock = NULL, claim_expires = NULL, "
+                "worker_pid = NULL, worker_unit = NULL, last_failure_error = ?, "
+                + set_sql + " WHERE id = ? AND status = 'running' AND current_run_id IS NULL",
+                (new_status, error_text[:500], *params, task_id),
+            )
+            _kb._append_event(conn, task_id, event_kind, payload, run_id=run_id)
+            return "evidence"
+
+        if forced_block:
+            failures = int(row["consecutive_failures"] or 0) + 1
+            conn.execute(
+                "UPDATE tasks SET status = 'blocked', claim_lock = NULL, claim_expires = NULL, "
+                "worker_pid = NULL, worker_unit = NULL, consecutive_failures = ?, last_failure_error = ? "
+                "WHERE id = ? AND status = 'running' AND current_run_id IS NULL",
+                (failures, error_text[:500], task_id),
+            )
+            _kb._append_event(
+                conn, task_id, "gave_up",
+                {
+                    "failures": failures,
+                    "effective_limit": violation_limit,
+                    "limit_source": limit_source,
+                    "error": error_text,
+                    "trigger_outcome": "crashed",
+                    "retry_status": "ready",
+                    "force_trip": True,
+                    "protocol_violations": streak,
+                    "protocol_violation_limit": violation_limit,
+                    "detected_at": "worker_exit_boundary",
+                },
+                run_id=run_id,
+            )
+            return "blocked"
+
+        conn.execute(
+            "UPDATE tasks SET status = 'ready', claim_lock = NULL, claim_expires = NULL, "
+            "worker_pid = NULL, worker_unit = NULL, last_failure_error = ? "
+            "WHERE id = ? AND status = 'running' AND current_run_id IS NULL",
+            (error_text[:500], task_id),
+        )
+        return "recovery"
+
+
 _PROTOCOL_VIOLATION_ERROR = (
-    # Worker subprocess returned 0 but its task is still ``running`` in the DB — it exited without calling
-    # ``kanban_complete`` / ``kanban_block``. Overwhelmingly the work itself succeeded and only the
-    # paperwork was skipped, so a retry usually completes; the corrective sentence below is surfaced to the
-    # retry worker via the prior-attempt error in ``build_worker_context`` (guidance approach from #61817).
+    # Fallback reaper diagnosis: a worker subprocess exited 0 while its task is
+    # still ``running``. The worker/CLI boundary normally records this earlier,
+    # after the stop guard's bounded nudges; this remains for older workers and
+    # transient boundary-write failures.
     "worker exited cleanly (rc=0) without calling "
     "kanban_complete or kanban_block — protocol violation. "
     "If the prior run already did the work, verify it and "
