@@ -13,7 +13,7 @@ import {
 import { $gateway } from '@/store/gateway'
 import { setMcpSetupRequest } from '@/store/mcp-setup'
 import { dispatchNativeNotification } from '@/store/native-notifications'
-import { receiveApprovalRequest, setSecretRequest, setSudoRequest } from '@/store/prompts'
+import { hasBlockingPromptRequest, receiveApprovalRequest, setSecretRequest, setSudoRequest } from '@/store/prompts'
 import { requestScrollToBottom } from '@/store/thread-scroll'
 
 import type { GatewayEventContext } from './types'
@@ -202,7 +202,10 @@ export function handleInputRequestEvent(ctx: GatewayEventContext): boolean {
       return {
         ...state,
         messages: projection.messages,
-        needsInput: false,
+        // This clarify is gone, but the session may still be parked on an
+        // approval/sudo/secret prompt raised by the same turn — the sidebar
+        // indicator has to stay lit for it.
+        needsInput: hasBlockingPromptRequest(sessionId),
         streamId: state.busy ? (projection.streamId ?? state.streamId) : null
       }
     })
