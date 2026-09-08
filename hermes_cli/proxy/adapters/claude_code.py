@@ -46,6 +46,10 @@ class ClaudeCodeAdapter(UpstreamAdapter):
         return _ALLOWED_PATHS
 
     @property
+    def wire_protocol(self) -> str:
+        return "anthropic-messages"
+
+    @property
     def transforms_openai_chat(self) -> bool:
         return True
 

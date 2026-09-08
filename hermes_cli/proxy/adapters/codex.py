@@ -57,6 +57,10 @@ class OpenAICodexAdapter(UpstreamAdapter):
         return True
 
     @property
+    def wire_protocol(self) -> str:
+        return "openai-responses"
+
+    @property
     def materializes_responses_stream(self) -> bool:
         return True
 

@@ -17,7 +17,7 @@ import ipaddress
 import json
 import logging
 import signal
-from typing import Optional
+from typing import Optional, Sequence, cast
 
 try:
     import aiohttp
@@ -560,7 +560,7 @@ def create_app(
 
 
 async def run_server(
-    adapter: UpstreamAdapter,
+    adapter: "UpstreamAdapter | Sequence[UpstreamAdapter]",
     host: str = DEFAULT_HOST,
     port: int = DEFAULT_PORT,
     shutdown_event: Optional[asyncio.Event] = None,
@@ -569,6 +569,9 @@ async def run_server(
 ) -> None:
     """Run the proxy in the current event loop until shutdown_event is set.
 
+    ``adapter`` is one adapter (single-provider pass-through, unchanged) or an
+    ordered sequence of two or more (the failover gateway).
+
     If shutdown_event is None, runs until cancelled (Ctrl+C or SIGTERM).
     """
     if not AIOHTTP_AVAILABLE:
@@ -576,12 +579,25 @@ async def run_server(
             "aiohttp is required for `hermes proxy`. Run `hermes setup` to install it."
         )
 
-    if adapter.loopback_only and not is_loopback_host(host):
-        raise RuntimeError(
-            f"{adapter.display_name} proxy is loopback-only; refusing bind host {host!r}."
-        )
+    adapters: list[UpstreamAdapter] = (
+        list(adapter)
+        if isinstance(adapter, (list, tuple))
+        else [cast(UpstreamAdapter, adapter)]
+    )
+    for entry in adapters:
+        if entry.loopback_only and not is_loopback_host(host):
+            raise RuntimeError(
+                f"{entry.display_name} proxy is loopback-only; refusing bind host {host!r}."
+            )
 
-    app = create_app(adapter, client_auth_token=client_auth_token)
+    if len(adapters) > 1:
+        from hermes_cli.proxy.gateway import create_failover_app
+
+        app = create_failover_app(adapters, client_auth_token=client_auth_token)
+        described = " -> ".join(entry.display_name for entry in adapters)
+    else:
+        app = create_app(adapters[0], client_auth_token=client_auth_token)
+        described = adapters[0].display_name
     runner = web.AppRunner(app, access_log=None)
     await runner.setup()
     site = web.TCPSite(runner, host=host, port=port)
@@ -591,7 +607,7 @@ async def run_server(
         "proxy: listening on http://%s:%d/v1 -> %s",
         host,
         port,
-        adapter.display_name,
+        described,
     )
 
     stop_event = shutdown_event or asyncio.Event()

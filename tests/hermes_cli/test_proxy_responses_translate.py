@@ -10,6 +10,7 @@ from __future__ import annotations
 import json
 
 from hermes_cli.proxy.responses_translate import (
+    ResponsesStreamTranslator,
     chat_chunk_to_responses_events,
     chat_request_to_responses,
     chat_response_to_responses,
@@ -342,3 +343,97 @@ def test_chat_stream_chunks_translate_to_responses_sse_events():
     assert len(completed) == 1
     assert completed[0]["response"]["status"] == "completed"
     assert completed[0]["response"]["output"][0]["content"][0]["text"] == "hello"
+
+
+# --------------------------------------------------------------------------
+# Streaming: backend Responses SSE -> canonical chat chunks
+# --------------------------------------------------------------------------
+
+
+def _responses_sse(event_type: str, payload: dict) -> bytes:
+    body = dict(payload)
+    body["type"] = event_type
+    return b"data: " + json.dumps(body, separators=(",", ":")).encode() + b"\n"
+
+
+def test_responses_sse_text_deltas_become_chat_content_chunks():
+    translator = ResponsesStreamTranslator("gpt-5")
+    chunks: list[dict] = []
+    for line in [
+        _responses_sse("response.created", {"response": {"id": "resp_1"}}),
+        _responses_sse("response.output_text.delta", {"delta": "he"}),
+        _responses_sse("response.output_text.delta", {"delta": "llo"}),
+        _responses_sse("response.completed", {"response": {"status": "completed"}}),
+    ]:
+        chunks.extend(translator.translate(line))
+
+    assert "".join(
+        chunk["choices"][0]["delta"].get("content", "") for chunk in chunks
+    ) == "hello"
+    assert all(chunk["object"] == "chat.completion.chunk" for chunk in chunks)
+    assert chunks[-1]["choices"][0]["finish_reason"] == "stop"
+
+
+def test_responses_sse_function_call_items_become_chat_tool_call_chunks():
+    translator = ResponsesStreamTranslator("gpt-5")
+    chunks: list[dict] = []
+    for line in [
+        _responses_sse("response.output_item.added", {
+            "output_index": 0,
+            "item": {"type": "function_call", "call_id": "call_a", "name": "lookup"},
+        }),
+        _responses_sse("response.function_call_arguments.delta", {
+            "output_index": 0,
+            "delta": '{"q":',
+        }),
+        _responses_sse("response.function_call_arguments.delta", {
+            "output_index": 0,
+            "delta": '"x"}',
+        }),
+        _responses_sse("response.completed", {"response": {"status": "completed"}}),
+    ]:
+        chunks.extend(translator.translate(line))
+
+    opening = chunks[0]["choices"][0]["delta"]["tool_calls"][0]
+    assert opening["index"] == 0
+    assert opening["id"] == "call_a"
+    assert opening["function"]["name"] == "lookup"
+
+    arguments = "".join(
+        call["function"].get("arguments", "")
+        for chunk in chunks
+        for call in chunk["choices"][0]["delta"].get("tool_calls", [])
+    )
+    assert arguments == '{"q":"x"}'
+    assert chunks[-1]["choices"][0]["finish_reason"] == "tool_calls"
+
+
+def test_responses_sse_ignores_unparseable_and_non_data_lines():
+    translator = ResponsesStreamTranslator("gpt-5")
+    assert list(translator.translate(b"event: response.created\n")) == []
+    assert list(translator.translate(b"data: not-json\n")) == []
+    assert list(translator.translate(b"\n")) == []
+
+
+def test_responses_sse_emits_exactly_one_terminal_chunk():
+    translator = ResponsesStreamTranslator("gpt-5")
+    chunks: list[dict] = []
+    for line in [
+        _responses_sse("response.output_text.delta", {"delta": "x"}),
+        _responses_sse("response.completed", {"response": {"status": "completed"}}),
+        _responses_sse("response.completed", {"response": {"status": "completed"}}),
+    ]:
+        chunks.extend(translator.translate(line))
+    terminal = [c for c in chunks if c["choices"][0]["finish_reason"] is not None]
+    assert len(terminal) == 1
+
+
+def test_responses_sse_incomplete_status_maps_to_length_finish_reason():
+    translator = ResponsesStreamTranslator("gpt-5")
+    chunks: list[dict] = []
+    for line in [
+        _responses_sse("response.output_text.delta", {"delta": "x"}),
+        _responses_sse("response.incomplete", {"response": {"status": "incomplete"}}),
+    ]:
+        chunks.extend(translator.translate(line))
+    assert chunks[-1]["choices"][0]["finish_reason"] == "length"

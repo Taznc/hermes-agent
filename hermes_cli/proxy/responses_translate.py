@@ -535,7 +535,104 @@ def chat_chunk_to_responses_events(
     return frames
 
 
+class ResponsesStreamTranslator:
+    """Stateful Responses-SSE-to-Chat-chunk translator for one upstream response.
+
+    Mirrors ``claude_translate.ClaudeStreamTranslator`` so both backend legs
+    produce the same canonical ``chat.completion.chunk`` stream, which is what
+    lets one client-facing encoder serve either backend.
+    """
+
+    def __init__(self, model: str) -> None:
+        self._model = model
+        self._chunk_id = "chatcmpl_" + uuid.uuid4().hex
+        self._tool_index_by_output: Dict[Any, int] = {}
+        self._next_tool_index = 0
+        self._finished = False
+
+    def _chunk(self, delta: Dict[str, Any], finish_reason: Optional[str]) -> Dict[str, Any]:
+        return {
+            "id": self._chunk_id,
+            "object": "chat.completion.chunk",
+            "created": int(time.time()),
+            "model": self._model,
+            "choices": [{"index": 0, "delta": delta, "finish_reason": finish_reason}],
+        }
+
+    def translate(self, raw: bytes) -> Iterable[Dict[str, Any]]:
+        """Translate one upstream SSE line into zero or more chat chunks."""
+        if not raw.startswith(b"data:"):
+            return
+        payload = raw[5:].strip()
+        if not payload or payload == b"[DONE]":
+            return
+        try:
+            event = json.loads(payload)
+        except (UnicodeDecodeError, json.JSONDecodeError):
+            return
+        if not isinstance(event, dict):
+            return
+
+        event_type = event.get("type")
+
+        if event_type == "response.output_text.delta":
+            text = event.get("delta")
+            if isinstance(text, str) and text:
+                yield self._chunk({"content": text}, None)
+            return
+
+        if event_type == "response.output_item.added":
+            item = event.get("item")
+            if isinstance(item, dict) and item.get("type") == "function_call":
+                index = self._tool_index_for(event.get("output_index"))
+                yield self._chunk({
+                    "tool_calls": [{
+                        "index": index,
+                        "id": str(item.get("call_id") or item.get("id") or ""),
+                        "type": "function",
+                        "function": {
+                            "name": str(item.get("name") or ""),
+                            "arguments": "",
+                        },
+                    }]
+                }, None)
+            return
+
+        if event_type == "response.function_call_arguments.delta":
+            argument_delta = event.get("delta")
+            if isinstance(argument_delta, str) and argument_delta:
+                index = self._tool_index_for(event.get("output_index"))
+                yield self._chunk({
+                    "tool_calls": [{
+                        "index": index,
+                        "function": {"arguments": argument_delta},
+                    }]
+                }, None)
+            return
+
+        if event_type in {"response.completed", "response.incomplete", "response.failed"}:
+            if self._finished:
+                return
+            self._finished = True
+            response = event.get("response") if isinstance(event.get("response"), dict) else {}
+            if (response or {}).get("status") == "incomplete" or event_type == "response.incomplete":
+                finish_reason = "length"
+            elif self._tool_index_by_output:
+                finish_reason = "tool_calls"
+            else:
+                finish_reason = "stop"
+            yield self._chunk({}, finish_reason)
+
+    def _tool_index_for(self, output_index: Any) -> int:
+        key = output_index if output_index is not None else "_default"
+        if key not in self._tool_index_by_output:
+            self._tool_index_by_output[key] = self._next_tool_index
+            self._next_tool_index += 1
+        return self._tool_index_by_output[key]
+
+
 __all__ = [
+    "ResponsesStreamTranslator",
     "chat_chunk_to_responses_events",
     "chat_request_to_responses",
     "chat_response_to_responses",

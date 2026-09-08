@@ -160,6 +160,27 @@ def _print_aiohttp_missing() -> None:
     )
 
 
+def _resolve_backends(provider: str) -> list:
+    """Resolve an ordered ``--provider`` value into adapter instances.
+
+    ``claude-code`` is one backend; ``claude-code,openai-codex`` is an ordered
+    failover chain. A single name keeps the existing single-provider path.
+    """
+    names = [part.strip() for part in str(provider or "").split(",") if part.strip()]
+    if not names:
+        raise ValueError("No proxy upstream provider specified.")
+    adapters = [get_adapter(name) for name in names]
+    seen = set()
+    for adapter in adapters:
+        if adapter.name in seen:
+            raise ValueError(
+                f"Provider {adapter.name!r} is listed more than once; each backend "
+                "may appear only once in a failover chain."
+            )
+        seen.add(adapter.name)
+    return adapters
+
+
 def cmd_proxy_start(args: Any) -> int:
     """Run the proxy server in the foreground.
 
@@ -171,25 +192,27 @@ def cmd_proxy_start(args: Any) -> int:
 
     provider = getattr(args, "provider", None) or "nous"
     try:
-        adapter = get_adapter(provider)
+        adapters = _resolve_backends(provider)
     except ValueError as exc:
         print(f"Error: {exc}", file=sys.stderr)
         return 2
 
     host = getattr(args, "host", None) or DEFAULT_HOST
     port = getattr(args, "port", None) or DEFAULT_PORT
-    if adapter.loopback_only and not is_loopback_host(host):
-        print(
-            f"Error: {adapter.display_name} proxy is loopback-only; "
-            f"refusing bind host {host!r}.",
-            file=sys.stderr,
-        )
-        return 2
+    for adapter in adapters:
+        if adapter.loopback_only and not is_loopback_host(host):
+            print(
+                f"Error: {adapter.display_name} proxy is loopback-only; "
+                f"refusing bind host {host!r}.",
+                file=sys.stderr,
+            )
+            return 2
 
     token_file = getattr(args, "auth_token_file", None)
-    if adapter.requires_client_auth and not token_file:
+    requires_auth = [a for a in adapters if a.requires_client_auth]
+    if requires_auth and not token_file:
         print(
-            f"Error: {adapter.display_name} requires client authentication; "
+            f"Error: {requires_auth[0].display_name} requires client authentication; "
             "provide an owner-only regular file with --auth-token-file.",
             file=sys.stderr,
         )
@@ -202,13 +225,25 @@ def cmd_proxy_start(args: Any) -> int:
             print(f"Error: {exc}", file=sys.stderr)
             return 2
 
-    if not adapter.is_authenticated():
+    # In failover mode an unauthenticated backend is a degraded chain, not a
+    # fatal start: the remaining backends still serve traffic. In
+    # single-provider mode it is still fatal, since nothing else can serve.
+    authenticated = [adapter for adapter in adapters if adapter.is_authenticated()]
+    if not authenticated:
+        adapter = adapters[0]
         auth_hint = getattr(adapter, "auth_hint", f"hermes auth add {adapter.name}")
         print(
             f"Not logged into {adapter.display_name}. Run `{auth_hint}` first.",
             file=sys.stderr,
         )
         return 2
+    for adapter in adapters:
+        if adapter not in authenticated:
+            print(
+                f"Warning: not logged into {adapter.display_name}; it will be "
+                "skipped until its credentials are available.",
+                file=sys.stderr,
+            )
 
     client_auth_message = (
         "  Client auth:    required (bearer from owner-only token file)\n"
@@ -216,20 +251,33 @@ def cmd_proxy_start(args: Any) -> int:
         else "  Client auth:    any bearer accepted\n"
     )
 
-    print(
-        f"Starting Hermes proxy for {adapter.display_name}\n"
-        f"  Listening on:  http://{host}:{port}/v1\n"
-        f"  Forwarding to: (resolved per-request from your subscription)\n"
-        f"{client_auth_message}"
-        f"\n"
-        f"Press Ctrl+C to stop.",
-        file=sys.stderr,
-    )
+    if len(adapters) > 1:
+        chain = " -> ".join(adapter.display_name for adapter in adapters)
+        print(
+            f"Starting Hermes failover proxy\n"
+            f"  Listening on:  http://{host}:{port}/v1\n"
+            f"  Backends:      {chain}\n"
+            f"  Client APIs:   /v1/chat/completions, /v1/responses\n"
+            f"{client_auth_message}"
+            f"\n"
+            f"Press Ctrl+C to stop.",
+            file=sys.stderr,
+        )
+    else:
+        print(
+            f"Starting Hermes proxy for {adapters[0].display_name}\n"
+            f"  Listening on:  http://{host}:{port}/v1\n"
+            f"  Forwarding to: (resolved per-request from your subscription)\n"
+            f"{client_auth_message}"
+            f"\n"
+            f"Press Ctrl+C to stop.",
+            file=sys.stderr,
+        )
 
     try:
         asyncio.run(
             run_server(
-                adapter,
+                adapters if len(adapters) > 1 else adapters[0],
                 host=host,
                 port=port,
                 client_auth_token=client_auth_token,

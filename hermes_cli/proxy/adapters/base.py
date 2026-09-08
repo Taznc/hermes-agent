@@ -81,6 +81,16 @@ class UpstreamAdapter(ABC):
         return None
 
     @property
+    def wire_protocol(self) -> str:
+        """The API family this upstream actually speaks.
+
+        The failover gateway uses this to pick a backend leg. Values:
+        ``"openai-chat"`` (default), ``"openai-responses"``,
+        ``"anthropic-messages"``. Single-provider pass-through ignores it.
+        """
+        return "openai-chat"
+
+    @property
     def transforms_openai_chat(self) -> bool:
         """Whether ``/chat/completions`` needs a provider-specific wire bridge."""
         return False
