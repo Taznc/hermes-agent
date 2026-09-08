@@ -601,6 +601,57 @@ class TestPrefetch:
         # Should not start a thread
         assert p._prefetch_thread is None
 
+    def test_join_timeout_defaults_above_real_recall_latency(self, provider):
+        # Contract: the join budget must leave room for a real recall. A
+        # self-hosted bank reranking on CPU answers in ~11 s; the old fixed
+        # 3.0 s dropped every warmed result unless the user happened to pause.
+        assert provider._prefetch_join_timeout > 11.0
+
+    def test_join_timeout_is_configurable(self, provider_with_config):
+        p = provider_with_config(prefetch_join_timeout=25.0)
+        assert p._prefetch_join_timeout == 25.0
+
+    def test_prefetch_waits_for_the_configured_join_budget(self, provider_with_config):
+        # The configured budget must actually reach thread.join(), otherwise a
+        # slow bank can never deliver a warmed result. The thread reports alive
+        # until joined (as a real one does), then completes.
+        p = provider_with_config(prefetch_join_timeout=17.0)
+        waited = {}
+
+        class _Thread:
+            def __init__(self):
+                self._alive = True
+
+            def is_alive(self):
+                return self._alive
+
+            def join(self, timeout=None):
+                waited["timeout"] = timeout
+                self._alive = False
+
+        p._prefetch_thread = _Thread()
+        p._prefetch_result, p._prefetch_count = "- warmed", 1
+        assert "warmed" in p.prefetch("current query")
+        assert waited["timeout"] == 17.0
+
+    def test_running_prefetch_is_not_discarded(self, provider):
+        # A recall still in flight when the join expires must stay buffered for
+        # the next turn. Clearing it there loses a result that is about to land
+        # and makes the following turn miss as well.
+        class _Alive:
+            def is_alive(self):
+                return True
+
+            def join(self, timeout=None):
+                return None
+
+        provider._prefetch_thread = _Alive()
+        provider._prefetch_result, provider._prefetch_count = "- in flight", 3
+
+        assert provider.prefetch("current query") == ""      # nothing injected now
+        assert provider._prefetch_result == "- in flight"    # ...but preserved
+        assert provider._prefetch_count == 3
+
     def test_prefetch_waits_for_pending_retain_before_recall(self, provider):
         """The background prefetch must wait for queued retains to drain so the
         next turn's recall observes the just-completed turn (no retain race)."""
