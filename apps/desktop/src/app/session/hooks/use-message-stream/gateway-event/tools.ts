@@ -1,6 +1,7 @@
 import { invalidateSlashCompletions } from '@/lib/slash-completion-cache'
 import { refreshBackgroundProcesses } from '@/store/composer-status'
 import { flashPetActivity, setPetActivity } from '@/store/pet'
+import { hasBlockingPromptRequest } from '@/store/prompts'
 import { pruneDelegateFallbackSubagents, upsertSubagent } from '@/store/subagents'
 import { reportMcpToolResult } from '@/store/suggestion-providers/repair'
 import { invalidateSkillSuggestionIndex } from '@/store/suggestion-providers/skill'
@@ -87,8 +88,12 @@ export function handleToolEvent(ctx: GatewayEventContext): boolean {
       // A pending clarify blocks the turn, so the first tool.complete after
       // one is the clarify resolving — drop the "needs input" flag here so
       // the sidebar indicator clears as soon as it's answered, not only at
-      // message.complete.
-      updateSessionState(sessionId, state => (state.needsInput ? { ...state, needsInput: false } : state))
+      // message.complete. But a turn can hold several prompts at once: an
+      // unrelated background tool finishing must not clear the flag while an
+      // approval/sudo/secret bar is still on screen waiting on the user.
+      updateSessionState(sessionId, state =>
+        state.needsInput && !hasBlockingPromptRequest(sessionId) ? { ...state, needsInput: false } : state
+      )
 
       // terminal/process tool calls are the only things that spawn or reap
       // background processes — sync the composer status stack right after.
