@@ -40,6 +40,7 @@
  * parity" for the audit and the outstanding gaps.
  */
 
+import { getApiRequestProfile } from '@/api/client'
 import { markWebReloadPending, registerNativeWebReload } from '@/store/web-reload'
 
 import { type AgentOverview, createAgentOverviewReader } from '../electron/agent-overview'
@@ -397,6 +398,26 @@ const READY_BOOT = {
   timestamp: Date.now()
 }
 
+// The active API request profile, as a spreadable `api()` fragment.
+//
+// A named profile is a DIFFERENT HERMES_HOME on the same backend, so every
+// profile-scoped route below must carry it or the call silently targets the
+// serving process's own home. store/profile pushes $activeGatewayProfile into
+// api/client's request-profile state on every (connection, profile) change,
+// and this reads that same single source rather than importing the store —
+// the shim evaluates before the app's module graph, and a store import here
+// would pull the whole app in at bridge-install time.
+//
+// normalizeProfileKey turns "no profile" into the literal 'default'; the
+// backend's _is_current_profile() treats only ''/null/'current' as "my own
+// home", so 'default' is dropped here rather than sent, keeping a
+// single-profile install byte-identical to before.
+function activeProfileScope(): { profile?: string } {
+  const profile = getApiRequestProfile()
+
+  return profile && profile !== 'default' ? { profile } : {}
+}
+
 async function api<T>(request: SpikeApiRequest): Promise<T> {
   const url = new URL(request.path, BASE_URL)
 
@@ -731,8 +752,10 @@ const shim = {
   // touch the filesystem directly, so every member proxies through the
   // backend's /api/fs/* gateway REST routes, the same seam desktop-fs.ts's
   // remote-mode branch already uses for the editor/preview file surfaces.
-  desktopPluginsRoot: async () => (await api<{ path: string }>({ path: '/api/fs/desktop-plugins-root' })).path,
-  agentPluginsRoot: async () => (await api<{ path: string }>({ path: '/api/fs/agent-plugins-root' })).path,
+  desktopPluginsRoot: async () =>
+    (await api<{ path: string }>({ path: '/api/fs/desktop-plugins-root', ...activeProfileScope() })).path,
+  agentPluginsRoot: async () =>
+    (await api<{ path: string }>({ path: '/api/fs/agent-plugins-root', ...activeProfileScope() })).path,
   readDir: async (dirPath: string) =>
     api<SpikeReadDirResult>({ path: `/api/fs/list?path=${encodeURIComponent(dirPath)}` }),
   readFileText: async (filePath: string) =>
@@ -762,6 +785,9 @@ const shim = {
   //
   // 90s budget: the backend's own git clone budgets 60s, so the shim's 30s
   // default ceiling would abort a legitimate slow clone before it finished.
+  // The probe only clones to a temp dir and reads its shape — it touches no
+  // HERMES_HOME, so it is deliberately NOT profile-scoped. The install below
+  // is.
   probePluginRepo: async (payload: { identifier?: string; repo?: string }) => {
     const identifier = payload.identifier ?? payload.repo ?? ''
 
@@ -791,6 +817,13 @@ const shim = {
         path: '/api/dashboard/desktop-plugins/install',
         method: 'POST',
         body: { identifier, force: Boolean(payload.force) },
+        // The install writes into <HERMES_HOME>/desktop-plugins, and the scan
+        // that runs straight after it (discoverRuntimePlugins ->
+        // desktopPluginsRoot above) is profile-scoped too. Omitting the
+        // profile here would install into the serving process's own home
+        // while the scan looked in profiles/<name>/ — the plugin would appear
+        // to install and then never load.
+        ...activeProfileScope(),
         timeoutMs: 90_000
       })
     } catch (error) {

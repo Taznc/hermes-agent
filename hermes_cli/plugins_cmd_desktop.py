@@ -130,8 +130,42 @@ def _insecure_scheme(git_url: str) -> bool:
     return git_url.startswith(("http://", "file://"))
 
 
+def _replace_existing_target(target_dir: Path) -> None:
+    """Remove whatever occupies *target_dir*, without ever following it out of the plugins root.
+
+    ``Path.is_dir()`` follows symlinks, so a ``<desktop-plugins>/<name>`` symlink pointing at an
+    outside directory reads as an existing install; ``shutil.rmtree`` then refuses to remove a
+    symlink, and copying into it writes through to the outside directory. ``lstat`` semantics are
+    what Electron gets for free — ``fsp.rm(..., {recursive: true, force: true})`` unlinks the link
+    itself — so this reproduces them: unlink a link, recurse only into a real directory.
+
+    A removal that fails raises rather than being swallowed: continuing past it is precisely how
+    the copy ends up writing through the thing that was supposed to be gone.
+    """
+    if target_dir.is_symlink() or target_dir.is_file():
+        target_dir.unlink()
+        return
+    if target_dir.is_dir():
+        shutil.rmtree(target_dir)
+
+
 def _plugin_root(clone_root: Path, subdir: Optional[str]) -> Path:
     return _resolve_subdir_within(clone_root, subdir) if subdir else clone_root
+
+
+def _require_within(root: Path, target: Path) -> None:
+    """Refuse a target that does not resolve inside *root*.
+
+    The folder-name guard already rejects a ``..`` component, but the plugins root or its parents
+    may themselves be symlinks (a profile home relocated by the operator), so containment is a
+    question about the RESOLVED pair, not about the name. Checked both before and after the copy:
+    a directory that resolves inside beforehand can only stay inside, and re-checking afterwards
+    is what makes an ``ok: true`` a statement about where the bytes actually landed.
+    """
+    resolved_root = root.resolve()
+    resolved_target = target.resolve()
+    if resolved_target != resolved_root and resolved_root not in resolved_target.parents:
+        raise PluginOperationError(f"Refusing to install outside the desktop plugins directory: {target}")
 
 
 def probe_plugin_repo(identifier: str) -> dict[str, Any]:
@@ -194,7 +228,8 @@ def install_desktop_plugin(identifier: str, *, force: bool, desktop_plugins_root
     camelCase, matching ``DesktopPluginInstallResult`` in ``apps/desktop/src/global.d.ts``.
     The whole source subtree is copied (``.git`` included) exactly as Electron's
     ``fsp.cp(..., {recursive: true})`` does — the clone's origin has already been stripped of
-    credentials by ``_clone_plugin_repo``.
+    credentials by ``_clone_plugin_repo`` — and symlinks inside it are reproduced as symlinks
+    rather than dereferenced, matching that same call.
     """
     try:
         try:
@@ -214,10 +249,19 @@ def install_desktop_plugin(identifier: str, *, force: bool, desktop_plugins_root
 
             source_subdir = detected["desktopSourceSubdir"]
             source_dir = plugin_root if source_subdir == "." else plugin_root / source_subdir
+            if source_dir.is_symlink():
+                # copytree() scandir()s the top-level source, so a symlinked desktop/ half would
+                # be dereferenced and an outside directory's CONTENTS copied in as real files.
+                # Electron never produces this from a git clone either; fail closed rather than
+                # invent a semantics for it.
+                return {"ok": False, "error": "The desktop plugin source directory is a symlink."}
+
             target_dir = desktop_plugins_root / plugin_name
             target_entry = target_dir / _DESKTOP_ENTRY_NAME
 
-            if target_dir.is_dir() or target_entry.is_file():
+            # lexists: a symlink at the install path counts as occupied even when it dangles,
+            # and is.dir()/is_file() would follow it out of the root (see _replace_existing_target).
+            if target_dir.is_symlink() or target_dir.is_dir() or target_entry.is_file():
                 if not force:
                     return {
                         "ok": False,
@@ -226,10 +270,17 @@ def install_desktop_plugin(identifier: str, *, force: bool, desktop_plugins_root
                             "Enable force reinstall to replace it."
                         ),
                     }
-                shutil.rmtree(target_dir, ignore_errors=True)
+                _replace_existing_target(target_dir)
 
             desktop_plugins_root.mkdir(parents=True, exist_ok=True)
-            shutil.copytree(source_dir, target_dir, dirs_exist_ok=True)
+            _require_within(desktop_plugins_root, target_dir)
+            # symlinks=True is Electron's `fsp.cp(..., {recursive: true})` semantics: a symlink in
+            # the cloned repo is reproduced as a symlink, never dereferenced into a real file
+            # holding an outside path's bytes.
+            shutil.copytree(source_dir, target_dir, symlinks=True, dirs_exist_ok=True)
+            # The copy created the tree; re-check now that it resolves, so a success is never
+            # reported for bytes that landed outside the plugins root.
+            _require_within(desktop_plugins_root, target_dir)
 
         if not target_entry.is_file():
             return {"ok": False, "error": f"Install completed but {target_entry} is missing."}

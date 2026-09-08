@@ -251,3 +251,97 @@ def test_install_never_writes_outside_the_plugins_root(tmp_path: Path):
     assert result["ok"] is False
     assert sibling.read_text(encoding="utf-8") == "untouched\n"
     assert root.is_dir()
+
+
+def test_a_symlink_in_the_cloned_repo_stays_a_symlink(tmp_path: Path):
+    """Electron's ``fsp.cp(..., {recursive: true})`` preserves links; dereferencing would copy
+    an outside file's BYTES into the plugins root, turning a repo that merely names a path into
+    one that exfiltrates its contents.
+    """
+    secret = tmp_path / "outside-secret.txt"
+    secret.write_text("private\n", encoding="utf-8")
+
+    repo = _init_repo(tmp_path / "linky")
+    (repo / "plugin.js").write_text("export function activate() {}\n", encoding="utf-8")
+    (repo / "leak.txt").symlink_to(secret)
+    _commit_all(repo)
+
+    root = tmp_path / "desktop-plugins"
+    root.mkdir()
+
+    result = install_desktop_plugin(f"file://{repo}", force=False, desktop_plugins_root=root)
+
+    assert result["ok"] is True
+    installed = root / "linky" / "leak.txt"
+    assert installed.is_symlink()
+    assert not installed.exists() or installed.resolve() == secret.resolve()
+    # The decisive assertion: the outside bytes are not sitting in the plugins root as a
+    # regular file, which is what symlinks=False produced.
+    assert not (installed.is_file() and not installed.is_symlink())
+
+
+def test_a_symlinked_desktop_source_directory_is_refused(tmp_path: Path):
+    """``copytree`` walks the source's ENTRIES, so a symlinked ``desktop/`` half would have an
+    outside directory's contents copied in as real files even with ``symlinks=True``."""
+    outside = tmp_path / "outside-dir"
+    outside.mkdir()
+    (outside / "plugin.js").write_text("// outside\n", encoding="utf-8")
+    (outside / "secret.txt").write_text("private\n", encoding="utf-8")
+
+    repo = _init_repo(tmp_path / "linked-half")
+    (repo / "desktop").symlink_to(outside, target_is_directory=True)
+    _commit_all(repo)
+
+    root = tmp_path / "desktop-plugins"
+    root.mkdir()
+
+    result = install_desktop_plugin(f"file://{repo}", force=False, desktop_plugins_root=root)
+
+    assert result["ok"] is False
+    assert "symlink" in result["error"]
+    assert list(root.iterdir()) == []
+
+
+def test_force_over_a_destination_symlink_unlinks_it_instead_of_writing_through(tmp_path: Path):
+    """``is_dir()`` follows a symlink, ``rmtree`` refuses to remove one, and
+    ``ignore_errors=True`` used to hide that — so a forced install reported ``ok`` while writing
+    ``plugin.js`` into whatever directory the link pointed at.
+    """
+    outside = tmp_path / "outside-dir"
+    outside.mkdir()
+    (outside / "keep.txt").write_text("untouched\n", encoding="utf-8")
+
+    repo = _init_repo(tmp_path / "my-widget")
+    (repo / "plugin.js").write_text("export function activate() {}\n", encoding="utf-8")
+    _commit_all(repo)
+
+    root = tmp_path / "desktop-plugins"
+    root.mkdir()
+    (root / "my-widget").symlink_to(outside, target_is_directory=True)
+
+    result = install_desktop_plugin(f"file://{repo}", force=True, desktop_plugins_root=root)
+
+    assert result["ok"] is True
+    assert not (outside / "plugin.js").exists(), "the install wrote through the symlink"
+    assert (outside / "keep.txt").read_text(encoding="utf-8") == "untouched\n"
+    installed = root / "my-widget"
+    assert not installed.is_symlink()
+    assert (installed / "plugin.js").is_file()
+
+
+def test_a_destination_symlink_still_blocks_an_unforced_install(tmp_path: Path):
+    """An occupied path is occupied whether it is a directory or a link to one — including a
+    DANGLING link, which ``is_dir()``/``is_file()`` both report as absent."""
+    repo = _init_repo(tmp_path / "my-widget")
+    (repo / "plugin.js").write_text("export function activate() {}\n", encoding="utf-8")
+    _commit_all(repo)
+
+    root = tmp_path / "desktop-plugins"
+    root.mkdir()
+    (root / "my-widget").symlink_to(tmp_path / "does-not-exist", target_is_directory=True)
+
+    result = install_desktop_plugin(f"file://{repo}", force=False, desktop_plugins_root=root)
+
+    assert result["ok"] is False
+    assert "already exists" in result["error"]
+    assert (root / "my-widget").is_symlink()

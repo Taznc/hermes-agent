@@ -39,6 +39,30 @@ def client(monkeypatch, tmp_path) -> TestClient:
     return test_client
 
 
+@pytest.fixture
+def profile_client(monkeypatch, tmp_path) -> TestClient:
+    """Real ``_fs_plugin_root``, real profile resolution, over a temp hermes root.
+
+    Deliberately UNMOCKED: the mocked ``client`` above cannot see whether ``?profile=`` was
+    honored, because its stub ignores the argument. This one resolves the named profile through
+    the same ``_config_profile_scope`` -> ``get_hermes_home()`` chain
+    ``GET /api/fs/desktop-plugins-root`` uses, so install and the post-install discovery scan are
+    asserted to land on one root rather than assumed to.
+    """
+    monkeypatch.setattr(dashboard_ui, "_require_token", lambda _request: None)
+    home = tmp_path / ".hermes"
+    (home / "profiles" / "coder").mkdir(parents=True)
+    monkeypatch.setattr(Path, "home", lambda: tmp_path)
+    monkeypatch.setenv("HERMES_HOME", str(home))
+
+    app = FastAPI()
+    app.include_router(dashboard_ui.router)
+    app.include_router(files_router.router)
+    test_client = TestClient(app)
+    test_client.hermes_home = home  # type: ignore[attr-defined]
+    return test_client
+
+
 def _desktop_repo(path: Path) -> Path:
     def git(*args: str) -> None:
         subprocess.run(["git", *args], cwd=path, check=True, capture_output=True, text=True)
@@ -104,3 +128,33 @@ def test_a_rejected_identifier_is_200_with_ok_false_not_a_4xx(client, path, payl
     body = response.json()
     assert body["ok"] is False
     assert body["error"]
+
+
+def test_a_named_profile_installs_into_that_profiles_root_and_the_scan_agrees(profile_client, tmp_path):
+    """The whole point of ``?profile=``: install and discovery must name ONE directory.
+
+    Without the shim propagating the active profile, the install landed in the SERVING
+    process's home while the loader scanned ``profiles/coder/desktop-plugins`` — the plugin
+    installed successfully and then never loaded.
+    """
+    repo = _desktop_repo(tmp_path / "my-widget")
+    home = profile_client.hermes_home
+
+    installed = profile_client.post(
+        "/api/dashboard/desktop-plugins/install?profile=coder",
+        json={"identifier": f"file://{repo}", "force": False},
+    )
+
+    assert installed.status_code == 200
+    body = installed.json()
+    assert body["ok"] is True
+
+    scanned = profile_client.get("/api/fs/desktop-plugins-root?profile=coder")
+
+    assert scanned.status_code == 200
+    scan_root = Path(scanned.json()["path"])
+    assert scan_root == home / "profiles" / "coder" / "desktop-plugins"
+    assert Path(body["path"]).parent == scan_root
+    assert (scan_root / "my-widget" / "plugin.js").is_file()
+    # And it did NOT leak into the serving process's own home.
+    assert not (home / "desktop-plugins" / "my-widget").exists()
