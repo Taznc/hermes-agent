@@ -458,12 +458,17 @@ function SidebarSessionRowImpl({
           // metadata / preview lines below need the extra rows (#68119).
           !card && density !== 'compact' && 'min-h-[2.75rem]',
           !card && density === 'detailed' && 'min-h-[3.875rem]',
-          isSelected && 'bg-(--ui-row-active-background)',
+          isSelected &&
+            'bg-(--ui-row-selected-background) shadow-[inset_0_0_0_1px_var(--ui-row-selected-ring)]',
           // Open in another pane: the SAME band, just weaker. Its own mixed
           // token rather than row opacity — dimming the whole row would take
           // the title and the status dot down with it.
           openUnfocused && 'bg-(--ui-row-open-background)',
           liveTurn && 'text-foreground',
+          // Working (R3): a faint steady accent wash under the charging bar,
+          // so a lit row reads as lit even with animations paused. The
+          // selected wash above is stronger and wins when both apply.
+          !isSelected && showsRunningArc(dotState) && 'bg-(--ui-row-working-background)',
           // Opaque surface while lifted so the dragged row erases what's under
           // it (translucency let the rows below bleed through). data-glass-opaque
           // keeps that true when window glass thins the field.
@@ -503,7 +508,25 @@ function SidebarSessionRowImpl({
         style={style}
         {...rest}
       >
-        {showsRunningArc(dotState) && <span aria-hidden="true" className="arc-border arc-row" />}
+        {showsRunningArc(dotState) && (
+          <span
+            aria-hidden="true"
+            className="working-bar"
+            data-stalled={dotState === 'stalled' ? '' : undefined}
+          />
+        )}
+        {/* Attention ring (A3): the loudest sidebar treatment, reserved for
+            the states that wait on the user. Breathing amber for a blocking
+            clarify/approval; steady orange for rate-limited (a wait, not a
+            question). Renders over the selection wash — a selected waiting
+            row still breathes. */}
+        {(dotState === 'needs-input' || dotState === 'rate-limited') && (
+          <span
+            aria-hidden="true"
+            className="attention-ring"
+            data-rate-limited={dotState === 'rate-limited' ? '' : undefined}
+          />
+        )}
         <SidebarRowBody
           // Every trailing figure lives in the actions slot, which the row
           // measures — so the title needs a gap from it and nothing else. Hover

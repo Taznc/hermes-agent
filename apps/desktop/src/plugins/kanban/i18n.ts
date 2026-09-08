@@ -16,7 +16,18 @@ type KanbanMessages = {
   newTaskCommand: string
   countTip: (running: number, ready: number) => string
   col: Record<
-    'archived' | 'blocked' | 'done' | 'on_hold' | 'ready' | 'review' | 'running' | 'scheduled' | 'todo' | 'triage',
+    | 'archived'
+    | 'blocked'
+    | 'done'
+    | 'idea'
+    | 'on_hold'
+    | 'ready'
+    | 'review'
+    | 'roadmap'
+    | 'running'
+    | 'scheduled'
+    | 'todo'
+    | 'triage',
     { label: string; help: string }
   >
   locked: { review: string; running: string; scheduled: string }
@@ -187,6 +198,11 @@ type KanbanMessages = {
   guideTodo: string
   guideTriage: string
   guideBlockLoop: (reason: string) => string
+  // Confirmation when a loop-broken triage card is dragged back into the work
+  // queue — the backend refuses the bare drag (409); this explains why.
+  blockLoopConfirmTitle: string
+  blockLoopConfirmBody: (title: string, column: string) => string
+  blockLoopConfirmAction: string
   guideScheduled: string
   guideRunning: string
   guideRunningStale: string
@@ -199,6 +215,25 @@ type KanbanMessages = {
   guideBlockedAutomatic: (cause: string) => string
   guideBlockedReviewNoVerdict: string
   guideBlockedUnknown: string
+  // Wishlist lanes (idea/roadmap). Calm and non-nagging by decision: these
+  // cards are not late, not stalled, and carry no age/staleness warning.
+  guideIdea: string
+  guideRoadmap: string
+  // Roadmap lane visibility toggle + the compact pill shown while hidden.
+  roadmapHideLanes: string
+  roadmapShowLanes: string
+  roadmapPill: (count: number) => string
+  // Per-card lane actions (roadmap cards only).
+  laneRefine: string
+  laneDemote: string
+  laneSpawnTriage: string
+  laneSpawnReady: string
+  spawnReadyTitle: string
+  spawnReadyBody: string
+  spawnReadyConfirm: string
+  /** Client-side invalid-drop feedback. Mirrors the DB layer's own refusal
+   *  wording so a locally-refused move and a server 400 read the same. */
+  laneDropRefused: (from: string, to: string) => string
   // Structured multiple-choice question rendering (blocked-callout options).
   choicesGroupLabel: string
   choiceSubmitError: string
@@ -333,6 +368,34 @@ type KanbanMessages = {
   profileDescriptionsHint: string
   profileGoodAt: string
   auto: string
+  // dispatch pause / maintenance drain
+  dispatchControl: string
+  pauseDispatch: string
+  resumeDispatch: string
+  draining: (running: number) => string
+  safeToRestart: string
+  dispatchRunning: string
+  pauseBusy: string
+  resumeBusy: string
+  pauseAllBoards: string
+  resumeAllBoards: string
+  boardsPaused: (paused: number, total: number) => string
+  pauseHint: string
+  /** "After drain" action queue. */
+  queuePostDrain: string
+  cancelPostDrain: string
+  actionServiceRestart: (target: string) => string
+  actionReboot: string
+  confirmRebootPrompt: string
+  confirmReboot: string
+  cancelConfirm: string
+  postDrainArmed: (action: string, running: number, remaining: string) => string
+  postDrainArmedDrained: (action: string, remaining: string) => string
+  postDrainFiring: (action: string) => string
+  postDrainSucceeded: (action: string) => string
+  postDrainFailed: (action: string, error: string) => string
+  postDrainExpired: (action: string) => string
+  postDrainCancelled: (action: string) => string
   // native/toast notifications for terminal worker events (completion-notify)
   notify: {
     completedTitle: string
@@ -365,7 +428,9 @@ export const en: KanbanMessages = {
     on_hold: { label: 'On Hold', help: 'Shelved by a human — drag back to Ready when you want it resumed.' },
     review: { label: 'Review', help: 'A review agent is checking the work. Set by the dispatcher.' },
     done: { label: 'Done', help: 'Completed; dependent children become ready.' },
-    archived: { label: 'Archived', help: 'Hidden from the default board view.' }
+    archived: { label: 'Archived', help: 'Hidden from the default board view.' },
+    idea: { label: 'Ideas', help: 'Rough capture — nothing here runs, and nothing here is late.' },
+    roadmap: { label: 'Roadmap', help: 'Hashed out but not authorized — spawn it to start work.' }
   },
   locked: {
     review: 'Review is entered by the dispatcher when a review agent takes the card.',
@@ -463,13 +528,13 @@ export const en: KanbanMessages = {
   couldNotEstimate: 'Could not estimate',
   complexity: { S: 'Small', M: 'Medium', L: 'Large' },
   ideaTitle: 'Capture idea',
-  ideaHint: 'Jot a rough roadmap idea — it lands in ROADMAP.md’s Ideas list for later triage, not as a card.',
+  ideaHint: 'Jot a rough idea — it lands as a card in the Ideas lane, ready to refine later.',
   ideaPlaceholder: 'Rough idea…',
   ideaSave: 'Save idea',
   ideaSaving: 'Saving…',
-  ideaSaved: 'Idea saved to the roadmap',
+  ideaSaved: 'Added to Ideas',
   ideaEmpty: 'Type something before saving.',
-  ideaUnavailable: 'Roadmap unavailable — the idea was not saved.',
+  ideaUnavailable: 'Could not add the idea — nothing was saved.',
   introBody:
     'You don’t run the cards — agents do. Put a card in Ready with an assignee and an agent picks it up within a minute. No assignee, no run. Triage: an agent rewrites the idea into a proper task first. Todo: waiting on other cards. Scheduled: waiting on a timer. Running and Review: the agents’ lanes, hands off. Blocked: something needs a look — open the card for what happened and what to do. Results come back on the card.',
   introGotIt: 'Got it',
@@ -541,6 +606,12 @@ export const en: KanbanMessages = {
   guideTodo: 'Waiting on other cards to finish before this one becomes ready.',
   guideTriage: 'A fresh idea — a specifier agent will flesh it out into a proper task.',
   guideBlockLoop: reason => `Blocked and re-blocked for the same reason — routed here for a decision: ${reason}`,
+  blockLoopConfirmTitle: 'This card looped — answer it before resuming',
+  blockLoopConfirmBody: (title, column) =>
+    `“${title}” was parked here automatically after blocking twice on the same unanswered question. ` +
+    `Moving it to ${column} without answering that question will start the same loop again. ` +
+    `Answer it in a comment first, then confirm.`,
+  blockLoopConfirmAction: 'Resume anyway',
   guideScheduled: 'Waiting for its scheduled time to arrive.',
   guideRunning: 'An agent is actively working on this — nothing to do but wait.',
   guideRunningStale: 'No heartbeat for 2+ minutes — the dispatcher will reclaim it shortly. Wait, or reclaim now.',
@@ -554,6 +625,19 @@ export const en: KanbanMessages = {
   guideBlockedAutomatic: cause => `${cause} Inspect the worker log, then retry or reassign.`,
   guideBlockedReviewNoVerdict: 'The reviewer exited without a verdict. Requeue it for another review pass.',
   guideBlockedUnknown: 'Inspect the worker log, then retry or reassign it.',
+  guideIdea: 'Rough idea — refine it into a roadmap item when ready.',
+  guideRoadmap: 'Specified, not yet authorized — spawn to Triage to start work.',
+  roadmapHideLanes: 'Hide Ideas and Roadmap',
+  roadmapShowLanes: 'Show Ideas and Roadmap',
+  roadmapPill: count => `Roadmap · ${count}`,
+  laneRefine: 'Refine to Roadmap',
+  laneDemote: 'Demote to Ideas',
+  laneSpawnTriage: 'Spawn to Triage',
+  laneSpawnReady: 'Spawn to Ready…',
+  spawnReadyTitle: 'Spawn straight to Ready?',
+  spawnReadyBody: 'Skip auto-decompose and dispatch as-is?',
+  spawnReadyConfirm: 'Spawn to Ready',
+  laneDropRefused: (from, to) => `Can’t move a card from ${from} to ${to}.`,
   choicesGroupLabel: 'Choose an option',
   choiceSubmitError: 'Could not submit your answer. Try again.',
   choiceRetry: 'Retry',
@@ -671,6 +755,34 @@ export const en: KanbanMessages = {
     'Descriptions guide the decomposer’s routing. Auto-generate with the auxiliary model, or write your own.',
   profileGoodAt: 'What is this profile good at?',
   auto: 'Auto',
+  dispatchControl: 'Dispatch',
+  pauseDispatch: 'Pause dispatch',
+  resumeDispatch: 'Resume dispatch',
+  draining: running => `${running} running — draining`,
+  safeToRestart: '0 running — safe to restart',
+  dispatchRunning: 'Dispatching normally',
+  pauseBusy: 'A dispatch tick is in progress — try pausing again in a moment.',
+  resumeBusy: 'A dispatch tick is in progress — try resuming again in a moment.',
+  pauseAllBoards: 'Pause all boards',
+  resumeAllBoards: 'Resume all boards',
+  boardsPaused: (paused, total) => `${paused} of ${total} boards paused`,
+  pauseHint:
+    'Stops new workers being claimed and spawned. Workers already running are never killed — wait for the count to reach 0 before restarting the gateway.',
+  queuePostDrain: 'After drain…',
+  cancelPostDrain: 'Cancel',
+  actionServiceRestart: target => `Restart ${target}`,
+  actionReboot: 'Reboot this machine',
+  confirmRebootPrompt: 'Reboot this machine once every worker has finished?',
+  confirmReboot: 'Yes, reboot after drain',
+  cancelConfirm: 'Keep waiting',
+  postDrainArmed: (action, running, remaining) =>
+    `${action} when drained — ${running} running, expires in ${remaining}`,
+  postDrainArmedDrained: (action, remaining) => `${action} — drained, firing shortly (expires in ${remaining})`,
+  postDrainFiring: action => `${action} — running now`,
+  postDrainSucceeded: action => `${action} — done`,
+  postDrainFailed: (action, error) => `${action} failed — ${error}`,
+  postDrainExpired: action => `${action} expired before the board drained — nothing ran`,
+  postDrainCancelled: action => `${action} cancelled`,
   notify: {
     completedTitle: 'Task completed',
     blockedTitle: 'Task blocked — needs your input',
@@ -699,7 +811,9 @@ const ja: KanbanMessages = {
     on_hold: { label: '保留', help: '人によって保留されました — 再開したい時に Ready へドラッグしてください。' },
     review: { label: 'レビュー', help: 'レビューエージェントが作業を確認中。ディスパッチャが設定します。' },
     done: { label: '完了', help: '完了。依存する子タスクが Ready になります。' },
-    archived: { label: 'アーカイブ', help: 'デフォルトのボード表示から非表示。' }
+    archived: { label: 'アーカイブ', help: 'デフォルトのボード表示から非表示。' },
+    idea: { label: 'アイデア', help: 'ラフな記録 — ここでは何も実行されず、遅延もありません。' },
+    roadmap: { label: 'ロードマップ', help: '仕様は固まっていますが未承認 — スポーンすると作業が始まります。' }
   },
   locked: {
     review: 'レビューは、レビューエージェントがカードを取得するとディスパッチャによって設定されます。',
@@ -797,14 +911,13 @@ const ja: KanbanMessages = {
   couldNotEstimate: '見積もりできませんでした',
   complexity: { S: '小', M: '中', L: '大' },
   ideaTitle: 'アイデアを記録',
-  ideaHint:
-    'ラフなロードマップのアイデアをメモ — カードではなく ROADMAP.md の Ideas リストに追加され、後でトリアージされます。',
+  ideaHint: 'ラフなアイデアをメモ — アイデアレーンのカードとして追加され、後で整えられます。',
   ideaPlaceholder: 'ラフなアイデア…',
   ideaSave: 'アイデアを保存',
   ideaSaving: '保存中…',
-  ideaSaved: 'アイデアをロードマップに保存しました',
+  ideaSaved: 'アイデアに追加しました',
   ideaEmpty: '保存する前に入力してください。',
-  ideaUnavailable: 'ロードマップが利用できません — アイデアは保存されませんでした。',
+  ideaUnavailable: 'アイデアを追加できませんでした — 保存されていません。',
   introBody:
     'カードはあなたではなくエージェントが実行します。担当を設定したカードを Ready に置くと、1分以内にエージェントが取得します。担当がなければ実行されません。トリアージ: エージェントがまずアイデアを適切なタスクに書き直します。Todo: 他のカード待ち。スケジュール: タイマー待ち。実行中とレビュー: エージェントのレーンなので手を出さないでください。ブロック: 確認が必要です — カードを開いて何が起きたか、次に何をすべきかを確認してください。結果はカードに戻ってきます。',
   introGotIt: '了解',
@@ -876,6 +989,12 @@ const ja: KanbanMessages = {
   guideTodo: '他のカードの完了を待っています。',
   guideTriage: '生のアイデアです — スペシファイアエージェントが正式なタスクに整えます。',
   guideBlockLoop: reason => `同じ理由でブロックが繰り返され、判断のためにここへ転送されました: ${reason}`,
+  blockLoopConfirmTitle: 'このカードはループしました — 再開前に回答してください',
+  blockLoopConfirmBody: (title, column) =>
+    `「${title}」は、未回答の同じ質問で 2 回ブロックされたため自動的にここへ移動されました。` +
+    `その質問に答えないまま ${column} へ移すと、同じループが再び始まります。` +
+    `まずコメントで回答してから確定してください。`,
+  blockLoopConfirmAction: 'それでも再開する',
   guideScheduled: '予定時刻の到来を待っています。',
   guideRunning: 'エージェントが現在作業中です — 待つ以外にすることはありません。',
   guideRunningStale:
@@ -891,6 +1010,19 @@ const ja: KanbanMessages = {
   guideBlockedAutomatic: cause => `${cause} ワーカーログを確認し、再試行するか再割り当てしてください。`,
   guideBlockedReviewNoVerdict: 'レビュアーが判定なしで終了しました。もう一度レビューへ再キューしてください。',
   guideBlockedUnknown: 'ワーカーログを確認し、再試行するか再割り当てしてください。',
+  guideIdea: 'ラフなアイデアです — 準備ができたらロードマップ項目に整えてください。',
+  guideRoadmap: '仕様は固まっていますが未承認です — トリアージへスポーンすると作業が始まります。',
+  roadmapHideLanes: 'アイデアとロードマップを非表示',
+  roadmapShowLanes: 'アイデアとロードマップを表示',
+  roadmapPill: count => `ロードマップ · ${count}`,
+  laneRefine: 'ロードマップへ整える',
+  laneDemote: 'アイデアへ戻す',
+  laneSpawnTriage: 'トリアージへスポーン',
+  laneSpawnReady: 'Ready へスポーン…',
+  spawnReadyTitle: '直接 Ready へスポーンしますか？',
+  spawnReadyBody: '自動分解をスキップしてそのままディスパッチしますか？',
+  spawnReadyConfirm: 'Ready へスポーン',
+  laneDropRefused: (from, to) => `${from} から ${to} へカードを移動できません。`,
   choicesGroupLabel: 'オプションを選択してください',
   choiceSubmitError: '回答を送信できませんでした。もう一度お試しください。',
   choiceRetry: '再試行',
@@ -1008,6 +1140,33 @@ const ja: KanbanMessages = {
     '説明はデコンポーザーのルーティングを導きます。補助モデルで自動生成するか、自分で書いてください。',
   profileGoodAt: 'このプロフィールの得意分野は？',
   auto: '自動',
+  dispatchControl: 'ディスパッチ',
+  pauseDispatch: 'ディスパッチを一時停止',
+  resumeDispatch: 'ディスパッチを再開',
+  draining: running => `実行中 ${running} 件 — 排出中`,
+  safeToRestart: '実行中 0 件 — 再起動しても安全',
+  dispatchRunning: '通常どおりディスパッチ中',
+  pauseBusy: 'ディスパッチのティック実行中です。少し待ってからもう一度お試しください。',
+  resumeBusy: 'ディスパッチのティック実行中です。少し待ってから再開をお試しください。',
+  pauseAllBoards: 'すべてのボードを一時停止',
+  resumeAllBoards: 'すべてのボードを再開',
+  boardsPaused: (paused, total) => `${total} 件中 ${paused} 件のボードが一時停止中`,
+  pauseHint:
+    '新しいワーカーの取得と起動を停止します。実行中のワーカーが強制終了されることはありません。ゲートウェイを再起動する前に、件数が 0 になるまで待ってください。',
+  queuePostDrain: '排出後に…',
+  cancelPostDrain: 'キャンセル',
+  actionServiceRestart: target => `${target} を再起動`,
+  actionReboot: 'このマシンを再起動',
+  confirmRebootPrompt: 'すべてのワーカーが完了したら、このマシンを再起動しますか？',
+  confirmReboot: 'はい、排出後に再起動',
+  cancelConfirm: '待機を続ける',
+  postDrainArmed: (action, running, remaining) => `排出後に${action} — 実行中 ${running} 件、${remaining}後に期限切れ`,
+  postDrainArmedDrained: (action, remaining) => `${action} — 排出完了、まもなく実行（${remaining}後に期限切れ）`,
+  postDrainFiring: action => `${action} — 実行中`,
+  postDrainSucceeded: action => `${action} — 完了`,
+  postDrainFailed: (action, error) => `${action}に失敗 — ${error}`,
+  postDrainExpired: action => `排出前に${action}の期限が切れました — 何も実行されていません`,
+  postDrainCancelled: action => `${action}をキャンセルしました`,
   notify: {
     completedTitle: 'タスク完了',
     blockedTitle: 'タスクがブロック中 — 入力が必要です',
@@ -1036,7 +1195,9 @@ const zh: KanbanMessages = {
     on_hold: { label: '已暂缓', help: '由人工暂缓 — 想恢复时拖回“就绪”即可。' },
     review: { label: '审查', help: '审查代理正在检查工作。由调度器设置。' },
     done: { label: '完成', help: '已完成；依赖它的子任务变为就绪。' },
-    archived: { label: '已归档', help: '从默认面板视图中隐藏。' }
+    archived: { label: '已归档', help: '从默认面板视图中隐藏。' },
+    idea: { label: '想法', help: '粗略记录 — 这里的卡片不会运行，也不存在延误。' },
+    roadmap: { label: '路线图', help: '已细化但尚未授权 — 派生后即可开始工作。' }
   },
   locked: {
     review: '审查状态由调度器在审查代理领取卡片时设置。',
@@ -1133,13 +1294,13 @@ const zh: KanbanMessages = {
   couldNotEstimate: '无法估算',
   complexity: { S: '小', M: '中', L: '大' },
   ideaTitle: '记录想法',
-  ideaHint: '记下一个粗略的路线图想法 — 它会加入 ROADMAP.md 的 Ideas 列表，而不是新建卡片，稍后再分诊。',
+  ideaHint: '记下一个粗略的想法 — 它会作为卡片加入“想法”泳道，稍后再细化。',
   ideaPlaceholder: '粗略的想法…',
   ideaSave: '保存想法',
   ideaSaving: '保存中…',
-  ideaSaved: '想法已保存到路线图',
+  ideaSaved: '已加入“想法”',
   ideaEmpty: '请先输入内容再保存。',
-  ideaUnavailable: '路线图不可用 — 想法未保存。',
+  ideaUnavailable: '无法添加想法 — 未保存任何内容。',
   introBody:
     '卡片不由你运行，而是由代理运行。把带有负责人的卡片放入“就绪”，代理会在一分钟内领取。没有负责人就不会运行。分诊：代理先把想法改写成合适的任务。待办：等待其他卡片。已排期：等待计时器。运行中与审查：这是代理的通道，请勿插手。受阻：需要关注 — 打开卡片查看发生了什么、接下来该怎么做。结果会回到卡片上。',
   introGotIt: '知道了',
@@ -1210,6 +1371,12 @@ const zh: KanbanMessages = {
   guideTodo: '正在等待其他卡片完成后才会变为就绪。',
   guideTriage: '一个新想法 — 细化代理会将其整理成正式任务。',
   guideBlockLoop: reason => `因同一原因反复受阻并重新受阻 — 已转到此处等待决定：${reason}`,
+  blockLoopConfirmTitle: '此卡片已陷入循环 — 请先回答再恢复',
+  blockLoopConfirmBody: (title, column) =>
+    `“${title}”因同一个未回答的问题两次受阻，已被自动移到此处。` +
+    `在未回答该问题的情况下将其移到 ${column}，会再次触发同样的循环。` +
+    `请先在评论中回答，然后再确认。`,
+  blockLoopConfirmAction: '仍然恢复',
   guideScheduled: '正在等待其预定时间到来。',
   guideRunning: '有代理正在积极处理它 — 只需等待。',
   guideRunningStale: '超过 2 分钟没有心跳 — 调度器很快会重新领取。可以等待，或立即重新领取。',
@@ -1222,6 +1389,19 @@ const zh: KanbanMessages = {
   guideBlockedAutomatic: cause => `${cause} 请查看工作单元日志，然后重试或重新分配。`,
   guideBlockedReviewNoVerdict: '审查者退出时没有给出结论。请重新排队进行另一轮审查。',
   guideBlockedUnknown: '请查看工作单元日志，然后重试或重新分配。',
+  guideIdea: '一个粗略的想法 — 准备好后再细化成路线图条目。',
+  guideRoadmap: '已细化但尚未授权 — 派生到“分诊”即可开始工作。',
+  roadmapHideLanes: '隐藏“想法”和“路线图”',
+  roadmapShowLanes: '显示“想法”和“路线图”',
+  roadmapPill: count => `路线图 · ${count}`,
+  laneRefine: '细化为路线图',
+  laneDemote: '退回想法',
+  laneSpawnTriage: '派生到分诊',
+  laneSpawnReady: '派生到就绪…',
+  spawnReadyTitle: '直接派生到“就绪”？',
+  spawnReadyBody: '跳过自动分解，按原样派发？',
+  spawnReadyConfirm: '派生到就绪',
+  laneDropRefused: (from, to) => `无法把卡片从${from}移动到${to}。`,
   choicesGroupLabel: '请选择一个选项',
   choiceSubmitError: '无法提交你的回答，请重试。',
   choiceRetry: '重试',
@@ -1337,6 +1517,32 @@ const zh: KanbanMessages = {
   profileDescriptionsHint: '说明用于引导分解器的路由。可用辅助模型自动生成，或自行填写。',
   profileGoodAt: '这个配置档擅长什么？',
   auto: '自动',
+  dispatchControl: '调度',
+  pauseDispatch: '暂停调度',
+  resumeDispatch: '恢复调度',
+  draining: running => `${running} 个运行中 — 正在排空`,
+  safeToRestart: '0 个运行中 — 可以安全重启',
+  dispatchRunning: '调度正常运行中',
+  pauseBusy: '正在执行一次调度周期，请稍后再试。',
+  resumeBusy: '正在执行一次调度周期，请稍后再尝试恢复。',
+  pauseAllBoards: '暂停所有面板',
+  resumeAllBoards: '恢复所有面板',
+  boardsPaused: (paused, total) => `${total} 个面板中有 ${paused} 个已暂停`,
+  pauseHint: '停止领取和启动新的工作者。已在运行的工作者不会被终止 — 请等待计数归零后再重启网关。',
+  queuePostDrain: '排空后…',
+  cancelPostDrain: '取消',
+  actionServiceRestart: target => `重启 ${target}`,
+  actionReboot: '重启这台机器',
+  confirmRebootPrompt: '在所有工作者完成后重启这台机器？',
+  confirmReboot: '是，排空后重启',
+  cancelConfirm: '继续等待',
+  postDrainArmed: (action, running, remaining) => `排空后${action} — ${running} 个运行中，${remaining}后过期`,
+  postDrainArmedDrained: (action, remaining) => `${action} — 已排空，即将执行（${remaining}后过期）`,
+  postDrainFiring: action => `${action} — 正在执行`,
+  postDrainSucceeded: action => `${action} — 已完成`,
+  postDrainFailed: (action, error) => `${action}失败 — ${error}`,
+  postDrainExpired: action => `${action}在面板排空前已过期 — 未执行任何操作`,
+  postDrainCancelled: action => `已取消${action}`,
   notify: {
     completedTitle: '任务已完成',
     blockedTitle: '任务受阻 — 需要你的输入',
@@ -1365,7 +1571,9 @@ const zhHant: KanbanMessages = {
     on_hold: { label: '已暫緩', help: '由人工暫緩 — 想恢復時拖回「就緒」即可。' },
     review: { label: '審查', help: '審查代理正在檢查工作。由排程器設定。' },
     done: { label: '完成', help: '已完成；相依它的子任務變為就緒。' },
-    archived: { label: '已封存', help: '從預設面板檢視中隱藏。' }
+    archived: { label: '已封存', help: '從預設面板檢視中隱藏。' },
+    idea: { label: '想法', help: '粗略記錄 — 這裡的卡片不會執行，也不存在延誤。' },
+    roadmap: { label: '路線圖', help: '已細化但尚未授權 — 派生後即可開始工作。' }
   },
   locked: {
     review: '審查狀態由排程器在審查代理領取卡片時設定。',
@@ -1462,13 +1670,13 @@ const zhHant: KanbanMessages = {
   couldNotEstimate: '無法估算',
   complexity: { S: '小', M: '中', L: '大' },
   ideaTitle: '記錄想法',
-  ideaHint: '記下一個粗略的路線圖想法 — 它會加入 ROADMAP.md 的 Ideas 清單，而不是新建卡片，稍後再分診。',
+  ideaHint: '記下一個粗略的想法 — 它會作為卡片加入「想法」泳道，稍後再細化。',
   ideaPlaceholder: '粗略的想法…',
   ideaSave: '儲存想法',
   ideaSaving: '儲存中…',
-  ideaSaved: '想法已儲存到路線圖',
+  ideaSaved: '已加入「想法」',
   ideaEmpty: '請先輸入內容再儲存。',
-  ideaUnavailable: '路線圖不可用 — 想法未儲存。',
+  ideaUnavailable: '無法新增想法 — 未儲存任何內容。',
   introBody:
     '卡片不由你執行，而是由代理執行。把有負責人的卡片放入「就緒」，代理會在一分鐘內領取。沒有負責人就不會執行。分類：代理先把想法改寫成合適的任務。待辦：等待其他卡片。已排程：等待計時器。執行中與審查：這是代理的通道，請勿插手。受阻：需要關注 — 開啟卡片查看發生了什麼、接下來該怎麼做。結果會回到卡片上。',
   introGotIt: '知道了',
@@ -1539,6 +1747,12 @@ const zhHant: KanbanMessages = {
   guideTodo: '正在等待其他卡片完成後才會變為就緒。',
   guideTriage: '一個新想法 — 細化代理會將其整理成正式任務。',
   guideBlockLoop: reason => `因同一原因反覆受阻並重新受阻 — 已轉到此處等待決定：${reason}`,
+  blockLoopConfirmTitle: '此卡片已陷入循環 — 請先回答再恢復',
+  blockLoopConfirmBody: (title, column) =>
+    `「${title}」因同一個未回答的問題兩次受阻，已被自動移到此處。` +
+    `在未回答該問題的情況下將其移到 ${column}，會再次觸發同樣的循環。` +
+    `請先在留言中回答，然後再確認。`,
+  blockLoopConfirmAction: '仍然恢復',
   guideScheduled: '正在等待其預定時間到來。',
   guideRunning: '有代理正在積極處理它 — 只需等待。',
   guideRunningStale: '超過 2 分鐘沒有心跳 — 排程器很快會重新領取。可以等待，或立即重新領取。',
@@ -1551,6 +1765,19 @@ const zhHant: KanbanMessages = {
   guideBlockedAutomatic: cause => `${cause} 請查看工作單元日誌，然後重試或重新指派。`,
   guideBlockedReviewNoVerdict: '審查者結束時沒有給出結論。請重新排隊進行另一輪審查。',
   guideBlockedUnknown: '請查看工作單元日誌，然後重試或重新指派。',
+  guideIdea: '一個粗略的想法 — 準備好後再細化成路線圖項目。',
+  guideRoadmap: '已細化但尚未授權 — 派生到「分診」即可開始工作。',
+  roadmapHideLanes: '隱藏「想法」和「路線圖」',
+  roadmapShowLanes: '顯示「想法」和「路線圖」',
+  roadmapPill: count => `路線圖 · ${count}`,
+  laneRefine: '細化為路線圖',
+  laneDemote: '退回想法',
+  laneSpawnTriage: '派生到分診',
+  laneSpawnReady: '派生到就緒…',
+  spawnReadyTitle: '直接派生到「就緒」？',
+  spawnReadyBody: '略過自動分解，按原樣派發？',
+  spawnReadyConfirm: '派生到就緒',
+  laneDropRefused: (from, to) => `無法把卡片從${from}移動到${to}。`,
   choicesGroupLabel: '請選擇一個選項',
   choiceSubmitError: '無法送出你的回答，請再試一次。',
   choiceRetry: '重試',
@@ -1666,6 +1893,32 @@ const zhHant: KanbanMessages = {
   profileDescriptionsHint: '說明用於引導分解器的路由。可用輔助模型自動產生，或自行填寫。',
   profileGoodAt: '這個設定檔擅長什麼？',
   auto: '自動',
+  dispatchControl: '調度',
+  pauseDispatch: '暫停調度',
+  resumeDispatch: '恢復調度',
+  draining: running => `${running} 個執行中 — 正在排空`,
+  safeToRestart: '0 個執行中 — 可以安全重啟',
+  dispatchRunning: '調度正常執行中',
+  pauseBusy: '正在執行一次調度週期，請稍後再試。',
+  resumeBusy: '正在執行一次調度週期，請稍後再嘗試恢復。',
+  pauseAllBoards: '暫停所有面板',
+  resumeAllBoards: '恢復所有面板',
+  boardsPaused: (paused, total) => `${total} 個面板中有 ${paused} 個已暫停`,
+  pauseHint: '停止領取與啟動新的工作者。已在執行的工作者不會被終止 — 請等待計數歸零後再重啟閘道。',
+  queuePostDrain: '排空後…',
+  cancelPostDrain: '取消',
+  actionServiceRestart: target => `重啟 ${target}`,
+  actionReboot: '重新啟動這台機器',
+  confirmRebootPrompt: '在所有工作者完成後重新啟動這台機器？',
+  confirmReboot: '是，排空後重新啟動',
+  cancelConfirm: '繼續等待',
+  postDrainArmed: (action, running, remaining) => `排空後${action} — ${running} 個執行中，${remaining}後過期`,
+  postDrainArmedDrained: (action, remaining) => `${action} — 已排空，即將執行（${remaining}後過期）`,
+  postDrainFiring: action => `${action} — 正在執行`,
+  postDrainSucceeded: action => `${action} — 已完成`,
+  postDrainFailed: (action, error) => `${action}失敗 — ${error}`,
+  postDrainExpired: action => `${action}在面板排空前已過期 — 未執行任何操作`,
+  postDrainCancelled: action => `已取消${action}`,
   notify: {
     completedTitle: '任務已完成',
     blockedTitle: '任務受阻 — 需要你的輸入',

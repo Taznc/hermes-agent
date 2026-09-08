@@ -16,6 +16,29 @@ from unittest.mock import Mock
 import pytest
 
 
+@pytest.fixture(autouse=True)
+def _placement_gives_no_answer(monkeypatch):
+    """State this file's PLACEMENT input: "the kernel says nothing".
+
+    The restart-safe tests here simulate topology through IDENTITY
+    (``_is_supervised_gateway_process``, ``INVOCATION_ID``, ``SYSTEMD_EXEC_PID``), which
+    is data a test can set. Placement is not: ``_scope_needed_by_cgroup_placement`` reads
+    the TEST RUNNER's own real cgroup, so leaving it live lets the verdict be decided by
+    where the suite happens to run — inside a supervised ``hermes-*`` unit it answers True
+    and wraps a command a test asserts is unwrapped; inside a ``hermes-worker-*`` scope it
+    answers "already isolated" and skips a wrap a test asserts happens.
+
+    Pinning it to ``None`` (a cgroup-v1 host, or a container that hides
+    ``/proc/self/cgroup``) makes these exercise the identity fallback deterministically on
+    any host. Placement itself is covered by
+    ``tests/tools/test_process_registry.py::TestSupervisedUnitCgroupPlacement`` and, live,
+    by ``tests/hermes_cli/test_kanban_gateway_restart_handoff.py``.
+    """
+    monkeypatch.setattr(
+        "tools.process_registry._scope_needed_by_cgroup_placement", lambda: None
+    )
+
+
 @pytest.fixture
 def execution_ledger(tmp_path, monkeypatch):
     import cron.executions as executions
@@ -433,7 +456,7 @@ def test_gateway_tool_run_without_adapter_objects_hands_off(monkeypatch):
 
     assert scheduler.run_one_job(job, adapters=None) is True
 
-    created.assert_called_once_with("tool-job", source="direct")
+    created.assert_called_once_with("tool-job", source="direct", scheduled_instant=None)
     assert job["execution_id"] == "exec-tool"
     launch.assert_called_once_with(job)
     run.assert_not_called()
@@ -450,7 +473,7 @@ def test_shared_run_path_creates_execution_before_managed_handoff(monkeypatch):
 
     assert scheduler.run_one_job(job, adapters={"discord": object()}) is True
 
-    created.assert_called_once_with("manual-job", source="direct")
+    created.assert_called_once_with("manual-job", source="direct", scheduled_instant=None)
     assert job["execution_id"] == "exec-new"
     launch.assert_called_once_with(job)
 
@@ -559,6 +582,10 @@ def test_managed_gateway_restart_preserves_active_worker_and_single_side_effect(
         "from cron import scheduler\n"
         "from tools import process_registry\n"
         "process_registry._is_supervised_gateway_process = lambda: True\n"
+        # The harness simulates the gateway by IDENTITY; the subprocess's real cgroup is
+        # the test runner's, so neutralize placement or a runner already inside a worker
+        # scope reads "already isolated" and the worker never gets its own unit.
+        "process_registry._scope_needed_by_cgroup_placement = lambda: None\n"
         f"job = json.loads(pathlib.Path({str(payload)!r}).read_text())\n"
         "if not scheduler.run_one_job(job, adapters=None, loop=None):\n"
         "    raise SystemExit('worker was not isolated')\n"

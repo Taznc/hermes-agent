@@ -15,7 +15,7 @@
  * for an automatic failure and confusing for a reviewer hand-off. See
  * KANBAN-STATUS-AUDIT.md (parent card) for the full trace.
  */
-import type { KanbanEvent, KanbanRun, KanbanTaskFull } from './types'
+import type { KanbanEvent, KanbanRun, KanbanTask, KanbanTaskFull } from './types'
 
 /** The subset of `KanbanText` `runErrorText` needs — kept narrow so callers
  *  without the full bound i18n object (e.g. `completion-notify.ts`, which
@@ -69,6 +69,36 @@ export function runErrorText(error: string, k: RunErrorTextDeps): { primary: str
  *  the `blocked` column (it routes to `todo` — see `_route_block`), so it can
  *  never be the `block_kind` of a task this resolver is asked about. */
 export type BlockKind = 'capability' | 'needs_input' | 'transient'
+
+/** Mirrors the backend's `BLOCK_RECURRENCE_LIMIT` (`kanban_db.py`). Duplicated
+ *  rather than fetched because it only gates a CONFIRMATION prompt: the
+ *  backend's 409 is the authority, and a drift here can at worst show or skip
+ *  a dialog, never allow a move the server refuses. */
+export const BLOCK_RECURRENCE_LIMIT = 2
+
+/**
+ * Would moving this card into the work queue re-arm the unblock-loop breaker?
+ *
+ * The breaker parks a task that re-blocks on the same `needs_input` cause into
+ * `triage` so a human decides before it resumes — but `triage` is also where
+ * ordinary rough ideas live, and the drag gesture is identical for both. This
+ * predicate is what lets the board tell them apart and ask for confirmation on
+ * the one that matters. Scoped exactly as the backend guard (and the specify/
+ * decompose sweep exclusions) are: `needs_input` only, since a `capability` or
+ * `transient` loop is a real scope problem a human may legitimately just re-run.
+ *
+ * `todo` is a guarded target alongside `ready` because `recompute_ready()`
+ * promotes a parent-satisfied `todo` card to `ready` on the next dispatcher
+ * tick — guarding only `ready` is bypassed by dropping the card one lane left.
+ */
+export function needsBlockLoopAck(task: Pick<KanbanTask, 'block_kind' | 'block_recurrences' | 'status'>, target: string): boolean {
+  return (
+    (target === 'ready' || target === 'todo') &&
+    task.status === 'triage' &&
+    task.block_kind === 'needs_input' &&
+    (task.block_recurrences ?? 0) >= BLOCK_RECURRENCE_LIMIT
+  )
+}
 
 /** The event kinds the backend's own recency scans treat as authoritative
  *  lifecycle markers (`_has_sticky_block`, `_gave_up_was_force_tripped`,
@@ -202,9 +232,11 @@ export interface StatusGuidanceDeps extends RunErrorTextDeps {
   guideBlockedReviewNoVerdict: string
   guideBlockedUnknown: string
   guideDone: string
+  guideIdea: string
   guideOnHold: string
   guideReadyQueued: string
   guideReview: string
+  guideRoadmap: string
   guideRunning: string
   guideRunningStale: string
   guideScheduled: string
@@ -223,7 +255,10 @@ export interface StatusGuidanceDeps extends RunErrorTextDeps {
  *  read `events`/`task` for a sharper answer (e.g. the actual
  *  `block_loop_detected` reason in `triage`) but must never fabricate a
  *  cause that isn't in the data. */
-const GUIDANCE_RESOLVERS: Record<string, (task: KanbanTaskFull, events: KanbanEvent[], runs: KanbanRun[], k: StatusGuidanceDeps) => string> = {
+const GUIDANCE_RESOLVERS: Record<
+  string,
+  (task: KanbanTaskFull, events: KanbanEvent[], runs: KanbanRun[], k: StatusGuidanceDeps) => string
+> = {
   archived: (_task, _events, _runs, k) => k.col.archived?.help ?? '',
 
   blocked: (task, events, runs, k) => {
@@ -272,11 +307,19 @@ const GUIDANCE_RESOLVERS: Record<string, (task: KanbanTaskFull, events: KanbanEv
 
   done: (_task, _events, _runs, k) => k.guideDone,
 
+  // The wishlist lanes are deliberately event-blind: a lane card is not late,
+  // not stalled, and never carries an age or staleness warning — the whole
+  // point of the lane is that a large wishlist costs the reader nothing. So
+  // these are flat constants, never a resolver that scans for a "cause".
+  idea: (_task, _events, _runs, k) => k.guideIdea,
+
   on_hold: (_task, _events, _runs, k) => k.guideOnHold,
 
   ready: (task, _events, _runs, k) => (task.assignee ? k.guideReadyQueued : k.guideAssignReady),
 
   review: (_task, _events, _runs, k) => k.guideReview,
+
+  roadmap: (_task, _events, _runs, k) => k.guideRoadmap,
 
   running: (task, _events, _runs, k) => {
     const stale = task.last_heartbeat_at ? Date.now() / 1000 - task.last_heartbeat_at > 120 : false

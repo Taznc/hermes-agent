@@ -91,6 +91,15 @@ def _compute_host_adopt_frame_meta(session: dict, frame: dict) -> None:
 def _relay_compute_host_rpc(message: dict) -> bool:
     """Relay host events while retaining the clarify snapshot needed on resume."""
     params = message.get("params") if isinstance(message, dict) else None
+    if isinstance(message, dict) and message.get("method") == "compute_host.activity":
+        if isinstance(params, dict):
+            session = _sessions.get(str(params.get("session_id") or ""))
+            if session is not None:
+                with _history_lock(session):
+                    if (session.get("running") and params.get("turn_id")
+                            and session.get("_compute_host_turn_id") == params["turn_id"]):
+                        session["_compute_host_activity_ns"] = params.get("activity_ns")
+        return True  # Internal observation, not a client event or replay entry.
     kind = params.get("type") if isinstance(params, dict) else None
     if kind in {"clarify.request", "clarify.expire"}:
         session = _sessions.get(str(params.get("session_id") or ""))
@@ -138,6 +147,11 @@ def _update_compute_host_clarify_snapshot(sid: str, session: dict, params: dict,
         elif question_id and isinstance(result.get("remaining"), list):
             pending["answers"] = {**(pending.get("answers") or {}),
                                   question_id: str(params.get("answer") or "")}
+            note = str(params.get("note") or "")
+            if note:
+                pending.setdefault("notes", {})[question_id] = note
+            elif (notes := pending.get("notes")) is not None:
+                notes.pop(question_id, None)
             if not result["remaining"]:
                 session.pop("_compute_host_pending_clarify", None)
 
@@ -164,6 +178,9 @@ def _respond_compute_host_clarify(rid: str, params: dict) -> dict | None:
     result = response.get("result")
     if not isinstance(result, dict):
         return _err(rid, 5019, "compute-host clarify response returned an invalid result")
+    note = str(params.get("note") or "")
+    if note and "note" not in result:
+        result = {**result, "note": note}
     _update_compute_host_clarify_snapshot(sid, session, params, result)
     return _ok(rid, result)
 
@@ -234,15 +251,30 @@ def _submit_prompt_to_compute_host(
     frame = _compute_host_turn_frame(rid, sid, session, text, image_paths=image_paths,
                                      queued_prompt_generation=queued_prompt_generation,
                                      display_kind=display_kind)
+    # Caller JSON-RPC ids may repeat across sockets and turns. Use an opaque
+    # dispatch lifetime token, installed before a fast child can send activity.
+    turn_id = frame["turn_id"] = frame["request_id"] = uuid.uuid4().hex
+    with session["history_lock"]:
+        session["_compute_host_turn_id"] = turn_id
+        session.pop("_compute_host_activity_ns", None)
 
     def _complete(done: dict) -> None:
         # submit_turn reports a synchronous pipe failure via the callback before re-raising;
         # leave the session untouched so prompt.submit can fail open to the in-process path.
         if done.get("reason") != "send_failed":
+            with session["history_lock"]:
+                if session.get("_compute_host_turn_id") != turn_id:
+                    return
+                session.pop("_compute_host_turn_id", None)
+                session.pop("_compute_host_activity_ns", None)
             _on_compute_host_turn_done(rid, sid, session, done)
     try:
         _get_compute_host_supervisor(cfg).submit_turn(frame, on_complete=_complete)
     except Exception as exc:
+        with session["history_lock"]:
+            if session.get("_compute_host_turn_id") == turn_id:
+                session.pop("_compute_host_turn_id", None)
+                session.pop("_compute_host_activity_ns", None)
         return _err(rid, 5019, f"compute-host dispatch failed: {exc}")
     with session["history_lock"]:
         session["_compute_host_active"] = True

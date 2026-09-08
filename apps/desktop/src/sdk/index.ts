@@ -21,6 +21,7 @@
 import { atom, computed, type ReadableAtom } from 'nanostores'
 import type { ReactNode } from 'react'
 
+import { capabilityScoped } from '@/api/client'
 import { PRIMARY_SESSION_VIEW } from '@/app/chat/session-view'
 import { openSession, type OpenSessionIntent } from '@/app/open-session'
 import type { ClientSessionState } from '@/app/types'
@@ -43,6 +44,7 @@ import { onGatewayEvent } from '@/contrib/events'
 import { registry } from '@/contrib/registry'
 import type { WorkspaceMode } from '@/contrib/types'
 import { deleteProfile, getLogs, getStatus, hermesApi, type HermesGateway } from '@/hermes'
+import { completeMcpDesktopOAuth } from '@/lib/mcp-dashboard-oauth'
 import {
   $gateway,
   activeGatewayConnectionId,
@@ -639,6 +641,27 @@ export const host = {
   /** Tail an app log file (`agent` / `errors` / `gateway` / `gui` / …). */
   logs: async (...args: Parameters<typeof getLogs>) => getLogs(...args),
 
+  /** Complete client-local MCP sign-in for a pinned bot profile, optionally
+   *  installing its catalog entry first. Uses the same OAuth flow as Settings. */
+  completeMcpOAuth: async (options: Parameters<typeof completeMcpDesktopOAuth>[0] & { catalogPreset?: string }) => {
+    const profile = capabilityScoped(options.profile)
+
+    if (options.catalogPreset) {
+      const added = await requestGatewayForAgent<{ ok?: boolean; error?: string }>(
+        profile.connectionId ?? null,
+        profile.profile || 'default',
+        'mcp.servers.add',
+        { name: options.serverName, preset: options.catalogPreset }
+      )
+
+      if (!added.ok) {
+        throw new Error(added.error || 'Could not add server')
+      }
+    }
+
+    return completeMcpDesktopOAuth({ ...options, profile })
+  },
+
   /** Navigate the app router (hash routes, e.g. '/command-center?section=system'). */
   navigate: (path: string) => {
     window.location.hash = path.startsWith('#') ? path : `#${path}`
@@ -914,11 +937,14 @@ export const host = {
       // not the registry-secondary path openGatewayForAgent takes for a 'local'
       // connection id. Behavior for a plain local open is unchanged.
       const dial = explicitRoute
-        ? () => openGatewayForAgent(explicitRoute.connectionId, explicitRoute.profile)
+        ? () =>
+            openGatewayForAgent(explicitRoute.connectionId, explicitRoute.profile, {
+              spawnPriority: 'foreground'
+            })
         : plan.switchWorkspace
           ? () => ensureGatewayProfile(plan.switchWorkspace as string)
           : plan.dialWithoutSwitching
-            ? () => openGatewayForProfile(plan.dialWithoutSwitching as string)
+            ? () => openGatewayForProfile(plan.dialWithoutSwitching as string, { spawnPriority: 'foreground' })
             : null
 
       if (dial) {
@@ -1722,6 +1748,16 @@ export {
   type TranscriptDirectiveProps
 } from '@/lib/transcript-directives'
 export { cn } from '@/lib/utils'
+/** THE persisted pane-size store, for a plugin surface that owns a drag sash
+ *  (a resizable drawer, rail, or docked panel). Read the current override with
+ *  `useValue($paneWidthOverride(id))`, write px during the drag with
+ *  `setPaneWidthOverride(id, px)`, and pass `undefined` to clear it back to the
+ *  surface's authored default — the same store, and the same double-click-to-
+ *  reset contract, the app's own sashes use, so a plugin's width persists to
+ *  localStorage and is cleared by a layout reset alongside core's panes rather
+ *  than drifting in a parallel store. Namespace the id with your plugin slug
+ *  (`kanban.taskDrawer`). */
+export { $paneWidthOverride, setPaneWidthOverride } from '@/store/panes'
 /** THE unread store behind `SessionStatusDot`'s emerald dot. A plugin that
  *  learns out-of-band that a session produced something the user hasn't seen
  *  (a roster poll's activity watermark, say) writes HERE rather than keeping

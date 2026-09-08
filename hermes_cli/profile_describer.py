@@ -62,7 +62,7 @@ Notable skills (up to {skill_cap}):
 """
 
 
-_FENCE_RE = re.compile(r"^```(?:json)?\s*|\s*```$", re.MULTILINE)
+_FENCE_RE = re.compile(r"^```(?:json)?\s*|\s*```$", re.MULTILINE | re.IGNORECASE)
 
 
 @dataclass
@@ -134,7 +134,7 @@ def describe_profile(profile_name: str, *, overwrite: bool = False, timeout: Opt
     all_skills = _collect_skills(profile_dir)
     skill_list = "\n".join(f"  - {n}" for n in _sample_skills(all_skills)) or "  (no skills installed)"
     try:
-        model, provider = profiles_mod._read_config_model(profile_dir)
+        model, provider, _effort = profiles_mod._read_config_model(profile_dir)
     except Exception:
         model, provider = None, None
     try:
@@ -166,6 +166,15 @@ def describe_profile(profile_name: str, *, overwrite: bool = False, timeout: Opt
         raw = ""
     parsed = _extract_json_blob(raw)
     if parsed is None:
+        # JSON-shaped but unparseable = the requested object got cut off (#104067); the prose
+        # fallback below is only for models that never attempted JSON.
+        stripped = _FENCE_RE.sub("", raw.strip())
+        if stripped.startswith("{"):
+            logger.info(
+                "describe: %s aux response looked JSON-shaped but failed to parse "
+                "(likely truncated) -- refusing to persist the raw fragment", canon,
+            )
+            return DescribeOutcome(canon, False, "LLM returned malformed/truncated JSON response")
         # Fall back: raw text trimmed to one paragraph.
         text = raw.strip().split("\n\n", 1)[0]
         if not text:

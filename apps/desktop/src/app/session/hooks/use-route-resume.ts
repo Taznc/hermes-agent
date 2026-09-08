@@ -3,7 +3,7 @@ import { type MutableRefObject, useEffect, useRef } from 'react'
 import { isNewChatRoute } from '@/app/routes'
 import { type SessionResumeRequest, setResumeExhaustedSessionId } from '@/store/session'
 import type { SessionProfileRoute } from '@/store/session-request-router'
-import { markSelectionRestore } from '@/store/session-states'
+import { focusOpenSession, markSelectionRestore } from '@/store/session-states'
 
 interface RouteResumeOptions {
   activeSessionId: string | null
@@ -13,6 +13,10 @@ interface RouteResumeOptions {
   freshDraftReady: boolean
   gatewayState: string | undefined
   locationPathname: string
+  /** A session route created solely to clear a workspace page behind a focused
+   * tile. The tile remains this history entry's foreground target: replay must
+   * re-front it, never resume it into main (which would close the tile). */
+  preserveSessionTile?: boolean
   resumeSession: (sessionId: string, focus: boolean, ownerRoute?: SessionProfileRoute) => Promise<unknown>
   // Stored-session id whose most recent resume failed terminally (set by
   // useSessionActions, mirrored from $resumeFailedSessionId). While this equals
@@ -76,6 +80,7 @@ export function useRouteResume({
   freshDraftReady,
   gatewayState,
   locationPathname,
+  preserveSessionTile,
   resumeSession,
   resumeFailedSessionId,
   resumeExhaustedSessionId,
@@ -120,11 +125,35 @@ export function useRouteResume({
     seenGatewayStateRef.current = true
     wasGatewayOpenRef.current = gatewayOpen
 
-    if (currentView !== 'chat' || !gatewayOpen) {
+    if (currentView !== 'chat') {
       return
     }
 
     if (routedSessionId) {
+      // The sidebar routed away from a full workspace page after it had already
+      // focused this session's tile. The URL now correctly classifies as chat
+      // (and the page/sidebar selection clears), but routing it through main
+      // would deliberately close the tile in resumeSession. The wiring proves
+      // the tile still exists before setting this flag; if it closes, the flag
+      // drops and an ordinary route resume is available again. Re-front it only
+      // when this history entry is visited: Kanban fronts `workspace`, so Back
+      // must actively restore the tile rather than merely suppressing resume.
+      // Other dependencies (resume requests, gateway state, session data) also
+      // re-run this effect; they must not let an old route steal focus from a
+      // newer explicit sidebar selection.
+      if (preserveSessionTile) {
+        if (!pathnameChanged || focusOpenSession(routedSessionId) === 'tile') {
+          return
+        }
+
+        // The tile vanished between validation and this effect. Fall through
+        // to the ordinary main-session resume path.
+      }
+
+      if (!gatewayOpen) {
+        return
+      }
+
       const cachedRuntime = runtimeIdByStoredSessionIdRef.current.get(routedSessionId)
 
       const alreadyActive =
@@ -194,6 +223,7 @@ export function useRouteResume({
     }
 
     if (
+      gatewayOpen &&
       isNewChatRoute(locationPathname) &&
       !creatingSessionRef.current &&
       (selectedStoredSessionId || activeSessionId || !freshDraftReady) &&
@@ -211,6 +241,7 @@ export function useRouteResume({
     freshDraftReady,
     gatewayState,
     locationPathname,
+    preserveSessionTile,
     resumeSession,
     sessionResumeRequest,
     routedSessionId,
@@ -250,7 +281,7 @@ export function useRouteResume({
       retryAttemptRef.current = 0
     }
 
-    if (currentView !== 'chat' || gatewayState !== 'open') {
+    if (currentView !== 'chat' || gatewayState !== 'open' || preserveSessionTile) {
       return
     }
 
@@ -320,6 +351,7 @@ export function useRouteResume({
     creatingSessionRef,
     currentView,
     gatewayState,
+    preserveSessionTile,
     resumeSession,
     resumeFailedSessionId,
     resumeExhaustedSessionId,

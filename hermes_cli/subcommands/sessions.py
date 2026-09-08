@@ -25,6 +25,10 @@ def build_sessions_parser(subparsers, *, cmd_sessions: Callable) -> None:
     sessions_list.add_argument("--workspace", metavar="NEEDLE",
         help="Only sessions in one workspace: a git repo root or project dir "
         "(matched by path substring or basename).")
+    _flag(sessions_list, "--include-archived",
+        help="Also list archived (soft-hidden) sessions")
+    _flag(sessions_list, "--archived-only",
+        help="List only archived sessions — the discovery path for `hermes sessions unarchive`")
 
     _filter_args = (
         ("--newer-than", dict(metavar="AGE", help="Only match sessions active within the last AGE "
@@ -97,8 +101,13 @@ def build_sessions_parser(subparsers, *, cmd_sessions: Callable) -> None:
         help="md/qmd only: after verified single-session export, delete that session (needs --yes)")
     _flag(sessions_export, "--force", help="md/qmd only: overwrite an existing export file")
 
-    sessions_delete = sessions_subparsers.add_parser("delete", help="Delete a specific session")
-    sessions_delete.add_argument("session_id", help="Session ID to delete")
+    sessions_delete = sessions_subparsers.add_parser(
+        "delete", help="Delete specific session(s) by ID")
+    sessions_delete.add_argument(
+        "session_ids", nargs="+", metavar="SESSION_ID",
+        help="Session ID(s) or unique prefix(es) to delete")
+    _flag(sessions_delete, "--dry-run",
+        help="List the sessions that would be deleted without deleting anything")
     add_yes_flag(sessions_delete, "Skip confirmation")
 
     sessions_prune = sessions_subparsers.add_parser(
@@ -111,6 +120,10 @@ def build_sessions_parser(subparsers, *, cmd_sessions: Callable) -> None:
         help="Also delete archived sessions (excluded by default)")
     _flag(sessions_prune, "--include-pinned",
         help="Also delete pinned sessions (excluded by default — pin is a keep flag)")
+    _flag(sessions_prune, "--include-open",
+        help="Also match sessions that never ended (no ended_at). Excluded by default: "
+            "a session you navigated away from never records an end, so filters "
+            "otherwise skip it silently")
     _flag(sessions_prune, "--never-active",
         help="Instead of ended sessions, delete keyed gateway rows that were "
             "opened and never used (no messages, tokens, tool calls or title) "
@@ -118,10 +131,31 @@ def build_sessions_parser(subparsers, *, cmd_sessions: Callable) -> None:
             "never reach these — it only ever selects ended sessions")
 
     sessions_archive = sessions_subparsers.add_parser(
-        "archive", help="Bulk-archive (soft-hide) sessions matching filters — no deletion")
+        "archive", help="Archive (soft-hide) sessions by ID or filter — no deletion")
     _add_session_filter_args(
         sessions_archive, "Only archive sessions older than AGE (duration like '5h'/'2d', "
         "bare number of days, or ISO timestamp)")
+    sessions_archive.add_argument("--ids", nargs="+", metavar="SESSION_ID",
+        help="Archive exactly these session ID(s) or unique prefix(es), open or ended. "
+            "Cannot be combined with metadata filters")
+    _flag(sessions_archive, "--include-open",
+        help="Also match sessions that never ended (no ended_at). Excluded by default: "
+            "a session you navigated away from never records an end, so filters "
+            "otherwise skip it silently. Implied by --ids")
+
+    sessions_unarchive = sessions_subparsers.add_parser(
+        "unarchive", help="Restore archived session(s) by ID back into listings",
+        description="Undo `hermes sessions archive`. Archive is a reversible soft-hide, so "
+            "this simply clears the flag across the session's compression lineage; "
+            "nothing was ever deleted. Find archived sessions with "
+            "`hermes sessions list --include-archived`.")
+    sessions_unarchive.add_argument("session_ids", nargs="*", metavar="SESSION_ID",
+        help="Session ID(s) or unique prefix(es) to unarchive")
+    sessions_unarchive.add_argument("--ids", nargs="+", metavar="SESSION_ID",
+        help="Same as the positional IDs (symmetry with `archive --ids`)")
+    _flag(sessions_unarchive, "--dry-run",
+        help="List the sessions that would be unarchived without changing anything")
+    add_yes_flag(sessions_unarchive, "Skip confirmation")
 
     sessions_subparsers.add_parser(
         "optimize", help="Reclaim disk space: merge FTS5 segments + VACUUM (no data change)")

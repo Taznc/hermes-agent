@@ -24,12 +24,16 @@ declare global {
       // Resolve a backend connection. Omit `profile` (or pass the primary) for
       // the window's backend; pass a named profile to lazily spawn/reuse that
       // profile's backend from the pool.
-      getConnection: (profile?: string | null) => Promise<HermesConnection>
+      getConnection: (
+        profile?: string | null,
+        opts?: { priority?: 'foreground' | 'background' }
+      ) => Promise<HermesConnection>
       // Registry-scoped backend resolution: dial (connectionId, profile). An
       // empty/local connectionId delegates to the legacy getConnection path.
       getConnectionFor?: (payload: {
         connectionId?: null | string
         profile?: null | string
+        priority?: 'foreground' | 'background'
       }) => Promise<HermesConnection>
       // Registry-scoped fresh WS URL (same result contract as getGatewayWsUrl).
       getGatewayWsUrlFor?: (payload: {
@@ -234,6 +238,10 @@ declare global {
       }
       api: <T>(request: HermesApiRequest) => Promise<T>
       notify: (payload: HermesNotification) => Promise<boolean>
+      /** Current OS/browser notification permission, when the platform exposes one
+       *  (web build only — Electron's OS notifications need no separate grant).
+       *  Absent on Electron; Settings treats a missing member as "not applicable". */
+      getNotificationPermission?: () => Promise<'granted' | 'denied' | 'default' | 'unsupported'>
       requestMicrophoneAccess: () => Promise<boolean>
       /** read_window_below tool: metadata for the OS window directly underneath this one (never pixels). */
       readWindowBelow?: () => Promise<{
@@ -273,6 +281,7 @@ declare global {
         connectionId?: null | string
         path: string
         profile?: null | string
+        sessionId?: string
         suggestedName?: string
       }) => Promise<{
         canceled?: boolean

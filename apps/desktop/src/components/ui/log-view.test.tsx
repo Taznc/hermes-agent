@@ -78,4 +78,32 @@ describe('LogView numbered mode', () => {
 
     expect(screen.getByText('1')).toBeTruthy()
   })
+
+  // Worker log lines carry a `[YYYY-MM-DD HH:MM:SS] ` prefix written by the
+  // dispatcher's log filter. A prefix (rather than a second gutter column) was
+  // chosen precisely so numbered mode needs no per-line parsing: a stamped line
+  // is ordinary text. The risk that buys is a MIXED file — a task whose earlier
+  // runs predate timestamps and whose later runs have them — so that is what is
+  // pinned here.
+  it('renders a mixed timestamped/legacy log with one gutter number per line', () => {
+    const mixed = [
+      '--- hermes-kanban-run:1 ---',
+      'legacy line with no timestamp',
+      '--- hermes-kanban-run:2 ---',
+      '[2026-09-07 20:14:03] stamped line',
+      '[2026-09-07 20:14:04] another stamped line'
+    ].join('\n')
+    const { container } = render(<LogView content={mixed} numbered />)
+
+    // Five lines, numbered 1..5 — the gutter counts lines, not formats.
+    expect(screen.getByText('5')).toBeTruthy()
+    expect(screen.queryByText('6')).toBeNull()
+    expect(screen.getByText('legacy line with no timestamp')).toBeTruthy()
+    expect(screen.getByText('[2026-09-07 20:14:03] stamped line')).toBeTruthy()
+    // The run marker keeps its exact on-disk shape — unstamped, one line.
+    expect(screen.getByText('--- hermes-kanban-run:2 ---')).toBeTruthy()
+
+    const lineSpans = Array.from(container.querySelectorAll('span.whitespace-pre'))
+    expect(lineSpans).toHaveLength(5)
+  })
 })

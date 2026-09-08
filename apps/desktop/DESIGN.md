@@ -102,6 +102,50 @@ for call-site shadow or border inventions.
 Never hardcode `border-gray-*`, `bg-white`, `text-black`, etc. The white tile in
 `BrandMark` is the one sanctioned literal (the mark needs a fixed backdrop).
 
+### Semantic severity tokens — four roles, never interchangeable
+
+Error, warning, and success each resolve to **separate roles**, because a
+severity surface poses two opposite contrast problems at once: text sitting *on*
+a tinted surface, and a solid fill sitting *under* text. One token cannot serve
+both — the surface and the text move together and the ratio never opens up. That
+collapse is exactly what made severity titles illegible before the reskin, so
+reaching for the `fill` token on text is a regression, not a shortcut.
+
+| Role | Tokens | Use |
+| --- | --- | --- |
+| `fill` | `--color-destructive` / `--color-warning` / `--color-success` (+ each `-foreground`) | the 4px severity stripe, and a solid button under its own `-foreground` |
+| `tint` | `--dt-destructive-tint` / `--dt-warning-tint` / `--dt-success-tint` | the source color the surface's 12% `color-mix` is mixed *from* — never painted directly |
+| `text` | `--color-destructive-text` / `--color-warning-text` / `--color-success-text` | the **reading** role: severity titles and icons on that severity's own tint |
+| solid | `--color-success-solid` | success only — the fill for a text-bearing solid |
+
+Why each role has to exist on its own:
+
+- **`text` is not `fill`.** The `-text` tokens hold the theme's hue and chroma
+  and pin lightness (`--dt-semantic-text-l`) to the end of the ramp the tinted
+  surface is *not* on — darker in light mode, lighter in dark. One knob per
+  mode, so every severity clears 4.5:1 against its own tint in both themes and a
+  custom skin still tracks.
+- **`tint` is not `fill`.** In light mode every fill is darker than the near-white
+  card, so the raw token already separates the surface. Dark mode is not
+  symmetric: the red fill is itself darker than the dark card, so mixing more of
+  it shifts hue without shifting luminance (measured 1.01:1 — a tint you can only
+  see if you know it is there). The tint therefore gets its own lightness in the
+  dark block, leaving the stripe, the button, and the reading text unmoved.
+- **`success-solid` is not `success`.** Red carries white and amber carries
+  near-black at full fill, but the mid-ramp green clears *neither* (4.37:1
+  near-black, 4.30:1 white) because it sits equidistant from both ends. The
+  text-bearing role gets its own lightness — the one that dark mode's green
+  already uses, which makes both modes' buttons identical and lifts the label to
+  ~6.35:1. The stripe and the surface tint keep the raw token, so the approved
+  look is unchanged; only the thing with text on it moves. Error and warning need
+  no such split, which is why there is no `-solid` for them.
+
+Consume these through the primitives — `Alert`'s `destructive`/`warning`/
+`success` variants own the stripe + tint + reading text, and `Button`'s
+`severity*` variants own the fill + `-foreground`. A call site that writes
+`bg-warning`/`text-success-text` by hand is re-deriving a contract that already
+has a home.
+
 ## Buttons — one component
 
 `src/components/ui/button.tsx` is the single source. Pick a `variant` + `size`;
@@ -111,7 +155,20 @@ do **not** pass `h-*`, `px-*`, `py-*`, or icon-size overrides.
 the default non-primary look), `outline` (transparent + 1px inset ring, no
 fill/shadow), `ghost`, `link`, `text` (boxless quiet inline — "Cancel",
 "Clear"), `textStrong` (bold underlined inline affordance — "Change",
-"Open logs").
+"Open logs"), and the severity family `severityError` / `severityWarning` /
+`severitySuccess` / `severityInfo`.
+
+**The severity family** is the solid action *inside a severity surface* — a
+toast or `Alert` already wearing that severity's stripe and 12% tint. Each
+variant pairs a **fill** token with that token's own `-foreground`. Use them
+only there; a severity variant on a bare card is a colored button with no
+context and reads as an error.
+
+`severityError` is deliberately **not** `destructive`. `destructive` is the
+destructive-*action* semantic (delete, remove) and carries `text-white` plus a
+`dark:bg-destructive/60` softening. Severity chrome stays at full fill in both
+modes so the stripe, the tint, and the button read as one object. Picking
+`destructive` for a severity slot is the mistake this split exists to prevent.
 
 **Sizes:** `default`, `xs`, `sm`, `lg`, `inline` (flush, zero box — for buttons
 that sit inside a heading/sentence; replaces `h-auto px-0 py-0`), `micro`
@@ -145,6 +202,10 @@ does not flash a trail. After a tip has opened the page is warm: the next
 trigger within 300ms opens instantly. The cooldown starts on close, so a
 hover a second later waits again. Close is immediate. `OverflowTip` stays
 on its own longer delay (list titles must not trail while scanning).
+
+**Slash descriptions.** Keep autocomplete rows single-line and ellipsized, but reveal the complete catalog description in the shared themed tooltip when hovering anywhere on a slash row. Size that tooltip to the window with collision padding and word wrapping; it must not intercept row selection. Catalog and completion producers preserve the full author-supplied description.
+
+**Model search.** Model filters and their highlighted labels treat hyphens, dots, underscores and spaces equivalently. Preserve original label spelling inside marks. The shared highlighter remains literal for other surfaces such as the command palette; model callers explicitly opt in. Model identifier search does not use dictionary spellcheck.
 
 **Keybind hints in tooltips.** On a tipped button bound to a rebindable hotkey,
 use `<TipKeybindLabel actionId="..." />` — it reads the i18n label and the
@@ -230,6 +291,9 @@ Sizes: `default`, `xs`, `overlay` (titlebar glyph counts).
 - Bordered surfaces in the transcript (tables, fences, callouts, attachments)
   use `--ui-stroke-tertiary`. Not `border-border` — that's the app-wide
   default and reads too hot against the thread.
+- Interactive directive chips in the composer expose their action on hover.
+  The action stays visible for a 500ms grace period while the pointer crosses
+  from the chip to the floating pill; leaving both dismisses it.
 - A tool result may expose an inline action that opens a preview. It must not
   open the rail automatically.
 - Install, onboarding, connecting, boot failure, and reauthentication are

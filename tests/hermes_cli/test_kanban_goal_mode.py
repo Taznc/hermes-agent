@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import sqlite3
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -127,6 +128,76 @@ def test_loop_stops_when_worker_already_completed(monkeypatch):
     )
     assert res["outcome"] == "completed_by_worker"
     assert turns == []  # no extra turns
+
+
+def test_claimed_goal_worker_continues_before_clean_exit_finalization(
+    kanban_home,
+    monkeypatch,
+):
+    """A successful nonterminal turn must reach the goal-loop continuation."""
+    import cli as cli_module
+
+    with kbc.connect() as conn:
+        task_id = kb.create_task(
+            conn,
+            title="finish the claimed goal",
+            body="Continue once, then complete the task.",
+            assignee="worker",
+            goal_mode=True,
+            goal_max_turns=3,
+        )
+        claimed = kb.claim_task(conn, task_id)
+        assert claimed is not None and claimed.current_run_id is not None
+        run_id = claimed.current_run_id
+
+    monkeypatch.setenv("HERMES_KANBAN_TASK", task_id)
+    monkeypatch.setenv("HERMES_KANBAN_BOARD", "default")
+    monkeypatch.setenv("HERMES_KANBAN_RUN_ID", str(run_id))
+    monkeypatch.setenv("HERMES_KANBAN_GOAL_MODE", "1")
+    monkeypatch.setattr(
+        goals,
+        "judge_goal",
+        lambda *_args, **_kwargs: ("continue", "one more step", False, None, False),
+    )
+    calls = 0
+
+    def run_conversation(**_kwargs):
+        nonlocal calls
+        calls += 1
+        if calls == 2:
+            with kbc.connect() as conn:
+                assert kb.complete_task(
+                    conn,
+                    task_id,
+                    summary="completed on the continuation",
+                    expected_run_id=run_id,
+                )
+        return {"failed": False, "final_response": f"turn {calls}"}
+
+    agent = SimpleNamespace(
+        run_conversation=run_conversation,
+        session_id="goal-session",
+        provider="test",
+    )
+    worker_cli = SimpleNamespace(
+        agent=agent,
+        session_id="goal-session",
+        conversation_history=[],
+    )
+
+    with pytest.raises(SystemExit) as exc:
+        cli_module._run_quiet_single_query(worker_cli, "work the goal")
+
+    assert exc.value.code == 0
+    assert calls == 2
+    with kbc.connect() as conn:
+        task = kb.get_task(conn, task_id)
+        run = conn.execute(
+            "SELECT outcome FROM task_runs WHERE id = ?",
+            (run_id,),
+        ).fetchone()
+    assert task is not None and task.status == "done"
+    assert run is not None and run["outcome"] == "completed"
 
 
 

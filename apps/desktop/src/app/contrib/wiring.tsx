@@ -82,6 +82,7 @@ import {
   setBusy,
   setMessages
 } from '@/store/session'
+import { $sessionTiles } from '@/store/session-states'
 import { clearSessionTodos, setSessionTodos, todosForHydration } from '@/store/todos'
 import { armWakeWord, stopClientCapture } from '@/store/wake-word'
 import { isAuxiliaryWindow, isBrowserWindow, isHudWindow } from '@/store/windows'
@@ -114,6 +115,7 @@ import {
   SETTINGS_ROUTE,
   syncWorkspaceRoute
 } from '../routes'
+import { SessionImportView } from '../session-import'
 import { SessionPickerOverlay } from '../session-picker-overlay'
 import { SessionSwitcher } from '../session-switcher'
 import { useBackgroundQueueDrain } from '../session/hooks/use-background-queue-drain'
@@ -228,6 +230,7 @@ export function ContribWiring({ children }: { children: ReactNode }) {
   const resumeExhaustedSessionId = useStore($resumeExhaustedSessionId)
   const sessionResumeRequest = useStore($sessionResumeRequest)
   const selectedStoredSessionId = useStore($selectedStoredSessionId)
+  const sessionTiles = useStore($sessionTiles)
   const messagingSessions = useStore($messagingSessions)
   const sessions = useStore($sessions)
   const activeConnectionId = useStore($activeConnectionId)
@@ -236,6 +239,19 @@ export function ContribWiring({ children }: { children: ReactNode }) {
   const boot = useStore($desktopBoot)
 
   const routedSessionId = routeSessionId(location.pathname)
+
+  // `openSession` marks this history entry only when it has already fronted a
+  // tile and is changing location solely to clear a full workspace page. Keep
+  // the marker valid only while that exact conversation is still tiled: a
+  // closed tile must fall back to normal route -> main resume behavior.
+  const preserveSessionTile = Boolean(
+    (location.state as { preserveSessionTile?: unknown } | null)?.preserveSessionTile &&
+      routedSessionId &&
+      sessionTiles.some(tile =>
+        sessions.some(session => sessionMatchesStoredId(session, tile.storedSessionId) && sessionMatchesStoredId(session, routedSessionId))
+      )
+  )
+
   const routedSessionIdRef = useRef(routedSessionId)
 
   routedSessionIdRef.current = routedSessionId
@@ -343,7 +359,7 @@ export function ContribWiring({ children }: { children: ReactNode }) {
 
   const { refreshHermesConfig, sttEnabled, voiceMaxRecordingSeconds } = useHermesConfig({ activeSessionIdRef })
 
-  const { applySavedMainModel, refreshCurrentModel, selectModel } = useModelControls({
+  const { applySavedMainModel, refreshCurrentModel, selectModel, selectRecommendedModel } = useModelControls({
     cacheOwnerConnectionId: activeConnectionId || undefined,
     cacheProfile: activeGatewayProfile,
     queryClient,
@@ -759,6 +775,7 @@ export function ContribWiring({ children }: { children: ReactNode }) {
     freshDraftReady,
     gatewayState,
     locationPathname: location.pathname,
+    preserveSessionTile,
     resumeSession,
     resumeFailedSessionId,
     resumeExhaustedSessionId,
@@ -1131,6 +1148,7 @@ export function ContribWiring({ children }: { children: ReactNode }) {
     openAgents,
     openCommandCenterSection,
     requestGateway,
+    selectRecommendedModel,
     selectModel,
     toggleCommandCenter
   }
@@ -1305,6 +1323,18 @@ export function ContribWiring({ children }: { children: ReactNode }) {
             }}
           />
         </Suspense>
+      )}
+
+      {currentView === 'session-import' && (
+        <SessionImportView
+          key={`${activeConnectionId}:${activeGatewayProfile}`}
+          onClose={closeOverlayToPreviousRoute}
+          onOpenSession={sessionId => {
+            closeOverlayToPreviousRoute()
+            openSession(sessionId, navigate, 'stack')
+          }}
+          owner={{ connectionId: activeConnectionId || 'local', profile: activeGatewayProfile }}
+        />
       )}
 
       {commandCenterOpen && (

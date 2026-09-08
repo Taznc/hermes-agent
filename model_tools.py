@@ -251,6 +251,19 @@ def get_tool_definitions(enabled_toolsets: Optional[List[str]] = None, disabled_
     return list(cached)
 
 
+def _delegate_dispatch_mode() -> str:
+    """delegate_task's schema text differs by dispatch mode (background vs blocking), which is a
+    property of the SESSION, not of the process — so it must be part of the memo key or one
+    session's cached schema is served to another with the wrong guidance (a Kanban worker told to
+    "dispatch and continue" on a call that blocks). Empty when unresolvable: an unknown mode is
+    still a stable key component, and the description builder has its own fallback."""
+    try:
+        from tools.delegate_tool_dispatch import effective_dispatch_mode
+        return effective_dispatch_mode()
+    except Exception:
+        return ""
+
+
 def _tool_defs_cache_key(
     enabled_toolsets: Optional[List[str]], disabled_toolsets: Optional[List[str]], skip_tool_search_assembly: bool,
 ) -> Optional[tuple]:
@@ -258,7 +271,8 @@ def _tool_defs_cache_key(
 
     Covers every argument plus everything that changes the result without one:
     registry generation, config.yaml mtime/size (dynamic schemas), kanban
-    context, profile scope. check_fn results are TTL-cached in the registry.
+    context, delegation dispatch mode, profile scope. check_fn results are
+    TTL-cached in the registry.
     """
     profile_scope = check_fn_cache_scope()
     if profile_scope == CHECK_FN_CACHE_BYPASS:
@@ -274,6 +288,7 @@ def _tool_defs_cache_key(
         frozenset(disabled_toolsets) if disabled_toolsets else None, registry._generation, cfg_fp,
         bool(os.environ.get("HERMES_KANBAN_TASK")), bool(skip_tool_search_assembly),
         _is_delegated_child_context(), _is_dispatcher_owned_worker(), profile_scope,
+        _delegate_dispatch_mode(),
     )
 
 

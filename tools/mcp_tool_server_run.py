@@ -162,7 +162,8 @@ class MCPServerRunMixin:
         # elicitation/create lets a server ask for structured input mid-call; the handler
         # routes it through Hermes' approval system.
         elicitation_config = config.get("elicitation", {})
-        self._elicitation = (_sampling.ElicitationHandler(self.name, elicitation_config, owner=self)
+        self._elicitation = (_sampling.ElicitationHandler(self.name, elicitation_config,
+                                                       call_context=lambda: self._pending_call_context)
                              if elicitation_config.get("enabled", True) and _core._MCP_ELICITATION_TYPES else None)
 
     async def _prepare_run(self, config: dict) -> bool:

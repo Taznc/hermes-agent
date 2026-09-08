@@ -6,7 +6,7 @@
  * usePluginI18n is stubbed to echo the dotted key so assertions match on
  * stable keys instead of translated English text.
  */
-import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
+import { QueryClient, QueryClientProvider, useQuery } from '@tanstack/react-query'
 import { cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react'
 import type { ReactNode } from 'react'
 import { afterEach, beforeAll, beforeEach, describe, expect, it, vi } from 'vitest'
@@ -55,15 +55,33 @@ const task: KanbanTask = {
   status: 'todo'
 }
 
-function Harness({ children }: { children: ReactNode }) {
-  const client = new QueryClient({ defaultOptions: { queries: { retry: false }, mutations: { retry: false } } })
+function ActiveBoardQueries({
+  fetchAllBoards,
+  fetchSingleBoard
+}: {
+  fetchAllBoards: () => Promise<unknown>
+  fetchSingleBoard: () => Promise<unknown>
+}) {
+  useQuery({ queryFn: fetchSingleBoard, queryKey: ['kanban', 'board', 'shipping', false] })
+  useQuery({ queryFn: fetchAllBoards, queryKey: ['kanban', 'board', ALL_BOARDS, false] })
 
-  return <QueryClientProvider client={client}>{children}</QueryClientProvider>
+  return null
 }
 
-function renderCard(overrides: Partial<KanbanTask> = {}) {
+function Harness({ children, probes }: { children: ReactNode; probes?: ReactNode }) {
+  const client = new QueryClient({ defaultOptions: { queries: { retry: false }, mutations: { retry: false } } })
+
+  return (
+    <QueryClientProvider client={client}>
+      {probes}
+      {children}
+    </QueryClientProvider>
+  )
+}
+
+function renderCard(overrides: Partial<KanbanTask> = {}, probes?: ReactNode) {
   return render(
-    <Harness>
+    <Harness probes={probes}>
       <Card
         columns={['todo', 'ready', 'done']}
         onDelete={vi.fn()}
@@ -102,10 +120,10 @@ describe('Card — send to roadmap ideas (Phase 2.15 follow-up)', () => {
     expect(JSON.stringify(addRoadmapIdea.mock.calls[0])).not.toContain('Sensitive internal notes')
   })
 
-  // Board routing (t_70f6ac4e #1). POST /roadmap/idea falls back to the ACTIVE
-  // board when no board is sent, and roadmap-sync maps each slug to a
-  // DIFFERENT file — so an idea from an All Boards card must carry that card's
-  // own board or it is appended to the wrong ROADMAP on disk, silently.
+  // Board routing (t_70f6ac4e #1). POST /roadmap/idea creates an `idea` card
+  // in the addressed board and falls back to the ACTIVE board when no board is
+  // sent, so an All Boards card must carry its own board or the new card lands
+  // on the wrong board, silently.
   it("carries the card's OWN board, never the all-boards sentinel", async () => {
     addRoadmapIdea.mockResolvedValue({ ok: true, reason: null })
     $boardSlug.set(ALL_BOARDS)
@@ -143,6 +161,30 @@ describe('Card — send to roadmap ideas (Phase 2.15 follow-up)', () => {
     await waitFor(() =>
       expect(notify).toHaveBeenCalledWith(expect.objectContaining({ kind: 'success', message: 'ideaSaved' }))
     )
+  })
+
+  it('on success: refetches active single-board and All Boards queries', async () => {
+    addRoadmapIdea.mockResolvedValue({ ok: true, reason: null })
+    const fetchAllBoards = vi.fn().mockResolvedValue({ columns: [] })
+    const fetchSingleBoard = vi.fn().mockResolvedValue({ columns: [] })
+
+    $boardSlug.set(ALL_BOARDS)
+    renderCard(
+      { board: 'shipping', board_name: 'Shipping' },
+      <ActiveBoardQueries fetchAllBoards={fetchAllBoards} fetchSingleBoard={fetchSingleBoard} />
+    )
+    await waitFor(() => {
+      expect(fetchSingleBoard).toHaveBeenCalledTimes(1)
+      expect(fetchAllBoards).toHaveBeenCalledTimes(1)
+    })
+
+    await openMenu()
+    fireEvent.click(screen.getByText('sendToRoadmap'))
+
+    await waitFor(() => {
+      expect(fetchSingleBoard).toHaveBeenCalledTimes(2)
+      expect(fetchAllBoards).toHaveBeenCalledTimes(2)
+    })
   })
 
   it('on roadmap_unavailable: notifies a distinct warning, not success', async () => {

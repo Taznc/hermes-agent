@@ -9,13 +9,25 @@ import { cn } from '@/lib/utils'
 // left. Skin is the shared composerPanelCard (also used by the attach menu).
 const DRAWER_SHELL = cn(
   'absolute left-2 z-50 w-80 max-w-[calc(100%-1rem)] max-h-[min(22rem,calc(100vh-8rem))]',
-  'overflow-y-auto overscroll-contain p-1 text-popover-foreground',
+  'p-1 text-popover-foreground',
   composerPanelCard
 )
 
-export const COMPLETION_DRAWER_CLASS = cn(DRAWER_SHELL, 'bottom-full mb-1')
+/** The panel IS the scroller: one scrolling column, nothing pinned. */
+const DRAWER_SCROLLS = 'overflow-y-auto overscroll-contain'
 
-export const COMPLETION_DRAWER_BELOW_CLASS = cn(DRAWER_SHELL, 'top-full mt-1')
+/** The panel holds a scrolling list PLUS pinned furniture (the description
+ *  footer), so the shell clips and the list inside does the scrolling —
+ *  otherwise the footer scrolls away with the rows it describes. */
+const DRAWER_COLUMN = 'flex flex-col overflow-hidden'
+
+export const COMPLETION_DRAWER_CLASS = cn(DRAWER_SHELL, DRAWER_SCROLLS, 'bottom-full mb-1')
+
+export const COMPLETION_DRAWER_BELOW_CLASS = cn(DRAWER_SHELL, DRAWER_SCROLLS, 'top-full mt-1')
+
+export const COMPLETION_PANEL_CLASS = cn(DRAWER_SHELL, DRAWER_COLUMN, 'bottom-full mb-1')
+
+export const COMPLETION_PANEL_BELOW_CLASS = cn(DRAWER_SHELL, DRAWER_COLUMN, 'top-full mt-1')
 
 export function ComposerCompletionDrawer({
   adapter,

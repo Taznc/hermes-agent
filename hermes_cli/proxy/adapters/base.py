@@ -94,6 +94,17 @@ class UpstreamAdapter(ABC):
         """
         return False
 
+    @property
+    def unsupported_responses_params(self) -> FrozenSet[str]:
+        """Top-level ``/responses`` fields the upstream rejects outright.
+
+        A subscription upstream may expose a narrower surface than the public
+        Responses API, answering 400 for a parameter that standard OpenAI
+        clients always send. Listing it here drops it from the forwarded body
+        instead of failing the request.
+        """
+        return frozenset()
+
     def describe(self) -> str:
         """One-line status summary for ``proxy status``."""
         try:
