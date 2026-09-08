@@ -54,6 +54,11 @@ class _DispatcherSettings:
     # Hard stop on the review<->changes_requested loop; kept in sync with
     # hermes_cli.kanban_db_dispatch.DEFAULT_MAX_REVIEW_ROUNDS (0 = unlimited).
     max_review_rounds: int = 3
+    # High-priority slot reservation; kept in sync with
+    # hermes_cli.kanban_db_dispatch.DEFAULT_PRIORITY_RESERVED_{SLOTS,THRESHOLD}.
+    # 0 slots = feature off (the shipped default).
+    priority_reserved_slots: int = 0
+    priority_reserved_threshold: int = 1
 
 
 def _resolve_dispatcher_settings(kanban_cfg: dict, kb: Any, *, quiet: bool = False) -> _DispatcherSettings:
@@ -156,6 +161,24 @@ def _resolve_dispatcher_settings(kanban_cfg: dict, kb: Any, *, quiet: bool = Fal
     max_review_rounds = _kbd()._nonnegative_int(
         kanban_cfg.get("max_review_rounds"), _kbd().DEFAULT_MAX_REVIEW_ROUNDS,
     )
+    # Re-resolved every tick like the concurrency caps above, and for the same reason:
+    # retuning the reservation must never require a gateway restart, because a restart
+    # SIGKILLs every in-flight worker and discards its uncommitted worktree — i.e. it
+    # destroys exactly the work the scheduler exists to protect.
+    priority_reserved_slots = _kbd()._nonnegative_int(
+        kanban_cfg.get("priority_reserved_slots"),
+        _kbd().DEFAULT_PRIORITY_RESERVED_SLOTS,
+    )
+    priority_reserved_threshold = _kbd()._any_int(
+        kanban_cfg.get("priority_reserved_threshold"),
+        _kbd().DEFAULT_PRIORITY_RESERVED_THRESHOLD,
+    )
+    if priority_reserved_slots and not quiet:
+        logger.info(
+            "kanban dispatcher: reserving %d ready slot(s) for priority >= %d "
+            "(earlier access to a slot; never preempts a running worker)",
+            priority_reserved_slots, priority_reserved_threshold,
+        )
 
     return _DispatcherSettings(
         interval=interval,
@@ -176,6 +199,8 @@ def _resolve_dispatcher_settings(kanban_cfg: dict, kb: Any, *, quiet: bool = Fal
         dispatch_start_window_seconds=dispatch_start_window_seconds,
         review_rework_escalation_profile=review_rework_escalation_profile,
         max_review_rounds=max_review_rounds,
+        priority_reserved_slots=priority_reserved_slots,
+        priority_reserved_threshold=priority_reserved_threshold,
     )
 
 
@@ -219,7 +244,8 @@ def _reload_dispatcher_settings(
     for field_name in ("max_in_progress", "max_in_progress_per_profile", "max_spawn",
                        "failure_limit", "default_assignee", "default_reviewer",
                        "dispatch_start_budget", "dispatch_start_window_seconds",
-                       "review_rework_escalation_profile", "max_review_rounds"):
+                       "review_rework_escalation_profile", "max_review_rounds",
+                       "priority_reserved_slots", "priority_reserved_threshold"):
         was, now = getattr(current, field_name), getattr(fresh, field_name)
         if was != now:
             logger.info("kanban dispatcher: %s changed %r -> %r (applied without restart)",

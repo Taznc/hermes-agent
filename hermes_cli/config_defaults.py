@@ -1824,6 +1824,21 @@ DEFAULT_CONFIG = {
         # fan-out workflows that would otherwise saturate one profile's local model / API quota / browser
         # pool while leaving other profiles idle. See #21582.
         "max_in_progress_per_profile": None,
+        # Reserve a slice of each tick's spawn budget for high-priority cards, so a
+        # Critical card is not stuck behind a pool saturated by Normal work. 0 (the
+        # default) is today's behaviour: priority only orders rows inside a tick and
+        # reserves no capacity. A positive int holds that many of the ready lane's
+        # slots for cards at or above `priority_reserved_threshold` whenever such a
+        # card actually wants one this tick (unclaimed in ready, or spawnable in
+        # review, with an assignee that names a real profile). With no high-priority
+        # demand the held slots go to normal work in the SAME tick — the reservation
+        # never idles capacity nobody is waiting for. It grants EARLIER ACCESS to a
+        # slot, never preemption: a running worker is never reclaimed to free one.
+        "priority_reserved_slots": 0,
+        # Priority at or above which a card draws on the reservation. Default 1 =
+        # High and above on the documented tier scale (critical=2, high=1, normal=0,
+        # low=-1). Inert while priority_reserved_slots is 0.
+        "priority_reserved_threshold": 1,
         # Per-board worker-session rolling start rate limit. A positive integer
         # allows at most this many `spawned` events within
         # dispatch_start_window_seconds; queued work resumes automatically when

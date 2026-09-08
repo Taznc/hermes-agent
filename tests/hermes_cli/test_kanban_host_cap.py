@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import sqlite3
 import threading
+import time
 from pathlib import Path
 
 import pytest
@@ -532,3 +533,322 @@ def test_review_budget_still_bounded_by_shared_cap(
 
     # Budget 2 total across both lanes, reservation notwithstanding.
     assert len(res.spawned) == 2
+
+
+# ---------------------------------------------------------------------------
+# 4. High-priority slot reservation (kanban.priority_reserved_slots)
+# ---------------------------------------------------------------------------
+#
+# Priority previously had no scheduling power at all: `_lane_rows` sorts
+# `priority DESC, created_at ASC`, and that ordering was the ONLY place priority
+# mattered. Every gate deciding whether a worker spawns at all ignored it, so a
+# Critical card behind a saturated pool waited exactly as long as a Normal one.
+#
+# The reservation is the same mechanism the review lane already uses (hold a slot
+# back so a sustained backlog cannot starve a lane), keyed on priority instead of
+# lane. It grants EARLIER ACCESS to a slot and never preempts a running worker.
+
+
+def _capped_config(monkeypatch, **kanban):
+    """Config with review dispatch on, plus whatever the test sets."""
+    import hermes_cli.config as cfgmod
+    cfg = {"review_dispatch": True, **kanban}
+    monkeypatch.setattr(cfgmod, "load_config", lambda *a, **k: {"kanban": dict(cfg)})
+
+
+def _park_running(conn: sqlite3.Connection, title: str, assignee: str) -> str:
+    """A task genuinely occupying a worker slot, with claim bookkeeping intact.
+
+    Setting ``status='running'`` alone is not enough: the reclaim phase runs first
+    and ``reconcile_orphaned_running`` requeues any running row with a NULL
+    ``claim_lock``/``claim_expires`` as a zombie, which would silently free the
+    very slot the test is trying to occupy. A foreign-host lock with a live expiry
+    is also invisible to ``detect_crashed_workers`` (this host's PIDs only) and to
+    ``release_stale_claims`` (not yet expired).
+    """
+    tid = kb.create_task(conn, title=title, assignee=assignee)
+    conn.execute(
+        "UPDATE tasks SET status = 'running', claim_lock = ?, claim_expires = ? "
+        "WHERE id = ?",
+        ("otherhost:12345", int(time.time()) + 3600, tid),
+    )
+    return tid
+
+
+def test_critical_card_spawns_against_a_saturated_normal_queue(
+    kanban_home, all_assignees_spawnable, monkeypatch,
+):
+    """AC6 (first direction), stated literally: reserved=1, a queue of normal
+    cards, and a newly-filed Critical card gets a worker on the next tick."""
+    _capped_config(monkeypatch, priority_reserved_slots=1, priority_reserved_threshold=1)
+
+    spawns: list = []
+    with kbc.connect() as conn:
+        for i in range(5):
+            kb.create_task(conn, title=f"normal-{i}", assignee="alice")
+        critical = kb.create_task(
+            conn, title="critical", assignee="alice", priority=2,
+        )
+        res = kbd.dispatch_once(
+            conn, spawn_fn=_fake_spawn_factory(spawns), max_in_progress=2,
+        )
+
+    assert critical in [s[0] for s in res.spawned]
+
+
+def test_reservation_holds_a_slot_for_a_critical_card_blocked_by_per_profile_cap(
+    kanban_home, all_assignees_spawnable, monkeypatch,
+):
+    """The DISCRIMINATING case: a reservation that only reorders is worthless,
+    because the ready lane is already sorted priority DESC.
+
+    A Critical card whose assignee is at ``max_in_progress_per_profile`` cannot
+    spawn this tick. Without a reservation, normal work immediately consumes the
+    whole budget and re-saturates the pool, so the Critical card is no closer to
+    a slot when the cap clears. With ``priority_reserved_slots=1`` its demand
+    holds one slot back.
+
+    AC3 in the same assertion: the capped Critical card still records
+    ``skipped_per_profile_capped`` — the reservation composes with the
+    per-profile cap and never overrides it into a spawn.
+    """
+    _capped_config(monkeypatch, priority_reserved_slots=1, priority_reserved_threshold=1)
+
+    spawns: list = []
+    with kbc.connect() as conn:
+        # 'busy' already has one worker running -> at a per-profile cap of 1.
+        _park_running(conn, "running", "busy")
+        critical = kb.create_task(
+            conn, title="critical-blocked", assignee="busy", priority=2,
+        )
+        # Distinct assignees: the per-profile cap must not be what limits normal
+        # work, or this test would pass for the wrong reason (see the control).
+        for i in range(4):
+            kb.create_task(conn, title=f"normal-{i}", assignee=f"worker{i}")
+        res = kbd.dispatch_once(
+            conn, spawn_fn=_fake_spawn_factory(spawns),
+            max_in_progress=3, max_in_progress_per_profile=1,
+        )
+
+    # One slot is consumed by the already-running worker; 2 remain. The Critical
+    # card holds one, so only ONE normal card spawns.
+    assert len(res.spawned) == 1
+    assert res.priority_slots_reserved == 1
+    # Nothing spawned into the held slot: that is the cost, reported not hidden.
+    assert res.priority_slots_unused == 1
+    # AC3: the per-profile cap still binds and is still recorded as such.
+    assert critical in [c[0] for c in res.skipped_per_profile_capped]
+    assert critical not in [s[0] for s in res.spawned]
+    # Every normal card held back by the reservation says so, not just the first.
+    assert len(res.deferred_priority_reserved) == 3
+
+
+def test_same_board_spawns_one_more_normal_card_when_reservation_is_off(
+    kanban_home, all_assignees_spawnable, monkeypatch,
+):
+    """Control for the test above, and the proof it is not vacuous: the identical
+    board at ``priority_reserved_slots=0`` (the default) hands the slot to normal
+    work instead of holding it."""
+    _capped_config(monkeypatch, priority_reserved_slots=0)
+
+    spawns: list = []
+    with kbc.connect() as conn:
+        _park_running(conn, "running", "busy")
+        kb.create_task(conn, title="critical-blocked", assignee="busy", priority=2)
+        for i in range(4):
+            kb.create_task(conn, title=f"normal-{i}", assignee=f"worker{i}")
+        res = kbd.dispatch_once(
+            conn, spawn_fn=_fake_spawn_factory(spawns),
+            max_in_progress=3, max_in_progress_per_profile=1,
+        )
+
+    assert len(res.spawned) == 2          # vs 1 with the reservation on
+    assert res.priority_slots_reserved == 0
+    assert res.priority_slots_unused == 0
+    assert res.deferred_priority_reserved == []
+
+
+def test_unused_reserved_slots_go_to_normal_work_in_the_same_tick(
+    kanban_home, all_assignees_spawnable, monkeypatch,
+):
+    """AC2's never-idle-capacity rule: a reservation with NO high-priority card
+    waiting reserves nothing, and normal work gets the whole budget in this tick
+    — not on some later one."""
+    _capped_config(monkeypatch, priority_reserved_slots=2, priority_reserved_threshold=1)
+
+    spawns: list = []
+    with kbc.connect() as conn:
+        for i in range(5):
+            kb.create_task(conn, title=f"normal-{i}", assignee="alice")
+        res = kbd.dispatch_once(
+            conn, spawn_fn=_fake_spawn_factory(spawns), max_in_progress=3,
+        )
+
+    assert len(res.spawned) == 3
+    assert res.priority_slots_reserved == 0
+    assert res.deferred_priority_reserved == []
+
+
+def test_reservation_releases_partially_when_demand_is_smaller_than_the_setting(
+    kanban_home, all_assignees_spawnable, monkeypatch,
+):
+    """Reserved is min(configured, budget, demand): 3 configured but only one
+    high-priority card wanting a slot holds ONE slot, not three."""
+    _capped_config(monkeypatch, priority_reserved_slots=3, priority_reserved_threshold=1)
+
+    spawns: list = []
+    with kbc.connect() as conn:
+        _park_running(conn, "running", "busy")
+        kb.create_task(conn, title="critical-blocked", assignee="busy", priority=2)
+        for i in range(5):
+            kb.create_task(conn, title=f"normal-{i}", assignee=f"worker{i}")
+        res = kbd.dispatch_once(
+            conn, spawn_fn=_fake_spawn_factory(spawns),
+            max_in_progress=4, max_in_progress_per_profile=1,
+        )
+
+    # Budget 3 after the running worker; demand is 1, so 1 held, 2 to normal work.
+    assert res.priority_slots_reserved == 1
+    assert len(res.spawned) == 2
+
+
+def test_unassigned_high_priority_card_never_holds_a_slot(
+    kanban_home, monkeypatch,
+):
+    """A Critical card nothing can spawn — no assignee, or a control-plane lane a
+    terminal pulls via claim_task — must not hold a worker slot hostage: no
+    worker would ever land in it, so the slot would idle forever."""
+    import hermes_cli.profiles as profmod
+    _capped_config(monkeypatch, priority_reserved_slots=1, priority_reserved_threshold=1)
+    monkeypatch.setattr(profmod, "profile_exists", lambda name: name == "alice")
+
+    spawns: list = []
+    with kbc.connect() as conn:
+        kb.create_task(conn, title="critical-terminal-lane", assignee="orion-cc", priority=2)
+        for i in range(3):
+            kb.create_task(conn, title=f"normal-{i}", assignee="alice")
+        res = kbd.dispatch_once(
+            conn, spawn_fn=_fake_spawn_factory(spawns), max_in_progress=2,
+        )
+
+    assert res.priority_slots_reserved == 0
+    assert len(res.spawned) == 2
+
+
+def test_reservation_never_exceeds_the_tick_budget(
+    kanban_home, all_assignees_spawnable, monkeypatch,
+):
+    """A reservation larger than the budget clamps to it instead of driving the
+    normal allowance negative — and it still cannot spawn more than the host cap
+    allows. The reservation only ever narrows what normal work may take."""
+    _capped_config(monkeypatch, priority_reserved_slots=10, priority_reserved_threshold=1)
+
+    spawns: list = []
+    with kbc.connect() as conn:
+        for i in range(3):
+            kb.create_task(conn, title=f"critical-{i}", assignee="alice", priority=2)
+        for i in range(3):
+            kb.create_task(conn, title=f"normal-{i}", assignee="alice")
+        res = kbd.dispatch_once(
+            conn, spawn_fn=_fake_spawn_factory(spawns), max_in_progress=2,
+        )
+
+    assert res.priority_slots_reserved == 2      # clamped to the budget
+    assert len(res.spawned) == 2                 # host cap still binds
+    assert all(s[0] for s in res.spawned)
+
+
+def test_high_priority_review_card_can_take_the_reserved_slot(
+    kanban_home, all_assignees_spawnable, monkeypatch,
+):
+    """A Critical card in the REVIEW lane is real demand on the same shared
+    budget, and a review spawn into a held slot counts as the reservation
+    working rather than as capacity wasted."""
+    _capped_config(monkeypatch, priority_reserved_slots=1, priority_reserved_threshold=1)
+
+    spawns: list = []
+    with kbc.connect() as conn:
+        for i in range(4):
+            kb.create_task(conn, title=f"normal-{i}", assignee="alice")
+        review_id = kb.create_task(
+            conn, title="critical-review", assignee="reviewer", priority=2,
+        )
+        _set_task_status(conn, review_id, "review")
+        res = kbd.dispatch_once(
+            conn, spawn_fn=_fake_spawn_factory(spawns), max_in_progress=2,
+        )
+
+    assert review_id in [s[0] for s in res.spawned]
+    assert res.priority_slots_reserved == 1
+    # The critical review card spawned into it, so nothing was held idle.
+    assert res.priority_slots_unused == 0
+
+
+def test_threshold_decides_which_cards_draw_on_the_reservation(
+    kanban_home, all_assignees_spawnable, monkeypatch,
+):
+    """``priority_reserved_threshold=2`` means only Critical draws on the
+    reservation; a High (1) card is normal work for this purpose."""
+    _capped_config(monkeypatch, priority_reserved_slots=1, priority_reserved_threshold=2)
+
+    spawns: list = []
+    with kbc.connect() as conn:
+        _park_running(conn, "running", "busy")
+        # Priority 1 is BELOW the threshold of 2 -> generates no demand.
+        kb.create_task(conn, title="high-blocked", assignee="busy", priority=1)
+        for i in range(3):
+            kb.create_task(conn, title=f"normal-{i}", assignee=f"worker{i}")
+        res = kbd.dispatch_once(
+            conn, spawn_fn=_fake_spawn_factory(spawns),
+            max_in_progress=3, max_in_progress_per_profile=1,
+        )
+
+    assert res.priority_slots_reserved == 0
+    assert len(res.spawned) == 2
+
+
+def test_default_config_leaves_dispatch_order_and_counts_unchanged(
+    kanban_home, all_assignees_spawnable, monkeypatch,
+):
+    """AC6 (second direction): with the feature at its shipped default the tick
+    is identical to the pre-reservation behaviour — same spawn count, same
+    priority-DESC order, and the new result fields inert."""
+    _capped_config(monkeypatch)   # no priority_reserved_* keys at all
+
+    spawns: list = []
+    with kbc.connect() as conn:
+        low = kb.create_task(conn, title="low", assignee="alice", priority=-1)
+        normal = kb.create_task(conn, title="normal", assignee="alice")
+        critical = kb.create_task(conn, title="critical", assignee="alice", priority=2)
+        res = kbd.dispatch_once(
+            conn, spawn_fn=_fake_spawn_factory(spawns), max_in_progress=3,
+        )
+
+    assert [s[0] for s in res.spawned] == [critical, normal, low]
+    assert res.priority_slots_reserved == 0
+    assert res.priority_slots_unused == 0
+    assert res.deferred_priority_reserved == []
+
+
+def test_settings_resolve_from_live_config_without_being_passed_in(
+    kanban_home, all_assignees_spawnable, monkeypatch,
+):
+    """AC4: an entry point that does not thread the settings still gets them,
+    resolved from live config on the tick itself — the same fallback
+    ``max_review_rounds`` uses, so retuning never needs a gateway restart."""
+    _capped_config(monkeypatch, priority_reserved_slots=1, priority_reserved_threshold=1)
+
+    spawns: list = []
+    with kbc.connect() as conn:
+        _park_running(conn, "running", "busy")
+        kb.create_task(conn, title="critical-blocked", assignee="busy", priority=2)
+        for i in range(4):
+            kb.create_task(conn, title=f"normal-{i}", assignee=f"worker{i}")
+        # No priority_reserved_* kwargs: dispatch_once must read them itself.
+        res = kbd.dispatch_once(
+            conn, spawn_fn=_fake_spawn_factory(spawns),
+            max_in_progress=3, max_in_progress_per_profile=1,
+        )
+
+    assert res.priority_slots_reserved == 1
+    assert len(res.spawned) == 1

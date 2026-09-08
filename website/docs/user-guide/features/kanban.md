@@ -171,12 +171,57 @@ later (`hermes kanban update <id> --priority ...`); `hermes kanban list` and
 `hermes kanban show` render a recognized tier by name, and any other integer
 by its bare number.
 
-Priority is a **dispatch-order tiebreaker only** — among tasks otherwise
-ready to run for the same assignee, higher priority is picked sooner. It does
-**not** reserve capacity, does **not** preempt a task that is already
-running, and does not affect model or reasoning-effort routing. Values
-outside the four-tier scale are accepted as-is (not clamped or migrated) and
-keep their relative order.
+Priority is a **dispatch-order tiebreaker by default** — among tasks otherwise
+ready to run for the same assignee, higher priority is picked sooner. On its
+own it does **not** reserve capacity and does **not** preempt a task that is
+already running, and it never affects model or reasoning-effort routing.
+Values outside the four-tier scale are accepted as-is (not clamped or
+migrated) and keep their relative order.
+
+#### Reserving worker slots for high-priority cards
+
+Ordering alone cannot help a Critical card when the worker pool is already
+saturated: it waits for a slot exactly as long as a Normal card would. Two
+opt-in settings give priority real scheduling power:
+
+| Key | Default | Meaning |
+|---|---|---|
+| `kanban.priority_reserved_slots` | `0` (off) | How many of a tick's ready-lane slots to hold for high-priority cards |
+| `kanban.priority_reserved_threshold` | `1` (High and above) | The priority at or above which a card draws on the reservation |
+
+**The default is off.** At `priority_reserved_slots: 0` dispatch behaves
+exactly as it always has — this changes scheduling on a live fleet, so it
+ships inert and you opt in.
+
+When it is on, below-threshold cards may consume at most
+`ready_budget - reserved` of the tick's slots, while at-or-above-threshold
+cards may use the full budget. A slot is only held when a high-priority card
+actually wants one this tick — unclaimed in `ready` or spawnable in `review`,
+with an assignee that names a real profile. **Reserved slots that no
+high-priority card is waiting for are handed to normal work in the same
+tick**, so the setting never idles capacity nobody is queued for. An
+unassigned Critical card, or one on a control-plane lane pulled by a terminal
+via `claim_task`, generates no demand and cannot hold a slot hostage.
+
+The reservation grants **earlier access to a slot — never preemption**. It
+never reclaims, pauses, or kills a running worker to make room: reclaiming
+would discard that worker's uncommitted worktree, the same way restarting the
+gateway does. A high-priority card waits for the next slot to free naturally;
+it simply is not overtaken by normal work while waiting.
+
+It composes with, and never overrides, every existing gate. The review-lane
+reservation, `max_in_progress`, `max_in_progress_per_profile`, the
+`dispatch_start_budget` window and the memory-pressure clamp all still bind:
+a high-priority card blocked by the per-profile cap records
+`skipped_per_profile_capped` and does **not** spawn — its slot is simply held
+rather than handed to normal work. The reservation can only narrow what
+below-threshold cards may take; it never grants capacity a cap withheld.
+
+Both settings are re-read every dispatcher tick, so retuning them takes effect
+without restarting the gateway (a restart SIGKILLs every in-flight worker).
+`hermes kanban dispatch --dry-run` reports how many slots were reserved, how
+many went unused, and which normal cards were held back, so the setting is
+observable rather than invisible.
 
 When a triage card is fanned out via `decompose`, every child **inherits the
 root's priority** unless the decomposer explicitly assigns a different
