@@ -179,6 +179,9 @@ def test_claude_proxy_translates_stream_and_terminates_once():
     b'data: {"type":"content_block_delta","delta":"oops"}\n',
     b'data: {"type":"content_block_start","index":0,"content_block":"oops"}\n',
     b'data: {"type":"message_delta","delta":"oops"}\n',
+    b'data: {"type":"content_block_delta","index":[],"delta":{"type":"input_json_delta"}}\n',
+    b'data: {"type":"content_block_start","index":0,"content_block":{"type":"tool_use","name":[]}}\n',
+    b'data: {"type":"message_delta","delta":{"stop_reason":[]}}\n',
 ])
 def test_claude_proxy_stream_fails_closed_with_a_terminal_error_chunk(malformed_event):
     frames = list(stream_events([

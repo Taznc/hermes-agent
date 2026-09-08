@@ -235,9 +235,13 @@ class ClaudeStreamTranslator:
                 delta["content"] = text
             elif part.get("type") == "input_json_delta":
                 content_index = event.get("index")
-                tool_call_index = self._tool_call_by_content_block.get(
-                    content_index,
-                    self._active_tool_call_index,
+                if content_index is not None and not isinstance(content_index, int):
+                    yield self._invalid_response_frame()
+                    return
+                tool_call_index = (
+                    self._tool_call_by_content_block.get(content_index, self._active_tool_call_index)
+                    if isinstance(content_index, int)
+                    else self._active_tool_call_index
                 )
                 if tool_call_index is not None:
                     delta["tool_calls"] = [{"index": tool_call_index, "function": {"arguments": part.get("partial_json", "")}}]
@@ -249,11 +253,15 @@ class ClaudeStreamTranslator:
             if block.get("type") == "tool_use":
                 tool_call_index = self._call_index
                 content_index = event.get("index")
+                tool_name = block.get("name", "")
+                if not isinstance(tool_name, str):
+                    yield self._invalid_response_frame()
+                    return
                 if isinstance(content_index, int):
                     self._tool_call_by_content_block[content_index] = tool_call_index
                 self._active_tool_call_index = tool_call_index
                 delta["tool_calls"] = [{"index": tool_call_index, "id": block.get("id"), "type": "function",
-                    "function": {"name": self._tool_name_map.get(block.get("name", ""), block.get("name", "")), "arguments": ""}}]
+                    "function": {"name": self._tool_name_map.get(tool_name, tool_name), "arguments": ""}}]
                 self._call_index += 1
         elif typ == "message_delta":
             message_delta_raw = event.get("delta")
@@ -262,8 +270,11 @@ class ClaudeStreamTranslator:
                 return
             message_delta = cast(Dict[str, Any], message_delta_raw)
             delta["content"] = ""
-            stop_reason = cast(str, message_delta.get("stop_reason"))
-            finish = _STOP_REASONS.get(stop_reason, "stop")
+            stop_reason = message_delta.get("stop_reason")
+            if stop_reason is not None and not isinstance(stop_reason, str):
+                yield self._invalid_response_frame()
+                return
+            finish = _STOP_REASONS.get(stop_reason, "stop") if stop_reason is not None else "stop"
             chunk = {"id": "chatcmpl_proxy", "object": "chat.completion.chunk", "created": int(time.time()),
                      "model": self._model, "choices": [{"index": 0, "delta": delta, "finish_reason": finish}]}
             yield b"data: " + json.dumps(chunk, separators=(",", ":")).encode() + b"\n\n"
