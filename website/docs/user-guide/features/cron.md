@@ -327,12 +327,60 @@ Hermes records each claimed cron attempt in the profile-local
 move through `claimed`, `running`, and one immutable terminal state:
 `completed`, `failed`, or `unknown`. After restart, Hermes marks an abandoned
 attempt `unknown` only when the original PID and process-start fingerprint prove
-that its owner is gone. Unknown attempts are audit records and are never
-automatically rerun.
+that its owner is gone.
 
 Inspect recent attempts with `hermes cron runs [job-id] --limit 20` (alias:
 `history`). Terminal history is bounded; active attempts are never pruned. The
 ledger is included in quick backups.
+
+### Interrupted runs: shutdown recovery and the one bounded retry
+
+A gateway or desktop shutdown can kill a run between its claim and its result.
+That is an **interruption**, not a job failure, and Hermes treats it as its own
+case so an occurrence is never lost silently.
+
+An interrupted attempt is recorded as interrupted in the ledger — a durable
+fact, not a guess from the error text — and raises a failure incident with type
+`interruption`, deduplicated and acknowledgeable like any other (see below).
+`hermes cron history` marks the attempt and says what was decided about it:
+
+```
+2a9f…  failed   job=9be64baa  source=builtin  2026-09-07T20:11:59+00:00  [interrupted; retry scheduled]
+```
+
+**The guarantee.** An occurrence lost to a shutdown is re-armed to run again on
+the next tick — **at most once**, and only when all of these hold:
+
+- The occurrence is still fresh: it was claimed within
+  `cron.interrupted_retry_max_age_minutes` (default 60). This is what recovers a
+  weekly job's missed run across a restart without resurrecting week-old work.
+- The job still exists and is still supposed to run. Disabled, paused,
+  completed and removed jobs are never resurrected.
+- No attempt for that job is currently in flight, so a retry can never run
+  concurrently with the work it is replaying.
+- The job has no retry outstanding already. The pending-retry stamp is cleared
+  only by a **successful** run, so a burst of gateway restarts produces exactly
+  one retry, never a loop.
+
+Anything else is declined *with a recorded reason* you can read in
+`hermes cron history`, so a lost occurrence is always diagnosable. While a
+retry is pending, `hermes cron list` and `hermes cron doctor` name it and the
+original attempt it recovers.
+
+**The limits.** A cron side effect may already have run before the
+interruption — Hermes cannot know — so a replayed job may repeat work it
+partly did. Jobs whose side effects are not safe to repeat should set the
+budget to `0`:
+
+```yaml
+cron:
+  interrupted_retry_max_age_minutes: 60   # default; 0 disables replay entirely
+```
+
+With `0`, interruptions are still recorded and still raise incidents; only the
+replay is off. This policy covers shutdown interruptions only: an ordinary job
+failure, and a run stopped by the 3-minute runaway-loop interrupt, are the
+job's own outcome and are never replayed.
 
 ### Repeated-failure review nudge
 
@@ -1101,7 +1149,7 @@ The referenced jobs' most recent completed outputs are injected above the prompt
 
 Jobs are stored in `~/.hermes/cron/jobs.json`. Output from job runs is saved to `~/.hermes/cron/output/{job_id}/{timestamp}.md`.
 
-Job definitions are plain JSON on disk: they survive `hermes update`, gateway restarts, and machine reboots. A job that was mid-run during a restart is marked `unknown` in the execution ledger — it is not automatically retried, but the job's next scheduled tick fires normally. See [Execution history](#execution-history) for details.
+Job definitions are plain JSON on disk: they survive `hermes update`, gateway restarts, and machine reboots. A job that was mid-run during a restart is marked `unknown` in the execution ledger and recorded as an interruption; that lost occurrence is re-armed once under a bounded policy, and the job's next scheduled tick fires normally either way. See [Interrupted runs](#interrupted-runs-shutdown-recovery-and-the-one-bounded-retry) for the guarantee and its limits.
 
 :::tip
 Ask the agent to manage jobs through the `cronjob` tool, `hermes cron edit`, or `/cron` — not by patching `jobs.json` directly. Direct edits can fail silently when [file write safety](../security.md#file-write-safety) blocks the path (for example when `HERMES_WRITE_SAFE_ROOT` is set), and the [file-mutation verifier](../configuration.md#file-mutation-verifier) footer is the authoritative signal that nothing was saved.
