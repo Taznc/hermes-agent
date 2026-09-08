@@ -181,9 +181,15 @@ KANBAN_BLOCK_SCHEMA = _schema(
     {
         "task_id": _prop("string", _DESC_TASK_ID_DEFAULT),
         "reason": _prop("string", (
-                "What you need answered or what stopped you, in one or "
-                "two sentences. Don't paste the whole conversation; the "
-                "human has the board and can ask follow-ups via comments."
+                "The ask, written for a human scanning a board card — NOT a "
+                "status report. Line 1: ONE sentence naming exactly what you "
+                "need to get unblocked. If a shell command would unblock you "
+                "(restart a service, grant access, install a credential), put "
+                "the exact copy-pasteable command in a ```cmd fence — the "
+                "board renders it with a copy button. Diagnosis, history, and "
+                "what you tried go in kanban_comment BEFORE you block; prose "
+                "here is capped (~700 chars, fenced blocks excluded) and "
+                "longer reasons are rejected."
         )),
         "kind": {
             "type": "string",
@@ -248,6 +254,14 @@ KANBAN_REQUEST_CHANGES_SCHEMA = _schema(
                 "Specific, actionable changes the implementer must make "
                 "before requesting another review."
         )),
+        "metadata": {
+            "type": "object",
+            "description": (
+                "Optional structured facts about this review round, such "
+                "as which acceptance criteria failed or what was checked."
+            ),
+            "additionalProperties": True,
+        },
     },
     ["reason"],
 )
@@ -363,8 +377,9 @@ KANBAN_CREATE_SCHEMA = _schema(
         "assignee": _prop("string", (
                 "Profile name that should execute this task "
                 "(e.g. 'researcher-a', 'reviewer', 'writer'). "
-                "Required — tasks without an assignee are never "
-                "dispatched."
+                "Required for real work — tasks without an assignee "
+                "are never dispatched. Optional only when 'lane' is "
+                "set, since a wishlist card never dispatches."
         )),
         "body": _prop("string", (
                 "Opening post: full spec, acceptance criteria, "
@@ -414,6 +429,18 @@ KANBAN_CREATE_SCHEMA = _schema(
                 "— a specifier profile is expected to flesh out "
                 "the body before work starts."
         )),
+        "lane": {
+            "type": "string",
+            "enum": ["idea", "roadmap"],
+            "description": (
+                "Park the card in an inert wishlist lane instead of the work queue: "
+                "'idea' (rough capture) or 'roadmap' (hashed out with the operator, still "
+                "not authorized to execute). Nothing automated ever touches a lane card — no "
+                "dispatcher, sweep, or decomposer — so 'assignee' is optional and it will not "
+                "run until someone spawns it. Mutually exclusive with 'triage' and "
+                "'initial_status'. Use this for wishlist items, NOT for work you want done."
+            ),
+        },
         "idempotency_key": _prop("string", (
                 "If a non-archived task with this key already "
                 "exists, return that task's id instead of creating "
@@ -488,7 +515,41 @@ KANBAN_CREATE_SCHEMA = _schema(
                 "rather than silently falling back to the profile default."
         )),
     },
-    ["title", "assignee"],
+    ["title"],
+)
+
+KANBAN_ROADMAP_SCHEMA = _schema(
+    "kanban_roadmap",
+    (
+        "Move a wishlist card between the inert roadmap lanes, or authorize it to "
+        "execute. 'refine' promotes idea → roadmap (hashed out with the operator), "
+        "'demote' sends roadmap → idea, and 'spawn' releases a roadmap card into the "
+        "work queue — landing in triage by default so it gets re-specified/split first, "
+        "or directly in ready with to='ready'. Only these transitions exist: a live card "
+        "can never be moved INTO a lane, and an idea must be refined before it can spawn. "
+        "Orchestrator-only."
+    ),
+    {
+        "task_id": _prop("string", "Wishlist card id to move."),
+        "action": {
+            "type": "string",
+            "enum": ["refine", "demote", "spawn"],
+            "description": (
+                "refine = idea → roadmap; demote = roadmap → idea; "
+                "spawn = roadmap → triage/ready (authorizes execution)."
+            ),
+        },
+        "to": {
+            "type": "string",
+            "enum": ["triage", "ready"],
+            "description": (
+                "Only for action='spawn': where the card lands. Default 'triage' so "
+                "auto-decompose can re-specify or split it; 'ready' opts out and queues "
+                "it for dispatch as-is."
+            ),
+        },
+    },
+    ["task_id", "action"],
 )
 
 KANBAN_UNBLOCK_SCHEMA = _schema(

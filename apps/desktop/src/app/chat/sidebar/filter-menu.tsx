@@ -1,6 +1,6 @@
 import { useStore } from '@nanostores/react'
 
-import { sessionDotClassName } from '@/app/chat/session-status-dot'
+import { SessionStatusMark } from '@/app/chat/session-status-dot'
 import { Button } from '@/components/ui/button'
 import { Codicon } from '@/components/ui/codicon'
 import {
@@ -65,7 +65,7 @@ import { runImportProfileFlow } from '@/store/profile-share'
 import { $projectTree } from '@/store/projects'
 import type { PullRequestBucket } from '@/store/pull-requests'
 import { $unreadFinishedSessionIds, markAllSessionsRead } from '@/store/session'
-import type { SessionStatusBucket } from '@/store/session-dot-state'
+import type { SessionDotState, SessionStatusBucket } from '@/store/session-dot-state'
 import { $sessionsHaveCost } from '@/store/sidebar-archive'
 
 interface Option<T extends string = string> {
@@ -74,6 +74,8 @@ interface Option<T extends string = string> {
   icon?: string
   id: T
   label: string
+  /** A live-session state, rendered with the row's own glyph mark. */
+  state?: SessionDotState
 }
 
 const GROUPINGS: Option<SidebarGrouping>[] = [
@@ -115,14 +117,18 @@ const PR_FILTERS: Option<PullRequestBucket>[] = [
 ]
 
 const STATUS_FILTERS: Option<SessionStatusBucket>[] = [
-  { dot: sessionDotClassName('needs-input'), id: 'needs-input', label: 'Needs input' },
-  { dot: sessionDotClassName('working'), id: 'working', label: 'Working' },
-  { dot: sessionDotClassName('unread'), id: 'unread', label: 'Unread' },
-  { dot: sessionDotClassName('draft'), id: 'draft', label: 'Draft' },
-  { dot: cn(sessionDotClassName('idle'), 'bg-(--ui-text-quaternary)'), id: 'idle', label: 'Idle' }
+  { id: 'needs-input', label: 'Needs input', state: 'needs-input' },
+  { id: 'working', label: 'Working', state: 'working' },
+  { id: 'unread', label: 'Unread', state: 'unread' },
+  { id: 'draft', label: 'Draft', state: 'draft' },
+  { dot: cn('size-1 rounded-full', 'bg-(--ui-text-quaternary)'), id: 'idle', label: 'Idle' }
 ]
 
 function OptionGlyph({ option }: { option: Option }) {
+  if (option.state) {
+    return <SessionStatusMark state={option.state} />
+  }
+
   if (option.dot) {
     return <span aria-hidden="true" className={cn('shrink-0', option.dot)} />
   }

@@ -286,8 +286,119 @@ def _is_supervised_worker_dispatcher() -> bool:
     means "the gateway runtime is loaded in this process" and is inherited by descendants
     that must keep restarting the gateway. Being the main process of a supervised unit is
     the property that actually matters here, so that is what is tested.
+
+    This answers IDENTITY only, and stays strict on purpose: ``INVOCATION_ID`` and
+    ``SYSTEMD_EXEC_PID`` are inherited by every descendant, so env markers alone cannot
+    separate a dispatcher running under a unit from an arbitrary CLI process. The
+    complementary PLACEMENT question is :func:`_scope_needed_by_cgroup_placement`; the two
+    are composed by :func:`_needs_restart_safe_scope`.
     """
     return _is_supervised_gateway_process() or _is_systemd_service_main_process()
+
+
+# A cgroup leaf/component meaning "this process was already lifted out of its unit": either
+# the dedicated worker slice or one of the transient units minted by _build_systemd_scope_argv.
+_WORKER_SLICE_COMPONENT = "hermes-workers.slice"
+_WORKER_UNIT_PREFIX = "hermes-worker-"
+
+
+def _read_own_cgroup_v2_path() -> Optional[str]:
+    """This process's cgroup-v2 path (the ``0::`` line of ``/proc/self/cgroup``), or None.
+
+    None means "no cgroup-v2 answer available" — a v1-only host, a container that hides the
+    file, or a non-Linux kernel — and callers must fall back to the identity predicates
+    rather than assume anything about placement.
+    """
+    try:
+        text = Path("/proc/self/cgroup").read_text(encoding="utf-8")
+    except OSError as exc:
+        logger.debug("Could not read /proc/self/cgroup: %s", exc)
+        return None
+    for line in text.splitlines():
+        if line.startswith("0::"):
+            return line.partition("::")[2].strip() or None
+    return None
+
+
+def _scope_needed_by_cgroup_placement() -> Optional[bool]:
+    """Would a plain ``Popen`` child land inside a supervised Hermes unit's cgroup?
+
+    Identity ("am I the unit's main pid?") is the wrong question for this: a dispatch tick
+    that runs in a DESCENDANT of the unit's main process spawns children into the very same
+    cgroup, yet every env marker it can see is merely inherited. Placement is read from the
+    kernel instead — cgroup membership is not inherited through a fork into a different
+    cgroup, so it separates the cases env markers cannot.
+
+    Tri-state, and the None is load-bearing:
+
+    * ``True``  — our cgroup leaf is a supervising Hermes unit, so an unwrapped child is a
+      leak into it (a unit stop SIGKILLs it, and its memory counts against that unit).
+    * ``False`` — we are already inside the worker slice or a ``hermes-worker-*`` transient
+      unit. The child is isolated by construction, and re-wrapping would mint a *nested*
+      scope that outlives the teardown of the one we are in.
+    * ``None``  — placement is unknown or says nothing (cgroup v1, a container, a non-Hermes
+      unit). Callers defer to the identity predicates, so behaviour is unchanged there.
+
+    The supervised set is derived rather than enumerated: ``is_hermes_unit`` (the same
+    prefix rule ``tools.hermes_service_guard`` uses to decide whether killing a unit would
+    take Hermes agents with it) already answers "is this a Hermes unit whose death reaches
+    our processes". Deriving it means a new ``hermes-*`` unit is covered the day it is
+    installed, where a hardcoded {gateway, web-desktop backend} pair would silently stop
+    covering the fleet.
+    """
+    cgroup = _read_own_cgroup_v2_path()
+    if cgroup is None:
+        return None
+    components = cgroup.split("/")
+    leaf = components[-1]
+    if _WORKER_SLICE_COMPONENT in components or leaf.startswith(_WORKER_UNIT_PREFIX):
+        return False
+    if not leaf.endswith((".service", ".scope")):
+        return None
+    try:
+        from tools.hermes_service_guard import is_hermes_unit
+    except Exception as exc:  # pragma: no cover - import guard, never expected
+        logger.debug("Could not resolve the Hermes unit predicate: %s", exc)
+        return None
+    return True if is_hermes_unit(leaf) else None
+
+
+def _needs_restart_safe_scope() -> bool:
+    """Whether a child spawned here must be lifted into its own transient scope.
+
+    For the DISPATCH path, where the child is itself a worker. Placement wins when the
+    kernel gives an answer, because it is the property that actually determines where the
+    child lands; identity is the fallback for hosts where placement cannot be read.
+
+    In particular a worker that is the main pid of its own ``hermes-worker-*`` unit has
+    identity True and placement False, and must NOT be re-wrapped. Verified live on this
+    host: ``systemd-run --user --slice=hermes-workers.slice`` called from inside
+    ``hermes-worker-kanban-*.service`` places the new unit as a SIBLING under
+    ``hermes-workers.slice``, not as a child of the calling unit — so a double-wrapped
+    worker would escape the teardown of the scope that spawned it.
+    """
+    placement = _scope_needed_by_cgroup_placement()
+    if placement is not None:
+        return placement
+    return _is_supervised_worker_dispatcher()
+
+
+def _background_executor_needs_scope() -> bool:
+    """Whether a background terminal executor spawned here needs its own scope.
+
+    Deliberately the UNION of placement and identity, not the placement-wins rule of
+    :func:`_needs_restart_safe_scope`, because the child here is a command running *inside*
+    a Hermes process rather than a worker being dispatched:
+
+    * placement True — we are in a supervising unit's cgroup (or a descendant of its main
+      process), so an unwrapped executor's memory counts against that unit and a unit stop
+      kills it. This arm is what fixes the descendant leak for background commands too.
+    * identity True with placement False — we ARE a ``hermes-worker-*`` unit's main
+      process. A sibling scope is exactly the isolation #70716 asks for: a memory-heavy
+      executor gets its own ``MemoryMax`` instead of pushing the worker past its own, and
+      the session records ``systemd_unit`` so teardown stops it by name.
+    """
+    return _scope_needed_by_cgroup_placement() is True or _is_supervised_worker_dispatcher()
 
 
 def _build_systemd_scope_argv(
@@ -335,7 +446,10 @@ def restart_safe_supervised_child_argv(
     supervisors, and non-Linux hosts retain the direct command.
 
     Applies to every supervised unit that dispatches workers, not just the
-    gateway — see :func:`_is_supervised_worker_dispatcher`.
+    gateway, and to DESCENDANTS of such a unit's main process as well — see
+    :func:`_needs_restart_safe_scope`.  A dispatch tick that runs in a child of
+    the unit's main process spawns into the unit's own cgroup exactly like the
+    main process does, so gating on identity alone leaked those workers.
 
     ``env`` is the mapping the caller will hand to ``Popen``; the user-bus
     variables are copied into it because the wrapped ``systemd-run --user``
@@ -344,7 +458,7 @@ def restart_safe_supervised_child_argv(
     """
     if not _IS_LINUX:
         return command
-    if not _is_supervised_worker_dispatcher():
+    if not _needs_restart_safe_scope():
         return command
     if not _systemd_run_user_scope_available():
         raise RestartSafeScopeUnavailable(
@@ -883,12 +997,17 @@ class ProcessRegistry:
 
     def _scope_argv(self, session: ProcessSession, safe_command: str, unit_suffix: str, label: str) -> List[str]:
         """Login-shell argv for *safe_command* (parity with LocalEnvironment: rc files
-        sourced, user tools on PATH), wrapped in a transient systemd scope when we are
-        the main process of a supervised unit (own cgroup: an OOM kills only the worker,
-        not the service and its control plane)."""
+        sourced, user tools on PATH), wrapped in a transient systemd scope when a plain
+        child would share a supervised unit's memory accounting (own cgroup: an OOM kills
+        only the worker, not the service and its control plane).
+
+        Uses the UNION predicate, not the dispatch one: inside a ``hermes-worker-*`` unit a
+        separate scope is exactly the isolation #70716 wants for a memory-heavy executor,
+        and the session records ``systemd_unit`` so teardown stops it by name.
+        """
         argv = [_find_shell(), "-lic", f"set +m; {safe_command}"]
         # This applies to both pipe mode and the PTY path above. See #70716.
-        in_supervised_service = _IS_LINUX and _is_supervised_worker_dispatcher()
+        in_supervised_service = _IS_LINUX and _background_executor_needs_scope()
         if in_supervised_service and _systemd_run_user_scope_available():
             session.systemd_unit = f"hermes-worker-{unit_suffix}.service"
             return _build_systemd_scope_argv(

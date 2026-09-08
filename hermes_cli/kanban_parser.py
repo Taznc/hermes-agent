@@ -161,6 +161,12 @@ _SPECS = [
         _PRIORITY,
         _arg("--triage", action="store_true",
              help="Park in triage — a specifier will flesh out the spec and promote to todo"),
+        _arg("--idea", action="store_true", dest="idea",
+             help="Park in the inert Idea lane (rough wishlist capture). No automation ever "
+                  "touches it and --assignee is optional. Refine it with `kanban refine`."),
+        _arg("--roadmap", action="store_true", dest="roadmap",
+             help="Park in the inert Roadmap lane (hashed out with the operator, still not "
+                  "authorized to execute). Authorize it later with `kanban spawn`."),
         _arg("--idempotency-key",
              help="Dedup key. If a non-archived task with this key exists, "
                   "its id is returned instead of creating a duplicate."),
@@ -326,6 +332,14 @@ _SPECS = [
         _reason("Optional reason/note — recorded as a comment before unholding. Quote multi-word reasons."),
         _TASK_IDS,
     ], help="Take one or more tasks off On Hold, returning them to ready (or todo while parents remain open)"),
+    _cmd("refine", [_TASK_IDS], help="Promote wishlist cards from the Idea lane to the Roadmap lane"),
+    _cmd("demote", [_TASK_IDS], help="Send Roadmap cards back to the Idea lane"),
+    _cmd("spawn", [
+        _TASK_IDS,
+        _arg("--to", choices=sorted(kb.ROADMAP_SPAWN_TARGETS), default="triage",
+             help="Where the card lands (default: triage, so auto-decompose can re-specify or "
+                  "split it first; --to ready opts out)"),
+    ], help="Authorize Roadmap cards to execute, landing them in triage (default) or ready"),
     _cmd("request-review", [
         _TASK_ID,
         _arg("--summary", help="What was implemented and how it was verified — shown to the reviewer."),
@@ -358,6 +372,10 @@ _SPECS = [
     _cmd("dispatch", [
         _arg("--dry-run", action="store_true", help="Don't actually spawn processes; just print what would happen"),
         _arg("--max", type=int, help="Cap number of spawns this pass"),
+        _arg("--pause", nargs="*", metavar="NOTE",
+             help="Stop this board claiming/spawning new workers (running workers are "
+                  "untouched) so it can drain before a maintenance restart; optional NOTE "
+                  "is recorded on the pause. Clear it with --resume-circuit."),
         _arg("--resume-circuit", action="store_true",
              help="Clear this board's dispatch pause after operator recovery and exit"),
         _arg("--circuit-status", action="store_true",

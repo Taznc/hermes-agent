@@ -745,6 +745,7 @@ export interface SessionResumeResponse {
   // from the resume snapshot instead of being lost until server-side timeout.
   pending_clarify?: {
     answers?: Record<string, unknown>
+    notes?: Record<string, unknown>
     choices?: null | string[]
     multi_select?: boolean
     question?: string

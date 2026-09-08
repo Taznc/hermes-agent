@@ -31,7 +31,30 @@ const buttonVariants = cva(
         text: `text-muted-foreground underline-offset-4 hover:text-foreground hover:underline ${TEXT_ACTION_ICON}`,
         // Emphasized inline-text action: bold + always-underlined link. Use for
         // the actionable affordance in a row ("Change", "Set", "Open logs", …).
-        textStrong: `font-semibold text-muted-foreground underline underline-offset-4 hover:text-foreground ${TEXT_ACTION_ICON}`
+        textStrong: `font-semibold text-muted-foreground underline underline-offset-4 hover:text-foreground ${TEXT_ACTION_ICON}`,
+        // ── Severity fills ───────────────────────────────────────────────────
+        // The solid action inside a severity surface (a toast/alert already
+        // wearing that severity's stripe + 12% tint). Each pairs a FILL token
+        // with that token's own `-foreground`, which is the opposite contrast
+        // problem from the `-text` reading role the title/icon wear: solid
+        // under text vs text on tint. Keep them separate — collapsing them is
+        // what made severity titles illegible before the reskin.
+        //
+        // `severityError` is NOT `destructive`. `destructive` is the
+        // destructive-ACTION semantic (delete, remove) and carries `text-white`
+        // plus a `dark:bg-destructive/60` softening; severity chrome must stay
+        // at full fill in both modes so the toast's stripe, tint, and button
+        // read as one object.
+        severityError: 'bg-destructive text-destructive-foreground hover:bg-destructive/90',
+        severityWarning: 'bg-warning text-warning-foreground hover:bg-warning/90',
+        // Success uses `-solid`, not the raw `--color-success`: the mid-ramp
+        // green clears 4.5:1 against neither white nor near-black, so the
+        // text-bearing role gets its own lightness (styles.css). Stripe and
+        // tint keep the raw token.
+        severitySuccess: 'bg-success-solid text-success-foreground hover:bg-success-solid/90',
+        // Non-severity notice (info): a neutral solid so an info toast's action
+        // does not borrow primary-blue emphasis it has not earned.
+        severityInfo: 'bg-secondary text-secondary-foreground hover:bg-secondary/80'
       },
       size: {
         default: 'px-3 py-1.5 has-[>svg]:px-2.5',

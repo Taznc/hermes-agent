@@ -162,12 +162,130 @@ def test_connect_migrates_legacy_db_before_optional_column_indexes(tmp_path):
     assert "session_id" in task_columns
     assert "tenant" in task_columns
     assert "idempotency_key" in task_columns
+    assert "created_by_task" in task_columns
+    assert "created_by_run" in task_columns
     assert "run_id" in event_columns
     # And their indexes — the regression scope of this test:
     assert "idx_tasks_session_id" in indexes
     assert "idx_tasks_tenant" in indexes
     assert "idx_tasks_idempotency" in indexes
     assert "idx_events_run" in indexes
+
+
+def test_connect_migrates_legacy_task_runs_adds_analytics_columns(tmp_path):
+    """Legacy DBs whose ``task_runs`` predates the analytics-capture columns
+
+    (model/provider/reasoning_effort/model_source/session_id/token+call
+    totals/estimated_cost_usd) migrate cleanly: the columns appear, existing
+    rows stay NULL, and a fresh insert + read-back round-trips through the
+    new columns without a schema error."""
+    db_path = tmp_path / "legacy-runs-kanban.db"
+    conn = sqlite3.connect(str(db_path))
+    conn.execute(
+        """
+        CREATE TABLE tasks (
+            id TEXT PRIMARY KEY,
+            title TEXT NOT NULL,
+            body TEXT,
+            assignee TEXT,
+            status TEXT NOT NULL,
+            priority INTEGER NOT NULL DEFAULT 0,
+            created_by TEXT,
+            created_at INTEGER NOT NULL,
+            started_at INTEGER,
+            completed_at INTEGER,
+            workspace_kind TEXT NOT NULL DEFAULT 'scratch',
+            workspace_path TEXT,
+            claim_lock TEXT,
+            claim_expires INTEGER
+        )
+        """
+    )
+    conn.execute(
+        """
+        CREATE TABLE task_events (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            task_id TEXT NOT NULL,
+            kind TEXT NOT NULL,
+            payload TEXT,
+            created_at INTEGER NOT NULL
+        )
+        """
+    )
+    # Pre-analytics-capture ``task_runs`` shape (matches the schema before
+    # this migration — no model/provider/token/session_id columns).
+    conn.execute(
+        """
+        CREATE TABLE task_runs (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            task_id TEXT NOT NULL,
+            profile TEXT,
+            step_key TEXT,
+            status TEXT NOT NULL,
+            claim_lock TEXT,
+            claim_expires INTEGER,
+            worker_pid INTEGER,
+            max_runtime_seconds INTEGER,
+            last_heartbeat_at INTEGER,
+            started_at INTEGER NOT NULL,
+            ended_at INTEGER,
+            outcome TEXT,
+            summary TEXT,
+            metadata TEXT,
+            error TEXT
+        )
+        """
+    )
+    conn.execute(
+        "INSERT INTO tasks (id, title, status, created_at) "
+        "VALUES ('legacy', 'old board task', 'ready', 1)"
+    )
+    conn.execute(
+        "INSERT INTO task_runs (task_id, status, started_at) "
+        "VALUES ('legacy', 'done', 1)"
+    )
+    conn.commit()
+    conn.close()
+
+    with kbc.connect(db_path) as migrated:
+        run_columns = {row["name"] for row in migrated.execute("PRAGMA table_info(task_runs)")}
+        for col in (
+            "model", "provider", "reasoning_effort", "model_source", "session_id",
+            "input_tokens", "output_tokens", "cache_read_tokens", "reasoning_tokens",
+            "api_calls", "tool_calls", "estimated_cost_usd",
+        ):
+            assert col in run_columns, f"missing migrated column: {col}"
+
+        # Pre-migration row survives with every new column NULL.
+        legacy_row = migrated.execute(
+            "SELECT model, provider, session_id, input_tokens, estimated_cost_usd "
+            "FROM task_runs WHERE task_id = 'legacy'"
+        ).fetchone()
+        assert tuple(legacy_row) == (None, None, None, None, None)
+
+        # A fresh insert can populate every new column and read back exactly.
+        migrated.execute(
+            "INSERT INTO task_runs ("
+            "    task_id, status, started_at, model, provider, reasoning_effort,"
+            "    model_source, session_id, input_tokens, output_tokens,"
+            "    cache_read_tokens, reasoning_tokens, api_calls, tool_calls,"
+            "    estimated_cost_usd"
+            ") VALUES ("
+            "    'legacy', 'done', 2, 'claude-sonnet-5', 'anthropic', 'high',"
+            "    'card_override', '20260101_000000_abcdef', 100, 50, 10, 5, 3, 7, 0.05"
+            ")"
+        )
+        migrated.commit()
+        row = migrated.execute(
+            "SELECT model, provider, reasoning_effort, model_source, session_id, "
+            "input_tokens, output_tokens, cache_read_tokens, reasoning_tokens, "
+            "api_calls, tool_calls, estimated_cost_usd "
+            "FROM task_runs WHERE started_at = 2"
+        ).fetchone()
+        assert tuple(row) == (
+            "claude-sonnet-5", "anthropic", "high", "card_override",
+            "20260101_000000_abcdef", 100, 50, 10, 5, 3, 7, 0.05,
+        )
 
 
 def test_connect_migrates_legacy_task_comments_adds_choice_json(tmp_path):
@@ -427,12 +545,12 @@ def _exited_status(code: int) -> int:
 
 
 
-def test_rate_limit_exit_requeues_without_counting_failure(
+def test_rate_limit_exit_with_valid_deadline_requeues_without_counting_failure(
     kanban_home, monkeypatch,
 ):
-    """A rate-limit sentinel exit releases the task to ``ready`` and leaves
-    ``consecutive_failures`` untouched — the breaker must never trip on a
-    transient throttle, even across many quota-wall hits."""
+    """A rate-limit sentinel carrying a validated finite deadline releases the
+    task to ``ready`` and leaves ``consecutive_failures`` untouched — the
+    breaker must never trip while a real quota window is active."""
     import hermes_cli.kanban_db as _kb
     from hermes_cli import kanban_db_dispatch as _kbd
 
@@ -450,13 +568,16 @@ def test_rate_limit_exit_requeues_without_counting_failure(
             # Claim to open a real run (so detect_crashed_workers can close
             # it with a rate_limited outcome), then point the claim at this
             # host + a dead pid so the crash path acts on it.
-            kb.claim_task(conn, tid, claimer=f"{host}:w{i}")
+            claimed = kb.claim_task(conn, tid, claimer=f"{host}:w{i}")
+            assert claimed is not None
             conn.execute(
                 "UPDATE tasks SET worker_pid=?, consecutive_failures=? "
                 "WHERE id=?",
                 (pid, 0, tid),
             )
             conn.commit()
+            with _kbd._open_worker_log(claimed, None) as log:
+                log.write(b"quota exhausted (429); retry after 60s.\n")
             _kbd._record_worker_exit(
                 pid, _exited_status(_kb.KANBAN_RATE_LIMIT_EXIT_CODE)
             )
@@ -1207,9 +1328,8 @@ class TestSharedBoardPaths:
     ):
         # The dispatcher must pin board paths while stripping any unrelated
         # HERMES_SESSION_* identity inherited from the long-lived gateway.
-        # The one exception is HERMES_SESSION_SOURCE, which the dispatcher
-        # re-sets to its own `kanban` tag AFTER the strip — a value it owns,
-        # never one inherited from whatever the gateway last routed.
+        # It then sets its own source tag and freshly generated worker session
+        # id AFTER the strip; neither value may come from stale gateway routing.
         default_home = tmp_path / ".hermes"
         default_home.mkdir()
         self._set_home(monkeypatch, tmp_path, default_home)
@@ -1267,6 +1387,10 @@ class TestSharedBoardPaths:
                 # Re-set by the dispatcher, so what matters is that it carries
                 # the worker's own tag rather than the inherited routing value.
                 assert env[key] == "kanban"
+                continue
+            if key == "HERMES_SESSION_ID":
+                assert env[key] == getattr(task, "_worker_session_id")
+                assert env[key] != "stale-routing-value"
                 continue
             assert key not in env
 
@@ -1564,6 +1688,76 @@ def test_unarchiving_completed_parent_clears_evidence_and_regates_children(kanba
         later_child = kb.create_task(conn, title="still gated", parents=[parent])
         still_gated = kb.get_task(conn, later_child)
         assert still_gated is not None and still_gated.status == "todo"
+
+
+def test_archiving_completed_parent_clears_only_its_satisfied_child_edges(kanban_home):
+    """Archival deletes edges it satisfied forever; it keeps every other edge.
+
+    A completed parent's dependency is satisfied permanently (``completed_at``
+    is durable), so its outgoing edge can never gate again — but surfaces that
+    resolve links against the active board cannot see the archived parent and
+    conservatively report the leftover row as an unresolved blocker. Archival
+    therefore drops those rows, and ONLY those: an archived-incomplete parent
+    was withdrawn and must keep gating, and edges where the archived task is
+    the child belong to the surviving parent's history.
+    """
+    with kbc.connect() as conn:
+        def parent_edges(task_id: str) -> list[str]:
+            return [
+                r[0] for r in conn.execute(
+                    "SELECT child_id FROM task_links WHERE parent_id = ? ORDER BY child_id",
+                    (task_id,),
+                ).fetchall()
+            ]
+
+        def child_edges(task_id: str) -> list[str]:
+            return [
+                r[0] for r in conn.execute(
+                    "SELECT parent_id FROM task_links WHERE child_id = ? ORDER BY parent_id",
+                    (task_id,),
+                ).fetchall()
+            ]
+
+        # Completed parent: its outgoing edge is satisfied for good.
+        # The grandparent completes (but is NOT archived) so `completed` is
+        # itself completable while keeping a real incoming edge on the board.
+        grandparent = kb.create_task(conn, title="grandparent")
+        completed = kb.create_task(conn, title="completed parent", parents=[grandparent])
+        released = kb.create_task(conn, title="released child", parents=[completed])
+        assert parent_edges(completed) == [released]
+        assert kb.complete_task(conn, grandparent)
+
+        assert kb.complete_task(conn, completed)
+        assert kb.archive_task(conn, completed)
+        assert parent_edges(completed) == [], (
+            "archiving a completed parent must delete the satisfied edge so the "
+            "child stops reporting an unresolvable blocker"
+        )
+        # Criterion 3: the archived task's own incoming edge is history on the
+        # surviving grandparent and must survive untouched.
+        assert child_edges(completed) == [grandparent]
+        assert parent_edges(grandparent) == [completed]
+        freed = kb.get_task(conn, released)
+        assert freed is not None and freed.status == "ready"
+        assert any(
+            event.kind == "archived" and (event.payload or {}).get("cleared_child_links") == [released]
+            for event in kb.list_events(conn, completed)
+        ), "the cleared edges must be auditable on the archived event"
+
+        # Withdrawn parent: never completed, so the edge stays and keeps gating.
+        withdrawn = kb.create_task(conn, title="withdrawn parent")
+        blocked = kb.create_task(conn, title="still blocked", parents=[withdrawn])
+        assert kb.archive_task(conn, withdrawn)
+        assert parent_edges(withdrawn) == [blocked], (
+            "an archived-incomplete parent is withdrawn, not satisfied: its edge "
+            "must remain so the child keeps showing a real blocker"
+        )
+        gated = kb.get_task(conn, blocked)
+        assert gated is not None and gated.status == "todo"
+        assert kb._parents_satisfied(conn, blocked) is False
+        ok, reason = kb.promote_task(conn, blocked, actor="operator")
+        assert ok is False and withdrawn in (reason or "")
+        assert kb.claim_task(conn, blocked, claimer="worker") is None
 
 
 
@@ -2143,3 +2337,335 @@ def test_bare_connect_does_not_close_on_context_exit(tmp_path):
     # Still usable after with-block exit (the leak).
     conn.execute("SELECT 1").fetchone()
     conn.close()  # explicit close to avoid leaking THIS test
+
+
+# ---------------------------------------------------------------------------
+# Roadmap lanes (idea / roadmap) — inert wishlist statuses
+# ---------------------------------------------------------------------------
+
+
+def test_lane_creation_lands_in_lane_without_assignee(kanban_home):
+    """``lane`` parks the card in the wishlist and makes ``assignee`` optional:
+    nothing dispatches a lane card, so demanding an assignee would be noise."""
+    with kbc.connect_closing() as conn:
+        idea = kb.create_task(conn, title="wishlist item", lane="idea")
+        road = kb.create_task(conn, title="agreed item", lane="roadmap")
+        assert kb.get_task(conn, idea).status == "idea"
+        assert kb.get_task(conn, idea).assignee is None
+        assert kb.get_task(conn, road).status == "roadmap"
+
+
+def test_lane_beats_parent_gating(kanban_home):
+    """An epic child in a lane must stay in the lane, never land in ``todo`` where the
+    promotion sweep would pick it up once the parent finished."""
+    with kbc.connect_closing() as conn:
+        epic = kb.create_task(conn, title="epic", assignee="alice")
+        child = kb.create_task(conn, title="child", lane="roadmap", parents=(epic,))
+        assert kb.get_task(conn, child).status == "roadmap"
+        kb.complete_task(conn, epic, summary="done")
+        kb.recompute_ready(conn)
+        # Parent is done; a ``todo`` child would have been promoted. The lane card is not.
+        assert kb.get_task(conn, child).status == "roadmap"
+
+
+@pytest.mark.parametrize("kwargs", [
+    {"triage": True},
+    {"initial_status": "blocked"},
+])
+def test_lane_conflicts_with_other_landing_flags(kanban_home, kwargs):
+    """``lane``/``triage``/``initial_status`` are three answers to one question; silently
+    picking one would put a wishlist card in the work queue or vice versa."""
+    with kbc.connect_closing() as conn:
+        with pytest.raises(ValueError, match="mutually exclusive"):
+            kb.create_task(conn, title="x", assignee="alice", lane="idea", **kwargs)
+
+
+def test_invalid_lane_rejected(kanban_home):
+    with kbc.connect_closing() as conn:
+        with pytest.raises(ValueError, match="lane must be one of"):
+            kb.create_task(conn, title="x", lane="backlog")
+
+
+def test_refine_demote_spawn_round_trip_with_events(kanban_home):
+    """The three lane verbs move the card and leave an auditable event each."""
+    with kbc.connect_closing() as conn:
+        tid = kb.create_task(conn, title="wishlist item", lane="idea")
+
+        assert kb.refine_task(conn, tid) is True
+        assert kb.get_task(conn, tid).status == "roadmap"
+
+        assert kb.demote_task(conn, tid) is True
+        assert kb.get_task(conn, tid).status == "idea"
+
+        kb.refine_task(conn, tid)
+        assert kb.spawn_roadmap_task(conn, tid) is True
+        assert kb.get_task(conn, tid).status == "triage"
+
+        kinds = [e.kind for e in kb.list_events(conn, tid)]
+        assert kinds.count("refined") == 2
+        assert kinds.count("demoted") == 1
+        assert kinds.count("spawned_from_roadmap") == 1
+
+
+def test_spawn_defaults_to_triage_and_ready_opts_out(kanban_home):
+    """Default landing is ``triage`` so auto-decompose re-specifies first; ``ready`` is
+    the explicit opt-out."""
+    with kbc.connect_closing() as conn:
+        a = kb.create_task(conn, title="a", lane="roadmap")
+        b = kb.create_task(conn, title="b", lane="roadmap")
+        kb.spawn_roadmap_task(conn, a)
+        kb.spawn_roadmap_task(conn, b, to="ready")
+        assert kb.get_task(conn, a).status == "triage"
+        assert kb.get_task(conn, b).status == "ready"
+
+        with pytest.raises(ValueError, match="spawn target must be one of"):
+            kb.spawn_roadmap_task(conn, kb.create_task(conn, title="c", lane="roadmap"), to="done")
+
+
+@pytest.mark.parametrize("live_status", [
+    "triage", "todo", "ready", "blocked", "on_hold", "scheduled", "review", "done", "running",
+])
+@pytest.mark.parametrize("verb", ["refine", "demote", "spawn"])
+def test_no_live_status_can_enter_a_lane(kanban_home, live_status, verb):
+    """The wishlist is entry-at-creation only. Every live status is refused with a
+    ValueError naming the attempted from->to, so the existing unblock/hold habits can
+    never park real work in the wishlist."""
+    apply = {
+        "refine": kb.refine_task,
+        "demote": kb.demote_task,
+        "spawn": kb.spawn_roadmap_task,
+    }[verb]
+    with kbc.connect_closing() as conn:
+        tid = kb.create_task(conn, title="live work", assignee="alice")
+        _set_task_status(conn, tid, live_status)
+        with pytest.raises(ValueError, match=f"{live_status!r} -> "):
+            apply(conn, tid)
+        assert kb.get_task(conn, tid).status == live_status
+
+
+def test_idea_cannot_spawn_directly(kanban_home):
+    """An idea must be refined before it can execute — spawning one is refused."""
+    with kbc.connect_closing() as conn:
+        tid = kb.create_task(conn, title="raw idea", lane="idea")
+        with pytest.raises(ValueError, match="'idea' -> 'triage'"):
+            kb.spawn_roadmap_task(conn, tid)
+        assert kb.get_task(conn, tid).status == "idea"
+
+
+@pytest.mark.parametrize("lane", ["idea", "roadmap"])
+def test_every_live_mutator_refuses_a_lane_card(kanban_home, lane):
+    """Table-driven transition matrix: no existing lifecycle mutator may move a lane card.
+    Each returns False (its status-guarded UPDATE matches nothing) rather than corrupting
+    the wishlist."""
+    with kbc.connect_closing() as conn:
+        def fresh() -> str:
+            return kb.create_task(conn, title="wish", lane=lane)
+
+        assert kb.promote_task(conn, fresh(), actor="op")[0] is False
+        assert kb.hold_task(conn, fresh()) is False
+        assert kb.unhold_task(conn, fresh()) is False
+        assert kb.schedule_task(conn, fresh()) is False
+        assert kb.block_task(conn, fresh(), reason="r") is False
+        assert kb.unblock_task(conn, fresh()) is False
+        assert kb.request_review(conn, fresh(), summary="s") is False
+        assert kb.complete_task(conn, fresh(), summary="s") is False
+        assert kb.claim_task(conn, fresh()) is None
+
+
+@pytest.mark.parametrize("lane", ["idea", "roadmap"])
+def test_archive_allowed_from_a_lane(kanban_home, lane):
+    """Dropping a wishlist item is always allowed."""
+    with kbc.connect_closing() as conn:
+        tid = kb.create_task(conn, title="drop me", lane=lane)
+        assert kb.archive_task(conn, tid) is True
+        assert kb.get_task(conn, tid).status == "archived"
+
+
+def test_board_stats_reports_lanes_but_excludes_them_from_active(kanban_home):
+    """Lane cards are visible in ``by_status`` but are not live work: a board holding only
+    wishlist items must report zero active."""
+    with kbc.connect_closing() as conn:
+        for i in range(3):
+            kb.create_task(conn, title=f"idea {i}", lane="idea")
+        for i in range(2):
+            kb.create_task(conn, title=f"road {i}", lane="roadmap")
+        stats = kb.board_stats(conn)
+        assert stats["by_status"]["idea"] == 3
+        assert stats["by_status"]["roadmap"] == 2
+        assert stats["roadmap_total"] == 5
+        assert stats["active_total"] == 0
+
+        kb.create_task(conn, title="real work", assignee="alice")
+        assert kb.board_stats(conn)["active_total"] == 1
+
+
+def test_lanes_are_listed_by_default(kanban_home):
+    """Inert does not mean hidden: the lanes still show up in the default listing."""
+    with kbc.connect_closing() as conn:
+        kb.create_task(conn, title="wish", lane="idea")
+        assert [t.status for t in kb.list_tasks(conn)] == ["idea"]
+        assert [t.title for t in kb.list_tasks(conn, status="roadmap")] == []
+
+
+def test_lane_board_is_completely_inert(kanban_home, all_assignees_spawnable, monkeypatch):
+    """The load-bearing guarantee: a board of nothing but lane cards must survive a full
+    dispatcher tick, both triage sweeps and ``recompute_ready`` with ZERO events and zero
+    row changes. This is the regression guard against a future ``status IN (...)`` whitelist
+    quietly gaining one of the lane names."""
+    from hermes_cli import kanban_decompose, kanban_specify
+
+    def fake_spawn(task, workspace, board=None):  # pragma: no cover - must never be called
+        raise AssertionError(f"dispatcher spawned a lane card: {task.id}")
+
+    with kbc.connect_closing() as conn:
+        for i in range(50):
+            kb.create_task(conn, title=f"idea {i}", lane="idea", assignee="alice")
+            kb.create_task(conn, title=f"road {i}", lane="roadmap", assignee="alice")
+
+        before_rows = conn.execute(
+            "SELECT id, status, assignee, claim_lock, worker_pid, current_run_id FROM tasks "
+            "ORDER BY id"
+        ).fetchall()
+        before_events = conn.execute("SELECT COUNT(*) AS n FROM task_events").fetchone()["n"]
+        before_runs = conn.execute("SELECT COUNT(*) AS n FROM task_runs").fetchone()["n"]
+
+        res = kbd.dispatch_once(conn, spawn_fn=fake_spawn)
+        promoted = kb.recompute_ready(conn)
+        triage_decompose = kanban_decompose.list_triage_ids()
+        triage_specify = kanban_specify.list_triage_ids()
+
+        after_rows = conn.execute(
+            "SELECT id, status, assignee, claim_lock, worker_pid, current_run_id FROM tasks "
+            "ORDER BY id"
+        ).fetchall()
+        after_events = conn.execute("SELECT COUNT(*) AS n FROM task_events").fetchone()["n"]
+        after_runs = conn.execute("SELECT COUNT(*) AS n FROM task_runs").fetchone()["n"]
+
+    assert not res.spawned and not res.crashed and not res.timed_out and not res.stale
+    assert not res.auto_blocked and not res.reclaimed and res.promoted == 0
+    assert promoted == 0
+    # The sweeps select status='triage'; a lane id appearing here means a lane leaked into
+    # the auto-decompose/specify input queue.
+    assert triage_decompose == []
+    assert triage_specify == []
+    assert [tuple(r) for r in after_rows] == [tuple(r) for r in before_rows]
+    assert after_events == before_events
+    assert after_runs == before_runs
+
+
+def test_spawn_to_ready_is_parent_gated_and_never_bogus_ready(
+    kanban_home, all_assignees_spawnable,
+):
+    """``spawn --to ready`` under an unfinished parent must land in ``todo``.
+
+    Every other entry into ``ready`` (unblock/promote/unarchive/dashboard) consults the parent
+    gate first. ``_lane_transition`` was a bare status CAS, so a lane card rendered as ``ready``
+    until the next dispatcher tick, where ``claim_task`` refused it with ``claim_rejected
+    {parents_not_done}`` and knocked it back to ``todo``. Assert the landing AND the absence of
+    that self-correction on the first tick — the event is what proves nothing had to be undone.
+    """
+    def fake_spawn(task, workspace, board=None):  # pragma: no cover - must never be called
+        raise AssertionError(f"dispatcher spawned a parent-gated card: {task.id}")
+
+    with kbc.connect_closing() as conn:
+        epic = kb.create_task(conn, title="epic", assignee="alice")
+        child = kb.create_task(
+            conn, title="gated child", assignee="alice", lane="roadmap", parents=(epic,),
+        )
+
+        assert kb.spawn_roadmap_task(conn, child, to="ready") is True
+        assert kb.get_task(conn, child).status == "todo"
+
+        spawn_events = [e for e in kb.list_events(conn, child) if e.kind == "spawned_from_roadmap"]
+        assert len(spawn_events) == 1
+        # The operator asked for ``ready``; the audit trail keeps both the request and the
+        # gated landing rather than silently rewriting one into the other.
+        assert spawn_events[0].payload == {"status": "todo", "requested_status": "ready"}
+
+        kbd.dispatch_once(conn, spawn_fn=fake_spawn)
+        assert [e.kind for e in kb.list_events(conn, child)].count("claim_rejected") == 0
+        assert kb.get_task(conn, child).status == "todo"
+
+        # The gate defers the landing, it does not cancel it: the card promotes normally
+        # once the parent finishes.
+        kb.complete_task(conn, epic, summary="done")
+        kb.recompute_ready(conn)
+        assert kb.get_task(conn, child).status == "ready"
+
+
+def test_spawn_to_ready_ungated_when_parents_are_done(kanban_home):
+    """The gate only defers — a satisfied (or absent) parent still lands directly in ``ready``
+    with the plain payload, so the common case keeps its existing contract."""
+    with kbc.connect_closing() as conn:
+        epic = kb.create_task(conn, title="epic", assignee="alice")
+        kb.complete_task(conn, epic, summary="done")
+        child = kb.create_task(
+            conn, title="child", assignee="alice", lane="roadmap", parents=(epic,),
+        )
+        assert kb.spawn_roadmap_task(conn, child, to="ready") is True
+        assert kb.get_task(conn, child).status == "ready"
+        spawned = [e for e in kb.list_events(conn, child) if e.kind == "spawned_from_roadmap"]
+        assert spawned[0].payload == {"status": "ready"}
+
+
+def test_spawn_to_triage_ignores_the_parent_gate(kanban_home):
+    """``triage`` is not a parent-gated status: an unfinished parent must not divert a
+    re-specify request into ``todo``, where no decomposer sweep would ever see it."""
+    with kbc.connect_closing() as conn:
+        epic = kb.create_task(conn, title="epic", assignee="alice")
+        child = kb.create_task(
+            conn, title="child", assignee="alice", lane="roadmap", parents=(epic,),
+        )
+        assert kb.spawn_roadmap_task(conn, child) is True
+        assert kb.get_task(conn, child).status == "triage"
+        spawned = [e for e in kb.list_events(conn, child) if e.kind == "spawned_from_roadmap"]
+        assert spawned[0].payload == {"status": "triage"}
+
+
+@pytest.mark.parametrize("lane", ["idea", "roadmap"])
+def test_unarchive_from_a_lane_records_the_wishlist_exit(kanban_home, lane):
+    """archive + unarchive is the second route out of a lane into live work; it must leave the
+    same ``spawned_from_roadmap`` audit mark ``spawn_roadmap_task`` does, or the wishlist->work
+    trail is skippable by taking the quieter path."""
+    with kbc.connect_closing() as conn:
+        tid = kb.create_task(conn, title="wish", assignee="alice", lane=lane)
+        assert kb.archive_task(conn, tid) is True
+        # The pre-archive status is what makes the exit recognisable later.
+        archived = [e for e in kb.list_events(conn, tid) if e.kind == "archived"]
+        assert archived[-1].payload["from_status"] == lane
+
+        assert kb.unarchive_task(conn, tid, status="ready") is True
+        assert kb.get_task(conn, tid).status == "ready"
+        kinds = [e.kind for e in kb.list_events(conn, tid)]
+        assert kinds.count("unarchived") == 1
+        assert kinds.count("spawned_from_roadmap") == 1
+        exit_event = [e for e in kb.list_events(conn, tid) if e.kind == "spawned_from_roadmap"][0]
+        assert exit_event.payload == {"status": "ready", "via": "unarchive"}
+
+
+def test_unarchive_of_ordinary_work_is_not_a_lane_exit(kanban_home):
+    """Only a card archived FROM a lane gets the wishlist audit event; ordinary work
+    round-tripping through the archive must not be mislabelled as a roadmap spawn."""
+    with kbc.connect_closing() as conn:
+        tid = kb.create_task(conn, title="real work", assignee="alice")
+        kb.archive_task(conn, tid)
+        kb.unarchive_task(conn, tid, status="ready")
+        kinds = [e.kind for e in kb.list_events(conn, tid)]
+        assert "spawned_from_roadmap" not in kinds
+
+
+@pytest.mark.parametrize("lane", ["idea", "roadmap"])
+def test_idempotency_key_ignores_lane_cards(kanban_home, lane):
+    """A lane card must not answer an idempotent create replay. It is not live work (it sits in
+    ``NON_ACTIVE_STATUSES`` beside ``archived``), so matching it would suppress the real task the
+    replay was meant to create and return a wishlist id to the caller instead."""
+    with kbc.connect_closing() as conn:
+        wish = kb.create_task(conn, title="wish", lane=lane, idempotency_key="k1")
+        assert kb.get_task_by_idempotency_key(conn, "k1") is None
+
+        real = kb.create_task(conn, title="real", assignee="alice", idempotency_key="k1")
+        assert real != wish
+        assert kb.get_task(conn, real).status == "ready"
+        # The live task still deduplicates its own replays.
+        assert kb.create_task(conn, title="real again", assignee="alice",
+                              idempotency_key="k1") == real

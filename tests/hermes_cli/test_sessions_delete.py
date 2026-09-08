@@ -14,6 +14,9 @@ def test_sessions_delete_accepts_unique_id_prefix(monkeypatch, capsys):
             captured["resolved_from"] = session_id
             return "20260315_092437_c9a6ff"
 
+        def resolve_session_ids(self, raw_ids):
+            return [self.resolve_session_id(raw) for raw in raw_ids], []
+
         def get_session(self, session_id):
             return {"id": session_id, "pinned": 0}
 

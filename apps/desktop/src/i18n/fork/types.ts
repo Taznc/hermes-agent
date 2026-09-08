@@ -24,6 +24,17 @@ export interface ForkTranslations {
       secretStorageHintEnable: string
       secretStorageHintDismiss: string
       openLogsFailed: string
+      /** Browser build: the host owns no connection registry, so this page can
+       *  only ever describe the one backend it is served by. Says so plainly
+       *  instead of rendering an empty "unavailable" page that reads like a
+       *  bug the user could fix. */
+      singleBackendTitle: string
+      /** With the backend's host, when the connection descriptor has one. */
+      singleBackendDesc: (host: string) => string
+      /** Host-free variant — used before the descriptor lands, or when its
+       *  baseUrl does not parse. Never paints "on undefined". */
+      singleBackendDescNoHost: string
+      singleBackendDocsLink: string
     }
     sessions: {
       /** Phase 2.12 — `sessions.rate_limit_default_recovery` (ask | resume_at_reset). */
@@ -76,6 +87,52 @@ export interface ForkTranslations {
     catchingUpNotice: string
     turnLostNotice: string
     turnLostRegenerate: string
+    /** Manual, advisory model-recommendation flow (`model_recommendation.get`). */
+    recommend: {
+      trigger: string
+      presetLabel: string
+      presets: { balanced: string; save_codex: string; best_quality: string }
+      /** Concise description of what each preset optimizes for. */
+      presetDescriptions: { balanced: string; save_codex: string; best_quality: string }
+      /** Shown INSTEAD of a selection while the profile-scoped read is pending —
+       *  painting a default would claim a stored choice that was never read. */
+      presetLoading: string
+      presetUnsaved: string
+      resultsLabel: string
+      /** States the FINAL privacy boundary: draft + attachment metadata only. */
+      privacy: string
+      pending: string
+      apply: string
+      /** Shown when the selection path did not apply outright — usually a
+       *  pending expensive-model confirmation, never a claim of failure. */
+      applyUnconfirmed: string
+      /** The selection path FAILED. Distinct from `applyUnconfirmed`: there is
+       *  nothing left to confirm, and the previous model is still in use
+       *  because the switch was rolled back (or never took effect). */
+      applyFailed: string
+      /** The switch failed AND the gateway refused the compensation, so the
+       *  backend may be left on the new model. Never claims a rollback that
+       *  did not happen — points the user at the model menu to verify. */
+      applyUnrestored: string
+      retry: string
+      failed: string
+      unavailable: string
+      unsupported: string
+      /** Results no longer describe the live draft/attachments/preset. */
+      stale: string
+      refresh: string
+      emptyDraft: string
+      draftTooLong: string
+      tooManyAttachments: string
+      attachmentUnsupported: string
+      /** Every reported state is rendered, `fresh` included: an unreported
+       *  availability and a checked-live one must not look the same. */
+      availability: { failed: string; fresh: string; stale: string; unavailable: string; unsupported: string }
+      /** The backend reported this route's quota is exhausted. */
+      limitReached: string
+      /** The backend reported this route is not permitted right now. */
+      notAllowed: string
+    }
   }
   assistant: {
     thread: {

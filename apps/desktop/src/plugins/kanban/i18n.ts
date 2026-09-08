@@ -333,6 +333,19 @@ type KanbanMessages = {
   profileDescriptionsHint: string
   profileGoodAt: string
   auto: string
+  // dispatch pause / maintenance drain
+  dispatchControl: string
+  pauseDispatch: string
+  resumeDispatch: string
+  draining: (running: number) => string
+  safeToRestart: string
+  dispatchRunning: string
+  pauseBusy: string
+  resumeBusy: string
+  pauseAllBoards: string
+  resumeAllBoards: string
+  boardsPaused: (paused: number, total: number) => string
+  pauseHint: string
   // native/toast notifications for terminal worker events (completion-notify)
   notify: {
     completedTitle: string
@@ -671,6 +684,19 @@ export const en: KanbanMessages = {
     'Descriptions guide the decomposer’s routing. Auto-generate with the auxiliary model, or write your own.',
   profileGoodAt: 'What is this profile good at?',
   auto: 'Auto',
+  dispatchControl: 'Dispatch',
+  pauseDispatch: 'Pause dispatch',
+  resumeDispatch: 'Resume dispatch',
+  draining: running => `${running} running — draining`,
+  safeToRestart: '0 running — safe to restart',
+  dispatchRunning: 'Dispatching normally',
+  pauseBusy: 'A dispatch tick is in progress — try pausing again in a moment.',
+  resumeBusy: 'A dispatch tick is in progress — try resuming again in a moment.',
+  pauseAllBoards: 'Pause all boards',
+  resumeAllBoards: 'Resume all boards',
+  boardsPaused: (paused, total) => `${paused} of ${total} boards paused`,
+  pauseHint:
+    'Stops new workers being claimed and spawned. Workers already running are never killed — wait for the count to reach 0 before restarting the gateway.',
   notify: {
     completedTitle: 'Task completed',
     blockedTitle: 'Task blocked — needs your input',
@@ -1008,6 +1034,19 @@ const ja: KanbanMessages = {
     '説明はデコンポーザーのルーティングを導きます。補助モデルで自動生成するか、自分で書いてください。',
   profileGoodAt: 'このプロフィールの得意分野は？',
   auto: '自動',
+  dispatchControl: 'ディスパッチ',
+  pauseDispatch: 'ディスパッチを一時停止',
+  resumeDispatch: 'ディスパッチを再開',
+  draining: running => `実行中 ${running} 件 — 排出中`,
+  safeToRestart: '実行中 0 件 — 再起動しても安全',
+  dispatchRunning: '通常どおりディスパッチ中',
+  pauseBusy: 'ディスパッチのティック実行中です。少し待ってからもう一度お試しください。',
+  resumeBusy: 'ディスパッチのティック実行中です。少し待ってから再開をお試しください。',
+  pauseAllBoards: 'すべてのボードを一時停止',
+  resumeAllBoards: 'すべてのボードを再開',
+  boardsPaused: (paused, total) => `${total} 件中 ${paused} 件のボードが一時停止中`,
+  pauseHint:
+    '新しいワーカーの取得と起動を停止します。実行中のワーカーが強制終了されることはありません。ゲートウェイを再起動する前に、件数が 0 になるまで待ってください。',
   notify: {
     completedTitle: 'タスク完了',
     blockedTitle: 'タスクがブロック中 — 入力が必要です',
@@ -1337,6 +1376,18 @@ const zh: KanbanMessages = {
   profileDescriptionsHint: '说明用于引导分解器的路由。可用辅助模型自动生成，或自行填写。',
   profileGoodAt: '这个配置档擅长什么？',
   auto: '自动',
+  dispatchControl: '调度',
+  pauseDispatch: '暂停调度',
+  resumeDispatch: '恢复调度',
+  draining: running => `${running} 个运行中 — 正在排空`,
+  safeToRestart: '0 个运行中 — 可以安全重启',
+  dispatchRunning: '调度正常运行中',
+  pauseBusy: '正在执行一次调度周期，请稍后再试。',
+  resumeBusy: '正在执行一次调度周期，请稍后再尝试恢复。',
+  pauseAllBoards: '暂停所有面板',
+  resumeAllBoards: '恢复所有面板',
+  boardsPaused: (paused, total) => `${total} 个面板中有 ${paused} 个已暂停`,
+  pauseHint: '停止领取和启动新的工作者。已在运行的工作者不会被终止 — 请等待计数归零后再重启网关。',
   notify: {
     completedTitle: '任务已完成',
     blockedTitle: '任务受阻 — 需要你的输入',
@@ -1666,6 +1717,18 @@ const zhHant: KanbanMessages = {
   profileDescriptionsHint: '說明用於引導分解器的路由。可用輔助模型自動產生，或自行填寫。',
   profileGoodAt: '這個設定檔擅長什麼？',
   auto: '自動',
+  dispatchControl: '調度',
+  pauseDispatch: '暫停調度',
+  resumeDispatch: '恢復調度',
+  draining: running => `${running} 個執行中 — 正在排空`,
+  safeToRestart: '0 個執行中 — 可以安全重啟',
+  dispatchRunning: '調度正常執行中',
+  pauseBusy: '正在執行一次調度週期，請稍後再試。',
+  resumeBusy: '正在執行一次調度週期，請稍後再嘗試恢復。',
+  pauseAllBoards: '暫停所有面板',
+  resumeAllBoards: '恢復所有面板',
+  boardsPaused: (paused, total) => `${total} 個面板中有 ${paused} 個已暫停`,
+  pauseHint: '停止領取與啟動新的工作者。已在執行的工作者不會被終止 — 請等待計數歸零後再重啟閘道。',
   notify: {
     completedTitle: '任務已完成',
     blockedTitle: '任務受阻 — 需要你的輸入',

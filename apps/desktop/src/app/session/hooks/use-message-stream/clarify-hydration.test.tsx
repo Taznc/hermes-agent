@@ -170,6 +170,21 @@ describe('clarify.request stream hydration', () => {
     expect(clarifyParts()).toHaveLength(1)
   })
 
+  it('keeps the same owned card answerable when reconnect replays its request', () => {
+    mountStream()
+
+    toolStart({ args: { choices: ['a'], question: 'Pick' }, name: 'clarify', tool_id: 'call-reconnect' })
+    clarifyRequest({ choices: ['a'], question: 'Pick', request_id: 'req-reconnect' })
+    // `session.resume` replays the still-pending request through the normal
+    // stream event. It must re-arm the original card, not create a second one
+    // or clear the request before the user acts.
+    clarifyRequest({ choices: ['a'], question: 'Pick', request_id: 'req-reconnect' })
+
+    expect($clarifyRequests.get()[SID]?.requestId).toBe('req-reconnect')
+    expect(clarifyParts()).toHaveLength(1)
+    expect(clarifyParts()[0]).not.toHaveProperty('result')
+  })
+
   it('re-arms a hydrated Codex tool-only clarify in place instead of appending a second card', () => {
     mountStream()
 

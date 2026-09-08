@@ -32,9 +32,61 @@ export const forkJa: TranslationOverrides = {
       openLogsFailed: 'ログフォルダを開けませんでした'
     }
   },
+  composer: {
+    recommend: {
+      trigger: 'おすすめ',
+      presetLabel: 'おすすめの基準',
+      presets: {
+        balanced: 'バランス',
+        save_codex: 'Codex を温存',
+        best_quality: '品質優先'
+      },
+      presetDescriptions: {
+        balanced: 'バランス：妥当なコストで十分な品質を狙います。',
+        save_codex: 'Codex を温存：他のルートを優先し、Codex の利用枠を長持ちさせます。',
+        best_quality: '品質優先：コストにかかわらず最も強力なルートを選びます。'
+      },
+      presetLoading: '設定を読み込み中…',
+      presetUnsaved: 'このバックエンドでは保存されません — 今回のセッションのみ有効です。',
+      resultsLabel: 'モデルのおすすめ',
+      privacy:
+        '現在の下書きと添付ファイルの名前・種類のみを確認します。会話履歴、ファイルの内容、プロジェクトファイルは送信されません。',
+      pending: '確認中…',
+      apply: '適用',
+      applyUnconfirmed: 'まだ適用されていません — 切り替えを確認するか、手動でモデルを選択してください。',
+      applyFailed: '切り替えできませんでした。以前のモデルのままです — もう一度試すか、手動で選択してください。',
+      applyUnrestored:
+        '切り替えが完了せず、以前のモデルにも戻せませんでした。送信する前にモデルメニューで確認してください。',
+      retry: '再試行',
+      failed: 'おすすめの取得に失敗しました。',
+      unavailable: '利用できるおすすめがありません。設定でおすすめ用ルーターを構成してください。',
+      unsupported: 'この Hermes バックエンドはおすすめ機能に対応していません。',
+      stale: '下書きが変更されたため、これらのおすすめは適用できません。',
+      refresh: '再確認',
+      emptyDraft: '先に下書きを入力してから確認してください。',
+      draftTooLong: 'この下書きは長すぎて確認できません。',
+      tooManyAttachments: '添付ファイルが多すぎて確認できません（最大 32 件）。',
+      attachmentUnsupported: '添付ファイル名が長すぎて確認できません。',
+      availability: {
+        failed: '空き状況の確認に失敗',
+        fresh: '最新',
+        stale: '空き状況が古い可能性',
+        unavailable: '利用不可',
+        unsupported: '空き状況は不明'
+      },
+      limitReached: '上限に達しました',
+      notAllowed: '現在のプランでは利用できません'
+    }
+  },
   settings: {
     gateway: {
-      openLogsFailed: 'ログフォルダを開けませんでした'
+      openLogsFailed: 'ログフォルダを開けませんでした',
+      singleBackendTitle: 'バックエンドは 1 つ、サーバー側で管理',
+      singleBackendDesc: (host: string) =>
+        `このブラウザ版は ${host} 上の単一の Hermes バックエンドに固定されています。リモート・SSH・Cloud のゲートウェイを登録するには Hermes デスクトップアプリが必要です。`,
+      singleBackendDescNoHost:
+        'このブラウザ版は単一の Hermes バックエンドに固定されています。リモート・SSH・Cloud のゲートウェイを登録するには Hermes デスクトップアプリが必要です。',
+      singleBackendDocsLink: 'デスクトップを複数の Hermes インスタンスに接続する'
     }
   },
   sidebar: {

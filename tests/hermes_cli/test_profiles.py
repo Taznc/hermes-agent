@@ -1172,3 +1172,29 @@ class TestResolveProfileEnvSpelling:
         assert Path(resolve_profile_env("default")) == _get_default_hermes_home()
 
 
+
+
+class TestReadConfigModel:
+    """(model, provider, reasoning_effort) from a profile's own config.yaml —
+    the kanban board renders this as 'what the worker actually runs'."""
+
+    def test_reads_model_provider_and_reasoning_effort(self, tmp_path):
+        from hermes_cli.profiles import _read_config_model
+        (tmp_path / "config.yaml").write_text(
+            "model:\n  default: some-model\n  provider: some-provider\n"
+            "agent:\n  reasoning_effort: high\n",
+            encoding="utf-8",
+        )
+        assert _read_config_model(tmp_path) == ("some-model", "some-provider", "high")
+
+    def test_missing_config_returns_all_none(self, tmp_path):
+        from hermes_cli.profiles import _read_config_model
+        assert _read_config_model(tmp_path) == (None, None, None)
+
+    def test_effort_read_even_when_model_block_absent(self, tmp_path):
+        from hermes_cli.profiles import _read_config_model
+        (tmp_path / "config.yaml").write_text(
+            "agent:\n  reasoning_effort: low\n", encoding="utf-8")
+        model, provider, effort = _read_config_model(tmp_path)
+        assert (model, provider) == (None, None)
+        assert effort == "low"

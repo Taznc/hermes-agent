@@ -136,6 +136,18 @@ export interface KanbanRun {
   worker_pid?: null | number
   started_at?: null | number
   ended_at?: null | number
+  model?: null | string
+  provider?: null | string
+  reasoning_effort?: null | string
+  model_source?: null | 'card_override' | 'profile_default' | 'routing'
+  session_id?: null | string
+  input_tokens?: null | number
+  output_tokens?: null | number
+  cache_read_tokens?: null | number
+  reasoning_tokens?: null | number
+  api_calls?: null | number
+  tool_calls?: null | number
+  estimated_cost_usd?: null | number
 }
 
 /** A structured multiple-choice answer, persisted alongside a comment's plain
@@ -297,12 +309,67 @@ export interface OrchestrationSettings {
   resolved_default_assignee: string
 }
 
+/** GET /dispatch/status — the pause circuit plus the drain signal. */
+export interface DispatchStatus {
+  paused: boolean
+  /** Raw circuit record: `reason` is `operator_paused` for a maintenance
+   *  drain, or a fault code for a systemic circuit. Null when running or when
+   *  this is an aggregate status. */
+  state: null | {
+    reason: string
+    paused_at?: number
+    paused_by?: string
+    note?: null | string
+    [key: string]: unknown
+  }
+  /** Workers still running in this scope — 0 means safe to restart. */
+  running_count: number
+  /** Server-rendered human status; null when running or aggregate. */
+  message: null | string
+  /** Aggregate-only fields returned for the explicit `boards=*` scope. */
+  all_paused?: boolean
+  board_count?: number
+  paused_count?: number
+  boards?: Array<DispatchStatus & { board: string }>
+  errors?: Array<{ board: string; error: string }>
+}
+
+/** POST /dispatch/pause. `paused: false` is a REFUSAL (a dispatch tick owns
+ *  at least one target lock), delivered as a normal 200 — never treat it as success. */
+export interface DispatchPauseResult {
+  paused: boolean
+  state: DispatchStatus['state']
+  reason?: string
+  board_count?: number
+  paused_count?: number
+  results?: Array<DispatchPauseResult & { board: string }>
+  failures?: Array<{ board: string; error: string }>
+}
+
+/** POST /dispatch/resume. */
+export interface DispatchResumeResult {
+  resumed: boolean
+  was_paused: boolean
+  previous?: DispatchStatus['state']
+  reason?: string
+  board_count?: number
+  resumed_count?: number
+  results?: Array<DispatchResumeResult & { board: string }>
+  failures?: Array<{ board: string; error: string }>
+}
+
 /** GET /profiles — the roster the decomposer routes across. */
 export interface KanbanProfile {
   name: string
   is_default: boolean
   description: string
   description_auto: boolean
+  /** The profile's own configured model/provider/depth — what a worker
+   *  actually runs when the task carries no override. Empty = unset
+   *  (provider defaults) or an older backend that doesn't report them. */
+  model?: string
+  provider?: string
+  reasoning_effort?: string
 }
 
 /** Column presentation — codicon + tone only. Labels + help live in i18n

@@ -131,6 +131,7 @@ export const zhHant = defineForkLocale(forkZhHant, {
     more: count => `另外 ${count} 則通知`,
     clearAll: '全部清除',
     dismiss: '關閉通知',
+    dismissAction: '關閉',
     details: '詳細資訊',
     copyDetail: '複製詳情',
     copyDetailFailed: '無法複製通知詳情',
@@ -325,6 +326,7 @@ export const zhHant = defineForkLocale(forkZhHant, {
       testBody: '通知運作正常。',
       testSent: '測試已傳送。若沒有出現，請檢查系統通知權限與專注模式／勿擾模式。',
       testUnsupported: '此系統不支援原生通知。',
+      testDenied: '此網站的通知已被封鎖。請在瀏覽器的網站設定中允許通知，然後再試一次。',
       completionSoundTitle: '完成提示音',
       completionSoundDesc: '代理回合結束時播放。可在此選擇預設並預覽。',
       completionSoundPreview: '預覽'
@@ -3009,7 +3011,13 @@ export const zhHant = defineForkLocale(forkZhHant, {
       questionProgress: (answered, total) => `已回答 ${answered}/${total}`,
       lateAnswer: (question, choice) => `關於「${question}」 — 我的回答: ${choice}`,
       lateAnswerTip: '將此回答起草為後續訊息',
-      lateAnswerHint: '此問題已不再等待回答。選擇一個選項會將其起草為後續訊息。'
+      lateAnswerHint: '此問題已不再等待回答。選擇一個選項會將其起草為後續訊息。',
+      addNote: '新增註記',
+      addNoteFor: label => `為${label}新增註記`,
+      note: '註記',
+      noteFor: label => `${label}的註記`,
+      notePlaceholder: '新增選用註記…',
+      selected: '已選擇'
     },
     tool: {
       copyCode: '複製程式碼',
