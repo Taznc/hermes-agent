@@ -164,6 +164,64 @@ as `infra` (bumping the interruption streak) but never parks a task in
 `scheduled`, so a quota signature with no usable backoff cannot loop the
 dispatcher indefinitely without ever reaching the interruption cap.
 
+## Host-wide account/budget circuits
+
+Per-board provider backoff cannot protect another board, and a provider name
+is not an account identity. The optional host circuit therefore has no inferred
+default. Configure opaque, non-secret budget-group labels explicitly:
+
+```yaml
+kanban:
+  quota_budget_groups:
+    primary-wallet:
+      providers: [openai-codex]
+      profiles: [implementer, reviewer]
+  quota_resume_spread_seconds: 30
+```
+
+This mapping and `quota_resume_spread_seconds` are host policy: configure them
+in the shared/default Hermes home's `config.yaml`. Assignee profile configs do
+not inherit or duplicate the mapping; profile-scoped workers read the same
+host policy when publishing their selected provider.
+
+A pinned route matches only when both its provider and profile are listed; `*`
+is accepted only when deliberately configured. For `provider=auto`, every group
+configured for the profile is a candidate. While any candidate is paused the
+dispatcher predicts the provider the worker's own startup ladder will choose
+(the explicit `provider=auto` request the dispatcher passes on the worker
+command line, then `hermes_cli.auth.resolve_provider` under that profile's
+home) and starts the task only when that provider maps to an
+unpaused group; a prediction that fails, resolves to an unmapped provider, or
+lands on the paused group defers the task, so `auto` can never hammer a
+proven-empty wallet. The worker then publishes the provider it actually
+selected before its machine-readable `EX_TEMPFAIL` exit, and marks that
+publication in its run log so reaping the same exit never republishes the
+observation from the configured task route. An automatic route
+with no configured candidates remains outside this circuit. Do not put email
+addresses, account IDs, keys, tokens, or vendor subscription identifiers in
+group names. The dispatcher and dashboard expose only a stable `budget-<hash>`
+handle.
+
+The first quota event with a valid retry deadline is recorded in
+`<kanban-home>/kanban/quota-circuits.db`, outside every board DB. SQLite
+`BEGIN IMMEDIATE`, WAL, and an upsert serialize concurrent board dispatchers;
+simultaneous observations extend one row and do not affect task failure
+budgets. Matching ready and review routes are guarded across all boards while
+unrelated groups continue. At the deadline one dispatcher atomically acquires
+a recovery probe; afterwards the circuit is `recovering` and admissions are
+serialized host-wide through a durable slot lease — at most one further
+matching start per `quota_resume_spread_seconds`, regardless of how many
+boards or cards contend at the boundary. The row clears on its own once no
+start has been admitted for four spread windows; a renewed quota signal re-arms
+it as `paused`. Dry-run dispatch only peeks and never consumes the probe or a
+slot. In-flight workers are never killed.
+
+The dashboard's host quota banner shows the opaque group, reason, first/last
+observation, next eligible time, and deferred board/card counts. Its **Clear
+circuit** button is the manual override. `GET /api/plugins/kanban/quota-circuits`
+and `DELETE /api/plugins/kanban/quota-circuits/{budget-handle}` provide the same
+sanitized diagnostic/control surface.
+
 ## Config keys
 
 * `kanban.count_infra_failures` (bool, default `false`) — when `true`,
@@ -181,7 +239,14 @@ dispatcher indefinitely without ever reaching the interruption cap.
   classify as `infra` and bump the interruption streak, they just never
   reach `scheduled`). Overridable via `HERMES_KANBAN_PROVIDER_BACKOFF`.
 * `kanban.provider_backoff_max_seconds` (int, default `86400`) — cap on
-  a single provider pause; larger `retry after Ns` values are clamped.
+  both a single per-board provider pause and a host budget-group circuit;
+  larger `retry after Ns` values are clamped.
+* `kanban.quota_budget_groups` (mapping, default `{}`) — explicit opaque
+  budget-group labels mapped to `providers` and `profiles`. Empty disables
+  host-wide grouping rather than conflating independent accounts.
+* `kanban.quota_resume_spread_seconds` (int, default `30`) — delay after the
+  first post-deadline recovery probe before the remaining matching routes are
+  released.
 
 ## Upstream-ability
 

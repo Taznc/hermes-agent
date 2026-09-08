@@ -234,6 +234,37 @@ def test_explicit_reviewer_survives_next_tick(kanban_home: Path) -> None:
         assert row["assignee"] == "codexreview"
 
 
+def test_later_explicit_reassignment_survives_default_reviewer(kanban_home: Path) -> None:
+    """A reviewer-less request may be intentionally reassigned before dispatch.
+
+    The nullable ``review_requested.reviewer`` field records only the original
+    request. It is not proof that the row remains implementer-owned after an
+    operator or dashboard explicitly changes its assignee.
+    """
+    with kbc.connect() as conn:
+        tid, _ = _make_review_task(conn, implementer="claudeprimary")
+        assert kb.assign_task(conn, tid, "codexreview") is True
+        row = conn.execute(
+            "SELECT status, assignee FROM tasks WHERE id = ?", (tid,),
+        ).fetchone()
+        assert row["status"] == "review"
+        assert row["assignee"] == "codexreview"
+
+    with kbc.connect() as conn:
+        res = kbd.dispatch_once(
+            conn, spawn_fn=_fake_spawn, dry_run=False,
+            default_reviewer="default",
+        )
+
+    assert res.auto_assigned_reviewer == []
+    assert any(s[0] == tid and s[1] == "codexreview" for s in res.spawned)
+    with kbc.connect() as conn:
+        row = conn.execute(
+            "SELECT assignee FROM tasks WHERE id = ?", (tid,),
+        ).fetchone()
+        assert row["assignee"] == "codexreview"
+
+
 # ---------------------------------------------------------------------------
 # B2(b): re-review provenance (_prior_reviewer) must not be hijacked
 # ---------------------------------------------------------------------------

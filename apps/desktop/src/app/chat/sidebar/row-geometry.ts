@@ -18,9 +18,8 @@ import { cn } from '@/lib/utils'
 // `SIDEBAR_ROW_PAD_TRAIL` is the row's own trailing inset and belongs to the
 // SHELL — the only box containing both the actions column AND the card's
 // in-body cluster, so one class insets every trailing thing a row can render.
-// Owned anywhere else, the age / chips / kebab sit flush on the border box,
-// which is exactly where a working row paints its arc (`.arc-row` has zero
-// standoff) — the ring ran through the text.
+// Owned anywhere else, the age / chips / kebab sit flush on the border box —
+// which the working row's charging bar (`.working-bar`) also hugs.
 
 export const SIDEBAR_ROW_MIN_H = 'min-h-[1.625rem]' as const
 export const SIDEBAR_ROW_PAD_X = 'pl-2 pr-2' as const

@@ -7,7 +7,7 @@
  * resolved by `resolveBlockCause` in `./status-guidance`.
  */
 
-import { Button, cn, Codicon, host } from '@hermes/plugin-sdk'
+import { Button, cn, Codicon, CopyButton, host } from '@hermes/plugin-sdk'
 import { useRef, useState } from 'react'
 
 import { latestBlockEvent } from './drawer_events'
@@ -137,6 +137,80 @@ export function parseBlockedChoices(reason: string): null | { options: BlockedCh
   const prose = reason.slice(0, lastMatch.index).trimEnd()
 
   return { options, prose }
+}
+
+/**
+ * Pulls copy-pasteable unblock commands out of a block reason. Workers are
+ * instructed (KANBAN_GUIDANCE rule 4 + the kanban_block schema) to put the
+ * exact command that unblocks them in a ```cmd fence; the board renders each
+ * one as a monospace block with a copy button instead of burying it in prose.
+ * `sh`/`bash`/`shell` are accepted as aliases so a worker that reflexively
+ * writes ```bash still gets the affordance.
+ */
+export function parseCmdFences(text: string): { commands: string[]; prose: string } {
+  const commands: string[] = []
+  const prose = text
+    .replace(/```(?:cmd|sh|bash|shell)\s*\n?([\s\S]*?)```/g, (_match, body: string) => {
+      const trimmed = body.trim()
+
+      if (trimmed) {
+        commands.push(trimmed)
+      }
+
+      return ''
+    })
+    .replace(/\n{3,}/g, '\n\n')
+    .trim()
+
+  return { commands, prose }
+}
+
+/** How much post-first-line prose shows without a toggle. Short context stays
+ *  inline; a wall of text collapses behind Show more so the card stays a card. */
+const REASON_DETAIL_INLINE_CHARS = 220
+
+/**
+ * Structured rendering of a worker's block reason: the first line is THE ASK
+ * and renders emphasized; any ```cmd fence becomes a copy-button command
+ * block; remaining prose is detail, collapsed behind Show more when long.
+ * This is the card-side half of the worker-protocol contract — even an
+ * old-style prose-wall reason degrades into first-line + collapsed detail
+ * instead of an unreadable paragraph.
+ */
+export function BlockReasonBody({ reason }: { reason: string }) {
+  const k = useKanban()
+  const [expanded, setExpanded] = useState(false)
+  const { commands, prose } = parseCmdFences(reason)
+
+  const newline = prose.indexOf('\n')
+  const ask = newline === -1 ? prose : prose.slice(0, newline).trimEnd()
+  const detail = newline === -1 ? '' : prose.slice(newline + 1).trim()
+  const collapsible = detail.length > REASON_DETAIL_INLINE_CHARS
+
+  return (
+    <div className="flex flex-col gap-1.5">
+      {ask && <p className="text-[0.78rem] leading-relaxed font-medium text-(--ui-text-primary)">{ask}</p>}
+      {commands.map(command => (
+        <div
+          className="flex items-start gap-1 rounded-md bg-(--ui-bg-quaternary) py-1 pr-1 pl-2"
+          key={command}
+        >
+          <code className="min-w-0 flex-1 self-center font-mono text-[0.6875rem] leading-relaxed break-all whitespace-pre-wrap text-(--ui-text-secondary)">
+            {command}
+          </code>
+          <CopyButton appearance="icon" buttonSize="icon-xs" buttonVariant="ghost" text={command} />
+        </div>
+      ))}
+      {detail && (!collapsible || expanded) && (
+        <p className="text-[0.71rem] leading-relaxed whitespace-pre-wrap text-(--ui-text-tertiary)">{detail}</p>
+      )}
+      {collapsible && (
+        <Button className="self-start" onClick={() => setExpanded(v => !v)} size="xs" variant="text">
+          {expanded ? k.showLess : k.showMore}
+        </Button>
+      )}
+    </div>
+  )
 }
 
 /**
@@ -419,9 +493,7 @@ export function CtaBanner({
         >
           {choices ? (
             <>
-              {choices.prose && (
-                <p className="text-[0.75rem] leading-relaxed text-(--ui-text-secondary)">{choices.prose}</p>
-              )}
+              {choices.prose && <BlockReasonBody reason={choices.prose} />}
               <ChoiceOptions
                 comments={comments}
                 onSubmit={onSubmitChoice}
@@ -430,10 +502,10 @@ export function CtaBanner({
                 questionEventId={blockEvent!.id}
               />
             </>
+          ) : reason ? (
+            <BlockReasonBody reason={reason} />
           ) : (
-            <p className="text-[0.75rem] leading-relaxed text-(--ui-text-secondary)">
-              {reason || k.ctaBlockedNoReason}
-            </p>
+            <p className="text-[0.75rem] leading-relaxed text-(--ui-text-secondary)">{k.ctaBlockedNoReason}</p>
           )}
         </Banner>
       )

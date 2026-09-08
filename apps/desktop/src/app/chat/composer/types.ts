@@ -2,6 +2,7 @@ import type { ReactNode } from 'react'
 
 import type { SubmitTextOptions } from '@/app/session/hooks/use-prompt-actions/utils'
 import type { HermesGateway } from '@/hermes'
+import type { ComposerAttachment } from '@/store/composer'
 
 import type { DroppedFile } from '../hooks/use-composer-actions'
 
@@ -26,9 +27,32 @@ export interface ChatBarState {
     quickModels?: QuickModelOption[]
     /** Reused status-bar dropdown (built with gateway + selectModel upstream). */
     modelMenuContent?: ReactNode
+    // >>> FORK ANCHOR: composer-model-recommendation <<<
+    /** Fork: the manual model-recommendation surface. A RENDER FUNCTION, not a
+     *  node, because the two halves live on opposite sides of this boundary:
+     *  gateway routing (profile, request, session-aware `selectModel`) belongs
+     *  to the ChatView's owner, exactly like `modelMenuContent`; the live draft
+     *  and attachment chips belong to the composer and are handed back here.
+     *  Absent (older/unwired owner) renders nothing at all. */
+    recommendRender?: (ctx: ComposerRecommendContext) => ReactNode
   }
   tools: { enabled: boolean; label: string; suggestions?: ContextSuggestion[] }
   voice: { enabled: boolean; active: boolean }
+}
+
+// >>> FORK ANCHOR: composer-model-recommendation <<<
+/** What the composer contributes to a recommendation request: the LIVE draft
+ *  (a getter — reading a captured string would evaluate a stale draft, and a
+ *  setter would let this surface mutate what the user is typing) and the
+ *  attachment chips whose metadata may accompany it. */
+export interface ComposerRecommendContext {
+  attachments: readonly ComposerAttachment[]
+  disabled: boolean
+  getDraft: () => string
+  /** Fires whenever the composer's draft changes. The composer keeps typing
+   *  OUT of React on purpose, so a surface that must react to an edit cannot
+   *  rely on being re-rendered; it subscribes and re-reads `getDraft()`. */
+  subscribeDraft: (listener: () => void) => () => void
 }
 
 export interface ChatBarProps {

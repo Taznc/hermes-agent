@@ -1712,6 +1712,141 @@ def test_board_link_edges_drop_after_unlink(client):
 
 
 # ---------------------------------------------------------------------------
+# Archived-satisfied parents must not surface as unresolvable phantom blockers
+# ---------------------------------------------------------------------------
+
+
+def _link_to_archived_parent(conn, *, completed: bool):
+    """Child linked to an ALREADY-archived parent.
+
+    Archiving a completed task deletes its outgoing edges, so this ordering --
+    link minted after the archive -- is the state that outlives that cleanup and
+    the one the payload filters have to handle. ``completed`` picks whether the
+    parent finished its work (dependency satisfied forever) or was withdrawn.
+    """
+    parent_id = kb.create_task(conn, title="blocker", assignee="alice")
+    if completed:
+        assert kb.complete_task(conn, parent_id)
+    assert kb.archive_task(conn, parent_id)
+    child_id = kb.create_task(conn, title="blocked", assignee="bob")
+    kb.link_tasks(conn, parent_id, child_id)
+    return parent_id, child_id
+
+
+def test_board_omits_edges_to_archived_completed_parents(client):
+    """A parent that finished and was archived must not gate its child's card.
+
+    The default board fetch omits archived tasks, so an edge naming one points
+    at an id the desktop's board index cannot resolve -- and an unresolvable
+    blocker is counted as GATING on purpose (deps.ts `partitionBlockers`). The
+    child would show "waiting on a blocker" forever with nothing to click.
+    Both rollups are asserted because the desktop reads `link_edges` when
+    present and falls back to `link_counts` when not; a phantom in either one
+    reaches the user.
+    """
+    with kbc.connect() as conn:
+        parent_id, child_id = _link_to_archived_parent(conn, completed=True)
+
+    body = client.get("/api/plugins/kanban/board").json()
+    ids = {t["id"] for col in body["columns"] for t in col["tasks"]}
+    assert parent_id not in ids, "precondition: default board hides archived tasks"
+
+    assert body["link_edges"] == []
+    cards = {t["id"]: t for col in body["columns"] for t in col["tasks"]}
+    assert cards[child_id]["link_counts"]["parents"] == 0
+
+    # Same contract on the drawer's own source: the "waiting on blocker" banner
+    # is fed by GET /tasks/:id links.parents, not by link_edges.
+    detail = client.get(f"/api/plugins/kanban/tasks/{child_id}").json()
+    assert detail["links"]["parents"] == []
+
+
+def test_board_keeps_edges_to_archived_parents_that_never_completed(client):
+    """The inverse: archived WITHOUT completion is a withdrawal, not success.
+
+    Nothing satisfied this dependency, so the child is genuinely still blocked
+    and both the edge and the banner must survive. This is the half that keeps
+    the fix from degenerating into "hide every archived parent".
+    """
+    with kbc.connect() as conn:
+        parent_id, child_id = _link_to_archived_parent(conn, completed=False)
+
+    body = client.get("/api/plugins/kanban/board").json()
+    assert body["link_edges"] == [[parent_id, child_id]]
+    cards = {t["id"]: t for col in body["columns"] for t in col["tasks"]}
+    assert cards[child_id]["link_counts"]["parents"] == 1
+
+    detail = client.get(f"/api/plugins/kanban/tasks/{child_id}").json()
+    assert detail["links"]["parents"] == [parent_id]
+
+
+def test_board_keeps_edges_to_satisfied_parents_it_can_render(client):
+    """A satisfied parent the payload DOES carry keeps its edge.
+
+    "Blockers clear" (the green all-clear chip) is a card with links whose
+    blockers are all resolvable and done. Dropping resolvable satisfied edges
+    would delete that state instead of fixing the phantom one, so the filter
+    must key on unresolvability, never on satisfaction alone.
+    """
+    with kbc.connect() as conn:
+        parent_id = kb.create_task(conn, title="blocker", assignee="alice")
+        child_id = kb.create_task(conn, title="blocked", assignee="bob", parents=[parent_id])
+        assert kb.complete_task(conn, parent_id)
+
+    body = client.get("/api/plugins/kanban/board").json()
+    assert body["link_edges"] == [[parent_id, child_id]]
+    cards = {t["id"]: t for col in body["columns"] for t in col["tasks"]}
+    assert cards[parent_id]["status"] == "done"
+    assert cards[child_id]["link_counts"]["parents"] == 1
+
+    # include_archived=True renders the archived parent, so its edge resolves
+    # and is kept there too -- the filter is scoped to what the view can show.
+    with kbc.connect() as conn:
+        arch_parent, arch_child = _link_to_archived_parent(conn, completed=True)
+
+    archived_body = client.get(
+        "/api/plugins/kanban/board", params={"include_archived": True}).json()
+    assert [arch_parent, arch_child] in archived_body["link_edges"]
+
+
+def test_board_keeps_edges_to_parents_that_no_longer_exist(client):
+    """A dangling edge (parent row deleted) still gates -- unchanged default.
+
+    "Unresolvable therefore still gating" is the right call when the parent is
+    genuinely gone: there is no completion evidence, and surfacing the broken
+    link is how the user learns to cut it. Only satisfied-and-archived parents
+    are exempt.
+    """
+    with kbc.connect() as conn:
+        parent_id = kb.create_task(conn, title="blocker", assignee="alice")
+        child_id = kb.create_task(conn, title="blocked", assignee="bob", parents=[parent_id])
+        conn.execute("DELETE FROM tasks WHERE id = ?", (parent_id,))
+        conn.commit()
+
+    body = client.get("/api/plugins/kanban/board").json()
+    assert body["link_edges"] == [[parent_id, child_id]]
+    cards = {t["id"]: t for col in body["columns"] for t in col["tasks"]}
+    assert cards[child_id]["link_counts"]["parents"] == 1
+
+    detail = client.get(f"/api/plugins/kanban/tasks/{child_id}").json()
+    assert detail["links"]["parents"] == [parent_id]
+
+
+def test_archived_satisfied_parent_keeps_its_own_children_listing(client):
+    """The filter is one-directional: it hides an edge from the CHILD's view of
+    its blockers, never from the archived parent's own record of what it
+    unblocked. Opening the parent (via include_archived) must still show the
+    lineage, which is the whole reason the row is kept in the DB.
+    """
+    with kbc.connect() as conn:
+        parent_id, child_id = _link_to_archived_parent(conn, completed=True)
+
+    detail = client.get(f"/api/plugins/kanban/tasks/{parent_id}").json()
+    assert detail["links"]["children"] == [child_id]
+
+
+
+# ---------------------------------------------------------------------------
 # Archive completed cards by selected board / All Boards scope
 # ---------------------------------------------------------------------------
 
@@ -1801,3 +1936,177 @@ def test_archive_done_skips_card_that_leaves_done_before_its_atomic_archive(clie
     assert response.json()["failures"] == []
     with kbc.connect() as conn:
         assert kb.get_task(conn, task_id).status == "todo"
+
+
+# ---------------------------------------------------------------------------
+# Roadmap lanes — columns, drag-drop transitions, POST /roadmap/idea
+# ---------------------------------------------------------------------------
+
+
+def test_board_renders_lane_columns_after_the_live_ones(client):
+    """The lanes are real columns (a status missing from BOARD_COLUMNS gets mis-bucketed
+    into ``todo``), and they trail every live column."""
+    r = client.get("/api/plugins/kanban/board")
+    names = [c["name"] for c in r.json()["columns"]]
+    assert names[-2:] == ["idea", "roadmap"]
+    assert names.index("done") < names.index("idea")
+
+
+def test_lane_card_is_bucketed_into_its_own_column(client):
+    with kbc.connect() as conn:
+        tid = kb.create_task(conn, title="wishlist item", lane="idea")
+    columns = {c["name"]: c["tasks"] for c in client.get("/api/plugins/kanban/board").json()["columns"]}
+    assert [t["id"] for t in columns["idea"]] == [tid]
+    assert columns["todo"] == []
+
+
+def test_patch_status_drags_between_lanes(client):
+    """Dragging idea <-> roadmap goes through refine/demote, leaving their events."""
+    with kbc.connect() as conn:
+        tid = kb.create_task(conn, title="wish", lane="idea")
+
+    r = client.patch(f"/api/plugins/kanban/tasks/{tid}", json={"status": "roadmap"})
+    assert r.status_code == 200, r.text
+    r = client.patch(f"/api/plugins/kanban/tasks/{tid}", json={"status": "idea"})
+    assert r.status_code == 200, r.text
+
+    with kbc.connect() as conn:
+        assert kb.get_task(conn, tid).status == "idea"
+        kinds = [e.kind for e in kb.list_events(conn, tid)]
+    assert "refined" in kinds and "demoted" in kinds
+
+
+def test_patch_status_dragging_roadmap_to_ready_spawns_it(client):
+    """Dragging a roadmap card into the work queue is an authorization, so it records
+    ``spawned_from_roadmap`` rather than a bare status write."""
+    with kbc.connect() as conn:
+        tid = kb.create_task(conn, title="wish", lane="roadmap")
+
+    r = client.patch(f"/api/plugins/kanban/tasks/{tid}", json={"status": "ready"})
+    assert r.status_code == 200, r.text
+    with kbc.connect() as conn:
+        assert kb.get_task(conn, tid).status == "ready"
+        assert "spawned_from_roadmap" in [e.kind for e in kb.list_events(conn, tid)]
+
+
+def test_patch_status_dragging_live_work_into_a_lane_is_a_400(client):
+    """The wishlist is entry-at-creation only; the refusal names the attempted from->to
+    so the UI can render an actionable toast."""
+    with kbc.connect() as conn:
+        tid = kb.create_task(conn, title="real work", assignee="alice")
+
+    r = client.patch(f"/api/plugins/kanban/tasks/{tid}", json={"status": "idea"})
+    assert r.status_code == 400, r.text
+    assert "-> 'idea'" in r.json()["detail"]
+    with kbc.connect() as conn:
+        assert kb.get_task(conn, tid).status == "ready"
+
+
+def test_bulk_lane_refusal_is_per_task_not_a_batch_abort(client):
+    """A refused lane move records its error on that entry and lets the rest proceed."""
+    with kbc.connect() as conn:
+        good = kb.create_task(conn, title="wish", lane="idea")
+        bad = kb.create_task(conn, title="real work", assignee="alice")
+
+    r = client.post(
+        "/api/plugins/kanban/tasks/bulk",
+        json={"ids": [good, bad], "status": "roadmap"},
+    )
+    assert r.status_code == 200, r.text
+    results = {e["id"]: e for e in r.json()["results"]}
+    assert results[good]["ok"] is True
+    assert results[bad]["ok"] is False
+    assert "-> 'roadmap'" in results[bad]["error"]
+
+    with kbc.connect() as conn:
+        assert kb.get_task(conn, good).status == "roadmap"
+        assert kb.get_task(conn, bad).status == "ready"
+
+
+def test_roadmap_idea_endpoint_creates_an_idea_card(client):
+    """The dashboard idea inbox now writes to the board, not ROADMAP.md — and the
+    ``{ok, reason}`` response shape is unchanged so shipped Desktop callers keep working."""
+    r = client.post("/api/plugins/kanban/roadmap/idea", json={"text": "Add a dark mode toggle"})
+    assert r.status_code == 200, r.text
+    assert r.json() == {"ok": True, "reason": None}
+
+    with kbc.connect() as conn:
+        tasks = kb.list_tasks(conn, status="idea")
+    assert [t.title for t in tasks] == ["Add a dark mode toggle"]
+    assert tasks[0].assignee is None
+
+
+def test_roadmap_idea_records_source_card_provenance(client):
+    with kbc.connect() as conn:
+        source = kb.create_task(conn, title="origin card", assignee="alice")
+
+    r = client.post(
+        "/api/plugins/kanban/roadmap/idea",
+        json={"text": "Split this out", "source_id": source},
+    )
+    assert r.status_code == 200, r.text
+    with kbc.connect() as conn:
+        idea = kb.list_tasks(conn, status="idea")[0]
+    assert source in (idea.body or "")
+
+
+def test_roadmap_idea_rejects_a_non_card_source_id(client):
+    """Provenance must match the canonical task-id shape, so a hostile value never
+    reaches the DB."""
+    r = client.post(
+        "/api/plugins/kanban/roadmap/idea",
+        json={"text": "An idea", "source_id": "t_evil\n<!-- injected -->"},
+    )
+    assert r.status_code == 422
+    with kbc.connect() as conn:
+        assert kb.list_tasks(conn, status="idea") == []
+
+
+def test_roadmap_idea_oversized_text_is_a_400_and_writes_nothing(client):
+    from hermes_dashboard_plugin_kanban_test import _ROADMAP_IDEA_MAX_LEN  # type: ignore
+
+    r = client.post(
+        "/api/plugins/kanban/roadmap/idea", json={"text": "x" * (_ROADMAP_IDEA_MAX_LEN + 1)},
+    )
+    assert r.status_code == 400
+    with kbc.connect() as conn:
+        assert kb.list_tasks(conn, status="idea") == []
+
+
+def test_roadmap_idea_at_max_length_is_stored_intact(client):
+    """A ``{"ok": true}`` must never mean part of the typed text was discarded."""
+    from hermes_dashboard_plugin_kanban_test import _ROADMAP_IDEA_MAX_LEN  # type: ignore
+
+    text = "y" * _ROADMAP_IDEA_MAX_LEN
+    r = client.post("/api/plugins/kanban/roadmap/idea", json={"text": text})
+    assert r.status_code == 200, r.text
+    with kbc.connect() as conn:
+        assert kb.list_tasks(conn, status="idea")[0].title == text
+
+
+def test_roadmap_idea_empty_text_is_fail_open_not_a_card(client):
+    r = client.post("/api/plugins/kanban/roadmap/idea", json={"text": "   \n\t  "})
+    assert r.status_code == 200
+    assert r.json() == {"ok": False, "reason": "empty_idea"}
+    with kbc.connect() as conn:
+        assert kb.list_tasks(conn, status="idea") == []
+
+
+def test_roadmap_idea_never_500s_when_the_write_fails(client, monkeypatch):
+    """Fail-open at the endpoint boundary: a broken capture must not take down the dialog."""
+    def boom(*a, **kw):
+        raise RuntimeError("db exploded")
+
+    monkeypatch.setattr(kb, "create_task", boom)
+    r = client.post("/api/plugins/kanban/roadmap/idea", json={"text": "An idea"})
+    assert r.status_code == 200
+    assert r.json() == {"ok": False, "reason": "roadmap_unavailable"}
+
+
+def test_roadmap_idea_unknown_board_is_a_404(client):
+    r = client.post(
+        "/api/plugins/kanban/roadmap/idea",
+        json={"text": "An idea"},
+        params={"board": "totally-unknown-board"},
+    )
+    assert r.status_code == 404

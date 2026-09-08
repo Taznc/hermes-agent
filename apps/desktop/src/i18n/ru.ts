@@ -500,6 +500,7 @@ export const ru = defineLocale({
       testSent:
         'Тест отправлен. Если ничего не появилось, проверьте разрешения на уведомления в системе и режим «Не беспокоить».',
       testUnsupported: 'Эта система не поддерживает системные уведомления.',
+      testDenied: 'Уведомления для этого сайта заблокированы. Разрешите их в настройках сайта в браузере и повторите попытку.',
       completionSoundTitle: 'Звук завершения',
       completionSoundDesc: 'Воспроизводится, когда ход агента завершён. Выберите пресет и прослушайте здесь.',
       completionSoundPreview: 'Прослушать'
@@ -3333,7 +3334,8 @@ export const ru = defineLocale({
       noGuestBody:
         'Эта сборка Hermes работает в браузере и не может встроить другой сайт в панель. Введите адрес выше, и Hermes откроет его в новой вкладке браузера.',
       noGuestOpen: url => `Открыть ${url} во вкладке браузера`,
-      openBlocked: 'Браузер заблокировал новую вкладку. Разрешите всплывающие окна для этой страницы и попробуйте снова.',
+      openBlocked:
+        'Браузер заблокировал новую вкладку. Разрешите всплывающие окна для этой страницы и попробуйте снова.',
       finishedRestarting: message => `Hermes завершил перезапуск сервера предпросмотра${message ? `: ${message}` : ''}`,
       failedRestarting: message => `Перезапуск сервера не удался: ${message}`,
       unknownError: 'неизвестная ошибка',
@@ -3502,7 +3504,13 @@ export const ru = defineLocale({
       questionProgress: (answered, total) => `Ответ дан на ${answered} из ${total}`,
       lateAnswer: (question, choice) => `Re: «${question}» — мой ответ: ${choice}`,
       lateAnswerTip: 'Составить этот ответ как продолжение',
-      lateAnswerHint: 'Этот промпт больше не ждёт. Выберите вариант, чтобы составить его как сообщение-продолжение.'
+      lateAnswerHint: 'Этот промпт больше не ждёт. Выберите вариант, чтобы составить его как сообщение-продолжение.',
+      addNote: 'Добавить заметку',
+      addNoteFor: label => `Добавить заметку к ${label}`,
+      note: 'Заметка',
+      noteFor: label => `Заметка к ${label}`,
+      notePlaceholder: 'Добавить необязательную заметку…',
+      selected: 'Выбрано'
     },
     mcpSetup: {
       installTitle: server => `Добавить MCP-сервер ${server}?`,

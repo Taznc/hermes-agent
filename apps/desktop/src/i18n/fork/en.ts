@@ -67,7 +67,52 @@ export const forkEn: ForkTranslations = {
     reconnectingBanner: 'Reconnecting to Hermes — you can keep reading and typing.',
     catchingUpNotice: 'Reconnected — catching up…',
     turnLostNotice: 'This turn may not have completed during the disconnect.',
-    turnLostRegenerate: 'Regenerate'
+    turnLostRegenerate: 'Regenerate',
+    recommend: {
+      trigger: 'Recommend',
+      presetLabel: 'Recommendation preference',
+      presets: {
+        balanced: 'Balanced',
+        save_codex: 'Save Codex',
+        best_quality: 'Best quality'
+      },
+      presetDescriptions: {
+        balanced: 'Balanced: good results at a reasonable cost.',
+        save_codex: 'Save Codex: prefers other routes so Codex usage lasts longer.',
+        best_quality: 'Best quality: picks the strongest route, whatever it costs.'
+      },
+      presetLoading: 'Loading your preference…',
+      presetUnsaved: 'Not saved on this backend — applies to this session only.',
+      resultsLabel: 'Model recommendations',
+      privacy:
+        'Checks your current draft and your attachments’ names and types only. Conversation history, file contents, and project files are never sent.',
+      pending: 'Checking…',
+      apply: 'Apply',
+      applyUnconfirmed: 'Not applied yet — confirm the switch, or pick a model manually.',
+      applyFailed:
+        'That switch did not go through. You are still on your previous model — try again or pick one manually.',
+      applyUnrestored:
+        'That switch did not finish, and the previous model could not be restored. Check the model menu before sending.',
+      retry: 'Try again',
+      failed: 'The recommendation check failed.',
+      unavailable: 'No recommendation is available. Configure a recommendation router in settings to enable this.',
+      unsupported: 'This Hermes backend does not support recommendations.',
+      stale: 'Your draft changed, so these recommendations no longer apply.',
+      refresh: 'Check again',
+      emptyDraft: 'Write a draft first, then check.',
+      draftTooLong: 'This draft is too long to check.',
+      tooManyAttachments: 'Too many attachments to check (32 maximum).',
+      attachmentUnsupported: 'An attachment name is too long to check.',
+      availability: {
+        failed: 'availability check failed',
+        fresh: 'live',
+        stale: 'stale availability',
+        unavailable: 'unavailable',
+        unsupported: 'availability unknown'
+      },
+      limitReached: 'limit reached',
+      notAllowed: 'not available on your plan'
+    }
   },
   assistant: {
     thread: {
