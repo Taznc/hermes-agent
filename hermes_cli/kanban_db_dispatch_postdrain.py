@@ -46,6 +46,9 @@ CANCELLED = "cancelled"
 
 TERMINAL_STATES = frozenset({SUCCEEDED, FAILED, EXPIRED, CANCELLED})
 
+GROUP_ARMING = "arming"
+GROUP_ARMED = "armed"
+
 
 class PostDrainActionRejected(ValueError):
     """A queue request names an action or target the operator may not run."""
@@ -148,13 +151,49 @@ def _systemctl_argv(cfg: PostDrainConfig, *args: str) -> list[str]:
     argv = ["systemctl"]
     if cfg.service_restart_scope == "user":
         argv.append("--user")
+    else:
+        argv.append("--no-ask-password")
     argv.extend(args)
     return argv
 
 
 def _host_systemctl_argv(*args: str) -> list[str]:
     """Argv for a command against the HOST, independent of any unit's scope."""
-    return ["systemctl", *args]
+    return ["systemctl", "--no-ask-password", *args]
+
+
+def _run_system_action(argv: list[str], *, allow_privileged_fallback: bool) -> None:
+    """Run a fixed systemd action without ever opening an authentication prompt.
+
+    The gateway normally runs as an unprivileged service user. A direct system
+    manager call may still be authorized by local policy, so try it first with
+    ``--no-ask-password``. System-scope actions then get exactly one declared
+    fallback: the same fixed argv through ``sudo -n``. User-manager actions are
+    already in the gateway user's authority domain and must never cross into
+    root's user manager via sudo.
+    """
+    candidates = [argv]
+    if allow_privileged_fallback:
+        candidates.append(["sudo", "-n", *argv])
+    errors: list[str] = []
+    for candidate in candidates:
+        try:
+            result = subprocess.run(
+                candidate,
+                capture_output=True,
+                text=True,
+                timeout=300,
+                check=False,
+                stdin=subprocess.DEVNULL,
+            )
+        except (OSError, subprocess.SubprocessError) as exc:
+            errors.append(f"{' '.join(candidate)}: {exc}")
+            continue
+        if result.returncode == 0:
+            return
+        detail = (result.stderr or result.stdout or "").strip()[:400]
+        errors.append(f"{' '.join(candidate)} exited {result.returncode}: {detail}")
+    raise RuntimeError("; ".join(errors))
 
 
 def _unit_properties(unit: str, cfg: PostDrainConfig) -> dict[str, str]:
@@ -217,12 +256,7 @@ def _service_observe_before(record: Mapping[str, Any], cfg: PostDrainConfig) -> 
 def _service_fire(record: Mapping[str, Any], cfg: PostDrainConfig) -> None:
     unit = str(record.get("target") or "")
     argv = _systemctl_argv(cfg, "restart", unit)
-    result = subprocess.run(argv, capture_output=True, text=True, timeout=300, check=False)
-    if result.returncode != 0:
-        raise RuntimeError(
-            f"{' '.join(argv)} exited {result.returncode}: "
-            f"{(result.stderr or result.stdout or '').strip()[:400]}"
-        )
+    _run_system_action(argv, allow_privileged_fallback=cfg.service_restart_scope == "system")
 
 
 def _monotonic_value(raw: Any) -> Optional[int]:
@@ -300,12 +334,7 @@ def _reboot_observe_before(record: Mapping[str, Any], cfg: PostDrainConfig) -> d
 def _reboot_fire(record: Mapping[str, Any], cfg: PostDrainConfig) -> None:
     # Host action: deliberately NOT ``_systemctl_argv``. See its docstring.
     argv = _host_systemctl_argv("reboot")
-    result = subprocess.run(argv, capture_output=True, text=True, timeout=300, check=False)
-    if result.returncode != 0:
-        raise RuntimeError(
-            f"{' '.join(argv)} exited {result.returncode}: "
-            f"{(result.stderr or result.stdout or '').strip()[:400]}"
-        )
+    _run_system_action(argv, allow_privileged_fallback=True)
 
 
 def _reboot_observe_after(record: Mapping[str, Any], cfg: PostDrainConfig) -> dict[str, Any]:
@@ -408,6 +437,27 @@ def queue_post_drain_action(
     Validation happens entirely against the handler table and config BEFORE
     anything is written, so a rejected request leaves no record behind.
     """
+    record = _new_post_drain_record(
+        action_kind=action_kind,
+        target=target,
+        requested_by=requested_by,
+        expires_in_seconds=expires_in_seconds,
+        group_id=group_id,
+        now=now,
+    )
+    return _write_post_drain_action(board, record)
+
+
+def _new_post_drain_record(
+    *,
+    action_kind: str,
+    target: Optional[str] = None,
+    requested_by: Optional[str] = None,
+    expires_in_seconds: Optional[int] = None,
+    group_id: Optional[str] = None,
+    now: Optional[int] = None,
+) -> dict[str, Any]:
+    """Validate one request and build its not-yet-persisted intent record."""
     handler = ACTION_HANDLERS.get(action_kind)
     if handler is None:
         raise PostDrainActionRejected(
@@ -442,7 +492,105 @@ def queue_post_drain_action(
     }
     if group_id:
         record["group_id"] = group_id
-    return _write_post_drain_action(board, record)
+    return record
+
+
+def _disarm_group_records(
+    boards: list[str], group_id: str, *, reason: str, now: int,
+) -> dict[str, dict[str, Any]]:
+    """Cancel every readable waiting leg after aggregate arming fails.
+
+    A leg whose write itself is broken remains ``arming`` (and therefore cannot
+    fire), while every readable leg is made visibly terminal for the operator.
+    Caller holds the host and all selected board locks.
+    """
+    disarmed: dict[str, dict[str, Any]] = {}
+    for slug in boards:
+        record = read_post_drain_action(slug)
+        if record is None or record.get("group_id") != group_id:
+            continue
+        if record.get("state") != WAITING:
+            continue
+        try:
+            disarmed[slug] = _write_post_drain_action(
+                slug,
+                {
+                    **record,
+                    "state": CANCELLED,
+                    "resolution": reason,
+                    "resolved_at": now,
+                },
+            )
+        except Exception:
+            # The persisted ``group_phase != armed`` remains a fail-closed fence.
+            continue
+    return disarmed
+
+
+def queue_post_drain_group(
+    boards: list[str],
+    *,
+    action_kind: str,
+    group_id: str,
+    target: Optional[str] = None,
+    requested_by: Optional[str] = None,
+    expires_in_seconds: Optional[int] = None,
+    now: Optional[int] = None,
+) -> dict[str, Any]:
+    """Persist and arm one aggregate intent without exposing a partial group.
+
+    Every leg first records the COMPLETE expected member set in ``arming``.
+    Only after all writes succeed is every leg promoted to ``armed``. Evaluation
+    requires the complete matching manifest and all armed markers, so a crash,
+    an exception, or a tick between any two writes cannot fire a partial group.
+    """
+    members = sorted(dict.fromkeys(str(board) for board in boards if str(board)))
+    if not members:
+        raise PostDrainActionRejected("an aggregate post-drain action needs at least one board")
+
+    # Validate and resolve exactly once before taking locks or writing anything.
+    prototype = _new_post_drain_record(
+        action_kind=action_kind,
+        target=target,
+        requested_by=requested_by,
+        expires_in_seconds=expires_in_seconds,
+        now=now,
+    )
+    current = int(now if now is not None else time.time())
+    records: dict[str, dict[str, Any]] = {}
+    failures: list[dict[str, str]] = []
+    lock_members: list[tuple[Optional[str], dict[str, Any]]] = [
+        (slug, {}) for slug in members
+    ]
+    with _group_locks(lock_members) as held:
+        if not held:
+            return {
+                "queued": False,
+                "records": records,
+                "failures": [{"board": slug, "error": "dispatch_in_progress"} for slug in members],
+            }
+        for phase in (GROUP_ARMING, GROUP_ARMED):
+            for slug in members:
+                record = {
+                    **prototype,
+                    "group_id": group_id,
+                    "group_members": members,
+                    "group_phase": phase,
+                }
+                try:
+                    records[slug] = _write_post_drain_action(slug, record)
+                except Exception as exc:
+                    failures.append({"board": slug, "error": str(exc)})
+                    records.update(
+                        _disarm_group_records(
+                            members,
+                            group_id,
+                            reason="aggregate arming failed",
+                            now=current,
+                        )
+                    )
+                    return {"queued": False, "records": records, "failures": failures}
+    return {"queued": True, "records": records, "failures": failures}
 
 
 def _cancel_locked(
@@ -504,24 +652,45 @@ def _group_members(
     them having dropped out.
     """
     group_id = record.get("group_id")
-    members: list[tuple[Optional[str], dict[str, Any]]] = [(board, dict(record))]
     if not group_id:
-        return members
-    try:
-        own_path = post_drain_path(board)
-        slugs = sorted(meta["slug"] for meta in _kb.list_boards(include_archived=False))
-    except Exception:
-        return members
-    for slug in slugs:
-        try:
-            if post_drain_path(slug) == own_path:
-                continue
-        except Exception:
-            continue
+        return [(board, dict(record))]
+
+    expected = record.get("group_members")
+    if (
+        not isinstance(expected, list)
+        or not expected
+        or not all(isinstance(slug, str) and slug for slug in expected)
+        or len(set(expected)) != len(expected)
+    ):
+        # A group whose complete membership is unknown is never safe to fire.
+        return [(board, dict(record))]
+
+    members: list[tuple[Optional[str], dict[str, Any]]] = []
+    for slug in sorted(expected):
         sibling = read_post_drain_action(slug)
         if sibling is not None and sibling.get("group_id") == group_id:
             members.append((slug, sibling))
     return members
+
+
+def _group_is_fully_armed(
+    record: Mapping[str, Any], members: list[tuple[Optional[str], dict[str, Any]]],
+) -> bool:
+    """Every declared aggregate leg exists, agrees on membership, and is armed."""
+    if not record.get("group_id"):
+        return True
+    expected = record.get("group_members")
+    if not isinstance(expected, list) or not expected:
+        return False
+    expected_set = set(expected)
+    if {slug for slug, _ in members} != expected_set:
+        return False
+    return all(
+        member.get("group_id") == record.get("group_id")
+        and member.get("group_members") == expected
+        and member.get("group_phase") == GROUP_ARMED
+        for _, member in members
+    )
 
 
 @contextlib.contextmanager
@@ -624,6 +793,8 @@ def _claim_group_for_firing(
         if fresh is None or fresh.get("state") != WAITING:
             return {}
         members = _group_members(board, fresh)
+        if not _group_is_fully_armed(fresh, members):
+            return {}
 
         # Expiry first, and for ANY member: a group can only fire as a unit, so
         # one dead leg means the rest can never fire either. Leaving them

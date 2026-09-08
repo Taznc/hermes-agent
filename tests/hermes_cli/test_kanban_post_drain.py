@@ -506,10 +506,9 @@ def two_boards(kanban_home):
 
 
 def _arm_group(boards, group_id="group-1", **kwargs):
-    return [
-        pd.queue_post_drain_action(board, action_kind="reboot", group_id=group_id, **kwargs)
-        for board in boards
-    ]
+    return pd.queue_post_drain_group(
+        list(boards), action_kind="reboot", group_id=group_id, **kwargs,
+    )
 
 
 def test_an_aggregate_group_never_fires_while_any_member_board_still_runs(two_boards, recorder):
@@ -971,6 +970,21 @@ def _record_argv(monkeypatch):
     return seen
 
 
+def _record_results(monkeypatch, returncodes):
+    seen: list[list[str]] = []
+    results = iter(returncodes)
+
+    def fake_run(argv, **kwargs):
+        seen.append(list(argv))
+        return type(
+            "Result", (),
+            {"returncode": next(results), "stdout": "", "stderr": "authorization denied"},
+        )()
+
+    monkeypatch.setattr(pd.subprocess, "run", fake_run)
+    return seen
+
+
 def test_reboot_never_inherits_the_user_service_restart_scope(kanban_home, monkeypatch):
     """``systemctl --user reboot`` is not a host reboot.
 
@@ -982,7 +996,7 @@ def test_reboot_never_inherits_the_user_service_restart_scope(kanban_home, monke
 
     pd._reboot_fire({}, pd.PostDrainConfig(service_restart_scope="user"))
 
-    assert argv_seen == [["systemctl", "reboot"]]
+    assert argv_seen == [["systemctl", "--no-ask-password", "reboot"]]
 
 
 def test_a_user_scoped_service_restart_still_uses_the_user_manager(kanban_home, monkeypatch):
@@ -992,5 +1006,62 @@ def test_a_user_scoped_service_restart_still_uses_the_user_manager(kanban_home, 
     pd._service_fire(
         {"target": "hermes-gateway.service"}, pd.PostDrainConfig(service_restart_scope="user"),
     )
+
+    assert argv_seen == [["systemctl", "--user", "restart", "hermes-gateway.service"]]
+
+
+@pytest.mark.parametrize(
+    "fire, record, expected_direct, expected_privileged",
+    [
+        pytest.param(
+            pd._service_fire,
+            {"target": "hermes-gateway.service"},
+            ["systemctl", "--no-ask-password", "restart", "hermes-gateway.service"],
+            ["sudo", "-n", "systemctl", "--no-ask-password", "restart", "hermes-gateway.service"],
+            id="system_service_restart",
+        ),
+        pytest.param(
+            pd._reboot_fire,
+            {},
+            ["systemctl", "--no-ask-password", "reboot"],
+            ["sudo", "-n", "systemctl", "--no-ask-password", "reboot"],
+            id="host_reboot",
+        ),
+    ],
+)
+def test_a_system_action_falls_back_to_fixed_noninteractive_privilege(
+    kanban_home, monkeypatch, fire, record, expected_direct, expected_privileged,
+):
+    argv_seen = _record_results(monkeypatch, [1, 0])
+
+    fire(record, pd.PostDrainConfig(service_restart_scope="system"))
+
+    assert argv_seen == [expected_direct, expected_privileged]
+
+
+def test_a_system_action_fails_after_both_noninteractive_paths_are_denied(
+    kanban_home, monkeypatch,
+):
+    argv_seen = _record_results(monkeypatch, [1, 1])
+
+    with pytest.raises(RuntimeError, match="authorization denied"):
+        pd._reboot_fire({}, pd.PostDrainConfig())
+
+    assert argv_seen == [
+        ["systemctl", "--no-ask-password", "reboot"],
+        ["sudo", "-n", "systemctl", "--no-ask-password", "reboot"],
+    ]
+
+
+def test_a_denied_user_service_restart_never_escalates_to_sudo(
+    kanban_home, monkeypatch,
+):
+    argv_seen = _record_results(monkeypatch, [1])
+
+    with pytest.raises(RuntimeError, match="authorization denied"):
+        pd._service_fire(
+            {"target": "hermes-gateway.service"},
+            pd.PostDrainConfig(service_restart_scope="user"),
+        )
 
     assert argv_seen == [["systemctl", "--user", "restart", "hermes-gateway.service"]]

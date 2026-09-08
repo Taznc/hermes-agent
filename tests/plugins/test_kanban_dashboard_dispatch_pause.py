@@ -447,6 +447,91 @@ def test_aggregate_queue_writes_one_record_per_board_sharing_a_group(client, kan
     assert len(groups) == 1 and None not in groups
 
 
+def test_aggregate_queue_is_not_fireable_between_member_writes(
+    client, kanban_home, monkeypatch,
+):
+    """A dispatcher tick interleaved with REST arming must see the full manifest.
+
+    This is the exact race that matters: both selected boards are already
+    operator-paused and drained, then the API has persisted only its first leg
+    when a server-side tick evaluates it. The host action must remain unfired
+    until every selected leg exists and the aggregate is fully armed.
+    """
+    kb.create_board("other-board")
+    for board in ("default", "other-board"):
+        kbd.pause_dispatch(board)
+
+    fired: list[str] = []
+    original_handler = pd.ACTION_HANDLERS["reboot"]
+    monkeypatch.setitem(
+        pd.ACTION_HANDLERS,
+        "reboot",
+        type(original_handler)(
+            kind="reboot",
+            takes_target=False,
+            resolve_target=original_handler.resolve_target,
+            observe_before=lambda record, cfg: {},
+            fire=lambda record, cfg: fired.append("reboot"),
+            observe_after=lambda record, cfg: {"state": pd.SUCCEEDED},
+        ),
+    )
+    real_write = pd._write_post_drain_action
+    first_group_write_seen = False
+
+    def write_with_interleaved_tick(board, record):
+        nonlocal first_group_write_seen
+        written = real_write(board, record)
+        if record.get("group_id") and not first_group_write_seen:
+            first_group_write_seen = True
+            pd.evaluate_post_drain_action(board)
+        return written
+
+    monkeypatch.setattr(pd, "_write_post_drain_action", write_with_interleaved_tick)
+
+    response = client.post(
+        f"{PREFIX}/dispatch/post-drain?boards=*", json={"action_kind": "reboot"},
+    )
+
+    assert response.status_code == 200
+    assert response.json()["queued"] is True
+    assert fired == []
+    records = [pd.read_post_drain_action(board) for board in ("default", "other-board")]
+    assert [record["state"] for record in records] == [pd.WAITING, pd.WAITING]
+    assert all(record["group_phase"] == "armed" for record in records)
+    assert all(record["group_members"] == ["default", "other-board"] for record in records)
+
+
+def test_aggregate_partial_write_failure_disarms_every_persisted_leg(
+    client, kanban_home, monkeypatch,
+):
+    """A failed multi-board arm cannot leave a surviving reboot intent."""
+    kb.create_board("other-board")
+    real_write = pd._write_post_drain_action
+
+    def fail_second_member(board, record):
+        if board == "other-board" and record.get("group_phase") == "arming":
+            raise OSError("simulated second-member write failure")
+        return real_write(board, record)
+
+    monkeypatch.setattr(pd, "_write_post_drain_action", fail_second_member)
+
+    response = client.post(
+        f"{PREFIX}/dispatch/post-drain?boards=*", json={"action_kind": "reboot"},
+    )
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["queued"] is False
+    assert payload["failures"] == [
+        {"board": "other-board", "error": "simulated second-member write failure"},
+    ]
+    assert len(payload["results"]) == 1
+    assert payload["results"][0]["board"] == "default"
+    assert payload["results"][0]["state"]["state"] == pd.CANCELLED
+    assert pd.read_post_drain_action("default")["state"] == pd.CANCELLED
+    assert pd.read_post_drain_action("other-board") is None
+
+
 def test_aggregate_status_reports_the_queued_action_and_total_running(client, kanban_home):
     kb.create_board("other-board")
     _running(None, 2)

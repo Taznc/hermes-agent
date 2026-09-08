@@ -2032,19 +2032,26 @@ def dispatch_queue_post_drain(
             detail=f"unknown post-drain action {payload.action_kind!r}",
         )
     group_id = f"{int(time.time())}-{uuid.uuid4().hex[:8]}"
-    results: list[dict[str, Any]] = []
-    failures: list[dict[str, str]] = []
-    for slug in slugs:
-        try:
-            results.append({"board": slug, "state": _queue(slug, group_id)})
-        except HTTPException:
-            raise
-        except Exception as exc:
-            failures.append({"board": slug, "error": str(exc)})
+    try:
+        group = kbpd.queue_post_drain_group(
+            slugs,
+            action_kind=payload.action_kind,
+            target=payload.target,
+            requested_by=requested_by,
+            expires_in_seconds=payload.expires_in_seconds,
+            group_id=group_id,
+        )
+    except kbpd.PostDrainActionRejected as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    results = [
+        {"board": slug, "state": state}
+        for slug, state in group["records"].items()
+    ]
+    failures = group["failures"]
     return {
-        "queued": bool(slugs) and len(results) == len(slugs),
+        "queued": group["queued"],
         "board_count": len(slugs),
-        "queued_count": len(results),
+        "queued_count": len(results) if group["queued"] else 0,
         "group_id": group_id,
         "results": results,
         "failures": failures,
