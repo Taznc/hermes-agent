@@ -884,12 +884,20 @@ _POOL_STATUS_FIELDS = (
 
 def _merge_disk_cooldown_state(
     entry: Dict[str, Any], disk_entry: Optional[Dict[str, Any]], provider_id: str,
+    *, reset_at: Optional[float] = None,
 ) -> Dict[str, Any]:
     """Keep a newer on-disk cooldown/quarantine over a stale in-memory one.
 
     ``write_credential_pool`` persists an in-memory snapshot that may predate another process
     marking the same credential exhausted/dead; without this merge the later rewrite resurrects a
-    rate-limited key as healthy and both processes resume hammering it."""
+    rate-limited key as healthy and both processes resume hammering it.
+
+    *reset_at* is the wall-clock instant an explicit operator reset (``hermes auth reset``) cleared
+    the in-memory rows. Such a reset carries no ``last_status_at``, so the plain timestamp
+    comparison below reads it as the stalest possible write and restores the very cooldown the
+    operator asked to clear. The operator's intent is authoritative for everything recorded up to
+    that instant — and only for that: a cooldown stamped AFTER the boundary is genuinely newer
+    information and still wins."""
     if not isinstance(disk_entry, dict):
         return entry
     try:
@@ -908,6 +916,8 @@ def _merge_disk_cooldown_state(
             return entry
         disk_ts = _parse_absolute_timestamp(disk_entry.get("last_status_at")) or 0.0
         mem_ts = _parse_absolute_timestamp(entry.get("last_status_at")) or 0.0
+        if reset_at is not None and disk_ts <= reset_at:
+            return entry
         if disk_ts <= mem_ts:
             return entry
         if disk_status == STATUS_EXHAUSTED:
@@ -925,12 +935,16 @@ def _entry_ids(entries: Iterable[Any]) -> Dict[str, Dict[str, Any]]:
 
 def write_credential_pool(
     provider_id: str, entries: List[Dict[str, Any]], *, removed_ids: Optional[Iterable[str]] = None,
+    reset_at: Optional[float] = None,
 ) -> Path:
     """Persist one provider's credential pool under auth.json.
 
     Final disk-boundary sanitizer for borrowed credentials (callers may pass raw dicts). Entries on
     disk but missing from *entries* (added concurrently) are merged back unless in *removed_ids*,
-    so a rotation/exhaustion rewrite never drops a concurrent credential."""
+    so a rotation/exhaustion rewrite never drops a concurrent credential.
+
+    *reset_at* marks this write as an explicit operator reset authoritative for cooldowns recorded
+    up to that instant (see ``_merge_disk_cooldown_state``)."""
     removed = {rid for rid in (removed_ids or ()) if rid}
     with _auth_store_lock():
         auth_store = _load_auth_store()
@@ -943,7 +957,7 @@ def write_credential_pool(
         existing_by_id = _entry_ids(existing_list)
         new_ids = set(_entry_ids(sanitized))
         merged: List[Dict[str, Any]] = [
-            _merge_disk_cooldown_state(e, existing_by_id.get(e.get("id")), provider_id)
+            _merge_disk_cooldown_state(e, existing_by_id.get(e.get("id")), provider_id, reset_at=reset_at)
             if isinstance(e, dict) else e
             for e in sanitized]
         for disk_entry in existing_list:
