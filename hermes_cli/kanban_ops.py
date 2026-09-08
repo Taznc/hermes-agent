@@ -135,6 +135,8 @@ def _cmd_dispatch(args: argparse.Namespace) -> int:
             dispatch_start_window_seconds=caps.dispatch_start_window_seconds,
             review_rework_escalation_profile=caps.review_rework_escalation_profile,
             max_review_rounds=caps.max_review_rounds,
+            priority_reserved_slots=caps.priority_reserved_slots,
+            priority_reserved_threshold=caps.priority_reserved_threshold,
         )
     if getattr(args, "json", False):
         _print_json({
@@ -163,6 +165,13 @@ def _cmd_dispatch(args: argparse.Namespace) -> int:
                 {"task_id": tid, "changes_rounds": rounds}
                 for (tid, rounds) in res.blocked_review_round_cap
             ],
+            "priority_reserved": {
+                "configured_slots": caps.priority_reserved_slots,
+                "threshold": caps.priority_reserved_threshold,
+                "reserved": res.priority_slots_reserved,
+                "unused": res.priority_slots_unused,
+                "deferred_task_ids": res.deferred_priority_reserved,
+            },
             "dispatch_paused": res.dispatch_paused,
         }, ascii=True)
         return 0
@@ -206,6 +215,22 @@ def _cmd_dispatch(args: argparse.Namespace) -> int:
         )
     if res.skipped_unassigned:
         print(f"Skipped (unassigned): {', '.join(res.skipped_unassigned)}")
+    # AC5 observability: the reservation is invisible otherwise — a normal card just
+    # fails to appear in `spawned` with no stated reason. Printed whenever the feature
+    # is configured, including when it reserved nothing this tick, so an operator can
+    # tell "off", "on but no high-priority demand", and "on and holding" apart.
+    if caps.priority_reserved_slots:
+        print(
+            f"Priority reservation: {res.priority_slots_reserved} of "
+            f"{caps.priority_reserved_slots} slot(s) held for priority >= "
+            f"{caps.priority_reserved_threshold}"
+            + (f", {res.priority_slots_unused} unused" if res.priority_slots_unused else "")
+        )
+        if res.deferred_priority_reserved:
+            print(
+                "  Deferred (below threshold, slot reserved): "
+                + ", ".join(res.deferred_priority_reserved)
+            )
     for tid, who, current in res.skipped_per_profile_capped:
         print(f"Deferred ({who} at per-profile cap, {current} running): {tid}")
     if res.skipped_nonspawnable:

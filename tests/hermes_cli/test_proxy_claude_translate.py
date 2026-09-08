@@ -17,6 +17,97 @@ def test_claude_subscription_proxy_is_loopback_only_and_requires_client_authorit
         create_app(adapter)
 
 
+def test_claude_proxy_preserves_openai_json_object_response_format():
+    """Hindsight's soft structured-output mode must reach Anthropic enforcement."""
+    _, raw, _ = prepare_chat_request({
+        "model": "claude-sonnet-4-6",
+        "messages": [{"role": "user", "content": "Return valid json only."}],
+        "response_format": {"type": "json_object"},
+    })
+
+    wire = json.loads(raw)
+    assert wire["output_config"] == {
+        "format": {
+            "type": "json_schema",
+            "schema": {"type": "object"},
+        }
+    }
+
+
+def test_claude_proxy_translates_openai_json_schema_response_format():
+    """A supplied schema must reach Anthropic without the OpenAI wrapper keys."""
+    schema = {
+        "type": "object",
+        "properties": {"verdict": {"type": "string"}},
+        "required": ["verdict"],
+    }
+    _, raw, _ = prepare_chat_request({
+        "model": "claude-sonnet-4-6",
+        "messages": [{"role": "user", "content": "Grade this."}],
+        "response_format": {
+            "type": "json_schema",
+            "json_schema": {"name": "verdict", "strict": True, "schema": schema},
+        },
+    })
+
+    wire = json.loads(raw)
+    assert wire["output_config"] == {"format": {"type": "json_schema", "schema": schema}}
+
+
+@pytest.mark.parametrize("response_format", [None, {"type": "text"}])
+def test_claude_proxy_omits_output_config_when_no_format_is_requested(response_format):
+    """Unconstrained requests must not gain output enforcement they did not ask for."""
+    payload = {
+        "model": "claude-sonnet-4-6",
+        "messages": [{"role": "user", "content": "Say hello."}],
+    }
+    if response_format is not None:
+        payload["response_format"] = response_format
+
+    _, raw, _ = prepare_chat_request(payload)
+
+    assert "output_config" not in json.loads(raw)
+
+
+@pytest.mark.parametrize("response_format", [
+    "json_object",
+    {},
+    {"type": "json"},
+    {"type": "json_schema"},
+    {"type": "json_schema", "json_schema": "verdict"},
+    {"type": "json_schema", "json_schema": {"name": "verdict"}},
+    {"type": "json_schema", "json_schema": {"schema": "object"}},
+])
+def test_claude_proxy_rejects_unsupported_response_format(response_format):
+    """Structured-output semantics are never silently weakened to plain prose."""
+    with pytest.raises(ValueError, match="response_format"):
+        prepare_chat_request({
+            "model": "claude-sonnet-4-6",
+            "messages": [{"role": "user", "content": "Return json."}],
+            "response_format": response_format,
+        })
+
+
+def test_claude_proxy_forces_named_client_tool_through_the_oauth_wire_name():
+    """A forced tool must name the wire tool that actually exists upstream."""
+    _, raw, tool_name_map = prepare_chat_request({
+        "model": "claude-sonnet-4-6",
+        "messages": [{"role": "user", "content": "look this up"}],
+        "tools": [
+            {"type": "function", "function": {
+                "name": "lookup", "description": "Lookup a record", "parameters": {"type": "object"},
+            }},
+        ],
+        "tool_choice": {"type": "function", "function": {"name": "lookup"}},
+    })
+
+    wire = json.loads(raw)
+    forced_name = wire["tool_choice"]["name"]
+    assert wire["tool_choice"]["type"] == "tool"
+    assert forced_name == wire["tools"][0]["name"]
+    assert tool_name_map[forced_name] == "lookup"
+
+
 def test_claude_proxy_translates_tool_request_and_response():
     headers, raw, tool_name_map = prepare_chat_request({
         "model": "claude-sonnet-4-6",

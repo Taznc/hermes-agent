@@ -214,6 +214,73 @@ def test_external_worker_refuses_to_run_without_durable_ownership(
     assert not ack.exists()
 
 
+def test_external_worker_waiter_holds_its_guard_until_the_worker_process_exits(
+    tmp_path, monkeypatch
+):
+    """A terminal execution row no longer means the worker is finished.
+
+    The worker commits its terminal row BEFORE Bot Chat delivery, and that send is a whole agent
+    turn (``cron.bot_chat_delivery_timeout_seconds``, default 600s). Returning on the row would
+    drop ``_restart_safe_waiter_job_ids`` — the guard ``mark_running_jobs_interrupted`` reads to
+    withhold shutdown marking from these jobs — and reap the handoff artifacts while delivery is
+    still running, re-arming the interruption that ordering exists to prevent. Only process exit
+    ends the wait.
+    """
+    import cron.scheduler as scheduler
+
+    job_id = "delivering-worker"
+    payload = tmp_path / "exec-1.json"
+    payload.write_text("{}", encoding="utf-8")
+    # Terminal from the very first read: the run finished, delivery has not.
+    monkeypatch.setattr(
+        scheduler, "get_execution", lambda _id: {"id": "exec-1", "status": "completed"}
+    )
+
+    observed_while_alive = []
+
+    class DeliveringWorker:
+        """Alive through three waits (delivery), then exits."""
+
+        def __init__(self):
+            self.wait_calls = 0
+
+        def wait(self, timeout=None):
+            self.wait_calls += 1
+            observed_while_alive.append(
+                {
+                    "guard_held": job_id in scheduler._restart_safe_waiter_job_ids,
+                    "handoff_present": payload.exists(),
+                }
+            )
+            if self.wait_calls < 3:
+                raise subprocess.TimeoutExpired(cmd="worker", timeout=timeout)
+            return 0
+
+    process = DeliveringWorker()
+    scheduler._restart_safe_waiter_job_ids.add(job_id)
+    try:
+        assert scheduler._wait_for_external_cron_worker(
+            process,
+            execution_id="exec-1",
+            job_id=job_id,
+            handoff_files=(payload,),
+        ) is True
+    finally:
+        scheduler._restart_safe_waiter_job_ids.discard(job_id)
+
+    # It kept waiting on the PROCESS rather than returning on the terminal row...
+    assert process.wait_calls == 3
+    # ...and neither the shutdown guard nor the handoff artifacts were released mid-delivery.
+    assert observed_while_alive == [
+        {"guard_held": True, "handoff_present": True},
+        {"guard_held": True, "handoff_present": True},
+        {"guard_held": True, "handoff_present": True},
+    ]
+    # Only after exit is the guard dropped and the handoff reaped.
+    assert job_id not in scheduler._restart_safe_waiter_job_ids
+    assert not payload.exists()
+
+
 def test_launch_external_worker_uses_restart_safe_scope_and_acknowledges(
     tmp_path, monkeypatch
 ):
@@ -232,6 +299,12 @@ def test_launch_external_worker_uses_restart_safe_scope_and_acknowledges(
     )
 
     class FakeProcess:
+        """Alive for the ownership acknowledgement, then exits.
+
+        The waiter deliberately does NOT return on a terminal execution row (the worker
+        terminalizes before delivering), so this worker has to actually exit to end the wait.
+        """
+
         returncode = None
 
         def poll(self):
@@ -239,6 +312,7 @@ def test_launch_external_worker_uses_restart_safe_scope_and_acknowledges(
 
         def wait(self, timeout=None):
             if self.returncode is None:
+                self.returncode = 0
                 raise subprocess.TimeoutExpired(cmd="worker", timeout=timeout)
             return self.returncode
 
@@ -260,13 +334,7 @@ def test_launch_external_worker_uses_restart_safe_scope_and_acknowledges(
     handoff = Mock(return_value={"id": "exec-1", "handoff_pending": 1})
     monkeypatch.setattr(scheduler, "mark_execution_handoff_pending", handoff)
     monkeypatch.setattr(scheduler.subprocess, "Popen", popen)
-    observed_statuses = iter(
-        [
-            {"id": "exec-1", "status": "running"},
-            {"id": "exec-1", "status": "completed"},
-        ]
-    )
-    get = Mock(side_effect=lambda _execution_id: next(observed_statuses))
+    get = Mock(return_value={"id": "exec-1", "status": "completed"})
     monkeypatch.setattr(scheduler, "get_execution", get)
     monkeypatch.setenv("ANTHROPIC_API_KEY", "should-not-cross-profile")
     from agent.secret_scope import set_multiplex_active
@@ -281,7 +349,9 @@ def test_launch_external_worker_uses_restart_safe_scope_and_acknowledges(
     assert spawned[0][1]["start_new_session"] is True
     assert "ANTHROPIC_API_KEY" not in spawned[0][1]["env"]
     handoff.assert_called_once_with("exec-1")
-    assert get.call_count == 2
+    # The row is read only after the worker exits — a terminal row is no longer a wakeup, since
+    # the worker terminalizes before it delivers.
+    assert get.call_count == 1
     assert payloads[0]["multiplex_active"] is True
     # Once the attempt is terminal the parent reaps its own handoff artifacts.
     assert not (tmp_path / "cron/external-workers/exec-1.json").exists()
