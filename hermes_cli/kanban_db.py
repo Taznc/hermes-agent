@@ -3435,6 +3435,9 @@ def release_stale_claims(conn: sqlite3.Connection, *, signal_fn=None) -> int:
                 reason="ttl_expired_worker_alive",
             )
             continue
+        # Preserve before the claim is released: a retry can be spawned onto
+        # this worktree on the very next tick.
+        _preserve_task_work(conn, row["id"])
         with write_txn(conn):
             retry_status = _retry_status_for_run(conn, row["id"])
             cur = conn.execute(
@@ -3531,6 +3534,11 @@ def reclaim_task(
     termination = _terminate_reclaimed_worker(
         row["worker_pid"], prev_lock, signal_fn=signal_fn, worker_unit=row["worker_unit"],
     )
+    # Preserve BEFORE releasing the claim: once the task returns to the pool a
+    # retry can be spawned onto the same worktree, and this run's uncommitted
+    # output would be indistinguishable from the next run's. The worker was
+    # just terminated, so the ownership gate sees a dead pid.
+    _preserve_task_work(conn, task_id)
     with write_txn(conn):
         retry_status = _retry_status_for_run(conn, task_id)
         cur = conn.execute(
@@ -3746,6 +3754,10 @@ def complete_task(
     # Success wipes the breaker counter (history stays on the event log).
     _clear_failure_counter(conn, task_id)
     recompute_ready(conn)  # separate txn so children see ``done``
+    # Preserve BEFORE cleanup: _cleanup_workspace only removes a worktree that
+    # is clean and fully pushed, so a successful snapshot is exactly what lets
+    # the worktree be reclaimed — and a refused one keeps it for a human.
+    _preserve_task_work(conn, task_id)
     _cleanup_workspace(conn, task_id)
     _done_task = get_task(conn, task_id)
     if fire_lifecycle_hook:
@@ -3754,6 +3766,26 @@ def complete_task(
 
 
 _REVIEW_APPROVED_NOTE = "Review approved without additional evidence."
+
+
+def _preserve_task_work(
+    conn: sqlite3.Connection, task_id: str, *, expected_run_id: Optional[int] = None,
+) -> None:
+    """Fire the worker-preservation safety net for a task whose run is ending.
+
+    Commit + push only: see :mod:`hermes_cli.kanban_preserve`. Best-effort and
+    late-bound — a lifecycle transition must never fail because preservation
+    could not run, and the import lives here so the preservation module can
+    import ``kanban_db`` back without a cycle.
+    """
+    try:
+        from hermes_cli import kanban_preserve
+
+        kanban_preserve.preserve_task_work(
+            conn, task_id, expected_run_id=expected_run_id,
+        )
+    except Exception:
+        _log.debug("kanban: work preservation unavailable for task %s", task_id)
 
 
 def _gate_created_cards(
@@ -4082,10 +4114,16 @@ def block_task(
         )
         _append_event(conn, task_id, event_kind, payload, run_id=run_id)
         blocked_task = get_task(conn, task_id)
-        if kind == "dependency":
+        dependency_lane = kind == "dependency"
+        if dependency_lane:
             # Historical ordering: the dependency lane fires inside the txn.
             _fire_task_hook("kanban_task_blocked", blocked_task, task_id, run_id, reason=reason)
-            return True
+    # Blocking ends this run, so the worker's output must be preserved before
+    # anything else can reclaim the workspace. Outside the write txn: the
+    # snapshot records its own event.
+    _preserve_task_work(conn, task_id)
+    if dependency_lane:
+        return True
     _fire_task_hook("kanban_task_blocked", blocked_task, task_id, run_id, reason=reason)
     return True
 
@@ -4256,6 +4294,9 @@ def request_review(
             if implementer_reasoning_effort is not None:
                 event_payload["implementer_reasoning_effort"] = implementer_reasoning_effort
         _append_event(conn, task_id, "review_requested", event_payload, run_id=run_id)
+    # The implementation run just ended; preserve its output before the review
+    # lane (or any reclaim) can touch the workspace.
+    _preserve_task_work(conn, task_id)
     return _ret(True)
 
 
@@ -4930,6 +4971,9 @@ def archive_task(
     # incomplete archived parents remain gated. Re-evaluate children now either way.
     recompute_ready(conn)
     # Reap the workspace on archive too (never-completed tasks kept it forever).
+    # Preservation first: archive is the last chance to rescue work from a task
+    # that never completed, and cleanup will only remove what it saved.
+    _preserve_task_work(conn, task_id)
     _cleanup_workspace(conn, task_id)
     return True
 

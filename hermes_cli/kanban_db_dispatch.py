@@ -674,6 +674,10 @@ def enforce_max_runtime(conn: sqlite3.Connection, *, signal_fn=None) -> list[str
             continue
 
         error = f"elapsed {int(elapsed)}s > limit {limit}s"
+        # The timed-out run is known exactly, so preservation is gated on it:
+        # if a newer run has already claimed the task, this sweep must not
+        # snapshot over the live worker's in-flight edits.
+        _kb._preserve_task_work(conn, tid, expected_run_id=run_id)
         with _kb.write_txn(conn):
             retry_status = _kb._retry_status_for_run(conn, tid)
             cur = conn.execute(
@@ -1129,6 +1133,7 @@ class _CrashSweep:
 def _reclaim_dead_workers(conn: sqlite3.Connection) -> _CrashSweep:
     """Release every host-local ``running`` task whose worker PID is dead."""
     sweep = _CrashSweep()
+    preserved_candidates: list[str] = []
     with _kb.write_txn(conn):
         rows = conn.execute(
             "SELECT id, worker_pid, worker_unit, claim_lock, started_at, assignee "
@@ -1229,6 +1234,15 @@ def _reclaim_dead_workers(conn: sqlite3.Connection) -> _CrashSweep:
                 sweep.crash_details.append(
                     (row["id"], pid, row["claim_lock"], dead.protocol_violation, dead.error_text)
                 )
+            preserved_candidates.append(row["id"])
+    # Preservation runs AFTER the sweep transaction commits (it does slow git
+    # work and records its own event, so it must not sit inside this write
+    # txn), but still BEFORE any spawn in this tick — so a retry can never be
+    # started onto a worktree whose previous run's output was not yet saved.
+    # No expected_run_id: ``_end_run`` already cleared ``current_run_id``, and
+    # the pid these tasks belonged to was verified dead above.
+    for task_id in preserved_candidates:
+        _kb._preserve_task_work(conn, task_id)
     return sweep
 
 
