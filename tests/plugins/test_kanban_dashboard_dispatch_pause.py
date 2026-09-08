@@ -21,6 +21,7 @@ from fastapi.testclient import TestClient
 from hermes_cli import kanban_db as kb
 from hermes_cli import kanban_db_connect as kbc
 from hermes_cli import kanban_db_dispatch as kbd
+from hermes_cli import kanban_db_dispatch_postdrain as pd
 
 PREFIX = "/api/plugins/kanban"
 
@@ -303,3 +304,188 @@ def test_unknown_board_is_rejected_not_silently_applied_to_the_active_board(
 
     assert response.status_code == 404
     assert kbd.read_dispatch_pause(None) is None
+
+
+# --- post-drain action queue ------------------------------------------------
+
+
+@pytest.fixture
+def allowlisted(monkeypatch):
+    """One unit is restartable; the request body may only name THAT unit."""
+    monkeypatch.setattr(
+        pd, "resolve_post_drain_config",
+        lambda: pd.PostDrainConfig(
+            service_restart_allowlist=("hermes-gateway.service",),
+            service_restart_scope="system",
+            default_expiry_seconds=3600,
+            max_expiry_seconds=86400,
+        ),
+    )
+
+
+def test_status_reports_no_queued_action_by_default(client, kanban_home):
+    assert client.get(f"{PREFIX}/dispatch/status").json()["post_drain"] is None
+
+
+def test_queueing_an_action_surfaces_it_on_status_with_the_live_running_count(
+    client, kanban_home,
+):
+    """The panel renders action + running count + time remaining from one poll."""
+    board = "queue-me"
+    kb.create_board(board)
+    _running(board, 3)
+    client.post(f"{PREFIX}/dispatch/pause?board={board}", json={})
+
+    queued = client.post(
+        f"{PREFIX}/dispatch/post-drain?board={board}",
+        json={"action_kind": "reboot", "expires_in_seconds": 1800},
+    )
+
+    assert queued.status_code == 200
+    assert queued.json()["queued"] is True
+
+    status = client.get(f"{PREFIX}/dispatch/status?board={board}").json()
+
+    assert status["post_drain"]["action_kind"] == "reboot"
+    assert status["post_drain"]["state"] == "waiting"
+    assert status["running_count"] == 3
+    assert 0 < status["post_drain"]["expires_in_seconds"] <= 1800
+
+
+def test_an_unknown_action_kind_is_rejected(client, kanban_home):
+    response = client.post(f"{PREFIX}/dispatch/post-drain", json={"action_kind": "rm_rf"})
+
+    assert response.status_code == 400
+    assert client.get(f"{PREFIX}/dispatch/status").json()["post_drain"] is None
+
+
+def test_a_target_outside_the_allowlist_is_rejected(client, kanban_home, allowlisted):
+    response = client.post(
+        f"{PREFIX}/dispatch/post-drain",
+        json={"action_kind": "service_restart", "target": "sshd.service"},
+    )
+
+    assert response.status_code == 400
+    assert client.get(f"{PREFIX}/dispatch/status").json()["post_drain"] is None
+
+    # Control: the same route with an ALLOWLISTED unit succeeds, so the 400
+    # above proves allowlist validation rather than a broken route.
+    allowed = client.post(
+        f"{PREFIX}/dispatch/post-drain",
+        json={"action_kind": "service_restart", "target": "hermes-gateway.service"},
+    )
+    assert allowed.status_code == 200
+
+
+def test_service_restart_is_rejected_when_no_allowlist_is_configured(client, kanban_home):
+    """The shipped default configures no restartable unit at all."""
+    response = client.post(
+        f"{PREFIX}/dispatch/post-drain",
+        json={"action_kind": "service_restart", "target": "hermes-gateway.service"},
+    )
+
+    assert response.status_code == 400
+
+
+def test_cancelling_a_queued_action_clears_it_from_status(client, kanban_home):
+    client.post(f"{PREFIX}/dispatch/post-drain", json={"action_kind": "reboot"})
+
+    cancelled = client.delete(f"{PREFIX}/dispatch/post-drain")
+
+    assert cancelled.status_code == 200
+    assert cancelled.json()["cancelled"] is True
+    assert client.get(f"{PREFIX}/dispatch/status").json()["post_drain"]["state"] == "cancelled"
+
+
+def test_resuming_dispatch_cancels_the_queued_action_over_rest(client, kanban_home):
+    board = "changed-my-mind"
+    kb.create_board(board)
+    client.post(f"{PREFIX}/dispatch/pause?board={board}", json={})
+    client.post(f"{PREFIX}/dispatch/post-drain?board={board}", json={"action_kind": "reboot"})
+
+    client.post(f"{PREFIX}/dispatch/resume?board={board}")
+
+    status = client.get(f"{PREFIX}/dispatch/status?board={board}").json()
+    assert status["post_drain"]["state"] == "cancelled"
+
+
+def test_the_queue_is_board_scoped(client, kanban_home):
+    kb.create_board("queued-board")
+    kb.create_board("untouched-board")
+
+    client.post(f"{PREFIX}/dispatch/post-drain?board=queued-board", json={"action_kind": "reboot"})
+
+    assert client.get(f"{PREFIX}/dispatch/status?board=queued-board").json()["post_drain"]
+    assert client.get(f"{PREFIX}/dispatch/status?board=untouched-board").json()["post_drain"] is None
+
+
+def test_an_unknown_board_is_rejected_by_the_queue_route(client, kanban_home):
+    kb.create_board("real-board")
+    assert client.post(
+        f"{PREFIX}/dispatch/post-drain?board=real-board", json={"action_kind": "reboot"},
+    ).status_code == 200
+
+    response = client.post(
+        f"{PREFIX}/dispatch/post-drain?board=no-such-board", json={"action_kind": "reboot"},
+    )
+
+    assert response.status_code == 404
+    assert pd.read_post_drain_action(None) is None
+
+
+def test_aggregate_queue_writes_one_record_per_board_sharing_a_group(client, kanban_home):
+    kb.create_board("other-board")
+
+    response = client.post(f"{PREFIX}/dispatch/post-drain?boards=*", json={"action_kind": "reboot"})
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["board_count"] == 2
+    assert payload["queued_count"] == 2
+    assert payload["failures"] == []
+    groups = {pd.read_post_drain_action(slug)["group_id"] for slug in ("default", "other-board")}
+    assert len(groups) == 1 and None not in groups
+
+
+def test_aggregate_status_reports_the_queued_action_and_total_running(client, kanban_home):
+    kb.create_board("other-board")
+    _running(None, 2)
+    client.post(f"{PREFIX}/dispatch/post-drain?boards=*", json={"action_kind": "reboot"})
+
+    status = client.get(f"{PREFIX}/dispatch/status?boards=*").json()
+
+    assert status["post_drain"]["action_kind"] == "reboot"
+    assert status["post_drain"]["state"] == "waiting"
+    assert status["running_count"] == 2
+    assert {item["board"]: item["post_drain"]["state"] for item in status["boards"]} == {
+        "default": "waiting",
+        "other-board": "waiting",
+    }
+
+
+def test_aggregate_cancel_clears_every_board(client, kanban_home):
+    kb.create_board("other-board")
+    client.post(f"{PREFIX}/dispatch/post-drain?boards=*", json={"action_kind": "reboot"})
+
+    response = client.delete(f"{PREFIX}/dispatch/post-drain?boards=*")
+
+    assert response.status_code == 200
+    assert response.json()["cancelled_count"] == 2
+    for slug in ("default", "other-board"):
+        assert pd.read_post_drain_action(slug)["state"] == "cancelled"
+
+
+def test_the_available_action_kinds_are_advertised_for_the_selector(client, kanban_home, allowlisted):
+    """The UI must render only what this host will actually accept."""
+    payload = client.get(f"{PREFIX}/dispatch/status").json()
+
+    assert payload["post_drain_actions"] == [
+        {"action_kind": "service_restart", "targets": ["hermes-gateway.service"]},
+        {"action_kind": "reboot", "targets": []},
+    ]
+
+
+def test_service_restart_is_not_offered_without_an_allowlist(client, kanban_home):
+    payload = client.get(f"{PREFIX}/dispatch/status").json()
+
+    assert payload["post_drain_actions"] == [{"action_kind": "reboot", "targets": []}]

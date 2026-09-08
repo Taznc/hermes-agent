@@ -164,12 +164,19 @@ def recorder(monkeypatch):
 
 
 def _running(board, count):
+    """Put ``count`` tasks into ``running`` with a live claim on ``board``.
+
+    The pid must be a LIVE process: the dispatcher's reclaim phase reconciles a
+    ``running`` row whose worker is gone, so a fake pid would legitimately drain
+    the board mid-tick and the "never fires while running" contract would be
+    tested against a board that is not actually running anything.
+    """
     with kbc.connect_closing(board=board) as conn:
         for index in range(count):
             task_id = kb.create_task(conn, title=f"worker-{index}", assignee="worker")
             conn.execute(
                 "UPDATE tasks SET status='running', claim_lock=?, worker_pid=? WHERE id=?",
-                (f"{kb._host_prefix()}1", 4242 + index, task_id),
+                (f"{kb._host_prefix()}1", os.getpid(), task_id),
             )
         conn.commit()
 
@@ -411,3 +418,70 @@ def test_resuming_dispatch_cancels_a_waiting_action(kanban_home, recorder):
     assert pd.read_post_drain_action(None)["state"] == pd.CANCELLED
     assert pd.evaluate_post_drain_action(None) is None
     assert recorder == []
+
+
+# --- the dispatcher tick is the trigger (no browser involved) ---------------
+
+
+def test_the_dispatcher_tick_fires_a_queued_action_on_a_drained_board(kanban_home, recorder):
+    """The card's central claim, proven server-side.
+
+    Nothing here opens an HTTP client or renders a component: ``dispatch_once``
+    is the same call the in-gateway dispatcher makes every tick, and it is what
+    fires the action.
+    """
+    kbd.pause_dispatch(None)
+    pd.queue_post_drain_action(None, action_kind="reboot")
+
+    with kbc.connect_closing(board=None) as conn:
+        kbd.dispatch_once(conn, board=None)
+
+    assert recorder == ["reboot:None"]
+    assert pd.read_post_drain_action(None)["state"] == pd.SUCCEEDED
+
+
+def test_the_dispatcher_tick_does_not_fire_while_workers_are_running(kanban_home, recorder):
+    _running(None, 1)
+    kbd.pause_dispatch(None)
+    pd.queue_post_drain_action(None, action_kind="reboot")
+
+    with kbc.connect_closing(board=None) as conn:
+        kbd.dispatch_once(conn, board=None)
+
+    assert recorder == []
+    assert pd.read_post_drain_action(None)["state"] == pd.WAITING
+
+
+def test_the_dispatcher_tick_fires_the_action_exactly_once_across_ticks(kanban_home, recorder):
+    kbd.pause_dispatch(None)
+    pd.queue_post_drain_action(None, action_kind="reboot")
+
+    for _ in range(4):
+        with kbc.connect_closing(board=None) as conn:
+            kbd.dispatch_once(conn, board=None)
+
+    assert recorder == ["reboot:None"]
+
+
+def test_a_dry_run_tick_never_fires_a_queued_action(kanban_home, recorder):
+    """A dry run reports what a tick WOULD do; rebooting the host is not that."""
+    kbd.pause_dispatch(None)
+    pd.queue_post_drain_action(None, action_kind="reboot")
+
+    with kbc.connect_closing(board=None) as conn:
+        kbd.dispatch_once(conn, board=None, dry_run=True)
+
+    assert recorder == []
+    assert pd.read_post_drain_action(None)["state"] == pd.WAITING
+
+
+def test_a_tick_with_no_queued_action_is_unaffected(kanban_home, recorder):
+    """Existing pause/resume/dispatch behaviour is unchanged when nothing is queued."""
+    kbd.pause_dispatch(None)
+
+    with kbc.connect_closing(board=None) as conn:
+        result = kbd.dispatch_once(conn, board=None)
+
+    assert recorder == []
+    assert result.dispatch_paused is not None
+    assert pd.read_post_drain_action(None) is None
