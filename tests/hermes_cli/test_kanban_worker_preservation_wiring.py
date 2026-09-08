@@ -24,8 +24,13 @@ from hermes_cli import kanban_preserve as kp
 
 def _git(*args: str, cwd: str | Path | None = None) -> str:
     result = subprocess.run(
-        ["git", *args], cwd=str(cwd) if cwd else None,
-        capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=60,
+        ["git", *args],
+        cwd=str(cwd) if cwd else None,
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        timeout=60,
     )
     assert result.returncode == 0, f"git {' '.join(args)} failed: {result.stderr}"
     return result.stdout
@@ -54,8 +59,15 @@ def calls(monkeypatch: pytest.MonkeyPatch) -> list[tuple]:
     return seen
 
 
-def _task(conn, task_id: str, *, status: str = "running", run_id: int | None = None,
-          pid: int | None = None, lock: str | None = None) -> None:
+def _task(
+    conn,
+    task_id: str,
+    *,
+    status: str = "running",
+    run_id: int | None = None,
+    pid: int | None = None,
+    lock: str | None = None,
+) -> None:
     conn.execute(
         "INSERT INTO tasks (id, title, assignee, status, workspace_kind, "
         " workspace_path, branch_name, current_run_id, worker_pid, claim_lock, "
@@ -174,13 +186,16 @@ def test_stale_claim_release_preserves(
 ) -> None:
     monkeypatch.setattr(kb, "_pid_alive", lambda pid: False)
     monkeypatch.setattr(
-        kb, "_terminate_reclaimed_worker", lambda *a, **k: {"terminated": True},
+        kb,
+        "_terminate_reclaimed_worker",
+        lambda *a, **k: {"terminated": True},
     )
     monkeypatch.setattr(kb, "_worker_survived_termination", lambda t: False)
     with kbc.connect_closing() as conn:
         _task(conn, "t_s1", lock=f"{kb._host_prefix()}999", pid=999)
         conn.execute(
-            "UPDATE tasks SET claim_expires = 1 WHERE id = ?", ("t_s1",),
+            "UPDATE tasks SET claim_expires = 1 WHERE id = ?",
+            ("t_s1",),
         )
         conn.commit()
         kb.release_stale_claims(conn)
@@ -193,7 +208,9 @@ def test_timed_out_run_preserves_with_its_own_run_id(
 ) -> None:
     """The timeout sweep knows exactly which run it is killing, so it must pass
     that run id — otherwise it could snapshot over a newer worker."""
-    monkeypatch.setattr(kbd, "_terminate_reclaimed_worker", lambda *a, **k: {"terminated": True})
+    monkeypatch.setattr(
+        kbd, "_terminate_reclaimed_worker", lambda *a, **k: {"terminated": True}
+    )
     monkeypatch.setattr(kbd, "_worker_survived_termination", lambda t: False)
     with kbc.connect_closing() as conn:
         _task(conn, "t_t1", lock=f"{kb._host_prefix()}998", pid=998, run_id=7)

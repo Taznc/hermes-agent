@@ -24,7 +24,10 @@ def _git(*args: str, cwd: str | Path | None = None, check: bool = True) -> str:
     result = subprocess.run(
         ["git", *args],
         cwd=str(cwd) if cwd else None,
-        capture_output=True, text=True, encoding="utf-8", errors="replace",
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
         timeout=60,
     )
     if check:
@@ -63,8 +66,11 @@ def _make_task(repo: Path, task_id: str = "t_demo") -> Path:
     _git("worktree", "add", "-b", f"wt/{task_id}", str(wt), "main", cwd=repo)
     with kbc.connect_closing() as conn:
         kb.create_task(
-            conn, title="demo", assignee="worker",
-            workspace_kind="worktree", workspace_path=str(wt),
+            conn,
+            title="demo",
+            assignee="worker",
+            workspace_kind="worktree",
+            workspace_path=str(wt),
         )
         conn.execute(
             "UPDATE tasks SET id = ?, workspace_path = ?, branch_name = ? "
@@ -79,7 +85,8 @@ def _events(task_id: str, kind: str) -> list[dict]:
     with kbc.connect_closing() as conn:
         rows = conn.execute(
             "SELECT payload FROM task_events WHERE task_id = ? AND kind = ? "
-            "ORDER BY id", (task_id, kind),
+            "ORDER BY id",
+            (task_id, kind),
         ).fetchall()
     return [json.loads(r["payload"]) if r["payload"] else {} for r in rows]
 
@@ -207,7 +214,8 @@ def test_the_owning_worker_itself_may_preserve(
     (wt / "work.py").write_text("value = 1\n", encoding="utf-8")
     with kbc.connect_closing() as conn:
         conn.execute(
-            "UPDATE tasks SET worker_pid = ? WHERE id = ?", (os.getpid(), "t_demo"),
+            "UPDATE tasks SET worker_pid = ? WHERE id = ?",
+            (os.getpid(), "t_demo"),
         )
         conn.commit()
     monkeypatch.setattr(kp, "_pid_alive", lambda pid: True)
@@ -246,8 +254,11 @@ def test_non_worktree_workspaces_are_never_touched(
     scratch.mkdir()
     with kbc.connect_closing() as conn:
         kb.create_task(
-            conn, title="scratchy", assignee="worker",
-            workspace_kind="scratch", workspace_path=str(scratch),
+            conn,
+            title="scratchy",
+            assignee="worker",
+            workspace_kind="scratch",
+            workspace_path=str(scratch),
         )
         conn.execute("UPDATE tasks SET id = 't_scratch' WHERE title = 'scratchy'")
         conn.commit()
@@ -302,8 +313,11 @@ def test_two_tasks_aliasing_the_same_workspace_path_refuse_to_preserve(
     (wt / "work.py").write_text("value = 1\n", encoding="utf-8")
     with kbc.connect_closing() as conn:
         kb.create_task(
-            conn, title="alias", assignee="worker",
-            workspace_kind="worktree", workspace_path=str(wt),
+            conn,
+            title="alias",
+            assignee="worker",
+            workspace_kind="worktree",
+            workspace_path=str(wt),
         )
         conn.execute(
             "UPDATE tasks SET id = 't_alias', workspace_path = ?, branch_name = ? "

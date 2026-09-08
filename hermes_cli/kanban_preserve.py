@@ -39,19 +39,46 @@ DEFAULT_MAX_TOTAL_BYTES = 20 * 1024 * 1024
 # reach this check (git excludes them from ``status``); this catches the tree
 # whose .gitignore simply forgot them.
 _GENERATED_DIR_NAMES = frozenset({
-    "node_modules", "dist", "build", "target", "__pycache__", "site-packages",
-    ".venv", "venv", ".next", ".nuxt", ".tox", ".mypy_cache", ".pytest_cache",
-    ".gradle", "vendor", "coverage", ".terraform",
+    "node_modules",
+    "dist",
+    "build",
+    "target",
+    "__pycache__",
+    "site-packages",
+    ".venv",
+    "venv",
+    ".next",
+    ".nuxt",
+    ".tox",
+    ".mypy_cache",
+    ".pytest_cache",
+    ".gradle",
+    "vendor",
+    "coverage",
+    ".terraform",
 })
 
 # Filenames that carry credentials by convention. Their CONTENTS are never the
 # question — a ``.env`` full of harmless ports is still a file no automation
 # should commit on a human's behalf.
 _SECRET_FILE_NAMES = frozenset({
-    ".env", ".netrc", "_netrc", ".git-credentials", ".npmrc", ".pypirc",
-    "credentials", "credentials.json", "client_secret.json", ".htpasswd",
-    "id_rsa", "id_dsa", "id_ecdsa", "id_ed25519", "identity",
-    ".dockercfg", "kubeconfig",
+    ".env",
+    ".netrc",
+    "_netrc",
+    ".git-credentials",
+    ".npmrc",
+    ".pypirc",
+    "credentials",
+    "credentials.json",
+    "client_secret.json",
+    ".htpasswd",
+    "id_rsa",
+    "id_dsa",
+    "id_ecdsa",
+    "id_ed25519",
+    "identity",
+    ".dockercfg",
+    "kubeconfig",
 })
 _SECRET_FILE_SUFFIXES = (".pem", ".key", ".p12", ".pfx", ".jks", ".keystore", ".ppk")
 _SECRET_FILE_PREFIXES = (".env.", "id_rsa", "id_dsa", "id_ecdsa", "id_ed25519")
@@ -96,13 +123,17 @@ def _git(cwd: Path, *args: str) -> subprocess.CompletedProcess:
         )
     except subprocess.TimeoutExpired as exc:
         return subprocess.CompletedProcess(
-            args=["git", "-C", str(cwd), *args], returncode=124,
-            stdout="", stderr=f"timed out after {exc.timeout}s",
+            args=["git", "-C", str(cwd), *args],
+            returncode=124,
+            stdout="",
+            stderr=f"timed out after {exc.timeout}s",
         )
     except OSError as exc:
         return subprocess.CompletedProcess(
-            args=["git", "-C", str(cwd), *args], returncode=127,
-            stdout="", stderr=str(exc),
+            args=["git", "-C", str(cwd), *args],
+            returncode=127,
+            stdout="",
+            stderr=str(exc),
         )
 
 
@@ -203,12 +234,14 @@ def _expand_candidates(worktree: Path, paths: list[str]) -> list[str]:
         ignored_result = subprocess.run(
             ["git", "-C", str(worktree), "check-ignore", "--stdin", "-z"],
             input="\0".join(to_check) + "\0",
-            capture_output=True, text=True, encoding="utf-8", errors="replace",
-            timeout=_GIT_TIMEOUT, check=False,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=_GIT_TIMEOUT,
+            check=False,
         )
-        ignored_set = {
-            p for p in (ignored_result.stdout or "").split("\0") if p
-        }
+        ignored_set = {p for p in (ignored_result.stdout or "").split("\0") if p}
         expanded.extend(p for p in to_check if p not in ignored_set)
     else:
         expanded.extend(to_check)
@@ -269,8 +302,11 @@ def _contains_credential(file_path: Path) -> Optional[bool]:
 
 
 def _check_content_safety(
-    worktree: Path, paths: list[str], *,
-    max_file_bytes: int, max_total_bytes: int,
+    worktree: Path,
+    paths: list[str],
+    *,
+    max_file_bytes: int,
+    max_total_bytes: int,
 ) -> Optional[PreserveResult]:
     """``None`` when every candidate is safe to commit, else the fail-closed
     ``unsafe`` verdict naming the offending path (never its contents)."""
@@ -279,12 +315,14 @@ def _check_content_safety(
         generated = _generated_component(rel)
         if generated is not None:
             return PreserveResult(
-                status="unsafe", reason="generated_artifact",
+                status="unsafe",
+                reason="generated_artifact",
                 detail=f"{rel} is inside a generated/vendored directory ({generated}/)",
             )
         if _looks_like_secret_filename(rel):
             return PreserveResult(
-                status="unsafe", reason="suspected_secret",
+                status="unsafe",
+                reason="suspected_secret",
                 detail=f"{rel} has a credential-bearing filename",
             )
         full = worktree / rel
@@ -294,26 +332,30 @@ def _check_content_safety(
             size = 0
         if size > max_file_bytes:
             return PreserveResult(
-                status="unsafe", reason="oversized",
+                status="unsafe",
+                reason="oversized",
                 detail=f"{rel} is {size} bytes (limit {max_file_bytes})",
             )
         total += size
         if total > max_total_bytes:
             return PreserveResult(
-                status="unsafe", reason="oversized",
+                status="unsafe",
+                reason="oversized",
                 detail=f"snapshot exceeds {max_total_bytes} bytes at {rel}",
             )
         if full.is_file() and not full.is_symlink():
             scan = _contains_credential(full)
             if scan is None:
                 return PreserveResult(
-                    status="unsafe", reason="credential_scan_unavailable",
+                    status="unsafe",
+                    reason="credential_scan_unavailable",
                     detail=f"{rel} could not be scanned for credentials "
-                           f"(the safety dependency is unavailable)",
+                    f"(the safety dependency is unavailable)",
                 )
             if scan:
                 return PreserveResult(
-                    status="unsafe", reason="suspected_secret",
+                    status="unsafe",
+                    reason="suspected_secret",
                     detail=f"{rel} contains what looks like a credential",
                 )
     return None
@@ -440,7 +482,9 @@ def _preserve_lock(worktree: Path, task_id: Optional[str]) -> Iterator[bool]:
 
 
 def preserve_worktree(
-    worktree: Path, branch: str, *,
+    worktree: Path,
+    branch: str,
+    *,
     task_id: Optional[str] = None,
     max_file_bytes: int = DEFAULT_MAX_FILE_BYTES,
     max_total_bytes: int = DEFAULT_MAX_TOTAL_BYTES,
@@ -453,13 +497,19 @@ def preserve_worktree(
         if not acquired:
             return PreserveResult(status="skipped", reason="concurrent")
         return _preserve_locked(
-            worktree, branch,
-            max_file_bytes=max_file_bytes, max_total_bytes=max_total_bytes,
+            worktree,
+            branch,
+            max_file_bytes=max_file_bytes,
+            max_total_bytes=max_total_bytes,
         )
 
 
 def _preserve_locked(
-    worktree: Path, branch: str, *, max_file_bytes: int, max_total_bytes: int,
+    worktree: Path,
+    branch: str,
+    *,
+    max_file_bytes: int,
+    max_total_bytes: int,
 ) -> PreserveResult:
     """The preservation body; the caller holds the per-worktree lock."""
     current = _git_out(worktree, "branch", "--show-current")
@@ -470,12 +520,16 @@ def _preserve_locked(
         return PreserveResult(status="skipped", reason="detached_head")
     if branch and current != branch:
         return PreserveResult(
-            status="skipped", reason="branch_mismatch", branch=current,
+            status="skipped",
+            reason="branch_mismatch",
+            branch=current,
             detail=f"worktree is on {current!r}, expected {branch!r}",
         )
     dirty = _dirty_paths(worktree)
     if dirty is None:
-        return PreserveResult(status="failed", reason="git_status_failed", branch=current)
+        return PreserveResult(
+            status="failed", reason="git_status_failed", branch=current
+        )
     unpushed = _has_unpushed_commits(worktree)
     if not dirty and not unpushed:
         return PreserveResult(status="nothing_to_preserve", branch=current)
@@ -483,8 +537,10 @@ def _preserve_locked(
     sha = _git_out(worktree, "rev-parse", "HEAD")
     if dirty:
         unsafe = _check_content_safety(
-            worktree, dirty,
-            max_file_bytes=max_file_bytes, max_total_bytes=max_total_bytes,
+            worktree,
+            dirty,
+            max_file_bytes=max_file_bytes,
+            max_total_bytes=max_total_bytes,
         )
         if unsafe is not None:
             unsafe.branch = current
@@ -493,7 +549,9 @@ def _preserve_locked(
         result = _git(worktree, "commit", "-m", _COMMIT_SUBJECT)
         if result.returncode != 0:
             return PreserveResult(
-                status="failed", reason="commit_failed", branch=current,
+                status="failed",
+                reason="commit_failed",
+                branch=current,
                 detail=(result.stderr or result.stdout or "").strip()[:500] or None,
             )
         sha = _git_out(worktree, "rev-parse", "HEAD")
@@ -504,8 +562,11 @@ def _preserve_locked(
         # usable remote simply cannot be pushed to, and that is recorded
         # rather than treated as a failure of the snapshot.
         return PreserveResult(
-            status="preserved", commit_sha=sha, pushed=False,
-            push_error="no_remote_configured", branch=current,
+            status="preserved",
+            commit_sha=sha,
+            pushed=False,
+            push_error="no_remote_configured",
+            branch=current,
         )
     # No --force / --force-with-lease, ever: a rejected push means the remote
     # holds work this snapshot does not, and losing that is strictly worse
@@ -516,7 +577,8 @@ def _preserve_locked(
         commit_sha=sha,
         pushed=push.returncode == 0,
         push_error=(
-            None if push.returncode == 0
+            None
+            if push.returncode == 0
             else ((push.stderr or push.stdout or "").strip()[:500] or "push_failed")
         ),
         branch=current,
@@ -553,7 +615,10 @@ def _pid_alive(pid: int) -> bool:
 
 
 def _ownership_skip(
-    row, expected_run_id: Optional[int], *, worker_pid: Optional[int] = None,
+    row,
+    expected_run_id: Optional[int],
+    *,
+    worker_pid: Optional[int] = None,
 ) -> Optional[PreserveResult]:
     """Fail-closed ownership gate: ``None`` to proceed, else the skip verdict.
 
@@ -579,7 +644,8 @@ def _ownership_skip(
         observed = current if current is not None else row["latest_run_id"]
         if observed is None or int(observed) != int(expected_run_id):
             return PreserveResult(
-                status="skipped", reason="stale_run",
+                status="skipped",
+                reason="stale_run",
                 detail=f"expected run {expected_run_id}, latest task run is {observed}",
             )
     current_pid = row["worker_pid"]
@@ -589,7 +655,8 @@ def _ownership_skip(
         and int(worker_pid) != int(current_pid)
     ):
         return PreserveResult(
-            status="skipped", reason="stale_run",
+            status="skipped",
+            reason="stale_run",
             detail="the task acquired a different worker after preservation was requested",
         )
     # A captured PID corroborates the current row; it never replaces it. Check
@@ -598,7 +665,8 @@ def _ownership_skip(
     for pid in (current_pid, worker_pid):
         if pid and int(pid) != os.getpid() and _pid_alive(int(pid)):
             return PreserveResult(
-                status="skipped", reason="worker_alive",
+                status="skipped",
+                reason="worker_alive",
                 detail=f"worker pid {int(pid)} still running",
             )
     return None
@@ -615,24 +683,30 @@ def _record(conn, task_id: str, result: PreserveResult, run_id: Optional[int]) -
     from hermes_cli import kanban_db as _kb
 
     if result.status == "preserved":
-        kind, payload = "work_preserved", {
-            "commit_sha": result.commit_sha,
-            "pushed": result.pushed,
-            "push_error": _sanitize_event_text(result.push_error),
-            "branch": result.branch,
-        }
+        kind, payload = (
+            "work_preserved",
+            {
+                "commit_sha": result.commit_sha,
+                "pushed": result.pushed,
+                "push_error": _sanitize_event_text(result.push_error),
+                "branch": result.branch,
+            },
+        )
     elif result.status in {"unsafe", "failed"}:
-        kind, payload = "work_preservation_failed", {
-            "status": result.status,
-            "reason": result.reason,
-            "detail": _sanitize_event_text(result.detail),
-            "commit_sha": result.commit_sha,
-            "pushed": False if result.pushed is None else result.pushed,
-            "push_error": _sanitize_event_text(
-                result.push_error or result.detail or result.reason
-            ),
-            "branch": result.branch,
-        }
+        kind, payload = (
+            "work_preservation_failed",
+            {
+                "status": result.status,
+                "reason": result.reason,
+                "detail": _sanitize_event_text(result.detail),
+                "commit_sha": result.commit_sha,
+                "pushed": False if result.pushed is None else result.pushed,
+                "push_error": _sanitize_event_text(
+                    result.push_error or result.detail or result.reason
+                ),
+                "branch": result.branch,
+            },
+        )
     else:
         return
     try:
@@ -660,7 +734,10 @@ def _sanitize_event_text(value: Optional[str]) -> Optional[str]:
 
 
 def preserve_task_work(
-    conn, task_id: str, *, expected_run_id: Optional[int] = None,
+    conn,
+    task_id: str,
+    *,
+    expected_run_id: Optional[int] = None,
     known_worker_pid: Optional[int] = None,
 ) -> PreserveResult:
     """Preserve one task's own worktree, gated on ownership, and record it.
@@ -686,14 +763,19 @@ def preserve_task_work(
     """
     try:
         return _preserve_task_work(
-            conn, task_id, expected_run_id=expected_run_id,
+            conn,
+            task_id,
+            expected_run_id=expected_run_id,
             known_worker_pid=known_worker_pid,
         )
     except Exception as exc:  # never block a lifecycle transition
         safe_detail = _sanitize_event_text(str(exc))
-        _log.warning("kanban: preservation errored for task %s: %s", task_id, safe_detail)
+        _log.warning(
+            "kanban: preservation errored for task %s: %s", task_id, safe_detail
+        )
         result = PreserveResult(
-            status="failed", reason="preservation_error",
+            status="failed",
+            reason="preservation_error",
             detail=safe_detail,
             commit_sha=_best_effort_head_sha(conn, task_id),
             pushed=False,
@@ -709,7 +791,8 @@ def _best_effort_head_sha(conn, task_id: str) -> Optional[str]:
     enrich an already-failed record, never to make a decision."""
     try:
         row = conn.execute(
-            "SELECT workspace_kind, workspace_path FROM tasks WHERE id = ?", (task_id,),
+            "SELECT workspace_kind, workspace_path FROM tasks WHERE id = ?",
+            (task_id,),
         ).fetchone()
         if not row or row["workspace_kind"] != "worktree" or not row["workspace_path"]:
             return None
@@ -722,7 +805,10 @@ def _best_effort_head_sha(conn, task_id: str) -> Optional[str]:
 
 
 def _preserve_task_work(
-    conn, task_id: str, *, expected_run_id: Optional[int],
+    conn,
+    task_id: str,
+    *,
+    expected_run_id: Optional[int],
     known_worker_pid: Optional[int] = None,
 ) -> PreserveResult:
     cfg = _preservation_config()
@@ -733,7 +819,8 @@ def _preserve_task_work(
         "t.current_run_id, "
         "(SELECT tr.id FROM task_runs tr WHERE tr.task_id = t.id "
         " ORDER BY tr.id DESC LIMIT 1) AS latest_run_id "
-        "FROM tasks t WHERE t.id = ?", (task_id,),
+        "FROM tasks t WHERE t.id = ?",
+        (task_id,),
     ).fetchone()
     if row is None:
         return PreserveResult(status="skipped", reason="task_not_found")
@@ -761,9 +848,13 @@ def _preserve_task_work(
 
     branch = (row["branch_name"] or "").strip() or f"wt/{task_id}"
     result = preserve_worktree(
-        worktree, branch, task_id=task_id,
+        worktree,
+        branch,
+        task_id=task_id,
         max_file_bytes=_positive_int(cfg.get("max_file_bytes"), DEFAULT_MAX_FILE_BYTES),
-        max_total_bytes=_positive_int(cfg.get("max_total_bytes"), DEFAULT_MAX_TOTAL_BYTES),
+        max_total_bytes=_positive_int(
+            cfg.get("max_total_bytes"), DEFAULT_MAX_TOTAL_BYTES
+        ),
     )
     _record(conn, task_id, result, row["current_run_id"])
     return result

@@ -149,7 +149,9 @@ def test_gitignored_and_build_artifacts_are_excluded_from_the_snapshot(
     (worktree / "src.py").write_text("x = 1\n", encoding="utf-8")
     (worktree / "debug.log").write_text("noise\n", encoding="utf-8")  # gitignored
     (worktree / "build").mkdir()
-    (worktree / "build" / "out.bin").write_text("blob\n", encoding="utf-8")  # gitignored
+    (worktree / "build" / "out.bin").write_text(
+        "blob\n", encoding="utf-8"
+    )  # gitignored
 
     result = kp.preserve_worktree(worktree, "wt/t_demo")
 
@@ -164,7 +166,9 @@ def test_untracked_generated_directory_is_refused_not_committed(
     """``node_modules/`` is not gitignored in this repo, so only the artifact
     guard stands between it and a multi-thousand-file safety commit."""
     (worktree / "node_modules" / "pkg").mkdir(parents=True)
-    (worktree / "node_modules" / "pkg" / "index.js").write_text("//\n", encoding="utf-8")
+    (worktree / "node_modules" / "pkg" / "index.js").write_text(
+        "//\n", encoding="utf-8"
+    )
     before = _head(worktree)
 
     result = kp.preserve_worktree(worktree, "wt/t_demo")
@@ -328,9 +332,12 @@ def test_existing_unpushed_commit_is_pushed_when_remote_tracking_refs_are_empty(
     # Simulate "no cached tracking refs" without touching the remote itself:
     # delete the one local remote-tracking ref for this repo's own origin.
     _git("update-ref", "-d", "refs/remotes/origin/main", cwd=worktree, check=False)
-    assert _git(
-        "for-each-ref", "--format=%(refname)", "refs/remotes", cwd=worktree
-    ).strip() == "", "precondition: no cached remote-tracking refs"
+    assert (
+        _git(
+            "for-each-ref", "--format=%(refname)", "refs/remotes", cwd=worktree
+        ).strip()
+        == ""
+    ), "precondition: no cached remote-tracking refs"
     assert _remote_branch_head(repo, "wt/t_demo") is None
 
     result = kp.preserve_worktree(worktree, "wt/t_demo")
@@ -341,9 +348,7 @@ def test_existing_unpushed_commit_is_pushed_when_remote_tracking_refs_are_empty(
     assert _remote_branch_head(repo, "wt/t_demo") == existing
 
 
-def test_repo_without_a_remote_commits_and_reports_no_remote(
-    tmp_path: Path
-) -> None:
+def test_repo_without_a_remote_commits_and_reports_no_remote(tmp_path: Path) -> None:
     solo = tmp_path / "solo"
     _git("init", "--initial-branch=main", str(solo))
     _git("config", "user.email", "t@example.com", cwd=solo)
@@ -525,9 +530,6 @@ def test_stale_lock_recovery_never_unlinks_the_shared_lock_path(
     assert unlinked == []
 
 
-
-
-
 def test_detached_head_is_refused(repo: Path, worktree: Path) -> None:
     _git("checkout", "--detach", cwd=worktree)
     (worktree / "mine.txt").write_text("mine\n", encoding="utf-8")
@@ -541,9 +543,7 @@ def test_detached_head_is_refused(repo: Path, worktree: Path) -> None:
     assert _git("status", "--porcelain", cwd=worktree).strip() != ""
 
 
-def test_wrong_branch_is_refused_and_never_switched(
-    repo: Path, worktree: Path
-) -> None:
+def test_wrong_branch_is_refused_and_never_switched(repo: Path, worktree: Path) -> None:
     """The worktree sitting on some other branch means our ownership belief is
     wrong; committing there would put this task's work on a stranger's branch."""
     _git("checkout", "-b", "someone-else", cwd=worktree)
