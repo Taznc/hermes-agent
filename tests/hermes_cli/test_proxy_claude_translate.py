@@ -17,6 +17,23 @@ def test_claude_subscription_proxy_is_loopback_only_and_requires_client_authorit
         create_app(adapter)
 
 
+def test_claude_proxy_preserves_openai_json_object_response_format():
+    """Hindsight's soft structured-output mode must reach Anthropic enforcement."""
+    _, raw, _ = prepare_chat_request({
+        "model": "claude-sonnet-4-6",
+        "messages": [{"role": "user", "content": "Return valid json only."}],
+        "response_format": {"type": "json_object"},
+    })
+
+    wire = json.loads(raw)
+    assert wire["output_config"] == {
+        "format": {
+            "type": "json_schema",
+            "schema": {"type": "object"},
+        }
+    }
+
+
 def test_claude_proxy_translates_tool_request_and_response():
     headers, raw, tool_name_map = prepare_chat_request({
         "model": "claude-sonnet-4-6",
