@@ -685,6 +685,63 @@ hermes kanban create "nightly ops review" \
     --json
 ```
 
+### Approving and landing a card (`hermes kanban approve` / `land`)
+
+A card that will be **landed** is approved with `hermes kanban approve`, not
+`complete`. Completion reaps the task worktree and its `wt/` branch on the spot,
+and that tree is exactly the evidence landing re-verifies — so approval instead
+records an explicit verdict bound to the reviewed commit and leaves the card in
+`review`, intact, awaiting the attended landing. (`complete` remains right for a
+card whose life genuinely ends at review.)
+
+```bash
+# Reviewer verdict: card stays in review, worktree and branch preserved
+hermes kanban approve t_abc
+
+# Configure the target once per board, then land by id
+hermes kanban boards set-land-target default origin/dev
+hermes kanban land t_abc
+
+# Or name it explicitly; batch and dry-run are supported
+hermes kanban land t_abc t_def --target origin/dev --dry-run --json
+```
+
+`land` turns that approval into a verified merge — replacing the manual
+archaeology of checking the board, the worktree, the push state, git ancestry
+and the remote by hand before every cleanup.
+
+It is **attended only** — nothing runs it automatically — and every gate fails
+closed with a reason code rather than merging on an assumption:
+
+- The target is read from `--target` or the board's `land_target` and **never
+  inferred**. A repository with both a fork and an upstream configured has no
+  safe default, so with neither set the command refuses. Output always names
+  the remote and branch, refusals included.
+- It requires a live `hermes kanban approve` verdict (a `done` status alone is
+  not approval, and an approval is retired by a newer `changes_requested` or a
+  newer review request), no live worker, satisfied dependencies, a clean
+  worktree, and a branch published at **exactly the approved commit** — a branch
+  that moved after review refuses, because verification is not review.
+- Fetching, pushing and reading back all address the remote's resolved **push
+  URL**, so a `pushurl` pointing at a second repository can never let it verify
+  one destination while writing another.
+- It requires verification evidence for that exact commit: either the board's
+  `land_verify` command re-run now, or a `pre_review_gate` / `verification`
+  receipt naming the same commit — read from the approval run or from the
+  review handoff, which is where the implementer's own pre-review gate lands.
+- It fetches the target, merges in a throwaway worktree, pushes **without
+  force**, then re-reads the remote and only closes the card once the content is
+  provably present there. "Already present" is judged against the target's
+  current tip, so a squash-merged card reads as already landed while
+  applied-then-reverted work correctly does not. Re-running a landing is safe
+  and idempotent.
+- `--dry-run` mutates nothing at all — no fetch, no worktree, no ref, and it
+  does not run the configured `land_verify` command either — and `--json`
+  returns one verdict per task. In a batch, one refusal never affects another
+  card.
+
+Full safety model and per-step recovery: `docs/kanban/landing.md` in the repo.
+
 ### Bulk CLI verbs
 
 All the lifecycle verbs accept multiple ids so you can clean up a batch
