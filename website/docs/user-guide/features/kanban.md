@@ -445,7 +445,9 @@ specialist under that profile's own model defaults.
 stop on that same loop: once a card accumulates this many `changes_requested`
 cycles since its last completion, the dispatcher blocks it (kind
 `review_round_cap`, visible via the card's status and its `review_round_cap`
-event in `hermes kanban show <id>`) instead of re-dispatching it to the
+event in `hermes kanban show <id>`, and as a dedicated `review_round_cap`
+diagnostic — round count, cap, and last reviewer reason — in
+`hermes kanban diagnostics`) instead of re-dispatching it to the
 implementer or the escalation profile — `review_rework_escalation_profile`
 still fires first for rounds under the cap. It is a hard stop; the
 reviewer-side round-count guidance in the sdlc-review skill is advisory
