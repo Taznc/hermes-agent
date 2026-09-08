@@ -9,7 +9,7 @@ import { type SessionView, SessionViewProvider } from '@/app/chat/session-view'
 import { hiddenPaneProps } from '@/components/pane-shell/pane-visibility'
 import { $activeTreeGroup, $hoveredTreeGroup } from '@/components/pane-shell/tree/store'
 import { I18nProvider } from '@/i18n'
-import { clearClarifyRequest, setClarifyRequest, updateClarifyHelp } from '@/store/clarify'
+import { $clarifyToolRequestIds, clearClarifyRequest, setClarifyRequest, updateClarifyHelp } from '@/store/clarify'
 import { $gateway } from '@/store/gateway'
 import { $profiles } from '@/store/profile'
 import { $activeSessionId, _resetSessionOwnerHintsForTests, setSessionOwnerHint } from '@/store/session'
@@ -41,6 +41,10 @@ vi.mock('@assistant-ui/react', () => ({
 afterEach(() => {
   cleanup()
   clearClarifyRequest()
+  // A tool row's request binding is sticky by design (it must not adopt a later
+  // turn's request), so it has to be reset between tests or a reused
+  // toolCallId inherits the previous test's binding.
+  $clarifyToolRequestIds.set({})
   $activeSessionId.set(null)
   $gateway.set(null)
   messageRunning = true
@@ -1007,6 +1011,16 @@ describe('ClarifyTool batch card', () => {
       kind: 'tile'
     })
 
+    // Each card's own args, so each correlates to its own session's request —
+    // the qids collide (both `q0`/`q1`), which is the thing under test.
+    const cardProps = (label: string, toolCallId: string): ToolCallMessagePartProps => {
+      const args: { questions: { question: string; choices?: string[] }[] } = {
+        questions: [{ choices: ['red', 'blue'], question: `${label} color?` }, { question: `${label} name?` }]
+      }
+
+      return { ...liveBatchProps(), args, argsText: JSON.stringify(args), toolCallId }
+    }
+
     $gateway.set({ request } as never)
     setClarifyRequest({
       choices: null,
@@ -1033,10 +1047,10 @@ describe('ClarifyTool batch card', () => {
     renderClarify(
       <>
         <SessionViewProvider value={batchView('session-background-batch')}>
-          <ClarifyTool {...liveBatchProps()} />
+          <ClarifyTool {...cardProps('Background', 'clarify-batch-background')} />
         </SessionViewProvider>
         <SessionViewProvider value={batchView('session-foreground-batch')}>
-          <ClarifyTool {...liveBatchProps()} />
+          <ClarifyTool {...cardProps('Foreground', 'clarify-batch-foreground')} />
         </SessionViewProvider>
       </>
     )
@@ -2006,5 +2020,312 @@ describe('ClarifyTool inert card owner isolation', () => {
     await waitFor(() => {
       expect(document.querySelector('[data-clarify-restoring]')).toBeNull()
     })
+  })
+})
+
+// Review round 1 found three ways the args-only card still misbehaved once it
+// was allowed to paint. Each case below is the reviewer's probe, kept.
+
+describe('ClarifyTool pending row correlates to its OWN request', () => {
+  const LATER_QUESTION = 'A later unrelated question?'
+
+  function batchProps(question: string, toolCallId: string): ToolCallMessagePartProps {
+    const args = { questions: [{ choices: BURIED_CHOICES, question }] }
+
+    return { ...uncorrelatedSingleProps(), args, argsText: JSON.stringify(args), toolCallId }
+  }
+
+  it('does not rebind a stale BATCH row to a later request in the same session', () => {
+    // The field shape: an old row sat unanswered for ~55 minutes while the turn
+    // carried on, so a later question can park its own request on the SAME
+    // session. Reading the session's request without correlating it repainted
+    // the old row with the new question and armed it — answering the wrong turn.
+    messageRunning = false
+    $activeSessionId.set('session-1')
+    $gateway.set({ request: vi.fn() } as never)
+
+    const props = batchProps('Old batch question?', 'clarify-old-batch')
+    const { rerender } = renderClarify(<ClarifyTool {...props} />)
+
+    act(() => {
+      setClarifyRequest({
+        choices: null,
+        multiSelect: false,
+        question: '',
+        questions: [{ choices: BURIED_CHOICES, multiSelect: false, qid: 'q0', question: LATER_QUESTION }],
+        requestId: 'request-later',
+        sessionId: 'session-1'
+      })
+    })
+    rerender(clarifyTree(<ClarifyTool {...props} />))
+
+    // Still its own question, still inert — the later request is not its own.
+    expect(screen.getByText('Old batch question?')).toBeTruthy()
+    expect(screen.queryByText(LATER_QUESTION)).toBeNull()
+    expect(document.querySelector('[data-clarify-restoring]')).toBeTruthy()
+    expect(screen.getByRole('button', { name: /Confirm and continue/ }).hasAttribute('disabled')).toBe(true)
+  })
+
+  it('does not rebind a stale SINGLE row to a later request in the same session', () => {
+    messageRunning = false
+    $activeSessionId.set('session-1')
+    $gateway.set({ request: vi.fn() } as never)
+
+    const props = uncorrelatedSingleProps()
+    const { rerender } = renderClarify(<ClarifyTool {...props} />)
+
+    act(() => {
+      setClarifyRequest({
+        choices: BURIED_CHOICES,
+        multiSelect: false,
+        question: LATER_QUESTION,
+        requestId: 'request-later-single',
+        sessionId: 'session-1'
+      })
+    })
+    rerender(clarifyTree(<ClarifyTool {...props} />))
+
+    expect(screen.getByText(BURIED_QUESTION)).toBeTruthy()
+    expect(screen.queryByText(LATER_QUESTION)).toBeNull()
+    expect(document.querySelector('[data-clarify-choices]')).toBeNull()
+  })
+
+  it('stays bound to its first request when a repeated same-text question follows', async () => {
+    // Two turns can ask the identical question. Text alone cannot separate them,
+    // so once a row has correlated it keeps ONLY that request id — otherwise the
+    // settled/older row silently adopts the newer turn's request.
+    const request = vi.fn().mockResolvedValue({ ok: true })
+
+    $activeSessionId.set('session-1')
+    $gateway.set({ request } as never)
+    setClarifyRequest({
+      choices: BURIED_CHOICES,
+      multiSelect: false,
+      question: BURIED_QUESTION,
+      requestId: 'request-first',
+      sessionId: 'session-1'
+    })
+
+    const props = uncorrelatedSingleProps()
+    const { rerender } = renderClarify(<ClarifyTool {...props} />)
+
+    // It correlated with request-first; now a NEW turn asks the same words.
+    act(() => {
+      setClarifyRequest({
+        choices: BURIED_CHOICES,
+        multiSelect: false,
+        question: BURIED_QUESTION,
+        requestId: 'request-second',
+        sessionId: 'session-1'
+      })
+    })
+    rerender(clarifyTree(<ClarifyTool {...props} />))
+
+    expect(document.querySelector('[data-clarify-restoring]')).toBeTruthy()
+    expect(document.querySelector('[data-clarify-choices]')).toBeNull()
+
+    fireEvent.click([...document.querySelectorAll<HTMLButtonElement>('[data-choice]')][0])
+    fireEvent.keyDown(window, { key: 'Enter' })
+
+    await waitFor(() => {
+      expect(request).not.toHaveBeenCalled()
+    })
+  })
+
+  it('re-arms on the SAME request id replayed after a reconnect', async () => {
+    // Sticky-by-id must not block the legitimate case: a reconnect replays the
+    // identical request id, and the card has to become answerable again.
+    const request = vi.fn().mockResolvedValue({ ok: true })
+
+    $activeSessionId.set('session-1')
+    $gateway.set({ request } as never)
+
+    const parked = {
+      choices: BURIED_CHOICES,
+      multiSelect: false,
+      question: BURIED_QUESTION,
+      requestId: 'request-replayed',
+      sessionId: 'session-1'
+    }
+
+    setClarifyRequest(parked)
+
+    const props = uncorrelatedSingleProps()
+    const { rerender } = renderClarify(<ClarifyTool {...props} />)
+
+    act(() => clearClarifyRequest('request-replayed', 'session-1'))
+    rerender(clarifyTree(<ClarifyTool {...props} />))
+    expect(document.querySelector('[data-clarify-restoring]')).toBeTruthy()
+
+    act(() => setClarifyRequest(parked))
+    rerender(clarifyTree(<ClarifyTool {...props} />))
+
+    expect(document.querySelector('[data-clarify-restoring]')).toBeNull()
+    fireEvent.click([...document.querySelectorAll<HTMLButtonElement>('[data-choice]')][0])
+    fireEvent.click(screen.getByRole('button', { name: /Continue/ }))
+
+    await waitFor(() => {
+      expect(request).toHaveBeenCalledWith('clarify.respond', {
+        answer: BURIED_CHOICES[0],
+        request_id: 'request-replayed'
+      })
+    })
+  })
+})
+
+describe('ClarifyTool batch card newly answerable focus handling', () => {
+  const parkedBatch = {
+    choices: null,
+    multiSelect: false,
+    question: '',
+    questions: [{ choices: BURIED_CHOICES, multiSelect: false, qid: 'q0', question: BURIED_QUESTION }],
+    requestId: 'request-batch-focus',
+    sessionId: 'session-1'
+  }
+
+  it('moves focus to the batch card region when nothing else is focused', () => {
+    messageRunning = false
+    $activeSessionId.set('session-1')
+    $gateway.set({ request: vi.fn() } as never)
+
+    const props = uncorrelatedBatchProps()
+    const { rerender } = renderClarify(<ClarifyTool {...props} />)
+
+    act(() => setClarifyRequest(parkedBatch))
+    rerender(clarifyTree(<ClarifyTool {...props} />))
+
+    const card = document.querySelector('[data-clarify-batch]')
+    expect(card).toBeTruthy()
+    expect(document.activeElement).toBe(card)
+    // Announced as a card, and a programmatic target only — never a Tab stop.
+    expect(card?.getAttribute('aria-label')).toBeTruthy()
+    expect(card?.getAttribute('tabindex')).toBe('-1')
+  })
+
+  it('never steals focus from a control the user is already using', () => {
+    messageRunning = false
+    $activeSessionId.set('session-1')
+    $gateway.set({ request: vi.fn() } as never)
+
+    const props = uncorrelatedBatchProps()
+    const { rerender } = renderClarify(<ClarifyTool {...props} />)
+
+    const composer = document.createElement('textarea')
+    document.body.append(composer)
+    composer.focus()
+
+    act(() => setClarifyRequest(parkedBatch))
+    rerender(clarifyTree(<ClarifyTool {...props} />))
+
+    expect(document.activeElement).toBe(composer)
+    composer.remove()
+  })
+
+  it('leaves focus alone for a batch card parked in a background tab', () => {
+    messageRunning = false
+    $gateway.set({ request: vi.fn() } as never)
+
+    const props = uncorrelatedBatchProps()
+
+    const hidden = (ui: ReactNode) => (
+      <div {...hiddenPaneProps(true)}>
+        <SessionViewProvider value={{ ...({} as SessionView), $runtimeId: atom<null | string>('session-1') }}>
+          {ui}
+        </SessionViewProvider>
+      </div>
+    )
+
+    const { rerender } = renderClarify(hidden(<ClarifyTool {...props} />))
+
+    act(() => setClarifyRequest(parkedBatch))
+    rerender(clarifyTree(hidden(<ClarifyTool {...props} />)))
+
+    expect(document.activeElement).toBe(document.body)
+  })
+})
+
+describe('ClarifyTool batch staged state survives the correlation gap', () => {
+  const parkedBatch = {
+    choices: null,
+    multiSelect: false,
+    question: '',
+    questions: [{ choices: null, multiSelect: false, qid: 'q0', question: BURIED_QUESTION }],
+    requestId: 'request-batch-draft',
+    sessionId: 'session-1'
+  }
+
+  function openEndedBatchProps(): ToolCallMessagePartProps {
+    const args = { questions: [{ question: BURIED_QUESTION }] }
+
+    return { ...uncorrelatedSingleProps(), args, argsText: JSON.stringify(args), toolCallId: 'clarify-batch-draft' }
+  }
+
+  it('keeps a typed draft and a picked choice across request → args-only → replay', async () => {
+    // Batch staged state used to be keyed by the server qid (`q0`). Clearing
+    // the request swaps the rendered questions to synthetic `args-0` ids, so
+    // the same mounted card rendered an empty field — the user watched their
+    // answer disappear while the transport flapped.
+    const request = vi.fn().mockResolvedValue({ ok: true })
+
+    $activeSessionId.set('session-1')
+    $gateway.set({ request } as never)
+    setClarifyRequest(parkedBatch)
+
+    const props = openEndedBatchProps()
+    const { rerender } = renderClarify(<ClarifyTool {...props} />)
+
+    // Staged while ARMED (a real user can only type into an enabled field).
+    const field = screen.getByRole('textbox') as HTMLTextAreaElement
+    expect(field.disabled).toBe(false)
+    fireEvent.change(field, { target: { value: 'keep this draft' } })
+
+    // The transport drops: the parked request is cleared, the card goes inert.
+    act(() => clearClarifyRequest('request-batch-draft', 'session-1'))
+    rerender(clarifyTree(<ClarifyTool {...props} />))
+
+    expect(document.querySelector('[data-clarify-restoring]')).toBeTruthy()
+    expect((screen.getByRole('textbox') as HTMLTextAreaElement).value).toBe('keep this draft')
+
+    // Replay: same card, same draft, now answerable and submittable.
+    act(() => setClarifyRequest(parkedBatch))
+    rerender(clarifyTree(<ClarifyTool {...props} />))
+
+    expect(document.querySelectorAll('[data-clarify-batch]')).toHaveLength(1)
+    expect((screen.getByRole('textbox') as HTMLTextAreaElement).value).toBe('keep this draft')
+
+    fireEvent.click(screen.getByRole('button', { name: /Confirm and continue/ }))
+
+    await waitFor(() => {
+      expect(request).toHaveBeenCalledWith('clarify.respond', {
+        answer: 'keep this draft',
+        question_id: 'q0',
+        request_id: 'request-batch-draft'
+      })
+    })
+  })
+
+  it('keeps a staged CHOICE and its note across the same gap', () => {
+    $activeSessionId.set('session-1')
+    $gateway.set({ request: vi.fn().mockResolvedValue({ ok: true }) } as never)
+    setClarifyRequest({
+      ...parkedBatch,
+      questions: [{ choices: BURIED_CHOICES, multiSelect: false, qid: 'q0', question: BURIED_QUESTION }]
+    })
+
+    const props = uncorrelatedBatchProps()
+    const { rerender } = renderClarify(<ClarifyTool {...props} />)
+
+    const choice = [...document.querySelectorAll<HTMLButtonElement>('[data-choice]')][1]
+    expect(choice.hasAttribute('disabled')).toBe(false)
+    fireEvent.click(choice)
+    expect(document.querySelector('[data-clarify-answered]')).toBeTruthy()
+
+    act(() => clearClarifyRequest('request-batch-draft', 'session-1'))
+    rerender(clarifyTree(<ClarifyTool {...props} />))
+
+    // The pick is still visibly staged (the block stays in its answered state)
+    // even though the rendered question ids swapped to the synthetic ones.
+    expect(document.querySelector('[data-clarify-answered]')).toBeTruthy()
+    expect(document.querySelector('[data-clarify-restoring]')).toBeTruthy()
   })
 })

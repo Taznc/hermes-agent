@@ -3118,6 +3118,7 @@ export const ja = defineForkLocale(forkJa, {
       confirmAndContinueLabel: '確定して続行',
       answeredBadge: '回答済み',
       questionProgress: (answered, total) => `${total}問中${answered}問回答済み`,
+      questionGroup: total => `回答が必要な質問が${total}件あります`,
       lateAnswer: (question, choice) => `「${question}」について — 私の回答: ${choice}`,
       lateAnswerTip: 'この回答をフォローアップメッセージとして下書きします',
       lateAnswerHint:

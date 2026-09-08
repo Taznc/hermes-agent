@@ -3503,6 +3503,7 @@ export const ru = defineLocale({
       confirmAndContinueLabel: 'Подтвердить и продолжить',
       answeredBadge: 'Ответ дан',
       questionProgress: (answered, total) => `Ответ дан на ${answered} из ${total}`,
+      questionGroup: total => `Вопросов, ожидающих ответа: ${total}`,
       lateAnswer: (question, choice) => `Re: «${question}» — мой ответ: ${choice}`,
       lateAnswerTip: 'Составить этот ответ как продолжение',
       lateAnswerHint: 'Этот промпт больше не ждёт. Выберите вариант, чтобы составить его как сообщение-продолжение.',

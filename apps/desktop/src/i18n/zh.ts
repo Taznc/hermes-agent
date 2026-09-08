@@ -3710,6 +3710,7 @@ export const zhAuthored: Translations = withForkKeys(forkZh, {
       confirmAndContinueLabel: '确认并继续',
       answeredBadge: '已回答',
       questionProgress: (answered, total) => `已回答 ${answered}/${total}`,
+      questionGroup: total => `有 ${total} 个问题待回答`,
       lateAnswer: (question, choice) => `关于"${question}" — 我的回答: ${choice}`,
       lateAnswerTip: '将此回答起草为后续消息',
       lateAnswerHint: '此问题已不再等待回答。选择一个选项会将其起草为后续消息。',

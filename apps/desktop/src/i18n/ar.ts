@@ -2671,6 +2671,7 @@ export const ar = defineForkLocale(forkAr, {
       confirmAndContinueLabel: 'تأكيد ومتابعة',
       answeredBadge: 'تمت الإجابة',
       questionProgress: (answered, total) => `تمت الإجابة على ${answered} من ${total}`,
+      questionGroup: total => `${total} أسئلة بحاجة إلى إجابة`,
       addNote: 'إضافة ملاحظة',
       addNoteFor: label => `إضافة ملاحظة إلى ${label}`,
       note: 'ملاحظة',
