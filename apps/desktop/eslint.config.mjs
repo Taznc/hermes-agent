@@ -16,6 +16,17 @@ export default [
     }
   },
   {
+    // notification-sw.js runs in the Service Worker global scope (`self`,
+    // `clients`, `registration`), not the window/document scope above —
+    // served as-is (no build step) to the browser from public/.
+    files: ['public/*.js'],
+    languageOptions: {
+      globals: {
+        ...globals.serviceworker
+      }
+    }
+  },
+  {
     // THE PLUGIN FENCE: plugins speak @hermes/plugin-sdk (+ react), never `@/…`
     // internals — the same isolation a runtime-fetched published plugin gets,
     // enforced on bundled ones so the SDK surface stays honest and sufficient.

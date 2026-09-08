@@ -490,6 +490,18 @@ export function useComposerDraft({
     }
   }, [syncDraftFromEditor])
 
+  // >>> FORK ANCHOR: composer-model-recommendation <<<
+  // A draft-change subscription for surfaces that must REACT to an edit
+  // without being re-rendered (typing is deliberately kept out of React).
+  // It rides the same composer-runtime subscription the sync above uses, so
+  // it covers typed, pasted, IME-committed and programmatic changes alike;
+  // subscribers re-read the live text through `getDraft()` themselves, so no
+  // draft text crosses this boundary.
+  const subscribeDraft = useCallback(
+    (listener: () => void) => composerRuntime.subscribe(listener),
+    [composerRuntime]
+  )
+
   return {
     activeQueueSessionKeyRef,
     clearDraft,
@@ -506,6 +518,7 @@ export function useComposerDraft({
     sessionIdRef,
     setComposerText,
     stashAt,
+    subscribeDraft,
     syncDraftFromEditor
   }
 }

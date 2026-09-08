@@ -62,7 +62,7 @@ import { ChatBar, ChatBarFallback } from './composer'
 import { requestComposerInsert } from './composer/focus'
 import { droppedFileInlineRefs } from './composer/inline-refs'
 import { ComposerSurfaceProvider, useComposerScope, useComposerSurfaceId } from './composer/scope'
-import type { ChatBarState } from './composer/types'
+import type { ChatBarState, ComposerRecommendContext } from './composer/types'
 import { type DroppedFile, partitionDroppedFiles } from './hooks/use-composer-actions'
 import { type DragKind, useFileDropZone } from './hooks/use-file-drop-zone'
 import { shouldShowIntro } from './intro-visibility'
@@ -86,6 +86,11 @@ interface ChatViewProps extends Omit<React.ComponentProps<'div'>, 'onSubmit'> {
   modelOptionsOwnerConnectionId?: string
   modelOptionsProfile?: string
   modelMenuContent?: React.ReactNode
+  // >>> FORK ANCHOR: composer-model-recommendation <<<
+  /** Fork: renders the manual model-recommendation surface for THIS view's
+   *  composer. Built by whoever owns this view's gateway route (shell or
+   *  tile), for the same reason `modelMenuContent` is. */
+  recommendRender?: (ctx: ComposerRecommendContext) => React.ReactNode
   requestModelOptionsForOwner?: <T>(method: string, params?: Record<string, unknown>) => Promise<T>
   onToggleSelectedPin: () => void
   onDeleteSelectedSession: () => void
@@ -388,6 +393,7 @@ const ChatViewContent = memo(function ChatViewContent({
   modelOptionsOwnerConnectionId,
   modelOptionsProfile,
   modelMenuContent,
+  recommendRender,
   requestModelOptionsForOwner,
   onToggleSelectedPin,
   onDeleteSelectedSession,
@@ -596,6 +602,8 @@ const ChatViewContent = memo(function ChatViewContent({
         canSwitch: gatewayOpen,
         loading: !gatewayOpen || (!currentModel && !currentProvider),
         modelMenuContent,
+        // >>> FORK ANCHOR: composer-model-recommendation <<<
+        recommendRender,
         quickModels
       },
       tools: {
@@ -608,7 +616,7 @@ const ChatViewContent = memo(function ChatViewContent({
         active: false
       }
     }),
-    [contextSuggestions, currentModel, currentProvider, gatewayOpen, modelMenuContent, quickModels]
+    [contextSuggestions, currentModel, currentProvider, gatewayOpen, modelMenuContent, quickModels, recommendRender]
   )
 
   // Drop files anywhere in the conversation area, not just on the composer

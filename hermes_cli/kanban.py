@@ -225,6 +225,7 @@ _DELEGATED_CHILD_DENIED_ACTIONS: frozenset[str] = frozenset({
     "init", "create", "swarm", "assign", "reclaim", "reassign", "link", "unlink",
     "claim", "comment", "attach", "attach-rm", "complete", "edit", "block",
     "schedule", "hold", "unblock", "unhold", "promote", "archive", "dispatch", "daemon", "repair",
+    "refine", "demote", "spawn",
     "heartbeat", "notify-subscribe", "notify-unsubscribe", "specify", "decompose",
     "gc",
 })
@@ -351,6 +352,13 @@ def _cmd_assignees(args: argparse.Namespace) -> int:
 
 
 def _cmd_create(args: argparse.Namespace) -> int:
+    lane = "idea" if getattr(args, "idea", False) else ("roadmap" if getattr(args, "roadmap", False) else None)
+    if getattr(args, "idea", False) and getattr(args, "roadmap", False):
+        return _err("kanban: --idea and --roadmap are mutually exclusive", 2)
+    if lane and getattr(args, "triage", False):
+        return _err(f"kanban: --{lane} and --triage are mutually exclusive", 2)
+    if lane and getattr(args, "initial_status", "running") != "running":
+        return _err(f"kanban: --{lane} and --initial-status are mutually exclusive", 2)
     try:
         ws_kind, ws_path = _parse_workspace_flag(args.workspace)
         branch_name = _parse_branch_flag(getattr(args, "branch", None))
@@ -401,6 +409,7 @@ def _cmd_create(args: argparse.Namespace) -> int:
                     goal_mode=bool(getattr(args, "goal_mode", False)),
                     goal_max_turns=getattr(args, "goal_max_turns", None),
                     initial_status=getattr(args, "initial_status", "running"),
+                    lane=lane,
                 )
             except ValueError as exc:  # forced-skill preflight against the assignee
                 return _err_structured(args, exc, rc=2)
@@ -470,8 +479,18 @@ def _cmd_list(args: argparse.Namespace) -> int:
     if not tasks:
         print("(no matching tasks)")
         return 0
-    for t in tasks:
+    # Roadmap-lane cards are inert wishlist entries, not queued work: list them under their own
+    # header AFTER every live column so a glance at the board still reads as "what is in flight".
+    live = [t for t in tasks if t.status not in kb.ROADMAP_LANE_STATUSES]
+    lanes = [t for t in tasks if t.status in kb.ROADMAP_LANE_STATUSES]
+    for t in live:
         print(_fmt_task_line(t))
+    if lanes:
+        if live:
+            print()
+        print("Roadmap (inert — no automation touches these):")
+        for t in lanes:
+            print(_fmt_task_line(t))
     return 0
 
 
@@ -497,6 +516,42 @@ def _print_section(title: str, lines) -> None:
     print(title)
     for line in lines:
         print(line)
+
+
+def _run_analytics_lines(run: kb.Run) -> list[str]:
+    """Compact human-readable launch and usage details, omitting NULL fields."""
+    lines: list[str] = []
+    identity = [
+        value
+        for value in (run.model, run.provider, run.reasoning_effort)
+        if value is not None
+    ]
+    if identity:
+        lines.append("model: " + " · ".join(identity))
+
+    token_parts = [
+        f"{label} {int(value):,}"
+        for label, value in (
+            ("in", run.input_tokens),
+            ("out", run.output_tokens),
+            ("cache", run.cache_read_tokens),
+            ("reasoning", run.reasoning_tokens),
+        )
+        if value is not None
+    ]
+    if token_parts:
+        lines.append("tokens: " + " · ".join(token_parts))
+
+    call_parts = [
+        f"{label} {int(value):,}"
+        for label, value in (("API", run.api_calls), ("tools", run.tool_calls))
+        if value is not None
+    ]
+    if call_parts:
+        lines.append("calls: " + " · ".join(call_parts))
+    if run.estimated_cost_usd is not None:
+        lines.append(f"estimated cost: ${run.estimated_cost_usd:.4f}")
+    return lines
 
 
 def _cmd_show(args: argparse.Namespace) -> int:
@@ -604,6 +659,8 @@ def _cmd_show(args: argparse.Namespace) -> int:
             el = f"{elapsed}s" if elapsed is not None else "active"
             outcome = r.outcome or r.status or "active"
             print(f"  #{r.id:<3} {outcome:<12} @{r.profile or '-'}  {el}  {_fmt_ts(r.started_at)}")
+            for analytics_line in _run_analytics_lines(r):
+                print(f"        {analytics_line}")
             if r.summary:
                 print(f"        → {r.summary.splitlines()[0][:160]}")
             if r.error:
@@ -1042,6 +1099,63 @@ def _cmd_unhold(args: argparse.Namespace) -> int:
                            lambda tid: f"cannot unhold {tid} (not on hold?)")
 
 
+def _lane_bulk(args: argparse.Namespace, verb: str, apply, ok_label: Optional[str]) -> int:
+    """Shared body for ``refine``/``demote``/``spawn``: apply a lane transition per id.
+
+    A refused transition raises ``ValueError`` from the DB layer naming ``from -> to``; that
+    message is the useful one, so print it per-id and keep going instead of aborting the batch.
+    ``ok_label=None`` means ``apply`` already printed its own success line (``spawn`` does: its
+    landing is parent-gated and therefore not known until after the write)."""
+    ids, rc = _require_ids(args)
+    if rc:
+        return rc
+    failed = False
+    with kbc.connect_closing() as conn:
+        for tid in ids:
+            try:
+                moved = apply(conn, tid)
+            except ValueError as exc:
+                failed = True
+                print(f"kanban {verb}: {exc}", file=sys.stderr)
+                continue
+            if moved:
+                if ok_label is not None:
+                    print(f"{ok_label} {tid}")
+            else:
+                failed = True
+                print(f"cannot {verb} {tid} (status changed concurrently?)", file=sys.stderr)
+    return 1 if failed else 0
+
+
+def _cmd_refine(args: argparse.Namespace) -> int:
+    """Idea -> Roadmap."""
+    return _lane_bulk(args, "refine", kb.refine_task, "Refined to roadmap")
+
+
+def _cmd_demote(args: argparse.Namespace) -> int:
+    """Roadmap -> Idea."""
+    return _lane_bulk(args, "demote", kb.demote_task, "Demoted to idea")
+
+
+def _cmd_spawn(args: argparse.Namespace) -> int:
+    """Roadmap -> triage (default) or ready."""
+    to = getattr(args, "to", "triage")
+
+    def apply(conn, tid) -> bool:
+        if not kb.spawn_roadmap_task(conn, tid, to=to):
+            return False
+        # ``ready`` is parent-gated, so the card may legitimately have landed in ``todo``.
+        # Report where it actually went; a fixed "Spawned to ready" would misreport it.
+        landed = kb.get_task(conn, tid)
+        if landed is not None and landed.status != to:
+            print(f"Spawned to {landed.status} {tid} (parents unfinished; requested {to})")
+            return True
+        print(f"Spawned to {to} {tid}")
+        return True
+
+    return _lane_bulk(args, "spawn", apply, None)
+
+
 def _cmd_request_review(args: argparse.Namespace) -> int:
     tid = args.task_id
     summary = _stripped_or_none(getattr(args, "summary", None))
@@ -1152,6 +1266,11 @@ def _cmd_stats(args: argparse.Namespace) -> int:
     print("By status:")
     for k in ("triage", "todo", "scheduled", "ready", "running", "blocked", "on_hold", "done"):
         print(f"  {k:8s}  {stats['by_status'].get(k, 0)}")
+    lane_counts = {k: stats["by_status"].get(k, 0) for k in ("idea", "roadmap")}
+    if any(lane_counts.values()):
+        print("\nRoadmap lanes (not counted as active work):")
+        for k, n in lane_counts.items():
+            print(f"  {k:8s}  {n}")
     if stats["by_assignee"]:
         print("\nBy assignee:")
         for who, counts in sorted(stats["by_assignee"].items()):
@@ -1236,6 +1355,8 @@ def _cmd_runs(args: argparse.Namespace) -> int:
         el = f"{elapsed}s" if elapsed < 60 else f"{elapsed // 60}m" if elapsed < 3600 else f"{elapsed / 3600:.1f}h"
         outcome = r.outcome or ("(running)" if not r.ended_at else r.status)
         print(f"{i:3d}  {outcome:12s}  {(r.profile or '-'):16s}  {el:>8s}  {_fmt_ts(r.started_at)}")
+        for analytics_line in _run_analytics_lines(r):
+            print(f"     {analytics_line}")
         if r.summary:
             print(f"     → {r.summary.splitlines()[0][:100]}")
         if r.error:
@@ -1329,6 +1450,7 @@ _HANDLERS = {
     "attachments": _cmd_attachments, "attach-rm": _cmd_attach_rm,
     "complete": _cmd_complete, "edit": _cmd_edit, "block": _cmd_block,
     "schedule": _cmd_schedule, "hold": _cmd_hold, "unblock": _cmd_unblock, "unhold": _cmd_unhold,
+    "refine": _cmd_refine, "demote": _cmd_demote, "spawn": _cmd_spawn,
     "request-review": _cmd_request_review, "request-changes": _cmd_request_changes,
     "reopen-review": _cmd_reopen_review, "promote": _cmd_promote,
     "archive": _cmd_archive, "tail": _cmd_tail, "dispatch": _cmd_dispatch,

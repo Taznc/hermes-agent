@@ -116,6 +116,20 @@ export function RunErrorLine({ error, k }: { error: string; k: KanbanText }) {
 export function RunRow({ k, run }: { k: KanbanText; run: KanbanRun }) {
   const outcome = run.outcome ?? run.status
   const tone = outcomeTone(outcome)
+  const modelParts = [run.model, run.provider, run.reasoning_effort].filter((value): value is string => value != null)
+
+  const tokenParts = [
+    run.input_tokens != null ? `in ${run.input_tokens.toLocaleString()}` : null,
+    run.output_tokens != null ? `out ${run.output_tokens.toLocaleString()}` : null,
+    run.cache_read_tokens != null ? `cache ${run.cache_read_tokens.toLocaleString()}` : null,
+    run.reasoning_tokens != null ? `reasoning ${run.reasoning_tokens.toLocaleString()}` : null
+  ].filter((value): value is string => value != null)
+
+  const usageParts = [
+    run.api_calls != null ? `API ${run.api_calls.toLocaleString()}` : null,
+    run.tool_calls != null ? `tools ${run.tool_calls.toLocaleString()}` : null,
+    run.estimated_cost_usd != null ? `estimated cost: $${run.estimated_cost_usd.toFixed(4)}` : null
+  ].filter((value): value is string => value != null)
 
   return (
     <AccentRow className="flex flex-col gap-0.5 py-1 text-[0.71rem]" tone={tone}>
@@ -132,6 +146,15 @@ export function RunRow({ k, run }: { k: KanbanText; run: KanbanRun }) {
         )}
         <span className="ml-auto shrink-0 text-(--ui-text-quaternary)">{ago(run.ended_at ?? run.started_at)}</span>
       </div>
+      {modelParts.length > 0 && (
+        <p className="text-(--ui-text-quaternary)">model: {modelParts.join(' · ')}</p>
+      )}
+      {tokenParts.length > 0 && (
+        <p className="text-(--ui-text-quaternary)">tokens: {tokenParts.join(' · ')}</p>
+      )}
+      {usageParts.length > 0 && (
+        <p className="text-(--ui-text-quaternary)">calls: {usageParts.join(' · ')}</p>
+      )}
       {run.error ? (
         <RunErrorLine error={run.error} k={k} />
       ) : (
@@ -223,6 +246,30 @@ export function CommentComposer({
   )
 }
 
+/** Long worker comments (diagnosis dumps, handoff context) collapse to a few
+ *  lines with a Show more toggle so the thread stays scannable; the toggle
+ *  only renders when the body is actually long. */
+const COMMENT_INLINE_CHARS = 300
+
+function CommentBody({ body }: { body: string }) {
+  const k = useKanban()
+  const [expanded, setExpanded] = useState(false)
+  const long = body.length > COMMENT_INLINE_CHARS || body.split('\n').length > 4
+
+  return (
+    <div className="flex flex-col gap-0.5">
+      <p className={cn('whitespace-pre-wrap text-(--ui-text-tertiary)', long && !expanded && 'line-clamp-3')}>
+        {body}
+      </p>
+      {long && (
+        <Button className="self-start" onClick={() => setExpanded(v => !v)} size="xs" variant="text">
+          {expanded ? k.showLess : k.showMore}
+        </Button>
+      )}
+    </div>
+  )
+}
+
 /** The comment thread + composer. The composer carries the
  *  `data-kanban-comment-input` hook the CTA banner's Reply deep-link focuses,
  *  which is why this whole section must be MOUNTED (not just reachable) once
@@ -266,7 +313,7 @@ export function CommentsSection({
               <li className="text-[0.75rem]" key={comment.id}>
                 <span className="font-medium text-(--ui-text-secondary)">{comment.author}</span>
                 <span className="ml-2 text-[0.625rem] text-(--ui-text-quaternary)">{ago(comment.created_at)}</span>
-                <p className="whitespace-pre-wrap text-(--ui-text-tertiary)">{comment.body}</p>
+                <CommentBody body={comment.body} />
               </li>
             ))}
           </ul>

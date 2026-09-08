@@ -1722,6 +1722,16 @@ export {
   type TranscriptDirectiveProps
 } from '@/lib/transcript-directives'
 export { cn } from '@/lib/utils'
+/** THE persisted pane-size store, for a plugin surface that owns a drag sash
+ *  (a resizable drawer, rail, or docked panel). Read the current override with
+ *  `useValue($paneWidthOverride(id))`, write px during the drag with
+ *  `setPaneWidthOverride(id, px)`, and pass `undefined` to clear it back to the
+ *  surface's authored default — the same store, and the same double-click-to-
+ *  reset contract, the app's own sashes use, so a plugin's width persists to
+ *  localStorage and is cleared by a layout reset alongside core's panes rather
+ *  than drifting in a parallel store. Namespace the id with your plugin slug
+ *  (`kanban.taskDrawer`). */
+export { $paneWidthOverride, setPaneWidthOverride } from '@/store/panes'
 /** THE unread store behind `SessionStatusDot`'s emerald dot. A plugin that
  *  learns out-of-band that a session produced something the user hasn't seen
  *  (a roster poll's activity watermark, say) writes HERE rather than keeping

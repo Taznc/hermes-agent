@@ -208,6 +208,52 @@ def test_a_profile_registry_lookup_failure_fails_closed(kanban_home):
     assert excinfo.value.code == PROFILE_UNAVAILABLE_CODE
 
 
+def test_a_wishlist_lane_card_is_inert_and_not_preflighted(kanban_home):
+    """A lane card is inert by construction — nothing dispatches it, and its
+    skill may well be installed before anyone acts on it. Refusing to file one
+    would block capture, which is the opposite of what the lane is for."""
+    from hermes_cli import kanban_db, kanban_db_connect
+
+    _make_profile(kanban_home, "claudecode", [])
+
+    with kanban_db_connect.connect_closing() as conn:
+        kanban_db.create_board(slug="default", name="Test")
+        task_id = kanban_db.create_task(
+            conn, title="someday", assignee="claudecode",
+            skills=["not-installed-yet"], lane="idea",
+        )
+        task = kanban_db.get_task(conn, task_id)
+        assert task.status == "idea"
+        assert task.skills == ["not-installed-yet"]
+
+
+def test_a_wishlist_card_promoted_to_live_work_is_still_preflighted(kanban_home):
+    """The lane exemption defers the check, it does not waive it: the moment a
+    lane card becomes dispatchable, the dispatcher refuses it exactly as it
+    refuses any other unloadable card."""
+    from hermes_cli import kanban_db, kanban_db_connect, kanban_db_dispatch
+
+    _make_profile(kanban_home, "claudecode", [])
+    spawned = []
+
+    with kanban_db_connect.connect_closing() as conn:
+        kanban_db.create_board(slug="default", name="Test")
+        task_id = kanban_db.create_task(
+            conn, title="someday", assignee="claudecode",
+            skills=["not-installed-yet"], lane="idea",
+        )
+        # Promote out of the lane into live work.
+        with kanban_db.write_txn(conn):
+            conn.execute("UPDATE tasks SET status = 'ready' WHERE id = ?", (task_id,))
+
+    with kanban_db_connect.connect_closing() as conn:
+        result = kanban_db_dispatch.dispatch_once(
+            conn, spawn_fn=lambda task, *a, **k: (spawned.append(task.id), 1)[1],
+        )
+    assert spawned == []
+    assert task_id in [tid for tid, _reason in result.skill_preflight_blocked]
+
+
 def test_the_explicit_inert_path_defers_the_check_to_the_dispatcher(kanban_home):
     """Import/relocation and deliberate card-before-profile ordering need a way
     in. It is an explicit opt-out, never an implicit one: the row is written,

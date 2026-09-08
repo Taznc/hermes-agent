@@ -135,6 +135,7 @@ export const en: Translations = withForkKeys(forkEn, {
     more: count => `${count} more ${count === 1 ? 'notification' : 'notifications'}`,
     clearAll: 'Clear all',
     dismiss: 'Dismiss notification',
+    dismissAction: 'Dismiss',
     details: 'Details',
     copyDetail: 'Copy detail',
     copyDetailFailed: 'Could not copy notification detail',
@@ -513,6 +514,7 @@ export const en: Translations = withForkKeys(forkEn, {
       testBody: 'Notifications are working.',
       testSent: 'Test sent. If nothing appears, check your OS notification permissions and Focus/Do Not Disturb.',
       testUnsupported: 'This system does not support native notifications.',
+      testDenied: 'Notifications are blocked for this site. Allow them in your browser\u2019s site settings, then try again.',
       completionSoundTitle: 'Completion Sound',
       completionSoundDesc: 'Plays when an agent turn finishes. Pick a preset and preview it here.',
       completionSoundPreview: 'Preview'
@@ -3517,6 +3519,7 @@ export const en: Translations = withForkKeys(forkEn, {
       gatewayDisconnected: 'Hermes gateway is not connected',
       sendFailed: 'Could not send clarify response',
       loadingQuestion: 'Loading question…',
+      restoring: 'Restoring this question — you can answer in a moment',
       other: 'Other (type your answer)',
       placeholder: 'Type your answer…',
       skip: 'Skip',
@@ -3525,9 +3528,16 @@ export const en: Translations = withForkKeys(forkEn, {
       confirmAndContinueLabel: 'Confirm and continue',
       answeredBadge: 'Answered',
       questionProgress: (answered, total) => `${answered} of ${total} answered`,
+      questionGroup: total => `${total} questions to answer`,
       lateAnswer: (question, choice) => `Re: "${question}" — my answer: ${choice}`,
       lateAnswerTip: 'Draft this answer as a follow-up message',
-      lateAnswerHint: 'This prompt is no longer waiting. Pick an option to draft it as a follow-up message.'
+      lateAnswerHint: 'This prompt is no longer waiting. Pick an option to draft it as a follow-up message.',
+      addNote: 'Add note',
+      addNoteFor: label => `Add note for ${label}`,
+      note: 'Note',
+      noteFor: label => `Note for ${label}`,
+      notePlaceholder: 'Add an optional note…',
+      selected: 'Selected'
     },
     mcpSetup: {
       installTitle: server => `Add the ${server} MCP server?`,

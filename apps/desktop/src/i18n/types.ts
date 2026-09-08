@@ -179,6 +179,7 @@ export interface UpstreamTranslations {
     more: (count: number) => string
     clearAll: string
     dismiss: string
+    dismissAction: string
     details: string
     copyDetail: string
     copyDetailFailed: string
@@ -430,6 +431,7 @@ export interface UpstreamTranslations {
       testBody: string
       testSent: string
       testUnsupported: string
+      testDenied: string
       completionSoundTitle: string
       completionSoundDesc: string
       completionSoundPreview: string
@@ -3057,6 +3059,7 @@ export interface UpstreamTranslations {
       gatewayDisconnected: string
       sendFailed: string
       loadingQuestion: string
+      restoring: string
       other: string
       placeholder: string
       skip: string
@@ -3065,9 +3068,16 @@ export interface UpstreamTranslations {
       confirmAndContinueLabel: string
       answeredBadge: string
       questionProgress: (answered: number, total: number) => string
+      questionGroup: (total: number) => string
       lateAnswer: (question: string, choice: string) => string
       lateAnswerTip: string
       lateAnswerHint: string
+      addNote: string
+      addNoteFor: (label: string) => string
+      note: string
+      noteFor: (label: string) => string
+      notePlaceholder: string
+      selected: string
     }
     mcpSetup: {
       installTitle: (server: string) => string

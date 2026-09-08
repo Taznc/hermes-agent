@@ -724,10 +724,16 @@ def test_terminate_reclaimed_worker_unit_stop_failure_does_not_fall_through(monk
 
 
 @pytest.mark.parametrize(
-    "verb",
-    ["request_review", "complete_task", "block_task"],
+    ("verb", "expected_status"),
+    [
+        ("request_review", "review"),
+        ("complete_task", "done"),
+        ("block_task", "blocked"),
+        ("schedule_task", "scheduled"),
+        ("hold_task", "on_hold"),
+    ],
 )
-def test_worker_pid_clearing_verb_also_clears_worker_unit(tmp_path, verb):
+def test_worker_pid_clearing_verb_also_clears_worker_unit(tmp_path, verb, expected_status):
     import hermes_cli.kanban_db_connect as kbc
 
     conn = kbc.connect(tmp_path / "kanban.db")
@@ -747,13 +753,22 @@ def test_worker_pid_clearing_verb_also_clears_worker_unit(tmp_path, verb):
             ok = kb.request_review(conn, task_id, summary="done", expected_run_id=claimed.current_run_id)
         elif verb == "complete_task":
             ok = kb.complete_task(conn, task_id, result="done")
-        else:
+        elif verb == "block_task":
             ok = kb.block_task(conn, task_id, reason="blocked for regression test")
+        elif verb == "schedule_task":
+            ok = kb.schedule_task(
+                conn, task_id, reason="scheduled for regression test", expected_run_id=claimed.current_run_id,
+            )
+        else:
+            ok = kb.hold_task(
+                conn, task_id, reason="held for regression test", expected_run_id=claimed.current_run_id,
+            )
         assert ok
 
         row = conn.execute(
-            "SELECT worker_pid, worker_unit FROM tasks WHERE id = ?", (task_id,),
+            "SELECT status, worker_pid, worker_unit FROM tasks WHERE id = ?", (task_id,),
         ).fetchone()
+        assert row["status"] == expected_status
         assert row["worker_pid"] is None
         assert row["worker_unit"] is None, (
             f"{verb} cleared worker_pid but left a stale worker_unit — this is "

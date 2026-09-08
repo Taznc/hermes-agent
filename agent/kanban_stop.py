@@ -28,9 +28,30 @@ _TERMINAL_KANBAN_TOOLS = frozenset({
 _DEFAULT_MAX_ATTEMPTS = 2
 
 
+def _is_dispatcher_owned_worker() -> bool:
+    """``HERMES_KANBAN_TASK`` is inherited, so its presence is not proof of ownership: a
+    ``delegate_task`` child (and any subprocess it spawns), and an in-process cron job fired
+    from a worker, all see the worker's task id while owning no board run. Fail open — the
+    guard exists to protect real dispatcher workers."""
+    try:
+        from agent.delegation_context import (
+            is_delegated_child_process_context,
+            is_dispatcher_owned_worker_context,
+        )
+
+        return is_dispatcher_owned_worker_context() and not is_delegated_child_process_context()
+    except Exception:
+        return True
+
+
 def kanban_stop_nudge_enabled() -> bool:
-    """On when ``HERMES_KANBAN_TASK`` is set, unless ``HERMES_KANBAN_STOP_NUDGE`` disables it."""
+    """On when ``HERMES_KANBAN_TASK`` is set AND this execution owns that task, unless
+    ``HERMES_KANBAN_STOP_NUDGE`` disables it. A plain-text summary IS the terminal state for a
+    delegated child — nudging one forces it to chase board tools it is (correctly) refused,
+    and its finished work is rewritten into an apology."""
     if (os.environ.get("HERMES_KANBAN_STOP_NUDGE") or "").strip().lower() in {"0", "false", "no", "off"}:
+        return False
+    if not _is_dispatcher_owned_worker():
         return False
     return bool((os.environ.get("HERMES_KANBAN_TASK") or "").strip())
 

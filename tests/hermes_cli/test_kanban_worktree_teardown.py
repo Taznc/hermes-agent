@@ -183,6 +183,14 @@ def test_complete_task_reaps_clean_worktree(kanban_home: Path, repo: Path) -> No
 
 
 def test_complete_task_preserves_dirty_worktree(kanban_home: Path, repo: Path) -> None:
+    """Dirty work is never lost at completion.
+
+    Since the preservation safety net (docs/kanban/worker-preservation.md) this
+    is satisfied by committing + pushing the work rather than by keeping the
+    directory: the worktree may then be reaped precisely BECAUSE its content is
+    safe on the remote. The invariant under test is the content surviving, not
+    the directory — so this asserts the work is retrievable from origin.
+    """
     with kbc.connect_closing() as conn:
         tid, wt = _worktree_task(conn, repo)
         (wt / "wip.txt").write_text("unsaved\n", encoding="utf-8")
@@ -190,8 +198,32 @@ def test_complete_task_preserves_dirty_worktree(kanban_home: Path, repo: Path) -
             conn.execute("UPDATE tasks SET status='ready' WHERE id=?", (tid,))
         assert kb.claim_task(conn, tid, claimer="worker") is not None
         assert kb.complete_task(conn, tid, summary="done")
+
+    # The work reached the remote on the task's own branch, unforced.
+    remote = _git("-C", str(repo), "ls-remote", "origin", f"refs/heads/wt/{tid}")
+    assert remote.strip(), "dirty work was not preserved to the remote"
+    blob = _git("-C", str(repo), "show", f"origin/wt/{tid}:wip.txt")
+    assert blob == "unsaved\n"
+
+
+def test_complete_task_keeps_a_worktree_preservation_refused(
+    kanban_home: Path, repo: Path
+) -> None:
+    """When the safety net refuses to snapshot (here: a credential-bearing
+    filename), cleanup must still find the worktree dirty and preserve it."""
+    with kbc.connect_closing() as conn:
+        tid, wt = _worktree_task(conn, repo)
+        (wt / ".env").write_text("TOKEN=abc\n", encoding="utf-8")
+        with kb.write_txn(conn):
+            conn.execute("UPDATE tasks SET status='ready' WHERE id=?", (tid,))
+        assert kb.claim_task(conn, tid, claimer="worker") is not None
+        assert kb.complete_task(conn, tid, summary="done")
+
     assert wt.is_dir()
-    assert (wt / "wip.txt").exists()
+    assert (wt / ".env").exists()
+    # Nothing was pushed, so nothing about the refusal looks like a success.
+    remote = _git("-C", str(repo), "ls-remote", "origin", f"refs/heads/wt/{tid}")
+    assert not remote.strip()
 
 
 def test_archive_task_reaps_clean_worktree(kanban_home: Path, repo: Path) -> None:

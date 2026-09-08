@@ -90,8 +90,23 @@ def _git_out(cwd: Path, *args: str, timeout: int = 30) -> Optional[str]:
 
 VALID_STATUSES = {
     "triage", "todo", "scheduled", "ready", "running", "blocked", "on_hold", "review", "done", "archived",
+    "idea", "roadmap",
 }
 VALID_INITIAL_STATUSES = {"running", "blocked"}
+
+# Wishlist lanes: a card parked here is INERT BY CONSTRUCTION. No sweep, dispatcher query,
+# promotion pass, decomposer, specifier, ``recompute_ready`` or stale/crash reaper may ever
+# select one, because every one of those selects an explicit status whitelist that omits both.
+# ``idea`` is rough capture, ``roadmap`` is hashed out with the operator but still NOT authorized
+# to execute. Cards enter a lane only at creation (``create_task(lane=...)``) so the existing
+# ``block``/``hold`` habits can never park live work in the wishlist; they leave through
+# ``spawn_roadmap_task`` (roadmap -> triage/ready) or ``archive_task``.
+ROADMAP_LANE_STATUSES = frozenset({"idea", "roadmap"})
+
+# Statuses that are not live work for health/cost purposes (board "active" aggregates, the
+# dispatcher-stuck heuristic, stale-age checks, workspace retention). The lanes sit beside
+# ``archived`` here: visible on the board, but never counted as work in flight.
+NON_ACTIVE_STATUSES = frozenset({"archived"}) | ROADMAP_LANE_STATUSES
 
 # Typed block reasons (routing in ``_route_block``); ``None`` = legacy un-typed.
 VALID_BLOCK_KINDS = {"dependency", "needs_input", "capability", "transient"}
@@ -856,6 +871,10 @@ class Task:
     # Transient systemd --user --scope unit name for the active/most-recent worker; NULL when
     # kanban.worker_launcher is unset (default plain Popen spawn).
     worker_unit: Optional[str] = None
+    # Lineage: the task/run that created this task via kanban_create. NULL for CLI/dashboard
+    # creates and every pre-feature row.
+    created_by_task: Optional[str] = None
+    created_by_run: Optional[int] = None
 
     @classmethod
     def from_row(cls, row: sqlite3.Row) -> "Task":
@@ -886,6 +905,7 @@ _TASK_OPTIONAL_COLUMNS = (
     "branch_name", "project_id", "tenant", "result", "idempotency_key", "worker_pid",
     "max_runtime_seconds", "last_heartbeat_at", "current_run_id", "workflow_template_id",
     "current_step_key", "max_retries", "session_id", "route_source", "route_name",
+    "created_by_task", "created_by_run",
 )
 # Text columns where "" is stored/read as "not set".
 _TASK_EMPTY_IS_NULL_COLUMNS = (
@@ -914,9 +934,24 @@ class Run:
     summary: Optional[str]
     metadata: Optional[dict]
     error: Optional[str]
+    # Analytics capture — see SCHEMA_SQL's task_runs comment. All NULL on
+    # legacy rows and on any run whose spawn/finalize couldn't resolve a value.
+    model: Optional[str] = None
+    provider: Optional[str] = None
+    reasoning_effort: Optional[str] = None
+    model_source: Optional[str] = None       # card_override | profile_default | routing
+    session_id: Optional[str] = None
+    input_tokens: Optional[int] = None
+    output_tokens: Optional[int] = None
+    cache_read_tokens: Optional[int] = None
+    reasoning_tokens: Optional[int] = None
+    api_calls: Optional[int] = None
+    tool_calls: Optional[int] = None
+    estimated_cost_usd: Optional[float] = None
 
     @classmethod
     def from_row(cls, row: sqlite3.Row) -> "Run":
+        g = lambda col, default=None: _row_get(row, col, default)  # noqa: E731
         return cls(
             **{
                 col: row[col] for col in (
@@ -928,6 +963,15 @@ class Run:
             started_at=int(row["started_at"]),
             ended_at=_opt_int(row["ended_at"]),
             metadata=_json_or(row["metadata"]),
+            model=g("model"), provider=g("provider"), reasoning_effort=g("reasoning_effort"),
+            model_source=g("model_source"), session_id=g("session_id"),
+            input_tokens=_opt_int(g("input_tokens")), output_tokens=_opt_int(g("output_tokens")),
+            cache_read_tokens=_opt_int(g("cache_read_tokens")),
+            reasoning_tokens=_opt_int(g("reasoning_tokens")),
+            api_calls=_opt_int(g("api_calls")), tool_calls=_opt_int(g("tool_calls")),
+            estimated_cost_usd=(
+                float(g("estimated_cost_usd")) if g("estimated_cost_usd") is not None else None
+            ),
         )
 
 
@@ -1129,7 +1173,12 @@ CREATE TABLE IF NOT EXISTS tasks (
     -- plain-Popen spawn path. Durable handle so a cold dispatcher process (e.g. after a gateway
     -- restart) can query the worker's exit status by unit name instead of relying on an
     -- in-process waitpid registry it never populated.
-    worker_unit          TEXT
+    worker_unit          TEXT,
+    -- Lineage: the task/run that created this task via kanban_create (kanban_tools.py), so an
+    -- orchestration tree can be reconstructed without scanning every ``created`` event payload.
+    -- NULL for CLI/dashboard-originated creates and every pre-feature row.
+    created_by_task       TEXT,
+    created_by_run        INTEGER
 );
 
 CREATE TABLE IF NOT EXISTS task_links (
@@ -1184,7 +1233,26 @@ CREATE TABLE IF NOT EXISTS task_runs (
     --          gave_up | reclaimed | (null while still running)
     summary             TEXT,
     metadata            TEXT,
-    error               TEXT
+    error               TEXT,
+    -- Analytics capture (all nullable; NULL on every pre-feature row and on
+    -- any run whose spawn/finalize couldn't resolve a value). See AC1-4 of
+    -- the kanban-analytics-capture card.
+    model               TEXT,
+    provider            TEXT,
+    reasoning_effort    TEXT,
+    -- model_source: card_override | profile_default | routing
+    model_source        TEXT,
+    -- Dispatcher-generated HERMES_SESSION_ID passed to the worker, so a
+    -- crashed/timed-out run (never reaching kanban_complete) is still
+    -- joinable to its state.db session row.
+    session_id          TEXT,
+    input_tokens        INTEGER,
+    output_tokens       INTEGER,
+    cache_read_tokens   INTEGER,
+    reasoning_tokens    INTEGER,
+    api_calls           INTEGER,
+    tool_calls          INTEGER,
+    estimated_cost_usd  REAL
 );
 
 -- Files attached to a task (PDFs, images, source documents). The blob
@@ -1609,6 +1677,7 @@ def delete_interruption_streak(conn: sqlite3.Connection, *, task_id: str) -> Non
 # of a clean ``sys.exit(75)``.
 _QUOTA_EXIT_LOG_RE = re.compile(r"quota exhausted \(429\)", re.IGNORECASE)
 _QUOTA_RETRY_AFTER_RE = re.compile(r"retry after ([0-9]+)s\b", re.IGNORECASE)
+_HOST_QUOTA_PUBLISHED_LOG_RE = re.compile(r"host quota circuit published\.", re.IGNORECASE)
 
 
 def worker_log_run_marker(run_id: int) -> str:
@@ -1638,7 +1707,10 @@ def _detect_quota_exit_signal(
     if not _QUOTA_EXIT_LOG_RE.search(log_text):
         return None
     m = _QUOTA_RETRY_AFTER_RE.search(log_text)
-    return {"retry_after_seconds": _parse_retry_after(m.group(1)) if m else None}
+    result = {"retry_after_seconds": _parse_retry_after(m.group(1)) if m else None}
+    if _HOST_QUOTA_PUBLISHED_LOG_RE.search(log_text):
+        result["host_circuit_published"] = True
+    return result
 
 def _parse_retry_after(text: Optional[str]) -> Optional[int]:
     """Parse a retry-after value: only positive base-10 integer. Returns None for malformed/missing/nonpositive."""
@@ -1984,7 +2056,9 @@ def create_task(
     route_source: Optional[str] = None, route_name: Optional[str] = None,
     goal_mode: bool = False, goal_max_turns: Optional[int] = None, initial_status: str = "running",
     session_id: Optional[str] = None, board: Optional[str] = None, project_id: Optional[str] = None,
-    project_source_task_id: Optional[str] = None, skill_preflight: bool = True,
+    project_source_task_id: Optional[str] = None, lane: Optional[str] = None,
+    created_by_task: Optional[str] = None, created_by_run: Optional[int] = None,
+    skill_preflight: bool = True,
 ) -> str:
     """Create a task (optionally under ``parents``); returns its id.
 
@@ -2001,12 +2075,19 @@ def create_task(
     audit/UI surfaces and never affect dispatch after creation.
     ``project_source_task_id``: cross-profile fallback when ``project_id`` is not
     in the active profile's projects.db — see ``_resolve_project_link``.
+    ``created_by_task``/``created_by_run``: lineage when this task was created
+    by a worker via ``kanban_create`` — NULL for CLI/dashboard creates.
+    ``lane``: ``"idea"``/``"roadmap"`` parks the card in an inert wishlist lane
+    (``ROADMAP_LANE_STATUSES``) that no automation ever selects; mutually exclusive
+    with ``triage`` and with a non-default ``initial_status``, and ``assignee`` is
+    optional there (nothing dispatches a lane card).
     """
     model_override, provider_override = _validate_model_override(model_override, provider_override)
     reasoning_effort = normalize_reasoning_effort(reasoning_effort)
     assignee = _canonical_assignee(assignee)
     if not title or not title.strip():
         raise ValueError("title is required")
+    lane = _validate_lane(lane, triage=triage, initial_status=initial_status)
     if initial_status not in VALID_INITIAL_STATUSES:
         raise ValueError(f"initial_status must be one of {sorted(VALID_INITIAL_STATUSES)}")
     if workspace_kind not in VALID_WORKSPACE_KINDS:
@@ -2040,11 +2121,15 @@ def create_task(
     # Forced skills resolve in the ASSIGNEE's isolated profile home, not ours.
     # Validating here — before the row exists — is what keeps an unloadable
     # skill from becoming a worker that dies during init on every retry.
-    # ``skill_preflight=False`` is the explicit inert path (board import, row
-    # relocation, deliberate card-before-profile ordering): the row is written
-    # unvalidated and the dispatcher's own check refuses to spawn it. It is
-    # never implicit — an assignee we cannot inspect fails closed instead.
-    if skill_preflight:
+    #
+    # Two explicit inert paths are exempt, and only these two. ``lane`` parks
+    # the card in a wishlist lane that is inert by construction (nothing
+    # dispatches it, and its skill may well be installed before anyone acts on
+    # it); ``skill_preflight=False`` is the opt-out for board import, row
+    # relocation and deliberate card-before-profile ordering. Both still face
+    # the dispatcher's own check on the way into live work, and neither is
+    # implicit — an assignee we cannot inspect fails closed rather than passing.
+    if skill_preflight and lane is None:
         from hermes_cli.kanban_skill_preflight import preflight_task_skills
         preflight_task_skills(assignee, skills_list)
 
@@ -2073,7 +2158,7 @@ def create_task(
             # allow_nested: graph builders compose create_task under one outer
             # commit so the dispatcher never sees a half-built graph.
             with write_txn(conn, allow_nested=True):
-                task_status = _initial_task_status(conn, parents, initial_status, triage)
+                task_status = _initial_task_status(conn, parents, initial_status, triage, lane)
                 # Project worktree: fresh dir under the repo + deterministic
                 # branch, instead of the random ``wt/<id>`` worker fallback.
                 if project_obj is not None and workspace_kind == "worktree":
@@ -2091,8 +2176,9 @@ def create_task(
                         max_runtime_seconds,
                         skills, max_retries, model_override, provider_override,
                         reasoning_effort, route_source, route_name,
-                        goal_mode, goal_max_turns, session_id
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        goal_mode, goal_max_turns, session_id,
+                        created_by_task, created_by_run
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         task_id, title.strip(), body, assignee, task_status, priority,
@@ -2103,6 +2189,7 @@ def create_task(
                         _opt_int(max_retries), model_override, provider_override, reasoning_effort,
                         route_source, route_name,
                         1 if goal_mode else 0, _opt_int(goal_max_turns), session_id,
+                        created_by_task, _opt_int(created_by_run),
                     ),
                 )
                 for pid in parents:
@@ -2127,6 +2214,9 @@ def create_task(
                         "reasoning_effort": reasoning_effort,
                         "route_source": route_source,
                         "route_name": route_name,
+                        "created_by_task": created_by_task,
+                        "created_by_run": _opt_int(created_by_run),
+                        "lane": lane,
                     },
                 )
                 if initial_status == "blocked":
@@ -2155,16 +2245,41 @@ def _board_meta_for(board: Optional[str]) -> dict:
     return read_board_metadata(board if board else get_current_board())
 
 
+def _validate_lane(
+    lane: Optional[str], *, triage: bool = False, initial_status: str = "running",
+) -> Optional[str]:
+    """Normalize a roadmap lane for ``create_task``: ``None`` or one of
+    ``ROADMAP_LANE_STATUSES``. Rejects combining a lane with ``triage`` or an explicit
+    ``initial_status`` — those are three different answers to "where does this card land",
+    and silently picking one would put live work in the wishlist (or vice versa)."""
+    if lane is None:
+        return None
+    lane = str(lane).strip()
+    if lane not in ROADMAP_LANE_STATUSES:
+        raise ValueError(f"lane must be one of {sorted(ROADMAP_LANE_STATUSES)}, got {lane!r}")
+    if triage:
+        raise ValueError("lane and triage are mutually exclusive")
+    if initial_status != "running":
+        raise ValueError(f"lane and initial_status={initial_status!r} are mutually exclusive")
+    return lane
+
+
 def _initial_task_status(
     conn: sqlite3.Connection, parents: tuple[str, ...], initial_status: str, triage: bool,
+    lane: Optional[str] = None,
 ) -> str:
-    """Status for a new task: ``blocked``/``triage`` when parked by the caller,
-    else ``ready`` unless a parent is unsatisfied (-> ``todo``). Parent ids are
-    validated in every mode (even triage) so link rows never dangle."""
+    """Status for a new task: a roadmap ``lane`` / ``blocked`` / ``triage`` when parked by the
+    caller, else ``ready`` unless a parent is unsatisfied (-> ``todo``). Parent ids are
+    validated in every mode (even triage) so link rows never dangle.
+
+    A lane wins over parent gating on purpose: an ``idea``/``roadmap`` card linked under an epic
+    must stay in its lane, never land in ``todo`` where the promotion sweep would pick it up."""
     if parents:
         missing = _missing_task_ids(conn, parents)
         if missing:
             raise ValueError(f"unknown parent task(s): {', '.join(missing)}")
+    if lane is not None:
+        return lane
     if initial_status == "blocked":
         return "blocked"
     if triage:
@@ -2263,13 +2378,19 @@ def get_task(conn: sqlite3.Connection, task_id: str) -> Optional[Task]:
 def get_task_by_idempotency_key(
     conn: sqlite3.Connection, idempotency_key: Optional[str]
 ) -> Optional[Task]:
-    """Return the newest active task for an idempotent create replay."""
+    """Return the newest active task for an idempotent create replay.
+
+    Non-active rows (``NON_ACTIVE_STATUSES``: ``archived`` plus the wishlist lanes) never
+    match. A lane card is not live work, so letting one answer the replay would suppress the
+    real create it was meant to deduplicate — the same reason ``archived`` was excluded.
+    """
     if not idempotency_key:
         return None
+    placeholders = ", ".join("?" * len(NON_ACTIVE_STATUSES))
     row = conn.execute(
-        "SELECT * FROM tasks WHERE idempotency_key = ? AND status != 'archived' "
+        f"SELECT * FROM tasks WHERE idempotency_key = ? AND status NOT IN ({placeholders}) "
         "ORDER BY created_at DESC LIMIT 1",
-        (idempotency_key,),
+        (idempotency_key, *sorted(NON_ACTIVE_STATUSES)),
     ).fetchone()
     return Task.from_row(row) if row else None
 
@@ -2915,6 +3036,68 @@ def _append_event(
     )
 
 
+def _copy_run_session_analytics(conn: sqlite3.Connection, run_id: int) -> None:
+    """Best-effort copy of one worker session's usage totals onto its run.
+
+    Session state is profile-scoped and may be missing, busy, or on an older
+    schema. Finalizing the Kanban run must always win over analytics capture, so
+    every lookup failure is reduced to one debug line and leaves the nullable
+    columns untouched.
+    """
+    row = conn.execute(
+        "SELECT profile, session_id FROM task_runs WHERE id = ?", (int(run_id),),
+    ).fetchone()
+    if row is None or not row["session_id"] or not row["profile"]:
+        return
+
+    session_id = str(row["session_id"])
+    profile = str(row["profile"])
+    state_conn: Optional[sqlite3.Connection] = None
+    try:
+        from hermes_cli.profiles import resolve_profile_env
+
+        state_path = Path(resolve_profile_env(profile)) / "state.db"
+        state_conn = sqlite3.connect(f"{state_path.resolve().as_uri()}?mode=ro", uri=True)
+        state_conn.row_factory = sqlite3.Row
+        usage = state_conn.execute(
+            """
+            SELECT input_tokens, output_tokens, cache_read_tokens,
+                   reasoning_tokens, api_call_count, tool_call_count,
+                   estimated_cost_usd
+              FROM sessions
+             WHERE id = ?
+            """,
+            (session_id,),
+        ).fetchone()
+        if usage is None:
+            raise LookupError("session row not found")
+        conn.execute(
+            """
+            UPDATE task_runs
+               SET input_tokens = ?, output_tokens = ?, cache_read_tokens = ?,
+                   reasoning_tokens = ?, api_calls = ?, tool_calls = ?,
+                   estimated_cost_usd = ?
+             WHERE id = ?
+            """,
+            (
+                usage["input_tokens"], usage["output_tokens"], usage["cache_read_tokens"],
+                usage["reasoning_tokens"], usage["api_call_count"], usage["tool_call_count"],
+                usage["estimated_cost_usd"], int(run_id),
+            ),
+        )
+    except Exception as exc:
+        _log.debug(
+            "kanban run analytics unavailable for run=%s profile=%s session=%s (%s)",
+            run_id,
+            profile,
+            session_id,
+            exc,
+        )
+    finally:
+        if state_conn is not None:
+            state_conn.close()
+
+
 def _end_run(
     conn: sqlite3.Connection, task_id: str, *, outcome: str, summary: Optional[str] = None,
     error: Optional[str] = None, metadata: Optional[dict] = None, status: Optional[str] = None,
@@ -2942,6 +3125,7 @@ def _end_run(
         """,
         (status or outcome, outcome, summary, error, _json_or_null(metadata), now, run_id),
     )
+    _copy_run_session_analytics(conn, run_id)
     conn.execute("UPDATE tasks SET current_run_id = NULL WHERE id = ?", (task_id,))
     return run_id
 
@@ -3035,13 +3219,19 @@ def _has_sticky_block(conn: sqlite3.Connection, task_id: str) -> bool:
     deliberately excluded from this scan (see ``_gave_up_was_force_tripped`` for the force-tripped
     subset that IS sticky) so a synthetic/legacy ``gave_up`` appended after a genuine worker
     ``blocked`` event can never mask it — only ``unblocked`` ends a worker/operator block.
+
+    ``review_round_cap`` (the dispatcher's hard stop on a runaway
+    review<->changes_requested loop, ``kanban.max_review_rounds``) is sticky for the
+    same reason as ``review_no_verdict``: without an explicit ``kanban_unblock`` the
+    card would immediately re-trip the cap on the very next tick since the round
+    count itself never resets on unblock (only ``complete_task`` clears it).
     """
     row = conn.execute(
         "SELECT kind FROM task_events "
-        "WHERE task_id = ? AND kind IN ('blocked', 'unblocked', 'review_no_verdict') "
+        "WHERE task_id = ? AND kind IN ('blocked', 'unblocked', 'review_no_verdict', 'review_round_cap') "
         "ORDER BY id DESC LIMIT 1", (task_id,),
     ).fetchone()
-    return bool(row) and row["kind"] in ("blocked", "review_no_verdict")
+    return bool(row) and row["kind"] in ("blocked", "review_no_verdict", "review_round_cap")
 
 
 def _gave_up_was_force_tripped(conn: sqlite3.Connection, task_id: str) -> bool:
@@ -3090,7 +3280,7 @@ def _resume_status_from_events(conn: sqlite3.Connection, task_id: str) -> str:
         "'blocked', 'block_loop_detected', 'dependency_wait', 'gave_up', "
         "'unblocked', 'changes_requested', 'review_reopened', 'status', 'reclaimed', "
         "'stale', 'timed_out', 'crashed', 'spawn_failed', 'rate_limited', 'held', "
-        "'review_no_verdict'"
+        "'review_no_verdict', 'review_round_cap'"
         ") ORDER BY id DESC LIMIT 1", (task_id,),
     ).fetchone()
     payload = _json_dict(_row_get(row, "payload"))
@@ -3475,6 +3665,9 @@ def release_stale_claims(conn: sqlite3.Connection, *, signal_fn=None) -> int:
                 reason="ttl_expired_worker_alive",
             )
             continue
+        # Preserve before the claim is released: a retry can be spawned onto
+        # this worktree on the very next tick.
+        _preserve_task_work(conn, row["id"])
         with write_txn(conn):
             retry_status = _retry_status_for_run(conn, row["id"])
             cur = conn.execute(
@@ -3571,6 +3764,11 @@ def reclaim_task(
     termination = _terminate_reclaimed_worker(
         row["worker_pid"], prev_lock, signal_fn=signal_fn, worker_unit=row["worker_unit"],
     )
+    # Preserve BEFORE releasing the claim: once the task returns to the pool a
+    # retry can be spawned onto the same worktree, and this run's uncommitted
+    # output would be indistinguishable from the next run's. The worker was
+    # just terminated, so the ownership gate sees a dead pid.
+    _preserve_task_work(conn, task_id)
     with write_txn(conn):
         retry_status = _retry_status_for_run(conn, task_id)
         cur = conn.execute(
@@ -3735,6 +3933,10 @@ def complete_task(
         # reopened while this task waited.
         if not _parents_satisfied(conn, task_id):
             return False
+        # Captured BEFORE the UPDATE below clears worker_pid: preservation's
+        # ownership gate must see the pid as it was during the live run, not
+        # the post-clear NULL this same transaction is about to produce.
+        captured_run_id, captured_worker_pid = _capture_worker_identity(conn, task_id)
         prior_status = _task_status(conn, task_id)
         sql = """
                 UPDATE tasks
@@ -3792,6 +3994,15 @@ def complete_task(
     # Success wipes the breaker counter (history stays on the event log).
     _clear_failure_counter(conn, task_id)
     recompute_ready(conn)  # separate txn so children see ``done``
+    # Preserve BEFORE cleanup: _cleanup_workspace only removes a worktree that
+    # is clean and fully pushed, so a successful snapshot is exactly what lets
+    # the worktree be reclaimed — and a refused one keeps it for a human.
+    _preserve_task_work(
+        conn,
+        task_id,
+        expected_run_id=captured_run_id,
+        known_worker_pid=captured_worker_pid,
+    )
     _cleanup_workspace(conn, task_id)
     _done_task = get_task(conn, task_id)
     if fire_lifecycle_hook:
@@ -3800,6 +4011,52 @@ def complete_task(
 
 
 _REVIEW_APPROVED_NOTE = "Review approved without additional evidence."
+
+
+def _capture_worker_identity(
+    conn: sqlite3.Connection, task_id: str,
+) -> tuple[Optional[int], Optional[int]]:
+    """Read the active run and PID before a lifecycle UPDATE clears ownership.
+
+    Both values are required. The PID protects a still-running worker after the
+    row is cleared; the run id makes the later preservation call reject a new
+    claim that landed after this transaction committed.
+    """
+    row = conn.execute(
+        "SELECT current_run_id, worker_pid FROM tasks WHERE id = ?", (task_id,),
+    ).fetchone()
+    if row is None:
+        return None, None
+    run_id = int(row["current_run_id"]) if row["current_run_id"] is not None else None
+    worker_pid = int(row["worker_pid"]) if row["worker_pid"] is not None else None
+    return run_id, worker_pid
+
+
+def _preserve_task_work(
+    conn: sqlite3.Connection, task_id: str, *, expected_run_id: Optional[int] = None,
+    known_worker_pid: Optional[int] = None,
+) -> None:
+    """Fire the worker-preservation safety net for a task whose run is ending.
+
+    Commit + push only: see :mod:`hermes_cli.kanban_preserve`. Best-effort and
+    late-bound — a lifecycle transition must never fail because preservation
+    could not run, and the import lives here so the preservation module can
+    import ``kanban_db`` back without a cycle.
+
+    Lifecycle paths capture both ``current_run_id`` and ``worker_pid`` before
+    clearing ownership. The run id detects a new claim between the transaction
+    and this call; the PID still protects a live old worker after the row was
+    cleared. Reclaim paths preserve before clearing and use the row directly.
+    """
+    try:
+        from hermes_cli import kanban_preserve
+
+        kanban_preserve.preserve_task_work(
+            conn, task_id, expected_run_id=expected_run_id,
+            known_worker_pid=known_worker_pid,
+        )
+    except Exception:
+        _log.debug("kanban: work preservation unavailable for task %s", task_id)
 
 
 def _gate_created_cards(
@@ -4101,6 +4358,9 @@ def block_task(
         ).fetchone()
         if cur_row is None:
             return False
+        # Captured BEFORE the UPDATE below clears worker_pid — see
+        # complete_task's identical comment for why this matters.
+        captured_run_id, captured_worker_pid = _capture_worker_identity(conn, task_id)
         source_status = _retry_status_for_run(conn, task_id) if cur_row["status"] == "running" else "ready"
         new_status, event_kind, set_sql, params, payload = _route_block(
             kind, reason, source_status, prev_kind=_row_get(cur_row, "block_kind"),
@@ -4128,10 +4388,21 @@ def block_task(
         )
         _append_event(conn, task_id, event_kind, payload, run_id=run_id)
         blocked_task = get_task(conn, task_id)
-        if kind == "dependency":
+        dependency_lane = kind == "dependency"
+        if dependency_lane:
             # Historical ordering: the dependency lane fires inside the txn.
             _fire_task_hook("kanban_task_blocked", blocked_task, task_id, run_id, reason=reason)
-            return True
+    # Blocking ends this run, so the worker's output must be preserved before
+    # anything else can reclaim the workspace. Outside the write txn: the
+    # snapshot records its own event.
+    _preserve_task_work(
+        conn,
+        task_id,
+        expected_run_id=captured_run_id,
+        known_worker_pid=captured_worker_pid,
+    )
+    if dependency_lane:
+        return True
     _fire_task_hook("kanban_task_blocked", blocked_task, task_id, run_id, reason=reason)
     return True
 
@@ -4176,6 +4447,23 @@ def redact_review_value(value: Any) -> Any:
     if isinstance(value, tuple):
         return tuple(redact_review_value(item) for item in value)
     return value
+
+
+def _review_round(conn: sqlite3.Connection, task_id: str) -> int:
+    """1 + the count of ``changes_requested`` events since the task's last
+    ``completed`` event (or since task creation if it has never completed).
+    Computed server-side so callers cannot spoof or drift the count."""
+    completed = conn.execute(
+        "SELECT id FROM task_events WHERE task_id = ? AND kind = 'completed' "
+        "ORDER BY id DESC LIMIT 1", (task_id,),
+    ).fetchone()
+    since_id = completed["id"] if completed else 0
+    row = conn.execute(
+        "SELECT COUNT(*) AS n FROM task_events "
+        "WHERE task_id = ? AND kind = 'changes_requested' AND id > ?",
+        (task_id, since_id),
+    ).fetchone()
+    return int(row["n"]) + 1
 
 
 def request_review(
@@ -4227,12 +4515,18 @@ def request_review(
         if not _parents_satisfied(conn, task_id):
             return _ret(False, "parent dependencies are not satisfied")
         trow = conn.execute(
-            "SELECT assignee, status, claim_lock, current_run_id, "
+            "SELECT assignee, status, claim_lock, current_run_id, worker_pid, "
             "model_override, provider_override, reasoning_effort "
             "FROM tasks WHERE id = ?", (task_id,),
         ).fetchone()
         if trow is None:
             return _ret(False, "task not found")
+        # Captured BEFORE the UPDATE below clears worker_pid — see
+        # complete_task's identical comment for why this matters.
+        captured_run_id = (
+            int(trow["current_run_id"]) if trow["current_run_id"] is not None else None
+        )
+        captured_worker_pid = int(trow["worker_pid"]) if trow["worker_pid"] is not None else None
         # Refuse to clear a live worker's claim without proof of ownership
         # (expected_run_id) or an explicit human override (force=True).
         if (
@@ -4302,6 +4596,7 @@ def request_review(
             "summary": _first_line(summary, 400) or None,
             "implementer": implementer,
             "reviewer": reviewer,
+            "review_round": _review_round(conn, task_id),
         }
         if cross_profile:
             # Preserved (not just deleted) so request_changes can restore the
@@ -4311,6 +4606,14 @@ def request_review(
             if implementer_reasoning_effort is not None:
                 event_payload["implementer_reasoning_effort"] = implementer_reasoning_effort
         _append_event(conn, task_id, "review_requested", event_payload, run_id=run_id)
+    # The implementation run just ended; preserve its output before the review
+    # lane (or any reclaim) can touch the workspace.
+    _preserve_task_work(
+        conn,
+        task_id,
+        expected_run_id=captured_run_id,
+        known_worker_pid=captured_worker_pid,
+    )
     return _ret(True)
 
 
@@ -4336,13 +4639,18 @@ def _nonblank_str(value: Any) -> Optional[str]:
 
 def request_changes(
     conn: sqlite3.Connection, task_id: str, *, reason: str, expected_run_id: Optional[int] = None,
+    metadata: Optional[dict] = None,
 ) -> tuple[bool, Optional[str]]:
     """Close an active reviewer run (claimed from ``review``) and hand the task
     back to the implementer from the latest ``review_requested`` event, parent
-    gating reapplied. Returns ``(ok, implementer | reason)``."""
+    gating reapplied. Returns ``(ok, implementer | reason)``.
+
+    ``metadata`` lands on the closing run (same handoff contract as
+    :func:`request_review`) and is redacted the same way."""
     reason = str(redact_review_value(reason or "")).strip()
     if not reason:
         return False, "reason is required"
+    metadata = redact_review_value(metadata)
 
     with write_txn(conn):
         task_row = conn.execute(
@@ -4437,6 +4745,7 @@ def request_changes(
             return False, "task changed during review handoff"
         run_id = _end_run(
             conn, task_id, outcome="changes_requested", status=new_status, summary=reason,
+            metadata=metadata,
         )
         _append_event(
             conn,
@@ -4447,6 +4756,7 @@ def request_changes(
                 "implementer": implementer,
                 "reviewer": reviewer,
                 "status": new_status,
+                "review_round": _review_round(conn, task_id),
             },
             run_id=run_id,
         )
@@ -4953,6 +5263,36 @@ def _insert_decomposed_child(
     return new_id
 
 
+def _clear_satisfied_outgoing_links(conn: sqlite3.Connection, task_id: str) -> list[str]:
+    """Drop the child edges an archived task can never gate again.
+
+    A completed task's dependency edge is satisfied *permanently* —
+    :func:`_parent_dependency_satisfied` keys off ``completed_at``, which only
+    the completion lifecycle writes, so no future state re-gates the child.
+    Keeping the row past that point is pure debt: an archived parent is absent
+    from the board payload, so every surface that resolves links against the
+    active view (the Desktop drawer's ``resolveLinks``) can only report it as an
+    unresolvable — and therefore conservatively still-gating — blocker.
+
+    An archived task WITHOUT ``completed_at`` was withdrawn, not finished; its
+    edges stay so the child keeps showing a real block. Edges where ``task_id``
+    is the CHILD are dependency history belonging to the surviving parent and
+    are never touched here. Returns the child ids whose edges were removed.
+    """
+    row = conn.execute("SELECT status, completed_at FROM tasks WHERE id = ?", (task_id,)).fetchone()
+    if row is None or not _parent_dependency_satisfied(row):
+        return []
+    children = [
+        r["child_id"]
+        for r in conn.execute(
+            "SELECT child_id FROM task_links WHERE parent_id = ? ORDER BY child_id", (task_id,),
+        ).fetchall()
+    ]
+    if children:
+        conn.execute("DELETE FROM task_links WHERE parent_id = ?", (task_id,))
+    return children
+
+
 def archive_task(
     conn: sqlite3.Connection, task_id: str, *, expected_status: Optional[str] = None,
 ) -> bool:
@@ -4963,6 +5303,16 @@ def archive_task(
     the write lock. The normal single-card archive remains status-agnostic.
     """
     with write_txn(conn):
+        # Captured BEFORE the UPDATE below clears worker_pid: archive is
+        # status-agnostic and — unlike complete/block/request_review — never
+        # terminates a running worker, so a task archived mid-run can still
+        # have a live process editing the worktree. Preservation's ownership
+        # gate must see that pid, not the NULL this same UPDATE is about to
+        # write, or it would race the live worker and commit its half-written
+        # tree (or let cleanup remove the worktree out from under it).
+        captured_run_id, captured_worker_pid = _capture_worker_identity(conn, task_id)
+        prior = conn.execute("SELECT status FROM tasks WHERE id = ?", (task_id,)).fetchone()
+        from_status = prior["status"] if prior is not None else None
         sql = (
             "UPDATE tasks SET status = 'archived', "
             "    claim_lock = NULL, claim_expires = NULL, worker_pid = NULL, worker_unit = NULL "
@@ -4980,13 +5330,43 @@ def archive_task(
             conn, task_id, outcome="reclaimed", status="reclaimed",
             summary="task archived with run still active",
         )
-        _append_event(conn, task_id, "archived", None, run_id=run_id)
+        cleared_children = _clear_satisfied_outgoing_links(conn, task_id)
+        # ``from_status`` is what makes archival reversible as an audit fact: the row itself
+        # keeps no memory of where it came from, so without this ``unarchive_task`` cannot tell
+        # a former wishlist card from ordinary work and the lane exit goes unrecorded.
+        payload: dict[str, Any] = {"from_status": from_status}
+        if cleared_children:
+            payload["cleared_child_links"] = cleared_children
+        _append_event(conn, task_id, "archived", payload, run_id=run_id)
     # Completed parents preserve their dependency satisfaction after archival;
     # incomplete archived parents remain gated. Re-evaluate children now either way.
     recompute_ready(conn)
     # Reap the workspace on archive too (never-completed tasks kept it forever).
+    # Preservation first: archive is the last chance to rescue work from a task
+    # that never completed, and cleanup will only remove what it saved.
+    _preserve_task_work(
+        conn,
+        task_id,
+        expected_run_id=captured_run_id,
+        known_worker_pid=captured_worker_pid,
+    )
     _cleanup_workspace(conn, task_id)
     return True
+
+
+def _archived_from_status(conn: sqlite3.Connection, task_id: str) -> Optional[str]:
+    """The status this task held immediately before its most recent archival.
+
+    Read from the newest ``archived`` event's ``from_status``. Events written before that
+    field existed return ``None``: the provenance was never persisted, and guessing one
+    would fabricate audit history rather than recover it.
+    """
+    row = conn.execute(
+        "SELECT payload FROM task_events WHERE task_id = ? AND kind = 'archived' "
+        "ORDER BY id DESC LIMIT 1", (task_id,),
+    ).fetchone()
+    value = _json_dict(_row_get(row, "payload")).get("from_status")
+    return value if isinstance(value, str) else None
 
 
 def unarchive_task(conn: sqlite3.Connection, task_id: str, *, status: str = "todo") -> bool:
@@ -4997,6 +5377,10 @@ def unarchive_task(conn: sqlite3.Connection, task_id: str, *, status: str = "tod
     Reopening archived-completed work also clears its completion evidence and
     atomically retracts descendants that relied on that evidence. Any running
     descendant is terminated only after the invalidation audit trail commits.
+
+    A card archived out of a wishlist lane also gets a ``spawned_from_roadmap``
+    event here: archive+unarchive is a second, quieter route out of a lane into
+    live work, and it must leave the same audit mark the ``spawn`` verb does.
     """
     if status not in {"triage", "todo", "ready"}:
         raise ValueError("unarchived tasks must land in triage, todo, or ready")
@@ -5009,6 +5393,11 @@ def unarchive_task(conn: sqlite3.Connection, task_id: str, *, status: str = "tod
         if archived is None or archived["status"] != "archived":
             return False
         reopening_satisfied_parent = _parent_dependency_satisfied(archived)
+        # Note: archival already deleted this task's outgoing (parent_id) edges
+        # when it was completed, so the invalidation sweep below only reaches
+        # children linked AFTER that archive. Reopened work re-gates via
+        # invalidate_descendants_for_parent_reopen; the cleared edges are gone
+        # for good and are not resurrected here.
         if target == "ready" and not _parents_satisfied(conn, task_id):
             target = "todo"
         cur = conn.execute(
@@ -5019,6 +5408,16 @@ def unarchive_task(conn: sqlite3.Connection, task_id: str, *, status: str = "tod
         if cur.rowcount != 1:
             return False
         _append_event(conn, task_id, "unarchived", {"status": target})
+        # A card that was archived out of a wishlist lane is leaving the lane for live work
+        # right now. ``spawn_roadmap_task`` is the only other exit and it stamps this event;
+        # archive+unarchive must not be a quieter way to make the same move. Legacy rows
+        # archived before ``from_status`` was recorded carry no lane provenance and get no
+        # event — nothing persisted it and it cannot be reconstructed.
+        if _archived_from_status(conn, task_id) in ROADMAP_LANE_STATUSES:
+            _append_event(
+                conn, task_id, "spawned_from_roadmap",
+                {"status": target, "via": "unarchive"},
+            )
         if reopening_satisfied_parent:
             result = invalidate_descendants_for_parent_reopen(
                 conn, task_id, author="operator",
@@ -5091,7 +5490,8 @@ def schedule_task(
                SET status       = 'scheduled',
                    claim_lock   = NULL,
                    claim_expires= NULL,
-                   worker_pid   = NULL
+                   worker_pid   = NULL,
+                   worker_unit  = NULL
              WHERE id = ?
                AND status IN ('todo', 'ready', 'running', 'blocked')
         """
@@ -5123,7 +5523,8 @@ def hold_task(
                SET status       = 'on_hold',
                    claim_lock   = NULL,
                    claim_expires= NULL,
-                   worker_pid   = NULL
+                   worker_pid   = NULL,
+                   worker_unit  = NULL
              WHERE id = ?
                AND status IN ('todo', 'triage', 'ready', 'running', 'blocked', 'scheduled')
         """
@@ -5137,6 +5538,98 @@ def hold_task(
         )
         _append_event(conn, task_id, "held", {"reason": reason}, run_id=run_id)
         return True
+
+
+# --- Roadmap lanes (idea / roadmap) ---
+#
+# The lanes are inert: nothing selects them, so the ONLY way a card leaves one is an explicit
+# operator verb here (or ``archive_task``). Every transition is a status-guarded CAS inside
+# ``write_txn`` mirroring ``hold_task``'s shape, and a refused transition raises ``ValueError``
+# naming the attempted from->to so a caller never has to guess why nothing moved.
+
+# Allowed lane transitions, ``from -> {to, ...}``. Deliberately one-directional out of the
+# wishlist: no live status may move INTO a lane (a card enters only at creation), so the existing
+# ``unblock``/``hold`` habits can never park real work here and ``on_hold`` keeps its meaning.
+ROADMAP_LANE_TRANSITIONS: dict[str, frozenset[str]] = {
+    "idea": frozenset({"roadmap", "archived"}),
+    "roadmap": frozenset({"triage", "ready", "idea", "archived"}),
+}
+
+# Where ``spawn_roadmap_task`` may land a card. ``triage`` is the default: the operator's standing
+# decision is to always let auto_decompose re-specify/split a roadmap item before it executes.
+ROADMAP_SPAWN_TARGETS = frozenset({"triage", "ready"})
+
+
+def _lane_transition(
+    conn: sqlite3.Connection, task_id: str, *, to: str, event: str,
+    payload: Optional[dict] = None, parent_gated: bool = False,
+) -> bool:
+    """Move ``task_id`` out of a roadmap lane into ``to``, appending ``event``.
+
+    Raises ``ValueError`` naming ``from -> to`` when the task's current status may not make this
+    move (including every live status, which can never enter a lane). Returns ``False`` only when
+    the row vanished mid-transaction.
+
+    ``parent_gated`` routes a ``ready`` landing through ``_landing_status_after_parents``, the
+    same re-gate ``unblock_task``/``promote_task``/``unarchive_task`` use, so a lane card linked
+    under an unfinished parent lands in ``todo`` instead of rendering as bogus ``ready`` until
+    ``claim_task`` refuses it. The gate downgrades the LANDING only — ``to`` is still validated
+    against ``ROADMAP_LANE_TRANSITIONS`` first, so it can never widen what an operator may ask
+    for. Only ``ready`` is parent-gated; ``triage`` is not a gated status.
+    """
+    with write_txn(conn):
+        row = conn.execute("SELECT status FROM tasks WHERE id = ?", (task_id,)).fetchone()
+        if row is None:
+            raise ValueError(f"unknown task {task_id}")
+        current = row["status"]
+        if to not in ROADMAP_LANE_TRANSITIONS.get(current, frozenset()):
+            raise ValueError(
+                f"invalid roadmap lane transition for {task_id}: {current!r} -> {to!r} "
+                f"(allowed from {current!r}: "
+                f"{sorted(ROADMAP_LANE_TRANSITIONS.get(current, frozenset())) or 'nothing'})"
+            )
+        landing = to
+        if parent_gated and to == "ready":
+            landing = _landing_status_after_parents(conn, task_id)
+        if landing != to:
+            payload = {**(payload or {}), "status": landing, "requested_status": to}
+        cur = conn.execute(
+            "UPDATE tasks SET status = ? WHERE id = ? AND status = ?", (landing, task_id, current),
+        )
+        if cur.rowcount != 1:
+            return False
+        _append_event(conn, task_id, event, payload)
+        return True
+
+
+def refine_task(conn: sqlite3.Connection, task_id: str) -> bool:
+    """``idea -> roadmap``: the item has been hashed out with the operator. Still inert —
+    refining authorizes nothing, it only says the shape is agreed."""
+    return _lane_transition(conn, task_id, to="roadmap", event="refined")
+
+
+def demote_task(conn: sqlite3.Connection, task_id: str) -> bool:
+    """``roadmap -> idea``: send a hashed-out item back to rough capture."""
+    return _lane_transition(conn, task_id, to="idea", event="demoted")
+
+
+def spawn_roadmap_task(conn: sqlite3.Connection, task_id: str, *, to: str = "triage") -> bool:
+    """``roadmap -> triage`` (default) or ``ready``: authorize the item to execute.
+
+    ``triage`` is the default so auto_decompose gets to re-specify/split it first; ``to="ready"``
+    is the explicit opt-out for an item that is already a single well-formed task. This is the
+    only path from the wishlist into live work — ``idea`` must be refined first.
+
+    ``ready`` is parent-gated exactly as every other entry into ``ready`` is: a card whose
+    parents are unfinished lands in ``todo`` and auto-promotes later, and the
+    ``spawned_from_roadmap`` payload records both the real landing and the ``requested_status``.
+    """
+    if to not in ROADMAP_SPAWN_TARGETS:
+        raise ValueError(f"spawn target must be one of {sorted(ROADMAP_SPAWN_TARGETS)}, got {to!r}")
+    return _lane_transition(
+        conn, task_id, to=to, event="spawned_from_roadmap", payload={"status": to},
+        parent_gated=True,
+    )
 
 
 def unhold_task(conn: sqlite3.Connection, task_id: str) -> bool:
@@ -5384,7 +5877,11 @@ def _ctx_comments(lines: list[str], comments: list[Comment], now: int) -> None:
 # --- Stats + SLA helpers ---
 
 def board_stats(conn: sqlite3.Connection) -> dict:
-    """Per-status + per-assignee counts and the oldest ``ready`` age (staleness signal)."""
+    """Per-status + per-assignee counts and the oldest ``ready`` age (staleness signal).
+
+    ``by_status`` reports the roadmap lanes (they are real cards on the board), but they are
+    excluded from ``active_total`` — a wishlist item is not work in flight, so it must not make
+    a quiet board look busy to any health/cost rule that asks "is anything live?"."""
     by_status: dict[str, int] = {}
     for row in conn.execute(
         "SELECT status, COUNT(*) AS n FROM tasks "
@@ -5406,6 +5903,12 @@ def board_stats(conn: sqlite3.Connection) -> dict:
     return {
         "by_status": by_status,
         "by_assignee": by_assignee,
+        "active_total": sum(
+            n for s, n in by_status.items() if s not in NON_ACTIVE_STATUSES
+        ),
+        "roadmap_total": sum(
+            n for s, n in by_status.items() if s in ROADMAP_LANE_STATUSES
+        ),
         "oldest_ready_age_seconds": oldest_ready_age,
         "now": now,
     }

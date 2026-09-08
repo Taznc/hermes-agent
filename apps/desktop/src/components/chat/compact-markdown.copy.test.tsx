@@ -71,4 +71,21 @@ describe('CompactMarkdown fenced code copy control', () => {
 
     await waitFor(() => expect(screen.getByRole('button', { name: 'Copy failed' })).toBeTruthy(), { timeout: 5000 })
   })
+
+  it('renders a raw HTML <pre> with a bare text child without throwing, and shows no copy button', () => {
+    // Streamdown passes raw HTML through; a bare `<pre>text</pre>` (no `<code>`
+    // wrapper) hands MarkdownPre a text child, not a React element. The old
+    // `Children.count(children) === 1 ? Children.only(children) : null` guard
+    // checked count, not element-ness, and `Children.only` throws on a text
+    // child — blanking the whole chat window (no error boundary above this).
+    render(
+      <I18nProvider configClient={null} initialLocale="en">
+        <CompactMarkdown text={'Page content.\n\n<pre>\n$ npm run build\ndone\n</pre>\n\nEnd.'} />
+      </I18nProvider>
+    )
+
+    expect(screen.getByText(/Page content\./)).toBeTruthy()
+    expect(screen.getByText(/End\./)).toBeTruthy()
+    expect(screen.queryByRole('button', { name: 'Copy code' })).toBeNull()
+  })
 })

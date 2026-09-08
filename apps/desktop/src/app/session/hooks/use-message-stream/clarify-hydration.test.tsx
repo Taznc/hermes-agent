@@ -170,6 +170,21 @@ describe('clarify.request stream hydration', () => {
     expect(clarifyParts()).toHaveLength(1)
   })
 
+  it('keeps the same owned card answerable when reconnect replays its request', () => {
+    mountStream()
+
+    toolStart({ args: { choices: ['a'], question: 'Pick' }, name: 'clarify', tool_id: 'call-reconnect' })
+    clarifyRequest({ choices: ['a'], question: 'Pick', request_id: 'req-reconnect' })
+    // `session.resume` replays the still-pending request through the normal
+    // stream event. It must re-arm the original card, not create a second one
+    // or clear the request before the user acts.
+    clarifyRequest({ choices: ['a'], question: 'Pick', request_id: 'req-reconnect' })
+
+    expect($clarifyRequests.get()[SID]?.requestId).toBe('req-reconnect')
+    expect(clarifyParts()).toHaveLength(1)
+    expect(clarifyParts()[0]).not.toHaveProperty('result')
+  })
+
   it('re-arms a hydrated Codex tool-only clarify in place instead of appending a second card', () => {
     mountStream()
 
@@ -425,5 +440,60 @@ describe('clarify.request stream hydration', () => {
 
     expect(clarifyParts()).toHaveLength(1)
     expect($clarifyRequests.get()[SID]?.questions).toHaveLength(2)
+  })
+
+  // The projection half of the buried-payload bug (t_08995d7c). The renderer
+  // card can only paint a question it can find in the tool part's `args`, so a
+  // pending clarify row must keep them across every path that rebuilds the
+  // transcript — including the one where the parked request is gone.
+  it('keeps a pending clarify row answerable-from-args when no request is parked', () => {
+    mountStream()
+
+    toolStart({
+      args: { questions: [{ choices: ['a', 'b'], question: 'Where should it live?' }] },
+      name: 'clarify',
+      tool_id: 'call-orphan'
+    })
+    clarifyRequest({
+      questions: [{ qid: 'q0', question: 'Where should it live?' }],
+      request_id: 'req-orphan'
+    })
+
+    // A transport drop clears the parked request; the tool itself is still
+    // blocked server-side, so the row must stay pending WITH its args.
+    act(() => clearClarifyRequest('req-orphan', SID))
+
+    const parts = clarifyParts()
+    expect(parts).toHaveLength(1)
+    expect(parts[0]).not.toHaveProperty('result')
+    expect(parts[0].type === 'tool-call' && parts[0].args).toMatchObject({
+      questions: [{ choices: ['a', 'b'], question: 'Where should it live?' }]
+    })
+  })
+
+  it('re-arms that same orphaned row on replay instead of appending a second one', () => {
+    mountStream()
+
+    toolStart({
+      args: { questions: [{ choices: ['a', 'b'], question: 'Where should it live?' }] },
+      name: 'clarify',
+      tool_id: 'call-replay'
+    })
+    clarifyRequest({
+      questions: [{ qid: 'q0', question: 'Where should it live?' }],
+      request_id: 'req-replay'
+    })
+    act(() => clearClarifyRequest('req-replay', SID))
+
+    // `session.resume` replays the still-pending request after reconnect.
+    clarifyRequest({
+      questions: [{ qid: 'q0', question: 'Where should it live?' }],
+      request_id: 'req-replay'
+    })
+
+    expect(clarifyParts()).toHaveLength(1)
+    expect(clarifyParts()[0]).not.toHaveProperty('result')
+    expect($clarifyRequests.get()[SID]?.requestId).toBe('req-replay')
+    expect(stream.state().needsInput).toBe(true)
   })
 })

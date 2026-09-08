@@ -65,6 +65,24 @@ def _dispatch_pause_message(state: dict, *, board: Optional[str] = None) -> str:
 
 def _cmd_dispatch(args: argparse.Namespace) -> int:
     board = getattr(args, "board", None)
+    pause_note = getattr(args, "pause", None)
+    if pause_note is not None:
+        paused = kbd.pause_dispatch(board, note=" ".join(pause_note).strip() or None)
+        if getattr(args, "json", False):
+            _print_json(paused, ascii=True)
+        if not paused.get("paused", False):
+            if not getattr(args, "json", False):
+                print(
+                    f"Dispatch for {board or kb.DEFAULT_BOARD} was not paused: "
+                    "a dispatch tick is in progress; retry --pause."
+                )
+            return 1
+        if not getattr(args, "json", False):
+            print(
+                f"Dispatch for {board or kb.DEFAULT_BOARD}: "
+                f"{_dispatch_pause_message(paused['state'], board=board)}"
+            )
+        return 0
     if getattr(args, "resume_circuit", False):
         cleared = kbd.resume_dispatch(board)
         if getattr(args, "json", False):
@@ -116,6 +134,7 @@ def _cmd_dispatch(args: argparse.Namespace) -> int:
             dispatch_start_budget=caps.dispatch_start_budget,
             dispatch_start_window_seconds=caps.dispatch_start_window_seconds,
             review_rework_escalation_profile=caps.review_rework_escalation_profile,
+            max_review_rounds=caps.max_review_rounds,
         )
     if getattr(args, "json", False):
         _print_json({

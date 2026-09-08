@@ -226,9 +226,16 @@ def specify_task(
 
 def list_triage_ids(*, tenant: Optional[str] = None) -> list[str]:
     """Task ids in the triage column; ``tenant`` narrows the sweep. Tasks parked in triage by the
-    unblock-loop breaker (``block_recurrences >= BLOCK_RECURRENCE_LIMIT``) are EXCLUDED — re-specifying
-    them would promote them straight back into the same block loop every tick; see
-    ``kanban_decompose.list_triage_ids``."""
+    unblock-loop breaker for a genuine human-decision gate (``block_recurrences >=
+    BLOCK_RECURRENCE_LIMIT`` AND ``block_kind == "needs_input"``) are EXCLUDED — re-specifying
+    them would promote them straight back into the same block loop every tick, and a
+    ``needs_input`` cause is "a human has not decided yet", which re-specifying cannot resolve.
+    A loop-broken task whose last block kind was ``capability``/``transient``/legacy-``None`` is
+    NOT excluded here: those can be genuine scope/fanout problems that a tightened spec fixes, so
+    they stay eligible for this sweep. See ``kanban_decompose.list_triage_ids``."""
     with kbc.connect_closing() as conn:
         tasks = kb.list_tasks(conn, status="triage", tenant=tenant, include_archived=False)
-    return [t.id for t in tasks if (t.block_recurrences or 0) < kb.BLOCK_RECURRENCE_LIMIT]
+    return [
+        t.id for t in tasks
+        if not ((t.block_recurrences or 0) >= kb.BLOCK_RECURRENCE_LIMIT and t.block_kind == "needs_input")
+    ]

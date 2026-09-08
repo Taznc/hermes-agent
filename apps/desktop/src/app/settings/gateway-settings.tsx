@@ -13,6 +13,7 @@ import type {
 } from '@/global'
 import { useI18n } from '@/i18n'
 import { ExternalLink } from '@/lib/external-link'
+import { connectionsManagedByHost } from '@/lib/host-connections'
 import {
   AlertCircle,
   Check,
@@ -36,7 +37,8 @@ import { notify, notifyError, readableError } from '@/store/notifications'
 import { ConnectionsRegistrySection } from './connections-registry'
 import { CONTROL_TEXT } from './constants'
 import { ManagedUpdatesSection } from './managed-updates-section'
-import { EmptyState, ListRow, Pill, SettingsContent, SettingsSkeleton, ToggleRow } from './primitives'
+import { ListRow, Pill, SettingsContent, SettingsSkeleton, ToggleRow } from './primitives'
+import { SingleBackendNotice } from './single-backend-notice'
 import { enrichSelectedSshHost, selectSshHost } from './ssh-host-selection'
 
 type Mode = 'local' | 'remote' | 'cloud' | 'ssh'
@@ -1193,8 +1195,20 @@ export function GatewaySettings({ embedded = false }: { embedded?: boolean } = {
     )
   }
 
-  if (!window.hermesDesktop?.getConnectionConfig) {
-    return <EmptyState description={g.unavailableDesc} title={g.unavailableTitle} />
+  if (!connectionsManagedByHost()) {
+    return (
+      <SettingsContent bare={embedded}>
+        {embedded ? null : (
+          <div className="mb-5">
+            <div className="flex items-center gap-2 text-[length:var(--conversation-text-font-size)] font-medium">
+              <Globe className="size-4 text-muted-foreground" />
+              {g.title}
+            </div>
+          </div>
+        )}
+        <SingleBackendNotice />
+      </SettingsContent>
+    )
   }
 
   return (

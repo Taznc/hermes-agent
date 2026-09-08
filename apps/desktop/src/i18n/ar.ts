@@ -142,6 +142,7 @@ export const ar = defineForkLocale(forkAr, {
     more: count => `${count} إشعار إضافي`,
     clearAll: 'مسح الكل',
     dismiss: 'إغلاق الإشعار',
+    dismissAction: 'إغلاق',
     details: 'التفاصيل',
     copyDetail: 'نسخ التفاصيل',
     copyDetailFailed: 'تعذر نسخ تفاصيل الإشعار',
@@ -403,6 +404,7 @@ export const ar = defineForkLocale(forkAr, {
       testBody: 'الإشعارات تعمل.',
       testSent: 'تم إرسال التجربة. إذا لم يظهر شيء، تحقق من أذونات الإشعارات في نظام التشغيل ووضع التركيز/عدم الإزعاج.',
       testUnsupported: 'هذا النظام لا يدعم الإشعارات الأصلية.',
+      testDenied: 'الإشعارات محظورة لهذا الموقع. فعّلها من إعدادات الموقع في متصفحك ثم أعد المحاولة.',
       completionSoundTitle: 'صوت الاكتمال',
       completionSoundDesc: 'يُشغّل عند انتهاء دور الوكيل. اختر إعدادا مسبقا وعاينه هنا.',
       completionSoundPreview: 'معاينة'
@@ -2662,13 +2664,21 @@ export const ar = defineForkLocale(forkAr, {
       gatewayDisconnected: 'البوابة غير متصلة',
       sendFailed: 'فشل الإرسال',
       loadingQuestion: 'جار تحميل السؤال...',
+      restoring: 'جارٍ استعادة هذا السؤال — يمكنك الإجابة بعد قليل',
       other: 'غير ذلك',
       placeholder: 'اكتب إجابتك...',
       skip: 'تخطي',
       continueLabel: 'متابعة',
       confirmAndContinueLabel: 'تأكيد ومتابعة',
       answeredBadge: 'تمت الإجابة',
-      questionProgress: (answered, total) => `تمت الإجابة على ${answered} من ${total}`
+      questionProgress: (answered, total) => `تمت الإجابة على ${answered} من ${total}`,
+      questionGroup: total => `${total} أسئلة بحاجة إلى إجابة`,
+      addNote: 'إضافة ملاحظة',
+      addNoteFor: label => `إضافة ملاحظة إلى ${label}`,
+      note: 'ملاحظة',
+      noteFor: label => `ملاحظة لـ ${label}`,
+      notePlaceholder: 'أضف ملاحظة اختيارية…',
+      selected: 'محدد'
     },
     tool: {
       copyCode: 'نسخ الكود',

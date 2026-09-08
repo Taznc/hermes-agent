@@ -9,7 +9,7 @@ import { type SessionView, SessionViewProvider } from '@/app/chat/session-view'
 import { hiddenPaneProps } from '@/components/pane-shell/pane-visibility'
 import { $activeTreeGroup, $hoveredTreeGroup } from '@/components/pane-shell/tree/store'
 import { I18nProvider } from '@/i18n'
-import { clearClarifyRequest, setClarifyRequest, updateClarifyHelp } from '@/store/clarify'
+import { $clarifyToolRequestIds, clearClarifyRequest, setClarifyRequest, updateClarifyHelp } from '@/store/clarify'
 import { $gateway } from '@/store/gateway'
 import { $profiles } from '@/store/profile'
 import { $activeSessionId, _resetSessionOwnerHintsForTests, setSessionOwnerHint } from '@/store/session'
@@ -41,6 +41,10 @@ vi.mock('@assistant-ui/react', () => ({
 afterEach(() => {
   cleanup()
   clearClarifyRequest()
+  // A tool row's request binding is sticky by design (it must not adopt a later
+  // turn's request), so it has to be reset between tests or a reused
+  // toolCallId inherits the previous test's binding.
+  $clarifyToolRequestIds.set({})
   $activeSessionId.set(null)
   $gateway.set(null)
   messageRunning = true
@@ -124,14 +128,19 @@ describe('ClarifyTool live card stays mounted across settle', () => {
     expect(document.querySelector('[data-clarify-settled]')).toBeNull()
   })
 
-  it('demotes to a tool row when the turn stopped and no request is left to answer', () => {
+  it('keeps the question visible but inert when the turn stopped and no request is left to answer', () => {
     messageRunning = false
     $activeSessionId.set('session-1')
     $gateway.set({ request: vi.fn() } as never)
     renderClarify(<ClarifyTool {...liveClarifyProps()} />)
 
+    // Previously this demoted to the generic tool row, which is exactly how a
+    // live question ended up buried in raw TOOL PAYLOAD. The question stays
+    // legible; what changes is that nothing is armed.
+    expect(screen.getByText('Which deployment target?')).toBeTruthy()
+    expect(screen.getByRole('button', { name: /Continue/ }).hasAttribute('disabled')).toBe(true)
+    // The shortcut marker stays off, so the composer keeps its printable keys.
     expect(document.querySelector('[data-clarify-choices]')).toBeNull()
-    expect(screen.queryByRole('button', { name: /Continue/ })).toBeNull()
   })
 
   it('holds the card through the gap between answering and the settled result', async () => {
@@ -149,10 +158,14 @@ describe('ClarifyTool live card stays mounted across settle', () => {
     messageRunning = false
     rerender(clarifyTree(<ClarifyTool {...liveClarifyProps()} />))
 
-    expect(document.querySelector('[data-clarify-choices]')).toBeTruthy()
+    // The card is still the clarify card, not a settled row or a payload row.
+    // Its shortcut marker is correctly gone — the request was cleared on submit,
+    // so there is nothing left for a keystroke to act on.
+    expect(document.querySelector('[data-slot="clarify-inline"]')).toBeTruthy()
+    expect(document.querySelector('[data-clarify-settled]')).toBeNull()
   })
 
-  it('demotes when the turn is stopped after the card was live but never answered', () => {
+  it('disarms but keeps the card when the turn is stopped after it was live but never answered', () => {
     renderLiveClarify()
 
     expect(document.querySelector('[data-clarify-choices]')).toBeTruthy()
@@ -160,8 +173,12 @@ describe('ClarifyTool live card stays mounted across settle', () => {
     messageRunning = false
     act(() => clearClarifyRequest('request-1', 'session-1'))
 
+    // Disarmed: the shortcut marker is gone and Continue cannot fire. Still
+    // visible: the question is in the tool args, so burying it in raw payload
+    // would be the very regression this file guards.
     expect(document.querySelector('[data-clarify-choices]')).toBeNull()
-    expect(screen.queryByRole('button', { name: /Continue/ })).toBeNull()
+    expect(screen.getByText('Which deployment target?')).toBeTruthy()
+    expect(screen.getByRole('button', { name: /Continue/ }).hasAttribute('disabled')).toBe(true)
   })
 
   it('paints the question from tool args instead of a spinner while request_id is still racing', () => {
@@ -204,6 +221,92 @@ describe('ClarifyTool choice selection', () => {
     })
   })
 
+  it('sends an optional note separately from the selected single answer', async () => {
+    const { request } = renderLiveClarify()
+
+    fireEvent.click(screen.getByRole('button', { name: /^[A-Z]staging/ }))
+    fireEvent.click(screen.getByRole('button', { name: 'Add note for staging' }))
+    fireEvent.change(screen.getByRole('textbox', { name: 'Note for staging' }), {
+      target: { value: 'Prefer the preview.' }
+    })
+    fireEvent.click(screen.getByRole('button', { name: /Continue/ }))
+
+    await waitFor(() => {
+      expect(request).toHaveBeenCalledWith('clarify.respond', {
+        answer: 'staging',
+        note: 'Prefer the preview.',
+        request_id: 'request-1'
+      })
+    })
+  })
+
+  it('keeps a question note reviewable after deselecting every choice and selecting another', () => {
+    renderLiveClarify({ multiSelect: true })
+    const staging = screen.getByRole('button', { name: /^[A-Z]staging/ })
+
+    fireEvent.click(staging)
+    fireEvent.click(screen.getByRole('button', { name: 'Add note for staging' }))
+    fireEvent.change(screen.getByRole('textbox', { name: 'Note for staging' }), {
+      target: { value: 'Preserve this note.' }
+    })
+    fireEvent.click(staging)
+    fireEvent.click(screen.getByRole('button', { name: /^[A-Z]production/ }))
+
+    expect(screen.getByRole('textbox', { name: 'Note for production' })).toHaveProperty('value', 'Preserve this note.')
+  })
+
+  it('keeps a selected-answer note visible and sends it when switching to Other', async () => {
+    const { request } = renderLiveClarify()
+
+    fireEvent.click(screen.getByRole('button', { name: /^[A-Z]staging/ }))
+    fireEvent.click(screen.getByRole('button', { name: 'Add note for staging' }))
+    fireEvent.change(screen.getByRole('textbox', { name: 'Note for staging' }), {
+      target: { value: 'Keep this context.' }
+    })
+    fireEvent.change(screen.getByPlaceholderText('Other (type your answer)'), {
+      target: { value: 'Custom deployment' }
+    })
+
+    expect(screen.getByRole('textbox', { name: 'Note for Other (type your answer)' })).toHaveProperty(
+      'value',
+      'Keep this context.'
+    )
+    fireEvent.click(screen.getByRole('button', { name: /Continue/ }))
+    await waitFor(() =>
+      expect(request).toHaveBeenCalledWith('clarify.respond', {
+        answer: 'Custom deployment',
+        note: 'Keep this context.',
+        request_id: 'request-1'
+      })
+    )
+  })
+
+  it('does not submit a note twice while the first response is pending', async () => {
+    const { request } = renderLiveClarify()
+    request.mockImplementation(() => new Promise(() => {}))
+
+    fireEvent.click(screen.getByRole('button', { name: /^[A-Z]staging/ }))
+    fireEvent.click(screen.getByRole('button', { name: 'Add note for staging' }))
+    const note = screen.getByRole('textbox', { name: 'Note for staging' })
+    fireEvent.change(note, { target: { value: 'Ready.' } })
+    fireEvent.keyDown(note, { key: 'Enter' })
+    await waitFor(() => expect(request).toHaveBeenCalledTimes(1))
+
+    expect((note as HTMLTextAreaElement).disabled).toBe(true)
+    fireEvent.keyDown(note, { key: 'Enter' })
+    expect(request).toHaveBeenCalledTimes(1)
+  })
+
+  it('opens one scoped note editor when multiple choices are selected', () => {
+    renderLiveClarify({ multiSelect: true })
+
+    fireEvent.click(screen.getByRole('button', { name: /^[A-Z]staging/ }))
+    fireEvent.click(screen.getByRole('button', { name: /^[A-Z]production/ }))
+    fireEvent.click(screen.getByRole('button', { name: 'Add note for staging' }))
+
+    expect(screen.getAllByPlaceholderText('Add an optional note…')).toHaveLength(1)
+  })
+
   it('keeps single-select replacement and plain-string submission', async () => {
     const { request } = renderLiveClarify()
     const staging = screen.getByRole('button', { name: /^[A-Z]staging/ })
@@ -223,6 +326,36 @@ describe('ClarifyTool choice selection', () => {
         request_id: 'request-1'
       })
     })
+  })
+
+  it('submits the Other draft on plain Enter and cancels the newline', async () => {
+    const { request } = renderLiveClarify()
+    const other = screen.getByPlaceholderText('Other (type your answer)')
+
+    other.focus()
+    fireEvent.change(other, { target: { value: 'canary' } })
+
+    // A cancelled keydown is how the browser is told not to insert "\n".
+    expect(fireEvent.keyDown(other, { key: 'Enter' })).toBe(false)
+    await waitFor(() => {
+      expect(request).toHaveBeenCalledWith('clarify.respond', {
+        answer: 'canary',
+        request_id: 'request-1'
+      })
+    })
+  })
+
+  it('leaves Shift+Enter and IME Enter alone in the Other draft', () => {
+    const { request } = renderLiveClarify()
+    const other = screen.getByPlaceholderText('Other (type your answer)')
+
+    other.focus()
+    fireEvent.change(other, { target: { value: 'canary' } })
+
+    expect(fireEvent.keyDown(other, { key: 'Enter', shiftKey: true })).toBe(true)
+    expect(fireEvent.keyDown(other, { isComposing: true, key: 'Enter' })).toBe(true)
+    expect(request).not.toHaveBeenCalled()
+    expect((other as HTMLTextAreaElement).value).toBe('canary')
   })
 })
 
@@ -670,7 +803,11 @@ function liveBatchProps(): ToolCallMessagePartProps {
   }
 }
 
-function renderLiveBatch(lockedAnswers?: Record<string, string>, multiSelect = false) {
+function renderLiveBatch(
+  lockedAnswers?: Record<string, string>,
+  multiSelect = false,
+  lockedNotes?: Record<string, string>
+) {
   const request = vi.fn().mockResolvedValue({ ok: true, remaining: [] })
 
   $activeSessionId.set('session-1')
@@ -678,6 +815,7 @@ function renderLiveBatch(lockedAnswers?: Record<string, string>, multiSelect = f
   setClarifyRequest({
     choices: null,
     lockedAnswers,
+    lockedNotes,
     multiSelect: false,
     question: '',
     questions: [
@@ -771,6 +909,241 @@ describe('ClarifyTool batch card', () => {
     expect((confirm as HTMLButtonElement).disabled).toBe(false)
   })
 
+  it('keeps a scoped note directly under a selected choice and sends it separately', async () => {
+    const request = renderLiveBatch()
+
+    fireEvent.click(screen.getByRole('button', { name: /^[A-Z]red/ }))
+    fireEvent.click(screen.getByRole('button', { name: 'Add note for red' }))
+
+    const note = screen.getByRole('textbox', { name: 'Note for red' })
+    expect(note.closest('[data-clarify-batch-question="q0"]')).toBeTruthy()
+    fireEvent.change(note, { target: { value: 'Use the stable palette.' } })
+    fireEvent.change(screen.getByPlaceholderText('Type your answer…'), { target: { value: 'packet' } })
+    fireEvent.submit(document.querySelector('form') as HTMLFormElement)
+
+    await waitFor(() => {
+      expect(request).toHaveBeenCalledTimes(2)
+    })
+    expect(request).toHaveBeenNthCalledWith(1, 'clarify.respond', {
+      answer: 'red',
+      note: 'Use the stable palette.',
+      question_id: 'q0',
+      request_id: 'request-batch'
+    })
+  })
+
+  it('keeps one scoped note editor for a batch multi-select answer', () => {
+    renderLiveBatch(undefined, true)
+
+    fireEvent.click(screen.getByRole('button', { name: /^[A-Z]red/ }))
+    fireEvent.click(screen.getByRole('button', { name: /^[A-Z]blue/ }))
+    fireEvent.click(screen.getByRole('button', { name: 'Add note for red' }))
+
+    expect(screen.getAllByPlaceholderText('Add an optional note…')).toHaveLength(1)
+  })
+
+  it('keeps a batch note reviewable after deselecting every choice and selecting another', () => {
+    renderLiveBatch(undefined, true)
+    const red = screen.getByRole('button', { name: /^[A-Z]red/ })
+
+    fireEvent.click(red)
+    fireEvent.click(screen.getByRole('button', { name: 'Add note for red' }))
+    fireEvent.change(screen.getByRole('textbox', { name: 'Note for red' }), { target: { value: 'Keep me.' } })
+    fireEvent.click(red)
+    fireEvent.click(screen.getByRole('button', { name: /^[A-Z]blue/ }))
+
+    expect(screen.getByRole('textbox', { name: 'Note for blue' })).toHaveProperty('value', 'Keep me.')
+  })
+
+  it('keeps a batch choice note visible when the answer changes to Other', () => {
+    renderLiveBatch()
+
+    fireEvent.click(screen.getByRole('button', { name: /^[A-Z]red/ }))
+    fireEvent.click(screen.getByRole('button', { name: 'Add note for red' }))
+    fireEvent.change(screen.getByRole('textbox', { name: 'Note for red' }), { target: { value: 'Keep me.' } })
+    fireEvent.change(screen.getByPlaceholderText('Other (type your answer)'), { target: { value: 'green' } })
+
+    expect(screen.getByRole('textbox', { name: 'Note for Other (type your answer)' })).toHaveProperty(
+      'value',
+      'Keep me.'
+    )
+  })
+
+  it('preserves a replayed locked note when confirming the remaining batch answer', async () => {
+    const request = renderLiveBatch({ q0: '["red"]' }, true, { q0: 'Previously accepted note' })
+
+    expect(screen.getByRole('textbox', { name: 'Note for red' })).toHaveProperty('value', 'Previously accepted note')
+    fireEvent.change(screen.getByPlaceholderText('Type your answer…'), { target: { value: 'Release' } })
+    fireEvent.click(screen.getByRole('button', { name: /Confirm and continue/ }))
+
+    await waitFor(() => expect(request).toHaveBeenCalledTimes(2))
+    expect(request).toHaveBeenNthCalledWith(1, 'clarify.respond', {
+      answer: '["red"]',
+      note: 'Previously accepted note',
+      question_id: 'q0',
+      request_id: 'request-batch'
+    })
+  })
+
+  it('does not submit a batch note twice while confirmation is pending', async () => {
+    const request = renderLiveBatch()
+    request.mockImplementation(() => new Promise(() => {}))
+
+    fireEvent.click(screen.getByRole('button', { name: /^[A-Z]red/ }))
+    fireEvent.click(screen.getByRole('button', { name: 'Add note for red' }))
+    const note = screen.getByRole('textbox', { name: 'Note for red' })
+    fireEvent.change(note, { target: { value: 'Ready.' } })
+    fireEvent.change(screen.getByPlaceholderText('Type your answer…'), { target: { value: 'Release' } })
+    fireEvent.keyDown(note, { key: 'Enter' })
+    await waitFor(() => expect(request).toHaveBeenCalledTimes(1))
+
+    expect((note as HTMLTextAreaElement).disabled).toBe(true)
+    fireEvent.keyDown(note, { key: 'Enter' })
+    expect(request).toHaveBeenCalledTimes(1)
+  })
+
+  it('advances within its own batch card when another mounted card has the same qids', () => {
+    const request = vi.fn().mockResolvedValue({ ok: true })
+
+    const batchView = (sessionId: string): SessionView => ({
+      ...({} as SessionView),
+      $runtimeId: atom<null | string>(sessionId),
+      kind: 'tile'
+    })
+
+    // Each card's own args, so each correlates to its own session's request —
+    // the qids collide (both `q0`/`q1`), which is the thing under test.
+    const cardProps = (label: string, toolCallId: string): ToolCallMessagePartProps => {
+      const args: { questions: { question: string; choices?: string[] }[] } = {
+        questions: [{ choices: ['red', 'blue'], question: `${label} color?` }, { question: `${label} name?` }]
+      }
+
+      return { ...liveBatchProps(), args, argsText: JSON.stringify(args), toolCallId }
+    }
+
+    $gateway.set({ request } as never)
+    setClarifyRequest({
+      choices: null,
+      multiSelect: false,
+      question: '',
+      questions: [
+        { choices: ['red', 'blue'], multiSelect: false, qid: 'q0', question: 'Background color?' },
+        { choices: null, multiSelect: false, qid: 'q1', question: 'Background name?' }
+      ],
+      requestId: 'request-background-batch',
+      sessionId: 'session-background-batch'
+    })
+    setClarifyRequest({
+      choices: null,
+      multiSelect: false,
+      question: '',
+      questions: [
+        { choices: ['red', 'blue'], multiSelect: false, qid: 'q0', question: 'Foreground color?' },
+        { choices: null, multiSelect: false, qid: 'q1', question: 'Foreground name?' }
+      ],
+      requestId: 'request-foreground-batch',
+      sessionId: 'session-foreground-batch'
+    })
+    renderClarify(
+      <>
+        <SessionViewProvider value={batchView('session-background-batch')}>
+          <ClarifyTool {...cardProps('Background', 'clarify-batch-background')} />
+        </SessionViewProvider>
+        <SessionViewProvider value={batchView('session-foreground-batch')}>
+          <ClarifyTool {...cardProps('Foreground', 'clarify-batch-foreground')} />
+        </SessionViewProvider>
+      </>
+    )
+
+    const drafts = screen.getAllByPlaceholderText('Other (type your answer)')
+    const nextAnswers = screen.getAllByPlaceholderText('Type your answer…')
+    fireEvent.change(drafts[1] as HTMLTextAreaElement, { target: { value: 'green' } })
+    fireEvent.keyDown(drafts[1] as HTMLTextAreaElement, { key: 'Enter' })
+
+    expect(document.activeElement).toBe(nextAnswers[1])
+  })
+
+  it('uses plain Enter to advance a batch draft without creating a newline', () => {
+    const request = renderLiveBatch()
+
+    const colorDraft = screen.getByPlaceholderText('Other (type your answer)')
+    fireEvent.change(colorDraft, { target: { value: 'green' } })
+
+    expect(fireEvent.keyDown(colorDraft, { key: 'Enter' })).toBe(false)
+    expect((colorDraft as HTMLTextAreaElement).value).toBe('green')
+    expect(document.activeElement).toBe(screen.getByPlaceholderText('Type your answer…'))
+    expect(request).not.toHaveBeenCalled()
+  })
+
+  it('cancels plain Enter in an empty batch draft without submitting or moving focus', () => {
+    const request = renderLiveBatch()
+    const colorDraft = screen.getByPlaceholderText('Other (type your answer)')
+    colorDraft.focus()
+
+    expect(fireEvent.keyDown(colorDraft, { key: 'Enter' })).toBe(false)
+    expect((colorDraft as HTMLTextAreaElement).value).toBe('')
+    expect(document.activeElement).toBe(colorDraft)
+    expect(request).not.toHaveBeenCalled()
+  })
+
+  it('does not cancel Shift+Enter so the browser can insert a newline in a batch draft', () => {
+    renderLiveBatch()
+
+    const colorDraft = screen.getByPlaceholderText('Other (type your answer)')
+    fireEvent.change(colorDraft, { target: { value: 'green' } })
+
+    expect(fireEvent.keyDown(colorDraft, { key: 'Enter', shiftKey: true })).toBe(true)
+    expect((colorDraft as HTMLTextAreaElement).value).toBe('green')
+  })
+
+  it('saves a batch note and advances to the next unanswered question on plain Enter', () => {
+    const request = renderLiveBatch()
+    fireEvent.click(screen.getByRole('button', { name: /^[A-Z]red/ }))
+    fireEvent.click(screen.getByRole('button', { name: 'Add note for red' }))
+    const note = screen.getByRole('textbox', { name: 'Note for red' })
+    fireEvent.change(note, { target: { value: 'Keep this note.' } })
+
+    expect(fireEvent.keyDown(note, { key: 'Enter' })).toBe(false)
+    expect((note as HTMLTextAreaElement).value).toBe('Keep this note.')
+    expect(document.activeElement).toBe(screen.getByPlaceholderText('Type your answer…'))
+    expect(request).not.toHaveBeenCalled()
+  })
+
+  it('leaves Shift+Enter and IME Enter in a batch note to the browser', () => {
+    const request = renderLiveBatch()
+    fireEvent.click(screen.getByRole('button', { name: /^[A-Z]red/ }))
+    fireEvent.click(screen.getByRole('button', { name: 'Add note for red' }))
+    const note = screen.getByRole('textbox', { name: 'Note for red' })
+    fireEvent.change(note, { target: { value: 'Keep this note.' } })
+
+    expect(fireEvent.keyDown(note, { key: 'Enter', shiftKey: true })).toBe(true)
+    expect(fireEvent.keyDown(note, { isComposing: true, key: 'Enter' })).toBe(true)
+    expect(request).not.toHaveBeenCalled()
+  })
+
+  it('confirms a ready batch from note Enter and includes the note once', async () => {
+    const request = renderLiveBatch()
+    fireEvent.click(screen.getByRole('button', { name: /^[A-Z]red/ }))
+    fireEvent.click(screen.getByRole('button', { name: 'Add note for red' }))
+    const note = screen.getByRole('textbox', { name: 'Note for red' })
+    fireEvent.change(note, { target: { value: 'Keep this note.' } })
+    fireEvent.change(screen.getByPlaceholderText('Type your answer…'), { target: { value: 'Release' } })
+
+    expect(fireEvent.keyDown(note, { key: 'Enter' })).toBe(false)
+    await waitFor(() => expect(request).toHaveBeenCalledTimes(2))
+    expect(request).toHaveBeenNthCalledWith(1, 'clarify.respond', {
+      answer: 'red',
+      note: 'Keep this note.',
+      question_id: 'q0',
+      request_id: 'request-batch'
+    })
+    expect(request).toHaveBeenNthCalledWith(2, 'clarify.respond', {
+      answer: 'Release',
+      question_id: 'q1',
+      request_id: 'request-batch'
+    })
+  })
+
   it('confirm sends every per-question lock in order and completes the batch', async () => {
     const request = renderLiveBatch()
 
@@ -860,6 +1233,24 @@ describe('ClarifyTool batch card', () => {
     expect(screen.getByText('red')).toBeTruthy()
     expect(screen.getByText('Name?')).toBeTruthy()
     expect(screen.getByText('Skipped')).toBeTruthy()
+  })
+
+  it('renders settled selected answers and notes as distinct fields', () => {
+    renderClarify(
+      <ClarifyTool
+        {...settledClarifyProps(
+          batchArgs(),
+          JSON.stringify({
+            responses: [{ note: 'Use the stable palette.', question: 'Color?', user_response: 'red' }]
+          }),
+          'clarify-batch-note-settled'
+        )}
+      />
+    )
+
+    expect(screen.getByText('Selected')).toBeTruthy()
+    expect(screen.getByText('Note')).toBeTruthy()
+    expect(screen.getByText('Use the stable palette.')).toBeTruthy()
   })
 })
 
@@ -1203,6 +1594,782 @@ describe('ClarifyTool visible-card scoping', () => {
     expect(request).toHaveBeenCalledWith('clarify.respond', {
       answer: 'staging',
       request_id: ZONE_A_REQUEST
+    })
+  })
+})
+
+// ─── Pending clarify with no correlated request (the buried-payload bug) ─────
+//
+// Field incident (session 20260907_234154_4b2f48): the provider tool call was
+// persisted with args carrying the question and three choices, the session tab
+// showed the amber needs-input mark for ~55 minutes, and the transcript showed
+// only the generic "Asked a question" row whose question was reachable ONLY by
+// expanding raw TOOL PAYLOAD. The renderer's `$clarifyRequests` entry was gone
+// (repeated WS drops across the wait) while the tool itself was still pending,
+// so the card's own gate — `!messageRunning && !request` — demoted a live
+// question to a JSON dump with no answer affordance.
+//
+// The contract these tests pin: a clarify tool call whose `result` is still
+// undefined and whose args carry a question NEVER renders as the generic tool
+// fallback. It renders the dedicated card, inert until an owned request id
+// exists, and nothing may be submitted from that inert state.
+
+const BURIED_QUESTION = 'Where should the polished launcher live?'
+const BURIED_CHOICES = ['Nav page plus Overview strip', 'Nav page only', 'Overview page only']
+
+function uncorrelatedSingleProps(): ToolCallMessagePartProps {
+  const args = { choices: BURIED_CHOICES, question: BURIED_QUESTION }
+
+  return {
+    addResult: vi.fn(),
+    args,
+    argsText: JSON.stringify(args),
+    isError: false,
+    respondToApproval: vi.fn(),
+    result: undefined,
+    resume: vi.fn(),
+    status: { type: 'running' },
+    toolCallId: 'clarify-uncorrelated',
+    toolName: 'clarify',
+    type: 'tool-call'
+  }
+}
+
+/** The field shape: batch args (a `questions` array, no top-level question). */
+function uncorrelatedBatchProps(): ToolCallMessagePartProps {
+  const args = { questions: [{ choices: BURIED_CHOICES, question: BURIED_QUESTION }] }
+
+  return {
+    ...uncorrelatedSingleProps(),
+    args,
+    argsText: JSON.stringify(args),
+    toolCallId: 'clarify-batch-uncorrelated'
+  }
+}
+
+describe('ClarifyTool pending question never degrades to raw payload', () => {
+  it('paints the dedicated card from args when the turn reports not-running and no request is parked', () => {
+    // Exactly the incident state: tool pending, args intact, store empty.
+    messageRunning = false
+    $activeSessionId.set('session-1')
+    $gateway.set({ request: vi.fn() } as never)
+
+    renderClarify(<ClarifyTool {...uncorrelatedSingleProps()} />)
+
+    expect(document.querySelector('[data-slot="clarify-inline"]')).toBeTruthy()
+    expect(screen.getByText(BURIED_QUESTION)).toBeTruthy()
+
+    // The semantic option rows, not the "Why?/Ask" help buttons beside them.
+    const options = [...document.querySelectorAll('[data-choice]')].map(el => el.textContent ?? '')
+
+    for (const choice of BURIED_CHOICES) {
+      expect(options.some(text => text.includes(choice))).toBe(true)
+    }
+  })
+
+  it('paints the BATCH questions from args alone (the shape the field incident used)', () => {
+    messageRunning = false
+    $activeSessionId.set('session-1')
+    $gateway.set({ request: vi.fn() } as never)
+
+    renderClarify(<ClarifyTool {...uncorrelatedBatchProps()} />)
+
+    expect(document.querySelector('[data-slot="clarify-inline"]')).toBeTruthy()
+    expect(screen.getByText(BURIED_QUESTION)).toBeTruthy()
+    // A bare spinner is the other way to bury the question — also forbidden.
+    expect(screen.queryByRole('status', { name: /Loading question/ })).toBeNull()
+  })
+
+  it('keeps every control inert and refuses to submit before an owned request exists', async () => {
+    messageRunning = false
+    const request = vi.fn().mockResolvedValue({ ok: true })
+
+    $activeSessionId.set('session-1')
+    $gateway.set({ request } as never)
+
+    renderClarify(<ClarifyTool {...uncorrelatedSingleProps()} />)
+
+    const choices = [...document.querySelectorAll<HTMLButtonElement>('[data-choice]')]
+    expect(choices).toHaveLength(BURIED_CHOICES.length)
+    expect(choices.every(el => el.hasAttribute('disabled'))).toBe(true)
+    expect(screen.getByRole('button', { name: /Skip/ }).hasAttribute('disabled')).toBe(true)
+    expect(screen.getByRole('button', { name: /Continue/ }).hasAttribute('disabled')).toBe(true)
+    expect((screen.getByPlaceholderText(/Other/) as HTMLTextAreaElement).disabled).toBe(true)
+
+    // A visible reason for the inert state, not a silently dead form.
+    expect(document.querySelector('[data-clarify-restoring]')).toBeTruthy()
+
+    fireEvent.click(choices[0])
+    fireEvent.keyDown(window, { key: 'Enter' })
+    fireEvent.keyDown(window, { key: 'a' })
+
+    await waitFor(() => {
+      expect(request).not.toHaveBeenCalled()
+    })
+  })
+
+  it('does not arm the keyboard-shortcut marker while the card is inert', () => {
+    messageRunning = false
+    $activeSessionId.set('session-1')
+    $gateway.set({ request: vi.fn() } as never)
+
+    renderClarify(<ClarifyTool {...uncorrelatedSingleProps()} />)
+
+    // `clarifyCardOwnsKey` reads this marker to YIELD those keys away from the
+    // composer. An inert card that claims them swallows them for nobody, so the
+    // user cannot type a message either.
+    expect(document.querySelector('[data-clarify-choices]')).toBeNull()
+  })
+
+  it('enables the same card in place when the request arrives, with no second row', async () => {
+    messageRunning = false
+    const request = vi.fn().mockResolvedValue({ ok: true })
+
+    $activeSessionId.set('session-1')
+    $gateway.set({ request } as never)
+
+    const { rerender } = renderClarify(<ClarifyTool {...uncorrelatedSingleProps()} />)
+
+    act(() => {
+      setClarifyRequest({
+        choices: BURIED_CHOICES,
+        multiSelect: false,
+        question: BURIED_QUESTION,
+        requestId: 'request-late',
+        sessionId: 'session-1'
+      })
+    })
+    rerender(clarifyTree(<ClarifyTool {...uncorrelatedSingleProps()} />))
+
+    // One card, now answerable — not a second transcript row.
+    expect(document.querySelectorAll('[data-slot="clarify-inline"]')).toHaveLength(1)
+    expect(document.querySelector('[data-clarify-restoring]')).toBeNull()
+
+    const choice = [...document.querySelectorAll<HTMLButtonElement>('[data-choice]')][1]
+    expect(choice.hasAttribute('disabled')).toBe(false)
+    fireEvent.click(choice)
+    fireEvent.click(screen.getByRole('button', { name: /Continue/ }))
+
+    await waitFor(() => {
+      expect(request).toHaveBeenCalledWith('clarify.respond', {
+        answer: BURIED_CHOICES[1],
+        request_id: 'request-late'
+      })
+    })
+  })
+
+  it('preserves a typed draft across the inert → answerable transition', async () => {
+    messageRunning = false
+    const request = vi.fn().mockResolvedValue({ ok: true })
+
+    $activeSessionId.set('session-1')
+    $gateway.set({ request } as never)
+
+    const props: ToolCallMessagePartProps = {
+      ...uncorrelatedSingleProps(),
+      args: { question: BURIED_QUESTION },
+      argsText: JSON.stringify({ question: BURIED_QUESTION })
+    }
+
+    const { rerender } = renderClarify(<ClarifyTool {...props} />)
+
+    const field = screen.getByRole('textbox')
+    fireEvent.change(field, { target: { value: 'my own answer' } })
+
+    act(() => {
+      setClarifyRequest({
+        choices: null,
+        multiSelect: false,
+        question: BURIED_QUESTION,
+        requestId: 'request-draft',
+        sessionId: 'session-1'
+      })
+    })
+    rerender(clarifyTree(<ClarifyTool {...props} />))
+
+    expect((screen.getByRole('textbox') as HTMLTextAreaElement).value).toBe('my own answer')
+
+    fireEvent.click(screen.getByRole('button', { name: /Continue/ }))
+
+    await waitFor(() => {
+      expect(request).toHaveBeenCalledWith('clarify.respond', {
+        answer: 'my own answer',
+        request_id: 'request-draft'
+      })
+    })
+  })
+
+  it('still falls back to the generic tool row when the args carry no question at all', () => {
+    messageRunning = false
+    $activeSessionId.set('session-1')
+    $gateway.set({ request: vi.fn() } as never)
+
+    const args = { unrelated: true }
+    renderClarify(
+      <ClarifyTool
+        addResult={vi.fn()}
+        args={args}
+        argsText={JSON.stringify(args)}
+        isError={false}
+        respondToApproval={vi.fn()}
+        result={undefined}
+        resume={vi.fn()}
+        status={{ type: 'running' }}
+        toolCallId="clarify-empty"
+        toolName="clarify"
+        type="tool-call"
+      />
+    )
+
+    // Nothing to paint — an empty clarify shell would be a lie about state.
+    expect(document.querySelector('[data-slot="clarify-inline"]')).toBeNull()
+  })
+
+  it('keeps a settled result on the settled card instead of resurrecting a form', () => {
+    messageRunning = false
+    $activeSessionId.set('session-1')
+    $gateway.set({ request: vi.fn() } as never)
+
+    renderClarify(
+      <ClarifyTool
+        {...settledClarifyProps(
+          { choices: BURIED_CHOICES, question: BURIED_QUESTION },
+          { question: BURIED_QUESTION, user_response: '' },
+          'clarify-settled-terminal'
+        )}
+      />
+    )
+
+    expect(document.querySelector('[data-clarify-settled]')).toBeTruthy()
+    expect(document.querySelector('[data-clarify-choices]')).toBeNull()
+    expect(screen.queryByRole('button', { name: /Continue/ })).toBeNull()
+  })
+})
+
+describe('ClarifyTool newly answerable focus handling', () => {
+  function becomeAnswerable(rerender: (ui: ReactNode) => void, props: ToolCallMessagePartProps) {
+    act(() => {
+      setClarifyRequest({
+        choices: BURIED_CHOICES,
+        multiSelect: false,
+        question: BURIED_QUESTION,
+        requestId: 'request-focus',
+        sessionId: 'session-1'
+      })
+    })
+    rerender(clarifyTree(<ClarifyTool {...props} />))
+  }
+
+  it('moves focus to the card region when nothing else is focused', () => {
+    messageRunning = false
+    $activeSessionId.set('session-1')
+    $gateway.set({ request: vi.fn() } as never)
+
+    const props = uncorrelatedSingleProps()
+    const { rerender } = renderClarify(<ClarifyTool {...props} />)
+
+    becomeAnswerable(rerender, props)
+
+    // The card itself, not a choice button: focusing a control would announce
+    // one option instead of the question AND disarm the card's own arrow /
+    // letter / Enter handler, which stands down while a control is focused.
+    const card = document.querySelector('[data-clarify-choices]')
+    expect(card).toBeTruthy()
+    expect(document.activeElement).toBe(card)
+    expect(card?.getAttribute('aria-label')).toBe(BURIED_QUESTION)
+    // Programmatic target only — it must not add a Tab stop.
+    expect(card?.getAttribute('tabindex')).toBe('-1')
+  })
+
+  it('never steals focus from a control the user is already using', () => {
+    messageRunning = false
+    $activeSessionId.set('session-1')
+    $gateway.set({ request: vi.fn() } as never)
+
+    const props = uncorrelatedSingleProps()
+    const { rerender } = renderClarify(<ClarifyTool {...props} />)
+
+    // Stand in for the composer: any focused editable must keep the caret.
+    const composer = document.createElement('textarea')
+    document.body.append(composer)
+    composer.focus()
+
+    becomeAnswerable(rerender, props)
+
+    expect(document.activeElement).toBe(composer)
+    composer.remove()
+  })
+
+  it('leaves focus alone for a card parked in a background tab', () => {
+    messageRunning = false
+    $gateway.set({ request: vi.fn() } as never)
+
+    const props = uncorrelatedSingleProps()
+
+    const hidden = (ui: ReactNode) => (
+      <div {...hiddenPaneProps(true)}>
+        <SessionViewProvider value={{ ...({} as SessionView), $runtimeId: atom<null | string>('session-1') }}>
+          {ui}
+        </SessionViewProvider>
+      </div>
+    )
+
+    const { rerender } = renderClarify(hidden(<ClarifyTool {...props} />))
+
+    act(() => {
+      setClarifyRequest({
+        choices: BURIED_CHOICES,
+        multiSelect: false,
+        question: BURIED_QUESTION,
+        requestId: 'request-hidden',
+        sessionId: 'session-1'
+      })
+    })
+    rerender(clarifyTree(hidden(<ClarifyTool {...props} />)))
+
+    // A background session becoming answerable must not yank the user's focus
+    // out of the chat they are actually looking at.
+    expect(document.activeElement).toBe(document.body)
+  })
+})
+
+describe('ClarifyTool inert card owner isolation', () => {
+  /** Minimal per-session view — the pending card only reads `$runtimeId`. */
+  function tileView(sessionId: string): SessionView {
+    return { ...({} as SessionView), $runtimeId: atom<null | string>(sessionId), kind: 'tile' }
+  }
+
+  it('renders exactly one card per session and arms only the one whose request landed', () => {
+    messageRunning = false
+    $gateway.set({ request: vi.fn().mockResolvedValue({ ok: true }) } as never)
+
+    // Only session-b's request survived the reconnect. Both transcripts still
+    // hold a pending clarify tool row, so both paint — but a keystroke or a
+    // submit may only reach the one that actually owns a request id.
+    setClarifyRequest({
+      choices: BURIED_CHOICES,
+      multiSelect: false,
+      question: BURIED_QUESTION,
+      requestId: 'request-b',
+      sessionId: 'session-b'
+    })
+
+    renderClarify(
+      <>
+        <SessionViewProvider value={tileView('session-a')}>
+          <ClarifyTool {...uncorrelatedSingleProps()} />
+        </SessionViewProvider>
+        <SessionViewProvider value={tileView('session-b')}>
+          <ClarifyTool {...{ ...uncorrelatedSingleProps(), toolCallId: 'clarify-b' }} />
+        </SessionViewProvider>
+      </>
+    )
+
+    // One dedicated card each — never a payload row, never a duplicate.
+    expect(document.querySelectorAll('[data-slot="clarify-inline"]')).toHaveLength(2)
+    // Exactly one is armed: session-b's. session-a's stays inert and marked.
+    expect(document.querySelectorAll('[data-clarify-choices]')).toHaveLength(1)
+    expect(document.querySelectorAll('[data-clarify-restoring]')).toHaveLength(1)
+  })
+
+  it('paints a hydrated compaction/resume row from args with no live request at all', () => {
+    // Post-compaction resume: the transcript is rebuilt from storage, the
+    // clarify tool row is still pending, and no clarify.request has replayed
+    // yet. The question must be on screen, not behind a payload expander.
+    messageRunning = false
+    $activeSessionId.set('session-1')
+    $gateway.set(null)
+
+    renderClarify(<ClarifyTool {...uncorrelatedBatchProps()} />)
+
+    expect(screen.getByText(BURIED_QUESTION)).toBeTruthy()
+    expect(document.querySelector('[data-clarify-restoring]')).toBeTruthy()
+    expect(screen.getByRole('button', { name: /Confirm and continue/ }).hasAttribute('disabled')).toBe(true)
+    expect(screen.getByRole('button', { name: /Skip/ }).hasAttribute('disabled')).toBe(true)
+  })
+
+  it('does not claim to be "restoring" during the submit → tool.complete gap', async () => {
+    // Caught live on the served candidate build: answering clears the request
+    // a beat before tool.complete swaps in the settled card. `!ready` is true
+    // in that window for the right reason, so a plain !ready check told the
+    // user their just-sent answer was "restoring — you can answer in a moment".
+    const request = vi.fn().mockResolvedValue({ ok: true, remaining: [] })
+
+    $activeSessionId.set('session-1')
+    $gateway.set({ request } as never)
+    setClarifyRequest({
+      choices: null,
+      multiSelect: false,
+      question: '',
+      questions: [{ choices: BURIED_CHOICES, multiSelect: false, qid: 'q0', question: BURIED_QUESTION }],
+      requestId: 'request-gap',
+      sessionId: 'session-1'
+    })
+
+    renderClarify(<ClarifyTool {...uncorrelatedBatchProps()} />)
+    expect(document.querySelector('[data-clarify-restoring]')).toBeNull()
+
+    fireEvent.click([...document.querySelectorAll<HTMLButtonElement>('[data-choice]')][0])
+    fireEvent.click(screen.getByRole('button', { name: /Confirm and continue/ }))
+
+    await waitFor(() => {
+      expect(request).toHaveBeenCalled()
+    })
+
+    // The request is cleared on success; the card holds until tool.complete.
+    await waitFor(() => {
+      expect(document.querySelector('[data-clarify-restoring]')).toBeNull()
+    })
+  })
+})
+
+// Review round 1 found three ways the args-only card still misbehaved once it
+// was allowed to paint. Each case below is the reviewer's probe, kept.
+
+describe('ClarifyTool pending row correlates to its OWN request', () => {
+  const LATER_QUESTION = 'A later unrelated question?'
+
+  function batchProps(question: string, toolCallId: string): ToolCallMessagePartProps {
+    const args = { questions: [{ choices: BURIED_CHOICES, question }] }
+
+    return { ...uncorrelatedSingleProps(), args, argsText: JSON.stringify(args), toolCallId }
+  }
+
+  it('does not rebind a stale BATCH row to a later request in the same session', () => {
+    // The field shape: an old row sat unanswered for ~55 minutes while the turn
+    // carried on, so a later question can park its own request on the SAME
+    // session. Reading the session's request without correlating it repainted
+    // the old row with the new question and armed it — answering the wrong turn.
+    messageRunning = false
+    $activeSessionId.set('session-1')
+    $gateway.set({ request: vi.fn() } as never)
+
+    const props = batchProps('Old batch question?', 'clarify-old-batch')
+    const { rerender } = renderClarify(<ClarifyTool {...props} />)
+
+    act(() => {
+      setClarifyRequest({
+        choices: null,
+        multiSelect: false,
+        question: '',
+        questions: [{ choices: BURIED_CHOICES, multiSelect: false, qid: 'q0', question: LATER_QUESTION }],
+        requestId: 'request-later',
+        sessionId: 'session-1'
+      })
+    })
+    rerender(clarifyTree(<ClarifyTool {...props} />))
+
+    // Still its own question, still inert — the later request is not its own.
+    expect(screen.getByText('Old batch question?')).toBeTruthy()
+    expect(screen.queryByText(LATER_QUESTION)).toBeNull()
+    expect(document.querySelector('[data-clarify-restoring]')).toBeTruthy()
+    expect(screen.getByRole('button', { name: /Confirm and continue/ }).hasAttribute('disabled')).toBe(true)
+  })
+
+  it('does not rebind a stale SINGLE row to a later request in the same session', () => {
+    messageRunning = false
+    $activeSessionId.set('session-1')
+    $gateway.set({ request: vi.fn() } as never)
+
+    const props = uncorrelatedSingleProps()
+    const { rerender } = renderClarify(<ClarifyTool {...props} />)
+
+    act(() => {
+      setClarifyRequest({
+        choices: BURIED_CHOICES,
+        multiSelect: false,
+        question: LATER_QUESTION,
+        requestId: 'request-later-single',
+        sessionId: 'session-1'
+      })
+    })
+    rerender(clarifyTree(<ClarifyTool {...props} />))
+
+    expect(screen.getByText(BURIED_QUESTION)).toBeTruthy()
+    expect(screen.queryByText(LATER_QUESTION)).toBeNull()
+    expect(document.querySelector('[data-clarify-choices]')).toBeNull()
+  })
+
+  it('stays bound to its first request when a repeated same-text question follows', async () => {
+    // Two turns can ask the identical question. Text alone cannot separate them,
+    // so once a row has correlated it keeps ONLY that request id — otherwise the
+    // settled/older row silently adopts the newer turn's request.
+    const request = vi.fn().mockResolvedValue({ ok: true })
+
+    $activeSessionId.set('session-1')
+    $gateway.set({ request } as never)
+    setClarifyRequest({
+      choices: BURIED_CHOICES,
+      multiSelect: false,
+      question: BURIED_QUESTION,
+      requestId: 'request-first',
+      sessionId: 'session-1'
+    })
+
+    const props = uncorrelatedSingleProps()
+    const { rerender } = renderClarify(<ClarifyTool {...props} />)
+
+    // It correlated with request-first; now a NEW turn asks the same words.
+    act(() => {
+      setClarifyRequest({
+        choices: BURIED_CHOICES,
+        multiSelect: false,
+        question: BURIED_QUESTION,
+        requestId: 'request-second',
+        sessionId: 'session-1'
+      })
+    })
+    rerender(clarifyTree(<ClarifyTool {...props} />))
+
+    expect(document.querySelector('[data-clarify-restoring]')).toBeTruthy()
+    expect(document.querySelector('[data-clarify-choices]')).toBeNull()
+
+    fireEvent.click([...document.querySelectorAll<HTMLButtonElement>('[data-choice]')][0])
+    fireEvent.keyDown(window, { key: 'Enter' })
+
+    await waitFor(() => {
+      expect(request).not.toHaveBeenCalled()
+    })
+  })
+
+  it('re-arms on the SAME request id replayed after a reconnect', async () => {
+    // Sticky-by-id must not block the legitimate case: a reconnect replays the
+    // identical request id, and the card has to become answerable again.
+    const request = vi.fn().mockResolvedValue({ ok: true })
+
+    $activeSessionId.set('session-1')
+    $gateway.set({ request } as never)
+
+    const parked = {
+      choices: BURIED_CHOICES,
+      multiSelect: false,
+      question: BURIED_QUESTION,
+      requestId: 'request-replayed',
+      sessionId: 'session-1'
+    }
+
+    setClarifyRequest(parked)
+
+    const props = uncorrelatedSingleProps()
+    const { rerender } = renderClarify(<ClarifyTool {...props} />)
+
+    act(() => clearClarifyRequest('request-replayed', 'session-1'))
+    rerender(clarifyTree(<ClarifyTool {...props} />))
+    expect(document.querySelector('[data-clarify-restoring]')).toBeTruthy()
+
+    act(() => setClarifyRequest(parked))
+    rerender(clarifyTree(<ClarifyTool {...props} />))
+
+    expect(document.querySelector('[data-clarify-restoring]')).toBeNull()
+    fireEvent.click([...document.querySelectorAll<HTMLButtonElement>('[data-choice]')][0])
+    fireEvent.click(screen.getByRole('button', { name: /Continue/ }))
+
+    await waitFor(() => {
+      expect(request).toHaveBeenCalledWith('clarify.respond', {
+        answer: BURIED_CHOICES[0],
+        request_id: 'request-replayed'
+      })
+    })
+  })
+})
+
+describe('ClarifyTool batch card newly answerable focus handling', () => {
+  const parkedBatch = {
+    choices: null,
+    multiSelect: false,
+    question: '',
+    questions: [{ choices: BURIED_CHOICES, multiSelect: false, qid: 'q0', question: BURIED_QUESTION }],
+    requestId: 'request-batch-focus',
+    sessionId: 'session-1'
+  }
+
+  it('moves focus to the batch card region when nothing else is focused', () => {
+    messageRunning = false
+    $activeSessionId.set('session-1')
+    $gateway.set({ request: vi.fn() } as never)
+
+    const props = uncorrelatedBatchProps()
+    const { rerender } = renderClarify(<ClarifyTool {...props} />)
+
+    act(() => setClarifyRequest(parkedBatch))
+    rerender(clarifyTree(<ClarifyTool {...props} />))
+
+    const card = document.querySelector('[data-clarify-batch]')
+    expect(card).toBeTruthy()
+    expect(document.activeElement).toBe(card)
+    // Announced as a card, and a programmatic target only — never a Tab stop.
+    expect(card?.getAttribute('aria-label')).toBeTruthy()
+    expect(card?.getAttribute('tabindex')).toBe('-1')
+  })
+
+  it('never steals focus from a control the user is already using', () => {
+    messageRunning = false
+    $activeSessionId.set('session-1')
+    $gateway.set({ request: vi.fn() } as never)
+
+    const props = uncorrelatedBatchProps()
+    const { rerender } = renderClarify(<ClarifyTool {...props} />)
+
+    const composer = document.createElement('textarea')
+    document.body.append(composer)
+    composer.focus()
+
+    act(() => setClarifyRequest(parkedBatch))
+    rerender(clarifyTree(<ClarifyTool {...props} />))
+
+    expect(document.activeElement).toBe(composer)
+    composer.remove()
+  })
+
+  it('leaves focus alone for a batch card parked in a background tab', () => {
+    messageRunning = false
+    $gateway.set({ request: vi.fn() } as never)
+
+    const props = uncorrelatedBatchProps()
+
+    const hidden = (ui: ReactNode) => (
+      <div {...hiddenPaneProps(true)}>
+        <SessionViewProvider value={{ ...({} as SessionView), $runtimeId: atom<null | string>('session-1') }}>
+          {ui}
+        </SessionViewProvider>
+      </div>
+    )
+
+    const { rerender } = renderClarify(hidden(<ClarifyTool {...props} />))
+
+    act(() => setClarifyRequest(parkedBatch))
+    rerender(clarifyTree(hidden(<ClarifyTool {...props} />)))
+
+    expect(document.activeElement).toBe(document.body)
+  })
+})
+
+describe('ClarifyTool batch staged state survives the correlation gap', () => {
+  const parkedBatch = {
+    choices: null,
+    multiSelect: false,
+    question: '',
+    questions: [{ choices: null, multiSelect: false, qid: 'q0', question: BURIED_QUESTION }],
+    requestId: 'request-batch-draft',
+    sessionId: 'session-1'
+  }
+
+  function openEndedBatchProps(): ToolCallMessagePartProps {
+    const args = { questions: [{ question: BURIED_QUESTION }] }
+
+    return { ...uncorrelatedSingleProps(), args, argsText: JSON.stringify(args), toolCallId: 'clarify-batch-draft' }
+  }
+
+  it('keeps a typed draft and a picked choice across request → args-only → replay', async () => {
+    // Batch staged state used to be keyed by the server qid (`q0`). Clearing
+    // the request swaps the rendered questions to synthetic `args-0` ids, so
+    // the same mounted card rendered an empty field — the user watched their
+    // answer disappear while the transport flapped.
+    const request = vi.fn().mockResolvedValue({ ok: true })
+
+    $activeSessionId.set('session-1')
+    $gateway.set({ request } as never)
+    setClarifyRequest(parkedBatch)
+
+    const props = openEndedBatchProps()
+    const { rerender } = renderClarify(<ClarifyTool {...props} />)
+
+    // Staged while ARMED (a real user can only type into an enabled field).
+    const field = screen.getByRole('textbox') as HTMLTextAreaElement
+    expect(field.disabled).toBe(false)
+    fireEvent.change(field, { target: { value: 'keep this draft' } })
+
+    // The transport drops: the parked request is cleared, the card goes inert.
+    act(() => clearClarifyRequest('request-batch-draft', 'session-1'))
+    rerender(clarifyTree(<ClarifyTool {...props} />))
+
+    expect(document.querySelector('[data-clarify-restoring]')).toBeTruthy()
+    expect((screen.getByRole('textbox') as HTMLTextAreaElement).value).toBe('keep this draft')
+
+    // Replay: same card, same draft, now answerable and submittable.
+    act(() => setClarifyRequest(parkedBatch))
+    rerender(clarifyTree(<ClarifyTool {...props} />))
+
+    expect(document.querySelectorAll('[data-clarify-batch]')).toHaveLength(1)
+    expect((screen.getByRole('textbox') as HTMLTextAreaElement).value).toBe('keep this draft')
+
+    fireEvent.click(screen.getByRole('button', { name: /Confirm and continue/ }))
+
+    await waitFor(() => {
+      expect(request).toHaveBeenCalledWith('clarify.respond', {
+        answer: 'keep this draft',
+        question_id: 'q0',
+        request_id: 'request-batch-draft'
+      })
+    })
+  })
+
+  it('keeps a recommended choice and its note visible through request loss and replay', async () => {
+    const request = vi.fn().mockResolvedValue({ ok: true })
+    const decoratedChoices = ['Alpha (Recommended)', 'Beta']
+    const bareChoices = ['Alpha', 'Beta']
+
+    const parkedRecommendedBatch = {
+      ...parkedBatch,
+      questions: [{ choices: decoratedChoices, multiSelect: false, qid: 'q0', question: BURIED_QUESTION }]
+    }
+
+    const args = { questions: [{ choices: bareChoices, question: BURIED_QUESTION }] }
+
+    const props: ToolCallMessagePartProps = {
+      ...uncorrelatedSingleProps(),
+      args,
+      argsText: JSON.stringify(args),
+      toolCallId: 'clarify-batch-draft'
+    }
+
+    $activeSessionId.set('session-1')
+    $gateway.set({ request } as never)
+    setClarifyRequest(parkedRecommendedBatch)
+
+    const { rerender } = renderClarify(<ClarifyTool {...props} />)
+
+    // The gateway decorates the recommended option, while persisted tool args
+    // retain the bare value. Stage the real request-side value while armed.
+    const alpha = [...document.querySelectorAll<HTMLButtonElement>('[data-choice]')][0]
+    expect(alpha.disabled).toBe(false)
+    fireEvent.click(alpha)
+    fireEvent.click(screen.getByRole('button', { name: 'Add note for Alpha' }))
+    fireEvent.change(screen.getByRole('textbox', { name: 'Note for Alpha' }), {
+      target: { value: 'keep this note' }
+    })
+
+    expect(alpha.getAttribute('aria-pressed')).toBe('true')
+    expect(screen.getByRole('textbox', { name: 'Note for Alpha' })).toHaveProperty('value', 'keep this note')
+
+    // Correlation drops: the card renders from bare args, but the selected
+    // option and its open note must remain visible instead of disappearing.
+    act(() => clearClarifyRequest('request-batch-draft', 'session-1'))
+    rerender(clarifyTree(<ClarifyTool {...props} />))
+
+    const inertAlpha = [...document.querySelectorAll<HTMLButtonElement>('[data-choice]')][0]
+    expect(inertAlpha.getAttribute('aria-pressed')).toBe('true')
+    expect(screen.getByRole('textbox', { name: 'Note for Alpha' })).toHaveProperty('value', 'keep this note')
+    expect(document.querySelector('[data-clarify-restoring]')).toBeTruthy()
+
+    // The same request id replays with decorated choices. Preserve the same
+    // local state, then send the canonical bare answer and server qid.
+    act(() => setClarifyRequest(parkedRecommendedBatch))
+    rerender(clarifyTree(<ClarifyTool {...props} />))
+
+    const replayedAlpha = [...document.querySelectorAll<HTMLButtonElement>('[data-choice]')][0]
+    expect(replayedAlpha.getAttribute('aria-pressed')).toBe('true')
+    expect(screen.getByRole('textbox', { name: 'Note for Alpha' })).toHaveProperty('value', 'keep this note')
+
+    fireEvent.click(screen.getByRole('button', { name: /Confirm and continue/ }))
+
+    await waitFor(() => {
+      expect(request).toHaveBeenCalledWith('clarify.respond', {
+        answer: 'Alpha',
+        note: 'keep this note',
+        question_id: 'q0',
+        request_id: 'request-batch-draft'
+      })
     })
   })
 })

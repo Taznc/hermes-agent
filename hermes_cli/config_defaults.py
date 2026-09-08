@@ -656,6 +656,8 @@ DEFAULT_CONFIG = {
             "trace": "disabled",         # "enabled" | "disabled" | "enabled_full"
         },
     },
+    # >>> FORK ANCHOR: model-recommendation-preset <<<
+    "model_recommendation": {"preset": "balanced"},
     # Auxiliary model config — provider/model per side task. provider "auto" = auto-detect;
     # empty model = provider's default aux model; all tasks fall back to
     # openrouter:google/gemini-3-flash-preview when the configured provider is unavailable.
@@ -724,6 +726,9 @@ DEFAULT_CONFIG = {
         "triage_specifier": _aux(120),
         "kanban_decomposer": _aux(180),
         "profile_describer": _aux(60),   # 1-2 sentence profile blurb; short, cheap
+        # Desktop advisory-only router. Inert until provider and model are explicitly configured;
+        # it is intentionally absent from the model-assignment slot inventory.
+        "model_recommendation": _aux(30),
         "goal_judge": _aux(60),          # /goal satisfaction + contract drafting; JSON calls
         # Curator skill-usage review can take minutes on reasoning models (umbrellas over hundreds
         # of skills); route cheaper via `hermes model` → auxiliary → Curator.
@@ -1719,6 +1724,30 @@ DEFAULT_CONFIG = {
         # it follows the bounded interruption policy (max_infra_interruptions) instead.
         # Default 24h. Parse only positive base-10 integer retry-after values.
         "provider_backoff_max_seconds": 86400,
+        # Optional host-wide account/budget quota circuits. Configure this only
+        # in the shared/default Hermes home's config.yaml; dispatchers and
+        # profile-scoped workers read that one authoritative host policy.
+        # Empty by default:
+        # provider names are not account identities, and credential selection
+        # happens inside the worker. Operators explicitly map opaque, non-secret
+        # group labels to provider/profile routes, for example:
+        # quota_budget_groups:
+        #   primary-wallet:
+        #     providers: [openai-codex]
+        #     profiles: [implementer, reviewer]
+        # A route matches both lists; `*` is accepted only when written. A task
+        # with provider `auto` is a candidate for every group mapped to its
+        # profile: the dispatcher predicts the provider the worker's own
+        # resolution ladder will choose for the explicit `provider=auto`
+        # request it is spawned with, and starts it only when that provider
+        # maps to an unpaused group. Unpredictable or unmapped resolution fails
+        # closed while any candidate group is paused.
+        "quota_budget_groups": {},
+        # At a circuit deadline, admit one recovery probe host-wide, then admit
+        # at most one further matching start per this many seconds until no
+        # start has been admitted for four such windows. A renewed quota event
+        # re-arms the circuit.
+        "quota_resume_spread_seconds": 30,
         # Max consecutive infra interruptions (external SIGTERM/SIGKILL, startup-window
         # dead pid, quota signature including malformed/missing retry-after) before the
         # task is routed through normal counted failure accounting. Default 3; minimum
@@ -1779,10 +1808,65 @@ DEFAULT_CONFIG = {
         # the earliest start leaves the window. None = off.
         "dispatch_start_budget": None,
         "dispatch_start_window_seconds": 600,
+        # Maintenance actions an operator may queue to fire automatically once a
+        # PAUSED board drains to zero running workers (dashboard "after drain"
+        # selector / POST /dispatch/post-drain). The trigger is drain, never a
+        # wall clock; expiry below is a safety bound, not a schedule.
+        "post_drain": {
+            # Units `service_restart` may restart, by exact name. EMPTY BY
+            # DEFAULT: a queued action runs unattended, so which units may be
+            # restarted is an explicit local decision rather than an inherited
+            # one, and an empty list makes `service_restart` unqueueable. A
+            # request may only NAME an entry from this list — it can never
+            # supply a unit of its own. e.g. ["hermes-gateway.service"].
+            "service_restart_allowlist": [],
+            # "system" (systemctl) or "user" (systemctl --user).
+            "service_restart_scope": "system",
+            # Expiry applied when the operator does not choose one. A pause that
+            # never drains lets the action expire instead of firing hours later
+            # into a state nobody expects.
+            "default_expiry_seconds": 3600,
+            # Hard ceiling on any requested expiry (24h).
+            "max_expiry_seconds": 86400,
+        },
         # After two reviewer changes-requested cycles, route the next rework run
         # to this specialist profile under that profile's own model defaults.
         # Empty preserves the original implementer loop.
         "review_rework_escalation_profile": "",
+        # Worker preservation safety net. When a run ends (completion, review
+        # request, block, archive) or is reclaimed (stale claim, timeout, dead
+        # worker), Hermes commits any dirty work in that task's OWN git
+        # worktree onto its existing task branch and pushes it to the
+        # configured remote without force — so implementation work never
+        # remains only on the machine that produced it.
+        #
+        # It is a PRESERVATION net, not merge automation: it never merges,
+        # rebases, force-pushes, switches branches, or deletes a worktree or
+        # branch, and it never touches another task's workspace. Ownership or
+        # branch ambiguity fails closed before commit; unsafe content and git
+        # failures record a redacted ``work_preservation_failed`` event. A
+        # rejected push keeps the local commit and records ``pushed: false``.
+        # In every case cleanup retains dirty or unpushed work for a human.
+        # Only ``worktree`` workspaces are in scope; ``scratch``/``dir`` are
+        # untouched. Gitignored files are excluded by git itself.
+        "worker_preservation": {
+            # Set false for non-Git workflows or hosts with custom remotes
+            # where an automated push is unwanted. Preservation is skipped
+            # entirely; nothing else changes.
+            "enabled": True,
+            # Refuse to snapshot when any single candidate file exceeds this,
+            # or when the whole snapshot does. A safety net rescues
+            # source-sized work; larger content is a build artifact or dataset
+            # a human should place deliberately.
+            "max_file_bytes": 5 * 1024 * 1024,
+            "max_total_bytes": 20 * 1024 * 1024,
+        },
+        # Hard stop on the review<->changes_requested loop: once a card accumulates this many
+        # changes_requested events since its last completion, the dispatcher blocks it
+        # (kind="review_round_cap") instead of re-dispatching to the implementer or escalation
+        # profile. 0 = unlimited (legacy behavior). The reviewer-side round contract (sdlc-review
+        # skill) is advisory; this is the hard stop that actually bounds a runaway rework loop.
+        "max_review_rounds": 3,
         # Auto-run the decomposer on Triage tasks every tick. False = manual via `hermes kanban
         # decompose <id>` or the dashboard's Decompose button.
         "auto_decompose": True,

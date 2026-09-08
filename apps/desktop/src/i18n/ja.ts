@@ -135,6 +135,7 @@ export const ja = defineForkLocale(forkJa, {
     more: count => `他 ${count} 件の通知`,
     clearAll: 'すべてクリア',
     dismiss: '通知を閉じる',
+    dismissAction: '閉じる',
     details: '詳細',
     copyDetail: '詳細をコピー',
     copyDetailFailed: '通知の詳細をコピーできませんでした',
@@ -335,6 +336,7 @@ export const ja = defineForkLocale(forkJa, {
       testSent:
         'テストを送信しました。表示されない場合は、OS の通知許可と集中モード／おやすみモードを確認してください。',
       testUnsupported: 'このシステムはネイティブ通知に対応していません。',
+      testDenied: 'このサイトの通知がブロックされています。ブラウザのサイト設定で許可してから、もう一度お試しください。',
       completionSoundTitle: '完了サウンド',
       completionSoundDesc: 'エージェントのターン終了時に再生されます。プリセットを選んでここで試聴できます。',
       completionSoundPreview: '試聴'
@@ -2933,7 +2935,8 @@ export const ja = defineForkLocale(forkJa, {
       noGuestBody:
         'このビルドの Hermes はブラウザー上で動作するため、他のサイトをペイン内に埋め込めません。上にアドレスを入力すると、Hermes が新しいブラウザータブで開きます。',
       noGuestOpen: url => `${url} をブラウザーのタブで開く`,
-      openBlocked: 'ブラウザーが新しいタブをブロックしました。このページのポップアップを許可してからもう一度お試しください。',
+      openBlocked:
+        'ブラウザーが新しいタブをブロックしました。このページのポップアップを許可してからもう一度お試しください。',
       finishedRestarting: message =>
         `Hermes がプレビューサーバーの再起動を完了しました${message ? `: ${message}` : ''}`,
       failedRestarting: message => `サーバーの再起動に失敗しました: ${message}`,
@@ -3107,6 +3110,7 @@ export const ja = defineForkLocale(forkJa, {
       gatewayDisconnected: 'Hermes ゲートウェイが接続されていません',
       sendFailed: '明確化応答を送信できませんでした',
       loadingQuestion: '質問を読み込み中…',
+      restoring: 'この質問を復元しています — まもなく回答できます',
       other: 'その他（回答を入力）',
       placeholder: '回答を入力…',
       skip: 'スキップ',
@@ -3115,9 +3119,17 @@ export const ja = defineForkLocale(forkJa, {
       confirmAndContinueLabel: '確定して続行',
       answeredBadge: '回答済み',
       questionProgress: (answered, total) => `${total}問中${answered}問回答済み`,
+      questionGroup: total => `回答が必要な質問が${total}件あります`,
       lateAnswer: (question, choice) => `「${question}」について — 私の回答: ${choice}`,
       lateAnswerTip: 'この回答をフォローアップメッセージとして下書きします',
-      lateAnswerHint: 'この質問はもう回答を待っていません。選択肢を選ぶとフォローアップメッセージとして下書きされます。'
+      lateAnswerHint:
+        'この質問はもう回答を待っていません。選択肢を選ぶとフォローアップメッセージとして下書きされます。',
+      addNote: 'メモを追加',
+      addNoteFor: label => `${label}にメモを追加`,
+      note: 'メモ',
+      noteFor: label => `${label}のメモ`,
+      notePlaceholder: '任意のメモを追加…',
+      selected: '選択済み'
     },
     tool: {
       copyCode: 'コードをコピー',

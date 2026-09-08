@@ -138,6 +138,7 @@ export const zhAuthored: Translations = withForkKeys(forkZh, {
     more: count => `另外 ${count} 条通知`,
     clearAll: '全部清除',
     dismiss: '关闭通知',
+    dismissAction: '关闭',
     details: '详情',
     copyDetail: '复制详情',
     copyDetailFailed: '无法复制通知详情',
@@ -512,6 +513,7 @@ export const zhAuthored: Translations = withForkKeys(forkZh, {
       testBody: '通知工作正常。',
       testSent: '测试已发送。如果没有出现，请检查系统通知权限和专注模式／勿扰模式。',
       testUnsupported: '此系统不支持原生通知。',
+      testDenied: '此网站的通知已被拦截。请在浏览器的网站设置中允许通知，然后重试。',
       completionSoundTitle: '完成提示音',
       completionSoundDesc: '智能体回合结束时播放。可在此选择预设并预览。',
       completionSoundPreview: '预览'
@@ -3700,6 +3702,7 @@ export const zhAuthored: Translations = withForkKeys(forkZh, {
       gatewayDisconnected: 'Hermes 网关未连接',
       sendFailed: '无法发送澄清响应',
       loadingQuestion: '正在加载问题…',
+      restoring: '正在恢复此问题 — 稍后即可回答',
       other: '其他 (输入你的答案)',
       placeholder: '输入你的答案…',
       skip: '跳过',
@@ -3708,9 +3711,16 @@ export const zhAuthored: Translations = withForkKeys(forkZh, {
       confirmAndContinueLabel: '确认并继续',
       answeredBadge: '已回答',
       questionProgress: (answered, total) => `已回答 ${answered}/${total}`,
+      questionGroup: total => `有 ${total} 个问题待回答`,
       lateAnswer: (question, choice) => `关于"${question}" — 我的回答: ${choice}`,
       lateAnswerTip: '将此回答起草为后续消息',
-      lateAnswerHint: '此问题已不再等待回答。选择一个选项会将其起草为后续消息。'
+      lateAnswerHint: '此问题已不再等待回答。选择一个选项会将其起草为后续消息。',
+      addNote: '添加备注',
+      addNoteFor: label => `为${label}添加备注`,
+      note: '备注',
+      noteFor: label => `${label}的备注`,
+      notePlaceholder: '添加可选备注…',
+      selected: '已选择'
     },
     mcpSetup: {
       installTitle: server => `添加 ${server} MCP 服务器？`,
