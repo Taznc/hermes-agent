@@ -46,8 +46,11 @@ def _write_config(home, data):
 
 
 def test_readonly_result_is_immutable(isolated_hermes_home):
-    """The frozen-view contract that replaced the old identity invariant: a readonly
-    caller cannot reach into the cache, at any depth. (FrozenConfigError is a TypeError.)"""
+    """The read-only-view contract that replaced the old identity invariant: a readonly
+    caller cannot reach into the cache, at any depth — not through a mutator (which raises,
+    FrozenConfigError being a TypeError) and not through object identity (nothing published
+    is an object the cache holds, so unbound base-class mutators cannot reach it either)."""
+    import hermes_cli.config as config_mod
     from hermes_cli.config import read_raw_config_readonly
 
     _write_config(isolated_hermes_home,
@@ -55,10 +58,22 @@ def test_readonly_result_is_immutable(isolated_hermes_home):
     ro = read_raw_config_readonly()
     assert ro["telemetry"]["shared_metrics"]["enabled"] is True
 
+    (entry,) = list(config_mod._RAW_CONFIG_CACHE.values())
+    cached = entry[2]
+    assert ro is not cached
+    assert ro["telemetry"] is not cached["telemetry"]
+    assert ro["list_key"] is not cached["list_key"]
+
     with pytest.raises(TypeError):
         ro["telemetry"]["shared_metrics"]["enabled"] = False
     with pytest.raises(TypeError):
         ro["list_key"].append(3)
+
+    dict.__setitem__(ro["telemetry"]["shared_metrics"], "enabled", False)
+    list.append(ro["list_key"], 3)
+    assert cached["telemetry"]["shared_metrics"]["enabled"] is True
+    assert cached["list_key"] == [1, 2]
+
     assert read_raw_config_readonly()["telemetry"]["shared_metrics"]["enabled"] is True
     assert read_raw_config_readonly()["list_key"] == [1, 2]
 

@@ -48,20 +48,45 @@ def _write_config(home: Path, data: dict) -> Path:
     return cfg
 
 
+def _cached_raw_tree() -> dict:
+    """The private tree ``_RAW_CONFIG_CACHE`` holds — nothing published may be part of it."""
+    (entry,) = list(config_mod._RAW_CONFIG_CACHE.values())
+    return entry[2]
+
+
+def _cached_merged_tree() -> dict:
+    (entry,) = list(config_mod._LOAD_CONFIG_CACHE.values())
+    return entry[4]
+
+
 # --------------------------------------------------------------------------------------
 # repro_a, step 1+2 — the aliasing itself
 # --------------------------------------------------------------------------------------
 
 def test_readonly_result_is_not_reachable_from_the_cache(config_home):
-    """The readonly reader must not publish anything the cache owns, at ANY depth.
+    """Nothing the readonly reader publishes may be an object the cache holds, at ANY depth.
 
-    Pre-fix both mutations SUCCEEDED and silently corrupted the cache for every later reader.
+    Pre-fix the readonly result WAS the cached dict and a retained nested list WAS the cached
+    list, so mutating it silently corrupted the cache for every later reader.
+
+    Object non-identity is the load-bearing assertion, not mutator refusal: a ``dict``
+    subclass that merely overrides ``__setitem__`` is still writable through the unbound
+    base-class method (``dict.__setitem__(view, ...)``), so a cache-owned subclass would
+    remain reachable. Both are asserted here.
     """
     _write_config(config_home, {"command_allowlist": ["ls", "cat"],
                                 "approvals": {"deny": ["rm -rf /"]}})
 
     result = read_raw_config_readonly()
     assert result["command_allowlist"] == ["ls", "cat"]
+
+    cached = _cached_raw_tree()
+    assert result is not cached
+    assert result["approvals"] is not cached["approvals"]
+    assert result["command_allowlist"] is not cached["command_allowlist"]
+    assert result["approvals"]["deny"] is not cached["approvals"]["deny"]
+    # Two readers never share a container either, so one cannot reach the other's.
+    assert result["approvals"] is not read_raw_config_readonly()["approvals"]
 
     with pytest.raises(TypeError):
         result["command_allowlist"].append("rm")
@@ -70,8 +95,18 @@ def test_readonly_result_is_not_reachable_from_the_cache(config_home):
     with pytest.raises(TypeError):
         result["new_key"] = 1
 
+    # The bypass that a mutator-overriding subclass cannot stop: unbound base-class calls.
+    # They must land in the throwaway view and be invisible to the cache and every reader.
+    dict.__setitem__(result["approvals"], "injected", True)
+    list.append(result["approvals"]["deny"], "injected")
+    dict.__setitem__(result, "injected_top", True)
+
+    assert "injected" not in cached["approvals"]
+    assert cached["approvals"]["deny"] == ["rm -rf /"]
+    assert "injected_top" not in cached
+    assert read_raw_config_readonly()["approvals"] == {"deny": ["rm -rf /"]}
+    assert read_raw_config()["approvals"] == {"deny": ["rm -rf /"]}
     assert read_raw_config_readonly()["command_allowlist"] == ["ls", "cat"]
-    assert read_raw_config_readonly()["approvals"]["deny"] == ["rm -rf /"]
 
 
 def test_mutable_reader_is_never_aliased_to_the_cache(config_home):
@@ -93,10 +128,21 @@ def test_load_config_readonly_has_the_same_contract(config_home):
                                 "command_allowlist": ["ls"]})
 
     ro = load_config_readonly()
+    cached = _cached_merged_tree()
+    assert ro is not cached
+    assert ro["model"] is not cached["model"]
+    assert ro["command_allowlist"] is not cached["command_allowlist"]
+
     with pytest.raises(TypeError):
         ro["command_allowlist"].append("rm")
     with pytest.raises(TypeError):
         ro["model"]["default"] = "other"
+
+    # Base-class bypass must not reach the cache on this path either.
+    dict.__setitem__(ro["model"], "default", "injected")
+    list.append(ro["command_allowlist"], "injected")
+    assert cached["model"]["default"] == "test-model"
+    assert cached["command_allowlist"] == ["ls"]
 
     mutable = load_config()
     assert type(mutable) is dict
@@ -174,21 +220,76 @@ def test_copy_terminates_while_a_retained_nested_list_grows(config_home):
 
 
 def test_breached_read_falls_back_to_the_last_good_snapshot(config_home, monkeypatch, caplog):
-    """On a breach the reader serves the read-only snapshot and logs ERROR — never spins."""
+    """On a breach the mutable readers still honour their contract: a plain MUTABLE copy.
+
+    Failing closed must not change what ``read_raw_config()``/``load_config()`` return —
+    callers mutate and serialize those results, so handing back a read-only view on the
+    fail-safe path would trade a hang for a ``TypeError`` (or a YAML ``RepresenterError``)
+    in exactly the degraded situation the fallback exists for. The fallback is a ``thaw`` of
+    the same cached tree: unbounded but terminating by construction (every list is
+    snapshotted before it is walked, every object memoised).
+    """
     from hermes_cli.config_snapshot import BoundedCopyBreach
 
-    _write_config(config_home, {"approvals": {"deny": ["rm -rf /"]}})
+    _write_config(config_home, {"approvals": {"deny": ["rm -rf /"], "mode": "manual"}})
     read_raw_config_readonly()  # populate the cache
+    load_config_readonly()
 
     def _always_breach(*_args, **_kwargs):
         raise BoundedCopyBreach("approvals", 999, 1.5, "node")
 
-    monkeypatch.setattr(config_mod, "bounded_deepcopy", _always_breach)
-    with caplog.at_level("ERROR", logger=config_mod.logger.name):
-        served = read_raw_config()
+    real_copy = config_mod.bounded_deepcopy
+    config_mod.bounded_deepcopy = _always_breach
+    try:
+        for reader in (read_raw_config, load_config):
+            caplog.clear()
+            with caplog.at_level("ERROR", logger=config_mod.logger.name):
+                served = reader()
 
-    assert served["approvals"]["deny"] == ["rm -rf /"]  # last good values, not {}
-    assert any("approvals" in rec.getMessage() for rec in caplog.records), caplog.text
+            assert served["approvals"]["deny"] == ["rm -rf /"]  # last good values, not {}
+            assert type(served) is dict and type(served["approvals"]["deny"]) is list
+            served["approvals"]["deny"].append("added")  # must not raise
+            served["approvals"]["mode"] = "auto"
+            yaml.safe_dump(served)  # callers write these results back out
+            assert any("approvals" in rec.getMessage() for rec in caplog.records), caplog.text
+    finally:
+        config_mod.bounded_deepcopy = real_copy
+
+    # Mutating a breach result must not have reached the cache.
+    assert read_raw_config_readonly()["approvals"]["deny"] == ["rm -rf /"]
+    assert read_raw_config()["approvals"]["mode"] == "manual"
+
+
+# --------------------------------------------------------------------------------------
+# YAML anchors/aliases and self-references must copy exactly as copy.deepcopy did
+# --------------------------------------------------------------------------------------
+
+def test_aliased_and_cyclic_yaml_still_reads(config_home):
+    """A self-referential document read fine on ``dev`` (``copy.deepcopy`` memoises); the
+    replacement copy must too, or every raw config read raises ``RecursionError``.
+
+    ``root: &root\\n  self: *root`` is the minimal case. Aliases that merely SHARE a node
+    (no cycle) must keep their sharing, since that is what ``copy.deepcopy`` guarantees and
+    what a caller comparing two sections would observe.
+    """
+    cfg = config_home / "config.yaml"
+    cfg.write_text("root: &root\n  self: *root\n", encoding="utf-8")
+
+    out = read_raw_config()
+    assert out["root"] is out["root"]["self"], "the cycle must be preserved, not unrolled"
+    assert read_raw_config()["root"]["self"]["self"]["self"] is not None
+    # The readonly view mints a wrapper per access, so identity is not the observable here
+    # (and ``==`` on two self-referential mappings recurses forever). Walking it must work.
+    node = read_raw_config_readonly()["root"]
+    for _ in range(50):
+        assert list(node.keys()) == ["self"]
+        node = node["self"]
+
+    cfg.write_text("shared: &s\n  a: 1\nfirst: *s\nsecond: *s\n", encoding="utf-8")
+    config_mod._RAW_CONFIG_CACHE.clear()
+    shared = read_raw_config()
+    assert shared["first"] == {"a": 1}
+    assert shared["first"] is shared["second"], "aliased nodes must stay shared after a copy"
 
 
 # --------------------------------------------------------------------------------------

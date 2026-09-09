@@ -27,7 +27,7 @@ from hermes_cli.cli_output import line_input
 from hermes_cli.colors import Colors, color
 from hermes_cli import managed_scope
 from hermes_cli.config_snapshot import (
-    BoundedCopyBreach, bounded_deepcopy, copy_budget_for, freeze)
+    BoundedCopyBreach, bounded_deepcopy, copy_budget_for, count_nodes, readonly_view, thaw)
 from hermes_cli.default_soul import DEFAULT_SOUL_MD, is_legacy_template_soul
 from hermes_cli.secret_prompt import masked_secret_prompt
 # Re-export from hermes_constants — canonical definition lives there.
@@ -214,10 +214,11 @@ _LAST_EXPANDED_CONFIG_BY_PATH: Dict[str, Any] = {}
 # atomic_yaml_write which produces a fresh inode, so stat() sees a new mtime_ns and the next load
 # repopulates automatically — no explicit invalidation hook. See #58514.
 _LOAD_CONFIG_CACHE: Dict[str, Tuple[int, int, int, int, Any, Dict[str, Optional[str]], int]] = {}
-# path -> (mtime_ns, size, frozen raw yaml view, node count) for the raw config readers (no
-# defaults merged in). The cache stores ONLY an immutable view: publishing a mutable cached
-# object let a caller retain a nested list and mutate it while another thread deepcopied it,
-# which never terminates (see hermes_cli/config_snapshot.py).
+# path -> (mtime_ns, size, raw yaml dict, node count) for the raw config readers (no defaults
+# merged in). The cached tree is PRIVATE: readers get a bounded mutable copy or a freshly
+# minted read-only view. Publishing the cached object let a caller retain a nested list and
+# mutate it while another thread deepcopied it, which never terminates (see
+# hermes_cli/config_snapshot.py).
 _RAW_CONFIG_CACHE: Dict[str, Tuple[int, int, Any, int]] = {}
 
 # Env var names written to .env that aren't in OPTIONAL_ENV_VARS (managed by setup/provider
@@ -1887,31 +1888,35 @@ def cfg_get(cfg: Optional[Dict[str, Any]], *keys: str, default: Any = None) -> A
     return node
 
 
-def _copy_config_snapshot(frozen: Any, nodes: int, *, source: str) -> Dict[str, Any]:
-    """Mutable deep copy of a frozen config snapshot, under node/elapsed ceilings.
+def _copy_config_snapshot(tree: Any, nodes: int, *, source: str) -> Dict[str, Any]:
+    """Mutable deep copy of a cached config tree, under node/elapsed ceilings.
 
     Runs OUTSIDE ``_CONFIG_LOCK``: a slow copy must never make config reads unavailable
-    process-wide. On breach we log the offending top-level key and fail closed to the
-    read-only snapshot — a bounded, correct answer beats a thread spinning forever inside
-    ``copy.deepcopy`` (which is exactly how a gateway wedged for 16 hours).
+    process-wide. On breach we log the offending top-level key and fall back to an
+    unbounded-but-terminating ``thaw`` of the same tree — the caller still gets ordinary
+    mutable containers, which is this API's contract, and ``thaw`` cannot spin because it
+    snapshots every list before walking it and memoises shared objects. A bounded, correct
+    answer beats a thread spinning forever inside ``copy.deepcopy`` (which is exactly how a
+    gateway wedged for 16 hours).
     """
     try:
-        return bounded_deepcopy(frozen, node_limit=copy_budget_for(nodes))
+        return bounded_deepcopy(tree, node_limit=copy_budget_for(nodes))
     except BoundedCopyBreach as breach:
         logger.error(
             "Copying %s exceeded its %s ceiling at top-level key %r after %d nodes / %.2fs "
-            "(snapshot was %d nodes when cached). Serving the read-only snapshot instead; "
-            "mutating it will raise. Inspect that key in config.yaml.",
+            "(snapshot was %d nodes when cached). Serving the last good snapshot instead. "
+            "Inspect that key in config.yaml.",
             source, breach.limit, breach.top_key, breach.nodes, breach.elapsed, nodes)
-        return frozen
+        return thaw(tree)
 
 
 def _raw_config_snapshot() -> Optional[Tuple[Any, int]]:
-    """``(frozen_view, node_count)`` for config.yaml, or None when missing/unparseable.
+    """``(cached_tree, node_count)`` for config.yaml, or None when missing/unparseable.
 
-    The cache stores ONLY the frozen view, so no caller can ever reach a mutable object the
-    cache owns — the aliasing that let a retained nested list be appended to while it was
-    being deepcopied. Everything here is O(1) on a cache hit; copying happens above the lock.
+    The tree stays PRIVATE to the cache: readers get either a bounded mutable copy or a
+    freshly minted read-only view, never this object. That closes the aliasing which let a
+    retained nested list be appended to while it was being deepcopied. Everything here is
+    O(1) on a cache hit; copying and wrapping happen above the lock.
     """
     with _CONFIG_LOCK:
         try:
@@ -1935,19 +1940,19 @@ def _raw_config_snapshot() -> Optional[Tuple[Any, int]]:
 
         if not isinstance(data, dict):
             data = {}
-        frozen, nodes = freeze(data)
-        _RAW_CONFIG_CACHE[path_key] = (*cache_key, frozen, nodes)
-        return frozen, nodes
+        nodes = count_nodes(data)
+        _RAW_CONFIG_CACHE[path_key] = (*cache_key, data, nodes)
+        return data, nodes
 
 
 def _read_raw_config_impl(*, want_deepcopy: bool) -> Dict[str, Any]:
     snapshot = _raw_config_snapshot()
     if snapshot is None:
         return {}
-    frozen, nodes = snapshot
+    tree, nodes = snapshot
     if not want_deepcopy:
-        return frozen
-    return _copy_config_snapshot(frozen, nodes, source="config.yaml")
+        return readonly_view(tree)
+    return _copy_config_snapshot(tree, nodes, source="config.yaml")
 
 
 def read_raw_config() -> Dict[str, Any]:
@@ -2175,7 +2180,7 @@ def _load_config_cache_sig(config_path: Path) -> Tuple[Optional[Tuple[int, int]]
 
 
 def _last_known_good_fallback(config_path: Path, path_key: str, cache_sig, exc: Exception) -> Optional[Tuple[Any, int]]:
-    """Warn about a parse failure and return the last-known-good ``(frozen, nodes)``, or None.
+    """Warn about a parse failure and return the last-known-good ``(tree, nodes)``, or None.
     A parse failure must not silently replace the effective config with defaults — that drops
     EVERY user override, including security-critical ``approvals.deny`` rules, when a gateway
     user mid-edits config.yaml into broken YAML. Keep serving the last good config until fixed."""
@@ -2190,12 +2195,13 @@ def _last_known_good_fallback(config_path: Path, path_key: str, cache_sig, exc: 
         return None
     # save_config() stores the pre-expansion dict (templates preserved); the load path stores the
     # expanded one. Expand defensively — idempotent when already expanded.
-    frozen, nodes = freeze(_expand_env_vars(copy.deepcopy(lkg)))
+    tree = _expand_env_vars(copy.deepcopy(lkg))
+    nodes = count_nodes(tree)
     if cache_sig is not None:
         # Cache under the corrupt file's signature (empty env snapshot: always valid) so repeated
         # loads don't re-parse; fixing the file changes the signature and reloads normally.
-        _LOAD_CONFIG_CACHE[path_key] = (*cache_sig, frozen, {}, nodes)
-    return frozen, nodes
+        _LOAD_CONFIG_CACHE[path_key] = (*cache_sig, tree, {}, nodes)
+    return tree, nodes
 
 
 def _merge_managed_overlay(expanded: Dict[str, Any]) -> Tuple[Dict[str, Any], Any]:
@@ -2265,24 +2271,24 @@ def _load_config_snapshot() -> Tuple[Any, int]:
         normalized = _canonicalize_config(config)
         expanded, managed_config = _merge_managed_overlay(_expand_env_vars(normalized))
         _LAST_EXPANDED_CONFIG_BY_PATH[path_key] = copy.deepcopy(expanded)
-        frozen, nodes = freeze(expanded)
+        nodes = count_nodes(expanded)
         if cache_sig is not None:
             # The env snapshot records the values this expansion was made against so later
             # loads detect drift.
             env_snapshot = _env_ref_snapshot(normalized)
             if managed_config:
                 _env_ref_snapshot(managed_config, env_snapshot)
-            _LOAD_CONFIG_CACHE[path_key] = (*cache_sig, frozen, env_snapshot, nodes)
+            _LOAD_CONFIG_CACHE[path_key] = (*cache_sig, expanded, env_snapshot, nodes)
         else:
             _LOAD_CONFIG_CACHE.pop(path_key, None)
-        return frozen, nodes
+        return expanded, nodes
 
 
 def _load_config_impl(*, want_deepcopy: bool) -> Dict[str, Any]:
-    frozen, nodes = _load_config_snapshot()
+    tree, nodes = _load_config_snapshot()
     if not want_deepcopy:
-        return frozen
-    return _copy_config_snapshot(frozen, nodes, source="the merged config")
+        return readonly_view(tree)
+    return _copy_config_snapshot(tree, nodes, source="the merged config")
 
 
 _SECURITY_COMMENT = """
