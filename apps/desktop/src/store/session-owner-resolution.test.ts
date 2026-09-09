@@ -16,6 +16,17 @@ const registry = (...ids: string[]) =>
     primary: ids[0] ?? null
   }) as never
 
+// A host that owns a connection registry (real Electron, any version): the
+// bridge always exposes getConnectionConfig, the sentinel connectionsManagedByHost
+// gates on. Tests below that model Electron topology (with or without a live
+// registry) call this so "no registry" and "no host capability" stay distinct.
+function setElectronHost(extra: Record<string, unknown> = {}): void {
+  ;(window as unknown as { hermesDesktop?: unknown }).hermesDesktop = {
+    getConnectionConfig: vi.fn(async () => ({})),
+    ...extra
+  }
+}
+
 beforeEach(() => {
   $connectionsRegistry.set(null)
   $profiles.set([])
@@ -27,9 +38,9 @@ afterEach(() => {
 
 describe('session owner topology', () => {
   it('fails closed while the modern registry bridge is present but its async cache is not loaded', () => {
-    ;(window as unknown as { hermesDesktop?: unknown }).hermesDesktop = {
+    setElectronHost({
       connections: { list: vi.fn(async () => Promise.reject(new Error('ipc unavailable'))) }
-    }
+    })
     $connectionsRegistry.set(null)
     $profiles.set([{ name: 'default' }] as never)
 
@@ -49,6 +60,7 @@ describe('session owner topology', () => {
     // closed. A bare profile still names a backend — the legacy profile door
     // (a pick on the primary / explicit `local` source) mints sessions owned
     // by that profile's pool socket in every topology.
+    setElectronHost()
     $connectionsRegistry.set(registry('local'))
     $profiles.set([{ name: 'default' }] as never)
 
@@ -80,6 +92,32 @@ describe('session owner topology', () => {
     expect(ambientGatewayOwnsEverySession()).toBe(false)
     expect(() =>
       assertSessionOwnerResolved('loki', { method: 'session.resume', sessionId: 'legacy-profile-owner' })
+    ).not.toThrow()
+  })
+
+  it('treats the ambient gateway as sole owner on a host with no connection registry, regardless of profile count', () => {
+    // The web-bridge shim (browser-served Desktop, no Electron main process)
+    // deliberately omits getConnectionConfig — see host-connections.ts. It
+    // serves every profile through the SAME physical backend process, scoped
+    // only by a `profile` request param, never a distinct socket per
+    // profile. Profile count is therefore not evidence of multiple backends
+    // here the way it is for Electron's pool, and the six-profile dev-VM
+    // deployment that regressed this (session-control RPCs throwing
+    // SessionOwnerResolutionError) must resolve to "ambient owns it".
+    delete (window as unknown as { hermesDesktop?: unknown }).hermesDesktop
+    $connectionsRegistry.set(null)
+    $profiles.set([
+      { name: 'default' },
+      { name: 'claudecode' },
+      { name: 'claudeprimary' },
+      { name: 'debugger' },
+      { name: 'orchestrator' },
+      { name: 'reviewer' }
+    ] as never)
+
+    expect(ambientGatewayOwnsEverySession()).toBe(true)
+    expect(() =>
+      assertSessionOwnerResolved(null, { method: 'session.control.read', sessionId: 'web-bridge-multi-profile' })
     ).not.toThrow()
   })
 })
