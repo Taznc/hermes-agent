@@ -153,6 +153,9 @@ def _responses_text_format_to_chat(fmt: Any) -> Optional[Dict[str, Any]]:
         name = fmt.get("name")
         if isinstance(name, str) and name:
             wrapper["name"] = name
+        strict = fmt.get("strict")
+        if isinstance(strict, bool):
+            wrapper["strict"] = strict
         return {"type": "json_schema", "json_schema": wrapper}
     if kind == "json_object":
         return {"type": "json_object"}
@@ -345,6 +348,9 @@ def _chat_response_format_to_responses(response_format: Any) -> Optional[Dict[st
         name = wrapper.get("name") if isinstance(wrapper, dict) else None
         if isinstance(name, str) and name:
             out["name"] = name
+        strict = wrapper.get("strict") if isinstance(wrapper, dict) else None
+        if isinstance(strict, bool):
+            out["strict"] = strict
         return out
     raise ValueError(f"unsupported response_format type: {kind!r}")
 
@@ -520,16 +526,26 @@ def chat_chunk_to_responses_events(
                 "arguments": entry["arguments"],
             })
         status = _FINISH_FOR_RESPONSES.get(str(choice.get("finish_reason")), "completed")
+        response: Dict[str, Any] = {
+            "id": state["response_id"],
+            "object": "response",
+            "status": status,
+            "model": state.get("model") or "",
+            "output": output,
+            "output_text": state.get("text", ""),
+        }
+        usage = chunk.get("usage")
+        if isinstance(usage, dict):
+            prompt_tokens = int(usage.get("prompt_tokens") or 0)
+            completion_tokens = int(usage.get("completion_tokens") or 0)
+            response["usage"] = {
+                "input_tokens": prompt_tokens,
+                "output_tokens": completion_tokens,
+                "total_tokens": int(usage.get("total_tokens") or prompt_tokens + completion_tokens),
+            }
         frames.append(_sse("response.completed", {
             "type": "response.completed",
-            "response": {
-                "id": state["response_id"],
-                "object": "response",
-                "status": status,
-                "model": state.get("model") or "",
-                "output": output,
-                "output_text": state.get("text", ""),
-            },
+            "response": response,
         }))
 
     return frames
@@ -614,14 +630,25 @@ class ResponsesStreamTranslator:
             if self._finished:
                 return
             self._finished = True
-            response = event.get("response") if isinstance(event.get("response"), dict) else {}
+            raw_response = event.get("response")
+            response = raw_response if isinstance(raw_response, dict) else {}
             if (response or {}).get("status") == "incomplete" or event_type == "response.incomplete":
                 finish_reason = "length"
             elif self._tool_index_by_output:
                 finish_reason = "tool_calls"
             else:
                 finish_reason = "stop"
-            yield self._chunk({}, finish_reason)
+            chunk = self._chunk({}, finish_reason)
+            usage = response.get("usage")
+            if isinstance(usage, dict):
+                prompt_tokens = int(usage.get("input_tokens") or 0)
+                completion_tokens = int(usage.get("output_tokens") or 0)
+                chunk["usage"] = {
+                    "prompt_tokens": prompt_tokens,
+                    "completion_tokens": completion_tokens,
+                    "total_tokens": int(usage.get("total_tokens") or prompt_tokens + completion_tokens),
+                }
+            yield chunk
 
     def _tool_index_for(self, output_index: Any) -> int:
         key = output_index if output_index is not None else "_default"

@@ -371,7 +371,12 @@ extend the provider's own rate-limit window.
   back.
 - When the cooldown expires the circuit goes **half-open** and admits exactly
   **one** probe request. Concurrent requests are refused the probe slot, so a
-  recovering provider never sees a thundering herd.
+  recovering provider never sees a thundering herd. If that probe is abandoned
+  before it reports an outcome (for example, the client disconnects), the
+  gateway releases only that request's slot when it observes the cancellation.
+  If the disconnected socket is not observed while the gateway awaits the
+  upstream, the orphaned probe lease expires after one cooldown and the next
+  request may probe. Either path prevents permanent backend exclusion.
 - Any successful response closes the circuit immediately and resets the count.
 
 To force a recovery check early, restart the proxy — circuit state is

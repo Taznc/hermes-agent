@@ -120,6 +120,10 @@ else
 fi
 restore
 
+# M12: an abandoned half-open attempt keeps the only probe slot forever.
+sed -i 's/^                if now - state\.probe_started_at < self\._probe_timeout:$/                if True:/' "$ROUTING"
+check_mutation "M12 abandoned half-open probe lease never expires"
+
 echo
 if [ "$FAILURES" -eq 0 ]; then
   echo "ALL MUTATIONS CAUGHT — the gateway suite is RED-capable."

@@ -225,6 +225,28 @@ class OpenAIChatLeg(BackendLeg):
         return headers
 
 
+def _update_anthropic_stream_usage(raw: bytes, usage: Dict[str, int]) -> None:
+    """Accumulate Anthropic SSE usage into canonical token fields."""
+    if not raw.startswith(b"data:"):
+        return
+    try:
+        event = json.loads(raw[5:].strip())
+    except (UnicodeDecodeError, json.JSONDecodeError):
+        return
+    if not isinstance(event, dict):
+        return
+    source: Any = event.get("usage")
+    if event.get("type") == "message_start":
+        message = event.get("message")
+        source = message.get("usage") if isinstance(message, dict) else None
+    if not isinstance(source, dict):
+        return
+    for field in ("input_tokens", "output_tokens"):
+        value = source.get(field)
+        if isinstance(value, int) and not isinstance(value, bool) and value >= 0:
+            usage[field] = value
+
+
 class AnthropicMessagesLeg(BackendLeg):
     """The Claude subscription leg, reusing the reviewed Anthropic bridge."""
 
@@ -265,17 +287,30 @@ class AnthropicMessagesLeg(BackendLeg):
         if stream:
             model = str(chat_request.get("model") or "claude")
             translator = ClaudeStreamTranslator(model, tool_name_map=tool_name_map)
+            usage: Dict[str, int] = {}
 
             async def chunks() -> AsyncIterator[Dict[str, Any]]:
                 async for line in response.content:
+                    _update_anthropic_stream_usage(line, usage)
                     for frame in translator.translate(line):
                         # ClaudeStreamTranslator emits encoded SSE frames; the
                         # gateway's canonical currency is the chunk object.
                         if frame.startswith(b"data: "):
                             try:
-                                yield json.loads(frame[6:].strip())
+                                chunk = json.loads(frame[6:].strip())
                             except (UnicodeDecodeError, json.JSONDecodeError):
                                 continue
+                            choices = chunk.get("choices")
+                            choice = choices[0] if isinstance(choices, list) and choices else {}
+                            if isinstance(choice, dict) and choice.get("finish_reason") and usage:
+                                prompt_tokens = usage.get("input_tokens", 0)
+                                completion_tokens = usage.get("output_tokens", 0)
+                                chunk["usage"] = {
+                                    "prompt_tokens": prompt_tokens,
+                                    "completion_tokens": completion_tokens,
+                                    "total_tokens": prompt_tokens + completion_tokens,
+                                }
+                            yield chunk
 
             return LegOutcome(
                 ok=True,

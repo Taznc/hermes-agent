@@ -492,17 +492,23 @@ def test_json_schema_structured_output_reaches_the_codex_backend():
             _codex_first(_codex_upstream(calls=calls), _anthropic_upstream())
         ) as harness:
             status, _, _ = await harness.post(
-                "/v1/responses",
+                "/v1/chat/completions",
                 {
                     "model": "gpt-5",
-                    "input": "hi",
-                    "text": {
-                        "format": {"type": "json_schema", "name": "out", "schema": schema}
+                    "messages": [{"role": "user", "content": "hi"}],
+                    "response_format": {
+                        "type": "json_schema",
+                        "json_schema": {"name": "out", "strict": True, "schema": schema},
                     },
                 },
             )
             assert status == 200
-        assert calls[0]["text"]["format"]["schema"] == schema
+        assert calls[0]["text"]["format"] == {
+            "type": "json_schema",
+            "name": "out",
+            "strict": True,
+            "schema": schema,
+        }
 
     asyncio.run(run())
 
@@ -577,8 +583,9 @@ def test_streaming_responses_client_over_codex_backend_emits_response_events():
 def test_streaming_responses_client_over_claude_backend_emits_response_events():
     """The cross-protocol streaming case: Anthropic SSE -> Responses SSE."""
     lines = [
+        b'data: {"type":"message_start","message":{"usage":{"input_tokens":11,"output_tokens":0}}}\n',
         b'data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"cross"}}\n',
-        b'data: {"type":"message_delta","delta":{"stop_reason":"end_turn"}}\n',
+        b'data: {"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"output_tokens":5}}\n',
     ]
 
     async def run():
@@ -590,10 +597,21 @@ def test_streaming_responses_client_over_claude_backend_emits_response_events():
                 {"model": "claude-sonnet-4-6", "input": "hi", "stream": True},
             )
             assert status == 200
-            text = body.decode()
-            assert "response.created" in text
-            assert "response.completed" in text
-            assert "cross" in text
+            data_events = [
+                json.loads(line[6:])
+                for line in body.decode().splitlines()
+                if line.startswith("data: ")
+            ]
+            completed = [
+                event for event in data_events if event.get("type") == "response.completed"
+            ]
+            assert len(completed) == 1
+            assert completed[0]["response"]["output_text"] == "cross"
+            assert completed[0]["response"]["usage"] == {
+                "input_tokens": 11,
+                "output_tokens": 5,
+                "total_tokens": 16,
+            }
 
     asyncio.run(run())
 
@@ -616,12 +634,20 @@ def test_streaming_chat_client_over_codex_backend_ends_with_done():
             assert status == 200
             text = body.decode()
             assert text.count("data: [DONE]") == 1
-            content = "".join(
-                json.loads(line[6:])["choices"][0]["delta"].get("content", "")
+            chunks = [
+                json.loads(line[6:])
                 for line in text.splitlines()
                 if line.startswith("data: ") and "[DONE]" not in line
+            ]
+            content = "".join(
+                chunk["choices"][0]["delta"].get("content", "") for chunk in chunks
             )
             assert content == "codex says hi"
+            assert chunks[-1]["usage"] == {
+                "prompt_tokens": 5,
+                "completion_tokens": 6,
+                "total_tokens": 11,
+            }
 
     asyncio.run(run())
 
@@ -1005,6 +1031,84 @@ def test_all_backends_in_cooldown_returns_a_terminal_service_unavailable():
             )
             assert status == 503
             assert json.loads(body)["error"]["code"] == "all_backends_unavailable"
+
+    asyncio.run(run())
+
+
+def test_abandoned_half_open_probe_does_not_permanently_exclude_recovered_backend():
+    """A disconnected probe owner cannot strand a healthy backend forever."""
+
+    async def run():
+        now = [1000.0]
+        mode = ["fail"]
+        probe_started = asyncio.Event()
+        release_probe = asyncio.Event()
+        claude_calls: List[str] = []
+
+        async def messages(request):
+            await request.read()
+            claude_calls.append(mode[0])
+            if mode[0] == "fail":
+                return web.json_response({"error": {"message": "capped"}}, status=429)
+            if mode[0] == "hang":
+                probe_started.set()
+                await release_probe.wait()
+            return web.json_response(_anthropic_text_message("recovered"))
+
+        claude_app = web.Application()
+        claude_app.router.add_post("/v1/messages", messages)
+        claude_runner, claude_base = await _serve(claude_app)
+        codex_runner, codex_base = await _serve(_codex_upstream())
+        breaker = BackendCircuit(
+            failure_threshold=1,
+            cooldown_seconds=60,
+            clock=lambda: now[0],
+        )
+        adapters = [
+            _StubAdapter("claude-code", "anthropic-messages", f"{claude_base}/v1"),
+            _StubAdapter("openai-codex", "openai-responses", f"{codex_base}/v1"),
+        ]
+        gateway_runner, gateway_base = await _serve(
+            create_failover_app(adapters, circuit=breaker)
+        )
+        payload = {"model": "m", "messages": [{"role": "user", "content": "hi"}]}
+
+        try:
+            async with aiohttp.ClientSession() as session:
+                async with session.post(
+                    f"{gateway_base}/v1/chat/completions", json=payload
+                ) as response:
+                    assert response.status == 200
+                    assert response.headers["X-Hermes-Route-Backend"] == "openai-codex"
+
+                now[0] += 61
+                mode[0] = "hang"
+                abandoned = asyncio.create_task(
+                    session.post(f"{gateway_base}/v1/chat/completions", json=payload)
+                )
+                await asyncio.wait_for(probe_started.wait(), timeout=2)
+                abandoned.cancel()
+                with pytest.raises(asyncio.CancelledError):
+                    await abandoned
+
+                # The server may not observe the disconnected socket while it
+                # is awaiting an upstream response. Once that orphaned probe's
+                # lease expires, a healthy backend must be reachable again.
+                await asyncio.sleep(0)
+                now[0] += 61
+                mode[0] = "healthy"
+                async with session.post(
+                    f"{gateway_base}/v1/chat/completions", json=payload
+                ) as response:
+                    assert response.status == 200
+                    assert response.headers["X-Hermes-Route-Backend"] == "claude-code"
+                    assert (await response.json())["choices"][0]["message"]["content"] == "recovered"
+            assert claude_calls == ["fail", "hang", "healthy"]
+        finally:
+            release_probe.set()
+            await gateway_runner.cleanup()
+            await codex_runner.cleanup()
+            await claude_runner.cleanup()
 
     asyncio.run(run())
 

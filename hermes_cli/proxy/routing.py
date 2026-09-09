@@ -88,6 +88,8 @@ class _CircuitState:
     failures: int = 0
     opened_until: float = 0.0
     probe_in_flight: bool = False
+    probe_owner: Optional[str] = None
+    probe_started_at: float = 0.0
 
 
 class BackendCircuit:
@@ -110,6 +112,7 @@ class BackendCircuit:
     ) -> None:
         self._threshold = max(1, int(failure_threshold))
         self._cooldown = max(0.0, float(cooldown_seconds))
+        self._probe_timeout = max(1.0, self._cooldown)
         self._clock = clock or time.monotonic
         self._lock = threading.Lock()
         self._states: Dict[str, _CircuitState] = {}
@@ -121,13 +124,14 @@ class BackendCircuit:
             self._states[backend] = state
         return state
 
-    def allows(self, backend: str) -> bool:
+    def allows(self, backend: str, *, probe_id: Optional[str] = None) -> bool:
         """Admit this caller to ``backend``; claims the half-open probe slot.
 
-        A ``True`` for an open circuit means "you are the one probe", so the
-        caller must report the outcome through ``record_success``/
-        ``record_failure`` — otherwise the slot stays claimed until the next
-        cooldown expiry recomputes it.
+        A ``True`` for an open circuit means "you are the one probe". The
+        caller reports a normal outcome through ``record_success`` or
+        ``record_failure`` and calls ``abandon_probe`` if the attempt exits
+        without an outcome. As a fallback for disconnects the server does not
+        observe, an unreported probe lease expires after one cooldown.
         """
         with self._lock:
             state = self._state(backend)
@@ -137,9 +141,31 @@ class BackendCircuit:
             if now < state.opened_until:
                 return False
             if state.probe_in_flight:
-                return False
+                if now - state.probe_started_at < self._probe_timeout:
+                    return False
+                # A caller can disappear without the server receiving a
+                # cancellation. Expire that orphaned lease so one new probe can
+                # test the backend instead of excluding it until restart.
+                state.probe_in_flight = False
+                state.probe_owner = None
             state.probe_in_flight = True
+            state.probe_owner = probe_id
+            state.probe_started_at = now
             return True
+
+    def abandon_probe(self, backend: str, *, probe_id: Optional[str] = None) -> None:
+        """Release only the half-open probe slot owned by ``probe_id``.
+
+        Ownership prevents a late cancellation from an older request from
+        releasing a newer request's probe. The circuit stays half-open so the
+        next caller can immediately test the recovered backend.
+        """
+        with self._lock:
+            state = self._state(backend)
+            if state.probe_in_flight and state.probe_owner == probe_id:
+                state.probe_in_flight = False
+                state.probe_owner = None
+                state.probe_started_at = 0.0
 
     def record_failure(self, backend: str, *, retry_after_seconds: Optional[float] = None) -> None:
         """Count one failure and (re)open the circuit once past threshold.
@@ -152,6 +178,8 @@ class BackendCircuit:
             state = self._state(backend)
             state.failures += 1
             state.probe_in_flight = False
+            state.probe_owner = None
+            state.probe_started_at = 0.0
             if state.failures < self._threshold and retry_after_seconds is None:
                 return
             cooldown = self._cooldown
@@ -166,6 +194,8 @@ class BackendCircuit:
             state.failures = 0
             state.opened_until = 0.0
             state.probe_in_flight = False
+            state.probe_owner = None
+            state.probe_started_at = 0.0
 
     def failure_count(self, backend: str) -> int:
         with self._lock:

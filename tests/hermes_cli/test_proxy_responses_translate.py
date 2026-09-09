@@ -81,11 +81,18 @@ def test_responses_request_text_format_maps_to_response_format():
     chat = responses_request_to_chat({
         "model": "m",
         "input": "go",
-        "text": {"format": {"type": "json_schema", "name": "out", "schema": schema}},
+        "text": {
+            "format": {
+                "type": "json_schema",
+                "name": "out",
+                "strict": True,
+                "schema": schema,
+            }
+        },
     })
     assert chat["response_format"] == {
         "type": "json_schema",
-        "json_schema": {"name": "out", "schema": schema},
+        "json_schema": {"name": "out", "strict": True, "schema": schema},
     }
 
 
@@ -218,16 +225,34 @@ def test_chat_request_tools_and_response_format_translate_to_responses_shape():
             "type": "function",
             "function": {"name": "lookup", "description": "d", "parameters": schema},
         }],
-        "response_format": {"type": "json_schema", "json_schema": {"name": "out", "schema": schema}},
+        "response_format": {
+            "type": "json_schema",
+            "json_schema": {"name": "out", "strict": True, "schema": schema},
+        },
         "max_tokens": 128,
     })
     assert payload["tools"] == [
         {"type": "function", "name": "lookup", "description": "d", "parameters": schema}
     ]
     assert payload["text"] == {
-        "format": {"type": "json_schema", "name": "out", "schema": schema}
+        "format": {
+            "type": "json_schema",
+            "name": "out",
+            "strict": True,
+            "schema": schema,
+        }
     }
     assert payload["max_output_tokens"] == 128
+
+    non_boolean = chat_request_to_responses({
+        "model": "m",
+        "messages": [{"role": "user", "content": "go"}],
+        "response_format": {
+            "type": "json_schema",
+            "json_schema": {"name": "out", "strict": "yes", "schema": schema},
+        },
+    })
+    assert "strict" not in non_boolean["text"]["format"]
 
 
 def test_chat_request_json_object_response_format_becomes_permissive_schema():
@@ -319,6 +344,7 @@ def test_chat_stream_chunks_translate_to_responses_sse_events():
             "id": "chatcmpl_s",
             "model": "m",
             "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}],
+            "usage": {"prompt_tokens": 11, "completion_tokens": 5, "total_tokens": 16},
         },
     ]:
         emitted.extend(chat_chunk_to_responses_events(chunk, state))
@@ -343,6 +369,11 @@ def test_chat_stream_chunks_translate_to_responses_sse_events():
     assert len(completed) == 1
     assert completed[0]["response"]["status"] == "completed"
     assert completed[0]["response"]["output"][0]["content"][0]["text"] == "hello"
+    assert completed[0]["response"]["usage"] == {
+        "input_tokens": 11,
+        "output_tokens": 5,
+        "total_tokens": 16,
+    }
 
 
 # --------------------------------------------------------------------------
@@ -363,7 +394,12 @@ def test_responses_sse_text_deltas_become_chat_content_chunks():
         _responses_sse("response.created", {"response": {"id": "resp_1"}}),
         _responses_sse("response.output_text.delta", {"delta": "he"}),
         _responses_sse("response.output_text.delta", {"delta": "llo"}),
-        _responses_sse("response.completed", {"response": {"status": "completed"}}),
+        _responses_sse("response.completed", {
+            "response": {
+                "status": "completed",
+                "usage": {"input_tokens": 7, "output_tokens": 3, "total_tokens": 10},
+            }
+        }),
     ]:
         chunks.extend(translator.translate(line))
 
@@ -372,6 +408,11 @@ def test_responses_sse_text_deltas_become_chat_content_chunks():
     ) == "hello"
     assert all(chunk["object"] == "chat.completion.chunk" for chunk in chunks)
     assert chunks[-1]["choices"][0]["finish_reason"] == "stop"
+    assert chunks[-1]["usage"] == {
+        "prompt_tokens": 7,
+        "completion_tokens": 3,
+        "total_tokens": 10,
+    }
 
 
 def test_responses_sse_function_call_items_become_chat_tool_call_chunks():

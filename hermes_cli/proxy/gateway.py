@@ -183,39 +183,45 @@ def create_failover_app(
             if adapter is None:
                 break
             name = adapter.name
-            if not breaker.allows(name):
+            if not breaker.allows(name, probe_id=context.request_id):
                 skipped.append(name)
                 context.record_attempt(name)
                 continue
             try:
-                credential = await asyncio.to_thread(adapter.get_credential)
-            except Exception as exc:
-                # An unusable credential is this backend's problem, not the
-                # client's request; move on rather than replaying an auth error.
-                logger.warning(
-                    "proxy: backend %s credential resolution failed: %s", name, exc
-                )
-                breaker.record_failure(name)
-                context.record_attempt(name)
-                last = LegOutcome(
-                    ok=False,
-                    status=401,
-                    error={
-                        "error": {
-                            "message": str(exc),
-                            "type": "upstream_auth_failed",
-                            "code": "upstream_auth_failed",
-                        }
-                    },
-                    failover_eligible=True,
-                    reason="credential_error",
-                )
-                continue
+                try:
+                    credential = await asyncio.to_thread(adapter.get_credential)
+                except Exception as exc:
+                    # An unusable credential is this backend's problem, not the
+                    # client's request; move on rather than replaying an auth error.
+                    logger.warning(
+                        "proxy: backend %s credential resolution failed: %s", name, exc
+                    )
+                    breaker.record_failure(name)
+                    context.record_attempt(name)
+                    last = LegOutcome(
+                        ok=False,
+                        status=401,
+                        error={
+                            "error": {
+                                "message": str(exc),
+                                "type": "upstream_auth_failed",
+                                "code": "upstream_auth_failed",
+                            }
+                        },
+                        failover_eligible=True,
+                        reason="credential_error",
+                    )
+                    continue
 
-            context.record_attempt(name)
-            outcome = await legs[name].send(
-                credential, chat_request, stream=wants_stream
-            )
+                context.record_attempt(name)
+                outcome = await legs[name].send(
+                    credential, chat_request, stream=wants_stream
+                )
+            except BaseException:
+                # Cancellation and unclassified exceptions carry no leg outcome,
+                # so they must explicitly release this request's half-open slot.
+                breaker.abandon_probe(name, probe_id=context.request_id)
+                raise
             _log_attempt(context, name, outcome)
 
             if outcome.ok:
