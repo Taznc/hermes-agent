@@ -4,15 +4,19 @@ The readonly variant exists for per-turn policy checks (e.g. the
 shared-metrics gate) that were paying a full config deepcopy on every call.
 Contract under test:
 
-1. identity invariant — repeat calls return the SAME cached object,
-   including across the very first (cache-miss) call;
+1. immutability — the result is a frozen view; mutating it raises rather
+   than corrupting the in-process cache (this REPLACED the old identity
+   invariant "repeat calls return the SAME cache-owned object", which is
+   what let a caller retain a nested cached list and mutate it while
+   read_raw_config() deepcopied it — a copy that never terminates and
+   wedged a gateway for 16h. Deep-copy behaviour is covered by
+   test_config_cache_aliasing.py);
 2. freshness — an edited config.yaml (mtime/size change) is picked up;
 3. parity — content equals read_raw_config()'s result;
 4. missing/broken config degrades to {} exactly like read_raw_config().
 """
 
 import os
-import time
 
 import pytest
 import yaml
@@ -39,6 +43,38 @@ def _write_config(home, data):
     return cfg
 
 
+
+
+def test_readonly_result_is_immutable(isolated_hermes_home):
+    """The frozen-view contract that replaced the old identity invariant: a readonly
+    caller cannot reach into the cache, at any depth. (FrozenConfigError is a TypeError.)"""
+    from hermes_cli.config import read_raw_config_readonly
+
+    _write_config(isolated_hermes_home,
+                  {"telemetry": {"shared_metrics": {"enabled": True}}, "list_key": [1, 2]})
+    ro = read_raw_config_readonly()
+    assert ro["telemetry"]["shared_metrics"]["enabled"] is True
+
+    with pytest.raises(TypeError):
+        ro["telemetry"]["shared_metrics"]["enabled"] = False
+    with pytest.raises(TypeError):
+        ro["list_key"].append(3)
+    assert read_raw_config_readonly()["telemetry"]["shared_metrics"]["enabled"] is True
+    assert read_raw_config_readonly()["list_key"] == [1, 2]
+
+
+def test_readonly_matches_the_mutable_variant(isolated_hermes_home):
+    """Parity: same content, independent objects."""
+    from hermes_cli.config import read_raw_config, read_raw_config_readonly
+
+    _write_config(isolated_hermes_home, {"a": {"b": 1}, "c": [1, 2]})
+    mutable = read_raw_config()
+    assert mutable == read_raw_config_readonly()
+
+    mutable["a"]["b"] = 999
+    mutable["c"].append(3)
+    assert read_raw_config_readonly()["a"]["b"] == 1
+    assert read_raw_config_readonly()["c"] == [1, 2]
 
 
 def test_freshness_after_config_edit(isolated_hermes_home):

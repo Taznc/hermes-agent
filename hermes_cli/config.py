@@ -26,6 +26,8 @@ import yaml
 from hermes_cli.cli_output import line_input
 from hermes_cli.colors import Colors, color
 from hermes_cli import managed_scope
+from hermes_cli.config_snapshot import (
+    BoundedCopyBreach, bounded_deepcopy, copy_budget_for, freeze)
 from hermes_cli.default_soul import DEFAULT_SOUL_MD, is_legacy_template_soul
 from hermes_cli.secret_prompt import masked_secret_prompt
 # Re-export from hermes_constants — canonical definition lives there.
@@ -211,9 +213,12 @@ _LAST_EXPANDED_CONFIG_BY_PATH: Dict[str, Any] = {}
 # _normalize_* + _expand_env_vars (~13 ms/call). save_config() + migrate_config() write via
 # atomic_yaml_write which produces a fresh inode, so stat() sees a new mtime_ns and the next load
 # repopulates automatically — no explicit invalidation hook. See #58514.
-_LOAD_CONFIG_CACHE: Dict[str, Tuple[int, int, int, int, Dict[str, Any], Dict[str, Optional[str]]]] = {}
-# path -> (mtime_ns, size, raw yaml dict) for read_raw_config() (no defaults merged in).
-_RAW_CONFIG_CACHE: Dict[str, Tuple[int, int, Dict[str, Any]]] = {}
+_LOAD_CONFIG_CACHE: Dict[str, Tuple[int, int, int, int, Any, Dict[str, Optional[str]], int]] = {}
+# path -> (mtime_ns, size, frozen raw yaml view, node count) for the raw config readers (no
+# defaults merged in). The cache stores ONLY an immutable view: publishing a mutable cached
+# object let a caller retain a nested list and mutate it while another thread deepcopied it,
+# which never terminates (see hermes_cli/config_snapshot.py).
+_RAW_CONFIG_CACHE: Dict[str, Tuple[int, int, Any, int]] = {}
 
 # Env var names written to .env that aren't in OPTIONAL_ENV_VARS (managed by setup/provider
 # flows directly). Also the set reload_env() may remove from os.environ.
@@ -1882,34 +1887,67 @@ def cfg_get(cfg: Optional[Dict[str, Any]], *keys: str, default: Any = None) -> A
     return node
 
 
-def _read_raw_config_impl(*, want_deepcopy: bool) -> Dict[str, Any]:
+def _copy_config_snapshot(frozen: Any, nodes: int, *, source: str) -> Dict[str, Any]:
+    """Mutable deep copy of a frozen config snapshot, under node/elapsed ceilings.
+
+    Runs OUTSIDE ``_CONFIG_LOCK``: a slow copy must never make config reads unavailable
+    process-wide. On breach we log the offending top-level key and fail closed to the
+    read-only snapshot — a bounded, correct answer beats a thread spinning forever inside
+    ``copy.deepcopy`` (which is exactly how a gateway wedged for 16 hours).
+    """
+    try:
+        return bounded_deepcopy(frozen, node_limit=copy_budget_for(nodes))
+    except BoundedCopyBreach as breach:
+        logger.error(
+            "Copying %s exceeded its %s ceiling at top-level key %r after %d nodes / %.2fs "
+            "(snapshot was %d nodes when cached). Serving the read-only snapshot instead; "
+            "mutating it will raise. Inspect that key in config.yaml.",
+            source, breach.limit, breach.top_key, breach.nodes, breach.elapsed, nodes)
+        return frozen
+
+
+def _raw_config_snapshot() -> Optional[Tuple[Any, int]]:
+    """``(frozen_view, node_count)`` for config.yaml, or None when missing/unparseable.
+
+    The cache stores ONLY the frozen view, so no caller can ever reach a mutable object the
+    cache owns — the aliasing that let a retained nested list be appended to while it was
+    being deepcopied. Everything here is O(1) on a cache hit; copying happens above the lock.
+    """
     with _CONFIG_LOCK:
         try:
             config_path = get_config_path()
             st = config_path.stat()
             cache_key = (st.st_mtime_ns, st.st_size)
         except (FileNotFoundError, OSError):
-            return {}
+            return None
 
         path_key = str(config_path)
         cached = _RAW_CONFIG_CACHE.get(path_key)
         if cached is not None and cached[:2] == cache_key:
-            return copy.deepcopy(cached[2]) if want_deepcopy else cached[2]
+            return cached[2], cached[3]
 
         try:
             with open(config_path, encoding="utf-8") as f:
                 data = fast_safe_load(f) or {}
         except Exception as e:
             _warn_config_parse_failure(config_path, e)
-            return {}
+            return None
 
         if not isinstance(data, dict):
             data = {}
-        # The cache stores its own deepcopy. The readonly path returns THAT object (identity
-        # invariant: later cache hits return the same dict); the mutable path returns the parse.
-        cached_copy = copy.deepcopy(data)
-        _RAW_CONFIG_CACHE[path_key] = (cache_key[0], cache_key[1], cached_copy)
-        return data if want_deepcopy else cached_copy
+        frozen, nodes = freeze(data)
+        _RAW_CONFIG_CACHE[path_key] = (*cache_key, frozen, nodes)
+        return frozen, nodes
+
+
+def _read_raw_config_impl(*, want_deepcopy: bool) -> Dict[str, Any]:
+    snapshot = _raw_config_snapshot()
+    if snapshot is None:
+        return {}
+    frozen, nodes = snapshot
+    if not want_deepcopy:
+        return frozen
+    return _copy_config_snapshot(frozen, nodes, source="config.yaml")
 
 
 def read_raw_config() -> Dict[str, Any]:
@@ -1934,8 +1972,10 @@ def read_user_config_raw(config_path: Optional[Path] = None) -> Dict[str, Any]:
 
 def read_raw_config_readonly() -> Dict[str, Any]:
     """``read_raw_config()`` without the per-call deepcopy, for callers that ONLY READ.
-    **Mutating the result corrupts the in-process cache for every subsequent caller.** Meant for
-    per-turn policy checks that were paying a full config deepcopy 2-3x per agent turn."""
+    Returns an **immutable view** of the cached parse — a ``dict``/``list`` subclass, so
+    ``isinstance`` checks still hold, but every mutator raises ``FrozenConfigError``. Meant for
+    per-turn policy checks that were paying a full config deepcopy 2-3x per agent turn.
+    ``copy.deepcopy()`` of the result yields ordinary mutable containers."""
     return _read_raw_config_impl(want_deepcopy=False)
 
 
@@ -1997,8 +2037,9 @@ def load_config() -> Dict[str, Any]:
 
 def load_config_readonly() -> Dict[str, Any]:
     """``load_config()`` without the defensive deepcopy (~half of the 265us cache-hit cost).
-    **Mutating the returned dict (or any nested structure) corrupts the in-process cache for
-    every subsequent caller** — only for code paths that never write to the result."""
+    Returns an **immutable view** of the cached merged config — a ``dict``/``list`` subclass, so
+    ``isinstance`` checks still hold, but every mutator raises ``FrozenConfigError``. Only for
+    code paths that never write to the result; ``copy.deepcopy()`` it if you need to mutate."""
     return _load_config_impl(want_deepcopy=False)
 
 
@@ -2133,8 +2174,8 @@ def _load_config_cache_sig(config_path: Path) -> Tuple[Optional[Tuple[int, int]]
     return user_sig, (*(user_sig or (0, 0)), *managed_sig)
 
 
-def _last_known_good_fallback(config_path: Path, path_key: str, cache_sig, exc: Exception) -> Optional[Dict[str, Any]]:
-    """Warn about a parse failure and return the last-known-good config, or None (-> defaults).
+def _last_known_good_fallback(config_path: Path, path_key: str, cache_sig, exc: Exception) -> Optional[Tuple[Any, int]]:
+    """Warn about a parse failure and return the last-known-good ``(frozen, nodes)``, or None.
     A parse failure must not silently replace the effective config with defaults — that drops
     EVERY user override, including security-critical ``approvals.deny`` rules, when a gateway
     user mid-edits config.yaml into broken YAML. Keep serving the last good config until fixed."""
@@ -2149,12 +2190,12 @@ def _last_known_good_fallback(config_path: Path, path_key: str, cache_sig, exc: 
         return None
     # save_config() stores the pre-expansion dict (templates preserved); the load path stores the
     # expanded one. Expand defensively — idempotent when already expanded.
-    lkg_copy: Dict[str, Any] = _expand_env_vars(copy.deepcopy(lkg))
+    frozen, nodes = freeze(_expand_env_vars(copy.deepcopy(lkg)))
     if cache_sig is not None:
         # Cache under the corrupt file's signature (empty env snapshot: always valid) so repeated
         # loads don't re-parse; fixing the file changes the signature and reloads normally.
-        _LOAD_CONFIG_CACHE[path_key] = (*cache_sig, lkg_copy, {})
-    return lkg_copy
+        _LOAD_CONFIG_CACHE[path_key] = (*cache_sig, frozen, {}, nodes)
+    return frozen, nodes
 
 
 def _merge_managed_overlay(expanded: Dict[str, Any]) -> Tuple[Dict[str, Any], Any]:
@@ -2175,7 +2216,14 @@ def _merge_managed_overlay(expanded: Dict[str, Any]) -> Tuple[Dict[str, Any], An
     return _deep_merge(expanded, _expand_env_vars(managed_normalized)), managed_config
 
 
-def _load_config_impl(*, want_deepcopy: bool) -> Dict[str, Any]:
+def _load_config_snapshot() -> Tuple[Any, int]:
+    """``(frozen_view, node_count)`` for the fully merged config.
+
+    Everything the lock protects — cache lookup, parse, merge, expand — happens here; the
+    caller's copy runs after release so one slow copy can never make config reads
+    unavailable process-wide. Only the frozen view is ever cached, so no caller can reach a
+    mutable object the cache owns.
+    """
     with _CONFIG_LOCK:
         ensure_hermes_home()
         config_path = get_config_path()
@@ -2192,7 +2240,7 @@ def _load_config_impl(*, want_deepcopy: bool) -> Dict[str, Any]:
             # (e.g. auxiliary.<task>.api_key) for the life of the process (#58514).
             env_snapshot = cached[5] if len(cached) > 5 else {}
             if all(_env_ref_lookup(k) == v for k, v in env_snapshot.items()):
-                return copy.deepcopy(cached[4]) if want_deepcopy else cached[4]
+                return cached[4], (cached[6] if len(cached) > 6 else 0)
 
         config = copy.deepcopy(DEFAULT_CONFIG)
 
@@ -2210,29 +2258,31 @@ def _load_config_impl(*, want_deepcopy: bool) -> Dict[str, Any]:
 
                 config = _deep_merge(config, user_config)
             except Exception as e:
-                lkg_copy = _last_known_good_fallback(config_path, path_key, cache_sig, e)
-                if lkg_copy is not None:
-                    return copy.deepcopy(lkg_copy) if want_deepcopy else lkg_copy
+                lkg = _last_known_good_fallback(config_path, path_key, cache_sig, e)
+                if lkg is not None:
+                    return lkg
 
         normalized = _canonicalize_config(config)
         expanded, managed_config = _merge_managed_overlay(_expand_env_vars(normalized))
         _LAST_EXPANDED_CONFIG_BY_PATH[path_key] = copy.deepcopy(expanded)
+        frozen, nodes = freeze(expanded)
         if cache_sig is not None:
-            # The cache stores its own deepcopy so load_config() callers can mutate freely while
-            # load_config_readonly() callers all see the same stable object. The env snapshot
-            # records the values this expansion was made against so later loads detect drift.
-            cached_copy = copy.deepcopy(expanded)
+            # The env snapshot records the values this expansion was made against so later
+            # loads detect drift.
             env_snapshot = _env_ref_snapshot(normalized)
             if managed_config:
                 _env_ref_snapshot(managed_config, env_snapshot)
-            _LOAD_CONFIG_CACHE[path_key] = (*cache_sig, cached_copy, env_snapshot)
-            # Readonly path returns the same object later calls will see (identity invariant).
-            if not want_deepcopy:
-                return cached_copy
+            _LOAD_CONFIG_CACHE[path_key] = (*cache_sig, frozen, env_snapshot, nodes)
         else:
             _LOAD_CONFIG_CACHE.pop(path_key, None)
-        # First-load result is a fresh dict (not aliased to the cache); safe to return directly.
-        return expanded
+        return frozen, nodes
+
+
+def _load_config_impl(*, want_deepcopy: bool) -> Dict[str, Any]:
+    frozen, nodes = _load_config_snapshot()
+    if not want_deepcopy:
+        return frozen
+    return _copy_config_snapshot(frozen, nodes, source="the merged config")
 
 
 _SECURITY_COMMENT = """
