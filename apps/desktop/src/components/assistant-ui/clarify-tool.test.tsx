@@ -718,8 +718,12 @@ describe('ClarifyTool recommended option', () => {
     // Assert the data hook, not the CSS class — styling is free to change.
     const badge = recommended.querySelector('[data-recommended]')
     expect(badge?.textContent).toBe('Recommended')
-    // ...and only the recommended row carries one.
-    expect(screen.getByRole('button', { name: /production/ }).querySelector('[data-recommended]')).toBeNull()
+    // ...and only the recommended choice row carries one. Newer cards also
+    // expose a per-choice help button with the option text in its accessible
+    // name, so select the actual row via its stable data hook.
+    const production = screen.getAllByRole('button', { name: /production/ }).find(button => button.hasAttribute('data-choice'))
+
+    expect(production?.querySelector('[data-recommended]')).toBeNull()
 
     fireEvent.click(recommended)
     fireEvent.keyDown(window, { key: 'Enter' })
