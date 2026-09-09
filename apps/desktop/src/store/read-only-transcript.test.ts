@@ -22,6 +22,9 @@ const registry = (...ids: string[]) =>
   }) as never
 
 beforeEach(() => {
+  ;(window as unknown as { hermesDesktop?: unknown }).hermesDesktop = {
+    getConnectionConfig: vi.fn(async () => ({}))
+  }
   $connectionsRegistry.set(null)
   $profiles.set([])
   $readOnlyStoredTranscripts.set(new Set())
