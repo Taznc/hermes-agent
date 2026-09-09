@@ -10,9 +10,9 @@ Two hazards this module closes, both proven against the shared raw-config cache:
    as fast as it is copied NEVER returns — a live gateway spun a core inside that frame for
    16 hours while holding the global config lock.
 
-The answer to (1) is a **frozen view**: built once per config-file signature, cached next to
-the mutable snapshot, and handed to every readonly caller. That keeps the readonly path O(1),
-which is the whole reason it exists (it runs 2-3x per agent turn). The frozen containers are
+The answer to (1) is a **frozen view**: built once per config-file signature, kept as the
+cache's only owned config tree, and handed to every readonly caller. That keeps the readonly path
+O(1), which is the whole reason it exists (it runs 2-3x per agent turn). The frozen containers are
 ``dict``/``list`` *subclasses* rather than ``MappingProxyType``/``tuple`` so the ~200 existing
 readonly call sites that branch on ``isinstance(cfg, dict)`` keep working; only the mutating
 methods are disabled. They also define ``__copy__``/``__deepcopy__`` so a caller that copies a
