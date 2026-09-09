@@ -96,11 +96,24 @@ void _prBranchBySession
  *  list — narrowed to the active profile scope. Reference changes whenever
  *  `$sessions`/`$archivedSessions` do (session-list churn is out of scope for
  *  this file, see header), but nothing downstream of a section that doesn't
- *  read this store pays for that. */
+ *  read this store pays for that.
+ *
+ *  The live branch drops `archived: true` rows because `$sessions` is a CACHE
+ *  of the backend's archived-excluded page, not a re-derivation of it: a
+ *  session archived by any other surface (CLI, another client, a bulk sweep)
+ *  can sit in it until a refresh evicts it, and `mergeSessionPage` deliberately
+ *  RETAINS `keep`-protected rows (pinned / working / open tiles / active) that
+ *  the server page already dropped. The project overlays each carry their own
+ *  `isLiveArchived` guard for this same reason; filtering at the shared root
+ *  means every consumer — flat Recents, grouped-by-project, profile groups —
+ *  agrees, instead of each one re-deriving the rule. */
 export const $sidebarScopedSessions = computed(
   [$sessions, $archivedSessions, $sidebarShowArchived, $profileScope],
   (sessions, archived, showArchived, profileScope) =>
-    filterSessionsByProfileScope(showArchived ? archived : sessions, profileScope)
+    filterSessionsByProfileScope(
+      showArchived ? archived : sessions.filter(session => session.archived !== true),
+      profileScope
+    )
 )
 
 /** True once a second profile exists AND the sidebar is scoped to "all" — the
