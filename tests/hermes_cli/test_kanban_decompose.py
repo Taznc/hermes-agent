@@ -241,6 +241,60 @@ AC1. `route()` returns "mechanical" for a mechanical payload.
      Tests: test_router.py::test_route_mechanical
 """
 
+# A child that quotes its parent's seven criteria as context, then declares two of
+# its own. The quoted labels belong to the parent, not to this card.
+_QUOTED_IN_FENCE_BODY = """Carve AC3 of the parent out into its own card.
+
+The parent card asked for all of this:
+
+```
+AC1 AC2 AC3 AC4 AC5 AC6 AC7
+```
+
+## Acceptance criteria
+AC1. `route()` returns "mechanical" for a mechanical payload.
+     Tests: test_router.py::test_route_mechanical
+AC2. `route()` returns "default" for a malformed payload.
+     Tests: test_router.py::test_route_malformed
+
+## Out of scope
+The other six parent criteria.
+"""
+
+_QUOTED_IN_BLOCKQUOTE_BODY = """Carve AC3 of the parent out into its own card.
+
+The parent card asked for all of this:
+
+> AC1 AC2 AC3 AC4 AC5 AC6 AC7
+
+## Acceptance criteria
+AC1. `route()` returns "mechanical" for a mechanical payload.
+     Tests: test_router.py::test_route_mechanical
+AC2. `route()` returns "default" for a malformed payload.
+     Tests: test_router.py::test_route_malformed
+
+## Out of scope
+The other six parent criteria.
+"""
+
+# One unpaired fence marker. It opens nothing, so the six real labels below it
+# stay visible to the counter.
+_UNTERMINATED_FENCE_BODY = """Do a lot of things at once.
+
+```
+
+## Acceptance criteria
+AC1. one. Tests: test_x.py::test_one
+AC2. two. Tests: test_x.py::test_two
+AC3. three. Tests: test_x.py::test_three
+AC4. four. Tests: test_x.py::test_four
+AC5. five. Tests: test_x.py::test_five
+AC6. six. Tests: test_x.py::test_six
+
+## Out of scope
+Nothing much.
+"""
+
 
 def test_child_body_contract_accepts_conforming():
     """A body with <= 5 numbered ACs and an '## Out of scope' section passes."""
@@ -259,6 +313,28 @@ def test_child_body_contract_rejects_missing_out_of_scope():
     violation = decomp._child_body_violation(_NO_OUT_OF_SCOPE_BODY)
     assert violation
     assert "out of scope" in violation.lower()
+
+
+def test_ac_labels_inside_fence_are_not_counted():
+    """Criteria QUOTED inside a fenced block belong to whoever wrote them, not to
+    the child reproducing them — so a child declaring two of its own passes even
+    though the body mentions seven distinct labels."""
+    assert len(set(decomp._AC_LABEL_RE.findall(_QUOTED_IN_FENCE_BODY))) == 7
+    assert decomp._child_body_violation(_QUOTED_IN_FENCE_BODY) == ""
+
+
+def test_ac_labels_inside_blockquote_are_not_counted():
+    """Same contract for a '>' block quote as for a fence."""
+    assert len(set(decomp._AC_LABEL_RE.findall(_QUOTED_IN_BLOCKQUOTE_BODY))) == 7
+    assert decomp._child_body_violation(_QUOTED_IN_BLOCKQUOTE_BODY) == ""
+
+
+def test_unterminated_fence_still_counts_real_labels():
+    """A dangling ``` opens nothing, so it cannot hide the labels the child really
+    declares: an over-cap body is still rejected."""
+    violation = decomp._child_body_violation(_UNTERMINATED_FENCE_BODY)
+    assert violation
+    assert "6" in violation and "5" in violation
 
 
 def _fanout_payload(bodies: list[str]) -> str:
