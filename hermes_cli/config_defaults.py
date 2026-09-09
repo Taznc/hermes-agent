@@ -1914,6 +1914,10 @@ DEFAULT_CONFIG = {
         # profile. 0 = unlimited (legacy behavior). The reviewer-side round contract (sdlc-review
         # skill) is advisory; this is the hard stop that actually bounds a runaway rework loop.
         "max_review_rounds": 3,
+        # Refuse a kanban_request_review handoff whose branch already conflicts with the board's
+        # land_target — the conflict costs a full review round to report and one `git merge` to
+        # fix. Skipped when the board sets no land_target or git cannot answer.
+        "require_mergeable_for_review": True,
         # Auto-run the decomposer on Triage tasks every tick. False = manual via `hermes kanban
         # decompose <id>` or the dashboard's Decompose button.
         "auto_decompose": True,
