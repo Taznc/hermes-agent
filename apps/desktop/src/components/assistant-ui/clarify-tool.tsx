@@ -1245,8 +1245,7 @@ function ClarifyToolSinglePending({
         <ClarifyHelpControls request={matchingRequest} target="question" targetLabel={question} />
 
         {hasChoices ? (
-<<<<<<< HEAD
-          <div className="grid gap-px" role="group">
+          <div className="grid gap-1" role="group">
             {choices.map((choice, index) => {
               const selected = selectedChoices.includes(choice)
 
@@ -1284,35 +1283,6 @@ function ClarifyToolSinglePending({
                 </div>
               )
             })}
-||||||| parent of 40e886af89 (fix(desktop): refine clarify choice styling + visual dump test coverage)
-          <div className="grid gap-px" role="group">
-            {choices.map((choice, index) => (
-              <ChoiceButton
-                active={activeIndex === index}
-                char={letterFor(index)}
-                choice={choice}
-                disabled={submitting || !ready}
-                key={`${index}-${choice}`}
-                keyShortcuts={`${letterFor(index)} ${index + 1}`}
-                onClick={() => selectChoice(choice, index)}
-                selected={selectedChoices.includes(choice)}
-              />
-            ))}
-=======
-          <div className="grid gap-1" role="group">
-            {choices.map((choice, index) => (
-              <ChoiceButton
-                active={activeIndex === index}
-                char={letterFor(index)}
-                choice={choice}
-                disabled={submitting || !ready}
-                key={`${index}-${choice}`}
-                keyShortcuts={`${letterFor(index)} ${index + 1}`}
-                onClick={() => selectChoice(choice, index)}
-                selected={selectedChoices.includes(choice)}
-              />
-            ))}
->>>>>>> 40e886af89 (fix(desktop): refine clarify choice styling + visual dump test coverage)
             <label
               className={cn(
                 OPTION_ROW_CLASS,
@@ -1541,8 +1511,7 @@ function BatchQuestionBlock({
       />
 
       {choices.length > 0 ? (
-<<<<<<< HEAD
-        <div className="grid gap-px pl-[1.625rem]" role="group">
+        <div className="grid gap-1 pl-[1.625rem]" role="group">
           {choices.map((choice, choiceIndex) => {
             // The gateway decorates its recommended choice for display, while
             // persisted tool args carry the bare option. Local staged state
@@ -1581,31 +1550,6 @@ function BatchQuestionBlock({
               </div>
             )
           })}
-||||||| parent of 40e886af89 (fix(desktop): refine clarify choice styling + visual dump test coverage)
-        <div className="grid gap-px pl-[1.625rem]" role="group">
-          {choices.map((choice, choiceIndex) => (
-            <ChoiceButton
-              char={letterFor(choiceIndex)}
-              choice={choice}
-              disabled={disabled}
-              key={`${choiceIndex}-${choice}`}
-              onClick={() => onToggle(choice)}
-              selected={staged.choices.includes(choice)}
-            />
-          ))}
-=======
-        <div className="grid gap-1 pl-[1.625rem]" role="group">
-          {choices.map((choice, choiceIndex) => (
-            <ChoiceButton
-              char={letterFor(choiceIndex)}
-              choice={choice}
-              disabled={disabled}
-              key={`${choiceIndex}-${choice}`}
-              onClick={() => onToggle(choice)}
-              selected={staged.choices.includes(choice)}
-            />
-          ))}
->>>>>>> 40e886af89 (fix(desktop): refine clarify choice styling + visual dump test coverage)
           <label className={cn(OPTION_ROW_CLASS, 'items-center')}>
             <KeyBadge char={letterFor(choices.length)} selected={Boolean(staged.draft.trim())} />
             <Textarea
