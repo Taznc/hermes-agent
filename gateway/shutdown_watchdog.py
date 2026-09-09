@@ -104,7 +104,10 @@ def start_loop_liveness_watchdog(
             except RuntimeError:  # normally closed loop: nothing left to backstop
                 return
             except Exception:
-                logger.debug("Failed to schedule gateway loop liveness probe", exc_info=True)
+                logger.warning(
+                    "Gateway loop liveness watchdog is STOPPING: scheduling a probe raised. The "
+                    "event loop no longer has a liveness backstop for the rest of this process.",
+                    exc_info=True)
                 return
             deadline = time.monotonic() + probe_timeout
             while not stop_event.is_set():  # poll so a stop() mid-wait is honoured within ~50ms
@@ -140,8 +143,14 @@ def start_loop_liveness_watchdog(
     try:
         thread.start()
     except Exception:
-        logger.debug("Failed to start gateway loop liveness watchdog", exc_info=True)
+        # WARNING, not debug: an unarmed watchdog is invisible until the loop wedges and nothing
+        # escalates. A 16h dispatch outage was diagnosed only by the ABSENCE of this evidence.
+        logger.warning("Failed to start gateway loop liveness watchdog — the event loop has NO "
+                       "liveness backstop; a wedged loop will not self-restart", exc_info=True)
         return None
+    logger.info("Gateway loop liveness watchdog armed (probe every %.0fs, timeout %.0fs, "
+                "%d strikes to hard-exit %d)", probe_interval, probe_timeout, max_strikes,
+                exit_code)
     return _LoopLivenessWatchdogHandle(stop_event, thread)
 
 
