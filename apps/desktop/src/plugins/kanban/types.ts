@@ -567,6 +567,7 @@ const EVENT_TONE: Record<string, string> = {
   respawn_guarded: SEVERITY_TONE.warning,
   review_no_verdict: COLUMN_META.review.tone,
   review_requested: COLUMN_META.review.tone,
+  review_round_cap: SEVERITY_TONE.warning,
   scheduled: COLUMN_META.scheduled.tone,
   spawned: COLUMN_META.ready.tone,
   stale: SEVERITY_TONE.warning,

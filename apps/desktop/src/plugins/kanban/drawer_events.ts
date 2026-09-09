@@ -120,6 +120,9 @@ export function eventText(event: KanbanEvent, k: KanbanText): { detail?: string;
     case 'review_no_verdict':
       return { label: k.evtReviewNoVerdict }
 
+    case 'review_round_cap':
+      return { label: k.evtReviewRoundCap, detail: str('reason') ?? undefined }
+
     case 'stale':
       return { label: k.evtStale }
 

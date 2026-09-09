@@ -511,6 +511,43 @@ export function CtaBanner({
       )
     }
 
+    // B2. The dispatcher's review-round cap — a scope/quality decision, not a
+    // worker failure and not a missing reason. The reviewer's last feedback is
+    // the cause and renders verbatim through the same structured body a manual
+    // block uses. Retry is deliberately NOT primary: bouncing the card back to
+    // Ready re-enters the loop the cap just stopped, so the intervention
+    // (reassign/rescope) leads and the round counts frame why.
+    if (cause.origin === 'review_round_cap') {
+      return (
+        <Banner
+          actions={
+            <>
+              <Button onClick={onFocusComment} size="xs" variant="secondary">
+                <Codicon name="comment" size="0.7rem" />
+                {k.ctaReply}
+              </Button>
+              <Button onClick={() => onMove('ready')} size="xs" variant="outline">
+                <Codicon name="debug-continue" size="0.7rem" />
+                {k.ctaUnblock}
+              </Button>
+            </>
+          }
+          icon="eye"
+          title={
+            cause.rounds != null && cause.max != null
+              ? k.ctaReviewRoundCapTitleCounted(cause.rounds, cause.max)
+              : k.ctaReviewRoundCapTitle
+          }
+          tone={SEVERITY_TONE.warning}
+        >
+          <div className="flex flex-col gap-1.5">
+            <p className="text-[0.75rem] leading-relaxed text-(--ui-text-secondary)">{k.ctaReviewRoundCapBody}</p>
+            {cause.reason && <BlockReasonBody reason={cause.reason} />}
+          </div>
+        </Banner>
+      )
+    }
+
     // B. Automatic circuit-breaker trip (gave_up / crashed / timed_out /
     // protocol_violation / rate_limited / stale) — this is NOT the worker
     // omitting a reason, and NOT a question for the user: it's a structured

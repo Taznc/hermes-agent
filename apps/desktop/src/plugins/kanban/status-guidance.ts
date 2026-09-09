@@ -70,6 +70,17 @@ export function runErrorText(error: string, k: RunErrorTextDeps): { primary: str
  *  never be the `block_kind` of a task this resolver is asked about. */
 export type BlockKind = 'capability' | 'needs_input' | 'transient'
 
+/** `task.block_kind` is NOT closed over `BlockKind`: the dispatcher writes its
+ *  own kinds through raw UPDATEs that bypass `block_task`'s `VALID_BLOCK_KINDS`
+ *  check (`review_round_cap` in `_apply_review_round_cap`). Narrowing through
+ *  this set is what keeps such a value from being cast into `BlockKind` and
+ *  indexed into the `blockKind` label map, which yields `undefined` and renders
+ *  an empty banner title. */
+const MANUAL_BLOCK_KINDS = new Set<string>(['capability', 'needs_input', 'transient'])
+
+const manualBlockKind = (raw: null | string | undefined): BlockKind | null =>
+  raw && MANUAL_BLOCK_KINDS.has(raw) ? (raw as BlockKind) : null
+
 /** Mirrors the backend's `BLOCK_RECURRENCE_LIMIT` (`kanban_db.py`). Duplicated
  *  rather than fetched because it only gates a CONFIRMATION prompt: the
  *  backend's 409 is the authority, and a drift here can at worst show or skip
@@ -111,6 +122,7 @@ const CAUSE_EVENT_KINDS = new Set([
   'block_loop_detected',
   'gave_up',
   'review_no_verdict',
+  'review_round_cap',
   'crashed',
   'timed_out',
   'protocol_violation',
@@ -154,6 +166,7 @@ export type BlockCause =
   | { origin: 'manual'; reason: string; kind: BlockKind | null }
   | { origin: 'automatic'; raw: string }
   | { origin: 'review_no_verdict' }
+  | { origin: 'review_round_cap'; rounds: null | number; max: null | number; reason: null | string }
   | { origin: 'unknown' }
 
 /**
@@ -186,13 +199,30 @@ export function resolveBlockCause(task: KanbanTaskFull, events: KanbanEvent[], r
       // field the backend keeps across unblock/re-block cycles — it's the
       // same field `_route_block` writes and the same one the OLD CTA logic
       // read, so this preserves exact icon/title behavior for manual blocks.
-      const kind = (task.block_kind ?? null) as BlockKind | null
+      // Narrowed through `manualBlockKind`: a dispatcher-written kind
+      // (`review_round_cap`) is not a manual block label and must not be
+      // cast into `BlockKind`.
+      const kind = manualBlockKind(task.block_kind)
 
       return { kind, origin: 'manual', reason: reason ?? '' }
     }
 
     if (event.kind === 'review_no_verdict') {
       return { origin: 'review_no_verdict' }
+    }
+
+    // The dispatcher's hard stop on a runaway review<->changes_requested loop
+    // (`_apply_review_round_cap`). Not a worker failure and not a question:
+    // the card ran out of review rounds, so the payload's round counts and
+    // last reviewer reason ARE the cause and must be shown as such.
+    if (event.kind === 'review_round_cap') {
+      const num = (key: string): null | number => {
+        const value = p[key]
+
+        return typeof value === 'number' ? value : null
+      }
+
+      return { max: num('max_review_rounds'), origin: 'review_round_cap', reason: str(p, 'reason'), rounds: num('changes_rounds') }
     }
 
     // gave_up / crashed / timed_out / protocol_violation / rate_limited /
@@ -230,6 +260,7 @@ export interface StatusGuidanceDeps extends RunErrorTextDeps {
   guideBlockedManualCapability: string
   guideBlockedManualTransient: string
   guideBlockedReviewNoVerdict: string
+  guideBlockedReviewRoundCap: string
   guideBlockedUnknown: string
   guideDone: string
   guideIdea: string
@@ -293,6 +324,13 @@ const GUIDANCE_RESOLVERS: Record<
 
     if (cause.origin === 'review_no_verdict') {
       return k.guideBlockedReviewNoVerdict
+    }
+
+    // The round cap is a scope/quality decision, not a retry: bouncing it
+    // straight back to Ready re-enters the same loop the cap just stopped.
+    // The next action is an intervention (reassign, rescope, archive).
+    if (cause.origin === 'review_round_cap') {
+      return k.guideBlockedReviewRoundCap
     }
 
     // D. No cause found anywhere — the banner already states the diagnosis

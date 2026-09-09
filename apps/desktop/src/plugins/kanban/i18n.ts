@@ -157,6 +157,7 @@ type KanbanMessages = {
   evtTimedOut: string
   evtProtocolViolation: string
   evtReviewNoVerdict: string
+  evtReviewRoundCap: string
   evtStale: string
   evtDependencyWait: string
   evtBlockLoop: string
@@ -183,6 +184,11 @@ type KanbanMessages = {
   ctaBlockedAutomaticTitle: string
   ctaReviewNoVerdictTitle: string
   ctaReviewNoVerdictBody: string
+  // The dispatcher's hard stop on a runaway review<->changes_requested loop.
+  // Counted variant is used whenever the event payload carried both numbers.
+  ctaReviewRoundCapTitle: string
+  ctaReviewRoundCapTitleCounted: (rounds: number, max: number) => string
+  ctaReviewRoundCapBody: string
   ctaRequeueReview: string
   ctaRetry: string
   ctaCopyLogCommand: string
@@ -216,6 +222,7 @@ type KanbanMessages = {
   guideBlockedManualTransient: string
   guideBlockedAutomatic: (cause: string) => string
   guideBlockedReviewNoVerdict: string
+  guideBlockedReviewRoundCap: string
   guideBlockedUnknown: string
   // Wishlist lanes (idea/roadmap). Calm and non-nagging by decision: these
   // cards are not late, not stalled, and carry no age/staleness warning.
@@ -566,6 +573,7 @@ export const en: KanbanMessages = {
   evtTimedOut: 'timed out — exceeded the run limit',
   evtProtocolViolation: 'worker exited without reporting a result',
   evtReviewNoVerdict: 'reviewer exited without a verdict',
+  evtReviewRoundCap: 'review round cap reached — dispatch stopped',
   evtStale: 'no progress — reclaimed',
   evtDependencyWait: 'waiting on a dependency',
   evtBlockLoop: 'blocked repeatedly — routed to triage',
@@ -591,6 +599,10 @@ export const en: KanbanMessages = {
   ctaReviewNoVerdictTitle: 'Reviewer exited without a verdict',
   ctaReviewNoVerdictBody:
     'The reviewer\u2019s run ended without approving, requesting changes, or escalating — a neutral outcome, not a failure of the work. Requeue for another review pass.',
+  ctaReviewRoundCapTitle: 'Out of review rounds',
+  ctaReviewRoundCapTitleCounted: (rounds, max) => `Out of review rounds (${rounds}/${max})`,
+  ctaReviewRoundCapBody:
+    'The reviewer sent this back for changes too many times, so the dispatcher stopped re-running it. Decide the intervention — reassign, rescope, or archive — then unblock.',
   ctaRequeueReview: 'Requeue for review',
   ctaRetry: 'Retry (Unblock)',
   ctaCopyLogCommand: 'Copy log command',
@@ -628,6 +640,7 @@ export const en: KanbanMessages = {
   guideBlockedManualTransient: 'A transient failure blocked this — it may clear on its own; unblock to retry.',
   guideBlockedAutomatic: cause => `${cause} Inspect the worker log, then retry or reassign.`,
   guideBlockedReviewNoVerdict: 'The reviewer exited without a verdict. Requeue it for another review pass.',
+  guideBlockedReviewRoundCap: 'Review rounds are exhausted — reassign, rescope, or archive it instead of simply retrying.',
   guideBlockedUnknown: 'Inspect the worker log, then retry or reassign it.',
   guideIdea: 'Rough idea — refine it into a roadmap item when ready.',
   guideRoadmap: 'Specified, not yet authorized — spawn to Triage to start work.',
@@ -950,6 +963,7 @@ const ja: KanbanMessages = {
   evtTimedOut: 'タイムアウト — 実行時間の上限を超えました',
   evtProtocolViolation: 'ワーカーが結果を報告せずに終了しました',
   evtReviewNoVerdict: 'レビュアーが判定なしで終了しました',
+  evtReviewRoundCap: 'レビュー往復の上限に達し、ディスパッチを停止しました',
   evtStale: '進捗なし — 再取得しました',
   evtDependencyWait: '依存関係を待機中',
   evtBlockLoop: '繰り返しブロック — トリアージへ転送',
@@ -976,6 +990,10 @@ const ja: KanbanMessages = {
   ctaReviewNoVerdictTitle: 'レビュアーが判定なしで終了しました',
   ctaReviewNoVerdictBody:
     'レビュアーの実行は、承認・変更依頼・エスカレーションのいずれもなく終了しました — これは作業の失敗ではなく中立的な結果です。もう一度レビューへ再キューしてください。',
+  ctaReviewRoundCapTitle: 'レビュー往復の上限に到達',
+  ctaReviewRoundCapTitleCounted: (rounds, max) => `レビュー往復の上限に到達（${rounds}/${max}）`,
+  ctaReviewRoundCapBody:
+    'レビュアーが変更依頼を繰り返したため、ディスパッチャーは再実行を停止しました。担当変更・範囲の見直し・アーカイブのいずれかを決めてから、ブロックを解除してください。',
   ctaRequeueReview: 'レビューに再キュー',
   ctaRetry: '再試行（ブロック解除）',
   ctaCopyLogCommand: 'ログコマンドをコピー',
@@ -1015,6 +1033,7 @@ const ja: KanbanMessages = {
     '一時的な失敗によりブロックされました — 自然に解消することがあります。ブロック解除して再試行してください。',
   guideBlockedAutomatic: cause => `${cause} ワーカーログを確認し、再試行するか再割り当てしてください。`,
   guideBlockedReviewNoVerdict: 'レビュアーが判定なしで終了しました。もう一度レビューへ再キューしてください。',
+  guideBlockedReviewRoundCap: 'レビュー往復の上限に達しました — 単に再試行せず、担当変更・範囲の見直し・アーカイブを検討してください。',
   guideBlockedUnknown: 'ワーカーログを確認し、再試行するか再割り当てしてください。',
   guideIdea: 'ラフなアイデアです — 準備ができたらロードマップ項目に整えてください。',
   guideRoadmap: '仕様は固まっていますが未承認です — トリアージへスポーンすると作業が始まります。',
@@ -1335,6 +1354,7 @@ const zh: KanbanMessages = {
   evtTimedOut: '已超时 — 超出运行时限',
   evtProtocolViolation: '工作单元未报告结果就退出了',
   evtReviewNoVerdict: '审查者退出时没有给出结论',
+  evtReviewRoundCap: '已达到审查轮次上限 — 已停止调度',
   evtStale: '没有进展 — 已重新领取',
   evtDependencyWait: '正在等待依赖',
   evtBlockLoop: '反复受阻 — 已转入分诊',
@@ -1360,6 +1380,10 @@ const zh: KanbanMessages = {
   ctaReviewNoVerdictTitle: '审查者退出时没有给出结论',
   ctaReviewNoVerdictBody:
     '审查者的运行结束时既未批准、也未请求修改或升级 — 这是一个中立的结果，不代表工作本身失败。请重新排队进行另一轮审查。',
+  ctaReviewRoundCapTitle: '审查轮次已用尽',
+  ctaReviewRoundCapTitleCounted: (rounds, max) => `审查轮次已用尽（${rounds}/${max}）`,
+  ctaReviewRoundCapBody:
+    '审查者多次要求修改，因此调度器已停止重新运行此卡片。请决定处理方式 — 重新分配、调整范围或归档 — 然后解除阻塞。',
   ctaRequeueReview: '重新排队审查',
   ctaRetry: '重试（解除阻塞）',
   ctaCopyLogCommand: '复制日志命令',
@@ -1396,6 +1420,7 @@ const zh: KanbanMessages = {
   guideBlockedManualTransient: '一次临时性失败导致受阻 — 可能会自行恢复；解除阻塞以重试。',
   guideBlockedAutomatic: cause => `${cause} 请查看工作单元日志，然后重试或重新分配。`,
   guideBlockedReviewNoVerdict: '审查者退出时没有给出结论。请重新排队进行另一轮审查。',
+  guideBlockedReviewRoundCap: '审查轮次已用尽 — 请重新分配、调整范围或归档，而不是直接重试。',
   guideBlockedUnknown: '请查看工作单元日志，然后重试或重新分配。',
   guideIdea: '一个粗略的想法 — 准备好后再细化成路线图条目。',
   guideRoadmap: '已细化但尚未授权 — 派生到“分诊”即可开始工作。',
@@ -1713,6 +1738,7 @@ const zhHant: KanbanMessages = {
   evtTimedOut: '已逾時 — 超出執行時限',
   evtProtocolViolation: '工作單元未回報結果就結束了',
   evtReviewNoVerdict: '審查者結束時沒有給出結論',
+  evtReviewRoundCap: '已達到審查輪次上限 — 已停止排程',
   evtStale: '沒有進度 — 已重新領取',
   evtDependencyWait: '正在等待相依項目',
   evtBlockLoop: '反覆受阻 — 已轉入分類',
@@ -1738,6 +1764,10 @@ const zhHant: KanbanMessages = {
   ctaReviewNoVerdictTitle: '審查者結束時沒有給出結論',
   ctaReviewNoVerdictBody:
     '審查者的執行結束時既未核准、也未請求修改或升級 — 這是一個中立的結果，不代表工作本身失敗。請重新排隊進行另一輪審查。',
+  ctaReviewRoundCapTitle: '審查輪次已用盡',
+  ctaReviewRoundCapTitleCounted: (rounds, max) => `審查輪次已用盡（${rounds}/${max}）`,
+  ctaReviewRoundCapBody:
+    '審查者多次要求修改，因此排程器已停止重新執行此卡片。請決定處理方式 — 重新指派、調整範圍或封存 — 然後解除封鎖。',
   ctaRequeueReview: '重新排隊審查',
   ctaRetry: '重試（解除封鎖）',
   ctaCopyLogCommand: '複製日誌指令',
@@ -1774,6 +1804,7 @@ const zhHant: KanbanMessages = {
   guideBlockedManualTransient: '一次暫時性失敗導致受阻 — 可能會自行恢復；解除封鎖以重試。',
   guideBlockedAutomatic: cause => `${cause} 請查看工作單元日誌，然後重試或重新指派。`,
   guideBlockedReviewNoVerdict: '審查者結束時沒有給出結論。請重新排隊進行另一輪審查。',
+  guideBlockedReviewRoundCap: '審查輪次已用盡 — 請重新指派、調整範圍或封存，而不是直接重試。',
   guideBlockedUnknown: '請查看工作單元日誌，然後重試或重新指派。',
   guideIdea: '一個粗略的想法 — 準備好後再細化成路線圖項目。',
   guideRoadmap: '已細化但尚未授權 — 派生到「分診」即可開始工作。',
