@@ -17,6 +17,7 @@ aiohttp = pytest.importorskip("aiohttp")
 from aiohttp import web  # noqa: E402
 
 from hermes_cli.proxy.adapters.base import UpstreamAdapter, UpstreamCredential  # noqa: E402
+from hermes_cli.proxy import legs as legs_module  # noqa: E402
 from hermes_cli.proxy.gateway import create_failover_app  # noqa: E402
 from hermes_cli.proxy.routing import BackendCircuit  # noqa: E402
 
@@ -1106,6 +1107,104 @@ def test_abandoned_half_open_probe_does_not_permanently_exclude_recovered_backen
             assert claude_calls == ["fail", "hang", "healthy"]
         finally:
             release_probe.set()
+            await gateway_runner.cleanup()
+            await codex_runner.cleanup()
+            await claude_runner.cleanup()
+
+    asyncio.run(run())
+
+
+def test_unclassified_leg_failure_frees_the_probe_slot_for_the_next_request(monkeypatch):
+    """An escaping exception must release the probe *immediately*, not on expiry.
+
+    The stale-lease timeout already guarantees eventual recovery, so it can mask
+    a missing owner-scoped release. Holding the injected clock still is what
+    separates the two layers: the next caller is served by the recovered backend
+    only if the abandoned attempt gave its half-open slot back on the way out.
+    """
+
+    async def run():
+        now = [1000.0]
+        mode = ["fail"]
+        claude_calls: List[str] = []
+
+        async def messages(request):
+            await request.read()
+            claude_calls.append(mode[0])
+            if mode[0] == "fail":
+                return web.json_response({"error": {"message": "capped"}}, status=429)
+            return web.json_response(_anthropic_text_message("recovered"))
+
+        claude_app = web.Application()
+        claude_app.router.add_post("/v1/messages", messages)
+        claude_runner, claude_base = await _serve(claude_app)
+        codex_runner, codex_base = await _serve(_codex_upstream())
+        breaker = BackendCircuit(
+            failure_threshold=1,
+            cooldown_seconds=60,
+            clock=lambda: now[0],
+        )
+        adapters = [
+            _StubAdapter("claude-code", "anthropic-messages", f"{claude_base}/v1"),
+            _StubAdapter("openai-codex", "openai-responses", f"{codex_base}/v1"),
+        ]
+        gateway_runner, gateway_base = await _serve(
+            create_failover_app(adapters, circuit=breaker)
+        )
+        payload = {"model": "m", "messages": [{"role": "user", "content": "hi"}]}
+
+        try:
+            async with aiohttp.ClientSession() as session:
+                async with session.post(
+                    f"{gateway_base}/v1/chat/completions", json=payload
+                ) as response:
+                    assert response.status == 200
+                    assert response.headers["X-Hermes-Route-Backend"] == "openai-codex"
+
+                # Cooldown expires and the upstream is healthy again, so the
+                # next request is admitted as the one half-open probe.
+                now[0] += 61
+                mode[0] = "healthy"
+
+                real_send = legs_module.AnthropicMessagesLeg.send
+                explode = [True]
+
+                async def exploding_send(self, credential, chat_request, *, stream):
+                    if explode[0]:
+                        explode[0] = False
+                        # MemoryError is deliberately not failover-eligible, so
+                        # it escapes the leg without producing any outcome.
+                        raise MemoryError("unclassified leg failure")
+                    return await real_send(self, credential, chat_request, stream=stream)
+
+                monkeypatch.setattr(
+                    legs_module.AnthropicMessagesLeg, "send", exploding_send
+                )
+                try:
+                    async with session.post(
+                        f"{gateway_base}/v1/chat/completions", json=payload
+                    ) as response:
+                        await response.read()
+                except aiohttp.ClientError:
+                    # The gateway may drop the connection rather than answer;
+                    # either way the abandoned probe must not hold the slot.
+                    pass
+                monkeypatch.setattr(
+                    legs_module.AnthropicMessagesLeg, "send", real_send
+                )
+
+                calls_before = len(claude_calls)
+                # No clock advance here: only an immediate release can let the
+                # recovered backend serve this request.
+                async with session.post(
+                    f"{gateway_base}/v1/chat/completions", json=payload
+                ) as response:
+                    assert response.status == 200
+                    assert response.headers["X-Hermes-Route-Backend"] == "claude-code"
+                    body = await response.json()
+                    assert body["choices"][0]["message"]["content"] == "recovered"
+                assert len(claude_calls) > calls_before
+        finally:
             await gateway_runner.cleanup()
             await codex_runner.cleanup()
             await claude_runner.cleanup()

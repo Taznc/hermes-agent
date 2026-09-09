@@ -124,6 +124,13 @@ restore
 sed -i 's/^                if now - state\.probe_started_at < self\._probe_timeout:$/                if True:/' "$ROUTING"
 check_mutation "M12 abandoned half-open probe lease never expires"
 
+# M13: the owner-scoped immediate release is disabled, so an abandoned attempt
+# holds the half-open slot until the stale lease expires. M12 covers the
+# cooldown-bounded fallback; only a test that never advances the clock can tell
+# the two layers apart.
+sed -i 's/^            if state\.probe_in_flight and state\.probe_owner == probe_id:$/            if False:/' "$ROUTING"
+check_mutation "M13 owner-scoped probe release disabled (no immediate recovery)"
+
 echo
 if [ "$FAILURES" -eq 0 ]; then
   echo "ALL MUTATIONS CAUGHT — the gateway suite is RED-capable."
