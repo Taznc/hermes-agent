@@ -255,6 +255,7 @@ describe('ProvidersSettings', () => {
         provider('qwen-oauth', true, {
           cli_command: 'hermes auth add qwen-oauth',
           disconnect_hint: "Use `hermes auth add qwen-oauth` or that provider's CLI to remove it.",
+          disconnect_command: 'qwen auth logout',
           disconnectable: false,
           flow: 'external',
           name: 'Qwen (via Qwen CLI)'
@@ -266,6 +267,7 @@ describe('ProvidersSettings', () => {
 
     expect(await screen.findByText('Qwen Code')).toBeTruthy()
     expect(screen.queryByRole('button', { name: 'Remove Qwen Code' })).toBeNull()
+    expect(screen.queryByRole('button', { name: 'Disconnect Qwen Code' })).toBeNull()
     expect(screen.getByText(/managed by its own CLI/)).toBeTruthy()
   })
 

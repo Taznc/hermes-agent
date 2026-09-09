@@ -1,6 +1,6 @@
 import { act, cleanup, renderHook } from '@testing-library/react'
 import { MemoryRouter } from 'react-router'
-import { afterEach, describe, expect, it } from 'vitest'
+import { afterEach, describe, expect, it, vi } from 'vitest'
 
 import { $currentUsage } from '@/store/session'
 
@@ -28,6 +28,7 @@ const baseProps = {
 
 afterEach(() => {
   cleanup()
+  vi.unstubAllGlobals()
   $currentUsage.set({ calls: 0, input: 0, output: 0, total: 0 })
 })
 
@@ -47,6 +48,14 @@ describe('useStatusbarItems render identity', () => {
     rerender()
 
     expect(result.current.leftStatusbarItems).toBe(before)
+  })
+
+  it('hides the interactive terminal affordance when the PTY bridge is absent', () => {
+    vi.stubGlobal('hermesDesktop', undefined)
+
+    const { result } = renderHook(() => useStatusbarItems(baseProps), { wrapper })
+
+    expect(result.current.statusbarItems.find(item => item.id === 'terminal')?.hidden).toBe(true)
   })
 
   it('keeps the gateway-health item identity stable when props are unchanged', () => {

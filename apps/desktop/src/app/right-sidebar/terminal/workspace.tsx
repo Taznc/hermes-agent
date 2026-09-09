@@ -5,6 +5,7 @@ import { $backgroundStatusBySession } from '@/store/composer-status'
 
 import { markAgentTerminalExited, seedAgentTerminalCommand, syncAgentTerminalSnapshot } from './agent-terminal-stream'
 import { setActiveTerminalId } from './buffer'
+import { interactiveTerminalAvailable } from './capability'
 import { AgentTerminalInstance, TerminalInstance } from './instance'
 import { $activeTerminalId, $terminals, ensureAgentTerminal, getTerminalBuffer } from './terminals'
 
@@ -17,7 +18,8 @@ interface TerminalWorkspaceProps {
  *  by PersistentTerminal (latched so shells survive hiding); the tab rail and
  *  new-terminal control live in the pane DOM — see TerminalPaneChrome. */
 export function TerminalWorkspace({ onAddSelectionToChat }: TerminalWorkspaceProps) {
-  const terminals = useStore($terminals)
+  const allTerminals = useStore($terminals)
+  const terminals = interactiveTerminalAvailable() ? allTerminals : allTerminals.filter(term => term.kind === 'agent')
   const activeId = useStore($activeTerminalId)
   const background = useStore($backgroundStatusBySession)
 

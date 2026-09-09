@@ -4,6 +4,10 @@ import type { TranslationOverrides } from '../define-locale'
 // here fall back to English through defineLocale(), exactly as before.
 
 export const forkAr: TranslationOverrides = {
+  rightSidebar: {
+    terminalUnavailableTitle: 'الطرفية المضمّنة غير متاحة',
+    terminalUnavailableBody: 'يتطلب الوصول التفاعلي إلى الصدفة تطبيق Hermes لسطح المكتب.'
+  },
   boot: {
     failure: {
       openLogsFailed: 'تعذّر فتح مجلد السجلات'
