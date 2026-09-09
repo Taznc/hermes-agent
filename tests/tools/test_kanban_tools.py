@@ -1630,7 +1630,7 @@ def test_request_review_ignores_the_conflict_when_the_preflight_is_disabled(
 
     tid, _ws = mergeability_env(conflicting=True)
     monkeypatch.setattr(
-        kt, "cfg_get",
+        kt._ktm, "cfg_get",
         lambda cfg, *keys, default=None: (
             False if keys == ("kanban", "require_mergeable_for_review") else default))
 

@@ -1175,6 +1175,15 @@ def _cmd_request_review(args: argparse.Namespace) -> int:
     metadata, rc = _parse_metadata_flag(getattr(args, "metadata", None))
     if rc:
         return rc
+    # The mergeability preflight guards the review lane, not one door into it:
+    # a worker refused by the kanban_request_review TOOL would otherwise shell
+    # out to this command and land the same unmergeable branch on a reviewer
+    # (task t_11421628). Same helper, same message, same event — the operator's
+    # off switch is `kanban.require_mergeable_for_review`, not the choice of
+    # entry point. Imported here so the CLI keeps no import-time dependency on
+    # the tool stack.
+    from tools import kanban_tools_mergeability as ktm
+
     with kbc.connect_closing() as conn:
         gate_err = _goal_gate_error(
             conn, tid, summary or "", "review handoff",
@@ -1182,6 +1191,12 @@ def _cmd_request_review(args: argparse.Namespace) -> int:
             "Provide acceptance evidence matching the task.")
         if gate_err:
             return _err(gate_err)
+        merge = ktm.preflight(kb.get_task(conn, tid), tid, board=getattr(args, "board", None))
+        if merge is not None:
+            if merge.conflicts:
+                ktm.record_conflict(conn, tid, merge, run_id=_worker_run_id_for(tid))
+                return _err(ktm.refusal_message(merge))
+            metadata = {**(metadata or {}), "mergeable_against": merge.stamp}
         ok, reason = kb.request_review(
             conn, tid, summary=summary, metadata=metadata, reviewer=getattr(args, "reviewer", None),
             expected_run_id=_worker_run_id_for(tid), force=bool(getattr(args, "force", False)), with_reason=True)

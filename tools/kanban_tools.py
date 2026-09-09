@@ -721,39 +721,6 @@ def _handle_block(args: dict, **kw) -> str:
         return _ok_landed(kb, conn, tid, "blocked", block_kind=kind)
 
 
-def _mergeability(kb, conn, task, tid: str, board: Optional[str]):
-    """Mergeability verdict for this handoff, or ``None`` to skip the gate.
-
-    Skips (byte-identical to the pre-gate behavior) when the operator turned it
-    off, when the board configures no ``land_target``, when the card has no
-    worktree workspace, or when git could not answer — see
-    ``kanban_tools_mergeability.check`` for the fail-open contract.
-    """
-    if not cfg_get(load_config(), "kanban", "require_mergeable_for_review", default=True):
-        return None
-    from hermes_cli.kanban_land import LandRefusal, resolve_target
-
-    try:
-        remote, branch = resolve_target(None, board=board)
-    except LandRefusal as exc:
-        logger.debug("mergeability preflight skipped for %s: %s", tid, exc)
-        return None
-    workspace = (task.workspace_path if task else None) or _own_task_env(
-        tid, "HERMES_KANBAN_WORKSPACE")
-    return _ktm.check(workspace, f"{remote}/{branch}")
-
-
-def _record_preflight_conflict(kb, conn, tid: str, merge) -> None:
-    """Durably record a refused handoff so the rounds it saves can be counted."""
-    from hermes_cli import kanban_db_connect as kbc
-
-    with kbc.write_txn(conn):
-        kb._append_event(
-            conn, tid, "review_preflight_conflict",
-            {"target": merge.target, "sha": merge.sha, "paths": list(merge.conflicts)},
-            run_id=_worker_run_id(tid))
-
-
 @_kanban_handler("kanban_request_review")
 def _handle_request_review(args: dict, **kw) -> str:
     """Move implementation into the first-class review phase."""
@@ -773,10 +740,10 @@ def _handle_request_review(args: dict, **kw) -> str:
     with _board(board) as (kb, conn):
         task = kb.get_task(conn, tid)
         _goal_gate("kanban_request_review", task, tid, summary)
-        merge = _mergeability(kb, conn, task, tid, board)
+        merge = _ktm.preflight(task, tid, board=board)
         if merge is not None:
             if merge.conflicts:
-                _record_preflight_conflict(kb, conn, tid, merge)
+                _ktm.record_conflict(conn, tid, merge, run_id=_worker_run_id(tid))
                 raise _Reject(_ktm.refusal_message(merge))
             metadata = {**(metadata or {}), "mergeable_against": merge.stamp}
         ok, fail_reason = kb.request_review(
