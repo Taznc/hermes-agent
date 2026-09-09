@@ -156,13 +156,39 @@ _FENCE_RE = re.compile(r"^```(?:json)?\s*|\s*```$", re.MULTILINE)
 _MAX_ACS_PER_CHILD = 5
 _AC_LABEL_RE = re.compile(r"\bAC(\d+)\b")
 _OUT_OF_SCOPE_RE = re.compile(r"^#{1,6}\s*out[ -]of[ -]scope\b", re.IGNORECASE | re.MULTILINE)
+# CommonMark allows up to three leading spaces before a fence or block quote marker.
+_BODY_FENCE_LINE_RE = re.compile(r"^ {0,3}```")
+_BLOCKQUOTE_LINE_RE = re.compile(r"^ {0,3}>")
+
+
+def _unquoted_text(text: str) -> str:
+    """``text`` with fenced code blocks and ``>`` block quotes removed.
+
+    A child that QUOTES its parent's criteria as context must not be charged for
+    the labels it quoted — a declaration belongs to its author, not to whoever
+    reproduced it. Fence markers pair in document order, so a trailing unpaired
+    marker opens nothing and is read as ordinary text: a dangling fence must not
+    be able to hide the labels the child really declares.
+    """
+    lines = text.split("\n")
+    fences = [i for i, line in enumerate(lines) if _BODY_FENCE_LINE_RE.match(line)]
+    fenced: set[int] = set()
+    for opened, closed in zip(fences[::2], fences[1::2]):
+        fenced.update(range(opened, closed + 1))
+    return "\n".join(
+        line
+        for i, line in enumerate(lines)
+        if i not in fenced and not _BLOCKQUOTE_LINE_RE.match(line)
+    )
 
 
 def _child_body_violation(body: str) -> str:
     """``""`` when ``body`` satisfies the child-body contract, else a one-line
     reason naming the violation (fed back to the LLM verbatim on the retry)."""
     text = body or ""
-    labels = set(_AC_LABEL_RE.findall(text))
+    # Only the label count is quoting-aware. The "Out of scope" search stays on the
+    # raw body deliberately: tightening it would reject bodies nothing rejects today.
+    labels = set(_AC_LABEL_RE.findall(_unquoted_text(text)))
     if len(labels) > _MAX_ACS_PER_CHILD:
         return (
             f"has {len(labels)} acceptance criteria (AC labels: "

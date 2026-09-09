@@ -394,6 +394,7 @@ type KanbanMessages = {
   queuePostDrain: string
   cancelPostDrain: string
   actionServiceRestart: (target: string) => string
+  actionRunScript: (name: string) => string
   actionReboot: string
   confirmRebootPrompt: string
   confirmReboot: string
@@ -788,6 +789,7 @@ export const en: KanbanMessages = {
   queuePostDrain: 'After drain…',
   cancelPostDrain: 'Cancel',
   actionServiceRestart: target => `Restart ${target}`,
+  actionRunScript: name => `Run ${name}`,
   actionReboot: 'Reboot this machine',
   confirmRebootPrompt: 'Reboot this machine once every worker has finished?',
   confirmReboot: 'Yes, reboot after drain',
@@ -1181,6 +1183,7 @@ const ja: KanbanMessages = {
   queuePostDrain: '排出後に…',
   cancelPostDrain: 'キャンセル',
   actionServiceRestart: target => `${target} を再起動`,
+  actionRunScript: name => `${name} を実行`,
   actionReboot: 'このマシンを再起動',
   confirmRebootPrompt: 'すべてのワーカーが完了したら、このマシンを再起動しますか？',
   confirmReboot: 'はい、排出後に再起動',
@@ -1565,6 +1568,7 @@ const zh: KanbanMessages = {
   queuePostDrain: '排空后…',
   cancelPostDrain: '取消',
   actionServiceRestart: target => `重启 ${target}`,
+  actionRunScript: name => `运行 ${name}`,
   actionReboot: '重启这台机器',
   confirmRebootPrompt: '在所有工作者完成后重启这台机器？',
   confirmReboot: '是，排空后重启',
@@ -1949,6 +1953,7 @@ const zhHant: KanbanMessages = {
   queuePostDrain: '排空後…',
   cancelPostDrain: '取消',
   actionServiceRestart: target => `重啟 ${target}`,
+  actionRunScript: name => `執行 ${name}`,
   actionReboot: '重新啟動這台機器',
   confirmRebootPrompt: '在所有工作者完成後重新啟動這台機器？',
   confirmReboot: '是，排空後重新啟動',

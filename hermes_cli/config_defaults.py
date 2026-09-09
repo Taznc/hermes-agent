@@ -1869,6 +1869,16 @@ DEFAULT_CONFIG = {
             "service_restart_allowlist": [],
             # "system" (systemctl) or "user" (systemctl --user).
             "service_restart_scope": "system",
+            # Maintenance scripts `run_script` may run, as NAME -> ABSOLUTE
+            # PATH. EMPTY BY DEFAULT for the same reason as the unit allowlist:
+            # a request may only NAME an entry here, never supply a path or
+            # arguments of its own, and an empty mapping makes `run_script`
+            # unqueueable. Unlike `service_restart`, the name is always
+            # required — a one-entry mapping does not resolve an unnamed
+            # request. Scripts run as the gateway user with no privilege
+            # escalation, and are bounded by a hard timeout.
+            # e.g. {"fork-sync": "/home/me/projects/scripts/fork-sync.sh"}.
+            "script_allowlist": {},
             # Expiry applied when the operator does not choose one. A pause that
             # never drains lets the action expire instead of firing hours later
             # into a state nobody expects.
@@ -1914,6 +1924,10 @@ DEFAULT_CONFIG = {
         # profile. 0 = unlimited (legacy behavior). The reviewer-side round contract (sdlc-review
         # skill) is advisory; this is the hard stop that actually bounds a runaway rework loop.
         "max_review_rounds": 3,
+        # Refuse a kanban_request_review handoff whose branch already conflicts with the board's
+        # land_target — the conflict costs a full review round to report and one `git merge` to
+        # fix. Skipped when the board sets no land_target or git cannot answer.
+        "require_mergeable_for_review": True,
         # Auto-run the decomposer on Triage tasks every tick. False = manual via `hermes kanban
         # decompose <id>` or the dashboard's Decompose button.
         "auto_decompose": True,

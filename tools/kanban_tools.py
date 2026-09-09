@@ -19,6 +19,7 @@ from typing import Any, Callable, Optional
 from agent.redact import redact_sensitive_text
 from hermes_cli.goals import judge_goal
 from tools.registry import registry, tool_error
+from tools import kanban_tools_mergeability as _ktm
 from hermes_cli.config import cfg_get, load_config
 from tools.kanban_tools_schemas import (
     KANBAN_ATTACH_SCHEMA,
@@ -720,6 +721,39 @@ def _handle_block(args: dict, **kw) -> str:
         return _ok_landed(kb, conn, tid, "blocked", block_kind=kind)
 
 
+def _mergeability(kb, conn, task, tid: str, board: Optional[str]):
+    """Mergeability verdict for this handoff, or ``None`` to skip the gate.
+
+    Skips (byte-identical to the pre-gate behavior) when the operator turned it
+    off, when the board configures no ``land_target``, when the card has no
+    worktree workspace, or when git could not answer — see
+    ``kanban_tools_mergeability.check`` for the fail-open contract.
+    """
+    if not cfg_get(load_config(), "kanban", "require_mergeable_for_review", default=True):
+        return None
+    from hermes_cli.kanban_land import LandRefusal, resolve_target
+
+    try:
+        remote, branch = resolve_target(None, board=board)
+    except LandRefusal as exc:
+        logger.debug("mergeability preflight skipped for %s: %s", tid, exc)
+        return None
+    workspace = (task.workspace_path if task else None) or _own_task_env(
+        tid, "HERMES_KANBAN_WORKSPACE")
+    return _ktm.check(workspace, f"{remote}/{branch}")
+
+
+def _record_preflight_conflict(kb, conn, tid: str, merge) -> None:
+    """Durably record a refused handoff so the rounds it saves can be counted."""
+    from hermes_cli import kanban_db_connect as kbc
+
+    with kbc.write_txn(conn):
+        kb._append_event(
+            conn, tid, "review_preflight_conflict",
+            {"target": merge.target, "sha": merge.sha, "paths": list(merge.conflicts)},
+            run_id=_worker_run_id(tid))
+
+
 @_kanban_handler("kanban_request_review")
 def _handle_request_review(args: dict, **kw) -> str:
     """Move implementation into the first-class review phase."""
@@ -735,8 +769,16 @@ def _handle_request_review(args: dict, **kw) -> str:
     metadata = _stamp_worker_session_metadata(tid, metadata)
     # Reviewer is model-supplied free text stored durably on the event payload.
     reviewer = _redact_opt(args.get("reviewer") or None)
-    with _board(args.get("board")) as (kb, conn):
-        _goal_gate("kanban_request_review", kb.get_task(conn, tid), tid, summary)
+    board = args.get("board")
+    with _board(board) as (kb, conn):
+        task = kb.get_task(conn, tid)
+        _goal_gate("kanban_request_review", task, tid, summary)
+        merge = _mergeability(kb, conn, task, tid, board)
+        if merge is not None:
+            if merge.conflicts:
+                _record_preflight_conflict(kb, conn, tid, merge)
+                raise _Reject(_ktm.refusal_message(merge))
+            metadata = {**(metadata or {}), "mergeable_against": merge.stamp}
         ok, fail_reason = kb.request_review(
             conn, tid, summary=summary, metadata=metadata, reviewer=reviewer,
             expected_run_id=_worker_run_id(tid), with_reason=True)
