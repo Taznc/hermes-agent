@@ -784,3 +784,249 @@ def test_reviewer_reassigns_for_autonomous_dispatch(kanban_home: Path) -> None:
         ev = _events(conn, tid, kind="review_requested")[0][1]
         assert ev["reviewer"] == "lead-reviewer"
         assert ev["implementer"] == "worker"
+
+
+# ---------------------------------------------------------------------------
+# Mergeability preflight on `hermes kanban request-review` (task t_11421628).
+#
+# The preflight landed on the tool handler only (t_3e83300c), leaving the CLI as
+# a second, ungated door into the review lane — and the CLI is exactly what a
+# worker refused by the tool would reach for next, which would make the
+# tool-side gate advisory rather than real. These tests pin the two doors to one
+# verdict.
+#
+# Real git repositories throughout, mirroring tests/tools/test_kanban_tools.py:
+# git's own merge machinery is what decides, so a mocked `git` would assert
+# nothing. They drive the real CLI entry point (build_parser -> kanban_command)
+# rather than the handler, so the argparse wiring is covered too.
+# ---------------------------------------------------------------------------
+
+
+def _git(repo, *args: str) -> str:
+    import subprocess
+
+    return subprocess.run(
+        ["git", "-C", str(repo), *args],
+        capture_output=True, text=True, check=True,
+    ).stdout.strip()
+
+
+def _make_origin(root):
+    """A repo with ``main`` (base) and ``dev`` (base + an edit to f.txt)."""
+    origin = root / "origin"
+    origin.mkdir()
+    _git(origin, "init", "-q", "-b", "main")
+    _git(origin, "config", "user.email", "t@example.invalid")
+    _git(origin, "config", "user.name", "t")
+    (origin / "f.txt").write_text("line1\nline2\n", encoding="utf-8")
+    _git(origin, "add", "-A")
+    _git(origin, "commit", "-qm", "base")
+    base = _git(origin, "rev-parse", "HEAD")
+    _git(origin, "checkout", "-q", "-b", "dev")
+    (origin / "f.txt").write_text("line1-FROM-DEV\nline2\n", encoding="utf-8")
+    _git(origin, "commit", "-qam", "dev moves f.txt")
+    _git(origin, "checkout", "-q", "main")
+    return origin, base
+
+
+def _make_workspace(root, origin, base, *, conflicting: bool):
+    """A clone branched off ``base``; ``conflicting`` decides whether its edit
+    collides with what ``origin/dev`` did to the same line."""
+    ws = root / "ws"
+    _git(root, "-c", "init.defaultBranch=main", "clone", "-q", str(origin), str(ws))
+    _git(ws, "config", "user.email", "t@example.invalid")
+    _git(ws, "config", "user.name", "t")
+    _git(ws, "checkout", "-q", "-b", "feature", base)
+    if conflicting:
+        (ws / "f.txt").write_text("line1-FROM-FEATURE\nline2\n", encoding="utf-8")
+    else:
+        (ws / "untouched-by-dev.txt").write_text("safe\n", encoding="utf-8")
+    _git(ws, "add", "-A")
+    _git(ws, "commit", "-qm", "feature work")
+    return ws
+
+
+def _run_kanban(*tokens) -> tuple[str, int]:
+    """Drive the real CLI entry point; returns (combined output, exit code)."""
+    import argparse
+    import contextlib
+    import io
+
+    from hermes_cli import kanban as kc
+
+    buf = io.StringIO()
+    parser = argparse.ArgumentParser()
+    kanban_parser = kc.build_parser(parser.add_subparsers(dest="_top"))
+    args = kanban_parser.parse_args(list(tokens))
+    with contextlib.redirect_stdout(buf), contextlib.redirect_stderr(buf):
+        rc = kc.kanban_command(args)
+    return buf.getvalue(), rc
+
+
+@pytest.fixture
+def cli_mergeability_env(monkeypatch, tmp_path):
+    """Factory: a worker task whose workspace is a real git clone, on a board
+    with a real ``land_target``. Returns ``make(conflicting=...)`` ->
+    ``(task_id, workspace_path)``."""
+    home = tmp_path / ".hermes"
+    home.mkdir()
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    monkeypatch.setenv("HERMES_PROFILE", "test-worker")
+    monkeypatch.delenv("HERMES_SESSION_ID", raising=False)
+    monkeypatch.setattr(Path, "home", lambda: tmp_path)
+
+    repos = tmp_path / "repos"
+    repos.mkdir()
+    origin, base = _make_origin(repos)
+
+    def make(*, conflicting: bool, land_target: str = "origin/dev",
+             workspace_path=None):
+        ws = _make_workspace(repos, origin, base, conflicting=conflicting)
+        kb._INITIALIZED_PATHS.clear()
+        kb.init_db()
+        if land_target:
+            kb.write_board_metadata(None, land_target=land_target)
+        with kbc.connect_closing() as conn:
+            tid = kb.create_task(
+                conn, title="cli mergeability", assignee="test-worker",
+                workspace_kind="worktree",
+                workspace_path=str(ws if workspace_path is None else workspace_path))
+            claimed = kb.claim_task(conn, tid)
+            assert claimed is not None
+        monkeypatch.setenv("HERMES_KANBAN_TASK", tid)
+        # request_review only clears a live claim with proof of ownership, which
+        # the real dispatcher supplies through this env var at spawn time.
+        monkeypatch.setenv("HERMES_KANBAN_RUN_ID", str(claimed.current_run_id))
+        return tid, ws
+
+    return make
+
+
+def _task_events(tid, kind=None):
+    with kbc.connect_closing() as conn:
+        evs = kb.list_events(conn, tid)
+    return [e for e in evs if kind is None or e.kind == kind]
+
+
+def _assert_untouched_cli_handoff(tid):
+    """The pre-gate contract: the handoff succeeded, stamped nothing, and
+    recorded nothing — byte-identical to the CLI's behavior before the gate."""
+    requested = _task_events(tid, "review_requested")
+    assert len(requested) == 1
+    with kbc.connect_closing() as conn:
+        run = kb.get_run(conn, requested[0].run_id)
+    assert run is not None
+    assert "mergeable_against" not in (run.metadata or {})
+    assert not _task_events(tid, "review_preflight_conflict")
+
+
+def test_cli_request_review_refuses_a_branch_conflicting_with_the_land_target(
+    cli_mergeability_env,
+) -> None:
+    """A handoff made through the CLI on a worktree that conflicts with the
+    board's ``land_target`` is refused with the same message and writes the
+    same ``review_preflight_conflict`` event as the tool path."""
+    tid, _ws = cli_mergeability_env(conflicting=True)
+
+    out, rc = _run_kanban("request-review", tid, "--summary", "implemented the thing")
+
+    assert rc != 0, out
+    assert "f.txt" in out, out
+    assert "git merge origin/dev" in out, out
+
+    with kbc.connect_closing() as conn:
+        assert kb.get_task(conn, tid).status == "running"
+    assert not _task_events(tid, "review_requested")
+
+    conflicts = _task_events(tid, "review_preflight_conflict")
+    assert len(conflicts) == 1
+    assert conflicts[0].payload["target"] == "origin/dev"
+    assert conflicts[0].payload["paths"] == ["f.txt"]
+
+
+def test_cli_request_review_stamps_the_target_it_verified_when_mergeable(
+    cli_mergeability_env,
+) -> None:
+    """A clean-merging worktree is handed off exactly as before, plus the proof
+    of what it was checked against — the same stamp the tool path writes."""
+    tid, ws = cli_mergeability_env(conflicting=False)
+
+    out, rc = _run_kanban("request-review", tid, "--summary", "implemented the thing")
+    assert rc == 0, out
+
+    with kbc.connect_closing() as conn:
+        assert kb.get_task(conn, tid).status == "review"
+
+    requested = _task_events(tid, "review_requested")
+    assert len(requested) == 1
+    with kbc.connect_closing() as conn:
+        run = kb.get_run(conn, requested[0].run_id)
+    assert run is not None
+    target, _, sha = run.metadata["mergeable_against"].partition("@")
+    assert target == "origin/dev"
+    assert sha == _git(ws, "rev-parse", "origin/dev")
+
+    assert not _task_events(tid, "review_preflight_conflict")
+
+
+def test_cli_request_review_ignores_the_conflict_when_the_preflight_is_disabled(
+    cli_mergeability_env,
+) -> None:
+    """``kanban.require_mergeable_for_review: false`` is a real off switch on
+    the CLI too — written into a real config.yaml rather than patched onto a
+    reader, so the resolution chain the operator actually edits is what is
+    proven. This is the documented escape hatch for a human override."""
+    tid, _ws = cli_mergeability_env(conflicting=True)
+    (Path.home() / ".hermes" / "config.yaml").write_text(
+        json.dumps({"kanban": {"require_mergeable_for_review": False}}), encoding="utf-8")
+
+    out, rc = _run_kanban("request-review", tid, "--summary", "implemented the thing")
+    assert rc == 0, out
+    with kbc.connect_closing() as conn:
+        assert kb.get_task(conn, tid).status == "review"
+    _assert_untouched_cli_handoff(tid)
+
+
+def test_cli_request_review_skips_the_preflight_without_a_land_target(
+    cli_mergeability_env,
+) -> None:
+    """With no ``land_target`` there is nothing to merge against and the
+    preflight must not invent one; the same conflicting branch is handed off."""
+    tid, _ws = cli_mergeability_env(conflicting=True, land_target="")
+
+    out, rc = _run_kanban("request-review", tid, "--summary", "implemented the thing")
+    assert rc == 0, out
+    with kbc.connect_closing() as conn:
+        assert kb.get_task(conn, tid).status == "review"
+    _assert_untouched_cli_handoff(tid)
+
+
+def test_cli_request_review_skips_the_preflight_on_a_non_git_workspace(
+    cli_mergeability_env, tmp_path: Path,
+) -> None:
+    """A scratch (non-git) workspace has no HEAD to merge, so the preflight
+    fails open rather than refusing work it cannot judge."""
+    plain = tmp_path / "not-a-repo"
+    plain.mkdir()
+    tid, _ws = cli_mergeability_env(conflicting=True, workspace_path=plain)
+
+    out, rc = _run_kanban("request-review", tid, "--summary", "implemented the thing")
+    assert rc == 0, out
+    with kbc.connect_closing() as conn:
+        assert kb.get_task(conn, tid).status == "review"
+    _assert_untouched_cli_handoff(tid)
+
+
+def test_cli_request_review_fails_open_when_the_land_target_is_unfetchable(
+    cli_mergeability_env, tmp_path: Path,
+) -> None:
+    """An unreachable remote is an infrastructure problem, not a verdict on the
+    branch — the CLI inherits the tool path's fail-open contract unchanged."""
+    tid, ws = cli_mergeability_env(conflicting=True)
+    _git(ws, "remote", "set-url", "origin", str(tmp_path / "gone"))
+
+    out, rc = _run_kanban("request-review", tid, "--summary", "implemented the thing")
+    assert rc == 0, out
+    with kbc.connect_closing() as conn:
+        assert kb.get_task(conn, tid).status == "review"
+    _assert_untouched_cli_handoff(tid)

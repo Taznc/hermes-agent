@@ -13,14 +13,24 @@ wrapper around that one answer.
 Lives outside ``tools/kanban_tools.py`` because the DB layer must stay
 git-agnostic and the tool facade must stay subprocess-agnostic; this is the
 only module in the kanban surface that shells out to git.
+
+It also owns the *orchestration* around that answer — the config switch, the
+land-target resolution, the workspace lookup, and the conflict event — because
+there are two doors into the review lane (``kanban_request_review`` and
+``hermes kanban request-review``) and a gate that only guards one of them is
+advisory rather than real (task t_11421628). Both entry points call
+:func:`preflight` and :func:`record_conflict`; neither owns a copy.
 """
 from __future__ import annotations
 
 import logging
+import os
 import subprocess
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional
+
+from hermes_cli.config import cfg_get, load_config
 
 logger = logging.getLogger(__name__)
 
@@ -125,3 +135,47 @@ def refusal_message(result: Mergeability) -> str:
         f"  git fetch {result.target.replace('/', ' ', 1)}\n"
         f"  git merge {result.target}\n"
     )
+
+
+def _own_task_env(task_id: str, var: str) -> Optional[str]:
+    """``$var`` only when this process is scoped to ``task_id``; else None."""
+    return os.environ.get(var) if os.environ.get("HERMES_KANBAN_TASK") == task_id else None
+
+
+def preflight(task, task_id: str, *, board: Optional[str]) -> Optional[Mergeability]:
+    """Mergeability verdict for a review handoff, or ``None`` to skip the gate.
+
+    Shared by both doors into the review lane — the ``kanban_request_review``
+    tool handler and ``hermes kanban request-review`` — so a worker refused at
+    one cannot walk through the other.
+
+    Skips (byte-identical to the pre-gate behavior) when the operator turned it
+    off with ``kanban.require_mergeable_for_review: false``, when the board
+    configures no ``land_target``, when the card has no worktree workspace, or
+    when git could not answer — see :func:`check` for the fail-open contract.
+    """
+    if not cfg_get(load_config(), "kanban", "require_mergeable_for_review", default=True):
+        return None
+    from hermes_cli.kanban_land import LandRefusal, resolve_target
+
+    try:
+        remote, branch = resolve_target(None, board=board)
+    except LandRefusal as exc:
+        logger.debug("mergeability preflight skipped for %s: %s", task_id, exc)
+        return None
+    workspace = (task.workspace_path if task else None) or _own_task_env(
+        task_id, "HERMES_KANBAN_WORKSPACE")
+    return check(workspace, f"{remote}/{branch}")
+
+
+def record_conflict(conn, task_id: str, result: Mergeability, *,
+                    run_id: Optional[int] = None) -> None:
+    """Durably record a refused handoff so the rounds it saves can be counted."""
+    from hermes_cli import kanban_db as kb
+    from hermes_cli import kanban_db_connect as kbc
+
+    with kbc.write_txn(conn):
+        kb._append_event(
+            conn, task_id, "review_preflight_conflict",
+            {"target": result.target, "sha": result.sha, "paths": list(result.conflicts)},
+            run_id=run_id)

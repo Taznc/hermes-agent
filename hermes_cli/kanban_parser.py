@@ -377,8 +377,18 @@ _SPECS = [
         _arg("--metadata", help="JSON object with structured reviewer handoff facts."),
         _arg("--force", action="store_true",
              help="Override the live-claim guard: move a running, claimed "
-                  "task to review even without owning its run (clears the worker's claim)."),
-    ], help="Move a task to 'review' (implementation done, awaiting review) — NOT a block"),
+                  "task to review even without owning its run (clears the worker's claim). "
+                  "Does NOT skip the mergeability preflight."),
+    ], help="Move a task to 'review' (implementation done, awaiting review) — NOT a block",
+       description=(
+           "Refuses when the task's worktree cannot merge the board's `land_target`: a "
+           "reviewer cannot adjudicate a branch they cannot merge, and this door is gated "
+           "exactly like the `kanban_request_review` tool. The refusal names the "
+           "conflicting paths and the two commands that fix them, and the task is left "
+           "untouched. The check is skipped when the board has no land_target, the "
+           "workspace is not a git worktree, or git cannot answer; turn it off entirely "
+           "with `kanban.require_mergeable_for_review: false` in config.yaml."
+       )),
     _cmd("approve", [
         _TASK_ID,
         _arg("--sha", metavar="COMMIT",
