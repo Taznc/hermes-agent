@@ -575,6 +575,66 @@ indicator totals workers across that scope. Already-running workers continue;
 if one board is busy, the other board results are preserved and the control
 stays actionable for a retry.
 
+#### Post-drain actions ("After drain…")
+
+The window above still needs someone present at the moment the board reaches 0.
+A **post-drain action** removes that: queue the intent up front, and the
+dispatcher's own tick fires it once the board (or, for an aggregate request,
+every selected board) has drained. No browser, dashboard poll, or wall-clock
+scheduler is involved, and the record survives the very restart it exists for.
+
+Three action kinds ship, all configured under `kanban.post_drain`:
+
+| Kind | Target | What it does |
+|---|---|---|
+| `service_restart` | An allowlisted **unit name** | `systemctl restart <unit>` |
+| `run_script` | An allowlisted **script name** | Runs that script as the gateway user |
+| `reboot` | none | Reboots the host |
+
+```yaml
+kanban:
+  post_drain:
+    # Units `service_restart` may restart, by exact name.
+    service_restart_allowlist:
+      - hermes-gateway.service
+    # "system" (systemctl) or "user" (systemctl --user).
+    service_restart_scope: system
+    # Scripts `run_script` may run, as NAME -> ABSOLUTE PATH.
+    script_allowlist:
+      fork-sync: /home/me/projects/hermes/scripts/fork-sync.sh
+      log-rotate: /home/me/bin/rotate-agent-logs.sh
+    default_expiry_seconds: 3600
+    max_expiry_seconds: 86400
+```
+
+Both allowlists are **empty by default**, which makes their kinds unqueueable.
+A queued action runs unattended, so what may run is an explicit local decision
+rather than an inherited one. A request may only **name** an entry that is
+already in the allowlist — it can never supply a unit, a path, or arguments of
+its own, which is why there is no freeform command form of this feature.
+
+`service_restart` resolves without a name when exactly one unit is allowlisted.
+`run_script` always requires the name: a unit name is a stable host fact, but a
+script name is an arbitrary local label, and an allowlist that later grows a
+second entry would silently change what an unnamed request had meant.
+
+Every record carries a mandatory **expiry** (`default_expiry_seconds`, bounded
+by `max_expiry_seconds`), so a pause that never drains lets the action expire
+instead of firing hours later into a state nobody expects. Resuming dispatch
+cancels a waiting action, and a waiting action can be cancelled directly from
+the panel; an action already firing is left alone.
+
+Success is an **observed** post-condition, never a bare exit code:
+`service_restart` requires the unit to come back `active` with a strictly newer
+start timestamp, `reboot` is confirmed from the other side by a changed machine
+instantiation, and `run_script` is judged on the script's exit status with a
+bounded tail of its stdout/stderr captured onto the record — so a failure is
+diagnosable from the dashboard rather than reading only "state: failed".
+Scripts run as the gateway user with a hard timeout and **no privilege
+escalation**: unlike the systemd kinds, there is no `sudo -n` fallback, because
+an allowlist of arbitrary local scripts must not become an allowlist of root
+shells.
+
 `review_rework_escalation_profile` breaks pathological implementation/review
 loops without removing review: the first changes request returns to the original
 implementer; after the second, the next ready run is reassigned to the configured

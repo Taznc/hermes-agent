@@ -4,6 +4,10 @@ import type { TranslationOverrides } from '../define-locale'
 // here fall back to English through defineLocale(), exactly as before.
 
 export const forkJa: TranslationOverrides = {
+  rightSidebar: {
+    terminalUnavailableTitle: '埋め込みターミナルは利用できません',
+    terminalUnavailableBody: '対話型シェルへのアクセスには Hermes デスクトップアプリが必要です。'
+  },
   assistant: {
     thread: {
       review: {

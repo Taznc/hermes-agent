@@ -574,3 +574,102 @@ def test_service_restart_is_not_offered_without_an_allowlist(client, kanban_home
     payload = client.get(f"{PREFIX}/dispatch/status").json()
 
     assert payload["post_drain_actions"] == [{"action_kind": "reboot", "targets": []}]
+
+
+# --- run_script over REST ---------------------------------------------------
+
+
+@pytest.fixture
+def script_allowlisted(tmp_path, monkeypatch):
+    """One script may be run, named ``fork-sync``, with a real file behind it."""
+    script = tmp_path / "fork-sync.sh"
+    script.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+    script.chmod(0o755)
+    monkeypatch.setattr(
+        pd, "resolve_post_drain_config",
+        lambda: pd.PostDrainConfig(
+            script_allowlist={"fork-sync": str(script)},
+            default_expiry_seconds=3600,
+            max_expiry_seconds=86400,
+        ),
+    )
+    return script
+
+
+def test_run_script_is_rejected_when_no_allowlist_is_configured(client, kanban_home):
+    """The shipped default declares no runnable script at all."""
+    response = client.post(
+        f"{PREFIX}/dispatch/post-drain",
+        json={"action_kind": "run_script", "target": "fork-sync"},
+    )
+
+    assert response.status_code == 400
+    assert client.get(f"{PREFIX}/dispatch/status").json()["post_drain"] is None
+
+
+def test_a_script_outside_the_allowlist_is_rejected(client, kanban_home, script_allowlisted):
+    """Neither an unlisted name nor a path the request supplies is accepted."""
+    for target in ("log-rotate", str(script_allowlisted)):
+        response = client.post(
+            f"{PREFIX}/dispatch/post-drain",
+            json={"action_kind": "run_script", "target": target},
+        )
+        assert response.status_code == 400
+        assert client.get(f"{PREFIX}/dispatch/status").json()["post_drain"] is None
+
+    # Control: the same route with the ALLOWLISTED name succeeds, so the 400s
+    # above prove allowlist validation rather than a broken route.
+    allowed = client.post(
+        f"{PREFIX}/dispatch/post-drain",
+        json={"action_kind": "run_script", "target": "fork-sync"},
+    )
+    assert allowed.status_code == 200
+    assert client.get(f"{PREFIX}/dispatch/status").json()["post_drain"]["target"] == "fork-sync"
+
+
+def test_a_run_script_request_without_a_name_is_rejected(client, kanban_home, script_allowlisted):
+    """Script identity is always explicit, even with a one-entry allowlist."""
+    response = client.post(f"{PREFIX}/dispatch/post-drain", json={"action_kind": "run_script"})
+
+    assert response.status_code == 400
+    assert client.get(f"{PREFIX}/dispatch/status").json()["post_drain"] is None
+
+
+def test_the_selector_offers_each_kind_its_own_allowlist(
+    client, kanban_home, tmp_path, monkeypatch,
+):
+    """Every targeted kind advertises ITS targets, not the restart allowlist's.
+
+    The catalog reads each handler's declared config source, so a second
+    targeted kind is a registration rather than another branch here.
+    """
+    monkeypatch.setattr(
+        pd, "resolve_post_drain_config",
+        lambda: pd.PostDrainConfig(
+            service_restart_allowlist=("hermes-gateway.service",),
+            script_allowlist={
+                "fork-sync": str(tmp_path / "fork-sync.sh"),
+                "log-rotate": str(tmp_path / "log-rotate.sh"),
+            },
+        ),
+    )
+
+    payload = client.get(f"{PREFIX}/dispatch/status").json()
+
+    assert payload["post_drain_actions"] == [
+        {"action_kind": "service_restart", "targets": ["hermes-gateway.service"]},
+        {"action_kind": "run_script", "targets": ["fork-sync", "log-rotate"]},
+        {"action_kind": "reboot", "targets": []},
+    ]
+
+
+def test_run_script_is_not_offered_without_a_script_allowlist(
+    client, kanban_home, allowlisted,
+):
+    """A configured RESTART allowlist must not make scripts selectable."""
+    payload = client.get(f"{PREFIX}/dispatch/status").json()
+
+    assert [entry["action_kind"] for entry in payload["post_drain_actions"]] == [
+        "service_restart",
+        "reboot",
+    ]

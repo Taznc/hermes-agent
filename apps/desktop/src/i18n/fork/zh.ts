@@ -39,6 +39,10 @@ export const forkZh: ForkTranslations = {
       rateLimitRecoveryFailed: 'Could not update the rate-limit recovery preference'
     }
   },
+  rightSidebar: {
+    terminalUnavailableTitle: '嵌入式终端不可用',
+    terminalUnavailableBody: '交互式 shell 访问需要 Hermes 桌面应用。'
+  },
   commandCenter: {
     maintenance: {
       curatorLoadFailed: '无法加载维护器状态',

@@ -156,6 +156,32 @@ describe('CtaBanner', () => {
     expect(screen.queryByText('ctaInitialBlockTitle')).toBeNull()
   })
 
+  it('review round cap: names the real cause and never claims no reason was recorded', () => {
+    // Regression for t_583024aa — the dispatcher's cap wrote block_kind and a
+    // review_round_cap event, yet the banner rendered "Blocked — cause
+    // unknown / No cause is recorded" directly above a diagnostics panel
+    // spelling out the exact cause.
+    const task = baseTask({ status: 'blocked', block_kind: 'review_round_cap' })
+
+    const events: KanbanEvent[] = [
+      {
+        id: 1,
+        kind: 'review_round_cap',
+        payload: { changes_rounds: 2, max_review_rounds: 2, reason: 'Round 2 still fails six safety requirements' },
+        created_at: 0
+      }
+    ]
+
+    render(
+      <CtaBanner comments={[]} events={events} onFocusComment={vi.fn()} onMove={vi.fn()} onSubmitChoice={vi.fn()} task={task} />
+    )
+
+    expect(screen.queryByText('ctaBlockedNoReason')).toBeNull()
+    expect(screen.queryByText('ctaBlockedTitle')).toBeNull()
+    expect(screen.getByText('ctaReviewRoundCapBody')).toBeTruthy()
+    expect(screen.getByText('Round 2 still fails six safety requirements')).toBeTruthy()
+  })
+
   it('blocked with no reason recorded: falls back to explanatory copy', () => {
     const task = baseTask({ status: 'blocked', block_kind: null })
 

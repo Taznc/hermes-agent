@@ -1,5 +1,5 @@
 import { atom } from 'nanostores'
-import { beforeEach, describe, expect, it, vi } from 'vitest'
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
 const STORAGE_KEY = 'hermes.desktop.terminals.v1'
 const bufferKey = (id: string) => `hermes.desktop.terminal-buffer.v1.${id}`
@@ -13,6 +13,36 @@ async function loadTerminalStore() {
 
   return { ...(await import('./terminals')), $currentCwd }
 }
+
+afterEach(() => {
+  vi.unstubAllGlobals()
+})
+
+describe('terminal capability', () => {
+  beforeEach(() => {
+    window.localStorage.clear()
+    vi.resetModules()
+  })
+
+  it('does not auto-create a user terminal when the PTY bridge is absent', async () => {
+    vi.stubGlobal('hermesDesktop', undefined)
+    const { $terminals, ensureTerminal } = await loadTerminalStore()
+
+    ensureTerminal()
+
+    expect($terminals.get()).toEqual([])
+  })
+
+  it('keeps auto-creation available when the PTY bridge is present', async () => {
+    vi.stubGlobal('hermesDesktop', { terminal: {} })
+    const { $terminals, ensureTerminal } = await loadTerminalStore()
+
+    ensureTerminal()
+
+    expect($terminals.get()).toHaveLength(1)
+    expect($terminals.get()[0]?.kind).toBe('user')
+  })
+})
 
 describe('terminal store persistence', () => {
   beforeEach(() => {

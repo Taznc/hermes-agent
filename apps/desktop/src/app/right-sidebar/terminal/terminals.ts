@@ -6,6 +6,7 @@ import { $currentCwd } from '@/store/session'
 import { setTerminalTakeover } from '../store'
 
 import { releaseAgentTerminal, seedAgentTerminalCommand } from './agent-terminal-stream'
+import { interactiveTerminalAvailable } from './capability'
 
 /** One in-app terminal tab. `id` is the renderer-side handle (distinct from the
  *  PTY session id the main process mints); each instance owns its own shell.
@@ -330,6 +331,10 @@ export function openAgentTerminal(procId: string, title: string): void {
  *  If a status-stack click already opened an agent tab, don't create a
  *  second, unrelated user shell just because the pane became visible. */
 export function ensureTerminal(): void {
+  if (!interactiveTerminalAvailable()) {
+    return
+  }
+
   if ($terminals.get().length === 0) {
     createTerminal()
   }

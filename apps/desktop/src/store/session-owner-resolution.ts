@@ -12,12 +12,27 @@
  * instead — the caller's error UX shows it, and the runtime that minted the
  * session is left untouched for the next correctly-routed attempt.
  *
- * The ONE case where the ambient gateway is not a fallback but the owner by
- * construction: no registry topology exists (legacy v1 primary) AND at most
- * one profile exists — a single backend serves every session, so there is
- * nothing to misroute to. Older single-profile backends omit `profile` on
- * their rows entirely; those users keep working unchanged.
+ * TWO cases where the ambient gateway is not a fallback but the owner by
+ * construction — both mean "no other physical backend can exist for any
+ * session on this host", just proven a different way:
+ *
+ *  1. No registry topology (legacy v1 primary) AND at most one profile — a
+ *     single backend serves every session, so there is nothing to misroute
+ *     to. Older single-profile backends omit `profile` on their rows
+ *     entirely; those users keep working unchanged.
+ *  2. The host owns no connection registry AT ALL (`connectionsManagedByHost`
+ *     is false — the browser-served web bridge, which has no Electron main
+ *     process and therefore no per-profile backend pool either). There every
+ *     profile is the SAME physical `hermes serve` process, scoped only by a
+ *     `profile` request param, never a distinct socket — so profile COUNT is
+ *     not evidence of multiple backends the way it is for Electron's pool,
+ *     and gating on it here fails closed for every multi-profile web
+ *     deployment. `connectionsManagedByHost` is the established sentinel for
+ *     this exact question (see host-connections.ts); reuse it instead of
+ *     inventing a parallel capability flag.
  */
+import { connectionsManagedByHost } from '@/lib/host-connections'
+
 import { hasRegistryTopology } from './connection-registry-state'
 import { $profiles } from './profile'
 import { isSessionOwnerRoute, type SessionOwnerScope } from './session-request-router'
@@ -44,10 +59,17 @@ export function isSessionOwnerResolutionError(error: unknown): error is SessionO
 }
 
 /** True when the ambient gateway is provably the only backend any session
- *  can live on (legacy single-backend Desktop): Electron has published no
- *  connection registry and there is at most one profile. The active route is
- *  presentation state; a null active connection does not prove sole topology. */
+ *  can live on: either the legacy single-backend Electron case (no published
+ *  connection registry and at most one profile), or a host that owns no
+ *  connection registry at all — there physically cannot be a second backend
+ *  to misroute to, regardless of profile count. The active route is
+ *  presentation state; a null active connection does not prove sole topology
+ *  on its own, which is why rung 1 still needs the profile-count check. */
 export function ambientGatewayOwnsEverySession(): boolean {
+  if (!connectionsManagedByHost()) {
+    return true
+  }
+
   return !hasRegistryTopology() && $profiles.get().length <= 1
 }
 

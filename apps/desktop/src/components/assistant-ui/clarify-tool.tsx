@@ -279,15 +279,29 @@ function ChoiceLabel({ choice }: { choice: string }) {
     return <>{renderClarifyInline(choice)}</>
   }
 
+  // The recommendation is a badge, not a trailing grey sentence. As prose it
+  // read as part of the option text and was easy to miss on a scan; as a pill
+  // it reads as metadata about the row. `data-recommended` is the stable hook
+  // for tests — asserting the CSS class instead makes any restyle a failure.
   return (
     <>
-      {renderClarifyInline(bare)} <span className="text-(--ui-text-tertiary)">{RECOMMENDED_LABEL}</span>
+      {renderClarifyInline(bare)}{' '}
+      <span
+        className="ml-0.5 whitespace-nowrap rounded-full bg-primary/10 px-1.5 py-px align-[0.5px] text-[0.625rem] font-medium tracking-wide text-primary"
+        data-recommended=""
+      >
+        {RECOMMENDED_LABEL.replace(/[()]/g, '')}
+      </span>
     </>
   )
 }
 
+// Options are real, hit-testable rows: a resting outline so each is a distinct
+// target instead of a bare line of text, and enough radius to match the card
+// they sit in. Vertical padding stays tight (py-1) so a 10-choice question is
+// still compact.
 const OPTION_ROW_CLASS =
-  'flex w-full items-start gap-2 rounded-[0.25rem] px-1.5 py-1 text-left disabled:cursor-not-allowed disabled:opacity-50'
+  'flex w-full items-start gap-2 rounded-lg px-2 py-1 text-left ring-1 ring-inset ring-transparent transition-[background-color,box-shadow] disabled:cursor-not-allowed disabled:opacity-50'
 
 // field-sizing on top of Textarea's shared chrome; kill min-h-16 for one-liners.
 const CLARIFY_TEXTAREA_CLASS =
@@ -575,7 +589,12 @@ function ChoiceButton({
           OPTION_ROW_CLASS,
           'text-(--ui-text-secondary) hover:bg-(--chrome-action-hover) hover:text-(--ui-text-primary)',
           active && 'bg-(--chrome-action-hover) text-(--ui-text-primary)',
-          selected && 'text-(--ui-text-primary)'
+          // Resting rows carry a faint outline so each option reads as its own
+          // target; a chosen row gets the accent tint + ring so "what did I
+          // pick" survives a glance. Selection used to be conveyed by the key
+          // badge alone, which is 18px of colour at the far left of the row.
+          !selected && 'ring-(--ui-text-tertiary)/15',
+          selected && 'bg-primary/8 text-(--ui-text-primary) ring-primary/40'
         )}
         data-choice
         data-highlighted={active || undefined}
@@ -1207,7 +1226,7 @@ function ClarifyToolSinglePending({
       role="group"
       tabIndex={-1}
     >
-      <ClarifyShell className="grid gap-2">
+      <ClarifyShell className="grid gap-2.5">
         <div className="flex items-start gap-2">
           <div className="flex-1 font-medium leading-(--conversation-line-height)">
             <ClarifyMarkdown text={question} />
@@ -1226,7 +1245,7 @@ function ClarifyToolSinglePending({
         <ClarifyHelpControls request={matchingRequest} target="question" targetLabel={question} />
 
         {hasChoices ? (
-          <div className="grid gap-px" role="group">
+          <div className="grid gap-1" role="group">
             {choices.map((choice, index) => {
               const selected = selectedChoices.includes(choice)
 
@@ -1492,7 +1511,7 @@ function BatchQuestionBlock({
       />
 
       {choices.length > 0 ? (
-        <div className="grid gap-px pl-[1.625rem]" role="group">
+        <div className="grid gap-1 pl-[1.625rem]" role="group">
           {choices.map((choice, choiceIndex) => {
             // The gateway decorates its recommended choice for display, while
             // persisted tool args carry the bare option. Local staged state

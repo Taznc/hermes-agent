@@ -24,6 +24,7 @@ const k: StatusGuidanceDeps = {
   guideBlockedManualCapability: 'guideBlockedManualCapability',
   guideBlockedManualTransient: 'guideBlockedManualTransient',
   guideBlockedReviewNoVerdict: 'guideBlockedReviewNoVerdict',
+  guideBlockedReviewRoundCap: 'guideBlockedReviewRoundCap',
   guideBlockedUnknown: 'guideBlockedUnknown',
   guideDone: 'guideDone',
   guideIdea: 'guideIdea',
@@ -143,6 +144,77 @@ describe('resolveBlockCause — fallback chain', () => {
     const task = baseTask({ last_failure_error: null })
 
     expect(resolveBlockCause(task, [], [])).toEqual({ origin: 'unknown' })
+  })
+})
+
+describe('resolveBlockCause — the dispatcher review-round cap (t_583024aa)', () => {
+  // The live card that exposed the defect: block_kind='review_round_cap' with a
+  // review_round_cap event. Before the fix this event kind was absent from
+  // CAUSE_EVENT_KINDS, so the scan fell through to `unknown` and the banner
+  // claimed "no cause is recorded" while the diagnostics panel below it printed
+  // the exact cause.
+  const capEvent = (payload: unknown = { changes_rounds: 2, max_review_rounds: 2, reason: 'Round 2 still fails six safety requirements' }) =>
+    event('review_round_cap', payload)
+
+  it('resolves the cap event to its own origin, never to unknown', () => {
+    const task = baseTask({ block_kind: 'review_round_cap', last_failure_error: null })
+
+    const cause = resolveBlockCause(task, [capEvent()], [])
+
+    expect(cause.origin).toBe('review_round_cap')
+    expect(cause).not.toEqual({ origin: 'unknown' })
+  })
+
+  it('carries the round counts and the reviewer reason off the payload', () => {
+    const task = baseTask({ block_kind: 'review_round_cap', last_failure_error: null })
+
+    expect(resolveBlockCause(task, [capEvent()], [])).toEqual({
+      max: 2,
+      origin: 'review_round_cap',
+      reason: 'Round 2 still fails six safety requirements',
+      rounds: 2
+    })
+  })
+
+  it('a payload missing the counts still resolves as the cap, with nulls — never unknown', () => {
+    const task = baseTask({ block_kind: 'review_round_cap', last_failure_error: null })
+
+    expect(resolveBlockCause(task, [capEvent({})], [])).toEqual({
+      max: null,
+      origin: 'review_round_cap',
+      reason: null,
+      rounds: null
+    })
+  })
+
+  it('a dispatcher-written block_kind is never cast into a manual BlockKind label', () => {
+    // `review_round_cap` is written by a raw UPDATE that bypasses
+    // VALID_BLOCK_KINDS, so it must not reach `blockKind[kind]` (which would
+    // index to undefined and render an empty banner title).
+    const task = baseTask({ block_kind: 'review_round_cap' })
+
+    const cause = resolveBlockCause(task, [event('blocked', { reason: 'manual words' })], [])
+
+    expect(cause).toEqual({ kind: null, origin: 'manual', reason: 'manual words' })
+  })
+
+  it('guidance points at an intervention, not a bare retry into the same loop', () => {
+    const task = baseTask({ block_kind: 'review_round_cap', last_failure_error: null })
+
+    const guidance = statusGuidance('blocked', task, [capEvent()], [], k)
+
+    expect(guidance).toBe('guideBlockedReviewRoundCap')
+    expect(guidance).not.toBe('guideBlockedUnknown')
+    expect(guidance).not.toBe('guideBlockedGeneric')
+  })
+
+  it('every locale defines the round-cap copy and never reuses the no-cause banner body', () => {
+    for (const [locale, bundle] of Object.entries(KANBAN_LOCALES)) {
+      expect(bundle.guideBlockedReviewRoundCap, `locale "${locale}"`).toBeTruthy()
+      expect(bundle.ctaReviewRoundCapBody, `locale "${locale}"`).toBeTruthy()
+      expect(bundle.ctaReviewRoundCapBody, `locale "${locale}"`).not.toBe(bundle.ctaBlockedNoReason)
+      expect(bundle.evtReviewRoundCap, `locale "${locale}"`).toBeTruthy()
+    }
   })
 })
 

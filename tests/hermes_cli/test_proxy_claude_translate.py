@@ -171,3 +171,29 @@ def test_claude_proxy_translates_stream_and_terminates_once():
     assert b'"content":"hello"' in frames[0]
     assert b'"finish_reason":"stop"' in frames[1]
     assert frames[-1] == b"data: [DONE]\n\n"
+
+
+@pytest.mark.parametrize("malformed_event", [
+    b"data: [1,2,3]\n",
+    b'data: {"type":"content_block_delta","delta":{"type":"text_delta","text":99}}\n',
+    b'data: {"type":"content_block_delta","delta":"oops"}\n',
+    b'data: {"type":"content_block_start","index":0,"content_block":"oops"}\n',
+    b'data: {"type":"message_delta","delta":"oops"}\n',
+    b'data: {"type":"content_block_delta","index":[],"delta":{"type":"input_json_delta"}}\n',
+    b'data: {"type":"content_block_start","index":0,"content_block":{"type":"tool_use","name":[]}}\n',
+    b'data: {"type":"message_delta","delta":{"stop_reason":[]}}\n',
+])
+def test_claude_proxy_stream_fails_closed_with_a_terminal_error_chunk(malformed_event):
+    frames = list(stream_events([
+        malformed_event,
+        b'data: {"type":"content_block_delta","delta":{"type":"text_delta","text":"must-not-escape"}}\n',
+    ], "claude-sonnet-4-6"))
+
+    data_frames = [frame for frame in frames if frame != b"data: [DONE]\n\n"]
+    chunks = [json.loads(frame.removeprefix(b"data: ")) for frame in data_frames]
+
+    assert all(chunk["object"] == "chat.completion.chunk" for chunk in chunks)
+    assert [chunk["error"]["code"] for chunk in chunks] == ["upstream_invalid_response"]
+    assert b"must-not-escape" not in b"".join(frames)
+    assert frames[-1] == b"data: [DONE]\n\n"
+    assert frames.count(b"data: [DONE]\n\n") == 1

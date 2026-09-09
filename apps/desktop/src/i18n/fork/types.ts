@@ -43,6 +43,10 @@ export interface ForkTranslations {
       rateLimitRecoveryFailed: string
     }
   }
+  rightSidebar: {
+    terminalUnavailableTitle: string
+    terminalUnavailableBody: string
+  }
   commandCenter: {
     maintenance: {
       curatorLoadFailed: string

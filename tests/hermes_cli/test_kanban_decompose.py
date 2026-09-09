@@ -85,8 +85,8 @@ def test_decompose_with_fanout_creates_children(kanban_home):
         "fanout": True,
         "rationale": "test split",
         "tasks": [
-            {"title": "research", "body": "look it up", "assignee": "researcher", "parents": []},
-            {"title": "build", "body": "code it", "assignee": "engineer", "parents": [0]},
+            {"title": "research", "body": _CONFORMING_BODY, "assignee": "researcher", "parents": []},
+            {"title": "build", "body": _CONFORMING_BODY, "assignee": "engineer", "parents": [0]},
         ],
     })
 
@@ -204,3 +204,214 @@ def test_clean_children_normalizes_priority(kanban_home):
     assert "priority" not in children[2]
 
 
+_CONFORMING_BODY = """Wire the classifier route into the dispatcher.
+
+Edit-Targets: hermes_cli/router.py
+
+## Acceptance criteria
+AC1. `route()` returns "mechanical" for a payload whose `route` key is "mechanical".
+     Tests: test_router.py::test_route_mechanical
+AC2. `route()` returns "default" for every malformed classifier output: empty
+     string, non-JSON text, JSON without a `route` key, `route` not in
+     {default, mechanical}.
+     Tests: test_router.py::test_route_malformed_falls_back
+
+## Out of scope
+Changing which model the classifier uses.
+"""
+
+_OVER_CAP_BODY = """Do a lot of things at once.
+
+## Acceptance criteria
+AC1. one. Tests: test_x.py::test_one
+AC2. two. Tests: test_x.py::test_two
+AC3. three. Tests: test_x.py::test_three
+AC4. four. Tests: test_x.py::test_four
+AC5. five. Tests: test_x.py::test_five
+AC6. six. Tests: test_x.py::test_six
+
+## Out of scope
+Nothing much.
+"""
+
+_NO_OUT_OF_SCOPE_BODY = """Wire the classifier route into the dispatcher.
+
+## Acceptance criteria
+AC1. `route()` returns "mechanical" for a mechanical payload.
+     Tests: test_router.py::test_route_mechanical
+"""
+
+# A child that quotes its parent's seven criteria as context, then declares two of
+# its own. The quoted labels belong to the parent, not to this card.
+_QUOTED_IN_FENCE_BODY = """Carve AC3 of the parent out into its own card.
+
+The parent card asked for all of this:
+
+```
+AC1 AC2 AC3 AC4 AC5 AC6 AC7
+```
+
+## Acceptance criteria
+AC1. `route()` returns "mechanical" for a mechanical payload.
+     Tests: test_router.py::test_route_mechanical
+AC2. `route()` returns "default" for a malformed payload.
+     Tests: test_router.py::test_route_malformed
+
+## Out of scope
+The other six parent criteria.
+"""
+
+_QUOTED_IN_BLOCKQUOTE_BODY = """Carve AC3 of the parent out into its own card.
+
+The parent card asked for all of this:
+
+> AC1 AC2 AC3 AC4 AC5 AC6 AC7
+
+## Acceptance criteria
+AC1. `route()` returns "mechanical" for a mechanical payload.
+     Tests: test_router.py::test_route_mechanical
+AC2. `route()` returns "default" for a malformed payload.
+     Tests: test_router.py::test_route_malformed
+
+## Out of scope
+The other six parent criteria.
+"""
+
+# One unpaired fence marker. It opens nothing, so the six real labels below it
+# stay visible to the counter.
+_UNTERMINATED_FENCE_BODY = """Do a lot of things at once.
+
+```
+
+## Acceptance criteria
+AC1. one. Tests: test_x.py::test_one
+AC2. two. Tests: test_x.py::test_two
+AC3. three. Tests: test_x.py::test_three
+AC4. four. Tests: test_x.py::test_four
+AC5. five. Tests: test_x.py::test_five
+AC6. six. Tests: test_x.py::test_six
+
+## Out of scope
+Nothing much.
+"""
+
+
+def test_child_body_contract_accepts_conforming():
+    """A body with <= 5 numbered ACs and an '## Out of scope' section passes."""
+    assert decomp._child_body_violation(_CONFORMING_BODY) == ""
+
+
+def test_child_body_contract_rejects_over_cap():
+    """A 6th acceptance criterion is a violation naming the cap."""
+    violation = decomp._child_body_violation(_OVER_CAP_BODY)
+    assert violation
+    assert "6" in violation and "5" in violation
+
+
+def test_child_body_contract_rejects_missing_out_of_scope():
+    """A body with no '## Out of scope' heading is a violation naming it."""
+    violation = decomp._child_body_violation(_NO_OUT_OF_SCOPE_BODY)
+    assert violation
+    assert "out of scope" in violation.lower()
+
+
+def test_ac_labels_inside_fence_are_not_counted():
+    """Criteria QUOTED inside a fenced block belong to whoever wrote them, not to
+    the child reproducing them — so a child declaring two of its own passes even
+    though the body mentions seven distinct labels."""
+    assert len(set(decomp._AC_LABEL_RE.findall(_QUOTED_IN_FENCE_BODY))) == 7
+    assert decomp._child_body_violation(_QUOTED_IN_FENCE_BODY) == ""
+
+
+def test_ac_labels_inside_blockquote_are_not_counted():
+    """Same contract for a '>' block quote as for a fence."""
+    assert len(set(decomp._AC_LABEL_RE.findall(_QUOTED_IN_BLOCKQUOTE_BODY))) == 7
+    assert decomp._child_body_violation(_QUOTED_IN_BLOCKQUOTE_BODY) == ""
+
+
+def test_unterminated_fence_still_counts_real_labels():
+    """A dangling ``` opens nothing, so it cannot hide the labels the child really
+    declares: an over-cap body is still rejected."""
+    violation = decomp._child_body_violation(_UNTERMINATED_FENCE_BODY)
+    assert violation
+    assert "6" in violation and "5" in violation
+
+
+def _fanout_payload(bodies: list[str]) -> str:
+    return jsonlib.dumps({
+        "fanout": True,
+        "rationale": "test split",
+        "tasks": [
+            {"title": f"child {i}", "body": b, "assignee": "engineer", "parents": []}
+            for i, b in enumerate(bodies)
+        ],
+    })
+
+
+def _patch_aux_sequence(contents: list[str]):
+    """Mock the aux LLM with one canned reply per call, in order."""
+    return patch(
+        "agent.auxiliary_client.call_llm",
+        side_effect=[_fake_aux_response(c) for c in contents],
+    )
+
+
+def test_decompose_retry_then_single_fallback(kanban_home):
+    """A contract-violating fan-out is re-prompted exactly once with the
+    violation named; a second violation falls back to no-fanout and writes no
+    child rows."""
+    with kbc.connect() as conn:
+        tid = kb.create_task(conn, title="ship a feature", triage=True)
+
+    bad = _fanout_payload([_OVER_CAP_BODY])
+    worse = _fanout_payload([_NO_OUT_OF_SCOPE_BODY])
+
+    patches = _patch_list_profiles(["orchestrator", "engineer"])
+    for p in patches:
+        p.start()
+    try:
+        with _patch_aux_sequence([bad, worse]) as mock_llm, _patch_extra_body():
+            outcome = decomp.decompose_task(tid, author="me")
+    finally:
+        for p in patches:
+            p.stop()
+
+    # Exactly one retry — not zero, not a loop.
+    assert mock_llm.call_count == 2
+    retry_user_msg = mock_llm.call_args_list[1].kwargs["messages"][-1]["content"]
+    assert "AC6" in retry_user_msg, retry_user_msg
+
+    assert outcome.ok is False
+    assert outcome.fanout is False
+    assert "contract" in outcome.reason.lower()
+
+    # No children written on either attempt; the task is untouched in triage.
+    with kbc.connect() as conn:
+        rows = kb.list_tasks(conn, limit=100)
+        root = kb.get_task(conn, tid)
+    assert [r.id for r in rows] == [tid]
+    assert root.status == "triage"
+
+
+def test_decompose_retry_succeeds_creates_children(kanban_home):
+    """A conforming retry is accepted and its children are created."""
+    with kbc.connect() as conn:
+        tid = kb.create_task(conn, title="ship a feature", triage=True)
+
+    bad = _fanout_payload([_NO_OUT_OF_SCOPE_BODY])
+    good = _fanout_payload([_CONFORMING_BODY, _CONFORMING_BODY])
+
+    patches = _patch_list_profiles(["orchestrator", "engineer"])
+    for p in patches:
+        p.start()
+    try:
+        with _patch_aux_sequence([bad, good]) as mock_llm, _patch_extra_body():
+            outcome = decomp.decompose_task(tid, author="me")
+    finally:
+        for p in patches:
+            p.stop()
+
+    assert mock_llm.call_count == 2
+    assert outcome.ok, outcome.reason
+    assert outcome.fanout is True
+    assert outcome.child_ids and len(outcome.child_ids) == 2
