@@ -44,7 +44,7 @@ import {
   saveProfileDescription
 } from './api'
 import type { KanbanProfile, PostDrainAction, PostDrainActionOption } from './types'
-import { errText, FIELD_LABEL, useKanban } from './ui'
+import { errText, FIELD_LABEL, type KanbanText, useKanban } from './ui'
 
 const DEFAULT_SENTINEL = '__default__'
 
@@ -92,6 +92,22 @@ function postDrainChoices(actions: PostDrainActionOption[]): PostDrainChoice[] {
   )
 }
 
+/** Human label per action kind, keyed by kind rather than branched on.
+ *
+ * The backend's registry is open — a kind is a registration there — so the
+ * renderer resolves the same way: one table entry per kind, and an unknown
+ * kind from a newer backend falls back to its raw id instead of being
+ * mislabelled as whatever the last branch happened to be. */
+const POST_DRAIN_LABELS: Record<string, (k: KanbanText, target: null | string) => string> = {
+  reboot: k => k.actionReboot,
+  run_script: (k, target) => k.actionRunScript(target ?? ''),
+  service_restart: (k, target) => k.actionServiceRestart(target ?? '')
+}
+
+function postDrainLabel(k: KanbanText, actionKind: string, target: null | string): string {
+  return POST_DRAIN_LABELS[actionKind]?.(k, target) ?? actionKind
+}
+
 /**
  * The "after drain" action queue, inside the dispatch panel.
  *
@@ -134,8 +150,7 @@ function PostDrainControl({
 
   const choices = postDrainChoices(actions)
 
-  const label = (choice: PostDrainChoice) =>
-    choice.actionKind === 'service_restart' ? k.actionServiceRestart(choice.target ?? '') : k.actionReboot
+  const label = (choice: PostDrainChoice) => postDrainLabel(k, choice.actionKind, choice.target)
 
   // An older backend omits the catalog entirely; render nothing rather than
   // guessing at kinds it may reject.
@@ -144,7 +159,7 @@ function PostDrainControl({
   }
 
   if (queued && !SETTLED_POST_DRAIN.has(queued.state)) {
-    const name = queued.action_kind === 'service_restart' ? k.actionServiceRestart(queued.target ?? '') : k.actionReboot
+    const name = postDrainLabel(k, queued.action_kind, queued.target)
     const remaining = formatRemaining(queued.expires_in_seconds ?? 0)
     const waiting = queued.state === 'waiting'
 
@@ -220,7 +235,7 @@ function PostDrainControl({
 
 function SettledPostDrain({ record }: { record: PostDrainAction }) {
   const k = useKanban()
-  const name = record.action_kind === 'service_restart' ? k.actionServiceRestart(record.target ?? '') : k.actionReboot
+  const name = postDrainLabel(k, record.action_kind, record.target)
 
   const text = {
     cancelled: () => k.postDrainCancelled(name),

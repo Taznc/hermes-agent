@@ -437,6 +437,63 @@ describe('Post-drain action queue', () => {
     )
   })
 
+  it('queues an allowlisted script by name, and labels it as a script', async () => {
+    // The third kind must be labelled by its OWN string rather than falling
+    // through to whatever the last branch happened to be — a `run_script`
+    // entry rendered as "reboot this machine" is the dangerous confusion.
+    status = {
+      ...status,
+      post_drain_actions: [
+        { action_kind: 'run_script', targets: ['fork-sync', 'log-rotate'] },
+        { action_kind: 'reboot', targets: [] }
+      ]
+    }
+    mount()
+
+    await openAfterDrainMenu()
+
+    expect(await screen.findByRole('menuitem', { name: 'actionRunScript(fork-sync)' })).toBeTruthy()
+    fireEvent.click(await screen.findByRole('menuitem', { name: 'actionRunScript(log-rotate)' }))
+
+    await waitFor(() =>
+      expect(rest).toHaveBeenCalledWith('/dispatch/post-drain?board=shipping', {
+        body: { action_kind: 'run_script', expires_in_seconds: null, target: 'log-rotate' },
+        method: 'POST'
+      })
+    )
+  })
+
+  it('reports a settled script failure under the script label', async () => {
+    status = {
+      ...status,
+      post_drain: {
+        ...QUEUED,
+        action_kind: 'run_script',
+        error: 'script exited 1: remote rejected the push',
+        state: 'failed',
+        target: 'fork-sync'
+      }
+    }
+    mount()
+
+    expect(
+      await screen.findByText(
+        'postDrainFailed(actionRunScript(fork-sync),script exited 1: remote rejected the push)'
+      )
+    ).toBeTruthy()
+  })
+
+  it('falls back to the raw kind id when a newer backend offers an unknown one', async () => {
+    // The backend's registry is open, so an unknown kind must render as itself
+    // rather than being mislabelled as one of the kinds this build knows.
+    status = { ...status, post_drain_actions: [{ action_kind: 'defrag_the_cache', targets: [] }] }
+    mount()
+
+    await openAfterDrainMenu()
+
+    expect(await screen.findByRole('menuitem', { name: 'defrag_the_cache' })).toBeTruthy()
+  })
+
   it('offers every allowlisted restart target, not just the first', async () => {
     // The catalog carries one row per KIND with all its allowlisted units. A
     // selector that only ever submitted `targets[0]` would leave every later

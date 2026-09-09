@@ -94,6 +94,120 @@ def test_a_single_entry_allowlist_resolves_the_target_without_a_request_body(kan
     assert record["target"] == "hermes-gateway.service"
 
 
+# --- run_script -------------------------------------------------------------
+
+
+@pytest.fixture
+def script_allowlisted(tmp_path, monkeypatch):
+    """Config where exactly one script may be run, with a real file behind it."""
+    script = tmp_path / "fork-sync.sh"
+    script.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+    script.chmod(0o755)
+    monkeypatch.setattr(
+        pd, "resolve_post_drain_config",
+        lambda: pd.PostDrainConfig(
+            script_allowlist={"fork-sync": str(script)},
+            default_expiry_seconds=3600,
+            max_expiry_seconds=86400,
+        ),
+    )
+    return script
+
+
+def test_run_script_target_must_come_from_the_config_allowlist(kanban_home, script_allowlisted):
+    for target in ("log-rotate", str(script_allowlisted), "/bin/true"):
+        with pytest.raises(pd.PostDrainActionRejected):
+            pd.queue_post_drain_action(None, action_kind="run_script", target=target)
+        assert pd.read_post_drain_action(None) is None
+
+    record = pd.queue_post_drain_action(None, action_kind="run_script", target="fork-sync")
+
+    # The record carries the NAME, never a path: the path is re-resolved from
+    # config at firing time, so removing the entry disarms the queued action.
+    assert record["target"] == "fork-sync"
+
+
+def test_run_script_is_unqueueable_when_the_allowlist_is_empty(kanban_home, monkeypatch):
+    monkeypatch.setattr(pd, "resolve_post_drain_config", pd.PostDrainConfig)
+
+    with pytest.raises(pd.PostDrainActionRejected):
+        pd.queue_post_drain_action(None, action_kind="run_script", target="fork-sync")
+    with pytest.raises(pd.PostDrainActionRejected):
+        pd.queue_post_drain_action(None, action_kind="run_script")
+    assert pd.read_post_drain_action(None) is None
+
+
+def test_run_script_always_needs_an_explicit_name_even_with_one_entry(
+    kanban_home, script_allowlisted,
+):
+    """A lone script entry does NOT resolve an unnamed request.
+
+    ``service_restart`` allows that because a unit name is a stable host fact
+    the operator recognises in the queued record. A script name is an arbitrary
+    local label, and an allowlist that later grows a second entry would silently
+    change what an unnamed request had meant, so script identity stays explicit.
+    """
+    with pytest.raises(pd.PostDrainActionRejected):
+        pd.queue_post_drain_action(None, action_kind="run_script")
+
+    assert pd.read_post_drain_action(None) is None
+    # Control: the SAME single-entry allowlist resolves when the name is given.
+    assert pd.queue_post_drain_action(
+        None, action_kind="run_script", target="fork-sync",
+    )["target"] == "fork-sync"
+
+
+@pytest.mark.parametrize(
+    "raw",
+    [
+        pytest.param(["fork-sync"], id="a_list_is_not_a_mapping"),
+        pytest.param("fork-sync=/tmp/x.sh", id="a_string_is_not_a_mapping"),
+        pytest.param({"fork-sync": "scripts/fork-sync.sh"}, id="relative_path"),
+        pytest.param({"fork-sync": ""}, id="empty_path"),
+        pytest.param({"": "/tmp/x.sh"}, id="empty_name"),
+        pytest.param({"fork-sync": 7}, id="non_string_path"),
+        pytest.param({7: "/tmp/x.sh"}, id="non_string_name"),
+    ],
+)
+def test_a_malformed_script_allowlist_entry_fails_closed(kanban_home, monkeypatch, raw):
+    """Garbage yields an EMPTY allowlist, which makes the kind unqueueable.
+
+    A relative path is dropped rather than resolved: what it would resolve
+    against is the dispatcher's working directory at firing time, which is not
+    something the operator who wrote the config chose.
+    """
+    monkeypatch.setattr(
+        pd, "resolve_post_drain_config",
+        lambda: pd.PostDrainConfig(script_allowlist=pd._script_entries(raw)),
+    )
+
+    with pytest.raises(pd.PostDrainActionRejected):
+        pd.queue_post_drain_action(None, action_kind="run_script", target="fork-sync")
+
+
+def test_the_script_allowlist_is_read_from_the_config_section(kanban_home, monkeypatch):
+    """The new key reaches the resolved config alongside the existing one."""
+    monkeypatch.setattr(
+        "hermes_cli.config.load_config_readonly",
+        lambda: {
+            "kanban": {
+                "post_drain": {
+                    "service_restart_allowlist": ["hermes-gateway.service"],
+                    "script_allowlist": {
+                        "fork-sync": "/opt/scripts/fork-sync.sh",
+                        "relative": "scripts/nope.sh",
+                    },
+                }
+            }
+        },
+    )
+
+    cfg = pd.resolve_post_drain_config()
+
+    assert cfg.script_allowlist == {"fork-sync": "/opt/scripts/fork-sync.sh"}
+    assert cfg.service_restart_allowlist == ("hermes-gateway.service",)
+
+
 def test_reboot_rejects_a_target(kanban_home):
     with pytest.raises(pd.PostDrainActionRejected):
         pd.queue_post_drain_action(None, action_kind="reboot", target="hermes-gateway.service")
@@ -1065,3 +1179,167 @@ def test_a_denied_user_service_restart_never_escalates_to_sudo(
         )
 
     assert argv_seen == [["systemctl", "--user", "restart", "hermes-gateway.service"]]
+
+
+# --- run_script fires as the gateway user, and reports what it observed ------
+
+
+def _script_cfg(path, name="fork-sync"):
+    return pd.PostDrainConfig(script_allowlist={name: str(path)})
+
+
+def _write_script(tmp_path, name, body):
+    script = tmp_path / name
+    script.write_text(body, encoding="utf-8")
+    script.chmod(0o755)
+    return script
+
+
+def test_run_script_never_builds_a_privileged_candidate(kanban_home, tmp_path, monkeypatch):
+    """No ``sudo -n`` rung exists for a script, on success OR on denial.
+
+    ``_run_system_action``'s escalation is for a fixed systemd argv naming a
+    unit. A maintenance script is arbitrary local code, so the same fallback
+    would silently turn an allowlist of paths into an allowlist of root shells.
+    """
+    script = _write_script(tmp_path, "ok.sh", "#!/bin/sh\nexit 0\n")
+    argv_seen = _record_argv(monkeypatch)
+
+    pd._script_fire({"target": "fork-sync"}, _script_cfg(script))
+
+    assert argv_seen == [[str(script)]]
+
+    # And a DENIED run does not then try again with privilege — the exact shape
+    # `_run_system_action` uses for a system-scoped unit.
+    denied = _record_results(monkeypatch, [1])
+    with pytest.raises(RuntimeError):
+        pd._script_fire({"target": "fork-sync"}, _script_cfg(script))
+
+    assert denied == [[str(script)]]
+
+
+def test_a_failing_script_reports_its_output_tail_in_the_error(kanban_home, tmp_path):
+    script = _write_script(
+        tmp_path, "boom.sh", "#!/bin/sh\necho 'partial progress'\necho 'the real reason' >&2\nexit 3\n",
+    )
+
+    with pytest.raises(RuntimeError) as excinfo:
+        pd._script_fire({"target": "fork-sync"}, _script_cfg(script))
+
+    message = str(excinfo.value)
+    assert "exited 3" in message
+    assert "the real reason" in message
+    # Bounded, so it survives the module's own 400-char truncation intact.
+    assert len(message) <= 400
+
+
+def test_captured_output_keeps_the_tail_and_marks_the_truncation(kanban_home, tmp_path):
+    """A long log must not push the failure's last words out of the record."""
+    script = _write_script(
+        tmp_path, "chatty.sh",
+        "#!/bin/sh\nawk 'BEGIN{for(i=0;i<400;i++) print \"noise line\"}'\n"
+        "echo 'FINAL FAILURE REASON' >&2\nexit 1\n",
+    )
+
+    with pytest.raises(RuntimeError) as excinfo:
+        pd._script_fire({"target": "fork-sync"}, _script_cfg(script))
+
+    message = str(excinfo.value)
+    assert "FINAL FAILURE REASON" in message
+    assert "…" in message
+
+
+def test_a_script_removed_from_the_allowlist_no_longer_fires(kanban_home, tmp_path):
+    """The record holds a NAME, so config is what decides at firing time."""
+    script = _write_script(tmp_path, "ok.sh", "#!/bin/sh\nexit 0\n")
+
+    with pytest.raises(pd.PostDrainActionRejected):
+        pd._script_fire({"target": "fork-sync"}, _script_cfg(script, name="something-else"))
+
+
+def test_a_queued_run_script_fires_once_on_drain_and_settles_with_its_output(
+    kanban_home, tmp_path, monkeypatch,
+):
+    """The card's headline flow, end to end through the real state machine.
+
+    Nothing is stubbed but the config: a real subprocess runs, and the verdict
+    is read back off the persisted record.
+    """
+    marker = tmp_path / "ran.txt"
+    script = _write_script(
+        tmp_path, "fork-sync.sh",
+        f"#!/bin/sh\necho ran >> {marker}\necho 'sync complete'\nexit 0\n",
+    )
+    monkeypatch.setattr(pd, "resolve_post_drain_config", lambda: _script_cfg(script))
+    kbd.pause_dispatch(None)
+    pd.queue_post_drain_action(None, action_kind="run_script", target="fork-sync")
+
+    settled = pd.evaluate_post_drain_action(None)
+
+    assert settled["state"] == pd.SUCCEEDED
+    assert settled["output"] == "sync complete"
+    assert marker.read_text(encoding="utf-8").count("ran") == 1
+
+    # A settled record is never re-fired, however many ticks follow.
+    assert pd.evaluate_post_drain_action(None) is None
+    assert pd.evaluate_post_drain_action(None) is None
+    assert marker.read_text(encoding="utf-8").count("ran") == 1
+    assert pd.read_post_drain_action(None)["state"] == pd.SUCCEEDED
+
+
+def test_a_failing_run_script_settles_failed_with_a_diagnosable_error(
+    kanban_home, tmp_path, monkeypatch,
+):
+    script = _write_script(
+        tmp_path, "fork-sync.sh", "#!/bin/sh\necho 'remote rejected the push' >&2\nexit 1\n",
+    )
+    monkeypatch.setattr(pd, "resolve_post_drain_config", lambda: _script_cfg(script))
+    kbd.pause_dispatch(None)
+    pd.queue_post_drain_action(None, action_kind="run_script", target="fork-sync")
+
+    settled = pd.evaluate_post_drain_action(None)
+
+    assert settled["state"] == pd.FAILED
+    assert "remote rejected the push" in settled["error"]
+
+
+def test_a_run_script_never_fires_while_a_worker_is_still_running(
+    kanban_home, tmp_path, monkeypatch,
+):
+    marker = tmp_path / "ran.txt"
+    script = _write_script(tmp_path, "fork-sync.sh", f"#!/bin/sh\necho ran >> {marker}\n")
+    monkeypatch.setattr(pd, "resolve_post_drain_config", lambda: _script_cfg(script))
+    _running(None, 1)
+    kbd.pause_dispatch(None)
+    pd.queue_post_drain_action(None, action_kind="run_script", target="fork-sync")
+
+    assert pd.evaluate_post_drain_action(None) is None
+    assert not marker.exists()
+    assert pd.read_post_drain_action(None)["state"] == pd.WAITING
+
+
+def test_an_unobserved_firing_script_settles_only_after_its_timeout_can_have_elapsed(
+    kanban_home,
+):
+    """A record whose firing process died is resolved, but not prematurely.
+
+    A script's evidence lives only inside the process that ran it, so a missing
+    outcome means unobserved, not failed — and that only becomes decidable once
+    no run this record started could still be alive.
+    """
+    fresh = pd._script_observe_after({"fired_at": int(time.time())}, pd.PostDrainConfig())
+
+    assert fresh == {}
+
+    stale = pd._script_observe_after(
+        {
+            "fired_at": int(time.time())
+            - pd.SCRIPT_TIMEOUT_SECONDS
+            - pd.SCRIPT_OBSERVATION_GRACE_SECONDS
+            - 1
+        },
+        pd.PostDrainConfig(),
+    )
+
+    assert stale["state"] == pd.FAILED
+    assert "unknown" in stale["error"]

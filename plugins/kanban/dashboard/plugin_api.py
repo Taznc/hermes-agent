@@ -1932,7 +1932,7 @@ def _post_drain_action_catalog() -> list[dict[str, Any]]:
         if not handler.takes_target:
             catalog.append({"action_kind": kind, "targets": []})
             continue
-        targets = list(cfg.service_restart_allowlist)
+        targets = handler.config_targets(cfg)
         if targets:
             catalog.append({"action_kind": kind, "targets": targets})
     return catalog

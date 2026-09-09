@@ -64,13 +64,16 @@ MAX_EXPIRY_SECONDS = 86400
 class PostDrainConfig:
     """Resolved ``kanban.post_drain`` policy.
 
-    The restart allowlist is deliberately EMPTY by default: a queued action runs
-    unattended with no operator watching, so which units may be restarted is an
-    explicit local decision, never an inherited default.
+    Both allowlists are deliberately EMPTY by default: a queued action runs
+    unattended with no operator watching, so which units may be restarted — and
+    which scripts may be run — is an explicit local decision, never an inherited
+    default.
     """
 
     service_restart_allowlist: tuple[str, ...] = ()
     service_restart_scope: str = "system"
+    script_allowlist: Mapping[str, str] = field(default_factory=dict)
+    """Name -> absolute path. A request names an entry; it never supplies a path."""
     default_expiry_seconds: int = DEFAULT_EXPIRY_SECONDS
     max_expiry_seconds: int = MAX_EXPIRY_SECONDS
 
@@ -81,11 +84,34 @@ def _positive_int(value: Any, fallback: int) -> int:
     return value
 
 
+def _script_entries(raw: Any) -> dict[str, str]:
+    """Parse the script allowlist, dropping anything that is not a usable entry.
+
+    A relative path is dropped rather than resolved: what it would resolve
+    against is the dispatcher's working directory at firing time, which is not
+    something the operator who wrote the config chose.
+    """
+    if not isinstance(raw, dict):
+        return {}
+    entries: dict[str, str] = {}
+    for name, path in raw.items():
+        if not isinstance(name, str) or not name.strip():
+            continue
+        if not isinstance(path, str) or not path.strip():
+            continue
+        candidate = path.strip()
+        if not os.path.isabs(candidate):
+            continue
+        entries[name.strip()] = candidate
+    return entries
+
+
 def resolve_post_drain_config() -> PostDrainConfig:
     """Read ``kanban.post_drain`` from config.yaml, failing closed on garbage.
 
     An unreadable or malformed section yields the default config, whose empty
-    allowlist makes ``service_restart`` unqueueable — the safe direction.
+    allowlists make ``service_restart`` and ``run_script`` unqueueable — the
+    safe direction.
     """
     try:
         from hermes_cli.config import load_config_readonly
@@ -107,6 +133,7 @@ def resolve_post_drain_config() -> PostDrainConfig:
     return PostDrainConfig(
         service_restart_allowlist=units,
         service_restart_scope="user" if scope == "user" else "system",
+        script_allowlist=_script_entries(section.get("script_allowlist")),
         default_expiry_seconds=min(
             _positive_int(section.get("default_expiry_seconds"), DEFAULT_EXPIRY_SECONDS),
             max_expiry,
@@ -133,8 +160,15 @@ class PostDrainAction:
     takes_target: bool
     resolve_target: Callable[[Optional[str], PostDrainConfig], Optional[str]]
     observe_before: Callable[[Mapping[str, Any], PostDrainConfig], dict[str, Any]]
-    fire: Callable[[Mapping[str, Any], PostDrainConfig], None]
+    fire: Callable[[Mapping[str, Any], PostDrainConfig], Optional[dict[str, Any]]]
     observe_after: Callable[[Mapping[str, Any], PostDrainConfig], dict[str, Any]]
+    config_targets: Callable[[PostDrainConfig], list[str]] = lambda cfg: []
+    """The allowlisted names a request may name, for the UI selector.
+
+    On the handler rather than in the catalog builder so a new targeted kind is
+    still a registration: a selector that read each kind's allowlist by name
+    would be the branch ladder this table exists to avoid.
+    """
     survives_execution: bool = True
     """False when the action destroys the process observing it (reboot): the
     record stays ``firing`` and is resolved by a later read from a new boot."""
@@ -319,6 +353,166 @@ def _reject_target(target: Optional[str], cfg: PostDrainConfig) -> None:
     return None
 
 
+# --- run_script -------------------------------------------------------------
+
+SCRIPT_TIMEOUT_SECONDS = 900
+"""Hard bound on one queued script. Nobody is watching it, so it cannot hang."""
+
+SCRIPT_OBSERVATION_GRACE_SECONDS = 60
+"""Slack past the timeout before a ``firing`` script record is called dead."""
+
+OUTPUT_TAIL_CHARS = 320
+"""Captured output kept per record — the TAIL, where a script reports its error.
+
+Under ``_run_system_action``'s 400-char truncation on purpose: the tail travels
+inside a ``RuntimeError`` message that the caller then truncates, so a larger
+budget here would simply be eaten and the operator would read a clipped tail.
+"""
+
+
+def _output_tail(stdout: Optional[str], stderr: Optional[str]) -> str:
+    """Combined output, newest end kept, marked when anything was dropped."""
+    combined = "\n".join(
+        part for part in ((stdout or "").strip(), (stderr or "").strip()) if part
+    )
+    if len(combined) <= OUTPUT_TAIL_CHARS:
+        return combined
+    return "…" + combined[-OUTPUT_TAIL_CHARS:]
+
+
+def _resolve_script_target(target: Optional[str], cfg: PostDrainConfig) -> str:
+    """Resolve which allowlisted script to run, by name.
+
+    A request never supplies a path or arguments: it may only NAME an entry in
+    ``kanban.post_drain.script_allowlist``. An empty allowlist means this kind
+    is unqueueable on this host.
+
+    Unlike ``service_restart``, a lone entry does NOT resolve an empty request.
+    A unit name is a stable host fact the operator recognises in the queued
+    record, but a script name is an arbitrary local label — and an allowlist
+    that later grows a second entry would silently change what an unnamed
+    request had meant. Script identity is always explicit.
+    """
+    allowed = cfg.script_allowlist
+    if not allowed:
+        raise PostDrainActionRejected(
+            "run_script is not configured on this host: set "
+            "kanban.post_drain.script_allowlist in config.yaml"
+        )
+    name = (target or "").strip()
+    if not name:
+        raise PostDrainActionRejected(
+            "run_script needs a target; allowed scripts: " + ", ".join(sorted(allowed))
+        )
+    if name not in allowed:
+        raise PostDrainActionRejected(
+            f"run_script target {name!r} is not in "
+            "kanban.post_drain.script_allowlist"
+        )
+    return name
+
+
+def _script_path(record: Mapping[str, Any], cfg: PostDrainConfig) -> str:
+    """The path CURRENT config maps this record's name to.
+
+    Resolved from config at every step, never from the record: a record is only
+    ever a name, so an entry removed from the allowlist between queueing and
+    draining stops the action instead of firing a path nobody still declares.
+    """
+    name = str(record.get("target") or "")
+    path = cfg.script_allowlist.get(name)
+    if not path:
+        raise PostDrainActionRejected(
+            f"run_script target {name!r} is no longer in "
+            "kanban.post_drain.script_allowlist"
+        )
+    return path
+
+
+def _script_observe_before(record: Mapping[str, Any], cfg: PostDrainConfig) -> dict[str, Any]:
+    """Record WHICH file is about to run, so the outcome names a real artifact."""
+    path = _script_path(record, cfg)
+    try:
+        stat = os.stat(path)
+        return {"path": path, "size": stat.st_size, "mtime": int(stat.st_mtime)}
+    except OSError as exc:
+        raise PostDrainActionRejected(f"run_script target {path!r} is not runnable: {exc}") from exc
+
+
+def _run_script_action(path: str) -> dict[str, Any]:
+    """Run one allowlisted script as the gateway user, and only as that user.
+
+    Deliberately NOT :func:`_run_system_action`: that helper's ``sudo -n``
+    fallback exists for systemd actions inside root's authority domain, where
+    the argv is fixed and names a unit. A maintenance script is arbitrary local
+    code, so granting it the same fallback would silently turn an allowlist of
+    paths into an allowlist of root shells.
+    """
+    try:
+        result = subprocess.run(
+            [path],
+            capture_output=True,
+            text=True,
+            timeout=SCRIPT_TIMEOUT_SECONDS,
+            check=False,
+            stdin=subprocess.DEVNULL,
+        )
+    except subprocess.TimeoutExpired as exc:
+        tail = _output_tail(
+            exc.stdout if isinstance(exc.stdout, str) else None,
+            exc.stderr if isinstance(exc.stderr, str) else None,
+        )
+        raise RuntimeError(f"{path} exceeded {SCRIPT_TIMEOUT_SECONDS}s: {tail}") from exc
+    except (OSError, subprocess.SubprocessError) as exc:
+        raise RuntimeError(f"{path}: {exc}") from exc
+    tail = _output_tail(result.stdout, result.stderr)
+    if result.returncode != 0:
+        raise RuntimeError(f"{path} exited {result.returncode}: {tail}")
+    return {"exit_code": 0, "output": tail}
+
+
+def _script_fire(record: Mapping[str, Any], cfg: PostDrainConfig) -> dict[str, Any]:
+    return _run_script_action(_script_path(record, cfg))
+
+
+def _script_observe_after(record: Mapping[str, Any], cfg: PostDrainConfig) -> dict[str, Any]:
+    """Success is the recorded exit status of the run this record fired.
+
+    A script has no external state to diff, so its only evidence — exit code and
+    output — exists solely inside the firing process and reaches here through
+    the ``fired_result`` the fire step persisted. Missing evidence therefore
+    means the run was never observed, not that it failed: that is only decidable
+    once the subprocess's own hard timeout has passed, after which no run this
+    record started can still be alive.
+    """
+    outcome = record.get("fired_result")
+    if isinstance(outcome, dict) and "exit_code" in outcome:
+        if outcome.get("exit_code") == 0:
+            return {
+                "state": SUCCEEDED,
+                "observed_after": outcome,
+                "output": outcome.get("output") or "",
+            }
+        return {
+            "state": FAILED,
+            "observed_after": outcome,
+            "error": f"script exited {outcome.get('exit_code')}: {outcome.get('output') or ''}",
+        }
+    fired_at = record.get("fired_at")
+    deadline = SCRIPT_TIMEOUT_SECONDS + SCRIPT_OBSERVATION_GRACE_SECONDS
+    if isinstance(fired_at, int) and time.time() - fired_at > deadline:
+        return {
+            "state": FAILED,
+            "error": (
+                "the process that fired this script did not record an outcome "
+                f"within {deadline}s; whether it completed is unknown"
+            ),
+        }
+    # Still running, or being run by another live tick. Settling here would be
+    # a guess against a subprocess that has not finished.
+    return {}
+
+
 def _reboot_observe_before(record: Mapping[str, Any], cfg: PostDrainConfig) -> dict[str, Any]:
     """Stamp the machine instantiation this record was queued in.
 
@@ -357,6 +551,16 @@ ACTION_HANDLERS: dict[str, PostDrainAction] = {
         observe_before=_service_observe_before,
         fire=_service_fire,
         observe_after=_service_observe_after,
+        config_targets=lambda cfg: list(cfg.service_restart_allowlist),
+    ),
+    "run_script": PostDrainAction(
+        kind="run_script",
+        takes_target=True,
+        resolve_target=_resolve_script_target,
+        observe_before=_script_observe_before,
+        fire=_script_fire,
+        observe_after=_script_observe_after,
+        config_targets=lambda cfg: sorted(cfg.script_allowlist),
     ),
     "reboot": PostDrainAction(
         kind="reboot",
@@ -934,12 +1138,23 @@ def evaluate_post_drain_action(
     # ONE invocation for the whole group: the action is host-wide, so a group of
     # three boards is still a single reboot.
     try:
-        handler.fire(own, cfg)
+        outcome = handler.fire(own, cfg)
     except Exception as exc:
         written = _settle_members(
             members, {"state": FAILED, "error": str(exc)[:400]}, now=current,
         )
         return written.get(board)
+
+    # Evidence that exists only inside this process (a script's exit code and
+    # output) is persisted before it is judged, so a crash between firing and
+    # observing leaves the verdict recoverable by a later tick rather than
+    # stranding the record in ``firing``.
+    if outcome:
+        members = [
+            (slug, _write_post_drain_action(slug, {**member, "fired_result": dict(outcome)}))
+            for slug, member in members
+        ]
+        own = next((member for slug, member in members if slug == board), members[0][1])
 
     try:
         verdict = handler.observe_after(own, cfg) or {}
