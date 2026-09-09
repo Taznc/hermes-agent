@@ -3494,6 +3494,10 @@ def recompute_ready(conn: sqlite3.Connection, failure_limit: int = None) -> int:
 
     1. The most recent block event was a worker-initiated ``kanban_block`` — those stay blocked until an
     explicit ``kanban_unblock`` (#28712).
+
+    A card whose event log ends in a terminal ``completed`` with no sanctioned
+    reopen is never promoted: it is healed back to ``done`` (see the
+    ``_terminal_completion_without_reopen`` call below).
     """
     if failure_limit is None:
         failure_limit = DEFAULT_FAILURE_LIMIT
@@ -3519,6 +3523,35 @@ def recompute_ready(conn: sqlite3.Connection, failure_limit: int = None) -> int:
                 "WHERE l.child_id = ?", (task_id,),
             ).fetchall()
             if all(_parent_dependency_satisfied(p) for p in parents):
+                # The event log outranks ``tasks.status``: a card whose last
+                # ``completed`` event has no sanctioned reopen after it is
+                # finished work, whatever put the row back in todo/blocked.
+                # Promoting it would record a misleading ``promoted`` event AND
+                # move it into the 'ready' lane that
+                # ``_terminal_card_replay_ids`` scans, tripping a board-wide
+                # dispatch pause before ``claim_task``'s identical guard is
+                # ever reached. Heal to 'done' here instead, in the same txn.
+                stale_completed_event_id = _terminal_completion_without_reopen(conn, task_id)
+                if stale_completed_event_id is not None:
+                    cur = conn.execute(
+                        "UPDATE tasks SET status = 'done', claim_lock = NULL, "
+                        "claim_expires = NULL, worker_pid = NULL "
+                        "WHERE id = ? AND status = ?", (task_id, cur_status),
+                    )
+                    if cur.rowcount == 1:
+                        _append_event(
+                            conn, task_id, "terminal_reclaim_rejected",
+                            {
+                                "completed_event_id": stale_completed_event_id,
+                                "source": "recompute_ready",
+                                "from_status": cur_status,
+                                "reason": (
+                                    "task already completed with no recorded reopen; "
+                                    "status desync healed back to done instead of promoting"
+                                ),
+                            },
+                        )
+                    continue
                 resume_status = _resume_status_from_events(conn, task_id)
                 if cur_status == "blocked":
                     # At the breaker limit, no auto-recovery (else block ->
@@ -3676,6 +3709,7 @@ def claim_task(
                     conn, task_id, "terminal_reclaim_rejected",
                     {
                         "completed_event_id": stale_completed_event_id,
+                        "source": "claim_task",
                         "reason": (
                             "task already completed with no recorded reopen; "
                             "status desync healed back to done instead of re-dispatching"
