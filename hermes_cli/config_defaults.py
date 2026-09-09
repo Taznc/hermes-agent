@@ -1869,6 +1869,16 @@ DEFAULT_CONFIG = {
             "service_restart_allowlist": [],
             # "system" (systemctl) or "user" (systemctl --user).
             "service_restart_scope": "system",
+            # Maintenance scripts `run_script` may run, as NAME -> ABSOLUTE
+            # PATH. EMPTY BY DEFAULT for the same reason as the unit allowlist:
+            # a request may only NAME an entry here, never supply a path or
+            # arguments of its own, and an empty mapping makes `run_script`
+            # unqueueable. Unlike `service_restart`, the name is always
+            # required — a one-entry mapping does not resolve an unnamed
+            # request. Scripts run as the gateway user with no privilege
+            # escalation, and are bounded by a hard timeout.
+            # e.g. {"fork-sync": "/home/me/projects/scripts/fork-sync.sh"}.
+            "script_allowlist": {},
             # Expiry applied when the operator does not choose one. A pause that
             # never drains lets the action expire instead of firing hours later
             # into a state nobody expects.

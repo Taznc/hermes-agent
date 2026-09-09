@@ -323,7 +323,8 @@ export interface OrchestrationSettings {
  *  whether or not this dashboard is open. */
 export interface PostDrainAction {
   action_kind: string
-  /** Allowlisted unit for `service_restart`; null for target-less kinds. */
+  /** Allowlisted unit (`service_restart`) or script name (`run_script`);
+   *  null for target-less kinds. Never a path or a command the request chose. */
   target: null | string
   requested_by: string
   requested_at: number
@@ -335,6 +336,8 @@ export interface PostDrainAction {
   expires_in_seconds: null | number
   /** Observed failure detail — present only in the `failed` state. */
   error?: string
+  /** Captured output tail — present when a `run_script` action succeeded. */
+  output?: string
   /** Shared by every board armed in one aggregate request. */
   group_id?: string
   /** Aggregate scope only: how many boards carry this action. */
@@ -345,7 +348,8 @@ export interface PostDrainAction {
  *  own registry + allowlist, so the UI can never offer an action that 400s. */
 export interface PostDrainActionOption {
   action_kind: string
-  /** Allowlisted targets; empty for target-less kinds like `reboot`. */
+  /** Allowlisted targets for this kind; empty for target-less kinds like
+   *  `reboot`. Which allowlist they came from is the backend's business. */
   targets: string[]
 }
 
