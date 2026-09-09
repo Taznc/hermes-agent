@@ -67,6 +67,7 @@ import {
 import { $removedSessionIds } from '@/store/session-removal'
 import { $workingSessionIds } from '@/store/session-states'
 import { ackAllSessionsRead } from '@/store/session-unread'
+import { loadArchivedSessions } from '@/store/sidebar-archive'
 import {
   $sidebarAllProfilesActive,
   $sidebarIsHiddenFromProjects,
@@ -219,6 +220,16 @@ export function SidebarWorkspaceSection({
 
     return () => window.clearTimeout(warm)
   }, [activeConnectionId, worktreeGroupingActive, showAllProfiles, profileScope, gatewayReady])
+
+  // Archived rows are excluded from the sessions query, so the Archived view
+  // has to fetch its own set — `$sidebarScopedSessions` reads
+  // `$archivedSessions`, which nothing else fills. Without this the toggle
+  // swaps to a permanently empty list.
+  useEffect(() => {
+    if (showArchived) {
+      void loadArchivedSessions()
+    }
+  }, [showArchived])
 
   // Sessions the branch join can't answer for get one look at their own
   // transcript — a `gh pr create` in there names the PR outright.
