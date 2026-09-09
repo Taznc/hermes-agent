@@ -72,6 +72,8 @@ type KanbanMessages = {
   archiveDoneConfirm: (count: number, scope: string) => string
   archiveDonePartial: (archived: number, failed: number, skipped: number) => string
   archiveDoneSuccess: (archived: number) => string
+  archiveDoneBackground: string
+  archiveDoneFailed: (message: string) => string
   clearSelection: string
   refused: string
   bulkFailed: (failed: number, total: number, err: string) => string
@@ -479,6 +481,8 @@ export const en: KanbanMessages = {
   archiveDonePartial: (archived, failed, skipped) =>
     `${archived} completed card${archived === 1 ? '' : 's'} archived; ${failed} failed and ${skipped} skipped.`,
   archiveDoneSuccess: archived => `${archived} completed card${archived === 1 ? '' : 's'} archived.`,
+  archiveDoneBackground: 'Archiving is still running in the background — check back shortly.',
+  archiveDoneFailed: message => `Could not archive completed cards — ${message}`,
   clearSelection: 'Clear selection (Esc)',
   refused: 'refused',
   bulkFailed: (failed, total, err) => `${failed} of ${total} failed — ${err}. Failed cards stay selected.`,
@@ -862,6 +866,8 @@ const ja: KanbanMessages = {
   archiveDonePartial: (archived, failed, skipped) =>
     `完了済みカード ${archived} 件をアーカイブ、${failed} 件失敗、${skipped} 件スキップしました。`,
   archiveDoneSuccess: archived => `完了済みカード ${archived} 件をアーカイブしました。`,
+  archiveDoneBackground: 'アーカイブはバックグラウンドで実行中です。しばらくしてから確認してください。',
+  archiveDoneFailed: message => `完了済みカードをアーカイブできませんでした — ${message}`,
   clearSelection: '選択をクリア（Esc）',
   refused: '拒否されました',
   bulkFailed: (failed, total, err) => `${total} 件中 ${failed} 件が失敗 — ${err}。失敗したカードは選択されたままです。`,
@@ -1245,6 +1251,8 @@ const zh: KanbanMessages = {
   archiveDonePartial: (archived, failed, skipped) =>
     `已归档 ${archived} 个已完成卡片；${failed} 个失败，${skipped} 个跳过。`,
   archiveDoneSuccess: archived => `已归档 ${archived} 个已完成卡片。`,
+  archiveDoneBackground: '归档仍在后台运行 — 请稍后再查看。',
+  archiveDoneFailed: message => `无法归档已完成卡片 — ${message}`,
   clearSelection: '清除选择（Esc）',
   refused: '被拒绝',
   bulkFailed: (failed, total, err) => `${total} 个中有 ${failed} 个失败 — ${err}。失败的卡片仍保持选中。`,
@@ -1621,6 +1629,8 @@ const zhHant: KanbanMessages = {
   archiveDonePartial: (archived, failed, skipped) =>
     `已封存 ${archived} 個已完成卡片；${failed} 個失敗，${skipped} 個略過。`,
   archiveDoneSuccess: archived => `已封存 ${archived} 個已完成卡片。`,
+  archiveDoneBackground: '封存仍在背景執行中 — 請稍後再查看。',
+  archiveDoneFailed: message => `無法封存已完成卡片 — ${message}`,
   clearSelection: '清除選取（Esc）',
   refused: '被拒絕',
   bulkFailed: (failed, total, err) => `${total} 個中有 ${failed} 個失敗 — ${err}。失敗的卡片仍保持選取。`,

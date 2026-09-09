@@ -373,10 +373,23 @@ function archiveDonePath(path: string): string {
   return $boardSlug.get() === ALL_BOARDS ? `${path}?boards=*` : withBoard(path)
 }
 
-export const fetchArchiveDonePreflight = () =>
-  call<ArchiveDonePreflight>(archiveDonePath('/tasks/archive-done/preflight'))
+/** Archiving every done card on every board is a bulk write whose duration
+ * scales with the candidate set (~76 cards observed), and the REST layer
+ * otherwise applies its generic 30s ceiling — which aborted the request in the
+ * UI while the backend kept going and completed. A per-call budget only ever
+ * RAISES that ceiling, so this is the one archive-done knob, not a global one. */
+export const ARCHIVE_DONE_TIMEOUT_MS = 300_000
 
-export const archiveDone = () => call<ArchiveDoneResult>(archiveDonePath('/tasks/archive-done'), { method: 'POST' })
+export const fetchArchiveDonePreflight = () =>
+  call<ArchiveDonePreflight>(archiveDonePath('/tasks/archive-done/preflight'), {
+    timeoutMs: ARCHIVE_DONE_TIMEOUT_MS
+  })
+
+export const archiveDone = () =>
+  call<ArchiveDoneResult>(archiveDonePath('/tasks/archive-done'), {
+    method: 'POST',
+    timeoutMs: ARCHIVE_DONE_TIMEOUT_MS
+  })
 
 // ── writes ────────────────────────────────────────────────────────────────────
 
