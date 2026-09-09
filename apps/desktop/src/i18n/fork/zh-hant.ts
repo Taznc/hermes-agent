@@ -4,6 +4,10 @@ import type { TranslationOverrides } from '../define-locale'
 // Keys absent here fall back to English through defineLocale(), as before.
 
 export const forkZhHant: TranslationOverrides = {
+  rightSidebar: {
+    terminalUnavailableTitle: '嵌入式終端機無法使用',
+    terminalUnavailableBody: '互動式 shell 存取需要 Hermes 桌面應用程式。'
+  },
   assistant: {
     thread: {
       review: {

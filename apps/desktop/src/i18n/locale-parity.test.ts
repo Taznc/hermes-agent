@@ -1,5 +1,6 @@
 import { describe, expect, it } from 'vitest'
 
+import { TRANSLATIONS } from './catalog'
 import { forkEn } from './fork/en'
 import type { Locale } from './types'
 import { zhAuthored } from './zh'
@@ -75,4 +76,15 @@ describe('desktop i18n fork-added key parity', () => {
     const missing = FORK_KEYS.filter(key => !keys.has(key))
     expect(missing).toEqual([])
   })
+
+  it.each(['ru', 'zh', 'zh-hant', 'ja', 'ar'] as const)(
+    'translates the web terminal unavailable state in "%s"',
+    locale => {
+      const english = TRANSLATIONS.en.rightSidebar
+      const translated = TRANSLATIONS[locale].rightSidebar
+
+      expect(translated.terminalUnavailableTitle).not.toBe(english.terminalUnavailableTitle)
+      expect(translated.terminalUnavailableBody).not.toBe(english.terminalUnavailableBody)
+    }
+  )
 })

@@ -41,6 +41,10 @@ export const forkEn: ForkTranslations = {
       rateLimitRecoveryFailed: 'Could not update the rate-limit recovery preference'
     }
   },
+  rightSidebar: {
+    terminalUnavailableTitle: 'Embedded terminal unavailable',
+    terminalUnavailableBody: 'Interactive shell access requires the Hermes desktop app.'
+  },
   commandCenter: {
     maintenance: {
       curatorLoadFailed: 'Could not load curator status',
