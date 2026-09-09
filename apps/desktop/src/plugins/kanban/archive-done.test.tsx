@@ -111,11 +111,19 @@ describe('Archive Done', () => {
     mount()
     const dialog = await openConfirmation()
 
-    expect(rest).toHaveBeenCalledWith('/tasks/archive-done/preflight?board=shipping', undefined)
+    expect(rest).toHaveBeenCalledWith(
+      '/tasks/archive-done/preflight?board=shipping',
+      expect.objectContaining({ timeoutMs: expect.any(Number) })
+    )
     expect(within(dialog).getByText('archiveDoneConfirm(2,Shipping)')).toBeTruthy()
 
     fireEvent.click(within(dialog).getByRole('button', { name: 'archiveDone()' }))
-    await waitFor(() => expect(rest).toHaveBeenCalledWith('/tasks/archive-done?board=shipping', { method: 'POST' }))
+    await waitFor(() =>
+      expect(rest).toHaveBeenCalledWith(
+        '/tasks/archive-done?board=shipping',
+        expect.objectContaining({ method: 'POST' })
+      )
+    )
   })
 
   it('uses the existing All Boards REST scope without client-side fan-out', async () => {
@@ -123,11 +131,16 @@ describe('Archive Done', () => {
     mount()
     const dialog = await openConfirmation()
 
-    expect(rest).toHaveBeenCalledWith('/tasks/archive-done/preflight?boards=*', undefined)
+    expect(rest).toHaveBeenCalledWith(
+      '/tasks/archive-done/preflight?boards=*',
+      expect.objectContaining({ timeoutMs: expect.any(Number) })
+    )
     expect(within(dialog).getByText('archiveDoneConfirm(3,All Boards)')).toBeTruthy()
 
     fireEvent.click(within(dialog).getByRole('button', { name: 'archiveDone()' }))
-    await waitFor(() => expect(rest).toHaveBeenCalledWith('/tasks/archive-done?boards=*', { method: 'POST' }))
+    await waitFor(() =>
+      expect(rest).toHaveBeenCalledWith('/tasks/archive-done?boards=*', expect.objectContaining({ method: 'POST' }))
+    )
     expect(rest.mock.calls.filter(([path]) => String(path).includes('/tasks/archive-done?'))).toHaveLength(1)
   })
 
@@ -140,7 +153,10 @@ describe('Archive Done', () => {
     await waitFor(() =>
       expect(screen.getByRole('button', { name: 'archiveDone()' }).hasAttribute('disabled')).toBe(true)
     )
-    expect(rest).toHaveBeenCalledWith('/tasks/archive-done/preflight?board=shipping', undefined)
+    expect(rest).toHaveBeenCalledWith(
+      '/tasks/archive-done/preflight?board=shipping',
+      expect.objectContaining({ timeoutMs: expect.any(Number) })
+    )
   })
 
   it('cancels without mutating', async () => {
@@ -182,14 +198,56 @@ describe('Archive Done', () => {
     expect(invalidate).toHaveBeenCalledWith({ queryKey: ['kanban', 'board'] })
   })
 
-  it('keeps the confirmation open with its inline error when archiving fails', async () => {
+  it('closes the confirmation before the archive settles and reports failure as a notification', async () => {
+    let settle: (outcome: { reject: Error } | { resolve: ArchiveDoneResult }) => void = () => {}
+
+    const posted = new Promise<{ reject: Error } | { resolve: ArchiveDoneResult }>(res => {
+      settle = res
+    })
+
+    let postStarted = false
+
+    rest.mockImplementation((path: string, options?: { method?: string }) => {
+      if (path.includes('/preflight')) {
+        return Promise.resolve({ done_count: 2, scope: { kind: 'board', label: 'Shipping' } })
+      }
+
+      if (options?.method === 'POST') {
+        postStarted = true
+
+        return posted.then(outcome => ('reject' in outcome ? Promise.reject(outcome.reject) : outcome.resolve))
+      }
+
+      return Promise.reject(new Error('unexpected request'))
+    })
+    mount()
+    const dialog = await openConfirmation()
+
+    fireEvent.click(within(dialog).getByRole('button', { name: 'archiveDone()' }))
+
+    // The dialog is gone while the archive request is still in flight — the
+    // whole point of the fire-and-forget confirm handler.
+    await waitFor(() => expect(screen.queryByRole('dialog')).toBeNull(), { timeout: 3000 })
+    expect(postStarted).toBe(true)
+    expect(notify).not.toHaveBeenCalled()
+
+    settle({ reject: new Error('archive unavailable') })
+
+    await waitFor(() =>
+      expect(notify).toHaveBeenCalledWith({ kind: 'error', message: 'archiveDoneFailed(archive unavailable)' })
+    )
+    expect(screen.queryByRole('dialog')).toBeNull()
+    expect(screen.queryByText('archive unavailable')).toBeNull()
+  })
+
+  it('reports an aborted archive as still running rather than as the raw abort text', async () => {
     rest.mockImplementation((path: string, options?: { method?: string }) => {
       if (path.includes('/preflight')) {
         return Promise.resolve({ done_count: 2, scope: { kind: 'board', label: 'Shipping' } })
       }
 
       return options?.method === 'POST'
-        ? Promise.reject(new Error('archive unavailable'))
+        ? Promise.reject(new DOMException('signal is aborted without reason', 'AbortError'))
         : Promise.reject(new Error('unexpected request'))
     })
     mount()
@@ -197,8 +255,30 @@ describe('Archive Done', () => {
 
     fireEvent.click(within(dialog).getByRole('button', { name: 'archiveDone()' }))
 
-    expect(await within(dialog).findByText('archive unavailable')).toBeTruthy()
-    expect(screen.getByRole('dialog')).toBeTruthy()
-    expect(notify).not.toHaveBeenCalledWith(expect.objectContaining({ kind: 'success' }))
+    await waitFor(() => expect(notify).toHaveBeenCalledWith({ kind: 'error', message: 'archiveDoneBackground()' }))
+    expect(notify).not.toHaveBeenCalledWith(
+      expect.objectContaining({ message: expect.stringContaining('signal is aborted') })
+    )
+  })
+
+  it('gives both archive-done requests a budget well above the generic REST timeout', async () => {
+    mount()
+    const dialog = await openConfirmation()
+
+    fireEvent.click(within(dialog).getByRole('button', { name: 'archiveDone()' }))
+    await waitFor(() =>
+      expect(rest.mock.calls.some(([path]) => String(path).startsWith('/tasks/archive-done?'))).toBe(true)
+    )
+
+    const archiveCalls = rest.mock.calls.filter(([path]) => String(path).includes('/tasks/archive-done'))
+
+    expect(archiveCalls.some(([path]) => String(path).includes('/preflight'))).toBe(true)
+    expect(archiveCalls.some(([, options]) => (options as undefined | { method?: string })?.method === 'POST')).toBe(
+      true
+    )
+
+    for (const [, options] of archiveCalls) {
+      expect((options as undefined | { timeoutMs?: number })?.timeoutMs ?? 0).toBeGreaterThanOrEqual(300_000)
+    }
   })
 })
