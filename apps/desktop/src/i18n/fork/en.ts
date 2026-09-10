@@ -63,6 +63,8 @@ export const forkEn: ForkTranslations = {
   },
   sidebar: {
     row: {
+      unarchive: 'Unarchive',
+      unarchiveSession: 'Unarchive session',
       rateLimited: {
         withTime: time => `Rate limited — retry at ${time}`,
         unknown: 'Rate limited — reset time unknown'
@@ -72,6 +74,10 @@ export const forkEn: ForkTranslations = {
       providerConfiguredVia: (configuredFamily, servedFamily) =>
         `Configured model: ${configuredFamily}, currently served via ${servedFamily}`
     }
+  },
+  desktop: {
+    unarchived: 'Restored',
+    unarchiveFailed: 'Unarchive failed'
   },
   composer: {
     reconnectingBanner: 'Reconnecting to Hermes — you can keep reading and typing.',

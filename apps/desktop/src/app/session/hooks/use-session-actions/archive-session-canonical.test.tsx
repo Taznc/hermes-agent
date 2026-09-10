@@ -52,6 +52,7 @@ import { $notifications, clearNotifications } from '@/store/notifications'
 import { $selectedStoredSessionId, $sessions, setSessions } from '@/store/session'
 import { isArchiveUndoPending, resetArchiveUndos } from '@/store/session-archive-undo'
 import { $removedSessionIds } from '@/store/session-removal'
+import { $archivedSessions } from '@/store/sidebar-archive'
 
 import type { ClientSessionState } from '../../../types'
 
@@ -76,7 +77,7 @@ function archivableSession(overrides: Partial<SessionInfo> = {}): SessionInfo {
   } as SessionInfo
 }
 
-type Handle = Pick<ReturnType<typeof useSessionActions>, 'archiveSession'>
+type Handle = Pick<ReturnType<typeof useSessionActions>, 'archiveSession' | 'unarchiveSession'>
 
 function Harness({ onReady }: { onReady: (handle: Handle) => void }) {
   const ref = <T,>(value: T): MutableRefObject<T> => ({ current: value })
@@ -101,7 +102,7 @@ function Harness({ onReady }: { onReady: (handle: Handle) => void }) {
   })
 
   useEffect(() => {
-    onReady({ archiveSession: actions.archiveSession })
+    onReady({ archiveSession: actions.archiveSession, unarchiveSession: actions.unarchiveSession })
   }, [actions, onReady])
 
   return null
@@ -118,6 +119,7 @@ async function mountHarness(): Promise<Handle> {
 describe('archiveSession({ withUndo: true }) reuses the canonical archive path', () => {
   beforeEach(() => {
     setSessions([])
+    $archivedSessions.set([])
     $pinnedSessionIds.set([])
     $removedSessionIds.set(new Set())
     $selectedStoredSessionId.set(null)
@@ -133,6 +135,7 @@ describe('archiveSession({ withUndo: true }) reuses the canonical archive path',
   afterEach(() => {
     cleanup()
     setSessions([])
+    $archivedSessions.set([])
     $pinnedSessionIds.set([])
     $selectedStoredSessionId.set(null)
     resetArchiveUndos()
@@ -189,5 +192,29 @@ describe('archiveSession({ withUndo: true }) reuses the canonical archive path',
     expect(isArchiveUndoPending('live-1')).toBe(false)
     // Rolled back to the sidebar.
     expect($sessions.get().map(s => s.id)).toEqual(['live-1'])
+  })
+
+  it('unarchives an archived row and surfaces it in the live sidebar', async () => {
+    $archivedSessions.set([archivableSession({ archived: true, profile: 'reviewer' })])
+
+    const handle = await mountHarness()
+
+    await act(() => handle.unarchiveSession('live-1'))
+
+    expect(patchArchived).toHaveBeenCalledWith('live-1', false, 'reviewer')
+    expect($archivedSessions.get()).toEqual([])
+    expect($sessions.get()).toEqual([expect.objectContaining({ archived: false, id: 'live-1' })])
+  })
+
+  it('rolls an unarchive failure back to the archived list', async () => {
+    $archivedSessions.set([archivableSession({ archived: true, profile: 'reviewer' })])
+    patchArchived.mockRejectedValueOnce(new Error('network down'))
+
+    const handle = await mountHarness()
+
+    await act(() => handle.unarchiveSession('live-1'))
+
+    expect($sessions.get()).toEqual([])
+    expect($archivedSessions.get()).toEqual([expect.objectContaining({ archived: true, id: 'live-1' })])
   })
 })

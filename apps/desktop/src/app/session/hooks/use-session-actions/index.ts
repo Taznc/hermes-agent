@@ -87,6 +87,7 @@ import {
   setResumeFailedSessionId,
   setSelectedStoredSessionId,
   setSessionOwnerHint,
+  setSessions,
   setSessionStartedAt,
   setTurnStartedAt,
   setWorkspaceCwdOwner,
@@ -2723,6 +2724,52 @@ export function useSessionActions({
     ]
   )
 
+  // Unarchive (#7b52ebc2 follow-up): the Archived filter's rows only ever
+  // offered the SAME "Archive session" verb wired to `archiveSession` — a
+  // no-op on an already-archived row, which read as "archiving does nothing
+  // here" rather than surfacing the row's real inverse action. Mirrors
+  // `archiveSession`'s optimistic-then-confirm shape, but the row only ever
+  // lives in `$archivedSessions` (never `$sessions`/messaging/cron — those
+  // slices exclude archived rows by construction), so there is no listed
+  // slice to drop from and no undo window to open.
+  const unarchiveSession = useCallback(async (storedSessionId: string) => {
+    const archived = $archivedSessions.get().find(session => sessionMatchesStoredId(session, storedSessionId))
+    const stampedProfile = archived?.profile?.trim()
+    const profile = stampedProfile || (await resolveSessionProfile(storedSessionId))
+
+    if (archived && !stampedProfile && !profile?.trim() && $profiles.get().filter(item => item.name.trim()).length > 1) {
+      notifyError(new Error('Session ownership could not be resolved'), copy.unarchiveFailed)
+
+      return
+    }
+
+    const previousArchived = $archivedSessions.get()
+
+    // Soft-hide from the Archived view immediately; surface it back in the
+    // live sidebar without waiting for a full refresh (same restore shape
+    // sessions-settings.tsx uses for its own Unarchive row).
+    $archivedSessions.set(previousArchived.filter(session => !sessionMatchesStoredId(session, storedSessionId)))
+
+    if (archived) {
+      untombstoneSessions([archived.id, archived._lineage_root_id])
+      setSessions(prev => [{ ...archived, archived: false }, ...prev.filter(s => s.id !== archived.id)])
+    }
+
+    try {
+      await setSessionArchived(storedSessionId, false, profile)
+      notify({ durationMs: 2_000, kind: 'success', message: copy.unarchived })
+    } catch (err) {
+      // Roll back both sides of the optimistic move.
+      $archivedSessions.set(previousArchived)
+
+      if (archived) {
+        setSessions(prev => prev.filter(s => s.id !== archived.id))
+      }
+
+      notifyError(err, copy.unarchiveFailed)
+    }
+  }, [copy])
+
   return {
     archiveSession,
     branchCurrentSession,
@@ -2734,6 +2781,7 @@ export function useSessionActions({
     removeSession,
     resumeSession,
     selectSidebarItem,
-    startFreshSessionDraft
+    startFreshSessionDraft,
+    unarchiveSession
   }
 }

@@ -514,7 +514,8 @@ export function ContribWiring({ children }: { children: ReactNode }) {
     removeSession,
     resumeSession,
     selectSidebarItem,
-    startFreshSessionDraft
+    startFreshSessionDraft,
+    unarchiveSession
   } = useSessionActions({
     activeSessionId,
     activeSessionIdRef,
@@ -1144,6 +1145,7 @@ export function ContribWiring({ children }: { children: ReactNode }) {
       triggerAndRefreshCronJobs(jobId, profileScope === ALL_PROFILES ? 'all' : profileScope)
         .then(() => undefined)
         .catch(() => undefined),
+    onUnarchiveSession: sessionId => void unarchiveSession(sessionId),
     getGateway: () => gatewayRef.current,
     openAgents,
     openCommandCenterSection,

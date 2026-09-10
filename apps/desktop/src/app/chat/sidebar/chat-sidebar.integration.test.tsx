@@ -40,6 +40,7 @@ const renderSidebar = (pathname: string, currentView: AppView) =>
           onNewSessionSplit={noop}
           onResumeSession={noop}
           onTriggerCronJob={noopAsync}
+          onUnarchiveSession={noop}
         />
       </SidebarProvider>
     </MemoryRouter>

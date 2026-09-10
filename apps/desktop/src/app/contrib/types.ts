@@ -23,6 +23,7 @@ export type SidebarActions = Pick<
   | 'onNewSessionSplit'
   | 'onResumeSession'
   | 'onTriggerCronJob'
+  | 'onUnarchiveSession'
 >
 
 /** The ChatView handlers the controller owns — forwarded verbatim. */

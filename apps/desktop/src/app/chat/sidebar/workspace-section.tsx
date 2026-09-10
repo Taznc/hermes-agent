@@ -112,6 +112,9 @@ interface SidebarWorkspaceSectionProps {
   onResumeSession: (sessionId: string, session?: SessionInfo) => void
   onDeleteSession: (sessionId: string) => void
   onArchiveSession: (sessionId: string) => void
+  /** Restore an archived row. Only ever reachable when `showArchived` puts
+   *  this section into 'archived' mode — see the row-level swap below. */
+  onUnarchiveSession: (sessionId: string) => void
   onBranchSession: (sessionId: string) => void
   onNewSessionInWorkspace: (path: null | string) => void
   /** See ChatSidebarProps.onNewSessionSplit — the new-session drag target. */
@@ -133,6 +136,7 @@ export function SidebarWorkspaceSection({
   onResumeSession,
   onDeleteSession,
   onArchiveSession,
+  onUnarchiveSession,
   onBranchSession,
   onNewSessionInWorkspace,
   onNewSessionSplit,
@@ -808,6 +812,7 @@ export function SidebarWorkspaceSection({
         onToggle={() => setSidebarRecentsOpen(!agentsOpen)}
         onTogglePin={pinSession}
         onToggleUnread={onToggleUnread}
+        onUnarchiveSession={onUnarchiveSession}
         open={agentsOpen}
         pinned={false}
         projectBackRow={inProject ? <ProjectBackRow label={s.projects.back} onClick={exitProjectScope} /> : undefined}

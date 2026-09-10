@@ -118,6 +118,9 @@ interface ChatSidebarProps extends React.ComponentProps<typeof Sidebar> {
   onResumeSession: (sessionId: string, session?: SessionInfo) => void
   onDeleteSession: (sessionId: string) => void
   onArchiveSession: (sessionId: string) => void
+  /** Restore an archived row — only ever exercised by the Archived filter's
+   *  rows (see SidebarSessionsSection's `archivedMode`). */
+  onUnarchiveSession: (sessionId: string) => void
   onBranchSession: (sessionId: string) => void
   onNewSessionInWorkspace: (path: null | string) => void
   /** Create a brand-new session and open it as a tile. `dir` is the dock edge
@@ -151,6 +154,7 @@ export function ChatSidebar({
   onResumeSession,
   onDeleteSession,
   onArchiveSession,
+  onUnarchiveSession,
   onBranchSession,
   onNewSessionInWorkspace,
   onNewSessionSplit,
@@ -451,6 +455,7 @@ export function ChatSidebar({
                   onNewSessionSplit={onNewSessionSplit}
                   onResumeSession={onResumeSession}
                   onToggleUnread={toggleUnread}
+                  onUnarchiveSession={onUnarchiveSession}
                 />
 
                 <SidebarMessagingSections

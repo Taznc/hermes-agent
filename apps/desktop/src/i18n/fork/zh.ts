@@ -61,6 +61,8 @@ export const forkZh: ForkTranslations = {
   },
   sidebar: {
     row: {
+      unarchive: '取消归档',
+      unarchiveSession: '取消归档会话',
       rateLimited: {
         withTime: time => `Rate limited — retry at ${time}`,
         unknown: 'Rate limited — reset time unknown'
@@ -70,6 +72,10 @@ export const forkZh: ForkTranslations = {
       providerConfiguredVia: (configuredFamily, servedFamily) =>
         `配置的模型：${configuredFamily}，当前经由 ${servedFamily} 提供服务`
     }
+  },
+  desktop: {
+    unarchived: '已恢复',
+    unarchiveFailed: '取消归档失败'
   },
   composer: {
     reconnectingBanner: '正在重新连接 Hermes — 你仍可以阅读和输入。',

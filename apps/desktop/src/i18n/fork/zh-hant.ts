@@ -92,11 +92,17 @@ export const forkZhHant: TranslationOverrides = {
   },
   sidebar: {
     row: {
+      unarchive: '取消封存',
+      unarchiveSession: '取消封存工作階段',
       providerConfigured: family => `設定的模型：${family}`,
       providerVia: family => `經由 ${family}`,
       providerConfiguredVia: (configuredFamily, servedFamily) =>
         `設定的模型：${configuredFamily}，目前經由 ${servedFamily} 提供服務`
     }
+  },
+  desktop: {
+    unarchived: '已還原',
+    unarchiveFailed: '取消封存失敗'
   },
   errors: {
     openLogsFailed: '無法開啟日誌資料夾'
