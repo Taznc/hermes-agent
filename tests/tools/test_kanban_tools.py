@@ -1514,7 +1514,10 @@ def mergeability_env(monkeypatch, tmp_path):
     origin, base = _make_origin(repos)
 
     def make(*, conflicting: bool, land_target: str = "origin/dev",
-             workspace_path=None):
+             workspace_path=None, status: str = "running"):
+        """``status`` selects the card state under test: ``running`` (claimed,
+        the ordinary worker case), ``ready`` (never claimed), ``todo`` (held by
+        an unfinished parent), or ``done`` (claimed then completed)."""
         ws = _make_workspace(repos, origin, base, conflicting=conflicting)
         from hermes_cli import kanban_db as kb
         from hermes_cli import kanban_db_connect as kbc
@@ -1523,16 +1526,29 @@ def mergeability_env(monkeypatch, tmp_path):
         if land_target:
             kb.write_board_metadata(None, land_target=land_target)
         with kbc.connect_closing() as conn:
+            parents = ()
+            if status == "todo":
+                parents = (kb.create_task(
+                    conn, title="unfinished parent", assignee="test-worker"),)
             tid = kb.create_task(
                 conn, title="mergeability", assignee="test-worker",
-                workspace_kind="worktree",
+                workspace_kind="worktree", parents=parents,
                 workspace_path=str(ws if workspace_path is None else workspace_path))
-            claimed = kb.claim_task(conn, tid)
-            assert claimed is not None
+            claimed = None
+            if status in ("running", "done"):
+                claimed = kb.claim_task(conn, tid)
+                assert claimed is not None
+            if status == "done":
+                assert kb.complete_task(
+                    conn, tid, summary="done", expected_run_id=claimed.current_run_id)
+            assert kb.get_task(conn, tid).status == status
         monkeypatch.setenv("HERMES_KANBAN_TASK", tid)
         # request_review only clears a live claim with proof of ownership, which
         # the real dispatcher supplies through this env var at spawn time.
-        monkeypatch.setenv("HERMES_KANBAN_RUN_ID", str(claimed.current_run_id))
+        if claimed is not None:
+            monkeypatch.setenv("HERMES_KANBAN_RUN_ID", str(claimed.current_run_id))
+        else:
+            monkeypatch.delenv("HERMES_KANBAN_RUN_ID", raising=False)
         return tid, ws
 
     return make
@@ -1688,3 +1704,95 @@ def test_request_review_fails_open_when_the_land_target_cannot_be_fetched(
     assert d["ok"] is True
     assert d["status"] == "review"
     _assert_untouched_handoff(tid)
+
+
+# ---------------------------------------------------------------------------
+# Gate ordering: status before mergeability (task t_fd4e3978).
+#
+# The preflight used to run in front of the status check, so a card that could
+# not enter the review lane at all was answered with a merge-conflict refusal
+# that additionally asserted it was "still running". Same conflicting worktree,
+# same gate ON — only the card's status varies.
+# ---------------------------------------------------------------------------
+
+
+def _assert_status_answer_not_merge_refusal(error: str) -> None:
+    """The refusal must be about the card's state, not about git. Asserted
+    negatively too: naming the conflicting path or the fix command would mean
+    the merge gate answered a question it has no business answering."""
+    assert "f.txt" not in error, error
+    assert "git merge origin/dev" not in error, error
+    assert "still running" not in error, error
+
+
+def test_request_review_on_a_done_card_answers_status_not_mergeability(
+    mergeability_env,
+):
+    """A completed card is not the worker's to hand off. The refusal must say
+    so — before the fix it got the merge-conflict text, which sent the reader
+    to resolve a conflict AND claimed the card was "still running"."""
+    from tools import kanban_tools as kt
+    from hermes_cli import kanban_db as kb
+    from hermes_cli import kanban_db_connect as kbc
+
+    tid, _ws = mergeability_env(conflicting=True, status="done")
+
+    d = json.loads(kt._handle_request_review({"summary": "implemented the thing"}))
+
+    assert d.get("ok") is not True
+    error = d.get("error", "")
+    _assert_status_answer_not_merge_refusal(error)
+    assert "running/ready" in error, error
+
+    with kbc.connect_closing() as conn:
+        assert kb.get_task(conn, tid).status == "done"
+    assert not [e for e in _events(tid) if e.kind == "review_preflight_conflict"]
+
+
+def test_request_review_on_a_todo_card_answers_status_not_mergeability(
+    mergeability_env,
+):
+    """A never-claimed card held in ``todo`` by an unfinished parent is gated
+    on that parent, not on git. The merge gate must not speak for it."""
+    from tools import kanban_tools as kt
+    from hermes_cli import kanban_db as kb
+    from hermes_cli import kanban_db_connect as kbc
+
+    tid, _ws = mergeability_env(conflicting=True, status="todo")
+
+    d = json.loads(kt._handle_request_review({"summary": "implemented the thing"}))
+
+    assert d.get("ok") is not True
+    error = d.get("error", "")
+    _assert_status_answer_not_merge_refusal(error)
+    assert "parent" in error, error
+
+    with kbc.connect_closing() as conn:
+        assert kb.get_task(conn, tid).status == "todo"
+    assert not [e for e in _events(tid) if e.kind == "review_preflight_conflict"]
+
+
+def test_request_review_refusal_states_the_status_the_card_is_actually_in(
+    mergeability_env,
+):
+    """``ready`` is reviewable, so a conflicting ``ready`` card is still
+    correctly refused by the merge gate — but the refusal must describe the
+    card it is holding. "still running" about a ``ready`` card is the same
+    confidently-wrong sentence the reorder removes elsewhere."""
+    from tools import kanban_tools as kt
+    from hermes_cli import kanban_db as kb
+    from hermes_cli import kanban_db_connect as kbc
+
+    tid, _ws = mergeability_env(conflicting=True, status="ready")
+
+    d = json.loads(kt._handle_request_review({"summary": "implemented the thing"}))
+
+    assert d.get("ok") is not True
+    error = d.get("error", "")
+    assert "f.txt" in error, error
+    assert "still ready" in error, error
+    assert "still running" not in error, error
+
+    with kbc.connect_closing() as conn:
+        assert kb.get_task(conn, tid).status == "ready"
+    assert len([e for e in _events(tid) if e.kind == "review_preflight_conflict"]) == 1

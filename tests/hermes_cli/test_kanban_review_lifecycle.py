@@ -880,23 +880,39 @@ def cli_mergeability_env(monkeypatch, tmp_path):
     origin, base = _make_origin(repos)
 
     def make(*, conflicting: bool, land_target: str = "origin/dev",
-             workspace_path=None):
+             workspace_path=None, status: str = "running"):
+        """``status`` selects the card state under test: ``running`` (claimed,
+        the ordinary worker case), ``ready`` (never claimed), ``todo`` (held by
+        an unfinished parent), or ``done`` (claimed then completed)."""
         ws = _make_workspace(repos, origin, base, conflicting=conflicting)
         kb._INITIALIZED_PATHS.clear()
         kb.init_db()
         if land_target:
             kb.write_board_metadata(None, land_target=land_target)
         with kbc.connect_closing() as conn:
+            parents = ()
+            if status == "todo":
+                parents = (kb.create_task(
+                    conn, title="unfinished parent", assignee="test-worker"),)
             tid = kb.create_task(
                 conn, title="cli mergeability", assignee="test-worker",
-                workspace_kind="worktree",
+                workspace_kind="worktree", parents=parents,
                 workspace_path=str(ws if workspace_path is None else workspace_path))
-            claimed = kb.claim_task(conn, tid)
-            assert claimed is not None
+            claimed = None
+            if status in ("running", "done"):
+                claimed = kb.claim_task(conn, tid)
+                assert claimed is not None
+            if status == "done":
+                assert kb.complete_task(
+                    conn, tid, summary="done", expected_run_id=claimed.current_run_id)
+            assert kb.get_task(conn, tid).status == status
         monkeypatch.setenv("HERMES_KANBAN_TASK", tid)
         # request_review only clears a live claim with proof of ownership, which
         # the real dispatcher supplies through this env var at spawn time.
-        monkeypatch.setenv("HERMES_KANBAN_RUN_ID", str(claimed.current_run_id))
+        if claimed is not None:
+            monkeypatch.setenv("HERMES_KANBAN_RUN_ID", str(claimed.current_run_id))
+        else:
+            monkeypatch.delenv("HERMES_KANBAN_RUN_ID", raising=False)
         return tid, ws
 
     return make
@@ -1030,3 +1046,110 @@ def test_cli_request_review_fails_open_when_the_land_target_is_unfetchable(
     with kbc.connect_closing() as conn:
         assert kb.get_task(conn, tid).status == "review"
     _assert_untouched_cli_handoff(tid)
+
+
+# ---------------------------------------------------------------------------
+# Gate ordering: status before mergeability (task t_fd4e3978).
+#
+# The preflight used to run in front of the status check, so a card that could
+# not enter the review lane at all was answered with a merge-conflict refusal
+# that additionally asserted it was "still running". The ordering lives in the
+# shared helper, so these mirror the tool-side cases exactly — same conflicting
+# worktree, same gate ON, only the card's status varies.
+# ---------------------------------------------------------------------------
+
+
+def _assert_status_answer_not_merge_refusal(out: str) -> None:
+    """The refusal must be about the card's state, not about git. Asserted
+    negatively too: naming the conflicting path or the fix command would mean
+    the merge gate answered a question it has no business answering."""
+    assert "f.txt" not in out, out
+    assert "git merge origin/dev" not in out, out
+    assert "still running" not in out, out
+
+
+def test_cli_request_review_on_a_done_card_answers_status_not_mergeability(
+    cli_mergeability_env,
+) -> None:
+    """A completed card is not the worker's to hand off; the CLI must say so
+    rather than hand back the merge-conflict refusal (the regression the
+    reviewer measured on this exact path)."""
+    tid, _ws = cli_mergeability_env(conflicting=True, status="done")
+
+    out, rc = _run_kanban("request-review", tid, "--summary", "implemented the thing")
+
+    assert rc != 0, out
+    _assert_status_answer_not_merge_refusal(out)
+    assert "running/ready" in out, out
+
+    with kbc.connect_closing() as conn:
+        assert kb.get_task(conn, tid).status == "done"
+    assert not _task_events(tid, "review_preflight_conflict")
+
+
+def test_cli_request_review_on_a_todo_card_answers_status_not_mergeability(
+    cli_mergeability_env,
+) -> None:
+    """A never-claimed card held in ``todo`` by an unfinished parent is gated
+    on that parent, not on git."""
+    tid, _ws = cli_mergeability_env(conflicting=True, status="todo")
+
+    out, rc = _run_kanban("request-review", tid, "--summary", "implemented the thing")
+
+    assert rc != 0, out
+    _assert_status_answer_not_merge_refusal(out)
+    assert "parent" in out, out
+
+    with kbc.connect_closing() as conn:
+        assert kb.get_task(conn, tid).status == "todo"
+    assert not _task_events(tid, "review_preflight_conflict")
+
+
+def test_cli_request_review_refusal_states_the_status_the_card_is_actually_in(
+    cli_mergeability_env,
+) -> None:
+    """``ready`` is reviewable, so a conflicting ``ready`` card is still
+    refused by the merge gate — but the refusal describes the card it is
+    holding instead of asserting it is "still running"."""
+    tid, _ws = cli_mergeability_env(conflicting=True, status="ready")
+
+    out, rc = _run_kanban("request-review", tid, "--summary", "implemented the thing")
+
+    assert rc != 0, out
+    assert "f.txt" in out, out
+    assert "still ready" in out, out
+    assert "still running" not in out, out
+
+    with kbc.connect_closing() as conn:
+        assert kb.get_task(conn, tid).status == "ready"
+    assert len(_task_events(tid, "review_preflight_conflict")) == 1
+
+
+def test_both_doors_refuse_a_conflicting_branch_with_the_identical_message(
+    cli_mergeability_env,
+) -> None:
+    """Parity is the constraint that keeps the gate real: a worker refused by
+    the tool must not get a different (or differently-worded) answer by
+    shelling out to the CLI. Both doors are driven against ONE card — a
+    refusal mutates nothing but the event log — and their text must match,
+    including the status sentence."""
+    from tools import kanban_tools as kt
+
+    tid, _ws = cli_mergeability_env(conflicting=True, status="ready")
+
+    tool_error = json.loads(
+        kt._handle_request_review({"task_id": tid, "summary": "implemented the thing"})
+    ).get("error", "")
+    cli_out, rc = _run_kanban("request-review", tid, "--summary", "implemented the thing")
+
+    assert rc != 0, cli_out
+    assert tool_error, tool_error
+    # The CLI prints the same message through _err(); compare the refusal body
+    # line-for-line rather than assuming identical framing.
+    for line in tool_error.splitlines():
+        assert line in cli_out, (line, cli_out)
+    assert "still ready" in tool_error and "still ready" in cli_out
+
+    with kbc.connect_closing() as conn:
+        assert kb.get_task(conn, tid).status == "ready"
+    assert len(_task_events(tid, "review_preflight_conflict")) == 2

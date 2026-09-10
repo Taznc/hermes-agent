@@ -1191,6 +1191,10 @@ def _cmd_request_review(args: argparse.Namespace) -> int:
             "Provide acceptance evidence matching the task.")
         if gate_err:
             return _err(gate_err)
+        # Status is validated inside preflight(), ahead of the git check, so a
+        # card that cannot enter the review lane gets kb.request_review()'s
+        # status answer below rather than an unrelated merge refusal. Shared
+        # with the tool door so the two cannot diverge (task t_fd4e3978).
         merge = ktm.preflight(kb.get_task(conn, tid), tid, board=getattr(args, "board", None))
         if merge is not None:
             if merge.conflicts:

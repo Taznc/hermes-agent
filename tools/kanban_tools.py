@@ -740,6 +740,10 @@ def _handle_request_review(args: dict, **kw) -> str:
     with _board(board) as (kb, conn):
         task = kb.get_task(conn, tid)
         _goal_gate("kanban_request_review", task, tid, summary)
+        # Status is validated inside preflight(), ahead of the git check, so a
+        # card that cannot enter the review lane gets kb.request_review()'s
+        # status answer below rather than an unrelated merge refusal. Shared
+        # with the CLI door so the two cannot diverge (task t_fd4e3978).
         merge = _ktm.preflight(task, tid, board=board)
         if merge is not None:
             if merge.conflicts:

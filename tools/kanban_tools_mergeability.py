@@ -38,14 +38,27 @@ logger = logging.getLogger(__name__)
 # preflight fails OPEN on timeout, so this is a latency bound, not a gate.
 _GIT_TIMEOUT_S = 60
 
+# The statuses ``kb.request_review()`` accepts (its UPDATE's
+# ``status IN ('running', 'ready')`` is the authority). A card outside this set
+# cannot enter the review lane whatever git says, so the gate does not run —
+# see :func:`preflight`.
+_REVIEWABLE_STATUSES = frozenset({"running", "ready"})
+
 
 @dataclass(frozen=True)
 class Mergeability:
-    """The preflight's verdict. ``conflicts`` empty = merges cleanly."""
+    """The preflight's verdict. ``conflicts`` empty = merges cleanly.
+
+    ``task_status`` is the card's status at the moment the check ran, carried
+    on the verdict so :func:`refusal_message` can state it rather than assume
+    it. Both doors get the accurate wording without either having to pass
+    anything, which is what keeps them identical.
+    """
 
     target: str
     sha: str
     conflicts: tuple[str, ...]
+    task_status: str
 
     @property
     def stamp(self) -> str:
@@ -73,9 +86,14 @@ def _conflicting_paths(stdout: str) -> list[str]:
     return paths
 
 
-def check(workspace: Optional[str], target: str) -> Optional[Mergeability]:
+def check(workspace: Optional[str], target: str, *,
+          task_status: str) -> Optional[Mergeability]:
     """Merge ``workspace``'s HEAD against ``target`` (``<remote>/<branch>``) in
     memory; ``None`` when the check could not be run at all.
+
+    ``task_status`` is the card's status, carried through onto the verdict for
+    the refusal text; it does not affect the merge itself (:func:`preflight`
+    owns the status gate).
 
     Fails OPEN by design — a missing workspace, a non-repo, an unreachable
     remote, an unknown branch, an ancient git without ``--write-tree``, or a
@@ -106,7 +124,7 @@ def check(workspace: Optional[str], target: str) -> Optional[Mergeability]:
         logger.debug("mergeability preflight skipped: %s", exc)
         return None
     if merge.returncode == 0:
-        return Mergeability(target=target, sha=sha, conflicts=())
+        return Mergeability(target=target, sha=sha, conflicts=(), task_status=task_status)
     if merge.returncode != 1:
         # Not git's clean/conflict contract — an old git, a corrupt repo, an
         # unmerged index. Unknown is not a conflict.
@@ -119,18 +137,27 @@ def check(workspace: Optional[str], target: str) -> Optional[Mergeability]:
         # a refusal it cannot act on is worse than no refusal.
         logger.debug("mergeability preflight skipped: conflict with no named paths")
         return None
-    return Mergeability(target=target, sha=sha, conflicts=tuple(paths))
+    return Mergeability(target=target, sha=sha, conflicts=tuple(paths),
+                        task_status=task_status)
 
 
 def refusal_message(result: Mergeability) -> str:
     """The text the implementer reads. Copy-pasteable on purpose: the whole
-    point is that they run one command instead of burning a review round."""
+    point is that they run one command instead of burning a review round.
+
+    The state sentence reports the card's ACTUAL status. It used to assert
+    "still running" unconditionally, which was confidently wrong for the one
+    other status that reaches here — a never-claimed ``ready`` card — and told
+    the reader to go fix a merge conflict while misdescribing the card they
+    were holding. Everything else (``done``, ``todo``, unknown id) is refused
+    by the status check ahead of this gate; see :func:`preflight`.
+    """
     paths = "\n".join(f"  {p}" for p in result.conflicts)
     return (
         f"kanban_request_review refused: your branch conflicts with {result.target} "
         f"({result.sha[:12]}), so a reviewer could not merge it. Conflicting "
         f"paths:\n{paths}\n\n"
-        f"Your task is unchanged and still running. Resolve the drift, re-run your "
+        f"Your task is unchanged and still {result.task_status}. Resolve the drift, re-run your "
         f"tests, then request review again:\n\n"
         f"  git fetch {result.target.replace('/', ' ', 1)}\n"
         f"  git merge {result.target}\n"
@@ -149,11 +176,29 @@ def preflight(task, task_id: str, *, board: Optional[str]) -> Optional[Mergeabil
     tool handler and ``hermes kanban request-review`` — so a worker refused at
     one cannot walk through the other.
 
+    **Status is checked before mergeability.** A card that is not ``running``/
+    ``ready`` cannot enter the review lane whatever git says, so running the
+    gate on one only replaces the answer the caller needs ("this card is not
+    yours to hand off") with an unrelated one ("go resolve a merge conflict")
+    — and the refusal used to assert the card was "still running" while it sat
+    in ``done`` or ``todo``. Returning ``None`` hands the verdict back to
+    ``kb.request_review()``, which owns the authoritative status/parent-gating
+    wording; deriving a second copy of it in each door is what would let the
+    two doors drift. Same reasoning for an unknown id (``task is None``): git
+    has nothing to say about a card that does not exist. This ordering lives
+    here rather than in the two entry points precisely so it cannot be applied
+    to one door and not the other (task t_fd4e3978).
+
     Skips (byte-identical to the pre-gate behavior) when the operator turned it
     off with ``kanban.require_mergeable_for_review: false``, when the board
     configures no ``land_target``, when the card has no worktree workspace, or
     when git could not answer — see :func:`check` for the fail-open contract.
     """
+    if task is None or getattr(task, "status", None) not in _REVIEWABLE_STATUSES:
+        logger.debug(
+            "mergeability preflight skipped for %s: status %r cannot enter review",
+            task_id, getattr(task, "status", None))
+        return None
     if not cfg_get(load_config(), "kanban", "require_mergeable_for_review", default=True):
         return None
     from hermes_cli.kanban_land import LandRefusal, resolve_target
@@ -163,9 +208,8 @@ def preflight(task, task_id: str, *, board: Optional[str]) -> Optional[Mergeabil
     except LandRefusal as exc:
         logger.debug("mergeability preflight skipped for %s: %s", task_id, exc)
         return None
-    workspace = (task.workspace_path if task else None) or _own_task_env(
-        task_id, "HERMES_KANBAN_WORKSPACE")
-    return check(workspace, f"{remote}/{branch}")
+    workspace = task.workspace_path or _own_task_env(task_id, "HERMES_KANBAN_WORKSPACE")
+    return check(workspace, f"{remote}/{branch}", task_status=task.status)
 
 
 def record_conflict(conn, task_id: str, result: Mergeability, *,
