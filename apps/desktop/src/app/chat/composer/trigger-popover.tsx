@@ -58,10 +58,11 @@ const LIST_CLASS = 'min-h-0 flex-1 overflow-y-auto overscroll-contain'
  *  rather than a clip. Fixed rather than fit-to-content because the footer is
  *  re-rendered on every arrow key, so a height that followed the text would
  *  resize the panel under the user's cursor on each press. Four lines holds the
- *  longest description in the installed corpus (111 chars) whole at the panel's
- *  20rem width; anything past that scrolls instead of being cut, so no text is
- *  ever unreachable. `overscroll-contain` keeps a wheel gesture here from
- *  scrolling the transcript behind the panel. */
+ *  longest description in the installed corpus (111 chars) whole at every width
+ *  the panel takes (DRAWER_SHELL in completion-drawer.tsx tracks the composer);
+ *  anything past that scrolls instead of being cut, so no text is ever
+ *  unreachable. `overscroll-contain` keeps a wheel gesture here from scrolling
+ *  the transcript behind the panel. */
 const DETAIL_CLASS = cn(
   'mt-1 h-[5.5rem] shrink-0 overflow-y-auto overscroll-contain px-2 pt-1.5',
   'text-(--ui-text-secondary)'
@@ -267,7 +268,13 @@ export function ComposerTriggerPopover({
                       <span className="grid size-4 shrink-0 place-items-center text-(--ref-color)" data-ref={refKind}>
                         <Codicon name={referenceStyle(refKind).codicon} size="0.875rem" />
                       </span>
-                      <span className="min-w-0 shrink truncate font-medium leading-5 text-foreground">{display}</span>
+                      {/* max-w caps a long skill/command name (e.g.
+                          `kanban-archive-dependency-safety`) so it can't crowd
+                          the description out of the row entirely — the label
+                          truncates first and the description keeps a floor. */}
+                      <span className="min-w-0 max-w-[45%] shrink truncate font-medium leading-5 text-foreground">
+                        {display}
+                      </span>
                       {description && (
                         <span className="min-w-0 flex-1 truncate leading-5 text-(--ui-text-tertiary)">
                           {description}
