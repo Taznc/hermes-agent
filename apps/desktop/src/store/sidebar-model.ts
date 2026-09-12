@@ -275,7 +275,8 @@ export const $sidebarIsPinnedSession = computed(
 export const $sidebarIsHiddenFromProjects = computed(
   [$sidebarIsPinnedSession, $sidebarFiltersNarrow, $sidebarSessionMatchesFilters],
   (isPinnedSession, filtersNarrow, sessionMatchesFilters) =>
-    (session: SessionInfo): boolean => isPinnedSession(session) || (filtersNarrow && !sessionMatchesFilters(session))
+    (session: SessionInfo): boolean =>
+      session.archived === true || isPinnedSession(session) || (filtersNarrow && !sessionMatchesFilters(session))
 )
 
 /** Sorted sessions with pins excluded — recents order, feeds the flat
