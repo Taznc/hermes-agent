@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import time
+
 from hermes_cli import kanban as kc
 from hermes_cli import kanban_db as kb
 from hermes_cli import kanban_db_connect as kbc
@@ -229,9 +231,23 @@ def test_third_changes_request_hits_review_round_cap_and_blocks(all_assignees_sp
 
         events = kb.list_events(conn, task_id)
         cap_event = [e for e in events if e.kind == "review_round_cap"][-1]
-        assert cap_event.payload.get("changes_rounds") == 3
-        assert cap_event.payload.get("max_review_rounds") == 3
-        assert cap_event.payload.get("reason") == "third and final"
+        assert cap_event.payload is not None
+        latest_verdict = [e for e in events if e.kind == "changes_requested"][-1]
+        legacy_payload = {
+            key: cap_event.payload.get(key)
+            for key in ("changes_rounds", "max_review_rounds", "reason")
+        }
+        assert legacy_payload == {
+            "changes_rounds": 3,
+            "max_review_rounds": 3,
+            "reason": "third and final",
+        }
+        assert cap_event.payload.get("verdict_round") == 3
+        assert cap_event.payload.get("verdict_at") == latest_verdict.created_at
+        assert cap_event.payload.get("runs_since_verdict") == 0
+        assert cap_event.payload.get("recent_run_outcomes") == []
+        assert cap_event.payload.get("parent_count") == 0
+        assert cap_event.payload.get("all_parents_terminal") is True
 
 
 def test_second_changes_request_stays_under_the_cap_and_dispatches(all_assignees_spawnable):
@@ -325,20 +341,69 @@ def test_show_surfaces_review_round_cap_block(all_assignees_spawnable):
     assert "root cause unclear" in output
 
 
-def test_diagnostics_surfaces_review_round_cap_block(all_assignees_spawnable):
-    """AC3: `hermes kanban diagnostics` surfaces the review_round_cap block kind,
-    the round count, and the last `changes_requested` reason via a dedicated
-    diagnostic rule (compute_task_diagnostics returned [] before this rule
-    existed, even though the task was correctly blocked)."""
+def test_diagnostics_attributes_stale_verdict_and_reports_current_state(
+    all_assignees_spawnable,
+):
+    """A round-2 verdict followed by newer runs is historical, not current."""
     with kbc.connect() as conn:
-        task_id = kb.create_task(conn, title="runaway rework", assignee="implementer")
-        kb._append_event(conn, task_id, "changes_requested", {"reason": "first"})
-        kb._append_event(conn, task_id, "changes_requested", {"reason": "second"})
-        kb._append_event(conn, task_id, "changes_requested", {"reason": "third and final"})
+        parent_id = kb.create_task(conn, title="terminal parent")
+        conn.execute(
+            "UPDATE tasks SET status = 'done', completed_at = ? WHERE id = ?",
+            (1_725_760_000, parent_id),
+        )
+        task_id = kb.create_task(
+            conn,
+            title="runaway rework",
+            assignee="implementer",
+            parents=(parent_id,),
+        )
+
+        def closed_run(outcome: str, started_at: int) -> int:
+            cur = conn.execute(
+                "INSERT INTO task_runs "
+                "(task_id, profile, status, outcome, started_at, ended_at) "
+                "VALUES (?, 'reviewer', ?, ?, ?, ?)",
+                (task_id, outcome, outcome, started_at, started_at + 1),
+            )
+            assert cur.lastrowid is not None
+            return int(cur.lastrowid)
+
+        first_run = closed_run("changes_requested", 1_725_760_100)
+        kb._append_event(
+            conn,
+            task_id,
+            "changes_requested",
+            {"reason": "first", "review_round": 1},
+            run_id=first_run,
+        )
+        verdict_run = closed_run("changes_requested", 1_725_760_200)
+        kb._append_event(
+            conn,
+            task_id,
+            "changes_requested",
+            {"reason": "round two findings", "review_round": 2},
+            run_id=verdict_run,
+        )
+        verdict_event_row = conn.execute("SELECT last_insert_rowid()").fetchone()
+        assert verdict_event_row is not None
+        verdict_event_id = int(verdict_event_row[0])
+        verdict_at = 1_725_760_260
+        conn.execute(
+            "UPDATE task_events SET created_at = ? WHERE id = ?",
+            (verdict_at, verdict_event_id),
+        )
+        later_outcomes = [
+            "dependency_wait",
+            "review_requested",
+            "completed",
+            "dependency_wait",
+        ]
+        for offset, outcome in enumerate(later_outcomes, start=1):
+            closed_run(outcome, verdict_at + offset)
         conn.commit()
 
-        result = kbd.dispatch_once(conn, spawn_fn=_spawn, max_review_rounds=3)
-        assert result.blocked_review_round_cap == [(task_id, 3)]
+        result = kbd.dispatch_once(conn, spawn_fn=_spawn, max_review_rounds=2)
+        assert result.blocked_review_round_cap == [(task_id, 2)]
 
         task = kb.get_task(conn, task_id)
         events = kb.list_events(conn, task_id)
@@ -349,9 +414,69 @@ def test_diagnostics_surfaces_review_round_cap_block(all_assignees_spawnable):
     matching = [d for d in diags if d.kind == "review_round_cap"]
     assert len(matching) == 1
     diag = matching[0]
-    assert diag.data["changes_rounds"] == 3
-    assert diag.data["max_review_rounds"] == 3
-    assert diag.data["last_reason"] == "third and final"
+    cap_event = [e for e in events if e.kind == "review_round_cap"][-1]
+    assert cap_event.payload is not None
+    assert cap_event.payload["verdict_round"] == 2
+    assert cap_event.payload["runs_since_verdict"] == len(later_outcomes)
+    assert cap_event.payload["recent_run_outcomes"] == list(reversed(later_outcomes[-3:]))
+    assert cap_event.payload["parent_count"] == 1
+    assert cap_event.payload["all_parents_terminal"] is True
+
+    verdict_event = next(e for e in events if e.id == verdict_event_id)
+    expected_attribution = (
+        f"Round {cap_event.payload['verdict_round']} verdict, "
+        f"{time.strftime('%m-%d %H:%M', time.localtime(verdict_event.created_at))}"
+    )
+    assert expected_attribution in diag.detail
+    assert "round two findings" in diag.detail
+    assert "Last reviewer feedback" not in diag.detail
+    assert f"{len(later_outcomes)} runs since that verdict" in diag.detail
+    assert "all 1 terminal" in diag.detail
+    assert "counter resets only when the card completes" in diag.detail
+    assert "unblock alone" in diag.detail.lower()
+
+    assert diag.data["changes_rounds"] == 2
+    assert diag.data["max_review_rounds"] == 2
+    assert diag.data["last_reason"] == "round two findings"
+    assert diag.data["verdict_round"] == 2
+    suggested = [action for action in diag.actions if action.suggested]
+    assert len(suggested) == 1
+    assert suggested[0].payload["command"] == (
+        f"hermes kanban assign {task_id} implementer"
+    )
+    unblock = next(action for action in diag.actions if action.kind == "unblock")
+    assert unblock.suggested is False
+    assert "re-block" in unblock.label
+
+
+def test_legacy_review_round_cap_payload_keeps_legacy_feedback_text():
+    task = {
+        "id": "t_legacy",
+        "status": "blocked",
+        "block_kind": "review_round_cap",
+        "assignee": "implementer",
+    }
+    legacy_payload = {
+        "changes_rounds": 3,
+        "max_review_rounds": 3,
+        "reason": "legacy finding",
+    }
+    events = [
+        {
+            "id": 1,
+            "kind": "review_round_cap",
+            "payload": legacy_payload,
+            "created_at": 1_725_760_260,
+        }
+    ]
+
+    diag = next(
+        d for d in kd.compute_task_diagnostics(task, events, [])
+        if d.kind == "review_round_cap"
+    )
+
+    assert 'Last reviewer feedback: "legacy finding".' in diag.detail
+    assert "Round 3 verdict" not in diag.detail
 
 
 def test_diagnostics_stays_empty_for_a_normal_blocked_task(all_assignees_spawnable):

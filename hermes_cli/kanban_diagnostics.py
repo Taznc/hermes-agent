@@ -579,10 +579,10 @@ def _rule_review_round_cap(task, events, runs, now, cfg) -> list[Diagnostic]:
     """Surfaces the dispatcher's hard stop on a runaway review<->changes_requested
     loop. ``_apply_review_round_cap`` (kanban_db_dispatch.py) blocks a card that hit
     ``kanban.max_review_rounds`` with ``block_kind == "review_round_cap"`` and appends a
-    ``review_round_cap`` event carrying ``changes_rounds``, ``max_review_rounds``, and the
-    last reviewer ``reason`` — without a dedicated rule that event was invisible to
-    ``hermes kanban diagnostics`` even though ``hermes kanban show`` already surfaces it
-    via the generic status/event view.
+    ``review_round_cap`` event carrying the legacy round-count/reason fields plus verdict
+    attribution and a current-state snapshot. Without a dedicated rule that event was
+    invisible to ``hermes kanban diagnostics`` even though ``hermes kanban show`` already
+    surfaces it via the generic status/event view.
 
     Deliberately does not require the event to be the LATEST event overall (an operator
     may have commented since) — only that it exists and the task is still blocked with
@@ -603,17 +603,37 @@ def _rule_review_round_cap(task, events, runs, now, cfg) -> list[Diagnostic]:
     changes_rounds = payload.get("changes_rounds")
     max_review_rounds = payload.get("max_review_rounds")
     reason = payload.get("reason")
+    verdict_round = payload.get("verdict_round")
+    verdict_at = payload.get("verdict_at")
+    runs_since_verdict = payload.get("runs_since_verdict")
+    recent_run_outcomes = payload.get("recent_run_outcomes")
+    parent_count = payload.get("parent_count")
+    all_parents_terminal = payload.get("all_parents_terminal")
     blocked_at = _event_ts(cap_event) or now
 
     task_id = _task_field(task, "id")
+    assignee = _task_field(task, "assignee")
     actions: list[DiagnosticAction] = []
     if task_id:
-        actions.append(DiagnosticAction(
-            kind="unblock", label="Unblock (after deciding how to break the loop)",
-            payload={}, suggested=True,
-        ))
-        cmd = f"hermes kanban events {task_id}"
-        actions.append(_cli_hint(f"Check review history: {cmd}", cmd))
+        profile = str(assignee).strip() if assignee else "<profile>"
+        assign_cmd = f"hermes kanban assign {task_id} {profile}"
+        actions.append(
+            _cli_hint(
+                f"Reassign to record operator intent: {assign_cmd}",
+                assign_cmd,
+                suggested=True,
+            )
+        )
+        actions.append(
+            DiagnosticAction(
+                kind="unblock",
+                label="Unblock only (will re-block until reassigned)",
+                payload={},
+                suggested=False,
+            )
+        )
+        history_cmd = f"hermes kanban events {task_id}"
+        actions.append(_cli_hint(f"Check review history: {history_cmd}", history_cmd))
 
     rounds_text = str(changes_rounds) if changes_rounds is not None else "the"
     cap_text = str(max_review_rounds) if max_review_rounds is not None else "configured"
@@ -623,12 +643,59 @@ def _rule_review_round_cap(task, events, runs, now, cfg) -> list[Diagnostic]:
         f"re-dispatching it to the implementer or the rework-escalation profile and blocked "
         f"it instead, so the review loop cannot cycle indefinitely. "
     )
-    if reason:
-        detail += f'Last reviewer feedback: "{reason}". '
-    detail += (
-        "Review the change history, decide the right intervention (reassign, rescope, "
-        "archive), and unblock when ready."
+    attributed = (
+        isinstance(verdict_round, int)
+        and not isinstance(verdict_round, bool)
+        and verdict_round > 0
+        and isinstance(verdict_at, (int, float))
+        and not isinstance(verdict_at, bool)
+        and verdict_at > 0
     )
+    verdict_label = None
+    if reason and attributed:
+        verdict_stamp = time.strftime("%m-%d %H:%M", time.localtime(verdict_at))
+        verdict_label = f"Round {verdict_round} verdict, {verdict_stamp}"
+        detail += f'Historical Round {verdict_round} verdict, {verdict_stamp}: "{reason}". '
+    elif reason:
+        detail += f'Last reviewer feedback: "{reason}". '
+
+    if isinstance(runs_since_verdict, int) and not isinstance(runs_since_verdict, bool):
+        run_word = "run" if runs_since_verdict == 1 else "runs"
+        detail += f"Current state: {runs_since_verdict} {run_word} since that verdict"
+        if isinstance(recent_run_outcomes, list):
+            outcomes = [str(value) for value in recent_run_outcomes if value]
+            detail += f"; recent outcomes: {', '.join(outcomes) if outcomes else 'none'}"
+        detail += ". "
+    if isinstance(parent_count, int) and not isinstance(parent_count, bool):
+        if parent_count == 0:
+            detail += "Structural parents: none. "
+        elif isinstance(all_parents_terminal, bool):
+            state = "all" if all_parents_terminal else "not all"
+            detail += f"Structural parents: {state} {parent_count} terminal. "
+
+    detail += (
+        "The review counter resets only when the card completes, so unblock alone returns "
+        "the task to ready and the dispatcher will re-block it. Reassign the task to record "
+        "operator intent after the attributed verdict, then review, rescope, or archive it as needed."
+    )
+
+    data = {
+        "changes_rounds": changes_rounds,
+        "max_review_rounds": max_review_rounds,
+    }
+    if verdict_label is not None:
+        data["verdict"] = verdict_label
+    data["last_reason"] = reason
+    for key, value in (
+        ("verdict_round", verdict_round),
+        ("verdict_at", verdict_at),
+        ("runs_since_verdict", runs_since_verdict),
+        ("recent_run_outcomes", recent_run_outcomes),
+        ("parent_count", parent_count),
+        ("all_parents_terminal", all_parents_terminal),
+    ):
+        if key in payload:
+            data[key] = value
 
     return [Diagnostic(
         kind="review_round_cap", severity="error",
@@ -636,11 +703,7 @@ def _rule_review_round_cap(task, events, runs, now, cfg) -> list[Diagnostic]:
         detail=detail,
         actions=actions,
         first_seen_at=blocked_at, last_seen_at=blocked_at, count=1,
-        data={
-            "changes_rounds": changes_rounds,
-            "max_review_rounds": max_review_rounds,
-            "last_reason": reason,
-        },
+        data=data,
     )]
 
 

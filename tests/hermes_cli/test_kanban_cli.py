@@ -6,6 +6,7 @@ import argparse
 import json
 import os
 import threading
+import time
 from pathlib import Path
 
 import pytest
@@ -346,7 +347,8 @@ def test_dispatch_json_reports_the_review_round_cap(kanban_home):
 
 def test_dispatch_text_reports_the_review_round_cap(kanban_home):
     """Same transition, human-readable mode: the line must name the card, the
-    round count, and the cap that stopped it."""
+    round count, and the cap that stopped it; the resulting diagnostic must
+    attribute the verdict and recommend the effective operator action."""
     tid = _card_at_the_review_round_cap("runaway rework")
 
     out = kc.run_slash("dispatch --dry-run")
@@ -354,6 +356,22 @@ def test_dispatch_text_reports_the_review_round_cap(kanban_home):
     assert "kanban.max_review_rounds=3" in out
     assert "after 3 change requests" in out
     assert tid in out
+
+    kc.run_slash("dispatch")
+    with kbc.connect() as conn:
+        cap_event = next(
+            event
+            for event in reversed(kb.list_events(conn, tid))
+            if event.kind == "review_round_cap"
+        )
+    assert cap_event.payload is not None
+    expected_verdict = (
+        f"Round {cap_event.payload['verdict_round']} verdict, "
+        f"{time.strftime('%m-%d %H:%M', time.localtime(cap_event.payload['verdict_at']))}"
+    )
+    diagnostics = kc.run_slash(f"diagnostics --task {tid}")
+    assert f"verdict={expected_verdict}" in diagnostics
+    assert f"hermes kanban assign {tid} implementer" in diagnostics
 
 
 def test_dispatch_text_stays_silent_when_nothing_was_capped(kanban_home):

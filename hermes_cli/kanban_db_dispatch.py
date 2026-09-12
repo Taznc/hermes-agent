@@ -3281,14 +3281,94 @@ def _manually_assigned_after(
     return not source.startswith("kanban.")
 
 
-def _last_changes_requested_reason(conn: sqlite3.Connection, task_id: str) -> Optional[str]:
-    """Reason text from the most recent ``changes_requested`` event, if any."""
-    event = _kb._latest_event(conn, task_id, "changes_requested")
-    if event is None:
-        return None
-    payload = _kb._json_dict(_kb._row_get(event, "payload"))
-    reason = payload.get("reason")
-    return reason if isinstance(reason, str) and reason.strip() else None
+def _review_round_cap_payload(
+    conn: sqlite3.Connection,
+    task_id: str,
+    *,
+    changes_rounds: int,
+    max_review_rounds: int,
+) -> dict[str, Any]:
+    """Snapshot the attributed verdict and the card state at cap time.
+
+    The three legacy fields stay unchanged. New fields make the reason explicitly
+    historical and show what happened after it, without changing the cap predicate.
+    """
+    event = conn.execute(
+        "SELECT id, run_id, payload, created_at FROM task_events "
+        "WHERE task_id = ? AND kind = 'changes_requested' "
+        "ORDER BY id DESC LIMIT 1",
+        (task_id,),
+    ).fetchone()
+    event_payload = _kb._json_dict(_kb._row_get(event, "payload"))
+    reason = event_payload.get("reason")
+    reason = reason if isinstance(reason, str) and reason.strip() else None
+
+    verdict_round = event_payload.get("review_round")
+    if (
+        not isinstance(verdict_round, int)
+        or isinstance(verdict_round, bool)
+        or verdict_round <= 0
+    ):
+        verdict_round = None
+    verdict_at = _kb._row_get(event, "created_at")
+    verdict_at = int(verdict_at) if verdict_at is not None else None
+    verdict_event_id = _kb._row_get(event, "id")
+    if verdict_round is None and verdict_event_id is not None:
+        row = conn.execute(
+            "SELECT COUNT(*) AS round_number FROM task_events "
+            "WHERE task_id = ? AND kind = 'changes_requested' AND id <= ? "
+            "AND id > COALESCE(("
+            "  SELECT MAX(id) FROM task_events WHERE task_id = ? "
+            "  AND kind = 'completed' AND id < ?"
+            "), 0)",
+            (task_id, int(verdict_event_id), task_id, int(verdict_event_id)),
+        ).fetchone()
+        verdict_round = int(row["round_number"]) if row else None
+
+    verdict_run_id = _kb._row_get(event, "run_id")
+    if verdict_run_id is not None:
+        run_where = "task_id = ? AND id > ?"
+        run_params: tuple[Any, ...] = (task_id, int(verdict_run_id))
+    elif verdict_at is not None:
+        run_where = "task_id = ? AND started_at > ?"
+        run_params = (task_id, verdict_at)
+    else:
+        run_where = "task_id = ? AND 0"
+        run_params = (task_id,)
+    runs_since = int(
+        conn.execute(
+            f"SELECT COUNT(*) AS count FROM task_runs WHERE {run_where}",
+            run_params,
+        ).fetchone()["count"]
+    )
+    recent_rows = conn.execute(
+        f"SELECT outcome, status FROM task_runs WHERE {run_where} "
+        "ORDER BY id DESC LIMIT 3",
+        run_params,
+    ).fetchall()
+    recent_outcomes = [row["outcome"] or row["status"] for row in recent_rows]
+
+    parent_state = conn.execute(
+        "SELECT COUNT(*) AS parent_count, "
+        "COALESCE(SUM(CASE WHEN t.status IN ('done', 'archived') THEN 1 ELSE 0 END), 0) "
+        "AS terminal_count "
+        "FROM task_links l JOIN tasks t ON t.id = l.parent_id "
+        "WHERE l.child_id = ?",
+        (task_id,),
+    ).fetchone()
+    parent_count = int(parent_state["parent_count"])
+
+    return {
+        "changes_rounds": changes_rounds,
+        "max_review_rounds": max_review_rounds,
+        "reason": reason,
+        "verdict_round": verdict_round,
+        "verdict_at": verdict_at,
+        "runs_since_verdict": runs_since,
+        "recent_run_outcomes": recent_outcomes,
+        "parent_count": parent_count,
+        "all_parents_terminal": int(parent_state["terminal_count"]) == parent_count,
+    }
 
 
 def _apply_review_round_cap(
@@ -3310,7 +3390,6 @@ def _apply_review_round_cap(
     """
     if dry_run:
         return True
-    reason = _last_changes_requested_reason(conn, task_id)
     try:
         with _kb.write_txn(conn):
             cur = conn.execute(
@@ -3321,15 +3400,17 @@ def _apply_review_round_cap(
             )
             if cur.rowcount != 1:
                 return False
+            payload = _review_round_cap_payload(
+                conn,
+                task_id,
+                changes_rounds=changes_rounds,
+                max_review_rounds=max_review_rounds,
+            )
             _kb._append_event(
                 conn,
                 task_id,
                 "review_round_cap",
-                {
-                    "changes_rounds": changes_rounds,
-                    "max_review_rounds": max_review_rounds,
-                    "reason": reason,
-                },
+                payload,
             )
     except Exception:
         _kb._log.debug(
