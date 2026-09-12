@@ -65,6 +65,9 @@ export interface ForkTranslations {
   }
   sidebar: {
     row: {
+      /** Inverse archive labels for rows rendered by the Archived filter. */
+      unarchive: string
+      unarchiveSession: string
       /** Phase 2.12 — "rate limited" terminal sidebar status.
        *  `withTime` when resetAt is known, `unknown` otherwise — never
        *  fabricate a reset time. */
@@ -85,6 +88,11 @@ export interface ForkTranslations {
        *  "Configured model: Claude, currently served via Codex". */
       providerConfiguredVia: (configuredFamily: string, servedFamily: string) => string
     }
+  }
+  desktop: {
+    /** Confirmation/failure copy for restoring a row from the Archived filter. */
+    unarchived: string
+    unarchiveFailed: string
   }
   composer: {
     reconnectingBanner: string

@@ -10,7 +10,7 @@
 // The contract asserted here is the relationship, not a snapshot: turning the
 // filter ON fetches the archived set, and the rows it returns reach the store
 // the Archived view reads.
-import { act, cleanup, render } from '@testing-library/react'
+import { act, cleanup, fireEvent, render, screen } from '@testing-library/react'
 import { MemoryRouter } from 'react-router'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
@@ -34,6 +34,9 @@ const noop = () => {}
 
 const noopAsync = async () => {}
 
+const onArchiveSessionMock = vi.fn()
+const onUnarchiveSessionMock = vi.fn()
+
 const archivedRow = makeSessionInfo({
   archived: true,
   id: 'archived-one',
@@ -49,7 +52,7 @@ const renderSidebar = () =>
       <SidebarProvider>
         <ChatSidebar
           currentView="chat"
-          onArchiveSession={noop}
+          onArchiveSession={onArchiveSessionMock}
           onBranchSession={noop}
           onDeleteSession={noop}
           onLoadMoreSessions={noop}
@@ -59,6 +62,7 @@ const renderSidebar = () =>
           onNewSessionSplit={noop}
           onResumeSession={noop}
           onTriggerCronJob={noopAsync}
+          onUnarchiveSession={onUnarchiveSessionMock}
         />
       </SidebarProvider>
     </MemoryRouter>
@@ -67,6 +71,8 @@ const renderSidebar = () =>
 describe('sidebar Archived filter', () => {
   beforeEach(() => {
     listAllProfileSessionsMock.mockReset()
+    onArchiveSessionMock.mockReset()
+    onUnarchiveSessionMock.mockReset()
     listAllProfileSessionsMock.mockResolvedValue({
       limit: 200,
       offset: 0,
@@ -104,5 +110,21 @@ describe('sidebar Archived filter', () => {
     // same helper cannot make this pass or fail spuriously.
     expect(listAllProfileSessionsMock.mock.calls.some(call => call[2] === 'only')).toBe(true)
     expect($archivedSessions.get().map(session => session.id)).toEqual(['archived-one'])
+  })
+
+  it('offers Unarchive — not Archive — on archived rows', async () => {
+    renderSidebar()
+
+    await act(async () => {
+      $sidebarShowArchived.set(true)
+      await Promise.resolve()
+    })
+
+    const unarchive = await screen.findByRole('button', { name: 'Unarchive session' })
+
+    expect(screen.queryByRole('button', { name: 'Archive session' })).toBeNull()
+    fireEvent.click(unarchive)
+    expect(onUnarchiveSessionMock).toHaveBeenCalledWith('archived-one')
+    expect(onArchiveSessionMock).not.toHaveBeenCalled()
   })
 })

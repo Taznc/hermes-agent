@@ -110,6 +110,9 @@ interface SidebarSessionsSectionProps {
   onResumeSession: (sessionId: string, session?: SessionInfo) => void
   onDeleteSession: (sessionId: string) => void
   onArchiveSession: (sessionId: string) => void
+  /** Restore an archived row. Optional: only Recents ever renders archived
+   *  rows — Pinned/Search never do. */
+  onUnarchiveSession?: (sessionId: string) => void
   onBranchSession?: (sessionId: string, profile?: string) => void
   onTogglePin: (sessionId: string) => void
   onToggleUnread: (sessionId: string) => void
@@ -190,6 +193,7 @@ export function SidebarSessionsSection({
   onResumeSession,
   onDeleteSession,
   onArchiveSession,
+  onUnarchiveSession,
   onBranchSession,
   onTogglePin,
   onToggleUnread,
@@ -272,7 +276,19 @@ export function SidebarSessionsSection({
         card,
         isPinned: pinned,
         isSelected: session.id === activeSessionId,
-        onArchive: () => onArchiveSession(session.id),
+        // Archived filter rows are the session's OWN inverse action: the
+        // "Archive session" verb is a no-op on an already-archived row, so
+        // swap to Unarchive whenever this row IS archived (never on a live
+        // row even if `showArchived` is somehow stale — `session.archived`
+        // is the row's own ground truth, same field the lead glyph above
+        // already branches on). Sections that never render archived rows
+        // (Pinned, Search) don't wire `onUnarchiveSession` — falls back to
+        // a no-op rather than mis-firing the archive RPC on an archived row.
+        onArchive: session.archived
+          ? onUnarchiveSession
+            ? () => onUnarchiveSession(session.id)
+            : () => {}
+          : () => onArchiveSession(session.id),
         onBranch: onBranchSession ? () => onBranchSession(session.id, session.profile) : undefined,
         onDelete: () => onDeleteSession(session.id),
         onPin: () => onTogglePin(sessionPinId(session)),
@@ -302,6 +318,7 @@ export function SidebarSessionsSection({
       onResumeSession,
       onTogglePin,
       onToggleUnread,
+      onUnarchiveSession,
       pinned,
       showProfileTags
     ]

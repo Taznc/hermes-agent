@@ -179,6 +179,7 @@ function NavigationHarness() {
           openSession(sessionId, navigate)
         }}
         onTriggerCronJob={() => Promise.resolve()}
+        onUnarchiveSession={noop}
       />
       <button onClick={() => setGatewayState('closed')} type="button">
         Close gateway

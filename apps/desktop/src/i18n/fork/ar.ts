@@ -71,11 +71,17 @@ export const forkAr: TranslationOverrides = {
   },
   sidebar: {
     row: {
+      unarchive: 'إلغاء الأرشفة',
+      unarchiveSession: 'إلغاء أرشفة الجلسة',
       providerConfigured: family => `النموذج المُهيأ: ${family}`,
       providerVia: family => `عبر ${family}`,
       providerConfiguredVia: (configuredFamily, servedFamily) =>
         `النموذج المُهيأ: ${configuredFamily}، ويُخدَم حاليًا عبر ${servedFamily}`
     }
+  },
+  desktop: {
+    unarchived: 'تمت الاستعادة',
+    unarchiveFailed: 'فشل إلغاء الأرشفة'
   },
   errors: {
     openLogsFailed: 'تعذّر فتح مجلد السجلات'

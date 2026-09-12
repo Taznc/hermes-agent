@@ -7,8 +7,22 @@ import { cn } from '@/lib/utils'
 
 // A standalone glassy panel floating just off the composer edge, inset from the
 // left. Skin is the shared composerPanelCard (also used by the attach menu).
+//
+// The width TRACKS THE COMPOSER rather than being a fixed number. Every earlier
+// value here (20rem, then 28rem, then 36rem) was a guess at one window size:
+// each one measurably widened the panel, yet on a wide window the panel still
+// stopped less than halfway across the composer and rows kept ellipsizing while
+// a large empty gutter sat to the right. A description column that truncates
+// beside unused space is the actual bug, and no constant fixes it for every
+// window.
+//
+// The popover's containing block is `ComposerPrimitive.Root` (`relative w-full`
+// in composer/index.tsx), so `100%` here IS the composer's width: the panel
+// spans it minus the `left-2` inset and a matching right gutter. The `min()`
+// caps it on very wide windows, where a full-bleed row would leave the eye
+// travelling past dead space between a short label and its description.
 const DRAWER_SHELL = cn(
-  'absolute left-2 z-50 w-80 max-w-[calc(100%-1rem)] max-h-[min(22rem,calc(100vh-8rem))]',
+  'absolute left-2 z-50 w-[min(64rem,calc(100%-1rem))] max-h-[min(22rem,calc(100vh-8rem))]',
   'p-1 text-popover-foreground',
   composerPanelCard
 )

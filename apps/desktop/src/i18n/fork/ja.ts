@@ -95,11 +95,17 @@ export const forkJa: TranslationOverrides = {
   },
   sidebar: {
     row: {
+      unarchive: 'アーカイブ解除',
+      unarchiveSession: 'セッションのアーカイブを解除',
       providerConfigured: family => `設定済みモデル: ${family}`,
       providerVia: family => `${family} 経由`,
       providerConfiguredVia: (configuredFamily, servedFamily) =>
         `設定済みモデル: ${configuredFamily}（現在は ${servedFamily} 経由で応答中）`
     }
+  },
+  desktop: {
+    unarchived: '復元しました',
+    unarchiveFailed: 'アーカイブ解除に失敗しました'
   },
   errors: {
     openLogsFailed: 'ログフォルダを開けませんでした'

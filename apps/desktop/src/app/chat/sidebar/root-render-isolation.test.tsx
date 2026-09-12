@@ -186,6 +186,7 @@ function Harness() {
         onNewSessionSplit={noop}
         onResumeSession={noop}
         onTriggerCronJob={() => Promise.resolve()}
+        onUnarchiveSession={noop}
       />
     </SidebarProvider>
   )
