@@ -4,7 +4,6 @@ import type { NewSessionPlacement } from '@/app/chat/new-session-drag'
 import {
   isHomeProjectId,
   liveSessionProjectId,
-  NO_PROJECT_ID,
   type SidebarProjectTree
 } from '@/app/chat/sidebar/projects/workspace-groups'
 import type { HermesGitBaseBranch, HermesGitBranch } from '@/global'
@@ -1304,9 +1303,12 @@ export async function switchBranchInRepo(repoPath: string, branch: string): Prom
 // effect even if the path repeats.
 export interface StartWorkSessionRequest {
   draft?: string
+  /** Allocate a distinct chat surface even when the current draft has not persisted a session yet. */
+  freshSurface?: boolean
   /** Stack the fresh session as a tab when main already holds a chat (palette/⌘O opens-from-nowhere). */
   openTab?: boolean
-  path: string
+  /** Null opens a detached draft rather than inheriting a current workspace. */
+  path: null | string
   token: number
 }
 
@@ -1358,16 +1360,17 @@ export function closeWorktreeDialog(): void {
 
 let startWorkToken = 0
 
-export function requestStartWorkSession(path: string, draft?: string, options?: { openTab?: boolean }): void {
-  const target = path.trim()
-
-  if (!target) {
-    return
-  }
+export function requestStartWorkSession(
+  path: null | string | undefined,
+  draft?: string,
+  options?: { freshSurface?: boolean; openTab?: boolean }
+): void {
+  const target = path?.trim() || null
 
   startWorkToken += 1
   $startWorkSessionRequest.set({
     draft: draft?.trim() || undefined,
+    freshSurface: options?.freshSurface || undefined,
     openTab: options?.openTab || undefined,
     path: target,
     token: startWorkToken
