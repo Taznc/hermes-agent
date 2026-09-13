@@ -130,7 +130,7 @@ import { useRouteResume } from '../session/hooks/use-route-resume'
 import { useSessionActions } from '../session/hooks/use-session-actions'
 import { useSessionListActions } from '../session/hooks/use-session-list-actions'
 import { useSessionStateCache } from '../session/hooks/use-session-state-cache'
-import { startWorkspaceSession } from '../session/workspace-session-target'
+import { consumeStartWorkSessionRequest, startWorkspaceSession } from '../session/workspace-session-target'
 import { PluginInstallModal } from '../settings/plugin-install-modal'
 import { useOverlayRouting } from '../shell/hooks/use-overlay-routing'
 import { useWindowControlsOverlayWidth } from '../shell/hooks/use-window-controls-overlay-width'
@@ -584,13 +584,13 @@ export function ContribWiring({ children }: { children: ReactNode }) {
   // "branch off into a new worktree" flow keeps the fresh-draft path — it
   // prefills the MAIN composer right after, so it has to own that surface.
   const startSessionInWorkspace = useCallback(
-    (path: null | string, options?: { openTab?: boolean }) => {
+    async (path: null | string, options?: { openTab?: boolean }): Promise<boolean> => {
       setWorkspaceScope('sessions')
 
       if (options?.openTab && mainChatOccupied(activeSessionIdRef.current, $selectedStoredSessionId.get())) {
-        void openNewSessionTile('center', { cwd: path, listed: false })
+        await openNewSessionTile('center', { cwd: path, listed: false })
 
-        return
+        return true
       }
 
       startWorkspaceSession({
@@ -601,6 +601,8 @@ export function ContribWiring({ children }: { children: ReactNode }) {
         requestGateway,
         startFreshSessionDraft
       })
+
+      return false
     },
     [activeSessionIdRef, openNewSessionTile, requestGateway, startFreshSessionDraft]
   )
@@ -617,12 +619,19 @@ export function ContribWiring({ children }: { children: ReactNode }) {
     }
 
     lastStartWorkTokenRef.current = startWorkSessionRequest.token
-    startSessionInWorkspace(startWorkSessionRequest.path, { openTab: startWorkSessionRequest.openTab })
 
-    if (startWorkSessionRequest.draft) {
-      requestComposerInsert(startWorkSessionRequest.draft, { target: 'main' })
-    }
-  }, [startSessionInWorkspace, startWorkSessionRequest])
+    setWorkspaceScope('sessions')
+    void consumeStartWorkSessionRequest({
+      insertDraft: requestComposerInsert,
+      isCurrent: () => startWorkSessionRequest.token === lastStartWorkTokenRef.current,
+      mainChatIsOccupied: mainChatOccupied(activeSessionIdRef.current, $selectedStoredSessionId.get()),
+      openFreshSurface: async path => {
+        await openNewSessionTile('center', { cwd: path, listed: false })
+      },
+      request: startWorkSessionRequest,
+      startMainSurface: path => void startSessionInWorkspace(path)
+    })
+  }, [activeSessionIdRef, openNewSessionTile, startSessionInWorkspace, startWorkSessionRequest])
 
   // "New project" DRAG completion: the dialog created a project that was
   // dropped onto a chat zone (tab-strip slot / pane edge / pane center). Open
