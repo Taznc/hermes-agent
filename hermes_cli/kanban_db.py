@@ -4970,6 +4970,7 @@ def request_changes(
         )
         if claimed_source != "review" and not ready_child:
             return False, "active run was not claimed from review"
+        reviewer = _canonical_assignee(_nonblank_str(task_row["assignee"]))
         if ready_child:
             repair_event = _latest_event(conn, task_id, "repair_dependency_reordered")
             repair_payload = _json_dict(_row_get(repair_event, "payload"))
@@ -4980,10 +4981,19 @@ def request_changes(
                 and int(repair_event["id"]) > int(claimed_event["id"])
                 and repair_id in parent_ids(conn, task_id)
             )
-            if not repair_linked_this_run or _parents_satisfied(conn, task_id):
+            if (
+                not repair_linked_this_run
+                or repair_id is None
+                or _parents_satisfied(conn, task_id)
+            ):
                 return False, "ready-child review requires a linked unfinished repair"
+            repair_task = get_task(conn, repair_id)
+            repair_assignee = _canonical_assignee(
+                _nonblank_str(repair_task.assignee if repair_task is not None else None)
+            )
+            if repair_assignee is None or repair_assignee == reviewer:
+                return False, "ready-child repair must be assigned to a different profile"
 
-        reviewer = _canonical_assignee(_nonblank_str(task_row["assignee"]))
         implementer: Optional[str]
         override_sets: list[str] = []
         override_params_list: list[Any] = []

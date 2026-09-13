@@ -280,6 +280,53 @@ def test_linking_repair_before_ready_review_child_reverses_deadlocking_edge(conn
     assert event.payload == {"repair": repair, "review": review_child}
 
 
+def test_ready_child_rejects_reviewer_owned_repair(conn, monkeypatch):
+    implementation = kb.create_task(conn, title="Implementation", assignee="builder")
+    implementation_run = kb.claim_task(conn, implementation, claimer="builder:parent")
+    assert implementation_run is not None
+    assert kb.complete_task(
+        conn,
+        implementation,
+        summary="implemented",
+        expected_run_id=implementation_run.current_run_id,
+    )
+    from hermes_cli import kanban_skill_preflight as skill_preflight
+
+    monkeypatch.setattr(
+        skill_preflight, "preflight_task_skills", lambda *_args, **_kwargs: None
+    )
+    review_child = kb.create_task(
+        conn,
+        title="Review release",
+        parents=[implementation],
+        skills=["sdlc-review"],
+        assignee="reviewer",
+    )
+    review_run = kb.claim_task(conn, review_child, claimer="reviewer:first")
+    assert review_run is not None
+    self_repair = kb.create_task(
+        conn,
+        title="Reviewer self-repair",
+        assignee="reviewer",
+        parents=[review_child],
+    )
+    kb.link_tasks(conn, self_repair, review_child)
+
+    ok, detail = kb.request_changes(
+        conn,
+        review_child,
+        reason="A separate repair is required.",
+        blockers=[_blocker("AC1: preserve the release behavior")],
+        expected_run_id=review_run.current_run_id,
+    )
+
+    assert ok is False
+    assert detail == "ready-child repair must be assigned to a different profile"
+    rejected_review = kb.get_task(conn, review_child)
+    assert rejected_review is not None
+    assert rejected_review.status == "running"
+
+
 def test_ready_child_repair_cycle_persists_contract_and_advances_rereview(
     conn, monkeypatch
 ):
