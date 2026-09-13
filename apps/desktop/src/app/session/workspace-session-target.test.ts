@@ -1,7 +1,8 @@
 import { afterEach, describe, expect, it, vi } from 'vitest'
 
+import { host } from '@/sdk'
 import { $activeGatewayProfile, $newChatProfile } from '@/store/profile'
-import { $projectScope, $projectTree, ALL_PROJECTS } from '@/store/projects'
+import { $projectScope, $projectTree, $startWorkSessionRequest, ALL_PROJECTS } from '@/store/projects'
 import {
   $currentBranch,
   $currentCwd,
@@ -14,7 +15,7 @@ import {
 
 import { deferred } from '../../test/deferred'
 
-import { startWorkspaceSession } from './workspace-session-target'
+import { consumeStartWorkSessionRequest, startWorkspaceSession } from './workspace-session-target'
 
 describe('startWorkspaceSession', () => {
   afterEach(() => {
@@ -23,6 +24,7 @@ describe('startWorkspaceSession', () => {
     setNewChatWorkspaceTarget(undefined)
     $projectScope.set(ALL_PROJECTS)
     $projectTree.set([])
+    $startWorkSessionRequest.set(null)
     $activeGatewayProfile.set('default')
     $newChatProfile.set(null)
     vi.restoreAllMocks()
@@ -127,5 +129,52 @@ describe('startWorkspaceSession', () => {
     $activeGatewayProfile.set('personal')
 
     expect($newChatProfile.get()).toBe('work')
+  })
+
+  it('allocates a distinct contextual surface when the previous draft is still unsent', async () => {
+    const roots = new Map<string, null | string>()
+    const composers = new Map<string, string>()
+    let activeSurface = ''
+    let nextSurface = 0
+
+    const consumeCurrentRequest = async () => {
+      const request = $startWorkSessionRequest.get()
+
+      expect(request).not.toBeNull()
+
+      if (!request) {
+        return
+      }
+
+      await consumeStartWorkSessionRequest({
+        insertDraft: draft => {
+          composers.set(activeSurface, `${composers.get(activeSurface) ?? ''}${draft}`)
+        },
+        isCurrent: () => $startWorkSessionRequest.get()?.token === request.token,
+        mainChatIsOccupied: false,
+        openFreshSurface: async path => {
+          activeSurface = `context-${++nextSurface}`
+          roots.set(activeSurface, path)
+        },
+        request,
+        startMainSurface: () => {
+          throw new Error('contextual requests must not reuse the main draft surface')
+        }
+      })
+    }
+
+    host.newChatWithContext({ cwd: '/workspace-a', draft: 'First card prompt' })
+    await consumeCurrentRequest()
+    const firstSurface = activeSurface
+
+    host.newChatWithContext({ cwd: undefined, draft: 'Second card prompt' })
+    await consumeCurrentRequest()
+    const secondSurface = activeSurface
+
+    expect(secondSurface).not.toBe(firstSurface)
+    expect(roots.get(firstSurface)).toBe('/workspace-a')
+    expect(roots.get(secondSurface)).toBeNull()
+    expect(composers.get(firstSurface)).toBe('First card prompt')
+    expect(composers.get(secondSurface)).toBe('Second card prompt')
   })
 })
