@@ -422,6 +422,26 @@ def test_dispatch_revalidates_tampered_legacy_row_before_spawn(conn):
     assert task.current_run_id is None
 
 
+def test_cli_unknown_route_diagnostic_offers_only_supported_remediation(conn, capsys):
+    _write_profile(kb.kanban_home(), "worker")
+    parser = argparse.ArgumentParser()
+    kc.build_parser(parser.add_subparsers(dest="command"))
+    args = parser.parse_args([
+        "kanban", "create", "unknown route", "--assignee", "worker",
+        "--model", "gpt-7-future", "--provider", "openai-codex",
+        "--reasoning", "medium",
+    ])
+
+    assert kc.kanban_command(args) == 2
+    diagnostic = capsys.readouterr().err
+    assert "unknown model route" in diagnostic
+    assert "choose an approved exact route" in diagnostic
+    assert "restrict but cannot expand" in diagnostic
+    assert "use operator force" not in diagnostic
+    assert "add an exact allowed_routes entry" not in diagnostic
+    assert kb.list_tasks(conn) == []
+
+
 def test_cli_requires_force_reason_for_denied_route(conn, monkeypatch, capsys):
     from hermes_cli import kanban as kanban_cli
 

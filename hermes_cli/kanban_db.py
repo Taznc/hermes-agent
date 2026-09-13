@@ -292,7 +292,10 @@ def validate_model_effort_policy(
         elif model in {"gpt-5.6-terra", "gpt-5.6-sol"}:
             detail = f"{model.rsplit('-', 1)[-1].title()} is allowed only with medium reasoning effort"
         else:
-            detail = "unknown model route (add an exact allowed_routes entry or use operator force)"
+            detail = (
+                "unknown model route (choose an approved exact route; "
+                "policy configuration may restrict but cannot expand the built-in set)"
+            )
         raise ValueError(f"Kanban model policy refuses {provider}/{model}/{effort}: {detail}")
     return ModelPolicyDecision(False)
 
