@@ -5074,7 +5074,7 @@ def test_ws_orphan_reap_keeps_pending_clarify_answerable_for_reconnect(monkeypat
         assert interrupted == []
         assert worker.is_alive()
         assert server._pending_clarify_request_payload("clarify-sid") == {
-            "question": "Continue?", "request_id": request_id
+            "question": "Continue?", "request_id": request_id, "timeout_seconds": 5.0
         }
         assert server._pending_clarify_request_payload("other-sid") is None
 
@@ -20925,6 +20925,46 @@ def test_clarify_callback_uses_configured_timeout(monkeypatch):
     assert captured["event"] == "clarify.request"
     assert captured["timeout"] == 42
     assert captured["payload"] == {"question": "Pick one", "choices": ["a", "b"]}
+
+
+def test_block_emits_timeout_seconds_when_finite(monkeypatch):
+    """_block tells renderers how long the bridge can stay blocked (finite
+    timeout) so the desktop can keep a clarify dialog alive while the server
+    is still waiting on clarify.respond (#83319)."""
+    emitted = {}
+
+    class FakeEvent:
+        def wait(self, timeout=None):
+            return False
+
+    monkeypatch.setattr(server.threading, "Event", FakeEvent)
+    monkeypatch.setattr(
+        server, "_emit", lambda event, sid, payload: emitted.setdefault(event, payload)
+    )
+
+    server._block("clarify.request", "sid-ttl", {"question": "q"}, timeout=42)
+
+    assert emitted["clarify.request"]["timeout_seconds"] == 42.0
+    assert emitted["clarify.request"]["question"] == "q"
+
+
+def test_block_omits_timeout_seconds_for_wait_forever(monkeypatch):
+    """timeout None (clarify_timeout <= 0) means the server waits for a real
+    answer — renderers must not treat the dialog as droppable (#83319)."""
+    emitted = {}
+
+    class FakeEvent:
+        def wait(self, timeout=None):
+            return False
+
+    monkeypatch.setattr(server.threading, "Event", FakeEvent)
+    monkeypatch.setattr(
+        server, "_emit", lambda event, sid, payload: emitted.setdefault(event, payload)
+    )
+
+    server._block("clarify.request", "sid-forever", {"question": "q"}, timeout=None)
+
+    assert "timeout_seconds" not in emitted["clarify.request"]
 
 
 def test_clarify_callback_multi_select_hint(monkeypatch):
