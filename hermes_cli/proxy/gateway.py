@@ -21,7 +21,7 @@ import asyncio
 import hmac
 import json
 import logging
-from typing import Any, Dict, List, Optional, Sequence
+from typing import Any, Dict, List, Mapping, Optional, Sequence
 
 try:
     from aiohttp import web
@@ -76,6 +76,7 @@ def create_failover_app(
     *,
     client_auth_token: Optional[str] = None,
     circuit: Optional[BackendCircuit] = None,
+    backend_models: Optional[Mapping[str, str]] = None,
 ) -> "web.Application":
     """Build the multi-backend failover ingress.
 
@@ -95,6 +96,11 @@ def create_failover_app(
     names = [adapter.name for adapter in backends]
     if len(set(names)) != len(names):
         raise ValueError(f"Duplicate proxy backends configured: {names}")
+    unknown_model_routes = set(backend_models or {}) - set(names)
+    if unknown_model_routes:
+        raise ValueError(
+            f"Models configured for unknown proxy backends: {sorted(unknown_model_routes)}"
+        )
     if any(adapter.requires_client_auth for adapter in backends) and not client_auth_token:
         raise RuntimeError(
             "This backend set requires client authentication; "
@@ -214,8 +220,11 @@ def create_failover_app(
                     continue
 
                 context.record_attempt(name)
+                backend_request = dict(chat_request)
+                if backend_models and backend_models.get(name):
+                    backend_request["model"] = backend_models[name]
                 outcome = await legs[name].send(
-                    credential, chat_request, stream=wants_stream
+                    credential, backend_request, stream=wants_stream
                 )
             except BaseException:
                 # Cancellation and unclassified exceptions carry no leg outcome,
@@ -227,7 +236,7 @@ def create_failover_app(
             if outcome.ok:
                 breaker.record_success(name)
                 return await _emit(
-                    request, outcome, client_api, context, name, chat_request
+                    request, outcome, client_api, context, name, backend_request
                 )
 
             breaker.record_failure(name, retry_after_seconds=outcome.retry_after)

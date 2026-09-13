@@ -17,7 +17,7 @@ import ipaddress
 import json
 import logging
 import signal
-from typing import Optional, Sequence, cast
+from typing import Mapping, Optional, Sequence, cast
 
 try:
     import aiohttp
@@ -566,6 +566,7 @@ async def run_server(
     shutdown_event: Optional[asyncio.Event] = None,
     *,
     client_auth_token: Optional[str] = None,
+    backend_models: Optional[Mapping[str, str]] = None,
 ) -> None:
     """Run the proxy in the current event loop until shutdown_event is set.
 
@@ -593,7 +594,11 @@ async def run_server(
     if len(adapters) > 1:
         from hermes_cli.proxy.gateway import create_failover_app
 
-        app = create_failover_app(adapters, client_auth_token=client_auth_token)
+        app = create_failover_app(
+            adapters,
+            client_auth_token=client_auth_token,
+            backend_models=backend_models,
+        )
         described = " -> ".join(entry.display_name for entry in adapters)
     else:
         app = create_app(adapters[0], client_auth_token=client_auth_token)

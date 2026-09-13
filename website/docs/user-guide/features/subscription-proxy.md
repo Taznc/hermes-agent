@@ -299,6 +299,24 @@ working when the gateway fails over to a backend that speaks the other — which
 is the whole point: with a single-provider proxy, switching ports also meant
 switching the client's protocol setting.
 
+### Use a profile's model and fallback chain
+
+For a durable workload-specific policy, put the primary model and fallback
+providers in a dedicated Hermes profile and start the proxy with that profile:
+
+```bash
+hermes -p hindsight proxy start --use-model-config \
+  --host 127.0.0.1 --port 8771 \
+  --auth-token-file ~/.hermes/hindsight/proxy.token
+```
+
+`--use-model-config` reads the active profile's `model.provider`,
+`model.default`, and `fallback_providers` in order. It also rewrites the model
+on each attempt, so a Claude model identifier is never replayed unchanged to a
+Codex, xAI, or Nous backend. Supported profile providers are `anthropic`
+(`claude-code` subscription), `openai-codex`, `xai`/`xai-oauth`, and `nous`.
+The option is mutually exclusive with an explicit `--provider` chain.
+
 The gateway serves exactly `/v1/chat/completions`, `/v1/responses`, and
 `/health`. Any other path returns a 404 naming what is available, rather than
 being forwarded somewhere it cannot be translated.

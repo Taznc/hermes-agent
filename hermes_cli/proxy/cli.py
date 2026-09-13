@@ -23,6 +23,16 @@ logger = logging.getLogger(__name__)
 
 _MAX_CLIENT_AUTH_TOKEN_CHARS = 4096
 
+_CONFIG_PROVIDER_TO_PROXY = {
+    "anthropic": "claude-code",
+    "claude-code": "claude-code",
+    "codex": "openai-codex",
+    "openai-codex": "openai-codex",
+    "nous": "nous",
+    "xai": "xai",
+    "xai-oauth": "xai",
+}
+
 
 def _validate_windows_owner_only_acl(
     *,
@@ -181,6 +191,47 @@ def _resolve_backends(provider: str) -> list:
     return adapters
 
 
+def _resolve_configured_routes(config: dict[str, Any]) -> list[tuple[Any, str]]:
+    """Resolve the active profile's primary and fallback models into proxy routes."""
+    from hermes_cli.fallback_config import get_fallback_chain
+
+    model_config = config.get("model")
+    if not isinstance(model_config, dict):
+        raise ValueError("The active profile has no model configuration.")
+    entries = [{
+        "provider": model_config.get("provider"),
+        "model": model_config.get("default"),
+    }, *get_fallback_chain(config)]
+
+    routes: list[tuple[Any, str]] = []
+    seen: set[str] = set()
+    for entry in entries:
+        provider = str(entry.get("provider") or "").strip().lower()
+        model = str(entry.get("model") or "").strip()
+        if not provider or not model:
+            raise ValueError(
+                "Every configured proxy route requires both provider and model."
+            )
+        adapter_name = _CONFIG_PROVIDER_TO_PROXY.get(provider)
+        if adapter_name is None:
+            raise ValueError(
+                f"Provider {provider!r} has no subscription proxy adapter."
+            )
+        adapter = get_adapter(adapter_name)
+        if adapter.name in seen:
+            raise ValueError(
+                f"Provider {provider!r} resolves to a repeated proxy backend; "
+                "each subscription may appear only once."
+            )
+        seen.add(adapter.name)
+        routes.append((adapter, model))
+    if len(routes) < 2:
+        raise ValueError(
+            "Profile model routing requires a primary and at least one fallback."
+        )
+    return routes
+
+
 def cmd_proxy_start(args: Any) -> int:
     """Run the proxy server in the foreground.
 
@@ -190,9 +241,24 @@ def cmd_proxy_start(args: Any) -> int:
         _print_aiohttp_missing()
         return 1
 
-    provider = getattr(args, "provider", None) or "nous"
+    provider = getattr(args, "provider", None)
+    use_model_config = bool(getattr(args, "use_model_config", False))
+    if use_model_config and provider:
+        print(
+            "Error: --use-model-config cannot be combined with --provider.",
+            file=sys.stderr,
+        )
+        return 2
     try:
-        adapters = _resolve_backends(provider)
+        backend_models = None
+        if use_model_config:
+            from hermes_cli.config import load_config
+
+            routes = _resolve_configured_routes(load_config())
+            adapters = [adapter for adapter, _ in routes]
+            backend_models = {adapter.name: model for adapter, model in routes}
+        else:
+            adapters = _resolve_backends(provider or "nous")
     except ValueError as exc:
         print(f"Error: {exc}", file=sys.stderr)
         return 2
@@ -252,7 +318,11 @@ def cmd_proxy_start(args: Any) -> int:
     )
 
     if len(adapters) > 1:
-        chain = " -> ".join(adapter.display_name for adapter in adapters)
+        chain = " -> ".join(
+            f"{adapter.display_name} ({backend_models[adapter.name]})"
+            if backend_models else adapter.display_name
+            for adapter in adapters
+        )
         print(
             f"Starting Hermes failover proxy\n"
             f"  Listening on:  http://{host}:{port}/v1\n"
@@ -275,12 +345,17 @@ def cmd_proxy_start(args: Any) -> int:
         )
 
     try:
+        server_kwargs: dict[str, Any] = {
+            "host": host,
+            "port": port,
+            "client_auth_token": client_auth_token,
+        }
+        if backend_models is not None:
+            server_kwargs["backend_models"] = backend_models
         asyncio.run(
             run_server(
                 adapters if len(adapters) > 1 else adapters[0],
-                host=host,
-                port=port,
-                client_auth_token=client_auth_token,
+                **server_kwargs,
             )
         )
     except KeyboardInterrupt:
@@ -338,9 +413,11 @@ def cmd_proxy(args: Any) -> int:
         "\n"
         "Subcommands:\n"
         "  hermes proxy start [--provider claude-code|codex|nous|xai] [--host 127.0.0.1] [--port 8645]\n"
-        "      [--auth-token-file PATH]\n"
+        "      [--auth-token-file PATH] [--use-model-config]\n"
         "      Run the proxy in the foreground. Comma-separate providers for an\n"
         "      ordered failover chain: --provider claude-code,openai-codex\n"
+        "      --use-model-config reads the active profile's primary and fallbacks,\n"
+        "      including each route's model. Select a profile with `hermes -p NAME`.\n"
         "  hermes proxy status\n"
         "      Show which upstream adapters are ready.\n"
         "  hermes proxy providers\n"
