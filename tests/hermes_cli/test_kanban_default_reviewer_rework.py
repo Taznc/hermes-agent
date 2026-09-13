@@ -186,6 +186,7 @@ def test_request_changes_restores_implementer_override_after_auto_assign(
         run_id = row["current_run_id"]
         ok, implementer = kb.request_changes(
             conn, tid, reason="needs more tests", expected_run_id=run_id,
+        blockers=[{"basis": "original_ac", "reference": "test acceptance contract"}],
         )
         assert ok is True
         assert implementer == "claudeprimary"
@@ -279,6 +280,7 @@ def test_rereview_provenance_survives_default_reviewer(kanban_home: Path) -> Non
         assert review_run is not None
         ok, implementer = kb.request_changes(
             conn, tid, reason="needs work", expected_run_id=review_run.current_run_id,
+        blockers=[{"basis": "original_ac", "reference": "test acceptance contract"}],
         )
         assert ok is True
         assert implementer == "claudeprimary"

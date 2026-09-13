@@ -2711,10 +2711,42 @@ def link_tasks(conn: sqlite3.Connection, parent_id: str, child_id: str) -> None:
     """
     if parent_id == child_id:
         raise ValueError("a task cannot depend on itself")
+    repair_reordered = False
     with write_txn(conn):
         missing = _missing_task_ids(conn, [parent_id, child_id])
         if missing:
             raise ValueError(f"unknown task(s): {', '.join(missing)}")
+        # A ready review child can discover separately agent-repairable work.
+        # Reverse only its direct child edge when the caller explicitly links
+        # that repair ahead of the review; ordinary cycles remain errors.
+        from hermes_cli import kanban_db_review as review_policy
+
+        reverse = conn.execute(
+            "SELECT 1 FROM task_links WHERE parent_id = ? AND child_id = ?",
+            (child_id, parent_id),
+        ).fetchone()
+        review_task = get_task(conn, child_id)
+        review_source = (
+            _retry_status_for_run(conn, child_id, review_task.current_run_id)
+            if review_task is not None and review_task.status == "running"
+            else getattr(review_task, "status", None)
+        )
+        if reverse is not None and review_policy.is_ready_review_child(
+            conn,
+            child_id,
+            review_task,
+            source_state=review_source,
+            exclude_parent_id=parent_id,
+        ):
+            conn.execute(
+                "DELETE FROM task_links WHERE parent_id = ? AND child_id = ?",
+                (child_id, parent_id),
+            )
+            _append_event(
+                conn, parent_id, "unlinked",
+                {"parent": child_id, "child": parent_id, "reason": "repair_dependency_reordered"},
+            )
+            repair_reordered = True
         if _would_cycle(conn, parent_id, child_id):
             raise ValueError(f"linking {parent_id} -> {child_id} would create a cycle")
         if _born_satisfied_parents(conn, [parent_id]):
@@ -2738,7 +2770,14 @@ def link_tasks(conn: sqlite3.Connection, parent_id: str, child_id: str) -> None:
         _append_event(
             conn, child_id, "linked", {"parent": parent_id, "child": child_id},
         )
+        if repair_reordered:
+            _append_event(
+                conn, child_id, "repair_dependency_reordered",
+                {"repair": parent_id, "review": child_id},
+            )
         _inherit_notify_subs(conn, child_id, (parent_id,))
+    if repair_reordered:
+        recompute_ready(conn)
 
 
 def _would_cycle(conn: sqlite3.Connection, parent_id: str, child_id: str) -> bool:
@@ -4874,11 +4913,17 @@ def _nonblank_str(value: Any) -> Optional[str]:
 
 def request_changes(
     conn: sqlite3.Connection, task_id: str, *, reason: str, expected_run_id: Optional[int] = None,
-    metadata: Optional[dict] = None,
+    metadata: Optional[dict] = None, blockers: Optional[list[dict[str, str]]] = None,
+    followups: Optional[list[str]] = None,
 ) -> tuple[bool, Optional[str]]:
     """Close an active reviewer run (claimed from ``review``) and hand the task
     back to the implementer from the latest ``review_requested`` event, parent
     gating reapplied. Returns ``(ok, implementer | reason)``.
+
+    ``blockers`` is the mandatory deterministic scope contract. The first
+    structured verdict consolidates all blockers; later verdicts may cite that
+    contract or identify a regression introduced by its rework. ``followups``
+    are persisted as inert suggestions and never create or release work.
 
     ``metadata`` lands on the closing run (same handoff contract as
     :func:`request_review`) and is redacted the same way."""
@@ -4886,6 +4931,19 @@ def request_changes(
     if not reason:
         return False, "reason is required"
     metadata = redact_review_value(metadata)
+    blockers = redact_review_value(blockers)
+    followups = redact_review_value(followups)
+    from hermes_cli import kanban_db_review as review_policy
+
+    try:
+        normalized_blockers, normalized_followups, seeded_from_legacy = (
+            review_policy.validate_verdict(
+                conn, task_id, blockers=blockers, followups=followups,
+            )
+        )
+    except ValueError as exc:
+        return False, str(exc)
+    max_review_rounds = review_policy.configured_max_review_rounds()
 
     with write_txn(conn):
         task_row = conn.execute(
@@ -4992,6 +5050,10 @@ def request_changes(
                 "reviewer": reviewer,
                 "status": new_status,
                 "review_round": _review_round(conn, task_id),
+                "max_review_rounds": max_review_rounds,
+                "blockers": normalized_blockers,
+                "followups": normalized_followups,
+                "contract_seeded_from_legacy": seeded_from_legacy,
             },
             run_id=run_id,
         )

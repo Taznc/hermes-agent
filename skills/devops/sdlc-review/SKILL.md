@@ -20,13 +20,12 @@ Independently verify work handed from a Kanban implementation run to the review 
 
 ## When to Use
 
-Use this skill when all of the following are true:
+Use this skill when the dispatcher explicitly loads it for either review path:
 
-- the dispatcher spawned you for a task claimed from the `review` lane;
-- an implementer submitted a `review_requested` handoff;
-- the task needs an independent verdict before it can be completed.
+- same-card review: the task was claimed from `review` after an implementer submitted a `review_requested` handoff; or
+- ready-child review: a separate review card was claimed from `ready` with this skill forced and its parent handoff identifies the deliverable.
 
-Do not use it for a separate downstream review card. A downstream card is ordinary implementation work with a review-oriented specification and completes through its own lifecycle.
+Both paths use the packet's effective review contract and exact round/cap metadata. A ready-child card completes through its own lifecycle; it does not call same-card `kanban_request_changes` on itself.
 
 ## Prerequisites
 
@@ -49,7 +48,8 @@ This skill is loaded automatically by the review dispatcher. Start with `kanban_
 | Verdict | When | Final action |
 |---|---|---|
 | Approve | Acceptance criteria and verification pass | `kanban_complete` |
-| Request changes | Correctable implementation defects remain | `kanban_comment`, then `kanban_request_changes` |
+| Request changes (same-card) | Correctable implementation defects remain | `kanban_request_changes` with all structured blockers |
+| Repair (ready-child) | Correctable defects remain | Repair in-card, or link executable repair ahead of this unfinished review |
 | Escalate | A human decision or external prerequisite is required | `kanban_block` |
 
 A requested-changes transition returns the task to its original implementer. When that implementer requests review again without naming a reviewer, the persisted reviewer provenance routes the re-review back to the same reviewer profile.
@@ -151,15 +151,22 @@ kanban_comment(
 )
 ```
 
-Then return the same task to its implementer:
+Then return the same task to its implementer with one consolidated verdict.
+Each blocker needs a precise `reference` and one `basis`: `original_ac`,
+`required_behavior`, `base_regression`, or `landing_gate`. On re-review, cite
+an established reference or use `base_regression` with `rework_of` naming one:
 
 ```text
 kanban_request_changes(
-    reason="<concise summary of the required corrections>"
+    reason="<concise summary of the required corrections>",
+    blockers=[
+        {"basis": "original_ac", "reference": "<AC + exact defect>"},
+    ],
+    followups=["<optional non-blocking improvement>"],
 )
 ```
 
-State where the defect is, how it reproduces, why it violates the task, and what minimum outcome would resolve it. The transition does not use blocker recurrence accounting.
+State where the defect is, how it reproduces, why it violates the task, and what minimum outcome would resolve it. Followups are inert and never release work. A ready-child review instead repairs within its own lifecycle or links separately executable repair work ahead of itself; never gate that repair behind the unfinished review/release.
 
 #### Escalate
 
