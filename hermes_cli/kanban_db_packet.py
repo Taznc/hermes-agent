@@ -222,6 +222,8 @@ def _runtime_caps(task) -> tuple[dict[str, Any], int]:
 
 def _workspace_refs(task, land_target: Optional[str]) -> dict[str, Any]:
     """Best-effort exact refs from the already-materialized task worktree."""
+    from hermes_cli.kanban_db_receipt import packet_preflight_receipt
+
     path = task.workspace_path
     head_sha = _kb._git_out(path, "rev-parse", "HEAD") if path else None
     base_sha = (
@@ -235,6 +237,7 @@ def _workspace_refs(task, land_target: Optional[str]) -> dict[str, Any]:
         "base_ref": land_target,
         "base_sha": base_sha,
         "head_sha": head_sha,
+        "preflight": packet_preflight_receipt(task.id),
     }
 
 

@@ -249,7 +249,7 @@ def notify_task_updated(
 # DispatchResult counters whose non-zero value means the tick did something.
 _TICK_ACTIVITY_FIELDS = (
     "spawned", "reclaimed", "promoted", "reconciled_orphans", "crashed", "stale",
-    "timed_out", "auto_blocked", "rate_limited", "review_no_verdict", "auto_assigned_default",
+    "timed_out", "auto_blocked", "preflight_blocked", "rate_limited", "review_no_verdict", "auto_assigned_default",
     "respawn_guarded", "skipped_per_profile_capped", "skipped_unassigned",
     "skipped_nonspawnable", "skill_preflight_blocked", "blocked_review_round_cap",
 )
@@ -916,6 +916,8 @@ class Task:
     # creates and every pre-feature row.
     created_by_task: Optional[str] = None
     created_by_run: Optional[int] = None
+    # In-memory dispatcher handoff; persisted as a board artifact, not a task column.
+    preflight_receipt_path: Optional[str] = None
 
     @classmethod
     def from_row(cls, row: sqlite3.Row) -> "Task":

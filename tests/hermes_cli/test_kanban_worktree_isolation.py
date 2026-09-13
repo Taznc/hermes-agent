@@ -38,8 +38,8 @@ def kanban_home(tmp_path, monkeypatch):
     return home
 
 
-def _git(cwd: Path, *args: str) -> None:
-    subprocess.run(
+def _git(cwd: Path, *args: str) -> str:
+    result = subprocess.run(
         [
             "git", "-C", str(cwd),
             "-c", "user.name=Test User",
@@ -49,6 +49,7 @@ def _git(cwd: Path, *args: str) -> None:
         ],
         check=True, capture_output=True, text=True,
     )
+    return result.stdout.strip()
 
 
 def _make_repo(tmp_path: Path) -> Path:
@@ -117,7 +118,9 @@ def test_resolve_worktree_falls_back_when_path_occupied(kanban_home, tmp_path):
         )
         task = kb.get_task(conn, tid)
 
-    workspace, branch = kbw._resolve_worktree_workspace(task)
+    workspace, branch = kbw._resolve_worktree_workspace(
+        task, base_ref=_git(repo, "rev-parse", "HEAD")
+    )
     assert workspace == (repo / ".worktrees" / tid).resolve()
     assert branch == f"wt/{tid}"
     # The sibling's checkout is untouched, still on its own branch.
