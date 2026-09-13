@@ -27,7 +27,7 @@ import { type ReactNode, useEffect, useMemo, useState, useSyncExternalStore } fr
 
 import { boardKey, BOARDS_KEY, estimateTask, fetchProfiles, PROFILES_KEY } from './api'
 import { indexBoard, partitionBlockers, resolveLinks } from './deps'
-import { getHermesActions, openHermesAction, resolveActionCwd } from './session-actions'
+import { getHermesActions, type HermesActionLabels, openHermesAction, resolveActionCwd } from './session-actions'
 import {
   type BoardMeta,
   type BoardsResponse,
@@ -231,16 +231,26 @@ export function HermesActionsSection({
   detail: KanbanTaskDetail
   task: KanbanTaskFull
 }) {
-  const actions = getHermesActions(task, detail.runs)
+  const k = useKanban()
+
+  const actionLabels: HermesActionLabels = {
+    explain: k.hermesActionExplain,
+    failure: k.hermesActionFailure,
+    rough: k.hermesActionRough,
+    scope: k.hermesActionScope,
+    unblock: k.hermesActionUnblock
+  }
+
+  const actions = getHermesActions(task, detail.runs, actionLabels)
   const cwd = resolveActionCwd(task, board)
   const context = { board, commentsCount: detail.comments.length, runs: detail.runs, task }
 
   return (
-    <Section label="Hermes actions">
+    <Section label={k.hermesActionsSection}>
       <div className="flex flex-wrap gap-1.5">
         {actions.map(action => (
           <Button
-            disabled={!cwd || !board.slug}
+            disabled={!board.slug}
             key={action.id}
             onClick={() => openHermesAction(action, context, options => host.newChatWithContext(options))}
             size="xs"
@@ -252,12 +262,12 @@ export function HermesActionsSection({
       </div>
       {!cwd && (
         <p className="text-[0.6875rem] leading-relaxed text-(--ui-text-quaternary)">
-          No project directory is available for this card.
+          {k.hermesActionsDetachedHint}
         </p>
       )}
       {cwd && !board.slug && (
         <p className="text-[0.6875rem] leading-relaxed text-(--ui-text-quaternary)">
-          Board context is unavailable for this card.
+          {k.hermesActionsBoardUnavailable}
         </p>
       )}
     </Section>

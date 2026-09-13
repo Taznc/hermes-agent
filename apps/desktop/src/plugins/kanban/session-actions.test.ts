@@ -1,5 +1,6 @@
 import { describe, expect, it, vi } from 'vitest'
 
+import { en } from './i18n'
 import { buildActionDraft, getHermesActions, openHermesAction, resolveActionCwd } from './session-actions'
 import type { BoardMeta, KanbanRun, KanbanTaskFull } from './types'
 
@@ -20,6 +21,14 @@ const board: BoardMeta = {
 
 const run = (status: string, id: number): KanbanRun => ({ id, status })
 
+const actionLabels = {
+  explain: en.hermesActionExplain,
+  failure: en.hermesActionFailure,
+  rough: en.hermesActionRough,
+  scope: en.hermesActionScope,
+  unblock: en.hermesActionUnblock
+}
+
 describe('seeded Hermes action catalog', () => {
   it.each([
     ['idea', ['Explain this card', 'Rough this out']],
@@ -27,19 +36,19 @@ describe('seeded Hermes action catalog', () => {
     ['blocked', ['Explain this card', 'Help me unblock it']],
     ['ready', ['Explain this card']]
   ])('shows the actions for %s', (status, expected) => {
-    expect(getHermesActions(task(status), [])).toEqual(expected.map(action => expect.objectContaining({ label: action })))
+    expect(getHermesActions(task(status), [], actionLabels)).toEqual(expected.map(action => expect.objectContaining({ label: action })))
   })
 
   it('adds failure investigation for a consecutive failure or errored latest run', () => {
-    expect(getHermesActions(task('todo', { consecutive_failures: 2 }), []).map(action => action.label)).toEqual([
+    expect(getHermesActions(task('todo', { consecutive_failures: 2 }), [], actionLabels).map(action => action.label)).toEqual([
       'Explain this card',
       'Investigate the failure'
     ])
-    expect(getHermesActions(task('done'), [run('completed', 1), run('errored', 2)]).map(action => action.label)).toEqual([
+    expect(getHermesActions(task('done'), [run('completed', 1), run('errored', 2)], actionLabels).map(action => action.label)).toEqual([
       'Explain this card',
       'Investigate the failure'
     ])
-    expect(getHermesActions(task('done'), [run('errored', 1), run('completed', 2)]).map(action => action.label)).toEqual([
+    expect(getHermesActions(task('done'), [run('errored', 1), run('completed', 2)], actionLabels).map(action => action.label)).toEqual([
       'Explain this card'
     ])
   })
@@ -54,9 +63,9 @@ describe('seeded Hermes action catalog', () => {
     'builds the %s intent around the exact card and board context',
     id => {
       const action = [
-        ...getHermesActions(task('idea', { consecutive_failures: 1 }), [run('errored', 9)]),
-        ...getHermesActions(task('roadmap'), []),
-        ...getHermesActions(task('blocked'), [])
+        ...getHermesActions(task('idea', { consecutive_failures: 1 }), [run('errored', 9)], actionLabels),
+        ...getHermesActions(task('roadmap'), [], actionLabels),
+        ...getHermesActions(task('blocked'), [], actionLabels)
       ].find(candidate => candidate.id === id)!
 
       const draft = buildActionDraft(action, {
@@ -73,9 +82,9 @@ describe('seeded Hermes action catalog', () => {
     }
   )
 
-  it('opens only a fresh editable draft and performs no operation when cwd is unavailable', () => {
+  it('opens a fresh editable draft through the cwd ladder, including detached sessions', () => {
     const open = vi.fn()
-    const action = getHermesActions(task('ready'), [])[0]
+    const action = getHermesActions(task('ready'), [], actionLabels)[0]
     const context = { board, commentsCount: 0, runs: [], task: task('ready') }
 
     expect(openHermesAction(action, context, open)).toBe(true)
@@ -88,9 +97,16 @@ describe('seeded Hermes action catalog', () => {
     expect(open.mock.calls[0][0]).not.toHaveProperty('submit')
 
     open.mockClear()
-    expect(openHermesAction(action, { ...context, board: { ...board, default_workdir: null } }, open)).toBe(false)
-    expect(open).not.toHaveBeenCalled()
+    expect(openHermesAction(action, { ...context, board: { ...board, default_workdir: null } }, open)).toBe(true)
+    expect(open).toHaveBeenCalledWith({
+      cwd: undefined,
+      draft: expect.stringContaining('t_exact123'),
+      openTab: true
+    })
+    expect(open.mock.calls[0][0]).not.toHaveProperty('send')
+    expect(open.mock.calls[0][0]).not.toHaveProperty('submit')
 
+    open.mockClear()
     expect(openHermesAction(action, { ...context, board: { ...board, slug: '' } }, open)).toBe(false)
     expect(open).not.toHaveBeenCalled()
   })

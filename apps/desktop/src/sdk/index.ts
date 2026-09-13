@@ -1266,7 +1266,7 @@ export const host = {
       pinNewChatProfile(options.profile)
     }
 
-    requestStartWorkSession(options.cwd ?? $currentCwd.get(), options.draft, { openTab: options.openTab })
+    requestStartWorkSession(options.cwd, options.draft, { openTab: options.openTab })
   },
 
   /** Front the tab a Bot Mode owner already has open — the tile that owner's

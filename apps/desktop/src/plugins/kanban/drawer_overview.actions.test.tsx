@@ -40,7 +40,7 @@ describe('HermesActionsSection', () => {
     const loaded = detail()
 
     render(<HermesActionsSection board={board} detail={loaded} task={loaded.task} />)
-    fireEvent.click(screen.getByRole('button', { name: 'Rough this out' }))
+    fireEvent.click(screen.getByRole('button', { name: 'hermesActionRough' }))
 
     expect(open).toHaveBeenCalledOnce()
     expect(open).toHaveBeenCalledWith({
@@ -52,20 +52,25 @@ describe('HermesActionsSection', () => {
     expect(open.mock.calls[0][0]).not.toHaveProperty('submit')
   })
 
-  it('shows every action as unavailable and does not open a session without a workdir', () => {
+  it('opens an editable detached draft when no card or board workdir exists', () => {
     const open = vi.spyOn(host, 'newChatWithContext').mockImplementation(() => undefined)
     const loaded = detail('blocked')
     loaded.task.workspace_path = ' '
 
     render(<HermesActionsSection board={{ ...board, default_workdir: null }} detail={loaded} task={loaded.task} />)
 
-    expect(screen.getByText('No project directory is available for this card.')).toBeTruthy()
-    const explain = screen.getByRole('button', { name: 'Explain this card' }) as HTMLButtonElement
-    const unblock = screen.getByRole('button', { name: 'Help me unblock it' }) as HTMLButtonElement
-    expect(explain.disabled).toBe(true)
-    expect(unblock.disabled).toBe(true)
+    const explain = screen.getByRole('button', { name: 'hermesActionExplain' }) as HTMLButtonElement
+    const unblock = screen.getByRole('button', { name: 'hermesActionUnblock' }) as HTMLButtonElement
+    expect(explain.disabled).toBe(false)
+    expect(unblock.disabled).toBe(false)
     fireEvent.click(explain)
-    expect(open).not.toHaveBeenCalled()
+    expect(open).toHaveBeenCalledWith({
+      cwd: undefined,
+      draft: expect.stringMatching(/t_exact123[\s\S]*board shipping/),
+      openTab: true
+    })
+    expect(open.mock.calls[0][0]).not.toHaveProperty('send')
+    expect(open.mock.calls[0][0]).not.toHaveProperty('submit')
   })
 
   it('reacts to already-owned board cache updates without fetching action metadata', async () => {
@@ -87,8 +92,8 @@ describe('HermesActionsSection', () => {
       </QueryClientProvider>
     )
 
-    const explain = screen.getByRole('button', { name: 'Explain this card' }) as HTMLButtonElement
-    expect(explain.disabled).toBe(true)
+    const explain = screen.getByRole('button', { name: 'hermesActionExplain' }) as HTMLButtonElement
+    expect(explain.disabled).toBe(false)
 
     await act(() => client.setQueryData(BOARDS_KEY, { boards: [board], current: 'shipping' }))
     expect(explain.disabled).toBe(false)

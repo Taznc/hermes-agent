@@ -266,7 +266,19 @@ describe('host chat creation', () => {
     expect($startWorkSessionRequest.get()).toMatchObject({
       draft: undefined,
       openTab: undefined,
-      path: '/projects/current'
+      path: null
+    })
+  })
+
+  it('queues a detached contextual chat without substituting the current cwd', () => {
+    $currentCwd.set('/projects/current')
+
+    host.newChatWithContext({ draft: 'Keep this unsent', openTab: true })
+
+    expect($startWorkSessionRequest.get()).toMatchObject({
+      draft: 'Keep this unsent',
+      openTab: true,
+      path: null
     })
   })
 
