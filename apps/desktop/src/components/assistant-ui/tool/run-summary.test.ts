@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest'
 
-import { summarizeToolRun, type ToolCallLike } from './run-summary'
+import { summarizeToolRun, toolPresentVerb, type ToolCallLike } from './run-summary'
 
 function tool(toolName: string, args: Record<string, unknown> = {}, result?: unknown): ToolCallLike {
   return { args, result, toolCallId: `${toolName}-${Math.random()}`, toolName }
@@ -56,5 +56,22 @@ describe('summarizeToolRun', () => {
   // or it narrates work that stopped happening and never offers its toggle.
   it('reads a run the turn left unresolved as finished', () => {
     expect(settled([read('a.ts'), tool('search_files', { query: 'toolRuns' })])).toBe('Explored 2 files')
+  })
+})
+
+describe('toolPresentVerb', () => {
+  it('names a category tool with its plain present-tense verb', () => {
+    expect(toolPresentVerb('read_file')).toBe('Exploring')
+    expect(toolPresentVerb('terminal')).toBe('Running')
+    expect(toolPresentVerb('edit_file')).toBe('Editing')
+  })
+
+  // MCP/plugin tools (and anything else uncategorized) used to collapse to a
+  // bare "Using" with no indication of what — the status line said the app
+  // was working but not on what. Naming the tool keeps the wait legible.
+  it('names the tool for the uncategorized catch-all instead of a bare "Using"', () => {
+    expect(toolPresentVerb('memory')).toBe('Using Memory')
+    expect(toolPresentVerb('clarify')).toBe('Using Clarify')
+    expect(toolPresentVerb('airtable_search_records')).toBe('Using Airtable Search Records')
   })
 })

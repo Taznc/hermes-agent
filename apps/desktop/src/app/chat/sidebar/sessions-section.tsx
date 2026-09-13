@@ -27,9 +27,9 @@ import {
   toggleWorkspaceNodeCollapsed
 } from '@/store/layout'
 import { sessionPinId } from '@/store/session'
-import { $sessionDotStateById, hasLiveTurn } from '@/store/session-dot-state'
+import { $liveTurnSessionIds } from '@/store/session-dot-state'
 
-import { SidebarDateDivider, SidebarSectionMeta } from './chrome'
+import { SidebarDateDivider, SidebarDateDividerArchiveButton, SidebarSectionMeta } from './chrome'
 import { mergeVisibleReorder, orderRowsWithinGroups, reorderableRowIds } from './order'
 import {
   EnteredProjectContent,
@@ -110,6 +110,9 @@ interface SidebarSessionsSectionProps {
   onResumeSession: (sessionId: string, session?: SessionInfo) => void
   onDeleteSession: (sessionId: string) => void
   onArchiveSession: (sessionId: string) => void
+  /** Restore an archived row. Optional: only Recents ever renders archived
+   *  rows — Pinned/Search never do. */
+  onUnarchiveSession?: (sessionId: string) => void
   onBranchSession?: (sessionId: string, profile?: string) => void
   onTogglePin: (sessionId: string) => void
   onToggleUnread: (sessionId: string) => void
@@ -190,6 +193,7 @@ export function SidebarSessionsSection({
   onResumeSession,
   onDeleteSession,
   onArchiveSession,
+  onUnarchiveSession,
   onBranchSession,
   onTogglePin,
   onToggleUnread,
@@ -228,7 +232,12 @@ export function SidebarSessionsSection({
   const { t } = useI18n()
   const dividerLabels = t.sidebar.dateDivider
   const statusDividerLabels = t.sidebar.statusDivider
-  const dotStates = useStore($sessionDotStateById)
+  // Membership only — not the raw dot-state map. $liveTurnSessionIds is a
+  // stableArray-guarded projection (see store/session-dot-state.ts), so this
+  // section only re-renders when a session's hasLiveTurn bucket actually
+  // flips, not on every dot-state tick (unread, background, etc. no-op here).
+  const liveTurnIds = useStore($liveTurnSessionIds)
+  const liveTurnIdSet = useMemo(() => new Set(liveTurnIds), [liveTurnIds])
   const nodeOpen = useStore($sidebarWorkspaceNodeOpen)
   const isListGroupOpen = useCallback((key: string) => nodeOpen[listGroupNodeId(key)] ?? true, [nodeOpen])
   const sectionOpen = collapsible ? open : true
@@ -267,7 +276,19 @@ export function SidebarSessionsSection({
         card,
         isPinned: pinned,
         isSelected: session.id === activeSessionId,
-        onArchive: () => onArchiveSession(session.id),
+        // Archived filter rows are the session's OWN inverse action: the
+        // "Archive session" verb is a no-op on an already-archived row, so
+        // swap to Unarchive whenever this row IS archived (never on a live
+        // row even if `showArchived` is somehow stale — `session.archived`
+        // is the row's own ground truth, same field the lead glyph above
+        // already branches on). Sections that never render archived rows
+        // (Pinned, Search) don't wire `onUnarchiveSession` — falls back to
+        // a no-op rather than mis-firing the archive RPC on an archived row.
+        onArchive: session.archived
+          ? onUnarchiveSession
+            ? () => onUnarchiveSession(session.id)
+            : () => {}
+          : () => onArchiveSession(session.id),
         onBranch: onBranchSession ? () => onBranchSession(session.id, session.profile) : undefined,
         onDelete: () => onDeleteSession(session.id),
         onPin: () => onTogglePin(sessionPinId(session)),
@@ -297,6 +318,7 @@ export function SidebarSessionsSection({
       onResumeSession,
       onTogglePin,
       onToggleUnread,
+      onUnarchiveSession,
       pinned,
       showProfileTags
     ]
@@ -309,25 +331,28 @@ export function SidebarSessionsSection({
   // exactly there; a sub-threshold release stays the ordinary click. The ONE
   // element here feeds both the plain and the virtualized list paths, so this
   // single wiring covers every date-divider "+" on screen.
-  const dividerAction =
-    grouping === 'date' && onNewSessionInWorkspace ? (
-      <WorkspaceAddButton
-        label={t.sidebar.nav['new-session']}
-        onClick={() => onNewSessionInWorkspace(null)}
-        onPointerDown={
-          onNewSessionSplit
-            ? event => {
-                startNewSessionDrag(placement => {
-                  onNewSessionSplit(placement.dir, {
-                    anchor: placement.anchor,
-                    before: placement.before
-                  })
-                }, event)
-              }
-            : undefined
-        }
-      />
-    ) : null
+  const newSessionDividerAction = useMemo(
+    () =>
+      grouping === 'date' && onNewSessionInWorkspace ? (
+        <WorkspaceAddButton
+          label={t.sidebar.nav['new-session']}
+          onClick={() => onNewSessionInWorkspace(null)}
+          onPointerDown={
+            onNewSessionSplit
+              ? event => {
+                  startNewSessionDrag(placement => {
+                    onNewSessionSplit(placement.dir, {
+                      anchor: placement.anchor,
+                      before: placement.before
+                    })
+                  }, event)
+                }
+              : undefined
+          }
+        />
+      ) : null,
+    [grouping, onNewSessionInWorkspace, onNewSessionSplit, t]
+  )
 
   const dividerToggle = useMemo(
     () => ({
@@ -371,20 +396,6 @@ export function SidebarSessionsSection({
     [renderRow]
   )
 
-  // Same as `renderRows`, but with date dividers folded in — used for
-  // entered-project lanes so a lane spanning multiple days reads
-  // chronologically, matching the flat recents list.
-  const renderRowsDated = useCallback(
-    (items: SessionInfo[]) => {
-      const entries = flattenSessionsWithBranches(items)
-
-      const rows = grouping === 'date' ? groupEntriesByRecency(entries) : toSessionRows(entries)
-
-      return hideCollapsedGroupRows(rows, isListGroupOpen).map(row => renderListRow(row, false))
-    },
-    [grouping, isListGroupOpen, renderListRow]
-  )
-
   // Flat recents as list rows: grouped by recency when enabled, plain otherwise.
   // The hand-picked order is then applied INSIDE each date group, so dragging a
   // row ranks it among its own day's chats instead of freezing the whole list
@@ -394,15 +405,71 @@ export function SidebarSessionsSection({
       grouping === 'date'
         ? groupEntriesByRecency(displayEntries)
         : grouping === 'status'
-          ? groupEntriesByStatus(
-              displayEntries,
-              entry => hasLiveTurn(dotStates[entry.session.id] ?? 'idle'),
-              statusDividerLabels
-            )
+          ? groupEntriesByStatus(displayEntries, entry => liveTurnIdSet.has(entry.session.id), statusDividerLabels)
           : toSessionRows(displayEntries)
 
     return manualOrderIds?.length ? orderRowsWithinGroups(rows, manualOrderIds) : rows
-  }, [grouping, displayEntries, dotStates, manualOrderIds, statusDividerLabels])
+  }, [grouping, displayEntries, liveTurnIdSet, manualOrderIds, statusDividerLabels])
+
+  const archiveDateGroup = useCallback(
+    (rows: readonly SidebarListRow[], key: string) => {
+      let insideGroup = false
+
+      for (const row of rows) {
+        if (row.kind === 'divider') {
+          if (insideGroup) {
+            break
+          }
+
+          insideGroup = row.key === key
+        } else if (insideGroup) {
+          onArchiveSession(row.entry.session.id)
+        }
+      }
+    },
+    [onArchiveSession]
+  )
+
+  const dividerAction = useCallback(
+    (key: string, label: string, rows: readonly SidebarListRow[] = flatRows) => {
+      if (grouping !== 'date') {
+        return newSessionDividerAction
+      }
+
+      return (
+        <>
+          <SidebarDateDividerArchiveButton
+            ariaLabel={`${t.sidebar.row.archiveSession}: ${label}`}
+            onArchive={() => archiveDateGroup(rows, key)}
+          />
+          {newSessionDividerAction}
+        </>
+      )
+    },
+    [archiveDateGroup, flatRows, grouping, newSessionDividerAction, t]
+  )
+
+  // Same as `renderRows`, but with date dividers folded in — used for
+  // entered-project lanes so a lane spanning multiple days reads
+  // chronologically, matching the flat recents list. These dividers receive
+  // the same archive action as the main recents list, scoped to this lane.
+  const renderRowsDated = useCallback(
+    (items: SessionInfo[]) => {
+      const entries = flattenSessionsWithBranches(items)
+      const rows = grouping === 'date' ? groupEntriesByRecency(entries) : toSessionRows(entries)
+
+      return hideCollapsedGroupRows(rows, isListGroupOpen).map(row =>
+        renderListRow(
+          row,
+          false,
+          row.kind === 'divider'
+            ? dividerAction(row.key, 'label' in row ? row.label : sessionBucketLabel(row.bucket, dividerLabels), rows)
+            : undefined
+        )
+      )
+    },
+    [dividerAction, dividerLabels, grouping, isListGroupOpen, renderListRow]
+  )
 
   // Closed date/status buckets keep their divider and drop the sessions under
   // it. Same array when nothing is collapsed so the virtualizer's rows ref
@@ -566,11 +633,27 @@ export function SidebarSessionsSection({
   } else if (sessionsDraggable) {
     inner = (
       <ReorderableList ids={sortableRowIds} onReorder={persistSessionOrder} sensors={dndSensors}>
-        {visibleRows.map(row => renderListRow(row, true, dividerAction))}
+        {visibleRows.map(row =>
+          renderListRow(
+            row,
+            true,
+            row.kind === 'divider'
+              ? dividerAction(row.key, 'label' in row ? row.label : sessionBucketLabel(row.bucket, dividerLabels))
+              : undefined
+          )
+        )}
       </ReorderableList>
     )
   } else {
-    inner = visibleRows.map(row => renderListRow(row, false, dividerAction))
+    inner = visibleRows.map(row =>
+      renderListRow(
+        row,
+        false,
+        row.kind === 'divider'
+          ? dividerAction(row.key, 'label' in row ? row.label : sessionBucketLabel(row.bucket, dividerLabels))
+          : undefined
+      )
+    )
   }
 
   // The virtualizer owns its own scroller, so suppress the wrapper's overflow

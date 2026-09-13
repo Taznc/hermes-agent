@@ -6,7 +6,7 @@ import { type BrowserWindow, ipcMain, screen } from 'electron'
 
 import { createHudDragSession } from './hud-drag'
 import { normalizeHudResizeBounds } from './hud-geometry'
-import { hudWindowingView, resolveHudWindowing } from './hud-windowing'
+import { resolveHudWindowing } from './hud-windowing'
 import { hudFrostFor, type TranslucencyState } from './translucency'
 
 function hudWindowing() {
@@ -40,10 +40,6 @@ export function registerHudIpc({
   // Main answers because it owns the actual Ozone backend selection.
   ipcMain.on('hermes:hud:native-drag', event => {
     event.returnValue = hudWindowing().move === 'native-drag'
-  })
-
-  ipcMain.on('hermes:hud:windowing', event => {
-    event.returnValue = hudWindowingView(hudWindowing())
   })
 
   // X11/KWin window transfer: a renderer-driven grab is temporarily sticky so

@@ -1,8 +1,11 @@
 import { FIELD_DESCRIPTIONS, FIELD_LABELS } from '@/app/settings/constants'
 
+import { forkEn } from './fork/en'
+import { withForkKeys } from './fork/merge'
 import type { Translations } from './types'
 
-export const en: Translations = {
+// >>> FORK ANCHOR: i18n-en <<<
+export const en: Translations = withForkKeys(forkEn, {
   sessionImport: {
     title: 'Continue from another app',
     subtitle: 'Bring a conversation into Hermes and pick up where you left off.',
@@ -76,7 +79,8 @@ export const en: Translations = {
     update: 'Update',
     tryHint: term => `Try “${term}”`,
     on: 'On',
-    off: 'Off'
+    off: 'Off',
+    undo: 'Undo'
   },
 
   fileMenu: {
@@ -165,6 +169,7 @@ export const en: Translations = {
     more: count => `${count} more ${count === 1 ? 'notification' : 'notifications'}`,
     clearAll: 'Clear all',
     dismiss: 'Dismiss notification',
+    dismissAction: 'Dismiss',
     details: 'Details',
     copyDetail: 'Copy detail',
     copyDetailFailed: 'Could not copy notification detail',
@@ -546,6 +551,7 @@ export const en: Translations = {
       testBody: 'Notifications are working.',
       testSent: 'Test sent. If nothing appears, check your OS notification permissions and Focus/Do Not Disturb.',
       testUnsupported: 'This system does not support native notifications.',
+      testDenied: 'Notifications are blocked for this site. Allow them in your browser\u2019s site settings, then try again.',
       completionSoundTitle: 'Completion Sound',
       completionSoundDesc: 'Plays when an agent turn finishes. Pick a preset and preview it here.',
       completionSoundPreview: 'Preview'
@@ -637,6 +643,9 @@ export const en: Translations = {
       toursDesc: 'Let Hermes walk you through the app, dimming the screen and spotlighting each step.',
       composerPopoutTitle: 'Floating Composer',
       composerPopoutDesc: 'Allow dragging the composer out of its dock. Turn this off to keep it locked at the bottom.',
+      requireModifierToOpenLinksTitle: 'Require ⌘/Ctrl-click to open chat links',
+      requireModifierToOpenLinksDesc:
+        '⌘-click on Mac or Ctrl-click elsewhere opens inline chat paths and URLs, including code chips. A regular click selects text. Enter on a focused link still opens it.',
       vibeHeartsTitle: 'Vibe Hearts',
       vibeHeartsDesc:
         'Floating hearts when you say thanks, ily, good bot, or send a heart. Separate from Message Reactions above.',
@@ -1130,6 +1139,7 @@ export const en: Translations = {
     },
     model: {
       loading: 'Loading model configuration...',
+      loadFailed: 'Failed to load model settings',
       appliesDesc: 'Applies to new sessions. Use the model picker in the composer to hot-swap the active chat.',
       provider: 'Provider',
       model: 'Model',
@@ -1138,7 +1148,6 @@ export const en: Translations = {
       reasoning: 'Reasoning',
       reasoningOff: 'Off',
       defaultsFailed: 'Failed to save model defaults',
-      loadFailed: 'Could not load models',
       restartRequired: 'This backend is running old code after an update. Restart it to load the new code.',
       restartBackend: 'Restart backend',
       restartingBackend: 'Restarting backend...',
@@ -1585,12 +1594,66 @@ export const en: Translations = {
     resetToMine: 'Back to my map'
   },
   agents: {
+    openAsTab: 'Open as tab',
+    liveUnavailable: 'Live status unavailable',
+    inventoryUnavailable: 'Update this gateway to show its sessions and bots.',
+    historyShifted: 'Sessions changed while reading; refreshing.',
     extendedTranscript: 'Extended transcript',
     transcriptTruncated: 'Showing the latest 16 KiB',
     transcriptUnavailable: 'Live transcript unavailable',
 
     close: 'Close agents',
-    title: 'Spawn tree',
+    title: 'Agents',
+    sessionsTab: 'Sessions',
+    treeTab: 'Spawn tree',
+    overviewSubtitle: 'Hermes session activity across registered sources.',
+    searchSessions: 'Search sessions',
+    allSources: 'All sources',
+    allProfiles: 'All profiles',
+    allProviders: 'All providers',
+    activityFilter: 'Activity',
+    recentActivity: 'Recent activity',
+    allSessions: 'All sessions',
+    noRecentActivity: 'No recent activity',
+    recentActivityHint:
+      'Running and needs-input sessions stay visible. Other sessions appear for 15 minutes after activity. Choose All sessions to inspect history.',
+    needsYou: 'Needs you',
+    working: 'Working',
+    unread: 'Unread',
+    idle: 'Idle',
+    stale: 'Stale',
+    noSessions: 'No matching sessions',
+    selectSession: 'Select a conversation to preview it.',
+    openConversation: 'Open conversation',
+    reply: 'Reply',
+    stop: 'Stop',
+    retry: 'Retry',
+    connect: 'Connect',
+    owner: 'Owner',
+    source: 'Source',
+    profile: 'Profile',
+    provider: 'Provider',
+    model: 'Model',
+    description: 'Description',
+    unknown: 'Unknown',
+    loadMore: 'Load more',
+    coverageNote: 'Live status covers connected Hermes processes only. Idle does not mean completed.',
+    promptHint: 'Open the conversation to answer approvals or questions.',
+    history: 'History coverage',
+    ready: 'Ready',
+    onDemand: 'On demand',
+    offline: 'Offline',
+    unsupported: 'Unsupported',
+    partial: 'Partial',
+    allQuiet: 'All quiet',
+    allQuietHint:
+      'Running and waiting sessions stay here. Finished chats fade out after 15 minutes; switch to All sessions for history.',
+    needYouCount: count => `${count} ${count === 1 ? 'needs' : 'need'} you`,
+    workingCount: count => `${count} working`,
+    closePreview: 'Close preview',
+    replyPlaceholder: 'Reply…',
+    noPreview: 'No preview available.',
+    shown: (visible, total) => `${visible} of ${total} sessions`,
     subtitle: 'Live subagent activity for the current turn.',
     emptyTitle: 'No live subagents',
     emptyDesc: 'When a turn delegates work, child agents stream their progress here.',
@@ -2496,6 +2559,7 @@ export const en: Translations = {
       openInSplit: 'Open in split',
       copyIdFailed: 'Could not copy session ID',
       sessionActions: 'Session actions',
+      archiveSession: 'Archive session',
       sessionRunning: 'Session running',
       needsInput: 'Needs your input',
       waitingForAnswer: 'Waiting for your answer',
@@ -3201,6 +3265,9 @@ export const en: Translations = {
       showTerminal: 'Show terminal',
       hideTerminal: 'Hide terminal',
       gateway: 'Gateway',
+      backend: 'Backend',
+      messagingStopped: 'messaging stopped',
+      messagingDegraded: name => `${name} down`,
       gatewayReady: 'ready',
       gatewayNeedsSetup: 'needs setup',
       gatewayUnavailable: 'inference unavailable',
@@ -3394,6 +3461,11 @@ export const en: Translations = {
       address: 'Address',
       addressPlaceholder: 'Enter address',
       blankPageBody: 'Type an address above to browse, or ask Hermes to open a page.',
+      noGuestTitle: 'Pages open in a browser tab',
+      noGuestBody:
+        'This build of Hermes runs in your browser, which cannot embed another site in the pane. Enter an address above and Hermes opens it in a new browser tab.',
+      noGuestOpen: url => `Open ${url} in a browser tab`,
+      openBlocked: 'Your browser blocked the new tab. Allow pop-ups for this page, then try again.',
       finishedRestarting: message => `Hermes finished restarting the preview server${message ? `: ${message}` : ''}`,
       failedRestarting: message => `Server restart failed: ${message}`,
       unknownError: 'unknown error',
@@ -3482,6 +3554,10 @@ export const en: Translations = {
       copyUrl: 'Copy URL',
       copyResolvedUrl: 'Copy resolved URL'
     },
+    file: {
+      openPreview: 'Open in preview',
+      openDefaultApp: 'Open with default app'
+    },
     image: {
       copyImage: 'Copy image',
       copyImageAddress: 'Copy image address',
@@ -3521,6 +3597,7 @@ export const en: Translations = {
       refresh: 'Refresh',
       moreActions: 'More actions',
       branchNewChat: 'Branch in new chat',
+      copyMessage: 'Copy message',
       react: 'React',
       dismissError: 'Dismiss error',
       errorLayers: {
@@ -3583,6 +3660,7 @@ export const en: Translations = {
       gatewayDisconnected: 'Hermes gateway is not connected',
       sendFailed: 'Could not send clarify response',
       loadingQuestion: 'Loading question…',
+      restoring: 'Restoring this question — you can answer in a moment',
       other: 'Other (type your answer)',
       placeholder: 'Type your answer…',
       skip: 'Skip',
@@ -3591,9 +3669,16 @@ export const en: Translations = {
       confirmAndContinueLabel: 'Confirm and continue',
       answeredBadge: 'Answered',
       questionProgress: (answered, total) => `${answered} of ${total} answered`,
+      questionGroup: total => `${total} questions to answer`,
       lateAnswer: (question, choice) => `Re: "${question}" — my answer: ${choice}`,
       lateAnswerTip: 'Draft this answer as a follow-up message',
-      lateAnswerHint: 'This prompt is no longer waiting. Pick an option to draft it as a follow-up message.'
+      lateAnswerHint: 'This prompt is no longer waiting. Pick an option to draft it as a follow-up message.',
+      addNote: 'Add note',
+      addNoteFor: label => `Add note for ${label}`,
+      note: 'Note',
+      noteFor: label => `Note for ${label}`,
+      notePlaceholder: 'Add an optional note…',
+      selected: 'Selected'
     },
     mcpSetup: {
       installTitle: server => `Add the ${server} MCP server?`,
@@ -3762,6 +3847,8 @@ export const en: Translations = {
     deleteFailed: 'Delete failed',
     archived: 'Archived',
     archiveFailed: 'Archive failed',
+    archivedUndoMessage: 'Session archived',
+    undoArchiveFailed: 'Undo failed',
     cwdChangeFailed: 'Working directory change failed',
     cwdStagedTitle: 'Working directory staged',
     cwdStagedMessage: 'Restart the desktop backend to apply cwd changes to this active session.',
@@ -3867,4 +3954,4 @@ export const en: Translations = {
       toggle: open => `${open ? 'Show' : 'Hide'} sidebar`
     }
   }
-}
+})

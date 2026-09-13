@@ -34,9 +34,10 @@ const RAIL_ACTION =
 /** Thin icon "bookmark" strip blended into the terminal surface, shown whenever a
  *  terminal exists. Each square is a tab (name + hotkey on hover); close via the
  *  shell's `exit`, middle-click, or the context menu. */
-export function TerminalRail() {
+export function TerminalRail({ interactive = true }: { interactive?: boolean }) {
   const { t } = useI18n()
-  const terminals = useStore($terminals)
+  const allTerminals = useStore($terminals)
+  const terminals = interactive ? allTerminals : allTerminals.filter(term => term.kind === 'agent')
   const activeId = useStore($activeTerminalId)
   const bindings = useStore($bindings)
   const toggleHint = bindings['view.showTerminal']?.[0]
@@ -66,21 +67,23 @@ export function TerminalRail() {
             toggleHint={toggleHint}
           />
         ))}
-        <li className="flex w-full justify-center">
-          <Tip
-            label={<TipHintLabel hint={newHint && formatCombo(newHint)} text={t.rightSidebar.terminalNew} />}
-            side="left"
-          >
-            <button
-              aria-label={t.rightSidebar.terminalNew}
-              className={cn(RAIL_ACTION, 'size-7 text-(--ui-text-quaternary)')}
-              onClick={() => createTerminal()}
-              type="button"
+        {interactive && (
+          <li className="flex w-full justify-center">
+            <Tip
+              label={<TipHintLabel hint={newHint && formatCombo(newHint)} text={t.rightSidebar.terminalNew} />}
+              side="left"
             >
-              <Codicon name="add" size="0.8125rem" />
-            </button>
-          </Tip>
-        </li>
+              <button
+                aria-label={t.rightSidebar.terminalNew}
+                className={cn(RAIL_ACTION, 'size-7 text-(--ui-text-quaternary)')}
+                onClick={() => createTerminal()}
+                type="button"
+              >
+                <Codicon name="add" size="0.8125rem" />
+              </button>
+            </Tip>
+          </li>
+        )}
       </ul>
 
       <div className="flex shrink-0 flex-col items-center pb-1.5">

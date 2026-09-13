@@ -413,8 +413,18 @@ const DirectiveImage: FC<{ id: string; label: string }> = ({ id, label }) => {
 
     // Remote gateway: the image lives on the gateway's disk, not ours — fetch
     // it over the authenticated API. Local: read it straight off this disk.
+    // `?.` on the object only guards a missing OBJECT — a partial bridge
+    // (e.g. the web build's shim, which omits readFileDataUrl on purpose)
+    // still throws "readFileDataUrl is not a function" when called bare.
+    // Missing capability is a known failure mode, so route it through the
+    // same .catch() as a real read error rather than resolving to undefined
+    // and leaving the placeholder pulsing forever.
     const load =
-      window.hermesDesktop && isRemoteGateway() ? gatewayMediaDataUrl(id) : window.hermesDesktop?.readFileDataUrl(id)
+      window.hermesDesktop && isRemoteGateway()
+        ? gatewayMediaDataUrl(id)
+        : window.hermesDesktop?.readFileDataUrl
+          ? window.hermesDesktop.readFileDataUrl(id)
+          : Promise.reject(new Error('readFileDataUrl is not available'))
 
     void Promise.resolve(load)
       .then(url => alive && url && setSrc(url))

@@ -1,6 +1,7 @@
 import { defineFieldCopy } from '@/app/settings/field-copy'
 
-import { defineLocale } from './define-locale'
+import { defineForkLocale } from './fork/merge'
+import { forkRu } from './fork/ru'
 
 // RU_PLURAL: (count, one, few, many) — русские формы сущ. падежа
 // RU_NOUN: (count, one, few, many) — формы род. множественного
@@ -23,7 +24,8 @@ const RU_NOUN = (count: number | string, one: string, few: string, many: string)
   return n === 1 && nn !== 11 ? one : n >= 2 && n <= 4 && (nn < 12 || nn > 14) ? few : many
 }
 
-export const ru = defineLocale({
+// >>> FORK ANCHOR: i18n-ru <<<
+export const ru = defineForkLocale(forkRu, {
   sessionImport: {
     title: 'Продолжить из другого приложения',
     subtitle: 'Перенесите разговор в Hermes и продолжите с того места, где остановились.',
@@ -175,6 +177,7 @@ export const ru = defineLocale({
       `Ещё ${count} ${count % 10 === 1 && count % 100 !== 11 ? 'уведомление' : count % 10 >= 2 && count % 10 <= 4 && (count % 100 < 12 || count % 100 > 14) ? 'уведомления' : 'уведомлений'}`,
     clearAll: 'Очистить всё',
     dismiss: 'Закрыть уведомление',
+    dismissAction: 'Закрыть',
     details: 'Подробности',
     copyDetail: 'Копировать подробность',
     copyDetailFailed: 'Не удалось скопировать подробность уведомления',
@@ -534,6 +537,7 @@ export const ru = defineLocale({
       testSent:
         'Тест отправлен. Если ничего не появилось, проверьте разрешения на уведомления в системе и режим «Не беспокоить».',
       testUnsupported: 'Эта система не поддерживает системные уведомления.',
+      testDenied: 'Уведомления для этого сайта заблокированы. Разрешите их в настройках сайта в браузере и повторите попытку.',
       completionSoundTitle: 'Звук завершения',
       completionSoundDesc: 'Воспроизводится, когда ход агента завершён. Выберите пресет и прослушайте здесь.',
       completionSoundPreview: 'Прослушать'
@@ -621,6 +625,9 @@ export const ru = defineLocale({
       reactionsDesc: 'Эмодзи-тапбеки в стиле iMessage — реагируйте на сообщения, и Hermes сможет реагировать на ваши.',
       composerPopoutTitle: 'Плавающий композер',
       composerPopoutDesc: 'Позволяет вытягивать композер из его док-зоны. Отключите, чтобы он был закреплён снизу.',
+      requireModifierToOpenLinksTitle: 'Открывать ссылки в чате по ⌘/Ctrl-клику',
+      requireModifierToOpenLinksDesc:
+        '⌘-клик на Mac или Ctrl-клик в других системах открывает пути и URL в чате, включая фрагменты кода. Обычный клик выделяет текст. Enter на сфокусированной ссылке по-прежнему открывает её.',
       embedsTitle: 'Встроенные превью',
       embedsDesc:
         'Богатые превью загружаются со сторонних сайтов (YouTube, X, …). «Спрашивать» показывает заглушку, пока вы не разрешите каждый источник; «Всегда» загружает их автоматически; «Выкл» оставляет обычные ссылки.',
@@ -1660,12 +1667,67 @@ export const ru = defineLocale({
     resetToMine: 'Вернуться к моей карте'
   },
   agents: {
+    openAsTab: 'Открыть как вкладку',
+    liveUnavailable: 'Статус выполнения недоступен',
+    inventoryUnavailable: 'Обновите этот шлюз, чтобы видеть его сессии и ботов.',
+    historyShifted: 'Сессии изменились во время чтения; обновляем.',
+    sessionsTab: 'Сессии',
+    treeTab: 'Дерево запусков',
+    overviewSubtitle: 'Активность сессий Hermes из зарегистрированных источников.',
+    searchSessions: 'Поиск сессий',
+    allSources: 'Все источники',
+    allProfiles: 'Все профили',
+    allProviders: 'Все провайдеры',
+    activityFilter: 'Активность',
+    recentActivity: 'Недавняя активность',
+    allSessions: 'Все сессии',
+    noRecentActivity: 'Нет недавней активности',
+    recentActivityHint:
+      'Работающие и ожидающие ввода сессии видны всегда. Остальные видны в течение 15 минут после активности. Для просмотра истории выберите «Все сессии».',
+    needsYou: 'Требуется ваш ответ',
+    working: 'Выполняется',
+    unread: 'Непрочитанное',
+    idle: 'Неактивен',
+    stale: 'Устаревшие данные',
+    noSessions: 'Подходящих сессий нет',
+    selectSession: 'Выберите разговор для предпросмотра.',
+    openConversation: 'Открыть разговор',
+    reply: 'Ответить',
+    stop: 'Остановить',
+    retry: 'Повторить',
+    connect: 'Подключить',
+    owner: 'Владелец',
+    source: 'Источник',
+    profile: 'Профиль',
+    provider: 'Провайдер',
+    model: 'Модель',
+    description: 'Описание',
+    unknown: 'Неизвестно',
+    loadMore: 'Загрузить ещё',
+    coverageNote:
+      'Текущий статус доступен только для подключённых процессов Hermes. Неактивен не означает, что работа завершена.',
+    promptHint: 'Откройте разговор, чтобы ответить на вопросы или запросы подтверждения.',
+    history: 'Охват истории',
+    ready: 'Готов',
+    onDemand: 'По запросу',
+    offline: 'Нет связи',
+    unsupported: 'Не поддерживается',
+    partial: 'Частично',
+    allQuiet: 'Всё спокойно',
+    allQuietHint:
+      'Работающие и ожидающие ввода сессии остаются здесь. Завершённые чаты исчезают через 15 минут; для истории выберите «Все сессии».',
+    needYouCount: count => `${count} ${count === 1 ? 'ждёт' : 'ждут'} вас`,
+    workingCount: count => `${count} в работе`,
+    closePreview: 'Закрыть предпросмотр',
+    replyPlaceholder: 'Ответить…',
+    noPreview: 'Предпросмотр недоступен.',
+    shown: (visible, total) => `${visible} / ${total}`,
     extendedTranscript: 'Подробный журнал',
     transcriptTruncated: 'Последние 16 КиБ',
     transcriptUnavailable: 'Текущий журнал недоступен',
 
     close: 'Закрыть агентов',
-    title: 'Дерево запусков',
+    title: 'Агенты',
     subtitle: 'Активные субагенты текущего хода в реальном времени.',
     emptyTitle: 'Нет активных субагентов',
     emptyDesc: 'Когда ход делегирует работу, дочерние агенты стримят свой прогресс сюда.',
@@ -3226,6 +3288,9 @@ export const ru = defineLocale({
       showTerminal: 'Показать терминал',
       hideTerminal: 'Скрыть терминал',
       gateway: 'Шлюз',
+      backend: 'Бэкенд',
+      messagingStopped: 'шлюз сообщений остановлен',
+      messagingDegraded: name => `${name} недоступен`,
       gatewayReady: 'готов',
       gatewayNeedsSetup: 'нужна настройка',
       gatewayChecking: 'проверка',
@@ -3405,6 +3470,12 @@ export const ru = defineLocale({
       address: 'Адрес',
       addressPlaceholder: 'Введите адрес',
       blankPageBody: 'Введите адрес выше, чтобы просматривать, или попросите Hermes открыть страницу.',
+      noGuestTitle: 'Страницы открываются во вкладке браузера',
+      noGuestBody:
+        'Эта сборка Hermes работает в браузере и не может встроить другой сайт в панель. Введите адрес выше, и Hermes откроет его в новой вкладке браузера.',
+      noGuestOpen: url => `Открыть ${url} во вкладке браузера`,
+      openBlocked:
+        'Браузер заблокировал новую вкладку. Разрешите всплывающие окна для этой страницы и попробуйте снова.',
       finishedRestarting: message => `Hermes завершил перезапуск сервера предпросмотра${message ? `: ${message}` : ''}`,
       failedRestarting: message => `Перезапуск сервера не удался: ${message}`,
       unknownError: 'неизвестная ошибка',
@@ -3519,6 +3590,7 @@ export const ru = defineLocale({
       refresh: 'Обновить',
       moreActions: 'Ещё действия',
       branchNewChat: 'Ветка в новый чат',
+      copyMessage: 'Копировать сообщение',
       react: 'Реакция',
       dismissError: 'Скрыть ошибку',
       filesChanged: count => `${count} ${RU_PLURAL(count, 'файл изменён', 'файла изменено', 'файлов изменено')}`,
@@ -3562,6 +3634,7 @@ export const ru = defineLocale({
       gatewayDisconnected: 'Шлюз Hermes не подключён',
       sendFailed: 'Не удалось отправить ответ на уточнение',
       loadingQuestion: 'Загрузка вопроса…',
+      restoring: 'Восстановление вопроса — скоро можно будет ответить',
       other: 'Другое (введите ответ)',
       placeholder: 'Введите ваш ответ…',
       skip: 'Пропустить',
@@ -3570,9 +3643,16 @@ export const ru = defineLocale({
       confirmAndContinueLabel: 'Подтвердить и продолжить',
       answeredBadge: 'Ответ дан',
       questionProgress: (answered, total) => `Ответ дан на ${answered} из ${total}`,
+      questionGroup: total => `Вопросов, ожидающих ответа: ${total}`,
       lateAnswer: (question, choice) => `Re: «${question}» — мой ответ: ${choice}`,
       lateAnswerTip: 'Составить этот ответ как продолжение',
-      lateAnswerHint: 'Этот промпт больше не ждёт. Выберите вариант, чтобы составить его как сообщение-продолжение.'
+      lateAnswerHint: 'Этот промпт больше не ждёт. Выберите вариант, чтобы составить его как сообщение-продолжение.',
+      addNote: 'Добавить заметку',
+      addNoteFor: label => `Добавить заметку к ${label}`,
+      note: 'Заметка',
+      noteFor: label => `Заметка к ${label}`,
+      notePlaceholder: 'Добавить необязательную заметку…',
+      selected: 'Выбрано'
     },
     mcpSetup: {
       installTitle: server => `Добавить MCP-сервер ${server}?`,

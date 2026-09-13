@@ -42,7 +42,7 @@ _LATE_CONTROL_TTL_SECS = 1800.0
 _LATE_CONTROL_MAX = 64
 # Host frames whose ``request_id`` resolves a pending/late control waiter.
 _CONTROL_REPLY_TYPES = frozenset({
-    "control.ack", "control.error", "respond.ack", "respond.error", "interrupt.ack",
+    "control.ack", "control.error", "respond.ack", "respond.error", "explain.ack", "explain.error", "interrupt.ack",
     "reload_mcp.ack", "shutdown.ack"})
 
 
@@ -255,6 +255,13 @@ class HostSupervisor:
         self.start()
         request_id = uuid.uuid4().hex
         frame = {"type": "respond", "sid": sid, "request_id": request_id, "params": dict(params)}
+        return self._await_reply(frame, request_id, timeout)
+
+    def explain(self, sid: str, params: dict[str, Any], *, timeout: float = 180.0) -> dict:
+        """Ask the host owning a live clarification for read-only help."""
+        self.start()
+        request_id = uuid.uuid4().hex
+        frame = {"type": "explain", "sid": sid, "request_id": request_id, "params": dict(params)}
         return self._await_reply(frame, request_id, timeout)
 
     def reload_mcp(self, sid: str, *, request_id: str | None = None) -> dict:

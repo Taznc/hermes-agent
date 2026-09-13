@@ -4,11 +4,13 @@ import { assistantTextPart, type ChatMessage, chatMessageText, textPart } from '
 import { normalizePersonalityValue } from '@/lib/chat-runtime'
 import { embeddedImageUrls, textWithoutEmbeddedImages } from '@/lib/embedded-images'
 import { parseErrorSurface } from '@/lib/error-surface'
+import { isProfileKnownMissing, noteProfileError } from '@/lib/profile-liveness'
 import { isMessagingSource, normalizeSessionSource } from '@/lib/session-source'
 import { reconcileApprovalModeForProfile } from '@/store/approval-mode'
 import { requestDesktopOnboardingForCredentialWarning } from '@/store/onboarding'
 import { $activeGatewayProfile, $profiles, normalizeProfileKey } from '@/store/profile'
 import { $projectTree } from '@/store/projects'
+import { forgetSessionPullRequest } from '@/store/pull-requests'
 import {
   $cronSessions,
   $currentCwd,
@@ -34,6 +36,7 @@ import {
   setYoloActive
 } from '@/store/session'
 import type { SessionProfileRoute } from '@/store/session-request-router'
+import { forgetConfirmedMissingSessionUnread } from '@/store/session-unread'
 
 // Re-exported for the many session-actions/tile call sites that already import
 // it from here; the canonical definition lives in @/store/session.
@@ -169,7 +172,16 @@ const COMPARED_FIELDS = [
   'durationS'
 ] as const
 
-const IGNORED_FIELDS = ['attachmentRefs', 'parts', 'rowId'] as const
+const IGNORED_FIELDS = [
+  'attachmentRefs',
+  'parts',
+  'rowId',
+  // Structured self-improvement detail records — stamped once when the
+  // review.summary system message is created (gateway-event.ts) and never
+  // mutated afterward for that message id, so there is nothing for a later
+  // reconcile pass to diff. Same rationale as rowId above.
+  'reviewActions'
+] as const
 
 // Compile-time check: every ChatMessagePart discriminant must be handled by
 // chatPartsEquivalent. If @assistant-ui adds a new part type, this fails tsc.
@@ -1483,11 +1495,75 @@ export async function resolveStoredSession(
     return cached
   }
 
+  // The full N-profile fan-out below is not cheap to repeat: every ambient
+  // gateway RPC that can't resolve its routing session's owner re-triggers it
+  // (wiring.tsx's shared requestGateway probes via resolveSessionProfile), and
+  // the 1.5s session.active_list backstop poll alone can fire it dozens of
+  // times a minute for one stuck id — a dead deep link, an orphaned Bot tile,
+  // a session deleted out from under a live route. With N profiles that is N
+  // GETs every ~1.5s, indefinitely, which is enough to starve Settings' own
+  // config/model-catalog fetches behind Chrome's per-origin connection cap
+  // (symptom: Settings never finishes loading while a stuck session is open).
+  // A short negative TTL plus in-flight de-dup caps the fan-out to roughly
+  // once per TTL window per id, not once per caller per tick — and it's a
+  // TTL, not a permanent blacklist like isProfileKnownMissing, because the
+  // session can legitimately appear moments later (still being created, a
+  // profile swap resolving).
+  if (isNegativelyCachedSessionProbe(storedSessionId)) {
+    return undefined
+  }
+
+  const inFlight = inFlightSessionProbes.get(storedSessionId)
+
+  if (inFlight) {
+    return inFlight
+  }
+
+  const probe = probeStoredSessionAcrossProfiles(storedSessionId).finally(() => {
+    inFlightSessionProbes.delete(storedSessionId)
+  })
+
+  inFlightSessionProbes.set(storedSessionId, probe)
+
+  return probe
+}
+
+// Bounded backstop for the cross-profile probe fan-out — see the call site's
+// comment in resolveStoredSession for why this exists. TTL-based (not a
+// permanent cache): a miss just means "not found on any profile RIGHT NOW".
+const SESSION_PROBE_NEGATIVE_TTL_MS = 15_000
+const negativeSessionProbes = new Map<string, number>()
+const inFlightSessionProbes = new Map<string, Promise<SessionInfo | undefined>>()
+
+function isNegativelyCachedSessionProbe(storedSessionId: string): boolean {
+  const missedAt = negativeSessionProbes.get(storedSessionId)
+
+  return missedAt !== undefined && Date.now() - missedAt < SESSION_PROBE_NEGATIVE_TTL_MS
+}
+
+/** Drop every recorded probe result and in-flight entry. Exported for tests —
+ *  this module-level state persists across test cases like isProfileKnownMissing. */
+export function __resetSessionProbeCache(): void {
+  negativeSessionProbes.clear()
+  inFlightSessionProbes.clear()
+}
+
+function isConfirmedSessionNotFound(error: unknown): boolean {
+  const message = error instanceof Error ? error.message : String(error ?? '')
+
+  // `getSession()` reports HTTP failures through Electron as `404: ...`; keep
+  // the resource check too, so a missing route on an older backend is never
+  // mistaken for proof that this particular session was deleted.
+  return /(?:^|:\s*)404(?:\s*:|\b)/.test(message) && /session not found/i.test(message)
+}
+
+async function probeStoredSessionAcrossProfiles(storedSessionId: string): Promise<SessionInfo | undefined> {
   // Direct by-id on the active profile — one row lookup, no list scan. Electron
   // routes an unscoped GET to the primary backend, which may not own the
   // active profile. A 404 there used to skip that profile in the probes below,
   // so the session was never found.
   const activeKey = normalizeProfileKey($activeGatewayProfile.get())
+  let everyProbeConfirmedMissing = true
 
   try {
     const session = await getSession(storedSessionId, activeKey)
@@ -1498,9 +1574,11 @@ export async function resolveStoredSession(
     session.profile ||= activeKey
 
     upsertResolvedSession(session, storedSessionId)
+    negativeSessionProbes.delete(storedSessionId)
 
     return session
-  } catch {
+  } catch (error) {
+    everyProbeConfirmedMissing &&= isConfirmedSessionNotFound(error)
     // Not on the active profile — fall through to the cross-profile probe.
   }
 
@@ -1508,10 +1586,14 @@ export async function resolveStoredSession(
   // lookup each) rather than pulling every profile's recent sessions. The
   // first hit carries its owning `profile`, which routes the resume to the
   // right backend. The active profile was already tried above.
+  //
+  // Profiles the spawn guard has already declared gone are skipped: that
+  // rejection is permanent, so re-probing them each lookup only reproduces the
+  // same error (the repeating `?profile=<dead>` bursts in the dev console).
   const otherProfiles = $profiles
     .get()
     .map(profile => normalizeProfileKey(profile.name))
-    .filter(key => key !== activeKey)
+    .filter(key => key !== activeKey && !isProfileKnownMissing(key))
 
   for (const profile of otherProfiles) {
     try {
@@ -1524,11 +1606,27 @@ export async function resolveStoredSession(
       session.profile = profile
 
       upsertResolvedSession(session, storedSessionId)
+      negativeSessionProbes.delete(storedSessionId)
 
       return session
-    } catch {
-      // Not on this profile; try the next.
+    } catch (error) {
+      everyProbeConfirmedMissing &&= isConfirmedSessionNotFound(error)
+      // A plain 404 just means the id isn't on this profile — try the next.
+      // "no longer exists" / "is being deleted" is the spawn guard telling us
+      // the profile itself is gone; remember it so later lookups skip it.
+      noteProfileError(profile, error)
     }
+  }
+
+  negativeSessionProbes.set(storedSessionId, Date.now())
+
+  if (everyProbeConfirmedMissing) {
+    // This is the only point where a missing id is proven rather than merely
+    // absent from the current profile or page. Retire client-only caches now;
+    // doing it earlier could erase state for a session still being created on a
+    // different profile.
+    forgetSessionPullRequest(storedSessionId)
+    forgetConfirmedMissingSessionUnread(storedSessionId)
   }
 
   return undefined
@@ -1660,7 +1758,17 @@ export function applyRuntimeInfo(
   reportBackendContract(info.desktop_contract)
 
   if (info.approval_mode !== undefined) {
-    reconcileApprovalModeForProfile($activeGatewayProfile.get(), info.approval_mode)
+    // Approval mode is PROFILE-scoped and the gateway already resolved it
+    // against this session's own profile, stamping that profile as
+    // `profile_name` in the same payload. Credit that name, and only from the
+    // foreground: a background tile runs in its own profile, so attributing
+    // its mode to the ambient active profile rewrote one profile's statusbar
+    // with another's setting — the cross-profile bug the gateway fix removed,
+    // reintroduced one layer up. Fall back to the active profile only for a
+    // legacy backend that sends no `profile_name`.
+    if (foreground) {
+      reconcileApprovalModeForProfile(info.profile_name || $activeGatewayProfile.get(), info.approval_mode)
+    }
   }
 
   requestDesktopOnboardingForCredentialWarning(info.credential_warning)

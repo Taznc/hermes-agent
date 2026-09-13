@@ -172,9 +172,11 @@
 }
 .hermes-kanban-dot-triage   { background: #b47dd6; }  /* lilac — fresh/unspecified */
 .hermes-kanban-dot-todo     { background: var(--color-muted-foreground); }
+.hermes-kanban-dot-scheduled { background: #a78bfa; }  /* violet — waiting on time */
 .hermes-kanban-dot-ready    { background: #d4b348; }  /* amber */
 .hermes-kanban-dot-running  { background: #3fb97d; }  /* green */
 .hermes-kanban-dot-blocked  { background: var(--color-destructive, #d14a4a); }
+.hermes-kanban-dot-on-hold  { background: #94a3b8; }  /* slate — human-shelved pause */
 .hermes-kanban-dot-review   { background: #48b0c4; }  /* cyan — awaiting review */
 .hermes-kanban-dot-done     { background: #4a8cd1; }  /* blue */
 .hermes-kanban-dot-archived { background: var(--color-border); }
@@ -1502,6 +1504,37 @@
   color: #ff8b6b;
   border: 1px solid rgba(255, 107, 61, 0.3);
 }
+/* ---- Host quota circuit --------------------------------------------- */
+.hermes-kanban-quota-circuits {
+  display: flex;
+  flex-direction: column;
+  gap: 0.45rem;
+  padding: 0.7rem 0.85rem;
+  border: 1px solid rgba(255, 158, 59, 0.45);
+  border-radius: var(--radius);
+  background: rgba(255, 158, 59, 0.09);
+  color: var(--color-foreground);
+  font-size: 0.75rem;
+}
+.hermes-kanban-quota-title { font-weight: 700; }
+.hermes-kanban-quota-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.75rem;
+}
+.hermes-kanban-quota-detail { line-height: 1.45; }
+.hermes-kanban-quota-clear {
+  flex: 0 0 auto;
+  padding: 0.25rem 0.6rem;
+  border: 1px solid rgba(255, 158, 59, 0.5);
+  border-radius: 0.3rem;
+  background: rgba(255, 158, 59, 0.15);
+  cursor: pointer;
+}
+.hermes-kanban-quota-clear:hover { background: rgba(255, 158, 59, 0.25); }
+.hermes-kanban-quota-message { color: var(--color-muted-foreground); }
+
 /* ---- Partial failure highlight --------------------------------------- */
 .hermes-kanban-card--failed :where(.hermes-kanban-card-content) {
   box-shadow: 0 0 0 2px var(--color-destructive, #d14a4a) inset,
@@ -1590,4 +1623,78 @@
 
 .hermes-kanban-trash-label {
   font-weight: 500;
+}
+
+/* ---------------------------------------------------------------------- */
+/* Task detail CTA — the loud, top-of-drawer banner that answers "why is  */
+/* this stuck and what do I do about it" for blocked/review/needs-input   */
+/* tasks. Louder than a diagnostic card: full border + tinted fill, not   */
+/* just a left rule, so it reads as the ONE thing asking for action.      */
+/* ---------------------------------------------------------------------- */
+
+.hermes-kanban-cta {
+  display: flex;
+  flex-direction: column;
+  gap: 0.5rem;
+  padding: 0.65rem 0.75rem;
+  border-radius: 0.5rem;
+  border: 1px solid;
+}
+
+.hermes-kanban-cta-head {
+  display: flex;
+  align-items: center;
+  gap: 0.4rem;
+}
+
+.hermes-kanban-cta-icon { font-size: 0.9rem; line-height: 1; }
+
+.hermes-kanban-cta-title {
+  font-size: 0.85rem;
+  font-weight: 700;
+}
+
+.hermes-kanban-cta-body {
+  font-size: 0.8rem;
+  line-height: 1.45;
+  color: var(--color-foreground);
+}
+
+.hermes-kanban-cta-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.4rem;
+}
+
+.hermes-kanban-cta--blocked {
+  border-color: rgba(255, 107, 61, 0.45);
+  background: rgba(255, 107, 61, 0.09);
+}
+.hermes-kanban-cta--blocked .hermes-kanban-cta-icon,
+.hermes-kanban-cta--blocked .hermes-kanban-cta-title {
+  color: var(--hermes-diag-error, #ff6b3d);
+}
+
+.hermes-kanban-cta--transient {
+  border-color: rgba(255, 158, 59, 0.45);
+  background: rgba(255, 158, 59, 0.09);
+}
+.hermes-kanban-cta--transient .hermes-kanban-cta-icon,
+.hermes-kanban-cta--transient .hermes-kanban-cta-title {
+  color: var(--hermes-diag-warning, #ff9e3b);
+}
+
+.hermes-kanban-cta--review {
+  border-color: rgba(251, 191, 36, 0.45);
+  background: rgba(251, 191, 36, 0.09);
+}
+.hermes-kanban-cta--review .hermes-kanban-cta-icon,
+.hermes-kanban-cta--review .hermes-kanban-cta-title {
+  color: #d69e00;
+}
+
+/* De-emphasise the meta table relative to the CTA — it's supporting detail,
+   not the thing the user needs to act on. */
+.hermes-kanban-drawer-meta {
+  opacity: 0.85;
 }

@@ -3,6 +3,7 @@ import { atom } from 'nanostores'
 
 import type { HermesConnection } from '@/global'
 import { HermesGateway, setApiRequestConnection } from '@/hermes'
+import { isMissingProfileError as isMissingProfileErrorShared, markProfileMissing } from '@/lib/profile-liveness'
 import { reconnectBackoffDelayMs } from '@/lib/reconnect-backoff'
 import { RECONNECT_ATTEMPT_TIMEOUT_MS, withTimeout } from '@/lib/with-timeout'
 import { markNativeNotifyBaseline } from '@/store/notify-baseline'
@@ -319,6 +320,15 @@ function isPrimaryRegistryRoute(connectionId: null | string, profile: string): b
     Boolean(g.primaryConnectionId) &&
     id === g.primaryConnectionId
   )
+}
+
+/** Read only an already-attached exact owner socket; never resolve or dial a route. */
+export function isGatewayOpenForAgent(connectionId: string, profile: string): boolean {
+  const gateway = isPrimaryRegistryRoute(connectionId, profile)
+    ? g.primaryGateway
+    : (g.secondaries.get(registryBackendScopeKey(connectionId, profile))?.gateway ?? null)
+
+  return isOpen(gateway)
 }
 
 /** True when `connectionId` is the window's already-attached source AND that
@@ -697,6 +707,13 @@ async function reconnectSecondary(entry: Secondary): Promise<void> {
     // infinite 15s-cap retry loop.
     if ((entry.connectionId && isMissingConnectionError(error)) || isMissingProfileError(error)) {
       entry.reconnecting = false
+
+      // Share the verdict: a profile the guard rejected here is the same dead
+      // profile the cross-profile session probe would otherwise keep probing.
+      if (isMissingProfileError(error)) {
+        markProfileMissing(entry.profile)
+      }
+
       disposeSecondary(entry)
 
       if (g.secondaries.get(entry.scope) === entry) {
@@ -730,10 +747,12 @@ function isMissingConnectionError(error: unknown): boolean {
 // the profile's directory is gone or its DELETE is still in flight. For a
 // renderer socket that condition is permanent: the backend it reconnects to
 // can never come back, and every retry hammers the guard (#88769).
+//
+// The predicate itself lives in lib/profile-liveness so the cross-profile
+// session probe classifies these the same way; re-exported here for the
+// existing call sites in this module.
 function isMissingProfileError(error: unknown): boolean {
-  const message = error instanceof Error ? error.message : String(error ?? '')
-
-  return message.includes('no longer exists') || message.includes('is being deleted')
+  return isMissingProfileErrorShared(error)
 }
 
 function createSecondary(profile: string, connectionId: null | string = null): Secondary {

@@ -24,7 +24,7 @@ import { useI18n } from '@/i18n'
 import { triggerHaptic } from '@/lib/haptics'
 import { AlertCircle, CheckCircle2, Loader2 } from '@/lib/icons'
 import { brandFor, brandGlyphStyle } from '@/lib/mcp-brands'
-import { completeMcpDesktopOAuth, McpOAuthCancelled } from '@/lib/mcp-dashboard-oauth'
+import { completeMcpDesktopOAuth, McpOAuthCancelled, openMcpOAuthPopup } from '@/lib/mcp-dashboard-oauth'
 import { directoryEntry } from '@/lib/mcp-directory'
 import { prettyName } from '@/lib/text'
 import { cn } from '@/lib/utils'
@@ -251,6 +251,26 @@ function McpSetupPending({ args }: ToolCallMessagePartProps) {
     const oauthScope = capabilityScoped()
     setWorking(true)
 
+    // Preserve the click's transient activation across whatever awaits this
+    // flow needs before it can know whether OAuth is actually required
+    // (catalog fetch, addMcpServer for the directory fallback). Chromium's
+    // transient activation from the click expires across an intervening
+    // await, so window.open() must happen HERE — synchronously, before any
+    // await in this callback — not deep inside completeMcpDesktopOAuth after
+    // those awaits already ran. Web build only: completeMcpDesktopOAuth's
+    // Electron path never reads popupWindow (it drives openExternal
+    // instead), so opening one there would leak an unused about:blank
+    // window. Closed below if the flow turns out not to need it (enable
+    // action, or an install resolved via catalog credentials rather than
+    // OAuth).
+    const popupWindow = action === 'enable' || !window.hermesDesktop?.isWebBuild ? undefined : openMcpOAuthPopup()
+
+    const closeUnusedPopup = () => {
+      if (popupWindow && !popupWindow.closed) {
+        popupWindow.close()
+      }
+    }
+
     // Poll-boundary abort for the background-install loop; the OAuth flows
     // carry their own cancel via completeMcpDesktopOAuth's `cancelled`.
     const throwIfCancelled = <T,>(value: T): T => {
@@ -274,7 +294,8 @@ function McpSetupPending({ args }: ToolCallMessagePartProps) {
         const flow = await completeMcpDesktopOAuth({
           serverName: server,
           profile: oauthScope,
-          cancelled: () => cancelRef.current
+          cancelled: () => cancelRef.current,
+          popupWindow
         })
 
         triggerHaptic('submit')
@@ -300,6 +321,7 @@ function McpSetupPending({ args }: ToolCallMessagePartProps) {
         const known = directoryEntry(server)
 
         if (!known) {
+          closeUnusedPopup()
           await respond({ detail: copy.notInCatalog(server), server, status: 'error' })
 
           return
@@ -318,7 +340,8 @@ function McpSetupPending({ args }: ToolCallMessagePartProps) {
           flow = await completeMcpDesktopOAuth({
             serverName: known.name,
             profile: oauthScope,
-            cancelled: () => cancelRef.current
+            cancelled: () => cancelRef.current,
+            popupWindow
           })
         } catch (error) {
           await removeMcpServer(known.name, oauthScope).catch(() => {
@@ -332,6 +355,10 @@ function McpSetupPending({ args }: ToolCallMessagePartProps) {
 
         return
       }
+
+      // Resolved via the catalog: credential-based, never OAuth — the popup
+      // pre-opened above (if any) goes unused.
+      closeUnusedPopup()
 
       const required = resolved.required_env.filter(env => env.required)
 
@@ -378,6 +405,13 @@ function McpSetupPending({ args }: ToolCallMessagePartProps) {
         status: 'error'
       })
     } finally {
+      // Belt-and-suspenders: completeMcpDesktopOAuth always closes the popup
+      // it was handed (success, error, or cancel), and every early-return
+      // path above calls closeUnusedPopup() explicitly — this only catches
+      // an exception thrown BETWEEN opening the popup and one of those
+      // points (e.g. getMcpCatalog() rejecting), where it would otherwise
+      // leak an open about:blank tab.
+      closeUnusedPopup()
       setWorking(false)
     }
   }, [action, copy, entry, envDraft, respond, server])

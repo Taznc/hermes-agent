@@ -45,6 +45,7 @@ vi.mock('@/i18n', () => ({
         },
         row: {
           archive: 'Archive',
+          unarchive: 'Unarchive',
           branchFrom: 'Branch from here',
           copyId: 'Copy ID',
           copyIdFailed: 'Failed to copy ID',
@@ -140,6 +141,48 @@ describe('SessionActionsMenu', () => {
     expect(await screen.findByRole('menu')).toBeTruthy()
     expect(screen.getByRole('menuitem', { name: /rename/i })).toBeTruthy()
     expect(screen.getByRole('menuitem', { name: /archive/i })).toBeTruthy()
+  })
+
+  it('shows Unarchive in an archived row dropdown and calls the inverse action', async () => {
+    const onUnarchive = vi.fn()
+    render(
+      <SessionActionsMenu
+        align="end"
+        archived
+        onArchive={onUnarchive}
+        sessionId="s1"
+        sideOffset={6}
+        title="My session"
+      >
+        <button aria-label="Session actions" type="button">
+          ⋮
+        </button>
+      </SessionActionsMenu>
+    )
+
+    const trigger = screen.getByRole('button', { name: 'Session actions' })
+    fireEvent.pointerDown(trigger, { button: 0, pointerType: 'mouse' })
+    fireEvent.pointerUp(trigger, { button: 0, pointerType: 'mouse' })
+    fireEvent.click(trigger)
+
+    expect(screen.queryByRole('menuitem', { name: /^Archive$/i })).toBeNull()
+    fireEvent.click(await screen.findByRole('menuitem', { name: /^Unarchive$/i }))
+    expect(onUnarchive).toHaveBeenCalledTimes(1)
+  })
+
+  it('shows Unarchive in an archived row context menu', async () => {
+    const onUnarchive = vi.fn()
+    render(
+      <SessionContextMenu archived onArchive={onUnarchive} sessionId="s1" title="My session">
+        <button aria-label="Session row" type="button">
+          Row
+        </button>
+      </SessionContextMenu>
+    )
+
+    fireEvent.contextMenu(screen.getByRole('button', { name: 'Session row' }))
+    fireEvent.click(await screen.findByRole('menuitem', { name: /^Unarchive$/i }))
+    expect(onUnarchive).toHaveBeenCalledTimes(1)
   })
 
   it('opens the rename dialog focused on its input, not the row trigger', async () => {

@@ -27,7 +27,14 @@ from hermes_time import now as _hermes_now
 EXECUTIONS_FILE: Optional[Path] = None
 
 INCIDENT_STATES = ("detected", "alerted", "closed")
+# Order matters: the first matching entry wins. ``interruption`` is FIRST because a shutdown
+# interruption is a fact about the process, not about the work — its text ("Interrupted by
+# shutdown...", "...owner exited before a durable terminal state") would otherwise be swallowed by
+# the generic ``agent``/``timeout`` keyword arms and reported as an ordinary job failure.
 _FAILURE_TYPE_ORDER = (
+    ("interruption", ("interrupted by shutdown", "interrupted by gateway shutdown",
+                      "owner exited before a durable terminal state",
+                      "interrupted before terminal completion")),
     ("rate_limit", (r"\b429\b", "rate limit", "usage limit", "quota")),
     ("timeout", ("timeout", "timed out")),
     ("auth", (r"\b401\b", "unauthorized", "authentication", "auth")),

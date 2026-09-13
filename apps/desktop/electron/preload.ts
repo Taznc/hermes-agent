@@ -1,18 +1,19 @@
 import { contextBridge, ipcRenderer, webFrame, webUtils } from 'electron'
 
-// Which translucency the OS can back. Asked synchronously because the renderer
-// needs it before its first paint, and answered by main because deciding it
-// needs `os.release()` — a sandboxed preload may only require electron, events,
-// timers and url, so importing node:os here throws before contextBridge runs
-// and takes the ENTIRE bridge down with it (window.hermesDesktop undefined =>
-// "Desktop IPC bridge is unavailable"). No reply means no glass, which degrades
-// to an ordinary opaque window rather than a page thinned over nothing.
-const translucencySupport = ipcRenderer.sendSync('hermes:translucency:support')
-const hudWindowing = ipcRenderer.sendSync('hermes:hud:windowing')
+import { createForkPreloadApi, parseForkWindowCaps } from './fork/preload-bridge'
+
+// >>> FORK ANCHOR: window-caps-argv <<<
+const windowCaps = parseForkWindowCaps()
+
+const translucencySupport = { glass: windowCaps.glass === true, translucency: windowCaps.translucency === true }
+const hudWindowing = windowCaps.hud
+
 const hudNativeDrag = hudWindowing?.nativeDrag === true
 const launchFlags = ipcRenderer.sendSync('hermes:launch-flags')
 
 contextBridge.exposeInMainWorld('hermesDesktop', {
+  // >>> FORK ANCHOR: desktop-preload-bridge <<<
+  ...createForkPreloadApi(ipcRenderer),
   glassSupported: translucencySupport?.glass === true,
   translucencySupported: translucencySupport?.translucency === true,
   // Launch-flag fact: the app was started with --local, so the renderer may
@@ -32,6 +33,7 @@ contextBridge.exposeInMainWorld('hermesDesktop', {
   getGatewayWsUrlFor: payload => ipcRenderer.invoke('hermes:gateway:ws-url-for', payload),
   // Union agent roster across every registered connection.
   getAgentRoster: () => ipcRenderer.invoke('hermes:agents:roster'),
+  getAgentOverview: (options?: { force?: boolean }) => ipcRenderer.invoke('hermes:agents:overview', options),
   openSessionWindow: (sessionId, opts) => ipcRenderer.invoke('hermes:window:openSession', sessionId, opts),
   openSessionInTerminal: (sessionId, opts) => ipcRenderer.invoke('hermes:window:openInTerminal', sessionId, opts),
   openWindow: () => ipcRenderer.invoke('hermes:window:openInstance'),
@@ -357,12 +359,13 @@ contextBridge.exposeInMainWorld('hermesDesktop', {
     }
   },
   terminal: {
+    ack: (id, bytes) => ipcRenderer.send('hermes:terminal:ack', id, bytes),
     attach: id => ipcRenderer.invoke('hermes:terminal:attach', id),
     cwd: id => ipcRenderer.invoke('hermes:terminal:cwd', id),
     dispose: id => ipcRenderer.invoke('hermes:terminal:dispose', id),
-    resize: (id, size) => ipcRenderer.invoke('hermes:terminal:resize', id, size),
+    resize: (id, size) => ipcRenderer.send('hermes:terminal:resize', id, size),
     start: options => ipcRenderer.invoke('hermes:terminal:start', options),
-    write: (id, data) => ipcRenderer.invoke('hermes:terminal:write', id, data),
+    write: (id, data) => ipcRenderer.send('hermes:terminal:write', id, data),
     onData: (id, callback) => {
       const channel = `hermes:terminal:${id}:data`
       const listener = (_event, payload) => callback(payload)
@@ -396,12 +399,7 @@ contextBridge.exposeInMainWorld('hermesDesktop', {
 
     return () => ipcRenderer.removeListener('hermes:open-folder-requested', listener)
   },
-  onOpenUpdatesRequested: callback => {
-    const listener = () => callback()
-    ipcRenderer.on('hermes:open-updates', listener)
 
-    return () => ipcRenderer.removeListener('hermes:open-updates', listener)
-  },
   onDeepLink: callback => {
     const listener = (_event, payload) => callback(payload)
     ipcRenderer.on('hermes:deep-link', listener)

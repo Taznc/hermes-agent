@@ -30,7 +30,7 @@ def _kbn():
 # "status" covers dashboard drag-drop and `_set_status_direct()`.
 # ``review_requested`` wakes the origin like a block but is not one;
 # the task is not archived so later review cycles keep notifying.
-TERMINAL_KINDS = ("completed", "blocked", "gave_up", "crashed", "timed_out", "status", "archived", "unblocked", "block_loop_detected", "review_requested", "changes_requested")
+TERMINAL_KINDS = ("completed", "blocked", "gave_up", "crashed", "timed_out", "status", "archived", "unblocked", "block_loop_detected", "review_requested", "changes_requested", "review_no_verdict")
 # Kinds that hand a decision back to the origin, which must take a turn.
 # status/archived/unblocked are bookkeeping.
 _WAKE_KINDS = ("completed", "gave_up", "crashed", "timed_out", "blocked", "review_requested", "changes_requested", "block_loop_detected")
@@ -357,6 +357,13 @@ _EVENT_FORMATTERS: dict[str, Callable[[Any, "_KanbanNotification"], tuple]] = {
     "status": lambda ev, n: (f"🔄 {n.head} → {_payload(ev, 'status') or ''}", None, None),
     "review_requested": _fmt_review_requested,
     "changes_requested": _fmt_changes_requested,
+    # Neutral audit outcome: the reviewer exited cleanly without approving, requesting changes, or
+    # escalating. Not a failure — but the card is now sticky-blocked and needs an explicit
+    # kanban_unblock before another reviewer pass can be dispatched, so surface it like a block.
+    "review_no_verdict": lambda ev, n: (
+        f"👀 {n.head} review ended with no verdict — parked; run `kanban_unblock` to requeue for review",
+        None, None,
+    ),
     # Re-blocked for the same cause past the limit and routed to `triage` for a
     # human. It emits no blocked/status event, so ping loudly here.
     "block_loop_detected": lambda ev, n: (

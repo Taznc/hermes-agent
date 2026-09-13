@@ -60,11 +60,12 @@ describe('restorePendingClarifyFromSnapshot', () => {
     )
   })
 
-  it('carries server-locked answers into the replayed batch card', () => {
+  it('carries validated server-locked answers and notes into the replayed batch card', () => {
     restorePendingClarifyFromSnapshot(
       {
         pending_clarify: {
           answers: { q0: 'Yes', junk: 42 },
+          notes: { q0: 'Previously accepted note', junk: 42 },
           request_id: 'rid2',
           questions: [{ qid: 'q0', question: 'Proceed?' }]
         }
@@ -74,7 +75,11 @@ describe('restorePendingClarifyFromSnapshot', () => {
     )
 
     expect(setClarifyRequestMock).toHaveBeenCalledWith(
-      expect.objectContaining({ lockedAnswers: { q0: 'Yes' }, requestId: 'rid2' })
+      expect.objectContaining({
+        lockedAnswers: { q0: 'Yes' },
+        lockedNotes: { q0: 'Previously accepted note' },
+        requestId: 'rid2'
+      })
     )
   })
 

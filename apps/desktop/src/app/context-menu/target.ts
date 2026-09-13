@@ -16,6 +16,8 @@ export interface ContextMenuDomTarget {
   linkUrl: string
   /** Source URL of the clicked image, when the click landed on one. */
   imageUrl: string
+  /** Text of the enclosing chat message, when the click landed in one. */
+  messageText: string
   /** True when the click landed on an `<img>` (imageUrl may still be empty
    *  for a broken image; Copy image works through coordinates either way). */
   onImage: boolean
@@ -39,11 +41,18 @@ function editableFrom(element: Element | null): HTMLElement | null {
   return host instanceof HTMLElement && host.isContentEditable ? host : null
 }
 
+/** The chat message the click landed in, if any. Assistant replies expose their
+ *  rendered body; user prompts their bubble root. Both are `data-slot` hooks the
+ *  transcript already stamps, so this needs no new markup. */
+const MESSAGE_BODY_SELECTOR =
+  '[data-slot="aui_assistant-message-content"], [data-slot="aui_user-message-root"], [data-slot="aui_system-message-root"]'
+
 export function resolveDomTarget(element: Element | null): ContextMenuDomTarget {
   const anchor = element?.closest('a[href]')
   const dialogContent = element?.closest('[data-slot="dialog-content"]')
   const image = element?.closest('img')
   const linkUrl = anchor?.getAttribute('href')?.trim() ?? ''
+  const messageBody = element?.closest(MESSAGE_BODY_SELECTOR)
 
   return {
     dialogPortalContainer: dialogContent instanceof HTMLElement ? dialogContent : null,
@@ -51,6 +60,11 @@ export function resolveDomTarget(element: Element | null): ContextMenuDomTarget 
     // A placeholder anchor is not a link the menu can act on.
     linkUrl: linkUrl === '#' ? '' : linkUrl,
     imageUrl: image instanceof HTMLImageElement ? image.currentSrc || image.src : '',
+    // `innerText` respects rendered line breaks (so a copied reply keeps its
+    // paragraphs); `textContent` is the fallback for environments that don't
+    // implement it, where it is the same string minus the layout awareness.
+    messageText:
+      messageBody instanceof HTMLElement ? (messageBody.innerText ?? messageBody.textContent ?? '').trim() : '',
     onImage: Boolean(image),
     selectionText: window.getSelection()?.toString().trim() ?? ''
   }
@@ -59,4 +73,28 @@ export function resolveDomTarget(element: Element | null): ContextMenuDomTarget 
 /** True when `url` is something the in-app browser can render. */
 export function isWebUrl(url: string): boolean {
   return /^https?:\/\//i.test(url)
+}
+
+/**
+ * Whether Electron's main process will emit its own `context-menu` event for
+ * this gesture — the sole reason it is ever safe to leave a `contextmenu`
+ * event unprevented.
+ *
+ * Chromium reports spellcheck facts and image coordinates to the HOST
+ * process only when the renderer's `contextmenu` event is NOT prevented, and
+ * in Electron the app never calls `Menu.popup` on that report — so an
+ * unprevented gesture there costs nothing and preserves the forward (see
+ * `electron/main.ts`'s `context-menu` handler). In a plain browser tab there
+ * is no host process: "unprevented" IS Chromium's own native context menu,
+ * so leaving it unprevented paints Chromium's menu on top of this app's.
+ *
+ * The Electron preload bridge exposes `contextMenuEdit` (and its
+ * `contextMenuSpellcheck`/`onContextMenuSpellcheck` siblings); the web
+ * build's `web-bridge-shim.ts` deliberately omits all three (there is no
+ * host-side edit command to route to — the browser handles editing
+ * natively). Their presence is therefore the natural sentinel for "is the
+ * Electron main-process context-menu bridge actually here".
+ */
+export function nativeContextMenuHandled(): boolean {
+  return typeof window.hermesDesktop?.contextMenuEdit === 'function'
 }

@@ -66,6 +66,7 @@ import { useSessionStatusPresence } from './hooks/use-status-presence'
 import { ActionBadges } from './micro-actions'
 import { chipTypedPathOnSpace, pathifyRefs } from './path-refs'
 import { QueuePanel } from './queue-panel'
+import { ReconnectStatusBanner } from './reconnect-banner'
 import {
   beginComposerComposition,
   composerPlainText,
@@ -97,6 +98,7 @@ export function ChatBar({
   queueSessionKey,
   sessionId,
   state,
+  storedSessionId,
   onCancel,
   onAddUrl,
   onAttachDroppedItems,
@@ -106,6 +108,7 @@ export function ChatBar({
   onPickFiles,
   onPickFolders,
   onPickImages,
+  onReload,
   onRemoveAttachment,
   onSteer,
   onSubmit: onSubmitProp,
@@ -243,6 +246,8 @@ export function ChatBar({
     sessionIdRef,
     setComposerText,
     stashAt,
+    // >>> FORK ANCHOR: composer-model-recommendation <<<
+    subscribeDraft,
     syncDraftFromEditor
   } = useComposerDraft({ activeQueueSessionKey, focusKey, inputDisabled, queueEditRef, sessionId })
 
@@ -1345,6 +1350,7 @@ export function ChatBar({
                   {/* Contribution seams: banners above, a row below, inline
                     additions beside the "+" menu and before the controls.
                     All four render nothing until something contributes. */}
+                  <ReconnectStatusBanner onReload={onReload} storedSessionId={storedSessionId} />
                   <ContribSlot area={COMPOSER_AREAS.top} />
                   <VoiceActivity state={voiceActivityState} />
                   <VoicePlaybackActivity />
@@ -1391,6 +1397,21 @@ export function ChatBar({
                       {controls}
                     </div>
                   </div>
+                  {/* >>> FORK ANCHOR: composer-model-recommendation <<<
+                      Flat row under the input — inside the composer surface, so
+                      it is not a card sitting on a card, and it wraps with the
+                      surface at narrow widths. The draft is read through a
+                      getter off the live DOM (the same source Enter uses), never
+                      a captured render value, so the recommendation always
+                      evaluates exactly what is on screen. Nothing renders until
+                      the owner supplies the seam. */}
+                  {state.model.recommendRender?.({
+                    attachments,
+                    disabled,
+                    getDraft: () =>
+                      editorRef.current ? composerPlainText(editorRef.current) : draftRef.current,
+                    subscribeDraft
+                  })}
                   <ContribSlot area={COMPOSER_AREAS.bottom} />
                 </div>
               </div>

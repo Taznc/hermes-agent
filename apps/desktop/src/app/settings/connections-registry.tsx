@@ -332,6 +332,10 @@ export function ConnectionsRegistrySection() {
       return
     }
 
+    if (!window.hermesDesktop?.oauthLoginConnectionConfig) {
+      return
+    }
+
     setSigningIn(true)
 
     try {

@@ -37,7 +37,10 @@ function loginShellExecutable(env: any = process.env, platform = process.platfor
   }
 
   // macOS Catalina+ defaults to zsh; most Linux distros default to bash.
-  return platform === 'darwin' ? '/bin/zsh' : '/bin/bash'
+  // Every caller of this function (captureLoginShellPath) already returns
+  // early on platform === 'win32' before reaching here — this POSIX-only
+  // shell resolution is unreachable on Windows, not a missing case.
+  return platform === 'darwin' ? '/bin/zsh' : '/bin/bash' // windows-footgun: ok — callers gate win32 before calling this
 }
 
 // Extract $PATH from between the sentinel markers. Uses the LAST start marker

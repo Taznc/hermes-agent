@@ -214,3 +214,81 @@ def test_exception_never_raises_on_weird_input():
 
     # Must not raise, whatever it returns.
     build_error_surface_from_exception(Hostile("x"))
+
+
+# ── Phase 2.12: reset_at / fallback_available wire fields ────────────────
+
+
+def test_result_reset_at_populated_for_rate_limit():
+    surface = build_error_surface_from_result(
+        _failed_result("rate_limit", reset_at=1234567890.5)
+    )
+    assert surface["code"] == "rate_limit"
+    assert surface["reset_at"] == 1234567890.5
+
+
+def test_result_reset_at_populated_for_upstream_rate_limit():
+    surface = build_error_surface_from_result(
+        _failed_result("upstream_rate_limit", reset_at=42.0)
+    )
+    assert surface["reset_at"] == 42.0
+
+
+def test_result_reset_at_omitted_when_absent():
+    surface = build_error_surface_from_result(_failed_result("rate_limit"))
+    assert "reset_at" not in surface
+
+
+def test_result_reset_at_never_leaks_onto_unrelated_reason():
+    """A stray reset_at key on a non-rate-limit result must not surface --
+    _surface() re-gates on the code, independent of what the result dict
+    happens to carry."""
+    surface = build_error_surface_from_result(
+        _failed_result("server_error", reset_at=999.0)
+    )
+    assert "reset_at" not in surface
+
+
+def test_result_fallback_available_true():
+    surface = build_error_surface_from_result(
+        _failed_result("rate_limit", fallback_available=True)
+    )
+    assert surface["fallback_available"] is True
+
+
+def test_result_fallback_available_false():
+    surface = build_error_surface_from_result(
+        _failed_result("rate_limit", fallback_available=False)
+    )
+    assert surface["fallback_available"] is False
+
+
+def test_result_fallback_available_omitted_when_absent():
+    surface = build_error_surface_from_result(_failed_result("rate_limit"))
+    assert "fallback_available" not in surface
+
+
+def test_exception_fallback_available_passthrough():
+    class FakeAPIError(Exception):
+        status_code = 429
+
+    surface = build_error_surface_from_exception(
+        FakeAPIError("rate limited"),
+        provider="openrouter",
+        fallback_available=True,
+    )
+    assert surface["fallback_available"] is True
+
+    surface = build_error_surface_from_exception(
+        FakeAPIError("rate limited"),
+        provider="openrouter",
+        fallback_available=False,
+    )
+    assert surface["fallback_available"] is False
+
+    # Unset (None) stays unset on the caller's side -- omitted from the wire
+    # descriptor rather than guessed.
+    surface = build_error_surface_from_exception(
+        FakeAPIError("rate limited"), provider="openrouter"
+    )
+    assert "fallback_available" not in surface

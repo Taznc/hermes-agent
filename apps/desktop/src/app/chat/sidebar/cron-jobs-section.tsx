@@ -14,7 +14,8 @@ import { useI18n } from '@/i18n'
 import { fmtDayTime, relativeTime } from '@/lib/time'
 import { cn } from '@/lib/utils'
 import { confirm } from '@/store/confirm'
-import { updateCronJobs } from '@/store/cron'
+import { $cronJobs, updateCronJobs } from '@/store/cron'
+import { $sidebarListLimit } from '@/store/layout'
 import { $changeEventsAvailable, $cronChangeTick } from '@/store/live-sync'
 import { notify, notifyError } from '@/store/notifications'
 import { $selectedStoredSessionId } from '@/store/session'
@@ -38,9 +39,11 @@ const PEEK_RUN_LIMIT = 5
 const PEEK_POLL_INTERVAL_MS = 8000
 const PEEK_BACKSTOP_INTERVAL_MS = 60_000
 
-// Keep the section compact: show a few jobs up front, reveal more in larger
-// steps on demand (mirrors the messaging sections in the sidebar).
-const INITIAL_VISIBLE_JOBS = 3
+// Keep the section compact when a numeric list-length is picked: show a few
+// jobs up front, reveal more in larger steps on demand (mirrors the messaging
+// sections in the sidebar). Under the default 'all' setting there is no
+// initial cap at all — see $sidebarListLimit.
+const INITIAL_VISIBLE_JOBS_DEFAULT = 3
 const LOAD_MORE_STEP = 10
 
 function nextRunMs(job: CronJob): null | number {
@@ -67,7 +70,6 @@ function formatRunTime(seconds?: null | number): string {
 }
 
 interface SidebarCronJobsSectionProps {
-  jobs: CronJob[]
   label: string
   max?: number
   // Open a run session's chat (1 click to output).
@@ -78,25 +80,51 @@ interface SidebarCronJobsSectionProps {
   onTriggerJob: (jobId: string) => Promise<void>
   onToggle: () => void
   open: boolean
+  /** False in the grouped-by-workspace (Projects) view, which has no room for
+   *  this section. Kept as a prop (not an internal store read) so the
+   *  parent's own `$sidebarWorktreeGroupingActive` subscription is the single
+   *  place that gate lives — this component still owns its own `$cronJobs`
+   *  subscription and empty-list gating below. */
+  visible?: boolean
 }
 
 export function SidebarCronJobsSection({
-  jobs,
   label,
   max = 50,
   onManageJob,
   onOpenRun,
   onTriggerJob,
   onToggle,
-  open
+  open,
+  visible: sectionVisible = true
 }: SidebarCronJobsSectionProps) {
+  // Owns its own subscription: the parent used to pass `jobs` down from a
+  // useStore($cronJobs) at the sidebar root, which meant a cron tick
+  // re-rendered the ENTIRE sidebar tree. Subscribing here confines that
+  // churn to this section.
+  const jobs = useStore($cronJobs)
   const [nowMs, setNowMs] = useState(() => Date.now())
   // Single-open inline peek so the section stays scannable.
   const [peekJobId, setPeekJobId] = useState<null | string>(null)
-  // Rows revealed so far; starts compact, grows in steps via "load more".
-  const [visibleCount, setVisibleCount] = useState(INITIAL_VISIBLE_JOBS)
+  const listLimit = useStore($sidebarListLimit)
+
+  // Rows revealed so far; starts compact under a numeric list-length, grows in
+  // steps via "load more". Under 'all' this is moot — see `cap` below, which
+  // ignores it entirely and shows everything (up to `max`).
+  const [visibleCount, setVisibleCount] = useState(
+    typeof listLimit === 'number' ? listLimit : INITIAL_VISIBLE_JOBS_DEFAULT
+  )
+
   const [triggeringJobIds, setTriggeringJobIds] = useState<ReadonlySet<string>>(() => new Set())
   const triggerControllerRef = useRef<CronTriggerController | null>(null)
+
+  // Switching the list-length setting (the filter menu) resets this section's
+  // own reveal-count back to that setting's floor, the same way the flat
+  // recents list resets $sessionsLimit on the same event.
+  useEffect(() => {
+    setVisibleCount(typeof listLimit === 'number' ? listLimit : INITIAL_VISIBLE_JOBS_DEFAULT)
+  }, [listLimit])
+
 
   // eslint-disable-next-line no-restricted-syntax -- controller mount identity, not an atom mirror
   useEffect(() => {
@@ -172,9 +200,16 @@ export function SidebarCronJobsSection({
     })
   }, [jobs])
 
-  const cap = Math.min(visibleCount, max)
+  const cap = listLimit === 'all' ? Math.min(sorted.length, max) : Math.min(visibleCount, max)
   const shown = sorted.slice(0, cap)
-  const hiddenCount = Math.min(sorted.length, max) - shown.length
+  const hiddenCount = listLimit === 'all' ? 0 : Math.min(sorted.length, max) - shown.length
+
+  // The section owns its own visibility now that it owns its own $cronJobs
+  // subscription — the parent used to gate rendering on `cronJobs.length > 0`
+  // before ever mounting this component.
+  if (!sectionVisible || jobs.length === 0) {
+    return null
+  }
 
   return (
     <SidebarGroup className="shrink-0 p-0 pb-1">

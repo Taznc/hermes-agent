@@ -438,6 +438,7 @@ def _resolve_child_runtime(
     parent_agent, delegation_cfg: dict, parent_api_key: Any, *, model: Optional[str], override_provider: Optional[str],
     override_base_url: Optional[str], override_api_key: Optional[str], override_api_mode: Optional[str],
     override_acp_command: Optional[str], override_acp_args: Optional[List[str]],
+    override_reasoning_config: Optional[Dict[str, Any]] = None,
     routing_cfg: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     """Child credentials, transport and routing (config override > parent inherit) as ``AIAgent`` kwargs. Rules that
@@ -491,20 +492,26 @@ def _resolve_child_runtime(
         # Forced ACP transport requires provider copilot-acp for run_agent to init the client.
         effective_provider, effective_api_mode = "copilot-acp", "chat_completions"
 
-    # Reasoning: delegation.reasoning_effort > parent. Keep the raw value — a
-    # YAML ``false`` must disable thinking, not coerce to "" and inherit.
+    # Reasoning, in precedence order: per-spawn argument > delegation.reasoning_effort > parent. The
+    # per-spawn value arrives already parsed AND validated (an unknown level failed the whole spawn
+    # upstream), so it wins outright — a caller that named a depth must not be quietly overridden by
+    # a global config pin. Keep the raw config value — a YAML ``false`` must disable thinking, not
+    # coerce to "" and inherit.
     child_reasoning = getattr(parent_agent, "reasoning_config", None)
-    try:
-        delegation_effort = delegation_cfg.get("reasoning_effort")
-        if delegation_effort or delegation_effort is False:
-            from hermes_constants import parse_reasoning_effort
-            parsed = parse_reasoning_effort(delegation_effort)
-            if parsed is None:
-                logger.warning("Unknown delegation.reasoning_effort '%s', inheriting parent level", delegation_effort)
-            else:
-                child_reasoning = parsed
-    except Exception as exc:
-        logger.debug("Could not load delegation reasoning_effort: %s", exc)
+    if override_reasoning_config is not None:
+        child_reasoning = override_reasoning_config
+    else:
+        try:
+            delegation_effort = delegation_cfg.get("reasoning_effort")
+            if delegation_effort or delegation_effort is False:
+                from hermes_constants import parse_reasoning_effort
+                parsed = parse_reasoning_effort(delegation_effort)
+                if parsed is None:
+                    logger.warning("Unknown delegation.reasoning_effort '%s', inheriting parent level", delegation_effort)
+                else:
+                    child_reasoning = parsed
+        except Exception as exc:
+            logger.debug("Could not load delegation reasoning_effort: %s", exc)
 
     kwargs: Dict[str, Any] = {
         "base_url": effective_base_url, "api_key": override_api_key or parent_api_key, "model": effective_model,

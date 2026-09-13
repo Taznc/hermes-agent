@@ -1,5 +1,5 @@
 import { cleanup, render, screen } from '@testing-library/react'
-import { afterEach, describe, expect, it } from 'vitest'
+import { afterEach, describe, expect, it, vi } from 'vitest'
 
 import { isMarkdownDocumentPath, mediaMarkdownHref } from '@/lib/media'
 
@@ -62,5 +62,31 @@ describe('markdown documents delivered via MEDIA', () => {
     const buttons = await screen.findAllByRole('button')
     expect(buttons.length).toBe(2)
     expect(screen.getByText('report.pdf')).toBeTruthy()
+  })
+
+  // Regression for the <div>-in-<p> hydration error: a MEDIA: link inside a
+  // paragraph is a child of MarkdownParagraph's real <p> (MarkdownLink is the
+  // registered `a` renderer), so the PreviewAttachment card it resolves to
+  // must not emit a block-level <div> there — the browser's parser would
+  // close the <p> early, desyncing React's tree from the DOM (React logs "In
+  // HTML, <div> cannot be a descendant of <p>. This will cause a hydration
+  // error.").
+  it('does not nest a <div> inside <p> for a MEDIA: link paragraph', async () => {
+    const errorSpy = vi.spyOn(console, 'error').mockImplementation(() => undefined)
+    const href = mediaMarkdownHref('/home/user/out/report.md')
+
+    const { container } = render(
+      <MarkdownTextContent isRunning={false} text={`Here is the file: [report.md](${href})`} />
+    )
+
+    await screen.findByText('report.md')
+
+    expect(container.querySelector('p div')).toBeNull()
+
+    for (const call of errorSpy.mock.calls) {
+      expect(String(call[0])).not.toMatch(/cannot be a descendant of/i)
+    }
+
+    errorSpy.mockRestore()
   })
 })

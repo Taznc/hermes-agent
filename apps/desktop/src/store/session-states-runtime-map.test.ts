@@ -114,7 +114,13 @@ describe('knownOwnerForSession / requestForOwnedSession', () => {
   })
 
   it('fails closed with an explicit owner-resolution error instead of the ambient socket', async () => {
-    // Somewhere to misroute to: two profiles exist.
+    // Somewhere to misroute to: two profiles exist on a real Electron pool
+    // (the bridge always exposes getConnectionConfig; only the browser-served
+    // web bridge omits it, and that shim has no per-profile backend pool at
+    // all — see session-owner-resolution.ts).
+    ;(window as unknown as { hermesDesktop?: unknown }).hermesDesktop = {
+      getConnectionConfig: vi.fn(async () => ({}))
+    }
     $profiles.set([{ name: 'default' }, { name: 'omar' }] as never)
     const ambient = vi.fn(async () => ({ ok: true }))
 
@@ -177,7 +183,10 @@ describe('knownOwnerForSession / requestForOwnedSession', () => {
     // an approval.request whose runtime id has no tile / hint / row binding.
     // hasRegistryTopology() is true here, so the ambient escape hatch is
     // closed by design — the exact owner must come from the event itself.
-    ;(window as unknown as { hermesDesktop: unknown }).hermesDesktop = { connections: { list: async () => null } }
+    ;(window as unknown as { hermesDesktop: unknown }).hermesDesktop = {
+      connections: { list: async () => null },
+      getConnectionConfig: vi.fn(async () => ({}))
+    }
     $connectionsRegistry.set({
       activeConnectionId: 'local',
       connections: [{ id: 'local', kind: 'local', label: 'Local' }]

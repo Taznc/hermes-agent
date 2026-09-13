@@ -308,7 +308,7 @@ def _profile_show(args):
     if not profile_exists(name):
         _die(f"Error: Profile '{name}' does not exist.")
     profile_dir = get_profile_dir(name)
-    model, provider = _read_config_model(profile_dir)
+    model, provider, _effort = _read_config_model(profile_dir)
     gw = _check_gateway_running(profile_dir) or _served_by_running_multiplexer(name)
     dist_name, dist_version, dist_source = _read_distribution_meta(profile_dir)
     alias_name = find_alias_for_profile(name)

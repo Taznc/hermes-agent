@@ -65,7 +65,8 @@ def _validate_batch_tasks(task_list: List[Dict[str, Any]]) -> Optional[str]:
     return None
 
 def _normalize_task_list(
-    goal, context, tasks, output_schema, top_role: str, max_children: int
+    goal, context, tasks, output_schema, top_role: str, max_children: int, *,
+    model: Optional[str] = None, reasoning_effort: Optional[str] = None,
 ) -> tuple[Optional[List[Dict[str, Any]]], Optional[str]]:
     """``(task_list, None)`` from ``tasks=[...]`` or the legacy single ``goal``, else ``(None, error)``."""
     recovered_tasks, tasks_error = _recover_tasks_from_json_string(tasks)
@@ -89,6 +90,10 @@ def _normalize_task_list(
         task_list = [{"goal": goal, "context": context, "role": top_role}]
         if output_schema is not None:
             task_list[0]["output_schema"] = output_schema
+        if model is not None:
+            task_list[0]["model"] = model
+        if reasoning_effort is not None:
+            task_list[0]["reasoning_effort"] = reasoning_effort
     else:
         return None, (
             "No tasks provided. Pass tasks=[{goal: '...', context: '...'}, "

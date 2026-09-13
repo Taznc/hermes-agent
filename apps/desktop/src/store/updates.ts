@@ -101,6 +101,9 @@ function isUpdateToastSnoozed(): boolean {
 // v5: requires raised WebSocket frame size for large one-shot file.attach.
 // v6: requires key-addressed plugins.manage rows (keyless rows render
 //     read-only in Settings → Plugins).
+// v7: requires file.attach_open/_chunk/_commit/_abort (chunked non-image
+//     attachment upload — file.attach's whole-file base64 remains for older
+//     backends, so a v6 backend still works, just without streaming).
 const REQUIRED_BACKEND_CONTRACT = 6
 const SKEW_TOAST_ID = 'backend-contract-skew'
 // The contract check runs on every session.resume (applyRuntimeInfo), so
@@ -142,8 +145,8 @@ function isInstallMethodToastSnoozed(): boolean {
 /**
  * Guard against a desktop GUI talking to a backend that predates its contract
  * (e.g. a bb/gui-built app pointed at a `main` checkout). Rather than failing
- * cryptically downstream, surface a warning with a one-click align that runs
- * the normal update flow (which self-heals to the right branch).
+ * cryptically downstream, surface a compatibility warning. Desktop must not
+ * offer an upstream-update action from this normal session lifecycle path.
  *
  * Runs on every session open; closing the toast snoozes it for a cooldown so it
  * doesn't nag on every thread switch.
@@ -163,13 +166,6 @@ export function reportBackendContract(contract: number | undefined): void {
   }
 
   notify({
-    action: {
-      label: translateNow('notifications.updateHermes'),
-      onClick: () => {
-        snoozeSkewToast()
-        void applyBackendUpdate()
-      }
-    },
     durationMs: 0,
     id: SKEW_TOAST_ID,
     kind: 'warning',
@@ -1002,7 +998,27 @@ export function startUpdatePoller(): void {
   }
 
   pollerStarted = true
-  void checkUpdates()
+  void checkUpdates().then(status => {
+    // Client update checks are disabled (desktop.auto_update_checks_enabled:
+    // false, or HERMES_DESKTOP_DISABLE_UPDATE_CHECKS) — the first check above
+    // already reported that and did no network I/O. Don't arm the 30-minute
+    // timer or the focus listener either; they'd just call checkUpdates()
+    // again every time, hitting the same no-op gate for no reason. The
+    // backend-update poller below is unaffected — it's a separate check for
+    // the Python backend's own git checkout, not the desktop client updater.
+    if (status?.reason === 'update-checks-disabled') {
+      return
+    }
+
+    window.addEventListener('focus', onFocus)
+    backgroundTimer = setInterval(
+      () => {
+        void checkUpdates()
+        void checkBackendUpdates()
+      },
+      30 * 60 * 1000
+    )
+  })
   void checkBackendUpdates()
   void refreshDesktopVersion()
   bridge.onProgress(ingestProgress)
@@ -1021,15 +1037,6 @@ export function startUpdatePoller(): void {
       void checkBackendUpdates()
     }
   })
-
-  window.addEventListener('focus', onFocus)
-  backgroundTimer = setInterval(
-    () => {
-      void checkUpdates()
-      void checkBackendUpdates()
-    },
-    30 * 60 * 1000
-  )
 }
 
 export function stopUpdatePoller(): void {

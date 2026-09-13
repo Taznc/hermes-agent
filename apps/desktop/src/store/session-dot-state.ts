@@ -23,16 +23,17 @@
  * surface). The write side of the persisted flag lives in session-unread.ts.
  */
 
-import { computed } from 'nanostores'
+import { atom, computed } from 'nanostores'
 
-import { stableArray, stableRecord } from '@/lib/stable-array'
+import { stableArray, stableRecord, stableSet } from '@/lib/stable-array'
 
 import { $backgroundRunningSessionIds } from './composer-status'
+import { $sidebarStatusFilter } from './layout'
 import { $messagingSessions, $sessions, $unreadFinishedSessionIds, lineageAliases } from './session'
 import {
   $attentionSessionIds,
   $draftSessionIds,
-  $sessionStates,
+  $sessionStatusById,
   $stalledSessionIds,
   $workingSessionIds
 } from './session-states'
@@ -47,9 +48,12 @@ import { $subagentsBySession, activeSubagentCount } from './subagents'
 // bridge and fresh-chat fallback as $backgroundRunningSessionIds:
 // $subagentsBySession is keyed by runtime id, surfaces key on stored ids, and
 // lineageAliases covers whichever tip of the conversation a surface holds.
+// Reads `$sessionStatusById` (not `$sessionStates`) for the same reason the
+// other status computeds do: it only republishes on a real status edge, not
+// on every streamed message delta.
 let delegatingIds: readonly string[] = []
 export const $delegatingSessionIds = computed(
-  [$subagentsBySession, $sessionStates, $sessions],
+  [$subagentsBySession, $sessionStatusById, $sessions],
   (bySession, states, sessions) => {
     const ids = new Set<string>()
 
@@ -67,7 +71,39 @@ export const $delegatingSessionIds = computed(
   }
 )
 
-export type SessionDotState = 'background' | 'draft' | 'idle' | 'needs-input' | 'stalled' | 'unread' | 'working'
+export type SessionDotState = 'background' | 'draft' | 'idle' | 'needs-input' | 'rate-limited' | 'stalled' | 'unread' | 'working'
+
+// Sessions with a pending, unresolved rate-limit terminal failure (Phase
+// 2.12). Keyed by STORED session id (not aliased — a rate limit belongs to
+// the exact turn that failed, and lineage rotation on that same session is
+// covered by re-claiming under the new tip in the computed below).
+// `resetAt` mirrors the failing turn's ErrorSurface.resetAt when known.
+// Cleared explicitly on retry/resume/dismiss (never inferred from busy —
+// the whole point is a session that is NOT busy but still needs attention).
+export const $rateLimitedSessionIds = atom<Readonly<Record<string, { resetAt?: number }>>>({})
+
+export function markSessionRateLimited(storedSessionId: null | string | undefined, resetAt?: number): void {
+  if (!storedSessionId) {
+    return
+  }
+
+  $rateLimitedSessionIds.set({ ...$rateLimitedSessionIds.get(), [storedSessionId]: { resetAt } })
+}
+
+export function clearSessionRateLimited(storedSessionId: null | string | undefined): void {
+  if (!storedSessionId) {
+    return
+  }
+
+  const current = $rateLimitedSessionIds.get()
+
+  if (!(storedSessionId in current)) {
+    return
+  }
+
+  const { [storedSessionId]: _dropped, ...rest } = current
+  $rateLimitedSessionIds.set(rest)
+}
 
 /** The sidebar row's arc. A quiet turn is still authoritatively running, so
  *  `stalled` keeps it; a blocking prompt drops it, because the amber dot is the
@@ -80,18 +116,22 @@ export const showsRunningArc = (state: SessionDotState): boolean => state === 's
 export const hasLiveTurn = (state: SessionDotState): boolean => showsRunningArc(state) || state === 'needs-input'
 
 /** The buckets the sidebar's status filter and ordering work in. `stalled` and
- *  `background` fold into the state a user would name them. */
-export type SessionStatusBucket = 'draft' | 'idle' | 'needs-input' | 'unread' | 'working'
+ *  `background` fold into the state a user would name them. `rate-limited` is
+ *  its own bucket — distinct from `needs-input` (no answer is required, just
+ *  a wait or a manual recovery choice) and from `working` (the turn is not
+ *  running). */
+export type SessionStatusBucket = 'draft' | 'idle' | 'needs-input' | 'rate-limited' | 'unread' | 'working'
 
 export const sessionStatusBucket = (state: SessionDotState = 'idle'): SessionStatusBucket =>
   state === 'stalled' || state === 'background' ? 'working' : state
 
 const STATUS_RANK: Record<SessionStatusBucket, number> = {
   'needs-input': 0,
-  working: 1,
-  unread: 2,
-  draft: 3,
-  idle: 4
+  'rate-limited': 1,
+  working: 2,
+  unread: 3,
+  draft: 4,
+  idle: 5
 }
 
 /** Loudest first — what ordering by status sorts on. */
@@ -109,9 +149,10 @@ export const $sessionDotStateById = computed(
     $unreadFinishedSessionIds,
     $draftSessionIds,
     $sessions,
-    $unreadWriteGuard
+    $unreadWriteGuard,
+    $rateLimitedSessionIds
   ],
-  (attention, working, stalled, background, delegating, unread, draft, sessions, unreadWriteGuard) => {
+  (attention, working, stalled, background, delegating, unread, draft, sessions, unreadWriteGuard, rateLimited) => {
     const next: Record<string, SessionDotState> = {}
 
     const claim = (ids: readonly string[], state: SessionDotState) => {
@@ -179,6 +220,21 @@ export const $sessionDotStateById = computed(
 
     claim(attention, 'needs-input')
 
+    // Rate-limited (Phase 2.12): a terminal failure the user must act on or
+    // wait out. Claimed AFTER working/stalled so it forcibly clears any
+    // leftover busy/spinner claim for the exact session whose turn just
+    // failed — busy=false is already true by the time this fires (the turn
+    // ended), but this also guards a straggling stale claim. Below
+    // needs-input: a blocking clarify prompt is a rarer, more urgent state
+    // and the two are mutually exclusive per session in practice.
+    for (const id of Object.keys(rateLimited)) {
+      for (const alias of lineageAliases(id, sessions)) {
+        if (next[alias] !== 'needs-input') {
+          next[alias] = 'rate-limited'
+        }
+      }
+    }
+
     return (dotStates = stableRecord(dotStates, next))
   }
 )
@@ -211,3 +267,60 @@ export const $unreadSessionCount = computed(
   [$sessionDotStateById, $sessions, $messagingSessions],
   (byId, sessions, messaging) => unreadSessionCount(byId, sessions, messaging)
 )
+
+/** Sessions the sidebar's status filter excludes, as a membership set.
+ *
+ * Isolated from the general filter predicate (project/profile/PR) because
+ * this is the one leg fed by $sessionDotStateById, which republishes on
+ * every dot-state edge — several times per turn while driving parallel
+ * agents. Wrapped in `stableSet` (same discipline as `$workingSessionIds`)
+ * so the membership set keeps its reference when the status filter is off
+ * or when a dot-state edge doesn't change which sessions it excludes. A
+ * caller (e.g. the sidebar's project-tree exclusion predicate) that reads
+ * this instead of `$sessionDotStateById` directly stops recomputing its own
+ * expensive downstream memo chain on ticks that change no filter outcome. */
+let statusExcludedIds: ReadonlySet<string> = new Set()
+
+export const $sidebarStatusExcludedIds = computed(
+  [$sessionDotStateById, $sidebarStatusFilter, $sessions],
+  (byId, statusFilter, sessions) => {
+    if (!statusFilter.length) {
+      return (statusExcludedIds = stableSet(statusExcludedIds, new Set()))
+    }
+
+    const next = new Set<string>()
+
+    for (const session of sessions) {
+      if (!statusFilter.includes(sessionStatusBucket(byId[session.id]))) {
+        next.add(session.id)
+      }
+    }
+
+    return (statusExcludedIds = stableSet(statusExcludedIds, next))
+  }
+)
+
+/** Session ids with a live turn (working/stalled/needs-input) — the same
+ *  predicate {@link hasLiveTurn} exposes per-row, projected as a stable id
+ *  list so a consumer that needs MEMBERSHIP (not the per-row state itself)
+ *  can subscribe without taking every dot-state edge.
+ *
+ *  `SidebarSessionsSection` is the concrete case: its WORKING/DONE status
+ *  grouping used to read the raw `$sessionDotStateById` map directly, which
+ *  re-rendered the section (recents, pinned, or a messaging group — whichever
+ *  instance) on every dot-state tick regardless of whether `grouping` was
+ *  even `'status'`. This list only changes reference when a session's
+ *  hasLiveTurn bucket actually flips. */
+let liveTurnIds: readonly string[] = []
+
+export const $liveTurnSessionIds = computed($sessionDotStateById, byId => {
+  const ids: string[] = []
+
+  for (const [id, state] of Object.entries(byId)) {
+    if (hasLiveTurn(state)) {
+      ids.push(id)
+    }
+  }
+
+  return (liveTurnIds = stableArray(liveTurnIds, ids))
+})

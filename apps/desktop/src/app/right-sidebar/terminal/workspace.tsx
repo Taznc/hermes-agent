@@ -3,10 +3,11 @@ import { useEffect } from 'react'
 
 import { $backgroundStatusBySession } from '@/store/composer-status'
 
-import { seedAgentTerminalCommand, syncAgentTerminalSnapshot } from './agent-terminal-stream'
+import { markAgentTerminalExited, seedAgentTerminalCommand, syncAgentTerminalSnapshot } from './agent-terminal-stream'
 import { setActiveTerminalId } from './buffer'
+import { interactiveTerminalAvailable } from './capability'
 import { AgentTerminalInstance, TerminalInstance } from './instance'
-import { $activeTerminalId, $terminals, ensureAgentTerminal } from './terminals'
+import { $activeTerminalId, $terminals, ensureAgentTerminal, getTerminalBuffer } from './terminals'
 
 interface TerminalWorkspaceProps {
   onAddSelectionToChat: (text: string, label?: string) => void
@@ -17,7 +18,8 @@ interface TerminalWorkspaceProps {
  *  by PersistentTerminal (latched so shells survive hiding); the tab rail and
  *  new-terminal control live in the pane DOM — see TerminalPaneChrome. */
 export function TerminalWorkspace({ onAddSelectionToChat }: TerminalWorkspaceProps) {
-  const terminals = useStore($terminals)
+  const allTerminals = useStore($terminals)
+  const terminals = interactiveTerminalAvailable() ? allTerminals : allTerminals.filter(term => term.kind === 'agent')
   const activeId = useStore($activeTerminalId)
   const background = useStore($backgroundStatusBySession)
 
@@ -40,6 +42,15 @@ export function TerminalWorkspace({ onAddSelectionToChat }: TerminalWorkspacePro
         ensureAgentTerminal(item.id, item.title)
         seedAgentTerminalCommand(item.id, item.title)
         syncAgentTerminalSnapshot(item.id, item.output ?? '')
+
+        // Free the four agent-stream maps once the process is known-exited AND
+        // its mirror tab is later closed (releaseAgentTerminal, called from
+        // closeTerminal). Marking here is cheap bookkeeping only — a running
+        // process must keep buffering even with no tab open, so nothing is
+        // freed until both conditions hold.
+        if (item.state !== 'running') {
+          markAgentTerminalExited(item.id)
+        }
       }
     }
   }, [background])
@@ -56,8 +67,8 @@ export function TerminalWorkspace({ onAddSelectionToChat }: TerminalWorkspacePro
             id={term.id}
             key={term.id}
             onAddSelectionToChat={onAddSelectionToChat}
-            restoreCwd={term.restoreCwd}
-            reviveBuffer={term.reviveBuffer}
+            restoreCwd={getTerminalBuffer(term.id)?.restoreCwd}
+            reviveBuffer={getTerminalBuffer(term.id)?.reviveBuffer}
           />
         )
       )}

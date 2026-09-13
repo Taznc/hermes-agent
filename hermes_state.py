@@ -56,6 +56,7 @@ from hermes_state_repair import _claim_repair_attempt, preflight_db_writability,
 from hermes_state_titles import SessionTitlesMixin
 from hermes_state_usage import SessionUsageMixin
 from hermes_state_maintenance import SessionMaintenanceMixin
+from hermes_state_archive import SessionArchiveMixin
 from hermes_state_gateway import SessionGatewayMixin
 from hermes_state_compression import SessionCompressionMixin
 from hermes_state_search import SessionSearchMixin
@@ -89,6 +90,14 @@ def resolved_max_resume_messages() -> int:
 
 def resolved_max_export_messages() -> int:
     return _configured_transcript_limit("max_export_messages")
+
+
+# >>> FORK ANCHOR: rate-limit-default-recovery <<<
+def resolved_rate_limit_default_recovery() -> str:
+    """Config-resolved ``sessions.rate_limit_default_recovery`` (fork Phase 2.12;
+    see hermes_fork.state_limits)."""
+    from hermes_fork.state_limits import resolved_rate_limit_default_recovery as _impl
+    return _impl()
 
 
 class SessionResumeTooLargeError(ValueError):
@@ -327,8 +336,8 @@ def _foreign_state_db_holders(db_path: Path) -> List[Tuple[int, str]]:
 class SessionDB(
     SessionSessionsMixin, SessionFtsSetupMixin, SessionSearchMixin, SessionSchemaMixin,
     SessionPortabilityMixin, SessionTelegramTopicsMixin, SessionCompressionMixin,
-    SessionGatewayMixin, SessionMaintenanceMixin, SessionUsageMixin, SessionTitlesMixin,
-    SessionMessagesMixin,
+    SessionGatewayMixin, SessionMaintenanceMixin, SessionArchiveMixin, SessionUsageMixin,
+    SessionTitlesMixin, SessionMessagesMixin,
 ):
     """SQLite-backed session storage with FTS5 search; many reader threads, one writer (WAL)."""
 

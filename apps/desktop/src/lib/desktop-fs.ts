@@ -45,6 +45,13 @@ export function isDesktopFsRemoteMode() {
   return $connection.get()?.mode === 'remote'
 }
 
+/** Native file verbs require both a local backend and Electron's file-manager bridge.
+ * The web desktop can preview and copy gateway paths, but cannot reveal a path or
+ * hand it to the OS default application on the user's machine. */
+export function canUseNativeFileActions() {
+  return !isDesktopFsRemoteMode() && typeof window.hermesDesktop?.revealPath === 'function'
+}
+
 // Active profile for FS/git REST calls. Without it the Electron api bridge
 // hits the primary (local) backend even when the user switched to a remote profile.
 export function desktopFsProfile(): string | undefined {
@@ -188,7 +195,27 @@ export async function trashDesktopPath(path: string): Promise<void> {
 }
 
 export async function copyTextToClipboard(text: string): Promise<void> {
-  await bridge().writeClipboard(text)
+  // Ladder, not a hard dependency: the Electron bridge is preferred (its main
+  // process write survives focus loss, which navigator.clipboard does not),
+  // but it is absent in the browser build and in older preloads. Falling back
+  // to the DOM API keeps "Copy path" working instead of throwing
+  // "writeClipboard is not a function". Mirrors writeClipboardText in
+  // components/ui/copy-button.tsx — the two must stay in agreement.
+  const ipc = bridge().writeClipboard
+
+  if (ipc) {
+    await ipc(text)
+
+    return
+  }
+
+  if (navigator.clipboard?.writeText) {
+    await navigator.clipboard.writeText(text)
+
+    return
+  }
+
+  throw new Error('Clipboard is not available')
 }
 
 // Working-tree-vs-HEAD diff for one file. Empty when unchanged / not a repo.

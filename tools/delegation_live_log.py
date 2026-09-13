@@ -80,12 +80,25 @@ def _dump_json(path: Path, payload: Dict[str, Any]) -> None:
     path.write_text(json.dumps(payload, indent=2, ensure_ascii=False), encoding="utf-8")
 
 
+def _format_route(route: Optional[Dict[str, Any]]) -> str:
+    """One header line for a per-task route, or "" when unknown. Marks inherited routes explicitly
+    so the reader can tell "routed here on purpose" from "took the parent's model"."""
+    if not isinstance(route, dict) or not (model := str(route.get("model") or "").strip()):
+        return ""
+    provider = str(route.get("provider") or "").strip()
+    where = f"{provider}/{model}" if provider else model
+    label = {"spawn": " (per-spawn override)", "config": " (delegation.model pin)",
+             "inherit": " (inherited from parent)"}.get(str(route.get("source") or "").strip(), "")
+    return f"model: {_redact(where)}{label}"
+
+
 class LiveTranscriptWriter:
     """Append-only event log for ONE subagent task. Best-effort: the first write
     failure flips ``_ok`` off and later calls become debug-logged no-ops."""
 
     def __init__(self, delegation_id: str, task_index: int, goal: str,
-                 context: Optional[str] = None, root: Optional[Path] = None):
+                 context: Optional[str] = None, root: Optional[Path] = None,
+                 route: Optional[Dict[str, Any]] = None):
         self.delegation_id = delegation_id
         self.task_index = task_index
         self._ok = False
@@ -102,7 +115,8 @@ class LiveTranscriptWriter:
                 "=== Hermes subagent live transcript ===\n"
                 f"delegation: {delegation_id}   task: {task_index}\n"
                 f"goal: {_redact(goal_line)}\n"  # header bypasses event(), so redact here too
-                f"started: {time.strftime(_TIME_FMT)}\n"
+                + (f"{route_line}\n" if (route_line := _format_route(route)) else "")
+                + f"started: {time.strftime(_TIME_FMT)}\n"
                 "(append-only; streams while the subagent runs — tail -f me)\n"
                 + "=" * 40 + "\n", encoding="utf-8")
             self.path, self._ok = path, True
@@ -227,23 +241,30 @@ def wrap_progress_callback(inner_cb, writer: LiveTranscriptWriter):
 def create_live_transcripts(
     task_list: List[Dict[str, Any]], context: Optional[str] = None,
     delegation_id: Optional[str] = None, model: Optional[str] = None,
-    provider: Optional[str] = None,
+    provider: Optional[str] = None, task_routes: Optional[List[Optional[Dict[str, Any]]]] = None,
 ) -> tuple[Optional[str], List[Optional[LiveTranscriptWriter]], List[str]]:
     """One pre-headered writer per task + a manifest.json; prunes stale dirs.
     Returns ``(delegation_id, writers, paths)``; on any top-level failure
-    ``(None, [None]*n, [])`` so delegation proceeds untouched."""
+    ``(None, [None]*n, [])`` so delegation proceeds untouched.
+
+    ``task_routes`` is an optional per-task ``{"model", "provider", "source"}`` mapping (see
+    ``tools.delegation_model_override``): each task's header then names the model that task
+    actually runs on — the only way to audit a heterogeneous batch, since the batch-level
+    ``model``/``provider`` describe the delegation default, not task N."""
     n = len(task_list)
     prune_stale_live_dirs()  # best-effort; never raises
     with _best_effort("creation"):
         # Same id shape as async_delegation's so the dir name matches the handle.
         deleg_id = delegation_id or f"deleg_{uuid.uuid4().hex[:8]}"
-        made = [LiveTranscriptWriter(deleg_id, i, str(t.get("goal", "")), context=t.get("context") or context)
+        routes = list(task_routes or [])
+        made = [LiveTranscriptWriter(deleg_id, i, str(t.get("goal", "")), context=t.get("context") or context,
+                                     route=routes[i] if i < len(routes) else None)
                 for i, t in enumerate(task_list)]
         writers: List[Optional[LiveTranscriptWriter]] = [w if w.path is not None else None for w in made]
         paths: List[str] = [str(w.path) for w in made if w.path is not None]
         if not paths:
             return None, [None] * n, []
-        _write_manifest(deleg_id, task_list, paths, model=model, provider=provider)
+        _write_manifest(deleg_id, task_list, paths, model=model, provider=provider, task_routes=task_routes)
         return deleg_id, writers, paths
     return None, [None] * n, []
 
@@ -254,7 +275,9 @@ def _manifest_path(delegation_id: str) -> Path:
 
 def _write_manifest(delegation_id: str, task_list: List[Dict[str, Any]],
                     paths: List[str], model: Optional[str] = None,
-                    provider: Optional[str] = None) -> None:
+                    provider: Optional[str] = None,
+                    task_routes: Optional[List[Optional[Dict[str, Any]]]] = None) -> None:
+    routes = list(task_routes or [])
     with _best_effort("manifest write"):
         _dump_json(_manifest_path(delegation_id), {
             "delegation_id": delegation_id, "started": time.strftime(_TIME_FMT),
@@ -264,7 +287,11 @@ def _write_manifest(delegation_id: str, task_list: List[Dict[str, Any]],
                 # Same mounted dir as the .log files, so the goal needs the same redaction.
                 "goal": _redact(str(t.get("goal", ""))[:500]),
                 "log": paths[i] if i < len(paths) else None,
-                "status": "running"} for i, t in enumerate(task_list)]})
+                "status": "running",
+                # Where this specific task runs (present even when inherited) so a heterogeneous
+                # batch is auditable from the manifest alone.
+                **({"route": routes[i]} if i < len(routes) and isinstance(routes[i], dict) else {}),
+            } for i, t in enumerate(task_list)]})
 
 
 def update_manifest_statuses(delegation_id: Optional[str],

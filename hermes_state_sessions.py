@@ -16,7 +16,8 @@ from agent.session_activity import (
 from hermes_state_common import (
     _LISTABLE_CHILD_SQL, _PREVIEW_ELIGIBLE_SQL, _PREVIEW_RAW_SELECT, _RECOVERABLE_END_REASONS,
     _RECOVERABLE_END_REASONS_SQL, _RESET_END_REASONS, _legacy_reset_child_sql, _shape_preview,
-    _sql_session_last_active, _sql_session_last_active_by_id, escape_like as _escape_like,
+    _sql_served_route_columns, _sql_session_last_active, _sql_session_last_active_by_id,
+    escape_like as _escape_like,
     _placeholders as _session_ids_placeholders,
 )
 
@@ -964,6 +965,7 @@ class SessionSessionsMixin:
             for key in (
                 "id", "ended_at", "end_reason", "message_count", "tool_call_count", "title", "last_active",
                 "preview", "model", "system_prompt", "cwd", "git_branch", "git_repo_root",
+                "configured_provider", "served_model", "served_provider",
             ):
                 if key in tip_row:
                     merged[key] = tip_row[key]
@@ -1163,6 +1165,7 @@ class SessionSessionsMixin:
         s = cls._session_row_dict(row)
         s["preview"] = _shape_preview(s.pop("_preview_raw", ""))
         s.pop("_effective_last_active", None)
+        s["configured_provider"] = cls._configured_provider_for_row(s)
         return s
 
     def list_sessions_rich(
@@ -1225,7 +1228,7 @@ class SessionSessionsMixin:
                     GROUP BY root_id
                 )
                 {select_head}{_sql_session_last_active("s")} AS last_active,
-                    COALESCE(cm.effective_last_active, s.started_at) AS _effective_last_active
+                    COALESCE(cm.effective_last_active, s.started_at) AS _effective_last_active{_sql_served_route_columns("s")}
                 FROM sessions s
                 LEFT JOIN chain_max cm ON cm.root_id = s.id
                 {prompt_join}
@@ -1236,7 +1239,7 @@ class SessionSessionsMixin:
             params = params + params + id_params + [limit, offset]  # WHERE binds twice (seed + outer)
         else:
             query = f"""
-                {select_head}{_sql_session_last_active("s")} AS last_active
+                {select_head}{_sql_session_last_active("s")} AS last_active{_sql_served_route_columns("s")}
                 {from_sessions}
                 {where_sql}
                 ORDER BY s.started_at DESC
@@ -1253,7 +1256,7 @@ class SessionSessionsMixin:
                 {select_head}COALESCE(
                         (SELECT MAX(m2.timestamp) FROM messages m2 WHERE m2.session_id = s.id),
                         s.started_at
-                    ) AS last_active
+                    ) AS last_active{_sql_served_route_columns("s")}
                 {from_sessions}
                 {pinned_where}
                 ORDER BY s.started_at DESC
@@ -1366,7 +1369,7 @@ class SessionSessionsMixin:
     def session_count(
         self, source: str = None, sources: List[str] = None, cwd_prefix: str = None,
         min_message_count: int = 0, include_archived: bool = False, archived_only: bool = False,
-        exclude_children: bool = False, exclude_sources: List[str] = None,
+        exclude_children: bool = False, exclude_sources: List[str] = None, include_hidden: bool = True,
     ) -> int:
         """Count sessions with list_sessions_rich's filters so a paired "load more" total matches."""
         where_clauses, params = _session_filter_where(
@@ -1374,6 +1377,8 @@ class SessionSessionsMixin:
             exclude_sources=exclude_sources, cwd_prefix=cwd_prefix, min_message_count=min_message_count,
             archived_only=archived_only, include_archived=include_archived,
         )
+        if not include_hidden:
+            where_clauses.append("s.hidden = 0")
         return self._read_one(f"SELECT COUNT(*) FROM sessions s{_where_sql(where_clauses, ' ')}", params)[0]
 
     def session_count_ge(self, n: int = 1) -> bool:

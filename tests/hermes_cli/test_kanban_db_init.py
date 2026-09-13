@@ -218,13 +218,13 @@ def test_healthy_fast_path_stays_lock_free(tmp_path, monkeypatch):
     with kbc.connect_closing(db_path):
         pass
 
-    locks: list[Path] = []
+    locks: list[tuple[Path, bool]] = []
     real_lock = kbc._cross_process_init_lock
 
     @contextlib.contextmanager
-    def recording_lock(path):
-        locks.append(path)
-        with real_lock(path):
+    def recording_lock(path, *, existing_only=False):
+        locks.append((path, existing_only))
+        with real_lock(path, existing_only=existing_only):
             yield
 
     monkeypatch.setattr(kbc, "_cross_process_init_lock", recording_lock)
@@ -233,7 +233,10 @@ def test_healthy_fast_path_stays_lock_free(tmp_path, monkeypatch):
         pass
     assert locks == []
 
+    # The legacy top-level default board is not an inventory entry, so its
+    # re-init must keep the create-capable mode — ``existing_only=True`` here
+    # could not recreate the DB that was just unlinked.
     db_path.unlink()
     with kbc.connect_closing(db_path):
         pass
-    assert len(locks) == 1
+    assert locks == [(db_path, False)]

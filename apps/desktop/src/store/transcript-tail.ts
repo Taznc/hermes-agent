@@ -11,6 +11,17 @@
  * Offsets use the backend's `order: 'latest'` semantics: measured back from
  * the NEWEST row, with each page returned in chronological order — so the
  * page immediately older than N already-loaded tail rows starts at offset N.
+ *
+ * Perf: entries are keyed by a profile-scoped composite (JSON-encoded) OR the
+ * bare stored id, and callers frequently need "every entry for this stored
+ * id regardless of scope" (matchingTailEntries). `transcriptTailState` reads
+ * that lookup from ChatRuntimeBoundary's render body — the hottest React path
+ * in the app, ticking ~30x/s while a turn streams. A naive lookup that
+ * JSON.parses every key to recover its stored id (bounded at
+ * TRANSCRIPT_TAIL_LIMIT) turns one render into up to 256 parses; at 30
+ * renders/sec that is ~7,700 JSON.parse calls/sec. `storedSessionIdIndex`
+ * maintains the reverse mapping (stored id -> its live keys) incrementally on
+ * every write/evict, so the lookup is O(matching keys) with no parsing.
  */
 
 import { atom } from 'nanostores'
@@ -40,6 +51,16 @@ export const $transcriptTailBySessionId = atom<Record<string, TranscriptTailStat
 const TRANSCRIPT_TAIL_LIMIT = 256
 let transcriptTailOrder: string[] = []
 
+// Reverse index: stored session id -> the set of live entry keys scoped to
+// it (a bare key equal to the stored id, and/or profile-scoped composite
+// keys). Kept in sync with `$transcriptTailBySessionId` by every writer/
+// evictor below so lookups never need to parse a key to recover its id.
+const storedSessionIdIndex = new Map<string, Set<string>>()
+// Reverse of the reverse: entry key -> the stored id it was recorded under,
+// so eviction (which only knows the oldest KEY) can update the index above
+// in O(1) instead of re-deriving the id.
+const storedSessionIdByKey = new Map<string, string>()
+
 type TailPage = Pick<SessionMessagesResponse, 'messages' | 'pagination'>
 
 function normalizedScope(profile?: TranscriptProfileScope): { connectionId: string; profile: string } | null {
@@ -63,20 +84,59 @@ function transcriptTailKey(storedSessionId: string, profile?: TranscriptProfileS
   return scope ? JSON.stringify([scope.connectionId, scope.profile, storedSessionId]) : storedSessionId
 }
 
+function indexKey(storedSessionId: string, key: string): void {
+  let keys = storedSessionIdIndex.get(storedSessionId)
+
+  if (!keys) {
+    keys = new Set()
+    storedSessionIdIndex.set(storedSessionId, keys)
+  }
+
+  keys.add(key)
+  storedSessionIdByKey.set(key, storedSessionId)
+}
+
+function unindexKey(key: string): void {
+  const storedSessionId = storedSessionIdByKey.get(key)
+
+  if (storedSessionId === undefined) {
+    return
+  }
+
+  storedSessionIdByKey.delete(key)
+  const keys = storedSessionIdIndex.get(storedSessionId)
+
+  if (!keys) {
+    return
+  }
+
+  keys.delete(key)
+
+  if (keys.size === 0) {
+    storedSessionIdIndex.delete(storedSessionId)
+  }
+}
+
+/** O(1) — no JSON.parse: reads the incrementally-maintained reverse index. */
 function matchingTailEntries(storedSessionId: string): Array<[string, TranscriptTailState]> {
-  return Object.entries($transcriptTailBySessionId.get()).filter(([key]) => {
-    if (key === storedSessionId) {
-      return true
-    }
+  const keys = storedSessionIdIndex.get(storedSessionId)
 
-    try {
-      const parsed = JSON.parse(key)
+  if (!keys || keys.size === 0) {
+    return []
+  }
 
-      return Array.isArray(parsed) && parsed.length === 3 && parsed[2] === storedSessionId
-    } catch {
-      return false
+  const current = $transcriptTailBySessionId.get()
+  const entries: Array<[string, TranscriptTailState]> = []
+
+  for (const key of keys) {
+    const state = current[key]
+
+    if (state) {
+      entries.push([key, state])
     }
-  })
+  }
+
+  return entries
 }
 
 function tailStateFromPage(page: TailPage, profile?: TranscriptProfileScope): TranscriptTailState {
@@ -95,7 +155,7 @@ function tailStateFromPage(page: TailPage, profile?: TranscriptProfileScope): Tr
   }
 }
 
-function setTranscriptTailEntry(key: string, state: TranscriptTailState): void {
+function setTranscriptTailEntry(key: string, storedSessionId: string, state: TranscriptTailState): void {
   const current = $transcriptTailBySessionId.get()
   const existing = new Set(Object.keys(current))
   transcriptTailOrder = transcriptTailOrder.filter(candidate => candidate !== key && existing.has(candidate))
@@ -103,11 +163,14 @@ function setTranscriptTailEntry(key: string, state: TranscriptTailState): void {
 
   const next = { ...current, [key]: state }
 
+  indexKey(storedSessionId, key)
+
   while (transcriptTailOrder.length > TRANSCRIPT_TAIL_LIMIT) {
     const oldest = transcriptTailOrder.shift()
 
     if (oldest !== undefined) {
       delete next[oldest]
+      unindexKey(oldest)
     }
   }
 
@@ -121,7 +184,7 @@ export function recordTranscriptTail(storedSessionId: string, page: TailPage, pr
   }
 
   const key = transcriptTailKey(storedSessionId, profile)
-  setTranscriptTailEntry(key, tailStateFromPage(page, profile))
+  setTranscriptTailEntry(key, storedSessionId, tailStateFromPage(page, profile))
 }
 
 /** Advance the bookkeeping after one older backfill page landed. */
@@ -147,7 +210,7 @@ export function recordTranscriptBackfillPage(
     return
   }
 
-  setTranscriptTailEntry(key, tailStateFromPage(page, previous.profile))
+  setTranscriptTailEntry(key, storedSessionId, tailStateFromPage(page, previous.profile))
 }
 
 export function transcriptTailState(
@@ -183,6 +246,7 @@ export function clearTranscriptTail(storedSessionId: string, profile?: Transcrip
 
   for (const key of keys) {
     delete next[key]
+    unindexKey(key)
   }
 
   const removed = new Set(keys)

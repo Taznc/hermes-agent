@@ -6,6 +6,7 @@ import type { ChatMessage } from '@/lib/chat-messages'
 import {
   acquireSubmitInFlight,
   appendText,
+  attachFileBytes,
   base64FromDataUrl,
   clearSessionRecentlyInterrupted,
   clearSubmitInFlight,
@@ -404,6 +405,131 @@ describe('readFileDataUrlForAttach', () => {
 
     await expect(readFileDataUrlForAttach('/tmp/note.txt')).resolves.toBe('data:text/plain;base64,YQ==')
     expect(previewReader).toHaveBeenCalledWith('/tmp/note.txt')
+  })
+})
+
+describe('attachFileBytes', () => {
+  afterEach(() => {
+    vi.unstubAllGlobals()
+  })
+
+  it('streams the file in bounded chunks via file.attach_open/_chunk/_commit', async () => {
+    const chunks = [
+      { base64: 'aGVsbG8=', bytesRead: 6, mimeType: 'text/plain', totalBytes: 11 },
+      { base64: 'd29ybGQ=', bytesRead: 5, mimeType: 'text/plain', totalBytes: 11 }
+    ]
+    const readFileChunkForAttach = vi.fn(async () => chunks.shift())
+    Object.defineProperty(window, 'hermesDesktop', {
+      configurable: true,
+      value: { readFileChunkForAttach }
+    })
+
+    const calls: { method: string; params?: Record<string, unknown> }[] = []
+    const requestGateway: GatewayRequest = vi.fn(async (method: string, params?: Record<string, unknown>) => {
+      calls.push({ method, params })
+
+      if (method === 'file.attach_open') {
+        return { upload_id: 'up-1' } as never
+      }
+
+      if (method === 'file.attach_commit') {
+        return { attached: true, ref_text: '@file:report.txt' } as never
+      }
+
+      return {} as never
+    })
+
+    const result = await attachFileBytes('/abs/report.txt', 'report.txt', requestGateway, 'sess-1')
+
+    expect(result).toEqual({ attached: true, ref_text: '@file:report.txt' })
+    expect(calls.map(c => c.method)).toEqual([
+      'file.attach_open',
+      'file.attach_chunk',
+      'file.attach_chunk',
+      'file.attach_commit'
+    ])
+    expect(calls[1]?.params).toMatchObject({ upload_id: 'up-1', chunk_base64: 'aGVsbG8=' })
+    expect(calls[2]?.params).toMatchObject({ upload_id: 'up-1', chunk_base64: 'd29ybGQ=' })
+    expect(calls[3]?.params).toMatchObject({ upload_id: 'up-1', path: '/abs/report.txt', name: 'report.txt' })
+    expect(readFileChunkForAttach).toHaveBeenCalledWith('/abs/report.txt', 0)
+    expect(readFileChunkForAttach).toHaveBeenCalledWith('/abs/report.txt', 6)
+  })
+
+  it('falls back to the whole-file transport when the bridge has no chunked reader', async () => {
+    const readFileDataUrl = vi.fn(async () => 'data:text/plain;base64,aGVsbG8=')
+    Object.defineProperty(window, 'hermesDesktop', {
+      configurable: true,
+      value: { readFileDataUrl }
+    })
+
+    const requestGateway: GatewayRequest = vi.fn(async () => ({ attached: true, ref_text: '@file:x' }) as never)
+
+    const result = await attachFileBytes('/abs/x.txt', 'x.txt', requestGateway, 'sess-1')
+
+    expect(result).toEqual({ attached: true, ref_text: '@file:x' })
+    expect(requestGateway).toHaveBeenCalledWith('file.attach', {
+      name: 'x.txt',
+      path: '/abs/x.txt',
+      session_id: 'sess-1',
+      data_url: 'data:text/plain;base64,aGVsbG8='
+    })
+  })
+
+  it('falls back to the whole-file transport when the gateway predates file.attach_open', async () => {
+    const readFileChunkForAttach = vi.fn()
+    const readFileDataUrl = vi.fn(async () => 'data:text/plain;base64,aGVsbG8=')
+    Object.defineProperty(window, 'hermesDesktop', {
+      configurable: true,
+      value: { readFileChunkForAttach, readFileDataUrl }
+    })
+
+    const requestGateway: GatewayRequest = vi.fn(async (method: string) => {
+      if (method === 'file.attach_open') {
+        throw new Error('unknown method: file.attach_open')
+      }
+
+      if (method === 'file.attach') {
+        return { attached: true, ref_text: '@file:x' } as never
+      }
+
+      return {} as never
+    })
+
+    const result = await attachFileBytes('/abs/x.txt', 'x.txt', requestGateway, 'sess-1')
+
+    expect(result).toEqual({ attached: true, ref_text: '@file:x' })
+    expect(readFileChunkForAttach).not.toHaveBeenCalled()
+  })
+
+  it('aborts the upload and rethrows when a chunk append fails', async () => {
+    const readFileChunkForAttach = vi.fn(async () => ({
+      base64: 'aGVsbG8=',
+      bytesRead: 6,
+      mimeType: 'text/plain',
+      totalBytes: 11
+    }))
+    Object.defineProperty(window, 'hermesDesktop', {
+      configurable: true,
+      value: { readFileChunkForAttach }
+    })
+
+    const calls: string[] = []
+    const requestGateway: GatewayRequest = vi.fn(async (method: string) => {
+      calls.push(method)
+
+      if (method === 'file.attach_open') {
+        return { upload_id: 'up-1' } as never
+      }
+
+      if (method === 'file.attach_chunk') {
+        throw new Error('boom')
+      }
+
+      return {} as never
+    })
+
+    await expect(attachFileBytes('/abs/x.txt', 'x.txt', requestGateway, 'sess-1')).rejects.toThrow('boom')
+    expect(calls).toEqual(['file.attach_open', 'file.attach_chunk', 'file.attach_abort'])
   })
 })
 

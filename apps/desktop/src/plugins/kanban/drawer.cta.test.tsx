@@ -1,0 +1,560 @@
+/**
+ * Focused tests for the task detail view's call-to-action banner: the answer
+ * to "why is this stuck and what do I do about it" for blocked/review tasks.
+ * Exercises the real @hermes/plugin-sdk (aliased to src/sdk in vite/vitest
+ * config), matching the pattern in model-override.test.tsx.
+ */
+import { cleanup, fireEvent, render, screen } from '@testing-library/react'
+import { afterEach, beforeAll, describe, expect, it, vi } from 'vitest'
+
+import { CtaBanner, latestBlockReason, parseBlockedChoices, parseCmdFences } from './drawer'
+import type { KanbanEvent, KanbanTaskFull } from './types'
+
+vi.mock('@/hermes', () => ({
+  getGlobalModelOptions: vi.fn().mockResolvedValue({ providers: [] }),
+  setApiRequestProfile: vi.fn()
+}))
+
+// Plugins only ever see @hermes/plugin-sdk (enforced by eslint), so tests
+// mirror the real bundle but stub usePluginI18n to echo the dotted key —
+// same shim completion-notify.test.ts uses. Assertions match on those keys
+// instead of translated English text.
+vi.mock('@hermes/plugin-sdk', async () => {
+  const actual = await vi.importActual<Record<string, unknown>>('@hermes/plugin-sdk')
+
+  return { ...actual, usePluginI18n: () => (key: string) => key }
+})
+
+beforeAll(() => {
+  Element.prototype.scrollIntoView = vi.fn()
+})
+
+afterEach(() => {
+  cleanup()
+})
+
+const baseTask = (overrides: Partial<KanbanTaskFull>): KanbanTaskFull => ({
+  id: 't_abc123',
+  status: 'ready',
+  title: 'Some task',
+  ...overrides
+})
+
+const blockedEvent = (reason?: string, kind: KanbanEvent['kind'] = 'blocked'): KanbanEvent => ({
+  id: 1,
+  kind,
+  payload: reason ? { reason } : null,
+  created_at: 0
+})
+
+describe('latestBlockReason', () => {
+  it('reads the reason off the most recent blocked event', () => {
+    const events = [blockedEvent('first reason'), blockedEvent('second reason')]
+
+    expect(latestBlockReason(events)).toBe('second reason')
+  })
+
+  it('also reads block_loop_detected reasons', () => {
+    expect(latestBlockReason([blockedEvent('looped', 'block_loop_detected')])).toBe('looped')
+  })
+
+  it('returns null when there is no blocked event, or no reason recorded', () => {
+    expect(latestBlockReason([])).toBeNull()
+    expect(latestBlockReason([blockedEvent(undefined)])).toBeNull()
+  })
+
+  it('tolerates a stringified JSON payload', () => {
+    const event: KanbanEvent = { id: 1, kind: 'blocked', payload: JSON.stringify({ reason: 'stringy' }), created_at: 0 }
+
+    expect(latestBlockReason([event])).toBe('stringy')
+  })
+})
+
+describe('CtaBanner', () => {
+  it('renders nothing for a normal (non-blocked, non-review) task', () => {
+    const task = baseTask({ status: 'running' })
+
+    const { container } = render(
+      <CtaBanner
+        comments={[]}
+        events={[]}
+        onFocusComment={vi.fn()}
+        onMove={vi.fn()}
+        onSubmitChoice={vi.fn()}
+        task={task}
+      />
+    )
+
+    expect(container.innerHTML).toBe('')
+  })
+
+  it('blocked: shows the worker-recorded reason and a Reply + Unblock action', () => {
+    const task = baseTask({ status: 'blocked', block_kind: 'needs_input' })
+    const onFocusComment = vi.fn()
+    const onMove = vi.fn()
+
+    render(
+      <CtaBanner
+        comments={[]}
+        events={[blockedEvent('Which API key should I use?')]}
+        onFocusComment={onFocusComment}
+        onMove={onMove}
+        onSubmitChoice={vi.fn()}
+        task={task}
+      />
+    )
+
+    expect(screen.getByText('Which API key should I use?')).toBeTruthy()
+    expect(screen.getByText('blockKind.needs_input')).toBeTruthy()
+
+    fireEvent.click(screen.getByText('ctaReply'))
+    expect(onFocusComment).toHaveBeenCalledTimes(1)
+
+    fireEvent.click(screen.getByText('ctaUnblock'))
+    expect(onMove).toHaveBeenCalledWith('ready')
+  })
+
+  it('initially blocked: identifies the deliberate creation gate without treating it as a worker failure', () => {
+    const task = baseTask({ status: 'blocked', block_kind: null })
+
+    render(
+      <CtaBanner
+        comments={[]}
+        events={[
+          {
+            ...blockedEvent('Check the card precondition.'),
+            payload: { intentional_initial_block: true, reason: 'Check the card precondition.' }
+          }
+        ]}
+        onFocusComment={vi.fn()}
+        onMove={vi.fn()}
+        onSubmitChoice={vi.fn()}
+        task={task}
+      />
+    )
+
+    expect(screen.getByText('ctaInitialBlockTitle')).toBeTruthy()
+    expect(screen.queryByText('ctaBlockedTitle')).toBeNull()
+    expect(screen.getByText('Check the card precondition.')).toBeTruthy()
+  })
+
+  it('automatic block: retains the ordinary blocked classification', () => {
+    const task = baseTask({ status: 'blocked', block_kind: null })
+
+    render(
+      <CtaBanner
+        comments={[]}
+        events={[blockedEvent('The worker process disappeared unexpectedly.')]}
+        onFocusComment={vi.fn()}
+        onMove={vi.fn()}
+        onSubmitChoice={vi.fn()}
+        task={task}
+      />
+    )
+
+    expect(screen.getByText('ctaBlockedTitle')).toBeTruthy()
+    expect(screen.queryByText('ctaInitialBlockTitle')).toBeNull()
+  })
+
+  it('review round cap: names the real cause and never claims no reason was recorded', () => {
+    // Regression for t_583024aa — the dispatcher's cap wrote block_kind and a
+    // review_round_cap event, yet the banner rendered "Blocked — cause
+    // unknown / No cause is recorded" directly above a diagnostics panel
+    // spelling out the exact cause.
+    const task = baseTask({ status: 'blocked', block_kind: 'review_round_cap' })
+
+    const events: KanbanEvent[] = [
+      {
+        id: 1,
+        kind: 'review_round_cap',
+        payload: { changes_rounds: 2, max_review_rounds: 2, reason: 'Round 2 still fails six safety requirements' },
+        created_at: 0
+      }
+    ]
+
+    render(
+      <CtaBanner comments={[]} events={events} onFocusComment={vi.fn()} onMove={vi.fn()} onSubmitChoice={vi.fn()} task={task} />
+    )
+
+    expect(screen.queryByText('ctaBlockedNoReason')).toBeNull()
+    expect(screen.queryByText('ctaBlockedTitle')).toBeNull()
+    expect(screen.getByText('ctaReviewRoundCapBody')).toBeTruthy()
+    expect(screen.getByText('Round 2 still fails six safety requirements')).toBeTruthy()
+  })
+
+  it('blocked with no reason recorded: falls back to explanatory copy', () => {
+    const task = baseTask({ status: 'blocked', block_kind: null })
+
+    render(
+      <CtaBanner comments={[]} events={[]} onFocusComment={vi.fn()} onMove={vi.fn()} onSubmitChoice={vi.fn()} task={task} />
+    )
+
+    expect(screen.getByText('ctaBlockedNoReason')).toBeTruthy()
+  })
+
+  it('automatic circuit-breaker (gave_up) failure: intelligible cause, retry action, no "needs your input"', () => {
+    // The demonstrated card, t_44ca59a3: status=blocked, block_kind=NULL,
+    // event tail is crashed -> gave_up{error:'pid 704578 not alive'} — no
+    // blocked/block_loop_detected event at all.
+    const task = baseTask({
+      block_kind: null,
+      last_failure_error: 'pid 704578 not alive',
+      status: 'blocked'
+    })
+
+    const events: KanbanEvent[] = [
+      { created_at: 0, id: 1, kind: 'crashed', payload: { error: 'pid 704578 not alive' } },
+      { created_at: 1, id: 2, kind: 'gave_up', payload: { error: 'pid 704578 not alive' } }
+    ]
+
+    render(
+      <CtaBanner comments={[]} events={events} onFocusComment={vi.fn()} onMove={vi.fn()} onSubmitChoice={vi.fn()} task={task} />
+    )
+
+    // Never the false "did not record a reason" / "needs your input" copy.
+    expect(screen.queryByText('ctaBlockedNoReason')).toBeNull()
+    expect(screen.queryByText('ctaBlockedTitle')).toBeNull()
+    // The real cause, humanized by runErrorText, is shown.
+    expect(screen.getByText('runErrPidNotAlive')).toBeTruthy()
+    expect(screen.getByText('ctaBlockedAutomaticTitle')).toBeTruthy()
+    // Retry is present; Reply exists but is not the only/primary action.
+    expect(screen.getByText('ctaRetry')).toBeTruthy()
+  })
+
+  it('automatic failure falls back to task.last_failure_error when no gave_up event is present', () => {
+    const task = baseTask({ block_kind: null, last_failure_error: 'pid 9 not alive', status: 'blocked' })
+
+    render(
+      <CtaBanner comments={[]} events={[]} onFocusComment={vi.fn()} onMove={vi.fn()} onSubmitChoice={vi.fn()} task={task} />
+    )
+
+    expect(screen.getByText('runErrPidNotAlive')).toBeTruthy()
+    expect(screen.getByText('ctaBlockedAutomaticTitle')).toBeTruthy()
+  })
+
+  it('reviewer exited with no verdict: neutral copy, requeue action, never a question', () => {
+    const task = baseTask({ block_kind: null, status: 'blocked' })
+    const events: KanbanEvent[] = [{ created_at: 0, id: 1, kind: 'review_no_verdict', payload: { pid: 1 } }]
+
+    render(
+      <CtaBanner comments={[]} events={events} onFocusComment={vi.fn()} onMove={vi.fn()} onSubmitChoice={vi.fn()} task={task} />
+    )
+
+    expect(screen.getByText('ctaReviewNoVerdictTitle')).toBeTruthy()
+    expect(screen.getByText('ctaRequeueReview')).toBeTruthy()
+    expect(screen.queryByText('ctaBlockedTitle')).toBeNull()
+  })
+
+  it('precedence: manual block AFTER an earlier gave_up resolves to manual, not automatic', () => {
+    const task = baseTask({ block_kind: 'needs_input', status: 'blocked' })
+
+    const events: KanbanEvent[] = [
+      { created_at: 0, id: 1, kind: 'gave_up', payload: { error: 'pid 1 not alive' } },
+      { created_at: 1, id: 2, kind: 'blocked', payload: { reason: 'Which key?' } }
+    ]
+
+    render(
+      <CtaBanner comments={[]} events={events} onFocusComment={vi.fn()} onMove={vi.fn()} onSubmitChoice={vi.fn()} task={task} />
+    )
+
+    expect(screen.getByText('Which key?')).toBeTruthy()
+    expect(screen.queryByText('ctaBlockedAutomaticTitle')).toBeNull()
+  })
+
+  it('precedence: manual block, unblocked, then a later gave_up resolves to automatic', () => {
+    const task = baseTask({ block_kind: 'needs_input', last_failure_error: null, status: 'blocked' })
+
+    const events: KanbanEvent[] = [
+      { created_at: 0, id: 1, kind: 'blocked', payload: { reason: 'Which key?' } },
+      { created_at: 1, id: 2, kind: 'unblocked', payload: null },
+      { created_at: 2, id: 3, kind: 'gave_up', payload: { error: 'pid 2 not alive' } }
+    ]
+
+    render(
+      <CtaBanner comments={[]} events={events} onFocusComment={vi.fn()} onMove={vi.fn()} onSubmitChoice={vi.fn()} task={task} />
+    )
+
+    expect(screen.getByText('ctaBlockedAutomaticTitle')).toBeTruthy()
+    expect(screen.queryByText('Which key?')).toBeNull()
+  })
+
+  it('review: offers Approve (-> done) and Send back (-> ready)', () => {
+    const task = baseTask({ status: 'review' })
+    const onMove = vi.fn()
+
+    render(
+      <CtaBanner comments={[]} events={[]} onFocusComment={vi.fn()} onMove={onMove} onSubmitChoice={vi.fn()} task={task} />
+    )
+
+    expect(screen.getByText('ctaReviewTitle')).toBeTruthy()
+
+    fireEvent.click(screen.getByText('ctaApprove'))
+    expect(onMove).toHaveBeenCalledWith('done')
+
+    fireEvent.click(screen.getByText('ctaSendBack'))
+    expect(onMove).toHaveBeenCalledWith('ready')
+  })
+})
+
+describe('parseBlockedChoices', () => {
+  const validFence = [
+    'Which environment should this ship to?',
+    '',
+    '```choices',
+    JSON.stringify([
+      { key: 'A', label: 'Staging' },
+      { key: 'B', label: 'Production', description: 'Goes live immediately' }
+    ]),
+    '```'
+  ].join('\n')
+
+  it('parses a valid fence into prose + options', () => {
+    const result = parseBlockedChoices(validFence)
+
+    expect(result).not.toBeNull()
+    expect(result?.prose).toBe('Which environment should this ship to?')
+    expect(result?.options).toEqual([
+      { key: 'A', label: 'Staging' },
+      { key: 'B', label: 'Production', description: 'Goes live immediately' }
+    ])
+  })
+
+  it('returns null when there is no fence', () => {
+    expect(parseBlockedChoices('Just a plain question, no options.')).toBeNull()
+  })
+
+  it('returns null on invalid JSON in the fence', () => {
+    expect(parseBlockedChoices('Question?\n```choices\nnot json\n```')).toBeNull()
+  })
+
+  it('returns null when the array has fewer than 2 or more than 6 options', () => {
+    const one = JSON.stringify([{ key: 'A', label: 'Only one' }])
+    const seven = JSON.stringify(Array.from({ length: 7 }, (_, i) => ({ key: `k${i}`, label: `L${i}` })))
+
+    expect(parseBlockedChoices(`Q?\n\`\`\`choices\n${one}\n\`\`\``)).toBeNull()
+    expect(parseBlockedChoices(`Q?\n\`\`\`choices\n${seven}\n\`\`\``)).toBeNull()
+  })
+
+  it('returns null when an option is missing key or label', () => {
+    const bad = JSON.stringify([{ key: 'A' }, { key: 'B', label: 'B' }])
+
+    expect(parseBlockedChoices(`Q?\n\`\`\`choices\n${bad}\n\`\`\``)).toBeNull()
+  })
+
+  it('returns null on duplicate keys', () => {
+    const dup = JSON.stringify([
+      { key: 'A', label: 'First' },
+      { key: 'A', label: 'Second' }
+    ])
+
+    expect(parseBlockedChoices(`Q?\n\`\`\`choices\n${dup}\n\`\`\``)).toBeNull()
+  })
+
+  it('uses the LAST fence when multiple are present', () => {
+    const first = JSON.stringify([
+      { key: 'X', label: 'Wrong' },
+      { key: 'Y', label: 'Also wrong' }
+    ])
+
+    const second = JSON.stringify([
+      { key: 'A', label: 'Right' },
+      { key: 'B', label: 'Also right' }
+    ])
+
+    const reason = `Q?\n\`\`\`choices\n${first}\n\`\`\`\nmore prose\n\`\`\`choices\n${second}\n\`\`\``
+
+    expect(parseBlockedChoices(reason)?.options).toEqual([
+      { key: 'A', label: 'Right' },
+      { key: 'B', label: 'Also right' }
+    ])
+  })
+})
+
+describe('CtaBanner with structured choices', () => {
+  const choicesReason = [
+    'Pick one:',
+    '```choices',
+    JSON.stringify([
+      { key: 'A', label: 'Option A' },
+      { key: 'B', label: 'Option B' }
+    ]),
+    '```'
+  ].join('\n')
+
+  it('renders options as clickable radio buttons instead of the plain reason text', () => {
+    const task = baseTask({ status: 'blocked', block_kind: 'needs_input' })
+
+    render(
+      <CtaBanner
+        comments={[]}
+        events={[blockedEvent(choicesReason)]}
+        onFocusComment={vi.fn()}
+        onMove={vi.fn()}
+        onSubmitChoice={vi.fn()}
+        task={task}
+      />
+    )
+
+    expect(screen.getByRole('radiogroup')).toBeTruthy()
+    const radios = screen.getAllByRole('radio')
+
+    expect(radios).toHaveLength(2)
+    expect(screen.getByText('Option A')).toBeTruthy()
+    expect(screen.getByText('Option B')).toBeTruthy()
+    // Reply button is not shown when options ARE the reply.
+    expect(screen.queryByText('ctaReply')).toBeNull()
+  })
+
+  it('clicking an option submits a structured choice and marks it selected', async () => {
+    const task = baseTask({ status: 'blocked', block_kind: 'needs_input' })
+    const onSubmitChoice = vi.fn().mockResolvedValue(undefined)
+
+    render(
+      <CtaBanner
+        comments={[]}
+        events={[blockedEvent(choicesReason)]}
+        onFocusComment={vi.fn()}
+        onMove={vi.fn()}
+        onSubmitChoice={onSubmitChoice}
+        task={task}
+      />
+    )
+
+    fireEvent.click(screen.getByText('Option A'))
+
+    expect(onSubmitChoice).toHaveBeenCalledWith('A) Option A', { key: 'A', label: 'Option A', question_event_id: 1 })
+
+    await vi.waitFor(() => {
+      expect(screen.getByText('Option A').closest('button')?.getAttribute('aria-checked')).toBe('true')
+    })
+    expect(screen.getByText('Option B').closest('button')?.hasAttribute('disabled')).toBe(true)
+  })
+
+  it('shows the answered state (read-only, checked) when a matching choice comment already exists', () => {
+    const task = baseTask({ status: 'blocked', block_kind: 'needs_input' })
+
+    const comment = {
+      author: 'dashboard',
+      body: 'B) Option B',
+      choice: { key: 'B', label: 'Option B', question_event_id: 1 },
+      created_at: 0,
+      id: 1
+    }
+
+    render(
+      <CtaBanner
+        comments={[comment]}
+        events={[blockedEvent(choicesReason)]}
+        onFocusComment={vi.fn()}
+        onMove={vi.fn()}
+        onSubmitChoice={vi.fn()}
+        task={task}
+      />
+    )
+
+    expect(screen.getByText('Option B').closest('button')?.getAttribute('aria-checked')).toBe('true')
+    expect(screen.getByText('Option A').closest('button')?.hasAttribute('disabled')).toBe(true)
+  })
+
+  it('falls back to plain text + Reply when the fence is malformed', () => {
+    const task = baseTask({ status: 'blocked', block_kind: 'needs_input' })
+    const onFocusComment = vi.fn()
+    const malformed = 'Pick one:\n```choices\nnot valid json\n```'
+
+    render(
+      <CtaBanner
+        comments={[]}
+        events={[blockedEvent(malformed)]}
+        onFocusComment={onFocusComment}
+        onMove={vi.fn()}
+        onSubmitChoice={vi.fn()}
+        task={task}
+      />
+    )
+
+    expect(screen.getByText(/Pick one:/, { selector: 'p' })).toBeTruthy()
+    expect(screen.queryByRole('radiogroup')).toBeNull()
+    fireEvent.click(screen.getByText('ctaReply'))
+    expect(onFocusComment).toHaveBeenCalledTimes(1)
+  })
+
+  it('renders a ```cmd fence as a copy-pasteable command block, not prose', () => {
+    const task = baseTask({ status: 'blocked', block_kind: 'needs_input' })
+    const reason =
+      'Need the dev VM service restarted.\n' +
+      '```cmd\nsudo systemctl restart dev-console.service\n```\n' +
+      'The scanner blocks the worker from running systemctl itself.'
+
+    render(
+      <CtaBanner
+        comments={[]}
+        events={[blockedEvent(reason)]}
+        onFocusComment={vi.fn()}
+        onMove={vi.fn()}
+        onSubmitChoice={vi.fn()}
+        task={task}
+      />
+    )
+
+    // The command renders in a dedicated monospace block…
+    const code = screen.getByText('sudo systemctl restart dev-console.service')
+    expect(code.tagName).toBe('CODE')
+    // …the first line renders as the emphasized ask…
+    expect(screen.getByText('Need the dev VM service restarted.')).toBeTruthy()
+    // …and the trailing context renders as detail prose.
+    expect(screen.getByText(/scanner blocks the worker/)).toBeTruthy()
+  })
+
+  it('collapses a long prose-wall reason behind Show more, keeping the first line visible', () => {
+    const task = baseTask({ status: 'blocked', block_kind: 'needs_input' })
+    const wall = 'Approve the deploy plan?\n' + 'Deployment detail sentence. '.repeat(20)
+
+    render(
+      <CtaBanner
+        comments={[]}
+        events={[blockedEvent(wall)]}
+        onFocusComment={vi.fn()}
+        onMove={vi.fn()}
+        onSubmitChoice={vi.fn()}
+        task={task}
+      />
+    )
+
+    expect(screen.getByText('Approve the deploy plan?')).toBeTruthy()
+    // The detail is hidden until Show more is clicked.
+    expect(screen.queryByText(/Deployment detail sentence/)).toBeNull()
+    fireEvent.click(screen.getByText('showMore'))
+    expect(screen.getByText(/Deployment detail sentence/)).toBeTruthy()
+    fireEvent.click(screen.getByText('showLess'))
+    expect(screen.queryByText(/Deployment detail sentence/)).toBeNull()
+  })
+})
+
+describe('parseCmdFences', () => {
+  it('extracts cmd fences and removes them from the prose', () => {
+    const { commands, prose } = parseCmdFences('Ask line\n```cmd\nsystemctl restart foo\n```\ntail')
+
+    expect(commands).toEqual(['systemctl restart foo'])
+    expect(prose).toBe('Ask line\n\ntail')
+  })
+
+  it('accepts sh/bash/shell aliases and multiple fences', () => {
+    const { commands } = parseCmdFences('a\n```bash\ncmd-one\n```\nb\n```sh\ncmd-two\n```')
+
+    expect(commands).toEqual(['cmd-one', 'cmd-two'])
+  })
+
+  it('leaves non-command fences (choices) untouched', () => {
+    const text = 'q\n```choices\n[{"key":"A","label":"A"}]\n```'
+    const { commands, prose } = parseCmdFences(text)
+
+    expect(commands).toEqual([])
+    expect(prose).toBe(text)
+  })
+
+  it('drops empty fences instead of emitting empty commands', () => {
+    const { commands } = parseCmdFences('x\n```cmd\n\n```')
+
+    expect(commands).toEqual([])
+  })
+})

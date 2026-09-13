@@ -10,6 +10,7 @@ import {
   setWorkspaceScope,
   workspaceScopeKey
 } from '@/components/pane-shell/workspace-scope'
+import { createClientSessionState } from '@/lib/chat-runtime'
 import { $activeGatewayProfile } from '@/store/profile'
 import { $activeSessionId, $connection, $selectedStoredSessionId, setSessions } from '@/store/session'
 import type { SessionProfileRoute } from '@/store/session-request-router'
@@ -18,10 +19,12 @@ import type * as SessionStatesModule from '@/store/session-states'
 import {
   $focusedStoredSessionId,
   $sessionStates,
+  $sessionStatusById,
   $sessionTiles,
   blankDraftTile,
   clearAllSessionStates,
   closeAllOpenSessionTiles,
+  dropSessionState,
   focusedSessionNeedsRoute,
   focusOpenSession,
   focusWorkspaceOwnerSessionTile,
@@ -33,6 +36,7 @@ import {
   openSessionTile,
   orderTilesByTree,
   patchSessionTile,
+  publishSessionState,
   recordSessionEventScope,
   releaseSessionTranscript,
   requestForOwnedSession,
@@ -876,6 +880,72 @@ describe('releaseSessionTranscript', () => {
   })
 })
 
+describe('$sessionStatusById', () => {
+  afterEach(() => {
+    clearAllSessionStates()
+  })
+
+  it('publishes on the first publish of a runtime', () => {
+    publishSessionState('rt-1', createClientSessionState('stored-1'))
+
+    expect($sessionStatusById.get()['rt-1']).toEqual({
+      busy: false,
+      needsInput: false,
+      storedSessionId: 'stored-1',
+      hasMessages: false
+    })
+  })
+
+  it('does NOT republish on a pure message-delta with unchanged status fields', () => {
+    publishSessionState('rt-1', createClientSessionState('stored-1'))
+    const first = $sessionStatusById.get()
+
+    // A streamed token: messages grows, busy/needsInput/storedSessionId are
+    // unchanged — the exact shape of a ~30Hz streaming publish.
+    publishSessionState('rt-1', {
+      ...createClientSessionState('stored-1'),
+      messages: [{ id: 'm1', role: 'assistant', parts: [{ type: 'text', text: 'partial' }] }]
+    } as ClientSessionState)
+
+    // hasMessages flips false -> true on the FIRST message landing, which is
+    // itself a real status edge (drives $draftSessionIds); that one publish
+    // is expected. Assert the record kept its reference across a SECOND,
+    // purely-additional delta once hasMessages is already true.
+    const afterFirstMessage = $sessionStatusById.get()
+    expect(afterFirstMessage).not.toBe(first)
+
+    publishSessionState('rt-1', {
+      ...createClientSessionState('stored-1'),
+      messages: [
+        { id: 'm1', role: 'assistant', parts: [{ type: 'text', text: 'partial' }] },
+        { id: 'm2', role: 'assistant', parts: [{ type: 'text', text: 'more tokens' }] }
+      ]
+    } as ClientSessionState)
+
+    expect($sessionStatusById.get()).toBe(afterFirstMessage)
+    expect($sessionStatusById.get()['rt-1']).toEqual(afterFirstMessage['rt-1'])
+  })
+
+  it('republishes on a real busy edge', () => {
+    publishSessionState('rt-1', createClientSessionState('stored-1'))
+    const before = $sessionStatusById.get()
+
+    publishSessionState('rt-1', { ...createClientSessionState('stored-1'), busy: true } as ClientSessionState)
+
+    expect($sessionStatusById.get()).not.toBe(before)
+    expect($sessionStatusById.get()['rt-1']?.busy).toBe(true)
+  })
+
+  it('drops the entry when the runtime is dropped', () => {
+    publishSessionState('rt-1', { ...createClientSessionState('stored-1'), busy: true } as ClientSessionState)
+    expect($sessionStatusById.get()['rt-1']).toBeDefined()
+
+    dropSessionState('rt-1')
+
+    expect($sessionStatusById.get()).not.toHaveProperty('rt-1')
+  })
+})
+
 describe('orderTilesByTree', () => {
   it('no-ops (null) without a tree or below two tiles', () => {
     expect(orderTilesByTree(null, [tile('a'), tile('b')])).toBeNull()
@@ -1065,12 +1135,15 @@ describe('focusedSessionNeedsRoute', () => {
     expect(focusedSessionNeedsRoute('main', true)).toBe(true)
   })
 
+  it('routes for an active tile while a full page remains selected behind it', () => {
+    expect(focusedSessionNeedsRoute('tile', true)).toBe(true)
+  })
+
   it('skips the route when the main session is already the visible chat', () => {
     expect(focusedSessionNeedsRoute('main', false)).toBe(false)
   })
 
-  it('never routes for a tile — its pane shows the chat on any route', () => {
-    expect(focusedSessionNeedsRoute('tile', true)).toBe(false)
+  it('skips the route for a tile when the workspace already shows chat', () => {
     expect(focusedSessionNeedsRoute('tile', false)).toBe(false)
   })
 })

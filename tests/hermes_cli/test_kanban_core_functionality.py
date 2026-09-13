@@ -324,6 +324,59 @@ def test_max_runtime_terminates_overrun_worker(kanban_home):
 
 
 
+def test_max_runtime_stops_local_worker_service_before_signalling(kanban_home, monkeypatch):
+    """An expired local transient-service worker is stopped as a cgroup first.
+
+    A foreign host's task is bookkeeping only: neither its deterministic unit
+    nor PID may be addressed by this dispatcher.
+    """
+    events: list[tuple[str, object]] = []
+    monkeypatch.setattr(kbd._kb, "_host_prefix", lambda: "local:")
+    monkeypatch.setattr(
+        "tools.process_registry._stop_systemd_unit",
+        lambda unit: events.append(("stop", unit)) or True,
+    )
+    monkeypatch.setattr(kbd._kb, "_pid_alive", lambda _pid: False)
+
+    def expired_task(conn, *, claim_lock: str, pid: int) -> tuple[str, int]:
+        tid = kb.create_task(conn, title="expired", assignee="worker", max_runtime_seconds=1)
+        claimed = kb.claim_task(conn, tid)
+        assert claimed is not None and claimed.current_run_id is not None
+        old = int(time.time()) - 30
+        with kb.write_txn(conn):
+            conn.execute(
+                "UPDATE tasks SET worker_pid = ?, claim_lock = ?, started_at = ? WHERE id = ?",
+                (pid, claim_lock, old, tid),
+            )
+            conn.execute(
+                "UPDATE task_runs SET started_at = ? WHERE id = ?",
+                (old, claimed.current_run_id),
+            )
+        return tid, claimed.current_run_id
+
+    conn = kbc.connect()
+    try:
+        local_id, local_run = expired_task(conn, claim_lock="local:dispatcher", pid=111_001)
+        foreign_id, foreign_run = expired_task(conn, claim_lock="foreign:dispatcher", pid=111_002)
+
+        assert kbd.enforce_max_runtime(
+            conn,
+            signal_fn=lambda pid, _sig: events.append(("signal", pid)),
+        ) == [local_id]
+
+        local_unit = f"hermes-worker-kanban-{local_id}-run-{local_run}.service"
+        assert events == [("stop", local_unit), ("signal", 111_001)]
+        timed_out = next(e for e in kb.list_events(conn, local_id) if e.kind == "timed_out")
+        assert timed_out.payload["systemd_unit"] == local_unit
+        assert timed_out.payload["systemd_unit_stopped"] is True
+        foreign = kb.get_task(conn, foreign_id)
+        assert foreign is not None
+        assert foreign.current_run_id == foreign_run
+        assert foreign.status == "running"
+    finally:
+        conn.close()
+
+
 # ---------------------------------------------------------------------------
 # Heartbeat (item 2 from the Multica audit)
 # ---------------------------------------------------------------------------
@@ -1338,7 +1391,6 @@ def test_protocol_violation_budget_not_consumed_by_other_failures(kanban_home):
     untouched (so the two budgets stay independent).
     """
     import hermes_cli.kanban_db as _kb
-    from hermes_cli import kanban_db_dispatch as _kbd
     conn = kbc.connect()
     try:
         tid = kb.create_task(conn, title="mixed", assignee="worker")
@@ -1350,28 +1402,23 @@ def test_protocol_violation_budget_not_consumed_by_other_failures(kanban_home):
         assert task.status == "ready"
         assert task.consecutive_failures == 1
 
-        # Two violations after it: streak 1 and 2 — both retry, unified
-        # counter untouched. (Pre-fix: the crash consumed the budget and the
-        # violations blocked well before three of them happened.)
-        for i, pid in enumerate((991001, 991002)):
-            _drive_protocol_violation(conn, tid, pid)
-            task = kb.get_task(conn, tid)
-            assert task.status == "ready", (
-                f"violation {i + 1} after a crash must still retry, "
-                f"got {task.status}"
-            )
-            assert task.consecutive_failures == 1, (
-                "below-budget violations must not tick the unified counter"
-            )
+        # One violation after it: streak 1 retries; the unified counter stays
+        # untouched. (The prior real crash must not consume this separate
+        # protocol-violation budget.)
+        _drive_protocol_violation(conn, tid, 991001)
+        task = kb.get_task(conn, tid)
+        assert task is not None
+        assert task.status == "ready"
+        assert task.consecutive_failures == 1, (
+            "the first protocol violation must not tick the unified counter"
+        )
 
-        # Third consecutive violation: streak hits the bound — blocked.
-        _drive_protocol_violation(conn, tid, 991003)
+        # Second consecutive violation: streak hits the bound — blocked.
+        _drive_protocol_violation(conn, tid, 991002)
         task = kb.get_task(conn, tid)
         assert task.status == "blocked"
         gave_up = [e for e in kb.list_events(conn, tid) if e.kind == "gave_up"]
         assert len(gave_up) == 1
-        assert (gave_up[0].payload or {}).get("protocol_violations") == \
-            _kbd._PROTOCOL_VIOLATION_FAILURE_LIMIT
     finally:
         conn.close()
 
@@ -1384,6 +1431,132 @@ def test_protocol_violation_budget_not_consumed_by_other_failures(kanban_home):
 
 
 
+
+
+def test_clean_exit_protocol_violation_allows_only_one_blind_retry(kanban_home):
+    """A clean exit without a lifecycle report gets one recovery run, then blocks.
+
+    The first exit releases the task with the prior-run error so the next worker
+    can verify and report any already-finished work. A second identical clean
+    exit is not evidence that the task needs another full execution: it must
+    leave a durable ``gave_up`` record and stay blocked for an operator.
+    """
+    conn = kbc.connect()
+    try:
+        tid = kb.create_task(conn, title="bounded-clean-exit", assignee="worker")
+
+        _drive_protocol_violation(conn, tid, 991101)
+        first = kb.get_task(conn, tid)
+        assert first is not None
+        assert first.status == "ready"
+        assert "without calling kanban_complete" in (first.last_failure_error or "")
+
+        _drive_protocol_violation(conn, tid, 991102)
+        second = kb.get_task(conn, tid)
+        assert second is not None
+        assert second.status == "blocked"
+        gave_up = [event for event in kb.list_events(conn, tid) if event.kind == "gave_up"]
+        assert len(gave_up) == 1
+        assert (gave_up[0].payload or {}).get("protocol_violations") == 2
+    finally:
+        conn.close()
+
+
+def test_worker_boundary_parks_completion_handoff_without_blind_rerun(kanban_home, monkeypatch):
+    """A clean worker result parks a credible same-run handoff before process exit."""
+    import cli as cli_module
+
+    conn = kbc.connect()
+    try:
+        tid = kb.create_task(conn, title="recover-handoff", assignee="worker")
+        claimed = kb.claim_task(conn, tid)
+        assert claimed is not None and claimed.current_run_id is not None
+        kb.add_comment(
+            conn,
+            tid,
+            author="worker",
+            body=(
+                "Implementation complete. Commit deadbeef; focused regression tests "
+                "passed; diff is ready for review."
+            ),
+        )
+        monkeypatch.setenv("HERMES_KANBAN_TASK", tid)
+        monkeypatch.setenv("HERMES_KANBAN_BOARD", "default")
+        monkeypatch.setenv("HERMES_KANBAN_RUN_ID", str(claimed.current_run_id))
+        monkeypatch.delenv("HERMES_KANBAN_GOAL_MODE", raising=False)
+        agent = SimpleNamespace(
+            run_conversation=lambda **_kwargs: {
+                "failed": False,
+                "final_response": "done",
+            },
+            session_id="handoff-session",
+            provider="test",
+        )
+        worker_cli = SimpleNamespace(
+            agent=agent,
+            session_id="handoff-session",
+            conversation_history=[],
+        )
+
+        with pytest.raises(SystemExit) as exc:
+            cli_module._run_quiet_single_query(worker_cli, "work kanban task")
+
+        assert exc.value.code == 1
+        current = kb.get_task(conn, tid)
+        assert current is not None and current.status == "blocked"
+        assert "verify/recover prior work" in (current.last_failure_error or "")
+        kinds = [event.kind for event in kb.list_events(conn, tid)]
+        assert "protocol_violation" in kinds
+        assert "blocked" in kinds
+    finally:
+        conn.close()
+
+
+def test_worker_boundary_allows_one_no_evidence_recovery_then_blocks(kanban_home, monkeypatch):
+    """No handoff evidence gets exactly one recovery run, never an endless clean rerun."""
+    import cli as cli_module
+
+    conn = kbc.connect()
+    try:
+        tid = kb.create_task(conn, title="bounded-worker-boundary", assignee="worker")
+        monkeypatch.setenv("HERMES_KANBAN_TASK", tid)
+        monkeypatch.setenv("HERMES_KANBAN_BOARD", "default")
+        monkeypatch.delenv("HERMES_KANBAN_GOAL_MODE", raising=False)
+        agent = SimpleNamespace(
+            run_conversation=lambda **_kwargs: {
+                "failed": False,
+                "final_response": "done",
+            },
+            session_id="bounded-session",
+            provider="test",
+        )
+        worker_cli = SimpleNamespace(
+            agent=agent,
+            session_id="bounded-session",
+            conversation_history=[],
+        )
+        first = kb.claim_task(conn, tid)
+        assert first is not None and first.current_run_id is not None
+        monkeypatch.setenv("HERMES_KANBAN_RUN_ID", str(first.current_run_id))
+        with pytest.raises(SystemExit) as first_exit:
+            cli_module._run_quiet_single_query(worker_cli, "work kanban task")
+        assert first_exit.value.code == 1
+        after_first = kb.get_task(conn, tid)
+        assert after_first is not None and after_first.status == "ready"
+
+        second = kb.claim_task(conn, tid)
+        assert second is not None and second.current_run_id is not None
+        monkeypatch.setenv("HERMES_KANBAN_RUN_ID", str(second.current_run_id))
+        with pytest.raises(SystemExit) as second_exit:
+            cli_module._run_quiet_single_query(worker_cli, "work kanban task")
+        assert second_exit.value.code == 1
+        after_second = kb.get_task(conn, tid)
+        assert after_second is not None and after_second.status == "blocked"
+        gave_up = [event for event in kb.list_events(conn, tid) if event.kind == "gave_up"]
+        assert len(gave_up) == 1
+        assert (gave_up[0].payload or {}).get("protocol_violations") == 2
+    finally:
+        conn.close()
 
 
 def test_notify_sub_starts_caught_up_on_active_task(kanban_home):
@@ -1416,3 +1589,305 @@ def test_notify_sub_starts_caught_up_on_active_task(kanban_home):
         conn.close()
 
 
+# ---------------------------------------------------------------------------
+# Dependency edges against already-satisfied archived parents
+# ---------------------------------------------------------------------------
+
+
+def _parent_edges(conn, task_id: str) -> list[str]:
+    return [
+        r[0] for r in conn.execute(
+            "SELECT child_id FROM task_links WHERE parent_id = ? ORDER BY child_id", (task_id,),
+        ).fetchall()
+    ]
+
+
+def _status(conn, task_id: str) -> str:
+    task = kb.get_task(conn, task_id)
+    assert task is not None
+    return task.status
+
+
+def test_link_against_archived_completed_parent_is_skipped_not_minted(kanban_home):
+    """An edge that would be born permanently satisfied is never persisted.
+
+    ``archive_task`` already deletes such an edge when the link is made first
+    and the parent archives second (``_clear_satisfied_outgoing_links``). The
+    reverse ordering — parent already archived-after-completion when the edge is
+    minted — used to leave a row that no gate ever consults and that every
+    link-resolving surface has to remember to filter. Both orderings must land
+    on the same board state, via BOTH mint paths (``create_task(parents=...)``
+    and ``link_tasks``), and the skip must be auditable.
+    """
+    conn = kbc.connect()
+    try:
+        parent = kb.create_task(conn, title="finished and filed away")
+        assert kb.complete_task(conn, parent)
+        assert kb.archive_task(conn, parent)
+
+        # Path 1: create_task(parents=[...]).
+        born = kb.create_task(conn, title="created under an archived parent", parents=[parent])
+        assert _parent_edges(conn, parent) == [], (
+            "create_task must not mint an edge against an archived-completed parent"
+        )
+        created = next(e for e in kb.list_events(conn, born) if e.kind == "created")
+        assert (created.payload or {}).get("skipped_parent_links") == [parent], (
+            "the skipped parent must be auditable on the created event"
+        )
+        born_skip = next(e for e in kb.list_events(conn, born) if e.kind == "link_skipped")
+        assert (born_skip.payload or {}) == {
+            "parent": parent,
+            "child": born,
+            "reason": "parent_archived_after_completion",
+        }, "both mint paths must record the skip in the same machine-readable shape"
+        # The dependency is genuinely met, so the child is released as usual.
+        assert _status(conn, born) == "ready"
+
+        # Path 2: link_tasks after the fact.
+        linked = kb.create_task(conn, title="linked to an archived parent")
+        kb.link_tasks(conn, parent, linked)
+        assert _parent_edges(conn, parent) == [], (
+            "link_tasks must not mint an edge against an archived-completed parent"
+        )
+        kinds = [e.kind for e in kb.list_events(conn, linked)]
+        assert "linked" not in kinds, "no edge was created, so none may be reported as linked"
+        skipped = next(e for e in kb.list_events(conn, linked) if e.kind == "link_skipped")
+        assert (skipped.payload or {}) == {
+            "parent": parent,
+            "child": linked,
+            "reason": "parent_archived_after_completion",
+        }
+        assert _status(conn, linked) == "ready"
+    finally:
+        conn.close()
+
+
+def test_archived_parent_without_completion_still_mints_a_gating_edge(kanban_home):
+    """A withdrawn parent was never satisfied: its edges are real and must gate.
+
+    The skip predicate is ``archived AND completed_at``, so an archived task that
+    never completed keeps minting genuine blockers through both paths.
+    """
+    conn = kbc.connect()
+    try:
+        withdrawn = kb.create_task(conn, title="withdrawn, never finished")
+        assert kb.archive_task(conn, withdrawn)
+
+        born = kb.create_task(conn, title="created under a withdrawn parent", parents=[withdrawn])
+        assert _parent_edges(conn, withdrawn) == [born]
+        assert _status(conn, born) == "todo"
+        assert kb._parents_satisfied(conn, born) is False
+        ok, reason = kb.promote_task(conn, born, actor="operator")
+        assert ok is False and withdrawn in (reason or "")
+
+        linked = kb.create_task(conn, title="linked to a withdrawn parent")
+        assert _status(conn, linked) == "ready"
+        kb.link_tasks(conn, withdrawn, linked)
+        assert _parent_edges(conn, withdrawn) == sorted([born, linked])
+        # Criterion 3: link_tasks' re-gate still demotes a ready child.
+        assert _status(conn, linked) == "todo"
+        assert any(e.kind == "linked" for e in kb.list_events(conn, linked))
+    finally:
+        conn.close()
+
+
+def test_done_parent_still_gets_a_real_edge_and_survives_reopen(kanban_home):
+    """A ``done`` parent is only PROVISIONALLY satisfied, so its edge is kept.
+
+    Reopening a done parent clears ``completed_at`` and retracts descendants via
+    ``invalidate_descendants_for_parent_reopen``, which walks ``task_links``.
+    Widening the skip from ``archived AND completed_at`` to the full
+    ``_parent_dependency_satisfied`` would silently strand every child linked
+    after its parent finished — this pins that it does not happen.
+    """
+    conn = kbc.connect()
+    try:
+        parent = kb.create_task(conn, title="done but not archived")
+        assert kb.complete_task(conn, parent)
+        child = kb.create_task(conn, title="linked after parent finished", parents=[parent])
+        assert _parent_edges(conn, parent) == [child], (
+            "a done (not archived) parent must keep a real edge — reopening it "
+            "has to be able to find and retract this child"
+        )
+        assert _status(conn, child) == "ready"
+
+        # The done-reopen path every surface routes through.
+        result = kb.invalidate_descendants_for_parent_reopen(
+            conn, parent, author="operator",
+        )
+        assert [entry["id"] for entry in result["invalidated"]] == [child], (
+            "reopening the parent must find and retract the child through its edge"
+        )
+        assert _status(conn, child) == "todo"
+    finally:
+        conn.close()
+
+
+def test_unarchive_restores_a_skipped_link_and_regates_the_child(kanban_home):
+    """Reopen semantics for the skipped edge — the whole point of the skip.
+
+    A skip is only correct while the parent's completion evidence is permanent.
+    Reopening the parent withdraws it, so the deferred edge is re-minted from the
+    audit trail and the child that was released on that evidence is retracted.
+    Anything less would leave a user looking at a card they believe is linked
+    while the board quietly lets it run — which is exactly the failure mode the
+    card warned about.
+    """
+    conn = kbc.connect()
+    try:
+        parent = kb.create_task(conn, title="archived, then reopened")
+        assert kb.complete_task(conn, parent)
+        assert kb.archive_task(conn, parent)
+        via_create = kb.create_task(conn, title="skipped via create", parents=[parent])
+        via_link = kb.create_task(conn, title="skipped via link")
+        kb.link_tasks(conn, parent, via_link)
+        assert _parent_edges(conn, parent) == []
+        assert _status(conn, via_create) == "ready"
+        assert _status(conn, via_link) == "ready"
+
+        assert kb.unarchive_task(conn, parent, status="todo")
+        reopened = kb.get_task(conn, parent)
+        assert reopened is not None and reopened.completed_at is None
+        assert _parent_edges(conn, parent) == sorted([via_create, via_link]), (
+            "both skip records must be replayed into real edges on reopen"
+        )
+        assert _status(conn, via_create) == "todo"
+        assert _status(conn, via_link) == "todo"
+        restored = next(
+            e for e in kb.list_events(conn, parent) if e.kind == "restored_child_links"
+        )
+        assert sorted((restored.payload or {})["children"]) == sorted([via_create, via_link])
+    finally:
+        conn.close()
+
+
+def test_unarchive_does_not_revive_a_link_the_operator_cut(kanban_home):
+    """An explicit unlink outranks a replayed skip.
+
+    The restore reads the audit trail, so without this reopening a parent would
+    resurrect an edge a human had deliberately removed — overturning their
+    decision with no trace. ``unlink_tasks`` is the operator's real path and has
+    to cancel a deferred relation too: from the caller's side the dependency
+    existed and now does not, whether or not a row ever backed it.
+    """
+    conn = kbc.connect()
+    try:
+        parent = kb.create_task(conn, title="archived parent")
+        assert kb.complete_task(conn, parent)
+        assert kb.archive_task(conn, parent)
+        child = kb.create_task(conn, title="child whose edge is cut", parents=[parent])
+
+        assert kb.unlink_tasks(conn, parent, child) is True, (
+            "cutting a deferred relation is a real removal, not a no-op"
+        )
+        assert any(
+            e.kind == "unlinked" and (e.payload or {}).get("parent") == parent
+            for e in kb.list_events(conn, child)
+        )
+
+        assert kb.unarchive_task(conn, parent, status="todo")
+        assert _parent_edges(conn, parent) == [], (
+            "a pair the operator explicitly unlinked must not be restored"
+        )
+        assert _status(conn, child) == "ready"
+    finally:
+        conn.close()
+
+
+def test_reverse_link_against_a_deferred_edge_is_rejected_as_a_cycle(kanban_home):
+    """A deferred edge gates the cycle check exactly as a persisted row does.
+
+    Without this, ``link_tasks(child, parent)`` succeeds because the P -> C
+    relation is only in the audit trail — and reopening P then has to choose
+    between writing a cycle and silently dropping the child. Either way the
+    caller is left believing in a link the board forgot, which is the outcome
+    this whole skip contract exists to prevent. On ``dev`` the persisted row
+    rejects the reverse link, so this pins that behavior across the change.
+    """
+    conn = kbc.connect()
+    try:
+        parent = kb.create_task(conn, title="archived, completed parent")
+        assert kb.complete_task(conn, parent)
+        assert kb.archive_task(conn, parent)
+        child = kb.create_task(conn, title="child of a deferred edge", parents=[parent])
+        assert _parent_edges(conn, parent) == []
+
+        with pytest.raises(ValueError, match="cycle"):
+            kb.link_tasks(conn, child, parent)
+
+        # Transitive: P -> C (deferred) plus C -> M (real) still blocks M -> P.
+        middle = kb.create_task(conn, title="middle", parents=[child])
+        with pytest.raises(ValueError, match="cycle"):
+            kb.link_tasks(conn, middle, parent)
+
+        # And the deferred edge is still restorable, since nothing overrode it.
+        assert kb.unarchive_task(conn, parent, status="todo")
+        assert _parent_edges(conn, parent) == [child]
+        assert _status(conn, child) == "todo"
+    finally:
+        conn.close()
+
+
+def test_archive_cleared_edge_is_not_resurrected_by_an_older_skip(kanban_home):
+    """A later archive cleanup outranks the skip that preceded it.
+
+    Sequence: skip P -> C, reopen P (restores the edge), complete + archive P
+    again (``_clear_satisfied_outgoing_links`` DELETES the edge), reopen again.
+    The second reopen must not replay the original skip: a cleared edge is a
+    deleted row, not a deferred write, and ``unarchive_task``'s contract is that
+    those are gone for good.
+    """
+    conn = kbc.connect()
+    try:
+        parent = kb.create_task(conn, title="archived twice")
+        assert kb.complete_task(conn, parent)
+        assert kb.archive_task(conn, parent)
+        child = kb.create_task(conn, title="skipped then cleared", parents=[parent])
+
+        assert kb.unarchive_task(conn, parent, status="ready")
+        assert _parent_edges(conn, parent) == [child]
+
+        assert kb.complete_task(conn, parent)
+        assert kb.archive_task(conn, parent)
+        assert _parent_edges(conn, parent) == [], "archival clears the satisfied edge"
+
+        assert kb.unarchive_task(conn, parent, status="todo")
+        assert _parent_edges(conn, parent) == [], (
+            "an edge deleted by archive cleanup stays deleted; the older skip "
+            "record must not resurrect it"
+        )
+        restored_events = [
+            e for e in kb.list_events(conn, parent) if e.kind == "restored_child_links"
+        ]
+        assert len(restored_events) == 1, "only the first reopen restored anything"
+    finally:
+        conn.close()
+
+
+def test_relink_after_an_unlink_wins_over_the_older_cut(kanban_home):
+    """The newest intent wins in both directions, not just unlink-over-skip.
+
+    Sequence: skip P -> C, operator unlinks it, then explicitly links it again
+    while P is still archived-after-completion (so the mint is skipped a second
+    time). Reopening P must honor the LATEST request and restore the edge —
+    treating the historical unlink as timeless would silently lose a dependency
+    the operator just asked for.
+    """
+    conn = kbc.connect()
+    try:
+        parent = kb.create_task(conn, title="archived parent")
+        assert kb.complete_task(conn, parent)
+        assert kb.archive_task(conn, parent)
+        child = kb.create_task(conn, title="cut then relinked", parents=[parent])
+
+        assert kb.unlink_tasks(conn, parent, child) is True
+        kb.link_tasks(conn, parent, child)
+        assert _parent_edges(conn, parent) == [], "the relink is skipped, like the first"
+
+        assert kb.unarchive_task(conn, parent, status="todo")
+        assert _parent_edges(conn, parent) == [child], (
+            "the later link is the operator's current intent and must be restored"
+        )
+        assert _status(conn, child) == "todo"
+    finally:
+        conn.close()

@@ -43,6 +43,10 @@ vi.mock('@/i18n', () => ({
 }))
 
 vi.mock('@/store/profile', () => ({
+  // The rail keys its refresh on the active backend (connection + profile) so
+  // switching sources re-enumerates that machine's profiles (#85731), so this
+  // mock must publish the connection atom the component subscribes to.
+  $activeGatewayConnection: atom<null | string>(null),
   $activeGatewayProfile: atom('default'),
   $profileColors: atom({}),
   $profileCreateRequest: atom(0),
@@ -55,6 +59,9 @@ vi.mock('@/store/profile', () => ({
     (profile.display_name ?? '').trim() || profile.name,
   refreshActiveProfile: vi.fn().mockResolvedValue(undefined),
   selectProfile: vi.fn(),
+  // The rail dials profiles on whichever source is live, not just the local
+  // pool — same #85731 seam as the connection atom above.
+  selectProfileOnActiveConnection: vi.fn(),
   setProfileColor: vi.fn(),
   setProfileOrder: vi.fn(),
   setShowAllProfiles: vi.fn(),

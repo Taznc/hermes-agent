@@ -30,6 +30,7 @@ import { $sessionControlBySession, refreshSessionControl } from '@/store/session
 import { $threadScrolledUp } from '@/store/thread-scroll'
 import { openSessionInNewWindow } from '@/store/windows'
 
+import { BackgroundTaskCard } from './background-task-card'
 import { PreviewStatusRow } from './preview-row'
 import { SessionControlSections } from './session-control'
 import { useSessionValue } from './session-control-utils'
@@ -233,15 +234,24 @@ export function ComposerStatusStack({ onSubmit, queue, sessionId }: ComposerStat
           icon={<Codicon className="text-muted-foreground/70" name={GROUP_ICON[group.type]} size="0.8rem" />}
           label={groupLabel(group, t.statusStack)}
         >
-          {group.items.map(item => (
-            <StatusItemRow
-              item={item}
-              key={item.id}
-              onDismiss={sessionId ? id => dismissBackgroundProcess(sessionId, id) : undefined}
-              onOpen={() => openSubagent(item)}
-              onStop={sessionId ? id => void stopBackgroundProcess(sessionId, id) : undefined}
-            />
-          ))}
+          {group.items.map(item =>
+            item.type === 'background' ? (
+              <BackgroundTaskCard
+                item={item}
+                key={item.id}
+                onDismiss={sessionId ? id => dismissBackgroundProcess(sessionId, id) : undefined}
+                onStop={sessionId ? id => void stopBackgroundProcess(sessionId, id) : undefined}
+              />
+            ) : (
+              <StatusItemRow
+                item={item}
+                key={item.id}
+                onDismiss={sessionId ? id => dismissBackgroundProcess(sessionId, id) : undefined}
+                onOpen={() => openSubagent(item)}
+                onStop={sessionId ? id => void stopBackgroundProcess(sessionId, id) : undefined}
+              />
+            )
+          )}
         </StatusSection>
       )
     })

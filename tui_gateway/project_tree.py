@@ -392,7 +392,7 @@ def _home_project(homeless: list[dict], hydrate: bool, previews: list[dict]) -> 
 
 def build_tree(
     projects: list[dict], sessions: list[dict], discovered_repos: list[dict],
-    resolve: Optional[Resolve] = None, *, preview_limit: int = 3, hydrate: bool = False,
+    resolve: Optional[Resolve] = None, *, preview_limit: int = 8, hydrate: bool = False,
     is_junk_root: Optional[Callable[[str], bool]] = None,
     is_junk_cwd: Optional[Callable[[str], bool]] = None, exists: Optional[Exists] = None) -> dict:
     """Build the authoritative project tree -> ``{"projects", "scoped_session_ids"}``.

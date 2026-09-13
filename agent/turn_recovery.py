@@ -725,6 +725,7 @@ def nonretryable_client_error_result(
         return _billing_failure_result(
             classified=classified, summary=_nonretryable_summary, messages=messages,
             api_call_count=api_call_count, provider=provider, base_url=base_url, model=model,
+            agent=agent,
         )
     return _failed_turn_result(_nonretryable_summary, messages, api_call_count, _nonretryable_summary)
 
@@ -748,7 +749,7 @@ def max_retries_exhausted_result(
     # Result/guidance helpers stay in the loop module (tests import + patch them there).
     from agent.conversation_loop import (
         _billing_block_dict, _billing_or_entitlement_message, _billing_terminal_label,
-        _print_billing_or_entitlement_guidance,
+        _fallback_availability, _print_billing_or_entitlement_guidance, _resolve_rate_limit_reset_at,
     )
 
     agent._flush_status_buffer()
@@ -854,6 +855,15 @@ def max_retries_exhausted_result(
         # Present only for billing walls: (provider, billing_url, is_nous, message).
         "billing_block": _billing_block,
     })
+    # Phase 2.12 (Desktop rate-limit recovery): when the failure is a rate limit, surface the
+    # best-known reset time; always surface fallback-chain visibility when a chain exists.
+    if classified.reason in (FailoverReason.rate_limit, FailoverReason.upstream_rate_limit):
+        _rl_reset_at = _resolve_rate_limit_reset_at(agent, classified)
+        if _rl_reset_at is not None:
+            result["reset_at"] = _rl_reset_at
+    _fb_avail = _fallback_availability(agent)
+    if _fb_avail is not None:
+        result["fallback_available"] = _fb_avail
     return result
 
 

@@ -19,6 +19,7 @@ import { useI18n } from '@/i18n'
 import { isDesktopFsRemoteMode } from '@/lib/desktop-fs'
 import { displayPath } from '@/lib/display-path'
 import { normalizeOrLocalPreviewTarget } from '@/lib/local-preview'
+import { cleanPath } from '@/lib/path-compare'
 import { cn } from '@/lib/utils'
 import {
   $renamingPath,
@@ -73,14 +74,18 @@ const STATUS_GLYPH: Record<string, { icon: string; tone: string }> = {
 
 // Review paths are repo-relative; the composer drop expects absolute paths, so
 // join against the pane's repo (its pinned scope, else the active session cwd).
+// `cleanPath` unifies the join so a backslash-rooted Windows cwd joined with
+// git's forward-slash relative path doesn't produce a mixed-separator string
+// (`C:\Users\x\proj/src/a.ts`) — the same lookup-key class of bug as the
+// change-map keys in coding-status.ts.
 function absolutePath(relative: string): string {
   if (/^([a-zA-Z]:[\\/]|\/)/.test(relative)) {
     return relative
   }
 
-  const cwd = reviewRepoCwd()?.replace(/[\\/]+$/, '')
+  const cwd = reviewRepoCwd()
 
-  return cwd ? `${cwd}/${relative}` : relative
+  return cwd ? `${cleanPath(cwd)}/${cleanPath(relative)}` : relative
 }
 
 // Fast, layout-aware row: `layout` slides siblings when one is inserted/removed

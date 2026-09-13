@@ -69,9 +69,17 @@ export function restorePendingClarifyFromSnapshot(
         )
       : undefined
 
+  const lockedNotes =
+    typeof pending.notes === 'object' && pending.notes !== null
+      ? Object.fromEntries(
+          Object.entries(pending.notes).filter((entry): entry is [string, string] => typeof entry[1] === 'string')
+        )
+      : undefined
+
   const request: ClarifyRequest = {
     choices: choices.length > 0 ? choices : null,
     lockedAnswers,
+    lockedNotes,
     multiSelect: pending.multi_select === true,
     question,
     receivedAt: Date.now() / 1000,

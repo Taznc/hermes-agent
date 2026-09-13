@@ -448,6 +448,10 @@ class ProfileInfo:
     gateway_running: bool
     model: Optional[str] = None
     provider: Optional[str] = None
+    # ``agent.reasoning_effort`` from the profile's own config.yaml — what a
+    # kanban worker spawned for this profile actually runs at when a task has
+    # no per-task override. Empty/None = provider default depth.
+    reasoning_effort: Optional[str] = None
     has_env: bool = False
     skill_count: int = 0
     alias_path: Optional[Path] = None
@@ -489,21 +493,25 @@ def _read_distribution_meta(profile_dir: Path) -> tuple:
 
 
 def _read_config_model(profile_dir: Path) -> tuple:
-    """Read model/provider from a profile's config.yaml. Returns (model, provider)."""
+    """Read model/provider/reasoning-effort from a profile's config.yaml.
+    Returns (model, provider, reasoning_effort)."""
     config_path = profile_dir / "config.yaml"
     if not config_path.exists():
-        return None, None
+        return None, None, None
     try:
         # load_config() targets the ACTIVE profile's home; read THIS profile's file raw.
         from hermes_cli.config import read_user_config_raw
-        model_cfg = read_user_config_raw(config_path).get("model", {})
+        raw = read_user_config_raw(config_path)
+        agent_cfg = raw.get("agent", {})
+        effort = agent_cfg.get("reasoning_effort") if isinstance(agent_cfg, dict) else None
+        model_cfg = raw.get("model", {})
         if isinstance(model_cfg, str):
-            return model_cfg, None
+            return model_cfg, None, effort
         if isinstance(model_cfg, dict):
-            return model_cfg.get("default") or model_cfg.get("model"), model_cfg.get("provider")
+            return model_cfg.get("default") or model_cfg.get("model"), model_cfg.get("provider"), effort
     except Exception:
         pass
-    return None, None
+    return None, None, None
 
 
 def _seed_model_config(profile_dir: Path) -> None:
@@ -667,7 +675,7 @@ def set_profile_display_name(profile_name: str, display_name: str) -> str:
 
 def _profile_info(name: str, path: Path, *, is_default: bool, alias_name: Optional[str] = None) -> ProfileInfo:
     """Build one :class:`ProfileInfo` from a profile directory."""
-    model, provider = _read_config_model(path)
+    model, provider, reasoning_effort = _read_config_model(path)
     dist_name, dist_version, dist_source = _read_distribution_meta(path)
     meta = read_profile_meta(path)
     alias_path = _wrapper_path(alias_name) if alias_name else None
@@ -678,7 +686,8 @@ def _profile_info(name: str, path: Path, *, is_default: bool, alias_name: Option
         gateway_running = gateway_running or _served_by_running_multiplexer(name)
     return ProfileInfo(
         name=name, path=path, is_default=is_default, gateway_running=gateway_running, model=model,
-        provider=provider, has_env=(path / ".env").exists(), skill_count=_count_skills(path),
+        provider=provider, reasoning_effort=reasoning_effort, has_env=(path / ".env").exists(),
+        skill_count=_count_skills(path),
         alias_path=alias_path, alias_name=alias_name, distribution_name=dist_name,
         distribution_version=dist_version, distribution_source=dist_source,
         **meta,
@@ -1110,7 +1119,7 @@ def _rmtree_with_retry(profile_dir: Path, onexc_handler) -> None:
 
 def _print_delete_summary(canon: str, profile_dir: Path, gw_running: bool, wrapper_path: Optional[Path]) -> None:
     """Show what ``delete_profile`` is about to remove."""
-    model, provider = _read_config_model(profile_dir)
+    model, provider, _effort = _read_config_model(profile_dir)
     skill_count = _count_skills(profile_dir)
     dist_name, dist_version, dist_source = _read_distribution_meta(profile_dir)
     print(f"\nProfile: {canon}")

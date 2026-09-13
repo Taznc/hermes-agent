@@ -14,8 +14,17 @@ import { refreshActiveProfile } from '@/store/profile'
  * used elsewhere in the sidebar (see refreshProjects/refreshProjectTree).
  * Extracted into its own hook (rather than left inline in ProfileRail) so the
  * focus/visibility wiring is unit-testable without rendering the whole rail.
+ *
+ * `scopeKey` identifies the backend the rail is currently pointed at (active
+ * gateway connection + profile). Switching connection or profile is a soft
+ * re-home that deliberately keeps ProfileRail mounted, so a mount-only fetch
+ * would leave the rail showing the PREVIOUS machine's profiles forever
+ * (#85731 -- "profile rail never updates when connecting to a remote"). Keying
+ * the effect on it re-enumerates against whichever backend is now live.
+ * Optional so callers that only need the focus/visibility behaviour (and the
+ * hook's own tests) can omit it.
  */
-export function useProfileRailRefreshOnActive(): void {
+export function useProfileRailRefreshOnActive(scopeKey?: string): void {
   useEffect(() => {
     void refreshActiveProfile()
 
@@ -34,5 +43,5 @@ export function useProfileRailRefreshOnActive(): void {
       window.removeEventListener('focus', onActive)
       document.removeEventListener('visibilitychange', onActive)
     }
-  }, [])
+  }, [scopeKey])
 }

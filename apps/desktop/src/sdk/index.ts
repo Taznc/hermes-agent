@@ -67,11 +67,13 @@ import {
   newSessionInAgent,
   newSessionInProfile,
   normalizeProfileKey,
+  pinNewChatProfile,
   refreshProfiles,
   selectProfile,
   setActiveProfile,
   setShowAllProfiles
 } from '@/store/profile'
+import { requestStartWorkSession } from '@/store/projects'
 import {
   $activeSessionId,
   $connection,
@@ -334,6 +336,8 @@ export const BOT_CHAT_SESSION_HYDRATION_TIMEOUT_MS = 60_000
 let openSessionGeneration = 0
 
 export interface PluginOpenSessionOptions {
+  /** A short-lived caller may abandon its selection while the owner socket dials. */
+  isCurrent?: () => boolean
   awaitHydration?: boolean
   expectHistory?: boolean
   /** Always request a sequenced session.resume after the open, even when the
@@ -364,6 +368,13 @@ export interface PluginOpenSessionOptions {
 export interface PluginNewChatOptions {
   workspaceMode?: WorkspaceMode
   workspaceOwnerKey?: string
+}
+
+export interface PluginNewChatContextOptions {
+  cwd?: string
+  draft?: string
+  openTab?: boolean
+  profile?: null | string
 }
 
 // Raise the "Syncing…" affordance for a paint-first wake (#89843) and tear it
@@ -643,21 +654,34 @@ export const host = {
    *  installing its catalog entry first. Uses the same OAuth flow as Settings. */
   completeMcpOAuth: async (options: Parameters<typeof completeMcpDesktopOAuth>[0] & { catalogPreset?: string }) => {
     const profile = capabilityScoped(options.profile)
+    let handedToOAuth = false
 
-    if (options.catalogPreset) {
-      const added = await requestGatewayForAgent<{ ok?: boolean; error?: string }>(
-        profile.connectionId ?? null,
-        profile.profile || 'default',
-        'mcp.servers.add',
-        { name: options.serverName, preset: options.catalogPreset }
-      )
+    try {
+      if (options.catalogPreset) {
+        const added = await requestGatewayForAgent<{ ok?: boolean; error?: string }>(
+          profile.connectionId ?? null,
+          profile.profile || 'default',
+          'mcp.servers.add',
+          { name: options.serverName, preset: options.catalogPreset }
+        )
 
-      if (!added.ok) {
-        throw new Error(added.error || 'Could not add server')
+        if (!added.ok) {
+          throw new Error(added.error || 'Could not add server')
+        }
       }
-    }
 
-    return completeMcpDesktopOAuth({ ...options, profile })
+      handedToOAuth = true
+
+      return await completeMcpDesktopOAuth({ ...options, profile })
+    } catch (error) {
+      // A catalog install can fail before the OAuth helper receives the popup
+      // handle. Until that handoff, this wrapper owns caller-side cleanup.
+      if (!handedToOAuth && options.popupWindow && !options.popupWindow.closed) {
+        options.popupWindow.close()
+      }
+
+      throw error
+    }
   },
 
   /** Navigate the app router (hash routes, e.g. '/command-center?section=system'). */
@@ -881,6 +905,7 @@ export const host = {
 
     const openingStillCurrent = () =>
       generation === openSessionGeneration &&
+      (options.isCurrent?.() ?? true) &&
       (options.workspaceMode !== 'bots' ||
         ($workspaceMode.get() === 'bots' && $workspaceOwnerKey.get() === (options.workspaceOwnerKey ?? null)))
 
@@ -995,10 +1020,10 @@ export const host = {
 
           const intent = options.intent ?? 'in-place'
 
-          if (options.workspaceMode === 'bots') {
+          if (options.workspaceMode) {
             openSession(storedSessionId, navigate, intent, {
               ownerRoute: ownerRoute ?? undefined,
-              workspaceMode: 'bots',
+              workspaceMode: options.workspaceMode,
               workspaceOwnerKey: options.workspaceOwnerKey,
               ...(options.tabTitle ? { workspaceTabTitle: options.tabTitle } : {})
             })
@@ -1232,6 +1257,16 @@ export const host = {
     }
 
     window.location.hash = '#/'
+  },
+
+  /** Start a fresh chat through the workspace-session flow, optionally
+   *  preselecting its profile and seeding an editable, unsent draft. */
+  newChatWithContext: (options: PluginNewChatContextOptions = {}): void => {
+    if (options.profile?.trim()) {
+      pinNewChatProfile(options.profile)
+    }
+
+    requestStartWorkSession(options.cwd, options.draft, { freshSurface: true, openTab: options.openTab })
   },
 
   /** Front the tab a Bot Mode owner already has open — the tile that owner's
@@ -1518,6 +1553,11 @@ export { SkillsView } from '@/app/skills'
  *  renders anywhere (a plugin dialog); pass a live `gateway` (see
  *  `host.getGateway()`) and an optional `profile` to scope it to one bot. */
 export { McpTab } from '@/app/skills/mcp-tab'
+/** The compact Streamdown preset core uses for tool detail bodies — tighter
+ *  typography, tokenized fences/tables, external links routed through the
+ *  host. Prefer it over raw `Streamdown` for small in-panel prose so every
+ *  surface renders markdown identically. */
+export { CompactMarkdown } from '@/components/chat/compact-markdown'
 /** The oversized Collapse lettering an empty chat is titled with — core writes
  *  "HERMES AGENT" with it, a `chat.empty` contribution writes its own name. */
 export { Wordmark } from '@/components/chat/wordmark'
@@ -1595,6 +1635,10 @@ export { Separator } from '@/components/ui/separator'
 export { Skeleton } from '@/components/ui/skeleton'
 export { Switch } from '@/components/ui/switch'
 export { Tabs, TabsList, TabsTrigger } from '@/components/ui/tabs'
+/** The flat text tab row (underline-on-active, no pill box) core uses for
+ *  in-panel tab strips. `TextTabMeta` is the quiet count/detail slot beside a
+ *  tab's label. Pair with `Tabs` only if you want the boxed segmented look. */
+export { TextTab, TextTabMeta } from '@/components/ui/text-tab'
 export { Textarea } from '@/components/ui/textarea'
 export { Tip, Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from '@/components/ui/tooltip'
 export type { GatewayEventListener } from '@/contrib/events'
@@ -1702,6 +1746,17 @@ export const TITLEBAR_AREAS = { center: 'titleBar.center', left: 'titleBar.left'
  *  setup.runtime_check, reconciled) — pass `host.request`. Don't hand-roll
  *  readiness from raw RPC shapes. */
 export { evaluateRuntimeReadiness, type RuntimeReadinessResult } from '@/lib/runtime-readiness'
+
+/** The transcript's active-work indicator as a contribution area: register a
+ *  `thread.activity` contribution and your component draws the "thinking" mark
+ *  in place of the core dither pulse. The row's status role, label, hint text,
+ *  and elapsed clock stay core-owned — you draw the mark, nothing else. */
+export {
+  THREAD_ACTIVITY_AREA,
+  type ThreadActivityContribution,
+  type ThreadActivityPhase,
+  type ThreadActivityState
+} from '@/lib/thread-activity'
 /** Canonical time formatting — every surface pulls from here so timestamps read
  *  the same app-wide. For a row's AGE, bucket with `coarseElapsed` and render
  *  the compact suffixes (`t.sidebar.row.ageMin` → "52m"), which is what the
@@ -1709,6 +1764,14 @@ export { evaluateRuntimeReadiness, type RuntimeReadinessResult } from '@/lib/run
  *  suffix. `relativeTime` is the bidirectional Intl form ("in 14 hr") — use it
  *  for a scheduled next-run, not for an age. */
 export { type AgoLabels, coarseElapsed, fmtDateTime, fmtDayTime, formatAgo, relativeTime } from '@/lib/time'
+/** Claim ONE tool's transcript card by name — core's hardcoded chain
+ *  (`clarify`, `setup_mcp`, `delegate_task`, `image_generate`, ...) consults
+ *  this registry first and falls through to its own rendering unchanged when
+ *  nothing claims the name. Last registration for a `toolName` wins, so a
+ *  plugin reload or update supersedes its own earlier claim without first
+ *  disposing it. A throwing `render` degrades to core's card for that tool,
+ *  never a blank transcript. */
+export { type ResolvedToolRenderer, resolveToolRenderer, TOOL_RENDERERS_AREA, type ToolRendererContribution } from '@/lib/tool-renderers'
 /** The transcript as a contribution area: register a named `::directive{...}`
  *  and the model can render your component inline in assistant messages. */
 export {
@@ -1717,6 +1780,16 @@ export {
   type TranscriptDirectiveProps
 } from '@/lib/transcript-directives'
 export { cn } from '@/lib/utils'
+/** THE persisted pane-size store, for a plugin surface that owns a drag sash
+ *  (a resizable drawer, rail, or docked panel). Read the current override with
+ *  `useValue($paneWidthOverride(id))`, write px during the drag with
+ *  `setPaneWidthOverride(id, px)`, and pass `undefined` to clear it back to the
+ *  surface's authored default — the same store, and the same double-click-to-
+ *  reset contract, the app's own sashes use, so a plugin's width persists to
+ *  localStorage and is cleared by a layout reset alongside core's panes rather
+ *  than drifting in a parallel store. Namespace the id with your plugin slug
+ *  (`kanban.taskDrawer`). */
+export { $paneWidthOverride, setPaneWidthOverride } from '@/store/panes'
 /** THE unread store behind `SessionStatusDot`'s emerald dot. A plugin that
  *  learns out-of-band that a session produced something the user hasn't seen
  *  (a roster poll's activity watermark, say) writes HERE rather than keeping

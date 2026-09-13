@@ -72,6 +72,55 @@ def test_kanban_show_text_renders_graph_with_open_connection(kanban_home):
     assert "Cannot operate on a closed database" not in output
 
 
+def test_kanban_show_text_renders_run_analytics_when_present(kanban_home):
+    with kbc.connect_closing() as conn:
+        tid = kb.create_task(conn, title="analytics task", assignee="alice")
+        claimed = kb.claim_task(conn, tid)
+        conn.execute(
+            """
+            UPDATE task_runs
+               SET model = 'gpt-5.6-sol', provider = 'openai', reasoning_effort = 'high',
+                   input_tokens = 1000, output_tokens = 500, cache_read_tokens = 200,
+                   reasoning_tokens = 50, api_calls = 12, tool_calls = 30,
+                   estimated_cost_usd = 1.23
+             WHERE id = ?
+            """,
+            (claimed.current_run_id,),
+        )
+        conn.commit()
+
+    output = kc.run_slash(f"show {tid}")
+
+    assert "model: gpt-5.6-sol · openai · high" in output
+    assert "tokens: in 1,000 · out 500 · cache 200 · reasoning 50" in output
+    assert "calls: API 12 · tools 30" in output
+    assert "estimated cost: $1.2300" in output
+
+
+def test_kanban_show_text_omits_absent_run_analytics(kanban_home):
+    with kbc.connect_closing() as conn:
+        tid = kb.create_task(conn, title="plain task", assignee="alice")
+        kb.claim_task(conn, tid)
+
+    output = kc.run_slash(f"show {tid}")
+
+    assert "model:" not in output
+    assert "tokens:" not in output
+    assert "undefined" not in output
+
+
+def test_list_text_renders_known_and_unknown_priority_tiers(kanban_home):
+    """Priority 0 must render as Normal rather than vanish by truthiness."""
+    with kbc.connect() as conn:
+        kb.create_task(conn, title="normal prio task", priority=0)
+        kb.create_task(conn, title="custom prio task", priority=90)
+
+    out = kc.run_slash("list")
+
+    assert "normalpriotask(normal)" in out.replace(" ", "")
+    assert "custompriotask(90)" in out.replace(" ", "")
+
+
 def test_board_override_is_isolated_per_concurrent_call(kanban_home, monkeypatch):
     kb.create_board("alpha")
     kb.create_board("beta")
@@ -182,3 +231,136 @@ def test_run_slash_reclaim_running_task(kanban_home):
 # ---------------------------------------------------------------------------
 
 
+# ---------------------------------------------------------------------------
+# Roadmap lanes — create --idea/--roadmap plus refine/demote/spawn
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("flag,expected", [("--idea", "idea"), ("--roadmap", "roadmap")])
+def test_create_lane_flag_needs_no_assignee(kanban_home, flag, expected):
+    """``--idea``/``--roadmap`` land the card in the inert lane; no assignee required."""
+    out = kc.run_slash(f'create "wishlist item" {flag} --json')
+    payload = json.loads(out)
+    assert payload["status"] == expected
+    assert payload["assignee"] is None
+
+
+def test_create_lane_flags_are_mutually_exclusive_with_triage(kanban_home):
+    out = kc.run_slash('create "x" --idea --triage')
+    assert "mutually exclusive" in out
+    with kbc.connect_closing() as conn:
+        assert kb.list_tasks(conn) == []
+
+
+def test_refine_demote_spawn_slash_round_trip(kanban_home):
+    """The three verbs move a card through the lanes and into the work queue."""
+    tid = json.loads(kc.run_slash('create "wish" --idea --json'))["id"]
+
+    assert "Refined to roadmap" in kc.run_slash(f"refine {tid}")
+    assert json.loads(kc.run_slash(f"show {tid} --json"))["task"]["status"] == "roadmap"
+
+    assert "Demoted to idea" in kc.run_slash(f"demote {tid}")
+    assert json.loads(kc.run_slash(f"show {tid} --json"))["task"]["status"] == "idea"
+
+    kc.run_slash(f"refine {tid}")
+    assert "Spawned to triage" in kc.run_slash(f"spawn {tid}")
+    assert json.loads(kc.run_slash(f"show {tid} --json"))["task"]["status"] == "triage"
+
+
+def test_spawn_to_ready_opts_out_of_triage(kanban_home):
+    tid = json.loads(kc.run_slash('create "wish" --roadmap --json'))["id"]
+    assert "Spawned to ready" in kc.run_slash(f"spawn {tid} --to ready")
+    assert json.loads(kc.run_slash(f"show {tid} --json"))["task"]["status"] == "ready"
+
+
+def test_refine_on_live_work_reports_the_attempted_transition(kanban_home):
+    """A refused lane move names from->to so the operator sees why nothing happened, and
+    the live card is untouched."""
+    tid = json.loads(kc.run_slash('create "real work" --assignee alice --json'))["id"]
+    out = kc.run_slash(f"refine {tid}")
+    assert "'ready' -> 'roadmap'" in out
+    assert json.loads(kc.run_slash(f"show {tid} --json"))["task"]["status"] == "ready"
+
+
+def test_ls_groups_lanes_under_a_roadmap_header_after_live_work(kanban_home):
+    """Wishlist cards render below every live column so the listing still reads as
+    'what is in flight'."""
+    kc.run_slash('create "live task" --assignee alice')
+    kc.run_slash('create "wishlist item" --idea')
+    out = kc.run_slash("list")
+    assert "Roadmap (inert" in out
+    assert out.index("live task") < out.index("Roadmap (inert") < out.index("wishlist item")
+
+
+def test_ls_status_filter_accepts_lane_names(kanban_home):
+    kc.run_slash('create "wishlist item" --idea')
+    kc.run_slash('create "agreed item" --roadmap')
+    ideas = json.loads(kc.run_slash("list --status idea --json"))
+    assert [t["title"] for t in ideas] == ["wishlist item"]
+
+
+def test_spawn_to_ready_reports_the_gated_landing_not_the_request(kanban_home):
+    """``--to ready`` under an unfinished parent lands in ``todo``; the CLI must say where the
+    card actually went. Printing the requested "Spawned to ready" would tell the operator their
+    card is queued for dispatch when it is sitting in ``todo`` waiting on its parent."""
+    epic = json.loads(kc.run_slash('create "epic" --assignee alice --json'))["id"]
+    tid = json.loads(kc.run_slash(f'create "wish" --roadmap --parent {epic} --json'))["id"]
+
+    out = kc.run_slash(f"spawn {tid} --to ready")
+    assert "Spawned to todo" in out
+    assert "requested ready" in out
+    assert json.loads(kc.run_slash(f"show {tid} --json"))["task"]["status"] == "todo"
+
+
+# ---------------------------------------------------------------------------
+# dispatch — review-round cap must be visible in both output modes
+# ---------------------------------------------------------------------------
+
+
+def _card_at_the_review_round_cap(title: str) -> str:
+    """A ready card with three ``changes_requested`` rounds — one more than the
+    default ``kanban.max_review_rounds`` allows, so the next dispatch tick caps
+    and blocks it instead of re-dispatching."""
+    with kbc.connect_closing() as conn:
+        tid = kb.create_task(conn, title=title, assignee="implementer")
+        for reason in ("first", "second", "third"):
+            kb._append_event(conn, tid, "changes_requested", {"reason": reason})
+        conn.commit()
+    return tid
+
+
+def test_dispatch_json_reports_the_review_round_cap(kanban_home):
+    """A capped card is a state change the operator must be able to see. The
+    JSON payload carried every other dispatcher transition but silently dropped
+    this one, so `hermes kanban dispatch --json` reported an empty tick while a
+    card had just been blocked."""
+    tid = _card_at_the_review_round_cap("runaway rework")
+
+    payload = json.loads(kc.run_slash("dispatch --dry-run --json"))
+
+    assert payload["blocked_review_round_cap"] == [
+        {"task_id": tid, "changes_rounds": 3}
+    ]
+    assert payload["spawned"] == []
+
+
+def test_dispatch_text_reports_the_review_round_cap(kanban_home):
+    """Same transition, human-readable mode: the line must name the card, the
+    round count, and the cap that stopped it."""
+    tid = _card_at_the_review_round_cap("runaway rework")
+
+    out = kc.run_slash("dispatch --dry-run")
+
+    assert "kanban.max_review_rounds=3" in out
+    assert "after 3 change requests" in out
+    assert tid in out
+
+
+def test_dispatch_text_stays_silent_when_nothing_was_capped(kanban_home):
+    """Negative case: the cap line is per-entry, never an unconditional header."""
+    with kbc.connect_closing() as conn:
+        kb.create_task(conn, title="ordinary card", assignee="implementer")
+
+    out = kc.run_slash("dispatch --dry-run")
+
+    assert "max_review_rounds" not in out
