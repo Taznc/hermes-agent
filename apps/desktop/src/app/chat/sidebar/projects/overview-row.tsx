@@ -1,3 +1,4 @@
+import { useStore } from '@nanostores/react'
 import type * as React from 'react'
 import { useRef } from 'react'
 
@@ -6,6 +7,7 @@ import { Codicon } from '@/components/ui/codicon'
 import type { SessionInfo } from '@/hermes'
 import { useI18n } from '@/i18n'
 import { cn } from '@/lib/utils'
+import { $sidebarShowAllSessions } from '@/store/layout'
 
 import {
   SIDEBAR_LEAD_ICON_SIZE,
@@ -99,8 +101,10 @@ export function ProjectOverviewRow({
   // The appearance popover anchors here (the full row) so it opens flush with
   // the sidebar's content edge regardless of which side the sidebar is on.
   const rowRef = useRef<HTMLDivElement>(null)
-  const fetched = (previewSessions ?? []).slice(0, PROJECT_PREVIEW_COUNT)
-  const preview = renderRows ? (fetched.length ? fetched : latestProjectSessions(project, PROJECT_PREVIEW_COUNT)) : []
+  const showAllSessions = useStore($sidebarShowAllSessions)
+  const limit = showAllSessions ? Infinity : PROJECT_PREVIEW_COUNT
+  const fetched = (previewSessions ?? []).slice(0, limit)
+  const preview = renderRows ? (fetched.length ? fetched : latestProjectSessions(project, limit)) : []
 
   const lead = reorderable ? (
     <SidebarRowGrab

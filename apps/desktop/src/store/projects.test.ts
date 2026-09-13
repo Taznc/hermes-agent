@@ -2,7 +2,12 @@ import { atom } from 'nanostores'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
 import { NO_PROJECT_ID, type SidebarProjectTree } from '@/app/chat/sidebar/projects/workspace-groups'
-import { $sidebarAgentsGrouped, setSidebarAgentsGrouped } from '@/store/layout'
+import {
+  $sidebarAgentsGrouped,
+  $sidebarShowAllSessions,
+  setSidebarAgentsGrouped,
+  setSidebarShowAllSessions
+} from '@/store/layout'
 import { $activeGatewayProfile, setShowAllProfiles } from '@/store/profile'
 import { $currentCwd, $selectedStoredSessionId, $sessions, applyConfiguredDefaultProjectDir } from '@/store/session'
 
@@ -146,6 +151,7 @@ describe('projects RPC profile forwarding', () => {
     $activeGatewayProfile.set('default')
     $activeProjectId.set(null)
     $projectTree.set([])
+    $sidebarShowAllSessions.set(false)
     setShowAllProfiles(false)
   })
 
@@ -166,6 +172,18 @@ describe('projects RPC profile forwarding', () => {
       profile: 'coder',
       project_id: 'p_123'
     })
+  })
+
+  it('widens project-tree previews when Show all sessions is enabled', async () => {
+    const request = vi.fn(async () => ({ active_id: null, projects: [], scoped_session_ids: [] }))
+    const gateway = { connectionState: 'open', request }
+    activeGateway.mockReturnValue(gateway as never)
+    gatewayAtom.set(gateway as never)
+
+    setSidebarShowAllSessions(true)
+    await refreshProjectTree()
+
+    expect(request).toHaveBeenCalledWith('projects.tree', { preview_limit: 2000, profile: 'default' })
   })
 
   it('skips project reads in the all-profiles view rather than forwarding its sentinel', async () => {

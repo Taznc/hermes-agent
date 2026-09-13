@@ -2000,6 +2000,7 @@ export const zhHant = defineLocale({
     noSessions: '尚無工作階段',
     noFilterMatches: '沒有工作階段符合這些篩選條件',
     projects: {
+      showAllSessions: '顯示所有工作階段',
       sectionLabel: '專案',
       home: '主頁',
       newButton: '新增專案',
