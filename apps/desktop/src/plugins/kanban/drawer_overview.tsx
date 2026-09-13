@@ -23,11 +23,14 @@ import {
   useQuery,
   useQueryClient
 } from '@hermes/plugin-sdk'
-import { type ReactNode, useEffect, useMemo, useState } from 'react'
+import { type ReactNode, useEffect, useMemo, useState, useSyncExternalStore } from 'react'
 
-import { boardKey, estimateTask, fetchProfiles, PROFILES_KEY } from './api'
+import { boardKey, BOARDS_KEY, estimateTask, fetchProfiles, PROFILES_KEY } from './api'
 import { indexBoard, partitionBlockers, resolveLinks } from './deps'
+import { getHermesActions, type HermesActionLabels, openHermesAction, resolveActionCwd } from './session-actions'
 import {
+  type BoardMeta,
+  type BoardsResponse,
   columnMeta,
   type Diagnostic,
   type DiagnosticAction,
@@ -211,6 +214,62 @@ export function DescriptionSection({
         <CollapsibleMarkdown text={body} />
       ) : (
         <p className="text-[0.8125rem] text-(--ui-text-quaternary)">{k.noDescription}</p>
+      )}
+    </Section>
+  )
+}
+
+/** Read-only/session-only follow-up intents. These deliberately receive the
+ * already-loaded detail payload and board metadata: opening a seeded chat must
+ * not cause another backend read, much less mutate the card. */
+export function HermesActionsSection({
+  board,
+  detail,
+  task
+}: {
+  board: BoardMeta
+  detail: KanbanTaskDetail
+  task: KanbanTaskFull
+}) {
+  const k = useKanban()
+
+  const actionLabels: HermesActionLabels = {
+    explain: k.hermesActionExplain,
+    failure: k.hermesActionFailure,
+    review: k.hermesActionReview,
+    rough: k.hermesActionRough,
+    scope: k.hermesActionScope,
+    unblock: k.hermesActionUnblock
+  }
+
+  const actions = getHermesActions(task, detail.runs, actionLabels)
+  const cwd = resolveActionCwd(task, board)
+  const context = { board, commentsCount: detail.comments.length, runs: detail.runs, task }
+
+  return (
+    <Section label={k.hermesActionsSection}>
+      <div className="flex flex-wrap gap-1.5">
+        {actions.map(action => (
+          <Button
+            disabled={!board.slug}
+            key={action.id}
+            onClick={() => openHermesAction(action, context, options => host.newChatWithContext(options))}
+            size="xs"
+            variant="outline"
+          >
+            {action.label}
+          </Button>
+        ))}
+      </div>
+      {!cwd && (
+        <p className="text-[0.6875rem] leading-relaxed text-(--ui-text-quaternary)">
+          {k.hermesActionsDetachedHint}
+        </p>
+      )}
+      {cwd && !board.slug && (
+        <p className="text-[0.6875rem] leading-relaxed text-(--ui-text-quaternary)">
+          {k.hermesActionsBoardUnavailable}
+        </p>
       )}
     </Section>
   )
@@ -480,6 +539,21 @@ export function DependenciesSection({
     qc.getQueryData<KanbanBoard>(boardKey(slug, true)) ??
     qc.getQueriesData<KanbanBoard>({ queryKey: ['kanban', 'board', slug] }).find(([, data]) => !!data)?.[1]
 
+  // Cache-only observer: Board owns this request. Subscribe to that cache so a
+  // late board response enables actions without adding an action-only fetch.
+  const boards = useSyncExternalStore(
+    onStoreChange => qc.getQueryCache().subscribe(onStoreChange),
+    () => qc.getQueryData<BoardsResponse>(BOARDS_KEY),
+    () => undefined
+  )
+
+  const taskBoardSlug = taskBoard || task.board || (slug !== '*' ? slug : '') || boards?.current || ''
+
+  const boardMeta = boards?.boards.find(candidate => candidate.slug === taskBoardSlug) ?? {
+    name: task.board_name,
+    slug: taskBoardSlug
+  }
+
   const index = useMemo(() => indexBoard(board), [board])
   // Links live within ONE board, so every id in `detail.links` belongs to this
   // task's board — resolve against that board's rows, not a same-id card from
@@ -506,7 +580,9 @@ export function DependenciesSection({
   }, [detail.links.children, detail.links.parents, index, task.id, taskBoard])
 
   return (
-    <Section label={k.dependencies} tone={gating.length > 0 ? GATING_TONE : undefined}>
+    <>
+      <HermesActionsSection board={boardMeta} detail={detail} task={task} />
+      <Section label={k.dependencies} tone={gating.length > 0 ? GATING_TONE : undefined}>
       {gating.length > 0 && (
         <Callout title={k.depWaitingBanner(gating.length, blockers.length)} tone={SEVERITY_TONE.warning} />
       )}
@@ -585,7 +661,8 @@ export function DependenciesSection({
           <span className="truncate">{k.parent}</span>
         </button>
       )}
-    </Section>
+      </Section>
+    </>
   )
 }
 
