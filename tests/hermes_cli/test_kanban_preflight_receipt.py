@@ -4,6 +4,7 @@ import json
 import os
 import subprocess
 from pathlib import Path
+from typing import Any
 
 import pytest
 
@@ -138,7 +139,7 @@ def test_reviewer_binding_rejects_workspace_at_different_artifact(
 
 
 def test_receipt_cache_reuses_identical_inputs_and_invalidates_changes(
-    isolated_board, tmp_path: Path
+    isolated_board, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ):
     conn, _ = isolated_board
     repo, declared, _ = _repo_with_unrelated_anchor(tmp_path)
@@ -204,7 +205,15 @@ def test_receipt_cache_reuses_identical_inputs_and_invalidates_changes(
     assert payload["commands"]["test"][1:] == ["tests/hermes_cli/"]
     assert payload["commands"]["lint"][1:4] == ["-m", "ruff", "check"]
     assert payload["artifacts"]["full_log"].endswith(".log")
+    assert payload["summary"]["exit_code"] == 0
     assert payload["summary"]["checks_failed"] == 0
+
+    monkeypatch.setenv("HERMES_KANBAN_PREFLIGHT_RECEIPT", str(first.path))
+    packet = kb.build_worker_task_packet(conn, task_id).to_dict()
+    packet_preflight = packet["workspace"]["preflight"]
+    assert packet_preflight["summary"]["exit_code"] == 0
+    full_log = Path(payload["artifacts"]["full_log"]).read_text(encoding="utf-8")
+    assert full_log not in json.dumps(packet)
 
     task.current_run_id = 42
     next_claim = kbr.build_preflight_receipt(
@@ -233,7 +242,12 @@ def test_packet_reads_bounded_receipt_summary_not_full_log(
             "receipt_version": 1,
             "task_id": task_id,
             "cache_key": "abc",
-            "summary": {"checks_run": 5, "checks_failed": 0, "excerpt": "ok"},
+            "summary": {
+                "exit_code": 0,
+                "checks_run": 5,
+                "checks_failed": 0,
+                "excerpt": "ok",
+            },
             "artifacts": {"receipt": str(receipt), "full_log": str(full_log)},
         }),
         encoding="utf-8",
@@ -244,6 +258,7 @@ def test_packet_reads_bounded_receipt_summary_not_full_log(
 
     preflight = packet["workspace"]["preflight"]
     assert preflight["cache_key"] == "abc"
+    assert preflight["summary"]["exit_code"] == 0
     assert preflight["summary"]["checks_failed"] == 0
     assert preflight["artifacts"]["full_log"] == str(full_log)
     assert secret_log_line not in json.dumps(packet)
@@ -299,6 +314,118 @@ def test_dispatch_materializes_receipt_and_reviewer_binds_same_artifact(
     assert review_receipt["role"] == "reviewer"
     assert review_receipt["artifact_ref"] == declared
     assert review_receipt["workspace"]["head_sha"] == declared
+
+
+def test_dispatch_ignores_cross_repository_parent_artifact(
+    isolated_board, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    conn, _ = isolated_board
+    target_root = tmp_path / "target"
+    foreign_root = tmp_path / "foreign"
+    target_root.mkdir()
+    foreign_root.mkdir()
+    target_repo, target_base, _ = _repo_with_unrelated_anchor(target_root)
+    foreign_repo, _, _ = _repo_with_unrelated_anchor(foreign_root)
+    (foreign_repo / "foreign-only.txt").write_text("foreign repository\n", encoding="utf-8")
+    _git(foreign_repo, "add", "foreign-only.txt")
+    _git(foreign_repo, "commit", "-m", "foreign artifact")
+    foreign_artifact = _git(foreign_repo, "rev-parse", "HEAD")
+    parent_id = kb.create_task(
+        conn,
+        title="dependency-only foreign parent",
+        workspace_kind="worktree",
+        workspace_path=str(foreign_repo),
+    )
+    assert kb.complete_task(
+        conn,
+        parent_id,
+        summary="foreign dependency complete",
+        metadata={"commit": foreign_artifact},
+    )
+    kb.write_board_metadata(None, default_workdir=str(target_repo), land_target=target_base)
+    child_id = kb.create_task(
+        conn,
+        title="target repository child",
+        assignee="worker",
+        parents=[parent_id],
+        workspace_kind="worktree",
+        workspace_path=str(target_repo),
+    )
+    monkeypatch.setattr(kbd, "_profile_exists_fn", lambda: lambda _name: True)
+    spawned: list[tuple[Any, str]] = []
+
+    result = kbd.dispatch_once(
+        conn,
+        spawn_fn=lambda task, workspace, **_kwargs: spawned.append((task, workspace)),
+        board=None,
+    )
+
+    assert result.preflight_blocked == []
+    assert len(spawned) == 1
+    child_task, child_workspace = spawned[0]
+    receipt = json.loads(
+        Path(child_task.preflight_receipt_path).read_text(encoding="utf-8")
+    )
+    assert _git(Path(child_workspace), "rev-parse", "HEAD") == target_base
+    assert receipt["workspace"]["base_sha"] == target_base
+    assert receipt["workspace"]["base_sha"] != foreign_artifact
+
+
+def test_dispatch_blocks_divergent_same_repository_parent_artifacts(
+    isolated_board, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    conn, _ = isolated_board
+    repo, _, common = _repo_with_unrelated_anchor(tmp_path)
+    _git(repo, "checkout", "-b", "left", common)
+    (repo / "left.txt").write_text("left\n", encoding="utf-8")
+    _git(repo, "add", "left.txt")
+    _git(repo, "commit", "-m", "left parent")
+    left = _git(repo, "rev-parse", "HEAD")
+    _git(repo, "checkout", "main")
+    (repo / "right.txt").write_text("right\n", encoding="utf-8")
+    _git(repo, "add", "right.txt")
+    _git(repo, "commit", "-m", "right parent")
+    right = _git(repo, "rev-parse", "HEAD")
+
+    parents = []
+    for title, artifact in (("left parent", left), ("right parent", right)):
+        parent_id = kb.create_task(
+            conn,
+            title=title,
+            workspace_kind="worktree",
+            workspace_path=str(repo),
+        )
+        assert kb.complete_task(
+            conn,
+            parent_id,
+            summary=f"{title} complete",
+            metadata={"commit": artifact},
+        )
+        parents.append(parent_id)
+    kb.write_board_metadata(None, default_workdir=str(repo), land_target=right)
+    child_id = kb.create_task(
+        conn,
+        title="must combine both parents",
+        assignee="worker",
+        parents=parents,
+        workspace_kind="worktree",
+        workspace_path=str(repo),
+    )
+    monkeypatch.setattr(kbd, "_profile_exists_fn", lambda: lambda _name: True)
+    spawned: list[str] = []
+
+    result = kbd.dispatch_once(
+        conn,
+        spawn_fn=lambda *_args, **_kwargs: spawned.append("spawned"),
+        board=None,
+    )
+
+    assert spawned == []
+    assert result.preflight_blocked == [child_id]
+    child = kb.get_task(conn, child_id)
+    assert child is not None and child.status == "blocked"
+    blocked = [event for event in kb.list_events(conn, child_id) if event.kind == "blocked"]
+    assert "parent artifacts diverge" in (blocked[-1].payload or {})["reason"]
 
 
 def test_dispatch_blocks_missing_declared_base_before_spawn(

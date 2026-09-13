@@ -22,7 +22,7 @@ from pathlib import Path
 from typing import Any, Optional
 
 
-RECEIPT_VERSION = 1
+RECEIPT_VERSION = 2
 _ARTIFACT_ENV = "HERMES_KANBAN_PREFLIGHT_RECEIPT"
 _ARTIFACT_METADATA_KEYS = ("artifact_sha", "commit", "reviewed_commit", "head_sha")
 
@@ -162,6 +162,87 @@ def _latest_closed_artifact(conn, task_id: str) -> Optional[str]:
     return _metadata_artifact(_kb._json_dict(row["metadata"]))
 
 
+def _repository_for_task(task, *, board: Optional[str]) -> Optional[Path]:
+    """Return the canonical repository authorized for a worktree task.
+
+    Task paths may name an existing checkout, a repository root, or a not-yet
+    created ``.worktrees/<task>`` target.  Resolve all three through the shared
+    worktree helpers, then canonicalize linked worktrees through their common
+    Git directory so repositories compare by identity rather than checkout.
+    """
+    from hermes_cli import kanban_db_workspace as _kbw
+
+    raw_path = (task.workspace_path or "").strip()
+    if not raw_path:
+        raw_path = str(_kb.read_board_metadata(board).get("default_workdir") or "").strip()
+    if not raw_path:
+        return None
+    path = Path(raw_path).expanduser()
+    if path.exists():
+        try:
+            return _repo_root(path)
+        except PreflightError:
+            pass
+    repo = _kbw._repo_root_for_worktree_target(path)
+    if repo is None:
+        return None
+    try:
+        return _repo_root(repo)
+    except PreflightError:
+        return None
+
+
+def _parent_artifacts_for_repo(
+    conn,
+    task,
+    *,
+    board: Optional[str],
+    repo: Path,
+) -> list[tuple[str, str, str]]:
+    """Return ``(parent_id, declared_ref, sha)`` for this repository only."""
+    artifacts: list[tuple[str, str, str]] = []
+    for parent_id in _kb.parent_ids(conn, task.id):
+        artifact = _latest_closed_artifact(conn, parent_id)
+        if not artifact:
+            continue
+        parent = _kb.get_task(conn, parent_id)
+        if parent is None:
+            continue
+        # A project mismatch is authoritative even if two repositories happen
+        # to share objects (forks commonly do).  Otherwise compare canonical
+        # Git common directories, not worktree checkout paths.
+        if task.project_id and parent.project_id and task.project_id != parent.project_id:
+            continue
+        parent_repo = _repository_for_task(parent, board=board)
+        if parent_repo is None:
+            if not (task.project_id and parent.project_id == task.project_id):
+                continue
+        elif parent_repo != repo:
+            continue
+        sha = _resolve_commit(
+            repo,
+            artifact,
+            label=f"same-repository parent {parent_id} artifact {artifact!r} is unavailable",
+        )
+        artifacts.append((parent_id, artifact, sha))
+    return artifacts
+
+
+def _descendant_parent_base(repo: Path, artifacts: list[tuple[str, str, str]]) -> str:
+    """Choose the one parent artifact containing every same-repo parent."""
+    for _parent_id, artifact, candidate_sha in artifacts:
+        if all(
+            _git(repo, "merge-base", "--is-ancestor", other_sha, candidate_sha).returncode == 0
+            for _other_id, _other_ref, other_sha in artifacts
+        ):
+            return artifact
+    parents = ", ".join(f"{parent_id}={sha}" for parent_id, _ref, sha in artifacts)
+    raise PreflightError(
+        "same-repository parent artifacts diverge; no single declared base contains all parents: "
+        + parents
+    )
+
+
 def workspace_plan(conn, task, *, board: Optional[str] = None) -> WorkspacePlan:
     """Choose the declared base and optional review artifact without guessing.
 
@@ -188,13 +269,15 @@ def workspace_plan(conn, task, *, board: Optional[str] = None) -> WorkspacePlan:
             )
         return WorkspacePlan(role, land_target or artifact, artifact, "review_handoff")
 
-    parent_artifacts = [
-        artifact
-        for parent_id in _kb.parent_ids(conn, task.id)
-        if (artifact := _latest_closed_artifact(conn, parent_id))
-    ]
+    repo = _repository_for_task(task, board=board)
+    if repo is None:
+        raise PreflightError("worktree task has no authorized git repository")
+    parent_artifacts = _parent_artifacts_for_repo(
+        conn, task, board=board, repo=repo
+    )
     if parent_artifacts:
-        return WorkspacePlan(role, parent_artifacts[-1], None, "parent_artifact")
+        base_ref = _descendant_parent_base(repo, parent_artifacts)
+        return WorkspacePlan(role, base_ref, None, "parent_artifact")
     if not land_target:
         raise PreflightError(
             "worktree task has no declared base: set the board land_target or provide a completed parent artifact"
@@ -418,6 +501,7 @@ def build_preflight_receipt(
         "cache_key": cache_key,
         "environment": environment,
         "summary": {
+            "exit_code": 0,
             "checks_run": len(checks),
             "checks_failed": 0,
             "excerpt": "; ".join(f"{name}={value}" for name, value in checks[:4]),
