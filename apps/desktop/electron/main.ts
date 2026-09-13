@@ -1,4 +1,4 @@
-import { execFileSync, spawn } from 'node:child_process'
+import { execFile, execFileSync, spawn } from 'node:child_process'
 import crypto from 'node:crypto'
 import fs from 'node:fs'
 import http from 'node:http'
@@ -7,6 +7,7 @@ import os from 'node:os'
 import path from 'node:path'
 import tls from 'node:tls'
 import { pathToFileURL } from 'node:url'
+import { promisify } from 'node:util'
 
 import {
   app,
@@ -31,6 +32,7 @@ import {
 } from 'electron'
 
 import { classifyActiveRuntime } from './active-runtime-state'
+import { createAgentOverviewReader, gatherOverviewBackends } from './agent-overview'
 import { destroyKeepaliveAgents, downloadAgentFor, jsonAgentFor, withRetry } from './api-transport'
 import { appIconCandidates, resolveAppIcon } from './app-icon'
 import { stopBackendChild as stopBackendChildImpl, stopBackendTreesForUpdate } from './backend-child'
@@ -58,7 +60,7 @@ import {
 import { backendCommandMatches, createBackendOwnership, createBackendShutdownCoordinator } from './backend-ownership'
 import {
   canImportHermesCli,
-  execProbeSync,
+  execProbeAsync,
   PROBE_TIMEOUT_MS,
   shouldTrustHermesOverride,
   verifyHermesCli
@@ -81,6 +83,7 @@ import {
 } from './bootstrap-platform'
 import { decideBootstrapRepair } from './bootstrap-repair-guard'
 import { runBootstrap } from './bootstrap-runner'
+import { capMapSize, pruneExpiredEntries } from './bounded-cache'
 import {
   BROWSER_WINDOW_HEIGHT,
   BROWSER_WINDOW_MIN_HEIGHT,
@@ -117,6 +120,7 @@ import {
   profileSshOverride,
   type RegistryBackendRequestScope,
   remoteRequestMatchesBaseUrl,
+  remoteTokenNeedsBearer,
   resolveAuthMode,
   resolveProfileApiRequest,
   resolveProfileBackendRoute,
@@ -187,6 +191,20 @@ import {
   stopFind
 } from './find-in-page'
 import { createFirstRunSetupGate } from './first-run-setup-gate'
+import { registerAttachmentStreamIpc } from './fork/attachment-stream-ipc'
+import { registerDevRestartWatch } from './fork/dev-restart-watch'
+import { repairStoredProfile } from './fork/profile-repair'
+import { freshRemoteTokenWsUrl, mintWsTicketWithStaticToken } from './fork/remote-auth'
+import {
+  applySecretStorageEncryption as applySecretStorageEncryptionFork,
+  migrateLegacyEncryptedSecretsOnce as migrateLegacyEncryptedSecretsOnceFork,
+  rewriteAllStoredSecrets as rewriteAllStoredSecretsFork,
+  type SecretRewriteDeps
+} from './fork/secret-rewrite'
+import { createSecretStorageIntegration } from './fork/secret-storage-integration'
+import { updateChecksDisabled } from './fork/update-checks-gate'
+import { createWindowCapsIntegration } from './fork/window-caps'
+import { findWindowsSystemPython } from './fork/windows-paths'
 import { registerFsIpc } from './fs-ipc'
 import {
   filenameFromContentDisposition,
@@ -298,6 +316,7 @@ import { poolTouchKeys } from './pool-touch-scope'
 import { createKeepAwake } from './power-save'
 import { capturePreviewContents } from './preview-capture'
 import { PreviewReachRegistry } from './preview-reach'
+import { guardWatcherErrors, PreviewWatcherRegistry } from './preview-watchers'
 import {
   createPrimaryRemoteConnection,
   FirstRunSetupResetError,
@@ -349,8 +368,10 @@ import { attachRendererConsoleCapture, formatRendererBoundaryReport } from './re
 import {
   classifyStoredSecret,
   readSecretStoragePolicy,
+  SECRET_STORAGE_LAST_ON_MARKER_FILE,
   SECRET_STORAGE_POLICY_FILE,
   type SecretStoragePolicy,
+  type SecureTokenStorageState,
   writeSecretStoragePolicy
 } from './secret-storage-policy'
 import {
@@ -363,6 +384,7 @@ import {
   SESSION_WINDOW_MIN_WIDTH
 } from './session-windows'
 import { ensureLoginShellPath } from './shell-path'
+import { resolveSshBinary, SSH_BINARY_MISSING_MESSAGE } from './ssh-binary'
 import { createBootstrapCoordinator, sshConfigFingerprint } from './ssh-bootstrap-coordinator'
 import { collectSshConfigHosts, parseSshGOutput } from './ssh-config'
 import { createSshProbeConnection, pickLocalPort, redactSecrets, SshConnection } from './ssh-connection'
@@ -477,6 +499,15 @@ const IS_PACKAGED = app.isPackaged || Boolean(process.env.HERMES_DESKTOP_IS_PACK
 const IS_MAC = process.platform === 'darwin'
 const IS_WINDOWS = process.platform === 'win32'
 const IS_WSL = isWslEnvironment()
+// Promisified execFile for every boot/connect-path probe converted off
+// execFileSync (Windows Python detection, the SSH config fingerprint, the
+// macOS updater helper repair). A single shared wrapper keeps the async
+// contract (timeout/windowsHide options, error shape) identical across call
+// sites instead of each one hand-rolling its own promisify.
+const execFileAsync = promisify(execFile)
+// NOTE: UPDATE_CHECKS_DISABLED is intentionally NOT defined here. The macOS
+// Dock/Finder launch fix (t_ef27fed2) moved it below resolveHermesHome() so
+// the config.yaml rung can be read when no env var was bridged.
 // Truthful macOS kernel major (Tahoe = 25). Product version lies (16 vs 26) per
 // build SDK, so gate Tahoe workarounds on Darwin instead.
 const DARWIN_MAJOR = IS_MAC ? Number.parseInt(os.release(), 10) || 0 : 0
@@ -486,6 +517,20 @@ const GLASS_SUPPORTED = glassSupportedOn(process.platform, os.release())
 // Clear rides setOpacity, a documented no-op on Linux, so neither mode works
 // there and Settings drops the row entirely.
 const TRANSLUCENCY_SUPPORTED = translucencySupportedOn(process.platform)
+
+// Process-constant window capabilities (translucency/glass + HUD windowing
+// profile) handed to preload via additionalArguments — computed once so the
+// renderer's first paint never stalls on an IPC round-trip. Implementation
+// and rationale live in the fork module.
+// >>> FORK ANCHOR: window-caps <<<
+const { WINDOW_CAPS_ARGUMENT, withWindowCapsArgument } = createWindowCapsIntegration({
+  glassSupported: GLASS_SUPPORTED,
+  translucencySupported: TRANSLUCENCY_SUPPORTED,
+  platform: process.platform,
+  env: process.env,
+  argv: process.argv
+})
+
 const APP_ROOT = app.getAppPath()
 
 // Device-local preference: block F12 from opening DevTools.
@@ -741,8 +786,17 @@ function loadInstallStamp() {
         })
       }
     } catch (e) {
-      console.warn(`[hermes] install-stamp.json found at ${p} , but parsing failed with ${e}`)
-      // Either ENOENT or malformed JSON; try the next candidate
+      // A MISSING file is the normal case, not a fault: in dev,
+      // process.resourcesPath points inside the prebuilt Electron.app, which
+      // never carries a stamp, so this candidate always misses. Warning about
+      // it on every launch — with the self-contradicting "found ... but
+      // parsing failed with ENOENT" wording — trains the reader to ignore a
+      // message that should mean something. Only a stamp that EXISTS and is
+      // malformed is worth surfacing.
+      if ((e as NodeJS.ErrnoException)?.code !== 'ENOENT') {
+        console.warn(`[hermes] install-stamp.json at ${p} could not be parsed: ${e}`)
+      }
+      // Either way, try the next candidate.
     }
   }
 
@@ -818,6 +872,23 @@ function resolveHermesHome() {
 }
 
 const HERMES_HOME = resolveHermesHome()
+
+// Gate for the desktop self-update checker (git ls-remote/fetch against
+// origin, plus the GitHub compare API). Bridged from `desktop.
+// auto_update_checks_enabled` in config.yaml by the `hermes desktop`
+// launcher (hermes_cli/main.py cmd_gui); an env var set directly (e.g. by a
+// dev running `electron .` outside the launcher) works the same way. A
+// packaged Hermes.app launched from the Dock/Finder/Spotlight gets none of
+// those bridged env vars, so the config.yaml path is a second, lower-priority
+// rung read directly from HERMES_HOME/config.yaml — that's why this has to
+// come after resolveHermesHome() rather than sit with the other early
+// launch-arg gates above. Also short-circuits unconditionally on
+// HERMES_DEV=1 — see fork/update-checks-gate.ts for the full rationale.
+// Default is checks ON — this only ever narrows behavior, never widens it.
+// >>> FORK ANCHOR: update-checks <<<
+const UPDATE_CHECKS_DISABLED = updateChecksDisabled(process.env, {
+  configPath: path.join(HERMES_HOME, 'config.yaml')
+})
 
 function pathWithHermesManagedNode(...entries) {
   const managed = hermesManagedNodePathEntries(HERMES_HOME).filter(directoryExists)
@@ -1659,7 +1730,7 @@ let connectionRegistryCache = null
 let connectionRegistryCacheMtime = null
 let remoteHeaderRulesInstalled = false
 const remoteWsHeaderStore = createRemoteWsHeaderStore()
-const previewWatchers = new Map()
+const previewWatchers = new PreviewWatcherRegistry()
 let previewShortcutActive = false
 let nativeThemeListenerInstalled = false
 
@@ -2505,7 +2576,7 @@ function isCommandScript(command) {
   return IS_WINDOWS && /\.(cmd|bat)$/i.test(command || '')
 }
 
-function unwrapWindowsVenvHermesCommand(command, backendArgs) {
+async function unwrapWindowsVenvHermesCommand(command, backendArgs) {
   return resolveVenvHermesCommand(command, backendArgs, {
     isWindows: IS_WINDOWS,
     isCommandScript,
@@ -2531,22 +2602,51 @@ function unwrapWindowsVenvHermesCommand(command, backendArgs) {
 //
 // Fast path: read the runtime's own dashboard.py (instant, covers managed
 // installs, dev checkouts, and the Windows venv). Fallback: probe the CLI once
-// (covers a bare `hermes` resolved from PATH with no known source root). Result
-// is cached per resolved runtime so we probe at most once per backend.
-const _serveSupportCache = new Map()
+// (covers a bare `hermes` resolved from PATH with no known source root).
+//
+// Cache policy: a positive result (`supported: true`) or a source-verified
+// negative is a durable fact about this runtime's code and is cached for the
+// process lifetime. A probe-based negative is NOT durable by default -- a
+// transient probe failure (spawn error, timeout) used to latch `false`
+// forever, silently routing a perfectly modern runtime through the legacy
+// `dashboard` form until the app restarted. We only cache a probe negative
+// permanently when the process actually ran and rejected the subcommand
+// (a real "serve is unknown" exit code); anything that never got a verdict
+// from the runtime itself (ENOENT, timeout, EACCES, ...) expires after
+// SERVE_SUPPORT_NEGATIVE_TTL_MS so the next resolve gets a fresh chance.
+const _serveSupportCache = new Map<string, { supported: boolean; expiresAt: number }>()
+const SERVE_SUPPORT_NEGATIVE_TTL_MS = 60_000
 
-function backendSupportsServe(backend) {
+function isCacheableProbeFailure(err: unknown): boolean {
+  if (!err || typeof err !== 'object') {
+    return false
+  }
+
+  const e = err as { code?: unknown; killed?: boolean; signal?: string }
+
+  // execFile sets `code` to the child's numeric exit code on a real,
+  // completed invocation that exited non-zero -- that IS the runtime
+  // telling us `serve` is an unrecognized subcommand, so it's a durable
+  // fact we can cache forever. A string `code` (ENOENT, ETIMEDOUT, ...),
+  // `killed`, or a delivered `signal` means the process never got to
+  // answer -- transient, do not latch.
+  return typeof e.code === 'number' && !e.killed && !e.signal
+}
+
+async function backendSupportsServe(backend): Promise<boolean> {
   if (!backend || !backend.command) {
     return true
   }
 
   const key = `${backend.command}::${backend.root || ''}`
+  const cached = _serveSupportCache.get(key)
 
-  if (_serveSupportCache.has(key)) {
-    return _serveSupportCache.get(key)
+  if (cached && cached.expiresAt > Date.now()) {
+    return cached.supported
   }
 
-  let supported = null
+  let supported: boolean | null = null
+  let cacheableFailure = true
 
   if (backend.root) {
     try {
@@ -2562,31 +2662,34 @@ function backendSupportsServe(backend) {
       const prefix = backend.args && backend.args[0] === '-m' ? backend.args.slice(0, 2) : []
       // Same cold-Windows Python-startup class as the runtime probes
       // (#61764/#72632/#72707): `serve --help` imports at least as much as
-      // `hermes --version` (~10.5s measured cold), and a false negative here
-      // is cached for the process lifetime, silently routing a modern
-      // runtime through the legacy `dashboard` form. Share the probe budget
-      // and its timeout-only retry instead of a thinner local bound.
-      execProbeSync(backend.command, [...prefix, 'serve', '--help'], {
+      // `hermes --version` (~10.5s measured cold). Async so this never
+      // blocks the Electron main thread; share the probe budget and its
+      // timeout-only retry instead of a thinner local bound.
+      await execProbeAsync(backend.command, [...prefix, 'serve', '--help'], {
         cwd: backend.root || undefined,
         env: { ...process.env, HERMES_HOME, ...(backend.env || {}) },
         timeout: PROBE_TIMEOUT_MS,
-        stdio: 'ignore',
         // `.cmd`/`.bat` shim backends carry shell: true in their descriptor
-        // (see resolveHermesBackend step 4); execFileSync of a .cmd without
+        // (see resolveHermesBackend step 4); execFile of a .cmd without
         // shell throws EINVAL on modern Node, which the catch below would
-        // mis-cache as "serve unsupported" for the process lifetime.
+        // otherwise mis-cache as "serve unsupported" for the process lifetime
+        // (guarded against by isCacheableProbeFailure below).
         shell: Boolean(backend.shell),
         windowsHide: true
       })
       supported = true
-    } catch {
+    } catch (err) {
       supported = false
+      cacheableFailure = isCacheableProbeFailure(err)
     }
   }
 
-  _serveSupportCache.set(key, supported)
+  const expiresAt = supported === false && !cacheableFailure ? Date.now() + SERVE_SUPPORT_NEGATIVE_TTL_MS : Infinity
+
+  _serveSupportCache.set(key, { supported, expiresAt })
   rememberLog(
-    `[backend] \`serve\` ${supported ? 'supported' : 'unsupported → routing via legacy `dashboard`'} for ${backend.label || key}`
+    `[backend] \`serve\` ${supported ? 'supported' : 'unsupported → routing via legacy `dashboard`'} for ${backend.label || key}` +
+      (supported === false && !cacheableFailure ? ' (transient probe failure; will re-probe)' : '')
   )
 
   return supported
@@ -2595,8 +2698,8 @@ function backendSupportsServe(backend) {
 // Given a resolved backend whose args target `serve`, return the args the
 // runtime actually understands: unchanged when `serve` is supported, or
 // rewritten to `dashboard --no-open` for older runtimes.
-function getBackendArgsForRuntime(backend) {
-  return backendSupportsServe(backend) ? backend.args : dashboardFallbackArgs(backend.args)
+async function getBackendArgsForRuntime(backend) {
+  return (await backendSupportsServe(backend)) ? backend.args : dashboardFallbackArgs(backend.args)
 }
 
 function normalizeExecutablePathForCompare(commandPath) {
@@ -2646,7 +2749,7 @@ function isHermesSourceRoot(root) {
   return directoryExists(root) && fileExists(path.join(root, 'hermes_cli', 'main.py'))
 }
 
-function findPythonForRoot(root) {
+async function findPythonForRoot(root) {
   const override = process.env.HERMES_DESKTOP_PYTHON
 
   if (override && fileExists(override)) {
@@ -2668,7 +2771,7 @@ function findPythonForRoot(root) {
   return findSystemPython()
 }
 
-function findSystemPython() {
+async function findSystemPython() {
   if (!IS_WINDOWS) {
     // POSIX systems: PATH lookup is safe.
     for (const command of ['python3', 'python']) {
@@ -2682,141 +2785,16 @@ function findSystemPython() {
     return null
   }
 
-  // Windows: PATH-based detection has TWO landmines we have to dodge.
-  //
-  //  (1) The Microsoft Store "Python stub" lives at
-  //      %LOCALAPPDATA%\Microsoft\WindowsApps\python.exe and is on PATH
-  //      by default on modern Windows. It's a redirector that opens the
-  //      Store window if no Store Python is installed. Running it for
-  //      `-m venv` would either succeed (real Store install — fine) or
-  //      pop the Store dialog (bad UX during boot).
-  //  (2) `py.exe` (Python launcher) is missing from per-user installs
-  //      that didn't check the launcher option, so PATH-only checks
-  //      miss real Python 3.13 installs (user-reported case).
-  //
-  // We also restrict ourselves to Python 3.11–3.13. 3.14 is the latest
-  // CPython but several Hermes deps (notably pywinpty's Rust-built
-  // windows_x86_64_msvc crate) don't yet publish 3.14 wheels, and
-  // `pip install -e .` falls back to source-build, which fails without
-  // a Rust toolchain. install.ps1 sidesteps this by pinning to 3.11
-  // via uv; until we add the same uv-managed Python pathway here, the
-  // simplest fix is to refuse 3.14 detection and let the NSIS prereq
-  // page offer to install 3.11 alongside.
-  //
-  // Strategy: probe in three passes, in order from most-precise to
-  // least-precise, and ONLY use PATH lookup as a last resort after
-  // confirming the candidate isn't the WindowsApps redirector.
-  //
-  //  Pass 1: PEP 514 registry — every standards-compliant Python
-  //          installer registers itself at SOFTWARE\Python\PythonCore.
-  //          The MS Store stub does NOT register here, so a hit means
-  //          a real Python install. Versions are explicit so we
-  //          inherently filter 3.14 out.
-  //  Pass 2: Filesystem probe of standard install locations
-  //          (Program Files, LocalAppData\Programs\Python). Same
-  //          version filtering by directory name.
-  //  Pass 3: PATH lookup of `py.exe` (the launcher itself never
-  //          triggers the Store) — but call it with a version flag so
-  //          we resolve to a SPECIFIC supported version, not whatever
-  //          py.exe's default is (which on a 3.14-only box would be
-  //          3.14).
-
-  const SUPPORTED_VERSIONS = ['3.11', '3.12', '3.13']
-  const SUPPORTED_VERSIONS_NO_DOT = ['311', '312', '313']
-
-  // Pass 1: registry. Use `reg query` since main process doesn't have
-  // a reliable in-process registry API across all electron versions.
-  for (const hive of ['HKLM', 'HKCU']) {
-    for (const version of SUPPORTED_VERSIONS) {
-      try {
-        const out = execFileSync(
-          'reg',
-          ['query', `${hive}\\SOFTWARE\\Python\\PythonCore\\${version}\\InstallPath`, '/ve', '/reg:64'],
-          // Registry reads are near-instant; the bound only exists so a
-          // pathologically wedged reg.exe can't hang the synchronous boot
-          // resolver forever (this ran unbounded before).
-          hiddenWindowsChildOptions({ encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'], timeout: 5_000 })
-        )
-
-        // Output format: "    (Default)    REG_SZ    C:\Path\To\Python\"
-        const match = out.match(/REG_SZ\s+(.+?)\s*$/m)
-
-        if (match) {
-          const installPath = match[1].trim()
-          const pythonExe = path.join(installPath, 'python.exe')
-
-          if (fileExists(pythonExe)) {
-            return pythonExe
-          }
-        }
-      } catch {
-        // Key not present — try next.
-      }
-    }
-  }
-
-  // Pass 2: filesystem probe of standard locations.
-  const programFiles = process.env['ProgramFiles'] || 'C:\\Program Files'
-  const localAppData = process.env.LOCALAPPDATA || ''
-
-  for (const versionDir of SUPPORTED_VERSIONS_NO_DOT) {
-    const systemWide = path.join(programFiles, `Python${versionDir}`, 'python.exe')
-
-    if (fileExists(systemWide)) {
-      return systemWide
-    }
-
-    if (localAppData) {
-      const perUser = path.join(localAppData, 'Programs', 'Python', `Python${versionDir}`, 'python.exe')
-
-      if (fileExists(perUser)) {
-        return perUser
-      }
-    }
-  }
-
-  // Pass 3: py.exe with explicit version flag. The launcher itself is
-  // safe to invoke (no Store popup) and `py -3.13 -c "import sys;
-  // print(sys.executable)"` resolves to the actual python.exe path of
-  // the requested version. We try in version-priority order so the
-  // first hit wins.
-  const pyExe = findOnPath('py.exe')
-
-  if (pyExe) {
-    for (const version of SUPPORTED_VERSIONS) {
-      try {
-        const out = execFileSync(
-          pyExe,
-          [`-${version}`, '-c', 'import sys; print(sys.executable)'],
-          hiddenWindowsChildOptions({
-            encoding: 'utf8',
-            stdio: ['ignore', 'pipe', 'ignore'],
-            // Bare interpreter startup — much lighter than the hermes-import
-            // probes, but still python.exe under cold cache / AV scan, so
-            // share the probe budget rather than running unbounded (this
-            // synchronous exec previously had no timeout at all).
-            timeout: PROBE_TIMEOUT_MS
-          })
-        )
-
-        const candidate = out.trim()
-
-        if (candidate && fileExists(candidate)) {
-          return candidate
-        }
-      } catch {
-        // py couldn't find that version — try next.
-      }
-    }
-  }
-
-  // We deliberately do NOT fall back to plain `python.exe` on PATH.
-  // Without a way to verify the version safely (running `python -V`
-  // risks the Microsoft Store popup), accepting whatever's there
-  // could land us on 3.14 and trigger the Rust-build-from-source
-  // failure. Better to return null and let the NSIS prereq page
-  // offer to install a known-good 3.11 via winget.
-  return null
+  // Windows: the registry/filesystem/py.exe probe ladder (Store-stub and
+  // 3.14 avoidance, CJK-safe registry reads) lives in the fork module.
+  // >>> FORK ANCHOR: windows-python-probe <<<
+  return findWindowsSystemPython({
+    env: process.env,
+    fileExists,
+    findOnPath,
+    execFileAsync,
+    probeTimeoutMs: PROBE_TIMEOUT_MS
+  })
 }
 
 // findGitBash — locate bash.exe on Windows. Resolves HERMES_GIT_BASH_PATH
@@ -2828,6 +2806,21 @@ function findGitBash() {
     env: process.env,
     fileExists,
     findOnPath
+  })
+}
+
+// resolveSsh — one ladder for every embedded-terminal/SSH-config call site
+// (see ssh-binary.ts): System32 OpenSSH (existence-checked, since the
+// feature is removable/absent on LTSC/IoT) → ssh.exe on PATH → Git for
+// Windows' bundled ssh.exe next to whatever findGitBash() resolved. Off
+// Windows this is just 'ssh', letting spawn's normal PATH search handle it.
+function resolveSsh() {
+  return resolveSshBinary({
+    isWindows: IS_WINDOWS,
+    env: process.env,
+    fileExists,
+    findOnPath,
+    gitBashPath: IS_WINDOWS ? findGitBash() : null
   })
 }
 
@@ -3138,6 +3131,17 @@ async function resolveHealedBranch(updateRoot, branch) {
 }
 
 async function checkUpdates() {
+  if (UPDATE_CHECKS_DISABLED) {
+    return {
+      supported: false,
+      reason: 'update-checks-disabled',
+      message:
+        'Desktop update checks are disabled (desktop.auto_update_checks_enabled: false in config.yaml, or HERMES_DESKTOP_DISABLE_UPDATE_CHECKS).',
+      hermesRoot: resolveUpdateRoot(),
+      branch: readDesktopUpdateConfig().branch
+    }
+  }
+
   const updateRoot = resolveUpdateRoot()
   let { branch } = readDesktopUpdateConfig()
   const gitDir = path.join(updateRoot, '.git')
@@ -3390,19 +3394,19 @@ function resolveUpdaterBinary() {
   return resolveStagedUpdaterBinary(HERMES_HOME, { fileExists, isWindows: IS_WINDOWS })
 }
 
-function repairMacUpdaterHelper(updater) {
+async function repairMacUpdaterHelper(updater) {
   if (!IS_MAC || !updater) {
     return
   }
 
   try {
-    execFileSync('/usr/bin/xattr', ['-cr', updater], { stdio: 'ignore' })
+    await execFileAsync('/usr/bin/xattr', ['-cr', updater])
   } catch (err) {
     rememberLog(`[updates] macOS updater helper quarantine repair skipped: ${err.message}`)
   }
 
   try {
-    execFileSync('/usr/bin/codesign', ['--verify', updater], { stdio: 'ignore' })
+    await execFileAsync('/usr/bin/codesign', ['--verify', updater])
 
     return
   } catch {
@@ -3411,7 +3415,7 @@ function repairMacUpdaterHelper(updater) {
   }
 
   try {
-    execFileSync('/usr/bin/codesign', ['--force', '--sign', '-', updater], { stdio: 'ignore' })
+    await execFileAsync('/usr/bin/codesign', ['--force', '--sign', '-', updater])
     rememberLog('[updates] repaired macOS updater helper signature')
   } catch (err) {
     rememberLog(`[updates] macOS updater helper signature repair skipped: ${err.message}`)
@@ -4031,7 +4035,7 @@ async function applyUpdates(opts: { stopSafeBlockers?: boolean } = {}) {
         'Updating Hermes — this window will close and the updater will open. Don’t reopen Hermes yourself; it restarts automatically when the update finishes.',
       percent: 100
     })
-    repairMacUpdaterHelper(updater)
+    await repairMacUpdaterHelper(updater)
 
     const updateRoot = resolveUpdateRoot()
     const { branch: configuredBranch } = readDesktopUpdateConfig()
@@ -4671,27 +4675,27 @@ function readBootstrapMarker() {
 // or a DMG launch over a prior CLI install satisfies this WITHOUT the desktop
 // ever having written the bootstrap marker -- so we must be able to recognise
 // "already installed" off the filesystem alone, not just the marker.
-function isActiveRuntimeUsable() {
+async function isActiveRuntimeUsable() {
   const venvPython = getVenvPython(VENV_ROOT)
 
   return (
     isHermesSourceRoot(ACTIVE_HERMES_ROOT) &&
     fileExists(venvPython) &&
-    canImportHermesCli(venvPython, {
+    (await canImportHermesCli(venvPython, {
       env: {
         PYTHONPATH: [ACTIVE_HERMES_ROOT, process.env.PYTHONPATH].filter(Boolean).join(path.delimiter)
       }
-    })
+    }))
   )
 }
 
-function activeRuntimeState() {
+async function activeRuntimeState() {
   // We DELIBERATELY do NOT verify that the checkout is currently at the
   // pinned commit -- users update via the in-app update path or `hermes
   // update`, which moves HEAD legitimately. The marker only attests "a
   // desktop-managed bootstrap ran here at least once"; runtime usability is
   // what decides whether we can actually launch.
-  return classifyActiveRuntime(readBootstrapMarker(), BOOTSTRAP_MARKER_SCHEMA_VERSION, isActiveRuntimeUsable())
+  return classifyActiveRuntime(readBootstrapMarker(), BOOTSTRAP_MARKER_SCHEMA_VERSION, await isActiveRuntimeUsable())
 }
 
 function writeBootstrapMarker(payload) {
@@ -4917,8 +4921,8 @@ function writeDefaultProjectDir(dir) {
   }
 }
 
-function createPythonBackend(root, label, backendArgs, options: any = {}) {
-  const python = findPythonForRoot(root)
+async function createPythonBackend(root, label, backendArgs, options: any = {}) {
+  const python = await findPythonForRoot(root)
 
   if (!python) {
     return null
@@ -4953,9 +4957,9 @@ function createPythonBackend(root, label, backendArgs, options: any = {}) {
 // canonical install location shared with the CLI installer. The venv at
 // VENV_ROOT may not exist yet on first run; bootstrap=true tells
 // ensureRuntime() to create / refresh it before launch.
-function createActiveBackend(backendArgs) {
+async function createActiveBackend(backendArgs) {
   const venvPython = getVenvPython(VENV_ROOT)
-  const command = fileExists(venvPython) ? venvPython : findSystemPython()
+  const command = fileExists(venvPython) ? venvPython : await findSystemPython()
 
   return {
     kind: 'python',
@@ -4973,13 +4977,13 @@ function createActiveBackend(backendArgs) {
   }
 }
 
-function resolveHermesBackend(backendArgs) {
+async function resolveHermesBackend(backendArgs) {
   // 1. Explicit override -- HERMES_DESKTOP_HERMES_ROOT points at a developer
   //    checkout. Honour it as-is (no bootstrap; the user is driving).
   const overrideRoot = process.env.HERMES_DESKTOP_HERMES_ROOT && path.resolve(process.env.HERMES_DESKTOP_HERMES_ROOT)
 
   if (overrideRoot && isHermesSourceRoot(overrideRoot)) {
-    const backend = createPythonBackend(overrideRoot, `Hermes source at ${overrideRoot}`, backendArgs)
+    const backend = await createPythonBackend(overrideRoot, `Hermes source at ${overrideRoot}`, backendArgs)
 
     if (backend) {
       return backend
@@ -4991,7 +4995,7 @@ function resolveHermesBackend(backendArgs) {
   //    installed `hermes` on PATH so local Python edits are actually exercised.
   //    (In dev with no checkout, SOURCE_REPO_ROOT won't pass isHermesSourceRoot.)
   if (!IS_PACKAGED && isHermesSourceRoot(SOURCE_REPO_ROOT)) {
-    const backend = createPythonBackend(SOURCE_REPO_ROOT, `Hermes source at ${SOURCE_REPO_ROOT}`, backendArgs)
+    const backend = await createPythonBackend(SOURCE_REPO_ROOT, `Hermes source at ${SOURCE_REPO_ROOT}`, backendArgs)
 
     if (backend) {
       return backend
@@ -5006,7 +5010,7 @@ function resolveHermesBackend(backendArgs) {
   //    builds could leave a healthy install behind without the marker. If the
   //    active runtime is usable, launch it directly; only fall through to
   //    bootstrap when the runtime itself is unusable.
-  const activeRuntime = activeRuntimeState()
+  const activeRuntime = await activeRuntimeState()
 
   if (activeRuntime.shouldUseActiveRuntime && !bootstrapRepairRequested) {
     if (!activeRuntime.hasValidMarker) {
@@ -5053,7 +5057,7 @@ function resolveHermesBackend(backendArgs) {
     }
 
     if (hermesCommand) {
-      const unwrapped = unwrapWindowsVenvHermesCommand(hermesCommand, backendArgs)
+      const unwrapped = await unwrapWindowsVenvHermesCommand(hermesCommand, backendArgs)
 
       if (unwrapped) {
         return unwrapped
@@ -5072,7 +5076,10 @@ function resolveHermesBackend(backendArgs) {
       // the Nix wrapper), not a discovered PATH candidate. It must not fall
       // through to the install-script bootstrap if the optional probe times
       // out under load; the pinned backend is the only valid runtime there.
-      if (shouldTrustHermesOverride(hermesOverride) || verifyHermesCli(hermesCommand, { shell: shellForProbe })) {
+      if (
+        shouldTrustHermesOverride(hermesOverride) ||
+        (await verifyHermesCli(hermesCommand, { shell: shellForProbe }))
+      ) {
         // `unwrapped` above already answered "is this a Windows venv shim?" —
         // it was null (not a shim, or its import probe failed). Do NOT re-run
         // unwrapWindowsVenvHermesCommand here: the second call repeats the
@@ -5098,7 +5105,7 @@ function resolveHermesBackend(backendArgs) {
   // 5. Last-ditch: pip-installed hermes_cli module via system Python.
   //    Same rationale as #4 -- the user installed this; we use it but don't
   //    take ownership.
-  const python = findSystemPython()
+  const python = await findSystemPython()
 
   if (python) {
     // Same smoke-test rationale as step 4: a system Python in the
@@ -5109,7 +5116,7 @@ function resolveHermesBackend(backendArgs) {
     // Verify the import works before trusting the candidate; on
     // failure, fall through to step 6 so the bootstrap runner pulls
     // a uv-managed 3.11 into %LOCALAPPDATA%\hermes\hermes-agent\venv.
-    if (canImportHermesCli(python)) {
+    if (await canImportHermesCli(python)) {
       return {
         kind: 'python',
         label: `installed hermes_cli module via ${python}`,
@@ -5260,7 +5267,7 @@ async function ensureRuntime(backend) {
 
     // Re-resolve now that the install exists. The new resolution lands in
     // step 3 (bootstrap-complete marker) and we recurse to wire venvPython.
-    return ensureRuntime(resolveHermesBackend(backend.args))
+    return ensureRuntime(await resolveHermesBackend(backend.args))
   }
 
   // bootstrap=true with a real backend (createActiveBackend path) means we
@@ -6344,7 +6351,7 @@ function sendPreviewFileChanged(payload) {
   webContents.send('hermes:preview-file-changed', payload)
 }
 
-async function watchPreviewFile(rawUrl) {
+async function watchPreviewFile(rawUrl, webContentsId: number | null = null) {
   const filePath = await filePathFromPreviewUrl(rawUrl)
   const watchDir = path.dirname(filePath)
   const targetName = path.basename(filePath)
@@ -6373,36 +6380,45 @@ async function watchPreviewFile(rawUrl) {
     }, PREVIEW_WATCH_DEBOUNCE_MS)
   })
 
-  previewWatchers.set(id, {
-    close: () => {
-      if (timer) {
-        clearTimeout(timer)
-      }
-
-      watcher.close()
+  // Deleting/renaming the watched directory raises FSWatcher 'error' (EPERM
+  // on Windows). Unhandled, that throws and crashes the main process — this
+  // is a plugin-folder/preview-file watcher on a user-managed path users
+  // routinely delete or rename, so it's reachable in normal use, not an edge
+  // case. Forget the watcher and let the renderer's own poll fallback pick up
+  // the loss instead of crashing the app.
+  guardWatcherErrors(watcher, error => {
+    if (timer) {
+      clearTimeout(timer)
+      timer = null
     }
+
+    previewWatchers.stop(id)
+    rememberLog(`[preview] file watcher error on ${watchDir}: ${error instanceof Error ? error.message : error}`)
   })
+
+  previewWatchers.register(
+    id,
+    {
+      close: () => {
+        if (timer) {
+          clearTimeout(timer)
+        }
+
+        watcher.close()
+      }
+    },
+    webContentsId
+  )
 
   return { id, path: filePath }
 }
 
 function stopPreviewFileWatch(id) {
-  const watcher = previewWatchers.get(id)
-
-  if (!watcher) {
-    return false
-  }
-
-  watcher.close()
-  previewWatchers.delete(id)
-
-  return true
+  return previewWatchers.stop(id)
 }
 
 function closePreviewWatchers() {
-  for (const id of previewWatchers.keys()) {
-    stopPreviewFileWatch(id)
-  }
+  previewWatchers.stopAll()
 }
 
 function requestOptionsWithHeaders(options: any = {}, headers = {}) {
@@ -6420,7 +6436,7 @@ function requestOptionsWithHeaders(options: any = {}, headers = {}) {
  *  readdir poll. Same registry + change channel as the preview file watchers
  *  (the renderer reconciles on any tick; per-file edits stay on their own
  *  watches), so stopPreviewFileWatch/closePreviewWatchers manage these too. */
-function watchDirectory(rawDir) {
+function watchDirectory(rawDir, webContentsId: number | null = null) {
   const watchDir = path.resolve(String(rawDir || ''))
 
   if (!fs.existsSync(watchDir) || !fs.statSync(watchDir).isDirectory()) {
@@ -6441,15 +6457,34 @@ function watchDirectory(rawDir) {
     }, PREVIEW_WATCH_DEBOUNCE_MS)
   })
 
-  previewWatchers.set(id, {
-    close: () => {
-      if (timer) {
-        clearTimeout(timer)
-      }
-
-      watcher.close()
+  // Same crash class as watchPreviewFile: a plugin-folder directory watcher
+  // that users routinely delete/rename must not let an unhandled 'error'
+  // (EPERM on Windows) take down the main process. runtime-loader already has
+  // a readdir-poll fallback for shells that predate watchDirectory — losing
+  // the watch here just means that fallback keeps reconciling.
+  guardWatcherErrors(watcher, error => {
+    if (timer) {
+      clearTimeout(timer)
+      timer = null
     }
+
+    previewWatchers.stop(id)
+    rememberLog(`[preview] directory watcher error on ${watchDir}: ${error instanceof Error ? error.message : error}`)
   })
+
+  previewWatchers.register(
+    id,
+    {
+      close: () => {
+        if (timer) {
+          clearTimeout(timer)
+        }
+
+        watcher.close()
+      }
+    },
+    webContentsId
+  )
 
   return { id, path: watchDir }
 }
@@ -6459,7 +6494,14 @@ function watchDirectory(rawDir) {
 // a password-provider gateway (which cannot satisfy the bearer/cookie checks
 // by design) from a real OAuth one. Any failure returns [] so callers keep the
 // strict guard — backends predating /api/auth/providers are unaffected.
+//
+// Keyed by baseUrl, which stays small in normal use (one entry per registered
+// connection), but nothing ever evicted it — a churned-through set of ad-hoc
+// remote URLs (temporary SSH tunnels, a base URL edited repeatedly in
+// Settings) would still accumulate for the life of the process. Cap it
+// defensively alongside the process's other never-evicted caches.
 const gatewayAuthProvidersCache = new Map<string, any[]>()
+const GATEWAY_AUTH_PROVIDERS_CACHE_LIMIT = 200
 
 async function gatewayAuthProviders(baseUrl, headers = {}) {
   const cached = gatewayAuthProvidersCache.get(baseUrl)
@@ -6484,6 +6526,7 @@ async function gatewayAuthProviders(baseUrl, headers = {}) {
     }
 
     gatewayAuthProvidersCache.set(baseUrl, providers)
+    capMapSize(gatewayAuthProvidersCache, GATEWAY_AUTH_PROVIDERS_CACHE_LIMIT)
   } catch {
     // Optional metadata — an unreadable list keeps the strict guard.
   }
@@ -6852,25 +6895,6 @@ async function showPluginCompatNoticeOnce() {
   }
 }
 
-function sendOpenUpdatesRequested() {
-  if (!mainWindow || mainWindow.isDestroyed()) {
-    return
-  }
-
-  const { webContents } = mainWindow
-
-  if (!webContents || webContents.isDestroyed()) {
-    return
-  }
-
-  webContents.send('hermes:open-updates')
-
-  if (!mainWindow.isVisible()) {
-    mainWindow.show()
-  }
-
-  mainWindow.focus()
-}
 
 // Push titlebar/fullscreen chrome state to a window's renderer. Defaults to the
 // primary, but any full chat window (primary or a secondary "instance" peer)
@@ -6898,17 +6922,11 @@ function sendWindowStateChanged(nextIsFullscreen?: boolean, target = mainWindow)
 function buildApplicationMenu() {
   const template = []
 
-  const checkForUpdatesItem = {
-    label: 'Check for Updates…',
-    click: () => sendOpenUpdatesRequested()
-  }
-
   if (IS_MAC) {
     template.push({
       label: APP_NAME,
       submenu: [
         { label: `About ${APP_NAME}`, click: () => showAboutPanelFresh() },
-        checkForUpdatesItem,
         { type: 'separator' },
         { role: 'services' },
         { type: 'separator' },
@@ -7019,11 +7037,6 @@ function buildApplicationMenu() {
     submenu: IS_MAC
       ? [{ role: 'minimize' }, { role: 'zoom' }, { role: 'front' }]
       : [{ role: 'minimize' }, { role: 'close' }]
-  })
-  template.push({
-    label: 'Help',
-    role: 'help',
-    submenu: [checkForUpdatesItem]
   })
 
   return Menu.buildFromTemplate(template)
@@ -7251,11 +7264,29 @@ function installZoomShortcuts(window) {
  *    renderer appends them to its already-open menu,
  *  - the gesture coordinates — kept for copyImageAt, which needs them.
  */
+// Keyed by webContents.id and never cleaned: every window that ever showed a
+// context menu stayed in this map for the life of the process, including
+// windows closed and reopened many times over a long session. Prune it the
+// same way foundInPageForwarders (below) prunes its own webContents-keyed
+// map — a one-shot 'destroyed' listener installed the first time a window is
+// seen — instead of leaving the entry to outlive its window.
 const lastContextMenuPoint = new Map<number, { x: number; y: number }>()
+const contextMenuPointCleanupInstalled = new Set<number>()
 
 function installContextMenuBridge(window: BrowserWindow) {
+  const webContentsId = window.webContents.id
+
+  if (!contextMenuPointCleanupInstalled.has(webContentsId)) {
+    contextMenuPointCleanupInstalled.add(webContentsId)
+
+    window.webContents.once('destroyed', () => {
+      lastContextMenuPoint.delete(webContentsId)
+      contextMenuPointCleanupInstalled.delete(webContentsId)
+    })
+  }
+
   window.webContents.on('context-menu', (_event, params) => {
-    lastContextMenuPoint.set(window.webContents.id, { x: params.x, y: params.y })
+    lastContextMenuPoint.set(webContentsId, { x: params.x, y: params.y })
 
     const suggestions = Array.isArray(params.dictionarySuggestions) ? params.dictionarySuggestions : []
 
@@ -7888,23 +7919,24 @@ function _nativeTokenStorePath() {
   return path.join(app.getPath('userData'), 'native-oauth-tokens.json')
 }
 
-// The electron-coupled half of the token store: safeStorage encryption plus the
-// userData file. native-token-store.ts owns the serialization/parse round trip
-// so it can be tested without an Electron runtime.
+// The electron-coupled half of the token store lives in the fork module —
+// see fork/secret-storage-integration.ts (created at the secret-storage-io
+// anchor below; safe to call here because it is only invoked at runtime,
+// long after module evaluation).
 function _nativeTokenStoreIo(): NativeTokenStoreIo {
-  return {
-    encrypt: encryptDesktopSecret,
-    decrypt: decryptDesktopSecret,
-    readStoreText: () => fs.readFileSync(_nativeTokenStorePath(), 'utf8'),
-    writeStoreText: (text: string) => {
-      fs.mkdirSync(path.dirname(_nativeTokenStorePath()), { recursive: true })
-      fs.writeFileSync(_nativeTokenStorePath(), text, { mode: 0o600 })
-    },
-    rememberLog
-  }
+  return secretStorageIntegration.nativeTokenStoreIo()
 }
 
 function _persistNativeTokens(baseUrl: string, tokens: NativeTokenSet | null) {
+  // Deliberately NOT wrapped in try/catch: persistNativeTokenSet already
+  // catches its own recoverable failure (an unwritable disk) internally and
+  // only THROWS for the two authoritative-failure cases — an unusable/null
+  // keychain and a corrupt-store abort — that must surface to the caller
+  // rather than be silently absorbed. Every call site already handles that
+  // (native login falls back to the embedded flow; ensureNativeAccessToken's
+  // refresh/force-clear callers already `.catch(() => null)`), so swallowing
+  // it here would silently turn a real "your tokens may not have saved"
+  // failure into a false "everything's fine".
   persistNativeTokenSet(baseUrl, tokens, _nativeTokenStoreIo())
 }
 
@@ -8279,15 +8311,23 @@ async function saveGatewayFileViaDataUrl(
 }
 
 // Mint a single-use WS ticket for a gated gateway. Returns the ticket string.
-// Prefers a native bearer token (cookieless RFC 8252 flow) when present,
-// falling back to the OAuth cookie partition otherwise.
-// Throws (with statusCode 401) if the session cookie is missing/expired —
+// Three credential shapes, in order: an explicit static session token (the
+// token-auth remote path), a native bearer token (cookieless RFC 8252 flow),
+// then the OAuth cookie partition.
+// Throws (with statusCode 401) if the credential is missing/expired —
 // callers treat that as "needs re-login".
 // Transient transport blips (brief host unreachable, 5xx, timeouts) are retried
 // a few times before failing — those 1-3s flaps were promoting into the
 // full-screen "couldn't start" lockout on reconnect.
-async function mintGatewayWsTicket(baseUrl, headers = {}) {
+async function mintGatewayWsTicket(baseUrl, headers = {}, staticToken: string | null = null) {
   return withTransientRetries(async () => {
+    // Token-auth remotes: the static session token is accepted as a bearer on
+    // the mint endpoint (fork rung — see fork/remote-auth.ts).
+    // >>> FORK ANCHOR: remote-auth-static-ticket <<<
+    if (staticToken) {
+      return mintWsTicketWithStaticToken(baseUrl, headers, staticToken, { fetchJson })
+    }
+
     // Native flow: mint the ticket with the bearer token, no cookie involved.
     const nativeAt = await ensureNativeAccessToken(baseUrl).catch(() => null)
 
@@ -8348,7 +8388,17 @@ async function freshGatewayWsUrl(profile) {
     return wsUrl
   }
 
-  // Local/token: the cached wsUrl already carries the (long-lived) token.
+  // Remote token-auth: trade the static token for a single-use ticket, with
+  // the cached wsUrl as fallback (fork rung — see fork/remote-auth.ts).
+  // >>> FORK ANCHOR: remote-auth-token-ws-url <<<
+  if (connection.mode === 'remote' && connection.token) {
+    return freshRemoteTokenWsUrl(connection, {
+      mintTicket: mintGatewayWsTicket,
+      buildTicketUrl: buildGatewayWsUrlWithTicket
+    })
+  }
+
+  // Local/ungated: the cached wsUrl already carries the (long-lived) token.
   rememberRemoteWsHeaders(connection.wsUrl, connection.headers)
 
   return connection.wsUrl
@@ -8895,11 +8945,28 @@ async function cloudAgentSilentSignIn(dashboardUrl) {
 // stored secrets in place.
 // ---------------------------------------------------------------------------
 const SECRET_STORAGE_POLICY_PATH = path.join(app.getPath('userData'), SECRET_STORAGE_POLICY_FILE)
+// Independent of the policy file itself — see readSecretStoragePolicy's doc
+// comment on why "the policy file disappeared" needs a durability signal that
+// doesn't live inside the same file that can disappear.
+const SECRET_STORAGE_LAST_ON_MARKER_PATH = path.join(app.getPath('userData'), SECRET_STORAGE_LAST_ON_MARKER_FILE)
 
-const _secretStoragePolicyIo = {
-  readText: () => fs.readFileSync(SECRET_STORAGE_POLICY_PATH, 'utf8'),
-  writeText: (text: string) => writeSecretFileAtomic(SECRET_STORAGE_POLICY_PATH, text, { encoding: 'utf8' })
-}
+// Electron-coupled IO for the policy + native token store (atomic writes,
+// corruption quarantine, last-on marker, honest keychain probe). The policy
+// decision logic stays in secret-storage-policy.ts / native-token-store.ts;
+// the side-effect bodies live in the fork module.
+// >>> FORK ANCHOR: secret-storage-io <<<
+const secretStorageIntegration = createSecretStorageIntegration({
+  nativeTokenStorePath: _nativeTokenStorePath,
+  policyPath: SECRET_STORAGE_POLICY_PATH,
+  lastOnMarkerPath: SECRET_STORAGE_LAST_ON_MARKER_PATH,
+  encrypt: (plaintext: string) => encryptDesktopSecret(plaintext),
+  decrypt: (secret: any) => decryptDesktopSecret(secret),
+  isEncryptionAvailable: () => safeStorage.isEncryptionAvailable(),
+  secretStoragePolicy: () => secretStoragePolicy(),
+  rememberLog
+})
+
+const _secretStoragePolicyIo = secretStorageIntegration.secretStoragePolicyIo
 
 let _secretStoragePolicy: SecretStoragePolicy | null = null
 
@@ -8916,210 +8983,49 @@ function setSecretStoragePolicy(next: SecretStoragePolicy) {
   writeSecretStoragePolicy(_secretStoragePolicy, _secretStoragePolicyIo)
 }
 
-/**
- * Keychain availability as the renderer should see it. With encryption
- * opted out this must NOT probe safeStorage — isEncryptionAvailable() is
- * itself a keychain touch that raises the macOS dialog this feature exists
- * to avoid. We report `true` so no plain-text warning banners fire: storing
- * plaintext is the user's chosen (default) mode, not a degraded state.
- */
+// Gated probe (suppresses the plaintext-opt-in CONFIRM dialog while the
+// policy is off) — see the fork module for the full rationale.
 function probeSecureTokenStorage(): boolean {
-  if (!secretStoragePolicy().on) {
-    return true
-  }
-
-  try {
-    return Boolean(safeStorage.isEncryptionAvailable())
-  } catch {
-    return false
-  }
+  return secretStorageIntegration.probeSecureTokenStorage()
 }
 
-/**
- * Rewrite every stored desktop secret (v1 connection.json token/headers +
- * per-profile overrides, v2 registry connections, native OAuth token store)
- * through `reencode`. Returns true when any store was rewritten. Shared by
- * the one-shot legacy migration and the Settings encryption toggle.
- */
+// The honest { available, policyOn } state the renderer's "stored without
+// OS keychain encryption" hint reads — see the fork module.
+function probeSecureTokenStorageState(): SecureTokenStorageState {
+  return secretStorageIntegration.probeSecureTokenStorageState()
+}
+
+// Bulk secret re-encoding (shared rewrite walker + one-shot legacy migration
+// + the Settings encryption toggle) lives in the fork module; this deps
+// object is the only seam it needs. See fork/secret-rewrite.ts.
+// >>> FORK ANCHOR: secret-rewrite <<<
+const _secretRewriteDeps: SecretRewriteDeps = {
+  readDesktopConnectionConfig: () => readDesktopConnectionConfig(),
+  writeDesktopConnectionConfig: config => writeDesktopConnectionConfig(config),
+  readDesktopConnectionsRegistry: () => readDesktopConnectionsRegistry(),
+  writeDesktopConnectionsRegistry: registry => writeDesktopConnectionsRegistry(registry),
+  nativeTokenStoreIo: () => _nativeTokenStoreIo(),
+  secretStoragePolicy: () => secretStoragePolicy(),
+  setSecretStoragePolicy: next => setSecretStoragePolicy(next),
+  decryptDesktopSecret: secret => decryptDesktopSecret(secret),
+  encryptSecretStrict: value => encryptDesktopSecretStrict(value, safeStorage),
+  isEncryptionAvailable: () => Boolean(safeStorage.isEncryptionAvailable()),
+  rememberLog
+}
+
 function rewriteAllStoredSecrets(shouldRewrite: (secret: any) => boolean, reencode: (secret: any) => any): boolean {
-  let touched = false
-
-  const rewriteBlock = (block: any) => {
-    if (!block || typeof block !== 'object') {
-      return block
-    }
-
-    const next = { ...block, ...(block.token ? { token: reencode(block.token) } : {}) }
-
-    if (block.headers && typeof block.headers === 'object') {
-      next.headers = Object.fromEntries(Object.entries(block.headers).map(([k, v]) => [k, reencode(v)]))
-    }
-
-    return next
-  }
-
-  const blockNeedsRewrite = (o: any) =>
-    shouldRewrite(o?.token) ||
-    Object.values(o?.headers && typeof o.headers === 'object' ? o.headers : {}).some(shouldRewrite)
-
-  // v1 connection.json.
-  const config = readDesktopConnectionConfig()
-
-  if (blockNeedsRewrite(config.remote) || Object.values(config.profiles || {}).some(blockNeedsRewrite)) {
-    touched = true
-    writeDesktopConnectionConfig({
-      ...config,
-      remote: rewriteBlock(config.remote),
-      profiles: Object.fromEntries(Object.entries(config.profiles || {}).map(([k, v]) => [k, rewriteBlock(v)]))
-    })
-  }
-
-  // v2 connections.json registry.
-  const registry = readDesktopConnectionsRegistry()
-
-  if (registry.connections?.some(blockNeedsRewrite)) {
-    touched = true
-    writeDesktopConnectionsRegistry({ ...registry, connections: registry.connections.map(rewriteBlock) })
-  }
-
-  // Native OAuth token store: baseUrl → blob.
-  const io = _nativeTokenStoreIo()
-
-  try {
-    const store = JSON.parse(io.readStoreText())
-
-    if (store && typeof store === 'object' && !Array.isArray(store)) {
-      const entries = Object.entries(store)
-
-      if (entries.some(([, v]) => shouldRewrite(v))) {
-        touched = true
-        io.writeStoreText(JSON.stringify(Object.fromEntries(entries.map(([k, v]) => [k, reencode(v)]))))
-      }
-    }
-  } catch {
-    // Missing/corrupt native token store: nothing to rewrite.
-  }
-
-  return touched
+  return rewriteAllStoredSecretsFork(_secretRewriteDeps, shouldRewrite, reencode)
 }
 
-/**
- * One-shot legacy migration: builds before the opt-in policy wrote every
- * secret as a safeStorage blob. With encryption now defaulting OFF, decrypt
- * each stored blob once and rewrite it as plain so no future launch touches
- * the keychain. Marked `migrated` whether or not every blob decrypts — a
- * broken keychain costs at most ONE prompt (this pass), never one per
- * launch; blobs that would not decrypt are left in place and simply read as
- * absent from then on (classifyStoredSecret → 'drop'), so opting encryption
- * back ON later can still recover them on a healthy keychain.
- *
- * Runs before createWindow() so every later read sees the final encodings.
- */
+// One-shot legacy migration — see fork/secret-rewrite.ts. Runs before
+// createWindow() so every later read sees the final encodings.
 function migrateLegacyEncryptedSecretsOnce() {
-  const policy = secretStoragePolicy()
-
-  if (policy.on || policy.migrated) {
-    return
-  }
-
-  const needsMigration = (secret: any) => classifyStoredSecret(secret, policy) === 'migrate'
-
-  const reencode = (secret: any) => {
-    if (!needsMigration(secret)) {
-      return secret
-    }
-
-    const plaintext = decryptDesktopSecret(secret)
-
-    // Undecryptable now (locked/absent keychain): keep the blob for a
-    // potential future opt-in, but post-migration reads treat it as unset.
-    return plaintext ? { encoding: 'plain', value: plaintext } : secret
-  }
-
-  let touchedKeychain = false
-
-  try {
-    touchedKeychain = rewriteAllStoredSecrets(needsMigration, reencode)
-  } catch (error) {
-    const detail = error instanceof Error ? error.message : String(error)
-
-    rememberLog(`[secret-storage] legacy migration pass failed: ${detail}`)
-  }
-
-  setSecretStoragePolicy({ on: false, migrated: true })
-
-  if (touchedKeychain) {
-    rememberLog('[secret-storage] migrated legacy keychain-encrypted secrets to opt-out storage (one-shot pass)')
-  }
+  migrateLegacyEncryptedSecretsOnceFork(_secretRewriteDeps)
 }
 
-/**
- * Settings → Gateway toggle: flip keychain-backed encryption and re-encode
- * every stored secret to match. Turning ON encrypts plain blobs through
- * strict safeStorage (throws loudly when the keychain is unusable — the
- * toggle stays off and the renderer shows the error). Turning OFF decrypts
- * back to plain; this is user-initiated, so a keychain prompt here is
- * expected and acceptable.
- */
+// Settings → Gateway toggle — see fork/secret-rewrite.ts.
 function applySecretStorageEncryption(on: boolean) {
-  const enable = on === true
-
-  if (secretStoragePolicy().on === enable) {
-    return { on: enable }
-  }
-
-  if (enable) {
-    const needsEncrypt = (secret: any) => secret?.encoding === 'plain' && Boolean(secret.value)
-
-    // Probe FIRST so an unusable keychain fails before any store is touched.
-    if (
-      !(() => {
-        try {
-          return Boolean(safeStorage.isEncryptionAvailable())
-        } catch {
-          return false
-        }
-      })()
-    ) {
-      throw new Error(
-        'OS keychain encryption is unavailable on this machine, so stored gateway secrets cannot be encrypted.'
-      )
-    }
-
-    setSecretStoragePolicy({ on: true, migrated: true })
-
-    try {
-      rewriteAllStoredSecrets(needsEncrypt, secret =>
-        needsEncrypt(secret) ? encryptDesktopSecretStrict(String(secret.value), safeStorage) : secret
-      )
-    } catch (error) {
-      // Encryption failed midway: revert the policy so reads keep working
-      // against whatever encodings are on disk (mixed stores read fine —
-      // decryptDesktopSecret handles both encodings under either policy).
-      setSecretStoragePolicy({ on: false, migrated: true })
-      throw error
-    }
-
-    return { on: true }
-  }
-
-  // Turning OFF: decrypt everything back to plain while the keychain is
-  // still readable, then flip the policy.
-  const needsDecrypt = (secret: any) => secret?.encoding === SAFE_STORAGE_ENCODING
-
-  rewriteAllStoredSecrets(needsDecrypt, (secret: any) => {
-    if (!needsDecrypt(secret)) {
-      return secret
-    }
-
-    const plaintext = decryptDesktopSecret(secret)
-
-    return plaintext ? { encoding: 'plain', value: plaintext } : secret
-  })
-
-  setSecretStoragePolicy({ on: false, migrated: true })
-
-  return { on: false }
+  return applySecretStorageEncryptionFork(_secretRewriteDeps, on, SAFE_STORAGE_ENCODING)
 }
 
 function encryptDesktopSecret(value, options = {}) {
@@ -9598,6 +9504,12 @@ function sanitizeConnectionsRegistry(registry = readDesktopConnectionsRegistry()
   // offer the plain-text opt-in on keyring-less Linux instead of failing.
   // Policy-aware: never touches safeStorage while encryption is opted out.
   const secureTokenStorage = probeSecureTokenStorage()
+  // The renderer-facing honest state ({ available, policyOn }) so Settings can
+  // show "stored without OS keychain encryption" instead of trusting the
+  // gated `secureTokenStorage` flag above, which always reads true while the
+  // policy is off (that flag exists only to suppress the plain-text opt-in
+  // CONFIRM dialog, not to describe the actual encryption state).
+  const secretStorageState = probeSecureTokenStorageState()
 
   return {
     version: registry.version,
@@ -9605,6 +9517,7 @@ function sanitizeConnectionsRegistry(registry = readDesktopConnectionsRegistry()
     launchMode: registry.launchMode,
     lastUsed: registry.lastUsed,
     secureTokenStorage,
+    secretStorageState,
     connections: registry.connections.map(sanitizeRegistryConnection),
     // Surface quarantined-entry NOTICES only (reason + best-effort label) —
     // the raw entries can carry token envelopes and stay in the file (#94246).
@@ -9690,21 +9603,28 @@ async function saveRegistryConnection(input: any = {}) {
 
 // Returns the desktop's chosen profile name, or null when unset. "default" is
 // a valid stored value (pins the root HERMES_HOME explicitly); null means "no
-// preference" and preserves the legacy launch (no --profile flag).
+// preference" and preserves the legacy launch (no --profile flag). A stored
+// name must also still EXIST on this machine; the validation + self-heal
+// rationale lives in fork/profile-repair.ts.
+// >>> FORK ANCHOR: profile-repair <<<
 function readActiveDesktopProfile() {
-  try {
-    const raw = fs.readFileSync(DESKTOP_PROFILE_CONFIG_PATH, 'utf8')
-    const parsed = JSON.parse(raw)
-    const name = parsed && typeof parsed.profile === 'string' ? parsed.profile.trim() : ''
+  return repairStoredProfile({
+    readStoredProfile: () => {
+      try {
+        const raw = fs.readFileSync(DESKTOP_PROFILE_CONFIG_PATH, 'utf8')
+        const parsed = JSON.parse(raw)
 
-    if (name && (name === 'default' || PROFILE_NAME_RE.test(name))) {
-      return name
-    }
-  } catch {
-    // Missing or malformed → no preference.
-  }
-
-  return null
+        return parsed && typeof parsed.profile === 'string' ? parsed.profile : ''
+      } catch {
+        // Missing or malformed → no preference.
+        return ''
+      }
+    },
+    isValidProfileName: key => PROFILE_NAME_RE.test(key),
+    profileDirectoryExists: key => directoryExists(path.join(HERMES_HOME, 'profiles', key)),
+    clearStoredProfile: () => void writeActiveDesktopProfile(null),
+    rememberLog
+  })
 }
 
 function writeActiveDesktopProfile(name) {
@@ -9808,6 +9728,9 @@ async function sanitizeDesktopConnectionConfig(config = readDesktopConnectionCon
   // true WITHOUT touching safeStorage — probing is itself a keychain touch
   // that raises the macOS password dialog (see probeSecureTokenStorage).
   const secureTokenStorage = probeSecureTokenStorage()
+  // The honest counterpart: { available, policyOn }. See
+  // sanitizeConnectionsRegistry for why the two are not the same signal.
+  const secretStorageState = probeSecureTokenStorageState()
 
   // Whether the currently saved token is stored in plain text (the keyring-less
   // opt-in path). The env override supplies its token from the environment, not
@@ -9845,6 +9768,10 @@ async function sanitizeDesktopConnectionConfig(config = readDesktopConnectionCon
     // Whether the OS keyring can encrypt a token; drives the plain-text opt-in
     // affordance in Settings → Gateway on keyring-less Linux.
     secureTokenStorage,
+    // The honest { available, policyOn } state (see probeSecureTokenStorageState)
+    // so the renderer can show a real "not OS-keychain encrypted" hint instead
+    // of relying on the gated `secureTokenStorage` flag above.
+    secretStorageState,
     // Whether the saved token is currently persisted in plain text.
     remoteTokenPlainText,
     sshHost: (ssh || savedSsh)?.host || '',
@@ -10529,10 +10456,11 @@ async function reachablePreviewUrl(webContentsId: number, rawUrl: string): Promi
 }
 
 async function effectiveSshConfigFingerprint(sshConfig) {
-  const ssh =
-    process.platform === 'win32'
-      ? path.join(process.env.SystemRoot || 'C:\\Windows', 'System32', 'OpenSSH', 'ssh.exe')
-      : 'ssh'
+  const ssh = resolveSsh()
+
+  if (!ssh) {
+    throw new Error(SSH_BINARY_MISSING_MESSAGE)
+  }
 
   const args = ['-G']
 
@@ -10545,9 +10473,9 @@ async function effectiveSshConfigFingerprint(sshConfig) {
   }
 
   args.push('--', sshConfig.user ? `${sshConfig.user}@${sshConfig.host}` : sshConfig.host)
-  const output = await execText(ssh, args, { timeout: 10_000 })
+  const stdout = await execText(ssh, args, { timeout: 10_000 })
 
-  return crypto.createHash('sha256').update(output).digest('hex')
+  return crypto.createHash('sha256').update(stdout).digest('hex')
 }
 
 async function bootstrapSshConnection(
@@ -10662,13 +10590,20 @@ async function bootstrapSshConnectionInner(profile, sshConfig, reuseToken, sourc
   let removeForceCleanup = () => {}
 
   if (created) {
+    const sshBinary = resolveSsh()
+
+    if (!sshBinary) {
+      throw new Error(SSH_BINARY_MISSING_MESSAGE)
+    }
+
     ssh = new SshConnection(
       { host: sshConfig.host, user: sshConfig.user, port: sshConfig.port, keyPath: sshConfig.keyPath },
       {
         rememberLog: sshRememberLog,
         ownershipId: sshOwnershipKey(profile),
         scope,
-        effectiveConfigFingerprint: sshConfig.effectiveConfigFingerprint
+        effectiveConfigFingerprint: sshConfig.effectiveConfigFingerprint,
+        sshBinary
       }
     )
     removeForceCleanup = lease.onForceCleanup(() => ssh.close())
@@ -11047,7 +10982,14 @@ async function requestJsonForProfile(profile: string, path: string, method: stri
     return fetchJsonViaOauthSession(url, { ...opts, headers: conn.headers })
   }
 
-  return fetchJson(url, conn.token, { ...opts, headers: conn.headers })
+  // Same bearer rule as hermes:api — a gated remote verifies the session token
+  // as `Authorization: Bearer`, while `X-Hermes-Session-Token` is honoured only
+  // by an ungated loopback backend. Sending both keeps local and remote working.
+  return fetchJson(url, conn.token, {
+    ...opts,
+    headers: conn.headers,
+    bearer: conn.mode === 'remote' && conn.token ? conn.token : undefined
+  })
 }
 
 async function probeRemoteAuthMode(rawUrl) {
@@ -11134,7 +11076,7 @@ async function testDesktopConnectionConfig(input: any = {}) {
 
     const ssh = createSshProbeConnection(
       { host: sshConfig.host, user: sshConfig.user, port: sshConfig.port, keyPath: sshConfig.keyPath },
-      { rememberLog: sshRememberLog }
+      { rememberLog: sshRememberLog, sshBinary: resolveSsh() }
     )
 
     try {
@@ -11377,6 +11319,30 @@ function broadcastConnectionsChanged(payload: { connectionId: string; reason: 'r
     }
   }
 }
+
+// ── Dev: main/backend staleness watchers ────────────────────────────────────
+// Dev-only "restart to apply" affordances for the Electron main-process
+// bundle and the backend Python source. The watchers, IPC handlers, and
+// lifecycle wiring live in the fork module — see fork/dev-restart-watch.ts
+// for the full rationale.
+// >>> FORK ANCHOR: dev-restart-watch <<<
+const devRestartWatch = registerDevRestartWatch({
+  appRoot: APP_ROOT,
+  isPackaged: IS_PACKAGED,
+  devServer: DEV_SERVER,
+  sourceRepoRoot: SOURCE_REPO_ROOT,
+  env: process.env,
+  app,
+  ipcMain,
+  getAllWindows: () => BrowserWindow.getAllWindows(),
+  isHermesSourceRoot,
+  directoryExists,
+  primaryBackendIsRemote: () => primaryBackendIsRemote(),
+  teardownPrimaryBackend: async () => {
+    await teardownPrimaryBackendAndWait({ soft: true })
+    sendConnectionApplied()
+  }
+})
 
 async function waitForBackendExit(child, timeoutMs = 5000) {
   if (!child || child.exitCode !== null || child.signalCode !== null) {
@@ -12599,9 +12565,9 @@ async function spawnPoolBackend(profile, entry, opts: { forceLocal?: boolean; po
   // step 3 in hermes_cli/main.py), so the child re-homes to this profile.
   // --port 0: the OS assigns an ephemeral port; the child announces it on stdout.
   const backendArgs = ['--profile', profile, 'serve', '--host', '127.0.0.1', '--port', '0']
-  const backend = await ensureRuntime(resolveHermesBackend(backendArgs))
+  const backend = await ensureRuntime(await resolveHermesBackend(backendArgs))
   // Route old runtimes (no `serve`) through the legacy `dashboard --no-open`.
-  backend.args = getBackendArgsForRuntime(backend)
+  backend.args = await getBackendArgsForRuntime(backend)
   const hermesCwd = resolveHermesCwd()
   const webDist = resolveWebDist()
   const readyFile = backend.readyFile ? makeDashboardReadyFile() : null
@@ -13025,7 +12991,7 @@ async function startHermes() {
 
     const backend = setup.backend
     // Route old runtimes (no `serve`) through the legacy `dashboard --no-open`.
-    backend.args = getBackendArgsForRuntime(backend)
+    backend.args = await getBackendArgsForRuntime(backend)
     const hermesCwd = resolveHermesCwd()
     const webDist = resolveWebDist()
     const readyFile = backend.readyFile ? makeDashboardReadyFile() : null
@@ -13450,7 +13416,12 @@ function spawnSecondaryWindow({
     // covers it. ready-to-show fires after the boot-time paint in
     // themes/context.tsx, so the window appears already themed.
     show: false,
-    webPreferences: chatWindowWebPreferences(PRELOAD_PATH)
+    // Must carry WINDOW_CAPS_ARGUMENT like every other PRELOAD_PATH window:
+    // preload no longer answers translucency/HUD-windowing via sendSync, it
+    // reads --hermes-window-caps off argv, so a window missing this argument
+    // gets glassSupported/translucencySupported forced false and hudWindowing
+    // undefined (#331b1a5e round-1 review finding).
+    webPreferences: withWindowCapsArgument(chatWindowWebPreferences(PRELOAD_PATH))
   })
 
   // Chat-surface registration: applyWindowTranslucency swaps this window's
@@ -13538,7 +13509,7 @@ function spawnBrowserWindow(tabId) {
     ...chatWindowSurfaceOptions(),
     icon,
     show: false,
-    webPreferences: chatWindowWebPreferences(PRELOAD_PATH)
+    webPreferences: withWindowCapsArgument(chatWindowWebPreferences(PRELOAD_PATH))
   })
 
   translucencyBackedWindows.add(win)
@@ -13630,7 +13601,7 @@ function createInstanceWindow() {
     ...chatWindowSurfaceOptions(),
     icon,
     show: false,
-    webPreferences: chatWindowWebPreferences(PRELOAD_PATH)
+    webPreferences: withWindowCapsArgument(chatWindowWebPreferences(PRELOAD_PATH))
   })
 
   instanceWindows.add(win)
@@ -13694,7 +13665,8 @@ const wakeIndicatorController = createWakeIndicatorWindowController({
   log: rememberLog,
   preloadPath: PRELOAD_PATH,
   rendererIndex: resolveRendererIndex,
-  wireWindow: window => wireCommonWindowHandlers(window, zoomWiringForWindowKind('wakeIndicator'))
+  wireWindow: window => wireCommonWindowHandlers(window, zoomWiringForWindowKind('wakeIndicator')),
+  additionalArguments: [WINDOW_CAPS_ARGUMENT]
 })
 
 // The pet overlay: a single transparent, frameless, always-on-top window that
@@ -13748,7 +13720,7 @@ function spawnPetOverlayWindow(bounds) {
     show: false,
     // Fully transparent — the renderer paints only the sprite + bubble.
     backgroundColor: '#00000000',
-    webPreferences: {
+    webPreferences: withWindowCapsArgument({
       preload: PRELOAD_PATH,
       contextIsolation: true,
       sandbox: true,
@@ -13757,7 +13729,7 @@ function spawnPetOverlayWindow(bounds) {
       // Keep the sprite animating + bubble updating while the main window is
       // minimized/blurred — the whole point of the overlay.
       backgroundThrottling: false
-    }
+    })
   })
 
   // Float above other apps and follow the user across desktops so the pet is
@@ -14204,7 +14176,7 @@ function spawnHudWindow(sessionId, profile) {
     // The full chat webPreferences — this window streams a real transcript, so
     // it needs everything a chat window needs (preload bridge, autoplay for
     // voice, the shared throttling contract).
-    webPreferences: chatWindowWebPreferences(PRELOAD_PATH)
+    webPreferences: withWindowCapsArgument(chatWindowWebPreferences(PRELOAD_PATH))
   })
 
   applyHudElectronOverlay(win, process.platform)
@@ -14422,13 +14394,13 @@ function spawnQuickEntryWindow() {
     hiddenInMissionControl: IS_MAC,
     show: false,
     backgroundColor: '#00000000',
-    webPreferences: {
+    webPreferences: withWindowCapsArgument({
       preload: PRELOAD_PATH,
       contextIsolation: true,
       sandbox: true,
       nodeIntegration: false,
       devTools: true
-    }
+    })
   })
 
   win.setAlwaysOnTop(true, IS_MAC ? 'floating' : 'screen-saver')
@@ -14594,7 +14566,7 @@ function createWindow() {
     // live answer keeps painting while the window is blurred or minimized,
     // without pinning visibilityState to 'visible' at idle. See
     // session-windows.ts and stream-throttle.ts.
-    webPreferences: chatWindowWebPreferences(PRELOAD_PATH)
+    webPreferences: withWindowCapsArgument(chatWindowWebPreferences(PRELOAD_PATH))
   })
 
   const createdMainWindow = mainWindow
@@ -15066,7 +15038,7 @@ ipcMain.handle('hermes:window:openInTerminal', async (_event, sessionId, opts) =
 
   try {
     const profile = typeof opts?.profile === 'string' ? opts.profile.trim() : ''
-    const backend = resolveHermesBackend(tuiResumeArgs(sessionId.trim(), profile || undefined))
+    const backend = await resolveHermesBackend(tuiResumeArgs(sessionId.trim(), profile || undefined))
 
     if (!backend.command) {
       return { ok: false, error: 'Hermes is not installed yet' }
@@ -15342,10 +15314,11 @@ ipcMain.handle('hermes:ssh-config:resolve', async (_event, host) => {
     throw new Error('SSH host is required.')
   }
 
-  const ssh =
-    process.platform === 'win32'
-      ? path.join(process.env.SystemRoot || 'C:\\Windows', 'System32', 'OpenSSH', 'ssh.exe')
-      : 'ssh'
+  const ssh = resolveSsh()
+
+  if (!ssh) {
+    throw new Error(SSH_BINARY_MISSING_MESSAGE)
+  }
 
   return new Promise((resolve, reject) => {
     const child = spawn(ssh, ['-G', '--', value], hiddenWindowsChildOptions({ stdio: ['ignore', 'pipe', 'pipe'] }))
@@ -15383,8 +15356,22 @@ ipcMain.handle('hermes:connection-config:test', async (_event, payload) => testD
 // ── Opt-in keychain encryption for stored secrets ───────────────────────────
 // get returns the current policy without touching safeStorage; set flips it
 // and re-encodes every stored secret (see applySecretStorageEncryption).
-ipcMain.handle('hermes:secret-storage:get', async () => ({ on: secretStoragePolicy().on }))
-ipcMain.handle('hermes:secret-storage:set', async (_event: any, on: any) => applySecretStorageEncryption(on === true))
+ipcMain.handle('hermes:secret-storage:get', async () => ({
+  on: secretStoragePolicy().on,
+  secretStorageState: probeSecureTokenStorageState()
+}))
+ipcMain.handle('hermes:secret-storage:set', async (_event: any, on: any) => {
+  const result = applySecretStorageEncryption(on === true)
+
+  // Return the HONEST post-toggle state, not just the gated `on` flag — the
+  // renderer's hint needs to know immediately whether the toggle it just
+  // confirmed actually left secrets encrypted (enable can succeed at the
+  // policy level yet still read `available: false` if the keychain probe
+  // itself is flaky at exactly this instant; disable always reads as the
+  // honest "off" state). Without this, the hint stayed stale until the next
+  // unrelated getConnectionConfig() hydration.
+  return { ...result, secretStorageState: probeSecureTokenStorageState() }
+})
 
 // ── v2 connection registry IPC (multi-source) ───────────────────────────────
 // Storage-level CRUD for named agent sources. Routing/pooling consumption of
@@ -15537,14 +15524,26 @@ const SSH_INVENTORY_RETRY_MS = 60_000
 // status probe is cached per connection with a TTL to avoid doubling roster
 // traffic; the Test button refreshes it eagerly. A missing id simply bypasses
 // the same-backend roster collapse — fully backward compatible.
+//
+// Bounded the same way as the other read-TTL'd caches above: connectionId
+// itself is small (one entry per registered connection, rarely more than a
+// handful), but a connection that gets removed and re-added under a new id
+// over a long-lived process — or the negative-TTL branch on repeated probe
+// failures — must not accumulate stale entries forever with nothing deleting
+// them. Prune-then-cap on every write, same pattern as titleCache.
 const connectionInstallIds = new Map<string, { id?: string; ts: number }>()
 const INSTALL_ID_TTL_MS = 5 * 60_000
 const INSTALL_ID_NEGATIVE_TTL_MS = 60_000
+const CONNECTION_INSTALL_ID_LIMIT = 500
 
 function rememberConnectionInstallId(connectionId: string, statusBody: any) {
   const raw = statusBody && typeof statusBody === 'object' ? statusBody.install_id : undefined
   const id = typeof raw === 'string' && raw.trim() ? raw.trim() : undefined
-  connectionInstallIds.set(connectionId, { id, ts: Date.now() })
+  const now = Date.now()
+
+  pruneExpiredEntries(connectionInstallIds, now, INSTALL_ID_TTL_MS, entry => entry.ts)
+  connectionInstallIds.set(connectionId, { id, ts: now })
+  capMapSize(connectionInstallIds, CONNECTION_INSTALL_ID_LIMIT)
 
   return id
 }
@@ -15603,7 +15602,7 @@ async function probeSshProfileInventory(connection) {
 
   const ssh = createSshProbeConnection(
     { host: sshConfig.host, user: sshConfig.user, port: sshConfig.port, keyPath: sshConfig.keyPath },
-    { rememberLog: sshRememberLog }
+    { rememberLog: sshRememberLog, sshBinary: resolveSsh() }
   )
 
   try {
@@ -15777,6 +15776,93 @@ async function enumerateRegistryAgentSources(registry = readDesktopConnectionsRe
   )
 }
 
+const readAgentOverview = createAgentOverviewReader<any>()
+
+// Credential-free local profile discovery for the overview: a directory
+// listing under HERMES_HOME/profiles, never a backend spawn. Mirrors the
+// SSH roster probe's contract (names only, 'default' implied).
+function readLocalProfileInventory(): null | string[] {
+  if (!directoryExists(HERMES_HOME)) {
+    return null
+  }
+
+  const profilesDir = path.join(HERMES_HOME, 'profiles')
+  const names = new Set<string>(['default'])
+
+  try {
+    if (directoryExists(profilesDir)) {
+      for (const entry of fs.readdirSync(profilesDir, { withFileTypes: true })) {
+        if (entry.isDirectory() && PROFILE_NAME_RE.test(entry.name) && !entry.name.endsWith('.rollback-old')) {
+          names.add(entry.name)
+        }
+      }
+    }
+  } catch {
+    // Unreadable profiles dir: the local source still reports 'default'.
+  }
+
+  return [...names]
+}
+
+ipcMain.handle('hermes:agents:overview', async (_event, options) => {
+  const registry = readDesktopConnectionsRegistry()
+
+  const promises = [
+    backendConnectionState.getPromise(),
+    ...[...backendPool.values()].map(entry => entry.connectionPromise)
+  ].filter(Boolean)
+
+  const pooled = await gatherOverviewBackends(promises, descriptor => resolvedConnectionId(registry, descriptor))
+
+  return readAgentOverview(
+    {
+      sources: registry.connections,
+      pooled,
+      discoverParked: async connectionId => {
+        const source = registry.connections.find(entry => entry.id === connectionId)
+
+        if (source?.kind === 'local') {
+          return (readLocalProfileInventory() ?? []).map(name => ({ name }))
+        }
+
+        if (source?.kind === 'ssh') {
+          // Reuse the roster's TTL/cached credential-free directory probe. No
+          // ensureRegistryBackend / profile activation on this read-only path.
+          await probeSshProfileInventory(source)
+
+          return (sshRosterCache.get(connectionId) ?? []).map(name => ({ name }))
+        }
+
+        return []
+      },
+      // URL/cloud discovery builds an HTTP descriptor only. In particular do NOT
+      // use ensureRegistryBackend: its primary fallback may start a runtime.
+      connect: async connectionId => {
+        const source = registry.connections.find(entry => entry.id === connectionId)
+
+        if (!source || (source.kind !== 'remote' && source.kind !== 'cloud')) {
+          return []
+        }
+
+        return [
+          await buildRemoteConnection(
+            source.url,
+            normAuthMode(source.authMode),
+            source.authMode === 'oauth' ? null : decryptDesktopSecret(source.token),
+            `registry:${source.id}`,
+            undefined,
+            source.kind === 'cloud' ? 'cloud' : 'url',
+            undefined,
+            source.headers
+          )
+        ]
+      },
+      fetch: (descriptor, requestPath) => getJsonForBackend(descriptor, requestPath, { timeoutMs: 8_000 })
+    },
+    { force: options?.force === true }
+  )
+})
+
 ipcMain.handle('hermes:agents:roster', async () => {
   const registry = readDesktopConnectionsRegistry()
   const enumerations = await enumerateRegistryAgentSources(registry)
@@ -15801,7 +15887,8 @@ ipcMain.handle('hermes:agents:roster', async () => {
 })
 
 // Registry-scoped fresh WS URL: the (connectionId, profile) analogue of
-// hermes:gateway:ws-url. Same single-use-ticket discipline for OAuth sources.
+// hermes:gateway:ws-url. Every gated remote gets a freshly-minted single-use
+// ticket — OAuth via its session, token-auth via its static token as a bearer.
 const registryGatewayWsUrlHandler = createRegistryGatewayWsUrlHandler({
   ensureBackend: ensureRegistryBackend,
   mintTicket: mintGatewayWsTicket,
@@ -15992,12 +16079,21 @@ async function fetchJsonForBackend(
     })
   }
 
+  // Same bearer rule as the hermes:api handler, via the shared resolver: a
+  // GATED remote verifies the session token as `Authorization: *** while
+  // `X-Hermes-Session-Token` is honoured only by an ungated loopback backend.
+  // Sending only the loopback header is what produced `401 no_cookie` on every
+  // REST call routed through this helper (registry `hermes:api`, roster
+  // enumeration, install-id probes) against a password/OAuth-gated dashboard.
+  const sendBearer = remoteTokenNeedsBearer(descriptor)
+
   return fetchJson(url, descriptor.token, {
     method: opts.method,
     body: opts.body,
     upload: opts.upload,
     timeoutMs: opts.timeoutMs,
-    headers: descriptor.headers
+    headers: descriptor.headers,
+    bearer: sendBearer && descriptor.token ? descriptor.token : undefined
   })
 }
 
@@ -16380,8 +16476,16 @@ async function remoteSessionList(profile, searchParams) {
 // profile hint (pure lookup lives in profile-session-routing.ts). Results are
 // memoized briefly so a burst of hint-less reads (transcript + messages)
 // costs one sweep across the configured remotes.
+//
+// A busy multi-day session touches thousands of distinct session ids; the TTL
+// was honored on READ (an expired entry was simply refetched) but an expired
+// entry was never DELETED, so the map only ever grew for the life of the
+// process. Prune expired entries on every write and cap the survivors —
+// titleCache's treatment (main.ts, ~line 5296) — so this can't outgrow a
+// bounded footprint either.
 const remoteOwnerBySessionId = new Map<string, { at: number; profile: null | string }>()
 const REMOTE_OWNER_CACHE_TTL_MS = 30_000
+const REMOTE_OWNER_CACHE_LIMIT = 1000
 
 async function remoteOwnerProfileForSession(sessionId: string) {
   if (!sessionId) {
@@ -16404,7 +16508,11 @@ async function remoteOwnerProfileForSession(sessionId: string) {
     remoteSessionList(profile, params)
   ).catch(() => null)
 
-  remoteOwnerBySessionId.set(sessionId, { at: Date.now(), profile: owner })
+  const now = Date.now()
+
+  pruneExpiredEntries(remoteOwnerBySessionId, now, REMOTE_OWNER_CACHE_TTL_MS, entry => entry.at)
+  remoteOwnerBySessionId.set(sessionId, { at: now, profile: owner })
+  capMapSize(remoteOwnerBySessionId, REMOTE_OWNER_CACHE_LIMIT)
 
   return owner
 }
@@ -16639,6 +16747,14 @@ async function handleHermesApiRequest(request) {
   // primary rename the lifecycle has already made `default` the temporary
   // primary until the PATCH settles, so the request routes there.
   const apiRoute = resolveProfileApiRequest(profile, request.path, profileRouteOptions(profile, request))
+  // Connection-scoped REST: when the renderer names a registry connection, the
+  // call must reach THAT source's backend. Routing by profile alone always
+  // resolves the local pool, so a remote's own data (its profile list, config,
+  // skills) could never be enumerated — the rail kept showing local profiles
+  // after connecting to a remote (#85731). Falls back to the profile-keyed
+  // pool when no connection is named, so local users are unchanged. A
+  // torn-down profile stays on the local teardown path resolved above.
+  const requestConnectionId = request?.connectionId
 
   const routeProfile = profileRename
     ? profileRename.routeProfile
@@ -16647,7 +16763,11 @@ async function handleHermesApiRequest(request) {
   let response
 
   try {
-    const connection = await ensureBackend(routeProfile)
+    const connection =
+      requestConnectionId && !tornDownProfile
+        ? await ensureRegistryBackend(requestConnectionId, routeProfile)
+        : await ensureBackend(routeProfile)
+
     const timeoutMs = resolveTimeoutMs(request?.timeoutMs, DEFAULT_FETCH_TIMEOUT_MS)
 
     const url = `${connection.baseUrl}${apiRoute.requestPath}`
@@ -16688,14 +16808,45 @@ async function handleHermesApiRequest(request) {
         })
       }
     } else {
+      // Gated remotes verify the session token as `Authorization: *** via
+      // the provider stack; `X-Hermes-Session-Token` is only honoured by an
+      // ungated loopback backend. Sending just the loopback header is what
+      // produced `401 no_cookie` on every REST call to a gated dashboard. Send
+      // both: local backends ignore the bearer, gated remotes ignore the
+      // loopback header. Shared resolver with fetchJsonForBackend so the two
+      // REST paths cannot drift apart.
+      const isRemoteToken = remoteTokenNeedsBearer(connection, requestConnectionId)
+
       response = await fetchJson(url, connection.token, {
         method: request?.method,
         body: request?.body,
         upload: request?.upload,
-        timeoutMs
+        timeoutMs,
+        bearer: isRemoteToken && connection.token ? connection.token : undefined
       })
     }
   } catch (error) {
+    // Diagnostic breadcrumb for cross-backend routing. A REST call that silently
+    // lands on the WRONG backend (or is rejected by the right one) surfaces to
+    // the user only as an empty list or a permanent skeleton, with nothing in
+    // the log tying it to a connection. Log the resolved route on failure so
+    // "the remote shows no profiles" is answerable from desktop.log alone.
+    const routeLabel = requestConnectionId
+      ? `conn=${requestConnectionId}${routeProfile ? ` profile=${routeProfile}` : ''}`
+      : `pool profile=${routeProfile || 'primary'}`
+
+    const status = error?.statusCode ?? error?.status
+
+    console.warn(
+      `[hermes] REST ${request?.method || 'GET'} ${request.path} -> ${routeLabel} FAILED` +
+        (status ? ` status=${status}` : '') +
+        `: ${error?.message || error}` +
+        (status === 401 || status === 403
+          ? ' — stored credential rejected. A pasted session token expires;' +
+            ' re-authenticate in Settings → Connections.'
+          : '')
+    )
+
     // A failed rename PATCH must not strand the app on the temporary primary:
     // restore the original active profile and restart its backend.
     if (profileRename) {
@@ -16890,12 +17041,26 @@ ipcMain.handle('hermes:readFileDataUrl', async (_event, filePath) => {
 // Keep a finite cap so Electron + base64 memory stays bounded while archives
 // can exceed the default 16 MiB preview ceiling (and still fit the gateway
 // WebSocket frame limit after base64 expansion).
+//
+// Kept for older renderer bundles only (a packaged app can run ahead of an
+// updated preload for one version). Whole-file-in-memory + a single ~341 MiB
+// structured-clone IPC reply is exactly the freeze/OOM path t_275f8015 fixes
+// — every current caller uses hermes:readFileChunkForAttach below instead.
 ipcMain.handle('hermes:readFileDataUrlForAttach', async (_event, filePath) => {
   return readFileDataUrlForIpc(filePath, {
     maxBytes: ATTACHMENT_UPLOAD_DEFAULT_MAX_BYTES,
     mimeType: mimeTypeForPath(resolveRequestedPathForIpc(filePath, { purpose: 'Attachment upload' })),
     purpose: 'Attachment upload'
   })
+})
+
+// Chunked attachment transport — bounded per-chunk IPC replies instead of a
+// whole-file base64 string; implementation and rationale in the fork module.
+// >>> FORK ANCHOR: attachment-stream-ipc <<<
+registerAttachmentStreamIpc({
+  ipcMain,
+  resolveRequestedPath: (filePath, options) => resolveRequestedPathForIpc(filePath, options),
+  mimeTypeForPath
 })
 
 ipcMain.handle('hermes:readFileText', async (_event, filePath) => {
@@ -17111,9 +17276,43 @@ ipcMain.handle('hermes:normalizePreviewTarget', (_event, target, baseDir) =>
   normalizePreviewTarget(String(target || ''), baseDir ? String(baseDir) : '')
 )
 
-ipcMain.handle('hermes:watchPreviewFile', (_event, url) => watchPreviewFile(String(url || '')))
+// Ties preview/directory watchers to the requesting webContents so a
+// renderer crash, reload, or re-home can't orphan fs.watch handles + debounce
+// timers forever (inotify watches are finite on Linux; this matters for
+// multi-day sessions). Installed once per webContents id — reload fires
+// 'did-start-navigation' repeatedly, and the listener itself removes any
+// watchers the (about to be replaced) page still owned, not itself.
+const previewWatcherOwnersHooked = new Set<number>()
 
-ipcMain.handle('hermes:watchDirectory', (_event, dir) => watchDirectory(String(dir || '')))
+function ensurePreviewWatcherOwnerCleanup(sender: Electron.WebContents) {
+  const senderId = sender.id
+
+  if (previewWatcherOwnersHooked.has(senderId)) {
+    return
+  }
+
+  previewWatcherOwnersHooked.add(senderId)
+
+  const cleanup = () => previewWatchers.stopForWebContents(senderId)
+
+  sender.on('did-start-navigation', cleanup)
+  sender.once('destroyed', () => {
+    cleanup()
+    previewWatcherOwnersHooked.delete(senderId)
+  })
+}
+
+ipcMain.handle('hermes:watchPreviewFile', (event, url) => {
+  ensurePreviewWatcherOwnerCleanup(event.sender)
+
+  return watchPreviewFile(String(url || ''), event.sender.id)
+})
+
+ipcMain.handle('hermes:watchDirectory', (event, dir) => {
+  ensurePreviewWatcherOwnerCleanup(event.sender)
+
+  return watchDirectory(String(dir || ''), event.sender.id)
+})
 
 ipcMain.handle('hermes:stopPreviewFileWatch', (_event, id) => stopPreviewFileWatch(String(id || '')))
 
@@ -17211,24 +17410,6 @@ app.on('before-quit', () => {
 // hold the event loop open or leak FDs past app teardown.
 app.on('will-quit', () => {
   destroyKeepaliveAgents()
-})
-
-// Answered synchronously so preload can publish the verdict before the
-// renderer's first script — see the note there on why it cannot decide this
-// itself. Registered at module scope, which runs long before any window.
-ipcMain.on('hermes:translucency:support', event => {
-  event.returnValue = { glass: GLASS_SUPPORTED, translucency: TRANSLUCENCY_SUPPORTED }
-})
-
-// Launch-flag facts the renderer needs before first paint (same sendSync
-// pattern as translucency). `--local` gates every local-models GUI surface;
-// it arrives from `hermes desktop --local` or directly on Hermes.exe (a
-// shortcut edit), and survives self-relaunches because collectRelaunchArgs
-// only strips internal flags.
-ipcMain.on('hermes:launch-flags', event => {
-  event.returnValue = {
-    localModels: process.argv.includes('--local') || process.platform === 'win32' || process.platform === 'darwin'
-  }
 })
 
 ipcMain.on('hermes:translucency', (_event, payload) => {
@@ -17563,7 +17744,8 @@ const terminalIpc = registerTerminalIpc({
   rememberLog,
   activeSshTerminalTarget,
   ensureBackend: webContentsId => ensureTerminalBackend(webContentsId),
-  getSshConnectionState: scope => sshConnections.get(scope)
+  getSshConnectionState: scope => sshConnections.get(scope),
+  resolveSshBinary: resolveSsh
 })
 
 const disposeTerminalSession = terminalIpc.disposeTerminalSession
@@ -17666,7 +17848,14 @@ ipcMain.handle('hermes:version', async () => {
     // Packaged only: a dev `--build-only` rewrites build/install-stamp.json
     // under a running `npm start`, which is a rebuild the developer asked for,
     // not a torn install to offer a restart for.
-    bundleSwapPending: IS_PACKAGED && detectBundleSwap(INSTALL_STAMP, loadInstallStamp())
+    bundleSwapPending: IS_PACKAGED && detectBundleSwap(INSTALL_STAMP, loadInstallStamp()),
+    // Build provenance for the fork/dev marker. Null on an official release
+    // built without a stamp; the renderer decides visibility from `source`.
+    buildBranch: INSTALL_STAMP?.branch ?? null,
+    buildCommit: INSTALL_STAMP?.commit ?? null,
+    buildAt: INSTALL_STAMP?.builtAt ?? null,
+    buildDirty: INSTALL_STAMP ? Boolean(INSTALL_STAMP.dirty) : null,
+    buildSource: INSTALL_STAMP?.source ?? null
   }
 })
 
@@ -17804,7 +17993,7 @@ async function runDesktopUninstall(mode) {
   let pythonPath = null
 
   if (modeRemovesAgent(mode)) {
-    const sysPy = findSystemPython()
+    const sysPy = await findSystemPython()
 
     if (sysPy) {
       py = sysPy
@@ -18059,32 +18248,6 @@ app.whenReady().then(() => {
   // before the backend start path awaits the same single-flight promise.
   void ensureLoginShellPath()
 
-  const systemCa = installWindowsSystemCaTrust(tls)
-
-  if (systemCa.applied) {
-    rememberLog(
-      `[tls] trusting ${systemCa.systemCertificateCount} Windows system CA certificate(s) for backend connections`
-    )
-  } else if (systemCa.error) {
-    rememberLog(`[tls] could not load Windows system CA certificates: ${systemCa.error}`)
-  }
-
-  // Keyring-less Linux `--password-store=basic` support. This must run before
-  // createWindow() and anything that could touch safeStorage; the narrow
-  // platform/switch/guard semantics live in the extracted helper.
-  enableBasicPasswordStoreEncryption({
-    platform: process.platform,
-    passwordStoreSwitch: app.commandLine.getSwitchValue('password-store'),
-    safeStorageApi: safeStorage
-  })
-
-  // Keychain encryption is opt-in (default OFF). One-shot: rewrite any
-  // legacy safeStorage-encrypted secrets as plain so no later launch ever
-  // touches the OS keychain unless the user turns encryption on in
-  // Settings → Gateway. Must run before createWindow() and the first
-  // connection resolution.
-  migrateLegacyEncryptedSecretsOnce()
-
   if (IS_MAC) {
     Menu.setApplicationMenu(buildApplicationMenu())
   } else {
@@ -18098,7 +18261,6 @@ app.whenReady().then(() => {
   installRemoteHeaderRules()
   registerDeepLinkProtocol()
 
-  ensureWslWindowsFonts()
   configureSpellChecker()
   registerPowerResumeListeners()
   keepAwake.set(readPersistedKeepAwake())
@@ -18124,12 +18286,67 @@ app.whenReady().then(() => {
     screen.on('display-removed', reposition)
   }
 
+  // Construct the (hidden, show:false) BrowserWindow BEFORE the remaining
+  // synchronous boot-time probes below. `new BrowserWindow()` hands
+  // Chromium's window/renderer/GPU spin-up to OTHER OS processes -- work
+  // that used to be serialized entirely behind the sync CA-trust cert-store
+  // enumeration, the safeStorage secret-migration decrypts, and the WSL font
+  // filesystem probe. Those three are still synchronous (they gate
+  // createActiveBackend/connection resolution below, which must not race
+  // ahead of them), but now they overlap Chromium's out-of-process init
+  // instead of preceding it, so first paint lands sooner. This whenReady
+  // callback is NOT async and none of the statements between here and the
+  // end of this function await anything, so ordinary run-to-completion
+  // semantics guarantee every one of them finishes -- and so does the
+  // secret/CA setup below -- before the startHermes() promise this call
+  // kicks off gets its first microtask turn. "Before createWindow()" in the
+  // comments below now means "before the connection can use it", which this
+  // still satisfies exactly.
   // A hard crash can interrupt the in-memory restore loop after exact remote
   // serves were drained. The owner-only recovery journal survives that crash;
   // its worker waits for the install marker to clear, then reopens every scope
   // captured by the original transaction before removing the journal entry.
   void resumeManagedSshRecoveries()
   createWindow()
+
+  const systemCa = installWindowsSystemCaTrust(tls)
+
+  if (systemCa.applied) {
+    rememberLog(
+      `[tls] trusting ${systemCa.systemCertificateCount} Windows system CA certificate(s) for backend connections`
+    )
+  } else if (systemCa.error) {
+    rememberLog(`[tls] could not load Windows system CA certificates: ${systemCa.error}`)
+  }
+
+  // Keyring-less Linux `--password-store=basic` support. Must run before
+  // anything that could touch safeStorage; the narrow platform/switch/guard
+  // semantics live in the extracted helper. The `password-store` command-line
+  // switch itself was already applied at module load (before `ready`), so
+  // running this after createWindow() does not reorder it relative to that.
+  enableBasicPasswordStoreEncryption({
+    platform: process.platform,
+    passwordStoreSwitch: app.commandLine.getSwitchValue('password-store'),
+    safeStorageApi: safeStorage
+  })
+
+  // Keychain encryption is opt-in (default OFF). One-shot: rewrite any
+  // legacy safeStorage-encrypted secrets as plain so no later launch ever
+  // touches the OS keychain unless the user turns encryption on in
+  // Settings → Gateway. Must run before the first connection resolution
+  // (startHermes(), kicked off inside createWindow() above, has not yielded
+  // to the event loop yet -- see the run-to-completion note above).
+  migrateLegacyEncryptedSecretsOnce()
+
+  ensureWslWindowsFonts()
+
+  // Dev only: notice when the main-process bundle is rebuilt underneath us so
+  // the renderer can offer an explicit restart.
+  devRestartWatch.watchDevMainBundle()
+  // Dev only: same courtesy for backend Python source (Phase 2.9) — the
+  // running `hermes serve` child has already imported agent/ tui_gateway/
+  // tools/ hermes_cli/, so an edit there needs the same explicit offer.
+  devRestartWatch.watchDevBackendPython()
 
   // Win/Linux cold start: the launching hermes:// URL is in our own argv.
   const _coldStartLink = _extractDeepLink(process.argv)

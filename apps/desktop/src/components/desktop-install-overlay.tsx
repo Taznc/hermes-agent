@@ -18,6 +18,7 @@ import { useI18n } from '@/i18n'
 import { AlertCircle, ChevronDown, ChevronRight, Globe, iconSize, Loader2, Monitor } from '@/lib/icons'
 import { capitalize } from '@/lib/text'
 import { cn } from '@/lib/utils'
+import { performWebReload } from '@/store/web-reload'
 
 import { FirstRunRemoteForm } from './first-run-remote-form'
 
@@ -475,7 +476,11 @@ export function DesktopInstallOverlay({ enabled = true }: DesktopInstallOverlayP
   // and the docs URL; user runs it from Terminal and relaunches the app.
   if (state.unsupportedPlatform) {
     const ups = state.unsupportedPlatform
-    const platformLabel = ups.platform === 'darwin' ? 'macOS' : ups.platform === 'linux' ? 'Linux' : ups.platform
+    // This branch is emitted only for macOS/Linux (see comment above);
+    // ups.platform structurally never equals 'win32' here, and the
+    // fallback arm below already prints the raw platform string if that
+    // ever changed, so there is no missing Windows case to add.
+    const platformLabel = ups.platform === 'darwin' ? 'macOS' : ups.platform === 'linux' ? 'Linux' : ups.platform // windows-footgun: ok — branch never reached with win32, see comment above
 
     return (
       <div className="fixed inset-0 z-(--z-setup) flex items-center justify-center bg-background/90 backdrop-blur-md">
@@ -519,7 +524,7 @@ export function DesktopInstallOverlay({ enabled = true }: DesktopInstallOverlayP
                 <Globe className="size-4" />
                 {copy.connectExistingShort}
               </Button>
-              <Button onClick={() => window.location.reload()} size="sm" variant="default">
+              <Button onClick={() => performWebReload()} size="sm" variant="default">
                 {copy.retryAfterRun}
               </Button>
             </div>
@@ -706,7 +711,7 @@ export function DesktopInstallOverlay({ enabled = true }: DesktopInstallOverlayP
                       // best-effort -- continue with reload regardless
                     }
 
-                    window.location.reload()
+                    performWebReload()
                   }}
                   size="sm"
                   variant="default"

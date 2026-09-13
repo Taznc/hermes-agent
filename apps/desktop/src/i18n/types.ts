@@ -7,6 +7,8 @@
 
 import type { TipId } from '@/lib/tips/catalog'
 
+import type { ForkTranslations } from './fork/types'
+
 export type Locale = 'en' | 'zh' | 'zh-hant' | 'ja' | 'ar' | 'ru'
 
 export type ToolTitleKey =
@@ -50,7 +52,10 @@ interface AuxTaskCopy {
   hint: string
 }
 
-export interface Translations {
+// >>> FORK ANCHOR: i18n-types <<<
+export type Translations = ForkTranslations & UpstreamTranslations
+
+export interface UpstreamTranslations {
   sessionImport: {
     title: string
     subtitle: string
@@ -124,6 +129,7 @@ export interface Translations {
     tryHint: (term: string) => string
     on: string
     off: string
+    undo: string
   }
 
   fileMenu: {
@@ -206,6 +212,7 @@ export interface Translations {
     more: (count: number) => string
     clearAll: string
     dismiss: string
+    dismissAction: string
     details: string
     copyDetail: string
     copyDetailFailed: string
@@ -460,6 +467,7 @@ export interface Translations {
       testBody: string
       testSent: string
       testUnsupported: string
+      testDenied: string
       completionSoundTitle: string
       completionSoundDesc: string
       completionSoundPreview: string
@@ -527,6 +535,8 @@ export interface Translations {
       toursDesc: string
       composerPopoutTitle: string
       composerPopoutDesc: string
+      requireModifierToOpenLinksTitle: string
+      requireModifierToOpenLinksDesc: string
       vibeHeartsTitle: string
       vibeHeartsDesc: string
       embedsTitle: string
@@ -985,6 +995,7 @@ export interface Translations {
     }
     model: {
       loading: string
+      loadFailed: string
       appliesDesc: string
       provider: string
       model: string
@@ -993,7 +1004,6 @@ export interface Translations {
       reasoning: string
       reasoningOff: string
       defaultsFailed: string
-      loadFailed: string
       restartRequired: string
       restartBackend: string
       restartingBackend: string
@@ -1396,6 +1406,59 @@ export interface Translations {
     resetToMine: string
   }
   agents: {
+    sessionsTab: string
+    treeTab: string
+    overviewSubtitle: string
+    liveUnavailable: string
+    inventoryUnavailable: string
+    historyShifted: string
+    openAsTab: string
+    searchSessions: string
+    allSources: string
+    allProfiles: string
+    allProviders: string
+    activityFilter: string
+    recentActivity: string
+    allSessions: string
+    noRecentActivity: string
+    recentActivityHint: string
+    needsYou: string
+    working: string
+    unread: string
+    idle: string
+    stale: string
+    noSessions: string
+    selectSession: string
+    openConversation: string
+    reply: string
+    stop: string
+    retry: string
+    connect: string
+    owner: string
+    source: string
+    profile: string
+    provider: string
+    model: string
+    description: string
+    unknown: string
+    loadMore: string
+    coverageNote: string
+    promptHint: string
+    history: string
+    ready: string
+    onDemand: string
+    offline: string
+    unsupported: string
+    partial: string
+    allQuiet: string
+    allQuietHint: string
+    needYouCount: (count: number) => string
+    workingCount: (count: number) => string
+    closePreview: string
+    replyPlaceholder: string
+    noPreview: string
+    shown: (visible: number, total: number) => string
+
     extendedTranscript: string
     transcriptTruncated: string
     transcriptUnavailable: string
@@ -2138,6 +2201,10 @@ export interface Translations {
       openInSplit: string
       copyIdFailed: string
       sessionActions: string
+      /** Accessible name for the always-in-flow row-level archive icon button
+       *  (distinct from the kebab menu's `archive` label — this is the direct
+       *  one-click affordance on the row itself). */
+      archiveSession: string
       sessionRunning: string
       needsInput: string
       waitingForAnswer: string
@@ -2745,6 +2812,9 @@ export interface Translations {
       showTerminal: string
       hideTerminal: string
       gateway: string
+      backend: string
+      messagingStopped: string
+      messagingDegraded: (name: string) => string
       gatewayReady: string
       gatewayNeedsSetup: string
       gatewayUnavailable: string
@@ -2936,6 +3006,10 @@ export interface Translations {
       address: string
       addressPlaceholder: string
       blankPageBody: string
+      noGuestTitle: string
+      noGuestBody: string
+      noGuestOpen: (url: string) => string
+      openBlocked: string
       finishedRestarting: (message?: string) => string
       failedRestarting: (message: string) => string
       unknownError: string
@@ -3021,6 +3095,10 @@ export interface Translations {
       copyUrl: string
       copyResolvedUrl: string
     }
+    file: {
+      openPreview: string
+      openDefaultApp: string
+    }
     image: {
       copyImage: string
       copyImageAddress: string
@@ -3057,6 +3135,7 @@ export interface Translations {
       refresh: string
       moreActions: string
       branchNewChat: string
+      copyMessage: string
       react: string
       dismissError: string
       /** Layer titles for the structured error card (agent/error_surface.py).
@@ -3119,6 +3198,7 @@ export interface Translations {
       gatewayDisconnected: string
       sendFailed: string
       loadingQuestion: string
+      restoring: string
       other: string
       placeholder: string
       skip: string
@@ -3127,9 +3207,16 @@ export interface Translations {
       confirmAndContinueLabel: string
       answeredBadge: string
       questionProgress: (answered: number, total: number) => string
+      questionGroup: (total: number) => string
       lateAnswer: (question: string, choice: string) => string
       lateAnswerTip: string
       lateAnswerHint: string
+      addNote: string
+      addNoteFor: (label: string) => string
+      note: string
+      noteFor: (label: string) => string
+      notePlaceholder: string
+      selected: string
     }
     mcpSetup: {
       installTitle: (server: string) => string
@@ -3260,6 +3347,8 @@ export interface Translations {
     deleteFailed: string
     archived: string
     archiveFailed: string
+    archivedUndoMessage: string
+    undoArchiveFailed: string
     cwdChangeFailed: string
     cwdStagedTitle: string
     cwdStagedMessage: string

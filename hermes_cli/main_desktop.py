@@ -1194,17 +1194,20 @@ def _detect_linux_password_store() -> str | None:
     return None
 
 
-def _desktop_launch_options() -> tuple[list[str], str, str, str]:
+def _desktop_launch_options() -> tuple[list[str], str, str, str, bool]:
     """``desktop.*`` launch options: ``(electron_flags, disable_gpu "auto"/"1"/"0", password_store,
-    ozone_hint "auto"/"x11"/"wayland")``; unknown values and config errors yield "auto"/[] so a
-    malformed config never blocks the launch."""
+    ozone_hint "auto"/"x11"/"wayland", auto_update_checks_enabled)``; unknown values and config
+    errors yield "auto"/[]/True so a malformed config never blocks the launch.
+    ``auto_update_checks_enabled`` is whether the Desktop app may contact upstream to check for
+    client self-updates (bridged to HERMES_DESKTOP_DISABLE_UPDATE_CHECKS)."""
     flags: list[str] = []
     disable_gpu = password_store = ozone_hint = "auto"
+    auto_update_checks_enabled = True
     try:
         from hermes_cli.config import load_config
         desktop_cfg = (load_config() or {}).get("desktop") or {}
     except Exception:
-        return flags, disable_gpu, password_store, ozone_hint
+        return flags, disable_gpu, password_store, ozone_hint, auto_update_checks_enabled
 
     raw_flags = desktop_cfg.get("electron_flags")
     if isinstance(raw_flags, str):
@@ -1224,7 +1227,14 @@ def _desktop_launch_options() -> tuple[list[str], str, str, str]:
         disable_gpu = _GPU_FLAG_WORDS.get(raw_gpu.strip().lower(), "auto")
     password_store = _choice("password_store", _LINUX_PASSWORD_STORES)
     ozone_hint = _choice("ozone_platform_hint", ("auto", "x11", "wayland"))
-    return flags, disable_gpu, password_store, ozone_hint
+
+    raw_auto_update = desktop_cfg.get("auto_update_checks_enabled", True)
+    if isinstance(raw_auto_update, bool):
+        auto_update_checks_enabled = raw_auto_update
+    elif isinstance(raw_auto_update, str):
+        auto_update_checks_enabled = raw_auto_update.strip().lower() not in ("0", "false", "no", "off")
+
+    return flags, disable_gpu, password_store, ozone_hint, auto_update_checks_enabled
 
 
 def _register_linux_desktop_entry() -> None:
@@ -1418,10 +1428,16 @@ def _desktop_launch_env(args: argparse.Namespace) -> tuple[dict, list[str]]:
     cwd = getattr(args, "cwd", None)
     env["HERMES_DESKTOP_CWD"] = str(Path(cwd).expanduser().resolve()) if cwd else os.getcwd()
 
-    config_electron_flags, config_disable_gpu, config_password_store, config_ozone_hint = (
-        _desktop_launch_options())
+    # `desktop.auto_update_checks_enabled: false` is bridged to HERMES_DESKTOP_DISABLE_UPDATE_CHECKS;
+    # an explicit env var still wins over config.
+    (
+        config_electron_flags, config_disable_gpu, config_password_store, config_ozone_hint,
+        config_auto_update_checks_enabled,
+    ) = _desktop_launch_options()
     if config_disable_gpu != "auto" and "HERMES_DESKTOP_DISABLE_GPU" not in os.environ:
         env["HERMES_DESKTOP_DISABLE_GPU"] = config_disable_gpu
+    if not config_auto_update_checks_enabled and "HERMES_DESKTOP_DISABLE_UPDATE_CHECKS" not in os.environ:
+        env["HERMES_DESKTOP_DISABLE_UPDATE_CHECKS"] = "1"
     if config_ozone_hint != "auto" and "ELECTRON_OZONE_PLATFORM_HINT" not in os.environ:
         env["ELECTRON_OZONE_PLATFORM_HINT"] = config_ozone_hint
 

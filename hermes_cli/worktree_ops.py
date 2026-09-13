@@ -369,14 +369,22 @@ def _setup_worktree(repo_root: str = None, sync_base: bool = True,
 def _worktree_has_unpushed_commits(worktree_path: str, timeout: int = 10) -> bool:
     """Whether a worktree has commits unreachable from any remote branch. Fails SAFE toward True.
 
-    No remote-tracking refs = no baseline -> False. A shallow boundary can disconnect an older
-    HEAD from origin/* so public commits look unpushed; ``_deepen_shallow_repo`` first if affordable.
+    No remote at all = no baseline -> False. A remote that IS configured but has no cached
+    tracking refs (never fetched, or pushed with ``--no-track``) is ambiguous, not proof
+    nothing is unpushed, so it fails toward True rather than silently treating real commits
+    as already safe. A shallow boundary can disconnect an older HEAD from origin/* so public
+    commits look unpushed; ``_deepen_shallow_repo`` first if affordable.
     """
     try:
+        remotes = _git_out(["remote"], worktree_path, timeout=timeout)
+        if remotes is None:
+            return True
+        if not remotes.strip():
+            return False  # no remote at all: nothing to be unpushed against
         remote_refs = _git_out(["for-each-ref", "--format=%(refname)", "refs/remotes"], worktree_path,
                                timeout=timeout)
         if not remote_refs:
-            return remote_refs is None  # no remote-tracking refs: nothing to be unpushed against
+            return True  # a remote IS configured but we have no cached baseline
         unpushed = _git_out(["log", "--oneline", "HEAD", "--not", "--remotes"], worktree_path,
                             timeout=timeout)
         return unpushed is None or bool(unpushed)
@@ -531,38 +539,69 @@ def _worktree_current_branch(worktree_path: str, timeout: int) -> Optional[str]:
     return branch if branch and branch != "HEAD" else None  # "HEAD" = detached
 
 
+_FULL_OID_RE = re.compile(r"^[0-9a-f]{40}$")
+
+
+def _merged_pr_heads(stdout: str) -> set:
+    """Full 40-hex head OIDs from ``gh pr list --json ...`` stdout, lowercased.
+
+    Every un-parseable shape yields the empty set, which correlates with nothing —
+    malformed output can never license a reap.
+    """
+    try:
+        prs = json.loads(stdout or "[]")
+    except Exception:
+        return set()
+    if not isinstance(prs, list):
+        return set()
+    heads = set()
+    for pr in prs:
+        oid = pr.get("headRefOid") if isinstance(pr, dict) else None
+        if isinstance(oid, str) and _FULL_OID_RE.match(oid.strip().lower()):
+            heads.add(oid.strip().lower())
+    return heads
+
+
 def _worktree_branch_pr_merged(
     worktree_path: str, timeout: int = 15, cache: Optional[Dict[str, bool]] = None,
 ) -> bool:
-    """Whether the branch's PR is MERGED on GitHub (``gh pr list``). Fails SAFE toward False.
+    """Whether THIS HEAD was merged via the branch's PR (``gh pr list``). Fails SAFE toward False.
 
-    Catches rebase-merges whose altered diff defeats ``git cherry``. Memoized on
-    ``(branch, head_sha)``; only True is cached since the PR may merge later without new commits.
+    Catches rebase-merges whose altered diff defeats ``git cherry``. A merged PR is
+    proof only about the commit GitHub recorded as its head: branch names are reused,
+    and a branch merged once may since have grown new commits. So the verdict is
+    ``HEAD in {headRefOid of merged PRs on this branch}`` — the name alone is never
+    enough, or a historical PR would license deleting fresh, unique work.
+
+    Memoized on ``(branch, head_sha)``; only True is cached, since the PR may merge
+    later without new commits.
     """
     try:
         branch = _worktree_current_branch(worktree_path, timeout)
         if branch is None:
             return False
+        head = _git_out(["rev-parse", "HEAD"], worktree_path, timeout=timeout)
+        if not head:
+            return False
+        head = head.strip().lower()
 
-        cache_key = None
-        if cache is not None:
-            sha = _git_out(["rev-parse", "HEAD"], worktree_path, timeout=timeout)
-            if sha:
-                cache_key = f"pr-merged:{branch}:{sha}"
-                if cache.get(cache_key) is True:
-                    return True
+        cache_key = f"pr-merged:{branch}:{head}"
+        if cache is not None and cache.get(cache_key) is True:
+            return True
 
         result = subprocess.run(
-            ["gh", "pr", "list", "--head", branch, "--state", "merged", "--json", "number", "--limit", "1"],
+            ["gh", "pr", "list", "--head", branch, "--state", "merged",
+             "--json", "number,headRefOid", "--limit", "20"],
             capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=timeout, cwd=worktree_path,
         )
         if result.returncode != 0:
             return False
-        prs = json.loads(result.stdout or "[]")
-        merged = isinstance(prs, list) and bool(prs)
-        if merged and cache is not None and cache_key is not None:
+        # Several merged PRs can share one reused branch name; the OID picks out ours.
+        if head not in _merged_pr_heads(result.stdout):
+            return False
+        if cache is not None:
             cache[cache_key] = True
-        return merged
+        return True
     except Exception:
         return False
 

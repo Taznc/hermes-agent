@@ -246,12 +246,14 @@ function fakeChild({ code = 0, stdout = '', stderr = '', errorEvent = null, hang
 }
 
 // Build a spawnFn that returns scripted children per ssh invocation, recording
-// the args it was called with.
+// the args it was called with, plus the resolved binary (first argv slot).
 function scriptedSpawn(scripts) {
   const calls: any[] = []
+  const commands: string[] = []
   let i = 0
 
-  const fn: any = (_cmd, args) => {
+  const fn: any = (cmd, args) => {
+    commands.push(cmd)
     calls.push(args)
     const script = typeof scripts === 'function' ? scripts(args, i) : scripts[Math.min(i, scripts.length - 1)]
     i += 1
@@ -260,6 +262,7 @@ function scriptedSpawn(scripts) {
   }
 
   fn.calls = calls
+  fn.commands = commands
 
   return fn
 }
@@ -282,6 +285,32 @@ test('open() establishes the master when not already alive', async () => {
   const conn = new SshConnection({ host: 'box', user: 'me' }, { spawnFn, controlDir: '/tmp/d' })
   await conn.open()
   assert.deepEqual(ops, ['check', 'master'], 'probes liveness first, then opens the master')
+})
+
+test('spawns the resolved sshBinary rather than a hardcoded/bare "ssh"', async () => {
+  const spawnFn = scriptedSpawn(() => ({ code: 0 }))
+
+  const conn = new SshConnection(
+    { host: 'box', user: 'me' },
+    { spawnFn, controlDir: '/tmp/d', sshBinary: 'D:\\Git\\usr\\bin\\ssh.exe' }
+  )
+
+  await conn.open()
+
+  assert.ok(spawnFn.commands.length > 0)
+  assert.ok(
+    spawnFn.commands.every(cmd => cmd === 'D:\\Git\\usr\\bin\\ssh.exe'),
+    `expected every spawn to use the resolved binary, got: ${JSON.stringify(spawnFn.commands)}`
+  )
+})
+
+test('defaults to bare "ssh" when no sshBinary option is passed (backward compatible)', async () => {
+  const spawnFn = scriptedSpawn(() => ({ code: 0 }))
+
+  const conn = new SshConnection({ host: 'box', user: 'me' }, { spawnFn, controlDir: '/tmp/d' })
+  await conn.open()
+
+  assert.ok(spawnFn.commands.every(cmd => cmd === 'ssh'))
 })
 
 test('open() abort kills an in-flight SSH child instead of waiting for timeout', async () => {

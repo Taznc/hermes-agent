@@ -1,6 +1,6 @@
 import { useStore } from '@nanostores/react'
 import type * as React from 'react'
-import { useState } from 'react'
+import { useEffect, useState } from 'react'
 
 import { type NewSessionPlacement, type NewSessionSplitHandler, startNewSessionDrag } from '@/app/chat/new-session-drag'
 import { Codicon } from '@/components/ui/codicon'
@@ -9,7 +9,7 @@ import type { SessionInfo } from '@/hermes'
 import { useI18n } from '@/i18n'
 import { displayPath } from '@/lib/display-path'
 import { useStoreSelector } from '@/lib/use-session-slice'
-import { setWorkspaceNodeOpen } from '@/store/layout'
+import { $sidebarListLimit, setWorkspaceNodeOpen } from '@/store/layout'
 import { notifyError } from '@/store/notifications'
 import { newSessionInProfile, pinNewChatProfile, selectProfile } from '@/store/profile'
 import { switchBranchInRepo } from '@/store/projects'
@@ -19,7 +19,7 @@ import { $sidebarSessionRankIds } from '@/store/sidebar-sort'
 import { SidebarGroupRow, SidebarRowLead, SidebarRowLink, SidebarRowStack } from '../chrome'
 import { rankSessions } from '../order'
 
-import { PROJECT_PREVIEW_COUNT, SIDEBAR_GROUP_PAGE, useWorkspaceNodeOpen } from './model'
+import { SIDEBAR_GROUP_PAGE, useWorkspaceNodeOpen } from './model'
 import type { SidebarSessionGroup } from './workspace-groups'
 import {
   WorkspaceAddButton,
@@ -58,16 +58,37 @@ export function SidebarWorkspaceGroup({
   // lanes that already hold sessions default open.
   const defaultOpen = isProfileGroup || group.sessions.length > 0
   const [open, toggleOpen] = useWorkspaceNodeOpen(group.id, defaultOpen)
-  const [visibleCount, setVisibleCount] = useState(SIDEBAR_GROUP_PAGE)
+  // A profile starts on the same preview size a project row uses; paging past
+  // it (the "…" button below) reveals the rest SIDEBAR_GROUP_PAGE at a time
+  // (or listLimit's own step, when numeric), same as a workspace lane.
+  // Previously a profile group's hiddenCount was hardcoded to 0, so the
+  // button never rendered and anything past the preview was silently
+  // unreachable — the list wasn't actually capped (`group.sessions` already
+  // holds every session for the profile), only the "reveal more" affordance
+  // was missing. Under 'all' there is no cap at all: every row renders and
+  // the affordance never appears.
+  const listLimit = useStore($sidebarListLimit)
+
+  const initialVisible = () =>
+    listLimit === 'all' ? Infinity : typeof listLimit === 'number' ? listLimit : SIDEBAR_GROUP_PAGE
+
+  const [visibleCount, setVisibleCount] = useState(initialVisible)
+
+  // Switching the list-length setting (the filter menu) resets this lane's
+  // own reveal-count back to that setting's floor, the same way the flat
+  // recents list and cron section react to the same event.
+  useEffect(() => {
+    setVisibleCount(initialVisible())
+    // eslint-disable-next-line react-hooks/exhaustive-deps -- initialVisible is a pure fn of listLimit
+  }, [listLimit])
 
   // A lane ranks by whatever the sort key says before it trims itself, so the
   // rows it hides are the ones the sort ranked last.
   const sessions = rankSessions(group.sessions, rankIds)
-  // A profile previews the same handful a project does, and clicking its label
-  // is how you see the rest. Workspace groups page within what's loaded.
-  const visibleSessions = sessions.slice(0, isProfileGroup ? PROJECT_PREVIEW_COUNT : visibleCount)
-  const hiddenCount = isProfileGroup ? 0 : sessions.length - visibleSessions.length
-  const nextCount = Math.min(SIDEBAR_GROUP_PAGE, hiddenCount)
+  const visibleSessions = sessions.slice(0, visibleCount)
+  const hiddenCount = listLimit === 'all' ? 0 : sessions.length - visibleSessions.length
+  const pageStep = typeof listLimit === 'number' ? listLimit : SIDEBAR_GROUP_PAGE
+  const nextCount = Math.min(pageStep, hiddenCount)
 
   // Leading glyph: a home mark for the repo's primary checkout (labeled by its
   // live branch), a branch/kanban mark otherwise.
@@ -225,7 +246,7 @@ export function SidebarWorkspaceGroup({
             <WorkspaceShowMoreButton
               count={nextCount}
               label={group.label}
-              onClick={() => setVisibleCount(count => count + SIDEBAR_GROUP_PAGE)}
+              onClick={() => setVisibleCount(count => count + pageStep)}
             />
           )}
         </>

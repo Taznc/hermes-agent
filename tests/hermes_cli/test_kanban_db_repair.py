@@ -207,6 +207,11 @@ def test_dispatch_tick_runs_wal_checkpoint_at_interval(tmp_path, monkeypatch):
     interval elapses the next tick checkpoints again."""
     db_path = tmp_path / "kanban.db"
     _build_board_db(db_path, tasks=1)
+    # Declare tmp_path as this test's kanban home so the pin below resolves
+    # inside it. kanban_db._pin_is_honored() drops an out-of-home pin that
+    # nothing vouches for — that is the guard which stops an inherited
+    # production pin from defeating a sandbox (t_602f6f7b / t_029c5ee7).
+    monkeypatch.setenv("HERMES_KANBAN_HOME", str(tmp_path))
     monkeypatch.setenv("HERMES_KANBAN_DB", str(db_path))
     # Fresh per-path clock so previous tests can't have claimed the slot.
     monkeypatch.setattr(kbc, "_LAST_WAL_CHECKPOINT", {})

@@ -74,6 +74,74 @@ import { isBrowserWindow, isSecondaryWindow } from './windows'
 export const $sessionStates = atom<Record<string, ClientSessionState>>({})
 
 // ---------------------------------------------------------------------------
+// Lightweight per-runtime status projection — the fields status computeds
+// actually read ($workingSessionIds, $attentionSessionIds, $draftSessionIds,
+// $delegatingSessionIds, $sessionDotStateById). $sessionStates republishes a
+// fresh Record on EVERY message delta while a turn streams (tens/sec) so
+// tile views can paint the growing transcript; every one of those publishes
+// used to also wake the status computeds even though busy/needsInput rarely
+// change mid-stream. This mirror publishes ONLY when one of the four status
+// fields actually changes, so status computeds recompute on real status
+// edges instead of on every token.
+// ---------------------------------------------------------------------------
+
+export interface SessionLightStatus {
+  busy: boolean
+  needsInput: boolean
+  storedSessionId: string | null
+  /** Substitutes for `state.messages.length > 0` in the draft predicate
+   *  without requiring a subscriber to hold the (potentially large, per-
+   *  token-growing) message array. */
+  hasMessages: boolean
+}
+
+export const $sessionStatusById = atom<Record<string, SessionLightStatus>>({})
+
+function lightStatusOf(state: ClientSessionState): SessionLightStatus {
+  return {
+    busy: state.busy,
+    needsInput: state.needsInput,
+    storedSessionId: state.storedSessionId,
+    // Older persisted snapshots / minimal test fixtures can omit `messages`
+    // entirely (see releaseSessionTranscript's same defensive check) — treat
+    // that as no messages rather than throwing on `.length`.
+    hasMessages: Array.isArray(state.messages) && state.messages.length > 0
+  }
+}
+
+function sameLightStatus(a: SessionLightStatus | undefined, b: SessionLightStatus): boolean {
+  return (
+    a !== undefined &&
+    a.busy === b.busy &&
+    a.needsInput === b.needsInput &&
+    a.storedSessionId === b.storedSessionId &&
+    a.hasMessages === b.hasMessages
+  )
+}
+
+function publishLightStatus(runtimeId: string, state: ClientSessionState): void {
+  const current = $sessionStatusById.get()
+  const next = lightStatusOf(state)
+
+  if (sameLightStatus(current[runtimeId], next)) {
+    return
+  }
+
+  $sessionStatusById.set({ ...current, [runtimeId]: next })
+}
+
+function dropLightStatus(runtimeId: string): void {
+  const current = $sessionStatusById.get()
+
+  if (!(runtimeId in current)) {
+    return
+  }
+
+  const { [runtimeId]: _dropped, ...rest } = current
+  $sessionStatusById.set(rest)
+}
+
+// ---------------------------------------------------------------------------
 // Event-source scopes: which registry connection's socket delivered a runtime
 // session's events. Working/attention membership alone is profile-blind — two
 // connected gateways can both expose a 'default' profile, so the gateway
@@ -130,6 +198,18 @@ export function forgetProfileOnlyRuntimeOwners(profile: string): void {
       sessionOwnerByRuntimeId.delete(runtimeId)
     }
   }
+}
+
+/** The exact (connectionId, profile) owner proved by a runtime's own inbound
+ * events, or undefined. Upstream widened the backing map to `SessionOwnerScope`
+ * so the legacy secondary producer can record a bare profile string; a bare
+ * profile is explicitly NOT an exact owner (see `sessionOwnerRouteFromRow`) and
+ * every consumer here reads `.connectionId`/`.profile`, so string entries are
+ * filtered out rather than handed on as a partial route. */
+export function runtimeSessionOwner(runtimeId: string): SessionOwnerRoute | undefined {
+  const owner = sessionOwnerByRuntimeId.get(runtimeId)
+
+  return owner && typeof owner === 'object' ? owner : undefined
 }
 
 /** Composite scopes of registry-sourced sessions that are live (busy or
@@ -239,8 +319,9 @@ export function _resetSessionOwnerHoldsForTests(): void {
  * source switch briefly changes the active gateway before an idle conversation
  * is cleared, so the primary runtime must survive that handoff. Open panes have
  * the same ownership contract: a non-focused idle tile is still user-visible
- * state and must not be evicted just because another pane has focus. Prefer the
- * live event scope, with the tile's persisted route as the pre-bind fallback.
+ * state and must not be evicted just because another pane has focus. The main
+ * thread's captured selected owner (or matching resumed state) pins its socket
+ * without waiting for a session event. Tiles carry their own persisted routes.
  *
  * A just-created session's owner is named by its create → foreground hold
  * (holdSessionOwnerUntilForeground) until the selected/tiled publication or
@@ -267,7 +348,22 @@ export function foregroundSessionScopes(): Set<string> {
     }
   }
 
-  addRuntimeScope($activeSessionId.get() ?? undefined)
+  const runtimeId = $activeSessionId.get()
+  const selectedId = $selectedStoredSessionId.get()
+  const state = runtimeId ? $sessionStates.get()[runtimeId] : undefined
+
+  // Native resume may bind without emitting an event. The captured open route
+  // also covers the synchronous active-id → state-publication gap. Never take
+  // an unrelated cached runtime's owner after the selection has moved on.
+  const selectedOwner = selectedId
+    ? (getSessionOwnerHint(selectedId) ?? (state?.storedSessionId === selectedId ? state.ownerRoute : undefined))
+    : undefined
+
+  if (selectedOwner) {
+    addRouteScope(selectedOwner)
+  } else {
+    addRuntimeScope(runtimeId ?? undefined)
+  }
 
   for (const tile of $sessionTiles.get()) {
     addRuntimeScope(tile.runtimeId)
@@ -320,6 +416,110 @@ export function setSessionStalled(storedSessionId: string | null | undefined, st
   } else if (!stalled && present) {
     $stalledSessionIds.set(current.filter(id => id !== storedSessionId))
   }
+}
+
+// --- Reconnect catch-up / lost-turn tracking --------------------------------
+// A session that was BUSY right before the socket dropped gets its busy flag
+// force-cleared by reconcileBusyStatesOnReconnect (its runtime id died with
+// the old connection — see that function's docstring). That leaves two
+// indistinguishable outcomes with no UI difference: the backend turn is still
+// genuinely running and will re-assert busy on its next event ("catching
+// up"), or the backend died mid-turn and nothing more is ever coming ("turn
+// lost"). Both states are keyed by STORED session id (aliased) so the
+// composer/thread can show a one-line notice without caring which runtime id
+// eventually claims the session.
+export const $catchingUpSessionIds = atom<string[]>([])
+export const $turnLostSessionIds = atom<string[]>([])
+
+function setSessionCatchingUp(storedSessionId: string | null | undefined, catchingUp: boolean) {
+  if (!storedSessionId) {
+    return
+  }
+
+  const current = $catchingUpSessionIds.get()
+  const present = current.includes(storedSessionId)
+
+  if (catchingUp && !present) {
+    $catchingUpSessionIds.set([...current, storedSessionId])
+  } else if (!catchingUp && present) {
+    $catchingUpSessionIds.set(current.filter(id => id !== storedSessionId))
+  }
+}
+
+export function setSessionTurnLost(storedSessionId: string | null | undefined, lost: boolean) {
+  if (!storedSessionId) {
+    return
+  }
+
+  const current = $turnLostSessionIds.get()
+  const present = current.includes(storedSessionId)
+
+  if (lost && !present) {
+    $turnLostSessionIds.set([...current, storedSessionId])
+  } else if (!lost && present) {
+    $turnLostSessionIds.set(current.filter(id => id !== storedSessionId))
+  }
+}
+
+// Grace window a downgraded-busy session gets to re-assert itself (a genuinely
+// live turn re-publishes busy within a beat of reconnect) before its silence
+// is read as "the turn was lost", not merely "still catching up". Independent
+// of SESSION_WATCHDOG_TIMEOUT_MS (5 min, below) — that one covers a turn that
+// is still AUTHORITATIVELY busy but has gone quiet; this one covers a turn
+// reconcileBusyStatesOnReconnect just force-cleared because its runtime id
+// died with the old connection, so there is no authoritative state to wait on
+// at all past this window.
+export const RECONNECT_CATCHUP_GRACE_MS = 20_000
+const catchupGraceTimers = new Map<string, ReturnType<typeof setTimeout>>()
+
+function armCatchupGrace(storedSessionId: string | null | undefined) {
+  if (!storedSessionId) {
+    return
+  }
+
+  const existing = catchupGraceTimers.get(storedSessionId)
+
+  if (existing) {
+    clearTimeout(existing)
+  }
+
+  catchupGraceTimers.set(
+    storedSessionId,
+    setTimeout(() => {
+      catchupGraceTimers.delete(storedSessionId)
+
+      // Still catching up and nothing re-asserted busy in the window: read as
+      // lost rather than leaving an indefinite "catching up…" notice.
+      if ($catchingUpSessionIds.get().includes(storedSessionId)) {
+        setSessionCatchingUp(storedSessionId, false)
+        setSessionTurnLost(storedSessionId, true)
+      }
+    }, RECONNECT_CATCHUP_GRACE_MS)
+  )
+}
+
+function clearCatchupGrace(storedSessionId: string | null | undefined) {
+  if (!storedSessionId) {
+    return
+  }
+
+  const timer = catchupGraceTimers.get(storedSessionId)
+
+  if (timer) {
+    clearTimeout(timer)
+    catchupGraceTimers.delete(storedSessionId)
+  }
+}
+
+/** Dismiss the "turn lost" notice without regenerating — e.g. the user reads
+ *  the transcript and decides the reply actually did land. */
+export function dismissTurnLost(storedSessionId: string | null | undefined) {
+  if (!storedSessionId) {
+    return
+  }
+
+  clearCatchupGrace(storedSessionId)
+  setSessionTurnLost(storedSessionId, false)
 }
 
 // --- Watchdog: marks busy sessions quiet after a long stream silence -------
@@ -413,6 +613,12 @@ function handleTransition(previous: ClientSessionState | null, next: ClientSessi
   if (next.busy) {
     setSessionStalled(next.storedSessionId, false)
     armWatchdog(runtimeId)
+    // A live turn re-asserting busy after a reconnect downgrade IS the
+    // "still running" resolution — clear both the transient catch-up notice
+    // and any (impossible, since this fired) turn-lost mark for this session.
+    clearCatchupGrace(next.storedSessionId)
+    setSessionCatchingUp(next.storedSessionId, false)
+    setSessionTurnLost(next.storedSessionId, false)
   } else {
     clearWatchdog(runtimeId)
     setSessionStalled(next.storedSessionId, false)
@@ -506,6 +712,11 @@ export function publishSessionState(runtimeId: string, state: ClientSessionState
     return
   }
 
+  // Status computeds read this projection instead of $sessionStates: it only
+  // republishes on a real busy/needsInput/storedSessionId/hasMessages edge,
+  // so a stream's tens-per-second message deltas don't wake them.
+  publishLightStatus(runtimeId, state)
+
   if (prev && evictable(runtimeId, state)) {
     handleTransition(prev, state, runtimeId)
     releaseSessionTranscript(runtimeId, state)
@@ -549,6 +760,7 @@ export function dropSessionState(runtimeId: string) {
   clearWatchdog(runtimeId)
   clearSessionProviderWait(runtimeId)
   sessionScopeByRuntimeId.delete(runtimeId)
+  dropLightStatus(runtimeId)
   sessionOwnerByRuntimeId.delete(runtimeId)
 
   const current = $sessionStates.get()
@@ -578,7 +790,16 @@ export function clearAllSessionStates() {
   sessionScopeByRuntimeId.clear()
   sessionOwnerByRuntimeId.clear()
   $stalledSessionIds.set([])
+
+  for (const timer of catchupGraceTimers.values()) {
+    clearTimeout(timer)
+  }
+
+  catchupGraceTimers.clear()
+  $catchingUpSessionIds.set([])
+  $turnLostSessionIds.set([])
   $sessionStates.set({})
+  $sessionStatusById.set({})
 }
 
 /** Downgrade cached busy/awaiting states after a gateway reconnect.
@@ -630,6 +851,16 @@ export function reconcileBusyStatesOnReconnect(scope?: string) {
       continue
     }
 
+    // Mark as catching up and arm the grace window BEFORE downgrading: a
+    // session already re-asserting busy on the SAME publish (impossible here,
+    // since we're about to force it false) would otherwise race the mark.
+    // handleTransition (fired by publishSessionState below) clears both if
+    // the state genuinely settles as non-busy on its own terms; a live
+    // backend's next event instead re-publishes busy and handleTransition's
+    // busy branch clears the catch-up/lost marks for real.
+    setSessionCatchingUp(state.storedSessionId, true)
+    armCatchupGrace(state.storedSessionId)
+
     sessionTileDelegate()?.retireBusyClaim?.(runtimeId)
 
     // Re-read — the write path may have republished (and released) this entry.
@@ -646,14 +877,18 @@ export function reconcileBusyStatesOnReconnect(scope?: string) {
   }
 }
 
-// Derived per-session status sets — pure projections of `$sessionStates` (which
-// holds `busy`/`needsInput` per runtime), keeping the data flow one-directional:
-// gateway event → cache → $sessionStates → computed views.
+// Derived per-session status sets — pure projections of `$sessionStatusById`
+// (the lightweight busy/needsInput/storedSessionId/hasMessages mirror of
+// `$sessionStates`), keeping the data flow one-directional: gateway event →
+// cache → $sessionStates → $sessionStatusById → computed views.
 //
-// Perf: `$sessionStates` is republished on EVERY message delta (tens/sec during
-// a turn), but these sets only change on busy/needsInput edges. `stableArray`
-// keeps the prior reference when membership is unchanged so `computed` skips the
-// emit — otherwise the whole sidebar + every row re-renders per token.
+// Perf: `$sessionStates` republishes on EVERY message delta (tens/sec during
+// a turn) for tile views, but `$sessionStatusById` only republishes on a real
+// busy/needsInput/storedSessionId/hasMessages edge — so these sets, which
+// only ever change on such an edge, stop recomputing per token. `stableArray`
+// on top keeps the prior reference when membership is unchanged so `computed`
+// skips the emit too — otherwise the whole sidebar + every row re-renders per
+// token.
 // Published under every id the conversation answers to, not just its current
 // tip: consumers hold whichever id they were created with, and compression
 // rotates the tip out from under them (see lineageAliases).
@@ -666,9 +901,9 @@ export function reconcileBusyStatesOnReconnect(scope?: string) {
 // conversation's queue key IS its runtime id"), so the row matches; once a
 // session is persisted its runtime id is nobody's key and the fallback is inert.
 const storedIds = (
-  states: Record<string, ClientSessionState>,
+  states: Record<string, SessionLightStatus>,
   sessions: readonly SessionInfo[],
-  pred: (s: ClientSessionState) => boolean
+  pred: (s: SessionLightStatus) => boolean
 ) => {
   const ids = new Set<string>()
 
@@ -687,7 +922,7 @@ const storedIds = (
 
 let workingIds: readonly string[] = []
 export const $workingSessionIds = computed(
-  [$sessionStates, $sessions],
+  [$sessionStatusById, $sessions],
   (states, sessions) =>
     (workingIds = stableArray(
       workingIds,
@@ -697,7 +932,7 @@ export const $workingSessionIds = computed(
 
 let attentionIds: readonly string[] = []
 export const $attentionSessionIds = computed(
-  [$sessionStates, $sessions],
+  [$sessionStatusById, $sessions],
   (states, sessions) =>
     (attentionIds = stableArray(
       attentionIds,
@@ -714,9 +949,9 @@ export const $attentionSessionIds = computed(
 // binding its runtime and loading its transcript, and calling that a draft
 // would flash the wrong mark on a conversation with years of history in it.
 let draftIds: readonly string[] = []
-export const $draftSessionIds = computed([$sessionStates, $sessions], (states, sessions) => {
-  const unsent = (state: ClientSessionState) => {
-    if (state.busy || state.messages.length > 0) {
+export const $draftSessionIds = computed([$sessionStatusById, $sessions], (states, sessions) => {
+  const unsent = (state: SessionLightStatus) => {
+    if (state.busy || state.hasMessages) {
       return false
     }
 
@@ -1672,12 +1907,13 @@ export function focusWorkspaceOwnerSessionTile(
 }
 
 /** Does a sidebar click still need to navigate after `focusOpenSession`? A miss
- *  always does. A `'main'` hit does too while the workspace pane is showing a
- *  full page (artifacts, skills, …): fronting the workspace tab doesn't put the
- *  chat back on screen — only a route change back to the session does. A tile
- *  hit never does; its pane renders the chat regardless of the route. */
+ * always does. Any hit does too while the workspace pane is showing a full page
+ * (artifacts, skills, contributed routes): a tile can paint its chat above that
+ * page, but leaving the route there keeps the stale page mounted and its
+ * sidebar row selected. A user-selected session is authoritative foreground
+ * intent, so route back to chat without relocating or closing the focused tile. */
 export function focusedSessionNeedsRoute(focused: 'main' | 'tile' | null, workspaceIsPage: boolean): boolean {
-  return !focused || (focused === 'main' && workspaceIsPage)
+  return !focused || workspaceIsPage
 }
 
 /** The open tab that's still an empty "New session" draft, if there is one.

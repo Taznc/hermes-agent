@@ -241,6 +241,7 @@ def _create_cron_job_sync(body: CronJobCreate, profile: Optional[str] = None):
         context_from = _cron_string_list(body.context_from)
         _validate_dashboard_cron_context_from(context_from, profile_name)
         no_agent = bool(body.no_agent)
+        resume_session_id = _cron_optional_text(body.resume_session_id)
         _validate_dashboard_cron_effective_job(
             {"prompt": body.prompt, "skills": skills, "script": script, "no_agent": no_agent})
         return _mutate_cron_for_profile(
@@ -259,6 +260,7 @@ def _create_cron_job_sync(body: CronJobCreate, profile: Optional[str] = None):
             enabled_toolsets=_cron_string_list(body.enabled_toolsets),
             workdir=_cron_optional_text(body.workdir),
             no_agent=no_agent,
+            resume_session_id=resume_session_id,
             **{key: getattr(body, key) for key in ("paused", "paused_reason")
                if key in body.model_fields_set})
     except HTTPException:

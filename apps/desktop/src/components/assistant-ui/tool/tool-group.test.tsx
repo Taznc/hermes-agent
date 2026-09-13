@@ -3,6 +3,7 @@ import { cleanup, fireEvent, render, screen, waitFor } from '@testing-library/re
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
 import { $displayTimestamps } from '@/store/display-timestamps'
+import { clearMcpAppCards, recordMcpAppCard } from '@/store/mcp-apps'
 import { clearAllPrompts, setApprovalRequest } from '@/store/prompts'
 import { $activeSessionId } from '@/store/session'
 import { clearDismissedToolRows } from '@/store/tool-dismiss'
@@ -395,6 +396,7 @@ beforeEach(() => {
 afterEach(() => {
   cleanup()
   clearAllPrompts()
+  clearMcpAppCards('sess-1')
   $activeSessionId.set(null)
   clearDismissedToolRows()
 })
@@ -424,6 +426,22 @@ describe('settled tool run', () => {
       expect(container.querySelectorAll('[data-tool-row]').length).toBe(1)
     })
     expect(container.querySelector('[data-tool-summary]')).toBeNull()
+  })
+
+  it('keeps a live MCP App card beside its tool row instead of behind that row disclosure', async () => {
+    recordMcpAppCard('sess-1', 'read-only', {
+      html: '<!doctype html><html><body><button>Refresh</button></body></html>',
+      id: 'per-call-opaque-identifier',
+      resourceUri: 'ui://mcp-apps/demo',
+      serverId: 'mcp-apps-demo',
+      toolName: 'show_demo_dashboard'
+    })
+
+    render(<GroupHarness message={completedOnlyMessage()} />)
+    const card = await screen.findByLabelText('MCP App from show_demo_dashboard')
+
+    expect(card.closest('[data-tool-row]')).toBeNull()
+    expect(card.parentElement?.getAttribute('data-slot')).toBe('mcp-app-card')
   })
 })
 

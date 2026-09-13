@@ -1,8 +1,10 @@
 import { defineFieldCopy } from '@/app/settings/field-copy'
 
-import { defineLocale } from './define-locale'
+import { forkJa } from './fork/ja'
+import { defineForkLocale } from './fork/merge'
 
-export const ja = defineLocale({
+// >>> FORK ANCHOR: i18n-ja <<<
+export const ja = defineForkLocale(forkJa, {
   sessionImport: {
     title: '別のアプリから続ける',
     subtitle: '会話をHermesに取り込み、続きを始めましょう。',
@@ -46,6 +48,7 @@ export const ja = defineLocale({
     choose: '選択',
     clear: 'クリア',
     close: '閉じる',
+    undo: '元に戻す',
     collapse: '折りたたむ',
     confirm: '確認',
     connect: '接続',
@@ -165,6 +168,7 @@ export const ja = defineLocale({
     more: count => `他 ${count} 件の通知`,
     clearAll: 'すべてクリア',
     dismiss: '通知を閉じる',
+    dismissAction: '閉じる',
     details: '詳細',
     copyDetail: '詳細をコピー',
     copyDetailFailed: '通知の詳細をコピーできませんでした',
@@ -372,6 +376,7 @@ export const ja = defineLocale({
       testSent:
         'テストを送信しました。表示されない場合は、OS の通知許可と集中モード／おやすみモードを確認してください。',
       testUnsupported: 'このシステムはネイティブ通知に対応していません。',
+      testDenied: 'このサイトの通知がブロックされています。ブラウザのサイト設定で許可してから、もう一度お試しください。',
       completionSoundTitle: '完了サウンド',
       completionSoundDesc: 'エージェントのターン終了時に再生されます。プリセットを選んでここで試聴できます。',
       completionSoundPreview: '試聴'
@@ -464,6 +469,9 @@ export const ja = defineLocale({
       toursDesc: '画面を暗くして各ステップを強調しながら、Hermes がアプリを案内します。',
       composerPopoutTitle: 'フローティング入力欄',
       composerPopoutDesc: '入力欄をドックからドラッグして外せるようにします。オフにすると画面下部に固定されます。',
+      requireModifierToOpenLinksTitle: 'チャットリンクを ⌘/Ctrl-クリックで開く',
+      requireModifierToOpenLinksDesc:
+        'Mac では ⌘-クリック、他の環境では Ctrl-クリックで、チャット内のパスや URL（コードチップを含む）を開きます。通常のクリックはテキスト選択です。フォーカスしたリンクの Enter はこれまでどおり開きます。',
       vibeHeartsTitle: 'バイブハート',
       vibeHeartsDesc:
         'ありがとう・愛してる・good bot・ハート絵文字のときに浮かぶハート。上のメッセージリアクションとは別です。',
@@ -1043,12 +1051,12 @@ export const ja = defineLocale({
     },
     model: {
       loading: 'モデル設定を読み込み中...',
+      loadFailed: 'モデル設定の読み込みに失敗しました',
       appliesDesc:
         '新しいセッションに適用されます。コンポーザーのモデルピッカーを使ってアクティブなチャットをホットスワップできます。',
       provider: 'プロバイダー',
       model: 'モデル',
       applying: '適用中...',
-      loadFailed: 'モデルを読み込めませんでした',
       restartRequired:
         'アップデート後、このバックエンドは古いコードのままです。再起動して新しいコードを読み込んでください。',
       restartBackend: 'バックエンドを再起動',
@@ -1402,12 +1410,66 @@ export const ja = defineLocale({
     emptyDesc: 'Hermes がスキルやメモリを蓄積すると、ここに表示されます。'
   },
   agents: {
+    openAsTab: 'タブとして開く',
+    liveUnavailable: 'ライブ状態は取得できません',
+    inventoryUnavailable: 'このゲートウェイを更新すると、セッションとボットを表示できます。',
+    historyShifted: '読み込み中にセッションが変化しました。再読み込みします。',
     extendedTranscript: '詳細な実行ログ',
     transcriptTruncated: '最新の 16 KiB を表示',
     transcriptUnavailable: 'ライブログは利用できません',
 
     close: 'エージェントを閉じる',
-    title: 'スポーンツリー',
+    title: 'エージェント',
+    sessionsTab: 'セッション',
+    treeTab: 'スポーンツリー',
+    overviewSubtitle: '登録済み接続先の Hermes セッションのアクティビティ。',
+    searchSessions: 'セッションを検索',
+    allSources: 'すべての接続先',
+    allProfiles: 'すべてのプロファイル',
+    allProviders: 'すべてのプロバイダー',
+    activityFilter: 'アクティビティ',
+    recentActivity: '最近のアクティビティ',
+    allSessions: 'すべてのセッション',
+    noRecentActivity: '最近のアクティビティはありません',
+    recentActivityHint:
+      '実行中・入力待ちのセッションは常に表示されます。その他は最終アクティビティから15分間表示されます。履歴を見るには「すべてのセッション」を選択してください。',
+    needsYou: '入力が必要',
+    working: '作業中',
+    unread: '未読',
+    idle: '待機中',
+    stale: '古い情報',
+    noSessions: '一致するセッションはありません',
+    selectSession: '会話を選択してプレビューします。',
+    openConversation: '会話を開く',
+    reply: '返信',
+    stop: '停止',
+    retry: '再試行',
+    connect: '接続',
+    owner: '所有者',
+    source: '接続先',
+    profile: 'プロファイル',
+    provider: 'プロバイダー',
+    model: 'モデル',
+    description: '説明',
+    unknown: '不明',
+    loadMore: 'さらに表示',
+    coverageNote: 'ライブ状態は接続中の Hermes プロセスのみです。待機中は完了を意味しません。',
+    promptHint: '承認や質問には会話を開いて回答してください。',
+    history: '履歴の取得状況',
+    ready: '接続済み',
+    onDemand: '必要時に接続',
+    offline: 'オフライン',
+    unsupported: '未対応',
+    partial: '一部のみ',
+    allQuiet: 'すべて静かです',
+    allQuietHint:
+      '実行中・入力待ちのセッションはここに残ります。完了したチャットは15分後に消えます。履歴は「すべてのセッション」で確認できます。',
+    needYouCount: count => `${count} 件が入力待ち`,
+    workingCount: count => `${count} 件が作業中`,
+    closePreview: 'プレビューを閉じる',
+    replyPlaceholder: '返信…',
+    noPreview: 'プレビューはありません。',
+    shown: (visible, total) => `${total} 件中 ${visible} 件`,
     subtitle: '現在のターンのライブサブエージェントのアクティビティ。',
     emptyTitle: 'ライブサブエージェントはありません',
     emptyDesc: 'ターンで作業を委任すると、子エージェントの進捗状況がここにストリームされます。',
@@ -2166,6 +2228,7 @@ export const ja = defineLocale({
       copyIdFailed: 'セッション ID をコピーできませんでした',
 
       sessionActions: 'セッションアクション',
+      archiveSession: 'セッションをアーカイブ',
       sessionRunning: 'セッション実行中',
       needsInput: '入力が必要です',
       waitingForAnswer: '回答を待っています',
@@ -2835,6 +2898,9 @@ export const ja = defineLocale({
       showTerminal: 'ターミナルを表示',
       hideTerminal: 'ターミナルを非表示',
       gateway: 'ゲートウェイ',
+      backend: 'バックエンド',
+      messagingStopped: 'メッセージング停止',
+      messagingDegraded: name => `${name} 停止`,
       gatewayReady: '準備完了',
       gatewayNeedsSetup: '設定が必要',
       gatewayUnavailable: '推論を利用できません',
@@ -3010,6 +3076,12 @@ export const ja = defineLocale({
       address: 'アドレス',
       addressPlaceholder: 'アドレスを入力',
       blankPageBody: '上のアドレス欄に入力するか、Hermes にページを開くよう頼んでください。',
+      noGuestTitle: 'ページはブラウザーのタブで開きます',
+      noGuestBody:
+        'このビルドの Hermes はブラウザー上で動作するため、他のサイトをペイン内に埋め込めません。上にアドレスを入力すると、Hermes が新しいブラウザータブで開きます。',
+      noGuestOpen: url => `${url} をブラウザーのタブで開く`,
+      openBlocked:
+        'ブラウザーが新しいタブをブロックしました。このページのポップアップを許可してからもう一度お試しください。',
       finishedRestarting: message =>
         `Hermes がプレビューサーバーの再起動を完了しました${message ? `: ${message}` : ''}`,
       failedRestarting: message => `サーバーの再起動に失敗しました: ${message}`,
@@ -3123,6 +3195,7 @@ export const ja = defineLocale({
       refresh: '更新',
       moreActions: 'その他のアクション',
       branchNewChat: '新しいチャットでブランチ',
+      copyMessage: 'メッセージをコピー',
       react: 'リアクション',
       dismissError: 'エラーを閉じる',
       errorLayers: {
@@ -3182,6 +3255,7 @@ export const ja = defineLocale({
       gatewayDisconnected: 'Hermes ゲートウェイが接続されていません',
       sendFailed: '明確化応答を送信できませんでした',
       loadingQuestion: '質問を読み込み中…',
+      restoring: 'この質問を復元しています — まもなく回答できます',
       other: 'その他（回答を入力）',
       placeholder: '回答を入力…',
       skip: 'スキップ',
@@ -3190,9 +3264,17 @@ export const ja = defineLocale({
       confirmAndContinueLabel: '確定して続行',
       answeredBadge: '回答済み',
       questionProgress: (answered, total) => `${total}問中${answered}問回答済み`,
+      questionGroup: total => `回答が必要な質問が${total}件あります`,
       lateAnswer: (question, choice) => `「${question}」について — 私の回答: ${choice}`,
       lateAnswerTip: 'この回答をフォローアップメッセージとして下書きします',
-      lateAnswerHint: 'この質問はもう回答を待っていません。選択肢を選ぶとフォローアップメッセージとして下書きされます。'
+      lateAnswerHint:
+        'この質問はもう回答を待っていません。選択肢を選ぶとフォローアップメッセージとして下書きされます。',
+      addNote: 'メモを追加',
+      addNoteFor: label => `${label}にメモを追加`,
+      note: 'メモ',
+      noteFor: label => `${label}のメモ`,
+      notePlaceholder: '任意のメモを追加…',
+      selected: '選択済み'
     },
     tool: {
       copyCode: 'コードをコピー',
@@ -3360,6 +3442,8 @@ export const ja = defineLocale({
     deleteFailed: '削除に失敗しました',
     archived: 'アーカイブしました',
     archiveFailed: 'アーカイブに失敗しました',
+    archivedUndoMessage: 'セッションをアーカイブしました',
+    undoArchiveFailed: '元に戻せませんでした',
     cwdChangeFailed: '作業ディレクトリの変更に失敗しました',
     cwdStagedTitle: '作業ディレクトリがステージングされました',
     cwdStagedMessage:

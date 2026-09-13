@@ -320,32 +320,40 @@ def import_board(
                 "cannot determine a board name from the archive — pass one "
                 "explicitly with --as <slug>"
             )
-        target = _available_slug(requested)
 
         staged_meta = _read_board_metadata(extracted / "board.json")
 
-        board_root = kb.board_dir(target)
-        board_root.mkdir(parents=True, exist_ok=True)
-        shutil.move(str(staged_db), str(board_root / "kanban.db"))
-        for tree in ("attachments", "logs"):
-            src = extracted / tree
-            if src.is_dir():
-                shutil.move(str(src), str(board_root / tree))
+        # One inventory hold covers target-slug selection through final
+        # placement and metadata. Extraction above touched only the tempdir, so
+        # it stays outside; the row-relocation pass below is per-board DB work
+        # under that board's own transaction, so it stays outside too. Without
+        # this hold, _available_slug's collision check is a plain read and a
+        # concurrent create_board can take the slug it just chose.
+        with kb.board_inventory_lock():
+            target = _available_slug(requested)
 
-    # Rewritten rather than moved across: the archive's copy names a slug
-    # and a workdir that belong to the exporting machine.
-    name = str(staged_meta.get("name") or manifest.get("board_name") or target)
-    kb.write_board_metadata(
-        target,
-        name=name,
-        description=str(staged_meta.get("description") or ""),
-        icon=str(staged_meta.get("icon") or ""),
-        color=str(staged_meta.get("color") or ""),
-        archived=False,
-    )
-    # Bring the imported schema up to this install's version before the
-    # relocation pass writes to it.
-    kb.init_db(board=target)
+            board_root = kb.board_dir(target)
+            board_root.mkdir(parents=True, exist_ok=True)
+            shutil.move(str(staged_db), str(board_root / "kanban.db"))
+            for tree in ("attachments", "logs"):
+                src = extracted / tree
+                if src.is_dir():
+                    shutil.move(str(src), str(board_root / tree))
+
+            # Rewritten rather than moved across: the archive's copy names a slug
+            # and a workdir that belong to the exporting machine.
+            name = str(staged_meta.get("name") or manifest.get("board_name") or target)
+            kb.write_board_metadata(
+                target,
+                name=name,
+                description=str(staged_meta.get("description") or ""),
+                icon=str(staged_meta.get("icon") or ""),
+                color=str(staged_meta.get("color") or ""),
+                archived=False,
+            )
+            # Bring the imported schema up to this install's version before the
+            # relocation pass writes to it.
+            kb.init_db(board=target)
 
     with kbc.connect_closing(board=target) as conn:
         stats, warnings = _relocate_imported_rows(conn, target)

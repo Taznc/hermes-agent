@@ -3,6 +3,7 @@
 import { type ReactNode, useCallback, useRef, useState } from 'react'
 
 import { useResizeObserver } from '@/hooks/use-resize-observer'
+import { useI18n } from '@/i18n'
 import { ChevronDown } from '@/lib/icons'
 import { cn } from '@/lib/utils'
 
@@ -12,6 +13,7 @@ interface ExpandableBlockProps {
 }
 
 export function ExpandableBlock({ children, className }: ExpandableBlockProps) {
+  const { t } = useI18n()
   const innerRef = useRef<HTMLDivElement>(null)
   const [expanded, setExpanded] = useState(false)
   const [overflowing, setOverflowing] = useState(false)
@@ -44,23 +46,41 @@ export function ExpandableBlock({ children, className }: ExpandableBlockProps) {
         {children}
       </div>
       {overflowing && (
-        // The fade is a pure overflow cue and must not intercept pointer events:
-        // it spans the full bottom edge (over the horizontal scrollbar of a wide
-        // code block AND the block's last line), so making it clickable killed
-        // both sideways scrolling and text selection. Keep the fade
-        // `pointer-events-none` and pin the only clickable target — a compact
-        // toggle — to the right edge, clear of the draggable scrollbar track.
-        <div className="pointer-events-none absolute inset-x-0 bottom-0 flex h-7 justify-end bg-linear-to-t from-[var(--expandable-fade-from,var(--ui-chat-surface-background))] to-transparent">
-          <button
-            aria-expanded={expanded}
-            aria-label={expanded ? 'Collapse' : 'Expand'}
-            className="pointer-events-auto flex h-7 w-9 cursor-pointer items-end justify-center pb-1 text-muted-foreground/70 transition-colors hover:text-foreground"
-            onClick={() => setExpanded(v => !v)}
-            type="button"
-          >
-            <ChevronDown className={cn('size-3.5 transition-transform', expanded && 'rotate-180')} />
-          </button>
-        </div>
+        // Pure overflow cue, decorative only: hints more content sits below
+        // the visible area. Never carries the click target and never
+        // intercepts pointer events, so it can't fight the scrollbar drag or
+        // text selection on the last visible line underneath it.
+        <div
+          className="pointer-events-none absolute inset-x-0 bottom-0 h-6 bg-linear-to-t from-[var(--expandable-fade-from,var(--ui-chat-surface-background))] to-transparent"
+          data-testid="expandable-fade"
+        />
+      )}
+      {overflowing && (
+        // The toggle lives OUTSIDE the scrollable box entirely, in its own
+        // full-width row below it — never on top of the scroll container.
+        // The old placement pinned a small icon-only button inside the
+        // scroller's own bottom-right corner: exactly where a vertical
+        // scrollbar (right edge) and a horizontal scrollbar (bottom edge, for
+        // wide code) both live, so the native scrollbar constantly ate the
+        // click. Living below the box, at full width, this control can never
+        // overlap either scrollbar regardless of scroll position, code
+        // width, or viewport size — and the much larger hit area (full card
+        // width) plus a visible hover fill make it easy to find and click.
+        <button
+          aria-expanded={expanded}
+          aria-label={expanded ? t.common.collapse : t.common.expand}
+          className={cn(
+            'flex w-full cursor-pointer items-center justify-center gap-1 border-t py-1 text-[0.6875rem]',
+            'border-(--ui-stroke-tertiary)/50 bg-[var(--expandable-fade-from,var(--ui-chat-surface-background))]',
+            'text-muted-foreground/70 transition-colors hover:bg-accent/40 hover:text-foreground',
+            'focus-visible:bg-accent/40 focus-visible:text-foreground focus-visible:outline-none'
+          )}
+          onClick={() => setExpanded(v => !v)}
+          type="button"
+        >
+          <span>{expanded ? t.common.collapse : t.common.expand}</span>
+          <ChevronDown className={cn('size-3.5 transition-transform', expanded && 'rotate-180')} />
+        </button>
       )}
     </div>
   )

@@ -172,6 +172,36 @@ def _empty_discovery_reason() -> str:
                 "panel asleep) — wake the display or attach a monitor/HDMI dummy, then run `hermes computer-use doctor`")
     return "window discovery returned no windows; run `hermes computer-use doctor` (display reachability, AX capability)"
 
+def _driver_update_checks_disabled() -> bool:
+    """True when the background cua-driver update nudge should stay silent.
+
+    ``_maybe_nudge_update()`` runs a `cua-driver check-update --json` shell-out
+    on every ``CuaDriverBackend.start()`` — a distinct upstream (trycua/cua's
+    GitHub Releases) from Hermes' own update check, so it isn't covered by
+    ``hermes_cli.banner._update_checks_disabled``. Mirrors that gate's two
+    guards for consistency:
+
+    - ``HERMES_DEV=1`` — the existing dev-mode env guard (local checkout,
+      not a packaged install); a dev build shelling out to check a
+      third-party driver's release feed on every action is exactly the
+      upstream noise this flag exists to silence.
+    - ``computer_use.check_for_driver_updates: false`` in config — an
+      explicit, persistent opt-out independent of the environment.
+
+    Never raises — a config read failure falls back to checks enabled (the
+    pre-existing behavior), since this only gates a best-effort, swallowed
+    nudge, never functionality.
+    """
+    if os.environ.get("HERMES_DEV") == "1":
+        return True
+    try:
+        if _computer_use_cfg().get("check_for_driver_updates") is False:
+            return True
+    except Exception:
+        pass
+    return False
+
+
 _update_checked = False
 # One auto-repair attempt per process: when the runtime-contract gate fails for something a reinstall fixes
 # (old version, missing manifest verbs) run the standard install path once instead of telling the user to.
@@ -205,6 +235,8 @@ def _maybe_nudge_update() -> None:
     if _update_checked:
         return
     _update_checked = True
+    if _driver_update_checks_disabled():
+        return
 
     def _run() -> None:
         with contextlib.suppress(Exception):

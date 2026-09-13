@@ -396,7 +396,6 @@ export function CreateAgentDialog({ open, onClose, roster }: CreateAgentDialogPr
           name: slug,
           title,
           description,
-          roster,
           customSoul: soul
         }),
         ...(model.trim() && provider.trim()

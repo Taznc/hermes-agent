@@ -2236,6 +2236,11 @@ def init_agent(
     # renderer (StdoutProxy would mangle them). None = builtins.print.
     agent._print_fn = None
     agent.background_review_callback = None  # Optional sync callback for gateway delivery
+    # Optional sync callback receiving the SAME event as background_review_callback plus structured
+    # per-action records (list[dict] from agent.background_review.collect_background_review_actions).
+    # Only the TUI gateway wires this (Desktop's expandable self-improvement row); CLI/messaging
+    # paths render plain text and leave it unset.
+    agent.background_review_detail_callback = None
     agent.memory_notifications = "on"  # Memory update notifications: "off", "on", "verbose"
     # Skips the end-of-turn review fork (~30K tokens/event); one switch for both review paths.
     agent.skip_background_review = bool(skip_background_review)

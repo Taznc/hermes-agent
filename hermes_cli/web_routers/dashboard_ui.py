@@ -7,7 +7,7 @@ Extracted from ``hermes_cli.web_server``; helpers/state that tests monkeypatch o
 import asyncio
 import logging
 from pathlib import Path
-from typing import Callable
+from typing import Callable, Optional
 
 from fastapi import APIRouter, HTTPException, Request
 from fastapi.responses import FileResponse
@@ -19,7 +19,8 @@ from hermes_cli.web_server_dashboard import (
 )
 from hermes_cli.web_server_memory import _normalize_memory_provider_name, _require_memory_provider_ready
 from hermes_cli.web_models import (
-    FontSetBody, ThemeSetBody, _AgentPluginInstallBody, _PluginProvidersPutBody, _PluginVisibilityBody,
+    FontSetBody, ThemeSetBody, _AgentPluginInstallBody, _DesktopPluginInstallBody, _PluginProbeBody,
+    _PluginProvidersPutBody, _PluginVisibilityBody,
 )
 
 _log = logging.getLogger("hermes_cli.web_server")
@@ -180,6 +181,53 @@ async def post_agent_plugin_install(request: Request, body: _AgentPluginInstallB
     # Strip internal paths from the response
     result.pop("after_install_path", None)
     return result
+
+
+# ---------------------------------------------------------------------------
+# Desktop-plugin (`plugin.js`) probe + install — the remote half of Electron's
+# `hermes:probePluginRepo` / `hermes:installDesktopPlugin` IPC handlers
+# (apps/desktop/electron/fs-ipc.ts -> electron/desktop-plugin-install.ts), for
+# the web-served desktop build's bridge shim
+# (apps/desktop/src/web-bridge-shim.ts), which has no Electron main process to
+# clone or write the filesystem locally.
+#
+# Distinct from /api/dashboard/agent-plugins/install above: that one clones into
+# the AGENT plugin root and validates the agent-plugin shape, so a desktop-only
+# repo (bare plugin.js, no plugin.yaml/__init__.py) never installs through it.
+#
+# Both return HTTP 200 with `{ok: false, error}` for user-facing failures rather
+# than a 4xx, matching the IPC handlers' result objects: the shim's api() throws
+# on a non-2xx response and the install modal calls these members without a
+# catch, so a 4xx would strand the dialog in its probing state.
+# ---------------------------------------------------------------------------
+
+
+@router.post("/api/dashboard/plugins/probe")
+async def post_plugin_probe(request: Request, body: _PluginProbeBody):
+    """Which halves — agent, desktop — a plugin repo carries. Clones to a temp dir only."""
+    _require_token(request)
+    from hermes_cli.plugins_cmd_desktop import probe_plugin_repo
+
+    return await asyncio.to_thread(probe_plugin_repo, body.identifier.strip())
+
+
+@router.post("/api/dashboard/desktop-plugins/install")
+async def post_desktop_plugin_install(
+    request: Request, body: _DesktopPluginInstallBody, profile: Optional[str] = None,
+):
+    """Install a repo's desktop half into `<HERMES_HOME>/desktop-plugins/<name>`."""
+    _require_token(request)
+    from hermes_cli.plugins_cmd_desktop import install_desktop_plugin
+    from hermes_cli.web_routers.files import _fs_plugin_root
+
+    def _run() -> dict:
+        # Same profile-aware root the scan half resolves through
+        # (/api/fs/desktop-plugins-root), so an install and the subsequent
+        # discovery scan can never disagree about where plugins live.
+        root = _fs_plugin_root("desktop-plugins", profile)
+        return install_desktop_plugin(body.identifier.strip(), force=body.force, desktop_plugins_root=root)
+
+    return await asyncio.to_thread(_run)
 
 
 def _validate_plugin_name(name: str) -> str:

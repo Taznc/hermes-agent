@@ -1,8 +1,17 @@
 import { defineFieldCopy } from '@/app/settings/field-copy'
 
+import { defineLocale } from './define-locale'
+import { withForkKeys } from './fork/merge'
+import { forkZh } from './fork/zh'
 import type { Translations } from './types'
 
-export const zh: Translations = {
+// Authored catalog. Kept fully typed as `Translations` (not
+// TranslationOverrides) so tsc still enforces every non-Record member, and
+// exported so locale-parity.test.ts can assert the AUTHORED key set against
+// `en` — the defineLocale() merge below would otherwise hide missing keys as
+// silent English fallback.
+// >>> FORK ANCHOR: i18n-zh <<<
+export const zhAuthored: Translations = withForkKeys(forkZh, {
   sessionImport: {
     title: '从其他应用继续',
     subtitle: '将对话导入 Hermes，接着上次的进度继续。',
@@ -74,6 +83,7 @@ export const zh: Translations = {
     skip: '跳过',
     update: '更新',
     tryHint: term => `试试“${term}”`,
+    undo: '撤销',
     on: '开',
     off: '关'
   },
@@ -161,6 +171,7 @@ export const zh: Translations = {
     more: count => `另外 ${count} 条通知`,
     clearAll: '全部清除',
     dismiss: '关闭通知',
+    dismissAction: '关闭',
     details: '详情',
     copyDetail: '复制详情',
     copyDetailFailed: '无法复制通知详情',
@@ -340,7 +351,13 @@ export const zh: Translations = {
       'view.toggleTabStrip': '切换标签',
       'view.showFiles': '显示文件浏览器',
       'view.showBrowser': '打开浏览器',
+      'view.toggleHud': '切换 HUD 模式',
+      'hud.snapToPointer': '将 HUD 移到指针位置（全局，HUD 打开时）',
       'view.showTerminal': '显示终端',
+      'view.newTerminal': '新建终端',
+      'view.nextTerminal': '下一个终端',
+      'view.prevTerminal': '上一个终端',
+      'view.closeTerminal': '关闭终端',
       'view.selectionToComposer': '将选区发送到输入框',
       'view.terminalCopy': '复制终端选区',
       'view.terminalPaste': '粘贴到终端',
@@ -532,6 +549,7 @@ export const zh: Translations = {
       testBody: '通知工作正常。',
       testSent: '测试已发送。如果没有出现，请检查系统通知权限和专注模式／勿扰模式。',
       testUnsupported: '此系统不支持原生通知。',
+      testDenied: '此网站的通知已被拦截。请在浏览器的网站设置中允许通知，然后重试。',
       completionSoundTitle: '完成提示音',
       completionSoundDesc: '智能体回合结束时播放。可在此选择预设并预览。',
       completionSoundPreview: '预览'
@@ -621,6 +639,9 @@ export const zh: Translations = {
       toursDesc: '让 Hermes 带你熟悉应用：调暗界面并逐步高亮每个位置。',
       composerPopoutTitle: '悬浮输入框',
       composerPopoutDesc: '允许将输入框拖出底部停靠区。关闭后，输入框会锁定在底部。',
+      requireModifierToOpenLinksTitle: '需 ⌘/Ctrl-点击才能打开聊天链接',
+      requireModifierToOpenLinksDesc:
+        '在 Mac 上用 ⌘-点击、在其他系统用 Ctrl-点击打开聊天中的路径和网址（包括代码片段）。普通点击用于选择文本。焦点在链接上时按 Enter 仍会打开。',
       vibeHeartsTitle: '心情爱心',
       vibeHeartsDesc: '当你说谢谢、爱你、good bot 或发送爱心时飘出的爱心。与上方的消息回应是两回事。',
       embedsTitle: '内嵌预览',
@@ -741,7 +762,8 @@ export const zh: Translations = {
       },
       browser: {
         allowPrivateUrls: '浏览器私有 URL',
-        autoLocalForPrivateUrls: '私有 URL 使用本地浏览器'
+        autoLocalForPrivateUrls: '私有 URL 使用本地浏览器',
+        useRealProfile: '使用我的真实浏览器配置'
       },
       checkpoints: {
         enabled: '文件检查点',
@@ -754,6 +776,7 @@ export const zh: Translations = {
       },
       stt: {
         enabled: '语音转文字',
+        echoTranscripts: '回显转写文本',
         provider: '语音转文字提供方',
         local: {
           model: '本地转写模型',
@@ -819,6 +842,10 @@ export const zh: Translations = {
         },
         piper: {
           voice: 'Piper 语音'
+        },
+        deepinfra: {
+          model: 'DeepInfra TTS 模型',
+          voice: 'DeepInfra 语音'
         }
       },
       memory: {
@@ -863,6 +890,10 @@ export const zh: Translations = {
         repoScanExcludePaths: '发现代码仓库时跳过这些文件夹及其子目录。'
       },
       timezone: '当 Hermes 需要本地时间上下文时使用。留空则使用系统时区。',
+      browser: {
+        useRealProfile:
+          '本地浏览使用你的真实登录信息。Hermes 会将你默认浏览器的配置文件（Cookie、登录信息、偏好设置）复制到一个受管理的快照中，并用其内置的 Chromium 驱动它——你的真实配置文件永远不会被直接打开，且每次运行时都会从中刷新副本。即使已配置云端浏览器后端，也可以让代理按需打开本地真实配置文件会话。仅支持基于 Chromium 的浏览器（Chrome、Edge、Brave、Brave Origin、Chromium）；非 Chromium 的默认浏览器会明确报错。默认关闭。'
+      },
       agent: {
         imageInputMode: '控制图片附件如何发送给模型。',
         maxTurns: 'Hermes 停止一次运行前工具调用轮次的上限。'
@@ -870,7 +901,11 @@ export const zh: Translations = {
       terminal: {
         cwd: '工具与终端操作的默认项目目录。',
         persistentShell: '当后端支持时，在命令之间保留 Shell 状态。',
-        envPassthrough: '传入工具执行的环境变量。'
+        envPassthrough: '传入工具执行的环境变量。',
+        dockerImage: '执行后端为 Docker 时使用的容器镜像。',
+        singularityImage: '执行后端为 Singularity 时使用的镜像。',
+        modalImage: '执行后端为 Modal 时使用的镜像。',
+        daytonaImage: '执行后端为 Daytona 时使用的镜像。'
       },
       codeExecution: {
         mode: '代码执行被限定到当前项目的严格程度。'
@@ -899,8 +934,23 @@ export const zh: Translations = {
       voice: {
         autoTts: '自动朗读助手回复。'
       },
+      tts: {
+        xai: {
+          voiceId: 'xAI 语音 ID（如 eve）或自定义语音 ID。',
+          language: '朗读语言代码（如 en、pt-BR），或 "auto" 自动检测。',
+          speed: '播放速度。0.7 = 较慢，1.0 = 正常，1.5 = 较快。',
+          autoSpeechTags: '让 LLM 在合成前向文本插入富有表现力的音频标签（[laughing]、[sighs]）。',
+          optimizeStreamingLatency: '延迟与质量的权衡。0 = 最佳质量，2 = 最低延迟。',
+          sampleRate: '音频采样率（Hz）。越高质量越好，文件越大。',
+          bitRate: 'MP3 比特率（bps）。仅当编码为 mp3 时生效。'
+        },
+        neutts: {
+          device: 'NeuTTS 的本地推理设备。'
+        }
+      },
       stt: {
         enabled: '启用本地或提供方支持的语音转写。',
+        echoTranscripts: '将语音消息的原始 🎙️ 转写文本发回对话。',
         elevenlabs: {
           languageCode: '可选的 ISO-639-3 语言代码。留空让 ElevenLabs 自动检测。'
         }
@@ -1321,6 +1371,7 @@ export const zh: Translations = {
     },
     model: {
       loading: '正在加载模型配置...',
+      loadFailed: '加载模型设置失败',
       appliesDesc: '应用于新会话。可在输入框的模型选择器中临时切换当前对话。',
       provider: '提供方',
       model: '模型',
@@ -1329,7 +1380,6 @@ export const zh: Translations = {
       reasoning: '推理',
       reasoningOff: '关闭',
       defaultsFailed: '保存模型默认值失败',
-      loadFailed: '无法加载模型',
       restartRequired: '更新后此后端仍在运行旧代码。请重启以加载新代码。',
       restartBackend: '重启后端',
       restartingBackend: '正在重启后端...',
@@ -1757,12 +1807,65 @@ export const zh: Translations = {
     resetToMine: '返回我的图谱'
   },
   agents: {
+    openAsTab: '在标签页中打开',
+    liveUnavailable: '实时状态不可用',
+    inventoryUnavailable: '更新此网关以显示其会话和机器人。',
+    historyShifted: '读取时会话发生了变化；正在刷新。',
     extendedTranscript: '扩展记录',
     transcriptTruncated: '显示最新 16 KiB',
     transcriptUnavailable: '实时记录不可用',
 
     close: '关闭代理',
-    title: '派生树',
+    title: '智能体',
+    sessionsTab: '会话',
+    treeTab: '派生树',
+    overviewSubtitle: '已注册来源的 Hermes 会话活动。',
+    searchSessions: '搜索会话',
+    allSources: '所有来源',
+    allProfiles: '所有配置',
+    allProviders: '所有提供商',
+    activityFilter: '活动',
+    recentActivity: '最近活动',
+    allSessions: '所有会话',
+    noRecentActivity: '暂无最近活动',
+    recentActivityHint:
+      '运行中和等待输入的会话始终显示。其他会话在最后活动后的15分钟内显示。选择“所有会话”查看历史记录。',
+    needsYou: '需要你',
+    working: '工作中',
+    unread: '未读',
+    idle: '空闲',
+    stale: '已过期',
+    noSessions: '没有匹配的会话',
+    selectSession: '选择会话以查看预览。',
+    openConversation: '打开会话',
+    reply: '回复',
+    stop: '停止',
+    retry: '重试',
+    connect: '连接',
+    owner: '所有者',
+    source: '来源',
+    profile: '配置',
+    provider: '提供商',
+    model: '模型',
+    description: '描述',
+    unknown: '未知',
+    loadMore: '加载更多',
+    coverageNote: '实时状态仅涵盖已连接的 Hermes 进程。空闲不代表已完成。',
+    promptHint: '打开会话以回应审批或问题。',
+    history: '历史覆盖范围',
+    ready: '就绪',
+    onDemand: '按需连接',
+    offline: '离线',
+    unsupported: '不支持',
+    partial: '部分可用',
+    allQuiet: '一切安静',
+    allQuietHint: '运行中和等待输入的会话会保留在此。已完成的对话在15分钟后消失；查看历史请切换到“所有会话”。',
+    needYouCount: count => `${count} 个需要你`,
+    workingCount: count => `${count} 个工作中`,
+    closePreview: '关闭预览',
+    replyPlaceholder: '回复…',
+    noPreview: '暂无预览。',
+    shown: (visible, total) => `显示 ${visible} / ${total} 个会话`,
     subtitle: '当前回合的子代理实时活动。',
     emptyTitle: '暂无活跃子代理',
     emptyDesc: '当某个回合派发任务时，子代理会在此实时显示进度。',
@@ -2661,6 +2764,7 @@ export const zh: Translations = {
       copyIdFailed: '无法复制会话 ID',
 
       sessionActions: '会话操作',
+      archiveSession: '归档会话',
       sessionRunning: '会话运行中',
       needsInput: '需要你输入',
       waitingForAnswer: '正在等待你的回答',
@@ -3350,6 +3454,9 @@ export const zh: Translations = {
       showTerminal: '显示终端',
       hideTerminal: '隐藏终端',
       gateway: '网关',
+      backend: '后端',
+      messagingStopped: '消息网关已停止',
+      messagingDegraded: name => `${name} 异常`,
       gatewayReady: '就绪',
       gatewayNeedsSetup: '需要设置',
       gatewayUnavailable: '推理不可用',
@@ -3542,6 +3649,11 @@ export const zh: Translations = {
       address: '地址',
       addressPlaceholder: '输入地址',
       blankPageBody: '在上方输入地址开始浏览，或让 Hermes 打开一个页面。',
+      noGuestTitle: '页面将在浏览器标签页中打开',
+      noGuestBody:
+        '此版本的 Hermes 在浏览器中运行，无法在面板内嵌入其他网站。在上方输入地址，Hermes 会在新的浏览器标签页中打开它。',
+      noGuestOpen: url => `在浏览器标签页中打开 ${url}`,
+      openBlocked: '浏览器阻止了新标签页。请为此页面允许弹出窗口后重试。',
       finishedRestarting: message => `Hermes 已完成预览服务器重启${message ? `: ${message}` : ''}`,
       failedRestarting: message => `服务器重启失败：${message}`,
       unknownError: '未知错误',
@@ -3628,6 +3740,10 @@ export const zh: Translations = {
       copyUrl: '复制 URL',
       copyResolvedUrl: '复制解析后的 URL'
     },
+    file: {
+      openPreview: '在预览中打开',
+      openDefaultApp: '用默认应用打开'
+    },
     image: {
       copyImage: '复制图片',
       copyImageAddress: '复制图片地址',
@@ -3665,6 +3781,7 @@ export const zh: Translations = {
       refresh: '刷新',
       moreActions: '更多操作',
       branchNewChat: '在新对话中分支',
+      copyMessage: '复制消息',
       react: '回应',
       dismissError: '关闭错误',
       errorLayers: {
@@ -3726,6 +3843,7 @@ export const zh: Translations = {
       gatewayDisconnected: 'Hermes 网关未连接',
       sendFailed: '无法发送澄清响应',
       loadingQuestion: '正在加载问题…',
+      restoring: '正在恢复此问题 — 稍后即可回答',
       other: '其他 (输入你的答案)',
       placeholder: '输入你的答案…',
       skip: '跳过',
@@ -3734,9 +3852,16 @@ export const zh: Translations = {
       confirmAndContinueLabel: '确认并继续',
       answeredBadge: '已回答',
       questionProgress: (answered, total) => `已回答 ${answered}/${total}`,
+      questionGroup: total => `有 ${total} 个问题待回答`,
       lateAnswer: (question, choice) => `关于"${question}" — 我的回答: ${choice}`,
       lateAnswerTip: '将此回答起草为后续消息',
-      lateAnswerHint: '此问题已不再等待回答。选择一个选项会将其起草为后续消息。'
+      lateAnswerHint: '此问题已不再等待回答。选择一个选项会将其起草为后续消息。',
+      addNote: '添加备注',
+      addNoteFor: label => `为${label}添加备注`,
+      note: '备注',
+      noteFor: label => `${label}的备注`,
+      notePlaceholder: '添加可选备注…',
+      selected: '已选择'
     },
     mcpSetup: {
       installTitle: server => `添加 ${server} MCP 服务器？`,
@@ -3891,6 +4016,8 @@ export const zh: Translations = {
     deleteFailed: '删除失败',
     archived: '已归档',
     archiveFailed: '归档失败',
+    archivedUndoMessage: '会话已归档',
+    undoArchiveFailed: '撤销失败',
     cwdChangeFailed: '工作目录更改失败',
     cwdStagedTitle: '工作目录已暂存',
     cwdStagedMessage: '重启桌面后端后，工作目录更改才会应用到当前活跃会话。',
@@ -3996,4 +4123,10 @@ export const zh: Translations = {
       toggle: open => `${open ? '显示' : '隐藏'}侧边栏`
     }
   }
-}
+})
+
+// Merge over `en` like the sibling locales (ja / zh-hant / ar): the authored
+// catalog above is complete today, and defineLocale() keeps any future
+// en-only key rendering as readable English fallback instead of `undefined`
+// at runtime. The parity test guards against relying on that fallback.
+export const zh = defineLocale(zhAuthored)

@@ -4,6 +4,7 @@ import { useLocation, useNavigate } from 'react-router'
 import { closeActiveTab } from '@/app/chat/close-tab'
 import { hudTargetSessionId } from '@/app/hud/handoff'
 import { setTerminalTakeover } from '@/app/right-sidebar/store'
+import { interactiveTerminalAvailable } from '@/app/right-sidebar/terminal/capability'
 import { closeActiveTerminal, createTerminal, cycleTerminal } from '@/app/right-sidebar/terminal/terminals'
 import { appViewForPath, isOverlayView } from '@/app/routes'
 import {
@@ -245,18 +246,31 @@ export function useKeybinds(deps: KeybindRuntimeDeps): void {
     // ⌘J toggles the right sidebar — but a layout with no right side (e.g.
     // terminal-on-bottom) would leave it a dead key, so it falls back to the
     // terminal there. The single "secondary panel" toggle.
-    'view.toggleRightSidebar': () =>
-      layoutHasRootSide('right') ? toggleFileBrowserOpen() : togglePaneVisible('terminal'),
+    'view.toggleRightSidebar': () => {
+      if (layoutHasRootSide('right')) {
+        toggleFileBrowserOpen()
+      } else if (interactiveTerminalAvailable()) {
+        togglePaneVisible('terminal')
+      }
+    },
     'view.toggleReview': toggleReview,
     'view.toggleStatusbar': toggleStatusbarVisible,
     'view.toggleTabStrip': () => void toggleTargetZoneTabStrip(),
     'view.showFiles': showFiles,
     'view.showBrowser': openBrowserTab,
     'view.toggleHud': () => toggleHud(hudTargetSessionId()),
-    'view.showTerminal': () => togglePaneVisible('terminal'),
+    'view.showTerminal': () => {
+      if (interactiveTerminalAvailable()) {
+        togglePaneVisible('terminal')
+      }
+    },
     // Create first so the pane's open-effect ensure sees a non-empty set and
     // doesn't also spawn one — net effect is exactly one fresh terminal.
     'view.newTerminal': () => {
+      if (!interactiveTerminalAvailable()) {
+        return
+      }
+
       createTerminal()
       setTerminalTakeover(true)
     },

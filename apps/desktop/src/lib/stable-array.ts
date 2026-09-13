@@ -15,3 +15,9 @@ export const stableRecord = <T>(
 
   return keys.length === Object.keys(prev).length && keys.every(k => prev[k] === next[k]) ? prev : Object.freeze(next)
 }
+
+/** {@link stableArray} for a Set: keeps `prev`'s reference when it holds the
+ *  exact same members as `next`, so a computed atom rebuilding a Set every
+ *  tick doesn't churn subscribers whose membership didn't actually change. */
+export const stableSet = <T>(prev: ReadonlySet<T>, next: Set<T>): ReadonlySet<T> =>
+  prev.size === next.size && [...next].every(v => prev.has(v)) ? prev : next

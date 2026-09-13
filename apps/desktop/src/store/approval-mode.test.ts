@@ -19,7 +19,7 @@ describe('profile-scoped approval mode cache', () => {
     const request = vi.fn(async () => ({ value: 'manual' }))
     await syncApprovalModeForProfile(request, 'default')
 
-    expect(request).toHaveBeenCalledWith('config.get', { key: 'approvals.mode' })
+    expect(request).toHaveBeenCalledWith('config.get', { key: 'approvals.mode', profile: 'default' })
     expect(approvalModeForProfile('default')).toBe('manual')
   })
 
@@ -36,6 +36,29 @@ describe('profile-scoped approval mode cache', () => {
     expect(approvalModeForProfile('work')).toBe('manual')
     expect(approvalModeForProfile('personal')).toBe('off')
     expect(approvalModeForProfile('default')).toBe('smart')
+  })
+
+  it('asks the backend for the SAME profile it caches under', async () => {
+    // Regression: approval mode is profile-scoped config and one backend
+    // serves every profile, so an unscoped read answered for whichever
+    // profile launched that backend. A profile configured `smart` therefore
+    // settled to the launch profile's `manual` right after session start.
+    const request = vi.fn(async () => ({ value: 'smart' }))
+    await syncApprovalModeForProfile(request, 'work')
+
+    expect(request).toHaveBeenCalledWith('config.get', { key: 'approvals.mode', profile: 'work' })
+
+    // A mode change during the session must write back to that same profile,
+    // or the next sync reverts the menu and another profile's policy changed.
+    const write = vi.fn(async () => ({ value: 'off' }))
+    await setApprovalModeForProfile(write, 'work', 'off')
+
+    expect(write).toHaveBeenCalledWith('config.set', {
+      key: 'approvals.mode',
+      profile: 'work',
+      value: 'off'
+    })
+    expect(approvalModeForProfile('work')).toBe('off')
   })
 
   it('rolls consecutive failed writes back to the last authoritative value', async () => {

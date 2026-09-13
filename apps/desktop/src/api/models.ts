@@ -21,7 +21,8 @@ export function getGlobalModelInfo(profile?: null | string): Promise<ModelInfoRe
 export function getUsageAnalytics(days = 30, profile?: ProfileScope): Promise<AnalyticsResponse> {
   return window.hermesDesktop.api<AnalyticsResponse>({
     ...capabilityScoped(profile),
-    path: `/api/analytics/usage?days=${Math.max(1, Math.floor(days))}`
+    path: `/api/analytics/usage?days=${Math.max(1, Math.floor(days))}`,
+    timeoutMs: STARTUP_REQUEST_TIMEOUT_MS
   })
 }
 
@@ -70,7 +71,8 @@ export function getRecommendedDefaultModel(
 ): Promise<RecommendedDefaultModel> {
   return hermesApi<RecommendedDefaultModel>({
     ...profileScoped(profile),
-    path: `/api/model/recommended-default?provider=${encodeURIComponent(provider)}`
+    path: `/api/model/recommended-default?provider=${encodeURIComponent(provider)}`,
+    timeoutMs: STARTUP_REQUEST_TIMEOUT_MS
   })
 }
 
@@ -93,14 +95,16 @@ export function setGlobalModel(
 export function getAuxiliaryModels(profile?: null | string): Promise<AuxiliaryModelsResponse> {
   return hermesApi<AuxiliaryModelsResponse>({
     ...profileScoped(profile),
-    path: '/api/model/auxiliary'
+    path: '/api/model/auxiliary',
+    timeoutMs: STARTUP_REQUEST_TIMEOUT_MS
   })
 }
 
 export function getMoaModels(profile?: null | string): Promise<MoaConfigResponse> {
   return hermesApi<MoaConfigResponse>({
     ...profileScoped(profile),
-    path: '/api/model/moa'
+    path: '/api/model/moa',
+    timeoutMs: STARTUP_REQUEST_TIMEOUT_MS
   })
 }
 

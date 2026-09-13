@@ -14,7 +14,7 @@ import { sessionRecency, type SidebarProjectTree } from './workspace-groups'
 export const SIDEBAR_GROUP_PAGE = 5
 
 // Recent sessions previewed under each project in the overview.
-export const PROJECT_PREVIEW_COUNT = 3
+export const PROJECT_PREVIEW_COUNT = 8
 
 // Max concurrent `git worktree list` probes when a project spans many repos.
 const WORKTREE_PROBE_CONCURRENCY = 4
@@ -42,8 +42,16 @@ const projectActivityTime = (project: SidebarProjectTree): number =>
   )
 
 // The project's most-recent sessions, for the overview preview under each row.
+// Archived is filtered defensively even though the source lanes should never
+// carry one (see workspace-groups.ts's `isLiveArchived`): this reads whatever
+// `project.repos[].groups[].sessions` holds at call time, and staying archived-safe
+// here means the invariant holds even if a future caller feeds it a hydrated
+// (drilled-in) tree instead of the empty-lane overview shape it expects today.
 export const latestProjectSessions = (project: SidebarProjectTree, limit: number): SessionInfo[] =>
-  [...projectSessions(project)].sort((a, b) => sessionRecency(b) - sessionRecency(a)).slice(0, limit)
+  [...projectSessions(project)]
+    .filter(session => session.archived !== true)
+    .sort((a, b) => sessionRecency(b) - sessionRecency(a))
+    .slice(0, limit)
 
 // Home is a fixture, not a project: it always leads the overview, above the
 // active project and outside any hand-picked order.

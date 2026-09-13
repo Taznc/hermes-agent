@@ -22,6 +22,9 @@ DELEGATED_CHILD_ENV_MARKER = "HERMES_DELEGATED_CHILD_CONTEXT"
 KANBAN_ENV_KEYS: tuple[str, ...] = (
     "HERMES_KANBAN_TASK", "HERMES_KANBAN_RUN_ID", "HERMES_KANBAN_CLAIM_LOCK",
     "HERMES_KANBAN_GOAL_MODE", "HERMES_KANBAN_GOAL_MAX_TURNS",
+    # Fork: the explicit-intent pin stamp. Board/location survive (upstream keeps routing), but an
+    # INHERITED stamp would let a descendant's stale pin pass _pin_is_honored's override arm.
+    "HERMES_KANBAN_PIN_HOME",
 )
 
 

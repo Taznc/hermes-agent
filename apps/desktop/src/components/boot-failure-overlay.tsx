@@ -12,12 +12,14 @@ import { ChevronLeft, ExternalLink, FileText, Loader2, LogIn, RefreshCw, Sliders
 import { $desktopBoot } from '@/store/boot'
 import { notify, notifyError } from '@/store/notifications'
 import { $desktopOnboarding } from '@/store/onboarding'
+import { performWebReload } from '@/store/web-reload'
 
 import type { RemoteReauth } from './boot-failure-reauth'
 import {
   deriveProviderShape,
   isRemoteConfig,
   isRemoteReauthFailure,
+  isWsAuthRejectedFailure,
   signInLabel,
   sshFailureMessage
 } from './boot-failure-reauth'
@@ -147,13 +149,13 @@ export function BootFailureOverlay() {
   const retry = async () => {
     setBusy('retry')
     await window.hermesDesktop?.resetBootstrap().catch(() => undefined)
-    window.location.reload()
+    performWebReload()
   }
 
   const repair = async () => {
     setBusy('repair')
     await window.hermesDesktop?.repairBootstrap().catch(() => undefined)
-    window.location.reload()
+    performWebReload()
   }
 
   const switchToLocalGateway = async () => {
@@ -209,7 +211,7 @@ export function BootFailureOverlay() {
         }
 
         notify({ kind: 'success', title: t.boot.failure.signedInTitle, message: t.boot.failure.signedInMessage })
-        window.location.reload()
+        performWebReload()
 
         return
       }
@@ -226,7 +228,17 @@ export function BootFailureOverlay() {
     }
   }
 
-  const openLogs = () => void window.hermesDesktop?.revealLogs().catch(() => undefined)
+  const openLogs = () => {
+    void window.hermesDesktop
+      ?.revealLogs()
+      .then(result => {
+        if (!result?.ok) {
+          notifyError(new Error(result?.error || 'reveal logs failed'), copy.openLogsFailed)
+        }
+      })
+      .catch(err => notifyError(err, copy.openLogsFailed))
+  }
+
   const copy = t.boot.failure
 
   const label = signInLabel(remoteReauth, {
@@ -280,6 +292,21 @@ export function BootFailureOverlay() {
   // progress. When set, the recovery screen leads with the cloud-specific
   // guidance instead of the generic remote-failure copy (#85335).
   const cloudDown = Boolean(boot.isCloudBackendDown)
+  // Confirmed WS-credential rejection while the gateway itself answered
+  // healthy (#t_360b3fcb) — see probeGatewayHealthOk / the up-front
+  // no-token check in use-gateway-boot.ts. Distinct from remoteReauth
+  // (OAuth-specific): this covers the loopback-token / web-spike path where
+  // there is no sign-in flow to drive from here, only a fresh credential
+  // link. Checked ahead of the generic remote/local branches so the
+  // gateway-is-fine copy wins over "couldn't start".
+  const wsAuthRejected = isWsAuthRejectedFailure(boot.error)
+  // The web-spike bridge (web-bridge-shim.ts) deliberately omits these
+  // Electron-only capabilities, so a served-as-web-app build must not offer
+  // buttons that silently no-op (repair) or route into an EmptyState
+  // (gateway settings — see gateway-settings.tsx's own getConnectionConfig
+  // check).
+  const canRepair = Boolean(window.hermesDesktop?.repairBootstrap)
+  const canOpenGatewaySettings = Boolean(window.hermesDesktop?.getConnectionConfig)
 
   if (remoteReauth) {
     actions = [
@@ -294,6 +321,17 @@ export function BootFailureOverlay() {
       localAction
     ]
     hint = copy.remoteSignInHint(label)
+  } else if (wsAuthRejected) {
+    // retryAction reloads via performWebReload() and reconnects with the
+    // exact same connection descriptor — offering it here would silently
+    // redial the identical tokenless URL into the same rejection forever,
+    // which is the dead end the card explicitly calls out (#t_360b3fcb
+    // scope item 4). There is no in-app action that can mint a fresh
+    // credential, so point at Settings when the bridge supports editing the
+    // connection (Electron token mode) and otherwise leave only the honest
+    // hint — never a button that looks actionable but isn't.
+    actions = [{ ...settingsAction, variant: 'secondary' }]
+    hint = copy.wsAuthHint
   } else if (cloudDown) {
     // A Nous Cloud agent is down — the user cannot restart the managed
     // instance and Repair is local-only. Lead with the paths that actually
@@ -340,6 +378,22 @@ export function BootFailureOverlay() {
     hint = copy.repairHint
   }
 
+  // Drop actions the web-spike bridge can't back: repair silently reloads
+  // with no effect, and gateway settings routes into its own "unavailable"
+  // EmptyState. Filtering here (rather than gating each action's onClick)
+  // keeps a build that lacks the capability from ever showing the button.
+  actions = actions.filter(action => {
+    if (action.key === 'repair') {
+      return canRepair
+    }
+
+    if (action.key === 'settings') {
+      return canOpenGatewaySettings
+    }
+
+    return true
+  })
+
   if (view === 'connect') {
     return (
       <div
@@ -381,10 +435,22 @@ export function BootFailureOverlay() {
           <ErrorIcon className="mt-0.5" size="1.25rem" />
           <div>
             <h2 className="text-[0.9375rem] font-semibold tracking-tight">
-              {remoteReauth ? copy.remoteTitle : cloudDown ? copy.cloudDownTitle : copy.title}
+              {remoteReauth
+                ? copy.remoteTitle
+                : wsAuthRejected
+                  ? copy.wsAuthTitle
+                  : cloudDown
+                    ? copy.cloudDownTitle
+                    : copy.title}
             </h2>
             <p className="mt-1 text-[0.8125rem] leading-5 text-(--ui-text-tertiary)">
-              {remoteReauth ? copy.remoteDescription : cloudDown ? copy.cloudDownDescription : copy.description}
+              {remoteReauth
+                ? copy.remoteDescription
+                : wsAuthRejected
+                  ? copy.wsAuthDescription
+                  : cloudDown
+                    ? copy.cloudDownDescription
+                    : copy.description}
             </p>
           </div>
         </div>

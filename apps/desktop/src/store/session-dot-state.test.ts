@@ -3,6 +3,7 @@ import { afterEach, beforeEach, describe, expect, it } from 'vitest'
 import { createClientSessionState } from '@/lib/chat-runtime'
 import type { SessionInfo } from '@/types/hermes'
 
+import { $sidebarStatusFilter } from './layout'
 import {
   $cronSessions,
   $messagingSessions,
@@ -15,7 +16,9 @@ import {
 } from './session'
 import {
   $delegatingSessionIds,
+  $liveTurnSessionIds,
   $sessionDotStateById,
+  $sidebarStatusExcludedIds,
   $unreadSessionCount,
   hasLiveTurn,
   showsRunningArc,
@@ -238,5 +241,84 @@ describe('$unreadSessionCount (titlebar badge)', () => {
 
     expect($unreadSessionCount.get()).toBe(0)
     expect($sessionDotStateById.get()['cron-1']).not.toBe('unread')
+  })
+})
+
+describe('$sidebarStatusExcludedIds', () => {
+  beforeEach(() => {
+    clearAllSessionStates()
+    $sessions.set([])
+    $sidebarStatusFilter.set([])
+  })
+
+  afterEach(() => {
+    clearAllSessionStates()
+    $sessions.set([])
+    $sidebarStatusFilter.set([])
+  })
+
+  it('is empty (and reference-stable) when no status filter is active', () => {
+    setSessions([storedRow('s1'), storedRow('s2', { unread: true })])
+
+    const first = $sidebarStatusExcludedIds.get()
+    expect(first.size).toBe(0)
+
+    // A dot-state-adjacent change with the filter off must not allocate a new set.
+    setSessions([storedRow('s1'), storedRow('s2', { unread: true }), storedRow('s3')])
+    expect($sidebarStatusExcludedIds.get()).toBe(first)
+  })
+
+  it('excludes sessions whose status bucket is not in the active filter', () => {
+    setSessions([storedRow('s1', { unread: true }), storedRow('s2')])
+    $sidebarStatusFilter.set(['unread'])
+
+    const excluded = $sidebarStatusExcludedIds.get()
+    expect(excluded.has('s1')).toBe(false)
+    expect(excluded.has('s2')).toBe(true)
+  })
+
+  it('keeps the same set reference when a dot-state tick does not change the outcome', () => {
+    setSessions([storedRow('s1', { unread: true }), storedRow('s2')])
+    $sidebarStatusFilter.set(['unread'])
+
+    const first = $sidebarStatusExcludedIds.get()
+
+    // Publish an unrelated dot-state-adjacent tick (a working session that
+    // isn't in the status filter's scope at all) — the excluded MEMBERSHIP
+    // doesn't change, so the reference must be preserved.
+    publishSessionState('rt-unrelated', createClientSessionState('s2'))
+    expect($sidebarStatusExcludedIds.get()).toBe(first)
+  })
+})
+
+describe('$liveTurnSessionIds', () => {
+  afterEach(() => {
+    clearAllSessionStates()
+    $sessions.set([])
+  })
+
+  it('includes a session with a live (working) turn', () => {
+    setSessions([storedRow('s1')])
+    publishSessionState('rt1', { ...createClientSessionState('s1'), busy: true })
+
+    expect($liveTurnSessionIds.get()).toContain('s1')
+  })
+
+  it('excludes an idle session', () => {
+    setSessions([storedRow('s1')])
+
+    expect($liveTurnSessionIds.get()).not.toContain('s1')
+  })
+
+  it('keeps the same array reference across an unrelated recompute', () => {
+    setSessions([storedRow('s1')])
+    publishSessionState('rt1', { ...createClientSessionState('s1'), busy: true })
+
+    const first = $liveTurnSessionIds.get()
+
+    // Publishing the SAME state again (no actual transition) must not
+    // reallocate the membership list.
+    publishSessionState('rt1', { ...createClientSessionState('s1'), busy: true })
+    expect($liveTurnSessionIds.get()).toBe(first)
   })
 })

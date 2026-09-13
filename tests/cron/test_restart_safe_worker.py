@@ -16,6 +16,29 @@ from unittest.mock import Mock
 import pytest
 
 
+@pytest.fixture(autouse=True)
+def _placement_gives_no_answer(monkeypatch):
+    """State this file's PLACEMENT input: "the kernel says nothing".
+
+    The restart-safe tests here simulate topology through IDENTITY
+    (``_is_supervised_gateway_process``, ``INVOCATION_ID``, ``SYSTEMD_EXEC_PID``), which
+    is data a test can set. Placement is not: ``_scope_needed_by_cgroup_placement`` reads
+    the TEST RUNNER's own real cgroup, so leaving it live lets the verdict be decided by
+    where the suite happens to run — inside a supervised ``hermes-*`` unit it answers True
+    and wraps a command a test asserts is unwrapped; inside a ``hermes-worker-*`` scope it
+    answers "already isolated" and skips a wrap a test asserts happens.
+
+    Pinning it to ``None`` (a cgroup-v1 host, or a container that hides
+    ``/proc/self/cgroup``) makes these exercise the identity fallback deterministically on
+    any host. Placement itself is covered by
+    ``tests/tools/test_process_registry.py::TestSupervisedUnitCgroupPlacement`` and, live,
+    by ``tests/hermes_cli/test_kanban_gateway_restart_handoff.py``.
+    """
+    monkeypatch.setattr(
+        "tools.process_registry._scope_needed_by_cgroup_placement", lambda: None
+    )
+
+
 @pytest.fixture
 def execution_ledger(tmp_path, monkeypatch):
     import cron.executions as executions
@@ -85,8 +108,11 @@ def test_restart_safe_gateway_child_fails_closed_without_scope(monkeypatch):
     monkeypatch.setenv("INVOCATION_ID", "managed-service")
     monkeypatch.setattr(process_registry, "_systemd_run_user_scope_available", lambda: False)
 
-    with pytest.raises(RuntimeError, match="systemd-run --user --scope is unavailable"):
-        process_registry.restart_safe_gateway_child_argv(
+    with pytest.raises(
+        process_registry.RestartSafeScopeUnavailable,
+        match="systemd-run --user --scope is unavailable",
+    ):
+        process_registry.restart_safe_supervised_child_argv(
             ["python", "worker.py"], unit_suffix="cron-job-1"
         )
 
@@ -96,8 +122,12 @@ def test_restart_safe_gateway_child_is_unchanged_outside_managed_gateway(monkeyp
 
     command = ["python", "worker.py"]
     monkeypatch.setattr(process_registry, "_is_supervised_gateway_process", lambda: False)
+    # A CI runner may itself be a systemd service child; only the unit's MAIN process
+    # (SYSTEMD_EXEC_PID == our pid) qualifies, so clear the markers explicitly.
+    monkeypatch.delenv("INVOCATION_ID", raising=False)
+    monkeypatch.delenv("SYSTEMD_EXEC_PID", raising=False)
 
-    assert process_registry.restart_safe_gateway_child_argv(
+    assert process_registry.restart_safe_supervised_child_argv(
         command, unit_suffix="cron-job-1"
     ) is command
 
@@ -112,7 +142,7 @@ def test_restart_safe_gateway_child_never_probes_systemd_off_linux(monkeypatch):
     monkeypatch.setattr(process_registry, "_systemd_run_user_scope_available", probe)
     monkeypatch.setenv("INVOCATION_ID", "managed-service")
 
-    assert process_registry.restart_safe_gateway_child_argv(
+    assert process_registry.restart_safe_supervised_child_argv(
         command, unit_suffix="cron-job-1"
     ) is command
     probe.assert_not_called()
@@ -184,6 +214,73 @@ def test_external_worker_refuses_to_run_without_durable_ownership(
     assert not ack.exists()
 
 
+def test_external_worker_waiter_holds_its_guard_until_the_worker_process_exits(
+    tmp_path, monkeypatch
+):
+    """A terminal execution row no longer means the worker is finished.
+
+    The worker commits its terminal row BEFORE Bot Chat delivery, and that send is a whole agent
+    turn (``cron.bot_chat_delivery_timeout_seconds``, default 600s). Returning on the row would
+    drop ``_restart_safe_waiter_job_ids`` — the guard ``mark_running_jobs_interrupted`` reads to
+    withhold shutdown marking from these jobs — and reap the handoff artifacts while delivery is
+    still running, re-arming the interruption that ordering exists to prevent. Only process exit
+    ends the wait.
+    """
+    import cron.scheduler as scheduler
+
+    job_id = "delivering-worker"
+    payload = tmp_path / "exec-1.json"
+    payload.write_text("{}", encoding="utf-8")
+    # Terminal from the very first read: the run finished, delivery has not.
+    monkeypatch.setattr(
+        scheduler, "get_execution", lambda _id: {"id": "exec-1", "status": "completed"}
+    )
+
+    observed_while_alive = []
+
+    class DeliveringWorker:
+        """Alive through three waits (delivery), then exits."""
+
+        def __init__(self):
+            self.wait_calls = 0
+
+        def wait(self, timeout=None):
+            self.wait_calls += 1
+            observed_while_alive.append(
+                {
+                    "guard_held": job_id in scheduler._restart_safe_waiter_job_ids,
+                    "handoff_present": payload.exists(),
+                }
+            )
+            if self.wait_calls < 3:
+                raise subprocess.TimeoutExpired(cmd="worker", timeout=timeout)
+            return 0
+
+    process = DeliveringWorker()
+    scheduler._restart_safe_waiter_job_ids.add(job_id)
+    try:
+        assert scheduler._wait_for_external_cron_worker(
+            process,
+            execution_id="exec-1",
+            job_id=job_id,
+            handoff_files=(payload,),
+        ) is True
+    finally:
+        scheduler._restart_safe_waiter_job_ids.discard(job_id)
+
+    # It kept waiting on the PROCESS rather than returning on the terminal row...
+    assert process.wait_calls == 3
+    # ...and neither the shutdown guard nor the handoff artifacts were released mid-delivery.
+    assert observed_while_alive == [
+        {"guard_held": True, "handoff_present": True},
+        {"guard_held": True, "handoff_present": True},
+        {"guard_held": True, "handoff_present": True},
+    ]
+    # Only after exit is the guard dropped and the handoff reaped.
+    assert job_id not in scheduler._restart_safe_waiter_job_ids
+    assert not payload.exists()
+
+
 def test_launch_external_worker_uses_restart_safe_scope_and_acknowledges(
     tmp_path, monkeypatch
 ):
@@ -193,15 +290,21 @@ def test_launch_external_worker_uses_restart_safe_scope_and_acknowledges(
     monkeypatch.setattr(scheduler, "_get_hermes_home", lambda: tmp_path)
     wrapped_commands = []
 
-    def wrap(command, *, unit_suffix):
+    def wrap(command, *, unit_suffix, env=None):
         wrapped_commands.append((command, unit_suffix))
         return ["scope", "--", *command]
 
     monkeypatch.setattr(
-        "tools.process_registry.restart_safe_gateway_child_argv", wrap
+        "tools.process_registry.restart_safe_supervised_child_argv", wrap
     )
 
     class FakeProcess:
+        """Alive for the ownership acknowledgement, then exits.
+
+        The waiter deliberately does NOT return on a terminal execution row (the worker
+        terminalizes before delivering), so this worker has to actually exit to end the wait.
+        """
+
         returncode = None
 
         def poll(self):
@@ -209,6 +312,7 @@ def test_launch_external_worker_uses_restart_safe_scope_and_acknowledges(
 
         def wait(self, timeout=None):
             if self.returncode is None:
+                self.returncode = 0
                 raise subprocess.TimeoutExpired(cmd="worker", timeout=timeout)
             return self.returncode
 
@@ -230,13 +334,7 @@ def test_launch_external_worker_uses_restart_safe_scope_and_acknowledges(
     handoff = Mock(return_value={"id": "exec-1", "handoff_pending": 1})
     monkeypatch.setattr(scheduler, "mark_execution_handoff_pending", handoff)
     monkeypatch.setattr(scheduler.subprocess, "Popen", popen)
-    observed_statuses = iter(
-        [
-            {"id": "exec-1", "status": "running"},
-            {"id": "exec-1", "status": "completed"},
-        ]
-    )
-    get = Mock(side_effect=lambda _execution_id: next(observed_statuses))
+    get = Mock(return_value={"id": "exec-1", "status": "completed"})
     monkeypatch.setattr(scheduler, "get_execution", get)
     monkeypatch.setenv("ANTHROPIC_API_KEY", "should-not-cross-profile")
     from agent.secret_scope import set_multiplex_active
@@ -251,7 +349,9 @@ def test_launch_external_worker_uses_restart_safe_scope_and_acknowledges(
     assert spawned[0][1]["start_new_session"] is True
     assert "ANTHROPIC_API_KEY" not in spawned[0][1]["env"]
     handoff.assert_called_once_with("exec-1")
-    assert get.call_count == 2
+    # The row is read only after the worker exits — a terminal row is no longer a wakeup, since
+    # the worker terminalizes before it delivers.
+    assert get.call_count == 1
     assert payloads[0]["multiplex_active"] is True
     # Once the attempt is terminal the parent reaps its own handoff artifacts.
     assert not (tmp_path / "cron/external-workers/exec-1.json").exists()
@@ -311,12 +411,12 @@ def test_launch_external_worker_stays_in_process_outside_managed_gateway(
 
     command_calls = []
 
-    def unchanged(command, *, unit_suffix):
+    def unchanged(command, *, unit_suffix, env=None):
         command_calls.append((command, unit_suffix))
         return command
 
     monkeypatch.setattr(
-        "tools.process_registry.restart_safe_gateway_child_argv", unchanged
+        "tools.process_registry.restart_safe_supervised_child_argv", unchanged
     )
     popen = Mock()
     monkeypatch.setattr(scheduler.subprocess, "Popen", popen)
@@ -552,6 +652,10 @@ def test_managed_gateway_restart_preserves_active_worker_and_single_side_effect(
         "from cron import scheduler\n"
         "from tools import process_registry\n"
         "process_registry._is_supervised_gateway_process = lambda: True\n"
+        # The harness simulates the gateway by IDENTITY; the subprocess's real cgroup is
+        # the test runner's, so neutralize placement or a runner already inside a worker
+        # scope reads "already isolated" and the worker never gets its own unit.
+        "process_registry._scope_needed_by_cgroup_placement = lambda: None\n"
         f"job = json.loads(pathlib.Path({str(payload)!r}).read_text())\n"
         "if not scheduler.run_one_job(job, adapters=None, loop=None):\n"
         "    raise SystemExit('worker was not isolated')\n"

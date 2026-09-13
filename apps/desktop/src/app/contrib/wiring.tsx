@@ -35,6 +35,7 @@ import { SendDiagnosticsHost } from '@/components/send-diagnostics-dialog'
 import { TipHost } from '@/components/tips'
 import { emitGatewayEvent } from '@/contrib/events'
 import { getLatestSessionMessages } from '@/hermes'
+import { useI18n } from '@/i18n'
 import { type ChatMessage, chatMessageText, preserveLocalAssistantErrors, toChatMessages } from '@/lib/chat-messages'
 import { isMessagingSource } from '@/lib/session-source'
 import { latestSessionTodos } from '@/lib/todos'
@@ -46,7 +47,7 @@ import { requestVoiceConversationStart } from '@/store/composer'
 import { $activeConnectionId } from '@/store/connections'
 import { $cronReviewRequest, setCronFocusJobId } from '@/store/cron'
 import { $pinnedSessionIds, pinSession, restoreWorktree, unpinSession } from '@/store/layout'
-import { notifyError } from '@/store/notifications'
+import { dismissNotification, notify, notifyError } from '@/store/notifications'
 import { $previewTarget } from '@/store/preview'
 import {
   $activeGatewayProfile,
@@ -81,6 +82,7 @@ import {
   setBusy,
   setMessages
 } from '@/store/session'
+import { $sessionTiles } from '@/store/session-states'
 import { clearSessionTodos, setSessionTodos, todosForHydration } from '@/store/todos'
 import { armWakeWord, stopClientCapture } from '@/store/wake-word'
 import { isAuxiliaryWindow, isBrowserWindow, isHudWindow } from '@/store/windows'
@@ -128,7 +130,7 @@ import { useRouteResume } from '../session/hooks/use-route-resume'
 import { useSessionActions } from '../session/hooks/use-session-actions'
 import { useSessionListActions } from '../session/hooks/use-session-list-actions'
 import { useSessionStateCache } from '../session/hooks/use-session-state-cache'
-import { startWorkspaceSession } from '../session/workspace-session-target'
+import { consumeStartWorkSessionRequest, startWorkspaceSession } from '../session/workspace-session-target'
 import { PluginInstallModal } from '../settings/plugin-install-modal'
 import { useOverlayRouting } from '../shell/hooks/use-overlay-routing'
 import { useWindowControlsOverlayWidth } from '../shell/hooks/use-window-controls-overlay-width'
@@ -139,8 +141,8 @@ import {
   titlebarToolsWidthCss
 } from '../shell/titlebar'
 import { TitlebarControls } from '../shell/titlebar-controls'
-import { UpdatesOverlay } from '../updates-overlay'
 
+import { archiveUndoToastId, buildArchiveUndoToastInput } from './archive-undo-toast'
 import { ContribWiringContext } from './context'
 import {
   reconcileActiveTranscript,
@@ -177,6 +179,7 @@ export function ContribWiring({ children }: { children: ReactNode }) {
   const queryClient = useQueryClient()
   const location = useLocation()
   const navigate = useNavigate()
+  const { t } = useI18n()
 
   const busyRef = useRef(false)
   const creatingSessionRef = useRef(false)
@@ -227,6 +230,7 @@ export function ContribWiring({ children }: { children: ReactNode }) {
   const resumeExhaustedSessionId = useStore($resumeExhaustedSessionId)
   const sessionResumeRequest = useStore($sessionResumeRequest)
   const selectedStoredSessionId = useStore($selectedStoredSessionId)
+  const sessionTiles = useStore($sessionTiles)
   const messagingSessions = useStore($messagingSessions)
   const sessions = useStore($sessions)
   const activeConnectionId = useStore($activeConnectionId)
@@ -235,6 +239,19 @@ export function ContribWiring({ children }: { children: ReactNode }) {
   const boot = useStore($desktopBoot)
 
   const routedSessionId = routeSessionId(location.pathname)
+
+  // `openSession` marks this history entry only when it has already fronted a
+  // tile and is changing location solely to clear a full workspace page. Keep
+  // the marker valid only while that exact conversation is still tiled: a
+  // closed tile must fall back to normal route -> main resume behavior.
+  const preserveSessionTile = Boolean(
+    (location.state as { preserveSessionTile?: unknown } | null)?.preserveSessionTile &&
+      routedSessionId &&
+      sessionTiles.some(tile =>
+        sessions.some(session => sessionMatchesStoredId(session, tile.storedSessionId) && sessionMatchesStoredId(session, routedSessionId))
+      )
+  )
+
   const routedSessionIdRef = useRef(routedSessionId)
 
   routedSessionIdRef.current = routedSessionId
@@ -342,7 +359,7 @@ export function ContribWiring({ children }: { children: ReactNode }) {
 
   const { refreshHermesConfig, sttEnabled, voiceMaxRecordingSeconds } = useHermesConfig({ activeSessionIdRef })
 
-  const { applySavedMainModel, refreshCurrentModel, selectModel } = useModelControls({
+  const { applySavedMainModel, refreshCurrentModel, selectModel, selectRecommendedModel } = useModelControls({
     cacheOwnerConnectionId: activeConnectionId || undefined,
     cacheProfile: activeGatewayProfile,
     queryClient,
@@ -388,6 +405,11 @@ export function ContribWiring({ children }: { children: ReactNode }) {
       if (!storedSessionId || !runtimeSessionId) {
         return
       }
+
+      // MCP Apps are authenticated only by a one-shot live completion event.
+      // Keep cards already admitted by that event while this same session is
+      // rehydrated: the completed transcript is what supplies their matching
+      // tool row. Stored history never creates cards on its own.
 
       const storedProfile = $sessions.get().find(session => sessionMatchesStoredId(session, storedSessionId))?.profile
 
@@ -492,7 +514,8 @@ export function ContribWiring({ children }: { children: ReactNode }) {
     removeSession,
     resumeSession,
     selectSidebarItem,
-    startFreshSessionDraft
+    startFreshSessionDraft,
+    unarchiveSession
   } = useSessionActions({
     activeSessionId,
     activeSessionIdRef,
@@ -561,13 +584,13 @@ export function ContribWiring({ children }: { children: ReactNode }) {
   // "branch off into a new worktree" flow keeps the fresh-draft path — it
   // prefills the MAIN composer right after, so it has to own that surface.
   const startSessionInWorkspace = useCallback(
-    (path: null | string, options?: { openTab?: boolean }) => {
+    async (path: null | string, options?: { openTab?: boolean }): Promise<boolean> => {
       setWorkspaceScope('sessions')
 
       if (options?.openTab && mainChatOccupied(activeSessionIdRef.current, $selectedStoredSessionId.get())) {
-        void openNewSessionTile('center', { cwd: path, listed: false })
+        await openNewSessionTile('center', { cwd: path, listed: false })
 
-        return
+        return true
       }
 
       startWorkspaceSession({
@@ -578,6 +601,8 @@ export function ContribWiring({ children }: { children: ReactNode }) {
         requestGateway,
         startFreshSessionDraft
       })
+
+      return false
     },
     [activeSessionIdRef, openNewSessionTile, requestGateway, startFreshSessionDraft]
   )
@@ -594,12 +619,19 @@ export function ContribWiring({ children }: { children: ReactNode }) {
     }
 
     lastStartWorkTokenRef.current = startWorkSessionRequest.token
-    startSessionInWorkspace(startWorkSessionRequest.path, { openTab: startWorkSessionRequest.openTab })
 
-    if (startWorkSessionRequest.draft) {
-      requestComposerInsert(startWorkSessionRequest.draft, { target: 'main' })
-    }
-  }, [startSessionInWorkspace, startWorkSessionRequest])
+    setWorkspaceScope('sessions')
+    void consumeStartWorkSessionRequest({
+      insertDraft: requestComposerInsert,
+      isCurrent: () => startWorkSessionRequest.token === lastStartWorkTokenRef.current,
+      mainChatIsOccupied: mainChatOccupied(activeSessionIdRef.current, $selectedStoredSessionId.get()),
+      openFreshSurface: async path => {
+        await openNewSessionTile('center', { cwd: path, listed: false })
+      },
+      request: startWorkSessionRequest,
+      startMainSurface: path => void startSessionInWorkspace(path)
+    })
+  }, [activeSessionIdRef, openNewSessionTile, startSessionInWorkspace, startWorkSessionRequest])
 
   // "New project" DRAG completion: the dialog created a project that was
   // dropped onto a chat zone (tab-strip slot / pane edge / pane center). Open
@@ -753,6 +785,7 @@ export function ContribWiring({ children }: { children: ReactNode }) {
     freshDraftReady,
     gatewayState,
     locationPathname: location.pathname,
+    preserveSessionTile,
     resumeSession,
     resumeFailedSessionId,
     resumeExhaustedSessionId,
@@ -956,6 +989,60 @@ export function ContribWiring({ children }: { children: ReactNode }) {
     void archiveSession(sessionId)
   }, [archiveSession])
 
+  // Row-level one-click archive (#70ab279e): archives through the ONE
+  // canonical `archiveSession` action (mutation fencing, unread cleanup,
+  // tile/runtime cleanup — see its doc comment) with `{ withUndo: true }`,
+  // which opens a 10s undo window in store/session-archive-undo.ts, and
+  // surfaces a "Session archived — Undo" toast for that same window. The
+  // toast is shown synchronously right after kicking off the archive — the
+  // undo bookkeeping records its window synchronously too, before the
+  // backend PATCH settles — so the two windows stay in lockstep instead of
+  // the toast's clock starting late on a slow network. Toast id is keyed to
+  // the session id: archiving several sessions in quick succession stacks
+  // one toast per session (each up to the shared notification cap, with an
+  // eviction handler that commits rather than orphans a still-live undo)
+  // rather than one toast clobbering another, and each toast's Undo button
+  // closes over its OWN session id, so it can never restore the wrong row. A
+  // failed archive drops the (now-meaningless) toast and reports the failure
+  // instead — the canonical action has already rolled its optimistic removal
+  // back by the time the rejection reaches us.
+  const archiveSessionViaSidebar = useCallback(
+    (storedSessionId: string) => {
+      // Archiving the session currently on screen must also navigate away —
+      // the state layer only clears the selection atom (it doesn't own
+      // routing; see its own doc comment). Leaving the ROUTE pointed at the
+      // now-archived session trips useRouteResume's stuck-on-routed-session
+      // self-heal, which re-resumes (and so re-fetches/re-inserts) the very
+      // session this click just archived, silently undoing it.
+      if ($selectedStoredSessionId.get() === storedSessionId) {
+        startFreshSessionDraft(true)
+      }
+
+      const toastId = archiveUndoToastId(storedSessionId)
+      // Routes through the ONE canonical archive action (mutation fencing,
+      // unread cleanup, tile/runtime cleanup — see its own doc comment) with
+      // `withUndo: true`, which additionally opens the 10s undo window this
+      // toast represents. Never a separate/forked archive path (#548d0d33,
+      // issue 2).
+      const archived = archiveSession(storedSessionId, { withUndo: true })
+
+      notify(
+        buildArchiveUndoToastInput({
+          message: t.desktop.archivedUndoMessage,
+          onUndoFailed: err => notifyError(err, t.desktop.undoArchiveFailed),
+          storedSessionId,
+          undoLabel: t.common.undo
+        })
+      )
+
+      void archived.catch(err => {
+        dismissNotification(toastId)
+        notifyError(err, t.desktop.archiveFailed)
+      })
+    },
+    [archiveSession, startFreshSessionDraft, t]
+  )
+
   // Single global listener for every rebindable hotkey plus the on-screen
   // keybind editor's capture mode (same as DesktopController).
   useKeybinds({
@@ -993,7 +1080,7 @@ export function ContribWiring({ children }: { children: ReactNode }) {
   const nextActions: WiringActions = {
     onAddContextRef: composer.addContextRefAttachment,
     onAddUrl: url => composer.addContextRefAttachment(`@url:${formatRefValue(url)}`, url),
-    onArchiveSession: sessionId => void archiveSession(sessionId),
+    onArchiveSession: sessionId => archiveSessionViaSidebar(sessionId),
     onAttachDroppedItems: composer.attachDroppedItems,
     onAttachImageBlob: composer.attachImageBlob,
     onAttachPrCommentUrl: composer.attachPrCommentUrl,
@@ -1067,10 +1154,12 @@ export function ContribWiring({ children }: { children: ReactNode }) {
       triggerAndRefreshCronJobs(jobId, profileScope === ALL_PROFILES ? 'all' : profileScope)
         .then(() => undefined)
         .catch(() => undefined),
+    onUnarchiveSession: sessionId => void unarchiveSession(sessionId),
     getGateway: () => gatewayRef.current,
     openAgents,
     openCommandCenterSection,
     requestGateway,
+    selectRecommendedModel,
     selectModel,
     toggleCommandCenter
   }
@@ -1216,7 +1305,7 @@ export function ContribWiring({ children }: { children: ReactNode }) {
         ownerConnectionId={activeConnectionId || undefined}
         profile={activeGatewayProfile}
       />
-      <UpdatesOverlay />
+
       <GatewayConnectingOverlay />
       <BootFailureOverlay />
       <CommandPalette />

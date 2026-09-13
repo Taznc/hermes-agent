@@ -1,10 +1,8 @@
-"""New sessions must wake parked/stale cached MCP servers immediately.
+"""Parked MCP servers revive only after an intentional lifecycle request.
 
-Regression for #50170: after a keepalive failure parks a server, its tools
-are deregistered — so a NEW agent session starting up saw the tools silently
-absent and had no way to trigger recovery until the next timed self-probe
-(up to _PARKED_RETRY_INTERVAL later). register_mcp_servers now nudges any
-cached entry whose session is None via _signal_reconnect.
+Repeated discovery runs (including cron ticks) must not reconnect a parked
+server whose configuration is unchanged or disabled. An enabled configuration
+change is an intentional recovery request and wakes the retained task.
 """
 
 import pytest
@@ -31,8 +29,12 @@ def test_register_wakes_stale_cached_server(monkeypatch, tmp_path):
 
         def __init__(self, name):
             self.name = name
+            self._config = {"url": "http://127.0.0.1:9/mcp"}
             self._reconnect_event = _Event(name)
             self._registered_tool_names: list[str] = []
+
+        def _bind_config(self, config):
+            self._config = config
 
     class _Alive:
         session = object()
@@ -55,8 +57,29 @@ def test_register_wakes_stale_cached_server(monkeypatch, tmp_path):
         })
         # Both cached → no new connections attempted; existing names returned.
         assert "healthy-srv__tool" in result
-        # The parked (session=None) entry got a reconnect nudge; the healthy
-        # one was left alone.
+        # Repeated discovery with the same config does not override a parked
+        # server's explicit-reconnect gate.
+        assert woken == []
+
+        # Disabling a parked server is not a recovery request: retain the
+        # changed config so a later re-enable is detectable, but do not open a
+        # transport merely because discovery ran.
+        disabled_config = {"url": "http://127.0.0.1:9/mcp", "enabled": False}
+        _mcp_discovery.register_mcp_servers({
+            "parked-srv": disabled_config,
+            "healthy-srv": {"url": "http://127.0.0.1:9/mcp"},
+        })
+        assert stale._config == disabled_config
+        assert woken == []
+
+        # Removing enabled: false is an intentional re-enable and wakes the
+        # retained task exactly once through the production discovery path.
+        reenabled_config = {"url": "http://127.0.0.1:9/mcp"}
+        _mcp_discovery.register_mcp_servers({
+            "parked-srv": reenabled_config,
+            "healthy-srv": {"url": "http://127.0.0.1:9/mcp"},
+        })
+        assert stale._config == reenabled_config
         assert woken == ["parked-srv"]
     finally:
         mcp_tool._servers.pop("parked-srv", None)

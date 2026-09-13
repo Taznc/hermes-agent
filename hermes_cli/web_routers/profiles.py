@@ -57,7 +57,10 @@ def _warn_profile_read_error(profile: str, exc: Exception) -> None:
     _log.warning("profile session read failed for %r (reported only in the response "
                  "errors array): %s", profile, exc)
 
+from hermes_cli.web_routers.agent_overview import router as agent_overview_router
+
 sessions_router = APIRouter()
+sessions_router.include_router(agent_overview_router)
 router = APIRouter()
 
 # Late-bound web_server helpers (resolved at call time; cycle-safe, monkeypatch-transparent).
@@ -169,16 +172,20 @@ def _best_effort(log_msg: str, *args, fn, default=None):
         return default
 
 
-def _profile_targets(log_label: str, *, lightweight: bool) -> List[Tuple[str, Path]]:
+def _profile_targets(log_label: str, *, lightweight: bool,
+                     errors: Optional[List[Dict[str, str]]] = None) -> List[Tuple[str, Path]]:
     """(name, home) for every profile, falling back to ``default`` alone. ``lightweight``
     uses ``profiles_to_serve`` (name/path only) instead of ``list_profiles``, which parses
-    config/meta and probes gateways/skills per profile — too heavy per sidebar refresh."""
+    config/meta and probes gateways/skills per profile — too heavy per sidebar refresh.
+    Overview callers pass ``errors`` so discovery failure cannot imply full coverage."""
     from hermes_cli import profiles as profiles_mod
     try:
         targets = (list(profiles_mod.profiles_to_serve(multiplex=True)) if lightweight
                    else [(info.name, info.path) for info in profiles_mod.list_profiles()])
     except Exception:
         _log.exception("%s: list_profiles failed", log_label)
+        if errors is not None:
+            errors.append({"error": "profile-inventory-unavailable"})
         targets = []
     if not targets:
         targets.append(("default", profiles_mod.get_profile_dir("default")))
@@ -518,13 +525,42 @@ def _merge_by_id(into: Dict[str, Dict[str, Any]], entries: List[Dict[str, Any]],
             existing["sessionCount"] = (existing.get("sessionCount") or 0) + (entry.get("sessionCount") or 0)
 
 
+def _scope_home_to_profile(project: Dict[str, Any], profile: str) -> None:
+    """Re-key the synthetic Home bucket to its owning profile, in place.
+
+    Every OTHER project folds across profiles by folder, because a folder is the same
+    workspace whoever opened it. Home is the opposite: it is not a place, it is the
+    catch-all for rows no folder claimed, so folding it merges unrelated identities. A
+    worker profile's cwd-less provisioning chatter (`profile-smoketest-*`, config smokes)
+    then appears inside the user's own Home, where archiving it looks like it has no
+    effect — the row belongs to a different store and a same-titled sibling takes its
+    slot in the preview window. Only ``default`` keeps the bare id, so the user's own
+    Home stays the id the desktop pins scope/new-session behaviour to (``NO_PROJECT_ID``).
+    """
+    from tui_gateway.project_tree import NO_PROJECT_ID
+
+    if project.get("id") != NO_PROJECT_ID or profile == "default":
+        return
+    scoped_id = f"{NO_PROJECT_ID}::{profile}"
+    project["id"] = scoped_id
+    project["label"] = f"{project.get('label') or 'Home'} · {profile}"
+    for repo in project.get("repos") or []:
+        if repo.get("id") == NO_PROJECT_ID:
+            repo["id"] = scoped_id
+        for lane in repo.get("groups") or []:
+            if lane.get("id") == NO_PROJECT_ID:
+                lane["id"] = scoped_id
+
+
 def _merge_profile_tree(
     merged: Dict[str, Dict[str, Any]], projects: List[Dict[str, Any]], profile: str,
     preview_limit: int) -> None:
     """Fold one profile's projects into the shared tree, keyed by folder: the same checkout
-    in two profiles is one group, as is ``__no_project__`` (else one "Home" per profile), and
-    a declared project (``p_<hash>``) folds with another profile's auto entry for the same
-    folder. Sessions carry the owning profile; a group header never claims a single owner."""
+    in two profiles is one group, and a declared project (``p_<hash>``) folds with another
+    profile's auto entry for the same folder. ``__no_project__`` is the exception — it is a
+    catch-all rather than a folder, so it stays per profile (see
+    ``_scope_home_to_profile``). Sessions carry the owning profile; a group header never
+    claims a single owner."""
     for project in projects:
         lane_sessions = (s for r in project.get("repos") or []
                          for lane in r.get("groups") or []
@@ -533,6 +569,7 @@ def _merge_profile_tree(
             session["profile"] = profile
             session["is_default_profile"] = profile == "default"
 
+        _scope_home_to_profile(project, profile)
         key = project.get("path") or project["id"]
         existing = merged.get(key)
         if existing is None:
@@ -557,7 +594,7 @@ def _merge_profile_tree(
 
 
 @sessions_router.get("/api/profiles/projects/tree")
-def get_profiles_projects_tree(preview_limit: int = 3, session_limit: int = 2000):
+def get_profiles_projects_tree(preview_limit: int = 8, session_limit: int = 2000):
     """Project tree for every profile at once, for the all-profiles sidebar.
 
     ``projects.tree`` over JSON-RPC answers for the backend's own profile only; this runs the

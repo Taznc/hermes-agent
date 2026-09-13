@@ -590,15 +590,24 @@ class GatewayStartupMixin:
         """Arm the selector floor and out-of-loop watchdog before adapters. Disabled entirely with
         ``gateway.loop_watchdog: false`` in config.yaml (config-only knob).
 
+        Arming outcomes are logged at INFO/WARNING, never debug: these guards are the last line
+        of defence against a wedged loop, and a silent arming failure is indistinguishable from a
+        working watchdog until the gateway hangs (#69089 and the 16h dispatch outage after it).
+
         See #69089.
         """
         from gateway.shutdown_watchdog import _arm_loop_floor_timer, start_loop_liveness_watchdog
         config = getattr(self, "config", None)
         if config is not None and not getattr(config, "loop_watchdog", True):
+            logger.info("Gateway loop liveness guards DISABLED by gateway.loop_watchdog: false — "
+                        "a frozen event loop will not self-restart")
             return
         if getattr(self, "_loop_floor_timer_handle", None) is None:
-            with _log_suppressed(logging.DEBUG, "Failed to arm gateway loop floor timer", exc_info=True):
+            try:
                 self._loop_floor_timer_handle = _arm_loop_floor_timer(loop)
+            except Exception:
+                logger.warning("Failed to arm gateway loop floor timer — selector waits may block "
+                               "indefinitely", exc_info=True)
         watchdog = getattr(self, "_loop_liveness_watchdog", None)
         if watchdog is None or not watchdog.is_alive():
             try:
@@ -616,7 +625,12 @@ class GatewayStartupMixin:
                     )),
                 )
             except Exception:
-                logger.debug("Failed to start gateway loop liveness watchdog", exc_info=True)
+                logger.warning("Failed to start gateway loop liveness watchdog — the event loop "
+                               "has NO liveness backstop for this process", exc_info=True)
+                self._loop_liveness_watchdog = None
+            if getattr(self, "_loop_liveness_watchdog", None) is None:
+                logger.warning("Gateway loop liveness watchdog is NOT armed — a frozen event loop "
+                               "will not be detected or restarted")
 
     def _stop_loop_liveness_guards(self) -> None:
         """Disarm lifetime liveness guards before shutdown can load the loop — including the

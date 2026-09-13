@@ -30,13 +30,15 @@ from hermes_cli.web_server_files import (
     _fs_path, _managed_file_entry, _managed_response_meta, _resolve_managed_path,
 )
 from hermes_cli.web_models import (
-    ChatImageUpload, FsWriteText, ManagedDirectoryCreate, ManagedFileDelete, ManagedFileUpload,
+    ChatFileUpload, ChatImageUpload, FsWriteText, ManagedDirectoryCreate, ManagedFileDelete,
+    ManagedFileUpload,
 )
 
 router = APIRouter()
 
 # Late-bound so a test's monkeypatch on the owning module wins at call time.
 _profile_scope = late("_profile_scope", "hermes_cli.web_server_profiles")
+_config_profile_scope = late("_config_profile_scope", "hermes_cli.web_server_profiles")
 get_hermes_home = late("get_hermes_home", "hermes_cli.config")
 load_config = late("load_config", "hermes_cli.config")
 # Image types GET /api/media serves — extension-allowlisted so an authenticated
@@ -354,6 +356,67 @@ async def upload_chat_image(payload: ChatImageUpload, profile: Optional[str] = N
     return await asyncio.to_thread(_run)
 
 
+# Chat non-image files: the web build's '+' Files picker and OS drag/drop hand
+# the renderer raw File bytes with no usable filesystem path — browsers never
+# expose one, and even Electron's local path is meaningless once bytes cross
+# to a remote gateway. Stage them under HERMES_HOME/uploads/ (mirrors
+# upload_chat_image's HERMES_HOME/images/) and hand back a gateway-visible
+# path the composer attaches exactly like a local pick via file.attach. See
+# web-bridge-shim.ts's selectPaths/saveFileBuffer and
+# use-composer-actions.ts's attachFileBlob.
+#
+# Capped to _FS_DATA_URL_MAX_BYTES, not the larger _MANAGED_FILE_MAX_BYTES:
+# file.attach in remote mode reads the staged path back through
+# GET /api/fs/read-data-url, which enforces that same (smaller) cap. A bigger
+# cap here would let the upload succeed and then fail unreadable at attach.
+
+
+def _sanitize_chat_upload_filename(filename: str | None) -> str:
+    candidate = Path(str(filename or "").strip()).name
+    candidate = re.sub(r"[\x00-\x1f]+", "_", candidate)
+    candidate = candidate.strip().strip(".")
+    return candidate or "upload"
+
+
+@router.post("/api/chat/file-upload")
+async def upload_chat_file(payload: ChatFileUpload, profile: Optional[str] = None):
+    """Persist a browser-provided non-image chat attachment for staging.
+
+    Mirrors ``upload_chat_image`` for arbitrary files. See the module comment
+    above for why this exists and its size cap.
+    """
+    def _run():
+        from hermes_cli.web_server import _FS_DATA_URL_MAX_BYTES
+        data, _mime_type = _decode_data_url(payload.data_url)
+        if len(data) > _FS_DATA_URL_MAX_BYTES:
+            mb = _FS_DATA_URL_MAX_BYTES // (1024 * 1024)
+            raise HTTPException(status_code=413, detail=f"File is too large; cap is {mb} MB")
+
+        with _profile_scope(profile) as scoped_home:
+            home = scoped_home or get_hermes_home()
+            upload_dir = Path(home) / "uploads"
+            with _io_errors("Upload directory is not writable", "Could not create upload directory"):
+                upload_dir.mkdir(parents=True, exist_ok=True)
+
+            safe_name = _sanitize_chat_upload_filename(payload.filename)
+            stem = re.sub(r"[^A-Za-z0-9_.-]+", "_", Path(safe_name).stem).strip("._-") or "upload"
+            ext = re.sub(r"[^A-Za-z0-9.]+", "", Path(safe_name).suffix[:16])
+            ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+            target = upload_dir / f"chat_{ts}_{secrets.token_hex(4)}_{stem}{ext}"
+
+            with _io_errors("Upload directory is not writable", "Could not write file"):
+                target.write_bytes(data)
+
+        return {
+            "ok": True,
+            "path": str(target),
+            "name": target.name,
+            "bytes": len(data),
+        }
+
+    return await asyncio.to_thread(_run)
+
+
 @router.get("/api/files")
 async def list_managed_files(request: Request, path: Optional[str] = None):
     policy, target, display_path = _resolve_managed_path(path, request)
@@ -613,10 +676,31 @@ async def fs_list(path: str):
             for entry in scan:
                 if entry.name in _FS_READDIR_HIDDEN:
                     continue
+                # Follow symlinks when classifying directories, matching the
+                # Electron shell's readDirForIpc (fs-read-dir.ts), which stats
+                # every symlinked dirent for exactly this reason. Both shells
+                # feed the SAME renderer code, so a divergence here is a real
+                # behavior fork: contrib/runtime-loader.ts's disk scan keeps
+                # only `entries.filter(e => e.isDirectory)`, so a symlinked
+                # plugin folder reported as a non-directory is silently never
+                # scanned and its plugin never loads. That is the documented
+                # dev install for desktop plugins (`ln -s` from a source repo
+                # into <hermes home>/desktop-plugins), so on the web build it
+                # broke every symlink-installed plugin.
+                #
+                # Not a sandbox weakening: `_fs_path()` already resolve()s the
+                # requested path, so symlinks are followed for reads either
+                # way; this only fixes the reported TYPE. A broken/dangling
+                # link raises OSError from the follow, which is caught here and
+                # reported as a non-directory rather than failing the listing.
+                try:
+                    is_directory = entry.is_dir()
+                except OSError:
+                    is_directory = False
                 entries.append({
                     "name": entry.name,
                     "path": str(target / entry.name),
-                    "isDirectory": entry.is_dir(follow_symlinks=False),
+                    "isDirectory": is_directory,
                 })
         entries.sort(key=lambda item: (not item["isDirectory"], item["name"].lower(), item["name"]))
         return {"entries": entries}
@@ -641,6 +725,37 @@ async def fs_read_text(path: str):
         "path": str(target),
         "text": data.decode("utf-8", errors="replace"),
         "truncated": st.st_size > _FS_TEXT_PREVIEW_MAX_BYTES,
+    }
+
+
+_FS_PLUGIN_SOURCE_MAX_BYTES = 16 * 1024 * 1024
+
+
+@router.get("/api/fs/read-plugin-source")
+async def fs_read_plugin_source(path: str):
+    """Full-source read for runtime desktop plugins, no truncation.
+
+    Mirrors Electron's ``hermes:readPluginSource`` IPC handler
+    (apps/desktop/electron/main.ts): a dedicated generous cap and a hard
+    413 instead of the 512 KiB silent truncation ``/api/fs/read-text``
+    applies for preview reads — evaluating a truncated plugin.js file as ESM
+    is a real failure the caller must see, not a payload the loader partially
+    executes (apps/desktop/src/contrib/runtime-loader.ts `readPluginSourceText`).
+    """
+    target, st = _fs_regular_file(_fs_path(path))
+    if st.st_size > _FS_PLUGIN_SOURCE_MAX_BYTES:
+        raise HTTPException(status_code=413, detail="Plugin source exceeds the 16 MiB read limit")
+    try:
+        data = target.read_bytes()
+    except PermissionError:
+        raise HTTPException(status_code=403, detail="File is not readable")
+    except OSError as exc:
+        raise HTTPException(status_code=400, detail=str(exc) or "File read failed")
+    return {
+        "byteSize": st.st_size,
+        "path": str(target),
+        "text": data.decode("utf-8", errors="replace"),
+        "truncated": False,
     }
 
 
@@ -748,3 +863,37 @@ async def fs_git_root(path: str):
 async def fs_default_cwd():
     cwd = _fs_default_cwd()
     return {"cwd": cwd, "branch": _fs_git_branch(cwd)}
+
+
+# ---------------------------------------------------------------------------
+# Disk-plugin roots — the remote half of the desktop's on-disk plugin door
+# (apps/desktop/src/contrib/runtime-loader.ts `diskRoots()`), for the web-spike
+# bridge shim (apps/desktop/src/web-bridge-shim.ts) which has no Electron main
+# process to resolve these paths locally. Mirrors Electron's
+# `hermes:fs:desktopPluginsRoot` / `hermes:fs:agentPluginsRoot` IPC handlers
+# (apps/desktop/electron/fs-ipc.ts `localPluginsRoot`): profile-aware,
+# created on demand so a fresh profile with no folder yet still resolves a
+# real (if empty) path instead of the scanner silently finding nothing.
+# ---------------------------------------------------------------------------
+
+
+def _fs_plugin_root(dir_name: str, profile: Optional[str]) -> Path:
+    with _config_profile_scope(profile):
+        target = get_hermes_home() / dir_name
+    try:
+        target.mkdir(parents=True, exist_ok=True)
+    except OSError:
+        pass  # Best-effort create, same as the Electron handler; the scan just finds nothing.
+    return target
+
+
+@router.get("/api/fs/desktop-plugins-root")
+async def fs_desktop_plugins_root(profile: Optional[str] = None):
+    """The standalone on-disk plugin root: `<HERMES_HOME>/desktop-plugins`."""
+    return {"path": str(_fs_plugin_root("desktop-plugins", profile))}
+
+
+@router.get("/api/fs/agent-plugins-root")
+async def fs_agent_plugins_root(profile: Optional[str] = None):
+    """The unified agent-plugin root's desktop half: `<HERMES_HOME>/plugins`."""
+    return {"path": str(_fs_plugin_root("plugins", profile))}

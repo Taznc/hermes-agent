@@ -3,6 +3,7 @@ import type { ReactNode } from 'react'
 import { useCallback, useEffect, useMemo, useState } from 'react'
 
 import { runInTerminal } from '@/app/right-sidebar/store'
+import { interactiveTerminalAvailable } from '@/app/right-sidebar/terminal/capability'
 import {
   FEATURED_ID,
   FeaturedProviderRow,
@@ -35,10 +36,6 @@ import { providerGroup, providerMeta, providerPriority } from './helpers'
 import { LocalModelsSettings } from './local-models-settings'
 import { SettingsContent, SettingsSkeleton } from './primitives'
 import { SettingsProfileScope } from './profile-scope'
-
-// The embedded terminal (and thus the "run disconnect command" path) only
-// exists in the Electron desktop shell, not the web dashboard.
-const canRunInTerminal = () => typeof window !== 'undefined' && Boolean(window.hermesDesktop?.terminal)
 
 // Parallel group headers ("Connected", "Other providers") so the expanded list
 // reads as its own section instead of bleeding into the connected group.
@@ -150,6 +147,11 @@ function OAuthPicker({
   const p = t.settings.providers
   const [showAll, setShowAll] = useState(false)
   const ordered = useMemo(() => sortProviders(providers), [providers])
+  // Reactive, not $localModelsEnabled.get() — see the comment on the same
+  // pattern in app/settings/index.tsx: on web this atom starts false and is
+  // corrected asynchronously, so a mounted picker must re-render on the
+  // correction, not freeze the value it saw at mount.
+  const localModelsEnabled = useStore($localModelsEnabled)
 
   if (ordered.length === 0) {
     return null
@@ -187,7 +189,7 @@ function OAuthPicker({
       {featured && <FeaturedProviderRow onSelect={select} provider={featured} />}
       {/* Slot #2 — the no-account path, matching onboarding. Behind the
           --local launch flag like every local-models surface. */}
-      {$localModelsEnabled.get() && <LocalModelsProviderRow onClick={onWantLocalModels} />}
+      {localModelsEnabled && <LocalModelsProviderRow onClick={onWantLocalModels} />}
       {connected.length > 0 && (
         <>
           <GroupLabel>{p.connected}</GroupLabel>
@@ -250,7 +252,7 @@ function ConnectedProviderRow({
   const canDisconnect = provider.disconnectable ?? provider.flow !== 'external'
   // External (CLI-managed) provider Hermes can't clear via the API, but ships a
   // command we can run in the embedded terminal (Electron shell only).
-  const terminalDisconnect = !canDisconnect && Boolean(provider.disconnect_command) && canRunInTerminal()
+  const terminalDisconnect = !canDisconnect && Boolean(provider.disconnect_command) && interactiveTerminalAvailable()
   // Only fall back to a static "remove it elsewhere" hint when we offer no button.
   const showHint = !canDisconnect && !terminalDisconnect
 
@@ -352,6 +354,8 @@ export function ProvidersSettings({
 }: ProvidersSettingsProps) {
   const { t } = useI18n()
   const scopeProfile = useStore($settingsRequestProfile)
+  // Reactive re-render on the async web correction (see index.tsx comment).
+  const localModelsEnabled = useStore($localModelsEnabled)
   const { rowProps, vars } = useEnvCredentials(scopeProfile)
   const [oauthProviders, setOauthProviders] = useState<OAuthProvider[]>([])
   const [openProvider, setOpenProvider] = useState<null | string>(null)
@@ -524,7 +528,7 @@ export function ProvidersSettings({
     // Strict --local gate: without the launch flag the pane doesn't render
     // even when local models are configured — a stale ?pview=local deep link
     // (or an old shortcut) lands on the accounts view instead.
-    return $localModelsEnabled.get() ? <LocalModelsSettings /> : null
+    return localModelsEnabled ? <LocalModelsSettings /> : null
   }
 
   return (

@@ -363,3 +363,56 @@ def test_import_rejects_a_future_format_version(kanban_root, tmp_path):
     kanban_root("target")
     with pytest.raises(ValueError, match="newer than this Hermes"):
         kt.import_board(str(bumped))
+
+
+# ---------------------------------------------------------------------------
+# Board-inventory lock participation
+# ---------------------------------------------------------------------------
+
+def test_import_holds_the_inventory_lock_around_placement(kanban_root, tmp_path):
+    """``import_board`` must take the shared inventory lock, and must hold it
+    across the whole add — target-slug selection through metadata.
+
+    Slug selection (``_available_slug``) is a plain existence read, so without
+    one hold spanning it and the placement a concurrent create can take the slug
+    this import just chose. Asserting the lock is held *at both ends* is what
+    distinguishes a real hold from a token acquire-and-release.
+    """
+    _seed_board()
+    archive = Path(kt.export_board("alpha", str(tmp_path / "alpha"))["archive"])
+    kanban_root("target")
+
+    from hermes_cli import kanban_db_inventory as kbi
+
+    held_during: list[str] = []
+    real_available_slug = kt._available_slug
+    real_write_metadata = kb.write_board_metadata
+
+    def _held() -> bool:
+        # The lock is exclusive, so if this thread already owns it a
+        # non-blocking re-acquire succeeds; if nobody owns it, it also
+        # succeeds — distinguish via the re-entrancy depth counter.
+        return getattr(kbi._DEPTH, "n", 0) > 0
+
+    def spy_available_slug(preferred):
+        held_during.append(f"select:{_held()}")
+        return real_available_slug(preferred)
+
+    def spy_write_metadata(board, **kwargs):
+        held_during.append(f"metadata:{_held()}")
+        return real_write_metadata(board, **kwargs)
+
+    kt._available_slug = spy_available_slug
+    kb.write_board_metadata = spy_write_metadata
+    try:
+        res = kt.import_board(str(archive))
+    finally:
+        kt._available_slug = real_available_slug
+        kb.write_board_metadata = real_write_metadata
+
+    assert held_during == ["select:True", "metadata:True"]
+    assert res["board"] == "alpha"
+    # Released by the time import returns — it is not leaked to the caller.
+    assert getattr(kbi._DEPTH, "n", 0) == 0
+    with kb.board_inventory_lock(timeout=0):
+        pass

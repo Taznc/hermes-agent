@@ -252,6 +252,21 @@ export function setRememberedRoute(path: null | string, profile: string): void {
 }
 
 let configuredDefaultProjectDir = ''
+// The local machine's home directory, as last reported by the Electron main
+// process (`getDefaultProjectDir`'s `defaultLabel`, which is `app.getPath
+// ('home')`). Needed renderer-side to expand a `~/…` chat-link path BEFORE
+// building a `file:` URL — the renderer has no `os.homedir()` of its own —
+// so `resolveChatLinkPath` (`@/lib/local-preview`) can take it as an
+// argument instead of resolving `~` into `process.cwd()`-relative.
+let knownHomeDir = ''
+
+export const getKnownHomeDir = (): string => knownHomeDir
+
+/** Test-only setter — production code populates this from
+ *  `syncConfiguredDefaultProjectDir`'s `defaultLabel`, never directly. */
+export function __setKnownHomeDirForTest(home: string): void {
+  knownHomeDir = home
+}
 
 function workspaceCwdKey(connection: HermesConnection | null = $connection.get()): string {
   if (connection?.mode !== 'remote') {
@@ -280,10 +295,14 @@ export async function syncConfiguredDefaultProjectDir(shouldPublish: () => boole
     return configuredDefaultProjectDir
   }
 
-  const { dir } = await settings()
+  const { defaultLabel, dir } = await settings()
 
   if (shouldPublish()) {
     configuredDefaultProjectDir = dir?.trim() || ''
+  }
+
+  if (defaultLabel?.trim()) {
+    knownHomeDir = defaultLabel.trim()
   }
 
   return configuredDefaultProjectDir

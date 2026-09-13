@@ -71,7 +71,8 @@ export function getHermesConfig(profile?: string): Promise<HermesConfig> {
 export function getHermesConfigRecord(profile?: ProfileScope): Promise<HermesConfigRecord> {
   return window.hermesDesktop.api<HermesConfigRecord>({
     ...capabilityScoped(profile),
-    path: '/api/config'
+    path: '/api/config',
+    timeoutMs: STARTUP_REQUEST_TIMEOUT_MS
   })
 }
 
@@ -86,7 +87,8 @@ export function getHermesConfigDefaults(): Promise<HermesConfigRecord> {
 export function getHermesConfigSchema(profile?: null | string): Promise<ConfigSchemaResponse> {
   return hermesApi<ConfigSchemaResponse>({
     ...profileScoped(profile),
-    path: '/api/config/schema'
+    path: '/api/config/schema',
+    timeoutMs: STARTUP_REQUEST_TIMEOUT_MS
   })
 }
 
@@ -114,7 +116,8 @@ export function saveHermesConfigRecord(config: HermesConfigRecord, profile?: Pro
 export function getEnvVars(profile?: null | string): Promise<Record<string, EnvVarInfo>> {
   return hermesApi<Record<string, EnvVarInfo>>({
     ...profileScoped(profile),
-    path: '/api/env'
+    path: '/api/env',
+    timeoutMs: STARTUP_REQUEST_TIMEOUT_MS
   })
 }
 
@@ -154,7 +157,10 @@ export function validateProviderCredential(
     ...profileScoped(),
     path: '/api/providers/validate',
     method: 'POST',
-    body: { key, value, api_key: apiKey ?? '' }
+    body: { key, value, api_key: apiKey ?? '' },
+    // Live-probes the provider (network round trip, sometimes a model list
+    // fetch) — well past the 30s default fetch timeout.
+    timeoutMs: 60_000
   })
 }
 
@@ -178,7 +184,10 @@ export function validateCustomEndpoint(endpoint: CustomEndpointUpdate): Promise<
   return hermesApi<CustomEndpointValidationResponse>({
     path: '/api/providers/custom-endpoints/validate',
     method: 'POST',
-    body: endpoint
+    body: endpoint,
+    // Live-probes the endpoint (network round trip, model listing) — well
+    // past the 30s default fetch timeout.
+    timeoutMs: 60_000
   })
 }
 

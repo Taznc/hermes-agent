@@ -796,6 +796,9 @@ elif _GATEWAY_HEALTH_TIMEOUT > _GATEWAY_HEALTH_TIMEOUT_MAX:
 
 _MANAGED_FILE_MAX_BYTES = 100 * 1024 * 1024
 _FS_DATA_URL_MAX_BYTES = 16 * 1024 * 1024
+# Chat file uploads share the read-data-url cap: a chat attachment is read back
+# through the same data-url path, so a larger upload could never be re-read.
+_CHAT_FILE_UPLOAD_MAX_BYTES = _FS_DATA_URL_MAX_BYTES
 # Multipart uploads stream to a temp file in fixed chunks and rename into
 # place: constant memory, no base64 inflation, no proxy body-size 502s (NS-501).
 _UPLOAD_CHUNK_BYTES = 1024 * 1024
@@ -964,6 +967,9 @@ app.include_router(_tools_routes.router)
 app.include_router(_analytics_routes.router)
 app.include_router(_chat_ws_routes.router)
 app.include_router(_dashboard_ui_routes.router)
+# >>> FORK ANCHOR: account-limits-route <<<
+from hermes_fork.account_limits.routes import router as _fork_account_limits_router  # noqa: E402
+app.include_router(_fork_account_limits_router)
 
 # Plugin API routes and the dashboard auth routes (/login, /auth/*, /api/auth/*)
 # mount before the SPA catch-all so /{full_path:path} doesn't swallow them. Auth
@@ -1839,6 +1845,9 @@ _PLUGIN_COMPAT_LAZY = {
     'windows_hide_flags': ('hermes_cli._subprocess_compat', 'windows_hide_flags'),
     'write_platform_config_field': ('hermes_cli.config', 'write_platform_config_field'),
 }
+# >>> FORK ANCHOR: plugin-compat <<<
+from hermes_fork.web_compat import FORK_PLUGIN_COMPAT_LAZY
+_PLUGIN_COMPAT_LAZY.update(FORK_PLUGIN_COMPAT_LAZY)
 
 
 def __getattr__(name):  # PEP 562 — lazy so no import cycles

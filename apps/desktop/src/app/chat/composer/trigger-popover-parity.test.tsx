@@ -89,7 +89,7 @@ describe('@ and / are one menu', () => {
   })
 
   it('renders the name and description for both kinds', () => {
-    const { rerender } = render(
+    const { container, rerender } = render(
       <ComposerTriggerPopover
         activeIndex={0}
         items={[slashItem('/work', 'Skills', 'Start in a worktree')]}
@@ -100,8 +100,12 @@ describe('@ and / are one menu', () => {
       />
     )
 
+    // Scoped to the row: the description also appears in the detail footer
+    // below the list, which is where the full text is readable.
+    const row = () => container.querySelector('button') as HTMLElement
+
     expect(screen.getByText('/work')).toBeTruthy()
-    expect(screen.getByText('Start in a worktree')).toBeTruthy()
+    expect(row().textContent).toContain('Start in a worktree')
 
     rerender(
       <ComposerTriggerPopover
@@ -115,7 +119,7 @@ describe('@ and / are one menu', () => {
     )
 
     expect(screen.getByText('src/main.tsx')).toBeTruthy()
-    expect(screen.getByText('src')).toBeTruthy()
+    expect(row().textContent).toContain('src')
   })
 
   it('an emoji row stays icon-less — the emoji IS the icon', () => {

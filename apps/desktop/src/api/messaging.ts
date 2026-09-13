@@ -39,7 +39,10 @@ export function testMessagingPlatform(
   return hermesApi<MessagingPlatformTestResponse>({
     ...profileScoped(profile),
     path: `/api/messaging/platforms/${encodeURIComponent(platformId)}/test`,
-    method: 'POST'
+    method: 'POST',
+    // Live-probes the platform's own API (network round trip) — well past
+    // the 30s default fetch timeout.
+    timeoutMs: 60_000
   })
 }
 

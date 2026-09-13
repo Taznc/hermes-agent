@@ -225,7 +225,7 @@ const BACKTICK_NOISE_RE = /`{3,}/g
 export const selectMessageRunning = (state: MessageRunningStateSlice) =>
   state.thread.isRunning && state.message.status?.type === 'running'
 
-function titleForTool(name: string): string {
+export function titleForTool(name: string): string {
   const normalized = name.replace(/^browser_/, '').replace(/^web_/, '')
 
   return normalized.split('_').filter(Boolean).map(capitalize).join(' ') || name
@@ -1275,6 +1275,24 @@ interface ToolTitleParts {
   title: string
 }
 
+const MEMORY_ACTION_KEYS = new Set([
+  'add',
+  'search',
+  'probe',
+  'related',
+  'reason',
+  'contradict',
+  'update',
+  'remove',
+  'list'
+])
+
+function isMemoryActionKey(
+  action: string
+): action is 'add' | 'contradict' | 'list' | 'probe' | 'reason' | 'related' | 'remove' | 'search' | 'update' {
+  return MEMORY_ACTION_KEYS.has(action)
+}
+
 function titlePartsFromAction(title: string, action?: string): ToolTitleParts {
   if (!action) {
     return { title }
@@ -1404,6 +1422,19 @@ function dynamicTitle(
     if (path) {
       return { title: fileEditBasename(path) }
     }
+  }
+
+  if (part.toolName === 'memory') {
+    const action = firstStringField(args, ['action'])
+
+    if (!isMemoryActionKey(action)) {
+      return fallback
+    }
+
+    const done = translateNow(`assistant.tool.memoryActions.${action}.done`)
+    const pending = translateNow(`assistant.tool.memoryActions.${action}.pending`)
+
+    return { title: verb(pending, done) }
   }
 
   return fallback

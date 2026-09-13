@@ -176,6 +176,9 @@ def _build_child_agent(
     routing_cfg: Optional[Dict[str, Any]] = None,
     # Legacy; accepted for wire compat but ignored (capability is depth-derived).
     role: str = "leaf",
+    # Per-spawn reasoning override, already parsed by tools.delegation_model_override.resolve_effort_override.
+    # None means "not requested" and preserves the global-pin/inherit chain.
+    override_reasoning_config: Optional[Dict[str, Any]] = None,
 ):
     """Build (don't run) a child AIAgent on the main thread. override_* (from delegation config) replace parent
     inheritance so children can run on a different provider:model pair."""
@@ -218,7 +221,7 @@ def _build_child_agent(
         parent_agent, delegation_cfg, parent_api_key, model=model, override_provider=override_provider,
         override_base_url=override_base_url, override_api_key=override_api_key, override_api_mode=override_api_mode,
         override_acp_command=override_acp_command,
-        override_acp_args=override_acp_args,
+        override_acp_args=override_acp_args, override_reasoning_config=override_reasoning_config,
         routing_cfg=routing_cfg,
     )
     if override_request_overrides is not None:
@@ -357,16 +360,58 @@ def _run_single_child(
         run.cleanup(heartbeat=heartbeat, child_pool=child_pool, leased_cred_id=leased_cred_id, close_deferred=_child_close_deferred)
 
 
-def _build_children(
-    task_list: List[Dict[str, Any]], task_schemas: List[Optional[Dict[str, Any]]], creds: Dict[str, Any], *,
-    top_role: str, max_iterations: int, parent_agent, routing_cfg: Dict[str, Any],
-    live_deleg_id: Optional[str], live_writers: list,
-) -> tuple[List[tuple], Optional[str]]:
-    """Build every child on the main thread (construction is not thread-safe);
-    ``(children, None)`` or ``([], error)`` on an explicit-pin preflight failure."""
-    from tools.delegation_live_log import wrap_progress_callback
-    from tools.delegation_output_schema import append_output_contract
-    overrides = {
+def _resolve_task_routes(
+    task_list: List[Dict[str, Any]], creds: Dict[str, Any], parent_agent, base_cfg: Dict[str, Any], *,
+    model: Optional[str], reasoning_effort: Optional[str],
+) -> tuple[List[Dict[str, Any]], List[Optional[Dict[str, Any]]], List[Dict[str, Any]], Optional[str]]:
+    """Phase 2.11 PRE-PASS: resolve optional per-spawn model / reasoning_effort for every task before any
+    child is constructed, so a bad override on task N of a fan-out returns a clean error while zero
+    children exist (same reason the output_schema pass runs up front).
+
+    Precedence per task: per-spawn argument > global delegation.* pin > parent inheritance. ``creds``
+    (the global pin / credentials_cfg resolution) is the fallback each task starts from, so omitting
+    both fields reproduces the default behaviour byte for byte. A top-level value is the DEFAULT for
+    every task in the batch; a per-item value overrides it. Returns
+    ``(task_creds, task_reasoning, task_routes, error)``."""
+    from tools.delegation_model_override import describe_route, resolve_effort_override, resolve_model_override
+    task_creds: List[Dict[str, Any]] = []
+    task_reasoning: List[Optional[Dict[str, Any]]] = []
+    sources: List[str] = []
+    default_source = "config" if creds.get("model") else "inherit"
+    for i, task in enumerate(task_list):
+        raw_effort = task.get("reasoning_effort")
+        if raw_effort is None:
+            raw_effort = reasoning_effort
+        parsed_effort, effort_err = resolve_effort_override(raw_effort)
+        if effort_err:
+            return [], [], [], f"Task {i}: {effort_err}"
+        task_reasoning.append(parsed_effort)
+        raw_model = task.get("model")
+        if raw_model is None:
+            raw_model = model
+        override_cfg, model_err = resolve_model_override(raw_model, parent_agent, base_cfg)
+        if model_err:
+            return [], [], [], f"Task {i}: {model_err}"
+        if override_cfg is None:
+            task_creds.append(creds)
+            sources.append(default_source)
+            continue
+        # Route the per-spawn model through the SAME credential resolver the global pin uses so credential
+        # scoping is enforced identically: a provider with no key fails the spawn loudly instead of the
+        # child silently falling back to the parent's credentials.
+        try:
+            task_creds.append(_resolve_delegation_credentials(override_cfg, parent_agent))
+        except ValueError as exc:
+            return [], [], [], f"Task {i} model override rejected: {exc}"
+        sources.append("spawn")
+    # Computed from the resolved credentials so it reports where the child ACTUALLY runs, with
+    # inheritance already applied — never a bare null the reader has to interpret.
+    task_routes = [describe_route(task_creds[i], parent_agent, source=sources[i]) for i in range(len(task_list))]
+    return task_creds, task_reasoning, task_routes, None
+
+
+def _child_overrides(creds: Dict[str, Any], routing_cfg: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    return {
         "override_provider": creds["provider"], "override_base_url": creds["base_url"],
         "override_api_key": creds["api_key"], "override_api_mode": creds["api_mode"],
         "override_request_overrides": creds.get("request_overrides"),
@@ -374,18 +419,36 @@ def _build_children(
         "override_acp_args": creds.get("args"),
         "routing_cfg": routing_cfg,
     }
+
+
+def _build_children(
+    task_list: List[Dict[str, Any]], task_schemas: List[Optional[Dict[str, Any]]], creds: Dict[str, Any], *,
+    top_role: str, max_iterations: int, parent_agent, live_deleg_id: Optional[str], live_writers: list,
+    routing_cfg: Optional[Dict[str, Any]] = None,
+    task_creds: Optional[List[Dict[str, Any]]] = None, task_reasoning: Optional[List[Optional[Dict[str, Any]]]] = None,
+) -> tuple[List[tuple], Optional[str]]:
+    """Build every child on the main thread (construction is not thread-safe);
+    ``(children, None)`` or ``([], error)`` on an explicit-pin preflight failure.
+    ``task_creds``/``task_reasoning`` (from ``_resolve_task_routes``) route task N individually."""
+    from tools.delegation_live_log import wrap_progress_callback
+    from tools.delegation_output_schema import append_output_contract
+    task_creds = task_creds or []
+    task_reasoning = task_reasoning or []
     children = []
     for i, t in enumerate(task_list):
         _task_schema = task_schemas[i] if i < len(task_schemas) else None
         _child_context = t.get("context")
         if _task_schema is not None:
             _child_context = append_output_contract(_child_context, _task_schema)
+        _creds = task_creds[i] if i < len(task_creds) else creds
         try:
             child = _build_child_preserving_parent_tools(
                 task_index=i, goal=t["goal"], context=_child_context,
                 toolsets=None,  # always inherit the parent's toolsets
-                model=creds["model"], max_iterations=max_iterations, task_count=len(task_list),
-                parent_agent=parent_agent, role=_normalize_role(t.get("role") or top_role), **overrides,
+                model=_creds["model"], max_iterations=max_iterations, task_count=len(task_list),
+                parent_agent=parent_agent, role=_normalize_role(t.get("role") or top_role),
+                override_reasoning_config=(task_reasoning[i] if i < len(task_reasoning) else None),
+                **_child_overrides(_creds, routing_cfg),
             )
         except ValueError as exc:
             return [], str(exc)
@@ -411,12 +474,19 @@ def delegate_task(
     goal: Optional[str] = None, context: Optional[str] = None, tasks: Optional[List[Dict[str, Any]]] = None,
     max_iterations: Optional[int] = None, role: Optional[str] = None, background: Optional[bool] = None,
     output_schema: Optional[Dict[str, Any]] = None, action: Optional[str] = None, subagent_id: Optional[str] = None,
-    message: Optional[str] = None, parent_agent=None, credentials_cfg: Optional[Dict[str, Any]] = None,
+    message: Optional[str] = None, model: Optional[str] = None, reasoning_effort: Optional[str] = None,
+    parent_agent=None, credentials_cfg: Optional[Dict[str, Any]] = None,
 ) -> str:
     """Spawn child agents (single ``goal`` or ``tasks=[...]`` batch) or control running ones. ``action``
     list/steer/stop run synchronously and bypass the pause gate, depth limit and async dispatch. ``role`` is legacy
     (per-task beats top-level; capability is depth-derived). Returns JSON with one results entry per task, or a
-    dispatch handle when running in the background."""
+    dispatch handle when running in the background.
+
+    Optional ``model`` / ``reasoning_effort`` route an individual spawn without touching global config. Both
+    accept a top-level value (the default for every task) and a per-item value inside ``tasks[]``, resolving as
+    per-spawn argument > global delegation.* pin > parent inheritance. Omitting them preserves the historical
+    behaviour exactly; an unknown model (or one on a provider without credentials) or effort level fails the
+    call rather than silently running the child somewhere else."""
     if parent_agent is None:
         return tool_error("delegate_task requires a parent agent context.")
 
@@ -467,9 +537,14 @@ def delegate_task(
         # spawn loudly (#80450).
         return tool_error(str(exc))
     max_children = _get_max_concurrent_children()
-    task_list, err = _normalize_task_list(goal, context, tasks, output_schema, top_role, max_children)
+    task_list, err = _normalize_task_list(
+        goal, context, tasks, output_schema, top_role, max_children, model=model, reasoning_effort=reasoning_effort)
     if not err:
         task_schemas, err = _coerce_task_schemas(task_list, output_schema)
+    if not err:
+        task_creds, task_reasoning, task_routes, err = _resolve_task_routes(
+            task_list, creds, parent_agent, credentials_cfg if credentials_cfg else cfg,
+            model=model, reasoning_effort=reasoning_effort)
     if err:
         return tool_error(err)
 
@@ -478,20 +553,21 @@ def delegate_task(
     # content or prompt caching. Best-effort: on failure live_paths is empty and delegation proceeds.
     from tools.delegation_live_log import create_live_transcripts
     live_deleg_id, live_writers, live_paths = create_live_transcripts(
-        task_list, context, model=creds.get("model"), provider=creds.get("provider")
+        task_list, context, model=creds.get("model"), provider=creds.get("provider"), task_routes=task_routes,
     )
     _announce_batch(parent_agent, len(task_list), live_deleg_id)
     origin = _capture_origin()
 
     children, err = _build_children(
         task_list, task_schemas, creds, top_role=top_role, max_iterations=default_max_iter, parent_agent=parent_agent,
-        routing_cfg=routing_cfg, live_deleg_id=live_deleg_id, live_writers=live_writers,
+        live_deleg_id=live_deleg_id, live_writers=live_writers, routing_cfg=routing_cfg,
+        task_creds=task_creds, task_reasoning=task_reasoning,
     )
     if err:
         return tool_error(err)
     batch = _Batch(
         task_list, children, parent_agent, creds, context, top_role, max_children,
-        live_deleg_id, live_writers, live_paths, *origin, overall_start,
+        live_deleg_id, live_writers, live_paths, *origin, overall_start, task_routes=task_routes,
     )
     return _run_batch(batch, background)
 
@@ -515,19 +591,47 @@ def _build_top_level_description() -> str:
         )
     else:
         restrictions_rule = "- Children cannot call delegate_task, clarify, memory, or cronjob.\n"
-    return _DESCRIPTION_HEAD + restrictions_rule + _DESCRIPTION_TAIL
+    return _DESCRIPTION_HEAD + _build_dispatch_mode_paragraph() + _DESCRIPTION_TAIL_HEAD + restrictions_rule + _DESCRIPTION_TAIL
+
+
+def _build_dispatch_mode_paragraph() -> str:
+    """How this call actually returns, from the SAME decision the dispatcher makes
+    (``delegate_tool_dispatch.effective_dispatch_mode``). A session that cannot receive a
+    detached completion AND has no session id to wake — a one-shot Kanban worker, a
+    session-id-less HTTP request, a cron job, an orchestrator subagent — runs the batch
+    INLINE, so telling such a caller "dispatch returns immediately, do not wait" is simply
+    false and makes it plan around a handle it will never get. Session-scoped, so the schema
+    stays byte-stable for the life of a conversation; ``model_tools._tool_defs_cache_key``
+    carries the mode so a cached schema cannot leak across sessions in one process."""
+    try:
+        from tools.delegate_tool_dispatch import DISPATCH_MODE_BLOCKING, effective_dispatch_mode
+
+        blocking = effective_dispatch_mode() == DISPATCH_MODE_BLOCKING
+    except Exception:
+        blocking = False
+    if not blocking:
+        return (
+            "Runs in the background: dispatch returns immediately with live transcript paths, and the call's "
+            "results re-enter the conversation as a new message when its subagents finish (one message per call "
+            "by default; with delegation.independent_completions each ungrouped task / `group` returns on its "
+            "own). Results are delivered only BETWEEN your turns: finish whatever does not depend on them, then "
+            "give a one-line status and END YOUR TURN. Never wait or poll on transcripts, artifact files, or CI "
+            "for a child. While children run, `action` (list/steer/stop) controls them live — steer when a "
+            "transcript shows a child drifting.\n\n"
+        )
+    return (
+        "This session cannot receive a detached result, so the call BLOCKS until every child finishes and returns "
+        "their consolidated results directly. Budget for that: a subagent routinely runs for many minutes, and that "
+        "time comes out of your own turn. Live transcript paths are in the result.\n\n"
+    )
 
 _DESCRIPTION_HEAD = (
     "Spawn subagents in isolated contexts; each gets its own conversation, terminal session, and toolset, and only its "
     "final summary returns to you. Pass every task in `tasks` — one entry spawns one subagent, several run in parallel "
     "(limit in the tasks description).\n\n"
-    "Runs in the background: dispatch returns immediately with live transcript paths, and the call's results re-enter "
-    "the conversation as a new message when its subagents finish (one message per call by default; with "
-    "delegation.independent_completions each ungrouped task / `group` returns on its own). Results are delivered only "
-    "BETWEEN your turns: finish whatever does not depend on them, then give a one-line status and END YOUR TURN. Never "
-    "wait or poll on transcripts, artifact files, or CI for a child. "
-    "While children run, `action` (list/steer/stop) controls them live — steer when a transcript shows a "
-    "child drifting.\n\n"
+)
+
+_DESCRIPTION_TAIL_HEAD = (
     "USE FOR: reasoning-heavy subtasks, work that would flood your context with intermediate data, or independent "
     "parallel workstreams.\n"
     "DO NOT USE FOR (use these instead):\n"
@@ -613,6 +717,12 @@ DELEGATE_TASK_SCHEMA = {
                             "schema_valid, plus schema_errors on failure). Keep it forgiving — require only "
                             "fields you will read.",
                         ),
+                        "model": _p(
+                            "string",
+                            "Optional model for THIS task only, so a batch can run cheap mechanical work and one "
+                            "hard reasoning task on different models. Must be a model on a provider you have "
+                            "credentials for; an unknown model fails the call. Omit to inherit. See top-level 'model'.",
+                        ),
                         "group": _p(
                             "string",
                             "Optional result-delivery bucket within this call (only when delegation.independent_completions "
@@ -620,11 +730,30 @@ DELEGATE_TASK_SCHEMA = {
                             "together in ONE message; ungrouped tasks return individually as each finishes. This does not "
                             "order execution; if B needs A's output, dispatch B after A returns.",
                         ),
+                        "reasoning_effort": _p(
+                            "string", "Optional reasoning depth for THIS task only. See top-level 'reasoning_effort'.",
+                        ),
                     },
                     "required": ["goal"],
                 },
                 "description": "(rebuilt at get_definitions() time)",
             },
+            "model": _p(
+                "string",
+                "Optional model for this delegation, overriding the model children would otherwise inherit. Use it "
+                "to run a hard task deeper or cheap work cheaper without changing global config. Precedence: this "
+                "argument > the global delegation.model pin > the parent's model. You may only select a model on a "
+                "provider this profile has credentials for; an unknown model returns an error rather than silently "
+                "falling back. In batch mode, tasks[].model overrides this per item.",
+            ),
+            "reasoning_effort": _p(
+                "string",
+                "Optional reasoning depth for this delegation, on providers that support it (ignored by models "
+                "without reasoning support). 'none' disables thinking for the child. Same precedence as 'model': "
+                "this argument > the global delegation.reasoning_effort pin > the parent's level. In batch mode, "
+                "tasks[].reasoning_effort overrides this per item.",
+                enum=["none", "minimal", "low", "medium", "high", "xhigh", "max", "ultra"],
+            ),
             # `background` (bool) is also accepted — DEPRECATED, ignored: top-level
             # delegations always run in the background. Unadvertised; do not re-add.
             "action": _p(
@@ -678,6 +807,7 @@ registry.register(
         max_iterations=args.get("max_iterations"), role=args.get("role"),
         background=_model_background_value(args, kw.get("parent_agent")), output_schema=args.get("output_schema"),
         action=args.get("action"), subagent_id=args.get("subagent_id"), message=args.get("message"),
+        model=args.get("model"), reasoning_effort=args.get("reasoning_effort"),
         parent_agent=kw.get("parent_agent"),
     ),
     check_fn=check_delegate_requirements,

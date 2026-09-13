@@ -1,10 +1,15 @@
 import type { AppendMessage } from '@assistant-ui/react'
 
+import type { FileAttachResponse } from '@/app/types'
 import { translateNow, type Translations } from '@/i18n'
 import type { ChatMessage } from '@/lib/chat-messages'
+import { isDesktopFsRemoteMode, readDesktopFileDataUrl, readDesktopFileDataUrlLocalFirst } from '@/lib/desktop-fs'
 import { type CommandsCatalogLike, filterDesktopCommandsCatalog } from '@/lib/desktop-slash-commands'
+import { isMissingRpcMethod } from '@/lib/gateway-rpc'
 import { isProviderSetupErrorMessage } from '@/lib/provider-setup-errors'
 import type { ComposerAttachment } from '@/store/composer'
+import { $sessions, knownSessionOwner } from '@/store/session'
+import type { SessionOwnerScope } from '@/store/session-request-router'
 
 import { registerRecoveredRuntime, singleFlightSessionResume, takeRecoveredRuntime } from './single-flight-resume'
 
@@ -72,6 +77,7 @@ export class SessionRecoveryAborted extends Error {
 }
 
 export interface SessionRecoveryDeps {
+  owner?: SessionOwnerScope
   requestGateway: GatewayRequest
   /**
    * Owning profile for a stored session. A resume without it lands on
@@ -119,17 +125,21 @@ export async function resumeStoredRuntimeSession(
   // same dead runtime at once, and each independent session.resume mints a new
   // runtime — every loser is an orphan for the reaper. Sharing one in-flight
   // promise makes concurrent recoveries converge on ONE runtime.
-  const resumed = await singleFlightSessionResume(storedSessionId, async () => {
-    const resolveProfile = deps.resolveProfile ?? defaultResolveProfile
-    const profile = await resolveProfile(storedSessionId)
+  const owner = deps.owner ?? knownSessionOwner($sessions.get(), storedSessionId)
+  const resolveProfile = deps.resolveProfile ?? defaultResolveProfile
+  const profile = await resolveProfile(storedSessionId)
 
-    return deps.requestGateway<{ session_id: string }>('session.resume', {
-      session_id: storedSessionId,
-      source: 'desktop',
-      omit_messages: true,
-      ...(profile ? { profile } : {})
-    })
-  })
+  const resumed = await singleFlightSessionResume(
+    storedSessionId,
+    () =>
+      deps.requestGateway<{ session_id: string }>('session.resume', {
+        session_id: storedSessionId,
+        source: 'desktop',
+        omit_messages: true,
+        ...(profile ? { profile } : {})
+      }),
+    owner ?? profile
+  )
 
   return resumed?.session_id ?? null
 }
@@ -158,6 +168,8 @@ export async function withSessionNotFoundResume<T>(
   deps: SessionRecoveryDeps,
   options?: { alsoTimeout?: boolean }
 ): Promise<{ recovered: boolean; result: T; sessionId: string }> {
+  const owner = deps.owner ?? knownSessionOwner($sessions.get(), storedSessionId ?? null)
+
   try {
     return { recovered: false, result: await call(sessionId), sessionId }
   } catch (err) {
@@ -174,14 +186,14 @@ export async function withSessionNotFoundResume<T>(
     // A previous recovery for this stored session already minted a runtime
     // that its caller drift-aborted away from. Reuse it before resuming
     // again — re-minting would strand yet another runtime for the reaper.
-    const cachedRecoveredId = takeRecoveredRuntime(storedSessionId, sessionId)
+    const cachedRecoveredId = takeRecoveredRuntime(storedSessionId, sessionId, owner)
 
     if (cachedRecoveredId) {
       const cachedDrift = deps.driftReason?.()
 
       if (cachedDrift) {
         // Still drifted: keep the runtime findable for whoever acts next.
-        registerRecoveredRuntime(storedSessionId, cachedRecoveredId)
+        registerRecoveredRuntime(storedSessionId, cachedRecoveredId, owner)
         throw new SessionRecoveryAborted(cachedDrift, cachedRecoveredId)
       }
 
@@ -201,7 +213,7 @@ export async function withSessionNotFoundResume<T>(
     let recoveredId: null | string
 
     try {
-      recoveredId = await resumeStoredRuntimeSession(storedSessionId, deps)
+      recoveredId = await resumeStoredRuntimeSession(storedSessionId, { ...deps, owner })
     } catch {
       throw err
     }
@@ -217,7 +229,7 @@ export async function withSessionNotFoundResume<T>(
       // (the user moved on), so record it in the stored->runtime recovery
       // cache. The next action targeting this stored session reuses it
       // instead of minting another orphan (#91276).
-      registerRecoveredRuntime(storedSessionId, recoveredId)
+      registerRecoveredRuntime(storedSessionId, recoveredId, owner)
       throw new SessionRecoveryAborted(drift, recoveredId)
     }
 
@@ -427,7 +439,12 @@ export async function readImageForRemoteAttach(
     }
   }
 
-  const dataUrl = await window.hermesDesktop?.readFileDataUrl(filePath)
+  // readDesktopFileDataUrlLocalFirst, not the raw bridge: it prefers this
+  // machine's disk (picker/clipboard/drop paths) and falls back to the
+  // gateway's /api/fs/read-data-url. The bare bridge call threw
+  // "readFileDataUrl is not a function" in the web build, where the member is
+  // deliberately omitted so the remote read stays in charge.
+  const dataUrl = await readDesktopFileDataUrlLocalFirst(filePath)
   const contentBase64 = dataUrl ? base64FromDataUrl(dataUrl) : ''
 
   return contentBase64 ? { contentBase64, filename: imageFilenameFromPath(filePath) } : null
@@ -437,14 +454,28 @@ export async function readImageForRemoteAttach(
 // when the desktop bridge can't read the file (e.g. it was moved/deleted).
 // Prefer the attach-specific IPC (256 MiB) so remote uploads are not stuck on
 // the preview/Settings default; fall back for older Electron shells.
+//
+// The web build has no local bridge reader at all (window.hermesDesktop never
+// defines readFileDataUrl there — see web-bridge-shim.ts) and a picker/drop
+// path is only ever the GATEWAY's own disk, so fall back to the remote
+// /api/fs/read-data-url facade exactly like image attach does via
+// readDesktopFileDataUrlLocalFirst. A local reader that throws (moved/deleted
+// file) still returns null rather than falling back, matching the previous
+// behavior for Electron.
 export async function readFileDataUrlForAttach(filePath: string): Promise<string | null> {
   const reader = window.hermesDesktop?.readFileDataUrlForAttach ?? window.hermesDesktop?.readFileDataUrl
 
-  if (!reader) {
+  if (reader) {
+    const dataUrl = await reader(filePath)
+
+    return dataUrl || null
+  }
+
+  if (!isDesktopFsRemoteMode()) {
     return null
   }
 
-  const dataUrl = await reader(filePath)
+  const dataUrl = await readDesktopFileDataUrl(filePath)
 
   return dataUrl || null
 }
@@ -467,6 +498,117 @@ export function friendlyRemoteAttachError(err: unknown, label: string): Error {
   const cap = Number.isFinite(limitBytes) && limitBytes > 0 ? ` (max ${Math.floor(limitBytes / (1024 * 1024))} MB)` : ''
 
   return new Error(`${label} is too large to upload to the remote gateway${cap}.`)
+}
+
+/**
+ * Stage a non-image file attachment on the gateway.
+ *
+ * Prefers the chunked file.attach_open/_chunk/_commit transport: the
+ * renderer drives repeated readFileChunkForAttach + file.attach_chunk calls
+ * bounded to ATTACHMENT_CHUNK_BYTES each, so neither Electron main nor this
+ * renderer nor the gateway ever holds a whole large file (or its base64
+ * expansion) in one buffer/string — the freeze/OOM path t_275f8015 exists to
+ * close. Falls back to the whole-file file.attach + data_url transport when
+ * the desktop bridge predates readFileChunkForAttach (older Electron shells,
+ * or the web-served build, which omits the whole readFileDataUrl/
+ * readFileChunkForAttach IPC surface — see web-bridge-shim.ts) OR when the
+ * gateway itself predates file.attach_open (backend contract < 7, detected
+ * via isMissingRpcMethod on the open call).
+ *
+ * A session-not-found failure mid-stream re-runs the WHOLE upload against
+ * the recovered session (a fresh upload_id — the old one belonged to the now
+ * -dead session) rather than resuming from the last acked chunk: session
+ * recovery is rare (post sleep/wake) and correctness beats the avoided
+ * re-read, whereas the non-streamed path's "read once outside the retry"
+ * optimization only ever amortized a single whole-file read to begin with.
+ */
+export async function attachFileBytes(
+  filePath: string,
+  label: string,
+  requestGateway: GatewayRequest,
+  liveSessionId: string
+): Promise<FileAttachResponse> {
+  const chunkedReader = window.hermesDesktop?.readFileChunkForAttach
+
+  const wholeFileFallback = async (): Promise<FileAttachResponse> => {
+    const dataUrl = await readFileDataUrlForAttach(filePath)
+
+    if (!dataUrl) {
+      throw new Error(`Could not read ${label}`)
+    }
+
+    return requestGateway<FileAttachResponse>('file.attach', {
+      name: label,
+      path: filePath,
+      session_id: liveSessionId,
+      data_url: dataUrl
+    })
+  }
+
+  if (!chunkedReader) {
+    return wholeFileFallback()
+  }
+
+  let uploadId: string | undefined
+
+  try {
+    const opened = await requestGateway<{ upload_id?: string }>('file.attach_open', { session_id: liveSessionId })
+    uploadId = opened?.upload_id
+  } catch (err) {
+    // Backend predates file.attach_open (DESKTOP_BACKEND_CONTRACT < 7):
+    // fall back to the whole-file transport rather than failing the attach.
+    if (isMissingRpcMethod(err)) {
+      return wholeFileFallback()
+    }
+
+    throw err
+  }
+
+  if (!uploadId) {
+    throw new Error(`Could not start upload for ${label}`)
+  }
+
+  try {
+    let offset = 0
+    let totalBytes = Number.POSITIVE_INFINITY
+
+    while (offset < totalBytes) {
+      const chunk = await chunkedReader(filePath, offset)
+
+      if (!chunk) {
+        throw new Error(`Could not read ${label}`)
+      }
+
+      totalBytes = chunk.totalBytes
+
+      if (chunk.bytesRead > 0) {
+        await requestGateway('file.attach_chunk', {
+          session_id: liveSessionId,
+          upload_id: uploadId,
+          chunk_base64: chunk.base64
+        })
+        offset += chunk.bytesRead
+      } else if (offset < totalBytes) {
+        // Reader reported nothing new before reaching the file's known size —
+        // reading is stuck (shrunk/replaced on disk mid-upload). Bail rather
+        // than spin forever re-requesting the same offset.
+        throw new Error(`Could not read ${label}`)
+      }
+    }
+
+    return await requestGateway<FileAttachResponse>('file.attach_commit', {
+      session_id: liveSessionId,
+      upload_id: uploadId,
+      path: filePath,
+      name: label
+    })
+  } catch (err) {
+    // Best-effort: an abort failure must not mask the real upload error, and
+    // a dead/recovered session (the common trigger) makes the abort itself
+    // fail harmlessly — the gateway's stale-upload reaper cleans it up later.
+    await requestGateway('file.attach_abort', { session_id: liveSessionId, upload_id: uploadId }).catch(() => {})
+    throw err
+  }
 }
 
 export function renderCommandsCatalog(catalog: CommandsCatalogLike, copy: Translations['desktop']): string {

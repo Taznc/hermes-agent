@@ -31,6 +31,7 @@ import { actEngineSource, type PreviewActAction, type PreviewActResult } from '@
 import { watchInPage } from '@/lib/preview-act/watch-in-page'
 
 import { clickAt, glideTo, pointerPlaced, pressKey, selectAll, typeText, wheelBy } from './preview-drive'
+import { activePreviewGuestMissing, PREVIEW_NO_GUEST_DRIVE } from './preview-guest'
 import { activePreviewInput, type PreviewInputHandle } from './preview-input'
 import { activePreviewNav, type PreviewNavHandle } from './preview-nav'
 import { activePreviewScriptRunner, type PreviewScriptRunner } from './preview-script-runner'
@@ -62,6 +63,16 @@ const DRIVEN: readonly string[] = ['click', 'hover', 'press', 'type']
 const CLICKS: readonly string[] = ['click', 'type']
 
 const NOTHING_OPEN = 'No live page is open in the in-app browser — open one with open_preview first.'
+
+/** Why nothing answered. "Open one with open_preview" is the right advice when
+ *  the rail is empty and wrong when the tab is open but this build has no guest
+ *  engine behind it — that sends the agent round the same loop forever instead
+ *  of reaching for a browser that works. Asked here, at the point of failure,
+ *  rather than up front: a registered runner or input handle IS a live guest,
+ *  and it outranks any capability probe. */
+function nothingToDrive(): string {
+  return activePreviewGuestMissing() ? PREVIEW_NO_GUEST_DRIVE : NOTHING_OPEN
+}
 
 const NAVIGATED =
   'The page stopped answering right after — it is probably navigating. Call elements to see where you landed.'
@@ -493,7 +504,7 @@ export async function actOnActivePreview(
     const handle = activePreviewNav()
 
     if (!handle) {
-      return { error: NOTHING_OPEN, success: false }
+      return { error: nothingToDrive(), success: false }
     }
 
     handle[nav]()
@@ -506,7 +517,7 @@ export async function actOnActivePreview(
   const run = activePreviewScriptRunner()
 
   if (!run) {
-    return { error: NOTHING_OPEN, success: false }
+    return { error: nothingToDrive(), success: false }
   }
 
   const typed = action as PreviewActAction

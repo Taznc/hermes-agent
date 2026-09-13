@@ -503,3 +503,75 @@ def test_windows_tcp_witness_arms_on_loop_task_source_shape():
     assert 'os.name == "posix"' in body, (
         "the AF_UNIX witness arm is not gated to POSIX platforms"
     )
+
+
+# --- Arming observability -----------------------------------------------------------
+# The 16h gateway wedge behind t_4c2f09a3 was survivable: this watchdog fires on that exact
+# freeze in isolation (verified, exit 75), but in production it never fired and BOTH arming
+# paths swallowed their failures into logger.debug — so there was no evidence either way at
+# default log level. These pin the evidence, not the mechanism.
+
+
+def test_watchdog_logs_at_info_when_it_arms(caplog):
+    loop = _immediate_loop()
+    with caplog.at_level("INFO", logger="gateway.shutdown_watchdog"):
+        handle = start_loop_liveness_watchdog(
+            loop, probe_interval=30.0, probe_timeout=10.0, max_strikes=3)
+    try:
+        assert handle is not None
+        armed = [r for r in caplog.records if r.levelname == "INFO" and "armed" in r.getMessage()]
+        assert armed, f"no INFO arming record: {caplog.text}"
+    finally:
+        if handle is not None:
+            handle.stop()
+            handle.join(timeout=5)
+
+
+def test_watchdog_logs_at_warning_when_arming_fails(caplog):
+    loop = _immediate_loop()
+    with (
+        patch("threading.Thread.start", side_effect=RuntimeError("cannot start thread")),
+        caplog.at_level("WARNING", logger="gateway.shutdown_watchdog"),
+    ):
+        handle = start_loop_liveness_watchdog(loop)
+    assert handle is None
+    warnings = [r for r in caplog.records if r.levelname == "WARNING"]
+    assert warnings, f"arming failure logged below WARNING: {caplog.text}"
+    assert "liveness backstop" in warnings[0].getMessage()
+
+
+def test_runner_warns_when_the_watchdog_is_not_armed(caplog):
+    """A None handle back from the starter must be loud — that is the production case the
+    diagnosis could not distinguish from 'armed but died'."""
+    from gateway.run import GatewayRunner
+
+    runner = object.__new__(GatewayRunner)
+    runner._loop_floor_timer_handle = None
+    runner._loop_liveness_watchdog = None
+    runner.config = None
+
+    with (
+        patch("gateway.shutdown_watchdog._arm_loop_floor_timer", return_value=MagicMock()),
+        patch("gateway.shutdown_watchdog.start_loop_liveness_watchdog", return_value=None),
+        caplog.at_level("WARNING", logger="gateway.run"),
+    ):
+        runner._start_loop_liveness_guards(MagicMock(spec=asyncio.AbstractEventLoop))
+
+    assert runner._loop_liveness_watchdog is None
+    assert [r for r in caplog.records if r.levelname == "WARNING"
+            and "NOT armed" in r.getMessage()], caplog.text
+
+
+def test_runner_logs_at_info_when_the_watchdog_is_disabled_by_config(caplog):
+    from gateway.run import GatewayRunner
+
+    runner = object.__new__(GatewayRunner)
+    runner._loop_floor_timer_handle = None
+    runner._loop_liveness_watchdog = None
+    runner.config = MagicMock(loop_watchdog=False)
+
+    with caplog.at_level("INFO", logger="gateway.run"):
+        runner._start_loop_liveness_guards(MagicMock(spec=asyncio.AbstractEventLoop))
+
+    assert runner._loop_liveness_watchdog is None
+    assert [r for r in caplog.records if "DISABLED" in r.getMessage()], caplog.text

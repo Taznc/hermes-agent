@@ -198,6 +198,78 @@ describe('ErrorBoundary assistant-ui lookup recovery', () => {
     expect(recoveryWarningCount(warnSpy.mock.calls)).toBe(0)
   })
 
+  // The root fallback REPLACES <App/>, and the toast host (NotificationStack)
+  // renders inside <App/>. Anything this surface reports through notifyError()
+  // is therefore written to a store with no renderer — invisible to the user.
+  // These cover the three things a user actually needs off a crash screen.
+  describe('root fallback crash-report affordances', () => {
+    it('marks the error message selectable so it can be read and copied out', () => {
+      // body { user-select: none } is app-wide; the opt-in attribute is the
+      // documented escape hatch (styles.css [data-selectable-text='true']).
+      const Bomb = makeBomb({
+        error: new Error("Cannot read properties of undefined (reading 'getDevMainBundleStale')")
+      })
+
+      render(
+        <RootErrorBoundary>
+          <Bomb />
+        </RootErrorBoundary>
+      )
+
+      const message = screen.getByText(/getDevMainBundleStale/)
+
+      expect(message.closest('[data-selectable-text="true"]')).not.toBeNull()
+    })
+
+    it('copies the message and component stack to the clipboard', async () => {
+      const writeText = vi.fn().mockResolvedValue(undefined)
+      Object.defineProperty(window, 'hermesDesktop', { configurable: true, value: undefined, writable: true })
+      Object.defineProperty(navigator, 'clipboard', { configurable: true, value: { writeText }, writable: true })
+
+      const Bomb = makeBomb({ error: new Error('boom-copy') })
+
+      render(
+        <RootErrorBoundary>
+          <Bomb />
+        </RootErrorBoundary>
+      )
+
+      fireEvent.click(screen.getByRole('button', { name: 'Copy' }))
+      await act(async () => { await Promise.resolve() })
+
+      expect(writeText).toHaveBeenCalledTimes(1)
+      expect(String(writeText.mock.calls[0][0])).toContain('boom-copy')
+      expect(screen.getByRole('button', { name: 'Copied' })).toBeTruthy()
+    })
+
+    it('reports the log outcome inline instead of into the unmounted toast host', async () => {
+      Object.defineProperty(window, 'hermesDesktop', {
+        configurable: true,
+        value: {
+          getRecentLogs: async () => ({ lines: ['line-one', 'line-two'], path: '/tmp/desktop.log' }),
+          revealLogs: async () => ({ error: 'not available in the web spike', ok: false, path: '' })
+        },
+        writable: true
+      })
+
+      const Bomb = makeBomb({ error: new Error('boom-logs') })
+
+      render(
+        <RootErrorBoundary>
+          <Bomb />
+        </RootErrorBoundary>
+      )
+
+      fireEvent.click(screen.getByRole('button', { name: 'Open logs' }))
+      await act(async () => { await Promise.resolve(); await Promise.resolve(); await Promise.resolve() })
+
+      // Falls back to rendering the log tail in-page when the host filesystem
+      // cannot be revealed (the web build), rather than doing nothing visible.
+      expect(screen.getByText(/line-two/)).toBeTruthy()
+      expect(screen.getByText('/tmp/desktop.log')).toBeTruthy()
+    })
+  })
+
   it.each([
     ['a differently cased classifier near-miss', new Error('UseClientLookup: Index 6 out of bounds (length: 2)')],
     ['a non-bounds lookup error', new Error('useClientLookup: Key "missing" not found')],

@@ -1,6 +1,6 @@
 import { useStore } from '@nanostores/react'
 
-import { sessionDotClassName } from '@/app/chat/session-status-dot'
+import { SessionStatusMark } from '@/app/chat/session-status-dot'
 import { Button } from '@/components/ui/button'
 import { Codicon } from '@/components/ui/codicon'
 import {
@@ -26,6 +26,7 @@ import {
   $sidebarFiltersActive,
   $sidebarGrouping,
   $sidebarListGroupIds,
+  $sidebarListLimit,
   $sidebarOrdering,
   $sidebarPrFilter,
   $sidebarProfileFilter,
@@ -39,11 +40,14 @@ import {
   resetSidebarView,
   setSidebarCardRows,
   setSidebarGrouping,
+  setSidebarListLimit,
   setSidebarOrdering,
   setSidebarShowAllSessions,
   setSidebarShowArchived,
   setWorkspaceNodesOpen,
+  SIDEBAR_LIST_LIMIT_OPTIONS,
   type SidebarGrouping,
+  type SidebarListLimit,
   type SidebarOrdering,
   type SidebarRowMeta,
   toggleSidebarPrFilter,
@@ -63,7 +67,7 @@ import { runImportProfileFlow } from '@/store/profile-share'
 import { $projectTree } from '@/store/projects'
 import type { PullRequestBucket } from '@/store/pull-requests'
 import { $unreadFinishedSessionIds, markAllSessionsRead } from '@/store/session'
-import type { SessionStatusBucket } from '@/store/session-dot-state'
+import type { SessionDotState, SessionStatusBucket } from '@/store/session-dot-state'
 import { $sessionsHaveCost } from '@/store/sidebar-archive'
 
 interface Option<T extends string = string> {
@@ -72,6 +76,8 @@ interface Option<T extends string = string> {
   icon?: string
   id: T
   label: string
+  /** A live-session state, rendered with the row's own glyph mark. */
+  state?: SessionDotState
 }
 
 const GROUPINGS: Option<SidebarGrouping>[] = [
@@ -80,6 +86,11 @@ const GROUPINGS: Option<SidebarGrouping>[] = [
   { icon: 'pulse', id: 'status', label: 'Status' },
   { icon: 'account', id: 'profile', label: 'Profile' }
 ]
+
+const LIST_LENGTHS: Option<string>[] = SIDEBAR_LIST_LIMIT_OPTIONS.map(option => ({
+  id: String(option),
+  label: option === 'all' ? 'All' : String(option)
+}))
 
 const ORDERINGS: Option<SidebarOrdering>[] = [
   { icon: 'clock', id: 'updated', label: 'Updated' },
@@ -108,14 +119,18 @@ const PR_FILTERS: Option<PullRequestBucket>[] = [
 ]
 
 const STATUS_FILTERS: Option<SessionStatusBucket>[] = [
-  { dot: sessionDotClassName('needs-input'), id: 'needs-input', label: 'Needs input' },
-  { dot: sessionDotClassName('working'), id: 'working', label: 'Working' },
-  { dot: sessionDotClassName('unread'), id: 'unread', label: 'Unread' },
-  { dot: sessionDotClassName('draft'), id: 'draft', label: 'Draft' },
-  { dot: cn(sessionDotClassName('idle'), 'bg-(--ui-text-quaternary)'), id: 'idle', label: 'Idle' }
+  { id: 'needs-input', label: 'Needs input', state: 'needs-input' },
+  { id: 'working', label: 'Working', state: 'working' },
+  { id: 'unread', label: 'Unread', state: 'unread' },
+  { id: 'draft', label: 'Draft', state: 'draft' },
+  { dot: cn('size-1 rounded-full', 'bg-(--ui-text-quaternary)'), id: 'idle', label: 'Idle' }
 ]
 
 function OptionGlyph({ option }: { option: Option }) {
+  if (option.state) {
+    return <SessionStatusMark state={option.state} />
+  }
+
   if (option.dot) {
     return <span aria-hidden="true" className={cn('shrink-0', option.dot)} />
   }
@@ -191,6 +206,7 @@ export function SidebarFilterMenu({ className }: { className?: string }) {
   const foldCollapsed = foldIds.length > 0 && foldIds.every(id => nodeOpen[id] === false)
 
   const groupingLabel = GROUPINGS.find(option => option.id === grouping)?.label
+  const listLengthLabel = listLimit === 'all' ? 'All' : String(listLimit)
 
   // Two options are conditional: dragging a row is what picks manual, so it
   // only appears as a way back out once there's a hand-picked order to leave;
@@ -253,6 +269,28 @@ export function SidebarFilterMenu({ className }: { className?: string }) {
                 value={grouping}
               >
                 {GROUPINGS.map(option => (
+                  <OptionRadio key={option.id} option={option} />
+                ))}
+              </DropdownMenuRadioGroup>
+            </DropdownMenuSubContent>
+          </DropdownMenuSub>
+
+          <DropdownMenuSub>
+            <DropdownMenuSubTrigger hideChevron>
+              List length
+              <span className="ml-auto flex items-center gap-1 pl-4 text-(--ui-text-tertiary)">
+                {listLengthLabel}
+                <Codicon name="chevron-right" size="1rem" />
+              </span>
+            </DropdownMenuSubTrigger>
+            <DropdownMenuSubContent>
+              <DropdownMenuRadioGroup
+                onValueChange={value =>
+                  setSidebarListLimit((value === 'all' ? 'all' : Number(value)) as SidebarListLimit)
+                }
+                value={String(listLimit)}
+              >
+                {LIST_LENGTHS.map(option => (
                   <OptionRadio key={option.id} option={option} />
                 ))}
               </DropdownMenuRadioGroup>

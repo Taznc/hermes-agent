@@ -18,7 +18,11 @@ export interface HudElectronOverlayWindow {
 
 /** Chrome Electron itself can honour. Compositor IPC is `promoteHudOverlay`. */
 export function applyHudElectronOverlay(win: HudElectronOverlayWindow, platform: string): void {
-  win.setAlwaysOnTop(true, platform === 'darwin' ? 'floating' : 'screen-saver')
+  // 'screen-saver' is Electron's own cross-platform level name — it is
+  // NOT a macOS-only value, it's simply what every non-mac platform uses
+  // (win32 included) as the always-on-top level, so there is no missing
+  // Windows branch here despite the darwin-only ternary shape.
+  win.setAlwaysOnTop(true, platform === 'darwin' ? 'floating' : 'screen-saver') // windows-footgun: ok — 'screen-saver' is the correct win32 value too
 
   if (platform !== 'darwin') {
     return

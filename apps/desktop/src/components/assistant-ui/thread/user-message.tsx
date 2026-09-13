@@ -9,6 +9,7 @@ import { type RestoreMessageTarget } from '@/components/assistant-ui/thread/type
 import { useMessageReactions } from '@/components/assistant-ui/thread/use-message-reactions'
 import { UserMessageText } from '@/components/assistant-ui/thread/user-message-text'
 import { Codicon } from '@/components/ui/codicon'
+import { Tip } from '@/components/ui/tooltip'
 import { useResizeObserver } from '@/hooks/use-resize-observer'
 import { useI18n } from '@/i18n'
 import { triggerHaptic } from '@/lib/haptics'
@@ -23,6 +24,21 @@ export function hasTextSelection(): boolean {
   const selection = window.getSelection()
 
   return Boolean(selection && !selection.isCollapsed && selection.toString().length > 0)
+}
+
+/**
+ * True when this click is part of a text-selection gesture, so the bubble's
+ * own action (open the editor / toggle the clamp) must stand down.
+ *
+ * Two cases, and the second is the one a plain `hasTextSelection()` misses:
+ * a finished drag-select leaves a live highlight, but a DOUBLE-click's
+ * word-select is applied by the browser AFTER the second `click` dispatches —
+ * at handler time the selection still reads collapsed. `detail >= 2` catches
+ * the double/triple click by the gesture itself, so double-clicking a word in
+ * your own prompt selects it for copying instead of opening the edit composer.
+ */
+export function isSelectionClick(event: { detail: number }): boolean {
+  return event.detail >= 2 || hasTextSelection()
 }
 
 export function StickyHumanMessageContainer({
@@ -457,7 +473,11 @@ export const UserMessage: FC<{
                 // attr below) so this handler keeps the picker gesture; a
                 // link/image/selection inside the bubble still gets the app
                 // menu, and this handler's selection guard keeps ⌘C flows.
-                data-context-menu-skip=""
+                // Stamped ONLY while the picker can actually open: with
+                // reactions off there is no gesture to protect, so the bubble
+                // stops claiming right-click and the shared menu takes it —
+                // that is where Copy message lives.
+                data-context-menu-skip={readOnly || !reactionsEnabled ? undefined : ''}
                 onContextMenu={
                   // Right-click is the desktop stand-in for iOS touch-and-hold —
                   // but only when there's nothing selected. A live highlight
@@ -479,18 +499,19 @@ export const UserMessage: FC<{
                   // full prompt is readable — never opens an edit composer.
                   <button
                     aria-expanded={bodyClamped ? expanded : undefined}
+                    aria-label={bodyClamped ? (expanded ? t.common.collapse : copy.expandMessage) : undefined}
                     className={cn(bubbleClassName, !bodyClamped && 'cursor-default')}
-                    onClick={() => {
+                    onClick={event => {
                       // Drag-select ends on mouseup→click; don't collapse the
-                      // clamp just because the highlight finished.
-                      if (hasTextSelection() || !bodyClamped) {
+                      // clamp just because the highlight finished. A multi-click
+                      // is a selection gesture too (see isSelectionClick).
+                      if (isSelectionClick(event) || !bodyClamped) {
                         return
                       }
 
                       triggerHaptic('selection')
                       setExpanded(value => !value)
                     }}
-                    title={bodyClamped ? (expanded ? t.common.collapse : copy.expandMessage) : undefined}
                     type="button"
                   >
                     {bubbleContent}
@@ -505,7 +526,7 @@ export const UserMessage: FC<{
                       aria-label={copy.editMessage}
                       className={bubbleClassName}
                       onClick={event => {
-                        if (hasTextSelection()) {
+                        if (isSelectionClick(event)) {
                           event.preventDefault()
                           event.stopPropagation()
 
@@ -514,8 +535,8 @@ export const UserMessage: FC<{
 
                         triggerHaptic('selection')
                       }}
-                      onPointerDown={() => {
-                        if (hasTextSelection()) {
+                      onPointerDown={event => {
+                        if (isSelectionClick(event)) {
                           return
                         }
 
@@ -530,41 +551,43 @@ export const UserMessage: FC<{
                 {(showStop || showRestore) && (
                   <div className="pointer-events-none absolute right-2 bottom-2 z-10 flex items-center justify-center opacity-0 transition-opacity group-hover/user-message:opacity-100 group-focus-within/user-message:opacity-100">
                     {showStop ? (
-                      <button
-                        aria-label={copy.stop}
-                        className={cn('pointer-events-auto size-5', USER_ACTION_ICON_BUTTON_CLASS)}
-                        onClick={event => {
-                          event.preventDefault()
-                          event.stopPropagation()
-                          void onCancel?.()
-                        }}
-                        title={copy.stop}
-                        type="button"
-                      >
-                        {StopGlyph}
-                      </button>
+                      <Tip label={copy.stop}>
+                        <button
+                          aria-label={copy.stop}
+                          className={cn('pointer-events-auto size-5', USER_ACTION_ICON_BUTTON_CLASS)}
+                          onClick={event => {
+                            event.preventDefault()
+                            event.stopPropagation()
+                            void onCancel?.()
+                          }}
+                          type="button"
+                        >
+                          {StopGlyph}
+                        </button>
+                      </Tip>
                     ) : (
-                      <button
-                        aria-label={copy.restoreCheckpoint}
-                        className={cn('pointer-events-auto size-6', USER_ACTION_ICON_BUTTON_CLASS)}
-                        onClick={event => {
-                          event.preventDefault()
-                          event.stopPropagation()
-                          triggerHaptic('selection')
-                          onRequestRestoreConfirm?.(messageId, {
-                            text: messageText,
-                            userOrdinal: runtimeUserOrdinal
-                          })
-                        }}
-                        onPointerDown={event => {
-                          event.preventDefault()
-                          event.stopPropagation()
-                        }}
-                        title={copy.restoreFromHere}
-                        type="button"
-                      >
-                        <Codicon name="discard" size="0.875rem" />
-                      </button>
+                      <Tip label={copy.restoreFromHere}>
+                        <button
+                          aria-label={copy.restoreCheckpoint}
+                          className={cn('pointer-events-auto size-6', USER_ACTION_ICON_BUTTON_CLASS)}
+                          onClick={event => {
+                            event.preventDefault()
+                            event.stopPropagation()
+                            triggerHaptic('selection')
+                            onRequestRestoreConfirm?.(messageId, {
+                              text: messageText,
+                              userOrdinal: runtimeUserOrdinal
+                            })
+                          }}
+                          onPointerDown={event => {
+                            event.preventDefault()
+                            event.stopPropagation()
+                          }}
+                          type="button"
+                        >
+                          <Codicon name="discard" size="0.875rem" />
+                        </button>
+                      </Tip>
                     )}
                   </div>
                 )}

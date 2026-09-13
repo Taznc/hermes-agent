@@ -68,6 +68,13 @@ Determine the current round from the history the task record already gives you: 
 
 The baseline duties in the Procedure section still apply on every round; the lens sets which inspection you lead with and weight most heavily.
 
+On re-review, start from the delta since the last reviewed handoff plus the
+unresolved findings. Use the prior and current commit IDs from structured
+metadata when available. Re-run checks that cover changed or previously failing
+paths, then smoke-test behavior that had already passed. Do not pay to repeat an
+unchanged full-suite run unless the new delta can affect it or this card is the
+graph's designated integration gate.
+
 ### Lens variation for ad-hoc review fan-outs
 
 The same principle applies outside the Kanban review lane. When spawning multiple parallel reviewers via `delegate_task`, give each reviewer a different lens — one diff-only brief, one full-context brief, one checkout-and-run brief — rather than identical briefs. Identical briefs produce correlated verdicts and duplicate findings; varied briefs cover more defect classes for the same review spend.
@@ -97,6 +104,20 @@ For code work:
 3. Exercise the reported failure path and at least one ordinary control path when practical.
 4. Check error handling, edge cases, concurrency boundaries, data preservation, security boundaries, and cross-platform behavior relevant to the change.
 5. Confirm that tests assert behavior rather than merely snapshotting source text or constants.
+
+Use staged verification ownership rather than duplicating every gate in every
+lane:
+
+- the implementer owns focused tests, affected lint/type checks, and direct
+  behavior proof;
+- the reviewer validates that evidence and independently re-runs checks selected
+  from the diff's risk surface;
+- a pre-created integration/release child owns the full applicable suite on the
+  combined branch.
+
+If no integration child exists and the acceptance criteria require a full
+suite, run it here. Evidence is reusable input, never a substitute for an
+independent risk judgment.
 
 For non-code work:
 

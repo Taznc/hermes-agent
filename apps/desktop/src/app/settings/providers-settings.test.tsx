@@ -84,6 +84,7 @@ afterEach(() => {
   $confirmRequest.set(null)
   vi.restoreAllMocks()
   vi.clearAllMocks()
+  vi.unstubAllGlobals()
 })
 
 // Removal goes through confirm() from @/store/confirm, so the host has to be
@@ -104,6 +105,48 @@ async function renderProvidersSettings() {
 }
 
 describe('ProvidersSettings', () => {
+  it('reveals the Local Models row when a delayed web status correction resolves after mount', async () => {
+    const originalDesktop = window.hermesDesktop
+    const { $localModelsEnabled } = await import('@/store/local-models-flag')
+    let resolveStatus!: (response: Response) => void
+    const statusResponse = new Promise<Response>(resolve => void (resolveStatus = resolve))
+
+    const fetchMock = vi.fn((url: URL | RequestInfo) => {
+      if (String(url).includes('/api/local-models/status')) {
+        return statusResponse
+      }
+
+      return Promise.reject(new Error(`unexpected request: ${String(url)}`))
+    })
+
+    $localModelsEnabled.set(false)
+    vi.stubGlobal('fetch', fetchMock)
+
+    try {
+      await renderProvidersSettings()
+      expect(screen.queryByText('Run models locally')).toBeNull()
+
+      // Importing the web shim starts its real fire-and-forget status
+      // correction while the Providers surface is already mounted.
+      await import('../../web-bridge-shim')
+      await waitFor(() => expect(fetchMock).toHaveBeenCalled())
+
+      await act(async () => {
+        resolveStatus(
+          new Response(JSON.stringify({ enabled: true }), {
+            headers: { 'Content-Type': 'application/json' },
+            status: 200
+          })
+        )
+      })
+
+      expect(await screen.findByText('Run models locally')).toBeTruthy()
+    } finally {
+      $localModelsEnabled.set(false)
+      Object.defineProperty(window, 'hermesDesktop', { configurable: true, value: originalDesktop })
+    }
+  })
+
   it('reads and saves API keys for the shared Settings target and reloads when it changes', async () => {
     const { $settingsScopeOverride } = await import('@/store/settings-scope')
     const { $activeGatewayProfile, $profiles } = await import('@/store/profile')
@@ -212,6 +255,7 @@ describe('ProvidersSettings', () => {
         provider('qwen-oauth', true, {
           cli_command: 'hermes auth add qwen-oauth',
           disconnect_hint: "Use `hermes auth add qwen-oauth` or that provider's CLI to remove it.",
+          disconnect_command: 'qwen auth logout',
           disconnectable: false,
           flow: 'external',
           name: 'Qwen (via Qwen CLI)'
@@ -223,6 +267,7 @@ describe('ProvidersSettings', () => {
 
     expect(await screen.findByText('Qwen Code')).toBeTruthy()
     expect(screen.queryByRole('button', { name: 'Remove Qwen Code' })).toBeNull()
+    expect(screen.queryByRole('button', { name: 'Disconnect Qwen Code' })).toBeNull()
     expect(screen.getByText(/managed by its own CLI/)).toBeTruthy()
   })
 

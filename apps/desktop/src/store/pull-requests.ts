@@ -32,7 +32,7 @@ export const $prBranchBySession = persistentAtom<Record<string, string>>(
 /** Sessions already scanned for a PR url. A transcript doesn't grow a new PR,
  *  so a miss is permanent and a hit is already in {@link $prBranchBySession} —
  *  either way the session is never scanned again. */
-const $prScannedSessions = persistentAtom<string[]>('hermes.desktop.prScannedSessions', [], Codecs.stringArray)
+export const $prScannedSessions = persistentAtom<string[]>('hermes.desktop.prScannedSessions', [], Codecs.stringArray)
 
 const fetchedAt = new Map<string, number>()
 const inFlight = new Set<string>()
@@ -69,6 +69,32 @@ export function stampSessionPrBranch(sessionId: string, repoRoot: string, branch
   }
 
   $prBranchBySession.set({ ...$prBranchBySession.get(), [sessionId]: branchPrKey(repoRoot, branch) })
+}
+
+/** A resolver proved this stored id is gone from every profile. Retire the
+ * local recovery records so a deleted transcript cannot stay remembered as a
+ * permanently-scanned PR source (or retain a branch badge) forever. */
+export function forgetSessionPullRequest(sessionId: string): void {
+  const id = sessionId.trim()
+
+  if (!id) {
+    return
+  }
+
+  const scanned = $prScannedSessions.get()
+  const remainingScanned = scanned.filter(candidate => candidate !== id)
+
+  if (remainingScanned.length !== scanned.length) {
+    $prScannedSessions.set(remainingScanned)
+  }
+
+  const branches = $prBranchBySession.get()
+
+  if (id in branches) {
+    const remainingBranches = { ...branches }
+    delete remainingBranches[id]
+    $prBranchBySession.set(remainingBranches)
+  }
 }
 
 /** Recover PRs the branch join can't see, from the sessions' own transcripts.

@@ -11,6 +11,7 @@ import copy
 import json
 import logging
 import os
+import re
 import threading
 from contextlib import contextmanager, suppress
 from dataclasses import dataclass, field
@@ -684,6 +685,223 @@ def summarize_background_review_actions(
     return actions
 
 
+def collect_background_review_actions(
+    review_messages: List[Dict],
+    prior_snapshot: List[Dict],
+    notification_mode: str = "on",
+) -> List[Dict[str, Any]]:
+    """Build structured per-call action records for a background review pass.
+
+    Companion to ``summarize_background_review_actions``: that function
+    renders the compact chat-line summary text (one joined string, success
+    only); this one returns every individual add/replace/remove/create/
+    patch/edit *call* the review made this pass — including calls that
+    FAILED (e.g. a memory write that would exceed the char budget) — as
+    structured records. A UI (Desktop's expandable self-improvement row,
+    Phase 1 of ROADMAP.md) can then present each mutation individually
+    without exposing the entire memory/skill store or collapsing distinct
+    operations into one opaque line.
+
+    Each record has: ``target`` ("memory" | "user" | "skill"), ``label``
+    (display string), ``operation`` (the tool's ``action``), legacy
+    ``success``/``message`` fields, and explicit ``state`` ("completed",
+    "no_op", "skipped", "declined", or "failed"), ``reason``, and bounded
+    redacted ``change_summary`` fields.  Raw tool arguments, source content,
+    tool output, and review reasoning are intentionally never serialized.
+    Skill records carry only the existing narrow ``skill_name`` identifier
+    when known; no inspect descriptor is emitted because this transport does
+    not grant a content-reading capability.
+
+    Mirrors ``summarize_background_review_actions``'s prior-snapshot
+    de-duplication (issue #14944) and its ``notification_mode`` gate: mode
+    ``off`` returns no records at all, matching the compact summary's
+    behavior of surfacing nothing when the user disabled the notice.
+    """
+    mode = str(notification_mode or "on").lower()
+    if mode == "off":
+        return []
+
+    existing_tool_call_ids = set()
+    existing_tool_contents = set()
+    for prior in prior_snapshot or []:
+        if not isinstance(prior, dict) or prior.get("role") != "tool":
+            continue
+        tcid = prior.get("tool_call_id")
+        if tcid:
+            existing_tool_call_ids.add(tcid)
+        else:
+            content = prior.get("content")
+            if isinstance(content, str):
+                existing_tool_contents.add(content)
+
+    notify_tools = {"memory", "skill_manage"}
+    call_details: dict = {}
+    for msg in review_messages or []:
+        if not isinstance(msg, dict) or msg.get("role") != "assistant":
+            continue
+        for tc in msg.get("tool_calls", []) or []:
+            if not isinstance(tc, dict):
+                continue
+            fn = tc.get("function", {}) or {}
+            fn_name = fn.get("name", "")
+            tcid = tc.get("id")
+            if fn_name not in notify_tools or not tcid:
+                continue
+            try:
+                args = json.loads(fn.get("arguments", "{}"))
+            except (json.JSONDecodeError, TypeError):
+                args = {}
+            call_details[tcid] = {
+                "tool": fn_name,
+                "action": args.get("action", ""),
+                "target": args.get("target", "memory"),
+                "content": args.get("content", ""),
+                "old_text": args.get("old_text", ""),
+                "operations": args.get("operations") or [],
+                "name": args.get("name", ""),
+                "old_string": args.get("old_string", ""),
+                "new_string": args.get("new_string", ""),
+            }
+
+    def _outcome(data: Dict[str, Any], success: bool) -> str:
+        """Return a public terminal state without publishing tool output.
+
+        Review tool replies and arguments can contain the very memory/profile/skill
+        text that this event is meant to explain.  Only recognize a small, stable
+        vocabulary from an explicit result field or conventional status wording;
+        callers receive a generic state and reason, never that source text.
+        """
+        for key in ("outcome", "state", "result", "status"):
+            value = str(data.get(key) or "").lower().replace("-", "_").replace(" ", "_")
+            if value in {"completed", "no_op", "skipped", "declined", "failed"}:
+                return value
+        text = " ".join(str(data.get(key) or "") for key in ("message", "error")).lower()
+        if any(word in text for word in ("declined", "denied", "not approved")):
+            return "declined"
+        if "skip" in text:
+            return "skipped"
+        if any(phrase in text for phrase in ("no change", "no changes", "unchanged", "already up to date", "no-op")):
+            return "no_op"
+        return "completed" if success else "failed"
+
+    def _safe_reason(target_label: str, operation: str, outcome: str) -> str:
+        noun = target_label.lower()
+        if outcome == "completed":
+            return f"{noun} {operation} completed."
+        if outcome == "no_op":
+            return f"No {noun} change was needed."
+        if outcome == "skipped":
+            return f"{target_label} review action was skipped."
+        if outcome == "declined":
+            return f"{target_label} review action was declined."
+        return f"{target_label} {operation} did not complete."
+
+    def _change_summary(operation: str, outcome: str) -> str:
+        """Bounded before/after description which cannot contain saved content."""
+        if outcome != "completed":
+            return "No stored content was changed."
+        if operation in {"add", "create"}:
+            return "Before: no new record. After: record added."
+        if operation in {"replace", "patch", "edit"}:
+            return "Before: prior record. After: updated record."
+        if operation == "remove":
+            return "Before: existing record. After: record removed."
+        return "Review action completed; stored content is redacted."
+
+    records: List[Dict[str, Any]] = []
+    for msg in review_messages or []:
+        if not isinstance(msg, dict) or msg.get("role") != "tool":
+            continue
+        tcid = msg.get("tool_call_id")
+        if tcid and tcid in existing_tool_call_ids:
+            continue
+        if not tcid:
+            content_str = msg.get("content")
+            if isinstance(content_str, str) and content_str in existing_tool_contents:
+                continue
+        # Only calls the review agent itself made this pass have a captured
+        # detail — inherited/foreign tool messages have nothing to key off.
+        detail = call_details.get(tcid)
+        if not detail:
+            continue
+
+        try:
+            data = json.loads(msg.get("content", "{}"))
+        except (json.JSONDecodeError, TypeError):
+            data = {}
+        # A buggy/legacy tool response can be a list or scalar rather than a
+        # dict (see the #59437 note in summarize_background_review_actions) —
+        # normalize so downstream .get() calls never AttributeError.
+        if not isinstance(data, dict):
+            data = {}
+
+        success = bool(data.get("success"))
+        is_skill = detail.get("tool") == "skill_manage"
+        # Never expose target or operation values received from a tool call or
+        # response. They are untrusted text just like the stored content this
+        # record deliberately redacts.
+        requested_target = detail.get("target")
+        target = "user" if not is_skill and requested_target == "user" else "memory"
+
+        if is_skill:
+            label = "Skill"
+        elif target == "user":
+            label = "User profile"
+        else:
+            label = "Memory"
+
+        memory_operations = {"add", "replace", "remove"}
+        skill_operations = {"create", "patch", "delete", "write_file", "remove_file"}
+        allowed_operations = skill_operations if is_skill else memory_operations
+
+        def _safe_operation(value: Any) -> str:
+            return value if isinstance(value, str) and value in allowed_operations else "unknown"
+
+        def _safe_skill_name(value: Any) -> Optional[str]:
+            """Return only a schema-shaped public skill identifier."""
+            if isinstance(value, str) and re.fullmatch(r"[a-z0-9][a-z0-9_-]{0,63}", value):
+                return value
+            return None
+
+        action = _safe_operation(detail.get("action"))
+        operations = detail.get("operations")
+        operations = operations if isinstance(operations, list) else []
+        target_name = "skill" if is_skill else (target or "memory")
+
+        def _record(operation: str, skill_name: Any = None) -> Dict[str, Any]:
+            outcome = _outcome(data, success)
+            record: Dict[str, Any] = {
+                "target": target_name,
+                "label": label,
+                "operation": operation,
+                # Kept for legacy consumers; new clients should render state/reason.
+                "success": outcome == "completed",
+                "message": _safe_reason(label, operation, outcome),
+                "state": outcome,
+                "reason": _safe_reason(label, operation, outcome),
+                "change_summary": _change_summary(operation, outcome),
+            }
+            if is_skill and isinstance(skill_name, str) and skill_name:
+                safe_name = _safe_skill_name(skill_name)
+                if safe_name:
+                    record["skill_name"] = safe_name
+            return record
+
+        if operations:
+            # Both memory and the schema-advertised skill_manage shape are batches.
+            # Publish one redacted record per operation, retaining only a narrow skill
+            # identifier for skill operations; never expose operation source fields.
+            for op in operations:
+                if not isinstance(op, dict):
+                    continue
+                op_act = _safe_operation(op.get("action"))
+                records.append(_record(op_act, op.get("name") if is_skill else None))
+        else:
+            records.append(_record(action, detail.get("name") if is_skill else None))
+
+    return records
+
+
 def build_memory_write_metadata(
     agent: Any, *, write_origin: Optional[str] = None, execution_context: Optional[str] = None,
     task_id: Optional[str] = None, tool_call_id: Optional[str] = None,
@@ -1045,10 +1263,30 @@ def _run_review_fork(
     st.review_agent = None
 
 
-def _publish_review_summary(agent: Any, actions: List[str]) -> None:
+def _publish_review_summary(
+    agent: Any, actions: List[str], review_messages: Optional[List[Dict]] = None,
+    messages_snapshot: Optional[List[Dict]] = None,
+) -> None:
     summary = " · ".join(dict.fromkeys(actions))
     agent._safe_print(f"  💾 Self-improvement review: {summary}")
-    if agent.background_review_callback:
+    # The structured detail callback (Desktop/TUI gateway) is a strict superset of the plain-text
+    # callback (CLI, messaging gateway) — same event plus per-action records. When both are wired,
+    # call ONLY the detail one so the surface doesn't get the same review.summary event twice.
+    detail_cb = getattr(agent, "background_review_detail_callback", None)
+    if detail_cb:
+        try:
+            detail_records = collect_background_review_actions(
+                review_messages or [], messages_snapshot or [],
+                notification_mode=getattr(agent, "memory_notifications", "on"),
+            )
+        except Exception as e:  # a malformed tool response must not take down the review pass
+            logger.warning(
+                "collect_background_review_actions returned partial results after exception "
+                "(treating as empty): %s", e)
+            detail_records = []
+        with suppress(Exception):
+            detail_cb(f"💾 Self-improvement review: {summary}", detail_records)
+    elif agent.background_review_callback:
         with suppress(Exception):
             agent.background_review_callback(f"💾 Self-improvement review: {summary}")
 
@@ -1117,7 +1355,7 @@ def _run_review_in_thread(
             actions = []
         _log_review_completion(st.review_usage, _classify_review_result(actions))
         if actions:
-            _publish_review_summary(agent, actions)
+            _publish_review_summary(agent, actions, st.review_messages, messages_snapshot)
     except Exception as e:
         logger.warning("Background memory/skill review failed: %s", e)
         if st.review_usage:

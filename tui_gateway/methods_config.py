@@ -91,7 +91,7 @@ def _(rid, params: dict) -> dict:
         if db is None:
             return _ok(rid, {"projects": [], "active_id": None, "scoped_session_ids": []})
         tree, active_id = _stamped_project_tree(
-            db, params, preview_limit=int(params.get("preview_limit") or 3), hydrate=False,
+            db, params, preview_limit=int(params.get("preview_limit") or 8), hydrate=False,
             session_limit=int(params.get("session_limit") or 2000), include_discovered=True)
         return _ok(rid, {"projects": tree["projects"], "active_id": active_id,
                          "scoped_session_ids": tree["scoped_session_ids"]})
@@ -210,8 +210,10 @@ _CONFIG_GETTERS = {
     "reasoning": _cfg_get_reasoning,
     "fast": _cfg_get_fast,
     "busy": lambda params: {"value": _load_busy_input_mode()},
-    "approval_mode": lambda params: {"value": _load_approval_mode()},
-    "approvals.mode": lambda params: {"value": _load_approval_mode()},
+    # Profile-scoped config: answer for the REQUESTED profile (the launch-scoped getters share this
+    # table, so bind the profile per-key rather than re-homing every other key).
+    "approval_mode": lambda params: {"value": _load_approval_mode(_profile_home(params.get("profile")))},
+    "approvals.mode": lambda params: {"value": _load_approval_mode(_profile_home(params.get("profile")))},
     "details_mode": lambda params: {"value": _display_word("details_mode", "collapsed", _DETAIL_MODES)},
     "thinking_mode": _cfg_get_thinking_mode,
     "density": lambda params: {"value": "on" if bool(_display_raw().get("tui_compact", False)) else "off"},

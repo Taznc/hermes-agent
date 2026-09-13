@@ -2,8 +2,8 @@ import { atom } from 'nanostores'
 
 import type { NewSessionPlacement } from '@/app/chat/new-session-drag'
 import {
+  isHomeProjectId,
   liveSessionProjectId,
-  NO_PROJECT_ID,
   type SidebarProjectTree
 } from '@/app/chat/sidebar/projects/workspace-groups'
 import type { HermesGitBaseBranch, HermesGitBranch } from '@/global'
@@ -153,7 +153,9 @@ export function resolveNewSessionCwd(): string {
 
   // Inside Home, "no folder" is the point: a new chat must stay detached rather
   // than silently attaching to the configured default dir and leaving Home.
-  if (scope === NO_PROJECT_ID) {
+  // Any profile's Home counts — in all-profiles mode a foreign bucket is keyed
+  // `__no_project__::<profile>`, and it is just as folder-less as our own.
+  if (isHomeProjectId(scope)) {
     return ''
   }
 
@@ -631,12 +633,55 @@ interface RepoScanState {
 const repoScanStates = new WeakMap<HermesGateway, RepoScanState>()
 const scanningGatewayGenerations = new WeakMap<HermesGateway, number>()
 
+// This subscription is registered once, at module load, and stays alive for
+// the life of the process — including every OTHER test file's process/worker
+// reuses (vitest keeps projects.ts's module-scope state alive across the
+// files that share a worker). Nanostores calls a fresh subscriber immediately
+// with the atom's current value, so the very first test file to import this
+// module (however indirectly, e.g. through use-background-sync.ts) runs this
+// callback synchronously against WHATEVER '@/store/gateway' resolves to for
+// that file — including a partial `vi.mock` that never intended to exercise
+// repo-scan state and doesn't export `activeGateway`. Swallow that the same
+// way a torn-down/unconfigured gateway is already handled below (no gateway
+// == not scanning) instead of letting an unrelated file's incomplete mock
+// throw an unhandled rejection into whichever test happens to be running
+// (#t_fc026713 — same "unowned work outliving its owning environment" class
+// as the local-runtime-jobs poll loop; this half of it isn't a timer, but a
+// permanent subscription with the identical failure shape).
 function syncReposScanning(): void {
-  const gateway = activeGateway()
+  let gateway: HermesGateway | null = null
+
+  try {
+    gateway = activeGateway()
+  } catch {
+    gateway = null
+  }
+
   $reposScanning.set(Boolean(gateway && scanningGatewayGenerations.has(gateway)))
 }
 
 $gateway.subscribe(syncReposScanning)
+
+// Reset the gateway-bound project cache. Projects live in the ACTIVE backend's
+// per-profile projects.db, so the list, the tree, the drilled-in scope and the
+// backend-capability verdict all describe one machine. Nanostores are not
+// React Query: nothing invalidates them, so without this a connection switch
+// keeps painting the PREVIOUS machine's projects — local repo names in the
+// sidebar while the chat runs on the remote box. Same reason the session lists
+// are wiped explicitly next door.
+//
+// The persisted $projectScope is reset too: its ids (`p_<hex>` rows and
+// filesystem paths alike) are meaningful only on the backend that issued them,
+// so a drilled-in local project would scope the remote sidebar to a project it
+// has never heard of.
+export function resetProjectsForGatewaySwitch(): void {
+  $projects.set([])
+  $activeProjectId.set(null)
+  $projectTree.set([])
+  $projectTreeLoading.set(false)
+  $projectsRpcAvailable.set(null)
+  $projectScope.set(ALL_PROJECTS)
+}
 
 export async function scanAndRecordRepos(force = false): Promise<void> {
   if (isDesktopFsRemoteMode()) {
@@ -1255,9 +1300,12 @@ export async function switchBranchInRepo(repoPath: string, branch: string): Prom
 // effect even if the path repeats.
 export interface StartWorkSessionRequest {
   draft?: string
+  /** Allocate a distinct chat surface even when the current draft has not persisted a session yet. */
+  freshSurface?: boolean
   /** Stack the fresh session as a tab when main already holds a chat (palette/⌘O opens-from-nowhere). */
   openTab?: boolean
-  path: string
+  /** Null opens a detached draft rather than inheriting a current workspace. */
+  path: null | string
   token: number
 }
 
@@ -1309,16 +1357,17 @@ export function closeWorktreeDialog(): void {
 
 let startWorkToken = 0
 
-export function requestStartWorkSession(path: string, draft?: string, options?: { openTab?: boolean }): void {
-  const target = path.trim()
-
-  if (!target) {
-    return
-  }
+export function requestStartWorkSession(
+  path: null | string | undefined,
+  draft?: string,
+  options?: { freshSurface?: boolean; openTab?: boolean }
+): void {
+  const target = path?.trim() || null
 
   startWorkToken += 1
   $startWorkSessionRequest.set({
     draft: draft?.trim() || undefined,
+    freshSurface: options?.freshSurface || undefined,
     openTab: options?.openTab || undefined,
     path: target,
     token: startWorkToken

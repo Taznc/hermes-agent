@@ -27,6 +27,7 @@ from hermes_constants import (
 from hermes_cli.env_loader import load_hermes_dotenv
 from utils import is_truthy_value
 from tools.environments.local import hermes_subprocess_env
+from tools.clarify_tool import CANCELLED_RESPONSE, TIMEOUT_RESPONSE
 from agent.replay_cleanup import sanitize_replay_history
 from agent.compaction_display import project_compaction_message_for_display  # noqa: F401
 from agent.skill_commands import describe_skill_invocation  # noqa: F401
@@ -83,10 +84,10 @@ _sessions: dict[str, dict] = {}
 _methods: dict[str, callable] = {}
 _pending: dict[str, tuple[str, threading.Event]] = {}
 _pending_prompt_payloads: dict[str, tuple[str, dict]] = {}
-_answers: dict[str, str] = {}
-# Batch clarify accumulators: rid → {"qids": [...], "answers": {qid: answer}}. Written by
-# clarify.respond (per-question lock, update-in-place), read out by _block on resolution/timeout
-# so locked answers survive the deadline.
+_answers: dict[str, Any] = {}
+# Batch clarify accumulators: rid → {"qids": [...], "answers": {qid: answer}, "notes": {qid: note}}.
+# Written by clarify.respond (per-question lock, update-in-place), read out by _block on
+# resolution/timeout so locked answers survive the deadline.
 _batch_clarify: dict[str, dict] = {}
 _db = None
 _db_error: str | None = None
@@ -160,7 +161,7 @@ _DETAIL_MODES = frozenset({"hidden", "collapsed", "expanded"})
 # git subprocess probes on an arbitrary (maybe slow) mount.
 _LONG_HANDLERS = frozenset({
     "session.foreign.list", "session.foreign.preview", "session.foreign.import",
-    "billing.state", "subscription.state", "subscription.preview", "subscription.change",
+    "billing.state", "subscription.state", "subscription.preview", "subscription.change", "clarify.explain",
     "subscription.resume", "subscription.upgrade", "usage.bars", "session.usage", "billing.step_up",
     "browser.manage", "cli.exec", "complete.path", "complete.slash", "llm.oneshot", "model.options",
     "pet.cells", "pet.gallery", "pet.generate", "pet.hatch", "pet.info", "pet.select", "pet.thumb",
@@ -642,12 +643,25 @@ def _pending_clarify_request_payload(sid: str) -> dict | None:
             # Batch clarify: replay the answers locked so far so a reconnecting client restores its ✓ state.
             if (batch := _batch_clarify.get(rid)) is not None and batch["answers"]:
                 snapshot["answers"] = dict(batch["answers"])
+                if batch.get("notes"):
+                    snapshot["notes"] = dict(batch["notes"])
             return snapshot
     if (session := _sessions.get(sid)) is not None:
         with session.get("history_lock", threading.Lock()):
             pending = session.get("_compute_host_pending_clarify")
             return dict(pending) if isinstance(pending, dict) else None
     return None
+
+
+def _has_pending_clarify_request(sid: str) -> bool:
+    """Whether ``sid`` owns a still-answerable clarify bridge request.
+
+    The request registry is the authority during a transport gap. Compute-host
+    sessions retain the same authority in their pending mirror. A detached
+    renderer can resume and replay either form; treating it as an abandoned
+    turn would turn the user-visible card into an implicit empty response.
+    """
+    return _pending_clarify_request_payload(sid) is not None
 
 
 def _pending_approval_request_payload(session_key: str) -> dict | None:
@@ -913,7 +927,11 @@ def _wire_session_agent(sid: str, key: str, agent) -> bool:
         load_permanent_allowlist()
     _wire_callbacks(sid)
     with contextlib.suppress(Exception):  # bare agents without the attribute must not break startup
-        agent.background_review_callback = lambda message, _sid=sid: _emit("review.summary", _sid, {"text": str(message)})
+        # The detail callback (not just the plain-text background_review_callback) so the desktop's
+        # review.summary event carries structured per-action records too (Desktop's expandable
+        # self-improvement row); Ink/TUI consumers only read `text` and ignore `actions`.
+        agent.background_review_detail_callback = lambda message, records, _sid=sid: _emit(
+            "review.summary", _sid, {"text": str(message), "actions": records})
         agent.memory_notifications = _load_memory_notifications()
     return notify_registered
 
@@ -1129,12 +1147,35 @@ def _load_cfg_raw() -> dict:
         p = _active_config_path()
         mtime = p.stat().st_mtime if p.exists() else None
         with _cfg_lock:
-            if _cfg_cache is not None and _cfg_mtime == mtime and _cfg_path == p:
-                return copy.deepcopy(_cfg_cache)
+            # Take only a REFERENCE under the lock, then copy outside it. The
+            # cached dict is immutable by construction (every writer installs a
+            # freshly-built private snapshot and never mutates one in place), so
+            # a reader that grabbed the old object still walks a consistent
+            # graph after a concurrent swap. Deep-copying while holding the lock
+            # turned this ~1us pointer read into a ~90us critical section that
+            # every other config read had to queue behind — a convoy that
+            # starved the hermes-change-watcher thread and, through it, the
+            # asyncio accept loop (backend stays "active (running)" while
+            # connections pile up unaccepted in the socket's Recv-Q).
+            cached = (
+                _cfg_cache
+                if (_cfg_cache is not None and _cfg_mtime == mtime and _cfg_path == p)
+                else None
+            )
+        if cached is not None:
+            return copy.deepcopy(cached)
         from hermes_cli.config import read_user_config_raw
         data = read_user_config_raw(p) if p.exists() else {}
-        with _cfg_lock:  # cache the RAW config: _save_cfg writes _cfg_cache back to disk
-            _cfg_cache, _cfg_mtime, _cfg_path = copy.deepcopy(data), mtime, p
+        # Cache the RAW user config (no managed overlay) so _save_cfg, which
+        # writes _cfg_cache back to disk, never persists managed values into
+        # the user's file. The managed overlay is applied on every return
+        # path instead (read-side only). Built OUTSIDE the lock, then installed
+        # with a bare reference swap, so the critical section stays O(1).
+        snapshot = copy.deepcopy(data)
+        with _cfg_lock:
+            _cfg_cache = snapshot
+            _cfg_mtime = mtime
+            _cfg_path = p
         return data
     return {}
 
@@ -1173,12 +1214,20 @@ def _save_cfg(cfg: dict):
     # Comment-, ordering- and Unicode-preserving write (a plain safe_dump clobbered hand-written configs);
     # fails closed on an unreadable existing config.yaml like atomic_config_write.
     atomic_roundtrip_yaml_save(path, cfg)
+    # Snapshot the caller's dict (they keep mutating theirs) and stat the file
+    # BEFORE taking the lock: both are expensive relative to the swap, and
+    # holding _cfg_lock across them convoys every concurrent config reader.
+    # The installed object is private to the cache and never mutated in place,
+    # which is what lets _load_cfg_raw copy it outside the lock.
+    snapshot = copy.deepcopy(cfg)
+    try:
+        mtime = path.stat().st_mtime
+    except Exception:
+        mtime = None
     with _cfg_lock:
-        _cfg_cache, _cfg_path = copy.deepcopy(cfg), path
-        try:
-            _cfg_mtime = path.stat().st_mtime
-        except Exception:
-            _cfg_mtime = None
+        _cfg_cache = snapshot
+        _cfg_path = path
+        _cfg_mtime = mtime
 
 
 def _session_for_key(session_key: str) -> dict | None:
@@ -1238,18 +1287,31 @@ _EXPIRING_REQUESTS = frozenset({
 })
 
 
-def _block(event: str, sid: str, payload: dict, timeout: float | None = 300, batch_qids: list[str] | None = None) -> str:
+def _block(
+    event: str,
+    sid: str,
+    payload: dict,
+    timeout: float | None = 300,
+    batch_qids: list[str] | None = None,
+) -> Any:
     rid = uuid.uuid4().hex[:8]
     ev = threading.Event()
     with _prompt_lock:
         _pending[rid] = (sid, ev)
         payload["request_id"] = rid
+        # Tell renderers how long the bridge can stay blocked: a finite
+        # positive timeout means the server gives up after it (the renderer
+        # may then drop a stale dialog once the turn ends); None means the
+        # request blocks until a real answer (clarify_timeout <= 0), in which
+        # case renderers must NOT drop the dialog on turn-end events (#83319).
+        if timeout is not None and timeout > 0:
+            payload["timeout_seconds"] = float(timeout)
         _pending_prompt_payloads[rid] = (event, dict(payload))
         if batch_qids:
             # Multi-question clarify: per-question answers accumulate here (update-in-place until every
             # qid is locked); locked answers survive a timeout — see the batch read-out below.
-            _batch_clarify[rid] = {"qids": list(batch_qids), "answers": {}}
-    answered, batch_answers = False, None
+            _batch_clarify[rid] = {"qids": list(batch_qids), "answers": {}, "notes": {}}
+    answered, batch_answers, batch_notes = False, None, None
     try:
         _emit(event, sid, payload)
         # Event semantics: None → wait forever (clarify_timeout <= 0; released only by a real answer or
@@ -1263,19 +1325,29 @@ def _block(event: str, sid: str, payload: dict, timeout: float | None = 300, bat
             answer = _answers.pop(rid, "")
             if (batch_state := _batch_clarify.pop(rid, None)) is not None:
                 batch_answers = dict(batch_state["answers"])
+                batch_notes = dict(batch_state.get("notes") or {})
     expire = lambda: _emit(f"{event.removesuffix('.request')}.expire", sid, {"request_id": rid})
     if batch_qids is not None:
-        # Cancel-all (respond with no question_id) resolves via _answers with "" — a plain cancel, not a partial result.
+        # Deliberate UI Skip/cancel-all keeps the historic empty bridge value;
+        # an interrupted turn gets a reason-aware result that clarify_tool
+        # projects as ``cancelled`` rather than an answered blank.
         if answer_present:
+            if answer == CANCELLED_RESPONSE:
+                return json.dumps({"answers": batch_answers or {}, "cancelled": True}, ensure_ascii=False)
             return answer
         result: dict[str, object] = {"answers": batch_answers or {}}
+        if batch_notes:
+            result["notes"] = batch_notes
         if not answered:
             # Deadline hit: keep what was locked, report the rest as absences (not skips), still expire live cards.
             result["timed_out"] = True
             expire()
         return json.dumps(result, ensure_ascii=False)
-    if not answered and not answer_present and event in _EXPIRING_REQUESTS:
-        expire()
+    if not answered and not answer_present:
+        if event in _EXPIRING_REQUESTS:
+            expire()
+        if event == "clarify.request":
+            return TIMEOUT_RESPONSE
     return answer
 
 
@@ -1343,13 +1415,29 @@ def _tour_request(sid: str, payload: dict) -> str:
 
 
 def _clear_pending(sid: str | None = None) -> None:
-    """Release pending prompts with an empty answer: only *sid*'s (session.interrupt must not cancel other
-    sessions' prompts), or every one when *sid* is None (shutdown)."""
+    """Release pending prompts: only *sid*'s (session.interrupt must not cancel other sessions' prompts),
+    or every one when *sid* is None (shutdown).  Clarify stops carry a cancellation sentinel so they never
+    masquerade as a deliberate UI Skip at the tool-result seam."""
     with _prompt_lock:
         for rid, (owner_sid, ev) in list(_pending.items()):
             if sid is None or owner_sid == sid:
-                _answers[rid] = ""
+                event = _pending_prompt_payloads.get(rid, ("", {}))[0]
+                _answers[rid] = CANCELLED_RESPONSE if event == "clarify.request" else ""
                 ev.set()
+                # #86036 follow-up: tell the client the wait is GONE. Without
+                # this, a desktop clarify parked on a wait-forever request
+                # stays actionable after /stop cleared the server side —
+                # clicking it can only produce a failed response.
+                event, payload = _pending_prompt_payloads.get(rid, ("", {}))
+                if event.startswith("clarify.request"):
+                    cancel_event = event.replace("clarify.request", "clarify.cancel", 1)
+                    try:
+                        _emit(cancel_event, owner_sid, dict(payload))
+                    except Exception:
+                        logger.debug(
+                            "failed to emit %s for rid %s", cancel_event, rid,
+                            exc_info=True,
+                        )
 
 
 # ── Agent factory ────────────────────────────────────────────────────
@@ -1676,12 +1764,33 @@ _BOOL_WORDS = {
 }
 
 
-def _load_approval_mode() -> str:
+def _load_approval_mode(profile_home=None) -> str:
     """Effective ``approvals.mode`` via the gate's own ``_get_approval_mode`` (a raw re-read missed the
-    managed overlay and ``${VAR}`` expansion)."""
+    managed overlay and ``${VAR}`` expansion).
+
+    ``profile_home`` binds that profile's ``HERMES_HOME`` for the lookup. Approval mode is
+    PROFILE-scoped config, so a caller that knows which profile it is answering for must say so —
+    otherwise the mode resolves against whichever profile launched this backend (one backend serves
+    every profile in the desktop's app-global remote mode, which is how a profile configured
+    ``smart`` reported ``manual``). Omit it only when the launch profile genuinely is the subject."""
     from tools.approval_context import _get_approval_mode
-    mode = _get_approval_mode()
-    return mode if mode in _APPROVAL_MODES else "manual"
+
+    def _resolved() -> str:
+        mode = _get_approval_mode()
+        return mode if mode in _APPROVAL_MODES else "manual"
+
+    # Already resolving against this profile (it IS the launch profile, or an enclosing scope bound
+    # it): skip a redundant contextvar push/pop on a hot payload path.
+    if profile_home is None:
+        return _resolved()
+    effective = get_hermes_home_override() or str(_hermes_home)
+    if str(profile_home) == str(effective):
+        return _resolved()
+    token = set_hermes_home_override(profile_home)
+    try:
+        return _resolved()
+    finally:
+        reset_hermes_home_override(token)
 
 
 def _coerce_statusbar(raw) -> str:
@@ -1982,8 +2091,9 @@ def _current_profile_name() -> str:
 # Monotonic GUI<->backend contract version: the desktop refuses a backend reporting less (or none) with a
 # one-click "update to align" prompt; bump whenever the desktop's backend contract changes. v2 file.attach;
 # v3 approvals.mode RPCs + session.info reconciliation; v4 session.create fast=false = explicit normal tier;
-# v5 ws_max_size >16 MiB file.attach frames; v6 plugins.manage rows carry the canonical registry key.
-DESKTOP_BACKEND_CONTRACT = 6
+# v5 ws_max_size >16 MiB file.attach frames; v6 plugins.manage rows carry the canonical registry key;
+# v7 file.attach_open/_chunk/_commit/_abort (chunked non-image upload; whole-file file.attach stays for compat).
+DESKTOP_BACKEND_CONTRACT = 7
 
 
 def _session_usage_snapshot(session: dict | None) -> dict:
@@ -2032,13 +2142,20 @@ def _session_info(agent, session: dict | None = None) -> dict:
     service_tier = getattr(agent, "service_tier", None) or mirror.get("service_tier") or ""
     # yolo ORs the same three sources check_all_command_guards() does (approvals.mode=off, the process
     # --yolo env, the per-session flag): the session flag alone would show "off" while config auto-approves.
+    # Approval mode is PROFILE-scoped and this payload also reports `profile_name` from the session's
+    # own `profile_home`; resolving against the ambient home made the two fields describe DIFFERENT
+    # profiles in one dict. Bind the session's profile so both answer for the same one, and seed from
+    # the resolver (its own fail-safe) rather than a second, less-informed "manual" guess.
+    try:
+        approval_mode = _load_approval_mode(sess.get("profile_home") or None)
+    except Exception:
+        approval_mode = "manual"
     try:
         from tools.approval import _YOLO_MODE_FROZEN, is_session_yolo_enabled
         session_yolo = bool(is_session_yolo_enabled(session_key)) if session_key else False
-        approval_mode = _load_approval_mode()
         yolo = bool(_YOLO_MODE_FROZEN) or session_yolo or approval_mode == "off"
     except Exception:
-        yolo, approval_mode = False, "manual"
+        yolo = approval_mode == "off"
     # A switch queued mid-turn applies at next turn start (agent.model still reads the OLD model); report the
     # pending pick so the end-of-turn settle doesn't blip the UI back first.
     pending_switch = sess.get("pending_model_switch") or {}
@@ -3018,6 +3135,7 @@ def _start_usage_ticker(sid: str, agent, interval: float = 1.0) -> tuple[threadi
 def _respond(rid, params, key, *, allow_expired=False):
     r = params.get("request_id", "")
     question_id = str(params.get("question_id") or "")
+    note = str(params.get("note") or "")
     with _prompt_lock:
         entry = _pending.get(r)
         if not entry:
@@ -3029,12 +3147,23 @@ def _respond(rid, params, key, *, allow_expired=False):
             if question_id not in batch["qids"]:
                 return _err(rid, 4002, f"unknown question_id {question_id!r}")
             batch["answers"][question_id] = params.get(key, "")
+            if note:
+                batch.setdefault("notes", {})[question_id] = note
+            elif (notes := batch.get("notes")) is not None:
+                notes.pop(question_id, None)
             if not (remaining := [qid for qid in batch["qids"] if qid not in batch["answers"]]):
                 ev.set()
-            return _ok(rid, {"status": "ok", "remaining": remaining})
-        _answers[r] = params.get(key, "")
+            result = {"status": "ok", "remaining": remaining}
+            if note:
+                result["note"] = note
+            return _ok(rid, result)
+        answer = params.get(key, "")
+        _answers[r] = {"answer": answer, "note": note} if key == "answer" and note else answer
         ev.set()
-    return _ok(rid, {"status": "ok"})
+    result = {"status": "ok"}
+    if note:
+        result["note"] = note
+    return _ok(rid, result)
 
 
 # ── Methods: tools & system ──────────────────────────────────────────
@@ -3213,3 +3342,7 @@ for _m in (
     _methods_session_control, _methods_subagents):
     _m.register(sys.modules[__name__])
 del _m
+
+# >>> FORK ANCHOR: gateway-fork-methods <<<
+from hermes_fork.gateway import register_fork_gateway_methods as _register_fork_gateway_methods  # noqa: E402
+_register_fork_gateway_methods(sys.modules[__name__])

@@ -1,6 +1,10 @@
-import { describe, expect, it } from 'vitest'
+import { cleanup, render, waitFor } from '@testing-library/react'
+import React from 'react'
+import { afterEach, describe, expect, it, vi } from 'vitest'
 
-import { formatRefValue, hermesDirectiveFormatter } from './directive-text'
+import { $connection } from '@/store/session'
+
+import { DirectiveContent, formatRefValue, hermesDirectiveFormatter } from './directive-text'
 
 describe('formatRefValue', () => {
   it('leaves simple paths untouched', () => {
@@ -92,5 +96,35 @@ describe('inline skill references', () => {
     )
 
     expect(mentions.map(segment => (segment.kind === 'mention' ? segment.type : ''))).toEqual(['skill', 'file'])
+  })
+})
+
+describe('DirectiveContent image directive (#94xxx regression)', () => {
+  afterEach(() => {
+    cleanup()
+    $connection.set(null)
+    vi.unstubAllGlobals()
+  })
+
+  it('does not throw when the bridge omits readFileDataUrl (web-shim mode)', async () => {
+    // The web-served desktop's bridge shim deliberately has no readFileDataUrl
+    // member at all (see web-bridge-shim.ts) — `window.hermesDesktop` exists
+    // but the method does not. `?.` on the object only guards a missing
+    // OBJECT; calling the missing method bare still throws
+    // "readFileDataUrl is not a function" and previously crashed the whole
+    // message render.
+    $connection.set({ mode: 'local' } as never)
+    vi.stubGlobal('window', { ...window, hermesDesktop: {} })
+
+    let rendered!: ReturnType<typeof render>
+
+    expect(() => {
+      rendered = render(React.createElement(DirectiveContent, { text: '@image:/tmp/pic.png' }))
+    }).not.toThrow()
+
+    // Falls back to the chip instead of crashing the render.
+    await waitFor(() => expect(rendered.container.querySelector('[data-ref="image"]')).toBeTruthy(), {
+      container: rendered.container
+    })
   })
 })

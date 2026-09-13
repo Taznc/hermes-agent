@@ -1885,6 +1885,32 @@ class TestSystemdCgroupIsolation:
     ENTIRE gateway cgroup, taking down the messaging control plane.
     """
 
+    @pytest.fixture(autouse=True)
+    def _placement_gives_no_answer(self, monkeypatch):
+        """State this class's PLACEMENT input: "the kernel says nothing".
+
+        Every test here simulates a topology through IDENTITY — ``INVOCATION_ID`` /
+        ``SYSTEMD_EXEC_PID`` / ``_HERMES_GATEWAY`` / ``get_running_pid`` — which is data
+        a test can set. Placement is not: ``_scope_needed_by_cgroup_placement`` reads the
+        TEST RUNNER's own real cgroup, so without pinning it the verdict is decided by
+        where the suite happens to run. That is not hypothetical on this fleet: run from
+        inside a supervised ``hermes-*`` unit, five of these tests fail because placement
+        correctly answers True and the command IS wrapped, while they assert a direct
+        ``/bin/bash`` argv; run from inside a ``hermes-worker-*`` scope, the tests
+        asserting a wrap would instead read "already isolated" and silently pass for the
+        wrong reason.
+
+        Pinning it to ``None`` (a cgroup-v1 host, or a container that hides
+        ``/proc/self/cgroup``) makes this class deterministically exercise the identity
+        fallback on any host. Placement itself is covered by
+        ``TestSupervisedUnitCgroupPlacement``, and end to end — in a real supervised-unit
+        cgroup, with a real fork — by
+        ``tests/hermes_cli/test_kanban_gateway_restart_handoff.py``.
+        """
+        monkeypatch.setattr(
+            "tools.process_registry._scope_needed_by_cgroup_placement", lambda: None
+        )
+
     @pytest.fixture()
     def _gateway_identity(self, monkeypatch):
         """Opt-in: mark this test as running AS the live gateway process."""
@@ -1914,11 +1940,14 @@ class TestSystemdCgroupIsolation:
     def test_wraps_in_systemd_scope_when_supervisor_and_available(
         self, registry, monkeypatch, _gateway_identity
     ):
-        """Under a supervisor with systemd-run available, the spawn argv is
-        wrapped in ``systemd-run --user --scope --unit=hermes-worker-<id>``."""
+        """Under a supervisor, a transient service preserves tracking and joins the worker slice."""
         fake_popen, captured = self._fake_popen_capture()
 
         monkeypatch.setattr("tools.process_registry._find_shell", lambda: "/bin/bash")
+        monkeypatch.setattr(
+            "tools.process_registry._worker_memory_max_bytes",
+            lambda: 4 * 1024 * 1024 * 1024,
+        )
         monkeypatch.setattr(
             "tools.process_registry._systemd_run_user_scope_available",
             lambda: True,
@@ -1940,30 +1969,30 @@ class TestSystemdCgroupIsolation:
         argv = captured["argv"]
         assert argv[0] == "/usr/bin/systemd-run", argv
         assert "--user" in argv
-        assert "--scope" in argv
+        assert "--scope" not in argv
+        assert "--pipe" in argv
         assert "--quiet" in argv, (
             "systemd-run argv must include --quiet (#70716 gap #3)"
         )
         assert "--unit" in argv
         unit_idx = argv.index("--unit")
-        assert argv[unit_idx + 1].startswith("hermes-worker-"), argv
-        assert argv[unit_idx + 1] == f"hermes-worker-{session.id}", (
-            argv
-        )  # _build_systemd_scope_argv uses bare name
+        assert argv[unit_idx + 1] == f"hermes-worker-{session.id}", argv
         properties = [
-            argv[index + 1]
-            for index, value in enumerate(argv[:-1])
-            if value == "--property"
+            value.partition("=")[2]
+            if value.startswith("--property=")
+            else argv[index + 1]
+            for index, value in enumerate(argv)
+            if value.startswith("--property=") or value == "--property"
         ]
-        assert "MemoryAccounting=yes" in properties
-        # systemd rejects OOMPolicy= on transient --scope units across the versions
-        # users run (239/245/249, #102486); emitting it fails the probe and every
-        # cron worker dispatch. MemoryMax + MemoryAccounting carry the isolation.
-        assert not any(p.startswith("OOMPolicy=") for p in properties), properties
-        memory_max = next(
-            value for value in properties if value.startswith("MemoryMax=")
-        )
-        assert int(memory_max.split("=", 1)[1]) > 0
+        assert {
+            "MemoryAccounting=yes",
+            "MemoryHigh=3G",
+            f"MemoryMax={4 * 1024 * 1024 * 1024}",
+            "TimeoutStopSec=30s",
+            # The fork spawns a transient SERVICE (--pipe, no --scope), which accepts OOMPolicy;
+            # upstream dropped it only because transient scopes reject it on systemd <253 (#102486).
+            "OOMPolicy=kill",
+        }.issubset(properties)
         # The original shell command must still be present at the tail,
         # after the ``--`` separator that prevents systemd-run from
         # interpreting command flags as its own.
@@ -1978,7 +2007,7 @@ class TestSystemdCgroupIsolation:
         # (and the scoped worker below it) a private session.
         assert captured["start_new_session"] is True
         # The session must record the unit name so kill_process can stop it.
-        assert session.systemd_unit == f"hermes-worker-{session.id}.scope"
+        assert session.systemd_unit == f"hermes-worker-{session.id}.service"
 
     def test_falls_back_when_systemd_run_unavailable(self, registry, monkeypatch, _gateway_identity):
         """Under a supervisor but without systemd-run, fall back to the
@@ -2045,6 +2074,9 @@ class TestSystemdCgroupIsolation:
         """
         monkeypatch.setenv("INVOCATION_ID", "herdr-service-inherited-marker")
         monkeypatch.delenv("_HERMES_GATEWAY", raising=False)
+        # SYSTEMD_EXEC_PID is inherited too; a descendant's pid never matches the
+        # unit's main pid, which is what keeps this path off the scope branch.
+        monkeypatch.setenv("SYSTEMD_EXEC_PID", str(os.getpid() + 1))
         monkeypatch.setattr("tools.process_registry._find_shell", lambda: "/bin/bash")
         monkeypatch.setattr(
             "tools.process_registry._systemd_run_user_scope_available",
@@ -2092,6 +2124,7 @@ class TestSystemdCgroupIsolation:
         """
         monkeypatch.setenv("INVOCATION_ID", "inherited-systemd-marker")
         monkeypatch.setenv("_HERMES_GATEWAY", "1")
+        monkeypatch.setenv("SYSTEMD_EXEC_PID", str(os.getpid() + 1))
         monkeypatch.setattr(
             "gateway.status.get_running_pid",
             lambda *, cleanup_stale=False: os.getpid() + 1,
@@ -2162,7 +2195,7 @@ class TestSystemdCgroupIsolation:
 
         stop_unit.assert_called_once()
         assert stop_unit.call_args.args[0].startswith("hermes-worker-proc_")
-        assert stop_unit.call_args.args[0].endswith(".scope")
+        assert stop_unit.call_args.args[0].endswith(".service")
         killpg.assert_not_called()
 
     def test_pty_spawn_is_wrapped_in_systemd_scope(self, registry, monkeypatch, _gateway_identity):
@@ -2190,11 +2223,12 @@ class TestSystemdCgroupIsolation:
 
         argv = pty_spawn.call_args.args[0]
         assert argv[0] == "/usr/bin/systemd-run"
-        assert "--scope" in argv
+        assert "--scope" not in argv
+        assert "--pipe" in argv
         assert "--unit" in argv
         assert "--" in argv
         assert argv[-3:] == ["/bin/bash", "-lic", "set +m; codex"]
-        assert session.systemd_unit == f"hermes-worker-{session.id}.scope"
+        assert session.systemd_unit == f"hermes-worker-{session.id}.service"
 
     def test_pty_spawn_failure_reaps_scope_before_distinct_pipe_fallback(
         self, registry, monkeypatch, _gateway_identity
@@ -2242,13 +2276,13 @@ class TestSystemdCgroupIsolation:
         assert [event[0] for event in events] == ["pty", "stop", "pipe"]
         stopped_unit = events[1][1]
         fallback_argv = events[2][1]
-        assert stopped_unit == f"hermes-worker-{session.id}.scope"
+        assert stopped_unit == f"hermes-worker-{session.id}.service"
         unit_idx = fallback_argv.index("--unit")
         assert fallback_argv[unit_idx + 1] == (
             f"hermes-worker-{session.id}-pipe-fallback"
         )
         assert session.systemd_unit == (
-            f"hermes-worker-{session.id}-pipe-fallback.scope"
+            f"hermes-worker-{session.id}-pipe-fallback.service"
         )
 
     def test_pty_spawn_failure_does_not_fallback_when_scope_reap_fails(
@@ -2368,10 +2402,21 @@ class TestSystemdCgroupIsolation:
         assert first is True
         assert second is True
         assert len(probe_calls) == 1, "probe must run only once (cached)"
-        # The probe must not carry OOMPolicy= either: that is the argv systemd
-        # rejected on scope units and cached as "unavailable" (#102486).
+        # The probe must mint the SAME unit shape the real spawn does, so a
+        # cached "available" verdict is evidence about the argv that will
+        # actually run. This fork spawns a transient SERVICE (--pipe, no
+        # --scope) into hermes-workers.slice, and a service accepts OOMPolicy=,
+        # so the probe carries it too. Upstream drops OOMPolicy because ITS
+        # probe/spawn use --scope, where older systemd rejected it (#102486) —
+        # a constraint that does not apply to the shape minted here. Verified
+        # live on systemd 255: `systemd-run --user --pipe ... --property
+        # OOMPolicy=kill -- /bin/true` exits 0.
         probe_argv = probe_calls[0][0]
-        assert not any(
+        assert "--scope" not in probe_argv, probe_argv
+        assert any(
+            value == "--pipe" for value in probe_argv if isinstance(value, str)
+        ), probe_argv
+        assert any(
             value.startswith("OOMPolicy=") for value in probe_argv if isinstance(value, str)
         ), probe_argv
 
@@ -2534,6 +2579,383 @@ class TestSystemdCgroupIsolation:
 
         assert pr._systemd_run_user_scope_available() is False
         assert probe_runs == [], "non-Linux must not exec the probe"
+
+    @pytest.mark.linux_only
+    def test_probe_prepares_the_user_bus_environment_first(self, monkeypatch):
+        """The probe must populate XDG_RUNTIME_DIR / DBUS_SESSION_BUS_ADDRESS itself.
+
+        A systemd SERVICE environment carries neither, so ``systemd-run --user`` fails with
+        "Failed to connect to bus: No medium found" and every worker silently lands back in
+        the unit's own cgroup. The gateway path only ever worked because an unrelated
+        ``systemctl --user`` call had already mutated ``os.environ`` as a side effect.
+        """
+        import tools.process_registry as pr
+
+        monkeypatch.setattr(pr, "_SYSTEMD_SCOPE_AVAILABLE", None)
+        monkeypatch.setattr("shutil.which", lambda name: "/usr/bin/systemd-run")
+        monkeypatch.delenv("XDG_RUNTIME_DIR", raising=False)
+        monkeypatch.delenv("DBUS_SESSION_BUS_ADDRESS", raising=False)
+
+        env_at_probe = {}
+
+        def fake_run(argv, **kwargs):
+            env_at_probe["xdg"] = os.environ.get("XDG_RUNTIME_DIR")
+            return subprocess.CompletedProcess(args=argv, returncode=0)
+
+        monkeypatch.setattr("subprocess.run", fake_run)
+        monkeypatch.setattr(
+            "hermes_cli.gateway._ensure_user_systemd_env",
+            lambda: os.environ.__setitem__("XDG_RUNTIME_DIR", "/run/user/4242"),
+        )
+
+        assert pr._systemd_run_user_scope_available() is True
+        assert env_at_probe["xdg"] == "/run/user/4242", (
+            "the user-bus environment must be prepared BEFORE systemd-run is exec'd"
+        )
+
+    def test_probe_env_preparation_failure_is_not_fatal(self, monkeypatch):
+        """A broken environment helper degrades to "bus unreachable", never an exception."""
+        import tools.process_registry as pr
+
+        monkeypatch.setattr(pr, "_SYSTEMD_SCOPE_AVAILABLE", None)
+        monkeypatch.setattr(pr, "_IS_LINUX", True)
+        monkeypatch.setattr("shutil.which", lambda name: "/usr/bin/systemd-run")
+        monkeypatch.setattr(
+            "hermes_cli.gateway._ensure_user_systemd_env",
+            lambda: (_ for _ in ()).throw(RuntimeError("no runtime dir")),
+        )
+        monkeypatch.setattr(
+            "subprocess.run",
+            lambda argv, **kwargs: subprocess.CompletedProcess(args=argv, returncode=0),
+        )
+
+        assert pr._systemd_run_user_scope_available() is True
+
+
+class TestSupervisedWorkerDispatcherIdentity:
+    """``_is_supervised_worker_dispatcher`` covers BOTH units that dispatch workers.
+
+    The web-desktop backend (``hermes serve``) runs the same kanban dispatcher as the
+    gateway in a different unit with ``KillMode=control-group``. Gating on "am I the
+    gateway" left its workers unwrapped in the unit's cgroup, so one ``systemctl stop``
+    SIGKILLed five in-flight workers at once.
+    """
+
+    def test_gateway_main_process_qualifies(self, monkeypatch):
+        import tools.process_registry as pr
+
+        monkeypatch.setattr(pr, "_is_supervised_gateway_process", lambda: True)
+        monkeypatch.delenv("INVOCATION_ID", raising=False)
+        monkeypatch.delenv("SYSTEMD_EXEC_PID", raising=False)
+
+        assert pr._is_supervised_worker_dispatcher() is True
+
+    def test_non_gateway_systemd_service_main_process_qualifies(self, monkeypatch):
+        import tools.process_registry as pr
+
+        monkeypatch.setattr(pr, "_is_supervised_gateway_process", lambda: False)
+        monkeypatch.setenv("INVOCATION_ID", "webdesktop-backend")
+        monkeypatch.setenv("SYSTEMD_EXEC_PID", str(os.getpid()))
+
+        assert pr._is_supervised_worker_dispatcher() is True
+
+    def test_service_descendant_does_not_qualify(self, monkeypatch):
+        """Both markers are inherited; only the unit's own main pid may mint scopes."""
+        import tools.process_registry as pr
+
+        monkeypatch.setattr(pr, "_is_supervised_gateway_process", lambda: False)
+        monkeypatch.setenv("INVOCATION_ID", "inherited-by-every-child")
+        monkeypatch.setenv("SYSTEMD_EXEC_PID", str(os.getpid() + 1))
+
+        assert pr._is_supervised_worker_dispatcher() is False
+
+    def test_plain_cli_process_does_not_qualify(self, monkeypatch):
+        import tools.process_registry as pr
+
+        monkeypatch.setattr(pr, "_is_supervised_gateway_process", lambda: False)
+        monkeypatch.delenv("INVOCATION_ID", raising=False)
+        monkeypatch.delenv("SYSTEMD_EXEC_PID", raising=False)
+
+        assert pr._is_supervised_worker_dispatcher() is False
+
+    def test_exec_pid_without_invocation_id_does_not_qualify(self, monkeypatch):
+        """A stale/forged SYSTEMD_EXEC_PID alone is not proof of supervision."""
+        import tools.process_registry as pr
+
+        monkeypatch.setattr(pr, "_is_supervised_gateway_process", lambda: False)
+        monkeypatch.delenv("INVOCATION_ID", raising=False)
+        monkeypatch.setenv("SYSTEMD_EXEC_PID", str(os.getpid()))
+
+        assert pr._is_supervised_worker_dispatcher() is False
+
+
+class TestScopeSpawnEnvironment:
+    """The wrapped ``systemd-run --user`` needs the user-bus vars in the CHILD env.
+
+    Callers snapshot ``os.environ`` before asking for the scoped argv, so the probe's
+    late resolution of XDG_RUNTIME_DIR / DBUS_SESSION_BUS_ADDRESS never reached the
+    ``Popen`` env — systemd-run exec'd with no bus and died with
+    "Failed to connect to bus: No medium found" before the worker ever started.
+    """
+
+    @pytest.fixture()
+    def _supervised_service(self, monkeypatch):
+        import tools.process_registry as pr
+
+        monkeypatch.setattr(pr, "_IS_LINUX", True)
+        monkeypatch.setattr(pr, "_is_supervised_gateway_process", lambda: False)
+        monkeypatch.setenv("INVOCATION_ID", "supervised-unit")
+        monkeypatch.setenv("SYSTEMD_EXEC_PID", str(os.getpid()))
+        # A host where cgroup placement gives no answer (v1, or a container that hides
+        # /proc/self/cgroup), so the identity fallback is what decides. Without this the
+        # verdict would come from the *test runner's own* cgroup, which under CI-in-a-
+        # worker-scope reads "already isolated" and skips the wrap this test is about.
+        monkeypatch.setattr(pr, "_scope_needed_by_cgroup_placement", lambda: None)
+        monkeypatch.setattr(pr, "_systemd_run_user_scope_available", lambda: True)
+        monkeypatch.setattr("shutil.which", lambda name: "/usr/bin/systemd-run")
+        return pr
+
+    def test_user_bus_vars_are_copied_into_the_child_env(
+        self, _supervised_service, monkeypatch
+    ):
+        pr = _supervised_service
+        monkeypatch.setenv("XDG_RUNTIME_DIR", "/run/user/4242")
+        monkeypatch.setenv("DBUS_SESSION_BUS_ADDRESS", "unix:path=/run/user/4242/bus")
+        # A pre-scope snapshot, exactly like the dispatcher's build_subprocess_env().
+        child_env = {"HERMES_HOME": "/tmp/home"}
+
+        argv = pr.restart_safe_supervised_child_argv(
+            ["hermes", "chat"], unit_suffix="kanban-t_x-run-1", env=child_env
+        )
+
+        assert argv[0] == "/usr/bin/systemd-run"
+        assert child_env["XDG_RUNTIME_DIR"] == "/run/user/4242"
+        assert child_env["DBUS_SESSION_BUS_ADDRESS"] == "unix:path=/run/user/4242/bus"
+        assert child_env["HERMES_HOME"] == "/tmp/home", "caller's own keys survive"
+
+    def test_child_env_is_untouched_when_no_scope_is_minted(self, monkeypatch):
+        """An unsupervised caller keeps a byte-identical env (no stray bus vars)."""
+        import tools.process_registry as pr
+
+        monkeypatch.setattr(pr, "_is_supervised_gateway_process", lambda: False)
+        monkeypatch.setattr(pr, "_scope_needed_by_cgroup_placement", lambda: None)
+        monkeypatch.delenv("INVOCATION_ID", raising=False)
+        monkeypatch.delenv("SYSTEMD_EXEC_PID", raising=False)
+        monkeypatch.setenv("XDG_RUNTIME_DIR", "/run/user/4242")
+        child_env = {"HERMES_HOME": "/tmp/home"}
+
+        command = ["hermes", "chat"]
+        assert pr.restart_safe_supervised_child_argv(
+            command, unit_suffix="kanban-t_x-run-1", env=child_env
+        ) is command
+        assert child_env == {"HERMES_HOME": "/tmp/home"}
+
+    def test_absent_user_bus_vars_are_not_invented(
+        self, _supervised_service, monkeypatch
+    ):
+        """Nothing is written when the probe could not resolve a bus address."""
+        pr = _supervised_service
+        monkeypatch.delenv("XDG_RUNTIME_DIR", raising=False)
+        monkeypatch.delenv("DBUS_SESSION_BUS_ADDRESS", raising=False)
+        child_env = {"HERMES_HOME": "/tmp/home"}
+
+        pr.restart_safe_supervised_child_argv(
+            ["hermes", "chat"], unit_suffix="kanban-t_x-run-1", env=child_env
+        )
+
+        assert "XDG_RUNTIME_DIR" not in child_env
+        assert "DBUS_SESSION_BUS_ADDRESS" not in child_env
+
+
+class TestSupervisedUnitCgroupPlacement:
+    """Placement, not identity, decides whether a child needs its own scope.
+
+    ``INVOCATION_ID`` / ``SYSTEMD_EXEC_PID`` are inherited by every descendant, so identity
+    alone cannot tell a dispatch tick running in a CHILD of a supervised unit's main
+    process from an arbitrary CLI process. It answered False for the descendant, the worker
+    was ``Popen``'d unwrapped into ``hermes-webdesktop-backend.service``'s own cgroup with
+    no log line, and one leaked worker measured 1853 MiB against that unit's 3G
+    ``MemoryHigh``.
+
+    cgroup membership is kernel-maintained and is NOT inherited through a fork into a
+    different cgroup, so it separates exactly the cases env markers cannot.
+    """
+
+    @staticmethod
+    def _with_cgroup(monkeypatch, path):
+        import tools.process_registry as pr
+
+        monkeypatch.setattr(pr, "_read_own_cgroup_v2_path", lambda: path)
+        return pr
+
+    def test_descendant_of_a_supervised_unit_needs_a_scope(self, monkeypatch):
+        """The leak: identity says no, placement says the child lands in the unit."""
+        pr = self._with_cgroup(
+            monkeypatch, "/system.slice/hermes-webdesktop-backend.service"
+        )
+        monkeypatch.setattr(pr, "_is_supervised_gateway_process", lambda: False)
+        monkeypatch.setenv("INVOCATION_ID", "inherited-by-every-child")
+        monkeypatch.setenv("SYSTEMD_EXEC_PID", str(os.getpid() + 1))
+
+        assert pr._is_supervised_worker_dispatcher() is False, (
+            "identity must stay strict — this is the predicate that cannot see the leak"
+        )
+        assert pr._scope_needed_by_cgroup_placement() is True
+        assert pr._needs_restart_safe_scope() is True
+
+    def test_supervised_unit_main_process_still_needs_a_scope(self, monkeypatch):
+        """The pre-existing behaviour is preserved: identity True, placement agrees."""
+        pr = self._with_cgroup(monkeypatch, "/system.slice/hermes-gateway.service")
+        monkeypatch.setattr(pr, "_is_supervised_gateway_process", lambda: False)
+        monkeypatch.setenv("INVOCATION_ID", "gateway")
+        monkeypatch.setenv("SYSTEMD_EXEC_PID", str(os.getpid()))
+
+        assert pr._scope_needed_by_cgroup_placement() is True
+        assert pr._needs_restart_safe_scope() is True
+
+    def test_already_scoped_worker_is_not_double_wrapped(self, monkeypatch):
+        """A worker is the main pid of its OWN transient unit: identity True, placement False.
+
+        Re-wrapping would not nest. Verified live on this host: ``systemd-run --user
+        --slice=hermes-workers.slice`` called from inside
+        ``hermes-worker-kanban-t_2aab9ed8-run-1147.service`` produced
+        ``.../hermes-workers.slice/hermes-probe-nest-*.service`` — a SIBLING, not a child —
+        so the second scope would survive teardown of the one that spawned it.
+        """
+        pr = self._with_cgroup(
+            monkeypatch,
+            "/user.slice/user-1000.slice/user@1000.service/hermes.slice"
+            "/hermes-workers.slice/hermes-worker-kanban-t_abc-run-7.service",
+        )
+        monkeypatch.setattr(pr, "_is_supervised_gateway_process", lambda: False)
+        monkeypatch.setenv("INVOCATION_ID", "own-transient-unit")
+        monkeypatch.setenv("SYSTEMD_EXEC_PID", str(os.getpid()))
+
+        assert pr._is_supervised_worker_dispatcher() is True
+        assert pr._scope_needed_by_cgroup_placement() is False
+        assert pr._needs_restart_safe_scope() is False, (
+            "placement must veto identity here or every worker double-wraps"
+        )
+
+    def test_worker_slice_member_outside_a_worker_unit_is_not_wrapped(self, monkeypatch):
+        """Slice membership alone is enough — the leaf need not be ``hermes-worker-*``."""
+        pr = self._with_cgroup(
+            monkeypatch, "/user.slice/hermes-workers.slice/some-other.scope"
+        )
+
+        assert pr._scope_needed_by_cgroup_placement() is False
+
+    def test_non_hermes_unit_defers_to_identity(self, monkeypatch):
+        """A foreign unit says nothing about Hermes supervision — identity decides."""
+        pr = self._with_cgroup(monkeypatch, "/system.slice/ssh.service")
+        monkeypatch.setattr(pr, "_is_supervised_gateway_process", lambda: False)
+        monkeypatch.delenv("INVOCATION_ID", raising=False)
+        monkeypatch.delenv("SYSTEMD_EXEC_PID", raising=False)
+
+        assert pr._scope_needed_by_cgroup_placement() is None
+        assert pr._needs_restart_safe_scope() is False
+
+    def test_interactive_login_session_is_not_wrapped(self, monkeypatch):
+        """A plain shell under session-N.scope is not a Hermes unit: no scope, no raise."""
+        pr = self._with_cgroup(
+            monkeypatch, "/user.slice/user-1000.slice/session-3.scope"
+        )
+        monkeypatch.setattr(pr, "_is_supervised_gateway_process", lambda: False)
+        monkeypatch.delenv("INVOCATION_ID", raising=False)
+        monkeypatch.delenv("SYSTEMD_EXEC_PID", raising=False)
+
+        assert pr._scope_needed_by_cgroup_placement() is None
+        assert pr._needs_restart_safe_scope() is False
+
+    def test_unreadable_cgroup_defers_to_identity(self, monkeypatch):
+        """cgroup v1, or a container hiding the file: behaviour is unchanged from before."""
+        pr = self._with_cgroup(monkeypatch, None)
+        monkeypatch.setattr(pr, "_is_supervised_gateway_process", lambda: False)
+        monkeypatch.setenv("INVOCATION_ID", "supervised")
+        monkeypatch.setenv("SYSTEMD_EXEC_PID", str(os.getpid()))
+
+        assert pr._scope_needed_by_cgroup_placement() is None
+        assert pr._needs_restart_safe_scope() is True
+
+    def test_cgroup_reader_parses_the_v2_line_only(self, monkeypatch, tmp_path):
+        """``_read_own_cgroup_v2_path`` takes the ``0::`` line and ignores v1 lines."""
+        import tools.process_registry as pr
+
+        cgroup_file = tmp_path / "cgroup"
+        cgroup_file.write_text(
+            "12:pids:/system.slice/decoy.service\n"
+            "0::/system.slice/hermes-gateway.service\n",
+            encoding="utf-8",
+        )
+        real_path = pr.Path
+
+        monkeypatch.setattr(
+            pr, "Path",
+            lambda p: cgroup_file if p == "/proc/self/cgroup" else real_path(p),
+        )
+
+        assert pr._read_own_cgroup_v2_path() == "/system.slice/hermes-gateway.service"
+
+
+class TestDescendantDispatcherFailsClosed:
+    """A descendant that must lift its child out fails CLOSED, exactly like the main pid.
+
+    Silently returning the unwrapped command is the pre-fix behaviour, and is why these
+    workers leaked into ``hermes-webdesktop-backend.service`` without one log line.
+    """
+
+    def test_descendant_raises_when_the_user_scope_is_unavailable(self, monkeypatch):
+        import tools.process_registry as pr
+
+        monkeypatch.setattr(pr, "_IS_LINUX", True)
+        monkeypatch.setattr(
+            pr, "_read_own_cgroup_v2_path",
+            lambda: "/system.slice/hermes-webdesktop-backend.service",
+        )
+        monkeypatch.setattr(pr, "_is_supervised_gateway_process", lambda: False)
+        monkeypatch.setenv("INVOCATION_ID", "inherited-by-every-child")
+        monkeypatch.setenv("SYSTEMD_EXEC_PID", str(os.getpid() + 1))
+        monkeypatch.setattr(pr, "_systemd_run_user_scope_available", lambda: False)
+
+        with pytest.raises(pr.RestartSafeScopeUnavailable):
+            pr.restart_safe_supervised_child_argv(
+                ["hermes", "chat"], unit_suffix="kanban-t_x-run-1"
+            )
+
+    def test_descendant_gets_a_scoped_argv_with_the_user_bus_in_the_child_env(
+        self, monkeypatch
+    ):
+        """The full production shape for a descendant: wrapped argv AND the bus vars.
+
+        Callers snapshot ``os.environ`` before asking for the argv, so a wrap that does not
+        also mutate ``env`` execs ``systemd-run`` with no reachable bus.
+        """
+        import tools.process_registry as pr
+
+        monkeypatch.setattr(pr, "_IS_LINUX", True)
+        monkeypatch.setattr(
+            pr, "_read_own_cgroup_v2_path",
+            lambda: "/system.slice/hermes-webdesktop-backend.service",
+        )
+        monkeypatch.setattr(pr, "_is_supervised_gateway_process", lambda: False)
+        monkeypatch.setenv("INVOCATION_ID", "inherited-by-every-child")
+        monkeypatch.setenv("SYSTEMD_EXEC_PID", str(os.getpid() + 1))
+        monkeypatch.setattr(pr, "_systemd_run_user_scope_available", lambda: True)
+        monkeypatch.setattr("shutil.which", lambda name: "/usr/bin/systemd-run")
+        monkeypatch.setenv("XDG_RUNTIME_DIR", "/run/user/4242")
+        monkeypatch.setenv("DBUS_SESSION_BUS_ADDRESS", "unix:path=/run/user/4242/bus")
+        child_env = {"HERMES_HOME": "/tmp/home"}
+
+        argv = pr.restart_safe_supervised_child_argv(
+            ["hermes", "chat"], unit_suffix="kanban-t_x-run-1", env=child_env
+        )
+
+        assert argv[0] == "/usr/bin/systemd-run"
+        assert "--slice=hermes-workers.slice" in argv
+        assert argv[argv.index("--unit") + 1] == "hermes-worker-kanban-t_x-run-1"
+        assert argv[argv.index("--") + 1:] == ["hermes", "chat"]
+        assert child_env["XDG_RUNTIME_DIR"] == "/run/user/4242"
+        assert child_env["DBUS_SESSION_BUS_ADDRESS"] == "unix:path=/run/user/4242/bus"
 
 
 class TestNotificationRedaction:

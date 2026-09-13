@@ -62,7 +62,7 @@ import { ChatBar, ChatBarFallback } from './composer'
 import { requestComposerInsert } from './composer/focus'
 import { droppedFileInlineRefs } from './composer/inline-refs'
 import { ComposerSurfaceProvider, useComposerScope, useComposerSurfaceId } from './composer/scope'
-import type { ChatBarState } from './composer/types'
+import type { ChatBarState, ComposerRecommendContext } from './composer/types'
 import { type DroppedFile, partitionDroppedFiles } from './hooks/use-composer-actions'
 import { type DragKind, useFileDropZone } from './hooks/use-file-drop-zone'
 import { shouldShowIntro } from './intro-visibility'
@@ -79,12 +79,18 @@ import {
   transcriptBackfillAvailable
 } from './transcript-backfill'
 import { advanceSessionTranscriptWindow, type SessionWindowMemo } from './transcript-window'
+import { useTranscriptWindowPagesDecay } from './use-transcript-window-pages-decay'
 
 interface ChatViewProps extends Omit<React.ComponentProps<'div'>, 'onSubmit'> {
   gateway: HermesGateway | null
   modelOptionsOwnerConnectionId?: string
   modelOptionsProfile?: string
   modelMenuContent?: React.ReactNode
+  // >>> FORK ANCHOR: composer-model-recommendation <<<
+  /** Fork: renders the manual model-recommendation surface for THIS view's
+   *  composer. Built by whoever owns this view's gateway route (shell or
+   *  tile), for the same reason `modelMenuContent` is. */
+  recommendRender?: (ctx: ComposerRecommendContext) => React.ReactNode
   requestModelOptionsForOwner?: <T>(method: string, params?: Record<string, unknown>) => Promise<T>
   onToggleSelectedPin: () => void
   onDeleteSelectedSession: () => void
@@ -282,6 +288,14 @@ function ChatRuntimeBoundary({
     return next.window
   }, [messages, windowPages])
 
+  // Trailing-edge decay: "Show earlier" only ever grows windowPages, so a
+  // session opened for days after one big expand keeps materializing pages
+  // the user is no longer reading. Bring it back to 1 after the user has
+  // settled at the bottom with nothing selected for a sustained interval —
+  // the same re-cut path a fresh session start already takes, just reached
+  // from idle instead of from a session swap.
+  useTranscriptWindowPagesDecay(windowPages, () => setWindowPages(1))
+
   const runtimeMessageRepository = useRuntimeMessageRepository(windowedMessages)
 
   const storedId = useStore(view.$storedId)
@@ -379,6 +393,7 @@ const ChatViewContent = memo(function ChatViewContent({
   modelOptionsOwnerConnectionId,
   modelOptionsProfile,
   modelMenuContent,
+  recommendRender,
   requestModelOptionsForOwner,
   onToggleSelectedPin,
   onDeleteSelectedSession,
@@ -587,6 +602,8 @@ const ChatViewContent = memo(function ChatViewContent({
         canSwitch: gatewayOpen,
         loading: !gatewayOpen || (!currentModel && !currentProvider),
         modelMenuContent,
+        // >>> FORK ANCHOR: composer-model-recommendation <<<
+        recommendRender,
         quickModels
       },
       tools: {
@@ -599,7 +616,7 @@ const ChatViewContent = memo(function ChatViewContent({
         active: false
       }
     }),
-    [contextSuggestions, currentModel, currentProvider, gatewayOpen, modelMenuContent, quickModels]
+    [contextSuggestions, currentModel, currentProvider, gatewayOpen, modelMenuContent, quickModels, recommendRender]
   )
 
   // Drop files anywhere in the conversation area, not just on the composer
@@ -761,6 +778,7 @@ const ChatViewContent = memo(function ChatViewContent({
               onPickFiles={onPickFiles}
               onPickFolders={onPickFolders}
               onPickImages={onPickImages}
+              onReload={onReload}
               onRemoveAttachment={onRemoveAttachment}
               onSteer={onSteer}
               onSubmit={onSubmit}
@@ -768,6 +786,7 @@ const ChatViewContent = memo(function ChatViewContent({
               queueSessionKey={queueSessionKey}
               sessionId={activeSessionId}
               state={chatBarState}
+              storedSessionId={storedId}
             />
           </Suspense>
         )}

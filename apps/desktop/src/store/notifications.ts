@@ -9,6 +9,23 @@ export interface NotificationAction {
   onClick: () => void
 }
 
+/**
+ * A compact record shown beneath a notification's message. It gives callers
+ * that report a background object (a Kanban card, import, deployment, etc.)
+ * a stable, scannable context block without turning the toast API into a
+ * feature-specific renderer.
+ */
+export interface NotificationContextCard {
+  /** Object name — e.g. the affected task, deployment, or import. */
+  title?: string
+  /** Quiet state line, such as "Done · reviewer". */
+  eyebrow?: string
+  /** The most useful short outcome or description. */
+  summary?: string
+  /** Stable identifiers or other low-priority metadata. */
+  meta?: string
+}
+
 export type NotificationPlacement = 'default' | 'bottom-right'
 
 export interface AppNotification {
@@ -20,11 +37,21 @@ export interface AppNotification {
   accentColor?: string
   /** Secondary detail line rendered below the message, muted (e.g. "$220.00 cap"). */
   meta?: string
+  /** Compact object context, styled as a small card inside the toast. */
+  contextCard?: NotificationContextCard
   title?: string
   message: string
   detail?: string
   action?: NotificationAction
   onDismiss?: () => void
+  /** Called when the 4-item stack cap silently drops this notification to make
+   *  room for a newer one (NOT called on a user dismiss — that's onDismiss).
+   *  Exists so a toast backing a live, still-running side effect (e.g. an
+   *  archive's undo window) can react to losing its only UI affordance —
+   *  typically by committing/cancelling that effect immediately rather than
+   *  leaving it running invisibly behind a toast the user can no longer see
+   *  or interact with. */
+  onEvict?: () => void
   createdAt: number
   placement?: NotificationPlacement
 }
@@ -35,11 +62,13 @@ export interface NotificationInput {
   icon?: string
   accentColor?: string
   meta?: string
+  contextCard?: NotificationContextCard
   title?: string
   message: string
   detail?: string
   action?: NotificationAction
   onDismiss?: () => void
+  onEvict?: () => void
   durationMs?: number
   placement?: NotificationPlacement
 }
@@ -49,12 +78,16 @@ const timers = new Map<string, number>()
 
 export const $notifications = atom<AppNotification[]>([])
 
-function defaultDuration(kind: NotificationKind) {
-  if (kind === 'error' || kind === 'warning') {
+function defaultDuration(kind: NotificationKind, action?: NotificationAction) {
+  // A recovery action must never disappear before the person can read and use
+  // it. Errors and warnings are already persistent for the same reason.
+  if (kind === 'error' || kind === 'warning' || action) {
     return 0
   }
 
-  return 5_000
+  // Routine confirmation still gets out of the way, but five seconds is too
+  // brief to read a complete sentence while continuing the task at hand.
+  return 8_000
 }
 
 // Only interruptions worth a top-center toast: errors, warnings, and anything
@@ -168,20 +201,37 @@ export function notify(input: NotificationInput): string {
     icon: input.icon,
     accentColor: input.accentColor,
     meta: input.meta,
+    contextCard: input.contextCard,
     title: input.title,
     message: input.message,
     detail: input.detail,
     action: input.action,
     onDismiss: input.onDismiss,
+    onEvict: input.onEvict,
     createdAt: Date.now(),
     placement: input.placement ?? defaultPlacement(kind, input.action)
   }
 
   window.clearTimeout(timers.get(id))
   timers.delete(id)
-  $notifications.set([notification, ...$notifications.get().filter(item => item.id !== id)].slice(0, 4))
 
-  const duration = input.durationMs ?? defaultDuration(kind)
+  const merged = [notification, ...$notifications.get().filter(item => item.id !== id)]
+  const kept = merged.slice(0, 4)
+  const evicted = merged.slice(4)
+
+  $notifications.set(kept)
+
+  // The cap silently drops anything past the 4th — without this, a toast
+  // backing a live pending-undo timer (or any other running side effect)
+  // could vanish from the UI while its timer/effect keeps running invisibly,
+  // with no way for the user to act on it again (#548d0d33, blocking issue 4).
+  for (const item of evicted) {
+    window.clearTimeout(timers.get(item.id))
+    timers.delete(item.id)
+    item.onEvict?.()
+  }
+
+  const duration = input.durationMs ?? defaultDuration(kind, input.action)
 
   if (duration > 0) {
     timers.set(

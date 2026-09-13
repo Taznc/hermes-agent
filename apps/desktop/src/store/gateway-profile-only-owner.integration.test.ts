@@ -87,6 +87,7 @@ function installDesktop(): void {
       token: 'test-token',
       wsUrl: `wss://${profile}.invalid/ws`
     })),
+    getConnectionConfig: vi.fn(async () => ({})),
     notify: vi.fn()
   }
 }

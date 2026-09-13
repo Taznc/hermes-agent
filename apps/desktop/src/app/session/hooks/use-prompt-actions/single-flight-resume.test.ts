@@ -35,6 +35,28 @@ describe('singleFlightSessionResume', () => {
     expect(requestGateway).toHaveBeenCalledTimes(1)
   })
 
+  it('keeps owner-scoped recovery resumes independent while coalescing the same owner', async () => {
+    let finish!: (value: { session_id: string }) => void
+
+    const pending = new Promise<{ session_id: string }>(resolve => {
+      finish = resolve
+    })
+
+    const requestA = vi.fn(() => pending)
+    const requestB = vi.fn(async () => ({ session_id: 'runtime-b' }))
+    const ownerA = { connectionId: 'source-a', profile: 'default' }
+    const ownerB = { connectionId: 'source-b', profile: 'default' }
+    const depsA = { owner: ownerA, requestGateway: requestA as never, resolveProfile: async () => 'default' }
+    const depsB = { owner: ownerB, requestGateway: requestB as never, resolveProfile: async () => 'default' }
+    const a = resumeStoredRuntimeSession('collision', depsA)
+    const aAgain = resumeStoredRuntimeSession('collision', depsA)
+    const b = resumeStoredRuntimeSession('collision', depsB)
+    finish({ session_id: 'runtime-a' })
+    expect(await Promise.all([a, aAgain, b])).toEqual(['runtime-a', 'runtime-a', 'runtime-b'])
+    expect(requestA).toHaveBeenCalledOnce()
+    expect(requestB).toHaveBeenCalledOnce()
+  })
+
   it('different stored ids still resume independently', async () => {
     const requestGateway = vi.fn(async (_method: string, params?: Record<string, unknown>) => {
       await new Promise(resolve => setTimeout(resolve, 5))
@@ -67,6 +89,48 @@ describe('singleFlightSessionResume', () => {
 })
 
 describe('drift-abort recovered-runtime cache', () => {
+  it('does not reuse a drift-aborted runtime for a different owner of the same durable id', async () => {
+    const ownerA = { connectionId: 'source-a', profile: 'default' }
+    const ownerB = { connectionId: 'source-b', profile: 'default' }
+    const requestA = vi.fn(async () => ({ session_id: 'runtime-a' }))
+    const requestB = vi.fn(async () => ({ session_id: 'runtime-b' }))
+
+    const call = vi.fn(async (runtime: string) => {
+      if (runtime === 'dead') {
+        throw new Error('session not found')
+      }
+
+      return runtime
+    })
+
+    await expect(
+      withSessionNotFoundResume('dead', 'collision', call, {
+        owner: ownerA,
+        requestGateway: requestA as never,
+        resolveProfile: async () => 'default',
+        driftReason: () => 'new selection'
+      })
+    ).rejects.toThrow(SessionRecoveryAborted)
+
+    const result = await withSessionNotFoundResume('dead', 'collision', call, {
+      owner: ownerB,
+      requestGateway: requestB as never,
+      resolveProfile: async () => 'default'
+    })
+
+    expect(result.sessionId).toBe('runtime-b')
+    expect(requestB).toHaveBeenCalledOnce()
+
+    const sameOwner = await withSessionNotFoundResume('dead', 'collision', call, {
+      owner: ownerA,
+      requestGateway: requestA as never,
+      resolveProfile: async () => 'default'
+    })
+
+    expect(sameOwner.sessionId).toBe('runtime-a')
+    expect(requestA).toHaveBeenCalledOnce()
+  })
+
   it('drift-abort does not strand the recovered runtime — it is registered in the cache', async () => {
     const requestGateway = vi.fn(async (method: string) => {
       if (method === 'session.resume') {

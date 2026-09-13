@@ -11,18 +11,37 @@ export interface ClarifyQuestion {
   multiSelect: boolean
 }
 
+export interface ClarifyHelp {
+  choice?: string
+  content?: string
+  error?: string
+  explanationId: string
+  followUp: string
+  questionId?: string
+  status: 'complete' | 'error' | 'loading'
+}
+
 export interface ClarifyRequest {
+  help?: Record<string, ClarifyHelp>
   requestId: string
   question: string
   choices: string[] | null
   multiSelect: boolean
-  /** Local receipt time (Unix seconds), used to reject stale resume cleanup. */
+  /** Local receipt time (Unix seconds), used for lifecycle guards. */
   receivedAt?: number
   sessionId: string | null
   /** Batch (multi-question) clarify: present instead of question/choices. */
   questions?: ClarifyQuestion[]
   /** Answers already locked server-side (reconnect replay): qid → answer. */
   lockedAnswers?: Record<string, string>
+  /**
+   * How long the server-side bridge stays blocked waiting for an answer.
+   * null/undefined means the renderer has no finite deadline and must wait
+   * for an explicit answer, cancel, or expire event.
+   */
+  timeoutSeconds?: number | null
+  /** Notes already locked server-side (reconnect replay): qid → note. */
+  lockedNotes?: Record<string, string>
 }
 
 /**
@@ -117,6 +136,79 @@ const keyFor = (sessionId: string | null | undefined): string => sessionId ?? ''
 
 export const $clarifyRequests = atom<Record<string, ClarifyRequest>>({})
 
+/** Help is renderer-owned presentation state, retained after its pending request
+ * settles so the original tool card can expose it without making a transcript turn. */
+export const $settledClarifyHelp = atom<Record<string, Record<string, ClarifyHelp>>>({})
+
+/** Associates a renderer transcript tool row with the request it rendered.
+ * The gateway's explain event intentionally exposes only request correlation;
+ * retaining this local association lets a remounted settled row find its help. */
+export const $clarifyToolRequestIds = atom<Record<string, string>>({})
+
+export function associateClarifyToolRequest(toolCallId: string, requestId: string): void {
+  if ($clarifyToolRequestIds.get()[toolCallId] === requestId) {
+    return
+  }
+
+  $clarifyToolRequestIds.set({ ...$clarifyToolRequestIds.get(), [toolCallId]: requestId })
+}
+
+export function updateClarifyHelp(
+  requestId: string,
+  sessionId: string | null | undefined,
+  explanationId: string,
+  update: Omit<ClarifyHelp, 'explanationId'>
+): void {
+  const key = keyFor(sessionId)
+  const current = $clarifyRequests.get()[key]
+
+  if (!current || current.requestId !== requestId) {
+    return
+  }
+
+  const help = { ...(current.help ?? {}), [explanationId]: { explanationId, ...update } }
+  $clarifyRequests.set({ ...$clarifyRequests.get(), [key]: { ...current, help } })
+}
+
+export function reconcileClarifyHelp(
+  requestId: string,
+  sessionId: string | null | undefined,
+  localExplanationId: string,
+  explanationId: string
+): void {
+  const key = keyFor(sessionId)
+  const current = $clarifyRequests.get()[key]
+
+  if (!current || current.requestId !== requestId || localExplanationId === explanationId) {
+    return
+  }
+
+  const local = current.help?.[localExplanationId]
+  const received = current.help?.[explanationId]
+
+  if (!local && !received) {
+    return
+  }
+
+  const help = { ...(current.help ?? {}) }
+  delete help[localExplanationId]
+  help[explanationId] = {
+    ...(local ?? { explanationId, followUp: '', status: 'loading' as const }),
+    ...(received ?? {}),
+    explanationId,
+    followUp: local?.followUp ?? received?.followUp ?? ''
+  }
+  $clarifyRequests.set({ ...$clarifyRequests.get(), [key]: { ...current, help } })
+}
+
+export function settledClarifyHelp(requestId: string | null): Record<string, ClarifyHelp> {
+  return requestId ? ($settledClarifyHelp.get()[requestId] ?? {}) : {}
+}
+
+export function settledClarifyHelpForToolCall(toolCallId: string): Record<string, ClarifyHelp> {
+  return settledClarifyHelp($clarifyToolRequestIds.get()[toolCallId] ?? null)
+}
+
 // The clarify request for the currently-viewed session. The inline ClarifyTool
 // only ever mounts inside the active session's transcript, so it reads this
 // focus-scoped view rather than reaching into the whole map.
@@ -132,6 +224,37 @@ export const sessionClarifyRequest = (sessionId: string | null) =>
 
 export function setClarifyRequest(request: ClarifyRequest): void {
   $clarifyRequests.set({ ...$clarifyRequests.get(), [keyFor(request.sessionId)]: request })
+}
+
+// `_block()` starts its Event wait immediately after emitting the request. The
+// renderer can therefore start its wall-clock estimate a fraction earlier than
+// the server starts waiting. Keep a small conservative margin so a turn-end at
+// that boundary cannot remove the only UI capable of releasing the bridge.
+const CLARIFY_TIMEOUT_GRACE_SECONDS = 2
+
+/**
+ * True when the server-side bridge may STILL be blocked on this request.
+ *
+ * The desktop clears parked clarify dialogs when a turn ends or errors, but
+ * the Python side stays blocked on clarify.respond until the user answers OR
+ * its own clarify timeout expires. A turn-end event that arrives while the
+ * bridge is still blocked (stream reconnect, HUD overlay focus churn —
+ * #83319) must not wipe the dialog, or the user loses the only thing that
+ * can unblock the agent. A finite timeout means the server gives up on its
+ * own after timeoutSeconds — past that point the dialog is stale and safe
+ * to drop. A null timeout means the server waits forever, so the dialog
+ * must survive turn-end events and only an explicit answer/skip clears it.
+ */
+export const clarifyStillBlocking = (request: ClarifyRequest | null, now: number = Date.now() / 1000): boolean => {
+  if (!request) {
+    return false
+  }
+
+  if (request.timeoutSeconds == null || request.receivedAt == null) {
+    return true
+  }
+
+  return now - request.receivedAt < request.timeoutSeconds + CLARIFY_TIMEOUT_GRACE_SECONDS
 }
 
 export function clearClarifyRequest(requestId?: string, sessionId?: string | null): void {
@@ -150,6 +273,10 @@ export function clearClarifyRequest(requestId?: string, sessionId?: string | nul
     const next = { ...requests }
     delete next[key]
     $clarifyRequests.set(next)
+
+    if (current.help && Object.keys(current.help).length > 0) {
+      $settledClarifyHelp.set({ ...$settledClarifyHelp.get(), [current.requestId]: current.help })
+    }
 
     return
   }
