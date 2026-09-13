@@ -1,7 +1,7 @@
 import type { BoardMeta, KanbanRun, KanbanTaskFull } from './types'
 
 export interface ActionSpec {
-  id: 'explain' | 'failure' | 'rough' | 'scope' | 'unblock'
+  id: 'explain' | 'failure' | 'review' | 'rough' | 'scope' | 'unblock'
   label: string
   intent: string
   predicate?: (task: KanbanTaskFull, runs: KanbanRun[]) => boolean
@@ -30,6 +30,11 @@ const FAILURE: ActionDefinition = {
   predicate: (task, runs) => (task.consecutive_failures ?? 0) > 0 || runs.at(-1)?.status === 'errored'
 }
 
+const REVIEW: ActionDefinition = {
+  id: 'review',
+  intent: "Inspect the branch and diff, then verify the work against the card's acceptance criteria. Do not modify the card."
+}
+
 export const STATUS_ACTIONS: Record<string, ActionDefinition[]> = {
   '*': [EXPLAIN],
   blocked: [
@@ -51,7 +56,9 @@ export const STATUS_ACTIONS: Record<string, ActionDefinition[]> = {
       intent:
         'Identify the likely files and seams, decide whether this is one shippable outcome or several, and check upstream prior art before spawning any work.'
     }
-  ]
+  ],
+  review: [REVIEW],
+  done: [REVIEW]
 }
 
 const PREDICATE_ACTIONS: ActionDefinition[] = [FAILURE]

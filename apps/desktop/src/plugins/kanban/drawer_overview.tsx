@@ -236,6 +236,7 @@ export function HermesActionsSection({
   const actionLabels: HermesActionLabels = {
     explain: k.hermesActionExplain,
     failure: k.hermesActionFailure,
+    review: k.hermesActionReview,
     rough: k.hermesActionRough,
     scope: k.hermesActionScope,
     unblock: k.hermesActionUnblock

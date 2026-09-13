@@ -6,6 +6,7 @@ const actionKeys = [
   'hermesActionsSection',
   'hermesActionExplain',
   'hermesActionFailure',
+  'hermesActionReview',
   'hermesActionRough',
   'hermesActionScope',
   'hermesActionUnblock',

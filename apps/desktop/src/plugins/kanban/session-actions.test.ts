@@ -24,6 +24,7 @@ const run = (status: string, id: number): KanbanRun => ({ id, status })
 const actionLabels = {
   explain: en.hermesActionExplain,
   failure: en.hermesActionFailure,
+  review: en.hermesActionReview,
   rough: en.hermesActionRough,
   scope: en.hermesActionScope,
   unblock: en.hermesActionUnblock
@@ -34,6 +35,8 @@ describe('seeded Hermes action catalog', () => {
     ['idea', ['Explain this card', 'Rough this out']],
     ['roadmap', ['Explain this card', 'Scope this']],
     ['blocked', ['Explain this card', 'Help me unblock it']],
+    ['review', ['Explain this card', 'Review this work']],
+    ['done', ['Explain this card', 'Review this work']],
     ['ready', ['Explain this card']]
   ])('shows the actions for %s', (status, expected) => {
     expect(getHermesActions(task(status), [], actionLabels)).toEqual(expected.map(action => expect.objectContaining({ label: action })))
@@ -46,10 +49,12 @@ describe('seeded Hermes action catalog', () => {
     ])
     expect(getHermesActions(task('done'), [run('completed', 1), run('errored', 2)], actionLabels).map(action => action.label)).toEqual([
       'Explain this card',
+      'Review this work',
       'Investigate the failure'
     ])
     expect(getHermesActions(task('done'), [run('errored', 1), run('completed', 2)], actionLabels).map(action => action.label)).toEqual([
-      'Explain this card'
+      'Explain this card',
+      'Review this work'
     ])
   })
 
@@ -59,13 +64,14 @@ describe('seeded Hermes action catalog', () => {
     expect(resolveActionCwd(task('todo'), { ...board, default_workdir: '' })).toBeUndefined()
   })
 
-  it.each(['explain', 'rough', 'scope', 'unblock', 'failure'] as const)(
+  it.each(['explain', 'rough', 'scope', 'unblock', 'failure', 'review'] as const)(
     'builds the %s intent around the exact card and board context',
     id => {
       const action = [
         ...getHermesActions(task('idea', { consecutive_failures: 1 }), [run('errored', 9)], actionLabels),
         ...getHermesActions(task('roadmap'), [], actionLabels),
-        ...getHermesActions(task('blocked'), [], actionLabels)
+        ...getHermesActions(task('blocked'), [], actionLabels),
+        ...getHermesActions(task('review'), [], actionLabels)
       ].find(candidate => candidate.id === id)!
 
       const draft = buildActionDraft(action, {
@@ -81,6 +87,24 @@ describe('seeded Hermes action catalog', () => {
       expect(draft).toContain(action.intent)
     }
   )
+
+  it('seeds review intent without mutating the action or exact card context', () => {
+    const exactBoard = { ...board, slug: 'release/2026.09+qa' }
+    const exactTask = task('review', { id: 't_review-42.exact' })
+    const action = getHermesActions(exactTask, [], actionLabels).find(candidate => candidate.id === 'review')!
+    const context = { board: exactBoard, commentsCount: 2, runs: [run('completed', 7)], task: exactTask }
+    const before = structuredClone({ action, context })
+    const open = vi.fn()
+
+    expect(openHermesAction(action, context, open)).toBe(true)
+
+    const draft = open.mock.calls[0][0].draft as string
+    expect(draft).toContain('card t_review-42.exact')
+    expect(draft).toContain('board release/2026.09+qa')
+    expect(draft).toContain('Inspect the branch and diff')
+    expect(draft).toContain("verify the work against the card's acceptance criteria")
+    expect({ action, context }).toEqual(before)
+  })
 
   it('opens a fresh editable draft through the cwd ladder, including detached sessions', () => {
     const open = vi.fn()

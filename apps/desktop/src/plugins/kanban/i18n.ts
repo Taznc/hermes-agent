@@ -180,6 +180,7 @@ type KanbanMessages = {
   hermesActionsSection: string
   hermesActionExplain: string
   hermesActionFailure: string
+  hermesActionReview: string
   hermesActionRough: string
   hermesActionScope: string
   hermesActionUnblock: string
@@ -605,6 +606,7 @@ export const en: KanbanMessages = {
   hermesActionsSection: 'Hermes actions',
   hermesActionExplain: 'Explain this card',
   hermesActionFailure: 'Investigate the failure',
+  hermesActionReview: 'Review this work',
   hermesActionRough: 'Rough this out',
   hermesActionScope: 'Scope this',
   hermesActionUnblock: 'Help me unblock it',
@@ -1004,6 +1006,7 @@ const ja: KanbanMessages = {
   hermesActionsSection: 'Hermes アクション',
   hermesActionExplain: 'このカードを説明',
   hermesActionFailure: '失敗を調査',
+  hermesActionReview: 'この作業をレビュー',
   hermesActionRough: '大まかにまとめる',
   hermesActionScope: 'スコープを決める',
   hermesActionUnblock: 'ブロック解除を手伝う',
@@ -1404,6 +1407,7 @@ const zh: KanbanMessages = {
   hermesActionsSection: 'Hermes 操作',
   hermesActionExplain: '说明此卡片',
   hermesActionFailure: '调查失败原因',
+  hermesActionReview: '审查此工作',
   hermesActionRough: '粗略整理',
   hermesActionScope: '确定范围',
   hermesActionUnblock: '帮我解除阻塞',
@@ -1797,6 +1801,7 @@ const zhHant: KanbanMessages = {
   hermesActionsSection: 'Hermes 操作',
   hermesActionExplain: '說明這張卡片',
   hermesActionFailure: '調查失敗原因',
+  hermesActionReview: '審查此工作',
   hermesActionRough: '粗略整理',
   hermesActionScope: '決定範圍',
   hermesActionUnblock: '協助解除封鎖',
