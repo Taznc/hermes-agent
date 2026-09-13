@@ -267,8 +267,12 @@ def test_complete_goal_mode_rejected_by_judge(monkeypatch, tmp_path):
     try:
         goal_task_id = kb.create_task(
             conn, title="goal-mode-test", assignee="test-worker",
-            body="Must achieve X with verified evidence.", goal_mode=True
+            body="Must achieve X with verified evidence."
         )
+        # Legacy/imported rows can still carry the retired bit; lifecycle
+        # safeguards remain covered even though new mutations reject it.
+        conn.execute("UPDATE tasks SET goal_mode = 1 WHERE id = ?", (goal_task_id,))
+        conn.commit()
         kb.claim_task(conn, goal_task_id)
     finally:
         conn.close()
@@ -365,8 +369,10 @@ def _make_goal_mode_worker_env(monkeypatch, tmp_path):
     try:
         goal_task_id = kb.create_task(
             conn, title="goal-mode-block-test", assignee="test-worker",
-            body="Must achieve X.", goal_mode=True,
+            body="Must achieve X.",
         )
+        conn.execute("UPDATE tasks SET goal_mode = 1 WHERE id = ?", (goal_task_id,))
+        conn.commit()
         kb.claim_task(conn, goal_task_id)
     finally:
         conn.close()
@@ -1842,3 +1848,27 @@ def test_request_review_refusal_states_the_status_the_card_is_actually_in(
     with kbc.connect_closing() as conn:
         assert kb.get_task(conn, tid).status == "ready"
     assert len([e for e in _events(tid) if e.kind == "review_preflight_conflict"]) == 1
+
+
+def test_create_model_policy_force_surface(worker_env):
+    from hermes_cli import kanban_db as kb
+    from tools import kanban_tools as kt
+
+    profile = kb.kanban_home() / "profiles" / "peer"
+    profile.mkdir(parents=True, exist_ok=True)
+    (profile / "config.yaml").write_text(
+        "model:\n  provider: openai-codex\n  default: gpt-5.6-sol\n"
+        "agent:\n  reasoning_effort: medium\n",
+        encoding="utf-8",
+    )
+    denied = json.loads(kt._handle_create({
+        "title": "denied child", "assignee": "peer", "model": "gpt-6-astra",
+        "provider": "openai-codex", "reasoning_effort": "medium",
+    }))
+    assert "operator force" in denied["error"]
+    forced = json.loads(kt._handle_create({
+        "title": "forced child", "assignee": "peer", "model": "gpt-6-astra",
+        "provider": "openai-codex", "reasoning_effort": "medium",
+        "policy_force": True, "policy_force_reason": "incident response",
+    }))
+    assert "cannot grant operator" in forced["error"]

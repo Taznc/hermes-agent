@@ -305,6 +305,33 @@ def test_patch_rejects_an_unknown_level(client):
     assert r.status_code == 400
 
 
+def test_dashboard_policy_force_is_durable(client, kanban_home):
+    profile = kanban_home / "profiles" / "worker"
+    profile.mkdir(parents=True, exist_ok=True)
+    (profile / "config.yaml").write_text(
+        "model:\n  provider: openai-codex\n  default: gpt-5.6-sol\n"
+        "agent:\n  reasoning_effort: medium\n",
+        encoding="utf-8",
+    )
+    task = _create(client)
+    denied = client.patch(
+        f"/api/plugins/kanban/tasks/{task['id']}",
+        json={"model_override": "gpt-6-astra", "provider_override": "openai-codex"},
+    )
+    assert denied.status_code == 400
+    forced = client.patch(
+        f"/api/plugins/kanban/tasks/{task['id']}",
+        json={
+            "model_override": "gpt-6-astra", "provider_override": "openai-codex",
+            "policy_force": True, "policy_force_reason": "incident response",
+            "policy_forced_by": "spoofed-client-profile",
+        },
+    )
+    assert forced.status_code == 200, forced.text
+    assert forced.json()["task"]["policy_force_reason"] == "incident response"
+    assert forced.json()["task"]["policy_forced_by"] == "default"
+
+
 def test_create_accepts_reasoning_effort(client):
     task = _create(client, reasoning_effort="minimal")
     assert task["reasoning_effort"] == "minimal"

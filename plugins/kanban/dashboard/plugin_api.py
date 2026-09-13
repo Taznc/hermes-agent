@@ -671,6 +671,8 @@ class CreateTaskBody(BaseModel):
     model_override: Optional[str] = None
     provider_override: Optional[str] = None
     reasoning_effort: Optional[str] = None  # none|minimal|…|ultra; None inherits the profile's level
+    policy_force: bool = False
+    policy_force_reason: Optional[str] = None
     project_id: Optional[str] = None  # None inherits the board's scoped project (if any)
     # Tokens from POST /attachments/staged (pasted images uploaded before this task existed, e.g.
     # the "new task" dialog); promoted into real task_attachments rows after creation. Defaults to
@@ -709,6 +711,7 @@ def create_task(payload: CreateTaskBody, board: Optional[str] = Query(None)):
             reasoning_effort=routing.reasoning_effort,
             route_source=routing.route_source,
             route_name=routing.route_name,
+            policy_forced_by=(kanban_db._hook_profile_name() if payload.policy_force else None),
         )
         task_id = kanban_db.create_task(
             conn, created_by="dashboard", board=board, **create_kwargs)
@@ -931,6 +934,8 @@ class UpdateTaskBody(BaseModel):
     clear_model_override: bool = False
     reasoning_effort: Optional[str] = None
     clear_reasoning_effort: bool = False
+    policy_force: bool = False
+    policy_force_reason: Optional[str] = None
     # Explicit second gesture for a card the unblock-loop breaker parked in triage on an
     # unanswered ``needs_input`` question. Absent (False) is what an ordinary drag sends, so
     # the guard is on by default and only a deliberate confirmation clears it.
@@ -953,6 +958,8 @@ class BulkTaskBody(BaseModel):
     clear_model_override: bool = False
     reasoning_effort: Optional[str] = None
     clear_reasoning_effort: bool = False
+    policy_force: bool = False
+    policy_force_reason: Optional[str] = None
     acknowledge_block_loop: bool = False
 
 
@@ -1074,14 +1081,33 @@ def _set_priority(conn, task_id: str, priority: int, board: Optional[str]) -> No
     kanban_db.notify_task_updated(conn, task_id, ("priority",), board=board)
 
 
-def _apply_model_override(conn, task_id: str, p) -> bool:
+def _apply_model_override(conn, task_id: str, p, board: Optional[str] = None) -> bool:
     """Raises ValueError/RuntimeError from kanban_db for the caller to map."""
     new_model = None if p.clear_model_override else (p.model_override or "").strip() or None
-    return kanban_db.set_model_override(conn, task_id, new_model, provider=p.provider_override)
+    return kanban_db.set_model_override(
+        conn, task_id, new_model, provider=p.provider_override,
+        policy_force=p.policy_force, policy_force_reason=p.policy_force_reason,
+        policy_forced_by=(kanban_db._hook_profile_name() if p.policy_force else None), board=board,
+    )
 
 
-def _apply_reasoning_effort(conn, task_id: str, p) -> bool:
-    return kanban_db.set_reasoning_effort(conn, task_id, None if p.clear_reasoning_effort else p.reasoning_effort)
+def _apply_reasoning_effort(conn, task_id: str, p, board: Optional[str] = None) -> bool:
+    return kanban_db.set_reasoning_effort(
+        conn, task_id, None if p.clear_reasoning_effort else p.reasoning_effort,
+        policy_force=p.policy_force, policy_force_reason=p.policy_force_reason,
+        policy_forced_by=(kanban_db._hook_profile_name() if p.policy_force else None), board=board,
+    )
+
+
+def _apply_combined_route(conn, task_id: str, p, board: Optional[str] = None) -> bool:
+    model = None if p.clear_model_override else (p.model_override or "").strip() or None
+    effort = None if p.clear_reasoning_effort else p.reasoning_effort
+    return kanban_db.set_route_overrides(
+        conn, task_id, model=model, provider=p.provider_override,
+        reasoning_effort=effort, policy_force=p.policy_force,
+        policy_force_reason=p.policy_force_reason, policy_forced_by=(kanban_db._hook_profile_name() if p.policy_force else None),
+        board=board,
+    )
 
 
 # Override knobs shared by PATCH and bulk: (payload wants it?, apply, bulk refusal message).
@@ -1140,6 +1166,12 @@ def _patch_title_body(conn, task_id: str, payload: UpdateTaskBody, board: Option
 
 @router.patch("/tasks/{task_id}")
 def update_task(task_id: str, payload: UpdateTaskBody, board: Optional[str] = Query(None)):
+    route_update_requested = any(wanted(payload) for wanted, _apply, _msg in _OVERRIDE_OPS)
+    if payload.assignee is not None and route_update_requested:
+        raise HTTPException(
+            status_code=400,
+            detail="assignee and model-route changes must be submitted as separate policy-checked updates",
+        )
     with _board_conn(board) as (board, conn):
         _require_task(conn, task_id)
         # For a combined assignee+review patch, request_review must capture the
@@ -1150,13 +1182,18 @@ def update_task(task_id: str, payload: UpdateTaskBody, board: Optional[str] = Qu
             # reassignment that would guarantee a worker init crash.
             with _map_errors(409, RuntimeError), _map_errors(400, ValueError):
                 _require_ok(kanban_db.assign_task(conn, task_id, payload.assignee or None))
+        wanted_model, wanted_effort = (_OVERRIDE_OPS[0][0](payload), _OVERRIDE_OPS[1][0](payload))
+        if wanted_model and wanted_effort:
+            with _map_errors(400, ValueError, RuntimeError):
+                _require_ok(_apply_combined_route(conn, task_id, payload, board))
+        else:
+            for wanted, apply, _refused in _OVERRIDE_OPS:
+                if wanted(payload):
+                    with _map_errors(400, ValueError, RuntimeError):
+                        ok = apply(conn, task_id, payload, board)
+                    _require_ok(ok)
         if payload.status is not None:
             _patch_status(conn, task_id, payload, review_assignee_deferred)
-        for wanted, apply, _refused in _OVERRIDE_OPS:
-            if wanted(payload):
-                with _map_errors(400, ValueError, RuntimeError):
-                    ok = apply(conn, task_id, payload)
-                _require_ok(ok)
         if payload.priority is not None:
             _set_priority(conn, task_id, payload.priority, board)
         if payload.title is not None or payload.body is not None:
@@ -1338,6 +1375,30 @@ def delete_link(parent_id: str = Query(...), child_id: str = Query(...), board: 
 def _bulk_apply_one(conn, tid: str, payload: BulkTaskBody, board: Optional[str], entry: dict) -> None:
     """Apply the bulk patch to one task, recording refusals in ``entry`` without aborting the
     remaining ops — except a rejected status verb (``_StatusRejected`` propagates)."""
+    wanted_model, wanted_effort = (_OVERRIDE_OPS[0][0](payload), _OVERRIDE_OPS[1][0](payload))
+    if payload.assignee is not None and (wanted_model or wanted_effort):
+        entry.update(
+            ok=False,
+            error="assignee and model-route changes require separate policy-checked updates",
+        )
+        return
+    if wanted_model and wanted_effort:
+        try:
+            if not _apply_combined_route(conn, tid, payload, board):
+                entry.update(ok=False, error="route override refused")
+        except (RuntimeError, ValueError) as e:
+            entry.update(ok=False, error=str(e))
+            return
+    else:
+        for wanted, apply, refused in _OVERRIDE_OPS:
+            if wanted(payload):
+                try:
+                    if not apply(conn, tid, payload, board):
+                        entry.update(ok=False, error=refused)
+                        return
+                except (RuntimeError, ValueError) as e:
+                    entry.update(ok=False, error=str(e))
+                    return
     if payload.archive and not kanban_db.archive_task(conn, tid):
         entry.update(ok=False, error="archive refused")
     if payload.status is not None and not payload.archive:
@@ -1360,13 +1421,7 @@ def _bulk_apply_one(conn, tid: str, payload: BulkTaskBody, board: Optional[str],
             entry.update(ok=False, error=str(e))
     if payload.priority is not None:
         _set_priority(conn, tid, payload.priority, board)
-    for wanted, apply, refused in _OVERRIDE_OPS:
-        if wanted(payload):
-            try:
-                if not apply(conn, tid, payload):
-                    entry.update(ok=False, error=refused)
-            except (ValueError, RuntimeError) as e:
-                entry.update(ok=False, error=str(e))
+
 
 
 @router.post("/tasks/bulk")

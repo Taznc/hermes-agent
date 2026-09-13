@@ -938,6 +938,12 @@ def _handle_create(args: dict, **kw) -> str:
     triage, skills, goal_mode = (
         _parse_bool_arg(args, "triage"), _coerce_str_list(args.get("skills"), "skills", "skill names"),
         _parse_bool_arg(args, "goal_mode"))
+    policy_force = bool(_parse_bool_arg(args, "policy_force"))
+    policy_force_reason = args.get("policy_force_reason")
+    _check(
+        not policy_force,
+        "worker tools cannot grant operator model-policy exceptions; use an operator CLI/dashboard action",
+    )
     model_override, provider_override = args.get("model"), args.get("provider")
     _check(model_override or not provider_override, "'provider' requires 'model' to be set as well")
     # Per-task thinking depth, independent of model/provider — create_task() validates it, so an
@@ -993,6 +999,8 @@ def _handle_create(args: dict, **kw) -> str:
             completion_contract=args.get("completion_contract"),
             initial_status=str(args.get("initial_status") or "running"), lane=lane,
             created_by=os.environ.get("HERMES_PROFILE") or "worker", session_id=session_id,
+            policy_force=policy_force, policy_force_reason=policy_force_reason,
+            policy_forced_by=((os.environ.get("HERMES_PROFILE") or "worker") if policy_force else None),
             created_by_task=os.environ.get("HERMES_KANBAN_TASK") or None,
             created_by_run=_opt_int(os.environ.get("HERMES_KANBAN_RUN_ID")))
         landed = _fields(kb.get_task(conn, new_tid), _CREATED_FIELDS)

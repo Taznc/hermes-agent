@@ -224,6 +224,10 @@ _SPECS = [
                   "independent of --model. Accepts minimal, low, medium, high, xhigh, max, ultra, or "
                   "'none' to disable thinking; an invalid level is rejected at filing time. Omit to "
                   "inherit the profile's own agent.reasoning_effort."),
+        _arg("--policy-force", action="store_true",
+             help="Operator-only exception to the unattended model policy; requires --policy-force-reason."),
+        _arg("--policy-force-reason", metavar="REASON",
+             help="Durable justification recorded with --policy-force and bound to this profile/route."),
         _arg("--completion-contract", metavar="CONTRACT",
              help="local-only (default), OWNER/REPO for publication, or exact GitHub PR URL; required CI gates done."),
         _arg("--goal", action="store_true", dest="goal_mode",
@@ -283,6 +287,10 @@ _SPECS = [
              help="Set (or clear) the task's reasoning effort, independent of the model/provider "
                   "override: any valid level plus 'none' (thinking off); 'clear'/'default' falls back "
                   "to the profile's own agent.reasoning_effort. Omit to leave it untouched."),
+        _arg("--policy-force", action="store_true",
+             help="Operator-only policy exception; requires --policy-force-reason."),
+        _arg("--policy-force-reason", metavar="REASON",
+             help="Durable exception reason bound to the current profile and exact route."),
     ], help="Set or clear a task's model/provider override and/or reasoning effort (takes effect on the next dispatch)"),
     _cmd("reclaim", [_TASK_ID, _RECLAIM_REASON], help="Release an active worker claim on a running task"),
     _cmd("reassign", [

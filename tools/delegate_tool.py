@@ -12,6 +12,7 @@ tool calls or reasoning.
 """
 
 import logging
+import os
 import time
 import weakref
 from typing import Any, Dict, List, Optional
@@ -495,6 +496,11 @@ def delegate_task(
         return _handle_control_action(normalized_action, subagent_id, message, parent_agent)
     if normalized_action and normalized_action != "spawn":
         return tool_error(f"Unknown action '{action}'. Use spawn (default), list, steer, or stop.")
+    if os.environ.get("HERMES_KANBAN_TASK"):
+        return tool_error(
+            "delegate_task spawning is disabled inside Kanban workers by the unattended model policy; "
+            "create an explicitly routed Kanban child task instead"
+        )
 
     # Operator kill switch (TUI / delegation.pause RPC): blocks NEW spawns only.
     if is_spawn_paused():

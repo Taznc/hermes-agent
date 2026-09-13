@@ -924,6 +924,9 @@ _LATER_TASK_COLUMNS = (
     ("reasoning_effort", "reasoning_effort TEXT"),
     ("route_source", "route_source TEXT"),
     ("route_name", "route_name TEXT"),
+    ("policy_forced_by", "policy_forced_by TEXT"),
+    ("policy_force_reason", "policy_force_reason TEXT"),
+    ("policy_force_route", "policy_force_route TEXT"),
     # Ralph-style goal loop toggle; 0 = classic single-shot worker.
     ("goal_mode", "goal_mode INTEGER NOT NULL DEFAULT 0"),
     ("goal_max_turns", "goal_max_turns INTEGER"),

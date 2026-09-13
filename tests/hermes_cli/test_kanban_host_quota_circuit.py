@@ -52,6 +52,10 @@ def _task(board: str, *, profile: str, provider: str) -> str:
             assignee=profile,
             model_override="test-model",
             provider_override=provider,
+            reasoning_effort="medium",
+            policy_force=True,
+            policy_force_reason="exercise quota routing with a synthetic provider",
+            policy_forced_by="operator",
         )
 
 
