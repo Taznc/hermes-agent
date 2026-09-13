@@ -25,7 +25,7 @@ Use this skill when the dispatcher explicitly loads it for either review path:
 - same-card review: the task was claimed from `review` after an implementer submitted a `review_requested` handoff; or
 - ready-child review: a separate review card was claimed from `ready` with this skill forced and its parent handoff identifies the deliverable.
 
-Both paths use the packet's effective review contract and exact round/cap metadata. A ready-child card completes through its own lifecycle; it does not call same-card `kanban_request_changes` on itself.
+Both paths use the packet's effective review contract and exact round/cap metadata. A ready-child reviewer never edits the implementation: create a separately assigned repair card, link that repair ahead of the unfinished review, then call `kanban_request_changes` on the review child so its structured blocker contract and round are persisted. The review child waits on the repair and auto-resumes for independent re-verification when the repair completes.
 
 ## Prerequisites
 
@@ -49,22 +49,26 @@ This skill is loaded automatically by the review dispatcher. Start with `kanban_
 |---|---|---|
 | Approve | Acceptance criteria and verification pass | `kanban_complete` |
 | Request changes (same-card) | Correctable implementation defects remain | `kanban_request_changes` with all structured blockers |
-| Repair (ready-child) | Correctable defects remain | Repair in-card, or link executable repair ahead of this unfinished review |
+| Repair (ready-child) | Correctable defects remain | Create a separately assigned repair, link it ahead of the review, then persist the verdict with `kanban_request_changes` |
 | Escalate | A human decision or external prerequisite is required | `kanban_block` |
 
-A requested-changes transition returns the task to its original implementer. When that implementer requests review again without naming a reviewer, the persisted reviewer provenance routes the re-review back to the same reviewer profile.
+A same-card requested-changes transition returns the task to its original implementer. When that implementer requests review again without naming a reviewer, persisted provenance routes re-review to the same reviewer profile. A ready-child verdict instead leaves the review reviewer-owned and dependency-waiting on its separately assigned repair.
 
 ## Review Lenses
 
-Vary how you look at the work on each round instead of repeating the same inspection. Decorrelated lenses catch different defect classes: a cold read of the artifact surfaces design and correctness problems that the implementer's narrative would have framed away, execution surfaces claims that do not reproduce, and a strict contract audit surfaces quiet scope drift. Repeating the round-1 lens on round 3 mostly re-finds what round 1 already found.
+Vary how you look at the work on each round instead of repeating the same inspection. Decorrelated lenses catch different defect classes: a cold read of the artifact surfaces design and correctness problems that the implementer's narrative would have framed away, execution surfaces claims that do not reproduce, and a strict contract audit surfaces quiet scope drift. Repeating the round-1 lens on a later round mostly re-finds what round 1 already found.
 
-Determine the current round from the history the task record already gives you: count the `changes_requested` entries in the "Prior attempts on this task" section of your worker context (also visible as prior runs in `kanban_show`). The current review round is that count plus one. Round 1 therefore shows zero `changes_requested` attempts; round 2 shows one; and so on.
+Use the packet's `current_round` and `max_rounds` as authoritative. The
+`changes_requested` entries in "Prior attempts on this task" remain an audit
+trail, not a counter to reconstruct: do not derive the round from prose or
+hardcode a terminal round. The configured cap may differ between boards or
+deployments.
 
 | Round | Lens | How to apply it |
 |---|---|---|
 | 1 | Artifact | Read the diff or deliverable cold, before the implementer's summary. Form an independent judgment, then compare it against the handoff narrative and investigate every mismatch. |
-| 2 | Execution | Check out the work and actually run it via `terminal`: build, test, and exercise the reported behavior yourself. Verify each handoff claim empirically instead of re-reading the artifact. |
-| 3+ | Contract | Re-read the ORIGINAL task body and acceptance criteria, then audit the deliverable strictly against them. Also verify that every item from every prior `kanban_request_changes` round actually landed. |
+| Intermediate re-review | Execution | When `max_rounds == 0` or `current_round < max_rounds`, check out the work and actually run it via `terminal`: build, test, and exercise the reported behavior yourself. Verify each handoff claim empirically instead of re-reading the artifact. |
+| Terminal bounded round | Contract | When `max_rounds > 0` and `current_round >= max_rounds`, re-read the ORIGINAL task body and acceptance criteria, audit the deliverable strictly against them, and verify every prior blocker landed. This is round 2 when the cap is 2; it is not hardcoded as round 3. Do not auto-approve unmet criteria: request changes normally and let the cap enforce its existing block. A comment or unblock without an authorized repair transition does not reset the contract or bypass the cap. |
 
 The baseline duties in the Procedure section still apply on every round; the lens sets which inspection you lead with and weight most heavily.
 
@@ -166,7 +170,7 @@ kanban_request_changes(
 )
 ```
 
-State where the defect is, how it reproduces, why it violates the task, and what minimum outcome would resolve it. Followups are inert and never release work. A ready-child review instead repairs within its own lifecycle or links separately executable repair work ahead of itself; never gate that repair behind the unfinished review/release.
+State where the defect is, how it reproduces, why it violates the task, and what minimum outcome would resolve it. Followups are inert and never release work. For a ready-child review, create a separately assigned repair card, link it ahead of the unfinished review, then call `kanban_request_changes` on the review child. That transition persists and validates the same blocker contract and round as same-card review, leaves the reviewer-owned review waiting on the repair dependency, and auto-resumes it for independent re-verification after the repair completes. Never edit the implementation as the reviewer or gate the repair behind the unfinished review/release.
 
 #### Escalate
 

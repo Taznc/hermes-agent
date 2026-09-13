@@ -6,6 +6,7 @@ import pytest
 
 from hermes_cli import kanban_db as kb
 from hermes_cli import kanban_db_connect as kbc
+from hermes_cli import kanban_db_dispatch as kbd
 from hermes_cli.kanban_db_packet import build_worker_task_packet
 
 
@@ -81,8 +82,10 @@ def test_first_review_persists_all_blockers_and_inert_followups(conn):
         for event in kb.list_events(conn, task_id)
         if event.kind == "changes_requested"
     ][-1]
+    assert isinstance(event.payload, dict)
     assert event.payload["blockers"] == blockers
     assert event.payload["followups"] == ["Consider a progress indicator."]
+    assert event.payload["review_path"] == "same_card"
     assert event.payload["review_round"] == 1
     assert event.payload["max_review_rounds"] >= 0
     assert kb.child_ids(conn, task_id) == []
@@ -275,6 +278,167 @@ def test_linking_repair_before_ready_review_child_reverses_deadlocking_edge(conn
         if event.kind == "repair_dependency_reordered"
     ][-1]
     assert event.payload == {"repair": repair, "review": review_child}
+
+
+def test_ready_child_repair_cycle_persists_contract_and_advances_rereview(
+    conn, monkeypatch
+):
+    implementation = kb.create_task(conn, title="Implementation", assignee="builder")
+    implementation_run = kb.claim_task(conn, implementation, claimer="builder:parent")
+    assert implementation_run is not None
+    assert kb.complete_task(
+        conn,
+        implementation,
+        summary="implemented",
+        expected_run_id=implementation_run.current_run_id,
+    )
+    from hermes_cli import kanban_skill_preflight as skill_preflight
+
+    monkeypatch.setattr(
+        skill_preflight, "preflight_task_skills", lambda *_args, **_kwargs: None
+    )
+    review_child = kb.create_task(
+        conn,
+        title="Review release",
+        parents=[implementation],
+        skills=["sdlc-review"],
+        assignee="reviewer",
+    )
+    first_review = kb.claim_task(conn, review_child, claimer="reviewer:first")
+    assert first_review is not None
+    cited = "AC1: preserve the release behavior"
+    ok, detail = kb.request_changes(
+        conn,
+        review_child,
+        reason="The reviewer must not repair in-card.",
+        blockers=[_blocker(cited)],
+        expected_run_id=first_review.current_run_id,
+    )
+    assert ok is False
+    assert detail == "ready-child review requires a linked unfinished repair"
+
+    repair = kb.create_task(
+        conn,
+        title="Repair release",
+        assignee="builder",
+        parents=[review_child],
+    )
+    kb.link_tasks(conn, repair, review_child)
+
+    assert kb.request_changes(
+        conn,
+        review_child,
+        reason="A separate repair is required.",
+        blockers=[_blocker(cited)],
+        expected_run_id=first_review.current_run_id,
+    ) == (True, "reviewer")
+    first_verdict = [
+        event
+        for event in kb.list_events(conn, review_child)
+        if event.kind == "changes_requested"
+    ][-1]
+    assert isinstance(first_verdict.payload, dict)
+    assert first_verdict.payload["review_path"] == "ready_child"
+    assert first_verdict.payload["review_round"] == 1
+    assert first_verdict.payload["blockers"] == [_blocker(cited)]
+    waiting_review = kb.get_task(conn, review_child)
+    assert waiting_review is not None
+    assert waiting_review.status == "todo"
+
+    repair_run = kb.claim_task(conn, repair, claimer="builder:repair")
+    assert repair_run is not None
+    assert kb.complete_task(
+        conn,
+        repair,
+        summary="repaired",
+        expected_run_id=repair_run.current_run_id,
+    )
+    resumed_review = kb.get_task(conn, review_child)
+    assert resumed_review is not None
+    assert resumed_review.status == "ready"
+
+    ready_packet = build_worker_task_packet(conn, review_child)
+    assert ready_packet.identity["role"] == "reviewer"
+    assert ready_packet.review["current_round"] == 2
+    assert ready_packet.review["changes_requested_rounds"] == 1
+    assert ready_packet.review["cited_references"] == [cited]
+
+    second_review = kb.claim_task(conn, review_child, claimer="reviewer:second")
+    assert second_review is not None
+    running_packet = build_worker_task_packet(conn, review_child)
+    assert running_packet.review["current_round"] == 2
+    assert running_packet.review["cited_references"] == [cited]
+
+    ok, detail = kb.request_changes(
+        conn,
+        review_child,
+        reason="An unrelated requirement appeared.",
+        blockers=[
+            _blocker("Required behavior: unrelated export", basis="required_behavior")
+        ],
+        expected_run_id=second_review.current_run_id,
+    )
+    assert ok is False
+    assert detail is not None
+    assert "outside the first-round review contract" in detail
+
+    second_repair = kb.create_task(
+        conn,
+        title="Repair release again",
+        assignee="builder",
+        parents=[review_child],
+    )
+    kb.link_tasks(conn, second_repair, review_child)
+    assert kb.request_changes(
+        conn,
+        review_child,
+        reason="The cited behavior still regressed.",
+        blockers=[_blocker(cited)],
+        followups=["Consider a progress indicator."],
+        expected_run_id=second_review.current_run_id,
+    ) == (True, "reviewer")
+    second_verdict = [
+        event
+        for event in kb.list_events(conn, review_child)
+        if event.kind == "changes_requested"
+    ][-1]
+    assert isinstance(second_verdict.payload, dict)
+    assert second_verdict.payload["review_path"] == "ready_child"
+    assert second_verdict.payload["review_round"] == 2
+    assert second_verdict.payload["blockers"] == [_blocker(cited)]
+    assert second_verdict.payload["followups"] == ["Consider a progress indicator."]
+    assert set(kb.parent_ids(conn, review_child)) == {
+        implementation,
+        repair,
+        second_repair,
+    }
+    assert kb.child_ids(conn, review_child) == []
+
+    second_repair_run = kb.claim_task(conn, second_repair, claimer="builder:repair-2")
+    assert second_repair_run is not None
+    assert kb.complete_task(
+        conn,
+        second_repair,
+        summary="repaired again",
+        expected_run_id=second_repair_run.current_run_id,
+    )
+    resumed_terminal_review = kb.get_task(conn, review_child)
+    assert resumed_terminal_review is not None
+    assert resumed_terminal_review.status == "ready"
+
+    def unexpected_spawn(*_args, **_kwargs):
+        raise AssertionError("the cap must stop dispatch before spawning")
+
+    cap_result = kbd.dispatch_once(
+        conn,
+        spawn_fn=unexpected_spawn,
+        max_review_rounds=2,
+    )
+    assert cap_result.blocked_review_round_cap == [(review_child, 2)]
+    capped_review = kb.get_task(conn, review_child)
+    assert capped_review is not None
+    assert capped_review.status == "blocked"
+    assert capped_review.block_kind == "review_round_cap"
 
 
 def test_standalone_ready_skill_tagged_task_keeps_ordinary_cycle_rejection(conn):

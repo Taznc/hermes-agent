@@ -178,9 +178,11 @@ def effective_review_contract(
     path = "ready_child" if ready_child else "same_card"
     references = sorted(cited_references(conn, task_id))
     target_task_ids = _kb.parent_ids(conn, task_id) if ready_child else [task_id]
-    current_round = changes_rounds + (1 if source_state == "review" else 0)
-    if ready_child and current_round == 0:
-        current_round = 1
+    current_round = (
+        changes_rounds + 1
+        if ready_child
+        else changes_rounds + (1 if source_state == "review" else 0)
+    )
     return {
         "path": path,
         "target_task_ids": target_task_ids,

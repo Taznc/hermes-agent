@@ -121,6 +121,7 @@ def _unresolved_review_items(
             "followups": payload.get("followups") or [],
             "metadata": payload.get("metadata"),
             "reviewer": payload.get("reviewer"),
+            "review_path": payload.get("review_path") or "same_card",
             "review_round": payload.get("review_round"),
             "max_review_rounds": payload.get("max_review_rounds"),
             "run_id": row["run_id"],
@@ -287,8 +288,24 @@ def build_worker_task_packet(
         if task.status == "running"
         else task.status
     )
-    role = "reviewer" if source_state == "review" else "implementer"
     handoff = _latest_closed_handoff(conn, task_id)
+    changes_rounds, _ = _kbd._changes_requested_state(conn, task_id)
+    caps, max_review_rounds = _runtime_caps(task)
+    from hermes_cli import kanban_db_review as review_policy
+
+    review_contract = review_policy.effective_review_contract(
+        conn,
+        task_id,
+        task=task,
+        source_state=source_state,
+        changes_rounds=changes_rounds,
+        max_review_rounds=max_review_rounds,
+    )
+    role = (
+        "reviewer"
+        if source_state == "review" or review_contract["path"] == "ready_child"
+        else "implementer"
+    )
     unresolved, unresolved_event_ids = _unresolved_review_items(conn, task_id)
     # On a rework dispatch the latest closed run is the reviewer verdict, which
     # is already represented losslessly in ``unresolved_items``. Do not emit
@@ -299,14 +316,6 @@ def build_worker_task_packet(
         and any(item.get("run_id") == handoff.get("run_id") for item in unresolved)
     ):
         handoff = None
-    changes_rounds, _ = _kbd._changes_requested_state(conn, task_id)
-    caps, max_review_rounds = _runtime_caps(task)
-    from hermes_cli import kanban_db_review as review_policy
-
-    review_contract = review_policy.effective_review_contract(
-        conn, task_id, task=task, source_state=source_state,
-        changes_rounds=changes_rounds, max_review_rounds=max_review_rounds,
-    )
 
     board_meta = _board_metadata_for_connection(conn, board)
     land_target = board_meta.get("land_target")

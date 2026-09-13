@@ -4916,9 +4916,13 @@ def request_changes(
     metadata: Optional[dict] = None, blockers: Optional[list[dict[str, str]]] = None,
     followups: Optional[list[str]] = None,
 ) -> tuple[bool, Optional[str]]:
-    """Close an active reviewer run (claimed from ``review``) and hand the task
-    back to the implementer from the latest ``review_requested`` event, parent
-    gating reapplied. Returns ``(ok, implementer | reason)``.
+    """Close an active reviewer run for either review path.
+
+    Same-card review hands the task back to the implementer from the latest
+    ``review_requested`` event. A ready-child review remains reviewer-owned and
+    must already have a separately assigned unfinished repair linked ahead of it;
+    parent gating keeps the review waiting until that repair completes. Returns
+    ``(ok, routed assignee | reason)``.
 
     ``blockers`` is the mandatory deterministic scope contract. The first
     structured verdict consolidates all blockers; later verdicts may cite that
@@ -4959,59 +4963,83 @@ def request_changes(
 
         claimed_event = _latest_event(conn, task_id, "claimed", current_run_id)
         claimed_payload = _json_dict(_row_get(claimed_event, "payload"))
-        if claimed_payload.get("source_status") != "review":
+        claimed_source = claimed_payload.get("source_status") or "ready"
+        active_task = get_task(conn, task_id)
+        ready_child = claimed_source == "ready" and review_policy.is_ready_review_child(
+            conn, task_id, active_task, source_state="ready"
+        )
+        if claimed_source != "review" and not ready_child:
             return False, "active run was not claimed from review"
+        if ready_child:
+            repair_event = _latest_event(conn, task_id, "repair_dependency_reordered")
+            repair_payload = _json_dict(_row_get(repair_event, "payload"))
+            repair_id = _nonblank_str(repair_payload.get("repair"))
+            repair_linked_this_run = (
+                repair_event is not None
+                and claimed_event is not None
+                and int(repair_event["id"]) > int(claimed_event["id"])
+                and repair_id in parent_ids(conn, task_id)
+            )
+            if not repair_linked_this_run or _parents_satisfied(conn, task_id):
+                return False, "ready-child review requires a linked unfinished repair"
 
-        requested_event = _latest_event(conn, task_id, "review_requested")
-        if requested_event is None:
-            return False, "no prior review_requested event"
-        requested_payload = _json_dict(requested_event["payload"])
-        implementer = _nonblank_str(requested_payload.get("implementer"))
-        if implementer is None:
-            return False, "review handoff has no valid implementer provenance"
         reviewer = _canonical_assignee(_nonblank_str(task_row["assignee"]))
-
-        # Round trip back to the implementer must not silently lose the pin
-        # that a cross-profile handoff snapshotted — from EITHER an explicit
-        # request_review(reviewer=...) (snapshot lives on this
-        # review_requested event) OR a kanban.default_reviewer auto-assign
-        # (the dispatcher's _apply_default_reviewer cannot rewrite this
-        # immutable review_requested row, so it snapshots onto a LATER
-        # "assigned" event instead — see kanban_db_dispatch.py). Pick
-        # whichever event carries the override snapshot and happened last;
-        # a same-profile review that never cleared the columns has neither,
-        # so there is nothing to restore.
-        override_payload = requested_payload
-        assigned_event = _latest_event(conn, task_id, "assigned")
-        if (
-            assigned_event is not None
-            and int(assigned_event["id"]) > int(requested_event["id"])
-        ):
-            assigned_payload = _json_dict(assigned_event["payload"])
-            if (
-                assigned_payload.get("source") == "kanban.default_reviewer"
-                and (
-                    "implementer_model_override" in assigned_payload
-                    or "implementer_reasoning_effort" in assigned_payload
-                )
-            ):
-                override_payload = assigned_payload
-
+        implementer: Optional[str]
         override_sets: list[str] = []
         override_params_list: list[Any] = []
-        if "implementer_model_override" in override_payload:
-            override_sets.extend(["model_override = ?", "provider_override = ?"])
-            override_params_list.extend(
-                [
-                    _nonblank_str(override_payload.get("implementer_model_override")),
-                    _nonblank_str(override_payload.get("implementer_provider_override")),
-                ]
-            )
-        if "implementer_reasoning_effort" in override_payload:
-            override_sets.append("reasoning_effort = ?")
-            override_params_list.append(
-                normalize_reasoning_effort(override_payload.get("implementer_reasoning_effort"))
-            )
+        if ready_child:
+            # A ready-child review remains reviewer-owned. Its separately assigned
+            # repair is the unfinished dependency that re-gates this card; the
+            # structured verdict closes only the current review run.
+            implementer = reviewer
+        else:
+            requested_event = _latest_event(conn, task_id, "review_requested")
+            if requested_event is None:
+                return False, "no prior review_requested event"
+            requested_payload = _json_dict(requested_event["payload"])
+            implementer = _nonblank_str(requested_payload.get("implementer"))
+            if implementer is None:
+                return False, "review handoff has no valid implementer provenance"
+
+            # Round trip back to the implementer must not silently lose the pin
+            # that a cross-profile handoff snapshotted — from EITHER an explicit
+            # request_review(reviewer=...) (snapshot lives on this
+            # review_requested event) OR a kanban.default_reviewer auto-assign
+            # (the dispatcher's _apply_default_reviewer cannot rewrite this
+            # immutable review_requested row, so it snapshots onto a LATER
+            # "assigned" event instead — see kanban_db_dispatch.py). Pick
+            # whichever event carries the override snapshot and happened last;
+            # a same-profile review that never cleared the columns has neither,
+            # so there is nothing to restore.
+            override_payload = requested_payload
+            assigned_event = _latest_event(conn, task_id, "assigned")
+            if (
+                assigned_event is not None
+                and int(assigned_event["id"]) > int(requested_event["id"])
+            ):
+                assigned_payload = _json_dict(assigned_event["payload"])
+                if (
+                    assigned_payload.get("source") == "kanban.default_reviewer"
+                    and (
+                        "implementer_model_override" in assigned_payload
+                        or "implementer_reasoning_effort" in assigned_payload
+                    )
+                ):
+                    override_payload = assigned_payload
+
+            if "implementer_model_override" in override_payload:
+                override_sets.extend(["model_override = ?", "provider_override = ?"])
+                override_params_list.extend(
+                    [
+                        _nonblank_str(override_payload.get("implementer_model_override")),
+                        _nonblank_str(override_payload.get("implementer_provider_override")),
+                    ]
+                )
+            if "implementer_reasoning_effort" in override_payload:
+                override_sets.append("reasoning_effort = ?")
+                override_params_list.append(
+                    normalize_reasoning_effort(override_payload.get("implementer_reasoning_effort"))
+                )
         override_sql = ""
         if override_sets:
             override_sql = ", " + ", ".join(override_sets)
@@ -5049,6 +5077,7 @@ def request_changes(
                 "implementer": implementer,
                 "reviewer": reviewer,
                 "status": new_status,
+                "review_path": "ready_child" if ready_child else "same_card",
                 "review_round": _review_round(conn, task_id),
                 "max_review_rounds": max_review_rounds,
                 "blockers": normalized_blockers,
