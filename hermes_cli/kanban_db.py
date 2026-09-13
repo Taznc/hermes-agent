@@ -249,7 +249,7 @@ def notify_task_updated(
 # DispatchResult counters whose non-zero value means the tick did something.
 _TICK_ACTIVITY_FIELDS = (
     "spawned", "reclaimed", "promoted", "reconciled_orphans", "crashed", "stale",
-    "timed_out", "auto_blocked", "rate_limited", "review_no_verdict", "auto_assigned_default",
+    "timed_out", "auto_blocked", "preflight_blocked", "rate_limited", "review_no_verdict", "auto_assigned_default",
     "respawn_guarded", "skipped_per_profile_capped", "skipped_unassigned",
     "skipped_nonspawnable", "skill_preflight_blocked", "blocked_review_round_cap",
 )
@@ -916,6 +916,8 @@ class Task:
     # creates and every pre-feature row.
     created_by_task: Optional[str] = None
     created_by_run: Optional[int] = None
+    # In-memory dispatcher handoff; persisted as a board artifact, not a task column.
+    preflight_receipt_path: Optional[str] = None
 
     @classmethod
     def from_row(cls, row: sqlite3.Row) -> "Task":
@@ -5798,23 +5800,10 @@ def unhold_task(conn: sqlite3.Connection, task_id: str) -> bool:
 # --- Worker context builder (what a spawned worker sees) ---
 
 def build_worker_context(conn: sqlite3.Connection, task_id: str) -> str:
-    """Everything a worker should read about its task: header, body,
-    attachments, prior attempts, done-parent handoffs, the assignee's recent
-    work, comments. Lists are tail-capped and fields char-capped
-    (``_CTX_MAX_*``) so the prompt stays bounded on pathological boards."""
-    task = get_task(conn, task_id)
-    if not task:
-        raise ValueError(f"unknown task {task_id}")
-    # One clock reading so every relative age in this rendering agrees.
-    now = int(time.time())
-    lines: list[str] = []
-    _ctx_header(lines, task)
-    _ctx_attachments(lines, list_attachments(conn, task_id))
-    _ctx_prior_attempts(lines, conn, task_id, now)
-    _ctx_parent_results(lines, conn, task_id, now)
-    _ctx_role_history(lines, conn, task, now)
-    _ctx_comments(lines, list_comments(conn, task_id), now)
-    return "\n".join(lines).rstrip() + "\n"
+    """Render the canonical packet for the legacy CLI/context surface."""
+    from hermes_cli.kanban_db_packet import render_worker_task_packet
+
+    return render_worker_task_packet(build_worker_task_packet(conn, task_id))
 
 
 def _ctx_cap(s: Optional[str], limit: int = _CTX_MAX_FIELD_BYTES) -> str:
@@ -6280,6 +6269,11 @@ from hermes_cli.kanban_db_workspace import (  # noqa: E402
     _is_managed_scratch_path,
     _managed_scratch_path_info,
     _scratch_workspace,
+)
+from hermes_cli.kanban_db_packet import (  # noqa: E402
+    WorkerTaskPacket,
+    build_worker_task_packet,
+    read_task_history_page,
 )
 from hermes_cli.kanban_db_dispatch import (  # noqa: E402
     DEFAULT_FAILURE_LIMIT,

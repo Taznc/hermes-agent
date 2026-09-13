@@ -255,6 +255,8 @@ class DispatchResult:
     """Task ids reclaimed because their worker PID disappeared."""
     auto_blocked: list[str] = field(default_factory=list)
     """Task ids auto-blocked by the spawn-failure circuit breaker."""
+    preflight_blocked: list[str] = field(default_factory=list)
+    """Task ids blocked before model spawn by deterministic workspace checks."""
     timed_out: list[str] = field(default_factory=list)
     """Task ids whose workers exceeded ``max_runtime_seconds``."""
     stale: list[str] = field(default_factory=list)
@@ -3104,12 +3106,28 @@ def _dispatch_lane_task(
     claimed = claim(conn, task_id, ttl_seconds=ttl_seconds)
     if claimed is None:
         return False
+    from hermes_cli import kanban_db_receipt as _kbr
+
+    plan = None
     try:
         resolved_branch_name = None
         if claimed.workspace_kind == "worktree":
-            workspace, resolved_branch_name = _kbw._resolve_worktree_workspace(claimed, board=board)
+            plan = _kbr.workspace_plan(conn, claimed, board=board)
+            workspace, resolved_branch_name = _kbw._resolve_worktree_workspace(
+                claimed, board=board, base_ref=plan.base_ref
+            )
         else:
             workspace = _kbw.resolve_workspace(claimed, board=board)
+    except _kbr.PreflightError as exc:
+        _kb.block_task(
+            conn,
+            claimed.id,
+            reason=f"Kanban preflight refused spawn: {exc}",
+            kind="capability",
+            expected_run_id=claimed.current_run_id,
+        )
+        result.preflight_blocked.append(claimed.id)
+        return False
     except Exception as exc:
         if _record_task_failure(
             conn, claimed.id, f"workspace: {exc}",
@@ -3120,6 +3138,28 @@ def _dispatch_lane_task(
     _kbw.set_workspace_path(conn, claimed.id, str(workspace))
     if claimed.workspace_kind == "worktree":
         _kbw.set_branch_name(conn, claimed.id, resolved_branch_name or (claimed.branch_name or "").strip() or f"wt/{claimed.id}")
+        claimed.workspace_path = str(workspace)
+        claimed.branch_name = resolved_branch_name or (claimed.branch_name or "").strip() or f"wt/{claimed.id}"
+    try:
+        receipt = _kbr.build_preflight_receipt(
+            claimed,
+            workspace,
+            board=board,
+            base_ref=plan.base_ref if plan is not None else None,
+            artifact_ref=plan.artifact_ref if plan is not None else None,
+            role=plan.role if plan is not None else ("reviewer" if lane == "review" else "implementer"),
+        )
+        claimed.preflight_receipt_path = str(receipt.path)
+    except _kbr.PreflightError as exc:
+        _kb.block_task(
+            conn,
+            claimed.id,
+            reason=f"Kanban preflight refused spawn: {exc}",
+            kind="capability",
+            expected_run_id=claimed.current_run_id,
+        )
+        result.preflight_blocked.append(claimed.id)
+        return False
     _kbw._maybe_emit_scratch_tip(conn, claimed.id, claimed.workspace_kind)
     if lane == "review":
         # Force-load sdlc-review; the kanban lifecycle is already in every
@@ -4501,7 +4541,13 @@ def _retag_legacy_worker_sessions(workspaces_root_path: str) -> None:
 
 
 def _worker_argv(task: Task, profile_arg: str, hermes_home: Optional[str]) -> list[str]:
-    """Build the ``hermes -p <profile> --cli ... chat -q ...`` worker command."""
+    """Build the worker command with an id-only, cache-safe startup query.
+
+    Dynamic task/body/history data is returned once by ``kanban_show`` as the
+    canonical worker packet.  Keeping it out of argv avoids a second operative
+    serialization and leaves the system/message prefix and role alternation
+    unchanged.
+    """
     cmd = [
         *_resolve_hermes_argv(),
         "-p", profile_arg,
@@ -4963,6 +5009,8 @@ def _default_spawn(task: Task, workspace: str, *, board: Optional[str] = None) -
         env["HERMES_KANBAN_RUN_ID"] = str(task.current_run_id)
     if task.claim_lock:
         env["HERMES_KANBAN_CLAIM_LOCK"] = task.claim_lock
+    if task.preflight_receipt_path:
+        env["HERMES_KANBAN_PREFLIGHT_RECEIPT"] = task.preflight_receipt_path
     # Goal-loop mode (Ralph-style /goal judge loop in cli.py quiet-mode path).
     # Only set when enabled so non-goal tasks keep a clean env.
     if task.goal_mode:
@@ -5010,6 +5058,7 @@ def _default_spawn(task: Task, workspace: str, *, board: Optional[str] = None) -
             "HERMES_HOME", "HERMES_TENANT", "HERMES_KANBAN_TASK",
             "HERMES_KANBAN_WORKSPACE", "HERMES_SESSION_SOURCE", "HERMES_SESSION_ID", "TERMINAL_CWD",
             "HERMES_KANBAN_BRANCH", "HERMES_KANBAN_RUN_ID", "HERMES_KANBAN_CLAIM_LOCK",
+            "HERMES_KANBAN_PREFLIGHT_RECEIPT",
             "HERMES_KANBAN_GOAL_MODE", "HERMES_KANBAN_GOAL_MAX_TURNS", "TERMINAL_TIMEOUT",
             "TERMINAL_MAX_FOREGROUND_TIMEOUT", "HERMES_KANBAN_DB", "HERMES_KANBAN_PIN_HOME",
             "HERMES_KANBAN_WORKSPACES_ROOT", "HERMES_KANBAN_BOARD", "HERMES_PROFILE",

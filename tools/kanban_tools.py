@@ -575,20 +575,18 @@ def inject_new_comments_from_env(agent: Any) -> bool:
 
 @_kanban_handler("kanban_show")
 def _handle_show(args: dict, **kw) -> str:
-    """Full task state: row, parents, children, comments, runs, last 50 events."""
+    """Canonical worker packet, or one cursor page of durable history."""
     tid = _require_task_id(args)
     with _board(args.get("board")) as (kb, conn):
-        task = _existing_task(kb, conn, tid)
-        return json.dumps({
-            "task": _fields(task, _TASK_FIELDS),
-            "parents": kb.parent_ids(conn, tid),
-            "children": kb.child_ids(conn, tid),
-            "comments": [_fields(c, _COMMENT_FIELDS) for c in kb.list_comments(conn, tid)],
-            # Capped; full log via CLI.
-            "events": [_fields(e, _EVENT_FIELDS) for e in kb.list_events(conn, tid)[-50:]],
-            "runs": [_fields(r, _RUN_FIELDS) for r in kb.list_runs(conn, tid)],
-            # Same string build_worker_context hands the dispatcher at spawn time.
-            "worker_context": kb.build_worker_context(conn, tid)})
+        _existing_task(kb, conn, tid)
+        cursor = args.get("history_cursor")
+        if cursor is not None:
+            page = kb.read_task_history_page(
+                conn, tid, str(cursor), args.get("history_limit", 20),
+            )
+            return json.dumps({"history_page": page}, ensure_ascii=False)
+        packet = kb.build_worker_task_packet(conn, tid, board=args.get("board"))
+        return json.dumps({"packet": packet.to_dict()}, ensure_ascii=False)
 
 
 @_kanban_handler("kanban_list")
@@ -808,14 +806,10 @@ def _handle_comment(args: dict, **kw) -> str:
     _check(tid, "task_id is required (use the current task id if that's what "
                 "you mean — pulls from env but kept explicit here)")
     body = _redact(_require_text(args, "body"))
-    # Author comes from the worker's runtime identity, never caller args: comments are
-    # injected into future workers' system prompts, so an args["author"] override could
-    # forge a directive from ``hermes-system``. Cross-task commenting stays unrestricted —
-    # it is the handoff channel between tasks.
-    # Comments are injected into the next worker's system prompt by ``build_worker_context`` as
-    # ``**{author}** (timestamp): {body}`` — accepting an ``args["author"]`` override let a worker forge a
-    # comment from an authoritative-looking name like ``hermes-system`` and poison the future-worker context
-    # with what reads as a system directive. See #19713.
+    # Author comes from the worker's runtime identity, never caller args. Comments can enter the
+    # next worker's canonical packet as explicitly framed history data, so an args["author"]
+    # override could forge an authoritative-looking source. Cross-task commenting stays
+    # unrestricted because it is the handoff channel between tasks. See #19713.
     author = os.environ.get("HERMES_PROFILE") or "worker"
     with _board(args.get("board")) as (kb, conn):
         cid = kb.add_comment(conn, tid, author=author, body=str(body))

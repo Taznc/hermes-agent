@@ -54,7 +54,9 @@ def _capture_spawn_env(kb, monkeypatch, workspace: str) -> dict:
         return FakeProc()
 
     monkeypatch.setattr(subprocess, "Popen", fake_popen)
-    kbd._default_spawn(_make_task(kb), workspace)
+    task = _make_task(kb)
+    task.preflight_receipt_path = f"{workspace}/preflight.json"
+    kbd._default_spawn(task, workspace)
     return captured
 
 
@@ -77,5 +79,8 @@ def test_terminal_cwd_pinned_to_workspace(monkeypatch, tmp_path):
     # The subprocess cwd and TERMINAL_CWD must agree — both anchor the workspace.
     assert captured["cwd"] == str(workspace)
     assert captured["env"]["HERMES_KANBAN_WORKSPACE"] == str(workspace)
+    assert captured["env"]["HERMES_KANBAN_PREFLIGHT_RECEIPT"] == str(
+        workspace / "preflight.json"
+    )
 
 
