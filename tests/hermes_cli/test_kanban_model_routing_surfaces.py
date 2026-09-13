@@ -32,7 +32,7 @@ def routing_decision():
     return KanbanModelRouteDecision(
         route_source="mechanical",
         route_name="mechanical",
-        model_override="gpt-5.6-terra",
+        model_override="gpt-5.4-mini",
         provider_override="openai-codex",
         reasoning_effort="medium",
     )
@@ -91,7 +91,7 @@ def test_create_paths_share_routing_and_show_provenance(
     )
     assert kanban_cli._cmd_create(cli_args) == 0
     cli_task = _latest_task_by_title("CLI task")
-    assert cli_task.model_override == "gpt-5.6-terra"
+    assert cli_task.model_override == "gpt-5.4-mini"
     assert cli_task.provider_override == "openai-codex"
     assert cli_task.reasoning_effort == "medium"
     assert cli_task.route_source == "mechanical"

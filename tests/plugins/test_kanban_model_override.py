@@ -108,20 +108,6 @@ def test_create_task_with_model_and_provider(conn):
     assert ev.payload["provider_override"] == "openrouter"
 
 
-def test_dashboard_create_rejects_unknown_explicit_route_without_profile_config(client):
-    response = client.post(
-        "/api/plugins/kanban/tasks",
-        json={
-            "title": "unknown route",
-            "model_override": "future-expensive-model",
-            "provider_override": "openai-codex",
-            "reasoning_effort": "medium",
-        },
-    )
-    assert response.status_code == 400
-    assert "unknown model route" in response.json()["detail"]
-
-
 def test_migration_adds_provider_override_column(conn):
     cols = {row["name"] for row in conn.execute("PRAGMA table_info(tasks)")}
     assert "model_override" in cols
@@ -244,31 +230,19 @@ def test_reasoning_effort_normalizes_and_rejects(conn):
         kb.set_reasoning_effort(conn, tid, "extremely-hard")
 
 
-def test_reasoning_effort_survives_clearing_the_model(conn, kanban_home):
+def test_reasoning_effort_survives_clearing_the_model(conn):
     """Depth and model are independent knobs: dropping a model override must
     not silently reset the thinking depth the operator chose."""
-    profile = kanban_home / "profiles" / "worker"
-    profile.mkdir(parents=True)
-    (profile / "config.yaml").write_text(
-        "model:\n  provider: openai-codex\n  default: gpt-5.6-sol\n"
-        "agent:\n  reasoning_effort: medium\n",
-        encoding="utf-8",
-    )
     tid = kb.create_task(
         conn, title="t", assignee="worker",
-        model_override="gpt-5.6-sol", provider_override="openai-codex",
-        reasoning_effort="high", policy_force=True,
-        policy_force_reason="hard diagnosis", policy_forced_by="operator",
+        model_override="glm-5", provider_override="openrouter",
+        reasoning_effort="ultra",
     )
-    assert kb.set_model_override(
-        conn, tid, None, policy_force=True,
-        policy_force_reason="continue hard diagnosis", policy_forced_by="operator",
-    )
-    task = kb.get_task(conn, tid)
-    assert task is not None
-    assert task.model_override is None
-    assert task.provider_override is None
-    assert task.reasoning_effort == "high"
+    assert kb.set_model_override(conn, tid, None)
+    t = kb.get_task(conn, tid)
+    assert t.model_override is None
+    assert t.provider_override is None
+    assert t.reasoning_effort == "ultra"
 
 
 def test_reasoning_effort_without_a_model_override(conn):

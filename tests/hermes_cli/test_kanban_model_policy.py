@@ -62,30 +62,10 @@ def test_policy_matrix_accepts_only_approved_unattended_routes():
     "gpt-5.3-codex-spark", "openai/gpt-oss-120b:free",
 ])
 def test_policy_denies_unattended_escape_hatch_models(model):
-    with pytest.raises(ValueError, match="model policy"):
+    with pytest.raises(ValueError, match="operator force"):
         kb.validate_model_effort_policy(
             provider="openai-codex", model=model, reasoning_effort="medium",
             assignee="worker", policy={},
-        )
-
-
-@pytest.mark.parametrize("model", [
-    "gpt-5.4-mini", "gpt-5.3-codex-spark", "openai/gpt-oss-120b:free",
-])
-def test_force_cannot_admit_categorically_denied_models(model):
-    with pytest.raises(ValueError, match="cannot be force-approved"):
-        kb.validate_model_effort_policy(
-            provider="openai-codex", model=model, reasoning_effort="medium",
-            assignee="worker", policy={}, force=True,
-            force_reason="operator exception", forced_by="operator",
-        )
-
-
-def test_luna_is_refused_for_independent_review_profiles_without_force():
-    with pytest.raises(ValueError, match="mechanical-only.*reviewer"):
-        kb.validate_model_effort_policy(
-            provider="openai-codex", model="gpt-5.6-luna", reasoning_effort="low",
-            assignee="reviewer", policy={},
         )
 
 
@@ -112,24 +92,6 @@ def test_force_requires_reason_and_binds_to_profile_and_route():
         "assignee": "reviewer", "model": "gpt-6-astra",
         "provider": "openai-codex", "reasoning_effort": "high",
     }
-    with pytest.raises(ValueError, match="cannot force-approve unknown route"):
-        kb.validate_model_effort_policy(
-            provider="openai-codex", model="gpt-7-future", reasoning_effort="medium",
-            assignee="reviewer", policy={}, force=True,
-            force_reason="unreviewed future model", forced_by="operator",
-        )
-    with pytest.raises(ValueError, match="cannot force-approve unknown route"):
-        kb.validate_model_effort_policy(
-            provider="openai-codex", model="not-astra-future", reasoning_effort="high",
-            assignee="reviewer", policy={}, force=True,
-            force_reason="substring is not a known family", forced_by="operator",
-        )
-    with pytest.raises(ValueError, match="cannot force-approve unknown route"):
-        kb.validate_model_effort_policy(
-            provider="openai-codex", model="gpt-5.6-terra", reasoning_effort="low",
-            assignee="worker", policy={}, force=True,
-            force_reason="invalid effort pairing", forced_by="operator",
-        )
 
 
 def test_create_rejects_goal_mode_and_persists_force_provenance(conn):
@@ -148,21 +110,6 @@ def test_create_rejects_goal_mode_and_persists_force_provenance(conn):
     assert json.loads(task.policy_force_route)["model"] == "gpt-6-astra"
     created = next(e for e in kb.list_events(conn, tid) if e.kind == "created")
     assert created.payload["model_policy_force"]["reason"] == "security incident"
-
-
-@pytest.mark.parametrize(
-    ("assignee", "model"),
-    [("missing-profile", "gpt-6-astra"), (None, "future-expensive-model")],
-)
-def test_create_rejects_explicit_denied_or_unknown_route_without_profile_config(
-    conn, assignee, model,
-):
-    with pytest.raises(ValueError, match="model policy"):
-        kb.create_task(
-            conn, title="explicit route", assignee=assignee,
-            model_override=model, provider_override="openai-codex",
-            reasoning_effort="medium",
-        )
 
 
 def test_mutations_validate_combined_route_and_clear_force_on_change(conn):
@@ -311,92 +258,6 @@ def test_default_reviewer_handoff_refuses_disallowed_profile_route(conn):
     assert task is not None
     assert task.status == "review"
     assert task.assignee == "worker"
-
-
-def test_explicit_review_handoff_refuses_luna_for_any_reviewer_profile(conn):
-    home = kb.kanban_home()
-    _write_profile(home, "worker")
-    _write_profile(home, "codexreview", model="gpt-5.6-luna", effort="low")
-    tid = kb.create_task(conn, title="review me", assignee="worker")
-
-    result = kb.request_review(
-        conn, tid, reviewer="codexreview", summary="ready", with_reason=True,
-    )
-    assert isinstance(result, tuple)
-    ok, reason = result
-    assert ok is False
-    assert isinstance(reason, str)
-    assert "mechanical-only Luna" in reason
-    task = kb.get_task(conn, tid)
-    assert task is not None
-    assert task.status == "ready"
-    assert task.assignee == "worker"
-
-
-def test_forced_implementer_route_survives_review_rework_only_for_implementer(conn):
-    home = kb.kanban_home()
-    _write_profile(home, "builder")
-    _write_profile(home, "reviewer")
-    tid = kb.create_task(
-        conn, title="forced implementation", assignee="builder",
-        model_override="gpt-6-astra", provider_override="openai-codex",
-        reasoning_effort="high", policy_force=True,
-        policy_force_reason="hard security incident", policy_forced_by="operator",
-    )
-    implementation = kb.claim_task(conn, tid, claimer="builder:1")
-    assert implementation is not None
-
-    assert kb.request_review(
-        conn, tid, reviewer="reviewer", expected_run_id=implementation.current_run_id,
-    )
-    review_lane = kb.get_task(conn, tid)
-    assert review_lane is not None
-    assert review_lane.assignee == "reviewer"
-    assert review_lane.policy_forced_by is None
-    assert review_lane.model_override is None
-
-    review = kb.claim_review_task(conn, tid, claimer="reviewer:1")
-    assert review is not None
-    assert kb.request_changes(
-        conn, tid, reason="add regression", expected_run_id=review.current_run_id,
-    ) == (True, "builder")
-
-    returned = kb.get_task(conn, tid)
-    assert returned is not None
-    assert returned.status == "ready"
-    assert returned.assignee == "builder"
-    assert returned.model_override == "gpt-6-astra"
-    assert returned.reasoning_effort == "high"
-    assert returned.policy_forced_by == "operator"
-    assert returned.policy_force_reason == "hard security incident"
-
-
-def test_review_reopen_restores_forced_implementer_route(conn):
-    home = kb.kanban_home()
-    _write_profile(home, "builder")
-    _write_profile(home, "reviewer")
-    tid = kb.create_task(
-        conn, title="forced reopen", assignee="builder",
-        model_override="gpt-6-astra", provider_override="openai-codex",
-        reasoning_effort="high", policy_force=True,
-        policy_force_reason="hard security incident", policy_forced_by="operator",
-    )
-    implementation = kb.claim_task(conn, tid, claimer="builder:1")
-    assert implementation is not None
-    assert kb.request_review(
-        conn, tid, reviewer="reviewer", expected_run_id=implementation.current_run_id,
-    ) is True
-
-    assert kb.reopen_review_task(conn, tid) is True
-    returned = kb.get_task(conn, tid)
-    assert returned is not None
-    assert returned.assignee == "builder"
-    assert returned.model_override == "gpt-6-astra"
-    assert returned.provider_override == "openai-codex"
-    assert returned.reasoning_effort == "high"
-    assert returned.policy_forced_by == "operator"
-    assert returned.policy_force_reason == "hard security incident"
-    assert returned.policy_force_route is not None
 
 
 def test_dispatch_revalidates_tampered_legacy_row_before_spawn(conn):

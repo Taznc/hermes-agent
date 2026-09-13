@@ -26,17 +26,6 @@ def quota_home(tmp_path, monkeypatch):
     monkeypatch.setenv("HERMES_HOME", str(home))
     monkeypatch.setenv("HERMES_KANBAN_HOME", str(home))
     monkeypatch.setattr(Path, "home", lambda: tmp_path)
-    # This suite exercises host/account quota grouping with synthetic legacy
-    # routes, not route admission. Keep the policy gate out of that fixture so
-    # dispatch reaches the quota circuit under test.
-    monkeypatch.setattr(
-        kb, "validate_task_model_policy",
-        lambda *_args, **_kwargs: kb.ModelPolicyDecision(False),
-    )
-    monkeypatch.setattr(
-        kb, "validate_model_effort_policy",
-        lambda **_kwargs: kb.ModelPolicyDecision(False),
-    )
     assert kqc.quota_circuit_db_path().resolve().is_relative_to(tmp_path.resolve())
     kb.init_db(board="default")
     kb.init_db(board="second")
@@ -57,21 +46,17 @@ BUDGET_GROUPS = {
 
 def _task(board: str, *, profile: str, provider: str) -> str:
     with kbc.connect(board=board) as conn:
-        task_id = kb.create_task(
+        return kb.create_task(
             conn,
             title=f"{board}-{profile}-{provider}",
             assignee=profile,
+            model_override="test-model",
+            provider_override=provider,
+            reasoning_effort="medium",
+            policy_force=True,
+            policy_force_reason="exercise quota routing with a synthetic provider",
+            policy_forced_by="operator",
         )
-        # Quota tests intentionally need synthetic provider/account routes that
-        # are not admissible for real unattended work. Seed them as legacy rows
-        # so this suite exercises quota grouping rather than model admission.
-        with kb.write_txn(conn):
-            conn.execute(
-                "UPDATE tasks SET model_override = ?, provider_override = ?, "
-                "reasoning_effort = ? WHERE id = ?",
-                ("test-model", provider, "medium", task_id),
-            )
-        return task_id
 
 
 def _guard(board: str, task_id: str, *, consume: bool = True):
@@ -130,7 +115,7 @@ def test_one_board_quota_event_guards_matching_routes_on_every_board(quota_home,
             max_in_progress=10,
             reconcile_orphans=False,
         )
-        assert [task_id for task_id, _who, _ws in result.spawned] == [unrelated], result
+        assert [task_id for task_id, _who, _ws in result.spawned] == [unrelated]
         assert (matching, "host_quota_circuit") in result.respawn_guarded
 
     circuits = kqc.list_quota_circuits(now=1_001)
@@ -392,7 +377,7 @@ def test_repeated_dispatch_ticks_never_start_auto_task_on_paused_provider(quota_
                 )
                 spawned.extend(task_id for task_id, _who, _ws in result.spawned)
                 if board == "default":
-                    assert (stuck, "host_quota_circuit") in result.respawn_guarded, result
+                    assert (stuck, "host_quota_circuit") in result.respawn_guarded
     assert stuck not in spawned
     # The reviewer card shares the paused candidate group but its profile's
     # resolution lands on a provider mapped to an unpaused group, so it is

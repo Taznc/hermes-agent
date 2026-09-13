@@ -82,14 +82,14 @@ def test_create_with_invalid_reasoning_fails_loudly(kanban_home):
 def test_create_with_model_and_reasoning_together(kanban_home):
     kc.run_slash(
         'create "task a" --assignee worker '
-        "--model gpt-5.6-sol --provider openai-codex --reasoning medium"
+        "--model claude-opus-4.6 --provider anthropic --reasoning xhigh"
     )
     with kbc.connect_closing() as conn:
         tasks = kb.list_tasks(conn, assignee="worker")
     t = tasks[0]
-    assert t.model_override == "gpt-5.6-sol"
-    assert t.provider_override == "openai-codex"
-    assert t.reasoning_effort == "medium"
+    assert t.model_override == "claude-opus-4.6"
+    assert t.provider_override == "anthropic"
+    assert t.reasoning_effort == "xhigh"
 
 
 # ---------------------------------------------------------------------------
@@ -120,17 +120,17 @@ def test_dispatcher_spawns_with_both_model_and_reasoning(kanban_home, monkeypatc
     with kbc.connect_closing() as conn:
         tid = kb.create_task(
             conn, title="t", assignee="elias",
-            model_override="gpt-5.6-sol", provider_override="openai-codex",
-            reasoning_effort="medium",
+            model_override="glm-5", provider_override="openrouter",
+            reasoning_effort="xhigh",
         )
         task = kb.get_task(conn, tid)
     cmd = _spawn_and_capture(monkeypatch, tmp_path, task)
     i = cmd.index("-m")
-    assert cmd[i + 1] == "gpt-5.6-sol"
+    assert cmd[i + 1] == "glm-5"
     j = cmd.index("--provider")
-    assert cmd[j + 1] == "openai-codex"
+    assert cmd[j + 1] == "openrouter"
     k = cmd.index("--reasoning")
-    assert cmd[k + 1] == "medium"
+    assert cmd[k + 1] == "xhigh"
 
 
 # ---------------------------------------------------------------------------
@@ -142,7 +142,7 @@ def test_set_model_reasoning_only_leaves_model_untouched(kanban_home):
     with kbc.connect_closing() as conn:
         tid = kb.create_task(
             conn, title="t", assignee="worker",
-            model_override="gpt-5.6-sol", provider_override="openai-codex",
+            model_override="gpt-5.6-sol", provider_override="openai",
         )
     out = kc.run_slash(f"set-model {tid} --reasoning medium")
     assert "error" not in out.lower()
@@ -151,20 +151,20 @@ def test_set_model_reasoning_only_leaves_model_untouched(kanban_home):
     assert t.reasoning_effort == "medium"
     # Model override is untouched — a reasoning-only call must not clear it.
     assert t.model_override == "gpt-5.6-sol"
-    assert t.provider_override == "openai-codex"
+    assert t.provider_override == "openai"
 
 
 def test_set_model_and_reasoning_together(kanban_home):
     with kbc.connect_closing() as conn:
         tid = kb.create_task(conn, title="t", assignee="worker")
     kc.run_slash(
-        f"set-model {tid} gpt-5.6-terra --provider openai-codex --reasoning medium"
+        f"set-model {tid} claude-opus-4.6 --provider anthropic --reasoning low"
     )
     with kbc.connect_closing() as conn:
         t = kb.get_task(conn, tid)
-    assert t.model_override == "gpt-5.6-terra"
-    assert t.provider_override == "openai-codex"
-    assert t.reasoning_effort == "medium"
+    assert t.model_override == "claude-opus-4.6"
+    assert t.provider_override == "anthropic"
+    assert t.reasoning_effort == "low"
 
 
 def test_set_model_reasoning_clear_falls_back_to_profile_default(kanban_home):
