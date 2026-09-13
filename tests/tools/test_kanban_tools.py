@@ -74,11 +74,19 @@ def test_show_defaults_to_env_task_id(worker_env):
     from tools import kanban_tools as kt
     out = kt._handle_show({})
     d = json.loads(out)
-    assert "task" in d
-    assert d["task"]["id"] == worker_env
-    assert d["task"]["status"] == "running"
-    assert "worker_context" in d
-    assert "runs" in d
+    assert set(d) == {"packet"}
+    assert d["packet"]["identity"]["task_id"] == worker_env
+    assert d["packet"]["identity"]["state"] == "running"
+    assert d["packet"]["identity"]["role"] == "implementer"
+
+
+def test_show_schema_exposes_bounded_history_cursor_without_task_data(worker_env):
+    from tools.kanban_tools_schemas import KANBAN_SHOW_SCHEMA
+
+    properties = KANBAN_SHOW_SCHEMA["parameters"]["properties"]
+    assert properties["history_cursor"]["type"] == "string"
+    assert properties["history_limit"]["type"] == "integer"
+    assert worker_env not in json.dumps(KANBAN_SHOW_SCHEMA)
 
 
 def test_list_filters_tasks(monkeypatch, worker_env):
@@ -614,7 +622,7 @@ def test_worker_lifecycle_through_tools(worker_env):
 
     # 1. show — worker orientation
     show = json.loads(kt._handle_show({}))
-    assert show["task"]["id"] == worker_env
+    assert show["packet"]["identity"]["task_id"] == worker_env
 
     # 2. heartbeat during long op
     assert json.loads(kt._handle_heartbeat({"note": "warming up"}))["ok"]
@@ -908,11 +916,11 @@ def test_board_param_none_falls_back_to_env(worker_env):
 
     out = kt._handle_show({})  # no board, no task_id
     d = json.loads(out)
-    assert d["task"]["id"] == worker_env
+    assert d["packet"]["identity"]["task_id"] == worker_env
 
     out = kt._handle_show({"task_id": worker_env, "board": None})
     d = json.loads(out)
-    assert d["task"]["id"] == worker_env
+    assert d["packet"]["identity"]["task_id"] == worker_env
 
     # Sanity: the env-resolved path is the legacy default DB, NOT an
     # 'alt' board path. Confirms the override path was not silently

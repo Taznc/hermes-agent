@@ -4501,7 +4501,13 @@ def _retag_legacy_worker_sessions(workspaces_root_path: str) -> None:
 
 
 def _worker_argv(task: Task, profile_arg: str, hermes_home: Optional[str]) -> list[str]:
-    """Build the ``hermes -p <profile> --cli ... chat -q ...`` worker command."""
+    """Build the worker command with an id-only, cache-safe startup query.
+
+    Dynamic task/body/history data is returned once by ``kanban_show`` as the
+    canonical worker packet.  Keeping it out of argv avoids a second operative
+    serialization and leaves the system/message prefix and role alternation
+    unchanged.
+    """
     cmd = [
         *_resolve_hermes_argv(),
         "-p", profile_arg,
