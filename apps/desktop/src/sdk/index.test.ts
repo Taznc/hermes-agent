@@ -2,9 +2,7 @@ import { afterEach, describe, expect, it } from 'vitest'
 
 import { createClientSessionState } from '@/lib/chat-runtime'
 import { host } from '@/sdk'
-import { $newChatProfile } from '@/store/profile'
-import { $startWorkSessionRequest } from '@/store/projects'
-import { $currentCwd, setActiveSessionId, setAwaitingResponse, setBusy } from '@/store/session'
+import { setActiveSessionId, setAwaitingResponse, setBusy } from '@/store/session'
 import { clearAllSessionStates, publishSessionState } from '@/store/session-states'
 
 describe('host.state turn flags', () => {
@@ -231,61 +229,5 @@ describe('host workspace scope', () => {
 
     expect(opened).toEqual(['tab'])
     expect($workspaceNewSessionTarget.get()).toEqual({ kind: 'route', route })
-  })
-})
-
-describe('host chat creation', () => {
-  const originalCwd = $currentCwd.get()
-
-  afterEach(() => {
-    $currentCwd.set(originalCwd)
-    $startWorkSessionRequest.set(null)
-  })
-
-  it('queues a fresh contextual chat with cwd, draft, tab, and profile', () => {
-    host.newChatWithContext({
-      cwd: ' /projects/contextual ',
-      draft: ' Explain the current work ',
-      openTab: true,
-      profile: 'reviewer'
-    })
-
-    expect($newChatProfile.get()).toBe('reviewer')
-    expect($startWorkSessionRequest.get()).toMatchObject({
-      draft: 'Explain the current work',
-      openTab: true,
-      path: '/projects/contextual'
-    })
-  })
-
-  it('supports omitted optional context without submitting a turn', () => {
-    $currentCwd.set('/projects/current')
-
-    host.newChatWithContext()
-
-    expect($startWorkSessionRequest.get()).toMatchObject({
-      draft: undefined,
-      openTab: undefined,
-      path: null
-    })
-  })
-
-  it('queues a detached contextual chat without substituting the current cwd', () => {
-    $currentCwd.set('/projects/current')
-
-    host.newChatWithContext({ draft: 'Keep this unsent', openTab: true })
-
-    expect($startWorkSessionRequest.get()).toMatchObject({
-      draft: 'Keep this unsent',
-      openTab: true,
-      path: null
-    })
-  })
-
-  it('keeps the existing newChat profile behavior', () => {
-    host.newChat('legacy-profile')
-
-    expect($newChatProfile.get()).toBe('legacy-profile')
-    expect(window.location.hash).toBe('#/')
   })
 })

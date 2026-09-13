@@ -4,6 +4,7 @@ import type { NewSessionPlacement } from '@/app/chat/new-session-drag'
 import {
   isHomeProjectId,
   liveSessionProjectId,
+  NO_PROJECT_ID,
   type SidebarProjectTree
 } from '@/app/chat/sidebar/projects/workspace-groups'
 import type { HermesGitBaseBranch, HermesGitBranch } from '@/global'
@@ -1305,8 +1306,7 @@ export interface StartWorkSessionRequest {
   draft?: string
   /** Stack the fresh session as a tab when main already holds a chat (palette/⌘O opens-from-nowhere). */
   openTab?: boolean
-  /** Null opens a detached draft rather than inheriting a current workspace. */
-  path: null | string
+  path: string
   token: number
 }
 
@@ -1358,8 +1358,12 @@ export function closeWorktreeDialog(): void {
 
 let startWorkToken = 0
 
-export function requestStartWorkSession(path: null | string | undefined, draft?: string, options?: { openTab?: boolean }): void {
-  const target = path?.trim() || null
+export function requestStartWorkSession(path: string, draft?: string, options?: { openTab?: boolean }): void {
+  const target = path.trim()
+
+  if (!target) {
+    return
+  }
 
   startWorkToken += 1
   $startWorkSessionRequest.set({

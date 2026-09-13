@@ -584,13 +584,13 @@ export function ContribWiring({ children }: { children: ReactNode }) {
   // "branch off into a new worktree" flow keeps the fresh-draft path — it
   // prefills the MAIN composer right after, so it has to own that surface.
   const startSessionInWorkspace = useCallback(
-    async (path: null | string, options?: { openTab?: boolean }): Promise<boolean> => {
+    (path: null | string, options?: { openTab?: boolean }) => {
       setWorkspaceScope('sessions')
 
       if (options?.openTab && mainChatOccupied(activeSessionIdRef.current, $selectedStoredSessionId.get())) {
-        await openNewSessionTile('center', { cwd: path, listed: false })
+        void openNewSessionTile('center', { cwd: path, listed: false })
 
-        return true
+        return
       }
 
       startWorkspaceSession({
@@ -601,8 +601,6 @@ export function ContribWiring({ children }: { children: ReactNode }) {
         requestGateway,
         startFreshSessionDraft
       })
-
-      return false
     },
     [activeSessionIdRef, openNewSessionTile, requestGateway, startFreshSessionDraft]
   )
@@ -619,14 +617,11 @@ export function ContribWiring({ children }: { children: ReactNode }) {
     }
 
     lastStartWorkTokenRef.current = startWorkSessionRequest.token
+    startSessionInWorkspace(startWorkSessionRequest.path, { openTab: startWorkSessionRequest.openTab })
 
-    void (async () => {
-      const openedInTab = await startSessionInWorkspace(startWorkSessionRequest.path, { openTab: startWorkSessionRequest.openTab })
-
-      if (startWorkSessionRequest.draft && startWorkSessionRequest.token === lastStartWorkTokenRef.current) {
-        requestComposerInsert(startWorkSessionRequest.draft, { target: openedInTab ? 'active' : 'main' })
-      }
-    })()
+    if (startWorkSessionRequest.draft) {
+      requestComposerInsert(startWorkSessionRequest.draft, { target: 'main' })
+    }
   }, [startSessionInWorkspace, startWorkSessionRequest])
 
   // "New project" DRAG completion: the dialog created a project that was

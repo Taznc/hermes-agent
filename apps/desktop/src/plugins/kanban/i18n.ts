@@ -176,16 +176,6 @@ type KanbanMessages = {
   readyUnassignedTitle: string
   readyUnassignedBody: string
   diagnosticsN: (n: number) => string
-  // Drawer — seeded, unsent Hermes chat actions.
-  hermesActionsSection: string
-  hermesActionExplain: string
-  hermesActionFailure: string
-  hermesActionReview: string
-  hermesActionRough: string
-  hermesActionScope: string
-  hermesActionUnblock: string
-  hermesActionsDetachedHint: string
-  hermesActionsBoardUnavailable: string
   // Call-to-action banner — the top-of-drawer answer to "why is this stuck
   // and what do I do about it" for blocked/review tasks.
   ctaBlockedTitle: string
@@ -603,15 +593,6 @@ export const en: KanbanMessages = {
   readyUnassignedBody:
     'The dispatcher only claims Ready cards that have an assignee. Pick a profile in the Assignee field above (or set a default assignee in the orchestration settings) and it runs within a minute.',
   diagnosticsN: n => `Diagnostics · ${n}`,
-  hermesActionsSection: 'Hermes actions',
-  hermesActionExplain: 'Explain this card',
-  hermesActionFailure: 'Investigate the failure',
-  hermesActionReview: 'Review this work',
-  hermesActionRough: 'Rough this out',
-  hermesActionScope: 'Scope this',
-  hermesActionUnblock: 'Help me unblock it',
-  hermesActionsDetachedHint: 'No project directory is available, so Hermes will open a detached chat.',
-  hermesActionsBoardUnavailable: 'Board context is unavailable for this card.',
   ctaBlockedTitle: 'Blocked — cause unknown',
   ctaInitialBlockTitle: 'Deliberately blocked at creation',
   ctaBlockedNoReason: 'No cause is recorded for this block. Check the worker log, or reassign to retry.',
@@ -1003,15 +984,6 @@ const ja: KanbanMessages = {
   readyUnassignedBody:
     'ディスパッチャは担当のある Ready カードのみ取得します。上の担当フィールドでプロフィールを選ぶ（またはオーケストレーション設定でデフォルトの担当を設定する）と、1分以内に実行されます。',
   diagnosticsN: n => `診断・${n}`,
-  hermesActionsSection: 'Hermes アクション',
-  hermesActionExplain: 'このカードを説明',
-  hermesActionFailure: '失敗を調査',
-  hermesActionReview: 'この作業をレビュー',
-  hermesActionRough: '大まかにまとめる',
-  hermesActionScope: 'スコープを決める',
-  hermesActionUnblock: 'ブロック解除を手伝う',
-  hermesActionsDetachedHint: 'プロジェクトディレクトリがないため、Hermes は切り離されたチャットを開きます。',
-  hermesActionsBoardUnavailable: 'このカードではボードコンテキストを利用できません。',
   ctaBlockedTitle: 'ブロック中 — 原因不明',
   ctaInitialBlockTitle: '作成時に意図的にブロックされました',
   ctaBlockedNoReason:
@@ -1404,15 +1376,6 @@ const zh: KanbanMessages = {
   readyUnassignedBody:
     '调度器只领取有负责人的就绪卡片。在上面的负责人字段选择一个配置档（或在编排设置中设置默认负责人），它会在一分钟内运行。',
   diagnosticsN: n => `诊断・${n}`,
-  hermesActionsSection: 'Hermes 操作',
-  hermesActionExplain: '说明此卡片',
-  hermesActionFailure: '调查失败原因',
-  hermesActionReview: '审查此工作',
-  hermesActionRough: '粗略整理',
-  hermesActionScope: '确定范围',
-  hermesActionUnblock: '帮我解除阻塞',
-  hermesActionsDetachedHint: '没有项目目录，因此 Hermes 将打开一个独立聊天。',
-  hermesActionsBoardUnavailable: '此卡片无法使用面板上下文。',
   ctaBlockedTitle: '受阻 — 原因不明',
   ctaInitialBlockTitle: '创建时被有意阻止',
   ctaBlockedNoReason: '此次受阻没有记录原因。请查看工作单元日志，或重新分配以重试。',
@@ -1798,15 +1761,6 @@ const zhHant: KanbanMessages = {
   readyUnassignedBody:
     '排程器只領取有負責人的就緒卡片。在上方的負責人欄位選擇一個設定檔（或在編排設定中設定預設負責人），它會在一分鐘內執行。',
   diagnosticsN: n => `診斷・${n}`,
-  hermesActionsSection: 'Hermes 操作',
-  hermesActionExplain: '說明這張卡片',
-  hermesActionFailure: '調查失敗原因',
-  hermesActionReview: '審查此工作',
-  hermesActionRough: '粗略整理',
-  hermesActionScope: '決定範圍',
-  hermesActionUnblock: '協助解除封鎖',
-  hermesActionsDetachedHint: '沒有專案目錄，因此 Hermes 會開啟一個獨立聊天。',
-  hermesActionsBoardUnavailable: '這張卡片無法使用面板脈絡。',
   ctaBlockedTitle: '受阻 — 原因不明',
   ctaInitialBlockTitle: '建立時刻意受阻',
   ctaBlockedNoReason: '此次受阻沒有記錄原因。請查看工作單元日誌，或重新指派以重試。',
