@@ -67,11 +67,13 @@ import {
   newSessionInAgent,
   newSessionInProfile,
   normalizeProfileKey,
+  pinNewChatProfile,
   refreshProfiles,
   selectProfile,
   setActiveProfile,
   setShowAllProfiles
 } from '@/store/profile'
+import { requestStartWorkSession } from '@/store/projects'
 import {
   $activeSessionId,
   $connection,
@@ -366,6 +368,13 @@ export interface PluginOpenSessionOptions {
 export interface PluginNewChatOptions {
   workspaceMode?: WorkspaceMode
   workspaceOwnerKey?: string
+}
+
+export interface PluginNewChatContextOptions {
+  cwd?: string
+  draft?: string
+  openTab?: boolean
+  profile?: null | string
 }
 
 // Raise the "Syncing…" affordance for a paint-first wake (#89843) and tear it
@@ -1248,6 +1257,16 @@ export const host = {
     }
 
     window.location.hash = '#/'
+  },
+
+  /** Start a fresh chat through the workspace-session flow, optionally
+   *  preselecting its profile and seeding an editable, unsent draft. */
+  newChatWithContext: (options: PluginNewChatContextOptions = {}): void => {
+    if (options.profile?.trim()) {
+      pinNewChatProfile(options.profile)
+    }
+
+    requestStartWorkSession(options.cwd, options.draft, { openTab: options.openTab })
   },
 
   /** Front the tab a Bot Mode owner already has open — the tile that owner's
