@@ -501,7 +501,7 @@ export const UserMessage: FC<{
                   // A live text highlight wins: finishing a drag-select must not
                   // open the editor and throw the selection away.
                   <ActionBarPrimitive.Edit asChild>
-                    <button
+                    <div
                       aria-label={copy.editMessage}
                       className={bubbleClassName}
                       onClick={event => {
@@ -514,6 +514,16 @@ export const UserMessage: FC<{
 
                         triggerHaptic('selection')
                       }}
+                      onKeyDown={event => {
+                        // The directive chips own their native keyboard activation.
+                        // Only the bubble itself turns Enter/Space into edit.
+                        if (event.currentTarget !== event.target || (event.key !== 'Enter' && event.key !== ' ')) {
+                          return
+                        }
+
+                        event.preventDefault()
+                        event.currentTarget.click()
+                      }}
                       onPointerDown={() => {
                         if (hasTextSelection()) {
                           return
@@ -521,10 +531,11 @@ export const UserMessage: FC<{
 
                         notifyThreadEditOpen()
                       }}
-                      type="button"
+                      role="button"
+                      tabIndex={0}
                     >
                       {bubbleContent}
-                    </button>
+                    </div>
                   </ActionBarPrimitive.Edit>
                 )}
                 {(showStop || showRestore) && (
