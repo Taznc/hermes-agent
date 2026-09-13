@@ -9,6 +9,7 @@ import json
 import logging
 import os
 import queue
+import re
 import sys
 import threading
 from collections import OrderedDict
@@ -325,6 +326,40 @@ KANBAN_GUIDANCE = (
     "- Do not call `delegate_task` as a board substitute. `delegate_task` is for short reasoning subtasks inside your "
     "own run; board tasks are for cross-agent handoffs that outlive one API loop."
 )
+
+
+_KANBAN_TASK_ID_RE = re.compile(r"^t_[a-f0-9]{8,}$")
+
+
+def resolve_kanban_worker_guidance(valid_tool_names: set[str]) -> str:
+    """Return the worker protocol only for a dispatcher-owned session.
+
+    Kanban capability is available to interactive sessions too, so tool
+    presence is not identity. The dispatcher-owned envelope is deliberately
+    session-scoped: it also works when Desktop is served by a remote backend.
+    """
+    if "kanban_show" not in valid_tool_names:
+        return ""
+    task_id = (os.environ.get("HERMES_KANBAN_TASK") or "").strip()
+    run_id = (os.environ.get("HERMES_KANBAN_RUN_ID") or "").strip()
+    claim_lock = (os.environ.get("HERMES_KANBAN_CLAIM_LOCK") or "").strip()
+    if not _KANBAN_TASK_ID_RE.fullmatch(task_id) or not claim_lock:
+        return ""
+    try:
+        if int(run_id) <= 0:
+            return ""
+        from agent.delegation_context import is_dispatcher_owned_worker_context
+        from gateway.session_context import get_session_env
+
+        if (
+            get_session_env("HERMES_SESSION_SOURCE", "").strip().lower() != "kanban"
+            or not is_dispatcher_owned_worker_context()
+        ):
+            return ""
+    except (TypeError, ValueError):
+        return ""
+    return KANBAN_GUIDANCE
+
 
 TOOL_USE_ENFORCEMENT_GUIDANCE = (
     "# Tool-use enforcement\n"

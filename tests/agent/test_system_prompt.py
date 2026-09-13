@@ -111,6 +111,76 @@ class TestContextFileCwd:
         assert "chosen workspace instructions" in context
 
 
+class TestKanbanWorkerGuidance:
+    def test_only_valid_dispatcher_identity_resolves_worker_protocol(self, monkeypatch):
+        from agent.prompt_builder import resolve_kanban_worker_guidance
+        from agent.delegation_context import non_dispatcher_owned_context
+
+        names = {"kanban_show"}
+        worker_env = {
+            "HERMES_KANBAN_TASK": "t_0123abcd",
+            "HERMES_KANBAN_RUN_ID": "17",
+            "HERMES_KANBAN_CLAIM_LOCK": "dispatcher:123",
+            "HERMES_SESSION_SOURCE": "kanban",
+        }
+        for key in worker_env:
+            monkeypatch.delenv(key, raising=False)
+
+        # Tool capability alone remains available to interactive Desktop/CLI
+        # sessions, but it must not opt them into a headless worker protocol.
+        for source in ("desktop", "cli"):
+            monkeypatch.setenv("HERMES_SESSION_SOURCE", source)
+            agent = _make_agent(
+                platform=source,
+                valid_tool_names=list(names),
+                _kanban_worker_guidance=None,
+            )
+            assert "Call `kanban_show()` first" not in _stable_prompt(agent)
+            assert agent.valid_tool_names == ["kanban_show"]
+
+        invalid_overrides = (
+            {"HERMES_KANBAN_TASK": "t_0123abcd"},
+            {**worker_env, "HERMES_KANBAN_TASK": "task-guessed"},
+            {**worker_env, "HERMES_KANBAN_RUN_ID": "stale"},
+            {**worker_env, "HERMES_KANBAN_CLAIM_LOCK": ""},
+            {**worker_env, "HERMES_SESSION_SOURCE": "desktop"},
+        )
+        for candidate in invalid_overrides:
+            for key in worker_env:
+                monkeypatch.delenv(key, raising=False)
+            for key, value in candidate.items():
+                monkeypatch.setenv(key, value)
+            assert resolve_kanban_worker_guidance(names) == ""
+
+        for key, value in worker_env.items():
+            monkeypatch.setenv(key, value)
+        with non_dispatcher_owned_context():
+            assert resolve_kanban_worker_guidance(names) == ""
+
+    def test_dispatcher_worker_prompt_is_complete_and_byte_stable(self, monkeypatch):
+        from agent.prompt_builder import KANBAN_GUIDANCE, resolve_kanban_worker_guidance
+
+        for key, value in {
+            "HERMES_KANBAN_TASK": "t_0123abcd",
+            "HERMES_KANBAN_RUN_ID": "17",
+            "HERMES_KANBAN_CLAIM_LOCK": "dispatcher:123",
+            "HERMES_SESSION_SOURCE": "kanban",
+        }.items():
+            monkeypatch.setenv(key, value)
+
+        guidance = resolve_kanban_worker_guidance({"kanban_show"})
+        agent = _make_agent(
+            valid_tool_names=["kanban_show"],
+            _kanban_worker_guidance=guidance,
+        )
+        first = _stable_prompt(agent)
+        second = _stable_prompt(agent)
+
+        assert guidance == KANBAN_GUIDANCE
+        assert KANBAN_GUIDANCE in first
+        assert first.encode("utf-8") == second.encode("utf-8")
+
+
 def _stable_prompt(agent):
     with (
         patch("agent.prompt_builder.load_soul_md", return_value=""),
