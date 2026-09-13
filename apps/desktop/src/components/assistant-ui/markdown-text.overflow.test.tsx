@@ -46,6 +46,9 @@ describe('markdown surface survives stack-overflow content', () => {
     const { container } = renderQuietly(<MarkdownTextContent isRunning={false} text={text} />)
 
     expect(container.textContent).toBeTruthy()
+    // A parser failure must not turn a normal reply into the bounded code-card
+    // surface used only for genuinely oversized messages.
+    expect(screen.queryByRole('button', { name: 'Expand' })).toBeNull()
   })
 
   // The crash is a property of the CONTENT, not of which part carries it: the
