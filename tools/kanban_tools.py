@@ -11,6 +11,7 @@ import functools
 import json
 import logging
 import os
+import re
 import time
 from contextlib import contextmanager
 from typing import Any, Callable, Optional
@@ -18,13 +19,14 @@ from typing import Any, Callable, Optional
 from agent.redact import redact_sensitive_text
 from hermes_cli.goals import judge_goal
 from tools.registry import registry, tool_error
+from tools import kanban_tools_mergeability as _ktm
 from hermes_cli.config import cfg_get, load_config
 from tools.kanban_tools_schemas import (
     KANBAN_ATTACH_SCHEMA,
     KANBAN_ATTACH_URL_SCHEMA, KANBAN_ATTACHMENTS_SCHEMA, KANBAN_BLOCK_SCHEMA, KANBAN_COMMENT_SCHEMA,
     KANBAN_COMPLETE_SCHEMA, KANBAN_CREATE_SCHEMA, KANBAN_HEARTBEAT_SCHEMA, KANBAN_LINK_SCHEMA,
     KANBAN_LIST_SCHEMA, KANBAN_REQUEST_CHANGES_SCHEMA, KANBAN_REQUEST_REVIEW_SCHEMA,
-    KANBAN_SHOW_SCHEMA, KANBAN_UNBLOCK_SCHEMA)
+    KANBAN_ROADMAP_SCHEMA, KANBAN_SHOW_SCHEMA, KANBAN_UNBLOCK_SCHEMA)
 
 logger = logging.getLogger(__name__)
 
@@ -99,7 +101,9 @@ def _check(cond: Any, message: str) -> None:
 def _kanban_handler(tool_name: str) -> Callable:
     """Wrap a handler so every failure is a structured tool error. ``ValueError``
     (invalid board slug, DB validation such as cycle/self-link, ``AttachmentTooLarge``)
-    is reported without a traceback; anything else is logged with ``logger.exception``."""
+    is reported without a traceback; anything else is logged with ``logger.exception``.
+    A refusal that carries machine-readable fields (skill preflight) keeps them, so
+    the agent can act on the code rather than parse the message."""
     def deco(fn):
         @functools.wraps(fn)
         def wrapper(args: dict, **kw) -> str:
@@ -110,7 +114,11 @@ def _kanban_handler(tool_name: str) -> Callable:
             except Exception as e:
                 if not isinstance(e, ValueError):
                     logger.exception(f"{tool_name} failed")
-                return tool_error(f"{tool_name}: {e}")
+                from hermes_cli.kanban_skill_preflight import structured_error_payload
+
+                structured = structured_error_payload(e) or {}
+                structured.pop("error", None)
+                return tool_error(f"{tool_name}: {e}", **structured)
         return wrapper
     return deco
 
@@ -139,6 +147,53 @@ def _require_task_id(args: dict) -> str:
     tid = _default_task_id(args.get("task_id"))
     _check(tid, "task_id is required (or set HERMES_KANBAN_TASK in the env)")
     return tid
+
+
+def _task_id_is_env_scoped(args: dict, tid: str) -> bool:
+    """True when ``tid`` was resolved from ``HERMES_KANBAN_TASK`` rather than
+    an explicit ``args["task_id"]`` — i.e. this call is a dispatcher-spawned
+    worker acting on ITS OWN assigned task, not an arbitrary/model-typed id.
+
+    This is the signal the orphan-exit contract below is built on: the board
+    row for a deleted task carries no tombstone (``delete_task`` wipes
+    tasks/task_links/task_events in one txn — see t_749b0510), so nothing in
+    the DB can tell "this id never existed" from "this id existed and was
+    deleted out from under its own worker". But the CALLING PROCESS knows
+    which task it was spawned for (the dispatcher pins ``HERMES_KANBAN_TASK``
+    at spawn time), so a vanished row that is also this worker's own env task
+    id is conclusively an orphan, never a typo.
+    """
+    return not args.get("task_id") and os.environ.get("HERMES_KANBAN_TASK") == tid
+
+
+def _orphan_or_lifecycle_error(
+    kb, conn, tid: str, args: dict, tool_name: str, detail: str,
+) -> str:
+    """Build the tool_error for a failed lifecycle call (heartbeat/complete/
+    block) that could not act on ``tid``.
+
+    Distinguishes, as a queryable/testable contract rather than a message
+    string: ``orphaned=True`` when this worker's own row is provably gone
+    (see :func:`_task_id_is_env_scoped`) — the worker should stop calling
+    kanban tools and end its turn, since nothing it does can reach the board
+    again — from an ordinary failure (bogus id, wrong status, race) which
+    stays retryable exactly as before. We do not raise a new exception type
+    across the tool-dispatch boundary (``tools/AGENTS.md``: handlers return
+    JSON; ``_kanban_handler`` is the single funnel for structured errors) —
+    a distinguishable field in the existing JSON error payload is the
+    smallest-footprint way to make this decidable by the calling agent
+    without adding a bespoke control-flow path through model_tools.py that
+    every other tool-error consumer would then need to special-case.
+    """
+    orphaned = _task_id_is_env_scoped(args, tid) and kb.get_task(conn, tid) is None
+    if orphaned:
+        return tool_error(
+            f"{tool_name}: task {tid} no longer exists on the board (its row was deleted "
+            f"while you were running — see t_749b0510). You are an orphaned worker: no "
+            f"kanban tool can reach this task again. Stop calling kanban tools for {tid} "
+            f"and end your turn now; nothing further you do can be recorded.",
+            orphaned=True, task_id=tid)
+    return tool_error(detail, task_id=tid)
 
 
 def _own_task_env(task_id: str, var: str) -> Optional[str]:
@@ -290,6 +345,24 @@ def _require_text(args: dict, name: str, message: Optional[str] = None) -> Any:
     return value
 
 
+# A blocked card is a board surface a human scans, not a log file. Cap the
+# PROSE of a block reason so cards stay readable; fenced blocks (```cmd
+# copy-paste commands, ```choices option sets) are excluded from the count
+# because they are exactly the structured payloads we want workers to send.
+_BLOCK_REASON_PROSE_LIMIT = 700
+_FENCE_RE = re.compile(r"```[a-zA-Z]*\s*[\s\S]*?```")
+
+
+def _check_block_reason_brevity(reason: str) -> None:
+    prose = _FENCE_RE.sub("", reason)
+    _check(
+        len(prose) <= _BLOCK_REASON_PROSE_LIMIT,
+        f"reason prose is {len(prose)} chars (limit {_BLOCK_REASON_PROSE_LIMIT}). A blocked card "
+        "must be scannable: line 1 = the one-sentence ask; an exact unblock command goes in a "
+        "```cmd fence (not counted); diagnosis and history go in kanban_comment first, then "
+        "re-call kanban_block with the short ask.")
+
+
 _BOOL_WORDS = {"true": True, "1": True, "yes": True, "false": False, "0": False, "no": False}
 
 
@@ -309,16 +382,26 @@ def _opt_int(value: Any, default: Optional[int] = None) -> Optional[int]:
 _TASK_FIELDS = tuple(
     "id title body assignee status tenant priority workspace_kind workspace_path created_by "
     "created_at started_at completed_at result current_run_id model_override "
-    "provider_override completion_contract last_failure_error".split())
+    "provider_override reasoning_effort route_source route_name "
+    "completion_contract last_failure_error created_by_task created_by_run".split())
 _TASK_SUMMARY_FIELDS = tuple(
     "id title assignee status priority tenant workspace_kind workspace_path project_id created_by "
-    "created_at started_at completed_at current_run_id model_override provider_override".split())
-_RUN_FIELDS = tuple("id profile status outcome summary error metadata started_at ended_at".split())
+    "created_at started_at completed_at current_run_id model_override provider_override reasoning_effort "
+    "route_source route_name created_by_task created_by_run".split())
+_RUN_FIELDS = tuple(
+    "id profile status outcome summary error metadata started_at ended_at model provider "
+    "reasoning_effort model_source session_id input_tokens output_tokens cache_read_tokens "
+    "reasoning_tokens api_calls tool_calls estimated_cost_usd".split()
+)
 _COMMENT_FIELDS = ("author", "body", "created_at")
 _EVENT_FIELDS = ("kind", "payload", "created_at", "run_id")
 _ATTACHMENT_FIELDS = tuple(
     "id filename content_type size uploaded_by stored_path created_at".split())
-_CREATED_FIELDS = ("status", "workspace_kind", "workspace_path", "project_id")
+_CREATED_FIELDS = (
+    "status", "workspace_kind", "workspace_path", "project_id",
+    "model_override", "provider_override", "reasoning_effort", "route_source", "route_name",
+    "created_by_task", "created_by_run",
+)
 
 
 def _fields(obj: Any, names: tuple[str, ...]) -> dict[str, Any]:
@@ -587,9 +670,18 @@ def _handle_complete(args: dict, **kw) -> str:
                 f"in-flight (no state change). Retry kanban_complete with the same "
                 f"summary/metadata and either drop these ids from created_cards, or pass "
                 f"created_cards=[] to skip the card-claim check entirely.")
-        task = kb.get_task(conn, tid)
-        _check(ok, (task.last_failure_error if task else None) or
-               f"could not complete {tid} (unknown id, stale run, or already terminal)")
+        if not ok:
+            # See _orphan_or_lifecycle_error / t_963c89a2: complete_task() False
+            # is otherwise indistinguishable between "wrong id" and "your own
+            # row was deleted while you were running" (t_749b0510) — the
+            # latter needs a signal the worker can act on to stop, not retry.
+            # Upstream's structured last_failure_error (stale run etc.) is the
+            # better ordinary-failure detail when the row is still there.
+            failed = kb.get_task(conn, tid)
+            return _orphan_or_lifecycle_error(
+                kb, conn, tid, args, "kanban_complete",
+                (failed.last_failure_error if failed else None)
+                or f"could not complete {tid} (unknown id, stale run, or already terminal)")
         run = kb.latest_run(conn, tid)
         return _ok(task_id=tid, run_id=run.id if run else None)
 
@@ -600,6 +692,7 @@ def _handle_block(args: dict, **kw) -> str:
     tid = _worker_guard("kanban_block", args)
     reason = _redact(
         _require_text(args, "reason", "reason is required — explain what input you need"))
+    _check_block_reason_brevity(str(reason))
     kind = args.get("kind")
     with _board(args.get("board")) as (kb, conn):
         _check(kind is None or kind in kb.VALID_BLOCK_KINDS,
@@ -621,7 +714,10 @@ def _handle_block(args: dict, **kw) -> str:
                f"finished or cannot proceed for another reason, call kanban_complete instead — "
                f"the completion judge will evaluate it.")
         ok = kb.block_task(conn, tid, reason=reason, kind=kind, expected_run_id=_worker_run_id(tid))
-        _check(ok, f"could not block {tid} (unknown id or not in running/ready)")
+        if not ok:
+            return _orphan_or_lifecycle_error(
+                kb, conn, tid, args, "kanban_block",
+                f"could not block {tid} (unknown id or not in running/ready)")
         return _ok_landed(kb, conn, tid, "blocked", block_kind=kind)
 
 
@@ -640,8 +736,20 @@ def _handle_request_review(args: dict, **kw) -> str:
     metadata = _stamp_worker_session_metadata(tid, metadata)
     # Reviewer is model-supplied free text stored durably on the event payload.
     reviewer = _redact_opt(args.get("reviewer") or None)
-    with _board(args.get("board")) as (kb, conn):
-        _goal_gate("kanban_request_review", kb.get_task(conn, tid), tid, summary)
+    board = args.get("board")
+    with _board(board) as (kb, conn):
+        task = kb.get_task(conn, tid)
+        _goal_gate("kanban_request_review", task, tid, summary)
+        # Status is validated inside preflight(), ahead of the git check, so a
+        # card that cannot enter the review lane gets kb.request_review()'s
+        # status answer below rather than an unrelated merge refusal. Shared
+        # with the CLI door so the two cannot diverge (task t_fd4e3978).
+        merge = _ktm.preflight(task, tid, board=board)
+        if merge is not None:
+            if merge.conflicts:
+                _ktm.record_conflict(conn, tid, merge, run_id=_worker_run_id(tid))
+                raise _Reject(_ktm.refusal_message(merge))
+            metadata = {**(metadata or {}), "mergeable_against": merge.stamp}
         ok, fail_reason = kb.request_review(
             conn, tid, summary=summary, metadata=metadata, reviewer=reviewer,
             expected_run_id=_worker_run_id(tid), with_reason=True)
@@ -656,9 +764,14 @@ def _handle_request_changes(args: dict, **kw) -> str:
     tid = _worker_guard("kanban_request_changes", args)
     reason = _redact(
         _require_text(args, "reason", "reason is required — describe the changes needed"))
+    metadata = args.get("metadata")
+    _require_dict_metadata(metadata)
+    if metadata is not None:
+        metadata = _redact_metadata(metadata)
+        _check(metadata is not None, "metadata could not be safely serialized")
     with _board(args.get("board")) as (kb, conn):
         ok, detail = kb.request_changes(
-            conn, tid, reason=reason, expected_run_id=_worker_run_id(tid))
+            conn, tid, reason=reason, expected_run_id=_worker_run_id(tid), metadata=metadata)
         _check(ok, f"could not request changes for {tid}: {detail or 'invalid review state'}")
         return _ok_landed(kb, conn, tid, "ready", implementer=detail)
 
@@ -676,7 +789,14 @@ def _handle_heartbeat(args: dict, **kw) -> str:
         kb.heartbeat_claim(conn, tid, claimer=os.environ.get("HERMES_KANBAN_CLAIM_LOCK"))
         ok = kbd.heartbeat_worker(
             conn, tid, note=args.get("note"), expected_run_id=_worker_run_id(tid))
-        _check(ok, f"could not heartbeat {tid} (unknown id or not running)")
+        if not ok:
+            # See _orphan_or_lifecycle_error: a worker whose own row was
+            # deleted mid-run (t_749b0510) gets a distinguishable
+            # ``orphaned: true`` field instead of an identical-looking
+            # "unknown id or not running" it can only retry forever.
+            return _orphan_or_lifecycle_error(
+                kb, conn, tid, args, "kanban_heartbeat",
+                f"could not heartbeat {tid} (unknown id or not running)")
         return _ok(task_id=tid)
 
 
@@ -807,36 +927,63 @@ def _handle_create(args: dict, **kw) -> str:
     """Create a (child) task; orchestrator workers use this to fan out."""
     _reject_delegated_child_mutation("kanban_create")
     title = _require_text(args, "title")
+    lane = args.get("lane")
+    if lane is not None:
+        lane = str(lane).strip()
+        _check(lane in {"idea", "roadmap"}, "lane must be 'idea' or 'roadmap'")
     assignee = args.get("assignee")
-    _check(assignee, "assignee is required — name the profile that should execute this "
-                     "task (the dispatcher will only spawn tasks with an assignee)")
+    # A lane card is inert — nothing dispatches it — so an assignee is meaningless there. For
+    # real work the assignee stays mandatory: an unassigned task sits in ready forever.
+    _check(assignee or lane, "assignee is required — name the profile that should execute this "
+                             "task (the dispatcher will only spawn tasks with an assignee)")
     # Workspace sharing is always explicit: omitted fields mean a fresh scratch workspace
     # even for a dispatcher-spawned creator (reusing the parent's path would let a child
     # mutate review evidence or race its checkout). Project identity is the one safe thing
     # to inherit implicitly (the DB turns it into a fresh per-task worktree).
     workspace_kind, workspace_path = args.get("workspace_kind"), args.get("workspace_path")
-    # See #67567.
-    project_id = args.get("project") or args.get("project_id")
-    project_source_task_id = None
     triage, skills, goal_mode = (
         _parse_bool_arg(args, "triage"), _coerce_str_list(args.get("skills"), "skills", "skill names"),
         _parse_bool_arg(args, "goal_mode"))
     model_override, provider_override = args.get("model"), args.get("provider")
     _check(model_override or not provider_override, "'provider' requires 'model' to be set as well")
+    # Per-task thinking depth, independent of model/provider — create_task() validates it, so an
+    # invalid level raises ValueError and surfaces as a tool_error rather than a silent fallback.
+    from hermes_cli import kanban_db
+    reasoning_effort = kanban_db.normalize_reasoning_effort(args.get("reasoning_effort"))
     parents = _coerce_str_list(args.get("parents") or [], "parents", "task ids")
     with _board(args.get("board")) as (kb, conn):
+        existing = kb.get_task_by_idempotency_key(conn, args.get("idempotency_key"))
+        if existing is not None:
+            landed = _fields(existing, _CREATED_FIELDS)
+            return _ok(task_id=existing.id, **landed, subscribed=_maybe_auto_subscribe(conn, existing.id))
+        # See #67567.
+        project_id = args.get("project") or args.get("project_id")
+        project_source_task_id = None
         from tools.async_delegation import _current_origin_session_id
         self_tid = (os.environ.get("HERMES_KANBAN_TASK")
                     if _is_dispatcher_owned_worker() else None)
         self_task = kb.get_task(conn, self_tid) if self_tid else None
         # The worker/API runtime may be transient; the owning task's origin is durable.
+        # Prefer the request-scoped api_server origin binding over HERMES_SESSION_ID: the env
+        # var is clobbered with a subagent's internal id whenever a child agent is constructed
+        # in-process, which would stamp — and later wake — the wrong session.
         session_id = (args.get("session_id") or (self_task.session_id if self_task else None)
                       or _current_origin_session_id() or os.environ.get("HERMES_SESSION_ID"))
         if project_id is None and workspace_kind is None and workspace_path is None:
             if self_task is not None and self_task.project_id:
                 project_id, project_source_task_id = self_task.project_id, self_task.id
+        from hermes_cli.kanban_model_routing import resolve_kanban_model_route
+        routing = resolve_kanban_model_route(
+            title=str(title).strip(), body=args.get("body"),
+            explicit_model=model_override, explicit_provider=provider_override,
+            explicit_reasoning_effort=reasoning_effort,
+        )
+        model_override, provider_override, reasoning_effort = (
+            routing.model_override, routing.provider_override, routing.reasoning_effort,
+        )
         new_tid = kb.create_task(
-            conn, title=str(title).strip(), body=args.get("body"), assignee=str(assignee),
+            conn, title=str(title).strip(), body=args.get("body"),
+            assignee=str(assignee) if assignee else None,
             parents=tuple(parents), tenant=args.get("tenant") or os.environ.get("HERMES_TENANT"),
             priority=_opt_int(args.get("priority"), 0),
             workspace_kind=str(workspace_kind if workspace_kind is not None else "scratch"),
@@ -846,10 +993,14 @@ def _handle_create(args: dict, **kw) -> str:
             idempotency_key=args.get("idempotency_key"),
             max_runtime_seconds=_opt_int(args.get("max_runtime_seconds")), skills=skills,
             model_override=model_override, provider_override=provider_override,
+            reasoning_effort=reasoning_effort,
+            route_source=routing.route_source, route_name=routing.route_name,
             goal_mode=goal_mode, goal_max_turns=_opt_int(args.get("goal_max_turns")),
             completion_contract=args.get("completion_contract"),
-            initial_status=str(args.get("initial_status") or "running"),
-            created_by=os.environ.get("HERMES_PROFILE") or "worker", session_id=session_id)
+            initial_status=str(args.get("initial_status") or "running"), lane=lane,
+            created_by=os.environ.get("HERMES_PROFILE") or "worker", session_id=session_id,
+            created_by_task=os.environ.get("HERMES_KANBAN_TASK") or None,
+            created_by_run=_opt_int(os.environ.get("HERMES_KANBAN_RUN_ID")))
         landed = _fields(kb.get_task(conn, new_tid), _CREATED_FIELDS)
         return _ok(task_id=new_tid, **landed, subscribed=_maybe_auto_subscribe(conn, new_tid))
 
@@ -944,6 +1095,33 @@ def _handle_unblock(args: dict, **kw) -> str:
         return _ok(task_id=tid, **_fields(kb.get_task(conn, tid), ("status",)))
 
 
+@_kanban_handler("kanban_roadmap")
+def _handle_roadmap(args: dict, **kw) -> str:
+    """Move a card between the inert roadmap lanes, or spawn it into the work queue."""
+    _reject_delegated_child_mutation("kanban_roadmap")
+    _require_orchestrator_tool("kanban_roadmap")
+    tid = args.get("task_id")
+    _check(tid, "task_id is required")
+    tid = str(tid)
+    action = str(args.get("action") or "").strip()
+    _check(action in {"refine", "demote", "spawn"},
+           "action must be one of 'refine', 'demote', 'spawn'")
+    to = str(args.get("to") or "triage").strip()
+    if action == "spawn":
+        _check(to in {"triage", "ready"}, "to must be 'triage' or 'ready'")
+    with _board(args.get("board")) as (kb, conn):
+        # An invalid transition raises ValueError naming from->to; the handler decorator turns
+        # that into a tool_error, which is the message the model needs.
+        if action == "refine":
+            moved = kb.refine_task(conn, tid)
+        elif action == "demote":
+            moved = kb.demote_task(conn, tid)
+        else:
+            moved = kb.spawn_roadmap_task(conn, tid, to=to)
+        _check(moved, f"could not {action} {tid} (status changed concurrently)")
+        return _ok(task_id=tid, action=action, **_fields(kb.get_task(conn, tid), ("status",)))
+
+
 @_kanban_handler("kanban_link")
 def _handle_link(args: dict, **kw) -> str:
     """Add a parent→child dependency edge after the fact (cycles/self-links → ValueError)."""
@@ -959,7 +1137,7 @@ def _handle_link(args: dict, **kw) -> str:
 # --- Registration (order preserved: it is the order tools appear in the schema) ---
 
 # kanban_list / kanban_unblock route the board and are hidden from task workers.
-_ORCHESTRATOR_TOOLS = frozenset({"kanban_list", "kanban_unblock"})
+_ORCHESTRATOR_TOOLS = frozenset({"kanban_list", "kanban_unblock", "kanban_roadmap"})
 _TOOLS = (
     ("kanban_show", KANBAN_SHOW_SCHEMA, _handle_show, "📋"),
     ("kanban_list", KANBAN_LIST_SCHEMA, _handle_list, "📋"),
@@ -974,6 +1152,7 @@ _TOOLS = (
     ("kanban_attachments", KANBAN_ATTACHMENTS_SCHEMA, _handle_attachments, "📎"),
     ("kanban_create", KANBAN_CREATE_SCHEMA, _handle_create, "➕"),
     ("kanban_unblock", KANBAN_UNBLOCK_SCHEMA, _handle_unblock, "▶"),
+    ("kanban_roadmap", KANBAN_ROADMAP_SCHEMA, _handle_roadmap, "★"),
     ("kanban_link", KANBAN_LINK_SCHEMA, _handle_link, "🔗"))
 
 for _name, _sch, _handler, _emoji in _TOOLS:

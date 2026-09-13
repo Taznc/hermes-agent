@@ -7,11 +7,12 @@ export interface RegistryGatewayWsConnection {
   headers?: Record<string, string>
   profile?: null | string
   sharedRemote?: boolean
+  token?: null | string
 }
 
 interface RegistryGatewayWsUrlDependencies {
   ensureBackend: (connectionId: unknown, profile: unknown) => Promise<RegistryGatewayWsConnection>
-  mintTicket: (baseUrl: string, headers?: Record<string, string>) => Promise<string>
+  mintTicket: (baseUrl: string, headers?: Record<string, string>, staticToken?: null | string) => Promise<string>
   buildTicketUrl: (baseUrl: string, ticket: string) => string
   rememberHeaders: (wsUrl: string, headers?: Record<string, string>) => void
 }
@@ -86,6 +87,18 @@ export function createRegistryGatewayWsUrlHandler(dependencies: RegistryGatewayW
     if (connection.authMode === 'oauth') {
       const ticket = await dependencies.mintTicket(connection.baseUrl, connection.headers)
       wsUrl = dependencies.buildTicketUrl(connection.baseUrl, ticket)
+    } else if (connection.token) {
+      // Token-auth against a GATED dashboard: the legacy `?token=` query param
+      // is refused on the WS upgrade (403) even though the same token
+      // authenticates every REST call, so mint a ticket with it. Falls back to
+      // the cached token-bearing wsUrl when the backend is ungated
+      // (loopback/local), where the mint endpoint does not exist.
+      try {
+        const ticket = await dependencies.mintTicket(connection.baseUrl, connection.headers, connection.token)
+        wsUrl = dependencies.buildTicketUrl(connection.baseUrl, ticket)
+      } catch {
+        wsUrl = connection.wsUrl
+      }
     }
 
     const finalWsUrl = registryGatewayWsUrl(connection, wsUrl)

@@ -164,6 +164,79 @@ def test_complete_retry_with_empty_created_cards_succeeds(worker_env):
         conn.close()
 
 
+def test_complete_orphaned_worker_gets_distinguishable_exit_signal(worker_env):
+    """When this worker's own board row is deleted out from under it
+    (t_749b0510's exact incident — delete_task on a live 'running' row),
+    kanban_complete must return a distinguishable ``orphaned: true`` field
+    instead of the same generic "unknown id or already terminal" error a
+    plain typo would produce. That is the actionable clean-exit signal
+    requested by t_963c89a2 item 3.
+    """
+    from hermes_cli import kanban_db as kb
+    from hermes_cli import kanban_db_connect as kbc
+    from tools import kanban_tools as kt
+
+    conn = kbc.connect()
+    try:
+        # Manufacture the orphan state with a raw DELETE rather than
+        # kb.delete_task: t_749b0510's guard now (correctly) REFUSES to delete a
+        # 'running' row with a live worker, which is the very incident this
+        # contract exists for. The guard closes one route into the state; it does
+        # not make the state unreachable (gc/archive paths, direct DB surgery,
+        # and any row deleted before the guard shipped all still produce it), so
+        # the orphan-exit signal must still hold. Asserting through delete_task
+        # here would test the guard, not this contract.
+        with kb.write_txn(conn):
+            conn.execute("DELETE FROM tasks WHERE id = ?", (worker_env,))
+        assert kb.get_task(conn, worker_env) is None
+    finally:
+        conn.close()
+
+    out = json.loads(kt._handle_complete({"summary": "trying to land after being orphaned"}))
+    assert out.get("orphaned") is True, out
+    assert out.get("task_id") == worker_env
+    assert out.get("error")
+
+
+def test_complete_bogus_task_id_is_not_reported_as_orphaned(monkeypatch, worker_env):
+    """A plain wrong/hallucinated id (never a real row) must NOT get the
+    orphan signal — only a task that this worker was actually scoped to via
+    HERMES_KANBAN_TASK and that is now provably gone counts as orphaned."""
+    from tools import kanban_tools as kt
+
+    monkeypatch.setenv("HERMES_KANBAN_TASK", worker_env)
+    out = json.loads(kt._handle_complete({
+        "task_id": "t_neverexisted0",
+        "summary": "should not be treated as an orphan",
+    }))
+    assert out.get("error")
+    assert "orphaned" not in out
+
+
+def test_heartbeat_orphaned_worker_gets_distinguishable_exit_signal(worker_env):
+    """Same orphan-exit contract for kanban_heartbeat: today's fleet incident
+    (t_749b0510's comment thread) showed a heartbeat on a deleted task
+    returning a silent False with nothing actionable — this must now be a
+    structured ``orphaned: true`` the worker can act on to stop."""
+    from hermes_cli import kanban_db as kb
+    from hermes_cli import kanban_db_connect as kbc
+    from tools import kanban_tools as kt
+
+    conn = kbc.connect()
+    try:
+        # Raw DELETE for the same reason as the kanban_complete case above:
+        # t_749b0510's guard correctly refuses delete_task on a live running row.
+        with kb.write_txn(conn):
+            conn.execute("DELETE FROM tasks WHERE id = ?", (worker_env,))
+        assert kb.get_task(conn, worker_env) is None
+    finally:
+        conn.close()
+
+    out = json.loads(kt._handle_heartbeat({"note": "still alive?"}))
+    assert out.get("orphaned") is True, out
+    assert out.get("task_id") == worker_env
+
+
 def test_complete_goal_mode_rejected_by_judge(monkeypatch, tmp_path):
     """Goal-mode tasks must pass the auxiliary judge before completion.
     Regression for #38367: workers bypassing the judge via early kanban_complete."""
@@ -232,6 +305,36 @@ def test_block_happy_path(worker_env):
         assert kb.get_task(conn, worker_env).status == "blocked"
     finally:
         conn.close()
+
+
+def test_block_rejects_wall_of_text_reason(worker_env):
+    """A block reason is a board card, not a log file: prose beyond the cap is
+    rejected with guidance to move diagnosis into kanban_comment."""
+    from tools import kanban_tools as kt
+    wall = "Deployment detail sentence. " * 60  # far past the prose cap
+    d = json.loads(kt._handle_block({"reason": wall}))
+    assert "error" in d
+    assert "kanban_comment" in d["error"]
+    # The task must NOT have been blocked.
+    from hermes_cli import kanban_db as kb
+    from hermes_cli import kanban_db_connect as kbc
+    conn = kbc.connect()
+    try:
+        assert kb.get_task(conn, worker_env).status != "blocked"
+    finally:
+        conn.close()
+
+
+def test_block_reason_fences_do_not_count_toward_prose_cap(worker_env):
+    """```cmd / ```choices fences are the structured payloads the UI wants —
+    a long command or option set must never trip the brevity gate."""
+    from tools import kanban_tools as kt
+    reason = (
+        "Restart the service to unblock me.\n"
+        "```cmd\n" + ("x" * 900) + "\n```"
+    )
+    d = json.loads(kt._handle_block({"reason": reason}))
+    assert d.get("ok") is True
 
 
 def _make_goal_mode_worker_env(monkeypatch, tmp_path):
@@ -1161,3 +1264,535 @@ def test_attach_url_happy_path_public_host(worker_env, default_url_guard, monkey
         assert Path(atts[0].stored_path).read_bytes() == payload
     finally:
         conn.close()
+
+
+# ---------------------------------------------------------------------------
+# Reviewer escalation via the real kanban_block tool path (task
+# t_f4ab1544, acceptance criterion 4: reviewer escalation is a legal
+# terminal action through the real tool path).
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture
+def review_claim_env(monkeypatch, tmp_path):
+    """A worker env whose task is claimed by a REVIEWER (not the original
+    implementer): request_review -> claim_review_task, then
+    HERMES_KANBAN_TASK is pointed at that claimed run."""
+    home = tmp_path / ".hermes"
+    home.mkdir()
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    monkeypatch.setenv("HERMES_PROFILE", "reviewer")
+    monkeypatch.delenv("HERMES_SESSION_ID", raising=False)
+    from pathlib import Path as _Path
+    monkeypatch.setattr(_Path, "home", lambda: tmp_path)
+
+    from hermes_cli import kanban_db as kb
+    from hermes_cli import kanban_db_connect as kbc
+    kb._INITIALIZED_PATHS.clear()
+    kb.init_db()
+    conn = kbc.connect()
+    try:
+        tid = kb.create_task(conn, title="reviewer-escalation-test", assignee="builder")
+        implementation = kb.claim_task(conn, tid, claimer="builder:1")
+        assert implementation is not None
+        assert kb.request_review(
+            conn, tid, summary="ready", reviewer="reviewer",
+            expected_run_id=implementation.current_run_id,
+        )
+        review = kb.claim_review_task(conn, tid, claimer="reviewer:1")
+        assert review is not None
+    finally:
+        conn.close()
+    monkeypatch.setenv("HERMES_KANBAN_TASK", tid)
+    return tid
+
+
+def test_reviewer_escalates_via_real_kanban_block_tool(review_claim_env):
+    """An active reviewer must be able to escalate through the real
+    ``kanban_block`` tool/handler, and an explicit unblock must resume
+    the task in ``review`` (not ``ready``) — the reviewer's escalation
+    is a legal terminal action, distinct from an implementer's block."""
+    from tools import kanban_tools as kt
+    from hermes_cli import kanban_db as kb
+    from hermes_cli import kanban_db_connect as kbc
+
+    out = kt._handle_block({
+        "reason": "needs_input: maintainer decision required",
+        "kind": "needs_input",
+    })
+    d = json.loads(out)
+    assert d["ok"] is True
+    assert d["status"] == "blocked"
+
+    conn = kbc.connect()
+    try:
+        blocked = kb.get_task(conn, review_claim_env)
+        assert blocked is not None
+        assert blocked.status == "blocked"
+        events = kb.list_events(conn, review_claim_env)
+        blocked_event = [e for e in events if e.kind == "blocked"][-1]
+        assert blocked_event.payload is not None
+        assert blocked_event.payload.get("source_status") == "review"
+
+        assert kb.unblock_task(conn, review_claim_env)
+        resumed = kb.get_task(conn, review_claim_env)
+        assert resumed is not None
+        assert resumed.status == "review"
+    finally:
+        conn.close()
+
+
+# ---------------------------------------------------------------------------
+# Roadmap lanes — kanban_create(lane=...) and the kanban_roadmap tool
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture
+def orchestrator_env(monkeypatch, tmp_path):
+    """An orchestrator profile: isolated HERMES_HOME, no HERMES_KANBAN_TASK, so the
+    orchestrator-gated lane tools are reachable."""
+    monkeypatch.delenv("HERMES_KANBAN_TASK", raising=False)
+    home = tmp_path / ".hermes"
+    home.mkdir()
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    monkeypatch.setenv("HERMES_PROFILE", "orchestrator")
+    monkeypatch.delenv("HERMES_SESSION_ID", raising=False)
+    from pathlib import Path as _P
+    monkeypatch.setattr(_P, "home", lambda: tmp_path)
+
+    from hermes_cli import kanban_db as kb
+    kb._INITIALIZED_PATHS.clear()
+    kb.init_db()
+    return home
+
+
+@pytest.mark.parametrize("lane", ["idea", "roadmap"])
+def test_tool_create_lane_needs_no_assignee(orchestrator_env, lane):
+    """A wishlist card never dispatches, so the tool drops the assignee requirement
+    that exists to stop work parking unassigned in ready forever."""
+    from tools import kanban_tools as kt
+    d = json.loads(kt._handle_create({"title": "wishlist item", "lane": lane}))
+    assert d["ok"] is True
+    assert d["status"] == lane
+
+    from hermes_cli import kanban_db as kb
+    from hermes_cli import kanban_db_connect as kbc
+    with kbc.connect_closing() as conn:
+        assert kb.get_task(conn, d["task_id"]).assignee is None
+
+
+def test_tool_create_still_requires_assignee_without_a_lane(orchestrator_env):
+    """The relaxation is scoped to lane cards — real work still needs an assignee."""
+    from tools import kanban_tools as kt
+    d = json.loads(kt._handle_create({"title": "real work"}))
+    assert d.get("ok") is not True
+    assert "assignee is required" in d.get("error", "")
+
+
+def test_tool_create_rejects_an_unknown_lane(orchestrator_env):
+    from tools import kanban_tools as kt
+    d = json.loads(kt._handle_create({"title": "x", "lane": "backlog"}))
+    assert d.get("ok") is not True
+    assert "lane must be" in d.get("error", "")
+
+
+def test_tool_roadmap_refine_demote_spawn(orchestrator_env):
+    """The action-style lane tool moves a card through both lanes and into triage."""
+    from tools import kanban_tools as kt
+    tid = json.loads(kt._handle_create({"title": "wish", "lane": "idea"}))["task_id"]
+
+    assert json.loads(kt._handle_roadmap({"task_id": tid, "action": "refine"}))["status"] == "roadmap"
+    assert json.loads(kt._handle_roadmap({"task_id": tid, "action": "demote"}))["status"] == "idea"
+    kt._handle_roadmap({"task_id": tid, "action": "refine"})
+    assert json.loads(kt._handle_roadmap({"task_id": tid, "action": "spawn"}))["status"] == "triage"
+
+
+def test_tool_roadmap_spawn_to_ready(orchestrator_env):
+    from tools import kanban_tools as kt
+    tid = json.loads(kt._handle_create({"title": "wish", "lane": "roadmap"}))["task_id"]
+    d = json.loads(kt._handle_roadmap({"task_id": tid, "action": "spawn", "to": "ready"}))
+    assert d["status"] == "ready"
+
+
+def test_tool_roadmap_refuses_live_work_and_says_why(orchestrator_env):
+    """A refused lane move surfaces the DB layer's from->to message as a tool error and
+    leaves the live card untouched."""
+    from tools import kanban_tools as kt
+    tid = json.loads(kt._handle_create({"title": "real work", "assignee": "peer"}))["task_id"]
+    d = json.loads(kt._handle_roadmap({"task_id": tid, "action": "refine"}))
+    assert d.get("ok") is not True
+    assert "-> 'roadmap'" in d.get("error", "")
+
+    from hermes_cli import kanban_db as kb
+    from hermes_cli import kanban_db_connect as kbc
+    with kbc.connect_closing() as conn:
+        assert kb.get_task(conn, tid).status == "ready"
+
+
+def test_tool_roadmap_is_orchestrator_only(worker_env):
+    """A dispatcher-spawned task worker must not be able to move wishlist cards."""
+    from hermes_cli import kanban_db as kb
+    from hermes_cli import kanban_db_connect as kbc
+    with kbc.connect_closing() as conn:
+        tid = kb.create_task(conn, title="wish", lane="idea")
+
+    from tools import kanban_tools as kt
+    d = json.loads(kt._handle_roadmap({"task_id": tid, "action": "refine"}))
+    assert d.get("ok") is not True
+    assert "orchestrator-only" in d.get("error", "") or "refusing to mutate" in d.get("error", "")
+
+    with kbc.connect_closing() as conn:
+        assert kb.get_task(conn, tid).status == "idea"
+
+
+# ---------------------------------------------------------------------------
+# Mergeability preflight on kanban_request_review (task t_3e83300c).
+#
+# Real git repositories throughout: the whole point of the preflight is that
+# git's own merge machinery decides, so a mocked ``git`` would assert nothing.
+# ---------------------------------------------------------------------------
+
+
+def _git(repo, *args: str) -> str:
+    import subprocess
+    return subprocess.run(
+        ["git", "-C", str(repo), *args],
+        capture_output=True, text=True, check=True,
+    ).stdout.strip()
+
+
+def _make_origin(root):
+    """A repo with ``main`` (base) and ``dev`` (base + an edit to f.txt)."""
+    origin = root / "origin"
+    origin.mkdir()
+    _git(origin, "init", "-q", "-b", "main")
+    _git(origin, "config", "user.email", "t@example.invalid")
+    _git(origin, "config", "user.name", "t")
+    (origin / "f.txt").write_text("line1\nline2\n", encoding="utf-8")
+    _git(origin, "add", "-A")
+    _git(origin, "commit", "-qm", "base")
+    base = _git(origin, "rev-parse", "HEAD")
+    _git(origin, "checkout", "-q", "-b", "dev")
+    (origin / "f.txt").write_text("line1-FROM-DEV\nline2\n", encoding="utf-8")
+    _git(origin, "commit", "-qam", "dev moves f.txt")
+    _git(origin, "checkout", "-q", "main")
+    return origin, base
+
+
+def _make_workspace(root, origin, base, *, conflicting: bool):
+    """A clone branched off ``base``; ``conflicting`` decides whether its edit
+    collides with what ``origin/dev`` did to the same line."""
+    ws = root / "ws"
+    _git(root, "-c", "init.defaultBranch=main", "clone", "-q", str(origin), str(ws))
+    _git(ws, "config", "user.email", "t@example.invalid")
+    _git(ws, "config", "user.name", "t")
+    _git(ws, "checkout", "-q", "-b", "feature", base)
+    if conflicting:
+        (ws / "f.txt").write_text("line1-FROM-FEATURE\nline2\n", encoding="utf-8")
+    else:
+        (ws / "untouched-by-dev.txt").write_text("safe\n", encoding="utf-8")
+    _git(ws, "add", "-A")
+    _git(ws, "commit", "-qm", "feature work")
+    return ws
+
+
+@pytest.fixture
+def mergeability_env(monkeypatch, tmp_path):
+    """Factory: build a worker task whose workspace is a real git clone, on a
+    board with a real ``land_target``. Returns ``make(conflicting=...)`` ->
+    ``(task_id, workspace_path)``."""
+    home = tmp_path / ".hermes"
+    home.mkdir()
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    monkeypatch.setenv("HERMES_PROFILE", "test-worker")
+    monkeypatch.delenv("HERMES_SESSION_ID", raising=False)
+    from pathlib import Path as _Path
+    monkeypatch.setattr(_Path, "home", lambda: tmp_path)
+
+    repos = tmp_path / "repos"
+    repos.mkdir()
+    origin, base = _make_origin(repos)
+
+    def make(*, conflicting: bool, land_target: str = "origin/dev",
+             workspace_path=None, status: str = "running"):
+        """``status`` selects the card state under test: ``running`` (claimed,
+        the ordinary worker case), ``ready`` (never claimed), ``todo`` (held by
+        an unfinished parent), or ``done`` (claimed then completed)."""
+        ws = _make_workspace(repos, origin, base, conflicting=conflicting)
+        from hermes_cli import kanban_db as kb
+        from hermes_cli import kanban_db_connect as kbc
+        kb._INITIALIZED_PATHS.clear()
+        kb.init_db()
+        if land_target:
+            kb.write_board_metadata(None, land_target=land_target)
+        with kbc.connect_closing() as conn:
+            parents = ()
+            if status == "todo":
+                parents = (kb.create_task(
+                    conn, title="unfinished parent", assignee="test-worker"),)
+            tid = kb.create_task(
+                conn, title="mergeability", assignee="test-worker",
+                workspace_kind="worktree", parents=parents,
+                workspace_path=str(ws if workspace_path is None else workspace_path))
+            claimed = None
+            if status in ("running", "done"):
+                claimed = kb.claim_task(conn, tid)
+                assert claimed is not None
+            if status == "done":
+                assert kb.complete_task(
+                    conn, tid, summary="done", expected_run_id=claimed.current_run_id)
+            assert kb.get_task(conn, tid).status == status
+        monkeypatch.setenv("HERMES_KANBAN_TASK", tid)
+        # request_review only clears a live claim with proof of ownership, which
+        # the real dispatcher supplies through this env var at spawn time.
+        if claimed is not None:
+            monkeypatch.setenv("HERMES_KANBAN_RUN_ID", str(claimed.current_run_id))
+        else:
+            monkeypatch.delenv("HERMES_KANBAN_RUN_ID", raising=False)
+        return tid, ws
+
+    return make
+
+
+def _events(tid):
+    from hermes_cli import kanban_db as kb
+    from hermes_cli import kanban_db_connect as kbc
+    with kbc.connect_closing() as conn:
+        return kb.list_events(conn, tid)
+
+
+def test_request_review_refuses_a_branch_that_conflicts_with_the_land_target(
+    mergeability_env,
+):
+    """AC1: a worktree whose HEAD conflicts with origin/<land_target> cannot
+    enter the review lane. The refusal names the conflicting path and the
+    exact fix command, the card stays running, and the refusal is recorded
+    as a ``review_preflight_conflict`` event so it can be counted."""
+    from tools import kanban_tools as kt
+    from hermes_cli import kanban_db as kb
+    from hermes_cli import kanban_db_connect as kbc
+
+    tid, _ws = mergeability_env(conflicting=True)
+
+    d = json.loads(kt._handle_request_review({"summary": "implemented the thing"}))
+
+    assert d.get("ok") is not True
+    error = d.get("error", "")
+    assert "f.txt" in error, error
+    assert "git merge origin/dev" in error, error
+
+    with kbc.connect_closing() as conn:
+        assert kb.get_task(conn, tid).status == "running"
+
+    conflicts = [e for e in _events(tid) if e.kind == "review_preflight_conflict"]
+    assert len(conflicts) == 1
+    assert conflicts[0].payload["target"] == "origin/dev"
+    assert conflicts[0].payload["paths"] == ["f.txt"]
+
+
+def test_request_review_stamps_the_target_it_verified_when_the_branch_merges(
+    mergeability_env,
+):
+    """AC2: a clean-merging worktree is handed off exactly as before, plus the
+    proof of what it was checked against — the reviewer reads the target and
+    commit from the event instead of taking the worker's word for it."""
+    from tools import kanban_tools as kt
+    from hermes_cli import kanban_db as kb
+    from hermes_cli import kanban_db_connect as kbc
+
+    tid, ws = mergeability_env(conflicting=False)
+
+    d = json.loads(kt._handle_request_review({"summary": "implemented the thing"}))
+    assert d["ok"] is True
+    assert d["status"] == "review"
+
+    requested = [e for e in _events(tid) if e.kind == "review_requested"]
+    assert len(requested) == 1
+    # request_review stores the handoff metadata on the run the event points at
+    # (task_runs.metadata), not inline on the event payload.
+    with kbc.connect_closing() as conn:
+        run = kb.get_run(conn, requested[0].run_id)
+    assert run is not None
+    stamp = run.metadata["mergeable_against"]
+
+    target, _, sha = stamp.partition("@")
+    assert target == "origin/dev"
+    assert sha == _git(ws, "rev-parse", "origin/dev")
+
+    assert not [e for e in _events(tid) if e.kind == "review_preflight_conflict"]
+
+
+def _assert_untouched_handoff(tid):
+    """AC3's shared contract: the handoff behaved exactly as it did before the
+    preflight existed — it succeeded, stamped nothing, and recorded nothing."""
+    from hermes_cli import kanban_db as kb
+    from hermes_cli import kanban_db_connect as kbc
+
+    requested = [e for e in _events(tid) if e.kind == "review_requested"]
+    assert len(requested) == 1
+    with kbc.connect_closing() as conn:
+        run = kb.get_run(conn, requested[0].run_id)
+    assert run is not None
+    assert "mergeable_against" not in (run.metadata or {})
+    assert not [e for e in _events(tid) if e.kind == "review_preflight_conflict"]
+
+
+def test_request_review_ignores_the_conflict_when_the_preflight_is_disabled(
+    mergeability_env, monkeypatch,
+):
+    """AC3: ``kanban.require_mergeable_for_review: false`` is a real off switch —
+    the same branch that AC1 refuses is handed off untouched."""
+    from tools import kanban_tools as kt
+
+    tid, _ws = mergeability_env(conflicting=True)
+    monkeypatch.setattr(
+        kt._ktm, "cfg_get",
+        lambda cfg, *keys, default=None: (
+            False if keys == ("kanban", "require_mergeable_for_review") else default))
+
+    d = json.loads(kt._handle_request_review({"summary": "implemented the thing"}))
+    assert d["ok"] is True
+    assert d["status"] == "review"
+    _assert_untouched_handoff(tid)
+
+
+def test_request_review_skips_the_preflight_when_the_board_has_no_land_target(
+    mergeability_env,
+):
+    """AC3: with no ``land_target`` there is nothing to merge against, and the
+    preflight must not invent one (no guessing ``dev``/``main``, no reading the
+    branch's upstream). The same conflicting branch is handed off untouched."""
+    from tools import kanban_tools as kt
+
+    tid, _ws = mergeability_env(conflicting=True, land_target="")
+
+    d = json.loads(kt._handle_request_review({"summary": "implemented the thing"}))
+    assert d["ok"] is True
+    assert d["status"] == "review"
+    _assert_untouched_handoff(tid)
+
+
+def test_request_review_skips_the_preflight_when_the_workspace_is_not_a_git_repo(
+    mergeability_env, tmp_path,
+):
+    """AC3: a scratch (non-git) workspace has no HEAD to merge, so the preflight
+    fails open rather than refusing work it cannot judge."""
+    from tools import kanban_tools as kt
+
+    plain = tmp_path / "not-a-repo"
+    plain.mkdir()
+    tid, _ws = mergeability_env(conflicting=True, workspace_path=plain)
+
+    d = json.loads(kt._handle_request_review({"summary": "implemented the thing"}))
+    assert d["ok"] is True
+    assert d["status"] == "review"
+    _assert_untouched_handoff(tid)
+
+
+def test_request_review_fails_open_when_the_land_target_cannot_be_fetched(
+    mergeability_env, tmp_path,
+):
+    """An unreachable remote is an infrastructure problem, not a verdict on the
+    branch. The preflight must never strand finished work outside the review
+    lane because the network (or a renamed remote) was down."""
+    from tools import kanban_tools as kt
+
+    tid, ws = mergeability_env(conflicting=True)
+    _git(ws, "remote", "set-url", "origin", str(tmp_path / "gone"))
+
+    d = json.loads(kt._handle_request_review({"summary": "implemented the thing"}))
+    assert d["ok"] is True
+    assert d["status"] == "review"
+    _assert_untouched_handoff(tid)
+
+
+# ---------------------------------------------------------------------------
+# Gate ordering: status before mergeability (task t_fd4e3978).
+#
+# The preflight used to run in front of the status check, so a card that could
+# not enter the review lane at all was answered with a merge-conflict refusal
+# that additionally asserted it was "still running". Same conflicting worktree,
+# same gate ON — only the card's status varies.
+# ---------------------------------------------------------------------------
+
+
+def _assert_status_answer_not_merge_refusal(error: str) -> None:
+    """The refusal must be about the card's state, not about git. Asserted
+    negatively too: naming the conflicting path or the fix command would mean
+    the merge gate answered a question it has no business answering."""
+    assert "f.txt" not in error, error
+    assert "git merge origin/dev" not in error, error
+    assert "still running" not in error, error
+
+
+def test_request_review_on_a_done_card_answers_status_not_mergeability(
+    mergeability_env,
+):
+    """A completed card is not the worker's to hand off. The refusal must say
+    so — before the fix it got the merge-conflict text, which sent the reader
+    to resolve a conflict AND claimed the card was "still running"."""
+    from tools import kanban_tools as kt
+    from hermes_cli import kanban_db as kb
+    from hermes_cli import kanban_db_connect as kbc
+
+    tid, _ws = mergeability_env(conflicting=True, status="done")
+
+    d = json.loads(kt._handle_request_review({"summary": "implemented the thing"}))
+
+    assert d.get("ok") is not True
+    error = d.get("error", "")
+    _assert_status_answer_not_merge_refusal(error)
+    assert "running/ready" in error, error
+
+    with kbc.connect_closing() as conn:
+        assert kb.get_task(conn, tid).status == "done"
+    assert not [e for e in _events(tid) if e.kind == "review_preflight_conflict"]
+
+
+def test_request_review_on_a_todo_card_answers_status_not_mergeability(
+    mergeability_env,
+):
+    """A never-claimed card held in ``todo`` by an unfinished parent is gated
+    on that parent, not on git. The merge gate must not speak for it."""
+    from tools import kanban_tools as kt
+    from hermes_cli import kanban_db as kb
+    from hermes_cli import kanban_db_connect as kbc
+
+    tid, _ws = mergeability_env(conflicting=True, status="todo")
+
+    d = json.loads(kt._handle_request_review({"summary": "implemented the thing"}))
+
+    assert d.get("ok") is not True
+    error = d.get("error", "")
+    _assert_status_answer_not_merge_refusal(error)
+    assert "parent" in error, error
+
+    with kbc.connect_closing() as conn:
+        assert kb.get_task(conn, tid).status == "todo"
+    assert not [e for e in _events(tid) if e.kind == "review_preflight_conflict"]
+
+
+def test_request_review_refusal_states_the_status_the_card_is_actually_in(
+    mergeability_env,
+):
+    """``ready`` is reviewable, so a conflicting ``ready`` card is still
+    correctly refused by the merge gate — but the refusal must describe the
+    card it is holding. "still running" about a ``ready`` card is the same
+    confidently-wrong sentence the reorder removes elsewhere."""
+    from tools import kanban_tools as kt
+    from hermes_cli import kanban_db as kb
+    from hermes_cli import kanban_db_connect as kbc
+
+    tid, _ws = mergeability_env(conflicting=True, status="ready")
+
+    d = json.loads(kt._handle_request_review({"summary": "implemented the thing"}))
+
+    assert d.get("ok") is not True
+    error = d.get("error", "")
+    assert "f.txt" in error, error
+    assert "still ready" in error, error
+    assert "still running" not in error, error
+
+    with kbc.connect_closing() as conn:
+        assert kb.get_task(conn, tid).status == "ready"
+    assert len([e for e in _events(tid) if e.kind == "review_preflight_conflict"]) == 1

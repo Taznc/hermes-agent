@@ -11,7 +11,9 @@ from typing import Any, Dict, List, Optional
 
 from agent.skill_commands import SKILL_SCAFFOLD_SQL_LIKE
 from utils import safe_json_loads
-from hermes_state_common import SCHEMA_SQL, _PREVIEW_RAW_SUBQUERY_SQL, _shape_preview, _sql_session_last_active
+from hermes_state_common import (
+    SCHEMA_SQL, _PREVIEW_RAW_SUBQUERY_SQL, _shape_preview, _sql_served_route_columns, _sql_session_last_active,
+)
 
 # Pre-split logger identity so log filtering/capture is unchanged.
 logger = logging.getLogger("hermes_state")
@@ -67,7 +69,7 @@ def _rich_select(select_cols: str, where: str, tail: str = "", prompt_select: Op
     return f"""
             SELECT {select_cols}{prompt_select or ""},
                 {_PREVIEW_RAW_SUBQUERY_SQL},
-                {_sql_session_last_active("s")} AS last_active
+                {_sql_session_last_active("s")} AS last_active{_sql_served_route_columns("s")}
             FROM sessions s
             {prompt_join}
             WHERE {where}{tail}
@@ -145,6 +147,7 @@ class SessionPortabilityMixin:
         """Session row dict with ``_preview_raw`` shaped into ``preview``."""
         s = cls._session_row_dict(row)
         s["preview"] = _shape_preview(s.pop("_preview_raw", ""))
+        s["configured_provider"] = cls._configured_provider_for_row(s)
         return s
 
     def _read_rows(self, sql: str, params=()) -> list:

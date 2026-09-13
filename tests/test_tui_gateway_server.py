@@ -541,26 +541,37 @@ def test_compute_host_clarify_snapshot_replays_and_proxies_batch_answers(monkeyp
             {
                 "id": "clarify-q0",
                 "method": "clarify.respond",
-                "params": {"request_id": "host-request", "question_id": "q0", "answer": "a"},
+                "params": {
+                    "request_id": "host-request",
+                    "question_id": "q0",
+                    "answer": "a",
+                    "note": "first note",
+                },
             }
         )
 
-        assert response["result"] == {"status": "ok", "remaining": ["q1"]}
+        assert response["result"] == {"status": "ok", "remaining": ["q1"], "note": "first note"}
         assert supervisor.responses == [
-            (sid, {"request_id": "host-request", "question_id": "q0", "answer": "a"}, 15.0)
+            (sid, {"request_id": "host-request", "question_id": "q0", "answer": "a", "note": "first note"}, 15.0)
         ]
         replayed = server._live_session_payload(sid, session)["pending_clarify"]
         assert replayed["answers"] == {"q0": "a"}
+        assert replayed["notes"] == {"q0": "first note"}
 
         final_response = server.handle_request(
             {
                 "id": "clarify-q1",
                 "method": "clarify.respond",
-                "params": {"request_id": "host-request", "question_id": "q1", "answer": "b"},
+                "params": {
+                    "request_id": "host-request",
+                    "question_id": "q1",
+                    "answer": "b",
+                    "note": "second note",
+                },
             }
         )
 
-        assert final_response["result"] == {"status": "ok", "remaining": []}
+        assert final_response["result"] == {"status": "ok", "remaining": [], "note": "second note"}
         assert "pending_clarify" not in server._live_session_payload(sid, session)
     finally:
         server._sessions.pop(sid, None)
@@ -5013,6 +5024,114 @@ def test_ws_orphan_reap_interrupts_in_process_turn(monkeypatch):
         server._sessions.pop("inline-sid", None)
 
 
+def test_ws_orphan_reap_keeps_pending_clarify_answerable_for_reconnect(monkeypatch):
+    """A detached clarify is user work, not an abandoned turn: keep its exact
+    request live so a reconnect can replay and deliberately resolve it."""
+    callbacks = []
+    interrupted = []
+    result = {}
+
+    class _Timer:
+        def __init__(self, _delay, callback):
+            callbacks.append(callback)
+
+        def start(self):
+            return None
+
+    class _LiveThread:
+        def is_alive(self):
+            return True
+
+    session = _session(
+        agent=types.SimpleNamespace(interrupt=lambda: interrupted.append("interrupted")),
+        transport=server._detached_ws_transport,
+        running=True,
+        _run_thread=_LiveThread(),
+    )
+    server._sessions["clarify-sid"] = session
+    monkeypatch.setattr(server, "_WS_ORPHAN_REAP_GRACE_S", 0.01)
+    monkeypatch.setattr(server.threading, "Timer", _Timer)
+    monkeypatch.setattr(server, "_emit", lambda *_args, **_kwargs: None)
+
+    worker = threading.Thread(
+        target=lambda: result.setdefault(
+            "answer", server._block("clarify.request", "clarify-sid", {"question": "Continue?"}, timeout=5)
+        )
+    )
+    worker.start()
+    try:
+        deadline = time.monotonic() + 1
+        while len(server._pending) != 1 and time.monotonic() < deadline:
+            time.sleep(0.01)
+        assert len(server._pending) == 1
+        request_id = next(iter(server._pending))
+
+        server._schedule_ws_orphan_reap("clarify-sid")
+        callbacks.pop(0)()
+
+        # The disconnect must not turn a visible pending card into an implicit
+        # empty response. Its same request id remains replayable only to owner.
+        assert interrupted == []
+        assert worker.is_alive()
+        assert server._pending_clarify_request_payload("clarify-sid") == {
+            "question": "Continue?", "request_id": request_id
+        }
+        assert server._pending_clarify_request_payload("other-sid") is None
+
+        response = server.handle_request(
+            {"id": "answer", "method": "clarify.respond", "params": {"request_id": request_id, "answer": "yes"}}
+        )
+        assert response["result"] == {"status": "ok"}
+        worker.join(timeout=1)
+        assert result["answer"] == "yes"
+    finally:
+        if server._pending:
+            server._clear_pending(None)
+        worker.join(timeout=1)
+        server._sessions.pop("clarify-sid", None)
+
+
+def test_ws_orphan_reap_preserves_compute_host_pending_clarify(monkeypatch):
+    """The compute-host mirror is equally authoritative during a renderer reconnect."""
+    callbacks = []
+    interrupted = []
+
+    class _Timer:
+        def __init__(self, _delay, callback):
+            callbacks.append(callback)
+
+        def start(self):
+            return None
+
+    class _Supervisor:
+        def interrupt(self, sid, *, request_id=None):
+            interrupted.append((sid, request_id))
+
+    session = _session(
+        agent=None,
+        transport=server._detached_ws_transport,
+        running=True,
+        _compute_host_active=True,
+        _compute_host_pending_clarify={"question": "Continue?", "request_id": "host-request"},
+    )
+    server._sessions["compute-clarify-sid"] = session
+    monkeypatch.setattr(server, "_WS_ORPHAN_REAP_GRACE_S", 0.01)
+    monkeypatch.setattr(server.threading, "Timer", _Timer)
+    monkeypatch.setattr(server, "_get_compute_host_supervisor", lambda _cfg=None: _Supervisor())
+    monkeypatch.setattr(server, "_load_cfg", lambda: {"dashboard": {"turn_isolation": True}})
+
+    try:
+        server._schedule_ws_orphan_reap("compute-clarify-sid")
+        callbacks.pop(0)()
+
+        assert interrupted == []
+        assert server._pending_clarify_request_payload("compute-clarify-sid") == {
+            "question": "Continue?", "request_id": "host-request"
+        }
+    finally:
+        server._sessions.pop("compute-clarify-sid", None)
+
+
 def test_ws_disconnect_running_sidecar_still_closes_without_orphan_timer(monkeypatch):
     closed = []
     scheduled = []
@@ -8429,6 +8548,198 @@ def test_config_set_approval_mode_persists_three_way_value_and_emits_live_status
     assert emitted[0][2]["approval_mode"] == "manual"
 
 
+def _profile_home_layout(tmp_path, monkeypatch, launch_mode, named_mode, name="work"):
+    """Launch profile + one named profile with DIFFERENT approval modes.
+
+    The desktop's app-global remote mode serves every profile from ONE backend,
+    so the ambient HERMES_HOME is the launch profile's. These tests assert the
+    named profile's own configured mode survives that, which is exactly what
+    regressed: a profile configured `smart` was reported as `manual`.
+    """
+    import yaml
+
+    launch_home = tmp_path / "launch"
+    launch_home.mkdir()
+    (launch_home / "config.yaml").write_text(
+        yaml.safe_dump({"approvals": {"mode": launch_mode}})
+    )
+
+    named_home = launch_home / "profiles" / name
+    named_home.mkdir(parents=True)
+    (named_home / "config.yaml").write_text(
+        yaml.safe_dump({"approvals": {"mode": named_mode}})
+    )
+
+    monkeypatch.setattr(server, "_hermes_home", launch_home)
+    monkeypatch.setenv("HERMES_HOME", str(launch_home))
+
+    return launch_home, named_home
+
+
+def test_config_get_approval_mode_resolves_the_requested_profile(tmp_path, monkeypatch):
+    """A configured `smart` profile must not report the launch profile's mode.
+
+    Initial-mode selection. The desktop statusbar caches approval mode per
+    profile and syncs it with config.get on mount; an unscoped read answered
+    for whichever profile launched the backend, so a profile configured
+    `smart` settled to `manual` right after session start.
+    """
+    _profile_home_layout(tmp_path, monkeypatch, launch_mode="manual", named_mode="smart")
+
+    scoped = server.handle_request(
+        {
+            "id": "1",
+            "method": "config.get",
+            "params": {"key": "approvals.mode", "profile": "work"},
+        }
+    )
+    assert scoped["result"]["value"] == "smart"
+
+    # The launch profile still answers for itself when no profile is named.
+    unscoped = server.handle_request(
+        {"id": "2", "method": "config.get", "params": {"key": "approvals.mode"}}
+    )
+    assert unscoped["result"]["value"] == "manual"
+
+
+def test_session_info_approval_mode_matches_its_own_profile_name(tmp_path, monkeypatch):
+    """`approval_mode` and `profile_name` must describe the SAME profile.
+
+    Initial-mode selection at the other divergence site: the payload derived
+    `profile_name` from the session's `profile_home` but resolved the mode
+    against the ambient home, so one dict named `work` and reported the launch
+    profile's mode.
+    """
+    _, named_home = _profile_home_layout(
+        tmp_path, monkeypatch, launch_mode="manual", named_mode="smart"
+    )
+
+    class _Agent:
+        model = "test/model"
+        provider = "test"
+        session_id = "sid"
+        reasoning_config = None
+        service_tier = None
+
+    session = {
+        "cwd": str(named_home),
+        "session_key": "sid",
+        "profile_home": str(named_home),
+    }
+    info = server._session_info(_Agent(), session)
+
+    assert info["profile_name"] == "work"
+    assert info["approval_mode"] == "smart"
+    # approvals.mode=off is the only bypass source here, and it isn't set.
+    assert info["yolo"] is False
+
+
+def test_session_info_reports_the_profile_its_approval_mode_belongs_to(tmp_path, monkeypatch):
+    """`profile_name` must accompany `approval_mode` on every payload.
+
+    The desktop credits the mode to `profile_name` rather than to whichever
+    profile is ambiently active, because a background tile runs in its own
+    profile. Dropping the field would silently send the renderer back to the
+    ambient-profile guess this pairing exists to remove.
+    """
+    launch_home, named_home = _profile_home_layout(
+        tmp_path, monkeypatch, launch_mode="manual", named_mode="smart"
+    )
+
+    class _Agent:
+        model = "test/model"
+        provider = "test"
+        session_id = "sid"
+        reasoning_config = None
+        service_tier = None
+
+    for home, expected_profile, expected_mode in (
+        (named_home, "work", "smart"),
+        (None, server._current_profile_name(), "manual"),
+    ):
+        session = {"cwd": str(home or launch_home), "session_key": "sid"}
+        if home is not None:
+            session["profile_home"] = str(home)
+        info = server._session_info(_Agent(), session)
+
+        assert info["profile_name"] == expected_profile
+        assert info["approval_mode"] == expected_mode
+
+
+def test_session_info_approval_mode_survives_a_failing_yolo_lookup(tmp_path, monkeypatch):
+    """A failure in the session-yolo lookup must not publish a guessed mode.
+
+    `approval_mode` was seeded `"manual"` before the try block and the except
+    branch reset only `yolo`, so any exception raised before the resolver ran
+    shipped that guess to the desktop as authoritative backend truth.
+    """
+    _, named_home = _profile_home_layout(
+        tmp_path, monkeypatch, launch_mode="manual", named_mode="smart"
+    )
+
+    import tools.approval as approval_mod
+
+    def _boom(_key):
+        raise RuntimeError("session yolo lookup failed")
+
+    monkeypatch.setattr(approval_mod, "is_session_yolo_enabled", _boom)
+
+    class _Agent:
+        model = "test/model"
+        provider = "test"
+        session_id = "sid"
+        reasoning_config = None
+        service_tier = None
+
+    info = server._session_info(
+        _Agent(),
+        {"cwd": str(named_home), "session_key": "sid", "profile_home": str(named_home)},
+    )
+
+    assert info["approval_mode"] == "smart"
+
+
+def test_config_set_approval_mode_writes_to_the_requested_profile(tmp_path, monkeypatch):
+    """A mode change during a session must persist to that session's profile.
+
+    Mode-change coverage. A scoped read plus an unscoped write would land the
+    new value in the launch profile's config.yaml, so the menu would revert on
+    the next sync while the wrong profile's policy silently changed.
+    """
+    import yaml
+
+    launch_home, named_home = _profile_home_layout(
+        tmp_path, monkeypatch, launch_mode="manual", named_mode="smart"
+    )
+    monkeypatch.setattr(server, "_emit", lambda *args: None)
+
+    resp = server.handle_request(
+        {
+            "id": "1",
+            "method": "config.set",
+            "params": {"key": "approvals.mode", "value": "off", "profile": "work"},
+        }
+    )
+    assert resp["result"] == {"key": "approvals.mode", "value": "off"}
+
+    named_cfg = yaml.safe_load((named_home / "config.yaml").read_text())
+    launch_cfg = yaml.safe_load((launch_home / "config.yaml").read_text())
+    assert named_cfg["approvals"]["mode"] == "off"
+    # The launch profile must be untouched by another profile's change.
+    assert launch_cfg["approvals"]["mode"] == "manual"
+
+    # And the change is immediately observable through the scoped read — the
+    # round-trip the desktop menu actually performs.
+    readback = server.handle_request(
+        {
+            "id": "2",
+            "method": "config.get",
+            "params": {"key": "approvals.mode", "profile": "work"},
+        }
+    )
+    assert readback["result"]["value"] == "off"
+
+
 def test_pet_gallery_quoted_false_enabled_reports_disabled(tmp_path, monkeypatch):
     """display.pet.enabled: "false" (quoted) must report enabled=False.
 
@@ -11273,6 +11584,9 @@ def test_file_attach_quotes_ref_with_spaces(monkeypatch, tmp_path):
         server._sessions.pop("sid", None)
 
 
+# ── Chunked file.attach_open/_chunk/_commit/_abort (t_275f8015) ────────────
+
+
 def test_commands_catalog_surfaces_quick_commands(monkeypatch):
     monkeypatch.setattr(
         server,
@@ -13328,6 +13642,7 @@ def test_interrupt_only_clears_own_session_pending():
         ev_a = threading.Event()
         ev_b = threading.Event()
         server._pending["rid-a"] = ("sid_a", ev_a)
+        server._pending_prompt_payloads["rid-a"] = ("clarify.request", {"request_id": "rid-a"})
         server._pending["rid-b"] = ("sid_b", ev_b)
         server._answers.clear()
 
@@ -13341,9 +13656,11 @@ def test_interrupt_only_clears_own_session_pending():
         )
         assert resp.get("result"), f"got error: {resp.get('error')}"
 
-        # Session A's pending must be released to empty.
+        # Session A's clarify must be released as an agent-readable cancellation,
+        # never as a deliberate blank Skip.
         assert ev_a.is_set(), "sid_a pending Event should be set after interrupt"
-        assert server._answers.get("rid-a") == ""
+        from tools.clarify_tool import CANCELLED_RESPONSE
+        assert server._answers.get("rid-a") == CANCELLED_RESPONSE
 
         # Session B's pending MUST remain untouched — no cross-session blast.
         assert not ev_b.is_set(), (
@@ -13357,8 +13674,106 @@ def test_interrupt_only_clears_own_session_pending():
         server._sessions.pop("sid_b", None)
         server._pending.pop("rid-a", None)
         server._pending.pop("rid-b", None)
+        server._pending_prompt_payloads.pop("rid-a", None)
+        server._pending_prompt_payloads.pop("rid-b", None)
         server._answers.pop("rid-a", None)
         server._answers.pop("rid-b", None)
+
+
+def test_interrupt_clarify_callback_returns_cancelled_result_not_blank():
+    """The live gateway callback must carry a stop through clarify_tool's result seam."""
+    from tools.clarify_tool import clarify_tool
+
+    session = _session()
+    session["agent"] = types.SimpleNamespace(interrupt=lambda: None)
+    server._sessions["cancel-clarify"] = session
+    result = {}
+
+    worker = threading.Thread(
+        target=lambda: result.setdefault(
+            "value",
+            json.loads(clarify_tool(
+                "Continue?", callback=server._agent_cbs("cancel-clarify")["clarify_callback"],
+            )),
+        ),
+    )
+    worker.start()
+    try:
+        deadline = time.monotonic() + 1
+        while not server._pending and time.monotonic() < deadline:
+            time.sleep(0.01)
+        assert len(server._pending) == 1
+
+        response = server.handle_request({
+            "id": "stop", "method": "session.interrupt", "params": {"session_id": "cancel-clarify"},
+        })
+
+        assert response["result"]
+        worker.join(timeout=1)
+        assert result["value"]["user_response"] == ""
+        assert result["value"]["cancelled"] is True
+        assert "timed_out" not in result["value"]
+    finally:
+        server._clear_pending(None)
+        worker.join(timeout=1)
+        server._sessions.pop("cancel-clarify", None)
+
+
+def test_interrupt_batch_clarify_callback_returns_cancelled_result_not_skip():
+    """Stopping a batch preserves its explicit cancellation reason through the real callback."""
+    from tools.clarify_tool import clarify_tool
+
+    session = _session()
+    session["agent"] = types.SimpleNamespace(interrupt=lambda: None)
+    server._sessions["cancel-batch-clarify"] = session
+    result = {}
+
+    worker = threading.Thread(
+        target=lambda: result.setdefault(
+            "value",
+            json.loads(clarify_tool(
+                "",
+                questions=[{"question": "One?"}, {"question": "Two?"}],
+                callback=server._agent_cbs("cancel-batch-clarify")["clarify_callback"],
+            )),
+        ),
+    )
+    worker.start()
+    try:
+        deadline = time.monotonic() + 1
+        while not server._pending and time.monotonic() < deadline:
+            time.sleep(0.01)
+        assert len(server._pending) == 1
+
+        response = server.handle_request({
+            "id": "stop", "method": "session.interrupt", "params": {"session_id": "cancel-batch-clarify"},
+        })
+
+        assert response["result"]
+        worker.join(timeout=1)
+        assert result["value"]["cancelled"] is True
+        assert "timed_out" not in result["value"]
+        assert [row["user_response"] for row in result["value"]["responses"]] == ["", ""]
+    finally:
+        server._clear_pending(None)
+        worker.join(timeout=1)
+        server._sessions.pop("cancel-batch-clarify", None)
+
+
+def test_clarify_callback_timeout_returns_timed_out_result_not_skip(monkeypatch):
+    """The configured gateway timeout must reach the final single-question result as a timeout."""
+    from tools.clarify_tool import clarify_tool
+
+    monkeypatch.setattr(server, "_clarify_timeout_seconds", lambda: 0.01)
+    monkeypatch.setattr(server, "_emit", lambda *_args, **_kwargs: None)
+
+    result = json.loads(clarify_tool(
+        "Continue?", callback=server._agent_cbs("timeout-clarify")["clarify_callback"],
+    ))
+
+    assert result["user_response"] == ""
+    assert result["timed_out"] is True
+    assert "cancelled" not in result
 
 
 def test_interrupt_clears_multiple_own_pending():
@@ -20576,6 +20991,50 @@ def test_clarify_callback_multi_select_hint(monkeypatch):
     assert captured["payload"] == {"question": "Pick one", "choices": ["a", "b"]}
 
 
+def test_single_clarify_callback_preserves_note_through_real_response(monkeypatch):
+    """A single response keeps its optional note through the production callback."""
+    from tools.clarify_tool import clarify_tool
+
+    emitted = threading.Event()
+    payloads = []
+
+    def capture(event, sid, payload):
+        if event == "clarify.request":
+            payloads.append(payload)
+            emitted.set()
+
+    monkeypatch.setattr(server, "_emit", capture)
+    monkeypatch.setattr(server, "_clarify_timeout_seconds", lambda: 5)
+    output = {}
+    callback = server._agent_cbs("clarify-note-session")["clarify_callback"]
+
+    worker = threading.Thread(
+        target=lambda: output.setdefault(
+            "result", json.loads(clarify_tool("Color?", ["red", "blue"], callback=callback))
+        )
+    )
+    worker.start()
+    assert emitted.wait(5)
+
+    response = server.handle_request(
+        {
+            "id": "clarify-note-response",
+            "method": "clarify.respond",
+            "params": {
+                "request_id": payloads[0]["request_id"],
+                "answer": "red",
+                "note": "Keep this note.",
+            },
+        }
+    )
+    worker.join(5)
+
+    assert not worker.is_alive()
+    assert response["result"]["note"] == "Keep this note."
+    assert output["result"]["user_response"] == "red"
+    assert output["result"]["note"] == "Keep this note."
+
+
 @pytest.mark.parametrize(
     ("configured", "expected"),
     [(0, None), (-1, None), (42, 42)],
@@ -20822,12 +21281,21 @@ def test_prompt_submit_releases_old_history_before_heap_trim(monkeypatch, tmp_pa
         monkeypatch.setattr(server, "_get_usage", lambda _a: {})
         monkeypatch.setattr(server, "render_message", lambda _t, _c: "")
         monkeypatch.setattr(server, "_emit", lambda *a: None)
-        monkeypatch.setattr(server, "set_hermes_home_override", lambda _home: object())
-        monkeypatch.setattr(
-            server,
-            "reset_hermes_home_override",
-            lambda _token: cleanup_order.append("reset_home"),
-        )
+        # Faithful stub: delegate to the real contextvar setter so
+        # get_hermes_home_override() actually reflects the bind. A no-op stub
+        # that still returned a token made the override invisible to readers,
+        # so profile-scoped resolvers (e.g. _session_info's approval-mode
+        # lookup) could not tell the profile was already bound and re-bound it
+        # — an artifact of the mock, not of production behavior.
+        _real_set = server.set_hermes_home_override
+        _real_reset = server.reset_hermes_home_override
+        monkeypatch.setattr(server, "set_hermes_home_override", lambda _home: _real_set(_home))
+
+        def _recording_reset(token):
+            cleanup_order.append("reset_home")
+            _real_reset(token)
+
+        monkeypatch.setattr(server, "reset_hermes_home_override", _recording_reset)
         monkeypatch.setattr("hermes_cli.mem_trim.trim_memory", _inspect_trim_frame)
 
         resp = server.handle_request(
@@ -20841,7 +21309,15 @@ def test_prompt_submit_releases_old_history_before_heap_trim(monkeypatch, tmp_pa
         assert resp is not None and resp.get("result")
         assert not observed["history"]
         assert not observed["run_kwargs"]
-        assert cleanup_order == ["trim", "reset_home"]
+        # Ordering invariant, not a call count: the trim must run before the
+        # turn's HERMES_HOME override is released. A later reset is legitimate
+        # — the settled `session.info` emit runs AFTER the turn releases its
+        # bind, so the profile-scoped approval-mode lookup in `_session_info`
+        # binds the session's profile itself (otherwise it would report the
+        # launch profile's mode for another profile's session).
+        assert cleanup_order[:2] == ["trim", "reset_home"]
+        assert set(cleanup_order) == {"trim", "reset_home"}
+        assert cleanup_order.count("trim") == 1
     finally:
         server._sessions.pop("sid_trim", None)
 

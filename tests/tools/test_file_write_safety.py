@@ -689,6 +689,74 @@ class TestProtectedInstructionFiles:
 
         assert rendered["choices"] == ["once", "deny"]
 
+    # ---- no-channel sessions (single-query / cron / unattended) ---------
+
+    def test_single_query_headless_fails_fast_not_timeout(self, tmp_path, approvals, monkeypatch):
+        """A kanban `hermes chat -q` worker: HERMES_SINGLE_QUERY_SESSION=1 registers the
+        CLI's queue-based callback (``_install_tool_callbacks()`` runs regardless of TTY)
+        but no ``prompt_toolkit`` Application ever drains it and no gateway notify_cb is
+        registered either. Before the fix this fell through to the CLI branch, found a
+        non-None callback, and called it — which then hung the full approval timeout before
+        reporting "timed out without a user response" (indistinguishable from a genuinely
+        silent human). It must instead recognize there is no reachable channel and fail
+        immediately with a message that does not suggest retrying will ever help."""
+        monkeypatch.setenv("HERMES_SINGLE_QUERY_SESSION", "1")
+        import sys as _sys
+        monkeypatch.setattr(_sys.stdin, "isatty", lambda: False, raising=False)
+        target = tmp_path / "AGENTS.md"
+        res = self._write(target)
+        assert res.get("error") and "BLOCKED" in res["error"]
+        assert "no approval channel is reachable" in res["error"]
+        assert not target.exists()
+        # The registered CLI callback must never have been invoked — it would only hang.
+        assert approvals["calls"] == []
+
+    def test_cron_headless_fails_fast_not_timeout(self, tmp_path, approvals, monkeypatch):
+        monkeypatch.setenv("HERMES_CRON_SESSION", "1")
+        import sys as _sys
+        monkeypatch.setattr(_sys.stdin, "isatty", lambda: False, raising=False)
+        target = tmp_path / "AGENTS.md"
+        res = self._write(target)
+        assert res.get("error") and "no approval channel is reachable" in res["error"]
+        assert not target.exists()
+        assert approvals["calls"] == []
+
+    def test_single_query_with_real_tty_still_prompts(self, tmp_path, monkeypatch):
+        """A genuinely interactive ``-q`` invocation (stdin IS a real terminal) must still
+        reach a human via the synchronous input() fallback in approval_prompt.py, rather
+        than being swept into the same fail-fast path as a headless worker."""
+        monkeypatch.setenv("HERMES_SINGLE_QUERY_SESSION", "1")
+        import sys as _sys
+        monkeypatch.setattr(_sys.stdin, "isatty", lambda: True, raising=False)
+        # prompt_dangerous_approval is imported inside the function; patch its source module.
+        import tools.approval_prompt as ap
+        monkeypatch.setattr(ap, "prompt_dangerous_approval", lambda *a, **kw: "once")
+        target = tmp_path / "AGENTS.md"
+        res = self._write(target, "approved from a real -q terminal")
+        assert not res.get("error"), res
+        assert target.read_text(encoding="utf-8") == "approved from a real -q terminal"
+
+    def test_gateway_notify_takes_priority_over_single_query_marker(self, tmp_path, monkeypatch):
+        """A live gateway session always wins even if HERMES_SINGLE_QUERY_SESSION leaked in —
+        the notify_cb branch must be checked before the no-channel short-circuit."""
+        monkeypatch.setenv("HERMES_SINGLE_QUERY_SESSION", "1")
+        import tools.approval as A
+        from tools import approval_context
+        session_key = "single-query-with-gateway-session"
+        token = approval_context.set_current_session_key(session_key)
+        try:
+            def notify(approval_data):
+                A.resolve_gateway_approval(session_key, "once")
+
+            A.register_gateway_notify(session_key, notify)
+            try:
+                res = self._write(tmp_path / "AGENTS.md", "gateway wins")
+                assert not res.get("error"), res
+            finally:
+                A.unregister_gateway_notify(session_key)
+        finally:
+            approval_context.reset_current_session_key(token)
+
 
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])

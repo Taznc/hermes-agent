@@ -225,11 +225,15 @@ test('a locked keychain keeps the stored entry for a later retry', () => {
   assert.deepEqual(locked.fileText(), first.fileText())
 })
 
-test('a corrupt store file loads as signed out instead of throwing', () => {
+test('a corrupt store file loads as signed out and logs the corruption instead of throwing', () => {
   const disk = createFakeDisk('{not json')
 
   assert.equal(loadNativeTokenSet(GATEWAY, disk.io), null)
-  assert.deepEqual(disk.logs, [])
+  // Unlike a merely-absent store (logs stay empty), a PRESENT-but-corrupt
+  // store is worth a log line: it's likely a truncated write, not "never
+  // used" — see readStore()'s doc comment in native-token-store.ts.
+  assert.equal(disk.logs.length, 1)
+  assert.match(disk.logs[0], /corrupt/)
 })
 
 test('an array store file loads as signed out instead of throwing', () => {
@@ -306,6 +310,130 @@ test('a non-Error write failure keeps its detail in the log', () => {
   // the only diagnostic there was.
   assert.doesNotThrow(() => persistNativeTokenSet(GATEWAY, TOKENS, disk.io))
   assert.equal(disk.logs[0], '[native-oauth] failed to persist tokens: disk went away')
+})
+
+// --- crash-safety: corrupt-store quarantine must not destroy other gateways ---
+//
+// The bug this guards against: a truncated write (kill -9 mid-persist with a
+// non-atomic writer) leaves the JSON unparseable. readStore() used to treat
+// that identically to "file never existed" — empty object, no signal — so the
+// very next persist() for ANY gateway would silently drop every other
+// gateway's stored refresh token by writing a fresh store containing only the
+// current entry. Quarantining the corrupt bytes instead of reading them as
+// empty-and-then-overwriting is what makes that no longer possible: the
+// corrupt file is moved aside before it can be clobbered, and a caller that
+// still wants to write is writing a genuinely fresh store, not overwriting
+// evidence.
+
+test('preserveCorruptStore is invoked exactly once when the store fails to parse', () => {
+  let quarantines = 0
+
+  const disk = createFakeDisk('{not valid json at all', {
+    preserveCorruptStore: () => {
+      quarantines += 1
+    }
+  })
+
+  loadNativeTokenSet(GATEWAY, disk.io)
+
+  assert.equal(quarantines, 1)
+})
+
+test('a quarantine failure does not prevent the corrupt store from still being read as empty', () => {
+  const disk = createFakeDisk('{not valid json at all', {
+    preserveCorruptStore: () => {
+      throw new Error('rename failed: EACCES')
+    }
+  })
+
+  // The quarantine attempt itself failing must not throw out of loadNativeTokenSet —
+  // "refuse to trust corrupt bytes" must hold even when quarantining is impossible.
+  assert.equal(loadNativeTokenSet(GATEWAY, disk.io), null)
+})
+
+test('an io without preserveCorruptStore (older/simpler callers) still refuses to trust corrupt bytes', () => {
+  // preserveCorruptStore is optional on the interface; omitting it must not
+  // change the safety property — corruption still reads as empty, not as a
+  // thrown error that could crash the caller.
+  const disk = createFakeDisk('{not valid json at all')
+
+  delete (disk.io as any).preserveCorruptStore
+
+  assert.equal(loadNativeTokenSet(GATEWAY, disk.io), null)
+})
+
+test('array store and truly-corrupt-JSON store are told apart: only the latter is quarantined', () => {
+  // An array is a deliberate "start fresh" case (see readStore's doc comment)
+  // — it's valid JSON, just the wrong shape, so there's nothing to preserve.
+  let arrayQuarantines = 0
+  const arrayDisk = createFakeDisk('[]', { preserveCorruptStore: () => (arrayQuarantines += 1) })
+
+  loadNativeTokenSet(GATEWAY, arrayDisk.io)
+  assert.equal(arrayQuarantines, 0, 'a syntactically valid array must not be treated as corruption')
+
+  let jsonQuarantines = 0
+  const corruptDisk = createFakeDisk('{not json', { preserveCorruptStore: () => (jsonQuarantines += 1) })
+
+  loadNativeTokenSet(GATEWAY, corruptDisk.io)
+  assert.equal(jsonQuarantines, 1, 'unparseable JSON must be quarantined')
+})
+
+test('persisting against a corrupt store aborts BEFORE writing anything — refuses the destructive rewrite', () => {
+  // The exact contract gap from review round 1: quarantining the corrupt
+  // bytes is necessary but not sufficient. If persistNativeTokenSet went on
+  // to write a fresh canonical store after quarantining, the write for
+  // gateway B would still be the only entry in the live store — identical
+  // end state to the original bug, just with better evidence preservation.
+  // The write MUST NOT happen at all; the caller (main.ts) is expected to
+  // surface the throw and let the user retry.
+  let writes = 0
+  let quarantines = 0
+
+  const disk = createFakeDisk('{not valid json at all', {
+    preserveCorruptStore: () => {
+      quarantines += 1
+    },
+    writeStoreText: () => {
+      writes += 1
+    }
+  })
+
+  assert.throws(
+    () => persistNativeTokenSet(GATEWAY, TOKENS, disk.io),
+    /corrupt/i,
+    'persisting against a corrupt store must throw, not silently succeed'
+  )
+
+  assert.equal(writes, 0, 'writeStoreText must never be called when the existing store is corrupt')
+  assert.equal(quarantines, 1, 'the corrupt bytes are still quarantined as part of the abort')
+})
+
+test('an array store (not corrupt, just wrong-shaped) still allows a normal persist', () => {
+  // Contrast case for the test above: an array is NOT corruption (see
+  // readStore's doc comment), so persisting over one must keep working exactly
+  // as before — only genuinely unparseable JSON triggers the write-abort.
+  const disk = createFakeDisk('[]')
+
+  assert.doesNotThrow(() => persistNativeTokenSet(GATEWAY, TOKENS, disk.io))
+  assert.deepEqual(loadNativeTokenSet(GATEWAY, createFakeDisk(disk.fileText()).io), TOKENS)
+})
+
+test('clearing (tokens=null) against a corrupt store also aborts rather than writing an empty store', () => {
+  // A logout/clear is a write too — it must not get a free pass around the
+  // corruption guard just because its intent is deletion rather than
+  // insertion. Writing `{}` over the quarantined bytes would be exactly as
+  // destructive to any OTHER gateway's entry the corrupt bytes might still
+  // have held.
+  let writes = 0
+
+  const disk = createFakeDisk('{not valid json at all', {
+    writeStoreText: () => {
+      writes += 1
+    }
+  })
+
+  assert.throws(() => persistNativeTokenSet(GATEWAY, null, disk.io), /corrupt/i)
+  assert.equal(writes, 0)
 })
 
 test('an unusable keychain fails the write loudly and writes nothing', () => {

@@ -201,6 +201,11 @@ describe('reportBackendContract', () => {
   it('warns when the backend is behind (or reports no contract)', () => {
     reportBackendContract(undefined)
     expect(notifySpy).toHaveBeenCalledTimes(1)
+    expect(notifySpy.mock.calls[0]?.[0]).toMatchObject({
+      id: 'backend-contract-skew',
+      kind: 'warning'
+    })
+    expect(notifySpy.mock.calls[0]?.[0]).not.toHaveProperty('action')
     reportBackendContract(1)
     expect(notifySpy).toHaveBeenCalledTimes(2)
   })
@@ -1385,5 +1390,25 @@ describe('startUpdatePoller', () => {
     await vi.advanceTimersByTimeAsync(0)
 
     expect(checkMock).toHaveBeenCalled()
+  })
+
+  it('does not arm the 30-minute timer or focus listener when checks are disabled', async () => {
+    checkMock.mockResolvedValue({
+      supported: false,
+      reason: 'update-checks-disabled',
+      message: 'Desktop update checks are disabled.',
+      fetchedAt: 0
+    })
+
+    startUpdatePoller()
+    await vi.advanceTimersByTimeAsync(0)
+
+    expect(checkMock).toHaveBeenCalledTimes(1)
+    expect(listeners['focus']).toBeUndefined()
+
+    checkMock.mockClear()
+    await vi.advanceTimersByTimeAsync(30 * 60 * 1000)
+
+    expect(checkMock).not.toHaveBeenCalled()
   })
 })

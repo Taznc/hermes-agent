@@ -4,6 +4,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { createClientSessionState } from '@/lib/chat-runtime'
 import { sessionMessagesSignature } from '@/lib/session-signatures'
 import { $changeEventsAvailable, notifySessionsChanged, resetLiveSync } from '@/store/live-sync'
+import { clearMcpAppCards, getMcpAppCard, recordMcpAppCard } from '@/store/mcp-apps'
 import {
   $activeSessionId,
   $selectedStoredSessionId,
@@ -178,6 +179,7 @@ afterEach(() => {
   clearAllSessionStates()
   $sessionTiles.set([])
   resetTypingActivityTracking()
+  clearMcpAppCards(ACTIVE_RUNTIME_ID)
 })
 
 describe('active transcript refresh', () => {
@@ -218,6 +220,21 @@ describe('active transcript refresh', () => {
     expect(fixture.states.get(ACTIVE_RUNTIME_ID)?.messages.at(-1)?.parts[0]).toMatchObject({
       text: 'hidden external answer'
     })
+  })
+
+  it('keeps an MCP App card admitted by the matching live tool completion', async () => {
+    recordMcpAppCard(ACTIVE_RUNTIME_ID, 'tool-call', {
+      html: '<!doctype html><html><body>chart</body></html>',
+      id: 'per-call-opaque-identifier',
+      resourceUri: 'ui://charts/summary',
+      serverId: 'charts',
+      toolName: 'chart'
+    })
+
+    const fixture = makeRefresh()
+    await fixture.refresh()
+
+    expect(getMcpAppCard(ACTIVE_RUNTIME_ID, 'tool-call')).toMatchObject({ toolName: 'chart' })
   })
 
   it('reconciles a workspace TILE transcript when sessions.changed ticks (#94255 review: behavior, not source-grep)', async () => {

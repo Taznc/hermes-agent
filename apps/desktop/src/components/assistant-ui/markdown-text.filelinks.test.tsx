@@ -1,7 +1,19 @@
 import { cleanup, render, screen, waitFor } from '@testing-library/react'
-import { afterEach, describe, expect, it } from 'vitest'
+import { afterEach, describe, expect, it, vi } from 'vitest'
 
 import { MarkdownTextContent } from './markdown-text'
+
+// Regression for the <div>-in-<p> hydration warning: MarkdownLink is the `a`
+// renderer, so an inline markdown link that resolves to PreviewAttachment /
+// MediaAttachment renders as a CHILD of MarkdownParagraph's real <p>. Those
+// attachment cards must therefore emit inline-safe markup (no <div>), or the
+// browser's HTML parser closes the <p> early and desyncs React's tree from
+// the DOM — the exact "In HTML, <div> cannot be a descendant of <p>" warning.
+function expectNoParagraphNestingWarning(errorSpy: ReturnType<typeof vi.spyOn>) {
+  for (const call of errorSpy.mock.calls) {
+    expect(String(call[0])).not.toMatch(/cannot be a descendant of/i)
+  }
+}
 
 // Regression for #82140: a plain filesystem href in assistant markdown
 // (`[report](/home/user/report.md)`) rendered as a bare dead anchor —
@@ -55,5 +67,42 @@ describe('MarkdownLink filesystem hrefs', () => {
     // preview affordance.
     expect(screen.queryByRole('button', { name: 'Open preview' })).toBeNull()
     expect(document.querySelector('a[href="#section-2"]')).not.toBeNull()
+  })
+
+  it('does not nest a <div> attachment card inside the paragraph <p>', async () => {
+    const errorSpy = vi.spyOn(console, 'error').mockImplementation(() => undefined)
+
+    const { container } = render(
+      <MarkdownTextContent isRunning={false} text="Wrote it: [report](/home/user/report.md)" />
+    )
+
+    await screen.findByText('report.md')
+
+    // The attachment card renders as a sibling flow inside the <p>; assert
+    // structurally (not just "no warning") that no block <div> landed there.
+    expect(container.querySelector('p div')).toBeNull()
+    expectNoParagraphNestingWarning(errorSpy)
+    errorSpy.mockRestore()
+  })
+
+  it('keeps a mixed text+attachment paragraph valid when text surrounds the link', async () => {
+    const errorSpy = vi.spyOn(console, 'error').mockImplementation(() => undefined)
+
+    const { container } = render(
+      <MarkdownTextContent
+        isRunning={false}
+        text="See the report here: [report](/home/user/report.md) for details."
+      />
+    )
+
+    await screen.findByText('report.md')
+
+    const paragraph = container.querySelector('p')
+    expect(paragraph).not.toBeNull()
+    expect(paragraph?.textContent).toContain('See the report here:')
+    expect(paragraph?.textContent).toContain('for details.')
+    expect(container.querySelector('p div')).toBeNull()
+    expectNoParagraphNestingWarning(errorSpy)
+    errorSpy.mockRestore()
   })
 })

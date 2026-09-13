@@ -48,7 +48,7 @@ class TestClarifyToolChoicesValidation:
             choices_passed.extend(choices or [])
             return "picked"
 
-        many_choices = ["a", "b", "c", "d", "e", "f", "g"]
+        many_choices = ["a", "b", "c", "d", "e", "f", "g", "h", "i", "j", "k", "l"]
         clarify_tool("Pick one", choices=many_choices, callback=mock_callback)
 
         assert len(choices_passed) == MAX_CHOICES
@@ -68,6 +68,18 @@ class TestClarifyToolChoicesValidation:
 
 class TestClarifyToolCallbackHandling:
     """Tests for callback error handling."""
+
+    def test_structured_single_callback_preserves_note_beside_clean_answer(self):
+        """A platform may return its canonical answer and optional note separately."""
+        def callback(question, choices):
+            return {"answer": "Rebase (Recommended)", "note": "Keep the migration commits."}
+
+        result = json.loads(clarify_tool(
+            "Which history?", choices=["Rebase", "Merge"], callback=callback,
+        ))
+
+        assert result["user_response"] == "Rebase"
+        assert result["note"] == "Keep the migration commits."
 
     def test_callback_exception_returns_error(self):
         """Should return error if callback raises exception."""
@@ -148,9 +160,16 @@ class TestClarifySchema:
         assert CLARIFY_SCHEMA["name"] == "clarify"
 
 
-    def test_max_choices_is_four(self):
-        """MAX_CHOICES constant should be 4."""
-        assert MAX_CHOICES == 4
+    def test_max_choices_matches_schema_cap(self):
+        """The advertised schema cap must equal the enforced trim.
+
+        A behavior contract, not a snapshot of the number: the model is told a
+        limit in `maxItems` and `_clean_choices` enforces it, so the two drifting
+        apart silently truncates options the model was told it could send.
+        """
+        per_question = CLARIFY_SCHEMA["parameters"]["properties"]["questions"]["items"]
+        assert per_question["properties"]["choices"]["maxItems"] == MAX_CHOICES
+        assert MAX_CHOICES >= 2
 
 
     def test_schema_multi_select_default_false(self):
@@ -240,7 +259,7 @@ class TestClarifyToolMultiSelect:
             choices_passed.extend(choices or [])
             return "a, b, c, d"
 
-        many_choices = ["a", "b", "c", "d", "e", "f"]
+        many_choices = ["a", "b", "c", "d", "e", "f", "g", "h", "i", "j", "k", "l"]
         clarify_tool(
             "Pick some",
             choices=many_choices,
@@ -454,7 +473,9 @@ class TestClarifyBatchValidation:
         clarify_tool(
             "",
             questions=[
-                {"question": "Pick letter", "choices": ["a", "b", "c", "d", "e", "f"]},
+                {"question": "Pick letter", "choices": [
+                    "a", "b", "c", "d", "e", "f", "g", "h", "i", "j", "k", "l",
+                ]},
                 {"question": "Pick layout", "choices": [
                     {"description": "Loose layout"}, "Tight",
                 ]},
@@ -530,6 +551,29 @@ class TestClarifyBatchDispatch:
         ))
         assert result["responses"][0]["user_response"] == "picked"
 
+    def test_batch_callback_preserves_notes_with_matching_answers(self):
+        """Batch notes remain scoped to their response rows and answers stay canonical."""
+        def cb(question, choices, multi_select=False, questions=None):
+            return {
+                "answers": {"q0": "Rebase (Recommended)", "q1": "later"},
+                "notes": {"q0": "Keep the migration commits."},
+            }
+
+        result = json.loads(clarify_tool(
+            "",
+            questions=[
+                {"question": "Which history?", "choices": ["Rebase", "Merge"]},
+                {"question": "When?"},
+            ],
+            callback=cb,
+        ))
+
+        first, second = result["responses"]
+        assert first["user_response"] == "Rebase"
+        assert first["note"] == "Keep the migration commits."
+        assert second["user_response"] == "later"
+        assert "note" not in second
+
     def test_batch_recommended_label_stripped_per_question(self):
         def cb(question, choices, multi_select=False, questions=None):
             return {"answers": {"q0": questions[0]["choices"][0]}}
@@ -570,6 +614,21 @@ class TestClarifyBatchDispatch:
         assert result["timed_out"] is True
         assert result["responses"][0]["user_response"] == "kept"
         assert result["responses"][1]["user_response"] == ""
+
+    def test_batch_cancelled_flag_is_distinct_from_timeout_and_skip(self):
+        """A stopped turn must not be indistinguishable from deliberately skipping every row."""
+        from tools.clarify_tool import CANCELLED_RESPONSE
+
+        def cb(question, choices, multi_select=False, questions=None):
+            return CANCELLED_RESPONSE
+
+        result = json.loads(clarify_tool(
+            "", questions=[{"question": "One?"}, {"question": "Two?"}], callback=cb,
+        ))
+
+        assert result["cancelled"] is True
+        assert "timed_out" not in result
+        assert [row["user_response"] for row in result["responses"]] == ["", ""]
 
     def test_batch_empty_response_is_skip_not_timeout(self):
         """A cancel-all resolves every answer empty with no timed_out flag."""
@@ -656,6 +715,25 @@ class TestClarifyBatchDispatch:
             "Color?", choices=["red", "blue"], callback=cb,
         ))
         assert set(result.keys()) == {"question", "choices_offered", "user_response"}
+
+    def test_single_cancel_and_timeout_are_distinct_from_deliberate_skip(self):
+        """Only an actual Skip has an answered-empty result without a terminal reason."""
+        from tools.clarify_tool import CANCELLED_RESPONSE, TIMEOUT_RESPONSE
+
+        def result_for(raw):
+            return json.loads(clarify_tool("Continue?", callback=lambda *_args: raw))
+
+        skipped = result_for("")
+        cancelled = result_for(CANCELLED_RESPONSE)
+        timed_out = result_for(TIMEOUT_RESPONSE)
+
+        assert skipped == {
+            "question": "Continue?", "choices_offered": None, "user_response": "",
+        }
+        assert cancelled["user_response"] == "" and cancelled["cancelled"] is True
+        assert "timed_out" not in cancelled
+        assert timed_out["user_response"] == "" and timed_out["timed_out"] is True
+        assert "cancelled" not in timed_out
 
 
 class TestRegistryBatchPassThrough:

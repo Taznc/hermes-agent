@@ -27,7 +27,7 @@ import { ExternalLink, Save, Trash2 } from '@/lib/icons'
 import { normalize } from '@/lib/text'
 import { cn } from '@/lib/utils'
 import { $changeEventsAvailable, $pairingChangeTick, $platformsChangeTick } from '@/store/live-sync'
-import { notify, notifyError } from '@/store/notifications'
+import { dismissNotification, notify, notifyError, readableError } from '@/store/notifications'
 import { $settingsRequestProfile } from '@/store/settings-scope'
 import { runGatewayRestart } from '@/store/system-actions'
 
@@ -47,6 +47,10 @@ interface MessagingViewProps extends React.ComponentProps<'section'> {
 }
 
 type EditMap = Record<string, Record<string, string>>
+
+// Stable id so a repeated silent-refresh failure toast de-dupes/replaces
+// itself instead of stacking, and so a subsequent success can dismiss it.
+const MESSAGING_SILENT_REFRESH_FAILED_ID = 'messaging-silent-refresh-failed'
 
 const PILL_TONE: Record<StatusTone, string> = {
   good: 'bg-primary/10 text-primary',
@@ -148,6 +152,11 @@ export function MessagingView({ setStatusbarItemGroup: _setStatusbarItemGroup, .
   const [saving, setSaving] = useState<string | null>(null)
   const platformIds = useMemo(() => platforms?.map(p => p.id) ?? [], [platforms])
   const [selectedId, setSelectedId] = useRouteEnumParam('platform', platformIds, platformIds[0] ?? '')
+  // Consecutive silent-refresh failures — surfaced once via a de-duped toast
+  // (stable id) rather than on every poll tick, so a dead backend doesn't
+  // spam the user but also doesn't get masked indefinitely (#silent-refresh).
+  const silentFailureStreakRef = useRef(0)
+  const SILENT_FAILURE_NOTIFY_THRESHOLD = 3
 
   const refreshPlatforms = useCallback(
     async (silent = false) => {
@@ -158,9 +167,33 @@ export function MessagingView({ setStatusbarItemGroup: _setStatusbarItemGroup, .
       try {
         const result = await getMessagingPlatforms(scopeProfile)
         setPlatforms(result.platforms)
+
+        if (silentFailureStreakRef.current >= SILENT_FAILURE_NOTIFY_THRESHOLD) {
+          dismissNotification(MESSAGING_SILENT_REFRESH_FAILED_ID)
+        }
+
+        silentFailureStreakRef.current = 0
       } catch (err) {
         if (!silent) {
           notifyError(err, m.loadFailed)
+        } else {
+          silentFailureStreakRef.current += 1
+
+          if (silentFailureStreakRef.current === SILENT_FAILURE_NOTIFY_THRESHOLD) {
+            // Background refreshes fail silently by default so a single
+            // transient hiccup doesn't toast — but repeated failures can mask
+            // a dead backend indefinitely, so surface it once here, with a
+            // stable id so it doesn't stack on every subsequent poll.
+            const readable = readableError(err, m.loadFailed)
+
+            notify({
+              detail: readable.detail,
+              id: MESSAGING_SILENT_REFRESH_FAILED_ID,
+              kind: 'error',
+              message: readable.message,
+              title: m.loadFailed
+            })
+          }
         }
       } finally {
         if (!silent) {

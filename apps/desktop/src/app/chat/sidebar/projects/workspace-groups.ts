@@ -119,6 +119,25 @@ export const DEFAULT_BRANCH_LABEL = 'main'
 export const NO_PROJECT_ID = '__no_project__'
 
 /**
+ * Home is a catch-all, not a folder, so it does NOT fold across profiles the way
+ * a shared checkout does: the all-profiles fan-out re-keys a non-default
+ * profile's bucket to `__no_project__::<profile>` (see `_scope_home_to_profile`
+ * in `hermes_cli/web_routers/profiles.py`). Without that, a worker profile's
+ * cwd-less provisioning chatter sits in the user's own Home, where archiving it
+ * looks like a no-op. `default` keeps the bare id so scope/new-session
+ * behaviour keyed on `NO_PROJECT_ID` is unchanged for the common case.
+ */
+export const homeProjectId = (profile?: null | string): string => {
+  const name = (profile ?? '').trim()
+
+  return !name || name === 'default' ? NO_PROJECT_ID : `${NO_PROJECT_ID}::${name}`
+}
+
+/** True for the Home bucket of ANY profile — never compare against `NO_PROJECT_ID` alone. */
+export const isHomeProjectId = (id?: null | string): boolean =>
+  id === NO_PROJECT_ID || (id ?? '').startsWith(`${NO_PROJECT_ID}::`)
+
+/**
  * A session with nowhere to be placed: no cwd and no recorded repo root. These
  * are the rows the Home bucket owns, and the only ones the live overlay can
  * hand it — a row WITH a cwd that the backend still couldn't place (junk root,
@@ -521,6 +540,21 @@ function liveLaneForRepo(repoRoot: string, session: SessionInfo): null | Sidebar
 const NO_REMOVED: ReadonlySet<string> = new Set()
 
 /**
+ * A live row this project/repo/lane merge must never place. The backend tree
+ * (overview preview and drilled-in lanes alike) already excludes archived
+ * rows at the source (`list_sessions_rich(include_archived=False)`), but the
+ * `live` cache these overlay functions merge in is NOT re-filtered the same
+ * way: a session can be archived by any surface other than this desktop's own
+ * archive action (CLI, another client, a bulk operation), and a stale
+ * `$sessions` entry — e.g. one a background tile's title-backfill re-fetched
+ * by id, or one `keep`-protected by a pin — can carry `archived: true` right
+ * back into the merge. Without this predicate every overlay below would place
+ * it into a project lane and it would never leave until a full backend
+ * snapshot refresh happened to coincide with a re-render.
+ */
+const isLiveArchived = (session: SessionInfo): boolean => session.archived === true
+
+/**
  * Reconcile ONE repo's lanes against the live `$sessions` cache: evict
  * deleted/archived rows (`removed`) and inject freshly-created ones, so a lane
  * mutates exactly like the flat Recents list. The backend snapshot stays the
@@ -556,7 +590,7 @@ export function overlayRepoLanes(
   for (const session of live) {
     const sessionPath = livePathForRepo(repo.path ?? '', session)
 
-    if (removed.has(session.id) || !sessionPath) {
+    if (removed.has(session.id) || isLiveArchived(session) || !sessionPath) {
       continue
     }
 
@@ -663,7 +697,15 @@ function overlayHomeLane(
   removed: ReadonlySet<string>
 ): SidebarProjectTree {
   const lane = project.repos[0]?.groups[0]
-  const detached = live.filter(session => isDetachedSession(session) && !removed.has(session.id))
+  // Another profile's Home owns rows THIS client's live list never carries, so
+  // only the launch profile's bucket absorbs detached live sessions; a foreign
+  // Home stays exactly as its own store reported it.
+  const ownsLive = project.id === NO_PROJECT_ID
+
+  const detached = ownsLive
+    ? live.filter(session => isDetachedSession(session) && !removed.has(session.id) && !isLiveArchived(session))
+    : []
+
   const kept = (lane?.sessions ?? []).filter(session => !removed.has(session.id))
 
   if (!detached.length && kept.length === (lane?.sessions.length ?? 0)) {
@@ -671,11 +713,11 @@ function overlayHomeLane(
   }
 
   const sessions = detached.reduce(upsertSession, kept)
-  const nextLane = { id: NO_PROJECT_ID, label: project.label, path: null, sessions }
+  const nextLane = { id: project.id, label: project.label, path: null, sessions }
 
   return {
     ...project,
-    repos: [{ id: NO_PROJECT_ID, label: project.label, path: null, groups: [nextLane], sessionCount: sessions.length }],
+    repos: [{ id: project.id, label: project.label, path: null, groups: [nextLane], sessionCount: sessions.length }],
     sessionCount: sessions.length
   }
 }
@@ -803,10 +845,13 @@ export function overlayLivePreviews(
   const byProject = new Map<string, SessionInfo[]>()
 
   for (const session of live) {
-    if (removed.has(session.id)) {
+    if (removed.has(session.id) || isLiveArchived(session)) {
       continue
     }
 
+    // A detached live row belongs to THIS client's own Home. Foreign profiles'
+    // Home buckets get their rows from their own store's snapshot, never from
+    // the local live list (`homeProjectId` keys those separately).
     const projectId = sessionBucketId(session, explicitProjects)
 
     if (!projectId) {
@@ -822,7 +867,7 @@ export function overlayLivePreviews(
 
   for (const node of projects) {
     const liveRows = byProject.get(node.id) ?? []
-    const base = (node.previewSessions ?? []).filter(session => !removed.has(session.id))
+    const base = (node.previewSessions ?? []).filter(session => !removed.has(session.id) && !isLiveArchived(session))
 
     if (!liveRows.length && !base.length) {
       continue

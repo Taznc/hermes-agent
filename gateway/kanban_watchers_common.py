@@ -46,8 +46,15 @@ def _board_slugs(kb: Any) -> list:
     return [b.get("slug") or kb.DEFAULT_BOARD for b in _list_boards(kb)]
 
 
-def _positive_int_setting(kanban_cfg: dict, key: str) -> Optional[int]:
-    """Parse an optional ``kanban.<key>`` int cap; None when unset or invalid (< 1 is invalid)."""
+def _positive_int_setting(kanban_cfg: dict, key: str, *, quiet: bool = False) -> Optional[int]:
+    """Parse an optional ``kanban.<key>`` int cap; None when unset or invalid (< 1 is invalid).
+
+    ``quiet`` suppresses only the success INFO line, for callers that re-read
+    settings on every dispatcher tick — logging the same cap once a minute
+    forever buries real events. Warnings about *invalid* values are never
+    suppressed: a malformed cap is a standing misconfiguration the operator
+    still needs to see.
+    """
     raw = kanban_cfg.get(key)
     if raw is None:
         return None
@@ -59,7 +66,8 @@ def _positive_int_setting(kanban_cfg: dict, key: str) -> Optional[int]:
     if value < 1:
         logger.warning("kanban dispatcher: kanban.%s=%r is below 1; ignoring", key, raw)
         return None
-    logger.info("kanban dispatcher: %s=%d", key, value)
+    if not quiet:
+        logger.info("kanban dispatcher: %s=%d", key, value)
     return value
 
 

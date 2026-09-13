@@ -1,7 +1,11 @@
 import { parseMarkdownIntoBlocks } from '@assistant-ui/react-streamdown'
-import { describe, expect, it } from 'vitest'
+import { beforeEach, describe, expect, it } from 'vitest'
 
-import { parseMarkdownIntoBlocksCached } from './markdown-blocks'
+import {
+  __exactCacheStatsForTests,
+  __resetMarkdownBlocksCachesForTests,
+  parseMarkdownIntoBlocksCached
+} from './markdown-blocks'
 
 // The contract: streaming through the cached splitter (one call per growing
 // prefix, exactly how Streamdown calls it per flush) must produce, at every
@@ -161,4 +165,50 @@ describe('parseMarkdownIntoBlocksCached', () => {
       }
     }
   }, 30_000)
+})
+
+describe('exact-cache byte budget', () => {
+  beforeEach(() => {
+    __resetMarkdownBlocksCachesForTests()
+  })
+
+  it('evicts oldest entries once the tracked byte budget is exceeded', () => {
+    // Each distinct text is ~200KB; 4MB / 200KB ≈ 20 entries fit, so pushing
+    // 40 distinct large texts through must evict roughly half of them rather
+    // than retaining all 40 the way a count-256 cap would.
+    const big = 'x'.repeat(100_000)
+
+    for (let i = 0; i < 40; i++) {
+      parseMarkdownIntoBlocksCached(`${big} unique-${i}`)
+    }
+
+    const stats = __exactCacheStatsForTests()
+
+    expect(stats.entries).toBeLessThan(40)
+    expect(stats.totalBytes).toBeLessThanOrEqual(4 * 1024 * 1024)
+  })
+
+  it('keeps small, frequently-used texts cached well past the old 256-entry cap', () => {
+    // Historically a 257th distinct SHORT text would evict the very first one
+    // even though total memory was trivial. The byte budget must not evict
+    // while comfortably under budget.
+    for (let i = 0; i < 300; i++) {
+      parseMarkdownIntoBlocksCached(`short message ${i}`)
+    }
+
+    const stats = __exactCacheStatsForTests()
+
+    expect(stats.entries).toBe(300)
+  })
+
+  it('a cache hit does not change the tracked total (no double counting)', () => {
+    const text = 'y'.repeat(50_000)
+    parseMarkdownIntoBlocksCached(text)
+    const after1 = __exactCacheStatsForTests().totalBytes
+
+    parseMarkdownIntoBlocksCached(text)
+    const after2 = __exactCacheStatsForTests().totalBytes
+
+    expect(after2).toBe(after1)
+  })
 })

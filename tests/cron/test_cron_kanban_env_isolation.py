@@ -391,6 +391,13 @@ def test_dispatcher_grants_only_the_assigned_worker_scope(tmp_path, monkeypatch)
     monkeypatch.setenv("HOME", str(tmp_path))
     db = tmp_path / "board.db"
     monkeypatch.setenv("HERMES_KANBAN_DB", str(db))
+    # Point the kanban HOME at the same tmp dir the board lives in, so the DB pin
+    # resolves UNDER it and the fork's stale-pin guard (kanban_db._pin_is_honored)
+    # honors it on the containment arm. Setting HERMES_KANBAN_PIN_HOME instead
+    # would test the intent-stamp escape hatch, which scrub_kanban_env
+    # deliberately strips from descendants — not what this fixture is about.
+    monkeypatch.setenv("HERMES_KANBAN_HOME", str(tmp_path))
+    monkeypatch.delenv("HERMES_KANBAN_PIN_HOME", raising=False)
     conn = connect(db)
     tid = kb.create_task(conn, title="assigned child", assignee="default")
     kb.claim_task(conn, tid)

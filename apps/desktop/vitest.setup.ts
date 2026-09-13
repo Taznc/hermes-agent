@@ -1,4 +1,5 @@
 import { configure } from '@testing-library/react'
+import { afterEach } from 'vitest'
 
 // Node 26 defines its own `localStorage` accessor on the global object, which
 // returns `undefined` unless the process was started with --localstorage-file
@@ -44,3 +45,20 @@ if (typeof (globalThis as any).localStorage === 'undefined') {
 // as the 15s testTimeout above it while still finishing below it, so a
 // genuinely hung await still surfaces as this assertion, not a test timeout.
 configure({ asyncUtilTimeout: 12_000 })
+
+// A component's poll loop (store/local-runtime-jobs.ts's watchLocalRuntimeJobs)
+// is deliberately designed to outlive its mounting component — that's what lets
+// a download survive the settings pane unmounting. In this suite the loop must
+// still die with the FILE that started it: vitest's pool workers reuse one
+// process across many test files, and a timer left running past its owning
+// file's teardown fires while an unrelated file executes, throwing
+// `ReferenceError: window is not defined` on whatever test happens to be
+// running (#t_fc026713 — moved between files/worker counts, which was the
+// signature that the fault wasn't in the file the error surfaced in). One
+// global afterEach here — rather than a per-file afterEach every caller has to
+// remember — guarantees no run's poll survives past its test.
+afterEach(async () => {
+  const { resetLocalRuntimeJobsForTests } = await import('@/store/local-runtime-jobs')
+
+  resetLocalRuntimeJobsForTests()
+})

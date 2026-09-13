@@ -489,17 +489,30 @@ def auth_reset_command(args) -> None:
     provider = _normalize_provider(getattr(args, "provider", ""))
     target = getattr(args, "target", None)
     pool = load_pool(provider)
-    if target is None or not str(target).strip():
-        count = pool.reset_statuses()
-        print(f"Reset status on {count} {provider} credentials")
+    if target is not None and str(target).strip():
+        index, matched, error = pool.resolve_target(target)
+        if matched is None or index is None:
+            raise SystemExit(f"{error} Provider: {provider}.")
+        cleared = pool.reset_status(matched.id)
+        if cleared is None:
+            raise SystemExit(f'No credential matching "{target}" for provider {provider}.')
+        print(f"Reset status on {provider} credential #{index} ({cleared.label})")
         return
-    index, matched, error = pool.resolve_target(target)
-    if matched is None or index is None:
-        raise SystemExit(f"{error} Provider: {provider}.")
-    cleared = pool.reset_status(matched.id)
-    if cleared is None:
-        raise SystemExit(f'No credential matching "{target}" for provider {provider}.')
-    print(f"Reset status on {provider} credential #{index} ({cleared.label})")
+    report = pool.reset_statuses_report()
+    if report.ok:
+        print(f"Reset status on {report.cleared} {provider} credentials")
+        return
+    # Never report an in-memory clear as a result: the 2026-09-07 incident printed
+    # success while both rows stayed exhausted on disk.
+    print(f"Reset only {report.cleared} of {report.requested} {provider} credentials")
+    if report.error:
+        print(f"Failed to persist the reset: {report.error}")
+    else:
+        print(
+            "The remaining rows are still in cooldown on disk — another Hermes process "
+            "may have re-recorded them. Re-run after stopping other Hermes processes."
+        )
+    raise SystemExit(1)
 
 
 def auth_refresh_command(args) -> None:

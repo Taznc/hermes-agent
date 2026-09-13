@@ -23,7 +23,7 @@ export interface McpOAuthFlow {
 }
 
 /** Connect to the server, list its tools, disconnect. Slow (spawns/handshakes
- *  for real) — well past the 15s default fetch timeout. */
+ *  for real) — well past the 30s default fetch timeout. */
 export function testMcpServer(name: string, profile?: ProfileScope): Promise<McpTestResult> {
   return window.hermesDesktop.api<McpTestResult>({
     ...capabilityScoped(profile),

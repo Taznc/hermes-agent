@@ -530,6 +530,18 @@ def _billing_or_entitlement_message(
     ])
 
 
+# >>> FORK ANCHOR: rate-limit-reset-resolution <<< (Phase 2.12; body in hermes_fork.rate_limit_recovery)
+def _resolve_rate_limit_reset_at(agent, classified) -> Optional[float]:
+    from hermes_fork.rate_limit_recovery import resolve_rate_limit_reset_at as _impl
+    return _impl(agent, classified)
+
+
+# >>> FORK ANCHOR: fallback-chain-availability <<< (Phase 2.12; body in hermes_fork.rate_limit_recovery)
+def _fallback_availability(agent) -> Optional[bool]:
+    from hermes_fork.rate_limit_recovery import fallback_availability as _impl
+    return _impl(agent)
+
+
 def _billing_block_dict(provider, base_url, model, message="", *, unverified: bool = False) -> Optional[dict]:
     """Best-effort structured billing descriptor (None if billing_links is unavailable)."""
     try:
@@ -558,6 +570,7 @@ def _billing_terminal_label(summary: str, unverified: bool) -> str:
 def _billing_failure_result(
     *, classified, summary: str, messages, api_call_count: int, provider: str, base_url, model: str,
     guidance: Optional[str] = None,
+    agent=None,
 ) -> dict:
     """Structured terminal result for a billing-classified failure — the single construction
     point for the non-retryable abort and max-retries paths (#82154)."""
@@ -568,7 +581,7 @@ def _billing_failure_result(
             unverified=unverified,
         )
     final = _billing_terminal_label(summary, unverified) + (f"\n\n{guidance}" if guidance else "")
-    return {
+    result = {
         "final_response": final, "messages": messages, "api_calls": api_call_count,
         "completed": False, "failed": True, "error": summary,
         "failure_reason": classified.reason.value,
@@ -577,6 +590,15 @@ def _billing_failure_result(
         "billing_unverified": unverified,
         "billing_block": _billing_block_dict(provider, base_url, model, guidance, unverified=unverified),
     }
+    # Phase 2.12: fallback-chain visibility, independent of the billing verdict itself — a billing
+    # wall can still have an untried fallback entry. reset_at is intentionally NOT populated here:
+    # billing has no "resets at X" semantics (agent/error_surface.py's _RATE_LIMIT_RESET_REASONS
+    # gates on reason, so a stray reset_at would be dropped anyway; omitting it keeps this honest).
+    if agent is not None:
+        fallback_available = _fallback_availability(agent)
+        if fallback_available is not None:
+            result["fallback_available"] = fallback_available
+    return result
 
 
 def _print_billing_or_entitlement_guidance(

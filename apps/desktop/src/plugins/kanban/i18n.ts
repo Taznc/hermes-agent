@@ -16,7 +16,18 @@ type KanbanMessages = {
   newTaskCommand: string
   countTip: (running: number, ready: number) => string
   col: Record<
-    'archived' | 'blocked' | 'done' | 'ready' | 'review' | 'running' | 'scheduled' | 'todo' | 'triage',
+    | 'archived'
+    | 'blocked'
+    | 'done'
+    | 'idea'
+    | 'on_hold'
+    | 'ready'
+    | 'review'
+    | 'roadmap'
+    | 'running'
+    | 'scheduled'
+    | 'todo'
+    | 'triage',
     { label: string; help: string }
   >
   locked: { review: string; running: string; scheduled: string }
@@ -33,6 +44,8 @@ type KanbanMessages = {
   deselect: string
   moveTo: (label: string) => string
   delete: string
+  // per-card "send to roadmap ideas" (Phase 2.15 follow-up)
+  sendToRoadmap: string
   reviewChecking: string
   attachedTip: (name: string) => string
   orchestratorTip: (name: string) => string
@@ -55,13 +68,27 @@ type KanbanMessages = {
   assign: string
   unassignAction: string
   archive: string
+  archiveDone: string
+  archiveDoneConfirm: (count: number, scope: string) => string
+  archiveDonePartial: (archived: number, failed: number, skipped: number) => string
+  archiveDoneSuccess: (archived: number) => string
+  archiveDoneBackground: string
+  archiveDoneFailed: (message: string) => string
   clearSelection: string
   refused: string
   bulkFailed: (failed: number, total: number, err: string) => string
   titlePlaceholderTriage: string
   titlePlaceholder: string
   descPlaceholder: string
+  pastedImages: (n: number) => string
+  removeImage: string
+  imagePasteFailed: string
   priority: string
+  priorityCritical: string
+  priorityHigh: string
+  priorityNormal: string
+  priorityLow: string
+  priorityCustom: (value: number) => string
   workspace: string
   boardDefaultSuffix: string
   workspaceOverride: string
@@ -95,6 +122,15 @@ type KanbanMessages = {
   tokUnit: string
   couldNotEstimate: string
   complexity: Record<'L' | 'M' | 'S', string>
+  // idea capture (Phase 2.15) — free-typed roadmap idea, board header
+  ideaTitle: string
+  ideaHint: string
+  ideaPlaceholder: string
+  ideaSave: string
+  ideaSaving: string
+  ideaSaved: string
+  ideaEmpty: string
+  ideaUnavailable: string
   introBody: string
   introGotIt: string
   // drawer — activity prose
@@ -116,26 +152,137 @@ type KanbanMessages = {
   evtScheduled: string
   evtArchived: string
   evtReprioritized: (priority: string) => string
+  evtGaveUp: string
+  evtCrashed: string
+  evtTimedOut: string
+  evtProtocolViolation: string
+  evtReviewNoVerdict: string
+  evtReviewRoundCap: string
+  evtStale: string
+  evtDependencyWait: string
+  evtBlockLoop: string
+  evtHeld: string
   someone: string
   // drawer — meta + sections
+  metaSectionLabel: string
   metaPriority: string
   metaTenant: string
   metaCreatedBy: string
   metaCreated: string
+  metaRun: string
+  metaRunStarted: string
+  metaRunCount: (n: number) => string
   metaWorkerPid: string
   readyUnassignedTitle: string
   readyUnassignedBody: string
   diagnosticsN: (n: number) => string
+  // Call-to-action banner — the top-of-drawer answer to "why is this stuck
+  // and what do I do about it" for blocked/review tasks.
+  ctaBlockedTitle: string
+  ctaInitialBlockTitle: string
+  ctaBlockedNoReason: string
+  ctaBlockedAutomaticTitle: string
+  ctaReviewNoVerdictTitle: string
+  ctaReviewNoVerdictBody: string
+  // The dispatcher's hard stop on a runaway review<->changes_requested loop.
+  // Counted variant is used whenever the event payload carried both numbers.
+  ctaReviewRoundCapTitle: string
+  ctaReviewRoundCapTitleCounted: (rounds: number, max: number) => string
+  ctaReviewRoundCapBody: string
+  ctaRequeueReview: string
+  ctaRetry: string
+  ctaCopyLogCommand: string
+  ctaReply: string
+  ctaUnblock: string
+  ctaReviewTitle: string
+  ctaReviewBody: string
+  ctaApprove: string
+  ctaSendBack: string
+  blockKind: Record<'capability' | 'needs_input' | 'transient', string>
+  // Plain-English "what happened / what to do" for a task's CURRENT status,
+  // rendered below the CTA banner for every status (see status-guidance.ts).
+  guideAssignReady: string
+  guideReadyQueued: string
+  guideTodo: string
+  guideTriage: string
+  guideBlockLoop: (reason: string) => string
+  // Confirmation when a loop-broken triage card is dragged back into the work
+  // queue — the backend refuses the bare drag (409); this explains why.
+  blockLoopConfirmTitle: string
+  blockLoopConfirmBody: (title: string, column: string) => string
+  blockLoopConfirmAction: string
+  guideScheduled: string
+  guideRunning: string
+  guideRunningStale: string
+  guideOnHold: string
+  guideReview: string
+  guideDone: string
+  guideBlockedGeneric: string
+  guideBlockedManualCapability: string
+  guideBlockedManualTransient: string
+  guideBlockedAutomatic: (cause: string) => string
+  guideBlockedReviewNoVerdict: string
+  guideBlockedReviewRoundCap: string
+  guideBlockedUnknown: string
+  // Wishlist lanes (idea/roadmap). Calm and non-nagging by decision: these
+  // cards are not late, not stalled, and carry no age/staleness warning.
+  guideIdea: string
+  guideRoadmap: string
+  // Roadmap lane visibility toggle + the compact pill shown while hidden.
+  roadmapHideLanes: string
+  roadmapShowLanes: string
+  roadmapPill: (count: number) => string
+  // Per-card lane actions (roadmap cards only).
+  laneRefine: string
+  laneDemote: string
+  laneSpawnTriage: string
+  laneSpawnReady: string
+  spawnReadyTitle: string
+  spawnReadyBody: string
+  spawnReadyConfirm: string
+  /** Client-side invalid-drop feedback. Mirrors the DB layer's own refusal
+   *  wording so a locally-refused move and a server 400 read the same. */
+  laneDropRefused: (from: string, to: string) => string
+  // Structured multiple-choice question rendering (blocked-callout options).
+  choicesGroupLabel: string
+  choiceSubmitError: string
+  choiceRetry: string
   commandCopied: string
   description: string
   editDescription: string
   cancelEdit: string
   noDescription: string
+  /** Collapsed-description affordance (Overview tab). */
+  showMore: string
+  showLess: string
+  /** Drawer tab strip — Overview / Activity / Log. */
+  tabOverview: string
+  tabActivity: string
+  tabLog: string
+  /** Empty states for the two non-Overview tabs. */
+  noActivityYet: string
+  noLogYet: string
   result: string
   latestSummary: string
   dependencies: string
   blockedBy: string
   blocks: string
+  /** Dependency-chain UI (drawer rows + card chips + board focus). */
+  depGating: string
+  depSatisfied: string
+  depBlockedByCount: (n: number) => string
+  depBlocksCount: (n: number) => string
+  depClear: string
+  depClearTip: string
+  depUnlink: string
+  depUnlinkTip: string
+  depMissing: string
+  depMissingTip: string
+  depWaitingBanner: (gating: number, total: number) => string
+  depFocusHint: string
+  depFocusUpstream: string
+  depFocusDownstream: string
+  depClearFocus: string
   comments: (n: number) => string
   commentsHelpRunning: string
   commentsHelp: string
@@ -147,12 +294,35 @@ type KanbanMessages = {
   requeueWithNote: string
   notePosted: string
   activity: (n: number) => string
+  /** Collapsed-run summary for identical consecutive activity events, e.g.
+   *  "heartbeat ×6 · last 46 sec. ago". */
+  activityRun: (label: string, n: number, ago: string) => string
   runs: (n: number) => string
+  /** Rollup badge next to the Runs section header when at least one run failed. */
+  runsFailedCount: (n: number) => string
+  // Plain-language framing for the raw dispatcher diagnostics that land in
+  // `run.error` — the human summary is primary; the raw string stays
+  // available behind an expand toggle (see runErrRaw / expand / collapse).
+  runErrStaleLock: string
+  runErrPidNotAlive: string
+  runErrPidExited: (code: string) => string
+  runErrPidSignaled: (signal: string) => string
+  runErrRaw: string
   workerLog: string
   workerLogTail: string
+  /** The active artifact was capped/rotated by the worker; this tells the
+   * reader it is seeing every retained byte, not a UI-paginated tail. */
+  workerLogRetained: string
+  workerLogLive: string
+  workerLogPaused: string
+  workerLogWrap: string
+  workerLogJumpToLatest: string
   attachments: (n: number) => string
   noAttachments: string
   uploadAttachment: string
+  images: (n: number) => string
+  brokenImage: string
+  openImage: string
   taskActions: string
   copyTaskId: string
   copyTitle: string
@@ -162,6 +332,7 @@ type KanbanMessages = {
   working: string
   // board switcher
   board: string
+  allBoards: string
   newBoard: string
   newBoardDots: string
   // Menu labels are bare verbs — the board they act on is the one named in the
@@ -189,6 +360,14 @@ type KanbanMessages = {
   projectHintPre: string
   projectHintCmd: string
   createBoard: string
+  // All Boards (consolidated view)
+  toggleBoard: (name: string) => string
+  boardsFailedNotice: (names: string) => string
+  /** New-task dialog board picker, shown only under the All Boards sentinel:
+   *  the view has no implied board, so the target is asked for rather than
+   *  resolved silently to whichever board happens to be active. */
+  pickBoard: string
+  pickBoardHint: string
   // orchestration
   orchestratorProfile: string
   defaultAssignee: string
@@ -198,15 +377,45 @@ type KanbanMessages = {
   profileDescriptionsHint: string
   profileGoodAt: string
   auto: string
+  // dispatch pause / maintenance drain
+  dispatchControl: string
+  pauseDispatch: string
+  resumeDispatch: string
+  draining: (running: number) => string
+  safeToRestart: string
+  dispatchRunning: string
+  pauseBusy: string
+  resumeBusy: string
+  pauseAllBoards: string
+  resumeAllBoards: string
+  boardsPaused: (paused: number, total: number) => string
+  pauseHint: string
+  /** "After drain" action queue. */
+  queuePostDrain: string
+  cancelPostDrain: string
+  actionServiceRestart: (target: string) => string
+  actionRunScript: (name: string) => string
+  actionReboot: string
+  confirmRebootPrompt: string
+  confirmReboot: string
+  cancelConfirm: string
+  postDrainArmed: (action: string, running: number, remaining: string) => string
+  postDrainArmedDrained: (action: string, remaining: string) => string
+  postDrainFiring: (action: string) => string
+  postDrainSucceeded: (action: string) => string
+  postDrainFailed: (action: string, error: string) => string
+  postDrainExpired: (action: string) => string
+  postDrainCancelled: (action: string) => string
   // native/toast notifications for terminal worker events (completion-notify)
   notify: {
     completedTitle: string
     blockedTitle: string
     blockLoopTitle: string
-    gaveUpTitle: string
+    gaveUpTitle: (cause?: string) => string
     crashedTitle: string
     timedOutTitle: string
     openKanban: string
+    openCard: string
     artifacts: (n: number) => string
   }
 }
@@ -222,10 +431,16 @@ export const en: KanbanMessages = {
     scheduled: { label: 'Scheduled', help: 'Waiting for a scheduled time to arrive.' },
     ready: { label: 'Ready', help: 'Dependencies satisfied — assign a profile and the dispatcher runs it.' },
     running: { label: 'Running', help: 'Claimed by a worker — an agent is on it. Set by the dispatcher.' },
-    blocked: { label: 'Blocked', help: 'The worker asked for human input.' },
+    blocked: {
+      label: 'Blocked',
+      help: 'Needs a look — a worker\u2019s question, an automatic failure, or a reviewer with no verdict.'
+    },
+    on_hold: { label: 'On Hold', help: 'Shelved by a human — drag back to Ready when you want it resumed.' },
     review: { label: 'Review', help: 'A review agent is checking the work. Set by the dispatcher.' },
     done: { label: 'Done', help: 'Completed; dependent children become ready.' },
-    archived: { label: 'Archived', help: 'Hidden from the default board view.' }
+    archived: { label: 'Archived', help: 'Hidden from the default board view.' },
+    idea: { label: 'Ideas', help: 'Rough capture — nothing here runs, and nothing here is late.' },
+    roadmap: { label: 'Roadmap', help: 'Hashed out but not authorized — spawn it to start work.' }
   },
   locked: {
     review: 'Review is entered by the dispatcher when a review agent takes the card.',
@@ -245,6 +460,7 @@ export const en: KanbanMessages = {
   deselect: 'Deselect',
   moveTo: label => `Move to ${label}`,
   delete: 'Delete',
+  sendToRoadmap: 'Send to roadmap ideas',
   reviewChecking: 'A review agent is checking the completed work.',
   attachedTip: name => `${name} is attached — the dispatcher hands this over on its next tick (≤1m).`,
   orchestratorTip: name => `${name} (the orchestrator) picks this up on the next tick and writes the spec.`,
@@ -268,13 +484,28 @@ export const en: KanbanMessages = {
   assign: 'Assign',
   unassignAction: 'Unassign',
   archive: 'Archive',
+  archiveDone: 'Archive Done',
+  archiveDoneConfirm: (count, scope) => `Archive ${count} completed card${count === 1 ? '' : 's'} from ${scope}?`,
+  archiveDonePartial: (archived, failed, skipped) =>
+    `${archived} completed card${archived === 1 ? '' : 's'} archived; ${failed} failed and ${skipped} skipped.`,
+  archiveDoneSuccess: archived => `${archived} completed card${archived === 1 ? '' : 's'} archived.`,
+  archiveDoneBackground: 'Archiving is still running in the background — check back shortly.',
+  archiveDoneFailed: message => `Could not archive completed cards — ${message}`,
   clearSelection: 'Clear selection (Esc)',
   refused: 'refused',
   bulkFailed: (failed, total, err) => `${failed} of ${total} failed — ${err}. Failed cards stay selected.`,
   titlePlaceholderTriage: 'Rough idea — a specifier will flesh it out',
   titlePlaceholder: 'Title',
   descPlaceholder: 'Description (optional)',
+  pastedImages: n => `Pasted images · ${n}`,
+  removeImage: 'Remove image',
+  imagePasteFailed: 'Could not upload pasted image',
   priority: 'Priority',
+  priorityCritical: 'Critical',
+  priorityHigh: 'High',
+  priorityNormal: 'Normal',
+  priorityLow: 'Low',
+  priorityCustom: value => `Custom (${value})`,
   workspace: 'Workspace',
   boardDefaultSuffix: ' · board default',
   workspaceOverride: 'Workspace path (optional override)',
@@ -308,8 +539,16 @@ export const en: KanbanMessages = {
   tokUnit: 'tok',
   couldNotEstimate: 'Could not estimate',
   complexity: { S: 'Small', M: 'Medium', L: 'Large' },
+  ideaTitle: 'Capture idea',
+  ideaHint: 'Jot a rough idea — it lands as a card in the Ideas lane, ready to refine later.',
+  ideaPlaceholder: 'Rough idea…',
+  ideaSave: 'Save idea',
+  ideaSaving: 'Saving…',
+  ideaSaved: 'Added to Ideas',
+  ideaEmpty: 'Type something before saving.',
+  ideaUnavailable: 'Could not add the idea — nothing was saved.',
   introBody:
-    'You don’t run the cards — agents do. Put a card in Ready with an assignee and an agent picks it up within a minute. No assignee, no run. Triage: an agent rewrites the idea into a proper task first. Todo: waiting on other cards. Scheduled: waiting on a timer. Running and Review: the agents’ lanes, hands off. Blocked: it’s waiting on you. Results come back on the card.',
+    'You don’t run the cards — agents do. Put a card in Ready with an assignee and an agent picks it up within a minute. No assignee, no run. Triage: an agent rewrites the idea into a proper task first. Todo: waiting on other cards. Scheduled: waiting on a timer. Running and Review: the agents’ lanes, hands off. Blocked: something needs a look — open the card for what happened and what to do. Results come back on the card.',
   introGotIt: 'Got it',
   evtCreated: (where, assignee) =>
     `created${where ? ` in ${where}` : ''}${assignee ? ` · assigned to ${assignee}` : ''}`,
@@ -330,26 +569,129 @@ export const en: KanbanMessages = {
   evtScheduled: 'scheduled for later',
   evtArchived: 'archived',
   evtReprioritized: priority => `priority set to ${priority}`,
+  evtGaveUp: 'gave up — automatic failure',
+  evtCrashed: 'worker crashed',
+  evtTimedOut: 'timed out — exceeded the run limit',
+  evtProtocolViolation: 'worker exited without reporting a result',
+  evtReviewNoVerdict: 'reviewer exited without a verdict',
+  evtReviewRoundCap: 'review round cap reached — dispatch stopped',
+  evtStale: 'no progress — reclaimed',
+  evtDependencyWait: 'waiting on a dependency',
+  evtBlockLoop: 'blocked repeatedly — routed to triage',
+  evtHeld: 'put on hold',
   someone: 'someone',
+  metaSectionLabel: 'Details',
   metaPriority: 'Priority',
   metaTenant: 'Tenant',
   metaCreatedBy: 'Created by',
   metaCreated: 'Created',
+  metaRun: 'Run',
+  metaRunStarted: 'Run started',
+  metaRunCount: n => `${n} of ${n}`,
   metaWorkerPid: 'Worker pid',
   readyUnassignedTitle: 'Ready, but unassigned — this card will never run.',
   readyUnassignedBody:
     'The dispatcher only claims Ready cards that have an assignee. Pick a profile in the Assignee field above (or set a default assignee in the orchestration settings) and it runs within a minute.',
   diagnosticsN: n => `Diagnostics · ${n}`,
+  ctaBlockedTitle: 'Blocked — cause unknown',
+  ctaInitialBlockTitle: 'Deliberately blocked at creation',
+  ctaBlockedNoReason: 'No cause is recorded for this block. Check the worker log, or reassign to retry.',
+  ctaBlockedAutomaticTitle: 'Blocked — automatic failure',
+  ctaReviewNoVerdictTitle: 'Reviewer exited without a verdict',
+  ctaReviewNoVerdictBody:
+    'The reviewer\u2019s run ended without approving, requesting changes, or escalating — a neutral outcome, not a failure of the work. Requeue for another review pass.',
+  ctaReviewRoundCapTitle: 'Out of review rounds',
+  ctaReviewRoundCapTitleCounted: (rounds, max) => `Out of review rounds (${rounds}/${max})`,
+  ctaReviewRoundCapBody:
+    'The reviewer sent this back for changes too many times, so the dispatcher stopped re-running it. Decide the intervention — reassign, rescope, or archive — then unblock.',
+  ctaRequeueReview: 'Requeue for review',
+  ctaRetry: 'Retry (Unblock)',
+  ctaCopyLogCommand: 'Copy log command',
+  ctaReply: 'Reply',
+  ctaUnblock: 'Unblock',
+  ctaReviewTitle: 'Needs review',
+  ctaReviewBody: 'A reviewer should check the work below before this is marked done.',
+  ctaApprove: 'Approve (mark done)',
+  ctaSendBack: 'Send back to Ready',
+  blockKind: {
+    needs_input: 'Needs your input',
+    capability: 'Missing a capability',
+    transient: 'Hit a transient failure'
+  },
+  guideAssignReady: 'Dependencies satisfied, but no assignee — pick a profile above or it will never run.',
+  guideReadyQueued: 'Waiting for the dispatcher to claim it — assigned and ready to run within a minute.',
+  guideTodo: 'Waiting on other cards to finish before this one becomes ready.',
+  guideTriage: 'A fresh idea — a specifier agent will flesh it out into a proper task.',
+  guideBlockLoop: reason => `Blocked and re-blocked for the same reason — routed here for a decision: ${reason}`,
+  blockLoopConfirmTitle: 'This card looped — answer it before resuming',
+  blockLoopConfirmBody: (title, column) =>
+    `“${title}” was parked here automatically after blocking twice on the same unanswered question. ` +
+    `Moving it to ${column} without answering that question will start the same loop again. ` +
+    `Answer it in a comment first, then confirm.`,
+  blockLoopConfirmAction: 'Resume anyway',
+  guideScheduled: 'Waiting for its scheduled time to arrive.',
+  guideRunning: 'An agent is actively working on this — nothing to do but wait.',
+  guideRunningStale: 'No heartbeat for 2+ minutes — the dispatcher will reclaim it shortly. Wait, or reclaim now.',
+  guideOnHold: 'Shelved by a human. Drag back to Ready when you want it resumed.',
+  guideReview: 'A reviewer is checking the completed work — approve or send back above.',
+  guideDone: 'Settled — completed, and any dependent cards are now unblocked.',
+  guideBlockedGeneric: 'Needs your input — reply in comments, or unblock to send it back to the queue.',
+  guideBlockedManualCapability:
+    'A missing capability is blocking this — resolve it, then reassign or unblock to retry.',
+  guideBlockedManualTransient: 'A transient failure blocked this — it may clear on its own; unblock to retry.',
+  guideBlockedAutomatic: cause => `${cause} Inspect the worker log, then retry or reassign.`,
+  guideBlockedReviewNoVerdict: 'The reviewer exited without a verdict. Requeue it for another review pass.',
+  guideBlockedReviewRoundCap: 'Review rounds are exhausted — reassign, rescope, or archive it instead of simply retrying.',
+  guideBlockedUnknown: 'Inspect the worker log, then retry or reassign it.',
+  guideIdea: 'Rough idea — refine it into a roadmap item when ready.',
+  guideRoadmap: 'Specified, not yet authorized — spawn to Triage to start work.',
+  roadmapHideLanes: 'Hide Ideas and Roadmap',
+  roadmapShowLanes: 'Show Ideas and Roadmap',
+  roadmapPill: count => `Roadmap · ${count}`,
+  laneRefine: 'Refine to Roadmap',
+  laneDemote: 'Demote to Ideas',
+  laneSpawnTriage: 'Spawn to Triage',
+  laneSpawnReady: 'Spawn to Ready…',
+  spawnReadyTitle: 'Spawn straight to Ready?',
+  spawnReadyBody: 'Skip auto-decompose and dispatch as-is?',
+  spawnReadyConfirm: 'Spawn to Ready',
+  laneDropRefused: (from, to) => `Can’t move a card from ${from} to ${to}.`,
+  choicesGroupLabel: 'Choose an option',
+  choiceSubmitError: 'Could not submit your answer. Try again.',
+  choiceRetry: 'Retry',
   commandCopied: 'Command copied',
   description: 'Description',
   editDescription: 'Edit description',
   cancelEdit: 'Cancel edit',
   noDescription: 'No description yet.',
+  showMore: 'Show more',
+  showLess: 'Show less',
+  tabOverview: 'Overview',
+  tabActivity: 'Activity',
+  tabLog: 'Log',
+  noActivityYet: 'No activity yet.',
+  noLogYet: 'No worker log yet.',
   result: 'Result',
   latestSummary: 'Latest summary',
   dependencies: 'Dependencies',
   blockedBy: 'Blocked by',
   blocks: 'Blocks',
+  depGating: 'Still gating',
+  depSatisfied: 'Satisfied',
+  depBlockedByCount: n => `blocked by ${n}`,
+  depBlocksCount: n => `blocks ${n}`,
+  depClear: 'Blockers clear',
+  depClearTip: 'Every task blocking this one is done — it can move to ready.',
+  depUnlink: 'Remove',
+  depUnlinkTip: 'Remove this dependency. The tasks stay; only the link is cut.',
+  depMissing: 'not on this board',
+  depMissingTip: 'This linked task was deleted, or is hidden by the current tenant/archive filter.',
+  depWaitingBanner: (gating, total) =>
+    total === 1 ? 'Waiting on 1 blocker.' : `Waiting on ${gating} of ${total} blockers.`,
+  depFocusHint: 'Click a card to trace its dependency chain · Esc to clear',
+  depFocusUpstream: 'blocks this',
+  depFocusDownstream: 'waits on this',
+  depClearFocus: 'Clear focus',
   comments: n => `Comments · ${n}`,
   commentsHelpRunning:
     'This task is running. Your note is folded into the worker’s current turn within a few seconds — no block/unblock dance. “Requeue with note” instead restarts the task from scratch with your note in context.',
@@ -363,12 +705,27 @@ export const en: KanbanMessages = {
   requeueWithNote: 'Requeue with note',
   notePosted: 'Note posted — worker requeued',
   activity: n => `Activity · ${n}`,
+  activityRun: (label, n, ago) => `${label} ×${n} · last ${ago}`,
   runs: n => `Runs · ${n}`,
+  runsFailedCount: n => (n === 1 ? '1 failed' : `${n} failed`),
+  runErrStaleLock: 'The worker’s claim expired, so the task was returned to the queue.',
+  runErrPidNotAlive: 'The worker process disappeared unexpectedly.',
+  runErrPidExited: code => `The worker exited with an error (code ${code}).`,
+  runErrPidSignaled: signal => `The worker was killed (signal ${signal}).`,
+  runErrRaw: 'Raw diagnostic',
   workerLog: 'Worker log',
   workerLogTail: 'Worker log · tail',
+  workerLogRetained: 'Worker log · retained',
+  workerLogLive: 'Live · following',
+  workerLogPaused: 'Live · paused',
+  workerLogWrap: 'Wrap lines',
+  workerLogJumpToLatest: 'Jump to latest',
   attachments: n => `Attachments · ${n}`,
   noAttachments: 'No attachments yet.',
   uploadAttachment: 'Upload attachment',
+  images: n => `Images · ${n}`,
+  brokenImage: 'Image unavailable',
+  openImage: 'Open image',
   taskActions: 'Task actions',
   copyTaskId: 'Copy task id',
   copyTitle: 'Copy title',
@@ -377,6 +734,7 @@ export const en: KanbanMessages = {
   close: 'Close',
   working: 'working',
   board: 'Board',
+  allBoards: 'All Boards',
   newBoard: 'New board',
   newBoardDots: 'New board…',
   exportDots: 'Export…',
@@ -402,6 +760,10 @@ export const en: KanbanMessages = {
     'New tasks run in the project’s repo (a worktree per task); each task can still override its workspace at creation. Manage projects with ',
   projectHintCmd: 'hermes project',
   createBoard: 'Create board',
+  toggleBoard: name => `Toggle ${name}`,
+  boardsFailedNotice: names => `Couldn't load: ${names}`,
+  pickBoard: 'Pick a board',
+  pickBoardHint: 'The board this task is created on.',
   orchestratorProfile: 'Orchestrator profile',
   defaultAssignee: 'Default assignee',
   defaultParen: '(default)',
@@ -411,14 +773,44 @@ export const en: KanbanMessages = {
     'Descriptions guide the decomposer’s routing. Auto-generate with the auxiliary model, or write your own.',
   profileGoodAt: 'What is this profile good at?',
   auto: 'Auto',
+  dispatchControl: 'Dispatch',
+  pauseDispatch: 'Pause dispatch',
+  resumeDispatch: 'Resume dispatch',
+  draining: running => `${running} running — draining`,
+  safeToRestart: '0 running — safe to restart',
+  dispatchRunning: 'Dispatching normally',
+  pauseBusy: 'A dispatch tick is in progress — try pausing again in a moment.',
+  resumeBusy: 'A dispatch tick is in progress — try resuming again in a moment.',
+  pauseAllBoards: 'Pause all boards',
+  resumeAllBoards: 'Resume all boards',
+  boardsPaused: (paused, total) => `${paused} of ${total} boards paused`,
+  pauseHint:
+    'Stops new workers being claimed and spawned. Workers already running are never killed — wait for the count to reach 0 before restarting the gateway.',
+  queuePostDrain: 'After drain…',
+  cancelPostDrain: 'Cancel',
+  actionServiceRestart: target => `Restart ${target}`,
+  actionRunScript: name => `Run ${name}`,
+  actionReboot: 'Reboot this machine',
+  confirmRebootPrompt: 'Reboot this machine once every worker has finished?',
+  confirmReboot: 'Yes, reboot after drain',
+  cancelConfirm: 'Keep waiting',
+  postDrainArmed: (action, running, remaining) =>
+    `${action} when drained — ${running} running, expires in ${remaining}`,
+  postDrainArmedDrained: (action, remaining) => `${action} — drained, firing shortly (expires in ${remaining})`,
+  postDrainFiring: action => `${action} — running now`,
+  postDrainSucceeded: action => `${action} — done`,
+  postDrainFailed: (action, error) => `${action} failed — ${error}`,
+  postDrainExpired: action => `${action} expired before the board drained — nothing ran`,
+  postDrainCancelled: action => `${action} cancelled`,
   notify: {
     completedTitle: 'Task completed',
     blockedTitle: 'Task blocked — needs your input',
     blockLoopTitle: 'Task routed to triage — needs a decision',
-    gaveUpTitle: 'Task gave up',
+    gaveUpTitle: cause => (cause ? `Task gave up — ${cause}` : 'Task gave up'),
     crashedTitle: 'Worker crashed — will retry',
     timedOutTitle: 'Task timed out — will retry',
     openKanban: 'Open Kanban',
+    openCard: 'Open card',
     artifacts: (n: number) => `${n} artifacts`
   }
 }
@@ -434,10 +826,13 @@ const ja: KanbanMessages = {
     scheduled: { label: 'スケジュール', help: '予定時刻を待っています。' },
     ready: { label: 'Ready', help: '依存関係が解決済み — プロフィールを割り当てるとディスパッチャが実行します。' },
     running: { label: '実行中', help: 'ワーカーが取得済み — エージェントが作業中。ディスパッチャが設定します。' },
-    blocked: { label: 'ブロック', help: 'ワーカーが人間の入力を求めています。' },
+    blocked: { label: 'ブロック', help: '確認が必要 — ワーカーの質問、自動的な失敗、または判定なしのレビューです。' },
+    on_hold: { label: '保留', help: '人によって保留されました — 再開したい時に Ready へドラッグしてください。' },
     review: { label: 'レビュー', help: 'レビューエージェントが作業を確認中。ディスパッチャが設定します。' },
     done: { label: '完了', help: '完了。依存する子タスクが Ready になります。' },
-    archived: { label: 'アーカイブ', help: 'デフォルトのボード表示から非表示。' }
+    archived: { label: 'アーカイブ', help: 'デフォルトのボード表示から非表示。' },
+    idea: { label: 'アイデア', help: 'ラフな記録 — ここでは何も実行されず、遅延もありません。' },
+    roadmap: { label: 'ロードマップ', help: '仕様は固まっていますが未承認 — スポーンすると作業が始まります。' }
   },
   locked: {
     review: 'レビューは、レビューエージェントがカードを取得するとディスパッチャによって設定されます。',
@@ -457,6 +852,7 @@ const ja: KanbanMessages = {
   deselect: '選択解除',
   moveTo: label => `${label} へ移動`,
   delete: '削除',
+  sendToRoadmap: 'ロードマップのアイデアに送る',
   reviewChecking: 'レビューエージェントが完了した作業を確認中です。',
   attachedTip: name => `${name} が担当 — ディスパッチャが次のティック（≤1分）で引き渡します。`,
   orchestratorTip: name => `${name}（オーケストレーター）が次のティックでこれを取得し、仕様を書きます。`,
@@ -480,13 +876,28 @@ const ja: KanbanMessages = {
   assign: '割り当て',
   unassignAction: '割り当て解除',
   archive: 'アーカイブ',
+  archiveDone: '完了をアーカイブ',
+  archiveDoneConfirm: (count, scope) => `${scope} の完了済みカード ${count} 件をアーカイブしますか？`,
+  archiveDonePartial: (archived, failed, skipped) =>
+    `完了済みカード ${archived} 件をアーカイブ、${failed} 件失敗、${skipped} 件スキップしました。`,
+  archiveDoneSuccess: archived => `完了済みカード ${archived} 件をアーカイブしました。`,
+  archiveDoneBackground: 'アーカイブはバックグラウンドで実行中です。しばらくしてから確認してください。',
+  archiveDoneFailed: message => `完了済みカードをアーカイブできませんでした — ${message}`,
   clearSelection: '選択をクリア（Esc）',
   refused: '拒否されました',
   bulkFailed: (failed, total, err) => `${total} 件中 ${failed} 件が失敗 — ${err}。失敗したカードは選択されたままです。`,
   titlePlaceholderTriage: '大まかなアイデア — スペシファイアが具体化します',
   titlePlaceholder: 'タイトル',
   descPlaceholder: '説明（任意）',
+  pastedImages: n => `貼り付けた画像・${n}`,
+  removeImage: '画像を削除',
+  imagePasteFailed: '貼り付けた画像をアップロードできませんでした',
   priority: '優先度',
+  priorityCritical: '緊急',
+  priorityHigh: '高',
+  priorityNormal: '通常',
+  priorityLow: '低',
+  priorityCustom: value => `カスタム (${value})`,
   workspace: 'ワークスペース',
   boardDefaultSuffix: '・ボード既定',
   workspaceOverride: 'ワークスペースパス（任意の上書き）',
@@ -520,8 +931,16 @@ const ja: KanbanMessages = {
   tokUnit: 'tok',
   couldNotEstimate: '見積もりできませんでした',
   complexity: { S: '小', M: '中', L: '大' },
+  ideaTitle: 'アイデアを記録',
+  ideaHint: 'ラフなアイデアをメモ — アイデアレーンのカードとして追加され、後で整えられます。',
+  ideaPlaceholder: 'ラフなアイデア…',
+  ideaSave: 'アイデアを保存',
+  ideaSaving: '保存中…',
+  ideaSaved: 'アイデアに追加しました',
+  ideaEmpty: '保存する前に入力してください。',
+  ideaUnavailable: 'アイデアを追加できませんでした — 保存されていません。',
   introBody:
-    'カードはあなたではなくエージェントが実行します。担当を設定したカードを Ready に置くと、1分以内にエージェントが取得します。担当がなければ実行されません。トリアージ: エージェントがまずアイデアを適切なタスクに書き直します。Todo: 他のカード待ち。スケジュール: タイマー待ち。実行中とレビュー: エージェントのレーンなので手を出さないでください。ブロック: あなたの対応待ちです。結果はカードに戻ってきます。',
+    'カードはあなたではなくエージェントが実行します。担当を設定したカードを Ready に置くと、1分以内にエージェントが取得します。担当がなければ実行されません。トリアージ: エージェントがまずアイデアを適切なタスクに書き直します。Todo: 他のカード待ち。スケジュール: タイマー待ち。実行中とレビュー: エージェントのレーンなので手を出さないでください。ブロック: 確認が必要です — カードを開いて何が起きたか、次に何をすべきかを確認してください。結果はカードに戻ってきます。',
   introGotIt: '了解',
   evtCreated: (where, assignee) => `作成${where ? `（${where}）` : ''}${assignee ? `・${assignee} に割り当て` : ''}`,
   evtMovedTo: col => `${col} へ移動`,
@@ -541,26 +960,132 @@ const ja: KanbanMessages = {
   evtScheduled: '後で実行するようスケジュール',
   evtArchived: 'アーカイブ済み',
   evtReprioritized: priority => `優先度を ${priority} に設定`,
+  evtGaveUp: '断念しました — 自動的な失敗',
+  evtCrashed: 'ワーカーがクラッシュしました',
+  evtTimedOut: 'タイムアウト — 実行時間の上限を超えました',
+  evtProtocolViolation: 'ワーカーが結果を報告せずに終了しました',
+  evtReviewNoVerdict: 'レビュアーが判定なしで終了しました',
+  evtReviewRoundCap: 'レビュー往復の上限に達し、ディスパッチを停止しました',
+  evtStale: '進捗なし — 再取得しました',
+  evtDependencyWait: '依存関係を待機中',
+  evtBlockLoop: '繰り返しブロック — トリアージへ転送',
+  evtHeld: '保留にしました',
   someone: '誰か',
+  metaSectionLabel: '詳細',
   metaPriority: '優先度',
   metaTenant: 'テナント',
   metaCreatedBy: '作成者',
   metaCreated: '作成',
+  metaRun: '実行',
+  metaRunStarted: '実行開始',
+  metaRunCount: n => `${n} / ${n}`,
   metaWorkerPid: 'ワーカー PID',
   readyUnassignedTitle: 'Ready ですが未割り当て — このカードは実行されません。',
   readyUnassignedBody:
     'ディスパッチャは担当のある Ready カードのみ取得します。上の担当フィールドでプロフィールを選ぶ（またはオーケストレーション設定でデフォルトの担当を設定する）と、1分以内に実行されます。',
   diagnosticsN: n => `診断・${n}`,
+  ctaBlockedTitle: 'ブロック中 — 原因不明',
+  ctaInitialBlockTitle: '作成時に意図的にブロックされました',
+  ctaBlockedNoReason:
+    'このブロックには原因が記録されていません。ワーカーログを確認するか、再割り当てして再試行してください。',
+  ctaBlockedAutomaticTitle: 'ブロック中 — 自動的な失敗',
+  ctaReviewNoVerdictTitle: 'レビュアーが判定なしで終了しました',
+  ctaReviewNoVerdictBody:
+    'レビュアーの実行は、承認・変更依頼・エスカレーションのいずれもなく終了しました — これは作業の失敗ではなく中立的な結果です。もう一度レビューへ再キューしてください。',
+  ctaReviewRoundCapTitle: 'レビュー往復の上限に到達',
+  ctaReviewRoundCapTitleCounted: (rounds, max) => `レビュー往復の上限に到達（${rounds}/${max}）`,
+  ctaReviewRoundCapBody:
+    'レビュアーが変更依頼を繰り返したため、ディスパッチャーは再実行を停止しました。担当変更・範囲の見直し・アーカイブのいずれかを決めてから、ブロックを解除してください。',
+  ctaRequeueReview: 'レビューに再キュー',
+  ctaRetry: '再試行（ブロック解除）',
+  ctaCopyLogCommand: 'ログコマンドをコピー',
+  ctaReply: '返信',
+  ctaUnblock: 'ブロック解除',
+  ctaReviewTitle: 'レビューが必要です',
+  ctaReviewBody: '完了とマークする前に、下の内容をレビュアーが確認してください。',
+  ctaApprove: '承認（完了にする）',
+  ctaSendBack: 'Ready に差し戻す',
+  blockKind: {
+    needs_input: '入力が必要',
+    capability: '機能が不足',
+    transient: '一時的な失敗が発生'
+  },
+  guideAssignReady: '依存関係は解決済みですが、担当が未設定です — 上で担当を選ばないと実行されません。',
+  guideReadyQueued: 'ディスパッチャの取得待ちです — 担当設定済みで、1分以内に実行されます。',
+  guideTodo: '他のカードの完了を待っています。',
+  guideTriage: '生のアイデアです — スペシファイアエージェントが正式なタスクに整えます。',
+  guideBlockLoop: reason => `同じ理由でブロックが繰り返され、判断のためにここへ転送されました: ${reason}`,
+  blockLoopConfirmTitle: 'このカードはループしました — 再開前に回答してください',
+  blockLoopConfirmBody: (title, column) =>
+    `「${title}」は、未回答の同じ質問で 2 回ブロックされたため自動的にここへ移動されました。` +
+    `その質問に答えないまま ${column} へ移すと、同じループが再び始まります。` +
+    `まずコメントで回答してから確定してください。`,
+  blockLoopConfirmAction: 'それでも再開する',
+  guideScheduled: '予定時刻の到来を待っています。',
+  guideRunning: 'エージェントが現在作業中です — 待つ以外にすることはありません。',
+  guideRunningStale:
+    '2分以上ハートビートがありません — まもなくディスパッチャが再取得します。待つか、今すぐ再取得してください。',
+  guideOnHold: '人によって保留にされました。再開したいときは Ready にドラッグしてください。',
+  guideReview: 'レビュアーが完了した作業を確認中です — 上で承認するか差し戻してください。',
+  guideDone: '解決済み — 完了しており、依存する子カードはブロック解除されています。',
+  guideBlockedGeneric: 'あなたの対応が必要です — コメントで返信するか、ブロック解除してキューに戻してください。',
+  guideBlockedManualCapability:
+    '不足している機能がブロックの原因です — 解消してから、再割り当てするかブロック解除して再試行してください。',
+  guideBlockedManualTransient:
+    '一時的な失敗によりブロックされました — 自然に解消することがあります。ブロック解除して再試行してください。',
+  guideBlockedAutomatic: cause => `${cause} ワーカーログを確認し、再試行するか再割り当てしてください。`,
+  guideBlockedReviewNoVerdict: 'レビュアーが判定なしで終了しました。もう一度レビューへ再キューしてください。',
+  guideBlockedReviewRoundCap: 'レビュー往復の上限に達しました — 単に再試行せず、担当変更・範囲の見直し・アーカイブを検討してください。',
+  guideBlockedUnknown: 'ワーカーログを確認し、再試行するか再割り当てしてください。',
+  guideIdea: 'ラフなアイデアです — 準備ができたらロードマップ項目に整えてください。',
+  guideRoadmap: '仕様は固まっていますが未承認です — トリアージへスポーンすると作業が始まります。',
+  roadmapHideLanes: 'アイデアとロードマップを非表示',
+  roadmapShowLanes: 'アイデアとロードマップを表示',
+  roadmapPill: count => `ロードマップ · ${count}`,
+  laneRefine: 'ロードマップへ整える',
+  laneDemote: 'アイデアへ戻す',
+  laneSpawnTriage: 'トリアージへスポーン',
+  laneSpawnReady: 'Ready へスポーン…',
+  spawnReadyTitle: '直接 Ready へスポーンしますか？',
+  spawnReadyBody: '自動分解をスキップしてそのままディスパッチしますか？',
+  spawnReadyConfirm: 'Ready へスポーン',
+  laneDropRefused: (from, to) => `${from} から ${to} へカードを移動できません。`,
+  choicesGroupLabel: 'オプションを選択してください',
+  choiceSubmitError: '回答を送信できませんでした。もう一度お試しください。',
+  choiceRetry: '再試行',
   commandCopied: 'コマンドをコピーしました',
   description: '説明',
   editDescription: '説明を編集',
   cancelEdit: '編集をキャンセル',
   noDescription: 'まだ説明はありません。',
+  showMore: 'もっと見る',
+  showLess: '折りたたむ',
+  tabOverview: '概要',
+  tabActivity: 'アクティビティ',
+  tabLog: 'ログ',
+  noActivityYet: 'まだアクティビティはありません。',
+  noLogYet: 'まだワーカーログはありません。',
   result: '結果',
   latestSummary: '最新のサマリー',
   dependencies: '依存関係',
   blockedBy: 'ブロック元',
   blocks: 'ブロック先',
+  depGating: 'ブロック中',
+  depSatisfied: '解消済み',
+  depBlockedByCount: n => `${n} 件にブロック`,
+  depBlocksCount: n => `${n} 件をブロック`,
+  depClear: 'ブロック解消',
+  depClearTip: 'このタスクをブロックしていたタスクはすべて完了しました。準備完了に移動できます。',
+  depUnlink: '解除',
+  depUnlinkTip: 'この依存関係を解除します。タスク自体は削除されず、リンクのみ切れます。',
+  depMissing: 'このボードにありません',
+  depMissingTip: 'リンク先のタスクは削除されたか、現在のテナント／アーカイブ絞り込みで非表示です。',
+  depWaitingBanner: (gating, total) =>
+    total === 1 ? '1 件のブロック待ちです。' : `${total} 件中 ${gating} 件のブロック待ちです。`,
+  depFocusHint: 'カードをクリックすると依存関係をたどれます · Esc で解除',
+  depFocusUpstream: 'これをブロック',
+  depFocusDownstream: 'これを待機',
+  depClearFocus: 'フォーカス解除',
   comments: n => `コメント・${n}`,
   commentsHelpRunning:
     'このタスクは実行中です。あなたのメモは数秒以内にワーカーの現在のターンに取り込まれます — ブロック/解除の操作は不要です。「メモを付けて再キュー」を選ぶと、メモを文脈に含めてタスクを最初からやり直します。',
@@ -574,12 +1099,27 @@ const ja: KanbanMessages = {
   requeueWithNote: 'メモを付けて再キュー',
   notePosted: 'メモを投稿しました — ワーカーを再キューしました',
   activity: n => `アクティビティ・${n}`,
+  activityRun: (label, n, ago) => `${label} ×${n}・最新 ${ago}`,
   runs: n => `実行・${n}`,
+  runsFailedCount: n => `失敗 ${n} 件`,
+  runErrStaleLock: 'ワーカーの取得ロックが期限切れになり、キューに戻されました。',
+  runErrPidNotAlive: 'ワーカープロセスが予期せず消失しました。',
+  runErrPidExited: code => `ワーカーがエラーで終了しました（コード ${code}）。`,
+  runErrPidSignaled: signal => `ワーカーが強制終了されました（シグナル ${signal}）。`,
+  runErrRaw: '生の診断情報',
   workerLog: 'ワーカーログ',
   workerLogTail: 'ワーカーログ・末尾',
+  workerLogRetained: 'ワーカーログ・保持済み',
+  workerLogLive: 'ライブ・追従中',
+  workerLogPaused: 'ライブ・一時停止中',
+  workerLogWrap: '行を折り返す',
+  workerLogJumpToLatest: '最新へ移動',
   attachments: n => `添付・${n}`,
   noAttachments: 'まだ添付はありません。',
   uploadAttachment: '添付をアップロード',
+  images: n => `画像・${n}`,
+  brokenImage: '画像を表示できません',
+  openImage: '画像を開く',
   taskActions: 'タスクの操作',
   copyTaskId: 'タスク ID をコピー',
   copyTitle: 'タイトルをコピー',
@@ -588,6 +1128,7 @@ const ja: KanbanMessages = {
   close: '閉じる',
   working: '作業中',
   board: 'ボード',
+  allBoards: 'すべてのボード',
   newBoard: '新しいボード',
   newBoardDots: '新しいボード…',
   exportDots: 'エクスポート…',
@@ -613,6 +1154,10 @@ const ja: KanbanMessages = {
     '新しいタスクはプロジェクトのリポジトリで実行されます（タスクごとに worktree）。各タスクは作成時にワークスペースを上書きできます。プロジェクトの管理は ',
   projectHintCmd: 'hermes project',
   createBoard: 'ボードを作成',
+  toggleBoard: name => `${name}を切り替え`,
+  boardsFailedNotice: names => `読み込めませんでした: ${names}`,
+  pickBoard: 'ボードを選択',
+  pickBoardHint: 'このタスクを作成するボード。',
   orchestratorProfile: 'オーケストレータープロフィール',
   defaultAssignee: 'デフォルトの担当',
   defaultParen: '（既定）',
@@ -622,14 +1167,43 @@ const ja: KanbanMessages = {
     '説明はデコンポーザーのルーティングを導きます。補助モデルで自動生成するか、自分で書いてください。',
   profileGoodAt: 'このプロフィールの得意分野は？',
   auto: '自動',
+  dispatchControl: 'ディスパッチ',
+  pauseDispatch: 'ディスパッチを一時停止',
+  resumeDispatch: 'ディスパッチを再開',
+  draining: running => `実行中 ${running} 件 — 排出中`,
+  safeToRestart: '実行中 0 件 — 再起動しても安全',
+  dispatchRunning: '通常どおりディスパッチ中',
+  pauseBusy: 'ディスパッチのティック実行中です。少し待ってからもう一度お試しください。',
+  resumeBusy: 'ディスパッチのティック実行中です。少し待ってから再開をお試しください。',
+  pauseAllBoards: 'すべてのボードを一時停止',
+  resumeAllBoards: 'すべてのボードを再開',
+  boardsPaused: (paused, total) => `${total} 件中 ${paused} 件のボードが一時停止中`,
+  pauseHint:
+    '新しいワーカーの取得と起動を停止します。実行中のワーカーが強制終了されることはありません。ゲートウェイを再起動する前に、件数が 0 になるまで待ってください。',
+  queuePostDrain: '排出後に…',
+  cancelPostDrain: 'キャンセル',
+  actionServiceRestart: target => `${target} を再起動`,
+  actionRunScript: name => `${name} を実行`,
+  actionReboot: 'このマシンを再起動',
+  confirmRebootPrompt: 'すべてのワーカーが完了したら、このマシンを再起動しますか？',
+  confirmReboot: 'はい、排出後に再起動',
+  cancelConfirm: '待機を続ける',
+  postDrainArmed: (action, running, remaining) => `排出後に${action} — 実行中 ${running} 件、${remaining}後に期限切れ`,
+  postDrainArmedDrained: (action, remaining) => `${action} — 排出完了、まもなく実行（${remaining}後に期限切れ）`,
+  postDrainFiring: action => `${action} — 実行中`,
+  postDrainSucceeded: action => `${action} — 完了`,
+  postDrainFailed: (action, error) => `${action}に失敗 — ${error}`,
+  postDrainExpired: action => `排出前に${action}の期限が切れました — 何も実行されていません`,
+  postDrainCancelled: action => `${action}をキャンセルしました`,
   notify: {
     completedTitle: 'タスク完了',
     blockedTitle: 'タスクがブロック中 — 入力が必要です',
     blockLoopTitle: 'タスクをトリアージへ移動 — 判断が必要です',
-    gaveUpTitle: 'タスクを断念しました',
+    gaveUpTitle: cause => (cause ? `タスクを断念しました — ${cause}` : 'タスクを断念しました'),
     crashedTitle: 'ワーカーがクラッシュ — 再試行します',
     timedOutTitle: 'タスクがタイムアウト — 再試行します',
     openKanban: 'かんばんを開く',
+    openCard: 'カードを開く',
     artifacts: (n: number) => `成果物 ${n} 件`
   }
 }
@@ -645,10 +1219,13 @@ const zh: KanbanMessages = {
     scheduled: { label: '已排期', help: '等待预定时间到来。' },
     ready: { label: '就绪', help: '依赖已满足 — 分配一个配置档，调度器即会运行它。' },
     running: { label: '运行中', help: '已被工作单元领取 — 有代理在处理。由调度器设置。' },
-    blocked: { label: '受阻', help: '工作单元需要人工输入。' },
+    blocked: { label: '受阻', help: '需要关注 — 工作单元的问题、自动失败，或没有结论的审查。' },
+    on_hold: { label: '已暂缓', help: '由人工暂缓 — 想恢复时拖回“就绪”即可。' },
     review: { label: '审查', help: '审查代理正在检查工作。由调度器设置。' },
     done: { label: '完成', help: '已完成；依赖它的子任务变为就绪。' },
-    archived: { label: '已归档', help: '从默认面板视图中隐藏。' }
+    archived: { label: '已归档', help: '从默认面板视图中隐藏。' },
+    idea: { label: '想法', help: '粗略记录 — 这里的卡片不会运行，也不存在延误。' },
+    roadmap: { label: '路线图', help: '已细化但尚未授权 — 派生后即可开始工作。' }
   },
   locked: {
     review: '审查状态由调度器在审查代理领取卡片时设置。',
@@ -668,6 +1245,7 @@ const zh: KanbanMessages = {
   deselect: '取消选择',
   moveTo: label => `移动到 ${label}`,
   delete: '删除',
+  sendToRoadmap: '发送到路线图想法',
   reviewChecking: '审查代理正在检查已完成的工作。',
   attachedTip: name => `${name} 已接手 — 调度器将在下一个周期（≤1 分钟）移交。`,
   orchestratorTip: name => `${name}（编排者）将在下一个周期领取并撰写规格。`,
@@ -690,13 +1268,28 @@ const zh: KanbanMessages = {
   assign: '分配',
   unassignAction: '取消分配',
   archive: '归档',
+  archiveDone: '归档已完成',
+  archiveDoneConfirm: (count, scope) => `要归档 ${scope} 中的 ${count} 个已完成卡片吗？`,
+  archiveDonePartial: (archived, failed, skipped) =>
+    `已归档 ${archived} 个已完成卡片；${failed} 个失败，${skipped} 个跳过。`,
+  archiveDoneSuccess: archived => `已归档 ${archived} 个已完成卡片。`,
+  archiveDoneBackground: '归档仍在后台运行 — 请稍后再查看。',
+  archiveDoneFailed: message => `无法归档已完成卡片 — ${message}`,
   clearSelection: '清除选择（Esc）',
   refused: '被拒绝',
   bulkFailed: (failed, total, err) => `${total} 个中有 ${failed} 个失败 — ${err}。失败的卡片仍保持选中。`,
   titlePlaceholderTriage: '大致想法 — 细化代理会补全',
   titlePlaceholder: '标题',
   descPlaceholder: '描述（可选）',
+  pastedImages: n => `已粘贴的图片・${n}`,
+  removeImage: '移除图片',
+  imagePasteFailed: '无法上传粘贴的图片',
   priority: '优先级',
+  priorityCritical: '紧急',
+  priorityHigh: '高',
+  priorityNormal: '普通',
+  priorityLow: '低',
+  priorityCustom: value => `自定义 (${value})`,
   workspace: '工作区',
   boardDefaultSuffix: '・面板默认',
   workspaceOverride: '工作区路径（可选覆盖）',
@@ -730,8 +1323,16 @@ const zh: KanbanMessages = {
   tokUnit: 'tok',
   couldNotEstimate: '无法估算',
   complexity: { S: '小', M: '中', L: '大' },
+  ideaTitle: '记录想法',
+  ideaHint: '记下一个粗略的想法 — 它会作为卡片加入“想法”泳道，稍后再细化。',
+  ideaPlaceholder: '粗略的想法…',
+  ideaSave: '保存想法',
+  ideaSaving: '保存中…',
+  ideaSaved: '已加入“想法”',
+  ideaEmpty: '请先输入内容再保存。',
+  ideaUnavailable: '无法添加想法 — 未保存任何内容。',
   introBody:
-    '卡片不由你运行，而是由代理运行。把带有负责人的卡片放入“就绪”，代理会在一分钟内领取。没有负责人就不会运行。分诊：代理先把想法改写成合适的任务。待办：等待其他卡片。已排期：等待计时器。运行中与审查：这是代理的通道，请勿插手。受阻：正在等你。结果会回到卡片上。',
+    '卡片不由你运行，而是由代理运行。把带有负责人的卡片放入“就绪”，代理会在一分钟内领取。没有负责人就不会运行。分诊：代理先把想法改写成合适的任务。待办：等待其他卡片。已排期：等待计时器。运行中与审查：这是代理的通道，请勿插手。受阻：需要关注 — 打开卡片查看发生了什么、接下来该怎么做。结果会回到卡片上。',
   introGotIt: '知道了',
   evtCreated: (where, assignee) => `已创建${where ? `（${where}）` : ''}${assignee ? `・分配给 ${assignee}` : ''}`,
   evtMovedTo: col => `移动到 ${col}`,
@@ -751,26 +1352,128 @@ const zh: KanbanMessages = {
   evtScheduled: '已排期稍后运行',
   evtArchived: '已归档',
   evtReprioritized: priority => `优先级设为 ${priority}`,
+  evtGaveUp: '已放弃 — 自动失败',
+  evtCrashed: '工作单元已崩溃',
+  evtTimedOut: '已超时 — 超出运行时限',
+  evtProtocolViolation: '工作单元未报告结果就退出了',
+  evtReviewNoVerdict: '审查者退出时没有给出结论',
+  evtReviewRoundCap: '已达到审查轮次上限 — 已停止调度',
+  evtStale: '没有进展 — 已重新领取',
+  evtDependencyWait: '正在等待依赖',
+  evtBlockLoop: '反复受阻 — 已转入分诊',
+  evtHeld: '已设为暂缓',
   someone: '某人',
+  metaSectionLabel: '详情',
   metaPriority: '优先级',
   metaTenant: '租户',
   metaCreatedBy: '创建者',
   metaCreated: '创建于',
+  metaRun: '运行',
+  metaRunStarted: '本次运行开始',
+  metaRunCount: n => `第 ${n} 次（共 ${n} 次）`,
   metaWorkerPid: '工作单元 PID',
   readyUnassignedTitle: '就绪但未分配 — 这张卡片永远不会运行。',
   readyUnassignedBody:
     '调度器只领取有负责人的就绪卡片。在上面的负责人字段选择一个配置档（或在编排设置中设置默认负责人），它会在一分钟内运行。',
   diagnosticsN: n => `诊断・${n}`,
+  ctaBlockedTitle: '受阻 — 原因不明',
+  ctaInitialBlockTitle: '创建时被有意阻止',
+  ctaBlockedNoReason: '此次受阻没有记录原因。请查看工作单元日志，或重新分配以重试。',
+  ctaBlockedAutomaticTitle: '受阻 — 自动失败',
+  ctaReviewNoVerdictTitle: '审查者退出时没有给出结论',
+  ctaReviewNoVerdictBody:
+    '审查者的运行结束时既未批准、也未请求修改或升级 — 这是一个中立的结果，不代表工作本身失败。请重新排队进行另一轮审查。',
+  ctaReviewRoundCapTitle: '审查轮次已用尽',
+  ctaReviewRoundCapTitleCounted: (rounds, max) => `审查轮次已用尽（${rounds}/${max}）`,
+  ctaReviewRoundCapBody:
+    '审查者多次要求修改，因此调度器已停止重新运行此卡片。请决定处理方式 — 重新分配、调整范围或归档 — 然后解除阻塞。',
+  ctaRequeueReview: '重新排队审查',
+  ctaRetry: '重试（解除阻塞）',
+  ctaCopyLogCommand: '复制日志命令',
+  ctaReply: '回复',
+  ctaUnblock: '解除阻塞',
+  ctaReviewTitle: '需要审查',
+  ctaReviewBody: '在标记完成之前，审查者应检查下面的工作内容。',
+  ctaApprove: '批准（标记完成）',
+  ctaSendBack: '退回到就绪',
+  blockKind: {
+    needs_input: '需要你的输入',
+    capability: '缺少能力',
+    transient: '发生了临时故障'
+  },
+  guideAssignReady: '依赖已满足，但尚未分配负责人 — 请在上方选择一个配置档，否则它永远不会运行。',
+  guideReadyQueued: '等待调度器领取 — 已分配负责人，将在一分钟内运行。',
+  guideTodo: '正在等待其他卡片完成后才会变为就绪。',
+  guideTriage: '一个新想法 — 细化代理会将其整理成正式任务。',
+  guideBlockLoop: reason => `因同一原因反复受阻并重新受阻 — 已转到此处等待决定：${reason}`,
+  blockLoopConfirmTitle: '此卡片已陷入循环 — 请先回答再恢复',
+  blockLoopConfirmBody: (title, column) =>
+    `“${title}”因同一个未回答的问题两次受阻，已被自动移到此处。` +
+    `在未回答该问题的情况下将其移到 ${column}，会再次触发同样的循环。` +
+    `请先在评论中回答，然后再确认。`,
+  blockLoopConfirmAction: '仍然恢复',
+  guideScheduled: '正在等待其预定时间到来。',
+  guideRunning: '有代理正在积极处理它 — 只需等待。',
+  guideRunningStale: '超过 2 分钟没有心跳 — 调度器很快会重新领取。可以等待，或立即重新领取。',
+  guideOnHold: '已被人工暂缓。想恢复时拖回“就绪”即可。',
+  guideReview: '审查者正在检查已完成的工作 — 请在上方批准或退回。',
+  guideDone: '已解决 — 已完成，其依赖的卡片现已解除阻塞。',
+  guideBlockedGeneric: '需要你的输入 — 在评论中回复，或解除阻塞将其送回队列。',
+  guideBlockedManualCapability: '缺少某项能力导致受阻 — 请先解决，再重新分配或解除阻塞以重试。',
+  guideBlockedManualTransient: '一次临时性失败导致受阻 — 可能会自行恢复；解除阻塞以重试。',
+  guideBlockedAutomatic: cause => `${cause} 请查看工作单元日志，然后重试或重新分配。`,
+  guideBlockedReviewNoVerdict: '审查者退出时没有给出结论。请重新排队进行另一轮审查。',
+  guideBlockedReviewRoundCap: '审查轮次已用尽 — 请重新分配、调整范围或归档，而不是直接重试。',
+  guideBlockedUnknown: '请查看工作单元日志，然后重试或重新分配。',
+  guideIdea: '一个粗略的想法 — 准备好后再细化成路线图条目。',
+  guideRoadmap: '已细化但尚未授权 — 派生到“分诊”即可开始工作。',
+  roadmapHideLanes: '隐藏“想法”和“路线图”',
+  roadmapShowLanes: '显示“想法”和“路线图”',
+  roadmapPill: count => `路线图 · ${count}`,
+  laneRefine: '细化为路线图',
+  laneDemote: '退回想法',
+  laneSpawnTriage: '派生到分诊',
+  laneSpawnReady: '派生到就绪…',
+  spawnReadyTitle: '直接派生到“就绪”？',
+  spawnReadyBody: '跳过自动分解，按原样派发？',
+  spawnReadyConfirm: '派生到就绪',
+  laneDropRefused: (from, to) => `无法把卡片从${from}移动到${to}。`,
+  choicesGroupLabel: '请选择一个选项',
+  choiceSubmitError: '无法提交你的回答，请重试。',
+  choiceRetry: '重试',
   commandCopied: '命令已复制',
   description: '描述',
   editDescription: '编辑描述',
   cancelEdit: '取消编辑',
   noDescription: '暂无描述。',
+  showMore: '显示更多',
+  showLess: '收起',
+  tabOverview: '概览',
+  tabActivity: '活动',
+  tabLog: '日志',
+  noActivityYet: '暂无活动。',
+  noLogYet: '暂无工作单元日志。',
   result: '结果',
   latestSummary: '最新摘要',
   dependencies: '依赖关系',
   blockedBy: '受阻于',
   blocks: '阻塞',
+  depGating: '仍在阻塞',
+  depSatisfied: '已满足',
+  depBlockedByCount: n => `被 ${n} 项阻塞`,
+  depBlocksCount: n => `阻塞 ${n} 项`,
+  depClear: '阻塞已清除',
+  depClearTip: '阻塞此任务的任务均已完成，可以移至就绪。',
+  depUnlink: '移除',
+  depUnlinkTip: '移除此依赖关系。任务本身保留，仅断开链接。',
+  depMissing: '不在此看板中',
+  depMissingTip: '关联任务已被删除，或被当前租户／归档筛选隐藏。',
+  depWaitingBanner: (gating, total) =>
+    total === 1 ? '正在等待 1 项阻塞。' : `正在等待 ${total} 项中的 ${gating} 项阻塞。`,
+  depFocusHint: '点击卡片可追踪其依赖链 · 按 Esc 清除',
+  depFocusUpstream: '阻塞它',
+  depFocusDownstream: '等待它',
+  depClearFocus: '清除聚焦',
   comments: n => `评论・${n}`,
   commentsHelpRunning:
     '此任务正在运行。你的备注会在几秒内融入工作单元当前的回合 — 无需阻塞/解除操作。选择“附带备注重新入队”则会带着你的备注从头重跑任务。',
@@ -783,12 +1486,27 @@ const zh: KanbanMessages = {
   requeueWithNote: '附带备注重新入队',
   notePosted: '备注已发布 — 工作单元已重新入队',
   activity: n => `活动・${n}`,
+  activityRun: (label, n, ago) => `${label} ×${n}・最近 ${ago}`,
   runs: n => `运行・${n}`,
+  runsFailedCount: n => `${n} 个失败`,
+  runErrStaleLock: '工作单元的领取锁已过期，任务已放回队列。',
+  runErrPidNotAlive: '工作单元进程意外消失。',
+  runErrPidExited: code => `工作单元因错误退出（代码 ${code}）。`,
+  runErrPidSignaled: signal => `工作单元被强制终止（信号 ${signal}）。`,
+  runErrRaw: '原始诊断信息',
   workerLog: '工作单元日志',
   workerLogTail: '工作单元日志・末尾',
+  workerLogRetained: '工作单元日志・已保留',
+  workerLogLive: '实时・跟随中',
+  workerLogPaused: '实时・已暂停',
+  workerLogWrap: '换行显示',
+  workerLogJumpToLatest: '跳至最新',
   attachments: n => `附件・${n}`,
   noAttachments: '暂无附件。',
   uploadAttachment: '上传附件',
+  images: n => `图片・${n}`,
+  brokenImage: '图片无法显示',
+  openImage: '打开图片',
   taskActions: '任务操作',
   copyTaskId: '复制任务 ID',
   copyTitle: '复制标题',
@@ -797,6 +1515,7 @@ const zh: KanbanMessages = {
   close: '关闭',
   working: '进行中',
   board: '面板',
+  allBoards: '所有面板',
   newBoard: '新建面板',
   newBoardDots: '新建面板…',
   exportDots: '导出…',
@@ -822,6 +1541,10 @@ const zh: KanbanMessages = {
     '新任务将在项目的仓库中运行（每个任务一个 worktree）；每个任务在创建时仍可覆盖其工作区。管理项目请使用 ',
   projectHintCmd: 'hermes project',
   createBoard: '创建面板',
+  toggleBoard: name => `切换 ${name}`,
+  boardsFailedNotice: names => `无法加载：${names}`,
+  pickBoard: '选择面板',
+  pickBoardHint: '此任务将创建在该面板上。',
   orchestratorProfile: '编排者配置档',
   defaultAssignee: '默认负责人',
   defaultParen: '（默认）',
@@ -830,14 +1553,42 @@ const zh: KanbanMessages = {
   profileDescriptionsHint: '说明用于引导分解器的路由。可用辅助模型自动生成，或自行填写。',
   profileGoodAt: '这个配置档擅长什么？',
   auto: '自动',
+  dispatchControl: '调度',
+  pauseDispatch: '暂停调度',
+  resumeDispatch: '恢复调度',
+  draining: running => `${running} 个运行中 — 正在排空`,
+  safeToRestart: '0 个运行中 — 可以安全重启',
+  dispatchRunning: '调度正常运行中',
+  pauseBusy: '正在执行一次调度周期，请稍后再试。',
+  resumeBusy: '正在执行一次调度周期，请稍后再尝试恢复。',
+  pauseAllBoards: '暂停所有面板',
+  resumeAllBoards: '恢复所有面板',
+  boardsPaused: (paused, total) => `${total} 个面板中有 ${paused} 个已暂停`,
+  pauseHint: '停止领取和启动新的工作者。已在运行的工作者不会被终止 — 请等待计数归零后再重启网关。',
+  queuePostDrain: '排空后…',
+  cancelPostDrain: '取消',
+  actionServiceRestart: target => `重启 ${target}`,
+  actionRunScript: name => `运行 ${name}`,
+  actionReboot: '重启这台机器',
+  confirmRebootPrompt: '在所有工作者完成后重启这台机器？',
+  confirmReboot: '是，排空后重启',
+  cancelConfirm: '继续等待',
+  postDrainArmed: (action, running, remaining) => `排空后${action} — ${running} 个运行中，${remaining}后过期`,
+  postDrainArmedDrained: (action, remaining) => `${action} — 已排空，即将执行（${remaining}后过期）`,
+  postDrainFiring: action => `${action} — 正在执行`,
+  postDrainSucceeded: action => `${action} — 已完成`,
+  postDrainFailed: (action, error) => `${action}失败 — ${error}`,
+  postDrainExpired: action => `${action}在面板排空前已过期 — 未执行任何操作`,
+  postDrainCancelled: action => `已取消${action}`,
   notify: {
     completedTitle: '任务已完成',
     blockedTitle: '任务受阻 — 需要你的输入',
     blockLoopTitle: '任务已转入分类 — 需要人工决定',
-    gaveUpTitle: '任务已放弃',
+    gaveUpTitle: cause => (cause ? `任务已放弃 — ${cause}` : '任务已放弃'),
     crashedTitle: '工作单元崩溃 — 将重试',
     timedOutTitle: '任务超时 — 将重试',
     openKanban: '打开看板',
+    openCard: '打开卡片',
     artifacts: (n: number) => `${n} 个产物`
   }
 }
@@ -853,10 +1604,13 @@ const zhHant: KanbanMessages = {
     scheduled: { label: '已排程', help: '等待預定時間到來。' },
     ready: { label: '就緒', help: '相依項目已滿足 — 指派一個設定檔，排程器便會執行它。' },
     running: { label: '執行中', help: '已被工作單元領取 — 有代理在處理。由排程器設定。' },
-    blocked: { label: '受阻', help: '工作單元需要人工輸入。' },
+    blocked: { label: '受阻', help: '需要關注 — 工作單元的問題、自動失敗，或沒有結論的審查。' },
+    on_hold: { label: '已暫緩', help: '由人工暫緩 — 想恢復時拖回「就緒」即可。' },
     review: { label: '審查', help: '審查代理正在檢查工作。由排程器設定。' },
     done: { label: '完成', help: '已完成；相依它的子任務變為就緒。' },
-    archived: { label: '已封存', help: '從預設面板檢視中隱藏。' }
+    archived: { label: '已封存', help: '從預設面板檢視中隱藏。' },
+    idea: { label: '想法', help: '粗略記錄 — 這裡的卡片不會執行，也不存在延誤。' },
+    roadmap: { label: '路線圖', help: '已細化但尚未授權 — 派生後即可開始工作。' }
   },
   locked: {
     review: '審查狀態由排程器在審查代理領取卡片時設定。',
@@ -876,6 +1630,7 @@ const zhHant: KanbanMessages = {
   deselect: '取消選取',
   moveTo: label => `移至 ${label}`,
   delete: '刪除',
+  sendToRoadmap: '傳送到路線圖想法',
   reviewChecking: '審查代理正在檢查已完成的工作。',
   attachedTip: name => `${name} 已接手 — 排程器將在下一個週期（≤1 分鐘）移交。`,
   orchestratorTip: name => `${name}（編排者）將在下一個週期領取並撰寫規格。`,
@@ -898,13 +1653,28 @@ const zhHant: KanbanMessages = {
   assign: '指派',
   unassignAction: '取消指派',
   archive: '封存',
+  archiveDone: '封存已完成',
+  archiveDoneConfirm: (count, scope) => `要封存 ${scope} 中的 ${count} 個已完成卡片嗎？`,
+  archiveDonePartial: (archived, failed, skipped) =>
+    `已封存 ${archived} 個已完成卡片；${failed} 個失敗，${skipped} 個略過。`,
+  archiveDoneSuccess: archived => `已封存 ${archived} 個已完成卡片。`,
+  archiveDoneBackground: '封存仍在背景執行中 — 請稍後再查看。',
+  archiveDoneFailed: message => `無法封存已完成卡片 — ${message}`,
   clearSelection: '清除選取（Esc）',
   refused: '被拒絕',
   bulkFailed: (failed, total, err) => `${total} 個中有 ${failed} 個失敗 — ${err}。失敗的卡片仍保持選取。`,
   titlePlaceholderTriage: '大致想法 — 細化代理會補全',
   titlePlaceholder: '標題',
   descPlaceholder: '描述（選填）',
+  pastedImages: n => `已貼上的圖片・${n}`,
+  removeImage: '移除圖片',
+  imagePasteFailed: '無法上傳貼上的圖片',
   priority: '優先順序',
+  priorityCritical: '緊急',
+  priorityHigh: '高',
+  priorityNormal: '一般',
+  priorityLow: '低',
+  priorityCustom: value => `自訂 (${value})`,
   workspace: '工作區',
   boardDefaultSuffix: '・面板預設',
   workspaceOverride: '工作區路徑（選填覆寫）',
@@ -938,8 +1708,16 @@ const zhHant: KanbanMessages = {
   tokUnit: 'tok',
   couldNotEstimate: '無法估算',
   complexity: { S: '小', M: '中', L: '大' },
+  ideaTitle: '記錄想法',
+  ideaHint: '記下一個粗略的想法 — 它會作為卡片加入「想法」泳道，稍後再細化。',
+  ideaPlaceholder: '粗略的想法…',
+  ideaSave: '儲存想法',
+  ideaSaving: '儲存中…',
+  ideaSaved: '已加入「想法」',
+  ideaEmpty: '請先輸入內容再儲存。',
+  ideaUnavailable: '無法新增想法 — 未儲存任何內容。',
   introBody:
-    '卡片不由你執行，而是由代理執行。把有負責人的卡片放入「就緒」，代理會在一分鐘內領取。沒有負責人就不會執行。分類：代理先把想法改寫成合適的任務。待辦：等待其他卡片。已排程：等待計時器。執行中與審查：這是代理的通道，請勿插手。受阻：正在等你。結果會回到卡片上。',
+    '卡片不由你執行，而是由代理執行。把有負責人的卡片放入「就緒」，代理會在一分鐘內領取。沒有負責人就不會執行。分類：代理先把想法改寫成合適的任務。待辦：等待其他卡片。已排程：等待計時器。執行中與審查：這是代理的通道，請勿插手。受阻：需要關注 — 開啟卡片查看發生了什麼、接下來該怎麼做。結果會回到卡片上。',
   introGotIt: '知道了',
   evtCreated: (where, assignee) => `已建立${where ? `（${where}）` : ''}${assignee ? `・指派給 ${assignee}` : ''}`,
   evtMovedTo: col => `移至 ${col}`,
@@ -959,26 +1737,128 @@ const zhHant: KanbanMessages = {
   evtScheduled: '已排程稍後執行',
   evtArchived: '已封存',
   evtReprioritized: priority => `優先順序設為 ${priority}`,
+  evtGaveUp: '已放棄 — 自動失敗',
+  evtCrashed: '工作單元已當機',
+  evtTimedOut: '已逾時 — 超出執行時限',
+  evtProtocolViolation: '工作單元未回報結果就結束了',
+  evtReviewNoVerdict: '審查者結束時沒有給出結論',
+  evtReviewRoundCap: '已達到審查輪次上限 — 已停止排程',
+  evtStale: '沒有進度 — 已重新領取',
+  evtDependencyWait: '正在等待相依項目',
+  evtBlockLoop: '反覆受阻 — 已轉入分類',
+  evtHeld: '已設為暫緩',
   someone: '某人',
+  metaSectionLabel: '詳情',
   metaPriority: '優先順序',
   metaTenant: '租戶',
   metaCreatedBy: '建立者',
   metaCreated: '建立於',
+  metaRun: '執行',
+  metaRunStarted: '本次執行開始',
+  metaRunCount: n => `第 ${n} 次（共 ${n} 次）`,
   metaWorkerPid: '工作單元 PID',
   readyUnassignedTitle: '就緒但未指派 — 這張卡片永遠不會執行。',
   readyUnassignedBody:
     '排程器只領取有負責人的就緒卡片。在上方的負責人欄位選擇一個設定檔（或在編排設定中設定預設負責人），它會在一分鐘內執行。',
   diagnosticsN: n => `診斷・${n}`,
+  ctaBlockedTitle: '受阻 — 原因不明',
+  ctaInitialBlockTitle: '建立時刻意受阻',
+  ctaBlockedNoReason: '此次受阻沒有記錄原因。請查看工作單元日誌，或重新指派以重試。',
+  ctaBlockedAutomaticTitle: '受阻 — 自動失敗',
+  ctaReviewNoVerdictTitle: '審查者結束時沒有給出結論',
+  ctaReviewNoVerdictBody:
+    '審查者的執行結束時既未核准、也未請求修改或升級 — 這是一個中立的結果，不代表工作本身失敗。請重新排隊進行另一輪審查。',
+  ctaReviewRoundCapTitle: '審查輪次已用盡',
+  ctaReviewRoundCapTitleCounted: (rounds, max) => `審查輪次已用盡（${rounds}/${max}）`,
+  ctaReviewRoundCapBody:
+    '審查者多次要求修改，因此排程器已停止重新執行此卡片。請決定處理方式 — 重新指派、調整範圍或封存 — 然後解除封鎖。',
+  ctaRequeueReview: '重新排隊審查',
+  ctaRetry: '重試（解除封鎖）',
+  ctaCopyLogCommand: '複製日誌指令',
+  ctaReply: '回覆',
+  ctaUnblock: '解除封鎖',
+  ctaReviewTitle: '需要審查',
+  ctaReviewBody: '在標記完成之前，審查者應檢查下面的工作內容。',
+  ctaApprove: '核准（標記完成）',
+  ctaSendBack: '退回至就緒',
+  blockKind: {
+    needs_input: '需要你的輸入',
+    capability: '缺少能力',
+    transient: '發生暫時性故障'
+  },
+  guideAssignReady: '相依項目已滿足，但尚未指派負責人 — 請在上方選擇一個設定檔，否則它永遠不會執行。',
+  guideReadyQueued: '等待排程器領取 — 已指派負責人，將在一分鐘內執行。',
+  guideTodo: '正在等待其他卡片完成後才會變為就緒。',
+  guideTriage: '一個新想法 — 細化代理會將其整理成正式任務。',
+  guideBlockLoop: reason => `因同一原因反覆受阻並重新受阻 — 已轉到此處等待決定：${reason}`,
+  blockLoopConfirmTitle: '此卡片已陷入循環 — 請先回答再恢復',
+  blockLoopConfirmBody: (title, column) =>
+    `「${title}」因同一個未回答的問題兩次受阻，已被自動移到此處。` +
+    `在未回答該問題的情況下將其移到 ${column}，會再次觸發同樣的循環。` +
+    `請先在留言中回答，然後再確認。`,
+  blockLoopConfirmAction: '仍然恢復',
+  guideScheduled: '正在等待其預定時間到來。',
+  guideRunning: '有代理正在積極處理它 — 只需等待。',
+  guideRunningStale: '超過 2 分鐘沒有心跳 — 排程器很快會重新領取。可以等待，或立即重新領取。',
+  guideOnHold: '已被人工暫緩。想恢復時拖回「就緒」即可。',
+  guideReview: '審查者正在檢查已完成的工作 — 請在上方核准或退回。',
+  guideDone: '已解決 — 已完成，其相依的卡片現已解除封鎖。',
+  guideBlockedGeneric: '需要你的輸入 — 在留言中回覆，或解除封鎖將其送回佇列。',
+  guideBlockedManualCapability: '缺少某項能力導致受阻 — 請先解決，再重新指派或解除封鎖以重試。',
+  guideBlockedManualTransient: '一次暫時性失敗導致受阻 — 可能會自行恢復；解除封鎖以重試。',
+  guideBlockedAutomatic: cause => `${cause} 請查看工作單元日誌，然後重試或重新指派。`,
+  guideBlockedReviewNoVerdict: '審查者結束時沒有給出結論。請重新排隊進行另一輪審查。',
+  guideBlockedReviewRoundCap: '審查輪次已用盡 — 請重新指派、調整範圍或封存，而不是直接重試。',
+  guideBlockedUnknown: '請查看工作單元日誌，然後重試或重新指派。',
+  guideIdea: '一個粗略的想法 — 準備好後再細化成路線圖項目。',
+  guideRoadmap: '已細化但尚未授權 — 派生到「分診」即可開始工作。',
+  roadmapHideLanes: '隱藏「想法」和「路線圖」',
+  roadmapShowLanes: '顯示「想法」和「路線圖」',
+  roadmapPill: count => `路線圖 · ${count}`,
+  laneRefine: '細化為路線圖',
+  laneDemote: '退回想法',
+  laneSpawnTriage: '派生到分診',
+  laneSpawnReady: '派生到就緒…',
+  spawnReadyTitle: '直接派生到「就緒」？',
+  spawnReadyBody: '略過自動分解，按原樣派發？',
+  spawnReadyConfirm: '派生到就緒',
+  laneDropRefused: (from, to) => `無法把卡片從${from}移動到${to}。`,
+  choicesGroupLabel: '請選擇一個選項',
+  choiceSubmitError: '無法送出你的回答，請再試一次。',
+  choiceRetry: '重試',
   commandCopied: '指令已複製',
   description: '描述',
   editDescription: '編輯描述',
   cancelEdit: '取消編輯',
   noDescription: '尚無描述。',
+  showMore: '顯示更多',
+  showLess: '收合',
+  tabOverview: '總覽',
+  tabActivity: '活動',
+  tabLog: '日誌',
+  noActivityYet: '尚無活動。',
+  noLogYet: '尚無工作單元日誌。',
   result: '結果',
   latestSummary: '最新摘要',
   dependencies: '相依關係',
   blockedBy: '受阻於',
   blocks: '阻擋',
+  depGating: '仍在阻擋',
+  depSatisfied: '已滿足',
+  depBlockedByCount: n => `被 ${n} 項阻擋`,
+  depBlocksCount: n => `阻擋 ${n} 項`,
+  depClear: '阻擋已清除',
+  depClearTip: '阻擋此任務的任務皆已完成，可以移至就緒。',
+  depUnlink: '移除',
+  depUnlinkTip: '移除此相依關係。任務本身保留，僅斷開連結。',
+  depMissing: '不在此看板中',
+  depMissingTip: '關聯任務已被刪除，或被目前租戶／封存篩選隱藏。',
+  depWaitingBanner: (gating, total) =>
+    total === 1 ? '正在等待 1 項阻擋。' : `正在等待 ${total} 項中的 ${gating} 項阻擋。`,
+  depFocusHint: '點擊卡片可追蹤其相依鏈 · 按 Esc 清除',
+  depFocusUpstream: '阻擋它',
+  depFocusDownstream: '等待它',
+  depClearFocus: '清除聚焦',
   comments: n => `留言・${n}`,
   commentsHelpRunning:
     '此任務正在執行。你的備註會在幾秒內融入工作單元目前的回合 — 無需阻擋/解除操作。選擇「附上備註重新排入佇列」則會帶著你的備註從頭重跑任務。',
@@ -991,12 +1871,27 @@ const zhHant: KanbanMessages = {
   requeueWithNote: '附上備註重新排入佇列',
   notePosted: '備註已發布 — 工作單元已重新排入佇列',
   activity: n => `活動・${n}`,
+  activityRun: (label, n, ago) => `${label} ×${n}・最近 ${ago}`,
   runs: n => `執行・${n}`,
+  runsFailedCount: n => `${n} 個失敗`,
+  runErrStaleLock: '工作單元的領取鎖已過期，任務已放回佇列。',
+  runErrPidNotAlive: '工作單元行程意外消失。',
+  runErrPidExited: code => `工作單元因錯誤結束（代碼 ${code}）。`,
+  runErrPidSignaled: signal => `工作單元被強制終止（訊號 ${signal}）。`,
+  runErrRaw: '原始診斷資訊',
   workerLog: '工作單元日誌',
   workerLogTail: '工作單元日誌・末尾',
+  workerLogRetained: '工作單元日誌・已保留',
+  workerLogLive: '即時・跟隨中',
+  workerLogPaused: '即時・已暫停',
+  workerLogWrap: '換行顯示',
+  workerLogJumpToLatest: '跳至最新',
   attachments: n => `附件・${n}`,
   noAttachments: '尚無附件。',
   uploadAttachment: '上傳附件',
+  images: n => `圖片・${n}`,
+  brokenImage: '圖片無法顯示',
+  openImage: '開啟圖片',
   taskActions: '任務操作',
   copyTaskId: '複製任務 ID',
   copyTitle: '複製標題',
@@ -1005,6 +1900,7 @@ const zhHant: KanbanMessages = {
   close: '關閉',
   working: '進行中',
   board: '面板',
+  allBoards: '所有面板',
   newBoard: '新增面板',
   newBoardDots: '新增面板…',
   exportDots: '匯出…',
@@ -1030,6 +1926,10 @@ const zhHant: KanbanMessages = {
     '新任務將在專案的儲存庫中執行（每個任務一個 worktree）；每個任務在建立時仍可覆寫其工作區。管理專案請使用 ',
   projectHintCmd: 'hermes project',
   createBoard: '建立面板',
+  toggleBoard: name => `切換 ${name}`,
+  boardsFailedNotice: names => `無法載入：${names}`,
+  pickBoard: '選擇面板',
+  pickBoardHint: '此任務將建立在該面板上。',
   orchestratorProfile: '編排者設定檔',
   defaultAssignee: '預設負責人',
   defaultParen: '（預設）',
@@ -1038,14 +1938,42 @@ const zhHant: KanbanMessages = {
   profileDescriptionsHint: '說明用於引導分解器的路由。可用輔助模型自動產生，或自行填寫。',
   profileGoodAt: '這個設定檔擅長什麼？',
   auto: '自動',
+  dispatchControl: '調度',
+  pauseDispatch: '暫停調度',
+  resumeDispatch: '恢復調度',
+  draining: running => `${running} 個執行中 — 正在排空`,
+  safeToRestart: '0 個執行中 — 可以安全重啟',
+  dispatchRunning: '調度正常執行中',
+  pauseBusy: '正在執行一次調度週期，請稍後再試。',
+  resumeBusy: '正在執行一次調度週期，請稍後再嘗試恢復。',
+  pauseAllBoards: '暫停所有面板',
+  resumeAllBoards: '恢復所有面板',
+  boardsPaused: (paused, total) => `${total} 個面板中有 ${paused} 個已暫停`,
+  pauseHint: '停止領取與啟動新的工作者。已在執行的工作者不會被終止 — 請等待計數歸零後再重啟閘道。',
+  queuePostDrain: '排空後…',
+  cancelPostDrain: '取消',
+  actionServiceRestart: target => `重啟 ${target}`,
+  actionRunScript: name => `執行 ${name}`,
+  actionReboot: '重新啟動這台機器',
+  confirmRebootPrompt: '在所有工作者完成後重新啟動這台機器？',
+  confirmReboot: '是，排空後重新啟動',
+  cancelConfirm: '繼續等待',
+  postDrainArmed: (action, running, remaining) => `排空後${action} — ${running} 個執行中，${remaining}後過期`,
+  postDrainArmedDrained: (action, remaining) => `${action} — 已排空，即將執行（${remaining}後過期）`,
+  postDrainFiring: action => `${action} — 正在執行`,
+  postDrainSucceeded: action => `${action} — 已完成`,
+  postDrainFailed: (action, error) => `${action}失敗 — ${error}`,
+  postDrainExpired: action => `${action}在面板排空前已過期 — 未執行任何操作`,
+  postDrainCancelled: action => `已取消${action}`,
   notify: {
     completedTitle: '任務已完成',
     blockedTitle: '任務受阻 — 需要你的輸入',
     blockLoopTitle: '任務已轉入分類 — 需要人工決定',
-    gaveUpTitle: '任務已放棄',
+    gaveUpTitle: cause => (cause ? `任務已放棄 — ${cause}` : '任務已放棄'),
     crashedTitle: '工作單元當機 — 將重試',
     timedOutTitle: '任務逾時 — 將重試',
     openKanban: '開啟看板',
+    openCard: '開啟卡片',
     artifacts: (n: number) => `${n} 個產物`
   }
 }

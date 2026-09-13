@@ -211,6 +211,50 @@ export function localProfilePoolKeys(profile: unknown): string[] {
 }
 
 /**
+ * Resolve the desktop's STORED profile preference against what is actually on
+ * disk. Returns the name to use, or null for "no preference" (the default
+ * profile / legacy launch).
+ *
+ * The preference outlives the profile it names: deleting a profile on another
+ * machine, syncing this file between machines, or restoring a backup all leave
+ * a well-formed name here with no directory behind it. Every profile-scoped
+ * consumer reads through this one value, so an unvalidated name routes EVERY
+ * profile-scoped REST call (config, env, model info, schema, sessions) at a
+ * profile the backend will never have — each answering
+ * `404 Profile 'x' does not exist.` forever, with nothing to self-heal it.
+ *
+ * Name-format validation cannot catch this: `claudeprimary` is perfectly
+ * well-formed for a profile that simply isn't installed here. Existence is the
+ * only test that works, which is the same rule `assertLocalProfileCanStart`
+ * enforces at the spawn boundary — kept here as a pure function so both the
+ * read path and its tests can share it without Electron.
+ *
+ * `default` is the root HERMES_HOME and always exists; only named profiles
+ * live under `profiles/<name>` and can go missing.
+ */
+export function resolveStoredDesktopProfile(
+  storedName: unknown,
+  isValidProfileName: (profile: string) => boolean,
+  profileDirectoryExists: (profile: string) => boolean
+): null | string {
+  const name = String(storedName ?? '').trim()
+
+  if (!name) {
+    return null
+  }
+
+  if (name !== 'default' && !isValidProfileName(name)) {
+    return null
+  }
+
+  if (name === 'default' || profileDirectoryExists(name)) {
+    return name
+  }
+
+  return null
+}
+
+/**
  * Pure decision logic for prepareProfileDeleteRequest: given the parsed
  * profile name (or null), decide which side-effecting branch the caller
  * should take and what profile name it should ultimately report as

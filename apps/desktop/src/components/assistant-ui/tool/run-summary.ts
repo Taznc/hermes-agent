@@ -1,7 +1,7 @@
 import { summarizeShellCommand } from '@/lib/summarize-command'
 import { firstStringField } from '@/lib/text'
 
-import { fileEditBasename, isFileEditTool, parseMaybeObject } from './fallback-model'
+import { fileEditBasename, isFileEditTool, parseMaybeObject, titleForTool } from './fallback-model'
 
 /**
  * The little a summary needs from a tool call, stated structurally so both
@@ -71,9 +71,18 @@ function isPending(tool: ToolCallLike): boolean {
  * How a tool reads while it is happening — "Editing", "Exploring". Shared with
  * the status line that covers the gap before a tool starts, so the same run is
  * described in the same words from the moment the model drafts it.
+ *
+ * The catch-all "other" category (MCP/plugin tools, `clarify`, `memory`,
+ * anything not covered by a named category) has no natural noun of its own —
+ * "Using" alone told the user nothing was happening but not what. Naming the
+ * tool ("Using Memory", "Using Airtable Search") is what makes the wait
+ * legible instead of contentless.
  */
 export function toolPresentVerb(toolName: string): string {
-  return CATEGORY_COPY[toolCategory(toolName)].present
+  const category = toolCategory(toolName)
+  const verb = CATEGORY_COPY[category].present
+
+  return category === 'other' ? `${verb} ${titleForTool(toolName)}` : verb
 }
 
 /** The thing a tool acted on, as the header should name it. */

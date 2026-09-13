@@ -523,6 +523,26 @@ export interface SessionInfo {
   last_active: number
   message_count: number
   model: null | string
+  /** Provider `session_gateway_runtime` would resolve for the NEXT turn/
+   *  resume of this session (Phase 2.13 sidebar identity) — the
+   *  configured/intended route. Raw Hermes provider id (e.g. `anthropic`,
+   *  `openai-codex`), not a display label; run through `providerFamilyLabel`
+   *  before rendering. `null`/undefined on a legacy session with no
+   *  resolvable provider (predates `model_config`, or backend predates this
+   *  field) — never infer a family from that. */
+  configured_provider?: null | string
+  /** Model id that actually served this session's most RECENT completed
+   *  turn, from `session_model_usage` (falls back to the legacy
+   *  first-call-only `sessions.model` column pre-v20 / for sessions with no
+   *  usage rows). Paired with {@link served_provider} for the mismatch
+   *  check below; not itself rendered unless a future surface wants it. */
+  served_model?: null | string
+  /** Provider that actually served this session's most recent completed
+   *  turn — see {@link served_model}. Compare (case-insensitively) against
+   *  {@link configured_provider}: a difference means a fallback occurred and
+   *  the sidebar's secondary "via <provider>" note should show. Equal (or
+   *  either missing) means no mismatch — render nothing extra. */
+  served_provider?: null | string
   output_tokens: number
   /** Parent conversation when this row is a /branch fork. */
   parent_session_id?: null | string
@@ -581,6 +601,45 @@ export interface MessageReaction {
   author: 'agent' | 'user'
   /** Epoch seconds. */
   at: number
+}
+
+/**
+ * One structured memory/skill mutation from a self-improvement background
+ * review pass (`agent.background_review.collect_background_review_actions`
+ * on the backend). Carried on the `review.summary` gateway event's
+ * `actions` array alongside the compact summary text, so Desktop's
+ * self-improvement transcript row can expand into the individual
+ * add/replace/remove/create/patch/edit calls the review made — including
+ * terminal no-op/skipped/declined/failed outcomes — instead of collapsing
+ * everything into one opaque line. Detail is intentionally redacted: it
+ * never carries stored memory/profile/skill text or raw tool output.
+ * ROADMAP.md Phase 1 (Desktop transcript auditability). Field names mirror
+ * the backend's snake_case wire shape, matching the rest of this file's
+ * gateway-projected types.
+ */
+export interface ReviewActionRecord {
+  /** 'memory' | 'user' | 'skill' */
+  target: string
+  /** Display label for the target: "Memory" | "User profile" | "Skill". */
+  label: string
+  /** The tool's own action verb: 'add' | 'replace' | 'remove' | 'create' |
+   *  'patch' | 'edit' | 'unknown'. */
+  operation: string
+  success: boolean
+  /** The tool's own success/error message. */
+  message: string
+  /** Newer backends' explicit terminal outcome; absent on older backends. */
+  state?: 'completed' | 'no_op' | 'skipped' | 'declined' | 'failed'
+  /** Short user-facing explanation with source content redacted. */
+  reason?: string
+  /** Bounded, generic before/after description with source content redacted. */
+  change_summary?: string
+  /** Deprecated raw previews from older backends. Never emitted by new backends. */
+  content_preview?: string
+  old_preview?: string
+  new_preview?: string
+  /** Present on skill records when the skill name is known. */
+  skill_name?: string
 }
 
 export interface SessionMessage {
@@ -689,6 +748,7 @@ export interface SessionResumeResponse {
   // from the resume snapshot instead of being lost until server-side timeout.
   pending_clarify?: {
     answers?: Record<string, unknown>
+    notes?: Record<string, unknown>
     choices?: null | string[]
     multi_select?: boolean
     question?: string
@@ -726,6 +786,11 @@ export interface SessionRuntimeInfo {
   install_warning?: string
   model?: string
   personality?: string
+  /** Profile this payload answers for. The gateway resolves profile-scoped
+   *  fields (notably {@link approval_mode}) against the SESSION's own profile,
+   *  so consumers must credit this name rather than the ambient active
+   *  profile — the two differ for any background or non-focused session. */
+  profile_name?: string
   provider?: string
   reasoning_effort?: string
   running?: boolean
@@ -904,6 +969,13 @@ export interface CronJobCreatePayload {
   name?: string
   prompt: string
   provider?: string
+  /**
+   * Optional id of an EXISTING local session this job should resume and
+   * resubmit its stored `prompt` into (see cron/scheduler.py's resume
+   * branch), instead of spawning a fresh agent session — the seam
+   * "Resume at reset" schedules against (see rate-limit-recovery.ts).
+   */
+  resume_session_id?: string
   schedule: string
 }
 
@@ -920,6 +992,7 @@ export interface CronJobUpdates {
   name?: string
   prompt?: string
   provider?: null | string
+  resume_session_id?: null | string
   schedule?: string
 }
 

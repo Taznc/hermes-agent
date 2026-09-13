@@ -33,11 +33,13 @@ export function Zoomable({ children, overlay, onCopy, label = 'Open full view', 
   return (
     <>
       <div className={cn('group/zoomable relative', className)}>
-        {/* The whole content is the trigger — click anywhere to open, like an image. */}
+        {/* The whole content is the trigger — click anywhere to open, like an
+            image. No Tip: the zoom-in cursor and the hover Maximize badge
+            already teach the affordance; `label` stays as the accessible name. */}
         <button
+          aria-label={label}
           className="block w-full cursor-zoom-in text-left"
           onClick={() => setOpen(true)}
-          title={label}
           type="button"
         >
           {children}

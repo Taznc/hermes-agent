@@ -21,11 +21,14 @@ if TYPE_CHECKING:
 
 _REMOVABLE_KINDS = ("scratch", "worktree")
 
-# Statuses after which a child no longer needs its parent's workspace artifacts.
+# Statuses after which a child no longer needs its parent's workspace artifacts. The roadmap
+# lanes count as finished here: a wishlist card is inert and may sit for months, so treating one
+# as an active child would pin its parent's worktree forever.
 _ACTIVE_CHILDREN_SQL = (
     "SELECT 1 FROM task_links l "
     "JOIN tasks t ON t.id = l.child_id "
-    "WHERE l.parent_id = ? AND t.status NOT IN ('done', 'archived', 'failed', 'cancelled') "
+    "WHERE l.parent_id = ? AND t.status NOT IN "
+    "('done', 'archived', 'failed', 'cancelled', 'idea', 'roadmap') "
     "LIMIT 1"
 )
 

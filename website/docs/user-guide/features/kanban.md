@@ -33,7 +33,47 @@ The board has two front doors, both backed by the same `~/.hermes/kanban.db`:
 - **Agents drive the board through a dedicated `kanban_*` toolset** — `kanban_show`, `kanban_list`, `kanban_complete`, `kanban_request_review`, `kanban_request_changes`, `kanban_block`, `kanban_heartbeat`, `kanban_comment`, `kanban_attach`, `kanban_attach_url`, `kanban_attachments`, `kanban_create`, `kanban_link`, `kanban_unblock`. The dispatcher spawns each worker with these tools already in its schema; orchestrator profiles can also enable the `kanban` toolset explicitly. The model reads and routes tasks by calling tools directly, *not* by shelling out to `hermes kanban`. See [How workers interact with the board](#how-workers-interact-with-the-board) below.
 - **You (and scripts, and cron) drive the board through `hermes kanban …`** on the CLI, `/kanban …` as a slash command, or the dashboard. These are for humans and automation — the places without a tool-calling model behind them.
 
-Both surfaces route through the same `kanban_db` layer, so reads see a consistent view and writes can't drift. The rest of this page shows CLI examples because they're easy to copy-paste, but every CLI verb has a tool-call equivalent the model uses.
+Both surfaces route through the same `kanban_db` layer, so reads see a consistent view and writes can't drift.
+
+Kanban can also auto-route new cards at create time when a profile enables `kanban.model_routing`.
+The selector looks only at the new card's title and body, stores the chosen route on the task, and
+never reruns on review, unblock, or retry transitions. The CLI's JSON `show` output and the
+dashboard task payload include the route provenance (`route_source`, `route_name`, and the resolved
+`reasoning_effort`) so you can audit how a card was classified.
+
+### Create-time routing policy
+
+`kanban.model_routing` is disabled by default, and its shipped defaults are deliberately inert:
+setting `enabled: true` alone cannot make a classifier call or select a route. Each profile independently
+configures its classifier provider/model and every eligible candidate route; profiles do not inherit this
+policy from the default profile. The classifier only sees the new card's title/body and must return either
+`default` or one of those configured named routes. Any malformed, unavailable, unsupported, or failed
+classification falls back to `default`, which means the assignee profile keeps its own
+model/provider/reasoning settings.
+
+Explicit task-level `model`, `provider`, and `reasoning_effort` overrides always win over routing.
+The route itself should be treated as a conservative safety gate, not a general optimizer: only
+configure cheap routes you are comfortable using for narrow, mechanical work.
+
+```yaml
+kanban:
+  model_routing:
+    enabled: false
+    classifier:
+      provider: openai-codex
+      model: gpt-5.4-mini
+      max_input_tokens: 8000
+    routes:
+      mechanical:
+        provider: openai-codex
+        model: gpt-5.4-mini
+        reasoning_effort: medium
+```
+
+The resolved route provenance is written back to the task row (`route_source`, `route_name`, and the
+ effective `reasoning_effort`) and stays stable across review, retry, unblock, and reclaim.
+
+The rest of this page shows CLI examples because they're easy to copy-paste, but every CLI verb has a tool-call equivalent the model uses.
 
 This is the shape that covers the workloads `delegate_task` can't:
 
@@ -112,15 +152,172 @@ They coexist: a kanban worker may call `delegate_task` internally during its run
   (e.g. one per project, repo, or domain); see [Boards (multi-project)](#boards-multi-project)
   below. Single-project users stay on the `default` board and never see the
   word "board" outside this docs section.
-- **Task** — a row with title, optional body, one assignee (a profile name), status (`triage | todo | ready | running | blocked | review | done | archived`), optional tenant namespace, optional idempotency key (dedup for retried automation).
+- **Task** — a row with title, optional body, one assignee (a profile name), status (`triage | todo | ready | running | blocked | review | done | archived`, plus the inert `idea | roadmap` [roadmap lanes](#roadmap-lanes-idea--roadmap)), optional tenant namespace, optional idempotency key (dedup for retried automation).
 - **Link** — `task_links` row recording a parent → child dependency. The dispatcher promotes `todo → ready` when all parents are `done`.
 - **Comment** — the inter-agent protocol. Agents and humans append comments; when a worker is (re-)spawned it reads the full comment thread as part of its context.
 - **Workspace** — the directory a worker operates in. Three kinds:
   - `scratch` (default) — fresh tmp dir under `~/.hermes/kanban/workspaces/<id>/` (or `~/.hermes/kanban/boards/<slug>/workspaces/<id>/` on non-default boards). **Deleted when the task completes** — scratch is ephemeral by design. Files explicitly declared through `kanban_complete(artifacts=[...])` are copied into durable per-task attachment storage before cleanup; existing deliverable paths in legacy completion summaries receive the same treatment. Other scratch files are removed. A missing declared scratch artifact keeps the task in-flight so the worker can correct the path and retry. Use `worktree:` or `dir:<path>` when the whole workspace should remain available. The first time a scratch workspace is created on an install, the dispatcher logs a warning and emits a `tip_scratch_workspace` event on the task (visible via `hermes kanban show <id>`).
   - `dir:<path>` — an existing shared directory (Obsidian vault, mail ops dir, per-account folder). **Must be an absolute path.** Relative paths like `dir:../tenants/foo/` are rejected at dispatch because they'd resolve against whatever CWD the dispatcher happens to be in, which is ambiguous and a confused-deputy escape vector. The path is otherwise trusted — it's your box, your filesystem, the worker runs with your uid. This is the trusted-local-user threat model; kanban is single-host by design. **Preserved on completion.**
   - `worktree` — a git worktree under `.worktrees/<id>/` for coding tasks. Use `worktree:<path>` to pin the exact target path. Worker-side `git worktree add` creates it, using `--branch` when provided. **Preserved on completion.**
-- **Dispatcher** — a long-lived loop that, every N seconds (default 60): reclaims stale claims, reclaims crashed workers (PID gone but TTL not yet expired), promotes ready tasks, atomically claims, spawns assigned profiles. Runs **inside the gateway** by default (`kanban.dispatch_in_gateway: true`). One dispatcher sweeps all boards per tick; workers are spawned with `HERMES_KANBAN_BOARD` pinned so they can't see other boards. After `kanban.failure_limit` consecutive spawn failures on the same task (default: 2) the dispatcher auto-blocks it with the last error as the reason — prevents thrashing on tasks whose profile doesn't exist, workspace can't mount, etc.
+- **Dispatcher** — a long-lived loop that, every N seconds (default 60): reclaims stale claims, reclaims crashed workers (PID gone but TTL not yet expired), promotes ready tasks, atomically claims, spawns assigned profiles. Runs **inside the gateway** by default (`kanban.dispatch_in_gateway: true`). One dispatcher sweeps all boards per tick; workers are spawned with `HERMES_KANBAN_BOARD` pinned so they can't see other boards. After `kanban.failure_limit` consecutive spawn failures on the same task (default: 2) the dispatcher auto-blocks it with the last error as the reason — prevents thrashing on tasks whose profile doesn't exist, workspace can't mount, etc. Deaths classified as infra (external SIGTERM/SIGKILL, a startup-window dead PID, or a provider quota/429 signature) do NOT tick this counter directly — see `docs/kanban/infra-failure-classification.md` for the exact signal allowlist, the bounded `kanban.max_infra_interruptions` streak that still eventually counts a repeatedly-interrupted task, and `kanban.provider_backoff`/`kanban.provider_backoff_max_seconds` for provider-wide quota parking.
 - **Tenant** — optional string namespace *within* a board. One specialist fleet can serve multiple businesses (`--tenant business-a`) with data isolation by workspace path and memory key prefix. Tenants are a soft filter; boards are the hard isolation boundary.
+
+### Priority
+
+`tasks.priority` is a plain integer column with a documented 4-tier
+convention: `critical=2`, `high=1`, `normal=0` (the default), `low=-1`. Set it
+at creation (`hermes kanban create --priority 2` or `kanban_create(...)`) or
+later (`hermes kanban update <id> --priority ...`); `hermes kanban list` and
+`hermes kanban show` render a recognized tier by name, and any other integer
+by its bare number.
+
+Priority is a **dispatch-order tiebreaker by default** — among tasks otherwise
+ready to run for the same assignee, higher priority is picked sooner. On its
+own it does **not** reserve capacity and does **not** preempt a task that is
+already running, and it never affects model or reasoning-effort routing.
+Values outside the four-tier scale are accepted as-is (not clamped or
+migrated) and keep their relative order.
+
+#### Reserving worker slots for high-priority cards
+
+Ordering alone cannot help a Critical card when the worker pool is already
+saturated: it waits for a slot exactly as long as a Normal card would. Two
+opt-in settings give priority real scheduling power:
+
+| Key | Default | Meaning |
+|---|---|---|
+| `kanban.priority_reserved_slots` | `0` (off) | How many of a tick's ready-lane slots to hold for high-priority cards |
+| `kanban.priority_reserved_threshold` | `1` (High and above) | The priority at or above which a card draws on the reservation |
+
+**The default is off.** At `priority_reserved_slots: 0` dispatch behaves
+exactly as it always has — this changes scheduling on a live fleet, so it
+ships inert and you opt in.
+
+When it is on, below-threshold **ready** cards may consume at most
+`ready_budget - reserved` of the tick's slots, while at-or-above-threshold
+ready cards may use the full budget. A slot is only held when a qualifying
+card actually wants one this tick: unclaimed in `ready`, with an assignee that
+names a real profile. An unassigned Critical card, or one on a control-plane
+lane pulled by a terminal via `claim_task`, generates no demand and cannot
+hold a slot hostage — nothing would ever spawn into it.
+
+**Slots nobody is queued for fall through to normal work in the same tick.**
+With no qualifying ready card waiting — or fewer of them than you configured
+slots — the unclaimed remainder goes to normal work immediately, not on some
+later tick.
+
+**A slot claimed by a queued high-priority card may sit idle, deliberately.**
+When a Critical card wants a slot but cannot spawn this tick (its assignee is
+at `max_in_progress_per_profile`, a co-edit serialization is in force, a
+respawn guard is cooling down), the reservation keeps holding that slot rather
+than lending it to normal work. That is the whole point of the setting: it is
+what stops normal work from re-saturating the pool before the Critical card
+becomes eligible. It is also its cost — capacity can stand idle for as long as
+that demand exists. `hermes kanban dispatch --dry-run` reports it as
+`unused` rather than hiding it, and below-threshold work still receives
+`ready_budget - reserved`.
+
+**The review lane is separate.** `review` already reserves a slot of its own
+so a sustained ready backlog cannot starve reviews, regardless of priority.
+A high-priority card in `review` therefore does *not* additionally draw on
+this reservation, and the reserved/unused counters describe the ready-lane
+reservation only.
+
+The reservation grants **earlier access to a slot — never preemption**. It
+never reclaims, pauses, or kills a running worker to make room: reclaiming
+would discard that worker's uncommitted worktree, the same way restarting the
+gateway does. A high-priority card waits for the next slot to free naturally;
+it simply is not overtaken by normal work while waiting.
+
+It composes with, and never overrides, every existing gate. The review-lane
+reservation, `max_in_progress`, `max_in_progress_per_profile`, the
+`dispatch_start_budget` window and the memory-pressure clamp all still bind:
+a high-priority card blocked by the per-profile cap records
+`skipped_per_profile_capped` and does **not** spawn — its slot is simply held
+rather than handed to normal work. The reservation can only narrow what
+below-threshold cards may take; it never grants capacity a cap withheld.
+
+Both settings are re-read every dispatcher tick, so retuning them takes effect
+without restarting the gateway (a restart SIGKILLs every in-flight worker).
+`hermes kanban dispatch --dry-run` reports how many slots were reserved, how
+many went unused, and which normal cards were held back, so the setting is
+observable rather than invisible.
+
+When a triage card is fanned out via `decompose`, every child **inherits the
+root's priority** unless the decomposer explicitly assigns a different
+per-child priority — a Critical card does not silently demote its own
+children to Normal.
+
+## Roadmap lanes (`idea` / `roadmap`)
+
+Every other column is eventually acted on by something — the dispatcher spawns
+`ready`, the promotion sweep moves `todo`, auto-decompose chews through
+`triage`, the reaper reclaims `running`. That leaves nowhere to write down
+"we should do this someday" without it becoming work.
+
+Two statuses exist for exactly that:
+
+- **`idea`** — rough, unrefined capture. Type a sentence and forget it.
+- **`roadmap`** — hashed out with you and agreed in shape, but **still not
+  authorized to execute**.
+
+Both are **inert by construction**. No sweep, dispatcher query, promotion
+pass, decomposer, specifier, `recompute_ready`, or stale/crash reaper selects
+them, because each of those selects an explicit list of statuses and neither
+lane name appears in any of them. A board of nothing but lane cards can run
+the dispatcher forever and nothing happens — there is a regression test that
+seeds 100 lane cards, runs a full tick plus both triage sweeps, and asserts
+zero events and zero row changes.
+
+They are also **not live work** for health and cost purposes: they are
+excluded from the active-task count in `hermes kanban stats`, from the
+"dispatcher stuck" heuristic, and from workspace-retention checks. They stay
+fully visible in `hermes kanban list` and on the dashboard.
+
+`assignee` is optional on a lane card — nothing dispatches it, so naming a
+profile would be noise.
+
+### Transitions
+
+Cards enter a lane **only at creation**. That is deliberate: it means your
+existing `block`/`hold`/`unblock` habits can never accidentally park live work
+in the wishlist, and `on_hold` (a deliberate pause of *real* work) keeps its
+meaning.
+
+| From | To | Verb |
+|---|---|---|
+| *(creation)* | `idea` | `hermes kanban create "…" --idea` |
+| *(creation)* | `roadmap` | `hermes kanban create "…" --roadmap` |
+| `idea` | `roadmap` | `hermes kanban refine <id>` |
+| `idea` | `archived` | `hermes kanban archive <id>` |
+| `roadmap` | `triage` | `hermes kanban spawn <id>` (default) |
+| `roadmap` | `ready` | `hermes kanban spawn <id> --to ready` |
+| `roadmap` | `idea` | `hermes kanban demote <id>` |
+| `roadmap` | `archived` | `hermes kanban archive <id>` |
+
+Everything else raises an error naming the attempted `from -> to`. In
+particular a live card can never be moved *into* a lane, and an `idea` cannot
+spawn directly — refine it first.
+
+**`spawn` lands in `triage` by default** so auto-decompose gets to re-specify
+or split the item before anyone works it; a roadmap note is rarely a
+well-formed task. Use `--to ready` to skip that when it already is one.
+
+Each transition appends an event (`refined`, `demoted`,
+`spawned_from_roadmap`), so the path from "idle thought" to "shipped" stays
+auditable.
+
+### Other surfaces
+
+- **Dashboard** — `idea` and `roadmap` are columns after `done`. Dragging
+  between them refines/demotes; dragging a `roadmap` card into `triage`/`ready`
+  spawns it. Dragging live work into a lane is refused with the attempted
+  transition in the error.
+- **Idea inbox** — the dashboard's idea-capture dialog and the per-card "send
+  to roadmap ideas" action create an `idea` card on the active board.
+- **Agents** — orchestrator profiles get `kanban_create(lane=...)` and
+  `kanban_roadmap(action="refine"|"demote"|"spawn")`. Dispatcher-spawned task
+  workers do not see the lane tools.
 
 ## Boards (multi-project)
 
@@ -268,6 +465,14 @@ hermes kanban stats
 
 When the dispatcher picks up `t_abcd` and spawns the `researcher` profile, the very first thing that worker's model does is call `kanban_show()` to read its task. It doesn't run `hermes kanban show t_abcd`.
 
+### Creation gates and dependency gates
+
+Use an explicit initial `blocked` status only when a card deliberately needs an
+operator precondition before any work can begin. Creation records that decision
+and directs readers to the card's precondition/body; it is not a worker failure.
+For work that merely waits for parent cards, create it normally with its parent
+links. It enters `todo` and promotes automatically after its parents complete.
+
 ### Gateway-embedded dispatcher (default)
 
 The dispatcher runs inside the gateway process. Nothing to install, no
@@ -282,7 +487,185 @@ kanban:
   review_dispatch: true            # default: spawn the assigned profile with
                                    # the bundled sdlc-review skill. Set false
                                    # for human-only review boards.
+  dispatch_start_budget: 20        # optional: starts per board/window before
+  dispatch_start_window_seconds: 600
+  review_rework_escalation_profile: debugger  # optional: route rework after
+                                               # two changes-requested cycles
 ```
+
+`dispatch_start_budget` is a rolling per-board start rate limit, not a
+concurrency cap or a manual circuit. The dispatcher counts real `spawned`
+events independently for each board and defers new workers after the configured
+limit. Its durable cooldown status reports `rate limited until <time>`; on the
+next gateway, CLI, or dashboard dispatch tick after the recorded start whose
+expiry restores capacity leaves the window, the status clears and exactly the
+available capacity starts automatically. This remains exact if a hot reload
+lowers the budget or expands the window. Configuration is hot-reloaded by the
+gateway.
+
+A completed/archived terminal event that appears dispatchable without a later
+explicit unarchive, or an unreadable pause-state file, is instead a safety
+pause. Those states report `manual intervention required` and remain stopped
+until `hermes kanban --board <slug> dispatch --resume-circuit` after the
+operator repairs or investigates the condition.
+
+#### Shared launcher prerequisite outage
+
+A failed restart-safe user-scope availability probe raises the structured
+`RestartSafeScopeUnavailable` error (`systemd_user_scope_unavailable`). This
+pauses the affected board immediately: ready and review cards keep their status
+and failure budgets, and the triggering run closes as `spawn_deferred`, not a
+task failure. Ordinary credential, configuration, or workspace errors still use
+the normal per-task retry policy; matching error text alone does not trip this
+circuit.
+
+The pause survives dispatcher restarts. Normally it is an atomic JSON sentinel
+beside the board database; if that write fails but SQLite is writable, a
+board-owned SQLite record keeps the pause authoritative. Deleting the triggering
+task or its history does not clear that fallback. Unreadable pause state also
+fails closed. Inspect the reason, fault code, time, and recovery action with:
+
+```bash
+hermes kanban --board <slug> dispatch --circuit-status
+```
+
+Repair the user-scope prerequisite and any reported pause-storage failure, then
+explicitly clear the circuit:
+
+```bash
+hermes kanban --board <slug> dispatch --resume-circuit
+```
+
+Resume clears both stores under the dispatch lock; if a tick owns the lock,
+resume refuses and must be retried. There is no timed auto-resume. If the
+prerequisite is still broken, the next attempt trips the board again before
+siblings are launched. If both JSON and SQLite persistence fail, the current
+tick stops, but durable recovery and task reconciliation cannot be guaranteed
+until storage is repaired.
+
+#### Pausing dispatch for maintenance
+
+Workers run inside the gateway's cgroup, so restarting or updating the gateway
+while any are running kills them and discards uncommitted worktree progress.
+Pause the board first, let it drain, then restart:
+
+```bash
+hermes kanban --board <slug> dispatch --pause "gateway restart"
+hermes kanban --board <slug> stats          # watch running reach 0
+# ... restart the gateway ...
+hermes kanban --board <slug> dispatch --resume-circuit
+```
+
+`--pause` uses the same durable circuit as the safety pauses above, so it
+survives the very restart it exists for. It stops the board **claiming and
+spawning new workers only** — it never terminates a worker that is already
+running, and a running worker can still complete or block normally while the
+board drains. The optional note is recorded on the pause and shown by
+`--circuit-status`, alongside who paused it and when. Pausing an
+already-paused board is a no-op that preserves the existing record, so it can
+never overwrite a safety pause's recovery guidance. Like resume, it refuses
+(exit 1) rather than racing a dispatch tick that holds the board lock; retry a
+moment later.
+
+The Desktop Kanban board exposes the same control in its orchestration
+settings panel, with a live "N running — draining" / "0 running — safe to
+restart" indicator. On **All Boards**, separate **Pause all boards** and
+**Resume all boards** actions apply the circuit to every active board and the
+indicator totals workers across that scope. Already-running workers continue;
+if one board is busy, the other board results are preserved and the control
+stays actionable for a retry.
+
+#### Post-drain actions ("After drain…")
+
+The window above still needs someone present at the moment the board reaches 0.
+A **post-drain action** removes that: queue the intent up front, and the
+dispatcher's own tick fires it once the board (or, for an aggregate request,
+every selected board) has drained. No browser, dashboard poll, or wall-clock
+scheduler is involved, and the record survives the very restart it exists for.
+
+Three action kinds ship, all configured under `kanban.post_drain`:
+
+| Kind | Target | What it does |
+|---|---|---|
+| `service_restart` | An allowlisted **unit name** | `systemctl restart <unit>` |
+| `run_script` | An allowlisted **script name** | Runs that script as the gateway user |
+| `reboot` | none | Reboots the host |
+
+```yaml
+kanban:
+  post_drain:
+    # Units `service_restart` may restart, by exact name.
+    service_restart_allowlist:
+      - hermes-gateway.service
+    # "system" (systemctl) or "user" (systemctl --user).
+    service_restart_scope: system
+    # Scripts `run_script` may run, as NAME -> ABSOLUTE PATH.
+    script_allowlist:
+      fork-sync: /home/me/projects/hermes/scripts/fork-sync.sh
+      log-rotate: /home/me/bin/rotate-agent-logs.sh
+    default_expiry_seconds: 3600
+    max_expiry_seconds: 86400
+```
+
+Both allowlists are **empty by default**, which makes their kinds unqueueable.
+A queued action runs unattended, so what may run is an explicit local decision
+rather than an inherited one. A request may only **name** an entry that is
+already in the allowlist — it can never supply a unit, a path, or arguments of
+its own, which is why there is no freeform command form of this feature.
+
+`service_restart` resolves without a name when exactly one unit is allowlisted.
+`run_script` always requires the name: a unit name is a stable host fact, but a
+script name is an arbitrary local label, and an allowlist that later grows a
+second entry would silently change what an unnamed request had meant.
+
+Every record carries a mandatory **expiry** (`default_expiry_seconds`, bounded
+by `max_expiry_seconds`), so a pause that never drains lets the action expire
+instead of firing hours later into a state nobody expects. Resuming dispatch
+cancels a waiting action, and a waiting action can be cancelled directly from
+the panel; an action already firing is left alone.
+
+Success is an **observed** post-condition, never a bare exit code:
+`service_restart` requires the unit to come back `active` with a strictly newer
+start timestamp, `reboot` is confirmed from the other side by a changed machine
+instantiation, and `run_script` is judged on the script's exit status with a
+bounded tail of its stdout/stderr captured onto the record — so a failure is
+diagnosable from the dashboard rather than reading only "state: failed".
+Scripts run as the gateway user with a hard timeout and **no privilege
+escalation**: unlike the systemd kinds, there is no `sudo -n` fallback, because
+an allowlist of arbitrary local scripts must not become an allowlist of root
+shells.
+
+`review_rework_escalation_profile` breaks pathological implementation/review
+loops without removing review: the first changes request returns to the original
+implementer; after the second, the next ready run is reassigned to the configured
+specialist under that profile's own model defaults.
+
+`max_review_rounds` (default `3`, set `0` to disable) is the dispatcher's hard
+stop on that same loop: once a card accumulates this many `changes_requested`
+cycles since its last completion, the dispatcher blocks it (kind
+`review_round_cap`, visible via the card's status and its `review_round_cap`
+event in `hermes kanban show <id>`, as a dedicated `review_round_cap`
+diagnostic — round count, cap, and last reviewer reason — in
+`hermes kanban diagnostics`, and as a `blocked_review_round_cap` entry in both
+the text and `--json` output of `hermes kanban dispatch`) instead of
+re-dispatching it to the
+implementer or the escalation profile — `review_rework_escalation_profile`
+still fires first for rounds under the cap. It is a hard stop; the
+reviewer-side round-count guidance in the sdlc-review skill is advisory
+only. An operator's explicit reassignment after the last `changes_requested`
+event bypasses both mechanisms, the same escape hatch
+`review_rework_escalation_profile` already honors. A card that hits the cap
+needs an explicit `kanban unblock` to resume — the round count itself is not
+reset by unblocking, only by completion, so simply unblocking a
+still-cycling card immediately re-trips the cap on the next tick.
+
+An operator-set model/provider/reasoning override (set at task creation with
+an explicit model, or later via `kanban set-model`) survives both
+`review_rework_escalation_profile` and the round cap's handoff — only an
+override the create-time routing classifier picked (`kanban.model_routing`)
+is cleared when a card moves to the escalation profile, matching that
+profile's own model defaults the way a classifier pick already did before an
+operator ever touched the card.
 
 Override the config flag at runtime via `HERMES_KANBAN_DISPATCH_IN_GATEWAY=0`
 for debugging. Standard gateway supervision applies: run `hermes gateway
@@ -298,6 +681,79 @@ the old standalone daemon alive for one release cycle, but running both
 a gateway-embedded dispatcher AND a standalone daemon against the same
 `kanban.db` causes claim races and is not supported.
 
+### Worker process lifetime (systemd, opt-in)
+
+By default a spawned worker is a direct child of the dispatcher (a plain
+`subprocess.Popen`, `start_new_session=True`): this is the fallback story on
+every platform and the exact behavior described above with nothing set.
+
+On Linux hosts running the gateway under systemd, an operator can decouple a
+worker's lifetime (and memory accounting) from the dispatching gateway
+process — so a `systemctl restart hermes-gateway` no longer kills in-flight
+kanban workers — via `kanban.worker_launcher`:
+
+```yaml
+# config.yaml
+kanban:
+  worker_launcher: []   # default: today's plain Popen, every platform
+  # Example opt-in value (Linux/systemd only):
+  # worker_launcher:
+  #   - "systemd-run"
+  #   - "--user"
+  #   - "--scope"
+  #   - "--slice=hermes-workers.slice"
+  #   - "--collect"
+  #   - "--property"
+  #   - "MemoryAccounting=yes"
+  #   - "--property"
+  #   - "MemoryHigh=1073741824"
+  #   - "--property"
+  #   - "MemoryMax=2147483648"
+```
+
+`worker_launcher` is an argv **prefix**: the dispatcher appends
+`--unit=kanban-<task_id>-run-<run_id>.scope` and the trailing `-- <worker command>`
+itself, so operators supply only the launcher binary and its own flags. The
+launcher binary is resolved with `shutil.which()` at spawn time; if it can't
+be found the dispatcher logs a warning and spawns that worker with a plain
+`Popen` instead of failing the task (fail-open — a misconfigured launcher
+must never stall the board). A `systemd-run --user` entry is additionally
+checked for a reachable user D-Bus socket (`XDG_RUNTIME_DIR`/
+`DBUS_SESSION_BUS_ADDRESS`, resolved from the process uid when absent from
+the environment — the gateway's own environment commonly lacks them); when
+the socket can't be found this also fails **closed** to a plain `Popen`
+spawn, since a `systemd-run --user` invocation with no reachable bus fails
+outright ("Failed to connect to bus") rather than degrading on its own. The
+launcher applies to whatever argv is about to be `Popen`'d — including
+after any restart-safe rewrap that already happened for a supervised
+gateway worker — never gated on argv identity.
+
+The default (`[]`) is a byte-identical no-op on Windows, macOS, and
+non-systemd Linux: there is no OS-conditional branch in core beyond the
+existing Windows `creationflags` guard, so leaving this unset never changes
+behavior on any platform.
+
+When a worker is spawned through a launcher that mints a systemd `--user
+--scope` unit, the dispatcher still uses `_pid_alive()` as the primary
+liveness signal every tick (parentage-independent, so this composes with
+gateway restarts exactly like the no-launcher path). `--scope` is a
+transparent exec (systemd execs the target process directly into the
+scope's cgroup rather than forking a separate wrapper), so in the common
+case the spawned worker remains a real, direct, waitpid-able child of the
+dispatcher process and its exit is classified with full fidelity by the
+same `os.waitpid`-based path used for the no-launcher default — no systemd
+status query is consulted or needed. The one case this cannot resolve is
+when the worker is no longer this process's child at all (e.g. a gateway
+restart re-adopted the task and this dispatcher process never reaped that
+pid itself); that case classifies as the neutral `"unknown"` outcome,
+which the infra-interruption bucket (`kanban.max_infra_interruptions`)
+bounds rather than the dispatcher inventing a systemd-derived verdict for
+it. Termination during a reclaim prefers `systemctl --user stop <unit>`
+over a bare PID signal when a `worker_unit` is recorded, since a scope may
+contain descendants a single-PID signal wouldn't reach; that stop is only
+treated as successful once the worker's PID is corroborated as actually
+gone, never on an unqualified "unit not loaded" response alone.
+
 ### Idempotent create (for automation / webhooks)
 
 ```bash
@@ -308,6 +764,63 @@ hermes kanban create "nightly ops review" \
     --idempotency-key "nightly-ops-$(date -u +%Y-%m-%d)" \
     --json
 ```
+
+### Approving and landing a card (`hermes kanban approve` / `land`)
+
+A card that will be **landed** is approved with `hermes kanban approve`, not
+`complete`. Completion reaps the task worktree and its `wt/` branch on the spot,
+and that tree is exactly the evidence landing re-verifies — so approval instead
+records an explicit verdict bound to the reviewed commit and leaves the card in
+`review`, intact, awaiting the attended landing. (`complete` remains right for a
+card whose life genuinely ends at review.)
+
+```bash
+# Reviewer verdict: card stays in review, worktree and branch preserved
+hermes kanban approve t_abc
+
+# Configure the target once per board, then land by id
+hermes kanban boards set-land-target default origin/dev
+hermes kanban land t_abc
+
+# Or name it explicitly; batch and dry-run are supported
+hermes kanban land t_abc t_def --target origin/dev --dry-run --json
+```
+
+`land` turns that approval into a verified merge — replacing the manual
+archaeology of checking the board, the worktree, the push state, git ancestry
+and the remote by hand before every cleanup.
+
+It is **attended only** — nothing runs it automatically — and every gate fails
+closed with a reason code rather than merging on an assumption:
+
+- The target is read from `--target` or the board's `land_target` and **never
+  inferred**. A repository with both a fork and an upstream configured has no
+  safe default, so with neither set the command refuses. Output always names
+  the remote and branch, refusals included.
+- It requires a live `hermes kanban approve` verdict (a `done` status alone is
+  not approval, and an approval is retired by a newer `changes_requested` or a
+  newer review request), no live worker, satisfied dependencies, a clean
+  worktree, and a branch published at **exactly the approved commit** — a branch
+  that moved after review refuses, because verification is not review.
+- Fetching, pushing and reading back all address the remote's resolved **push
+  URL**, so a `pushurl` pointing at a second repository can never let it verify
+  one destination while writing another.
+- It requires verification evidence for that exact commit: either the board's
+  `land_verify` command re-run now, or a `pre_review_gate` / `verification`
+  receipt naming the same commit — read from the approval run or from the
+  review handoff, which is where the implementer's own pre-review gate lands.
+- It fetches the target, merges in a throwaway worktree, pushes **without
+  force**, then re-reads the remote and only closes the card once the content is
+  provably present there. "Already present" is judged against the target's
+  current tip, so a squash-merged card reads as already landed while
+  applied-then-reverted work correctly does not. Re-running a landing is safe
+  and idempotent.
+- `--dry-run` mutates nothing at all — no fetch, no worktree, no ref, and it
+  does not run the configured `land_verify` command either — and `--json`
+  returns one verdict per task. In a batch, one refusal never affects another
+  card.
+
+Full safety model and per-step recovery: `docs/kanban/landing.md` in the repo.
 
 ### Bulk CLI verbs
 
@@ -445,6 +958,36 @@ Keep secrets, raw logs, tokens, OAuth material, and unrelated transcripts out of
 tests, say so explicitly in `summary` and use `metadata` for the evidence that
 does exist, such as source URLs, issue ids, or manual review steps.
 
+### Efficient engineering task packets
+
+Worker startup is paid context, so put discovery that is already known into the
+card instead of making every lane rediscover it. An engineering card should
+name:
+
+- the exact edit targets and ownership boundary;
+- the base branch and relevant existing commits;
+- acceptance criteria and the focused verification commands;
+- known baseline failures;
+- inherited decisions and prior reviewer findings;
+- the upstream duplicate/prior-art search result, source, and timestamp.
+
+Run the prior-art search once when the parent or orchestrator files the work.
+Children inherit that evidence and refresh it only when absent or stale. Assigned
+skills are preloaded into the worker process before its first model turn; workers
+should use that loaded content rather than spending a tool cycle loading the same
+skill again.
+
+Target one testable behavior or architectural seam per card—usually roughly one
+to four hours of agent work. Split work that crosses UI, backend, persistence,
+and deployment ownership boundaries, and always declare `Edit-Targets:` so the
+dispatcher can serialize collisions. Do not create microcards whose workspace,
+prompt, review, and handoff overhead exceeds their implementation.
+
+Use staged verification: the worker runs focused checks for its changed paths;
+the reviewer independently selects checks from the diff's risks; one explicit
+integration/release child runs the full applicable suite on the combined branch.
+Do not make every lane rerun the same unchanged full suite.
+
 ### The worker lifecycle
 
 Every profile that works kanban tasks automatically gets the worker lifecycle — it's injected into the worker's system prompt at spawn (the `KANBAN_GUIDANCE` block), so there is **nothing to install or configure**. It teaches the worker the full lifecycle in **tool calls**, not CLI commands:
@@ -452,9 +995,9 @@ Every profile that works kanban tasks automatically gets the worker lifecycle �
 1. On spawn, call `kanban_show()` to read title + body + parent handoffs + prior attempts + full comment thread.
 2. `cd $HERMES_KANBAN_WORKSPACE` (via the terminal tool) and do the work there.
 3. Call `kanban_heartbeat(note="...")` every few minutes during long operations. **If your work may run longer than 1 hour, call `kanban_heartbeat` at least once an hour** — the dispatcher reclaims tasks that have been running past `kanban.dispatch_stale_timeout_seconds` (default 4 h) with no heartbeat in the last hour, on the assumption the worker crashed without cleanup. A reclaim is benign (the task goes back to `ready` for re-dispatch without a failure-counter tick) but you lose your current run's progress.
-4. Complete with `kanban_complete(summary="...", metadata={...})`, or `kanban_block(reason="...")` if stuck.
+4. Complete with `kanban_complete(summary="...", metadata={...})`, `kanban_block(reason="...")` if stuck, or hand off with `kanban_request_review(summary="...")` / `kanban_request_changes(reason="...")` — all four are board-terminal for the current run.
 
-That final `kanban_complete` / `kanban_block` call is part of the worker
+That final board-terminal call is part of the worker
 protocol. If the worker process exits with status 0 while the task is still
 `running`, the dispatcher treats that as a protocol violation and emits a
 `protocol_violation` event.
@@ -463,7 +1006,9 @@ protocol. If the worker process exits with status 0 while the task is still
 synthetic nudges when it detects the model is about to stop without a terminal
 board tool call. This catches the common case where the model narrates the next
 step ("Let me write the report") and stops with `finish_reason=stop`. The nudge
-reminds the model to call `kanban_complete` or `kanban_block` immediately. This
+reminds the model to call `kanban_complete`, `kanban_block`,
+`kanban_request_review`, or `kanban_request_changes` immediately — any of the
+four satisfies the guard, since each closes out the current run. This
 guard is active only for dispatcher-spawned workers (`HERMES_KANBAN_TASK` is
 set) and can be disabled with `HERMES_KANBAN_STOP_NUDGE=0`.
 
@@ -516,6 +1061,30 @@ hermes kanban create "audit auth flow" \
 
 The dispatcher emits one `--skills <name>` flag per skill listed, so the worker spawns with all of them loaded on top of the auto-injected kanban guidance. The skill names must match skills that are actually installed on the assignee's profile (run `hermes skills list` to see what's available); there's no runtime install.
 
+#### Profile-scoped skill preflight
+
+Profiles have **isolated** skill registries, so a skill installed for the profile that files a card is not necessarily available to the profile that will run it. Because a forced skill that the worker cannot load kills it during initialization — before any work happens — every surface preflights the card's skills against the **assignee's own profile home**:
+
+- **Create** (`hermes kanban create`, the `kanban_create` tool, the dashboard dialog) refuses the card before writing the row, naming the profile and each missing skill.
+- **Assign / reassign** re-runs the same check against the new profile — including the reviewer handoff, and *before* `--reclaim` releases a running worker — so moving a card cannot introduce the mismatch either.
+- **The dispatcher** re-checks before claiming, which catches imported boards and rows written before this check existed. A mismatch blocks the card once with a `capability` block; no worker is spawned, and neither the retry budget nor the board's start budget is charged. Any failure count left over from initialization-only crashes is cleared at the same time, so fixing the configuration and unblocking the card resumes it with a clean counter.
+
+The verdict comes from the **same loader the worker runs at startup**, executed under the assignee's own home, not from a list of installed skill names. That means the preflight agrees with the worker on every way a name fails to load: absent, operator-disabled, ambiguous across skill directories (the loader refuses to guess between two same-named skills), gated to another OS by a `platforms:` tag, or an unresolvable `plugin:skill` / `category:skill` spelling.
+
+The check never falls back to another profile's registry: a profile whose home cannot be inspected (missing, tombstoned, unreadable) **fails closed** with a distinct diagnostic rather than assuming the skill is present. Board import and other deliberate "write the row now, validate at dispatch" paths opt out explicitly with `create_task(..., skill_preflight=False)`; the dispatcher still refuses to spawn such a card.
+
+Every surface reports the refusal with the same machine-readable fields, so automation can key on the code instead of parsing the message:
+
+| Field | Meaning |
+| --- | --- |
+| `code` | `kanban_skill_missing`, or `kanban_skill_profile_unavailable` when the profile could not be inspected |
+| `profile` | The assignee profile the skills were resolved against |
+| `missing_skills` | The card's skills that profile cannot load |
+
+They appear as extra keys on the `kanban_*` tool's error JSON, as the `detail` object of the dashboard's HTTP 400, and on stdout from `hermes kanban create/assign/reassign --json`. Without `--json` the CLI keeps its plain-English message.
+
+To fix a rejected card, either install/enable the skill for that profile (`hermes -p <profile> skills list` to inspect, then install it or remove it from `skills.disabled` in that profile's `config.yaml`), or drop the skill from the card.
+
 ### Per-task model override
 
 Pin a task's worker to a specific model (and optionally provider), independent of the assignee profile's default:
@@ -531,6 +1100,27 @@ hermes kanban set-model t_abcd none    # clear the override
 ```
 
 The dispatcher spawns the worker with the pinned model (`--provider <name>` is passed when set; `--provider` requires a model). The dashboard's per-task model dropdown drives the same `model_override` field. With no override, the worker uses its profile's configured model.
+
+### Per-task reasoning effort
+
+Pin a task's worker to a specific thinking depth, independent of the model override — a task can run the assignee profile's own model at a different depth:
+
+```bash
+# At creation
+hermes kanban create "hard refactor" --assignee coder \
+    --reasoning high
+
+# Model and reasoning together — independent knobs, both reach the worker
+hermes kanban create "hard refactor" --assignee coder \
+    --model claude-opus-4.6 --provider anthropic --reasoning xhigh
+
+# Or later — takes effect on the next dispatch
+hermes kanban set-model t_abcd --reasoning medium   # model override untouched
+hermes kanban set-model t_abcd --reasoning none     # thinking off (a real value)
+hermes kanban set-model t_abcd --reasoning clear    # fall back to profile default
+```
+
+Precedence is per-card `reasoning_effort` > the assignee profile's own `agent.reasoning_effort` — same shape as the model override above, and evaluated independently of it. `--reasoning` accepts any level in `VALID_REASONING_EFFORTS` (`minimal`, `low`, `medium`, `high`, `xhigh`, `max`, `ultra`) plus `none` to disable thinking; an invalid level is rejected at filing/setting time with the valid set named in the error, rather than silently falling back to the profile default. Omitting the flag leaves the field unset (`NULL`), and the worker inherits its profile's configured reasoning effort — unchanged behavior. The `kanban_create` MCP tool exposes the same field as `reasoning_effort` so an orchestrator can set depth per child when it fans out.
 
 ### Cost strategy: frontier orchestrator, inexpensive workers
 
@@ -789,6 +1379,7 @@ hermes kanban create "<title>" [--body ...] [--assignee <profile>]
                                 [--workspace scratch|worktree|worktree:<path>|dir:<path>]
                                 [--branch <name>]
                                 [--priority N] [--triage] [--idempotency-key KEY]
+                                [--idea | --roadmap]
                                 [--max-runtime 30m|2h|1d|<seconds>]
                                 [--max-retries N]
                                 [--goal] [--goal-max-turns N]
@@ -817,6 +1408,11 @@ hermes kanban block <id> "<reason>" [--ids <id>...]
 hermes kanban unblock <id>...
 hermes kanban archive <id>...
 
+# Roadmap lanes — see "Roadmap lanes (idea / roadmap)" below:
+hermes kanban refine <id>...                           # idea -> roadmap
+hermes kanban demote <id>...                           # roadmap -> idea
+hermes kanban spawn  <id>... [--to triage|ready]       # roadmap -> work queue (default: triage)
+
 hermes kanban request-review <id> [--summary "..."] [--metadata JSON] [--reviewer PROFILE]
 hermes kanban request-changes <id> "<required changes>"               # active reviewer -> implementer
 hermes kanban reopen-review  <id>... [--reason "..."]                 # changes requested: 'review' -> ready/todo
@@ -833,6 +1429,7 @@ hermes kanban daemon --force                           # DEPRECATED — standalo
         [--failure-limit N] [--pidfile PATH] [-v]
 hermes kanban stats [--json]                           # per-status + per-assignee counts
 hermes kanban log <id> [--tail BYTES]                  # worker log from ~/.hermes/kanban/logs/
+                                                       #   lines are prefixed `[YYYY-MM-DD HH:MM:SS] ` (local time)
 hermes kanban notify-subscribe <id>                    # gateway bridge hook (used by /kanban in the gateway)
         --platform <name> --chat-id <id> [--thread-id <id>] [--user-id <id>]
         [--chat-type dm|group|channel|thread] [--delivery-mode notify|notify+wake|wake]
@@ -1065,6 +1662,85 @@ that have *already* happened, use the reconciliation-card pattern above with
 the `agent-merge-conflict-arbiter` optional skill; hotspot flagging is the upstream fix that keeps
 the reconciler from becoming a standing lane.
 
+### Declaring a card's edit surface (`Edit-Targets:`)
+
+Hotspot comments are a *post-hoc* signal: they only exist once a worker has
+already collided. To stop the collision happening at all, a card body can
+declare the files it intends to write, and the dispatcher serializes any two
+cards that name a common path:
+
+```
+Edit-Targets: apps/desktop/src/app/chat/right-rail/preview-pane.tsx, apps/desktop/src/lib/preview-guest.ts
+```
+
+A bullet list under an `Edit targets:` heading works too. When a card about to
+be dispatched names a path that a currently-running (or just-spawned) card
+already owns, the dispatcher does **not** block it for a human — it adds a real
+`parents=[holder]` dependency edge, so the card waits and then starts from a
+tree that already contains the holder's work. Once the holder completes the card
+promotes and dispatches normally.
+
+This exists because prose does not serialize agents. Two cards were once fanned
+out with the shared decision written into *both* bodies — "import the helper, do
+not define a second one" — and both workers still created it with different
+contents, because they ran in separate worktrees nine minutes apart and could
+not see each other. The `parents=[...]` edge is the only mechanism on the board
+that can actually order two workers.
+
+Scope is deliberately narrow, so declaring costs nothing:
+
+- Matching is exact per-path equality after normalization (`./a/b.ts`, `a//b.ts`,
+  `` `a/b.ts` `` and the residue of a bolded label are the same file). Markdown
+  spelling never splits the key: ``**hotspot:** `a/b.ts` `` and `hotspot: a/b.ts`
+  declare the same path, so an orchestrator's `Edit-Targets:` field and a
+  worker's bolded hotspot comment interoperate. No globs, no directory prefixes.
+- Only the overlapping pair is serialized — two cards naming *different* files
+  in the same repo still run concurrently. It is not a repo-wide lock.
+- A card that declares nothing and has no hotspot history dispatches exactly as
+  it did before.
+- Tenants are separate workspaces, so the same path under two tenants is not a
+  collision.
+- Emitted `hotspot:` comments and `hotspot` keys in completion metadata count as
+  a declared surface too — that signal was already in the DB and is now read
+  back rather than only being available to a human reading the board. A negated
+  line (`hotspot: none`, `hotspot: N/A`) declares nothing, however much prose
+  follows it, and a line whose comma-separated items are not *all* paths is
+  treated as prose rather than having its file-shaped fragments harvested. The
+  worker protocol asks every card for a hotspot line, so most of them are
+  negations; mining that prose would park unrelated cards behind each other. A
+  trailing parenthetical annotation (`` `a/b.ts` (2235 lines, +235) — reason ``)
+  is dropped before that check, so an annotation's internal comma cannot make a
+  genuinely declared file look like prose.
+- A brace group is expanded into the real files it names
+  (`src/i18n/{en,zh}.ts` → `src/i18n/en.ts`, `src/i18n/zh.ts`) rather than being
+  comma-split into fragments, and anything still carrying glob syntax
+  (`*`, `?`, `[]`, an unbalanced brace) is rejected outright. A fragment such as
+  `src/i18n/{en` is identical for any two cards touching that directory, so
+  admitting one would serialize them on a path that does not exist.
+- **Quoting a line is not declaring one.** A `hotspot:` or `Edit-Targets:` line
+  inside a fenced code block or a markdown blockquote is text somebody is
+  *citing as evidence about another card*, and it contributes nothing to the
+  quoting card's own edit surface. The review protocol asks reviewers to quote
+  the offending text, so without this rule documenting a parsing defect would
+  change routing: a card whose thread merely quotes a sibling's hotspot line
+  becomes the registered holder of a file it never touches, and the card that
+  genuinely edits it is parked behind it. The identical line written as ordinary
+  prose is still read normally.
+
+**The dependency edge is a lease, not a permanent dependency.** A card only
+waits while the holder is still on its way to producing the work it should start
+from. If the holder goes `blocked` or `on_hold`, the dispatcher drops the edge
+on the next tick and the parked card promotes immediately — otherwise an
+operator would have to unblock a *different* card to free it, which is exactly
+the "needs a human" routing bug this feature exists to remove. Edges an
+orchestrator or human added are left alone; only the dispatcher's own
+serialization edges are released.
+
+Deferred cards appear in the dispatch result's `serialized_coedit` bucket as
+`(task_id, holder_id, path)` and get a `serialized_coedit` event on the card, so
+`hermes kanban tail` shows why a card is waiting. Released edges appear in
+`released_coedit` as `(task_id, holder_id)` with a `coedit_released` event.
+
 ## Multi-tenant usage
 
 When one specialist fleet serves multiple businesses, tag each task with a tenant:
@@ -1201,6 +1877,23 @@ Runs are exposed on the dashboard (Run History section in the drawer, one colour
 
 **Live drawer refresh.** When the dashboard's WebSocket event stream reports new events for the task the user is currently viewing, the drawer reloads itself (via a per-task event counter threaded into its `useEffect` dependency list). Closing and reopening is no longer required to see a run's new row or updated outcome.
 
+### Host-wide quota circuits
+
+Per-board provider backoff cannot identify a subscription account or protect sibling boards. For shared wallets, configure explicit opaque budget groups; the default is empty so independent accounts are never silently conflated:
+
+```yaml
+kanban:
+  quota_budget_groups:
+    primary-wallet:
+      providers: [openai-codex]
+      profiles: [implementer, reviewer]
+  quota_resume_spread_seconds: 30
+```
+
+Put these keys in the shared/default Hermes home's `config.yaml`. They are one host policy: assignee profile configs do not need to duplicate them, and profile-scoped workers read the same mapping when publishing a quota result.
+
+Do not use account IDs, email addresses, keys, or tokens as group labels. A machine-readable quota failure with a valid deadline opens one host-level SQLite circuit for the matching group. For `provider=auto`, every group configured for the profile is a candidate; while any candidate is paused, the dispatcher predicts the provider the worker's own resolution ladder will pick for the explicit `provider=auto` request under that profile's home and starts the task only when that provider maps to an unpaused group — an unpredictable or unmapped resolution fails closed, so `auto` never re-hits an exhausted wallet. The worker publishes the actual selected provider before `EX_TEMPFAIL` and records that publication in its run log, so the reaper never republishes the same observation from the configured task route. New matching ready/review starts on every board are deferred; in-flight workers and unrelated groups continue. At expiry one recovery probe is admitted, then further matching starts are serialized host-wide to at most one per `quota_resume_spread_seconds` until recovery goes idle. The dashboard shows only an opaque `budget-<hash>` handle with state (`paused`/`recovering`), reason, observation times, next eligibility, and deferred board/card counts, plus a manual **Clear circuit** control. See `docs/kanban/infra-failure-classification.md` for storage and race semantics.
+
 ### Forward compatibility
 
 Two nullable columns on `tasks` are reserved for v2 workflow routing: `workflow_template_id` (which template this task belongs to) and `current_step_key` (which step in that template is active). The v1 kernel ignores them for routing but lets clients write them, so a v2 release can add the routing machinery without another schema migration.
@@ -1240,10 +1933,11 @@ Every transition appends a row to `task_events`. Each row carries an optional `r
 | `heartbeat` | `{note?}` | Worker called `hermes kanban heartbeat $TASK` to signal liveness during long operations. |
 | `reclaimed` | `{stale_lock}` | Claim TTL expired without a completion; task goes back to `ready`. |
 | `crashed` | `{pid, claimer}` | Worker PID no longer alive but TTL hadn't expired yet. |
-| `timed_out` | `{pid, elapsed_seconds, limit_seconds, sigkill}` | `max_runtime_seconds` exceeded; dispatcher SIGTERM'd (then SIGKILL'd after 5 s grace) and re-queued. |
+| `interrupted` | `{pid, claimer, reason, quota_retry_after_seconds?}` | Worker died for a reason classified as infra rather than a task fault: an external SIGTERM/SIGKILL the dispatcher did not send (`reason: external_signal`), a dead PID discovered inside the dispatcher's own startup window right after a gateway restart (`reason: startup_window`), or a provider 429/quota signature in the worker log (`reason: quota`). Does NOT tick `consecutive_failures` — bumps a separate persistent per-task interruption streak instead (`kanban.max_infra_interruptions`, default 3); once that streak is exceeded the SAME kind of death is instead recorded as an ordinary `crashed` and does count. `kanban.count_infra_failures: true` disables this classification entirely (every such death always counts). See `docs/kanban/infra-failure-classification.md`. |
+| `timed_out` | `{pid, elapsed_seconds, limit_seconds, sigkill}` | `max_runtime_seconds` exceeded; dispatcher SIGTERM'd (then SIGKILL'd after 5 s grace) and re-queued. This remains a counted failure even though SIGTERM/SIGKILL are the same signals `interrupted` treats as infra elsewhere — the dispatcher persists a durable kill-intent record before signalling so its own kill is never misclassified as external, even across a dispatcher restart between the signal and the reap. |
 | `stale` | `{elapsed_seconds, last_heartbeat_at, heartbeat_age_seconds, timeout_seconds, pid, terminated}` | Task ran longer than `kanban.dispatch_stale_timeout_seconds` (default 4 h) AND no `kanban_heartbeat` arrived in the last hour. Dispatcher SIGTERM'd the host-local worker (if any), reset the task to `ready` for re-dispatch. Does NOT tick the failure counter (stale is dispatcher-side absence detection, not a worker fault). Workers running long operations should call `kanban_heartbeat` at least once an hour to avoid this. |
 | `reconciled` | `{reason, claim_lock, claim_expires, worker_pid}` | Orphaned-card reconciliation: the card was `running` with broken claim bookkeeping (`claim_lock` or `claim_expires` NULL — crash mid-claim, manual SQL, DB restore) and no live worker, so none of the TTL/crash/stale paths could ever recover it. The dispatcher requeued it to `ready` with an explanatory comment. Gated by `kanban.reconcile_orphans` in config.yaml (default `true`). |
-| `respawn_guarded` | `{reason}` | Dispatcher refused to re-spawn this ready task this tick. Reasons: `blocker_auth` (last failure was a quota/auth/429 error — wait for the rate window to reset), `recent_success` (a completed run happened in the last hour — wait for review before re-running), `active_pr` (a GitHub PR URL appears in a recent comment — a prior worker already opened a PR). The task stays in `ready`; the next tick gets another chance to spawn. If the underlying condition persists, the normal `consecutive_failures` circuit breaker will auto-block via `gave_up` after `failure_limit` failures. |
+| `respawn_guarded` | `{reason}` | Dispatcher refused to re-spawn this ready task this tick. Reasons include `blocker_auth`, `recent_success`, `active_pr`, per-board `provider_backoff`, host-wide `host_quota_circuit`, and post-deadline `host_quota_resume_spread`. Host quota reasons require an explicit `kanban.quota_budget_groups` route mapping; they never expose the configured group name in the board event. The task stays in `ready`; a later tick gets another chance to spawn. |
 | `spawn_failed` | `{error, failures}` | One spawn attempt failed (missing PATH, workspace unmountable, …). Counter increments; task returns to `ready` for retry. |
 | `protocol_violation` | `{pid, claimer, exit_code, protocol_violation}` | Worker exited successfully while the task was still `running`, usually because it answered without calling `kanban_complete` or `kanban_block`. Emitted on every violation (the payload's `protocol_violation: true` marker is copied into the run metadata and feeds the violation-only retry budget). Below the budget — up to `_PROTOCOL_VIOLATION_FAILURE_LIMIT` (default 3) *consecutive* violations, per-task `max_retries` overriding — the task simply returns to `ready` for another attempt; when the streak reaches the bound the dispatcher also emits `gave_up` and auto-blocks. |
 | `gave_up` | `{failures, effective_limit, limit_source, error}` | Circuit breaker fired after N consecutive non-successful attempts. Task auto-blocks with the last error. The effective limit resolves as task `max_retries`, then dispatcher `failure_limit` / `kanban.failure_limit`, then the built-in default. |

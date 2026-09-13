@@ -8,6 +8,7 @@ import { createClientSessionState } from '@/lib/chat-runtime'
 import type * as ChatRuntime from '@/lib/chat-runtime'
 import type * as Time from '@/lib/time'
 import type * as ComposerStatusStore from '@/store/composer-status'
+import { setSidebarWidth, SIDEBAR_DEFAULT_WIDTH, SIDEBAR_MAX_WIDTH } from '@/store/layout'
 import type * as SessionStore from '@/store/session'
 import { clearAllSessionStates, publishSessionState } from '@/store/session-states'
 import type * as SessionStatesStore from '@/store/session-states'
@@ -29,11 +30,20 @@ vi.mock('@/i18n', () => ({
         row: {
           ageMin: 'm',
           ageNow: 'now',
+          archiveSession: 'Archive session',
           backgroundRunning: 'Running in background',
           finishedUnread: 'Finished',
           handoffOrigin: (platform: string) => `Started on ${platform}`,
           messageCount: (count: number) => `${count} messages`,
           needsInput: 'Needs input',
+          rateLimited: {
+            unknown: 'Rate limited',
+            withTime: (time: string) => `Rate limited until ${time}`
+          },
+          providerConfigured: (family: string) => `Configured model: ${family}`,
+          providerConfiguredVia: (configuredFamily: string, servedFamily: string) =>
+            `Configured model: ${configuredFamily}, currently served via ${servedFamily}`,
+          providerVia: (family: string) => `via ${family}`,
           sessionActions: 'Session actions',
           sessionRunning: 'Running',
           todoProgress: 'Tasks completed',
@@ -181,7 +191,7 @@ describe('SidebarSessionRow running arc', () => {
     clearAllSessionStates()
   })
 
-  const arc = (container: HTMLElement) => container.querySelector('.arc-row')
+  const arc = (container: HTMLElement) => container.querySelector('.working-bar')
 
   it('paints no arc for a settled session', () => {
     const { container } = renderRow(makeSession({ title: 'Settled' }))
@@ -230,6 +240,70 @@ describe('SidebarSessionRow running arc', () => {
   })
 })
 
+// Attention ring (A3): the breathing amber border for a session blocked on the
+// user, and its steady orange rate-limited variant. Drives the mocked
+// $attentionSessionIds atom / the real rate-limited store the way the app does,
+// so this covers the row wiring, not just the CSS class existing.
+describe('SidebarSessionRow attention ring', () => {
+  afterEach(() => {
+    void import('@/store/session-states').then(({ $attentionSessionIds }) =>
+      ($attentionSessionIds as ReturnType<typeof atom<string[]>>).set([])
+    )
+    void import('@/store/session-dot-state').then(({ clearSessionRateLimited }) => clearSessionRateLimited('s1'))
+    clearAllSessionStates()
+  })
+
+  const ring = (container: HTMLElement) => container.querySelector('.attention-ring')
+
+  it('paints no ring for a settled session', () => {
+    const { container } = renderRow(makeSession({ title: 'Settled' }))
+
+    expect(ring(container)).toBeNull()
+  })
+
+  it('paints the breathing ring while the session needs input', async () => {
+    const { $attentionSessionIds } = await import('@/store/session-states')
+
+    act(() => {
+      ;($attentionSessionIds as ReturnType<typeof atom<string[]>>).set(['s1'])
+    })
+
+    const { container } = renderRow(makeSession({ title: 'Waiting' }))
+    const el = ring(container)
+
+    expect(el).toBeTruthy()
+    expect(el?.hasAttribute('data-rate-limited')).toBe(false)
+  })
+
+  it('paints the steady variant for a rate-limited session', async () => {
+    const { markSessionRateLimited } = await import('@/store/session-dot-state')
+
+    act(() => {
+      markSessionRateLimited('s1')
+    })
+
+    const { container } = renderRow(makeSession({ title: 'Limited' }))
+
+    expect(ring(container)?.hasAttribute('data-rate-limited')).toBe(true)
+  })
+
+  it('never paints the ring and the working bar together', async () => {
+    const { $attentionSessionIds } = await import('@/store/session-states')
+
+    // Busy AND blocked: needs-input outranks working in the dot-state
+    // priority, so the row shows the ring, not the bar.
+    publishSessionState('rt1', { ...createClientSessionState('s1'), busy: true })
+    act(() => {
+      ;($attentionSessionIds as ReturnType<typeof atom<string[]>>).set(['s1'])
+    })
+
+    const { container } = renderRow(makeSession({ title: 'Blocked' }))
+
+    expect(ring(container)).toBeTruthy()
+    expect(container.querySelector('.working-bar')).toBeNull()
+  })
+})
+
 describe('SidebarSessionRow', () => {
   afterEach(() => {
     vi.useRealTimers()
@@ -252,6 +326,54 @@ describe('SidebarSessionRow', () => {
 
     const kebab = screen.getByRole('button', { name: 'Session actions' })
     expect(tipTrigger(kebab)).toBeNull()
+  })
+
+  // Row-level one-click archive icon (#7b52ebc2): a direct, always-rendered
+  // button beside the kebab so archiving never requires opening a menu.
+  describe('row-level archive button', () => {
+    it('renders a keyboard-focusable, screen-reader-labeled archive button on every row', () => {
+      render(
+        <SidebarSessionRow
+          isPinned={false}
+          isSelected={false}
+          onArchive={noop}
+          onDelete={noop}
+          onPin={noop}
+          onResume={noop}
+          onToggleUnread={noop}
+          session={makeSession({ title: 'Archivable session' })}
+          unread={false}
+        />
+      )
+
+      const archiveButton = screen.getByRole('button', { name: 'Archive session' })
+      expect(archiveButton.tagName).toBe('BUTTON')
+      expect(archiveButton.getAttribute('tabindex')).not.toBe('-1')
+    })
+
+    it('fires onArchive exactly once on click and does not select/resume the row', () => {
+      const onArchive = vi.fn()
+      const onResume = vi.fn()
+
+      render(
+        <SidebarSessionRow
+          isPinned={false}
+          isSelected={false}
+          onArchive={onArchive}
+          onDelete={noop}
+          onPin={noop}
+          onResume={onResume}
+          onToggleUnread={noop}
+          session={makeSession({ title: 'Archivable session' })}
+          unread={false}
+        />
+      )
+
+      fireEvent.click(screen.getByRole('button', { name: 'Archive session' }))
+
+      expect(onArchive).toHaveBeenCalledTimes(1)
+      expect(onResume).not.toHaveBeenCalled()
+    })
   })
 
   // Full-title tooltip on hover (#83000-class ask): the label is a tooltip
@@ -437,5 +559,101 @@ describe('Inbox-style session card', () => {
 
     expect(workspace.className).toMatch(/\btruncate\b/)
     expect(screen.getByText('133 messages')).toBeTruthy()
+  })
+})
+
+describe('Provider identity (Phase 2.13)', () => {
+  afterEach(() => {
+    setSidebarWidth(SIDEBAR_MAX_WIDTH)
+  })
+
+  it('shows only the configured family when the served route matches', () => {
+    renderRow(
+      makeSession({
+        configured_provider: 'anthropic',
+        served_provider: 'anthropic',
+        title: 'Matching route'
+      }),
+      { card: true }
+    )
+
+    expect(screen.getByText('Claude')).toBeTruthy()
+    expect(screen.queryByText(/^via /)).toBeNull()
+  })
+
+  it('surfaces a "via <provider>" note only when the served route differs (fallback)', () => {
+    renderRow(
+      makeSession({
+        configured_provider: 'anthropic',
+        served_provider: 'openai-codex',
+        title: 'Fell back mid-conversation'
+      }),
+      { card: true }
+    )
+
+    expect(screen.getByText('Claude')).toBeTruthy()
+    expect(screen.getByText('via Codex')).toBeTruthy()
+  })
+
+  it('renders no identity chip for a legacy session with no resolvable provider', () => {
+    renderRow(
+      makeSession({
+        configured_provider: null,
+        served_provider: null,
+        title: 'Legacy session'
+      }),
+      { card: true }
+    )
+
+    expect(screen.queryByText('Claude')).toBeNull()
+    expect(screen.queryByText('Codex')).toBeNull()
+    expect(screen.queryByText(/^via /)).toBeNull()
+  })
+
+  it('title-cases an unrecognized provider instead of implying a false Claude/Codex identity', () => {
+    renderRow(
+      makeSession({
+        configured_provider: 'my-custom-endpoint',
+        served_provider: 'my-custom-endpoint',
+        title: 'Custom endpoint session'
+      }),
+      { card: true }
+    )
+
+    expect(screen.getByText('My Custom Endpoint')).toBeTruthy()
+  })
+
+  it('exposes the full mismatch text as the accessible name of the identity chip', () => {
+    renderRow(
+      makeSession({
+        configured_provider: 'anthropic',
+        served_provider: 'openai-codex',
+        title: 'Accessible mismatch'
+      }),
+      { card: true }
+    )
+
+    expect(screen.getByLabelText('Configured model: Claude, currently served via Codex')).toBeTruthy()
+  })
+
+  it('collapses the "via" note to a tooltip-only glyph below the narrow-sidebar threshold', () => {
+    setSidebarWidth(SIDEBAR_DEFAULT_WIDTH)
+
+    renderRow(
+      makeSession({
+        configured_provider: 'anthropic',
+        served_provider: 'openai-codex',
+        title: 'Narrow sidebar'
+      }),
+      { card: true }
+    )
+
+    // The full "via Codex" text is gone from the DOM at the narrow width...
+    expect(screen.queryByText('via Codex')).toBeNull()
+    // ...but the mismatch is still discoverable: the tooltip trigger carries
+    // the same text as its label, and the wrapper's accessible name is intact.
+    expect(screen.getByText('•')).toBeTruthy()
+    expect(tipTrigger(screen.getByText('•'))).toBeTruthy()
+    expect(screen.getByLabelText('Configured model: Claude, currently served via Codex')).toBeTruthy()
   })
 })

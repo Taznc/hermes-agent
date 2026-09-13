@@ -96,7 +96,8 @@ scripts/run_tests.sh -v --tb=long             # pass-through pytest flags
 ```
 
 - Tests auto-redirect `HERMES_HOME` to temp dirs — never touch real `~/.hermes/`.
-- The script probes `.venv`, then `venv`, then the shared worktree venv.
+- An explicitly-set `HERMES_PYTHON` (with pytest) wins; otherwise the script probes
+  `.venv`, then `venv`, then the shared worktree venv.
 - **Windows:** the wrapper is POSIX-only; see `references/windows-quirks.md`
   for the direct-pytest workaround.
 

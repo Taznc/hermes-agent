@@ -81,6 +81,12 @@ class ChatImageUpload(BaseModel):
     data_url: str
     filename: Optional[str] = None
 
+
+class ChatFileUpload(BaseModel):
+    data_url: str
+    filename: Optional[str] = None
+
+
 class ManagedDirectoryCreate(BaseModel):
     path: str
 
@@ -293,6 +299,7 @@ class CronJobCreate(BaseModel):
     enabled_toolsets: Optional[List[str]] = None
     workdir: Optional[str] = None
     no_agent: bool = False
+    resume_session_id: Optional[str] = None
 
 class CronJobUpdate(BaseModel):
     updates: dict
@@ -496,6 +503,13 @@ class _AgentPluginInstallBody(BaseModel):
     identifier: str
     force: bool = False
     enable: bool = True
+
+class _PluginProbeBody(BaseModel):
+    identifier: str
+
+class _DesktopPluginInstallBody(BaseModel):
+    identifier: str
+    force: bool = False
 
 class _PluginProvidersPutBody(BaseModel):
     memory_provider: Optional[str] = None

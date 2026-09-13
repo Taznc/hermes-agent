@@ -61,17 +61,29 @@ export function Panel({
 interface PanelHeaderProps {
   // Right-aligned controls (search, "+ New", segmented control, …).
   actions?: ReactNode
+  // Overlay presentations float a close (X) at right-3 over the actions row;
+  // embedded presentations (route tiles) have no such control. Defaults to
+  // true so every other PanelHeader caller (none of which currently pass
+  // `actions` from an embeddable surface) keeps its existing clearance.
+  reserveActionsClearance?: boolean
   subtitle?: ReactNode
   title: ReactNode
 }
 
-export function PanelHeader({ actions, subtitle, title }: PanelHeaderProps) {
+export function PanelHeader({ actions, reserveActionsClearance = true, subtitle, title }: PanelHeaderProps) {
+  const clearance = Boolean(actions) && reserveActionsClearance
+
   return (
     // The overlay's close (X) is absolutely positioned at right-3 and costs no
     // layout space, so header actions would otherwise slide right up against it.
     // Reserve clearance (button footprint from the card edge + a small gap) on
-    // the right whenever actions are present.
-    <header className={cn('mb-3 flex shrink-0 items-start justify-between gap-3', actions ? 'pr-8' : undefined)}>
+    // the right whenever actions are present AND that floating X exists.
+    // data-actions-clearance is the stable test hook — the pr-8 utility itself
+    // is an implementation detail free to change.
+    <header
+      className={cn('mb-3 flex shrink-0 items-start justify-between gap-3', clearance ? 'pr-8' : undefined)}
+      data-actions-clearance={clearance}
+    >
       <div className="min-w-0">
         <h2 className="text-sm font-semibold text-foreground">{title}</h2>
         {subtitle ? <p className="truncate text-xs text-muted-foreground/80">{subtitle}</p> : null}

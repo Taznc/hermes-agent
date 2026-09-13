@@ -98,6 +98,10 @@ export async function renameSessionPreferringRpc(
 interface SessionActions {
   sessionId: string
   title: string
+  /** This row came from the Archived filter. Its archive affordance is the
+   *  inverse operation, so labels/icons read Unarchive throughout the direct
+   *  button, kebab menu and context menu. */
+  archived?: boolean
   pinned?: boolean
   /** Backend-derived read state — drives the Mark as unread/read label. */
   unread?: boolean
@@ -184,6 +188,7 @@ function MoveToProjectItems({ kit, sessionId, profile }: { kit: MenuKit; session
 function useSessionActions({
   sessionId,
   title,
+  archived = false,
   pinned = false,
   unread = false,
   profile,
@@ -431,8 +436,8 @@ function useSessionActions({
   const dangerItems: ActionItemSpec[] = [
     spec({
       disabled: !onArchive,
-      icon: 'archive',
-      label: r.archive,
+      icon: archived ? 'history' : 'archive',
+      label: archived ? r.unarchive : r.archive,
       onSelect: () => {
         triggerHaptic('selection')
         onArchive?.()

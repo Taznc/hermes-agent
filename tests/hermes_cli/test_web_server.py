@@ -1107,6 +1107,12 @@ class TestWebServerEndpoints:
 
     # ── POST /api/chat/image-upload (browser clipboard/drop images) ─────
 
+    # POST /api/chat/file-upload (browser +Files picker / OS file drop) tests
+    # live in tests/hermes_fork/test_chat_file_upload.py: it's a fork-owned
+    # feature (hermes_fork.account_limits-style anchor pattern for tests, see
+    # docs/fork-anchor-extraction.md rule 10), so it doesn't need to sit in
+    # this upstream-shared file.
+
 
 
 

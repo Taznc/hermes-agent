@@ -8,6 +8,7 @@ import {
   attachmentId,
   coalesceToolOnlyAssistants,
   coerceThinkingText,
+  contextPath,
   createToolMergeCache,
   messageCreatedAt,
   optimisticAttachmentRef,
@@ -219,6 +220,39 @@ describe('attachmentId', () => {
 
   it('keeps distinct urls distinct', () => {
     expect(attachmentId('url', 'https://example.com/a')).not.toBe(attachmentId('url', 'https://example.com/b'))
+  })
+})
+
+describe('contextPath', () => {
+  it('strips a posix cwd prefix to a repo-relative path', () => {
+    expect(contextPath('/repo/src/a.ts', '/repo')).toBe('src/a.ts')
+  })
+
+  it('strips a backslash win32 cwd from a backslash win32 path', () => {
+    // Reproduces the original bug: a local Windows backend reports a
+    // backslash-separated cwd, and the referenced file path is also
+    // backslash-separated — the old startsWith('cwd/') check never matched.
+    expect(contextPath('C:\\Users\\x\\proj\\src\\a.ts', 'C:\\Users\\x\\proj')).toBe('src/a.ts')
+  })
+
+  it('strips a backslash win32 cwd from a forward-slash path', () => {
+    expect(contextPath('C:/Users/x/proj/src/a.ts', 'C:\\Users\\x\\proj')).toBe('src/a.ts')
+  })
+
+  it('strips regardless of drive-letter/segment case (NTFS case-insensitivity)', () => {
+    expect(contextPath('C:\\Users\\X\\Proj\\src\\a.ts', 'c:\\users\\x\\proj')).toBe('src/a.ts')
+  })
+
+  it('stays case-sensitive for POSIX paths', () => {
+    expect(contextPath('/repo/src/a.ts', '/Repo')).toBe('/repo/src/a.ts')
+  })
+
+  it('returns the original path unchanged when cwd is empty', () => {
+    expect(contextPath('/repo/src/a.ts', '')).toBe('/repo/src/a.ts')
+  })
+
+  it('returns the original path unchanged when it does not live under cwd', () => {
+    expect(contextPath('/other/src/a.ts', '/repo')).toBe('/other/src/a.ts')
   })
 })
 

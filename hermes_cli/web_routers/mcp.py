@@ -46,8 +46,25 @@ def _gc_mcp_oauth_flows() -> None:
             _mcp_oauth_flows.pop(flow_id, None)
 
 
-def _mcp_oauth_callback_url(request: Request, server_name: str) -> str:
-    """Externally reachable callback URL for a dashboard flow."""
+def _mcp_oauth_callback_url(request: Request, server_name: str, client_public_origin: Optional[str] = None) -> str:
+    """Externally reachable callback URL for a dashboard flow.
+
+    Precedence: ``dashboard.public_url`` (operator-declared, authoritative for every OAuth
+    flow on this backend) > ``client_public_origin`` (validated caller-declared origin,
+    browser-only) > request reconstruction (legacy; correct for a directly-exposed backend,
+    WRONG behind the web-served Desktop renderer's same-origin ``/api`` proxy).
+
+    That proxy runs Vite's ``changeOrigin: true``, which rewrites the ``Host`` header FastAPI
+    sees to the private loopback backend's own address — so ``request.base_url`` there is
+    ``http://127.0.0.1:<port>``, unreachable from the OAuth provider's redirect. Without an
+    operator-configured ``dashboard.public_url`` (the common case for this spike deployment),
+    the reconstruction rung silently registered a callback the browser could never receive.
+    The browser-native OAuth caller (``completeMcpBrowserOAuth`` in
+    ``apps/desktop/src/lib/mcp-dashboard-oauth.ts``) knows its own real origin
+    (``window.location.origin``) and sends it as ``client_public_origin``; the already-
+    ``_require_token``-authenticated caller trusting its own self-reported origin adds no new
+    privilege over what an authenticated caller can already do to this backend directly.
+    """
     from urllib.parse import quote, urlparse, urlunparse
 
     from hermes_cli.dashboard_auth.prefix import prefix_from_request, resolve_public_url
@@ -56,6 +73,8 @@ def _mcp_oauth_callback_url(request: Request, server_name: str) -> str:
     public_url = resolve_public_url()
     if public_url:
         return f"{public_url}{suffix}"
+    if client_public_origin:
+        return f"{client_public_origin}{suffix}"
     base = urlparse(str(request.base_url))
     prefix = prefix_from_request(request)
     return urlunparse(base._replace(path=f"{prefix}{suffix}", params="", query="", fragment=""))
@@ -192,14 +211,32 @@ async def test_mcp_server(name: str, profile: Optional[str] = None):
 
 
 @router.post("/api/mcp/servers/{name}/auth")
-async def auth_mcp_server(name: str, request: Request, profile: Optional[str] = None):
-    """Start MCP OAuth and hand the authorization URL to the dashboard browser."""
+async def auth_mcp_server(
+    name: str,
+    request: Request,
+    profile: Optional[str] = None,
+    client_public_origin: Optional[str] = None,
+):
+    """Start MCP OAuth and hand the authorization URL to the dashboard browser.
+
+    ``client_public_origin`` (query param, browser-only): the caller's own
+    ``window.location.origin``, used to build an externally reachable OAuth callback when
+    ``dashboard.public_url`` is unset and request-header reconstruction would otherwise
+    resolve to the private loopback backend (same-origin proxy with ``changeOrigin: true`` —
+    see ``_mcp_oauth_callback_url``). Validated and normalised (bare ``scheme://host[:port]``,
+    no path/query/fragment/injection characters) before use; malformed values are dropped
+    exactly like a malformed ``dashboard.public_url`` (fall through to reconstruction) rather
+    than rejecting the request, since this is a defense-in-depth callback fix, not new auth.
+    """
+    from hermes_cli.dashboard_auth.prefix import normalise_declared_origin
     from hermes_cli.mcp_config import _get_mcp_servers
     from hermes_constants import get_hermes_home
     from tools.mcp_dashboard_oauth import DashboardOAuthFlow
 
     _require_token(request)
     _gc_mcp_oauth_flows()
+
+    origin = normalise_declared_origin(client_public_origin)
 
     def _home() -> str:
         return str(get_hermes_home().expanduser().resolve(strict=False))
@@ -226,7 +263,7 @@ async def auth_mcp_server(name: str, request: Request, profile: Optional[str] = 
         server_name=name,
         profile=profile,
         hermes_home=flow_home,
-        redirect_uri=(cfg.get("oauth") or {}).get("redirect_uri") or _mcp_oauth_callback_url(request, name),
+        redirect_uri=(cfg.get("oauth") or {}).get("redirect_uri") or _mcp_oauth_callback_url(request, name, origin),
         reconnect_live=flow_home == process_home,
     )
     with _mcp_oauth_flows_lock:

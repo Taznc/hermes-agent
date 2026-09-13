@@ -408,11 +408,19 @@ export function useComposerActions({
 
       for (const path of paths) {
         const rel = contextPath(path, currentCwd)
+        // Web build: selectDesktopPaths stages picked files through
+        // uploadPickedFile/saveFileBuffer, whose returned path carries an
+        // internal timestamp/hash basename (see upload_chat_file in
+        // web_server.py), not the name the user picked in the OS dialog. The
+        // bridge remembers that original name keyed by the staged path;
+        // prefer it here so the '+' → Files chip matches attachImagePath's
+        // Electron-parity behavior instead of showing the staged basename.
+        const stagedName = kind === 'file' ? window.hermesDesktop?.getStagedDisplayName?.(path) : undefined
 
         attachToMain({
           id: attachmentId(kind, rel),
           kind,
-          label: pathLabel(path),
+          label: stagedName || pathLabel(path),
           detail: rel,
           refText: `@${kind}:${formatRefValue(rel)}`,
           path
@@ -449,11 +457,19 @@ export function useComposerActions({
       }
 
       const rel = contextPath(filePath, currentCwd)
+      // Web build: a path staged through saveFileBuffer carries an internal
+      // timestamp/hash basename (see upload_chat_file in web_server.py), not
+      // the name the user picked/dropped. The bridge remembers that original
+      // name keyed by the staged path; prefer it for the chip label so the
+      // web upload path matches attachImagePath's Electron-parity behavior.
+      // Undefined (Electron, or a path never staged) falls back to the
+      // path's own basename as before.
+      const stagedName = window.hermesDesktop?.getStagedDisplayName?.(filePath)
 
       attachToMain({
         id: attachmentId('file', rel),
         kind: 'file',
-        label: pathLabel(filePath),
+        label: stagedName || pathLabel(filePath),
         detail: rel,
         refText: `@file:${formatRefValue(rel)}`,
         path: filePath
@@ -535,6 +551,43 @@ export function useComposerActions({
       }
     },
     [attachImagePath, copy.imageAttach, copy.imageAttachFailed, copy.imageWriteFailed]
+  )
+
+  /**
+   * Web-build counterpart to attachContextFilePath for a dropped/picked
+   * non-image File with no usable local path (browsers never expose one —
+   * see web-bridge-shim.ts's getPathForFile/selectPaths). Stages the raw
+   * bytes through the bridge's saveFileBuffer (defined only in the web
+   * shim; Electron always has a real path already and never defines it) and
+   * attaches the gateway-visible path it returns. No-op (returns false) on
+   * Electron so callers can fall back to the existing path-based attach.
+   */
+  const attachFileBlob = useCallback(
+    async (file: File) => {
+      const saveFileBuffer = window.hermesDesktop?.saveFileBuffer
+
+      if (!saveFileBuffer || file.size === 0) {
+        return false
+      }
+
+      try {
+        const buffer = await file.arrayBuffer()
+        const savedPath = await saveFileBuffer(new Uint8Array(buffer), file.name)
+
+        if (!savedPath) {
+          notify({ kind: 'error', title: copy.dropFiles, message: copy.imageWriteFailed })
+
+          return false
+        }
+
+        return attachContextFilePath(savedPath)
+      } catch (err) {
+        notifyError(err, copy.dropFiles)
+
+        return false
+      }
+    },
+    [attachContextFilePath, copy.dropFiles, copy.imageWriteFailed]
   )
 
   const pickImages = useCallback(async () => {
@@ -691,6 +744,17 @@ export function useComposerActions({
           continue
         }
 
+        // No local path at all — the web build (browsers never expose one)
+        // or an older Electron shell missing getPathForFile. Stage the raw
+        // bytes instead of dropping the file on the floor; attachFileBlob is
+        // a no-op returning false when the bridge has no saveFileBuffer
+        // (Electron, which should always have hit the branch above).
+        if (!filePath && (await attachFileBlob(file))) {
+          attached = true
+
+          continue
+        }
+
         lastFailure = `Could not attach ${file.name || 'file'}`
       }
 
@@ -700,7 +764,7 @@ export function useComposerActions({
 
       return attached
     },
-    [attachContextFilePath, attachContextFolderPath, attachImageBlob, attachImagePath, copy.dropFiles]
+    [attachContextFilePath, attachContextFolderPath, attachFileBlob, attachImageBlob, attachImagePath, copy.dropFiles]
   )
 
   const removeAttachment = useCallback(
@@ -730,6 +794,7 @@ export function useComposerActions({
     attachContextFilePath,
     attachContextFolderPath,
     attachDroppedItems,
+    attachFileBlob,
     attachImageBlob,
     attachImagePath,
     attachPrCommentUrl,

@@ -1,6 +1,7 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
 import type { ChatMessage } from '@/lib/chat-messages'
+import { $notifications, clearNotifications } from '@/store/notifications'
 import { $transcriptTailBySessionId, recordTranscriptTail, transcriptTailState } from '@/store/transcript-tail'
 
 import {
@@ -163,6 +164,7 @@ describe('backfillOlderTranscriptPage', () => {
   beforeEach(() => {
     $transcriptTailBySessionId.set({})
     _resetTranscriptBackfillForTests()
+    clearNotifications()
     vi.mocked(getOlderSessionMessages).mockReset()
   })
 
@@ -352,5 +354,48 @@ describe('backfillOlderTranscriptPage', () => {
 
     expect(applied).toBe(false)
     expect(transcriptBackfillAvailable('stored-1')).toBe(true)
+  })
+
+  it('does not notify on a single failure but does after a second consecutive one', async () => {
+    truncatedTail()
+    vi.mocked(getOlderSessionMessages).mockRejectedValue(new Error('network down'))
+
+    await backfillOlderTranscriptPage({ storedSessionId: 'stored-1', isCurrent: () => true, applyOlderPage: vi.fn() })
+    expect($notifications.get()).toHaveLength(0)
+
+    await backfillOlderTranscriptPage({ storedSessionId: 'stored-1', isCurrent: () => true, applyOlderPage: vi.fn() })
+    expect($notifications.get()).toHaveLength(1)
+    expect($notifications.get()[0].kind).toBe('error')
+
+    // A third consecutive failure re-uses the same notification id rather
+    // than stacking a fresh toast per click.
+    await backfillOlderTranscriptPage({ storedSessionId: 'stored-1', isCurrent: () => true, applyOlderPage: vi.fn() })
+    expect($notifications.get()).toHaveLength(1)
+  })
+
+  it('resets the failure streak after a subsequent success', async () => {
+    truncatedTail()
+    vi.mocked(getOlderSessionMessages).mockRejectedValue(new Error('network down'))
+
+    await backfillOlderTranscriptPage({ storedSessionId: 'stored-1', isCurrent: () => true, applyOlderPage: vi.fn() })
+    await backfillOlderTranscriptPage({ storedSessionId: 'stored-1', isCurrent: () => true, applyOlderPage: vi.fn() })
+    expect($notifications.get()).toHaveLength(1)
+
+    vi.mocked(getOlderSessionMessages).mockResolvedValue({
+      messages: [row(1, 'older-1')],
+      pagination: { limit: 120, offset: 120, order: 'latest', returned: 1 },
+      session_id: 'stored-1'
+    } as never)
+
+    await backfillOlderTranscriptPage({ storedSessionId: 'stored-1', isCurrent: () => true, applyOlderPage: vi.fn() })
+
+    // Two more failures after the reset should notify again from scratch.
+    vi.mocked(getOlderSessionMessages).mockRejectedValue(new Error('network down'))
+    recordTranscriptTail('stored-1', {
+      messages: Array.from({ length: 120 }, (_, index) => row(index + 240, `tail${index}`)),
+      pagination: { limit: 120, offset: 0, order: 'latest', returned: 120 }
+    })
+    await backfillOlderTranscriptPage({ storedSessionId: 'stored-1', isCurrent: () => true, applyOlderPage: vi.fn() })
+    expect($notifications.get()).toHaveLength(1)
   })
 })

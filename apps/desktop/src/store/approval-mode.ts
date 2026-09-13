@@ -53,7 +53,14 @@ export async function syncApprovalModeForProfile(
 ): Promise<ApprovalMode> {
   const key = profileKey(profile)
   const revision = nextRevision(key)
-  const result = (await requestGateway('config.get', { key: 'approvals.mode' })) as { value?: string }
+  // Send the profile we are caching under. Approval mode is profile-scoped
+  // config and one backend serves every profile, so an unscoped read answers
+  // for whichever profile launched that backend — which is how a profile
+  // configured `smart` showed up here as `manual`.
+  const result = (await requestGateway('config.get', {
+    key: 'approvals.mode',
+    profile: key
+  })) as { value?: string }
   const mode = normalizeApprovalMode(result?.value)
 
   if (revisions.get(key) === revision) {
@@ -74,8 +81,11 @@ export async function setApprovalModeForProfile(
   cacheApprovalMode(key, mode)
 
   try {
+    // Scoped like the read above: the write must land in the same profile's
+    // config, or the menu reverts on the next sync.
     const result = (await requestGateway('config.set', {
       key: 'approvals.mode',
+      profile: key,
       value: mode
     })) as { value?: string }
 

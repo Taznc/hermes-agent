@@ -404,7 +404,14 @@ function sshErrorMessage(kind, conn, stderr?) {
 
 // Resolves { code, stdout, stderr }. On timeout the child is SIGKILLed and the
 // promise rejects with err.kind = TIMEOUT. `spawnFn` is injectable for tests.
-function runSsh(args, { timeoutMs, spawnFn = spawn, stdin = 'ignore', stdinData, signal }: any = {}) {
+// `sshBinary` defaults to bare 'ssh' (PATH lookup) for any caller that hasn't
+// been threaded through the resolved binary yet; Desktop's own call sites all
+// pass the resolved path (see ssh-binary.ts) so Windows never depends on a
+// hardcoded System32 location that may not exist.
+function runSsh(
+  args,
+  { timeoutMs, spawnFn = spawn, stdin = 'ignore', stdinData, signal, sshBinary = 'ssh' }: any = {}
+) {
   return new Promise((resolve, reject) => {
     if (signal?.aborted) {
       const error: any = new Error('SSH operation was cancelled.')
@@ -418,7 +425,7 @@ function runSsh(args, { timeoutMs, spawnFn = spawn, stdin = 'ignore', stdinData,
     let child
 
     try {
-      child = spawnFn('ssh', args, { stdio: [useStdinPipe ? 'pipe' : 'ignore', 'pipe', 'pipe'] })
+      child = spawnFn(sshBinary, args, { stdio: [useStdinPipe ? 'pipe' : 'ignore', 'pipe', 'pipe'] })
     } catch (error) {
       reject(error)
 
@@ -551,6 +558,7 @@ class SshConnection {
   keyPath: string
   controlPath: string
   _spawnFn: any
+  _sshBinary: string
   _log: (msg: string) => void
   _connectTimeoutMs: number
   _execTimeoutMs: number
@@ -593,6 +601,10 @@ class SshConnection {
     this._tunnels = new Map()
 
     this._spawnFn = opts.spawnFn || spawn
+    // Resolved ssh binary path (see ssh-binary.ts) threaded from Electron;
+    // defaults to bare 'ssh' for direct/test construction so existing
+    // callers that don't pass it keep resolving via PATH as before.
+    this._sshBinary = opts.sshBinary || 'ssh'
 
     this._log = typeof opts.rememberLog === 'function' ? opts.rememberLog : () => {}
     this._connectTimeoutMs = opts.connectTimeoutMs ?? DEFAULT_CONNECT_TIMEOUT_MS
@@ -655,6 +667,7 @@ class SshConnection {
         result = await runSsh(buildExecArgs(this, 'exit 0', this._connectTimeoutMs), {
           timeoutMs: this._connectTimeoutMs,
           spawnFn: this._spawnFn,
+          sshBinary: this._sshBinary,
           signal
         })
       } catch (error) {
@@ -704,7 +717,7 @@ class SshConnection {
     let result
 
     try {
-      result = await runSsh(args, { timeoutMs: this._connectTimeoutMs, spawnFn: this._spawnFn, signal })
+      result = await runSsh(args, { timeoutMs: this._connectTimeoutMs, spawnFn: this._spawnFn, sshBinary: this._sshBinary, signal })
     } catch (error) {
       throw this._fail(error, SSH_ERROR.UNREACHABLE)
     }
@@ -729,7 +742,12 @@ class SshConnection {
       : buildExecArgs(this, 'exit 0', this._connectTimeoutMs)
 
     try {
-      const result: any = await runSsh(args, { timeoutMs: this._connectTimeoutMs, spawnFn: this._spawnFn, signal })
+      const result: any = await runSsh(args, {
+        timeoutMs: this._connectTimeoutMs,
+        spawnFn: this._spawnFn,
+        sshBinary: this._sshBinary,
+        signal
+      })
 
       return result.code === 0
     } catch (error: any) {
@@ -748,6 +766,7 @@ class SshConnection {
       const result: any = await runSsh(buildExecArgs(this, 'exit 0', this._connectTimeoutMs), {
         timeoutMs: this._connectTimeoutMs,
         spawnFn: this._spawnFn,
+        sshBinary: this._sshBinary,
         signal
       })
 
@@ -769,7 +788,8 @@ class SshConnection {
     try {
       await runSsh(buildControlArgs(this, 'exit', [], this._connectTimeoutMs), {
         timeoutMs: this._connectTimeoutMs,
-        spawnFn: this._spawnFn
+        spawnFn: this._spawnFn,
+        sshBinary: this._sshBinary
       })
     } catch {
       void 0
@@ -794,6 +814,7 @@ class SshConnection {
       result = await runSsh(args, {
         timeoutMs: timeoutMs ?? this._execTimeoutMs,
         spawnFn: this._spawnFn,
+        sshBinary: this._sshBinary,
         ...(stdinData != null ? { stdinData } : {})
       })
     } catch (error) {
@@ -817,7 +838,7 @@ class SshConnection {
   // cascaded into SIGTERM of a healthy backend (#96266).
   _startNoMuxTunnelChild(tunnel: any, spec: string, args: string[], localPort: number | string) {
     return new Promise<void>((resolve, reject) => {
-      const child = this._spawnFn('ssh', args, { stdio: ['ignore', 'ignore', 'pipe'] })
+      const child = this._spawnFn(this._sshBinary, args, { stdio: ['ignore', 'ignore', 'pipe'] })
       tunnel.child = child
       let stderr = ''
       let readyConfirmed = false
@@ -989,7 +1010,7 @@ class SshConnection {
     let result
 
     try {
-      result = await runSsh(args, { timeoutMs: this._forwardTimeoutMs, spawnFn: this._spawnFn })
+      result = await runSsh(args, { timeoutMs: this._forwardTimeoutMs, spawnFn: this._spawnFn, sshBinary: this._sshBinary })
     } catch (error) {
       throw this._fail(error)
     }
@@ -1027,7 +1048,7 @@ class SshConnection {
     const args = buildControlArgs(this, 'cancel', ['-L', spec], this._connectTimeoutMs)
 
     try {
-      await runSsh(args, { timeoutMs: this._forwardTimeoutMs, spawnFn: this._spawnFn })
+      await runSsh(args, { timeoutMs: this._forwardTimeoutMs, spawnFn: this._spawnFn, sshBinary: this._sshBinary })
       this._logLine(`cancelled forward 127.0.0.1:${localPort}`)
     } catch (error: any) {
       this._logLine(`cancelForward failed (ignored): ${error.message}`)
@@ -1064,7 +1085,7 @@ class SshConnection {
     const args = buildControlArgs(this, 'exit', [], this._connectTimeoutMs)
 
     try {
-      const result: any = await runSsh(args, { timeoutMs: this._connectTimeoutMs, spawnFn: this._spawnFn })
+      const result: any = await runSsh(args, { timeoutMs: this._connectTimeoutMs, spawnFn: this._spawnFn, sshBinary: this._sshBinary })
 
       if (result.code !== 0) {
         throw this._fail(result.stderr)

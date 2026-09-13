@@ -2,7 +2,7 @@ import { useStore } from '@nanostores/react'
 import { type MutableRefObject, useCallback, useEffect, useRef } from 'react'
 import type { NavigateFunction } from 'react-router'
 
-import { NO_PROJECT_ID } from '@/app/chat/sidebar/projects/workspace-groups'
+import { isHomeProjectId } from '@/app/chat/sidebar/projects/workspace-groups'
 import { graftRefreshedTailOntoBackfill } from '@/app/chat/transcript-backfill'
 import { revealTreePane } from '@/components/pane-shell/tree/store'
 import { setWorkspaceScope } from '@/components/pane-shell/workspace-scope'
@@ -46,6 +46,7 @@ import {
   type AgentProfileRoute,
   ensureGatewayAgent,
   ensureGatewayProfile,
+  ensureGatewaySessionProfile,
   normalizeProfileKey,
   resolveNewChatOwnerRoute
 } from '@/store/profile'
@@ -86,11 +87,17 @@ import {
   setResumeFailedSessionId,
   setSelectedStoredSessionId,
   setSessionOwnerHint,
+  setSessions,
   setSessionStartedAt,
   setTurnStartedAt,
   setWorkspaceCwdOwner,
   setYoloActive
 } from '@/store/session'
+import {
+  captureArchiveNeighbors,
+  discardPendingArchiveUndo,
+  registerPendingArchiveUndo
+} from '@/store/session-archive-undo'
 import { clearSessionControl } from '@/store/session-control'
 import { isSessionOwnerResolutionError } from '@/store/session-owner-resolution'
 import {
@@ -313,7 +320,9 @@ async function desktopSessionCreateParams(
   if (capturedRoute) {
     await ensureGatewayAgent(capturedRoute.connectionId, profile)
   } else {
-    await ensureGatewayProfile(profile)
+    // Source-preserving: on a registry agent this must NOT re-home the window
+    // to a same-named local profile (the silent local-fallback on Send).
+    await ensureGatewaySessionProfile(profile)
   }
 
   return {
@@ -544,7 +553,7 @@ export function useSessionActions({
         // Home is an explicit detached scope: do not let a stale live cwd from
         // the previously selected project leak into this new session (#84220).
         const workspaceTarget = $newChatWorkspaceTarget.get()
-        const homeScope = $projectScope.get() === NO_PROJECT_ID
+        const homeScope = isHomeProjectId($projectScope.get())
 
         const cwd =
           workspaceTarget === null || (workspaceTarget === undefined && homeScope)
@@ -875,7 +884,29 @@ export function useSessionActions({
 
       const requestId = resumeRequestRef.current + 1
       resumeRequestRef.current = requestId
-      const resumedSameSelectedSession = selectedStoredSessionIdRef.current === storedSessionId
+      const ownerRoute = capturedOwner || getSessionOwnerHint(storedSessionId)
+      const previousRuntime = runtimeIdByStoredSessionIdRef.current.get(storedSessionId)
+      const previousState = previousRuntime ? sessionStateByRuntimeIdRef.current.get(previousRuntime) : undefined
+
+      const cacheOwnerMatches = (state: ClientSessionState): boolean => {
+        if (!ownerRoute) {
+          return true
+        }
+
+        const cachedOwner = state.ownerRoute ?? state.transcriptProvenance
+
+        return Boolean(
+          cachedOwner &&
+          cachedOwner.connectionId === ownerRoute.connectionId &&
+          normalizeProfileKey(cachedOwner.profile) ===
+            normalizeProfileKey(ownerRoute.targetProfile || ownerRoute.profile)
+        )
+      }
+
+      const resumedSameSelectedSession =
+        selectedStoredSessionIdRef.current === storedSessionId &&
+        (!ownerRoute || Boolean(previousState && cacheOwnerMatches(previousState)))
+
       const resumeStartMessages = resumedSameSelectedSession ? $messages.get() : []
 
       const isCurrentResume = () =>
@@ -935,6 +966,12 @@ export function useSessionActions({
           return null
         }
 
+        // A different owner's cache may back a still-running background chat.
+        // Treat it as a miss here; do not destroy that owner's runtime state.
+        if (!cacheOwnerMatches(state)) {
+          return null
+        }
+
         if (state.storedSessionId !== storedSessionId) {
           runtimeIdByStoredSessionIdRef.current.delete(storedSessionId)
           sessionStateByRuntimeIdRef.current.delete(runtimeId)
@@ -963,7 +1000,6 @@ export function useSessionActions({
       // gateway call (no-op when it's already on that profile / single-profile).
       // resolveStoredSession finds the row by id (cheap), so an uncached pasted
       // id loads as fast as a sidebar click instead of hanging on a list scan.
-      const ownerRoute = capturedOwner || getSessionOwnerHint(storedSessionId)
       // A connection switch clears/reloads the session rows before this path
       // runs, so an untagged row belongs to the connection that supplied the
       // current list. Capture that source before the async metadata lookup. If
@@ -976,7 +1012,10 @@ export function useSessionActions({
         ambientConnection?.mode === 'remote' ? ambientConnection.connectionId?.trim() || '' : ''
 
       const storedForProfile = await resolveStoredSession(storedSessionId, ownerRoute)
-      const sessionProfile = storedForProfile?.profile
+
+      // Optional REST metadata must not erase the backend profile of a known
+      // owner: multiplexed gateways select the resume DB from the RPC payload.
+      const sessionProfile = ownerRoute ? ownerRoute.targetProfile || ownerRoute.profile : storedForProfile?.profile
 
       if (resumeRequestRef.current !== requestId) {
         return
@@ -1548,22 +1587,25 @@ export function useSessionActions({
         let resumeRuntimeBaselineMessages: ChatMessage[] = []
         const resumeStartedAt = Date.now() / 1000
 
-        const resumePromise = singleFlightSessionResume(storedSessionId, () =>
-          requestForSession<SessionResumeResponse>('session.resume', {
-            session_id: storedSessionId,
-            cols: 96,
-            source: 'desktop',
-            defer_history: !watchWindow,
-            // REST is the transcript authority for Desktop. Avoid duplicating a
-            // potentially huge compression lineage in the WebSocket response.
-            // Watch windows attach lazily (live mirror). Every other cold resume
-            // gets the gateway's default deferred build: the RPC returns the
-            // transcript immediately instead of blocking the switch on _make_agent
-            // (MCP discovery / prompt build), and the agent pre-warms in the
-            // background while the prefetch above paints the transcript.
-            ...(watchWindow ? { lazy: true } : { omit_messages: true }),
-            ...(sessionProfile ? { profile: sessionProfile } : {})
-          })
+        const resumePromise = singleFlightSessionResume(
+          storedSessionId,
+          () =>
+            requestForSession<SessionResumeResponse>('session.resume', {
+              session_id: storedSessionId,
+              cols: 96,
+              source: 'desktop',
+              defer_history: !watchWindow,
+              // REST is the transcript authority for Desktop. Avoid duplicating a
+              // potentially huge compression lineage in the WebSocket response.
+              // Watch windows attach lazily (live mirror). Every other cold resume
+              // gets the gateway's default deferred build: the RPC returns the
+              // transcript immediately instead of blocking the switch on _make_agent
+              // (MCP discovery / prompt build), and the agent pre-warms in the
+              // background while the prefetch above paints the transcript.
+              ...(watchWindow ? { lazy: true } : { omit_messages: true }),
+              ...(sessionProfile ? { profile: sessionProfile } : {})
+            }),
+          sessionOwner
         ).then(resumed => {
           resumeRuntimeBaselineMessages =
             sessionStateByRuntimeIdRef.current.get(resumed.session_id)?.messages ?? resumeRuntimeBaselineMessages
@@ -1802,6 +1844,13 @@ export function useSessionActions({
             ...state,
             ...(runtimeInfo ?? {}),
             messages: visibleMessagesForView,
+            ownerRoute:
+              sessionOwner && typeof sessionOwner === 'object'
+                ? {
+                    ...sessionOwner,
+                    profile: sessionOwner.targetProfile || sessionOwner.profile
+                  }
+                : undefined,
             transcriptProvenance,
             busy: resumedRunning,
             awaitingResponse: resumedRunning && !recoveredInFlightTail,
@@ -2070,11 +2119,13 @@ export function useSessionActions({
         //    "Couldn't load this session" strand. removeSession already routes
         //    by (connection, profile); this is the same ownership contract.
         //
-        // An untagged parent keeps the historic profile-only path exactly.
+        // An untagged parent keeps the historic profile path — source-preserving:
+        // on a registry agent this must NOT re-home the window to a same-named
+        // local profile (the silent local-fallback on branch).
         if (ownerRoute) {
           await ensureGatewayAgent(ownerRoute.connectionId, ownerRoute.profile)
         } else {
-          await ensureGatewayProfile(profile)
+          await ensureGatewaySessionProfile(profile)
         }
 
         const requestBranchGateway = <T>(method: string, params: Record<string, unknown>): Promise<T> =>
@@ -2359,7 +2410,7 @@ export function useSessionActions({
         if (ownerRoute) {
           await ensureGatewayAgent(ownerRoute.connectionId, ownerRoute.profile)
         } else {
-          await ensureGatewayProfile(profile)
+          await ensureGatewaySessionProfile(profile)
         }
 
         // Read the parent transcript from the backend that OWNS it. A bare
@@ -2546,8 +2597,18 @@ export function useSessionActions({
   )
 
   const archiveSession = useCallback(
-    async (storedSessionId: string) => {
-      clearNotifications()
+    async (storedSessionId: string, opts: { withUndo?: boolean } = {}) => {
+      const { withUndo = false } = opts
+
+      // A hotkey/menu archive clears the toast stack the same way it always
+      // has. The undo-capable sidebar path must NOT do this — it is often
+      // showing (or about to show) an undo toast for THIS archive, and
+      // clearing here would also silently kill any OTHER session's still-live
+      // undo toast, orphaning its timer exactly like the notification-cap
+      // eviction bug this feature was rejected for (t_548d0d33, issue 4).
+      if (!withUndo) {
+        clearNotifications()
+      }
 
       const listed = findListedSession(storedSessionId)
       const archived = listed?.session
@@ -2571,6 +2632,13 @@ export function useSessionActions({
       // live tip after compression. Drop both so the pin can't linger.
       const archivedPinId = archived ? sessionPinId(archived) : storedSessionId
       const archivedIds = [storedSessionId, archived?.id, archived?._lineage_root_id]
+      const wasPinned = previousPinned.includes(storedSessionId) || previousPinned.includes(archivedPinId)
+      // Captured from the row's neighbors (a stable ordering invariant), not
+      // its absolute index — an index recorded now goes stale the instant a
+      // SECOND concurrent archive shifts the list, which is exactly the bug
+      // that made concurrent undos restore in the wrong order (t_548d0d33,
+      // issue 1). Must run BEFORE the optimistic removal below.
+      const neighbors = withUndo && archived ? captureArchiveNeighbors(storedSessionId) : null
 
       // Soft-hide: drop from every sidebar slice immediately, keep the data.
       dropListedSession(storedSessionId)
@@ -2582,12 +2650,32 @@ export function useSessionActions({
         startFreshSessionDraft(true)
       }
 
+      // Kicked off (not awaited) before the undo entry registers, so
+      // `registerPendingArchiveUndo` can hand the SAME in-flight promise to
+      // the undo-window bookkeeping — `undoArchive` then queues its inverse
+      // PATCH behind this one instead of racing it (t_548d0d33, issue 3).
+      const writePromise = setSessionArchived(storedSessionId, true, profile)
+
+      if (withUndo && archived) {
+        registerPendingArchiveUndo({
+          nextPinId: neighbors?.nextPinId ?? null,
+          prevPinId: neighbors?.prevPinId ?? null,
+          session: archived,
+          storedSessionId,
+          wasPinned,
+          writePromise
+        })
+      }
+
       try {
-        await setSessionArchived(storedSessionId, true, profile)
+        await writePromise
         // Archived rows never reach the sidebar, so their persisted unread can
         // only rot. Dropped after the RPC so a failed archive keeps it.
         forgetSessionUnread(archivedIds, profile)
         // An archived session is hidden from the sidebar; its tile must go too.
+        // This runs for EVERY archive path, undo-capable or not — the whole
+        // point of routing the sidebar icon through this one action instead of
+        // a forked helper (t_548d0d33, issue 2).
         const tiledRuntimeId = runtimeIdByStoredSessionIdRef.current.get(storedSessionId)
         closeSessionTile(storedSessionId)
 
@@ -2597,14 +2685,31 @@ export function useSessionActions({
           dropSessionState(tiledRuntimeId)
         }
 
-        notify({ durationMs: 2_000, kind: 'success', message: copy.archived })
+        // The undo-capable caller shows its OWN "Session archived — Undo"
+        // toast (wiring.tsx) for this same window; a second ambient "Archived"
+        // toast here would be redundant noise on top of it.
+        if (!withUndo) {
+          notify({ durationMs: 2_000, kind: 'success', message: copy.archived })
+        }
       } catch (err) {
+        if (withUndo) {
+          // The mutation never took — there is nothing pending to undo.
+          discardPendingArchiveUndo(storedSessionId)
+        }
+
         if (archived) {
           restoreListedSession(archived, listed?.slice)
         }
 
         untombstoneSessions(archivedIds)
         $pinnedSessionIds.set(previousPinned)
+
+        // The undo-capable caller surfaces its own failure toast (and rolls
+        // back its own optimistic UI) from the rejection this rethrows.
+        if (withUndo) {
+          throw err
+        }
+
         notifyError(err, copy.archiveFailed)
       } finally {
         endSessionMutation(archivedIds)
@@ -2619,6 +2724,52 @@ export function useSessionActions({
     ]
   )
 
+  // Unarchive (#7b52ebc2 follow-up): the Archived filter's rows only ever
+  // offered the SAME "Archive session" verb wired to `archiveSession` — a
+  // no-op on an already-archived row, which read as "archiving does nothing
+  // here" rather than surfacing the row's real inverse action. Mirrors
+  // `archiveSession`'s optimistic-then-confirm shape, but the row only ever
+  // lives in `$archivedSessions` (never `$sessions`/messaging/cron — those
+  // slices exclude archived rows by construction), so there is no listed
+  // slice to drop from and no undo window to open.
+  const unarchiveSession = useCallback(async (storedSessionId: string) => {
+    const archived = $archivedSessions.get().find(session => sessionMatchesStoredId(session, storedSessionId))
+    const stampedProfile = archived?.profile?.trim()
+    const profile = stampedProfile || (await resolveSessionProfile(storedSessionId))
+
+    if (archived && !stampedProfile && !profile?.trim() && $profiles.get().filter(item => item.name.trim()).length > 1) {
+      notifyError(new Error('Session ownership could not be resolved'), copy.unarchiveFailed)
+
+      return
+    }
+
+    const previousArchived = $archivedSessions.get()
+
+    // Soft-hide from the Archived view immediately; surface it back in the
+    // live sidebar without waiting for a full refresh (same restore shape
+    // sessions-settings.tsx uses for its own Unarchive row).
+    $archivedSessions.set(previousArchived.filter(session => !sessionMatchesStoredId(session, storedSessionId)))
+
+    if (archived) {
+      untombstoneSessions([archived.id, archived._lineage_root_id])
+      setSessions(prev => [{ ...archived, archived: false }, ...prev.filter(s => s.id !== archived.id)])
+    }
+
+    try {
+      await setSessionArchived(storedSessionId, false, profile)
+      notify({ durationMs: 2_000, kind: 'success', message: copy.unarchived })
+    } catch (err) {
+      // Roll back both sides of the optimistic move.
+      $archivedSessions.set(previousArchived)
+
+      if (archived) {
+        setSessions(prev => prev.filter(s => s.id !== archived.id))
+      }
+
+      notifyError(err, copy.unarchiveFailed)
+    }
+  }, [copy])
+
   return {
     archiveSession,
     branchCurrentSession,
@@ -2630,6 +2781,7 @@ export function useSessionActions({
     removeSession,
     resumeSession,
     selectSidebarItem,
-    startFreshSessionDraft
+    startFreshSessionDraft,
+    unarchiveSession
   }
 }

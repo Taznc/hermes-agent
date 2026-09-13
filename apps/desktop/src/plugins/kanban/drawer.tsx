@@ -1,16 +1,27 @@
 /**
- * Task drawer — the desktop port of the dashboard's task detail, flat-styled:
- * status menu + meta table, DIAGNOSTICS (the "why is this stuck" panel, with
- * reassign recovery), description (editable), result/summary, dependencies,
- * comments (+composer), activity, run history, and the worker log tail.
+ * Task drawer — the desktop port of the dashboard's task detail.
+ *
+ * FACADE. It owns the shell (status-colored header band, tab strip, the
+ * queries and mutations) and delegates each tab's body to a `drawer_<topic>`
+ * sibling:
+ *   - `drawer_overview` — diagnostics, meta, description, deps, result
+ *   - `drawer_activity` — event feed, runs, comments + composer
+ *   - `drawer_log`      — worker log tail, attachments
+ *   - `drawer_events`   — pure event/run text derivation (no React)
+ *   - `drawer_cta`      — the call-to-action banner + choice questions
+ *
+ * Color: every tone here comes from `columnMeta(status)` / `SEVERITY_TONE`
+ * and is applied through `wash()` — the drawer never picks a color itself, so
+ * it stays consistent with the board by construction.
  */
 
 import {
-  Badge,
-  Button,
+  $paneWidthOverride,
   cn,
   Codicon,
-  compactNumber,
+  ConfirmDialog,
+  Dialog,
+  DialogContent,
   DropdownMenu,
   DropdownMenuContent,
   DropdownMenuItem,
@@ -19,530 +30,142 @@ import {
   ErrorState,
   host,
   Loader,
-  LogView,
-  Textarea,
-  Tip,
+  setPaneWidthOverride,
   useMutation,
   useQuery,
   useQueryClient,
   useValue
 } from '@hermes/plugin-sdk'
-import { type ReactNode, useEffect, useRef, useState } from 'react'
+import { type PointerEvent as ReactPointerEvent, useEffect, useMemo, useState } from 'react'
 
 import {
   $boardSlug,
   addComment,
   deleteTask,
-  estimateTask,
   fetchLog,
   fetchProfiles,
   fetchTask,
+  linkTasks,
   logKey,
   patchTask,
   PROFILES_KEY,
   reassignTask,
   reclaimTask,
   taskKey,
+  unlinkTasks,
   uploadAttachment
 } from './api'
-import { ModelOverrideField, overridePatch } from './model-override'
+import { ActivityRow, CommentsSection, RunsSection } from './drawer_activity'
+import { CtaBanner } from './drawer_cta'
+import { groupActivity } from './drawer_events'
 import {
-  type Diagnostic,
-  type DiagnosticAction,
-  type KanbanAttachment,
-  type KanbanEvent,
-  type KanbanTaskDetail,
-  SEVERITY_TONE,
-  type TaskEstimate
-} from './types'
+  AttachmentsSection,
+  FULL_LOG_TAIL_BYTES,
+  ImagesSection,
+  isImageAttachment,
+  WorkerLogSection
+} from './drawer_log'
+import {
+  AssigneeMenu,
+  DependenciesSection,
+  DescriptionSection,
+  Diagnostics,
+  EstimateSection,
+  isAdminSummary,
+  MetaRow
+} from './drawer_overview'
+import { ModelOverrideField, overrideLabel, overridePatch } from './model-override'
+import { PriorityPicker } from './priority-picker'
+import { statusGuidance } from './status-guidance'
+import { type ChoiceResponse, columnMeta, type KanbanTaskDetail, SEVERITY_TONE } from './types'
 import {
   ago,
-  Avatar,
   Callout,
-  columnLabel,
-  duration,
+  CollapsibleMarkdown,
   errText,
+  FIELD_LABEL,
+  IdChip,
   isLockedTarget,
-  type KanbanText,
   lockedReason,
   ScrollFade,
   Section,
   shortId,
   StatusMenu,
+  TabStrip,
   useDefaultAssignee,
-  useKanban
+  useKanban,
+  wash
 } from './ui'
 
+export { ActivityRow, RunErrorLine } from './drawer_activity'
+// Re-exported for the plugin's existing test suite and for board.tsx, which
+// import these by name. Behavior lives in the siblings; this is the door.
+export { CtaBanner, parseBlockedChoices, parseCmdFences } from './drawer_cta'
+export { type ActivityGroup, groupActivity, latestBlockReason, runErrorText } from './drawer_events'
+export { ImagesSection, ImageThumb, isImageAttachment } from './drawer_log'
+
+type TabId = 'activity' | 'log' | 'overview'
+
 /**
- * Turn a task_events row into an operator-readable line. The backend logs
- * machine payloads ("status" + {"status":"ready"}); rendering the raw kind
- * made the feed useless ("status · 2 sec. ago" after a drag). Known kinds get
- * prose with the payload folded in; unknown kinds fall back to kind + compact
- * key=value detail so new backend events still say something.
+ * Pending focus request for the comment composer. The CTA banner's Reply lives
+ * on Overview while the composer lives on Activity, so the deep-link is a
+ * two-beat action: switch tabs, then focus once the input has mounted. A
+ * one-shot flag (rather than a direct querySelector at click time) is what
+ * keeps Reply from being a silently dead button.
  */
-function eventText(event: KanbanEvent, k: KanbanText): { detail?: string; label: string } {
-  let p: Record<string, unknown> = {}
+const FOCUS_COMMENT_ATTEMPTS = 10
 
-  if (typeof event.payload === 'string' && event.payload) {
-    try {
-      p = JSON.parse(event.payload) as Record<string, unknown>
-    } catch {
-      return { label: event.kind.replace(/_/g, ' '), detail: event.payload }
-    }
-  } else if (event.payload && typeof event.payload === 'object') {
-    p = event.payload as Record<string, unknown>
-  }
+/**
+ * Drawer width sash. The Log tab carries raw shell output, and 26rem wraps it
+ * to shreds — so the drawer's left edge is a drag handle, the same interaction
+ * the shell's column seam and the docked detail pane already use, persisted
+ * through the same pane store so a width chosen once survives reopens and
+ * restarts. Drag geometry is inverted from the shell's rail: this drawer is
+ * anchored right, so pulling LEFT widens it.
+ */
+const DRAWER_PANE_ID = 'kanban.taskDrawer'
+/** The authored 26rem default, in px — the width the class paints when no
+ *  override is stored, and the drag's starting point on a first drag. */
+const DRAWER_DEFAULT_WIDTH_PX = 416
+const DRAWER_MIN_WIDTH_PX = 384
+const DRAWER_MAX_VW = 0.68
 
-  const str = (key: string): null | string => {
-    const value = p[key]
+/** Clamp to [24rem, 68vw], with the ceiling floored at the minimum so a window
+ *  narrower than 24rem can't invert the range and pin the drawer to a sliver. */
+function clampDrawerWidth(px: number) {
+  const max = Math.max(DRAWER_MIN_WIDTH_PX, Math.round(window.innerWidth * DRAWER_MAX_VW))
 
-    return typeof value === 'string' && value ? value : null
-  }
-
-  const col = (key: string) => {
-    const value = str(key)
-
-    return value ? columnLabel(k, value) : null
-  }
-
-  switch (event.kind) {
-    case 'created':
-      return { label: k.evtCreated(col('status') ?? '', str('assignee') ?? '') }
-    case 'status': {
-      const reason = str('reason')
-
-      return {
-        label: k.evtMovedTo(col('status') ?? '?'),
-        detail: reason === 'parent_reopened' ? k.evtParentReopened(str('parent') ?? '') : (reason ?? undefined)
-      }
-    }
-
-    case 'assigned': {
-      const assignee = str('assignee')
-
-      return { label: assignee ? k.evtAssignedTo(assignee) : k.evtUnassigned }
-    }
-
-    case 'commented':
-      return { label: k.evtCommentBy(str('author') ?? k.someone) }
-
-    case 'claimed':
-      return { label: str('source_status') === 'review' ? k.evtClaimedReview : k.evtClaimedWorker }
-
-    case 'spawned':
-      return { label: k.evtWorkerStarted, detail: p.pid != null ? `pid ${p.pid}` : undefined }
-
-    case 'completed':
-      return { label: k.evtCompleted }
-
-    case 'blocked':
-      return { label: k.evtBlocked, detail: str('reason') ?? undefined }
-
-    case 'unblocked':
-      return { label: k.evtUnblocked(col('status') ?? '') }
-
-    case 'reclaimed':
-      return { label: k.evtReclaimed, detail: str('reason') ?? undefined }
-
-    case 'specified':
-      return { label: k.evtSpecified }
-
-    case 'promoted':
-      return { label: k.evtPromoted }
-
-    case 'scheduled':
-      return { label: k.evtScheduled, detail: str('reason') ?? undefined }
-
-    case 'archived':
-      return { label: k.evtArchived }
-
-    case 'reprioritized':
-      return { label: k.evtReprioritized(String(p.priority ?? '?')) }
-    default: {
-      const detail = Object.entries(p)
-        .filter(([, value]) => value != null && typeof value !== 'object')
-        .map(([key, value]) => `${key}=${String(value)}`)
-        .join(' ')
-
-      return { label: event.kind.replace(/_/g, ' '), detail: detail || undefined }
-    }
-  }
+  return Math.min(max, Math.max(DRAWER_MIN_WIDTH_PX, Math.round(px)))
 }
 
-function MetaRow({ children, label }: { children: ReactNode; label: string }) {
-  return (
-    <>
-      <span className="text-(--ui-text-quaternary)">{label}</span>
-      <span className="min-w-0 truncate text-(--ui-text-secondary)">{children}</span>
-    </>
-  )
-}
+function focusCommentInput(attemptsLeft = FOCUS_COMMENT_ATTEMPTS): void {
+  const el = document.querySelector<HTMLElement>('[data-kanban-comment-input="true"]')
 
-/** The dashboard's diagnostics panel: severity-toned, plain-English, with the
- *  backend's structured recovery actions as buttons. `reassign` is skipped —
- *  the Assignee control in the meta table IS that action, inline. */
-function Diagnostics({ items, onReclaim }: { items: Diagnostic[]; onReclaim: () => void }) {
-  const k = useKanban()
+  if (el) {
+    el.scrollIntoView({ behavior: 'smooth', block: 'nearest' })
+    el.focus()
 
-  const act = (action: DiagnosticAction) => {
-    if (action.kind === 'reclaim') {
-      onReclaim()
-    } else if (action.kind === 'cli_hint') {
-      void navigator.clipboard.writeText(String(action.payload?.command ?? action.label))
-      host.notify({ kind: 'info', message: k.commandCopied })
-    }
+    return
   }
 
-  return (
-    <div className="flex flex-col gap-2">
-      {items.map(diag => {
-        const tone = SEVERITY_TONE[diag.severity]
-        const actions = diag.actions.filter(action => action.kind === 'reclaim' || action.kind === 'cli_hint')
-
-        return (
-          <Callout
-            key={`${diag.kind}-${diag.last_seen_at}`}
-            title={`${diag.title}${diag.count > 1 ? ` ×${diag.count}` : ''}`}
-            tone={tone}
-          >
-            <p className="whitespace-pre-wrap text-[0.71rem] leading-relaxed text-(--ui-text-secondary)">
-              {diag.detail}
-            </p>
-            {actions.length > 0 && (
-              <div className="flex flex-wrap gap-1.5">
-                {actions.map(action => (
-                  <Button
-                    key={`${action.kind}-${action.label}`}
-                    onClick={() => act(action)}
-                    size="xs"
-                    variant={action.suggested ? 'secondary' : 'outline'}
-                  >
-                    {action.kind === 'cli_hint' && <Codicon name="copy" size="0.7rem" />}
-                    {action.label}
-                  </Button>
-                ))}
-              </div>
-            )}
-          </Callout>
-        )
-      })}
-    </div>
-  )
-}
-
-/** Jira-style inline assignee editor: the meta row IS the control — click the
- *  assignee to reassign (reclaims a running worker first, resets the failure
- *  streak — the explicit human recovery action). */
-function AssigneeMenu({
-  current,
-  onReassign
-}: {
-  current: null | string | undefined
-  onReassign: (p: string) => void
-}) {
-  const k = useKanban()
-  const { data: roster } = useQuery({ queryKey: PROFILES_KEY, queryFn: fetchProfiles, staleTime: 60_000 })
-
-  return (
-    <DropdownMenu>
-      <DropdownMenuTrigger asChild>
-        <button
-          className="-mx-1 inline-flex max-w-full items-center gap-1.5 rounded px-1 py-0.5 text-left transition-colors hover:bg-(--chrome-action-hover)"
-          type="button"
-        >
-          {current ? (
-            <>
-              <Avatar name={current} size="0.875rem" />
-              <span className="truncate">{current}</span>
-            </>
-          ) : (
-            <span className="text-(--ui-text-quaternary)">{k.unassigned}</span>
-          )}
-          <Codicon className="shrink-0 text-(--ui-text-quaternary)" name="chevron-down" size="0.65rem" />
-        </button>
-      </DropdownMenuTrigger>
-      <DropdownMenuContent align="start">
-        {(roster?.profiles ?? []).map(profile => (
-          <DropdownMenuItem key={profile.name} onSelect={() => onReassign(profile.name)}>
-            <Avatar name={profile.name} size="0.875rem" />
-            {profile.name}
-            {profile.name === current && <Codicon className="ml-auto" name="check" size="0.8rem" />}
-          </DropdownMenuItem>
-        ))}
-      </DropdownMenuContent>
-    </DropdownMenu>
-  )
-}
-
-// Mirrors the review pane's commit-message field: one row tall to start
-// (button-height), CSS field-sizing grows it with content, button hugs the
-// bottom edge as it grows.
-//
-// On a RUNNING task the worker polls its comment thread and folds new notes
-// into the live turn (OUT-OF-BAND steer), so a plain note reaches the agent
-// mid-run within a few seconds — no block/unblock dance. `onRequeue` is the
-// heavier option: post the note AND reclaim so the task restarts from scratch
-// with the note in context (use when the current run has gone off the rails).
-function CommentComposer({
-  onRequeue,
-  onSubmit,
-  pending,
-  running
-}: {
-  onRequeue?: (body: string) => void
-  onSubmit: (body: string) => void
-  pending: boolean
-  running?: boolean
-}) {
-  const k = useKanban()
-  const [body, setBody] = useState('')
-
-  const submit = () => {
-    const trimmed = body.trim()
-
-    if (trimmed && !pending) {
-      onSubmit(trimmed)
-      setBody('')
-    }
+  if (attemptsLeft > 0) {
+    requestAnimationFrame(() => focusCommentInput(attemptsLeft - 1))
   }
-
-  const requeue = () => {
-    const trimmed = body.trim()
-
-    if (trimmed && !pending && onRequeue) {
-      onRequeue(trimmed)
-      setBody('')
-    }
-  }
-
-  return (
-    <div className="flex flex-col gap-1.5">
-      <div className="relative">
-        <Textarea
-          className={cn('field-sizing-content max-h-40 min-h-0 resize-none', running ? 'pr-[3.5rem]' : 'pr-[5rem]')}
-          onChange={event => setBody(event.target.value)}
-          onKeyDown={event => {
-            if (event.key === 'Enter' && !event.shiftKey) {
-              event.preventDefault()
-              submit()
-            }
-          }}
-          placeholder={running ? k.messageWorker : k.addComment}
-          rows={1}
-          size="sm"
-          value={body}
-        />
-        <Button
-          className="absolute top-1 right-1"
-          disabled={!body.trim() || pending}
-          onClick={submit}
-          size="xs"
-          variant="secondary"
-        >
-          {running ? k.send : k.comment}
-        </Button>
-      </div>
-      {running && onRequeue && (
-        <div className="flex items-center justify-between gap-2">
-          <span className="text-[0.625rem] leading-tight text-(--ui-text-quaternary)">{k.deliveredLive}</span>
-          <Button className="shrink-0" disabled={!body.trim() || pending} onClick={requeue} size="xs" variant="outline">
-            <Codicon name="debug-restart" size="0.7rem" />
-            {k.requeueWithNote}
-          </Button>
-        </div>
-      )}
-    </div>
-  )
-}
-
-function DescriptionSection({ body, onSave }: { body: null | string | undefined; onSave: (body: string) => void }) {
-  const k = useKanban()
-  const [editing, setEditing] = useState(false)
-  const [draft, setDraft] = useState('')
-
-  return (
-    <Section
-      action={
-        <Button
-          aria-label={editing ? k.cancelEdit : k.editDescription}
-          onClick={() => {
-            setDraft(body ?? '')
-            setEditing(!editing)
-          }}
-          size="icon-xs"
-          variant="ghost"
-        >
-          <Codicon name={editing ? 'close' : 'edit'} size="0.75rem" />
-        </Button>
-      }
-      label={k.description}
-    >
-      {editing ? (
-        <div className="flex flex-col gap-1.5">
-          <Textarea
-            className="min-h-24 text-[0.75rem]"
-            onChange={event => setDraft(event.target.value)}
-            value={draft}
-          />
-          <Button
-            className="self-end"
-            onClick={() => {
-              onSave(draft)
-              setEditing(false)
-            }}
-            size="xs"
-            variant="secondary"
-          >
-            {k.save}
-          </Button>
-        </div>
-      ) : body ? (
-        <p className="whitespace-pre-wrap text-[0.8125rem] text-(--ui-text-secondary)">{body}</p>
-      ) : (
-        <p className="text-[0.8125rem] text-(--ui-text-quaternary)">{k.noDescription}</p>
-      )}
-    </Section>
-  )
-}
-
-// `latest_summary` is just the newest non-null run summary. A reclaim writes an
-// administrative note into that slot; hide those (Runs still shows them).
-const isAdminSummary = (summary: string) => /^status changed to \w+ \(dashboard\/direct\)$/.test(summary)
-
-function AttachmentsSection({
-  attachments,
-  onUpload,
-  pending
-}: {
-  attachments: KanbanAttachment[]
-  onUpload: (file: File) => void
-  pending: boolean
-}) {
-  const k = useKanban()
-  const fileRef = useRef<HTMLInputElement>(null)
-
-  return (
-    <Section
-      action={
-        <>
-          <input
-            hidden
-            onChange={event => {
-              const file = event.target.files?.[0]
-
-              if (file) {
-                onUpload(file)
-              }
-
-              event.target.value = ''
-            }}
-            ref={fileRef}
-            type="file"
-          />
-          <Button
-            aria-label={k.uploadAttachment}
-            disabled={pending}
-            onClick={() => fileRef.current?.click()}
-            size="icon-xs"
-            variant="ghost"
-          >
-            <Codicon name={pending ? 'sync' : 'cloud-upload'} size="0.8rem" spinning={pending} />
-          </Button>
-        </>
-      }
-      label={k.attachments(attachments.length)}
-    >
-      {attachments.length > 0 ? (
-        <ul className="flex flex-col gap-1">
-          {attachments.map(attachment => (
-            <li className="flex items-center gap-1.5 text-[0.75rem] text-(--ui-text-tertiary)" key={attachment.id}>
-              <Codicon name="file" size="0.75rem" />
-              {attachment.filename}
-            </li>
-          ))}
-        </ul>
-      ) : (
-        <p className="text-[0.75rem] text-(--ui-text-quaternary)">{k.noAttachments}</p>
-      )}
-    </Section>
-  )
-}
-
-// Rough effort estimate via the auxiliary (auto-routed) model. Tokens +
-// complexity, never dollars — providers don't report cost reliably. Gated
-// behind an explicit click + disclaimer since it makes a model call. The
-// control keeps a stable footprint (spinner swaps in place) so there's no
-// layout jump when it runs.
-function EstimateSection({ id }: { id: string }) {
-  const k = useKanban()
-  const [result, setResult] = useState<null | TaskEstimate>(null)
-
-  const est = useMutation({
-    mutationFn: () => estimateTask(id),
-    onError: err => host.notify({ kind: 'error', message: errText(err) }),
-    onSuccess: r => {
-      if (r.ok) {
-        setResult(r)
-      } else {
-        host.notify({ kind: 'warning', message: r.reason || k.couldNotEstimate })
-      }
-    }
-  })
-
-  // A new task resets the cached estimate (the drawer reuses one instance).
-  useEffect(() => setResult(null), [id])
-
-  return (
-    <Section label={k.estimate}>
-      {result?.ok ? (
-        <div className="flex flex-col gap-1">
-          <div className="flex items-center gap-2 text-[0.8125rem]">
-            <span className="font-medium tabular-nums text-(--ui-text-secondary)">
-              ~{compactNumber(result.est_tokens)} {k.tokUnit}
-            </span>
-            {result.complexity && (
-              <span className="text-(--ui-text-tertiary)">
-                · {k.complexity[result.complexity] ?? result.complexity}
-              </span>
-            )}
-            <Tip label={k.reEstimate}>
-              <Button
-                aria-label={k.reEstimate}
-                className="ml-auto"
-                disabled={est.isPending}
-                onClick={() => est.mutate()}
-                size="icon-xs"
-                variant="ghost"
-              >
-                <Codicon name="refresh" size="0.75rem" spinning={est.isPending} />
-              </Button>
-            </Tip>
-          </div>
-          {result.rationale && (
-            <p className="text-[0.6875rem] leading-relaxed text-(--ui-text-quaternary)">{result.rationale}</p>
-          )}
-        </div>
-      ) : (
-        <div className="flex items-center gap-2">
-          <Button disabled={est.isPending} onClick={() => est.mutate()} size="xs" variant="outline">
-            <Codicon name={est.isPending ? 'loading' : 'dashboard'} size="0.75rem" spinning={est.isPending} />
-            {est.isPending ? k.estimating : k.estimateEffort}
-          </Button>
-          <Tip label={k.estimateTipLong}>
-            <span className="text-[0.625rem] text-(--ui-text-quaternary)">{k.makesModelCall}</span>
-          </Tip>
-        </div>
-      )}
-    </Section>
-  )
 }
 
 export function TaskDrawer({
+  board: taskBoard,
   columns,
   id,
   onClose,
   onOpen
 }: {
+  /** The card's own board, from the caller's board cache — REQUIRED to route
+   *  every fetch/mutation correctly in All Boards mode, where `$boardSlug` is
+   *  the `'*'` sentinel and cannot resolve a real board on its own. `undefined`
+   *  in single-board mode (byte-identical to the pre-existing behavior: every
+   *  call falls through to `$boardSlug`). */
+  board?: string
   columns: string[]
   id: null | string
   onClose: () => void
@@ -551,23 +174,102 @@ export function TaskDrawer({
   const k = useKanban()
   const qc = useQueryClient()
   const slug = useValue($boardSlug)
+  const [lightbox, setLightbox] = useState<null | { filename: string; src: string }>(null)
+  // Tab selection is pure presentation and belongs to this component — a
+  // global store would make one drawer's tab leak into the next card.
+  const [tab, setTab] = useState<TabId>('overview')
+  // Drawer width: persisted override (undefined = the authored w-[26rem]).
+  const widthOverride = useValue($paneWidthOverride(DRAWER_PANE_ID))
+  const [resizing, setResizing] = useState(false)
+  // Roadmap → Ready is the one lane spawn that skips auto-decompose, so it
+  // confirms — same gate as the board's drag/menu path (`spawnReadyKey`),
+  // scoped to this single open card instead of a cardKey since the drawer
+  // only ever has one task in view.
+  const [confirmingReady, setConfirmingReady] = useState(false)
+
+  const startResize = (event: ReactPointerEvent<HTMLDivElement>) => {
+    if (event.button !== 0) {
+      return
+    }
+
+    event.preventDefault()
+    const startX = event.clientX
+    const startWidth = widthOverride ?? DRAWER_DEFAULT_WIDTH_PX
+    setResizing(true)
+
+    // Right-anchored: leftward pointer travel is negative dx but MORE width.
+    const onMove = (move: globalThis.PointerEvent) =>
+      setPaneWidthOverride(DRAWER_PANE_ID, clampDrawerWidth(startWidth + (startX - move.clientX)))
+
+    // Same teardown contract as the shell's sashes: pointercancel (window
+    // drag-out, touch cancel, system gesture) ends the drag exactly like
+    // pointerup, with explicit cross-removal of both — `{ once: true }`
+    // wouldn't remove the sibling path.
+    const onUp = () => {
+      window.removeEventListener('pointermove', onMove)
+      window.removeEventListener('pointerup', onUp)
+      window.removeEventListener('pointercancel', onUp)
+      setResizing(false)
+    }
+
+    window.addEventListener('pointermove', onMove)
+    window.addEventListener('pointerup', onUp)
+    window.addEventListener('pointercancel', onUp)
+  }
 
   // Socket-invalidated (bindApi); the interval is only the socketless heartbeat.
   const { data: detail, error } = useQuery({
     enabled: !!id,
-    queryFn: () => fetchTask(id!),
+    queryFn: () => fetchTask(id!, taskBoard),
     queryKey: taskKey(slug, id ?? ''),
     refetchInterval: 30_000
   })
 
   const task = detail?.task
   const running = task?.status === 'running'
+  // The task's liveness fields summarize the card; the active attempt's own
+  // timestamp lives in the run collection and is the only honest run clock
+  // after retries or review/rework cycles.
+  const currentRun = running ? detail?.runs.find(run => run.status === 'running') : undefined
   const defaultAssignee = useDefaultAssignee()
+
+  // Resolve what an un-overridden task ACTUALLY runs: the assignee profile's
+  // own configured model/provider/effort from the roster. The Model row then
+  // reads "provider: model · Effort" (muted = inherited) instead of an opaque
+  // "Profile default" that hides the real depth. Older backends without the
+  // roster fields quietly fall back to the generic copy.
+  const { data: roster } = useQuery({ queryFn: fetchProfiles, queryKey: PROFILES_KEY, staleTime: 60_000 })
+  const assigneeName = task?.assignee || defaultAssignee
+  const assigneeProfile = assigneeName ? roster?.profiles.find(p => p.name === assigneeName) : undefined
+
+  const resolvedInheritLabel =
+    assigneeProfile && (assigneeProfile.model || assigneeProfile.reasoning_effort)
+      ? overrideLabel(
+          {
+            effort: assigneeProfile.reasoning_effort ?? '',
+            model: assigneeProfile.model ?? '',
+            provider: assigneeProfile.provider ?? ''
+          },
+          k.modelInherit
+        )
+      : undefined
+
+  // The worker artifact is capped/rotated by the backend at this same size,
+  // so this is the entire retained log — never an arbitrary UI tail that
+  // readers need to page through.
+  const logTail = FULL_LOG_TAIL_BYTES
+  // A different card starts on Overview — carrying the previous card's tab
+  // over would open a log the user never asked for. A confirm bound to the
+  // PREVIOUS card must not linger open against the new one.
+  useEffect(() => {
+    setTab('overview')
+    setConfirmingReady(false)
+  }, [id])
 
   const { data: log } = useQuery({
     enabled: !!id,
-    queryFn: () => fetchLog(id!),
-    queryKey: logKey(slug, id ?? ''),
+    queryFn: () => fetchLog(id!, logTail, taskBoard),
+    queryKey: logKey(slug, id ?? '', logTail),
     refetchInterval: running ? 3_000 : 15_000
   })
 
@@ -591,7 +293,7 @@ export function TaskDrawer({
   // Optimistic status change against the task cache; rolls back + toasts on a
   // rejected transition (the backend enforces the workflow).
   const moveMut = useMutation({
-    mutationFn: (status: string) => patchTask(id!, { status }),
+    mutationFn: (status: string) => patchTask(id!, { status }, taskBoard),
     onMutate: async status => {
       await qc.cancelQueries({ queryKey: taskKey(slug, id!) })
       const previous = qc.getQueryData<KanbanTaskDetail>(taskKey(slug, id!))
@@ -622,7 +324,8 @@ export function TaskDrawer({
     )
 
   const commentMut = useMutation({
-    mutationFn: (body: string) => addComment(id!, body),
+    mutationFn: ({ body, choice }: { body: string; choice?: ChoiceResponse }) =>
+      addComment(id!, body, choice, taskBoard),
     onError: err => host.notify({ kind: 'error', message: errText(err) }),
     onSuccess: invalidate
   })
@@ -632,8 +335,8 @@ export function TaskDrawer({
   // replacement for the block → comment → unblock dance.
   const requeueMut = useMutation({
     mutationFn: async (body: string) => {
-      await addComment(id!, body)
-      await reclaimTask(id!)
+      await addComment(id!, body, undefined, taskBoard)
+      await reclaimTask(id!, taskBoard)
     },
     onError: err => host.notify({ kind: 'error', message: errText(err) }),
     onSuccess: () => {
@@ -642,22 +345,47 @@ export function TaskDrawer({
     }
   })
 
-  const uploadMut = useMutation({
-    mutationFn: async (file: File) =>
-      uploadAttachment(id!, {
-        bytes: await file.arrayBuffer(),
-        contentType: file.type || undefined,
-        filename: file.name
-      }),
+  // Priority-only PATCH — never touches status/title/body/assignee.
+  const priorityMut = useMutation({
+    mutationFn: (priority: number) => patchTask(id!, { priority }, taskBoard),
     onError: err => host.notify({ kind: 'error', message: errText(err) }),
     onSuccess: invalidate
   })
+
+  const uploadMut = useMutation({
+    mutationFn: async (file: File) =>
+      uploadAttachment(
+        id!,
+        {
+          bytes: await file.arrayBuffer(),
+          contentType: file.type || undefined,
+          filename: file.name
+        },
+        taskBoard
+      ),
+    onError: err => host.notify({ kind: 'error', message: errText(err) }),
+    onSuccess: invalidate
+  })
+
+  const activityGroups = useMemo(() => (detail ? groupActivity(detail.events, k) : []), [detail, k])
+
+  // Upstream made `attachments` optional on the drawer payload: an older backend
+  // omits the key entirely, which means "this backend has no attachment support"
+  // and is NOT the same as an empty list. `supportsAttachments` preserves that
+  // distinction (upstream gates its section on `Array.isArray(detail.attachments)`
+  // for the same reason) while `attachments` gives the two filtered sections a
+  // safe array to read without each guarding the shape itself.
+  const supportsAttachments = Array.isArray(detail?.attachments)
+
+  const attachments = useMemo(() => (Array.isArray(detail?.attachments) ? detail.attachments : []), [detail])
 
   if (!id) {
     return null
   }
 
   const errorMessage = error ? errText(error) : null
+  const tone = columnMeta(task?.status ?? '').tone
+  const attachmentCount = attachments.length
 
   const move = (status: string) => {
     if (!task || status === task.status) {
@@ -670,23 +398,59 @@ export function TaskDrawer({
       return
     }
 
+    // Spawning straight to Ready skips auto-decompose, which is the standing
+    // default for a roadmap item — so it is the one lane move that asks
+    // first, same rule as the board's drag/menu path.
+    if (task.status === 'roadmap' && status === 'ready') {
+      setConfirmingReady(true)
+
+      return
+    }
+
     moveMut.mutate(status)
   }
 
+  /** Reply deep-link: comments live on Activity, so switch there first and
+   *  focus once the composer has mounted. */
+  const focusComment = () => {
+    setTab('activity')
+    requestAnimationFrame(() => focusCommentInput())
+  }
+
   return (
-    <div className="absolute inset-y-0 right-0 z-20 flex w-[26rem] flex-col border-l border-(--ui-stroke-tertiary) bg-(--ui-bg-elevated) duration-150 ease-out animate-in fade-in slide-in-from-right-4">
-      <header className="flex flex-col gap-2 px-4 pt-3.5 pb-3">
+    <div
+      className="absolute inset-y-0 right-0 z-20 flex w-[26rem] flex-col border-l border-(--ui-stroke-tertiary) bg-(--ui-bg-elevated) duration-150 ease-out animate-in fade-in slide-in-from-right-4"
+      style={widthOverride !== undefined ? { width: `${widthOverride}px` } : undefined}
+    >
+      {/* Left-edge drag sash — widen the drawer to read the Log tab, double-
+          click to fall back to the authored 26rem. */}
+      <div
+        className="group/vsash absolute inset-y-0 left-0 z-10 w-1 -translate-x-1/2 cursor-col-resize"
+        data-kanban-drawer-sash="true"
+        onDoubleClick={() => setPaneWidthOverride(DRAWER_PANE_ID, undefined)}
+        onPointerDown={startResize}
+      >
+        <div
+          className={cn(
+            'absolute inset-y-0 left-1/2 w-px -translate-x-1/2 transition-colors',
+            resizing ? 'bg-(--ui-stroke-secondary)' : 'group-hover/vsash:bg-(--ui-stroke-secondary)'
+          )}
+        />
+      </div>
+
+      {/* Status-colored header band — the card's state is the first thing the
+          eye lands on, and it's the same tone the board's column uses. */}
+      <header
+        className="flex flex-col gap-2 px-4 pt-3.5 pb-3"
+        style={task ? { backgroundColor: wash(tone, 8), boxShadow: `inset 0 -1px 0 ${wash(tone, 22)}` } : undefined}
+      >
         <div className="flex items-center gap-2">
           {task ? (
             <StatusMenu columns={columns} onMove={move} status={task.status} />
           ) : (
             <span className="font-mono text-sm text-(--ui-text-tertiary)">{shortId(id)}</span>
           )}
-          {task && (
-            <span className="font-mono text-[0.625rem] text-(--ui-text-quaternary)" data-selectable-text="true">
-              {shortId(task.id)}
-            </span>
-          )}
+          {task && <IdChip className="text-[0.625rem]" id={task.id} />}
           <div className="ml-auto flex items-center gap-0.5">
             {task && (
               <DropdownMenu>
@@ -719,11 +483,16 @@ export function TaskDrawer({
                     {k.copyTitle}
                   </DropdownMenuItem>
                   <DropdownMenuSeparator />
-                  <DropdownMenuItem onSelect={mutate(() => patchTask(task.id, { status: 'archived' }), onClose)}>
+                  <DropdownMenuItem
+                    onSelect={mutate(() => patchTask(task.id, { status: 'archived' }, taskBoard), onClose)}
+                  >
                     <Codicon name="archive" size="0.85rem" />
                     {k.archive}
                   </DropdownMenuItem>
-                  <DropdownMenuItem className="text-destructive" onSelect={mutate(() => deleteTask(task.id), onClose)}>
+                  <DropdownMenuItem
+                    className="text-destructive"
+                    onSelect={mutate(() => deleteTask(task.id, taskBoard), onClose)}
+                  >
                     <Codicon name="trash" size="0.85rem" />
                     {k.delete}
                   </DropdownMenuItem>
@@ -747,7 +516,19 @@ export function TaskDrawer({
         )}
       </header>
 
-      <div className="min-h-0 flex-1 overflow-y-auto px-4 pb-4" data-selectable-text="true">
+      {detail && task && (
+        <TabStrip
+          active={tab}
+          onSelect={next => setTab(next as TabId)}
+          tabs={[
+            { id: 'overview', label: k.tabOverview },
+            { id: 'activity', label: k.tabActivity, count: detail.events.length },
+            { id: 'log', label: k.tabLog, count: attachmentCount }
+          ]}
+        />
+      )}
+
+      <div className="min-h-0 flex-1 overflow-y-auto px-4 py-3 pb-10" data-selectable-text="true">
         {errorMessage ? (
           <ErrorState title={errorMessage} />
         ) : !detail || !task ? (
@@ -755,206 +536,200 @@ export function TaskDrawer({
             <Loader type="lemniscate-bloom" />
           </div>
         ) : (
-          <div className="flex flex-col gap-4 text-sm">
-            <div className="grid grid-cols-[6rem_minmax(0,1fr)] gap-x-3 gap-y-1 text-[0.71rem]">
-              <MetaRow label={k.assignee}>
-                <AssigneeMenu
-                  current={task.assignee}
-                  onReassign={profile => void mutate(() => reassignTask(task.id, profile))()}
+          <div className="flex flex-col gap-4 text-sm" id={`kanban-tabpanel-${tab}`} role="tabpanel">
+            {tab === 'overview' && (
+              <>
+                <CtaBanner
+                  comments={detail.comments}
+                  events={detail.events}
+                  onFocusComment={focusComment}
+                  onMove={move}
+                  onSubmitChoice={(body, choice) => commentMut.mutateAsync({ body, choice })}
+                  runs={detail.runs}
+                  task={task}
                 />
-              </MetaRow>
-              {typeof task.priority === 'number' && <MetaRow label={k.metaPriority}>{task.priority}</MetaRow>}
-              {task.tenant && <MetaRow label={k.metaTenant}>{task.tenant}</MetaRow>}
-              {task.workspace_path && (
-                <MetaRow label={k.workspace}>
-                  {task.workspace_kind ? `${task.workspace_kind}: ` : ''}
-                  {task.workspace_path}
-                </MetaRow>
-              )}
-              <MetaRow label={k.model}>
-                <ModelOverrideField
-                  onChange={next => void mutate(() => patchTask(task.id, overridePatch(next)))()}
-                  value={{
-                    effort: task.reasoning_effort ?? '',
-                    model: task.model_override ?? '',
-                    provider: task.provider_override ?? ''
-                  }}
-                />
-              </MetaRow>
-              {task.created_by && <MetaRow label={k.metaCreatedBy}>{task.created_by}</MetaRow>}
-              {ago(task.created_at) && <MetaRow label={k.metaCreated}>{ago(task.created_at)}</MetaRow>}
-              {running && task.worker_pid ? <MetaRow label={k.metaWorkerPid}>{task.worker_pid}</MetaRow> : null}
-            </div>
 
-            {task.status === 'ready' && !task.assignee && !defaultAssignee && (
-              <Callout title={k.readyUnassignedTitle} tone={SEVERITY_TONE.warning}>
-                <p className="text-[0.71rem] leading-relaxed text-(--ui-text-secondary)">{k.readyUnassignedBody}</p>
-              </Callout>
-            )}
+                <p className="text-[0.71rem] leading-relaxed text-(--ui-text-tertiary)">
+                  {statusGuidance(task.status, task, detail.events, detail.runs, k)}
+                </p>
 
-            {task.diagnostics && task.diagnostics.length > 0 && (
-              <Section label={k.diagnosticsN(task.diagnostics.length)}>
-                <Diagnostics items={task.diagnostics} onReclaim={() => void mutate(() => reclaimTask(task.id))()} />
-              </Section>
-            )}
-
-            <DescriptionSection body={task.body} onSave={body => void mutate(() => patchTask(task.id, { body }))()} />
-
-            <EstimateSection id={task.id} />
-
-            {task.result && (
-              <Section label={k.result}>
-                <p className="whitespace-pre-wrap text-[0.8125rem] text-(--ui-text-secondary)">{task.result}</p>
-              </Section>
-            )}
-
-            {task.latest_summary && !isAdminSummary(task.latest_summary) && (
-              <Section label={k.latestSummary}>
-                <p className="whitespace-pre-wrap text-[0.8125rem] text-(--ui-text-secondary)">{task.latest_summary}</p>
-              </Section>
-            )}
-
-            {(detail.links.parents.length > 0 || detail.links.children.length > 0) && (
-              <Section label={k.dependencies}>
-                {(['parents', 'children'] as const).map(side =>
-                  detail.links[side].length > 0 ? (
-                    <div className="flex flex-wrap items-center gap-1.5" key={side}>
-                      <span className="text-[0.6875rem] text-(--ui-text-quaternary)">
-                        {side === 'parents' ? k.blockedBy : k.blocks}
-                      </span>
-                      {detail.links[side].map(linked => (
-                        <button
-                          className="rounded bg-(--ui-bg-quaternary) px-1.5 py-0.5 font-mono text-[0.625rem] text-(--ui-text-secondary) transition-colors hover:bg-(--chrome-action-hover) hover:text-foreground"
-                          key={linked}
-                          onClick={() => onOpen(linked)}
-                          type="button"
-                        >
-                          {shortId(linked)}
-                        </button>
-                      ))}
-                    </div>
-                  ) : null
+                {task.status === 'ready' && !task.assignee && !defaultAssignee && (
+                  <Callout title={k.readyUnassignedTitle} tone={SEVERITY_TONE.warning}>
+                    <p className="text-[0.71rem] leading-relaxed text-(--ui-text-secondary)">{k.readyUnassignedBody}</p>
+                  </Callout>
                 )}
-              </Section>
+
+                {task.diagnostics && task.diagnostics.length > 0 && (
+                  <Section label={k.diagnosticsN(task.diagnostics.length)} tone={SEVERITY_TONE.warning}>
+                    <Diagnostics
+                      items={task.diagnostics}
+                      onReclaim={() => void mutate(() => reclaimTask(task.id, taskBoard))()}
+                    />
+                  </Section>
+                )}
+
+                <DescriptionSection
+                  body={task.body}
+                  onSave={body => void mutate(() => patchTask(task.id, { body }, taskBoard))()}
+                />
+
+                <div className="flex flex-col gap-1.5">
+                  <div className={FIELD_LABEL}>{k.metaSectionLabel}</div>
+                  <div className="grid grid-cols-[5.5rem_minmax(0,1fr)] gap-x-3 gap-y-0.5 text-[0.71rem]">
+                    <MetaRow label={k.assignee}>
+                      <AssigneeMenu
+                        current={task.assignee}
+                        onReassign={profile => void mutate(() => reassignTask(task.id, profile, taskBoard))()}
+                      />
+                    </MetaRow>
+                    <MetaRow label={k.metaPriority}>
+                      <PriorityPicker onChange={priority => priorityMut.mutate(priority)} priority={task.priority} />
+                    </MetaRow>
+                    {task.tenant && <MetaRow label={k.metaTenant}>{task.tenant}</MetaRow>}
+                    {task.workspace_path && (
+                      <MetaRow
+                        label={k.workspace}
+                        title={`${task.workspace_kind ? `${task.workspace_kind}: ` : ''}${task.workspace_path}`}
+                      >
+                        {task.workspace_kind ? `${task.workspace_kind}: ` : ''}
+                        {task.workspace_path}
+                      </MetaRow>
+                    )}
+                    <MetaRow label={k.model}>
+                      <ModelOverrideField
+                        inheritLabel={resolvedInheritLabel}
+                        onChange={next => void mutate(() => patchTask(task.id, overridePatch(next), taskBoard))()}
+                        value={{
+                          effort: task.reasoning_effort ?? '',
+                          model: task.model_override ?? '',
+                          provider: task.provider_override ?? ''
+                        }}
+                      />
+                    </MetaRow>
+                    {task.created_by && <MetaRow label={k.metaCreatedBy}>{task.created_by}</MetaRow>}
+                    {ago(task.created_at) && <MetaRow label={k.metaCreated}>{ago(task.created_at)}</MetaRow>}
+                    {currentRun?.started_at && ago(currentRun.started_at) && (
+                      <MetaRow label={k.metaRunStarted}>{ago(currentRun.started_at)}</MetaRow>
+                    )}
+                    {running && detail.runs.length > 1 && (
+                      <MetaRow label={k.metaRun}>{k.metaRunCount(detail.runs.length)}</MetaRow>
+                    )}
+                    {running && task.worker_pid ? <MetaRow label={k.metaWorkerPid}>{task.worker_pid}</MetaRow> : null}
+                  </div>
+                </div>
+
+                {task.result && (
+                  <Section label={k.result} tone={columnMeta('done').tone}>
+                    <CollapsibleMarkdown text={task.result} />
+                  </Section>
+                )}
+
+                {task.latest_summary && !isAdminSummary(task.latest_summary) && (
+                  <Section label={k.latestSummary}>
+                    <CollapsibleMarkdown text={task.latest_summary} />
+                  </Section>
+                )}
+
+                <DependenciesSection
+                  board={taskBoard}
+                  detail={detail}
+                  onLink={parentId => void mutate(() => linkTasks(parentId, task.id, taskBoard))()}
+                  onOpen={onOpen}
+                  onUnlink={(parentId, childId) => void mutate(() => unlinkTasks(parentId, childId, taskBoard))()}
+                  slug={slug}
+                  task={task}
+                />
+
+                <EstimateSection board={taskBoard} id={task.id} />
+              </>
             )}
 
-            <Section
-              action={
-                <Tip label={running ? k.commentsHelpRunning : k.commentsHelp}>
-                  <span className="grid size-5 place-items-center rounded text-(--ui-text-quaternary) hover:text-(--ui-text-secondary)">
-                    <Codicon name="question" size="0.8rem" />
-                  </span>
-                </Tip>
-              }
-              label={k.comments(detail.comments.length)}
-            >
-              {detail.comments.length > 0 && (
-                <ul className="flex flex-col gap-2">
-                  {detail.comments.map(comment => (
-                    <li className="text-[0.75rem]" key={comment.id}>
-                      <span className="font-medium text-(--ui-text-secondary)">{comment.author}</span>
-                      <span className="ml-2 text-[0.625rem] text-(--ui-text-quaternary)">
-                        {ago(comment.created_at)}
-                      </span>
-                      <p className="whitespace-pre-wrap text-(--ui-text-tertiary)">{comment.body}</p>
-                    </li>
-                  ))}
-                </ul>
-              )}
-              <CommentComposer
-                onRequeue={body => requeueMut.mutate(body)}
-                onSubmit={body => commentMut.mutate(body)}
-                pending={commentMut.isPending || requeueMut.isPending}
-                running={running}
-              />
-            </Section>
+            {tab === 'activity' && (
+              <>
+                <CommentsSection
+                  comments={detail.comments}
+                  onRequeue={body => requeueMut.mutate(body)}
+                  onSubmit={body => commentMut.mutate({ body })}
+                  pending={commentMut.isPending || requeueMut.isPending}
+                  running={running}
+                />
 
-            {detail.events.length > 0 && (
-              <Section label={k.activity(detail.events.length)}>
-                <ScrollFade deps={detail.events.length} max="7rem">
-                  <ul className="flex flex-col gap-1">
-                    {detail.events.map(event => {
-                      const { detail: extra, label } = eventText(event, k)
+                {detail.events.length > 0 ? (
+                  <Section label={k.activity(detail.events.length)}>
+                    {/* Activity is an audit trail, not a live terminal: retain
+                        the reader's place while it refreshes, and give a dense
+                        timeline enough room to show more than a handful of
+                        transitions at once. The Worker Log owns live-follow. */}
+                    <ScrollFade max="min(28rem, 46vh)">
+                      <ul className="flex flex-col gap-1">
+                        {activityGroups.map(group => (
+                          <ActivityRow group={group} k={k} key={group.events[0].id} />
+                        ))}
+                      </ul>
+                    </ScrollFade>
+                  </Section>
+                ) : (
+                  <p className="text-[0.75rem] text-(--ui-text-quaternary)">{k.noActivityYet}</p>
+                )}
 
-                      return (
-                        <li className="flex items-baseline gap-2 text-[0.6875rem]" key={event.id}>
-                          <span className="shrink-0 text-(--ui-text-secondary)">{label}</span>
-                          {extra && (
-                            <span
-                              className="min-w-0 truncate text-[0.625rem] text-(--ui-text-quaternary)"
-                              title={extra}
-                            >
-                              {extra}
-                            </span>
-                          )}
-                          <span className="ml-auto shrink-0 text-(--ui-text-quaternary)">{ago(event.created_at)}</span>
-                        </li>
-                      )
-                    })}
-                  </ul>
-                </ScrollFade>
-              </Section>
+                <RunsSection runs={detail.runs} />
+              </>
             )}
 
-            {detail.runs.length > 0 && (
-              <Section label={k.runs(detail.runs.length)}>
-                <ScrollFade max="11rem">
-                  <ul className="flex flex-col gap-1.5">
-                    {detail.runs.map(run => {
-                      const failed = ['crashed', 'failed', 'timed_out', 'gave_up'].includes(run.outcome ?? run.status)
+            {tab === 'log' && (
+              <>
+                <WorkerLogSection live={running} log={log} />
 
-                      return (
-                        <li className="flex flex-col gap-0.5 text-[0.71rem]" key={run.id}>
-                          <div className="flex items-center gap-2">
-                            <Badge size="xs" variant={failed ? 'destructive' : 'muted'}>
-                              {run.outcome ?? run.status}
-                            </Badge>
-                            {run.profile && <span className="text-(--ui-text-tertiary)">{run.profile}</span>}
-                            {duration(run.started_at, run.ended_at) && (
-                              <span className="text-(--ui-text-quaternary)">
-                                {duration(run.started_at, run.ended_at)}
-                              </span>
-                            )}
-                            <span className="ml-auto shrink-0 text-(--ui-text-quaternary)">
-                              {ago(run.ended_at ?? run.started_at)}
-                            </span>
-                          </div>
-                          {(run.error || run.summary) && (
-                            <p
-                              className={cn(
-                                'line-clamp-2 whitespace-pre-wrap',
-                                run.error ? 'text-destructive' : 'text-(--ui-text-quaternary)'
-                              )}
-                            >
-                              {run.error ?? run.summary}
-                            </p>
-                          )}
-                        </li>
-                      )
-                    })}
-                  </ul>
-                </ScrollFade>
-              </Section>
-            )}
+                <ImagesSection
+                  attachments={attachments.filter(isImageAttachment)}
+                  board={taskBoard}
+                  onOpen={(filename, src) => setLightbox({ filename, src })}
+                />
 
-            {log?.exists && log.content && (
-              <Section label={log.truncated ? k.workerLogTail : k.workerLog}>
-                <ScrollFade deps={log.content.length} max="12rem">
-                  <LogView className="border-0 px-0">{log.content}</LogView>
-                </ScrollFade>
-              </Section>
-            )}
-
-            {Array.isArray(detail.attachments) && (
-              <AttachmentsSection
-                attachments={detail.attachments}
-                onUpload={file => uploadMut.mutate(file)}
-                pending={uploadMut.isPending}
-              />
+                {supportsAttachments && (
+                  <AttachmentsSection
+                    attachments={attachments.filter(a => !isImageAttachment(a))}
+                    onUpload={file => uploadMut.mutate(file)}
+                    pending={uploadMut.isPending}
+                  />
+                )}
+              </>
             )}
           </div>
         )}
       </div>
+
+      <Dialog onOpenChange={open => !open && setLightbox(null)} open={!!lightbox}>
+        <DialogContent
+          bodyClassName="block overflow-visible p-0"
+          className="w-auto max-h-[calc(100vh-12rem)] max-w-[calc(100vw-12rem)] border-0 bg-transparent shadow-none"
+          showCloseButton={false}
+        >
+          {lightbox && (
+            <img
+              alt={lightbox.filename}
+              className="block max-h-[calc(100vh-12rem)] max-w-[calc(100vw-12rem)] cursor-zoom-out rounded-lg object-contain shadow-2xl"
+              onClick={() => setLightbox(null)}
+              onError={() => setLightbox(null)}
+              src={lightbox.src}
+            />
+          )}
+        </DialogContent>
+      </Dialog>
+
+      {/* Same seam as the board's spawn-Ready confirm: `onConfirm` returns
+          the mutation's own promise, so a server-side rejection surfaces
+          inline and the dialog stays open instead of closing on failure. */}
+      <ConfirmDialog
+        confirmLabel={k.spawnReadyConfirm}
+        description={k.spawnReadyBody}
+        onClose={() => setConfirmingReady(false)}
+        onConfirm={async () => {
+          await moveMut.mutateAsync('ready')
+        }}
+        open={confirmingReady}
+        title={k.spawnReadyTitle}
+      />
     </div>
   )
 }

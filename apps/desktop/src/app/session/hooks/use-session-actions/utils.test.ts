@@ -69,6 +69,24 @@ describe('applyRuntimeInfo approval mode', () => {
     expect(approvalModeForProfile('work')).toBe('smart')
     expect(approvalModeForProfile('default')).toBe('smart')
   })
+
+  it('credits the profile the payload names, not whichever profile is active', () => {
+    // The backend resolves approval mode against the SESSION's own profile and
+    // reports both fields in one payload. Re-attributing that mode to the
+    // ambient active profile reintroduces the cross-profile bug one layer up.
+    applyRuntimeInfo({ approval_mode: 'manual', profile_name: 'other' })
+
+    expect(approvalModeForProfile('other')).toBe('manual')
+    expect(approvalModeForProfile('work')).toBe('smart')
+  })
+
+  it('never lets a background session publish into the foreground cache', () => {
+    // Background tiles run in their own profile. Only the surface the user is
+    // looking at may write the shared statusbar value.
+    applyRuntimeInfo({ approval_mode: 'manual' }, { foreground: false })
+
+    expect(approvalModeForProfile('work')).toBe('smart')
+  })
 })
 
 const initialOnboardingState = $desktopOnboarding.get()

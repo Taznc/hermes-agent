@@ -10,12 +10,17 @@ import {
   deleteProfile,
   deleteSession,
   getAllSessionMessages,
+  getAuxiliaryModels,
   getCronJobs,
+  getEnvVars,
   getGlobalModelInfo,
   getGlobalModelOptions,
   getHermesConfig,
   getHermesConfigDefaults,
+  getHermesConfigRecord,
+  getHermesConfigSchema,
   getLatestSessionMessages,
+  getMoaModels,
   getOlderSessionMessages,
   getProfiles,
   getSession,
@@ -458,7 +463,18 @@ describe('Hermes REST helpers', () => {
       [getHermesConfigDefaults, '/api/config/defaults'],
       [getGlobalModelInfo, '/api/model/info'],
       [() => getGlobalModelOptions(), '/api/model/options?explicit_only=1'],
-      [getCronJobs, '/api/cron/jobs']
+      [getCronJobs, '/api/cron/jobs'],
+      // Regression: the Settings panel's schema fetch (GET /api/config/schema)
+      // used to be the one boot-burst call missing timeoutMs, so a stalled
+      // fetch never rejected and the panel spun on a bare skeleton forever
+      // with no error/retry affordance (see config-settings.test.tsx). Every
+      // sibling read the Settings panel fires during its own load must carry
+      // the same bounded timeout.
+      [() => getHermesConfigSchema(), '/api/config/schema'],
+      [() => getHermesConfigRecord(), '/api/config'],
+      [() => getAuxiliaryModels(), '/api/model/auxiliary'],
+      [() => getMoaModels(), '/api/model/moa'],
+      [() => getEnvVars(), '/api/env']
     ]
 
     for (const [call, path] of bootCalls) {
@@ -503,7 +519,8 @@ describe('Hermes REST helpers', () => {
 
     expect(api).toHaveBeenCalledWith({
       path: '/api/sessions/session-1/messages?profile=xiaoxuxu',
-      profile: 'xiaoxuxu'
+      profile: 'xiaoxuxu',
+      timeoutMs: 60_000
     })
   })
 
@@ -522,7 +539,8 @@ describe('Hermes REST helpers', () => {
     expect(api).toHaveBeenNthCalledWith(2, {
       connectionId: 'source-a',
       path: '/api/sessions/session-1/messages?profile=backend-default',
-      profile: 'backend-default'
+      profile: 'backend-default',
+      timeoutMs: 60_000
     })
   })
 
@@ -555,7 +573,8 @@ describe('Hermes REST helpers', () => {
     expect(LATEST_SESSION_MESSAGES_LIMIT).toBe(120)
     expect(api).toHaveBeenCalledWith({
       path: '/api/sessions/session-1/messages?profile=xiaoxuxu&limit=120&order=latest&include_compacted=true',
-      profile: 'xiaoxuxu'
+      profile: 'xiaoxuxu',
+      timeoutMs: 60_000
     })
   })
 
@@ -580,7 +599,8 @@ describe('Hermes REST helpers', () => {
 
     expect(api).toHaveBeenCalledWith({
       path: '/api/sessions/session-1/messages?profile=xiaoxuxu&limit=120&offset=240&order=latest&include_compacted=true',
-      profile: 'xiaoxuxu'
+      profile: 'xiaoxuxu',
+      timeoutMs: 60_000
     })
   })
 
@@ -595,7 +615,8 @@ describe('Hermes REST helpers', () => {
 
     expect(api).toHaveBeenCalledWith({
       path: '/api/sessions/session-1/messages?profile=xiaoxuxu&limit=500&offset=1000&order=latest',
-      profile: 'xiaoxuxu'
+      profile: 'xiaoxuxu',
+      timeoutMs: 60_000
     })
   })
 
@@ -617,11 +638,13 @@ describe('Hermes REST helpers', () => {
     expect(result.messages).toEqual([{ id: 1 }, { id: 2 }, { id: 3 }])
     expect(api).toHaveBeenNthCalledWith(1, {
       path: '/api/sessions/session-1/messages?profile=xiaoxuxu&limit=500&offset=0&order=oldest&include_compacted=true',
-      profile: 'xiaoxuxu'
+      profile: 'xiaoxuxu',
+      timeoutMs: 60_000
     })
     expect(api).toHaveBeenNthCalledWith(2, {
       path: '/api/sessions/session-1/messages?profile=xiaoxuxu&limit=500&offset=2&order=oldest&include_compacted=true',
-      profile: 'xiaoxuxu'
+      profile: 'xiaoxuxu',
+      timeoutMs: 60_000
     })
   })
 

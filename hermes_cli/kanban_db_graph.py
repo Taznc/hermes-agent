@@ -24,17 +24,26 @@ def inherit_creator_origin(
 
 def initial_task_state(
     conn: sqlite3.Connection, parents: tuple[str, ...], initial_status: str,
-    triage: bool, tenant: Optional[str],
+    triage: bool, tenant: Optional[str], lane: Optional[str] = None,
 ) -> tuple[str, Optional[str]]:
     """Resolve state and tenant under the creator's write transaction.
 
     Parent order breaks ties in this soft namespace; explicit tenant wins.
     Validate parents even for parked tasks so links never dangle.
+
+    Fork: ``lane`` (an inert ``idea``/``roadmap`` wishlist card) wins over parent
+    gating on purpose — a lane card linked under an epic must stay in its lane,
+    never land in ``todo`` where the promotion sweep would pick it up. Parent
+    satisfaction goes through ``_parent_dependency_satisfied`` so an ARCHIVED but
+    completed parent still counts as done (a plain ``status != 'done'`` test
+    would re-gate every child of an archived-after-completion parent).
     """
+    from hermes_cli.kanban_db import _parent_dependency_satisfied
+
     rows = {}
     if parents:
         rows = {row["id"]: row for row in conn.execute(
-            "SELECT id, status, tenant FROM tasks WHERE id IN "
+            "SELECT id, status, tenant, completed_at FROM tasks WHERE id IN "
             "(" + ",".join("?" * len(parents)) + ")", parents,
         )}
         missing = [pid for pid in parents if pid not in rows]
@@ -42,11 +51,13 @@ def initial_task_state(
             raise ValueError(f"unknown parent task(s): {', '.join(missing)}")
         if tenant is None:
             tenant = next((rows[pid]["tenant"] for pid in parents if rows[pid]["tenant"]), None)
+    if lane is not None:
+        return lane, tenant
     if initial_status == "blocked":
         return "blocked", tenant
     if triage:
         return "triage", tenant
-    if any(row["status"] != "done" for row in rows.values()):
+    if any(not _parent_dependency_satisfied(row) for row in rows.values()):
         return "todo", tenant
     return "ready", tenant
 
@@ -115,7 +126,7 @@ def decompose_triage_task(
     now = int(time.time())
     with write_txn(conn):
         root_row = conn.execute(
-            "SELECT id, status, tenant, workspace_kind, workspace_path "
+            "SELECT id, status, tenant, workspace_kind, workspace_path, priority "
             "FROM tasks WHERE id = ?", (task_id,),
         ).fetchone()
         if root_row is None or root_row["status"] != "triage":
@@ -179,6 +190,9 @@ def _insert_decomposed_child(
     and one shared checkout would put them all on the first sibling's branch
     with no lock; leaving it unset makes dispatch materialize a fresh
     ``<repo>/.worktrees/<child-id>`` per child from the board anchor.
+
+    Priority: a per-child integer overrides the root; otherwise the child
+    inherits the root's stored value.
     """
     from hermes_cli.kanban_db import (
         _new_task_id, _canonical_assignee, _append_event,
@@ -194,17 +208,20 @@ def _insert_decomposed_child(
         child_ws_path = root_row["workspace_path"]
     else:
         child_ws_path = None
+    child_priority = child.get("priority")
+    if not isinstance(child_priority, int) or isinstance(child_priority, bool):
+        child_priority = root_row["priority"]
     new_id = _new_task_id()
     body = child.get("body")
     conn.execute(
         "INSERT INTO tasks "
         "(id, title, body, assignee, status, workspace_kind, "
-        " workspace_path, tenant, created_at, created_by) "
-        "VALUES (?, ?, ?, ?, 'todo', ?, ?, ?, ?, ?)",
+        " workspace_path, tenant, created_at, created_by, priority) "
+        "VALUES (?, ?, ?, ?, 'todo', ?, ?, ?, ?, ?, ?)",
         (
             new_id, child["title"].strip(), body if isinstance(body, str) else None,
             _canonical_assignee(child.get("assignee")), child_ws_kind, child_ws_path,
-            root_row["tenant"], now, (author or "decomposer"),
+            root_row["tenant"], now, (author or "decomposer"), child_priority,
         ),
     )
     _append_event(

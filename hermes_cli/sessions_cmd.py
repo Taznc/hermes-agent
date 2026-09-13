@@ -250,7 +250,13 @@ def _default_exclude(args):
 
 def _cmd_list(db, args):
     from hermes_state_sessions import workspace_key as _ws_key
-    sessions = db.list_sessions_rich(source=args.source, exclude_sources=_default_exclude(args), limit=args.limit)
+    # Archived sessions are soft-hidden, so they need an explicit opt-in to be listed at all —
+    # otherwise `hermes sessions unarchive` has no way to discover its own targets.
+    sessions = db.list_sessions_rich(
+        source=args.source, exclude_sources=_default_exclude(args), limit=args.limit,
+        include_archived=bool(getattr(args, "include_archived", False)),
+        archived_only=bool(getattr(args, "archived_only", False)),
+    )
 
     # Workspace filter: workspace key (git repo root, else cwd) — path substring or exact basename.
     _ws_filter = (getattr(args, "workspace", None) or "").strip()
@@ -527,20 +533,8 @@ def _export_markdown_single(db, args, export_one, output_dir, lineage_is_logical
 # -- delete / prune / archive -------------------------------------------------
 
 def _cmd_delete(db, args):
-    resolved_session_id = db.resolve_session_id(args.session_id)
-    if not resolved_session_id:
-        return _not_found(args.session_id)
-    # The delete is honored (explicit id), but a pin is a "keep" flag: say so instead of silently destroying it.
-    _pinned_note = " (this session is PINNED)" if (db.get_session(resolved_session_id) or {}).get("pinned") else ""
-    if not args.yes:
-        if not _confirm_prompt(f"Delete session '{resolved_session_id}'{_pinned_note} and all its messages? [y/N] "):
-            print("Cancelled.")
-            return
-    elif _pinned_note:
-        print(f"Warning: deleting a pinned session '{resolved_session_id}'.")
-    if not db.delete_session(resolved_session_id, sessions_dir=_sessions_dir()):
-        return _not_found(args.session_id)
-    print(f"Deleted session '{resolved_session_id}'.")
+    from hermes_cli.sessions_cmd_archive import cmd_delete_ids
+    return cmd_delete_ids(db, args)
 
 
 #: Age floor for `prune --never-active`; generous: a young never-active row may be a chat nobody replied to yet.
@@ -611,6 +605,10 @@ def _cmd_prune_or_archive(db, args, action):
     prune = action == "prune"
     if prune and getattr(args, "never_active", False):
         return _prune_never_active_keyed(db, args)
+    if not prune and getattr(args, "ids", None):
+        # Explicit ids bypass the whole filter selector (and its ended-only gate).
+        from hermes_cli.sessions_cmd_archive import cmd_archive_ids
+        return cmd_archive_ids(db, args, archived=True)
     from hermes_cli.session_filters import build_prune_filters, describe_filters, format_epoch
     # Bare `prune` keeps the historical "older than 90 days" default. ANY filter — including --source —
     # suppresses the implicit cutoff (`prune --source cron` matches ALL cron sessions); the preview +
@@ -624,22 +622,26 @@ def _cmd_prune_or_archive(db, args, action):
         return 1
     if not prune and not any(v for k, v in filters.items() if k != "older_than_days"):
         print("Refusing to archive every ended session: pass at least one "
-              "filter (e.g. --newer-than 5h, --source cli, --title codex).")
+              "filter (e.g. --newer-than 5h, --source cli, --title codex), or name sessions "
+              "explicitly with --ids.")
         return
 
     # Prune skips archived rows unless --include-archived; archive only targets not-yet-archived rows.
     filters["archived"] = None if prune and getattr(args, "include_archived", False) else False
     filters["include_pinned"] = getattr(args, "include_pinned", False)
+    # Sessions the user navigates away from never receive ended_at, so filters match almost nothing
+    # without this opt-in (#85007, #90360). Off by default: the ended gate stays byte-identical.
+    include_open = filters["include_open"] = bool(getattr(args, "include_open", False))
     if not filters["include_pinned"]:
         _note_pinned_skipped(db, filters, action)
     candidates = db.list_prune_candidates(**filters)
     # Archive expands each row to its compression lineage (may include open continuations), so a
     # direct-open count would misdescribe its effect.
-    skipped_open = db.count_open_prune_matches(**filters) if prune else 0
+    skipped_open = db.count_open_prune_matches(**filters) if prune and not include_open else 0
     if skipped_open:
         print(f"Note: {skipped_open} open session{'' if skipped_open == 1 else 's'} also match these filters but "
-              "will be skipped because prune only deletes ended sessions. Use `hermes sessions delete <id>` "
-              "to remove one explicitly.")
+              "will be skipped because prune only deletes ended sessions. Pass --include-open to "
+              "include them, or use `hermes sessions delete <id>` to remove one explicitly.")
     if not candidates:
         print(f"No sessions match ({describe_filters(filters)}).")
         return
@@ -937,10 +939,18 @@ def _cmd_stats(db, args):
 # -- dispatch -----------------------------------------------------------------
 
 _PRE_DB_HANDLERS = {"repair": _cmd_repair, "recover": _cmd_recover, "import": _cmd_import}
+
+
+def _cmd_unarchive(db, args):
+    from hermes_cli.sessions_cmd_archive import cmd_archive_ids
+    return cmd_archive_ids(db, args, archived=False)
+
+
 _DB_HANDLERS = {
     "list": _cmd_list, "export": _cmd_export, "delete": _cmd_delete, "rename": _cmd_rename, "pinned": _cmd_pinned,
     "prune": partial(_cmd_prune_or_archive, action="prune"), "pin": partial(_cmd_pin, pinning=True),
     "archive": partial(_cmd_prune_or_archive, action="archive"), "unpin": partial(_cmd_pin, pinning=False),
+    "unarchive": _cmd_unarchive,
     "retitle-skills": _cmd_retitle_skills, "browse": _cmd_browse, "optimize": _cmd_optimize,
     "clean-markers": _cmd_clean_markers, "optimize-storage": _cmd_optimize_storage,
     "repair-routing": _cmd_repair_routing, "stats": _cmd_stats,

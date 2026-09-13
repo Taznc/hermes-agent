@@ -3,9 +3,11 @@ import { normalizeMathDelimiters } from '@assistant-ui/react-streamdown'
 import { isLikelyProseFence, sanitizeLanguageTag } from '@/lib/markdown-code'
 import { clampHtmlNestingDepth } from '@/lib/markdown-html-depth'
 import { mediaKind, mediaMarkdownHref } from '@/lib/media'
+import { linkifyBarePaths } from '@/lib/path-refs'
 import { previewMarkdownHref } from '@/lib/preview-targets'
 import { stripPreviewTargets } from '@/lib/preview-targets'
 import { linkifySessionRefs } from '@/lib/session-refs'
+import { parseTranscriptDirective } from '@/lib/transcript-directives'
 
 const REASONING_BLOCK_RE = /<(think|thinking|reasoning|scratchpad|analysis)>[\s\S]*?<\/\1>\s*/gi
 const PREVIEW_MARKER_RE = /\[Preview:[^\]]+\]\(#preview[:/][^)]+\)/gi
@@ -193,11 +195,17 @@ function routeFileLinksToPreview(text: string): string {
   })
 }
 
+// Order matters: `routeFileLinksToPreview` first, so an authored
+// `[label](/path)` becomes `#preview/` before `linkifyBarePaths` sees it (the
+// lookbehind then skips it as a link target); `autoLinkRawUrls` after, so a
+// bare path never appears inside a URL it would otherwise split.
 function rewriteProseSegment(segment: string): string {
   return linkifySessionRefs(
     autoLinkRawUrls(
-      routeFileLinksToPreview(
-        segment.replace(/`{3,}/g, '').replace(LOCAL_PREVIEW_URL_RE, '$1').replace(CITATION_MARKER_RE, '')
+      linkifyBarePaths(
+        routeFileLinksToPreview(
+          segment.replace(/`{3,}/g, '').replace(LOCAL_PREVIEW_URL_RE, '$1').replace(CITATION_MARKER_RE, '')
+        )
       )
     )
   )
@@ -217,7 +225,29 @@ function rewriteProseSegment(segment: string): string {
  * dollar can't be mistaken for math.
  */
 function normalizeVisibleProse(text: string): string {
-  return text
+  // Transcript directives (`::name{...}` alone on a line) must reach the
+  // paragraph renderer byte-intact: the prose rewrites below would turn an
+  // absolute `file="/abs/path.html"` into a nested markdown link, the
+  // paragraph would stop being text-only, and the directive would render as
+  // prose instead of the plugin's widget. Mask those lines behind inert
+  // sentinels (no `/`, `$`, `:` — nothing any rewrite matches) and restore
+  // them after the pipeline. `parseTranscriptDirective` is the same parser
+  // the renderer uses, so the shield and the renderer can never disagree
+  // about what counts as a directive. Sentinel chars are Unicode private-use
+  // (U+E000) — never produced by the model, matched by no rewrite.
+  const shielded: string[] = []
+
+  const masked = text.replace(/^[ \t]*::\S[^\n]*$/gm, line => {
+    if (parseTranscriptDirective(line) === null) {
+      return line
+    }
+
+    shielded.push(line)
+
+    return `\uE000hermes-directive-${shielded.length - 1}\uE000`
+  })
+
+  const out = masked
     .split(INLINE_CODE_SPLIT_RE)
     .map(part =>
       part.startsWith('`')
@@ -228,6 +258,10 @@ function normalizeVisibleProse(text: string): string {
             .join('')
     )
     .join('')
+
+  return shielded.length === 0
+    ? out
+    : out.replace(/\uE000hermes-directive-(\d+)\uE000/g, (match, index: string) => shielded[Number(index)] ?? match)
 }
 
 function isEscapedAt(text: string, index: number): boolean {

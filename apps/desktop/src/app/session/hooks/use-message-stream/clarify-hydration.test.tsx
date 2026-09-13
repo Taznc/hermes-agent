@@ -39,6 +39,9 @@ const clarifyExpire = (requestId: string) =>
 const clarifyCancel = (requestId: string) =>
   act(() => stream.handleEvent({ payload: { request_id: requestId }, session_id: SID, type: 'clarify.cancel' }))
 
+const clarifyExplanation = (payload: Record<string, unknown>) =>
+  act(() => stream.handleEvent({ payload, session_id: SID, type: 'clarify.explanation' }))
+
 function clarifyParts() {
   const messages = stream.state().messages ?? []
 
@@ -79,6 +82,26 @@ describe('clarify.request stream hydration', () => {
       choices: ['yes', 'no'],
       question: 'Ship it?'
     })
+  })
+
+  it('receives explain events in the pending request without creating a transcript row', () => {
+    mountStream()
+    clarifyRequest({ choices: ['yes', 'no'], question: 'Ship it?', request_id: 'req-help' })
+    const partsBefore = clarifyParts()
+
+    clarifyExplanation({
+      choice: 'yes',
+      content: 'It releases the approved build.',
+      explanation_id: 'explain-1',
+      request_id: 'req-help'
+    })
+
+    expect($clarifyRequests.get()[SID]?.help?.['explain-1']).toMatchObject({
+      choice: 'yes',
+      content: 'It releases the approved build.',
+      status: 'complete'
+    })
+    expect(clarifyParts()).toEqual(partsBefore)
   })
 
   it('reveals a clarify prompt raised by the active session', () => {
@@ -179,6 +202,21 @@ describe('clarify.request stream hydration', () => {
     toolStart({ args: { choices: ['a'], question: 'Pick' }, name: 'clarify', tool_id: 'call-xyz' })
 
     expect(clarifyParts()).toHaveLength(1)
+  })
+
+  it('keeps the same owned card answerable when reconnect replays its request', () => {
+    mountStream()
+
+    toolStart({ args: { choices: ['a'], question: 'Pick' }, name: 'clarify', tool_id: 'call-reconnect' })
+    clarifyRequest({ choices: ['a'], question: 'Pick', request_id: 'req-reconnect' })
+    // `session.resume` replays the still-pending request through the normal
+    // stream event. It must re-arm the original card, not create a second one
+    // or clear the request before the user acts.
+    clarifyRequest({ choices: ['a'], question: 'Pick', request_id: 'req-reconnect' })
+
+    expect($clarifyRequests.get()[SID]?.requestId).toBe('req-reconnect')
+    expect(clarifyParts()).toHaveLength(1)
+    expect(clarifyParts()[0]).not.toHaveProperty('result')
   })
 
   it('re-arms a hydrated Codex tool-only clarify in place instead of appending a second card', () => {
@@ -347,6 +385,95 @@ describe('clarify.request stream hydration', () => {
     expect($clarifyRequests.get()[SID]?.questions).toHaveLength(2)
   })
 
+  it('merges a BATCH tool.start that ALSO carries a top-level question', () => {
+    mountStream()
+
+    // THE field bug (2026-09-05): the model passed a batch-level `question`
+    // heading alongside `questions`. tool.start then keyed on the heading
+    // while clarify.request — whose batch wire shape has no top-level
+    // question — keyed on the joined question texts, so the two never matched
+    // and TWO identical interactive cards mounted.
+    toolStart({
+      args: {
+        question: 'Scoping the fork-delta inventory',
+        questions: [{ question: 'Drink?' }, { question: 'Productive when?' }]
+      },
+      name: 'clarify',
+      tool_id: 'call-batch-heading'
+    })
+    clarifyRequest({
+      questions: [
+        { qid: 'q0', question: 'Drink?' },
+        { qid: 'q1', question: 'Productive when?' }
+      ],
+      request_id: 'req-batch-heading'
+    })
+
+    expect(clarifyParts()).toHaveLength(1)
+  })
+
+  it('merges a heading-carrying batch when tool.start lands AFTER the request', () => {
+    mountStream()
+
+    clarifyRequest({
+      questions: [
+        { qid: 'q0', question: 'Drink?' },
+        { qid: 'q1', question: 'Productive when?' }
+      ],
+      request_id: 'req-heading-late'
+    })
+    toolStart({
+      args: {
+        question: 'Scoping the fork-delta inventory',
+        questions: [{ question: 'Drink?' }, { question: 'Productive when?' }]
+      },
+      name: 'clarify',
+      tool_id: 'call-heading-late'
+    })
+
+    expect(clarifyParts()).toHaveLength(1)
+  })
+
+  it('collapses to ONE open card even when correlation finds nothing in common', () => {
+    mountStream()
+
+    // The invariant backstop: only one clarify can block a session at a time,
+    // so two open rows are always a correlation miss, never real state. Even
+    // with zero overlapping args the card must not mount twice.
+    toolStart({ args: { question: 'totally unrelated text' }, name: 'clarify', tool_id: 'call-mismatch' })
+    clarifyRequest({
+      questions: [
+        { qid: 'q0', question: 'Drink?' },
+        { qid: 'q1', question: 'Productive when?' }
+      ],
+      request_id: 'req-mismatch'
+    })
+
+    expect(clarifyParts()).toHaveLength(1)
+  })
+
+  it('settles the surviving card when tool.complete arrives with the provider id', () => {
+    mountStream()
+
+    // Dedupe must not orphan the completion: the survivor inherits the
+    // provider tool id, so tool.complete (keyed by that id) still lands.
+    toolStart({ args: { question: 'unrelated heading' }, name: 'clarify', tool_id: 'call-survivor' })
+    clarifyRequest({
+      questions: [{ qid: 'q0', question: 'Drink?' }],
+      request_id: 'req-survivor'
+    })
+    toolComplete({
+      args: { questions: [{ question: 'Drink?' }] },
+      name: 'clarify',
+      result: { responses: [{ question: 'Drink?', user_response: 'Coffee' }] },
+      tool_id: 'call-survivor'
+    })
+
+    const parts = clarifyParts()
+    expect(parts).toHaveLength(1)
+    expect(parts[0]).toHaveProperty('result')
+  })
+
   it('does not duplicate when the batch clarify.request arrives before tool.start', () => {
     mountStream()
 
@@ -365,5 +492,60 @@ describe('clarify.request stream hydration', () => {
 
     expect(clarifyParts()).toHaveLength(1)
     expect($clarifyRequests.get()[SID]?.questions).toHaveLength(2)
+  })
+
+  // The projection half of the buried-payload bug (t_08995d7c). The renderer
+  // card can only paint a question it can find in the tool part's `args`, so a
+  // pending clarify row must keep them across every path that rebuilds the
+  // transcript — including the one where the parked request is gone.
+  it('keeps a pending clarify row answerable-from-args when no request is parked', () => {
+    mountStream()
+
+    toolStart({
+      args: { questions: [{ choices: ['a', 'b'], question: 'Where should it live?' }] },
+      name: 'clarify',
+      tool_id: 'call-orphan'
+    })
+    clarifyRequest({
+      questions: [{ qid: 'q0', question: 'Where should it live?' }],
+      request_id: 'req-orphan'
+    })
+
+    // A transport drop clears the parked request; the tool itself is still
+    // blocked server-side, so the row must stay pending WITH its args.
+    act(() => clearClarifyRequest('req-orphan', SID))
+
+    const parts = clarifyParts()
+    expect(parts).toHaveLength(1)
+    expect(parts[0]).not.toHaveProperty('result')
+    expect(parts[0].type === 'tool-call' && parts[0].args).toMatchObject({
+      questions: [{ choices: ['a', 'b'], question: 'Where should it live?' }]
+    })
+  })
+
+  it('re-arms that same orphaned row on replay instead of appending a second one', () => {
+    mountStream()
+
+    toolStart({
+      args: { questions: [{ choices: ['a', 'b'], question: 'Where should it live?' }] },
+      name: 'clarify',
+      tool_id: 'call-replay'
+    })
+    clarifyRequest({
+      questions: [{ qid: 'q0', question: 'Where should it live?' }],
+      request_id: 'req-replay'
+    })
+    act(() => clearClarifyRequest('req-replay', SID))
+
+    // `session.resume` replays the still-pending request after reconnect.
+    clarifyRequest({
+      questions: [{ qid: 'q0', question: 'Where should it live?' }],
+      request_id: 'req-replay'
+    })
+
+    expect(clarifyParts()).toHaveLength(1)
+    expect(clarifyParts()[0]).not.toHaveProperty('result')
+    expect($clarifyRequests.get()[SID]?.requestId).toBe('req-replay')
+    expect(stream.state().needsInput).toBe(true)
   })
 })

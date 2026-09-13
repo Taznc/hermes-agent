@@ -24,7 +24,7 @@ import { handoffOriginSource, sessionSourceLabel } from '@/lib/session-source'
 import { coarseElapsed } from '@/lib/time'
 import { useStoreSelector } from '@/lib/use-session-slice'
 import { cn } from '@/lib/utils'
-import { $sidebarRowMeta } from '@/store/layout'
+import { $sidebarRowMeta, $sidebarWidth, SIDEBAR_DEFAULT_WIDTH, SIDEBAR_MAX_WIDTH } from '@/store/layout'
 import { normalizeProfileKey } from '@/store/profile'
 import { $projects } from '@/store/projects'
 import { $pullRequestsByBranch, sessionPrKey } from '@/store/pull-requests'
@@ -47,7 +47,7 @@ import {
   SidebarRowShell
 } from './chrome'
 import { SessionActionsMenu, SessionContextMenu } from './session-actions-menu'
-import { sessionRowDetails } from './session-row-details'
+import { sessionRowDetails, type SessionRowIdentity, sessionRowIdentity } from './session-row-details'
 import { resolveSessionRowClick } from './session-row-gesture'
 import { useProfilePrewarm } from './use-profile-prewarm'
 
@@ -120,6 +120,55 @@ function formatAge(seconds: number, r: Translations['sidebar']['row']): string {
   return unit === 'second' ? r.ageNow : `${value}${r[AGE_KEY[unit]]}`
 }
 
+/** Configured-model family text, plus a secondary "via <provider>" note ONLY
+ *  on a mismatch with the session's latest-served turn (Phase 2.13). Never
+ *  color-only: the "via" note is always real text (or, below `narrow`, a
+ *  glyph that still carries the same text as its tooltip and the wrapper's
+ *  accessible name) — color is not the identity signal here at all, just the
+ *  quaternary muting every other secondary row label already uses. */
+function ProviderIdentityBadge({
+  className,
+  identity,
+  narrow,
+  r
+}: {
+  className?: string
+  identity: SessionRowIdentity
+  narrow: boolean
+  r: Translations['sidebar']['row']
+}) {
+  if (!identity.configured) {return null}
+
+  if (!identity.served) {
+    return (
+      <span aria-label={r.providerConfigured(identity.configured)} className={className}>
+        {identity.configured}
+      </span>
+    )
+  }
+
+  const viaText = r.providerVia(identity.served)
+
+  return (
+    <span
+      aria-label={r.providerConfiguredVia(identity.configured, identity.served)}
+      className={cn('inline-flex min-w-0 items-center gap-1', className)}
+    >
+      <span aria-hidden="true" className="truncate">
+        {identity.configured}
+      </span>
+      <Tip label={viaText}>
+        {/* Below `narrow` the note collapses to this dot — still tooltipped,
+            never vanishing outright, so the mismatch stays discoverable at
+            any sidebar width. */}
+        <span aria-hidden="true" className="shrink-0 truncate text-(--ui-text-quaternary)">
+          {narrow ? '•' : viaText}
+        </span>
+      </Tip>
+    </span>
+  )
+}
+
 function SidebarSessionRowImpl({
   session,
   branchStem,
@@ -153,6 +202,25 @@ function SidebarSessionRowImpl({
     messageCount: fmt.messageCount,
     toolCallCount: fmt.toolCallCount
   })
+
+  // Configured-vs-served provider identity (Phase 2.13): `configured` is the
+  // primary family label (Claude/Codex/etc, or a title-cased fallback for an
+  // unrecognized provider — never guessed for a legacy session with no
+  // resolvable provider). `served` is populated ONLY on a mismatch with the
+  // session's latest completed turn (e.g. a rate-limit fallback), so the
+  // common case where they agree renders nothing extra.
+  const identity = sessionRowIdentity(session)
+  // Below this width the secondary "via <provider>" note collapses to
+  // tooltip-only — same responsive intent as the row's other truncation
+  // rules, just gated on the sidebar's own resizable width rather than a CSS
+  // container query (the note's text needs to vanish, not just visually
+  // clip, so the accessible name can still carry it as a tooltip). The
+  // threshold sits at the midpoint of the sidebar's own resize range
+  // (SIDEBAR_DEFAULT_WIDTH..SIDEBAR_MAX_WIDTH) — the default width is
+  // "narrow" by this measure, and widening the rail past the midpoint earns
+  // back the full "via <provider>" text.
+  const sidebarWidth = useStore($sidebarWidth)
+  const narrowSidebar = sidebarWidth < (SIDEBAR_DEFAULT_WIDTH + SIDEBAR_MAX_WIDTH) / 2
 
   const timestamp = session.last_active || session.started_at
   const age = formatAge(timestamp, r)
@@ -296,47 +364,82 @@ function SidebarSessionRowImpl({
   // shell column would span the card's full height and shave every line,
   // when only the header shares its line with the age and kebab.
   const actionsNode = (
-    <div className="relative z-2 flex shrink-0 items-center justify-end gap-1" data-row-actions>
-      {trailing.map(({ key, node }, index) => (
-        <span
-          className={
-            chipEndsSlot && index === trailing.length - 1 ? cn('inline-flex justify-end', TAIL_HIDES) : undefined
-          }
-          key={key}
+    <div className="flex shrink-0 items-center justify-end gap-1" data-row-actions>
+      {/* Trailing chips + kebab keep their OWN positioning context (unchanged
+          from before the archive button existed): the kebab overlays the
+          last trailing chip via `absolute right-0` relative to THIS wrapper,
+          not the outer actions cluster, so adding a sibling control below
+          cannot shift what the kebab overlays or where it lands. */}
+      <div className="relative z-2 flex items-center gap-1">
+        {trailing.map(({ key, node }, index) => (
+          <span
+            className={
+              chipEndsSlot && index === trailing.length - 1 ? cn('inline-flex justify-end', TAIL_HIDES) : undefined
+            }
+            key={key}
+          >
+            {node}
+          </span>
+        ))}
+        <SessionActionsMenu
+          archived={session.archived === true}
+          onArchive={onArchive}
+          onBranch={onBranch}
+          onDelete={onDelete}
+          onPin={onPin}
+          onToggleUnread={onToggleUnread}
+          pinned={isPinned}
+          profile={session.profile}
+          sessionId={session.id}
+          title={title}
+          unread={unread}
         >
-          {node}
-        </span>
-      ))}
-      <SessionActionsMenu
-        onArchive={onArchive}
-        onBranch={onBranch}
-        onDelete={onDelete}
-        onPin={onPin}
-        onToggleUnread={onToggleUnread}
-        pinned={isPinned}
-        profile={session.profile}
-        sessionId={session.id}
-        title={title}
-        unread={unread}
-      >
+          <Button
+            aria-label={r.sessionActions}
+            className={cn(
+              'size-5 rounded-[4px] bg-transparent text-transparent transition-colors duration-100 hover:bg-(--ui-control-active-background) hover:text-foreground focus-visible:bg-(--ui-control-active-background) focus-visible:text-foreground focus-visible:ring-0 data-[state=open]:bg-(--ui-control-active-background) data-[state=open]:text-foreground group-hover:text-(--ui-text-tertiary) [&_svg]:size-3.5!',
+              trailing.length > 0 && 'absolute right-0',
+              pr && KEBAB_YIELDS
+            )}
+            size="icon"
+            variant="ghost"
+          >
+            <Codicon name="kebab-vertical" size="0.875rem" />
+          </Button>
+        </SessionActionsMenu>
+      </div>
+      {/* Row-level one-click archive/unarchive (#7b52ebc2): a real,
+          always-in-flow sibling past the kebab cluster so the action never
+          needs a menu. Unlike the kebab it never overlaps anything — it
+          always reserves its own width in the actions column, so neither it
+          nor the title's truncation point ever shifts as trailing chips or
+          the kebab fade in and out on hover. Same transparent-until-hover/
+          focus treatment as the kebab so the pair reads as one cluster. */}
+      <Tip label={session.archived ? r.unarchiveSession : r.archiveSession}>
         <Button
-          aria-label={r.sessionActions}
-          className={cn(
-            'size-5 rounded-[4px] bg-transparent text-transparent transition-colors duration-100 hover:bg-(--ui-control-active-background) hover:text-foreground focus-visible:bg-(--ui-control-active-background) focus-visible:text-foreground focus-visible:ring-0 data-[state=open]:bg-(--ui-control-active-background) data-[state=open]:text-foreground group-hover:text-(--ui-text-tertiary) [&_svg]:size-3.5!',
-            trailing.length > 0 && 'absolute right-0',
-            pr && KEBAB_YIELDS
-          )}
+          aria-label={session.archived ? r.unarchiveSession : r.archiveSession}
+          className="size-5 shrink-0 rounded-[4px] bg-transparent text-transparent transition-colors duration-100 hover:bg-(--ui-control-active-background) hover:text-foreground focus-visible:bg-(--ui-control-active-background) focus-visible:text-foreground focus-visible:ring-0 group-hover:text-(--ui-text-tertiary) [&_svg]:size-3.5!"
+          onClick={event => {
+            // The action button is not a descendant of the row's own click
+            // target (SidebarRowBody), but stop propagation anyway so archive
+            // OR unarchive can never also select/resume the row if the DOM
+            // nesting changes later.
+            event.stopPropagation()
+            triggerHaptic('selection')
+            onArchive()
+          }}
           size="icon"
           variant="ghost"
         >
-          <Codicon name="kebab-vertical" size="0.875rem" />
+          <Codicon name={session.archived ? 'history' : 'archive'} size="0.875rem" />
         </Button>
-      </SessionActionsMenu>
+      </Tip>
     </div>
   )
 
   return (
     <SessionContextMenu
+      archived={session.archived === true}
       onArchive={onArchive}
       onBranch={onBranch}
       onDelete={onDelete}
@@ -357,12 +460,17 @@ function SidebarSessionRowImpl({
           // metadata / preview lines below need the extra rows (#68119).
           !card && density !== 'compact' && 'min-h-[2.75rem]',
           !card && density === 'detailed' && 'min-h-[3.875rem]',
-          isSelected && 'bg-(--ui-row-active-background)',
+          isSelected &&
+            'bg-(--ui-row-selected-background) shadow-[inset_0_0_0_1px_var(--ui-row-selected-ring)]',
           // Open in another pane: the SAME band, just weaker. Its own mixed
           // token rather than row opacity — dimming the whole row would take
           // the title and the status dot down with it.
           openUnfocused && 'bg-(--ui-row-open-background)',
           liveTurn && 'text-foreground',
+          // Working (R3): a faint steady accent wash under the charging bar,
+          // so a lit row reads as lit even with animations paused. The
+          // selected wash above is stronger and wins when both apply.
+          !isSelected && showsRunningArc(dotState) && 'bg-(--ui-row-working-background)',
           // Opaque surface while lifted so the dragged row erases what's under
           // it (translucency let the rows below bleed through). data-glass-opaque
           // keeps that true when window glass thins the field.
@@ -402,7 +510,25 @@ function SidebarSessionRowImpl({
         style={style}
         {...rest}
       >
-        {showsRunningArc(dotState) && <span aria-hidden="true" className="arc-border arc-row" />}
+        {showsRunningArc(dotState) && (
+          <span
+            aria-hidden="true"
+            className="working-bar"
+            data-stalled={dotState === 'stalled' ? '' : undefined}
+          />
+        )}
+        {/* Attention ring (A3): the loudest sidebar treatment, reserved for
+            the states that wait on the user. Breathing amber for a blocking
+            clarify/approval; steady orange for rate-limited (a wait, not a
+            question). Renders over the selection wash — a selected waiting
+            row still breathes. */}
+        {(dotState === 'needs-input' || dotState === 'rate-limited') && (
+          <span
+            aria-hidden="true"
+            className="attention-ring"
+            data-rate-limited={dotState === 'rate-limited' ? '' : undefined}
+          />
+        )}
         <SidebarRowBody
           // Every trailing figure lives in the actions slot, which the row
           // measures — so the title needs a gap from it and nothing else. Hover
@@ -505,14 +631,26 @@ function SidebarSessionRowImpl({
                     {/* Session-list density (#68119): comfortable adds one
                         deterministic metadata line; detailed adds the initial
                         request preview. Compact keeps today's one-line row. */}
-                    {density !== 'compact' && details.metadata && (
+                    {density !== 'compact' && (details.metadata || identity.configured) && (
                       <span
                         className={cn(
-                          'mt-0.5 block truncate text-[0.625rem] text-(--ui-text-tertiary)',
+                          'mt-0.5 flex min-w-0 items-baseline gap-1 text-[0.625rem] text-(--ui-text-tertiary)',
                           SIDEBAR_TRUNCATED_LEADING
                         )}
                       >
-                        {details.metadata}
+                        {identity.configured && (
+                          <ProviderIdentityBadge
+                            className="shrink-0"
+                            identity={identity}
+                            narrow={narrowSidebar}
+                            r={r}
+                          />
+                        )}
+                        {details.metadata && (
+                          <span className={cn('min-w-0 truncate', SIDEBAR_TRUNCATED_LEADING)}>
+                            {identity.configured ? ` · ${details.metadata}` : details.metadata}
+                          </span>
+                        )}
                       </span>
                     )}
                     {density === 'detailed' && details.preview && (
@@ -576,13 +714,21 @@ function SidebarSessionRowImpl({
                     </span>
                   ) : null}
                 </div>
-                {model || size || todoProgress ? (
+                {model || size || todoProgress || identity.configured ? (
                   <span
                     className={cn(
                       'flex min-w-0 items-baseline gap-2 text-[0.625rem] text-(--ui-text-tertiary)',
                       SIDEBAR_TRUNCATED_LEADING
                     )}
                   >
+                    {identity.configured ? (
+                      <ProviderIdentityBadge
+                        className="min-w-0 shrink-0"
+                        identity={identity}
+                        narrow={narrowSidebar}
+                        r={r}
+                      />
+                    ) : null}
                     {model ? <span className="min-w-0 truncate">{model}</span> : null}
                     {size ? <span className="shrink-0 tabular-nums">{size}</span> : null}
                     {todoProgress ? (

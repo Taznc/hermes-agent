@@ -1,10 +1,12 @@
 /**
  * Install desktop themes from external sources.
  *
- * The heavy lifting (network + .vsix unzip) lives in the Electron main process
- * (`electron/vscode-marketplace.ts`), reached via `window.hermesDesktop.themes`.
- * Main hands back the raw theme JSON; we parse + convert + persist here so the
- * conversion stays in one unit-testable place.
+ * The heavy lifting (network + .vsix unzip) happens behind
+ * `window.hermesDesktop.themes`: the Electron main process
+ * (`electron/vscode-marketplace.ts`) in the desktop app, and the browser-native
+ * equivalent (`web-bridge-shim.ts` + `lib/vsix-archive.ts`) on the web-served
+ * build. Either way the bridge hands back the raw theme JSON; we parse +
+ * convert + persist here so the conversion stays in one unit-testable place.
  */
 
 import type { DesktopMarketplaceThemeResult } from '@/global'

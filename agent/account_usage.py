@@ -30,6 +30,24 @@ class AccountUsageWindow:
     used_percent: Optional[float] = None
     reset_at: Optional[datetime] = None
     detail: Optional[str] = None
+    # >>> FORK ANCHOR: usage-window-metadata <<< (fields consumed by hermes_fork.account_limits)
+    severity: Optional[str] = None
+    is_active: Optional[bool] = None
+    scope: Optional[str] = None
+    limit_window_seconds: Optional[int] = None
+    limit_reached: Optional[bool] = None
+
+
+@dataclass(frozen=True)
+class AccountUsageBalance:
+    """A sanitized provider balance suitable for UI rendering. Provider responses can carry account
+    identifiers beside balance fields; this model intentionally has no identifier-bearing fields."""
+
+    label: str
+    used: Optional[float] = None
+    limit: Optional[float] = None
+    remaining: Optional[float] = None
+    currency: Optional[str] = None
 
 
 @dataclass(frozen=True)
@@ -41,11 +59,15 @@ class AccountUsageSnapshot:
     plan: Optional[str] = None
     windows: tuple[AccountUsageWindow, ...] = ()
     details: tuple[str, ...] = ()
+    # >>> FORK ANCHOR: usage-snapshot-metadata <<< (fields consumed by hermes_fork.account_limits)
+    balances: tuple[AccountUsageBalance, ...] = ()
+    allowed: Optional[bool] = None
+    limit_reached: Optional[bool] = None
     unavailable_reason: Optional[str] = None
 
     @property
     def available(self) -> bool:
-        return bool(self.windows or self.details) and not self.unavailable_reason
+        return bool(self.windows or self.details or self.balances) and not self.unavailable_reason
 
 
 def _snapshot(provider: str, source: str, windows: list, details: list, **kw: Any) -> AccountUsageSnapshot:
@@ -318,14 +340,17 @@ def _resolve_codex_usage_credentials(
             # Pool-only creds carry no singleton account_id; header is optional.
             logger.debug("codex ▸ /usage account_id read failed (best-effort)", exc_info=True)
         return creds["api_key"], str(creds.get("base_url", "") or "").strip(), account_id
-    except AuthError:
+    except AuthError as exc:
         logger.debug("codex ▸ /usage runtime resolver returned no creds; trying pool", exc_info=True)
+        resolver_error = exc
     # Tier 3: pool credentials have no account_id concept → header omitted.
     from agent.credential_pool import load_pool
     entry = load_pool("openai-codex").select()
-    if entry is None:
-        raise RuntimeError("No available openai-codex credential in credential pool")
-    return entry.runtime_api_key, str(entry.runtime_base_url or base_url or "").strip(), None
+    if entry is not None:
+        return entry.runtime_api_key, str(entry.runtime_base_url or base_url or "").strip(), None
+    # >>> FORK ANCHOR: codex-usage-quota-rescue <<<
+    from hermes_fork.account_limits.codex_rescue import rescue_codex_usage_credentials
+    return rescue_codex_usage_credentials(resolver_error, base_url)
 
 
 def _codex_banked_resets(payload: dict) -> int:
@@ -371,18 +396,9 @@ def _fetch_codex_account_usage(
 ) -> Optional[AccountUsageSnapshot]:
     token, resolved_base_url, account_id = _resolve_codex_usage_credentials(base_url, api_key)
     payload = _get_json(_codex_backend_urls(resolved_base_url)[0], _codex_headers(token, account_id), timeout=15.0)
-    windows = _usage_windows(payload.get("rate_limit") or {}, (("primary_window", "Session"), ("secondary_window", "Weekly")),
-                             "used_percent", "reset_at")
-    details: list[str] = []
-    count = _codex_banked_resets(payload)
-    if count > 0:
-        details.append(f"You have {count} reset{_plural(count)} banked - use /usage reset to activate")
-    credits, balance = payload.get("credits") or {}, (payload.get("credits") or {}).get("balance")
-    if credits.get("has_credits") and _is_num(balance):
-        details.append(f"Credits balance: ${float(balance):.2f}")
-    elif credits.get("has_credits") and credits.get("unlimited"):
-        details.append("Credits balance: unlimited")
-    return _snapshot("openai-codex", "usage_api", windows, details, plan=_title_case_slug(payload.get("plan_type")))
+    # >>> FORK ANCHOR: codex-usage-mapping <<<
+    from hermes_fork.account_limits.providers import codex_usage_snapshot
+    return codex_usage_snapshot(payload)
 
 
 @dataclass(frozen=True)
@@ -508,16 +524,9 @@ def _fetch_anthropic_account_usage(
     headers = {"Authorization": f"Bearer {token}", "Accept": "application/json", "Content-Type": "application/json",
                "anthropic-beta": "oauth-2025-04-20", "User-Agent": "claude-code/2.1.0"}
     payload = _get_json("https://api.anthropic.com/api/oauth/usage", headers, timeout=15.0)
-    windows = _usage_windows(
-        payload, (("five_hour", "Current session"), ("seven_day", "Current week"), ("seven_day_opus", "Opus week"),
-                  ("seven_day_sonnet", "Sonnet week")), "utilization", "resets_at", fraction=True,
-    )
-    details: list[str] = []
-    extra = payload.get("extra_usage") or {}
-    used_credits, monthly_limit = extra.get("used_credits"), extra.get("monthly_limit")
-    if extra.get("is_enabled") and _is_num(used_credits) and _is_num(monthly_limit):
-        details.append(f"Extra usage: {used_credits:.2f} / {monthly_limit:.2f} {extra.get('currency') or 'USD'}")
-    return _snapshot("anthropic", "oauth_usage_api", windows, details)
+    # >>> FORK ANCHOR: anthropic-usage-mapping <<<
+    from hermes_fork.account_limits.providers import anthropic_usage_snapshot
+    return anthropic_usage_snapshot(payload)
 
 
 def _fetch_openrouter_account_usage(base_url: Optional[str], api_key: Optional[str]) -> Optional[AccountUsageSnapshot]:
@@ -571,3 +580,15 @@ def fetch_account_usage(
         return fetcher(base_url, api_key) if fetcher else None
     except Exception:
         return None
+
+
+# >>> FORK ANCHOR: account-limits-service <<< (fork surfaces import these from here so the
+# public import path predates the extraction; implementation lives in hermes_fork)
+def fetch_account_limits(providers: Optional[tuple[str, ...]] = None) -> tuple[AccountUsageSnapshot, ...]:
+    from hermes_fork.account_limits.service import fetch_account_limits as _impl
+    return _impl(providers)
+
+
+def serialize_account_usage(snapshot: AccountUsageSnapshot) -> dict[str, Any]:
+    from hermes_fork.account_limits.service import serialize_account_usage as _impl
+    return _impl(snapshot)

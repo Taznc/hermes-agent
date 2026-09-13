@@ -194,6 +194,17 @@ def _sql_session_last_active_by_id(session_id_expr: str) -> str:
         f"(SELECT started_at FROM sessions _act_s WHERE _act_s.id = {session_id_expr})")
 
 
+# >>> FORK ANCHOR: served-route-columns <<< (fork Phase 2.13; bodies in hermes_fork.state_limits)
+def _sql_served_route_column(alias: str, column: str) -> str:
+    from hermes_fork.state_limits import sql_served_route_column
+    return sql_served_route_column(alias, column)
+
+
+def _sql_served_route_columns(alias: str = "s") -> str:
+    from hermes_fork.state_limits import sql_served_route_columns
+    return sql_served_route_columns(alias)
+
+
 SCHEMA_VERSION = 30
 
 # Auto-maintenance VACUUMs only above this freelist fraction; below it a rewrite costs more I/O than it returns.

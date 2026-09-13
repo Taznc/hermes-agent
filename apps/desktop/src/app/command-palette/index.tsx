@@ -60,7 +60,6 @@ import {
 import { getServers } from '@/lib/mcp-servers'
 import { normalize } from '@/lib/text'
 import { cn } from '@/lib/utils'
-import { resolveVersionStatus } from '@/lib/version-status'
 import { $repoWorktrees } from '@/store/coding-status'
 import {
   $commandPaletteOpen,
@@ -73,17 +72,10 @@ import { $bindings, bindingsFor } from '@/store/keybinds'
 import { $dismissedAutoProjectIds, filterVisibleProjects } from '@/store/layout'
 import { openPetGenerate } from '@/store/pet-generate'
 import { openBrowserTab } from '@/store/preview'
+import { $activeGatewayConnection, $activeGatewayProfile, normalizeProfileKey } from '@/store/profile'
 import { $projectTree, goToProject, openFolderAsProject, requestStartWorkSession } from '@/store/projects'
-import { $connection } from '@/store/session'
 import { runGatewayRestart } from '@/store/system-actions'
-import {
-  $backendUpdateApply,
-  $backendUpdateStatus,
-  $desktopVersion,
-  $updateApply,
-  $updateStatus,
-  requestActiveUpdate
-} from '@/store/updates'
+import { performWebReload } from '@/store/web-reload'
 import { canOpenNewWindow, openNewWindow } from '@/store/windows'
 import { luminance } from '@/themes/color'
 import { type ThemeMode, useTheme } from '@/themes/context'
@@ -107,6 +99,8 @@ import { SECTIONS } from '../settings/constants'
 import { type SettingsSearchEntry, settingsSearchTargetQuery } from '../settings/settings-search'
 import { useSettingsSearchCatalog } from '../settings/use-settings-search'
 
+import { switchToAgentRow } from './agent-row-switch'
+import { buildAgentPaletteRows } from './agent-rows'
 import { usePaletteContributions } from './contrib'
 import { HighlightWatcher } from './highlight-watcher'
 import { MarketplaceThemePage } from './marketplace-theme-page'
@@ -557,6 +551,8 @@ function CommandPaletteBody({ onExited }: { onExited: () => void }) {
   const worktrees = useStore($repoWorktrees)
   const projectTree = useStore($projectTree)
   const dismissedAutoProjects = useStore($dismissedAutoProjectIds)
+  const activeGatewayProfile = useStore($activeGatewayProfile)
+  const activeGatewayConnection = useStore($activeGatewayConnection)
   const navigate = useNavigate()
 
   const { availableThemes, clearThemePreview, mode, previewTheme, resolvedMode, setMode, setTheme, themeName } =
@@ -576,34 +572,6 @@ function CommandPaletteBody({ onExited }: { onExited: () => void }) {
   const [page, setPage] = useState<string | null>(null)
   const inputRef = useRef<HTMLInputElement>(null)
 
-  // The Update row names the same install the statusbar names — same target
-  // selection, same resolver. Reduced to the label string: an in-flight apply
-  // rewrites these stores on every progress line, and only a changed string
-  // should rebuild the palette's groups.
-  const connection = useStore($connection)
-  const desktopVersion = useStore($desktopVersion)
-  const clientStatus = useStore($updateStatus)
-  const clientApply = useStore($updateApply)
-  const backendStatus = useStore($backendUpdateStatus)
-  const backendApply = useStore($backendUpdateApply)
-
-  const updateVersionLabel = useMemo(() => {
-    const backend = connection?.mode === 'remote'
-    const apply = backend ? backendApply : clientApply
-    const status = backend ? backendStatus : clientStatus
-
-    return resolveVersionStatus({
-      applying: apply.applying || apply.stage === 'restart',
-      behind: status?.behind ?? 0,
-      copy: t.shell.statusbar,
-      remote: backend,
-      restarting: apply.stage === 'restart',
-      sha: status?.currentSha?.slice(0, 7) ?? null,
-      target: backend ? 'backend' : 'client',
-      updateAvailable: status?.updateAvailable,
-      version: backend ? status?.currentVersion : desktopVersion?.appVersion
-    }).label
-  }, [backendApply, backendStatus, clientApply, clientStatus, connection?.mode, desktopVersion?.appVersion, t])
 
   // cmdk's onSelect doesn't forward the triggering event — keep the last
   // click/keydown modifiers so session rows can honour ⌘-Enter / ⌘-click.
@@ -659,6 +627,24 @@ function CommandPaletteBody({ onExited }: { onExited: () => void }) {
   const archivedQuery = useQuery({
     queryKey: ['command-palette', 'archived'],
     queryFn: () => listAllProfileSessions(200, 0, 'only')
+  })
+
+  // The union agent roster across every registered connection (Settings →
+  // Connections). This is the ONLY built-in surface that lists agents from
+  // other machines: the profile rail renders /api/profiles from whichever
+  // backend is currently active, so a remote source's profiles are invisible
+  // there until you're already on it (#85731).
+  //
+  // Feature-detected: older Desktop builds have no bridge method, and the
+  // handler itself reports unreachable sources per-row rather than failing, so
+  // one dead box can't empty the list. A missing bridge yields no rows and the
+  // group simply doesn't render.
+  const rosterQuery = useQuery({
+    queryKey: ['command-palette', 'agent-roster'],
+    queryFn: async () => (await window.hermesDesktop?.getAgentRoster?.()) ?? null,
+    // The roster fans out REST calls to every registered source; keep reopens
+    // cheap but let an added/removed connection show up without a restart.
+    staleTime: 30_000
   })
 
   // getServers is the shared choke point that also drops malformed (null/
@@ -728,6 +714,45 @@ function CommandPaletteBody({ onExited }: { onExited: () => void }) {
   const [selectTick, setSelectTick] = useState(0)
 
   const contributedItems = usePaletteContributions()
+
+  // Agents on every registered connection → "switch this window onto that
+  // machine". Selecting a row re-homes the app the same way the sidebar gateway
+  // selector and the fleet rail do (sidebar, sessions, cron and new chats all
+  // follow), through selectConnection's two-phase commit — see
+  // agent-row-switch.ts for why that door and not a bare activation.
+  // Row selection/suppression rules live in buildAgentPaletteRows (pure).
+  const agentGroup = useMemo<PaletteGroup[]>(() => {
+    const rows = buildAgentPaletteRows({
+      activeConnectionId: activeGatewayConnection,
+      activeProfile: activeGatewayProfile,
+      localLabel: t.profiles.thisDevice,
+      normalizeProfile: normalizeProfileKey,
+      roster: rosterQuery.data
+    })
+
+    if (rows.length === 0) {
+      return []
+    }
+
+    return [
+      {
+        heading: t.profiles.agentsHeading,
+        items: rows.map(row => ({
+          active: row.isActive,
+          // The label already names the device, so the detail carries STATUS:
+          // why a source has no agents yet, or nothing when it's just a switch.
+          detail: row.needsConnect ? (row.unavailableReason ?? t.profiles.notConnected) : undefined,
+          icon: row.isLocal ? Monitor : Globe,
+          id: `agent-${row.connectionId}-${row.profile}`,
+          keywords: ['agent', 'connection', 'gateway', 'switch', 'remote', row.profile, row.device, row.handle],
+          label: row.needsConnect
+            ? t.profiles.connectToAgent(row.device)
+            : t.profiles.switchToAgent(row.profile, row.device),
+          run: () => switchToAgentRow(row, t.profiles.switchConnectionFailed)
+        }))
+      }
+    ]
+  }, [activeGatewayConnection, activeGatewayProfile, rosterQuery.data, t])
 
   // The active repo's worktrees → "new conversation in <branch>". This is the
   // ⌘K-typed "I want to work on <branch>" reflex: each entry seeds a fresh
@@ -927,20 +952,13 @@ function CommandPaletteBody({ onExited }: { onExited: () => void }) {
             label: cc.restartGateway,
             run: () => void runGatewayRestart()
           },
-          {
-            detail: updateVersionLabel,
-            icon: Download,
-            id: 'cc-update-hermes',
-            keywords: ['update', 'upgrade', 'hermes', 'version', 'system', 'restart'],
-            label: cc.updateHermes,
-            run: () => requestActiveUpdate()
-          },
+
           {
             icon: RefreshCw,
             id: 'cc-reload-window',
             keywords: ['reload', 'window', 'refresh', 'restart', 'ui', 'stuck'],
             label: cc.reloadWindow,
-            run: () => window.location.reload()
+            run: () => performWebReload()
           },
           {
             action: 'view.showBrowser',
@@ -1020,7 +1038,7 @@ function CommandPaletteBody({ onExited }: { onExited: () => void }) {
     selectTick,
     settingsSectionLabel,
     t,
-    updateVersionLabel
+
   ])
 
   // The long, granular lists (settings fields, API keys, MCP servers, archived
@@ -1260,13 +1278,14 @@ function CommandPaletteBody({ onExited }: { onExited: () => void }) {
     themeName
   ])
 
-  // Branch rows rank below BOTH the fixed groups and the typed-only lists: they
-  // scale with whatever worktrees happen to exist, so on a tie they're the least
-  // likely thing meant. Everything above is either always-present chrome or a
-  // list the search itself asked for.
+  // Agent rows sit between the fixed groups and the branch list: they're a
+  // deliberate "which machine am I on" switch (more intentional than a
+  // worktree), but still rank below always-present chrome and the lists search
+  // asked for. Branch rows stay last: they scale with whatever worktrees happen
+  // to exist, so on a tie they're the least likely thing meant.
   const groups = useMemo(
-    () => [...baseGroups, ...searchGroups, ...branchGroup],
-    [baseGroups, branchGroup, searchGroups]
+    () => [...baseGroups, ...searchGroups, ...agentGroup, ...branchGroup],
+    [agentGroup, baseGroups, branchGroup, searchGroups]
   )
 
   // Settings-scoped page (⌘K on the Settings overlay, or its search pill):

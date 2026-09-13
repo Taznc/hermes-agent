@@ -3,6 +3,7 @@ import type { ReactNode } from 'react'
 import { useEffect } from 'react'
 import { useNavigate } from 'react-router'
 
+import { pickRevealLabel } from '@/app/right-sidebar/file-actions'
 import { terminalMenuHandleFor } from '@/app/right-sidebar/terminal/terminal-context-menu'
 import { toggleTargetZoneTabStrip } from '@/components/pane-shell/tree/store'
 import { Codicon } from '@/components/ui/codicon'
@@ -17,14 +18,18 @@ import {
   DropdownMenuTrigger
 } from '@/components/ui/dropdown-menu'
 import { type Translations, useI18n } from '@/i18n'
+import { canUseNativeFileActions } from '@/lib/desktop-fs'
 import { hostPathLabel, hudForcesNativeLinks, normalizeExternalUrl, openExternalLink } from '@/lib/external-link'
 import { formatCombo } from '@/lib/keybinds/combo'
-import { isRemoteGateway } from '@/lib/media'
+import { normalizeOrLocalPreviewTarget, resolveChatLinkPath } from '@/lib/local-preview'
+import { isFileMediaPath, isRemoteGateway } from '@/lib/media'
 import { reachablePreviewUrl } from '@/lib/preview-reach'
 import { openCommandPalette } from '@/store/command-palette'
+import { copyFilePath, revealFile } from '@/store/file-actions'
+import { notifyError } from '@/store/notifications'
 import { openPreview } from '@/store/preview'
+import { getKnownHomeDir } from '@/store/session'
 import { toggleStatusbarVisible } from '@/store/statusbar-prefs'
-import { requestActiveUpdate } from '@/store/updates'
 import { canOpenNewWindow, openNewWindow } from '@/store/windows'
 
 import { navigateToWorkspacePage, NEW_CHAT_ROUTE, SETTINGS_ROUTE } from '../routes'
@@ -37,7 +42,7 @@ import {
   openDomContextMenu,
   openTerminalContextMenu
 } from './store'
-import { isWebUrl, resolveDomTarget } from './target'
+import { isWebUrl, nativeContextMenuHandled, resolveDomTarget } from './target'
 
 /** Marks a surface that owns PLAIN right-clicks itself (the user-message
  *  reaction bubble). Owned targets inside it — links, images, editables,
@@ -136,6 +141,11 @@ function domSections(open: Extract<OpenContextMenu, { kind: 'dom' }>, t: Transla
   const sections: ReactNode[][] = []
   const linkUrl = target.linkUrl ? normalizeExternalUrl(target.linkUrl) : ''
   const linkIsWeb = isWebUrl(linkUrl)
+  // A bare path made clickable in chat (`InlinePathLink`) carries the raw
+  // path as its href. It is a file on the AGENT's machine, so the verbs are
+  // file verbs — preview, default app, reveal, copy path — not browser ones.
+  const linkIsFile = Boolean(linkUrl) && !linkIsWeb && isFileMediaPath(linkUrl)
+  const localFs = canUseNativeFileActions()
   const imageIsWeb = isWebUrl(target.imageUrl)
   const openInApp = !hudForcesNativeLinks()
   const showResolvedCopy = linkIsWeb && isRemoteGateway() && isLoopbackUrl(linkUrl)
@@ -192,7 +202,48 @@ function domSections(open: Extract<OpenContextMenu, { kind: 'dom' }>, t: Transla
     withEditableFocus(() => void window.hermesDesktop?.contextMenuSpellcheck?.(action))
   }
 
-  if (linkUrl) {
+  if (linkIsFile) {
+    const { path: filePath, url: fileUrl } = resolveChatLinkPath(linkUrl, getKnownHomeDir())
+
+    const openInPreview = async () => {
+      try {
+        const preview = await normalizeOrLocalPreviewTarget(linkUrl)
+
+        if (!preview) {
+          throw new Error(`Could not open preview target: ${linkUrl}`)
+        }
+
+        openPreview(preview, 'explicit-link')
+      } catch (error) {
+        notifyError(error, t.preview.unavailable)
+      }
+    }
+
+    sections.push(
+      [
+        openInApp ? (
+          <Item icon="open-preview" key="file-open-preview" label={copy.file.openPreview} onSelect={() => void openInPreview()} />
+        ) : null,
+        localFs ? (
+          <Item
+            icon="link-external"
+            key="file-open-default"
+            label={copy.file.openDefaultApp}
+            onSelect={() => openExternalLink(fileUrl)}
+          />
+        ) : null,
+        localFs ? (
+          <Item
+            icon="folder-opened"
+            key="file-reveal"
+            label={pickRevealLabel(t.fileMenu.revealFinder, t.fileMenu.revealExplorer, t.fileMenu.revealFileManager)}
+            onSelect={() => void revealFile(filePath)}
+          />
+        ) : null,
+        <Item icon="copy" key="file-copy-path" label={t.fileMenu.copyPath} onSelect={() => void copyFilePath(filePath)} />
+      ].filter(Boolean)
+    )
+  } else if (linkUrl) {
     sections.push(
       [
         linkIsWeb && openInApp ? (
@@ -359,15 +410,30 @@ function domSections(open: Extract<OpenContextMenu, { kind: 'dom' }>, t: Transla
         shortcut={EDIT_SHORTCUTS.selectAll}
       />
     ])
-  } else if (target.selectionText) {
-    sections.push([
-      <Item
-        icon="copy"
-        key="selection-copy"
-        label={t.common.copy}
-        onSelect={() => void writeClipboardText(target.selectionText)}
-      />
-    ])
+  } else if (target.selectionText || target.messageText) {
+    // Selection first (what you highlighted is what you meant), then the whole
+    // message as the no-selection fallback — right-click a reply, Copy message,
+    // done, without dragging across a long answer.
+    sections.push(
+      [
+        target.selectionText ? (
+          <Item
+            icon="copy"
+            key="selection-copy"
+            label={t.common.copy}
+            onSelect={() => void writeClipboardText(target.selectionText)}
+          />
+        ) : null,
+        target.messageText ? (
+          <Item
+            icon="copy"
+            key="message-copy"
+            label={t.assistant.thread.copyMessage}
+            onSelect={() => void writeClipboardText(target.messageText)}
+          />
+        ) : null
+      ].filter(Boolean)
+    )
   }
 
   return sections
@@ -588,14 +654,6 @@ function shellSections({ navigate, t }: ShellVerbs): ReactNode[][] {
         label={t.commandCenter.settings}
         onSelect={() => navigateToWorkspacePage(navigate, SETTINGS_ROUTE)}
       />
-    ],
-    [
-      <Item
-        icon="cloud-download"
-        key="shell-update"
-        label={t.commandCenter.updateHermes}
-        onSelect={requestActiveUpdate}
-      />
     ]
   ]
 }
@@ -618,10 +676,14 @@ export function AppContextMenu() {
   const open = useStore($contextMenu)
 
   useEffect(() => {
-    // stopPropagation beats other renderer handlers; preventDefault is never
-    // called because Chromium emits the main-process context-menu event (the
-    // spellcheck + image-coordinate source) only for unprevented gestures —
-    // and with no Menu.popup anywhere, "default" means no menu at all.
+    // stopPropagation beats other renderer handlers in every shell.
+    // preventDefault is conditional on nativeContextMenuHandled(): in
+    // Electron, "default" is a main-process context-menu event this app
+    // handles without popping a native menu (see target.ts for the sentinel
+    // and why), so skipping preventDefault there costs nothing and keeps
+    // that forward alive. In a plain browser there is no main process —
+    // "default" IS Chromium's own context menu, so it must be prevented or
+    // it paints on top of this one.
     const onContextMenu = (event: MouseEvent) => {
       const element = event.target instanceof Element ? event.target : null
 
@@ -640,12 +702,22 @@ export function AppContextMenu() {
 
       if (terminal) {
         event.stopPropagation()
+
+        if (!nativeContextMenuHandled()) {
+          event.preventDefault()
+        }
+
         openTerminalContextMenu(event.clientX, event.clientY, terminal)
 
         return
       }
 
       const target = resolveDomTarget(element)
+      // Message text alone is deliberately NOT "owned": the user bubble's
+      // reaction picker claims bare right-clicks via the skip attr, and only a
+      // link/image/editable/selection outranks it. An assistant message is in
+      // no skip region, so it falls through and gets the DOM menu (which now
+      // carries Copy message) without this check.
       const owned = Boolean(target.linkUrl || target.onImage || target.editable || target.selectionText)
 
       // The reaction bubble owns bare right-clicks; a link inside it still
@@ -655,6 +727,11 @@ export function AppContextMenu() {
       }
 
       event.stopPropagation()
+
+      if (!nativeContextMenuHandled()) {
+        event.preventDefault()
+      }
+
       openDomContextMenu(event.clientX, event.clientY, target)
     }
 

@@ -14,11 +14,13 @@ const ensureGatewayForProfile = vi.fn(async (_profile: string) => undefined)
 const ensureGatewayForAgent = vi.fn(async (_connectionId: null | string, _profile: string) => true)
 const openGatewayForProfile = vi.fn(async (_profile: string) => undefined)
 const activeGatewayConnectionId = vi.fn<() => null | string>(() => null)
+const activeGateway = vi.fn<() => unknown>(() => null)
 const $gateway = atom<unknown>({ id: 'live-socket' })
 const resetStarmapGraph = vi.fn()
 
 vi.mock('@/store/gateway', () => ({
   $gateway,
+  activeGateway,
   activeGatewayConnectionId,
   ensureGatewayForAgent,
   ensureGatewayForProfile,

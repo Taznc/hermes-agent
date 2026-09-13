@@ -174,6 +174,14 @@ describe('connecting overlay vs recovery surface', () => {
     // Transport blips no longer set boot.error (toast + background retry).
     // Confirmed OAuth reauth still does — and that recovery surface must win
     // over any residual connecting state so Sign-in / Gateway settings stay reachable.
+    // Electron always exposes getConnectionConfig (only the browser web-spike
+    // shim omits it), which is what gates the Gateway settings button.
+    const originalDesktop = window.hermesDesktop
+    Object.defineProperty(window, 'hermesDesktop', {
+      configurable: true,
+      value: { getRecentLogs: async () => ({ lines: [] }), getConnectionConfig: async () => null }
+    })
+
     setGatewayState('error')
     $desktopBoot.set({
       ...$desktopBoot.get(),
@@ -182,18 +190,22 @@ describe('connecting overlay vs recovery surface', () => {
       visible: true
     })
 
-    await act(async () => {
-      render(
-        <>
-          <GatewayConnectingOverlay />
-          <BootFailureOverlay />
-        </>
-      )
-    })
+    try {
+      await act(async () => {
+        render(
+          <>
+            <GatewayConnectingOverlay />
+            <BootFailureOverlay />
+          </>
+        )
+      })
 
-    // Escape hatch is reachable; the connecting overlay bows out.
-    expect(isRecoveryShown()).toBe(true)
-    expect(screen.getByRole('button', { name: /gateway settings/i })).toBeTruthy()
-    expect(isConnectingShown()).toBe(false)
+      // Escape hatch is reachable; the connecting overlay bows out.
+      expect(isRecoveryShown()).toBe(true)
+      expect(screen.getByRole('button', { name: /gateway settings/i })).toBeTruthy()
+      expect(isConnectingShown()).toBe(false)
+    } finally {
+      Object.defineProperty(window, 'hermesDesktop', { configurable: true, value: originalDesktop })
+    }
   })
 })

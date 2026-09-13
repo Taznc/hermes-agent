@@ -5,11 +5,30 @@ import { useViewedInterval } from '@/hooks/use-viewed-interval'
 // Module-level registry so timers survive component unmount/remount (e.g.
 // when a tool row scrolls out and back). Keyed by caller-supplied timerKey;
 // anonymous timers (no key) start fresh each mount.
+//
+// Every distinct timerKey ever seen stayed in these maps forever: a
+// long-lived session accumulates one entry per tool call / reasoning block
+// ever rendered, with nothing ever removing an old one. Size-capped LRU
+// (delete-then-set on touch, evict oldest-first on overflow — same recency
+// trick as markdown-blocks.ts's exactCache) bounds it without changing
+// behavior for the common case of a session with far fewer than the cap.
+const TIMER_REGISTRY_MAX = 5000
 const startedAtByKey = new Map<string, number>()
 
 // Durations of things that have already finished, kept beside the origins that
 // measured them. See `useMeasuredDuration`.
 const durationByKey = new Map<string, number>()
+
+function touchLru<V>(map: Map<string, V>, key: string, value: V): void {
+  map.delete(key)
+  map.set(key, value)
+
+  if (map.size > TIMER_REGISTRY_MAX) {
+    const oldestKey = map.keys().next().value as string
+
+    map.delete(oldestKey)
+  }
+}
 
 function startedAt(key?: string): number {
   if (!key) {
@@ -19,11 +38,16 @@ function startedAt(key?: string): number {
   const existing = startedAtByKey.get(key)
 
   if (existing !== undefined) {
+    // Read-touch: refresh recency so a long-lived tool row's timer key isn't
+    // the "oldest" entry evicted out from under it just because it started
+    // long ago and other keys have been created since.
+    touchLru(startedAtByKey, key, existing)
+
     return existing
   }
 
   const now = Date.now()
-  startedAtByKey.set(key, now)
+  touchLru(startedAtByKey, key, now)
 
   return now
 }
@@ -101,7 +125,7 @@ export function useMeasuredDuration(active: boolean, timerKey: string): null | n
       const finalElapsed = Math.max(elapsed, Math.floor((Date.now() - startedAt(timerKey)) / 1000))
 
       setWatching(false)
-      durationByKey.set(timerKey, finalElapsed)
+      touchLru(durationByKey, timerKey, finalElapsed)
       setMeasured(finalElapsed)
     }
   }, [active, elapsed, timerKey, watching])
@@ -113,3 +137,10 @@ export function __resetElapsedTimerRegistryForTests() {
   startedAtByKey.clear()
   durationByKey.clear()
 }
+
+// Test-only introspection for the LRU cap contract.
+export function __timerRegistrySizesForTests() {
+  return { durationByKey: durationByKey.size, startedAtByKey: startedAtByKey.size }
+}
+
+export const __TIMER_REGISTRY_MAX_FOR_TESTS = TIMER_REGISTRY_MAX

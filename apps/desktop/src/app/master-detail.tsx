@@ -100,13 +100,20 @@ export function MasterDetail({
       )
     }
 
+    // Ends on pointerup OR pointercancel (window drag-out, touch cancel,
+    // system gesture) — a cancelled stream must tear down too, or the sash
+    // keeps resizing with no button held. Explicit removal instead of
+    // `{ once: true }`: once-per-listener doesn't cross-remove the other path.
     const onUp = () => {
       window.removeEventListener('pointermove', onMove)
+      window.removeEventListener('pointerup', onUp)
+      window.removeEventListener('pointercancel', onUp)
       setDragging(false)
     }
 
     window.addEventListener('pointermove', onMove)
-    window.addEventListener('pointerup', onUp, { once: true })
+    window.addEventListener('pointerup', onUp)
+    window.addEventListener('pointercancel', onUp)
   }
 
   // With a sash the detail side gets a relative wrapper so the seam handle can
@@ -258,13 +265,18 @@ export function DetailPane({
       setPaneHeightOverride(id, Math.min(max, Math.max(0, Math.round(startHeight + (startY - move.clientY)))))
     }
 
+    // Same teardown contract as the split sash above: pointercancel ends the
+    // drag exactly like pointerup, with explicit cross-removal of both.
     const onUp = () => {
       window.removeEventListener('pointermove', onMove)
+      window.removeEventListener('pointerup', onUp)
+      window.removeEventListener('pointercancel', onUp)
       setDragging(false)
     }
 
     window.addEventListener('pointermove', onMove)
-    window.addEventListener('pointerup', onUp, { once: true })
+    window.addEventListener('pointerup', onUp)
+    window.addEventListener('pointercancel', onUp)
   }
 
   return (

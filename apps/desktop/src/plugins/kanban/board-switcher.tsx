@@ -36,6 +36,7 @@ import { type ReactNode, useEffect, useState } from 'react'
 
 import {
   $boardSlug,
+  ALL_BOARDS,
   BOARDS_KEY,
   createBoard,
   deleteBoard,
@@ -329,9 +330,13 @@ export function BoardSwitcher() {
     return null
   }
 
-  const currentSlug = slug || boards.current
-  const current = boards.boards.find(meta => meta.slug === currentSlug)
-  const label = current?.name || current?.slug || k.board
+  const isAllBoards = slug === ALL_BOARDS
+  const currentSlug = isAllBoards ? ALL_BOARDS : slug || boards.current
+  const current = isAllBoards ? null : boards.boards.find(meta => meta.slug === currentSlug)
+  // Summed live card count across every board — the same `total` each row
+  // already shows, added up, so the trigger reads as "everything" at a glance.
+  const allBoardsTotal = boards.boards.reduce((sum, meta) => sum + (meta.total ?? 0), 0)
+  const label = isAllBoards ? k.allBoards : current?.name || current?.slug || k.board
 
   return (
     <>
@@ -339,13 +344,24 @@ export function BoardSwitcher() {
         <DropdownMenuTrigger asChild>
           <Button className="h-7 max-w-56 gap-1.5 px-2" size="sm" variant="ghost">
             <span className="min-w-0 flex-1 truncate text-[0.75rem] font-medium leading-none">{label}</span>
-            {typeof current?.total === 'number' && (
-              <span className="text-[0.6875rem] tabular-nums text-(--ui-text-quaternary)">{current.total}</span>
+            {isAllBoards ? (
+              <span className="text-[0.6875rem] tabular-nums text-(--ui-text-quaternary)">{allBoardsTotal}</span>
+            ) : (
+              typeof current?.total === 'number' && (
+                <span className="text-[0.6875rem] tabular-nums text-(--ui-text-quaternary)">{current.total}</span>
+              )
             )}
             <Codicon className="shrink-0 text-(--ui-text-tertiary)" name="chevron-down" size="0.8125rem" />
           </Button>
         </DropdownMenuTrigger>
         <DropdownMenuContent align="center">
+          <DropdownMenuItem onSelect={() => $boardSlug.set(ALL_BOARDS)}>
+            <Codicon name="layers" size="0.8rem" />
+            {k.allBoards}
+            <span className="text-[0.625rem] tabular-nums text-(--ui-text-quaternary)">{allBoardsTotal}</span>
+            {isAllBoards && <Codicon className="ml-auto" name="check" size="0.8rem" />}
+          </DropdownMenuItem>
+          <DropdownMenuSeparator />
           {boards.boards.map(meta => (
             <DropdownMenuItem
               key={meta.slug}
@@ -355,7 +371,7 @@ export function BoardSwitcher() {
               {typeof meta.total === 'number' && (
                 <span className="text-[0.625rem] tabular-nums text-(--ui-text-quaternary)">{meta.total}</span>
               )}
-              {meta.slug === currentSlug && <Codicon className="ml-auto" name="check" size="0.8rem" />}
+              {!isAllBoards && meta.slug === currentSlug && <Codicon className="ml-auto" name="check" size="0.8rem" />}
             </DropdownMenuItem>
           ))}
           <DropdownMenuSeparator />

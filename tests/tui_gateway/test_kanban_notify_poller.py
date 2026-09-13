@@ -317,10 +317,13 @@ class TestNotificationPollerLoopKanbanWiring:
             "running": running,
         }
 
-    def test_idle_session_gets_status_update_and_agent_turn(self, monkeypatch):
+    def test_idle_session_waits_for_continue_before_agent_turn(self, monkeypatch):
+        import tui_gateway.server as server
+
         tid = _create_subscribed_task()
         _complete(tid, summary="poller e2e done")
         session = self._poller_session(running=False)
+        monkeypatch.setattr(server, "_block", lambda *args, **kwargs: "Continue now")
 
         stop, thread, emits, submits = self._start_poller(session, monkeypatch)
         try:
@@ -336,10 +339,31 @@ class TestNotificationPollerLoopKanbanWiring:
         assert session["running"] is True  # poller claimed the turn
         assert not session.get("_kanban_pending")
 
+    def test_skip_prevents_agent_turn_for_an_idle_session(self, monkeypatch):
+        import tui_gateway.server as server
+
+        tid = _create_subscribed_task()
+        _complete(tid, summary="do not investigate")
+        session = self._poller_session(running=False)
+        monkeypatch.setattr(server, "_block", lambda *args, **kwargs: "Skip this update")
+
+        stop, thread, emits, submits = self._start_poller(session, monkeypatch)
+        try:
+            assert self._wait_for(lambda: any(e == "status.update" for e, _ in emits))
+        finally:
+            stop.set()
+            thread.join(timeout=5)
+
+        assert not submits
+        assert session["running"] is False
+
     def test_busy_session_buffers_then_flushes_when_idle(self, monkeypatch):
+        import tui_gateway.server as server
+
         tid = _create_subscribed_task()
         _complete(tid, summary="buffered while busy")
         session = self._poller_session(running=True)
+        monkeypatch.setattr(server, "_block", lambda *args, **kwargs: "Continue now")
 
         stop, thread, emits, submits = self._start_poller(session, monkeypatch)
         try:

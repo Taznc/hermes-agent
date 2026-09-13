@@ -1,8 +1,10 @@
 import type { GatewayWsUrlResult } from '@hermes/shared'
 import type { TranslucencyState } from '@hermes/shared/translucency'
 
+import type { AgentOverview } from '../electron/agent-overview'
 import type { PoolLimits } from '../electron/pool-limits'
 
+import type { ForkDesktopApi, ForkSecretStorageEncryptionResult } from './fork/desktop-api'
 import type { WakeIndicatorState } from './lib/wake-indicator'
 import type {
   PetOverlayBounds,
@@ -12,11 +14,13 @@ import type {
 } from './store/pet-overlay'
 import type { QuickEntryStatePush, QuickEntryStatus, QuickEntrySubmitPayload } from './store/quick-entry'
 
+export type { AgentOverview, OverviewProfile, OverviewSession, OverviewSource } from '../electron/agent-overview'
 export {}
 
 declare global {
   interface Window {
-    hermesDesktop: {
+    // >>> FORK ANCHOR: desktop-bridge-types <<<
+    hermesDesktop: ForkDesktopApi & {
       // Resolve a backend connection. Omit `profile` (or pass the primary) for
       // the window's backend; pass a named profile to lazily spawn/reuse that
       // profile's backend from the pool.
@@ -38,6 +42,7 @@ declare global {
       }) => Promise<GatewayWsUrlResult>
       // Union agent roster across every registered connection.
       getAgentRoster?: () => Promise<DesktopAgentRoster>
+      getAgentOverview?: (options?: { force?: boolean }) => Promise<AgentOverview>
       // Credential-free routes across the union connection registry. The
       // optional profile list is used only by the single-local v1 fallback;
       // endpoint and auth material never crosses the IPC boundary.
@@ -173,8 +178,8 @@ declare global {
       // Opt-in OS-keychain encryption for stored gateway secrets (default
       // off). `get` never touches the OS keychain; `set` re-encodes stored
       // secrets and can throw when the keychain is unusable.
-      getSecretStorageEncryption: () => Promise<{ on: boolean }>
-      setSecretStorageEncryption: (on: boolean) => Promise<{ on: boolean }>
+      getSecretStorageEncryption: () => Promise<ForkSecretStorageEncryptionResult>
+      setSecretStorageEncryption: (on: boolean) => Promise<ForkSecretStorageEncryptionResult>
       // v2 multi-connection registry: named agent sources, all persisted
       // together (local + any number of remote/cloud/ssh instances).
       connections: {
@@ -233,6 +238,10 @@ declare global {
       }
       api: <T>(request: HermesApiRequest) => Promise<T>
       notify: (payload: HermesNotification) => Promise<boolean>
+      /** Current OS/browser notification permission, when the platform exposes one
+       *  (web build only — Electron's OS notifications need no separate grant).
+       *  Absent on Electron; Settings treats a missing member as "not applicable". */
+      getNotificationPermission?: () => Promise<'granted' | 'denied' | 'default' | 'unsupported'>
       requestMicrophoneAccess: () => Promise<boolean>
       /** read_window_below tool: metadata for the OS window directly underneath this one (never pixels). */
       readWindowBelow?: () => Promise<{
@@ -304,6 +313,19 @@ declare global {
         webContentsId: number
       }) => Promise<string>
       saveClipboardImage: () => Promise<string>
+      /** Web build only: stage a non-image File's raw bytes (no local path
+       *  available) and return a gateway-visible path, the file counterpart
+       *  to saveImageBuffer. Electron always has a real path via
+       *  getPathForFile and never defines this member. */
+      saveFileBuffer?: (data: ArrayBuffer | Uint8Array, filename: string) => Promise<string>
+      /** Web build only: the original filename a staged (non-image) path was
+       *  uploaded under — saveFileBuffer/selectPaths record it as they stage
+       *  each file. The staged path's own basename is an internal
+       *  timestamp/hash name (see upload_chat_file), not the name the user
+       *  picked/dropped, so the composer label must look it up here rather
+       *  than deriving it from the path. Undefined on Electron, where the
+       *  real local path's basename already is the true name. */
+      getStagedDisplayName?: (path: string) => string | undefined
       getPathForFile: (file: File) => string
       normalizePreviewTarget: (target: string, baseDir?: string) => Promise<HermesPreviewTarget | null>
       watchPreviewFile: (url: string) => Promise<HermesPreviewWatch>
@@ -453,6 +475,11 @@ declare global {
         ) => Promise<{ root: string; label: string }[]>
       }
       terminal: {
+        /** Renderer's ack of processed output bytes for a data flush; drives
+         *  the main-process pty's pause/resume flow control. Fire-and-forget
+         *  (no return value) — a dropped ack just leaves flow control
+         *  conservative a little longer. */
+        ack: (id: string, bytes: number) => void
         attach: (id: string) => Promise<boolean>
         /** Best-effort current working directory of the live PTY child (POSIX
          *  only; null on Windows or when unavailable). Used to reopen a tab
@@ -461,9 +488,12 @@ declare global {
         dispose: (id: string) => Promise<boolean>
         onData: (id: string, callback: (payload: string) => void) => () => void
         onExit: (id: string, callback: (payload: HermesTerminalExit) => void) => () => void
-        resize: (id: string, size: { cols: number; rows: number }) => Promise<boolean>
+        /** Fire-and-forget — no round trip per resize (SIGWINCH is one-way). */
+        resize: (id: string, size: { cols: number; rows: number }) => void
         start: (options?: { cols?: number; cwd?: string; rows?: number }) => Promise<HermesTerminalSession>
-        write: (id: string, data: string) => Promise<boolean>
+        /** Fire-and-forget — no round trip per keystroke; the previous
+         *  boolean return value was never read by any caller. */
+        write: (id: string, data: string) => void
       }
       reachPreviewUrl?: (url: string) => Promise<string>
       setActiveConnectionRoute?: (
@@ -476,7 +506,7 @@ declare global {
       onClosePreviewRequested?: (callback: () => void) => () => void
       onPreviewNav?: (callback: (command: 'back' | 'forward' | 'reload') => void) => () => void
       onOpenFolderRequested?: (callback: () => void) => () => void
-      onOpenUpdatesRequested?: (callback: () => void) => () => void
+
       onDeepLink?: (
         callback: (payload: { kind: string; name: string; params: Record<string, string> }) => void
       ) => () => void
@@ -828,7 +858,10 @@ export interface DesktopConnectionConfig {
   remoteTokenSet: boolean
   // Whether OS-keychain-backed encryption (Electron safeStorage) is currently
   // available on this machine. When false, a persisted remote token can only be
-  // stored as plain text on disk (with an explicit opt-in).
+  // stored as plain text on disk (with an explicit opt-in). NOTE: this reads
+  // `true` whenever keychain encryption is opted OUT (the default) — it exists
+  // only to gate the plain-text CONFIRM dialog, not to describe reality. Read
+  // `secretStorageState` for the honest answer.
   secureTokenStorage: boolean
   // Whether the currently-persisted remote token is stored with encoding
   // 'plain' (i.e. plain text on disk in connection.json), which happens when
@@ -936,7 +969,9 @@ export interface DesktopConnectionsRegistry {
   // compatibility with an older Electron main during a rolling app update.
   lastUsed?: string
   // Whether OS-keychain-backed encryption (Electron safeStorage) is available;
-  // false drives the plain-text token opt-in on keyring-less Linux.
+  // false drives the plain-text token opt-in on keyring-less Linux. NOTE: this
+  // reads `true` whenever keychain encryption is opted OUT (the default); read
+  // `secretStorageState` for the honest answer (see DesktopConnectionConfig).
   secureTokenStorage: boolean
   connections: DesktopRegistryConnection[]
 }
@@ -1232,8 +1267,10 @@ export interface HermesApiRequest {
   // Route this REST call to a specific REGISTERED gateway connection (v2
   // registry). Data owned by a remote gateway — cron jobs and their run
   // sessions — lives in that host's state.db, so requests for it must resolve
-  // through the owning connection, not the local profile pool. Omit / '' to
-  // keep the legacy profile-routed path; explicit 'local' forces this device.
+  // through the owning connection, not the local profile pool. Also required
+  // for anything that must enumerate the ACTIVE source's own state — its
+  // profile list, config, skills — since profile-only routing always resolves
+  // the local backend. Omit / '' / 'local' keep the legacy profile-routed path.
   connectionId?: string | null
 }
 

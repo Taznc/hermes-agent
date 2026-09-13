@@ -63,6 +63,13 @@ function dispatcher(
 }
 
 beforeEach(() => {
+  // Real Electron pool topology: the bridge always exposes
+  // getConnectionConfig (see session-owner-resolution.ts / host-connections.ts
+  // — only the browser-served web bridge, with no per-profile backend pool,
+  // omits it).
+  ;(window as unknown as { hermesDesktop?: unknown }).hermesDesktop = {
+    getConnectionConfig: vi.fn(async () => ({}))
+  }
   gatewayMocks.activeConnectionId = 'local'
   $connectionsRegistry.set({ connections: [{ id: 'local' }] } as never)
   $profiles.set([{ name: 'default' }, { name: 'omar' }] as never)
@@ -70,6 +77,7 @@ beforeEach(() => {
 })
 
 afterEach(() => {
+  delete (window as unknown as { hermesDesktop?: unknown }).hermesDesktop
   $connectionsRegistry.set(null)
   setSessions([])
   setCronSessions([])

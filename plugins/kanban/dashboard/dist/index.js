@@ -94,9 +94,11 @@
   const FALLBACK_COLUMN_LABEL = {
     triage: "Triage",
     todo: "Todo",
+    scheduled: "Scheduled",
     ready: "Ready",
     running: "In Progress",
     blocked: "Blocked",
+    on_hold: "On Hold",
     review: "Review",
     done: "Done",
     archived: "Archived",
@@ -104,9 +106,11 @@
   const FALLBACK_COLUMN_HELP = {
     triage: "Raw ideas — a specifier will flesh out the spec",
     todo: "Waiting on dependencies or unassigned",
+    scheduled: "Waiting for a scheduled time to arrive",
     ready: "Dependencies satisfied; assign a profile to dispatch",
     running: "Claimed by a worker — in-flight",
     blocked: "Worker asked for human input",
+    on_hold: "Shelved by a human — drag back to Ready when you want it resumed",
     review: "Implementation complete — awaiting review",
     done: "Completed",
     archived: "Archived",
@@ -172,9 +176,11 @@
   const COLUMN_DOT = {
     triage: "hermes-kanban-dot-triage",
     todo: "hermes-kanban-dot-todo",
+    scheduled: "hermes-kanban-dot-scheduled",
     ready: "hermes-kanban-dot-ready",
     running: "hermes-kanban-dot-running",
     blocked: "hermes-kanban-dot-blocked",
+    on_hold: "hermes-kanban-dot-on-hold",
     review: "hermes-kanban-dot-review",
     done: "hermes-kanban-dot-done",
     archived: "hermes-kanban-dot-archived",
@@ -1281,6 +1287,7 @@
           },
         }) : null,
         h(OrchestrationPanel, null),
+        h(QuotaCircuitBanner, null),
         h(AttentionStrip, {
           boardData,
           onOpen: setSelectedTaskId,
@@ -1294,7 +1301,11 @@
           search, setSearch,
           onNudgeDispatch: function () {
             SDK.fetchJSON(withBoard(`${API}/dispatch?max=8`, board), { method: "POST" })
-              .then(loadBoard)
+              .then(function (result) {
+                return loadBoard().then(function () {
+                  if (result && result.dispatch_status) setError(result.dispatch_status);
+                });
+              })
               .catch(function (e) { setError(String(e.message || e)); });
           },
           onRefresh: loadBoard,
@@ -1349,6 +1360,66 @@
           requestDialog: function (req) { return kanbanDialogs.request(req); },
         }) : null,
       ),
+    );
+  }
+
+  // -------------------------------------------------------------------------
+  // Host quota circuit — shared across every board/profile on this machine.
+  // -------------------------------------------------------------------------
+
+  function QuotaCircuitBanner() {
+    const [circuits, setCircuits] = useState([]);
+    const [message, setMessage] = useState("");
+
+    const load = useCallback(function () {
+      return SDK.fetchJSON(`${API}/quota-circuits`).then(function (payload) {
+        setCircuits((payload && payload.circuits) || []);
+      }).catch(function (err) {
+        setMessage("Quota diagnostics unavailable: " + (err.message || String(err)));
+      });
+    }, []);
+
+    useEffect(function () {
+      load();
+      const timer = setInterval(load, 30000);
+      return function () { clearInterval(timer); };
+    }, [load]);
+
+    const clearCircuit = function (group) {
+      setMessage("");
+      SDK.fetchJSON(`${API}/quota-circuits/${encodeURIComponent(group)}`, {
+        method: "DELETE",
+      }).then(function () {
+        setMessage("Quota circuit cleared.");
+        load();
+      }).catch(function (err) {
+        setMessage("Clear failed: " + (err.message || String(err)));
+      });
+    };
+
+    if (circuits.length === 0 && !message) return null;
+    return h("div", { className: "hermes-kanban-quota-circuits", role: "status" },
+      h("div", { className: "hermes-kanban-quota-title" },
+        "Host quota circuit active — matching account budget groups are deferred"),
+      circuits.map(function (circuit) {
+        return h("div", { className: "hermes-kanban-quota-row", key: circuit.group },
+          h("div", { className: "hermes-kanban-quota-detail" },
+            h("strong", null, circuit.group),
+            " · " + circuit.reason,
+            " · First observed " + new Date(circuit.first_observed_at * 1000).toLocaleString(),
+            " · Last observed " + new Date(circuit.last_observed_at * 1000).toLocaleString(),
+            " · Next eligible " + new Date(circuit.next_eligible_at * 1000).toLocaleString(),
+            " · Boards deferred " + circuit.boards_deferred,
+            " · Cards deferred " + circuit.cards_deferred,
+          ),
+          h("button", {
+            type: "button",
+            className: "hermes-kanban-quota-clear",
+            onClick: function () { clearCircuit(circuit.group); },
+          }, "Clear circuit"),
+        );
+      }),
+      message ? h("div", { className: "hermes-kanban-quota-message" }, message) : null,
     );
   }
 
@@ -3892,6 +3963,7 @@
               onClick: function () { props.setEditing(true); },
             }, t.title || tx(i18n, "untitled", "(untitled)")),
       ),
+      h(CtaBanner, { task: t, events: events, onPatch: props.onPatch }),
       h("div", { className: "hermes-kanban-drawer-meta" },
         h(MetaRow, { label: tx(i18n, "status", "Status"), value: t.status }),
         h(AssigneeEditor, { task: t, onPatch: props.onPatch }),
@@ -4206,6 +4278,102 @@
       h("span", { className: "hermes-kanban-meta-label" }, props.label),
       h("span", { className: "hermes-kanban-meta-value" }, props.value),
     );
+  }
+
+  // The reason text on the most recent `blocked` event, if any — the
+  // worker's own explanation for why the task is stuck, surfaced verbatim
+  // in the CTA banner instead of making the user dig through Events for it.
+  function _latestBlockReason(events) {
+    for (let i = events.length - 1; i >= 0; i--) {
+      const e = events[i];
+      if (e.kind === "blocked" || e.kind === "block_loop_detected") {
+        const p = e.payload;
+        if (p && typeof p === "object" && typeof p.reason === "string" && p.reason) {
+          return p.reason;
+        }
+        return null;
+      }
+    }
+    return null;
+  }
+
+  const BLOCK_KIND_LABEL = {
+    dependency: "waitingOnDependency",
+    needs_input: "needsYourInput",
+    capability: "missingCapability",
+    transient: "transientFailure",
+  };
+  const BLOCK_KIND_FALLBACK = {
+    dependency: "Waiting on a dependency",
+    needs_input: "Needs your input",
+    capability: "Missing a capability",
+    transient: "Hit a transient failure",
+  };
+
+  // The task detail view's top-of-drawer call to action: the answer to "why
+  // is this stuck and what do I do about it", rendered once above everything
+  // else whenever the task needs a human decision right now (blocked or
+  // parked in review). Everything below stays informational.
+  function CtaBanner(props) {
+    const { t } = useI18n();
+    const task = props.task;
+    const events = props.events || [];
+
+    if (task.status === "blocked") {
+      const kind = task.block_kind || null;
+      const reason = _latestBlockReason(events);
+      const cls = kind === "transient" ? "hermes-kanban-cta--transient" : "hermes-kanban-cta--blocked";
+      const icon = kind === "needs_input" ? "?" : kind === "transient" ? "\u21BB" : "!!";
+      const title = kind
+        ? tx(t, "cta." + BLOCK_KIND_LABEL[kind], BLOCK_KIND_FALLBACK[kind])
+        : tx(t, "cta.blockedTitle", "Blocked — needs your input");
+      return h("div", { className: cn("hermes-kanban-cta", cls) },
+        h("div", { className: "hermes-kanban-cta-head" },
+          h("span", { className: "hermes-kanban-cta-icon" }, icon),
+          h("span", { className: "hermes-kanban-cta-title" }, title),
+        ),
+        h("div", { className: "hermes-kanban-cta-body" },
+          reason || tx(t, "cta.blockedNoReason", "The worker blocked this task but did not record a reason.")),
+        h("div", { className: "hermes-kanban-cta-actions" },
+          h(Button, {
+            size: "sm",
+            onClick: function () {
+              const ta = document.querySelector(".hermes-kanban-drawer-comment-row input, .hermes-kanban-drawer-comment-row textarea");
+              if (ta) { ta.scrollIntoView({ behavior: "smooth", block: "nearest" }); ta.focus(); }
+            },
+          }, tx(t, "cta.reply", "Reply")),
+          h(Button, {
+            size: "sm",
+            variant: "outline",
+            onClick: function () { props.onPatch({ status: "ready" }); },
+          }, tx(t, "unblock", "Unblock")),
+        ),
+      );
+    }
+
+    if (task.status === "review") {
+      return h("div", { className: "hermes-kanban-cta hermes-kanban-cta--review" },
+        h("div", { className: "hermes-kanban-cta-head" },
+          h("span", { className: "hermes-kanban-cta-icon" }, "\u{1F441}"),
+          h("span", { className: "hermes-kanban-cta-title" }, tx(t, "cta.reviewTitle", "Needs review")),
+        ),
+        h("div", { className: "hermes-kanban-cta-body" },
+          tx(t, "cta.reviewBody", "A reviewer should check the work below before this is marked done.")),
+        h("div", { className: "hermes-kanban-cta-actions" },
+          h(Button, {
+            size: "sm",
+            onClick: function () { props.onPatch({ status: "done" }, { confirm: getDestructiveConfirm(t, "done") }); },
+          }, tx(t, "cta.approve", "Approve (mark done)")),
+          h(Button, {
+            size: "sm",
+            variant: "outline",
+            onClick: function () { props.onPatch({ status: "ready" }); },
+          }, tx(t, "cta.sendBack", "Send back to Ready")),
+        ),
+      );
+    }
+
+    return null;
   }
 
   function TitleEditor(props) {
@@ -4710,6 +4878,8 @@
         specifyButton,
         decomposeButton,
         b("→ triage",  { status: "triage" },   task.status !== "triage"),
+        b(tx(t, "hold", "Shelve"), { status: "on_hold" },
+          task.status !== "on_hold" && task.status !== "done" && task.status !== "archived"),
         b("→ ready",   { status: "ready" },    task.status !== "ready"),
         // No direct → running button: /tasks/:id PATCH rejects status=running
         // with 400 (issue #19535). Tasks enter running only through the
@@ -4782,6 +4952,9 @@
   // -------------------------------------------------------------------------
 
   if (window.__HERMES_PLUGINS__ && typeof window.__HERMES_PLUGINS__.register === "function") {
+    // Sub-surfaces the host does not route to directly are reachable off the
+    // registered page so behavioral tests can mount them with a fake SDK.
+    KanbanPage.QuotaCircuitBanner = QuotaCircuitBanner;
     window.__HERMES_PLUGINS__.register("kanban", KanbanPage);
   }
 })();

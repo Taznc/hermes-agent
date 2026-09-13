@@ -30,7 +30,10 @@ import { $workspaceIsPage, sessionRoute } from './routes'
 
 export type OpenSessionIntent = 'in-place' | 'main' | 'stack' | 'tab' | 'window'
 
-export type OpenSessionNavigate = (to: string, options?: { replace?: boolean }) => void
+export type OpenSessionNavigate = (
+  to: string,
+  options?: { replace?: boolean; state?: { preserveSessionTile?: boolean } }
+) => void
 
 export interface OpenSessionWorkspaceScope {
   ownerRoute?: SessionProfileRoute
@@ -165,7 +168,18 @@ export function openSession(
   // otherwise load it into main. From a full page (artifacts, skills, …) a
   // `'main'` hit still has to route back: fronting the workspace tab alone
   // leaves the page showing.
-  if (focusedSessionNeedsRoute(focusOpenSession(storedSessionId, workspaceScope), $workspaceIsPage.get())) {
-    navigate(sessionRoute(storedSessionId))
+  const focused = focusOpenSession(storedSessionId, workspaceScope)
+
+  if (focusedSessionNeedsRoute(focused, $workspaceIsPage.get())) {
+    // A session route normally means "make this the primary chat", which is
+    // why useRouteResume intentionally removes a duplicate tile. This route is
+    // different: the tile is already foreground; changing location only clears
+    // a full workspace page left behind it. Carry that narrow intent through
+    // history so route resume keeps the existing tile in place.
+    if (focused === 'tile') {
+      navigate(sessionRoute(storedSessionId), { state: { preserveSessionTile: true } })
+    } else {
+      navigate(sessionRoute(storedSessionId))
+    }
   }
 }

@@ -2,6 +2,7 @@ import { atom } from 'nanostores'
 
 import type { NewSessionPlacement } from '@/app/chat/new-session-drag'
 import {
+  isHomeProjectId,
   liveSessionProjectId,
   NO_PROJECT_ID,
   type SidebarProjectTree
@@ -153,7 +154,9 @@ export function resolveNewSessionCwd(): string {
 
   // Inside Home, "no folder" is the point: a new chat must stay detached rather
   // than silently attaching to the configured default dir and leaving Home.
-  if (scope === NO_PROJECT_ID) {
+  // Any profile's Home counts — in all-profiles mode a foreign bucket is keyed
+  // `__no_project__::<profile>`, and it is just as folder-less as our own.
+  if (isHomeProjectId(scope)) {
     return ''
   }
 
@@ -381,7 +384,12 @@ interface ProjectTreePayload {
   scoped_session_ids: string[]
 }
 
-const PROJECT_TREE_PREVIEW_LIMIT = 3
+// Keep in sync with PROJECT_PREVIEW_COUNT (app/chat/sidebar/projects/model.ts)
+// — that's the renderer's slice of these same preview sessions, so raising one
+// without the other just truncates one level earlier and silently hides rows
+// again. Not imported directly: model.ts already imports from this module
+// (via $worktreeRefreshToken), so importing back would create a cycle.
+const PROJECT_TREE_PREVIEW_LIMIT = 8
 // The all-profiles fan-out reads one database per profile, so it is allowed the
 // same headroom as the cross-profile session list rather than the interactive
 // default.
@@ -629,12 +637,55 @@ interface RepoScanState {
 const repoScanStates = new WeakMap<HermesGateway, RepoScanState>()
 const scanningGatewayGenerations = new WeakMap<HermesGateway, number>()
 
+// This subscription is registered once, at module load, and stays alive for
+// the life of the process — including every OTHER test file's process/worker
+// reuses (vitest keeps projects.ts's module-scope state alive across the
+// files that share a worker). Nanostores calls a fresh subscriber immediately
+// with the atom's current value, so the very first test file to import this
+// module (however indirectly, e.g. through use-background-sync.ts) runs this
+// callback synchronously against WHATEVER '@/store/gateway' resolves to for
+// that file — including a partial `vi.mock` that never intended to exercise
+// repo-scan state and doesn't export `activeGateway`. Swallow that the same
+// way a torn-down/unconfigured gateway is already handled below (no gateway
+// == not scanning) instead of letting an unrelated file's incomplete mock
+// throw an unhandled rejection into whichever test happens to be running
+// (#t_fc026713 — same "unowned work outliving its owning environment" class
+// as the local-runtime-jobs poll loop; this half of it isn't a timer, but a
+// permanent subscription with the identical failure shape).
 function syncReposScanning(): void {
-  const gateway = activeGateway()
+  let gateway: HermesGateway | null = null
+
+  try {
+    gateway = activeGateway()
+  } catch {
+    gateway = null
+  }
+
   $reposScanning.set(Boolean(gateway && scanningGatewayGenerations.has(gateway)))
 }
 
 $gateway.subscribe(syncReposScanning)
+
+// Reset the gateway-bound project cache. Projects live in the ACTIVE backend's
+// per-profile projects.db, so the list, the tree, the drilled-in scope and the
+// backend-capability verdict all describe one machine. Nanostores are not
+// React Query: nothing invalidates them, so without this a connection switch
+// keeps painting the PREVIOUS machine's projects — local repo names in the
+// sidebar while the chat runs on the remote box. Same reason the session lists
+// are wiped explicitly next door.
+//
+// The persisted $projectScope is reset too: its ids (`p_<hex>` rows and
+// filesystem paths alike) are meaningful only on the backend that issued them,
+// so a drilled-in local project would scope the remote sidebar to a project it
+// has never heard of.
+export function resetProjectsForGatewaySwitch(): void {
+  $projects.set([])
+  $activeProjectId.set(null)
+  $projectTree.set([])
+  $projectTreeLoading.set(false)
+  $projectsRpcAvailable.set(null)
+  $projectScope.set(ALL_PROJECTS)
+}
 
 export async function scanAndRecordRepos(force = false): Promise<void> {
   if (isDesktopFsRemoteMode()) {

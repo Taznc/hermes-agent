@@ -30,6 +30,13 @@ export { ModelMenuCloseContext } from './model-catalog-menu'
 export interface ModelSelection {
   model: string
   provider: string
+  // >>> FORK ANCHOR: composer-model-recommendation <<<
+  /** Fork: apply a reasoning effort as part of the SAME selection. A model
+   *  recommendation is one choice — model plus effort — so it must scope,
+   *  confirm and roll back as one; a second write from the caller would have
+   *  to re-derive primary-vs-tile and could half-apply. Omitted by every
+   *  upstream caller, which keeps their behaviour byte-identical. */
+  effort?: string
   /** Runtime id of the surface that opened the menu. When set, the switch
    *  targets that session (a tile) instead of the primary `$activeSessionId`. */
   sessionId?: null | string
