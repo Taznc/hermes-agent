@@ -5074,7 +5074,7 @@ def test_ws_orphan_reap_keeps_pending_clarify_answerable_for_reconnect(monkeypat
         assert interrupted == []
         assert worker.is_alive()
         assert server._pending_clarify_request_payload("clarify-sid") == {
-            "question": "Continue?", "request_id": request_id
+            "question": "Continue?", "request_id": request_id, "timeout_seconds": 5.0
         }
         assert server._pending_clarify_request_payload("other-sid") is None
 
