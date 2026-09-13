@@ -9,6 +9,7 @@ from __future__ import annotations
 
 from dataclasses import asdict, dataclass
 import json
+from pathlib import Path
 from typing import Any, Optional
 
 
@@ -237,6 +238,35 @@ def _workspace_refs(task, land_target: Optional[str]) -> dict[str, Any]:
     }
 
 
+def _board_metadata_for_connection(conn, fallback_board: Optional[str]) -> dict[str, Any]:
+    """Resolve metadata from the database the caller actually opened.
+
+    An omitted board argument can still be pinned by ``HERMES_KANBAN_DB``, which
+    outranks ``HERMES_KANBAN_BOARD``.  Reading metadata from either raw input
+    would therefore let the packet describe a different board than ``conn``.
+    """
+    database_rows = conn.execute("PRAGMA database_list").fetchall()
+    main_row = next((row for row in database_rows if row[1] == "main"), None)
+    if main_row is None or not main_row[2]:
+        return _kb.read_board_metadata(fallback_board)
+    opened_path = Path(main_row[2]).expanduser().resolve()
+
+    # Named boards come first because a path pin also makes the default board's
+    # derived ``db_path`` point at the pin. Compare against canonical filesystem
+    # locations instead of that env-sensitive display field.
+    boards = _kb.list_boards(include_archived=True)
+    for meta in (item for item in boards if item.get("slug") != _kb.DEFAULT_BOARD):
+        slug = str(meta["slug"])
+        if (_kb.board_dir(slug) / "kanban.db").expanduser().resolve() == opened_path:
+            return meta
+    if (_kb.kanban_home() / "kanban.db").expanduser().resolve() == opened_path:
+        return _kb.read_board_metadata(_kb.DEFAULT_BOARD)
+
+    # A hand-pinned arbitrary DB has no board.json identity to recover. Preserve
+    # the prior fail-safe contract (no inferred landing authority).
+    return _kb.read_board_metadata(fallback_board)
+
+
 def build_worker_task_packet(
     conn, task_id: str, *, board: Optional[str] = None
 ) -> WorkerTaskPacket:
@@ -266,7 +296,7 @@ def build_worker_task_packet(
     caps, max_review_rounds = _runtime_caps(task)
     current_round = changes_rounds + (1 if source_state == "review" else 0)
 
-    board_meta = _kb.read_board_metadata(board)
+    board_meta = _board_metadata_for_connection(conn, board)
     land_target = board_meta.get("land_target")
     completion_contract = task.completion_contract or "local-only"
     handoff_run_ids = (
