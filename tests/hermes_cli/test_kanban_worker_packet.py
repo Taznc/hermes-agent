@@ -164,9 +164,10 @@ def test_packet_bounds_history_and_preserves_parent_handoff(board):
     packet = kb.build_worker_task_packet(board, child).to_dict()
     encoded = json.dumps(packet, ensure_ascii=False).encode("utf-8")
 
-    assert packet["dependencies"][0]["handoff"]["summary"] == parent_summary
-    assert packet["dependencies"][0]["handoff"]["metadata"] == {"receipt": "R" * 4000}
-    assert packet["dependencies"][1]["handoff"]["summary"] == "second parent evidence"
+    dependencies = {item["task_id"]: item for item in packet["dependencies"]}
+    assert dependencies[parent]["handoff"]["summary"] == parent_summary
+    assert dependencies[parent]["handoff"]["metadata"] == {"receipt": "R" * 4000}
+    assert dependencies[second_parent]["handoff"]["summary"] == "second parent evidence"
     assert len(encoded) < 40_000
     comments_marker = next(
         item for item in packet["history"]["retrieval"] if item["kind"] == "comments"
