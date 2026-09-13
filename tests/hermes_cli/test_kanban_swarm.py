@@ -172,7 +172,7 @@ def test_create_swarm_resolves_every_route_before_any_topology_is_visible(tmp_pa
     route = KanbanModelRouteDecision(
         route_source="mechanical",
         route_name="mechanical",
-        model_override="gpt-5.4-mini",
+        model_override="gpt-5.6-terra",
         provider_override="openai-codex",
         reasoning_effort="medium",
     )
@@ -212,7 +212,7 @@ def test_create_swarm_resolves_every_route_before_any_topology_is_visible(tmp_pa
         assert calls[3]["body"] == synthesizer.body
         assert root.route_source == "mechanical"
         assert root.route_name == "mechanical"
-        assert root.model_override == "gpt-5.4-mini"
+        assert root.model_override == "gpt-5.6-terra"
         assert worker.route_source == "mechanical"
         assert worker.route_name == "mechanical"
         assert verifier.route_source == "mechanical"
@@ -266,7 +266,7 @@ def test_create_swarm_idempotent_return_skips_rerouting(tmp_path, monkeypatch):
     route = KanbanModelRouteDecision(
         route_source="mechanical",
         route_name="mechanical",
-        model_override="gpt-5.4-mini",
+        model_override="gpt-5.6-terra",
         provider_override="openai-codex",
         reasoning_effort="medium",
     )

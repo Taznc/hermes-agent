@@ -3054,7 +3054,9 @@ def _dispatch_lane_task(
     if policy_task is not None:
         try:
             _prepare_worker_launch(policy_task)
-            _validate_prepared_model_policy(policy_task, board=board)
+            _validate_prepared_model_policy(
+                policy_task, board=board, review_lane=(lane == "review"),
+            )
         except ValueError as exc:
             reason = str(exc)
             result.model_policy_blocked.append((task_id, reason))
@@ -3149,7 +3151,9 @@ def _dispatch_lane_task(
         # compatible custom spawn function. This closes the race where a very
         # fast worker finalizes its run before the parent records its PID.
         _prepare_worker_launch(claimed)
-        _validate_prepared_model_policy(claimed, board=board)
+        _validate_prepared_model_policy(
+            claimed, board=board, review_lane=(lane == "review"),
+        )
         _stamp_worker_run_launch(conn, claimed)
         pid = _call_spawn_fn(spawn_fn if spawn_fn is not None else _default_spawn, claimed, str(workspace), board)
         if pid:
@@ -3430,8 +3434,15 @@ def _apply_rework_escalation(
             ).fetchone()
             if row is None:
                 return False
-            preserve = _model_override_is_operator_set(conn, task_id)
             current_task = _kb.get_task(conn, task_id)
+            preserve = _model_override_is_operator_set(conn, task_id) and not (
+                current_task
+                and (
+                    current_task.policy_forced_by
+                    or current_task.policy_force_reason
+                    or current_task.policy_force_route
+                )
+            )
             if current_task is not None:
                 candidate = replace(
                     current_task,
@@ -3552,7 +3563,8 @@ def _apply_default_reviewer(
     try:
         with _kb.write_txn(conn):
             row = conn.execute(
-                "SELECT model_override, provider_override, reasoning_effort FROM tasks WHERE id = ?",
+                "SELECT model_override, provider_override, reasoning_effort, policy_forced_by, "
+                "policy_force_reason, policy_force_route FROM tasks WHERE id = ?",
                 (task_id,),
             ).fetchone()
             if row is None:
@@ -3570,7 +3582,9 @@ def _apply_default_reviewer(
                 policy_force_reason=None,
                 policy_force_route=None,
             )
-            _kb.validate_task_model_policy(candidate, allow_legacy_unconfigured=True)
+            _kb.validate_review_task_model_policy(
+                candidate, allow_legacy_unconfigured=True,
+            )
             implementer_model_override = row["model_override"]
             implementer_provider_override = row["provider_override"]
             implementer_reasoning_effort = row["reasoning_effort"]
@@ -3596,6 +3610,10 @@ def _apply_default_reviewer(
                 payload["implementer_provider_override"] = implementer_provider_override
             if implementer_reasoning_effort is not None:
                 payload["implementer_reasoning_effort"] = implementer_reasoning_effort
+            if row["policy_forced_by"] or row["policy_force_reason"] or row["policy_force_route"]:
+                payload["implementer_policy_forced_by"] = row["policy_forced_by"]
+                payload["implementer_policy_force_reason"] = row["policy_force_reason"]
+                payload["implementer_policy_force_route"] = row["policy_force_route"]
             _kb._append_event(conn, task_id, "assigned", payload)
     except Exception:
         _kb._log.debug(
@@ -4482,7 +4500,9 @@ def _prepare_worker_launch(task: Task, hermes_home: Optional[str] = None) -> Non
         setattr(task, "_worker_run_analytics", _resolve_worker_run_analytics(task, hermes_home))
 
 
-def _validate_prepared_model_policy(task: Task, *, board: Optional[str]) -> None:
+def _validate_prepared_model_policy(
+    task: Task, *, board: Optional[str], review_lane: bool = False,
+) -> None:
     """Validate the exact route prepared for worker argv/run accounting."""
     if task.goal_mode:
         raise ValueError("goal_mode is disabled by the unattended Kanban policy")
@@ -4507,6 +4527,15 @@ def _validate_prepared_model_policy(task: Task, *, board: Optional[str]) -> None
         raise ValueError(
             "stored model policy force does not match the prepared assignee/route; "
             "re-approve with force plus a durable reason"
+        )
+    if (
+        review_lane
+        and str(analytics.get("model") or "").strip().casefold() == "gpt-5.6-luna"
+        and not has_force
+    ):
+        raise ValueError(
+            "Kanban model policy refuses mechanical-only Luna for review work; "
+            "use Sol/medium or provide operator force plus a durable reason"
         )
 
 

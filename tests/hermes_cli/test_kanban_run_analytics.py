@@ -76,8 +76,8 @@ def test_spawn_stamps_explicit_model_override_as_card_override(kanban_home, monk
     with kbc.connect_closing() as conn:
         tid = kb.create_task(
             conn, title="t", assignee="elias",
-            model_override="claude-sonnet-5", provider_override="anthropic",
-            reasoning_effort="high", route_source="explicit",
+            model_override="gpt-5.6-sol", provider_override="openai-codex",
+            reasoning_effort="medium", route_source="explicit",
         )
         task = kb.get_task(conn, tid)
 
@@ -87,14 +87,14 @@ def test_spawn_stamps_explicit_model_override_as_card_override(kanban_home, monk
         run = kb.get_run(conn, kb.get_task(conn, tid).current_run_id)
         events = kb.list_events(conn, tid)
 
-    assert run.model == "claude-sonnet-5"
-    assert run.provider == "anthropic"
-    assert run.reasoning_effort == "high"
+    assert run.model == "gpt-5.6-sol"
+    assert run.provider == "openai-codex"
+    assert run.reasoning_effort == "medium"
     assert run.model_source == "card_override"
 
     spawned = next(e for e in events if e.kind == "spawned")
-    assert spawned.payload["model"] == "claude-sonnet-5"
-    assert spawned.payload["provider"] == "anthropic"
+    assert spawned.payload["model"] == "gpt-5.6-sol"
+    assert spawned.payload["provider"] == "openai-codex"
     assert spawned.payload["model_source"] == "card_override"
 
 
@@ -105,9 +105,9 @@ def test_spawn_routed_override_uses_routing_source(kanban_home, monkeypatch, tmp
             conn,
             title="t",
             assignee="elias",
-            model_override="cheap-model",
-            provider_override="openrouter",
-            reasoning_effort="low",
+            model_override="gpt-5.6-terra",
+            provider_override="openai-codex",
+            reasoning_effort="medium",
             route_source="mechanical",
             route_name="mechanical",
         )
@@ -119,8 +119,8 @@ def test_spawn_routed_override_uses_routing_source(kanban_home, monkeypatch, tmp
         run = kb.get_run(conn, kb.get_task(conn, tid).current_run_id)
 
     assert run.model_source == "routing"
-    assert run.model == "cheap-model"
-    assert run.provider == "openrouter"
+    assert run.model == "gpt-5.6-terra"
+    assert run.provider == "openai-codex"
 
 
 def test_spawn_without_override_stamps_profile_default_source(kanban_home, monkeypatch, tmp_path):
