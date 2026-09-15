@@ -507,7 +507,7 @@ def test_json_schema_structured_output_reaches_the_claude_backend():
             assert status == 200
         assert calls[0]["output_config"]["format"] == {
             "type": "json_schema",
-            "schema": schema,
+            "schema": {**schema, "additionalProperties": False},
         }
 
     asyncio.run(run())

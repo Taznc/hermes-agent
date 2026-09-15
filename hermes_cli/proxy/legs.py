@@ -204,16 +204,7 @@ class OpenAIChatLeg(BackendLeg):
         except (UnicodeDecodeError, json.JSONDecodeError):
             parsed = None
         if not isinstance(parsed, dict):
-            return LegOutcome(
-                ok=False,
-                status=502,
-                error=_error_payload(
-                    "upstream returned a success status with an unusable body",
-                    "upstream_invalid_response",
-                ),
-                failover_eligible=True,
-                reason="invalid_success_body",
-            )
+            return _invalid_success_outcome()
         return LegOutcome(ok=True, status=response.status, chat=parsed, reason="ok")
 
     def _headers(self, credential: UpstreamCredential) -> Dict[str, str]:
@@ -253,6 +244,7 @@ class AnthropicMessagesLeg(BackendLeg):
     async def send(self, credential, chat_request, *, stream):
         from hermes_cli.proxy.claude_translate import (
             ClaudeStreamTranslator,
+            UntranslatableBlockError,
             prepare_chat_request,
             response_to_openai,
         )
@@ -338,8 +330,11 @@ class AnthropicMessagesLeg(BackendLeg):
                 chat=response_to_openai(parsed, tool_name_map=tool_name_map),
                 reason="ok",
             )
-        except ValueError:
-            return _invalid_success_outcome()
+        except ValueError as exc:
+            return _invalid_success_outcome(
+                reason="invalid_success_body:untranslatable",
+                block_type=exc.block_type if isinstance(exc, UntranslatableBlockError) else None,
+            )
 
 
 class OpenAIResponsesLeg(BackendLeg):
@@ -434,15 +429,25 @@ class OpenAIResponsesLeg(BackendLeg):
                 reason="ok",
             )
         except ValueError:
-            return _invalid_success_outcome()
+            return _invalid_success_outcome(reason="invalid_success_body:untranslatable")
 
 
-def _invalid_success_outcome() -> LegOutcome:
+def _invalid_success_outcome(
+    *, reason: str = "invalid_success_body:unparseable", block_type: str | None = None
+) -> LegOutcome:
     """A 2xx whose body cannot be translated is an upstream defect, not a refusal.
 
     It is failover-eligible: a second subscription may well answer correctly,
     and the client has been told nothing yet.
+
+    ``reason`` discriminates the two causes that used to share one label — a
+    body that was not JSON at all (``:unparseable``) versus one that parsed
+    cleanly and the translator refused (``:untranslatable``). Collapsing them
+    cost a full investigation to rediscover from live traffic: a valid Anthropic
+    extended-thinking 200 looked exactly like a corrupt body in the log.
     """
+    if block_type:
+        logger.info("proxy.leg untranslatable_block_type=%s", block_type)
     return LegOutcome(
         ok=False,
         status=502,
@@ -451,7 +456,7 @@ def _invalid_success_outcome() -> LegOutcome:
             "upstream_invalid_response",
         ),
         failover_eligible=True,
-        reason="invalid_success_body",
+        reason=reason,
     )
 
 
