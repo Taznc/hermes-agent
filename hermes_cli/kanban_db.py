@@ -33,6 +33,8 @@ from typing import Any, Iterable, Optional
 
 from toolsets import get_toolset_names
 
+from hermes_cli import kanban_usage as _kanban_usage
+
 _log = logging.getLogger(__name__)
 
 
@@ -1158,6 +1160,11 @@ class Run:
     api_calls: Optional[int] = None
     tool_calls: Optional[int] = None
     estimated_cost_usd: Optional[float] = None
+    # Whole-campaign reconciliation (hermes_cli/kanban_usage.py). ``usage_status``
+    # distinguishes a measured zero from an unmeasurable run: reconciled |
+    # session_only | unavailable, NULL on legacy rows.
+    cache_write_tokens: Optional[int] = None
+    usage_status: Optional[str] = None
 
     @classmethod
     def from_row(cls, row: sqlite3.Row) -> "Run":
@@ -1182,6 +1189,8 @@ class Run:
             estimated_cost_usd=(
                 float(g("estimated_cost_usd")) if g("estimated_cost_usd") is not None else None
             ),
+            cache_write_tokens=_opt_int(g("cache_write_tokens")),
+            usage_status=g("usage_status"),
         )
 
 
@@ -1467,7 +1476,16 @@ CREATE TABLE IF NOT EXISTS task_runs (
     reasoning_tokens    INTEGER,
     api_calls           INTEGER,
     tool_calls          INTEGER,
-    estimated_cost_usd  REAL
+    estimated_cost_usd  REAL,
+    -- Whole-campaign reconciliation rollup (hermes_cli/kanban_usage.py). The
+    -- columns above are an absolute rewrite of the reconciled per-route rows in
+    -- ``task_run_usage``, not a one-shot copy of the sessions row, so worker
+    -- tails and auxiliary calls that land after finalize are included on the
+    -- next reconciliation instead of being lost.
+    -- usage_status: reconciled | session_only | unavailable. NULL counts mean
+    -- "not measurable"; 0 means "measured zero".
+    cache_write_tokens  INTEGER,
+    usage_status        TEXT
 );
 
 -- Files attached to a task (PDFs, images, source documents). The blob
@@ -1585,6 +1603,10 @@ CREATE INDEX IF NOT EXISTS idx_runs_status           ON task_runs(status);
 CREATE INDEX IF NOT EXISTS idx_attachments_task      ON task_attachments(task_id, created_at);
 CREATE INDEX IF NOT EXISTS idx_notify_task           ON kanban_notify_subs(task_id);
 """
+
+# Per-route run usage lives in its own sibling so the reconciliation logic and its DDL
+# stay together; appended here so a fresh board gets it from one executescript.
+SCHEMA_SQL += _kanban_usage.TASK_RUN_USAGE_SCHEMA_SQL
 
 
 # --- ID generation ---
@@ -3713,65 +3735,20 @@ def _append_event(
 
 
 def _copy_run_session_analytics(conn: sqlite3.Connection, run_id: int) -> None:
-    """Best-effort copy of one worker session's usage totals onto its run.
+    """Reconcile one run's whole usage (main + auxiliary + delegated) onto its run.
 
-    Session state is profile-scoped and may be missing, busy, or on an older
-    schema. Finalizing the Kanban run must always win over analytics capture, so
-    every lookup failure is reduced to one debug line and leaves the nullable
-    columns untouched.
+    Delegates to :func:`hermes_cli.kanban_usage.safe_reconcile_run_usage`, which rewrites
+    the per-route ``task_run_usage`` rows and the ``task_runs`` rollup absolutely rather
+    than copying the flat ``sessions`` counters once. Reconciling again later is
+    idempotent AND picks up whatever the worker's tail wrote after this point, which a
+    one-shot copy structurally could not.
+
+    Finalizing the Kanban run must always win over analytics capture, so every failure
+    mode is reduced to one debug line inside the helper and leaves the nullable columns
+    untouched. Kept as a thin wrapper under its original name so existing call sites and
+    their tests keep working.
     """
-    row = conn.execute(
-        "SELECT profile, session_id FROM task_runs WHERE id = ?", (int(run_id),),
-    ).fetchone()
-    if row is None or not row["session_id"] or not row["profile"]:
-        return
-
-    session_id = str(row["session_id"])
-    profile = str(row["profile"])
-    state_conn: Optional[sqlite3.Connection] = None
-    try:
-        from hermes_cli.profiles import resolve_profile_env
-
-        state_path = Path(resolve_profile_env(profile)) / "state.db"
-        state_conn = sqlite3.connect(f"{state_path.resolve().as_uri()}?mode=ro", uri=True)
-        state_conn.row_factory = sqlite3.Row
-        usage = state_conn.execute(
-            """
-            SELECT input_tokens, output_tokens, cache_read_tokens,
-                   reasoning_tokens, api_call_count, tool_call_count,
-                   estimated_cost_usd
-              FROM sessions
-             WHERE id = ?
-            """,
-            (session_id,),
-        ).fetchone()
-        if usage is None:
-            raise LookupError("session row not found")
-        conn.execute(
-            """
-            UPDATE task_runs
-               SET input_tokens = ?, output_tokens = ?, cache_read_tokens = ?,
-                   reasoning_tokens = ?, api_calls = ?, tool_calls = ?,
-                   estimated_cost_usd = ?
-             WHERE id = ?
-            """,
-            (
-                usage["input_tokens"], usage["output_tokens"], usage["cache_read_tokens"],
-                usage["reasoning_tokens"], usage["api_call_count"], usage["tool_call_count"],
-                usage["estimated_cost_usd"], int(run_id),
-            ),
-        )
-    except Exception as exc:
-        _log.debug(
-            "kanban run analytics unavailable for run=%s profile=%s session=%s (%s)",
-            run_id,
-            profile,
-            session_id,
-            exc,
-        )
-    finally:
-        if state_conn is not None:
-            state_conn.close()
+    _kanban_usage.safe_reconcile_run_usage(conn, run_id)
 
 
 def _end_run(

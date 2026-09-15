@@ -978,6 +978,9 @@ _LATER_RUN_COLUMNS = (
     ("api_calls", "api_calls INTEGER"),
     ("tool_calls", "tool_calls INTEGER"),
     ("estimated_cost_usd", "estimated_cost_usd REAL"),
+    # Whole-campaign reconciliation columns (hermes_cli/kanban_usage.py).
+    ("cache_write_tokens", "cache_write_tokens INTEGER"),
+    ("usage_status", "usage_status TEXT"),
 )
 
 
@@ -1175,7 +1178,8 @@ _REBUILD_SPECS = {
         " model_source TEXT, session_id TEXT, input_tokens INTEGER,"
         " output_tokens INTEGER, cache_read_tokens INTEGER,"
         " reasoning_tokens INTEGER, api_calls INTEGER, tool_calls INTEGER,"
-        " estimated_cost_usd REAL)",
+        " estimated_cost_usd REAL, cache_write_tokens INTEGER,"
+        " usage_status TEXT)",
         (
             "CREATE INDEX idx_runs_task ON task_runs(task_id, started_at)",
             "CREATE INDEX idx_runs_status ON task_runs(status)",
