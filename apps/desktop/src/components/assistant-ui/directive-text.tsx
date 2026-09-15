@@ -576,7 +576,14 @@ const DirectiveChip: FC<{
   }
 
   return activate ? (
-    <button {...props} onClick={activate} type="button">
+    <button
+      {...props}
+      onClick={event => {
+        event.stopPropagation()
+        activate()
+      }}
+      type="button"
+    >
       {body}
     </button>
   ) : (
