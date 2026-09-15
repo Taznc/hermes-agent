@@ -1,0 +1,177 @@
+{
+ "cc_c2ffe5": {
+  "disabled": {
+   "proactive_prune_tokens": 0,
+   "threshold_tokens": 500000,
+   "full_compressions": 1,
+   "prune_commits": 0,
+   "prune_reclaimed_tokens": 0,
+   "cache_breaks_total": 1,
+   "skill_reload_risk_events": 0,
+   "transcript_total_tokens": 963405,
+   "transcript_messages": 1549
+  },
+  "prune_96k": {
+   "proactive_prune_tokens": 96000,
+   "threshold_tokens": 500000,
+   "full_compressions": 1,
+   "prune_commits": 6,
+   "prune_reclaimed_tokens": 187353,
+   "cache_breaks_total": 7,
+   "skill_reload_risk_events": 4,
+   "transcript_total_tokens": 963405,
+   "transcript_messages": 1549
+  },
+  "prune_48k": {
+   "proactive_prune_tokens": 48000,
+   "threshold_tokens": 500000,
+   "full_compressions": 1,
+   "prune_commits": 14,
+   "prune_reclaimed_tokens": 364736,
+   "cache_breaks_total": 15,
+   "skill_reload_risk_events": 18,
+   "transcript_total_tokens": 963405,
+   "transcript_messages": 1549
+  }
+ },
+ "cc_1e84c0": {
+  "disabled": {
+   "proactive_prune_tokens": 0,
+   "threshold_tokens": 500000,
+   "full_compressions": 2,
+   "prune_commits": 0,
+   "prune_reclaimed_tokens": 0,
+   "cache_breaks_total": 2,
+   "skill_reload_risk_events": 0,
+   "transcript_total_tokens": 1256294,
+   "transcript_messages": 1093
+  },
+  "prune_96k": {
+   "proactive_prune_tokens": 96000,
+   "threshold_tokens": 500000,
+   "full_compressions": 0,
+   "prune_commits": 10,
+   "prune_reclaimed_tokens": 943374,
+   "cache_breaks_total": 10,
+   "skill_reload_risk_events": 26,
+   "transcript_total_tokens": 1256294,
+   "transcript_messages": 1093
+  },
+  "prune_48k": {
+   "proactive_prune_tokens": 48000,
+   "threshold_tokens": 500000,
+   "full_compressions": 0,
+   "prune_commits": 12,
+   "prune_reclaimed_tokens": 943374,
+   "cache_breaks_total": 12,
+   "skill_reload_risk_events": 30,
+   "transcript_total_tokens": 1256294,
+   "transcript_messages": 1093
+  }
+ },
+ "cc_1b7595": {
+  "disabled": {
+   "proactive_prune_tokens": 0,
+   "threshold_tokens": 500000,
+   "full_compressions": 1,
+   "prune_commits": 0,
+   "prune_reclaimed_tokens": 0,
+   "cache_breaks_total": 1,
+   "skill_reload_risk_events": 0,
+   "transcript_total_tokens": 530835,
+   "transcript_messages": 818
+  },
+  "prune_96k": {
+   "proactive_prune_tokens": 96000,
+   "threshold_tokens": 500000,
+   "full_compressions": 0,
+   "prune_commits": 4,
+   "prune_reclaimed_tokens": 159010,
+   "cache_breaks_total": 4,
+   "skill_reload_risk_events": 9,
+   "transcript_total_tokens": 530835,
+   "transcript_messages": 818
+  },
+  "prune_48k": {
+   "proactive_prune_tokens": 48000,
+   "threshold_tokens": 500000,
+   "full_compressions": 0,
+   "prune_commits": 9,
+   "prune_reclaimed_tokens": 259065,
+   "cache_breaks_total": 9,
+   "skill_reload_risk_events": 23,
+   "transcript_total_tokens": 530835,
+   "transcript_messages": 818
+  }
+ },
+ "rv_0f366f": {
+  "disabled": {
+   "proactive_prune_tokens": 0,
+   "threshold_tokens": 500000,
+   "full_compressions": 1,
+   "prune_commits": 0,
+   "prune_reclaimed_tokens": 0,
+   "cache_breaks_total": 1,
+   "skill_reload_risk_events": 0,
+   "transcript_total_tokens": 744085,
+   "transcript_messages": 585
+  },
+  "prune_96k": {
+   "proactive_prune_tokens": 96000,
+   "threshold_tokens": 500000,
+   "full_compressions": 0,
+   "prune_commits": 6,
+   "prune_reclaimed_tokens": 419745,
+   "cache_breaks_total": 6,
+   "skill_reload_risk_events": 22,
+   "transcript_total_tokens": 744085,
+   "transcript_messages": 585
+  },
+  "prune_48k": {
+   "proactive_prune_tokens": 48000,
+   "threshold_tokens": 500000,
+   "full_compressions": 0,
+   "prune_commits": 10,
+   "prune_reclaimed_tokens": 485238,
+   "cache_breaks_total": 10,
+   "skill_reload_risk_events": 42,
+   "transcript_total_tokens": 744085,
+   "transcript_messages": 585
+  }
+ },
+ "rv_1b5a91": {
+  "disabled": {
+   "proactive_prune_tokens": 0,
+   "threshold_tokens": 500000,
+   "full_compressions": 1,
+   "prune_commits": 0,
+   "prune_reclaimed_tokens": 0,
+   "cache_breaks_total": 1,
+   "skill_reload_risk_events": 0,
+   "transcript_total_tokens": 540106,
+   "transcript_messages": 674
+  },
+  "prune_96k": {
+   "proactive_prune_tokens": 96000,
+   "threshold_tokens": 500000,
+   "full_compressions": 0,
+   "prune_commits": 4,
+   "prune_reclaimed_tokens": 238778,
+   "cache_breaks_total": 4,
+   "skill_reload_risk_events": 4,
+   "transcript_total_tokens": 540106,
+   "transcript_messages": 674
+  },
+  "prune_48k": {
+   "proactive_prune_tokens": 48000,
+   "threshold_tokens": 500000,
+   "full_compressions": 0,
+   "prune_commits": 7,
+   "prune_reclaimed_tokens": 305028,
+   "cache_breaks_total": 7,
+   "skill_reload_risk_events": 8,
+   "transcript_total_tokens": 540106,
+   "transcript_messages": 674
+  }
+ }
+}
