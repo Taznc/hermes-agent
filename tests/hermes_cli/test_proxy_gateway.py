@@ -254,6 +254,35 @@ def test_failover_app_rejects_duplicate_backends():
         create_failover_app(duplicated)
 
 
+def test_failover_rewrites_the_model_for_each_configured_backend():
+    async def run():
+        claude_calls: List[Dict[str, Any]] = []
+        codex_calls: List[Dict[str, Any]] = []
+        async with _Harness(
+            _claude_first(
+                _anthropic_upstream(status=429, calls=claude_calls),
+                _codex_upstream(calls=codex_calls),
+            ),
+            backend_models={
+                "claude-code": "claude-sonnet-5",
+                "openai-codex": "gpt-5.6-sol",
+            },
+        ) as harness:
+            status, _, _ = await harness.post(
+                "/v1/chat/completions",
+                {
+                    "model": "client-placeholder",
+                    "messages": [{"role": "user", "content": "hi"}],
+                },
+            )
+
+        assert status == 200
+        assert claude_calls[0]["model"] == "claude-sonnet-5"
+        assert codex_calls[0]["model"] == "gpt-5.6-sol"
+
+    asyncio.run(run())
+
+
 def test_unknown_gateway_path_is_a_clear_404_not_a_silent_proxy():
     async def run():
         async with _Harness(
@@ -1263,6 +1292,26 @@ def test_cli_parses_an_ordered_provider_chain():
 
     adapters = _resolve_backends("claude-code,openai-codex")
     assert [adapter.name for adapter in adapters] == ["claude-code", "openai-codex"]
+
+
+def test_cli_resolves_profile_model_config_into_proxy_routes():
+    from hermes_cli.proxy.cli import _resolve_configured_routes
+
+    routes = _resolve_configured_routes({
+        "model": {"provider": "anthropic", "default": "claude-sonnet-5"},
+        "fallback_providers": [
+            {"provider": "openai-codex", "model": "gpt-5.6-sol"},
+            {"provider": "xai", "model": "grok-4.6"},
+            {"provider": "nous", "model": "anthropic/claude-opus-5"},
+        ],
+    })
+
+    assert [(adapter.name, model) for adapter, model in routes] == [
+        ("claude-code", "claude-sonnet-5"),
+        ("openai-codex", "gpt-5.6-sol"),
+        ("xai", "grok-4.6"),
+        ("nous", "anthropic/claude-opus-5"),
+    ]
 
 
 def test_cli_resolves_the_codex_alias_inside_a_chain():

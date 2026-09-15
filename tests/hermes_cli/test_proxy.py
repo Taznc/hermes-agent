@@ -40,6 +40,24 @@ def _write_auth_store(hermes_home: Path, nous_state: Dict[str, Any]) -> Path:
     return auth_path
 
 
+def test_nous_adapter_uses_global_auth_fallback_for_a_profile():
+    global_state = {
+        "agent_key": "global-agent-key",
+        "access_token": "global-access",
+        "refresh_token": "global-refresh",
+    }
+    adapter = NousPortalAdapter()
+
+    with (
+        patch("hermes_cli.proxy.adapters.nous_portal._load_auth_store", return_value={"providers": {}}),
+        patch(
+            "hermes_cli.proxy.adapters.nous_portal._load_provider_state_with_source",
+            return_value=(global_state, Path("/global/auth.json")),
+        ),
+    ):
+        assert adapter.is_authenticated()
+
+
 def test_nous_adapter_concurrent_refresh_serialized(tmp_path, monkeypatch):
     """Two parallel get_credential() calls must serialize through the lock."""
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))

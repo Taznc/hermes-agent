@@ -336,11 +336,19 @@ def build_gateway_parser(
     )
     proxy_start.add_argument(
         "--provider",
-        default="nous",
+        default=None,
         help=(
             "Upstream provider: claude-code, codex, nous, or xai (default: nous). "
             "Comma-separate two or more for an ordered failover chain "
             "(e.g. claude-code,openai-codex). See `hermes proxy providers`."
+        ),
+    )
+    proxy_start.add_argument(
+        "--use-model-config",
+        action="store_true",
+        help=(
+            "Use the active profile's primary and fallback provider/model routes. "
+            "Select the profile with the global `hermes -p NAME` option."
         ),
     )
     proxy_start.add_argument(
