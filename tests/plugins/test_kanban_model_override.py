@@ -108,6 +108,20 @@ def test_create_task_with_model_and_provider(conn):
     assert ev.payload["provider_override"] == "openrouter"
 
 
+def test_dashboard_create_rejects_unknown_explicit_route_without_profile_config(client):
+    response = client.post(
+        "/api/plugins/kanban/tasks",
+        json={
+            "title": "unknown route",
+            "model_override": "future-expensive-model",
+            "provider_override": "openai-codex",
+            "reasoning_effort": "medium",
+        },
+    )
+    assert response.status_code == 400
+    assert "unknown model route" in response.json()["detail"]
+
+
 def test_migration_adds_provider_override_column(conn):
     cols = {row["name"] for row in conn.execute("PRAGMA table_info(tasks)")}
     assert "model_override" in cols
@@ -230,19 +244,31 @@ def test_reasoning_effort_normalizes_and_rejects(conn):
         kb.set_reasoning_effort(conn, tid, "extremely-hard")
 
 
-def test_reasoning_effort_survives_clearing_the_model(conn):
+def test_reasoning_effort_survives_clearing_the_model(conn, kanban_home):
     """Depth and model are independent knobs: dropping a model override must
     not silently reset the thinking depth the operator chose."""
+    profile = kanban_home / "profiles" / "worker"
+    profile.mkdir(parents=True)
+    (profile / "config.yaml").write_text(
+        "model:\n  provider: openai-codex\n  default: gpt-5.6-sol\n"
+        "agent:\n  reasoning_effort: medium\n",
+        encoding="utf-8",
+    )
     tid = kb.create_task(
         conn, title="t", assignee="worker",
-        model_override="glm-5", provider_override="openrouter",
-        reasoning_effort="ultra",
+        model_override="gpt-5.6-sol", provider_override="openai-codex",
+        reasoning_effort="high", policy_force=True,
+        policy_force_reason="hard diagnosis", policy_forced_by="operator",
     )
-    assert kb.set_model_override(conn, tid, None)
-    t = kb.get_task(conn, tid)
-    assert t.model_override is None
-    assert t.provider_override is None
-    assert t.reasoning_effort == "ultra"
+    assert kb.set_model_override(
+        conn, tid, None, policy_force=True,
+        policy_force_reason="continue hard diagnosis", policy_forced_by="operator",
+    )
+    task = kb.get_task(conn, tid)
+    assert task is not None
+    assert task.model_override is None
+    assert task.provider_override is None
+    assert task.reasoning_effort == "high"
 
 
 def test_reasoning_effort_without_a_model_override(conn):
@@ -303,6 +329,33 @@ def test_patch_rejects_an_unknown_level(client):
         json={"reasoning_effort": "bogus"},
     )
     assert r.status_code == 400
+
+
+def test_dashboard_policy_force_is_durable(client, kanban_home):
+    profile = kanban_home / "profiles" / "worker"
+    profile.mkdir(parents=True, exist_ok=True)
+    (profile / "config.yaml").write_text(
+        "model:\n  provider: openai-codex\n  default: gpt-5.6-sol\n"
+        "agent:\n  reasoning_effort: medium\n",
+        encoding="utf-8",
+    )
+    task = _create(client)
+    denied = client.patch(
+        f"/api/plugins/kanban/tasks/{task['id']}",
+        json={"model_override": "gpt-6-astra", "provider_override": "openai-codex"},
+    )
+    assert denied.status_code == 400
+    forced = client.patch(
+        f"/api/plugins/kanban/tasks/{task['id']}",
+        json={
+            "model_override": "gpt-6-astra", "provider_override": "openai-codex",
+            "policy_force": True, "policy_force_reason": "incident response",
+            "policy_forced_by": "spoofed-client-profile",
+        },
+    )
+    assert forced.status_code == 200, forced.text
+    assert forced.json()["task"]["policy_force_reason"] == "incident response"
+    assert forced.json()["task"]["policy_forced_by"] == "default"
 
 
 def test_create_accepts_reasoning_effort(client):

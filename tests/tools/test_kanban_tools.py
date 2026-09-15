@@ -74,11 +74,19 @@ def test_show_defaults_to_env_task_id(worker_env):
     from tools import kanban_tools as kt
     out = kt._handle_show({})
     d = json.loads(out)
-    assert "task" in d
-    assert d["task"]["id"] == worker_env
-    assert d["task"]["status"] == "running"
-    assert "worker_context" in d
-    assert "runs" in d
+    assert set(d) == {"packet"}
+    assert d["packet"]["identity"]["task_id"] == worker_env
+    assert d["packet"]["identity"]["state"] == "running"
+    assert d["packet"]["identity"]["role"] == "implementer"
+
+
+def test_show_schema_exposes_bounded_history_cursor_without_task_data(worker_env):
+    from tools.kanban_tools_schemas import KANBAN_SHOW_SCHEMA
+
+    properties = KANBAN_SHOW_SCHEMA["parameters"]["properties"]
+    assert properties["history_cursor"]["type"] == "string"
+    assert properties["history_limit"]["type"] == "integer"
+    assert worker_env not in json.dumps(KANBAN_SHOW_SCHEMA)
 
 
 def test_list_filters_tasks(monkeypatch, worker_env):
@@ -259,8 +267,12 @@ def test_complete_goal_mode_rejected_by_judge(monkeypatch, tmp_path):
     try:
         goal_task_id = kb.create_task(
             conn, title="goal-mode-test", assignee="test-worker",
-            body="Must achieve X with verified evidence.", goal_mode=True
+            body="Must achieve X with verified evidence."
         )
+        # Legacy/imported rows can still carry the retired bit; lifecycle
+        # safeguards remain covered even though new mutations reject it.
+        conn.execute("UPDATE tasks SET goal_mode = 1 WHERE id = ?", (goal_task_id,))
+        conn.commit()
         kb.claim_task(conn, goal_task_id)
     finally:
         conn.close()
@@ -357,8 +369,10 @@ def _make_goal_mode_worker_env(monkeypatch, tmp_path):
     try:
         goal_task_id = kb.create_task(
             conn, title="goal-mode-block-test", assignee="test-worker",
-            body="Must achieve X.", goal_mode=True,
+            body="Must achieve X.",
         )
+        conn.execute("UPDATE tasks SET goal_mode = 1 WHERE id = ?", (goal_task_id,))
+        conn.commit()
         kb.claim_task(conn, goal_task_id)
     finally:
         conn.close()
@@ -614,7 +628,7 @@ def test_worker_lifecycle_through_tools(worker_env):
 
     # 1. show — worker orientation
     show = json.loads(kt._handle_show({}))
-    assert show["task"]["id"] == worker_env
+    assert show["packet"]["identity"]["task_id"] == worker_env
 
     # 2. heartbeat during long op
     assert json.loads(kt._handle_heartbeat({"note": "warming up"}))["ok"]
@@ -908,16 +922,54 @@ def test_board_param_none_falls_back_to_env(worker_env):
 
     out = kt._handle_show({})  # no board, no task_id
     d = json.loads(out)
-    assert d["task"]["id"] == worker_env
+    assert d["packet"]["identity"]["task_id"] == worker_env
 
     out = kt._handle_show({"task_id": worker_env, "board": None})
     d = json.loads(out)
-    assert d["task"]["id"] == worker_env
+    assert d["packet"]["identity"]["task_id"] == worker_env
 
     # Sanity: the env-resolved path is the legacy default DB, NOT an
     # 'alt' board path. Confirms the override path was not silently
     # forced.
     assert kb.kanban_db_path() == kb.kanban_db_path(board="default")
+
+
+def test_show_packet_metadata_follows_env_db_pin_precedence(monkeypatch, tmp_path):
+    """The packet and connection resolve the same board when no argument is given."""
+    from pathlib import Path as _Path
+    from hermes_cli import kanban_db as kb
+    from hermes_cli import kanban_db_connect as kbc
+    from tools import kanban_tools  # noqa: F401 -- register the production handler
+    from tools.registry import registry
+
+    home = tmp_path / ".hermes"
+    home.mkdir()
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    monkeypatch.setenv("HERMES_KANBAN_HOME", str(home))
+    monkeypatch.setattr(_Path, "home", lambda: tmp_path)
+    for name in ("HERMES_KANBAN_DB", "HERMES_KANBAN_BOARD", "HERMES_KANBAN_TASK"):
+        monkeypatch.delenv(name, raising=False)
+    kb._INITIALIZED_PATHS.clear()
+
+    kb.write_board_metadata("named", land_target="origin/dev")
+    kb.write_board_metadata("decoy", land_target="upstream/main")
+    conn = kbc.connect(board="named")
+    try:
+        task_id = kb.create_task(conn, title="named-board packet", workspace_kind="scratch")
+    finally:
+        conn.close()
+
+    # The DB path pin outranks the conflicting board slug for omitted-board calls.
+    monkeypatch.setenv("HERMES_KANBAN_BOARD", "decoy")
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(kb.kanban_db_path(board="named")))
+    monkeypatch.setenv("HERMES_KANBAN_TASK", task_id)
+
+    entry = registry.get_entry("kanban_show")
+    assert entry is not None
+    packet = json.loads(entry.handler({}))["packet"]
+
+    assert packet["authority"]["land_target"] == "origin/dev"
+    assert packet["workspace"]["base_ref"] == "origin/dev"
 
 
 # ---------------------------------------------------------------------------
@@ -1796,3 +1848,27 @@ def test_request_review_refusal_states_the_status_the_card_is_actually_in(
     with kbc.connect_closing() as conn:
         assert kb.get_task(conn, tid).status == "ready"
     assert len([e for e in _events(tid) if e.kind == "review_preflight_conflict"]) == 1
+
+
+def test_create_model_policy_force_surface(worker_env):
+    from hermes_cli import kanban_db as kb
+    from tools import kanban_tools as kt
+
+    profile = kb.kanban_home() / "profiles" / "peer"
+    profile.mkdir(parents=True, exist_ok=True)
+    (profile / "config.yaml").write_text(
+        "model:\n  provider: openai-codex\n  default: gpt-5.6-sol\n"
+        "agent:\n  reasoning_effort: medium\n",
+        encoding="utf-8",
+    )
+    denied = json.loads(kt._handle_create({
+        "title": "denied child", "assignee": "peer", "model": "gpt-6-astra",
+        "provider": "openai-codex", "reasoning_effort": "medium",
+    }))
+    assert "operator force" in denied["error"]
+    forced = json.loads(kt._handle_create({
+        "title": "forced child", "assignee": "peer", "model": "gpt-6-astra",
+        "provider": "openai-codex", "reasoning_effort": "medium",
+        "policy_force": True, "policy_force_reason": "incident response",
+    }))
+    assert "cannot grant operator" in forced["error"]

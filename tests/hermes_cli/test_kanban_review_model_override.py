@@ -34,6 +34,14 @@ def kanban_home(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
     home.mkdir()
     monkeypatch.setenv("HERMES_HOME", str(home))
     monkeypatch.setattr(Path, "home", lambda: tmp_path)
+    profile_config = (
+        "model:\n  provider: openai-codex\n  default: gpt-5.6-terra\n"
+        "agent:\n  reasoning_effort: medium\n"
+    )
+    for name in ("claudeprimary", "codexreview"):
+        profile_dir = home / "profiles" / name
+        profile_dir.mkdir(parents=True)
+        profile_dir.joinpath("config.yaml").write_text(profile_config, encoding="utf-8")
     kb.init_db()
     return home
 
@@ -75,14 +83,17 @@ def test_cross_profile_review_does_not_inherit_implementer_model(
     with kbc.connect() as conn:
         tid = kb.create_task(
             conn, title="impl", assignee="claudeprimary",
-            model_override="claude-opus-5", provider_override="anthropic",
+            model_override="gpt-5.6-terra", provider_override="openai-codex",
             reasoning_effort="medium",
         )
         claimed = kb.claim_task(conn, tid)
-        assert kb.request_review(
+        review_result = kb.request_review(
             conn, tid, summary="done", reviewer="codexreview",
-            expected_run_id=claimed.current_run_id,
-        ) is True
+            expected_run_id=claimed.current_run_id, with_reason=True,
+        )
+        assert isinstance(review_result, tuple)
+        ok, review_reason = review_result
+        assert ok is True, review_reason
 
         t = kb.get_task(conn, tid)
         assert t.status == "review"
@@ -115,7 +126,7 @@ def test_request_changes_restores_implementer_override(
     with kbc.connect() as conn:
         tid = kb.create_task(
             conn, title="impl", assignee="claudeprimary",
-            model_override="claude-opus-5", provider_override="anthropic",
+            model_override="gpt-5.6-terra", provider_override="openai-codex",
             reasoning_effort="medium",
         )
         claimed = kb.claim_task(conn, tid)
@@ -135,8 +146,8 @@ def test_request_changes_restores_implementer_override(
 
         t = kb.get_task(conn, tid)
         assert t.assignee == "claudeprimary"
-        assert t.model_override == "claude-opus-5", "implementer's pin must be restored"
-        assert t.provider_override == "anthropic"
+        assert t.model_override == "gpt-5.6-terra", "implementer's pin must be restored"
+        assert t.provider_override == "openai-codex"
         assert t.reasoning_effort == "medium"
 
         # And the restored pin actually reaches the worker argv on reclaim.
@@ -144,8 +155,8 @@ def test_request_changes_restores_implementer_override(
         assert reclaimed is not None
         cmd = _spawn_and_capture(monkeypatch, tmp_path, reclaimed)
         model, provider = _model_flags(cmd)
-        assert model == "claude-opus-5"
-        assert provider == "anthropic"
+        assert model == "gpt-5.6-terra"
+        assert provider == "openai-codex"
 
 
 # ---------------------------------------------------------------------------
@@ -159,7 +170,7 @@ def test_rereview_after_changes_requested_still_works(
     with kbc.connect() as conn:
         tid = kb.create_task(
             conn, title="impl", assignee="claudeprimary",
-            model_override="claude-opus-5", provider_override="anthropic",
+            model_override="gpt-5.6-terra", provider_override="openai-codex",
         )
         claimed = kb.claim_task(conn, tid)
         assert kb.request_review(
@@ -175,7 +186,7 @@ def test_rereview_after_changes_requested_still_works(
         # reviewer= (relies on _prior_reviewer provenance).
         retry = kb.claim_task(conn, tid, claimer="claudeprimary:retry2")
         assert retry is not None
-        assert retry.model_override == "claude-opus-5"
+        assert retry.model_override == "gpt-5.6-terra"
         ok, reason = kb.request_review(
             conn, tid, summary="v2", expected_run_id=retry.current_run_id,
             with_reason=True,
@@ -201,8 +212,8 @@ def test_rereview_after_changes_requested_still_works(
         assert ok2 is True
         assert implementer2 == "claudeprimary"
         t2 = kb.get_task(conn, tid)
-        assert t2.model_override == "claude-opus-5"
-        assert t2.provider_override == "anthropic"
+        assert t2.model_override == "gpt-5.6-terra"
+        assert t2.provider_override == "openai-codex"
 
 
 # ---------------------------------------------------------------------------
@@ -237,7 +248,7 @@ def test_reopen_legacy_review_without_review_requested_preserves_assignee_and_pi
     with kbc.connect() as conn:
         tid = kb.create_task(
             conn, title="legacy review", assignee="builder",
-            model_override="gpt-5.6", provider_override="openai-codex", reasoning_effort="medium",
+            model_override="gpt-5.6-terra", provider_override="openai-codex", reasoning_effort="medium",
         )
         with kb.write_txn(conn):
             conn.execute("UPDATE tasks SET status = 'review' WHERE id = ?", (tid,))
@@ -247,7 +258,7 @@ def test_reopen_legacy_review_without_review_requested_preserves_assignee_and_pi
         assert task is not None
         assert task.status == "ready"
         assert task.assignee == "builder"
-        assert task.model_override == "gpt-5.6"
+        assert task.model_override == "gpt-5.6-terra"
         assert task.provider_override == "openai-codex"
         assert task.reasoning_effort == "medium"
 
@@ -263,8 +274,8 @@ def test_same_profile_review_keeps_override(
     with kbc.connect() as conn:
         tid = kb.create_task(
             conn, title="impl", assignee="claudeprimary",
-            model_override="claude-opus-5", provider_override="anthropic",
-            reasoning_effort="ultra",
+            model_override="gpt-5.6-terra", provider_override="openai-codex",
+            reasoning_effort="medium",
         )
         claimed = kb.claim_task(conn, tid)
         # Explicit self-review: reviewer == implementer.
@@ -274,17 +285,17 @@ def test_same_profile_review_keeps_override(
         ) is True
         t = kb.get_task(conn, tid)
         assert t.assignee == "claudeprimary"
-        assert t.model_override == "claude-opus-5"
-        assert t.provider_override == "anthropic"
-        assert t.reasoning_effort == "ultra"
+        assert t.model_override == "gpt-5.6-terra"
+        assert t.provider_override == "openai-codex"
+        assert t.reasoning_effort == "medium"
 
         review_run = kb.claim_review_task(conn, tid)
-        assert review_run.model_override == "claude-opus-5"
-        assert review_run.reasoning_effort == "ultra"
+        assert review_run.model_override == "gpt-5.6-terra"
+        assert review_run.reasoning_effort == "medium"
         cmd = _spawn_and_capture(monkeypatch, tmp_path, review_run)
         model, provider = _model_flags(cmd)
-        assert model == "claude-opus-5"
-        assert provider == "anthropic"
+        assert model == "gpt-5.6-terra"
+        assert provider == "openai-codex"
 
 
 def test_review_with_no_reviewer_reassignment_keeps_override(kanban_home: Path) -> None:
@@ -293,7 +304,7 @@ def test_review_with_no_reviewer_reassignment_keeps_override(kanban_home: Path) 
     with kbc.connect() as conn:
         tid = kb.create_task(
             conn, title="impl", assignee="claudeprimary",
-            model_override="claude-opus-5", provider_override="anthropic",
+            model_override="gpt-5.6-terra", provider_override="openai-codex",
         )
         claimed = kb.claim_task(conn, tid)
         assert kb.request_review(
@@ -301,8 +312,8 @@ def test_review_with_no_reviewer_reassignment_keeps_override(kanban_home: Path) 
         ) is True
         t = kb.get_task(conn, tid)
         assert t.assignee == "claudeprimary"
-        assert t.model_override == "claude-opus-5"
-        assert t.provider_override == "anthropic"
+        assert t.model_override == "gpt-5.6-terra"
+        assert t.provider_override == "openai-codex"
 
 
 # ---------------------------------------------------------------------------
@@ -316,7 +327,7 @@ def test_explicit_reviewer_override_wins(
     with kbc.connect() as conn:
         tid = kb.create_task(
             conn, title="impl", assignee="claudeprimary",
-            model_override="claude-opus-5", provider_override="anthropic",
+            model_override="gpt-5.6-terra", provider_override="openai-codex",
         )
         claimed = kb.claim_task(conn, tid)
         assert kb.request_review(
@@ -343,5 +354,5 @@ def test_explicit_reviewer_override_wins(
         assert ok is True
         assert implementer == "claudeprimary"
         t2 = kb.get_task(conn, tid)
-        assert t2.model_override == "claude-opus-5"
-        assert t2.provider_override == "anthropic"
+        assert t2.model_override == "gpt-5.6-terra"
+        assert t2.provider_override == "openai-codex"

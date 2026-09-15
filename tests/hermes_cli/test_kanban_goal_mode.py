@@ -143,9 +143,14 @@ def test_claimed_goal_worker_continues_before_clean_exit_finalization(
             title="finish the claimed goal",
             body="Continue once, then complete the task.",
             assignee="worker",
-            goal_mode=True,
-            goal_max_turns=3,
         )
+        # New mutations reject goal mode; retain coverage for imported/legacy
+        # rows that still carry the retired columns.
+        conn.execute(
+            "UPDATE tasks SET goal_mode = 1, goal_max_turns = 3 WHERE id = ?",
+            (task_id,),
+        )
+        conn.commit()
         claimed = kb.claim_task(conn, task_id)
         assert claimed is not None and claimed.current_run_id is not None
         run_id = claimed.current_run_id

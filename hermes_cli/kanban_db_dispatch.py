@@ -21,6 +21,7 @@ import time
 import uuid
 from dataclasses import dataclass
 from dataclasses import field
+from dataclasses import replace
 from pathlib import Path
 from typing import Any
 from typing import Callable
@@ -251,6 +252,9 @@ class DispatchResult:
     claim, so no worker is spawned, no start-budget slot is consumed and no
     retry is counted. The card is blocked once (``capability``) and waits for a
     human to install the skill or drop it from the card."""
+    model_policy_blocked: list[tuple[str, str]] = field(default_factory=list)
+    """``(task_id, reason)`` refused before claim/spawn because the resolved
+    provider/model/effort route violates the unattended-worker policy."""
     crashed: list[str] = field(default_factory=list)
     """Task ids reclaimed because their worker PID disappeared."""
     auto_blocked: list[str] = field(default_factory=list)
@@ -3042,6 +3046,23 @@ def _dispatch_lane_task(
     if profile_exists is not None and not profile_exists(assignee):
         result.skipped_nonspawnable.append(task_id)
         return False
+    # Resolve named/card/profile routing before claiming: policy failures are
+    # configuration errors, not paid worker failures, and must not consume the
+    # retry breaker or dispatch start budget. Re-run after the real claim below
+    # as a defence against stale/imported rows and route-resolution drift.
+    policy_task = _kb.get_task(conn, task_id)
+    if policy_task is not None:
+        try:
+            _prepare_worker_launch(policy_task)
+            _validate_prepared_model_policy(
+                policy_task, board=board, review_lane=(lane == "review"),
+            )
+        except ValueError as exc:
+            reason = str(exc)
+            result.model_policy_blocked.append((task_id, reason))
+            if not dry_run:
+                _kb.block_task(conn, task_id, reason=reason, kind="needs_input")
+            return False
     # Per-profile cap: one profile's local model / API quota / browser pool
     # must not be overwhelmed by a fan-out even with global headroom.
     if per_profile_cap is not None:
@@ -3130,6 +3151,9 @@ def _dispatch_lane_task(
         # compatible custom spawn function. This closes the race where a very
         # fast worker finalizes its run before the parent records its PID.
         _prepare_worker_launch(claimed)
+        _validate_prepared_model_policy(
+            claimed, board=board, review_lane=(lane == "review"),
+        )
         _stamp_worker_run_launch(conn, claimed)
         pid = _call_spawn_fn(spawn_fn if spawn_fn is not None else _default_spawn, claimed, str(workspace), board)
         if pid:
@@ -3226,11 +3250,25 @@ def _apply_default_assignee(
         return True
     try:
         with _kb.write_txn(conn):
-            conn.execute(
-                "UPDATE tasks SET assignee = ? WHERE id = ? "
+            current_task = _kb.get_task(conn, task_id)
+            if current_task is None:
+                return False
+            candidate = replace(
+                current_task,
+                assignee=assignee,
+                policy_forced_by=None,
+                policy_force_reason=None,
+                policy_force_route=None,
+            )
+            _kb.validate_task_model_policy(candidate, allow_legacy_unconfigured=True)
+            cur = conn.execute(
+                "UPDATE tasks SET assignee = ?, policy_forced_by = NULL, "
+                "policy_force_reason = NULL, policy_force_route = NULL WHERE id = ? "
                 "AND (assignee IS NULL OR assignee = '')",
                 (assignee, task_id),
             )
+            if cur.rowcount != 1:
+                return False
             _kb._append_event(
                 conn, task_id, "assigned",
                 {"assignee": assignee, "source": "kanban.default_assignee"},
@@ -3396,17 +3434,40 @@ def _apply_rework_escalation(
             ).fetchone()
             if row is None:
                 return False
-            preserve = _model_override_is_operator_set(conn, task_id)
+            current_task = _kb.get_task(conn, task_id)
+            preserve = _model_override_is_operator_set(conn, task_id) and not (
+                current_task
+                and (
+                    current_task.policy_forced_by
+                    or current_task.policy_force_reason
+                    or current_task.policy_force_route
+                )
+            )
+            if current_task is not None:
+                candidate = replace(
+                    current_task,
+                    assignee=escalation_profile,
+                    model_override=(current_task.model_override if preserve else None),
+                    provider_override=(current_task.provider_override if preserve else None),
+                    reasoning_effort=(current_task.reasoning_effort if preserve else None),
+                    policy_forced_by=None, policy_force_reason=None, policy_force_route=None,
+                )
+                _kb.validate_task_model_policy(
+                    candidate, allow_legacy_unconfigured=True,
+                )
             if preserve:
                 cur = conn.execute(
-                    "UPDATE tasks SET assignee = ? "
+                    "UPDATE tasks SET assignee = ?, policy_forced_by = NULL, "
+                    "policy_force_reason = NULL, policy_force_route = NULL "
                     "WHERE id = ? AND status = 'ready' AND assignee = ?",
                     (escalation_profile, task_id, previous_assignee),
                 )
             else:
                 cur = conn.execute(
                     "UPDATE tasks SET assignee = ?, model_override = NULL, "
-                    "provider_override = NULL, reasoning_effort = NULL "
+                    "provider_override = NULL, reasoning_effort = NULL, "
+                    "policy_forced_by = NULL, policy_force_reason = NULL, "
+                    "policy_force_route = NULL "
                     "WHERE id = ? AND status = 'ready' AND assignee = ?",
                     (escalation_profile, task_id, previous_assignee),
                 )
@@ -3502,17 +3563,36 @@ def _apply_default_reviewer(
     try:
         with _kb.write_txn(conn):
             row = conn.execute(
-                "SELECT model_override, provider_override, reasoning_effort FROM tasks WHERE id = ?",
+                "SELECT model_override, provider_override, reasoning_effort, policy_forced_by, "
+                "policy_force_reason, policy_force_route FROM tasks WHERE id = ?",
                 (task_id,),
             ).fetchone()
             if row is None:
                 return False
+            current_task = _kb.get_task(conn, task_id)
+            if current_task is None:
+                return False
+            candidate = replace(
+                current_task,
+                assignee=reviewer,
+                model_override=None,
+                provider_override=None,
+                reasoning_effort=None,
+                policy_forced_by=None,
+                policy_force_reason=None,
+                policy_force_route=None,
+            )
+            _kb.validate_review_task_model_policy(
+                candidate, allow_legacy_unconfigured=True,
+            )
             implementer_model_override = row["model_override"]
             implementer_provider_override = row["provider_override"]
             implementer_reasoning_effort = row["reasoning_effort"]
             cur = conn.execute(
                 "UPDATE tasks SET assignee = ?, model_override = NULL, provider_override = NULL, "
-                "reasoning_effort = NULL WHERE id = ? AND status = 'review'",
+                "reasoning_effort = NULL, policy_forced_by = NULL, "
+                "policy_force_reason = NULL, policy_force_route = NULL "
+                "WHERE id = ? AND status = 'review'",
                 (reviewer, task_id),
             )
             if cur.rowcount != 1:
@@ -3530,6 +3610,10 @@ def _apply_default_reviewer(
                 payload["implementer_provider_override"] = implementer_provider_override
             if implementer_reasoning_effort is not None:
                 payload["implementer_reasoning_effort"] = implementer_reasoning_effort
+            if row["policy_forced_by"] or row["policy_force_reason"] or row["policy_force_route"]:
+                payload["implementer_policy_forced_by"] = row["policy_forced_by"]
+                payload["implementer_policy_force_reason"] = row["policy_force_reason"]
+                payload["implementer_policy_force_route"] = row["policy_force_route"]
             _kb._append_event(conn, task_id, "assigned", payload)
     except Exception:
         _kb._log.debug(
@@ -4416,6 +4500,45 @@ def _prepare_worker_launch(task: Task, hermes_home: Optional[str] = None) -> Non
         setattr(task, "_worker_run_analytics", _resolve_worker_run_analytics(task, hermes_home))
 
 
+def _validate_prepared_model_policy(
+    task: Task, *, board: Optional[str], review_lane: bool = False,
+) -> None:
+    """Validate the exact route prepared for worker argv/run accounting."""
+    if task.goal_mode:
+        raise ValueError("goal_mode is disabled by the unattended Kanban policy")
+    if (
+        not _kb._profile_config_exists(task.assignee)
+        and not (task.model_override or task.provider_override or task.reasoning_effort)
+    ):
+        # A legacy profile with neither config nor explicit route has no route
+        # for this layer to judge. Any explicit pin still fails closed below.
+        return
+    analytics = dict(getattr(task, "_worker_run_analytics", {}) or {})
+    has_force = bool(
+        task.policy_forced_by or task.policy_force_reason or task.policy_force_route
+    )
+    decision = _kb.validate_model_effort_policy(
+        provider=analytics.get("provider"), model=analytics.get("model"),
+        reasoning_effort=analytics.get("reasoning_effort"), assignee=task.assignee,
+        policy=_kb._effective_model_policy(task.assignee, board), force=has_force,
+        force_reason=task.policy_force_reason, forced_by=task.policy_forced_by,
+    )
+    if has_force and decision.force_route != task.policy_force_route:
+        raise ValueError(
+            "stored model policy force does not match the prepared assignee/route; "
+            "re-approve with force plus a durable reason"
+        )
+    if (
+        review_lane
+        and str(analytics.get("model") or "").strip().casefold() == "gpt-5.6-luna"
+        and not has_force
+    ):
+        raise ValueError(
+            "Kanban model policy refuses mechanical-only Luna for review work; "
+            "use Sol/medium or provide operator force plus a durable reason"
+        )
+
+
 def _stamp_worker_run_launch(conn: sqlite3.Connection, task: Task) -> None:
     """Persist launch identity before Popen so a fast worker cannot outrun it."""
     run_id = task.current_run_id or _kb._current_run_id(conn, task.id)
@@ -4501,7 +4624,13 @@ def _retag_legacy_worker_sessions(workspaces_root_path: str) -> None:
 
 
 def _worker_argv(task: Task, profile_arg: str, hermes_home: Optional[str]) -> list[str]:
-    """Build the ``hermes -p <profile> --cli ... chat -q ...`` worker command."""
+    """Build the worker command with an id-only, cache-safe startup query.
+
+    Dynamic task/body/history data is returned once by ``kanban_show`` as the
+    canonical worker packet.  Keeping it out of argv avoids a second operative
+    serialization and leaves the system/message prefix and role alternation
+    unchanged.
+    """
     cmd = [
         *_resolve_hermes_argv(),
         "-p", profile_arg,

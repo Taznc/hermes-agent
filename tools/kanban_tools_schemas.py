@@ -43,15 +43,24 @@ def _schema(name: str, description: str, properties: dict[str, Any], required: l
 KANBAN_SHOW_SCHEMA = _schema(
     "kanban_show",
     (
-        "Read a task's full state — title, body, assignee, parent task "
-        "handoffs, your prior attempts on this task if any, comments, "
-        "and recent events. Use this to (re)orient yourself before "
-        "starting work, especially on retries. The response includes a "
-        "pre-formatted ``worker_context`` string suitable for inclusion "
-        "verbatim in your reasoning."
+        "Read one canonical bounded task packet for worker orientation. "
+        "The packet retains the complete operative body/acceptance criteria, "
+        "latest handoffs, dependency summaries, review contract, caps, and "
+        "workspace/landing authority without also duplicating raw task and "
+        "history objects. When its history section provides a retrieval "
+        "cursor, call this tool again with that cursor to read full-fidelity "
+        "history pages without repeating the packet."
     ),
     {
         "task_id": _prop("string", _DESC_TASK_ID_DEFAULT),
+        "history_cursor": _prop(
+            "string",
+            "Opaque cursor from packet.history.retrieval or a prior history_page.next_cursor.",
+        ),
+        "history_limit": _prop(
+            "integer",
+            "History rows to return with a cursor (default 20, maximum 50).",
+        ),
     },
     [],
 )

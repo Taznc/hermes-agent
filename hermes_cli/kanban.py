@@ -361,6 +361,8 @@ def _cmd_create(args: argparse.Namespace) -> int:
     if lane and getattr(args, "initial_status", "running") != "running":
         return _err(f"kanban: --{lane} and --initial-status are mutually exclusive", 2)
     from agent.delegation_context import is_dispatcher_owned_worker_context
+    if getattr(args, "policy_force", False) and is_dispatcher_owned_worker_context():
+        return _err("kanban: worker contexts cannot grant operator model-policy exceptions", 2)
 
     try:
         ws_kind, ws_path = _parse_workspace_flag(args.workspace)
@@ -415,6 +417,9 @@ def _cmd_create(args: argparse.Namespace) -> int:
                     initial_status=getattr(args, "initial_status", "running"),
                     creator_task_id=(os.environ.get("HERMES_KANBAN_TASK")
                                      if is_dispatcher_owned_worker_context() else None),
+                    policy_force=bool(getattr(args, "policy_force", False)),
+                    policy_force_reason=getattr(args, "policy_force_reason", None),
+                    policy_forced_by=(_profile_author() if getattr(args, "policy_force", False) else None),
                     lane=lane,
                 )
             except ValueError as exc:  # forced-skill preflight against the assignee
@@ -687,9 +692,12 @@ def _cmd_assign(args: argparse.Namespace) -> int:
 
 
 def _cmd_set_model(args: argparse.Namespace) -> int:
-    """Set/clear a task's model+provider override and/or reasoning effort. The two are independent
-    (``kb.set_model_override`` / ``kb.set_reasoning_effort``): only the override(s) named on the
-    command line are touched — a ``--reasoning``-only call must not clear a model override."""
+    """Set/clear a task model/provider override and/or reasoning effort."""
+    from agent.delegation_context import is_dispatcher_owned_worker_context
+    if getattr(args, "policy_force", False) and is_dispatcher_owned_worker_context():
+        return _err("kanban: worker contexts cannot grant operator model-policy exceptions", 2)
+    # Only the override(s) named on the command line are touched; a
+    # ``--reasoning``-only call must not clear a model override.
     model = args.model
     provider = getattr(args, "provider", None)
     reasoning_arg = getattr(args, "reasoning_effort", None)
@@ -698,19 +706,41 @@ def _cmd_set_model(args: argparse.Namespace) -> int:
         return _err("kanban: set-model requires a model (or 'none' to clear) and/or --reasoning <level>", 2)
     if model is not None and model.lower() in {"none", "-", "null", ""}:
         model = None
+    effort = (
+        None if reasoning_arg is not None and reasoning_arg.strip().lower()
+        in {"clear", "default", "-", "null"} else reasoning_arg
+    )
     messages: list[str] = []
     try:
         with kbc.connect_closing() as conn:
-            if touch_model:
-                if not kb.set_model_override(conn, args.task_id, model, provider=provider):
+            force = bool(getattr(args, "policy_force", False))
+            force_reason = getattr(args, "policy_force_reason", None)
+            forced_by = _profile_author() if force else None
+            if touch_model and reasoning_arg is not None:
+                if not kb.set_route_overrides(
+                    conn, args.task_id, model=model, provider=provider,
+                    reasoning_effort=effort, policy_force=force,
+                    policy_force_reason=force_reason, policy_forced_by=forced_by,
+                ):
                     return _err(f"no such task: {args.task_id}")
                 messages.append(f"model override: {f'{provider}:{model}' if provider else model}" if model
                                 else "model override cleared (profile default)")
-            if reasoning_arg is not None:
-                # "none" is a REAL reasoning_effort value (thinking off), distinct from clearing back
-                # to the profile's own level — so the clear keywords are 'clear'/'default'.
-                effort = None if reasoning_arg.strip().lower() in {"clear", "default", "-", "null"} else reasoning_arg
-                if not kb.set_reasoning_effort(conn, args.task_id, effort):
+                messages.append(f"reasoning effort: {effort}" if effort else "reasoning effort cleared (profile default)")
+            elif touch_model:
+                if not kb.set_model_override(
+                    conn, args.task_id, model, provider=provider,
+                    policy_force=force, policy_force_reason=force_reason,
+                    policy_forced_by=forced_by,
+                ):
+                    return _err(f"no such task: {args.task_id}")
+                messages.append(f"model override: {f'{provider}:{model}' if provider else model}" if model
+                                else "model override cleared (profile default)")
+            elif reasoning_arg is not None:
+                if not kb.set_reasoning_effort(
+                    conn, args.task_id, effort,
+                    policy_force=force, policy_force_reason=force_reason,
+                    policy_forced_by=forced_by,
+                ):
                     return _err(f"no such task: {args.task_id}")
                 messages.append(f"reasoning effort: {effort}" if effort else "reasoning effort cleared (profile default)")
     except (ValueError, RuntimeError) as exc:

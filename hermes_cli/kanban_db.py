@@ -27,7 +27,7 @@ import sys
 import logging
 import time
 from contextvars import ContextVar, Token
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any, Iterable, Optional
 
@@ -138,6 +138,166 @@ def normalize_reasoning_effort(effort: Optional[str]) -> Optional[str]:
         return value
     allowed = ", ".join(("none", *VALID_REASONING_EFFORTS))
     raise ValueError(f"reasoning_effort must be one of {allowed}, got {effort!r}")
+
+
+@dataclass(frozen=True)
+class ModelPolicyDecision:
+    forced: bool
+    force_reason: Optional[str] = None
+    force_route: Optional[str] = None
+
+
+_DEFAULT_UNATTENDED_ROUTES = frozenset({
+    ("openai-codex", "gpt-5.6-luna", "low"),
+    ("openai-codex", "gpt-5.6-terra", "medium"),
+    ("openai-codex", "gpt-5.6-sol", "medium"),
+})
+_OPERATOR_ONLY_EFFORTS = frozenset({"high", "xhigh", "max", "ultra"})
+_LUNA_INELIGIBLE_PROFILES = frozenset({"reviewer", "debugger"})
+
+
+def _configured_policy_routes(policy: Optional[dict]) -> set[tuple[str, str, str]]:
+    if not isinstance(policy, dict) or "allowed_routes" not in policy:
+        return set(_DEFAULT_UNATTENDED_ROUTES)
+    routes: set[tuple[str, str, str]] = set()
+    raw_routes = policy.get("allowed_routes", [])
+    if isinstance(raw_routes, list):
+        for raw in raw_routes:
+            if not isinstance(raw, dict):
+                continue
+            provider = str(raw.get("provider") or "").strip().casefold()
+            model = str(raw.get("model") or "").strip().casefold()
+            effort = str(raw.get("reasoning_effort") or "").strip().casefold()
+            if provider and model and effort:
+                routes.add((provider, model, effort))
+    unsupported = routes - _DEFAULT_UNATTENDED_ROUTES
+    if unsupported:
+        rendered = ", ".join("/".join(route) for route in sorted(unsupported))
+        raise ValueError(
+            "kanban.model_policy.allowed_routes may only restrict the built-in unattended "
+            f"allowlist; unsupported route(s): {rendered}"
+        )
+    return routes
+
+
+def _force_route_json(
+    *, provider: Optional[str], model: Optional[str], reasoning_effort: Optional[str],
+    assignee: Optional[str],
+) -> str:
+    return json.dumps(
+        {
+            "assignee": assignee,
+            "model": model,
+            "provider": provider,
+            "reasoning_effort": reasoning_effort,
+        },
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+
+
+def validate_model_effort_policy(
+    *, provider: Optional[str], model: Optional[str], reasoning_effort: Optional[str],
+    assignee: Optional[str], policy: Optional[dict] = None, force: bool = False,
+    force_reason: Optional[str] = None, forced_by: Optional[str] = None,
+) -> ModelPolicyDecision:
+    """Validate one fully-resolved unattended Kanban route.
+
+    Unknown routes fail closed. Board/profile configuration may restrict the
+    built-in triples through ``kanban.model_policy.allowed_routes``;
+    it never guesses cost from a model name. Operator exceptions are bound to
+    both the assignee and the exact route so a later handoff cannot inherit
+    the approval silently.
+    """
+    provider = str(provider or "").strip().casefold() or None
+    model = str(model or "").strip().casefold() or None
+    effort = normalize_reasoning_effort(reasoning_effort)
+    assignee = _canonical_assignee(assignee) if assignee else None
+    policy = policy if isinstance(policy, dict) else {}
+    if policy.get("_fallback_routes"):
+        raise ValueError(
+            "Kanban model policy forbids hidden fallback routes; clear "
+            f"fallback_providers/fallback_model for profile {assignee!r} before dispatch"
+        )
+    if provider == "moa" or (model and model.startswith("moa:")):
+        raise ValueError(
+            "Kanban model policy forbids MoA routes for unattended work; "
+            "select one approved provider/model/effort triple"
+        )
+    reason = str(force_reason or "").strip() or None
+    actor = _canonical_assignee(forced_by) if forced_by else None
+    if not force and (reason or actor):
+        raise ValueError("model policy force reason/profile require policy_force=True")
+    if not provider or not model or effort is None:
+        raise ValueError(
+            "Kanban model policy could not resolve provider/model/reasoning for the assignee; "
+            "configure the profile route or set an approved explicit route"
+        )
+    categorically_denied = (
+        "mini" in model
+        or "spark" in model
+        or model.endswith(":free")
+        or model.endswith("/free")
+    )
+    if categorically_denied:
+        raise ValueError(
+            f"Kanban model policy denies {provider}/{model}/{effort}; "
+            "mini, Spark, and free-tier models cannot be force-approved for unattended work"
+        )
+    allowed_models = {route[1] for route in _DEFAULT_UNATTENDED_ROUTES}
+    canonical_efforts = {
+        route_model: route_effort
+        for _route_provider, route_model, route_effort in _DEFAULT_UNATTENDED_ROUTES
+    }
+    astra_model = model.startswith("gpt-") and model.endswith("-astra")
+    forceable_model = provider == "openai-codex" and (
+        (
+            model in allowed_models
+            and (effort == canonical_efforts[model] or effort in _OPERATOR_ONLY_EFFORTS)
+        )
+        or astra_model
+    )
+    if force:
+        if not reason:
+            raise ValueError("model policy force requires a non-empty reason")
+        if not actor:
+            raise ValueError("model policy force requires the operator profile that approved it")
+        if not forceable_model:
+            raise ValueError(
+                f"Kanban model policy cannot force-approve unknown route {provider}/{model}/{effort}; "
+                "operator exceptions are limited to Astra, approved models with operator-only "
+                "effort, and profile-suitability overrides"
+            )
+        return ModelPolicyDecision(
+            True, reason,
+            _force_route_json(
+                provider=provider, model=model, reasoning_effort=effort, assignee=assignee,
+            ),
+        )
+    if "astra" in model or effort in _OPERATOR_ONLY_EFFORTS:
+        raise ValueError(
+            f"Kanban model policy denies unattended route {provider}/{model}/{effort}; "
+            "retry with operator force plus a durable non-empty reason"
+        )
+    if model == "gpt-5.6-luna" and assignee in _LUNA_INELIGIBLE_PROFILES:
+        raise ValueError(
+            f"Kanban model policy refuses mechanical-only Luna for {assignee!r}; "
+            "use Sol/medium for independent review or hard debugging, or provide "
+            "operator force plus a durable reason"
+        )
+    route = (provider, model, effort)
+    if route not in _configured_policy_routes(policy):
+        if model == "gpt-5.6-luna":
+            detail = "Luna is allowed only with low reasoning effort"
+        elif model in {"gpt-5.6-terra", "gpt-5.6-sol"}:
+            detail = f"{model.rsplit('-', 1)[-1].title()} is allowed only with medium reasoning effort"
+        else:
+            detail = (
+                "unknown model route (choose an approved exact route; "
+                "policy configuration may restrict but cannot expand the built-in set)"
+            )
+        raise ValueError(f"Kanban model policy refuses {provider}/{model}/{effort}: {detail}")
+    return ModelPolicyDecision(False)
 
 
 KNOWN_TOOLSET_NAMES = frozenset(name.casefold() for name in get_toolset_names())
@@ -729,6 +889,7 @@ def write_board_metadata(
     icon: Optional[str] = None, color: Optional[str] = None, archived: Optional[bool] = None,
     default_workdir: Optional[str] = None, project_id: Optional[str] = None,
     land_target: Optional[str] = None, land_verify: Optional[str] = None,
+    model_policy: Optional[dict] = None,
 ) -> dict:
     """Create/update ``board.json``; unmentioned fields are preserved, ``created_at``
     set on first write. ``project_id``/``default_workdir``/``land_target``/
@@ -761,6 +922,10 @@ def write_board_metadata(
         ):
             if value is not None:
                 meta[key] = str(value) if value else None
+        if model_policy is not None:
+            if not isinstance(model_policy, dict):
+                raise ValueError("model_policy must be an object")
+            meta["model_policy"] = model_policy
         if not meta.get("created_at"):
             meta["created_at"] = int(time.time())
         path = board_metadata_path(slug)
@@ -898,6 +1063,9 @@ class Task:
     reasoning_effort: Optional[str] = None   # VALID_REASONING_EFFORTS | "none"; NULL = profile's
     route_source: Optional[str] = None       # explicit | default | selected route name
     route_name: Optional[str] = None          # selected route id (if any)
+    policy_forced_by: Optional[str] = None
+    policy_force_reason: Optional[str] = None
+    policy_force_route: Optional[str] = None
     # Breaker trip count; None -> ``kanban.failure_limit`` -> DEFAULT_FAILURE_LIMIT.
     max_retries: Optional[int] = None
     # ``/goal``-style loop: a judge re-checks each turn IN THE SAME SESSION until
@@ -947,6 +1115,7 @@ _TASK_OPTIONAL_COLUMNS = (
     "max_runtime_seconds", "last_heartbeat_at", "current_run_id", "workflow_template_id",
     "current_step_key", "max_retries", "session_id", "route_source", "route_name",
     "completion_contract", "created_by_task", "created_by_run",
+    "policy_forced_by", "policy_force_reason", "policy_force_route",
 )
 # Text columns where "" is stored/read as "not set".
 _TASK_EMPTY_IS_NULL_COLUMNS = (
@@ -1174,6 +1343,11 @@ CREATE TABLE IF NOT EXISTS tasks (
     -- a named route. NULL = legacy boards / pre-feature rows.
     route_source         TEXT,
     route_name           TEXT,
+    -- Durable operator exception provenance. The route JSON includes the
+    -- assignee so approvals cannot transfer silently across handoffs.
+    policy_forced_by     TEXT,
+    policy_force_reason  TEXT,
+    policy_force_route   TEXT,
     -- Per-task override for the consecutive-failure circuit breaker.
     -- The value is the failure count at which the breaker trips — e.g.
     -- ``max_retries=1`` blocks on the first failure. NULL (the common
@@ -1960,6 +2134,156 @@ def _canonical_assignee(assignee: Optional[str]) -> Optional[str]:
     return normalize_profile_name(assignee)
 
 
+def _profile_route_and_policy(
+    assignee: Optional[str],
+) -> tuple[Optional[str], Optional[str], Optional[str], dict]:
+    if not assignee:
+        return None, None, None, {}
+    try:
+        from hermes_cli.config import read_user_config_raw
+        from hermes_cli.profiles import get_profile_dir
+
+        path = get_profile_dir(assignee) / "config.yaml"
+        raw = read_user_config_raw(path) if path.is_file() else {}
+    except Exception:
+        raw = {}
+    model_cfg = raw.get("model", {}) if isinstance(raw, dict) else {}
+    agent_cfg = raw.get("agent", {}) if isinstance(raw, dict) else {}
+    kanban_cfg = raw.get("kanban", {}) if isinstance(raw, dict) else {}
+    if isinstance(model_cfg, str):
+        model, provider = model_cfg, None
+    elif isinstance(model_cfg, dict):
+        model = model_cfg.get("default") or model_cfg.get("model")
+        provider = model_cfg.get("provider")
+    else:
+        model, provider = None, None
+    effort = agent_cfg.get("reasoning_effort") if isinstance(agent_cfg, dict) else None
+    policy = kanban_cfg.get("model_policy", {}) if isinstance(kanban_cfg, dict) else {}
+    policy = dict(policy) if isinstance(policy, dict) else {}
+    fallback_routes = (
+        raw.get("fallback_providers") or raw.get("fallback_model")
+        or (model_cfg.get("fallback_providers") if isinstance(model_cfg, dict) else None)
+        or (model_cfg.get("fallback_model") if isinstance(model_cfg, dict) else None)
+    )
+    if fallback_routes:
+        policy["_fallback_routes"] = fallback_routes
+    return model, provider, effort, policy
+
+
+def _profile_config_exists(assignee: Optional[str]) -> bool:
+    if not assignee:
+        return False
+    try:
+        from hermes_cli.profiles import get_profile_dir
+        return (get_profile_dir(assignee) / "config.yaml").is_file()
+    except Exception:
+        return False
+
+
+def _effective_model_policy(assignee: Optional[str], board: Optional[str]) -> dict:
+    """Profile policy with board metadata layered over it.
+
+    ``allowed_routes`` is restrictive: profile and board lists are intersected,
+    and neither can expand the built-in unattended allowlist.
+    """
+    _model, _provider, _effort, profile_policy = _profile_route_and_policy(assignee)
+    board_policy = _board_meta_for(board).get("model_policy", {})
+    if not isinstance(board_policy, dict):
+        board_policy = {}
+    merged = {**profile_policy, **board_policy}
+    restrictions = [
+        source.get("allowed_routes", [])
+        for source in (profile_policy, board_policy)
+        if "allowed_routes" in source
+    ]
+    if restrictions:
+        route_maps = []
+        for raw_routes in restrictions:
+            mapping = {
+                (
+                    str(route.get("provider") or "").strip().casefold(),
+                    str(route.get("model") or "").strip().casefold(),
+                    str(route.get("reasoning_effort") or "").strip().casefold(),
+                ): route
+                for route in raw_routes if isinstance(route, dict)
+            } if isinstance(raw_routes, list) else {}
+            route_maps.append(mapping)
+        allowed = set(route_maps[0])
+        for mapping in route_maps[1:]:
+            allowed &= set(mapping)
+        merged["allowed_routes"] = [route_maps[0][route] for route in sorted(allowed)]
+    else:
+        merged.pop("allowed_routes", None)
+    return merged
+
+
+def resolved_task_model_route(
+    task: Task, *, board: Optional[str] = None,
+) -> tuple[Optional[str], Optional[str], Optional[str]]:
+    profile_model, profile_provider, profile_effort, _policy = _profile_route_and_policy(task.assignee)
+    return (
+        task.provider_override or profile_provider,
+        task.model_override or profile_model,
+        task.reasoning_effort or profile_effort,
+    )
+
+
+def validate_task_model_policy(
+    task: Task, *, board: Optional[str] = None, allow_legacy_unconfigured: bool = False,
+) -> ModelPolicyDecision:
+    if task.goal_mode:
+        raise ValueError("goal_mode is disabled by the unattended Kanban policy")
+    provider, model, effort = resolved_task_model_route(task, board=board)
+    if (
+        allow_legacy_unconfigured
+        and not _profile_config_exists(task.assignee)
+        and not (
+            task.model_override or task.provider_override or task.reasoning_effort is not None
+            or task.policy_forced_by or task.policy_force_reason or task.policy_force_route
+        )
+    ):
+        return ModelPolicyDecision(False)
+    has_force = bool(task.policy_forced_by or task.policy_force_reason or task.policy_force_route)
+    decision = validate_model_effort_policy(
+        provider=provider,
+        model=model,
+        reasoning_effort=effort,
+        assignee=task.assignee,
+        policy=_effective_model_policy(task.assignee, board),
+        force=has_force,
+        force_reason=task.policy_force_reason,
+        forced_by=task.policy_forced_by,
+    )
+    if has_force and decision.force_route != task.policy_force_route:
+        raise ValueError(
+            "stored model policy force does not match the current assignee/route; "
+            "re-approve with force plus a durable reason"
+        )
+    return decision
+
+
+def validate_review_task_model_policy(
+    task: Task, *, board: Optional[str] = None, allow_legacy_unconfigured: bool = False,
+) -> ModelPolicyDecision:
+    """Validate a task specifically for independent review execution.
+
+    Review is never mechanical work, regardless of the reviewer's profile
+    name. A same-profile operator-forced route remains an explicit exception;
+    cross-profile handoffs clear force provenance before reaching this helper.
+    """
+    decision = validate_task_model_policy(
+        task, board=board, allow_legacy_unconfigured=allow_legacy_unconfigured,
+    )
+    _provider, model, _effort = resolved_task_model_route(task, board=board)
+    has_force = bool(task.policy_forced_by or task.policy_force_reason or task.policy_force_route)
+    if str(model or "").strip().casefold() == "gpt-5.6-luna" and not has_force:
+        raise ValueError(
+            "Kanban model policy refuses mechanical-only Luna for review work; "
+            "use Sol/medium or provide operator force plus a durable reason"
+        )
+    return decision
+
+
 def _resolve_project_link(
     conn: sqlite3.Connection, project_id: Optional[str], project_source_task_id: Optional[str],
     workspace_kind: str, workspace_path: Optional[str],
@@ -2103,6 +2427,8 @@ def create_task(
     completion_contract: Optional[str] = None,
     created_by_task: Optional[str] = None, created_by_run: Optional[int] = None,
     skill_preflight: bool = True,
+    policy_force: bool = False, policy_force_reason: Optional[str] = None,
+    policy_forced_by: Optional[str] = None,
 ) -> str:
     """Create a task (optionally under ``parents``); returns its id.
 
@@ -2135,6 +2461,24 @@ def create_task(
     model_override, provider_override = _validate_model_override(model_override, provider_override)
     reasoning_effort = normalize_reasoning_effort(reasoning_effort)
     assignee = _canonical_assignee(assignee)
+    if goal_mode or goal_max_turns is not None:
+        raise ValueError("goal_mode is disabled by the unattended Kanban policy; goal_max_turns is also disabled")
+    profile_model, profile_provider, profile_effort, _profile_policy = _profile_route_and_policy(assignee)
+    resolved_model = model_override or profile_model
+    resolved_provider = provider_override or profile_provider
+    resolved_effort = reasoning_effort or profile_effort
+    policy_decision = validate_model_effort_policy(
+        provider=resolved_provider, model=resolved_model, reasoning_effort=resolved_effort,
+        assignee=assignee, policy=_effective_model_policy(assignee, board),
+        force=policy_force, force_reason=policy_force_reason, forced_by=policy_forced_by,
+    ) if (
+        policy_force or policy_force_reason or policy_forced_by
+        or (
+            (_profile_config_exists(assignee) or model_override or provider_override
+             or reasoning_effort is not None)
+            and resolved_model and resolved_provider and resolved_effort is not None
+        )
+    ) else ModelPolicyDecision(False)
     if not title or not title.strip():
         raise ValueError("title is required")
     lane = _validate_lane(lane, triage=triage, initial_status=initial_status)
@@ -2227,9 +2571,10 @@ def create_task(
                         max_runtime_seconds,
                         skills, max_retries, model_override, provider_override,
                         reasoning_effort, route_source, route_name,
+                        policy_forced_by, policy_force_reason, policy_force_route,
                         goal_mode, goal_max_turns, session_id, completion_contract,
                         created_by_task, created_by_run
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         task_id, title.strip(), body, assignee, task_status, priority,
@@ -2239,6 +2584,8 @@ def create_task(
                         json.dumps(skills_list) if skills_list is not None else None,
                         _opt_int(max_retries), model_override, provider_override, reasoning_effort,
                         route_source, route_name,
+                        policy_forced_by if policy_decision.forced else None,
+                        policy_decision.force_reason, policy_decision.force_route,
                         1 if goal_mode else 0, _opt_int(goal_max_turns), session_id,
                         completion_contract,
                         created_by_task, _opt_int(created_by_run),
@@ -2275,6 +2622,11 @@ def create_task(
                     "reasoning_effort": reasoning_effort,
                     "route_source": route_source,
                     "route_name": route_name,
+                    "model_policy_force": ({
+                        "forced_by": policy_forced_by,
+                        "reason": policy_decision.force_reason,
+                        "route": _json_or(policy_decision.force_route),
+                    } if policy_decision.forced else None),
                     "created_by_task": created_by_task,
                     "created_by_run": _opt_int(created_by_run),
                     "lane": lane,
@@ -2620,22 +2972,29 @@ def assign_task(conn: sqlite3.Connection, task_id: str, profile: Optional[str]) 
     """
     profile = _canonical_assignee(profile)
     with write_txn(conn):
-        row = conn.execute(
-            "SELECT status, claim_lock, assignee, skills FROM tasks WHERE id = ?", (task_id,)
-        ).fetchone()
-        if not row:
+        task = get_task(conn, task_id)
+        if not task:
             return False
-        if row["claim_lock"] is not None and row["status"] == "running":
+        if task.claim_lock is not None and task.status == "running":
             raise RuntimeError(
                 f"cannot reassign {task_id}: currently running (claimed). "
                 "Wait for completion or reclaim the stale lock first."
             )
-        if row["assignee"] != profile:
+        if task.assignee != profile:
             _preflight_assignee_change(conn, task_id, profile)
+            if profile:
+                validate_task_model_policy(
+                    replace(
+                        task, assignee=profile, policy_forced_by=None,
+                        policy_force_reason=None, policy_force_route=None,
+                    ), allow_legacy_unconfigured=True,
+                )
             # The failure streak is per task/profile; a new profile starts fresh.
             conn.execute(
                 "UPDATE tasks SET assignee = ?, consecutive_failures = 0, "
-                "last_failure_error = NULL WHERE id = ?", (profile, task_id),
+                "last_failure_error = NULL, policy_forced_by = NULL, "
+                "policy_force_reason = NULL, policy_force_route = NULL WHERE id = ?",
+                (profile, task_id),
             )
         else:
             conn.execute("UPDATE tasks SET assignee = ? WHERE id = ?", (profile, task_id))
@@ -2647,16 +3006,46 @@ def assign_task(conn: sqlite3.Connection, task_id: str, profile: Optional[str]) 
 
 def set_model_override(
     conn: sqlite3.Connection, task_id: str, model: Optional[str], provider: Optional[str] = None,
+    *, policy_force: bool = False, policy_force_reason: Optional[str] = None,
+    policy_forced_by: Optional[str] = None, board: Optional[str] = None,
 ) -> bool:
     """Set (empty ``model`` clears BOTH) the per-task model/provider override.
     Allowed while ``running``: it applies on the NEXT dispatch, which is the
     rate-limit-recovery flow (set, then reclaim/retry)."""
     model, provider = _validate_model_override(model, provider)
+    task = get_task(conn, task_id)
+    if task is None:
+        return False
+    candidate = replace(
+        task, model_override=model, provider_override=provider,
+        policy_forced_by=None, policy_force_reason=None, policy_force_route=None,
+    )
+    resolved_provider, resolved_model, resolved_effort = resolved_task_model_route(candidate, board=board)
+    decision = validate_model_effort_policy(
+        provider=resolved_provider, model=resolved_model, reasoning_effort=resolved_effort,
+        assignee=candidate.assignee, policy=_effective_model_policy(candidate.assignee, board),
+        force=policy_force, force_reason=policy_force_reason, forced_by=policy_forced_by,
+    ) if (
+        policy_force or policy_force_reason or policy_forced_by
+        or (
+            (_profile_config_exists(candidate.assignee) or candidate.model_override
+             or candidate.provider_override or candidate.reasoning_effort is not None)
+            and resolved_provider and resolved_model and resolved_effort is not None
+        )
+    ) else ModelPolicyDecision(False)
     return _set_task_override(
         conn, task_id,
-        "UPDATE tasks SET model_override = ?, provider_override = ? WHERE id = ?", (model, provider),
-        "model_override_set", {"model": model, "provider": provider},
-        ("model_override", "provider_override"), archived_msg="cannot set model override",
+        "UPDATE tasks SET model_override = ?, provider_override = ?, policy_forced_by = ?, "
+        "policy_force_reason = ?, policy_force_route = ? WHERE id = ?",
+        (model, provider, policy_forced_by if decision.forced else None,
+         decision.force_reason, decision.force_route),
+        "model_override_set", {
+            "model": model, "provider": provider,
+            "model_policy_force": ({"forced_by": policy_forced_by, "reason": decision.force_reason}
+                                   if decision.forced else None),
+        },
+        ("model_override", "provider_override", "policy_forced_by", "policy_force_reason",
+         "policy_force_route"), archived_msg="cannot set model override",
     )
 
 
@@ -2678,16 +3067,110 @@ def _set_task_override(
     return True
 
 
-def set_reasoning_effort(conn: sqlite3.Connection, task_id: str, effort: Optional[str]) -> bool:
+def set_reasoning_effort(
+    conn: sqlite3.Connection, task_id: str, effort: Optional[str], *,
+    policy_force: bool = False, policy_force_reason: Optional[str] = None,
+    policy_forced_by: Optional[str] = None, board: Optional[str] = None,
+) -> bool:
     """Set (empty clears; ``"none"`` pins thinking OFF) the per-task reasoning
     effort. Independent of the model override so clearing one never resets the
     other; applies on the NEXT dispatch, so settable while running."""
     effort = normalize_reasoning_effort(effort)
-    return _set_task_override(
-        conn, task_id, "UPDATE tasks SET reasoning_effort = ? WHERE id = ?", (effort,),
-        "reasoning_effort_set", {"reasoning_effort": effort},
-        ("reasoning_effort",), archived_msg="cannot set reasoning effort",
+    task = get_task(conn, task_id)
+    if task is None:
+        return False
+    candidate = replace(
+        task, reasoning_effort=effort, policy_forced_by=None,
+        policy_force_reason=None, policy_force_route=None,
     )
+    resolved_provider, resolved_model, resolved_effort = resolved_task_model_route(candidate, board=board)
+    decision = validate_model_effort_policy(
+        provider=resolved_provider, model=resolved_model, reasoning_effort=resolved_effort,
+        assignee=candidate.assignee, policy=_effective_model_policy(candidate.assignee, board),
+        force=policy_force, force_reason=policy_force_reason, forced_by=policy_forced_by,
+    ) if (
+        policy_force or policy_force_reason or policy_forced_by
+        or (
+            (_profile_config_exists(candidate.assignee) or candidate.model_override
+             or candidate.provider_override or candidate.reasoning_effort is not None)
+            and resolved_provider and resolved_model and resolved_effort is not None
+        )
+    ) else ModelPolicyDecision(False)
+    return _set_task_override(
+        conn, task_id,
+        "UPDATE tasks SET reasoning_effort = ?, policy_forced_by = ?, "
+        "policy_force_reason = ?, policy_force_route = ? WHERE id = ?",
+        (effort, policy_forced_by if decision.forced else None,
+         decision.force_reason, decision.force_route),
+        "reasoning_effort_set", {
+            "reasoning_effort": effort,
+            "model_policy_force": ({"forced_by": policy_forced_by, "reason": decision.force_reason}
+                                   if decision.forced else None),
+        },
+        ("reasoning_effort", "policy_forced_by", "policy_force_reason", "policy_force_route"),
+        archived_msg="cannot set reasoning effort",
+    )
+
+
+def set_route_overrides(
+    conn: sqlite3.Connection, task_id: str, *, model: Optional[str],
+    provider: Optional[str], reasoning_effort: Optional[str],
+    policy_force: bool = False, policy_force_reason: Optional[str] = None,
+    policy_forced_by: Optional[str] = None, board: Optional[str] = None,
+) -> bool:
+    """Atomically set and validate a complete model/provider/effort change."""
+    model, provider = _validate_model_override(model, provider)
+    effort = normalize_reasoning_effort(reasoning_effort)
+    task = get_task(conn, task_id)
+    if task is None:
+        return False
+    candidate = replace(
+        task, model_override=model, provider_override=provider, reasoning_effort=effort,
+        policy_forced_by=None, policy_force_reason=None, policy_force_route=None,
+    )
+    resolved_provider, resolved_model, resolved_effort = resolved_task_model_route(
+        candidate, board=board,
+    )
+    decision = validate_model_effort_policy(
+        provider=resolved_provider, model=resolved_model, reasoning_effort=resolved_effort,
+        assignee=candidate.assignee, policy=_effective_model_policy(candidate.assignee, board),
+        force=policy_force, force_reason=policy_force_reason, forced_by=policy_forced_by,
+    ) if (
+        policy_force or policy_force_reason or policy_forced_by
+        or (
+            (_profile_config_exists(candidate.assignee) or candidate.model_override
+             or candidate.provider_override or candidate.reasoning_effort is not None)
+            and resolved_provider and resolved_model and resolved_effort is not None
+        )
+    ) else ModelPolicyDecision(False)
+    with write_txn(conn):
+        status = _task_status(conn, task_id)
+        if status is None:
+            return False
+        if status == "archived":
+            raise RuntimeError(f"cannot set route overrides on archived task {task_id}")
+        conn.execute(
+            "UPDATE tasks SET model_override = ?, provider_override = ?, reasoning_effort = ?, "
+            "policy_forced_by = ?, policy_force_reason = ?, policy_force_route = ? WHERE id = ?",
+            (model, provider, effort, policy_forced_by if decision.forced else None,
+             decision.force_reason, decision.force_route, task_id),
+        )
+        force_payload = ({"forced_by": policy_forced_by, "reason": decision.force_reason}
+                         if decision.forced else None)
+        _append_event(
+            conn, task_id, "model_override_set",
+            {"model": model, "provider": provider, "model_policy_force": force_payload},
+        )
+        _append_event(
+            conn, task_id, "reasoning_effort_set",
+            {"reasoning_effort": effort, "model_policy_force": force_payload},
+        )
+    notify_task_updated(
+        conn, task_id,
+        ("model_override", "provider_override", "reasoning_effort", "policy_forced_by",
+         "policy_force_reason", "policy_force_route"),
+    )
+    return True
 
 
 # --- Links ---
@@ -4749,7 +5232,8 @@ def request_review(
             return _ret(False, "parent dependencies are not satisfied")
         trow = conn.execute(
             "SELECT assignee, status, claim_lock, current_run_id, worker_pid, "
-            "model_override, provider_override, reasoning_effort "
+            "model_override, provider_override, reasoning_effort, policy_forced_by, "
+            "policy_force_reason, policy_force_route "
             "FROM tasks WHERE id = ?", (task_id,),
         ).fetchone()
         if trow is None:
@@ -4793,8 +5277,26 @@ def request_review(
         override_sql = ""
         override_params: tuple[Any, ...] = ()
         if cross_profile:
-            override_sql = ", model_override = ?, provider_override = ?, reasoning_effort = ?"
+            override_sql = (
+                ", model_override = ?, provider_override = ?, reasoning_effort = ?, "
+                "policy_forced_by = NULL, policy_force_reason = NULL, policy_force_route = NULL"
+            )
             override_params = (reviewer_model_override, reviewer_provider_override, None)
+            current_task = get_task(conn, task_id)
+            if current_task is not None:
+                try:
+                    validate_review_task_model_policy(
+                        replace(
+                            current_task, assignee=reviewer,
+                            model_override=reviewer_model_override,
+                            provider_override=reviewer_provider_override,
+                            reasoning_effort=None, policy_forced_by=None,
+                            policy_force_reason=None, policy_force_route=None,
+                        ),
+                        allow_legacy_unconfigured=True,
+                    )
+                except ValueError as exc:
+                    return _ret(False, str(exc))
         assignee_sql = ", assignee = ?" if reviewer is not None else ""
         run_guard = "" if expected_run_id is None else " AND current_run_id = ?"
         params: tuple[Any, ...] = (
@@ -4838,6 +5340,10 @@ def request_review(
             event_payload["implementer_provider_override"] = implementer_provider_override
             if implementer_reasoning_effort is not None:
                 event_payload["implementer_reasoning_effort"] = implementer_reasoning_effort
+            if trow["policy_forced_by"] or trow["policy_force_reason"] or trow["policy_force_route"]:
+                event_payload["implementer_policy_forced_by"] = trow["policy_forced_by"]
+                event_payload["implementer_policy_force_reason"] = trow["policy_force_reason"]
+                event_payload["implementer_policy_force_route"] = trow["policy_force_route"]
         _append_event(conn, task_id, "review_requested", event_payload, run_id=run_id)
     # The implementation run just ended; preserve its output before the review
     # lane (or any reclaim) can touch the workspace.
@@ -4868,6 +5374,32 @@ def _prior_reviewer(conn: sqlite3.Connection, task_id: str):
 
 def _nonblank_str(value: Any) -> Optional[str]:
     return value if isinstance(value, str) and value.strip() else None
+
+
+def _latest_default_reviewer_snapshot(
+    conn: sqlite3.Connection, task_id: str, *, after_event_id: int,
+) -> Optional[dict[str, Any]]:
+    """Newest default-reviewer assignment snapshot after one review request.
+
+    Manual reviewer reassignment events may follow the automatic handoff; they
+    must not hide the immutable implementer route/provenance snapshot.
+    """
+    rows = conn.execute(
+        "SELECT payload FROM task_events WHERE task_id = ? AND kind = 'assigned' "
+        "AND id > ? ORDER BY id DESC",
+        (task_id, int(after_event_id)),
+    ).fetchall()
+    for row in rows:
+        payload = _json_dict(row["payload"])
+        if payload.get("source") != "kanban.default_reviewer":
+            continue
+        if (
+            "implementer_model_override" in payload
+            or "implementer_reasoning_effort" in payload
+            or "implementer_policy_force_route" in payload
+        ):
+            return payload
+    return None
 
 
 def request_changes(
@@ -4922,41 +5454,71 @@ def request_changes(
         # a same-profile review that never cleared the columns has neither,
         # so there is nothing to restore.
         override_payload = requested_payload
-        assigned_event = _latest_event(conn, task_id, "assigned")
-        if (
-            assigned_event is not None
-            and int(assigned_event["id"]) > int(requested_event["id"])
-        ):
-            assigned_payload = _json_dict(assigned_event["payload"])
-            if (
-                assigned_payload.get("source") == "kanban.default_reviewer"
-                and (
-                    "implementer_model_override" in assigned_payload
-                    or "implementer_reasoning_effort" in assigned_payload
-                )
-            ):
-                override_payload = assigned_payload
+        assigned_payload = _latest_default_reviewer_snapshot(
+            conn, task_id, after_event_id=int(requested_event["id"]),
+        )
+        if assigned_payload is not None:
+            override_payload = assigned_payload
 
-        override_sets: list[str] = []
-        override_params_list: list[Any] = []
-        if "implementer_model_override" in override_payload:
-            override_sets.extend(["model_override = ?", "provider_override = ?"])
-            override_params_list.extend(
-                [
-                    _nonblank_str(override_payload.get("implementer_model_override")),
-                    _nonblank_str(override_payload.get("implementer_provider_override")),
-                ]
-            )
-        if "implementer_reasoning_effort" in override_payload:
-            override_sets.append("reasoning_effort = ?")
-            override_params_list.append(
+        current_task = get_task(conn, task_id)
+        if current_task is None:
+            return False, "task not found"
+        restored_task = replace(
+            current_task,
+            assignee=implementer,
+            model_override=(
+                _nonblank_str(override_payload.get("implementer_model_override"))
+                if "implementer_model_override" in override_payload
+                else current_task.model_override
+            ),
+            provider_override=(
+                _nonblank_str(override_payload.get("implementer_provider_override"))
+                if "implementer_model_override" in override_payload
+                else current_task.provider_override
+            ),
+            reasoning_effort=(
                 normalize_reasoning_effort(override_payload.get("implementer_reasoning_effort"))
+                if "implementer_reasoning_effort" in override_payload
+                else current_task.reasoning_effort
+            ),
+            policy_forced_by=(
+                _nonblank_str(override_payload.get("implementer_policy_forced_by"))
+                if "implementer_policy_force_route" in override_payload
+                else current_task.policy_forced_by
+            ),
+            policy_force_reason=(
+                _nonblank_str(override_payload.get("implementer_policy_force_reason"))
+                if "implementer_policy_force_route" in override_payload
+                else current_task.policy_force_reason
+            ),
+            policy_force_route=(
+                _nonblank_str(override_payload.get("implementer_policy_force_route"))
+                if "implementer_policy_force_route" in override_payload
+                else current_task.policy_force_route
+            ),
+        )
+        try:
+            validate_task_model_policy(restored_task, allow_legacy_unconfigured=True)
+        except ValueError:
+            # Legacy review events did not preserve force provenance. Returning
+            # their denied pin would strand the review, so converge on the
+            # implementer's approved profile default instead of transferring or
+            # fabricating an exception.
+            restored_task = replace(
+                restored_task, model_override=None, provider_override=None,
+                reasoning_effort=None, policy_forced_by=None,
+                policy_force_reason=None, policy_force_route=None,
             )
-        override_sql = ""
-        if override_sets:
-            override_sql = ", " + ", ".join(override_sets)
-        override_params: tuple[Any, ...] = tuple(override_params_list)
+            try:
+                validate_task_model_policy(restored_task, allow_legacy_unconfigured=True)
+            except ValueError as exc:
+                return False, str(exc)
 
+        override_params = (
+            restored_task.model_override, restored_task.provider_override,
+            restored_task.reasoning_effort, restored_task.policy_forced_by,
+            restored_task.policy_force_reason, restored_task.policy_force_route,
+        )
         new_status = _landing_status_after_parents(conn, task_id)
         # consecutive_failures deliberately PRESERVED: a review transition is
         # not evidence the pathology cleared; only complete_task resets it.
@@ -4968,8 +5530,13 @@ def request_changes(
                    claim_lock = NULL,
                    claim_expires = NULL,
                    worker_pid = NULL,
-                   worker_unit = NULL
-            """ + override_sql + """
+                   worker_unit = NULL,
+                   model_override = ?,
+                   provider_override = ?,
+                   reasoning_effort = ?,
+                   policy_forced_by = ?,
+                   policy_force_reason = ?,
+                   policy_force_route = ?
              WHERE id = ? AND status = 'running' AND current_run_id = ?
             """,
             (new_status, implementer, *override_params, task_id, int(current_run_id)),
@@ -5142,47 +5709,71 @@ def reopen_review_task(conn: sqlite3.Connection, task_id: str) -> bool:
         review_event = _latest_event(conn, task_id, "review_requested")
         handoff = _json_dict(_row_get(review_event, "payload")) if review_event is not None else {}
         implementer = _nonblank_str(handoff.get("implementer"))
-        assigned_event = _latest_event(conn, task_id, "assigned")
-        if (
-            assigned_event is not None
-            and review_event is not None
-            and int(assigned_event["id"]) > int(review_event["id"])
-        ):
-            assigned_payload = _json_dict(assigned_event["payload"])
-            if (
-                assigned_payload.get("source") == "kanban.default_reviewer"
-                and (
-                    "implementer_model_override" in assigned_payload
-                    or "implementer_reasoning_effort" in assigned_payload
-                )
-            ):
-                handoff = assigned_payload
-        override_sets: list[str] = []
-        override_params_list: list[Any] = []
-        if "implementer_model_override" in handoff:
-            override_sets.extend(["model_override = ?", "provider_override = ?"])
-            override_params_list.extend(
-                [
-                    _nonblank_str(handoff.get("implementer_model_override")),
-                    _nonblank_str(handoff.get("implementer_provider_override")),
-                ]
+        if review_event is not None:
+            assigned_payload = _latest_default_reviewer_snapshot(
+                conn, task_id, after_event_id=int(review_event["id"]),
             )
-        if "implementer_reasoning_effort" in handoff:
-            override_sets.append("reasoning_effort = ?")
-            override_params_list.append(normalize_reasoning_effort(handoff.get("implementer_reasoning_effort")))
+            if assigned_payload is not None:
+                handoff = assigned_payload
+        current_task = get_task(conn, task_id)
+        if current_task is None:
+            return False
+        candidate = replace(
+            current_task,
+            assignee=(implementer or current_task.assignee),
+            model_override=(
+                _nonblank_str(handoff.get("implementer_model_override"))
+                if "implementer_model_override" in handoff else current_task.model_override
+            ),
+            provider_override=(
+                _nonblank_str(handoff.get("implementer_provider_override"))
+                if "implementer_model_override" in handoff else current_task.provider_override
+            ),
+            reasoning_effort=(
+                normalize_reasoning_effort(handoff.get("implementer_reasoning_effort"))
+                if "implementer_reasoning_effort" in handoff else current_task.reasoning_effort
+            ),
+            policy_forced_by=(
+                _nonblank_str(handoff.get("implementer_policy_forced_by"))
+                if "implementer_policy_forced_by" in handoff else current_task.policy_forced_by
+            ),
+            policy_force_reason=(
+                _nonblank_str(handoff.get("implementer_policy_force_reason"))
+                if "implementer_policy_force_reason" in handoff else current_task.policy_force_reason
+            ),
+            policy_force_route=(
+                _nonblank_str(handoff.get("implementer_policy_force_route"))
+                if "implementer_policy_force_route" in handoff else current_task.policy_force_route
+            ),
+        )
+        try:
+            validate_task_model_policy(candidate, allow_legacy_unconfigured=True)
+        except ValueError:
+            candidate = replace(
+                candidate, model_override=None, provider_override=None,
+                reasoning_effort=None, policy_forced_by=None,
+                policy_force_reason=None, policy_force_route=None,
+            )
+            try:
+                validate_task_model_policy(candidate, allow_legacy_unconfigured=True)
+            except ValueError:
+                return False
         params: tuple[Any, ...] = (
             new_status,
+            candidate.model_override, candidate.provider_override,
+            candidate.reasoning_effort, candidate.policy_forced_by,
+            candidate.policy_force_reason, candidate.policy_force_route,
             *((implementer,) if implementer else ()),
-            *override_params_list,
             task_id,
         )
         cur = conn.execute(
             # consecutive_failures deliberately PRESERVED: review reopen is not
             # a success signal; only complete_task resets the breaker (#35072).
             "UPDATE tasks SET status = ?, current_run_id = NULL, "
-            "claim_lock = NULL, claim_expires = NULL, worker_pid = NULL, worker_unit = NULL "
+            "claim_lock = NULL, claim_expires = NULL, worker_pid = NULL, worker_unit = NULL, "
+            "model_override = ?, provider_override = ?, reasoning_effort = ?, "
+            "policy_forced_by = ?, policy_force_reason = ?, policy_force_route = ? "
             + (", assignee = ?" if implementer else "")
-            + (", " + ", ".join(override_sets) if override_sets else "")
             + " WHERE id = ? AND status = 'review'",
             params,
         )
@@ -5798,23 +6389,10 @@ def unhold_task(conn: sqlite3.Connection, task_id: str) -> bool:
 # --- Worker context builder (what a spawned worker sees) ---
 
 def build_worker_context(conn: sqlite3.Connection, task_id: str) -> str:
-    """Everything a worker should read about its task: header, body,
-    attachments, prior attempts, done-parent handoffs, the assignee's recent
-    work, comments. Lists are tail-capped and fields char-capped
-    (``_CTX_MAX_*``) so the prompt stays bounded on pathological boards."""
-    task = get_task(conn, task_id)
-    if not task:
-        raise ValueError(f"unknown task {task_id}")
-    # One clock reading so every relative age in this rendering agrees.
-    now = int(time.time())
-    lines: list[str] = []
-    _ctx_header(lines, task)
-    _ctx_attachments(lines, list_attachments(conn, task_id))
-    _ctx_prior_attempts(lines, conn, task_id, now)
-    _ctx_parent_results(lines, conn, task_id, now)
-    _ctx_role_history(lines, conn, task, now)
-    _ctx_comments(lines, list_comments(conn, task_id), now)
-    return "\n".join(lines).rstrip() + "\n"
+    """Render the canonical packet for the legacy CLI/context surface."""
+    from hermes_cli.kanban_db_packet import render_worker_task_packet
+
+    return render_worker_task_packet(build_worker_task_packet(conn, task_id))
 
 
 def _ctx_cap(s: Optional[str], limit: int = _CTX_MAX_FIELD_BYTES) -> str:
@@ -6280,6 +6858,11 @@ from hermes_cli.kanban_db_workspace import (  # noqa: E402
     _is_managed_scratch_path,
     _managed_scratch_path_info,
     _scratch_workspace,
+)
+from hermes_cli.kanban_db_packet import (  # noqa: E402
+    WorkerTaskPacket,
+    build_worker_task_packet,
+    read_task_history_page,
 )
 from hermes_cli.kanban_db_dispatch import (  # noqa: E402
     DEFAULT_FAILURE_LIMIT,
