@@ -151,6 +151,12 @@ _DEFAULT_UNATTENDED_ROUTES = frozenset({
     ("openai-codex", "gpt-5.6-luna", "low"),
     ("openai-codex", "gpt-5.6-terra", "medium"),
     ("openai-codex", "gpt-5.6-sol", "medium"),
+    # 2026-09-15: Claude promoted to the fleet's primary unattended provider
+    # (Codex kept as fallback only). These match the profiles' own
+    # model.default / agent.reasoning_effort baselines exactly, so ordinary
+    # dispatch is a pre-approved route rather than an operator-forced one.
+    ("anthropic", "claude-sonnet-5", "high"),
+    ("anthropic", "claude-opus-5", "high"),
 })
 _OPERATOR_ONLY_EFFORTS = frozenset({"high", "xhigh", "max", "ultra"})
 _LUNA_INELIGIBLE_PROFILES = frozenset({"reviewer", "debugger"})
@@ -274,7 +280,10 @@ def validate_model_effort_policy(
                 provider=provider, model=model, reasoning_effort=effort, assignee=assignee,
             ),
         )
-    if "astra" in model or effort in _OPERATOR_ONLY_EFFORTS:
+    if "astra" in model or (
+        effort in _OPERATOR_ONLY_EFFORTS
+        and (provider, model, effort) not in _DEFAULT_UNATTENDED_ROUTES
+    ):
         raise ValueError(
             f"Kanban model policy denies unattended route {provider}/{model}/{effort}; "
             "retry with operator force plus a durable non-empty reason"
