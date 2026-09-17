@@ -41,6 +41,31 @@ export function isSelectionClick(event: { detail: number }): boolean {
   return event.detail >= 2 || hasTextSelection()
 }
 
+/**
+ * True when a pointer press landed on an interactive control nested inside the
+ * bubble — an active directive chip today.
+ *
+ * The editable bubble hosts the edit control, so a press anywhere in it arms
+ * the thread's edit hold (`data-editing` on the viewport). A chip's own press
+ * bubbles up here too, but the chip stops the resulting click, so the edit
+ * composer never mounts — and the hold, which only clears when that composer
+ * unmounts, would stay armed forever after an action that must run the
+ * directive and nothing else.
+ *
+ * Keyed off the nearest control ANCESTOR of the pressed node, not
+ * `target === currentTarget`: ordinary prose inside the bubble is a
+ * descendant too, and it must still open the editor.
+ */
+export function isNestedControlPress(event: { currentTarget: Element; target: EventTarget | null }): boolean {
+  if (!(event.target instanceof Element)) {
+    return false
+  }
+
+  const control = event.target.closest('a[href],button,input,select,textarea,[role="button"]')
+
+  return control !== null && control !== event.currentTarget && event.currentTarget.contains(control)
+}
+
 export function StickyHumanMessageContainer({
   attachments,
   children,
@@ -546,7 +571,7 @@ export const UserMessage: FC<{
                         event.currentTarget.click()
                       }}
                       onPointerDown={event => {
-                        if (isSelectionClick(event)) {
+                        if (isSelectionClick(event) || isNestedControlPress(event)) {
                           return
                         }
 
