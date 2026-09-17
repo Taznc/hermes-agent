@@ -1,18 +1,20 @@
 """Regression for the cache-aware proactive-prune canary (t_b6dc22f0).
 
-Behavior contract, not a real-transcript snapshot: on a synthetic but
-representative transcript (mirrors evals/compaction/fixtures.py's shape),
-enabling `proactive_prune_tokens` at either candidate threshold must not
-produce FEWER cache-breaking events than leaving it disabled. Production's
-only two cache-breaking paths per turn_preflight.py are (a) a full
-ContextCompressor.compress() and (b) a committed
-ContextCompressor.prune_tool_results_only() — every commit rewrites the
-message list and calls archive_and_compact(), each one repricing the next
-request's context at new-input rates under prompt caching. If a future
-change makes pruning strictly cheaper in cache-break count, this test is
-expected to start failing and should be revisited alongside the real
-5-transcript evidence in evals/compaction/results/prune-canary-t_b6dc22f0.json
-before flipping any default.
+Behavior contract, not a real-transcript snapshot, restated per round-1
+review (comment 1223/1233): the original version asserted against
+`cache_breaks_total`, an unweighted sum of full compressions (each an
+LLM-backed summarizer call over the whole collapsed region) and prune
+commits (no auxiliary call at all) — a full compression and a prune commit
+are not comparable events, so an event-count assertion cannot establish
+whether pruning is cheaper or more expensive. This version asserts against
+the token-level usage metrics AC1 requires instead: on a synthetic but
+representative transcript (mirrors evals/compaction/fixtures.py's shape), a
+committed prune must reclaim tokens and be reflected in the reported
+new-input/cache-read accounting, and the pass/fail question for any future
+default change is decided by campaign-level `new_input_tokens` /
+`cache_read_tokens` (see evals/compaction/results/prune-canary-t_b6dc22f0.json
+and its `-campaign.json` sibling for the real 5-transcript evidence), not by
+raw event counts.
 """
 import sys
 from pathlib import Path
@@ -43,7 +45,7 @@ def _write_transcript(tmp_path) -> str:
     return str(path)
 
 
-def test_proactive_prune_never_reduces_cache_breaks(tmp_path):
+def test_proactive_prune_activity_is_reflected_in_usage_accounting(tmp_path):
     # Tiny context window (explicit config override, the same knob production
     # uses) so full-compression AND prune thresholds both fire repeatedly
     # within a transcript this small, without needing a real
@@ -52,17 +54,36 @@ def test_proactive_prune_never_reduces_cache_breaks(tmp_path):
     candidates = {"disabled": 0, "prune_active_high": 20_000, "prune_active_low": 10_000}
     results = simulate(transcript_path, candidates, config_context_length=150_000)
 
-    disabled_breaks = results["disabled"]["cache_breaks_total"]
+    disabled = results["disabled"]
     for label in ("prune_active_high", "prune_active_low"):
-        assert results[label]["cache_breaks_total"] >= disabled_breaks, (
-            f"{label} produced fewer cache breaks ({results[label]['cache_breaks_total']}) "
-            f"than disabled ({disabled_breaks}) on the synthetic canary transcript — "
-            "re-run the real-transcript canary before treating pruning as a win."
+        r = results[label]
+        # A non-trivial prune candidate must show actual prune activity for
+        # any comparison to be meaningful.
+        assert r["prune_commits"] > 0
+        assert r["prune_reclaimed_tokens"] > 0
+        # AC1's required token metrics must actually be populated (round-1
+        # blocker: the original harness recorded none of these).
+        for key in (
+            "new_input_tokens", "cache_read_tokens", "cache_write_tokens",
+            "output_tokens", "compaction_aux_calls", "compaction_aux_input_tokens",
+            "total_calls", "skill_reload_events", "reread_events",
+        ):
+            assert key in r
+        # Fewer (or equal) full compressions than disabled is the whole point
+        # of pruning (reclaiming tokens keeps the live window under
+        # threshold_tokens longer) — assert the mechanism is doing that,
+        # rather than comparing an unweighted count across non-comparable
+        # event types (round-1 blocker #1).
+        assert r["full_compressions"] <= disabled["full_compressions"]
+        # Distinct-body accounting must never exceed how many tool results
+        # actually existed on the transcript (a cumulative-count regression
+        # would blow past this bound; round-1 blocker #2).
+        import json as _json
+        total_tool_msgs = sum(
+            1 for m in _json.loads(Path(transcript_path).read_text())["messages"]
+            if m.get("role") == "tool"
         )
-        # Every commit is itself a cache break in addition to whatever full
-        # compressions still fire; a non-trivial prune candidate must show
-        # actual prune activity for the comparison to be meaningful.
-        assert results[label]["prune_commits"] > 0
+        assert r["reread_events"] <= total_tool_msgs
 
 
 def test_proactive_prune_reclaims_tokens_when_it_commits(tmp_path):
