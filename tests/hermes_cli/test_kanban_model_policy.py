@@ -34,13 +34,15 @@ def _write_profile(home, name, model="gpt-5.6-sol", effort="medium"):
 
 
 def test_policy_matrix_accepts_only_approved_unattended_routes():
-    for model, effort in (
-        ("gpt-5.6-luna", "low"),
-        ("gpt-5.6-terra", "medium"),
-        ("gpt-5.6-sol", "medium"),
+    for provider, model, effort in (
+        ("openai-codex", "gpt-5.6-luna", "low"),
+        ("openai-codex", "gpt-5.6-terra", "medium"),
+        ("openai-codex", "gpt-5.6-sol", "medium"),
+        ("anthropic", "claude-sonnet-5", "high"),
+        ("anthropic", "claude-opus-5", "high"),
     ):
         decision = kb.validate_model_effort_policy(
-            provider="openai-codex", model=model, reasoning_effort=effort,
+            provider=provider, model=model, reasoning_effort=effort,
             assignee="worker", policy={},
         )
         assert decision.forced is False
@@ -54,6 +56,51 @@ def test_policy_matrix_accepts_only_approved_unattended_routes():
         kb.validate_model_effort_policy(
             provider="openai-codex", model="gpt-7-future", reasoning_effort="medium",
             assignee="worker", policy={},
+        )
+
+
+def test_claude_baseline_routes_are_unattended_approved_not_operator_forced():
+    """2026-09-15 bootstrap: Claude promoted to primary unattended provider.
+
+    RED on the pre-fix policy (only openai-codex routes were pre-approved;
+    anthropic/high was rejected outright and could not even be force-approved,
+    since ``forceable_model`` gated force-approval to ``provider ==
+    "openai-codex"``). GREEN once claude-sonnet-5/high and claude-opus-5/high
+    join ``_DEFAULT_UNATTENDED_ROUTES`` and the operator-only-effort veto
+    exempts exactly those two pre-approved triples.
+    """
+    for model in ("claude-sonnet-5", "claude-opus-5"):
+        decision = kb.validate_model_effort_policy(
+            provider="anthropic", model=model, reasoning_effort="high",
+            assignee="claudecode", policy={},
+        )
+        assert decision.forced is False
+
+    # A route that merely resembles the baseline (different effort) must stay
+    # denied — the exemption is scoped to the exact pre-approved triples, not
+    # to "anthropic at any effort".
+    with pytest.raises(ValueError, match="unattended route"):
+        kb.validate_model_effort_policy(
+            provider="anthropic", model="claude-sonnet-5", reasoning_effort="xhigh",
+            assignee="claudecode", policy={},
+        )
+    with pytest.raises(ValueError, match="unknown model route"):
+        kb.validate_model_effort_policy(
+            provider="anthropic", model="claude-sonnet-5", reasoning_effort="medium",
+            assignee="claudecode", policy={},
+        )
+
+    # Existing Codex routes and every other operator-only-effort/Astra
+    # rejection are unchanged by the exemption.
+    with pytest.raises(ValueError, match="unattended route"):
+        kb.validate_model_effort_policy(
+            provider="openai-codex", model="gpt-5.6-sol", reasoning_effort="high",
+            assignee="claudecode", policy={},
+        )
+    with pytest.raises(ValueError, match="unattended route"):
+        kb.validate_model_effort_policy(
+            provider="openai-codex", model="gpt-6-astra", reasoning_effort="medium",
+            assignee="claudecode", policy={},
         )
 
 
