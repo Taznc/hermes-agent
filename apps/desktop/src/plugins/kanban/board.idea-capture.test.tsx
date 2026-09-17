@@ -10,7 +10,7 @@ import { cleanup, fireEvent, render, screen, waitFor } from '@testing-library/re
 import type { ReactElement } from 'react'
 import { afterEach, beforeAll, beforeEach, describe, expect, it, vi } from 'vitest'
 
-import { IdeaCaptureDialog } from './board'
+import { IdeaCaptureDialog } from './new-task-dialog'
 
 const { addRoadmapIdea, notify } = vi.hoisted(() => ({ addRoadmapIdea: vi.fn(), notify: vi.fn() }))
 
