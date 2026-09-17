@@ -1,8 +1,6 @@
-"""Fork-owned Kanban config defaults.
+"""Fork-owned Kanban configuration and dispatcher policy.
 
-Holds the fork's additions to ``DEFAULT_CONFIG["kanban"]`` and its
-``HERMES_KANBAN_*`` ``OPTIONAL_ENV_VARS`` bridge entries, merged into
-``hermes_cli/config_defaults.py`` at the ``# >>> FORK ANCHOR:
-kanban-config-defaults <<<`` site. See ``config_defaults.py`` in this
-package for the data itself.
+``config_defaults`` holds the fork's config/env additions; the dispatch,
+model-routing, and dependency modules extract cohesive policy behind anchors
+without moving schema, migrations, or dashboard contracts out of core.
 """
