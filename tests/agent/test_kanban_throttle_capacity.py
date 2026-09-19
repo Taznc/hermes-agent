@@ -181,6 +181,24 @@ def test_nous_cached_jwt_reading_is_refused_as_stale(portal):
     assert snap.windows == ()
 
 
+def test_only_codes_this_module_mints_are_carried_through_by_name():
+    """The classifier is the trust boundary for a durable audit row.
+
+    ``unavailable_reason`` carries two different things: an enumerated code
+    minted here, and free-form provider prose that ``/usage`` prints. Only the
+    former may survive verbatim, or untrusted text ends up in a persisted
+    record; anything else must degrade to the caller's generic verdict.
+    """
+    assert cap.classify_unavailable_reason(cap.STALE_PORTAL_READING) == (
+        cap.STALE_PORTAL_READING
+    )
+    for foreign in (
+        None, "", "Account 12345 suspended", "Nous Portal account read failed.",
+        f"prefixed {cap.STALE_PORTAL_READING}",
+    ):
+        assert cap.classify_unavailable_reason(foreign) is None
+
+
 def test_nous_depleted_access_reads_as_fully_consumed(portal):
     """The Portal stating access is gone is authoritative, and must win even
     when no usable denominator exists to compute a percentage from."""

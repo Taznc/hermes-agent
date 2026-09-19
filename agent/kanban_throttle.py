@@ -369,8 +369,16 @@ def capacity_signal(
         return CapacitySignal(provider=provider, fresh=False, reason="fetch_unavailable")
     if getattr(snapshot, "unavailable_reason", None):
         # Provider-stated unavailability (wrong credential kind, expired login).
-        # Carried as a code, never the raw payload.
-        return CapacitySignal(provider=provider, fresh=False, reason="provider_unavailable")
+        # A code this module minted survives by name — `stale_portal_reading`
+        # tells the operator to re-authenticate, which `provider_unavailable`
+        # does not — while arbitrary provider prose generalizes rather than
+        # being echoed into a durable audit row.
+        from agent.kanban_throttle_capacity import classify_unavailable_reason
+
+        named = classify_unavailable_reason(snapshot.unavailable_reason)
+        return CapacitySignal(
+            provider=provider, fresh=False, reason=named or "provider_unavailable",
+        )
     fetched_at = getattr(snapshot, "fetched_at", None)
     observed_at: Optional[int] = None
     if fetched_at is not None:

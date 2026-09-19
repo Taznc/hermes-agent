@@ -298,6 +298,116 @@ def test_declined_unsupported_destination_is_audited_once_per_episode(capacity):
     assert declined[0]["payload"]["action"] == "no route change"
 
 
+# --- Named unavailability survives to the audit trail -------------------
+
+
+class _Sub:
+    plan = "Plus"
+    monthly_credits = 20.0
+    credits_remaining = 5.0
+    current_period_end = None
+
+
+class _CachedJwtInfo:
+    """A Nous portal answer reconstructed from cached JWT claims.
+
+    ``source='jwt'`` / ``fresh=False`` is the real shape the portal returns
+    when the live account read could not be made: the claims carry entitlement,
+    not current balance, so the numbers beside them describe nothing.
+    """
+
+    logged_in = True
+    source = "jwt"
+    fresh = False
+    error = None
+    paid_service_access = True
+    subscription = _Sub()
+
+
+@pytest.fixture
+def cached_jwt_portal(monkeypatch):
+    """Drive the REAL Nous adapter from a cached-JWT portal answer.
+
+    Patched at the portal read rather than at ``fetch_capacity_snapshot`` so
+    the whole chain under test is production code: adapter -> snapshot ->
+    ``capacity_signal`` -> ``evaluate_throttle`` -> persisted audit row.
+    """
+    import hermes_cli.nous_account as na
+
+    monkeypatch.setattr(
+        na, "get_nous_portal_account_info", lambda **kw: _CachedJwtInfo(),
+        raising=True,
+    )
+    kt.reset_signal_cache()
+
+
+_NOUS_CFG = {
+    "usage_throttle": {
+        "source_providers": ["nous"],
+        "levers": {"downgrade_model": {
+            "enabled": True, "threshold_pct": 1,
+            "ladder": ["expensive", "cheap"],
+        }},
+    }
+}
+
+
+def test_cached_jwt_reading_is_audited_by_name_not_as_generic_unavailability(
+    cached_jwt_portal,
+):
+    """AC4 end-to-end: the enumerated reason survives to the durable record.
+
+    ``stale_portal_reading`` and ``provider_unavailable`` call for different
+    operator actions — re-authenticate versus wait for the provider — so
+    collapsing the named code into the generic one makes the audit trail
+    actively misleading about what is wrong.
+    """
+    snapshot = cap.nous_capacity_snapshot()
+    assert snapshot is not None
+    assert snapshot.unavailable_reason == cap.STALE_PORTAL_READING
+
+    signal = kt.capacity_signal("nous", cfg=kt.load_throttle_config(_NOUS_CFG))
+    assert signal.fresh is False
+    assert signal.used_percent is None
+    assert signal.reason == cap.STALE_PORTAL_READING
+
+    decision = kt.evaluate_throttle(kanban_cfg=_NOUS_CFG, now=11_000)
+    assert decision.degraded is True
+    (payload,) = [
+        e["payload"] for e in kt.recent_throttle_events(50)
+        if e["kind"] == "degraded"
+    ]
+    assert payload["provider_detail"] == [f"nous:{cap.STALE_PORTAL_READING}"]
+
+
+def test_arbitrary_provider_unavailability_stays_generic(cfg, capacity):
+    """The other half of the contract: only codes this module mints are
+    carried through. Free-form provider text must never reach a durable row.
+    """
+    capacity(_snapshot(
+        provider="nous", unavailable_reason="Account 12345 suspended: contact support",
+    ))
+    assert kt.capacity_signal("nous", cfg=cfg).reason == "provider_unavailable"
+
+
+def test_cached_jwt_episode_is_recorded_once_and_mutates_no_route(
+    cached_jwt_portal,
+):
+    """A named degraded reason is still an episode, not a per-tick log, and it
+    holds every route exactly as filed."""
+    for tick in (12_000, 12_100, 12_200):
+        kt.reset_signal_cache()  # force a real re-read, so dedup is proven
+        decision = kt.evaluate_throttle(kanban_cfg=_NOUS_CFG, now=tick)
+        assert decision.degraded is True
+        assert decision.pressure_percent is None
+        assert kt.plan_route_change(
+            decision, assignee="worker", model="expensive", provider="anthropic",
+        ) is None
+
+    degraded = [e for e in kt.recent_throttle_events(50) if e["kind"] == "degraded"]
+    assert len(degraded) == 1
+
+
 # --- Secrecy ------------------------------------------------------------
 
 

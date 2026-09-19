@@ -53,6 +53,29 @@ STALE_PORTAL_READING = "stale_portal_reading"
 SIGNAL_RATE_LIMIT_WINDOWS = "rate_limit_windows"
 SIGNAL_CREDIT_BALANCE = "credit_balance"
 
+#: Unavailability codes THIS module mints, and which are therefore safe to
+#: carry verbatim into a signal and a persisted audit row.  An adapter also
+#: puts free-form provider prose in ``unavailable_reason`` (it is the operator-
+#: facing text ``/usage`` prints), so membership is deliberately exact-match
+#: against codes minted here: anything else generalizes rather than being
+#: echoed into a durable record.
+_STATIC_UNAVAILABLE_REASONS = frozenset({STALE_PORTAL_READING})
+
+
+def classify_unavailable_reason(reason: Optional[str]) -> Optional[str]:
+    """This module's own sanitized code for *reason*, or ``None``.
+
+    A snapshot's ``unavailable_reason`` is two different things wearing one
+    field: an enumerated code minted here, or arbitrary provider/adapter prose.
+    Collapsing both into a generic verdict loses a distinction the operator
+    needs — ``stale_portal_reading`` means "log in again", not "the provider is
+    down" — while echoing both would put untrusted text in the audit trail.
+    Recognising only what this module minted keeps each named case named and
+    everything else generic.
+    """
+    text = str(reason or "").strip()
+    return text if text in _STATIC_UNAVAILABLE_REASONS else None
+
 
 @dataclass(frozen=True)
 class ProviderCapability:
@@ -330,6 +353,6 @@ def fetch_capacity_snapshot(provider: Optional[str]) -> Optional[Any]:
 __all__ = [
     "SIGNAL_CREDIT_BALANCE", "SIGNAL_RATE_LIMIT_WINDOWS", "STALE_PORTAL_READING",
     "UNSUPPORTED_PROVIDER", "ProviderCapability", "capability_for",
-    "capability_table", "fetch_capacity_snapshot", "normalize_provider",
-    "nous_capacity_snapshot",
+    "capability_table", "classify_unavailable_reason", "fetch_capacity_snapshot",
+    "normalize_provider", "nous_capacity_snapshot",
 ]
