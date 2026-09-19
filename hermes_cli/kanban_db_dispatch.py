@@ -96,7 +96,7 @@ _RESPAWN_GUARD_SUCCESS_WINDOW = 3600  # 1 hour
 # ``HERMES_KANBAN_RATE_LIMIT_COOLDOWN_SECONDS``.
 DEFAULT_RATE_LIMIT_COOLDOWN_SECONDS = 300  # 5 minutes
 
-# Within this window a GitHub PR URL in a comment blocks re-spawn.
+# Default duplicate-work window; failed-run/rework recovery can supersede it.
 _RESPAWN_GUARD_PR_WINDOW = 86400  # 24 hours
 
 _RESPAWN_GUARD_PR_URL_RE = re.compile(
@@ -1926,6 +1926,7 @@ def check_respawn_guard(
     lane: str = "ready",
     board: Optional[str] = None,
     consume_host_probe: bool = False,
+    pr_recovery: Optional[dict] = None,
 ) -> Optional[str]:
     """Return a guard reason if ``task_id`` should NOT be re-spawned, else None.
 
@@ -1939,7 +1940,11 @@ def check_respawn_guard(
     a re-queue event arrived after it — a deliberate re-run) and ``"active_pr"``
     (a GitHub PR URL, from a comment AUTHORED BY this task's own assignee, whose
     owner/repo matches this task's own repo when that repo is resolvable —
-    re-spawning risks a duplicate PR). The review lane skips the last two: they
+    re-spawning risks a duplicate PR, unless a failed run superseded the comment
+    and its bounded recovery cooldown elapsed, or a reviewer requested changes).
+    ``pr_recovery`` receives the
+    local evidence for logging and a receipt on a successful claim; the check
+    itself does not mutate the board. The review lane skips the last two: they
     are the *inputs* to a review handoff. Stale / dead claim locks are NOT a
     guard reason — the reclaim passes own those.
     """
@@ -1979,9 +1984,9 @@ def check_respawn_guard(
     #    LATEST run only: a newer crash/completion supersedes the rate-limit run.
     rl_cooldown = _kb._resolve_rate_limit_cooldown_seconds()
     latest_run = conn.execute(
-        "SELECT outcome, ended_at FROM task_runs "
+        "SELECT id, profile, outcome, ended_at FROM task_runs "
         "WHERE task_id = ? AND ended_at IS NOT NULL "
-        "ORDER BY ended_at DESC LIMIT 1",
+        "ORDER BY ended_at DESC, id DESC LIMIT 1",
         (task_id,),
     ).fetchone()
     if latest_run is not None and latest_run["outcome"] == "rate_limited":
@@ -2056,18 +2061,35 @@ def check_respawn_guard(
     assignee = row["assignee"]
     own_repo_slug = _task_own_repo_slug(conn, task_id)
     pr_cutoff = now - _RESPAWN_GUARD_PR_WINDOW
+    from hermes_cli.kanban_db_dispatch_pr_recovery import pr_recovery_after_run
+
+    recovered_urls: set[str] = set()
     for c in conn.execute(
-        "SELECT author, body FROM task_comments WHERE task_id = ? AND created_at >= ?",
+        "SELECT author, body, created_at FROM task_comments WHERE task_id = ? AND created_at >= ?",
         (task_id, pr_cutoff),
     ).fetchall():
         if not c["body"] or not assignee or c["author"] != assignee:
             continue
         for match in _RESPAWN_GUARD_PR_URL_RE.finditer(c["body"]):
-            if own_repo_slug is None:
-                return "active_pr"
             cited_slug = f"{match.group('owner')}/{match.group('repo')}".lower()
-            if cited_slug == own_repo_slug:
-                return "active_pr"
+            if own_repo_slug is not None and cited_slug != own_repo_slug:
+                continue
+            recovery = pr_recovery_after_run(latest_run, c["created_at"], assignee, now)
+            if recovery is not None and recovery["eligible"]:
+                recovered_urls.add(match.group(0))
+                if pr_recovery is not None:
+                    pr_recovery.update(recovery, pr_urls=sorted(recovered_urls))
+                continue
+            if pr_recovery is not None:
+                pr_recovery.clear()
+                if recovery is not None:
+                    pr_recovery.update(recovery, pr_urls=[match.group(0)])
+            _kb._log.debug(
+                "kanban active_pr deferred task=%s pr=%s prior_run=%s eligible_at=%s",
+                task_id, match.group(0), latest_run["id"] if latest_run else None,
+                recovery["eligible_at"] if recovery else c["created_at"] + _RESPAWN_GUARD_PR_WINDOW,
+            )
+            return "active_pr"
 
     return None
 
@@ -3103,12 +3125,14 @@ def _dispatch_lane_task(
         if current >= per_profile_cap:
             result.skipped_per_profile_capped.append((task_id, assignee, current))
             return False
+    pr_recovery: dict = {}
     guard_reason = check_respawn_guard(
         conn,
         task_id,
         lane=lane,
         board=board,
         consume_host_probe=not dry_run,
+        pr_recovery=pr_recovery,
     )
     if guard_reason is not None:
         result.respawn_guarded.append((task_id, guard_reason))
@@ -3121,7 +3145,7 @@ def _dispatch_lane_task(
         # owned by ``kanban.default_assignee``, not "unassigned but secretly routed".
         if not dry_run:
             with _kb.write_txn(conn):
-                _kb._append_event(conn, task_id, "respawn_guarded", {"reason": guard_reason})
+                _kb._append_event(conn, task_id, "respawn_guarded", {"reason": guard_reason, **pr_recovery})
         return False
 
     def _count_spawn(name: str) -> None:
@@ -3158,6 +3182,23 @@ def _dispatch_lane_task(
     claimed = claim(conn, task_id, ttl_seconds=ttl_seconds)
     if claimed is None:
         return False
+    if pr_recovery:
+        with _kb.write_txn(conn):
+            _kb._append_event(
+                conn, task_id, "active_pr_recovery", pr_recovery, run_id=claimed.current_run_id,
+            )
+            # The canonical packet previews comments, not event payloads. Give
+            # the resumed worker the same-PR constraint before it starts.
+            _kb.add_comment(
+                conn, task_id, author="dispatcher",
+                body=f"PR recovery: {', '.join(pr_recovery['pr_urls'])}\n"
+                     f"{pr_recovery['recovery']}",
+            )
+        _kb._log.info(
+            "kanban active_pr recovery claimed task=%s run=%s prior_run=%s reason=%s prs=%s",
+            task_id, claimed.current_run_id, pr_recovery["prior_run_id"],
+            pr_recovery["recovery_reason"], pr_recovery["pr_urls"],
+        )
     from hermes_cli import kanban_db_receipt as _kbr
 
     plan = None

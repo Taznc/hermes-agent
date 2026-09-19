@@ -66,6 +66,15 @@ def test_malformed_config_shape_keeps_the_current_caps():
     assert after.max_in_progress == before.max_in_progress
 
 
+def test_active_dispatch_interval_is_finite_even_for_yaml_nonfinite_values():
+    import math
+
+    for raw in (float("nan"), float("inf"), "nan", "inf"):
+        settings = _settings(dispatch_interval_seconds=raw)
+        assert math.isfinite(settings.interval), "nonfinite intervals busy-spin or sleep forever"
+        assert settings.interval >= 1
+
+
 def test_interval_is_not_changed_by_a_reload():
     """The loop sleeps on the boot interval; reloading must not desync it."""
     before = _settings(dispatch_interval_seconds=30)

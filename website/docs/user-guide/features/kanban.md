@@ -1002,6 +1002,16 @@ protocol. If the worker process exits with status 0 while the task is still
 `running`, the dispatcher treats that as a protocol violation and emits a
 `protocol_violation` event.
 
+Both worker entry paths (`chat -q <prompt>` and quiet `chat -q <prompt> -Q`) preserve the agent's
+structured failure result: generic provider failures exit **1**, while verified
+rate-limit/billing failures exit **75** (`EX_TEMPFAIL`) through the existing quota
+publication and reaper policy. A missing or malformed quota reset deadline still
+uses the bounded interruption policy; exit 75 does not invent a reset time.
+Provider aborts are not model text stops and must not be reported as clean-exit
+protocol violations. A genuine text stop with no lifecycle call is recorded at
+the process boundary, fenced to the worker's current run; an already-recorded
+completion is left untouched.
+
 **Agent-side prevention:** Before the worker exits, Hermes injects up to two
 synthetic nudges when it detects the model is about to stop without a terminal
 board tool call. This catches the common case where the model narrates the next
