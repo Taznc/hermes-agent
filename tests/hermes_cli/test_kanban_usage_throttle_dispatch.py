@@ -457,6 +457,41 @@ def test_missing_signal_produces_a_visible_degraded_tick_and_no_route_change(
     assert spawner.calls[0]["argv_model"] == "claude-opus-5"
 
 
+def test_unsupported_source_provider_is_visible_at_the_dispatch_surface(
+    board_home, monkeypatch,
+):
+    """AC4 at the surface an operator actually reads.
+
+    The throttle's own tests prove the classification; this proves the
+    dispatcher reports it rather than flattening it into the generic
+    no-signal record, and that the tick behaves exactly as it would without
+    the feature. ``xai`` is named deliberately — its unsupported verdict comes
+    from the real capability table, so a table that drifted to "supported"
+    would fail here instead of silently throttling on a fabricated reading.
+    """
+    _use_config(
+        monkeypatch, _throttle_cfg(source_providers=["xai"]),
+    )
+    kt.reset_signal_cache()
+    _ready_task(model="claude-opus-5", provider="anthropic")
+
+    spawner = _Spawner()
+    result = _tick(spawn_fn=spawner, max_in_progress=3)
+
+    state = result.usage_throttle
+    assert state["degraded"] is True
+    assert state["degraded_reason"] == kt.DEGRADED_UNSUPPORTED_SOURCE
+    # The remedy differs from a transient miss: pointing at `/usage` would send
+    # the operator chasing a reading this provider never serves.
+    assert "source_providers" in state["recovery"]
+    assert "/usage" not in state["recovery"]
+    assert state["pressure_percent"] is None
+    # No signal, no guess: the card dispatches on the operator's own route.
+    assert len(result.spawned) == 1
+    assert result.throttle_rerouted == []
+    assert spawner.calls[0]["argv_model"] == "claude-opus-5"
+
+
 def test_stale_signal_holds_the_state_instead_of_recovering(board_home, monkeypatch):
     _use_config(monkeypatch, _throttle_cfg())
     _pressure(monkeypatch, 97.0)

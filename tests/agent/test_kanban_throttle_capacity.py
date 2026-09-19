@@ -54,11 +54,11 @@ def test_grok_is_unsupported_under_every_spelling(spelling):
     assert "404" in capability.evidence
 
 
-def test_unsupported_provider_yields_a_reason_and_never_a_snapshot():
-    """The whole point of the unsupported verdict: no fabricated reading."""
-    snapshot, reason = cap.fetch_capacity_snapshot("xai")
-    assert snapshot is None
-    assert reason == cap.UNSUPPORTED_PROVIDER
+def test_unsupported_provider_yields_no_snapshot_and_never_reaches_the_network():
+    """The whole point of the unsupported verdict: no fabricated reading, and
+    no fetch attempt either — the capability table settles it outright."""
+    assert cap.capability_for("xai").supported is False
+    assert cap.fetch_capacity_snapshot("xai") is None
 
 
 def test_unknown_provider_is_unsupported_rather_than_assumed_readable():
@@ -66,8 +66,7 @@ def test_unknown_provider_is_unsupported_rather_than_assumed_readable():
     assumed to have a signal."""
     capability = cap.capability_for("some-provider-that-does-not-exist")
     assert capability.supported is False
-    snapshot, reason = cap.fetch_capacity_snapshot("some-provider-that-does-not-exist")
-    assert (snapshot, reason) == (None, cap.UNSUPPORTED_PROVIDER)
+    assert cap.fetch_capacity_snapshot("some-provider-that-does-not-exist") is None
 
 
 def test_capability_derives_from_the_live_fetcher_registry(monkeypatch):
@@ -263,22 +262,29 @@ def test_supported_provider_routes_through_the_shared_usage_fetcher(monkeypatch)
         return fetched
 
     monkeypatch.setattr(account_usage, "fetch_account_usage", _fetch, raising=True)
-    snapshot, reason = cap.fetch_capacity_snapshot("codex")
-    assert reason is None
-    assert snapshot is fetched
+    assert cap.fetch_capacity_snapshot("codex") is fetched
+    # The alias resolved to the canonical key before the fetch, so one account's
+    # quota can never be read under another account's name.
     assert called == ["openai-codex"]
 
 
-def test_supported_provider_that_fails_is_distinct_from_unsupported(monkeypatch):
-    """(None, None) vs (None, UNSUPPORTED): retry helps in one case only."""
+def test_supported_provider_that_fails_never_raises_onto_the_dispatch_path(monkeypatch):
+    """A failing fetch yields None rather than propagating.
+
+    The supported-vs-unsupported distinction is carried by the CAPABILITY, not
+    by this return value — which is exactly why both must be consulted: a
+    caller that read only the None would conflate "network blipped, retry
+    helps" with "this provider will never answer".
+    """
     from agent import account_usage
 
     def _boom(provider, **kw):
         raise RuntimeError("network")
 
     monkeypatch.setattr(account_usage, "fetch_account_usage", _boom, raising=True)
-    assert cap.fetch_capacity_snapshot("openai-codex") == (None, None)
-    assert cap.fetch_capacity_snapshot("xai") == (None, cap.UNSUPPORTED_PROVIDER)
+    assert cap.fetch_capacity_snapshot("openai-codex") is None
+    assert cap.capability_for("openai-codex").supported is True
+    assert cap.capability_for("xai").supported is False
 
 
 def test_nous_is_dispatched_to_the_fork_adapter_not_the_usage_fetcher(monkeypatch):
@@ -295,7 +301,7 @@ def test_nous_is_dispatched_to_the_fork_adapter_not_the_usage_fetcher(monkeypatc
         cap, "nous_capacity_snapshot", lambda: "sentinel", raising=True
     )
     monkeypatch.setitem(cap._ADAPTERS, "nous", cap.nous_capacity_snapshot)
-    assert cap.fetch_capacity_snapshot("nous") == ("sentinel", None)
+    assert cap.fetch_capacity_snapshot("nous") == "sentinel"
 
 
 def test_reset_at_is_carried_through_for_a_credit_period(portal):

@@ -269,8 +269,8 @@ def _fetch_snapshot(provider: str, *, timeout: float):
     """Wall-clock-bounded authenticated fetch through the capacity adapters.
 
     :func:`agent.kanban_throttle_capacity.fetch_capacity_snapshot` already fails
-    open; the pool bounds a hung socket so a slow provider cannot stall a
-    dispatch tick.  Returns ``(snapshot, unsupported_reason)``.
+    open to ``None``; the pool bounds a hung socket so a slow provider cannot
+    stall a dispatch tick.
     """
     import concurrent.futures
 
@@ -281,23 +281,31 @@ def _fetch_snapshot(provider: str, *, timeout: float):
 
 
 def _cached_snapshot(provider: str, *, cfg: ThrottleConfig, now: float):
-    """``(snapshot_or_None, unsupported_reason_or_None)``, memoized per poll.
-
-    An unsupported provider is cached like any other answer: it is a stable
-    fact, so re-deriving it every tick would buy nothing.
-    """
     with _cache_lock:
         entry = _snapshot_cache.get(provider)
         if entry is not None and entry[0] > now:
             return entry[1]
     try:
-        result = _fetch_snapshot(provider, timeout=cfg.fetch_timeout_seconds)
+        snapshot = _fetch_snapshot(provider, timeout=cfg.fetch_timeout_seconds)
     except Exception:
         logger.debug("kanban throttle: %s capacity fetch failed", provider, exc_info=True)
-        result = (None, None)
+        snapshot = None
     with _cache_lock:
-        _snapshot_cache[provider] = (now + cfg.poll_interval_seconds, result)
-    return result
+        _snapshot_cache[provider] = (now + cfg.poll_interval_seconds, snapshot)
+    return snapshot
+
+
+def _unsupported_reason(provider: str) -> Optional[str]:
+    """``unsupported_provider`` when no adapter can ever answer for *provider*.
+
+    Answered from the capability table alone, so it costs no network call and is
+    settled BEFORE the fetch seam: "never readable" and "did not answer this
+    time" are different operator problems, and deciding them at different points
+    is what keeps them from collapsing into one reason code.
+    """
+    from agent.kanban_throttle_capacity import UNSUPPORTED_PROVIDER, capability_for
+
+    return None if capability_for(provider).supported else UNSUPPORTED_PROVIDER
 
 
 def _worst_active_window(snapshot) -> tuple[Optional[float], Optional[str]]:
@@ -349,12 +357,14 @@ def capacity_signal(
 ) -> CapacitySignal:
     """Read one provider's capacity, classifying every unusable case by name."""
     current = int(time.time()) if now is None else int(now)
-    snapshot, unsupported = _cached_snapshot(provider, cfg=cfg, now=float(current))
+    unsupported = _unsupported_reason(provider)
     if unsupported is not None:
-        # No adapter will ever answer for this provider.  Distinct from a failed
-        # fetch: retrying cannot help, so the operator's action is to change the
-        # configured source rather than to wait.
+        # No adapter will ever answer for this provider.  Decided before the
+        # fetch, so an unsupported provider costs no network call at all, and is
+        # distinct from a failed fetch: retrying cannot help, so the operator's
+        # action is to change the configured source rather than to wait.
         return CapacitySignal(provider=provider, fresh=False, reason=unsupported)
+    snapshot = _cached_snapshot(provider, cfg=cfg, now=float(current))
     if snapshot is None:
         return CapacitySignal(provider=provider, fresh=False, reason="fetch_unavailable")
     if getattr(snapshot, "unavailable_reason", None):
@@ -418,15 +428,23 @@ def _degraded_classification(
     the board's state exactly where it is; only the operator's remedy differs,
     and the record has to say which one it is or the hint sends them to
     `hermes /usage` for an account that will never report.
-    """
-    from agent.kanban_throttle_capacity import UNSUPPORTED_PROVIDER
 
-    detail = tuple(
-        f"{s.provider}:{s.reason or 'unknown'}" for s in signals
-    )
+    An unsupported provider's detail carries the adapters' own EVIDENCE for
+    that verdict, because "unsupported" with no justification is indistinguish-
+    able from a bug: the operator has to be able to see that the provider was
+    actually probed and serves no quota document, without reading source.
+    """
+    from agent.kanban_throttle_capacity import UNSUPPORTED_PROVIDER, capability_for
+
+    detail = []
+    for signal in signals:
+        reason = signal.reason or "unknown"
+        if reason == UNSUPPORTED_PROVIDER:
+            reason = f"{reason} ({capability_for(signal.provider).evidence})"
+        detail.append(f"{signal.provider}:{reason}")
     if signals and all(s.reason == UNSUPPORTED_PROVIDER for s in signals):
-        return DEGRADED_UNSUPPORTED_SOURCE, _UNSUPPORTED_HINT, detail
-    return DEGRADED_NO_SIGNAL, _RECOVERY_HINT, detail
+        return DEGRADED_UNSUPPORTED_SOURCE, _UNSUPPORTED_HINT, tuple(detail)
+    return DEGRADED_NO_SIGNAL, _RECOVERY_HINT, tuple(detail)
 
 
 # --- Persistent global state -------------------------------------------

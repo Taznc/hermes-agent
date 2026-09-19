@@ -3,6 +3,12 @@
 Covers the seam between :mod:`agent.kanban_throttle_capacity` and
 :mod:`agent.kanban_throttle`: exhaustion semantics, the unsupported-provider
 degraded state, and the guarantee that an unusable reading mutates no route.
+
+The unsupported-provider cases deliberately do NOT fake a verdict — they name
+``xai``, which the real capability table reports as unsupported on its own
+evidence. Stubbing that answer would let the table drift to "supported" while
+these tests stayed green, which is precisely the failure this card exists to
+prevent.
 """
 
 from __future__ import annotations
@@ -59,10 +65,12 @@ def _snapshot(**kw) -> AccountUsageSnapshot:
 
 @pytest.fixture
 def capacity(monkeypatch):
-    """Install a fake result at the authenticated adapter seam.
+    """Install a fake snapshot at the authenticated adapter seam.
 
     Patched on ``kanban_throttle_capacity`` because the throttle late-imports
-    ``fetch_capacity_snapshot`` from there inside the function.
+    ``fetch_capacity_snapshot`` from there inside the function. Only the
+    NETWORK half is faked: whether a provider is supported at all still comes
+    from the real capability table.
     """
 
     def _install(result):
@@ -87,10 +95,9 @@ def test_account_level_limit_reached_reads_as_full_pressure(cfg, capacity):
     ``used_percent``. Trusting the number would admit workers onto a closed
     account.
     """
-    capacity((
-        _snapshot(limit_reached=True,
-                  windows=(AccountUsageWindow(label="Session", used_percent=3.0),)),
-        None,
+    capacity(_snapshot(
+        limit_reached=True,
+        windows=(AccountUsageWindow(label="Session", used_percent=3.0),),
     ))
     signal = kt.capacity_signal("openai-codex", cfg=cfg)
     assert signal.fresh is True
@@ -100,10 +107,9 @@ def test_account_level_limit_reached_reads_as_full_pressure(cfg, capacity):
 
 def test_allowed_false_reads_as_full_pressure(cfg, capacity):
     """``allowed`` is the other half of the same statement."""
-    capacity((
-        _snapshot(allowed=False,
-                  windows=(AccountUsageWindow(label="Session", used_percent=5.0),)),
-        None,
+    capacity(_snapshot(
+        allowed=False,
+        windows=(AccountUsageWindow(label="Session", used_percent=5.0),),
     ))
     assert kt.capacity_signal("openai-codex", cfg=cfg).used_percent == 100.0
 
@@ -112,19 +118,16 @@ def test_exhausted_account_with_no_parseable_window_is_still_full(cfg, capacity)
     """"Provider says it is closed" is a stronger fact than "no window
     parsed" — without this the board would hold its old state while the
     account is provably spent."""
-    capacity((_snapshot(allowed=False, windows=()), None))
+    capacity(_snapshot(allowed=False, windows=()))
     signal = kt.capacity_signal("openai-codex", cfg=cfg)
     assert signal.fresh is True
     assert signal.used_percent == 100.0
 
 
 def test_per_window_limit_reached_wins_over_its_own_percentage(cfg, capacity):
-    capacity((
-        _snapshot(windows=(
-            AccountUsageWindow(label="Weekly", used_percent=8.0, limit_reached=True),
-        )),
-        None,
-    ))
+    capacity(_snapshot(windows=(
+        AccountUsageWindow(label="Weekly", used_percent=8.0, limit_reached=True),
+    )))
     signal = kt.capacity_signal("openai-codex", cfg=cfg)
     assert signal.used_percent == 100.0
     assert signal.window_label == "Weekly"
@@ -133,14 +136,11 @@ def test_per_window_limit_reached_wins_over_its_own_percentage(cfg, capacity):
 def test_an_inactive_exhausted_window_is_still_skipped(cfg, capacity):
     """``is_active is False`` is the provider saying the window is not
     counting; a stale limit flag on it must not manufacture pressure."""
-    capacity((
-        _snapshot(windows=(
-            AccountUsageWindow(label="Old", used_percent=10.0, limit_reached=True,
-                               is_active=False),
-            AccountUsageWindow(label="Now", used_percent=20.0, is_active=True),
-        )),
-        None,
-    ))
+    capacity(_snapshot(windows=(
+        AccountUsageWindow(label="Old", used_percent=10.0, limit_reached=True,
+                           is_active=False),
+        AccountUsageWindow(label="Now", used_percent=20.0, is_active=True),
+    )))
     signal = kt.capacity_signal("openai-codex", cfg=cfg)
     assert signal.used_percent == 20.0
     assert signal.window_label == "Now"
@@ -149,13 +149,10 @@ def test_an_inactive_exhausted_window_is_still_skipped(cfg, capacity):
 def test_healthy_snapshot_is_unaffected_by_the_exhaustion_path(cfg, capacity):
     """Regression guard: the ordinary case must still report the worst active
     window verbatim."""
-    capacity((
-        _snapshot(allowed=True, limit_reached=False, windows=(
-            AccountUsageWindow(label="Session", used_percent=19.0, is_active=True),
-            AccountUsageWindow(label="Weekly", used_percent=64.0, is_active=True),
-        )),
-        None,
-    ))
+    capacity(_snapshot(allowed=True, limit_reached=False, windows=(
+        AccountUsageWindow(label="Session", used_percent=19.0, is_active=True),
+        AccountUsageWindow(label="Weekly", used_percent=64.0, is_active=True),
+    )))
     signal = kt.capacity_signal("openai-codex", cfg=cfg)
     assert (signal.used_percent, signal.window_label) == (64.0, "Weekly")
     assert signal.reason is None
@@ -171,6 +168,17 @@ def test_unsupported_provider_is_reported_by_name_not_as_a_fetch_failure(cfg):
     assert signal.fresh is False
     assert signal.used_percent is None
     assert signal.reason == cap.UNSUPPORTED_PROVIDER
+
+
+def test_unsupported_provider_is_settled_without_any_fetch(cfg, monkeypatch):
+    """The verdict is a property of the provider, so it must cost no network
+    call — an unsupported source cannot become a per-tick timeout budget."""
+    monkeypatch.setattr(
+        cap, "fetch_capacity_snapshot",
+        lambda provider: pytest.fail(f"fetched unsupported provider {provider!r}"),
+        raising=True,
+    )
+    assert kt.capacity_signal("xai", cfg=cfg).reason == cap.UNSUPPORTED_PROVIDER
 
 
 def test_all_sources_unsupported_degrades_with_the_actionable_hint(cfg):
@@ -189,12 +197,9 @@ def test_all_sources_unsupported_degrades_with_the_actionable_hint(cfg):
 def test_a_readable_provider_beside_an_unsupported_one_still_drives_state(capacity):
     """One bad entry in ``source_providers`` must not blind the throttle to a
     provider that does report."""
-    capacity(lambda provider: (
-        (_snapshot(provider="anthropic", windows=(
-            AccountUsageWindow(label="Weekly", used_percent=75.0, is_active=True),
-        )), None)
-        if provider == "anthropic" else (None, cap.UNSUPPORTED_PROVIDER)
-    ))
+    capacity(lambda provider: _snapshot(provider="anthropic", windows=(
+        AccountUsageWindow(label="Weekly", used_percent=75.0, is_active=True),
+    )) if provider == "anthropic" else None)
     decision = kt.evaluate_throttle(
         kanban_cfg={"usage_throttle": {"source_providers": ["xai", "anthropic"]}},
         now=2_000,
@@ -207,9 +212,7 @@ def test_a_readable_provider_beside_an_unsupported_one_still_drives_state(capaci
 def test_mixed_unsupported_and_failed_fetch_uses_the_generic_hint(capacity):
     """Only an ALL-unsupported read is a configuration error; a provider that
     could have answered but did not is the ordinary transient case."""
-    capacity(lambda provider: (
-        (None, None) if provider == "anthropic" else (None, cap.UNSUPPORTED_PROVIDER)
-    ))
+    capacity(lambda provider: None)
     decision = kt.evaluate_throttle(
         kanban_cfg={"usage_throttle": {"source_providers": ["xai", "anthropic"]}},
         now=3_000,
@@ -221,7 +224,7 @@ def test_mixed_unsupported_and_failed_fetch_uses_the_generic_hint(capacity):
 # --- No route mutation without a signal ---------------------------------
 
 
-def test_unsupported_source_mutates_no_route(capacity):
+def test_unsupported_source_mutates_no_route():
     """AC4: a degraded state leaves every spawn's route exactly as filed."""
     decision = kt.evaluate_throttle(
         kanban_cfg={
@@ -245,12 +248,9 @@ def test_unsupported_source_mutates_no_route(capacity):
 def test_unsupported_failover_destination_declines_the_reroute(capacity):
     """A destination with no capacity contract is unknown, not spare
     capacity."""
-    capacity(lambda provider: (
-        (_snapshot(provider="anthropic", windows=(
-            AccountUsageWindow(label="Weekly", used_percent=97.0, is_active=True),
-        )), None)
-        if provider == "anthropic" else (None, cap.UNSUPPORTED_PROVIDER)
-    ))
+    capacity(lambda provider: _snapshot(provider="anthropic", windows=(
+        AccountUsageWindow(label="Weekly", used_percent=97.0, is_active=True),
+    )) if provider == "anthropic" else None)
     decision = kt.evaluate_throttle(
         kanban_cfg={
             "usage_throttle": {
@@ -273,12 +273,9 @@ def test_unsupported_failover_destination_declines_the_reroute(capacity):
 def test_declined_unsupported_destination_is_audited_once_per_episode(capacity):
     """The refusal has to be visible, and visible again after recovery — but
     not once per spawn in between."""
-    capacity(lambda provider: (
-        (_snapshot(provider="anthropic", windows=(
-            AccountUsageWindow(label="Weekly", used_percent=97.0, is_active=True),
-        )), None)
-        if provider == "anthropic" else (None, cap.UNSUPPORTED_PROVIDER)
-    ))
+    capacity(lambda provider: _snapshot(provider="anthropic", windows=(
+        AccountUsageWindow(label="Weekly", used_percent=97.0, is_active=True),
+    )) if provider == "anthropic" else None)
     kanban_cfg = {
         "usage_throttle": {
             "source_providers": ["anthropic"],
@@ -304,12 +301,11 @@ def test_declined_unsupported_destination_is_audited_once_per_episode(capacity):
 # --- Secrecy ------------------------------------------------------------
 
 
-def test_degraded_audit_records_reason_codes_only(capacity):
+def test_degraded_audit_records_reason_codes_only():
     """AC5: the audit trail is durable and operator-visible, so a payload that
     echoed a provider response would persist a leak."""
     import re
 
-    capacity((None, cap.UNSUPPORTED_PROVIDER))
     kt.evaluate_throttle(
         kanban_cfg={"usage_throttle": {"source_providers": ["xai", "grok"]}},
         now=7_000,
@@ -322,11 +318,29 @@ def test_degraded_audit_records_reason_codes_only(capacity):
     assert not re.search(r"[A-Za-z0-9_-]{40,}", blob)
 
 
+def test_unsupported_audit_carries_the_evidence_for_the_verdict():
+    """AC1: "unsupported" without justification is indistinguishable from a
+    bug.  The operator must be able to see the provider WAS probed and serves
+    no quota document, from the record alone — not by reading source."""
+    kt.evaluate_throttle(
+        kanban_cfg={"usage_throttle": {"source_providers": ["xai"]}}, now=7_500,
+    )
+    payloads = [
+        e["payload"] for e in kt.recent_throttle_events(50)
+        if e["payload"].get("reason") == kt.DEGRADED_UNSUPPORTED_SOURCE
+    ]
+    assert payloads, "the unsupported condition must be recorded"
+    detail = " ".join(payloads[0]["provider_detail"])
+    assert cap.UNSUPPORTED_PROVIDER in detail
+    # The evidence is the capability table's own text, carried verbatim, so the
+    # record cannot drift from the verdict it justifies.
+    assert cap.capability_for("xai").evidence in detail
+
+
 def test_public_state_of_an_exhausted_account_carries_no_payload(capacity):
-    capacity((
-        _snapshot(limit_reached=True, allowed=False,
-                  windows=(AccountUsageWindow(label="Session", used_percent=2.0),)),
-        None,
+    capacity(_snapshot(
+        limit_reached=True, allowed=False,
+        windows=(AccountUsageWindow(label="Session", used_percent=2.0),),
     ))
     decision = kt.evaluate_throttle(
         kanban_cfg={"usage_throttle": {"source_providers": ["openai-codex"]}},
@@ -345,10 +359,9 @@ def test_public_state_of_an_exhausted_account_carries_no_payload(capacity):
 # --- Restart / multi-board persistence ----------------------------------
 
 
-def test_unsupported_degraded_state_survives_a_restart(capacity):
+def test_unsupported_degraded_state_survives_a_restart():
     """The state row is shared across board dispatchers and restarts; a
     re-import must not re-emit the same episode."""
-    capacity((None, cap.UNSUPPORTED_PROVIDER))
     kanban_cfg = {"usage_throttle": {"source_providers": ["xai"]}}
     kt.evaluate_throttle(kanban_cfg=kanban_cfg, now=9_000)
     first = len(kt.recent_throttle_events(50))
@@ -356,9 +369,8 @@ def test_unsupported_degraded_state_survives_a_restart(capacity):
     assert len(kt.recent_throttle_events(50)) == first
 
 
-def test_dry_run_reports_unsupported_without_writing_history(capacity):
+def test_dry_run_reports_unsupported_without_writing_history():
     """A report of what a tick WOULD do must not manufacture a record."""
-    capacity((None, cap.UNSUPPORTED_PROVIDER))
     decision = kt.evaluate_throttle(
         kanban_cfg={"usage_throttle": {"source_providers": ["xai"]}},
         now=10_000, persist=False,

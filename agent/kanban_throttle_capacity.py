@@ -297,30 +297,34 @@ _ADAPTERS: dict[str, Callable[[], Optional[Any]]] = {
 }
 
 
-def fetch_capacity_snapshot(provider: Optional[str]) -> tuple[Optional[Any], Optional[str]]:
-    """``(snapshot, reason)`` for one provider.
+def fetch_capacity_snapshot(provider: Optional[str]) -> Optional[Any]:
+    """One provider's authenticated capacity snapshot, or ``None``.
 
-    Exactly one side is meaningful: a snapshot means the provider answered, and
-    a reason means it cannot be asked at all.  A supported provider that simply
-    failed to answer returns ``(None, None)`` — the caller classifies that as a
-    transient fetch failure, which is a different operator action from a
-    provider that will never have a signal.
+    ``None`` means *this attempt produced nothing* — a failed fetch, a logged-out
+    account, an adapter that declined to build a window.  It deliberately does
+    NOT mean "unsupported": that verdict is a stable property of the provider,
+    answered by :func:`capability_for` without any network call, and the caller
+    is expected to consult it first so the two are never conflated.  Routing an
+    unsupported provider here anyway still yields ``None`` rather than a guess.
+
+    Never raises: this runs on the dispatch path, where an exception would wedge
+    admission for every board.
     """
     capability = capability_for(provider)
     if not capability.supported:
-        return None, UNSUPPORTED_PROVIDER
+        return None
     adapter = _ADAPTERS.get(capability.provider)
     try:
         if adapter is not None:
-            return adapter(), None
+            return adapter()
         from agent.account_usage import fetch_account_usage
 
-        return fetch_account_usage(capability.provider), None
+        return fetch_account_usage(capability.provider)
     except Exception:
         logger.debug(
             "capacity: %s snapshot fetch failed", capability.provider, exc_info=True
         )
-        return None, None
+        return None
 
 
 __all__ = [
