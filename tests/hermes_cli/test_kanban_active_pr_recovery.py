@@ -140,6 +140,7 @@ def test_explicit_review_rework_releases_old_evidence_not_new_comments_or_other_
     assert kb.request_changes(
         conn, tid, reason="Fix failing check on the existing PR",
         expected_run_id=review.current_run_id,
+        blockers=[{"basis": "original_ac", "reference": "test acceptance contract"}],
     ) == (True, "builder")
     assert kbd.check_respawn_guard(conn, tid) is None
     recovery = {}
