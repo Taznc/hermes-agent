@@ -151,6 +151,107 @@ def test_bounded_copy_of_a_live_growing_list_terminates():
     assert isinstance(out["growing"], list)
 
 
+class _SlowKey:
+    """A mapping key whose hash is slow.
+
+    The copier hashes every key it writes into the output dict, so this puts the cost in the
+    ORDINARY container walk — the exact frame the wedged gateway was sampled in
+    (``_copy_node`` iterating a dict), not in a delegated ``__deepcopy__``.
+    """
+
+    def __init__(self, name: str, delay: float):
+        self.name = name
+        self.delay = delay
+
+    def __hash__(self):
+        time.sleep(self.delay)
+        return hash(self.name)
+
+    def __eq__(self, other):
+        return isinstance(other, _SlowKey) and other.name == self.name
+
+
+def test_elapsed_ceiling_fires_during_an_ordinary_walk_of_a_tiny_tree():
+    """The wall-clock ceiling must bind on SMALL trees, inside the plain container walk.
+
+    Regression for the gateway wedge: the deadline used to be sampled every 4096th node, so a
+    tree with fewer nodes than that never evaluated it even once and ran unbounded. The
+    gateway's own config tree is 449 nodes, so its nominal 5s budget was dead code. This is a
+    behaviour contract — "a copy that overruns its budget raises" — not a node-count snapshot,
+    and the cost sits where the wedge's own stack sat rather than behind ``copy.deepcopy``.
+    """
+    budget_s = 0.25
+    per_node = budget_s / 2
+    source = {_SlowKey(f"k{i}", per_node): i for i in range(8)}
+
+    assert count_nodes(source) < 20, "this test is only meaningful on a tiny tree"
+    unbounded_cost = per_node * len(source)
+    assert unbounded_cost > budget_s * 2, "the copy must be able to overrun its budget"
+
+    started = time.monotonic()
+    with pytest.raises(BoundedCopyBreach) as excinfo:
+        bounded_deepcopy(source, node_limit=2_000_000, time_budget_s=budget_s)
+    elapsed = time.monotonic() - started
+
+    assert excinfo.value.limit == "elapsed"
+    # Bounded by the budget plus the one in-flight node it cannot interrupt, and strictly less
+    # than letting the walk run to completion: the ceiling actually cut the copy short.
+    assert elapsed < unbounded_cost, f"copy ran {elapsed:.2f}s — its ceiling did not bind"
+    assert elapsed < budget_s + per_node * 2, f"copy ran {elapsed:.2f}s past its ceiling"
+
+
+def test_elapsed_ceiling_binds_a_copy_whose_whole_cost_is_one_delegated_node():
+    """A value handed to ``copy.deepcopy`` is charged as ONE node; the clock must still bind.
+
+    An arbitrary object's ``__deepcopy__`` can run for any length of time and cannot be
+    interrupted from outside, so no per-node check can pre-empt it. The contract is that such
+    a copy still RAISES rather than returning a value produced far past its ceiling — which is
+    what the caller's fail-closed fallback (``thaw`` of the last good tree) depends on.
+    """
+    budget_s = 0.25
+    slow_per_node = budget_s * 4
+
+    class SlowLeaf:
+        """Not a dict/list/tuple/scalar, so the copier delegates to copy.deepcopy."""
+
+        def __deepcopy__(self, memo):
+            time.sleep(slow_per_node)
+            return SlowLeaf()
+
+    source = {"slow": SlowLeaf()}
+    assert count_nodes(source) < 10, "this test is only meaningful on a tiny tree"
+
+    started = time.monotonic()
+    with pytest.raises(BoundedCopyBreach) as excinfo:
+        bounded_deepcopy(source, node_limit=2_000_000, time_budget_s=budget_s)
+    elapsed = time.monotonic() - started
+
+    assert excinfo.value.limit == "elapsed"
+    # Bounded by the budget plus the one in-flight node it cannot interrupt, not by a
+    # hardcoded duration: the copy must not be allowed to run indefinitely.
+    assert elapsed < budget_s + slow_per_node * 2, f"copy ran {elapsed:.2f}s past its ceiling"
+
+
+def test_node_ceiling_still_reports_the_node_limit_not_the_clock():
+    """The added entry/exit clock checks must not relabel a node-limit breach."""
+    source = {"small": [1, 2, 3], "huge": [[0] * 50 for _ in range(2000)]}
+    with pytest.raises(BoundedCopyBreach) as excinfo:
+        bounded_deepcopy(source, node_limit=500, time_budget_s=3600.0)
+    assert excinfo.value.limit == "node"
+    assert excinfo.value.top_key == "huge"
+
+
+def test_thaw_has_no_ceilings_and_never_breaches():
+    """``thaw`` is the fail-closed fallback for a breached copy; it must never itself breach."""
+
+    class SlowLeaf:
+        def __deepcopy__(self, memo):
+            time.sleep(0.05)
+            return SlowLeaf()
+
+    assert thaw({"slow": SlowLeaf()})["slow"] is not None
+
+
 def test_breach_names_the_offending_top_level_key():
     """Fail-closed reporting: the breach must name the key an operator has to look at."""
     source = {"small": [1, 2, 3], "huge": [[0] * 50 for _ in range(2000)]}

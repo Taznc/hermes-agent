@@ -18,7 +18,12 @@ def test_claude_subscription_proxy_is_loopback_only_and_requires_client_authorit
 
 
 def test_claude_proxy_preserves_openai_json_object_response_format():
-    """Hindsight's soft structured-output mode must reach Anthropic enforcement."""
+    """Hindsight's soft structured-output mode must reach Anthropic enforcement.
+
+    Anthropic requires ``additionalProperties`` to be explicit on an object
+    schema; without it the request 400s, which is terminal (400 is not a
+    failover status), so the bridge supplies the permissive-mode default.
+    """
     _, raw, _ = prepare_chat_request({
         "model": "claude-sonnet-4-6",
         "messages": [{"role": "user", "content": "Return valid json only."}],
@@ -29,13 +34,17 @@ def test_claude_proxy_preserves_openai_json_object_response_format():
     assert wire["output_config"] == {
         "format": {
             "type": "json_schema",
-            "schema": {"type": "object"},
+            "schema": {"type": "object", "additionalProperties": False},
         }
     }
 
 
 def test_claude_proxy_translates_openai_json_schema_response_format():
-    """A supplied schema must reach Anthropic without the OpenAI wrapper keys."""
+    """A supplied schema must reach Anthropic without the OpenAI wrapper keys.
+
+    The top-level ``additionalProperties: false`` Anthropic now demands is
+    injected; the caller's own dict is never mutated.
+    """
     schema = {
         "type": "object",
         "properties": {"verdict": {"type": "string"}},
@@ -51,7 +60,70 @@ def test_claude_proxy_translates_openai_json_schema_response_format():
     })
 
     wire = json.loads(raw)
-    assert wire["output_config"] == {"format": {"type": "json_schema", "schema": schema}}
+    assert wire["output_config"] == {
+        "format": {
+            "type": "json_schema",
+            "schema": {**schema, "additionalProperties": False},
+        }
+    }
+    assert "additionalProperties" not in schema
+
+
+@pytest.mark.parametrize("schema,expected", [
+    pytest.param(
+        {"type": "object", "properties": {"a": {"type": "string"}}},
+        {"type": "object", "properties": {"a": {"type": "string"}}, "additionalProperties": False},
+        id="object-without-the-key-gains-the-default",
+    ),
+    pytest.param(
+        {"type": "object", "additionalProperties": True},
+        {"type": "object", "additionalProperties": True},
+        id="explicit-true-is-never-overridden",
+    ),
+    pytest.param(
+        {"type": "object", "additionalProperties": False},
+        {"type": "object", "additionalProperties": False},
+        id="explicit-false-is-left-alone",
+    ),
+    pytest.param(
+        {"type": "object", "additionalProperties": {"type": "string"}},
+        {"type": "object", "additionalProperties": {"type": "string"}},
+        id="explicit-subschema-is-left-alone",
+    ),
+    pytest.param(
+        {"type": "array", "items": {"type": "object"}},
+        {"type": "array", "items": {"type": "object"}},
+        id="non-object-top-level-is-untouched",
+    ),
+    pytest.param(
+        {"type": "object", "properties": {"nested": {"type": "object"}}},
+        {
+            "type": "object",
+            "properties": {"nested": {"type": "object"}},
+            "additionalProperties": False,
+        },
+        id="nested-objects-are-deliberately-not-rewritten",
+    ),
+    pytest.param(
+        {"$ref": "#/definitions/Thing"},
+        {"$ref": "#/definitions/Thing"},
+        id="schema-without-a-type-is-untouched",
+    ),
+])
+def test_claude_proxy_supplies_additional_properties_conservatively(schema, expected):
+    """Anthropic demands the key on object schemas; the bridge adds no more.
+
+    Rewriting a caller's schema tree is a semantic change this bridge has no
+    mandate to make, so the injection is scoped to the top-level object and an
+    explicit value of any kind survives exactly as written.
+    """
+    _, raw, _ = prepare_chat_request({
+        "model": "claude-sonnet-4-6",
+        "messages": [{"role": "user", "content": "Grade this."}],
+        "response_format": {"type": "json_schema", "json_schema": {"name": "o", "schema": schema}},
+    })
+
+    assert json.loads(raw)["output_config"]["format"]["schema"] == expected
 
 
 @pytest.mark.parametrize("response_format", [None, {"type": "text"}])
@@ -140,6 +212,81 @@ def test_claude_proxy_translates_tool_request_and_response():
     assert choice["message"]["tool_calls"][0]["function"]["name"] == "lookup"
     assert choice["message"]["tool_calls"][1]["function"]["name"] == "session_search"
     assert json.loads(choice["message"]["tool_calls"][0]["function"]["arguments"]) == {"id": 7}
+
+
+def _reasoning_wire(*, model="claude-sonnet-5", **extra):
+    _, raw, _ = prepare_chat_request({
+        "model": model,
+        "messages": [{"role": "user", "content": "hi"}],
+        **extra,
+    })
+    return raw
+
+
+def test_claude_proxy_absent_reasoning_effort_is_byte_identical_to_explicit_null():
+    """The additive guarantee is on the serialized body, not key presence."""
+    without_key = _reasoning_wire()
+    explicit_null = _reasoning_wire(reasoning_effort=None)
+
+    assert without_key == explicit_null
+    assert b"thinking" not in without_key
+    assert b"output_config" not in without_key
+
+
+@pytest.mark.parametrize("effort,expected", [
+    ("low", "low"),
+    ("high", "high"),
+    ("minimal", "low"),
+    ("ultra", "max"),
+])
+def test_claude_proxy_forwards_client_sent_reasoning_effort(effort, expected):
+    wire = json.loads(_reasoning_wire(reasoning_effort=effort))
+
+    assert wire["thinking"] == {"type": "adaptive", "display": "summarized"}
+    assert wire["output_config"]["effort"] == expected
+
+
+def test_claude_proxy_downgrades_xhigh_for_sonnet_4_6():
+    """Sonnet/Opus 4.6 400 on ``xhigh``; the shared adapter maps it to max."""
+    wire = json.loads(_reasoning_wire(
+        model="claude-sonnet-4-6", reasoning_effort="xhigh"
+    ))
+
+    assert wire["output_config"]["effort"] == "max"
+
+
+def test_claude_proxy_leaves_xhigh_on_a_model_that_accepts_it():
+    wire = json.loads(_reasoning_wire(
+        model="claude-opus-4-8", reasoning_effort="xhigh"
+    ))
+
+    assert wire["output_config"]["effort"] == "xhigh"
+
+
+def test_claude_proxy_omits_thinking_for_haiku_even_when_effort_is_sent():
+    """Haiku has no extended thinking; asking must not create an upstream 400."""
+    wire = json.loads(_reasoning_wire(
+        model="claude-haiku-4-5", reasoning_effort="high"
+    ))
+
+    assert "thinking" not in wire
+    assert "output_config" not in wire
+
+
+def test_claude_proxy_merges_effort_and_structured_output_config():
+    """Effort and format share output_config; neither may overwrite the other."""
+    wire = json.loads(_reasoning_wire(
+        reasoning_effort="high", response_format={"type": "json_object"}
+    ))
+
+    assert wire["output_config"]["effort"] == "high"
+    assert wire["output_config"]["format"]["schema"]["additionalProperties"] is False
+
+
+@pytest.mark.parametrize("effort", ["extreme", 5, True])
+def test_claude_proxy_rejects_unusable_reasoning_effort(effort):
+    with pytest.raises(ValueError, match="reasoning_effort"):
+        _reasoning_wire(reasoning_effort=effort)
 
 
 def test_claude_proxy_reverses_oauth_tool_aliases_in_streaming_response():

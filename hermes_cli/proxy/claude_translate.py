@@ -7,15 +7,42 @@ never logged.  Existing Hermes conversion code owns tool/message normalization.
 from __future__ import annotations
 
 import json
+import re
 import time
 import uuid
 from typing import Any, Dict, Iterable, cast
 
-from agent.anthropic_adapter import _get_claude_code_version, build_anthropic_kwargs
+from agent.anthropic_adapter import ADAPTIVE_EFFORT_MAP, _get_claude_code_version, build_anthropic_kwargs
 
 _ANTHROPIC_VERSION = "2023-06-01"
 _OAUTH_BETAS = "claude-code-20250219,oauth-2025-04-20"
 _STOP_REASONS = {"end_turn": "stop", "tool_use": "tool_calls", "max_tokens": "length", "stop_sequence": "stop"}
+
+# Anthropic content blocks this bridge recognizes but deliberately does not emit.
+# Claude 4.6+ thinks adaptively by DEFAULT, so an ordinary 200 routinely carries
+# ``thinking`` ahead of ``text``; refusing those blocks turned valid responses
+# into ``invalid_success_body``.  They are skipped rather than concatenated
+# because reasoning text is not part of the assistant's answer and must never
+# reach the OpenAI ``content`` a client will show or parse.  The set is named
+# and explicit so the accepted vocabulary stays auditable — any block type
+# outside it still fails closed.
+_NON_EMITTING_BLOCK_TYPES = frozenset({"thinking", "redacted_thinking"})
+
+
+class UntranslatableBlockError(ValueError):
+    """An Anthropic content block this bridge cannot express in Chat Completions.
+
+    Carries the offending type so a caller's telemetry can name it without
+    touching the block's contents, which may hold user or reasoning text.
+    """
+
+    def __init__(self, block_type: Any) -> None:
+        self.block_type = (
+            block_type
+            if isinstance(block_type, str) and re.fullmatch(r"[A-Za-z0-9_.:-]{1,64}", block_type)
+            else None
+        )
+        super().__init__(f"unsupported Anthropic content block type: {block_type!r}")
 
 
 def _wire_to_client_tool_names(payload_tools: Any, anthropic_tools: Any) -> Dict[str, str]:
@@ -43,14 +70,34 @@ def _wire_to_client_tool_names(payload_tools: Any, anthropic_tools: Any) -> Dict
     return {wire_name: client_name for client_name, wire_name in zip(client_names, wire_names) if wire_name}
 
 
+def _object_schema_with_additional_properties(schema: Dict[str, Any]) -> Dict[str, Any]:
+    """Return ``schema`` guaranteed to declare ``additionalProperties``.
+
+    Anthropic now refuses an object schema that leaves the key implicit:
+    ``output_config.format.schema: For 'object' type, 'additionalProperties'
+    must be explicitly set to false``.  OpenAI callers routinely omit it, so the
+    bridge supplies the default rather than handing them a 400 that no failover
+    can rescue (HTTP 400 is terminal by policy).
+
+    Deliberately conservative: only the TOP-LEVEL object gains the key, an
+    explicit value of any kind is left exactly as the caller wrote it, and the
+    caller's dict is never mutated.  Nested objects are untouched because
+    rewriting a caller's schema tree is a semantic change this bridge has no
+    mandate to make; a nested omission still surfaces as Anthropic's own error.
+    """
+    if schema.get("type") != "object" or "additionalProperties" in schema:
+        return schema
+    return {**schema, "additionalProperties": False}
+
+
 def _anthropic_output_format(response_format: Any) -> Dict[str, Any] | None:
     """Translate an OpenAI ``response_format`` to an Anthropic output format.
 
     Anthropic enforces structured output through a JSON Schema, so OpenAI's
-    schema-less ``json_object`` mode maps to the permissive ``{"type": "object"}``
-    schema.  ``text`` is OpenAI's explicit unconstrained mode and correctly
-    produces no enforcement.  Anything this bridge cannot express faithfully
-    raises instead of silently downgrading the caller to free prose.
+    schema-less ``json_object`` mode maps to the permissive object schema.
+    ``text`` is OpenAI's explicit unconstrained mode and correctly produces no
+    enforcement.  Anything this bridge cannot express faithfully raises instead
+    of silently downgrading the caller to free prose.
 
     ``agent.auxiliary_client._translate_anthropic_response_format`` performs the
     same mapping for in-process SDK calls but drops shapes it cannot handle,
@@ -65,7 +112,7 @@ def _anthropic_output_format(response_format: Any) -> Dict[str, Any] | None:
     if kind == "text":
         return None
     if kind == "json_object":
-        return {"type": "json_schema", "schema": {"type": "object"}}
+        return {"type": "json_schema", "schema": {"type": "object", "additionalProperties": False}}
     if kind == "json_schema":
         wrapper = response_format.get("json_schema")
         schema = wrapper.get("schema") if isinstance(wrapper, dict) else None
@@ -73,8 +120,34 @@ def _anthropic_output_format(response_format: Any) -> Dict[str, Any] | None:
             raise ValueError("response_format json_schema requires a schema object")
         # OpenAI-only wrapper keys (name/strict/description) have no Anthropic
         # equivalent and are 400s upstream, so only the schema travels.
-        return {"type": "json_schema", "schema": schema}
+        return {"type": "json_schema", "schema": _object_schema_with_additional_properties(schema)}
     raise ValueError(f"unsupported response_format type: {kind!r}")
+
+
+def _reasoning_config(payload: Dict[str, Any]) -> Dict[str, Any] | None:
+    """Translate a client-sent OpenAI ``reasoning_effort`` to a reasoning config.
+
+    Strictly additive: absent the field the wire stays byte-identical to what
+    every existing caller already sends, because ``build_anthropic_kwargs``
+    applies no thinking parameter for a ``None`` config.  When a client does
+    ask, the shared adapter owns the mapping — adaptive vs budget models, the
+    ``xhigh`` -> ``max`` downgrade, and Haiku's lack of extended thinking.
+
+    An unrecognized spelling raises rather than silently resolving to a default
+    effort: a caller that asked for one depth and quietly got another is billed
+    for a request it did not make.
+    """
+    effort = payload.get("reasoning_effort")
+    if effort is None:
+        return None
+    if not isinstance(effort, str):
+        raise ValueError("reasoning_effort must be a string")
+    normalized = effort.strip().lower()
+    if normalized == "none":
+        return {"enabled": False}
+    if normalized not in ADAPTIVE_EFFORT_MAP:
+        raise ValueError(f"unsupported reasoning_effort: {effort!r}")
+    return {"effort": normalized}
 
 
 def prepare_chat_request(payload: Dict[str, Any]) -> tuple[Dict[str, str], bytes, Dict[str, str]]:
@@ -98,7 +171,7 @@ def prepare_chat_request(payload: Dict[str, Any]) -> tuple[Dict[str, str], bytes
         messages=messages,
         tools=payload.get("tools") if isinstance(payload.get("tools"), list) else None,
         max_tokens=int(max_tokens),
-        reasoning_config=None,
+        reasoning_config=_reasoning_config(payload),
         tool_choice=tool_choice if isinstance(tool_choice, str) else None,
         is_oauth=True,
         base_url="https://api.anthropic.com/v1",
@@ -151,8 +224,10 @@ def response_to_openai(message: Dict[str, Any], *, tool_name_map: Dict[str, str]
                 "name": (tool_name_map or {}).get(name, name),
                 "arguments": json.dumps(tool_input, separators=(",", ":")),
             }})
+        elif block_type in _NON_EMITTING_BLOCK_TYPES:
+            continue
         else:
-            raise ValueError(f"unsupported Anthropic content block type: {block_type!r}")
+            raise UntranslatableBlockError(block_type)
     usage = message.get("usage", {})
     if not isinstance(usage, dict):
         raise ValueError("Anthropic message usage must be an object")
