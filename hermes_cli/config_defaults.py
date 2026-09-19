@@ -1833,8 +1833,14 @@ DEFAULT_CONFIG = {
         "usage_throttle": {
             "enabled": True,
             # Accounts whose quota drives admission. Each must be a provider
-            # `hermes /usage` can read with real authenticated credentials; a
-            # provider with no signal produces a degraded record, never a guess.
+            # with an authenticated machine-readable capacity signal; a
+            # provider with no signal produces a degraded record, never a
+            # guess. Supported today: `anthropic` (OAuth usage windows),
+            # `openai-codex` (usage-API rate-limit windows) and `nous`
+            # (Portal subscription credit balance). `xai`/Grok is NOT
+            # supported — an inference credential is served no quota document
+            # — so naming it here yields a visible unsupported state and no
+            # throttling, never an invented number.
             "source_providers": ["anthropic"],
             # A reading older than this is stale and is not acted on.
             "signal_max_age_seconds": 900,

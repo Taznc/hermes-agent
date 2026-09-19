@@ -63,10 +63,21 @@ _STATE_RANK = {STATE_NORMAL: 0, STATE_REDUCE: 1, STATE_DOWNGRADE: 2, STATE_DRAIN
 #: deduplication and rendered to operators.
 DEGRADED_NO_SIGNAL = "no_fresh_capacity_signal"
 DEGRADED_FAILOVER_DESTINATION = "failover_destination_capacity_unknown"
+#: Every configured source provider is one this build has no capacity contract
+#: for.  Separated from ``DEGRADED_NO_SIGNAL`` because the operator action is
+#: completely different: no amount of waiting or re-authenticating will produce
+#: a reading, the configuration itself names a provider that cannot be read.
+DEGRADED_UNSUPPORTED_SOURCE = "configured_providers_unsupported"
 
 _RECOVERY_HINT = (
     "check `hermes /usage` for the configured provider account, or set "
     "kanban.usage_throttle.enabled=false to disable admission throttling"
+)
+
+_UNSUPPORTED_HINT = (
+    "set kanban.usage_throttle.source_providers to an account with an "
+    "authenticated quota signal, or set kanban.usage_throttle.enabled=false "
+    "to disable admission throttling"
 )
 
 
@@ -255,30 +266,38 @@ def reset_signal_cache() -> None:
 
 
 def _fetch_snapshot(provider: str, *, timeout: float):
-    """Wall-clock-bounded authenticated fetch.  ``fetch_account_usage`` already
-    fails open to ``None``; the pool bounds a hung socket so a slow provider
-    cannot stall a dispatch tick."""
+    """Wall-clock-bounded authenticated fetch through the capacity adapters.
+
+    :func:`agent.kanban_throttle_capacity.fetch_capacity_snapshot` already fails
+    open; the pool bounds a hung socket so a slow provider cannot stall a
+    dispatch tick.  Returns ``(snapshot, unsupported_reason)``.
+    """
     import concurrent.futures
 
-    from agent.account_usage import fetch_account_usage
+    from agent.kanban_throttle_capacity import fetch_capacity_snapshot
 
     with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
-        return pool.submit(fetch_account_usage, provider).result(timeout=timeout)
+        return pool.submit(fetch_capacity_snapshot, provider).result(timeout=timeout)
 
 
 def _cached_snapshot(provider: str, *, cfg: ThrottleConfig, now: float):
+    """``(snapshot_or_None, unsupported_reason_or_None)``, memoized per poll.
+
+    An unsupported provider is cached like any other answer: it is a stable
+    fact, so re-deriving it every tick would buy nothing.
+    """
     with _cache_lock:
         entry = _snapshot_cache.get(provider)
         if entry is not None and entry[0] > now:
             return entry[1]
     try:
-        snapshot = _fetch_snapshot(provider, timeout=cfg.fetch_timeout_seconds)
+        result = _fetch_snapshot(provider, timeout=cfg.fetch_timeout_seconds)
     except Exception:
         logger.debug("kanban throttle: %s capacity fetch failed", provider, exc_info=True)
-        snapshot = None
+        result = (None, None)
     with _cache_lock:
-        _snapshot_cache[provider] = (now + cfg.poll_interval_seconds, snapshot)
-    return snapshot
+        _snapshot_cache[provider] = (now + cfg.poll_interval_seconds, result)
+    return result
 
 
 def _worst_active_window(snapshot) -> tuple[Optional[float], Optional[str]]:
@@ -288,14 +307,23 @@ def _worst_active_window(snapshot) -> tuple[Optional[float], Optional[str]]:
     window is not currently counting, and ``None`` means it did not say — which
     must not be read as "inactive", or a provider that omits the field would
     silently report no pressure at all.
+
+    A window the provider marks ``limit_reached`` counts as fully consumed
+    whatever percentage it reports beside that flag.  Codex serves exactly this
+    shape — ``limit_reached`` true alongside a low ``used_percent`` — and taking
+    the percentage at face value would admit a wave of workers onto an account
+    the provider has already closed.  The flag is the provider's own
+    authoritative statement, so honouring it is faithfulness, not estimation.
     """
     worst: Optional[float] = None
     label: Optional[str] = None
     for window in getattr(snapshot, "windows", ()) or ():
-        used = getattr(window, "used_percent", None)
-        if used is None or isinstance(used, bool) or not isinstance(used, (int, float)):
-            continue
         if getattr(window, "is_active", None) is False:
+            continue
+        used = getattr(window, "used_percent", None)
+        if getattr(window, "limit_reached", None) is True:
+            used = 100.0
+        if used is None or isinstance(used, bool) or not isinstance(used, (int, float)):
             continue
         value = float(used)
         if worst is None or value > worst:
@@ -303,12 +331,30 @@ def _worst_active_window(snapshot) -> tuple[Optional[float], Optional[str]]:
     return worst, label
 
 
+def _snapshot_exhausted(snapshot) -> bool:
+    """The provider states this account cannot currently serve requests.
+
+    Snapshot-wide counterpart to the per-window flag: Codex reports
+    ``allowed``/``limit_reached`` at the top level of its usage payload, and an
+    account in that state has zero capacity regardless of which window is worst.
+    """
+    return (
+        getattr(snapshot, "limit_reached", None) is True
+        or getattr(snapshot, "allowed", None) is False
+    )
+
+
 def capacity_signal(
     provider: str, *, cfg: ThrottleConfig, now: Optional[int] = None,
 ) -> CapacitySignal:
     """Read one provider's capacity, classifying every unusable case by name."""
     current = int(time.time()) if now is None else int(now)
-    snapshot = _cached_snapshot(provider, cfg=cfg, now=float(current))
+    snapshot, unsupported = _cached_snapshot(provider, cfg=cfg, now=float(current))
+    if unsupported is not None:
+        # No adapter will ever answer for this provider.  Distinct from a failed
+        # fetch: retrying cannot help, so the operator's action is to change the
+        # configured source rather than to wait.
+        return CapacitySignal(provider=provider, fresh=False, reason=unsupported)
     if snapshot is None:
         return CapacitySignal(provider=provider, fresh=False, reason="fetch_unavailable")
     if getattr(snapshot, "unavailable_reason", None):
@@ -327,6 +373,15 @@ def capacity_signal(
             provider=provider, fresh=False, observed_at=observed_at, reason="stale",
         )
     used, label = _worst_active_window(snapshot)
+    if _snapshot_exhausted(snapshot):
+        # Account-level exhaustion outranks any window reading, including a
+        # snapshot that carries no usable window at all: "provider says it is
+        # closed" is a stronger, fresher fact than "no window parsed".
+        return CapacitySignal(
+            provider=provider, fresh=True, used_percent=100.0,
+            window_label=label or "account", observed_at=observed_at,
+            reason="provider_limit_reached",
+        )
     if used is None:
         return CapacitySignal(
             provider=provider, fresh=False, observed_at=observed_at,
@@ -351,6 +406,27 @@ def worst_capacity_signal(
     if not usable:
         return None, read
     return max(usable, key=lambda s: s.used_percent or 0.0), read
+
+
+def _degraded_classification(
+    signals: Sequence[CapacitySignal],
+) -> tuple[str, str, tuple[str, ...]]:
+    """``(reason, recovery hint, per-provider detail)`` for an unusable read.
+
+    Distinguishes "configured to read a provider that has no capacity contract"
+    from "a provider that does have one did not answer this time".  Both hold
+    the board's state exactly where it is; only the operator's remedy differs,
+    and the record has to say which one it is or the hint sends them to
+    `hermes /usage` for an account that will never report.
+    """
+    from agent.kanban_throttle_capacity import UNSUPPORTED_PROVIDER
+
+    detail = tuple(
+        f"{s.provider}:{s.reason or 'unknown'}" for s in signals
+    )
+    if signals and all(s.reason == UNSUPPORTED_PROVIDER for s in signals):
+        return DEGRADED_UNSUPPORTED_SOURCE, _UNSUPPORTED_HINT, detail
+    return DEGRADED_NO_SIGNAL, _RECOVERY_HINT, detail
 
 
 # --- Persistent global state -------------------------------------------
@@ -636,8 +712,20 @@ class ThrottleDecision:
             "drain": self.drain,
             "downgrade": self.downgrade,
             "operator_intent": dict(self.operator_intent or {}),
-            "recovery": _RECOVERY_HINT if self.degraded else None,
+            "recovery": self.recovery_hint,
         }
+
+    @property
+    def recovery_hint(self) -> Optional[str]:
+        """What the operator should actually DO about the current degraded
+        state.  An unsupported source provider is not fixed by checking
+        `/usage`, so pointing there would send them chasing a reading that
+        cannot exist."""
+        if not self.degraded:
+            return None
+        if self.degraded_reason == DEGRADED_UNSUPPORTED_SOURCE:
+            return _UNSUPPORTED_HINT
+        return _RECOVERY_HINT
 
 
 def _lever_for(state: str, cfg: ThrottleConfig) -> Optional[LeverConfig]:
@@ -708,7 +796,7 @@ def evaluate_throttle(
         # Fully inert: no fetch, no state row, no events.
         return _inert_decision(cfg, current_time)
 
-    signal, _all_signals = worst_capacity_signal(cfg=cfg, now=current_time)
+    signal, all_signals = worst_capacity_signal(cfg=cfg, now=current_time)
 
     with _write_conn() as conn:
         stored = _read_state(conn)
@@ -717,10 +805,11 @@ def evaluate_throttle(
 
         if not persist:
             if signal is None or signal.used_percent is None:
+                reason, _hint, _detail = _degraded_classification(all_signals)
                 return ThrottleDecision(
                     enabled=True, state=previous, previous_state=previous, changed=False,
                     pressure_percent=None, provider=None, window_label=None, degraded=True,
-                    degraded_reason=DEGRADED_NO_SIGNAL, observed_at=current_time,
+                    degraded_reason=reason, observed_at=current_time,
                     operator_intent=intent, config=cfg,
                 )
             resolved = next_state(previous, float(signal.used_percent), cfg)
@@ -736,7 +825,7 @@ def evaluate_throttle(
             # Unknown pressure: hold the persisted state verbatim in BOTH
             # directions and say so.  One degraded episode records once; a
             # later episode (after a healthy reading) records again.
-            reason = DEGRADED_NO_SIGNAL
+            reason, hint, detail = _degraded_classification(all_signals)
             degraded_since = stored.get("degraded_since") or current_time
             if stored.get("degraded_reason") != reason or not stored.get("degraded_since"):
                 _record_event(
@@ -744,13 +833,18 @@ def evaluate_throttle(
                     {
                         "reason": reason, "state": previous,
                         "providers": list(cfg.source_providers),
-                        "recovery": _RECOVERY_HINT,
+                        # Per-provider reason CODES only: the adapters classify
+                        # every failure by name, and none of those names carry a
+                        # credential, account identifier or payload fragment.
+                        "provider_detail": list(detail),
+                        "recovery": hint,
                     },
                     now=current_time,
                 )
                 logger.warning(
-                    "kanban usage throttle: no fresh capacity signal; holding state %r "
-                    "and making no speculative change (%s)", previous, _RECOVERY_HINT,
+                    "kanban usage throttle: no usable capacity signal (%s); holding "
+                    "state %r and making no speculative change (%s)",
+                    reason, previous, hint,
                 )
             _write_state(conn, {
                 **stored, "state": previous, "operator_intent": intent,
@@ -997,6 +1091,8 @@ def plan_route_change(
 
 __all__ = [
     "STATE_DRAIN", "STATE_DOWNGRADE", "STATE_NORMAL", "STATE_REDUCE",
+    "DEGRADED_FAILOVER_DESTINATION", "DEGRADED_NO_SIGNAL",
+    "DEGRADED_UNSUPPORTED_SOURCE",
     "CapacitySignal", "RoutePlan", "ThrottleConfig", "ThrottleDecision",
     "capacity_signal", "evaluate_throttle", "failover_eligible_profiles",
     "load_throttle_config", "next_state", "plan_failover", "plan_route_change",
