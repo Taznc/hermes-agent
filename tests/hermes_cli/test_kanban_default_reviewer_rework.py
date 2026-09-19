@@ -228,6 +228,7 @@ def test_later_manual_reviewer_assignment_does_not_hide_implementer_snapshot(
         assert kb.request_changes(
             conn, tid, reason="manual reviewer feedback",
             expected_run_id=review.current_run_id,
+            blockers=[{"basis": "original_ac", "reference": "test acceptance contract"}],
         ) == (True, "claudeprimary")
 
         task = kb.get_task(conn, tid)
