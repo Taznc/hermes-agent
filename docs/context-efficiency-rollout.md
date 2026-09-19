@@ -86,24 +86,64 @@ skills:
     - autonomous-ai-agents
 ```
 
-## Measured effect
+## Measured effect — fresh Desktop session, `system_prompts` table
 
-Before/after on a real profile (`hermes_cli/prompt_size.py::compute_prompt_breakdown`,
-platform=`cli`, 86 total installed skills, identical skill set both runs):
+Round-1 review correctly rejected the original measurement
+(`compute_prompt_breakdown(platform="cli")` on an 86-skill profile) as not
+evidence for the Desktop default on the real 127-skill population. Re-measured
+with a script
+(`/tmp/desktop_fresh_session_probe.py` — throwaway, not committed) that:
 
-| | before | after | Δ |
+1. Builds two isolated `HERMES_HOME` temp dirs, each **symlinking** the real
+   `/home/hermes/.hermes/skills` (the actual 127-skill installed population,
+   not a synthetic stand-in) and seeding `config.yaml` from the live file
+   (`skills.compact_categories: []` for "before", the recommended list above
+   for "after" — never hand-written from scratch).
+2. Resolves the Desktop toolset list through the REAL production path,
+   `tui_gateway.server._load_enabled_toolsets(platform="desktop")` (the same
+   function the Desktop backend calls), then constructs a real
+   `platform="desktop"` `AIAgent` and calls `agent.system_prompt.build_system_prompt`.
+3. Persists the rendered prompt into that isolated home's `state.db` via
+   `SessionDB.create_session(..., system_prompt=full_prompt)` and reads it
+   back from the **`system_prompts` table** (`SELECT sp.prompt FROM sessions
+   s JOIN system_prompts sp ON sp.hash = s.system_prompt_hash`), asserting the
+   persisted bytes equal the rendered bytes — this is the literal Desktop
+   session-creation path, not an offline breakdown tool.
+
+Results (both runs against the identical real skill population):
+
+| | before (`compact_categories: []`) | after (recommended list) | Δ |
 |---|---:|---:|---:|
-| `<available_skills>` index | 8,739 B | 4,769 B | **-45.4%** |
-| system prompt total | 16,252 B | 12,322 B | -24.2% |
-| skill names present | 86 | 86 | 0 (never hidden) |
+| `<available_skills>` block | 11,858 B | 6,836 B | **-42.4%** |
+| system prompt total | 27,124 B | 22,128 B | -18.4% |
+| skill names rendered in index | 122 | 122 | 0 (never hidden) |
 
-45.4% exceeds the ≥40% acceptance bar. Every one of the 86 skill names was
-present in both the before and after index (script-verified: `names_match`).
+42.4% exceeds the ≥40% acceptance bar (AC1), measured from the
+`system_prompts` table of a session built through the real Desktop
+construction path (AC1's exact ask).
 
-Applying this to a session with more installed skills / a larger shared
-library scales proportionally — the demoted categories' full descriptions
-are removed entirely from the wire cost and replaced by one shared
-comma-joined names line.
+### AC2 — every installed skill still appears
+
+Installed-name census (`agent.skill_utils.get_all_skills_dirs` +
+`iter_skill_index_files`) against the same symlinked population finds **127**
+directories with a `SKILL.md`. The rendered index (both before AND after)
+contains **122** of them; the identical 5-name gap in both runs is
+pre-existing, unrelated to this change, and never regresses:
+
+- `apple-notes`, `apple-reminders`, `findmy` (all `platforms: [macos]` —
+  filtered by `skill_matches_platform` on this Linux host; would render on
+  macOS) — `agent/skill_utils.py`.
+- `imessage` (`platforms: [macos]`, same gate).
+- `research-paper-writing` (`metadata.hermes.requires_toolsets: [terminal,
+  files]` in its frontmatter — `_skill_should_show`'s conditional-activation
+  gate hides it because `"files"` is not a real toolset name in this
+  install's `available_toolsets`) — pre-existing frontmatter issue in the
+  skill itself, not something `compact_categories` touches.
+
+`before_names == after_names` (both sets of 122 are byte-identical) is the
+load-bearing assertion: the config change moves categories to names-only, it
+does not drop a single visible name. The 5-name gap is orthogonal, was
+present before this task started, and is out of scope for it.
 
 ## Cache safety
 
