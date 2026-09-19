@@ -7,26 +7,88 @@ controls an operator reaches for during a drain/restart.
 
 from __future__ import annotations
 
+import logging
+import sqlite3
 import time
 import uuid
-from typing import Any, Optional
+from contextlib import closing, contextmanager
+from functools import partial
+from typing import Any, Callable, Iterator, Optional
 
 from fastapi import APIRouter, HTTPException, Query
 from pydantic import BaseModel
 
 from hermes_cli import kanban_db
+from hermes_cli import kanban_db_connect as kbc
 from hermes_cli import kanban_db_dispatch as kbd
 from hermes_cli import kanban_db_dispatch_postdrain as kbpd
 from hermes_cli import kanban_quota_circuit as kqc
 
-from plugins.kanban.dashboard._common import (
-    _BOARD_Q_DESCRIPTION,
-    _board_conn,
-    _resolve_board,
-    _with_board_pinned,
-)
+log = logging.getLogger(__name__)
 
-_BOARD_Q = Query(None, description=_BOARD_Q_DESCRIPTION)
+# This module is deliberately self-contained (no shared ``_common``/sibling
+# import) rather than depending on plugin_api.py: it is the one genuinely
+# fork-only slice of the dashboard router (zero upstream commits touch this
+# code), so it must not gain an import edge back into the upstream-owned
+# facade. See t_2e2c6479 review round 1 — the other proposed sibling
+# extractions (boards/recovery/worker-visibility/a shared "_common") were
+# reverted because they relocated upstream-owned code and increased
+# merge-conflict surface against upstream/main instead of reducing it.
+
+
+def _normalize_slug_or_400(slug: str) -> Optional[str]:
+    with _value_error_400():
+        return kanban_db._normalize_board_slug(slug)
+
+
+def _resolve_board(board: Optional[str]) -> Optional[str]:
+    """Validate/normalise a board slug query param (400 malformed, 404 unknown);
+    ``None`` when omitted so ``kbc.connect()`` falls through to the active board."""
+    if board is None or board == "":
+        return None
+    normed = _normalize_slug_or_400(board)
+    if normed and normed != kanban_db.DEFAULT_BOARD and not kanban_db.board_exists(normed):
+        raise HTTPException(status_code=404, detail=f"board {normed!r} does not exist")
+    return normed
+
+
+def _conn(board: Optional[str] = None):
+    """Connect to the already-normalised ``board`` (``None`` = active). ``init_db`` is
+    idempotent; running it here lets a fresh install self-heal if POST /tasks arrives first."""
+    try:
+        kanban_db.init_db(board=board)
+    except Exception as exc:
+        log.warning("kanban init_db failed: %s", exc)
+    return kbc.connect(board=board)
+
+
+@contextmanager
+def _board_conn(board: Optional[str]) -> Iterator[tuple[Optional[str], sqlite3.Connection]]:
+    """Resolve the ``board`` query param, open a connection, close it on exit."""
+    board = _resolve_board(board)
+    with closing(_conn(board=board)) as conn:
+        yield board, conn
+
+
+def _with_board_pinned(board: Optional[str], fn: Callable[[], Any]) -> Any:
+    """Run ``fn`` with the board pinned context-locally, not via the process-global
+    ``HERMES_KANBAN_BOARD`` env var (concurrent requests for different boards would cross-write)."""
+    with kanban_db.scoped_current_board(_resolve_board(board) or kanban_db.DEFAULT_BOARD):
+        return fn()
+
+
+@contextmanager
+def _map_errors(status: int, *types: type[BaseException]) -> Iterator[None]:
+    """Map the given exception types to ``HTTPException(status, str(exc))``."""
+    try:
+        yield
+    except types as e:
+        raise HTTPException(status_code=status, detail=str(e))
+
+
+_value_error_400 = partial(_map_errors, 400, ValueError)  # domain-layer validation refusals
+
+_BOARD_Q = Query(None, description="Kanban board slug (omit for current)")
 
 router = APIRouter()
 

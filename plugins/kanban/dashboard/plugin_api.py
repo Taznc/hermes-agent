@@ -10,6 +10,7 @@ dispatcher's write txns); it carries its credential in the query string (browser
 from __future__ import annotations
 
 import asyncio
+import base64
 import importlib
 import json
 import logging
@@ -18,56 +19,39 @@ import sqlite3
 import time
 import uuid
 from concurrent.futures import ThreadPoolExecutor
-from contextlib import closing
+from contextlib import closing, contextmanager
 from dataclasses import asdict
+from functools import partial
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any, Callable, Iterator, Optional
 
-from fastapi import APIRouter, HTTPException, Query, WebSocket, WebSocketDisconnect, status as http_status
+from fastapi import (
+    APIRouter, File, Form, HTTPException, Query, UploadFile, WebSocket, WebSocketDisconnect, status as http_status)
+from fastapi.responses import FileResponse
 from pydantic import BaseModel, Field
 
 from hermes_cli import kanban_db
 from hermes_cli import kanban_db_connect as kbc
 from hermes_cli import kanban_db_notify as kbn
 from hermes_cli import kanban_db_dispatch as kbd
+from hermes_cli import kanban_db_workspace as kbw
 from hermes_cli import kanban_diagnostics as kd
+from hermes_cli.kanban_db import KANBAN_ATTACHMENT_MAX_BYTES, _collision_free_path, _safe_attachment_name
 
-from plugins.kanban.dashboard import attachments_router as _attachments_router
-from plugins.kanban.dashboard import boards_router as _boards_router
 from plugins.kanban.dashboard import dispatch_pause_router as _dispatch_pause_router
-from plugins.kanban.dashboard import recovery_router as _recovery_router
-from plugins.kanban.dashboard import worker_visibility_router as _worker_visibility_router
-from plugins.kanban.dashboard._common import (
-    BOARD_COLUMNS,
-    _attachment_dict,
-    _board_conn,
-    _conflict,
-    _conn,
-    _errors_to_500,
-    _map_errors,
-    _projects_by_id,
-    _require_ok,
-    _require_task,
-    _resolve_board,
-    _run_aux,
-    _value_error_400,
-    _with_board_pinned,
-)
 
 log = logging.getLogger(__name__)
 
 router = APIRouter()
 
-# Each sibling module owns one topical slice of the dashboard's routes; this facade
-# just mounts them alongside its own remaining handlers (board/task CRUD, comments,
-# diagnostics, profiles, decompose, orchestration settings, the /events WebSocket).
-# No route path, method, or response shape changes across the split — see the
-# corresponding test files under tests/plugins/test_kanban_*.py.
-router.include_router(_attachments_router.router)
-router.include_router(_worker_visibility_router.router)
-router.include_router(_recovery_router.router)
+# ``dispatch_pause_router`` is the one genuinely fork-only slice (dispatch pause
+# circuit, post-drain actions, quota circuits) — zero upstream commits touch it,
+# so extracting it is a strict reduction in collision surface. The other sibling
+# extractions attempted in round 1 (boards/recovery/worker-visibility/attachments/
+# _common) were reverted: they relocated upstream-owned code and INCREASED
+# merge-conflict surface against upstream/main (6 hunks -> 8) instead of reducing
+# it. See t_2e2c6479 review round 1 for the measured evidence.
 router.include_router(_dispatch_pause_router.router)
-router.include_router(_boards_router.router)
 
 _BOARD_Q = Query(None, description="Kanban board slug (omit for current)")
 
@@ -85,7 +69,131 @@ def _ws_upgrade_authorized(ws: "WebSocket") -> bool:
     return bool(_ws._ws_auth_ok(ws))
 
 
+def _normalize_slug_or_400(slug: str) -> Optional[str]:
+    with _value_error_400():
+        return kanban_db._normalize_board_slug(slug)
+
+
+def _resolve_board(board: Optional[str]) -> Optional[str]:
+    """Validate/normalise a board slug query param (400 malformed, 404 unknown);
+    ``None`` when omitted so ``kb.connect()`` falls through to the active board."""
+    if board is None or board == "":
+        return None
+    normed = _normalize_slug_or_400(board)
+    if normed and normed != kanban_db.DEFAULT_BOARD and not kanban_db.board_exists(normed):
+        raise HTTPException(status_code=404, detail=f"board {normed!r} does not exist")
+    return normed
+
+
+def _existing_board_slug(slug: str) -> str:
+    """Normalise a path slug and require the board to exist (400 / 404)."""
+    normed = _normalize_slug_or_400(slug)
+    if not normed or not kanban_db.board_exists(normed):
+        raise HTTPException(status_code=404, detail=f"board {slug!r} does not exist")
+    return normed
+
+
+def _conn(board: Optional[str] = None):
+    """Connect to the already-normalised ``board`` (``None`` = active). ``init_db`` is
+    idempotent; running it here lets a fresh install self-heal if POST /tasks arrives first."""
+    try:
+        kanban_db.init_db(board=board)
+    except Exception as exc:
+        log.warning("kanban init_db failed: %s", exc)
+    return kbc.connect(board=board)
+
+
+@contextmanager
+def _board_conn(board: Optional[str]) -> Iterator[tuple[Optional[str], sqlite3.Connection]]:
+    """Resolve the ``board`` query param, open a connection, close it on exit."""
+    board = _resolve_board(board)
+    with closing(_conn(board=board)) as conn:
+        yield board, conn
+
+
+def _with_board_pinned(board: Optional[str], fn: Callable[[], Any]) -> Any:
+    """Run ``fn`` with the board pinned context-locally, not via the process-global
+    ``HERMES_KANBAN_BOARD`` env var (concurrent requests for different boards would cross-write)."""
+    with kanban_db.scoped_current_board(_resolve_board(board) or kanban_db.DEFAULT_BOARD):
+        return fn()
+
+
+def _require(getter: Callable, conn: sqlite3.Connection, ident, label: str):
+    obj = getter(conn, ident)
+    if obj is None:
+        raise HTTPException(status_code=404, detail=f"{label} {ident} not found")
+    return obj
+
+
+def _run_aux(board: Optional[str], module: str, fn: str, task_id: str, author: Optional[str]) -> Any:
+    """Run a slow auxiliary-LLM task helper (``hermes_cli.<module>.<fn>``) with the board pinned;
+    the module is imported lazily so a missing aux client can't break plugin load."""
+    def _run():
+        return getattr(importlib.import_module(f"hermes_cli.{module}"), fn)(task_id, author=(author or None))
+    return _with_board_pinned(board, _run)
+
+
+def _require_task(conn: sqlite3.Connection, task_id: str) -> kanban_db.Task:
+    return _require(kanban_db.get_task, conn, task_id, "task")
+
+
+def _require_run(conn: sqlite3.Connection, run_id: int) -> kanban_db.Run:
+    return _require(kanban_db.get_run, conn, run_id, "run")
+
+
+def _require_ok(ok: bool) -> None:
+    """404 when a kanban_db mutator reports the task vanished mid-request."""
+    if not ok:
+        raise HTTPException(status_code=404, detail="task not found")
+
+
+def _conflict(detail: str) -> HTTPException:
+    return HTTPException(status_code=409, detail=detail)
+
+
+@contextmanager
+def _map_errors(status: int, *types: type[BaseException]) -> Iterator[None]:
+    """Map the given exception types to ``HTTPException(status, str(exc))``.
+
+    A refusal carrying machine-readable fields (skill preflight) becomes a dict
+    detail with the same ``code``/``profile``/``missing_skills`` contract the
+    CLI and tool surfaces emit; everything else keeps its plain string detail.
+    """
+    try:
+        yield
+    except types as e:
+        from hermes_cli.kanban_skill_preflight import structured_error_payload
+
+        raise HTTPException(status_code=status, detail=structured_error_payload(e) or str(e))
+
+
+_value_error_400 = partial(_map_errors, 400, ValueError)  # domain-layer validation refusals
+
+
+@contextmanager
+def _errors_to_500(prefix: str) -> Iterator[None]:
+    """Map any unexpected exception to ``500 "<prefix>: <exc>"``; HTTPExceptions pass through."""
+    try:
+        yield
+    except HTTPException:
+        raise
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"{prefix}: {exc}")
+
+
 # --- Serialization helpers --------------------------------------------------
+
+# Dashboard columns, left-to-right ("archived" is a filter toggle, not a column). Keep in
+# sync with kanban_db.VALID_STATUSES — a status missing here gets mis-bucketed into ``todo``.
+# ``on_hold`` is the human-initiated shelf/pause column — distinct from ``blocked`` (worker needs
+# input) and ``scheduled`` (waiting on time). ``idea``/``roadmap`` are the inert wishlist lanes:
+# real columns the UI renders, but no automation ever selects them. They LEAD the live columns
+# because the board reads left-to-right as a lifecycle: a wish is captured (idea), hashed out
+# (roadmap), and only then authorized into the work queue that starts at ``triage``.
+BOARD_COLUMNS: list[str] = [
+    "idea", "roadmap",
+    "triage", "todo", "scheduled", "ready", "running", "blocked", "on_hold", "review", "done",
+]
 
 _CARD_SUMMARY_PREVIEW_CHARS = 200
 
@@ -100,6 +208,20 @@ def _task_dict(task: kanban_db.Task, *, latest_summary: Optional[str] = None) ->
     # Latest non-null run summary (workers hand off via ``task_runs.summary``, not ``tasks.result``).
     d["latest_summary"] = latest_summary
     return d
+
+
+def _attachment_dict(a: kanban_db.Attachment) -> dict[str, Any]:
+    """``stored_path`` is the absolute on-disk path workers read; UI downloads by ``id``."""
+    return {
+        "id": a.id, "task_id": a.task_id, "filename": a.filename, "content_type": a.content_type,
+        "size": a.size, "uploaded_by": a.uploaded_by, "stored_path": a.stored_path, "created_at": a.created_at}
+
+
+def _staged_attachment_dict(a: "kanban_db.StagedAttachment") -> dict[str, Any]:
+    """Pre-submit paste flow; deliberately omits ``stored_path`` — the staged blob is a short-lived
+    client-scoped intermediate the browser already has a local Blob/preview URL for."""
+    return {"token": a.token, "filename": a.filename, "content_type": a.content_type, "size": a.size,
+            "created_at": a.created_at}
 
 
 def _placeholders(ids: list) -> str:
@@ -628,6 +750,176 @@ def create_task(payload: CreateTaskBody, board: Optional[str] = Query(None)):
             except Exception:
                 pass  # probe failure must never block the create itself
         return body
+
+
+# --- Attachments — upload / list / download / delete ------------------------
+# Size cap, filename sanitiser, and collision resolver live in ``kanban_db`` so the
+# dashboard, agent toolset, and CLI share one implementation.
+
+@router.get("/tasks/{task_id}/attachments")
+def list_task_attachments(task_id: str, board: Optional[str] = Query(None)):
+    with _board_conn(board) as (board, conn):
+        _require_task(conn, task_id)
+        return {"attachments": [_attachment_dict(a) for a in kanban_db.list_attachments(conn, task_id)]}
+
+
+@router.post("/tasks/{task_id}/attachments")
+async def upload_task_attachment(
+    task_id: str,
+    file: UploadFile = File(...),
+    board: Optional[str] = Query(None),
+    uploaded_by: Optional[str] = Form(None)):
+    """Store an upload under ``attachments_root(board)/<task_id>/`` (sanitised,
+    collision-resolved name; ``_safe_attachment_name`` ValueError → 400) and record it."""
+    with _board_conn(board) as (board, conn), _value_error_400():
+        _require_task(conn, task_id)
+        safe_name = _safe_attachment_name(file.filename or "")
+        dest_dir = kanban_db.task_attachments_dir(task_id, board=board)
+        dest_dir.mkdir(parents=True, exist_ok=True)
+        dest_path = _collision_free_path(dest_dir, safe_name)  # foo.pdf → foo (1).pdf …
+        total = 0  # stream in chunks with a hard size cap so one upload can't fill the disk
+        try:
+            with open(dest_path, "wb") as out:
+                while chunk := await file.read(1024 * 1024):
+                    total += len(chunk)
+                    if total > KANBAN_ATTACHMENT_MAX_BYTES:
+                        out.close()
+                        dest_path.unlink(missing_ok=True)
+                        raise HTTPException(
+                            status_code=413, detail=f"attachment exceeds {KANBAN_ATTACHMENT_MAX_BYTES // (1024 * 1024)} MB limit")
+                    out.write(chunk)
+        except OSError as exc:
+            raise HTTPException(status_code=500, detail=f"failed to store attachment: {exc}")
+        att_id = kanban_db.add_attachment(
+            conn, task_id, filename=dest_path.name, stored_path=str(dest_path.resolve()),
+            content_type=file.content_type, size=total, uploaded_by=(uploaded_by or "dashboard"))
+        att = kanban_db.get_attachment(conn, att_id)
+        return {"attachment": _attachment_dict(att) if att else None}
+
+
+@router.get("/attachments/{attachment_id}")
+def download_attachment(attachment_id: int, board: Optional[str] = Query(None)):
+    with _board_conn(board) as (board, conn):
+        att = kanban_db.get_attachment(conn, attachment_id)
+        if att is None:
+            raise HTTPException(status_code=404, detail="attachment not found")
+        # Defense in depth against a tampered DB row: the blob must still live under the board's attachments root.
+        root = kanban_db.attachments_root(board=board).resolve()
+        try:
+            stored = Path(att.stored_path).resolve()
+            stored.relative_to(root)
+        except (ValueError, OSError):
+            raise HTTPException(status_code=404, detail="attachment file unavailable")
+        if not stored.is_file():
+            raise HTTPException(status_code=404, detail="attachment file missing on disk")
+        return FileResponse(path=str(stored), filename=att.filename, media_type=att.content_type or "application/octet-stream")
+
+
+@router.delete("/attachments/{attachment_id}")
+def remove_attachment(attachment_id: int, board: Optional[str] = Query(None)):
+    with _board_conn(board) as (board, conn):
+        if kanban_db.delete_attachment(conn, attachment_id) is None:
+            raise HTTPException(status_code=404, detail="attachment not found")
+        return {"ok": True, "id": attachment_id}
+
+
+def _attachment_file_under_root(stored_path: str, board: Optional[str], label: str) -> Path:
+    """Defense in depth against a tampered DB row: the blob must still live under the board's
+    attachments root and exist on disk (404 otherwise)."""
+    root = kanban_db.attachments_root(board=board).resolve()
+    try:
+        stored = Path(stored_path).resolve()
+        stored.relative_to(root)
+    except (ValueError, OSError):
+        raise HTTPException(status_code=404, detail=f"{label} file unavailable")
+    if not stored.is_file():
+        raise HTTPException(status_code=404, detail=f"{label} file missing on disk")
+    return stored
+
+
+# Inline-rendering cap for the data-url endpoint: Desktop plugin REST goes through the Electron IPC
+# bridge (JSON/ArrayBuffer only, no streamed byte range a plain <img> could point at). A 10 MB pasted
+# image (KANBAN_IMAGE_ATTACHMENT_MAX_BYTES) base64-inlines fine; this guards against a larger GENERIC
+# attachment (25 MB cap) that was never meant for inline rendering — those stay download-only.
+_ATTACHMENT_INLINE_MAX_BYTES = 12 * 1024 * 1024
+
+
+@router.get("/attachments/{attachment_id}/data-url")
+def attachment_data_url(attachment_id: int, board: Optional[str] = Query(None)):
+    """Attachment bytes as a base64 data URL (JSON body) — the desktop plugin host has no
+    authenticated binary-fetch door, so rendering a pasted image inline needs the bytes delivered
+    as a data URL rather than a URL to point an ``<img>`` at."""
+    with _board_conn(board) as (board, conn):
+        att = kanban_db.get_attachment(conn, attachment_id)
+        if att is None:
+            raise HTTPException(status_code=404, detail="attachment not found")
+        stored = _attachment_file_under_root(att.stored_path, board, "attachment")
+        size = stored.stat().st_size
+        if size > _ATTACHMENT_INLINE_MAX_BYTES:
+            raise HTTPException(
+                status_code=413,
+                detail=f"attachment exceeds {_ATTACHMENT_INLINE_MAX_BYTES // (1024 * 1024)} MB inline-render limit; download it instead")
+        mime = att.content_type or "application/octet-stream"
+        encoded = base64.b64encode(stored.read_bytes()).decode("ascii")
+        return {"data_url": f"data:{mime};base64,{encoded}", "content_type": mime, "size": size}
+
+
+# --- Staged attachments — pre-task-creation pasted images ----------------------
+# (docs/design/kanban-task-image-attachments.md). Distinct from /tasks/{id}/attachments because no
+# task_id exists yet: the "new task" dialog accepts & previews a pasted image before Create.
+# Image-only (mime allowlist + 10 MB cap), unlike the generic (any mime, 25 MB) task upload.
+
+@router.post("/attachments/staged", status_code=http_status.HTTP_201_CREATED)
+async def upload_staged_attachment(
+    file: UploadFile = File(...), board: Optional[str] = Query(None), uploaded_by: Optional[str] = Form(None)):
+    """Stage a pasted image before its owning task exists: mime allowlist up front (400), then a
+    streamed read with a hard cap (413), matching ``upload_task_attachment``."""
+    board = _resolve_board(board)
+    content_type = (file.content_type or "").split(";", 1)[0].strip().lower()
+    if content_type not in kanban_db.KANBAN_IMAGE_ALLOWED_MIME_TYPES:
+        accepted = ", ".join(sorted(kanban_db.KANBAN_IMAGE_ALLOWED_MIME_TYPES))
+        raise HTTPException(
+            status_code=400, detail=f"unsupported image type: {file.content_type or 'unknown'}; accepted: {accepted}")
+    with _value_error_400():
+        safe_name = _safe_attachment_name(file.filename or "")
+    chunks: list[bytes] = []
+    total = 0
+    while chunk := await file.read(1024 * 1024):
+        total += len(chunk)
+        if total > kanban_db.KANBAN_IMAGE_ATTACHMENT_MAX_BYTES:
+            raise HTTPException(
+                status_code=413,
+                detail=f"attachment exceeds {kanban_db.KANBAN_IMAGE_ATTACHMENT_MAX_BYTES // (1024 * 1024)} MB limit")
+        chunks.append(chunk)
+    try:
+        staged = kanban_db.stage_attachment_bytes(
+            safe_name, b"".join(chunks), content_type=file.content_type,
+            uploaded_by=(uploaded_by or "dashboard"), board=board)
+    except kanban_db.AttachmentTooLarge as e:
+        raise HTTPException(status_code=413, detail=str(e))
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    return {"attachment": _staged_attachment_dict(staged)}
+
+
+@router.get("/attachments/staged/{token}")
+def download_staged_attachment(token: str, board: Optional[str] = Query(None)):
+    """Serve a staged blob (dialog reload / multi-tab parity with ``GET /attachments/{id}``)."""
+    board = _resolve_board(board)
+    staged = kanban_db.get_staged_attachment(token, board=board)
+    if staged is None:
+        raise HTTPException(status_code=404, detail="staged attachment not found")
+    stored = _attachment_file_under_root(staged.stored_path, board, "staged attachment")
+    return FileResponse(path=str(stored), filename=staged.filename,
+                        media_type=staged.content_type or "application/octet-stream")
+
+
+@router.delete("/attachments/staged/{token}")
+def remove_staged_attachment(token: str, board: Optional[str] = Query(None)):
+    board = _resolve_board(board)
+    if not kanban_db.delete_staged_attachment(token, board=board):
+        raise HTTPException(status_code=404, detail="staged attachment not found")
+    return {"ok": True, "token": token}
 
 
 # --- PATCH /tasks/:id  and  POST /tasks/bulk ---------------------------------
@@ -1195,6 +1487,224 @@ def list_diagnostics(
         return {"diagnostics": out, "count": sum(len(d["diagnostics"]) for d in out)}
 
 
+# --- Worker visibility — active-worker list, per-run inspect/terminate -------
+
+try:
+    import psutil as _psutil
+except ImportError:
+    _psutil = None  # type: ignore[assignment]
+
+
+@router.get("/workers/active")
+def list_active_workers(board: Optional[str] = _BOARD_Q):
+    """Every running worker: an open ``task_runs`` row with a ``worker_pid`` whose
+    task is ``running``. Returns ``{workers, count, checked_at}``."""
+    with _board_conn(board) as (board, conn):
+        rows = conn.execute(
+            "SELECT r.id AS run_id, r.task_id, t.title AS task_title, t.status AS task_status, "
+            "t.assignee AS task_assignee, r.profile, r.worker_pid, r.started_at, r.claim_lock, "
+            "r.claim_expires, r.last_heartbeat_at, r.max_runtime_seconds "
+            "FROM task_runs r JOIN tasks t ON t.id = r.task_id "
+            "WHERE r.ended_at IS NULL AND r.worker_pid IS NOT NULL AND t.status = 'running' "
+            "ORDER BY r.started_at ASC").fetchall()
+        workers = [dict(row) for row in rows]
+        return {"workers": workers, "count": len(workers), "checked_at": int(time.time())}
+
+
+@router.get("/runs/{run_id}")
+def get_run_endpoint(run_id: int, board: Optional[str] = _BOARD_Q):
+    """``{run: {...}}`` with the same serialisation as ``GET /tasks/{id}``; 404 if unknown."""
+    with _board_conn(board) as (board, conn):
+        return {"run": asdict(_require_run(conn, run_id))}
+
+
+@router.get("/runs/{run_id}/inspect")
+def inspect_run_endpoint(run_id: int, board: Optional[str] = _BOARD_Q):
+    """Live psutil stats for a run's worker; ``{alive: false, reason}`` when unavailable and
+    access-denied reported inline rather than as a 500."""
+    with _board_conn(board) as (board, conn):
+        r = _require_run(conn, run_id)
+
+    def _dead(reason: str, **extra) -> dict:
+        return {"run_id": run_id, "alive": False, **extra, "reason": reason}
+
+    if r.ended_at is not None:
+        return _dead("run already ended")
+    pid = r.worker_pid
+    if pid is None:
+        return _dead("no worker_pid recorded")
+    if _psutil is None:
+        return _dead("psutil not available", pid=pid)
+    try:
+        proc = _psutil.Process(pid)
+        info = proc.as_dict(attrs=["cpu_percent", "memory_info", "num_threads", "status", "create_time", "cmdline"])
+        try:
+            num_fds = proc.num_fds()
+        except AttributeError:  # POSIX-only
+            num_fds = None
+        mem = info.get("memory_info")
+        return {
+            "run_id": run_id, "alive": True, "pid": pid,
+            "cpu_percent": info.get("cpu_percent"),
+            "memory_rss_bytes": mem.rss if mem else None,
+            "memory_vms_bytes": mem.vms if mem else None,
+            "num_threads": info.get("num_threads"), "num_fds": num_fds,
+            "status": info.get("status"), "create_time": info.get("create_time"), "cmdline": info.get("cmdline")}
+    except _psutil.NoSuchProcess:
+        return _dead("process not found", pid=pid)
+    except _psutil.AccessDenied:
+        return {"run_id": run_id, "alive": True, "pid": pid, "error": "access denied"}
+
+
+class TerminateRunBody(BaseModel):
+    reason: Optional[str] = None
+
+
+@router.post("/runs/{run_id}/terminate")
+def terminate_run_endpoint(run_id: int, payload: TerminateRunBody, board: Optional[str] = _BOARD_Q):
+    """Terminate an in-flight run via ``reclaim_task`` (same SIGTERM->SIGKILL flow, bookkeeping
+    and events as ``POST /tasks/{id}/reclaim``); 409 if already ended / not reclaimable.
+
+    Closes the gap left by PR #28432, which shipped the read-only sibling endpoints (``/workers/active``,
+    ``/runs/{run_id}``, ``/runs/{run_id}/inspect``) but no termination control surface.
+    """
+    with _board_conn(board) as (board, conn):
+        r = _require_run(conn, run_id)
+        if r.ended_at is not None:
+            raise _conflict(f"run {run_id} already ended")
+        if not kanban_db.reclaim_task(conn, r.task_id, reason=payload.reason):
+            raise _conflict(f"cannot terminate run {run_id}: task {r.task_id} is no longer in a reclaimable state")
+        return {"ok": True, "run_id": run_id, "task_id": r.task_id}
+
+
+# --- Recovery actions — reclaim / specify / reassign / estimate -------------
+
+class ReclaimBody(BaseModel):
+    reason: Optional[str] = None
+
+
+@router.post("/tasks/{task_id}/reclaim")
+def reclaim_task_endpoint(task_id: str, payload: ReclaimBody, board: Optional[str] = Query(None)):
+    """Release an active worker claim without waiting for the claim TTL
+    (``hermes kanban reclaim <task_id> --reason ...``)."""
+    with _board_conn(board) as (board, conn):
+        if not kanban_db.reclaim_task(conn, task_id, reason=payload.reason):
+            raise _conflict(f"cannot reclaim {task_id}: not in a claimable state (not running, or unknown id)")
+        return {"ok": True, "task_id": task_id}
+
+
+class SpecifyBody(BaseModel):
+    """Only the author is configurable; model + prompt come from
+    ``auxiliary.triage_specifier`` in config.yaml, same as the CLI."""
+
+    author: Optional[str] = None
+
+
+@router.post("/tasks/{task_id}/specify")
+def specify_task_endpoint(task_id: str, payload: SpecifyBody, board: Optional[str] = Query(None)):
+    """Flesh out a triage task via the auxiliary LLM (``hermes kanban specify``). Non-OK is NOT
+    an HTTP error — the UI renders the reason inline. Sync ``def`` → runs in the threadpool."""
+    outcome = _run_aux(board, "kanban_specify", "specify_task", task_id, payload.author)
+    return {"ok": bool(outcome.ok), "task_id": outcome.task_id, "reason": outcome.reason, "new_title": outcome.new_title}
+
+
+class ReassignBody(BaseModel):
+    profile: Optional[str] = None  # "" or None = unassign
+    reclaim_first: bool = False
+    reason: Optional[str] = None
+
+
+@router.post("/tasks/{task_id}/reassign")
+def reassign_task_endpoint(task_id: str, payload: ReassignBody, board: Optional[str] = Query(None)):
+    """Reassign to another profile, optionally reclaiming first
+    (``hermes kanban reassign <task_id> <profile> [--reclaim]``)."""
+    with _board_conn(board) as (board, conn), _value_error_400():
+        ok = kanban_db.reassign_task(
+            conn, task_id, payload.profile or None, reclaim_first=bool(payload.reclaim_first), reason=payload.reason)
+        if not ok:
+            raise _conflict(
+                f"cannot reassign {task_id}: unknown id, or still "
+                "running (pass reclaim_first=true to release the claim first)")
+        return {"ok": True, "task_id": task_id, "assignee": payload.profile or None}
+
+
+# Estimate: rough token/complexity read via the auxiliary model. NOT a dollar cost.
+_ESTIMATE_SYSTEM_PROMPT = (
+    "You estimate how much work an autonomous coding agent will spend on a "
+    "kanban task. Given the task title and description, respond with STRICT "
+    "JSON only (no prose, no code fence):\n"
+    '{"est_tokens": <integer total tokens across the whole run>, '
+    '"complexity": "S"|"M"|"L", '
+    '"rationale": "<one short sentence>"}\n'
+    "Base the token figure on a realistic multi-turn agent run (reading files, "
+    "tool calls, edits, retries) — not a single reply. S≈small/localized, "
+    "M≈multi-file, L≈broad or ambiguous. Be honest that this is a rough guess.")
+
+
+class EstimateBody(BaseModel):
+    title: str = ""
+    body: Optional[str] = None
+
+
+@router.post("/estimate")
+def estimate_text_endpoint(payload: EstimateBody):
+    """Estimate from raw title/body (create dialog, before a task exists)."""
+    return _run_estimate(payload.title, payload.body)
+
+
+@router.post("/tasks/{task_id}/estimate")
+def estimate_task_endpoint(task_id: str, board: Optional[str] = Query(None)):
+    """Estimate for an existing task; ``{ok, est_tokens, complexity, rationale, model}``."""
+    with _board_conn(board) as (board, conn):
+        task = _require_task(conn, task_id)
+    return _run_estimate(task.title, task.body)
+
+
+def _cap(s: Optional[str], n: int) -> str:
+    s = (s or "").strip()
+    return s if len(s) <= n else s[:n] + "…"
+
+
+def _run_estimate(title: str, body: Optional[str]) -> dict:
+    """Never raises — config/parse/API errors become ``{"ok": False, "reason"}`` so the UI renders them inline."""
+    if not (title or "").strip():
+        return {"ok": False, "reason": "a title is required to estimate"}
+    try:
+        from agent.auxiliary_client import call_llm
+    except Exception:
+        return {"ok": False, "reason": "auxiliary client unavailable"}
+    user_msg = f"Title: {_cap(title, 400)}\n\nDescription:\n{_cap(body, 4000) or '(none)'}"
+    try:
+        resp = call_llm(
+            task="kanban_estimator",
+            messages=[{"role": "system", "content": _ESTIMATE_SYSTEM_PROMPT}, {"role": "user", "content": user_msg}],
+            temperature=0.0, max_tokens=300, timeout=60)
+    except Exception as exc:
+        return {"ok": False, "reason": f"LLM error: {type(exc).__name__}"}
+    try:
+        raw = (resp.choices[0].message.content or "").strip()
+        model = getattr(resp, "model", None)
+    except Exception:
+        raw, model = "", None
+
+    # Same tolerant JSON-blob extraction the specifier uses.
+    try:
+        m = None if raw.lstrip().startswith("{") else re.search(r"\{.*\}", raw, re.DOTALL)
+        obj = json.loads(m.group(0) if m else raw)
+        parsed = obj if isinstance(obj, dict) else None
+    except Exception:
+        parsed = None
+    if not parsed:
+        return {"ok": False, "reason": "could not parse an estimate from the model"}
+    try:
+        est_tokens = int(parsed.get("est_tokens") or 0)
+    except (TypeError, ValueError):
+        est_tokens = 0
+    complexity = str(parsed.get("complexity") or "").strip().upper()
+    return {
+        "ok": True, "est_tokens": est_tokens, "complexity": complexity if complexity in {"S", "M", "L"} else None,
+        "rationale": str(parsed.get("rationale") or "").strip() or None, "model": model}
+
 
 # --- POST /roadmap/idea — capture a free-typed roadmap idea as an ``idea`` card on the resolved
 # board. Previously this appended to the roadmap-sync plugin's markdown "## Ideas" inbox; the
@@ -1372,7 +1882,6 @@ def get_task_log(task_id: str, tail: Optional[int] = Query(None, ge=1, le=2_000_
         "size_bytes": size, "content": content or "", "truncated": bool(tail and size > tail)}
 
 
-
 @router.post("/dispatch")
 def dispatch(dry_run: bool = Query(False), max_n: int = Query(8, alias="max"), board: Optional[str] = Query(None)):
     """Dispatch nudge so the UI doesn't wait out the 60 s dispatcher tick.
@@ -1412,7 +1921,6 @@ def dispatch(dry_run: bool = Query(False), max_n: int = Query(8, alias="max"), b
             return {"result": str(result)}
 
 
-
 @router.get("/model-options")
 def model_options():
     """Providers + curated models for the override dropdown via ``inventory.build_models_payload``
@@ -1433,6 +1941,247 @@ def model_options():
         log.exception("kanban model-options failed")
         return {"providers": []}  # empty catalog → the UI falls back to a free-text input
 
+
+# --- Boards CRUD (multi-project support) --------------------------------------
+
+class CreateBoardBody(BaseModel):
+    slug: str
+    name: Optional[str] = None
+    description: Optional[str] = None
+    icon: Optional[str] = None
+    color: Optional[str] = None
+    default_workdir: Optional[str] = None
+    # Project (id or slug) scoping the board: default_workdir mirrors its primary repo, tasks inherit it.
+    project_id: Optional[str] = None
+    switch: bool = False
+
+
+class RenameBoardBody(BaseModel):
+    name: Optional[str] = None
+    description: Optional[str] = None
+    icon: Optional[str] = None
+    color: Optional[str] = None
+    # For both fields: ``None`` = leave unchanged; "" = clear; value = validate/resolve + set.
+    default_workdir: Optional[str] = None
+    project_id: Optional[str] = None
+
+
+# Board transfer exchanges filesystem PATHS, not bytes (same contract as profile export/import):
+# clients run the native save/open dialog on the machine hosting the backend.
+
+class ExportBoardBody(BaseModel):
+    output: str = ""  # empty → staging path under the kanban root
+    attachments: bool = True
+    logs: bool = False
+
+
+class ImportBoardBody(BaseModel):
+    archive: str  # path to a board .tar.gz on the backend's filesystem
+    slug: Optional[str] = None  # override the archive's slug; collisions auto-suffix
+    switch: bool = False
+
+
+def _board_display_kwargs(p: BaseModel) -> dict[str, Any]:
+    """Display-metadata fields shared by create_board / write_board_metadata."""
+    return {"name": p.name, "description": p.description, "icon": p.icon, "color": p.color}
+
+
+def _resolve_project(ref: Optional[str]) -> tuple[Optional[str], Optional[str], Optional[str]]:
+    """Resolve a project id/slug to ``(id, name, primary_path)``; ``(None,)*3``
+    for a falsy ref, 400 when a non-empty ref doesn't resolve."""
+    if not ref or not ref.strip():
+        return None, None, None
+    with _errors_to_500("projects unavailable"):
+        from hermes_cli import projects_db as pdb
+        with pdb.connect_closing() as pconn:
+            proj = pdb.get_project(pconn, ref.strip())
+    if proj is None:
+        raise HTTPException(status_code=400, detail=f"project {ref!r} does not exist")
+    return proj.id, proj.name, (proj.primary_path or None)
+
+
+def _projects_by_id() -> dict[str, Any]:
+    """Map every project id -> Project (archived included) for annotation."""
+    try:
+        from hermes_cli import projects_db as pdb
+        with pdb.connect_closing() as pconn:
+            return {p.id: p for p in pdb.list_projects(pconn, include_archived=True)}
+    except Exception:
+        return {}
+
+
+def _board_counts(slug: str) -> dict[str, int]:
+    """``{status: count}`` for a board; ``{}`` on a missing/empty DB."""
+    try:
+        if not kanban_db.kanban_db_path(board=slug).exists():
+            return {}
+        with closing(kbc.connect(board=slug)) as conn:
+            rows = conn.execute("SELECT status, COUNT(*) AS n FROM tasks GROUP BY status").fetchall()
+            return {r["status"]: int(r["n"]) for r in rows}
+    except Exception:
+        return {}
+
+
+def _default_workspace_kind(board: dict[str, Any]) -> str:
+    """Recommend a non-destructive task workspace from board metadata."""
+    workdir = str(board.get("default_workdir") or "").strip()
+    if not workdir:
+        return "scratch"
+    try:
+        return "worktree" if kbw._git_toplevel(Path(workdir)) else "dir"
+    except (OSError, ValueError):
+        return "dir"
+
+
+def _annotate_board_meta(meta: dict) -> dict:
+    meta["default_workspace_kind"] = _default_workspace_kind(meta)
+    _, meta["project_name"], _ = _resolve_project(meta.get("project_id"))
+    return meta
+
+
+@router.get("/projects")
+def list_kanban_projects():
+    """Live (non-archived) projects available for board scoping."""
+    with _errors_to_500("failed to list projects"):
+        from hermes_cli import projects_db as pdb
+        with pdb.connect_closing() as pconn:
+            projects = pdb.list_projects(pconn, include_archived=False)
+    return {"projects": [
+        {"id": p.id, "slug": p.slug, "name": p.name,
+         "primary_path": p.primary_path or "", "icon": p.icon or "", "color": p.color or ""}
+        for p in projects]}
+
+
+@router.get("/boards")
+def list_boards(include_archived: bool = Query(False)):
+    """Every board on disk with task counts and the active slug."""
+    boards = kanban_db.list_boards(include_archived=include_archived)
+    current = kanban_db.get_current_board()
+    proj_map = _projects_by_id()
+    for b in boards:
+        b["is_current"] = (b["slug"] == current)
+        b["counts"] = _board_counts(b["slug"])
+        # Live cards only — archived tasks are hidden from every default board view,
+        # so counting them in the switcher badge would visibly disagree.
+        b["total"] = sum(n for status, n in b["counts"].items() if status != "archived")
+        b["default_workspace_kind"] = _default_workspace_kind(b)
+        pid = b["project_id"] = b.get("project_id") or None
+        proj = proj_map.get(pid) if pid else None
+        b["project_name"] = proj.name if proj else None
+    return {"boards": boards, "current": current}
+
+
+def _validate_workdir(raw: str) -> str:
+    """Board default_workdir must be an absolute, existing directory (400 otherwise)."""
+    requested = Path(raw).expanduser()
+    if not requested.is_absolute():
+        raise HTTPException(status_code=400, detail="Project directory must be an absolute path.")
+    if not requested.is_dir():
+        raise HTTPException(status_code=400, detail="Project directory must be an existing directory.")
+    return str(requested.resolve())
+
+
+@router.post("/boards")
+def create_board_endpoint(payload: CreateBoardBody):
+    """Create a board. Idempotent — ``slug`` collision returns the existing one."""
+    default_workdir = _validate_workdir(payload.default_workdir) if payload.default_workdir else None
+    # A chosen project's primary repo becomes the default workdir unless one was passed explicitly.
+    project_id, _pname, primary_path = _resolve_project(payload.project_id)
+    if primary_path and not default_workdir:
+        default_workdir = primary_path
+    with _value_error_400():
+        meta = kanban_db.create_board(
+            payload.slug, default_workdir=default_workdir, project_id=project_id, **_board_display_kwargs(payload))
+    if payload.switch:
+        with _value_error_400():
+            kanban_db.set_current_board(meta["slug"])
+    return {"board": _annotate_board_meta(meta), "current": kanban_db.get_current_board()}
+
+
+@router.patch("/boards/{slug}")
+def rename_board(slug: str, payload: RenameBoardBody):
+    """Update display metadata / default workdir / project scope (slug is immutable)."""
+    normed = _existing_board_slug(slug)
+    # write_board_metadata treats a falsy value as "clear", so pass "" through.
+    default_workdir: Optional[str] = None
+    if payload.default_workdir is not None:
+        raw = payload.default_workdir.strip()
+        default_workdir = _validate_workdir(raw) if raw else ""
+    # A resolved project mirrors its repo into default_workdir unless the caller set it explicitly.
+    project_id: Optional[str] = None
+    if payload.project_id is not None:
+        if payload.project_id.strip():
+            project_id, _pname, primary_path = _resolve_project(payload.project_id)
+            if primary_path and default_workdir is None:
+                default_workdir = primary_path
+        else:
+            project_id = ""  # clear the scope
+    meta = kanban_db.write_board_metadata(
+        normed, default_workdir=default_workdir, project_id=project_id, **_board_display_kwargs(payload))
+    return {"board": _annotate_board_meta(meta)}
+
+
+@router.delete("/boards/{slug}")
+def delete_board(slug: str, delete: bool = Query(False, description="Hard-delete instead of archive")):
+    """Archive (default) or hard-delete a board."""
+    with _value_error_400():
+        res = kanban_db.remove_board(slug, archive=not delete)
+    return {"result": res, "current": kanban_db.get_current_board()}
+
+
+async def _run_transfer(fn, log_label: str):
+    """Run a blocking kanban_transfer call off the event loop, mapping its errors
+    to 404 (missing path) / 400 (invalid) / 500 (logged)."""
+    try:
+        return await asyncio.get_running_loop().run_in_executor(None, fn)
+    except FileNotFoundError as exc:
+        raise HTTPException(status_code=404, detail=str(exc))
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    except Exception as exc:
+        log.exception("%s failed", log_label)
+        raise HTTPException(status_code=500, detail=str(exc))
+
+
+@router.post("/boards/{slug}/export")
+async def export_board_endpoint(slug: str, body: ExportBoardBody):
+    """Write ``slug`` to a portable archive; return the path written."""
+    from hermes_cli import kanban_transfer
+
+    output = (body.output or "").strip()
+    if not output:
+        staging = kanban_db.kanban_home() / "kanban" / "board-exports"
+        try:
+            staging.mkdir(parents=True, exist_ok=True)
+        except OSError as exc:
+            raise HTTPException(status_code=500, detail=f"Could not create export directory: {exc}")
+        output = str(staging / f"{slug}-{time.strftime('%Y%m%d-%H%M%S')}.tar.gz")
+    return await _run_transfer(
+        lambda: kanban_transfer.export_board(slug, output, include_attachments=body.attachments, include_logs=body.logs),
+        f"POST /boards/{slug}/export")
+
+
+@router.post("/boards/import")
+async def import_board_endpoint(body: ImportBoardBody):
+    """Import a board archive as a NEW board; return the landed board."""
+    from hermes_cli import kanban_transfer
+
+    archive = (body.archive or "").strip()
+    if not archive:
+        raise HTTPException(status_code=400, detail="archive path is required")
+    result = await _run_transfer(
+        lambda: kanban_transfer.import_board(archive, (body.slug or "").strip() or None, activate=body.switch),
+        "POST /boards/import")
+    return {**result, "current": kanban_db.get_current_board()}
+
+
+@router.post("/boards/{slug}/switch")
+def switch_board(slug: str):
+    """Persist ``slug`` as the active board for CLI / slash-command parity
+    (dashboard users pick boards client-side via localStorage)."""
+    normed = _existing_board_slug(slug)
+    kanban_db.set_current_board(normed)
+    return {"current": normed}
 
 
 # --- Profile metadata & description editing (kanban orchestrator) ------------
