@@ -528,6 +528,64 @@ def test_failover_refuses_without_fresh_destination_capacity(
     assert degraded[0]["payload"]["action"] == "no route change"
 
 
+def test_failover_refusal_is_audited_once_per_episode_not_once_per_database(
+    throttle_home, monkeypatch,
+):
+    # Deduplication must scope to the degraded EPISODE, exactly as the
+    # no-capacity-signal path does. A destination account that flaps refuses
+    # reroutes over and over, and the audit row (with its warning) is the only
+    # signal an operator gets that it is happening; collapsing every later
+    # refusal into the first record makes a recurring refusal invisible.
+    def _refusals():
+        return [
+            e for e in kt.recent_throttle_events(50)
+            if e["kind"] == "degraded"
+            and e["payload"]["reason"] == kt.DEGRADED_FAILOVER_DESTINATION
+        ]
+
+    cfg = _failover_config()
+    source = _snapshot(("Seven Day", 99.0))
+    healthy_destination = _snapshot(("Session", 5.0), provider="openai-codex")
+
+    # Episode 1 — the destination is unreadable, so the reroute is refused.
+    _serve(monkeypatch, {"anthropic": source, "openai-codex": None})
+    blind = kt.evaluate_throttle(kanban_cfg=cfg, now=1_000)
+    assert kt.failover_eligible_profiles(blind, now=1_000) == ()
+    assert len(_refusals()) == 1
+
+    # The destination proves itself again and the lever arms: episode over.
+    _serve(monkeypatch, {"anthropic": source, "openai-codex": healthy_destination})
+    armed = kt.evaluate_throttle(kanban_cfg=cfg, now=2_000)
+    assert kt.failover_eligible_profiles(armed, now=2_000) == ("overflow-worker",)
+
+    # Episode 2 — it goes dark again. A refusal after an intervening healthy
+    # observation is a new episode and earns its own record.
+    _serve(monkeypatch, {"anthropic": source, "openai-codex": None})
+    again = kt.evaluate_throttle(kanban_cfg=cfg, now=3_000)
+    assert kt.failover_eligible_profiles(again, now=3_000) == ()
+    assert len(_refusals()) == 2
+
+    # Within one episode the refusal still records exactly once, however many
+    # times it is consulted — two boards and every queued card ask this same
+    # question each tick.
+    for _ in range(4):
+        assert kt.plan_failover(again, assignee="overflow-worker", now=3_000) is None
+    assert len(_refusals()) == 2
+
+    # Two episodes can open and close inside a single second, so the episode
+    # marker cannot be the clock: a timestamped fingerprint would collide here
+    # and silently drop the second refusal.
+    _serve(monkeypatch, {"anthropic": source, "openai-codex": healthy_destination})
+    kt.failover_eligible_profiles(
+        kt.evaluate_throttle(kanban_cfg=cfg, now=4_000), now=4_000
+    )
+    _serve(monkeypatch, {"anthropic": source, "openai-codex": None})
+    kt.failover_eligible_profiles(
+        kt.evaluate_throttle(kanban_cfg=cfg, now=4_000), now=4_000
+    )
+    assert len(_refusals()) == 3
+
+
 def test_failover_refuses_when_the_source_signal_is_not_fresh(
     throttle_home, monkeypatch,
 ):

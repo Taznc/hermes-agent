@@ -376,6 +376,12 @@ CREATE TABLE IF NOT EXISTS throttle_events (
     created_at   INTEGER NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_throttle_events_created ON throttle_events(created_at);
+CREATE TABLE IF NOT EXISTS throttle_degraded_episodes (
+    key     TEXT    PRIMARY KEY,
+    detail  TEXT,
+    since   INTEGER NOT NULL,
+    seq     INTEGER NOT NULL
+);
 """
 
 
@@ -414,6 +420,21 @@ def _write_conn():
     except Exception:
         conn.rollback()
         raise
+    finally:
+        conn.close()
+
+
+@contextlib.contextmanager
+def _read_conn():
+    """Read-only access with no ``BEGIN IMMEDIATE``.
+
+    Diagnostics and the "is anything actually degraded right now" fast path are
+    plain SELECTs; taking the write lock for them would serialise them against
+    dispatcher ticks for no benefit.
+    """
+    conn = _connect()
+    try:
+        yield conn
     finally:
         conn.close()
 
@@ -481,9 +502,59 @@ def _record_event(
     return cur.rowcount == 1
 
 
+def _open_degraded_episode(
+    conn: sqlite3.Connection, key: str, detail: str, *, now: int,
+) -> Optional[int]:
+    """Start (or continue) a degraded episode; return its marker when NEW.
+
+    ``None`` means the same condition is already being reported and this
+    observation belongs to the episode already on record.  The marker is the
+    per-episode component of the audit fingerprint, so a condition that recurs
+    after :func:`_close_degraded_episode` earns a fresh row instead of being
+    deduplicated against the first occurrence for the life of the store.
+
+    The marker is a persisted monotonic sequence rather than the clock: two
+    episodes can open and close inside one second, and a timestamp would let
+    the second one collide with the first on the UNIQUE fingerprint — the very
+    silent-dedup failure this exists to prevent.
+
+    This is the same episode contract the no-signal path gets from the
+    ``degraded_since`` column on the state row.  It lives in its own table
+    because it is written from the per-spawn route-planning path, which must
+    not join the dispatch tick's read-modify-write of that row.
+    """
+    row = conn.execute(
+        "SELECT detail, seq FROM throttle_degraded_episodes WHERE key = ?", (key,)
+    ).fetchone()
+    if row is not None and row["detail"] is not None and str(row["detail"]) == detail:
+        return None
+    marker = int(row["seq"] if row is not None else 0) + 1
+    conn.execute(
+        "INSERT INTO throttle_degraded_episodes (key, detail, since, seq) "
+        "VALUES (?, ?, ?, ?) "
+        "ON CONFLICT(key) DO UPDATE SET detail = excluded.detail, "
+        "since = excluded.since, seq = excluded.seq",
+        (key, detail, int(now), marker),
+    )
+    return marker
+
+
+def _close_degraded_episode(conn: sqlite3.Connection, key: str, *, now: int) -> None:
+    """Mark the condition resolved, so a later recurrence is a NEW episode.
+
+    The row is kept (with a null detail) rather than deleted: the sequence it
+    carries is what makes the next episode's fingerprint distinct from this
+    one's.
+    """
+    conn.execute(
+        "UPDATE throttle_degraded_episodes SET detail = NULL, since = ? WHERE key = ?",
+        (int(now), key),
+    )
+
+
 def recent_throttle_events(limit: int = 20) -> list[dict[str, Any]]:
     """Newest-first audit records, for diagnostics surfaces."""
-    with _write_conn() as conn:
+    with _read_conn() as conn:
         rows = conn.execute(
             "SELECT kind, payload, created_at FROM throttle_events "
             "ORDER BY created_at DESC, id DESC LIMIT ?",
@@ -768,13 +839,31 @@ def _ladder_step(model: Optional[str], ladder: Sequence[str]) -> Optional[str]:
     return rungs[index + 1] if index + 1 < len(rungs) else None
 
 
+#: Episode key for the failover-destination degraded condition.  One key,
+#: because one destination account is one condition: a refusal that changes
+#: detail code (stale -> missing) is the same ongoing episode re-described,
+#: and gets its own row because the detail is part of the fingerprint.
+_EPISODE_FAILOVER_DESTINATION = "failover_destination"
+
+
 def _failover_declined(reason: str, *, now: int) -> None:
-    """Record one deduplicated degraded episode for a refused reroute."""
+    """Record one deduplicated degraded episode for a refused reroute.
+
+    Deduplication is per EPISODE, not for the lifetime of the store: a refusal
+    that recurs after the destination was proven healthy again is a new fact an
+    operator needs, so it earns its own audit row and warning.  Within one
+    episode the refusal records once however many spawns consult it.
+    """
     with contextlib.suppress(Exception):
         with _write_conn() as conn:
+            marker = _open_degraded_episode(
+                conn, _EPISODE_FAILOVER_DESTINATION, reason, now=now,
+            )
+            if marker is None:
+                return
             if _record_event(
                 conn, "degraded",
-                f"failover:{DEGRADED_FAILOVER_DESTINATION}:{reason}",
+                f"failover:{DEGRADED_FAILOVER_DESTINATION}:{reason}:{marker}",
                 {
                     "reason": DEGRADED_FAILOVER_DESTINATION, "detail": reason,
                     "action": "no route change", "recovery": _RECOVERY_HINT,
@@ -785,6 +874,25 @@ def _failover_declined(reason: str, *, now: int) -> None:
                     "kanban usage throttle: cross-provider failover declined (%s); "
                     "no route change", reason,
                 )
+
+
+def _failover_destination_proven(*, now: int) -> None:
+    """The destination read cleanly: end any open refusal episode.
+
+    Consulted on every spawn while the lever is armed, so the common case —
+    nothing to close — is answered by a plain SELECT and never takes the write
+    lock away from a dispatcher tick.
+    """
+    with contextlib.suppress(Exception):
+        with _read_conn() as conn:
+            row = conn.execute(
+                "SELECT detail FROM throttle_degraded_episodes WHERE key = ?",
+                (_EPISODE_FAILOVER_DESTINATION,),
+            ).fetchone()
+            if row is None or row["detail"] is None:
+                return
+        with _write_conn() as conn:
+            _close_degraded_episode(conn, _EPISODE_FAILOVER_DESTINATION, now=now)
 
 
 def failover_eligible_profiles(
@@ -820,6 +928,9 @@ def failover_eligible_profiles(
     if destination.used_percent > lever.destination_max_pressure_pct:
         _failover_declined("destination_under_pressure", now=current)
         return ()
+    # Proven healthy: any refusal episode is over, so the NEXT refusal is a new
+    # episode with its own audit row rather than a silent duplicate of the last.
+    _failover_destination_proven(now=current)
     return lever.eligible_profiles
 
 
