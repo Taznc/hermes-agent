@@ -37,6 +37,12 @@ _IMAGE_EXTS = {".png", ".jpg", ".jpeg", ".gif", ".webp"}
 _VIDEO_EXTS = {".mp4", ".mov", ".avi", ".mkv", ".webm", ".3gp"}
 _GC_INTERVAL_SECONDS = 3600.0
 _HEALTH_WINDOW = 6
+# A collect that outruns this many tick intervals is reported and left to finish
+# on its own thread. Derived from the caller's interval rather than configured:
+# the bound exists to make a stall OBSERVABLE, not to be tuned. Floored so a
+# fast interval cannot make a merely-slow board look stuck.
+_NOTIFIER_COLLECT_TIMEOUT_INTERVALS = 3
+_NOTIFIER_COLLECT_TIMEOUT_FLOOR_S = 30.0
 
 
 class GatewayKanbanWatchersMixin:
@@ -69,6 +75,13 @@ class GatewayKanbanWatchersMixin:
         — is the dedup mechanism (unsub-on-terminal dropped users when the
         dispatcher respawned a crashed task). All SQLite work runs in a thread;
         one tick's failure never stops the next.
+
+        The collect is **single-flight and shielded**: at most one is in flight,
+        and a collect that outruns its bound is reported and left to finish
+        rather than cancelled. Cancelling an ``asyncio.to_thread`` future does
+        not stop the underlying thread, so a bare timeout would leak a thread per
+        tick; retaining the task also preserves delivery of events the slow
+        collect already claimed (the cursor advances at claim time, before send).
         """
         from gateway.config import Platform as _Platform
         try:
@@ -90,6 +103,18 @@ class GatewayKanbanWatchersMixin:
         # board, at startup (0 → first tick) and at most hourly.
         _gc_next_at = 0.0
 
+        # Single-flight handle for the in-flight collect. A collect runs on a
+        # threadpool worker; cancelling its future does NOT stop that thread, so
+        # a bare `wait_for` would leak one thread per tick and exhaust the pool
+        # within minutes. The task is shielded and retained instead: the loop
+        # stops WAITING on a slow collect but never abandons it, so the events it
+        # already claimed (claim_unseen_events_for_sub advances the cursor before
+        # delivery) are still delivered when it returns.
+        collect_task: Optional[asyncio.Task] = None
+        collect_started_at = 0.0
+        collect_timeout = max(
+            interval * _NOTIFIER_COLLECT_TIMEOUT_INTERVALS, _NOTIFIER_COLLECT_TIMEOUT_FLOOR_S)
+
         while self._running:
             try:
                 _gc_due = time.monotonic() >= _gc_next_at
@@ -98,15 +123,35 @@ class GatewayKanbanWatchersMixin:
                     _gc_next_at = time.monotonic() + _GC_INTERVAL_SECONDS
                     _retention = _gc_retention_days()
 
-                deliveries = await asyncio.to_thread(
-                    _notifier_collect, self, _kb,
-                    notifier_profile=notifier_profile, gc_due=_gc_due, gc_retention_days=_retention,
-                )
+                if collect_task is None:
+                    collect_started_at = time.monotonic()
+                    collect_task = asyncio.create_task(asyncio.to_thread(
+                        _notifier_collect, self, _kb,
+                        notifier_profile=notifier_profile, gc_due=_gc_due, gc_retention_days=_retention,
+                    ))
+                elif _gc_due:
+                    # The skipped tick owns this GC slot; give it back so the next
+                    # free tick runs the sweep instead of waiting a full hour.
+                    _gc_next_at = 0.0
+
+                deliveries = []
+                try:
+                    deliveries = await asyncio.wait_for(
+                        asyncio.shield(collect_task), timeout=collect_timeout)
+                    collect_task = None
+                except asyncio.TimeoutError:
+                    logger.warning(
+                        "kanban notifier: collect has been running %.0fs (> %.0fs); skipping this "
+                        "tick and waiting for it to finish. Dispatch is unaffected; if this repeats "
+                        "the notifier thread is stuck and the gateway needs a stack dump (SIGUSR2).",
+                        time.monotonic() - collect_started_at, collect_timeout)
+
                 for d in deliveries:
                     await _KanbanNotification(
                         self, d, platform_cls=_Platform, sub_fail_counts=sub_fail_counts,
                     ).deliver()
             except Exception as exc:
+                collect_task = None
                 logger.warning("kanban notifier tick failed: %s", exc)
             await self._sleep_between_ticks(interval)
 
