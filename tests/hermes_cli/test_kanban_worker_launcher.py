@@ -281,7 +281,7 @@ def test_worker_launcher_skips_redundant_outer_scope_when_already_scope_wrapped(
     root, workspace, task = worker_setup
     _set_worker_launcher(root, ["systemd-run", "--user", "--scope"])
     monkeypatch.setattr("shutil.which", lambda name: "/usr/bin/systemd-run" if name == "systemd-run" else None)
-    monkeypatch.setattr(kbd, "_systemd_user_bus_reachable", lambda: True)
+    monkeypatch.setattr(wl, "_systemd_user_bus_reachable", lambda: True)
 
     # Simulate the supervised-gateway topology where _restart_safe_worker_argv
     # has already produced a real systemd-run --user --scope invocation.
@@ -466,7 +466,7 @@ def test_worker_launcher_systemd_run_user_applies_when_bus_reachable(worker_setu
     root, workspace, task = worker_setup
     _set_worker_launcher(root, ["systemd-run", "--user", "--scope"])
     monkeypatch.setattr("shutil.which", lambda name: "/usr/bin/systemd-run" if name == "systemd-run" else None)
-    monkeypatch.setattr(kbd, "_systemd_user_bus_reachable", lambda: True)
+    monkeypatch.setattr(wl, "_systemd_user_bus_reachable", lambda: True)
 
     captured = {}
 
