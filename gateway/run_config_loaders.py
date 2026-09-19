@@ -38,6 +38,80 @@ logger = logging.getLogger("gateway.run")
 
 _BUSY_INPUT_MODES = {"interrupt", "queue", "steer"}
 
+# Cached immutable view of the gateway runtime config, revalidated against every input that
+# feeds it. Single-entry: one gateway process reads one config.yaml.
+_RUNTIME_CONFIG_VIEW_CACHE: Dict[str, Any] = {}
+
+
+def _runtime_config_inputs() -> Optional[tuple]:
+    """``(mtime_ns, size)`` for every file the runtime config is built from, or None.
+
+    None means "something is unreadable" and disables caching for that call, so a config the
+    loader fails open on is never pinned. The managed file is included because
+    ``apply_managed_overlay`` merges it on top of the user config on every load.
+    """
+    from gateway.run import _gateway_config_home
+    from hermes_cli.managed_scope import get_managed_dir
+
+    paths = [_gateway_config_home() / "config.yaml"]
+    managed_dir = get_managed_dir()
+    if managed_dir is not None:
+        paths.append(managed_dir / "config.yaml")
+    key = []
+    for path in paths:
+        try:
+            st = path.stat()
+        except OSError:
+            return None
+        key.append((str(path), st.st_mtime_ns, st.st_size))
+    return tuple(key)
+
+
+def _gateway_runtime_config_view() -> Any:
+    """Immutable view of the gateway runtime config, revalidated against its input files.
+
+    ``_load_gateway_runtime_config`` costs a bounded deepcopy of the whole tree plus a managed
+    overlay and a full ``${VAR}`` expansion rebuild on EVERY call, and the notification watcher
+    calls it on a 2s timer while holding the event loop. Read-only callers get this instead:
+    the rebuild happens only when an input file's ``(mtime_ns, size)`` changes or an env value
+    behind a ``${VAR}`` ref moves, so a steady-state hit is a couple of stat calls.
+
+    Returns a **read-only view** (mutators raise ``FrozenConfigError``) because the cached tree
+    is shared by every later reader. Callers that mutate keep using the mutable loader.
+    """
+    from gateway.run import _load_gateway_config, _load_gateway_runtime_config
+    from hermes_cli.config import _env_ref_snapshot
+    from hermes_cli.config_snapshot import readonly_view
+
+    inputs = _runtime_config_inputs()
+    if inputs is None:
+        return readonly_view(_load_gateway_runtime_config())
+
+    cached = _RUNTIME_CONFIG_VIEW_CACHE.get("entry")
+    if cached is not None and cached[0] == inputs and _env_refs_unchanged(cached[1]):
+        return cached[2]
+
+    # Snapshot the refs from the UNEXPANDED sources: the expanded tree no longer contains them.
+    # Only the names this config actually references are revalidated, so a hit stays O(refs).
+    # The managed overlay is expanded before it is merged, so its refs are read from the managed
+    # file directly — the same pair of sources ``load_config()`` snapshots (#58514).
+    from hermes_cli.managed_scope import load_managed_config
+    refs = _env_ref_snapshot(_load_gateway_config())
+    _env_ref_snapshot(load_managed_config(), refs)
+    view = readonly_view(_load_gateway_runtime_config())
+    _RUNTIME_CONFIG_VIEW_CACHE["entry"] = (inputs, refs, view)
+    return view
+
+
+def _env_refs_unchanged(refs: Dict[str, Any]) -> bool:
+    from hermes_cli.config import _env_ref_lookup
+    return all(_env_ref_lookup(name) == value for name, value in refs.items())
+
+
+def invalidate_gateway_runtime_config_view() -> None:
+    """Drop the cached view. For tests and for callers that just rewrote config.yaml."""
+    _RUNTIME_CONFIG_VIEW_CACHE.clear()
+
 
 class GatewayConfigLoadersMixin:
     """Config/env loaders (busy modes, reasoning, service tier, timeouts, fallback) for GatewayRunner."""
@@ -381,11 +455,14 @@ class GatewayConfigLoadersMixin:
 
     @staticmethod
     def _load_background_notifications_mode() -> str:
-        """Background process notification mode from env/config (default ``concise``)."""
-        from gateway.run import _load_gateway_runtime_config
+        """Background process notification mode from env/config (default ``concise``).
+
+        Reads the CACHED view: the notification watcher calls this every 2s on the event loop,
+        and the uncached loader rebuilds the whole config tree per call.
+        """
         mode = os.getenv("HERMES_BACKGROUND_NOTIFICATIONS", "")
         if not mode:
-            raw = cfg_get(_load_gateway_runtime_config(), "display", "background_process_notifications")
+            raw = cfg_get(_gateway_runtime_config_view(), "display", "background_process_notifications")
             if raw is False:
                 mode = "off"
             elif raw not in {None, ""}:

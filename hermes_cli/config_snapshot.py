@@ -36,7 +36,10 @@ ordinary containers, which is the documented escape hatch.
 The answer to (2) is :func:`bounded_deepcopy`: it snapshots each list before iterating it (so
 a concurrent appender can no longer extend the work in flight) and enforces node and
 wall-clock ceilings, raising :class:`BoundedCopyBreach` naming the offending top-level key
-instead of spinning forever. Both it and :func:`thaw` memoise on ``id()`` like
+instead of spinning forever. The wall-clock ceiling is checked on **every** node and on copy
+entry/exit — sampling it every Nth node left it structurally unreachable for any tree smaller
+than the sampling interval, so the gateway's own 449-node config tree never evaluated its
+nominal 5s budget even once. Both it and :func:`thaw` memoise on ``id()`` like
 ``copy.deepcopy``, so YAML anchors/aliases keep their shared identity and a self-referential
 document copies instead of recursing forever.
 """
@@ -64,7 +67,6 @@ __all__ = [
 # ceiling is the backstop for a source that is being mutated while we copy it.
 DEFAULT_COPY_NODE_FLOOR = 2_000_000
 DEFAULT_COPY_TIME_BUDGET_S = 5.0
-_TIME_CHECK_EVERY = 4096
 
 _FROZEN_HINT = (
     "config snapshots are read-only — use load_config()/read_raw_config() for a mutable copy"
@@ -327,15 +329,25 @@ class _Budget:
         self.deadline = None if time_budget_s is None else self.started + time_budget_s
         self.top_key: Any = None
 
+    def check_deadline(self) -> None:
+        """Raise if the wall-clock ceiling has passed. Safe to call with zero nodes spent.
+
+        Called on copy entry/exit and either side of the ``copy.deepcopy`` delegation, so a
+        copy whose cost sits in ONE expensive node is still caught. ``spend`` calls this on
+        every node: sampling it every Nth node made the ceiling unreachable for any tree
+        smaller than the sampling interval, which is how a 449-node config tree wedged a
+        gateway with a nominal 5s budget it never once evaluated.
+        """
+        if self.deadline is not None and time.monotonic() > self.deadline:
+            raise BoundedCopyBreach(
+                self.top_key, self.nodes, time.monotonic() - self.started, "elapsed")
+
     def spend(self) -> None:
         self.nodes += 1
         if self.node_limit is not None and self.nodes > self.node_limit:
             raise BoundedCopyBreach(
                 self.top_key, self.nodes, time.monotonic() - self.started, "node")
-        if (self.deadline is not None and self.nodes % _TIME_CHECK_EVERY == 0
-                and time.monotonic() > self.deadline):
-            raise BoundedCopyBreach(
-                self.top_key, self.nodes, time.monotonic() - self.started, "elapsed")
+        self.check_deadline()
 
 
 def _copy_node(value: Any, budget: _Budget, memo: Dict[int, Any], keep: List[Any]) -> Any:
@@ -377,6 +389,16 @@ def _copy_node(value: Any, budget: _Budget, memo: Dict[int, Any], keep: List[Any
 def _copy_tree(source: Any, budget: _Budget) -> Any:
     memo: Dict[int, Any] = {}
     keep: List[Any] = []
+    budget.check_deadline()
+    out = _copy_tree_inner(source, budget, memo, keep)
+    # Entry and exit checks bracket the whole copy, so the ceiling is enforced even when no
+    # single node exceeded it. Only on the success path: a breach already in flight names the
+    # real limit that tripped and must not be overwritten by a later "elapsed".
+    budget.check_deadline()
+    return out
+
+
+def _copy_tree_inner(source: Any, budget: _Budget, memo: Dict[int, Any], keep: List[Any]) -> Any:
     if isinstance(source, dict) and not isinstance(source, FrozenDict):
         budget.spend()
         out: Dict[Any, Any] = {}
