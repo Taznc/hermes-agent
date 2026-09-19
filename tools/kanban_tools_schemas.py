@@ -263,6 +263,33 @@ KANBAN_REQUEST_CHANGES_SCHEMA = _schema(
                 "Specific, actionable changes the implementer must make "
                 "before requesting another review."
         )),
+        "blockers": {
+            "type": "array",
+            "minItems": 1,
+            "description": (
+                "Consolidated blocking findings. Each cites an allowed basis and precise "
+                "reference. On re-review, cite an established reference or use "
+                "base_regression with rework_of naming one."
+            ),
+            "items": {
+                "type": "object",
+                "additionalProperties": False,
+                "properties": {
+                    "basis": {"type": "string", "enum": [
+                        "original_ac", "required_behavior", "base_regression", "landing_gate",
+                    ]},
+                    "reference": _prop("string", "Precise contract reference."),
+                    "rework_of": _prop(
+                        "string", "Established blocker reference that this regression reworked."),
+                },
+                "required": ["basis", "reference"],
+            },
+        },
+        "followups": {
+            "type": "array",
+            "items": {"type": "string", "minLength": 1},
+            "description": "Optional inert, non-blocking improvements; never releases work.",
+        },
         "metadata": {
             "type": "object",
             "description": (
@@ -272,7 +299,7 @@ KANBAN_REQUEST_CHANGES_SCHEMA = _schema(
             "additionalProperties": True,
         },
     },
-    ["reason"],
+    ["reason", "blockers"],
 )
 
 KANBAN_HEARTBEAT_SCHEMA = _schema(

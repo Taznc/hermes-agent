@@ -101,6 +101,7 @@ def test_review_packet_has_review_role_round_and_latest_handoff(board):
         reason="add the missing regression",
         metadata={"test": "test_regression"},
         expected_run_id=review_claim.current_run_id,
+    blockers=[{"basis": "original_ac", "reference": "test acceptance contract"}],
     )
     assert ok
     retry_claim = kb.claim_task(board, task_id)

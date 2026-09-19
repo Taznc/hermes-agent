@@ -1242,11 +1242,33 @@ def _cmd_request_review(args: argparse.Namespace) -> int:
     return 0
 
 
+def _parse_review_blockers(
+    values: list[str],
+) -> tuple[Optional[list[dict[str, str]]], Optional[str]]:
+    blockers: list[dict[str, str]] = []
+    for value in values:
+        basis, separator, remainder = value.partition("=")
+        if not separator:
+            return None, f"invalid --blocker {value!r}; expected BASIS=REFERENCE"
+        reference, rework_separator, rework_of = remainder.partition("|rework_of=")
+        blocker = {"basis": basis.strip(), "reference": reference.strip()}
+        if rework_separator:
+            blocker["rework_of"] = rework_of.strip()
+        blockers.append(blocker)
+    return blockers, None
+
+
 def _cmd_request_changes(args: argparse.Namespace) -> int:
     tid = args.task_id
     reason = " ".join(args.reason).strip()
+    blockers, blocker_error = _parse_review_blockers(list(args.blocker or []))
+    if blocker_error:
+        return _err(blocker_error)
     with kbc.connect_closing() as conn:
-        ok, detail = kb.request_changes(conn, tid, reason=reason, expected_run_id=_worker_run_id_for(tid))
+        ok, detail = kb.request_changes(
+            conn, tid, reason=reason, blockers=blockers,
+            followups=list(args.followup or []), expected_run_id=_worker_run_id_for(tid),
+        )
         if not ok:
             return _err(f"cannot request changes for {tid}: {detail or 'invalid review state'}")
         print(f"Requested changes for {tid}" + (f"; routed to {detail}" if detail else ""))

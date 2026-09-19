@@ -1811,6 +1811,99 @@ DEFAULT_CONFIG = {
             },
             "routes": {},
         },
+        # Usage-aware admission control. The dispatcher reads the REAL,
+        # authenticated provider quota (agent/account_usage.py — never local
+        # token/cost accounting, which measures an unrelated thing) once per
+        # tick and steps down BEFORE the account hits a hard limit, then steps
+        # back up on its own once usage resets.
+        #
+        # Pressure is the worst ACTIVE window across every source provider —
+        # 5-hour, weekly, whichever is closest to its limit — and it is ONE
+        # global state shared by every board, because one subscription is one
+        # shared resource.
+        #
+        # The throttle never writes this config and never pauses a board: it
+        # NARROWS the effective concurrency cap in memory and rewrites the route
+        # of the worker it is about to spawn. Your own max_in_progress and each
+        # card's stored route are untouched, so recovery restores them exactly.
+        #
+        # A missing, failed or stale reading changes NOTHING in either direction
+        # (escalating would invent pressure, recovering would invent headroom)
+        # and records one visible degraded event instead.
+        "usage_throttle": {
+            "enabled": True,
+            # Accounts whose quota drives admission. Each must be a provider
+            # with an authenticated machine-readable capacity signal; a
+            # provider with no signal produces a degraded record, never a
+            # guess. Supported today: `anthropic` (OAuth usage windows),
+            # `openai-codex` (usage-API rate-limit windows) and `nous`
+            # (Portal subscription credit balance). `xai`/Grok is NOT
+            # supported — an inference credential is served no quota document
+            # — so naming it here yields a visible unsupported state and no
+            # throttling, never an invented number.
+            "source_providers": ["anthropic"],
+            # A reading older than this is stale and is not acted on.
+            "signal_max_age_seconds": 900,
+            # Minimum spacing between authenticated quota fetches. Ticks in
+            # between reuse the cached reading, so adding boards does not
+            # multiply calls to the provider.
+            "poll_interval_seconds": 120,
+            "fetch_timeout_seconds": 20,
+            # Applied progressively as pressure rises. Each lever has its own
+            # toggle, so any one can be disabled without losing the others.
+            "levers": {
+                # 1. Fewer concurrent workers. `max_in_progress` is an absolute
+                # ceiling combined as min(your cap, this) — it can only tighten.
+                "reduce_concurrency": {
+                    "enabled": True,
+                    "threshold_pct": 70,
+                    "max_in_progress": 2,
+                },
+                # 2. Cheaper model. ONE global ordered ladder (expensive first)
+                # applied uniformly to every profile; a task whose model is on
+                # the ladder moves one rung down for that spawn only. A model
+                # not on the ladder is left alone rather than guessed at.
+                # Empty by default: the ladder names YOUR models.
+                "downgrade_model": {
+                    "enabled": True,
+                    "threshold_pct": 80,
+                    "ladder": [],
+                },
+                # 3. Drain. No new claims; in-flight workers finish normally and
+                # are never killed, reclaimed or paused.
+                "pause_drain": {
+                    "enabled": True,
+                    "threshold_pct": 90,
+                },
+                # 4. Cross-provider failover — OFF BY DEFAULT and deliberately
+                # hard to arm. Another provider is not unlimited overflow: a
+                # reroute requires this toggle, the assignee named in
+                # `eligible_profiles` (never inferred from having a route
+                # configured), a destination route, AND a fresh authenticated
+                # reading for BOTH the source and the destination showing the
+                # destination at or below `max_pressure_pct`. Any missing or
+                # stale signal on either side means no reroute plus a visible
+                # degraded event.
+                "cross_provider_failover": {
+                    "enabled": False,
+                    "threshold_pct": 95,
+                    "eligible_profiles": [],
+                    "destination": {
+                        "provider": "",
+                        "model": "",
+                        "max_pressure_pct": 50,
+                    },
+                },
+            },
+            "resume": {
+                # Ramp-back point, a SEPARATE knob from every step-down
+                # threshold: the state de-escalates only all the way back to
+                # normal, and only at or below this, so the board cannot
+                # oscillate across a single boundary.
+                "threshold_pct": 50,
+                "log_event": True,
+            },
+        },
         # Global cap: positive int = the HOST never has more than N tasks 'running' across all
         # boards and both dispatch lanes. None = ~MemTotal / 512 MiB clamped to [2, 8]; where
         # MemTotal is unreadable (macOS/Windows) None means no cap.

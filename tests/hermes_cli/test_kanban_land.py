@@ -174,7 +174,7 @@ def _review_cycle(conn, *, approve: bool, request_changes_after: bool = False,
         assert kb.reopen_review_task(conn, task_id)
         _hand_to_review(conn, task_id, summary="again")
         assert kb.claim_review_task(conn, task_id, claimer="lock-rev2") is not None
-        ok, _ = kb.request_changes(conn, task_id, reason="needs work")
+        ok, _ = kb.request_changes(conn, task_id, reason="needs work", blockers=[{"basis": "original_ac", "reference": "test acceptance contract"}])
         assert ok
     return task_id
 

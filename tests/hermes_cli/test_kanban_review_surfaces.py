@@ -65,6 +65,11 @@ def test_review_tools_redact_handoff_and_route_changes(
     changed = json.loads(
         tools._handle_request_changes({
             "reason": f"Add a boundary assertion; leaked={change_secret}",
+            "blockers": [{
+                "basis": "original_ac",
+                "reference": "AC1: redact durable review handoffs",
+            }],
+            "followups": ["Consider a shorter error message."],
         })
     )
     assert changed["ok"] is True
@@ -82,6 +87,11 @@ def test_review_tools_redact_handoff_and_route_changes(
         ][-1]
         assert event.payload is not None
         assert change_secret not in event.payload["reason"]
+        assert event.payload["blockers"] == [{
+            "basis": "original_ac",
+            "reference": "AC1: redact durable review handoffs",
+        }]
+        assert event.payload["followups"] == ["Consider a shorter error message."]
         assert event.payload["reason"] != (
             "Add a boundary assertion; leaked=" + change_secret
         )
@@ -103,8 +113,15 @@ def test_review_tools_are_gated_and_visible_to_kanban_workers(
         for definition in definitions
         if "function" in definition
     }
+    by_name = {
+        definition["function"]["name"]: definition["function"]
+        for definition in definitions if "function" in definition
+    }
     assert "kanban_request_review" in names
     assert "kanban_request_changes" in names
+    changes_schema = by_name["kanban_request_changes"]["parameters"]
+    assert "blockers" in changes_schema["required"]
+    assert changes_schema["properties"]["blockers"]["minItems"] == 1
 
     from agent.transports.hermes_tools_mcp_server import EXPOSED_TOOLS
 
@@ -155,7 +172,9 @@ def test_review_cli_round_trip_preserves_handoff(
     monkeypatch.setenv("HERMES_KANBAN_RUN_ID", str(review.current_run_id))
 
     output = kc.run_slash(
-        f"request-changes {task_id} 'cover the malformed payload case'"
+        f"request-changes {task_id} 'cover the malformed payload case' "
+        "--blocker 'original_ac=AC1: malformed payload handling' "
+        "--followup 'Consider more export formats'"
     )
     assert "Requested changes" in output
     with kbc.connect() as conn:
@@ -201,6 +220,10 @@ def test_domain_and_cli_review_handoffs_redact_before_persistence(
             conn,
             direct_id,
             reason=f"change {secret}",
+            blockers=[{
+                "basis": "original_ac",
+                "reference": "AC1: redact durable review handoffs",
+            }],
             expected_run_id=review.current_run_id,
         ) == (True, "builder")
         run = kb.latest_run(conn, direct_id)

@@ -237,6 +237,7 @@ def test_routing_classifier_runs_only_on_create_across_lifecycle(
         assert reviewed is not None
         ok, implementer = kb.request_changes(
             conn, task.id, reason="needs another pass", expected_run_id=reviewed.current_run_id,
+        blockers=[{"basis": "original_ac", "reference": "test acceptance contract"}],
         )
         assert ok is True
         assert implementer == "claudeprimary"

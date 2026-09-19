@@ -259,6 +259,8 @@ class DispatchResult:
     """Task ids reclaimed because their worker PID disappeared."""
     auto_blocked: list[str] = field(default_factory=list)
     """Task ids auto-blocked by the spawn-failure circuit breaker."""
+    preflight_blocked: list[str] = field(default_factory=list)
+    """Task ids blocked before model spawn by deterministic workspace checks."""
     timed_out: list[str] = field(default_factory=list)
     """Task ids whose workers exceeded ``max_runtime_seconds``."""
     stale: list[str] = field(default_factory=list)
@@ -305,6 +307,22 @@ class DispatchResult:
     """Current per-board dispatch stop state. Start-budget records are
     self-expiring cooldowns; integrity/safety records remain sticky until an
     operator explicitly resumes the board."""
+    usage_throttle: Optional[dict[str, Any]] = None
+    """Global usage-throttle state consulted this tick
+    (``agent.kanban_throttle``): pressure state, the automatic concurrency
+    ceiling, whether the board is draining, and any degraded condition. Present
+    whenever ``kanban.usage_throttle`` is enabled, so an operator can tell
+    "throttled" from "idle" — a silent blind spot is worse than a visible one.
+    Distinct from ``dispatch_paused``: a drain is an automatic, self-clearing
+    admission decision, NOT a sticky operator/fault pause."""
+    throttle_drained: list[str] = field(default_factory=list)
+    """Ready/review task ids not claimed this tick because the usage throttle is
+    draining. NOT a failure and NOT operator-actionable: in-flight work keeps
+    running and these spawn on a later tick once pressure clears."""
+    throttle_rerouted: list[tuple[str, str, str]] = field(default_factory=list)
+    """``(task_id, kind, route)`` for spawns whose route the throttle changed
+    in memory this tick (``kind`` is ``downgrade`` or ``failover``). The card
+    row keeps the operator's own route, so nothing has to be restored later."""
 
 
 # Bounded registry of recently-reaped worker exits, filled by the reap loop in
@@ -3019,12 +3037,20 @@ def _dispatch_lane_task(
     per_profile_running: dict[str, int],
     coedit_index=None,
     coedit_paths: Optional[dict] = None,
+    throttle=None,
+    drain_exempt: frozenset[str] = frozenset(),
 ) -> bool:
     """Guard, claim, resolve the workspace and spawn one ready/review row.
     Returns True when a spawn slot was consumed (real or ``dry_run``); every
     skip is recorded on ``result``.
     """
     task_id = row["id"]
+    # Drain carve-out: when the throttle is draining, only a profile whose work
+    # the operator opted into cross-provider failover (with both accounts'
+    # capacity freshly proven) may still be claimed. Everyone else was already
+    # recorded in ``throttle_drained``; this is the enforcement half.
+    if throttle is not None and throttle.drain and assignee not in drain_exempt:
+        return False
     # Forced-skill preflight FIRST: a card can carry skills that never passed
     # create-time validation (imported board, pre-check row, skill uninstalled
     # or disabled since), and it must be refused before anything else decides
@@ -3053,6 +3079,13 @@ def _dispatch_lane_task(
     policy_task = _kb.get_task(conn, task_id)
     if policy_task is not None:
         try:
+            # Judge the route the worker would ACTUALLY get, throttle rewrite
+            # included — otherwise a downgraded route could clear this gate as
+            # its original and then be refused after the claim, charging the
+            # card for a configuration outcome. Recorded only on a dry run,
+            # where this copy is the sole chance to report the reroute; a real
+            # tick reports the one applied to the claimed task below.
+            _apply_throttle_route(policy_task, throttle, result, record=dry_run)
             _prepare_worker_launch(policy_task)
             _validate_prepared_model_policy(
                 policy_task, board=board, review_lane=(lane == "review"),
@@ -3125,12 +3158,28 @@ def _dispatch_lane_task(
     claimed = claim(conn, task_id, ttl_seconds=ttl_seconds)
     if claimed is None:
         return False
+    from hermes_cli import kanban_db_receipt as _kbr
+
+    plan = None
     try:
         resolved_branch_name = None
         if claimed.workspace_kind == "worktree":
-            workspace, resolved_branch_name = _kbw._resolve_worktree_workspace(claimed, board=board)
+            plan = _kbr.workspace_plan(conn, claimed, board=board)
+            workspace, resolved_branch_name = _kbw._resolve_worktree_workspace(
+                claimed, board=board, base_ref=plan.base_ref
+            )
         else:
             workspace = _kbw.resolve_workspace(claimed, board=board)
+    except _kbr.PreflightError as exc:
+        _kb.block_task(
+            conn,
+            claimed.id,
+            reason=f"Kanban preflight refused spawn: {exc}",
+            kind="capability",
+            expected_run_id=claimed.current_run_id,
+        )
+        result.preflight_blocked.append(claimed.id)
+        return False
     except Exception as exc:
         if _record_task_failure(
             conn, claimed.id, f"workspace: {exc}",
@@ -3141,6 +3190,28 @@ def _dispatch_lane_task(
     _kbw.set_workspace_path(conn, claimed.id, str(workspace))
     if claimed.workspace_kind == "worktree":
         _kbw.set_branch_name(conn, claimed.id, resolved_branch_name or (claimed.branch_name or "").strip() or f"wt/{claimed.id}")
+        claimed.workspace_path = str(workspace)
+        claimed.branch_name = resolved_branch_name or (claimed.branch_name or "").strip() or f"wt/{claimed.id}"
+    try:
+        receipt = _kbr.build_preflight_receipt(
+            claimed,
+            workspace,
+            board=board,
+            base_ref=plan.base_ref if plan is not None else None,
+            artifact_ref=plan.artifact_ref if plan is not None else None,
+            role=plan.role if plan is not None else ("reviewer" if lane == "review" else "implementer"),
+        )
+        claimed.preflight_receipt_path = str(receipt.path)
+    except _kbr.PreflightError as exc:
+        _kb.block_task(
+            conn,
+            claimed.id,
+            reason=f"Kanban preflight refused spawn: {exc}",
+            kind="capability",
+            expected_run_id=claimed.current_run_id,
+        )
+        result.preflight_blocked.append(claimed.id)
+        return False
     _kbw._maybe_emit_scratch_tip(conn, claimed.id, claimed.workspace_kind)
     if lane == "review":
         # Force-load sdlc-review; the kanban lifecycle is already in every
@@ -3150,6 +3221,9 @@ def _dispatch_lane_task(
         # Resolve and persist before invoking either the built-in or a
         # compatible custom spawn function. This closes the race where a very
         # fast worker finalizes its run before the parent records its PID.
+        # The throttle rewrite happens FIRST so the policy gate, the persisted
+        # run analytics and the worker argv all describe the same route.
+        _apply_throttle_route(claimed, throttle, result)
         _prepare_worker_launch(claimed)
         _validate_prepared_model_policy(
             claimed, board=board, review_lane=(lane == "review"),
@@ -3654,6 +3728,138 @@ def _run_reclaim_phase(
     result.promoted = _kb.recompute_ready(conn, failure_limit=failure_limit)
 
 
+def _evaluate_usage_throttle(
+    result: DispatchResult,
+    *,
+    operator_max_in_progress: Optional[int],
+    board: Optional[str],
+    dry_run: bool,
+):
+    """Consult the global usage throttle once for this tick.
+
+    Returns the decision, or ``None`` when the feature is off or unavailable.
+    A throttle fault must NEVER wedge dispatch: any failure here reduces to a
+    log line and a tick that behaves exactly as it did before the feature
+    existed.  The summary is attached to *result* whenever the throttle is
+    enabled — including in the healthy state — so an operator can distinguish
+    "throttled" from "idle" instead of inferring it from an absence.
+    """
+    try:
+        from agent import kanban_throttle
+
+        decision = kanban_throttle.evaluate_throttle(
+            operator_max_in_progress=operator_max_in_progress,
+            board=board,
+            persist=not dry_run,
+        )
+    except Exception:
+        _kb._log.warning(
+            "kanban dispatch: usage throttle evaluation failed; "
+            "dispatching without admission throttling this tick",
+            exc_info=True,
+        )
+        return None
+    if not decision.enabled:
+        return None
+    result.usage_throttle = decision.public_state()
+    return decision
+
+
+def _apply_throttle_route(
+    task: "Task", decision, result: DispatchResult, *, record: bool = True,
+) -> None:
+    """Rewrite one spawn's route in memory when the throttle calls for it.
+
+    The card row is deliberately NOT updated: the stored route is the
+    operator's intent, and mutating it would make recovery a restore operation
+    that could clobber a route the operator changed meanwhile.  Because the
+    change lives only on this ``Task`` instance, the next spawn after pressure
+    clears uses the operator's own route with nothing to undo.
+
+    The rewritten route is still validated by the normal model-policy gate
+    downstream, so a downgrade cannot smuggle in a route the policy forbids.
+    ``record=False`` applies the same change to the throwaway pre-claim policy
+    copy, where reporting it would double-count the one real reroute.
+    """
+    if decision is None:
+        return
+    # An explicitly forced route is an operator decision with a durable reason
+    # recorded against it; automatic pressure never overrides that.
+    if task.policy_forced_by or task.policy_force_route:
+        return
+    try:
+        from agent import kanban_throttle
+
+        plan = kanban_throttle.plan_route_change(
+            decision,
+            assignee=task.assignee,
+            model=task.model_override,
+            provider=task.provider_override,
+        )
+    except Exception:
+        _kb._log.debug("kanban dispatch: throttle route planning failed", exc_info=True)
+        return
+    if plan is None or not plan.model:
+        return
+    previous = task.model_override
+    task.model_override = plan.model
+    if plan.provider:
+        task.provider_override = plan.provider
+    # Drop any resolved analytics so _prepare_worker_launch recomputes the run
+    # identity from the NEW route; a stale value would record the route the
+    # worker did not actually run.
+    with contextlib.suppress(AttributeError):
+        setattr(task, "_worker_run_analytics", None)
+    if not record:
+        return
+    result.throttle_rerouted.append(
+        (task.id, plan.kind, f"{plan.provider or '-'}/{plan.model}")
+    )
+    _kb._log.warning(
+        "kanban dispatch: usage throttle %s for task %s (%s -> %s); %s. "
+        "The card's stored route is unchanged.",
+        plan.kind, task.id, previous or "profile default", plan.model, plan.reason,
+    )
+
+
+def _failover_exempt_profiles(decision) -> frozenset[str]:
+    """Profiles a drain may still admit, because their work is being rerouted
+    to a DIFFERENT account whose capacity was freshly proven.
+
+    Empty on every failure and on the shipped defaults, so the drain stays
+    fail-closed: a throttle fault can only ever make the board MORE careful.
+    """
+    try:
+        from agent import kanban_throttle
+
+        return frozenset(kanban_throttle.failover_eligible_profiles(decision))
+    except Exception:
+        _kb._log.debug("kanban dispatch: failover eligibility check failed", exc_info=True)
+        return frozenset()
+
+
+def _apply_drain(
+    conn: sqlite3.Connection,
+    result: DispatchResult,
+    *,
+    exempt: frozenset[str],
+    board: Optional[str],
+) -> bool:
+    """Record the drained lanes; return True iff the tick should still spawn.
+
+    Every queued card is reported (an operator must see WHY nothing started),
+    and the tick continues only when at least one queued card belongs to a
+    failover-exempt profile.
+    """
+    rows = _lane_rows(conn, "ready")
+    if review_dispatch_enabled():
+        rows = rows + _lane_rows(conn, "review")
+    result.throttle_drained = [
+        str(row["id"]) for row in rows if str(row["assignee"] or "") not in exempt
+    ]
+    return bool(exempt) and len(result.throttle_drained) < len(rows)
+
+
 def _tick_spawn_budget(
     conn: sqlite3.Connection,
     result: DispatchResult,
@@ -3889,6 +4095,33 @@ def _dispatch_once_locked(
         failure_limit=failure_limit, reconcile_orphans=reconcile_orphans,
         board=board,
     )
+    # Usage-aware admission. Deliberately AFTER the reclaim/promotion phase:
+    # even while draining, stale/crashed/timed-out bookkeeping must keep
+    # running and todo->ready promotion must keep happening — a drain stops NEW
+    # claims, it does not freeze the board. The decision narrows this tick's
+    # cap in memory only; `max_in_progress` as the operator configured it is
+    # still the value on the next uncongested tick.
+    throttle = _evaluate_usage_throttle(
+        result, operator_max_in_progress=max_in_progress, board=board, dry_run=dry_run,
+    )
+    drain_exempt: frozenset[str] = frozenset()
+    if throttle is not None:
+        max_in_progress = throttle.narrowed_max_in_progress(max_in_progress)
+        if throttle.drain:
+            # No new claims — EXCEPT for profiles the operator explicitly
+            # opted into cross-provider failover, whose work will not land on
+            # the exhausted account at all. That carve-out is what keeps the
+            # failover lever reachable: pressure high enough to arm it is also
+            # high enough to drain, so an unconditional return here would make
+            # the lever dead code. It stays fail-closed — the helper returns no
+            # profiles unless the lever is enabled, the profile is allowlisted,
+            # and BOTH source and destination capacity are freshly proven.
+            drain_exempt = _failover_exempt_profiles(throttle)
+            if not _apply_drain(conn, result, exempt=drain_exempt, board=board):
+                # In-flight workers are untouched: nothing killed, reclaimed or
+                # paused, and no pause sentinel written (this state is
+                # automatic and self-clearing, unlike an operator/fault pause).
+                return result
     may_spawn, spawn_budget = _tick_spawn_budget(
         conn, result, max_spawn=max_spawn, max_in_progress=max_in_progress, board=board,
     )
@@ -4042,6 +4275,7 @@ def _dispatch_once_locked(
         failure_limit=failure_limit, spawn_fn=spawn_fn,
         per_profile_cap=per_profile_cap, per_profile_running=per_profile_running,
         coedit_index=coedit_index, coedit_paths=coedit_paths,
+        throttle=throttle, drain_exempt=drain_exempt,
     )
     default_assignee = _resolve_default_assignee(default_assignee)
     default_reviewer = _resolve_default_reviewer(default_reviewer)
@@ -5092,6 +5326,8 @@ def _default_spawn(task: Task, workspace: str, *, board: Optional[str] = None) -
         env["HERMES_KANBAN_RUN_ID"] = str(task.current_run_id)
     if task.claim_lock:
         env["HERMES_KANBAN_CLAIM_LOCK"] = task.claim_lock
+    if task.preflight_receipt_path:
+        env["HERMES_KANBAN_PREFLIGHT_RECEIPT"] = task.preflight_receipt_path
     # Goal-loop mode (Ralph-style /goal judge loop in cli.py quiet-mode path).
     # Only set when enabled so non-goal tasks keep a clean env.
     if task.goal_mode:
@@ -5139,6 +5375,7 @@ def _default_spawn(task: Task, workspace: str, *, board: Optional[str] = None) -
             "HERMES_HOME", "HERMES_TENANT", "HERMES_KANBAN_TASK",
             "HERMES_KANBAN_WORKSPACE", "HERMES_SESSION_SOURCE", "HERMES_SESSION_ID", "TERMINAL_CWD",
             "HERMES_KANBAN_BRANCH", "HERMES_KANBAN_RUN_ID", "HERMES_KANBAN_CLAIM_LOCK",
+            "HERMES_KANBAN_PREFLIGHT_RECEIPT",
             "HERMES_KANBAN_GOAL_MODE", "HERMES_KANBAN_GOAL_MAX_TURNS", "TERMINAL_TIMEOUT",
             "TERMINAL_MAX_FOREGROUND_TIMEOUT", "HERMES_KANBAN_DB", "HERMES_KANBAN_PIN_HOME",
             "HERMES_KANBAN_WORKSPACES_ROOT", "HERMES_KANBAN_BOARD", "HERMES_PROFILE",

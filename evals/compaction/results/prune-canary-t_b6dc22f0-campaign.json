@@ -1,0 +1,44 @@
+{
+ "disabled": {
+  "new_input_tokens": 4133475,
+  "cache_read_tokens": 115695513,
+  "cache_write_tokens": 4133475,
+  "output_tokens": 237000,
+  "compaction_aux_calls": 6,
+  "compaction_aux_input_tokens": 2743434,
+  "compaction_aux_output_tokens": 24000,
+  "total_calls": 480,
+  "full_compressions": 6,
+  "prune_commits": 0,
+  "skill_reload_events": 0,
+  "reread_events": 0
+ },
+ "prune_96k": {
+  "new_input_tokens": 5760860,
+  "cache_read_tokens": 84134717,
+  "cache_write_tokens": 5760860,
+  "output_tokens": 237000,
+  "compaction_aux_calls": 1,
+  "compaction_aux_input_tokens": 472061,
+  "compaction_aux_output_tokens": 4000,
+  "total_calls": 475,
+  "full_compressions": 1,
+  "prune_commits": 30,
+  "skill_reload_events": 18,
+  "reread_events": 391
+ },
+ "prune_48k": {
+  "new_input_tokens": 6165912,
+  "cache_read_tokens": 81061819,
+  "cache_write_tokens": 6165912,
+  "output_tokens": 237000,
+  "compaction_aux_calls": 1,
+  "compaction_aux_input_tokens": 458968,
+  "compaction_aux_output_tokens": 4000,
+  "total_calls": 475,
+  "full_compressions": 1,
+  "prune_commits": 52,
+  "skill_reload_events": 23,
+  "reread_events": 463
+ }
+}

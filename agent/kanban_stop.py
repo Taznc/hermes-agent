@@ -107,7 +107,8 @@ def build_kanban_stop_nudge(
         "2. Call `kanban_complete(summary=..., artifacts=[...])` if the work is "
         "done, `kanban_block(reason=...)` if you are blocked, "
         "`kanban_request_review(summary=...)` to hand off for review, or "
-        "`kanban_request_changes(reason=...)` if you are a reviewer sending work back.\n\n"
+        "`kanban_request_changes(reason=..., blockers=[{basis, reference}, ...])` if you are a "
+        "reviewer sending one consolidated in-contract verdict back.\n\n"
         "Never end a turn with only a promise of future action. Repeated "
         "protocol violations will block this task and require manual intervention.]"
     )

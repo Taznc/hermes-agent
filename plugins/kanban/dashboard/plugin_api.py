@@ -963,6 +963,18 @@ class BulkTaskBody(BaseModel):
     acknowledge_block_loop: bool = False
 
 
+class ReviewBlockerBody(BaseModel):
+    basis: str
+    reference: str
+    rework_of: Optional[str] = None
+
+
+class RequestChangesBody(BaseModel):
+    reason: str
+    blockers: list[ReviewBlockerBody] = Field(min_length=1)
+    followups: list[str] = Field(default_factory=list)
+
+
 class _StatusRejected(Exception):
     """A status the dashboard may not set via this path; the message is user-facing."""
 
@@ -1200,6 +1212,30 @@ def update_task(task_id: str, payload: UpdateTaskBody, board: Optional[str] = Qu
             _patch_title_body(conn, task_id, payload, board)
         updated = kanban_db.get_task(conn, task_id)
         return {"task": _task_dict(updated) if updated else None}
+
+
+@router.post("/tasks/{task_id}/request-changes")
+def request_task_changes(
+    task_id: str,
+    payload: RequestChangesBody,
+    board: Optional[str] = Query(None),
+):
+    with _board_conn(board) as (_board, conn):
+        _require_task(conn, task_id)
+        ok, detail = kanban_db.request_changes(
+            conn,
+            task_id,
+            reason=payload.reason,
+            blockers=[item.model_dump(exclude_none=True) for item in payload.blockers],
+            followups=payload.followups,
+        )
+        if not ok:
+            raise HTTPException(status_code=409, detail=detail or "invalid review state")
+        updated = kanban_db.get_task(conn, task_id)
+        return {
+            "task": _task_dict(updated) if updated else None,
+            "implementer": detail,
+        }
 
 
 @router.delete("/tasks/{task_id}")

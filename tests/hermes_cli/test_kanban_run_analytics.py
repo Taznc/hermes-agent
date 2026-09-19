@@ -403,6 +403,7 @@ def test_third_rejection_carries_review_round_3(kanban_home):
             ok, _ = kb.request_changes(
                 conn, tid, reason="nope", metadata={"review_note": review_round},
                 expected_run_id=reviewer_claim.current_run_id,
+            blockers=[{"basis": "original_ac", "reference": "test acceptance contract"}],
             )
             assert ok
 

@@ -173,6 +173,12 @@ def _cmd_dispatch(args: argparse.Namespace) -> int:
                 "deferred_task_ids": res.deferred_priority_reserved,
             },
             "dispatch_paused": res.dispatch_paused,
+            "usage_throttle": res.usage_throttle,
+            "throttle_drained": res.throttle_drained,
+            "throttle_rerouted": [
+                {"task_id": tid, "kind": kind, "route": route}
+                for (tid, kind, route) in res.throttle_rerouted
+            ],
         }, ascii=True)
         return 0
     print(f"Reclaimed:    {res.reclaimed}")
@@ -242,6 +248,40 @@ def _cmd_dispatch(args: argparse.Namespace) -> int:
         print(f"Blocked (forced skill unavailable to assignee): {tid}\n  {reason}")
     if res.dispatch_paused:
         print("Dispatch: " + _dispatch_pause_message(res.dispatch_paused, board=board))
+    # Printed whenever the throttle is enabled, healthy state included: an
+    # operator must be able to tell "throttled" from "idle" rather than infer
+    # it from an absent line.
+    if res.usage_throttle:
+        state = res.usage_throttle
+        if state.get("degraded"):
+            print(
+                f"Usage throttle: DEGRADED ({state.get('degraded_reason')}) — holding "
+                f"state={state.get('state')}, no automatic change"
+            )
+            if state.get("recovery"):
+                print(f"  Recovery: {state['recovery']}")
+        else:
+            pressure = state.get("pressure_percent")
+            where = " ".join(
+                str(p) for p in (state.get("provider"), state.get("window")) if p
+            )
+            print(
+                f"Usage throttle: state={state.get('state')}"
+                + (f" at {pressure:.0f}%" if isinstance(pressure, (int, float)) else "")
+                + (f" ({where})" if where else "")
+            )
+        if state.get("max_in_progress") is not None:
+            print(
+                f"  Automatic concurrency ceiling: {state['max_in_progress']} "
+                f"(your kanban.max_in_progress is unchanged)"
+            )
+        if res.throttle_drained:
+            print(
+                "  Draining — in-flight work continues, no new claims: "
+                + ", ".join(res.throttle_drained)
+            )
+        for tid, kind, route in res.throttle_rerouted:
+            print(f"  Route {kind} (this spawn only, card unchanged): {tid} -> {route}")
     return 0
 
 

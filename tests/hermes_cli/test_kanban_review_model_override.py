@@ -140,6 +140,7 @@ def test_request_changes_restores_implementer_override(
         assert review_run.reasoning_effort is None
         ok, implementer = kb.request_changes(
             conn, tid, reason="needs work", expected_run_id=review_run.current_run_id,
+        blockers=[{"basis": "original_ac", "reference": "test acceptance contract"}],
         )
         assert ok is True
         assert implementer == "claudeprimary"
@@ -180,6 +181,7 @@ def test_rereview_after_changes_requested_still_works(
         review_run = kb.claim_review_task(conn, tid)
         kb.request_changes(
             conn, tid, reason="fix it", expected_run_id=review_run.current_run_id,
+        blockers=[{"basis": "original_ac", "reference": "test acceptance contract"}],
         )
 
         # Implementer reclaims, fixes, requests review again with NO explicit
@@ -208,6 +210,7 @@ def test_rereview_after_changes_requested_still_works(
         # And a second round trip back still restores the pin.
         ok2, implementer2 = kb.request_changes(
             conn, tid, reason="one more pass", expected_run_id=review_run2.current_run_id,
+        blockers=[{"basis": "original_ac", "reference": "test acceptance contract"}],
         )
         assert ok2 is True
         assert implementer2 == "claudeprimary"
@@ -236,6 +239,7 @@ def test_no_override_card_unaffected(kanban_home: Path) -> None:
         review_run = kb.claim_review_task(conn, tid)
         ok, implementer = kb.request_changes(
             conn, tid, reason="fix", expected_run_id=review_run.current_run_id,
+        blockers=[{"basis": "original_ac", "reference": "test acceptance contract"}],
         )
         assert ok is True
         assert implementer == "claudeprimary"
@@ -350,6 +354,7 @@ def test_explicit_reviewer_override_wins(
         # back — the reviewer-specific override doesn't clobber the snapshot.
         ok, implementer = kb.request_changes(
             conn, tid, reason="fix", expected_run_id=review_run.current_run_id,
+        blockers=[{"basis": "original_ac", "reference": "test acceptance contract"}],
         )
         assert ok is True
         assert implementer == "claudeprimary"

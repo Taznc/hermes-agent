@@ -406,6 +406,7 @@ def test_forced_implementer_route_survives_review_rework_only_for_implementer(co
     assert review is not None
     assert kb.request_changes(
         conn, tid, reason="add regression", expected_run_id=review.current_run_id,
+        blockers=[{"basis": "original_ac", "reference": "test acceptance contract"}],
     ) == (True, "builder")
 
     returned = kb.get_task(conn, tid)
