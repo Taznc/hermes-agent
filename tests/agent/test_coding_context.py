@@ -333,6 +333,34 @@ class TestProfiles:
         general = cc.resolve_runtime_mode(platform="telegram", cwd=tmp_path, config={})
         assert general.compact_skill_categories() == frozenset()
 
+    def test_configured_compact_categories_apply_on_every_posture(self, tmp_path):
+        # Operator-pinned skills.compact_categories demotes on ANY platform/posture — unlike the
+        # coding-focus deny-list it is not gated on `focus` or on being in a code workspace.
+        cfg = {"skills": {"compact_categories": ["creative", "media"]}}
+        general = cc.coding_compact_skill_categories(platform="telegram", cwd=tmp_path, config=cfg)
+        assert general == frozenset({"creative", "media"})
+        # Nested categories fold to their top-level segment.
+        nested_cfg = {"skills": {"compact_categories": ["social-media/twitter"]}}
+        nested = cc.coding_compact_skill_categories(platform="cli", cwd=tmp_path, config=nested_cfg)
+        assert nested == frozenset({"social-media"})
+        # A bare string is accepted the same as a one-item list.
+        bare_cfg = {"skills": {"compact_categories": "research"}}
+        bare = cc.coding_compact_skill_categories(platform="cli", cwd=tmp_path, config=bare_cfg)
+        assert bare == frozenset({"research"})
+        # Malformed values fail open to no demotion rather than raising.
+        for bad in (None, 42, {"not": "a list"}):
+            bad_cfg = {"skills": {"compact_categories": bad}}
+            assert cc.coding_compact_skill_categories(platform="cli", cwd=tmp_path, config=bad_cfg) == frozenset()
+
+    def test_configured_compact_categories_union_with_focus_posture(self, tmp_path):
+        # The operator list and the focus-posture deny-list compose (union), they don't replace
+        # each other.
+        _git_init(tmp_path)
+        cfg = {"agent": {"coding_context": "focus"}, "skills": {"compact_categories": ["devops"]}}
+        combined = cc.coding_compact_skill_categories(platform="cli", cwd=tmp_path, config=cfg)
+        assert "social-media" in combined  # from the focus posture deny-list
+        assert "devops" in combined        # from the operator config, which focus alone keeps full
+
 
 # ── detection signals ───────────────────────────────────────────────────────
 
