@@ -34,6 +34,7 @@ import pytest
 
 from hermes_cli import kanban_db as kb
 from hermes_cli import kanban_db_dispatch as kbd
+from hermes_fork.kanban import worker_launcher as wl
 
 
 def _make_task(**overrides) -> kb.Task:
@@ -324,14 +325,12 @@ def test_apply_worker_launcher_skips_double_scope_directly():
         "kanban-t_launcher-run-7.scope", "--collect", "--", "hermes", "-p", "coder",
     ]
 
-    import hermes_cli.kanban_db_dispatch as kbd_module
-
-    orig_prefix = kbd_module._worker_launcher_prefix
+    orig_prefix = wl._worker_launcher_prefix
     try:
-        kbd_module._worker_launcher_prefix = lambda: ["systemd-run", "--user", "--scope"]
-        argv, unit = kbd_module._apply_worker_launcher(task, already_wrapped)
+        wl._worker_launcher_prefix = lambda: ["systemd-run", "--user", "--scope"]
+        argv, unit = wl._apply_worker_launcher(task, already_wrapped)
     finally:
-        kbd_module._worker_launcher_prefix = orig_prefix
+        wl._worker_launcher_prefix = orig_prefix
 
     assert argv is already_wrapped  # no rewrap at all -- pure pass-through
     assert unit == "kanban-t_launcher-run-7.scope"
@@ -380,9 +379,9 @@ def test_worker_launcher_systemd_run_user_injects_bus_env_into_child(worker_setu
     root, workspace, task = worker_setup
     _set_worker_launcher(root, ["systemd-run", "--user", "--scope"])
     monkeypatch.setattr("shutil.which", lambda name: "/usr/bin/systemd-run" if name == "systemd-run" else None)
-    monkeypatch.setattr(kbd, "_systemd_user_bus_reachable", lambda: True)
+    monkeypatch.setattr(wl, "_systemd_user_bus_reachable", lambda: True)
     monkeypatch.setattr(
-        kbd, "_resolve_systemd_user_bus_env",
+        wl, "_resolve_systemd_user_bus_env",
         lambda: ("/run/user/4242", "unix:path=/run/user/4242/bus"),
     )
     # Simulate the gateway's actually-stripped environment (#B3's premise):
@@ -442,7 +441,7 @@ def test_worker_launcher_systemd_run_user_fails_closed_without_reachable_bus(wor
     root, workspace, task = worker_setup
     _set_worker_launcher(root, ["systemd-run", "--user", "--scope"])
     monkeypatch.setattr("shutil.which", lambda name: "/usr/bin/systemd-run" if name == "systemd-run" else None)
-    monkeypatch.setattr(kbd, "_systemd_user_bus_reachable", lambda: False)
+    monkeypatch.setattr(wl, "_systemd_user_bus_reachable", lambda: False)
 
     captured = {}
 
