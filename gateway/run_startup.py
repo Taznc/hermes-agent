@@ -710,6 +710,7 @@ class GatewayStartupMixin:
                 loop_heartbeat_forever(
                     interval_s=DEFAULT_HEARTBEAT_INTERVAL_S,
                     start_time=getattr(self, "_gateway_started_at", 0.0),
+                    snapshot_fn=self._kanban_dispatcher_health_snapshot,
                 )
             )
             # PERMANENT watcher tag so the scale-to-zero idle check doesn't count it as busy forever.

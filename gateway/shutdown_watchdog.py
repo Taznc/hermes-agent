@@ -331,7 +331,8 @@ def _sweep_stale_tick_sockets(own_path: Path) -> None:
 
 async def loop_heartbeat_forever(
     *, interval_s: float = DEFAULT_HEARTBEAT_INTERVAL_S, start_time: Optional[float] = None,
-    home: Optional[Path] = None, should_continue: Optional[Callable[[], bool]] = None) -> None:
+    home: Optional[Path] = None, should_continue: Optional[Callable[[], bool]] = None,
+    snapshot_fn: Optional[Callable[[], Dict[str, Any]]] = None) -> None:
     """Rewrite the loop heartbeat file on a cadence until cancelled / gated off. Runs on the
     gateway loop so a frozen loop lets the file age for monitors. The fsync write goes to a thread
     (inline, a stalled filesystem blocked the loop inside its own heartbeat and the liveness
@@ -369,9 +370,17 @@ async def loop_heartbeat_forever(
     extra = {"loop_tick_socket": tick_server is not None, "loop_tick_tcp_port": tick_tcp_port}
     try:
         while True:  # first write is immediate so monitors see a fresh file at once
+            # Capture on-loop, before the off-loop write: a stalled dispatcher
+            # must not manufacture a new attempt/success just because we beat.
+            current_extra = dict(extra)
+            if snapshot_fn is not None:
+                try:
+                    current_extra["kanban_dispatcher"] = snapshot_fn()
+                except Exception:
+                    logger.debug("Dispatcher heartbeat snapshot failed", exc_info=True)
             try:
                 await asyncio.to_thread(write_loop_heartbeat, start_time=start_time, home=home,
-                                        extra=extra)
+                                        extra=current_extra)
             except Exception:  # write_loop_heartbeat never raises: executor problem, keep the task
                 logger.debug("Loop heartbeat write failed off-loop", exc_info=True)
             if should_continue is not None and not should_continue():

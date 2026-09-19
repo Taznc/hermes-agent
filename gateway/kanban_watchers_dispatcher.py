@@ -8,6 +8,7 @@ the singleton lock and the health telemetry; everything that only needs the
 from __future__ import annotations
 
 import contextlib
+import math
 import os
 import sqlite3
 import time
@@ -78,6 +79,8 @@ def _resolve_dispatcher_settings(kanban_cfg: dict, kb: Any, *, quiet: bool = Fal
     """
     try:
         interval = float(kanban_cfg.get("dispatch_interval_seconds", 60) or 60)
+        if not math.isfinite(interval):
+            raise ValueError("dispatch interval must be finite")
     except (ValueError, TypeError):
         logger.warning("kanban dispatcher: invalid dispatch_interval_seconds=%r, using default 60",
                        kanban_cfg.get("dispatch_interval_seconds"))

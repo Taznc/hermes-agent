@@ -4524,6 +4524,12 @@ def _run_single_query_mode(cli, query, image, quiet, oneshot):
         cli._show_security_advisories()
         cli.chat(query, images=single_query_images or None)
         cli._print_exit_summary(clear_screen=False)
+        # The dispatcher uses this non-quiet path. Preserve the structured turn
+        # verdict rather than mistaking provider failures for clean text stops.
+        # Reuse the quiet path's quota publisher and run-fenced lifecycle receipt.
+        if os.environ.get("HERMES_KANBAN_TASK"):
+            exit_code = _kanban_worker_result_exit_code(cli, getattr(cli, "_last_turn_result", None))
+            sys.exit(_finalize_kanban_worker_process_exit(exit_code))
     finally:
         _finalize_single_query(cli)
 
