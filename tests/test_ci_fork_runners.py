@@ -43,6 +43,7 @@ def test_fork_python_parallelism_fits_standard_runner():
     workflow = yaml.safe_load((WORKFLOWS / "tests.yml").read_text())
     step = next(step for step in workflow["jobs"]["test"]["steps"] if step.get("name") == "Run tests")
     assert step["env"]["HERMES_TEST_WORKERS"] == "${{ " + OWNER + " && 96 || 2 }}"
+    assert workflow["jobs"]["test"]["timeout-minutes"] == "${{ " + OWNER + " && 30 || 120 }}"
     # This is a runner-availability fix, not permission to skip or narrow tests.
     assert "scripts/run_tests.sh" in step["run"]
     assert "--files" not in step["run"]
