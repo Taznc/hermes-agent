@@ -243,6 +243,7 @@ def test_request_review_malformed_provenance_gets_distinct_reason(
         assert review is not None
         assert kb.request_changes(
             conn, tid, reason="fix", expected_run_id=review.current_run_id,
+        blockers=[{"basis": "original_ac", "reference": "test acceptance contract"}],
         ) == (True, "builder")
         # Corrupt the changes_requested payload so re-review cannot recover
         # the prior reviewer.

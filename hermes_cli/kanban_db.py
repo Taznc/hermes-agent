@@ -418,7 +418,7 @@ def notify_task_updated(
 # DispatchResult counters whose non-zero value means the tick did something.
 _TICK_ACTIVITY_FIELDS = (
     "spawned", "reclaimed", "promoted", "reconciled_orphans", "crashed", "stale",
-    "timed_out", "auto_blocked", "rate_limited", "review_no_verdict", "auto_assigned_default",
+    "timed_out", "auto_blocked", "preflight_blocked", "rate_limited", "review_no_verdict", "auto_assigned_default",
     "respawn_guarded", "skipped_per_profile_capped", "skipped_unassigned",
     "skipped_nonspawnable", "skill_preflight_blocked", "blocked_review_round_cap",
 )
@@ -1093,6 +1093,8 @@ class Task:
     # creates and every pre-feature row.
     created_by_task: Optional[str] = None
     created_by_run: Optional[int] = None
+    # In-memory dispatcher handoff; persisted as a board artifact, not a task column.
+    preflight_receipt_path: Optional[str] = None
 
     @classmethod
     def from_row(cls, row: sqlite3.Row) -> "Task":
@@ -3201,10 +3203,42 @@ def link_tasks(conn: sqlite3.Connection, parent_id: str, child_id: str) -> None:
     """
     if parent_id == child_id:
         raise ValueError("a task cannot depend on itself")
+    repair_reordered = False
     with write_txn(conn):
         missing = _missing_task_ids(conn, [parent_id, child_id])
         if missing:
             raise ValueError(f"unknown task(s): {', '.join(missing)}")
+        # A ready review child can discover separately agent-repairable work.
+        # Reverse only its direct child edge when the caller explicitly links
+        # that repair ahead of the review; ordinary cycles remain errors.
+        from hermes_cli import kanban_db_review as review_policy
+
+        reverse = conn.execute(
+            "SELECT 1 FROM task_links WHERE parent_id = ? AND child_id = ?",
+            (child_id, parent_id),
+        ).fetchone()
+        review_task = get_task(conn, child_id)
+        review_source = (
+            _retry_status_for_run(conn, child_id, review_task.current_run_id)
+            if review_task is not None and review_task.status == "running"
+            else getattr(review_task, "status", None)
+        )
+        if reverse is not None and review_policy.is_ready_review_child(
+            conn,
+            child_id,
+            review_task,
+            source_state=review_source,
+            exclude_parent_id=parent_id,
+        ):
+            conn.execute(
+                "DELETE FROM task_links WHERE parent_id = ? AND child_id = ?",
+                (child_id, parent_id),
+            )
+            _append_event(
+                conn, parent_id, "unlinked",
+                {"parent": child_id, "child": parent_id, "reason": "repair_dependency_reordered"},
+            )
+            repair_reordered = True
         if _would_cycle(conn, parent_id, child_id):
             raise ValueError(f"linking {parent_id} -> {child_id} would create a cycle")
         if _born_satisfied_parents(conn, [parent_id]):
@@ -3228,7 +3262,14 @@ def link_tasks(conn: sqlite3.Connection, parent_id: str, child_id: str) -> None:
         _append_event(
             conn, child_id, "linked", {"parent": parent_id, "child": child_id},
         )
+        if repair_reordered:
+            _append_event(
+                conn, child_id, "repair_dependency_reordered",
+                {"repair": parent_id, "review": child_id},
+            )
         _inherit_notify_subs(conn, child_id, (parent_id,))
+    if repair_reordered:
+        recompute_ready(conn)
 
 
 def _would_cycle(conn: sqlite3.Connection, parent_id: str, child_id: str) -> bool:
@@ -5413,11 +5454,21 @@ def _latest_default_reviewer_snapshot(
 
 def request_changes(
     conn: sqlite3.Connection, task_id: str, *, reason: str, expected_run_id: Optional[int] = None,
-    metadata: Optional[dict] = None,
+    metadata: Optional[dict] = None, blockers: Optional[list[dict[str, str]]] = None,
+    followups: Optional[list[str]] = None,
 ) -> tuple[bool, Optional[str]]:
-    """Close an active reviewer run (claimed from ``review``) and hand the task
-    back to the implementer from the latest ``review_requested`` event, parent
-    gating reapplied. Returns ``(ok, implementer | reason)``.
+    """Close an active reviewer run for either review path.
+
+    Same-card review hands the task back to the implementer from the latest
+    ``review_requested`` event. A ready-child review remains reviewer-owned and
+    must already have a separately assigned unfinished repair linked ahead of it;
+    parent gating keeps the review waiting until that repair completes. Returns
+    ``(ok, routed assignee | reason)``.
+
+    ``blockers`` is the mandatory deterministic scope contract. The first
+    structured verdict consolidates all blockers; later verdicts may cite that
+    contract or identify a regression introduced by its rework. ``followups``
+    are persisted as inert suggestions and never create or release work.
 
     ``metadata`` lands on the closing run (same handoff contract as
     :func:`request_review`) and is redacted the same way."""
@@ -5425,6 +5476,19 @@ def request_changes(
     if not reason:
         return False, "reason is required"
     metadata = redact_review_value(metadata)
+    blockers = redact_review_value(blockers)
+    followups = redact_review_value(followups)
+    from hermes_cli import kanban_db_review as review_policy
+
+    try:
+        normalized_blockers, normalized_followups, seeded_from_legacy = (
+            review_policy.validate_verdict(
+                conn, task_id, blockers=blockers, followups=followups,
+            )
+        )
+    except ValueError as exc:
+        return False, str(exc)
+    max_review_rounds = review_policy.configured_max_review_rounds()
 
     with write_txn(conn):
         task_row = conn.execute(
@@ -5440,88 +5504,129 @@ def request_changes(
 
         claimed_event = _latest_event(conn, task_id, "claimed", current_run_id)
         claimed_payload = _json_dict(_row_get(claimed_event, "payload"))
-        if claimed_payload.get("source_status") != "review":
+        claimed_source = claimed_payload.get("source_status") or "ready"
+        active_task = get_task(conn, task_id)
+        ready_child = claimed_source == "ready" and review_policy.is_ready_review_child(
+            conn, task_id, active_task, source_state="ready"
+        )
+        if claimed_source != "review" and not ready_child:
             return False, "active run was not claimed from review"
-
-        requested_event = _latest_event(conn, task_id, "review_requested")
-        if requested_event is None:
-            return False, "no prior review_requested event"
-        requested_payload = _json_dict(requested_event["payload"])
-        implementer = _nonblank_str(requested_payload.get("implementer"))
-        if implementer is None:
-            return False, "review handoff has no valid implementer provenance"
         reviewer = _canonical_assignee(_nonblank_str(task_row["assignee"]))
+        if ready_child:
+            repair_event = _latest_event(conn, task_id, "repair_dependency_reordered")
+            repair_payload = _json_dict(_row_get(repair_event, "payload"))
+            repair_id = _nonblank_str(repair_payload.get("repair"))
+            repair_linked_this_run = (
+                repair_event is not None
+                and claimed_event is not None
+                and int(repair_event["id"]) > int(claimed_event["id"])
+                and repair_id in parent_ids(conn, task_id)
+            )
+            if (
+                not repair_linked_this_run
+                or repair_id is None
+                or _parents_satisfied(conn, task_id)
+            ):
+                return False, "ready-child review requires a linked unfinished repair"
+            repair_task = get_task(conn, repair_id)
+            repair_assignee = _canonical_assignee(
+                _nonblank_str(repair_task.assignee if repair_task is not None else None)
+            )
+            if repair_assignee is None or repair_assignee == reviewer:
+                return False, "ready-child repair must be assigned to a different profile"
 
-        # Round trip back to the implementer must not silently lose the pin
-        # that a cross-profile handoff snapshotted — from EITHER an explicit
-        # request_review(reviewer=...) (snapshot lives on this
-        # review_requested event) OR a kanban.default_reviewer auto-assign
-        # (the dispatcher's _apply_default_reviewer cannot rewrite this
-        # immutable review_requested row, so it snapshots onto a LATER
-        # "assigned" event instead — see kanban_db_dispatch.py). Pick
-        # whichever event carries the override snapshot and happened last;
-        # a same-profile review that never cleared the columns has neither,
-        # so there is nothing to restore.
-        override_payload = requested_payload
-        assigned_payload = _latest_default_reviewer_snapshot(
-            conn, task_id, after_event_id=int(requested_event["id"]),
-        )
-        if assigned_payload is not None:
-            override_payload = assigned_payload
+        implementer: Optional[str]
+        if ready_child:
+            # A ready-child review remains reviewer-owned. Its separately assigned
+            # repair is the unfinished dependency that re-gates this card; the
+            # structured verdict closes only the current review run. There is no
+            # implementer handoff here, so the card's own route pin is carried
+            # through unchanged rather than restored from a review event.
+            implementer = reviewer
+            if active_task is None:
+                return False, "task not found"
+            restored_task = active_task
+        else:
+            requested_event = _latest_event(conn, task_id, "review_requested")
+            if requested_event is None:
+                return False, "no prior review_requested event"
+            requested_payload = _json_dict(requested_event["payload"])
+            implementer = _nonblank_str(requested_payload.get("implementer"))
+            if implementer is None:
+                return False, "review handoff has no valid implementer provenance"
 
-        current_task = get_task(conn, task_id)
-        if current_task is None:
-            return False, "task not found"
-        restored_task = replace(
-            current_task,
-            assignee=implementer,
-            model_override=(
-                _nonblank_str(override_payload.get("implementer_model_override"))
-                if "implementer_model_override" in override_payload
-                else current_task.model_override
-            ),
-            provider_override=(
-                _nonblank_str(override_payload.get("implementer_provider_override"))
-                if "implementer_model_override" in override_payload
-                else current_task.provider_override
-            ),
-            reasoning_effort=(
-                normalize_reasoning_effort(override_payload.get("implementer_reasoning_effort"))
-                if "implementer_reasoning_effort" in override_payload
-                else current_task.reasoning_effort
-            ),
-            policy_forced_by=(
-                _nonblank_str(override_payload.get("implementer_policy_forced_by"))
-                if "implementer_policy_force_route" in override_payload
-                else current_task.policy_forced_by
-            ),
-            policy_force_reason=(
-                _nonblank_str(override_payload.get("implementer_policy_force_reason"))
-                if "implementer_policy_force_route" in override_payload
-                else current_task.policy_force_reason
-            ),
-            policy_force_route=(
-                _nonblank_str(override_payload.get("implementer_policy_force_route"))
-                if "implementer_policy_force_route" in override_payload
-                else current_task.policy_force_route
-            ),
-        )
-        try:
-            validate_task_model_policy(restored_task, allow_legacy_unconfigured=True)
-        except ValueError:
-            # Legacy review events did not preserve force provenance. Returning
-            # their denied pin would strand the review, so converge on the
-            # implementer's approved profile default instead of transferring or
-            # fabricating an exception.
+            # Round trip back to the implementer must not silently lose the pin
+            # that a cross-profile handoff snapshotted — from EITHER an explicit
+            # request_review(reviewer=...) (snapshot lives on this
+            # review_requested event) OR a kanban.default_reviewer auto-assign
+            # (the dispatcher's _apply_default_reviewer cannot rewrite this
+            # immutable review_requested row, so it snapshots onto a LATER
+            # "assigned" event instead — see kanban_db_dispatch.py). Pick
+            # whichever event carries the override snapshot and happened last;
+            # a same-profile review that never cleared the columns has neither,
+            # so there is nothing to restore.
+            override_payload = requested_payload
+            assigned_payload = _latest_default_reviewer_snapshot(
+                conn, task_id, after_event_id=int(requested_event["id"]),
+            )
+            if assigned_payload is not None:
+                override_payload = assigned_payload
+
+            current_task = get_task(conn, task_id)
+            if current_task is None:
+                return False, "task not found"
             restored_task = replace(
-                restored_task, model_override=None, provider_override=None,
-                reasoning_effort=None, policy_forced_by=None,
-                policy_force_reason=None, policy_force_route=None,
+                current_task,
+                assignee=implementer,
+                model_override=(
+                    _nonblank_str(override_payload.get("implementer_model_override"))
+                    if "implementer_model_override" in override_payload
+                    else current_task.model_override
+                ),
+                provider_override=(
+                    _nonblank_str(override_payload.get("implementer_provider_override"))
+                    if "implementer_model_override" in override_payload
+                    else current_task.provider_override
+                ),
+                reasoning_effort=(
+                    normalize_reasoning_effort(
+                        override_payload.get("implementer_reasoning_effort")
+                    )
+                    if "implementer_reasoning_effort" in override_payload
+                    else current_task.reasoning_effort
+                ),
+                policy_forced_by=(
+                    _nonblank_str(override_payload.get("implementer_policy_forced_by"))
+                    if "implementer_policy_force_route" in override_payload
+                    else current_task.policy_forced_by
+                ),
+                policy_force_reason=(
+                    _nonblank_str(override_payload.get("implementer_policy_force_reason"))
+                    if "implementer_policy_force_route" in override_payload
+                    else current_task.policy_force_reason
+                ),
+                policy_force_route=(
+                    _nonblank_str(override_payload.get("implementer_policy_force_route"))
+                    if "implementer_policy_force_route" in override_payload
+                    else current_task.policy_force_route
+                ),
             )
             try:
                 validate_task_model_policy(restored_task, allow_legacy_unconfigured=True)
-            except ValueError as exc:
-                return False, str(exc)
+            except ValueError:
+                # Legacy review events did not preserve force provenance. Returning
+                # their denied pin would strand the review, so converge on the
+                # implementer's approved profile default instead of transferring or
+                # fabricating an exception.
+                restored_task = replace(
+                    restored_task, model_override=None, provider_override=None,
+                    reasoning_effort=None, policy_forced_by=None,
+                    policy_force_reason=None, policy_force_route=None,
+                )
+                try:
+                    validate_task_model_policy(restored_task, allow_legacy_unconfigured=True)
+                except ValueError as exc:
+                    return False, str(exc)
 
         override_params = (
             restored_task.model_override, restored_task.provider_override,
@@ -5565,7 +5670,12 @@ def request_changes(
                 "implementer": implementer,
                 "reviewer": reviewer,
                 "status": new_status,
+                "review_path": "ready_child" if ready_child else "same_card",
                 "review_round": _review_round(conn, task_id),
+                "max_review_rounds": max_review_rounds,
+                "blockers": normalized_blockers,
+                "followups": normalized_followups,
+                "contract_seeded_from_legacy": seeded_from_legacy,
             },
             run_id=run_id,
         )

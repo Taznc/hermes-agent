@@ -106,6 +106,7 @@ def test_same_card_review_supports_changes_and_approval_without_block_loop(conn)
         task_id,
         reason="Add a regression for the fallback branch.",
         expected_run_id=review.current_run_id,
+    blockers=[{"basis": "original_ac", "reference": "test acceptance contract"}],
     ) == (True, "builder")
 
     rework = kb.get_task(conn, task_id)
@@ -162,6 +163,7 @@ def test_rereview_requires_explicit_reviewer_when_provenance_is_invalid(
         task_id,
         reason="Correct the implementation.",
         expected_run_id=review.current_run_id,
+    blockers=[{"basis": "original_ac", "reference": "test acceptance contract"}],
     ) == (True, "builder")
     with kb.write_txn(conn):
         if bad_payload is None:
@@ -236,6 +238,7 @@ def test_review_changes_reapply_parent_gate(conn):
         task_id,
         reason="Parent contract changed; rework after it lands.",
         expected_run_id=review.current_run_id,
+    blockers=[{"basis": "original_ac", "reference": "test acceptance contract"}],
     ) == (True, "builder")
     regated = kb.get_task(conn, task_id)
     assert regated is not None
@@ -302,6 +305,7 @@ def test_request_changes_fails_closed_on_malformed_review_provenance(
         task_id,
         reason="Needs changes.",
         expected_run_id=review.current_run_id,
+    blockers=[{"basis": "original_ac", "reference": "test acceptance contract"}],
     )
     assert ok is False
     assert "implementer provenance" in (detail or "")
@@ -527,6 +531,7 @@ def test_goal_run_status_is_bound_to_original_run(conn) -> None:
         task_id,
         reason="fix it",
         expected_run_id=review.current_run_id,
+    blockers=[{"basis": "original_ac", "reference": "test acceptance contract"}],
     ) == (True, "builder")
     successor = kb.claim_task(conn, task_id)
     assert successor is not None
@@ -681,6 +686,7 @@ def test_review_transitions_preserve_consecutive_failures(conn) -> None:
     assert kb.request_changes(
         conn, task_id, reason="needs fixes",
         expected_run_id=review.current_run_id,
+    blockers=[{"basis": "original_ac", "reference": "test acceptance contract"}],
     ) == (True, "builder")
     assert _failures(conn, task_id) == 1  # request_changes preserved it
 

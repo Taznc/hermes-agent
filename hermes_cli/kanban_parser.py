@@ -410,8 +410,18 @@ _SPECS = [
            "the pushed branch — is the evidence landing re-verifies before it merges. Use "
            "`hermes kanban complete` instead when a card's life genuinely ends at review."
        )),
-    _cmd("request-changes", [_TASK_ID, _arg("reason", nargs="+", help="Concrete changes required before re-review")],
-         help="Reviewer verdict: return the active review run to its implementer"),
+    _cmd("request-changes", [
+        _TASK_ID,
+        _arg("reason", nargs="+", help="Concrete changes required before re-review"),
+        _arg(
+            "--blocker", action="append", required=True, metavar="BASIS=REFERENCE",
+            help=("Repeat for every blocker. BASIS is original_ac, required_behavior, "
+                  "base_regression, or landing_gate. On re-review append "
+                  "|rework_of=PRIOR_REFERENCE for a new rework regression."),
+        ),
+        _arg("--followup", action="append", default=[],
+             help="Optional inert non-blocking improvement (repeatable)."),
+    ], help="Reviewer verdict: return the active review run to its implementer"),
     _cmd("reopen-review", [
         _TASK_IDS,
         _reason("Optional reason/note — recorded as a comment before reopening. Quote multi-word reasons."),
