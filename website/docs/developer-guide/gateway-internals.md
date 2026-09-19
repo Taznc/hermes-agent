@@ -262,6 +262,41 @@ The gateway runs periodic maintenance alongside message handling:
 
 ## Process Management
 
+### Kanban dispatcher liveness and recovery
+
+Worker spawn/completion logs measure task progress, **not** dispatcher liveness.
+The existing process-scoped `$HERMES_HOME/state/gateway.heartbeat` contains a
+`kanban_dispatcher` snapshot captured on the gateway loop before the file write:
+
+- `phase`, `phase_elapsed_seconds`, `phase_durations_seconds`, `interval_seconds`
+  identify where a tick is waiting (`reap`, `configure`, `auto_decompose`,
+  `reload_settings`, `dispatch`, `ready_probe`, or `sleeping`).
+- `attempted_ticks` / `completed_ticks`, `last_attempt_at`, `last_finished_at`,
+  and `last_success_at` advance even on idle or deliberately deferred ticks.
+  Timestamps are epoch seconds; elapsed durations use the monotonic clock.
+  Errors advance completion, but never success. In-flight work advances neither.
+- `last_outcome` is `error`, `spawned`, `guard_deferred`, `no_capacity`, `no_spawn`,
+  or `idle`, in that precedence order. The snapshot also records aggregate counts
+  and `ready_pending`, not task ids, board names, paths, or error text.
+  `no_capacity` requires explicit per-profile-cap or critical-memory evidence;
+  unreported global-cap exhaustion remains `no_spawn`, not an inferred hang.
+- `stalled` means an active phase exceeded `max(30s, 3 × dispatch interval)`.
+  It is diagnostic, not a cancellation or restart instruction. A genuine
+  interpreter/GIL freeze also stops the outer heartbeat; validate its PID/start
+  time and the existing loop-scheduling witness before classifying the process.
+
+Structured `kanban dispatcher health:` summaries are DEBUG per completed tick
+and INFO at most once per five minutes. Stalled-phase warnings are similarly
+bounded. Enable DEBUG for the `gateway.run` logger when per-tick timings are
+needed. The heartbeat stays useful with default logging and zero worker spawns.
+
+A gateway contending for the machine-global dispatcher lock stays on standby
+and retries at its configured cadence. Unavailable locking fails closed.
+Cancellation releases ownership after any in-flight thread finishes, not when
+its asyncio waiter stops. Loop teardown that also cancels the shielded service
+retains the lock until process exit: another writer must not race that thread.
+This does not steal a live owner's lock or recover a GIL-frozen process.
+
 The gateway runs as a long-lived process, managed via:
 
 - `hermes gateway start` / `hermes gateway stop` — manual control

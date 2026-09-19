@@ -15,6 +15,7 @@ import os
 import time
 from pathlib import Path
 from typing import Any, Optional
+from gateway.kanban_dispatcher_health import DispatcherHealth
 
 from gateway.kanban_watchers_common import (
     _acquire_singleton_lock,
@@ -48,6 +49,10 @@ _NOTIFIER_COLLECT_TIMEOUT_FLOOR_S = 30.0
 
 class GatewayKanbanWatchersMixin:
     """Kanban watcher / notifier / dispatcher loops for GatewayRunner."""
+
+    def _kanban_dispatcher_health_snapshot(self) -> dict:
+        health = getattr(self, "_kanban_dispatcher_health", None)
+        return health.snapshot() if health is not None else {"phase": "not_started"}
 
     def _owns_kanban_dispatcher_lock(self) -> bool:
         return getattr(self, "_kanban_dispatcher_lock_handle", None) is not None
@@ -259,6 +264,7 @@ class GatewayKanbanWatchersMixin:
             except (TypeError, ValueError):
                 interval = 60.0
             interval = max(interval, 1.0)
+            self._kanban_dispatcher_health.interval = interval
             lock_path = _kb.kanban_home() / "kanban" / ".dispatcher.lock"
             handle, state = _acquire_singleton_lock(lock_path)
             if state == "held":
@@ -267,6 +273,7 @@ class GatewayKanbanWatchersMixin:
                     logger.warning("kanban dispatcher: assumed leadership after standby (%s)", lock_path)
                 else:
                     logger.info("kanban dispatcher: holding singleton dispatcher lock (%s)", lock_path)
+                self._kanban_dispatcher_health.phase("starting")
                 return _load_config, _kb, kanban_cfg
             if state == "unavailable":
                 if not unavailable_logged:
@@ -275,6 +282,7 @@ class GatewayKanbanWatchersMixin:
             elif not waiting_logged:
                 logger.info("kanban dispatcher: another gateway holds the lock (%s); standing by, retrying every %.1fs", lock_path, interval)
                 waiting_logged = True
+            self._kanban_dispatcher_health.phase("standby")
             await self._sleep_between_ticks(interval)
         return None
 
@@ -287,10 +295,12 @@ class GatewayKanbanWatchersMixin:
             logger.error("kanban dispatcher: retained leadership; refusing duplicate start")
             return
         self._kanban_dispatcher_watcher_active = True
+        health = self._kanban_dispatcher_health = DispatcherHealth()
         pending = None
 
-        async def service(func, *args):
+        async def service(phase, func, *args):
             nonlocal pending
+            health.phase(phase)
             pending = asyncio.create_task(_to_thread_process_service(func, *args))
             # Cancelling to_thread cannot stop its worker. Keep its task alive
             # so the lock cannot pass to a standby while it is still writing.
@@ -305,19 +315,24 @@ class GatewayKanbanWatchersMixin:
                     "kanban dispatcher: service cancelled at loop teardown; "
                     "leadership retained until process exit to protect in-flight writes"
                 )
+                health.phase("retained")
                 return
             finished.exception()  # consume failures after watcher cancellation
             self._release_kanban_dispatcher_lock()
             self._kanban_dispatcher_watcher_active = False
+            health.phase("stopped")
 
         try:
             await self._run_kanban_dispatcher(service)
         finally:
             if pending is not None and (not pending.done() or pending.cancelled()):
+                health.phase("draining")
                 pending.add_done_callback(release)
             else:
                 self._release_kanban_dispatcher_lock()
                 self._kanban_dispatcher_watcher_active = False
+                if health.snapshot()["phase"] != "disabled":
+                    health.phase("stopped")
 
 
     async def _run_kanban_dispatcher(self, service) -> None:
@@ -331,6 +346,7 @@ class GatewayKanbanWatchersMixin:
         """
         boot = await self._kanban_dispatcher_boot()
         if boot is None:
+            self._kanban_dispatcher_health.phase("disabled" if self._running else "stopped")
             return
         _load_config, _kb, kanban_cfg = boot
         settings = _resolve_dispatcher_settings(kanban_cfg, _kb)
@@ -348,14 +364,18 @@ class GatewayKanbanWatchersMixin:
 
         logger.info("kanban dispatcher: embedded in gateway (interval=%.1fs)", interval)
         while self._running:
+            health = self._kanban_dispatcher_health
+            health.begin_tick()
+            results, ready_pending, paused, error_type = [], False, False, None
             try:
                 # Reap zombies before per-board work so a board DB failure
                 # cannot block cleanup of unrelated workers.
                 from hermes_cli import kanban_db_dispatch as _kbd
-                pids = await service(_kbd.reap_worker_zombies)
+                pids = await service("reap", _kbd.reap_worker_zombies)
                 if pids:
                     logger.info("kanban dispatcher: reaped %d zombie worker(s), pids=%s", len(pids), pids)
-            except Exception:
+            except Exception as exc:
+                error_type = type(exc).__name__
                 logger.exception("kanban dispatcher: zombie reaper failed")
 
             try:
@@ -363,24 +383,26 @@ class GatewayKanbanWatchersMixin:
                 # dispatch while paused; running workers finish naturally.
                 if not _kanban_dispatch_allowed():
                     bad_ticks = 0
+                    paused = True
                 else:
                     # Re-read the auto-decompose toggle live so disabling it
                     # takes effect on the next tick, not on restart.
-                    _ad_enabled, _ad_per_tick = _resolve_auto_decompose_settings(_load_config)
+                    _ad_enabled, _ad_per_tick = await service(
+                        "configure", _resolve_auto_decompose_settings, _load_config)
                     # See #49638.
                     if _ad_enabled:
-                        await service(dispatcher.auto_decompose_tick, _ad_per_tick)
+                        await service("auto_decompose", dispatcher.auto_decompose_tick, _ad_per_tick)
                     # Re-read the concurrency caps for the same reason: raising
                     # max_in_progress must not require a gateway restart, which
                     # would SIGKILL every worker the cap is scheduling.
                     settings = await service(
-                        _reload_dispatcher_settings, _load_config, _kb, settings)
+                        "reload_settings", _reload_dispatcher_settings, _load_config, _kb, settings)
                     dispatcher.settings = settings
-                    results = await service(dispatcher.tick_once)
+                    results = await service("dispatch", dispatcher.tick_once)
                     any_spawned = _log_spawn_results(results)
                     paused_boards = _paused_board_slugs(results)
                     ready_pending = await service(
-                        dispatcher.ready_nonempty, paused_boards,
+                        "ready_probe", dispatcher.ready_nonempty, paused_boards,
                     )
                     bad_ticks = bad_ticks + 1 if ready_pending and not any_spawned else 0
                 now = int(time.time())
@@ -396,9 +418,12 @@ class GatewayKanbanWatchersMixin:
             except asyncio.CancelledError:
                 logger.debug("kanban dispatcher: cancelled")
                 raise
-            except Exception:
+            except Exception as exc:
+                error_type = type(exc).__name__
                 logger.exception("kanban dispatcher: unexpected watcher error")
 
+            health.finish_tick(results, ready_pending=ready_pending,
+                               error_type=error_type, paused=paused)
             await self._sleep_between_ticks(interval)
 
 
