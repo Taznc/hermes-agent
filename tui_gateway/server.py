@@ -2690,7 +2690,13 @@ def _session_live_status(sid: str, session: dict) -> str:
     # Unset + build never started = a lazy watch session idling, not one stuck mid-construction.
     if ready is not None and not ready.is_set() and session.get("agent_build_started"):
         return "starting"
-    return "working" if session.get("running") else "idle"
+    if session.get("running"):
+        return "working"
+    # Background delegate_task children outlive the parent turn. Report work
+    # without setting session["running"] (the parent remains free to accept input).
+    from .methods_subagents import _owned_subagent_records
+    children = _owned_subagent_records(sid, session.get("transport"), session)
+    return "working" if any(r.get("status") in {"running", "queued"} for r in children) else "idle"
 
 
 def _session_live_title(session: dict, key: str) -> str:

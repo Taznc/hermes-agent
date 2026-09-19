@@ -162,8 +162,19 @@ def _capture_gateway_steer_authority(owner_session_id: Optional[str]) -> tuple[A
     if not owner_session_id:
         return None, None
     try:
-        from tui_gateway.server import _current_session_steer_authority
-        return _current_session_steer_authority(owner_session_id)
+        from tui_gateway import server
+        # A turn's request socket can detach while the turn keeps running. Its
+        # private, ContextVar-bound session object is still commissioning work;
+        # never turn that stale socket into an ownerless child. RPC controls keep
+        # using _current_session_steer_authority and cannot borrow this capability.
+        expected = server._current_runtime_session_record.get()
+        if expected is not None:
+            with server._sessions_lock:
+                if (server._sessions.get(owner_session_id) is not expected
+                        or expected.get("_finalized")):
+                    return None, None
+                return expected.get("transport"), expected
+        return server._current_session_steer_authority(owner_session_id)
     except Exception:
         return None, None
 
