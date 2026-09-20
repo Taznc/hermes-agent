@@ -773,7 +773,9 @@ async function reviewCreatePr(repoPath, gitBin, ghBin) {
     throw new Error('gh pr create failed (is gh installed and authenticated?)')
   }
 
-  const url = created.stdout.trim().split('\n').filter(Boolean).pop() || ''
+  // gh on Windows can emit CRLF; split on /\r?\n/ so a trailing '\r' never
+  // rides along on the parsed PR URL.
+  const url = created.stdout.trim().split(/\r?\n/).filter(Boolean).pop() || ''
 
   return { url }
 }

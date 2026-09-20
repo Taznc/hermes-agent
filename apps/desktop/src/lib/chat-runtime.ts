@@ -144,7 +144,7 @@ export function contextPath(path: string, cwd: string): string {
   const cleanedPath = cleanPath(path)
   const comparePath = comparisonPath(cleanedPath)
   const compareCwd = comparisonPath(cleanPath(cwd))
-  const prefix = `${compareCwd}/`
+  const prefix = `${compareCwd}/` // windows-footgun: ok — compareCwd is already cleanPath()-normalized above, never backslash-separated
 
   return comparePath.startsWith(prefix) ? cleanedPath.slice(prefix.length) : path
 }

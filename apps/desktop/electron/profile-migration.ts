@@ -36,15 +36,32 @@ export interface MigrationDecision {
 }
 
 /**
+ * Join a base path with one or more relative segments using forward-slash
+ * spelling, regardless of whether `base` itself is POSIX- or
+ * Windows-spelled (Electron's app.getPath() reports backslash paths on
+ * Windows). A bare template-literal join (`${base}/${name}`) breaks in that
+ * case because it never normalizes the separator the base already carries.
+ * Node's fs APIs accept forward slashes on every platform, so joining with
+ * '/' is safe everywhere and keeps this module free of a node:path import
+ * (needed so it stays unit-testable without Electron; see file header).
+ */
+function joinPath(base: string, ...segments: string[]): string {
+  const cleanedBase = base.replace(/[\\/]+$/, '')
+  const cleanedSegments = segments.map(segment => segment.replace(/^[\\/]+|[\\/]+$/g, '')).filter(Boolean)
+
+  return [cleanedBase, ...cleanedSegments].join('/')
+}
+
+/**
  * Production layout: default IS `hermesHome`; named profiles are children of
  * `profilesRoot`. There is no `profiles/default` directory on a normal install.
  */
 export function profileStateDbPath(name: string, hermesHome: string, profilesRoot: string): string {
-  return name === 'default' ? `${hermesHome}/state.db` : `${profilesRoot}/${name}/state.db`
+  return name === 'default' ? joinPath(hermesHome, 'state.db') : joinPath(profilesRoot, name, 'state.db')
 }
 
 export function profileGatewayPidPath(name: string, hermesHome: string, profilesRoot: string): string {
-  return name === 'default' ? `${hermesHome}/gateway.pid` : `${profilesRoot}/${name}/gateway.pid`
+  return name === 'default' ? joinPath(hermesHome, 'gateway.pid') : joinPath(profilesRoot, name, 'gateway.pid')
 }
 
 function resolveHermesHome(profilesRoot: string, hermesHome?: string): string {

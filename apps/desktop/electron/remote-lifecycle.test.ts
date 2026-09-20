@@ -1904,7 +1904,7 @@ test.skipIf(process.platform === 'win32')(
         }
       )
 
-      const [reservation, lock, ownerFile] = stdout.split('\n')
+      const [reservation, lock, ownerFile] = stdout.split('\n') // windows-footgun: ok — this whole test is test.skipIf(process.platform === 'win32'); exec() here always shells to /bin/sh with a POSIX printf '%s\n', so CRLF can never occur
       const base = `${fakeHome}/.hermes/desktop-ssh/${OWNERSHIP_ID}`
       assert.equal(reservation, `${base}/.connect.lock`)
       assert.equal(lock, `${base}/backend.lock.json`)

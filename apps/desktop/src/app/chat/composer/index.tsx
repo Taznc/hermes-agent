@@ -749,8 +749,16 @@ export function ChatBar({
 
       // Backspace climbs out of an `@` path one segment at a time, mirroring
       // Tab's one-key descent. Only when the caret sits at the end of the
-      // token — mid-token editing keeps normal character deletion.
-      if (event.key === 'Backspace' && !event.metaKey && !event.altKey && ascendTriggerPath()) {
+      // token — mid-token editing keeps normal character deletion. Exclude
+      // metaKey (mac) AND ctrlKey (Windows/Linux) so the native word-delete
+      // modifier on each platform still deletes a word instead of ascending.
+      if (
+        event.key === 'Backspace' &&
+        !event.metaKey &&
+        !event.altKey &&
+        !event.ctrlKey &&
+        ascendTriggerPath()
+      ) {
         event.preventDefault()
         triggerKeyConsumedRef.current = true
 

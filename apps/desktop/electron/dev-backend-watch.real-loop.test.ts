@@ -42,6 +42,15 @@ function waitForRelevantEvent(watchDir: string, timeoutMs = 4000): Promise<strin
         resolve(seen)
       }
     })
+
+    // Same crash class as production's watchDevBackendPython: an unhandled
+    // 'error' (e.g. the watched dir vanishing mid-test on afterEach's
+    // rmSync) throws and takes down the whole vitest worker instead of
+    // just this one test.
+    watcher.on('error', () => {
+      clearTimeout(timer)
+      resolve(seen)
+    })
   })
 }
 
@@ -63,6 +72,10 @@ it('a real __pycache__ write under the watched dir is never flagged relevant (af
       flagged.push(String(filename))
     }
   })
+
+  // Same crash class as watchDevBackendPython in production: an unhandled
+  // 'error' on this FSWatcher would throw and take down the vitest worker.
+  watcher.on('error', () => undefined)
 
   await new Promise(resolve => setTimeout(resolve, 50))
   writeFileSync(path.join(dir, '__pycache__', 'server.cpython-312.pyc'), Buffer.from([0, 1, 2]))
