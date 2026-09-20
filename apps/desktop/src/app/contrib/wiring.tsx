@@ -47,6 +47,7 @@ import { requestVoiceConversationStart } from '@/store/composer'
 import { $activeConnectionId } from '@/store/connections'
 import { $cronReviewRequest, setCronFocusJobId } from '@/store/cron'
 import { $pinnedSessionIds, pinSession, restoreWorktree, unpinSession } from '@/store/layout'
+import { $startNewSessionFromTopic, type StartNewSessionFromTopic } from '@/store/new-session-proposal'
 import { dismissNotification, notify, notifyError } from '@/store/notifications'
 import { $previewTarget } from '@/store/preview'
 import {
@@ -735,6 +736,26 @@ export function ContribWiring({ children }: { children: ReactNode }) {
   // SAME submit machinery the normal composer uses (current chat / picked
   // session / new session), and it hears gateway truth from this window.
   useQuickEntryBridge({ startFreshSessionDraft, submitText })
+
+  // Publish the canonical "fresh clean session, seeded with a real first
+  // turn" pipeline for consumers outside this tree (the new-session-proposal
+  // card's Approve, and the /new-topic manual trigger) — same core/contrib
+  // boundary crossing as $restartPreviewServer above. Fresh draft + submit is
+  // exactly the New Chat + type + Enter path: create/publish lifecycle, then
+  // prompt.submit runs the seeded topic as a real turn (never a raw
+  // session.create with an inline `messages` array, which never persists or
+  // submits — see t_2023fb69 review round 1).
+  useEffect(() => {
+    const startNewSessionFromTopic: StartNewSessionFromTopic = async topic => {
+      startFreshSessionDraft()
+
+      return submitText(topic)
+    }
+
+    $startNewSessionFromTopic.set(startNewSessionFromTopic)
+
+    return () => $startNewSessionFromTopic.set(null)
+  }, [startFreshSessionDraft, submitText])
 
   // Leaving HUD mode hands this window the session back (see hud/handoff).
   useHudHandoff({ navigate, resumeSession })

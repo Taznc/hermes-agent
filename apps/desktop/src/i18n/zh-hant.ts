@@ -3165,6 +3165,19 @@ export const zhHant = defineForkLocale(forkZhHant, {
       notePlaceholder: '新增選用註記…',
       selected: '已選擇'
     },
+    newSessionProposal: {
+      title: '要為此開始一個新工作階段嗎？',
+      description: topic => `新工作階段：「${topic}」`,
+      reasonLabel: '原因',
+      approve: '開始新工作階段',
+      decline: '留在此處',
+      approved: '已開始新工作階段',
+      declined: '已拒絕',
+      unanswered: '未回應',
+      failed: '無法開始新工作階段',
+      sendFailed: '無法傳送回應',
+      gatewayDisconnected: 'Hermes 閘道未連線'
+    },
     tool: {
       copyCode: '複製程式碼',
       renderingImage: '正在渲染圖片',
@@ -3261,6 +3274,8 @@ export const zhHant = defineForkLocale(forkZhHant, {
     audioReadFailed: '無法讀取錄製的音訊',
     sessionUnavailable: '工作階段不可用',
     createSessionFailed: '無法建立新工作階段',
+    newTopicMissingTopic: '需要主題',
+    newTopicUsage: '用法：/new-topic <主題> — 作為新工作階段的第一則訊息',
     promptFailed: '提示詞傳送失敗',
     providerCredentialRequired: '傳送第一則訊息前請先新增提供方憑證。',
     emptySlashCommand: '空的斜線指令',

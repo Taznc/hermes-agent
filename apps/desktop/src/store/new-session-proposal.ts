@@ -3,6 +3,22 @@ import { atom, computed } from 'nanostores'
 import { $gateway } from './gateway'
 
 /**
+ * Bridge into the canonical session-creation pipeline (`useSessionActions` /
+ * `usePromptActions`, both mounted only inside `ContribWiring`). The inline
+ * proposal card and the `/new-topic` manual trigger both live outside that
+ * tree, so they can't call `startFreshSessionDraft`/`submitText` directly —
+ * `ContribWiring` publishes this one function here (mirrors the
+ * `$restartPreviewServer` pattern used for the same core/contrib boundary).
+ *
+ * Starts a brand-new, clean session (no inherited profile/model/history) and
+ * submits `topic` as its real first turn through the normal create →
+ * publish → prompt.submit pipeline — never a raw `session.create` call.
+ * Resolves to whether the submit succeeded.
+ */
+export type StartNewSessionFromTopic = (topic: string) => Promise<boolean>
+export const $startNewSessionFromTopic = atom<StartNewSessionFromTopic | null>(null)
+
+/**
  * Pending `session.propose.request`s — the desktop half of the
  * `propose_new_session` tool's blocking bridge
  * (tools/propose_new_session_tool.py). Mirrors the clarify/mcp-setup stores:

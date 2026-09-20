@@ -7,7 +7,11 @@ import { afterEach, describe, expect, it, vi } from 'vitest'
 import { type SessionView, SessionViewProvider } from '@/app/chat/session-view'
 import { I18nProvider } from '@/i18n'
 import { $gateway } from '@/store/gateway'
-import { $newSessionProposalRequests, setNewSessionProposalRequest } from '@/store/new-session-proposal'
+import {
+  $newSessionProposalRequests,
+  $startNewSessionFromTopic,
+  setNewSessionProposalRequest
+} from '@/store/new-session-proposal'
 
 import { NewSessionProposalTool } from './new-session-proposal-tool'
 
@@ -23,6 +27,7 @@ afterEach(() => {
   cleanup()
   $newSessionProposalRequests.set({})
   $gateway.set(null)
+  $startNewSessionFromTopic.set(null)
   messageRunning = true
   vi.clearAllMocks()
 })
@@ -105,18 +110,12 @@ describe('NewSessionProposalTool pending card', () => {
     expect(screen.queryByRole('button', { name: 'Start new session' })).toBeNull()
   })
 
-  it('Approve creates a new clean session via session.create and navigates into it', async () => {
-    const startHash = window.location.hash
-
-    const request = vi.fn(async (method: string) => {
-      if (method === 'session.create') {
-        return { session_id: 'runtime-new', stored_session_id: 'stored-new' }
-      }
-
-      return { ok: true }
-    })
+  it('Approve routes through the canonical startNewSessionFromTopic pipeline', async () => {
+    const startNewSessionFromTopic = vi.fn().mockResolvedValue(true)
+    const request = vi.fn().mockResolvedValue({ ok: true })
 
     $gateway.set({ request } as never)
+    $startNewSessionFromTopic.set(startNewSessionFromTopic)
     setNewSessionProposalRequest({
       reason: 'Topic pivot detected',
       requestId: 'request-1',
@@ -132,42 +131,63 @@ describe('NewSessionProposalTool pending card', () => {
       )
     )
 
-    try {
-      fireEvent.click(await screen.findByRole('button', { name: 'Start new session' }))
+    fireEvent.click(await screen.findByRole('button', { name: 'Start new session' }))
 
-      await waitFor(() => {
-        expect(request).toHaveBeenCalledWith(
-          'session.create',
-          expect.objectContaining({
-            messages: [{ content: 'Debug the flaky upload test', role: 'user' }]
-          })
-        )
-      })
+    // Approve must go through the shared create -> publish -> prompt.submit
+    // pipeline (bridged in from ContribWiring), never a raw session.create —
+    // that never persists a row or submits the seeded topic as a real turn
+    // (t_2023fb69 review round 1).
+    await waitFor(() => {
+      expect(startNewSessionFromTopic).toHaveBeenCalledWith('Debug the flaky upload test')
+    })
 
-      // session.create must not carry over this session's profile/model/history —
-      // only the seeded first message travels to the new session (decided with
-      // Josh, 2026-09-19).
-      const createCall = request.mock.calls.find(call => call[0] === 'session.create')
-      expect(createCall?.[1]).not.toHaveProperty('profile')
-      expect(createCall?.[1]).not.toHaveProperty('model')
+    expect(request).not.toHaveBeenCalledWith('session.create', expect.anything())
 
-      await waitFor(() => {
-        expect(request).toHaveBeenCalledWith(
-          'session.propose.respond',
-          expect.objectContaining({
-            request_id: 'request-1',
-            result: JSON.stringify({ status: 'approved', topic: 'Debug the flaky upload test' })
-          })
-        )
-      })
-
-      await waitFor(() => {
-        expect(window.location.hash).toBe('#/stored-new')
-      })
-    } finally {
-      window.location.hash = startHash
-    }
+    await waitFor(() => {
+      expect(request).toHaveBeenCalledWith(
+        'session.propose.respond',
+        expect.objectContaining({
+          request_id: 'request-1',
+          result: JSON.stringify({ status: 'approved', topic: 'Debug the flaky upload test' })
+        })
+      )
+    })
   })
+
+  it('Approve surfaces a failure when startNewSessionFromTopic reports it did not submit', async () => {
+    const startNewSessionFromTopic = vi.fn().mockResolvedValue(false)
+    const request = vi.fn().mockResolvedValue({ ok: true })
+
+    $gateway.set({ request } as never)
+    $startNewSessionFromTopic.set(startNewSessionFromTopic)
+    setNewSessionProposalRequest({
+      reason: 'Topic pivot detected',
+      requestId: 'request-1',
+      sessionId: 'session-1',
+      topic: 'Debug the flaky upload test'
+    })
+
+    render(
+      tree(
+        <SessionViewProvider value={tileView('session-1')}>
+          <NewSessionProposalTool {...pendingProps()} />
+        </SessionViewProvider>
+      )
+    )
+
+    fireEvent.click(await screen.findByRole('button', { name: 'Start new session' }))
+
+    await waitFor(() => {
+      expect(request).toHaveBeenCalledWith(
+        'session.propose.respond',
+        expect.objectContaining({
+          request_id: 'request-1',
+          result: expect.stringContaining('"status":"error"')
+        })
+      )
+    })
+  })
+
 
   it('Decline responds with declined and never calls session.create', async () => {
     const request = vi.fn().mockResolvedValue({ ok: true })

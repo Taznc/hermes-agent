@@ -5,7 +5,6 @@ import { useStore } from '@nanostores/react'
 import { useCallback, useMemo, useState } from 'react'
 
 import { useSessionView } from '@/app/chat/session-view'
-import { sessionRoute } from '@/app/routes'
 import { ToolFallback } from '@/components/assistant-ui/tool/fallback'
 import { parseMaybeObject } from '@/components/assistant-ui/tool/fallback-model/format'
 import { WIDGET_SHELL_CLASS } from '@/components/chat/widget-shell'
@@ -17,6 +16,7 @@ import { AlertCircle, CheckCircle2 } from '@/lib/icons'
 import { cn } from '@/lib/utils'
 import { $gateway } from '@/store/gateway'
 import {
+  $startNewSessionFromTopic,
   clearNewSessionProposalRequest,
   type NewSessionProposalOutcome,
   sessionNewSessionProposalRequest
@@ -171,7 +171,9 @@ function NewSessionProposalPending({ args }: ToolCallMessagePartProps) {
   }, [respond, topic])
 
   const approve = useCallback(async () => {
-    if (!gateway) {
+    const startNewSession = $startNewSessionFromTopic.get()
+
+    if (!gateway || !startNewSession) {
       notifyError(new Error(copy.gatewayDisconnected), copy.failed)
 
       return
@@ -182,18 +184,20 @@ function NewSessionProposalPending({ args }: ToolCallMessagePartProps) {
     try {
       // New session does NOT inherit profile/model/history from the parent —
       // clean start, context arrives entirely via the seeded first message
-      // (decided with Josh, 2026-09-19).
-      const created = await gateway.request<{ session_id: string; stored_session_id?: string }>('session.create', {
-        cols: 96,
-        source: 'desktop',
-        messages: [{ content: topic, role: 'user' }]
-      })
+      // (decided with Josh, 2026-09-19). Routed through the SAME canonical
+      // create -> publish -> prompt.submit pipeline New Chat + Enter uses
+      // (bridged in from ContribWiring — see $startNewSessionFromTopic) so
+      // the seeded topic is a real, persisted first turn, not an inert
+      // session.create `messages` array that never runs (t_2023fb69 review
+      // round 1).
+      const ok = await startNewSession(topic)
+
+      if (!ok) {
+        throw new Error(copy.failed)
+      }
 
       triggerHaptic('submit')
       await respond({ status: 'approved', topic })
-
-      const routedId = created.stored_session_id ?? created.session_id
-      window.location.hash = `#${sessionRoute(routedId)}`
     } catch (error) {
       notifyError(error, copy.failed)
       await respond({ detail: String(error), status: 'error', topic })

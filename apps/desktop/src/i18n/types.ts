@@ -3321,6 +3321,8 @@ export interface UpstreamTranslations {
     audioReadFailed: string
     sessionUnavailable: string
     createSessionFailed: string
+    newTopicMissingTopic: string
+    newTopicUsage: string
     promptFailed: string
     providerCredentialRequired: string
     emptySlashCommand: string

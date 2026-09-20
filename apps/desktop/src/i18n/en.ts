@@ -3819,6 +3819,8 @@ export const en: Translations = withForkKeys(forkEn, {
     audioReadFailed: 'Could not read recorded audio',
     sessionUnavailable: 'Session unavailable',
     createSessionFailed: 'Could not create a new session',
+    newTopicMissingTopic: 'Topic required',
+    newTopicUsage: 'Usage: /new-topic <topic> — the seeded first message for the new session',
     promptFailed: 'Prompt failed',
     providerCredentialRequired: 'Add a provider credential before sending your first message.',
     emptySlashCommand: 'empty slash command',

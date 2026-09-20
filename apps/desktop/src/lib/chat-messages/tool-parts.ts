@@ -137,7 +137,7 @@ function toolPartMatchValues(part: ChatMessagePart): string[] {
 
   const args = part.args as Record<string, unknown>
 
-  const query = firstStringField(args, ['search_term', 'query', 'question', 'server', 'command', 'code', 'path'])
+  const query = firstStringField(args, ['search_term', 'query', 'question', 'server', 'topic', 'command', 'code', 'path'])
 
   const context = typeof args.context === 'string' ? args.context.trim() : ''
   const preview = typeof args.preview === 'string' ? args.preview.trim() : ''

@@ -3989,6 +3989,8 @@ export const zhAuthored: Translations = withForkKeys(forkZh, {
     audioReadFailed: '无法读取录制的音频',
     sessionUnavailable: '会话不可用',
     createSessionFailed: '无法创建新会话',
+    newTopicMissingTopic: '需要主题',
+    newTopicUsage: '用法：/new-topic <主题> — 作为新会话的第一条消息',
     promptFailed: '提示词发送失败',
     providerCredentialRequired: '发送第一条消息前请先添加提供方凭据。',
     emptySlashCommand: '空 slash 命令',
