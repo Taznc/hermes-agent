@@ -1,3 +1,4 @@
+import { useStore } from '@nanostores/react'
 import { useEffect, useState } from 'react'
 
 import { Button } from '@/components/ui/button'
@@ -6,7 +7,9 @@ import { SegmentedControl } from '@/components/ui/segmented-control'
 import { Tip } from '@/components/ui/tooltip'
 import { useI18n } from '@/i18n'
 import { openRouteTile } from '@/store/route-tiles'
+import { $sessionStatusById } from '@/store/session-states'
 
+import { useSubagentSnapshot } from '../chat/composer/status-stack/use-subagent-snapshot'
 import { Panel, PanelHeader } from '../overlays/panel'
 import { AGENTS_ROUTE } from '../routes'
 
@@ -14,6 +17,21 @@ import { SessionOverview } from './sessions'
 import { SpawnTreeView } from './spawn-tree'
 
 export { SubagentRow } from './spawn-tree'
+
+function SessionSubagentSnapshot({ sessionId }: { sessionId: string }) {
+  useSubagentSnapshot(sessionId)
+
+  return null
+}
+
+function SubagentSnapshots() {
+  const states = useStore($sessionStatusById)
+
+  // The Agents route can replace chat entirely. Hydrate every observed runtime,
+  // including settled parents, without requiring its composer to stay mounted.
+  // The shared hook routes by exact owner and fences reconnect/event races.
+  return Object.keys(states).map(sessionId => <SessionSubagentSnapshot key={sessionId} sessionId={sessionId} />)
+}
 
 export function AgentsView({ onClose, embedded = false }: { onClose: () => void; embedded?: boolean }) {
   const { t } = useI18n()
@@ -36,6 +54,7 @@ export function AgentsView({ onClose, embedded = false }: { onClose: () => void;
 
   const content = (
     <>
+      <SubagentSnapshots />
       <PanelHeader
         actions={
           <>

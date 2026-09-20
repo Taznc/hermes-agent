@@ -75,11 +75,14 @@ def _events(conn, tid, kind=None):
 
 def _make_review_task(
     conn, *, implementer: str = "claudeprimary", reasoning_effort: str | None = None,
+    model_override: str | None = None, provider_override: str | None = None,
 ) -> tuple[str, int]:
     """A task carried through running -> review via ``request_review``,
     still assigned to its implementer (auto-review's starting state)."""
     tid = kb.create_task(
-        conn, title="impl a feature", assignee=implementer, reasoning_effort=reasoning_effort,
+        conn, title="impl a feature", assignee=implementer,
+        reasoning_effort=reasoning_effort, model_override=model_override,
+        provider_override=provider_override,
     )
     kb.claim_task(conn, tid)
     run_id = kb.get_task(conn, tid).current_run_id
@@ -98,7 +101,10 @@ def _make_review_task(
 
 def test_default_reviewer_reassigns_when_different_from_implementer(kanban_home: Path) -> None:
     with kbc.connect() as conn:
-        tid, _ = _make_review_task(conn, implementer="claudeprimary", reasoning_effort="ultra")
+        tid, _ = _make_review_task(
+            conn, implementer="claudeprimary", reasoning_effort="medium",
+            model_override="gpt-5.6-terra", provider_override="openai-codex",
+        )
 
     with kbc.connect() as conn:
         res = kbd.dispatch_once(
@@ -124,7 +130,9 @@ def test_default_reviewer_reassigns_when_different_from_implementer(kanban_home:
         assert evs[0][1]["assignee"] == "default"
         assert evs[0][1]["previous_assignee"] == "claudeprimary"
         assert evs[0][1]["source"] == "kanban.default_reviewer"
-        assert evs[0][1]["implementer_reasoning_effort"] == "ultra"
+        assert evs[0][1]["implementer_model_override"] == "gpt-5.6-terra"
+        assert evs[0][1]["implementer_provider_override"] == "openai-codex"
+        assert evs[0][1]["implementer_reasoning_effort"] == "medium"
 
 
 # ---------------------------------------------------------------------------
@@ -233,7 +241,10 @@ def test_auto_assigned_reviewer_survives_request_changes_round_trip(kanban_home:
     check (kanban_db._prior_reviewer) — no "re-review has no durable
     reviewer provenance" regression."""
     with kbc.connect() as conn:
-        tid, _ = _make_review_task(conn, implementer="claudeprimary", reasoning_effort="ultra")
+        tid, _ = _make_review_task(
+            conn, implementer="claudeprimary", reasoning_effort="medium",
+            model_override="gpt-5.6-terra", provider_override="openai-codex",
+        )
 
     with kbc.connect() as conn:
         res = kbd.dispatch_once(
@@ -267,7 +278,7 @@ def test_auto_assigned_reviewer_survives_request_changes_round_trip(kanban_home:
         ).fetchone()
         assert row["status"] == "ready"
         assert row["assignee"] == "claudeprimary"
-        assert row["reasoning_effort"] == "ultra"
+        assert row["reasoning_effort"] == "medium"
 
         # Implementer does another pass and re-requests review WITHOUT
         # explicitly naming a reviewer — request_review must fall back to

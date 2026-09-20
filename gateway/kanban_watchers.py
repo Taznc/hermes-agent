@@ -10,10 +10,12 @@ in ``kanban_watchers_common``.
 from __future__ import annotations
 
 import asyncio
+import math
 import os
 import time
 from pathlib import Path
 from typing import Any, Optional
+from gateway.kanban_dispatcher_health import DispatcherHealth
 
 from gateway.kanban_watchers_common import (
     _acquire_singleton_lock,
@@ -37,10 +39,20 @@ _IMAGE_EXTS = {".png", ".jpg", ".jpeg", ".gif", ".webp"}
 _VIDEO_EXTS = {".mp4", ".mov", ".avi", ".mkv", ".webm", ".3gp"}
 _GC_INTERVAL_SECONDS = 3600.0
 _HEALTH_WINDOW = 6
+# A collect that outruns this many tick intervals is reported and left to finish
+# on its own thread. Derived from the caller's interval rather than configured:
+# the bound exists to make a stall OBSERVABLE, not to be tuned. Floored so a
+# fast interval cannot make a merely-slow board look stuck.
+_NOTIFIER_COLLECT_TIMEOUT_INTERVALS = 3
+_NOTIFIER_COLLECT_TIMEOUT_FLOOR_S = 30.0
 
 
 class GatewayKanbanWatchersMixin:
     """Kanban watcher / notifier / dispatcher loops for GatewayRunner."""
+
+    def _kanban_dispatcher_health_snapshot(self) -> dict:
+        health = getattr(self, "_kanban_dispatcher_health", None)
+        return health.snapshot() if health is not None else {"phase": "not_started"}
 
     def _owns_kanban_dispatcher_lock(self) -> bool:
         return getattr(self, "_kanban_dispatcher_lock_handle", None) is not None
@@ -69,6 +81,13 @@ class GatewayKanbanWatchersMixin:
         — is the dedup mechanism (unsub-on-terminal dropped users when the
         dispatcher respawned a crashed task). All SQLite work runs in a thread;
         one tick's failure never stops the next.
+
+        The collect is **single-flight and shielded**: at most one is in flight,
+        and a collect that outruns its bound is reported and left to finish
+        rather than cancelled. Cancelling an ``asyncio.to_thread`` future does
+        not stop the underlying thread, so a bare timeout would leak a thread per
+        tick; retaining the task also preserves delivery of events the slow
+        collect already claimed (the cursor advances at claim time, before send).
         """
         from gateway.config import Platform as _Platform
         try:
@@ -90,6 +109,18 @@ class GatewayKanbanWatchersMixin:
         # board, at startup (0 → first tick) and at most hourly.
         _gc_next_at = 0.0
 
+        # Single-flight handle for the in-flight collect. A collect runs on a
+        # threadpool worker; cancelling its future does NOT stop that thread, so
+        # a bare `wait_for` would leak one thread per tick and exhaust the pool
+        # within minutes. The task is shielded and retained instead: the loop
+        # stops WAITING on a slow collect but never abandons it, so the events it
+        # already claimed (claim_unseen_events_for_sub advances the cursor before
+        # delivery) are still delivered when it returns.
+        collect_task: Optional[asyncio.Task] = None
+        collect_started_at = 0.0
+        collect_timeout = max(
+            interval * _NOTIFIER_COLLECT_TIMEOUT_INTERVALS, _NOTIFIER_COLLECT_TIMEOUT_FLOOR_S)
+
         while self._running:
             try:
                 _gc_due = time.monotonic() >= _gc_next_at
@@ -98,15 +129,35 @@ class GatewayKanbanWatchersMixin:
                     _gc_next_at = time.monotonic() + _GC_INTERVAL_SECONDS
                     _retention = _gc_retention_days()
 
-                deliveries = await asyncio.to_thread(
-                    _notifier_collect, self, _kb,
-                    notifier_profile=notifier_profile, gc_due=_gc_due, gc_retention_days=_retention,
-                )
+                if collect_task is None:
+                    collect_started_at = time.monotonic()
+                    collect_task = asyncio.create_task(asyncio.to_thread(
+                        _notifier_collect, self, _kb,
+                        notifier_profile=notifier_profile, gc_due=_gc_due, gc_retention_days=_retention,
+                    ))
+                elif _gc_due:
+                    # The skipped tick owns this GC slot; give it back so the next
+                    # free tick runs the sweep instead of waiting a full hour.
+                    _gc_next_at = 0.0
+
+                deliveries = []
+                try:
+                    deliveries = await asyncio.wait_for(
+                        asyncio.shield(collect_task), timeout=collect_timeout)
+                    collect_task = None
+                except asyncio.TimeoutError:
+                    logger.warning(
+                        "kanban notifier: collect has been running %.0fs (> %.0fs); skipping this "
+                        "tick and waiting for it to finish. Dispatch is unaffected; if this repeats "
+                        "the notifier thread is stuck and the gateway needs a stack dump (SIGUSR2).",
+                        time.monotonic() - collect_started_at, collect_timeout)
+
                 for d in deliveries:
                     await _KanbanNotification(
                         self, d, platform_cls=_Platform, sub_fail_counts=sub_fail_counts,
                     ).deliver()
             except Exception as exc:
+                collect_task = None
                 logger.warning("kanban notifier tick failed: %s", exc)
             await self._sleep_between_ticks(interval)
 
@@ -184,55 +235,107 @@ class GatewayKanbanWatchersMixin:
             except Exception as exc:
                 logger.warning("kanban notifier: artifact upload (%s) failed: %s", path, exc)
 
-    def _kanban_dispatcher_boot(self) -> Optional[tuple]:
-        """Resolve config, kanban_db and the singleton lock; None when the dispatcher must not run.
-
-        Config is read once at boot (restart to apply), except the auto-decompose
-        toggle which is re-read every tick. The env var is an escape hatch to
-        disable without editing YAML.
-        """
+    async def _kanban_dispatcher_boot(self) -> Optional[tuple]:
+        """Wait for exclusive leadership, rechecking configuration each attempt."""
         try:
             from hermes_cli.config import load_config as _load_config
-        except Exception:
-            logger.warning("kanban dispatcher: config loader unavailable; disabled")
-            return None
-        env_override = os.environ.get("HERMES_KANBAN_DISPATCH_IN_GATEWAY", "").strip().lower()
-        if env_override in {"0", "false", "no", "off"}:
-            logger.info("kanban dispatcher: disabled via HERMES_KANBAN_DISPATCH_IN_GATEWAY env")
-            return None
-        try:
-            cfg = _load_config()
-        except Exception as exc:
-            logger.warning("kanban dispatcher: cannot load config (%s); disabled", exc)
-            return None
-        kanban_cfg = cfg.get("kanban", {}) if isinstance(cfg, dict) else {}
-        if not kanban_cfg.get("dispatch_in_gateway", True):
-            logger.info("kanban dispatcher: disabled via config kanban.dispatch_in_gateway=false")
-            return None
-        try:
             from hermes_cli import kanban_db as _kb
-        except Exception:
-            logger.warning("kanban dispatcher: kanban_db not importable; dispatcher disabled")
+        except ImportError:
+            logger.warning("kanban dispatcher: dependencies unavailable; disabled")
             return None
-
-        # Single-dispatcher backstop (see _acquire_singleton_lock). The lock
-        # lives at the machine-global kanban root, so it serialises ALL gateways.
-        self._kanban_dispatcher_lock_handle = None
-        _lock_path = _kb.kanban_home() / "kanban" / ".dispatcher.lock"
-        _lock_handle, _lock_state = _acquire_singleton_lock(_lock_path)
-        if _lock_state == "contended":
-            logger.info("kanban dispatcher: another gateway already holds the dispatcher "
-                        "lock (%s); this gateway will NOT dispatch.", _lock_path)
-            return None
-        if _lock_state == "held":
-            self._kanban_dispatcher_lock_handle = _lock_handle  # hold for process lifetime
-            logger.info("kanban dispatcher: holding singleton dispatcher lock (%s)", _lock_path)
-        else:
-            logger.warning("kanban dispatcher: advisory lock unavailable at %s; proceeding "
-                           "on config control alone.", _lock_path)
-        return _load_config, _kb, kanban_cfg
+        waiting_logged = False
+        unavailable_logged = False
+        while self._running:
+            env_override = os.environ.get("HERMES_KANBAN_DISPATCH_IN_GATEWAY", "").strip().lower()
+            if env_override in {"0", "false", "no", "off"}:
+                return None
+            try:
+                cfg = _load_config()
+            except Exception:
+                logger.exception("kanban dispatcher: cannot refresh configuration; disabled")
+                return None
+            kanban_cfg = cfg.get("kanban", {}) if isinstance(cfg, dict) else {}
+            if not kanban_cfg.get("dispatch_in_gateway", True):
+                return None
+            try:
+                interval = float(kanban_cfg.get("dispatch_interval_seconds", 60) or 60)
+                if not math.isfinite(interval):
+                    raise ValueError("dispatch interval must be finite")
+            except (TypeError, ValueError):
+                interval = 60.0
+            interval = max(interval, 1.0)
+            self._kanban_dispatcher_health.interval = interval
+            lock_path = _kb.kanban_home() / "kanban" / ".dispatcher.lock"
+            handle, state = _acquire_singleton_lock(lock_path)
+            if state == "held":
+                self._kanban_dispatcher_lock_handle = handle
+                if waiting_logged or unavailable_logged:
+                    logger.warning("kanban dispatcher: assumed leadership after standby (%s)", lock_path)
+                else:
+                    logger.info("kanban dispatcher: holding singleton dispatcher lock (%s)", lock_path)
+                self._kanban_dispatcher_health.phase("starting")
+                return _load_config, _kb, kanban_cfg
+            if state == "unavailable":
+                if not unavailable_logged:
+                    logger.error("kanban dispatcher: lock unavailable at %s; dispatch disabled until exclusion can be established", lock_path)
+                    unavailable_logged = True
+            elif not waiting_logged:
+                logger.info("kanban dispatcher: another gateway holds the lock (%s); standing by, retrying every %.1fs", lock_path, interval)
+                waiting_logged = True
+            self._kanban_dispatcher_health.phase("standby")
+            await self._sleep_between_ticks(interval)
+        return None
 
     async def _kanban_dispatcher_watcher(self) -> None:
+        """Own leadership until the watcher and any in-flight service work exit."""
+        if getattr(self, "_kanban_dispatcher_watcher_active", False):
+            logger.warning("kanban dispatcher: watcher already active; ignoring duplicate start")
+            return
+        if self._owns_kanban_dispatcher_lock():
+            logger.error("kanban dispatcher: retained leadership; refusing duplicate start")
+            return
+        self._kanban_dispatcher_watcher_active = True
+        health = self._kanban_dispatcher_health = DispatcherHealth()
+        pending = None
+
+        async def service(phase, func, *args):
+            nonlocal pending
+            health.phase(phase)
+            pending = asyncio.create_task(_to_thread_process_service(func, *args))
+            # Cancelling to_thread cannot stop its worker. Keep its task alive
+            # so the lock cannot pass to a standby while it is still writing.
+            return await asyncio.shield(pending)
+
+        def release(finished):
+            if finished.cancelled():
+                # Event-loop teardown may cancel even the shielded service.
+                # Its thread can still be writing: retain the lock until process
+                # exit rather than allowing another gateway to race that work.
+                logger.error(
+                    "kanban dispatcher: service cancelled at loop teardown; "
+                    "leadership retained until process exit to protect in-flight writes"
+                )
+                health.phase("retained")
+                return
+            finished.exception()  # consume failures after watcher cancellation
+            self._release_kanban_dispatcher_lock()
+            self._kanban_dispatcher_watcher_active = False
+            health.phase("stopped")
+
+        try:
+            await self._run_kanban_dispatcher(service)
+        finally:
+            if pending is not None and (not pending.done() or pending.cancelled()):
+                health.phase("draining")
+                pending.add_done_callback(release)
+            else:
+                self._release_kanban_dispatcher_lock()
+                self._kanban_dispatcher_watcher_active = False
+                if health.snapshot()["phase"] != "disabled":
+                    health.phase("stopped")
+
+
+    async def _run_kanban_dispatcher(self, service) -> None:
         """Embedded kanban dispatcher — one tick every `dispatch_interval_seconds`.
 
         Gated by `kanban.dispatch_in_gateway` (default True); when false the
@@ -241,8 +344,9 @@ class GatewayKanbanWatchersMixin:
         failure never stops the next. Shutdown: ``self._running`` is checked
         between ticks and the in-flight ``to_thread`` returns on its own.
         """
-        boot = self._kanban_dispatcher_boot()
+        boot = await self._kanban_dispatcher_boot()
         if boot is None:
+            self._kanban_dispatcher_health.phase("disabled" if self._running else "stopped")
             return
         _load_config, _kb, kanban_cfg = boot
         settings = _resolve_dispatcher_settings(kanban_cfg, _kb)
@@ -260,14 +364,18 @@ class GatewayKanbanWatchersMixin:
 
         logger.info("kanban dispatcher: embedded in gateway (interval=%.1fs)", interval)
         while self._running:
+            health = self._kanban_dispatcher_health
+            health.begin_tick()
+            results, ready_pending, paused, error_type = [], False, False, None
             try:
                 # Reap zombies before per-board work so a board DB failure
                 # cannot block cleanup of unrelated workers.
                 from hermes_cli import kanban_db_dispatch as _kbd
-                pids = await _to_thread_process_service(_kbd.reap_worker_zombies)
+                pids = await service("reap", _kbd.reap_worker_zombies)
                 if pids:
                     logger.info("kanban dispatcher: reaped %d zombie worker(s), pids=%s", len(pids), pids)
-            except Exception:
+            except Exception as exc:
+                error_type = type(exc).__name__
                 logger.exception("kanban dispatcher: zombie reaper failed")
 
             try:
@@ -275,24 +383,26 @@ class GatewayKanbanWatchersMixin:
                 # dispatch while paused; running workers finish naturally.
                 if not _kanban_dispatch_allowed():
                     bad_ticks = 0
+                    paused = True
                 else:
                     # Re-read the auto-decompose toggle live so disabling it
                     # takes effect on the next tick, not on restart.
-                    _ad_enabled, _ad_per_tick = _resolve_auto_decompose_settings(_load_config)
+                    _ad_enabled, _ad_per_tick = await service(
+                        "configure", _resolve_auto_decompose_settings, _load_config)
                     # See #49638.
                     if _ad_enabled:
-                        await _to_thread_process_service(dispatcher.auto_decompose_tick, _ad_per_tick)
+                        await service("auto_decompose", dispatcher.auto_decompose_tick, _ad_per_tick)
                     # Re-read the concurrency caps for the same reason: raising
                     # max_in_progress must not require a gateway restart, which
                     # would SIGKILL every worker the cap is scheduling.
-                    settings = await _to_thread_process_service(
-                        _reload_dispatcher_settings, _load_config, _kb, settings)
+                    settings = await service(
+                        "reload_settings", _reload_dispatcher_settings, _load_config, _kb, settings)
                     dispatcher.settings = settings
-                    results = await _to_thread_process_service(dispatcher.tick_once)
+                    results = await service("dispatch", dispatcher.tick_once)
                     any_spawned = _log_spawn_results(results)
                     paused_boards = _paused_board_slugs(results)
-                    ready_pending = await _to_thread_process_service(
-                        dispatcher.ready_nonempty, paused_boards,
+                    ready_pending = await service(
+                        "ready_probe", dispatcher.ready_nonempty, paused_boards,
                     )
                     bad_ticks = bad_ticks + 1 if ready_pending and not any_spawned else 0
                 now = int(time.time())
@@ -307,14 +417,14 @@ class GatewayKanbanWatchersMixin:
                     last_warn_at = now
             except asyncio.CancelledError:
                 logger.debug("kanban dispatcher: cancelled")
-                self._release_kanban_dispatcher_lock()
                 raise
-            except Exception:
+            except Exception as exc:
+                error_type = type(exc).__name__
                 logger.exception("kanban dispatcher: unexpected watcher error")
 
+            health.finish_tick(results, ready_pending=ready_pending,
+                               error_type=error_type, paused=paused)
             await self._sleep_between_ticks(interval)
-
-        self._release_kanban_dispatcher_lock()
 
 
 # ---- BEGIN PLUGIN-COMPAT (revert-scheduled; see COMPAT_MANIFEST.md) ----

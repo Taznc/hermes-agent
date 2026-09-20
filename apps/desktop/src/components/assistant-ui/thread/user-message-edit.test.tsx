@@ -12,6 +12,7 @@ import { act, cleanup, fireEvent, render, screen, waitFor } from '@testing-libra
 import { afterEach, describe, expect, it, vi } from 'vitest'
 
 import { useIncrementalExternalStoreRuntime } from '@/lib/incremental-external-store-runtime'
+import { $previewTabs, closeRightRail } from '@/store/preview'
 
 import { assistantMessage, stubThreadEnvironment, stubThreadViewportSize, userMessage } from '../test-utils'
 
@@ -20,6 +21,7 @@ stubThreadEnvironment()
 
 afterEach(() => {
   cleanup()
+  closeRightRail()
 })
 
 stubThreadViewportSize()
@@ -38,8 +40,14 @@ async function moveFocusOutside(editor: HTMLElement) {
 }
 
 // Mirrors chat/index.tsx: incremental runtime + messageRepository + onEdit.
-function IncrementalHarness({ onEdit }: { onEdit: (message: AppendMessage) => Promise<void> }) {
-  const repository = ExportedMessageRepository.fromArray([userMessage(), assistantMessage()])
+function IncrementalHarness({
+  onEdit,
+  text = 'edit me please'
+}: {
+  onEdit: (message: AppendMessage) => Promise<void>
+  text?: string
+}) {
+  const repository = ExportedMessageRepository.fromArray([userMessage('user-1', text), assistantMessage()])
 
   const runtime = useIncrementalExternalStoreRuntime<ThreadMessage>({
     messageRepository: repository,
@@ -177,6 +185,38 @@ describe('click-to-edit user message', () => {
 
     expect(editor.className).toContain('max-h-48')
     expect(editor.className).toContain('overflow-y-auto')
+  })
+
+  it('keeps an active URL directive independently operable without nesting it in the edit control', async () => {
+    const onEdit = vi.fn(async () => {})
+    const errors = vi.spyOn(console, 'error').mockImplementation(() => {})
+
+    const { container } = render(
+      <IncrementalHarness onEdit={onEdit} text="review @url:`https://example.com/docs` before editing" />
+    )
+
+    try {
+      const editControl = await screen.findByRole('button', { name: 'Edit message' })
+      const chip = screen.getByTitle('https://example.com/docs')
+
+      expect(editControl.tagName).not.toBe('BUTTON')
+      expect(chip.tagName).toBe('BUTTON')
+      expect(chip.parentElement?.closest('button')).toBeNull()
+
+      fireEvent.click(chip)
+
+      await waitFor(() => {
+        expect($previewTabs.get().at(-1)?.target.url).toBe('https://example.com/docs')
+        expect(container.querySelector('[data-slot="aui_edit-composer-root"]')).toBeNull()
+      })
+      expect(onEdit).not.toHaveBeenCalled()
+
+      fireEvent.keyDown(editControl, { key: 'Enter' })
+      expect(await screen.findByRole('textbox', { name: 'Edit message' })).toBeTruthy()
+      expect(errors).not.toHaveBeenCalledWith(expect.stringMatching(/button.*descendant/i), expect.anything())
+    } finally {
+      errors.mockRestore()
+    }
   })
 })
 

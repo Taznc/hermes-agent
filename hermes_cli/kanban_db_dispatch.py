@@ -21,6 +21,7 @@ import time
 import uuid
 from dataclasses import dataclass
 from dataclasses import field
+from dataclasses import replace
 from pathlib import Path
 from typing import Any
 from typing import Callable
@@ -95,7 +96,7 @@ _RESPAWN_GUARD_SUCCESS_WINDOW = 3600  # 1 hour
 # ``HERMES_KANBAN_RATE_LIMIT_COOLDOWN_SECONDS``.
 DEFAULT_RATE_LIMIT_COOLDOWN_SECONDS = 300  # 5 minutes
 
-# Within this window a GitHub PR URL in a comment blocks re-spawn.
+# Default duplicate-work window; failed-run/rework recovery can supersede it.
 _RESPAWN_GUARD_PR_WINDOW = 86400  # 24 hours
 
 _RESPAWN_GUARD_PR_URL_RE = re.compile(
@@ -251,6 +252,9 @@ class DispatchResult:
     claim, so no worker is spawned, no start-budget slot is consumed and no
     retry is counted. The card is blocked once (``capability``) and waits for a
     human to install the skill or drop it from the card."""
+    model_policy_blocked: list[tuple[str, str]] = field(default_factory=list)
+    """``(task_id, reason)`` refused before claim/spawn because the resolved
+    provider/model/effort route violates the unattended-worker policy."""
     crashed: list[str] = field(default_factory=list)
     """Task ids reclaimed because their worker PID disappeared."""
     auto_blocked: list[str] = field(default_factory=list)
@@ -1904,6 +1908,7 @@ def check_respawn_guard(
     lane: str = "ready",
     board: Optional[str] = None,
     consume_host_probe: bool = False,
+    pr_recovery: Optional[dict] = None,
 ) -> Optional[str]:
     """Return a guard reason if ``task_id`` should NOT be re-spawned, else None.
 
@@ -1917,7 +1922,11 @@ def check_respawn_guard(
     a re-queue event arrived after it — a deliberate re-run) and ``"active_pr"``
     (a GitHub PR URL, from a comment AUTHORED BY this task's own assignee, whose
     owner/repo matches this task's own repo when that repo is resolvable —
-    re-spawning risks a duplicate PR). The review lane skips the last two: they
+    re-spawning risks a duplicate PR, unless a failed run superseded the comment
+    and its bounded recovery cooldown elapsed, or a reviewer requested changes).
+    ``pr_recovery`` receives the
+    local evidence for logging and a receipt on a successful claim; the check
+    itself does not mutate the board. The review lane skips the last two: they
     are the *inputs* to a review handoff. Stale / dead claim locks are NOT a
     guard reason — the reclaim passes own those.
     """
@@ -1957,9 +1966,9 @@ def check_respawn_guard(
     #    LATEST run only: a newer crash/completion supersedes the rate-limit run.
     rl_cooldown = _kb._resolve_rate_limit_cooldown_seconds()
     latest_run = conn.execute(
-        "SELECT outcome, ended_at FROM task_runs "
+        "SELECT id, profile, outcome, ended_at FROM task_runs "
         "WHERE task_id = ? AND ended_at IS NOT NULL "
-        "ORDER BY ended_at DESC LIMIT 1",
+        "ORDER BY ended_at DESC, id DESC LIMIT 1",
         (task_id,),
     ).fetchone()
     if latest_run is not None and latest_run["outcome"] == "rate_limited":
@@ -2034,18 +2043,35 @@ def check_respawn_guard(
     assignee = row["assignee"]
     own_repo_slug = _task_own_repo_slug(conn, task_id)
     pr_cutoff = now - _RESPAWN_GUARD_PR_WINDOW
+    from hermes_cli.kanban_db_dispatch_pr_recovery import pr_recovery_after_run
+
+    recovered_urls: set[str] = set()
     for c in conn.execute(
-        "SELECT author, body FROM task_comments WHERE task_id = ? AND created_at >= ?",
+        "SELECT author, body, created_at FROM task_comments WHERE task_id = ? AND created_at >= ?",
         (task_id, pr_cutoff),
     ).fetchall():
         if not c["body"] or not assignee or c["author"] != assignee:
             continue
         for match in _RESPAWN_GUARD_PR_URL_RE.finditer(c["body"]):
-            if own_repo_slug is None:
-                return "active_pr"
             cited_slug = f"{match.group('owner')}/{match.group('repo')}".lower()
-            if cited_slug == own_repo_slug:
-                return "active_pr"
+            if own_repo_slug is not None and cited_slug != own_repo_slug:
+                continue
+            recovery = pr_recovery_after_run(latest_run, c["created_at"], assignee, now)
+            if recovery is not None and recovery["eligible"]:
+                recovered_urls.add(match.group(0))
+                if pr_recovery is not None:
+                    pr_recovery.update(recovery, pr_urls=sorted(recovered_urls))
+                continue
+            if pr_recovery is not None:
+                pr_recovery.clear()
+                if recovery is not None:
+                    pr_recovery.update(recovery, pr_urls=[match.group(0)])
+            _kb._log.debug(
+                "kanban active_pr deferred task=%s pr=%s prior_run=%s eligible_at=%s",
+                task_id, match.group(0), latest_run["id"] if latest_run else None,
+                recovery["eligible_at"] if recovery else c["created_at"] + _RESPAWN_GUARD_PR_WINDOW,
+            )
+            return "active_pr"
 
     return None
 
@@ -3042,6 +3068,23 @@ def _dispatch_lane_task(
     if profile_exists is not None and not profile_exists(assignee):
         result.skipped_nonspawnable.append(task_id)
         return False
+    # Resolve named/card/profile routing before claiming: policy failures are
+    # configuration errors, not paid worker failures, and must not consume the
+    # retry breaker or dispatch start budget. Re-run after the real claim below
+    # as a defence against stale/imported rows and route-resolution drift.
+    policy_task = _kb.get_task(conn, task_id)
+    if policy_task is not None:
+        try:
+            _prepare_worker_launch(policy_task)
+            _validate_prepared_model_policy(
+                policy_task, board=board, review_lane=(lane == "review"),
+            )
+        except ValueError as exc:
+            reason = str(exc)
+            result.model_policy_blocked.append((task_id, reason))
+            if not dry_run:
+                _kb.block_task(conn, task_id, reason=reason, kind="needs_input")
+            return False
     # Per-profile cap: one profile's local model / API quota / browser pool
     # must not be overwhelmed by a fan-out even with global headroom.
     if per_profile_cap is not None:
@@ -3049,12 +3092,14 @@ def _dispatch_lane_task(
         if current >= per_profile_cap:
             result.skipped_per_profile_capped.append((task_id, assignee, current))
             return False
+    pr_recovery: dict = {}
     guard_reason = check_respawn_guard(
         conn,
         task_id,
         lane=lane,
         board=board,
         consume_host_probe=not dry_run,
+        pr_recovery=pr_recovery,
     )
     if guard_reason is not None:
         result.respawn_guarded.append((task_id, guard_reason))
@@ -3067,7 +3112,7 @@ def _dispatch_lane_task(
         # owned by ``kanban.default_assignee``, not "unassigned but secretly routed".
         if not dry_run:
             with _kb.write_txn(conn):
-                _kb._append_event(conn, task_id, "respawn_guarded", {"reason": guard_reason})
+                _kb._append_event(conn, task_id, "respawn_guarded", {"reason": guard_reason, **pr_recovery})
         return False
 
     def _count_spawn(name: str) -> None:
@@ -3104,6 +3149,23 @@ def _dispatch_lane_task(
     claimed = claim(conn, task_id, ttl_seconds=ttl_seconds)
     if claimed is None:
         return False
+    if pr_recovery:
+        with _kb.write_txn(conn):
+            _kb._append_event(
+                conn, task_id, "active_pr_recovery", pr_recovery, run_id=claimed.current_run_id,
+            )
+            # The canonical packet previews comments, not event payloads. Give
+            # the resumed worker the same-PR constraint before it starts.
+            _kb.add_comment(
+                conn, task_id, author="dispatcher",
+                body=f"PR recovery: {', '.join(pr_recovery['pr_urls'])}\n"
+                     f"{pr_recovery['recovery']}",
+            )
+        _kb._log.info(
+            "kanban active_pr recovery claimed task=%s run=%s prior_run=%s reason=%s prs=%s",
+            task_id, claimed.current_run_id, pr_recovery["prior_run_id"],
+            pr_recovery["recovery_reason"], pr_recovery["pr_urls"],
+        )
     try:
         resolved_branch_name = None
         if claimed.workspace_kind == "worktree":
@@ -3130,6 +3192,9 @@ def _dispatch_lane_task(
         # compatible custom spawn function. This closes the race where a very
         # fast worker finalizes its run before the parent records its PID.
         _prepare_worker_launch(claimed)
+        _validate_prepared_model_policy(
+            claimed, board=board, review_lane=(lane == "review"),
+        )
         _stamp_worker_run_launch(conn, claimed)
         pid = _call_spawn_fn(spawn_fn if spawn_fn is not None else _default_spawn, claimed, str(workspace), board)
         if pid:
@@ -3226,11 +3291,25 @@ def _apply_default_assignee(
         return True
     try:
         with _kb.write_txn(conn):
-            conn.execute(
-                "UPDATE tasks SET assignee = ? WHERE id = ? "
+            current_task = _kb.get_task(conn, task_id)
+            if current_task is None:
+                return False
+            candidate = replace(
+                current_task,
+                assignee=assignee,
+                policy_forced_by=None,
+                policy_force_reason=None,
+                policy_force_route=None,
+            )
+            _kb.validate_task_model_policy(candidate, allow_legacy_unconfigured=True)
+            cur = conn.execute(
+                "UPDATE tasks SET assignee = ?, policy_forced_by = NULL, "
+                "policy_force_reason = NULL, policy_force_route = NULL WHERE id = ? "
                 "AND (assignee IS NULL OR assignee = '')",
                 (assignee, task_id),
             )
+            if cur.rowcount != 1:
+                return False
             _kb._append_event(
                 conn, task_id, "assigned",
                 {"assignee": assignee, "source": "kanban.default_assignee"},
@@ -3396,17 +3475,40 @@ def _apply_rework_escalation(
             ).fetchone()
             if row is None:
                 return False
-            preserve = _model_override_is_operator_set(conn, task_id)
+            current_task = _kb.get_task(conn, task_id)
+            preserve = _model_override_is_operator_set(conn, task_id) and not (
+                current_task
+                and (
+                    current_task.policy_forced_by
+                    or current_task.policy_force_reason
+                    or current_task.policy_force_route
+                )
+            )
+            if current_task is not None:
+                candidate = replace(
+                    current_task,
+                    assignee=escalation_profile,
+                    model_override=(current_task.model_override if preserve else None),
+                    provider_override=(current_task.provider_override if preserve else None),
+                    reasoning_effort=(current_task.reasoning_effort if preserve else None),
+                    policy_forced_by=None, policy_force_reason=None, policy_force_route=None,
+                )
+                _kb.validate_task_model_policy(
+                    candidate, allow_legacy_unconfigured=True,
+                )
             if preserve:
                 cur = conn.execute(
-                    "UPDATE tasks SET assignee = ? "
+                    "UPDATE tasks SET assignee = ?, policy_forced_by = NULL, "
+                    "policy_force_reason = NULL, policy_force_route = NULL "
                     "WHERE id = ? AND status = 'ready' AND assignee = ?",
                     (escalation_profile, task_id, previous_assignee),
                 )
             else:
                 cur = conn.execute(
                     "UPDATE tasks SET assignee = ?, model_override = NULL, "
-                    "provider_override = NULL, reasoning_effort = NULL "
+                    "provider_override = NULL, reasoning_effort = NULL, "
+                    "policy_forced_by = NULL, policy_force_reason = NULL, "
+                    "policy_force_route = NULL "
                     "WHERE id = ? AND status = 'ready' AND assignee = ?",
                     (escalation_profile, task_id, previous_assignee),
                 )
@@ -3502,17 +3604,36 @@ def _apply_default_reviewer(
     try:
         with _kb.write_txn(conn):
             row = conn.execute(
-                "SELECT model_override, provider_override, reasoning_effort FROM tasks WHERE id = ?",
+                "SELECT model_override, provider_override, reasoning_effort, policy_forced_by, "
+                "policy_force_reason, policy_force_route FROM tasks WHERE id = ?",
                 (task_id,),
             ).fetchone()
             if row is None:
                 return False
+            current_task = _kb.get_task(conn, task_id)
+            if current_task is None:
+                return False
+            candidate = replace(
+                current_task,
+                assignee=reviewer,
+                model_override=None,
+                provider_override=None,
+                reasoning_effort=None,
+                policy_forced_by=None,
+                policy_force_reason=None,
+                policy_force_route=None,
+            )
+            _kb.validate_review_task_model_policy(
+                candidate, allow_legacy_unconfigured=True,
+            )
             implementer_model_override = row["model_override"]
             implementer_provider_override = row["provider_override"]
             implementer_reasoning_effort = row["reasoning_effort"]
             cur = conn.execute(
                 "UPDATE tasks SET assignee = ?, model_override = NULL, provider_override = NULL, "
-                "reasoning_effort = NULL WHERE id = ? AND status = 'review'",
+                "reasoning_effort = NULL, policy_forced_by = NULL, "
+                "policy_force_reason = NULL, policy_force_route = NULL "
+                "WHERE id = ? AND status = 'review'",
                 (reviewer, task_id),
             )
             if cur.rowcount != 1:
@@ -3530,6 +3651,10 @@ def _apply_default_reviewer(
                 payload["implementer_provider_override"] = implementer_provider_override
             if implementer_reasoning_effort is not None:
                 payload["implementer_reasoning_effort"] = implementer_reasoning_effort
+            if row["policy_forced_by"] or row["policy_force_reason"] or row["policy_force_route"]:
+                payload["implementer_policy_forced_by"] = row["policy_forced_by"]
+                payload["implementer_policy_force_reason"] = row["policy_force_reason"]
+                payload["implementer_policy_force_route"] = row["policy_force_route"]
             _kb._append_event(conn, task_id, "assigned", payload)
     except Exception:
         _kb._log.debug(
@@ -4416,6 +4541,45 @@ def _prepare_worker_launch(task: Task, hermes_home: Optional[str] = None) -> Non
         setattr(task, "_worker_run_analytics", _resolve_worker_run_analytics(task, hermes_home))
 
 
+def _validate_prepared_model_policy(
+    task: Task, *, board: Optional[str], review_lane: bool = False,
+) -> None:
+    """Validate the exact route prepared for worker argv/run accounting."""
+    if task.goal_mode:
+        raise ValueError("goal_mode is disabled by the unattended Kanban policy")
+    if (
+        not _kb._profile_config_exists(task.assignee)
+        and not (task.model_override or task.provider_override or task.reasoning_effort)
+    ):
+        # A legacy profile with neither config nor explicit route has no route
+        # for this layer to judge. Any explicit pin still fails closed below.
+        return
+    analytics = dict(getattr(task, "_worker_run_analytics", {}) or {})
+    has_force = bool(
+        task.policy_forced_by or task.policy_force_reason or task.policy_force_route
+    )
+    decision = _kb.validate_model_effort_policy(
+        provider=analytics.get("provider"), model=analytics.get("model"),
+        reasoning_effort=analytics.get("reasoning_effort"), assignee=task.assignee,
+        policy=_kb._effective_model_policy(task.assignee, board), force=has_force,
+        force_reason=task.policy_force_reason, forced_by=task.policy_forced_by,
+    )
+    if has_force and decision.force_route != task.policy_force_route:
+        raise ValueError(
+            "stored model policy force does not match the prepared assignee/route; "
+            "re-approve with force plus a durable reason"
+        )
+    if (
+        review_lane
+        and str(analytics.get("model") or "").strip().casefold() == "gpt-5.6-luna"
+        and not has_force
+    ):
+        raise ValueError(
+            "Kanban model policy refuses mechanical-only Luna for review work; "
+            "use Sol/medium or provide operator force plus a durable reason"
+        )
+
+
 def _stamp_worker_run_launch(conn: sqlite3.Connection, task: Task) -> None:
     """Persist launch identity before Popen so a fast worker cannot outrun it."""
     run_id = task.current_run_id or _kb._current_run_id(conn, task.id)
@@ -4501,7 +4665,13 @@ def _retag_legacy_worker_sessions(workspaces_root_path: str) -> None:
 
 
 def _worker_argv(task: Task, profile_arg: str, hermes_home: Optional[str]) -> list[str]:
-    """Build the ``hermes -p <profile> --cli ... chat -q ...`` worker command."""
+    """Build the worker command with an id-only, cache-safe startup query.
+
+    Dynamic task/body/history data is returned once by ``kanban_show`` as the
+    canonical worker packet.  Keeping it out of argv avoids a second operative
+    serialization and leaves the system/message prefix and role alternation
+    unchanged.
+    """
     cmd = [
         *_resolve_hermes_argv(),
         "-p", profile_arg,

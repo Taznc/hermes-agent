@@ -1416,7 +1416,7 @@ export const zhHant = defineForkLocale(forkZhHant, {
     replyPlaceholder: '回覆…',
     noPreview: '暫無預覽。',
     shown: (visible, total) => `顯示 ${visible} / ${total} 個工作階段`,
-    subtitle: '目前回合的子代理即時活動。',
+    subtitle: '各工作階段的子代理即時活動，包括背景工作。',
     emptyTitle: '暫無活躍子代理',
     emptyDesc: '當某個回合派發任務時，子代理會在此即時顯示進度。',
     running: '執行中',

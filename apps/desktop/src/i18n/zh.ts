@@ -1866,7 +1866,7 @@ export const zhAuthored: Translations = withForkKeys(forkZh, {
     replyPlaceholder: '回复…',
     noPreview: '暂无预览。',
     shown: (visible, total) => `显示 ${visible} / ${total} 个会话`,
-    subtitle: '当前回合的子代理实时活动。',
+    subtitle: '各会话的子代理实时活动，包括后台任务。',
     emptyTitle: '暂无活跃子代理',
     emptyDesc: '当某个回合派发任务时，子代理会在此实时显示进度。',
     running: '运行中',

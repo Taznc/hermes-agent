@@ -116,7 +116,8 @@ def test_escalation_preserves_operator_set_model_override(all_assignees_spawnabl
     with kbc.connect() as conn:
         task_id = kb.create_task(
             conn, title="hard rework", assignee="implementer",
-            model_override="claude-sonnet-5", provider_override="anthropic",
+            model_override="gpt-5.6-terra", provider_override="openai-codex",
+            reasoning_effort="medium",
         )
         kb._append_event(conn, task_id, "changes_requested", {"reason": "first"})
         kb._append_event(conn, task_id, "changes_requested", {"reason": "second"})
@@ -134,12 +135,42 @@ def test_escalation_preserves_operator_set_model_override(all_assignees_spawnabl
         task = kb.get_task(conn, task_id)
         assert task is not None
         assert task.assignee == "debugger"
-        assert task.model_override == "claude-sonnet-5"
-        assert task.provider_override == "anthropic"
+        assert task.model_override == "gpt-5.6-terra"
+        assert task.provider_override == "openai-codex"
 
         events = kb.list_events(conn, task_id)
         assigned = [e for e in events if e.kind == "assigned"][-1]
         assert assigned.payload.get("preserved_overrides") is True
+
+
+def test_forced_route_is_not_transferred_to_escalation_profile(all_assignees_spawnable):
+    with kbc.connect() as conn:
+        task_id = kb.create_task(
+            conn, title="forced hard rework", assignee="implementer",
+            model_override="gpt-5.6-terra", provider_override="openai-codex",
+            reasoning_effort="high", policy_force=True,
+            policy_force_reason="operator exception", policy_forced_by="operator",
+        )
+        kb._append_event(conn, task_id, "changes_requested", {"reason": "first"})
+        kb._append_event(conn, task_id, "changes_requested", {"reason": "second"})
+        conn.commit()
+
+        result = kbd.dispatch_once(
+            conn, spawn_fn=_spawn, review_rework_escalation_profile="debugger",
+        )
+
+        assert result.auto_escalated_rework == [
+            (task_id, "implementer", "debugger", 2)
+        ]
+        task = kb.get_task(conn, task_id)
+        assert task is not None
+        assert task.assignee == "debugger"
+        assert task.model_override is None
+        assert task.provider_override is None
+        assert task.reasoning_effort is None
+        assert task.policy_forced_by is None
+        assert task.policy_force_reason is None
+        assert task.policy_force_route is None
 
 
 def test_escalation_clears_classifier_picked_model_override(all_assignees_spawnable):
@@ -149,7 +180,7 @@ def test_escalation_clears_classifier_picked_model_override(all_assignees_spawna
     with kbc.connect() as conn:
         task_id = kb.create_task(
             conn, title="hard rework", assignee="implementer",
-            model_override="gpt-5.4-mini", provider_override="openai-codex",
+            model_override="gpt-5.6-terra", provider_override="openai-codex",
             route_source="mechanical", route_name="mechanical",
         )
         kb._append_event(conn, task_id, "changes_requested", {"reason": "first"})
@@ -183,10 +214,11 @@ def test_escalation_preserves_operator_set_via_set_model_override_cli(all_assign
     with kbc.connect() as conn:
         task_id = kb.create_task(
             conn, title="hard rework", assignee="implementer",
-            model_override="gpt-5.4-mini", provider_override="openai-codex",
+            model_override="gpt-5.6-terra", provider_override="openai-codex",
+            reasoning_effort="medium",
             route_source="mechanical", route_name="mechanical",
         )
-        assert kb.set_model_override(conn, task_id, "claude-sonnet-5", provider="anthropic")
+        assert kb.set_model_override(conn, task_id, "gpt-5.6-sol", provider="openai-codex")
         kb._append_event(conn, task_id, "changes_requested", {"reason": "first"})
         kb._append_event(conn, task_id, "changes_requested", {"reason": "second"})
         conn.commit()
@@ -202,8 +234,8 @@ def test_escalation_preserves_operator_set_via_set_model_override_cli(all_assign
         ]
         task = kb.get_task(conn, task_id)
         assert task is not None
-        assert task.model_override == "claude-sonnet-5"
-        assert task.provider_override == "anthropic"
+        assert task.model_override == "gpt-5.6-sol"
+        assert task.provider_override == "openai-codex"
 
 
 def test_third_changes_request_hits_review_round_cap_and_blocks(all_assignees_spawnable):

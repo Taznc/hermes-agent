@@ -1654,7 +1654,7 @@ export const en: Translations = withForkKeys(forkEn, {
     replyPlaceholder: 'Reply…',
     noPreview: 'No preview available.',
     shown: (visible, total) => `${visible} of ${total} sessions`,
-    subtitle: 'Live subagent activity for the current turn.',
+    subtitle: 'Live subagent activity across sessions, including background work.',
     emptyTitle: 'No live subagents',
     emptyDesc: 'When a turn delegates work, child agents stream their progress here.',
     running: 'Running',

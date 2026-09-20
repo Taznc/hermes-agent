@@ -846,7 +846,10 @@ def test_claude_proxy_forwards_response_format_as_anthropic_output_config():
         assert status == 200
         assert json.loads(raw)["choices"][0]["message"]["content"] == '{"ok":true}'
         assert captured["body"]["output_config"] == {
-            "format": {"type": "json_schema", "schema": {"type": "object"}}
+            "format": {
+                "type": "json_schema",
+                "schema": {"type": "object", "additionalProperties": False},
+            }
         }
 
     asyncio.run(run())

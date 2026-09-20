@@ -304,8 +304,9 @@ def test_goal_mode_review_handoff_cannot_bypass_judge(
             conn,
             title="Goal-mode tool task",
             assignee="builder",
-            goal_mode=True,
         )
+        conn.execute("UPDATE tasks SET goal_mode = 1 WHERE id = ?", (tool_task,))
+        conn.commit()
         claimed = kb.claim_task(conn, tool_task, claimer="builder:1")
         assert claimed is not None
     monkeypatch.setenv("HERMES_KANBAN_TASK", tool_task)
@@ -339,8 +340,9 @@ def test_goal_mode_review_handoff_cannot_bypass_judge(
             conn,
             title="Goal-mode CLI task",
             assignee="builder",
-            goal_mode=True,
         )
+        conn.execute("UPDATE tasks SET goal_mode = 1 WHERE id = ?", (cli_task,))
+        conn.commit()
         cli_claimed = kb.claim_task(conn, cli_task, claimer="builder:2")
         assert cli_claimed is not None
     monkeypatch.setenv("HERMES_KANBAN_TASK", cli_task)

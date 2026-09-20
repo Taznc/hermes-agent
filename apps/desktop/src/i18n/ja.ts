@@ -1470,7 +1470,7 @@ export const ja = defineForkLocale(forkJa, {
     replyPlaceholder: '返信…',
     noPreview: 'プレビューはありません。',
     shown: (visible, total) => `${total} 件中 ${visible} 件`,
-    subtitle: '現在のターンのライブサブエージェントのアクティビティ。',
+    subtitle: 'バックグラウンドの作業を含む、各セッションのサブエージェントのアクティビティ。',
     emptyTitle: 'ライブサブエージェントはありません',
     emptyDesc: 'ターンで作業を委任すると、子エージェントの進捗状況がここにストリームされます。',
     running: '実行中',
