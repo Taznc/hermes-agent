@@ -17,6 +17,9 @@ class TurnRetryState:
     # Per-provider OAuth / credential refresh guards
     codex_auth_retry_attempted: bool = False
     anthropic_auth_retry_attempted: bool = False
+    # Late one-shot: a 401 that survived pool recovery + the early refresh is re-checked
+    # against the LIVE OAuth source (a peer may have rotated mid-request) before it turns fatal.
+    anthropic_rotation_retry_attempted: bool = False
     nous_auth_retry_attempted: bool = False
     nous_paid_entitlement_refresh_attempted: bool = False
     copilot_auth_retry_attempted: bool = False

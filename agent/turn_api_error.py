@@ -21,7 +21,7 @@ from agent.turn_recovery import (
     _NONRETRYABLE_LABELS, abort_turn_on_interrupt, compute_error_backoff, interruptible_backoff_sleep,
     log_api_error_attempt,
     max_retries_exhausted_result, nonretryable_client_error_result, recover_after_classification,
-    recover_before_classification, route_classified_error,
+    recover_before_classification, route_classified_error, try_anthropic_rotation_retry,
 )
 
 logger = logging.getLogger("agent.conversation_loop")
@@ -300,6 +300,12 @@ def settle_unrecovered_error(
                 )
                 retry_count = 0
                 return _verdict("continue")
+        # Anthropic OAuth self-heal BEFORE fallback: a peer process rotated the shared single-use
+        # refresh token mid-request (401 "revoked") and the new token is already on disk. One retry
+        # on the SAME provider, only when a different token was actually re-resolved.
+        if try_anthropic_rotation_retry(agent, _retry, status_code):
+            retry_count = 0
+            return _verdict("continue")
         # Announce the fallback only when a chain exists, else "trying fallback..." lies
         # before a silent abort.
         if agent._has_pending_fallback():

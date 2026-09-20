@@ -847,7 +847,9 @@ class ClientLifecycleMixin:
             logger.info("Copilot credentials re-exchanged after stale-credential 400 (source=%s)", token_source)
         return ok
 
-    def _try_refresh_anthropic_client_credentials(self) -> bool:
+    def _try_refresh_anthropic_client_credentials(self, *, token: Optional[str] = None) -> bool:
+        """Rebuild the Anthropic client on a DIFFERENT token. ``token`` skips the resolver
+        (caller already re-resolved it from a live source, e.g. the 401 rotation-retry)."""
         # Only native Anthropic rotates OAuth tokens; other anthropic_messages providers (MiniMax, Alibaba, ...)
         # and Azure use static keys — a refresh would pick up the ~/.claude OAuth token and break auth.
         if (
@@ -856,12 +858,14 @@ class ClientLifecycleMixin:
             or base_url_host_matches(getattr(self, "_anthropic_base_url", "") or "", "azure.com")
         ):
             return False
-        try:
-            from agent.anthropic_credentials import resolve_anthropic_token
-            new_token = resolve_anthropic_token()
-        except Exception as exc:
-            logger.debug("Anthropic credential refresh failed: %s", exc)
-            return False
+        new_token = token
+        if new_token is None:
+            try:
+                from agent.anthropic_credentials import resolve_anthropic_token
+                new_token = resolve_anthropic_token()
+            except Exception as exc:
+                logger.debug("Anthropic credential refresh failed: %s", exc)
+                return False
         new_token = new_token.strip() if isinstance(new_token, str) else ""
         if not new_token or new_token == self._anthropic_api_key:
             return False
