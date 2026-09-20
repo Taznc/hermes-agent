@@ -178,6 +178,7 @@ beforeEach(() => {
 
 describe('Show all sessions', () => {
   const sessions = Array.from({ length: 6 }, (_, index) => ({ id: `session-${index + 1}` }) as SessionInfo)
+
   const renderRows = (items: SessionInfo[]) => (
     <>
       {items.map(item => (
@@ -186,24 +187,29 @@ describe('Show all sessions', () => {
     </>
   )
 
-  it('keeps the five-session page by default and renders every loaded workspace session when enabled', () => {
+  it('keeps the five-session lane page regardless of Show all sessions — the preference only widens project previews', () => {
     workspaceOpen.value = true
 
     render(<SidebarWorkspaceGroup group={group({ sessions })} renderRows={renderRows} />)
 
     expect(screen.getByText('session-5')).toBeTruthy()
     expect(screen.queryByText('session-6')).toBeNull()
+    expect(screen.getByRole('button', { name: 'Show 1 more in feature' })).toBeTruthy()
 
+    // Upstream never wires this atom into SidebarWorkspaceGroup — an entered
+    // project's worktree/branch lanes keep their own fixed paging + show-more
+    // regardless of the sidebar-wide preview preference.
     act(() => $sidebarShowAllSessions.set(true))
 
-    expect(screen.getByText('session-6')).toBeTruthy()
-    expect(screen.queryByRole('button', { name: /Show .* more in feature/ })).toBeNull()
+    expect(screen.queryByText('session-6')).toBeNull()
+    expect(screen.getByRole('button', { name: 'Show 1 more in feature' })).toBeTruthy()
   })
 
   it('does not cap expanded project previews at two date groups', () => {
     workspaceOpen.value = true
     $sidebarShowAllSessions.set(true)
     const now = Math.floor(Date.now() / 1000)
+
     const previewSessions = [0, 2, 10, 40].map(
       days =>
         ({
