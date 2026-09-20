@@ -15,7 +15,6 @@ import { fmtDayTime, relativeTime } from '@/lib/time'
 import { cn } from '@/lib/utils'
 import { confirm } from '@/store/confirm'
 import { $cronJobs, updateCronJobs } from '@/store/cron'
-import { $sidebarListLimit } from '@/store/layout'
 import { $changeEventsAvailable, $cronChangeTick } from '@/store/live-sync'
 import { notify, notifyError } from '@/store/notifications'
 import { $selectedStoredSessionId } from '@/store/session'
@@ -39,11 +38,9 @@ const PEEK_RUN_LIMIT = 5
 const PEEK_POLL_INTERVAL_MS = 8000
 const PEEK_BACKSTOP_INTERVAL_MS = 60_000
 
-// Keep the section compact when a numeric list-length is picked: show a few
-// jobs up front, reveal more in larger steps on demand (mirrors the messaging
-// sections in the sidebar). Under the default 'all' setting there is no
-// initial cap at all — see $sidebarListLimit.
-const INITIAL_VISIBLE_JOBS_DEFAULT = 3
+// Keep the section compact: show a few jobs up front, reveal more in larger
+// steps on demand (mirrors the messaging sections in the sidebar).
+const INITIAL_VISIBLE_JOBS = 3
 const LOAD_MORE_STEP = 10
 
 function nextRunMs(job: CronJob): null | number {
@@ -106,25 +103,11 @@ export function SidebarCronJobsSection({
   const [nowMs, setNowMs] = useState(() => Date.now())
   // Single-open inline peek so the section stays scannable.
   const [peekJobId, setPeekJobId] = useState<null | string>(null)
-  const listLimit = useStore($sidebarListLimit)
-
-  // Rows revealed so far; starts compact under a numeric list-length, grows in
-  // steps via "load more". Under 'all' this is moot — see `cap` below, which
-  // ignores it entirely and shows everything (up to `max`).
-  const [visibleCount, setVisibleCount] = useState(
-    typeof listLimit === 'number' ? listLimit : INITIAL_VISIBLE_JOBS_DEFAULT
-  )
+  // Rows revealed so far; starts compact, grows in steps via "load more".
+  const [visibleCount, setVisibleCount] = useState(INITIAL_VISIBLE_JOBS)
 
   const [triggeringJobIds, setTriggeringJobIds] = useState<ReadonlySet<string>>(() => new Set())
   const triggerControllerRef = useRef<CronTriggerController | null>(null)
-
-  // Switching the list-length setting (the filter menu) resets this section's
-  // own reveal-count back to that setting's floor, the same way the flat
-  // recents list resets $sessionsLimit on the same event.
-  useEffect(() => {
-    setVisibleCount(typeof listLimit === 'number' ? listLimit : INITIAL_VISIBLE_JOBS_DEFAULT)
-  }, [listLimit])
-
 
   // eslint-disable-next-line no-restricted-syntax -- controller mount identity, not an atom mirror
   useEffect(() => {
@@ -200,9 +183,9 @@ export function SidebarCronJobsSection({
     })
   }, [jobs])
 
-  const cap = listLimit === 'all' ? Math.min(sorted.length, max) : Math.min(visibleCount, max)
+  const cap = Math.min(visibleCount, max)
   const shown = sorted.slice(0, cap)
-  const hiddenCount = listLimit === 'all' ? 0 : Math.min(sorted.length, max) - shown.length
+  const hiddenCount = Math.min(sorted.length, max) - shown.length
 
   // The section owns its own visibility now that it owns its own $cronJobs
   // subscription — the parent used to gate rendering on `cronJobs.length > 0`

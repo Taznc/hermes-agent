@@ -255,6 +255,22 @@ export function ChatSidebar({
 
   const activeSidebarSessionId = currentView === 'chat' ? selectedSessionId : null
 
+  // Toggle the persisted read-state watermark from a row menu. The row's own
+  // `unread` prop mirrors what the dot paints; flip it and let the backend
+  // become the truth (optimistic update + rollback in markSessionUnread).
+  const toggleUnread = useCallback(
+    (storedId: string) => {
+      const row = $sessions.get().find(r => r.id === storedId)
+
+      if (!row) {
+        return
+      }
+
+      markSessionUnread(storedId, row.unread !== true).catch(err => notifyError(err, s.row.unreadFailed))
+    },
+    [s.row.unreadFailed]
+  )
+
   const dndSensors = useSensors(
     useSensor(PointerSensor, { activationConstraint: { distance: 6 } }),
     useSensor(KeyboardSensor, { coordinateGetter: sortableKeyboardCoordinates })
@@ -945,15 +961,6 @@ export function ChatSidebar({
     projectTreeLoading &&
     !projectOverview?.length &&
     !(inProject && (enteredProject?.sessionCount ?? 0) > 0)
-
-      if (!row) {
-        return
-      }
-
-      markSessionUnread(storedId, row.unread !== true).catch(err => notifyError(err, s.row.unreadFailed))
-    },
-    [s.row.unreadFailed]
-  )
 
   return (
     <Sidebar

@@ -15,12 +15,12 @@ import { $activeConnectionId } from '@/store/connections'
 import {
   $sidebarCardRows,
   $sidebarGrouping,
-  $sidebarListLimit,
   $sidebarOrdering,
   $sidebarProjectOrderIds,
   $sidebarRecentsOpen,
   $sidebarSessionOrderIds,
   $sidebarSessionOrderManual,
+  $sidebarShowAllSessions,
   $sidebarShowArchived,
   $sidebarWorkspaceOrderIds,
   $sidebarWorkspaceParentOrderIds,
@@ -91,6 +91,7 @@ import {
   overlayLivePreviews,
   ProjectBackRow,
   ProjectMenu,
+  PROJECT_PREVIEW_COUNT,
   projectTreeCwd,
   reconcileEnteredProjectSessions,
   type SidebarProjectTree,
@@ -149,7 +150,7 @@ export function SidebarWorkspaceSection({
   const grouping = useStore($sidebarGrouping)
   const ordering = useStore($sidebarOrdering)
   const cardRows = useStore($sidebarCardRows)
-  const listLimit = useStore($sidebarListLimit)
+  const showAllSessions = useStore($sidebarShowAllSessions)
   const showArchived = useStore($sidebarShowArchived)
   const agentsOpen = useStore($sidebarRecentsOpen)
   const filtersActive = useStore($sidebarFiltersActive)
@@ -481,11 +482,17 @@ export function SidebarWorkspaceSection({
 
   const overviewPreviews = useMemo<Record<string, SessionInfo[]>>(
     () =>
-      overlayLivePreviews(projectOverview ?? [], agentSessions, projects, listLimit === 'all' ? Infinity : listLimit, {
-        removed: removedSessionIds,
-        rankIds: sortOrderIds
-      }),
-    [projectOverview, agentSessions, projects, removedSessionIds, sortOrderIds, listLimit]
+      overlayLivePreviews(
+        projectOverview ?? [],
+        agentSessions,
+        projects,
+        showAllSessions ? Infinity : PROJECT_PREVIEW_COUNT,
+        {
+          removed: removedSessionIds,
+          rankIds: sortOrderIds
+        }
+      ),
+    [projectOverview, agentSessions, projects, removedSessionIds, sortOrderIds, showAllSessions]
   )
 
   const enteredProjectOverlaySessions = useMemo(

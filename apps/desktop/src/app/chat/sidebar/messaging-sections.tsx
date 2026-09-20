@@ -3,15 +3,15 @@ import { useState } from 'react'
 
 import { PlatformAvatar } from '@/app/messaging/platform-icon'
 import { cn } from '@/lib/utils'
-import { $sidebarListLimit, $sidebarMessagingOpenIds, toggleSidebarMessagingOpen } from '@/store/layout'
+import { $sidebarMessagingOpenIds, toggleSidebarMessagingOpen } from '@/store/layout'
 import { $sidebarMessagingGroups } from '@/store/sidebar-model'
 
 import { SIDEBAR_GROUP_BODY } from './chrome'
 import { SidebarLoadMoreRow } from './load-more-row'
 import { SidebarSessionsSection } from './sessions-section'
 
-// Mirrors the flat recents/cron sections: compact under a numeric list-length,
-// full under 'all'.
+// Mirrors the flat recents/cron sections: compact by default, load more on
+// demand.
 const NON_SESSION_LOAD_STEP = 10
 
 interface SidebarMessagingSectionsProps {
@@ -48,7 +48,6 @@ export function SidebarMessagingSections({
   visible: sectionVisible = true
 }: SidebarMessagingSectionsProps) {
   const messagingGroups = useStore($sidebarMessagingGroups)
-  const listLimit = useStore($sidebarListLimit)
   const messagingOpenIds = useStore($sidebarMessagingOpenIds)
   const [messagingLoadMorePending, setMessagingLoadMorePending] = useState<Record<string, boolean>>({})
   const [messagingVisible, setMessagingVisible] = useState<Record<string, number>>({})
@@ -66,8 +65,7 @@ export function SidebarMessagingSections({
   }
 
   const revealMoreMessaging = (platform: string, loaded: number, hasMore: boolean) => {
-    const step = typeof listLimit === 'number' ? listLimit : NON_SESSION_LOAD_STEP
-    const next = (messagingVisible[platform] ?? step) + NON_SESSION_LOAD_STEP
+    const next = (messagingVisible[platform] ?? NON_SESSION_LOAD_STEP) + NON_SESSION_LOAD_STEP
 
     setMessagingVisible(prev => ({ ...prev, [platform]: next }))
 
@@ -83,11 +81,10 @@ export function SidebarMessagingSections({
   return (
     <>
       {messagingGroups.map(group => {
-        const revealedCount =
-          listLimit === 'all' ? group.sessions.length : (messagingVisible[group.sourceId] ?? listLimit)
+        const revealedCount = messagingVisible[group.sourceId] ?? NON_SESSION_LOAD_STEP
 
         const shownSessions = group.sessions.slice(0, revealedCount)
-        const canRevealMore = listLimit !== 'all' && (revealedCount < group.sessions.length || group.hasMore)
+        const canRevealMore = revealedCount < group.sessions.length || group.hasMore
 
         return (
           <SidebarSessionsSection
