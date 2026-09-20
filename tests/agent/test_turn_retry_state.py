@@ -15,8 +15,7 @@ from agent.turn_retry_state import TurnRetryState
 
 EXPECTED_FIELDS = {
     "codex_auth_retry_attempted",
-    "anthropic_auth_retry_attempted",
-    "anthropic_rotation_retry_attempted",
+    "anthropic_401_retry_attempted",
     "nous_auth_retry_attempted",
     "nous_paid_entitlement_refresh_attempted",
     "copilot_auth_retry_attempted",
@@ -59,7 +58,7 @@ def test_guards_are_independently_mutable():
     assert s.restart_with_compressed_messages is True
     # untouched guards stay False
     assert s.has_retried_429 is False
-    assert s.anthropic_auth_retry_attempted is False
+    assert s.anthropic_401_retry_attempted is False
 
 
 def test_copilot_provider_check_accepts_alias_spellings():

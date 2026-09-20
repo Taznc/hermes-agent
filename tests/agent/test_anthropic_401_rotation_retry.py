@@ -152,7 +152,7 @@ def test_401_with_rotated_token_on_disk_retries_once_on_new_token(cred_file, cap
     assert agent._anthropic_api_key == NEW
     assert agent._anthropic_client.token == NEW
     assert agent._is_anthropic_oauth is True
-    assert retry.anthropic_rotation_retry_attempted is True
+    assert retry.anthropic_401_retry_attempted is True
     assert any("adopted the rotated OAuth token" in r.getMessage() for r in caplog.records)
 
 
@@ -276,3 +276,72 @@ def test_pool_owned_oauth_entry_reresolves_via_pool(cred_file):
     assert verdict.action == "continue"
     assert built == [NEW]
     read_file.assert_not_called()               # pool-owned rows never touch ~/.claude
+
+
+# ── unified per-iteration budget: early refresh and late rotation share ONE guard ─────────
+
+
+def test_early_refresh_success_consumes_budget_no_second_retry_in_settle(cred_file):
+    """A 401 recovered by the early ``recover_after_classification`` refresh must NOT also
+    be eligible for a second retry via the late rotation path in the SAME iteration."""
+    from agent.turn_recovery import recover_after_classification
+
+    cred_file(NEW)
+    agent = _make_agent()
+    agent._recover_with_credential_pool = MagicMock(return_value=(False, False))
+    retry = TurnRetryState()
+    err = _revoked_401()
+    classified = classify_api_error(err, provider=agent.provider, model=agent.model)
+    messages = _messages()
+    api_messages = [{"role": "system", "content": "SYSTEM PROMPT (byte-stable)"}] + copy.deepcopy(messages)
+
+    with patch.object(agent, "_try_refresh_anthropic_client_credentials", return_value=True):
+        recovered, _ = recover_after_classification(
+            agent, err, classified, retry, status_code=401, error_context={},
+            messages=messages, api_messages=api_messages,
+        )
+    assert recovered is True
+    assert retry.anthropic_401_retry_attempted is True
+
+    # A repeated 401 in the same iteration must NOT get a second retry: the budget is spent.
+    built, builder = _built_clients(agent)
+    with builder, patch.object(ac, "refresh_anthropic_oauth_pure") as post:
+        verdict, terminal, _, _ = _settle(agent, retry, messages, api_error=err)
+    assert verdict.action == "return"
+    terminal.assert_called_once()
+    assert built == []                          # no second client rebuild
+    post.assert_not_called()
+
+
+def test_early_refresh_failure_leaves_budget_for_rotation_retry(cred_file):
+    """When the early refresh does NOT recover the 401, the late rotation path still gets
+    its one retry against the live credential source."""
+    from agent.turn_recovery import recover_after_classification
+
+    cred_file(OLD)  # file still holds the failed token — nothing to adopt yet
+    agent = _make_agent()
+    agent._recover_with_credential_pool = MagicMock(return_value=(False, False))
+    retry = TurnRetryState()
+    err = _revoked_401()
+    classified = classify_api_error(err, provider=agent.provider, model=agent.model)
+    messages = _messages()
+    api_messages = [{"role": "system", "content": "SYSTEM PROMPT (byte-stable)"}] + copy.deepcopy(messages)
+
+    with patch.object(agent, "_try_refresh_anthropic_client_credentials", return_value=False):
+        recovered, _ = recover_after_classification(
+            agent, err, classified, retry, status_code=401, error_context={},
+            messages=messages, api_messages=api_messages,
+        )
+    assert recovered is False
+    assert retry.anthropic_401_retry_attempted is False    # budget still available
+
+    # A peer rotates the file between the failed refresh and the settle-phase re-check.
+    cred_file(NEW)
+    built, builder = _built_clients(agent)
+    with builder, patch.object(ac, "refresh_anthropic_oauth_pure") as post:
+        verdict, terminal, _, _ = _settle(agent, retry, messages, api_error=err)
+    assert verdict.action == "continue"
+    terminal.assert_not_called()
+    assert built == [NEW]
+    assert retry.anthropic_401_retry_attempted is True
+    post.assert_not_called()

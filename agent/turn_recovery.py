@@ -340,10 +340,10 @@ def _refresh_credentials_after_401(
     if (
         agent.api_mode == "anthropic_messages"
         and hasattr(agent, '_anthropic_api_key')
-        and not _retry.anthropic_auth_retry_attempted
+        and not _retry.anthropic_401_retry_attempted
     ):
-        _retry.anthropic_auth_retry_attempted = True
         if agent._try_refresh_anthropic_client_credentials():
+            _retry.anthropic_401_retry_attempted = True
             _plines(agent, "🔐 Anthropic credentials refreshed after 401. Retrying request...")
             return True
         _print_anthropic_401_diagnostics(agent, agent._anthropic_api_key)
@@ -407,10 +407,9 @@ def try_anthropic_rotation_retry(agent: Any, _retry: TurnRetryState, status_code
         or getattr(agent, "api_mode", None) != "anthropic_messages"
         or getattr(agent, "provider", None) != "anthropic"
         or not getattr(agent, "_is_anthropic_oauth", False)
-        or _retry.anthropic_rotation_retry_attempted
+        or _retry.anthropic_401_retry_attempted
     ):
         return False
-    _retry.anthropic_rotation_retry_attempted = True
     failed_token = getattr(agent, "_anthropic_api_key", "") or ""
     try:
         new_token = _reresolve_anthropic_oauth_token(agent, failed_token)
@@ -418,6 +417,7 @@ def try_anthropic_rotation_retry(agent: Any, _retry: TurnRetryState, status_code
         logger.debug("Anthropic 401 rotation re-resolution raised: %s", exc)
         new_token = None
     if new_token and agent._try_refresh_anthropic_client_credentials(token=new_token):
+        _retry.anthropic_401_retry_attempted = True
         logger.info(
             "%sAnthropic 401 after credential rotation: adopted the rotated OAuth token from its live "
             "source (prefix %s… → %s…) and retrying the request once",
