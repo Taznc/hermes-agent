@@ -181,7 +181,10 @@ def discover_eligible_candidates() -> list[dict[str, Any]]:
 def _router_messages(draft: str, attachments: list[dict[str, Any]], policy: str,
                      candidates: list[dict[str, Any]], availability: dict[str, dict[str, Any]]) -> list[dict[str, str]]:
     instruction = (
-        "Choose at most one route per provider from the supplied candidates. Return only the strict JSON schema. "
+        "Choose exactly one route per provider from the supplied candidates: you must include a "
+        "recommendation for every distinct provider present in candidates, never omit an eligible "
+        "provider even if it looks weaker, and pick at most one model within each provider. "
+        "Return only the strict JSON schema. "
         "Use the complete unsent draft and attachment metadata, not hidden context. If the request is ambiguous, "
         "set ambiguous=true and choose a conservative higher effort with a concise reason. "
         f"Policy: {policy}. balanced means cheapest adequate route; save_codex preserves Codex capacity unless "
