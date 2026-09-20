@@ -16,7 +16,11 @@ class TurnRetryState:
 
     # Per-provider OAuth / credential refresh guards
     codex_auth_retry_attempted: bool = False
-    anthropic_auth_retry_attempted: bool = False
+    # Single per-iteration budget for Anthropic 401 recovery: the early credential refresh
+    # (``recover_after_classification``) and the late live-source rotation re-check
+    # (``settle_unrecovered_error``) share this ONE flag so a 401 gets strictly one retry
+    # per API-call iteration, never two independent one-shot guards.
+    anthropic_401_retry_attempted: bool = False
     nous_auth_retry_attempted: bool = False
     nous_paid_entitlement_refresh_attempted: bool = False
     copilot_auth_retry_attempted: bool = False
