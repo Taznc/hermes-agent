@@ -3702,6 +3702,19 @@ export const en: Translations = withForkKeys(forkEn, {
       reloadFailed: 'Server saved, but reloading MCP tools failed — they load next session',
       gatewayDisconnected: 'Hermes gateway is not connected'
     },
+    newSessionProposal: {
+      title: 'Start a new session for this?',
+      description: topic => `New session: “${topic}”`,
+      reasonLabel: 'Why now',
+      approve: 'Start new session',
+      decline: 'Stay here',
+      approved: 'Started a new session',
+      declined: 'Declined',
+      unanswered: 'No response',
+      failed: 'Could not start the new session',
+      sendFailed: 'Could not send the response',
+      gatewayDisconnected: 'Hermes gateway is not connected'
+    },
     tool: {
       copyCode: 'Copy code',
       renderingImage: 'Rendering image',

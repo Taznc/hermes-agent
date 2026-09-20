@@ -29,7 +29,7 @@ export function isFileEditTool(toolName: string): boolean {
 //
 // Everything else is ephemeral activity — reads, searches, commands — which is
 // what a run summarizes and what the live ticker cycles through.
-const CARD_TOOL_NAMES = new Set(['clarify', 'delegate_task', 'image_generate', 'setup_mcp'])
+const CARD_TOOL_NAMES = new Set(['clarify', 'delegate_task', 'image_generate', 'setup_mcp', 'propose_new_session'])
 
 export function isCardTool(toolName: string): boolean {
   return CARD_TOOL_NAMES.has(toolName) || isFileEditTool(toolName)

@@ -8,6 +8,7 @@ import { clearSessionDraft, type ComposerAttachment } from '@/store/composer'
 import { resetBrowseState } from '@/store/composer-input-history'
 import { enqueueQueuedPrompt, type QueuedPromptEntry } from '@/store/composer-queue'
 import { hasMcpSetupRequest, skipMcpSetupRequest } from '@/store/mcp-setup'
+import { hasNewSessionProposalRequest, skipNewSessionProposalRequest } from '@/store/new-session-proposal'
 import { hasBlockingPromptRequest } from '@/store/prompts'
 
 import { cloneAttachments, type QueueEditState } from '../composer-utils'
@@ -177,6 +178,13 @@ export function useComposerSubmit({
     // mcp.setup.respond, so a typed message declines the card and rides on.
     if (payloadPresent && !queueEdit && hasMcpSetupRequest(sessionId)) {
       void skipMcpSetupRequest(sessionId)
+    }
+
+    // Same deal for a pending new-session proposal card: the agent is blocked
+    // on session.propose.respond, so a typed message declines the card and
+    // rides on.
+    if (payloadPresent && !queueEdit && hasNewSessionProposalRequest(sessionId)) {
+      void skipNewSessionProposalRequest(sessionId)
     }
 
     // Approval / sudo / secret prompts also park the turn inside a tool batch,
