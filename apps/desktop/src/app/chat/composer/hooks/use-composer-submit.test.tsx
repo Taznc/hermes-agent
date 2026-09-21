@@ -429,16 +429,53 @@ describe('useComposerSubmit with a clarify parked on the session', () => {
     expect($clarifyRequests.get()['runtime-session']).toBeUndefined()
   })
 
-  it('skips the question before steering a busy turn', async () => {
+  it('steers a busy turn, then releases the clarify only once the steer settles', async () => {
+    parkClarify('runtime-session')
+
+    let resolveSteer: (accepted: boolean) => void = () => {}
+
+    const steerSettled = new Promise<boolean>(resolve => {
+      resolveSteer = resolve
+    })
+
+    const { hook, onSteer } = renderSubmitHook({ busy: true, text: 'change course' })
+    onSteer.mockReturnValueOnce(steerSettled)
+
+    act(() => {
+      hook.result.current.submitDraft()
+    })
+
+    // The clarify card must still be showing while onSteer's RPC is in
+    // flight — releasing it first would let the blocked clarify tool call
+    // return and race the correction into the tool batch before onSteer's
+    // own RPC lands (agent.redirect() degrades to agent.steer() while a tool
+    // is executing), silently dropping the user's correction.
+    await waitFor(() => expect(onSteer).toHaveBeenCalledWith('change course'))
+    expect($clarifyRequests.get()['runtime-session']).toBeDefined()
+    expect(gatewayRequest).not.toHaveBeenCalledWith('clarify.respond', expect.anything())
+
+    resolveSteer(true)
+
+    await waitFor(() =>
+      expect(gatewayRequest).toHaveBeenCalledWith('clarify.respond', { request_id: 'req-runtime-session', answer: '' })
+    )
+    expect($clarifyRequests.get()['runtime-session']).toBeUndefined()
+  })
+
+  it('releases the clarify even when the steer is rejected (turn already ended)', async () => {
     parkClarify('runtime-session')
     const { hook, onSteer } = renderSubmitHook({ busy: true, text: 'change course' })
+    onSteer.mockResolvedValueOnce(false)
 
     act(() => {
       hook.result.current.submitDraft()
     })
 
     await waitFor(() => expect(onSteer).toHaveBeenCalledWith('change course'))
-    expect(gatewayRequest).toHaveBeenCalledWith('clarify.respond', { request_id: 'req-runtime-session', answer: '' })
+    await waitFor(() =>
+      expect(gatewayRequest).toHaveBeenCalledWith('clarify.respond', { request_id: 'req-runtime-session', answer: '' })
+    )
+    expect($clarifyRequests.get()['runtime-session']).toBeUndefined()
   })
 
   it('leaves the question alone for an empty Enter (Stop, not an answer)', () => {
