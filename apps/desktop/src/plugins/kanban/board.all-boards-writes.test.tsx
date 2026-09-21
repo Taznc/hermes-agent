@@ -88,7 +88,7 @@ function client() {
 // ── #2: the create target ────────────────────────────────────────────────────
 
 async function renderNewTaskDialog() {
-  const { NewTaskDialog } = await import('./board')
+  const { NewTaskDialog } = await import('./new-task-dialog')
 
   render(
     <QueryClientProvider client={client()}>
@@ -143,7 +143,7 @@ describe('new-task dialog: the board a card is created on (All Boards mode)', ()
     expect(board).toBeTruthy()
   })
 
-  it("the follow-up status patch lands on the SAME board as the create", async () => {
+  it('the follow-up status patch lands on the SAME board as the create', async () => {
     $boardSlug.set(ALL_BOARDS)
     // create() answers 'ready'; the dialog's target lane is 'ready' too, so
     // force a mismatch to exercise the follow-up patch.
@@ -170,7 +170,7 @@ describe('new-task dialog: the board a card is created on (All Boards mode)', ()
   it('offers no parent field when every candidate is on another board', async () => {
     $boardSlug.set(ALL_BOARDS)
 
-    const { NewTaskDialog } = await import('./board')
+    const { NewTaskDialog } = await import('./new-task-dialog')
 
     render(
       <QueryClientProvider client={client()}>
@@ -192,7 +192,7 @@ describe('new-task dialog: the board a card is created on (All Boards mode)', ()
   it('offers the parent field when a candidate shares the target board', async () => {
     $boardSlug.set(ALL_BOARDS)
 
-    const { NewTaskDialog } = await import('./board')
+    const { NewTaskDialog } = await import('./new-task-dialog')
 
     render(
       <QueryClientProvider client={client()}>
@@ -214,7 +214,7 @@ describe('new-task dialog: the board a card is created on (All Boards mode)', ()
   it('single-board mode offers every parent, board-less (unchanged)', async () => {
     $boardSlug.set('')
 
-    const { NewTaskDialog } = await import('./board')
+    const { NewTaskDialog } = await import('./new-task-dialog')
 
     render(
       <QueryClientProvider client={client()}>
@@ -242,7 +242,13 @@ function seedMergedBoard(qc: QueryClient) {
         tasks: [
           { board: 'homelab', board_name: 'Homelab', id: 't_home_open', status: 'todo', title: 'Homelab open card' },
           { board: 'homelab', board_name: 'Homelab', id: 't_home_other', status: 'todo', title: 'Homelab sibling' },
-          { board: 'shipping', board_name: 'Shipping', id: 't_ship_foreign', status: 'todo', title: 'Shipping stranger' }
+          {
+            board: 'shipping',
+            board_name: 'Shipping',
+            id: 't_ship_foreign',
+            status: 'todo',
+            title: 'Shipping stranger'
+          }
         ]
       }
     ],

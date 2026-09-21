@@ -3,7 +3,7 @@ import { cleanup, fireEvent, render, screen, waitFor, within } from '@testing-li
 import { afterEach, beforeAll, beforeEach, describe, expect, it, vi } from 'vitest'
 
 import { $boardSlug, ALL_BOARDS, type ArchiveDoneResult, bindApi } from './api'
-import { ArchiveDoneControl } from './board'
+import { ArchiveDoneControl } from './archive-done-control'
 
 const { notify, translate } = vi.hoisted(() => ({
   notify: vi.fn(),
