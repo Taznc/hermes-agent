@@ -406,9 +406,33 @@ def coding_system_prompt_parts(
     return mode.system_prompt_parts(valid_tool_names=valid_tool_names, workspace_block=workspace_block)
 
 
+def _configured_compact_skill_categories(config: Optional[dict[str, Any]]) -> frozenset[str]:
+    """Operator-pinned skill categories (``skills.compact_categories`` in config.yaml) to demote
+    to names-only. Unlike the posture-driven deny-list this applies on EVERY platform and posture
+    (not gated on ``focus``) — an operator with a large shared skill library wants the index small
+    everywhere, not just while coding. Same contract as the posture deny-list: demoted, never
+    hidden; nested categories (``social-media/twitter``) follow their top-level segment. Accepts a
+    bare string or a list; anything else (missing key, malformed value) fails open to no change."""
+    try:
+        if config is None:
+            from hermes_cli.config import load_config_readonly
+            config = load_config_readonly()
+        raw = ((config or {}).get("skills", {}) or {}).get("compact_categories", [])
+    except Exception:
+        return frozenset()
+    if isinstance(raw, str):
+        raw = [raw]
+    if not isinstance(raw, (list, tuple)):
+        return frozenset()
+    return frozenset(str(item).strip().split("/", 1)[0] for item in raw if str(item).strip())
+
+
 def coding_compact_skill_categories(*, platform: Optional[str] = None, cwd: Optional[str | Path] = None, config: Optional[dict[str, Any]] = None) -> frozenset[str]:
-    """Skill categories the active posture demotes to names-only (empty outside ``focus``)."""
-    return resolve_runtime_mode(platform=platform, cwd=cwd, config=config).compact_skill_categories()
+    """Skill categories to demote to names-only: the active posture's deny-list (empty outside
+    ``focus``) unioned with the operator-pinned ``skills.compact_categories`` config list (applies
+    regardless of posture)."""
+    posture = resolve_runtime_mode(platform=platform, cwd=cwd, config=config).compact_skill_categories()
+    return posture | _configured_compact_skill_categories(config)
 
 
 # ── git/workspace probe ─────────────────────────────────────────────────────

@@ -2492,6 +2492,7 @@ export const ru = defineForkLocale(forkRu, {
     noSessions: 'Сеансов пока нет',
     noFilterMatches: 'Нет сеансов по этим фильтрам',
     projects: {
+      showAllSessions: 'Показать все сессии',
       sectionLabel: 'Проекты',
       home: 'Главная',
       newButton: 'Новый проект',

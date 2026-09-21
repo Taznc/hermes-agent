@@ -88,7 +88,7 @@ function pasteImages(target: Element, blobs: File[]) {
 
 async function renderDialog() {
   // Import after mocks are registered.
-  const { NewTaskDialog } = await import('./board')
+  const { NewTaskDialog } = await import('./new-task-dialog')
   const client = new QueryClient({ defaultOptions: { queries: { retry: false } } })
   const onClose = vi.fn()
 
@@ -194,8 +194,9 @@ describe('new-task dialog: paste-to-upload images', () => {
   })
 
   it('disables Create while an image upload is still in flight', async () => {
-    let resolveUpload: (value: { attachment: { content_type: string; filename: string; size: number; token: string } }) => void =
-      () => undefined
+    let resolveUpload: (value: {
+      attachment: { content_type: string; filename: string; size: number; token: string }
+    }) => void = () => undefined
 
     stageAttachmentMock.mockReturnValue(
       new Promise(resolve => {
