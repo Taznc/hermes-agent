@@ -1328,6 +1328,13 @@ DEFAULT_CONFIG = {
     # and resolved; read-only — creation goes to ~/.hermes/skills/ unless create_dir redirects it.
     "skills": {
         "external_dirs": [],   # e.g. ["~/.agents/skills", "/shared/team-skills"]
+        # Top-level skill categories to collapse to a single names-only line in the
+        # <available_skills> system-prompt index, on every platform and posture (unioned with the
+        # coding-focus posture's own demotions, which only apply under agent.coding_context: focus).
+        # Demoted, never hidden: every skill name stays in the index and skill_view()/skills_list
+        # still load them normally. Nested categories ("social-media/twitter") follow their
+        # top-level segment. e.g. ["creative", "media", "research"]. Malformed values are ignored.
+        "compact_categories": [],
         # Where skill_manage-created skills go (empty = profile-local dir). When set, new skills
         # land here AND agent-facing instructions name this path; expanded (~, ${VAR}), relative to
         # HERMES_HOME, scanned alongside the local dir.
