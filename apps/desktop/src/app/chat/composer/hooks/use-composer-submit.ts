@@ -164,14 +164,7 @@ export function useComposerSubmit({
     // (default 5 min) — the message looks sent and nothing happens. Typing a
     // real message instead of picking an option IS the answer "none of these":
     // skip the question so the tool returns, then route the words normally.
-    //
-    // Fire-and-forget, not awaited: the skip clears the card synchronously and
-    // both RPCs ride the same socket in call order, so the gateway resolves the
-    // clarify before it sees the follow-up. Awaiting first would leave the draft
-    // live for a tick — long enough for a second Enter to send it twice.
-    if (payloadPresent && !queueEdit && hasClarifyRequest(sessionId)) {
-      void skipClarifyRequest(sessionId)
-    }
+    const clarifyPending = !queueEdit && hasClarifyRequest(sessionId)
 
     // Same deal for a pending MCP setup card: the agent is blocked on
     // mcp.setup.respond, so a typed message declines the card and rides on.
@@ -187,6 +180,35 @@ export function useComposerSubmit({
     // interrupted." — the message looks eaten. Queue the words as the next turn
     // instead; the prompt stays answerable and the queue drains on settle.
     const blockingPrompt = !queueEdit && hasBlockingPromptRequest(sessionId)
+
+    // Whether submitDraft will actually route through steerDraft below — kept
+    // in sync with that branch's own condition so the clarify-release decision
+    // (right below) agrees with what's really about to happen.
+    const willSteerClarify =
+      clarifyPending &&
+      busy &&
+      !!onSteer &&
+      !compacting &&
+      !blockingPrompt &&
+      !attachments.length &&
+      !!text.trim() &&
+      !SLASH_COMMAND_RE.test(text.trim())
+
+    // A clarify parked mid-turn is one specific case of "agent blocked inside a
+    // tool batch": the clarify tool call is itself the blocked tool. Releasing
+    // it (clarify.respond) wakes that tool's worker thread, which can finish
+    // the batch and drain any pending steer/redirect correction BEFORE this
+    // steer's own RPC has round-tripped and staged that correction server-side
+    // (agent.redirect() degrades to agent.steer() while a tool is executing,
+    // per interrupt_control.py). Losing that race silently drops the user's
+    // correction — the turn keeps running on its own, unedited, with no visual
+    // sign anything went wrong until it finishes or the user hits Stop. So when
+    // we're about to steer, release the clarify only AFTER steerDraft's RPC
+    // settles (see steerDraft below); every other path (idle submit, slash
+    // exec, queue) has no such race and keeps releasing it immediately.
+    if (payloadPresent && clarifyPending && !willSteerClarify) {
+      void skipClarifyRequest(sessionId)
+    }
 
     if (queueEdit) {
       exitQueuedEdit('save')
@@ -206,7 +228,7 @@ export function useComposerSubmit({
         // Cursor-style stop-and-correct: interrupt the live turn and redirect
         // it with this text. redirect() preserves the shown reasoning/work; if
         // the turn already ended, steerDraft re-queues so nothing is lost.
-        steerDraft()
+        steerDraft(clarifyPending ? sessionId : null)
       } else if (payloadPresent) {
         // Attachments can't ride a redirect (no tool-result image carriage) —
         // queue the whole payload for the next turn. Same for a turn parked on
@@ -236,7 +258,14 @@ export function useComposerSubmit({
   // Redirect the live turn with a correction. The gateway either restarts the
   // active model request with its displayed context or waits for the current
   // tool boundary. If the turn already ended, queue the words instead.
-  const steerDraft = () => {
+  //
+  // `releaseClarifyAfter`: when this correction is answering a clarify card by
+  // typing past it (see submitDraft above), the clarify must stay parked on
+  // the server until onSteer's RPC settles. Releasing it first (or in
+  // parallel) lets the clarify tool's worker thread wake, finish its batch,
+  // and drain any pending correction before this RPC ever lands — the
+  // correction silently vanishes and the turn runs on unedited.
+  const steerDraft = (releaseClarifyAfter?: string | null) => {
     const text = draftRef.current.trim()
 
     // Guard on live editor state, not the render-lagged `canSteer`: a redirect
@@ -248,11 +277,22 @@ export function useComposerSubmit({
     triggerHaptic('submit')
     clearDraft()
 
-    void Promise.resolve(onSteer(text)).then(accepted => {
-      if (!accepted && activeQueueSessionKey) {
-        enqueueQueuedPrompt(activeQueueSessionKey, { text, attachments: [] })
-      }
-    })
+    void Promise.resolve(onSteer(text))
+      .then(accepted => {
+        if (!accepted && activeQueueSessionKey) {
+          enqueueQueuedPrompt(activeQueueSessionKey, { text, attachments: [] })
+        }
+
+        return accepted
+      })
+      .finally(() => {
+        // Only now is the correction guaranteed staged (accepted) or
+        // definitely never going to land (rejected/thrown) — either way it's
+        // safe to let the clarify's tool call return.
+        if (releaseClarifyAfter) {
+          void skipClarifyRequest(releaseClarifyAfter)
+        }
+      })
   }
 
   const queueDraft = () => {
