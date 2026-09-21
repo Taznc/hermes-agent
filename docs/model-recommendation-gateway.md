@@ -30,6 +30,41 @@ different profile configured. The rejection message contains no draft text.
 
 Only complete unsent draft text and attachment metadata are accepted. Attachment bytes, local paths, prior transcript content, project files, secret values, and hidden context are neither accepted nor passed to the router.
 
+## Candidate scope
+
+The router is not offered the profile's whole model inventory. The picker lists
+~40 providers, most of them aggregators reselling the same frontier models, so
+an unscoped call spends router capacity to return one model several times under
+several slugs — advice the user cannot act on differently.
+
+Candidates are therefore narrowed before the router call, under
+`model_recommendation:` in `config.yaml`:
+
+```yaml
+model_recommendation:
+  preset: balanced
+  providers: [anthropic, openai-codex, nous]   # in preference order
+  free_only_providers: [nous]                  # admitted for their free tier only
+```
+
+- `providers` is both the scope and the dedupe priority. A provider absent from
+  this list is never a candidate, however well configured it is.
+- `free_only_providers` admits a provider for its zero-cost models only; its
+  paid models are not candidates at all. Free status is resolved from the
+  provider's live pricing catalog rather than the picker's cache-only view,
+  which reports every model as unpriced on a cold cache. A model that cannot be
+  proven free is treated as paid, so an unreachable catalog withholds routes
+  rather than inventing free ones.
+- Candidates are then deduplicated by underlying model: namespacing
+  (`anthropic/claude-opus-5`), a `:free` suffix, and version punctuation
+  (`4.8` vs `4-8`) all collapse to one identity. The earlier provider in
+  `providers` wins, except that a free route always wins its identity — paying
+  for a model available for nothing is never the better recommendation.
+
+Both lists fall back to the defaults above when unset, empty, or malformed, so
+a broken override degrades to working defaults rather than reporting that no
+eligible route exists.
+
 ## Response
 
 A configured router returns:

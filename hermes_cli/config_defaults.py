@@ -664,7 +664,19 @@ DEFAULT_CONFIG = {
         },
     },
     # >>> FORK ANCHOR: model-recommendation-preset <<<
-    "model_recommendation": {"preset": "balanced"},
+    # `preset` is the composer's saved recommendation preference (balanced |
+    # save_codex | best_quality). `providers` scopes WHICH routes the advisory
+    # router may consider, in preference order — the full picker inventory is the
+    # wrong candidate set, because most aggregators resell the same frontier
+    # models and an unscoped router burns a paid call returning one model three
+    # times under three slugs. Candidates are deduplicated by underlying model,
+    # and the earlier provider wins a tie. `free_only_providers` admits a provider
+    # for its free tier only (its paid models are not candidates at all).
+    "model_recommendation": {
+        "preset": "balanced",
+        "providers": ["anthropic", "openai-codex", "nous"],
+        "free_only_providers": ["nous"],
+    },
     # Auxiliary model config — provider/model per side task. provider "auto" = auto-detect;
     # empty model = provider's default aux model; all tasks fall back to
     # openrouter:google/gemini-3-flash-preview when the configured provider is unavailable.

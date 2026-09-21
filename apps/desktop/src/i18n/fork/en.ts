@@ -127,7 +127,12 @@ export const forkEn: ForkTranslations = {
         unsupported: 'availability unknown'
       },
       limitReached: 'limit reached',
-      notAllowed: 'not available on your plan'
+      notAllowed: 'not available on your plan',
+      close: 'Close',
+      topPick: 'Top pick',
+      resultsHeading: 'Suggested models',
+      details: 'What gets checked',
+      freeRoute: 'Free'
     }
   },
   assistant: {

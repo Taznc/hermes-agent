@@ -487,3 +487,154 @@ def test_v1_input_bounds_and_partial_metadata_remain_compatible():
     # than silently request advice on a partial attachment inventory.
     assert service._safe_attachment_metadata([{"name": str(i)} for i in range(33)]) == [
         {"name": str(i)} for i in range(32)]
+
+
+# ── Candidate scoping: Claude, Codex, and Nous FREE models only ──────────────
+#
+# The picker's whole inventory is the wrong candidate set for an advisory call:
+# most aggregators resell the same frontier models, so an unscoped router spends
+# a paid call to return one model several times under several slugs. These pin
+# the two halves of the fix — which providers are in scope, and one route per
+# underlying model — so a future inventory change cannot quietly reintroduce
+# duplicate advice.
+
+def _candidate(provider: str, model: str, cost: str = "paid_or_unknown"):
+    return {
+        "provider": provider,
+        "model": model,
+        "capabilities": {"reasoning": True, "fast": False, "effort_options": list(service.EFFORTS)},
+        "cost": cost,
+    }
+
+
+@pytest.fixture
+def free_catalog(monkeypatch):
+    """Pin the free-tier catalog `scope_candidates` consults.
+
+    The real lookup is a live pricing fetch, deliberately NOT the picker's
+    cache-only view (which reports every model paid on a cold cache and would
+    silently drop the whole free tier). Tests state the catalog explicitly so
+    they assert scoping, not today's Nous price list.
+    """
+    def _install(*models: str) -> None:
+        monkeypatch.setattr(service, "_free_models", lambda _provider: frozenset(models))
+
+    _install()
+    return _install
+
+
+def test_scoping_keeps_only_claude_codex_and_nous_free_routes(free_catalog):
+    free_catalog("upstage/solar-pro4:free")
+    scoped = service.scope_candidates([
+        _candidate("anthropic", "claude-opus-5"),
+        _candidate("openai-codex", "gpt-6-astra"),
+        _candidate("nous", "upstage/solar-pro4:free"),
+        # Nous is admitted for its FREE tier only: a paid Nous route is not a
+        # candidate even though the provider is in scope.
+        _candidate("nous", "deepseek/deepseek-v4-pro"),
+        # Out of scope entirely, however well configured.
+        _candidate("xai-oauth", "grok-4.7"),
+        _candidate("openrouter", "some/model"),
+    ])
+
+    assert [(item["provider"], item["model"]) for item in scoped] == [
+        ("anthropic", "claude-opus-5"),
+        ("openai-codex", "gpt-6-astra"),
+        ("nous", "upstage/solar-pro4:free"),
+    ]
+    # The free tier is labelled free even when the picker's cold cache called it
+    # `paid_or_unknown` — the router must not be told a free route costs money.
+    assert scoped[-1]["cost"] == "free"
+
+
+def test_a_free_tier_that_cannot_be_proven_free_is_not_offered(free_catalog):
+    # Catalog unreachable (or the model simply is not free). Unknown pricing
+    # must read as "not proven free", never as free.
+    free_catalog()
+
+    assert service.scope_candidates([_candidate("nous", "deepseek/deepseek-v4-pro")]) == []
+
+
+def test_free_pricing_is_not_fetched_when_no_free_only_provider_is_in_scope(monkeypatch):
+    def explode(_provider):
+        raise AssertionError("pricing must not be fetched for a scope with no free-only provider")
+
+    monkeypatch.setattr(service, "_free_models", explode)
+    scoped = service.scope_candidates(
+        [_candidate("anthropic", "claude-opus-5")], ("anthropic", "openai-codex"), frozenset())
+
+    assert [item["model"] for item in scoped] == ["claude-opus-5"]
+
+
+def test_free_detection_reads_numeric_catalog_prices_not_a_literal_free_string(monkeypatch):
+    # The raw catalog prices models per token as numeric strings and NEVER as
+    # the word "free"; an earlier cut string-matched "free" and silently found
+    # zero free models, dropping the whole tier. Spellings of zero vary.
+    monkeypatch.setattr(
+        "hermes_cli.models_pricing.get_pricing_for_provider",
+        lambda _provider: {
+            "vendor/zero:free": {"prompt": "0", "completion": "0"},
+            "vendor/padded-zero:free": {"prompt": "0.0000000000", "completion": "0.0000000000"},
+            "vendor/input-only-free": {"prompt": "0", "completion": ""},
+            "vendor/cheap": {"prompt": "0.0000001400", "completion": "0.0000002800"},
+            "vendor/malformed": {"prompt": None, "completion": object()},
+            "vendor/not-a-dict": "nonsense",
+        },
+    )
+
+    assert service._free_models("nous") == frozenset(
+        {"vendor/zero:free", "vendor/padded-zero:free", "vendor/input-only-free"})
+
+
+def test_free_detection_fails_closed_when_the_catalog_is_unreachable(monkeypatch):
+    def explode(_provider):
+        raise RuntimeError("network down")
+
+    monkeypatch.setattr("hermes_cli.models_pricing.get_pricing_for_provider", explode)
+
+    # Unknown pricing is not evidence of a free tier.
+    assert service._free_models("nous") == frozenset()
+
+
+def test_scoping_offers_each_underlying_model_once_on_its_native_route(free_catalog):
+    free_catalog("anthropic/claude-opus-5")
+    # The exact duplication the user reported: one model, three slugs.
+    scoped = service.scope_candidates([
+        _candidate("anthropic", "claude-opus-5"),
+        _candidate("nous", "anthropic/claude-opus-5"),
+        _candidate("openai-codex", "gpt-6-astra"),
+        _candidate("nous", "openai/gpt-6-astra"),
+    ])
+
+    assert [(item["provider"], item["model"]) for item in scoped] == [
+        # Free wins its identity outright — never pay for a model available free.
+        ("openai-codex", "gpt-6-astra"),
+        ("nous", "anthropic/claude-opus-5"),
+    ]
+
+
+def test_model_identity_collapses_namespacing_free_suffix_and_version_punctuation():
+    assert service._model_identity("anthropic/claude-opus-4.8") == service._model_identity("claude-opus-4-8")
+    assert service._model_identity("upstage/solar-pro4:free") == service._model_identity("solar-pro4")
+    # Genuinely different models must NOT collapse, or advice silently vanishes.
+    assert service._model_identity("claude-opus-5") != service._model_identity("claude-sonnet-5")
+
+
+def test_scope_config_reads_overrides_and_falls_back_on_unusable_values():
+    assert service._scope_config({}) == (
+        service._DEFAULT_SCOPED_PROVIDERS, frozenset(service._DEFAULT_FREE_ONLY_PROVIDERS))
+    # Order is the dedupe priority, so it is preserved verbatim.
+    scoped, free_only = service._scope_config(
+        {"model_recommendation": {"providers": ["Nous", "anthropic", "nous"], "free_only_providers": []}})
+    assert scoped == ("nous", "anthropic")
+    # An empty list means "nothing configured", not "scope to nothing": falling
+    # through to a default beats reporting no eligible routes on a working setup.
+    assert free_only == frozenset(service._DEFAULT_FREE_ONLY_PROVIDERS) & {"nous", "anthropic"}
+    # A free-only entry outside the scope is inert rather than an error.
+    assert service._scope_config(
+        {"model_recommendation": {"providers": ["anthropic"], "free_only_providers": ["nous"]}})[1] == frozenset()
+
+
+def test_defaults_declare_the_recommendation_scope():
+    assert DEFAULT_CONFIG["model_recommendation"]["providers"] == ["anthropic", "openai-codex", "nous"]
+    assert DEFAULT_CONFIG["model_recommendation"]["free_only_providers"] == ["nous"]

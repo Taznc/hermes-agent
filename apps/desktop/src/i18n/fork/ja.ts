@@ -79,7 +79,12 @@ export const forkJa: TranslationOverrides = {
         unsupported: '空き状況は不明'
       },
       limitReached: '上限に達しました',
-      notAllowed: '現在のプランでは利用できません'
+      notAllowed: '現在のプランでは利用できません',
+      close: '閉じる',
+      topPick: 'おすすめ',
+      resultsHeading: 'モデルの候補',
+      details: '送信される情報',
+      freeRoute: '無料'
     }
   },
   settings: {

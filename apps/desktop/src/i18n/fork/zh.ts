@@ -122,7 +122,12 @@ export const forkZh: ForkTranslations = {
         unsupported: '可用性未知'
       },
       limitReached: '已达上限',
-      notAllowed: '你的方案不支持此路由'
+      notAllowed: '你的方案不支持此路由',
+      close: '关闭',
+      topPick: '首选',
+      resultsHeading: '推荐模型',
+      details: '检查哪些内容',
+      freeRoute: '免费'
     }
   },
   assistant: {
