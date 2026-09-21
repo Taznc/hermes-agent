@@ -1830,6 +1830,7 @@ export const ar = defineForkLocale(forkAr, {
     noSessions: 'لا توجد جلسات بعد',
     noFilterMatches: 'لا توجد جلسات تطابق عوامل التصفية هذه',
     projects: {
+      showAllSessions: 'عرض جميع الجلسات',
       sectionLabel: 'المشاريع',
       home: 'الرئيسية',
       newButton: 'مشروع جديد',

@@ -2,15 +2,14 @@ import { beforeEach, describe, expect, it } from 'vitest'
 
 import {
   $sidebarGrouping,
-  $sidebarListLimit,
   $sidebarOrdering,
   $sidebarRowMeta,
+  $sidebarShowAllSessions,
   $sidebarViewCustomized,
   resetSidebarView,
   setSidebarGrouping,
-  setSidebarListLimit,
   setSidebarOrdering,
-  SIDEBAR_LIST_LIMIT_OPTIONS,
+  setSidebarShowAllSessions,
   toggleSidebarRowMeta,
   toggleSidebarStatusFilter
 } from './layout'
@@ -22,6 +21,24 @@ beforeEach(() => {
 })
 
 describe('the sidebar as it ships', () => {
+  it('remembers expanded project previews across grouping changes and clears them on reset', () => {
+    expect($sidebarShowAllSessions.get()).toBe(false)
+
+    setSidebarGrouping('project')
+    setSidebarShowAllSessions(true)
+    setSidebarGrouping('date')
+
+    expect($sidebarShowAllSessions.get()).toBe(true)
+    expect($sidebarViewCustomized.get()).toBe(true)
+    expect(window.localStorage.getItem('hermes.desktop.sidebarShowAllSessions')).toBe('true')
+
+    resetSidebarView()
+
+    expect($sidebarShowAllSessions.get()).toBe(false)
+    expect($sidebarViewCustomized.get()).toBe(false)
+    expect(window.localStorage.getItem('hermes.desktop.sidebarShowAllSessions')).toBe('false')
+  })
+
   it('groups by date, sorts by recency, and pins the timestamp and preview', () => {
     expect($sidebarGrouping.get()).toBe('date')
     expect($sidebarOrdering.get()).toBe('updated')
@@ -77,40 +94,5 @@ describe('the sidebar as it ships', () => {
 
     expect($showAllProfiles.get()).toBe(true)
     expect($sidebarGrouping.get()).toBe('profile')
-  })
-})
-
-describe('the sidebar list-length setting', () => {
-  it('ships as "all" — every unarchived row, no load-more affordance', () => {
-    expect($sidebarListLimit.get()).toBe('all')
-  })
-
-  it('offers the documented picks in order: all, 10, 25, 50, 100', () => {
-    expect(SIDEBAR_LIST_LIMIT_OPTIONS).toEqual(['all', 10, 25, 50, 100])
-  })
-
-  it('trims to the numeric pick and reports the view as customized', () => {
-    setSidebarListLimit(25)
-
-    expect($sidebarListLimit.get()).toBe(25)
-    expect($sidebarViewCustomized.get()).toBe(true)
-  })
-
-  it('is not "customized" while still on the shipped default', () => {
-    expect($sidebarViewCustomized.get()).toBe(false)
-
-    setSidebarListLimit('all')
-
-    expect($sidebarViewCustomized.get()).toBe(false)
-  })
-
-  it('resetSidebarView returns it to "all" alongside every other knob', () => {
-    setSidebarGrouping('project')
-    setSidebarListLimit(50)
-
-    resetSidebarView()
-
-    expect($sidebarListLimit.get()).toBe('all')
-    expect($sidebarViewCustomized.get()).toBe(false)
   })
 })
