@@ -204,10 +204,28 @@ describe('Recommend results surface', () => {
     const rows = screen.getAllByTestId('composer-recommend-row')
 
     expect(rows).toHaveLength(2)
-    expect(rows[0].textContent).toContain('openai-codex')
-    expect(rows[0].textContent).toContain('gpt-5.6-terra')
-    expect(rows[1].textContent).toContain('anthropic')
-    expect(rows[1].textContent).toContain('claude-opus-5')
+    // Rows render the app's own display names, not raw routing identifiers:
+    // a provider slug is an id, and `gpt-5.6-terra` is how the catalog stores
+    // a model, not how the rest of the app spells it. The ORDER is still the
+    // backend's, and no family is hardcoded — the label comes from the shared
+    // `providerFamilyLabel`, which falls back to a title-cased slug.
+    expect(rows[0].textContent).toContain('Codex')
+    expect(rows[0].textContent).toContain('GPT-5.6-terra')
+    expect(rows[1].textContent).toContain('Claude')
+    expect(rows[1].textContent).toContain('Opus 5')
+  })
+
+  it('marks only the backend top-ranked row as the top pick', async () => {
+    setup()
+    await openResults()
+
+    const picks = screen.getAllByTestId('composer-recommend-top-pick')
+    const rows = screen.getAllByTestId('composer-recommend-row')
+
+    // The backend already ranked under the active preset, so the panel leads
+    // with an answer instead of a list the user must re-rank themselves.
+    expect(picks).toHaveLength(1)
+    expect(rows[0].contains(picks[0])).toBe(true)
   })
 
   it('shows the reason and effort each row carries', async () => {
@@ -741,6 +759,24 @@ describe('Preset selector', () => {
 })
 
 describe('Keyboard and focus behaviour', () => {
+  it('closes the results with the panel close control', async () => {
+    const { draftRef, request } = setup()
+
+    await openResults()
+    fireEvent.click(screen.getByTestId('composer-recommend-close'))
+
+    // A pointer user needs a visible way out: the panel is a persistent
+    // surface inside the composer, not a popover that dismisses on outside
+    // click, so without this control Escape is the only exit and that is
+    // invisible to anyone using a mouse.
+    await waitFor(() => expect(screen.queryByTestId('composer-recommend-panel')).toBeNull())
+    // Dismissing is not editing or re-requesting.
+    expect(draftRef.current).toBe('Refactor the parser for me')
+    expect(request.mock.calls.filter(([method]) => method === 'model_recommendation.get')).toHaveLength(1)
+    // The trigger survives the dismissal, so the user can check again.
+    expect(recommendButton().hasAttribute('disabled')).toBe(false)
+  })
+
   it('closes the results on Escape pressed from the element that actually has focus', async () => {
     const { draftRef } = setup()
 

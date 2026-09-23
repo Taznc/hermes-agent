@@ -17,6 +17,20 @@ EFFORTS = ("none", "minimal", "low", "medium", "high", "xhigh", "max", "ultra")
 _AVAILABILITY_FRESH_SECONDS = 900
 _UNAVAILABLE = "Model recommendation router is not configured."
 
+# Which routes this advisory surface is allowed to consider, in PREFERENCE order.
+#
+# The picker's full inventory is the wrong candidate set for a recommendation: it
+# offers ~40 providers, most of them aggregators reselling the same few frontier
+# models, so an unscoped router spends a paid call to return the same model three
+# times under three slugs. The scope is the small set of routes whose capacity the
+# profile actually owns, and the order is also the DEDUPE priority — a model
+# reachable natively and through an aggregator is offered on its native route.
+_DEFAULT_SCOPED_PROVIDERS = ("anthropic", "openai-codex", "nous")
+# Providers admitted for their free tier only. An aggregator earns a slot here by
+# costing nothing, not by reselling a frontier model the profile can already reach
+# natively — so a paid route on one of these is not a candidate at all.
+_DEFAULT_FREE_ONLY_PROVIDERS = ("nous",)
+
 _OUTPUT_SCHEMA = {
     "name": "model_recommendations",
     "strict": True,
@@ -131,8 +145,56 @@ def _availability_payload(providers: set[str]) -> dict[str, dict[str, Any]]:
     return result
 
 
+def _scope_config(config: dict[str, Any]) -> tuple[tuple[str, ...], frozenset[str]]:
+    """Resolve ``(scoped_providers, free_only_providers)`` from config.
+
+    Both lists are user-overridable under ``model_recommendation:`` so a profile
+    with different subscriptions is not stuck with this fork's defaults. Order is
+    meaningful and preserved; unknown/blank entries are dropped, and an empty or
+    malformed list falls back to the default rather than silently scoping to
+    nothing (which would report "no eligible routes" on a working setup).
+    """
+    section = config.get("model_recommendation") if isinstance(config, dict) else None
+    section = section if isinstance(section, dict) else {}
+
+    def _slugs(key: str, fallback: tuple[str, ...]) -> tuple[str, ...]:
+        raw = section.get(key)
+        if not isinstance(raw, list):
+            return fallback
+        seen: dict[str, None] = {}
+        for item in raw:
+            if isinstance(item, str) and (slug := item.strip().lower()):
+                seen.setdefault(slug, None)
+        return tuple(seen) or fallback
+
+    scoped = _slugs("providers", _DEFAULT_SCOPED_PROVIDERS)
+    # Free-only entries outside the scope are inert, but keeping them out of the
+    # set makes the two settings independent to reason about.
+    free_only = frozenset(_slugs("free_only_providers", _DEFAULT_FREE_ONLY_PROVIDERS)) & frozenset(scoped)
+    return scoped, free_only
+
+
+def _model_identity(model: str) -> str:
+    """Collapse the same underlying model across routes to one identity.
+
+    An aggregator namespaces what it resells (``anthropic/claude-opus-5``) and a
+    free tier suffixes it (``…:free``); neither is a different model from the
+    native ``claude-opus-5``. Punctuation inside the version is normalized too,
+    because catalogs disagree on ``4.8`` vs ``4-8`` for one identical model.
+    """
+    base = model.strip().lower().split(":", 1)[0]
+    base = base.rsplit("/", 1)[-1]
+    return base.replace(".", "-").strip("-")
+
+
 def discover_eligible_candidates() -> list[dict[str, Any]]:
-    """Return validated configured/authenticated inventory routes, never credentials."""
+    """Return validated configured/authenticated inventory routes, never credentials.
+
+    Returns the whole authenticated inventory. Narrowing it to the routes this
+    fork will actually recommend is ``scope_candidates``'s job — discovery
+    answers "what can this profile reach", scoping answers "what should we
+    offer", and keeping them apart makes each testable without the other.
+    """
     from hermes_cli.inventory import build_model_options_payload, load_picker_context
     from hermes_cli.providers import HERMES_OVERLAYS
 
@@ -157,13 +219,17 @@ def discover_eligible_candidates() -> list[dict[str, Any]]:
             model for model in (row.get("unavailable_models") or [])
             if isinstance(model, str)
         }
-        capabilities = row.get("capabilities") if isinstance(row.get("capabilities"), dict) else {}
-        pricing = row.get("pricing") if isinstance(row.get("pricing"), dict) else {}
+        capabilities = row.get("capabilities")
+        capabilities = capabilities if isinstance(capabilities, dict) else {}
+        pricing = row.get("pricing")
+        pricing = pricing if isinstance(pricing, dict) else {}
         for model in row.get("models") or []:
             if not isinstance(model, str) or not model.strip() or model in unavailable_models:
                 continue
-            caps = capabilities.get(model) if isinstance(capabilities.get(model), dict) else {}
-            price = pricing.get(model) if isinstance(pricing.get(model), dict) else {}
+            caps = capabilities.get(model)
+            caps = caps if isinstance(caps, dict) else {}
+            price = pricing.get(model)
+            price = price if isinstance(price, dict) else {}
             reasoning = bool(caps.get("reasoning", False))
             candidates.append({
                 "provider": provider,
@@ -178,12 +244,101 @@ def discover_eligible_candidates() -> list[dict[str, Any]]:
     return candidates
 
 
+def _free_models(provider: str) -> frozenset[str]:
+    """Model ids this provider serves for free, from its live pricing catalog.
+
+    The picker's inventory carries CACHE-ONLY pricing so a cold endpoint can
+    never block a menu open, which means a cold cache reports every model as
+    `paid_or_unknown`. For a free-only provider that is indistinguishable from
+    "this provider has nothing free" and silently drops the whole tier. A
+    recommendation is a deliberate, user-initiated action that already spends a
+    router call, so resolving pricing for real is proportionate here (the
+    catalog is itself cached for an hour downstream).
+
+    Failures return empty: unknown pricing must read as "not proven free",
+    never as free. That keeps a paid model off a free-only route even when the
+    catalog is unreachable.
+    """
+    try:
+        from hermes_cli.models_pricing import _format_price_per_mtok, get_pricing_for_provider
+
+        pricing = get_pricing_for_provider(provider) or {}
+    except Exception:
+        return frozenset()
+    # Raw catalog prices are per-token numeric strings ("0", "0.0000000000",
+    # "0.0000043500") — never the literal "free". Reuse the picker's own
+    # formatter rather than string-matching them, so a zero-price model is
+    # recognised however that catalog chose to spell zero.
+    free: set[str] = set()
+    for model, entry in pricing.items():
+        if not isinstance(model, str) or not isinstance(entry, dict):
+            continue
+        prompt_raw, completion_raw = entry.get("prompt", ""), entry.get("completion", "")
+        try:
+            # Guard the empty string BEFORE formatting, exactly as the picker's
+            # own `_apply_pricing` does — the formatter does not round-trip ""
+            # to "", so formatting it first would misread an unpriced output
+            # direction as a real (non-free) price.
+            prompt = _format_price_per_mtok(prompt_raw) if prompt_raw != "" else ""
+            completion = _format_price_per_mtok(completion_raw) if completion_raw != "" else ""
+        except Exception:
+            continue
+        # Both directions must cost nothing — mirrors `_apply_pricing`'s own
+        # `free` flag, so the two never disagree about what "free" means.
+        if prompt == "free" and completion in ("free", ""):
+            free.add(model)
+    return frozenset(free)
+
+
+def scope_candidates(
+    candidates: list[dict[str, Any]],
+    scoped_providers: tuple[str, ...] = _DEFAULT_SCOPED_PROVIDERS,
+    free_only_providers: frozenset[str] = frozenset(_DEFAULT_FREE_ONLY_PROVIDERS),
+) -> list[dict[str, Any]]:
+    """Narrow discovery output to the routes worth spending a router call on.
+
+    Three passes, in order: keep only in-scope providers; drop paid models on a
+    free-only provider; then keep ONE route per underlying model. A model the
+    profile can reach both natively and through an aggregator is offered on the
+    higher-priority route, except that a free route always wins its identity —
+    paying for a model available for nothing is never the better advice.
+    """
+    rank = {slug: index for index, slug in enumerate(scoped_providers)}
+    # Resolved lazily and once per provider: a scope with no free-only provider
+    # in it must not pay for a pricing lookup nobody reads.
+    free_by_provider: dict[str, frozenset[str]] = {}
+    best: dict[str, dict[str, Any]] = {}
+    for candidate in candidates:
+        provider = candidate["provider"]
+        if provider not in rank:
+            continue
+        cost = candidate["cost"]
+        if provider in free_only_providers:
+            if provider not in free_by_provider:
+                free_by_provider[provider] = _free_models(provider)
+            if candidate["model"] not in free_by_provider[provider]:
+                continue
+            # Proven free by the live catalog — correct the cache-cold label so
+            # the dedupe pass below can prefer it, and the router sees the truth.
+            cost = "free"
+            candidate = {**candidate, "cost": cost}
+        identity = _model_identity(candidate["model"])
+        incumbent = best.get(identity)
+        key = (cost != "free", rank[provider])
+        if incumbent is None or key < (incumbent["cost"] != "free", rank[incumbent["provider"]]):
+            best[identity] = candidate
+    # Stable, provider-grouped output: the router reads a tidy list, and the
+    # candidate set is deterministic for a given inventory (easier to debug).
+    return sorted(best.values(), key=lambda item: (rank[item["provider"]], item["model"]))
+
+
 def _router_messages(draft: str, attachments: list[dict[str, Any]], policy: str,
                      candidates: list[dict[str, Any]], availability: dict[str, dict[str, Any]]) -> list[dict[str, str]]:
     instruction = (
-        "Choose exactly one route per provider from the supplied candidates: you must include a "
-        "recommendation for every distinct provider present in candidates, never omit an eligible "
-        "provider even if it looks weaker, and pick at most one model within each provider. "
+        "Choose one route per provider present in the candidates: include every distinct provider, "
+        "never omit an eligible one even if it looks weaker, and pick at most one model within each "
+        "provider. The candidates are already deduplicated — each entry is a different underlying "
+        "model, so never return two routes you believe are the same model. "
         "Return only the strict JSON schema. "
         "Use the complete unsent draft and attachment metadata, not hidden context. If the request is ambiguous, "
         "set ambiguous=true and choose a conservative higher effort with a concise reason. "
@@ -306,11 +461,13 @@ def recommend(*, draft: Any, attachments: Any, policy: Any) -> dict[str, Any]:
     if policy not in POLICIES:
         raise ValueError("policy must be balanced, save_codex, or best_quality")
     from hermes_cli.config import load_config
-    router = _router_config(load_config())
+    config = load_config()
+    router = _router_config(config)
     if router is None:
         return unavailable()
     safe_attachments = _safe_attachment_metadata(attachments)
-    candidates = discover_eligible_candidates()
+    scoped_providers, free_only_providers = _scope_config(config)
+    candidates = scope_candidates(discover_eligible_candidates(), scoped_providers, free_only_providers)
     if not candidates:
         return unavailable("No configured authenticated model routes are eligible.")
     availability = _availability_payload({item["provider"] for item in candidates})

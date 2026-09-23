@@ -55,7 +55,12 @@ export const forkAr: TranslationOverrides = {
         unsupported: 'التوفر غير معروف'
       },
       limitReached: 'تم بلوغ الحد',
-      notAllowed: 'غير متاح في خطتك'
+      notAllowed: 'غير متاح في خطتك',
+      close: 'إغلاق',
+      topPick: 'الخيار الأفضل',
+      resultsHeading: 'النماذج المقترحة',
+      details: 'ما الذي يتم فحصه',
+      freeRoute: 'مجاني'
     }
   },
   settings: {

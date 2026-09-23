@@ -76,7 +76,12 @@ export const forkZhHant: TranslationOverrides = {
         unsupported: '可用性未知'
       },
       limitReached: '已達上限',
-      notAllowed: '你的方案不支援此路由'
+      notAllowed: '你的方案不支援此路由',
+      close: '關閉',
+      topPick: '首選',
+      resultsHeading: '推薦模型',
+      details: '檢查哪些內容',
+      freeRoute: '免費'
     }
   },
   settings: {

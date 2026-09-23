@@ -7,10 +7,12 @@ import type {
   ModelSelectionRecovery,
   RecommendedModelSelection
 } from '@/app/session/hooks/use-model-controls'
+import { Badge } from '@/components/ui/badge'
 import { Button } from '@/components/ui/button'
 import { Codicon } from '@/components/ui/codicon'
 import { SegmentedControl, type SegmentedControlOption } from '@/components/ui/segmented-control'
 import { useI18n } from '@/i18n'
+import { modelDisplayParts, providerFamilyLabel } from '@/lib/model-status-label'
 import type { ComposerAttachment } from '@/store/composer'
 
 import {
@@ -419,6 +421,11 @@ export function ComposerRecommend({
           <Codicon name="lightbulb" size="0.75rem" />
           <span className="truncate">{copy.trigger}</span>
         </Button>
+        {/* The preset stays OUT here, beside the trigger, because it is a
+            PRE-request control: it decides the policy the request is made
+            under. Moving it into the results panel would mean a user could not
+            express "best quality" without first spending a router call under
+            the wrong preset. */}
         <div aria-label={copy.presetLabel} className="flex min-w-0 flex-wrap items-center gap-1" role="group">
           {/* The track is live from the first paint — a user who wants Best
               quality should not have to wait on a config read to say so — but
@@ -469,138 +476,257 @@ export function ComposerRecommend({
       {open ? (
         <div
           aria-label={copy.resultsLabel}
-          className="flex min-w-0 flex-col gap-1 text-xs"
+          className="flex min-w-0 flex-col overflow-hidden rounded-md bg-(--ui-bg-secondary) text-xs shadow-[inset_0_0_0_1px_color-mix(in_srgb,var(--ui-stroke-secondary)_50%,transparent)]"
           data-testid="composer-recommend-panel"
           id={panelId}
           role="region"
           tabIndex={-1}
         >
-          <p className="text-(--ui-text-tertiary)" data-testid="composer-recommend-privacy">
-            {copy.privacy}
-          </p>
-          {blockedNote ? (
-            <p data-testid="composer-recommend-ineligible" role="status">
-              {blockedNote}
-            </p>
-          ) : null}
-          {pending ? (
-            <p data-testid="composer-recommend-pending" role="status">
-              {copy.pending}
-            </p>
-          ) : null}
-          {stale ? (
-            <p className="flex flex-wrap items-center gap-2" data-testid="composer-recommend-stale" role="status">
-              <span>{copy.stale}</span>
-              <Button
-                data-testid="composer-recommend-refresh-stale"
-                onClick={() => void runRequest()}
-                size="sm"
-                type="button"
-                variant="text"
+          {/* HEADER — title, the preset track, and the close control. The panel
+              is a persistent surface inside the composer rather than a popover,
+              so it needs an explicit way out: Escape alone is invisible to a
+              pointer user, which is how a result list becomes stuck chrome
+              sitting above the send button. */}
+          <div className="flex min-w-0 flex-wrap items-center gap-x-2 gap-y-1 px-2 py-1.5">
+            <span className="flex min-w-0 items-center gap-1 font-medium text-(--ui-text-primary)">
+              <Codicon className="text-(--ui-text-tertiary)" name="lightbulb" size="0.75rem" />
+              <span className="truncate">{copy.resultsHeading}</span>
+            </span>
+            <Button
+              aria-label={copy.close}
+              className="ml-auto"
+              data-testid="composer-recommend-close"
+              onClick={() => setOpen(false)}
+              size="icon-xs"
+              type="button"
+              variant="ghost"
+            >
+              <Codicon name="close" size="0.75rem" />
+            </Button>
+          </div>
+          <div className="flex min-w-0 flex-col gap-1.5 px-2 pb-2">
+            {blockedNote ? (
+              <p data-testid="composer-recommend-ineligible" role="status">
+                {blockedNote}
+              </p>
+            ) : null}
+            {pending ? (
+              <p
+                className="flex items-center gap-1.5 text-(--ui-text-tertiary)"
+                data-testid="composer-recommend-pending"
+                role="status"
               >
-                {copy.refresh}
-              </Button>
-            </p>
-          ) : null}
-          {!pending && live?.status === 'unsupported' ? (
-            <p data-testid="composer-recommend-unsupported">{copy.unsupported}</p>
-          ) : null}
-          {!pending && live?.status === 'unavailable' ? (
-            <p data-testid="composer-recommend-unavailable">{live.reason || copy.unavailable}</p>
-          ) : null}
-          {!pending && live?.status === 'failed' ? (
-            <p className="flex flex-wrap items-center gap-2" data-testid="composer-recommend-failed">
-              <span>{copy.failed}</span>
-              <Button
-                data-testid="composer-recommend-retry"
-                onClick={() => void runRequest()}
-                size="sm"
-                type="button"
-                variant="text"
-              >
-                {copy.retry}
-              </Button>
-            </p>
-          ) : null}
-          {!pending && live?.status === 'ok'
-            ? live.recommendations.map(row => {
-                const key = rowKey(row)
-                const availability = row.availability
-                // The backend's own verdict on whether this route can be used
-                // right now. Rendering Apply on a limit-reached route would
-                // offer a switch the gateway will refuse.
-                const usable = availability?.allowed !== false && availability?.limit_reached !== true
-
-                return (
-                  <div
-                    className="flex min-w-0 flex-wrap items-baseline gap-x-2 gap-y-0.5"
-                    data-testid="composer-recommend-row"
-                    key={key}
-                  >
-                    <span className="min-w-0 break-words font-medium">
-                      {row.provider} · {row.model}
-                    </span>
-                    {row.effort ? <span className="text-(--ui-text-tertiary)">{row.effort}</span> : null}
-                    {/* Reported states are shown verbatim — INCLUDING `fresh`.
-                        Suppressing it made "checked, live" look identical to
-                        "never reported", which is the freshness claim the card
-                        asks for. Absent availability still prints nothing. */}
-                    {availability?.status ? (
-                      <span className="text-(--ui-text-tertiary)" data-testid="composer-recommend-availability">
-                        {copy.availability[availability.status]}
-                      </span>
-                    ) : null}
-                    {availability?.limit_reached ? (
-                      <span className="text-(--ui-text-tertiary)" data-testid="composer-recommend-limit-reached">
-                        {copy.limitReached}
-                      </span>
-                    ) : null}
-                    {availability?.allowed === false && !availability.limit_reached ? (
-                      <span className="text-(--ui-text-tertiary)" data-testid="composer-recommend-not-allowed">
-                        {copy.notAllowed}
-                      </span>
-                    ) : null}
-                    {row.reason ? (
-                      <span className="min-w-0 basis-full break-words text-(--ui-text-tertiary)">{row.reason}</span>
-                    ) : null}
-                    {usable ? (
-                      <Button
-                        data-testid="composer-recommend-apply"
-                        disabled={apply.kind === 'applying'}
-                        onClick={() => void applyRecommendation(row)}
-                        size="sm"
-                        type="button"
-                        variant="text"
-                      >
-                        {copy.apply}
-                      </Button>
-                    ) : null}
-                    {apply.kind === 'unconfirmed' && apply.row === key ? (
-                      <span data-testid="composer-recommend-apply-unconfirmed">{copy.applyUnconfirmed}</span>
-                    ) : null}
-                    {/* Two distinct honest reports, never one blurred message:
-                        a rolled-back failure leaves the previous model in use,
-                        while a refused compensation may have left the backend
-                        on the new one and must say so instead of claiming a
-                        rollback the gateway rejected. */}
-                    {apply.kind === 'failed' && apply.row === key && apply.recovery !== 'restore_failed' ? (
-                      <span className="min-w-0 basis-full break-words" data-testid="composer-recommend-apply-failed">
-                        {copy.applyFailed}
-                      </span>
-                    ) : null}
-                    {apply.kind === 'failed' && apply.row === key && apply.recovery === 'restore_failed' ? (
-                      <span
-                        className="min-w-0 basis-full break-words"
-                        data-testid="composer-recommend-apply-unrestored"
-                      >
-                        {copy.applyUnrestored}
-                      </span>
-                    ) : null}
-                  </div>
-                )
-              })
-            : null}
+                <Codicon className="animate-spin" name="loading" size="0.75rem" />
+                {copy.pending}
+              </p>
+            ) : null}
+            {stale ? (
+              <p className="flex flex-wrap items-center gap-2" data-testid="composer-recommend-stale" role="status">
+                <span>{copy.stale}</span>
+                <Button
+                  data-testid="composer-recommend-refresh-stale"
+                  onClick={() => void runRequest()}
+                  size="sm"
+                  type="button"
+                  variant="text"
+                >
+                  {copy.refresh}
+                </Button>
+              </p>
+            ) : null}
+            {!pending && live?.status === 'unsupported' ? (
+              <p data-testid="composer-recommend-unsupported">{copy.unsupported}</p>
+            ) : null}
+            {!pending && live?.status === 'unavailable' ? (
+              <p data-testid="composer-recommend-unavailable">{live.reason || copy.unavailable}</p>
+            ) : null}
+            {!pending && live?.status === 'failed' ? (
+              <p className="flex flex-wrap items-center gap-2" data-testid="composer-recommend-failed">
+                <span>{copy.failed}</span>
+                <Button
+                  data-testid="composer-recommend-retry"
+                  onClick={() => void runRequest()}
+                  size="sm"
+                  type="button"
+                  variant="text"
+                >
+                  {copy.retry}
+                </Button>
+              </p>
+            ) : null}
+            {!pending && live?.status === 'ok'
+              ? live.recommendations.map((row, index) => (
+                  <RecommendationCard
+                    applyState={apply}
+                    copy={copy}
+                    key={rowKey(row)}
+                    onApply={() => void applyRecommendation(row)}
+                    row={row}
+                    // The backend already ranked under the active preset, so
+                    // the first row IS the answer. Saying so turns a list the
+                    // user has to re-rank themselves into a recommendation.
+                    topPick={index === 0 && !stale}
+                  />
+                ))
+              : null}
+            {/* The disclosure sits LAST and closed: the privacy boundary must
+                stay one click away, but leading with it buried the actual
+                advice under a paragraph nobody re-reads after the first time. */}
+            <details className="group min-w-0">
+              <summary className="inline-flex cursor-pointer list-none items-center gap-1 text-[0.6875rem] text-(--ui-text-tertiary) transition-colors hover:text-(--ui-text-secondary) [&::-webkit-details-marker]:hidden">
+                <Codicon
+                  className="transition-transform group-open:rotate-90"
+                  name="chevron-right"
+                  size="0.6875rem"
+                />
+                {copy.details}
+              </summary>
+              <div className="flex flex-col gap-1 pt-1 pl-3.5">
+                <p className="text-[0.6875rem] text-(--ui-text-tertiary)" data-testid="composer-recommend-privacy">
+                  {copy.privacy}
+                </p>
+              </div>
+            </details>
+          </div>
         </div>
+      ) : null}
+    </div>
+  )
+}
+
+/**
+ * One recommended route, as a card.
+ *
+ * A card rather than a run of inline spans because the three things it carries
+ * answer different questions and were previously indistinguishable inside one
+ * wrapped line of text: WHAT the route is (model, provider, effort), WHETHER it
+ * can be used right now (availability, limits), and WHY it was picked (the
+ * router's reason). Apply is a real button here — the primary action of the
+ * card it belongs to — not a text link trailing the prose.
+ */
+function RecommendationCard({
+  applyState,
+  copy,
+  onApply,
+  row,
+  topPick
+}: {
+  applyState: ApplyState
+  copy: ReturnType<typeof useI18n>['t']['composer']['recommend']
+  onApply: () => void
+  row: ModelRecommendation
+  topPick: boolean
+}) {
+  const key = rowKey(row)
+  const availability = row.availability
+  // The backend's own verdict on whether this route can be used right now.
+  // Rendering Apply on a limit-reached route would offer a switch the gateway
+  // will refuse.
+  const usable = availability?.allowed !== false && availability?.limit_reached !== true
+  const mine = applyState.row === key
+  const applying = applyState.kind === 'applying'
+  // A provider slug is an identifier, not a label: the card says "Claude" and
+  // "Codex" where the rest of the app does, and falls back to a title-cased
+  // slug for anything else rather than inventing a family name.
+  const providerLabel = providerFamilyLabel(row.provider) ?? row.provider
+  const { name, tag } = modelDisplayParts(row.model)
+
+  return (
+    <div
+      className="flex min-w-0 flex-col gap-1 rounded-[5px] bg-(--ui-bg-primary) px-2 py-1.5 shadow-[inset_0_0_0_1px_color-mix(in_srgb,var(--ui-stroke-secondary)_35%,transparent)]"
+      data-testid="composer-recommend-row"
+    >
+      <div className="flex min-w-0 flex-wrap items-center gap-x-1.5 gap-y-1">
+        <span className="min-w-0 truncate font-medium text-(--ui-text-primary)">{name}</span>
+        {tag ? <span className="text-(--ui-text-tertiary)">{tag}</span> : null}
+        <Badge size="xs" variant="muted">
+          {providerLabel}
+        </Badge>
+        {row.effort ? (
+          <Badge size="xs" variant="outline">
+            {row.effort}
+          </Badge>
+        ) : null}
+        {topPick ? (
+          <Badge data-testid="composer-recommend-top-pick" size="xs" variant="default">
+            {copy.topPick}
+          </Badge>
+        ) : null}
+        {usable ? (
+          <Button
+            className="ml-auto"
+            data-testid="composer-recommend-apply"
+            disabled={applying}
+            onClick={onApply}
+            size="xs"
+            type="button"
+            variant="secondary"
+          >
+            {applying && mine ? <Codicon className="animate-spin" name="loading" size="0.6875rem" /> : null}
+            {copy.apply}
+          </Button>
+        ) : null}
+      </div>
+      {availability?.status || availability?.limit_reached || availability?.allowed === false ? (
+        <div className="flex min-w-0 flex-wrap items-center gap-1">
+          {/* Reported states are shown verbatim — INCLUDING `fresh`.
+              Suppressing it made "checked, live" look identical to "never
+              reported", which is the freshness claim the card asks for. Absent
+              availability still prints nothing. */}
+          {availability?.status ? (
+            <Badge
+              data-testid="composer-recommend-availability"
+              size="xs"
+              variant={
+                availability.status === 'fresh'
+                  ? 'success'
+                  : availability.status === 'unavailable' || availability.status === 'failed'
+                    ? 'destructive'
+                    : 'muted'
+              }
+            >
+              {copy.availability[availability.status]}
+            </Badge>
+          ) : null}
+          {availability?.limit_reached ? (
+            <Badge data-testid="composer-recommend-limit-reached" size="xs" variant="warn">
+              {copy.limitReached}
+            </Badge>
+          ) : null}
+          {availability?.allowed === false && !availability.limit_reached ? (
+            <Badge data-testid="composer-recommend-not-allowed" size="xs" variant="warn">
+              {copy.notAllowed}
+            </Badge>
+          ) : null}
+        </div>
+      ) : null}
+      {row.reason ? (
+        <p className="min-w-0 break-words text-[0.6875rem] leading-4 text-(--ui-text-tertiary)">{row.reason}</p>
+      ) : null}
+      {applyState.kind === 'unconfirmed' && mine ? (
+        <p className="text-[0.6875rem] text-(--ui-text-secondary)" data-testid="composer-recommend-apply-unconfirmed">
+          {copy.applyUnconfirmed}
+        </p>
+      ) : null}
+      {/* Two distinct honest reports, never one blurred message: a rolled-back
+          failure leaves the previous model in use, while a refused compensation
+          may have left the backend on the new one and must say so instead of
+          claiming a rollback the gateway rejected. */}
+      {applyState.kind === 'failed' && mine && applyState.recovery !== 'restore_failed' ? (
+        <p
+          className="min-w-0 break-words text-[0.6875rem] text-destructive"
+          data-testid="composer-recommend-apply-failed"
+        >
+          {copy.applyFailed}
+        </p>
+      ) : null}
+      {applyState.kind === 'failed' && mine && applyState.recovery === 'restore_failed' ? (
+        <p
+          className="min-w-0 break-words text-[0.6875rem] text-destructive"
+          data-testid="composer-recommend-apply-unrestored"
+        >
+          {copy.applyUnrestored}
+        </p>
       ) : null}
     </div>
   )

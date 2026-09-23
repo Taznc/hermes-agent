@@ -144,6 +144,20 @@ export interface ForkTranslations {
       limitReached: string
       /** The backend reported this route is not permitted right now. */
       notAllowed: string
+      /** Dismisses the results panel. The panel is a persistent surface inside
+       *  the composer, not a popover — without an explicit control the only way
+       *  out is Escape, which is invisible to a pointer user. */
+      close: string
+      /** Marks the top-ranked row under the active preset, so the panel leads
+       *  with an answer instead of a list the user must re-rank themselves. */
+      topPick: string
+      /** Heading above the result rows. */
+      resultsHeading: string
+      /** Collapses the privacy/preset detail behind a control, so the default
+       *  view is the recommendation rather than the disclosure. */
+      details: string
+      /** The route costs nothing to run — worth surfacing next to the name. */
+      freeRoute: string
     }
   }
   assistant: {
