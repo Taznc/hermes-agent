@@ -462,6 +462,21 @@ def test_router_input_contains_draft_and_safe_attachment_metadata_only(monkeypat
     assert result["recommendations"][0]["effort"] == "high"
 
 
+def test_router_instruction_requires_covering_every_candidate_provider():
+    """The strict parser fails closed whenever the router omits an eligible provider
+    (see test_router_output_omitting_an_eligible_provider_fails_closed). With a wide
+    candidate pool (multiple providers, e.g. nous/anthropic/openai-codex/xai-oauth) the
+    router was observed dropping providers because the instruction only said "at most
+    one route per provider" and never told it every provider must be present, so real
+    calls with 3+ distinct providers failed closed 100% of the time. The instruction
+    must say so explicitly."""
+    messages = service._router_messages("Draft", [], "balanced", CANDIDATES, {})
+    instruction = messages[0]["content"]
+
+    assert "every distinct provider" in instruction or "every provider" in instruction
+    assert "omit" in instruction.lower()
+
+
 def test_router_output_omitting_an_eligible_provider_fails_closed():
     incomplete = (
         '{"task_risk":"low","ambiguous":false,"recommendations":['
