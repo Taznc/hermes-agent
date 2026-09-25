@@ -2470,7 +2470,12 @@ export const zhHant = defineForkLocale(forkZhHant, {
       branchOffFrom: base => `從 ${base} 建立新分支`,
       switchTo: branch => `切換到 ${branch}`,
       switchFailed: branch => `無法切換到 ${branch}`,
-      worktrees: '工作樹'
+      worktrees: '工作樹',
+      riskUncommitted: count => `${count} 個變更檔案`,
+      riskUnpushed: count => `${count} 個未推送提交`,
+      riskUnmerged: base => `尚未合併到 ${base}`,
+      riskConflicted: '合併衝突',
+      riskUnknown: '無法取得 Git 狀態'
     }
   },
 

@@ -2924,7 +2924,12 @@ export const en: Translations = withForkKeys(forkEn, {
       branchOffFrom: base => `New branch from ${base}`,
       switchTo: branch => `Switch to ${branch}`,
       switchFailed: branch => `Could not switch to ${branch}`,
-      worktrees: 'Worktrees'
+      worktrees: 'Worktrees',
+      riskUncommitted: count => `${count} changed file${count === 1 ? '' : 's'}`,
+      riskUnpushed: count => `${count} commit${count === 1 ? '' : 's'} not pushed`,
+      riskUnmerged: base => `Not merged into ${base}`,
+      riskConflicted: 'Merge conflicts',
+      riskUnknown: 'Git status unavailable'
     }
   },
 

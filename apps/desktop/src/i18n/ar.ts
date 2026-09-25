@@ -2204,7 +2204,12 @@ export const ar = defineForkLocale(forkAr, {
       branchOffFrom: base => `فرع جديد من ${base}`,
       switchTo: branch => `التبديل إلى ${branch}`,
       switchFailed: branch => `تعذّر التبديل إلى ${branch}`,
-      worktrees: 'أشجار العمل'
+      worktrees: 'أشجار العمل',
+      riskUncommitted: count => `${count} ملف تم تغييره`,
+      riskUnpushed: count => `${count} عملية ارتكاب لم تُدفع`,
+      riskUnmerged: base => `غير مدمج في ${base}`,
+      riskConflicted: 'تعارضات دمج',
+      riskUnknown: 'حالة Git غير متاحة'
     }
   },
   updates: {

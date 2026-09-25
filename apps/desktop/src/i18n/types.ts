@@ -2520,6 +2520,11 @@ export interface UpstreamTranslations {
       switchTo: (branch: string) => string
       switchFailed: (branch: string) => string
       worktrees: string
+      riskUncommitted: (count: number) => string
+      riskUnpushed: (count: number) => string
+      riskUnmerged: (base: string) => string
+      riskConflicted: string
+      riskUnknown: string
     }
   }
 

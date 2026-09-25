@@ -1385,6 +1385,13 @@ export interface HermesRepoStatus {
   // files aren't in the diff, so they don't contribute lines.
   added: number
   removed: number
+  // Commits on HEAD not yet pushed: `@{upstream}`'s count when one is
+  // configured, else HEAD's lead over `defaultBranch` (local-only branch).
+  unpushed: number
+  // Is HEAD's tip contained in `defaultBranch`? Null when `defaultBranch` is
+  // null, HEAD is detached, or git couldn't resolve the comparison — never
+  // read null as "not merged".
+  mergedIntoBase: boolean | null
   // Capped changed-file list (REPO_STATUS_FILE_CAP) for the diff/open actions.
   files: HermesRepoStatusFile[]
 }

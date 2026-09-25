@@ -28,6 +28,8 @@ const sampleStatus: HermesRepoStatus = {
   changed: 3,
   added: 12,
   removed: 4,
+  unpushed: 1,
+  mergedIntoBase: false,
   files: []
 }
 

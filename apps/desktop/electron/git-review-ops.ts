@@ -186,7 +186,7 @@ async function branchBase(git) {
 // the remote's HEAD, then common local trunk names. Null when none is found
 // (e.g. a fresh repo with only a feature branch). Used to offer "branch off the
 // trunk" regardless of which branch you're currently on.
-async function defaultBranchName(git) {
+async function defaultBranchName(cwd, gitBin, git) {
   try {
     const head = (await git.revparse(['--abbrev-ref', 'origin/HEAD'])).trim()
 
@@ -206,16 +206,104 @@ async function defaultBranchName(git) {
     'refs/remotes/origin/main',
     'refs/remotes/origin/master'
   ]) {
-    try {
-      await git.raw(['rev-parse', '--verify', '--quiet', ref])
-
+    if (await refExists(cwd, gitBin, ref)) {
       return ref.replace(/^refs\/(?:heads|remotes\/origin)\//, '')
-    } catch {
-      // Ref doesn't exist; try the next candidate.
     }
   }
 
   return null
+}
+
+// Commits reachable from HEAD but not from `base` (`git rev-list --count
+// base..HEAD`), or null when `base` doesn't resolve (no upstream / no ref).
+async function commitsAhead(git, base) {
+  try {
+    const count = Number((await git.raw(['rev-list', '--count', `${base}..HEAD`])).trim())
+
+    return Number.isFinite(count) ? count : null
+  } catch {
+    return null
+  }
+}
+
+// Does `ref` resolve to a real commit? Raw execFile (not simple-git's `raw`,
+// whose reject-on-error check requires BOTH a nonzero exit AND non-empty
+// stderr — `rev-parse --verify --quiet` intentionally prints nothing on a
+// clean miss, so `git.raw` here would resolve as if the ref existed).
+function refExists(cwd, gitBin, ref) {
+  return new Promise(resolve => {
+    execFile(
+      gitBin || 'git',
+      ['rev-parse', '--verify', '--quiet', ref],
+      { cwd, windowsHide: true, timeout: 30_000 },
+      err => resolve(!err)
+    )
+  })
+}
+
+// Commits on HEAD not yet pushed: prefer the real upstream (`@{upstream}`);
+// without one (a local-only branch), fall back to the default branch (the
+// remote copy when it exists, else the local one) so a fresh feature branch
+// still reports its unlanded work. 0 when neither resolves.
+async function unpushedCount(cwd, gitBin, git, defaultBranch) {
+  const viaUpstream = await commitsAhead(git, '@{upstream}')
+
+  if (viaUpstream !== null) {
+    return viaUpstream
+  }
+
+  if (!defaultBranch) {
+    return 0
+  }
+
+  const remoteBase = `origin/${defaultBranch}`
+  const base = (await refExists(cwd, gitBin, remoteBase)) ? remoteBase : defaultBranch
+
+  return (await commitsAhead(git, base)) ?? 0
+}
+
+// Is HEAD's tip contained in the default branch? A raw execFile (not
+// simple-git's `raw`, which throws on ANY nonzero exit and can't tell "not an
+// ancestor" (exit 1) from a real error) so the three-state contract holds.
+function isAncestor(cwd, gitBin, ancestor, ref) {
+  return new Promise(resolve => {
+    execFile(
+      gitBin || 'git',
+      ['merge-base', '--is-ancestor', ancestor, ref],
+      { cwd, windowsHide: true, timeout: 30_000 },
+      err => {
+        if (!err) {
+          resolve(true)
+        } else if (typeof err.code === 'number' && err.code === 1) {
+          resolve(false)
+        } else {
+          resolve(null)
+        }
+      }
+    )
+  })
+}
+
+// Null when there's no default branch to compare against or HEAD is detached
+// (a branch-less state has no "merged" meaning); true outright for the
+// default branch's own checkout.
+async function mergedIntoBase(cwd, gitBin, git, detached, branch, defaultBranch) {
+  if (detached || !defaultBranch) {
+    return null
+  }
+
+  if (branch === defaultBranch) {
+    return true
+  }
+
+  const remoteBase = `origin/${defaultBranch}`
+  const base = (await refExists(cwd, gitBin, remoteBase)) ? remoteBase : defaultBranch
+
+  if (!(await refExists(cwd, gitBin, base))) {
+    return null
+  }
+
+  return isAncestor(cwd, gitBin, 'HEAD', base)
 }
 
 // A status file's single-letter classification, preferring the staged (index)
@@ -826,6 +914,8 @@ async function repoStatus(repoPath, gitBin) {
   }
 
   const detached = typeof status.detached === 'boolean' ? status.detached : !status.current
+  const branch = detached ? null : status.current || null
+  const defaultBranch = await defaultBranchName(cwd, gitBin, git)
 
   const files = status.files.map(file => ({
     path: file.path,
@@ -836,8 +926,8 @@ async function repoStatus(repoPath, gitBin) {
   }))
 
   const result = {
-    branch: detached ? null : status.current || null,
-    defaultBranch: await defaultBranchName(git),
+    branch,
+    defaultBranch,
     detached,
     ahead: status.ahead || 0,
     behind: status.behind || 0,
@@ -848,6 +938,8 @@ async function repoStatus(repoPath, gitBin) {
     changed: files.length,
     added: 0,
     removed: 0,
+    unpushed: await unpushedCount(cwd, gitBin, git, defaultBranch),
+    mergedIntoBase: await mergedIntoBase(cwd, gitBin, git, detached, branch, defaultBranch),
     files: files.slice(0, 200)
   }
 

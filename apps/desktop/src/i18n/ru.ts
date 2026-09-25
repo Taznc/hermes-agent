@@ -2956,7 +2956,14 @@ export const ru = defineForkLocale(forkRu, {
       branchOffFrom: base => `Новая ветка от ${base}`,
       switchTo: branch => `Переключиться на ${branch}`,
       switchFailed: branch => `Не удалось переключиться на ${branch}`,
-      worktrees: 'Worktrees'
+      worktrees: 'Worktrees',
+      riskUncommitted: count =>
+        `${count} ${count % 10 === 1 && count % 100 !== 11 ? 'изменённый файл' : count % 10 >= 2 && count % 10 <= 4 && (count % 100 < 12 || count % 100 > 14) ? 'изменённых файла' : 'изменённых файлов'}`,
+      riskUnpushed: count =>
+        `${count} ${count % 10 === 1 && count % 100 !== 11 ? 'неотправленный коммит' : count % 10 >= 2 && count % 10 <= 4 && (count % 100 < 12 || count % 100 > 14) ? 'неотправленных коммита' : 'неотправленных коммитов'}`,
+      riskUnmerged: base => `Не влито в ${base}`,
+      riskConflicted: 'Конфликты слияния',
+      riskUnknown: 'Статус Git недоступен'
     }
   },
   updates: {

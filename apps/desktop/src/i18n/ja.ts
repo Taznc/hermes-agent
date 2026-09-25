@@ -2552,7 +2552,12 @@ export const ja = defineForkLocale(forkJa, {
       branchOffFrom: base => `${base} から新しいブランチ`,
       switchTo: branch => `${branch} に切り替え`,
       switchFailed: branch => `${branch} に切り替えできませんでした`,
-      worktrees: 'ワークツリー'
+      worktrees: 'ワークツリー',
+      riskUncommitted: count => `${count} 件の変更ファイル`,
+      riskUnpushed: count => `${count} 件の未プッシュコミット`,
+      riskUnmerged: base => `${base} に未マージ`,
+      riskConflicted: 'マージの競合',
+      riskUnknown: 'Git のステータスを取得できません'
     }
   },
 

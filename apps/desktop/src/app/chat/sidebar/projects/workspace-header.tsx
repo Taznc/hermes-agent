@@ -1,12 +1,17 @@
+import { useStore } from '@nanostores/react'
 import type * as React from 'react'
+import { useEffect } from 'react'
 
 import { ActionsContextMenu, ActionsMenu, type MenuKit, renderActionItem } from '@/components/ui/actions-menu'
 import { Codicon } from '@/components/ui/codicon'
 import { DisclosureCaret } from '@/components/ui/disclosure-caret'
+import { StatusDot, type StatusTone } from '@/components/status-dot'
 import { Tip } from '@/components/ui/tooltip'
+import type { HermesRepoStatus } from '@/global'
 import { useI18n } from '@/i18n'
+import { worktreeRisk, type WorktreeRisk } from '@/lib/worktree-risk'
 import { cn } from '@/lib/utils'
-import { openWorktreeDialog } from '@/store/coding-status'
+import { openWorktreeDialog, registerRepoStatusCwd, repoStatusForCwd } from '@/store/coding-status'
 import { copyPath, revealPath } from '@/store/projects'
 
 import { SidebarRowLead } from '../chrome'
@@ -186,6 +191,98 @@ export function StartWorkButton({ repoPath }: { repoPath: string }) {
       >
         <Codicon name="git-branch" size="0.75rem" />
       </button>
+    </Tip>
+  )
+}
+
+// Semantic dot per DESIGN.md's severity tokens: clean lanes stay silent
+// (matches the "silence is the default state" rule for badges elsewhere in
+// the sidebar); a merge conflict is the one destructive-red case; uncommitted
+// changes are the amber "act on this" case; unpushed/unmerged share the
+// informational blue since neither blocks anything, they just mean "this
+// worktree still holds work the default branch doesn't have yet"; an
+// unresolvable probe renders a hollow muted ring rather than hiding outright,
+// so "we don't know" is visually distinct from "everything is clean".
+const RISK_TONE: Record<Exclude<WorktreeRisk, 'clean' | 'unknown'>, StatusTone> = {
+  conflicted: 'bad',
+  uncommitted: 'warn',
+  unmerged: 'good',
+  unpushed: 'good'
+}
+
+function riskTooltip(
+  risk: WorktreeRisk,
+  status: HermesRepoStatus | null,
+  s: ReturnType<typeof useI18n>['t']['statusStack']['coding']
+): string {
+  if (risk === 'unknown') {
+    return s.riskUnknown
+  }
+
+  if (!status) {
+    return s.riskUnknown
+  }
+
+  const parts: string[] = []
+
+  if (status.conflicted > 0) {
+    parts.push(s.riskConflicted)
+  }
+
+  if (status.changed > 0) {
+    parts.push(s.riskUncommitted(status.changed))
+  }
+
+  if (status.unpushed > 0) {
+    parts.push(s.riskUnpushed(status.unpushed))
+  }
+
+  if (status.mergedIntoBase === false && status.defaultBranch) {
+    parts.push(s.riskUnmerged(status.defaultBranch))
+  }
+
+  return parts.join(' · ') || s.riskUnknown
+}
+
+// One lane's git-health dot. Self-subscribing (registers/reads the SAME
+// per-cwd probe the composer coding rail uses — no new poller, no new IPC):
+// rides the existing refresh edges (cwd change, turn settle, focus,
+// `$worktreeRefreshToken`). Renders nothing for a clean lane or a blank path
+// (silence is the default state); a probe that hasn't landed yet, or that
+// resolved to "unknown", shows a hollow muted ring rather than nothing, so a
+// genuinely-unresolvable lane never looks indistinguishable from clean.
+export function WorktreeRiskBadge({ path }: { path: null | string }) {
+  const { t } = useI18n()
+  const s = t.statusStack.coding
+  const status = useStore(repoStatusForCwd(path))
+
+  useEffect(() => registerRepoStatusCwd(path), [path])
+
+  if (!path) {
+    return null
+  }
+
+  const risk = worktreeRisk(status)
+
+  if (risk === 'clean') {
+    return null
+  }
+
+  if (risk === 'unknown') {
+    return (
+      <Tip label={s.riskUnknown}>
+        <span
+          aria-label={s.riskUnknown}
+          className="box-border size-1.5 shrink-0 rounded-full border border-dashed border-(--ui-text-quaternary)"
+          role="status"
+        />
+      </Tip>
+    )
+  }
+
+  return (
+    <Tip label={riskTooltip(risk, status, s)}>
+      <StatusDot aria-label={riskTooltip(risk, status, s)} className="shrink-0" role="status" tone={RISK_TONE[risk]} />
     </Tip>
   )
 }

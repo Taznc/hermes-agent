@@ -226,8 +226,10 @@ if (typeof window !== 'undefined' && !window.__PERF_DRIVE__) {
           defaultBranch: 'main',
           detached: false,
           files: [file],
+          mergedIntoBase: true,
           removed: 0,
           staged: 0,
+          unpushed: 0,
           unstaged: kind === 'modified' ? 1 : 0,
           untracked: kind === 'added' ? 1 : 0
         }

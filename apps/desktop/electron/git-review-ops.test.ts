@@ -88,6 +88,42 @@ test('repoStatus reports an untracked directory without recursively listing its 
   )
 })
 
+test('repoStatus reports unpushed commits and mergedIntoBase=false with no upstream', async () => {
+  const dir = makeRepo()
+
+  execFileSync('git', ['checkout', '-qb', 'feature'], { cwd: dir })
+  fs.writeFileSync(path.join(dir, 'tracked.txt'), 'changed\n')
+  execFileSync('git', ['commit', '-qam', 'work'], { cwd: dir })
+
+  const status = await repoStatus(dir, 'git')
+
+  assert.ok(status)
+  assert.equal(status.unpushed, 1)
+  assert.equal(status.mergedIntoBase, false)
+})
+
+test('repoStatus reports unpushed=0 and mergedIntoBase=true on the default branch itself', async () => {
+  const dir = makeRepo()
+
+  const status = await repoStatus(dir, 'git')
+
+  assert.ok(status)
+  assert.equal(status.unpushed, 0)
+  assert.equal(status.mergedIntoBase, true)
+})
+
+test('repoStatus reports mergedIntoBase=null on a detached HEAD', async () => {
+  const dir = makeRepo()
+  const head = execFileSync('git', ['rev-parse', 'HEAD'], { cwd: dir }).toString().trim()
+
+  execFileSync('git', ['checkout', '-q', head], { cwd: dir })
+
+  const status = await repoStatus(dir, 'git')
+
+  assert.ok(status)
+  assert.equal(status.mergedIntoBase, null)
+})
+
 test('reviewList reports an untracked directory without recursively listing its contents', async () => {
   const dir = makeRepo()
   const nested = path.join(dir, 'browser-profile', 'Default', 'Cache')

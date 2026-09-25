@@ -26,7 +26,8 @@ import {
   WorkspaceContextMenu,
   WorkspaceHeader,
   WorkspaceMenu,
-  WorkspaceShowMoreButton
+  WorkspaceShowMoreButton,
+  WorktreeRiskBadge
 } from './workspace-header'
 
 interface SidebarWorkspaceGroupProps {
@@ -199,8 +200,9 @@ export function SidebarWorkspaceGroup({
         <WorkspaceContextMenu onRemove={onRemove} path={group.path}>
           <WorkspaceHeader
             action={
-              (onNewSession || onRemove) && (
-                <div className="flex items-center">
+              !group.isKanban && (
+                <div className="flex items-center gap-0.5">
+                  <WorktreeRiskBadge path={group.path} />
                   {addButton}
                   {onRemove && <WorkspaceMenu onRemove={onRemove} path={group.path} />}
                 </div>

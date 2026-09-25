@@ -195,6 +195,48 @@ def _status_letter(tag: str, xy: str) -> str:
 # ── coding rail ──────────────────────────────────────────────────────────────
 
 
+def _rev_list_count(cwd: str, base: str) -> int | None:
+    """Commits reachable from HEAD but not from ``base``, or None if ``base`` doesn't resolve."""
+    code, out, _ = _git(cwd, ["rev-list", "--count", f"{base}..HEAD"])
+    if code != 0:
+        return None
+    out = out.strip()
+    return int(out) if out.isdigit() else None
+
+
+def _unpushed_count(cwd: str, default_branch: str | None) -> int:
+    """Commits on HEAD not yet pushed: prefer ``@{upstream}``; without one, fall back to the
+    default branch (remote copy when it exists, else local) so a local-only branch still counts
+    its unlanded work. 0 when neither resolves."""
+    via_upstream = _rev_list_count(cwd, "@{upstream}")
+    if via_upstream is not None:
+        return via_upstream
+    if not default_branch:
+        return 0
+    remote_base = f"origin/{default_branch}"
+    base = remote_base if _ref_exists(cwd, remote_base) else default_branch
+    return _rev_list_count(cwd, base) or 0
+
+
+def _merged_into_base(cwd: str, detached: bool, branch: str | None, default_branch: str | None) -> bool | None:
+    """Is HEAD's tip contained in the default branch? None with no default branch, a detached
+    HEAD, or a git error; True outright for the default branch's own checkout."""
+    if detached or not default_branch:
+        return None
+    if branch == default_branch:
+        return True
+    remote_base = f"origin/{default_branch}"
+    base = remote_base if _ref_exists(cwd, remote_base) else default_branch
+    if not _ref_exists(cwd, base):
+        return None
+    code, _, _ = _git(cwd, ["merge-base", "--is-ancestor", "HEAD", base])
+    if code == 0:
+        return True
+    if code == 1:
+        return False
+    return None
+
+
 def repo_status(cwd: str) -> dict | None:
     """Compact working-tree status for the coding rail. None on a non-repo."""
     if not _is_dir(cwd):
@@ -224,11 +266,14 @@ def repo_status(cwd: str) -> dict | None:
     counts = _numstat(cwd, ["HEAD"]).values()
     added = sum(a for a, _ in counts)
     added += sum(_untracked_insertions(cwd, f["path"]) for f in files[:_UNTRACKED_SCAN_CAP] if f["untracked"])
+    default_branch = _default_branch_name(cwd)
     return {
-        "branch": branch, "defaultBranch": _default_branch_name(cwd), "detached": detached,
+        "branch": branch, "defaultBranch": default_branch, "detached": detached,
         "ahead": ahead, "behind": behind,
         **{flag: sum(f[flag] for f in files) for flag in ("staged", "unstaged", "untracked", "conflicted")},
         "changed": len(files), "added": added, "removed": sum(r for _, r in counts), "files": files[:200],
+        "unpushed": _unpushed_count(cwd, default_branch),
+        "mergedIntoBase": _merged_into_base(cwd, detached, branch, default_branch),
     }
 
 
