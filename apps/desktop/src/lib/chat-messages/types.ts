@@ -128,6 +128,8 @@ export type GatewayEventPayload = {
   server?: string
   action?: string
   reason?: string
+  // session.propose.request (propose_new_session tool — inline new-session approval card)
+  topic?: string
   // approval.request (dangerous command / execute_code) — session-keyed
   command?: string
   description?: string

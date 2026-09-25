@@ -88,7 +88,7 @@ function toolPayloadMatchValues(payload: GatewayEventPayload | undefined): strin
   // row (the model's tool_call_id) so the two ids don't produce a duplicate
   // clarify card — same correlation ClarifyToolPending uses for request↔args.
   // `server` is setup_mcp's identifying arg, for the identical reason.
-  const query = firstStringField(payloadArgs, ['search_term', 'query', 'question', 'server', 'command', 'code', 'path'])
+  const query = firstStringField(payloadArgs, ['search_term', 'query', 'question', 'server', 'topic', 'command', 'code', 'path'])
 
   const context = typeof payload?.context === 'string' ? payload.context.trim() : ''
   const preview = typeof payload?.preview === 'string' ? payload.preview.trim() : ''
@@ -137,7 +137,7 @@ function toolPartMatchValues(part: ChatMessagePart): string[] {
 
   const args = part.args as Record<string, unknown>
 
-  const query = firstStringField(args, ['search_term', 'query', 'question', 'server', 'command', 'code', 'path'])
+  const query = firstStringField(args, ['search_term', 'query', 'question', 'server', 'topic', 'command', 'code', 'path'])
 
   const context = typeof args.context === 'string' ? args.context.trim() : ''
   const preview = typeof args.preview === 'string' ? args.preview.trim() : ''
@@ -288,11 +288,31 @@ function completeOpenStreamParts(parts: ChatMessagePart[], completedAt: number):
   )
 }
 
+export interface UpsertToolPartOptions {
+  /**
+   * A hydration/re-arm event correlates onto an existing row by CONTEXT
+   * (topic/question/etc, see {@link toolPartMatchValues}) rather than by its
+   * own id — e.g. `session.propose.request` mirrors a `propose_new_session`
+   * tool.start by topic, using a synthetic request id that is never the
+   * provider's real tool-call id. Without this flag such an event would
+   * overwrite an already-correlated row's real provider id with its own
+   * synthetic one whenever it lands AFTER the real tool.start, only for the
+   * later tool.complete (keyed by the provider id) to force it back — a
+   * window where the card's id doesn't match what will settle it. Set this
+   * for hydration-style upserts so a context match keeps the existing row's
+   * id; it has no effect on a brand-new row or an exact-id match, and a real
+   * tool.start/tool.progress/tool.complete call must never set it (id 310-479
+   * lines, t_2023fb69 recovery / reviewer comment 1341 item 3).
+   */
+  preferExistingId?: boolean
+}
+
 export function upsertToolPart(
   parts: ChatMessagePart[],
   payload: GatewayEventPayload | undefined,
   phase: 'running' | 'complete',
-  occurredAt = Date.now() / 1000
+  occurredAt = Date.now() / 1000,
+  options: UpsertToolPartOptions = {}
 ): ChatMessagePart[] {
   const stableId = toolId(payload)
   const name = payload?.name || 'tool'
@@ -307,10 +327,15 @@ export function upsertToolPart(
   const prevResult = prev && 'result' in prev ? prev.result : undefined
   const args = toolArgs(payload, prevArgs)
 
-  const id =
-    stableId ||
-    (prev && 'toolCallId' in prev && typeof prev.toolCallId === 'string' ? prev.toolCallId : '') ||
-    nextLiveToolId(name)
+  const prevToolCallId = prev && 'toolCallId' in prev && typeof prev.toolCallId === 'string' ? prev.toolCallId : ''
+  // This update landed on `prev` via its OWN stable id (the top rung of
+  // findToolPartIndex), not via context matching — preferExistingId only
+  // ever applies to the latter, so an exact-id hit always takes the normal
+  // path below.
+  const matchedByExactId = Boolean(stableId && prevToolCallId === stableId)
+  const keepPrevId = Boolean(options.preferExistingId && prevToolCallId && !matchedByExactId)
+
+  const id = keepPrevId ? prevToolCallId : stableId || prevToolCallId || nextLiveToolId(name)
 
   const base = {
     type: 'tool-call' as const,

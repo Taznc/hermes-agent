@@ -496,6 +496,22 @@ export function useSlashCommand(deps: SlashCommandDeps) {
         new: async () => {
           startFreshSessionDraft()
         },
+        // Manual trigger for the same clean hand-off the agent's
+        // `propose_new_session` tool card offers: no bare-arg peek (unlike
+        // /title) — the whole point is a topic with no shared history, so an
+        // empty /new-topic is just a no-op prompt, not a fallback to exec.
+        newTopic: async ctx => {
+          const topic = ctx.arg.trim()
+
+          if (!topic) {
+            notify({ kind: 'error', message: copy.newTopicUsage, title: copy.newTopicMissingTopic })
+
+            return
+          }
+
+          startFreshSessionDraft()
+          await submitPromptText(topic)
+        },
         branch: async () => {
           await branchCurrentSession()
         },
