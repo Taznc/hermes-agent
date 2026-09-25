@@ -50,6 +50,16 @@ describe('layoutChain', () => {
     expect(rankOf(layout, 'gc')).toBe(2)
   })
 
+  it('places every chain member even when one is reachable only through a cycle', () => {
+    // f→b→c→f is a cycle; q hangs off b. Upstream ranks b first, so the
+    // downstream walk must still traverse b to reach q.
+    const layout = layoutChain(graphOf([['f', 'b'], ['b', 'c'], ['c', 'f'], ['b', 'q']]), 'f')
+
+    expect(layout.nodes.map(n => n.key).sort()).toEqual(['b', 'c', 'f', 'q'])
+    expect(layout.nodes.every(n => Number.isInteger(n.rank))).toBe(true)
+    expect(layout.ranks).toBe(new Set(layout.nodes.map(n => n.rank)).size)
+  })
+
   it('terminates on a cycle and keeps the first rank assignment', () => {
     const layout = layoutChain(graphOf([['a', 'b'], ['b', 'c'], ['c', 'a']]), 'a')
     const keys = layout.nodes.map(n => n.key).sort()

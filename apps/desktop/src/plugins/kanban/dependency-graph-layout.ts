@@ -45,15 +45,24 @@ function assignRanks(graph: DependencyGraph, focusedKey: string): Map<string, nu
   const rank = new Map<string, number>([[focusedKey, 0]])
 
   const walk = (next: (graph: DependencyGraph, key: string) => readonly string[], step: number) => {
+    // Per-walk visited set, separate from `rank`: on cyclic (legacy) data a
+    // node the upstream walk already ranked must still be traversed on the
+    // downstream walk, or anything reachable only through it is never placed.
     const queue = [focusedKey]
+    const visited = new Set<string>(queue)
 
     for (let head = 0; head < queue.length; head += 1) {
       const key = queue[head]
       const depth = rank.get(key)! + step
 
       for (const neighbour of next(graph, key)) {
-        if (!rank.has(neighbour)) {
-          rank.set(neighbour, depth)
+        if (!visited.has(neighbour)) {
+          visited.add(neighbour)
+
+          if (!rank.has(neighbour)) {
+            rank.set(neighbour, depth)
+          }
+
           queue.push(neighbour)
         }
       }
@@ -161,7 +170,10 @@ export function edgePath(from: { x: number; y: number }, to: { x: number; y: num
   const y1 = from.y + NODE_H / 2
   const x2 = to.x
   const y2 = to.y + NODE_H / 2
-  const bend = Math.max(24, (x2 - x1) / 2)
+  // A transitive shortcut can put parent and child in the same column
+  // (x2 <= x1); a fixed outward bend keeps that arrow from folding back
+  // through both boxes.
+  const bend = x2 > x1 ? Math.max(24, (x2 - x1) / 2) : NODE_W / 2
 
   return `M ${x1} ${y1} C ${x1 + bend} ${y1}, ${x2 - bend} ${y2}, ${x2} ${y2}`
 }

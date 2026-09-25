@@ -21,6 +21,7 @@ import {
   DialogDescription,
   DialogHeader,
   DialogTitle,
+  SegmentedControl,
   Tip
 } from '@hermes/plugin-sdk'
 import { useMemo } from 'react'
@@ -51,24 +52,16 @@ export function FocusDepthControls({
 }) {
   const k = useKanban()
 
-  const option = (id: FocusDepth, label: string) => (
-    <Button
-      aria-pressed={depth === id}
-      className={cn(depth === id && 'bg-(--chrome-action-hover) text-foreground')}
-      onClick={() => onDepth(id)}
-      size="xs"
-      variant="ghost"
-    >
-      {label}
-    </Button>
-  )
-
   return (
     <div className="flex shrink-0 items-center gap-0.5">
-      <div className="flex items-center gap-0.5 rounded-md bg-(--ui-bg-tertiary) p-0.5" role="group">
-        {option('direct', k.depFocusDirect)}
-        {option('chain', k.depFocusChain)}
-      </div>
+      <SegmentedControl
+        onChange={onDepth}
+        options={[
+          { id: 'direct', label: k.depFocusDirect },
+          { id: 'chain', label: k.depFocusChain }
+        ]}
+        value={depth}
+      />
       <Button onClick={onShowGraph} size="xs" variant="ghost">
         <Codicon name="type-hierarchy" size="0.75rem" />
         {k.depShowGraph}
@@ -82,6 +75,7 @@ const ARROW_DONE_ID = 'kanban-dep-arrow-done'
 
 function GraphNodeBox({
   focused,
+  nodeKey,
   onOpenCard,
   onRecentre,
   task,
@@ -89,6 +83,8 @@ function GraphNodeBox({
   y
 }: {
   focused: boolean
+  /** The node's cardKey (board-qualified in All Boards mode), not the bare id. */
+  nodeKey: string
   onOpenCard: () => void
   onRecentre: () => void
   task: KanbanTask
@@ -103,7 +99,7 @@ function GraphNodeBox({
         'group absolute flex flex-col justify-center gap-1 rounded-md border border-(--ui-stroke-tertiary) bg-(--ui-bg-elevated) px-2.5 py-2 text-left transition-[box-shadow,background-color] hover:bg-primary/[0.06]',
         focused && 'ring-2 ring-(--ui-stroke-primary)'
       )}
-      data-node-key={task.id}
+      data-node-key={nodeKey}
       style={{ left: x, top: y, width: NODE_W, height: NODE_H }}
     >
       <button
@@ -210,6 +206,7 @@ function GraphCanvas({
           <GraphNodeBox
             focused={node.key === focusedKey}
             key={node.key}
+            nodeKey={node.key}
             onOpenCard={() => onOpenCard(node.key)}
             onRecentre={() => onRecentre(node.key)}
             task={task}
