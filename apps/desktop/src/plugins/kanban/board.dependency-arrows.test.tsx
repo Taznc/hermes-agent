@@ -3,7 +3,7 @@
  * exist exactly while a trace is live, follow the Direct/Full chain toggle,
  * and never point at a card the board isn't rendering. The data layer
  * (./api) is mocked at the module boundary, same shape as
- * dependency-graph-board.test.tsx.
+ * board.focus-depth.test.tsx.
  */
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
 import { cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react'

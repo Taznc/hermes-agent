@@ -1,8 +1,6 @@
 /**
- * Board-level interplay between the dependency trace, the Full chain toggle,
- * and the graph dialog: one Esc closes one layer (dialog first, then the
- * trace), closing the dialog keeps the trace, and Full chain widens the lit
- * set from direct neighbours to the transitive chain.
+ * Board-level Full chain toggle: widens the lit set from the focused card's
+ * direct neighbours to its transitive chain.
  *
  * Mounts the real KanbanBoardPage; the data layer (./api) is mocked at the
  * module boundary, same shape as board.all-boards.test.tsx.
@@ -94,32 +92,15 @@ async function mount() {
 /** The card container for a title — the draggable node the rings live on. */
 const cardOf = (title: string) => screen.getByText(title).closest('[draggable="true"]') as HTMLElement
 
-/** A trace is live iff the focus hint bar is up. `hidden: true` because an
- *  open Radix modal marks everything outside it aria-hidden. The focused
+/** A trace is live iff the focus hint bar is up. The focused
  *  card's own trace button shares the label, hence getAll. */
-const tracing = () => screen.queryAllByRole('button', { hidden: true, name: 'depClearFocus' }).length > 0
+const tracing = () => screen.queryAllByRole('button', { name: 'depClearFocus' }).length > 0
 
 /** Buttons are labelled by the dotted i18n key (usePluginI18n is echoed). */
 const buttonsIn = (el: HTMLElement, label: RegExp) =>
   Array.from(el.querySelectorAll('button')).filter(b => label.test(b.getAttribute('aria-label') ?? ''))
 
-describe('dependency graph dialog on the board', () => {
-  it('Esc closes the dialog first and keeps the trace; a second Esc clears the trace', async () => {
-    await mount()
-
-    fireEvent.click(buttonsIn(cardOf('Focus'), /depGraphHint/)[0])
-
-    await screen.findByRole('dialog')
-    expect(tracing()).toBe(true)
-
-    fireEvent.keyDown(screen.getByRole('dialog'), { key: 'Escape' })
-    await waitFor(() => expect(screen.queryByRole('dialog')).toBeNull())
-    expect(tracing()).toBe(true)
-
-    fireEvent.keyDown(window, { key: 'Escape' })
-    await waitFor(() => expect(tracing()).toBe(false))
-  })
-
+describe('focus depth on the board', () => {
   it('Full chain lights the grandparent that Direct links leaves dimmed', async () => {
     await mount()
 

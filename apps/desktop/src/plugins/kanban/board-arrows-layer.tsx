@@ -9,14 +9,37 @@
  * free. A lane's own vertical scroll, a resize, or a card changing height
  * re-measures (rAF-coalesced). Nothing is mounted or measured while no card
  * is focused, so the common board pays nothing.
+ *
+ * `FocusDepthControls` is the Direct / Full chain switch the focus hint bar
+ * shows while a trace is live; it decides which edges this layer draws.
  */
 
-import { cn } from '@hermes/plugin-sdk'
+import { cn, SegmentedControl } from '@hermes/plugin-sdk'
 import { type RefObject, useId, useLayoutEffect, useMemo, useState } from 'react'
 
 import { type BoardArrow, type CardBox, clampToLane, focusEdges, routeArrows, sameArrows } from './board-arrows'
 import { type DependencyGraph, isGating } from './deps'
 import type { KanbanTask } from './types'
+import { useKanban } from './ui'
+
+export type FocusDepth = 'chain' | 'direct'
+
+/** Direct links (one hop) vs Full chain (transitive, both directions). */
+export function FocusDepthControls({ depth, onDepth }: { depth: FocusDepth; onDepth: (depth: FocusDepth) => void }) {
+  const k = useKanban()
+
+  return (
+    <SegmentedControl
+      className="shrink-0"
+      onChange={onDepth}
+      options={[
+        { id: 'direct', label: k.depFocusDirect },
+        { id: 'chain', label: k.depFocusChain }
+      ]}
+      value={depth}
+    />
+  )
+}
 
 /** Attribute every rendered card carries (its `cardKey`), and the one each
  *  lane's vertical scroller carries — the layer's only coupling to `card.tsx`. */

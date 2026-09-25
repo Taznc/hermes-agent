@@ -49,10 +49,9 @@ import {
   primeAllBoardsSocket
 } from './api'
 import { ArchiveDoneControl } from './archive-done-control'
-import { BoardDependencyArrows } from './board-arrows-layer'
+import { BoardDependencyArrows, type FocusDepth, FocusDepthControls } from './board-arrows-layer'
 import { BoardSwitcher } from './board-switcher'
 import { BoardInfoContext, Column, EMPTY_BOARD_INFO } from './card'
-import { DependencyGraphDialog, type FocusDepth, FocusDepthControls } from './dependency-graph-dialog'
 import { DependencyContext, type DependencyView, EMPTY_IDS } from './dependency-view'
 import { buildGraph, cardKey, chainSets, focusSets, indexBoard, parseCardKey, taskCardKey } from './deps'
 import { TaskDrawer } from './drawer'
@@ -413,7 +412,6 @@ export function KanbanBoardPage() {
   // One hop by default (see focusSets); 'chain' is the opt-in transitive view.
   const [focusDepth, setFocusDepth] = useState<FocusDepth>('direct')
   // The card the graph overlay is centred on; null = closed.
-  const [graphKey, setGraphKey] = useState<null | string>(null)
 
   useEffect(() => {
     const onHashChange = () => setRouteSearch(notificationRouteSearch())
@@ -507,7 +505,6 @@ export function KanbanBoardPage() {
   useEffect(() => {
     if (focused && board && !index.has(focused)) {
       setFocused(null)
-      setGraphKey(null)
     }
   }, [board, focused, index])
 
@@ -524,10 +521,6 @@ export function KanbanBoardPage() {
       // would be a fresh function every render and rebuild this object (and
       // thus re-render every card) for nothing.
       onFocus: (id: string) => setFocused(prev => (prev === id ? null : id)),
-      onOpenGraph: (id: string) => {
-        setFocused(id)
-        setGraphKey(id)
-      },
       upstream: chain.upstream
     }),
     [chain, focused, graph, hasEdges, index]
@@ -557,7 +550,7 @@ export function KanbanBoardPage() {
   // single keypress and Esc always dismisses one layer at a time, innermost
   // first. Same shape as the selection handler.
   useEffect(() => {
-    if (!focused || openKey || addStatus || graphKey || selected.size > 0) {
+    if (!focused || openKey || addStatus || selected.size > 0) {
       return
     }
 
@@ -570,7 +563,7 @@ export function KanbanBoardPage() {
     window.addEventListener('keydown', onKey)
 
     return () => window.removeEventListener('keydown', onKey)
-  }, [focused, openKey, addStatus, graphKey, selected.size])
+  }, [focused, openKey, addStatus, selected.size])
 
   const columnNames = board?.columns.map(col => col.name) ?? []
 
@@ -957,7 +950,7 @@ export function KanbanBoardPage() {
             <div className="mx-4 mb-2 flex shrink-0 items-center gap-2 rounded-lg bg-(--ui-bg-quinary) px-3 py-1.5 text-[0.6875rem] text-(--ui-text-secondary)">
               <Codicon className="shrink-0 text-(--ui-text-tertiary)" name="references" size="0.8rem" />
               <span className="min-w-0 truncate">{k.depFocusHint}</span>
-              <FocusDepthControls depth={focusDepth} onDepth={setFocusDepth} onShowGraph={() => setGraphKey(focused)} />
+              <FocusDepthControls depth={focusDepth} onDepth={setFocusDepth} />
               <Button className="ml-auto shrink-0" onClick={() => setFocused(null)} size="xs" variant="ghost">
                 <Codicon name="close" size="0.7rem" />
                 {k.depClearFocus}
@@ -1069,19 +1062,6 @@ export function KanbanBoardPage() {
           )}
 
           <NewTaskDialog onClose={() => setAddStatus(null)} parents={parentOptions} target={addStatus} />
-          {/* Closing keeps `focused`: the board trace outlives the overlay. */}
-          <DependencyGraphDialog
-            focusedKey={graphKey}
-            graph={graph}
-            hasEdges={hasEdges}
-            index={index}
-            onClose={() => setGraphKey(null)}
-            onOpenCard={setOpenKey}
-            onRecentre={key => {
-              setFocused(key)
-              setGraphKey(key)
-            }}
-          />
           <IdeaCaptureDialog onClose={() => setIdeaOpen(false)} open={ideaOpen} />
           {/* Roadmap → Ready is the one spawn that bypasses auto-decompose, so
               it confirms; Roadmap → Triage (the default) never asks. The
