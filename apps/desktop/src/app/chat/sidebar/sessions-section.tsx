@@ -432,7 +432,7 @@ export function SidebarSessionsSection({
   }, [grouping, displayEntries, liveTurnIdSet, manualOrderIds, statusDividerLabels])
 
   const dividerAction = useCallback(
-    (key: string, label: string, rows: readonly SidebarListRow[] = flatRows) => newSessionDividerAction,
+    (_key: string, _label: string) => newSessionDividerAction,
     [newSessionDividerAction]
   )
 
@@ -450,7 +450,7 @@ export function SidebarSessionsSection({
           row,
           false,
           row.kind === 'divider'
-            ? dividerAction(row.key, 'label' in row ? row.label : sessionBucketLabel(row.bucket, dividerLabels), rows)
+            ? dividerAction(row.key, 'label' in row ? row.label : sessionBucketLabel(row.bucket, dividerLabels))
             : undefined
         )
       )

@@ -10,8 +10,8 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
 import type { SessionInfo } from '@/types/hermes'
 
-const patchArchived = vi.fn<(id: string, archived: boolean, profile?: null | string) => Promise<{ ok: boolean }>>(
-  () => Promise.resolve({ ok: true })
+const patchArchived = vi.fn<(id: string, archived: boolean, profile?: null | string) => Promise<{ ok: boolean }>>(() =>
+  Promise.resolve({ ok: true })
 )
 
 vi.mock('@/hermes', async importOriginal => ({

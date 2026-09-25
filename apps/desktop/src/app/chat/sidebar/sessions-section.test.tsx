@@ -1,4 +1,4 @@
-import { cleanup, fireEvent, render, screen } from '@testing-library/react'
+import { cleanup, render } from '@testing-library/react'
 import type * as React from 'react'
 import { afterEach, describe, expect, it, vi } from 'vitest'
 
@@ -183,5 +183,4 @@ describe('SidebarSessionsSection memoization & virtualizer stability', () => {
     const thirdRowsRef = mockVirtualListPropsHistory[2].rows
     expect(thirdRowsRef).not.toBe(secondRowsRef)
   })
-
 })
