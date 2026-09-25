@@ -455,6 +455,7 @@ export function Card({
             dimmed && 'opacity-35 saturate-50',
             dragging && 'opacity-40'
           )}
+          data-card-key={key}
           draggable
           onClick={event => {
             if (event.metaKey || event.ctrlKey) {
@@ -777,7 +778,7 @@ export function Column({
           <Codicon name="chevron-left" size="0.75rem" />
         </button>
       </header>
-      <div className="relative flex min-h-0 flex-1 flex-col gap-2 overflow-y-auto">
+      <div className="relative flex min-h-0 flex-1 flex-col gap-2 overflow-y-auto" data-lane-scroller>
         {lanes
           ? lanes.map(([assignee, tasks]) => (
               <div className="flex flex-col gap-2" key={assignee}>
