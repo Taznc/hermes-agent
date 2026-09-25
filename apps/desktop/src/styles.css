@@ -398,8 +398,16 @@
       var(--theme-neutral-card)
     );
     --ui-chat-bubble-opaque-background: var(--ui-bg-editor);
-    --ui-inline-code-background: color-mix(in srgb, #141414 5%, transparent);
-    --ui-inline-code-foreground: color-mix(in srgb, #141414 88%, transparent);
+    /* Derived from the theme's own foreground (--ui-base), not a hardcoded
+       #141414/#ffffff anchor gated on the `.dark` class. A skin's actual
+       painted surface can land dark even when `.dark` isn't toggled (skins
+       are single-mode; `renderedModeFor` buckets by background luminance,
+       which is a coarse heuristic) — pinning to a fixed near-black anchor in
+       that case put near-black text on a near-black surface. Tying it to
+       --ui-base/--ui-text-primary means inline code always reads exactly as
+       legibly as normal prose, for any skin. */
+    --ui-inline-code-background: color-mix(in srgb, var(--ui-base) 6%, transparent);
+    --ui-inline-code-foreground: var(--ui-text-primary);
     --ui-selection-background: color-mix(in srgb, #ffd24a 55%, transparent);
 
     --dt-background: var(--ui-bg-chrome);
@@ -649,8 +657,9 @@
     /* Dark needs a lighter resting border than light mode. */
     --dt-input-border: 4%;
 
-    --ui-inline-code-background: color-mix(in srgb, #ffffff 7%, transparent);
-    --ui-inline-code-foreground: color-mix(in srgb, #ffffff 88%, transparent);
+    /* --ui-inline-code-* no longer needs a dark override: the base rule now
+       derives from --ui-base/--ui-text-primary, which already track the
+       theme's mode. See the :root definition above. */
     --ui-selection-background: color-mix(in srgb, #ffd24a 38%, transparent);
     /* A dark card sits ABOVE the chrome (#161618 over #0d0d0e), so an inline
        widget wearing the raw card fill reads as a lit panel. Take it down a
