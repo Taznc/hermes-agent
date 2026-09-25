@@ -269,7 +269,18 @@ export function handleInputRequestEvent(ctx: GatewayEventContext): boolean {
       setNewSessionProposalRequest({ reason, requestId, sessionId: sessionId ?? null, topic })
 
       if (sessionId) {
-        upsertToolCall(sessionId, { args: { reason, topic }, name: 'propose_new_session', tool_id: requestId }, 'running')
+        // A synthetic request id must never clobber the provider's real
+        // tool.start id when it lands second (t_2023fb69 recovery / reviewer
+        // comment 1341 item 3) — correlate by topic but keep whichever id
+        // the row already carries.
+        upsertToolCall(
+          sessionId,
+          { args: { reason, topic }, name: 'propose_new_session', tool_id: requestId },
+          'running',
+          undefined,
+          occurredAt,
+          { preferExistingId: true }
+        )
         updateSessionState(sessionId, state => ({ ...state, needsInput: true }))
       }
 

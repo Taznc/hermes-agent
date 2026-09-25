@@ -50,18 +50,26 @@ describe('propose_new_session tool.start / session.propose.request dedupe', () =
     expect(open[0]?.type === 'tool-call' && open[0].toolCallId).toBe('provider-call-1')
   })
 
-  it('(b) real tool.start then synthetic request row: correlates onto one open card', () => {
+  it('(b) real tool.start then synthetic request row: correlates onto one open card, keeping the provider id', () => {
     let parts: ChatMessagePart[] = []
 
+    // The synthetic request hydration path (input-requests.ts:271-284) passes
+    // `preferExistingId: true` into `upsertToolPart` for exactly this reason:
+    // a request id that merely correlates by topic must never clobber the
+    // provider's real tool-call id, or the card's id would flap between the
+    // synthetic and real id depending on arrival order, only for the later
+    // tool.complete (always keyed by the provider id) to force it back.
     parts = upsertToolPart(parts, proposePayload('provider-call-1'), 'running')
-    parts = upsertToolPart(parts, proposePayload('req-live-1'), 'running')
+    parts = upsertToolPart(parts, proposePayload('req-live-1'), 'running', undefined, { preferExistingId: true })
 
     const open = openProposeParts(parts)
 
     // Still ONE card — the synthetic request update landed on the SAME row
     // the tool.start created, not a second row under the live-tool id.
     expect(open).toHaveLength(1)
-    expect(open[0]?.type === 'tool-call' && open[0].toolCallId).toBe('req-live-1')
+    // The provider's real id survives the hydration update, unlike order (a)
+    // where the row is genuinely new and simply adopts whichever id arrives.
+    expect(open[0]?.type === 'tool-call' && open[0].toolCallId).toBe('provider-call-1')
   })
 
   it('a subsequent tool.complete keyed by the provider id settles the single card from order (a)', () => {
@@ -91,7 +99,7 @@ describe('propose_new_session tool.start / session.propose.request dedupe', () =
     let parts: ChatMessagePart[] = []
 
     parts = upsertToolPart(parts, proposePayload('provider-call-1'), 'running')
-    parts = upsertToolPart(parts, proposePayload('req-live-1'), 'running')
+    parts = upsertToolPart(parts, proposePayload('req-live-1'), 'running', undefined, { preferExistingId: true })
 
     parts = upsertToolPart(
       parts,
@@ -104,9 +112,9 @@ describe('propose_new_session tool.start / session.propose.request dedupe', () =
       'complete'
     )
 
-    // Correlates via the shared topic even though the row's current id
-    // (req-live-1) doesn't literally match the completion's provider id —
-    // there is still exactly one settled card, never a stray second one.
+    // The row already carries the provider id (preferExistingId kept it from
+    // being overwritten by the synthetic request id), so the completion
+    // settles it by a direct id match — never a stray second card.
     const settled = parts.filter(part => part.type === 'tool-call' && part.toolName === 'propose_new_session' && part.result !== undefined)
 
     expect(settled).toHaveLength(1)

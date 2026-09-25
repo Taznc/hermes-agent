@@ -3,6 +3,7 @@ import { act, cleanup, render, waitFor } from '@testing-library/react'
 import { type MutableRefObject, useRef } from 'react'
 import { afterEach, describe, expect, it, vi } from 'vitest'
 
+import { NEW_CHAT_ROUTE, sessionRoute } from '@/app/routes'
 import { clearSingleFlightSessionResumeState } from '@/app/session/hooks/use-prompt-actions/single-flight-resume'
 import { useSubmitPrompt } from '@/app/session/hooks/use-prompt-actions/submit'
 import { useSessionActions } from '@/app/session/hooks/use-session-actions'
@@ -44,10 +45,12 @@ interface HarnessHandle {
 
 function Harness({
   onReady,
-  requestGateway
+  requestGateway,
+  navigate
 }: {
   onReady: (h: HarnessHandle) => void
   requestGateway: <T>(method: string, params?: Record<string, unknown>) => Promise<T>
+  navigate: (path: string, options?: { replace?: boolean }) => void
 }) {
   const activeSessionId = useStore($activeSessionId)
   const selectedStoredSessionId = useStore($selectedStoredSessionId)
@@ -71,7 +74,7 @@ function Harness({
     ensureSessionState: cache.ensureSessionState,
     getRouteToken: () => '/::',
     getRoutedStoredSessionId: () => null,
-    navigate: vi.fn() as never,
+    navigate: navigate as never,
     requestGateway,
     resetViewSync: cache.resetViewSync,
     runtimeIdByStoredSessionIdRef: cache.runtimeIdByStoredSessionIdRef,
@@ -122,6 +125,11 @@ describe('makeStartNewSessionFromTopic — real create/publish/navigate/first-su
 
   it('creates a clean session, publishes/selects it, and submits the topic as its first real turn', async () => {
     const calls: { method: string; params?: Record<string, unknown> }[] = []
+    const navigateCalls: { path: string; replace?: boolean }[] = []
+
+    const navigate = vi.fn((path: string, options?: { replace?: boolean }) => {
+      navigateCalls.push({ path, replace: options?.replace })
+    })
 
     const requestGateway = vi.fn(async (method: string, params?: Record<string, unknown>) => {
       calls.push({ method, params })
@@ -135,7 +143,7 @@ describe('makeStartNewSessionFromTopic — real create/publish/navigate/first-su
 
     let handle: HarnessHandle | null = null
     await act(async () => {
-      render(<Harness onReady={h => (handle = h)} requestGateway={requestGateway} />)
+      render(<Harness navigate={navigate} onReady={h => (handle = h)} requestGateway={requestGateway} />)
     })
     await waitFor(() => expect(handle).not.toBeNull())
 
@@ -153,6 +161,16 @@ describe('makeStartNewSessionFromTopic — real create/publish/navigate/first-su
     // now the live selection, not just handed back to the caller.
     await waitFor(() => expect($activeSessionId.get()).toBe(RUNTIME_ID))
     expect($selectedStoredSessionId.get()).toBe(STORED_ID)
+
+    // Real navigation, not just store mutation: startFreshSessionDraft routes
+    // to the fresh-draft route first, then createBackendSessionForSend routes
+    // to the newly created stored session — both required by acceptance #2.
+    // A regression that deleted both navigate() calls in use-session-actions/
+    // index.ts would leave this array empty while the store assertions above
+    // still passed.
+    expect(navigateCalls.length).toBeGreaterThanOrEqual(2)
+    expect(navigateCalls[0]).toEqual({ path: NEW_CHAT_ROUTE, replace: false })
+    expect(navigateCalls.at(-1)).toEqual({ path: sessionRoute(STORED_ID), replace: true })
 
     // The topic became the session's first REAL submitted turn — a genuine
     // prompt.submit RPC, not a synthesized transcript row.
@@ -172,6 +190,8 @@ describe('makeStartNewSessionFromTopic — real create/publish/navigate/first-su
   })
 
   it('resolves false without creating a session when the pipeline rejects the send (e.g. empty gateway failure)', async () => {
+    const navigate = vi.fn()
+
     const requestGateway = vi.fn(async (method: string) => {
       if (method === 'session.create') {
         throw new Error('backend unavailable')
@@ -182,7 +202,7 @@ describe('makeStartNewSessionFromTopic — real create/publish/navigate/first-su
 
     let handle: HarnessHandle | null = null
     await act(async () => {
-      render(<Harness onReady={h => (handle = h)} requestGateway={requestGateway} />)
+      render(<Harness navigate={navigate} onReady={h => (handle = h)} requestGateway={requestGateway} />)
     })
     await waitFor(() => expect(handle).not.toBeNull())
 
