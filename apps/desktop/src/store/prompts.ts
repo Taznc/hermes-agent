@@ -144,6 +144,9 @@ export async function replayPendingApproval(gateway: ApprovalGateway | null, ses
     return
   }
 
+  // Snapshot what is parked now: a fresh `approval.request` landing while this
+  // query is in flight must survive an empty (older) answer.
+  const parkedBefore = approval.$all.get()[keyFor(sessionId)]
   let rawResult: unknown
 
   try {
@@ -163,7 +166,20 @@ export async function replayPendingApproval(gateway: ApprovalGateway | null, ses
   const result =
     rawResult && typeof rawResult === 'object' ? (rawResult as { approvals?: PendingApprovalPayload[] }) : {}
 
-  const pending = Array.isArray(result?.approvals) ? result.approvals[0] : undefined
+  const approvals = Array.isArray(result?.approvals) ? result.approvals : undefined
+  const pending = approvals?.[0]
+
+  // The backend queue is authoritative. An empty list means whatever is parked
+  // here was resolved elsewhere (timeout, another client, /approve) — drop it,
+  // or the jump button keeps advertising "Approval needed" for a turn that
+  // is no longer waiting on anyone.
+  if (approvals && approvals.length === 0) {
+    if (parkedBefore && approval.$all.get()[keyFor(sessionId)] === parkedBefore) {
+      clearApprovalRequest(sessionId)
+    }
+
+    return
+  }
 
   if (!pending || typeof pending.request_id !== 'string') {
     return
@@ -178,6 +194,20 @@ export async function replayPendingApproval(gateway: ApprovalGateway | null, ses
     sessionId,
     smartDenied: pending.smart_denied === true
   })
+}
+
+/** A tool finishing proves the agent thread is no longer parked on whatever
+ *  approval this session is showing — unless another one is queued. Ask the
+ *  backend (authoritative queue) instead of guessing: an approval that timed
+ *  out or was answered from another surface emits no `*.resolved` event, so
+ *  without this the parked request lingers until `message.complete` and the
+ *  jump button reads "Approval needed" while nothing is waiting. */
+export async function reconcileParkedApproval(gateway: ApprovalGateway | null, sessionId: string | null): Promise<void> {
+  if (!approval.$all.get()[keyFor(sessionId)]) {
+    return
+  }
+
+  await replayPendingApproval(gateway, sessionId)
 }
 
 /** The prompt request for one specific session — the tile counterpart of the
