@@ -3,6 +3,7 @@
 ``ClientLifecycleMixin`` owns task cleanup, the shared primary client, per-request client caches
 (owner-thread close vs stranger-thread abort), credential rotation and route-derived headers.
 """
+import hashlib
 import logging
 import threading
 import time
@@ -496,6 +497,12 @@ class ClientLifecycleMixin:
         if self.api_mode == "anthropic_messages":
             self._try_refresh_anthropic_client_credentials()
         key = self._request_anthropic_client_key()
+        if getattr(self, "_anthropic_retry_bearer_log_pending", False):
+            self._anthropic_retry_bearer_log_pending = False
+            # OAuth's literal first 12 bytes are always "sk-ant-oat01".
+            # A digest identifies the actual wire bearer without leaking it.
+            digest = hashlib.sha256(str(key[1]).encode()).hexdigest()[:12] if key[0] == "direct" else "bedrock"
+            logger.info("Anthropic 401 retry request bearer sha256=%s", digest)
         cached, stale = self._checkout_request_slot(_ANTHROPIC_SLOT, key)
         if cached is not None:
             return cached
@@ -878,6 +885,9 @@ class ClientLifecycleMixin:
             logger.warning("Failed to rebuild Anthropic client after credential refresh: %s", exc)
             return False
         self._anthropic_api_key, self._is_anthropic_oauth = new_token, self._anthropic_oauth_flag(new_token)
+        # Pool recovery identifies the failed bearer through api_key. Leaving it
+        # at the pre-adoption value makes the next 401 refresh the wrong generation.
+        self.api_key = new_token
         return True
 
     # ------------------------------------------------------------------ route-derived client config

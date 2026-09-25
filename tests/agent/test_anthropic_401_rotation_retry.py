@@ -17,15 +17,20 @@ Upstream context: NousResearch/hermes-agent #105797, #92606.
 from __future__ import annotations
 
 import copy
+import hashlib
 import json
 import logging
 import time
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
+import anthropic
+import httpx
 import pytest
 
 from agent import anthropic_credentials as ac
+from agent.agent_runtime_helpers import _recover_auth_failure
+from agent.credential_pool import AUTH_TYPE_OAUTH, CredentialPool, PooledCredential
 from agent.error_classifier import classify_api_error
 from agent.turn_api_error import settle_unrecovered_error
 from agent.turn_retry_state import TurnRetryState
@@ -345,3 +350,179 @@ def test_early_refresh_failure_leaves_budget_for_rotation_retry(cred_file):
     assert built == [NEW]
     assert retry.anthropic_401_retry_attempted is True
     post.assert_not_called()
+
+
+# Native Anthropic SDK wire and two-agent credential-generation invariants.
+
+def test_swapped_anthropic_request_client_sends_rotated_bearer(monkeypatch, caplog):
+    seen = []
+    old, new = "sk-ant-oat01-old-probe", "sk-ant-oat01-new-probe"
+
+    def endpoint(request):
+        seen.append(request.headers.get("authorization"))
+        status = 200 if seen[-1] == f"Bearer {new}" else 401
+        if status == 401:
+            return httpx.Response(401, json={"type": "error", "error": {"type": "authentication_error", "message": "OAuth access token has been revoked."}})
+        return httpx.Response(200, json={"id": "msg_probe", "type": "message", "role": "assistant", "model": "claude-sonnet-4-5", "content": [{"type": "text", "text": "ok"}], "stop_reason": "end_turn", "usage": {"input_tokens": 1, "output_tokens": 1}})
+
+    transport = httpx.MockTransport(endpoint)
+    def build(token, base_url, **kwargs):
+        return anthropic.Anthropic(auth_token=token, base_url="https://probe.invalid", http_client=httpx.Client(transport=transport), max_retries=0)
+
+    agent = AIAgent.__new__(AIAgent)
+    agent.provider = "anthropic"
+    agent.api_mode = "anthropic_messages"
+    agent.model = "claude-sonnet-4-5"
+    agent.base_url = "https://probe.invalid"
+    agent._anthropic_base_url = agent.base_url
+    agent._anthropic_api_key = old
+    agent._anthropic_client = build(old, agent.base_url)
+    agent._is_anthropic_oauth = True
+    agent._oauth_1m_beta_disabled = False
+    monkeypatch.setattr(agent, "_build_direct_anthropic_client", build)
+    monkeypatch.setattr(agent, "_build_anthropic_client_for_key", lambda key: build(key[1], key[2]))
+    monkeypatch.setattr(agent, "_try_refresh_anthropic_client_credentials", lambda **kwargs: False)
+    kwargs = {"model": agent.model, "max_tokens": 32, "messages": [{"role": "user", "content": "probe"}]}
+    first = agent._create_request_anthropic_client(reason="probe")
+    try:
+        first.messages.create(**kwargs)
+    except anthropic.AuthenticationError:
+        pass
+    else:
+        raise AssertionError("old bearer was not revoked")
+    agent._close_request_anthropic_client(first, reason="stream_error_cleanup")
+    entry = type("Entry", (), {"runtime_api_key": new, "runtime_base_url": agent.base_url, "id": "probe"})()
+    agent._swap_credential(entry)
+    agent._anthropic_retry_bearer_log_pending = True
+    with caplog.at_level(logging.INFO, logger="run_agent"):
+        retry = agent._create_request_anthropic_client(reason="probe-retry")
+    assert f"sha256={hashlib.sha256(new.encode()).hexdigest()[:12]}" in caplog.text
+    assert retry.messages.create(**kwargs).content[0].text == "ok"
+    assert seen == [f"Bearer {old}", f"Bearer {new}"]
+    agent._close_request_anthropic_client(retry, reason="request_complete")
+    # The last-chance adoption path rebuilds only the shared client; its pool
+    # identity must follow the same generation for a subsequent 401.
+    agent._try_refresh_anthropic_client_credentials = AIAgent._try_refresh_anthropic_client_credentials.__get__(agent)
+    latest = "sk-ant-oat01-latest-probe"
+    assert agent._try_refresh_anthropic_client_credentials(token=latest)
+    assert agent.api_key == latest
+
+
+def test_concurrent_401_adopts_peer_pool_token_without_another_refresh():
+    """A peer already rotated the shared grant; the stale request must not rotate it again."""
+    old, new = "sk-ant-oat01-old-probe", "sk-ant-oat01-new-probe"
+    peer = AIAgent.__new__(AIAgent)
+    peer.provider = "anthropic"
+    peer.api_mode = "anthropic_messages"
+    peer._is_anthropic_oauth = True
+    peer._anthropic_api_key = old
+    peer._is_entitlement_failure = MagicMock(return_value=False)
+    peer._swap_credential = MagicMock()
+    entry = SimpleNamespace(id="shared", runtime_api_key=old, source="claude_code")
+    pool = MagicMock()
+    pool.entries.return_value = [entry]
+    # First AIAgent minted a replacement from the (simulated) shared endpoint;
+    # its refresh invalidates the old bearer. The second agent's 401 is stale.
+    owner = AIAgent.__new__(AIAgent)
+    owner.provider = "anthropic"
+    owner.api_mode = "anthropic_messages"
+    owner._is_anthropic_oauth = True
+    owner._is_entitlement_failure = MagicMock(return_value=False)
+    owner._swap_credential = MagicMock()
+    def refresh(**_kwargs):
+        entry.runtime_api_key = new
+        return entry
+    pool.try_refresh_matching.side_effect = refresh
+    assert _recover_auth_failure(
+        owner, pool, status_code=401, has_retried_429=False, error_context={},
+        api_key_hint=old, credential_id="shared", rotate_and_swap=MagicMock(),
+    )[0]
+    pool.try_refresh_matching.assert_called_once()
+    pool.try_refresh_matching.reset_mock()
+    recovered, _ = _recover_auth_failure(
+        peer, pool, status_code=401, has_retried_429=False, error_context={},
+        api_key_hint=old, credential_id="shared", rotate_and_swap=MagicMock(),
+    )
+    assert recovered is True
+    peer._swap_credential.assert_called_once_with(entry)
+    pool.try_refresh_matching.assert_not_called()
+
+
+def test_two_agents_converge_on_one_refresh_and_retry_on_new_wire_bearer(tmp_path, monkeypatch):
+    """Real pools, singleton file and Anthropic SDK wire; only the OAuth HTTP endpoint is faked."""
+    import hermes_cli.auth as auth_mod
+
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "hermes"))
+    for name in ("ANTHROPIC_TOKEN", "CLAUDE_CODE_OAUTH_TOKEN", "ANTHROPIC_API_KEY"):
+        monkeypatch.delenv(name, raising=False)
+    monkeypatch.setattr(auth_mod, "_global_auth_file_path", lambda: None)
+    path = tmp_path / "claude" / ".credentials.json"
+    path.parent.mkdir()
+    monkeypatch.setattr(ac, "claude_code_credentials_path", lambda: path)
+    monkeypatch.setattr(ac, "_read_claude_code_credentials_from_keychain", lambda: None)
+    old, new = "sk-ant-oat01-old-rotation", "sk-ant-oat01-new-rotation"
+    path.write_text(json.dumps({"claudeAiOauth": {
+        "accessToken": old, "refreshToken": "refresh-old",
+        "expiresAt": int(time.time() * 1000) + 3_600_000,
+    }}))
+
+    class FakeOAuthEndpoint:
+        current = "sk-ant-oat01-revoked-before-probe"
+        refresh_token = "refresh-old"
+        posts = 0
+
+        def refresh(self, refresh_token, *, use_json=False):
+            assert refresh_token == self.refresh_token
+            self.posts += 1
+            self.current, self.refresh_token = new, "refresh-new"
+            return {"access_token": new, "refresh_token": "refresh-new",
+                    "expires_at_ms": int(time.time() * 1000) + 3_600_000}
+
+    endpoint = FakeOAuthEndpoint()
+    monkeypatch.setattr(ac, "refresh_anthropic_oauth_pure", endpoint.refresh)
+    seen = []
+
+    def serve(request):
+        bearer = request.headers.get("authorization")
+        seen.append(bearer)
+        if bearer != f"Bearer {endpoint.current}":
+            return httpx.Response(401, json={"type": "error", "error": {
+                "type": "authentication_error", "message": "OAuth access token has been revoked."}})
+        return httpx.Response(200, json={"id": "msg_test", "type": "message", "role": "assistant",
+            "model": "claude-sonnet-4-5", "content": [{"type": "text", "text": "ok"}],
+            "stop_reason": "end_turn", "usage": {"input_tokens": 1, "output_tokens": 1}})
+
+    transport = httpx.MockTransport(serve)
+    def build(token, _base_url):
+        return anthropic.Anthropic(auth_token=token, base_url="https://api.anthropic.com",
+            max_retries=0, http_client=httpx.Client(transport=transport))
+
+    entry = PooledCredential(provider="anthropic", id="shared", label="Claude Code",
+        auth_type=AUTH_TYPE_OAUTH, priority=0, source="claude_code",
+        access_token=old, refresh_token="refresh-old", expires_at_ms=int(time.time() * 1000) + 3_600_000)
+    agents = []
+    kwargs = {"model": "claude-sonnet-4-5", "max_tokens": 16,
+              "messages": [{"role": "user", "content": "hello"}]}
+    for _ in range(2):
+        agent = AIAgent.__new__(AIAgent)
+        agent.provider, agent.api_mode, agent.model = "anthropic", "anthropic_messages", "claude-sonnet-4-5"
+        agent.base_url = agent._anthropic_base_url = "https://api.anthropic.com"
+        agent.api_key = agent._anthropic_api_key = old
+        agent._is_anthropic_oauth = True
+        agent._credential_pool_entry_id = "shared"
+        agent._is_entitlement_failure = MagicMock(return_value=False)
+        agent._build_direct_anthropic_client = build
+        agent._build_anthropic_client_for_key = lambda key: build(key[1], key[2])
+        agent._anthropic_client = build(old, agent.base_url)
+        pool = CredentialPool("anthropic", [entry])
+        agents.append((agent, pool))
+
+    for agent, _pool in agents:
+        with pytest.raises(anthropic.AuthenticationError):
+            agent._create_request_anthropic_client(reason="before-401").messages.create(**kwargs)
+    for agent, pool in agents:
+        assert _recover_auth_failure(agent, pool, status_code=401, has_retried_429=False,
+            error_context={}, api_key_hint=old, credential_id="shared", rotate_and_swap=MagicMock())[0]
+        assert agent._create_request_anthropic_client(reason="retry").messages.create(**kwargs).content[0].text == "ok"
+    assert endpoint.posts == 1
+    assert seen == [f"Bearer {old}", f"Bearer {old}", f"Bearer {new}", f"Bearer {new}"]

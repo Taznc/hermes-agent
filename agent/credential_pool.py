@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from agent.credential_pool_admin import CredentialPoolAdminMixin
 
+from contextlib import suppress
 import logging
 import os
 import random
@@ -1437,6 +1438,17 @@ class CredentialPool(CredentialPoolAdminMixin):
                 return self._refresh_entry_impl(synced, force=force)
             synced = self._sync_entry_from_pool_store(entry)
             if self.provider == "anthropic" and synced.source == "claude_code":
+                # A just-written credential file means another process may be in
+                # the middle of the revoke/refresh race. Give its rotation a short
+                # settling window BEFORE taking the shared file lock, then re-read
+                # inside that lock. Waiters converge on the winner's token instead
+                # of serially revoking every freshly minted access token.
+                if force:
+                    from agent.anthropic_credentials import claude_code_credentials_path
+                    with suppress(OSError):
+                        age = time.time() - claude_code_credentials_path().stat().st_mtime
+                        if 0 <= age < 0.75:
+                            time.sleep(0.75 - age)
                 # claude_code entries are NOT profile-owned: the refresh token
                 # lives in one shared ~/.claude/.credentials.json (or Keychain)
                 # every profile reads. The profile-scoped lock above only covers

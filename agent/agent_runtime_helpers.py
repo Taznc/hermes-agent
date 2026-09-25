@@ -720,6 +720,21 @@ def _recover_auth_failure(agent, pool, *, status_code, has_retried_429, error_co
             agent.provider or "provider",
         )
         return False, has_retried_429
+    # A peer may already have rotated this grant while our request was in flight.
+    # The pool entry can be newer than the failed bearer even before its forced-refresh
+    # path runs; POSTing again here immediately revokes the peer's fresh access token.
+    if (
+        status_code == 401 and agent.provider == "anthropic"
+        and getattr(agent, "api_mode", None) == "anthropic_messages"
+        and getattr(agent, "_is_anthropic_oauth", False)
+        and credential_id and api_key_hint
+    ):
+        current = next((e for e in pool.entries() if e.id == credential_id), None)
+        if current is not None and current.runtime_api_key and current.runtime_api_key != api_key_hint:
+            _ra().logger.info("Anthropic 401: adopting already-rotated pool entry %s without refresh", credential_id)
+            agent._anthropic_retry_bearer_log_pending = True
+            agent._swap_credential(current)
+            return True, has_retried_429
     # Refresh the entry that supplied the failing key, not current(): refreshing a healthy entry
     # burns its single-use refresh token for a failure it never had.
     refresh_kwargs = {"api_key_hint": api_key_hint}
@@ -746,6 +761,8 @@ def _recover_auth_failure(agent, pool, *, status_code, has_retried_429, error_co
             )
             return False, has_retried_429
     _ra().logger.info("Credential auth failure — refreshed pool entry %s", getattr(refreshed, 'id', '?'))
+    if agent.provider == "anthropic" and getattr(agent, "api_mode", None) == "anthropic_messages":
+        agent._anthropic_retry_bearer_log_pending = True
     agent._swap_credential(refreshed)
     return True, has_retried_429
 
