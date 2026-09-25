@@ -408,32 +408,6 @@ function SidebarSessionRowImpl({
           </Button>
         </SessionActionsMenu>
       </div>
-      {/* Row-level one-click archive/unarchive (#7b52ebc2): a real,
-          always-in-flow sibling past the kebab cluster so the action never
-          needs a menu. Unlike the kebab it never overlaps anything — it
-          always reserves its own width in the actions column, so neither it
-          nor the title's truncation point ever shifts as trailing chips or
-          the kebab fade in and out on hover. Same transparent-until-hover/
-          focus treatment as the kebab so the pair reads as one cluster. */}
-      <Tip label={session.archived ? r.unarchiveSession : r.archiveSession}>
-        <Button
-          aria-label={session.archived ? r.unarchiveSession : r.archiveSession}
-          className="size-5 shrink-0 rounded-[4px] bg-transparent text-transparent transition-colors duration-100 hover:bg-(--ui-control-active-background) hover:text-foreground focus-visible:bg-(--ui-control-active-background) focus-visible:text-foreground focus-visible:ring-0 group-hover:text-(--ui-text-tertiary) [&_svg]:size-3.5!"
-          onClick={event => {
-            // The action button is not a descendant of the row's own click
-            // target (SidebarRowBody), but stop propagation anyway so archive
-            // OR unarchive can never also select/resume the row if the DOM
-            // nesting changes later.
-            event.stopPropagation()
-            triggerHaptic('selection')
-            onArchive()
-          }}
-          size="icon"
-          variant="ghost"
-        >
-          <Codicon name={session.archived ? 'history' : 'archive'} size="0.875rem" />
-        </Button>
-      </Tip>
     </div>
   )
 

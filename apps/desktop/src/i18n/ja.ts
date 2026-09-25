@@ -3442,8 +3442,6 @@ export const ja = defineForkLocale(forkJa, {
     deleteFailed: '削除に失敗しました',
     archived: 'アーカイブしました',
     archiveFailed: 'アーカイブに失敗しました',
-    archivedUndoMessage: 'セッションをアーカイブしました',
-    undoArchiveFailed: '元に戻せませんでした',
     cwdChangeFailed: '作業ディレクトリの変更に失敗しました',
     cwdStagedTitle: '作業ディレクトリがステージングされました',
     cwdStagedMessage:

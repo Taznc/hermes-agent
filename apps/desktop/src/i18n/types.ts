@@ -3347,8 +3347,6 @@ export interface UpstreamTranslations {
     deleteFailed: string
     archived: string
     archiveFailed: string
-    archivedUndoMessage: string
-    undoArchiveFailed: string
     cwdChangeFailed: string
     cwdStagedTitle: string
     cwdStagedMessage: string

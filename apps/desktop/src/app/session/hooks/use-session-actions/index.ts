@@ -93,11 +93,6 @@ import {
   setWorkspaceCwdOwner,
   setYoloActive
 } from '@/store/session'
-import {
-  captureArchiveNeighbors,
-  discardPendingArchiveUndo,
-  registerPendingArchiveUndo
-} from '@/store/session-archive-undo'
 import { clearSessionControl } from '@/store/session-control'
 import { isSessionOwnerResolutionError } from '@/store/session-owner-resolution'
 import {
@@ -2597,18 +2592,8 @@ export function useSessionActions({
   )
 
   const archiveSession = useCallback(
-    async (storedSessionId: string, opts: { withUndo?: boolean } = {}) => {
-      const { withUndo = false } = opts
-
-      // A hotkey/menu archive clears the toast stack the same way it always
-      // has. The undo-capable sidebar path must NOT do this — it is often
-      // showing (or about to show) an undo toast for THIS archive, and
-      // clearing here would also silently kill any OTHER session's still-live
-      // undo toast, orphaning its timer exactly like the notification-cap
-      // eviction bug this feature was rejected for (t_548d0d33, issue 4).
-      if (!withUndo) {
-        clearNotifications()
-      }
+    async (storedSessionId: string) => {
+      clearNotifications()
 
       const listed = findListedSession(storedSessionId)
       const archived = listed?.session
@@ -2632,13 +2617,6 @@ export function useSessionActions({
       // live tip after compression. Drop both so the pin can't linger.
       const archivedPinId = archived ? sessionPinId(archived) : storedSessionId
       const archivedIds = [storedSessionId, archived?.id, archived?._lineage_root_id]
-      const wasPinned = previousPinned.includes(storedSessionId) || previousPinned.includes(archivedPinId)
-      // Captured from the row's neighbors (a stable ordering invariant), not
-      // its absolute index — an index recorded now goes stale the instant a
-      // SECOND concurrent archive shifts the list, which is exactly the bug
-      // that made concurrent undos restore in the wrong order (t_548d0d33,
-      // issue 1). Must run BEFORE the optimistic removal below.
-      const neighbors = withUndo && archived ? captureArchiveNeighbors(storedSessionId) : null
 
       // Soft-hide: drop from every sidebar slice immediately, keep the data.
       dropListedSession(storedSessionId)
@@ -2650,32 +2628,12 @@ export function useSessionActions({
         startFreshSessionDraft(true)
       }
 
-      // Kicked off (not awaited) before the undo entry registers, so
-      // `registerPendingArchiveUndo` can hand the SAME in-flight promise to
-      // the undo-window bookkeeping — `undoArchive` then queues its inverse
-      // PATCH behind this one instead of racing it (t_548d0d33, issue 3).
-      const writePromise = setSessionArchived(storedSessionId, true, profile)
-
-      if (withUndo && archived) {
-        registerPendingArchiveUndo({
-          nextPinId: neighbors?.nextPinId ?? null,
-          prevPinId: neighbors?.prevPinId ?? null,
-          session: archived,
-          storedSessionId,
-          wasPinned,
-          writePromise
-        })
-      }
-
       try {
-        await writePromise
+        await setSessionArchived(storedSessionId, true, profile)
         // Archived rows never reach the sidebar, so their persisted unread can
         // only rot. Dropped after the RPC so a failed archive keeps it.
         forgetSessionUnread(archivedIds, profile)
         // An archived session is hidden from the sidebar; its tile must go too.
-        // This runs for EVERY archive path, undo-capable or not — the whole
-        // point of routing the sidebar icon through this one action instead of
-        // a forked helper (t_548d0d33, issue 2).
         const tiledRuntimeId = runtimeIdByStoredSessionIdRef.current.get(storedSessionId)
         closeSessionTile(storedSessionId)
 
@@ -2685,31 +2643,14 @@ export function useSessionActions({
           dropSessionState(tiledRuntimeId)
         }
 
-        // The undo-capable caller shows its OWN "Session archived — Undo"
-        // toast (wiring.tsx) for this same window; a second ambient "Archived"
-        // toast here would be redundant noise on top of it.
-        if (!withUndo) {
-          notify({ durationMs: 2_000, kind: 'success', message: copy.archived })
-        }
+        notify({ durationMs: 2_000, kind: 'success', message: copy.archived })
       } catch (err) {
-        if (withUndo) {
-          // The mutation never took — there is nothing pending to undo.
-          discardPendingArchiveUndo(storedSessionId)
-        }
-
         if (archived) {
           restoreListedSession(archived, listed?.slice)
         }
 
         untombstoneSessions(archivedIds)
         $pinnedSessionIds.set(previousPinned)
-
-        // The undo-capable caller surfaces its own failure toast (and rolls
-        // back its own optimistic UI) from the rejection this rethrows.
-        if (withUndo) {
-          throw err
-        }
-
         notifyError(err, copy.archiveFailed)
       } finally {
         endSessionMutation(archivedIds)

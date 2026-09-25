@@ -1,9 +1,8 @@
-// Regression for review t_548d0d33, blocking issue 2: the sidebar's
-// undo-capable archive must route through the ONE canonical `archiveSession`
-// action (mutation fencing, unread cleanup, tile/runtime cleanup) instead of
-// a second, forked implementation. This exercises the real hook with
-// `{ withUndo: true }` and asserts every canonical side effect still fires,
-// plus that a 10s undo window opens for it — the two halves of the fix.
+// Regression coverage for the ONE canonical archiveSession/unarchiveSession
+// pair: mutation fencing, unread cleanup, tile/runtime cleanup, notification
+// behavior, and rollback on failure. The Archive-Undo layer that used to sit
+// on top of this action has been removed (t_77c22e64) — archive is a plain
+// optimistic mutation, reversible only through the Archived view's Unarchive.
 import { act, cleanup, render, waitFor } from '@testing-library/react'
 import type { MutableRefObject } from 'react'
 import { useEffect } from 'react'
@@ -50,7 +49,6 @@ vi.mock('@/store/session-states', async importOriginal => ({
 import { $pinnedSessionIds } from '@/store/layout'
 import { $notifications, clearNotifications } from '@/store/notifications'
 import { $selectedStoredSessionId, $sessions, setSessions } from '@/store/session'
-import { isArchiveUndoPending, resetArchiveUndos } from '@/store/session-archive-undo'
 import { $removedSessionIds } from '@/store/session-removal'
 import { $archivedSessions } from '@/store/sidebar-archive'
 
@@ -116,14 +114,13 @@ async function mountHarness(): Promise<Handle> {
   return handle as Handle
 }
 
-describe('archiveSession({ withUndo: true }) reuses the canonical archive path', () => {
+describe('the canonical archiveSession/unarchiveSession pair', () => {
   beforeEach(() => {
     setSessions([])
     $archivedSessions.set([])
     $pinnedSessionIds.set([])
     $removedSessionIds.set(new Set())
     $selectedStoredSessionId.set(null)
-    resetArchiveUndos()
     clearNotifications()
     patchArchived.mockReset()
     patchArchived.mockResolvedValue({ ok: true })
@@ -138,39 +135,24 @@ describe('archiveSession({ withUndo: true }) reuses the canonical archive path',
     $archivedSessions.set([])
     $pinnedSessionIds.set([])
     $selectedStoredSessionId.set(null)
-    resetArchiveUndos()
     clearNotifications()
   })
 
-  it('fences the mutation, cleans up unread + tile state, and opens an undo window', async () => {
+  it('fences the mutation and cleans up unread + tile state on archive', async () => {
     setSessions([archivableSession()])
 
     const handle = await mountHarness()
 
-    await act(() => handle.archiveSession('live-1', { withUndo: true }))
+    await act(() => handle.archiveSession('live-1'))
 
     expect(patchArchived).toHaveBeenCalledWith('live-1', true, undefined)
-    // Same cleanup the plain (non-undo) archive path performs — this is the
-    // whole point of routing through one action instead of a fork.
     expect(forgetSessionUnreadSpy).toHaveBeenCalledTimes(1)
     expect(closeSessionTileSpy).toHaveBeenCalledWith('live-1')
-    // The undo-capable caller's own window is now live.
-    expect(isArchiveUndoPending('live-1')).toBe(true)
     // Row is optimistically gone from the active list.
     expect($sessions.get().map(s => s.id)).toEqual([])
   })
 
-  it('does not show the ambient "Archived" toast for the undo-capable path (the caller shows its own)', async () => {
-    setSessions([archivableSession()])
-
-    const handle = await mountHarness()
-
-    await act(() => handle.archiveSession('live-1', { withUndo: true }))
-
-    expect($notifications.get()).toEqual([])
-  })
-
-  it('shows the ambient "Archived" toast and does NOT open an undo window for a plain archive', async () => {
+  it('shows the ambient "Archived" toast on a successful archive', async () => {
     setSessions([archivableSession()])
 
     const handle = await mountHarness()
@@ -178,20 +160,20 @@ describe('archiveSession({ withUndo: true }) reuses the canonical archive path',
     await act(() => handle.archiveSession('live-1'))
 
     expect($notifications.get().length).toBe(1)
-    expect(isArchiveUndoPending('live-1')).toBe(false)
   })
 
-  it('rejects (does not swallow) an undo-capable archive failure and discards the pending entry', async () => {
+  it('rolls an archive failure back to the sidebar and surfaces the error', async () => {
     setSessions([archivableSession()])
     patchArchived.mockRejectedValueOnce(new Error('network down'))
 
     const handle = await mountHarness()
 
-    await expect(act(() => handle.archiveSession('live-1', { withUndo: true }))).rejects.toThrow('network down')
+    await act(() => handle.archiveSession('live-1'))
 
-    expect(isArchiveUndoPending('live-1')).toBe(false)
-    // Rolled back to the sidebar.
+    // Rolled back to the sidebar — the canonical action never rethrows on the
+    // plain (non-caller-owned) path, it surfaces its own failure toast.
     expect($sessions.get().map(s => s.id)).toEqual(['live-1'])
+    expect($notifications.get().length).toBe(1)
   })
 
   it('unarchives an archived row and surfaces it in the live sidebar', async () => {

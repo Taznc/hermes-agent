@@ -47,7 +47,7 @@ import { requestVoiceConversationStart } from '@/store/composer'
 import { $activeConnectionId } from '@/store/connections'
 import { $cronReviewRequest, setCronFocusJobId } from '@/store/cron'
 import { $pinnedSessionIds, pinSession, restoreWorktree, unpinSession } from '@/store/layout'
-import { dismissNotification, notify, notifyError } from '@/store/notifications'
+import { notifyError } from '@/store/notifications'
 import { $previewTarget } from '@/store/preview'
 import {
   $activeGatewayProfile,
@@ -142,7 +142,6 @@ import {
 } from '../shell/titlebar'
 import { TitlebarControls } from '../shell/titlebar-controls'
 
-import { archiveUndoToastId, buildArchiveUndoToastInput } from './archive-undo-toast'
 import { ContribWiringContext } from './context'
 import {
   reconcileActiveTranscript,
@@ -989,60 +988,6 @@ export function ContribWiring({ children }: { children: ReactNode }) {
     void archiveSession(sessionId)
   }, [archiveSession])
 
-  // Row-level one-click archive (#70ab279e): archives through the ONE
-  // canonical `archiveSession` action (mutation fencing, unread cleanup,
-  // tile/runtime cleanup — see its doc comment) with `{ withUndo: true }`,
-  // which opens a 10s undo window in store/session-archive-undo.ts, and
-  // surfaces a "Session archived — Undo" toast for that same window. The
-  // toast is shown synchronously right after kicking off the archive — the
-  // undo bookkeeping records its window synchronously too, before the
-  // backend PATCH settles — so the two windows stay in lockstep instead of
-  // the toast's clock starting late on a slow network. Toast id is keyed to
-  // the session id: archiving several sessions in quick succession stacks
-  // one toast per session (each up to the shared notification cap, with an
-  // eviction handler that commits rather than orphans a still-live undo)
-  // rather than one toast clobbering another, and each toast's Undo button
-  // closes over its OWN session id, so it can never restore the wrong row. A
-  // failed archive drops the (now-meaningless) toast and reports the failure
-  // instead — the canonical action has already rolled its optimistic removal
-  // back by the time the rejection reaches us.
-  const archiveSessionViaSidebar = useCallback(
-    (storedSessionId: string) => {
-      // Archiving the session currently on screen must also navigate away —
-      // the state layer only clears the selection atom (it doesn't own
-      // routing; see its own doc comment). Leaving the ROUTE pointed at the
-      // now-archived session trips useRouteResume's stuck-on-routed-session
-      // self-heal, which re-resumes (and so re-fetches/re-inserts) the very
-      // session this click just archived, silently undoing it.
-      if ($selectedStoredSessionId.get() === storedSessionId) {
-        startFreshSessionDraft(true)
-      }
-
-      const toastId = archiveUndoToastId(storedSessionId)
-      // Routes through the ONE canonical archive action (mutation fencing,
-      // unread cleanup, tile/runtime cleanup — see its own doc comment) with
-      // `withUndo: true`, which additionally opens the 10s undo window this
-      // toast represents. Never a separate/forked archive path (#548d0d33,
-      // issue 2).
-      const archived = archiveSession(storedSessionId, { withUndo: true })
-
-      notify(
-        buildArchiveUndoToastInput({
-          message: t.desktop.archivedUndoMessage,
-          onUndoFailed: err => notifyError(err, t.desktop.undoArchiveFailed),
-          storedSessionId,
-          undoLabel: t.common.undo
-        })
-      )
-
-      void archived.catch(err => {
-        dismissNotification(toastId)
-        notifyError(err, t.desktop.archiveFailed)
-      })
-    },
-    [archiveSession, startFreshSessionDraft, t]
-  )
-
   // Single global listener for every rebindable hotkey plus the on-screen
   // keybind editor's capture mode (same as DesktopController).
   useKeybinds({
@@ -1080,7 +1025,7 @@ export function ContribWiring({ children }: { children: ReactNode }) {
   const nextActions: WiringActions = {
     onAddContextRef: composer.addContextRefAttachment,
     onAddUrl: url => composer.addContextRefAttachment(`@url:${formatRefValue(url)}`, url),
-    onArchiveSession: sessionId => archiveSessionViaSidebar(sessionId),
+    onArchiveSession: sessionId => void archiveSession(sessionId),
     onAttachDroppedItems: composer.attachDroppedItems,
     onAttachImageBlob: composer.attachImageBlob,
     onAttachPrCommentUrl: composer.attachPrCommentUrl,
