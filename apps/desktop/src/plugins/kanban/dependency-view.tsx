@@ -32,6 +32,8 @@ export interface DependencyView {
   hasEdges: boolean
   index: Map<string, KanbanTask>
   onFocus: (key: string) => void
+  /** Focus `key` AND open the graph overlay centred on it. */
+  onOpenGraph: (key: string) => void
   upstream: ReadonlySet<string>
 }
 
@@ -46,6 +48,7 @@ export const NO_DEPENDENCIES: DependencyView = {
   hasEdges: false,
   index: new Map(),
   onFocus: () => {},
+  onOpenGraph: () => {},
   upstream: EMPTY_IDS
 }
 
