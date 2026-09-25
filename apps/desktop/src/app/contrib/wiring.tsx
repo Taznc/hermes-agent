@@ -142,6 +142,7 @@ import { TitlebarControls } from '../shell/titlebar-controls'
 import { UpdatesOverlay } from '../updates-overlay'
 
 import { ContribWiringContext } from './context'
+import { useCreditsNoticeDemo } from './dev/use-credits-notice-demo'
 import {
   reconcileActiveTranscript,
   resolveActiveTranscriptSession,
@@ -360,22 +361,8 @@ export function ContribWiring({ children }: { children: ReactNode }) {
     return () => window.removeEventListener('hermes:open-keybinds', onOpenKeybinds)
   }, [navigate])
 
-  // Dev-only: install the credit-notice demo trigger (Ctrl+Shift+C / ⌘K palette
-  // / window.__creditsDemo). Dynamic import inside the DEV guard so the module
-  // is dropped from production builds.
-  useEffect(() => {
-    if (!import.meta.env.DEV) {
-      return
-    }
-
-    let dispose: (() => void) | undefined
-
-    void import('./dev/credits-notice-demo').then(m => {
-      dispose = m.installCreditsNoticeDemo()
-    })
-
-    return () => dispose?.()
-  }, [])
+  // Dev-only trigger: its module is dynamically loaded only under the DEV guard.
+  useCreditsNoticeDemo()
 
   // Post-turn rehydrate from stored history (same behavior as DesktopController,
   // including finished-todos restoration).
