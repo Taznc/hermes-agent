@@ -395,7 +395,11 @@ _SPECS = [
            "conflicting paths and the two commands that fix them, and the task is left "
            "untouched. The check is skipped when the board has no land_target, the "
            "workspace is not a git worktree, or git cannot answer; turn it off entirely "
-           "with `kanban.require_mergeable_for_review: false` in config.yaml."
+           "with `kanban.require_mergeable_for_review: false` in config.yaml. Also refuses "
+           "a rework handoff (the card has a changes_requested round since its last "
+           "completion) whose --metadata lacks rework_items=[{item, evidence}] mapping each "
+           "reviewer item to its proof; off switch "
+           "`kanban.require_rework_items_for_review: false`."
        )),
     _cmd("approve", [
         _TASK_ID,

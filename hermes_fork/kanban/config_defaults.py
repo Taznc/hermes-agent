@@ -199,6 +199,12 @@ FORK_KANBAN_DEFAULTS = {
     # land_target — the conflict costs a full review round to report and one `git merge` to
     # fix. Skipped when the board sets no land_target or git cannot answer.
     "require_mergeable_for_review": True,
+    # Refuse a kanban_request_review handoff on a card with >= 1 changes_requested round
+    # since its last completion unless metadata.rework_items=[{item, evidence}] maps each
+    # reviewer item to its proof. An incomplete rework handoff otherwise burns the next
+    # review round on "items 2 and 3 still not done" — with max_review_rounds at 2 that is
+    # the main way a card hits the cap. First-time requests are never gated.
+    "require_rework_items_for_review": True,
     # Argv PREFIX prepended to every spawned worker command. Empty list (default) = today's
     # plain `subprocess.Popen(argv, ...)` on every platform (Windows, macOS, non-systemd
     # Linux) — byte-identical behaviour, nothing to configure. When non-empty, the dispatcher

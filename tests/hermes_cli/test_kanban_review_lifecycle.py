@@ -1153,3 +1153,102 @@ def test_both_doors_refuse_a_conflicting_branch_with_the_identical_message(
     with kbc.connect_closing() as conn:
         assert kb.get_task(conn, tid).status == "ready"
     assert len(_task_events(tid, "review_preflight_conflict")) == 2
+
+
+# ---------------------------------------------------------------------------
+# Rework-items preflight on the CLI door (tools/kanban_tools_rework.py).
+# The tool door is covered in tests/tools/test_kanban_tools.py; the CLI
+# tests below pin that the gate guards the lane, not one entry point.
+# ---------------------------------------------------------------------------
+
+_CLI_REWORK_REASON = "1. missing timeout test\n2. CLI door still bypasses the gate"
+
+
+@pytest.fixture
+def cli_rework_env(monkeypatch, tmp_path):
+    """``make(prior_rounds=N)`` -> task id held by the worker on run N+1 after
+    N real ``changes_requested`` events. No ``land_target``, so only the
+    rework gate is in play."""
+    home = tmp_path / ".hermes"
+    home.mkdir()
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    monkeypatch.setenv("HERMES_PROFILE", "test-worker")
+    monkeypatch.delenv("HERMES_SESSION_ID", raising=False)
+    monkeypatch.setattr(Path, "home", lambda: tmp_path)
+
+    def make(*, prior_rounds: int) -> str:
+        kb._INITIALIZED_PATHS.clear()
+        kb.init_db()
+        with kbc.connect_closing() as conn:
+            tid = kb.create_task(conn, title="cli rework", assignee="test-worker")
+            claimed = kb.claim_task(conn, tid)
+            assert claimed is not None
+            for n in range(prior_rounds):
+                assert kb.request_review(
+                    conn, tid, summary=f"attempt {n + 1}", reviewer="reviewer",
+                    expected_run_id=claimed.current_run_id)
+                review = kb.claim_review_task(conn, tid)
+                assert review is not None
+                assert kb.request_changes(
+                    conn, tid, reason=_CLI_REWORK_REASON,
+                    expected_run_id=review.current_run_id) == (True, "test-worker")
+                claimed = kb.claim_task(conn, tid)
+                assert claimed is not None
+        monkeypatch.setenv("HERMES_KANBAN_TASK", tid)
+        monkeypatch.setenv("HERMES_KANBAN_RUN_ID", str(claimed.current_run_id))
+        return tid
+
+    return make
+
+
+def test_cli_request_review_after_changes_requested_refuses_without_rework_items(
+    cli_rework_env,
+) -> None:
+    """The CLI door refuses a rework handoff with no ``rework_items`` using
+    the same message the tool door prints — round count, key to add, and the
+    reviewer's reason quoted back — and leaves the card running."""
+    from tools import kanban_tools as kt
+
+    tid = cli_rework_env(prior_rounds=1)
+
+    tool_error = json.loads(
+        kt._handle_request_review({"task_id": tid, "summary": "addressed the review"})
+    ).get("error", "")
+    out, rc = _run_kanban("request-review", tid, "--summary", "addressed the review")
+
+    assert rc != 0, out
+    assert "rework_items" in out, out
+    assert "1 prior changes_requested round" in out, out
+    for line in _CLI_REWORK_REASON.splitlines():
+        assert line in out, out
+    for line in tool_error.splitlines():
+        assert line in out, (line, out)
+
+    with kbc.connect_closing() as conn:
+        assert kb.get_task(conn, tid).status == "running"
+    assert len(_task_events(tid, "review_requested")) == 1
+
+
+def test_cli_request_review_after_changes_requested_passes_with_rework_items(
+    cli_rework_env,
+) -> None:
+    """``--metadata`` carrying a well-formed ``rework_items`` list clears the
+    gate through the CLI and lands on the run the reviewer reads."""
+    tid = cli_rework_env(prior_rounds=1)
+    items = [
+        {"item": "1. missing timeout test", "evidence": "abc123; 3 passed"},
+        {"item": "2. CLI door", "evidence": "abc123 hermes_cli/kanban.py"},
+    ]
+
+    out, rc = _run_kanban(
+        "request-review", tid, "--summary", "addressed both",
+        "--metadata", json.dumps({"rework_items": items}))
+
+    assert rc == 0, out
+    requested = _task_events(tid, "review_requested")
+    assert len(requested) == 2
+    with kbc.connect_closing() as conn:
+        assert kb.get_task(conn, tid).status == "review"
+        run = kb.get_run(conn, requested[-1].run_id)
+    assert run is not None
+    assert run.metadata["rework_items"] == items
