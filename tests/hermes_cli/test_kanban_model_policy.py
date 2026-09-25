@@ -104,6 +104,42 @@ def test_claude_baseline_routes_are_unattended_approved_not_operator_forced():
         )
 
 
+def test_opus_5_5_and_gpt_6_sol_join_unattended_allowlist_alongside_predecessors():
+    """2026-09-23: Opus 5.5 / GPT-6 Sol admitted as drop-in successors.
+
+    RED on the pre-fix policy (neither triple was in
+    ``_DEFAULT_UNATTENDED_ROUTES``, so both failed closed). GREEN once they
+    are added. Asserts the *relationship* — new routes validate AND every
+    previously-approved route still validates unchanged — not a frozen
+    snapshot of the whole set, and that an arbitrary unknown route still
+    fails closed.
+    """
+    previously_approved = (
+        ("openai-codex", "gpt-5.6-luna", "low"),
+        ("openai-codex", "gpt-5.6-terra", "medium"),
+        ("openai-codex", "gpt-5.6-sol", "medium"),
+        ("anthropic", "claude-sonnet-5", "high"),
+        ("anthropic", "claude-opus-5", "high"),
+    )
+    newly_approved = (
+        ("anthropic", "claude-opus-5-5", "high"),
+        ("openai-codex", "gpt-6-sol", "medium"),
+    )
+
+    for provider, model, effort in previously_approved + newly_approved:
+        decision = kb.validate_model_effort_policy(
+            provider=provider, model=model, reasoning_effort=effort,
+            assignee="worker", policy={},
+        )
+        assert decision.forced is False
+
+    with pytest.raises(ValueError, match="denies unattended route"):
+        kb.validate_model_effort_policy(
+            provider="anthropic", model="claude-opus-6", reasoning_effort="high",
+            assignee="worker", policy={},
+        )
+
+
 @pytest.mark.parametrize("model", [
     "gpt-6-astra", "gpt-6-astra-pro", "gpt-5.4-mini",
     "gpt-5.3-codex-spark", "openai/gpt-oss-120b:free",

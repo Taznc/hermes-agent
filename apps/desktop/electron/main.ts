@@ -6358,7 +6358,7 @@ async function watchPreviewFile(rawUrl, webContentsId: number | null = null) {
   const id = crypto.randomBytes(12).toString('base64url')
   let timer = null
 
-  const watcher = fs.watch(watchDir, (_eventType, filename) => {
+  const onPreviewFileWatchEvent = (_eventType, filename) => {
     const changedName = filename ? path.basename(String(filename)) : ''
 
     if (changedName && changedName !== targetName) {
@@ -6378,7 +6378,8 @@ async function watchPreviewFile(rawUrl, webContentsId: number | null = null) {
 
       sendPreviewFileChanged({ id, path: filePath, url: pathToFileURL(filePath).toString() })
     }, PREVIEW_WATCH_DEBOUNCE_MS)
-  })
+  }
+  const watcher = fs.watch(watchDir, onPreviewFileWatchEvent)
 
   // Deleting/renaming the watched directory raises FSWatcher 'error' (EPERM
   // on Windows). Unhandled, that throws and crashes the main process — this
@@ -6446,7 +6447,7 @@ function watchDirectory(rawDir, webContentsId: number | null = null) {
   const id = crypto.randomBytes(12).toString('base64url')
   let timer = null
 
-  const watcher = fs.watch(watchDir, () => {
+  const onWatchDirectoryEvent = () => {
     if (timer) {
       clearTimeout(timer)
     }
@@ -6455,7 +6456,8 @@ function watchDirectory(rawDir, webContentsId: number | null = null) {
       timer = null
       sendPreviewFileChanged({ id, path: watchDir, url: pathToFileURL(watchDir).toString() })
     }, PREVIEW_WATCH_DEBOUNCE_MS)
-  })
+  }
+  const watcher = fs.watch(watchDir, onWatchDirectoryEvent)
 
   // Same crash class as watchPreviewFile: a plugin-folder directory watcher
   // that users routinely delete/rename must not let an unhandled 'error'
@@ -17944,7 +17946,11 @@ async function getUninstallSummary() {
         }
 
         try {
-          const line = stdout.trim().split('\n').filter(Boolean).pop() || '{}'
+          // .split(/\r?\n/) — the child (a hermes_cli.main subprocess) can
+          // emit CRLF line endings if it ever runs a Windows PowerShell/batch
+          // helper under the hood; a bare '\n' split would leave a trailing
+          // '\r' on the JSON line, breaking JSON.parse below.
+          const line = stdout.trim().split(/\r?\n/).filter(Boolean).pop() || '{}'
           const parsed = JSON.parse(line)
           // The app bundle the renderer would be removing on *this* machine,
           // resolved from the running exe (the Python probe only knows the

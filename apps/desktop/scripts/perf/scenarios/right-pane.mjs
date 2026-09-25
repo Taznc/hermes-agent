@@ -247,8 +247,15 @@ export default {
       let affectedGit = { counts: { 'project-tree-render': 0, 'project-tree-row-render': 0 }, rows: {} }
 
       if (visiblePath) {
-        const relative = String(visiblePath).startsWith(`${cwd}/`)
-          ? String(visiblePath).slice(cwd.length + 1)
+        // The DOM title attribute mirrors the app's display-path normalization
+        // (forward-slash always, per src/lib/display-path.ts's contract), but
+        // `cwd` above came from node:path's resolve() and is native-separator
+        // (backslash on Windows) — comparing raw would silently never match
+        // there. Normalize cwd to the same forward-slash spelling first.
+        const cwdForCompare = cwd.replace(/\\/g, '/')
+        const cwdPrefix = cwdForCompare + '/' // windows-footgun: ok — cwdForCompare is already forward-slash-normalized above, never backslash-separated
+        const relative = String(visiblePath).startsWith(cwdPrefix)
+          ? String(visiblePath).slice(cwdPrefix.length)
           : String(visiblePath)
         await cdp.eval(START_COUNTERS)
         await cdp.eval(`window.__PERF_DRIVE__.rightPaneGit(${JSON.stringify(relative)}, 'modified')`)

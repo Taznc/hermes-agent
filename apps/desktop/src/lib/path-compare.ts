@@ -21,3 +21,18 @@ export const isUnderPath = (parent: string, child: string): boolean => {
 
   return c === p || c.startsWith(`${p}/`)
 }
+
+/** Join a base path with one or more relative segments using the same
+ *  forward-slash spelling `cleanPath` produces, regardless of whether `base`
+ *  itself is POSIX- or Windows-spelled (a local Windows backend reports
+ *  backslash cwds). Segments are trimmed of leading/trailing slashes before
+ *  joining so a caller never has to reason about double slashes.
+ *  Replacement for hardcoded template-literal joins (interpolating a raw
+ *  path variable followed by a literal slash), which break when that
+ *  variable turns out to be backslash-separated. */
+export const joinPath = (base: string, ...segments: string[]): string => {
+  const cleanedBase = cleanPath(base)
+  const cleanedSegments = segments.map(segment => segment.trim().replace(/^\/+|\/+$/g, '')).filter(Boolean)
+
+  return [cleanedBase, ...cleanedSegments].join('/')
+}

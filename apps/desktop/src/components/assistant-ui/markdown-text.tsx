@@ -525,6 +525,35 @@ function HugeTextFallback({ containerClassName, text }: { containerClassName?: s
   )
 }
 
+// A renderer exception is different from an oversized response: the latter
+// needs a bounded, scrollable plain-text surface to protect the thread, while
+// the former is usually an ordinary answer that happened to hit a parser edge
+// case. Do not make a normal reply look like a code card just because its rich
+// markdown path failed. Keep its line breaks and content-visibility protection,
+// but let it flow with the conversation and remain fully readable.
+function MarkdownErrorFallback({ containerClassName, text }: { containerClassName?: string; text: string }) {
+  const chunks = useMemo(() => chunkByLines(text, 200), [text])
+
+  return (
+    <div
+      className={cn(
+        'aui-md w-full max-w-none whitespace-pre-wrap wrap-anywhere text-[length:var(--conversation-text-font-size)] leading-(--dt-line-height) text-foreground',
+        containerClassName
+      )}
+    >
+      {chunks.map((chunk, index) => (
+        <div
+          className="[content-visibility:auto]"
+          key={index}
+          style={{ containIntrinsicSize: `auto ${chunk.lines * 16}px` }}
+        >
+          {chunk.text}
+        </div>
+      ))}
+    </div>
+  )
+}
+
 /**
  * Paragraph override. Almost always a plain `<p>` — but a paragraph that is
  * exactly one `::name{...}` directive claimed by a plugin renders as that
@@ -729,7 +758,7 @@ function MarkdownTextSurface({
     // that overflowed the stack will overflow again, and remounting per token
     // during streaming would cost far more than the plain rendering saves.
     <ErrorBoundary
-      fallback={() => <HugeTextFallback containerClassName={containerClassName} text={text} />}
+      fallback={() => <MarkdownErrorFallback containerClassName={containerClassName} text={text} />}
       label="markdown-render"
     >
       <StreamdownTextPrimitive

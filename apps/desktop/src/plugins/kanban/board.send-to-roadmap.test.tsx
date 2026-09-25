@@ -12,7 +12,7 @@ import type { ReactNode } from 'react'
 import { afterEach, beforeAll, beforeEach, describe, expect, it, vi } from 'vitest'
 
 import { $boardSlug, ALL_BOARDS } from './api'
-import { Card } from './board'
+import { Card } from './card'
 import type { KanbanTask } from './types'
 
 const { addRoadmapIdea, notify } = vi.hoisted(() => ({ addRoadmapIdea: vi.fn(), notify: vi.fn() }))

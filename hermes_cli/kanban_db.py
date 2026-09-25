@@ -157,6 +157,10 @@ _DEFAULT_UNATTENDED_ROUTES = frozenset({
     # dispatch is a pre-approved route rather than an operator-forced one.
     ("anthropic", "claude-sonnet-5", "high"),
     ("anthropic", "claude-opus-5", "high"),
+    # 2026-09-23: Opus 5.5 / GPT-6 Sol releases — drop-in successors admitted
+    # at the same tiers/efforts as the models they supersede.
+    ("anthropic", "claude-opus-5-5", "high"),
+    ("openai-codex", "gpt-6-sol", "medium"),
 })
 _OPERATOR_ONLY_EFFORTS = frozenset({"high", "xhigh", "max", "ultra"})
 _LUNA_INELIGIBLE_PROFILES = frozenset({"reviewer", "debugger"})

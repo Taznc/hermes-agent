@@ -3,7 +3,7 @@ import ignore from 'ignore'
 import type { HermesReadDirEntry, HermesReadDirResult } from '@/global'
 import { desktopFsCacheKey, desktopGitRoot, readDesktopDir, readDesktopFileDataUrl } from '@/lib/desktop-fs'
 import { ALWAYS_EXCLUDED } from '@/lib/excluded-paths'
-import { cleanPath, comparisonPath } from '@/lib/path-compare'
+import { cleanPath, comparisonPath, joinPath } from '@/lib/path-compare'
 
 export type ProjectTreeEntry = HermesReadDirEntry
 
@@ -84,7 +84,7 @@ async function readGitignore(dir: string): Promise<GitignoreRule | null> {
       return null
     }
 
-    const text = decodeDataUrl(await readDesktopFileDataUrl(`${dir}/.gitignore`))
+    const text = decodeDataUrl(await readDesktopFileDataUrl(joinPath(dir, '.gitignore')))
 
     return { base: dir, ig: ignore().add(text) }
   } catch {

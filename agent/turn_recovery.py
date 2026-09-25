@@ -340,14 +340,97 @@ def _refresh_credentials_after_401(
     if (
         agent.api_mode == "anthropic_messages"
         and hasattr(agent, '_anthropic_api_key')
-        and not _retry.anthropic_auth_retry_attempted
+        and not _retry.anthropic_401_retry_attempted
     ):
-        _retry.anthropic_auth_retry_attempted = True
         if agent._try_refresh_anthropic_client_credentials():
+            _retry.anthropic_401_retry_attempted = True
             _plines(agent, "🔐 Anthropic credentials refreshed after 401. Retrying request...")
             return True
         _print_anthropic_401_diagnostics(agent, agent._anthropic_api_key)
     return False
+
+def _reresolve_anthropic_oauth_token(agent: Any, failed_token: str) -> Optional[str]:
+    """Re-read the LIVE source of a native-Anthropic OAuth credential after a 401 and return a
+    token that differs from ``failed_token``, or None.
+
+    Race: refresh tokens are single-use, so the moment a peer process (another profile's
+    worker, or the ``claude`` CLI) rotates the shared ``~/.claude/.credentials.json`` the
+    in-flight access token is revoked and every concurrent request 401s. The pool path may
+    have already spent its refresh budget against the pre-rotation file, but the rotated
+    token is on disk by now. Adopt-before-POST is preserved by ``_refresh_oauth_token``.
+    """
+    from agent import anthropic_credentials as ac
+
+    if not ac._is_oauth_token(failed_token):
+        return None  # static API keys never rotate; a 401 there is genuinely fatal
+    pool = getattr(agent, "_credential_pool", None)
+    entry_id = getattr(agent, "_credential_pool_entry_id", None)
+    entry = None
+    if pool is not None and entry_id:
+        try:
+            entry = next((e for e in pool.entries() if e.id == entry_id), None)
+        except Exception:
+            entry = None
+    if entry is None or getattr(entry, "source", None) == "claude_code":
+        # Borrowed Claude Code file (or no pool identity): re-read under the shared file lock;
+        # adopt an already-rotated token first, POST a refresh only if the file still holds ours.
+        creds = ac.read_claude_code_credentials()
+        if creds and creds.get("refreshToken"):
+            token = ac._refresh_oauth_token(
+                {"accessToken": failed_token, "refreshToken": creds.get("refreshToken", "")}
+            )
+            if token and token != failed_token:
+                return token
+        return None
+    # Pool-owned OAuth (hermes_pkce, ...): a fresh load re-seeds from its singleton store.
+    try:
+        from agent.credential_pool import AUTH_TYPE_OAUTH, load_pool
+        for e in load_pool("anthropic").entries():
+            if e.id != entry_id or e.auth_type != AUTH_TYPE_OAUTH:
+                continue
+            token = (e.access_token or "").strip()
+            expires_at_ms = getattr(e, "expires_at_ms", None) or 0
+            if token and token != failed_token and (not expires_at_ms or expires_at_ms > time.time() * 1000):
+                return token
+    except Exception as exc:
+        logger.debug("Anthropic pool re-resolution after 401 failed: %s", exc)
+    return None
+
+
+def try_anthropic_rotation_retry(agent: Any, _retry: TurnRetryState, status_code: Optional[int]) -> bool:
+    """Last-chance 401 recovery for native Anthropic OAuth, run right before the error turns fatal:
+    once per API-call iteration, re-resolve the credential from its live source and, if a different
+    token is now available, rebuild the client and signal a retry. Non-Anthropic providers and
+    static API keys return False untouched."""
+    if (
+        status_code != 401
+        or getattr(agent, "api_mode", None) != "anthropic_messages"
+        or getattr(agent, "provider", None) != "anthropic"
+        or not getattr(agent, "_is_anthropic_oauth", False)
+        or _retry.anthropic_401_retry_attempted
+    ):
+        return False
+    failed_token = getattr(agent, "_anthropic_api_key", "") or ""
+    try:
+        new_token = _reresolve_anthropic_oauth_token(agent, failed_token)
+    except Exception as exc:
+        logger.debug("Anthropic 401 rotation re-resolution raised: %s", exc)
+        new_token = None
+    if new_token and agent._try_refresh_anthropic_client_credentials(token=new_token):
+        _retry.anthropic_401_retry_attempted = True
+        logger.info(
+            "%sAnthropic 401 after credential rotation: adopted the rotated OAuth token from its live "
+            "source (prefix %s… → %s…) and retrying the request once",
+            agent.log_prefix, failed_token[:12], new_token[:12],
+        )
+        _vlines(agent, "🔐 Anthropic OAuth token was rotated by another process — adopted the new token, retrying request...")
+        return True
+    logger.info(
+        "%sAnthropic 401 rotation-retry exhausted: live credential source holds no newer token "
+        "(prefix %s…); treating the 401 as fatal", agent.log_prefix, failed_token[:12],
+    )
+    return False
+
 
 def _recover_format_errors(
     agent: Any, api_error: Exception, classified: Any, _retry: TurnRetryState,

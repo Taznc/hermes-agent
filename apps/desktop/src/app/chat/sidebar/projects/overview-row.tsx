@@ -7,7 +7,7 @@ import { Codicon } from '@/components/ui/codicon'
 import type { SessionInfo } from '@/hermes'
 import { useI18n } from '@/i18n'
 import { cn } from '@/lib/utils'
-import { $sidebarListLimit } from '@/store/layout'
+import { $sidebarShowAllSessions } from '@/store/layout'
 
 import {
   SIDEBAR_LEAD_ICON_SIZE,
@@ -22,7 +22,7 @@ import {
   SidebarRowShell
 } from '../chrome'
 
-import { latestProjectSessions, useWorkspaceNodeOpen } from './model'
+import { latestProjectSessions, PROJECT_PREVIEW_COUNT, useWorkspaceNodeOpen } from './model'
 import { ProjectContextMenu, ProjectMenu } from './project-menu'
 import type { SidebarProjectTree } from './workspace-groups'
 import { WorkspaceAddButton } from './workspace-header'
@@ -101,10 +101,10 @@ export function ProjectOverviewRow({
   // The appearance popover anchors here (the full row) so it opens flush with
   // the sidebar's content edge regardless of which side the sidebar is on.
   const rowRef = useRef<HTMLDivElement>(null)
-  const listLimit = useStore($sidebarListLimit)
-  const previewCount = listLimit === 'all' ? Infinity : listLimit
-  const fetched = (previewSessions ?? []).slice(0, previewCount)
-  const preview = renderRows ? (fetched.length ? fetched : latestProjectSessions(project, previewCount)) : []
+  const showAllSessions = useStore($sidebarShowAllSessions)
+  const limit = showAllSessions ? Infinity : PROJECT_PREVIEW_COUNT
+  const fetched = (previewSessions ?? []).slice(0, limit)
+  const preview = renderRows ? (fetched.length ? fetched : latestProjectSessions(project, limit)) : []
 
   const lead = reorderable ? (
     <SidebarRowGrab

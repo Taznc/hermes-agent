@@ -2460,6 +2460,7 @@ export const en: Translations = withForkKeys(forkEn, {
     noSessions: 'No sessions yet',
     noFilterMatches: 'No sessions match these filters',
     projects: {
+      showAllSessions: 'Show all sessions',
       sectionLabel: 'Projects',
       home: 'Home',
       newButton: 'New project',

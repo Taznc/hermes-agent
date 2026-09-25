@@ -2666,6 +2666,7 @@ export const zhAuthored: Translations = withForkKeys(forkZh, {
     noSessions: '暂无会话',
     noFilterMatches: '没有会话符合这些筛选条件',
     projects: {
+      showAllSessions: '显示所有会话',
       sectionLabel: '项目',
       home: '主页',
       newButton: '新建项目',

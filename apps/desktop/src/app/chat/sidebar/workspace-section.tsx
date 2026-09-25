@@ -15,12 +15,12 @@ import { $activeConnectionId } from '@/store/connections'
 import {
   $sidebarCardRows,
   $sidebarGrouping,
-  $sidebarListLimit,
   $sidebarOrdering,
   $sidebarProjectOrderIds,
   $sidebarRecentsOpen,
   $sidebarSessionOrderIds,
   $sidebarSessionOrderManual,
+  $sidebarShowAllSessions,
   $sidebarShowArchived,
   $sidebarWorkspaceOrderIds,
   $sidebarWorkspaceParentOrderIds,
@@ -89,6 +89,7 @@ import {
   excludeProjectSessions,
   overlayLiveLanes,
   overlayLivePreviews,
+  PROJECT_PREVIEW_COUNT,
   ProjectBackRow,
   ProjectMenu,
   projectTreeCwd,
@@ -149,7 +150,7 @@ export function SidebarWorkspaceSection({
   const grouping = useStore($sidebarGrouping)
   const ordering = useStore($sidebarOrdering)
   const cardRows = useStore($sidebarCardRows)
-  const listLimit = useStore($sidebarListLimit)
+  const showAllSessions = useStore($sidebarShowAllSessions)
   const showArchived = useStore($sidebarShowArchived)
   const agentsOpen = useStore($sidebarRecentsOpen)
   const filtersActive = useStore($sidebarFiltersActive)
@@ -234,6 +235,18 @@ export function SidebarWorkspaceSection({
       void loadArchivedSessions()
     }
   }, [showArchived])
+
+  // Widen the existing tree query when the user expands previews, without
+  // repeating repo discovery. Initial load/scope changes use the effect above.
+  useEffect(
+    () =>
+      $sidebarShowAllSessions.listen(() => {
+        if (gatewayReady && worktreeGroupingActive) {
+          void refreshProjectTree()
+        }
+      }),
+    [gatewayReady, worktreeGroupingActive]
+  )
 
   // Sessions the branch join can't answer for get one look at their own
   // transcript — a `gh pr create` in there names the PR outright.
@@ -481,11 +494,17 @@ export function SidebarWorkspaceSection({
 
   const overviewPreviews = useMemo<Record<string, SessionInfo[]>>(
     () =>
-      overlayLivePreviews(projectOverview ?? [], agentSessions, projects, listLimit === 'all' ? Infinity : listLimit, {
-        removed: removedSessionIds,
-        rankIds: sortOrderIds
-      }),
-    [projectOverview, agentSessions, projects, removedSessionIds, sortOrderIds, listLimit]
+      overlayLivePreviews(
+        projectOverview ?? [],
+        agentSessions,
+        projects,
+        showAllSessions ? Infinity : PROJECT_PREVIEW_COUNT,
+        {
+          removed: removedSessionIds,
+          rankIds: sortOrderIds
+        }
+      ),
+    [projectOverview, agentSessions, projects, removedSessionIds, sortOrderIds, showAllSessions]
   )
 
   const enteredProjectOverlaySessions = useMemo(

@@ -562,7 +562,11 @@ function spawnPowerShell(scriptPath, args, { emit, stageName, abortSignal, herme
 
 function spawnBash(scriptPath, args, { emit, stageName, abortSignal, hermesHome }: any = {}) {
   return new Promise<any>((resolve, reject) => {
-    const child = spawn('bash', [scriptPath, ...args], {
+    // spawnBash is only ever invoked as the isPosix branch of
+    // `(isPosix ? spawnBash : spawnPowerShell)(...)` in fetchManifest/runStage,
+    // itself gated on installerKind derived from installScriptKind(), which
+    // returns 'powershell' on win32 — spawnBash is unreachable on Windows.
+    const child = spawn('bash', [scriptPath, ...args], { // windows-footgun: ok — guarded by isPosix at call site (see comment above)
       stdio: ['ignore', 'pipe', 'pipe'],
       env: {
         ...process.env,

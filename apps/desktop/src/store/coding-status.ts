@@ -2,7 +2,7 @@ import { atom, computed, type ReadableAtom } from 'nanostores'
 
 import type { HermesGitWorktree, HermesRepoStatus } from '@/global'
 import { desktopGit } from '@/lib/desktop-git'
-import { cleanPath, comparisonPath } from '@/lib/path-compare'
+import { cleanPath, comparisonPath, joinPath } from '@/lib/path-compare'
 
 import {
   $projectScope,
@@ -157,7 +157,7 @@ export const $repoChangeByPath = computed([$repoStatus, $currentCwd], (status, c
 
   for (const file of status.files) {
     const kind: RepoChangeKind = file.conflicted ? 'conflicted' : file.untracked ? 'added' : 'modified'
-    map.set(comparisonPath(`${root}/${cleanPath(file.path)}`), kind)
+    map.set(comparisonPath(joinPath(root, cleanPath(file.path))), kind)
   }
 
   return map

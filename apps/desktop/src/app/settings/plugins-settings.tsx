@@ -14,6 +14,7 @@ import { getProfiles } from '@/hermes'
 import { useI18n } from '@/i18n'
 import { triggerHaptic } from '@/lib/haptics'
 import { FolderOpen, Monitor, Package, RefreshCw } from '@/lib/icons'
+import { joinPath } from '@/lib/path-compare'
 import { normalize } from '@/lib/text'
 import {
   $agentPluginBusy,
@@ -88,7 +89,7 @@ async function revealAgentPluginsDir(request: GatewayRequest) {
       return
     }
 
-    const opened = await window.hermesDesktop?.openDir?.(`${home}/plugins`)
+    const opened = await window.hermesDesktop?.openDir?.(joinPath(home, 'plugins'))
 
     if (opened && !opened.ok) {
       notifyError(opened.error ?? 'unknown error', 'Could not open the plugins folder')
