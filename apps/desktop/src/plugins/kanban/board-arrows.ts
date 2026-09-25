@@ -62,7 +62,10 @@ const midY = (box: CardBox) => (box.top + box.bottom) / 2
  *  Several arrows on the same side of one card are spread along that side,
  *  ordered by the far end's height, so they fan instead of stacking into one
  *  indistinguishable line. */
-export function routeArrows(edges: ReadonlyArray<readonly [string, string]>, boxes: Map<string, CardBox>): BoardArrow[] {
+export function routeArrows(
+  edges: ReadonlyArray<readonly [string, string]>,
+  boxes: Map<string, CardBox>
+): BoardArrow[] {
   const routed = edges.flatMap(([parent, child]) => {
     const from = boxes.get(parent)
     const to = boxes.get(child)
@@ -181,8 +184,22 @@ export function focusEdges(
     return chainEdges(graph, new Set([focused, ...lit.upstream, ...lit.downstream]))
   }
 
-  return [
-    ...upstreamOf(graph, focused).map((parent): [string, string] => [parent, focused]),
-    ...downstreamOf(graph, focused).map((child): [string, string] => [focused, child])
-  ]
+  // Deduplicated like chainEdges: a repeated link_edges row must not yield two
+  // paths with the same React key.
+  const seen = new Set<string>()
+  const edges: Array<[string, string]> = []
+
+  const add = (parent: string, child: string) => {
+    const id = `${parent}\u0001${child}`
+
+    if (parent !== child && !seen.has(id)) {
+      seen.add(id)
+      edges.push([parent, child])
+    }
+  }
+
+  upstreamOf(graph, focused).forEach(parent => add(parent, focused))
+  downstreamOf(graph, focused).forEach(child => add(focused, child))
+
+  return edges
 }

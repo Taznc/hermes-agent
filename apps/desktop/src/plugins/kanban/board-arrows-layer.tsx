@@ -176,10 +176,7 @@ export function BoardDependencyArrows({
             refY="3.5"
             viewBox="0 0 7 7"
           >
-            <path
-              className={side === 'upstream' ? 'fill-amber-500' : 'fill-sky-500'}
-              d="M 0 0 L 7 3.5 L 0 7 z"
-            />
+            <path className={side === 'upstream' ? 'fill-amber-500' : 'fill-sky-500'} d="M 0 0 L 7 3.5 L 0 7 z" />
           </marker>
         ))}
       </defs>

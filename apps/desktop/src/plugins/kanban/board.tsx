@@ -993,8 +993,12 @@ export function KanbanBoardPage() {
               // instead of extending underneath it on a short viewport.
               // `relative`: the dependency-arrow layer is positioned against the
               // strip's scroll content, so it pans with the lanes for free.
+              // While a trace is live the right gutter grows to fit the widest
+              // same-lane bracket (LOOP_OUT + 40), so the last lane's loop is
+              // never clipped by the strip's scroll edge.
               className={cn(
                 'relative flex min-h-0 flex-1 gap-2 overflow-x-auto px-4 pt-1 pb-3',
+                focused && 'pr-16',
                 grabbing && 'cursor-grabbing'
               )}
               // Clicking the board background clears the trace — the gaps between

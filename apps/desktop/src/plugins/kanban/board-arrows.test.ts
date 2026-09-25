@@ -104,7 +104,14 @@ describe('routeArrows', () => {
 
   it('flags an arrow whose end is scrolled out of its lane', () => {
     const hidden = { ...box(300, 0), offscreen: true }
-    const [arrow] = routeArrows([['a', 'b']], new Map([['a', box(0, 0)], ['b', hidden]]))
+
+    const [arrow] = routeArrows(
+      [['a', 'b']],
+      new Map([
+        ['a', box(0, 0)],
+        ['b', hidden]
+      ])
+    )
 
     expect(arrow.offscreen).toBe(true)
   })
@@ -136,6 +143,24 @@ describe('focusEdges', () => {
   } as unknown as KanbanBoard
 
   const graph = buildGraph(board)
+
+  it('direct mode draws a repeated link row once (no duplicate React keys)', () => {
+    const dup = buildGraph({
+      columns: [],
+      link_edges: [
+        ['p', 'f'],
+        ['p', 'f'],
+        ['f', 'c']
+      ]
+    } as unknown as KanbanBoard)
+
+    const edges = focusEdges(dup, 'f', 'direct', { downstream: new Set(['c']), upstream: new Set(['p']) })
+
+    expect(edges).toEqual([
+      ['p', 'f'],
+      ['f', 'c']
+    ])
+  })
 
   it('every drawn edge joins two cards the trace keeps lit', () => {
     for (const [depth, sets] of [
