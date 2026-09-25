@@ -261,4 +261,36 @@ describe('SidebarSessionsSection memoization & virtualizer stability', () => {
     expect(screen.queryByRole('button', { name: /Archive session/i })).toBeNull()
     expect(onArchiveSession).not.toHaveBeenCalled()
   })
+
+  // AC4 (reviewer round 1): the virtualized path must receive the same
+  // inverse-action callback the flat renderer wires — proves the chain from
+  // SidebarSessionsSection down to VirtualSessionList's own archived-row
+  // routing (asserted in virtual-session-list.test.tsx) is unbroken at
+  // >=VIRTUALIZE_THRESHOLD sessions, where the section actually switches to
+  // the virtualized renderer.
+  it('forwards onUnarchiveSession to VirtualSessionList once virtualized', () => {
+    mockVirtualListPropsHistory.length = 0
+    const onUnarchiveSession = vi.fn()
+
+    render(
+      <SidebarSessionsSection
+        activeSessionId={null}
+        emptyState={<div>Empty</div>}
+        label="Sessions"
+        onArchiveSession={noop}
+        onDeleteSession={noop}
+        onResumeSession={noop}
+        onToggle={noop}
+        onTogglePin={noop}
+        onToggleUnread={noop}
+        onUnarchiveSession={onUnarchiveSession}
+        open={true}
+        pinned={false}
+        sessions={generateSessions(VIRTUALIZE_THRESHOLD + 5)}
+      />
+    )
+
+    expect(mockVirtualListPropsHistory.length).toBe(1)
+    expect(mockVirtualListPropsHistory[0].onUnarchiveSession).toBe(onUnarchiveSession)
+  })
 })
