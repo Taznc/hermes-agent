@@ -328,6 +328,28 @@ describe('SidebarSessionRow', () => {
     expect(tipTrigger(kebab)).toBeNull()
   })
 
+  // The dedicated one-click row archive/unarchive icon button (#7b52ebc2) is
+  // removed by this card: only the kebab (Session actions) and context menus
+  // may offer Archive/Unarchive, never a second always-visible affordance.
+  it('renders no dedicated archive button — only the kebab menu trigger', () => {
+    render(
+      <SidebarSessionRow
+        isPinned={false}
+        isSelected={false}
+        onArchive={noop}
+        onDelete={noop}
+        onPin={noop}
+        onResume={noop}
+        onToggleUnread={noop}
+        session={makeSession({ title: 'Archivable session' })}
+        unread={false}
+      />
+    )
+
+    expect(screen.queryByRole('button', { name: 'Archive session' })).toBeNull()
+    expect(screen.getByRole('button', { name: 'Session actions' })).toBeTruthy()
+  })
+
   // Full-title tooltip on hover (#83000-class ask): the label is a tooltip
   // trigger, but the tip only opens when the title is actually truncated.
   describe('full-title overflow tooltip', () => {

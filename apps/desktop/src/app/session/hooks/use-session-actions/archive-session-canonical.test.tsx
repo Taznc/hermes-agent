@@ -162,6 +162,19 @@ describe('the canonical archiveSession/unarchiveSession pair', () => {
     expect($notifications.get().length).toBe(1)
   })
 
+  // The 10-second Archive Undo layer (store/session-archive-undo.ts,
+  // app/contrib/archive-undo-toast.ts) is removed by this card: the success
+  // toast is a plain confirmation with no recovery action attached.
+  it('does not attach an Undo action to the archive success toast', async () => {
+    setSessions([archivableSession()])
+
+    const handle = await mountHarness()
+
+    await act(() => handle.archiveSession('live-1'))
+
+    expect($notifications.get()[0]?.action).toBeUndefined()
+  })
+
   it('rolls an archive failure back to the sidebar and surfaces the error', async () => {
     setSessions([archivableSession()])
     patchArchived.mockRejectedValueOnce(new Error('network down'))

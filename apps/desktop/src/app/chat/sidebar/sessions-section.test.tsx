@@ -1,4 +1,4 @@
-import { cleanup, render } from '@testing-library/react'
+import { cleanup, render, screen } from '@testing-library/react'
 import type * as React from 'react'
 import { afterEach, describe, expect, it, vi } from 'vitest'
 
@@ -182,5 +182,83 @@ describe('SidebarSessionsSection memoization & virtualizer stability', () => {
 
     const thirdRowsRef = mockVirtualListPropsHistory[2].rows
     expect(thirdRowsRef).not.toBe(secondRowsRef)
+  })
+
+  // Bulk date/status-group archive (`archiveDateGroup` +
+  // `SidebarDateDividerArchiveButton`) is removed by this card: a date
+  // divider must never carry an archive affordance, in the flat renderer or
+  // an entered project's dated lane. `newSessionDividerAction` (the "+" to
+  // start a session in that bucket) is the only surviving divider action.
+  it('renders no bulk archive action on date dividers in the flat (non-virtualized) list', () => {
+    const onArchiveSession = vi.fn()
+
+    render(
+      <SidebarSessionsSection
+        activeSessionId={null}
+        emptyState={<div>Empty</div>}
+        grouping="date"
+        label="Sessions"
+        onArchiveSession={onArchiveSession}
+        onDeleteSession={noop}
+        onResumeSession={noop}
+        onToggle={noop}
+        onTogglePin={noop}
+        onToggleUnread={noop}
+        open={true}
+        pinned={false}
+        sessions={[makeSession('today'), makeSession('yesterday', 900)]}
+      />
+    )
+
+    expect(screen.queryByRole('button', { name: /Archive session/i })).toBeNull()
+    expect(onArchiveSession).not.toHaveBeenCalled()
+  })
+
+  it('renders no bulk archive action on date dividers inside an entered project', () => {
+    const onArchiveSession = vi.fn()
+
+    render(
+      <SidebarSessionsSection
+        activeSessionId={null}
+        emptyState={<div>Empty</div>}
+        grouping="date"
+        label="Sessions"
+        onArchiveSession={onArchiveSession}
+        onDeleteSession={noop}
+        onResumeSession={noop}
+        onToggle={noop}
+        onTogglePin={noop}
+        onToggleUnread={noop}
+        open={true}
+        pinned={false}
+        projectContent={{
+          id: 'home',
+          isNoProject: true,
+          label: 'Home',
+          path: null,
+          repos: [
+            {
+              groups: [
+                {
+                  id: 'home-lane',
+                  label: 'Home',
+                  path: null,
+                  sessions: [makeSession('today'), makeSession('yesterday', 900)]
+                }
+              ],
+              id: 'home-repo',
+              label: 'Home',
+              path: null,
+              sessionCount: 2
+            }
+          ],
+          sessionCount: 2
+        }}
+        sessions={[]}
+      />
+    )
+
+    expect(screen.queryByRole('button', { name: /Archive session/i })).toBeNull()
+    expect(onArchiveSession).not.toHaveBeenCalled()
   })
 })

@@ -603,6 +603,7 @@ export function SidebarSessionsSection({
         onResumeSession={onResumeSession}
         onTogglePin={onTogglePin}
         onToggleUnread={onToggleUnread}
+        onUnarchiveSession={onUnarchiveSession}
         pinned={pinned}
         rows={visibleRows}
         showProfileTags={showProfileTags}
