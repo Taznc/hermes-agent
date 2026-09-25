@@ -620,8 +620,9 @@ def _rule_review_round_cap(task, events, runs, now, cfg) -> list[Diagnostic]:
     detail = (
         f"This task hit {rounds_text} review→changes-requested rounds, at or above the "
         f"configured cap of {cap_text} (kanban.max_review_rounds). The dispatcher stopped "
-        f"re-dispatching it to the implementer or the rework-escalation profile and blocked "
-        f"it instead, so the review loop cannot cycle indefinitely. "
+        f"re-dispatching it (any configured rework-escalation profile already had its one "
+        f"terminal round) and blocked it instead, so the review loop cannot cycle "
+        f"indefinitely. "
     )
     if reason:
         detail += f'Last reviewer feedback: "{reason}". '
