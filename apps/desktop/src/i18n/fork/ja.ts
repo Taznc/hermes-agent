@@ -101,7 +101,6 @@ export const forkJa: TranslationOverrides = {
   sidebar: {
     row: {
       unarchive: 'アーカイブ解除',
-      unarchiveSession: 'セッションのアーカイブを解除',
       providerConfigured: family => `設定済みモデル: ${family}`,
       providerVia: family => `${family} 経由`,
       providerConfiguredVia: (configuredFamily, servedFamily) =>

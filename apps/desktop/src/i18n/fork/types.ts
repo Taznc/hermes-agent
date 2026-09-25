@@ -65,9 +65,8 @@ export interface ForkTranslations {
   }
   sidebar: {
     row: {
-      /** Inverse archive labels for rows rendered by the Archived filter. */
+      /** Inverse archive label for rows rendered by the Archived filter. */
       unarchive: string
-      unarchiveSession: string
       /** Phase 2.12 — "rate limited" terminal sidebar status.
        *  `withTime` when resetAt is known, `unknown` otherwise — never
        *  fabricate a reset time. */

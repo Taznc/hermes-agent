@@ -62,7 +62,6 @@ export const forkZh: ForkTranslations = {
   sidebar: {
     row: {
       unarchive: '取消归档',
-      unarchiveSession: '取消归档会话',
       rateLimited: {
         withTime: time => `Rate limited — retry at ${time}`,
         unknown: 'Rate limited — reset time unknown'

@@ -2228,7 +2228,6 @@ export const ja = defineForkLocale(forkJa, {
       copyIdFailed: 'セッション ID をコピーできませんでした',
 
       sessionActions: 'セッションアクション',
-      archiveSession: 'セッションをアーカイブ',
       sessionRunning: 'セッション実行中',
       needsInput: '入力が必要です',
       waitingForAnswer: '回答を待っています',

@@ -2201,10 +2201,6 @@ export interface UpstreamTranslations {
       openInSplit: string
       copyIdFailed: string
       sessionActions: string
-      /** Accessible name for the always-in-flow row-level archive icon button
-       *  (distinct from the kebab menu's `archive` label — this is the direct
-       *  one-click affordance on the row itself). */
-      archiveSession: string
       sessionRunning: string
       needsInput: string
       waitingForAnswer: string
