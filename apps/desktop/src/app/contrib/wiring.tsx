@@ -47,7 +47,7 @@ import { requestVoiceConversationStart } from '@/store/composer'
 import { $activeConnectionId } from '@/store/connections'
 import { $cronReviewRequest, setCronFocusJobId } from '@/store/cron'
 import { $pinnedSessionIds, pinSession, restoreWorktree, unpinSession } from '@/store/layout'
-import { $startNewSessionFromTopic, type StartNewSessionFromTopic } from '@/store/new-session-proposal'
+import { $startNewSessionFromTopic, makeStartNewSessionFromTopic } from '@/store/new-session-proposal'
 import { dismissNotification, notify, notifyError } from '@/store/notifications'
 import { $previewTarget } from '@/store/preview'
 import {
@@ -746,11 +746,7 @@ export function ContribWiring({ children }: { children: ReactNode }) {
   // session.create with an inline `messages` array, which never persists or
   // submits — see t_2023fb69 review round 1).
   useEffect(() => {
-    const startNewSessionFromTopic: StartNewSessionFromTopic = async topic => {
-      startFreshSessionDraft()
-
-      return submitText(topic)
-    }
+    const startNewSessionFromTopic = makeStartNewSessionFromTopic({ startFreshSessionDraft, submitText })
 
     $startNewSessionFromTopic.set(startNewSessionFromTopic)
 

@@ -19,6 +19,25 @@ export type StartNewSessionFromTopic = (topic: string) => Promise<boolean>
 export const $startNewSessionFromTopic = atom<StartNewSessionFromTopic | null>(null)
 
 /**
+ * The pipeline itself, extracted so it's testable against the REAL
+ * `startFreshSessionDraft`/`submitText` from `usePromptActions` rather than a
+ * mock — `ContribWiring` wires this into `$startNewSessionFromTopic` as-is.
+ * Kept here (not inline in wiring.tsx) purely so a test can import it without
+ * mounting the full contrib tree (t_2023fb69 recovery, reviewer comment 1341
+ * item 2).
+ */
+export function makeStartNewSessionFromTopic(deps: {
+  startFreshSessionDraft: () => void
+  submitText: (text: string) => Promise<boolean>
+}): StartNewSessionFromTopic {
+  return async topic => {
+    deps.startFreshSessionDraft()
+
+    return deps.submitText(topic)
+  }
+}
+
+/**
  * Pending `session.propose.request`s — the desktop half of the
  * `propose_new_session` tool's blocking bridge
  * (tools/propose_new_session_tool.py). Mirrors the clarify/mcp-setup stores:
