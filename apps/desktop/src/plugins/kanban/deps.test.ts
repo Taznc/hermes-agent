@@ -18,6 +18,8 @@ import {
   blockerStand,
   buildGraph,
   cardKey,
+  chainEdges,
+  chainSets,
   type DependencyGraph,
   downstreamOf,
   focusSets,
@@ -787,6 +789,100 @@ describe('focusSets', () => {
     )
 
     expect(focusSets(doubled, 'c').upstream.size).toBe(1)
+  })
+})
+
+describe('chainSets — the transitive counterpart of focusSets', () => {
+  // grandparent → parent → focus → child → grandchild
+  const { graph } = scene(
+    [
+      ['grandparent', 'todo'],
+      ['parent', 'todo'],
+      ['focus', 'todo'],
+      ['child', 'todo'],
+      ['grandchild', 'todo']
+    ],
+    [
+      ['grandparent', 'parent'],
+      ['parent', 'focus'],
+      ['focus', 'child'],
+      ['child', 'grandchild']
+    ]
+  )
+
+  it('includes every blocker upstream, not just the direct one', () => {
+    expect(chainSets(graph, 'focus').upstream).toEqual(new Set(['parent', 'grandparent']))
+  })
+
+  it('includes every dependant downstream, not just the direct one', () => {
+    expect(chainSets(graph, 'focus').downstream).toEqual(new Set(['child', 'grandchild']))
+  })
+
+  it('leaves the one-hop focusSets unchanged on the same graph', () => {
+    expect([...focusSets(graph, 'focus').upstream]).toEqual(['parent'])
+    expect([...focusSets(graph, 'focus').downstream]).toEqual(['child'])
+  })
+
+  it('never contains the focused key itself, even when a cycle loops back onto it', () => {
+    const { graph: cyclic } = scene(
+      [
+        ['a', 'todo'],
+        ['b', 'todo'],
+        ['c', 'todo']
+      ],
+      [
+        ['a', 'b'],
+        ['b', 'c'],
+        ['c', 'a']
+      ]
+    )
+
+    const { downstream, upstream } = chainSets(cyclic, 'a')
+
+    expect(upstream.has('a')).toBe(false)
+    expect(downstream.has('a')).toBe(false)
+    expect(upstream).toEqual(new Set(['b', 'c']))
+    expect(downstream).toEqual(new Set(['b', 'c']))
+  })
+
+  it('returns two empty sets for an unlinked key', () => {
+    const { downstream, upstream } = chainSets(graph, 'nobody')
+
+    expect(upstream.size).toBe(0)
+    expect(downstream.size).toBe(0)
+  })
+})
+
+describe('chainEdges', () => {
+  const { graph } = scene(
+    [
+      ['a', 'todo'],
+      ['b', 'todo'],
+      ['c', 'todo'],
+      ['x', 'todo']
+    ],
+    [
+      ['a', 'b'],
+      ['b', 'c'],
+      ['x', 'b'],
+      ['a', 'b']
+    ]
+  )
+
+  it('returns only edges whose BOTH ends are in the set, oriented parent→child', () => {
+    const edges = chainEdges(graph, new Set(['a', 'b', 'c']))
+
+    expect(edges).toEqual(expect.arrayContaining([['a', 'b'], ['b', 'c']]))
+    expect(edges).toHaveLength(2)
+    expect(edges.some(([parent, child]) => parent === 'x' || child === 'x')).toBe(false)
+  })
+
+  it('de-duplicates a repeated edge', () => {
+    expect(chainEdges(graph, new Set(['a', 'b'])).filter(([p, c]) => p === 'a' && c === 'b')).toHaveLength(1)
+  })
+
+  it('returns nothing for a set with no internal links', () => {
+    expect(chainEdges(graph, new Set(['a', 'c']))).toEqual([])
   })
 })
 

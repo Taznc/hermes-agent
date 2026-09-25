@@ -208,3 +208,56 @@ export function focusSets(graph: DependencyGraph, key: string): { upstream: Set<
     downstream: new Set(downstreamOf(graph, key))
   }
 }
+
+/** Every key reachable from `start` by walking `next` — BFS, so a cycle
+ *  terminates (each key is enqueued once) and `start` itself only appears if
+ *  the walk loops back onto it; callers strip it. */
+function reachable(graph: DependencyGraph, start: string, next: (graph: DependencyGraph, key: string) => readonly string[]): Set<string> {
+  const seen = new Set<string>()
+  const queue = [start]
+
+  for (let head = 0; head < queue.length; head += 1) {
+    for (const neighbour of next(graph, queue[head])) {
+      if (neighbour !== start && !seen.has(neighbour)) {
+        seen.add(neighbour)
+        queue.push(neighbour)
+      }
+    }
+  }
+
+  return seen
+}
+
+/** The opt-in "full chain" counterpart of `focusSets`: the TRANSITIVE closure
+ *  in each direction — every blocker of a blocker, every card waiting on a
+ *  card that waits on this one. Cycle-safe; never contains `key`. The user
+ *  chooses this deliberately (a segmented toggle in the focus bar), so the
+ *  "lights up the whole board" concern that keeps `focusSets` at one hop is
+ *  theirs to weigh. */
+export function chainSets(graph: DependencyGraph, key: string): { upstream: Set<string>; downstream: Set<string> } {
+  return {
+    upstream: reachable(graph, key, upstreamOf),
+    downstream: reachable(graph, key, downstreamOf)
+  }
+}
+
+/** The `[parentKey, childKey]` edges with BOTH ends inside `keys`, each once.
+ *  Feeds the graph overlay: an edge to a card outside the drawn set would
+ *  point at nothing. */
+export function chainEdges(graph: DependencyGraph, keys: ReadonlySet<string>): Array<[string, string]> {
+  const edges: Array<[string, string]> = []
+  const seen = new Set<string>()
+
+  for (const parent of keys) {
+    for (const child of downstreamOf(graph, parent)) {
+      const id = `${parent}\u0001${child}`
+
+      if (keys.has(child) && !seen.has(id)) {
+        seen.add(id)
+        edges.push([parent, child])
+      }
+    }
+  }
+
+  return edges
+}
