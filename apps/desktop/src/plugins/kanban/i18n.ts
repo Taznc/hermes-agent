@@ -296,12 +296,6 @@ type KanbanMessages = {
   /** Focus depth toggle + graph overlay. */
   depFocusDirect: string
   depFocusChain: string
-  depShowGraph: string
-  depGraphTitle: string
-  depGraphLegend: string
-  depGraphOpenCard: string
-  depGraphEmpty: string
-  depGraphHint: string
   comments: (n: number) => string
   commentsHelpRunning: string
   commentsHelp: string
@@ -722,12 +716,6 @@ export const en: KanbanMessages = {
   depClearFocus: 'Clear focus',
   depFocusDirect: 'Direct links',
   depFocusChain: 'Full chain',
-  depShowGraph: 'Show graph',
-  depGraphTitle: 'Dependency graph',
-  depGraphLegend: 'Arrows point from a blocker to the card it blocks · muted arrows are already done',
-  depGraphOpenCard: 'Open card',
-  depGraphEmpty: 'No dependency links to draw',
-  depGraphHint: 'Show dependency graph',
   comments: n => `Comments · ${n}`,
   commentsHelpRunning:
     'This task is running. Your note is folded into the worker’s current turn within a few seconds — no block/unblock dance. “Requeue with note” instead restarts the task from scratch with your note in context.',
@@ -1133,12 +1121,6 @@ const ja: KanbanMessages = {
   depClearFocus: 'フォーカス解除',
   depFocusDirect: '直接リンク',
   depFocusChain: '全チェーン',
-  depShowGraph: 'グラフを表示',
-  depGraphTitle: '依存関係グラフ',
-  depGraphLegend: '矢印はブロック元からブロックされるカードへ · 薄い矢印は完了済み',
-  depGraphOpenCard: 'カードを開く',
-  depGraphEmpty: '描画できる依存関係がありません',
-  depGraphHint: '依存関係グラフを表示',
   comments: n => `コメント・${n}`,
   commentsHelpRunning:
     'このタスクは実行中です。あなたのメモは数秒以内にワーカーの現在のターンに取り込まれます — ブロック/解除の操作は不要です。「メモを付けて再キュー」を選ぶと、メモを文脈に含めてタスクを最初からやり直します。',
@@ -1538,12 +1520,6 @@ const zh: KanbanMessages = {
   depClearFocus: '清除聚焦',
   depFocusDirect: '直接链接',
   depFocusChain: '完整链路',
-  depShowGraph: '显示图谱',
-  depGraphTitle: '依赖图谱',
-  depGraphLegend: '箭头从阻塞方指向被阻塞的卡片 · 淡色箭头表示已完成',
-  depGraphOpenCard: '打开卡片',
-  depGraphEmpty: '没有可绘制的依赖链接',
-  depGraphHint: '显示依赖图谱',
   comments: n => `评论・${n}`,
   commentsHelpRunning:
     '此任务正在运行。你的备注会在几秒内融入工作单元当前的回合 — 无需阻塞/解除操作。选择“附带备注重新入队”则会带着你的备注从头重跑任务。',
@@ -1940,12 +1916,6 @@ const zhHant: KanbanMessages = {
   depClearFocus: '清除聚焦',
   depFocusDirect: '直接連結',
   depFocusChain: '完整鏈路',
-  depShowGraph: '顯示圖譜',
-  depGraphTitle: '相依圖譜',
-  depGraphLegend: '箭頭從阻擋方指向被阻擋的卡片 · 淡色箭頭表示已完成',
-  depGraphOpenCard: '開啟卡片',
-  depGraphEmpty: '沒有可繪製的相依連結',
-  depGraphHint: '顯示相依圖譜',
   comments: n => `留言・${n}`,
   commentsHelpRunning:
     '此任務正在執行。你的備註會在幾秒內融入工作單元目前的回合 — 無需阻擋/解除操作。選擇「附上備註重新排入佇列」則會帶著你的備註從頭重跑任務。',

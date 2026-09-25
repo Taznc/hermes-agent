@@ -20,6 +20,15 @@ import { execFileSync, spawn } from 'node:child_process'
 import { availableParallelism } from 'node:os'
 
 const IS_CI = Boolean(process.env.GITHUB_ACTIONS)
+// Standard (non-paid) fork runners have 4 cores. vitest, tsc and eslint each
+// size their own worker pool from availableParallelism() independently, so
+// running several units at once multiplies that oversubscription — the
+// exact contention that produced the web/TUI timing failures on PR14. The
+// NousResearch org runs this on a 32-core runner (js-tests.yml), where one
+// unit's worker pool already uses the whole machine and concurrent units are
+// the intended win. A local, non-CI run (laptop) is neither: keep it at full
+// parallelism since there is no shared/standard-runner contention to bound.
+const IS_NOUS_CI = IS_CI && process.env.GITHUB_REPOSITORY_OWNER === 'NousResearch'
 const NPM = process.platform === 'win32' ? 'npm.cmd' : 'npm'
 
 /** @returns {{pkg: string, script: string}[]} */
@@ -74,6 +83,24 @@ function runUnit(unit) {
   })
 }
 
+// process.stdout.write() to a pipe (what GitHub Actions and any `cmd |
+// other-cmd` pipeline attach) is asynchronous: a large write can return
+// `false` (the kernel pipe buffer is full) and finish flushing later, on
+// its own tick. `process.exit()` tears the process down immediately and
+// does not wait for that pending flush, so a large buffered failure — a
+// check that printed megabytes before dying — could get truncated mid-log
+// with no indication anything was cut. Wrapping every write in a
+// drain-aware promise, and never force-exiting, makes the full output (and
+// the trailing summary/footer after it) land before the process is
+// allowed to end.
+/** @param {string} text */
+function writeOut(text) {
+  return new Promise((resolve, reject) => {
+    const flushed = process.stdout.write(text, (err) => (err ? reject(err) : resolve()))
+    if (flushed) resolve()
+  })
+}
+
 async function main() {
   const argv = process.argv.slice(2)
   const units = discoverUnits()
@@ -82,7 +109,8 @@ async function main() {
     console.error(
       '::error::No workspace package declares a check script — refusing to report green having run nothing.',
     )
-    process.exit(1)
+    process.exitCode = 1
+    return
   }
 
   if (argv.includes('--list')) {
@@ -93,7 +121,11 @@ async function main() {
   const flagIdx = argv.indexOf('--concurrency')
   const concurrency = Math.max(
     1,
-    flagIdx !== -1 ? Number(argv[flagIdx + 1]) : Math.min(units.length, availableParallelism()),
+    flagIdx !== -1
+      ? Number(argv[flagIdx + 1])
+      : IS_CI && !IS_NOUS_CI
+        ? 1
+        : Math.min(units.length, availableParallelism()),
   )
 
   console.log(`running ${units.length} checks, up to ${concurrency} at a time:`)
@@ -115,7 +147,7 @@ async function main() {
       const status = res.code === 0 ? 'PASS' : 'FAIL'
       if (IS_CI) console.log(`::group::${status} ${label} (${secs}s)`)
       else console.log(`----- ${status} ${label} (${secs}s) -----`)
-      process.stdout.write(res.output.endsWith('\n') ? res.output : res.output + '\n')
+      await writeOut(res.output.endsWith('\n') ? res.output : res.output + '\n')
       if (IS_CI) console.log('::endgroup::')
     }
   }
@@ -133,7 +165,8 @@ async function main() {
   if (failed.length > 0) {
     for (const r of failed) console.error(`::error::${r.unit.pkg} :: ${r.unit.script} failed`)
     console.error(`::error::${failed.length} of ${results.length} checks failed`)
-    process.exit(1)
+    process.exitCode = 1
+    return
   }
   console.log(`\nall ${results.length} checks passed`)
 }

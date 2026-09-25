@@ -455,6 +455,7 @@ export function Card({
             dimmed && 'opacity-35 saturate-50',
             dragging && 'opacity-40'
           )}
+          data-card-key={key}
           draggable
           onClick={event => {
             if (event.metaKey || event.ctrlKey) {
@@ -531,29 +532,12 @@ export function Card({
               </button>
             </Tip>
           )}
-          {/* Sibling affordance: the same trace, drawn as a graph. Sits left of
-              the trace button so the two read as one hover group. */}
-          {linked && (
-            <Tip label={k.depGraphHint}>
-              <button
-                aria-label={k.depGraphHint}
-                className="absolute top-1.5 right-7 grid size-5 place-items-center rounded text-(--ui-text-quaternary) opacity-0 transition-opacity group-hover:opacity-100 hover:bg-(--chrome-action-hover) hover:text-foreground focus-visible:opacity-100"
-                onClick={event => {
-                  event.stopPropagation()
-                  deps.onOpenGraph(key)
-                }}
-                type="button"
-              >
-                <Codicon name="type-hierarchy" size="0.8rem" />
-              </button>
-            </Tip>
-          )}
           <span
             className={cn(
               'line-clamp-2 text-[0.8125rem] font-medium leading-snug text-foreground',
-              // Keep the title clear of the dependency focus affordances. Static
+              // Keep the title clear of the dependency focus affordance. Static
               // per task, so hover never reflows the card.
-              linked && 'pr-11'
+              linked && 'pr-5'
             )}
           >
             {task.title || task.id}
@@ -777,7 +761,7 @@ export function Column({
           <Codicon name="chevron-left" size="0.75rem" />
         </button>
       </header>
-      <div className="relative flex min-h-0 flex-1 flex-col gap-2 overflow-y-auto">
+      <div className="relative flex min-h-0 flex-1 flex-col gap-2 overflow-y-auto" data-lane-scroller>
         {lanes
           ? lanes.map(([assignee, tasks]) => (
               <div className="flex flex-col gap-2" key={assignee}>
