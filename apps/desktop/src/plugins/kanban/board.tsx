@@ -49,6 +49,7 @@ import {
   primeAllBoardsSocket
 } from './api'
 import { ArchiveDoneControl } from './archive-done-control'
+import { BoardDependencyArrows } from './board-arrows-layer'
 import { BoardSwitcher } from './board-switcher'
 import { BoardInfoContext, Column, EMPTY_BOARD_INFO } from './card'
 import { DependencyGraphDialog, type FocusDepth, FocusDepthControls } from './dependency-graph-dialog'
@@ -990,7 +991,16 @@ export function KanbanBoardPage() {
               // This is the board's sole vertical flex child. `min-h-0` lets it
               // yield space to the page chrome (including the status bar)
               // instead of extending underneath it on a short viewport.
-              className={cn('flex min-h-0 flex-1 gap-2 overflow-x-auto px-4 pt-1 pb-3', grabbing && 'cursor-grabbing')}
+              // `relative`: the dependency-arrow layer is positioned against the
+              // strip's scroll content, so it pans with the lanes for free.
+              // While a trace is live the right gutter grows to fit the widest
+              // same-lane bracket (LOOP_OUT + 40), so the last lane's loop is
+              // never clipped by the strip's scroll edge.
+              className={cn(
+                'relative flex min-h-0 flex-1 gap-2 overflow-x-auto px-4 pt-1 pb-3',
+                focused && 'pr-16',
+                grabbing && 'cursor-grabbing'
+              )}
               // Clicking the board background clears the trace — the gaps between
               // lanes, a lane's padding, a lane header, empty column space. Keyed
               // off "the click did not land on a card" rather than a strict
@@ -1033,6 +1043,18 @@ export function KanbanBoardPage() {
                   />
                 )
               })}
+              {/* Arrows between the real cards while a trace is live. Keyed off
+                  the same `chain` sets that light the cards, so an arrow never
+                  lands on a dimmed card. */}
+              <BoardDependencyArrows
+                depth={focusDepth}
+                downstream={chain.downstream}
+                focused={focused}
+                graph={graph}
+                index={index}
+                stripRef={lanesRef}
+                upstream={chain.upstream}
+              />
             </div>
           )}
 
