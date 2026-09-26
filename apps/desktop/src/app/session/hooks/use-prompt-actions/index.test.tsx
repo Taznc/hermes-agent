@@ -133,7 +133,8 @@ function Harness({
   selectedStoredSessionIdRef: selectedStoredSessionIdRefProp,
   storedSessionId,
   activeSessionId,
-  createBackendSessionForSend
+  createBackendSessionForSend,
+  startFreshSessionDraft
 }: {
   activeSessionIdRef?: MutableRefObject<string | null>
   busyRef?: MutableRefObject<boolean>
@@ -159,6 +160,7 @@ function Harness({
   storedSessionId?: null | string
   activeSessionId?: null | string
   createBackendSessionForSend?: (preview?: null | string) => Promise<null | string>
+  startFreshSessionDraft?: () => void
 }) {
   const localActiveSessionIdRef = useRef<string | null>(
     activeSessionId === undefined ? RUNTIME_SESSION_ID : activeSessionId
@@ -208,7 +210,7 @@ function Harness({
     resumeStoredSession: resumeStoredSession ?? (() => undefined),
     runtimeIdByStoredSessionIdRef,
     selectedStoredSessionIdRef,
-    startFreshSessionDraft: () => undefined,
+    startFreshSessionDraft: startFreshSessionDraft ?? (() => undefined),
     sttEnabled: false,
     updateSessionState: (sessionId, updater, storedSessionId) => {
       // Seed with interrupted:true so we can prove a fresh submit clears it.
@@ -429,6 +431,100 @@ function renderedSeedTexts(seeds: Record<string, unknown>[]): string[] {
     return messages.flatMap(message => (message.parts ?? []).map(part => part.text ?? ''))
   })
 }
+
+// Manual trigger for the same clean hand-off the propose_new_session tool card
+// offers (t_2023fb69 recovery, reviewer comment 1341 item 1): /new-topic must
+// start a fresh draft and submit the topic through the normal prompt path,
+// and an empty topic must no-op instead of falling back to exec.
+describe('usePromptActions /new-topic', () => {
+  afterEach(() => {
+    cleanup()
+    vi.restoreAllMocks()
+  })
+
+  it('starts a fresh draft and submits the topic through the normal prompt path', async () => {
+    const startFreshSessionDraft = vi.fn()
+    const submitted: (Record<string, unknown> | undefined)[] = []
+
+    const requestGateway = vi.fn(async (method: string, params?: Record<string, unknown>) => {
+      if (method === 'prompt.submit') {
+        submitted.push(params)
+      }
+
+      return {} as never
+    })
+
+    let handle: HarnessHandle | null = null
+    await actRender(
+      <Harness
+        onReady={h => (handle = h)}
+        refreshSessions={async () => undefined}
+        requestGateway={requestGateway}
+        startFreshSessionDraft={startFreshSessionDraft}
+      />
+    )
+
+    await handle!.submitText('/new-topic refactor the auth module')
+
+    // Fresh draft first — mirrors New Chat + type + Enter, never a raw
+    // session.create with an inline messages array (t_2023fb69 round 1).
+    expect(startFreshSessionDraft).toHaveBeenCalledTimes(1)
+    expect(requestGateway).not.toHaveBeenCalledWith('slash.exec', expect.anything())
+    expect(requestGateway).toHaveBeenCalledWith(
+      'prompt.submit',
+      expect.objectContaining({ text: 'refactor the auth module' }),
+      expect.anything()
+    )
+    expect(submitted).toEqual([expect.objectContaining({ text: 'refactor the auth module' })])
+  })
+
+  it('no-ops on an empty topic instead of starting a draft or falling back to exec', async () => {
+    const startFreshSessionDraft = vi.fn()
+    const requestGateway = vi.fn(async () => ({}) as never)
+
+    let handle: HarnessHandle | null = null
+    await actRender(
+      <Harness
+        onReady={h => (handle = h)}
+        refreshSessions={async () => undefined}
+        requestGateway={requestGateway}
+        startFreshSessionDraft={startFreshSessionDraft}
+      />
+    )
+
+    await handle!.submitText('/new-topic')
+
+    expect(startFreshSessionDraft).not.toHaveBeenCalled()
+    expect(requestGateway).not.toHaveBeenCalled()
+    expect($notifications.get()).toEqual(
+      expect.arrayContaining([expect.objectContaining({ kind: 'error', title: 'Topic required' })])
+    )
+
+    clearNotifications()
+  })
+
+  it('no-ops on whitespace-only arg the same way as no arg at all', async () => {
+    const startFreshSessionDraft = vi.fn()
+    const requestGateway = vi.fn(async () => ({}) as never)
+
+    let handle: HarnessHandle | null = null
+    await actRender(
+      <Harness
+        onReady={h => (handle = h)}
+        refreshSessions={async () => undefined}
+        requestGateway={requestGateway}
+        startFreshSessionDraft={startFreshSessionDraft}
+      />
+    )
+
+    await handle!.submitText('/new-topic    ')
+
+    expect(startFreshSessionDraft).not.toHaveBeenCalled()
+    expect(requestGateway).not.toHaveBeenCalled()
+
+    clearNotifications()
+  })
+})
 
 // The HUD floats over the app the user is really working in, so the gateway
 // turns this flag into a per-turn hint: read the window underneath and work in

@@ -11,6 +11,7 @@ import { type ComponentProps, type FC, type ReactNode, useEffect, useMemo, useRe
 import { ClarifyTool } from '@/components/assistant-ui/clarify-tool'
 import { MarkdownText, MarkdownTextContent } from '@/components/assistant-ui/markdown-text'
 import { McpSetupTool } from '@/components/assistant-ui/mcp-setup-tool'
+import { NewSessionProposalTool } from '@/components/assistant-ui/new-session-proposal-tool'
 import { AgentDeliveryNotice, deliveryTargetFromCommand } from '@/components/assistant-ui/thread/agent-delivery'
 import { TimelineTimestamp } from '@/components/assistant-ui/thread/timeline-timestamp'
 import { DelegateTool } from '@/components/assistant-ui/tool/delegate'
@@ -118,6 +119,10 @@ const CoreChainToolFallback: FC<TimelineToolCallProps> = props => {
 
   if (props.toolName === 'setup_mcp') {
     return <McpSetupTool {...props} />
+  }
+
+  if (props.toolName === 'propose_new_session') {
+    return <NewSessionProposalTool {...props} />
   }
 
   return <ToolFallback {...props} />

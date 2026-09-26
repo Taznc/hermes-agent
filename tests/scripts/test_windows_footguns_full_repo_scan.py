@@ -14,18 +14,20 @@ before anyone ran the script directly. This closes that gap the same way
 the stdin guard already closes its equivalent one.
 
 The Python ruleset scans clean on this tree (asserted unconditionally
-below). The newer JS/TS ruleset (apps/desktop/{src,electron,scripts}) is a
-genuine tooling gap fix: it surfaces real, pre-existing Windows footguns
-in the current tree that predate this checker's JS/TS coverage and are
-each individually triaged (see the card thread / commit message for the
-full list — six fs.watch() sites needing error handlers, template-literal
-path joins, CRLF-unsafe splits, etc.). Those are fixed by sibling cards,
-not by this tooling card, so this test allowlists the exact known sites
-by ``file:rule`` pair rather than suppressing them inline (suppression
-markers would silence the checker for the callers who ARE about to fix
-them). Any NEW match — a different file, a different rule, or a genuinely
+below). The JS/TS ruleset (apps/desktop/{src,electron,scripts}) previously
+carried a KNOWN_JS_TRUE_POSITIVES allowlist of 12 real, pre-existing
+Windows footguns that predated this checker's JS/TS coverage. All 12 were
+fixed in commit 3016a2c1ca5cadb78423f57269d6e99fe94aa91c ("fix(desktop):
+resolve Windows-footgun findings and map contributor emails", already on
+dev): inline suppressions for the two already-normalized template-literal
+joins, error handlers wired for the fs.watch() sites, CRLF-safe
+split(/\r?\n/) in place of split('\n'), a ctrlKey fallback added alongside
+metaKey, and a shared joinPath() helper replacing the remaining bare
+${x}/ joins. --all now exits 0 on the full repo, so the allowlist is
+empty. Any NEW match — a different file, a different rule, or a genuinely
 new site — still fails the test, which is the regression-guard property
-that matters.
+that matters. Do not repopulate this allowlist as a parking lot; fix the
+footgun or suppress it inline with a comment naming the guard.
 """
 
 from __future__ import annotations
@@ -40,29 +42,26 @@ SCRIPT = REPO_ROOT / "scripts" / "check-windows-footguns.py"
 
 # (relative file path, rule name) pairs that are KNOWN, TRIAGED true
 # positives on the current tree as of the JS/TS ruleset's introduction.
-# Each is a real pre-existing Windows footgun slated for a sibling fix
-# card, not a checker false positive — do not add an entry here to
-# silence a NEW finding; use an inline `// windows-footgun: ok` suppression
-# instead if it's genuinely a false positive, or fix the underlying bug.
-KNOWN_JS_TRUE_POSITIVES = {
-    ("apps/desktop/src/lib/chat-runtime.ts", "template-literal filesystem path join with bare '/'"),
-    ("apps/desktop/src/app/settings/plugins-settings.tsx", "template-literal filesystem path join with bare '/'"),
-    # NOTE: right-sidebar/review/file-tree.tsx used to be listed here. The
-    # Windows path-correctness card (fcc6e84153) routed that join through
-    # path-compare.ts's cleanPath/comparisonPath, so the checker no longer
-    # flags it. Both cards were in flight at once; this allowlist was written
-    # against the pre-fix tree.
-    ("apps/desktop/src/app/right-sidebar/files/ipc.ts", "template-literal filesystem path join with bare '/'"),
-    ("apps/desktop/src/app/chat/composer/index.tsx", "metaKey without a ctrlKey fallback"),
-    ("apps/desktop/src/store/coding-status.ts", "template-literal filesystem path join with bare '/'"),
-    ("apps/desktop/electron/main.ts", "fs.watch() without a nearby error handler"),
-    ("apps/desktop/electron/main.ts", "split('\\n') on child process output"),
-    ("apps/desktop/electron/dev-backend-watch.real-loop.test.ts", "fs.watch() without a nearby error handler"),
-    ("apps/desktop/electron/git-review-ops.ts", "split('\\n') on child process output"),
-    ("apps/desktop/electron/bootstrap-runner.ts", "spawn('bash'|'sh') without a platform guard"),
-    ("apps/desktop/scripts/perf/gateway_attach_bench.py", "bare Path.read_text()/write_text() without encoding="),
-    ("apps/desktop/scripts/perf/scenarios/right-pane.mjs", "template-literal filesystem path join with bare '/'"),
-}
+# Each entry here is a real pre-existing Windows footgun awaiting a
+# sibling fix card, not a checker false positive — do not add an entry
+# here to silence a NEW finding; use an inline `// windows-footgun: ok`
+# suppression instead if it's genuinely a false positive, or fix the
+# underlying bug.
+#
+# Empty as of commit 3016a2c1ca5cadb78423f57269d6e99fe94aa91c
+# ("fix(desktop): resolve Windows-footgun findings and map contributor
+# emails", already on origin/dev), which fixed the 12 entries that used
+# to live here (apps/desktop/electron/bootstrap-runner.ts,
+# dev-backend-watch.real-loop.test.ts, git-review-ops.ts, main.ts (x2),
+# apps/desktop/scripts/perf/gateway_attach_bench.py,
+# scripts/perf/scenarios/right-pane.mjs, apps/desktop/src/app/chat/
+# composer/index.tsx, right-sidebar/files/ipc.ts, settings/
+# plugins-settings.tsx, apps/desktop/src/lib/chat-runtime.ts,
+# apps/desktop/src/store/coding-status.ts) via inline suppressions,
+# nearby error handlers, CRLF-safe splits, a ctrlKey fallback, and the
+# shared joinPath() helper. `--all` scans clean, so this stays empty
+# until a genuinely new triaged true positive appears.
+KNOWN_JS_TRUE_POSITIVES: set[tuple[str, str]] = set()
 
 MATCH_HEADER_RE = re.compile(r"^(\S+):\d+: \[(.+)\]$", re.MULTILINE)
 
