@@ -196,14 +196,21 @@ class DispatchResult:
     telemetry/CLI/dashboard can show the implementer->reviewer handoff."""
     auto_escalated_rework: list[tuple[str, str, str, int]] = field(default_factory=list)
     """``(task_id, previous_assignee, escalation_profile, changes_rounds)`` for
-    ready cards routed to a specialist after repeated requested-change cycles."""
+    ready cards routed to a specialist after repeated requested-change cycles
+    while still UNDER ``kanban.max_review_rounds``."""
+    escalated_review_cap: list[tuple[str, str, str, int]] = field(default_factory=list)
+    """``(task_id, previous_assignee, escalation_profile, changes_rounds)`` for
+    ready cards that reached ``kanban.max_review_rounds`` and were handed to
+    ``kanban.review_rework_escalation_profile`` for exactly ONE terminal,
+    scope-locked rework round (event ``review_cap_escalated``) instead of being
+    blocked outright. The card blocks on the next tick only if that escalated
+    round also comes back ``changes_requested``."""
     blocked_review_round_cap: list[tuple[str, int]] = field(default_factory=list)
-    """``(task_id, changes_rounds)`` for ready cards that hit
-    ``kanban.max_review_rounds`` and were blocked (kind ``review_round_cap``)
-    instead of being re-dispatched to the implementer or escalation profile.
-    The hard stop for the review<->changes_requested loop — checked BEFORE
-    ``auto_escalated_rework`` so a card at the cap blocks rather than getting
-    one more escalated round."""
+    """``(task_id, changes_rounds)`` for ready cards at ``kanban.max_review_rounds``
+    that were blocked (kind ``review_round_cap``). The hard stop for the
+    review<->changes_requested loop — reached only when no escalation profile is
+    configured, or when the escalation profile already owns the card (its terminal
+    round came back ``changes_requested`` too)."""
     skipped_nonspawnable: list[str] = field(default_factory=list)
     """Ready task ids whose assignee names a control-plane lane (e.g. a Claude
     Code terminal like ``orion-cc``), not a Hermes profile. Expected steady-state
@@ -2409,11 +2416,14 @@ def _apply_review_round_cap(
     max_review_rounds: int,
     dry_run: bool,
 ) -> bool:
-    """Hard-stop a card that hit ``kanban.max_review_rounds``: block it instead of
-    re-dispatching to the implementer or the rework escalation profile.
+    """Hard-stop a card that hit ``kanban.max_review_rounds`` with no escalation
+    left: block it instead of re-dispatching to the implementer.
 
     This is the hard stop for the review<->changes_requested loop (the reviewer-side
-    round contract in the sdlc-review skill is advisory only). Mirrors
+    round contract in the sdlc-review skill is advisory only). The dispatcher only
+    reaches it once ``kanban.review_rework_escalation_profile`` is unset or has
+    already had its one terminal round (see :func:`_apply_rework_escalation` with
+    ``review_cap``). Mirrors
     :func:`_apply_rework_escalation`'s shape: a raw UPDATE guarded by the row's
     current status/assignee so a race (row already claimed/reassigned) is a no-op,
     plus a durable event carrying the round count and last reviewer reason.
@@ -2486,6 +2496,7 @@ def _apply_rework_escalation(
     previous_assignee: str,
     changes_rounds: int,
     dry_run: bool,
+    review_cap: Optional[int] = None,
 ) -> bool:
     """Route repeated review rework to a specialist under its own model route.
 
@@ -2494,6 +2505,13 @@ def _apply_rework_escalation(
     routing-classifier pick is cleared, matching the specialist's OWN model
     defaults the way a classifier pick already did before an operator ever
     touched the card.
+
+    ``review_cap`` marks the handoff as the card's ONE terminal rework round at
+    ``kanban.max_review_rounds``: the same guarded UPDATE, plus a durable
+    ``review_cap_escalated`` event so the worker packet and the next tick can
+    tell "escalated at the cap" from an ordinary under-cap escalation. A further
+    ``changes_requested`` after this round blocks the card
+    (:func:`_apply_review_round_cap`).
     """
     if dry_run:
         return True
@@ -2560,6 +2578,18 @@ def _apply_rework_escalation(
                     "preserved_overrides": preserve,
                 },
             )
+            if review_cap is not None:
+                _kb._append_event(
+                    conn,
+                    task_id,
+                    "review_cap_escalated",
+                    {
+                        "changes_rounds": changes_rounds,
+                        "max_review_rounds": review_cap,
+                        "escalation_profile": escalation_profile,
+                        "previous_assignee": previous_assignee,
+                    },
+                )
     except Exception:
         _kb._log.debug(
             "kanban dispatch: failed to escalate review rework for task %s to %r",
@@ -3115,24 +3145,41 @@ def _dispatch_once_locked(
                 continue
             row_assignee = default_assignee
             result.auto_assigned_default.append(row["id"])
-        # Hard round cap runs BEFORE escalation: a card that already hit the cap must block,
-        # not get re-routed to a specialist for yet another round. Manual reassignment after
-        # the last changes_requested is the same escape hatch the escalation path already
-        # honors — an operator's explicit routing decision always wins over both mechanisms.
+        # Round cap vs. escalation. At kanban.max_review_rounds the card gets ONE terminal
+        # rework round under kanban.review_rework_escalation_profile (recorded as
+        # review_cap_escalated so the worker knows it is the last pass); it blocks only when
+        # that escalated round ALSO comes back changes_requested (the profile already owns
+        # the card) or when no escalation profile is configured. Manual reassignment after
+        # the last changes_requested is the escape hatch both mechanisms honor — an
+        # operator's explicit routing decision always wins.
         changes_rounds, latest_change_id = _changes_requested_state(conn, row["id"])
         manually_reassigned = _manually_assigned_after(conn, row["id"], latest_change_id)
-        if (
-            max_review_rounds
-            and changes_rounds >= max_review_rounds
-            and not manually_reassigned
-            and _apply_review_round_cap(
+        at_cap = bool(max_review_rounds) and changes_rounds >= max_review_rounds
+        if at_cap and not manually_reassigned:
+            if (
+                rework_escalation_profile
+                and row_assignee != rework_escalation_profile
+                and _apply_rework_escalation(
+                    conn,
+                    row["id"],
+                    rework_escalation_profile,
+                    previous_assignee=row_assignee,
+                    changes_rounds=changes_rounds,
+                    dry_run=dry_run,
+                    review_cap=max_review_rounds,
+                )
+            ):
+                result.escalated_review_cap.append(
+                    (row["id"], row_assignee, rework_escalation_profile, changes_rounds)
+                )
+                row_assignee = rework_escalation_profile
+            elif _apply_review_round_cap(
                 conn, row["id"], changes_rounds=changes_rounds,
                 max_review_rounds=max_review_rounds, dry_run=dry_run,
-            )
-        ):
-            result.blocked_review_round_cap.append((row["id"], changes_rounds))
-            continue
-        if rework_escalation_profile and row_assignee != rework_escalation_profile:
+            ):
+                result.blocked_review_round_cap.append((row["id"], changes_rounds))
+                continue
+        elif rework_escalation_profile and row_assignee != rework_escalation_profile:
             if (
                 changes_rounds >= 2
                 and not manually_reassigned

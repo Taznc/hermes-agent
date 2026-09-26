@@ -187,10 +187,12 @@ FORK_KANBAN_DEFAULTS = {
         "max_file_bytes": 5 * 1024 * 1024,
         "max_total_bytes": 20 * 1024 * 1024,
     },
-    # Hard stop on the review<->changes_requested loop: once a card accumulates this many
-    # changes_requested events since its last completion, the dispatcher blocks it
-    # (kind="review_round_cap") instead of re-dispatching to the implementer or escalation
-    # profile. 0 = unlimited (legacy behavior). The reviewer-side round contract (sdlc-review
+    # Bound on the review<->changes_requested loop: once a card accumulates this many
+    # changes_requested events since its last completion, the dispatcher hands it to
+    # review_rework_escalation_profile for ONE terminal rework round (event
+    # review_cap_escalated) and blocks it (kind="review_round_cap") only if that round also
+    # comes back changes_requested — or immediately, when no escalation profile is set.
+    # 0 = unlimited (legacy behavior). The reviewer-side round contract (sdlc-review
     # skill) is advisory; this is the hard stop that actually bounds a runaway rework loop.
     "max_review_rounds": 3,
     # Refuse a kanban_request_review handoff whose branch already conflicts with the board's
@@ -203,6 +205,12 @@ FORK_KANBAN_DEFAULTS = {
     # pushed, mergeable, acceptance) are accepted, not required. Off by default; the
     # refusal is an actionable tool error and the card stays with the implementer.
     "require_pre_review_gate": False,
+    # Refuse a kanban_request_review handoff on a card with >= 1 changes_requested round
+    # since its last completion unless metadata.rework_items=[{item, evidence}] maps each
+    # reviewer item to its proof. An incomplete rework handoff otherwise burns the next
+    # review round on "items 2 and 3 still not done" — with max_review_rounds at 2 that is
+    # the main way a card hits the cap. First-time requests are never gated.
+    "require_rework_items_for_review": True,
     # Argv PREFIX prepended to every spawned worker command. Empty list (default) = today's
     # plain `subprocess.Popen(argv, ...)` on every platform (Windows, macOS, non-systemd
     # Linux) — byte-identical behaviour, nothing to configure. When non-empty, the dispatcher

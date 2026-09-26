@@ -161,6 +161,11 @@ def _cmd_dispatch(args: argparse.Namespace) -> int:
                  "changes_rounds": rounds}
                 for (tid, prev, who, rounds) in res.auto_escalated_rework
             ],
+            "escalated_review_cap": [
+                {"task_id": tid, "previous_assignee": prev, "assignee": who,
+                 "changes_rounds": rounds}
+                for (tid, prev, who, rounds) in res.escalated_review_cap
+            ],
             "blocked_review_round_cap": [
                 {"task_id": tid, "changes_rounds": rounds}
                 for (tid, rounds) in res.blocked_review_round_cap
@@ -206,6 +211,12 @@ def _cmd_dispatch(args: argparse.Namespace) -> int:
     for tid, previous, who, rounds in res.auto_escalated_rework:
         print(
             f"Escalated review rework after {rounds} change requests: "
+            f"{tid} ({previous} -> {who})"
+        )
+    for tid, previous, who, rounds in res.escalated_review_cap:
+        print(
+            f"Escalated at kanban.max_review_rounds={caps.max_review_rounds} "
+            f"after {rounds} change requests (terminal rework round): "
             f"{tid} ({previous} -> {who})"
         )
     for tid, rounds in res.blocked_review_round_cap:

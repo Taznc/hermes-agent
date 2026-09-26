@@ -640,17 +640,20 @@ loops without removing review: the first changes request returns to the original
 implementer; after the second, the next ready run is reassigned to the configured
 specialist under that profile's own model defaults.
 
-`max_review_rounds` (default `3`, set `0` to disable) is the dispatcher's hard
-stop on that same loop: once a card accumulates this many `changes_requested`
-cycles since its last completion, the dispatcher blocks it (kind
+`max_review_rounds` (default `3`, set `0` to disable) bounds that same loop.
+Once a card accumulates this many `changes_requested` cycles since its last
+completion, the dispatcher hands it to `review_rework_escalation_profile` for
+exactly **one terminal rework round** (event `review_cap_escalated`; the
+worker packet's `review.terminal_rework` is `true` for that run so the
+specialist knows it is the last pass) and reports it as an
+`escalated_review_cap` entry in `hermes kanban dispatch` output. Only if that
+escalated round *also* comes back `changes_requested` — or if no escalation
+profile is configured — does the dispatcher block the card (kind
 `review_round_cap`, visible via the card's status and its `review_round_cap`
 event in `hermes kanban show <id>`, as a dedicated `review_round_cap`
 diagnostic — round count, cap, and last reviewer reason — in
 `hermes kanban diagnostics`, and as a `blocked_review_round_cap` entry in both
-the text and `--json` output of `hermes kanban dispatch`) instead of
-re-dispatching it to the
-implementer or the escalation profile — `review_rework_escalation_profile`
-still fires first for rounds under the cap. It is a hard stop; the
+the text and `--json` output of `hermes kanban dispatch`). It is a hard stop; the
 reviewer-side round-count guidance in the sdlc-review skill is advisory
 only. An operator's explicit reassignment after the last `changes_requested`
 event bypasses both mechanisms, the same escape hatch
@@ -658,6 +661,19 @@ event bypasses both mechanisms, the same escape hatch
 needs an explicit `kanban unblock` to resume — the round count itself is not
 reset by unblocking, only by completion, so simply unblocking a
 still-cycling card immediately re-trips the cap on the next tick.
+
+`require_rework_items_for_review` (default `true`) closes the most common way a
+card reaches that cap: a rework run that silently skipped some of the
+reviewer's numbered items. Once a card has one or more `changes_requested`
+events since its last completion, both `kanban_request_review` and
+`hermes kanban request-review` refuse a handoff whose metadata lacks
+`rework_items` — a non-empty list of `{item, evidence}` objects — and the
+refusal quotes that reason back so the implementer can fill it in without
+another lookup. When the reviewer's reason uses a numbered list (lines
+starting `1.`, `2)`, ...), the gate also requires at least that many
+`rework_items` entries; it is a count-bound shape check, not semantic
+verification that entry *N* actually addresses item *N* — the reviewer still
+confirms correspondence at review time. First-time handoffs are not gated.
 
 An operator-set model/provider/reasoning override (set at task creation with
 an explicit model, or later via `kanban set-model`) survives both
