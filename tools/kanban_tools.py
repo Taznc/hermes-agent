@@ -20,6 +20,7 @@ from agent.redact import redact_sensitive_text
 from hermes_cli.goals import judge_goal
 from tools.registry import registry, tool_error
 from tools import kanban_tools_mergeability as _ktm
+from tools import kanban_tools_review_gate as _krg
 from hermes_cli.config import cfg_get, load_config
 from tools.kanban_tools_schemas import (
     KANBAN_ATTACH_SCHEMA,
@@ -731,6 +732,8 @@ def _handle_request_review(args: dict, **kw) -> str:
     if metadata is not None:
         metadata = _redact_metadata(metadata)
         _check(metadata is not None, "metadata could not be safely serialized")
+    if gate_refusal := _krg.refusal(metadata):
+        raise _Reject(gate_refusal)
     metadata = _stamp_worker_session_metadata(tid, metadata)
     # Reviewer is model-supplied free text stored durably on the event payload.
     reviewer = _redact_opt(args.get("reviewer") or None)
