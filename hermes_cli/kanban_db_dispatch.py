@@ -1155,6 +1155,11 @@ def _reclaim_dead_workers(conn: sqlite3.Connection, board: Optional[str] = None)
                 continue
             if _worker_alive(row["worker_pid"], _kb._row_get(row, "worker_started_at")):
                 continue
+            # >>> FORK ANCHOR: infra-interruptions <<<
+            from hermes_fork.kanban.infra_interruptions import book_host_restart as _fork_host_restart
+            if _fork_host_restart(conn, row, sweep, board=board):
+                continue
+            # <<< FORK ANCHOR >>>
 
             pid = int(row["worker_pid"])
             dead = _classify_dead_worker(pid, row["claim_lock"], task_id=row["id"], board=board)
