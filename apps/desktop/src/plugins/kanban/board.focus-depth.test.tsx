@@ -89,8 +89,13 @@ async function mount() {
   await screen.findByText('Focus')
 }
 
-/** The card container for a title — the draggable node the rings live on. */
-const cardOf = (title: string) => screen.getByText(title).closest('[draggable="true"]') as HTMLElement
+/** The card container for a title — the draggable node the rings live on.
+ *  Scoped to cards: the answer bar repeats linked cards' titles. */
+const cardOf = (title: string) =>
+  screen
+    .queryAllByText(title)
+    .map(el => el.closest<HTMLElement>('[draggable="true"]'))
+    .find(Boolean) as HTMLElement
 
 /** A trace is live iff the focus hint bar is up. The focused
  *  card's own trace button shares the label, hence getAll. */
@@ -109,12 +114,14 @@ describe('focus depth on the board', () => {
 
     const dimmed = (title: string) => cardOf(title).classList.contains('opacity-35')
 
-    // Direct: parent lit, grandparent dimmed.
+    // Direct: parent lit; the grandparent is outside the trace, so it is
+    // folded into its lane's "+N cards" gap rather than drawn.
     expect(dimmed('Parent')).toBe(false)
-    expect(dimmed('Grandparent')).toBe(true)
+    expect(cardOf('Grandparent')).toBeUndefined()
 
     fireEvent.click(screen.getByRole('button', { name: 'depFocusChain' }))
 
-    await waitFor(() => expect(dimmed('Grandparent')).toBe(false))
+    await waitFor(() => expect(cardOf('Grandparent')).toBeDefined())
+    expect(dimmed('Grandparent')).toBe(false)
   })
 })

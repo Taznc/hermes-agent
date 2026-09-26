@@ -98,7 +98,6 @@ export const forkZhHant: TranslationOverrides = {
   sidebar: {
     row: {
       unarchive: '取消封存',
-      unarchiveSession: '取消封存工作階段',
       providerConfigured: family => `設定的模型：${family}`,
       providerVia: family => `經由 ${family}`,
       providerConfiguredVia: (configuredFamily, servedFamily) =>

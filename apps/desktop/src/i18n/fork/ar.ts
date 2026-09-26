@@ -77,7 +77,6 @@ export const forkAr: TranslationOverrides = {
   sidebar: {
     row: {
       unarchive: 'إلغاء الأرشفة',
-      unarchiveSession: 'إلغاء أرشفة الجلسة',
       providerConfigured: family => `النموذج المُهيأ: ${family}`,
       providerVia: family => `عبر ${family}`,
       providerConfiguredVia: (configuredFamily, servedFamily) =>

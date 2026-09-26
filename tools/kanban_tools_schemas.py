@@ -240,7 +240,13 @@ KANBAN_REQUEST_REVIEW_SCHEMA = _schema(
             "type": "object",
             "description": (
                 "Optional structured handoff facts for the reviewer, such "
-                "as changed_files, tests_run, commit, or decisions."
+                "as changed_files, tests_run, commit, or decisions. REQUIRED "
+                "on a rework handoff (the reviewer previously requested "
+                "changes on this task): rework_items, a non-empty list of "
+                "{item, evidence} objects, one per numbered item in the "
+                "reviewer's latest changes_requested reason, where evidence "
+                "is the commit/test/output proving that item is done. The "
+                "request is refused without it."
             ),
             "additionalProperties": True,
         },

@@ -8,8 +8,7 @@ export const forkRu: TranslationOverrides = {
   },
   sidebar: {
     row: {
-      unarchive: 'Разархивировать',
-      unarchiveSession: 'Разархивировать сеанс'
+      unarchive: 'Разархивировать'
     }
   },
   desktop: {

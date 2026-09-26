@@ -1,7 +1,8 @@
 import { invalidateSlashCompletions } from '@/lib/slash-completion-cache'
 import { refreshBackgroundProcesses } from '@/store/composer-status'
+import { $gateway } from '@/store/gateway'
 import { flashPetActivity, setPetActivity } from '@/store/pet'
-import { hasPendingInputRequest } from '@/store/prompts'
+import { hasPendingInputRequest, reconcileParkedApproval } from '@/store/prompts'
 import { pruneDelegateFallbackSubagents, upsertSubagent } from '@/store/subagents'
 import { reportMcpToolResult } from '@/store/suggestion-providers/repair'
 import { invalidateSkillSuggestionIndex } from '@/store/suggestion-providers/skill'
@@ -73,6 +74,7 @@ export function handleToolEvent(ctx: GatewayEventContext): boolean {
       // This live projection is deliberately not part of the tool result, so
       // transcript hydration cannot recreate an untrusted historical frame.
       recordMcpAppCard(sessionId, String(payload?.tool_id || ''), payload?.mcp_app)
+      void reconcileParkedApproval($gateway.get(), sessionId).catch(() => undefined)
 
       if (isActiveEvent) {
         setPetActivity({ toolRunning: false })

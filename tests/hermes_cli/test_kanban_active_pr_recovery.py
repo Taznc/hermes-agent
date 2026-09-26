@@ -164,3 +164,44 @@ def test_explicit_review_rework_releases_old_evidence_not_new_comments_or_other_
     assert not recovery, "a newer comment must invalidate the old recovery receipt"
     clock[0] += kbd._RESPAWN_GUARD_PR_WINDOW + 1
     assert kbd.check_respawn_guard(conn, tid) is None
+
+
+def test_requeue_after_pr_comment_releases_guard_with_same_pr_receipt(sandbox):
+    """A board-driven requeue (promotion after a dependency wait, unblock,
+    reclaim, or manual status change) is a deliberate "run it again". It must
+    release the duplicate-PR guard the same way it releases ``recent_success``
+    — otherwise a card whose worker cited its PR and then blocked on parents
+    sits ``ready`` and unspawnable for the whole 24-hour window after the
+    parents land, wedging every card downstream of it. The released worker
+    still receives the same-PR recovery receipt so it resumes, never duplicates.
+    """
+    conn, clock = sandbox
+    tid = kb.create_task(conn, title="Integrate and land", assignee="builder")
+    run = kb.claim_task(conn, tid)
+    assert run is not None
+    kb.add_comment(conn, tid, author="builder", body=f"Opened {PR}, waiting on CI repairs")
+    clock[0] += 1
+    assert kb.block_task(
+        conn, tid, reason="waiting on repair cards", kind="dependency",
+        expected_run_id=run.current_run_id,
+    )
+    task = kb.get_task(conn, tid)
+    assert task is not None and task.status == "todo"
+    assert kbd.check_respawn_guard(conn, tid) == "active_pr"
+
+    # Parents land -> the board promotes the card itself. That promotion is
+    # the requeue; nothing else changes on the card.
+    clock[0] += 1
+    assert kb.recompute_ready(conn) == 1
+    task = kb.get_task(conn, tid)
+    assert task is not None and task.status == "ready"
+    recovery = {}
+    assert kbd.check_respawn_guard(conn, tid, pr_recovery=recovery) is None
+    assert recovery["pr_urls"] == [PR]
+    assert recovery["recovery_reason"] == "requeued"
+    assert "existing PR" in recovery["recovery"]
+
+    # Only a requeue AFTER the PR comment releases it: fresh evidence re-arms.
+    clock[0] += 1
+    kb.add_comment(conn, tid, author="builder", body=f"Re-pushed {PR}")
+    assert kbd.check_respawn_guard(conn, tid) == "active_pr"

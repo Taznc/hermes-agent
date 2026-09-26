@@ -196,14 +196,21 @@ class DispatchResult:
     telemetry/CLI/dashboard can show the implementer->reviewer handoff."""
     auto_escalated_rework: list[tuple[str, str, str, int]] = field(default_factory=list)
     """``(task_id, previous_assignee, escalation_profile, changes_rounds)`` for
-    ready cards routed to a specialist after repeated requested-change cycles."""
+    ready cards routed to a specialist after repeated requested-change cycles
+    while still UNDER ``kanban.max_review_rounds``."""
+    escalated_review_cap: list[tuple[str, str, str, int]] = field(default_factory=list)
+    """``(task_id, previous_assignee, escalation_profile, changes_rounds)`` for
+    ready cards that reached ``kanban.max_review_rounds`` and were handed to
+    ``kanban.review_rework_escalation_profile`` for exactly ONE terminal,
+    scope-locked rework round (event ``review_cap_escalated``) instead of being
+    blocked outright. The card blocks on the next tick only if that escalated
+    round also comes back ``changes_requested``."""
     blocked_review_round_cap: list[tuple[str, int]] = field(default_factory=list)
-    """``(task_id, changes_rounds)`` for ready cards that hit
-    ``kanban.max_review_rounds`` and were blocked (kind ``review_round_cap``)
-    instead of being re-dispatched to the implementer or escalation profile.
-    The hard stop for the review<->changes_requested loop — checked BEFORE
-    ``auto_escalated_rework`` so a card at the cap blocks rather than getting
-    one more escalated round."""
+    """``(task_id, changes_rounds)`` for ready cards at ``kanban.max_review_rounds``
+    that were blocked (kind ``review_round_cap``). The hard stop for the
+    review<->changes_requested loop — reached only when no escalation profile is
+    configured, or when the escalation profile already owns the card (its terminal
+    round came back ``changes_requested`` too)."""
     skipped_nonspawnable: list[str] = field(default_factory=list)
     """Ready task ids whose assignee names a control-plane lane (e.g. a Claude
     Code terminal like ``orion-cc``), not a Hermes profile. Expected steady-state
@@ -1530,12 +1537,13 @@ def check_respawn_guard(
     ).fetchone()
     if recent_completed:
         completed_at = int(recent_completed["ended_at"] or 0)
+        from hermes_cli.kanban_db_dispatch_pr_recovery import REQUEUE_EVENT_KINDS
         requeued_after = conn.execute(
             "SELECT 1 FROM task_events "
             "WHERE task_id = ? AND created_at >= ? "
-            "AND kind IN ('status', 'promoted', 'unblocked', 'reclaimed') "
+            f"AND kind IN ({','.join('?' * len(REQUEUE_EVENT_KINDS))}) "
             "LIMIT 1",
-            (task_id, completed_at),
+            (task_id, completed_at, *REQUEUE_EVENT_KINDS),
         ).fetchone()
         if not requeued_after:
             return "recent_success"
@@ -1557,7 +1565,9 @@ def check_respawn_guard(
     assignee = row["assignee"]
     own_repo_slug = _task_own_repo_slug(conn, task_id)
     pr_cutoff = now - _RESPAWN_GUARD_PR_WINDOW
-    from hermes_cli.kanban_db_dispatch_pr_recovery import pr_recovery_after_run
+    from hermes_cli.kanban_db_dispatch_pr_recovery import (
+        pr_recovery_after_requeue, pr_recovery_after_run,
+    )
 
     recovered_urls: set[str] = set()
     for c in conn.execute(
@@ -1570,7 +1580,15 @@ def check_respawn_guard(
             cited_slug = f"{match.group('owner')}/{match.group('repo')}".lower()
             if own_repo_slug is not None and cited_slug != own_repo_slug:
                 continue
-            recovery = pr_recovery_after_run(latest_run, c["created_at"], assignee, now)
+            # Same escape as ``recent_success`` above: a board-driven requeue
+            # after the evidence (promotion once parents land, unblock,
+            # reclaim, manual status change) is a deliberate re-run. Without
+            # it a card that cited its PR and then waited on dependencies
+            # sits unspawnable for the full window after they land, and
+            # wedges every card downstream of it.
+            recovery = pr_recovery_after_requeue(conn, task_id, c["created_at"])
+            if recovery is None:
+                recovery = pr_recovery_after_run(latest_run, c["created_at"], assignee, now)
             if recovery is not None and recovery["eligible"]:
                 recovered_urls.add(match.group(0))
                 if pr_recovery is not None:
@@ -2483,11 +2501,14 @@ def _apply_review_round_cap(
     max_review_rounds: int,
     dry_run: bool,
 ) -> bool:
-    """Hard-stop a card that hit ``kanban.max_review_rounds``: block it instead of
-    re-dispatching to the implementer or the rework escalation profile.
+    """Hard-stop a card that hit ``kanban.max_review_rounds`` with no escalation
+    left: block it instead of re-dispatching to the implementer.
 
     This is the hard stop for the review<->changes_requested loop (the reviewer-side
-    round contract in the sdlc-review skill is advisory only). Mirrors
+    round contract in the sdlc-review skill is advisory only). The dispatcher only
+    reaches it once ``kanban.review_rework_escalation_profile`` is unset or has
+    already had its one terminal round (see :func:`_apply_rework_escalation` with
+    ``review_cap``). Mirrors
     :func:`_apply_rework_escalation`'s shape: a raw UPDATE guarded by the row's
     current status/assignee so a race (row already claimed/reassigned) is a no-op,
     plus a durable event carrying the round count and last reviewer reason.
@@ -2560,6 +2581,7 @@ def _apply_rework_escalation(
     previous_assignee: str,
     changes_rounds: int,
     dry_run: bool,
+    review_cap: Optional[int] = None,
 ) -> bool:
     """Route repeated review rework to a specialist under its own model route.
 
@@ -2568,6 +2590,13 @@ def _apply_rework_escalation(
     routing-classifier pick is cleared, matching the specialist's OWN model
     defaults the way a classifier pick already did before an operator ever
     touched the card.
+
+    ``review_cap`` marks the handoff as the card's ONE terminal rework round at
+    ``kanban.max_review_rounds``: the same guarded UPDATE, plus a durable
+    ``review_cap_escalated`` event so the worker packet and the next tick can
+    tell "escalated at the cap" from an ordinary under-cap escalation. A further
+    ``changes_requested`` after this round blocks the card
+    (:func:`_apply_review_round_cap`).
     """
     if dry_run:
         return True
@@ -2634,6 +2663,18 @@ def _apply_rework_escalation(
                     "preserved_overrides": preserve,
                 },
             )
+            if review_cap is not None:
+                _kb._append_event(
+                    conn,
+                    task_id,
+                    "review_cap_escalated",
+                    {
+                        "changes_rounds": changes_rounds,
+                        "max_review_rounds": review_cap,
+                        "escalation_profile": escalation_profile,
+                        "previous_assignee": previous_assignee,
+                    },
+                )
     except Exception:
         _kb._log.debug(
             "kanban dispatch: failed to escalate review rework for task %s to %r",
@@ -3349,24 +3390,41 @@ def _dispatch_once_locked(
                 continue
             row_assignee = default_assignee
             result.auto_assigned_default.append(row["id"])
-        # Hard round cap runs BEFORE escalation: a card that already hit the cap must block,
-        # not get re-routed to a specialist for yet another round. Manual reassignment after
-        # the last changes_requested is the same escape hatch the escalation path already
-        # honors — an operator's explicit routing decision always wins over both mechanisms.
+        # Round cap vs. escalation. At kanban.max_review_rounds the card gets ONE terminal
+        # rework round under kanban.review_rework_escalation_profile (recorded as
+        # review_cap_escalated so the worker knows it is the last pass); it blocks only when
+        # that escalated round ALSO comes back changes_requested (the profile already owns
+        # the card) or when no escalation profile is configured. Manual reassignment after
+        # the last changes_requested is the escape hatch both mechanisms honor — an
+        # operator's explicit routing decision always wins.
         changes_rounds, latest_change_id = _changes_requested_state(conn, row["id"])
         manually_reassigned = _manually_assigned_after(conn, row["id"], latest_change_id)
-        if (
-            max_review_rounds
-            and changes_rounds >= max_review_rounds
-            and not manually_reassigned
-            and _apply_review_round_cap(
+        at_cap = bool(max_review_rounds) and changes_rounds >= max_review_rounds
+        if at_cap and not manually_reassigned:
+            if (
+                rework_escalation_profile
+                and row_assignee != rework_escalation_profile
+                and _apply_rework_escalation(
+                    conn,
+                    row["id"],
+                    rework_escalation_profile,
+                    previous_assignee=row_assignee,
+                    changes_rounds=changes_rounds,
+                    dry_run=dry_run,
+                    review_cap=max_review_rounds,
+                )
+            ):
+                result.escalated_review_cap.append(
+                    (row["id"], row_assignee, rework_escalation_profile, changes_rounds)
+                )
+                row_assignee = rework_escalation_profile
+            elif _apply_review_round_cap(
                 conn, row["id"], changes_rounds=changes_rounds,
                 max_review_rounds=max_review_rounds, dry_run=dry_run,
-            )
-        ):
-            result.blocked_review_round_cap.append((row["id"], changes_rounds))
-            continue
-        if rework_escalation_profile and row_assignee != rework_escalation_profile:
+            ):
+                result.blocked_review_round_cap.append((row["id"], changes_rounds))
+                continue
+        elif rework_escalation_profile and row_assignee != rework_escalation_profile:
             if (
                 changes_rounds >= 2
                 and not manually_reassigned

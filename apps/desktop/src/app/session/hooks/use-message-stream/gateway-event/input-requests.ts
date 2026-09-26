@@ -13,6 +13,7 @@ import {
 import { $gateway } from '@/store/gateway'
 import { setMcpSetupRequest } from '@/store/mcp-setup'
 import { dispatchNativeNotification } from '@/store/native-notifications'
+import { setNewSessionProposalRequest } from '@/store/new-session-proposal'
 import { hasBlockingPromptRequest, receiveApprovalRequest, setSecretRequest, setSudoRequest } from '@/store/prompts'
 import { requestScrollToBottom } from '@/store/thread-scroll'
 
@@ -245,6 +246,46 @@ export function handleInputRequestEvent(ctx: GatewayEventContext): boolean {
 
       dispatchNativeNotification({
         body: reason || server,
+        kind: 'input',
+        sessionId,
+        title: translateNow('notifications.native.inputTitle')
+      })
+    }
+
+    return true
+  }
+
+  if (event.type === 'session.propose.request') {
+    // propose_new_session tool (desktop GUI): the agent proposed handing this
+    // topic off into a brand-new session, and the Python side is blocked on
+    // session.propose.respond. Park the request per-session (like clarify /
+    // setup_mcp) and upsert a stable pending tool row so the inline approval
+    // card has somewhere to render even when tool.start was missed.
+    const requestId = typeof payload?.request_id === 'string' ? payload.request_id : ''
+    const topic = typeof payload?.topic === 'string' ? payload.topic : ''
+    const reason = typeof payload?.reason === 'string' ? payload.reason : ''
+
+    if (requestId && topic) {
+      setNewSessionProposalRequest({ reason, requestId, sessionId: sessionId ?? null, topic })
+
+      if (sessionId) {
+        // A synthetic request id must never clobber the provider's real
+        // tool.start id when it lands second (t_2023fb69 recovery / reviewer
+        // comment 1341 item 3) — correlate by topic but keep whichever id
+        // the row already carries.
+        upsertToolCall(
+          sessionId,
+          { args: { reason, topic }, name: 'propose_new_session', tool_id: requestId },
+          'running',
+          undefined,
+          occurredAt,
+          { preferExistingId: true }
+        )
+        updateSessionState(sessionId, state => ({ ...state, needsInput: true }))
+      }
+
+      dispatchNativeNotification({
+        body: reason || topic,
         kind: 'input',
         sessionId,
         title: translateNow('notifications.native.inputTitle')

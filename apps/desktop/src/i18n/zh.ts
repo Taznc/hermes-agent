@@ -2764,7 +2764,6 @@ export const zhAuthored: Translations = withForkKeys(forkZh, {
       copyIdFailed: '无法复制会话 ID',
 
       sessionActions: '会话操作',
-      archiveSession: '归档会话',
       sessionRunning: '会话运行中',
       needsInput: '需要你输入',
       waitingForAnswer: '正在等待你的回答',
@@ -3885,6 +3884,19 @@ export const zhAuthored: Translations = withForkKeys(forkZh, {
       reloadFailed: '服务器已保存，但重新加载 MCP 工具失败 — 将在下个会话加载',
       gatewayDisconnected: 'Hermes 网关未连接'
     },
+    newSessionProposal: {
+      title: '要为此开始一个新会话吗？',
+      description: topic => `新会话：“${topic}”`,
+      reasonLabel: '原因',
+      approve: '开始新会话',
+      decline: '留在此处',
+      approved: '已开始新会话',
+      declined: '已拒绝',
+      unanswered: '未响应',
+      failed: '无法开始新会话',
+      sendFailed: '无法发送响应',
+      gatewayDisconnected: 'Hermes 网关未连接'
+    },
     tool: {
       copyCode: '复制代码',
       renderingImage: '正在渲染图片',
@@ -3977,6 +3989,8 @@ export const zhAuthored: Translations = withForkKeys(forkZh, {
     audioReadFailed: '无法读取录制的音频',
     sessionUnavailable: '会话不可用',
     createSessionFailed: '无法创建新会话',
+    newTopicMissingTopic: '需要主题',
+    newTopicUsage: '用法：/new-topic <主题> — 作为新会话的第一条消息',
     promptFailed: '提示词发送失败',
     providerCredentialRequired: '发送第一条消息前请先添加提供方凭据。',
     emptySlashCommand: '空 slash 命令',
@@ -4016,8 +4030,6 @@ export const zhAuthored: Translations = withForkKeys(forkZh, {
     deleteFailed: '删除失败',
     archived: '已归档',
     archiveFailed: '归档失败',
-    archivedUndoMessage: '会话已归档',
-    undoArchiveFailed: '撤销失败',
     cwdChangeFailed: '工作目录更改失败',
     cwdStagedTitle: '工作目录已暂存',
     cwdStagedMessage: '重启桌面后端后，工作目录更改才会应用到当前活跃会话。',

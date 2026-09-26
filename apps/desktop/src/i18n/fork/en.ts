@@ -64,7 +64,6 @@ export const forkEn: ForkTranslations = {
   sidebar: {
     row: {
       unarchive: 'Unarchive',
-      unarchiveSession: 'Unarchive session',
       rateLimited: {
         withTime: time => `Rate limited — retry at ${time}`,
         unknown: 'Rate limited — reset time unknown'

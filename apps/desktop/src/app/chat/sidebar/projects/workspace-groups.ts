@@ -551,8 +551,18 @@ const NO_REMOVED: ReadonlySet<string> = new Set()
  * back into the merge. Without this predicate every overlay below would place
  * it into a project lane and it would never leave until a full backend
  * snapshot refresh happened to coincide with a re-render.
+ *
+ * Every overlay function below accepts an `isArchived` override (defaulting to
+ * this bare-flag check) so a caller wired into the centralized sidebar
+ * membership policy (`$sidebarIsArchivedSession` — see store/sidebar-model.ts)
+ * can inject it and reject a `keep`-protected row stamped `archived: false`
+ * that `session.archived === true` alone cannot see. Production callers in
+ * `workspace-section.tsx` pass that policy explicitly; unit tests exercising
+ * these pure functions in isolation keep the bare-flag default so their direct
+ * `archived: true` fixtures still exercise this file's own placement logic
+ * without depending on the store layer.
  */
-const isLiveArchived = (session: SessionInfo): boolean => session.archived === true
+export const isLiveArchived = (session: SessionInfo): boolean => session.archived === true
 
 /**
  * Reconcile ONE repo's lanes against the live `$sessions` cache: evict
@@ -565,7 +575,8 @@ const isLiveArchived = (session: SessionInfo): boolean => session.archived === t
 export function overlayRepoLanes(
   repo: SidebarWorkspaceTree,
   live: SessionInfo[],
-  removed: ReadonlySet<string> = NO_REMOVED
+  removed: ReadonlySet<string> = NO_REMOVED,
+  isArchived: (session: SessionInfo) => boolean = isLiveArchived
 ): SidebarWorkspaceTree {
   const repoRootKey = pathKey(repo.path)
   let changed = false
@@ -590,7 +601,7 @@ export function overlayRepoLanes(
   for (const session of live) {
     const sessionPath = livePathForRepo(repo.path ?? '', session)
 
-    if (removed.has(session.id) || isLiveArchived(session) || !sessionPath) {
+    if (removed.has(session.id) || isArchived(session) || !sessionPath) {
       continue
     }
 
@@ -694,7 +705,8 @@ export function overlayRepoLanes(
 function overlayHomeLane(
   project: SidebarProjectTree,
   live: SessionInfo[],
-  removed: ReadonlySet<string>
+  removed: ReadonlySet<string>,
+  isArchived: (session: SessionInfo) => boolean = isLiveArchived
 ): SidebarProjectTree {
   const lane = project.repos[0]?.groups[0]
   // Another profile's Home owns rows THIS client's live list never carries, so
@@ -703,7 +715,7 @@ function overlayHomeLane(
   const ownsLive = project.id === NO_PROJECT_ID
 
   const detached = ownsLive
-    ? live.filter(session => isDetachedSession(session) && !removed.has(session.id) && !isLiveArchived(session))
+    ? live.filter(session => isDetachedSession(session) && !removed.has(session.id) && !isArchived(session))
     : []
 
   const kept = (lane?.sessions ?? []).filter(session => !removed.has(session.id))
@@ -785,16 +797,17 @@ export function excludeProjectSessions(
 export function overlayLiveLanes(
   project: SidebarProjectTree,
   live: SessionInfo[],
-  removed: ReadonlySet<string> = NO_REMOVED
+  removed: ReadonlySet<string> = NO_REMOVED,
+  isArchived: (session: SessionInfo) => boolean = isLiveArchived
 ): SidebarProjectTree {
   if (project.isNoProject) {
-    return overlayHomeLane(project, live, removed)
+    return overlayHomeLane(project, live, removed, isArchived)
   }
 
   let changed = false
 
   const repos = project.repos.map(repo => {
-    const next = overlayRepoLanes(repo, live, removed)
+    const next = overlayRepoLanes(repo, live, removed, isArchived)
 
     changed ||= next !== repo
 
@@ -813,17 +826,24 @@ export function overlayLiveLanes(
  * full-tree request is stale or still loading. The live cache remains the
  * freshest copy when both sources contain a row; overview previews only fill
  * sessions that are missing from that cache.
+ *
+ * `previewSessions` comes straight from the backend project-tree snapshot,
+ * which is a separate fetch from the live cache and can be stale for the same
+ * reason `$sessions` can (see {@link isLiveArchived}'s doc) — so a row it
+ * contributes is checked against the same injected predicate before being
+ * spliced in, not just deduped by id.
  */
 export function reconcileEnteredProjectSessions(
   live: SessionInfo[],
-  previewSessions: SessionInfo[] | undefined
+  previewSessions: SessionInfo[] | undefined,
+  isArchived: (session: SessionInfo) => boolean = isLiveArchived
 ): SessionInfo[] {
   if (!previewSessions?.length) {
     return live
   }
 
   const liveIds = new Set(live.map(session => session.id))
-  const missingPreviews = previewSessions.filter(session => !liveIds.has(session.id))
+  const missingPreviews = previewSessions.filter(session => !liveIds.has(session.id) && !isArchived(session))
 
   return missingPreviews.length ? [...live, ...missingPreviews] : live
 }
@@ -832,6 +852,8 @@ interface PreviewOverlayOptions {
   removed?: ReadonlySet<string>
   /** The active sort key as an id order; recency when empty. */
   rankIds?: string[]
+  /** Injected archive-membership check — see {@link isLiveArchived}'s doc. */
+  isArchived?: (session: SessionInfo) => boolean
 }
 
 /** Merge live sessions into per-project overview previews, keyed by project id. */
@@ -840,12 +862,12 @@ export function overlayLivePreviews(
   live: SessionInfo[],
   explicitProjects: ProjectInfo[],
   limit: number,
-  { removed = NO_REMOVED, rankIds }: PreviewOverlayOptions = {}
+  { removed = NO_REMOVED, rankIds, isArchived = isLiveArchived }: PreviewOverlayOptions = {}
 ): Record<string, SessionInfo[]> {
   const byProject = new Map<string, SessionInfo[]>()
 
   for (const session of live) {
-    if (removed.has(session.id) || isLiveArchived(session)) {
+    if (removed.has(session.id) || isArchived(session)) {
       continue
     }
 
@@ -867,7 +889,7 @@ export function overlayLivePreviews(
 
   for (const node of projects) {
     const liveRows = byProject.get(node.id) ?? []
-    const base = (node.previewSessions ?? []).filter(session => !removed.has(session.id) && !isLiveArchived(session))
+    const base = (node.previewSessions ?? []).filter(session => !removed.has(session.id) && !isArchived(session))
 
     if (!liveRows.length && !base.length) {
       continue

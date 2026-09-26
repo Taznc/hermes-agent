@@ -1,6 +1,22 @@
 import { describe, expect, it } from 'vitest'
 
-import { ARROW_GAP, arrowSides, type CardBox, clampToLane, focusEdges, routeArrows } from './board-arrows'
+import {
+  ARROW_GAP,
+  arrowHead,
+  arrowSides,
+  BRACKET_MAX,
+  type CardBox,
+  chevrons,
+  clampToLane,
+  type Curve,
+  FAN_LIFT,
+  focusEdges,
+  pointAt,
+  REVEAL_MARGIN,
+  revealDelta,
+  revealGroupDelta,
+  routeArrows
+} from './board-arrows'
 import { buildGraph, chainSets, focusSets } from './deps'
 import type { KanbanBoard } from './types'
 
@@ -117,6 +133,118 @@ describe('routeArrows', () => {
   })
 })
 
+describe('ribbon routing', () => {
+  it('is one smooth cubic per edge whose ends match its curve', () => {
+    const [arrow] = routeArrows(
+      [['a', 'b']],
+      new Map([
+        ['a', box(0, 0)],
+        ['b', box(400, 200)]
+      ])
+    )
+
+    expect(arrow.d).toMatch(/^M [\d.]+ [\d.]+ C [\d.]+ [\d.]+, [\d.]+ [\d.]+, [\d.]+ [\d.]+$/)
+    expect(pointAt(arrow.curve, 0)).toEqual(arrow.curve[0])
+    expect(pointAt(arrow.curve, 1)).toEqual(arrow.curve[3])
+    // Handles leave horizontally toward the child, and never overshoot it.
+    expect(arrow.curve[1].x).toBeGreaterThan(arrow.curve[0].x)
+    expect(arrow.curve[2].x).toBeLessThan(arrow.curve[3].x)
+    expect(arrow.curve[1].x).toBeLessThanOrEqual(arrow.curve[0].x + 120)
+  })
+
+  it('ribbons that land on one card side arc through separate height bands', () => {
+    const arrows = routeArrows(
+      [
+        ['a', 'c'],
+        ['b', 'c']
+      ],
+      new Map([
+        ['a', box(0, 0)],
+        ['b', box(0, 100)],
+        ['c', box(400, 50)]
+      ])
+    )
+
+    const lifts = arrows.map(arrow => arrow.curve[2].y - arrow.curve[3].y)
+
+    expect(lifts).toEqual([-FAN_LIFT / 2, FAN_LIFT / 2])
+  })
+
+  it("a same-lane bracket stays inside the strip's reserved right gutter", () => {
+    const [arrow] = routeArrows(
+      [['a', 'b']],
+      new Map([
+        ['a', box(0, 0)],
+        ['b', box(0, 2000)]
+      ])
+    )
+
+    let widest = 0
+
+    for (let t = 0; t <= 1; t += 0.01) {
+      widest = Math.max(widest, pointAt(arrow.curve, t).x)
+    }
+
+    expect(widest - 200).toBeLessThanOrEqual(BRACKET_MAX + ARROW_GAP)
+  })
+})
+
+describe('arrowHead', () => {
+  const pairs = (points: string) => points.split(' ').map(p => p.split(',').map(Number))
+
+  it('puts the tip exactly on the curve end, pointing along it', () => {
+    const curve: Curve = [
+      { x: 0, y: 0 },
+      { x: 50, y: 0 },
+      { x: 150, y: 0 },
+      { x: 200, y: 0 }
+    ]
+
+    const [tip, wing1, notch, wing2] = pairs(arrowHead(curve, 22))
+
+    expect(tip).toEqual([200, 0])
+    expect(wing1[0]).toBeCloseTo(178)
+    expect(notch[0]).toBeLessThan(200)
+    expect(notch[0]).toBeGreaterThan(wing1[0])
+    expect(wing1[1]).toBe(-wing2[1])
+  })
+
+  it('shrinks on a short hop so the head never reaches back over the blocker', () => {
+    const curve: Curve = [
+      { x: 0, y: 0 },
+      { x: 10, y: 0 },
+      { x: 10, y: 0 },
+      { x: 20, y: 0 }
+    ]
+
+    const xs = pairs(arrowHead(curve, 22)).map(([x]) => x)
+
+    expect(Math.min(...xs)).toBeGreaterThanOrEqual(20 - Math.max(8, 20 * 0.6) - 0.1)
+  })
+})
+
+describe('chevrons', () => {
+  const straight = (length: number): Curve => [
+    { x: 0, y: 0 },
+    { x: length / 3, y: 0 },
+    { x: (2 * length) / 3, y: 0 },
+    { x: length, y: 0 }
+  ]
+
+  it('none on a short line; roughly one per 46px on a long one', () => {
+    expect(chevrons(straight(60), 5)).toEqual([])
+    expect(chevrons(straight(500), 5)).toHaveLength(Math.floor((500 - 40) / 46))
+  })
+
+  it('every chevron points the way the line runs (its apex is ahead of its arms)', () => {
+    for (const points of chevrons(straight(300), 5)) {
+      const [arm, apex] = points.split(' ').map(p => p.split(',').map(Number))
+
+      expect(apex[0]).toBeGreaterThan(arm[0])
+    }
+  })
+})
+
 describe('clampToLane', () => {
   const lane = { bottom: 500, top: 100 }
 
@@ -127,6 +255,83 @@ describe('clampToLane', () => {
   it('pins a card scrolled out of its lane to the edge it left by', () => {
     expect(clampToLane({ bottom: 80, top: 20 }, lane)).toEqual({ bottom: 100, offscreen: true, top: 100 })
     expect(clampToLane({ bottom: 700, top: 600 }, lane)).toEqual({ bottom: 500, offscreen: true, top: 500 })
+  })
+})
+
+describe('revealDelta', () => {
+  const view = { end: 500, start: 100 }
+
+  const shown = (item: { end: number; start: number }) => {
+    const d = revealDelta(item, view)
+
+    return { end: item.end - d, start: item.start - d }
+  }
+
+  it('does not scroll a card that is already fully in view', () => {
+    expect(revealDelta({ end: 300, start: 200 }, view)).toBe(0)
+  })
+
+  it('brings a card below or above the fold fully into view, with the margin', () => {
+    for (const item of [
+      { end: 560, start: 440 }, // straddles the bottom edge
+      { end: 900, start: 780 }, // fully below
+      { end: 160, start: 40 }, // straddles the top edge
+      { end: 20, start: -100 } // fully above
+    ]) {
+      const after = shown(item)
+
+      expect(after.start).toBeGreaterThanOrEqual(view.start + REVEAL_MARGIN)
+      expect(after.end).toBeLessThanOrEqual(view.end - REVEAL_MARGIN)
+    }
+  })
+
+  it('shows the leading edge of a card taller than the view', () => {
+    expect(shown({ end: 1400, start: 700 }).start).toBe(view.start + REVEAL_MARGIN)
+  })
+})
+
+describe('revealGroupDelta', () => {
+  const view = { end: 500, start: 100 }
+  const after = (item: { end: number; start: number }, d: number) => ({ end: item.end - d, start: item.start - d })
+
+  const inView = (item: { end: number; start: number }) =>
+    item.start >= view.start + REVEAL_MARGIN && item.end <= view.end - REVEAL_MARGIN
+
+  it('does not scroll when every linked card is already in view', () => {
+    expect(revealGroupDelta([{ end: 200, start: 150 }, { end: 400, start: 350 }], view)).toBe(0)
+  })
+
+  it('brings a whole group that fits into view in one move, not card by card', () => {
+    const items = [
+      { end: 700, start: 640 },
+      { end: 820, start: 760 }
+    ]
+
+    const d = revealGroupDelta(items, view)
+
+    expect(items.map(item => inView(after(item, d)))).toEqual([true, true])
+  })
+
+  it('keeps the anchor (focused card) in view when the group does not fit', () => {
+    const items = [
+      { end: 160, start: 100 },
+      { end: 1260, start: 1200 }
+    ]
+
+    const anchor = items[1]
+
+    expect(inView(after(anchor, revealGroupDelta(items, view, anchor)))).toBe(true)
+  })
+
+  it('without an anchor, shows the leading card in full when the group does not fit', () => {
+    const lead = { end: 760, start: 700 }
+    const d = revealGroupDelta([lead, { end: 1600, start: 1540 }], view)
+
+    expect(inView(after(lead, d))).toBe(true)
+  })
+
+  it('is a no-op for an empty group', () => {
+    expect(revealGroupDelta([], view)).toBe(0)
   })
 })
 

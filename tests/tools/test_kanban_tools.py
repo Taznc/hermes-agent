@@ -1850,6 +1850,266 @@ def test_request_review_refusal_states_the_status_the_card_is_actually_in(
     assert len([e for e in _events(tid) if e.kind == "review_preflight_conflict"]) == 1
 
 
+# ---------------------------------------------------------------------------
+# Rework-items preflight: a handoff after a reviewer's changes_requested must
+# map each reviewer item to its evidence (tools/kanban_tools_rework.py).
+# ---------------------------------------------------------------------------
+
+_REWORK_REASON = (
+    "1. tests/foo missing the timeout case\n"
+    "2. the CLI door still bypasses the gate\n"
+    "3. docstring says 'running' for a ready card"
+)
+
+
+@pytest.mark.parametrize("reason,expected", [
+    (None, 0),
+    ("", 0),
+    ("please also handle the no-assignee edge case", 0),
+    ("1. one thing\n2. another thing", 2),
+    (_REWORK_REASON, 3),
+    ("  1. indented\n  2. also indented", 2),
+    ("1) paren style\n2) also paren", 2),
+    ("see item 1 of 3 in the diff", 0),  # mid-sentence, not line-leading
+    ("- bullet one\n- bullet two", 0),  # bullets are not numbered
+])
+def test_enumerated_item_count(reason, expected):
+    """Pure counting function: line-leading ``N.``/``N)`` numbering only;
+    mid-sentence numbers and bare bullets are not implied items."""
+    from tools.kanban_tools_rework import enumerated_item_count
+
+    assert enumerated_item_count(reason) == expected
+
+
+@pytest.fixture
+def rework_env(monkeypatch, tmp_path):
+    """Factory: ``make(prior_rounds=N)`` -> task id of a card the worker holds
+    on its (N+1)th implementation run, with N real ``changes_requested``
+    events written through the same DB API the reviewer tool uses. No
+    ``land_target`` on the board, so the mergeability preflight stays out of
+    the way and only the rework gate is under test."""
+    home = tmp_path / ".hermes"
+    home.mkdir()
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    monkeypatch.setenv("HERMES_PROFILE", "test-worker")
+    monkeypatch.delenv("HERMES_SESSION_ID", raising=False)
+    from pathlib import Path as _Path
+    monkeypatch.setattr(_Path, "home", lambda: tmp_path)
+
+    def make(*, prior_rounds: int, reason: str = _REWORK_REASON) -> str:
+        from hermes_cli import kanban_db as kb
+        from hermes_cli import kanban_db_connect as kbc
+        kb._INITIALIZED_PATHS.clear()
+        kb.init_db()
+        with kbc.connect_closing() as conn:
+            tid = kb.create_task(conn, title="rework", assignee="test-worker")
+            claimed = kb.claim_task(conn, tid)
+            assert claimed is not None
+            for n in range(prior_rounds):
+                assert kb.request_review(
+                    conn, tid, summary=f"attempt {n + 1}", reviewer="reviewer",
+                    expected_run_id=claimed.current_run_id)
+                review = kb.claim_review_task(conn, tid)
+                assert review is not None
+                assert kb.request_changes(
+                    conn, tid, reason=reason, expected_run_id=review.current_run_id,
+                ) == (True, "test-worker")
+                claimed = kb.claim_task(conn, tid)
+                assert claimed is not None
+            assert kb.get_task(conn, tid).status == "running"
+        monkeypatch.setenv("HERMES_KANBAN_TASK", tid)
+        monkeypatch.setenv("HERMES_KANBAN_RUN_ID", str(claimed.current_run_id))
+        return tid
+
+    return make
+
+
+def _run_metadata_for(tid):
+    from hermes_cli import kanban_db as kb
+    from hermes_cli import kanban_db_connect as kbc
+    requested = [e for e in _events(tid) if e.kind == "review_requested"]
+    with kbc.connect_closing() as conn:
+        run = kb.get_run(conn, requested[-1].run_id)
+    return run.metadata or {}
+
+
+def test_request_review_first_round_needs_no_rework_items(rework_env):
+    """Zero prior ``changes_requested`` rounds: the gate has nothing to map,
+    so a plain first handoff goes through exactly as before."""
+    from tools import kanban_tools as kt
+
+    tid = rework_env(prior_rounds=0)
+
+    d = json.loads(kt._handle_request_review({"summary": "implemented the thing"}))
+    assert d["ok"] is True, d
+    assert d["status"] == "review"
+    assert "rework_items" not in _run_metadata_for(tid)
+
+
+def test_request_review_after_changes_requested_refuses_without_rework_items(rework_env):
+    """One prior round and no ``rework_items``: refused, the card stays
+    running, and the refusal carries everything the implementer needs — the
+    key to add, its shape, the round count, and the reviewer's own reason
+    text — so the fix is one edit rather than another lookup."""
+    from tools import kanban_tools as kt
+    from hermes_cli import kanban_db as kb
+    from hermes_cli import kanban_db_connect as kbc
+
+    tid = rework_env(prior_rounds=1)
+
+    d = json.loads(kt._handle_request_review({
+        "summary": "addressed the review",
+        "metadata": {"tests_run": ["scripts/run_tests.sh tests/foo"]},
+    }))
+
+    assert d.get("ok") is not True, d
+    error = d.get("error", "")
+    assert "rework_items" in error, error
+    assert "1 prior changes_requested round" in error, error
+    assert "evidence" in error, error
+    for line in _REWORK_REASON.splitlines():
+        assert line in error, error
+
+    with kbc.connect_closing() as conn:
+        assert kb.get_task(conn, tid).status == "running"
+    # Only the fixture's round-1 handoff exists; the refused one wrote nothing.
+    assert len([e for e in _events(tid) if e.kind == "review_requested"]) == 1
+
+
+@pytest.mark.parametrize("bad", [
+    [],
+    "did all three",
+    [{"item": "1", "evidence": ""}],
+    [{"item": "1"}],
+    ["1. done"],
+])
+def test_request_review_rejects_malformed_rework_items(rework_env, bad):
+    """The shape is the contract: an empty list, a bare string, or an entry
+    missing ``item``/``evidence`` is no better than omitting the key, and the
+    refusal points at the offending shape."""
+    from tools import kanban_tools as kt
+
+    rework_env(prior_rounds=1)
+
+    d = json.loads(kt._handle_request_review({
+        "summary": "addressed the review", "metadata": {"rework_items": bad},
+    }))
+    assert d.get("ok") is not True, d
+    assert "rework_items" in d.get("error", ""), d
+
+
+def test_request_review_rejects_undercounted_rework_items(rework_env):
+    """The fixture reason enumerates 3 numbered items (``1.``, ``2.``,
+    ``3.``); a well-formed but short list — 1 entry — is refused with a
+    count-shortfall message naming both numbers, not silently accepted."""
+    from tools import kanban_tools as kt
+
+    rework_env(prior_rounds=1)
+
+    d = json.loads(kt._handle_request_review({
+        "summary": "addressed the review",
+        "metadata": {"rework_items": [
+            {"item": "1. tests/foo missing the timeout case", "evidence": "abc123"},
+        ]},
+    }))
+    assert d.get("ok") is not True, d
+    error = d.get("error", "")
+    assert "rework_items" in error, error
+    assert "1 entry" in error, error
+    assert "3 items" in error, error
+
+
+def test_request_review_free_form_reason_skips_the_count_check(rework_env):
+    """A reviewer reason with no line-leading numbering (a prose paragraph)
+    is not sliced into an implied item count: one well-formed entry is
+    enough, exactly as before this check existed."""
+    from tools import kanban_tools as kt
+
+    rework_env(
+        prior_rounds=1,
+        reason="please also cover the edge case where the task has no assignee",
+    )
+
+    d = json.loads(kt._handle_request_review({
+        "summary": "addressed the review",
+        "metadata": {"rework_items": [
+            {"item": "the no-assignee edge case", "evidence": "abc123; new test passes"},
+        ]},
+    }))
+    assert d["ok"] is True, d
+    assert d["status"] == "review"
+
+
+def test_request_review_after_changes_requested_passes_with_rework_items(rework_env):
+    """One prior round with a well-formed mapping: handed off, and the
+    mapping rides the run metadata where the reviewer reads the handoff."""
+    from tools import kanban_tools as kt
+
+    tid = rework_env(prior_rounds=1)
+    items = [
+        {"item": "1. tests/foo missing the timeout case",
+         "evidence": "a1b2c3d; scripts/run_tests.sh tests/foo -> 4 passed"},
+        {"item": "2. CLI door bypasses the gate", "evidence": "a1b2c3d hermes_cli/kanban.py"},
+        {"item": "3. docstring wording", "evidence": "a1b2c3d, no test"},
+    ]
+
+    d = json.loads(kt._handle_request_review({
+        "summary": "addressed all three", "metadata": {"rework_items": items},
+    }))
+    assert d["ok"] is True, d
+    assert d["status"] == "review"
+    assert _run_metadata_for(tid)["rework_items"] == items
+
+
+def test_request_review_rework_gate_honours_the_config_off_switch(rework_env, monkeypatch):
+    """``kanban.require_rework_items_for_review: false`` is a real off
+    switch: the same handoff refused above goes through."""
+    from tools import kanban_tools as kt
+
+    rework_env(prior_rounds=1)
+    monkeypatch.setattr(
+        kt._ktr, "cfg_get",
+        lambda cfg, *keys, default=None: (
+            False if keys == ("kanban", "require_rework_items_for_review") else default))
+
+    d = json.loads(kt._handle_request_review({"summary": "addressed the review"}))
+    assert d["ok"] is True, d
+    assert d["status"] == "review"
+
+
+def test_request_review_refusal_quotes_a_reason_past_the_old_600char_cutoff(rework_env):
+    """Regression (round-1 review of this gate): the refusal used to clip the
+    reviewer's reason at 600 characters, so a numbered item enumerated past
+    that cutoff was silently hidden from the implementer even though the
+    count gate still demanded a ``rework_items`` entry for it. The full
+    reason — including the far item — must appear in the refusal, and a
+    refused handoff must still leave the task/run untouched."""
+    from tools import kanban_tools as kt
+    from hermes_cli import kanban_db as kb
+    from hermes_cli import kanban_db_connect as kbc
+
+    padding = "x" * 650
+    far_item = "2. the padded-out finding well past character 600"
+    reason = f"1. filler finding — {padding}\n{far_item}"
+    tid = rework_env(prior_rounds=1, reason=reason)
+
+    d = json.loads(kt._handle_request_review({
+        "summary": "addressed the review",
+        "metadata": {"rework_items": [
+            {"item": "1. filler finding", "evidence": "abc123"},
+        ]},
+    }))
+
+    assert d.get("ok") is not True, d
+    error = d.get("error", "")
+    assert far_item in error, error
+    assert "2 items" in error, error
+
+    with kbc.connect_closing() as conn:
+        assert kb.get_task(conn, tid).status == "running"
+    assert len([e for e in _events(tid) if e.kind == "review_requested"]) == 1
+
+
 def test_create_model_policy_force_surface(worker_env):
     from hermes_cli import kanban_db as kb
     from tools import kanban_tools as kt

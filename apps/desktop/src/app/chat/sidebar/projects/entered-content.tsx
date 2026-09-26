@@ -111,6 +111,15 @@ function RepoFlatSection({
   // git-worktree lanes) so out-of-tree/sibling worktrees — which exist as visual
   // lanes before the snapshot carries their sessions — get the new row. The
   // overlay drops lanes it empties, so re-merge to restore still-real worktrees.
+  //
+  // `overlayRepoLanes` keeps its default archive predicate here: `liveSessions`
+  // is `enteredProjectOverlaySessions` from workspace-section.tsx, which is
+  // already built from `$sidebarUnpinnedAgentSessions` (the centralized
+  // `$sidebarIsArchivedSession` policy, see store/sidebar-model.ts) through
+  // `reconcileEnteredProjectSessions` — itself called with that same injected
+  // predicate. A stale `archived: false` row cannot reach this input; the
+  // bare-flag default is therefore a correct, already-filtered-input contract
+  // rather than a second independent guard.
   const overlaidGroups = useMemo(() => {
     if (!(liveSessions?.length || removedSessionIds?.size)) {
       return mergedGroups

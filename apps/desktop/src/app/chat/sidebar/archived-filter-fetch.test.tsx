@@ -112,7 +112,7 @@ describe('sidebar Archived filter', () => {
     expect($archivedSessions.get().map(session => session.id)).toEqual(['archived-one'])
   })
 
-  it('offers Unarchive — not Archive — on archived rows', async () => {
+  it('offers Unarchive — not Archive — in the row menu on archived rows', async () => {
     renderSidebar()
 
     await act(async () => {
@@ -120,10 +120,13 @@ describe('sidebar Archived filter', () => {
       await Promise.resolve()
     })
 
-    const unarchive = await screen.findByRole('button', { name: 'Unarchive session' })
+    const trigger = await screen.findByRole('button', { name: 'Session actions' })
 
-    expect(screen.queryByRole('button', { name: 'Archive session' })).toBeNull()
-    fireEvent.click(unarchive)
+    fireEvent.pointerDown(trigger, { button: 0 })
+    fireEvent.click(trigger)
+
+    expect(screen.queryByRole('menuitem', { name: /^Archive$/i })).toBeNull()
+    fireEvent.click(await screen.findByRole('menuitem', { name: /^Unarchive$/i }))
     expect(onUnarchiveSessionMock).toHaveBeenCalledWith('archived-one')
     expect(onArchiveSessionMock).not.toHaveBeenCalled()
   })

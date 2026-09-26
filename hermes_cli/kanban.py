@@ -1213,6 +1213,7 @@ def _cmd_request_review(args: argparse.Namespace) -> int:
     # entry point. Imported here so the CLI keeps no import-time dependency on
     # the tool stack.
     from tools import kanban_tools_mergeability as ktm
+    from tools import kanban_tools_rework as ktr
 
     with kbc.connect_closing() as conn:
         gate_err = _goal_gate_error(
@@ -1225,12 +1226,18 @@ def _cmd_request_review(args: argparse.Namespace) -> int:
         # card that cannot enter the review lane gets kb.request_review()'s
         # status answer below rather than an unrelated merge refusal. Shared
         # with the tool door so the two cannot diverge (task t_fd4e3978).
-        merge = ktm.preflight(kb.get_task(conn, tid), tid, board=getattr(args, "board", None))
+        task = kb.get_task(conn, tid)
+        merge = ktm.preflight(task, tid, board=getattr(args, "board", None))
         if merge is not None:
             if merge.conflicts:
                 ktm.record_conflict(conn, tid, merge, run_id=_worker_run_id_for(tid))
                 return _err(ktm.refusal_message(merge))
             metadata = {**(metadata or {}), "mergeable_against": merge.stamp}
+        # Same second preflight as the tool door: a rework handoff must carry
+        # metadata.rework_items mapping each reviewer item to its evidence.
+        rework_refusal = ktr.preflight(conn, task, tid, metadata)
+        if rework_refusal is not None:
+            return _err(rework_refusal)
         ok, reason = kb.request_review(
             conn, tid, summary=summary, metadata=metadata, reviewer=getattr(args, "reviewer", None),
             expected_run_id=_worker_run_id_for(tid), force=bool(getattr(args, "force", False)), with_reason=True)

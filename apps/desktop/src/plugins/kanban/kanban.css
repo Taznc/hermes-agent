@@ -44,3 +44,44 @@
     --kanban-arc-angle: 360deg;
   }
 }
+
+/* Focus-mode dependency lines (board-arrows-layer.tsx). Hovering a line or
+   its answer-bar row isolates it: every other line fades, the hovered one
+   brightens, and its two cards get a plain ring (overriding the trace's
+   dimming so an unlit end still reads). */
+.kanban-dep-lines [data-line-part],
+.kanban-dep-lines [data-edge] {
+  transition: opacity 0.12s;
+}
+
+.kanban-dep-lines[data-hovering] [data-line-part]:not([data-hot]) {
+  opacity: 0.1;
+}
+
+.kanban-dep-lines [data-edge][data-hot] .kanban-dep-line,
+.kanban-dep-lines polygon[data-hot] {
+  filter: brightness(1.3);
+}
+
+[data-dep-hot] {
+  opacity: 1 !important;
+  filter: none !important;
+  box-shadow: 0 0 0 2px var(--ui-text-primary, #fff) !important;
+}
+
+/* "Moving dots": a dotted white overlay whose dashes march blocker → blocked. */
+.kanban-dep-flow {
+  animation: kanban-dep-flow 1.1s linear infinite;
+}
+
+@keyframes kanban-dep-flow {
+  to {
+    stroke-dashoffset: -18;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .kanban-dep-flow {
+    animation: none;
+  }
+}

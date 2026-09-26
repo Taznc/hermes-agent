@@ -293,9 +293,27 @@ type KanbanMessages = {
   depFocusUpstream: string
   depFocusDownstream: string
   depClearFocus: string
+  /** The "+N cards" marker a focused trace folds unrelated lane cards into. */
+  depGap: (n: number) => string
+  depGapShow: string
   /** Focus depth toggle + graph overlay. */
   depFocusDirect: string
   depFocusChain: string
+  depFocused: string
+  depVerdictNone: string
+  depVerdictClear: (total: number) => string
+  depVerdictStalled: (open: number) => string
+  depVerdictWaiting: (open: number, parts: string, cleared: number) => string
+  depStatusCount: (n: number, status: string) => string
+  depBlockedByHeading: (n: number) => string
+  depBlocksHeading: (n: number) => string
+  depNothingBlocks: string
+  depNothingWaits: string
+  depRowTip: string
+  depLegendLead: string
+  depLegendHead: string
+  depChevrons: string
+  depFlow: string
   comments: (n: number) => string
   commentsHelpRunning: string
   commentsHelp: string
@@ -663,7 +681,8 @@ export const en: KanbanMessages = {
   guideBlockedManualTransient: 'A transient failure blocked this — it may clear on its own; unblock to retry.',
   guideBlockedAutomatic: cause => `${cause} Inspect the worker log, then retry or reassign.`,
   guideBlockedReviewNoVerdict: 'The reviewer exited without a verdict. Requeue it for another review pass.',
-  guideBlockedReviewRoundCap: 'Review rounds are exhausted — reassign, rescope, or archive it instead of simply retrying.',
+  guideBlockedReviewRoundCap:
+    'Review rounds are exhausted — reassign, rescope, or archive it instead of simply retrying.',
   guideBlockedUnknown: 'Inspect the worker log, then retry or reassign it.',
   guideIdea: 'Rough idea — refine it into a roadmap item when ready.',
   guideRoadmap: 'Specified, not yet authorized — spawn to Triage to start work.',
@@ -714,8 +733,27 @@ export const en: KanbanMessages = {
   depFocusUpstream: 'blocks this',
   depFocusDownstream: 'waits on this',
   depClearFocus: 'Clear focus',
+  depGap: n => (n === 1 ? '+1 card' : `+${n} cards`),
+  depGapShow: 'Not linked to the focused card — click to show',
   depFocusDirect: 'Direct links',
   depFocusChain: 'Full chain',
+  depFocused: 'Focused',
+  depVerdictNone: 'No blockers — nothing holds this card',
+  depVerdictClear: total =>
+    total === 1 ? 'Its blocker is done — ready to move' : `All ${total} blockers done — ready to move`,
+  depVerdictStalled: open =>
+    open === 1 ? 'Stalled — its open blocker is On hold' : `Stalled — all ${open} open blockers are On hold`,
+  depVerdictWaiting: (open, parts, cleared) => `Waiting on ${open}: ${parts}${cleared ? ` · ${cleared} done` : ''}`,
+  depStatusCount: (n, status) => `${n} ${status.toLowerCase()}`,
+  depBlockedByHeading: n => `Blocked by ${n}`,
+  depBlocksHeading: n => `Blocks ${n}`,
+  depNothingBlocks: 'Nothing',
+  depNothingWaits: 'Nothing waits on it',
+  depRowTip: 'Hover to highlight its line · click to focus this card',
+  depLegendLead: "Line colour = the blocker's status:",
+  depLegendHead: 'the arrowhead lands on the card that is held up',
+  depChevrons: 'Chevrons',
+  depFlow: 'Moving dots',
   comments: n => `Comments · ${n}`,
   commentsHelpRunning:
     'This task is running. Your note is folded into the worker’s current turn within a few seconds — no block/unblock dance. “Requeue with note” instead restarts the task from scratch with your note in context.',
@@ -1068,7 +1106,8 @@ const ja: KanbanMessages = {
     '一時的な失敗によりブロックされました — 自然に解消することがあります。ブロック解除して再試行してください。',
   guideBlockedAutomatic: cause => `${cause} ワーカーログを確認し、再試行するか再割り当てしてください。`,
   guideBlockedReviewNoVerdict: 'レビュアーが判定なしで終了しました。もう一度レビューへ再キューしてください。',
-  guideBlockedReviewRoundCap: 'レビュー往復の上限に達しました — 単に再試行せず、担当変更・範囲の見直し・アーカイブを検討してください。',
+  guideBlockedReviewRoundCap:
+    'レビュー往復の上限に達しました — 単に再試行せず、担当変更・範囲の見直し・アーカイブを検討してください。',
   guideBlockedUnknown: 'ワーカーログを確認し、再試行するか再割り当てしてください。',
   guideIdea: 'ラフなアイデアです — 準備ができたらロードマップ項目に整えてください。',
   guideRoadmap: '仕様は固まっていますが未承認です — トリアージへスポーンすると作業が始まります。',
@@ -1119,8 +1158,27 @@ const ja: KanbanMessages = {
   depFocusUpstream: 'これをブロック',
   depFocusDownstream: 'これを待機',
   depClearFocus: 'フォーカス解除',
+  depGap: n => `+${n} 件`,
+  depGapShow: 'フォーカス中のカードとは無関係です — クリックで表示',
   depFocusDirect: '直接リンク',
   depFocusChain: '全チェーン',
+  depFocused: 'フォーカス中',
+  depVerdictNone: 'ブロックなし — このカードを止めているものはありません',
+  depVerdictClear: total =>
+    total === 1 ? 'ブロック元は完了 — 移動できます' : `${total} 件のブロック元がすべて完了 — 移動できます`,
+  depVerdictStalled: open =>
+    open === 1 ? '停滞 — 未完了のブロック元が保留中です' : `停滞 — 未完了のブロック元 ${open} 件すべてが保留中です`,
+  depVerdictWaiting: (open, parts, cleared) => `${open} 件を待機中: ${parts}${cleared ? ` · ${cleared} 件完了` : ''}`,
+  depStatusCount: (n, status) => `${status} ${n}`,
+  depBlockedByHeading: n => `ブロック元 ${n}`,
+  depBlocksHeading: n => `ブロック先 ${n}`,
+  depNothingBlocks: 'なし',
+  depNothingWaits: '待機しているカードはありません',
+  depRowTip: 'ホバーで線を強調 · クリックでこのカードにフォーカス',
+  depLegendLead: '線の色 = ブロック元のステータス:',
+  depLegendHead: '矢印の先が止められているカードです',
+  depChevrons: 'シェブロン',
+  depFlow: '流れる点',
   comments: n => `コメント・${n}`,
   commentsHelpRunning:
     'このタスクは実行中です。あなたのメモは数秒以内にワーカーの現在のターンに取り込まれます — ブロック/解除の操作は不要です。「メモを付けて再キュー」を選ぶと、メモを文脈に含めてタスクを最初からやり直します。',
@@ -1518,8 +1576,27 @@ const zh: KanbanMessages = {
   depFocusUpstream: '阻塞它',
   depFocusDownstream: '等待它',
   depClearFocus: '清除聚焦',
+  depGap: n => `+${n} 张卡片`,
+  depGapShow: '与聚焦卡片无关 — 点击显示',
   depFocusDirect: '直接链接',
   depFocusChain: '完整链路',
+  depFocused: '当前聚焦',
+  depVerdictNone: '无阻塞 — 没有任务卡住此卡片',
+  depVerdictClear: total => (total === 1 ? '其阻塞项已完成 — 可以移动' : `全部 ${total} 项阻塞已完成 — 可以移动`),
+  depVerdictStalled: open =>
+    open === 1 ? '停滞 — 其未完成的阻塞项处于搁置' : `停滞 — 全部 ${open} 项未完成阻塞均处于搁置`,
+  depVerdictWaiting: (open, parts, cleared) =>
+    `正在等待 ${open} 项：${parts}${cleared ? ` · ${cleared} 项已完成` : ''}`,
+  depStatusCount: (n, status) => `${status} ${n}`,
+  depBlockedByHeading: n => `被阻塞 ${n}`,
+  depBlocksHeading: n => `阻塞 ${n}`,
+  depNothingBlocks: '无',
+  depNothingWaits: '没有任务在等待它',
+  depRowTip: '悬停以高亮其连线 · 点击以聚焦此卡片',
+  depLegendLead: '连线颜色 = 阻塞项的状态：',
+  depLegendHead: '箭头指向被卡住的卡片',
+  depChevrons: '方向箭头',
+  depFlow: '流动圆点',
   comments: n => `评论・${n}`,
   commentsHelpRunning:
     '此任务正在运行。你的备注会在几秒内融入工作单元当前的回合 — 无需阻塞/解除操作。选择“附带备注重新入队”则会带着你的备注从头重跑任务。',
@@ -1914,8 +1991,27 @@ const zhHant: KanbanMessages = {
   depFocusUpstream: '阻擋它',
   depFocusDownstream: '等待它',
   depClearFocus: '清除聚焦',
+  depGap: n => `+${n} 張卡片`,
+  depGapShow: '與聚焦卡片無關 — 點擊顯示',
   depFocusDirect: '直接連結',
   depFocusChain: '完整鏈路',
+  depFocused: '目前聚焦',
+  depVerdictNone: '無阻擋 — 沒有任務卡住此卡片',
+  depVerdictClear: total => (total === 1 ? '其阻擋項已完成 — 可以移動' : `全部 ${total} 項阻擋已完成 — 可以移動`),
+  depVerdictStalled: open =>
+    open === 1 ? '停滯 — 其未完成的阻擋項處於擱置' : `停滯 — 全部 ${open} 項未完成阻擋均處於擱置`,
+  depVerdictWaiting: (open, parts, cleared) =>
+    `正在等待 ${open} 項：${parts}${cleared ? ` · ${cleared} 項已完成` : ''}`,
+  depStatusCount: (n, status) => `${status} ${n}`,
+  depBlockedByHeading: n => `被阻擋 ${n}`,
+  depBlocksHeading: n => `阻擋 ${n}`,
+  depNothingBlocks: '無',
+  depNothingWaits: '沒有任務在等待它',
+  depRowTip: '懸停以醒目提示其連線 · 點擊以聚焦此卡片',
+  depLegendLead: '連線顏色 = 阻擋項的狀態：',
+  depLegendHead: '箭頭指向被卡住的卡片',
+  depChevrons: '方向箭頭',
+  depFlow: '流動圓點',
   comments: n => `留言・${n}`,
   commentsHelpRunning:
     '此任務正在執行。你的備註會在幾秒內融入工作單元目前的回合 — 無需阻擋/解除操作。選擇「附上備註重新排入佇列」則會帶著你的備註從頭重跑任務。',

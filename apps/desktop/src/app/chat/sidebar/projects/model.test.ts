@@ -1,6 +1,8 @@
 import { describe, expect, it } from 'vitest'
 
-import { orderProjectsByIds, sortProjectsForOverview } from './model'
+import type { SessionInfo } from '@/types/hermes'
+
+import { latestProjectSessions, orderProjectsByIds, sortProjectsForOverview } from './model'
 import { NO_PROJECT_ID, type SidebarProjectTree } from './workspace-groups'
 
 function makeProject(id: string, sessionCount: number): SidebarProjectTree {
@@ -74,5 +76,40 @@ describe('sortProjectsForOverview', () => {
     const projects = [makeProject('scanned', 0), active, home()]
 
     expect(ids(sortProjectsForOverview(projects, 'active'))).toEqual([NO_PROJECT_ID, 'active', 'scanned'])
+  })
+})
+
+describe('latestProjectSessions', () => {
+  const sessionRow = (id: string, overrides: Partial<SessionInfo> = {}): SessionInfo =>
+    ({ archived: false, id, last_active: 0, message_count: 1, source: 'cli', started_at: 0, title: id, ...overrides }) as SessionInfo
+
+  const projectWithSessions = (sessions: SessionInfo[]): SidebarProjectTree => ({
+    ...makeProject('/www/app', sessions.length),
+    repos: [
+      {
+        groups: [{ id: '/www/app::main', isMain: true, label: 'main', path: '/www/app', sessions }],
+        id: '/www/app',
+        label: 'app',
+        path: '/www/app',
+        sessionCount: sessions.length
+      }
+    ]
+  })
+
+  it('drops a session flagged archived on the bare-flag default', () => {
+    const project = projectWithSessions([sessionRow('live'), sessionRow('archived-flag', { archived: true })])
+
+    expect(latestProjectSessions(project, 8).map(s => s.id)).toEqual(['live'])
+  })
+
+  it('rejects a stale archived=false row via an injected archive predicate', () => {
+    // Round-2 review finding 3 (t_d0a6300e): a caller wired into the
+    // centralized `$sidebarIsArchivedSession` policy must be able to reject a
+    // row the bare-flag default cannot see (still stamped `archived: false`
+    // locally, but `archived: true` per the independent archived-only query).
+    const project = projectWithSessions([sessionRow('live'), sessionRow('stale-archived-false')])
+    const isArchived = (session: SessionInfo) => session.id === 'stale-archived-false'
+
+    expect(latestProjectSessions(project, 8, isArchived).map(s => s.id)).toEqual(['live'])
   })
 })

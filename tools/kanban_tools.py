@@ -20,6 +20,8 @@ from agent.redact import redact_sensitive_text
 from hermes_cli.goals import judge_goal
 from tools.registry import registry, tool_error
 from tools import kanban_tools_mergeability as _ktm
+from tools import kanban_tools_review_gate as _krg
+from tools import kanban_tools_rework as _ktr
 from hermes_cli.config import cfg_get, load_config
 from tools.kanban_tools_schemas import (
     KANBAN_ATTACH_SCHEMA,
@@ -731,6 +733,8 @@ def _handle_request_review(args: dict, **kw) -> str:
     if metadata is not None:
         metadata = _redact_metadata(metadata)
         _check(metadata is not None, "metadata could not be safely serialized")
+    if gate_refusal := _krg.refusal(metadata):
+        raise _Reject(gate_refusal)
     metadata = _stamp_worker_session_metadata(tid, metadata)
     # Reviewer is model-supplied free text stored durably on the event payload.
     reviewer = _redact_opt(args.get("reviewer") or None)
@@ -748,6 +752,12 @@ def _handle_request_review(args: dict, **kw) -> str:
                 _ktm.record_conflict(conn, tid, merge, run_id=_worker_run_id(tid))
                 raise _Reject(_ktm.refusal_message(merge))
             metadata = {**(metadata or {}), "mergeable_against": merge.stamp}
+        # Second preflight on the same path: a rework handoff (prior
+        # changes_requested since the last completion) must map each reviewer
+        # item to its evidence, or the next round is spent on "still not done".
+        rework_refusal = _ktr.preflight(conn, task, tid, metadata)
+        if rework_refusal is not None:
+            raise _Reject(rework_refusal)
         ok, fail_reason = kb.request_review(
             conn, tid, summary=summary, metadata=metadata, reviewer=reviewer,
             expected_run_id=_worker_run_id(tid), with_reason=True)

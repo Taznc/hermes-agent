@@ -239,6 +239,7 @@ def test_escalation_preserves_operator_set_via_set_model_override_cli(all_assign
 
 
 def test_third_changes_request_hits_review_round_cap_and_blocks(all_assignees_spawnable):
+    """No escalation profile configured: the cap is a plain hard stop."""
     with kbc.connect() as conn:
         task_id = kb.create_task(conn, title="runaway rework", assignee="implementer")
         kb._append_event(conn, task_id, "changes_requested", {"reason": "first"})
@@ -446,3 +447,167 @@ def test_cap_only_tick_is_classified_as_activity_not_idle(all_assignees_spawnabl
 
     assert "blocked_review_round_cap" in kb._TICK_ACTIVITY_FIELDS
     assert [kw["outcome"] for kw in ticks] == ["ok"]
+
+
+# ---------------------------------------------------------------------------
+# At the cap: one terminal escalated round BEFORE the hard block
+# ---------------------------------------------------------------------------
+
+
+def _card_at_cap(conn, *, assignee: str, rounds: int = 2) -> str:
+    task_id = kb.create_task(conn, title="at the cap", assignee=assignee)
+    for i in range(rounds):
+        kb._append_event(conn, task_id, "changes_requested", {"reason": f"round {i + 1}"})
+    conn.commit()
+    return task_id
+
+
+def test_at_cap_escalates_to_profile_for_one_terminal_round_instead_of_blocking(
+    all_assignees_spawnable,
+):
+    """A fully AI-operated board must not need a human at the cap while a
+    specialist is configured: the card goes to the escalation profile for ONE
+    more round, stays dispatchable, and carries a durable review_cap_escalated
+    event — it is NOT blocked."""
+    with kbc.connect() as conn:
+        task_id = _card_at_cap(conn, assignee="implementer", rounds=2)
+
+        result = kbd.dispatch_once(
+            conn,
+            spawn_fn=_spawn,
+            max_review_rounds=2,
+            review_rework_escalation_profile="debugger",
+        )
+
+        assert result.blocked_review_round_cap == []
+        assert result.escalated_review_cap == [(task_id, "implementer", "debugger", 2)]
+        assert result.auto_escalated_rework == []
+        assert [(tid, who) for tid, who, _ws in result.spawned] == [(task_id, "debugger")]
+
+        task = kb.get_task(conn, task_id)
+        assert task is not None
+        assert task.status == "running"
+        assert task.block_kind != "review_round_cap"
+        assert task.assignee == "debugger"
+
+        events = kb.list_events(conn, task_id)
+        assert not any(e.kind == "review_round_cap" for e in events)
+        escalated = [e for e in events if e.kind == "review_cap_escalated"]
+        assert len(escalated) == 1
+        assert escalated[0].payload == {
+            "changes_rounds": 2,
+            "max_review_rounds": 2,
+            "escalation_profile": "debugger",
+            "previous_assignee": "implementer",
+        }
+
+        # The escalated worker can see it is on the terminal pass.
+        packet = kb.build_worker_task_packet(conn, task_id).to_dict()
+        assert packet["review"]["terminal_rework"] is True
+
+
+def test_at_cap_blocks_when_the_escalated_round_also_requests_changes(
+    all_assignees_spawnable,
+):
+    """The escalation profile already owns the card at the cap, so its one
+    terminal round came back changes_requested: now — and only now — the
+    hard stop fires."""
+    with kbc.connect() as conn:
+        task_id = _card_at_cap(conn, assignee="implementer", rounds=2)
+        first = kbd.dispatch_once(
+            conn, spawn_fn=_spawn, max_review_rounds=2,
+            review_rework_escalation_profile="debugger",
+        )
+        assert first.escalated_review_cap == [(task_id, "implementer", "debugger", 2)]
+
+        # The specialist's round ends in yet another changes request.
+        with kb.write_txn(conn):
+            conn.execute(
+                "UPDATE tasks SET status = 'ready', claim_lock = NULL, claim_expires = NULL, "
+                "worker_pid = NULL WHERE id = ?",
+                (task_id,),
+            )
+            kb._append_event(conn, task_id, "changes_requested", {"reason": "still wrong"})
+
+        second = kbd.dispatch_once(
+            conn, spawn_fn=_spawn, max_review_rounds=2,
+            review_rework_escalation_profile="debugger",
+        )
+
+        assert second.escalated_review_cap == []
+        assert second.spawned == []
+        assert second.blocked_review_round_cap == [(task_id, 3)]
+        task = kb.get_task(conn, task_id)
+        assert task is not None
+        assert task.status == "blocked"
+        assert task.block_kind == "review_round_cap"
+        assert task.assignee == "debugger"
+        cap_event = [e for e in kb.list_events(conn, task_id) if e.kind == "review_round_cap"][-1]
+        assert cap_event.payload.get("reason") == "still wrong"
+        # Exactly one escalated round was granted — the block did not re-escalate.
+        assert sum(
+            1 for e in kb.list_events(conn, task_id) if e.kind == "review_cap_escalated"
+        ) == 1
+
+
+def test_at_cap_without_escalation_profile_blocks_immediately(all_assignees_spawnable):
+    """Existing behaviour preserved: no specialist configured means the cap is
+    still a hard block on the implementer, with no escalation event."""
+    with kbc.connect() as conn:
+        task_id = _card_at_cap(conn, assignee="implementer", rounds=2)
+
+        result = kbd.dispatch_once(
+            conn, spawn_fn=_spawn, max_review_rounds=2,
+            review_rework_escalation_profile="",
+        )
+
+        assert result.escalated_review_cap == []
+        assert result.spawned == []
+        assert result.blocked_review_round_cap == [(task_id, 2)]
+        task = kb.get_task(conn, task_id)
+        assert task is not None
+        assert task.status == "blocked"
+        assert task.block_kind == "review_round_cap"
+        assert task.assignee == "implementer"
+        assert not any(
+            e.kind == "review_cap_escalated" for e in kb.list_events(conn, task_id)
+        )
+        assert kb.build_worker_task_packet(conn, task_id).to_dict()["review"][
+            "terminal_rework"
+        ] is False
+
+
+def test_manual_reassignment_at_cap_overrides_escalation_too(all_assignees_spawnable):
+    """An operator's explicit routing after the last changes request wins over
+    the cap-time escalation exactly as it wins over the block."""
+    with kbc.connect() as conn:
+        task_id = _card_at_cap(conn, assignee="implementer", rounds=2)
+        assert kb.assign_task(conn, task_id, "specialist") is True
+
+        result = kbd.dispatch_once(
+            conn, spawn_fn=_spawn, max_review_rounds=2,
+            review_rework_escalation_profile="debugger",
+        )
+
+        assert result.escalated_review_cap == []
+        assert result.blocked_review_round_cap == []
+        assert [(tid, who) for tid, who, _ws in result.spawned] == [(task_id, "specialist")]
+
+
+def test_terminal_rework_flag_resets_after_completion(all_assignees_spawnable):
+    """Same work-epoch rule as the round counter: a card that was escalated at
+    the cap, completed, and later reopened is not still 'terminal'."""
+    with kbc.connect() as conn:
+        task_id = _card_at_cap(conn, assignee="implementer", rounds=2)
+        kbd.dispatch_once(
+            conn, spawn_fn=_spawn, max_review_rounds=2,
+            review_rework_escalation_profile="debugger",
+        )
+        assert kb.build_worker_task_packet(conn, task_id).to_dict()["review"][
+            "terminal_rework"
+        ] is True
+        assert kb.complete_task(conn, task_id, summary="done at last") is True
+
+        assert kb.build_worker_task_packet(conn, task_id).to_dict()["review"][
+            "terminal_rework"
+        ] is False

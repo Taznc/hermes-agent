@@ -39,6 +39,7 @@ import {
 } from '@/store/session'
 import { $removedSessionIds } from '@/store/session-removal'
 import { $sessionTiles, $workingSessionIds, getRecentlySettledSessionIds } from '@/store/session-states'
+import { loadArchivedSessions } from '@/store/sidebar-archive'
 
 import { refreshCronJobs as refreshCronJobsStore } from '../../cron/cron-actions'
 
@@ -261,6 +262,18 @@ export function useSessionListActions({ profileScope }: UseSessionListActionsArg
       }
 
       try {
+        // Keep the archived-only identity set warm on the SAME cadence as every
+        // other sidebar slice, not only when the user toggles Archived on —
+        // otherwise `$sidebarArchivedIdentitySet`/`$sidebarIsArchivedSession`
+        // stay empty for an entire session that never opens Archived, and a
+        // stale `mergeSessionPage`-retained `archived: false` row (external
+        // CLI archive of a keep-protected/open/pinned session) has no signal
+        // to reject it against (round-2 review finding 1 on t_d0a6300e).
+        // Fire-and-forget: `loadArchivedSessions` owns its own in-flight guard
+        // and store, and must not gate this refresh's loading/request-id
+        // bookkeeping or its own error handling.
+        void loadArchivedSessions()
+
         const limit = $sessionsLimit.get()
 
         // Require at least one message so abandoned/empty "Untitled" drafts (one

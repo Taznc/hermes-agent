@@ -257,6 +257,7 @@ _TICK_ACTIVITY_FIELDS = (
     "timed_out", "auto_blocked", "preflight_blocked", "rate_limited", "review_no_verdict", "auto_assigned_default",
     "respawn_guarded", "skipped_per_profile_capped", "skipped_unassigned",
     "skipped_nonspawnable", "skill_preflight_blocked", "blocked_review_round_cap",
+    "escalated_review_cap",
 )
 
 

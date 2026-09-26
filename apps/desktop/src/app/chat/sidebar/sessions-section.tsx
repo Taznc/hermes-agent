@@ -30,7 +30,7 @@ import {
 import { sessionPinId } from '@/store/session'
 import { $liveTurnSessionIds } from '@/store/session-dot-state'
 
-import { SidebarDateDivider, SidebarDateDividerArchiveButton, SidebarSectionMeta } from './chrome'
+import { SidebarDateDivider, SidebarSectionMeta } from './chrome'
 import { mergeVisibleReorder, orderRowsWithinGroups, reorderableRowIds } from './order'
 import {
   EnteredProjectContent,
@@ -431,42 +431,9 @@ export function SidebarSessionsSection({
     return manualOrderIds?.length ? orderRowsWithinGroups(rows, manualOrderIds) : rows
   }, [grouping, displayEntries, liveTurnIdSet, manualOrderIds, statusDividerLabels])
 
-  const archiveDateGroup = useCallback(
-    (rows: readonly SidebarListRow[], key: string) => {
-      let insideGroup = false
-
-      for (const row of rows) {
-        if (row.kind === 'divider') {
-          if (insideGroup) {
-            break
-          }
-
-          insideGroup = row.key === key
-        } else if (insideGroup) {
-          onArchiveSession(row.entry.session.id)
-        }
-      }
-    },
-    [onArchiveSession]
-  )
-
   const dividerAction = useCallback(
-    (key: string, label: string, rows: readonly SidebarListRow[] = flatRows) => {
-      if (grouping !== 'date') {
-        return newSessionDividerAction
-      }
-
-      return (
-        <>
-          <SidebarDateDividerArchiveButton
-            ariaLabel={`${t.sidebar.row.archiveSession}: ${label}`}
-            onArchive={() => archiveDateGroup(rows, key)}
-          />
-          {newSessionDividerAction}
-        </>
-      )
-    },
-    [archiveDateGroup, flatRows, grouping, newSessionDividerAction, t]
+    (_key: string, _label: string) => newSessionDividerAction,
+    [newSessionDividerAction]
   )
 
   // Same as `renderRows`, but with date dividers folded in — used for
@@ -483,7 +450,7 @@ export function SidebarSessionsSection({
           row,
           false,
           row.kind === 'divider'
-            ? dividerAction(row.key, 'label' in row ? row.label : sessionBucketLabel(row.bucket, dividerLabels), rows)
+            ? dividerAction(row.key, 'label' in row ? row.label : sessionBucketLabel(row.bucket, dividerLabels))
             : undefined
         )
       )
@@ -636,6 +603,7 @@ export function SidebarSessionsSection({
         onResumeSession={onResumeSession}
         onTogglePin={onTogglePin}
         onToggleUnread={onToggleUnread}
+        onUnarchiveSession={onUnarchiveSession}
         pinned={pinned}
         rows={visibleRows}
         showProfileTags={showProfileTags}

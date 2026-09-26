@@ -69,6 +69,22 @@ def _latest_closed_handoff(conn, task_id: str) -> Optional[dict[str, Any]]:
     }
 
 
+def _terminal_rework(conn, task_id: str) -> bool:
+    """Whether the card is on its ONE escalated rework round at
+    ``kanban.max_review_rounds``: a ``review_cap_escalated`` event newer than the
+    last ``completed`` event. Same work-epoch rule as the round counter itself
+    (:func:`kanban_db_dispatch._changes_requested_state`), so a card that
+    completed and was later reopened does not inherit a stale terminal flag."""
+    row = conn.execute(
+        "SELECT 1 FROM task_events WHERE task_id = ? AND kind = 'review_cap_escalated' "
+        "AND id > COALESCE(("
+        "  SELECT MAX(id) FROM task_events WHERE task_id = ? AND kind = 'completed'"
+        "), 0) LIMIT 1",
+        (task_id, task_id),
+    ).fetchone()
+    return row is not None
+
+
 def _dependency_packet(conn, task_id: str) -> dict[str, Any]:
     task = _kb.get_task(conn, task_id)
     handoff = _latest_closed_handoff(conn, task_id)
@@ -358,6 +374,7 @@ def build_worker_task_packet(
         handoff=handoff,
         review={
             **review_contract,
+            "terminal_rework": _terminal_rework(conn, task_id),
             "unresolved_items": unresolved,
         },
         dependencies=[

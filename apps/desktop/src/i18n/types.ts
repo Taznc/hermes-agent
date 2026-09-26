@@ -2201,10 +2201,6 @@ export interface UpstreamTranslations {
       openInSplit: string
       copyIdFailed: string
       sessionActions: string
-      /** Accessible name for the always-in-flow row-level archive icon button
-       *  (distinct from the kebab menu's `archive` label — this is the direct
-       *  one-click affordance on the row itself). */
-      archiveSession: string
       sessionRunning: string
       needsInput: string
       waitingForAnswer: string
@@ -3240,6 +3236,19 @@ export interface UpstreamTranslations {
       reloadFailed: string
       gatewayDisconnected: string
     }
+    newSessionProposal: {
+      title: string
+      description: (topic: string) => string
+      reasonLabel: string
+      approve: string
+      decline: string
+      approved: string
+      declined: string
+      unanswered: string
+      failed: string
+      sendFailed: string
+      gatewayDisconnected: string
+    }
     tool: {
       copyCode: string
       renderingImage: string
@@ -3309,6 +3318,8 @@ export interface UpstreamTranslations {
     audioReadFailed: string
     sessionUnavailable: string
     createSessionFailed: string
+    newTopicMissingTopic: string
+    newTopicUsage: string
     promptFailed: string
     providerCredentialRequired: string
     emptySlashCommand: string
@@ -3347,8 +3358,6 @@ export interface UpstreamTranslations {
     deleteFailed: string
     archived: string
     archiveFailed: string
-    archivedUndoMessage: string
-    undoArchiveFailed: string
     cwdChangeFailed: string
     cwdStagedTitle: string
     cwdStagedMessage: string

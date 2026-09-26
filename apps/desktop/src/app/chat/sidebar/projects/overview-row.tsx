@@ -8,6 +8,7 @@ import type { SessionInfo } from '@/hermes'
 import { useI18n } from '@/i18n'
 import { cn } from '@/lib/utils'
 import { $sidebarShowAllSessions } from '@/store/layout'
+import { $sidebarIsArchivedSession } from '@/store/sidebar-model'
 
 import {
   SIDEBAR_LEAD_ICON_SIZE,
@@ -102,9 +103,10 @@ export function ProjectOverviewRow({
   // the sidebar's content edge regardless of which side the sidebar is on.
   const rowRef = useRef<HTMLDivElement>(null)
   const showAllSessions = useStore($sidebarShowAllSessions)
+  const isArchivedSession = useStore($sidebarIsArchivedSession)
   const limit = showAllSessions ? Infinity : PROJECT_PREVIEW_COUNT
   const fetched = (previewSessions ?? []).slice(0, limit)
-  const preview = renderRows ? (fetched.length ? fetched : latestProjectSessions(project, limit)) : []
+  const preview = renderRows ? (fetched.length ? fetched : latestProjectSessions(project, limit, isArchivedSession)) : []
 
   const lead = reorderable ? (
     <SidebarRowGrab
