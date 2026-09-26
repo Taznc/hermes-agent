@@ -158,7 +158,14 @@ def test_fire_due_rearms_after_claimed_job_failure(chronos, monkeypatch, tmp_pat
 
 
 def test_fire_due_forwards_manual_force_to_claim(chronos, monkeypatch):
-    """A manual force fire must reach the store claim as force=True."""
+    """A manual force fire must reach the store claim as force=True.
+
+    Asserts only the forwarding contract this test exists to guard (`force`
+    and `return_job` reach the claim call) — not the full kwargs dict, which
+    would freeze against any other field `claim_fire` legitimately passes
+    through (e.g. `execution_id`) and turn every unrelated addition into a
+    spurious failure here.
+    """
     prov, _fake = chronos
     seen = []
     monkeypatch.setattr(
@@ -171,7 +178,9 @@ def test_fire_due_forwards_manual_force_to_claim(chronos, monkeypatch):
     )
 
     assert prov.fire_due("j1", force=True) is False
-    assert seen == [{"return_job": True, "force": True}]
+    assert len(seen) == 1
+    assert seen[0]["force"] is True
+    assert seen[0]["return_job"] is True
 
 
 def test_fire_due_no_rearm_when_job_gone(chronos, monkeypatch):

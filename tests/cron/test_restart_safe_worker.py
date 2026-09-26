@@ -693,8 +693,20 @@ def test_managed_gateway_restart_preserves_active_worker_and_single_side_effect(
                 scheduler.drain_delivery_queue(
                     {Platform.TELEGRAM: adapter}, replacement_loop
                 )
+                row = delivery_queue.get_status(execution["id"])
             current = executions.latest_execution(job["id"])
-            if current and current["status"] == "completed":
+            # The run's own terminal ledger row is committed BEFORE delivery is
+            # attempted (_terminalize_run_outcome) — a completed execution does
+            # NOT mean its delivery has landed yet. Wait for the delivery row to
+            # reach a terminal state too, draining the queue on every pending
+            # sighting, or this loop can break mid-delivery and race the
+            # assertions below against a send that is still in flight.
+            if (
+                current
+                and current["status"] == "completed"
+                and row
+                and row["status"] in ("delivered", "failed", "unknown")
+            ):
                 break
             time.sleep(0.05)
         assert executions.latest_execution(job["id"])["status"] == "completed"
