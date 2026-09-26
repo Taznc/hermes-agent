@@ -92,6 +92,10 @@ class ChatImageUpload(BaseModel):
     data_url: str
     filename: Optional[str] = None
 
+class ChatFileUpload(BaseModel):
+    data_url: str
+    filename: Optional[str] = None
+
 class ManagedDirectoryCreate(BaseModel):
     path: str
 
