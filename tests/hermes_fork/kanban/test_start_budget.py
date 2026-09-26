@@ -326,9 +326,32 @@ def test_contended_dispatcher_starts_nothing_and_holder_starts_once(env):
     ).fetchone()[0] == 1
 
 
-def test_anchor_is_wired_into_dispatch_once_locked():
-    import inspect
+def test_exhausted_budget_is_enforced_before_any_claim_in_either_lane(env):
+    conn, _cfg, _clock, spawned, spawn = env
+    a, b, ready_c = _new(conn, 3)
+    (review_d,) = _new(conn, 1, "v")
+    conn.execute("UPDATE tasks SET status = 'review' WHERE id = ?", (review_d,))
+    conn.commit()
+    _tick(conn, spawn)
+    started = list(spawned)
+    assert len(started) == 2
+    _finish(conn, *started)
+    held_ids = sorted({a, b, ready_c, review_d} - set(started))
 
-    src = inspect.getsource(kbd._dispatch_once_locked)
-    assert "FORK ANCHOR: start-budget" in src
-    assert src.index("_tick_spawn_budget(") < src.index("_fork_start_admit(") < src.index("_lane_rows(")
+    def claims():
+        return conn.execute(
+            "SELECT COUNT(*) FROM task_events WHERE kind = 'claimed'"
+        ).fetchone()[0]
+
+    def runs():
+        return conn.execute("SELECT COUNT(*) FROM task_runs").fetchone()[0]
+
+    claims_before, runs_before = claims(), runs()
+    held = _tick(conn, spawn, max_spawn=10)
+
+    assert held.spawned == [] and spawned == started
+    assert (claims(), runs()) == (claims_before, runs_before)
+    for tid in held_ids:
+        row = kb.get_task(conn, tid)
+        assert row.claim_lock is None and row.status in ("ready", "review")
+        assert (tid, "start_budget") in held.respawn_guarded
