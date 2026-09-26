@@ -33,6 +33,7 @@ import {
 } from '@hermes/plugin-sdk'
 import { useEffect, useMemo, useRef, useState } from 'react'
 
+import { FocusAnswerBar } from './answer-bar'
 import {
   $boardSlug,
   $collapsedLanes,
@@ -49,7 +50,7 @@ import {
   primeAllBoardsSocket
 } from './api'
 import { ArchiveDoneControl } from './archive-done-control'
-import { BoardDependencyArrows, type FocusDepth, FocusDepthControls } from './board-arrows-layer'
+import { BoardDependencyArrows, type FocusDepth } from './board-arrows-layer'
 import { BoardSwitcher } from './board-switcher'
 import { BoardInfoContext, Column, EMPTY_BOARD_INFO } from './card'
 import { DependencyContext, type DependencyView, EMPTY_IDS } from './dependency-view'
@@ -942,20 +943,21 @@ export function KanbanBoardPage() {
 
           {isAllBoards && <BoardsErrorNotice errors={board?.errors} />}
 
-          {/* Focus-mode hint. Only while a trace is live, so the board chrome is
-          unchanged in the common case. Its own row rather than an overlay:
+          {/* The answer bar. Only while a trace is live, so the board chrome
+          is unchanged in the common case. Its own row rather than an overlay:
           the board is dimmed underneath and an overlay would compete with the
-          selection bar for the same corner. */}
+          selection bar for the same corner. Clicking a row moves the focus
+          (never toggles it off — the row is a different card). */}
           {focused && (
-            <div className="mx-4 mb-2 flex shrink-0 items-center gap-2 rounded-lg bg-(--ui-bg-quinary) px-3 py-1.5 text-[0.6875rem] text-(--ui-text-secondary)">
-              <Codicon className="shrink-0 text-(--ui-text-tertiary)" name="references" size="0.8rem" />
-              <span className="min-w-0 truncate">{k.depFocusHint}</span>
-              <FocusDepthControls depth={focusDepth} onDepth={setFocusDepth} />
-              <Button className="ml-auto shrink-0" onClick={() => setFocused(null)} size="xs" variant="ghost">
-                <Codicon name="close" size="0.7rem" />
-                {k.depClearFocus}
-              </Button>
-            </div>
+            <FocusAnswerBar
+              depth={focusDepth}
+              focused={focused}
+              graph={graph}
+              index={index}
+              onClear={() => setFocused(null)}
+              onDepth={setFocusDepth}
+              onFocus={setFocused}
+            />
           )}
 
           {errorMessage && !board ? (
@@ -987,8 +989,8 @@ export function KanbanBoardPage() {
               // `relative`: the dependency-arrow layer is positioned against the
               // strip's scroll content, so it pans with the lanes for free.
               // While a trace is live the right gutter grows to fit the widest
-              // same-lane bracket (LOOP_OUT + 40), so the last lane's loop is
-              // never clipped by the strip's scroll edge.
+              // same-lane bracket (BRACKET_MAX + casing), so the last lane's
+              // loop is never clipped by the strip's scroll edge.
               className={cn(
                 'relative flex min-h-0 flex-1 gap-2 overflow-x-auto px-4 pt-1 pb-3',
                 focused && 'pr-16',
@@ -1000,9 +1002,12 @@ export function KanbanBoardPage() {
               // `currentTarget` check, which would only catch the thin gutters.
               // Cards are the draggable nodes (same vocabulary useGrabScroll uses),
               // so a click on a card — including its own trace button — is left to
-              // the card's own handler.
+              // the card's own handler. A click on a dependency line is not a
+              // click on the background either: lines are hover targets.
               onClickCapture={event => {
-                if (focused && !(event.target as HTMLElement).closest('[draggable="true"]')) {
+                const target = event.target as Element
+
+                if (focused && !target.closest('[draggable="true"], [data-board-arrows]')) {
                   setFocused(null)
                 }
               }}

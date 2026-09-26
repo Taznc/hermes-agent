@@ -33,6 +33,7 @@ import {
   useState
 } from 'react'
 
+import { FocusRollup } from './answer-bar'
 import { $lanesByProfile, addRoadmapIdea, fetchAttachmentDataUrl } from './api'
 import { focusRole, hasDependencies, PROMOTABLE_STATUSES, useDependencies } from './dependency-view'
 import { blockerStand, downstreamOf, taskCardKey, upstreamOf } from './deps'
@@ -554,6 +555,11 @@ export function Card({
           ) : (
             <CardFooter arc={arc} onSetPriority={priority => onSetPriority(key, priority)} task={task} />
           )}
+          {/* The focused card answers "why am I stuck?" on itself too: a
+              swatch per blocker in its status colour + the answer bar's
+              verdict. Only on the focused card, and only with edges (an older
+              backend's bare counts can't say which blockers still gate). */}
+          {role === 'focused' && deps.hasEdges && <FocusRollup graph={deps.graph} index={deps.index} taskKey={key} />}
         </div>
       </ContextMenuTrigger>
       <ContextMenuContent>

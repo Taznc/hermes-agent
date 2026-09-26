@@ -1,6 +1,19 @@
 import { describe, expect, it } from 'vitest'
 
-import { ARROW_GAP, arrowSides, type CardBox, clampToLane, focusEdges, routeArrows } from './board-arrows'
+import {
+  ARROW_GAP,
+  arrowHead,
+  arrowSides,
+  BRACKET_MAX,
+  type CardBox,
+  chevrons,
+  clampToLane,
+  type Curve,
+  FAN_LIFT,
+  focusEdges,
+  pointAt,
+  routeArrows
+} from './board-arrows'
 import { buildGraph, chainSets, focusSets } from './deps'
 import type { KanbanBoard } from './types'
 
@@ -114,6 +127,118 @@ describe('routeArrows', () => {
     )
 
     expect(arrow.offscreen).toBe(true)
+  })
+})
+
+describe('ribbon routing', () => {
+  it('is one smooth cubic per edge whose ends match its curve', () => {
+    const [arrow] = routeArrows(
+      [['a', 'b']],
+      new Map([
+        ['a', box(0, 0)],
+        ['b', box(400, 200)]
+      ])
+    )
+
+    expect(arrow.d).toMatch(/^M [\d.]+ [\d.]+ C [\d.]+ [\d.]+, [\d.]+ [\d.]+, [\d.]+ [\d.]+$/)
+    expect(pointAt(arrow.curve, 0)).toEqual(arrow.curve[0])
+    expect(pointAt(arrow.curve, 1)).toEqual(arrow.curve[3])
+    // Handles leave horizontally toward the child, and never overshoot it.
+    expect(arrow.curve[1].x).toBeGreaterThan(arrow.curve[0].x)
+    expect(arrow.curve[2].x).toBeLessThan(arrow.curve[3].x)
+    expect(arrow.curve[1].x).toBeLessThanOrEqual(arrow.curve[0].x + 120)
+  })
+
+  it('ribbons that land on one card side arc through separate height bands', () => {
+    const arrows = routeArrows(
+      [
+        ['a', 'c'],
+        ['b', 'c']
+      ],
+      new Map([
+        ['a', box(0, 0)],
+        ['b', box(0, 100)],
+        ['c', box(400, 50)]
+      ])
+    )
+
+    const lifts = arrows.map(arrow => arrow.curve[2].y - arrow.curve[3].y)
+
+    expect(lifts).toEqual([-FAN_LIFT / 2, FAN_LIFT / 2])
+  })
+
+  it("a same-lane bracket stays inside the strip's reserved right gutter", () => {
+    const [arrow] = routeArrows(
+      [['a', 'b']],
+      new Map([
+        ['a', box(0, 0)],
+        ['b', box(0, 2000)]
+      ])
+    )
+
+    let widest = 0
+
+    for (let t = 0; t <= 1; t += 0.01) {
+      widest = Math.max(widest, pointAt(arrow.curve, t).x)
+    }
+
+    expect(widest - 200).toBeLessThanOrEqual(BRACKET_MAX + ARROW_GAP)
+  })
+})
+
+describe('arrowHead', () => {
+  const pairs = (points: string) => points.split(' ').map(p => p.split(',').map(Number))
+
+  it('puts the tip exactly on the curve end, pointing along it', () => {
+    const curve: Curve = [
+      { x: 0, y: 0 },
+      { x: 50, y: 0 },
+      { x: 150, y: 0 },
+      { x: 200, y: 0 }
+    ]
+
+    const [tip, wing1, notch, wing2] = pairs(arrowHead(curve, 22))
+
+    expect(tip).toEqual([200, 0])
+    expect(wing1[0]).toBeCloseTo(178)
+    expect(notch[0]).toBeLessThan(200)
+    expect(notch[0]).toBeGreaterThan(wing1[0])
+    expect(wing1[1]).toBe(-wing2[1])
+  })
+
+  it('shrinks on a short hop so the head never reaches back over the blocker', () => {
+    const curve: Curve = [
+      { x: 0, y: 0 },
+      { x: 10, y: 0 },
+      { x: 10, y: 0 },
+      { x: 20, y: 0 }
+    ]
+
+    const xs = pairs(arrowHead(curve, 22)).map(([x]) => x)
+
+    expect(Math.min(...xs)).toBeGreaterThanOrEqual(20 - Math.max(8, 20 * 0.6) - 0.1)
+  })
+})
+
+describe('chevrons', () => {
+  const straight = (length: number): Curve => [
+    { x: 0, y: 0 },
+    { x: length / 3, y: 0 },
+    { x: (2 * length) / 3, y: 0 },
+    { x: length, y: 0 }
+  ]
+
+  it('none on a short line; roughly one per 46px on a long one', () => {
+    expect(chevrons(straight(60), 5)).toEqual([])
+    expect(chevrons(straight(500), 5)).toHaveLength(Math.floor((500 - 40) / 46))
+  })
+
+  it('every chevron points the way the line runs (its apex is ahead of its arms)', () => {
+    for (const points of chevrons(straight(300), 5)) {
+      const [arm, apex] = points.split(' ').map(p => p.split(',').map(Number))
+
+      expect(apex[0]).toBeGreaterThan(arm[0])
+    }
   })
 })
 
