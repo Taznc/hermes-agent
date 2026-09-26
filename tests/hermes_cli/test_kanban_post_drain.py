@@ -7,6 +7,7 @@ trigger fires without a browser connected.
 
 from __future__ import annotations
 
+import dataclasses
 import os
 import threading
 import time
@@ -258,7 +259,7 @@ def recorder(monkeypatch):
 
             monkeypatch.setitem(
                 pd.ACTION_HANDLERS, kind,
-                type(original)(
+                dataclasses.replace(original,
                     kind=original.kind,
                     takes_target=original.takes_target,
                     resolve_target=original.resolve_target,
@@ -276,6 +277,16 @@ def recorder(monkeypatch):
     calls.install("reboot")
     calls.install("service_restart")
     return calls
+
+
+def _queue_consented(board, **kwargs):
+    """Queue an action AND record the operator's consent, as an attended operator would.
+
+    A lifecycle kind never fires on queued intent alone (see the consent tests below),
+    so the firing-machinery tests model the fully-consented path explicitly.
+    """
+    record = pd.queue_post_drain_action(board, **kwargs)
+    return pd.record_operator_consent(board, granted_by="operator")["state"] or record
 
 
 def _running(board, count):
@@ -299,7 +310,7 @@ def _running(board, count):
 def test_a_queued_action_never_fires_while_workers_are_running(kanban_home, recorder):
     _running(None, 2)
     kbd.pause_dispatch(None)
-    pd.queue_post_drain_action(None, action_kind="reboot")
+    _queue_consented(None, action_kind="reboot")
 
     outcome = pd.evaluate_post_drain_action(None)
 
@@ -310,7 +321,7 @@ def test_a_queued_action_never_fires_while_workers_are_running(kanban_home, reco
 
 def test_a_queued_action_fires_when_the_paused_board_reaches_zero_running(kanban_home, recorder):
     kbd.pause_dispatch(None)
-    pd.queue_post_drain_action(None, action_kind="reboot")
+    _queue_consented(None, action_kind="reboot")
 
     outcome = pd.evaluate_post_drain_action(None)
 
@@ -320,7 +331,7 @@ def test_a_queued_action_fires_when_the_paused_board_reaches_zero_running(kanban
 
 
 def test_a_queued_action_does_not_fire_on_an_unpaused_board(kanban_home, recorder):
-    pd.queue_post_drain_action(None, action_kind="reboot")
+    _queue_consented(None, action_kind="reboot")
 
     assert pd.evaluate_post_drain_action(None) is None
     assert recorder == []
@@ -333,7 +344,7 @@ def test_a_fault_pause_is_not_a_maintenance_window(kanban_home, recorder):
     state an unattended reboot must not be launched into.
     """
     kbd._write_dispatch_pause(None, "restart_safe_scope_unavailable", fault_code="x")
-    pd.queue_post_drain_action(None, action_kind="reboot")
+    _queue_consented(None, action_kind="reboot")
 
     assert pd.evaluate_post_drain_action(None) is None
     assert recorder == []
@@ -341,7 +352,7 @@ def test_a_fault_pause_is_not_a_maintenance_window(kanban_home, recorder):
 
 def test_an_expired_action_becomes_expired_and_never_fires(kanban_home, recorder):
     kbd.pause_dispatch(None)
-    pd.queue_post_drain_action(None, action_kind="reboot", expires_in_seconds=600)
+    _queue_consented(None, action_kind="reboot", expires_in_seconds=600)
 
     outcome = pd.evaluate_post_drain_action(None, now=int(time.time()) + 601)
 
@@ -353,7 +364,7 @@ def test_an_expired_action_becomes_expired_and_never_fires(kanban_home, recorder
 def test_expiry_wins_over_a_drained_board(kanban_home, recorder):
     """Expiry is checked before the drain condition, not after it."""
     kbd.pause_dispatch(None)
-    pd.queue_post_drain_action(None, action_kind="reboot", expires_in_seconds=60)
+    _queue_consented(None, action_kind="reboot", expires_in_seconds=60)
 
     pd.evaluate_post_drain_action(None, now=int(time.time()) + 61)
 
@@ -362,7 +373,7 @@ def test_expiry_wins_over_a_drained_board(kanban_home, recorder):
 
 def test_a_fired_action_is_not_fired_again_by_later_evaluations(kanban_home, recorder):
     kbd.pause_dispatch(None)
-    pd.queue_post_drain_action(None, action_kind="reboot")
+    _queue_consented(None, action_kind="reboot")
 
     pd.evaluate_post_drain_action(None)
     pd.evaluate_post_drain_action(None)
@@ -395,7 +406,7 @@ def test_concurrent_evaluations_fire_a_queued_action_exactly_once(kanban_home, m
 
     monkeypatch.setitem(
         pd.ACTION_HANDLERS, "reboot",
-        type(original)(
+        dataclasses.replace(original,
             kind="reboot", takes_target=False, resolve_target=original.resolve_target,
             observe_before=lambda record, cfg: {}, fire=slow_fire,
             observe_after=lambda record, cfg: {"state": pd.SUCCEEDED},
@@ -403,7 +414,7 @@ def test_concurrent_evaluations_fire_a_queued_action_exactly_once(kanban_home, m
     )
 
     kbd.pause_dispatch(None)
-    pd.queue_post_drain_action(None, action_kind="reboot")
+    _queue_consented(None, action_kind="reboot")
 
     start = threading.Barrier(8)
     errors: list[BaseException] = []
@@ -443,7 +454,7 @@ def test_a_record_already_firing_is_never_re_claimed(kanban_home, recorder):
     reconciliation is a pure observation: the handler must never run twice.
     """
     kbd.pause_dispatch(None)
-    record = pd.queue_post_drain_action(None, action_kind="reboot")
+    record = _queue_consented(None, action_kind="reboot")
     pd._write_post_drain_action(None, {**record, "state": pd.FIRING})
 
     pd.evaluate_post_drain_action(None)
@@ -455,7 +466,7 @@ def test_a_record_already_firing_is_never_re_claimed(kanban_home, recorder):
 @pytest.mark.parametrize("state", [pd.SUCCEEDED, pd.FAILED, pd.EXPIRED, pd.CANCELLED])
 def test_a_terminal_record_is_never_re_claimed(kanban_home, recorder, state):
     kbd.pause_dispatch(None)
-    record = pd.queue_post_drain_action(None, action_kind="reboot")
+    record = _queue_consented(None, action_kind="reboot")
     pd._write_post_drain_action(None, {**record, "state": state})
 
     assert pd.evaluate_post_drain_action(None) is None
@@ -466,7 +477,7 @@ def test_a_terminal_record_is_never_re_claimed(kanban_home, recorder, state):
 def test_a_failed_action_records_the_observed_failure(kanban_home, recorder):
     recorder.install("reboot", succeeds=False)
     kbd.pause_dispatch(None)
-    pd.queue_post_drain_action(None, action_kind="reboot")
+    _queue_consented(None, action_kind="reboot")
 
     outcome = pd.evaluate_post_drain_action(None)
 
@@ -484,14 +495,14 @@ def test_a_handler_that_raises_leaves_a_failed_record_not_a_stuck_one(kanban_hom
 
     monkeypatch.setitem(
         pd.ACTION_HANDLERS, "reboot",
-        type(original)(
+        dataclasses.replace(original,
             kind="reboot", takes_target=False, resolve_target=original.resolve_target,
             observe_before=lambda record, cfg: {}, fire=boom,
             observe_after=lambda record, cfg: {},
         ),
     )
     kbd.pause_dispatch(None)
-    pd.queue_post_drain_action(None, action_kind="reboot")
+    _queue_consented(None, action_kind="reboot")
 
     outcome = pd.evaluate_post_drain_action(None)
 
@@ -520,7 +531,7 @@ def test_an_action_whose_process_does_not_survive_stays_firing(kanban_home, monk
         ),
     )
     kbd.pause_dispatch(None)
-    pd.queue_post_drain_action(None, action_kind="reboot")
+    _queue_consented(None, action_kind="reboot")
 
     outcome = pd.evaluate_post_drain_action(None)
 
@@ -531,7 +542,7 @@ def test_an_action_whose_process_does_not_survive_stays_firing(kanban_home, monk
 
 def test_resuming_dispatch_cancels_a_waiting_action(kanban_home, recorder):
     kbd.pause_dispatch(None)
-    pd.queue_post_drain_action(None, action_kind="reboot")
+    _queue_consented(None, action_kind="reboot")
 
     kbd.resume_dispatch(None)
 
@@ -551,7 +562,7 @@ def test_the_dispatcher_tick_fires_a_queued_action_on_a_drained_board(kanban_hom
     fires the action.
     """
     kbd.pause_dispatch(None)
-    pd.queue_post_drain_action(None, action_kind="reboot")
+    _queue_consented(None, action_kind="reboot")
 
     with kbc.connect_closing(board=None) as conn:
         kbd.dispatch_once(conn, board=None)
@@ -563,7 +574,7 @@ def test_the_dispatcher_tick_fires_a_queued_action_on_a_drained_board(kanban_hom
 def test_the_dispatcher_tick_does_not_fire_while_workers_are_running(kanban_home, recorder):
     _running(None, 1)
     kbd.pause_dispatch(None)
-    pd.queue_post_drain_action(None, action_kind="reboot")
+    _queue_consented(None, action_kind="reboot")
 
     with kbc.connect_closing(board=None) as conn:
         kbd.dispatch_once(conn, board=None)
@@ -574,7 +585,7 @@ def test_the_dispatcher_tick_does_not_fire_while_workers_are_running(kanban_home
 
 def test_the_dispatcher_tick_fires_the_action_exactly_once_across_ticks(kanban_home, recorder):
     kbd.pause_dispatch(None)
-    pd.queue_post_drain_action(None, action_kind="reboot")
+    _queue_consented(None, action_kind="reboot")
 
     for _ in range(4):
         with kbc.connect_closing(board=None) as conn:
@@ -586,7 +597,7 @@ def test_the_dispatcher_tick_fires_the_action_exactly_once_across_ticks(kanban_h
 def test_a_dry_run_tick_never_fires_a_queued_action(kanban_home, recorder):
     """A dry run reports what a tick WOULD do; rebooting the host is not that."""
     kbd.pause_dispatch(None)
-    pd.queue_post_drain_action(None, action_kind="reboot")
+    _queue_consented(None, action_kind="reboot")
 
     with kbc.connect_closing(board=None) as conn:
         kbd.dispatch_once(conn, board=None, dry_run=True)
@@ -619,10 +630,13 @@ def two_boards(kanban_home):
     return ("default", "other")
 
 
-def _arm_group(boards, group_id="group-1", **kwargs):
-    return pd.queue_post_drain_group(
+def _arm_group(boards, group_id="group-1", *, consent=True, **kwargs):
+    group = pd.queue_post_drain_group(
         list(boards), action_kind="reboot", group_id=group_id, **kwargs,
     )
+    if consent and group["queued"]:
+        pd.record_operator_consent(boards[0], granted_by="operator")
+    return group
 
 
 def test_an_aggregate_group_never_fires_while_any_member_board_still_runs(two_boards, recorder):
@@ -694,7 +708,7 @@ def test_concurrent_board_ticks_fire_an_aggregate_group_exactly_once(two_boards,
 
     monkeypatch.setitem(
         pd.ACTION_HANDLERS, "reboot",
-        type(original)(
+        dataclasses.replace(original,
             kind="reboot", takes_target=False, resolve_target=original.resolve_target,
             observe_before=lambda record, cfg: {}, fire=slow_fire,
             observe_after=lambda record, cfg: {"state": pd.SUCCEEDED},
@@ -750,7 +764,7 @@ def test_two_independent_boards_do_not_each_fire_a_host_action_at_once(two_board
 
     monkeypatch.setitem(
         pd.ACTION_HANDLERS, "reboot",
-        type(original)(
+        dataclasses.replace(original,
             kind="reboot", takes_target=False, resolve_target=original.resolve_target,
             observe_before=lambda record, cfg: {}, fire=slow_fire,
             observe_after=lambda record, cfg: {"state": pd.SUCCEEDED},
@@ -758,7 +772,7 @@ def test_two_independent_boards_do_not_each_fire_a_host_action_at_once(two_board
     )
     # Deliberately NO group_id: two unrelated single-board intents.
     for board in two_boards:
-        pd.queue_post_drain_action(board, action_kind="reboot")
+        _queue_consented(board, action_kind="reboot")
 
     start = threading.Barrier(2)
     finished = threading.Semaphore(0)
@@ -826,7 +840,7 @@ def real_reboot_observation(monkeypatch):
     original = pd.ACTION_HANDLERS["reboot"]
     monkeypatch.setitem(
         pd.ACTION_HANDLERS, "reboot",
-        type(original)(
+        dataclasses.replace(original,
             kind="reboot", takes_target=False, resolve_target=original.resolve_target,
             observe_before=pd._reboot_observe_before,
             fire=lambda record, cfg: fired.append("reboot"),
@@ -839,7 +853,7 @@ def real_reboot_observation(monkeypatch):
 
 def _firing_record_from_epoch(epoch):
     kbd.pause_dispatch(None)
-    record = pd.queue_post_drain_action(None, action_kind="reboot")
+    record = _queue_consented(None, action_kind="reboot")
     return pd._write_post_drain_action(None, {
         **record, "state": pd.FIRING, "observed_before": {"epoch": epoch},
     })
@@ -927,7 +941,7 @@ def test_a_cancel_that_reports_success_means_the_action_never_fired(
     rebooted the host.
     """
     kbd.pause_dispatch(None)
-    pd.queue_post_drain_action(None, action_kind="reboot")
+    _queue_consented(None, action_kind="reboot")
 
     read_started = threading.Event()
     release = threading.Event()
@@ -966,14 +980,14 @@ def test_a_cancel_arriving_after_the_claim_reports_failure(kanban_home, monkeypa
 
     monkeypatch.setitem(
         pd.ACTION_HANDLERS, "reboot",
-        type(original)(
+        dataclasses.replace(original,
             kind="reboot", takes_target=False, resolve_target=original.resolve_target,
             observe_before=lambda record, cfg: {}, fire=slow_fire,
             observe_after=lambda record, cfg: {"state": pd.SUCCEEDED},
         ),
     )
     kbd.pause_dispatch(None)
-    pd.queue_post_drain_action(None, action_kind="reboot")
+    _queue_consented(None, action_kind="reboot")
 
     thread = threading.Thread(target=lambda: pd.evaluate_post_drain_action(None))
     thread.start()
@@ -1272,7 +1286,7 @@ def test_a_queued_run_script_fires_once_on_drain_and_settles_with_its_output(
     )
     monkeypatch.setattr(pd, "resolve_post_drain_config", lambda: _script_cfg(script))
     kbd.pause_dispatch(None)
-    pd.queue_post_drain_action(None, action_kind="run_script", target="fork-sync")
+    _queue_consented(None, action_kind="run_script", target="fork-sync")
 
     settled = pd.evaluate_post_drain_action(None)
 
@@ -1295,7 +1309,7 @@ def test_a_failing_run_script_settles_failed_with_a_diagnosable_error(
     )
     monkeypatch.setattr(pd, "resolve_post_drain_config", lambda: _script_cfg(script))
     kbd.pause_dispatch(None)
-    pd.queue_post_drain_action(None, action_kind="run_script", target="fork-sync")
+    _queue_consented(None, action_kind="run_script", target="fork-sync")
 
     settled = pd.evaluate_post_drain_action(None)
 
@@ -1311,7 +1325,7 @@ def test_a_run_script_never_fires_while_a_worker_is_still_running(
     monkeypatch.setattr(pd, "resolve_post_drain_config", lambda: _script_cfg(script))
     _running(None, 1)
     kbd.pause_dispatch(None)
-    pd.queue_post_drain_action(None, action_kind="run_script", target="fork-sync")
+    _queue_consented(None, action_kind="run_script", target="fork-sync")
 
     assert pd.evaluate_post_drain_action(None) is None
     assert not marker.exists()

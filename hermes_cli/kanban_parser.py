@@ -441,6 +441,9 @@ _SPECS = [
              help="Clear this board's dispatch pause after operator recovery and exit"),
         _arg("--circuit-status", action="store_true",
              help="Show this board's rate-limit or manual dispatch-safety state and exit"),
+        _arg("--consent-post-drain", action="store_true",
+             help="Attended only: give explicit consent to this board's queued post-drain "
+                  "restart/reboot so it may fire once drained (asks for typed confirmation)"),
         _arg("--failure-limit", type=int, default=kbd.DEFAULT_FAILURE_LIMIT,
              help=f"Auto-block a task after this many consecutive non-success attempts "
                   f"(spawn_failed, timed_out, or crashed; default: {kbd.DEFAULT_FAILURE_LIMIT})"),

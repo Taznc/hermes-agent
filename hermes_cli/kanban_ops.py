@@ -63,6 +63,32 @@ def _dispatch_pause_message(state: dict, *, board: Optional[str] = None) -> str:
     return kbd.dispatch_pause_message(state, board=board)
 
 
+def _cmd_consent_post_drain(board: Optional[str]) -> int:
+    """Attended consent for a queued post-drain restart/reboot (never from a worker or a pipe)."""
+    import os
+    import sys
+
+    from hermes_cli import kanban_db_dispatch_postdrain as kbpd
+
+    name = board or kb.DEFAULT_BOARD
+    if os.environ.get("HERMES_KANBAN_TASK") or not sys.stdin.isatty():
+        print("Refused: consent must be given by the operator at an interactive terminal, "
+              "not by a worker or a script.", file=sys.stderr)
+        return 1
+    record = kbpd.read_post_drain_action(board)
+    if record is None or record.get("state") != kbpd.WAITING or not kbpd._needs_consent(record):
+        print(f"Nothing on {name} is waiting for consent.")
+        return 1
+    what = f"{record['action_kind']} {record.get('target') or ''}".strip()
+    answer = input(f"Allow '{what}' to run once {name} drains? Type 'yes' to consent: ")
+    if answer.strip().lower() != "yes":
+        print("Not consented; the action stays queued and will not fire.")
+        return 1
+    result = kbpd.record_operator_consent(board)
+    print("Consent recorded." if result.get("consented") else f"Not recorded: {result.get('reason')}")
+    return 0 if result.get("consented") else 1
+
+
 def _cmd_dispatch(args: argparse.Namespace) -> int:
     board = getattr(args, "board", None)
     pause_note = getattr(args, "pause", None)
@@ -99,6 +125,8 @@ def _cmd_dispatch(args: argparse.Namespace) -> int:
             suffix = f" (was {state.get('reason')})" if state else " (was not paused)"
             print(f"Dispatch circuit resumed for {board or kb.DEFAULT_BOARD}{suffix}.")
         return 0
+    if getattr(args, "consent_post_drain", False):
+        return _cmd_consent_post_drain(board)
     if getattr(args, "circuit_status", False):
         state = kbd.read_dispatch_pause(board)
         if getattr(args, "json", False):

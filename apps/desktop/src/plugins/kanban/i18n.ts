@@ -425,6 +425,8 @@ type KanbanMessages = {
   postDrainFailed: (action: string, error: string) => string
   postDrainExpired: (action: string) => string
   postDrainCancelled: (action: string) => string
+  /** Restart/reboot armed but not yet consented: names the attended CLI command. */
+  postDrainNeedsConsent: (action: string, command: string) => string
   // native/toast notifications for terminal worker events (completion-notify)
   notify: {
     completedTitle: string
@@ -838,6 +840,8 @@ export const en: KanbanMessages = {
   postDrainFailed: (action, error) => `${action} failed — ${error}`,
   postDrainExpired: action => `${action} expired before the board drained — nothing ran`,
   postDrainCancelled: action => `${action} cancelled`,
+  postDrainNeedsConsent: (action, command) =>
+    `${action} is armed but will NOT run until you consent in a terminal: ${command}`,
   notify: {
     completedTitle: 'Task completed',
     blockedTitle: 'Task blocked — needs your input',
@@ -1248,6 +1252,8 @@ const ja: KanbanMessages = {
   postDrainFailed: (action, error) => `${action}に失敗 — ${error}`,
   postDrainExpired: action => `排出前に${action}の期限が切れました — 何も実行されていません`,
   postDrainCancelled: action => `${action}をキャンセルしました`,
+  postDrainNeedsConsent: (action, command) =>
+    `${action}は待機中ですが、ターミナルで同意するまで実行されません: ${command}`,
   notify: {
     completedTitle: 'タスク完了',
     blockedTitle: 'タスクがブロック中 — 入力が必要です',
@@ -1650,6 +1656,7 @@ const zh: KanbanMessages = {
   postDrainFailed: (action, error) => `${action}失败 — ${error}`,
   postDrainExpired: action => `${action}在面板排空前已过期 — 未执行任何操作`,
   postDrainCancelled: action => `已取消${action}`,
+  postDrainNeedsConsent: (action, command) => `${action}已排队，但在终端中同意之前不会执行：${command}`,
   notify: {
     completedTitle: '任务已完成',
     blockedTitle: '任务受阻 — 需要你的输入',
@@ -2052,6 +2059,7 @@ const zhHant: KanbanMessages = {
   postDrainFailed: (action, error) => `${action}失敗 — ${error}`,
   postDrainExpired: action => `${action}在面板排空前已過期 — 未執行任何操作`,
   postDrainCancelled: action => `已取消${action}`,
+  postDrainNeedsConsent: (action, command) => `${action}已排隊，但在終端機中同意之前不會執行：${command}`,
   notify: {
     completedTitle: '任務已完成',
     blockedTitle: '任務受阻 — 需要你的輸入',

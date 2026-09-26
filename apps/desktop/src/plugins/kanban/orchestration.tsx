@@ -172,9 +172,11 @@ function PostDrainControl({
           style={{ color: running === 0 ? 'var(--ui-text-positive)' : 'var(--ui-text-warning)' }}
         >
           {waiting
-            ? running === 0
-              ? k.postDrainArmedDrained(name, remaining)
-              : k.postDrainArmed(name, running, remaining)
+            ? queued.consent === 'pending' && queued.consent_command
+              ? k.postDrainNeedsConsent(name, queued.consent_command)
+              : running === 0
+                ? k.postDrainArmedDrained(name, remaining)
+                : k.postDrainArmed(name, running, remaining)
             : k.postDrainFiring(name)}
         </span>
         {/* Cancel is offered only while waiting — an action already firing has

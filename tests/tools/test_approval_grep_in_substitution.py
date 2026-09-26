@@ -37,7 +37,7 @@ def test_genuinely_unbalanced_quoting_still_fails_closed():
 
 
 def test_hardline_patterns_unchanged():
-    for command in ("rm -rf /", 'echo "$(rm -rf /)"', "sudo shutdown -h now"):
+    for command in ("rm -rf /", 'echo "$(rm -rf /)"', "sudo mkfs.ext4 /dev/sda"):
         assert detect_hardline_command(command)[0] is True, command
 
 
@@ -46,23 +46,36 @@ class TestExecutableSubstitutionBodiesStayExecutable:
     substitution body inside double quotes as CODE, or a newline-separated hardline command hides as an
     operand (independent review witness: blocked on main as 'malformed', approved on the first fix)."""
 
-    @pytest.mark.parametrize("cmd", [
+    _HIDDEN_REBOOTS = [
         'echo "$(grep -P \'safe\' /dev/null\nreboot)"',
         'echo "$(grep x f; reboot)"',
         'echo "$(grep x f && reboot)"',
         'echo "$(grep x f | shutdown -h now)"',
         'echo "$(echo $(grep x f)\nreboot)"',
         'echo "`grep x f\nreboot`"',
-    ])
+    ]
+
+    @pytest.mark.parametrize("cmd", _HIDDEN_REBOOTS)
+    def test_reboot_inside_a_quoted_substitution_is_caught_as_itself(self, cmd):
+        # Host power now asks (lifecycle tier) instead of sitting on the hardline floor; the
+        # property under test is unchanged: the substitution body is CODE, so it is caught.
+        from tools.approval_detection import detect_dangerous_command
+        from tools.approval_lifecycle import is_lifecycle_pattern
+
+        is_dangerous, key, _desc = detect_dangerous_command(cmd)
+        assert is_dangerous and key == "system shutdown/reboot" and is_lifecycle_pattern(key)
+
+    @pytest.mark.parametrize("cmd", [c.replace("shutdown -h now", "rm -rf /").replace("reboot", "rm -rf /")
+                                     for c in _HIDDEN_REBOOTS])
     def test_hardline_command_inside_a_quoted_substitution_blocks_as_itself(self, cmd):
         blocked, reason = detect_hardline_command(cmd)
-        assert blocked and reason == "system shutdown/reboot"
+        assert blocked and reason == "recursive delete of root filesystem"
 
     def test_public_guard_blocks_without_offering_approval(self, tmp_path, monkeypatch):
         monkeypatch.setenv("HERMES_HOME", str(tmp_path / "hh"))
         from tools.approval import check_dangerous_command
         calls = []
-        result = check_dangerous_command('echo "$(grep -P \'safe\' /dev/null\nreboot)"', "local",
+        result = check_dangerous_command('echo "$(grep -P \'safe\' /dev/null\nrm -rf /)"', "local",
                                          approval_callback=lambda *a, **k: calls.append(a) or False)
         assert result["approved"] is False and "hardline" in result["message"].lower() and calls == []
 

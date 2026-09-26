@@ -262,12 +262,111 @@ class TestCheckDangerousCommandLifecycleParity:
 
 
 # ---------------------------------------------------------------------------
-# hardline reboot/shutdown stays on the pre-existing hardline floor (never bypassable)
+# reboot/shutdown ASK (AC2) instead of sitting on the hardline floor
 # ---------------------------------------------------------------------------
 
-class TestHardlineLifecycleUnaffected:
-    def test_reboot_is_hardline_blocked_even_under_yolo(self):
+class TestHostPowerAsksInsteadOfHardline:
+    """AC2: reboot/shutdown/halt report "requires approval" — never auto-approved, never floored."""
+
+    def test_reboot_is_refused_under_yolo_without_a_human(self):
         with patch.object(approval_module, "_YOLO_MODE_FROZEN", True):
             result = check_all_command_guards(_REBOOT_CMD, "local")
         assert result["approved"] is False
-        assert result.get("hardline") is True
+        assert not result.get("hardline")
+        assert _REBOOT_CMD in result["message"]
+
+    @patch(_TIRITH_PATCH, return_value=_tirith_allow())
+    def test_reboot_prompts_once_or_deny_for_an_interactive_human(self, _mock_tirith):
+        os.environ["HERMES_INTERACTIVE"] = "1"
+        seen = {}
+
+        def callback(command, description, **kwargs):
+            seen.update(kwargs, description=description)
+            return "once"
+
+        result = check_all_command_guards(_REBOOT_CMD, "local", approval_callback=callback)
+        assert result["approved"] is True
+        assert seen.get("allow_permanent") is False
+        assert seen.get("allow_session") is False
+        assert is_lifecycle_pattern(seen["description"])
+
+
+# ---------------------------------------------------------------------------
+# persistence boundary: a scope the prompt never offered is never stored
+# ---------------------------------------------------------------------------
+
+class TestLifecycleScopeIsClampedAtPersistence:
+    """A callback / transport / old client answering session or always for a restart gets THIS
+    operation only: nothing lands in the session cache, the permanent set, or config.yaml."""
+
+    @pytest.mark.parametrize("answer", ["session", "always"])
+    @patch(_TIRITH_PATCH, return_value=_tirith_allow())
+    def test_wider_scope_answer_is_honoured_once_and_never_stored(self, _mock_tirith, answer):
+        os.environ["HERMES_INTERACTIVE"] = "1"
+        with patch.object(approval_module, "save_permanent_allowlist") as save:
+            result = check_all_command_guards(
+                _RESTART_CMD, "local", approval_callback=MagicMock(return_value=answer))
+        assert result["approved"] is True
+        save.assert_not_called()
+        assert not approval_module._permanent_approved
+        assert not any(approval_module._session_approved.values())
+
+    @patch(_TIRITH_PATCH, return_value=_tirith_allow())
+    def test_the_same_restart_prompts_again_after_an_always_answer(self, _mock_tirith):
+        os.environ["HERMES_INTERACTIVE"] = "1"
+        with patch.object(approval_module, "save_permanent_allowlist"):
+            check_all_command_guards(_RESTART_CMD, "local", approval_callback=MagicMock(return_value="always"))
+        again = MagicMock(return_value="deny")
+        assert check_all_command_guards(_RESTART_CMD, "local", approval_callback=again)["approved"] is False
+        again.assert_called_once()
+
+    @patch(_TIRITH_PATCH, return_value=_tirith_allow())
+    def test_ordinary_dangerous_always_still_persists(self, _mock_tirith):
+        os.environ["HERMES_INTERACTIVE"] = "1"
+        with patch.object(approval_module, "save_permanent_allowlist") as save:
+            check_all_command_guards("chmod 777 /tmp/x", "local", approval_callback=MagicMock(return_value="always"))
+        save.assert_called_once()
+
+
+# ---------------------------------------------------------------------------
+# lifecycle wins classification even when an earlier dangerous rule also matches
+# ---------------------------------------------------------------------------
+
+class TestRedirectedLifecycleIsStillLifecycle:
+    @pytest.mark.parametrize("command", [
+        "docker --context prod restart web",
+        "docker -H ssh://prod-host stop app",
+        "podman --remote stop web",
+        "podman --url ssh://core@h/run/podman.sock restart web",
+        "DOCKER_HOST=ssh://prod docker kill app",
+    ])
+    def test_redirected_lifecycle_is_classified_as_lifecycle(self, command):
+        from tools.approval_detection import detect_dangerous_command
+
+        is_dangerous, key, desc = detect_dangerous_command(command)
+        assert is_dangerous and is_lifecycle_pattern(key) and is_lifecycle_pattern(desc)
+        assert "also:" in desc, "the redirect reason must still be shown to the human"
+
+    def test_redirected_non_lifecycle_keeps_its_own_reason(self):
+        from tools.approval_detection import detect_dangerous_command
+
+        is_dangerous, _key, desc = detect_dangerous_command("docker --context prod ps")
+        assert is_dangerous and not is_lifecycle_pattern(desc)
+        assert "daemon redirect" in desc
+
+    def test_mode_off_cannot_wave_through_a_redirected_restart(self, monkeypatch):
+        monkeypatch.setattr(approval_context, "_get_approval_mode", lambda: "off")
+        with patch.object(approval_module, "_YOLO_MODE_FROZEN", True):
+            result = check_all_command_guards("docker --context prod restart web", "local")
+            ordinary = check_all_command_guards("docker --context prod ps", "local")
+        assert result["approved"] is False
+        assert ordinary["approved"] is True
+
+
+def test_clamp_scope_table():
+    clamp = approval_module._clamp_scope
+    assert clamp("always", allow_session=False, allow_permanent=False) == "once"
+    assert clamp("session", allow_session=False, allow_permanent=False) == "once"
+    assert clamp("always", allow_session=True, allow_permanent=False) == "session"
+    assert clamp("always", allow_session=True, allow_permanent=True) == "always"
+    assert clamp("once", allow_session=False, allow_permanent=False) == "once"

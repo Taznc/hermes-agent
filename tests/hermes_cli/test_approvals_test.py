@@ -59,11 +59,21 @@ class TestVerdicts:
         assert "allow" in out
 
     def test_hardline_command_denies_with_rule_name(self, isolated_approvals, capsys):
-        rc = at.approvals_test_command(_args(["sudo", "re" + "boot"]))
+        rc = at.approvals_test_command(_args(["mkfs.ext4", "/dev/sda1"]))
         out = capsys.readouterr().out
         assert rc == 3
         assert "hardline-deny" in out
-        assert "system shutdown/reboot" in out
+        assert "format filesystem (mkfs)" in out
+
+    @pytest.mark.parametrize("argv", [["sudo", "re" + "boot"], ["shut" + "down", "-h", "now"],
+                                      ["ha" + "lt"], ["systemctl", "re" + "boot"]])
+    def test_host_power_requires_approval_ac2(self, isolated_approvals, capsys, argv):
+        """AC2: reboot/shutdown/halt report 'requires approval', not allow and not hardline."""
+        rc = at.approvals_test_command(_args(argv))
+        out = capsys.readouterr().out
+        assert rc == 2
+        assert "ask-approval" in out
+        assert "never auto-approvable" in out
 
     def test_dangerous_command_asks_with_exit_2(self, isolated_approvals, capsys):
         rc = at.approvals_test_command(_args(["rm", "-rf", "~/project/build"]))
@@ -100,8 +110,11 @@ class TestVerdicts:
         out = capsys.readouterr().out
         assert rc == 0
         assert "off" in out
-        rc = at.approvals_test_command(_args(["sudo", "re" + "boot"]))
+        rc = at.approvals_test_command(_args(["mkfs.ext4", "/dev/sda1"]))
         assert rc == 3
+        # ...and mode=off never downgrades a reboot below "requires approval".
+        rc = at.approvals_test_command(_args(["sudo", "re" + "boot"]))
+        assert rc == 2
 
     def test_lifecycle_command_not_bypassed_by_mode_off_yolo_or_allowlist(
             self, isolated_approvals, capsys, monkeypatch):
@@ -192,9 +205,9 @@ class TestOutputAndWiring:
     def test_json_output_is_machine_readable(self, isolated_approvals, capsys):
         rc = at.approvals_test_command(_args(["sudo", "re" + "boot"], as_json=True))
         payload = json.loads(capsys.readouterr().out)
-        assert rc == 3
-        assert payload["verdict"] == "hardline-deny"
-        assert payload["exit_code"] == 3
+        assert rc == 2
+        assert payload["verdict"] == "ask-approval"
+        assert payload["exit_code"] == 2
         assert payload["rule"] == "system shutdown/reboot"
         assert payload["command"] == "sudo re" + "boot"
         assert isinstance(payload["normalized_variants"], list)

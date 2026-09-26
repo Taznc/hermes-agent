@@ -12,6 +12,8 @@ import shlex
 import tempfile
 import unicodedata
 
+from tools.approval_lifecycle import is_lifecycle_pattern
+
 logger = logging.getLogger("tools.approval")
 
 # Sensitive write targets, matched via ~ / $HOME / $HERMES_HOME spellings. The resolved absolute
@@ -112,9 +114,18 @@ HARDLINE_PATTERNS = [
     # Kill every process on the system — anchor the command-name token so `echo "kill -1 sends SIGHUP to
     # everything"` doesn't trip (#93392).
     (_CMDPOS + r'kill\s+(-[^\s]+\s+)*-1\b', "kill all processes"),
+]
+
+# Host power state (reboot / shutdown / halt / poweroff / kexec). NOT hardline: the operator decided
+# (kanban card 2026-09-25) that a reboot is a restart-class action that must always ASK — interactive
+# once/deny, never auto-approvable — rather than being unconditionally refused. The never-auto-approve
+# contract comes from tools.approval_lifecycle (every description here carries a lifecycle marker), which
+# also fails a reboot CLOSED in any unattended context. Kept _CMDPOS-anchored exactly as they were on the
+# hardline list so `echo reboot` / `grep shutdown log` stay unflagged.
+HOST_POWER_PATTERNS = [
     (_CMDPOS + r'(shutdown|reboot|halt|poweroff)\b', "system shutdown/reboot"),
     (_CMDPOS + r'init\s+[06]\b', "init 0/6 (shutdown/reboot)"),
-    (_CMDPOS + r'systemctl\s+(poweroff|reboot|halt|kexec)\b', "systemctl poweroff/reboot"),
+    (_CMDPOS + r'systemctl\s+(?:-[^\s]+\s+)*(poweroff|reboot|halt|kexec)\b', "systemctl poweroff/reboot"),
     (_CMDPOS + r'telinit\s+[06]\b', "telinit 0/6 (shutdown/reboot)"),
 ]
 
@@ -195,7 +206,10 @@ def detect_hardline_command(command: str) -> tuple:
 
 
 # ---- Dangerous command patterns -----------------------------------------------------------
+# Host-power rules lead the dangerous tier so a reboot is classified as a reboot, not as
+# whatever broader rule happens to match first (see detect_dangerous_command).
 DANGEROUS_PATTERNS = [
+    *HOST_POWER_PATTERNS,
     (r'\brm\s+(-[^\s]*\s+)*/', "delete in root path"),
     (r'\brm\s+-[^\s]*r', "recursive delete"),
     (r'\brm\s+--recursive\b', "recursive delete (long flag)"),
@@ -317,10 +331,11 @@ DANGEROUS_PATTERNS = [
     (r'\bpodman\s+(?:-{1,2}\S+(?:[=\s]\S+)?\s+)*(?:-r\b|--remote\b)', "podman remote mode (-r/--remote: remote daemon)"),
     (r'\b(?:docker_host|docker_context|container_host|container_connection)=\S+', "docker/podman daemon redirect via environment (DOCKER_HOST/CONTAINER_HOST)"),
     # Container lifecycle (docker.sock mounts let the agent stop/kill containers) always needs
+    # consent. Podman (and its docker shim) is the same verb set against the same kind of daemon.
     # consent. Global flags between docker/compose and the verb and the legacy `docker-compose`
     # binary are allowed so a flag can't slip past.
-    (r'\bdocker(?:-compose|\s+compose)\s+(?:-{1,2}\S+(?:[=\s]\S+)?\s+)*(restart|stop|kill|down)\b', "docker compose restart/stop/kill/down (container lifecycle)"),
-    (r'\bdocker\s+(?:-{1,2}\S+(?:[=\s]\S+)?\s+)*(restart|stop|kill)\b', "docker restart/stop/kill (container lifecycle)"),
+    (r'\b(?:docker|podman)(?:-compose|\s+compose)\s+(?:-{1,2}\S+(?:[=\s]\S+)?\s+)*(restart|stop|kill|down)\b', "docker compose restart/stop/kill/down (container lifecycle)"),
+    (r'\b(?:docker|podman)\s+(?:-{1,2}\S+(?:[=\s]\S+)?\s+)*(restart|stop|kill)\b', "docker restart/stop/kill (container lifecycle)"),
     # Gateway protection: never start gateway outside systemd management
     (r'gateway\s+run\b.*(&\s*$|&\s*;|\bdisown\b|\bsetsid\b)', "start gateway outside systemd (use 'systemctl --user restart hermes-gateway')"),
     (r'\bnohup\b.*gateway\s+run\b', "start gateway outside systemd (use 'systemctl --user restart hermes-gateway')"),
@@ -1410,22 +1425,22 @@ def _is_shell_token_spliced_gateway_lifecycle(command: str) -> bool:
     return contains_gateway_lifecycle_command(command)
 
 
-def detect_dangerous_command(command: str) -> tuple:
-    """Check dangerous patterns -> (is_dangerous, pattern_key, description)."""
-    if _command_parser_limit_exceeded(command):
-        return (True, _PARSER_LIMIT_DESCRIPTION, _PARSER_LIMIT_DESCRIPTION)
-    if _is_verification_artifact_cleanup(command):
-        return (False, None, None)
+def _dangerous_findings(command: str):
+    """Yield every dangerous description for *command*, in classification-priority order.
+
+    Lazy: ``detect_dangerous_command`` stops at the first lifecycle finding, and the
+    /proc-resolving service-guard pass stays last so it only runs when nothing earlier did.
+    """
     for command_variant in _command_detection_variants(command):
         command_lower = command_variant.lower()
         for pattern_re, description in DANGEROUS_PATTERNS_COMPILED:
             if pattern_re.search(command_lower):
-                return (True, description, description)
+                yield description
     normalized = _normalize_command_for_detection(command)
     for description, _ in _execution_flag_findings(normalized):
-        return (True, description, description)
+        yield description
     if _is_shell_token_spliced_gateway_lifecycle(command):
-        return (True, _GATEWAY_LIFECYCLE_SPLICE_DESCRIPTION, _GATEWAY_LIFECYCLE_SPLICE_DESCRIPTION)
+        yield _GATEWAY_LIFECYCLE_SPLICE_DESCRIPTION
     # Target-resolving pass, last because it is the only one that reads /proc: the text
     # patterns above cannot classify `kill -TERM <pid>` (a bare number carries no dangerous
     # keyword), yet signalling a Hermes unit's MainPID kills the fleet exactly as
@@ -1434,5 +1449,33 @@ def detect_dangerous_command(command: str) -> tuple:
     from tools.hermes_service_guard import detect_hermes_service_stop
     is_service_stop, service_desc = detect_hermes_service_stop(command)
     if is_service_stop:
-        return (True, service_desc, service_desc)
+        yield service_desc
+
+
+def detect_dangerous_command(command: str) -> tuple:
+    """Check dangerous patterns -> (is_dangerous, pattern_key, description).
+
+    A restart/stop/reboot finding (``tools.approval_lifecycle``) WINS over any other finding,
+    wherever it sits in the pattern order. The first match used to decide the description, so
+    ``docker --context prod restart web`` was classified by the earlier daemon-redirect rule,
+    which the lifecycle lens does not recognise — and yolo, ``approvals.mode: off``, the smart
+    guardian or a stored approval could then wave a restart through. When a lifecycle finding
+    overrides an earlier one, the earlier reason rides along in the description so the prompt
+    still says the daemon was redirected.
+    """
+    if _command_parser_limit_exceeded(command):
+        return (True, _PARSER_LIMIT_DESCRIPTION, _PARSER_LIMIT_DESCRIPTION)
+    if _is_verification_artifact_cleanup(command):
+        return (False, None, None)
+    first = None
+    for description in _dangerous_findings(command):
+        if is_lifecycle_pattern(description):
+            key = description
+            if first is not None and first != description:
+                description = f"{description} [also: {first}]"
+            return (True, key, description)
+        if first is None:
+            first = description
+    if first is not None:
+        return (True, first, first)
     return (False, None, None)

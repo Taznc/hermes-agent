@@ -90,7 +90,13 @@ _HARDLINE_BLOCK = [
     # System-wide kill
     "kill -9 -1",
     "kill -1",
-    # Shutdown / reboot / halt
+]
+
+
+# Host power state (reboot / shutdown / halt). NOT hardline: the operator's contract is that a
+# reboot always ASKS (interactive once/deny) and is never auto-approvable. Compound, subshell and
+# brace-group spellings must still be CAUGHT — they just land on the ask tier, not the floor.
+_HOST_POWER_ASK = [
     "shutdown -h now",
     "shutdown -r now",
     "sudo shutdown now",
@@ -104,7 +110,6 @@ _HARDLINE_BLOCK = [
     "systemctl poweroff",
     "systemctl reboot",
     "systemctl halt",
-    # Compound / subshell variants
     "ls; reboot",
     "echo done && shutdown -h now",
     "false || halt",
@@ -115,10 +120,6 @@ _HARDLINE_BLOCK = [
     "exec shutdown",
     "nohup reboot",
     "setsid poweroff",
-    # Bare subshell `(cmd)` and brace-group `{ cmd; }` openers put the trigger
-    # at a real command position, so they must hit the floor just like `$(…)`.
-    # These slipped through before the quote-aware command-start tokenizer
-    # learned to recognize `(` / `{` (issue: (reboot) walked past --yolo).
     "(reboot)",
     "( reboot )",
     "(shutdown -h now)",
@@ -210,6 +211,17 @@ def test_hardline_detection_blocks(command):
     assert desc, "hardline match must provide a description"
 
 
+@pytest.mark.parametrize("command", _HOST_POWER_ASK)
+def test_host_power_is_caught_as_lifecycle_not_hardline(command):
+    """Every reboot/shutdown spelling is still detected — on the ask tier, as lifecycle."""
+    from tools.approval_lifecycle import is_lifecycle_pattern
+
+    assert detect_hardline_command(command) == (False, None), f"{command!r} is on the floor"
+    is_dangerous, _key, desc = detect_dangerous_command(command)
+    assert is_dangerous, f"{command!r} slipped past detection entirely"
+    assert is_lifecycle_pattern(desc), f"{command!r} -> {desc!r} is not lifecycle"
+
+
 @pytest.mark.parametrize("command", _HARDLINE_ALLOW)
 def test_hardline_detection_allows(command):
     is_hl, desc = detect_hardline_command(command)
@@ -291,10 +303,15 @@ def test_quoted_newline_data_not_blocked(command):
 
 @pytest.mark.parametrize("command", _QUOTED_NEWLINE_THREATS_BLOCK)
 def test_real_newline_separated_threats_still_blocked(command):
-    """Unquoted newlines / $() / backticks remain real command boundaries."""
-    is_hl, desc = detect_hardline_command(command)
-    assert is_hl, f"real threat leaked through hardline floor: {command!r}"
-    assert desc
+    """Unquoted newlines / $() / backticks remain real command boundaries: the reboot is caught
+    (on the lifecycle ask tier since host power left the hardline floor)."""
+    from tools.approval_lifecycle import is_lifecycle_pattern
+
+    is_hl, _ = detect_hardline_command(command)
+    is_dangerous, _key, desc = detect_dangerous_command(command)
+    assert is_hl or (is_dangerous and is_lifecycle_pattern(desc)), (
+        f"real threat leaked through detection: {command!r}"
+    )
 
 
 def test_quoted_newline_data_not_blocked_by_full_guard_chain(clean_session):
@@ -566,7 +583,7 @@ def test_yolo_env_var_cannot_bypass_hardline(clean_session, monkeypatch):
     monkeypatch.setenv("HERMES_YOLO_MODE", "1")
 
     for cmd in ['rm -rf /', 'rm -rf "/"', 'rm -rf "$HOME"', "rm -rf ${HOME}",
-                "shutdown -h now", "mkfs.ext4 /dev/sda", "reboot"]:
+                "mkfs.ext4 /dev/sda"]:
         r1 = check_dangerous_command(cmd, "local")
         assert r1["approved"] is False, f"yolo leaked hardline on {cmd!r} (check_dangerous_command)"
         assert r1.get("hardline") is True
@@ -616,11 +633,7 @@ def test_subshell_brace_group_cannot_bypass_hardline(clean_session, monkeypatch)
     """
     monkeypatch.setenv("HERMES_YOLO_MODE", "1")
 
-    for cmd in ["(reboot)", "( reboot )", "(shutdown -h now)", "(poweroff)",
-                "(systemctl reboot)", "(init 0)", "(sudo reboot)",
-                "{ reboot; }", "{ shutdown -h now; }", "{ poweroff; }",
-                "(rm -rf /)", "{ rm -rf /; }", "(rm -rf ~)",
-                "true && (reboot)", "echo hi; { reboot; }"]:
+    for cmd in ["(rm -rf /)", "{ rm -rf /; }", "(rm -rf ~)"]:
         r1 = check_dangerous_command(cmd, "local")
         assert r1["approved"] is False, f"yolo leaked hardline on {cmd!r} (check_dangerous_command)"
         assert r1.get("hardline") is True
@@ -628,6 +641,22 @@ def test_subshell_brace_group_cannot_bypass_hardline(clean_session, monkeypatch)
         r2 = check_all_command_guards(cmd, "local")
         assert r2["approved"] is False, f"yolo leaked hardline on {cmd!r} (check_all_command_guards)"
         assert r2.get("hardline") is True
+
+
+def test_host_power_is_never_approved_under_yolo(clean_session, monkeypatch):
+    """Reboot/shutdown left the hardline floor for the lifecycle ASK tier — which yolo can never
+    bypass either. With no interactive human (this test), every spelling fails CLOSED with the
+    out-of-band instruction rather than the hardline text."""
+    monkeypatch.setenv("HERMES_YOLO_MODE", "1")
+
+    for cmd in ["reboot", "shutdown -h now", "(reboot)", "( reboot )", "(shutdown -h now)",
+                "(poweroff)", "(systemctl reboot)", "(init 0)", "(sudo reboot)", "{ reboot; }",
+                "{ shutdown -h now; }", "{ poweroff; }", "true && (reboot)", "echo hi; { reboot; }"]:
+        for check in (check_dangerous_command, check_all_command_guards):
+            result = check(cmd, "local")
+            assert result["approved"] is False, f"yolo approved host power {cmd!r} ({check.__name__})"
+            assert not result.get("hardline"), f"{cmd!r} should ask, not hit the hardline floor"
+            assert "out-of-band" in result["message"]
 
 
 def test_quoted_paren_brace_prose_not_blocked_under_yolo(clean_session, monkeypatch):

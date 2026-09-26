@@ -342,6 +342,11 @@ export interface PostDrainAction {
   group_id?: string
   /** Aggregate scope only: how many boards carry this action. */
   board_count?: number
+  /** Restart/reboot kinds: `pending` until the operator consents at an attended terminal.
+   *  The dispatcher never fires a `pending` record, however drained the board is. */
+  consent?: 'granted' | 'pending'
+  /** Present while consent is pending: the exact CLI command the operator runs. */
+  consent_command?: string
 }
 
 /** One entry the "after drain" selector may offer. Derived from the backend's

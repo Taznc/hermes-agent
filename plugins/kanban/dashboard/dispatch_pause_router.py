@@ -151,7 +151,15 @@ def _post_drain_view(board: Optional[str], *, now: Optional[int] = None) -> Opti
     remaining = (
         max(0, int(expires_at) - current) if isinstance(expires_at, int) else None
     )
-    return {**record, "expires_in_seconds": remaining}
+    view = {**record, "expires_in_seconds": remaining}
+    if record.get("state") == kbpd.WAITING and kbpd._needs_consent(record):
+        # Consent is deliberately NOT an HTTP action: this surface is reachable by
+        # anything holding the dashboard token, which is exactly the "queued intent"
+        # channel. The operator gives consent at an attended terminal; the panel only
+        # names the exact command to run.
+        slug = _resolve_board(board) or kanban_db.get_current_board()
+        view["consent_command"] = f"hermes kanban --board {slug} dispatch --consent-post-drain"
+    return view
 
 
 def _post_drain_action_catalog() -> list[dict[str, Any]]:

@@ -352,6 +352,25 @@ def test_queueing_an_action_surfaces_it_on_status_with_the_live_running_count(
     assert 0 < status["post_drain"]["expires_in_seconds"] <= 1800
 
 
+def test_the_dashboard_can_queue_a_restart_but_never_consent_to_it(client, kanban_home, allowlisted):
+    """Queued intent over HTTP is not consent: the record stays pending, the panel names the
+    attended CLI command, and no HTTP verb on the post-drain route grants it."""
+    client.post(f"{PREFIX}/dispatch/pause", json={})
+    client.post(f"{PREFIX}/dispatch/post-drain",
+                json={"action_kind": "service_restart", "target": "hermes-gateway.service"})
+
+    view = client.get(f"{PREFIX}/dispatch/status").json()["post_drain"]
+    assert view["consent"] == pd.CONSENT_PENDING
+    assert view["consent_command"].endswith("dispatch --consent-post-drain")
+
+    for verb in ("put", "patch"):
+        assert getattr(client, verb)(f"{PREFIX}/dispatch/post-drain", json={"consent": "granted"}).status_code == 405
+    # A re-POST cannot smuggle consent in the body either: it re-queues as pending.
+    client.post(f"{PREFIX}/dispatch/post-drain",
+                json={"action_kind": "service_restart", "consent": "granted"})
+    assert pd.read_post_drain_action(kb.get_current_board())["consent"] == pd.CONSENT_PENDING
+
+
 def test_an_unknown_action_kind_is_rejected(client, kanban_home):
     response = client.post(f"{PREFIX}/dispatch/post-drain", json={"action_kind": "rm_rf"})
 

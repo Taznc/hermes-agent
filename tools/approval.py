@@ -310,6 +310,22 @@ def load_permanent(patterns: set):
         _permanent_approved.update(patterns)
 
 
+def _clamp_scope(choice: str, *, allow_session: bool, allow_permanent: bool) -> str:
+    """Reduce an approval ``choice`` to the widest scope the prompt actually OFFERED.
+
+    Hiding [s]ession / [a]lways in the UI is not enforcement: a transport, a gateway
+    ``/approve always``, or an older client can still hand back a scope the prompt never
+    offered. That answer is still consent for THIS operation, so it is honoured as the
+    widest permitted scope rather than refused — but it never becomes a standing grant the
+    gate was told to forbid (the restart/stop/reboot class; see tools.approval_lifecycle).
+    """
+    if choice == "always" and not allow_permanent:
+        choice = "session"
+    if choice == "session" and not allow_session:
+        choice = "once"
+    return choice
+
+
 def _persist_choice(session_key: str, choice: str, warnings: list[tuple]) -> None:
     """Persist a human ``session``/``always`` choice for each ``(key, _, is_tirith)``. Tirith
     findings are session-max by design (no broad permanent allowlisting of content-level
@@ -698,7 +714,8 @@ def _human_decision(spec: _GateSpec, *, command: str, description: str,
     def grant(choice: str) -> dict:
         # A smart-DENY owner override is always one operation, even if an older client returns "session" or "always".
         if not smart_denied:
-            _persist_choice(session_key, choice, warnings)
+            _persist_choice(session_key, _clamp_scope(choice, allow_session=allow_session,
+                                                      allow_permanent=allow_permanent), warnings)
         if spec.user_approved:
             return _user_approved(session_key, description)
         return _approved()

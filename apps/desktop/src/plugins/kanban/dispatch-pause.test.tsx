@@ -568,6 +568,16 @@ describe('Post-drain action queue', () => {
     expect(await screen.findByText('postDrainArmedDrained(actionReboot(),42m)')).toBeTruthy()
   })
 
+  it('says a pending-consent restart will not run, and names the attended command', async () => {
+    const command = 'hermes kanban --board shipping dispatch --consent-post-drain'
+    status = { ...status, post_drain: { ...QUEUED, consent: 'pending', consent_command: command }, running_count: 0 }
+    mount()
+
+    // Never "firing shortly": a drained board still waits for the operator's consent.
+    expect(await screen.findByText(`postDrainNeedsConsent(actionReboot(),${command})`)).toBeTruthy()
+    expect(screen.queryByText('postDrainArmedDrained(actionReboot(),42m)')).toBeNull()
+  })
+
   it('offers Cancel while an action is waiting and clears it through the scoped endpoint', async () => {
     status = { ...status, post_drain: QUEUED }
     mount()

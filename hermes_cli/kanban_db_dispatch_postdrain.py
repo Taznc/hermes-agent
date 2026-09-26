@@ -49,6 +49,10 @@ TERMINAL_STATES = frozenset({SUCCEEDED, FAILED, EXPIRED, CANCELLED})
 GROUP_ARMING = "arming"
 GROUP_ARMED = "armed"
 
+# Operator consent for a lifecycle (restart/reboot) record. See record_operator_consent.
+CONSENT_PENDING = "pending"
+CONSENT_GRANTED = "granted"
+
 
 class PostDrainActionRejected(ValueError):
     """A queue request names an action or target the operator may not run."""
@@ -172,6 +176,8 @@ class PostDrainAction:
     survives_execution: bool = True
     """False when the action destroys the process observing it (reboot): the
     record stays ``firing`` and is resolved by a later read from a new boot."""
+    lifecycle: bool = False
+    """True for a restart/stop/reboot kind: see :func:`record_operator_consent`."""
 
 
 def _systemctl_argv(cfg: PostDrainConfig, *args: str) -> list[str]:
@@ -552,6 +558,7 @@ ACTION_HANDLERS: dict[str, PostDrainAction] = {
         fire=_service_fire,
         observe_after=_service_observe_after,
         config_targets=lambda cfg: list(cfg.service_restart_allowlist),
+        lifecycle=True,
     ),
     "run_script": PostDrainAction(
         kind="run_script",
@@ -570,6 +577,7 @@ ACTION_HANDLERS: dict[str, PostDrainAction] = {
         fire=_reboot_fire,
         observe_after=_reboot_observe_after,
         survives_execution=False,
+        lifecycle=True,
     ),
 }
 
@@ -694,6 +702,10 @@ def _new_post_drain_record(
         "expires_at": requested_at + ttl,
         "state": WAITING,
     }
+    if handler.lifecycle:
+        # Queued intent is NOT consent. Nothing fires until an operator records
+        # it on this exact record (record_operator_consent); see _consent_missing.
+        record["consent"] = CONSENT_PENDING
     if group_id:
         record["group_id"] = group_id
     return record
@@ -841,7 +853,56 @@ def cancel_post_drain_action(
         return _cancel_locked(board, reason=reason, now=now)
 
 
+def _grant_consent(
+    board: Optional[str], record: Mapping[str, Any], *, granted_by: Optional[str], now: int,
+) -> dict[str, Any]:
+    with _group_locks(_group_members(board, record)) as held:
+        if not held:
+            return {"consented": False, "state": record, "reason": "dispatch_in_progress"}
+        fresh = read_post_drain_action(board)
+        if fresh is None or fresh.get("state") != WAITING or not _needs_consent(fresh):
+            return {"consented": False, "state": fresh}
+        stamp = {"consent": CONSENT_GRANTED, "consented_at": now,
+                 "consented_by": granted_by or _kb._hook_profile_name()}
+        written = {
+            slug: _write_post_drain_action(slug, {**member, **stamp})
+            for slug, member in _group_members(board, fresh)
+            if member.get("state") == WAITING
+        }
+    return {"consented": True, "state": written.get(board, {**fresh, **stamp})}
+
+
+def record_operator_consent(
+    board: Optional[str] = None, *, granted_by: Optional[str] = None, now: Optional[int] = None,
+) -> dict[str, Any]:
+    """Record the operator's explicit consent for this board's queued lifecycle action.
+
+    A ``service_restart`` or ``reboot`` record is queued with ``consent: pending`` and the
+    dispatcher will not fire it until this runs (see ``_claim_group_for_firing``). An
+    allowlist entry names what MAY be restarted; it is never standing permission to do it.
+    """
+    record = read_post_drain_action(board)
+    if record is None or record.get("state") != WAITING or not _needs_consent(record):
+        return {"consented": False, "state": record}
+    current = int(now if now is not None else time.time())
+    return _grant_consent(board, record, granted_by=granted_by, now=current)
+
+
 # --- firing on observed drain ----------------------------------------------
+
+
+def _consent_missing(members: list[tuple[Optional[str], dict[str, Any]]]) -> bool:
+    """True while any member of a lifecycle action still lacks operator consent."""
+    return any(
+        _needs_consent(member) for _, member in members
+    )
+
+
+def _needs_consent(member: Mapping[str, Any]) -> bool:
+    handler = ACTION_HANDLERS.get(str(member.get("action_kind")))
+    if handler is None or not handler.lifecycle:
+        return False
+    return member.get("consent") != CONSENT_GRANTED
 
 
 def _group_members(
@@ -1042,6 +1103,10 @@ def _claim_group_for_firing(
         # EVERY member must have drained. Firing while a sibling board still has
         # a live worker is the exact damage the drain wait exists to prevent.
         if not all(_board_is_operator_drained(slug) for slug, _ in members):
+            return {}
+
+        # A restart/reboot never fires on queued intent alone.
+        if _consent_missing(members):
             return {}
 
         fired = [
