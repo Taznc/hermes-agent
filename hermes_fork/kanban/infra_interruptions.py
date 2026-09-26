@@ -57,9 +57,6 @@ from hermes_cli import kanban_db as _kb
 # is counted (dev's ``kanban.max_infra_interruptions`` default).
 MAX_HOST_RESTART_INTERRUPTIONS = 3
 
-# Closed runs to walk when counting the streak; it caps at a handful anyway.
-_STREAK_SCAN_LIMIT = 50
-
 REASON = "host_restart_interrupted"
 
 
@@ -89,18 +86,18 @@ def host_restart_streak(conn: sqlite3.Connection, task_id: str) -> int:
     does not, so the neutral allowance is at most ``MAX_HOST_RESTART_INTERRUPTIONS``
     per success and every later unwitnessed death reaches the breaker.
     """
-    streak = 0
+    # No row limit: the boundary is the last completed run however far back it is,
+    # otherwise enough non-completed runs would age the interruptions out of view
+    # and re-grant the allowance. LIKE only prefilters; the JSON parse decides.
     rows = conn.execute(
-        "SELECT outcome, metadata FROM task_runs "
-        "WHERE task_id = ? AND ended_at IS NOT NULL ORDER BY id DESC LIMIT ?",
-        (task_id, _STREAK_SCAN_LIMIT),
+        "SELECT metadata FROM task_runs "
+        "WHERE task_id = ? AND ended_at IS NOT NULL "
+        "AND id > COALESCE((SELECT MAX(id) FROM task_runs "
+        "                   WHERE task_id = ? AND outcome = 'completed'), 0) "
+        "AND metadata LIKE '%host_restart_interrupted%'",
+        (task_id, task_id),
     ).fetchall()
-    for row in rows:
-        if row["outcome"] == "completed":
-            break
-        if _kb._json_dict(row["metadata"]).get("host_restart_interrupted"):
-            streak += 1
-    return streak
+    return sum(1 for row in rows if _kb._json_dict(row["metadata"]).get("host_restart_interrupted"))
 
 
 def _has_exit_witness(pid: int, task_id: str, board: Optional[str]) -> bool:
