@@ -7,6 +7,10 @@ past that); see the **routing table** at the end and read the area file before e
 
 **Never give up on the right solution.**
 
+<!-- >>> FORK ANCHOR: fork-md <<< -->
+**This is the Taznc fork (`next` branch).** Read `FORK.md` first: tiers, hard rules, the feature ledger, and what "done" means here.
+<!-- <<< FORK ANCHOR >>> -->
+
 ## What Hermes Is
 
 Hermes is a personal AI agent that runs the same agent core across a CLI, a messaging
