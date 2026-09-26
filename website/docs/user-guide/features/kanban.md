@@ -640,17 +640,20 @@ loops without removing review: the first changes request returns to the original
 implementer; after the second, the next ready run is reassigned to the configured
 specialist under that profile's own model defaults.
 
-`max_review_rounds` (default `3`, set `0` to disable) is the dispatcher's hard
-stop on that same loop: once a card accumulates this many `changes_requested`
-cycles since its last completion, the dispatcher blocks it (kind
+`max_review_rounds` (default `3`, set `0` to disable) bounds that same loop.
+Once a card accumulates this many `changes_requested` cycles since its last
+completion, the dispatcher hands it to `review_rework_escalation_profile` for
+exactly **one terminal rework round** (event `review_cap_escalated`; the
+worker packet's `review.terminal_rework` is `true` for that run so the
+specialist knows it is the last pass) and reports it as an
+`escalated_review_cap` entry in `hermes kanban dispatch` output. Only if that
+escalated round *also* comes back `changes_requested` — or if no escalation
+profile is configured — does the dispatcher block the card (kind
 `review_round_cap`, visible via the card's status and its `review_round_cap`
 event in `hermes kanban show <id>`, as a dedicated `review_round_cap`
 diagnostic — round count, cap, and last reviewer reason — in
 `hermes kanban diagnostics`, and as a `blocked_review_round_cap` entry in both
-the text and `--json` output of `hermes kanban dispatch`) instead of
-re-dispatching it to the
-implementer or the escalation profile — `review_rework_escalation_profile`
-still fires first for rounds under the cap. It is a hard stop; the
+the text and `--json` output of `hermes kanban dispatch`). It is a hard stop; the
 reviewer-side round-count guidance in the sdlc-review skill is advisory
 only. An operator's explicit reassignment after the last `changes_requested`
 event bypasses both mechanisms, the same escape hatch
