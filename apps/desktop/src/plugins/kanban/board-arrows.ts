@@ -329,6 +329,40 @@ export function revealDelta(
   return bottom > 0 ? bottom : 0
 }
 
+interface Span {
+  end: number
+  start: number
+}
+
+/** The scroll delta for ONE viewport holding several linked cards (a lane
+ *  vertically, or the lane strip horizontally). `revealDelta` shows one card;
+ *  a lane can hold several cards in the trace, and chasing them one by one
+ *  would scroll back and forth and leave only the last one visible.
+ *
+ *  - Everything fits: the smallest move that shows the whole group.
+ *  - It doesn't fit: show the `anchor` (the focused card, when this viewport
+ *    holds it) or the group's leading card, plus as many of the rest as fit
+ *    below it. Every line still ends at the lane edge for a card left out,
+ *    and that line is drawn dashed. */
+export function revealGroupDelta(items: readonly Span[], view: Span, anchor?: Span, margin = REVEAL_MARGIN): number {
+  if (items.length === 0) {
+    return 0
+  }
+
+  const group = {
+    end: Math.max(...items.map(item => item.end)),
+    start: Math.min(...items.map(item => item.start))
+  }
+
+  if (group.end - group.start <= view.end - view.start - 2 * margin) {
+    return revealDelta(group, view, margin)
+  }
+
+  const lead = anchor ?? items.reduce((first, item) => (item.start < first.start ? item : first))
+
+  return revealDelta(lead, view, margin)
+}
+
 /** Arrow lists are rebuilt on every measure; keep the old array when nothing
  *  moved so React bails out instead of re-rendering the layer per scroll tick. */
 export function sameArrows(a: readonly BoardArrow[], b: readonly BoardArrow[]): boolean {

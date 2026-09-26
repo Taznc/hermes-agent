@@ -14,6 +14,7 @@ import {
   pointAt,
   REVEAL_MARGIN,
   revealDelta,
+  revealGroupDelta,
   routeArrows
 } from './board-arrows'
 import { buildGraph, chainSets, focusSets } from './deps'
@@ -286,6 +287,51 @@ describe('revealDelta', () => {
 
   it('shows the leading edge of a card taller than the view', () => {
     expect(shown({ end: 1400, start: 700 }).start).toBe(view.start + REVEAL_MARGIN)
+  })
+})
+
+describe('revealGroupDelta', () => {
+  const view = { end: 500, start: 100 }
+  const after = (item: { end: number; start: number }, d: number) => ({ end: item.end - d, start: item.start - d })
+
+  const inView = (item: { end: number; start: number }) =>
+    item.start >= view.start + REVEAL_MARGIN && item.end <= view.end - REVEAL_MARGIN
+
+  it('does not scroll when every linked card is already in view', () => {
+    expect(revealGroupDelta([{ end: 200, start: 150 }, { end: 400, start: 350 }], view)).toBe(0)
+  })
+
+  it('brings a whole group that fits into view in one move, not card by card', () => {
+    const items = [
+      { end: 700, start: 640 },
+      { end: 820, start: 760 }
+    ]
+
+    const d = revealGroupDelta(items, view)
+
+    expect(items.map(item => inView(after(item, d)))).toEqual([true, true])
+  })
+
+  it('keeps the anchor (focused card) in view when the group does not fit', () => {
+    const items = [
+      { end: 160, start: 100 },
+      { end: 1260, start: 1200 }
+    ]
+
+    const anchor = items[1]
+
+    expect(inView(after(anchor, revealGroupDelta(items, view, anchor)))).toBe(true)
+  })
+
+  it('without an anchor, shows the leading card in full when the group does not fit', () => {
+    const lead = { end: 760, start: 700 }
+    const d = revealGroupDelta([lead, { end: 1600, start: 1540 }], view)
+
+    expect(inView(after(lead, d))).toBe(true)
+  })
+
+  it('is a no-op for an empty group', () => {
+    expect(revealGroupDelta([], view)).toBe(0)
   })
 })
 

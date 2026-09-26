@@ -283,6 +283,62 @@ describe('focus answer bar', () => {
     }
   })
 
+  it('scrolls every lane holding a linked card, not just the focused one', async () => {
+    // Same fake layout as above: every lane is a 400px viewport at 100-500.
+    // The focused card `f` sits in view, but its blockers `h1`/`h2` (both in
+    // the On hold lane) and its dependant `c` (Ready lane) start below the
+    // fold. Each card's rect follows its own lane's scrollTop.
+    const scrolled = new WeakMap<Element, number>()
+    const scrollTop = Object.getOwnPropertyDescriptor(Element.prototype, 'scrollTop')!
+    const rect = Element.prototype.getBoundingClientRect
+    const contentTop: Record<string, number> = { c: 900, d: 120, f: 150, h1: 700, h2: 800 }
+
+    Object.defineProperty(Element.prototype, 'scrollTop', {
+      configurable: true,
+      get() {
+        return scrolled.get(this) ?? 0
+      },
+      set(value: number) {
+        scrolled.set(this, value)
+      }
+    })
+
+    const box = (top: number, height: number) =>
+      ({ bottom: top + height, height, left: 0, right: 240, top, width: 240 }) as DOMRect
+
+    Element.prototype.getBoundingClientRect = function (this: Element) {
+      if (this.hasAttribute('data-lane-scroller')) {
+        return box(100, 400)
+      }
+
+      const key = this.getAttribute('data-card-key')
+
+      if (key && key in contentTop) {
+        const lane = this.closest('[data-lane-scroller]')!
+
+        return box(contentTop[key] - (scrolled.get(lane) ?? 0), 80)
+      }
+
+      return rect.call(this)
+    }
+
+    try {
+      await mount()
+      focusCard('f')
+      await waitFor(() => expect(bar()).not.toBeNull())
+
+      for (const key of ['f', 'h1', 'h2', 'c']) {
+        const card = cardByKey(key).getBoundingClientRect()
+
+        expect(card.top, key).toBeGreaterThanOrEqual(100)
+        expect(card.bottom, key).toBeLessThanOrEqual(500)
+      }
+    } finally {
+      Element.prototype.getBoundingClientRect = rect
+      Object.defineProperty(Element.prototype, 'scrollTop', scrollTop)
+    }
+  })
+
   it('lines never take pointer events, so a card under a line stays clickable', async () => {
     await mount()
     focusCard('f')
