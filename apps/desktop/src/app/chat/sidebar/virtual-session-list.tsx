@@ -51,6 +51,10 @@ export interface VirtualSessionListProps {
   onBranchSession?: (sessionId: string, profile?: string) => void
   onDeleteSession: (sessionId: string) => void
   onResumeSession: (sessionId: string, session?: SessionInfo) => void
+  /** Restore an archived row. Optional: only Recents ever renders archived
+   *  rows — Pinned/Search never do. Mirrors `sessions-section.tsx`'s
+   *  `renderRow` inverse-action wiring. */
+  onUnarchiveSession?: (sessionId: string) => void
   onTogglePin: (sessionId: string) => void
   onToggleUnread: (sessionId: string) => void
   pinned: boolean
@@ -76,6 +80,7 @@ export const VirtualSessionList: FC<VirtualSessionListProps> = ({
   onBranchSession,
   onDeleteSession,
   onResumeSession,
+  onUnarchiveSession,
   onTogglePin,
   onToggleUnread,
   pinned,
@@ -163,7 +168,19 @@ export const VirtualSessionList: FC<VirtualSessionListProps> = ({
       card,
       isPinned: pinned,
       isSelected: session.id === activeSessionId,
-      onArchive: () => onArchiveSession(session.id),
+      // Archived filter rows are the session's OWN inverse action: the
+      // "Archive session" verb is a no-op on an already-archived row, so
+      // swap to Unarchive whenever this row IS archived (never on a live
+      // row even if `showArchived` is somehow stale — `session.archived`
+      // is the row's own ground truth). Sections that never render archived
+      // rows (Pinned, Search) don't wire `onUnarchiveSession` — falls back
+      // to a no-op rather than mis-firing the archive RPC on an archived
+      // row. Mirrors `sessions-section.tsx`'s `renderRow`.
+      onArchive: session.archived
+        ? onUnarchiveSession
+          ? () => onUnarchiveSession(session.id)
+          : () => {}
+        : () => onArchiveSession(session.id),
       onBranch: onBranchSession ? () => onBranchSession(session.id, session.profile) : undefined,
       onDelete: () => onDeleteSession(session.id),
       onPin: () => onTogglePin(sessionPinId(session)),

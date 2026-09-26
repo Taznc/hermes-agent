@@ -2148,7 +2148,6 @@ export const zhHant = defineForkLocale(forkZhHant, {
       copyIdFailed: '無法複製工作階段 ID',
 
       sessionActions: '工作階段動作',
-      archiveSession: '封存工作階段',
       sessionRunning: '工作階段執行中',
       needsInput: '需要您的輸入',
       waitingForAnswer: '等待您的回答',
@@ -3316,8 +3315,6 @@ export const zhHant = defineForkLocale(forkZhHant, {
     deleteFailed: '刪除失敗',
     archived: '已封存',
     archiveFailed: '封存失敗',
-    archivedUndoMessage: '工作階段已封存',
-    undoArchiveFailed: '復原失敗',
     cwdChangeFailed: '工作目錄變更失敗',
     cwdStagedTitle: '工作目錄已暫存',
     cwdStagedMessage: '重新啟動桌面後端後，工作目錄變更才會套用至此作用中工作階段。',

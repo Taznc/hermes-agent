@@ -2228,7 +2228,6 @@ export const ja = defineForkLocale(forkJa, {
       copyIdFailed: 'セッション ID をコピーできませんでした',
 
       sessionActions: 'セッションアクション',
-      archiveSession: 'セッションをアーカイブ',
       sessionRunning: 'セッション実行中',
       needsInput: '入力が必要です',
       waitingForAnswer: '回答を待っています',
@@ -3457,8 +3456,6 @@ export const ja = defineForkLocale(forkJa, {
     deleteFailed: '削除に失敗しました',
     archived: 'アーカイブしました',
     archiveFailed: 'アーカイブに失敗しました',
-    archivedUndoMessage: 'セッションをアーカイブしました',
-    undoArchiveFailed: '元に戻せませんでした',
     cwdChangeFailed: '作業ディレクトリの変更に失敗しました',
     cwdStagedTitle: '作業ディレクトリがステージングされました',
     cwdStagedMessage:

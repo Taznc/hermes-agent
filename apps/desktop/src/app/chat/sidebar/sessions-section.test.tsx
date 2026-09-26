@@ -21,6 +21,7 @@ vi.mock('@/i18n', () => ({
           today: 'Today',
           yesterday: 'Yesterday'
         },
+        nav: { 'new-session': 'New session' },
         projects: { toggle: (label: string, open: boolean) => `${open ? 'Hide' : 'Show'} ${label}` },
         row: { archiveSession: 'Archive session' }
       }
@@ -184,9 +185,12 @@ describe('SidebarSessionsSection memoization & virtualizer stability', () => {
     expect(thirdRowsRef).not.toBe(secondRowsRef)
   })
 
-  it('archives only the sessions beneath the clicked date divider', () => {
-    vi.useFakeTimers()
-    vi.setSystemTime(new Date('2026-09-06T16:00:00Z'))
+  // Bulk date/status-group archive (`archiveDateGroup` +
+  // `SidebarDateDividerArchiveButton`) is removed by this card: a date
+  // divider must never carry an archive affordance, in the flat renderer or
+  // an entered project's dated lane. `newSessionDividerAction` (the "+" to
+  // start a session in that bucket) is the only surviving divider action.
+  it('renders no bulk archive action on date dividers in the flat (non-virtualized) list', () => {
     const onArchiveSession = vi.fn()
 
     render(
@@ -203,25 +207,15 @@ describe('SidebarSessionsSection memoization & virtualizer stability', () => {
         onToggleUnread={noop}
         open={true}
         pinned={false}
-        sessions={[
-          makeSession('today', Date.parse('2026-09-06T15:00:00Z') / 1000),
-          makeSession('yesterday-a', Date.parse('2026-09-05T15:00:00Z') / 1000),
-          makeSession('yesterday-b', Date.parse('2026-09-05T14:00:00Z') / 1000)
-        ]}
+        sessions={[makeSession('today'), makeSession('yesterday', 900)]}
       />
     )
 
-    fireEvent.click(screen.getByRole('button', { name: 'Archive session: Yesterday' }))
-
-    expect(onArchiveSession).toHaveBeenCalledTimes(2)
-    expect(onArchiveSession).toHaveBeenNthCalledWith(1, 'yesterday-a')
-    expect(onArchiveSession).toHaveBeenNthCalledWith(2, 'yesterday-b')
-    vi.useRealTimers()
+    expect(screen.queryByRole('button', { name: /Archive session/i })).toBeNull()
+    expect(onArchiveSession).not.toHaveBeenCalled()
   })
 
-  it('renders the archive action for date dividers inside an entered project', () => {
-    vi.useFakeTimers()
-    vi.setSystemTime(new Date('2026-09-06T16:00:00Z'))
+  it('renders no bulk archive action on date dividers inside an entered project', () => {
     const onArchiveSession = vi.fn()
 
     render(
@@ -250,10 +244,7 @@ describe('SidebarSessionsSection memoization & virtualizer stability', () => {
                   id: 'home-lane',
                   label: 'Home',
                   path: null,
-                  sessions: [
-                    makeSession('today', Date.parse('2026-09-06T15:00:00Z') / 1000),
-                    makeSession('yesterday', Date.parse('2026-09-05T15:00:00Z') / 1000)
-                  ]
+                  sessions: [makeSession('today'), makeSession('yesterday', 900)]
                 }
               ],
               id: 'home-repo',
@@ -268,9 +259,122 @@ describe('SidebarSessionsSection memoization & virtualizer stability', () => {
       />
     )
 
-    fireEvent.click(screen.getByRole('button', { name: 'Archive session: Yesterday' }))
+    expect(screen.queryByRole('button', { name: /Archive session/i })).toBeNull()
+    expect(onArchiveSession).not.toHaveBeenCalled()
+  })
 
-    expect(onArchiveSession).toHaveBeenCalledExactlyOnceWith('yesterday')
-    vi.useRealTimers()
+  // AC4 (reviewer round 1): the virtualized path must receive the same
+  // inverse-action callback the flat renderer wires — proves the chain from
+  // SidebarSessionsSection down to VirtualSessionList's own archived-row
+  // routing (asserted in virtual-session-list.test.tsx) is unbroken at
+  // >=VIRTUALIZE_THRESHOLD sessions, where the section actually switches to
+  // the virtualized renderer.
+  it('forwards onUnarchiveSession to VirtualSessionList once virtualized', () => {
+    mockVirtualListPropsHistory.length = 0
+    const onUnarchiveSession = vi.fn()
+
+    render(
+      <SidebarSessionsSection
+        activeSessionId={null}
+        emptyState={<div>Empty</div>}
+        label="Sessions"
+        onArchiveSession={noop}
+        onDeleteSession={noop}
+        onResumeSession={noop}
+        onToggle={noop}
+        onTogglePin={noop}
+        onToggleUnread={noop}
+        onUnarchiveSession={onUnarchiveSession}
+        open={true}
+        pinned={false}
+        sessions={generateSessions(VIRTUALIZE_THRESHOLD + 5)}
+      />
+    )
+
+    expect(mockVirtualListPropsHistory.length).toBe(1)
+    expect(mockVirtualListPropsHistory[0].onUnarchiveSession).toBe(onUnarchiveSession)
+  })
+
+  // AC6 (reviewer round 2, recovery t_77c22e64): the tests above (lines 192,
+  // 217) prove the FLAT renderer's divider carries no bulk archive control,
+  // and 'forwards onUnarchiveSession...' proves callback wiring against the
+  // bare mocked VirtualSessionList — neither exercises a REAL virtual divider.
+  // This test unmocks './virtual-session-list' (and stubs '@tanstack/
+  // react-virtual' so the divider row is deterministically among the
+  // virtualizer's rendered items) to render the actual SidebarDateDivider
+  // component through the virtualized path at >=VIRTUALIZE_THRESHOLD
+  // sessions, and asserts no bulk Archive control renders on it while the
+  // ordinary new-session divider action still does.
+  it('renders no bulk archive action on a REAL virtualized date divider, preserving the new-session action', async () => {
+    vi.resetModules()
+    vi.doUnmock('./virtual-session-list')
+    vi.doMock('@tanstack/react-virtual', () => ({
+      useVirtualizer: ({ count }: { count: number }) => ({
+        getTotalSize: () => count * 40,
+        getVirtualItems: () =>
+          Array.from({ length: count }, (_, index) => ({ end: (index + 1) * 40, index, start: index * 40 })),
+        measure: () => {},
+        measureElement: () => {}
+      })
+    }))
+    vi.doMock('@dnd-kit/sortable', () => ({ useSortable: () => ({ attributes: {}, listeners: {} }) }))
+    vi.doMock('@dnd-kit/utilities', () => ({ CSS: { Transform: { toString: () => '' } } }))
+
+    const { SidebarSessionsSection: RealVirtualSessionsSection } = await import('./sessions-section')
+
+    const onArchiveSession = vi.fn()
+    const onNewSessionInWorkspace = vi.fn()
+
+    const nowSec = Date.now() / 1000
+
+    // Two calendar days, split by a real >8h gap so headRunCutoffMs actually
+    // ends the head run and groupEntriesByRecency emits a real "Yesterday"
+    // divider between them (a tight cluster of close timestamps never breaks
+    // into groups at all — this must span a genuine day boundary).
+    const todaySessions = generateSessions(15).map((session, i) => ({
+      ...session,
+      id: `today-${i}`,
+      last_active: nowSec - i * 60,
+      started_at: nowSec - i * 60
+    })) as SessionInfo[]
+
+    const yesterdaySessions = generateSessions(15).map((session, i) => ({
+      ...session,
+      id: `yesterday-${i}`,
+      last_active: nowSec - 26 * 60 * 60 - i * 60,
+      started_at: nowSec - 26 * 60 * 60 - i * 60
+    })) as SessionInfo[]
+
+    render(
+      <RealVirtualSessionsSection
+        activeSessionId={null}
+        emptyState={<div>Empty</div>}
+        grouping="date"
+        label="Sessions"
+        onArchiveSession={onArchiveSession}
+        onDeleteSession={noop}
+        onNewSessionInWorkspace={onNewSessionInWorkspace}
+        onResumeSession={noop}
+        onToggle={noop}
+        onTogglePin={noop}
+        onToggleUnread={noop}
+        open={true}
+        pinned={false}
+        sessions={[...todaySessions, ...yesterdaySessions]}
+      />
+    )
+
+    // A real divider rendered — proves this exercised the virtualized path,
+    // not a degenerate empty list.
+    expect(screen.getByText('Yesterday')).toBeTruthy()
+
+    expect(screen.queryByRole('button', { name: /Archive session/i })).toBeNull()
+    expect(onArchiveSession).not.toHaveBeenCalled()
+
+    // The new-session "+" divider action is the one surviving divider
+    // affordance — it must still be present and functional.
+    const newSessionButton = screen.getAllByRole('button', { name: 'New session' })[0]
+    fireEvent.click(newSessionButton)
+    expect(onNewSessionInWorkspace).toHaveBeenCalledWith(null)
   })
 })

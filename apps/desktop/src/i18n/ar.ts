@@ -1916,7 +1916,6 @@ export const ar = defineForkLocale(forkAr, {
       copyIdFailed: 'فشل نسخ المعرف',
 
       sessionActions: 'إجراءات الجلسة',
-      archiveSession: 'أرشفة الجلسة',
       sessionRunning: 'الجلسة تعمل',
       needsInput: 'تحتاج إدخالا',
       waitingForAnswer: 'بانتظار إجابة',
@@ -3041,8 +3040,6 @@ export const ar = defineForkLocale(forkAr, {
     deleteFailed: 'فشل الحذف',
     archived: 'تمت الأرشفة',
     archiveFailed: 'فشلت الأرشفة',
-    archivedUndoMessage: 'تمت أرشفة الجلسة',
-    undoArchiveFailed: 'فشل التراجع',
     cwdChangeFailed: 'فشل تغيير مجلد العمل',
     cwdStagedTitle: 'تم تجهيز مجلد العمل',
     cwdStagedMessage: 'سيطبق مجلد العمل على الرسالة التالية.',
