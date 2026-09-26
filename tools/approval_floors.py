@@ -189,10 +189,22 @@ def _command_matches_permanent_allowlist(command: str) -> bool:
     """True when command_allowlist holds this exact command text or a matching
     glob. Permanent approvals historically store dangerous-pattern keys such as
     ``recursive delete``; manual entries are command text, possibly with
-    shell-style wildcards like ``podman *``."""
+    shell-style wildcards like ``podman *``.
+
+    A restart/stop/reboot command is EXCLUDED here even when its literal text (or a glob)
+    is present in ``command_allowlist``: that class is non-allowlistable by design (see
+    ``tools.approval_lifecycle``), so a stale or manually-added allowlist entry — or a
+    broad glob like ``systemctl *`` that happens to also match a restart — can never
+    downgrade it to auto-approved. See kanban card evidence 2026-09-25.
+    """
     from tools import approval as _a
+    from tools.approval_detection import detect_dangerous_command
+    from tools.approval_lifecycle import is_lifecycle_pattern
     command = (command or "").strip()
     if not command or _has_allowlist_shell_operator(command):
+        return False
+    is_dangerous, _pattern_key, description = detect_dangerous_command(command)
+    if is_dangerous and is_lifecycle_pattern(description):
         return False
     with _a._lock:
         patterns = tuple(_a._permanent_approved)

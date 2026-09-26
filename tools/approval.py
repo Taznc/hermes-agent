@@ -35,6 +35,7 @@ from tools.approval_floors import (
     _user_deny_block_result,
 )
 from tools.approval_gateway_wait import _await_gateway_decision
+from tools.approval_lifecycle import is_lifecycle_pattern
 from tools.approval_prompt import _present_with_selected_transport, _transport_choice, prompt_dangerous_approval
 from tools.approval_smart import _smart_verdict
 
@@ -660,14 +661,17 @@ def _human_decision(spec: _GateSpec, *, command: str, description: str,
                     pattern_key: str, pattern_keys: list[str], warnings: list[tuple],
                     session_key: str, approval_callback, is_cli: bool, is_gateway: bool,
                     is_ask: bool, smart: bool = False,
-                    permanent_capable: bool = True, pending_body=None) -> dict:
+                    permanent_capable: bool = True, allow_session: bool = True,
+                    pending_body=None) -> dict:
     """Ask a human (after the optional guardian-LLM step) and turn the answer into the gate result.
 
     ``warnings`` are the ``(key, _, is_tirith)`` tuples :func:`_persist_choice` stores on
     session/always. ``permanent_capable`` hides [a]lways when no key could be permanently
     allowlisted (pure-tirith prompts); a smart-DENY owner override reduces every surface to
-    once/deny and persists nothing. ``pending_body`` is a thunk, built only once a human is
-    actually asked, so a smart APPROVE never pays for redacting a large script.
+    once/deny and persists nothing. ``allow_session`` hides [s]ession too — used by the
+    lifecycle (restart/stop/reboot) gate so EVERY occurrence re-prompts, not just the first one
+    in a session. ``pending_body`` is a thunk, built only once a human is actually asked, so a
+    smart APPROVE never pays for redacting a large script.
     """
     from agent.redact import redact_sensitive_text
 
@@ -679,6 +683,7 @@ def _human_decision(spec: _GateSpec, *, command: str, description: str,
             return result
     pending_body = pending_body() if pending_body else None
     allow_permanent = permanent_capable and not smart_denied
+    allow_session = allow_session and not smart_denied
 
     def deny(template: str, outcome: str, **fmt) -> dict:
         breaker = ""
@@ -702,7 +707,7 @@ def _human_decision(spec: _GateSpec, *, command: str, description: str,
         attempt = _present_with_selected_transport(
             command=command, description=description, pattern_key=pattern_key, pattern_keys=pattern_keys,
             session_key=session_key, surface="gateway" if (is_gateway or is_ask) else "cli",
-            allow_session=not smart_denied, allow_permanent=allow_permanent,
+            allow_session=allow_session, allow_permanent=allow_permanent,
         )
         choice, denied = _transport_choice(attempt, pattern_key=pattern_key, description=description)
         if denied is not None:
@@ -728,8 +733,8 @@ def _human_decision(spec: _GateSpec, *, command: str, description: str,
             data = {
                 "command": display_command, "pattern_key": pattern_key,
                 "pattern_keys": pattern_keys, "description": display_description,
-                "allow_permanent": permanent_capable and not smart_denied,
-                "allow_session": not smart_denied,
+                "allow_permanent": allow_permanent,
+                "allow_session": allow_session,
             }
             if smart_denied:
                 data["smart_denied"] = True
@@ -773,7 +778,8 @@ def _human_decision(spec: _GateSpec, *, command: str, description: str,
                        pattern_keys=list(pattern_keys), session_key=session_key, surface="cli")
     approval_context._fire_approval_hook("pre_approval_request", **hook_kwargs)
     choice = prompt_dangerous_approval(prompt_command, prompt_description, allow_permanent=allow_permanent,
-                                       smart_denied=smart_denied, approval_callback=approval_callback)
+                                       allow_session=allow_session, smart_denied=smart_denied,
+                                       approval_callback=approval_callback)
     approval_context._fire_approval_hook("post_approval_response", **hook_kwargs, choice=choice)
     if choice == "timeout":
         return deny(spec.cli_timeout, "timeout")
@@ -812,17 +818,29 @@ def _run_approval_gate(
     context BLOCKS instead of auto-approving, so a plugin-flagged action never runs ungated.
     Unattended deny text is ``ctx.block_message(subject, noun, advice)`` unless the caller passes
     an explicit ``*_deny_message`` (the file-tool write gates word their own).
+
+    A restart/stop/reboot ``description`` (``is_lifecycle_pattern``) disables every
+    auto-approve exit in this function — yolo, the session/permanent cache, single-query /
+    cron / unattended approve-mode — and forces once/deny only (no session persistence) at
+    the final human prompt. See tools.approval_lifecycle.
     """
+    lifecycle = is_lifecycle_pattern(description)
     # Hardline blocks are the caller's job BEFORE this gate, so yolo here only skips the recoverable approval layer.
-    if _yolo_active():
+    if not lifecycle and _yolo_active():
         return _approved()
     session_key = get_current_session_key()
-    if is_approved(session_key, pattern_key):
+    if not lifecycle and is_approved(session_key, pattern_key):
         return _approved()
 
     approval_callback, is_cli, is_gateway, is_ask = _presence(approval_callback)
     if not is_cli and not is_gateway:
         log_args = (autoapprove_log_prefix, pattern_key, description)
+        if lifecycle:
+            from tools.approval_lifecycle import lifecycle_out_of_band_message
+            logger.warning("%s (pattern: %s): %s — lifecycle command, no interactive user/gateway "
+                           "present; BLOCKED (never auto-approvable).", *log_args)
+            return _blocked(lifecycle_out_of_band_message(display_target, description),
+                            pattern_key=pattern_key, description=description)
         # Every unattended context resolves instantly — never a pending approval nobody can answer.
         deny_messages = {
             "single_query": single_query_deny_message, "cron": cron_deny_message,
@@ -862,6 +880,7 @@ def _run_approval_gate(
         _ACTION_GATE, command=display_target, description=description, pattern_key=pattern_key,
         pattern_keys=[pattern_key], warnings=[(pattern_key, None, False)], session_key=session_key,
         approval_callback=approval_callback, is_cli=is_cli, is_gateway=is_gateway, is_ask=is_ask,
+        permanent_capable=not lifecycle, allow_session=not lifecycle,
     )
 
 
@@ -906,17 +925,22 @@ def check_dangerous_command(command: str, env_type: str,
                             has_host_access: bool = False) -> dict:
     """Detect a dangerous command and handle approval (pattern layer only). ``has_host_access``:
     a Docker sandbox that bind-mounts host paths must not skip approval.
-    Returns ``{"approved": True/False, "message": str or None, ...}``."""
+    Returns ``{"approved": True/False, "message": str or None, ...}``.
+
+    A restart/stop/reboot finding skips the yolo/allowlist bypasses below — see
+    ``check_all_command_guards`` and ``tools.approval_lifecycle`` for the rationale.
+    """
     if _should_skip_container_guards(env_type, has_host_access=has_host_access):
         return _user_deny_block(command) or _approved()
     blocked = _floor_block(command)
     if blocked is not None:
         return blocked
-    if _yolo_active():
-        return _approved()
-    if _command_matches_permanent_allowlist(command):
-        return _approved()
     is_dangerous, pattern_key, description = detect_dangerous_command(command)
+    if not (is_dangerous and is_lifecycle_pattern(description)):
+        if _yolo_active():
+            return _approved()
+        if _command_matches_permanent_allowlist(command):
+            return _approved()
     if not is_dangerous:
         return _approved()
     return _run_approval_gate(
@@ -997,7 +1021,12 @@ def check_all_command_guards(command: str, env_type: str,
     """Run all pre-exec security checks and return a single approval decision. Tirith and
     dangerous-command findings are presented as ONE combined approval request, so a gateway
     force=True replay cannot bypass one check when only the other was shown to the user.
-    ``has_host_access``: a Docker sandbox with bind-mounted host paths takes the normal flow."""
+    ``has_host_access``: a Docker sandbox with bind-mounted host paths takes the normal flow.
+
+    A restart/stop/reboot finding (``is_lifecycle_pattern``) skips the ``--yolo`` /
+    ``approvals.mode: off`` bypass below — that class must always reach a human or the
+    unattended fail-closed path, never an unconditional grant. See tools.approval_lifecycle.
+    """
     if _should_skip_container_guards(env_type, has_host_access=has_host_access):
         return _user_deny_block(command) or _approved()
 
@@ -1005,11 +1034,15 @@ def check_all_command_guards(command: str, env_type: str,
     if blocked is not None:
         return blocked
 
+    is_dangerous, pattern_key, description = detect_dangerous_command(command)
+    command_is_lifecycle = is_dangerous and is_lifecycle_pattern(description)
+
     approval_mode = approval_context._get_approval_mode()
-    if _yolo_active() or approval_mode == "off":
-        return _approved()
-    if _command_matches_permanent_allowlist(command):
-        return _approved()
+    if not command_is_lifecycle:
+        if _yolo_active() or approval_mode == "off":
+            return _approved()
+        if _command_matches_permanent_allowlist(command):
+            return _approved()
 
     approval_callback, is_cli, is_gateway, is_ask = _presence(approval_callback)
     # Outside CLI/gateway/ask flows we never block on approvals: each
@@ -1019,6 +1052,13 @@ def check_all_command_guards(command: str, env_type: str,
             result = _unattended_deny(command, ctx)
             if result is not None:
                 return result
+        if command_is_lifecycle:
+            # No approve-mode unattended context short-circuits a lifecycle command: nobody is
+            # present to approve it, so it fails closed even where the operator has configured
+            # cron_mode/single_query_mode/unattended_mode: approve for ordinary dangerous commands.
+            from tools.approval_lifecycle import lifecycle_out_of_band_message
+            return _blocked(lifecycle_out_of_band_message(command, description),
+                            pattern_key=pattern_key, description=description)
         return _approved()
 
     # Gather findings: warnings = [(pattern_key, description, is_tirith)]. Tirith block AND warn both go through the
@@ -1033,7 +1073,7 @@ def check_all_command_guards(command: str, env_type: str,
         tirith_key = f"tirith:{rule_id}"
         if not is_approved(session_key, tirith_key):
             warnings.append((tirith_key, _format_tirith_description(tirith_result), True))
-    if is_dangerous and not is_approved(session_key, pattern_key):
+    if is_dangerous and (is_lifecycle_pattern(description) or not is_approved(session_key, pattern_key)):
         warnings.append((pattern_key, description, False))
     if not warnings:
         return _approved()
@@ -1041,6 +1081,10 @@ def check_all_command_guards(command: str, env_type: str,
     combined_desc = "; ".join(desc for _, desc, _ in warnings)
     primary_key = warnings[0][0]
     all_keys = [key for key, _, _ in warnings]
+    # A restart/stop/reboot finding is terminal: no smart-approval guardian call (an LLM must
+    # never auto-approve this class), no [a]lways persistence, and no [s]ession persistence —
+    # every occurrence re-prompts, even later in the same session. See tools.approval_lifecycle.
+    is_lifecycle = any(not is_t and is_lifecycle_pattern(desc) for _, desc, is_t in warnings)
 
     # "Always" is offered when at least one warning is a dangerous-pattern key the persistence layer would actually
     # allowlist permanently. Pure-tirith findings are session-max by design, so a tirith-only prompt hides Always;
@@ -1049,8 +1093,10 @@ def check_all_command_guards(command: str, env_type: str,
         _COMMAND_GATE, command=command, description=combined_desc,
         pattern_key=primary_key, pattern_keys=all_keys, warnings=warnings,
         session_key=session_key, approval_callback=approval_callback,
-        is_cli=is_cli, is_gateway=is_gateway, is_ask=is_ask, smart=approval_mode == "smart",
-        permanent_capable=any(not is_t for _, _, is_t in warnings),
+        is_cli=is_cli, is_gateway=is_gateway, is_ask=is_ask,
+        smart=approval_mode == "smart" and not is_lifecycle,
+        permanent_capable=any(not is_t for _, _, is_t in warnings) and not is_lifecycle,
+        allow_session=not is_lifecycle,
     )
 
 

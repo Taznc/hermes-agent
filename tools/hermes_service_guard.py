@@ -108,8 +108,27 @@ def _executable_name(token: str) -> str:
     return Path(token.replace("\\", "/")).name.removesuffix(".exe").lower() or token.lower()
 
 
+def _configured_protected_unit_stems() -> frozenset[str]:
+    """``approvals.protected_units`` from config: bare unit stems (no suffix), lowercased.
+
+    Read fresh (not cached) so a config edit takes effect without a restart; the config
+    loader itself is process-local and cheap. A read failure yields an empty set rather than
+    raising — this function must never make the approval path fail OPEN by throwing.
+    """
+    try:
+        from tools.approval_context import _get_approval_config
+        raw = _get_approval_config().get("protected_units", [])
+    except Exception:
+        return frozenset()
+    if not isinstance(raw, (list, tuple)):
+        return frozenset()
+    return frozenset(
+        str(unit).strip().lower() for unit in raw if isinstance(unit, str) and unit.strip()
+    )
+
+
 def is_hermes_unit(unit: str) -> bool:
-    """True for a systemd unit/scope whose death takes Hermes agents with it.
+    """True for a systemd unit/scope whose stop/restart must never be auto-approved.
 
     Covers the supervising services (``hermes-gateway.service``,
     ``hermes-webdesktop-backend.service``, ``hermes-webui.service``) and the transient
@@ -117,8 +136,20 @@ def is_hermes_unit(unit: str) -> bool:
     sibling worker's scope either. Deliberately prefix-based rather than an enumerated
     unit list: the fleet grows new ``hermes-*`` units regularly and an allowlist of names
     would silently stop covering them.
+
+    Union'd with ``approvals.protected_units`` (config_defaults.py) for units that matter to
+    Hermes/Dev-VM function but do NOT happen to be ``hermes-*``-prefixed (e.g. a renderer
+    spike process with its own name). See #94021.
     """
-    return _executable_name(unit).startswith("hermes")
+    name = _executable_name(unit)
+    if name.startswith("hermes"):
+        return True
+    stem = name
+    for suffix in (".service", ".scope"):
+        if stem.endswith(suffix):
+            stem = stem[: -len(suffix)]
+            break
+    return stem in _configured_protected_unit_stems()
 
 
 def _unit_for_pid(pid: int) -> Optional[str]:

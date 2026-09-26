@@ -186,7 +186,8 @@ def normalize_command(command: str) -> str:
 
 def is_unsafe_class(description: str) -> bool:
     """True when a dangerous-class description must never be proposed."""
-    return bool(_UNSAFE_CLASS_RE.search(description or ""))
+    from tools.approval_lifecycle import is_lifecycle_pattern
+    return bool(_UNSAFE_CLASS_RE.search(description or "")) or is_lifecycle_pattern(description)
 
 
 def _unsafe_root_binary(token: str) -> bool:

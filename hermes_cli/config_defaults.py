@@ -1570,6 +1570,19 @@ DEFAULT_CONFIG = {
         # / mode=off. Quote in YAML when starting with * or containing {}/!/: e.g. "git push
         # --force*".
         "deny": [],
+        # Bare systemd unit stems (no .service/.scope suffix) whose stop/restart/kill/disable/mask
+        # is NEVER auto-approvable: not by --yolo, approvals.mode=off, command_allowlist, prior
+        # session/permanent approval, or the smart-approval guardian LLM. A present human is still
+        # asked (once/deny only — no session/always); an absent human gets an instant deny naming
+        # the unit and the exact command to run out-of-band. Union'd with the existing hermes-*
+        # prefix net in tools/hermes_service_guard.py, never a replacement for it — this list is
+        # for protecting a unit that does NOT happen to be hermes-*-prefixed. See #94021.
+        "protected_units": [
+            "hermes-gateway", "hermes-webdesktop-backend", "hermes-webdesktop-dev",
+            "hermes-webdesktop-stable", "hermes-dashboard", "hermes-webui",
+            "hermes-hindsight-proxy", "hermes-hindsight-tunnel", "hermes-automation-chrome",
+            "hermes-xvfb", "hermes-code-server",
+        ],
         # /reload-mcp confirms before rebuilding the MCP tool set (it invalidates the prompt cache,
         # so the next message re-sends full input). "Always Approve" → false.
         "mcp_reload_confirm": True,

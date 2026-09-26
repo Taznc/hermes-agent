@@ -184,6 +184,51 @@ def test_worker_scopes_count_as_hermes_units():
     assert not is_hermes_unit("ssh.service")
 
 
+# --- config-driven protected_units (AC4: config-driven, not hardcoded) ----------------------
+
+def test_protected_units_from_config_cover_a_non_hermes_prefixed_unit(monkeypatch):
+    """A unit that matters to Hermes/Dev-VM function but is NOT hermes-*-prefixed (e.g. a
+    renderer spike process with its own name) is still protected when listed in
+    ``approvals.protected_units`` (hermes_cli/config_defaults.py)."""
+    from tools import approval_context
+
+    monkeypatch.setattr(
+        approval_context, "_get_approval_config",
+        lambda: {"protected_units": ["some-spike-renderer"]},
+    )
+    assert is_hermes_unit("some-spike-renderer.service")
+    assert is_hermes_unit("some-spike-renderer.scope")
+    assert not is_hermes_unit("some-other-unit.service")
+
+
+def test_protected_units_config_is_read_fresh_not_cached(monkeypatch):
+    """A config edit takes effect without a process restart — no caching layer."""
+    from tools import approval_context
+
+    monkeypatch.setattr(approval_context, "_get_approval_config", lambda: {"protected_units": []})
+    assert not is_hermes_unit("newly-added-unit.service")
+
+    monkeypatch.setattr(
+        approval_context, "_get_approval_config",
+        lambda: {"protected_units": ["newly-added-unit"]},
+    )
+    assert is_hermes_unit("newly-added-unit.service")
+
+
+def test_protected_units_config_failure_fails_closed_not_open(monkeypatch):
+    """A config-read exception must not make the approval path fail OPEN by throwing —
+    and must not accidentally mark every unit protected either; it degrades to the
+    existing hermes-* prefix net only."""
+    from tools import approval_context
+
+    def boom():
+        raise RuntimeError("config unavailable")
+
+    monkeypatch.setattr(approval_context, "_get_approval_config", boom)
+    assert is_hermes_unit("hermes-gateway.service")  # prefix net still works
+    assert not is_hermes_unit("unrelated.service")  # never raises, never fails open
+
+
 # --- interactive vs non-interactive divergence ---------------------------------------------
 # The whole point of the card: the same command must reach OPPOSITE outcomes depending on
 # whether a human can answer. These drive the real approval gate, not the detector alone.

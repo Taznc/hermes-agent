@@ -177,12 +177,12 @@ class TestRankingAndSafety:
     def test_ranking_orders_by_frequency(self, db_path):
         path, con = db_path
         for _ in range(5):
-            _add_terminal_call(con, "docker restart web")
+            _add_terminal_call(con, "docker context use myctx")
         for _ in range(2):
             _add_terminal_call(con, "git push --force origin main")
         records = scan_approval_history(path, days=0)
         proposals = build_proposals(records, min_count=2)
-        assert [p.pattern for p in proposals] == ["docker restart *", "git push *"]
+        assert [p.pattern for p in proposals] == ["docker context *", "git push *"]
         assert proposals[0].count == 5
         assert proposals[1].count == 2
 
@@ -192,6 +192,37 @@ class TestRankingAndSafety:
         records = scan_approval_history(path, days=0)
         assert build_proposals(records, min_count=2) == []
         assert len(build_proposals(records, min_count=1)) == 1
+
+
+class TestLifecycleNeverProposed:
+    """AC3: ``hermes approvals suggest`` must never propose a restart/reboot category,
+    regardless of how often it was implicitly approved in history. See kanban card
+    evidence 2026-09-25 and tools.approval_lifecycle."""
+
+    @pytest.mark.parametrize("description", [
+        "stop/restart system service",
+        "stop/restart hermes gateway (kills running agents)",
+        "docker restart/stop/kill (container lifecycle)",
+        "docker compose restart/stop/kill/down (container lifecycle)",
+        "hermes update (restarts gateway, kills running agents)",
+        "force stop service (Stop-Service -Force)",
+        "stop/delete service (sc)",
+        "stop/restart hermes launchd service (kills running agents)",
+        "system shutdown/reboot",
+        "systemctl poweroff/reboot",
+    ])
+    def test_lifecycle_description_is_unsafe_class(self, description):
+        assert is_unsafe_class(description) is True
+
+    def test_frequent_restart_commands_never_proposed(self, db_path):
+        path, con = db_path
+        for _ in range(10):
+            _add_terminal_call(con, "systemctl --user restart hermes-hindsight-proxy")
+        for _ in range(10):
+            _add_terminal_call(con, "docker restart web")
+        records = scan_approval_history(path, days=0)
+        proposals = build_proposals(records, min_count=1)
+        assert proposals == []
 
 
 
@@ -231,12 +262,12 @@ class TestApply:
         for _ in range(4):
             _add_terminal_call(con, "git push --force origin main")
         for _ in range(3):
-            _add_terminal_call(con, "docker restart web")
+            _add_terminal_call(con, "docker context use myctx")
         rc = suggest_command(_args(path, apply_indices="1,2"))
         assert rc == 0
-        assert isolated_allowlist["patterns"] == {"git push *", "docker restart *"}
+        assert isolated_allowlist["patterns"] == {"git push *", "docker context *"}
         out = capsys.readouterr().out
-        assert "git push *" in out and "docker restart *" in out
+        assert "git push *" in out and "docker context *" in out
 
 
 
