@@ -77,8 +77,8 @@ interface SpikeReadFileTextResult {
   truncated?: boolean
 }
 
-// Wire shapes of /api/dashboard/plugins/probe and
-// /api/dashboard/desktop-plugins/install. Deliberately identical to
+// Wire shapes of the web-desktop-bridge plugin's probe and desktop-install
+// routes. Deliberately identical to
 // PluginProbeResult / DesktopPluginInstallResult in global.d.ts (and to what
 // electron/desktop-plugin-install.ts returns) so the backend response is
 // handed to the renderer verbatim with no translation layer to drift.
@@ -692,6 +692,23 @@ async function saveGatewayFile(
   return { saved: true }
 }
 
+// A non-2xx answer from api(). Same message as the plain Error it replaces
+// (callers and toasts see identical text); `status` lets bridge members tell
+// "route not mounted" (404) apart from a real failure without parsing it.
+class HermesApiStatusError extends Error {
+  readonly status: number
+
+  constructor(path: string, status: number) {
+    super(`Hermes API ${path} failed: ${status}`)
+    this.name = 'HermesApiStatusError'
+    this.status = status
+  }
+}
+
+function isApiStatus(error: unknown, status: number): boolean {
+  return error instanceof HermesApiStatusError && error.status === status
+}
+
 async function api<T>(request: SpikeApiRequest, responseType: 'json' | 'response' = 'json'): Promise<T> {
   const url = new URL(request.path, BASE_URL)
 
@@ -739,7 +756,7 @@ async function api<T>(request: SpikeApiRequest, responseType: 'json' | 'response
       credentials: 'include'
     })
 
-    if (!res.ok) {throw new Error(`Hermes API ${request.path} failed: ${res.status}`)}
+    if (!res.ok) {throw new HermesApiStatusError(request.path, res.status)}
 
     if (responseType === 'response') {
       return res as T
@@ -750,6 +767,137 @@ async function api<T>(request: SpikeApiRequest, responseType: 'json' | 'response
     return (text ? JSON.parse(text) : undefined) as T
   } finally {
     clearTimeout(timer)
+  }
+}
+
+// ── Desktop-plugin door ─────────────────────────────────────────────────────
+// Electron answers these five members from its main process (electron/fs-ipc.ts
+// + electron/desktop-plugin-install.ts). A browser tab has no main process, so
+// they proxy to the opt-in `web-desktop-bridge` backend plugin:
+//   GET  desktop-plugins-root / agent-plugins-root  -> { path }
+//   GET  read-plugin-source?path=                    -> HermesReadFileTextResult
+//   POST probe { identifier }                        -> PluginProbeResult
+//   POST desktop-install { identifier, force }       -> DesktopPluginInstallResult
+// all under /api/plugins/web-desktop-bridge/, token-gated like every /api route
+// (api() carries the session token and the 30s timeout ceiling).
+//
+// The plugin is opt-in, so every member must survive a backend that does not
+// mount these routes (plugin disabled, or an older backend) — a 404 — without
+// throwing into a caller that has no catch and without a request storm:
+//  - desktopPluginsRoot/agentPluginsRoot resolve to '' — the "no root" value
+//    contrib/runtime-loader.ts's diskRoots() and the onboarding runbook already
+//    treat as absent. They never reject (onboarding/setup-profile.ts awaits
+//    desktopPluginsRoot() with no catch). A 404 latches `bridgeAbsent` for the
+//    page's lifetime so the loader's 5s poll stops re-requesting a route that
+//    is not there; any later successful bridge call (e.g. a probe after the
+//    user enabled the plugin) clears it.
+//  - probePluginRepo/installDesktopPlugin resolve to `{ ok: false, error }`,
+//    matching the IPC handlers: plugin-install-modal.tsx calls both with no
+//    catch, so a rejection would strand the dialog in its probing state.
+//  - readPluginSource DOES reject on any non-2xx (403 outside the plugin
+//    roots, 404 missing, 413 over 16 MiB): the loader must see a real failure,
+//    never a partial or empty source to evaluate.
+//
+// Profile: desktopPluginsRoot and installDesktopPlugin deliberately send NO
+// profile. Electron's desktop-plugin root is app-level ("a desktop plugin
+// extends this app, not an agent" — fs-ipc.ts), and the install target must
+// be the very root the scan reads. agentPluginsRoot IS profile-scoped in
+// Electron (<HERMES_HOME>/profiles/<p>/plugins), so it carries the active
+// request profile like the shim's other profile-scoped calls.
+const BRIDGE_API = '/api/plugins/web-desktop-bridge'
+const BRIDGE_NOT_ENABLED = 'The web-desktop-bridge plugin is not enabled on this backend.'
+
+// Git clone + validation server-side budgets ~60s; the 30s api() default would
+// abort a legitimate slow clone first.
+const BRIDGE_GIT_TIMEOUT_MS = 90_000
+
+let bridgeAbsent = false
+let bridgeRootWarned = false
+
+interface SpikePathResult {
+  path?: unknown
+}
+
+async function bridgePluginsRoot(route: string, scope: { profile?: string }): Promise<string> {
+  if (bridgeAbsent) {
+    return ''
+  }
+
+  try {
+    const result = await api<SpikePathResult | undefined>({ path: `${BRIDGE_API}/${route}`, ...scope })
+    bridgeAbsent = false
+
+    return typeof result?.path === 'string' ? result.path : ''
+  } catch (error) {
+    if (isApiStatus(error, 404)) {
+      bridgeAbsent = true
+    } else if (!bridgeRootWarned) {
+      // Transient (5xx, timeout, offline): '' this pass, the next poll retries.
+      // Warn once, not on every 5s tick.
+      bridgeRootWarned = true
+      console.warn(`[web-bridge-shim] ${route} unavailable; on-disk desktop plugins skipped`, error)
+    }
+
+    return ''
+  }
+}
+
+const desktopPluginsRoot = (): Promise<string> => bridgePluginsRoot('desktop-plugins-root', {})
+
+const agentPluginsRoot = (): Promise<string> => bridgePluginsRoot('agent-plugins-root', activeProfileScope())
+
+// Rejects on every non-2xx (see above): api() throws HermesApiStatusError, so
+// a 413/403/404 reaches the loader as a real failure with `status` attached.
+const readPluginSource = (filePath: string): Promise<SpikeReadFileTextResult> =>
+  api<SpikeReadFileTextResult>({ path: `${BRIDGE_API}/read-plugin-source?path=${encodeURIComponent(filePath)}` })
+
+function bridgeFailureMessage(error: unknown): string {
+  if (isApiStatus(error, 404)) {
+    return BRIDGE_NOT_ENABLED
+  }
+
+  return error instanceof Error ? error.message : String(error)
+}
+
+function pluginIdentifier(payload: { identifier?: string; repo?: string } | undefined): string {
+  return String(payload?.identifier || payload?.repo || '').trim()
+}
+
+const probePluginRepo = async (payload: { identifier?: string; repo?: string }): Promise<SpikePluginProbeResult> => {
+  try {
+    const result = await api<SpikePluginProbeResult>({
+      path: `${BRIDGE_API}/probe`,
+      method: 'POST',
+      body: { identifier: pluginIdentifier(payload) },
+      timeoutMs: BRIDGE_GIT_TIMEOUT_MS
+    })
+
+    bridgeAbsent = false
+
+    return { ...result, warnings: result.warnings ?? [] }
+  } catch (error) {
+    return { ok: false, agent: false, desktop: false, warnings: [], error: bridgeFailureMessage(error) }
+  }
+}
+
+const installDesktopPlugin = async (payload: {
+  identifier?: string
+  repo?: string
+  force?: boolean
+}): Promise<SpikeDesktopPluginInstallResult> => {
+  try {
+    const result = await api<SpikeDesktopPluginInstallResult>({
+      path: `${BRIDGE_API}/desktop-install`,
+      method: 'POST',
+      body: { identifier: pluginIdentifier(payload), force: Boolean(payload?.force) },
+      timeoutMs: BRIDGE_GIT_TIMEOUT_MS
+    })
+
+    bridgeAbsent = false
+
+    return result
+  } catch (error) {
+    return { ok: false, error: bridgeFailureMessage(error) }
   }
 }
 
@@ -1022,14 +1170,16 @@ const shim = {
   readFileText: async (filePath: string) =>
     api<SpikeReadFileTextResult>({ path: `/api/fs/read-text?path=${encodeURIComponent(filePath)}` }),
 
+  // ── desktop-plugin door (web-desktop-bridge backend plugin) ─────────────
   // desktopPluginsRoot / agentPluginsRoot / readPluginSource and the
-  // probePluginRepo / installDesktopPlugin install door are OMITTED on this
-  // branch: the fork's /api/fs/desktop-plugins-root, /api/fs/read-plugin-source,
-  // /api/dashboard/plugins/probe and /api/dashboard/desktop-plugins/install
-  // backend routes have not been ported to upstream main. desktopPluginsRoot
-  // is the sentinel contrib/runtime-loader.ts gates its whole disk scan on,
-  // and plugin-install-modal.tsx renders its honest "unavailable" copy when
-  // probePluginRepo is absent.
+  // probePluginRepo / installDesktopPlugin install door. See the
+  // "Desktop-plugin door" block above for the routes and how each member
+  // degrades when the opt-in backend plugin is not enabled.
+  desktopPluginsRoot,
+  agentPluginsRoot,
+  readPluginSource,
+  probePluginRepo,
+  installDesktopPlugin,
 
   // ── first-render adjacents ───────────────────────────────────────────────
   onPreviewFileChanged: unsub,
@@ -1278,8 +1428,7 @@ const shim = {
 
   // OMITTED ON PURPOSE (consumers optional-chained/feature-gated): terminal,
   // git, petOverlay, hud, quickEntry, wakeIndicator, zoom, uninstall,
-  // installDesktopPlugin, probePluginRepo, desktopPluginsRoot, introReveal,
-  // minimizeToTray, getConnectionFor,
+  // introReveal, minimizeToTray, getConnectionFor,
   // mcpOauth (browser popup fallback lives in lib/mcp-dashboard-oauth.ts
   // instead — no loopback listener possible from a tab), cloud, connections,
   // settings, findInPage*, onBootstrapEvent (the install overlay's sentinel —
@@ -1304,7 +1453,12 @@ const shim = {
   // and hands folder-churn detection to runtime-loader.ts's 5s poll fallback
   // instead of a push notification; disk plugins (account-limits included)
   // still discover and load correctly on the initial scan/poll via
-  // desktopPluginsRoot/agentPluginsRoot + readDir/readPluginSource above.
+  // desktopPluginsRoot/agentPluginsRoot + readDir/readPluginSource above —
+  // when the web-desktop-bridge backend plugin is enabled. Without it those
+  // members answer '' / { ok: false } (see the "Desktop-plugin door" block)
+  // and the disk door stays empty, as before. removeDesktopPlugin,
+  // reconcileDesktopPlugins and openDir remain omitted: the bridge plugin
+  // serves no route for them and every caller optional-chains the method.
 }
 
 ;(window as unknown as { hermesDesktop: unknown }).hermesDesktop = shim
