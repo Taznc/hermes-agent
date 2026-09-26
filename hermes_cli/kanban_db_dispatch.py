@@ -1519,12 +1519,13 @@ def check_respawn_guard(
     ).fetchone()
     if recent_completed:
         completed_at = int(recent_completed["ended_at"] or 0)
+        from hermes_cli.kanban_db_dispatch_pr_recovery import REQUEUE_EVENT_KINDS
         requeued_after = conn.execute(
             "SELECT 1 FROM task_events "
             "WHERE task_id = ? AND created_at >= ? "
-            "AND kind IN ('status', 'promoted', 'unblocked', 'reclaimed') "
+            f"AND kind IN ({','.join('?' * len(REQUEUE_EVENT_KINDS))}) "
             "LIMIT 1",
-            (task_id, completed_at),
+            (task_id, completed_at, *REQUEUE_EVENT_KINDS),
         ).fetchone()
         if not requeued_after:
             return "recent_success"
@@ -1546,7 +1547,9 @@ def check_respawn_guard(
     assignee = row["assignee"]
     own_repo_slug = _task_own_repo_slug(conn, task_id)
     pr_cutoff = now - _RESPAWN_GUARD_PR_WINDOW
-    from hermes_cli.kanban_db_dispatch_pr_recovery import pr_recovery_after_run
+    from hermes_cli.kanban_db_dispatch_pr_recovery import (
+        pr_recovery_after_requeue, pr_recovery_after_run,
+    )
 
     recovered_urls: set[str] = set()
     for c in conn.execute(
@@ -1559,7 +1562,15 @@ def check_respawn_guard(
             cited_slug = f"{match.group('owner')}/{match.group('repo')}".lower()
             if own_repo_slug is not None and cited_slug != own_repo_slug:
                 continue
-            recovery = pr_recovery_after_run(latest_run, c["created_at"], assignee, now)
+            # Same escape as ``recent_success`` above: a board-driven requeue
+            # after the evidence (promotion once parents land, unblock,
+            # reclaim, manual status change) is a deliberate re-run. Without
+            # it a card that cited its PR and then waited on dependencies
+            # sits unspawnable for the full window after they land, and
+            # wedges every card downstream of it.
+            recovery = pr_recovery_after_requeue(conn, task_id, c["created_at"])
+            if recovery is None:
+                recovery = pr_recovery_after_run(latest_run, c["created_at"], assignee, now)
             if recovery is not None and recovery["eligible"]:
                 recovered_urls.add(match.group(0))
                 if pr_recovery is not None:
