@@ -2,9 +2,12 @@
 
 Reached from ONE upstream line: the ``dispatcher-standby`` FORK ANCHOR at the
 top of ``gateway.kanban_watchers.GatewayKanbanWatchersMixin._kanban_dispatcher_watcher``.
-The upstream body after that anchor is the shadowed reference implementation;
-``tests/hermes_fork/kanban/test_dispatcher_standby.py`` pins its source hash so
-an upstream sync that edits it fails loudly and gets re-ported here.
+The upstream body after that anchor (and ``_kanban_dispatcher_boot``) is
+unreachable while the anchor is present; it is kept as the reference this module
+ports. Upstream-sync owner: when a ``next`` <- ``upstream/main`` merge touches
+``gateway/kanban_watchers.py`` or ``gateway/kanban_watchers_dispatcher.py``,
+diff that dispatcher body and port behaviour changes here.
+``test_anchor_routes_watcher_to_fork_runtime`` proves the anchor is live.
 
 What this changes relative to upstream ``next``:
 
@@ -30,11 +33,18 @@ What this changes relative to upstream ``next``:
   ``phase_elapsed_seconds``, ``stalled``). Snapshots are payload-free: no task
   ids, board names, paths or error text.
 
-Observable at ``runner._fork_kanban_dispatcher_health.snapshot()`` and in
-``<HERMES_HOME>/state/kanban_dispatcher_health.json``, rewritten by a loop timer
-every ``_PUBLISH_PERIOD_S`` (so a hung dispatch thread still shows as a growing
-``phase_elapsed_seconds``) and at every role change / completed tick. A reader
-must check ``pid`` is alive and ``written_at`` is fresh before trusting it.
+Observable per watcher at ``runner._fork_kanban_dispatcher_health.snapshot()``
+(every role, including standby and disabled), and machine-wide in the leader
+view ``<kanban_home>/kanban/.dispatcher_health.json`` next to the dispatcher
+lock. That file has exactly one writer: the watcher currently holding the lock;
+a standby never writes it. It is rewritten by a loop timer every
+``_PUBLISH_PERIOD_S`` (so a hung dispatch thread still shows as a growing
+``phase_elapsed_seconds``) and at every role change / completed tick, and the
+leader's final ``stopped`` record is written BEFORE the lock is released, so a
+promoted standby's record is never overwritten by its predecessor. ``watcher``
+names the writing watcher run. A reader must check ``pid`` is alive and
+``written_at`` is fresh: a crashed leader leaves its last record until a
+standby promotes and overwrites it.
 
 Ported from frozen ``dev`` f6cfcb0bb8 (standby) and 7175e94c81 (telemetry),
 re-implemented at T1 instead of inline. Not ported: dev's per-tick live settings
@@ -49,6 +59,7 @@ import json
 import math
 import os
 import time
+import uuid
 from pathlib import Path
 from typing import Any, Callable, Iterable, Optional
 
@@ -67,7 +78,7 @@ from gateway.kanban_watchers_dispatcher import (
 
 HEALTH_ATTR = "_fork_kanban_dispatcher_health"
 _ACTIVE_ATTR = "_fork_kanban_dispatcher_active"
-SNAPSHOT_FILENAME = "kanban_dispatcher_health.json"
+SNAPSHOT_FILENAME = ".dispatcher_health.json"
 
 _HEALTH_WINDOW = 6  # consecutive ready-but-no-spawn ticks before the "stuck" warning
 _LEADER_START_DELAY_S = 5.0  # let adapters wire up before the first spawn (upstream parity)
@@ -89,8 +100,9 @@ class DispatcherHealth:
         self._durations: dict[str, float] = {}
         self._last_report: Optional[float] = None
         self._last_stall_report: Optional[float] = None
+        self.watcher_id = uuid.uuid4().hex[:12]
         self._state: dict[str, Any] = {
-            "role": "candidate", "lock_state": None, "standby_attempts": 0,
+            "watcher": self.watcher_id, "role": "candidate", "lock_state": None, "standby_attempts": 0,
             "standby_since": None, "leader_since": None,
             "attempted_ticks": 0, "completed_ticks": 0,
             "last_attempt_at": None, "last_finished_at": None,
@@ -202,15 +214,21 @@ class DispatcherHealth:
 
 
 def snapshot_path() -> Path:
-    from hermes_constants import get_hermes_home
-    return get_hermes_home() / "state" / SNAPSHOT_FILENAME
+    """Leader view, in the same kanban home as the lock that elects its writer."""
+    from hermes_cli import kanban_db as kb
+    return kb.kanban_home() / "kanban" / SNAPSHOT_FILENAME
 
 
 class _Publisher:
-    """Rewrites the snapshot file from a loop timer, independent of tick progress."""
+    """Rewrites the leader view from a loop timer, independent of tick progress.
 
-    def __init__(self, health: DispatcherHealth, path: Path) -> None:
-        self.health, self.path = health, path
+    Writes only while ``owns_lock()``, so the OS lock elects the single writer.
+    Check-then-write cannot race: ownership is dropped only by this watcher's own
+    release, which also runs on the loop thread.
+    """
+
+    def __init__(self, health: DispatcherHealth, path: Path, owns_lock: Callable[[], bool]) -> None:
+        self.health, self.path, self.owns_lock = health, path, owns_lock
         self._handle: Optional[asyncio.TimerHandle] = None
         self._failed = False
 
@@ -234,6 +252,8 @@ class _Publisher:
         self.publish()
 
     def publish(self) -> None:
+        if not self.owns_lock():
+            return
         # Tiny file on the loop thread by design: a saturated default executor
         # (the very stall this reports) must not stop the report.
         data = {**self.health.snapshot(), "pid": os.getpid(), "written_at": time.time()}
@@ -402,7 +422,7 @@ async def run_watcher(runner: Any) -> None:
     setattr(runner, _ACTIVE_ATTR, True)
     health = DispatcherHealth()
     setattr(runner, HEALTH_ATTR, health)
-    publisher = _Publisher(health, snapshot_path())
+    publisher = _Publisher(health, snapshot_path(), runner._owns_kanban_dispatcher_lock)
     publisher.start()
     service = _Service(health)
 
@@ -418,11 +438,11 @@ async def run_watcher(runner: Any) -> None:
             return
         if fut is not None:
             fut.exception()  # consume; the watcher already logged or was cancelled
-        runner._release_kanban_dispatcher_lock()
-        setattr(runner, _ACTIVE_ATTR, False)
         if health.snapshot()["role"] != "disabled":
             health.end("stopped")
-        publisher.stop()
+        publisher.stop()  # final leader record while the lock is still held
+        runner._release_kanban_dispatcher_lock()
+        setattr(runner, _ACTIVE_ATTR, False)
 
     try:
         await _lead(runner, health, service, publisher.publish)

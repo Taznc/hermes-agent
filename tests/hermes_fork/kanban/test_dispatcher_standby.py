@@ -10,8 +10,6 @@ models the leader exiting. Only tick cadence is shortened.
 from __future__ import annotations
 
 import asyncio
-import hashlib
-import inspect
 import json
 import logging
 import os
@@ -126,25 +124,20 @@ def snapshot_file() -> dict:
 
 # -- anchor ----------------------------------------------------------------
 
-# sha256 of the upstream dispatcher body the anchor shadows. If an upstream sync
-# changes it, re-read the diff and port any behavior change into
-# hermes_fork/kanban/dispatcher_standby.py before updating this hash.
-_SHADOWED_UPSTREAM_SHA256 = "e99c55167196e8e4e401d1d188d6052a20425f0c8b3ce0c74b25e1e22fb1c71e"
+@pytest.mark.asyncio
+async def test_anchor_routes_watcher_to_fork_runtime(monkeypatch):
+    """The upstream entry point must reach run_watcher and never the shadowed body."""
+    seen: list = []
 
+    async def fork_watcher(runner):
+        seen.append(runner)
 
-def _shadowed_upstream_source() -> str:
-    watcher = inspect.getsource(GatewayKanbanWatchersMixin._kanban_dispatcher_watcher)
-    head, _, rest = watcher.partition("# >>> FORK ANCHOR: dispatcher-standby <<<")
-    assert rest, "dispatcher-standby FORK ANCHOR missing from _kanban_dispatcher_watcher"
-    _, _, body = rest.partition("# <<< FORK ANCHOR >>>")
-    return inspect.getsource(GatewayKanbanWatchersMixin._kanban_dispatcher_boot) + head + body
-
-
-def test_shadowed_upstream_dispatcher_unchanged_since_port():
-    digest = hashlib.sha256(_shadowed_upstream_source().encode()).hexdigest()
-    assert digest == _SHADOWED_UPSTREAM_SHA256, (
-        "upstream _kanban_dispatcher_boot/_kanban_dispatcher_watcher changed: port the "
-        f"change into hermes_fork.kanban.dispatcher_standby, then set the hash to {digest}")
+    monkeypatch.setattr(ds, "run_watcher", fork_watcher)
+    monkeypatch.setattr(GatewayKanbanWatchersMixin, "_kanban_dispatcher_boot",
+                        lambda self: pytest.fail("shadowed upstream dispatcher body ran"))
+    runner = Runner()
+    await asyncio.wait_for(runner._kanban_dispatcher_watcher(), 1)
+    assert seen == [runner]
 
 
 # -- leadership --------------------------------------------------------------
@@ -199,7 +192,7 @@ async def test_contended_gateway_stands_by_then_promotes_when_leader_exits(env, 
             assert ticks == [] and not runner._owns_kanban_dispatcher_lock()
             assert snap["stalled"] is False, "standby is not a stall"
             assert sum("standing by" in r.getMessage() for r in caplog.records) == 1, "log once, not per retry"
-            assert snapshot_file()["role"] == "standby"
+            assert not ds.snapshot_path().exists(), "a standby must never write the leader view"
 
             other.exit()  # leader exit -> standby promotion
             await until(lambda: ticks, what="promoted dispatch tick")
@@ -207,6 +200,8 @@ async def test_contended_gateway_stands_by_then_promotes_when_leader_exits(env, 
             assert snap["role"] == "leader" and snap["leader_since"] is not None
             assert runner._owns_kanban_dispatcher_lock()
             assert any("assumed leadership after standby" in r.getMessage() for r in caplog.records)
+            await until(lambda: snapshot_file()["role"] == "leader", what="promoted leader view")
+            assert snapshot_file()["watcher"] == snap["watcher"]
         finally:
             if other.proc.poll() is None:
                 other.exit()
@@ -228,10 +223,32 @@ async def test_two_watchers_never_lead_concurrently(env):
         leader, follower, lt = (a, b, ta) if a.health.snapshot()["role"] == "leader" else (b, a, tb)
         for _ in range(20):
             assert [a._owns_kanban_dispatcher_lock(), b._owns_kanban_dispatcher_lock()].count(True) == 1
+            # Single writer: the shared leader view only ever names the lock holder.
+            if ds.snapshot_path().exists():
+                assert snapshot_file()["watcher"] == leader.health.snapshot()["watcher"]
             await asyncio.sleep(0.01)
-        await stop(leader, lt)
-        await until(lambda: follower.health.snapshot()["role"] == "leader", what="follower promotion")
+        writes: list[dict] = []
+        real_replace = os.replace
+
+        def recording_replace(src, dst):
+            real_replace(src, dst)
+            if Path(dst) == ds.snapshot_path():
+                writes.append(snapshot_file())
+
+        with pytest.MonkeyPatch.context() as mp:
+            mp.setattr(ds.os, "replace", recording_replace)
+            await stop(leader, lt)
+            await until(lambda: follower.health.snapshot()["role"] == "leader", what="follower promotion")
+            await until(lambda: writes and writes[-1]["role"] == "leader", what="promoted leader view")
+            await asyncio.sleep(ds._PUBLISH_PERIOD_S * 3)
         assert follower._owns_kanban_dispatcher_lock() and not leader._owns_kanban_dispatcher_lock()
+        old_id, new_id = leader.health.snapshot()["watcher"], follower.health.snapshot()["watcher"]
+        writers = [w["watcher"] for w in writes]
+        first_new = writers.index(new_id)
+        # Predecessor's writes all precede the promoted leader's; its last one is "stopped".
+        assert set(writers[:first_new]) == {old_id} and old_id not in writers[first_new:]
+        assert writes[first_new - 1]["role"] == "stopped"
+        assert snapshot_file()["watcher"] == new_id and snapshot_file()["role"] == "leader"
     finally:
         a._running = b._running = False
         await asyncio.wait_for(asyncio.gather(ta, tb), 5)
