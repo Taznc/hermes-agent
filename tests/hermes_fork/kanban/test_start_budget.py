@@ -281,7 +281,7 @@ def test_max_in_progress_stays_an_independent_concurrency_cap(env):
     assert len(third.spawned) == 1
 
 
-@pytest.mark.parametrize("value", [None, 0, -3, "six", True, ""])
+@pytest.mark.parametrize("value", [None, 0, -3, "six", True, "", 1.5, 0.5, "1.5", float("nan"), float("inf")])
 def test_budget_off_leaves_upstream_behaviour_unchanged(env, value):
     conn, cfg, _clock, _spawned, spawn = env
     cfg["dispatch_start_budget"] = value
@@ -293,12 +293,44 @@ def test_budget_off_leaves_upstream_behaviour_unchanged(env, value):
     assert all(_deferred(conn, t) == [] for t in ids)
 
 
+def test_integral_float_budget_is_accepted(env):
+    """YAML ``2.0`` is an integer value, not a fractional one: it enforces 2."""
+    conn, cfg, _clock, spawned, spawn = env
+    cfg["dispatch_start_budget"] = 2.0
+    _new(conn, 3)
+    res = _tick(conn, spawn)
+    assert len(res.spawned) == 2
+    _finish(conn, *[t for t, *_ in res.spawned])
+    assert _tick(conn, spawn).spawned == []
+    assert len(spawned) == 2
+
+
 def test_invalid_window_falls_back_to_default(env):
     _conn, cfg, *_ = env
-    cfg["dispatch_start_window_seconds"] = "soon"
-    assert start_budget.settings() == (2, start_budget.DEFAULT_WINDOW_SECONDS)
-    cfg["dispatch_start_window_seconds"] = 0
-    assert start_budget.settings() == (2, start_budget.DEFAULT_WINDOW_SECONDS)
+    for bad in ("soon", 0, 1.5, "1.5", float("nan")):
+        cfg["dispatch_start_window_seconds"] = bad
+        assert start_budget.settings() == (2, start_budget.DEFAULT_WINDOW_SECONDS), bad
+
+
+def test_fractional_window_holds_for_the_default_window_not_a_truncated_one(env):
+    """``1.5`` must not become a 1-second window that lets starts through at once."""
+    conn, cfg, clock, spawned, spawn = env
+    cfg["dispatch_start_window_seconds"] = 1.5
+    a, b, c = _new(conn, 3)
+
+    first = _tick(conn, spawn)
+    assert [t for t, *_ in first.spawned] == [a, b]
+    _finish(conn, a, b)
+
+    clock.now = T0 + 2  # a truncated 1s window would already have expired
+    assert _tick(conn, spawn).spawned == []
+    (held,) = _deferred(conn, c)
+    assert held["window_seconds"] == start_budget.DEFAULT_WINDOW_SECONDS
+    assert held["next_eligible_at"] == T0 + start_budget.DEFAULT_WINDOW_SECONDS + 1
+
+    clock.now = T0 + start_budget.DEFAULT_WINDOW_SECONDS + 1
+    assert [t for t, *_ in _tick(conn, spawn).spawned] == [c]
+    assert spawned == [a, b, c]
 
 
 # -------------------------------------------------------------- contention

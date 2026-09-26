@@ -69,6 +69,9 @@ def settings() -> tuple[Optional[int], int]:
 def _positive(value: Any) -> Optional[int]:
     if isinstance(value, bool):
         return None
+    # int() truncates, so 1.5 would silently become a live budget/window of 1.
+    if isinstance(value, float) and not value.is_integer():
+        return None
     try:
         parsed = int(value)
     except (TypeError, ValueError):
