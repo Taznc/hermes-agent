@@ -670,15 +670,15 @@ def _classify_dead_worker(
     # ``kanban.count_infra_failures=true`` restores pre-classification
     # behaviour wholesale: every death that WOULD be infra-classified is
     # instead routed through the ordinary legit/counted path below.
-    if kind in ("signaled", "nonzero_exit", "unknown") and not _count_infra_failures_enabled():
+    if kind in ("signaled", "nonzero_exit", "unknown") and not _kb._count_infra_failures_enabled():
         infra_category, infra_reason = classify_infra_exit(
             exit_kind=kind,
             signal_number=code if kind == "signaled" else None,
             dispatcher_killed=dispatcher_killed,
             within_startup_window=(
                 kind == "unknown"
-                and _dispatcher_uptime_seconds() is not None
-                and _dispatcher_uptime_seconds() <= _resolve_infra_startup_window_seconds()
+                and _kb._dispatcher_uptime_seconds() is not None
+                and _kb._dispatcher_uptime_seconds() <= _kb._resolve_infra_startup_window_seconds()
             ),
             quota_signal_dict=quota_signal_dict,
         )
@@ -798,16 +798,16 @@ def _reclaim_dead_workers(
                         board=board or _kb.get_current_board(),
                         task_id=row["id"],
                         reason="quota",
-                        max_seconds=_resolve_provider_backoff_max_seconds(),
+                        max_seconds=_kb._resolve_provider_backoff_max_seconds(),
                     )
                     if circuit is not None:
                         dead.event_payload["budget_group"] = circuit["group"]
                         dead.event_payload["host_resume_at"] = circuit["next_eligible_at"]
-                provider = _task_provider(conn, row["id"]) if _provider_backoff_enabled() else None
+                provider = _kb._task_provider(conn, row["id"]) if _kb._provider_backoff_enabled() else None
                 if provider:
                     until = register_provider_backoff(
                         conn, provider=provider, retry_after=retry_after, task_id=row["id"],
-                        max_seconds=_resolve_provider_backoff_max_seconds(),
+                        max_seconds=_kb._resolve_provider_backoff_max_seconds(),
                     )
                     if until is not None:
                         target_status = "scheduled"
@@ -919,7 +919,7 @@ def _account_infra_deaths(
     promoted: list[str] = []
     if not infra_details:
         return promoted
-    max_allowed = _resolve_max_infra_interruptions()
+    max_allowed = _kb._resolve_max_infra_interruptions()
     for tid, pid, claimer, error_text in infra_details:
         streak = increment_interruption_streak(conn, task_id=tid)
         if streak > max_allowed:
