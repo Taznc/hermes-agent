@@ -3471,3 +3471,7 @@ for _m in (
     _methods_connectors_account, _methods_display, _methods_display_watch, _methods_onboarding):
     _m.register(sys.modules[__name__])
 del _m
+
+# >>> FORK ANCHOR: gateway-fork-methods <<<
+from hermes_fork.gateway import register_fork_gateway_methods as _register_fork_gateway_methods  # noqa: E402
+_register_fork_gateway_methods(sys.modules[__name__])
