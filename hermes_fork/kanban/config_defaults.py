@@ -197,6 +197,12 @@ FORK_KANBAN_DEFAULTS = {
     # land_target — the conflict costs a full review round to report and one `git merge` to
     # fix. Skipped when the board sets no land_target or git cannot answer.
     "require_mergeable_for_review": True,
+    # Refuse a kanban_request_review handoff (first review and re-review alike) whose
+    # metadata lacks a usable `pre_review_gate` dict — non-empty `revision` (commit SHA or
+    # `patch:<path>`) and `tests` (focused tests/gates run + result). Other keys (lint,
+    # pushed, mergeable, acceptance) are accepted, not required. Off by default; the
+    # refusal is an actionable tool error and the card stays with the implementer.
+    "require_pre_review_gate": False,
     # Argv PREFIX prepended to every spawned worker command. Empty list (default) = today's
     # plain `subprocess.Popen(argv, ...)` on every platform (Windows, macOS, non-systemd
     # Linux) — byte-identical behaviour, nothing to configure. When non-empty, the dispatcher
