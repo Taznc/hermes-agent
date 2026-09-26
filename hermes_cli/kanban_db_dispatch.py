@@ -2052,6 +2052,11 @@ def _dispatch_lane_task(
     claimed = claim(conn, task_id, ttl_seconds=ttl_seconds)
     if claimed is None:
         return False
+    # >>> FORK ANCHOR: kanban-unattended-route-policy <<<
+    from hermes_fork.kanban.route_policy import deny_unapproved_route
+    if spawn_fn is None and deny_unapproved_route(conn, claimed, result, board=board):
+        return False
+    # <<< FORK ANCHOR >>>
     try:
         resolved_branch_name = None
         if claimed.workspace_kind == "worktree":
