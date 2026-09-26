@@ -39,7 +39,7 @@ import {
   clampToLane,
   edgeId,
   focusEdges,
-  revealDelta,
+  revealGroupDelta,
   routeArrows,
   sameArrows
 } from './board-arrows'
@@ -169,21 +169,27 @@ function onStroke(path: SVGPathElement, at: { x: number; y: number }): boolean {
   return path.isPointInStroke(point)
 }
 
-/** Scroll `view` along one axis just enough to show `el` (see `revealDelta`).
- *  A view with no layout yet (hidden pane, jsdom) is left alone. */
-function revealIn(view: HTMLElement | null, el: HTMLElement, axis: 'x' | 'y') {
+/** Scroll `view` along one axis just enough to show the `els` it holds (see
+ *  `revealGroupDelta`), keeping `anchor` in view when they don't all fit. A
+ *  view with no layout yet (hidden pane, jsdom) is left alone. */
+function revealIn(view: HTMLElement | null, els: readonly HTMLElement[], axis: 'x' | 'y', anchor?: HTMLElement) {
   const box = view?.getBoundingClientRect()
 
-  if (!view || !box || box.width === 0 || box.height === 0) {
+  if (!view || !box || box.width === 0 || box.height === 0 || els.length === 0) {
     return
   }
 
-  const rect = el.getBoundingClientRect()
+  const span = (el: HTMLElement) => {
+    const rect = el.getBoundingClientRect()
 
-  const delta =
-    axis === 'y'
-      ? revealDelta({ end: rect.bottom, start: rect.top }, { end: box.bottom, start: box.top })
-      : revealDelta({ end: rect.right, start: rect.left }, { end: box.right, start: box.left })
+    return axis === 'y' ? { end: rect.bottom, start: rect.top } : { end: rect.right, start: rect.left }
+  }
+
+  const delta = revealGroupDelta(
+    els.map(span),
+    axis === 'y' ? { end: box.bottom, start: box.top } : { end: box.right, start: box.left },
+    anchor ? span(anchor) : undefined
+  )
 
   if (delta !== 0) {
     view[axis === 'y' ? 'scrollTop' : 'scrollLeft'] += delta
@@ -220,24 +226,48 @@ export function BoardDependencyArrows({
 
   const endpoints = useMemo(() => new Set(edges.flat()), [edges])
 
-  // Keep the focused card on screen. Opening the answer bar pushes the lane
-  // strip down by the bar's height, and the focused card grows its roll-up, so
-  // a card clicked near the bottom of its lane would otherwise land below the
-  // fold — every line then aims at a lane edge instead of the card. Clicking
-  // an answer-bar row can also focus a card scrolled out of view. Runs before
-  // the measure below, in the same commit as the bar, so the first paint
-  // already has the card (and its lines) in place.
+  // Bring the whole trace on screen: the focused card AND every card it links
+  // to, in every lane. Without this the user scrolls each lane hunting for
+  // the far end of each line. Opening the answer bar also pushes the strip
+  // down by the bar's height, so the focused card itself can drop below the
+  // fold, and clicking an answer-bar row can focus a card scrolled out of view.
+  //
+  // Each lane scrolls once, for the linked cards it holds (the focused card
+  // wins when they don't all fit). Then the strip scrolls sideways for the
+  // focused card plus as many linked lanes as fit around it. Keyed on the
+  // endpoint set, so it re-runs when the trace grows (Full chain) but never
+  // on a plain re-measure, and it never fights the user scrolling afterwards.
+  // Runs before the measure below, in the same commit as the bar, so the
+  // first paint already has the cards (and their lines) in place.
   useLayoutEffect(() => {
     const strip = stripRef.current
-    const card = focused && strip ? cardEl(strip, focused) : undefined
+    const focusCardEl = focused && strip ? cardEl(strip, focused) : undefined
 
-    if (!strip || !card) {
+    if (!strip || !focusCardEl) {
       return
     }
 
-    revealIn(card.closest<HTMLElement>(`[${LANE_SCROLLER_ATTR}]`), card, 'y')
-    revealIn(strip, card, 'x')
-  }, [focused, stripRef])
+    const keys = new Set([focused!, ...endpoints])
+
+    const cards = Array.from(strip.querySelectorAll<HTMLElement>(`[${CARD_KEY_ATTR}]`)).filter(el =>
+      keys.has(el.getAttribute(CARD_KEY_ATTR)!)
+    )
+
+    const byLane = new Map<HTMLElement, HTMLElement[]>()
+
+    for (const card of cards) {
+      const lane = card.closest<HTMLElement>(`[${LANE_SCROLLER_ATTR}]`)
+
+      if (lane) {
+        byLane.set(lane, [...(byLane.get(lane) ?? []), card])
+      }
+    }
+
+    byLane.forEach((laneCards, lane) =>
+      revealIn(lane, laneCards, 'y', laneCards.includes(focusCardEl) ? focusCardEl : undefined)
+    )
+    revealIn(strip, cards, 'x', focusCardEl)
+  }, [endpoints, focused, stripRef])
 
   // Layout effect: the first measure lands before paint, so a trace never
   // flashes line-less.

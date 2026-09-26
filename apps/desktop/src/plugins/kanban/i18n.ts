@@ -293,6 +293,9 @@ type KanbanMessages = {
   depFocusUpstream: string
   depFocusDownstream: string
   depClearFocus: string
+  /** The "+N cards" marker a focused trace folds unrelated lane cards into. */
+  depGap: (n: number) => string
+  depGapShow: string
   /** Focus depth toggle + graph overlay. */
   depFocusDirect: string
   depFocusChain: string
@@ -678,7 +681,8 @@ export const en: KanbanMessages = {
   guideBlockedManualTransient: 'A transient failure blocked this — it may clear on its own; unblock to retry.',
   guideBlockedAutomatic: cause => `${cause} Inspect the worker log, then retry or reassign.`,
   guideBlockedReviewNoVerdict: 'The reviewer exited without a verdict. Requeue it for another review pass.',
-  guideBlockedReviewRoundCap: 'Review rounds are exhausted — reassign, rescope, or archive it instead of simply retrying.',
+  guideBlockedReviewRoundCap:
+    'Review rounds are exhausted — reassign, rescope, or archive it instead of simply retrying.',
   guideBlockedUnknown: 'Inspect the worker log, then retry or reassign it.',
   guideIdea: 'Rough idea — refine it into a roadmap item when ready.',
   guideRoadmap: 'Specified, not yet authorized — spawn to Triage to start work.',
@@ -729,6 +733,8 @@ export const en: KanbanMessages = {
   depFocusUpstream: 'blocks this',
   depFocusDownstream: 'waits on this',
   depClearFocus: 'Clear focus',
+  depGap: n => (n === 1 ? '+1 card' : `+${n} cards`),
+  depGapShow: 'Not linked to the focused card — click to show',
   depFocusDirect: 'Direct links',
   depFocusChain: 'Full chain',
   depFocused: 'Focused',
@@ -1100,7 +1106,8 @@ const ja: KanbanMessages = {
     '一時的な失敗によりブロックされました — 自然に解消することがあります。ブロック解除して再試行してください。',
   guideBlockedAutomatic: cause => `${cause} ワーカーログを確認し、再試行するか再割り当てしてください。`,
   guideBlockedReviewNoVerdict: 'レビュアーが判定なしで終了しました。もう一度レビューへ再キューしてください。',
-  guideBlockedReviewRoundCap: 'レビュー往復の上限に達しました — 単に再試行せず、担当変更・範囲の見直し・アーカイブを検討してください。',
+  guideBlockedReviewRoundCap:
+    'レビュー往復の上限に達しました — 単に再試行せず、担当変更・範囲の見直し・アーカイブを検討してください。',
   guideBlockedUnknown: 'ワーカーログを確認し、再試行するか再割り当てしてください。',
   guideIdea: 'ラフなアイデアです — 準備ができたらロードマップ項目に整えてください。',
   guideRoadmap: '仕様は固まっていますが未承認です — トリアージへスポーンすると作業が始まります。',
@@ -1151,6 +1158,8 @@ const ja: KanbanMessages = {
   depFocusUpstream: 'これをブロック',
   depFocusDownstream: 'これを待機',
   depClearFocus: 'フォーカス解除',
+  depGap: n => `+${n} 件`,
+  depGapShow: 'フォーカス中のカードとは無関係です — クリックで表示',
   depFocusDirect: '直接リンク',
   depFocusChain: '全チェーン',
   depFocused: 'フォーカス中',
@@ -1567,6 +1576,8 @@ const zh: KanbanMessages = {
   depFocusUpstream: '阻塞它',
   depFocusDownstream: '等待它',
   depClearFocus: '清除聚焦',
+  depGap: n => `+${n} 张卡片`,
+  depGapShow: '与聚焦卡片无关 — 点击显示',
   depFocusDirect: '直接链接',
   depFocusChain: '完整链路',
   depFocused: '当前聚焦',
@@ -1980,6 +1991,8 @@ const zhHant: KanbanMessages = {
   depFocusUpstream: '阻擋它',
   depFocusDownstream: '等待它',
   depClearFocus: '清除聚焦',
+  depGap: n => `+${n} 張卡片`,
+  depGapShow: '與聚焦卡片無關 — 點擊顯示',
   depFocusDirect: '直接連結',
   depFocusChain: '完整鏈路',
   depFocused: '目前聚焦',

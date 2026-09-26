@@ -52,7 +52,7 @@ import {
 import { ArchiveDoneControl } from './archive-done-control'
 import { $hotEdge, BoardDependencyArrows, type FocusDepth } from './board-arrows-layer'
 import { BoardSwitcher } from './board-switcher'
-import { BoardInfoContext, Column, EMPTY_BOARD_INFO } from './card'
+import { BoardInfoContext, Column, EMPTY_BOARD_INFO, LANE_GAP_ATTR } from './card'
 import { DependencyContext, type DependencyView, EMPTY_IDS } from './dependency-view'
 import { buildGraph, cardKey, chainSets, focusSets, indexBoard, parseCardKey, taskCardKey } from './deps'
 import { TaskDrawer } from './drawer'
@@ -1009,7 +1009,11 @@ export function KanbanBoardPage() {
               onClickCapture={event => {
                 const target = event.target as Element
 
-                if (focused && !$hotEdge.get() && !target.closest('[draggable="true"], [data-board-arrows]')) {
+                if (
+                  focused &&
+                  !$hotEdge.get() &&
+                  !target.closest(`[draggable="true"], [data-board-arrows], [${LANE_GAP_ATTR}]`)
+                ) {
                   setFocused(null)
                 }
               }}
