@@ -20,13 +20,16 @@ import type { SessionInfo } from '@/types/hermes'
 
 import { $pinnedSessionIds, $sidebarGrouping, $sidebarShowArchived, setSidebarGrouping, setSidebarShowArchived } from './layout'
 import { $projectTree } from './projects'
-import { $sessions, mergeSessionPage } from './session'
+import { $cronSessions, $messagingSessions, $sessions, mergeSessionPage, setCronSessions, setMessagingSessions } from './session'
 import { $archivedSessions } from './sidebar-archive'
 import {
+  $sidebarMessagingGroups,
   $sidebarPinnedSessions,
   $sidebarProjectModel,
   $sidebarScopedSessions,
   $sidebarUnpinnedAgentSessions,
+  $sidebarVisibleCronSessions,
+  $sidebarVisibleMessagingSessions,
   $sidebarWorktreeGroupingActive
 } from './sidebar-model'
 
@@ -44,6 +47,8 @@ describe('sidebar archived-row scoping', () => {
     $projectTree.set([])
     $sidebarShowArchived.set(false)
     $pinnedSessionIds.set([])
+    $cronSessions.set([])
+    $messagingSessions.set([])
     setSidebarGrouping('date')
   })
 
@@ -53,6 +58,8 @@ describe('sidebar archived-row scoping', () => {
     $projectTree.set([])
     $sidebarShowArchived.set(false)
     $pinnedSessionIds.set([])
+    $cronSessions.set([])
+    $messagingSessions.set([])
     setSidebarGrouping('date')
   })
 
@@ -169,6 +176,67 @@ describe('sidebar archived-row scoping', () => {
       setSidebarShowArchived(true)
 
       expect($sidebarScopedSessions.get().map(session => session.id)).toContain(x.id)
+    })
+  })
+
+  // Regression (round-2 review, t_d0a6300e finding 2): the Cron and Messaging
+  // sidebar sections, and everything downstream of them (Pinned via
+  // `$sidebarSessionByAnyId`, the per-platform Messaging groups), read the raw
+  // `$cronSessions`/`$messagingSessions` stores directly and had no archive
+  // guard of their own — only the flat Recents / project-tree path did. A
+  // cron run or messaging thread archived by another surface, while this
+  // client's cache still holds a stale `archived: false` copy (same class of
+  // leak as the mergeSessionPage-survivor case above), stayed visible in
+  // those sections even with the Archived filter off.
+  describe('cron and messaging sections honor the same centralized policy', () => {
+    it('drops a stale archived=false cron row from the Cron section', () => {
+      const x = row('cron-external-archive-X', { archived: false, source: 'cron' })
+
+      setCronSessions([x])
+      $archivedSessions.set([row(x.id, { archived: true })])
+
+      expect($sidebarVisibleCronSessions.get().map(session => session.id)).not.toContain(x.id)
+    })
+
+    it('drops a stale archived=false messaging row from the Messaging section and its groups', () => {
+      const x = row('msg-external-archive-X', { archived: false, source: 'telegram' })
+
+      setMessagingSessions([x])
+      $archivedSessions.set([row(x.id, { archived: true })])
+
+      expect($sidebarVisibleMessagingSessions.get().map(session => session.id)).not.toContain(x.id)
+      expect($sidebarMessagingGroups.get().flatMap(group => group.sessions.map(session => session.id))).not.toContain(
+        x.id
+      )
+    })
+
+    it('a stale archived cron/messaging row cannot resurface via Pinned', () => {
+      const cronRow = row('cron-external-archive-X', { archived: false, source: 'cron' })
+      const messagingRow = row('msg-external-archive-X', { archived: false, source: 'telegram' })
+
+      setCronSessions([cronRow])
+      setMessagingSessions([messagingRow])
+      $archivedSessions.set([row(cronRow.id, { archived: true }), row(messagingRow.id, { archived: true })])
+      $pinnedSessionIds.set([cronRow.id, messagingRow.id])
+
+      const pinnedIds = $sidebarPinnedSessions.get().map(session => session.id)
+
+      expect(pinnedIds).not.toContain(cronRow.id)
+      expect(pinnedIds).not.toContain(messagingRow.id)
+    })
+
+    it('still shows cron/messaging rows once Archived is on and they are the canonical archived copy', () => {
+      const cronRow = row('cron-external-archive-X', { archived: false, source: 'cron' })
+
+      setCronSessions([cronRow])
+      $archivedSessions.set([row(cronRow.id, { archived: true })])
+      setSidebarShowArchived(true)
+
+      // Archived mode reads the archived-only store directly (not the
+      // cron/messaging sections), so the canonical archived copy must still
+      // be reachable there — the policy above must not also hide it in
+      // Archived mode.
+      expect($archivedSessions.get().map(session => session.id)).toContain(cronRow.id)
     })
   })
 })

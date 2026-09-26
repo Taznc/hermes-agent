@@ -719,6 +719,36 @@ describe('overlayLiveLanes', () => {
     expect(overlaid.sessionCount).toBe(0)
   })
 
+  it('rejects a stale archived=false row via an injected archive predicate (centralized policy case)', () => {
+    // Round-2 review finding 3 (t_d0a6300e): the bare-flag default
+    // (`session.archived === true`) cannot see a `mergeSessionPage`-retained
+    // row that is still stamped `archived: false` but is `archived: true` per
+    // the independent archived-only query. Production callers inject
+    // `$sidebarIsArchivedSession` for exactly this reason; this proves the
+    // injected predicate is actually consulted for placement, not just the
+    // bare flag.
+    const project = projectNode({
+      id: '/www/app',
+      isAuto: true,
+      repos: [{ id: '/www/app', label: 'app', path: '/www/app', sessionCount: 0, groups: [] }]
+    })
+
+    const stale = makeCwdSession('/www/app', { archived: false, git_branch: 'main', id: 'stale-archived-false' })
+    const archivedIds = new Set(['stale-archived-false'])
+    const isArchived = (session: SessionInfo) => session.archived === true || archivedIds.has(session.id)
+
+    const withoutPredicate = overlayLiveLanes(project, [stale])
+
+    expect(withoutPredicate.repos.flatMap(repo => repo.groups.flatMap(g => g.sessions)).map(s => s.id)).toEqual([
+      'stale-archived-false'
+    ])
+
+    const withPredicate = overlayLiveLanes(project, [stale], undefined, isArchived)
+
+    expect(withPredicate.repos.flatMap(repo => repo.groups.flatMap(g => g.sessions))).toEqual([])
+    expect(withPredicate.sessionCount).toBe(0)
+  })
+
   it('evicts an archived live session even from Home (isNoProject lane)', () => {
     const home = homeNode([])
     const live = [makeCwdSession(null, { archived: true, id: 'stale-archived' })]
