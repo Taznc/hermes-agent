@@ -2234,6 +2234,15 @@ def _update_preflight_handled(args) -> bool:
             branch_explicit=bool(getattr(args, "branch", None)),
         )
         return True
+
+    # Fork deploys: refuse when the checkout tracks a remote other than origin
+    # (the updater only ever pulls origin). See hermes_fork/update_guard.py.
+    from hermes_fork.update_guard import cross_remote_refusal
+
+    cross_remote = cross_remote_refusal(PROJECT_ROOT)
+    if cross_remote is not None:
+        print(cross_remote)
+        sys.exit(2)
     return False
 
 
