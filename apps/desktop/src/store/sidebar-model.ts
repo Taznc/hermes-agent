@@ -252,12 +252,25 @@ export const $sidebarSortedSessions = computed($sidebarVisibleSessions, visible 
   [...visible].sort((a, b) => sessionRecency(b) - sessionRecency(a))
 )
 
-export const $sidebarVisibleCronSessions = computed([$cronSessions, $profileScope], (cron, scope) =>
-  filterSessionsByProfileScope(cron, scope)
+/** Cron section rows: profile-scoped AND passed through the centralized
+ *  archive-membership policy, so an externally archived cron run row (same
+ *  stale-`archived:false`-cache class the flat list guards against — see
+ *  `$sidebarIsArchivedSession`'s doc) cannot re-enter the sidebar through the
+ *  Cron section, or through Pinned/`$sidebarSessionByAnyId` below, which both
+ *  read this store rather than `$cronSessions` directly. */
+export const $sidebarVisibleCronSessions = computed(
+  [$cronSessions, $profileScope, $sidebarIsArchivedSession],
+  (cron, scope, isArchivedSession) => filterSessionsByProfileScope(cron, scope).filter(session => !isArchivedSession(session))
 )
 
-export const $sidebarVisibleMessagingSessions = computed([$messagingSessions, $profileScope], (messaging, scope) =>
-  filterSessionsByProfileScope(messaging, scope)
+/** Messaging section rows: profile-scoped AND passed through the same
+ *  centralized policy as every other normal-mode surface — see
+ *  `$sidebarVisibleCronSessions`'s doc for why. Feeds `$sidebarMessagingGroups`
+ *  (below) as well as Pinned/`$sidebarSessionByAnyId`. */
+export const $sidebarVisibleMessagingSessions = computed(
+  [$messagingSessions, $profileScope, $sidebarIsArchivedSession],
+  (messaging, scope, isArchivedSession) =>
+    filterSessionsByProfileScope(messaging, scope).filter(session => !isArchivedSession(session))
 )
 
 /** Every visible/cron/messaging session indexed by every id a pin might be
@@ -268,14 +281,20 @@ export const $sidebarSessionByAnyId = computed(
 )
 
 /** The Pinned section's rows (local pin order first, then server-flagged pins
- *  the local set doesn't know about yet — see `resolvePinnedSessions`). */
+ *  the local set doesn't know about yet — see `resolvePinnedSessions`). Reads
+ *  the archive-filtered cron/messaging views (`$sidebarVisibleCronSessions`/
+ *  `$sidebarVisibleMessagingSessions`), not the raw `$cronSessions`/
+ *  `$messagingSessions` stores — a pin is not an exception to normal-mode
+ *  archive membership (see the FINAL decision in `$sidebarIsArchivedSession`'s
+ *  doc: no exceptions for pinned rows), so an externally archived cron/
+ *  messaging row must not resurface here either. */
 export const $sidebarPinnedSessions = computed(
   [
     $pinnedSessionIds,
     $sidebarSessionByAnyId,
     $sidebarVisibleSessions,
-    $cronSessions,
-    $messagingSessions,
+    $sidebarVisibleCronSessions,
+    $sidebarVisibleMessagingSessions,
     $unconfirmedPinWrites
   ],
   (pinnedIds, sessionByAnyId, visible, cron, messaging, unconfirmedPinWrites) =>
