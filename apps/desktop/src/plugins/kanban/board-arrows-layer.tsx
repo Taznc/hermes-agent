@@ -39,6 +39,7 @@ import {
   clampToLane,
   edgeId,
   focusEdges,
+  revealDelta,
   routeArrows,
   sameArrows
 } from './board-arrows'
@@ -149,6 +150,46 @@ const cardEl = (strip: HTMLElement, key: string) =>
     el => el.getAttribute(CARD_KEY_ATTR) === key
   )
 
+/** Width of a line's invisible hover band, in px. */
+const HIT_WIDTH = 14
+
+/** Is `at` (in the layer's own coordinates) on this hover band? A renderer
+ *  without SVG geometry (jsdom) simply never hovers a line. */
+function onStroke(path: SVGPathElement, at: { x: number; y: number }): boolean {
+  if (typeof path.isPointInStroke !== 'function') {
+    return false
+  }
+
+  const svg = path.ownerSVGElement
+  const point: DOMPointInit = svg?.createSVGPoint?.() ?? { x: 0, y: 0 }
+
+  point.x = at.x
+  point.y = at.y
+
+  return path.isPointInStroke(point)
+}
+
+/** Scroll `view` along one axis just enough to show `el` (see `revealDelta`).
+ *  A view with no layout yet (hidden pane, jsdom) is left alone. */
+function revealIn(view: HTMLElement | null, el: HTMLElement, axis: 'x' | 'y') {
+  const box = view?.getBoundingClientRect()
+
+  if (!view || !box || box.width === 0 || box.height === 0) {
+    return
+  }
+
+  const rect = el.getBoundingClientRect()
+
+  const delta =
+    axis === 'y'
+      ? revealDelta({ end: rect.bottom, start: rect.top }, { end: box.bottom, start: box.top })
+      : revealDelta({ end: rect.right, start: rect.left }, { end: box.right, start: box.left })
+
+  if (delta !== 0) {
+    view[axis === 'y' ? 'scrollTop' : 'scrollLeft'] += delta
+  }
+}
+
 export function BoardDependencyArrows({
   depth,
   downstream,
@@ -178,6 +219,25 @@ export function BoardDependencyArrows({
   )
 
   const endpoints = useMemo(() => new Set(edges.flat()), [edges])
+
+  // Keep the focused card on screen. Opening the answer bar pushes the lane
+  // strip down by the bar's height, and the focused card grows its roll-up, so
+  // a card clicked near the bottom of its lane would otherwise land below the
+  // fold — every line then aims at a lane edge instead of the card. Clicking
+  // an answer-bar row can also focus a card scrolled out of view. Runs before
+  // the measure below, in the same commit as the bar, so the first paint
+  // already has the card (and its lines) in place.
+  useLayoutEffect(() => {
+    const strip = stripRef.current
+    const card = focused && strip ? cardEl(strip, focused) : undefined
+
+    if (!strip || !card) {
+      return
+    }
+
+    revealIn(card.closest<HTMLElement>(`[${LANE_SCROLLER_ATTR}]`), card, 'y')
+    revealIn(strip, card, 'x')
+  }, [focused, stripRef])
 
   // Layout effect: the first measure lands before paint, so a trace never
   // flashes line-less.
@@ -250,6 +310,71 @@ export function BoardDependencyArrows({
   // A hover belongs to one trace: a new focus (or none) starts clean.
   useEffect(() => () => $hotEdge.set(null), [focused, depth])
 
+  // Line hover. The layer sits OVER the cards (z-10) and its hover bands are
+  // 14px wide, so if the lines were pointer targets they would swallow every
+  // click, drag, context menu and lane wheel on whatever card they cross.
+  // Instead the whole layer stays `pointer-events: none` and the strip
+  // hit-tests the bands itself on pointermove (rAF-coalesced), topmost line
+  // first. It only ever clears a hover IT set, so an answer-bar row's hover
+  // is never stomped.
+  useEffect(() => {
+    const strip = stripRef.current
+
+    if (!strip || !focused) {
+      return
+    }
+
+    let frame = 0
+    let point: { x: number; y: number } | null = null
+    let mine: null | string = null
+
+    const settle = (id: null | string) => {
+      if (id) {
+        $hotEdge.set(id)
+      } else if (mine && $hotEdge.get() === mine) {
+        $hotEdge.set(null)
+      }
+
+      mine = id
+    }
+
+    const run = () => {
+      frame = 0
+      const svg = strip.querySelector<SVGSVGElement>('[data-board-arrows]')
+
+      if (!svg || !point) {
+        return settle(null)
+      }
+
+      const origin = svg.getBoundingClientRect()
+      const at = { x: point.x - origin.left, y: point.y - origin.top }
+      const bands = Array.from(svg.querySelectorAll<SVGPathElement>('[data-hit]')).reverse()
+      const band = bands.find(path => onStroke(path, at))
+
+      settle(band?.closest('[data-edge]')?.getAttribute('data-edge') ?? null)
+    }
+
+    const move = (event: PointerEvent) => {
+      point = { x: event.clientX, y: event.clientY }
+      frame ||= requestAnimationFrame(run)
+    }
+
+    const leave = () => {
+      point = null
+      frame ||= requestAnimationFrame(run)
+    }
+
+    strip.addEventListener('pointermove', move)
+    strip.addEventListener('pointerleave', leave)
+
+    return () => {
+      cancelAnimationFrame(frame)
+      strip.removeEventListener('pointermove', move)
+      strip.removeEventListener('pointerleave', leave)
+      settle(null)
+    }
+  }, [focused, stripRef])
+
   // Ring the two cards of the hovered line. Direct attribute writes on the
   // two elements, so a hover costs two DOM writes instead of a board render.
   useEffect(() => {
@@ -319,8 +444,6 @@ export function BoardDependencyArrows({
             data-side={side}
             data-status={style.status}
             key={id}
-            onMouseEnter={() => $hotEdge.set(id)}
-            onMouseLeave={() => $hotEdge.set($hotEdge.get() === id ? null : $hotEdge.get())}
             opacity={style.opacity}
           >
             <path
@@ -350,8 +473,10 @@ export function BoardDependencyArrows({
                 strokeWidth={Math.max(1.6, style.width * 0.42)}
               />
             )}
-            {/* Fat invisible twin: a 5px line is too thin to hover reliably. */}
-            <path d={arrow.d} fill="none" pointerEvents="stroke" stroke="transparent" strokeWidth={14} />
+            {/* Fat invisible twin: a 5px line is too thin to hover reliably.
+                Hit-tested by the strip's pointermove (see above), never a
+                pointer target itself. */}
+            <path d={arrow.d} data-hit fill="none" stroke="transparent" strokeWidth={HIT_WIDTH} />
           </g>
         ))}
       </g>

@@ -306,6 +306,29 @@ export function clampToLane(
   return { bottom: Math.min(card.bottom, lane.bottom), offscreen: false, top: Math.max(card.top, lane.top) }
 }
 
+/** Breathing room kept between a revealed card and its viewport's edge. */
+export const REVEAL_MARGIN = 8
+
+/** The scroll delta that brings `item` into `view` along one axis, "nearest"
+ *  style: 0 when it is already fully in view, otherwise the smallest move that
+ *  shows it (its leading edge first when it is taller than the view). Used to
+ *  keep the focused card on screen when the answer bar opening above the board
+ *  shrinks every lane. */
+export function revealDelta(
+  item: { end: number; start: number },
+  view: { end: number; start: number },
+  margin = REVEAL_MARGIN
+): number {
+  const top = item.start - (view.start + margin)
+  const bottom = item.end - (view.end - margin)
+
+  if (top < 0 || item.end - item.start > view.end - view.start - 2 * margin) {
+    return top
+  }
+
+  return bottom > 0 ? bottom : 0
+}
+
 /** Arrow lists are rebuilt on every measure; keep the old array when nothing
  *  moved so React bails out instead of re-rendering the layer per scroll tick. */
 export function sameArrows(a: readonly BoardArrow[], b: readonly BoardArrow[]): boolean {

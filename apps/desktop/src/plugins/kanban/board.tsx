@@ -50,7 +50,7 @@ import {
   primeAllBoardsSocket
 } from './api'
 import { ArchiveDoneControl } from './archive-done-control'
-import { BoardDependencyArrows, type FocusDepth } from './board-arrows-layer'
+import { $hotEdge, BoardDependencyArrows, type FocusDepth } from './board-arrows-layer'
 import { BoardSwitcher } from './board-switcher'
 import { BoardInfoContext, Column, EMPTY_BOARD_INFO } from './card'
 import { DependencyContext, type DependencyView, EMPTY_IDS } from './dependency-view'
@@ -1003,11 +1003,13 @@ export function KanbanBoardPage() {
               // Cards are the draggable nodes (same vocabulary useGrabScroll uses),
               // so a click on a card — including its own trace button — is left to
               // the card's own handler. A click on a dependency line is not a
-              // click on the background either: lines are hover targets.
+              // click on the background either: lines are hover targets. The
+              // line layer is pointer-transparent (so it never swallows a
+              // card click), so "on a line" means "a line is hovered".
               onClickCapture={event => {
                 const target = event.target as Element
 
-                if (focused && !target.closest('[draggable="true"], [data-board-arrows]')) {
+                if (focused && !$hotEdge.get() && !target.closest('[draggable="true"], [data-board-arrows]')) {
                   setFocused(null)
                 }
               }}

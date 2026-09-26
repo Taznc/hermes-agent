@@ -232,4 +232,98 @@ describe('focus answer bar', () => {
     await waitFor(() => expect(bar()).toBeNull())
     expect($hotEdge.get()).toBeNull()
   })
+
+  it('keeps the focused card on screen when the bar opening pushes it below its lane fold', async () => {
+    // jsdom has no layout: give every lane a 400px viewport and put `f` at
+    // 600–700px in its lane's content, i.e. below the fold once the bar is
+    // open. The card's rect follows its own lane's scrollTop.
+    const scrolled = new WeakMap<Element, number>()
+    const scrollTop = Object.getOwnPropertyDescriptor(Element.prototype, 'scrollTop')!
+    const rect = Element.prototype.getBoundingClientRect
+
+    Object.defineProperty(Element.prototype, 'scrollTop', {
+      configurable: true,
+      get() {
+        return scrolled.get(this) ?? 0
+      },
+      set(value: number) {
+        scrolled.set(this, value)
+      }
+    })
+
+    const box = (top: number, height: number) =>
+      ({ bottom: top + height, height, left: 0, right: 240, top, width: 240 }) as DOMRect
+
+    Element.prototype.getBoundingClientRect = function (this: Element) {
+      if (this.hasAttribute('data-lane-scroller')) {
+        return box(100, 400)
+      }
+
+      if (this.getAttribute('data-card-key') === 'f') {
+        const lane = this.closest('[data-lane-scroller]')!
+
+        return box(600 - (scrolled.get(lane) ?? 0), 100)
+      }
+
+      return rect.call(this)
+    }
+
+    try {
+      await mount()
+      focusCard('f')
+      await waitFor(() => expect(bar()).not.toBeNull())
+
+      const card = cardByKey('f').getBoundingClientRect()
+
+      expect(card.top).toBeGreaterThanOrEqual(100)
+      expect(card.bottom).toBeLessThanOrEqual(500)
+    } finally {
+      Element.prototype.getBoundingClientRect = rect
+      Object.defineProperty(Element.prototype, 'scrollTop', scrollTop)
+    }
+  })
+
+  it('lines never take pointer events, so a card under a line stays clickable', async () => {
+    await mount()
+    focusCard('f')
+    await waitFor(() => expect(line('h2->f')).not.toBeNull())
+
+    const layer = root.querySelector<SVGSVGElement>('[data-board-arrows]')!
+
+    expect(layer.classList.contains('pointer-events-none')).toBe(true)
+    // Nothing inside the layer may opt back in (the old hover band did, with
+    // `pointer-events="stroke"`, and swallowed clicks on every card it crossed).
+    expect(layer.querySelector('[pointer-events]')).toBeNull()
+    expect(layer.querySelectorAll('[data-hit]').length).toBeGreaterThan(0)
+  })
+
+  it('hovering a line is hit-tested by the strip and isolates that line', async () => {
+    const proto = Element.prototype as unknown as { isPointInStroke?: (p: DOMPointInit) => boolean }
+    const original = proto.isPointInStroke
+
+    proto.isPointInStroke = function (this: Element) {
+      return this.closest('[data-edge]')?.getAttribute('data-edge') === 'h2->f'
+    }
+
+    try {
+      await mount()
+      focusCard('f')
+      await waitFor(() => expect(line('h2->f')).not.toBeNull())
+
+      const strip = root.querySelector('[data-board-arrows]')!.parentElement!
+
+      fireEvent.pointerMove(strip, { clientX: 10, clientY: 10 })
+      await waitFor(() => expect(line('h2->f')!.hasAttribute('data-hot')).toBe(true))
+      expect(cardByKey('h2').hasAttribute('data-dep-hot')).toBe(true)
+
+      // A click while a line is hovered is a click on the line: the trace stays.
+      fireEvent.click(strip)
+      expect(bar()).not.toBeNull()
+
+      fireEvent.pointerLeave(strip)
+      await waitFor(() => expect($hotEdge.get()).toBeNull())
+    } finally {
+      proto.isPointInStroke = original
+    }
+  })
 })
