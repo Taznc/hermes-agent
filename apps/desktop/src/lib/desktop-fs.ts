@@ -203,7 +203,19 @@ export async function trashDesktopPath(path: string): Promise<void> {
 }
 
 export async function copyTextToClipboard(text: string): Promise<void> {
-  await bridge().writeClipboard(text)
+  // Ladder, not a hard dependency: the Electron bridge is preferred (its main
+  // process write survives focus loss, which navigator.clipboard does not),
+  // but it is absent in the web-served build. Mirrors writeClipboardText in
+  // components/ui/copy-button.tsx — the two must stay in agreement.
+  const desktop = window.hermesDesktop
+
+  if (desktop?.writeClipboard) {
+    await desktop.writeClipboard(text)
+
+    return
+  }
+
+  await navigator.clipboard.writeText(text)
 }
 
 // Working-tree-vs-HEAD diff for one file. Empty when unchanged / not a repo.
