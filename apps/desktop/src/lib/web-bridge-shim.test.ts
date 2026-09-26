@@ -102,10 +102,7 @@ const SENTINEL_GATED: Record<string, string> = {
   // Only caller is gateway-settings.tsx's GatewayConnectionSettings, which
   // renders its "unavailable" EmptyState before any handler that reaches
   // reconnectMovedCloudAgent() can mount when getConnectionConfig is absent.
-  'app/settings/cloud-team-change.ts': 'getConnectionConfig',
-  // watchPreviewFile/stopPreviewFileWatch run only for entries diskRoots()
-  // found, and diskRoots() returns [] unless desktopPluginsRoot() exists.
-  'contrib/runtime-loader.ts': 'desktopPluginsRoot'
+  'app/settings/cloud-team-change.ts': 'getConnectionConfig'
 }
 
 /** Files exempted by a gate that lives in ANOTHER file (the renderer). */
@@ -137,7 +134,16 @@ const VERIFIED_SAFE: Record<string, string> = {
   // `bridge` is the optional `introReveal` namespace (absent in the shim), so
   // `bridge?.onSkip(...)` short-circuits on the namespace.
   'store/intro-reveal.ts:onSkip': 'optional introReveal namespace short-circuits',
-  'store/intro-reveal.ts:onClosed': 'optional introReveal namespace short-circuits'
+  'store/intro-reveal.ts:onClosed': 'optional introReveal namespace short-circuits',
+  // The shim now defines desktopPluginsRoot (web-desktop-bridge plugin), so
+  // the disk door is reachable once that plugin is enabled. The shim still
+  // omits the preview-file watch pair: watchDiskPluginFile() calls
+  // watchPreviewFile inside try/catch, so the "not a function" TypeError is
+  // swallowed and record.watchId stays null — which makes both
+  // stopPreviewFileWatch calls (each behind `if (record.watchId)`) dead code.
+  // Hot-reload falls back to the loader's 5s poll.
+  'contrib/runtime-loader.ts:watchPreviewFile': 'inside try/catch in watchDiskPluginFile',
+  'contrib/runtime-loader.ts:stopPreviewFileWatch': 'behind if (record.watchId), never set without watchPreviewFile'
 }
 
 interface Site {
