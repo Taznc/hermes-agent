@@ -1082,16 +1082,18 @@ def test_cli_daemon_help_marks_deprecated():
 def test_gateway_dispatcher_disables_corrupt_board_without_traceback(
     monkeypatch, tmp_path, caplog, corrupt_exc
 ):
-    """Corrupt board DBs log one actionable error and stop retrying per tick."""
+    """Corrupt board DBs log one actionable error and stop retrying per tick,
+    while the ready/review health probe keeps checking every tick regardless.
+    """
     import asyncio
     import logging
     import sqlite3
+    from collections import defaultdict
 
     from gateway.run import GatewayRunner
     import hermes_cli.config as _cfg_mod
     import hermes_cli.kanban_db as _kb
     from hermes_cli import kanban_db_connect as _kbc
-    from hermes_cli import kanban_db_dispatch as _kbd
 
     runner = object.__new__(GatewayRunner)
     runner._running = True
@@ -1120,10 +1122,22 @@ def test_gateway_dispatcher_disables_corrupt_board_without_traceback(
     )
     monkeypatch.setattr(_kb, "kanban_db_path", lambda board=None: corrupt_db)
 
-    calls = {"connect": 0, "to_thread": 0}
+    # Each tick offloads a fixed sequence of named phase functions via
+    # `service(phase, func, *args)` -> `_to_thread_process_service` ->
+    # `asyncio.to_thread(_run_in_fresh_context, func, *args)`, so `args[0]`
+    # passed to the patched `to_thread` below is always the real phase
+    # function. Bucket connects by that function's name — rather than by a
+    # raw `to_thread` call count — so this test survives any future
+    # service() phase being added to (or removed from) the tick body; only
+    # the LAST phase per tick, `ready_nonempty` (the health probe), is used
+    # to detect "one full tick completed".
+    TICKS = 2
+    connects_by_phase = defaultdict(int)
+    current_phase = ["boot"]
+    ready_probe_calls = 0
 
     def _connect(*args, **kwargs):
-        calls["connect"] += 1
+        connects_by_phase[current_phase[0]] += 1
         if corrupt_exc == "guard":
             raise _kbc.KanbanDbCorruptError(
                 corrupt_db,
@@ -1133,17 +1147,14 @@ def test_gateway_dispatcher_disables_corrupt_board_without_traceback(
         raise sqlite3.DatabaseError("file is not a database")
 
     async def _to_thread(fn, *args, **kwargs):
-        # PR salvage (#32857 commit 7): the dispatcher now reaps zombies at
-        # the top of each tick via ``asyncio.to_thread(_kbd.reap_worker_zombies)``
-        # BEFORE the per-board tick work. Each tick now issues 3 ``to_thread``
-        # calls (reaper + ``_tick_once`` + ``_ready_nonempty``) instead of 2,
-        # so this counter must reach 6 to allow the same 2 dispatch ticks the
-        # pre-reaper test expected at 4. Connect counts in the assertion below
-        # are unchanged.
-        calls["to_thread"] += 1
+        nonlocal ready_probe_calls
+        phase_fn = args[0] if args else fn
+        current_phase[0] = getattr(phase_fn, "__name__", "?")
         result = fn(*args, **kwargs)
-        if calls["to_thread"] >= 6:
-            runner._running = False
+        if current_phase[0] == "ready_nonempty":
+            ready_probe_calls += 1
+            if ready_probe_calls >= TICKS:
+                runner._running = False
         return result
 
     async def _sleep(_delay):
@@ -1165,13 +1176,14 @@ def test_gateway_dispatcher_disables_corrupt_board_without_traceback(
     assert sum("not a valid SQLite database" in msg for msg in messages) == 1
     assert not any("tick failed on board" in msg for msg in messages)
     assert not any(record.exc_info for record in caplog.records)
-    # First tick connect (dispatch) + two probes per `_has_ready_work` call
-    # (ready then review, both via _kbc.connect). The second dispatch tick
-    # skips the dispatch connect because the corrupt board fingerprint is
-    # disabled, but the ready/review probes still each connect. PR f55d94a1e
-    # added the review-column probe alongside the existing ready-column
-    # probe, bumping this from 3 → 5.
-    assert calls["connect"] == 5
+    # Dispatch (`tick_once`) quarantines the board on its first failed
+    # connect and must not retry it on later ticks while quarantined.
+    assert connects_by_phase["tick_once"] == 1, connects_by_phase
+    # The ready/review health probe (`ready_nonempty`) is independent of the
+    # dispatch quarantine — has_spawnable_ready/has_spawnable_review share
+    # one connection per call, and a corrupt board must not go unmonitored,
+    # so the probe keeps trying on every tick regardless of quarantine.
+    assert connects_by_phase["ready_nonempty"] == TICKS, connects_by_phase
 
 
 # ---------------------------------------------------------------------------
