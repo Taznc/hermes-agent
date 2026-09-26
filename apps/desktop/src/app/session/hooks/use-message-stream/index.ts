@@ -16,7 +16,8 @@ import {
   reasoningPart,
   renderMediaTags,
   sealOpenToolParts,
-  upsertToolPart
+  upsertToolPart,
+  type UpsertToolPartOptions
 } from '@/lib/chat-messages'
 import type { ErrorSurface } from '@/lib/error-surface'
 import {
@@ -454,7 +455,8 @@ export function useMessageStream({
       payload: GatewayEventPayload | undefined,
       phase: 'running' | 'complete',
       sourceEventType?: string,
-      occurredAt = Date.now() / 1000
+      occurredAt = Date.now() / 1000,
+      options?: UpsertToolPartOptions
     ) => {
       // Text deltas flush on a timer but tool events apply now; flush first so
       // a tool part can't jump ahead of the text that preceded it.
@@ -487,8 +489,8 @@ export function useMessageStream({
 
       mutateStream(
         sessionId,
-        parts => dedupeGeneratedImageEchoesInParts(upsertToolPart(parts, payload, phase, occurredAt)),
-        () => upsertToolPart([], payload, phase, occurredAt),
+        parts => dedupeGeneratedImageEchoesInParts(upsertToolPart(parts, payload, phase, occurredAt, options)),
+        () => upsertToolPart([], payload, phase, occurredAt, options),
         {
           pending: m => phase !== 'complete' || (m.pending ?? false),
           // A clarify `tool.start` landing after its `clarify.request` row can

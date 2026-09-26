@@ -3275,6 +3275,19 @@ export const ja = defineForkLocale(forkJa, {
       notePlaceholder: '任意のメモを追加…',
       selected: '選択済み'
     },
+    newSessionProposal: {
+      title: '新しいセッションを開始しますか？',
+      description: topic => `新しいセッション: 「${topic}」`,
+      reasonLabel: '理由',
+      approve: '新しいセッションを開始',
+      decline: 'ここに留まる',
+      approved: '新しいセッションを開始しました',
+      declined: '拒否しました',
+      unanswered: '応答なし',
+      failed: '新しいセッションを開始できませんでした',
+      sendFailed: '応答を送信できませんでした',
+      gatewayDisconnected: 'Hermes ゲートウェイが接続されていません'
+    },
     tool: {
       copyCode: 'コードをコピー',
       renderingImage: '画像をレンダリング中',
@@ -3400,6 +3413,8 @@ export const ja = defineForkLocale(forkJa, {
     audioReadFailed: '録音した音声を読み取れませんでした',
     sessionUnavailable: 'セッションが利用できません',
     createSessionFailed: '新しいセッションを作成できませんでした',
+    newTopicMissingTopic: 'トピックが必要です',
+    newTopicUsage: '使い方: /new-topic <トピック> — 新しいセッションの最初のメッセージとして送られます',
     promptFailed: 'プロンプトに失敗しました',
     providerCredentialRequired: '最初のメッセージを送信する前にプロバイダー認証情報を追加してください。',
     emptySlashCommand: '空のスラッシュコマンド',

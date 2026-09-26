@@ -3702,6 +3702,19 @@ export const en: Translations = withForkKeys(forkEn, {
       reloadFailed: 'Server saved, but reloading MCP tools failed — they load next session',
       gatewayDisconnected: 'Hermes gateway is not connected'
     },
+    newSessionProposal: {
+      title: 'Start a new session for this?',
+      description: topic => `New session: “${topic}”`,
+      reasonLabel: 'Why now',
+      approve: 'Start new session',
+      decline: 'Stay here',
+      approved: 'Started a new session',
+      declined: 'Declined',
+      unanswered: 'No response',
+      failed: 'Could not start the new session',
+      sendFailed: 'Could not send the response',
+      gatewayDisconnected: 'Hermes gateway is not connected'
+    },
     tool: {
       copyCode: 'Copy code',
       renderingImage: 'Rendering image',
@@ -3806,6 +3819,8 @@ export const en: Translations = withForkKeys(forkEn, {
     audioReadFailed: 'Could not read recorded audio',
     sessionUnavailable: 'Session unavailable',
     createSessionFailed: 'Could not create a new session',
+    newTopicMissingTopic: 'Topic required',
+    newTopicUsage: 'Usage: /new-topic <topic> — the seeded first message for the new session',
     promptFailed: 'Prompt failed',
     providerCredentialRequired: 'Add a provider credential before sending your first message.',
     emptySlashCommand: 'empty slash command',

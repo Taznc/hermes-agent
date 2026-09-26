@@ -1,7 +1,7 @@
 import type { QueryClient } from '@tanstack/react-query'
 import type { MutableRefObject } from 'react'
 
-import type { GatewayEventPayload } from '@/lib/chat-messages'
+import type { GatewayEventPayload, UpsertToolPartOptions } from '@/lib/chat-messages'
 import type { RpcEvent } from '@/types/hermes'
 
 import type { ClientSessionState } from '../../../../types'
@@ -44,7 +44,8 @@ export interface GatewayEventDeps {
     payload: GatewayEventPayload | undefined,
     phase: 'running' | 'complete',
     sourceEventType?: string,
-    occurredAt?: number
+    occurredAt?: number,
+    options?: UpsertToolPartOptions
   ) => void
 }
 

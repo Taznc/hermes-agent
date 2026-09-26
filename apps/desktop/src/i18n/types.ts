@@ -3236,6 +3236,19 @@ export interface UpstreamTranslations {
       reloadFailed: string
       gatewayDisconnected: string
     }
+    newSessionProposal: {
+      title: string
+      description: (topic: string) => string
+      reasonLabel: string
+      approve: string
+      decline: string
+      approved: string
+      declined: string
+      unanswered: string
+      failed: string
+      sendFailed: string
+      gatewayDisconnected: string
+    }
     tool: {
       copyCode: string
       renderingImage: string
@@ -3305,6 +3318,8 @@ export interface UpstreamTranslations {
     audioReadFailed: string
     sessionUnavailable: string
     createSessionFailed: string
+    newTopicMissingTopic: string
+    newTopicUsage: string
     promptFailed: string
     providerCredentialRequired: string
     emptySlashCommand: string

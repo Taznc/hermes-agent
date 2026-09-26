@@ -22,15 +22,67 @@ def conn(tmp_path, monkeypatch):
         yield opened
 
 
-def _write_profile(home, name, model="gpt-5.6-sol", effort="medium"):
+def _write_profile(
+    home, name, model="gpt-5.6-sol", effort="medium", provider="openai-codex"
+):
     profile = home / "profiles" / name
     profile.mkdir(parents=True, exist_ok=True)
     (profile / "profile.yaml").write_text(f"name: {name}\n", encoding="utf-8")
     (profile / "config.yaml").write_text(
-        f"model:\n  provider: openai-codex\n  default: {model}\n"
+        f"model:\n  provider: {provider}\n  default: {model}\n"
         f"agent:\n  reasoning_effort: {effort}\n",
         encoding="utf-8",
     )
+
+
+def test_respawn_uses_current_assignee_profile_route_not_dispatcher_default(conn):
+    """An external config rotation between runs is not a profile-home leak."""
+    home = kb.kanban_home()
+    (home / "config.yaml").write_text(
+        "model:\n  provider: anthropic\n  default: claude-opus-5-5\n"
+        "agent:\n  reasoning_effort: medium\n",
+        encoding="utf-8",
+    )
+    _write_profile(home, "debugger", model="gpt-6-sol", effort="medium")
+    tid = kb.create_task(
+        conn, title="config rotated while blocked", assignee="debugger"
+    )
+
+    first = kb.get_task(conn, tid)
+    assert first is not None
+    kbd._prepare_worker_launch(first)
+    assert getattr(first, "_worker_run_analytics")["model"] == "gpt-6-sol"
+    kbd._validate_prepared_model_policy(first, board=None)
+
+    assert kb.block_task(conn, tid, reason="external approval", kind="needs_input")
+    # The operator temporarily moved this very profile to Opus during a Codex
+    # outage. The original run's model must not be treated as a durable pin.
+    _write_profile(
+        home, "debugger", model="claude-opus-5-5", effort="medium", provider="anthropic"
+    )
+    assert kb.unblock_task(conn, tid)
+    respawn = kb.get_task(conn, tid)
+    assert respawn is not None
+    kbd._prepare_worker_launch(respawn)
+    analytics = getattr(respawn, "_worker_run_analytics")
+    assert analytics["model_source"] == "profile_default"
+    assert analytics["model"] == "claude-opus-5-5"
+    assert analytics["provider"] == "anthropic"
+    with pytest.raises(
+        ValueError, match="anthropic/claude-opus-5-5/medium: unknown model route"
+    ):
+        kbd._validate_prepared_model_policy(respawn, board=None)
+
+    # The approved route is Opus/high, regardless of the dispatcher's own
+    # default profile still being Opus/medium.
+    _write_profile(
+        home, "debugger", model="claude-opus-5-5", effort="high", provider="anthropic"
+    )
+    corrected = kb.get_task(conn, tid)
+    assert corrected is not None
+    kbd._prepare_worker_launch(corrected)
+    assert getattr(corrected, "_worker_run_analytics")["reasoning_effort"] == "high"
+    kbd._validate_prepared_model_policy(corrected, board=None)
 
 
 def test_policy_matrix_accepts_only_approved_unattended_routes():

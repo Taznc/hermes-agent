@@ -113,6 +113,10 @@ def _agent_cbs(sid: str) -> dict:
         # (typing an API key, browser OAuth) and, like clarify, a late answer is tolerated.
         "setup_mcp_callback": lambda server, action, reason: _block(
             "mcp.setup.request", sid, {"server": server, "action": action, "reason": reason}, timeout=600),
+        # propose_new_session (desktop GUI): approve/decline card for handing a topic off into a
+        # brand-new session; like clarify/setup_mcp, a late answer after timeout is tolerated.
+        "propose_new_session_callback": lambda topic, reason: _block(
+            "session.propose.request", sid, {"topic": topic, "reason": reason}, timeout=600),
         # tour (desktop GUI): renderer drives driver.js and answers tour.respond.
         "tour_callback": lambda payload: _tour_request(sid, payload)}
 

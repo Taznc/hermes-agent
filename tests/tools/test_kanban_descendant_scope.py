@@ -81,7 +81,7 @@ def test_terminal_descendants_cannot_mutate_even_after_task_is_removed(tmp_path,
         outputs.append(proc.stdout)
     for output in outputs:
         row = json.loads(next(line.split("SCOPE_RESULT=", 1)[1] for line in output.splitlines() if "SCOPE_RESULT=" in line))
-        assert row["show"]["task"]["id"] == own, row
+        assert row["show"]["packet"]["identity"]["task_id"] == own, row
         assert not row["owner"] and row["default"] is None, row
         assert row["db"] == str(tmp_path / "assigned.db") and row["board"] == "default"
         assert all("error" in value for value in row["tools"]), row

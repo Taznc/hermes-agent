@@ -344,6 +344,7 @@ def _refresh_credentials_after_401(
     ):
         if agent._try_refresh_anthropic_client_credentials():
             _retry.anthropic_401_retry_attempted = True
+            agent._anthropic_retry_bearer_log_pending = True
             _plines(agent, "🔐 Anthropic credentials refreshed after 401. Retrying request...")
             return True
         _print_anthropic_401_diagnostics(agent, agent._anthropic_api_key)
@@ -418,6 +419,7 @@ def try_anthropic_rotation_retry(agent: Any, _retry: TurnRetryState, status_code
         new_token = None
     if new_token and agent._try_refresh_anthropic_client_credentials(token=new_token):
         _retry.anthropic_401_retry_attempted = True
+        agent._anthropic_retry_bearer_log_pending = True
         logger.info(
             "%sAnthropic 401 after credential rotation: adopted the rotated OAuth token from its live "
             "source (prefix %s… → %s…) and retrying the request once",

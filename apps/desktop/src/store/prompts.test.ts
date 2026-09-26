@@ -12,6 +12,7 @@ import {
   clearSecretRequest,
   clearSudoRequest,
   receiveApprovalRequest,
+  reconcileParkedApproval,
   replayPendingApproval,
   setApprovalRequest,
   setSecretRequest,
@@ -366,5 +367,54 @@ describe('pending approval replay backoff', () => {
     await replayPendingApproval(gateway, 's1')
 
     expect(calls).toHaveLength(2)
+  })
+})
+
+describe('stale approval reconciliation', () => {
+  it('drops a parked approval the backend no longer holds (timed out / answered elsewhere)', async () => {
+    setApprovalRequest({ command: 'rm -rf x', description: 'd', requestId: 'r1', sessionId: 's1' })
+
+    await reconcileParkedApproval({ request: async () => ({ approvals: [] }) }, 's1')
+
+    expect($approvalRequest.get()).toBeNull()
+  })
+
+  it('keeps a parked approval the backend still holds', async () => {
+    setApprovalRequest({ command: 'rm -rf x', description: 'd', requestId: 'r1', sessionId: 's1' })
+
+    const gateway = {
+      request: async (method: string) =>
+        method === 'approval.pending'
+          ? { approvals: [{ command: 'rm -rf x', description: 'd', request_id: 'r1' }] }
+          : { acknowledged: true }
+    }
+
+    await reconcileParkedApproval(gateway, 's1')
+
+    expect($approvalRequest.get()?.requestId).toBe('r1')
+  })
+
+  it('does not let an empty answer clobber an approval that arrived mid-query', async () => {
+    setApprovalRequest({ command: 'old', description: 'd', requestId: 'r1', sessionId: 's1' })
+
+    const gateway = {
+      request: async () => {
+        setApprovalRequest({ command: 'new', description: 'd', requestId: 'r2', sessionId: 's1' })
+
+        return { approvals: [] }
+      }
+    }
+
+    await reconcileParkedApproval(gateway, 's1')
+
+    expect($approvalRequest.get()?.requestId).toBe('r2')
+  })
+
+  it('skips the round-trip when nothing is parked', async () => {
+    const request = vi.fn(async () => ({ approvals: [] }))
+
+    await reconcileParkedApproval({ request }, 's1')
+
+    expect(request).not.toHaveBeenCalled()
   })
 })

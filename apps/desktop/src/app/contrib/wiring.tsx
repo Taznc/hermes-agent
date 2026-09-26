@@ -47,6 +47,7 @@ import { requestVoiceConversationStart } from '@/store/composer'
 import { $activeConnectionId } from '@/store/connections'
 import { $cronReviewRequest, setCronFocusJobId } from '@/store/cron'
 import { $pinnedSessionIds, pinSession, restoreWorktree, unpinSession } from '@/store/layout'
+import { $startNewSessionFromTopic, makeStartNewSessionFromTopic } from '@/store/new-session-proposal'
 import { notifyError } from '@/store/notifications'
 import { $previewTarget } from '@/store/preview'
 import {
@@ -143,6 +144,7 @@ import {
 import { TitlebarControls } from '../shell/titlebar-controls'
 
 import { ContribWiringContext } from './context'
+import { useCreditsNoticeDemo } from './dev/use-credits-notice-demo'
 import {
   reconcileActiveTranscript,
   resolveActiveTranscriptSession,
@@ -376,22 +378,8 @@ export function ContribWiring({ children }: { children: ReactNode }) {
     return () => window.removeEventListener('hermes:open-keybinds', onOpenKeybinds)
   }, [navigate])
 
-  // Dev-only: install the credit-notice demo trigger (Ctrl+Shift+C / ⌘K palette
-  // / window.__creditsDemo). Dynamic import inside the DEV guard so the module
-  // is dropped from production builds.
-  useEffect(() => {
-    if (!import.meta.env.DEV) {
-      return
-    }
-
-    let dispose: (() => void) | undefined
-
-    void import('./dev/credits-notice-demo').then(m => {
-      dispose = m.installCreditsNoticeDemo()
-    })
-
-    return () => dispose?.()
-  }, [])
+  // Dev-only trigger: its module is dynamically loaded only under the DEV guard.
+  useCreditsNoticeDemo()
 
   // Post-turn rehydrate from stored history (same behavior as DesktopController,
   // including finished-todos restoration).
@@ -734,6 +722,22 @@ export function ContribWiring({ children }: { children: ReactNode }) {
   // SAME submit machinery the normal composer uses (current chat / picked
   // session / new session), and it hears gateway truth from this window.
   useQuickEntryBridge({ startFreshSessionDraft, submitText })
+
+  // Publish the canonical "fresh clean session, seeded with a real first
+  // turn" pipeline for consumers outside this tree (the new-session-proposal
+  // card's Approve, and the /new-topic manual trigger) — same core/contrib
+  // boundary crossing as $restartPreviewServer above. Fresh draft + submit is
+  // exactly the New Chat + type + Enter path: create/publish lifecycle, then
+  // prompt.submit runs the seeded topic as a real turn (never a raw
+  // session.create with an inline `messages` array, which never persists or
+  // submits — see t_2023fb69 review round 1).
+  useEffect(() => {
+    const startNewSessionFromTopic = makeStartNewSessionFromTopic({ startFreshSessionDraft, submitText })
+
+    $startNewSessionFromTopic.set(startNewSessionFromTopic)
+
+    return () => $startNewSessionFromTopic.set(null)
+  }, [startFreshSessionDraft, submitText])
 
   // Leaving HUD mode hands this window the session back (see hud/handoff).
   useHudHandoff({ navigate, resumeSession })

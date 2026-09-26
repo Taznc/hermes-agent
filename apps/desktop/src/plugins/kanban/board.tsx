@@ -33,6 +33,7 @@ import {
 } from '@hermes/plugin-sdk'
 import { useEffect, useMemo, useRef, useState } from 'react'
 
+import { FocusAnswerBar } from './answer-bar'
 import {
   $boardSlug,
   $collapsedLanes,
@@ -49,10 +50,11 @@ import {
   primeAllBoardsSocket
 } from './api'
 import { ArchiveDoneControl } from './archive-done-control'
+import { $hotEdge, BoardDependencyArrows, type FocusDepth } from './board-arrows-layer'
 import { BoardSwitcher } from './board-switcher'
-import { BoardInfoContext, Column, EMPTY_BOARD_INFO } from './card'
+import { BoardInfoContext, Column, EMPTY_BOARD_INFO, LANE_GAP_ATTR } from './card'
 import { DependencyContext, type DependencyView, EMPTY_IDS } from './dependency-view'
-import { buildGraph, cardKey, focusSets, indexBoard, parseCardKey, taskCardKey } from './deps'
+import { buildGraph, cardKey, chainSets, focusSets, indexBoard, parseCardKey, taskCardKey } from './deps'
 import { TaskDrawer } from './drawer'
 import { IdeaCaptureDialog, NewTaskDialog } from './new-task-dialog'
 import { OrchestrationPanel } from './orchestration'
@@ -408,6 +410,9 @@ export function KanbanBoardPage() {
   // state, never a persisted store: a reload should not resurrect a trace the
   // user started three sessions ago.
   const [focused, setFocused] = useState<null | string>(null)
+  // One hop by default (see focusSets); 'chain' is the opt-in transitive view.
+  const [focusDepth, setFocusDepth] = useState<FocusDepth>('direct')
+  // The card the graph overlay is centred on; null = closed.
 
   useEffect(() => {
     const onHashChange = () => setRouteSearch(notificationRouteSearch())
@@ -486,11 +491,14 @@ export function KanbanBoardPage() {
   const index = useMemo(() => indexBoard(board), [board])
   const hasEdges = Boolean(board?.link_edges && board.link_edges.length > 0)
 
-  // One hop only (see focusSets) — a transitive closure lights up most of a
-  // busy board and defeats the dimming.
+  // One hop by default (see focusSets) — a transitive closure lights up most
+  // of a busy board and defeats the dimming — unless the user asked for it.
   const chain = useMemo(
-    () => (focused ? focusSets(graph, focused) : { downstream: EMPTY_IDS, upstream: EMPTY_IDS }),
-    [graph, focused]
+    () =>
+      focused
+        ? (focusDepth === 'chain' ? chainSets : focusSets)(graph, focused)
+        : { downstream: EMPTY_IDS, upstream: EMPTY_IDS },
+    [graph, focused, focusDepth]
   )
 
   // A focused card that left the board (deleted, archived, filtered away by a
@@ -935,19 +943,21 @@ export function KanbanBoardPage() {
 
           {isAllBoards && <BoardsErrorNotice errors={board?.errors} />}
 
-          {/* Focus-mode hint. Only while a trace is live, so the board chrome is
-          unchanged in the common case. Its own row rather than an overlay:
+          {/* The answer bar. Only while a trace is live, so the board chrome
+          is unchanged in the common case. Its own row rather than an overlay:
           the board is dimmed underneath and an overlay would compete with the
-          selection bar for the same corner. */}
+          selection bar for the same corner. Clicking a row moves the focus
+          (never toggles it off — the row is a different card). */}
           {focused && (
-            <div className="mx-4 mb-2 flex shrink-0 items-center gap-2 rounded-lg bg-(--ui-bg-quinary) px-3 py-1.5 text-[0.6875rem] text-(--ui-text-secondary)">
-              <Codicon className="shrink-0 text-(--ui-text-tertiary)" name="references" size="0.8rem" />
-              <span className="min-w-0 truncate">{k.depFocusHint}</span>
-              <Button className="ml-auto shrink-0" onClick={() => setFocused(null)} size="xs" variant="ghost">
-                <Codicon name="close" size="0.7rem" />
-                {k.depClearFocus}
-              </Button>
-            </div>
+            <FocusAnswerBar
+              depth={focusDepth}
+              focused={focused}
+              graph={graph}
+              index={index}
+              onClear={() => setFocused(null)}
+              onDepth={setFocusDepth}
+              onFocus={setFocused}
+            />
           )}
 
           {errorMessage && !board ? (
@@ -976,16 +986,34 @@ export function KanbanBoardPage() {
               // This is the board's sole vertical flex child. `min-h-0` lets it
               // yield space to the page chrome (including the status bar)
               // instead of extending underneath it on a short viewport.
-              className={cn('flex min-h-0 flex-1 gap-2 overflow-x-auto px-4 pt-1 pb-3', grabbing && 'cursor-grabbing')}
+              // `relative`: the dependency-arrow layer is positioned against the
+              // strip's scroll content, so it pans with the lanes for free.
+              // While a trace is live the right gutter grows to fit the widest
+              // same-lane bracket (BRACKET_MAX + casing), so the last lane's
+              // loop is never clipped by the strip's scroll edge.
+              className={cn(
+                'relative flex min-h-0 flex-1 gap-2 overflow-x-auto px-4 pt-1 pb-3',
+                focused && 'pr-16',
+                grabbing && 'cursor-grabbing'
+              )}
               // Clicking the board background clears the trace — the gaps between
               // lanes, a lane's padding, a lane header, empty column space. Keyed
               // off "the click did not land on a card" rather than a strict
               // `currentTarget` check, which would only catch the thin gutters.
               // Cards are the draggable nodes (same vocabulary useGrabScroll uses),
               // so a click on a card — including its own trace button — is left to
-              // the card's own handler.
+              // the card's own handler. A click on a dependency line is not a
+              // click on the background either: lines are hover targets. The
+              // line layer is pointer-transparent (so it never swallows a
+              // card click), so "on a line" means "a line is hovered".
               onClickCapture={event => {
-                if (focused && !(event.target as HTMLElement).closest('[draggable="true"]')) {
+                const target = event.target as Element
+
+                if (
+                  focused &&
+                  !$hotEdge.get() &&
+                  !target.closest(`[draggable="true"], [data-board-arrows], [${LANE_GAP_ATTR}]`)
+                ) {
                   setFocused(null)
                 }
               }}
@@ -1019,6 +1047,18 @@ export function KanbanBoardPage() {
                   />
                 )
               })}
+              {/* Arrows between the real cards while a trace is live. Keyed off
+                  the same `chain` sets that light the cards, so an arrow never
+                  lands on a dimmed card. */}
+              <BoardDependencyArrows
+                depth={focusDepth}
+                downstream={chain.downstream}
+                focused={focused}
+                graph={graph}
+                index={index}
+                stripRef={lanesRef}
+                upstream={chain.upstream}
+              />
             </div>
           )}
 

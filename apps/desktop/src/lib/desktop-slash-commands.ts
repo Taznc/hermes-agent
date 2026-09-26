@@ -62,6 +62,7 @@ export type DesktopActionId =
   | 'help'
   | 'journey'
   | 'new'
+  | 'newTopic'
   | 'pet'
   | 'profile'
   | 'skin'
@@ -174,6 +175,12 @@ const rpc = (
 const DESKTOP_COMMAND_SPECS: readonly DesktopCommandSpec[] = [
   // Local client actions
   { name: '/new', description: 'Start a new desktop chat', aliases: ['/reset'], surface: action('new') },
+  {
+    name: '/new-topic',
+    description: 'Start a fresh session seeded with a topic — no shared history',
+    surface: action('newTopic'),
+    argumentMode: 'text'
+  },
   {
     name: '/stop',
     description: 'Stop the active turn and background processes',

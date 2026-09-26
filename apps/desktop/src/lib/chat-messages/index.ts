@@ -23,5 +23,5 @@ export {
   upsertToolPart,
   withUniqueToolCallIdsWithinMessage
 } from './tool-parts'
-export type { PendingClarifyProjection, SettledClarifyProjection } from './tool-parts'
+export type { PendingClarifyProjection, SettledClarifyProjection, UpsertToolPartOptions } from './tool-parts'
 export type { ChatMessage, ChatMessagePart, GatewayEventPayload, TimelinePartMetadata } from './types'
