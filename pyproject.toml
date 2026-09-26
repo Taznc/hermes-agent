@@ -804,6 +804,8 @@ include = [
   "tools.*",
   "hermes_cli",
   "hermes_cli.*",
+  "hermes_fork",
+  "hermes_fork.*",
   "gateway",
   "gateway.*",
   "tui_gateway",
