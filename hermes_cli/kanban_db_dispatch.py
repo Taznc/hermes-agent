@@ -2306,6 +2306,10 @@ def _dispatch_once_locked(
     may_spawn, spawn_budget = _tick_spawn_budget(
         conn, result, max_spawn=max_spawn, max_in_progress=max_in_progress, board=board,
     )
+    # >>> FORK ANCHOR: start-budget <<<
+    from hermes_fork.kanban.start_budget import admit as _fork_start_admit
+    may_spawn, spawn_budget = _fork_start_admit(conn, result, may_spawn, spawn_budget, dry_run=dry_run)
+    # <<< FORK ANCHOR >>>
     if not may_spawn:
         return result
 
