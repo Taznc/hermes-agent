@@ -87,7 +87,6 @@ const NAMESPACED = new Set([
  */
 const SENTINEL_GATED: Record<string, string> = {
   'app/settings/gateway-settings.tsx': 'getConnectionConfig',
-  'components/boot-failure-overlay.tsx': 'getConnectionConfig',
   'components/desktop-install-overlay.tsx': 'onBootstrapEvent',
   // Rendered ONLY by desktop-install-overlay (its remote-setup step), which
   // bails before mount unless onBootstrapEvent exists — so this form never

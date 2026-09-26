@@ -42,7 +42,7 @@
 
 import { getApiRequestProfile } from '@/api/client'
 
-import type { DesktopMarketplaceThemeResult } from './global'
+import type { DesktopBootstrapState, DesktopMarketplaceThemeResult } from './global'
 import { extractVsixThemes } from './lib/vsix-archive'
 
 // Self-contained minimal types (structural subsets of src/global.d.ts shapes;
@@ -1050,6 +1050,27 @@ const shim = {
   getRecentLogs: async () => ({ path: '(web spike: no desktop.log)', lines: [] as string[] }),
   revealLogs: async () => ({ ok: false, path: '', error: 'not available in the web spike' }),
   reportRendererError: (_report: unknown) => {},
+  // Same shape of bug, two more members: boot-failure-overlay's bundled-install
+  // probe (`?.getBootstrapState()`) and its Retry/sign-in paths
+  // (`?.resetBootstrap()`). Both are OBJECT-chained, so once boot fails —
+  // e.g. the WebSocket is refused because the tab has no session token yet —
+  // the overlay meant to SHOW the failure threw "getBootstrapState is not a
+  // function" into the error boundary instead. The install overlay stays
+  // gated by `onBootstrapEvent`, which must remain omitted; these two do not
+  // reopen it. An inert snapshot: no bootstrap ever ran in the web build.
+  getBootstrapState: async (): Promise<DesktopBootstrapState> => ({
+    active: false,
+    manifest: null,
+    stages: {},
+    error: null,
+    log: [],
+    startedAt: null,
+    completedAt: null,
+    setupChoice: null,
+    unsupportedPlatform: null,
+    bundled: false
+  }),
+  resetBootstrap: async () => ({ ok: true }),
 
   // ── updates namespace ────────────────────────────────────────────────────
   // Present so startUpdatePoller() (store/updates.ts) runs: it's the only
@@ -1261,8 +1282,10 @@ const shim = {
   // minimizeToTray, getConnectionFor,
   // mcpOauth (browser popup fallback lives in lib/mcp-dashboard-oauth.ts
   // instead — no loopback listener possible from a tab), cloud, connections,
-  // settings, findInPage*, getBootstrapState/onBootstrapEvent (must stay
-  // omitted TOGETHER), readFileDataUrl, openSessionWindow/openWindow,
+  // settings, findInPage*, onBootstrapEvent (the install overlay's sentinel —
+  // getBootstrapState/resetBootstrap are present as inert stubs above because
+  // the boot-FAILURE overlay object-chains them; the install overlay itself
+  // still bails on the missing onBootstrapEvent), readFileDataUrl, openSessionWindow/openWindow,
   // writeClipboard, setActiveWork, setTranslucency, battery,
   // watchPreviewFile/watchDirectory/stopPreviewFileWatch, contextMenu*, and
   // the REMAINING oauth*/ssh*/connection-config surfaces (getConnectionConfig
