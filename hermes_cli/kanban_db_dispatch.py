@@ -2012,6 +2012,11 @@ def _dispatch_lane_task(
     Returns True when a spawn slot was consumed (real or ``dry_run``); every
     skip is recorded on ``result``.
     """
+    # >>> FORK ANCHOR: review-routing <<<
+    from hermes_fork.kanban.review_routing import admit as _fork_review_admit
+    if not (assignee := _fork_review_admit(conn, row, assignee, lane=lane, dry_run=dry_run)):
+        return False
+    # <<< FORK ANCHOR >>>
     task_id = row["id"]
     # Non-profile assignees (control-plane lanes that pull via ``claim_task``)
     # would fail ``hermes -p <assignee>`` at startup and loop ready→crash→ready
