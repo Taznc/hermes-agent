@@ -1913,6 +1913,7 @@ def rework_env(monkeypatch, tmp_path):
                 assert review is not None
                 assert kb.request_changes(
                     conn, tid, reason=reason, expected_run_id=review.current_run_id,
+                    blockers=[{"basis": "original_ac", "reference": "test acceptance contract"}],
                 ) == (True, "test-worker")
                 claimed = kb.claim_task(conn, tid)
                 assert claimed is not None

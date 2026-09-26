@@ -1192,7 +1192,9 @@ def cli_rework_env(monkeypatch, tmp_path):
                 assert review is not None
                 assert kb.request_changes(
                     conn, tid, reason=_CLI_REWORK_REASON,
-                    expected_run_id=review.current_run_id) == (True, "test-worker")
+                    expected_run_id=review.current_run_id,
+                    blockers=[{"basis": "original_ac", "reference": "test acceptance contract"}],
+                ) == (True, "test-worker")
                 claimed = kb.claim_task(conn, tid)
                 assert claimed is not None
         monkeypatch.setenv("HERMES_KANBAN_TASK", tid)
