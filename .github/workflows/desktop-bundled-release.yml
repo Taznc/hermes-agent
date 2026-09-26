@@ -736,7 +736,7 @@ jobs:
       matrix:
         target:
           - label: win32-arm64
-            runner: ${{ github.repository_owner == 'NousResearch' && 'windows-latest-32-arm-core' || 'windows-latest' }}
+            runner: ${{ github.repository_owner == 'NousResearch' && 'windows-latest-32-arm-core' || 'windows-11-arm' }}
     env: *win32-env
     steps: *win32-steps
 

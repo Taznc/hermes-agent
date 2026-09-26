@@ -39,7 +39,7 @@ def _iter_strings(value):
     [
         ("tests.yml", "ubuntu-latest-96-core", "ubuntu-latest"),
         ("tests-os.yml", "windows-latest-32-core", "windows-latest"),
-        ("tests-os.yml", "windows-latest-32-arm-core", "windows-latest"),
+        ("tests-os.yml", "windows-latest-32-arm-core", "windows-11-arm"),
         ("js-tests.yml", "ubuntu-latest-32-core", "ubuntu-latest"),
         ("rust-tests.yml", "ubuntu-latest-32-core", "ubuntu-latest"),
         ("nix.yml", "ubuntu-latest-32-core", "ubuntu-latest"),
@@ -49,9 +49,9 @@ def _iter_strings(value):
         ("docker.yml", "ubuntu-latest-32-arm-core", "ubuntu-24.04-arm"),
         ("windows-venv-e2e.yml", "windows-latest-32-core", "windows-latest"),
         ("pm-bundle.yml", "windows-latest-32-core", "windows-latest"),
-        ("pm-bundle.yml", "windows-latest-32-arm-core", "windows-latest"),
+        ("pm-bundle.yml", "windows-latest-32-arm-core", "windows-11-arm"),
         ("desktop-bundled-release.yml", "windows-latest-32-core", "windows-latest"),
-        ("desktop-bundled-release.yml", "windows-latest-32-arm-core", "windows-latest"),
+        ("desktop-bundled-release.yml", "windows-latest-32-arm-core", "windows-11-arm"),
         ("desktop-bundled-release.yml", "ubuntu-latest-32-core", "ubuntu-latest"),
     ],
 )
@@ -73,20 +73,25 @@ def test_large_runner_labels_have_a_standard_fork_fallback(filename, large, stan
 def test_compound_arch_and_owner_gate_has_standard_fallback(filename, arch_expr_fragment):
     """Files that already branch on arch get the owner-gate wrapped AROUND
     the existing arch ternary, not a separate/duplicated expression, and
-    still resolve to a standard (non-paid) label on a non-Nous owner."""
+    still resolve to an architecture-matching standard (non-paid) label on
+    a non-Nous owner: windows-11-arm for the arm64 branch, windows-latest
+    for the x64 branch."""
     text = (WORKFLOWS / filename).read_text()
     matches = [line for line in text.splitlines() if arch_expr_fragment in line and "runs-on" in line]
     assert matches, f"expected arch-gated runs-on line in {filename}"
     for line in matches:
         assert OWNER in line, line
         assert "windows-latest-32" in line
-        assert line.strip().endswith("'windows-latest' }}"), line
+        assert "windows-11-arm" in line, line
+        assert line.strip().endswith("|| 'windows-latest' }}") or line.strip().endswith(
+            "|| (" + arch_expr_fragment + " && 'windows-11-arm' || 'windows-latest') }}"
+        ), line
 
 
 def test_windows_bundle_sdk_matrix_array_has_fork_fallback():
     document = _load(WORKFLOWS / "windows-bundle-sdk.yml")
     runners = document["jobs"]["windows-bundle-tools"]["strategy"]["matrix"]["runner"]
-    expected = "${{ " + OWNER + " && 'windows-latest-32-arm-core' || 'windows-latest' }}"
+    expected = "${{ " + OWNER + " && 'windows-latest-32-arm-core' || 'windows-11-arm' }}"
     assert runners == [expected, expected]
 
 
