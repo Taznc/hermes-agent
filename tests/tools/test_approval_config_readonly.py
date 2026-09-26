@@ -86,14 +86,41 @@ def test_config_readers_never_call_deepcopy_variant(config_home, monkeypatch):
 
 def test_readers_return_live_cache_without_corrupting_it(
         config_home, monkeypatch):
-    """Guard-population check for the readonly swap: repeated reads return
-    the same cached object and the cache stays intact — no swapped site
-    may mutate what it returns."""
+    """Guard-population check for the readonly swap: repeated reads observe the same
+    values and the cache stays intact — no swapped site may corrupt what it returns.
+
+    ``first is second`` is NOT the contract here (and pinning it caused a production
+    incident): commit abd57025c4 deliberately made ``load_config_readonly()`` mint a
+    *fresh* hollow wrapper on every call specifically so that no caller ever holds an
+    object the cache owns — the prior single-shared-instance design let a caller retain
+    a nested container and mutate it (even via an unbound ``dict``/``list`` base-class
+    method, which bypasses a subclass's overridden mutators) while another thread was
+    deepcopying the *same* object, which never terminated and wedged a gateway for 16
+    hours (see hermes_cli/config_snapshot.py's ``readonly_view``/``FrozenDict`` docs).
+    So this test pins the actual contract named in its title — corruption resistance —
+    not object identity: repeated reads are value-equal, a normal mutation attempt is
+    refused (``FrozenConfigError``), and even an unbound base-class mutation on a
+    returned view (the exact vector abd57025c4 closed) never reaches the shared cache
+    or a subsequent, independent read."""
+    from hermes_cli.config_snapshot import FrozenConfigError
+
     first = _get_approval_config()
     second = _get_approval_config()
-    assert first is second  # live cache object, no deepcopy
-    # a full guard pass must leave the cache values untouched
+    assert first == second  # value-equal repeated reads
     before = dict(first)
+
+    # A normal (bound) mutation attempt is refused outright.
+    with pytest.raises(FrozenConfigError):
+        first["mode"] = "smart"
+
+    # The harder case: an unbound base-class mutator bypasses FrozenDict's overridden
+    # __setitem__ (this is exactly what escaped the pre-fix "subclass with overridden
+    # mutators" design). It must corrupt only the throwaway view it was handed —
+    # never the shared cache a subsequent independent read observes.
+    dict.__setitem__(first, "mode", "CORRUPTED")
+    assert _get_approval_config()["mode"] == before["mode"]
+
+    # A full guard pass must leave the cache values untouched too.
     check_all_command_guards("ls -la", "local")
     _get_cron_approval_mode()
     load_permanent_allowlist()

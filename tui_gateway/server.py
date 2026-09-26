@@ -458,6 +458,14 @@ def _db_unavailable_error(rid, *, code: int):
 # ── Per-session profile scoping: the desktop's app-global remote mode points every profile at this
 # backend, so calls carry ``profile`` → open that profile's db and bind its HERMES_HOME (ContextVar
 # override) so config/skills/model/persistence resolve to it. Omitted/own profile → launch profile.
+class ProfileUnavailableError(FileNotFoundError):
+    """An explicit ``profile`` param names no live profile on this host. Raised out of the method
+    (never a silent fall-back to the launch profile) so a missing/traversal-shaped target is refused
+    instead of resolving; ``handle_request`` maps it to JSON-RPC 4064 (the code every other
+    profile-scoped surface already uses for "profile not found") so it becomes a typed refusal
+    response instead of an uncaught exception escaping dispatch()."""
+
+
 def _profile_home(profile: str | None) -> Path | None:
     """Resolve a named profile's home on THIS host, or None for the launch profile."""
     if not (name := (profile or "").strip()):
@@ -465,7 +473,7 @@ def _profile_home(profile: str | None) -> Path | None:
     from hermes_cli import profiles as profiles_mod
     home = Path(profiles_mod.get_profile_dir(name))
     if not home.is_dir():
-        raise FileNotFoundError(f"Profile '{name}' does not exist.")
+        raise ProfileUnavailableError(f"Profile '{name}' does not exist.")
     if home.resolve() == Path(_hermes_home).resolve():
         return None  # already the launch profile (no override needed)
     _served_profile_homes.add(home)  # the change watcher must stat every served sibling store too
@@ -749,6 +757,8 @@ def handle_request(req: dict) -> dict | None:
     token = _current_rpc_method.set(method)
     try:
         return fn(rid, params)
+    except ProfileUnavailableError as exc:
+        return _err(rid, 4064, str(exc))
     finally:
         _current_rpc_method.reset(token)
 
