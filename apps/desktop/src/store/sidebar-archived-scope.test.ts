@@ -18,11 +18,12 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
 import type { SessionInfo } from '@/types/hermes'
 
-import { $sidebarGrouping, $sidebarShowArchived, setSidebarGrouping, setSidebarShowArchived } from './layout'
+import { $pinnedSessionIds, $sidebarGrouping, $sidebarShowArchived, setSidebarGrouping, setSidebarShowArchived } from './layout'
 import { $projectTree } from './projects'
-import { $sessions } from './session'
+import { $sessions, mergeSessionPage } from './session'
 import { $archivedSessions } from './sidebar-archive'
 import {
+  $sidebarPinnedSessions,
   $sidebarProjectModel,
   $sidebarScopedSessions,
   $sidebarUnpinnedAgentSessions,
@@ -42,6 +43,7 @@ describe('sidebar archived-row scoping', () => {
     $archivedSessions.set([])
     $projectTree.set([])
     $sidebarShowArchived.set(false)
+    $pinnedSessionIds.set([])
     setSidebarGrouping('date')
   })
 
@@ -50,6 +52,7 @@ describe('sidebar archived-row scoping', () => {
     $archivedSessions.set([])
     $projectTree.set([])
     $sidebarShowArchived.set(false)
+    $pinnedSessionIds.set([])
     setSidebarGrouping('date')
   })
 
@@ -123,5 +126,49 @@ describe('sidebar archived-row scoping', () => {
 
     expect($sidebarGrouping.get()).toBe('project')
     expect($sidebarWorktreeGroupingActive.get()).toBe(true)
+  })
+
+  // Regression (t_7feb9e6d): external `hermes sessions archive --ids` updates
+  // the durable DB, but the desktop's own `$sessions` cache was populated
+  // BEFORE that mutation. The next normal-mode page excludes the now-archived
+  // row, yet `mergeSessionPage` deliberately RETAINS `keep`-protected rows
+  // (pinned / working / open tiles / active) that the server page dropped —
+  // so a stale `{archived: false}` snapshot of that exact row survives the
+  // merge and re-enters the normal sidebar even though the independent
+  // archived-only query already reports it `archived: true`. The centralized
+  // membership boundary this card owns must reject that stale row from every
+  // normal-mode surface (flat + grouped) regardless of why mergeSessionPage
+  // kept it, and it must still surface once Archived is toggled on.
+  describe('external CLI archive of an open/pinned tile (stale mergeSessionPage survivor)', () => {
+    for (const grouping of ['project', 'date'] as const) {
+      it(`does not include a kept stale archived=false row in normal ${grouping} sidebar`, () => {
+        setSidebarGrouping(grouping)
+        const x = row('external-archive-X', { archived: false })
+        // External archive: the fresh normal-mode page no longer carries X.
+        const incoming: SessionInfo[] = []
+        const retained = mergeSessionPage([x], incoming, [x.id])
+        $sessions.set(retained)
+        $archivedSessions.set([row(x.id, { archived: true })])
+
+        expect(retained).toContainEqual(x) // proves the stale cache survives the merge
+        expect($sidebarScopedSessions.get().map(session => session.id)).not.toContain(x.id)
+        expect($sidebarUnpinnedAgentSessions.get().map(session => session.id)).not.toContain(x.id)
+
+        // A stale pin is another normal-sidebar surface, independent of rows
+        // rendered by the server-owned project tree.
+        $pinnedSessionIds.set([x.id])
+        expect($sidebarPinnedSessions.get().map(session => session.id)).not.toContain(x.id)
+      })
+    }
+
+    it('shows the canonical archived row once Archived is on', () => {
+      const x = row('external-archive-X', { archived: false })
+
+      $sessions.set(mergeSessionPage([x], [], [x.id]))
+      $archivedSessions.set([row(x.id, { archived: true })])
+      setSidebarShowArchived(true)
+
+      expect($sidebarScopedSessions.get().map(session => session.id)).toContain(x.id)
+    })
   })
 })

@@ -92,26 +92,73 @@ import { $archivedSessions } from './sidebar-archive'
 // learned, same comment as the sidebar root's original `prLookupsByRepo`.
 void _prBranchBySession
 
+let archivedIdentitySetCache: ReadonlySet<string> = new Set()
+
+/** Every id `$archivedSessions` (the independently-fetched, authoritative
+ *  archived-only query) currently confirms archived — both the live id and
+ *  the lineage root, mirroring `$sidebarPinnedIdentitySet`'s identity rule.
+ *  `stableSet`-guarded so a recompute landing on the same membership doesn't
+ *  push a fresh Set reference through the predicate below. */
+export const $sidebarArchivedIdentitySet = computed($archivedSessions, archived => {
+  const ids = new Set<string>()
+
+  for (const session of archived) {
+    ids.add(session.id)
+
+    if (session._lineage_root_id) {
+      ids.add(session._lineage_root_id)
+    }
+  }
+
+  return (archivedIdentitySetCache = stableSet(archivedIdentitySetCache, ids))
+})
+
+/** THE single archive-membership policy every normal-mode sidebar surface
+ *  (flat Recents, grouped-by-project, Pinned, profile groups) must consult —
+ *  replaces the two guards that used to each answer "is this archived?" from
+ *  a different, partial signal (fixes t_7feb9e6d: an externally archived,
+ *  `keep`-protected row can survive `mergeSessionPage` carrying its stale
+ *  `archived: false` snapshot, so trusting the row's own flag alone is not
+ *  enough). A session counts as archived when EITHER its own flag says so
+ *  (the ordinary, non-stale case) OR the independently-fetched archived-only
+ *  set already confirms it under either identity — whichever signal has
+ *  caught up first wins, so neither a stale cache nor a not-yet-refreshed
+ *  archived query can hide a row the other one already knows about.
+ *
+ *  Per the diagnosis card's final decision: no exceptions for pinned, active,
+ *  working, open-tile, project, profile, or live-overlay rows. An archived
+ *  session may still stay open in the main content tile; it must not remain
+ *  in normal sidebar membership. */
+export const $sidebarIsArchivedSession = computed(
+  $sidebarArchivedIdentitySet,
+  archivedIds =>
+    (session: SessionInfo): boolean =>
+      session.archived === true ||
+      archivedIds.has(session.id) ||
+      (session._lineage_root_id != null && archivedIds.has(session._lineage_root_id))
+)
+
 /** Sessions in scope: the archived set when Archived is on, else the live
  *  list — narrowed to the active profile scope. Reference changes whenever
  *  `$sessions`/`$archivedSessions` do (session-list churn is out of scope for
  *  this file, see header), but nothing downstream of a section that doesn't
  *  read this store pays for that.
  *
- *  The live branch drops `archived: true` rows because `$sessions` is a CACHE
- *  of the backend's archived-excluded page, not a re-derivation of it: a
- *  session archived by any other surface (CLI, another client, a bulk sweep)
- *  can sit in it until a refresh evicts it, and `mergeSessionPage` deliberately
- *  RETAINS `keep`-protected rows (pinned / working / open tiles / active) that
- *  the server page already dropped. The project overlays each carry their own
- *  `isLiveArchived` guard for this same reason; filtering at the shared root
- *  means every consumer — flat Recents, grouped-by-project, profile groups —
- *  agrees, instead of each one re-deriving the rule. */
+ *  The live branch drops every row `$sidebarIsArchivedSession` flags because
+ *  `$sessions` is a CACHE of the backend's archived-excluded page, not a
+ *  re-derivation of it: a session archived by any other surface (CLI, another
+ *  client, a bulk sweep) can sit in it until a refresh evicts it, and
+ *  `mergeSessionPage` deliberately RETAINS `keep`-protected rows (pinned /
+ *  working / open tiles / active) that the server page already dropped —
+ *  possibly still carrying a stale `archived: false`. Filtering at the shared
+ *  root through the one centralized predicate means every consumer agrees,
+ *  instead of each one re-deriving (and each one only partially reproducing)
+ *  the rule. */
 export const $sidebarScopedSessions = computed(
-  [$sessions, $archivedSessions, $sidebarShowArchived, $profileScope],
-  (sessions, archived, showArchived, profileScope) =>
+  [$sessions, $archivedSessions, $sidebarShowArchived, $profileScope, $sidebarIsArchivedSession],
+  (sessions, archived, showArchived, profileScope, isArchivedSession) =>
     filterSessionsByProfileScope(
-      showArchived ? archived : sessions.filter(session => session.archived !== true),
+      showArchived ? archived : sessions.filter(session => !isArchivedSession(session)),
       profileScope
     )
 )
@@ -271,12 +318,15 @@ export const $sidebarIsPinnedSession = computed(
 
 /** What the project tree drops: pins (their own section) plus anything the
  *  active filters exclude — the same rule the flat list applies, so filtering
- *  reads the same whether you're looking at lanes or the flat view. */
+ *  reads the same whether you're looking at lanes or the flat view. Archive
+ *  membership is resolved through the one centralized `$sidebarIsArchivedSession`
+ *  policy (see its doc) so a stale backend project-tree snapshot row is
+ *  dropped by the exact same rule a stale `$sessions` cache row is. */
 export const $sidebarIsHiddenFromProjects = computed(
-  [$sidebarIsPinnedSession, $sidebarFiltersNarrow, $sidebarSessionMatchesFilters],
-  (isPinnedSession, filtersNarrow, sessionMatchesFilters) =>
+  [$sidebarIsPinnedSession, $sidebarFiltersNarrow, $sidebarSessionMatchesFilters, $sidebarIsArchivedSession],
+  (isPinnedSession, filtersNarrow, sessionMatchesFilters, isArchivedSession) =>
     (session: SessionInfo): boolean =>
-      session.archived === true || isPinnedSession(session) || (filtersNarrow && !sessionMatchesFilters(session))
+      isArchivedSession(session) || isPinnedSession(session) || (filtersNarrow && !sessionMatchesFilters(session))
 )
 
 /** Sorted sessions with pins excluded — recents order, feeds the flat
