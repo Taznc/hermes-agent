@@ -339,6 +339,43 @@ describe('focus answer bar', () => {
     }
   })
 
+  it('folds the cards a trace does not touch into "+N cards" gaps, and opening one keeps the trace', async () => {
+    await mount()
+    const gaps = () => Array.from(root.querySelectorAll<HTMLElement>('[data-lane-gap]'))
+
+    expect(gaps()).toHaveLength(0)
+
+    // Focus `h1`: its links are `x` (blocker) and `f` (dependant). `h2` (same
+    // lane), `c` and `d` are unrelated, so they fold; linked cards stay.
+    focusCard('h1')
+    await waitFor(() => expect(gaps().length).toBeGreaterThan(0))
+
+    for (const key of ['h1', 'x', 'f']) {
+      expect(cardByKey(key), key).not.toBeNull()
+    }
+
+    for (const key of ['h2', 'c', 'd']) {
+      expect(cardByKey(key), key).toBeNull()
+    }
+
+    // Every card is still accounted for: folded counts + rendered cards = board.
+    const folded = gaps().reduce((sum, gap) => sum + Number(gap.getAttribute('data-lane-gap')), 0)
+
+    expect(folded + root.querySelectorAll('[data-card-key]').length).toBe(6)
+
+    // Opening a gap shows its cards and does NOT count as a click off the board.
+    const onHold = gaps().find(gap => gap.closest('[data-lane-scroller]')?.contains(cardByKey('h1')))!
+
+    fireEvent.click(onHold)
+    await waitFor(() => expect(cardByKey('h2')).not.toBeNull())
+    expect(bar()).not.toBeNull()
+
+    // Clearing the focus restores every lane in full.
+    fireEvent.keyDown(window, { key: 'Escape' })
+    await waitFor(() => expect(gaps()).toHaveLength(0))
+    expect(root.querySelectorAll('[data-card-key]')).toHaveLength(6)
+  })
+
   it('lines never take pointer events, so a card under a line stays clickable', async () => {
     await mount()
     focusCard('f')

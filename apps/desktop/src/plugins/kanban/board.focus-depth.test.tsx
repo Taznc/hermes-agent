@@ -114,12 +114,14 @@ describe('focus depth on the board', () => {
 
     const dimmed = (title: string) => cardOf(title).classList.contains('opacity-35')
 
-    // Direct: parent lit, grandparent dimmed.
+    // Direct: parent lit; the grandparent is outside the trace, so it is
+    // folded into its lane's "+N cards" gap rather than drawn.
     expect(dimmed('Parent')).toBe(false)
-    expect(dimmed('Grandparent')).toBe(true)
+    expect(cardOf('Grandparent')).toBeUndefined()
 
     fireEvent.click(screen.getByRole('button', { name: 'depFocusChain' }))
 
-    await waitFor(() => expect(dimmed('Grandparent')).toBe(false))
+    await waitFor(() => expect(cardOf('Grandparent')).toBeDefined())
+    expect(dimmed('Grandparent')).toBe(false)
   })
 })

@@ -35,8 +35,9 @@ import {
 
 import { FocusRollup } from './answer-bar'
 import { $lanesByProfile, addRoadmapIdea, fetchAttachmentDataUrl } from './api'
-import { focusRole, hasDependencies, PROMOTABLE_STATUSES, useDependencies } from './dependency-view'
+import { EMPTY_IDS, focusRole, hasDependencies, PROMOTABLE_STATUSES, useDependencies } from './dependency-view'
 import { blockerStand, downstreamOf, taskCardKey, upstreamOf } from './deps'
+import { foldLane } from './lane-fold'
 import { PriorityPicker } from './priority-picker'
 import { type BoardAllInfo, columnMeta, isRoadmapLane, type KanbanTask, laneDropAllowed } from './types'
 import {
@@ -636,6 +637,78 @@ export function Card({
 
 const UNASSIGNED_LANE = 'unassigned'
 
+/** Marks a folded run of unrelated cards. The board's click-off-to-clear
+ *  handler skips it, so opening a gap never ends the trace it belongs to. */
+export const LANE_GAP_ATTR = 'data-lane-gap'
+
+type CardActions = Pick<
+  Parameters<typeof Card>[0],
+  'columns' | 'onDelete' | 'onMove' | 'onOpen' | 'onSetPriority' | 'onToggleSelect'
+>
+
+/**
+ * A lane's cards. While a card is focused, every run of cards that are NOT in
+ * the trace folds into one small "+N cards" marker, so the linked cards in
+ * every lane sit together on screen instead of being spread down lanes the
+ * user has to scroll. Nothing is lost: the marker says how many it holds, and
+ * clicking it puts those cards back (for this focus only). Selected cards
+ * never fold — a bulk action must not hit cards the user can't see.
+ */
+function LaneCards({
+  actions,
+  onOpenGap,
+  openGaps,
+  selected,
+  tasks
+}: {
+  actions: CardActions
+  onOpenGap: (id: string) => void
+  openGaps: ReadonlySet<string>
+  selected: ReadonlySet<string>
+  tasks: KanbanTask[]
+}) {
+  const k = useKanban()
+  const deps = useDependencies()
+
+  const card = (task: KanbanTask) => (
+    <Card {...actions} key={taskCardKey(task)} selected={selected.has(taskCardKey(task))} task={task} />
+  )
+
+  if (!deps.focused) {
+    return <>{tasks.map(card)}</>
+  }
+
+  const slots = foldLane(
+    tasks,
+    taskCardKey,
+    task => focusRole(deps, taskCardKey(task)) !== null || selected.has(taskCardKey(task)),
+    openGaps
+  )
+
+  return (
+    <>
+      {slots.map(slot =>
+        slot.kind === 'card' ? (
+          card(slot.item)
+        ) : (
+          <Tip key={`gap:${slot.id}`} label={k.depGapShow}>
+            <button
+              {...{ [LANE_GAP_ATTR]: slot.items.length }}
+              aria-label={`${k.depGap(slot.items.length)} · ${k.depGapShow}`}
+              className="flex shrink-0 items-center justify-center gap-1 rounded-md border border-dashed border-(--ui-stroke-tertiary) py-0.5 text-[0.625rem] tabular-nums text-(--ui-text-quaternary) transition-colors hover:border-(--ui-text-quaternary) hover:bg-(--chrome-action-hover) hover:text-(--ui-text-secondary)"
+              onClick={() => onOpenGap(slot.id)}
+              type="button"
+            >
+              <Codicon name="unfold" size="0.7rem" />
+              {k.depGap(slot.items.length)}
+            </button>
+          </Tip>
+        )
+      )}
+    </>
+  )
+}
+
 export function Column({
   collapsed,
   column,
@@ -670,6 +743,18 @@ export function Column({
   const label = columnLabel(k, column.name)
   const locked = isLockedTarget(column.name)
   const byProfile = useValue($lanesByProfile)
+  const { focused } = useDependencies()
+
+  // Gaps the user opened, remembered only for the focus they were opened
+  // under: a new trace folds from scratch.
+  const [opened, setOpened] = useState<{ focus: null | string; ids: ReadonlySet<string> }>({
+    focus: null,
+    ids: EMPTY_IDS
+  })
+
+  const openGaps = opened.focus === focused ? opened.ids : EMPTY_IDS
+  const onOpenGap = (id: string) => setOpened({ focus: focused, ids: new Set([...openGaps, id]) })
+  const actions: CardActions = { columns, onDelete, onMove, onOpen, onSetPriority, onToggleSelect }
 
   // The dashboard's "lanes by profile": sub-group Running by assignee so a
   // fleet's in-flight work reads per-worker. Null = flat (off, or trivial).
@@ -768,42 +853,32 @@ export function Column({
         </button>
       </header>
       <div className="relative flex min-h-0 flex-1 flex-col gap-2 overflow-y-auto" data-lane-scroller>
-        {lanes
-          ? lanes.map(([assignee, tasks]) => (
-              <div className="flex flex-col gap-2" key={assignee}>
-                <div className="flex items-center gap-1.5 px-1 pt-1 text-[0.625rem] text-(--ui-text-quaternary)">
-                  {assignee !== UNASSIGNED_LANE && <Avatar name={assignee} size="0.875rem" />}
-                  {assignee}
-                  <span className="tabular-nums">{tasks.length}</span>
-                </div>
-                {tasks.map(task => (
-                  <Card
-                    columns={columns}
-                    key={taskCardKey(task)}
-                    onDelete={onDelete}
-                    onMove={onMove}
-                    onOpen={onOpen}
-                    onSetPriority={onSetPriority}
-                    onToggleSelect={onToggleSelect}
-                    selected={selected.has(taskCardKey(task))}
-                    task={task}
-                  />
-                ))}
+        {lanes ? (
+          lanes.map(([assignee, tasks]) => (
+            <div className="flex flex-col gap-2" key={assignee}>
+              <div className="flex items-center gap-1.5 px-1 pt-1 text-[0.625rem] text-(--ui-text-quaternary)">
+                {assignee !== UNASSIGNED_LANE && <Avatar name={assignee} size="0.875rem" />}
+                {assignee}
+                <span className="tabular-nums">{tasks.length}</span>
               </div>
-            ))
-          : column.tasks.map(task => (
-              <Card
-                columns={columns}
-                key={taskCardKey(task)}
-                onDelete={onDelete}
-                onMove={onMove}
-                onOpen={onOpen}
-                onSetPriority={onSetPriority}
-                onToggleSelect={onToggleSelect}
-                selected={selected.has(taskCardKey(task))}
-                task={task}
+              <LaneCards
+                actions={actions}
+                onOpenGap={onOpenGap}
+                openGaps={openGaps}
+                selected={selected}
+                tasks={tasks}
               />
-            ))}
+            </div>
+          ))
+        ) : (
+          <LaneCards
+            actions={actions}
+            onOpenGap={onOpenGap}
+            openGaps={openGaps}
+            selected={selected}
+            tasks={column.tasks}
+          />
+        )}
         {/* Jira-style lane add — dashed, faded in on lane hover. Opacity (not
             display) so it always holds its slot and never thrashes layout.
             Locked lanes get none: you can't create into a system state. The
