@@ -269,6 +269,7 @@ def test_auto_assigned_reviewer_survives_request_changes_round_trip(kanban_home:
 
         ok, implementer = kb.request_changes(
             conn, tid, reason="needs more tests", expected_run_id=run_id,
+        blockers=[{"basis": "original_ac", "reference": "test acceptance contract"}],
         )
         assert ok is True
         assert implementer == "claudeprimary"
