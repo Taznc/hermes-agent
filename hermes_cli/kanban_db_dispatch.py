@@ -2024,6 +2024,10 @@ def _dispatch_lane_task(
             result.skipped_per_profile_capped.append((task_id, assignee, current))
             return False
     guard_reason = check_respawn_guard(conn, task_id, lane=lane)
+    # >>> FORK ANCHOR: pr-requeue-recovery <<<
+    from hermes_fork.kanban.pr_requeue import release as _fork_pr_release
+    guard_reason = _fork_pr_release(conn, task_id, guard_reason, dry_run=dry_run)
+    # <<< FORK ANCHOR >>>
     if guard_reason is not None:
         result.respawn_guarded.append((task_id, guard_reason))
         # Event so ``hermes kanban tail`` shows why the task looks stuck.
