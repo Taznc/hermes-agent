@@ -76,6 +76,13 @@ def fork_method(name: str, *, params: type[Params], result: type[Result], doc: s
     return dec
 
 
+def upstream_methods(methods: dict) -> dict:
+    """*methods* without the ``fork.*`` contracts (``gateway-contracts-upstream-only`` anchor in
+    ``scripts/gen_gateway_contracts.py``): the committed upstream TS/OpenRPC artefacts render the same
+    bytes whether or not ``tui_gateway.server`` (and so this registry) ran first in the interpreter."""
+    return {name: c for name, c in methods.items() if not name.startswith(FORK_PREFIX)}
+
+
 def _fork_method_modules() -> tuple[ModuleType, ...]:
     """Every fork gateway method module. Add each new ``methods_*`` module here."""
     from hermes_fork.gateway import methods_ping

@@ -35,6 +35,9 @@ from tui_gateway.contracts.connectors import (  # noqa: E402
 )
 from tui_gateway.contracts.connectors_operation import ConnectionSettleReason, ConnectionTargetState  # noqa: E402
 from tui_gateway.contracts.registry import EVENTS, METHODS, SERVER_REQUESTS  # noqa: E402
+# >>> FORK ANCHOR: gateway-contracts-upstream-only <<<
+from hermes_fork.gateway.registry import upstream_methods as _upstream_methods  # noqa: E402
+METHODS = _upstream_methods(METHODS)
 from tools.connectors.contract import SettleReason, TargetState  # noqa: E402
 from tools.connectors.gateway.wire import ConnectionStatus  # noqa: E402
 from tools.connectors.portal.tools_cache import ToolsRead  # noqa: E402
