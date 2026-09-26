@@ -5,7 +5,7 @@ from __future__ import annotations
 
 from tui_gateway.contracts.base import Params, Result
 
-from hermes_fork.gateway import fork_method
+from hermes_fork.gateway.registry import fork_method
 
 
 class ForkPingParams(Params):
