@@ -35,6 +35,14 @@ Decision order for any request: can it be a skill? an MCP server? a plugin
 (Python `on_*` hook or Desktop SDK contribution point)? a new file? an anchor?
 Only then inline.
 
+If it's *almost* a plugin but the plugin system can't do one part, consider a
+**fork extension point**: a generic, additive capability under `ctx.fork.*` /
+`host.fork.*` (T1 module + T2 anchor), with the feature shipped as a plugin on
+top. Use one when a second feature would likely use it or inlining would touch
+busy upstream files. Existing hooks and SDK methods never change, so public
+plugins keep working on `next`. Register it as an X-row in the ledger's Part C.
+Full rules: `next-branch-policy.md` § Fork extension points.
+
 ## Hard rules
 
 - **Never** edit i18n catalogs (`apps/desktop/src/i18n/*.json`) directly — use the overlay in `src/i18n/fork/`.
@@ -80,7 +88,7 @@ Prior art — <feature>
   ledger:    <id + decision | not listed>
   upstream:  <shipped in <sha/PR> | open PR #N (<title>, <age>) | rejected PR #N: <reason> | none found (queries: ...)>
   dev:       <commits/paths | none>
-  seam:      <T0 plugin via <hook> | T1 | needs T2 anchor at <file> | T3 because ...>
+  seam:      <T0 plugin via <hook> | T0 plugin + fork extension point X<nn> (new/existing) | T1 | needs T2 anchor at <file> | T3 because ...>
   proposal:  <use upstream's | wait for PR #N | build at T<n>: ...>
 ```
 
