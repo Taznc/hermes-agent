@@ -10,6 +10,8 @@ import {
   recoverActiveSourceAfterFailedGatewaySwitch,
   registerGatewaySwitchLifecycle
 } from '@/store/gateway-switch'
+import { $pinnedSessionIds, $sidebarShowArchived, setSidebarGrouping } from '@/store/layout'
+import { $projectTree } from '@/store/projects'
 import {
   $cronSessions,
   $messagingPlatformTotals,
@@ -28,6 +30,8 @@ import {
   setSessions,
   setSessionsLoading
 } from '@/store/session'
+import { $archivedSessions } from '@/store/sidebar-archive'
+import { $sidebarPinnedSessions, $sidebarProjectModel, $sidebarScopedSessions } from '@/store/sidebar-model'
 
 import { deferred } from '../../../test/deferred'
 
@@ -109,6 +113,7 @@ beforeEach(() => {
   getCronJobs.mockResolvedValue([])
   listSidebarSessions.mockReset()
   listAllProfileSessions.mockReset()
+  listAllProfileSessions.mockResolvedValue({ limit: 200, offset: 0, sessions: [], total: 0 })
   removed.ids = new Set()
   setCronJobs([])
   setSessions([])
@@ -119,6 +124,11 @@ beforeEach(() => {
   setSessionProfilesTruncated({})
   setSessionProfilesUsage({})
   setSessionsLoading(false)
+  $archivedSessions.set([])
+  $pinnedSessionIds.set([])
+  $sidebarShowArchived.set(false)
+  $projectTree.set([])
+  setSidebarGrouping('date')
 })
 
 afterEach(() => {
@@ -132,6 +142,11 @@ afterEach(() => {
   setSessionProfilesTruncated({})
   setSessionProfilesUsage({})
   setSessionsLoading(false)
+  $archivedSessions.set([])
+  $pinnedSessionIds.set([])
+  $sidebarShowArchived.set(false)
+  $projectTree.set([])
+  setSidebarGrouping('date')
 })
 
 describe('refreshSessions identity + loading hygiene', () => {
@@ -442,6 +457,110 @@ describe('refreshSessions identity + loading hygiene', () => {
   })
 })
 
+describe('refreshSessions keeps the archived identity set warm', () => {
+  // Regression (round-2 review, t_d0a6300e): `$sidebarArchivedIdentitySet` /
+  // `$sidebarIsArchivedSession` only ever populated when the user opened the
+  // Archived filter. A session archived by another surface (CLI, another
+  // client) between refreshes — while `mergeSessionPage` keep-protects it
+  // here as pinned/open — had no archived-identity signal to be rejected
+  // against, so it kept showing in Recents/Projects even with Archived OFF.
+  // `refreshSessions` must warm that set on every normal-mode refresh, not
+  // only when the Archived filter is toggled on.
+  it('fetches the archived-only slice on every refresh, with the Archived filter off', async () => {
+    listSidebarSessions.mockResolvedValue(sidebar({ sessions: [row('a')] }))
+
+    const { result } = renderHook(() => useSessionListActions({ profileScope: 'default' }))
+
+    await act(async () => {
+      await result.current.refreshSessions()
+    })
+
+    // The 'only' archived slice is a distinct query from any recents/cron/
+    // messaging read (those go through listSidebarSessions).
+    expect(listAllProfileSessions.mock.calls.some(call => call[2] === 'only')).toBe(true)
+  })
+
+  it('lands the fetched archived rows in the store the identity predicate reads', async () => {
+    listSidebarSessions.mockResolvedValue(sidebar({ sessions: [row('a')] }))
+    listAllProfileSessions.mockResolvedValue({
+      limit: 200,
+      offset: 0,
+      sessions: [row('archived-elsewhere', { archived: true })],
+      total: 1
+    })
+
+    const { result } = renderHook(() => useSessionListActions({ profileScope: 'default' }))
+
+    await act(async () => {
+      await result.current.refreshSessions()
+    })
+
+    expect($archivedSessions.get().map(session => session.id)).toEqual(['archived-elsewhere'])
+  })
+
+  it('hides an externally archived pinned survivor in Project and Date, then shows it in Archived', async () => {
+    const stale = row('external-archive-X', { archived: false })
+    const archived = row(stale.id, { archived: true })
+    const live = row('live')
+    // X was pinned while still live. The external CLI archive has removed it
+    // from the normal backend page, but this window has not queried Archived.
+    setSessions([stale, live])
+    $pinnedSessionIds.set([stale.id])
+    expect($archivedSessions.get()).toEqual([])
+    expect($sidebarScopedSessions.get().map(session => session.id)).toContain(stale.id)
+    expect($sidebarPinnedSessions.get().map(session => session.id)).toContain(stale.id)
+    $projectTree.set([
+      {
+        id: 'project-1',
+        label: 'Project',
+        path: '/repo',
+        sessionCount: 2,
+        repos: [
+          {
+            id: '/repo',
+            label: 'repo',
+            path: '/repo',
+            sessionCount: 2,
+            groups: [{ id: 'main', isMain: true, label: 'main', path: '/repo', sessions: [stale, live] }]
+          }
+        ]
+      }
+    ])
+    listSidebarSessions.mockResolvedValue(sidebar({ sessions: [live] }))
+    listAllProfileSessions.mockResolvedValue({ limit: 200, offset: 0, sessions: [archived], total: 1 })
+
+    const { result } = renderHook(() => useSessionListActions({ profileScope: 'default' }))
+    await act(async () => {
+      await result.current.refreshSessions()
+      // The archived query is independent of the batched sidebar response.
+      await vi.waitFor(() => expect($archivedSessions.get().map(session => session.id)).toEqual([stale.id]))
+    })
+
+    expect(listAllProfileSessions.mock.calls.some(call => call[2] === 'only')).toBe(true)
+    expect($sessions.get().map(session => session.id)).toContain(stale.id) // merge keep really happened
+
+    for (const grouping of ['project', 'date'] as const) {
+      setSidebarGrouping(grouping)
+      expect($sidebarScopedSessions.get().map(session => session.id)).not.toContain(stale.id)
+      expect($sidebarPinnedSessions.get().map(session => session.id)).not.toContain(stale.id)
+
+      if (grouping === 'project') {
+        const projectSessionIds = $sidebarProjectModel
+          .get()
+          .flatMap(project =>
+            project.repos.flatMap(repo => repo.groups.flatMap(group => group.sessions.map(session => session.id)))
+          )
+
+        expect(projectSessionIds).toContain(live.id)
+        expect(projectSessionIds).not.toContain(stale.id)
+      }
+    }
+
+    $sidebarShowArchived.set(true)
+    expect($sidebarScopedSessions.get().map(session => session.id)).toContain(stale.id)
+  })
+})
+
 describe('refreshSessions batches slices into one request', () => {
   it('makes a single sidebar call and distributes recents / cron / messaging', async () => {
     const recents = [row('a'), row('b')]
@@ -456,9 +575,13 @@ describe('refreshSessions batches slices into one request', () => {
       await result.current.refreshSessions()
     })
 
-    // One batched call, not three separate listAllProfileSessions reads.
+    // One batched call, not three separate listAllProfileSessions reads for
+    // recents/cron/messaging. The archived-only identity set is a distinct,
+    // independently-queried slice (see sidebar-archive.ts) kept warm on the
+    // same cadence — any listAllProfileSessions call this refresh makes must
+    // be that 'only' query, never a recents/cron/messaging read.
     expect(listSidebarSessions).toHaveBeenCalledTimes(1)
-    expect(listAllProfileSessions).not.toHaveBeenCalled()
+    expect(listAllProfileSessions.mock.calls.every(call => call[2] === 'only')).toBe(true)
 
     // Each slice landed in its own store.
     expect($sessions.get().map(s => s.id)).toEqual(['a', 'b'])

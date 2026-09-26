@@ -47,9 +47,17 @@ const projectActivityTime = (project: SidebarProjectTree): number =>
 // `project.repos[].groups[].sessions` holds at call time, and staying archived-safe
 // here means the invariant holds even if a future caller feeds it a hydrated
 // (drilled-in) tree instead of the empty-lane overview shape it expects today.
-export const latestProjectSessions = (project: SidebarProjectTree, limit: number): SessionInfo[] =>
+// Accepts the same injected-predicate override as the overlay functions in
+// workspace-groups.ts, so a caller wired into the centralized
+// `$sidebarIsArchivedSession` policy can reject a stale `archived: false` row
+// that the bare-flag default can't see (see that predicate's doc).
+export const latestProjectSessions = (
+  project: SidebarProjectTree,
+  limit: number,
+  isArchived: (session: SessionInfo) => boolean = session => session.archived === true
+): SessionInfo[] =>
   [...projectSessions(project)]
-    .filter(session => session.archived !== true)
+    .filter(session => !isArchived(session))
     .sort((a, b) => sessionRecency(b) - sessionRecency(a))
     .slice(0, limit)
 

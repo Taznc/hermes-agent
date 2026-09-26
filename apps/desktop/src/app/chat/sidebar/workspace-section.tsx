@@ -70,6 +70,7 @@ import { ackAllSessionsRead } from '@/store/session-unread'
 import { loadArchivedSessions } from '@/store/sidebar-archive'
 import {
   $sidebarAllProfilesActive,
+  $sidebarIsArchivedSession,
   $sidebarIsHiddenFromProjects,
   $sidebarProjectModel,
   $sidebarScopedSessions,
@@ -159,6 +160,7 @@ export function SidebarWorkspaceSection({
   const agentSessions = useStore($sidebarUnpinnedAgentSessions)
   const projectModel = useStore($sidebarProjectModel)
   const showAllProfiles = useStore($sidebarAllProfilesActive)
+  const isArchivedSession = useStore($sidebarIsArchivedSession)
 
   const profileScope = useStore($profileScope)
   const activeConnectionId = useStore($activeConnectionId)
@@ -500,16 +502,17 @@ export function SidebarWorkspaceSection({
         projects,
         showAllSessions ? Infinity : PROJECT_PREVIEW_COUNT,
         {
+          isArchived: isArchivedSession,
           removed: removedSessionIds,
           rankIds: sortOrderIds
         }
       ),
-    [projectOverview, agentSessions, projects, removedSessionIds, sortOrderIds, showAllSessions]
+    [projectOverview, agentSessions, projects, removedSessionIds, sortOrderIds, showAllSessions, isArchivedSession]
   )
 
   const enteredProjectOverlaySessions = useMemo(
-    () => reconcileEnteredProjectSessions(agentSessions, overviewEnteredProject?.previewSessions),
-    [agentSessions, overviewEnteredProject?.previewSessions]
+    () => reconcileEnteredProjectSessions(agentSessions, overviewEnteredProject?.previewSessions, isArchivedSession),
+    [agentSessions, overviewEnteredProject?.previewSessions, isArchivedSession]
   )
 
   // Overlay live `$sessions` onto the entered project so a just-created session
@@ -521,8 +524,10 @@ export function SidebarWorkspaceSection({
   // overlay always has a lane to place a missing in-project session into.
   const enteredProjectContent = useMemo(
     () =>
-      enteredProject ? overlayLiveLanes(enteredProject, enteredProjectOverlaySessions, removedSessionIds) : undefined,
-    [enteredProject, enteredProjectOverlaySessions, removedSessionIds]
+      enteredProject
+        ? overlayLiveLanes(enteredProject, enteredProjectOverlaySessions, removedSessionIds, isArchivedSession)
+        : undefined,
+    [enteredProject, enteredProjectOverlaySessions, removedSessionIds, isArchivedSession]
   )
 
   const onEnterProject = useCallback(
