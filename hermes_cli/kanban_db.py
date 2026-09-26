@@ -3375,6 +3375,11 @@ def request_review(
     def _ret(ok: bool, reason: Optional[str] = None):
         return (ok, reason) if with_reason else ok
 
+    # >>> FORK ANCHOR: pre-review-gate <<<
+    from hermes_cli.kanban_fork_review_gate import refusal as _fork_review_refusal
+    if not force and (_fork_gate_err := _fork_review_refusal(metadata)):
+        return _ret(False, _fork_gate_err)
+    # <<< FORK ANCHOR >>>
     summary = redact_review_value(summary)
     metadata = redact_review_value(metadata)
     # Declared (metadata["artifacts"]) and prose-referenced files
