@@ -2054,7 +2054,7 @@ def _dispatch_lane_task(
         return False
     # >>> FORK ANCHOR: kanban-unattended-route-policy <<<
     from hermes_fork.kanban.route_policy import deny_unapproved_route
-    if spawn_fn is None and deny_unapproved_route(conn, claimed, result, board=board):
+    if deny_unapproved_route(conn, claimed, result, board=board):
         return False
     # <<< FORK ANCHOR >>>
     try:

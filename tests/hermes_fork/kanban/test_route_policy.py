@@ -308,12 +308,66 @@ def test_operator_fix_then_unblock_spawns(home, spawned):
         assert spawned == [tid]
 
 
-def test_injected_spawn_fn_bypasses_gate(home):
-    """The anchor gates the production spawner only; callers that inject their
-    own ``spawn_fn`` (tests, embedders) decide for themselves."""
+def test_injected_spawn_fn_is_gated_too(home):
+    """An injected ``spawn_fn`` still launches an unattended worker, so the
+    gate runs before it exactly as before the default spawner."""
     _profile(home, "alpha", "{}\n")
+    _profile(home, "beta", APPROVED_PROFILE)
     got: list[str] = []
     with kbc.connect() as conn:
-        tid = kb.create_task(conn, title="injected", assignee="alpha")
-        kbd.dispatch_once(conn, spawn_fn=lambda task, ws: got.append(task.id))
-        assert got == [tid]
+        bad = kb.create_task(conn, title="injected bad", assignee="alpha")
+        ok = kb.create_task(conn, title="injected ok", assignee="beta")
+        res = kbd.dispatch_once(conn, spawn_fn=lambda task, ws: got.append(task.id))
+        assert got == [ok]
+        assert bad in res.auto_blocked
+        task = kb.get_task(conn, bad)
+        assert task.status == "blocked" and task.block_kind == "needs_input"
+        assert "not fully resolved" in _block_reason(conn, bad)
+
+
+def test_fork_suite_runs_with_gate_live():
+    """The repo-root conftest waives admission only outside tests/hermes_fork."""
+    assert rp._ADMIT_ALL_FOR_TESTS is False
+
+
+# -- endpoint / credential redirection --------------------------------------------------
+
+
+@pytest.mark.parametrize("override", [
+    "base_url: https://evil.example/v1",
+    "api_key: sk-other",
+    "key_env: OTHER_KEY",
+    "api_key_env: OTHER_KEY",
+])
+def test_approved_fallback_redirected_to_other_endpoint_is_denied(home, spawned, override):
+    """``resolve_runtime_with_fallback`` forwards a fallback entry's base_url /
+    key into ``resolve_runtime_provider``; an approved (provider, model, effort)
+    triple pointed at another endpoint or credential is not the approved route."""
+    _profile(home, "alpha", APPROVED_PROFILE.replace(
+        "  fallback_providers: []\n",
+        f"  fallback_providers:\n  - provider: anthropic\n    model: claude-opus-5-5\n    {override}\n",
+    ))
+    key = override.split(":", 1)[0]
+    with kbc.connect() as conn:
+        tid = kb.create_task(conn, title="fb redirect", assignee="alpha")
+        res = _dispatch(conn)
+        _assert_denied(conn, res, spawned, tid, "fallback[0] anthropic/claude-opus-5-5/high", key)
+
+
+@pytest.mark.parametrize("override", ["base_url: https://proxy.example/v1", "api_key: sk-other"])
+def test_approved_primary_redirected_to_other_endpoint_is_denied(home, spawned, override):
+    _profile(home, "alpha", APPROVED_PROFILE.replace("  provider: anthropic\n", f"  provider: anthropic\n  {override}\n"))
+    key = override.split(":", 1)[0]
+    with kbc.connect() as conn:
+        tid = kb.create_task(conn, title="primary redirect", assignee="alpha")
+        res = _dispatch(conn)
+        _assert_denied(conn, res, spawned, tid, "primary anthropic/claude-opus-5-5/high", f"model.{key}")
+
+
+def test_empty_endpoint_keys_are_not_overrides(home, spawned):
+    """``base_url: ''`` (what `hermes setup` writes) redirects nothing."""
+    _profile(home, "alpha", APPROVED_PROFILE.replace("  provider: anthropic\n", "  provider: anthropic\n  base_url: ''\n"))
+    with kbc.connect() as conn:
+        tid = kb.create_task(conn, title="empty base_url", assignee="alpha")
+        _dispatch(conn)
+        assert spawned == [tid]

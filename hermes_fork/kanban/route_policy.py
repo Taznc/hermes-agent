@@ -69,6 +69,21 @@ _NOUS_PROVIDERS = frozenset({"nous", "nous-portal", "nousresearch"})
 #: Whole-token model markers that are never admitted unattended.
 _DENIED_MODEL_TOKENS = frozenset({"free", "mini", "spark"})
 _TOKEN_SPLIT = re.compile(r"[\s/:._-]+")
+#: Keys that redirect a route to another endpoint or credential without
+#: changing its (provider, model) identity: ``resolve_runtime_with_fallback``
+#: forwards a fallback entry's ``base_url`` / key into ``resolve_runtime_provider``,
+#: and ``model.base_url`` is honoured for the configured provider (e.g.
+#: ``_anthropic_cfg_base_url``). The allowlist approves an identity, not an
+#: endpoint, so any non-empty override fails closed.
+_ENDPOINT_OVERRIDE_KEYS = ("base_url", "api_key", "key_env", "api_key_env")
+
+#: Test-suite seam; no production code sets it. Upstream's own dispatch suites
+#: create cards for throwaway, model-less profiles and test claim/spawn
+#: mechanics, not route policy, so the repo-root ``conftest.py`` sets this for
+#: every test OUTSIDE ``tests/hermes_fork/`` (where the policy is exercised
+#: with the gate live). Only in-process code can flip it: there is no config
+#: key or environment variable behind it.
+_ADMIT_ALL_FOR_TESTS = False
 
 
 @dataclass(frozen=True)
@@ -79,6 +94,8 @@ class Route:
     provider: str
     model: str
     effort: Optional[str]
+    #: Non-empty endpoint/credential override keys carried by this route.
+    endpoint_overrides: tuple[str, ...] = ()
 
     def render(self) -> str:
         return f"{self.source} {self.provider or '?'}/{self.model or '?'}/{self.effort or '?'}"
@@ -86,6 +103,12 @@ class Route:
 
 def _clean(value: Any) -> str:
     return str(value).strip().casefold() if isinstance(value, str) else ""
+
+
+def _endpoint_overrides(entry: Any) -> tuple[str, ...]:
+    if not isinstance(entry, dict):
+        return ()
+    return tuple(k for k in _ENDPOINT_OVERRIDE_KEYS if str(entry.get(k) or "").strip())
 
 
 def _effort_label(reasoning: Optional[dict]) -> Optional[str]:
@@ -142,12 +165,16 @@ def resolve_routes(task: "Task", config: dict) -> list[Route]:
     else:
         effort = _config_effort(config, model_s)
 
-    routes = [Route("primary", _clean(provider), _clean(model_s), effort)]
+    # ``model.base_url`` / ``model.api_key`` are judged on the primary whatever
+    # its provider: whether the resolver applies them depends on provider
+    # matching rules this gate does not re-implement, so presence fails closed.
+    routes = [Route("primary", _clean(provider), _clean(model_s), effort,
+                    tuple(f"model.{k}" for k in _endpoint_overrides(model_cfg)))]
     for i, entry in enumerate(_fallback_entries(config)):
         fb_model = str(entry.get("model") or "").strip()
         routes.append(Route(
             f"fallback[{i}]", _clean(entry.get("provider")), _clean(fb_model),
-            _config_effort(config, fb_model),
+            _config_effort(config, fb_model), _endpoint_overrides(entry),
         ))
     return routes
 
@@ -165,6 +192,9 @@ def route_denial(route: Route) -> Optional[str]:
         return f"{route.render()} is denied: {marker[0]!r} models never run unattended"
     if (route.provider, route.model, route.effort) not in APPROVED_UNATTENDED_ROUTES:
         return f"{route.render()} is not an approved unattended route"
+    if route.endpoint_overrides:
+        return (f"{route.render()} is denied: it carries endpoint/credential overrides "
+                f"({', '.join(route.endpoint_overrides)}); approved routes run only on the provider's own endpoint")
     return None
 
 
@@ -195,7 +225,12 @@ def deny_unapproved_route(conn: sqlite3.Connection, task: "Task", result: Any, *
     On denial the card is blocked ``needs_input`` (its run closed, the claim
     released) and its id lands in ``result.auto_blocked``. Any error while
     resolving the route is itself a denial: the gate fails closed.
+
+    Runs for every spawner, including a ``spawn_fn`` injected into
+    ``dispatch_once``: an injected spawner still launches an unattended worker.
     """
+    if _ADMIT_ALL_FOR_TESTS:
+        return False
     try:
         reason = unattended_route_denial(task)
     except Exception as exc:  # unreadable config, bad profile name, ...
