@@ -17,8 +17,7 @@ explicit operator override and bypasses the gate, as it bypasses the live-claim
 fence. Off by default, so upstream behaviour is unchanged.
 
 Ported from the frozen ``dev`` branch (``tools/kanban_tools_review_gate.py``,
-feb4981922), which gated the tool handler only. A new file (T1) rather than
-``hermes_fork/`` because ``next`` does not package ``hermes_fork`` yet.
+feb4981922), which gated the tool handler only.
 """
 
 from __future__ import annotations

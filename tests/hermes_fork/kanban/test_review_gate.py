@@ -15,7 +15,7 @@ from pathlib import Path
 
 import pytest
 
-from hermes_cli import kanban_fork_review_gate as gate
+from hermes_fork.kanban import review_gate as gate
 
 _KANBAN_ENV = (
     "HERMES_KANBAN_DB", "HERMES_KANBAN_BOARD", "HERMES_KANBAN_TASK",
