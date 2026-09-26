@@ -42,10 +42,6 @@ from tools.kanban_tools_mergeability import _REVIEWABLE_STATUSES
 
 logger = logging.getLogger(__name__)
 
-# The reviewer's reason is quoted back so the implementer needs no second
-# lookup; bounded so a long review does not blow up the refusal.
-_REASON_QUOTE_CHARS = 600
-
 # Line-leading numbering: "1. ...", "2) ...", allowing up to 3 spaces of
 # indent (a reviewer's list is rarely indented further). Deliberately does
 # NOT match mid-sentence numbers ("item 1 of 3") or bare bullets ("- ...") —
@@ -101,11 +97,15 @@ def rework_items_problem(value: Any, *, min_count: int = 0) -> Optional[str]:
 def refusal_message(*, rounds: int, problem: str, reason: Optional[str],
                     task_status: str) -> str:
     """The text the implementer reads: what is missing, the exact shape to
-    add, and the reviewer's reason it must be mapped against."""
+    add, and the reviewer's reason it must be mapped against.
+
+    The reason is quoted in FULL, never truncated — a reviewer's numbered
+    item past any fixed cutoff would otherwise be silently hidden from the
+    refusal while the count gate still demanded an entry for it (this bit a
+    round-1 review of this very gate: a 600-char cap dropped later items).
+    """
     if reason:
         quoted = reason.strip()
-        if len(quoted) > _REASON_QUOTE_CHARS:
-            quoted = quoted[:_REASON_QUOTE_CHARS].rstrip() + " […]"
         reason_block = "\n".join(f"  {line}" for line in quoted.splitlines()) or "  (blank)"
     else:
         reason_block = "  (the changes_requested event recorded no reason text)"

@@ -2077,6 +2077,39 @@ def test_request_review_rework_gate_honours_the_config_off_switch(rework_env, mo
     assert d["status"] == "review"
 
 
+def test_request_review_refusal_quotes_a_reason_past_the_old_600char_cutoff(rework_env):
+    """Regression (round-1 review of this gate): the refusal used to clip the
+    reviewer's reason at 600 characters, so a numbered item enumerated past
+    that cutoff was silently hidden from the implementer even though the
+    count gate still demanded a ``rework_items`` entry for it. The full
+    reason — including the far item — must appear in the refusal, and a
+    refused handoff must still leave the task/run untouched."""
+    from tools import kanban_tools as kt
+    from hermes_cli import kanban_db as kb
+    from hermes_cli import kanban_db_connect as kbc
+
+    padding = "x" * 650
+    far_item = "2. the padded-out finding well past character 600"
+    reason = f"1. filler finding — {padding}\n{far_item}"
+    tid = rework_env(prior_rounds=1, reason=reason)
+
+    d = json.loads(kt._handle_request_review({
+        "summary": "addressed the review",
+        "metadata": {"rework_items": [
+            {"item": "1. filler finding", "evidence": "abc123"},
+        ]},
+    }))
+
+    assert d.get("ok") is not True, d
+    error = d.get("error", "")
+    assert far_item in error, error
+    assert "2 items" in error, error
+
+    with kbc.connect_closing() as conn:
+        assert kb.get_task(conn, tid).status == "running"
+    assert len([e for e in _events(tid) if e.kind == "review_requested"]) == 1
+
+
 def test_create_model_policy_force_surface(worker_env):
     from hermes_cli import kanban_db as kb
     from tools import kanban_tools as kt
