@@ -28,6 +28,7 @@ import {
   setSessions,
   setSessionsLoading
 } from '@/store/session'
+import { $archivedSessions } from '@/store/sidebar-archive'
 
 import { deferred } from '../../../test/deferred'
 
@@ -109,6 +110,7 @@ beforeEach(() => {
   getCronJobs.mockResolvedValue([])
   listSidebarSessions.mockReset()
   listAllProfileSessions.mockReset()
+  listAllProfileSessions.mockResolvedValue({ limit: 200, offset: 0, sessions: [], total: 0 })
   removed.ids = new Set()
   setCronJobs([])
   setSessions([])
@@ -119,6 +121,7 @@ beforeEach(() => {
   setSessionProfilesTruncated({})
   setSessionProfilesUsage({})
   setSessionsLoading(false)
+  $archivedSessions.set([])
 })
 
 afterEach(() => {
@@ -132,6 +135,7 @@ afterEach(() => {
   setSessionProfilesTruncated({})
   setSessionProfilesUsage({})
   setSessionsLoading(false)
+  $archivedSessions.set([])
 })
 
 describe('refreshSessions identity + loading hygiene', () => {
@@ -442,6 +446,48 @@ describe('refreshSessions identity + loading hygiene', () => {
   })
 })
 
+describe('refreshSessions keeps the archived identity set warm', () => {
+  // Regression (round-2 review, t_d0a6300e): `$sidebarArchivedIdentitySet` /
+  // `$sidebarIsArchivedSession` only ever populated when the user opened the
+  // Archived filter. A session archived by another surface (CLI, another
+  // client) between refreshes — while `mergeSessionPage` keep-protects it
+  // here as pinned/open — had no archived-identity signal to be rejected
+  // against, so it kept showing in Recents/Projects even with Archived OFF.
+  // `refreshSessions` must warm that set on every normal-mode refresh, not
+  // only when the Archived filter is toggled on.
+  it('fetches the archived-only slice on every refresh, with the Archived filter off', async () => {
+    listSidebarSessions.mockResolvedValue(sidebar({ sessions: [row('a')] }))
+
+    const { result } = renderHook(() => useSessionListActions({ profileScope: 'default' }))
+
+    await act(async () => {
+      await result.current.refreshSessions()
+    })
+
+    // The 'only' archived slice is a distinct query from any recents/cron/
+    // messaging read (those go through listSidebarSessions).
+    expect(listAllProfileSessions.mock.calls.some(call => call[2] === 'only')).toBe(true)
+  })
+
+  it('lands the fetched archived rows in the store the identity predicate reads', async () => {
+    listSidebarSessions.mockResolvedValue(sidebar({ sessions: [row('a')] }))
+    listAllProfileSessions.mockResolvedValue({
+      limit: 200,
+      offset: 0,
+      sessions: [row('archived-elsewhere', { archived: true })],
+      total: 1
+    })
+
+    const { result } = renderHook(() => useSessionListActions({ profileScope: 'default' }))
+
+    await act(async () => {
+      await result.current.refreshSessions()
+    })
+
+    expect($archivedSessions.get().map(session => session.id)).toEqual(['archived-elsewhere'])
+  })
+})
+
 describe('refreshSessions batches slices into one request', () => {
   it('makes a single sidebar call and distributes recents / cron / messaging', async () => {
     const recents = [row('a'), row('b')]
@@ -456,9 +502,13 @@ describe('refreshSessions batches slices into one request', () => {
       await result.current.refreshSessions()
     })
 
-    // One batched call, not three separate listAllProfileSessions reads.
+    // One batched call, not three separate listAllProfileSessions reads for
+    // recents/cron/messaging. The archived-only identity set is a distinct,
+    // independently-queried slice (see sidebar-archive.ts) kept warm on the
+    // same cadence — any listAllProfileSessions call this refresh makes must
+    // be that 'only' query, never a recents/cron/messaging read.
     expect(listSidebarSessions).toHaveBeenCalledTimes(1)
-    expect(listAllProfileSessions).not.toHaveBeenCalled()
+    expect(listAllProfileSessions.mock.calls.every(call => call[2] === 'only')).toBe(true)
 
     // Each slice landed in its own store.
     expect($sessions.get().map(s => s.id)).toEqual(['a', 'b'])
