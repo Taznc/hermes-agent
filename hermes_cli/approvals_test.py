@@ -34,6 +34,7 @@ def evaluate_command(command: str, env_type: str = "local") -> dict:
     """
     import tools.approval as approval
     from tools import approval_context, approval_detection, approval_floors
+    from tools.approval_lifecycle import is_lifecycle_pattern
     # Sync config-persisted "always" patterns so the allowlist check below sees what the runtime
     # would see (load is read-only).
     try:
@@ -89,7 +90,20 @@ def evaluate_command(command: str, env_type: str = "local") -> dict:
                    "config.yaml (blocked even under --yolo / mode=off)",
         )
 
-    # 5. Yolo / approvals.mode=off bypass.
+    is_dangerous, pattern_key, description = approval_detection.detect_dangerous_command(command)
+
+    # 5. Restart/stop/reboot lifecycle class — never auto-approvable, so it skips the
+    #    yolo / mode=off / command_allowlist bypasses below (mirrors check_all_command_guards).
+    if is_dangerous and is_lifecycle_pattern(description):
+        return result(
+            "ask-approval", rule=description,
+            detail="service/system lifecycle command: never auto-approvable (not by --yolo, "
+                   "approvals.mode=off, command_allowlist, session/permanent approval, or the "
+                   "smart guardian); an interactive user is asked once/deny only, and an "
+                   f"unattended context is denied (pattern key: {pattern_key!r})",
+        )
+
+    # 6. Yolo / approvals.mode=off bypass.
     if (approval._YOLO_MODE_FROZEN
             or approval.is_current_session_yolo_enabled()
             or approval_context._get_approval_mode() == "off"):
@@ -99,12 +113,11 @@ def evaluate_command(command: str, env_type: str = "local") -> dict:
                    "only hardline/deny rules would block",
         )
 
-    # 6. Permanent command_allowlist.
+    # 7. Permanent command_allowlist.
     if approval_floors._command_matches_permanent_allowlist(command):
         return result("allow", detail="matches command_allowlist in config.yaml (permanently approved)")
 
-    # 7. Dangerous-pattern detection → would prompt.
-    is_dangerous, pattern_key, description = approval_detection.detect_dangerous_command(command)
+    # 8. Dangerous-pattern detection → would prompt.
     if is_dangerous:
         return result(
             "ask-approval", rule=description,

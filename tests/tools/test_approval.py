@@ -808,8 +808,12 @@ class TestWebhookApprovalExclusion:
             approval_context, "_get_unattended_approval_mode", lambda: "approve"
         )
 
-        result = check_all_command_guards("sudo systemctl restart nginx", "local")
+        result = check_all_command_guards("rm -rf ~/project/build", "local")
         assert result["approved"] is True
+        # ...but the approve opt-in never extends to the restart/stop/reboot class.
+        result = check_all_command_guards("sudo systemctl restart nginx", "local")
+        assert result["approved"] is False
+        assert "out-of-band" in result["message"]
 
     def test_webhook_safe_command_still_approves(self, monkeypatch):
         """Non-dangerous commands on unattended platforms are unaffected."""

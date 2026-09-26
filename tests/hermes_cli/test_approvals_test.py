@@ -103,6 +103,22 @@ class TestVerdicts:
         rc = at.approvals_test_command(_args(["sudo", "re" + "boot"]))
         assert rc == 3
 
+    def test_lifecycle_command_not_bypassed_by_mode_off_yolo_or_allowlist(
+            self, isolated_approvals, capsys, monkeypatch):
+        """Mirrors the runtime: restart/stop never reports allow, even with every bypass on."""
+        cmd = ["systemctl", "--user", "restart", "hermes-webdesktop-dev"]
+        monkeypatch.setattr(approval_context, "_get_approval_config", lambda: {"mode": "off"})
+        monkeypatch.setattr(A, "_YOLO_MODE_FROZEN", True)
+        A._permanent_approved.add("stop/restart system service")
+        rc = at.approvals_test_command(_args(cmd))
+        out = capsys.readouterr().out
+        assert rc == 2
+        assert "ask-approval" in out
+        assert "lifecycle" in out
+        # Ordinary dangerous commands keep the bypass (no regression).
+        rc = at.approvals_test_command(_args(["rm", "-rf", "~/project/build"]))
+        assert rc == 0
+
 
 class TestNormalizationParity:
     """The tester must run the same de-obfuscation path as the runtime."""
