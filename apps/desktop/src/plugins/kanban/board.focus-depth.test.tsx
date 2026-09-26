@@ -89,8 +89,13 @@ async function mount() {
   await screen.findByText('Focus')
 }
 
-/** The card container for a title — the draggable node the rings live on. */
-const cardOf = (title: string) => screen.getByText(title).closest('[draggable="true"]') as HTMLElement
+/** The card container for a title — the draggable node the rings live on.
+ *  Scoped to cards: the answer bar repeats linked cards' titles. */
+const cardOf = (title: string) =>
+  screen
+    .queryAllByText(title)
+    .map(el => el.closest<HTMLElement>('[draggable="true"]'))
+    .find(Boolean) as HTMLElement
 
 /** A trace is live iff the focus hint bar is up. The focused
  *  card's own trace button shares the label, hence getAll. */

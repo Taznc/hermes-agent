@@ -112,12 +112,21 @@ export const $hiddenBoards = atom<Record<string, boolean>>({})
  *  drop out of the board's counts with them. */
 export const $roadmapHidden = atom<Record<string, boolean>>({})
 
+/** Focus-mode line marks: direction chevrons along each dependency line (on
+ *  by default) and the animated "moving dots" that flow blocker → blocked
+ *  (off by default — motion is opt-in). Toggled from the answer bar's
+ *  legend. Persisted. */
+export const $depChevrons = atom<boolean>(true)
+export const $depFlow = atom<boolean>(false)
+
 const BOARD_SLUG_KEY = 'boardSlug'
 const INTRO_KEY = 'introDismissed'
 const LANES_KEY = 'lanesByProfile'
 const COLLAPSED_KEY = 'collapsedLanes'
 const HIDDEN_BOARDS_KEY = 'hiddenBoards'
 const ROADMAP_HIDDEN_KEY = 'roadmapHidden'
+const DEP_CHEVRONS_KEY = 'depChevrons'
+const DEP_FLOW_KEY = 'depFlow'
 
 /** One live `task_events` frame → precise cache invalidation: the board, plus
  *  each touched task's detail. The polls (8s board / 4s drawer) stay as the
@@ -221,6 +230,8 @@ export function bindApi(
   persist($collapsedLanes, COLLAPSED_KEY, {})
   persist($hiddenBoards, HIDDEN_BOARDS_KEY, {})
   persist($roadmapHidden, ROADMAP_HIDDEN_KEY, {})
+  persist($depChevrons, DEP_CHEVRONS_KEY, true)
+  persist($depFlow, DEP_FLOW_KEY, false)
 
   const open = (slug: string) => {
     // A board switch (including into/out of the sentinel) always invalidates any prior

@@ -90,7 +90,13 @@ async function mount() {
   await screen.findByText('Focus task')
 }
 
-const cardOf = (title: string) => screen.getByText(title).closest('[draggable="true"]') as HTMLElement
+/** The card container for a title — the draggable node the rings live on.
+ *  Scoped to cards: the answer bar repeats linked cards' titles. */
+const cardOf = (title: string) =>
+  screen
+    .queryAllByText(title)
+    .map(el => el.closest<HTMLElement>('[draggable="true"]'))
+    .find(Boolean) as HTMLElement
 
 const traceButton = (title: string) =>
   Array.from(cardOf(title).querySelectorAll('button')).find(b =>
@@ -141,7 +147,7 @@ describe('dependency arrows on the board', () => {
 
     // "task" keeps Focus and its blocker; Child leaves the board.
     fireEvent.change(screen.getByPlaceholderText('filterCards'), { target: { value: 'task' } })
-    await waitFor(() => expect(screen.queryByText('Child')).toBeNull())
+    await waitFor(() => expect(cardOf('Child')).toBeUndefined())
 
     await waitFor(() => expect(drawnEdges()).toEqual(['p->f']))
   })
