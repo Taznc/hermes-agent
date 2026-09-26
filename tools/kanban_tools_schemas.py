@@ -22,19 +22,22 @@ def _prop(type_: str, description: str) -> dict[str, str]:
     return {"type": type_, "description": description}
 
 
-def _board_schema_prop() -> dict[str, str]:
+def _board_schema_prop(note: str = "") -> dict[str, str]:
     """Schema fragment for the optional ``board`` parameter (one place to tweak)."""
-    return _prop("string", _DESC_BOARD)
+    return _prop("string", f"{_DESC_BOARD} {note}" if note else _DESC_BOARD)
 
 
-def _schema(name: str, description: str, properties: dict[str, Any], required: list[str]) -> dict[str, Any]:
+def _schema(
+    name: str, description: str, properties: dict[str, Any], required: list[str],
+    *, board_note: str = "",
+) -> dict[str, Any]:
     """Build a tool schema; every kanban tool takes an optional trailing ``board``."""
     return {
         "name": name,
         "description": description,
         "parameters": {
             "type": "object",
-            "properties": {**properties, "board": _board_schema_prop()},
+            "properties": {**properties, "board": _board_schema_prop(board_note)},
             "required": required,
         },
     }
@@ -63,6 +66,8 @@ KANBAN_SHOW_SCHEMA = _schema(
         ),
     },
     [],
+    board_note=("If omitted and the task is not on the active board, the other boards "
+                "are searched and the hit's board is returned as resolved_board."),
 )
 
 KANBAN_LIST_SCHEMA = _schema(
@@ -92,6 +97,7 @@ KANBAN_LIST_SCHEMA = _schema(
         "limit": _prop("integer", "Optional maximum rows to return (default 50, max 200)."),
     },
     [],
+    board_note=('"*" lists every non-archived board; each row carries its board slug.'),
 )
 
 KANBAN_COMPLETE_SCHEMA = _schema(

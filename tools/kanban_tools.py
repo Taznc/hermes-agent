@@ -19,6 +19,7 @@ from typing import Any, Callable, Optional
 from agent.redact import redact_sensitive_text
 from hermes_cli.goals import judge_goal
 from tools.registry import registry, tool_error
+from tools import kanban_tools_crossboard as _ktx
 from tools import kanban_tools_mergeability as _ktm
 from tools import kanban_tools_review_gate as _krg
 from tools import kanban_tools_rework as _ktr
@@ -109,6 +110,8 @@ def _kanban_handler(tool_name: str) -> Callable:
     def deco(fn):
         @functools.wraps(fn)
         def wrapper(args: dict, **kw) -> str:
+            if _ktx.is_all(args.get("board")) and (refusal := _ktx.star_refusal(tool_name)):
+                return tool_error(refusal)
             try:
                 return fn(args, **kw)
             except _Reject as e:
@@ -243,10 +246,15 @@ def _worker_guard(tool_name: str, args: dict) -> str:
     return tid
 
 
+def _is_env_worker() -> bool:
+    """A dispatcher-spawned worker: pinned to its task's board, no board routing."""
+    return bool(os.environ.get("HERMES_KANBAN_TASK"))
+
+
 def _require_orchestrator_tool(tool_name: str) -> None:
     """The check_fn already hides orchestrator tools from workers; this catches
     a stale registration or test harness routing a worker here anyway."""
-    if os.environ.get("HERMES_KANBAN_TASK"):
+    if _is_env_worker():
         raise _Reject(
             f"{tool_name} is orchestrator-only; dispatcher-spawned workers must use "
             "kanban_complete, kanban_block, kanban_heartbeat, or kanban_comment for their "
@@ -577,18 +585,35 @@ def inject_new_comments_from_env(agent: Any) -> bool:
 
 @_kanban_handler("kanban_show")
 def _handle_show(args: dict, **kw) -> str:
-    """Canonical worker packet, or one cursor page of durable history."""
+    """Canonical worker packet, or one cursor page of durable history. With no
+    ``board`` (orchestrators only) a miss on the active board searches the others."""
     tid = _require_task_id(args)
-    with _board(args.get("board")) as (kb, conn):
-        _existing_task(kb, conn, tid)
+    board = args.get("board")
+
+    def payload(kb, conn, slug: Optional[str]) -> dict:
         cursor = args.get("history_cursor")
         if cursor is not None:
-            page = kb.read_task_history_page(
-                conn, tid, str(cursor), args.get("history_limit", 20),
-            )
-            return json.dumps({"history_page": page}, ensure_ascii=False)
-        packet = kb.build_worker_task_packet(conn, tid, board=args.get("board"))
-        return json.dumps({"packet": packet.to_dict()}, ensure_ascii=False)
+            return {"history_page": kb.read_task_history_page(
+                conn, tid, str(cursor), args.get("history_limit", 20))}
+        return {"packet": kb.build_worker_task_packet(conn, tid, board=slug).to_dict()}
+
+    if _ktx.is_all(board):
+        _require_orchestrator_tool('kanban_show(board="*")')
+    else:
+        with _board(board) as (kb, conn):
+            if kb.get_task(conn, tid) is not None:
+                return json.dumps(payload(kb, conn, board), ensure_ascii=False)
+        # Explicit board or a worker: the pre-existing "not found", no search.
+        _check(not board and not _is_env_worker(), f"task {tid} not found")
+    hits, errors = _ktx.find_task(tid, payload)
+    if len(hits) != 1:
+        found_on = [slug for slug, _ in hits]
+        detail = (f"task {tid} is on several boards {found_on}; pass board=<slug>" if hits
+                  else f"task {tid} not found")
+        return tool_error(detail, **({"board_errors": errors} if errors else {}))
+    slug, out = hits[0]
+    return json.dumps({**out, "resolved_board": slug,
+                       **({"board_errors": errors} if errors else {})}, ensure_ascii=False)
 
 
 @_kanban_handler("kanban_list")
@@ -603,6 +628,11 @@ def _handle_list(args: dict, **kw) -> str:
         return tool_error("limit must be an integer")
     _check(limit >= 1, "limit must be >= 1")
     _check(limit <= KANBAN_LIST_MAX_LIMIT, f"limit must be <= {KANBAN_LIST_MAX_LIMIT}")
+    if _ktx.is_all(args.get("board")):
+        return json.dumps(_ktx.list_all(
+            assignee=args.get("assignee"), status=args.get("status"), tenant=args.get("tenant"),
+            include_archived=include_archived, limit=limit, max_limit=KANBAN_LIST_MAX_LIMIT,
+            summarize=_task_summary_dict))
     with _board(args.get("board")) as (kb, conn):
         # Match CLI list: dependencies cleared since the last dispatcher tick
         # should be visible to orchestrators immediately.
