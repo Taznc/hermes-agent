@@ -1489,6 +1489,26 @@ clone_repo() {
             log_info "Existing installation found, updating..."
             cd "$INSTALL_DIR"
 
+            # Fork deploys: this path only ever fetches origin and falls back to
+            # `reset --hard origin/$BRANCH`. A checkout whose branch tracks a
+            # different remote (e.g. fork/dev with upstream as origin) would be
+            # replaced by the origin branch. Refuse before touching anything.
+            # Mirrors hermes_fork/update_guard.py (same bypass variable).
+            if [ "${HERMES_ALLOW_CROSS_REMOTE_UPDATE:-}" != "1" ]; then
+                local _cur_branch _tracked_remote
+                _cur_branch="$(git symbolic-ref --quiet --short HEAD 2>/dev/null || true)"
+                _tracked_remote=""
+                if [ -n "$_cur_branch" ]; then
+                    _tracked_remote="$(git config --get "branch.${_cur_branch}.remote" 2>/dev/null || true)"
+                fi
+                if [ -n "$_tracked_remote" ] && [ "$_tracked_remote" != "origin" ] && [ "$_tracked_remote" != "." ]; then
+                    log_error "Refusing to update: '$_cur_branch' tracks remote '$_tracked_remote', but this updater pulls from origin."
+                    log_error "Deploy with: git -C $INSTALL_DIR fetch $_tracked_remote && git -C $INSTALL_DIR merge --ff-only $_tracked_remote/$_cur_branch"
+                    log_error "Override for one run: HERMES_ALLOW_CROSS_REMOTE_UPDATE=1"
+                    exit 2
+                fi
+            fi
+
             local autostash_ref=""
             discard_update_lockfile_churn "$INSTALL_DIR"
             if [ -n "$(git status --porcelain)" ]; then
