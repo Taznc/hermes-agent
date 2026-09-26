@@ -1862,6 +1862,25 @@ _REWORK_REASON = (
 )
 
 
+@pytest.mark.parametrize("reason,expected", [
+    (None, 0),
+    ("", 0),
+    ("please also handle the no-assignee edge case", 0),
+    ("1. one thing\n2. another thing", 2),
+    (_REWORK_REASON, 3),
+    ("  1. indented\n  2. also indented", 2),
+    ("1) paren style\n2) also paren", 2),
+    ("see item 1 of 3 in the diff", 0),  # mid-sentence, not line-leading
+    ("- bullet one\n- bullet two", 0),  # bullets are not numbered
+])
+def test_enumerated_item_count(reason, expected):
+    """Pure counting function: line-leading ``N.``/``N)`` numbering only;
+    mid-sentence numbers and bare bullets are not implied items."""
+    from tools.kanban_tools_rework import enumerated_item_count
+
+    assert enumerated_item_count(reason) == expected
+
+
 @pytest.fixture
 def rework_env(monkeypatch, tmp_path):
     """Factory: ``make(prior_rounds=N)`` -> task id of a card the worker holds
@@ -1977,6 +1996,48 @@ def test_request_review_rejects_malformed_rework_items(rework_env, bad):
     }))
     assert d.get("ok") is not True, d
     assert "rework_items" in d.get("error", ""), d
+
+
+def test_request_review_rejects_undercounted_rework_items(rework_env):
+    """The fixture reason enumerates 3 numbered items (``1.``, ``2.``,
+    ``3.``); a well-formed but short list — 1 entry — is refused with a
+    count-shortfall message naming both numbers, not silently accepted."""
+    from tools import kanban_tools as kt
+
+    rework_env(prior_rounds=1)
+
+    d = json.loads(kt._handle_request_review({
+        "summary": "addressed the review",
+        "metadata": {"rework_items": [
+            {"item": "1. tests/foo missing the timeout case", "evidence": "abc123"},
+        ]},
+    }))
+    assert d.get("ok") is not True, d
+    error = d.get("error", "")
+    assert "rework_items" in error, error
+    assert "1 entry" in error, error
+    assert "3 items" in error, error
+
+
+def test_request_review_free_form_reason_skips_the_count_check(rework_env):
+    """A reviewer reason with no line-leading numbering (a prose paragraph)
+    is not sliced into an implied item count: one well-formed entry is
+    enough, exactly as before this check existed."""
+    from tools import kanban_tools as kt
+
+    rework_env(
+        prior_rounds=1,
+        reason="please also cover the edge case where the task has no assignee",
+    )
+
+    d = json.loads(kt._handle_request_review({
+        "summary": "addressed the review",
+        "metadata": {"rework_items": [
+            {"item": "the no-assignee edge case", "evidence": "abc123; new test passes"},
+        ]},
+    }))
+    assert d["ok"] is True, d
+    assert d["status"] == "review"
 
 
 def test_request_review_after_changes_requested_passes_with_rework_items(rework_env):

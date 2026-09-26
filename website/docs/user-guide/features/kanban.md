@@ -667,10 +667,13 @@ card reaches that cap: a rework run that silently skipped some of the
 reviewer's numbered items. Once a card has one or more `changes_requested`
 events since its last completion, both `kanban_request_review` and
 `hermes kanban request-review` refuse a handoff whose metadata lacks
-`rework_items` — a non-empty list of `{item, evidence}` objects, one per item
-in the reviewer's latest reason — and the refusal quotes that reason back so
-the implementer can fill it in without another lookup. First-time handoffs
-are not gated.
+`rework_items` — a non-empty list of `{item, evidence}` objects — and the
+refusal quotes that reason back so the implementer can fill it in without
+another lookup. When the reviewer's reason uses a numbered list (lines
+starting `1.`, `2)`, ...), the gate also requires at least that many
+`rework_items` entries; it is a count-bound shape check, not semantic
+verification that entry *N* actually addresses item *N* — the reviewer still
+confirms correspondence at review time. First-time handoffs are not gated.
 
 An operator-set model/provider/reasoning override (set at task creation with
 an explicit model, or later via `kanban set-model`) survives both

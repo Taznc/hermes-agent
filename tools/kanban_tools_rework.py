@@ -6,8 +6,20 @@ implementer timed out, or stopped early) burns the card's next review round on
 "items 2 and 3 still not done". With ``kanban.max_review_rounds`` at 2 that is
 the main way a card hits the round cap. The reviewer cannot tell from a prose
 summary whether every item was addressed, so the handoff has to say so
-mechanically: ``metadata.rework_items`` maps EACH item from the latest
-``changes_requested`` reason to the commit/test/output that proves it.
+mechanically: ``metadata.rework_items`` must carry at least one entry per item
+enumerated in the latest ``changes_requested`` reason, each mapped to the
+commit/test/output that proves it.
+
+Honesty about what this checks: it is a **count-bound shape/presence gate**,
+not semantic verification. It parses the reviewer's reason for line-leading
+numbering (``1.``, ``2)``, ...) and requires ``len(rework_items)`` to be at
+least that count; it does NOT read the text of either side to confirm entry
+*N* actually addresses reviewer item *N* — that correspondence is still the
+reviewer's job at review time. What it catches mechanically is the common
+failure this gate exists for: a reviewer enumerates three items and the
+handoff carries only one ``rework_items`` entry. A reason with no detected
+numbering (a free-form paragraph) gets the presence/shape check only, exactly
+as before.
 
 This is the second check on the review-lane preflight path, next to the
 mergeability preflight in :mod:`tools.kanban_tools_mergeability`. It shares
@@ -22,6 +34,7 @@ number.
 from __future__ import annotations
 
 import logging
+import re
 from typing import Any, Optional
 
 from hermes_cli.config import cfg_get, load_config
@@ -33,13 +46,34 @@ logger = logging.getLogger(__name__)
 # lookup; bounded so a long review does not blow up the refusal.
 _REASON_QUOTE_CHARS = 600
 
+# Line-leading numbering: "1. ...", "2) ...", allowing up to 3 spaces of
+# indent (a reviewer's list is rarely indented further). Deliberately does
+# NOT match mid-sentence numbers ("item 1 of 3") or bare bullets ("- ...") —
+# false positives there would gate reasons that were never actually a
+# numbered list, which is worse than under-counting.
+_NUMBERED_ITEM_RE = re.compile(r"(?m)^[ \t]{0,3}(\d+)[.)][ \t]+\S")
 
-def rework_items_problem(value: Any) -> Optional[str]:
+
+def enumerated_item_count(reason: Optional[str]) -> int:
+    """Count of line-leading numbered items in ``reason`` (``0`` if none).
+
+    A free-form paragraph reason — no line starts with ``N.``/``N)`` — is not
+    sliced into implied items and returns 0, leaving only the presence/shape
+    check in :func:`rework_items_problem`.
+    """
+    if not reason:
+        return 0
+    return len(_NUMBERED_ITEM_RE.findall(reason))
+
+
+def rework_items_problem(value: Any, *, min_count: int = 0) -> Optional[str]:
     """Why ``value`` is not a valid ``rework_items`` list, or ``None`` if it is.
 
     Valid: a non-empty list whose every element is a dict with non-empty
-    string ``item`` and ``evidence``. The message names the first offending
-    element so the fix is one edit, not a guess.
+    string ``item`` and ``evidence``, and — when ``min_count`` is set (the
+    reviewer's reason enumerated that many items) — at least ``min_count``
+    entries. The message names the first offending element, or the count
+    shortfall, so the fix is one edit, not a guess.
     """
     if value is None:
         return "metadata.rework_items is missing"
@@ -55,6 +89,12 @@ def rework_items_problem(value: Any) -> Optional[str]:
             got = entry.get(key)
             if not isinstance(got, str) or not got.strip():
                 return f"metadata.rework_items[{i}] needs a non-empty string {key!r}"
+    if min_count and len(value) < min_count:
+        entries_word = "entry" if len(value) == 1 else "entries"
+        items_word = "item" if min_count == 1 else "items"
+        return (f"metadata.rework_items has {len(value)} {entries_word} but the "
+                f"reviewer's reason enumerates {min_count} {items_word} — add one "
+                f"rework_items entry per numbered item")
     return None
 
 
@@ -73,10 +113,12 @@ def refusal_message(*, rounds: int, problem: str, reason: Optional[str],
     return (
         f"kanban_request_review refused: this task has {rounds} prior changes_requested "
         f"round{plural} since its last completion, and {problem}. A rework handoff must "
-        f"list metadata.rework_items=[{{item, evidence}}] mapping EACH numbered item from "
-        f"the reviewer's latest changes_requested reason to the commit/test/output that "
-        f"proves it, so the reviewer does not spend a round rediscovering what was "
-        f"skipped.\n\n"
+        f"list metadata.rework_items=[{{item, evidence}}] with one entry per numbered item "
+        f"from the reviewer's latest changes_requested reason, each mapped to the "
+        f"commit/test/output that proves it. This is a count-checked shape gate (entries >= "
+        f"items enumerated in the reason), not semantic verification — the reviewer still "
+        f"confirms each entry actually addresses its item; it exists so a round is not spent "
+        f"rediscovering an item that was silently dropped.\n\n"
         f"Add to your request, one entry per reviewer item:\n"
         f"  metadata.rework_items = [\n"
         f"    {{\"item\": \"<reviewer item 1, in their words>\", "
@@ -113,11 +155,13 @@ def preflight(conn, task, task_id: str, metadata: Optional[dict]) -> Optional[st
     rounds, _latest_id = kbd._changes_requested_state(conn, task_id)
     if rounds < 1:
         return None
-    problem = rework_items_problem((metadata or {}).get("rework_items"))
+    reason = kbd._last_changes_requested_reason(conn, task_id)
+    min_count = enumerated_item_count(reason)
+    problem = rework_items_problem((metadata or {}).get("rework_items"), min_count=min_count)
     if problem is None:
         return None
     return refusal_message(
         rounds=rounds, problem=problem,
-        reason=kbd._last_changes_requested_reason(conn, task_id),
+        reason=reason,
         task_status=task.status,
     )

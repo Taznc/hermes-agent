@@ -397,8 +397,8 @@ _SPECS = [
            "workspace is not a git worktree, or git cannot answer; turn it off entirely "
            "with `kanban.require_mergeable_for_review: false` in config.yaml. Also refuses "
            "a rework handoff (the card has a changes_requested round since its last "
-           "completion) whose --metadata lacks rework_items=[{item, evidence}] mapping each "
-           "reviewer item to its proof; off switch "
+           "completion) whose --metadata lacks rework_items=[{item, evidence}], one entry "
+           "per reviewer item (count-checked when the reason is numbered); off switch "
            "`kanban.require_rework_items_for_review: false`."
        )),
     _cmd("approve", [
