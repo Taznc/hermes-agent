@@ -12,6 +12,8 @@ import {
   FAN_LIFT,
   focusEdges,
   pointAt,
+  REVEAL_MARGIN,
+  revealDelta,
   routeArrows
 } from './board-arrows'
 import { buildGraph, chainSets, focusSets } from './deps'
@@ -252,6 +254,38 @@ describe('clampToLane', () => {
   it('pins a card scrolled out of its lane to the edge it left by', () => {
     expect(clampToLane({ bottom: 80, top: 20 }, lane)).toEqual({ bottom: 100, offscreen: true, top: 100 })
     expect(clampToLane({ bottom: 700, top: 600 }, lane)).toEqual({ bottom: 500, offscreen: true, top: 500 })
+  })
+})
+
+describe('revealDelta', () => {
+  const view = { end: 500, start: 100 }
+
+  const shown = (item: { end: number; start: number }) => {
+    const d = revealDelta(item, view)
+
+    return { end: item.end - d, start: item.start - d }
+  }
+
+  it('does not scroll a card that is already fully in view', () => {
+    expect(revealDelta({ end: 300, start: 200 }, view)).toBe(0)
+  })
+
+  it('brings a card below or above the fold fully into view, with the margin', () => {
+    for (const item of [
+      { end: 560, start: 440 }, // straddles the bottom edge
+      { end: 900, start: 780 }, // fully below
+      { end: 160, start: 40 }, // straddles the top edge
+      { end: 20, start: -100 } // fully above
+    ]) {
+      const after = shown(item)
+
+      expect(after.start).toBeGreaterThanOrEqual(view.start + REVEAL_MARGIN)
+      expect(after.end).toBeLessThanOrEqual(view.end - REVEAL_MARGIN)
+    }
+  })
+
+  it('shows the leading edge of a card taller than the view', () => {
+    expect(shown({ end: 1400, start: 700 }).start).toBe(view.start + REVEAL_MARGIN)
   })
 })
 
