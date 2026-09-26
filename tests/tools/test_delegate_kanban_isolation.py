@@ -302,3 +302,39 @@ def test_child_attempting_default_complete_does_not_finish_parent_or_delete_work
     assert task.status == "running"
     assert run.status == "running"
     assert workspace.is_dir()
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX bash snapshot path")
+def test_child_fence_does_not_persist_into_shared_terminal_for_parent(monkeypatch, tmp_path):
+    """A child and its parent share one terminal environment (CLI "default" /
+    ``session:<key>``). The child's write fence rides its command env, but must
+    not persist through the shared session snapshot and fence the parent."""
+    home = tmp_path / ".hermes"
+    home.mkdir()
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    for key in ("HERMES_KANBAN_TASK", "HERMES_KANBAN_RUN_ID", "HERMES_DELEGATED_CHILD_CONTEXT"):
+        monkeypatch.delenv(key, raising=False)
+
+    from agent.delegation_context import delegated_child_context
+    from hermes_cli import kanban_db as kb
+    from tools.environments.local import LocalEnvironment
+
+    probe = "echo marker=${HERMES_DELEGATED_CHILD_CONTEXT:-unset}"
+    create_board = _python_with_repo_path(
+        "from hermes_cli import kanban; import argparse; "
+        "p=argparse.ArgumentParser(); sub=p.add_subparsers(dest='cmd'); kanban.build_parser(sub); "
+        "raise SystemExit(kanban.kanban_command(p.parse_args(['kanban','boards','create','parentboard'])))"
+    )
+    env = LocalEnvironment(cwd=str(tmp_path), timeout=30)
+    try:
+        with delegated_child_context():
+            child = env.execute(probe, timeout=30)
+        parent = env.execute(probe, timeout=30)
+        parent_write = env.execute(create_board, timeout=30)
+    finally:
+        env.cleanup()
+
+    assert "marker=1" in child["output"]
+    assert "marker=unset" in parent["output"]
+    assert parent_write["returncode"] == 0, parent_write["output"]
+    assert kb.board_exists("parentboard")
