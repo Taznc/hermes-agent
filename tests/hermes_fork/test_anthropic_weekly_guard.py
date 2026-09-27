@@ -1,6 +1,9 @@
 """Production pre-claim admission, OAuth usage parsing, and expiring operator overrides."""
 import argparse
 import json
+import os
+import subprocess
+import sys
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
@@ -231,6 +234,23 @@ def test_effective_profile_config_drives_provider_gate(home, monkeypatch):
         task = kb.get_task(conn, tid)
         assert task is not None and task.status == "ready"
         assert any(task_id == tid and "weekly" in reason for task_id, reason in result.respawn_guarded)
+
+
+def test_real_cli_targets_assignee_without_switching_home(home):
+    profile = _profile(home, "claude", "claude-opus-4-1")
+    (profile / "kanban-weekly-usage.json").write_text('{"marker":"assignee"}')
+    repo = Path(__file__).resolve().parents[2]
+    env = {**os.environ, "HERMES_HOME": str(home), "PYTHONPATH": str(repo)}
+    env.pop("HERMES_KANBAN_TASK", None)
+    proc = subprocess.run(
+        [sys.executable, "-c", "from hermes_cli.main import main; raise SystemExit(main())",
+         "kanban", "weekly-usage", "--assignee", "claude", "status"],
+        env=env, cwd=repo, text=True, capture_output=True, timeout=30, check=False,
+    )
+    assert proc.returncode == 0, proc.stderr
+    data = json.loads(proc.stdout)
+    assert data["threshold_percent"] == 70
+    assert data["sample"] == {"marker": "assignee"}
 
 
 def test_cli_parser_and_worker_cannot_override(home, monkeypatch):

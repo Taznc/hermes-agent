@@ -8,10 +8,10 @@ personal chat, cron, other-provider Kanban workers or Hindsight's own processes.
 
 Operator CLI, scoped to an assignee's account::
 
-    hermes kanban weekly-usage --profile coder status
-    hermes kanban weekly-usage --profile coder override --threshold 90 --until-reset --reason "release"
-    hermes kanban weekly-usage --profile coder override --bypass --hours 2 --reason "urgent"
-    hermes kanban weekly-usage --profile coder clear
+    hermes kanban weekly-usage --assignee coder status
+    hermes kanban weekly-usage --assignee coder override --threshold 90 --until-reset --reason "release"
+    hermes kanban weekly-usage --assignee coder override --bypass --hours 2 --reason "urgent"
+    hermes kanban weekly-usage --assignee coder clear
 
 The per-profile cache is bounded (5 minutes); an unavailable/old sample never
 permits new Claude workers. Failures are retried at most once per minute, and
@@ -198,7 +198,7 @@ def admit(conn, row, assignee):
 def add_parser(sub):
     p = sub.add_parser("weekly-usage", help="Inspect/temporarily override Anthropic weekly Kanban admission")
     actions = p.add_subparsers(dest="weekly_usage_action")
-    p.add_argument("--profile", default="default", help="Target assignee profile (default: default); place before subcommand")
+    p.add_argument("--assignee", default="default", help="Kanban worker assignee whose Anthropic account to inspect or override")
     actions.add_parser("status", help="Show threshold, last sample, and active override")
     override = actions.add_parser("override", help="Temporarily raise threshold or bypass with audit")
     choice = override.add_mutually_exclusive_group(required=True)
@@ -227,7 +227,7 @@ def command(args):
         print("weekly-usage: workers cannot change operator overrides")
         return 2
     try:
-        home = _profile_home(getattr(args, "profile", "default"))
+        home = _profile_home(getattr(args, "assignee", "default"))
     except ValueError as exc:
         print(f"weekly-usage: {exc}")
         return 2
@@ -239,7 +239,7 @@ def command(args):
         return 0
     if action == "clear":
         try:
-            _audit(home, {"at": now.isoformat(), "actor": getpass.getuser(), "profile": getattr(args, "profile", "default"), "action": "clear"})
+            _audit(home, {"at": now.isoformat(), "actor": getpass.getuser(), "profile": getattr(args, "assignee", "default"), "action": "clear"})
             (home / "kanban-weekly-override.json").unlink(missing_ok=True)
         except OSError as exc:
             print(f"weekly-usage: {exc}")
@@ -268,7 +268,7 @@ def command(args):
             if hours is None or not math.isfinite(hours) or not 0 < hours <= 168:
                 raise ValueError("--hours must be positive and <= 168")
             expiry = now + timedelta(hours=hours)
-        record = {"action": "override", "actor": getpass.getuser(), "profile": getattr(args, "profile", "default"),
+        record = {"action": "override", "actor": getpass.getuser(), "profile": getattr(args, "assignee", "default"),
                   "created_at": now.isoformat(), "expires_at": expiry.isoformat(),
                   "threshold_percent": threshold, "bypass": bool(bypass), "reason": reason,
                   "reset_at": reset.isoformat() if reset else None}
