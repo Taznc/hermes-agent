@@ -184,7 +184,8 @@ def test_second_return_routes_to_escalation_profile(board):
     assert _review_and_reject(conn, tid, spawn, spawned) == "debugger"
     last = _events(conn, tid, "assigned")[-1]
     assert last == {"assignee": "debugger", "from": "coder",
-                    "source": "kanban.review_rework_escalation_profile", "changes_rounds": 2}
+                    "source": "kanban.review_rework_escalation_profile", "changes_rounds": 2,
+                    "return_to": "coder"}
     # The escalated worker's own rejection returns to it (it is the implementer now).
     assert _review_and_reject(conn, tid, spawn, spawned) == "debugger"
     assert not _events(conn, tid, "review_cap_escalated")

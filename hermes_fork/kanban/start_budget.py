@@ -119,7 +119,21 @@ def admit(
     refused the tick. With ``k`` starts left in the window the tick may spawn
     at most ``k`` (shared by the ready and review lanes); with none left it
     returns ``(False, None)`` so nothing is claimed.
+
+    First, unconditionally, it runs the review-routing hand-back
+    (:func:`hermes_fork.kanban.review_routing.return_diagnosed`): this anchor
+    is the fork's only per-tick seam that runs under the board's tick lock
+    before the lanes are enumerated, so a card handed back from a diagnosis
+    hop is dispatched in this same tick without a second upstream anchor.
     """
+    from hermes_fork.kanban.review_routing import return_diagnosed
+
+    try:
+        return_diagnosed(conn, dry_run=dry_run)
+    except Exception:  # never let the hand-back sweep break dispatch
+        from hermes_cli import kanban_db as _kb
+
+        _kb._log.exception("kanban review rework hand-back sweep failed")
     budget, window = settings()
     if budget is None or not may_spawn:
         return may_spawn, spawn_budget
