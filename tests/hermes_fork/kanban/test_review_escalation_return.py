@@ -12,8 +12,12 @@ Drives the real ``dispatch_once`` on an isolated HERMES_HOME/kanban.db, like
 
 from __future__ import annotations
 
+import subprocess
+from pathlib import Path
+
 from hermes_cli import kanban_db as kb
 from hermes_cli import kanban_db_dispatch as kbd
+from hermes_cli import kanban_db_workspace as kbw
 from hermes_fork.kanban import review_routing
 
 from tests.hermes_fork.kanban.test_review_routing import (  # noqa: F401  (fixture)
@@ -161,6 +165,22 @@ def test_operator_unblock_after_escalation_block_wins(board):
     assert not _events(conn, tid, review_routing.RETURNED_EVENT)
 
 
+def test_operator_unblock_then_second_block_still_wins(board):
+    """Operator said "debugger, go again"; its next block is not a hand-back."""
+    conn, cfg, spawned, spawn = board
+    tid = _escalated(conn, cfg, spawn, spawned)
+    _diagnose_and_block(conn, tid)
+    assert kb.unblock_task(conn, tid)
+    assert _tick(conn, spawn, spawned) == "debugger"
+    _diagnose_and_block(conn, tid)
+    assert _tick(conn, spawn, spawned) is None
+    t = _task(conn, tid)
+    # A second same-kind block goes to ``triage`` upstream; either way it stays put.
+    assert t.status in ("blocked", "triage") and t.assignee == "debugger"
+    assert not _events(conn, tid, review_routing.RETURNED_EVENT)
+    assert _tick(conn, spawn, spawned) is None
+
+
 def test_escalation_without_return_to_is_left_alone(board):
     """Escalations recorded before this change carry no ``return_to``."""
     conn, cfg, spawned, spawn = board
@@ -184,6 +204,104 @@ def test_dry_run_reports_hand_back_without_writing(board):
     t = _task(conn, tid)
     assert (t.status, t.assignee) == ("blocked", "debugger")
     assert not _events(conn, tid, review_routing.RETURNED_EVENT)
+
+
+# ------------------------------------------------------------ workspace
+
+def _complete_diagnosis(conn, tid):
+    t = _task(conn, tid)
+    assert kb.complete_task(conn, tid, summary=f"Diagnosis only. {DIAGNOSIS}",
+                            expected_run_id=t.current_run_id)
+
+
+def test_scratch_workspace_survives_diagnosis_completion(board):
+    """Upstream complete_task rmtree's a scratch workspace; the hop must not."""
+    conn, cfg, spawned, spawn = board
+    tid = _escalated(conn, cfg, spawn, spawned)
+    t = _task(conn, tid)
+    ws = Path(t.workspace_path)
+    assert kbw._is_managed_scratch_path(ws)  # a real reapable scratch dir
+    (ws / "implementer_work.py").write_text("x = 1\n", encoding="utf-8")
+    pin = _events(conn, tid, "assigned")[-1]
+    assert (t.workspace_kind, pin[review_routing.PIN_KEY]) == ("dir", "scratch")
+
+    _complete_diagnosis(conn, tid)
+    assert (ws / "implementer_work.py").read_text(encoding="utf-8") == "x = 1\n"
+
+    assert _tick(conn, spawn, spawned) == "coder"
+    t = _task(conn, tid)
+    assert (t.workspace_kind, t.workspace_path) == ("scratch", str(ws))  # resolved at spawn
+    assert (ws / "implementer_work.py").read_text(encoding="utf-8") == "x = 1\n"
+
+
+def _git(*args):
+    res = subprocess.run(["git", *args], capture_output=True, text=True, timeout=60)
+    assert res.returncode == 0, res.stderr
+    return res.stdout
+
+
+def test_clean_pushed_worktree_survives_diagnosis_completion(board, tmp_path):
+    """Upstream removes a clean, fully pushed worktree (and its wt/ branch)."""
+    conn, cfg, spawned, spawn = board
+    origin, repo = tmp_path / "origin.git", tmp_path / "project"
+    _git("init", "--bare", str(origin))
+    _git("clone", str(origin), str(repo))
+    for k, v in (("user.email", "t@example.com"), ("user.name", "t")):
+        _git("-C", str(repo), "config", k, v)
+    (repo / "README.md").write_text("hello\n", encoding="utf-8")
+    _git("-C", str(repo), "add", "README.md")
+    _git("-C", str(repo), "commit", "-m", "init")
+    _git("-C", str(repo), "push", "origin", "HEAD")
+
+    cfg.update(default_reviewer="reviewer", review_rework_escalation_profile="debugger",
+               max_review_rounds=4)
+    tid = kb.create_task(conn, title="card", assignee="coder",
+                         workspace_kind="worktree", workspace_path=str(repo))
+    assert _tick(conn, spawn, spawned) == "coder"
+    wt = Path(_task(conn, tid).workspace_path)
+    branch = _task(conn, tid).branch_name
+    (wt / "fix.py").write_text("fixed = True\n", encoding="utf-8")
+    _git("-C", str(wt), "add", "fix.py")
+    _git("-C", str(wt), "commit", "-m", "wip")
+    _git("-C", str(wt), "push", "origin", f"HEAD:{branch}")  # clean + pushed: reapable
+    assert _review_and_reject(conn, tid, spawn, spawned) == "coder"
+    assert _review_and_reject(conn, tid, spawn, spawned) == "debugger"
+    assert _task(conn, tid).workspace_path == str(wt)
+
+    _complete_diagnosis(conn, tid)
+    assert (wt / "fix.py").exists()
+    assert _git("-C", str(repo), "branch", "--list", branch).strip()
+
+    assert _tick(conn, spawn, spawned) == "coder"
+    t = _task(conn, tid)
+    assert (t.workspace_kind, t.workspace_path, t.branch_name) == ("worktree", str(wt), branch)
+    assert (wt / "fix.py").read_text(encoding="utf-8") == "fixed = True\n"
+
+
+def test_operator_reassign_restores_pinned_workspace_kind(board):
+    conn, cfg, spawned, spawn = board
+    tid = _escalated(conn, cfg, spawn, spawned)
+    _diagnose_and_block(conn, tid)
+    assert kb.assign_task(conn, tid, "operator")
+    _tick(conn, spawn, spawned)
+    assert _task(conn, tid).workspace_kind == "scratch"
+    assert _events(conn, tid, review_routing.UNPINNED_EVENT) == [{"workspace_kind": "scratch"}]
+
+
+def test_genuine_dir_task_is_never_repinned_or_rewritten(board, tmp_path):
+    conn, cfg, spawned, spawn = board
+    cfg.update(default_reviewer="reviewer", review_rework_escalation_profile="debugger",
+               max_review_rounds=4)
+    d = tmp_path / "shared"
+    tid = kb.create_task(conn, title="card", assignee="coder", workspace_kind="dir",
+                         workspace_path=str(d))
+    assert _tick(conn, spawn, spawned) == "coder"
+    _review_and_reject(conn, tid, spawn, spawned)
+    assert _review_and_reject(conn, tid, spawn, spawned) == "debugger"
+    assert review_routing.PIN_KEY not in _events(conn, tid, "assigned")[-1]
+    _complete_diagnosis(conn, tid)
+    assert _tick(conn, spawn, spawned) == "coder"
+    assert _task(conn, tid).workspace_kind == "dir"
 
 
 # --------------------------------------------------------------- rounds/cap

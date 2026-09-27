@@ -26,6 +26,17 @@ round count, and a ``review_rework_returned`` marker newer than the latest
 worker that DOES request review is acting as the implementer (a fixing
 escalation profile) and is never handed back. ``needs_input`` stays blocked for
 a human. Escalations written before ``return_to`` existed are left alone.
+An operator ``unblock`` or ``assign`` after the escalation is explicit
+routing: the hop is then never handed back, whatever the worker does next.
+
+The hop must not cost the implementer its workspace: upstream
+``complete_task`` reaps ``scratch`` (and clean, pushed ``worktree``)
+workspaces, so a diagnosis ``kanban_complete`` would delete the tree the
+implementer returns to. :func:`_escalate` therefore pins the workspace as
+``dir`` (the kind upstream never removes) for the hop, recording the original
+kind on the escalation event; the hand-back restores it, and
+:func:`_unpin_abandoned` restores pins no hand-back will (reassigned or
+finished cards).
 
 Every decision is derived from durable ``task_events`` (``changes_requested``
 since the last ``completed``, ``review_requested`` provenance, ``assigned``
@@ -214,14 +225,15 @@ def _implementer_owned(conn: sqlite3.Connection, task_id: str, assignee: str) ->
 def _reassign(
     conn: sqlite3.Connection, task_id: str, *, status: str, previous: str, new: str,
     payload: dict, extra_event: Optional[tuple[str, dict]] = None,
-    comment: Optional[str] = None,
+    comment: Optional[str] = None, pin_workspace: bool = False,
 ) -> bool:
     """Guarded handoff: only an unclaimed row still in ``status`` and still
     owned by ``previous`` moves, so a race is a no-op with no phantom event.
     ``from`` is recorded so the respawn guard sees a real handoff. With
     ``new == previous`` only ``extra_event`` is written (same guard).
     ``comment`` lands in the same txn, before the worker is spawned, so the
-    new owner's worker context carries it."""
+    new owner's worker context carries it. ``pin_workspace`` see
+    :func:`_pin_workspace`."""
     from hermes_cli import kanban_db as _kb
 
     with _kb.write_txn(conn):
@@ -232,6 +244,10 @@ def _reassign(
         )
         if cur.rowcount != 1:
             return False
+        if pin_workspace and new != previous:  # the pin is recorded on the assigned event
+            pinned = _pin_workspace(conn, task_id)
+            if pinned is not None:
+                payload = {**payload, PIN_KEY: pinned}
         if new != previous:
             _kb._append_event(
                 conn, task_id, "assigned", {"assignee": new, "from": previous, **payload},
@@ -321,8 +337,92 @@ def _escalate(
         payload={"source": _SRC_ESCALATION, "changes_rounds": rounds, "return_to": assignee},
         extra_event=extra,
         comment=escalation_brief(assignee, escalation, rounds) if escalation != assignee else None,
+        pin_workspace=True,
     )
     return escalation if moved else ""
+
+
+# ------------------------------------------------------- workspace pinning
+
+PIN_KEY = "pinned_workspace_kind"
+"""On the escalation ``assigned`` event: the workspace kind the hop replaced."""
+UNPINNED_EVENT = "review_rework_workspace_restored"
+"""Durable marker: an abandoned escalation's pinned workspace kind was restored."""
+_REMOVABLE = ("scratch", "worktree")
+_PINNED = "dir"
+
+
+def _pin_workspace(conn: sqlite3.Connection, task_id: str) -> Optional[str]:
+    """Park the implementer's workspace as ``dir`` for the escalation hop.
+
+    Upstream ``complete_task`` reaps a ``scratch`` (rmtree) or a clean, pushed
+    ``worktree`` workspace right after the commit, so an escalated worker's
+    diagnosis ``kanban_complete`` would delete the tree the implementer comes
+    back to. ``dir`` is the kind upstream never removes; the path, branch and
+    contents are untouched, and the worker still gets the same directory.
+    The original kind is returned so the caller records it on the escalation
+    event; :func:`_hand_back` / :func:`_unpin_abandoned` put it back. Runs in
+    the caller's txn. ``None`` when there is nothing to protect."""
+    row = conn.execute(
+        "SELECT workspace_kind, workspace_path FROM tasks WHERE id = ?", (task_id,),
+    ).fetchone()
+    kind = (row["workspace_kind"] or "scratch") if row else None
+    if kind not in _REMOVABLE or not row["workspace_path"]:
+        return None
+    conn.execute("UPDATE tasks SET workspace_kind = ? WHERE id = ?", (_PINNED, task_id))
+    return kind
+
+
+def _unpin_abandoned(conn: sqlite3.Connection, dry_run: bool) -> list[str]:
+    """Restore the workspace kind of pins that no hand-back will restore.
+
+    A pin whose escalation ends in a hand-back is restored by
+    :func:`_hand_back` (which runs first in the same sweep). Otherwise the pin
+    holds while the card is live and is restored once a newer ``assigned``
+    event routed it away (operator reassign) or the card finished (done or
+    archived, e.g. a fixing escalation profile got approved, or an operator
+    unblock kept the hop from returning). The workspace survived completion
+    because of the pin; with the kind restored ``kanban gc`` treats it as
+    before."""
+    from hermes_cli import kanban_db as _kb
+
+    restored: list[str] = []
+    for row in conn.execute(
+        "SELECT id, status FROM tasks WHERE workspace_kind = ? AND claim_lock IS NULL", (_PINNED,),
+    ).fetchall():
+        task_id = row["id"]
+        pin = conn.execute(
+            "SELECT id, payload FROM task_events WHERE task_id = ? AND kind = 'assigned' "
+            "AND json_extract(payload, '$.' || ?) IS NOT NULL ORDER BY id DESC LIMIT 1",
+            (task_id, PIN_KEY),
+        ).fetchone()
+        if pin is None:
+            continue  # a genuine ``dir`` task
+        pin_id, kind = int(pin["id"]), _payload(pin["payload"]).get(PIN_KEY)
+        later = {
+            r["kind"] for r in conn.execute(
+                "SELECT DISTINCT kind FROM task_events WHERE task_id = ? AND id > ? "
+                "AND kind IN ('assigned', ?, ?)",
+                (task_id, pin_id, RETURNED_EVENT, UNPINNED_EVENT),
+            )
+        }
+        finished = row["status"] in ("done", "archived")
+        if kind not in _REMOVABLE or later & {RETURNED_EVENT, UNPINNED_EVENT}:
+            continue
+        if "assigned" not in later and not finished:
+            continue
+        if not dry_run:
+            with _kb.write_txn(conn):
+                cur = conn.execute(
+                    "UPDATE tasks SET workspace_kind = ? WHERE id = ? AND workspace_kind = ? "
+                    "AND claim_lock IS NULL",
+                    (kind, task_id, _PINNED),
+                )
+                if cur.rowcount != 1:
+                    continue
+                _kb._append_event(conn, task_id, UNPINNED_EVENT, {"workspace_kind": kind})
+        restored.append(task_id)
+    return restored
 
 
 def escalation_brief(implementer: str, escalation: str, rounds: int) -> str:
@@ -444,6 +544,10 @@ def return_diagnosed(conn: sqlite3.Connection, *, dry_run: bool) -> list[str]:
         if esc is None:
             continue
         esc_id, esc_data = esc
+        # An operator unblock since the escalation ("go again") is explicit
+        # routing: every later terminal of that profile stays with the operator.
+        if _operator_routed_after(conn, task_id, esc_id):
+            continue
         terminal = _diagnosis_terminal(conn, task_id, esc_id, owner)
         if terminal is None or _TERMINAL_STATUS[terminal["kind"]] != status:
             continue
@@ -452,6 +556,7 @@ def return_diagnosed(conn: sqlite3.Connection, *, dry_run: bool) -> list[str]:
             continue
         if _hand_back(conn, _kb, task_id, status, owner, esc_data, terminal):
             returned.append(task_id)
+    _unpin_abandoned(conn, dry_run)
     return returned
 
 
@@ -464,18 +569,23 @@ def _hand_back(
     reason = terminal_payload.get("reason") if terminal["kind"] == "blocked" else terminal_payload.get("summary")
     first = (reason or "").strip().splitlines()[0][:300] if isinstance(reason, str) and reason.strip() else ""
     terminations: list = []
+    pinned = esc_data.get(PIN_KEY)
     with _kb.write_txn(conn):
         new_status = _kb._landing_status_after_parents(conn, task_id)
         # block_kind/block_recurrences reset: the hand-back block is the
         # escalation protocol's end-of-step signal, not a wall, so the
         # implementer's first genuine block must not count as its recurrence.
+        # The workspace kind pinned by _escalate is restored for the implementer.
         cur = conn.execute(
             "UPDATE tasks SET status = ?, assignee = ?, completed_at = NULL, "
             "block_kind = NULL, block_recurrences = 0, "
-            "consecutive_failures = 0, last_failure_error = NULL "
+            "consecutive_failures = 0, last_failure_error = NULL, "
+            "workspace_kind = CASE WHEN ? IS NOT NULL AND workspace_kind = ? THEN ? "
+            "ELSE workspace_kind END "
             "WHERE id = ? AND status = ? AND assignee = ? AND claim_lock IS NULL "
             "AND current_run_id IS NULL",
-            (new_status, target, task_id, status, owner),
+            (new_status, target, pinned if pinned in _REMOVABLE else None, _PINNED, pinned,
+             task_id, status, owner),
         )
         if cur.rowcount != 1:
             return False
