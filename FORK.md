@@ -31,9 +31,17 @@ Landing: feature branch → review → merge into `next`. Direct pushes to
 A worker that discovers mid-card it must exceed its tier **blocks with
 `needs_input`** stating what it found. It does not proceed at a higher tier.
 
-Decision order for any request: can it be a skill? an MCP server? a plugin
-(Python `on_*` hook or Desktop SDK contribution point)? a new file? an anchor?
-Only then inline.
+Decision order for any request: current upstream built-in/config → skill,
+MCP, Python plugin hook or Desktop SDK contribution point (T0) → upstream-free
+T1 module → narrow T2 anchor into that module. **When no T0 seam exists,
+T1 implementation plus T2 anchors is the default**, not inline edits. Mark
+the card T2 if it needs any anchor. Inventory every upstream call site before
+setting the tier; each upstream file gets at most 5 anchor lines with a named
+marker, while tests should live in fork-owned files where practical. A small
+one-off or quiet upstream file does not justify T3. Inline edits require a
+concrete reason extraction cannot preserve the contract, the closest T1/T2
+alternative, and operator confirmation before coding. If the necessary seam
+exceeds the T2 budget, split the design or block for a tier decision.
 
 If it's *almost* a plugin but the plugin system can't do one part, consider a
 **fork extension point**: a generic, additive capability under `ctx.fork.*` /
