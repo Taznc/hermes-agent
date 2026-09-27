@@ -558,7 +558,36 @@ def _anchored_worktree(repo_root: Path, task_id: str, branch_name: str) -> tuple
     return target, branch_name
 
 
-def _resolve_worktree_workspace(task: Task, *, board: Optional[str] = None) -> tuple[Path, str]:
+def _legacy_canonical_worktree_resume(
+    task: Task, path: Path, branch_name: str, conn: Optional[sqlite3.Connection],
+) -> bool:
+    """Resume a pre-marker canonical checkout without claiming teardown ownership.
+
+    The row/path alone is insufficient: require the default task branch, a
+    canonical linked checkout and a *previous* worker-spawn record. No marker
+    is written, so cleanup continues to preserve this tree for manual review.
+    """
+    if conn is None or branch_name != f"wt/{task.id}":
+        return False
+    common = _git_common_dir(path)
+    repo = common.parent if common is not None and common.name == ".git" else None
+    if repo is None or _path_key(path) != _path_key(repo / ".worktrees" / task.id):
+        return False
+    if _kanban_worktree_provenance(path) is not None:
+        return False
+    try:
+        row = conn.execute(
+            "SELECT 1 FROM task_runs WHERE task_id=? AND worker_pid IS NOT NULL "
+            "AND id != COALESCE(?, -1) LIMIT 1",
+            (task.id, task.current_run_id),
+        ).fetchone()
+    except (sqlite3.Error, AttributeError):
+        return False
+    return row is not None
+
+
+def _resolve_worktree_workspace(task: Task, *, board: Optional[str] = None,
+                                conn: Optional[sqlite3.Connection] = None) -> tuple[Path, str]:
     """Resolve + materialize a linked git worktree for ``task``. With no
     ``task.workspace_path`` the anchor is the board's ``default_workdir`` so
     every worktree lands under a board-owned repo (``<repo>/.worktrees/<id>``)
@@ -601,6 +630,17 @@ def _resolve_worktree_workspace(task: Task, *, board: Optional[str] = None) -> t
         actual_branch = _git_current_branch(requested)
         if actual_branch == branch_name and _worktree_owned_by_task(task.id, requested, branch_name):
             return requested_resolved, actual_branch
+        if actual_branch == branch_name and _kanban_worktree_provenance(requested) is None:
+            if _legacy_canonical_worktree_resume(task, requested, branch_name, conn):
+                _kb._log.warning(
+                    "Resuming legacy unmarked worktree %s for task %s; automatic teardown disabled",
+                    requested, task.id,
+                )
+                return requested_resolved, branch_name
+            # Do not hide an unmarked checkout of this task's branch behind a
+            # fresh fallback: that would strand its work (or adopt a foreign tree).
+            raise ValueError(f"Refusing to dispatch task {task.id} into unowned worktree {requested}; "
+                             "legacy recovery requires a canonical checkout and a prior worker run")
         # The requested path is an existing checkout of a DIFFERENT task's
         # branch (decompose children inherit the root's workspace_path
         # verbatim, so siblings all point here). Reusing it would run this task

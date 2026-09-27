@@ -297,6 +297,50 @@ def test_legacy_dispatch_does_not_adopt_foreign_checkout(kanban_home: Path, repo
         assert ws != served.resolve() and branch == f"wt/{tid}"
     assert served.is_dir()
 
+def test_legacy_canonical_resume_preserves_unmarked_tree(kanban_home: Path, repo: Path) -> None:
+    """An old worker-spawn record plus canonical Git checkout permits resume, not ownership."""
+    with kbc.connect_closing() as conn:
+        tid = kb.create_task(conn, title="old worker", assignee="worker")
+        wt = repo / ".worktrees" / tid
+        _git("-C", str(repo), "worktree", "add", "-b", f"wt/{tid}", str(wt), "HEAD")
+        with kb.write_txn(conn):
+            conn.execute("UPDATE tasks SET workspace_kind='worktree', workspace_path=?, branch_name=? WHERE id=?",
+                         (str(wt), f"wt/{tid}", tid))
+            conn.execute("INSERT INTO task_runs (task_id, status, started_at, worker_pid) VALUES (?, 'released', 1, 12345)", (tid,))
+        task = kb.get_task(conn, tid)
+        assert kbw._resolve_worktree_workspace(task, conn=conn) == (wt.resolve(), f"wt/{tid}")
+        assert kbw._kanban_worktree_provenance(wt) is None
+        kbw._cleanup_worktree_workspace(tid, str(wt), f"wt/{tid}")
+        assert wt.exists(), "legacy resume never grants teardown ownership"
+
+
+def test_legacy_canonical_without_prior_worker_is_not_adopted(kanban_home: Path, repo: Path) -> None:
+    with kbc.connect_closing() as conn:
+        tid = kb.create_task(conn, title="forged row", assignee="worker")
+        wt = repo / ".worktrees" / tid
+        _git("-C", str(repo), "worktree", "add", "-b", f"wt/{tid}", str(wt), "HEAD")
+        with kb.write_txn(conn):
+            conn.execute("UPDATE tasks SET workspace_kind='worktree', workspace_path=?, branch_name=? WHERE id=?",
+                         (str(wt), f"wt/{tid}", tid))
+        with pytest.raises(ValueError, match="unowned worktree"):
+            kbw._resolve_worktree_workspace(kb.get_task(conn, tid), conn=conn)
+        assert wt.exists() and kbw._kanban_worktree_provenance(wt) is None
+
+
+def test_legacy_noncanonical_prior_worker_does_not_fallback(kanban_home: Path, repo: Path) -> None:
+    with kbc.connect_closing() as conn:
+        tid = kb.create_task(conn, title="old custom", assignee="worker")
+        wt = repo / ".worktrees" / "old-custom"
+        _git("-C", str(repo), "worktree", "add", "-b", f"wt/{tid}", str(wt), "HEAD")
+        with kb.write_txn(conn):
+            conn.execute("UPDATE tasks SET workspace_kind='worktree', workspace_path=?, branch_name=? WHERE id=?",
+                         (str(wt), f"wt/{tid}", tid))
+            conn.execute("INSERT INTO task_runs (task_id, status, started_at, worker_pid) VALUES (?, 'released', 1, 12345)", (tid,))
+        with pytest.raises(ValueError, match="unowned worktree"):
+            kbw._resolve_worktree_workspace(kb.get_task(conn, tid), conn=conn)
+        assert wt.exists() and not (repo / ".worktrees" / tid).exists()
+
+
 def test_legacy_row_claiming_served_branch_cannot_reap_it(kanban_home: Path, repo: Path) -> None:
     served = _served_worktree(repo, "served-claimed", "next")
     with kbc.connect_closing() as conn:

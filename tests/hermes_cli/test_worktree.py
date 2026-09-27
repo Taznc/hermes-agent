@@ -125,6 +125,17 @@ class TestWorktreeLockReaping:
         cli._prune_stale_worktrees(str(git_repo))
         assert wt.exists(), "live-locked worktree (this pid) must never be reaped"
 
+    def test_foreign_lock_on_marked_tree_survives_prune(self, git_repo):
+        import cli
+        wt = self._mk(cli, git_repo, "hermes-deployment", age_h=500)
+        subprocess.run(["git", "worktree", "lock", "--reason", "served deployment", str(wt)],
+                       cwd=git_repo, check=True, capture_output=True)
+        cli._prune_stale_worktrees(str(git_repo))
+        assert wt.exists()
+        listing = subprocess.run(["git", "worktree", "list", "--porcelain"], cwd=git_repo,
+                                 check=True, capture_output=True, text=True).stdout
+        assert "locked served deployment" in listing
+
     def test_dead_locked_clean_is_reaped(self, git_repo):
         import cli
         wt = self._mk(cli, git_repo, "hermes-dead", pid=999999)
@@ -226,6 +237,17 @@ class TestPrunerBranchOwnership:
         assert subprocess.run(["git", "show-ref", "--verify", "refs/heads/hermes/hermes-handmade"],
                               cwd=git_repo, capture_output=True).returncode == 0
 
+    def test_lock_added_after_classification_is_preserved(self, git_repo):
+        wt = self._mk_on(git_repo, "hermes-lock-race", branch="hermes/hermes-lock-race")
+        worktree_ops._mark_prune_owned_worktree(str(wt), "hermes/hermes-lock-race")
+        subprocess.run(["git", "worktree", "lock", "--reason", "served deployment", str(wt)],
+                       cwd=git_repo, check=True, capture_output=True)
+        worktree_ops._reap_prune_verdicts(str(git_repo), [(wt, 0, True, "reap", None)], 1)
+        assert wt.exists()
+        assert "locked served deployment" in subprocess.run(
+            ["git", "worktree", "list", "--porcelain"], cwd=git_repo, check=True,
+            capture_output=True, text=True).stdout
+
     def test_reap_rechecks_branch_after_classification(self, git_repo):
         wt = self._mk_on(git_repo, "hermes-race", branch="hermes/hermes-race")
         worktree_ops._mark_prune_owned_worktree(str(wt), "hermes/hermes-race")
@@ -292,9 +314,13 @@ class TestWorktreeLockPredicate:
         assert worktree_ops._worktree_lock_is_live(str(git_repo), str(p)) is None
 
 
-    def test_foreign_lock_reason_returns_dead(self, git_repo):
+    def test_foreign_lock_reason_is_preserved(self, git_repo):
         p = self._mk_locked(git_repo, "hermes-foreign", "some other tool")
-        assert worktree_ops._worktree_lock_is_live(str(git_repo), str(p)) == "dead"
+        assert worktree_ops._worktree_lock_is_live(str(git_repo), str(p)) == "live"
+
+    def test_embedded_pid_in_foreign_reason_is_preserved(self, git_repo):
+        p = self._mk_locked(git_repo, "hermes-foreign-pid", "served: hermes pid=999999")
+        assert worktree_ops._worktree_lock_is_live(str(git_repo), str(p)) == "live"
 
     def test_bad_repo_root_fails_safe_to_live(self, tmp_path):
         # Not a git repo -> git query fails -> must report "live" (never delete)

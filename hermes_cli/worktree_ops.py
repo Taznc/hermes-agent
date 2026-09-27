@@ -749,10 +749,11 @@ def _worktree_branch_pushed_exact(
 
 
 def _worktree_lock_is_live(repo_root: str, worktree_path: str, timeout: int = 10):
-    """Lock state: ``"live"`` (owning pid runs), ``"dead"`` (pid gone / non-hermes reason), None (unlocked).
+    """Lock state: ``"live"`` (running PID, foreign or unknown lock),
+    ``"dead"`` (exact Hermes PID reason and PID gone), None (unlocked).
 
-    ``hermes -w`` locks with reason ``hermes pid=<pid>``; ``worktree remove --force`` refuses
-    locked trees, so a crashed session's lock would keep its tree forever. Fails SAFE toward "live".
+    ``hermes -w`` locks with reason ``hermes pid=<pid>``; only those stale locks
+    may be unlocked. Fails SAFE toward "live".
     """
     try:
         listing = _git_out(["worktree", "list", "--porcelain"], repo_root, timeout=timeout)
@@ -773,10 +774,11 @@ def _worktree_lock_is_live(repo_root: str, worktree_path: str, timeout: int = 10
             if current != target:
                 continue
             reason = line[len("locked"):].strip()
-            m = re.search(r"hermes pid=(\d+)", reason)
+            m = re.fullmatch(r"hermes pid=([0-9]+)", reason)
             if not m:
-                # A foreign lock here is a leftover; the age/dirty/unpushed gates already passed.
-                return "dead"
+                # A foreign lock may protect a live deployment even on a tree
+                # originally created by Hermes. Never unlock it.
+                return "live"
             pid = int(m.group(1))
             if pid == os.getpid():
                 return "live"
@@ -864,7 +866,8 @@ def _classify_prune_candidates(repo_root: str, candidates: list) -> list:
                 return (entry, mtime, force, "unpushed", None)
             keep_branch = not merged
 
-        # Live lock = running hermes; a dead lock is unlocked in phase 3.
+        # A live or foreign lock preserves the tree; only a stale Hermes PID
+        # lock is eligible for unlocking in phase 3.
         lock_state = _worktree_lock_is_live(repo_root, str(entry), timeout=5)
         if lock_state == "live":
             return (entry, mtime, force, "locked-live", None)
@@ -954,9 +957,16 @@ def _reap_prune_verdicts(repo_root: str, verdicts: list, stale_work_cutoff: floa
                 str(entry), _fetch_remote_branch_heads(repo_root, timeout=10)))
         ):
             continue
-        if lock_state == "dead":
-            _git_quiet(["worktree", "unlock", str(entry)], repo_root,
-                       log=f"Failed to unlock dead worktree {entry.name}")
+        # A lock may have been installed or replaced after classification.
+        # Only unlock a currently stale Hermes PID lock; Git itself refuses
+        # removal if another actor locks the tree before the remove call.
+        current_lock = _worktree_lock_is_live(repo_root, str(entry), timeout=5)
+        if current_lock == "live" or current_lock != lock_state:
+            continue
+        if current_lock == "dead":
+            if _git(["worktree", "unlock", str(entry)], repo_root, timeout=10).returncode != 0:
+                logger.warning("Failed to unlock dead worktree %s", entry.name)
+                continue
 
         try:
             branch = _worktree_symbolic_branch(str(entry), timeout=5)
