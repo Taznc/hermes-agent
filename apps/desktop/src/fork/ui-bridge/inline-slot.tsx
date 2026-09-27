@@ -67,17 +67,23 @@ export function parkedForRow(
  * run of activity is expanded rather than a one-line ticker clipping the card. The
  * user's own prior choice is restored afterwards.
  */
-function useHoldDisclosureOpen(disclosureId: string, hold: boolean): void {
-  useEffect(() => {
-    if (!hold) {
-      return
-    }
+function HoldDisclosureOpen({ args, toolCallId, toolName }: Pick<ToolRowProps, 'args' | 'toolCallId' | 'toolName'>) {
+  // Mounted only while a card is live, so ordinary rows never touch the aui store.
+  const messageId = useAuiState(state => state.message.id)
 
+  const disclosureId = useMemo(
+    () => toolEntryDisclosureId(messageId, { args, toolCallId, toolName }),
+    [args, messageId, toolCallId, toolName]
+  )
+
+  useEffect(() => {
     const previous = $toolDisclosureStates.get()[disclosureId]
     setToolDisclosureOpen(disclosureId, true)
 
     return () => setToolDisclosureOpen(disclosureId, previous ?? false)
-  }, [disclosureId, hold])
+  }, [disclosureId])
+
+  return null
 }
 
 /**
@@ -99,20 +105,12 @@ export function withUiRequestSlot(Row: FC<ToolRowProps>): FC<ToolRowProps> {
     const view = useSessionView()
     const sessionId = useStore(view.$runtimeId)
     const activeSessionId = useStore($activeSessionId)
-    const messageId = useAuiState(state => state.message.id)
     const { args, isError, result, toolCallId, toolName } = props
     const hasResult = result !== undefined
 
     const parked = hasResult ? null : parkedForRow(requests, sessionId, toolCallId, () => view.$messages.get())
     const live = parked ? contributorForKind(contributions, parked.kind) : null
     const settled = hasResult ? contributorForTool(contributions, toolName) : null
-
-    const disclosureId = useMemo(
-      () => toolEntryDisclosureId(messageId, { args, toolCallId, toolName }),
-      [args, messageId, toolCallId, toolName]
-    )
-
-    useHoldDisclosureOpen(disclosureId, Boolean(parked && live))
 
     if (settled?.data.renderResult) {
       const resultProps: UiToolResultRenderProps = { args, isError: Boolean(isError), result, toolCallId, toolName }
@@ -141,6 +139,7 @@ export function withUiRequestSlot(Row: FC<ToolRowProps>): FC<ToolRowProps> {
 
     return (
       <>
+        <HoldDisclosureOpen args={args} toolCallId={toolCallId} toolName={toolName} />
         <Row {...props} />
         <div className="mt-1.5 min-w-0 max-w-full" data-fork-ui-request={parked.kind}>
           <ContribBoundary id={live.id} variant="chip">
