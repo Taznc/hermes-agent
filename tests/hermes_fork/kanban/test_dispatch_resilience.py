@@ -177,6 +177,46 @@ def test_timeout_kill_intent_persist_then_consume(kanban_home):
         assert not dr.consume_timeout_kill_intent(conn, task_id=tid, run_id=1, worker_pid=999)
 
 
+def test_account_infra_deaths_honours_a_kb_level_override_of_the_resolver(
+    kanban_home, monkeypatch,
+):
+    """Binding-level regression for the ``ab0d0451b5`` extraction bug.
+
+    ``_account_infra_deaths`` must read the cap through the same origin
+    binding (``hermes_cli.kanban_db._resolve_max_infra_interruptions``) that
+    ``check_respawn_guard`` and every caller-facing test patch. A bare,
+    module-local call to the extracted module's own copy of the resolver
+    reads the real default (3) instead of a patched value and silently
+    disables the active-PR interruption cooldown a patched test expects.
+
+    Reproduce the pre-fix regression by reverting this call to the module-
+    local name (``_resolve_max_infra_interruptions()`` instead of
+    ``_kb._resolve_max_infra_interruptions()``) in
+    ``hermes_fork/kanban/dispatch_resilience.py``: this test goes RED because
+    the patched cap of 1 is never observed and the streak is never promoted.
+    """
+    monkeypatch.setattr(kb, "_resolve_max_infra_interruptions", lambda: 1)
+    with kbc.connect() as conn:
+        tid = kb.create_task(conn, title="t", assignee="a", max_retries=5)
+        # Two infra deaths exceed the patched cap of 1 (streak 2 > 1) and must
+        # promote the task to a legit counted crash via ``_record_task_failure``.
+        promoted = dr._account_infra_deaths(
+            conn, [(tid, 111, "a", "signal 15 (terminated)")],
+        )
+        assert promoted == []
+        assert dr.read_interruption_streak(conn, task_id=tid) == 1
+
+        promoted = dr._account_infra_deaths(
+            conn, [(tid, 112, "a", "signal 15 (terminated)")],
+        )
+        assert promoted == [tid], (
+            "expected the second infra death to exceed the patched cap of 1 "
+            "and promote to a counted crash; got no promotion, meaning "
+            "_account_infra_deaths read the unpatched module-local resolver "
+            "(default cap 3) instead of hermes_cli.kanban_db's patched one"
+        )
+
+
 def test_provider_backoff_register_query_and_release(kanban_home):
     with kbc.connect() as conn:
         tid = kb.create_task(conn, title="t", assignee="a")
