@@ -15,6 +15,7 @@ from hermes_fork.kanban import weekly_usage
 def home(tmp_path, monkeypatch):
     root = tmp_path / "home"
     root.mkdir()
+    (root / "config.yaml").write_text("kanban:\n  anthropic_weekly_guard:\n    enabled: true\n")
     monkeypatch.setenv("HERMES_HOME", str(root))
     monkeypatch.setattr(Path, "home", lambda: tmp_path)
     kb.init_db()
@@ -24,7 +25,10 @@ def home(tmp_path, monkeypatch):
 def _profile(home, name, model, provider="anthropic"):
     path = home if name == "default" else home / "profiles" / name
     path.mkdir(parents=True, exist_ok=True)
-    (path / "config.yaml").write_text(f"model:\n  default: {model}\n  provider: {provider}\n")
+    (path / "config.yaml").write_text(
+        f"model:\n  default: {model}\n  provider: {provider}\n"
+        + ("kanban:\n  anthropic_weekly_guard:\n    enabled: true\n" if name == "default" else "")
+    )
     return path
 
 
@@ -41,6 +45,17 @@ def _oauth(monkeypatch, percent, *, reset=None):
 
 def _dispatch(conn):
     return kbd.dispatch_once(conn, spawn_fn=lambda task, workspace, board=None: 31337)
+
+
+def test_guard_is_opt_in(home, monkeypatch):
+    _profile(home, "default", "claude-opus-4-1")
+    (home / "config.yaml").write_text("model:\n  default: claude-opus-4-1\n  provider: anthropic\n")
+    monkeypatch.setattr(account_usage, "resolve_anthropic_token", lambda: None)
+    with kbc.connect() as conn:
+        tid = kb.create_task(conn, title="other home", assignee="default")
+        assert [task_id for task_id, _, _ in _dispatch(conn).spawned] == [tid]
+    assert weekly_usage._threshold() is None
+    assert not (home / "kanban-weekly-usage.json").exists()
 
 
 def test_claim_boundary_and_other_provider_unaffected(home, monkeypatch):
@@ -187,12 +202,35 @@ def test_invalid_override_cannot_be_enabled(home, monkeypatch):
 
 
 def test_explicit_config_threshold_and_providers(home, monkeypatch):
-    (home / "config.yaml").write_text("model:\n  default: claude-sonnet-4-5\n  provider: anthropic\nkanban:\n  anthropic_weekly_guard:\n    threshold_percent: 90\n")
+    (home / "config.yaml").write_text("model:\n  default: claude-sonnet-4-5\n  provider: anthropic\nkanban:\n  anthropic_weekly_guard:\n    enabled: true\n    threshold_percent: 90\n")
     _oauth(monkeypatch, 75)
     with kbc.connect() as conn:
         tid = kb.create_task(conn, title="under adjusted cap", assignee="default")
         assert [t for t, _, _ in _dispatch(conn).spawned] == [tid]
     assert weekly_usage._threshold() == 90
+
+
+def test_effective_profile_config_drives_provider_gate(home, monkeypatch):
+    """Managed/profile overlays must beat the raw per-profile YAML."""
+    from hermes_cli import config as config_module
+    from hermes_constants import get_hermes_home
+    profile = _profile(home, "configured", "gpt-5", "openai-codex")
+    original = config_module.load_config_readonly
+
+    def effective(*args, **kwargs):
+        if Path(get_hermes_home()) == profile:
+            return {"model": {"default": "claude-opus-4-1", "provider": "anthropic"}}
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(config_module, "load_config_readonly", effective)
+    _oauth(monkeypatch, 75)
+    with kbc.connect() as conn:
+        tid = kb.create_task(conn, title="effective Claude", assignee="configured")
+        result = _dispatch(conn)
+        assert not result.spawned
+        task = kb.get_task(conn, tid)
+        assert task is not None and task.status == "ready"
+        assert any(task_id == tid and "weekly" in reason for task_id, reason in result.respawn_guarded)
 
 
 def test_cli_parser_and_worker_cannot_override(home, monkeypatch):

@@ -1,9 +1,10 @@
 """Pre-claim weekly Anthropic OAuth admission for unattended Kanban workers only.
 
-Default: 70% ``Current week`` (and the matching Opus/Sonnet week, when
-reported). Configure ``kanban.anthropic_weekly_guard.threshold_percent`` in
-config.yaml; ``enabled: false`` explicitly disables it. No change to personal
-chat, cron, other-provider Kanban workers or Hindsight's own processes.
+Disabled unless ``kanban.anthropic_weekly_guard.enabled: true`` is explicitly
+set. The enabled default threshold is 70% ``Current week`` (and the matching
+Opus/Sonnet week, when reported). Configure
+``kanban.anthropic_weekly_guard.threshold_percent`` to change it. No change to
+personal chat, cron, other-provider Kanban workers or Hindsight's own processes.
 
 Operator CLI, scoped to an assignee's account::
 
@@ -74,9 +75,13 @@ def _atomic_json(path, value):
 
 def _identity(conn, row, assignee):
     from hermes_cli.profiles import get_profile_dir
-    from hermes_cli.config import read_user_config_raw
+    from hermes_cli.config import load_config_readonly
+    from hermes_cli.kanban_db_dispatch import _worker_profile_scope
     task = conn.execute("SELECT model_override, provider_override FROM tasks WHERE id = ?", (row["id"],)).fetchone()
-    cfg = read_user_config_raw(get_profile_dir(assignee) / "config.yaml")
+    # Match the spawned worker's resolved configuration, not just the raw YAML:
+    # defaults and managed/profile overlays can change the provider or model.
+    with _worker_profile_scope(str(get_profile_dir(assignee))):
+        cfg = load_config_readonly()
     model_cfg = cfg.get("model") or {}
     if isinstance(model_cfg, str):
         model_cfg = {"default": model_cfg}
@@ -96,11 +101,10 @@ def _identity(conn, row, assignee):
 def _threshold():
     from hermes_cli.config import load_config_readonly
     cfg = (load_config_readonly().get("kanban") or {}).get("anthropic_weekly_guard", {})
-    if not isinstance(cfg, dict):
-        return DEFAULT_THRESHOLD
-    # The default is always enabled. Invalid config fails closed, not open.
-    if cfg.get("enabled") is False:
+    if not isinstance(cfg, dict) or cfg.get("enabled") is not True:
         return None
+    # Explicit opt-in: malformed thresholds fail closed rather than silently
+    # turning an enabled guard into a disabled one.
     value = cfg.get("threshold_percent", DEFAULT_THRESHOLD)
     if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value) or not 0 < value <= 100:
         raise ValueError("kanban.anthropic_weekly_guard.threshold_percent must be in (0, 100]")
@@ -157,6 +161,12 @@ def _override(home, now):
 def admit(conn, row, assignee):
     """Return a reason to defer without claiming, or None to proceed."""
     try:
+        threshold = _threshold()
+        if threshold is None:
+            return None  # A home that has not opted in keeps upstream behavior.
+    except Exception as exc:
+        return f"weekly Anthropic guard: invalid guard configuration ({type(exc).__name__}: {exc})"
+    try:
         model = _identity(conn, row, assignee)
         if model is None:
             return None
@@ -164,9 +174,6 @@ def admit(conn, row, assignee):
         # Unknown model/profile scope may be Anthropic; never silently admit.
         return f"weekly Anthropic guard: cannot resolve worker model: {exc}"
     try:
-        threshold = _threshold()
-        if threshold is None:
-            return None
         now = _now()
         home = _profile_home(assignee)
         override = _override(home, now)
