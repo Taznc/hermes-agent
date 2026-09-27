@@ -5,6 +5,7 @@ import { useRef, useState } from 'react'
 import { type NewSessionSplitHandler, startNewSessionDrag } from '@/app/chat/new-session-drag'
 import { Codicon } from '@/components/ui/codicon'
 import { Tip } from '@/components/ui/tooltip'
+import { SidebarProjectGroupAction } from '@/fork/sidebar-group-actions'
 import type { SessionInfo } from '@/hermes'
 import { useI18n } from '@/i18n'
 import { cn } from '@/lib/utils'
@@ -200,6 +201,7 @@ export function ProjectOverviewRow({
               delete — but it still starts sessions: a null path is the "no
               folder" chat. New session sits outermost: it's the one you reach
               for. */}
+          <SidebarProjectGroupAction project={project} /* FORK ANCHOR: sidebar-group-action */ />
           {!project.isNoProject && <ProjectMenu anchorRef={rowRef} isActive={isActive} project={project} />}
           {onNewSession && (
             <WorkspaceAddButton
