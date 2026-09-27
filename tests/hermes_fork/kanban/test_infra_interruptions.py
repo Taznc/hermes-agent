@@ -168,6 +168,34 @@ def test_a_completed_run_resets_the_allowance(board):
     assert _last_run(board, tid)["outcome"] == "reclaimed"
 
 
+def test_allowance_does_not_age_out_behind_many_non_completed_runs(board):
+    """Only a completed run resets the allowance: a long tail of closed, non-completed
+    runs (e.g. operator requeues of a failing card) must not push the spent
+    interruptions out of view and re-grant a neutral reboot death."""
+    tid = kb.create_task(board, title="t", assignee="a")
+    cap = ii.MAX_HOST_RESTART_INTERRUPTIONS
+    for i in range(cap):
+        _running(board, tid, 84000 + i)
+        kbd.detect_crashed_workers(board)
+    now = int(time.time())
+    board.executemany(
+        "INSERT INTO task_runs (task_id, status, started_at, ended_at, outcome, error) "
+        "VALUES (?, 'crashed', ?, ?, 'crashed', 'rc=1')",
+        [(tid, now, now)] * 60,
+    )
+    board.commit()
+    assert ii.host_restart_streak(board, tid) == cap
+    _running(board, tid, 84100)
+    kbd.detect_crashed_workers(board)
+    assert _last_run(board, tid)["outcome"] == "crashed"
+    assert kb.get_task(board, tid).consecutive_failures == 1
+    neutral = [
+        r for r in board.execute("SELECT metadata FROM task_runs WHERE task_id=?", (tid,))
+        if kb._json_dict(r["metadata"]).get("host_restart_interrupted")
+    ]
+    assert len(neutral) == cap
+
+
 # --- everything else keeps upstream's booking --------------------------------
 
 
