@@ -5367,6 +5367,7 @@ export const esOverrides = {
       refresh: 'Actualizar',
       moreActions: 'Más acciones',
       branchNewChat: 'Ramificar en chat nuevo',
+      copyMessage: 'Copiar mensaje',
       react: 'Reaccionar',
       dismissError: 'Descartar error',
       errorLayers: {
