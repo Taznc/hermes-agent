@@ -21,6 +21,7 @@ import { Input } from '@/components/ui/input'
 import { ProfileGlyph } from '@/components/ui/profile-glyph'
 import { useContributions } from '@/contrib'
 import { ContribBoundary, ContribRender } from '@/contrib/react/boundary'
+import { forkProfileGroupAction } from '@/fork/sidebar-group-actions'
 import type { SessionInfo } from '@/hermes'
 import { useI18n } from '@/i18n'
 import { useStoreSelector } from '@/lib/use-session-slice'
@@ -211,6 +212,7 @@ function GatewayProfileGroup({
         // below); the full handle stays on the grabber (see useSortableBindings).
         actions={
           <div className="flex items-center">
+            {forkProfileGroupAction(group, label) /* FORK ANCHOR: sidebar-group-action */}
             {group.profile && !embedded && (
               <WorkspaceAddButton
                 label={s.newSessionIn(label)}
