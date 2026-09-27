@@ -2035,7 +2035,7 @@ def _dispatch_lane_task(
             return False
     guard_reason = check_respawn_guard(conn, task_id, lane=lane)
     # >>> FORK ANCHOR: pr-requeue-recovery <<<
-    from hermes_fork.kanban.pr_requeue import release as _fork_pr_release
+    from hermes_fork.kanban.preclaim_guards import release as _fork_pr_release
     guard_reason = _fork_pr_release(conn, task_id, guard_reason, dry_run=dry_run)
     # <<< FORK ANCHOR >>>
     if guard_reason is not None:

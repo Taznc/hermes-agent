@@ -473,5 +473,9 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
                                     "HERMES_KANBAN_BOARD env var). Use `hermes kanban boards "
                                     "list` to see all boards.")
     _add_commands(kanban_parser.add_subparsers(dest="kanban_action"), _SPECS)
+    # >>> FORK ANCHOR: anthropic-weekly-cli <<<
+    from hermes_fork.kanban.weekly_usage import add_parser as _weekly_parser
+    _weekly_parser(next(a for a in kanban_parser._actions if isinstance(a, argparse._SubParsersAction)))
+    # <<< FORK ANCHOR >>>
     kanban_parser.set_defaults(_kanban_parser=kanban_parser)
     return kanban_parser
