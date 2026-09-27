@@ -104,6 +104,7 @@ class TestWorktreeLockReaping:
             ["git", "worktree", "add", str(p), "-b", f"hermes/{name}", "HEAD"],
             cwd=repo, capture_output=True,
         )
+        worktree_ops._mark_prune_owned_worktree(str(p), f"hermes/{name}")
         if pid is not None:
             subprocess.run(
                 ["git", "worktree", "lock", "--reason", f"hermes pid={pid}", str(p)],
@@ -211,6 +212,30 @@ class TestPrunerBranchOwnership:
         cli._prune_stale_worktrees(str(git_repo))
         assert wt.exists()
 
+    def test_hand_managed_tree_with_hermes_prefix_is_preserved(self, git_repo):
+        import cli
+        wt = self._mk_on(git_repo, "hermes-handmade", branch="hermes/hermes-handmade")
+        cli._prune_stale_worktrees(str(git_repo))
+        assert wt.exists(), "a branch prefix is not evidence Hermes created this checkout"
+
+    def test_hand_managed_orphan_branch_is_not_deleted(self, git_repo):
+        import cli
+        subprocess.run(["git", "branch", "hermes/hermes-handmade", "HEAD"], cwd=git_repo,
+                       check=True, capture_output=True)
+        cli._prune_stale_worktrees(str(git_repo))
+        assert subprocess.run(["git", "show-ref", "--verify", "refs/heads/hermes/hermes-handmade"],
+                              cwd=git_repo, capture_output=True).returncode == 0
+
+    def test_reap_rechecks_branch_after_classification(self, git_repo):
+        wt = self._mk_on(git_repo, "hermes-race", branch="hermes/hermes-race")
+        worktree_ops._mark_prune_owned_worktree(str(wt), "hermes/hermes-race")
+        # Classification approved the original branch. Before serial mutation,
+        # the checkout changed to a served (fully pushed) branch.
+        subprocess.run(["git", "branch", "next", "HEAD"], cwd=git_repo, check=True, capture_output=True)
+        subprocess.run(["git", "switch", "next"], cwd=wt, check=True, capture_output=True)
+        worktree_ops._reap_prune_verdicts(str(git_repo), [(wt, 0, True, "reap", None)], 1)
+        assert wt.exists() and worktree_ops._worktree_symbolic_branch(str(wt)) == "next"
+
     def test_detached_head_tree_never_reaped(self, git_repo):
         import cli
         wt = self._mk_on(git_repo, "pinned", detach=True)
@@ -225,6 +250,8 @@ class TestPrunerBranchOwnership:
             "subagent-abc": "hermes-subagent/subagent-abc",
         }
         paths = {n: self._mk_on(git_repo, n, branch=b) for n, b in trees.items()}
+        for name, path in paths.items():
+            worktree_ops._mark_prune_owned_worktree(str(path), trees[name])
         cli._prune_stale_worktrees(str(git_repo))
         for name, p in paths.items():
             assert not p.exists(), f"{name} on {trees[name]} is Hermes scratch and should be reaped"
@@ -299,6 +326,7 @@ class TestWidenedPruner:
             ["git", "worktree", "add", str(p), "-b", f"wt/{name}", "HEAD"],
             cwd=repo, capture_output=True,
         )
+        worktree_ops._mark_prune_owned_worktree(str(p), f"wt/{name}")
         sha = None
         if commit:
             (p / "work.txt").write_text(f"work for {name}\n")
@@ -614,6 +642,7 @@ class TestShallowCloneDeepening:
             ["git", "worktree", "add", str(wt), "-b", "hermes/hermes-shallowstuck", "HEAD"],
             clone,
         )
+        worktree_ops._mark_prune_owned_worktree(str(wt), "hermes/hermes-shallowstuck")
 
         self._advance_upstream(up, "B")
         # Same shape as the updater: shallow fetch of the new tip only.
@@ -727,6 +756,7 @@ class TestPrMergedEscapeHatch:
             ["git", "worktree", "add", str(p), "-b", f"hermes/{name}", "HEAD"],
             cwd=repo, capture_output=True,
         )
+        worktree_ops._mark_prune_owned_worktree(str(p), f"hermes/{name}")
         (p / "salvaged.txt").write_text("diff that was reworked during salvage\n")
         subprocess.run(["git", "add", "salvaged.txt"], cwd=p, capture_output=True)
         subprocess.run(["git", "commit", "-m", "salvaged work"], cwd=p, capture_output=True)

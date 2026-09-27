@@ -391,6 +391,35 @@ def _worktree_add(repo_root: str, wt_path: Path, branch_name: str, base_ref: str
         return None
     return base_ref, base_label
 
+_PRUNE_OWNER_FILE = "hermes-prune-owner.json"
+
+def _prune_owner_path(worktree_path: str) -> Optional[Path]:
+    """Git-admin location, outside the working tree (not affected by git status)."""
+    try:
+        git_dir = _git_out(["rev-parse", "--path-format=absolute", "--git-dir"], worktree_path)
+        common = _git_out(["rev-parse", "--path-format=absolute", "--git-common-dir"], worktree_path)
+        if git_dir and common and Path(git_dir).resolve() != Path(common).resolve():
+            return Path(git_dir) / _PRUNE_OWNER_FILE
+    except Exception:
+        pass
+    return None
+
+def _mark_prune_owned_worktree(worktree_path: str, branch: str) -> None:
+    marker = _prune_owner_path(worktree_path)
+    if marker is None:
+        raise RuntimeError(f"Cannot mark worktree ownership: {worktree_path}")
+    marker.write_text(json.dumps({"path": str(Path(worktree_path).resolve()), "branch": branch}), encoding="utf-8")
+
+def _is_prune_owned_worktree(worktree_path: str, branch: str) -> bool:
+    marker = _prune_owner_path(worktree_path)
+    if marker is None:
+        return False
+    try:
+        owner = json.loads(marker.read_text(encoding="utf-8"))
+        return owner == {"path": str(Path(worktree_path).resolve()), "branch": branch}
+    except (OSError, ValueError, TypeError):
+        return False
+
 
 def _setup_worktree(repo_root: str = None, sync_base: bool = True,
                     name: Optional[str] = None) -> Optional[Dict[str, str]]:
@@ -432,6 +461,10 @@ def _setup_worktree(repo_root: str = None, sync_base: bool = True,
     if added is None:
         return None
     base_ref, base_label = added
+    try:
+        _mark_prune_owned_worktree(str(wt_path), branch_name)
+    except Exception as e:
+        logger.warning("Worktree %s created but cannot mark ownership; startup pruner will preserve it: %s", wt_path, e)
     _copy_worktree_includes(repo_root, wt_path)
 
     # Lock so other processes (and `git worktree remove`) see it is in use; fail-soft.
@@ -805,7 +838,7 @@ def _classify_prune_candidates(repo_root: str, candidates: list) -> list:
         # reaped. A clean, fully-pushed tree on ``next``/``main``/a user branch/a detached
         # HEAD is exactly what a served or hand-managed checkout looks like.
         owned, branch = _worktree_on_hermes_owned_branch(str(entry), timeout=5)
-        if not owned:
+        if not owned or not _is_prune_owned_worktree(str(entry), branch or ""):
             logger.debug(
                 "Preserving worktree %s: checked out on %s, not a Hermes-owned branch (%s)",
                 entry, branch or "<detached HEAD>", ", ".join(HERMES_OWNED_BRANCH_PREFIXES),
@@ -860,13 +893,13 @@ def _classify_prune_candidates(repo_root: str, candidates: list) -> list:
 _PRESERVE_REASONS = {
     "dirty": "uncommitted changes",
     "unpushed": "unpushed commits",
-    "foreign-branch": "not on a Hermes-owned branch",
+    "foreign-branch": "no matching Hermes creation marker/branch",
 }
 
 # Branch prefixes Hermes itself mints for scratch worktrees under ``.worktrees/``:
 # ``hermes/`` (``hermes -w``), ``hermes-subagent/`` (subagent isolation), ``wt/`` (kanban
 # default) and ``pr-`` (review checkouts, see ``_prune_orphaned_branches``). The startup
-# pruner only reaps trees on these. A tree checked out on anything else — a trunk such as
+# pruner requires BOTH this prefix and a creation marker. A tree on anything else — a trunk such as
 # ``main``/``next``, a user's feature branch, a detached HEAD — was not created by Hermes
 # for scratch use and may be a served or hand-managed checkout: preserved, never guessed.
 HERMES_OWNED_BRANCH_PREFIXES = ("hermes/", "hermes-subagent/", "wt/", "pr-")
@@ -905,13 +938,31 @@ def _reap_prune_verdicts(repo_root: str, verdicts: list, stale_work_cutoff: floa
             logger.debug("Skipping live-locked worktree: %s", entry.name)
             continue
 
+        # Classification is a snapshot. Branch/provenance can change before the
+        # serial removal; a forced remove must recheck both immediately beforehand.
+        owned, current = _worktree_on_hermes_owned_branch(str(entry), timeout=5)
+        if not owned or not _is_prune_owned_worktree(str(entry), current or ""):
+            logger.warning("Preserving worktree %s: ownership changed before removal", entry)
+            continue
+        if _worktree_is_dirty(str(entry), timeout=5):
+            logger.debug("Preserving worktree %s: state changed or unpushed at removal", entry)
+            continue
+        if _worktree_has_unpushed_commits(str(entry), timeout=5) and not (
+            _worktree_commits_all_merged_upstream(str(entry), timeout=30)
+            or _worktree_branch_pr_merged(str(entry), timeout=15)
+            or (verdict == "reap-keep-branch" and _worktree_branch_pushed_exact(
+                str(entry), _fetch_remote_branch_heads(repo_root, timeout=10)))
+        ):
+            continue
         if lock_state == "dead":
             _git_quiet(["worktree", "unlock", str(entry)], repo_root,
                        log=f"Failed to unlock dead worktree {entry.name}")
 
         try:
-            branch = _git(["branch", "--show-current"], str(entry), timeout=5).stdout.strip()
-            remove_result = _git(["worktree", "remove", str(entry), "--force"], repo_root, timeout=15)
+            branch = _worktree_symbolic_branch(str(entry), timeout=5)
+            if branch != current or not _is_prune_owned_worktree(str(entry), branch or ""):
+                continue
+            remove_result = _git(["worktree", "remove", str(entry)], repo_root, timeout=15)
             if remove_result.returncode != 0:
                 logger.debug("Failed to remove worktree %s: %s", entry.name, remove_result.stderr.strip())
                 continue
@@ -928,17 +979,16 @@ def _reap_prune_verdicts(repo_root: str, verdicts: list, stale_work_cutoff: floa
 def _prune_stale_worktrees(repo_root: str, max_age_hours: int = 24) -> None:
     """Remove stale worktrees and orphaned branches on startup.
 
-    Guards at every tier and age: trees not on a Hermes-owned branch (``HERMES_OWNED_BRANCH_PREFIXES``;
-    detached HEADs included) are never removed; dirty trees are never removed; unpushed commits are never
+    Guards at every tier and age: trees without a Hermes-created admin marker AND
+    matching branch (detached HEADs included) are never removed; dirty trees are never removed; unpushed commits are never
     removed UNLESS patch-equivalent to upstream, the PR is MERGED on GitHub, or the head EXACTLY
     matches origin (tree reaped, branch kept). Live-locked trees are skipped; dead locks are
     unlocked first. Trees preserved >7 days are listed in one WARNING so work can't rot silently.
-    Phases: ``_prune_candidates`` -> ``_classify_prune_candidates`` -> ``_reap_prune_verdicts``
-    -> ``_prune_orphaned_branches``.
+    Phases: ``_prune_candidates`` -> ``_classify_prune_candidates`` -> ``_reap_prune_verdicts``.
+    Orphan branches have no provenance marker, so startup never deletes them.
     """
     worktrees_dir = Path(repo_root) / ".worktrees"
     if not worktrees_dir.exists():
-        _prune_orphaned_branches(repo_root)
         return
 
     # Shallow clones make every aged tree read as unpushed forever; deepen once (fail-soft).
@@ -948,7 +998,6 @@ def _prune_stale_worktrees(repo_root: str, max_age_hours: int = 24) -> None:
     now = time.time()
     candidates = _prune_candidates(worktrees_dir, max_age_hours, now)
     if not candidates:
-        _prune_orphaned_branches(repo_root)
         return
 
     verdicts = _classify_prune_candidates(repo_root, candidates)
@@ -959,7 +1008,9 @@ def _prune_stale_worktrees(repo_root: str, max_age_hours: int = 24) -> None:
                        "reclaim (run `hermes worktree prune` to review and reclaim): %s",
                        len(preserved_stale), ", ".join(sorted(preserved_stale)))
 
-    _prune_orphaned_branches(repo_root, protect=kept_branches)
+    # An orphan branch has no checkout/admin marker left to establish its
+    # creator. Prefix-only deletion could destroy a hand-managed branch.
+    # Leave orphan cleanup to an explicit user-reviewed command.
 
     # The conservative startup pass accumulates trees it can never reclaim; say so once per launch.
     try:

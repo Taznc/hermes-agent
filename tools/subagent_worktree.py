@@ -93,6 +93,11 @@ def create_subagent_worktree(parent_cwd: Optional[str], subagent_id: Optional[st
         # Common on repos with zero commits (unborn HEAD) — degrade silently.
         logger.warning("subagent worktree: git worktree add failed: %s", result.stderr.strip())
         return None
+    try:
+        from hermes_cli.worktree_ops import _mark_prune_owned_worktree
+        _mark_prune_owned_worktree(str(wt_path), branch)
+    except Exception as exc:
+        logger.warning("subagent worktree: cannot mark startup-pruner ownership for %s: %s", wt_path, exc)
     logger.info("subagent worktree created: %s (branch %s)", wt_path, branch)
     return {"path": str(wt_path), "branch": branch, "repo_root": repo_root, "base_commit": base_commit}
 

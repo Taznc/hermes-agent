@@ -68,7 +68,7 @@ def repo(tmp_path: Path) -> Path:
 
 def _make_worktree(repo: Path, task_id: str, branch: str | None = None) -> Path:
     target = repo / ".worktrees" / task_id
-    kbw._ensure_git_worktree(repo, target, branch or f"wt/{task_id}")
+    kbw._ensure_git_worktree(repo, target, branch or f"wt/{task_id}", task_id)
     return target
 
 
@@ -285,6 +285,27 @@ def test_archive_task_preserves_served_checkout_on_other_branch(kanban_home: Pat
     assert (served / "README.md").exists()
     assert _branch_exists(repo, "next")
 
+def test_legacy_dispatch_does_not_adopt_foreign_checkout(kanban_home: Path, repo: Path) -> None:
+    served = _served_worktree(repo, "served-legacy", "next")
+    with kbc.connect_closing() as conn:
+        tid = kb.create_task(conn, title="legacy", assignee="worker")
+        with kb.write_txn(conn):
+            conn.execute("UPDATE tasks SET workspace_kind='worktree', workspace_path=? WHERE id=?", (str(served), tid))
+        task = kb.get_task(conn, tid)
+        assert task is not None
+        ws, branch = kbw._resolve_worktree_workspace(task)
+        assert ws != served.resolve() and branch == f"wt/{tid}"
+    assert served.is_dir()
+
+def test_legacy_row_claiming_served_branch_cannot_reap_it(kanban_home: Path, repo: Path) -> None:
+    served = _served_worktree(repo, "served-claimed", "next")
+    with kbc.connect_closing() as conn:
+        tid = kb.create_task(conn, title="legacy", assignee="worker")
+        with kb.write_txn(conn):
+            conn.execute("UPDATE tasks SET workspace_kind='worktree', workspace_path=?, branch_name='next' WHERE id=?", (str(served), tid))
+        assert kb.archive_task(conn, tid)
+    assert served.is_dir()
+
 
 # ---------------------------------------------------------------------------
 # Creation-time guard: create_task refuses to adopt someone else's checkout
@@ -319,19 +340,14 @@ def test_create_task_rejects_foreign_checkout_even_with_other_branch_name(
             )
 
 
-def test_create_task_allows_existing_checkout_on_own_branch(kanban_home: Path, repo: Path) -> None:
-    """(d) Same path, task's own branch (retry / re-dispatch) -> allowed and resolvable."""
+def test_create_task_cannot_claim_existing_checkout_by_naming_its_branch(kanban_home: Path, repo: Path) -> None:
+    """Caller-controlled branch_name is not worktree provenance."""
     wt = _make_worktree(repo, "retry-me", branch="wt/retry-me")
     with kbc.connect_closing() as conn:
-        tid = kb.create_task(
-            conn, title="retry", assignee="worker",
-            workspace_kind="worktree", workspace_path=str(wt), branch_name="wt/retry-me",
-        )
-        task = kb.get_task(conn, tid)
-        assert task is not None
-        ws, branch = kbw._resolve_worktree_workspace(task)
-    assert ws == wt.resolve()
-    assert branch == "wt/retry-me"
+        with pytest.raises(ValueError):
+            kb.create_task(conn, title="claim", assignee="worker",
+                           workspace_kind="worktree", workspace_path=str(wt), branch_name="wt/retry-me")
+    assert wt.is_dir()
 
 
 def test_create_task_allows_new_path_and_repo_root_anchor(kanban_home: Path, repo: Path) -> None:

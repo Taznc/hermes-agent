@@ -17,6 +17,7 @@ from pathlib import Path
 from typing import Optional
 from typing import TYPE_CHECKING
 import contextlib
+import json
 
 from hermes_cli.worktree_ops import release_lsp_clients
 
@@ -212,25 +213,22 @@ def _worktree_owned_by_task(task_id: str, path: Path, branch_name: Optional[str]
     branches. A detached HEAD is never ours."""
     owned = _task_owned_branch(task_id, branch_name)
     actual = _git_checked_out_branch(path)
-    if actual == owned:
+    if actual == owned and _kanban_worktree_provenance(path) == (task_id, owned):
         return True
     _kb._log.warning(
         "Preserving worktree for task %s: %s is checked out on %s, "
-        "but the task owns branch %s — it was not created for this task",
+        "but the task owns branch %s — checkout branch/provenance does not match this task",
         task_id, path, actual or "<detached HEAD>", owned,
     )
     return False
 
 
 def _reject_foreign_worktree_checkout(workspace_path: Optional[str], branch_name: Optional[str]) -> None:
-    """Creation-time guard: a ``worktree`` task may not adopt an existing
-    checkout that sits on a branch other than the one the task will own.
+    """Creation-time guard: a new task cannot adopt ANY existing linked checkout.
 
-    Raises ``ValueError``. The task id does not exist yet, so with no
-    ``branch_name`` the owned branch is the not-yet-minted ``wt/<new-id>``
-    and *no* existing checkout can match; with a ``branch_name`` an existing
-    checkout on exactly that branch (a retry/re-dispatch) stays allowed. A
-    repo root is an anchor request (dispatch materializes
+    A caller may choose ``branch_name`` to match a foreign tree, so branch
+    equality cannot establish ownership. Re-dispatch resumes the SAME task id,
+    not a newly created task. A repo root is an anchor (dispatch materializes
     ``<repo>/.worktrees/<id>`` under it) and is left to the resolver; a path
     that does not exist yet is what the dispatcher creates."""
     if not workspace_path:
@@ -242,17 +240,14 @@ def _reject_foreign_worktree_checkout(workspace_path: Optional[str], branch_name
         return  # a main checkout: anchor semantics, never adopted verbatim
     actual = _git_checked_out_branch(wp)
     owned = (branch_name or "").strip() or None
-    if owned is not None and actual == owned:
-        return
     repo_root = _repo_root_for_worktree_target(wp.parent)
     suggested = os.path.join(str(repo_root) if repo_root else "<repo>", ".worktrees", "<name>")
     raise ValueError(
         f"workspace_path {str(workspace_path)!r} is an existing git checkout on branch "
-        f"{actual or '<detached HEAD>'}, which this task would not own "
+        f"{actual or '<detached HEAD>'}, which a new task cannot own "
         f"(task branch: {owned or 'wt/<task-id>'}). A worktree task must not adopt "
         "someone else's checkout — completing or archiving it would try to remove that "
-        f"tree. Pass a NEW path such as {suggested!r} (the dispatcher creates the "
-        "worktree), or pass branch_name matching the existing checkout to resume it."
+        f"tree. Pass a NEW path such as {suggested!r} (the dispatcher creates the worktree)."
     )
 
 
@@ -264,8 +259,9 @@ def _cleanup_worktree_workspace(
     requires a clean tree AND every commit reachable from a remote-tracking
     ref; any doubt (dirty, unpushed, unresolvable repo, failing git) preserves
     it. The tree must also be checked out on the branch the task owns
-    (``branch_name`` or ``wt/<task-id>``) — a task whose ``workspace_path``
-    points at someone else's checkout does not get to remove it. The
+    (``branch_name`` or ``wt/<task-id>``) and carry the dispatch-time admin
+    marker for this task — a task whose ``workspace_path`` points at someone
+    else's checkout does not get to remove it. The
     auto-generated ``wt/<task-id>`` branch is deleted with it; custom
     branches are kept. Best-effort."""
     try:
@@ -314,6 +310,8 @@ def _cleanup_worktree_workspace(
         # No --force: git's own dirty guard re-verifies at removal time, so if
         # the tree became dirty since our check (TOCTOU) removal fails safe.
         release_lsp_clients(str(worktree_path))
+        if not _worktree_owned_by_task(task_id, wp, branch_name):
+            return  # branch/marker changed after the earlier ownership check
         result = _git(repo_root, "worktree", "remove", str(wp), timeout=60)
         if result.returncode != 0:
             # Windows can retain a directory handle briefly after cwd changes.
@@ -328,7 +326,7 @@ def _cleanup_worktree_workspace(
             return
         _kb._log.debug("Removed worktree workspace: %s", wp)
         branch = _task_owned_branch(task_id, branch_name)
-        if branch.startswith("wt/"):
+        if branch == f"wt/{task_id}":
             _git(repo_root, "branch", "-D", branch, timeout=30)
     except Exception:
         pass  # best-effort — never block completion
@@ -482,6 +480,20 @@ def _git_common_dir(path: Path) -> Optional[Path]:
 def _git_dir(path: Path) -> Optional[Path]:
     return _git_abs_path(path, "--git-dir")
 
+_KANBAN_PROVENANCE_FILE = "hermes-kanban-owner.json"
+
+def _kanban_worktree_provenance(path: Path) -> Optional[tuple[str, str]]:
+    """Only a dispatcher-created worktree has this git-admin marker. DB rows and
+    branch spelling alone are caller-controlled and cannot authorize teardown."""
+    git_dir = _git_dir(path)
+    if git_dir is None or _git_common_dir(path) == git_dir:
+        return None
+    try:
+        owner = json.loads((git_dir / _KANBAN_PROVENANCE_FILE).read_text(encoding="utf-8"))
+        return owner["task_id"], owner["branch"]
+    except (OSError, ValueError, KeyError, TypeError):
+        return None
+
 
 def _git_current_branch(path: Path) -> Optional[str]:
     return _kb._git_out(path, "branch", "--show-current")
@@ -511,12 +523,14 @@ def _repo_root_for_worktree_target(path: Path) -> Optional[Path]:
         current = current.parent
 
 
-def _ensure_git_worktree(repo_root: Path, target: Path, branch_name: str) -> None:
+def _ensure_git_worktree(repo_root: Path, target: Path, branch_name: str, task_id: Optional[str] = None) -> None:
     """Materialize ``target`` as a linked git worktree under ``repo_root``."""
     target = target.expanduser()
     repo_common = _git_common_dir(repo_root)
     if target.exists() and repo_common is not None and _path_key(_git_common_dir(target)) == _path_key(repo_common):
-        return
+        if task_id and _worktree_owned_by_task(task_id, target, branch_name):
+            return
+        raise ValueError(f"Refusing to adopt existing unowned worktree at {target}")
     target.parent.mkdir(parents=True, exist_ok=True)
     if _git_branch_exists(repo_root, branch_name):
         args = ["worktree", "add", str(target), branch_name]
@@ -528,12 +542,19 @@ def _ensure_git_worktree(repo_root: Path, target: Path, branch_name: str) -> Non
         raise RuntimeError(
             f"git worktree add failed for {target} on branch {branch_name}: {stderr}"
         )
+    if task_id:
+        git_dir = _git_dir(target)
+        if git_dir is None or _git_common_dir(target) == git_dir:
+            raise RuntimeError(f"Cannot record worktree ownership for {target}")
+        (git_dir / _KANBAN_PROVENANCE_FILE).write_text(
+            json.dumps({"task_id": task_id, "branch": branch_name}), encoding="utf-8"
+        )
 
 
 def _anchored_worktree(repo_root: Path, task_id: str, branch_name: str) -> tuple[Path, str]:
     """Materialize the canonical ``<repo>/.worktrees/<task-id>`` worktree."""
     target = repo_root / ".worktrees" / task_id
-    _ensure_git_worktree(repo_root, target, branch_name)
+    _ensure_git_worktree(repo_root, target, branch_name, task_id)
     return target, branch_name
 
 
@@ -578,22 +599,21 @@ def _resolve_worktree_workspace(task: Task, *, board: Optional[str] = None) -> t
 
     if requested.exists() and _is_linked_worktree_checkout(requested):
         actual_branch = _git_current_branch(requested)
-        if actual_branch == branch_name:
+        if actual_branch == branch_name and _worktree_owned_by_task(task.id, requested, branch_name):
             return requested_resolved, actual_branch
         # The requested path is an existing checkout of a DIFFERENT task's
         # branch (decompose children inherit the root's workspace_path
         # verbatim, so siblings all point here). Reusing it would run this task
         # on the other task's branch — silent cross-task provenance corruption,
         # unsafe under concurrency — so fall back to our own worktree.
-        fallback_root = _repo_root_for_worktree_target(requested.parent)
+        common = _git_common_dir(requested)
+        fallback_root = common.parent if common and common.name == ".git" else None
         if fallback_root is not None:
             fallback = fallback_root / ".worktrees" / task.id
             if _path_key(fallback.resolve(strict=False)) != _path_key(requested_resolved):
-                _ensure_git_worktree(fallback_root, fallback, branch_name)
+                _ensure_git_worktree(fallback_root, fallback, branch_name, task.id)
                 return fallback.resolve(strict=False), branch_name
-        # No repo to anchor a fallback on (or the occupied path IS this task's
-        # own canonical worktree): keep the legacy reuse rather than fail dispatch.
-        return requested_resolved, actual_branch or branch_name
+        raise ValueError(f"Refusing to dispatch task {task.id} into unowned worktree {requested}")
 
     repo_root = _git_toplevel(requested)
     if repo_root is not None and _path_key(requested_resolved) == _path_key(repo_root):
@@ -605,7 +625,7 @@ def _resolve_worktree_workspace(task: Task, *, board: Optional[str] = None) -> t
             f"task {task.id} worktree path {task.workspace_path!r} is not inside a git repo "
             "and does not point at a git repo root"
         )
-    _ensure_git_worktree(repo_root, requested, branch_name)
+    _ensure_git_worktree(repo_root, requested, branch_name, task.id)
     return requested, branch_name
 
 
