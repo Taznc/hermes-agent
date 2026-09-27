@@ -157,6 +157,88 @@ class TestWorktreeLockReaping:
         assert wt.exists(), "dirty worktree must survive even past the 72h tier"
 
 
+class TestPrunerBranchOwnership:
+    """The startup pruner only reaps trees on branches Hermes minted for scratch use.
+
+    A clean, fully-pushed, unlocked tree under ``.worktrees/`` that is checked out
+    on ``next``/``main``/a user branch/a detached HEAD looks *exactly* like a
+    reapable scratch tree to the age/dirty/unpushed gates — but it is what a
+    served or hand-managed checkout looks like too (the kanban incident: a
+    served ``next`` tree removed with every guard passing). Ownership is
+    decided by branch prefix (``HERMES_OWNED_BRANCH_PREFIXES``); anything else
+    is preserved at any age.
+    """
+
+    @staticmethod
+    def _age(path, hours):
+        import time
+        t = time.time() - (hours * 3600)
+        os.utime(path, (t, t))
+
+    def _mk_on(self, repo, name, branch=None, detach=False, age_h=500):
+        p = repo / ".worktrees" / name
+        (repo / ".worktrees").mkdir(exist_ok=True)
+        if detach:
+            args = ["git", "worktree", "add", "--detach", str(p), "HEAD"]
+        elif branch:
+            # Pre-existing long-lived branch, fully "pushed" (same commit as origin/main).
+            subprocess.run(["git", "branch", branch, "HEAD"], cwd=repo, capture_output=True)
+            args = ["git", "worktree", "add", str(p), branch]
+        else:
+            raise AssertionError("branch or detach required")
+        r = subprocess.run(args, cwd=repo, capture_output=True, text=True)
+        assert r.returncode == 0, r.stderr
+        self._age(p, age_h)
+        return p
+
+    def test_tree_on_trunk_branch_never_reaped(self, git_repo):
+        import cli
+        served = self._mk_on(git_repo, "served-next", branch="next")
+        assert not worktree_ops._worktree_is_dirty(str(served))
+        assert not worktree_ops._worktree_has_unpushed_commits(str(served)), (
+            "precondition: every legacy gate passes — only ownership can save this tree"
+        )
+        cli._prune_stale_worktrees(str(git_repo))
+        assert served.exists(), "a tree checked out on `next` is not Hermes scratch — never reap"
+        assert (served / "README.md").exists()
+        heads = subprocess.run(["git", "branch", "--list", "next"], cwd=git_repo,
+                               capture_output=True, text=True).stdout
+        assert "next" in heads
+
+    def test_tree_on_user_feature_branch_never_reaped(self, git_repo):
+        import cli
+        wt = self._mk_on(git_repo, "my-feature", branch="feature/handmade")
+        cli._prune_stale_worktrees(str(git_repo))
+        assert wt.exists()
+
+    def test_detached_head_tree_never_reaped(self, git_repo):
+        import cli
+        wt = self._mk_on(git_repo, "pinned", detach=True)
+        cli._prune_stale_worktrees(str(git_repo))
+        assert wt.exists()
+
+    def test_hermes_owned_prefixes_still_reaped(self, git_repo):
+        import cli
+        trees = {
+            "hermes-scratch": "hermes/hermes-scratch",
+            "t_named_kanban": "wt/t_named_kanban",
+            "subagent-abc": "hermes-subagent/subagent-abc",
+        }
+        paths = {n: self._mk_on(git_repo, n, branch=b) for n, b in trees.items()}
+        cli._prune_stale_worktrees(str(git_repo))
+        for name, p in paths.items():
+            assert not p.exists(), f"{name} on {trees[name]} is Hermes scratch and should be reaped"
+
+    def test_ownership_predicate(self, git_repo):
+        served = self._mk_on(git_repo, "pred-next", branch="next")
+        owned, branch = worktree_ops._worktree_on_hermes_owned_branch(str(served))
+        assert (owned, branch) == (False, "next")
+        detached = self._mk_on(git_repo, "pred-detached", detach=True)
+        assert worktree_ops._worktree_on_hermes_owned_branch(str(detached)) == (False, None)
+        mine = self._mk_on(git_repo, "pred-wt", branch="wt/pred")
+        assert worktree_ops._worktree_on_hermes_owned_branch(str(mine)) == (True, "wt/pred")
+
+
 class TestWorktreeLockPredicate:
     """_worktree_lock_is_live classification (real cli helper)."""
 

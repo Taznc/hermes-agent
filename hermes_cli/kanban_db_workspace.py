@@ -188,6 +188,74 @@ def _cleanup_workspace(conn: sqlite3.Connection, task_id: str) -> None:
         pass  # best-effort — never block completion
 
 
+def _task_owned_branch(task_id: str, branch_name: Optional[str]) -> str:
+    """The one branch a task's worktree cleanup may act on: its recorded
+    ``branch_name``, else the dispatcher's ``wt/<task-id>`` default."""
+    return (branch_name or "").strip() or f"wt/{task_id}"
+
+
+def _git_checked_out_branch(path: Path) -> Optional[str]:
+    """Branch checked out at ``path`` (``symbolic-ref --short HEAD``); ``None``
+    when detached or when git cannot answer — callers must treat that as
+    "not ours"."""
+    return _kb._git_out(path, "symbolic-ref", "--short", "HEAD")
+
+
+def _worktree_owned_by_task(task_id: str, path: Path, branch_name: Optional[str]) -> bool:
+    """Whether the checkout at ``path`` is on the branch the task owns.
+
+    A worktree task's ``workspace_path`` is a *request*, not proof of
+    ownership: a caller can point it at a checkout that already existed
+    before the task did (the served ``next`` tree, a sibling task's worktree,
+    a user's feature branch). Only a tree on the task's own branch may be
+    torn down; anything else is preserved with a WARNING naming both
+    branches. A detached HEAD is never ours."""
+    owned = _task_owned_branch(task_id, branch_name)
+    actual = _git_checked_out_branch(path)
+    if actual == owned:
+        return True
+    _kb._log.warning(
+        "Preserving worktree for task %s: %s is checked out on %s, "
+        "but the task owns branch %s — it was not created for this task",
+        task_id, path, actual or "<detached HEAD>", owned,
+    )
+    return False
+
+
+def _reject_foreign_worktree_checkout(workspace_path: Optional[str], branch_name: Optional[str]) -> None:
+    """Creation-time guard: a ``worktree`` task may not adopt an existing
+    checkout that sits on a branch other than the one the task will own.
+
+    Raises ``ValueError``. The task id does not exist yet, so with no
+    ``branch_name`` the owned branch is the not-yet-minted ``wt/<new-id>``
+    and *no* existing checkout can match; with a ``branch_name`` an existing
+    checkout on exactly that branch (a retry/re-dispatch) stays allowed. A
+    repo root is an anchor request (dispatch materializes
+    ``<repo>/.worktrees/<id>`` under it) and is left to the resolver; a path
+    that does not exist yet is what the dispatcher creates."""
+    if not workspace_path:
+        return
+    wp = Path(str(workspace_path)).expanduser()
+    if not wp.is_dir() or not (wp / ".git").exists():
+        return
+    if not _is_linked_worktree_checkout(wp):
+        return  # a main checkout: anchor semantics, never adopted verbatim
+    actual = _git_checked_out_branch(wp)
+    owned = (branch_name or "").strip() or None
+    if owned is not None and actual == owned:
+        return
+    repo_root = _repo_root_for_worktree_target(wp.parent)
+    suggested = os.path.join(str(repo_root) if repo_root else "<repo>", ".worktrees", "<name>")
+    raise ValueError(
+        f"workspace_path {str(workspace_path)!r} is an existing git checkout on branch "
+        f"{actual or '<detached HEAD>'}, which this task would not own "
+        f"(task branch: {owned or 'wt/<task-id>'}). A worktree task must not adopt "
+        "someone else's checkout — completing or archiving it would try to remove that "
+        f"tree. Pass a NEW path such as {suggested!r} (the dispatcher creates the "
+        "worktree), or pass branch_name matching the existing checkout to resume it."
+    )
+
+
 def _cleanup_worktree_workspace(
     task_id: str, path: str, branch_name: Optional[str] = None
 ) -> None:
@@ -195,7 +263,10 @@ def _cleanup_worktree_workspace(
     Mirrors the CLI startup pruner (``cli._prune_stale_worktrees``): removal
     requires a clean tree AND every commit reachable from a remote-tracking
     ref; any doubt (dirty, unpushed, unresolvable repo, failing git) preserves
-    it. The auto-generated ``wt/<task-id>`` branch is deleted with it; custom
+    it. The tree must also be checked out on the branch the task owns
+    (``branch_name`` or ``wt/<task-id>``) — a task whose ``workspace_path``
+    points at someone else's checkout does not get to remove it. The
+    auto-generated ``wt/<task-id>`` branch is deleted with it; custom
     branches are kept. Best-effort."""
     try:
         from hermes_cli.worktree_ops import _worktree_has_unpushed_commits, _worktree_is_dirty
@@ -211,6 +282,8 @@ def _cleanup_worktree_workspace(
         repo_root = common.parent
         if _path_key(wp.resolve(strict=False)) == _path_key(repo_root.resolve(strict=False)):
             return  # never remove the main checkout
+        if not _worktree_owned_by_task(task_id, wp, branch_name):
+            return  # someone else's checkout (served tree, sibling task, user branch)
         if _worktree_is_dirty(str(wp)) or _worktree_has_unpushed_commits(str(wp)):
             _kb._log.info(
                 "Preserving worktree for task %s: dirty or unpushed work at %s",
@@ -254,7 +327,7 @@ def _cleanup_worktree_workspace(
             )
             return
         _kb._log.debug("Removed worktree workspace: %s", wp)
-        branch = (branch_name or "").strip() or f"wt/{task_id}"
+        branch = _task_owned_branch(task_id, branch_name)
         if branch.startswith("wt/"):
             _git(repo_root, "branch", "-D", branch, timeout=30)
     except Exception:

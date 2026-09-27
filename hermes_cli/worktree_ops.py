@@ -780,7 +780,8 @@ def _prune_candidates(worktrees_dir: Path, max_age_hours: int, now: float) -> li
 def _classify_prune_candidates(repo_root: str, candidates: list) -> list:
     """Phase 2, parallel read-only classification -> ``[(entry, mtime, force, verdict, lock_state)]``.
 
-    verdict in ``dirty`` / ``unpushed`` / ``locked-live`` / ``reap`` / ``reap-keep-branch``. Each
+    verdict in ``foreign-branch`` / ``dirty`` / ``unpushed`` / ``locked-live`` / ``reap`` /
+    ``reap-keep-branch``. Each
     check is a read-only query on a distinct worktree (no repo-wide lock), so a bounded pool is
     safe; mutation stays serial. ``git cherry`` verdicts are memoized on disk.
     """
@@ -800,6 +801,16 @@ def _classify_prune_candidates(repo_root: str, candidates: list) -> list:
 
     def _classify(item):
         entry, mtime, force = item
+        # Ownership first: only trees on a branch Hermes minted for scratch use are ever
+        # reaped. A clean, fully-pushed tree on ``next``/``main``/a user branch/a detached
+        # HEAD is exactly what a served or hand-managed checkout looks like.
+        owned, branch = _worktree_on_hermes_owned_branch(str(entry), timeout=5)
+        if not owned:
+            logger.debug(
+                "Preserving worktree %s: checked out on %s, not a Hermes-owned branch (%s)",
+                entry, branch or "<detached HEAD>", ", ".join(HERMES_OWNED_BRANCH_PREFIXES),
+            )
+            return (entry, mtime, force, "foreign-branch", None)
         # Never delete real work regardless of age: only clean, merged/pushed trees are reaped.
         if _worktree_is_dirty(str(entry), timeout=5):
             return (entry, mtime, force, "dirty", None)
@@ -846,7 +857,34 @@ def _classify_prune_candidates(repo_root: str, candidates: list) -> list:
 
 
 # Preserving verdicts -> reason reported for trees past the stale-work cutoff.
-_PRESERVE_REASONS = {"dirty": "uncommitted changes", "unpushed": "unpushed commits"}
+_PRESERVE_REASONS = {
+    "dirty": "uncommitted changes",
+    "unpushed": "unpushed commits",
+    "foreign-branch": "not on a Hermes-owned branch",
+}
+
+# Branch prefixes Hermes itself mints for scratch worktrees under ``.worktrees/``:
+# ``hermes/`` (``hermes -w``), ``hermes-subagent/`` (subagent isolation), ``wt/`` (kanban
+# default) and ``pr-`` (review checkouts, see ``_prune_orphaned_branches``). The startup
+# pruner only reaps trees on these. A tree checked out on anything else — a trunk such as
+# ``main``/``next``, a user's feature branch, a detached HEAD — was not created by Hermes
+# for scratch use and may be a served or hand-managed checkout: preserved, never guessed.
+HERMES_OWNED_BRANCH_PREFIXES = ("hermes/", "hermes-subagent/", "wt/", "pr-")
+
+
+def _worktree_symbolic_branch(worktree_path: str, timeout: float = 5) -> Optional[str]:
+    """Branch checked out at *worktree_path* via ``symbolic-ref --short HEAD``; None when detached
+    or when git cannot answer. Fails SAFE toward None (callers treat None as not-ours)."""
+    try:
+        return _git_out(["symbolic-ref", "--short", "HEAD"], worktree_path, timeout=timeout) or None
+    except Exception:
+        return None
+
+
+def _worktree_on_hermes_owned_branch(worktree_path: str, timeout: float = 5) -> tuple[bool, Optional[str]]:
+    """``(owned, branch)``: whether the tree's checked-out branch carries a Hermes-minted prefix."""
+    branch = _worktree_symbolic_branch(worktree_path, timeout=timeout)
+    return bool(branch and branch.startswith(HERMES_OWNED_BRANCH_PREFIXES)), branch
 
 
 def _reap_prune_verdicts(repo_root: str, verdicts: list, stale_work_cutoff: float) -> tuple[list, set]:
@@ -890,7 +928,8 @@ def _reap_prune_verdicts(repo_root: str, verdicts: list, stale_work_cutoff: floa
 def _prune_stale_worktrees(repo_root: str, max_age_hours: int = 24) -> None:
     """Remove stale worktrees and orphaned branches on startup.
 
-    Guards at every tier and age: dirty trees are never removed; unpushed commits are never
+    Guards at every tier and age: trees not on a Hermes-owned branch (``HERMES_OWNED_BRANCH_PREFIXES``;
+    detached HEADs included) are never removed; dirty trees are never removed; unpushed commits are never
     removed UNLESS patch-equivalent to upstream, the PR is MERGED on GitHub, or the head EXACTLY
     matches origin (tree reaped, branch kept). Live-locked trees are skipped; dead locks are
     unlocked first. Trees preserved >7 days are listed in one WARNING so work can't rot silently.
@@ -916,8 +955,8 @@ def _prune_stale_worktrees(repo_root: str, max_age_hours: int = 24) -> None:
     preserved_stale, kept_branches = _reap_prune_verdicts(repo_root, verdicts, now - (7 * 24 * 3600))
 
     if preserved_stale:
-        logger.warning("Preserving %d worktree(s) older than 7 days with unmerged work "
-                       "(run `hermes worktree prune` to review and reclaim): %s",
+        logger.warning("Preserving %d worktree(s) older than 7 days that the startup pruner will not "
+                       "reclaim (run `hermes worktree prune` to review and reclaim): %s",
                        len(preserved_stale), ", ".join(sorted(preserved_stale)))
 
     _prune_orphaned_branches(repo_root, protect=kept_branches)

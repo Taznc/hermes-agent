@@ -551,6 +551,56 @@ def test_create_happy_path(worker_env):
         conn.close()
 
 
+def test_create_refuses_worktree_path_on_foreign_checkout(monkeypatch, worker_env, tmp_path):
+    """Incident replay at the tool seam: ``kanban_create`` with
+    ``workspace_kind='worktree'`` pointing at a pre-existing linked checkout on
+    another branch (a served ``next`` tree) is rejected as a structured tool
+    error naming the branch and a fresh ``<repo>/.worktrees/<name>`` path.
+    Archiving such a card used to ``git worktree remove`` the served tree."""
+    import subprocess
+    from hermes_cli import kanban_db as kb
+    from hermes_cli import kanban_db_connect as kbc
+    from tools import kanban_tools as kt
+
+    monkeypatch.delenv("HERMES_KANBAN_TASK", raising=False)
+
+    def git(*args, cwd):
+        r = subprocess.run(["git", "-C", str(cwd), "-c", "user.name=t", "-c", "user.email=t@x",
+                            *args], capture_output=True, text=True)
+        assert r.returncode == 0, r.stderr
+
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    git("init", "-b", "main", cwd=repo)
+    (repo / "README.md").write_text("x\n")
+    git("add", "README.md", cwd=repo)
+    git("commit", "-q", "-m", "init", cwd=repo)
+    git("branch", "next", cwd=repo)
+    served = tmp_path / "repo-next"
+    git("worktree", "add", str(served), "next", cwd=repo)
+
+    out = json.loads(kt._handle_create({
+        "title": "port X", "assignee": "coder",
+        "workspace_kind": "worktree", "workspace_path": str(served),
+    }))
+    assert out.get("ok") is not True, out
+    err = out.get("error") or json.dumps(out)
+    assert "next" in err and ".worktrees" in err, err
+    assert served.is_dir() and (served / "README.md").exists()
+    conn = kbc.connect()
+    try:
+        assert all(t.title != "port X" for t in kb.list_tasks(conn))
+    finally:
+        conn.close()
+
+    # A brand-new path under the repo is what the dispatcher expects, and is accepted.
+    ok = json.loads(kt._handle_create({
+        "title": "port X", "assignee": "coder",
+        "workspace_kind": "worktree", "workspace_path": str(repo / ".worktrees" / "port-x"),
+    }))
+    assert ok["ok"] is True, ok
+
+
 @pytest.mark.parametrize("explicit", [{"workspace_kind": "scratch"}, {"project": ""}])
 @pytest.mark.parametrize("target_scoped", [False, True])
 def test_create_explicit_scratch_ignores_ambient_board_project(
