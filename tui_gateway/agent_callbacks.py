@@ -10,6 +10,11 @@ import contextlib
 import threading
 
 from .method_ctx import bind_module
+# >>> FORK ANCHOR: plugin-ui-bridge <<<
+from hermes_fork.ui.gateway import bridge_callbacks  # noqa: E402
+ui_request_callback, ui_emit_callback = bridge_callbacks(  # plugin tool ui.request / ui.emit (hermes_fork/ui)
+    lambda server_requests, sid, p, t: server_requests.send("plugin.request", sid, p, timeout=t),
+    lambda _emit, sid, p: _emit("plugin.event", sid, p))  # <<< FORK ANCHOR >>>
 
 
 # Child-session live mirror: a delegated child's activity reaches the gateway only as

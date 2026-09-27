@@ -76,11 +76,25 @@ def fork_method(name: str, *, params: type[Params], result: type[Result], doc: s
     return dec
 
 
-def upstream_methods(methods: dict) -> dict:
-    """*methods* without the ``fork.*`` contracts (``gateway-contracts-upstream-only`` anchor in
-    ``scripts/gen_gateway_contracts.py``): the committed upstream TS/OpenRPC artefacts render the same
-    bytes whether or not ``tui_gateway.server`` (and so this registry) ran first in the interpreter."""
-    return {name: c for name, c in methods.items() if not name.startswith(FORK_PREFIX)}
+# Fork contracts outside the ``fork.`` namespace (server requests / events whose wire name the desktop
+# already dispatches on, e.g. ``plugin.request``), declared at registration by a fork module.
+_FORK_CONTRACT_NAMES: set[str] = set()
+
+
+def mark_fork_contract(*names: str) -> None:
+    """Record fork-declared contract names so :func:`upstream_only` keeps them out of the generated files."""
+    _FORK_CONTRACT_NAMES.update(names)
+
+
+def upstream_only(table: dict) -> dict:
+    """*table* (METHODS / SERVER_REQUESTS / EVENTS) without fork contracts (``gateway-contracts-upstream-only``
+    anchor in ``scripts/gen_gateway_contracts.py``): the committed upstream TS/OpenRPC artefacts render the
+    same bytes whether or not ``tui_gateway.server`` (and so this registry) ran first in the interpreter."""
+    return {name: c for name, c in table.items()
+            if not name.startswith(FORK_PREFIX) and name not in _FORK_CONTRACT_NAMES}
+
+
+upstream_methods = upstream_only  # F24 name, kept for callers of the original anchor
 
 
 def _fork_method_modules() -> tuple[ModuleType, ...]:
@@ -102,6 +116,16 @@ def _default_modules() -> tuple[ModuleType, ...]:
         return ()
 
 
+def _install_gateway_seams(server) -> None:
+    try:
+        from hermes_fork.ui.gateway import install as install_plugin_ui
+        install_plugin_ui(server)
+    except Exception:
+        if _contracts.STRICT:
+            raise
+        logger.exception("plugin UI bridge failed to install; plugin ui.request will fall back")
+
+
 def _rpc_handler(method: ForkMethod):
     def handle(rid, params: dict) -> dict:
         try:
@@ -116,7 +140,12 @@ def _rpc_handler(method: ForkMethod):
 def register_fork_gateway_methods(server, modules: Iterable[ModuleType] | None = None) -> list[str]:
     """Declare the contract of every fork method in *modules* (default: :func:`_fork_method_modules`)
     and register it on *server* through upstream's one registration seam (``server.register_method``).
-    Idempotent. Returns the registered names."""
+    Idempotent. Returns the registered names.
+
+    The default call (the anchor) also installs the other fork gateway seams that need the fully
+    registered server module: the plugin UI bridge (:func:`hermes_fork.ui.gateway.install`)."""
+    if modules is None:
+        _install_gateway_seams(server)
     names = {m.__name__ for m in (_default_modules() if modules is None else modules)}
     methods = sorted((m for m in _DECLARED.values() if m.handler.__module__ in names), key=lambda m: m.name)
     for method in methods:
