@@ -46,8 +46,7 @@ import {
 import { onGatewayEvent } from '@/contrib/events'
 import { registry } from '@/contrib/registry'
 import type { WorkspaceMode } from '@/contrib/types'
-// >>> FORK ANCHOR: host-fork <<<
-import { forkHost } from '@/fork/sdk'
+import { forkHost } from '@/fork/sdk-host' // FORK ANCHOR: host-fork
 import { deleteProfile, getLogs, getStatus, hermesApi, type HermesGateway } from '@/hermes'
 import { completeMcpDesktopOAuth } from '@/lib/mcp-dashboard-oauth'
 import {
@@ -924,6 +923,7 @@ export const host = {
 
   /** Session-list mutations (pin, reorder, colour) — see `./sessions`. */
   sessions: sessionsHost,
+  fork: forkHost, // FORK ANCHOR: host-fork — fork-only capabilities, see src/fork/sdk-host.ts
 
   /** Typed capabilities bridge — see `./bridge.ts`. `pluginDecisions` is
    *  read-only: plugin toggling stays in the app's Plugins tab. */
@@ -1582,8 +1582,6 @@ export const host = {
    *  active instance changes on a profile swap. */
   getGateway: (): HermesGateway | null => $gateway.get(),
 
-  // >>> FORK ANCHOR: host-fork <<<
-  fork: forkHost,
   composer: composerHost
 }
 

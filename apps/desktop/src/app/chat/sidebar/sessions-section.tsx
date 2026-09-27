@@ -7,6 +7,7 @@ import { type NewSessionSplitHandler, startNewSessionDrag } from '@/app/chat/new
 import { SidebarPanelLabel } from '@/app/shell/sidebar-label'
 import { DisclosureCaret } from '@/components/ui/disclosure-caret'
 import { SidebarGroup, SidebarGroupContent } from '@/components/ui/sidebar'
+import { forkListDividerAction, useForkPublishListRows } from '@/fork/sidebar-group-actions'
 import type { HermesGitWorktree } from '@/global'
 import type { SessionInfo } from '@/hermes'
 import { useI18n } from '@/i18n'
@@ -365,7 +366,7 @@ export function SidebarSessionsSection({
 
       return (
         <SidebarDateDivider
-          action={action}
+          action={forkListDividerAction(row, action) /* FORK ANCHOR: sidebar-group-action */}
           key={row.key}
           label={label}
           toggle={{
@@ -441,6 +442,7 @@ export function SidebarSessionsSection({
   // it. Same array when nothing is collapsed so the virtualizer's rows ref
   // stays stable across parent re-renders.
   const visibleRows = useMemo(() => hideCollapsedGroupRows(flatRows, isListGroupOpen), [flatRows, isListGroupOpen])
+  useForkPublishListRows(flatRows, grouping !== 'none') // FORK ANCHOR: sidebar-group-action
 
   // dnd-kit must see exactly the ids it renders, in render order: the sortable
   // set is derived from the rows, not from `sessions`. Feeding it the unrendered

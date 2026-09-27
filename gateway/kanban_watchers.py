@@ -257,6 +257,10 @@ class GatewayKanbanWatchersMixin:
         failure never stops the next. Shutdown: ``self._running`` is checked
         between ticks and the in-flight ``to_thread`` returns on its own.
         """
+        # >>> FORK ANCHOR: dispatcher-standby <<<
+        from hermes_fork.kanban.dispatcher_standby import run_watcher as _fork_dispatcher_watcher
+        return await _fork_dispatcher_watcher(self)
+        # <<< FORK ANCHOR >>>
         boot = self._kanban_dispatcher_boot()
         if boot is None:
             return

@@ -5,6 +5,7 @@ import { useVirtualizer } from '@tanstack/react-virtual'
 import type * as React from 'react'
 import { type FC, useEffect, useRef } from 'react'
 
+import { forkListDividerAction } from '@/fork/sidebar-group-actions'
 import type { SessionInfo } from '@/hermes'
 import { useI18n } from '@/i18n'
 import { type SidebarListRow } from '@/lib/session-date-groups'
@@ -139,7 +140,7 @@ export const VirtualSessionList: FC<VirtualSessionListProps> = ({
       return (
         <div data-index={virtualItem.index} key={row.key} ref={virtualizer.measureElement} style={itemStyle}>
           <SidebarDateDivider
-            action={dividerAction}
+            action={forkListDividerAction(row, dividerAction) /* FORK ANCHOR: sidebar-group-action */}
             label={label}
             toggle={
               dividerToggle
