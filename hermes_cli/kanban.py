@@ -138,6 +138,11 @@ def _check_dispatcher_presence(hermes_home: Optional[Path] = None) -> tuple[bool
 def kanban_command(args: argparse.Namespace) -> int:
     """Entry point from ``hermes kanban …``; returns a shell-style exit code."""
     action = getattr(args, "kanban_action", None)
+    # >>> FORK ANCHOR: anthropic-weekly-cli <<<
+    if action == "weekly-usage":
+        from hermes_fork.kanban.weekly_usage import command as _weekly_command
+        return _weekly_command(args)
+    # <<< FORK ANCHOR >>>
     if not action:
         parser = getattr(args, "_kanban_parser", None)
         if parser is not None:
