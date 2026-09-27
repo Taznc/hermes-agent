@@ -5,14 +5,14 @@ import {
   handleServerRequest,
   type ServerRequestContext
 } from '@/app/session/hooks/use-message-stream/gateway-event/server-requests'
+import type { ClientSessionState } from '@/app/types'
 import { emitGatewayEvent, onGatewayEvent } from '@/contrib/events'
 import { registry } from '@/contrib/registry'
 import { parkedForRow } from '@/fork/ui-bridge/inline-slot'
 import { $uiRequests, cancelUiRequest, resetUiBridgeForTests, respondUiRequest } from '@/fork/ui-bridge/store'
 import { PLUGIN_EVENT_TYPE, UI_REQUEST_AREA } from '@/fork/ui-bridge/types'
-import { createClientSessionState } from '@/lib/chat-runtime'
 import type { ChatMessage } from '@/lib/chat-messages'
-import type { ClientSessionState } from '@/app/types'
+import { createClientSessionState } from '@/lib/chat-runtime'
 
 const toolCall = (toolCallId: string, extra: Record<string, unknown> = {}) =>
   ({ args: {}, argsText: '{}', toolCallId, toolName: 'ask', type: 'tool-call', ...extra }) as never

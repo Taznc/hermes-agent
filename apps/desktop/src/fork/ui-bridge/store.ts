@@ -3,7 +3,6 @@ import { atom } from 'nanostores'
 
 import { onGatewayEvent } from '@/contrib/events'
 import { registry } from '@/contrib/registry'
-
 import { UI_REQUEST_AREA, type UiRequestContribution } from '@/fork/ui-bridge/types'
 
 /** Server requests the renderer rejects with this code are "unanswered" to the backend:

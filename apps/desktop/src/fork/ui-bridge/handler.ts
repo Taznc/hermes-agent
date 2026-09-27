@@ -1,9 +1,8 @@
 import type { ServerRequestContext } from '@/app/session/hooks/use-message-stream/gateway-event/server-requests'
 import { $diskPluginsScanPending } from '@/contrib/runtime-loader'
+import { hasUiRequestContributor, installUiBridgeTeardown, parkUiRequest } from '@/fork/ui-bridge/store'
 import { type ChatMessage, restorePendingBlockingToolCall } from '@/lib/chat-messages'
 import { requestScrollToBottom } from '@/store/thread-scroll'
-
-import { hasUiRequestContributor, installUiBridgeTeardown, parkUiRequest } from '@/fork/ui-bridge/store'
 
 const str = (v: unknown): string => (typeof v === 'string' ? v : '')
 
