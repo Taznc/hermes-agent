@@ -8,8 +8,15 @@ import {
 import type { ClientSessionState } from '@/app/types'
 import { emitGatewayEvent, onGatewayEvent } from '@/contrib/events'
 import { registry } from '@/contrib/registry'
+import { $diskPluginsScanPending } from '@/contrib/runtime-loader'
 import { parkedForRow } from '@/fork/ui-bridge/inline-slot'
-import { $uiRequests, cancelUiRequest, resetUiBridgeForTests, respondUiRequest } from '@/fork/ui-bridge/store'
+import {
+  $uiRequests,
+  cancelUiRequest,
+  isUiRequestDeferred,
+  resetUiBridgeForTests,
+  respondUiRequest
+} from '@/fork/ui-bridge/store'
 import { PLUGIN_EVENT_TYPE, UI_REQUEST_AREA } from '@/fork/ui-bridge/types'
 import type { ChatMessage } from '@/lib/chat-messages'
 import { createClientSessionState } from '@/lib/chat-runtime'
@@ -155,19 +162,29 @@ describe('plugin.request handler', () => {
 
 describe('teardown via the host.onEvent tap', () => {
   it('clears a parked card on interrupt/timeout (request.cancel) and on turn end, per session', () => {
-    const { deliver } = harness({ 's-a': [assistant('a', [toolCall('ca')])], 's-b': [assistant('b', [toolCall('cb')])] }, 's-a')
+    const { deliver } = harness(
+      { 's-a': [assistant('a', [toolCall('ca')])], 's-b': [assistant('b', [toolCall('cb')])] },
+      's-a'
+    )
 
     deliver('srq-a1', { kind: 'ask/questions', payload: {}, session_id: 's-a' })
     deliver('srq-b1', { kind: 'ask/questions', payload: {}, session_id: 's-b' })
 
-    emitGatewayEvent({ payload: { id: 'srq-a1', method: 'plugin.request', reason: 'interrupted' }, session_id: 's-a', type: 'request.cancel' })
+    emitGatewayEvent({
+      payload: { id: 'srq-a1', method: 'plugin.request', reason: 'interrupted' },
+      session_id: 's-a',
+      type: 'request.cancel'
+    })
     expect(Object.keys($uiRequests.get())).toEqual(['srq-b1'])
 
     deliver('srq-a2', { kind: 'ask/questions', payload: {}, session_id: 's-a' })
     emitGatewayEvent({ payload: { settled: true, text: '' } as never, session_id: 's-b', type: 'message.complete' })
     expect(Object.keys($uiRequests.get())).toEqual(['srq-a2'])
 
-    emitGatewayEvent({ payload: { reason: 'idle', session_id: 's-a', stored_session_id: 'x' }, type: 'session.reclaimed' })
+    emitGatewayEvent({
+      payload: { reason: 'idle', session_id: 's-a', stored_session_id: 'x' },
+      type: 'session.reclaimed'
+    })
     expect($uiRequests.get()).toEqual({})
   })
 
@@ -175,10 +192,96 @@ describe('teardown via the host.onEvent tap', () => {
     const seen = vi.fn()
     const off = onGatewayEvent(PLUGIN_EVENT_TYPE, seen)
 
-    emitGatewayEvent({ payload: { kind: 'ask/progress', payload: { step: 1 } }, session_id: 's-a', type: PLUGIN_EVENT_TYPE } as never)
+    emitGatewayEvent({
+      payload: { kind: 'ask/progress', payload: { step: 1 } },
+      session_id: 's-a',
+      type: PLUGIN_EVENT_TYPE
+    } as never)
     off()
     await flush()
 
-    expect(seen).toHaveBeenCalledWith(expect.objectContaining({ payload: { kind: 'ask/progress', payload: { step: 1 } } }))
+    expect(seen).toHaveBeenCalledWith(
+      expect.objectContaining({ payload: { kind: 'ask/progress', payload: { step: 1 } } })
+    )
+  })
+})
+
+describe('requests deferred behind the boot disk-plugin scan', () => {
+  let disposeLate: () => void = () => undefined
+
+  beforeEach(() => $diskPluginsScanPending.set(true))
+
+  afterEach(() => {
+    disposeLate()
+    disposeLate = () => undefined
+    $diskPluginsScanPending.set(false)
+  })
+
+  const registerLate = () => {
+    disposeLate = registry.register({
+      area: UI_REQUEST_AREA,
+      data: { kind: 'late/kind', render: () => null },
+      id: 'late'
+    })
+  }
+
+  it('decides once the scan finishes: parks when a late plugin renders the kind, else {unsupported: true}', () => {
+    const { deliver } = harness({ 's-a': [assistant('a', [toolCall('ca')])] }, 's-a')
+    const late = deliver('srq-late', { kind: 'late/kind', payload: {}, session_id: 's-a' }).request
+    const none = deliver('srq-none', { kind: 'nobody/kind', payload: {}, session_id: 's-a' }).request
+
+    expect(isUiRequestDeferred('srq-late')).toBe(true)
+    expect(late.respond).not.toHaveBeenCalled()
+    expect($uiRequests.get()).toEqual({})
+
+    registerLate()
+    $diskPluginsScanPending.set(false)
+
+    expect(isUiRequestDeferred('srq-late')).toBe(false)
+    expect($uiRequests.get()['srq-late']).toMatchObject({ kind: 'late/kind', sessionId: 's-a', toolCallId: 'ca' })
+    expect(none.respond).toHaveBeenCalledWith({ unsupported: true })
+  })
+
+  it('never parks a request cancelled (request.cancel) before the scan finishes', () => {
+    const { deliver } = harness({ 's-a': [assistant('a', [toolCall('ca')])] }, 's-a')
+    const { request } = deliver('srq-late', { kind: 'late/kind', payload: {}, session_id: 's-a' })
+
+    emitGatewayEvent({
+      payload: { id: 'srq-late', method: 'plugin.request', reason: 'timeout' },
+      session_id: 's-a',
+      type: 'request.cancel'
+    })
+    expect(isUiRequestDeferred('srq-late')).toBe(false)
+
+    registerLate()
+    $diskPluginsScanPending.set(false)
+
+    expect($uiRequests.get()).toEqual({})
+    expect(request.respond).not.toHaveBeenCalled()
+    expect(request.fail).not.toHaveBeenCalled()
+  })
+
+  it('never parks a request whose session ended before the scan finishes; other sessions still park', () => {
+    const { deliver } = harness(
+      { 's-a': [assistant('a', [toolCall('ca')])], 's-b': [assistant('b', [toolCall('cb')])] },
+      's-a'
+    )
+
+    const ended = deliver('srq-a', { kind: 'late/kind', payload: {}, session_id: 's-a' }).request
+    deliver('srq-b', { kind: 'late/kind', payload: {}, session_id: 's-b' })
+    const reclaimed = deliver('srq-a2', { kind: 'late/kind', payload: {}, session_id: 's-c' }).request
+
+    emitGatewayEvent({ payload: { settled: true, text: '' } as never, session_id: 's-a', type: 'message.complete' })
+    emitGatewayEvent({
+      payload: { reason: 'idle', session_id: 's-c', stored_session_id: 'x' },
+      type: 'session.reclaimed'
+    })
+
+    registerLate()
+    $diskPluginsScanPending.set(false)
+
+    expect(Object.keys($uiRequests.get())).toEqual(['srq-b'])
+    expect(ended.respond).not.toHaveBeenCalled()
+    expect(reclaimed.respond).not.toHaveBeenCalled()
   })
 })

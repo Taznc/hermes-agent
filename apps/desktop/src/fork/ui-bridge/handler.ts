@@ -1,6 +1,12 @@
 import type { ServerRequestContext } from '@/app/session/hooks/use-message-stream/gateway-event/server-requests'
 import { $diskPluginsScanPending } from '@/contrib/runtime-loader'
-import { hasUiRequestContributor, installUiBridgeTeardown, parkUiRequest } from '@/fork/ui-bridge/store'
+import {
+  deferUiRequest,
+  hasUiRequestContributor,
+  installUiBridgeTeardown,
+  parkUiRequest,
+  withdrawDeferredUiRequest
+} from '@/fork/ui-bridge/store'
 import { type ChatMessage, restorePendingBlockingToolCall } from '@/lib/chat-messages'
 import { requestScrollToBottom } from '@/store/thread-scroll'
 
@@ -68,13 +74,16 @@ export function handlePluginRequest(ctx: ServerRequestContext): void {
 
   if (!hasUiRequestContributor(kind)) {
     // A replay at boot can beat the disk-plugin scan: decide once plugins are in.
+    // Deferred (not parked) meanwhile; teardown withdraws it, so a request cancelled
+    // or whose session ended before the scan finished is never parked afterwards.
     if ($diskPluginsScanPending.get()) {
       const off = $diskPluginsScanPending.listen(pending => {
-        if (!pending) {
-          off()
+        if (!pending && withdrawDeferredUiRequest(request.id)) {
           handlePluginRequest(ctx)
         }
       })
+
+      deferUiRequest(request.id, sessionId, off)
 
       return
     }

@@ -34,7 +34,37 @@ export function parkUiRequest(request: ServerRequest, parked: ParkedUiRequest): 
   $uiRequests.set({ ...$uiRequests.get(), [parked.requestId]: parked })
 }
 
+/**
+ * Requests waiting for the boot disk-plugin scan before they can decide between
+ * parking and `{unsupported: true}`. They are not parked yet, so teardown must
+ * withdraw them here too, or a cancelled request would park after the scan.
+ */
+const deferred = new Map<string, { off: () => void; sessionId: string }>()
+
+export function deferUiRequest(requestId: string, sessionId: string, off: () => void): void {
+  // A replay of a still-deferred id replaces the earlier wait.
+  deferred.get(requestId)?.off()
+  deferred.set(requestId, { off, sessionId })
+}
+
+/** Stop waiting for `requestId`. True when it was deferred. */
+export function withdrawDeferredUiRequest(requestId: string): boolean {
+  const entry = deferred.get(requestId)
+
+  if (!entry) {
+    return false
+  }
+
+  deferred.delete(requestId)
+  entry.off()
+
+  return true
+}
+
+export const isUiRequestDeferred = (requestId: string): boolean => deferred.has(requestId)
+
 export function unparkUiRequest(requestId: string): void {
+  withdrawDeferredUiRequest(requestId)
   handles.delete(requestId)
 
   const current = $uiRequests.get()
@@ -47,6 +77,12 @@ export function unparkUiRequest(requestId: string): void {
 
 /** Drop every parked card of one session (turn ended, errored, or the session went away). */
 export function clearSessionUiRequests(sessionId: string): void {
+  for (const [requestId, entry] of [...deferred]) {
+    if (entry.sessionId === sessionId) {
+      withdrawDeferredUiRequest(requestId)
+    }
+  }
+
   for (const parked of Object.values($uiRequests.get())) {
     if (parked.sessionId === sessionId) {
       unparkUiRequest(parked.requestId)
@@ -169,6 +205,10 @@ export function installUiBridgeTeardown(): void {
 }
 
 export function resetUiBridgeForTests(): void {
+  for (const requestId of [...deferred.keys()]) {
+    withdrawDeferredUiRequest(requestId)
+  }
+
   handles.clear()
   $uiRequests.set({})
 }

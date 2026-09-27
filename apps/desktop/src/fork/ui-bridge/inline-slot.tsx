@@ -15,11 +15,7 @@ import {
   type ParkedUiRequest,
   respondUiRequest
 } from '@/fork/ui-bridge/store'
-import {
-  UI_REQUEST_AREA,
-  type UiRequestRenderProps,
-  type UiToolResultRenderProps
-} from '@/fork/ui-bridge/types'
+import { UI_REQUEST_AREA, type UiRequestRenderProps, type UiToolResultRenderProps } from '@/fork/ui-bridge/types'
 import type { ChatMessage } from '@/lib/chat-messages'
 import { $activeSessionId } from '@/store/session'
 import { $toolDisclosureStates, setToolDisclosureOpen } from '@/store/tool-view'
