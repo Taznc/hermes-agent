@@ -1155,6 +1155,11 @@ def _reclaim_dead_workers(conn: sqlite3.Connection, board: Optional[str] = None)
                 continue
             if _worker_alive(row["worker_pid"], _kb._row_get(row, "worker_started_at")):
                 continue
+            # >>> FORK ANCHOR: infra-interruptions <<<
+            from hermes_fork.kanban.infra_interruptions import book_host_restart as _fork_host_restart
+            if _fork_host_restart(conn, row, sweep, board=board):
+                continue
+            # <<< FORK ANCHOR >>>
 
             pid = int(row["worker_pid"])
             dead = _classify_dead_worker(pid, row["claim_lock"], task_id=row["id"], board=board)
@@ -2007,6 +2012,11 @@ def _dispatch_lane_task(
     Returns True when a spawn slot was consumed (real or ``dry_run``); every
     skip is recorded on ``result``.
     """
+    # >>> FORK ANCHOR: review-routing <<<
+    from hermes_fork.kanban.review_routing import admit as _fork_review_admit
+    if not (assignee := _fork_review_admit(conn, row, assignee, lane=lane, dry_run=dry_run)):
+        return False
+    # <<< FORK ANCHOR >>>
     task_id = row["id"]
     # Non-profile assignees (control-plane lanes that pull via ``claim_task``)
     # would fail ``hermes -p <assignee>`` at startup and loop ready→crash→ready
@@ -2024,6 +2034,10 @@ def _dispatch_lane_task(
             result.skipped_per_profile_capped.append((task_id, assignee, current))
             return False
     guard_reason = check_respawn_guard(conn, task_id, lane=lane)
+    # >>> FORK ANCHOR: pr-requeue-recovery <<<
+    from hermes_fork.kanban.pr_requeue import release as _fork_pr_release
+    guard_reason = _fork_pr_release(conn, task_id, guard_reason, dry_run=dry_run)
+    # <<< FORK ANCHOR >>>
     if guard_reason is not None:
         result.respawn_guarded.append((task_id, guard_reason))
         # Event so ``hermes kanban tail`` shows why the task looks stuck.

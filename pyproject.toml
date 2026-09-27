@@ -819,6 +819,8 @@ include = [
   "hermes_platform.*",
   "pm",
   "pm.*",
+  "hermes_fork",
+  "hermes_fork.*",
   "tools",
   "tools.*",
 ]
