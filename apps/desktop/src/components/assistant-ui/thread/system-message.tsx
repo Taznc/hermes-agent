@@ -73,6 +73,7 @@ export const SystemMessage: FC = () => {
     return (
       <MessagePrimitive.Root
         className="w-full min-w-0 self-start"
+        data-message-copy-text={text}
         data-role="system"
         data-slot="aui_system-message-root"
       >
@@ -97,6 +98,7 @@ export const SystemMessage: FC = () => {
     return (
       <MessagePrimitive.Root
         className="flex w-full min-w-0 max-w-full items-start gap-1.5 self-start py-0.5"
+        data-message-copy-text={text}
         data-role="system"
         data-slot="aui_system-message-root"
       >
@@ -119,6 +121,7 @@ export const SystemMessage: FC = () => {
     return (
       <MessagePrimitive.Root
         className="flex max-w-[min(86%,44rem)] items-center gap-1.5 self-center px-2 py-0.5 text-[0.6875rem] leading-5 text-muted-foreground/60"
+        data-message-copy-text={text}
         data-role="system"
         data-slot="aui_system-message-root"
       >
@@ -145,6 +148,7 @@ export const SystemMessage: FC = () => {
           'w-[60%] max-w-[44rem] self-center px-2 py-0.5 text-[0.6875rem] leading-5 text-muted-foreground/60',
           multiline ? 'text-left' : 'text-center'
         )}
+        data-message-copy-text={text}
         data-role="system"
         data-slot="aui_system-message-root"
       >
@@ -170,6 +174,7 @@ export const SystemMessage: FC = () => {
         'w-[60%] max-w-[44rem] self-center px-2 py-0.5 text-[0.6875rem] leading-5 text-muted-foreground/55',
         multiline ? 'text-left' : 'text-center'
       )}
+      data-message-copy-text={text}
       data-role="system"
       data-slot="aui_system-message-root"
     >

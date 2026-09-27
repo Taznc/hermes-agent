@@ -66,7 +66,8 @@ describe('assistant reaction picker', () => {
 
 // The user bubble's right-click is the desktop stand-in for touch-and-hold,
 // so while reactions are ON it opens the picker (reacting survives the removal
-// of the double-click tapback). While reactions are OFF there is no picker to
+// of the double-click tapback); Copy message rides that picker (see
+// user-message-copy.test.tsx). While reactions are OFF there is no picker to
 // protect, so the bubble must NOT claim the gesture: the shared AppContextMenu
 // takes it and offers Copy message. The bubble used to stamp
 // `data-context-menu-skip` unconditionally, stranding that right-click on

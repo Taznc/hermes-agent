@@ -14,6 +14,7 @@ import { type RestoreMessageTarget } from '@/components/assistant-ui/thread/type
 import { useMessageReactions } from '@/components/assistant-ui/thread/use-message-reactions'
 import { UserMessageText } from '@/components/assistant-ui/thread/user-message-text'
 import { Codicon } from '@/components/ui/codicon'
+import { writeClipboardText } from '@/components/ui/copy-button'
 import { Tip } from '@/components/ui/tooltip'
 import { useResizeObserver } from '@/hooks/use-resize-observer'
 import { useI18n } from '@/i18n'
@@ -125,10 +126,14 @@ function useDeferredSingleClickEdit(): {
 export function StickyHumanMessageContainer({
   attachments,
   children,
+  copyText,
   messageId
 }: {
   attachments?: ReactNode
   children: ReactNode
+  /** What the app menu's Copy message yields for this prompt (the root also
+   *  renders timestamp / reaction / checkpoint chrome, which must not copy). */
+  copyText?: string
   messageId?: string
 }) {
   return (
@@ -139,6 +144,7 @@ export function StickyHumanMessageContainer({
     <>
       <div
         className="group/user-message sticky z-40 -mx-4 flex w-[calc(100%+2rem)] min-w-0 max-w-none flex-col items-stretch gap-0 self-end overflow-visible px-4 pb-(--conversation-turn-gap) pt-1"
+        data-message-copy-text={copyText}
         data-message-id={messageId}
         data-role="user"
         data-slot="aui_user-message-root"
@@ -387,6 +393,17 @@ export const UserMessage: FC<{
     [react]
   )
 
+  // What "Copy message" yields: the prompt as sent plus its attachment refs
+  // (they render as chips below the bubble but are part of what was sent) —
+  // never the timestamp, reaction badge, or checkpoint labels the root also
+  // renders.
+  const copyText = [messageText.trim(), ...attachmentRefs].filter(Boolean).join('\n')
+
+  const copyMessage = useCallback(() => {
+    setPickerOpen(false)
+    void writeClipboardText(copyText).catch(() => {})
+  }, [copyText])
+
   // Sticky human bubbles clamp to ~2 lines with a soft fade so a long prompt
   // doesn't dominate the viewport while the response streams underneath; the
   // clamp lifts on hover / focus (see styles.css). We measure the *unclamped*
@@ -445,6 +462,7 @@ export const UserMessage: FC<{
     return (
       <MessagePrimitive.Root
         className="flex w-full min-w-0 flex-col items-stretch"
+        data-message-copy-text={messageText.trim()}
         data-role="user"
         data-slot="aui_user-message-root"
       >
@@ -458,6 +476,7 @@ export const UserMessage: FC<{
     return (
       <MessagePrimitive.Root
         className="flex w-full min-w-0 flex-col items-stretch pb-(--conversation-turn-gap)"
+        data-message-copy-text={messageText.trim()}
         data-role="user"
         data-slot="aui_user-message-root"
       >
@@ -512,11 +531,15 @@ export const UserMessage: FC<{
             </div>
           ) : null
         }
+        copyText={copyText}
         messageId={messageId}
       >
         <ActionBarPrimitive.Root className="relative w-full max-w-full" data-slot="aui_user-bubble-actions">
           <div className="human-message-with-todos-wrapper flex w-full flex-col gap-0">
             <ReactionPicker
+              // The bubble's right-click opens this picker instead of the app
+              // menu, so Copy message rides the picker here.
+              copyAction={{ label: copy.copyMessage, onCopy: copyMessage }}
               onOpenChange={setPickerOpen}
               onSelect={pickEmoji}
               open={pickerOpen}
@@ -531,7 +554,8 @@ export const UserMessage: FC<{
                 // Stamped ONLY while the picker can actually open: with
                 // reactions off there is no gesture to protect, so the bubble
                 // stops claiming right-click and the shared menu takes it —
-                // that is where Copy message lives.
+                // that is where Copy message lives then. With reactions on,
+                // Copy message rides the picker (copyAction above).
                 data-context-menu-skip={readOnly || !reactionsEnabled ? undefined : ''}
                 onContextMenu={
                   // Right-click is the desktop stand-in for iOS touch-and-hold —

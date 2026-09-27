@@ -43,9 +43,30 @@ function editableFrom(element: Element | null): HTMLElement | null {
 
 /** The chat message the click landed in, if any. Assistant replies expose their
  *  rendered body; user prompts and system rows their root. All are `data-slot`
- *  hooks the transcript already stamps, so this needs no new markup. */
+ *  hooks the transcript already stamps. */
 const MESSAGE_BODY_SELECTOR =
   '[data-slot="aui_assistant-message-content"], [data-slot="aui_user-message-root"], [data-slot="aui_system-message-root"]'
+
+/** A message root whose rendered text also carries chrome (timestamp, reaction
+ *  badge, checkpoint controls) stamps the exact text to copy here, so Copy
+ *  message yields the message and never its metadata. */
+const MESSAGE_COPY_TEXT_ATTR = 'data-message-copy-text'
+
+function messageTextFrom(body: Element | null | undefined): string {
+  if (!(body instanceof HTMLElement)) {
+    return ''
+  }
+
+  const stamped = body.getAttribute(MESSAGE_COPY_TEXT_ATTR)
+
+  if (stamped !== null) {
+    return stamped.trim()
+  }
+
+  // `innerText` respects rendered line breaks (so a copied reply keeps its
+  // paragraphs); `textContent` is the fallback where layout is unavailable.
+  return (body.innerText ?? body.textContent ?? '').trim()
+}
 
 export function resolveDomTarget(element: Element | null): ContextMenuDomTarget {
   const anchor = element?.closest('a[href]')
@@ -60,10 +81,7 @@ export function resolveDomTarget(element: Element | null): ContextMenuDomTarget 
     // A placeholder anchor is not a link the menu can act on.
     linkUrl: linkUrl === '#' ? '' : linkUrl,
     imageUrl: image instanceof HTMLImageElement ? image.currentSrc || image.src : '',
-    // `innerText` respects rendered line breaks (so a copied reply keeps its
-    // paragraphs); `textContent` is the fallback where layout is unavailable.
-    messageText:
-      messageBody instanceof HTMLElement ? (messageBody.innerText ?? messageBody.textContent ?? '').trim() : '',
+    messageText: messageTextFrom(messageBody),
     onImage: Boolean(image),
     selectionText: window.getSelection()?.toString().trim() ?? ''
   }

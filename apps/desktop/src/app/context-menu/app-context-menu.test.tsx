@@ -110,6 +110,15 @@ describe('resolveDomTarget', () => {
     // Text that is not a chat message offers no Copy message.
     expect(outside.messageText).toBe('')
   })
+
+  it('prefers the text a message root stamps over its rendered chrome', () => {
+    const host = attach(
+      '<div data-slot="aui_user-message-root" data-message-copy-text="  just the prompt  ">' +
+        '<span>just the prompt</span><span>🎉</span><time>9:41 AM</time></div>'
+    )
+
+    expect(resolveDomTarget(host.querySelector('span')).messageText).toBe('just the prompt')
+  })
 })
 
 describe('AppContextMenu', () => {
