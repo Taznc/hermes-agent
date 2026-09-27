@@ -14,7 +14,7 @@ Config key (``config.yaml``)::
 
 * Unset (or ``null``): ``None`` is returned and upstream's 8.0 s default applies,
   so without the key behaviour is unchanged.
-* Not a finite number > 0 (``0``, ``-1``, ``"abc"``, ``true``, ``nan``, ``inf``):
+* Not a finite number > 0 (``0``, ``-1``, ``"abc"``, ``true``, ``nan``, ``inf``, an integer too large for a float):
   one warning per distinct value, then the upstream default.
 * Set it >= the active provider's OWN wait (for hindsight, ``prefetch_join_timeout``
   in ``$HERMES_HOME/hindsight/config.json``, or its worst recall latency when
@@ -52,7 +52,7 @@ def external_prefetch_timeout(mem_config: Any) -> Optional[float]:
     if not isinstance(raw, bool):
         try:
             value = float(raw)
-        except (TypeError, ValueError):
+        except (TypeError, ValueError, OverflowError):  # OverflowError: int too large for a float
             value = None
     if value is not None and math.isfinite(value) and value > 0:
         return value

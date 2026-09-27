@@ -109,6 +109,18 @@ def test_timeout_follows_the_profile_home_a_b_a(tmp_path, monkeypatch):
     assert observed == [30.0, memory_manager._EXTERNAL_PREFETCH_TIMEOUT_S, 30.0]
 
 
+def test_oversized_integer_warns_and_keeps_the_provider_at_the_default_cap(tmp_path, monkeypatch, caplog):
+    # float(10**400) raises OverflowError; it must not escape into agent_init's
+    # provider-init except, which would disable external memory entirely.
+    monkeypatch.setattr(fork_memory, "_warned", set())
+    home = _home(tmp_path, "huge", f"  external_prefetch_timeout: {10**400}\n")
+    with caplog.at_level(logging.WARNING), _agent_in(home, monkeypatch) as agent:
+        assert agent._memory_manager is not None
+        assert [p.name for p in agent._memory_manager.providers] == ["slowmem"]
+        assert agent._memory_manager._external_prefetch_timeout == memory_manager._EXTERNAL_PREFETCH_TIMEOUT_S
+    assert caplog.text.count("Ignoring memory.external_prefetch_timeout") == 1
+
+
 @pytest.mark.parametrize("raw, expected", [(30, 30.0), (12.5, 12.5), ("45", 45.0)])
 def test_valid_values(raw, expected):
     assert fork_memory.external_prefetch_timeout({"external_prefetch_timeout": raw}) == expected
@@ -121,7 +133,7 @@ def test_unset_means_upstream_default(mem_config, caplog):
     assert caplog.text == ""
 
 
-@pytest.mark.parametrize("raw", [0, -1, "abc", True, math.nan, math.inf, [30]])
+@pytest.mark.parametrize("raw", [0, -1, "abc", True, math.nan, math.inf, [30], 10**400, "1" * 400])
 def test_invalid_values_warn_and_fall_back(raw, caplog, monkeypatch):
     monkeypatch.setattr(fork_memory, "_warned", set())
     with caplog.at_level(logging.WARNING):
