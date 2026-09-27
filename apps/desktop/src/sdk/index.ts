@@ -46,6 +46,8 @@ import {
 import { onGatewayEvent } from '@/contrib/events'
 import { registry } from '@/contrib/registry'
 import type { WorkspaceMode } from '@/contrib/types'
+// >>> FORK ANCHOR: host-fork <<<
+import { forkHost } from '@/fork/sdk'
 import { deleteProfile, getLogs, getStatus, hermesApi, type HermesGateway } from '@/hermes'
 import { completeMcpDesktopOAuth } from '@/lib/mcp-dashboard-oauth'
 import {
@@ -1580,6 +1582,8 @@ export const host = {
    *  active instance changes on a profile swap. */
   getGateway: (): HermesGateway | null => $gateway.get(),
 
+  // >>> FORK ANCHOR: host-fork <<<
+  fork: forkHost,
   composer: composerHost
 }
 
