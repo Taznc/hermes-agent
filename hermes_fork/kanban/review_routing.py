@@ -540,37 +540,57 @@ def return_diagnosed(conn: sqlite3.Connection, *, dry_run: bool) -> list[str]:
     returned: list[str] = []
     for row in rows:
         task_id, status, owner = row["id"], row["status"], row["assignee"]
-        esc = _escalation_owner(conn, task_id, owner)
-        if esc is None:
-            continue
-        esc_id, esc_data = esc
-        # An operator unblock since the escalation ("go again") is explicit
-        # routing: every later terminal of that profile stays with the operator.
-        if _operator_routed_after(conn, task_id, esc_id):
-            continue
-        terminal = _diagnosis_terminal(conn, task_id, esc_id, owner)
-        if terminal is None or _TERMINAL_STATUS[terminal["kind"]] != status:
+        candidate = _handback_candidate(conn, task_id, status, owner)
+        if candidate is None:
             continue
         if dry_run:
             returned.append(task_id)
             continue
-        if _hand_back(conn, _kb, task_id, status, owner, esc_data, terminal):
+        if _hand_back(conn, _kb, task_id, status, owner, candidate):
             returned.append(task_id)
     _unpin_abandoned(conn, dry_run)
     return returned
 
 
+def _handback_candidate(
+    conn: sqlite3.Connection, task_id: str, status: str, owner: str,
+) -> Optional[tuple[int, dict, sqlite3.Row]]:
+    """``(escalation_event_id, escalation_payload, terminal)`` when the card
+    at ``status``/``owner`` is a hand-back; ``None`` otherwise. Pure read;
+    :func:`_hand_back` re-runs it inside its write txn."""
+    esc = _escalation_owner(conn, task_id, owner)
+    if esc is None:
+        return None
+    esc_id, esc_data = esc
+    # An operator unblock since the escalation ("go again") is explicit
+    # routing: every later terminal of that profile stays with the operator.
+    if _operator_routed_after(conn, task_id, esc_id):
+        return None
+    terminal = _diagnosis_terminal(conn, task_id, esc_id, owner)
+    if terminal is None or _TERMINAL_STATUS[terminal["kind"]] != status:
+        return None
+    return esc_id, esc_data, terminal
+
+
 def _hand_back(
     conn: sqlite3.Connection, _kb: Any, task_id: str, status: str, owner: str,
-    esc_data: dict, terminal: sqlite3.Row,
+    candidate: tuple[int, dict, sqlite3.Row],
 ) -> bool:
-    target = esc_data["return_to"]
-    terminal_payload = _payload(terminal["payload"])
-    reason = terminal_payload.get("reason") if terminal["kind"] == "blocked" else terminal_payload.get("summary")
-    first = (reason or "").strip().splitlines()[0][:300] if isinstance(reason, str) and reason.strip() else ""
     terminations: list = []
-    pinned = esc_data.get(PIN_KEY)
     with _kb.write_txn(conn):
+        # Re-decide under the write lock. The row guard below cannot see an
+        # operator unblock + re-block made since the unlocked scan (same
+        # status, same assignee), so the event-level checks run again here and
+        # must name the same escalation and the same diagnosis terminal.
+        fresh = _handback_candidate(conn, task_id, status, owner)
+        if fresh is None or (fresh[0], int(fresh[2]["id"])) != (candidate[0], int(candidate[2]["id"])):
+            return False
+        _esc_id, esc_data, terminal = fresh
+        target = esc_data["return_to"]
+        terminal_payload = _payload(terminal["payload"])
+        reason = terminal_payload.get("reason") if terminal["kind"] == "blocked" else terminal_payload.get("summary")
+        first = (reason or "").strip().splitlines()[0][:300] if isinstance(reason, str) and reason.strip() else ""
+        pinned = esc_data.get(PIN_KEY)
         new_status = _kb._landing_status_after_parents(conn, task_id)
         # block_kind/block_recurrences reset: the hand-back block is the
         # escalation protocol's end-of-step signal, not a wall, so the

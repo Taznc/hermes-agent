@@ -15,6 +15,8 @@ from __future__ import annotations
 import subprocess
 from pathlib import Path
 
+import pytest
+
 from hermes_cli import kanban_db as kb
 from hermes_cli import kanban_db_dispatch as kbd
 from hermes_cli import kanban_db_workspace as kbw
@@ -179,6 +181,38 @@ def test_operator_unblock_then_second_block_still_wins(board):
     assert t.status in ("blocked", "triage") and t.assignee == "debugger"
     assert not _events(conn, tid, review_routing.RETURNED_EVENT)
     assert _tick(conn, spawn, spawned) is None
+
+
+def _operator_unblock_reblock(conn, tid):
+    assert kb.unblock_task(conn, tid)
+    assert kb.block_task(conn, tid, reason="Operator: hold for inspection", kind="dependency")
+
+
+def _operator_reassign_round_trip(conn, tid):
+    assert kb.assign_task(conn, tid, "operator")
+    assert kb.assign_task(conn, tid, "debugger")
+
+
+@pytest.mark.parametrize("operator_move", [_operator_unblock_reblock, _operator_reassign_round_trip])
+def test_operator_routing_between_scan_and_hand_back_wins(board, monkeypatch, operator_move):
+    """Operator acts after the unlocked scan picked the card but before the
+    hand-back txn. The row ends where it started (``blocked``/``debugger``),
+    so only the in-txn event recheck can see it."""
+    conn, cfg, spawned, spawn = board
+    tid = _escalated(conn, cfg, spawn, spawned)
+    _diagnose_and_block(conn, tid)
+    original = review_routing._hand_back
+
+    def interleaved(*args):
+        operator_move(conn, tid)
+        assert (_task(conn, tid).status, _task(conn, tid).assignee) == ("blocked", "debugger")
+        return original(*args)
+
+    monkeypatch.setattr(review_routing, "_hand_back", interleaved)
+    assert _tick(conn, spawn, spawned) is None
+    t = _task(conn, tid)
+    assert (t.status, t.assignee) == ("blocked", "debugger")
+    assert not _events(conn, tid, review_routing.RETURNED_EVENT)
 
 
 def test_escalation_without_return_to_is_left_alone(board):
