@@ -41,6 +41,9 @@
  */
 
 import { getApiRequestProfile } from '@/api/client'
+// >>> FORK ANCHOR: web-desktop-plugin-removal <<<
+import { createWebDesktopPluginRemoval } from './fork/web-desktop-plugin-removal'
+// <<< FORK ANCHOR >>>
 
 import type { DesktopBootstrapState, DesktopMarketplaceThemeResult } from './global'
 import { extractVsixThemes } from './lib/vsix-archive'
@@ -901,6 +904,10 @@ const installDesktopPlugin = async (payload: {
   }
 }
 
+// >>> FORK ANCHOR: web-desktop-plugin-removal <<<
+const removeDesktopPlugin = createWebDesktopPluginRemoval(api, BRIDGE_API, bridgeFailureMessage)
+// <<< FORK ANCHOR >>>
+
 // ── OS/browser notifications ────────────────────────────────────────────────
 // Electron's real bridge shows notifications via `new Notification()` in the
 // main process and wires click/action back over IPC (hermes:focus-session,
@@ -1180,6 +1187,9 @@ const shim = {
   readPluginSource,
   probePluginRepo,
   installDesktopPlugin,
+  // >>> FORK ANCHOR: web-desktop-plugin-removal <<<
+  removeDesktopPlugin,
+  // <<< FORK ANCHOR >>>
 
   // ── first-render adjacents ───────────────────────────────────────────────
   onPreviewFileChanged: unsub,
@@ -1456,9 +1466,9 @@ const shim = {
   // desktopPluginsRoot/agentPluginsRoot + readDir/readPluginSource above —
   // when the web-desktop-bridge backend plugin is enabled. Without it those
   // members answer '' / { ok: false } (see the "Desktop-plugin door" block)
-  // and the disk door stays empty, as before. removeDesktopPlugin,
-  // reconcileDesktopPlugins and openDir remain omitted: the bridge plugin
-  // serves no route for them and every caller optional-chains the method.
+  // and the disk door stays empty, as before. reconcileDesktopPlugins and
+  // openDir remain omitted: the bridge plugin serves no route for them and
+  // every caller optional-chains the method.
 }
 
 ;(window as unknown as { hermesDesktop: unknown }).hermesDesktop = shim
