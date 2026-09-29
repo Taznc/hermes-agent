@@ -7,8 +7,8 @@
 
 import { atom } from 'nanostores'
 
-import type { DependencyGraph } from './deps'
-import type { KanbanTask } from './types'
+import type { DependencyGraph } from '@/fork/kanban/deps'
+import type { KanbanTask } from '@/fork/kanban/types'
 
 export type FocusDepth = 'chain' | 'direct'
 

@@ -7,10 +7,9 @@
 
 import { Codicon } from '@/components/ui/codicon'
 import { DropdownMenuItem } from '@/components/ui/dropdown-menu'
-
-import { ALL_BOARDS, enterAllBoards } from './all-boards'
-import { useForkBackend } from './backend'
-import { kanbanForkText, useKanban } from './text'
+import { ALL_BOARDS, enterAllBoards } from '@/fork/kanban/all-boards'
+import { useForkBackend } from '@/fork/kanban/backend'
+import { kanbanForkText, useKanban } from '@/fork/kanban/text'
 
 function AllBoardsItem({ boards, slug }: { boards: ReadonlyArray<{ total?: number }>; slug: string }) {
   const k = useKanban()

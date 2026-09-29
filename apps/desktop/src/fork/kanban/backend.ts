@@ -13,9 +13,8 @@ import { useStore as useValue } from '@nanostores/react'
 import { atom } from 'nanostores'
 import { useEffect } from 'react'
 
+import { probeForkBackend } from '@/fork/kanban/all-boards'
 import { $activeConnectionId } from '@/store/connections'
-
-import { probeForkBackend } from './all-boards'
 
 export const $forkBackend = atom<boolean | null>(null)
 

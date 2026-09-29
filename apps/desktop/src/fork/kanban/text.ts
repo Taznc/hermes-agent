@@ -6,10 +6,9 @@
 
 import { useMemo } from 'react'
 
+import { en, KANBAN_FORK_LOCALES } from '@/fork/kanban/i18n'
 import { type PluginTranslate, registerPluginLocales, translatePlugin, usePluginI18n } from '@/i18n/plugin-i18n'
 import { getRuntimeI18nLocale } from '@/i18n/runtime'
-
-import { en, KANBAN_FORK_LOCALES } from './i18n'
 
 export const KANBAN_FORK_I18N_ID = 'kanban-fork'
 

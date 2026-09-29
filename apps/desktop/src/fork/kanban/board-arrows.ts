@@ -10,7 +10,7 @@
  * parent BLOCKS the child, so every arrow's head lands on the blocked card.
  */
 
-import { chainEdges, type DependencyGraph, downstreamOf, upstreamOf } from './deps'
+import { chainEdges, type DependencyGraph, downstreamOf, upstreamOf } from '@/fork/kanban/deps'
 
 /** A card's box in lane-strip content coordinates (scroll-independent). */
 export interface CardBox {

@@ -32,8 +32,6 @@ import { atom } from 'nanostores'
 import { Fragment, type RefObject, useEffect, useLayoutEffect, useMemo, useState } from 'react'
 
 import { SegmentedControl } from '@/components/ui/segmented-control'
-import { cn } from '@/lib/utils'
-
 import {
   arrowHead,
   type BoardArrow,
@@ -45,14 +43,15 @@ import {
   revealGroupDelta,
   routeArrows,
   sameArrows
-} from './board-arrows'
-import { type DependencyGraph, isGating } from './deps'
-import { linkTone } from './focus-verdict'
-import { $depChevrons, $depFlow, type FocusDepth } from './state'
-import { useKanban } from './text'
-import type { KanbanTask } from './types'
+} from '@/fork/kanban/board-arrows'
+import { type DependencyGraph, isGating } from '@/fork/kanban/deps'
+import { linkTone } from '@/fork/kanban/focus-verdict'
+import { $depChevrons, $depFlow, type FocusDepth } from '@/fork/kanban/state'
+import { useKanban } from '@/fork/kanban/text'
+import type { KanbanTask } from '@/fork/kanban/types'
+import { cn } from '@/lib/utils'
 
-export type { FocusDepth } from './state'
+export type { FocusDepth } from '@/fork/kanban/state'
 
 /** The edge (`edgeId`) under the pointer — a line, or its answer-bar row.
  *  Presentation only; never persisted. */

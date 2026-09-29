@@ -20,10 +20,9 @@ import type { QueryClient } from '@tanstack/react-query'
 import type { WritableAtom } from 'nanostores'
 
 import { pluginRest, type PluginRestOptions, pluginSocket } from '@/api/plugins'
+import type { KanbanBoard, KanbanTask } from '@/fork/kanban/types'
 import { queryClient } from '@/lib/query-client'
 import { $activeConnectionId } from '@/store/connections'
-
-import type { KanbanBoard, KanbanTask } from './types'
 
 /** The plugin's REST door (`ctx.rest`) — namespace-scoped to `kanban`. */
 export type Rest = <T>(path: string, opts?: PluginRestOptions) => Promise<T>

@@ -11,7 +11,7 @@
  *  send `link_edges`.
  */
 
-import { type KanbanBoard, type KanbanTask, type ResolvedLink, ROADMAP_LANES } from './types'
+import { type KanbanBoard, type KanbanTask, type ResolvedLink, ROADMAP_LANES } from '@/fork/kanban/types'
 
 /** A blocker stops gating once it reaches a terminal state. `done` is the
  *  dispatcher's own promotion rule (a child promotes when every parent is

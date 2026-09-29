@@ -7,8 +7,8 @@
  * (`deps.ts`), no round-trips.
  */
 
-import { type DependencyGraph, downstreamOf, isGating, upstreamOf } from './deps'
-import type { KanbanTask } from './types'
+import { type DependencyGraph, downstreamOf, isGating, upstreamOf } from '@/fork/kanban/deps'
+import type { KanbanTask } from '@/fork/kanban/types'
 
 /** A linked card as the answer bar lists it. `status` is `'unknown'` for a
  *  link whose card the board doesn't have (deleted, filtered by tenant). */

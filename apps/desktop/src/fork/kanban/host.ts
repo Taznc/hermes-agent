@@ -19,10 +19,10 @@
  * connection every member degrades to a no-op/pass-through.
  */
 
-import { ALL_BOARDS, routeRest } from './all-boards'
-import { boardOverlay } from './board-overlay'
-import { frameCard } from './card-frame'
-import { allBoardsItem, boardLabel } from './switcher'
+import { ALL_BOARDS, routeRest } from '@/fork/kanban/all-boards'
+import { boardOverlay } from '@/fork/kanban/board-overlay'
+import { frameCard } from '@/fork/kanban/card-frame'
+import { allBoardsItem, boardLabel } from '@/fork/kanban/switcher'
 
 export const forkKanban = {
   version: 1 as const,

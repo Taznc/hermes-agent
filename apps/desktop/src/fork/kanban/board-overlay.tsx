@@ -24,16 +24,13 @@ import { createPortal } from 'react-dom'
 
 import { Codicon } from '@/components/ui/codicon'
 import { Tip } from '@/components/ui/tooltip'
-import { cn } from '@/lib/utils'
-import { $activeConnectionId } from '@/store/connections'
-
-import { ALL_BOARDS, type AllBoardsInfo, type AllBoardsPayload, fetchLinkEdges, leaveAllBoards, watchAllBoards } from './all-boards'
-import { FocusAnswerBar } from './answer-bar'
-import { useForkBackend } from './backend'
-import { $hotEdge, BoardDependencyArrows } from './board-arrows-layer'
-import { FOLD_KEY_ATTR, LANE_GAP_ATTR } from './card-frame'
-import { buildGraph, chainSets, focusSets, indexBoard } from './deps'
-import { foldLane } from './lane-fold'
+import { ALL_BOARDS, type AllBoardsInfo, type AllBoardsPayload, fetchLinkEdges, leaveAllBoards, watchAllBoards } from '@/fork/kanban/all-boards'
+import { FocusAnswerBar } from '@/fork/kanban/answer-bar'
+import { useForkBackend } from '@/fork/kanban/backend'
+import { $hotEdge, BoardDependencyArrows } from '@/fork/kanban/board-arrows-layer'
+import { FOLD_KEY_ATTR, LANE_GAP_ATTR } from '@/fork/kanban/card-frame'
+import { buildGraph, chainSets, focusSets, indexBoard } from '@/fork/kanban/deps'
+import { foldLane } from '@/fork/kanban/lane-fold'
 import {
   $depView,
   $focusDepth,
@@ -48,9 +45,11 @@ import {
   NO_FOLDS,
   resetFocus,
   toggleBoardHidden
-} from './state'
-import { useKanban } from './text'
-import type { KanbanBoard } from './types'
+} from '@/fork/kanban/state'
+import { useKanban } from '@/fork/kanban/text'
+import type { KanbanBoard } from '@/fork/kanban/types'
+import { cn } from '@/lib/utils'
+import { $activeConnectionId } from '@/store/connections'
 
 /** Anything open on top of the board owns Esc (drawer, dialogs, menus). */
 const LAYER_OPEN = '[role="dialog"], [role="alertdialog"], [role="menu"]'

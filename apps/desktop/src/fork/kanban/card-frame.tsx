@@ -23,13 +23,12 @@ import { type ComponentType, type MouseEvent, type ReactElement, type ReactNode,
 
 import { Codicon } from '@/components/ui/codicon'
 import { Tip } from '@/components/ui/tooltip'
+import { FocusRollup } from '@/fork/kanban/answer-bar'
+import { downstreamOf, taskCardKey, upstreamOf } from '@/fork/kanban/deps'
+import { $depView, $folds, $hiddenBoards, type DependencyView, markSelected, openGap, toggleFocus } from '@/fork/kanban/state'
+import { useKanban } from '@/fork/kanban/text'
+import type { KanbanTask } from '@/fork/kanban/types'
 import { cn } from '@/lib/utils'
-
-import { FocusRollup } from './answer-bar'
-import { downstreamOf, taskCardKey, upstreamOf } from './deps'
-import { $depView, $folds, $hiddenBoards, type DependencyView, markSelected, openGap, toggleFocus } from './state'
-import { useKanban } from './text'
-import type { KanbanTask } from './types'
 
 /** Marks a folded run of unrelated cards. The overlay's click-off-to-clear
  *  handler skips it, so opening a gap never ends the trace it belongs to. */

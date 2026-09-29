@@ -1,12 +1,12 @@
 import { computed, type ReadableAtom } from 'nanostores'
 
+import { forkKanban } from '@/fork/kanban/host'
 import { refreshProjectTree } from '@/store/projects'
 import { $sessions, sessionMatchesStoredId } from '@/store/session'
 import { $removedSessionIds } from '@/store/session-removal'
 import { sessionTileDelegate } from '@/store/session-states'
 import { $archivedSessions, loadArchivedSessions } from '@/store/sidebar-archive'
 
-import { forkKanban } from './kanban/host'
 import { SIDEBAR_GROUP_ACTION_AREA } from './sidebar-group-actions'
 import { forkUi } from './ui-bridge/sdk'
 

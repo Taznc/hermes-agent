@@ -20,11 +20,9 @@ import type { CSSProperties, ReactNode } from 'react'
 
 import { Button } from '@/components/ui/button'
 import { Codicon } from '@/components/ui/codicon'
-import { cn } from '@/lib/utils'
-
-import { edgeId } from './board-arrows'
-import { $hotEdge, FocusDepthControls } from './board-arrows-layer'
-import type { DependencyGraph } from './deps'
+import { edgeId } from '@/fork/kanban/board-arrows'
+import { $hotEdge, FocusDepthControls } from '@/fork/kanban/board-arrows-layer'
+import type { DependencyGraph } from '@/fork/kanban/deps'
 import {
   type FocusLink,
   focusLinks,
@@ -33,10 +31,11 @@ import {
   LEGEND_STATUSES,
   linkTone,
   type VerdictKind
-} from './focus-verdict'
-import { $depChevrons, $depFlow, type FocusDepth } from './state'
-import { columnLabel, type KanbanText, useKanban } from './text'
-import type { KanbanTask } from './types'
+} from '@/fork/kanban/focus-verdict'
+import { $depChevrons, $depFlow, type FocusDepth } from '@/fork/kanban/state'
+import { columnLabel, type KanbanText, useKanban } from '@/fork/kanban/text'
+import type { KanbanTask } from '@/fork/kanban/types'
+import { cn } from '@/lib/utils'
 
 /** Verdict chip colours, one per kind — the same hues the lines use. */
 const VERDICT_TONE: Record<VerdictKind, string> = {
