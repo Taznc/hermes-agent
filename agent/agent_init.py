@@ -1279,7 +1279,10 @@ def _memory_provider_init_kwargs(agent, platform) -> Dict[str, Any]:
     with suppress(Exception):
         from hermes_cli.profiles import get_active_profile_name
         kwargs["agent_identity"] = get_active_profile_name()
-        kwargs["agent_workspace"] = "hermes"
+        # >>> FORK ANCHOR: memory-workspace-identity <<<
+        from hermes_fork.workspace import agent_workspace as _fork_agent_workspace
+        kwargs["agent_workspace"] = _fork_agent_workspace(agent)
+        # <<< FORK ANCHOR >>>
     return kwargs
 
 
