@@ -49,8 +49,8 @@ import {
 import { type DependencyGraph, isGating } from './deps'
 import { linkTone } from './focus-verdict'
 import { $depChevrons, $depFlow, type FocusDepth } from './state'
-import type { KanbanTask } from './types'
 import { useKanban } from './text'
+import type { KanbanTask } from './types'
 
 export type { FocusDepth } from './state'
 

@@ -6,6 +6,7 @@ import { $removedSessionIds } from '@/store/session-removal'
 import { sessionTileDelegate } from '@/store/session-states'
 import { $archivedSessions, loadArchivedSessions } from '@/store/sidebar-archive'
 
+import { forkKanban } from './kanban/host'
 import { SIDEBAR_GROUP_ACTION_AREA } from './sidebar-group-actions'
 import { forkUi } from './ui-bridge/sdk'
 
@@ -129,5 +130,7 @@ export const forkHost = {
     GROUP_ACTION_AREA: SIDEBAR_GROUP_ACTION_AREA
   },
   /** X02 plugin UI bridge (see ui-bridge/sdk.ts). */
-  ui: forkUi
+  ui: forkUi,
+  /** Kanban focus mode + All Boards (see kanban/host.ts). */
+  kanban: forkKanban
 }

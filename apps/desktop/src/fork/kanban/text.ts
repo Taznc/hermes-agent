@@ -6,7 +6,8 @@
 
 import { useMemo } from 'react'
 
-import { type PluginTranslate, registerPluginLocales, usePluginI18n } from '@/i18n/plugin-i18n'
+import { type PluginTranslate, registerPluginLocales, translatePlugin, usePluginI18n } from '@/i18n/plugin-i18n'
+import { getRuntimeI18nLocale } from '@/i18n/runtime'
 
 import { en, KANBAN_FORK_LOCALES } from './i18n'
 
@@ -48,3 +49,9 @@ export function useKanban(): KanbanText {
 }
 
 export const columnLabel = (k: KanbanText, name: string) => k.colLabel(name)
+
+/** One-shot fork string for non-React call sites (the switcher label, which
+ *  upstream computes in render but outside any fork hook). Its host component
+ *  already re-renders on a locale switch through its own i18n hooks. */
+export const kanbanForkText = (key: keyof typeof en): string =>
+  translatePlugin(KANBAN_FORK_I18N_ID, getRuntimeI18nLocale(), key, [])

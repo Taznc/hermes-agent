@@ -35,6 +35,12 @@ export interface KanbanBoard {
   columns: KanbanColumn[]
   /** Fork backend only. Absent on upstream's `/board` payload. */
   link_edges?: LinkEdge[]
+  /** Upstream payload fields the fork never reads (kept so a full payload
+   *  literal type-checks). */
+  assignees?: string[]
+  latest_event_id?: number
+  now?: number
+  tenants?: string[]
 }
 
 /** One linked task resolved against the board index (`deps.resolveLinks`). */

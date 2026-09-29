@@ -35,8 +35,8 @@ import {
   type VerdictKind
 } from './focus-verdict'
 import { $depChevrons, $depFlow, type FocusDepth } from './state'
-import type { KanbanTask } from './types'
 import { columnLabel, type KanbanText, useKanban } from './text'
+import type { KanbanTask } from './types'
 
 /** Verdict chip colours, one per kind — the same hues the lines use. */
 const VERDICT_TONE: Record<VerdictKind, string> = {
