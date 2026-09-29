@@ -17,7 +17,6 @@ from pathlib import Path
 from typing import Optional
 from typing import TYPE_CHECKING
 import contextlib
-import json
 
 from hermes_cli.worktree_ops import release_lsp_clients
 
@@ -189,68 +188,6 @@ def _cleanup_workspace(conn: sqlite3.Connection, task_id: str) -> None:
         pass  # best-effort — never block completion
 
 
-def _task_owned_branch(task_id: str, branch_name: Optional[str]) -> str:
-    """The one branch a task's worktree cleanup may act on: its recorded
-    ``branch_name``, else the dispatcher's ``wt/<task-id>`` default."""
-    return (branch_name or "").strip() or f"wt/{task_id}"
-
-
-def _git_checked_out_branch(path: Path) -> Optional[str]:
-    """Branch checked out at ``path`` (``symbolic-ref --short HEAD``); ``None``
-    when detached or when git cannot answer — callers must treat that as
-    "not ours"."""
-    return _kb._git_out(path, "symbolic-ref", "--short", "HEAD")
-
-
-def _worktree_owned_by_task(task_id: str, path: Path, branch_name: Optional[str]) -> bool:
-    """Whether the checkout at ``path`` is on the branch the task owns.
-
-    A worktree task's ``workspace_path`` is a *request*, not proof of
-    ownership: a caller can point it at a checkout that already existed
-    before the task did (the served ``next`` tree, a sibling task's worktree,
-    a user's feature branch). Only a tree on the task's own branch may be
-    torn down; anything else is preserved with a WARNING naming both
-    branches. A detached HEAD is never ours."""
-    owned = _task_owned_branch(task_id, branch_name)
-    actual = _git_checked_out_branch(path)
-    if actual == owned and _kanban_worktree_provenance(path) == (task_id, owned):
-        return True
-    _kb._log.warning(
-        "Preserving worktree for task %s: %s is checked out on %s, "
-        "but the task owns branch %s — checkout branch/provenance does not match this task",
-        task_id, path, actual or "<detached HEAD>", owned,
-    )
-    return False
-
-
-def _reject_foreign_worktree_checkout(workspace_path: Optional[str], branch_name: Optional[str]) -> None:
-    """Creation-time guard: a new task cannot adopt ANY existing linked checkout.
-
-    A caller may choose ``branch_name`` to match a foreign tree, so branch
-    equality cannot establish ownership. Re-dispatch resumes the SAME task id,
-    not a newly created task. A repo root is an anchor (dispatch materializes
-    ``<repo>/.worktrees/<id>`` under it) and is left to the resolver; a path
-    that does not exist yet is what the dispatcher creates."""
-    if not workspace_path:
-        return
-    wp = Path(str(workspace_path)).expanduser()
-    if not wp.is_dir() or not (wp / ".git").exists():
-        return
-    if not _is_linked_worktree_checkout(wp):
-        return  # a main checkout: anchor semantics, never adopted verbatim
-    actual = _git_checked_out_branch(wp)
-    owned = (branch_name or "").strip() or None
-    repo_root = _repo_root_for_worktree_target(wp.parent)
-    suggested = os.path.join(str(repo_root) if repo_root else "<repo>", ".worktrees", "<name>")
-    raise ValueError(
-        f"workspace_path {str(workspace_path)!r} is an existing git checkout on branch "
-        f"{actual or '<detached HEAD>'}, which a new task cannot own "
-        f"(task branch: {owned or 'wt/<task-id>'}). A worktree task must not adopt "
-        "someone else's checkout — completing or archiving it would try to remove that "
-        f"tree. Pass a NEW path such as {suggested!r} (the dispatcher creates the worktree)."
-    )
-
-
 def _cleanup_worktree_workspace(
     task_id: str, path: str, branch_name: Optional[str] = None
 ) -> None:
@@ -258,11 +195,7 @@ def _cleanup_worktree_workspace(
     Mirrors the CLI startup pruner (``cli._prune_stale_worktrees``): removal
     requires a clean tree AND every commit reachable from a remote-tracking
     ref; any doubt (dirty, unpushed, unresolvable repo, failing git) preserves
-    it. The tree must also be checked out on the branch the task owns
-    (``branch_name`` or ``wt/<task-id>``) and carry the dispatch-time admin
-    marker for this task — a task whose ``workspace_path`` points at someone
-    else's checkout does not get to remove it. The
-    auto-generated ``wt/<task-id>`` branch is deleted with it; custom
+    it. The auto-generated ``wt/<task-id>`` branch is deleted with it; custom
     branches are kept. Best-effort."""
     try:
         from hermes_cli.worktree_ops import _worktree_has_unpushed_commits, _worktree_is_dirty
@@ -278,8 +211,6 @@ def _cleanup_worktree_workspace(
         repo_root = common.parent
         if _path_key(wp.resolve(strict=False)) == _path_key(repo_root.resolve(strict=False)):
             return  # never remove the main checkout
-        if not _worktree_owned_by_task(task_id, wp, branch_name):
-            return  # someone else's checkout (served tree, sibling task, user branch)
         if _worktree_is_dirty(str(wp)) or _worktree_has_unpushed_commits(str(wp)):
             _kb._log.info(
                 "Preserving worktree for task %s: dirty or unpushed work at %s",
@@ -310,8 +241,6 @@ def _cleanup_worktree_workspace(
         # No --force: git's own dirty guard re-verifies at removal time, so if
         # the tree became dirty since our check (TOCTOU) removal fails safe.
         release_lsp_clients(str(worktree_path))
-        if not _worktree_owned_by_task(task_id, wp, branch_name):
-            return  # branch/marker changed after the earlier ownership check
         result = _git(repo_root, "worktree", "remove", str(wp), timeout=60)
         if result.returncode != 0:
             # Windows can retain a directory handle briefly after cwd changes.
@@ -325,8 +254,8 @@ def _cleanup_worktree_workspace(
             )
             return
         _kb._log.debug("Removed worktree workspace: %s", wp)
-        branch = _task_owned_branch(task_id, branch_name)
-        if branch == f"wt/{task_id}":
+        branch = (branch_name or "").strip() or f"wt/{task_id}"
+        if branch.startswith("wt/"):
             _git(repo_root, "branch", "-D", branch, timeout=30)
     except Exception:
         pass  # best-effort — never block completion
@@ -480,20 +409,6 @@ def _git_common_dir(path: Path) -> Optional[Path]:
 def _git_dir(path: Path) -> Optional[Path]:
     return _git_abs_path(path, "--git-dir")
 
-_KANBAN_PROVENANCE_FILE = "hermes-kanban-owner.json"
-
-def _kanban_worktree_provenance(path: Path) -> Optional[tuple[str, str]]:
-    """Only a dispatcher-created worktree has this git-admin marker. DB rows and
-    branch spelling alone are caller-controlled and cannot authorize teardown."""
-    git_dir = _git_dir(path)
-    if git_dir is None or _git_common_dir(path) == git_dir:
-        return None
-    try:
-        owner = json.loads((git_dir / _KANBAN_PROVENANCE_FILE).read_text(encoding="utf-8"))
-        return owner["task_id"], owner["branch"]
-    except (OSError, ValueError, KeyError, TypeError):
-        return None
-
 
 def _git_current_branch(path: Path) -> Optional[str]:
     return _kb._git_out(path, "branch", "--show-current")
@@ -523,14 +438,12 @@ def _repo_root_for_worktree_target(path: Path) -> Optional[Path]:
         current = current.parent
 
 
-def _ensure_git_worktree(repo_root: Path, target: Path, branch_name: str, task_id: Optional[str] = None) -> None:
+def _ensure_git_worktree(repo_root: Path, target: Path, branch_name: str) -> None:
     """Materialize ``target`` as a linked git worktree under ``repo_root``."""
     target = target.expanduser()
     repo_common = _git_common_dir(repo_root)
     if target.exists() and repo_common is not None and _path_key(_git_common_dir(target)) == _path_key(repo_common):
-        if task_id and _worktree_owned_by_task(task_id, target, branch_name):
-            return
-        raise ValueError(f"Refusing to adopt existing unowned worktree at {target}")
+        return
     target.parent.mkdir(parents=True, exist_ok=True)
     if _git_branch_exists(repo_root, branch_name):
         args = ["worktree", "add", str(target), branch_name]
@@ -542,52 +455,16 @@ def _ensure_git_worktree(repo_root: Path, target: Path, branch_name: str, task_i
         raise RuntimeError(
             f"git worktree add failed for {target} on branch {branch_name}: {stderr}"
         )
-    if task_id:
-        git_dir = _git_dir(target)
-        if git_dir is None or _git_common_dir(target) == git_dir:
-            raise RuntimeError(f"Cannot record worktree ownership for {target}")
-        (git_dir / _KANBAN_PROVENANCE_FILE).write_text(
-            json.dumps({"task_id": task_id, "branch": branch_name}), encoding="utf-8"
-        )
 
 
 def _anchored_worktree(repo_root: Path, task_id: str, branch_name: str) -> tuple[Path, str]:
     """Materialize the canonical ``<repo>/.worktrees/<task-id>`` worktree."""
     target = repo_root / ".worktrees" / task_id
-    _ensure_git_worktree(repo_root, target, branch_name, task_id)
+    _ensure_git_worktree(repo_root, target, branch_name)
     return target, branch_name
 
 
-def _legacy_canonical_worktree_resume(
-    task: Task, path: Path, branch_name: str, conn: Optional[sqlite3.Connection],
-) -> bool:
-    """Resume a pre-marker canonical checkout without claiming teardown ownership.
-
-    The row/path alone is insufficient: require the default task branch, a
-    canonical linked checkout and a *previous* worker-spawn record. No marker
-    is written, so cleanup continues to preserve this tree for manual review.
-    """
-    if conn is None or branch_name != f"wt/{task.id}":
-        return False
-    common = _git_common_dir(path)
-    repo = common.parent if common is not None and common.name == ".git" else None
-    if repo is None or _path_key(path) != _path_key(repo / ".worktrees" / task.id):
-        return False
-    if _kanban_worktree_provenance(path) is not None:
-        return False
-    try:
-        row = conn.execute(
-            "SELECT 1 FROM task_runs WHERE task_id=? AND worker_pid IS NOT NULL "
-            "AND id != COALESCE(?, -1) LIMIT 1",
-            (task.id, task.current_run_id),
-        ).fetchone()
-    except (sqlite3.Error, AttributeError):
-        return False
-    return row is not None
-
-
-def _resolve_worktree_workspace(task: Task, *, board: Optional[str] = None,
-                                conn: Optional[sqlite3.Connection] = None) -> tuple[Path, str]:
+def _resolve_worktree_workspace(task: Task, *, board: Optional[str] = None) -> tuple[Path, str]:
     """Resolve + materialize a linked git worktree for ``task``. With no
     ``task.workspace_path`` the anchor is the board's ``default_workdir`` so
     every worktree lands under a board-owned repo (``<repo>/.worktrees/<id>``)
@@ -628,32 +505,22 @@ def _resolve_worktree_workspace(task: Task, *, board: Optional[str] = None,
 
     if requested.exists() and _is_linked_worktree_checkout(requested):
         actual_branch = _git_current_branch(requested)
-        if actual_branch == branch_name and _worktree_owned_by_task(task.id, requested, branch_name):
+        if actual_branch == branch_name:
             return requested_resolved, actual_branch
-        if actual_branch == branch_name and _kanban_worktree_provenance(requested) is None:
-            if _legacy_canonical_worktree_resume(task, requested, branch_name, conn):
-                _kb._log.warning(
-                    "Resuming legacy unmarked worktree %s for task %s; automatic teardown disabled",
-                    requested, task.id,
-                )
-                return requested_resolved, branch_name
-            # Do not hide an unmarked checkout of this task's branch behind a
-            # fresh fallback: that would strand its work (or adopt a foreign tree).
-            raise ValueError(f"Refusing to dispatch task {task.id} into unowned worktree {requested}; "
-                             "legacy recovery requires a canonical checkout and a prior worker run")
         # The requested path is an existing checkout of a DIFFERENT task's
         # branch (decompose children inherit the root's workspace_path
         # verbatim, so siblings all point here). Reusing it would run this task
         # on the other task's branch — silent cross-task provenance corruption,
         # unsafe under concurrency — so fall back to our own worktree.
-        common = _git_common_dir(requested)
-        fallback_root = common.parent if common and common.name == ".git" else None
+        fallback_root = _repo_root_for_worktree_target(requested.parent)
         if fallback_root is not None:
             fallback = fallback_root / ".worktrees" / task.id
             if _path_key(fallback.resolve(strict=False)) != _path_key(requested_resolved):
-                _ensure_git_worktree(fallback_root, fallback, branch_name, task.id)
+                _ensure_git_worktree(fallback_root, fallback, branch_name)
                 return fallback.resolve(strict=False), branch_name
-        raise ValueError(f"Refusing to dispatch task {task.id} into unowned worktree {requested}")
+        # No repo to anchor a fallback on (or the occupied path IS this task's
+        # own canonical worktree): keep the legacy reuse rather than fail dispatch.
+        return requested_resolved, actual_branch or branch_name
 
     repo_root = _git_toplevel(requested)
     if repo_root is not None and _path_key(requested_resolved) == _path_key(repo_root):
@@ -665,7 +532,7 @@ def _resolve_worktree_workspace(task: Task, *, board: Optional[str] = None,
             f"task {task.id} worktree path {task.workspace_path!r} is not inside a git repo "
             "and does not point at a git repo root"
         )
-    _ensure_git_worktree(repo_root, requested, branch_name, task.id)
+    _ensure_git_worktree(repo_root, requested, branch_name)
     return requested, branch_name
 
 
@@ -722,6 +589,11 @@ def set_workspace_path(conn: sqlite3.Connection, task_id: str, path: Path | str)
 def set_branch_name(conn: sqlite3.Connection, task_id: str, branch_name: str) -> None:
     _set_task_column(conn, task_id, "branch_name", str(branch_name))
 
+
+# >>> FORK ANCHOR: kanban-worktree-ownership <<<
+from hermes_fork.kanban.worktree_ownership import install as _fork_worktree_ownership  # noqa: E402
+_fork_worktree_ownership(__name__)  # a task may only tear down/adopt a worktree it created
+# <<< FORK ANCHOR >>>
 
 # Late-bound origin namespace (see module docstring); imported LAST so this
 # module is fully populated before ``kanban_db`` imports from it.

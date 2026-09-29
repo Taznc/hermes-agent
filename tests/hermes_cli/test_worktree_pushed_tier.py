@@ -68,6 +68,8 @@ def _mk_worktree(repo, name, branch, commit=True, push=False, extra_commit_after
     (repo / ".worktrees").mkdir(exist_ok=True)
     p = repo / ".worktrees" / name
     _run(["git", "worktree", "add", str(p), "-b", branch, "HEAD"], repo)
+    from hermes_fork.worktree_prune_ownership import mark_prune_owned_worktree
+    mark_prune_owned_worktree(str(p), branch)  # fork: the pruner reaps only Hermes-marked trees
     if commit:
         (p / f"{name}.txt").write_text("payload\n")
         _run(["git", "add", f"{name}.txt"], p)
