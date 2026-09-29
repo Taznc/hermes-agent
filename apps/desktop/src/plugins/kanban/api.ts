@@ -204,7 +204,7 @@ export function bindApi(
   socket: Socket,
   notifyDoors?: { os?: PluginOs; t?: PluginTranslate }
 ): () => void {
-  // >>> FORK ANCHOR: kanban-all-boards <<<
+  // >>> FORK ANCHOR: kanban-all-boards <<< seam: host.fork.kanban from '@/fork/kanban/host'
   r = host.fork?.kanban?.routeRest(r, $boardSlug) ?? r
   // <<< FORK ANCHOR >>>
   rest = r

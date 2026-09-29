@@ -335,7 +335,7 @@ export function BoardSwitcher() {
 
   const currentSlug = slug || boards.current
   const current = boards.boards.find(meta => meta.slug === currentSlug)
-  // >>> FORK ANCHOR: kanban-all-boards <<<
+  // >>> FORK ANCHOR: kanban-all-boards <<< seam: host.fork.kanban from '@/fork/kanban/switcher'
   const label = host.fork?.kanban?.boardLabel(slug) || current?.name || current?.slug || k.board
   // <<< FORK ANCHOR >>>
 
