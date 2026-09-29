@@ -7,6 +7,7 @@ import { sessionTileDelegate } from '@/store/session-states'
 import { $archivedSessions, loadArchivedSessions } from '@/store/sidebar-archive'
 
 import { SIDEBAR_GROUP_ACTION_AREA } from './sidebar-group-actions'
+import { forkUi } from './ui-bridge/sdk'
 
 /**
  * `host.fork` — the fork's namespaced, versioned Desktop plugin capabilities
@@ -126,5 +127,7 @@ export const forkHost = {
     version: 1 as const,
     /** Contribution area for group-header actions (see sidebar-group-actions). */
     GROUP_ACTION_AREA: SIDEBAR_GROUP_ACTION_AREA
-  }
+  },
+  /** X02 plugin UI bridge (see ui-bridge/sdk.ts). */
+  ui: forkUi
 }

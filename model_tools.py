@@ -830,6 +830,10 @@ def _execute_tool(function_name: str, function_args: Dict[str, Any], original_ar
         dispatch_kwargs["enabled_tools"] = enabled_tools if enabled_tools is not None else _last_resolved_tool_names
     else:
         dispatch_kwargs["user_task"] = user_task
+    # >>> FORK ANCHOR: plugin-ui-dispatch <<<
+    from hermes_fork.ui.dispatch import plugin_tool_kwargs  # plugin tools only: setdefault ui + clarify_callback
+    dispatch_kwargs = {**plugin_tool_kwargs(function_name), **dispatch_kwargs}
+    # <<< FORK ANCHOR >>>
 
     def _dispatch(next_args: Dict[str, Any]) -> Any:
         from tools.connectors import dispatch_connector_call, is_connector_name

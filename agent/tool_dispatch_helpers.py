@@ -28,6 +28,10 @@ logger = logging.getLogger(__name__)
 
 # Interactive / user-facing tools never run concurrently: any of these in a batch is a barrier.
 _NEVER_PARALLEL_TOOLS = frozenset({"clarify", "manage_connections", "manage_catalog"})
+# >>> FORK ANCHOR: interactive-plugin-tools <<<
+from hermes_fork.ui.interactive import with_interactive_plugin_tools  # noqa: E402
+_NEVER_PARALLEL_TOOLS = with_interactive_plugin_tools(_NEVER_PARALLEL_TOOLS)  # + ctx.fork interactive=True tools
+# <<< FORK ANCHOR >>>
 
 # Read-only tools with no shared mutable session state.
 _PARALLEL_SAFE_TOOLS = frozenset({
