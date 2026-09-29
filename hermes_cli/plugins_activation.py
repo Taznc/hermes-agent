@@ -106,6 +106,10 @@ def activate_plugin_now(name: str, *, in_process: bool = True) -> Dict[str, Any]
     activation: Optional[Dict[str, Any]] = load_and_go_live(name) if in_process else None
     if not in_process:
         activation = (notify_serve_backend(name, Path(get_hermes_home())) or {}).get("activation")
+    # >>> FORK ANCHOR: serve-peer-activation <<<
+    from hermes_fork.serve_peers import notify_serve_peers
+    activation = notify_serve_peers(name, Path(get_hermes_home()), activation, upstream_dialed=not in_process)
+    # <<< FORK ANCHOR >>>
     answer = None
     try:
         from gateway.control_socket import reload_gateway_plugins
