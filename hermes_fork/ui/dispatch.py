@@ -23,7 +23,9 @@ def plugin_owner(name: str) -> str | None:
         manager = get_plugin_manager()
     except Exception:
         return None
-    if name not in manager._plugin_tool_names:
+    # Manager doubles (and a manager built before plugin discovery) may lack the set; the anchor
+    # runs on every tool call, so a missing attribute must mean "not a plugin tool", never a raise.
+    if name not in getattr(manager, "_plugin_tool_names", ()):
         return None
     for plugin_key, registrations in list(manager._ownership_ledger.items()):
         if any(r.kind == "tool" and r.key == name and r.active for r in registrations):
