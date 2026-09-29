@@ -104,6 +104,7 @@ class TestWorktreeLockReaping:
             ["git", "worktree", "add", str(p), "-b", f"hermes/{name}", "HEAD"],
             cwd=repo, capture_output=True,
         )
+        worktree_ops._mark_prune_owned_worktree(str(p), f"hermes/{name}")
         if pid is not None:
             subprocess.run(
                 ["git", "worktree", "lock", "--reason", f"hermes pid={pid}", str(p)],
@@ -123,6 +124,17 @@ class TestWorktreeLockReaping:
         wt = self._mk(cli, git_repo, "hermes-live", pid=os.getpid())
         cli._prune_stale_worktrees(str(git_repo))
         assert wt.exists(), "live-locked worktree (this pid) must never be reaped"
+
+    def test_foreign_lock_on_marked_tree_survives_prune(self, git_repo):
+        import cli
+        wt = self._mk(cli, git_repo, "hermes-deployment", age_h=500)
+        subprocess.run(["git", "worktree", "lock", "--reason", "served deployment", str(wt)],
+                       cwd=git_repo, check=True, capture_output=True)
+        cli._prune_stale_worktrees(str(git_repo))
+        assert wt.exists()
+        listing = subprocess.run(["git", "worktree", "list", "--porcelain"], cwd=git_repo,
+                                 check=True, capture_output=True, text=True).stdout
+        assert "locked served deployment" in listing
 
     def test_dead_locked_clean_is_reaped(self, git_repo):
         import cli
@@ -157,6 +169,125 @@ class TestWorktreeLockReaping:
         assert wt.exists(), "dirty worktree must survive even past the 72h tier"
 
 
+class TestPrunerBranchOwnership:
+    """The startup pruner only reaps trees on branches Hermes minted for scratch use.
+
+    A clean, fully-pushed, unlocked tree under ``.worktrees/`` that is checked out
+    on ``next``/``main``/a user branch/a detached HEAD looks *exactly* like a
+    reapable scratch tree to the age/dirty/unpushed gates — but it is what a
+    served or hand-managed checkout looks like too (the kanban incident: a
+    served ``next`` tree removed with every guard passing). Ownership is
+    decided by branch prefix (``HERMES_OWNED_BRANCH_PREFIXES``); anything else
+    is preserved at any age.
+    """
+
+    @staticmethod
+    def _age(path, hours):
+        import time
+        t = time.time() - (hours * 3600)
+        os.utime(path, (t, t))
+
+    def _mk_on(self, repo, name, branch=None, detach=False, age_h=500):
+        p = repo / ".worktrees" / name
+        (repo / ".worktrees").mkdir(exist_ok=True)
+        if detach:
+            args = ["git", "worktree", "add", "--detach", str(p), "HEAD"]
+        elif branch:
+            # Pre-existing long-lived branch, fully "pushed" (same commit as origin/main).
+            subprocess.run(["git", "branch", branch, "HEAD"], cwd=repo, capture_output=True)
+            args = ["git", "worktree", "add", str(p), branch]
+        else:
+            raise AssertionError("branch or detach required")
+        r = subprocess.run(args, cwd=repo, capture_output=True, text=True)
+        assert r.returncode == 0, r.stderr
+        self._age(p, age_h)
+        return p
+
+    def test_tree_on_trunk_branch_never_reaped(self, git_repo):
+        import cli
+        served = self._mk_on(git_repo, "served-next", branch="next")
+        assert not worktree_ops._worktree_is_dirty(str(served))
+        assert not worktree_ops._worktree_has_unpushed_commits(str(served)), (
+            "precondition: every legacy gate passes — only ownership can save this tree"
+        )
+        cli._prune_stale_worktrees(str(git_repo))
+        assert served.exists(), "a tree checked out on `next` is not Hermes scratch — never reap"
+        assert (served / "README.md").exists()
+        heads = subprocess.run(["git", "branch", "--list", "next"], cwd=git_repo,
+                               capture_output=True, text=True).stdout
+        assert "next" in heads
+
+    def test_tree_on_user_feature_branch_never_reaped(self, git_repo):
+        import cli
+        wt = self._mk_on(git_repo, "my-feature", branch="feature/handmade")
+        cli._prune_stale_worktrees(str(git_repo))
+        assert wt.exists()
+
+    def test_hand_managed_tree_with_hermes_prefix_is_preserved(self, git_repo):
+        import cli
+        wt = self._mk_on(git_repo, "hermes-handmade", branch="hermes/hermes-handmade")
+        cli._prune_stale_worktrees(str(git_repo))
+        assert wt.exists(), "a branch prefix is not evidence Hermes created this checkout"
+
+    def test_hand_managed_orphan_branch_is_not_deleted(self, git_repo):
+        import cli
+        subprocess.run(["git", "branch", "hermes/hermes-handmade", "HEAD"], cwd=git_repo,
+                       check=True, capture_output=True)
+        cli._prune_stale_worktrees(str(git_repo))
+        assert subprocess.run(["git", "show-ref", "--verify", "refs/heads/hermes/hermes-handmade"],
+                              cwd=git_repo, capture_output=True).returncode == 0
+
+    def test_lock_added_after_classification_is_preserved(self, git_repo):
+        wt = self._mk_on(git_repo, "hermes-lock-race", branch="hermes/hermes-lock-race")
+        worktree_ops._mark_prune_owned_worktree(str(wt), "hermes/hermes-lock-race")
+        subprocess.run(["git", "worktree", "lock", "--reason", "served deployment", str(wt)],
+                       cwd=git_repo, check=True, capture_output=True)
+        worktree_ops._reap_prune_verdicts(str(git_repo), [(wt, 0, True, "reap", None)], 1)
+        assert wt.exists()
+        assert "locked served deployment" in subprocess.run(
+            ["git", "worktree", "list", "--porcelain"], cwd=git_repo, check=True,
+            capture_output=True, text=True).stdout
+
+    def test_reap_rechecks_branch_after_classification(self, git_repo):
+        wt = self._mk_on(git_repo, "hermes-race", branch="hermes/hermes-race")
+        worktree_ops._mark_prune_owned_worktree(str(wt), "hermes/hermes-race")
+        # Classification approved the original branch. Before serial mutation,
+        # the checkout changed to a served (fully pushed) branch.
+        subprocess.run(["git", "branch", "next", "HEAD"], cwd=git_repo, check=True, capture_output=True)
+        subprocess.run(["git", "switch", "next"], cwd=wt, check=True, capture_output=True)
+        worktree_ops._reap_prune_verdicts(str(git_repo), [(wt, 0, True, "reap", None)], 1)
+        assert wt.exists() and worktree_ops._worktree_symbolic_branch(str(wt)) == "next"
+
+    def test_detached_head_tree_never_reaped(self, git_repo):
+        import cli
+        wt = self._mk_on(git_repo, "pinned", detach=True)
+        cli._prune_stale_worktrees(str(git_repo))
+        assert wt.exists()
+
+    def test_hermes_owned_prefixes_still_reaped(self, git_repo):
+        import cli
+        trees = {
+            "hermes-scratch": "hermes/hermes-scratch",
+            "t_named_kanban": "wt/t_named_kanban",
+            "subagent-abc": "hermes-subagent/subagent-abc",
+        }
+        paths = {n: self._mk_on(git_repo, n, branch=b) for n, b in trees.items()}
+        for name, path in paths.items():
+            worktree_ops._mark_prune_owned_worktree(str(path), trees[name])
+        cli._prune_stale_worktrees(str(git_repo))
+        for name, p in paths.items():
+            assert not p.exists(), f"{name} on {trees[name]} is Hermes scratch and should be reaped"
+
+    def test_ownership_predicate(self, git_repo):
+        served = self._mk_on(git_repo, "pred-next", branch="next")
+        owned, branch = worktree_ops._worktree_on_hermes_owned_branch(str(served))
+        assert (owned, branch) == (False, "next")
+        detached = self._mk_on(git_repo, "pred-detached", detach=True)
+        assert worktree_ops._worktree_on_hermes_owned_branch(str(detached)) == (False, None)
+        mine = self._mk_on(git_repo, "pred-wt", branch="wt/pred")
+        assert worktree_ops._worktree_on_hermes_owned_branch(str(mine)) == (True, "wt/pred")
+
+
 class TestWorktreeLockPredicate:
     """_worktree_lock_is_live classification (real cli helper)."""
 
@@ -183,9 +314,13 @@ class TestWorktreeLockPredicate:
         assert worktree_ops._worktree_lock_is_live(str(git_repo), str(p)) is None
 
 
-    def test_foreign_lock_reason_returns_dead(self, git_repo):
+    def test_foreign_lock_reason_is_preserved(self, git_repo):
         p = self._mk_locked(git_repo, "hermes-foreign", "some other tool")
-        assert worktree_ops._worktree_lock_is_live(str(git_repo), str(p)) == "dead"
+        assert worktree_ops._worktree_lock_is_live(str(git_repo), str(p)) == "live"
+
+    def test_embedded_pid_in_foreign_reason_is_preserved(self, git_repo):
+        p = self._mk_locked(git_repo, "hermes-foreign-pid", "served: hermes pid=999999")
+        assert worktree_ops._worktree_lock_is_live(str(git_repo), str(p)) == "live"
 
     def test_bad_repo_root_fails_safe_to_live(self, tmp_path):
         # Not a git repo -> git query fails -> must report "live" (never delete)
@@ -217,6 +352,7 @@ class TestWidenedPruner:
             ["git", "worktree", "add", str(p), "-b", f"wt/{name}", "HEAD"],
             cwd=repo, capture_output=True,
         )
+        worktree_ops._mark_prune_owned_worktree(str(p), f"wt/{name}")
         sha = None
         if commit:
             (p / "work.txt").write_text(f"work for {name}\n")
@@ -532,6 +668,7 @@ class TestShallowCloneDeepening:
             ["git", "worktree", "add", str(wt), "-b", "hermes/hermes-shallowstuck", "HEAD"],
             clone,
         )
+        worktree_ops._mark_prune_owned_worktree(str(wt), "hermes/hermes-shallowstuck")
 
         self._advance_upstream(up, "B")
         # Same shape as the updater: shallow fetch of the new tip only.
@@ -645,6 +782,7 @@ class TestPrMergedEscapeHatch:
             ["git", "worktree", "add", str(p), "-b", f"hermes/{name}", "HEAD"],
             cwd=repo, capture_output=True,
         )
+        worktree_ops._mark_prune_owned_worktree(str(p), f"hermes/{name}")
         (p / "salvaged.txt").write_text("diff that was reworked during salvage\n")
         subprocess.run(["git", "add", "salvaged.txt"], cwd=p, capture_output=True)
         subprocess.run(["git", "commit", "-m", "salvaged work"], cwd=p, capture_output=True)

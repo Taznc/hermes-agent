@@ -109,12 +109,15 @@ def test_resolve_worktree_falls_back_when_path_occupied(kanban_home, tmp_path):
     occupied = _add_worktree(repo, repo / ".worktrees" / "sibling", "wt/sibling")
 
     with kbc.connect() as conn:
-        tid = kb.create_task(
-            conn,
-            title="second sibling",
-            workspace_kind="worktree",
-            workspace_path=str(occupied),  # inherited shared/stale path
-        )
+        # ``create_task`` now refuses a worktree path that is someone else's
+        # checkout; this exercises the dispatch-time heal for rows that already
+        # carry a shared/stale path, so seed the legacy row directly.
+        tid = kb.create_task(conn, title="second sibling")
+        with kb.write_txn(conn):
+            conn.execute(
+                "UPDATE tasks SET workspace_kind='worktree', workspace_path=? WHERE id=?",
+                (str(occupied), tid),
+            )
         task = kb.get_task(conn, tid)
 
     workspace, branch = kbw._resolve_worktree_workspace(task)
