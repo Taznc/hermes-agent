@@ -180,6 +180,22 @@ def test_workspace_default_is_honored(isolated):
     assert ws.agent_workspace(_agent(cwd="/"), {"workspace_from_cwd": True, "workspace_default": 3}) == "hermes"
 
 
+def test_workspace_prefix_applies_to_resolved_identity_only(isolated):
+    cfg = {"workspace_from_cwd": True, "workspace_prefix": "project-", "workspace_default": "hermes"}
+    repo = _repo(isolated.work / "my-project")
+    assert ws.agent_workspace(_agent(cwd=str(repo)), cfg) == "project-my-project"
+    # The default is a bank name in its own right: never prefixed.
+    assert ws.agent_workspace(_agent(cwd=str(isolated.home)), cfg) == "hermes"
+    assert ws.agent_workspace(_agent(cwd=str(isolated.hermes_home / "x")), cfg) == "hermes"
+
+
+def test_workspace_prefix_blank_or_non_string_is_ignored(isolated):
+    repo = _repo(isolated.work / "my-project")
+    for raw in ("", "   ", None, 7):
+        cfg = {"workspace_from_cwd": True, "workspace_prefix": raw}
+        assert ws.agent_workspace(_agent(cwd=str(repo)), cfg) == "my-project"
+
+
 def test_dotfiles_repo_at_home_is_not_a_workspace(isolated):
     (isolated.home / ".git").mkdir()
     assert ws.agent_workspace(_agent(cwd=str(isolated.home)), ON) == "hermes"
