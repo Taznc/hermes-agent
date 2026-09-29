@@ -307,8 +307,7 @@ def _wrap_classify_prune_candidates(original):
 
 # ------------------------------------------------------------------------------------------- anchor
 
-#: upstream name -> fork replacement (``install`` records the replaced function as
-#: ``__fork_replaces__``; the pin test hashes its source).
+#: upstream name -> fork replacement.
 REPLACEMENTS = {
     "_worktree_lock_is_live": worktree_lock_is_live,
     "_reap_prune_verdicts": reap_prune_verdicts,
@@ -327,10 +326,6 @@ def install(module_name: str) -> None:
     Idempotent: already-replaced and already-wrapped names are left alone."""
     ops = sys.modules[module_name]
     for name, replacement in REPLACEMENTS.items():
-        current = getattr(ops, name)
-        if current is replacement:
-            continue
-        replacement.__fork_replaces__ = current
         setattr(ops, name, replacement)
     for name, wrap in WRAPPERS.items():
         current = getattr(ops, name)

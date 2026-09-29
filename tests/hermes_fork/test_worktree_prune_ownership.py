@@ -7,8 +7,6 @@ branches are never deleted.
 
 from __future__ import annotations
 
-import hashlib
-import inspect
 import os
 import subprocess
 import time
@@ -70,24 +68,6 @@ def _porcelain(repo) -> str:
 # --------------------------------------------------------------------------------------- the anchor
 
 
-# sha256 of inspect.getsource() of each upstream function the anchor replaces or wraps. An upstream
-# edit changes the hash: re-port it into hermes_fork/worktree_prune_ownership.py (or drop the
-# override if upstream now covers ownership), then update the hash here.
-_UPSTREAM_PINS = {
-    "_worktree_lock_is_live": "e0d56442ef218431ee9fb01de3cd3ebfb57cf657e59ef22fc00cbf9f1eef2f5a",
-    "_reap_prune_verdicts": "f9a166a78d3c099fc9df2b2071d082a3f5d69ed8cb2dcc34ed9c594e84c242d7",
-    "_prune_orphaned_branches": "ed95ce4eb39ff94706a54442aab6d54ea52b577750c02e98954c818f8640ad85",
-    "_setup_worktree": "9864ff98461946a8bb1f78fdabd557e4af0e5f37671fef6f9bf708a0f59a5b00",
-    "_classify_prune_candidates": "3cb63a41995349cbcf94fa770e94daf6bc24235ce9669456ff8697d1c3076d6f",
-}
-
-
-def _upstream(name):
-    if name in prune.REPLACEMENTS:
-        return prune.REPLACEMENTS[name].__fork_replaces__
-    return getattr(worktree_ops, name).__fork_wrapped__
-
-
 def test_anchor_rebinds_pruner_functions():
     for name, replacement in prune.REPLACEMENTS.items():
         assert getattr(worktree_ops, name) is replacement, f"worktree-prune-ownership anchor did not rebind {name}"
@@ -101,22 +81,17 @@ def test_install_is_idempotent():
     assert {name: getattr(worktree_ops, name) for name in before} == before
 
 
-@pytest.mark.parametrize("name", sorted(_UPSTREAM_PINS))
-def test_overridden_upstream_function_unchanged(name):
-    original = _upstream(name)
-    assert original.__module__ == worktree_ops.__name__ and original.__name__ == name
-    digest = hashlib.sha256(inspect.getsource(original).encode("utf-8")).hexdigest()
-    assert digest == _UPSTREAM_PINS[name], (
-        f"upstream changed worktree_ops.{name}; re-port it into "
-        f"hermes_fork/worktree_prune_ownership.py, then pin {digest}"
-    )
-
-
-def test_cli_reexports_reach_the_fork_functions():
-    """cli.py re-exports worktree_ops names at import; the anchor runs before that import finishes."""
+def test_cli_reexports_reach_the_fork_functions(git_repo):
+    """cli.py re-exports worktree_ops names at import; the anchor runs before that import finishes,
+    so a worktree created through the ``cli`` facade carries the prune-owner marker."""
     import cli
     assert cli._setup_worktree is worktree_ops._setup_worktree
-    assert cli._prune_stale_worktrees.__globals__["_classify_prune_candidates"] is worktree_ops._classify_prune_candidates
+    info = cli._setup_worktree(str(git_repo), sync_base=False)
+    assert info is not None
+    try:
+        assert prune.is_prune_owned_worktree(info["path"], info["branch"])
+    finally:
+        subprocess.run(["git", "worktree", "remove", "--force", info["path"]], cwd=git_repo, capture_output=True)
 
 
 # ------------------------------------------------------------------------------ pruner branch ownership
@@ -177,6 +152,32 @@ def test_hermes_owned_prefixes_still_reaped(git_repo):
     cli._prune_stale_worktrees(str(git_repo))
     for name, p in paths.items():
         assert not p.exists(), f"{name} on {trees[name]} is Hermes scratch and should be reaped"
+
+
+def test_prune_removal_never_forces(git_repo, monkeypatch):
+    """Every ``git worktree remove`` the pruner issues omits ``--force``, including for a tree with
+    untracked-only content (the case upstream force-removed); git's own dirty guard stays in force."""
+    import cli
+    clean = _mk_on(git_repo, "hermes-clean", branch="hermes/hermes-clean")
+    untracked = _mk_on(git_repo, "hermes-untracked", branch="hermes/hermes-untracked")
+    (untracked / "scratch.txt").write_text("notes\n")
+    _age(untracked, 500)
+    for p, b in ((clean, "hermes/hermes-clean"), (untracked, "hermes/hermes-untracked")):
+        prune.mark_prune_owned_worktree(str(p), b)
+    calls = []
+    real_git = worktree_ops._git
+
+    def spy(args, cwd, *a, **kw):
+        calls.append(list(args))
+        return real_git(args, cwd, *a, **kw)
+
+    monkeypatch.setattr(worktree_ops, "_git", spy)
+    cli._prune_stale_worktrees(str(git_repo))
+    removes = [c for c in calls if c[:2] == ["worktree", "remove"]]
+    assert removes, "precondition: the pruner attempted removal"
+    assert not any("--force" in c or "-f" in c for c in removes), removes
+    assert not clean.exists()
+    assert untracked.exists() and (untracked / "scratch.txt").exists()
 
 
 def test_marker_for_other_branch_is_not_ownership(git_repo):

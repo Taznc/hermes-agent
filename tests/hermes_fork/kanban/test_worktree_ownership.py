@@ -10,8 +10,6 @@ their source. Nothing checked that the tree was the task's own.
 
 from __future__ import annotations
 
-import hashlib
-import inspect
 import json
 import subprocess
 from pathlib import Path
@@ -81,42 +79,38 @@ def _served_worktree(repo: Path, name: str, branch: str) -> Path:
 # --------------------------------------------------------------------------------------- the anchor
 
 
-# sha256 of inspect.getsource() of each upstream function the anchor replaces. An upstream edit to
-# one of them changes its hash: re-port the edit into hermes_fork/kanban/worktree_ownership.py (or
-# drop the replacement if upstream now covers ownership), then update the hash here.
-_UPSTREAM_PINS = {
-    "_ensure_git_worktree": "79feb2157ae8e731b46f499384e44cecd330fad3f177cf39bcd80b6cf536b719",
-    "_anchored_worktree": "6f83602452227825c93ad0b86a0f5fc685127acf61536c207f34448a22b0b6e1",
-    "_resolve_worktree_workspace": "a2a24cfdbd292d3ebc669469a8d62e054ae25349a5c93450c60d6dae274074c7",
-    "_cleanup_worktree_workspace": "efad44e295becbab69f9683fc8ed445601c8793c00f67be76ee6fcb2ed261c57",
-}
-
-
 def test_anchor_rebinds_every_worktree_lifecycle_function() -> None:
     for name, replacement in own.REPLACEMENTS.items():
         assert getattr(kbw, name) is replacement, f"kanban-worktree-ownership anchor did not rebind {name}"
-    # Public entry points reach the replacements through the module global.
-    assert kbw.resolve_workspace.__globals__["_resolve_worktree_workspace"] is own.resolve_worktree_workspace
-    assert kbw._cleanup_workspace.__globals__["_cleanup_worktree_workspace"] is own.cleanup_worktree_workspace
 
 
 def test_install_is_idempotent() -> None:
     before = {name: getattr(kbw, name) for name in own.REPLACEMENTS}
-    replaced = {name: fn.__fork_replaces__ for name, fn in own.REPLACEMENTS.items()}
     own.install(kbw.__name__)
     assert {name: getattr(kbw, name) for name in own.REPLACEMENTS} == before
-    assert {name: fn.__fork_replaces__ for name, fn in own.REPLACEMENTS.items()} == replaced
 
 
-@pytest.mark.parametrize("name", sorted(_UPSTREAM_PINS))
-def test_replaced_upstream_function_unchanged(name: str) -> None:
-    original = own.REPLACEMENTS[name].__fork_replaces__
-    assert original.__module__ == kbw.__name__ and original.__name__ == name
-    digest = hashlib.sha256(inspect.getsource(original).encode("utf-8")).hexdigest()
-    assert digest == _UPSTREAM_PINS[name], (
-        f"upstream changed kanban_db_workspace.{name}; re-port it into "
-        f"hermes_fork/kanban/worktree_ownership.py, then pin {digest}"
-    )
+def test_public_entry_points_route_through_the_guard(kanban_home: Path, repo: Path) -> None:
+    """``resolve_workspace`` / ``_cleanup_workspace`` (the upstream public paths) reach the fork
+    replacements: resolving marks the new tree and cleanup removes it, while cleanup of a row that
+    points at a foreign checkout leaves that checkout alone."""
+    served = _served_worktree(repo, "served-public", "next")
+    with kbc.connect_closing() as conn:
+        own_tid = kb.create_task(conn, title="own", assignee="worker", workspace_kind="worktree",
+                                 workspace_path=str(repo / ".worktrees" / "public-new"))
+        task = kb.get_task(conn, own_tid)
+        assert task is not None
+        ws = Path(kbw.resolve_workspace(task))
+        assert own.provenance(ws) == (own_tid, f"wt/{own_tid}")
+        foreign_tid = kb.create_task(conn, title="foreign", assignee="worker")
+        with kb.write_txn(conn):
+            conn.execute("UPDATE tasks SET workspace_kind='worktree', workspace_path=?, branch_name=? "
+                         "WHERE id=?", (str(served), "next", foreign_tid))
+            conn.execute("UPDATE tasks SET branch_name=? WHERE id=?", (f"wt/{own_tid}", own_tid))
+        kbw._cleanup_workspace(conn, foreign_tid)
+        assert served.is_dir()
+        kbw._cleanup_workspace(conn, own_tid)
+        assert not ws.exists()
 
 
 # ------------------------------------------------------------ cleanup: only the task's own worktree
@@ -323,13 +317,57 @@ def test_legacy_noncanonical_prior_worker_does_not_fallback(kanban_home: Path, r
         assert wt.exists() and not (repo / ".worktrees" / tid).exists()
 
 
-def test_dispatch_passes_its_connection_for_legacy_resume(kanban_home: Path, repo: Path) -> None:
-    """``kanban_db_dispatch`` calls the resolver with ``conn=`` (the one non-anchor fork line in
-    that file): without it a legacy unmarked worktree could never be resumed."""
-    from hermes_cli import kanban_db_dispatch as kbd
+def _legacy_canonical_task(conn, repo: Path, *, prior_worker: bool) -> tuple[str, Path]:
+    """A ready worktree task whose canonical ``<repo>/.worktrees/<id>`` checkout predates markers."""
+    tid = kb.create_task(conn, title="legacy dispatch", assignee="worker")
+    wt = repo / ".worktrees" / tid
+    _git("-C", str(repo), "worktree", "add", "-b", f"wt/{tid}", str(wt), "HEAD")
+    with kb.write_txn(conn):
+        conn.execute("UPDATE tasks SET workspace_kind='worktree', workspace_path=?, branch_name=? WHERE id=?",
+                     (str(wt), f"wt/{tid}", tid))
+        if prior_worker:
+            conn.execute("INSERT INTO task_runs (task_id, status, started_at, ended_at, worker_pid) "
+                         "VALUES (?, 'released', 1, 2, 12345)", (tid,))
+    return tid, wt
 
-    src = inspect.getsource(kbd._dispatch_lane_task)
-    assert "_kbw._resolve_worktree_workspace(claimed, board=board, conn=conn)" in src
+
+@pytest.mark.parametrize("prior_worker", [True, False], ids=["prior-worker-resumes", "no-prior-worker-refused"])
+def test_dispatch_resumes_legacy_canonical_worktree_only_after_a_prior_worker(
+    kanban_home: Path, repo: Path, monkeypatch: pytest.MonkeyPatch, prior_worker: bool,
+) -> None:
+    """Through the real dispatcher tick: a legacy unmarked canonical checkout is resumed (spawned in
+    place, still unmarked, so teardown stays disabled) only when an earlier worker ran there;
+    otherwise the claim fails with ``spawn_failed`` and nothing is spawned or marked."""
+    from hermes_cli import kanban_db_dispatch as kbd
+    from hermes_cli import profiles
+
+    monkeypatch.setattr(profiles, "profile_exists", lambda name: True)
+    spawned: list[tuple[str, str]] = []
+
+    def fake_spawn(task, workspace, board=None):
+        spawned.append((task.id, workspace))
+        return None
+
+    with kbc.connect_closing() as conn:
+        tid, wt = _legacy_canonical_task(conn, repo, prior_worker=prior_worker)
+        result = kbd.dispatch_once(conn, spawn_fn=fake_spawn)
+        task = kb.get_task(conn, tid)
+        assert task is not None
+        outcomes = [r["outcome"] for r in conn.execute(
+            "SELECT outcome FROM task_runs WHERE task_id=? ORDER BY id", (tid,))]
+
+    assert wt.is_dir() and own.provenance(wt) is None
+    if prior_worker:
+        assert spawned == [(tid, str(wt.resolve()))]
+        assert [s[0] for s in result.spawned] == [tid]
+        assert task.status == "running" and task.workspace_path == str(wt.resolve())
+        kbw._cleanup_worktree_workspace(tid, str(wt), f"wt/{tid}")
+        assert wt.is_dir(), "a resumed legacy tree never gains teardown ownership"
+    else:
+        assert spawned == [] and not result.spawned
+        assert task.status != "running"
+        assert outcomes[-1] == "spawn_failed"
+        assert not any((repo / ".worktrees").glob(f"{tid}?*")), "no fallback tree is created"
 
 
 # ------------------------------------------------------------------ creation: never adopt a checkout

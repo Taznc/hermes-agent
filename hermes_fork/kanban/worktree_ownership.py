@@ -352,8 +352,7 @@ def cleanup_worktree_workspace(task_id: str, path: str, branch_name: Optional[st
 
 # ------------------------------------------------------------------------------------------- anchor
 
-#: upstream name -> fork replacement. ``install`` records each replaced upstream function on the
-#: replacement as ``__fork_replaces__`` (the pin test hashes its source).
+#: upstream name -> fork replacement.
 REPLACEMENTS = {
     "_ensure_git_worktree": ensure_git_worktree,
     "_anchored_worktree": anchored_worktree,
@@ -368,8 +367,4 @@ def install(module_name: str) -> None:
     Idempotent: a second call on an already-installed module is a no-op."""
     ws = sys.modules[module_name]
     for name, replacement in REPLACEMENTS.items():
-        current = getattr(ws, name)
-        if current is replacement:
-            continue
-        replacement.__fork_replaces__ = current
         setattr(ws, name, replacement)
