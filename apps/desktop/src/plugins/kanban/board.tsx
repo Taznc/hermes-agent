@@ -260,7 +260,7 @@ function Card({
   const summary = task.latest_summary || task.body
   const fallback = useDefaultAssignee()
   const arc = arcState(task, fallback)
-  // FORK ANCHOR: kanban-focus — this + `fork ??` below: seam from '@/fork/kanban/card-frame'
+  // >>> FORK ANCHOR: kanban-focus <<< (+ `fork ??` below) seam: host.fork.kanban from '@/fork/kanban/card-frame'
   const fork = host.fork?.kanban?.frameCard(Card, { columns, onDelete, onMove, onOpen, onToggleSelect, selected, task })
 
   return fork ?? (
