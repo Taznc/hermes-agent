@@ -9,30 +9,30 @@
 //
 // That property is invisible to a DOM assertion: the transcript looks
 // identical either way. So this counts renders instead. AssistantMessageBody
-// is the root component, and `useTapbackDoubleClick` is called by it and by
-// nothing else in the tree, which makes it an exact render counter for the
-// root without needing to export or wrap an internal component.
+// is the root component, and it is the only caller of `useEnterAnimation`
+// keyed `assistant-message:*`, which makes that call an exact render counter
+// for the root without needing to export or wrap an internal component.
 import { AssistantRuntimeProvider, type ThreadMessage, useExternalStoreRuntime } from '@assistant-ui/react'
 import { cleanup, render, waitFor } from '@testing-library/react'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
-import type * as messageReactionsModule from '@/components/assistant-ui/thread/use-message-reactions'
+import type * as enterAnimationModule from '@/lib/use-enter-animation'
 
 import { Thread } from '.'
 
 let rootRenders = 0
 
-vi.mock('@/components/assistant-ui/thread/use-message-reactions', async importActual => {
-  const actual = await importActual<typeof messageReactionsModule>()
+vi.mock('@/lib/use-enter-animation', async importActual => {
+  const actual = await importActual<typeof enterAnimationModule>()
 
   return {
     ...actual,
-    useTapbackDoubleClick: (messageId: string, role: 'assistant' | 'user') => {
-      if (role === 'assistant') {
+    useEnterAnimation: (enabled: boolean, animationKey?: string) => {
+      if (animationKey?.startsWith('assistant-message:')) {
         rootRenders += 1
       }
 
-      return actual.useTapbackDoubleClick(messageId, role)
+      return actual.useEnterAnimation(enabled, animationKey)
     }
   }
 })

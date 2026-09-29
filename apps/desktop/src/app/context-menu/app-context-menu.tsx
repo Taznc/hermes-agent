@@ -357,15 +357,30 @@ function domSections(open: Extract<OpenContextMenu, { kind: 'dom' }>, t: Transla
         shortcut={EDIT_SHORTCUTS.selectAll}
       />
     ])
-  } else if (target.selectionText) {
-    sections.push([
-      <Item
-        icon="copy"
-        key="selection-copy"
-        label={t.common.copy}
-        onSelect={() => void writeClipboardText(target.selectionText)}
-      />
-    ])
+  } else if (target.selectionText || target.messageText) {
+    // Selection first (what you highlighted is what you meant), then the whole
+    // message as the no-selection fallback — right-click a reply, Copy message,
+    // done, without dragging across a long answer.
+    sections.push(
+      [
+        target.selectionText ? (
+          <Item
+            icon="copy"
+            key="selection-copy"
+            label={t.common.copy}
+            onSelect={() => void writeClipboardText(target.selectionText)}
+          />
+        ) : null,
+        target.messageText ? (
+          <Item
+            icon="copy"
+            key="message-copy"
+            label={t.assistant.thread.copyMessage}
+            onSelect={() => void writeClipboardText(target.messageText)}
+          />
+        ) : null
+      ].filter(Boolean)
+    )
   }
 
   return sections

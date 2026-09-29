@@ -4974,6 +4974,7 @@ export const en: Translations = {
       refresh: 'Refresh',
       moreActions: 'More actions',
       branchNewChat: 'Branch in new chat',
+      copyMessage: 'Copy message',
       react: 'React',
       dismissError: 'Dismiss error',
       errorLayers: {

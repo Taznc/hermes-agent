@@ -3218,6 +3218,7 @@ export const ar = defineLocale({
       refresh: 'تحديث',
       moreActions: 'إجراءات إضافية',
       branchNewChat: 'تفريع إلى محادثة جديدة',
+      copyMessage: 'نسخ الرسالة',
       react: 'تفاعل',
       dismissError: 'تجاهل الخطأ',
       errorLayers: {

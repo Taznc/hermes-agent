@@ -1,4 +1,4 @@
-import { ActionBarPrimitive, BranchPickerPrimitive, MessagePrimitive, useAuiState } from '@assistant-ui/react'
+import { ActionBarPrimitive, BranchPickerPrimitive, MessagePrimitive, useAui, useAuiState } from '@assistant-ui/react'
 import { type FC, type ReactNode, useCallback, useEffect, useRef, useState } from 'react'
 
 import { DirectiveContent } from '@/components/assistant-ui/directive-text'
@@ -14,6 +14,7 @@ import { type RestoreMessageTarget } from '@/components/assistant-ui/thread/type
 import { useMessageReactions } from '@/components/assistant-ui/thread/use-message-reactions'
 import { UserMessageText } from '@/components/assistant-ui/thread/user-message-text'
 import { Codicon } from '@/components/ui/codicon'
+import { writeClipboardText } from '@/components/ui/copy-button'
 import { Tip } from '@/components/ui/tooltip'
 import { useResizeObserver } from '@/hooks/use-resize-observer'
 import { useI18n } from '@/i18n'
@@ -32,13 +33,107 @@ export function hasTextSelection(): boolean {
   return Boolean(selection && !selection.isCollapsed && selection.toString().length > 0)
 }
 
+/**
+ * True when this click is part of a text-selection gesture, so the bubble's
+ * own action (open the editor / toggle the clamp) must stand down.
+ *
+ * Two cases, and the second is the one a plain `hasTextSelection()` misses:
+ * a finished drag-select leaves a live highlight, but a DOUBLE-click's
+ * word-select is applied by the browser AFTER the second `click` dispatches —
+ * at handler time the selection still reads collapsed. `detail >= 2` catches
+ * the double/triple click by the gesture itself, so double-clicking a word in
+ * your own prompt selects it for copying instead of opening the edit composer.
+ */
+export function isSelectionClick(event: { detail: number }): boolean {
+  return event.detail >= 2 || hasTextSelection()
+}
+
+/**
+ * How long a lone mouse click on a user bubble waits before opening the edit
+ * composer, so the second click of a double-click can cancel it. Same pattern
+ * (and order of magnitude) as the review file tree's single/double split.
+ */
+export const EDIT_CLICK_DELAY_MS = 300
+
+/**
+ * Open the edit composer from a bubble click without eating double/triple
+ * clicks.
+ *
+ * `isSelectionClick` alone is not enough: the FIRST click of a double-click
+ * has `detail === 1` and nothing selected yet, so an immediate beginEdit swaps
+ * the bubble for the editor before the second click lands and the word-select
+ * never happens. A mouse click (detail 1) therefore defers by one double-click
+ * interval, and any follow-up click (detail >= 2) cancels it. Keyboard
+ * activation (Enter/Space → click with detail 0) opens at once. If a drag
+ * produced a highlight by the time the timer fires, it stands down too.
+ */
+function useDeferredSingleClickEdit(): {
+  canEdit: boolean
+  onClick: (event: { detail: number; preventDefault: () => void; stopPropagation: () => void }) => void
+} {
+  const aui = useAui()
+  const isEditing = useAuiState(s => s.composer.isEditing)
+  const timerRef = useRef<null | ReturnType<typeof setTimeout>>(null)
+
+  const cancel = useCallback(() => {
+    if (timerRef.current !== null) {
+      clearTimeout(timerRef.current)
+      timerRef.current = null
+    }
+  }, [])
+
+  useEffect(() => cancel, [cancel])
+
+  const open = useCallback(() => {
+    triggerHaptic('selection')
+    // Escape the scroll-follow before the editor's layout lands.
+    notifyThreadEditOpen()
+    aui.composer().beginEdit()
+  }, [aui])
+
+  const onClick = useCallback(
+    (event: { detail: number; preventDefault: () => void; stopPropagation: () => void }) => {
+      if (isSelectionClick(event)) {
+        cancel()
+        event.preventDefault()
+        event.stopPropagation()
+
+        return
+      }
+
+      if (event.detail === 0) {
+        cancel()
+        open()
+
+        return
+      }
+
+      cancel()
+      timerRef.current = setTimeout(() => {
+        timerRef.current = null
+
+        if (!hasTextSelection()) {
+          open()
+        }
+      }, EDIT_CLICK_DELAY_MS)
+    },
+    [cancel, open]
+  )
+
+  return { canEdit: !isEditing, onClick }
+}
+
 export function StickyHumanMessageContainer({
   attachments,
   children,
+  copyText,
   messageId
 }: {
   attachments?: ReactNode
   children: ReactNode
+  /** What the app menu's Copy message yields for this prompt (the root also
+   *  renders timestamp / reaction / checkpoint chrome, which must not copy). */
+  copyText?: string
   messageId?: string
 }) {
   return (
@@ -49,6 +144,7 @@ export function StickyHumanMessageContainer({
     <>
       <div
         className="group/user-message sticky z-40 -mx-4 flex w-[calc(100%+2rem)] min-w-0 max-w-none flex-col items-stretch gap-0 self-end overflow-visible px-4 pb-(--conversation-turn-gap) pt-1"
+        data-message-copy-text={copyText}
         data-message-id={messageId}
         data-role="user"
         data-slot="aui_user-message-root"
@@ -297,6 +393,17 @@ export const UserMessage: FC<{
     [react]
   )
 
+  // What "Copy message" yields: the prompt as sent plus its attachment refs
+  // (they render as chips below the bubble but are part of what was sent) —
+  // never the timestamp, reaction badge, or checkpoint labels the root also
+  // renders.
+  const copyText = [messageText.trim(), ...attachmentRefs].filter(Boolean).join('\n')
+
+  const copyMessage = useCallback(() => {
+    setPickerOpen(false)
+    void writeClipboardText(copyText).catch(() => {})
+  }, [copyText])
+
   // Sticky human bubbles clamp to ~2 lines with a soft fade so a long prompt
   // doesn't dominate the viewport while the response streams underneath; the
   // clamp lifts on hover / focus (see styles.css). We measure the *unclamped*
@@ -313,6 +420,7 @@ export const UserMessage: FC<{
   const readOnly = isWatchWindow()
   const [expanded, setExpanded] = useState(false)
   const clampActive = !(readOnly && expanded)
+  const openEdit = useDeferredSingleClickEdit()
 
   const measureClamp = useCallback((entries: readonly ResizeObserverEntry[]) => {
     const inner = clampInnerRef.current
@@ -354,6 +462,7 @@ export const UserMessage: FC<{
     return (
       <MessagePrimitive.Root
         className="flex w-full min-w-0 flex-col items-stretch"
+        data-message-copy-text={messageText.trim()}
         data-role="user"
         data-slot="aui_user-message-root"
       >
@@ -367,6 +476,7 @@ export const UserMessage: FC<{
     return (
       <MessagePrimitive.Root
         className="flex w-full min-w-0 flex-col items-stretch pb-(--conversation-turn-gap)"
+        data-message-copy-text={messageText.trim()}
         data-role="user"
         data-slot="aui_user-message-root"
       >
@@ -421,11 +531,15 @@ export const UserMessage: FC<{
             </div>
           ) : null
         }
+        copyText={copyText}
         messageId={messageId}
       >
         <ActionBarPrimitive.Root className="relative w-full max-w-full" data-slot="aui_user-bubble-actions">
           <div className="human-message-with-todos-wrapper flex w-full flex-col gap-0">
             <ReactionPicker
+              // The bubble's right-click opens this picker instead of the app
+              // menu, so Copy message rides the picker here.
+              copyAction={{ label: copy.copyMessage, onCopy: copyMessage }}
               onOpenChange={setPickerOpen}
               onSelect={pickEmoji}
               open={pickerOpen}
@@ -437,7 +551,12 @@ export const UserMessage: FC<{
                 // attr below) so this handler keeps the picker gesture; a
                 // link/image/selection inside the bubble still gets the app
                 // menu, and this handler's selection guard keeps ⌘C flows.
-                data-context-menu-skip=""
+                // Stamped ONLY while the picker can actually open: with
+                // reactions off there is no gesture to protect, so the bubble
+                // stops claiming right-click and the shared menu takes it —
+                // that is where Copy message lives then. With reactions on,
+                // Copy message rides the picker (copyAction above).
+                data-context-menu-skip={readOnly || !reactionsEnabled ? undefined : ''}
                 onContextMenu={
                   // Right-click is the desktop stand-in for iOS touch-and-hold —
                   // but only when there's nothing selected. A live highlight
@@ -460,10 +579,11 @@ export const UserMessage: FC<{
                   <button
                     aria-expanded={bodyClamped ? expanded : undefined}
                     className={cn(bubbleClassName, !bodyClamped && 'cursor-default')}
-                    onClick={() => {
+                    onClick={event => {
                       // Drag-select ends on mouseup→click; don't collapse the
-                      // clamp just because the highlight finished.
-                      if (hasTextSelection() || !bodyClamped) {
+                      // clamp just because the highlight finished. A multi-click
+                      // is a selection gesture too (see isSelectionClick).
+                      if (isSelectionClick(event) || !bodyClamped) {
                         return
                       }
 
@@ -477,34 +597,18 @@ export const UserMessage: FC<{
                 ) : (
                   // Always editable — clicking opens the edit composer even while a
                   // turn streams; sending the edit reverts (interrupt + rewind).
-                  // A live text highlight wins: finishing a drag-select must not
-                  // open the editor and throw the selection away.
-                  <ActionBarPrimitive.Edit asChild>
-                    <button
-                      aria-label={copy.editMessage}
-                      className={bubbleClassName}
-                      onClick={event => {
-                        if (hasTextSelection()) {
-                          event.preventDefault()
-                          event.stopPropagation()
-
-                          return
-                        }
-
-                        triggerHaptic('selection')
-                      }}
-                      onPointerDown={() => {
-                        if (hasTextSelection()) {
-                          return
-                        }
-
-                        notifyThreadEditOpen()
-                      }}
-                      type="button"
-                    >
-                      {bubbleContent}
-                    </button>
-                  </ActionBarPrimitive.Edit>
+                  // A selection gesture wins: a finished drag-select or a
+                  // double/triple-click selects text and never opens the editor
+                  // (see useDeferredSingleClickEdit).
+                  <button
+                    aria-label={copy.editMessage}
+                    className={bubbleClassName}
+                    disabled={!openEdit.canEdit}
+                    onClick={openEdit.onClick}
+                    type="button"
+                  >
+                    {bubbleContent}
+                  </button>
                 )}
                 {(showStop || showRestore) && (
                   <div className="pointer-events-none absolute right-2 bottom-2 z-10 flex items-center justify-center opacity-0 transition-opacity group-hover/user-message:opacity-100 group-focus-within/user-message:opacity-100">

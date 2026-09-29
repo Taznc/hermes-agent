@@ -5388,6 +5388,7 @@ export const frOverrides = {
       refresh: 'Actualiser',
       moreActions: "Plus d'actions",
       branchNewChat: 'Créer une branche dans une nouvelle conversation',
+      copyMessage: 'Copier le message',
       react: 'Réagir',
       dismissError: "Ignorer l'erreur",
       errorLayers: {

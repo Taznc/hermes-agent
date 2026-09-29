@@ -3726,6 +3726,7 @@ export const ja = defineLocale({
       refresh: '更新',
       moreActions: 'その他のアクション',
       branchNewChat: '新しいチャットでブランチ',
+      copyMessage: 'メッセージをコピー',
       react: 'リアクション',
       dismissError: 'エラーを閉じる',
       errorGenericProvider: 'AI サービス',
