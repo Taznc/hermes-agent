@@ -9,6 +9,7 @@ import subprocess
 import pytest
 
 from hermes_cli import worktree_ops
+from hermes_fork.worktree_prune_ownership import mark_prune_owned_worktree  # fork: pruner reaps only marked trees
 
 
 @pytest.fixture
@@ -104,6 +105,7 @@ class TestWorktreeLockReaping:
             ["git", "worktree", "add", str(p), "-b", f"hermes/{name}", "HEAD"],
             cwd=repo, capture_output=True,
         )
+        mark_prune_owned_worktree(str(p), f"hermes/{name}")
         if pid is not None:
             subprocess.run(
                 ["git", "worktree", "lock", "--reason", f"hermes pid={pid}", str(p)],
@@ -183,9 +185,9 @@ class TestWorktreeLockPredicate:
         assert worktree_ops._worktree_lock_is_live(str(git_repo), str(p)) is None
 
 
-    def test_foreign_lock_reason_returns_dead(self, git_repo):
+    def test_foreign_lock_reason_returns_live(self, git_repo):
         p = self._mk_locked(git_repo, "hermes-foreign", "some other tool")
-        assert worktree_ops._worktree_lock_is_live(str(git_repo), str(p)) == "dead"
+        assert worktree_ops._worktree_lock_is_live(str(git_repo), str(p)) == "live"
 
     def test_bad_repo_root_fails_safe_to_live(self, tmp_path):
         # Not a git repo -> git query fails -> must report "live" (never delete)
@@ -217,6 +219,7 @@ class TestWidenedPruner:
             ["git", "worktree", "add", str(p), "-b", f"wt/{name}", "HEAD"],
             cwd=repo, capture_output=True,
         )
+        mark_prune_owned_worktree(str(p), f"wt/{name}")
         sha = None
         if commit:
             (p / "work.txt").write_text(f"work for {name}\n")
@@ -532,6 +535,7 @@ class TestShallowCloneDeepening:
             ["git", "worktree", "add", str(wt), "-b", "hermes/hermes-shallowstuck", "HEAD"],
             clone,
         )
+        mark_prune_owned_worktree(str(wt), "hermes/hermes-shallowstuck")
 
         self._advance_upstream(up, "B")
         # Same shape as the updater: shallow fetch of the new tip only.
@@ -645,6 +649,7 @@ class TestPrMergedEscapeHatch:
             ["git", "worktree", "add", str(p), "-b", f"hermes/{name}", "HEAD"],
             cwd=repo, capture_output=True,
         )
+        mark_prune_owned_worktree(str(p), f"hermes/{name}")
         (p / "salvaged.txt").write_text("diff that was reworked during salvage\n")
         subprocess.run(["git", "add", "salvaged.txt"], cwd=p, capture_output=True)
         subprocess.run(["git", "commit", "-m", "salvaged work"], cwd=p, capture_output=True)

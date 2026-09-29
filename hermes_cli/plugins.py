@@ -229,6 +229,9 @@ class LoadedPlugin:
 
 class PluginContext:
     """Facade given to plugins so they can register tools and hooks."""
+    # >>> FORK ANCHOR: plugin-context-fork <<<
+    from hermes_fork.plugin_context import fork  # ctx.fork: additive fork plugin API (X02 ui, interactive tools)
+    # <<< FORK ANCHOR >>>
 
     def __init__(self, manifest: PluginManifest, manager: "PluginManager"):
         self.manifest = manifest

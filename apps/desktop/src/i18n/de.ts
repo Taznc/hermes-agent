@@ -5401,6 +5401,7 @@ export const deOverrides = {
       refresh: 'Aktualisieren',
       moreActions: 'Weitere Aktionen',
       branchNewChat: 'In neuem Chat abzweigen',
+      copyMessage: 'Nachricht kopieren',
       react: 'Reagieren',
       dismissError: 'Fehler schließen',
       errorLayers: {

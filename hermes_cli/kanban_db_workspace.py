@@ -634,6 +634,11 @@ def set_branch_name(conn: sqlite3.Connection, task_id: str, branch_name: str) ->
     _set_task_column(conn, task_id, "branch_name", str(branch_name))
 
 
+# >>> FORK ANCHOR: kanban-worktree-ownership <<<
+from hermes_fork.kanban.worktree_ownership import install as _fork_worktree_ownership  # noqa: E402
+_fork_worktree_ownership(__name__)  # a task may only tear down/adopt a worktree it created
+# <<< FORK ANCHOR >>>
+
 # Late-bound origin namespace (see module docstring); imported LAST so this
 # module is fully populated before ``kanban_db`` imports from it.
 from hermes_cli import kanban_db as _kb  # noqa: E402

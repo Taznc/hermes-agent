@@ -1333,6 +1333,11 @@ def create_task(
 
     now = int(time.time())
 
+    # >>> FORK ANCHOR: kanban-worktree-ownership <<<
+    from hermes_fork.kanban.worktree_ownership import reject_foreign_checkout as _fork_reject_checkout
+    _fork_reject_checkout(workspace_kind, workspace_path, branch_name)  # never adopt an existing checkout
+    # <<< FORK ANCHOR >>>
+
     # Only persistent kinds inherit the board ``default_workdir``: a scratch
     # task inheriting it would point cleanup at the user's source tree.
     if workspace_path is None and project_repo is None and workspace_kind in {"dir", "worktree"}:

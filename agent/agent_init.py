@@ -1299,7 +1299,10 @@ def _memory_provider_init_kwargs(agent, platform) -> Dict[str, Any]:
     with suppress(Exception):
         from hermes_cli.profiles import get_active_profile_name
         kwargs["agent_identity"] = get_active_profile_name()
-        kwargs["agent_workspace"] = "hermes"
+        # >>> FORK ANCHOR: memory-workspace-identity <<<
+        from hermes_fork.workspace import agent_workspace as _fork_agent_workspace
+        kwargs["agent_workspace"] = _fork_agent_workspace(agent)
+        # <<< FORK ANCHOR >>>
     return kwargs
 
 
@@ -1355,7 +1358,10 @@ def _init_memory(agent, _agent_cfg, skip_memory, platform, memory_manager=None):
             if not is_core_memory_provider(_mem_provider_name):
                 from agent.memory_manager import MemoryManager as _MemoryManager
                 from plugins.memory import load_memory_provider as _load_mem
-                agent._memory_manager = _MemoryManager()
+                # >>> FORK ANCHOR: memory-external-prefetch-timeout <<<
+                from hermes_fork.memory import external_prefetch_timeout as _fork_prefetch_timeout
+                agent._memory_manager = _MemoryManager(external_prefetch_timeout=_fork_prefetch_timeout(mem_config))
+                # <<< FORK ANCHOR >>>
                 _mp = _load_mem(_mem_provider_name)
                 if _mp is None:
                     # The provider left core for the catalog (or was never installed): fetch it once.

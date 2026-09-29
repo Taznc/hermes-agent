@@ -24,6 +24,8 @@ import { ActivityTimerText } from '@/components/chat/activity-timer-text'
 import { GeneratedImage } from '@/components/chat/generated-image-result'
 import { SCAFFOLD_LABEL_CLASS, SCAFFOLD_META_CLASS, ScaffoldRow } from '@/components/chat/scaffold-row'
 import { useOnboardingChatActive } from '@/components/onboarding-chat/assembly'
+// >>> FORK ANCHOR: plugin-ui-bridge <<<
+import { withUiRequestSlot } from '@/fork/ui-bridge/inline-slot'
 import { useI18n } from '@/i18n'
 import { mcpTargets, toolLabels } from '@/lib/connector-tools'
 import { generatedImageFromResult } from '@/lib/generated-images'
@@ -443,5 +445,6 @@ export const MESSAGE_PARTS_COMPONENTS = {
   ReasoningGroup: ReasoningAccordionGroup,
   Text: TimelineMarkdownText,
   ToolGroup: ToolGroupSlot,
-  tools: { Fallback: ChainToolFallback }
+  // >>> FORK ANCHOR: plugin-ui-bridge <<<
+  tools: { Fallback: withUiRequestSlot(ChainToolFallback) }
 } as const

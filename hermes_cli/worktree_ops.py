@@ -972,3 +972,8 @@ def _prune_orphaned_branches(repo_root: str, protect: Optional[set] = None) -> N
         _git_quiet(["branch", "-D"] + orphaned[i:i + 50], repo_root, timeout=30,
                    log="Failed to prune orphaned branches")
     logger.debug("Pruned %d orphaned branches", len(orphaned))
+
+# >>> FORK ANCHOR: worktree-prune-ownership <<<
+from hermes_fork.worktree_prune_ownership import install as _fork_prune_ownership  # noqa: E402
+_fork_prune_ownership(__name__)  # startup pruner reaps only marked Hermes-created trees, never --force
+# <<< FORK ANCHOR >>>

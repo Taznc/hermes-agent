@@ -8,6 +8,8 @@ import {
 } from '@/app/chat/right-rail/preview-typing-abort'
 import { readActiveTerminal } from '@/app/right-sidebar/terminal/buffer'
 import { pendingClarifyToolPayload } from '@/app/session/hooks/use-session-actions/restore-pending-clarify'
+// >>> FORK ANCHOR: plugin-ui-bridge <<<
+import { handlePluginRequest } from '@/fork/ui-bridge/handler'
 import { translateNow } from '@/i18n'
 import { restorePendingClarifyToolCall } from '@/lib/chat-messages'
 import type { PreviewActAction } from '@/lib/preview-act/act-in-page'
@@ -562,6 +564,8 @@ export const SERVER_REQUEST_HANDLERS: Record<string, Handler> = {
   approval,
   clarify,
   'display.install.sudo': displayInstallSudo,
+  // >>> FORK ANCHOR: plugin-ui-bridge <<<
+  'plugin.request': handlePluginRequest,
   'preview.act': previewAct,
   'preview.read': previewRead,
   secret,

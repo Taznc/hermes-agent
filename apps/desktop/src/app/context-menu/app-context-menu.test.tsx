@@ -91,6 +91,34 @@ describe('resolveDomTarget', () => {
 
     expect(resolveDomTarget(host.querySelector('a')).dialogPortalContainer).toBe(dialog)
   })
+
+  it('resolves the enclosing chat message so the menu can copy it whole', () => {
+    const host = attach(
+      '<div data-slot="aui_assistant-message-content"><p>first line</p><p>second line</p></div>' +
+        '<div data-slot="aui_user-message-root"><span>my prompt</span></div>' +
+        '<p>loose text outside any message</p>'
+    )
+
+    const inAssistant = resolveDomTarget(host.querySelector('[data-slot="aui_assistant-message-content"] p'))
+    const inUser = resolveDomTarget(host.querySelector('[data-slot="aui_user-message-root"] span'))
+    const outside = resolveDomTarget(host.querySelector('div + div + p'))
+
+    // The whole message, from a click on one line inside it.
+    expect(inAssistant.messageText).toContain('first line')
+    expect(inAssistant.messageText).toContain('second line')
+    expect(inUser.messageText).toBe('my prompt')
+    // Text that is not a chat message offers no Copy message.
+    expect(outside.messageText).toBe('')
+  })
+
+  it('prefers the text a message root stamps over its rendered chrome', () => {
+    const host = attach(
+      '<div data-slot="aui_user-message-root" data-message-copy-text="  just the prompt  ">' +
+        '<span>just the prompt</span><span>🎉</span><time>9:41 AM</time></div>'
+    )
+
+    expect(resolveDomTarget(host.querySelector('span')).messageText).toBe('just the prompt')
+  })
 })
 
 describe('AppContextMenu', () => {
@@ -377,6 +405,32 @@ describe('AppContextMenu', () => {
     fireEvent.contextMenu(host.querySelector('p')!)
 
     expect(await screen.findByText('Settings')).toBeTruthy()
+  })
+
+  it('offers Copy message on a chat message right-click and copies the whole message', async () => {
+    const writeClipboard = vi.fn().mockResolvedValue(undefined)
+
+    installBridge({ writeClipboard })
+    mountMenu()
+    const host = attach('<div data-slot="aui_assistant-message-content"><p>whole</p><p>reply</p></div>')
+
+    fireEvent.contextMenu(host.querySelector('p')!)
+    fireEvent.click(await screen.findByText('Copy message'))
+
+    await waitFor(() => expect(writeClipboard).toHaveBeenCalled())
+    expect(String(writeClipboard.mock.calls[0]?.[0])).toContain('whole')
+    expect(String(writeClipboard.mock.calls[0]?.[0])).toContain('reply')
+  })
+
+  it('does not offer Copy message on chrome outside any message', async () => {
+    installBridge()
+    mountMenu()
+    const host = attach('<div><p>plain chrome</p></div>')
+
+    fireEvent.contextMenu(host.querySelector('p')!)
+
+    expect(await screen.findByText('Settings')).toBeTruthy()
+    expect(screen.queryByText('Copy message')).toBeNull()
   })
 
   it('skips plain right-clicks inside a skip-marked surface, but not links in it', async () => {
