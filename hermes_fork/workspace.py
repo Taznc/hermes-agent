@@ -15,6 +15,7 @@ Config keys (``config.yaml``, read from the resolved ``memory`` section)::
     memory:
       workspace_from_cwd: true      # default false -> upstream behaviour, literal "hermes"
       workspace_default: "hermes"   # what non-workspace sessions resolve to (default "hermes")
+      workspace_prefix: "project-"  # prepended to a RESOLVED identity only (default "")
 
 Resolution when the flag is on (never raises; any failure -> ``workspace_default``):
 
@@ -41,8 +42,9 @@ Resolution when the flag is on (never raises; any failure -> ``workspace_default
 
 Why a literal default and not ``""``: hindsight's ``_resolve_bank_id_template`` collapses
 the ``-``/``_`` run an empty placeholder leaves, so ``project-{workspace}`` would render
-``project`` for home-dir sessions (not the static ``bank_id``). With the default,
-``project-{workspace}`` renders ``project-hermes`` for those sessions.
+``project`` for home-dir sessions (not the static ``bank_id``). Recommended pairing:
+``bank_id_template: "{workspace}"`` + ``workspace_prefix: "project-"`` + ``workspace_default:
+"hermes"`` -> repo sessions ``project-<repo>``, everything else the existing ``hermes`` bank.
 
 Called from exactly one site: the ``memory-workspace-identity`` FORK ANCHOR in
 ``agent.agent_init._memory_provider_init_kwargs``. ``mem_config`` is not in scope
@@ -62,6 +64,7 @@ logger = logging.getLogger(__name__)
 
 CONFIG_KEY_ENABLED = "workspace_from_cwd"
 CONFIG_KEY_DEFAULT = "workspace_default"
+CONFIG_KEY_PREFIX = "workspace_prefix"
 UPSTREAM_WORKSPACE = "hermes"
 
 _GIT_WALK_MAX_DEPTH = 12
@@ -95,6 +98,17 @@ def _workspace_default(mem_config: Mapping[str, Any]) -> str:
     if isinstance(raw, str) and raw.strip():
         return raw.strip()
     return UPSTREAM_WORKSPACE
+
+
+def _workspace_prefix(mem_config: Mapping[str, Any]) -> str:
+    """Prefix applied to a RESOLVED workspace identity only (never to the default).
+
+    With ``bank_id_template: "{workspace}"``, ``workspace_prefix: "project-"`` sends repo
+    sessions to ``project-<repo>`` while non-workspace sessions still land in the default
+    bank verbatim. Putting the prefix in the template instead (``project-{workspace}``)
+    would rename the default too (``project-hermes``), orphaning the main bank."""
+    raw = mem_config.get(CONFIG_KEY_PREFIX)
+    return raw.strip() if isinstance(raw, str) and raw.strip() else ""
 
 
 # ── path classification ───────────────────────────────────────────────────────
@@ -300,7 +314,8 @@ def agent_workspace(agent: Any, mem_config: Optional[Mapping[str, Any]] = None) 
             return UPSTREAM_WORKSPACE
         default = _workspace_default(cfg)
         cwd, repo_root = _agent_cwd(agent)
-        return resolve_workspace_identity(cwd, repo_root=repo_root) or default
+        identity = resolve_workspace_identity(cwd, repo_root=repo_root)
+        return f"{_workspace_prefix(cfg)}{identity}" if identity else default
     except Exception:
         logger.debug("agent_workspace resolution failed; using %r", UPSTREAM_WORKSPACE, exc_info=True)
         return UPSTREAM_WORKSPACE
