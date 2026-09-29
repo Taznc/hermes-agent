@@ -1333,15 +1333,10 @@ def create_task(
 
     now = int(time.time())
 
-    # A worktree task may not adopt a checkout that already exists on a branch it
-    # will not own: completing/archiving it would run ``git worktree remove`` on
-    # someone else's tree (a served checkout, a sibling task). Dispatch creates
-    # the worktree; the caller should pass a NEW path. A checkout already on the
-    # task's ``branch_name`` (retry/re-dispatch) is allowed.
-    if workspace_kind == "worktree":
-        from hermes_cli.kanban_db_workspace import _reject_foreign_worktree_checkout
-
-        _reject_foreign_worktree_checkout(workspace_path, branch_name)
+    # >>> FORK ANCHOR: kanban-worktree-ownership <<<
+    from hermes_fork.kanban.worktree_ownership import reject_foreign_checkout as _fork_reject_checkout
+    _fork_reject_checkout(workspace_kind, workspace_path, branch_name)  # never adopt an existing checkout
+    # <<< FORK ANCHOR >>>
 
     # Only persistent kinds inherit the board ``default_workdir``: a scratch
     # task inheriting it would point cleanup at the user's source tree.

@@ -92,7 +92,8 @@ def _linked_worktree(project: Path, tmp_path: Path) -> Path:
 # Production removal paths; each returns (root that goes away, sibling root that stays, remove()).
 def _kanban_worktree(project, tmp_path, monkeypatch):
     from hermes_cli import kanban_db_workspace as kbw
-    wt = _linked_worktree(project, tmp_path)
+    wt = tmp_path / "wt"
+    kbw._ensure_git_worktree(project, wt, "wt/t1", "t1")  # fork: dispatch-created, so t1 owns it
     return wt, project, lambda: kbw._cleanup_worktree_workspace("t1", str(wt), "wt/t1")
 
 
