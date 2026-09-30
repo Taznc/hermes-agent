@@ -234,11 +234,18 @@ export function graftRefreshedTailOntoBackfill(refreshedTail: ChatMessage[], pre
     return refreshedTail
   }
 
-  if (prefixIsEarlier) {
-    return [...previous.slice(0, anchor), ...refreshedTail]
-  }
-
   const refreshedIds = new Set(refreshedTail.map(message => message.id))
+
+  if (prefixIsEarlier) {
+    // A page-local row (a tool fold with no stored id) that the page also
+    // carries is not older history: keeping it would duplicate it, and the
+    // longer result would read as "behind" to the send guard on every retry.
+    const prefix = previous
+      .slice(0, anchor)
+      .filter(message => message.rowId !== undefined || !refreshedIds.has(message.id))
+
+    return prefix.length ? [...prefix, ...refreshedTail] : refreshedTail
+  }
 
   // The page already contains everything on screen, including a live row the
   // tail really did cover. Take the page. This is what keeps a finished reply
