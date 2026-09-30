@@ -220,6 +220,30 @@ describe('graftRefreshedTailOntoBackfill', () => {
     expect(graftRefreshedTailOntoBackfill(refreshed, previous).map(m => m.rowId)).toEqual([1, 2, undefined, 3, 4])
   })
 
+  it('does not duplicate a leading page-local fold the window already shows', () => {
+    // A session that opens with a tool turn renders a fold with no stored id
+    // in front of the first stored row, on both the window and the page.
+    const previous = [chat('opening-fold'), chat('prompt', 2), chat('reply', 3)]
+    const refreshed = [chat('opening-fold'), chat('prompt', 2), chat('reply', 3), chat('new-reply', 4)]
+
+    expect(graftRefreshedTailOntoBackfill(refreshed, previous).map(m => m.id)).toEqual([
+      'opening-fold',
+      'prompt',
+      'reply',
+      'new-reply'
+    ])
+
+    // A window already carrying the duplicate converges back to one copy.
+    const duplicated = [chat('opening-fold'), ...previous]
+
+    expect(graftRefreshedTailOntoBackfill(refreshed, duplicated).map(m => m.id)).toEqual([
+      'opening-fold',
+      'prompt',
+      'reply',
+      'new-reply'
+    ])
+  })
+
   it('returns the refreshed tail when it is not shorter than the previous transcript', () => {
     const previous = [chat('a', 1)]
     const refreshed = [chat('a', 1), chat('b', 2)]
