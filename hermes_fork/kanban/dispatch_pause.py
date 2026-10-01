@@ -66,13 +66,16 @@ def pause_path(board: Optional[str] = None) -> Path:
 
 
 def _read(path: Path) -> Optional[dict[str, Any]]:
-    """``None`` when not paused, else the pause record (fail closed on damage)."""
+    """``None`` when not paused, else the pause record (fail closed on damage).
+
+    Read directly, never ``Path.exists()`` first: Python 3.14 maps an
+    inaccessible parent's PermissionError to ``False`` there, which would
+    report an existing sentinel as absent. Only FileNotFoundError is absent.
+    """
     try:
-        if not path.exists():
-            return None
         raw = json.loads(path.read_text(encoding="utf-8"))
     except FileNotFoundError:
-        return None  # resumed between the stat and the read
+        return None
     except (OSError, ValueError) as exc:
         return {"reason": UNREADABLE, "detail": str(exc), "path": str(path)}
     if not isinstance(raw, dict) or not raw.get("reason"):
