@@ -95,9 +95,15 @@ const failedBoards = (failures: Array<{ board: string }>) => failures.map(f => f
  * (no unreadable board, a known count), every targeted board paused, and 0
  * running. A partial pause shows the count only: an unpaused board can start
  * work at any moment. An incomplete read names the boards and clears nothing.
+ * `stale`: the latest refresh failed and `status` is React Query's cached last
+ * success, so nothing about the drain is known now and nothing is cleared.
  */
-export function drainText(k: KanbanText, status: DispatchStatus): string {
+export function drainText(k: KanbanText, status: DispatchStatus, stale = false): string {
   const running = status.running_count
+
+  if (stale) {
+    return k.statusStale
+  }
 
   if (status.errors.length || running === null) {
     return k.statusUnknown(failedBoards(status.errors))
@@ -163,11 +169,19 @@ export function DispatchControl() {
     ) : null
   }
 
-  const drain = drainText(k, status)
+  // React Query keeps the last good `data` when a refresh rejects: show it as
+  // last-known state, never as a live drain signal.
+  const stale = Boolean(error)
+  const drain = drainText(k, status, stale)
   const note = !isAll ? status.boards[0]?.state?.note : undefined
 
   return (
-    <div className="flex flex-col gap-1.5" data-dispatch-control data-paused={status.paused ? 'true' : 'false'}>
+    <div
+      className="flex flex-col gap-1.5"
+      data-dispatch-control
+      data-paused={status.paused ? 'true' : 'false'}
+      data-stale={stale ? 'true' : undefined}
+    >
       {label}
       <div className="flex flex-wrap items-center gap-2">
         {isAll ? (
@@ -199,14 +213,15 @@ export function DispatchControl() {
         )}
         <span className="text-[0.75rem] text-(--ui-text-secondary)" data-dispatch-summary>
           {isAll
-            ? status.paused_count > 0 || status.errors.length
+            ? status.paused_count > 0 || status.errors.length || stale
               ? `${k.boardsPaused(status.paused_count, status.board_count)} · ${drain}`
               : k.dispatchRunning
-            : status.paused
+            : status.paused || stale
               ? drain
               : k.dispatchRunning}
         </span>
       </div>
+      {stale && <p className="text-[0.6875rem] text-(--ui-text-quaternary)">{String((error as Error).message ?? error)}</p>}
       {status.estop && <EstopLine reason={status.estop.reason ?? ''} />}
       <p className="text-[0.6875rem] text-(--ui-text-quaternary)">{note || k.pauseHint}</p>
     </div>
@@ -228,14 +243,14 @@ function EstopLine({ reason }: { reason: string }) {
 export function DispatchPausedNotice({ slug }: { slug: string }) {
   const k = useKanban()
   const backend = useForkBackend()
-  const { data: status } = useDispatchStatus(slug, backend === true)
+  const { data: status, error } = useDispatchStatus(slug, backend === true)
 
   if (backend !== true || !status || (status.paused_count === 0 && !status.estop)) {
     return null
   }
 
   const isAll = slug === ALL_BOARDS
-  const drain = drainText(k, status)
+  const drain = drainText(k, status, Boolean(error))
 
   const text = status.estop
     ? k.estopEngaged(status.estop.reason ?? '')

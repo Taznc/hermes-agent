@@ -237,6 +237,33 @@ describe('single board', () => {
     expect(control()).toBeNull()
   })
 
+  it('revokes restart clearance on both surfaces when a refresh of a paused board fails', async () => {
+    paused = new Set(['alpha'])
+    const client = await mount('alpha')
+    await waitFor(() => expect(summary()).toBe('0 running — safe to restart'))
+    expect(banner()?.textContent).toContain('Dispatch paused · 0 running — safe to restart')
+
+    forkUp = false
+    await client.invalidateQueries({ queryKey: ['kanban-fork', 'dispatch'] })
+    await waitFor(() => expect(client.getQueryState(['kanban-fork', 'dispatch', 'local', 'alpha'])?.status).toBe('error'))
+    expect(summary()).toBe('status refresh failed — last known state, running count unknown')
+    expect(banner()?.textContent).toContain('Dispatch paused · status refresh failed')
+    expect(control()?.dataset.stale).toBe('true')
+    expect(root.textContent).not.toContain('safe to restart')
+  })
+
+  it('does not claim a live board is dispatching normally once its refresh fails', async () => {
+    const client = await mount('alpha')
+    await waitFor(() => expect(summary()).toBe('Dispatching normally'))
+
+    forkUp = false
+    await client.invalidateQueries({ queryKey: ['kanban-fork', 'dispatch'] })
+    await waitFor(() => expect(control()?.dataset.stale).toBe('true'))
+    expect(summary()).toBe('status refresh failed — last known state, running count unknown')
+    // Nothing was paused, so the page banner stays out of the way.
+    expect(banner()).toBeNull()
+  })
+
   it('warns when a dispatch tick kept the lock and nothing was written', async () => {
     busyNext = true
     await mount('alpha')
@@ -265,8 +292,19 @@ describe('All Boards', () => {
     await waitFor(() =>
       expect(client.getQueryState(['kanban-fork', 'dispatch', 'local', ALL_BOARDS])?.status).toBe('error')
     )
-    expect.soft(summary()).not.toContain('safe to restart')
-    expect.soft(banner()?.textContent).not.toContain('safe to restart')
+    expect(client.getQueryState(['kanban-fork', 'dispatch', 'local', ALL_BOARDS])?.data).toBeDefined()
+    // The cached paused/zero-running data stays, but it is no longer a drain signal.
+    expect(summary()).toBe('2 of 2 boards paused · status refresh failed — last known state, running count unknown')
+    expect(banner()?.textContent).toContain('2 of 2 boards paused · status refresh failed')
+    expect(control()?.dataset.stale).toBe('true')
+    expect(control()?.textContent).toContain('404')
+    expect(root.textContent).not.toContain('safe to restart')
+
+    // A later good read restores clearance.
+    forkUp = true
+    await client.invalidateQueries({ queryKey: ['kanban-fork', 'dispatch'] })
+    await waitFor(() => expect(summary()).toBe('2 of 2 boards paused · 0 running — safe to restart'))
+    expect(control()?.dataset.stale).toBeUndefined()
   })
 
   it('pauses every board at once, then resumes them all', async () => {
@@ -339,6 +377,7 @@ describe('drainText', () => {
     draining: (n: number) => `${n} draining`,
     runningCount: (n: number) => `${n} running`,
     safeToRestart: 'safe',
+    statusStale: 'stale',
     statusUnknown: (b: string) => `unknown ${b}`
   } as unknown as KanbanText
 
@@ -360,6 +399,9 @@ describe('drainText', () => {
     expect(drainText(k, status({ paused: false, paused_count: 1 }))).toBe('0 running')
     expect(drainText(k, status({ errors: [{ board: 'a', detail: 'x' }], running_count: null }))).toBe('unknown a')
     expect(drainText(k, status({ running_count: null }))).toBe('unknown ')
+    // A failed refresh over cached data clears nothing, whatever the cache says.
+    expect(drainText(k, status({}), true)).toBe('stale')
+    expect(drainText(k, status({ paused: false, paused_count: 0 }), true)).toBe('stale')
   })
 })
 
