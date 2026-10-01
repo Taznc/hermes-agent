@@ -133,6 +133,34 @@ def test_damaged_sentinel_fails_closed(env, body):
     assert _tick(spawn).spawned == [] and spawned == []
 
 
+def test_inaccessible_pause_sentinel_parent_must_not_claim(env, monkeypatch):
+    """Python 3.14 Path.exists can hide PermissionError from an inaccessible parent."""
+    spawned, spawn = env
+    (task_id,) = _new(1)
+    dispatch_pause.pause()
+    sentinel = dispatch_pause.pause_path()
+    assert dispatch_pause.is_paused()
+    original_exists = Path.exists
+    original_read_text = Path.read_text
+
+    def inaccessible_exists(path):
+        return False if path == sentinel else original_exists(path)
+
+    def inaccessible_read_text(path, *args, **kwargs):
+        if path == sentinel:
+            raise PermissionError("pause sentinel parent inaccessible")
+        return original_read_text(path, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "exists", inaccessible_exists)
+    monkeypatch.setattr(Path, "read_text", inaccessible_read_text)
+
+    state = dispatch_pause.read_state()
+    result = _tick(spawn)
+    assert result.spawned == [] and spawned == [], f"pause state {state!r} admitted a claim"
+    assert state is not None and state["reason"] == dispatch_pause.UNREADABLE
+    assert _status(task_id).status == "ready"
+
+
 def test_dev_start_budget_record_still_pauses_until_resumed(env):
     """A dev-home cooldown record has no next writer to expire it: held until resume."""
     spawned, spawn = env
