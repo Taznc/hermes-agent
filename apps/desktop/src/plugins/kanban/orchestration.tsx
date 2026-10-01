@@ -148,6 +148,10 @@ export function OrchestrationPanel() {
     return null
   }
 
+  // >>> FORK ANCHOR: kanban-dispatch-pause <<< seam: host.fork.kanban from '@/fork/kanban/dispatch-pause'
+  const forkDispatch = host.fork?.kanban?.dispatchControl()
+  // <<< FORK ANCHOR >>>
+
   return (
     <div className="flex flex-col gap-4 border-t border-(--ui-stroke-tertiary) px-4 py-3">
       <div className="flex flex-wrap items-end gap-4">
@@ -173,6 +177,7 @@ export function OrchestrationPanel() {
           {k.autoDecompose}
         </label>
       </div>
+      {forkDispatch}
 
       <div className="flex flex-col gap-1.5">
         <span className={FIELD_LABEL}>{k.profileDescriptions}</span>

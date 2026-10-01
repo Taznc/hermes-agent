@@ -13,6 +13,8 @@
  *                                      Esc/click-off, fold, All Boards chips.
  *  - `allBoardsItem(slug, boards)`     board-switcher.tsx menu item.
  *  - `boardLabel(slug)`                board-switcher.tsx trigger label.
+ *  - `dispatchControl()`               orchestration.tsx — pause/resume
+ *                                      dispatch for the board or all boards.
  *
  * Plugins feature-detect: `host.fork?.kanban?.version >= 1`, falling back to
  * upstream behaviour when absent. With no `kanban-fork` backend on the
@@ -22,6 +24,7 @@
 import { ALL_BOARDS, routeRest } from '@/fork/kanban/all-boards'
 import { boardOverlay } from '@/fork/kanban/board-overlay'
 import { frameCard } from '@/fork/kanban/card-frame'
+import { dispatchControl } from '@/fork/kanban/dispatch-pause'
 import { allBoardsItem, boardLabel } from '@/fork/kanban/switcher'
 
 export const forkKanban = {
@@ -30,6 +33,7 @@ export const forkKanban = {
   allBoardsItem,
   boardLabel,
   boardOverlay,
+  dispatchControl,
   frameCard,
   routeRest
 }

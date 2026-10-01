@@ -12,7 +12,8 @@
  *  - the lane fold: reading each lane's rendered order from the DOM (upstream
  *    groups/filters lanes its own way) and publishing `$folds`;
  *  - All Boards: board filter chips, the partial-failure notice, and one live
- *    socket per board.
+ *    socket per board;
+ *  - the dispatch-paused banner (`dispatch-pause.tsx`).
  *
  * With no fork backend it renders nothing and publishes nothing.
  */
@@ -30,6 +31,7 @@ import { useForkBackend } from '@/fork/kanban/backend'
 import { $hotEdge, BoardDependencyArrows } from '@/fork/kanban/board-arrows-layer'
 import { FOLD_KEY_ATTR, LANE_GAP_ATTR } from '@/fork/kanban/card-frame'
 import { buildGraph, chainSets, focusSets, indexBoard } from '@/fork/kanban/deps'
+import { DispatchPausedNotice } from '@/fork/kanban/dispatch-pause'
 import { foldLane } from '@/fork/kanban/lane-fold'
 import {
   $depView,
@@ -357,6 +359,7 @@ export function BoardOverlay({
 
   return (
     <>
+      <DispatchPausedNotice slug={slug} />
       {isAll && <BoardFilterChips boards={payload?.boards ?? []} />}
       {isAll && <BoardsErrorNotice errors={payload?.errors} />}
       {focused && hasEdges && (
