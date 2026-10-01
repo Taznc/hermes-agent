@@ -52,6 +52,10 @@ from hermes_cli.plugins_cmd_update import (  # noqa: F401
     _clear_plugin_bytecode, cmd_adopt, cmd_check_updates, cmd_trust_update_url, cmd_update,
     dashboard_update_user_plugin,
 )
+# >>> FORK ANCHOR: plugin-update-activation <<<
+from hermes_fork.plugin_update_activation import wrap_update_entry_points  # noqa: E402
+cmd_update, dashboard_update_user_plugin = wrap_update_entry_points(cmd_update, dashboard_update_user_plugin)
+# <<< FORK ANCHOR >>>
 
 logger = logging.getLogger(__name__)
 _DEFAULT_CLONE_TIMEOUT_SECONDS = 300

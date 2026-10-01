@@ -1245,6 +1245,10 @@ def _publish_host_rendezvous(host: str, port: int) -> None:
             "This is NOT another backend holding it.", error)
         return
     if outcome is hr.HostLockOutcome.HELD_BY_OTHER:
+        # >>> FORK ANCHOR: serve-peer-record <<<
+        from hermes_fork.serve_peers import publish_serve_peer
+        publish_serve_peer(host, port, _SESSION_TOKEN)  # plugin activation still reaches this backend
+        # <<< FORK ANCHOR >>>
         owner = hr.read_record(role)
         if desktop_child:
             # A second pool child is Desktop's own topology, not a conflict.
