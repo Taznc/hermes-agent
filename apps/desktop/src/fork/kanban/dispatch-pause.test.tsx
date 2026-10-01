@@ -19,8 +19,9 @@ import { $notifications, clearNotifications } from '@/store/notifications'
 
 import { ALL_BOARDS } from './all-boards'
 import { resetForkBackend } from './backend'
-import { dispatchPath } from './dispatch-pause'
+import { dispatchPath, type DispatchStatus, drainText } from './dispatch-pause'
 import { resetFocus } from './state'
+import type { KanbanText } from './text'
 
 const NOT_FOUND = "Error invoking remote method 'hermes:api': Error: 404: {\"detail\":\"Not Found\"}"
 
@@ -32,6 +33,7 @@ let paused = new Set<string>()
 let running: Record<string, number> = {}
 let estop: null | { reason: string } = null
 let busyNext = false
+let unreadable = new Set<string>()
 
 function boardStatus(board: string) {
   return {
@@ -63,17 +65,20 @@ const forkRest = vi.fn(async (_plugin: string, path: string, opts?: PluginRestOp
   }
 
   if (pathname === '/dispatch/status') {
-    const boards = slugs.map(boardStatus)
+    // Mirrors kanban-fork: unreadable boards land in `errors`, count toward
+    // board_count, and make running_count unknown (null).
+    const boards = slugs.filter(s => !unreadable.has(s)).map(boardStatus)
+    const errors = slugs.filter(s => unreadable.has(s)).map(board => ({ board, detail: 'disk gone' }))
     const pausedCount = boards.filter(b => b.paused).length
 
     return {
-      board_count: boards.length,
+      board_count: slugs.length,
       boards,
-      errors: [],
+      errors,
       estop,
-      paused: pausedCount === boards.length,
+      paused: pausedCount === slugs.length,
       paused_count: pausedCount,
-      running_count: boards.reduce((sum, b) => sum + b.running_count, 0),
+      running_count: errors.length ? null : boards.reduce((sum, b) => sum + b.running_count, 0),
       scope: all ? 'all' : 'board'
     }
   }
@@ -145,6 +150,7 @@ beforeEach(() => {
   running = {}
   estop = null
   busyNext = false
+  unreadable = new Set()
   disposeLocales = registerPluginLocales('kanban', KANBAN_LOCALES)
 })
 
@@ -270,15 +276,73 @@ describe('All Boards', () => {
     await waitFor(() => expect(banner()).toBeNull())
   })
 
-  it('reports a partial pause and keeps both actions available', async () => {
+  it('reports a partial pause without restart clearance and keeps both actions available', async () => {
+    // beta paused, alpha live, nothing running: alpha can claim work at any
+    // moment, so this is a count, never "safe to restart".
     paused = new Set(['beta'])
     await mount(ALL_BOARDS)
 
-    await waitFor(() => expect(summary()).toBe('1 of 2 boards paused · 0 running — safe to restart'))
+    await waitFor(() => expect(summary()).toBe('1 of 2 boards paused · 0 running'))
     expect(control()?.dataset.paused).toBe('false')
     expect(screen.getByRole('button', { name: 'Pause all boards' })).toHaveProperty('disabled', false)
     expect(screen.getByRole('button', { name: 'Resume all boards' })).toHaveProperty('disabled', false)
-    expect(banner()?.textContent).toContain('1 of 2 boards paused')
+    expect(banner()?.textContent).toContain('1 of 2 boards paused · 0 running')
+    expect(root.textContent).not.toContain('safe to restart')
+  })
+
+  it('never clears a restart when a board could not be read, and names it', async () => {
+    // Every board paused, but alpha's read failed: its workers are unknown,
+    // so "0 running" from the readable boards is not a drain signal.
+    paused = new Set(BOARDS)
+    running = { alpha: 3 }
+    unreadable = new Set(['alpha'])
+    await mount(ALL_BOARDS)
+
+    const unknown = 'running count unknown — could not read alpha'
+
+    await waitFor(() => expect(summary()).toBe(`1 of 2 boards paused · ${unknown}`))
+    expect(banner()?.textContent).toContain(`1 of 2 boards paused · ${unknown}`)
+    expect(root.textContent).not.toContain('safe to restart')
+    expect(control()?.dataset.paused).toBe('false')
+    // A retry of the fan-out is still on offer, as is resume.
+    expect(screen.getByRole('button', { name: 'Pause all boards' })).toHaveProperty('disabled', false)
+    expect(screen.getByRole('button', { name: 'Resume all boards' })).toHaveProperty('disabled', false)
+  })
+
+  it('shows an unreadable board even when nothing is paused yet', async () => {
+    unreadable = new Set(['beta'])
+    await mount(ALL_BOARDS)
+
+    await waitFor(() => expect(summary()).toBe('0 of 2 boards paused · running count unknown — could not read beta'))
+  })
+})
+
+describe('drainText', () => {
+  const k = {
+    draining: (n: number) => `${n} draining`,
+    runningCount: (n: number) => `${n} running`,
+    safeToRestart: 'safe',
+    statusUnknown: (b: string) => `unknown ${b}`
+  } as unknown as KanbanText
+
+  const status = (over: Partial<DispatchStatus>): DispatchStatus => ({
+    board_count: 2,
+    boards: [],
+    errors: [],
+    estop: null,
+    paused: true,
+    paused_count: 2,
+    running_count: 0,
+    scope: 'all',
+    ...over
+  })
+
+  it('clears a restart only when every board is paused, all reads succeeded, and nothing runs', () => {
+    expect(drainText(k, status({}))).toBe('safe')
+    expect(drainText(k, status({ running_count: 2 }))).toBe('2 draining')
+    expect(drainText(k, status({ paused: false, paused_count: 1 }))).toBe('0 running')
+    expect(drainText(k, status({ errors: [{ board: 'a', detail: 'x' }], running_count: null }))).toBe('unknown a')
+    expect(drainText(k, status({ running_count: null }))).toBe('unknown ')
   })
 })
 

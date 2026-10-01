@@ -25,7 +25,7 @@ import { Button } from '@/components/ui/button'
 import { Codicon } from '@/components/ui/codicon'
 import { ALL_BOARDS, boardSlugAtom, FORK_PLUGIN_ID } from '@/fork/kanban/all-boards'
 import { useForkBackend } from '@/fork/kanban/backend'
-import { useKanban } from '@/fork/kanban/text'
+import { type KanbanText, useKanban } from '@/fork/kanban/text'
 import { $activeConnectionId } from '@/store/connections'
 import { notify, notifyError } from '@/store/notifications'
 
@@ -44,7 +44,8 @@ export interface DispatchStatus {
   estop: null | { engaged_at?: null | string; reason?: null | string }
   paused: boolean
   paused_count: number
-  running_count: number
+  /** `null` when any targeted board could not be read: the drain count is unknown. */
+  running_count: null | number
   scope: 'all' | 'board'
 }
 
@@ -88,6 +89,26 @@ function useDispatchStatus(slug: string, enabled: boolean) {
 }
 
 const failedBoards = (failures: Array<{ board: string }>) => failures.map(f => f.board).join(', ')
+
+/**
+ * The drain line. Restart clearance ("safe to restart") needs a complete read
+ * (no unreadable board, a known count), every targeted board paused, and 0
+ * running. A partial pause shows the count only: an unpaused board can start
+ * work at any moment. An incomplete read names the boards and clears nothing.
+ */
+export function drainText(k: KanbanText, status: DispatchStatus): string {
+  const running = status.running_count
+
+  if (status.errors.length || running === null) {
+    return k.statusUnknown(failedBoards(status.errors))
+  }
+
+  if (!status.paused) {
+    return k.runningCount(running)
+  }
+
+  return running === 0 ? k.safeToRestart : k.draining(running)
+}
 
 export function DispatchControl() {
   const k = useKanban()
@@ -142,8 +163,7 @@ export function DispatchControl() {
     ) : null
   }
 
-  const running = status.running_count
-  const drain = running === 0 ? k.safeToRestart : k.draining(running)
+  const drain = drainText(k, status)
   const note = !isAll ? status.boards[0]?.state?.note : undefined
 
   return (
@@ -179,7 +199,7 @@ export function DispatchControl() {
         )}
         <span className="text-[0.75rem] text-(--ui-text-secondary)" data-dispatch-summary>
           {isAll
-            ? status.paused_count > 0
+            ? status.paused_count > 0 || status.errors.length
               ? `${k.boardsPaused(status.paused_count, status.board_count)} · ${drain}`
               : k.dispatchRunning
             : status.paused
@@ -215,8 +235,7 @@ export function DispatchPausedNotice({ slug }: { slug: string }) {
   }
 
   const isAll = slug === ALL_BOARDS
-  const running = status.running_count
-  const drain = running === 0 ? k.safeToRestart : k.draining(running)
+  const drain = drainText(k, status)
 
   const text = status.estop
     ? k.estopEngaged(status.estop.reason ?? '')
