@@ -183,6 +183,8 @@ async function mount(slug: string, { openSettings = true } = {}) {
   if (openSettings) {
     fireEvent.click(await screen.findByRole('button', { name: 'Orchestration settings' }))
   }
+
+  return client
 }
 
 const control = () => root.querySelector<HTMLElement>('[data-dispatch-control]')
@@ -252,6 +254,21 @@ describe('single board', () => {
 })
 
 describe('All Boards', () => {
+  it('revokes restart clearance after a previously successful status read fails', async () => {
+    paused = new Set(BOARDS)
+    const client = await mount(ALL_BOARDS)
+    await waitFor(() => expect(summary()).toContain('safe to restart'))
+    expect(banner()?.textContent).toContain('safe to restart')
+
+    forkUp = false
+    await client.invalidateQueries({ queryKey: ['kanban-fork', 'dispatch'] })
+    await waitFor(() =>
+      expect(client.getQueryState(['kanban-fork', 'dispatch', 'local', ALL_BOARDS])?.status).toBe('error')
+    )
+    expect.soft(summary()).not.toContain('safe to restart')
+    expect.soft(banner()?.textContent).not.toContain('safe to restart')
+  })
+
   it('pauses every board at once, then resumes them all', async () => {
     running = { alpha: 1, beta: 2 }
     await mount(ALL_BOARDS)
