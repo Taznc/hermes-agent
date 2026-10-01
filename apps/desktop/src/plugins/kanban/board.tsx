@@ -260,8 +260,10 @@ function Card({
   const summary = task.latest_summary || task.body
   const fallback = useDefaultAssignee()
   const arc = arcState(task, fallback)
+  // >>> FORK ANCHOR: kanban-focus <<< (+ `fork ??` below) seam: host.fork.kanban from '@/fork/kanban/card-frame'
+  const fork = host.fork?.kanban?.frameCard(Card, { columns, onDelete, onMove, onOpen, onToggleSelect, selected, task })
 
-  return (
+  return fork ?? (
     <ContextMenu>
       <ContextMenuTrigger asChild>
         <div
@@ -1369,6 +1371,7 @@ export function KanbanBoardPage() {
       {settingsOpen && <OrchestrationPanel />}
 
       {board && <Intro />}
+      {host.fork?.kanban?.boardOverlay({ board, slug, stripRef: lanesRef }) /* FORK ANCHOR: kanban-focus */}
 
       {errorMessage && !board ? (
         <div className="grid flex-1 place-items-center">

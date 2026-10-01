@@ -335,7 +335,9 @@ export function BoardSwitcher() {
 
   const currentSlug = slug || boards.current
   const current = boards.boards.find(meta => meta.slug === currentSlug)
-  const label = current?.name || current?.slug || k.board
+  // >>> FORK ANCHOR: kanban-all-boards <<< seam: host.fork.kanban from '@/fork/kanban/switcher'
+  const label = host.fork?.kanban?.boardLabel(slug) || current?.name || current?.slug || k.board
+  // <<< FORK ANCHOR >>>
 
   return (
     <>
@@ -359,6 +361,7 @@ export function BoardSwitcher() {
           </DropdownMenuTrigger>
         </Tip>
         <DropdownMenuContent align="center">
+          {host.fork?.kanban?.allBoardsItem(slug, boards.boards) /* FORK ANCHOR: kanban-all-boards */}
           {boards.boards.map(meta => (
             <DropdownMenuItem
               key={meta.slug}

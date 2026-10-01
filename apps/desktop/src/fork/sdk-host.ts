@@ -1,5 +1,6 @@
 import { computed, type ReadableAtom } from 'nanostores'
 
+import { forkKanban } from '@/fork/kanban/host'
 import { refreshProjectTree } from '@/store/projects'
 import { $sessions, sessionMatchesStoredId } from '@/store/session'
 import { $removedSessionIds } from '@/store/session-removal'
@@ -129,5 +130,7 @@ export const forkHost = {
     GROUP_ACTION_AREA: SIDEBAR_GROUP_ACTION_AREA
   },
   /** X02 plugin UI bridge (see ui-bridge/sdk.ts). */
-  ui: forkUi
+  ui: forkUi,
+  /** Kanban focus mode + All Boards (see kanban/host.ts). */
+  kanban: forkKanban
 }
