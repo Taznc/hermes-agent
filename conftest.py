@@ -10,16 +10,19 @@ from pathlib import Path
 
 import pytest
 
-_FORK_TESTS = Path(__file__).resolve().parent / "tests" / "hermes_fork"
+_ROUTE_POLICY_TESTS = (
+    Path(__file__).resolve().parent / "tests" / "hermes_fork" / "kanban" / "test_route_policy.py"
+)
 
 
 @pytest.fixture(autouse=True)
-def _fork_route_policy_admits_upstream_suites(request, monkeypatch):
+def _fork_route_policy_admits_other_suites(request, monkeypatch):
     """Unattended route policy (``hermes_fork/kanban/route_policy.py``) stays
-    live for ``tests/hermes_fork/``; upstream's dispatch suites use model-less
-    throwaway profiles to test claim/spawn mechanics, so admission is waived
-    for them via the module's test-only seam."""
-    if _FORK_TESTS in Path(str(request.node.path)).resolve().parents:
+    live only for its own tests; every other dispatch suite (upstream's and
+    the fork's other kanban seams) uses model-less throwaway profiles to test
+    claim/spawn mechanics, so admission is waived for them via the module's
+    test-only seam."""
+    if Path(str(request.node.path)).resolve() == _ROUTE_POLICY_TESTS:
         yield
         return
     try:
