@@ -120,6 +120,9 @@ def admit(
     at most ``k`` (shared by the ready and review lanes); with none left it
     returns ``(False, None)`` so nothing is claimed.
 
+    A board paused by :mod:`hermes_fork.kanban.dispatch_pause` refuses the
+    tick outright (after the hand-back sweep, which moves no worker).
+
     First, unconditionally, it runs the review-routing hand-back
     (:func:`hermes_fork.kanban.review_routing.return_diagnosed`): this anchor
     is the fork's only per-tick seam that runs under the board's tick lock
@@ -134,6 +137,11 @@ def admit(
         from hermes_cli import kanban_db as _kb
 
         _kb._log.exception("kanban review rework hand-back sweep failed")
+    # Per-board operator pause rides this anchor too (same lock, same point).
+    from hermes_fork.kanban.dispatch_pause import admit as admit_unpaused
+
+    if not admit_unpaused(conn, result, may_spawn):
+        return False, None
     budget, window = settings()
     if budget is None or not may_spawn:
         return may_spawn, spawn_budget

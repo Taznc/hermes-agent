@@ -37,6 +37,24 @@ export const en = {
   allBoardsTip: 'Show every board at once',
   boardChipTip: (name: string) => `Show or hide ${name}`,
   boardsError: (n: number) => (n === 1 ? '1 board could not be read' : `${n} boards could not be read`),
+  dispatchControl: 'Dispatch',
+  pauseDispatch: 'Pause dispatch',
+  resumeDispatch: 'Resume dispatch',
+  draining: (running: number) => `${running} running — draining`,
+  safeToRestart: '0 running — safe to restart',
+  runningCount: (running: number) => `${running} running`,
+  statusUnknown: (boards: string) => `running count unknown — could not read ${boards}`,
+  statusStale: 'status refresh failed — last known state, running count unknown',
+  dispatchRunning: 'Dispatching normally',
+  pauseBusy: 'A dispatch tick is in progress — try pausing again in a moment.',
+  pauseAllBoards: 'Pause all boards',
+  resumeAllBoards: 'Resume all boards',
+  boardsPaused: (paused: number, total: number) => `${paused} of ${total} boards paused`,
+  pauseHint:
+    'Stops new workers being claimed and spawned. Workers already running are never killed — wait for the count to reach 0 before restarting the gateway.',
+  dispatchPaused: 'Dispatch paused',
+  estopEngaged: (reason: string) =>
+    `Hermes is paused (hermes pause${reason ? `: ${reason}` : ''}) — no board dispatches until \`hermes resume\`.`
 } satisfies PluginMessages
 
 const ja = {
@@ -66,6 +84,24 @@ const ja = {
   depGapShow: 'フォーカス中のカードとは無関係です — クリックで表示',
   depFocusHint: 'カードをクリックすると依存関係をたどれます · Esc で解除',
   allBoards: 'すべてのボード',
+  dispatchControl: 'ディスパッチ',
+  pauseDispatch: 'ディスパッチを一時停止',
+  resumeDispatch: 'ディスパッチを再開',
+  dispatchPaused: 'ディスパッチ一時停止中',
+  draining: (running: number) => `実行中 ${running} 件 — 排出中`,
+  safeToRestart: '実行中 0 件 — 再起動しても安全',
+  runningCount: (running: number) => `実行中 ${running} 件`,
+  statusUnknown: (boards: string) => `実行中の件数は不明 — ${boards} を読み取れませんでした`,
+  statusStale: '状態の更新に失敗 — 最後に確認した状態、実行中の件数は不明',
+  dispatchRunning: '通常どおりディスパッチ中',
+  pauseBusy: 'ディスパッチのティック実行中です。少し待ってからもう一度お試しください。',
+  pauseAllBoards: 'すべてのボードを一時停止',
+  resumeAllBoards: 'すべてのボードを再開',
+  boardsPaused: (paused: number, total: number) => `${total} 件中 ${paused} 件のボードが一時停止中`,
+  pauseHint:
+    '新しいワーカーの取得と起動を停止します。実行中のワーカーが強制終了されることはありません。ゲートウェイを再起動する前に、件数が 0 になるまで待ってください。',
+  estopEngaged: (reason: string) =>
+    `Hermes は一時停止中です（hermes pause${reason ? `: ${reason}` : ''}）— \`hermes resume\` までどのボードもディスパッチしません。`
 } satisfies PluginMessages
 
 const zh = {
@@ -95,6 +131,23 @@ const zh = {
   depGapShow: '与聚焦卡片无关 — 点击显示',
   depFocusHint: '点击卡片可追踪其依赖链 · 按 Esc 清除',
   allBoards: '所有面板',
+  dispatchControl: '调度',
+  pauseDispatch: '暂停调度',
+  resumeDispatch: '恢复调度',
+  dispatchPaused: '调度已暂停',
+  draining: (running: number) => `${running} 个运行中 — 正在排空`,
+  safeToRestart: '0 个运行中 — 可以安全重启',
+  runningCount: (running: number) => `${running} 个运行中`,
+  statusUnknown: (boards: string) => `运行数量未知 — 无法读取 ${boards}`,
+  statusStale: '状态刷新失败 — 显示上次已知状态，运行数量未知',
+  dispatchRunning: '调度正常运行中',
+  pauseBusy: '正在执行一次调度周期，请稍后再试。',
+  pauseAllBoards: '暂停所有面板',
+  resumeAllBoards: '恢复所有面板',
+  boardsPaused: (paused: number, total: number) => `${total} 个面板中有 ${paused} 个已暂停`,
+  pauseHint: '停止领取和启动新的工作者。已在运行的工作者不会被终止 — 请等待计数归零后再重启网关。',
+  estopEngaged: (reason: string) =>
+    `Hermes 已暂停（hermes pause${reason ? `：${reason}` : ''}）— 在 \`hermes resume\` 之前所有面板都不会调度。`
 } satisfies PluginMessages
 
 const zhHant = {
@@ -124,6 +177,23 @@ const zhHant = {
   depGapShow: '與聚焦卡片無關 — 點擊顯示',
   depFocusHint: '點擊卡片可追蹤其相依鏈 · 按 Esc 清除',
   allBoards: '所有面板',
+  dispatchControl: '調度',
+  pauseDispatch: '暫停調度',
+  resumeDispatch: '恢復調度',
+  dispatchPaused: '調度已暫停',
+  draining: (running: number) => `${running} 個執行中 — 正在排空`,
+  safeToRestart: '0 個執行中 — 可以安全重啟',
+  runningCount: (running: number) => `${running} 個執行中`,
+  statusUnknown: (boards: string) => `執行數量未知 — 無法讀取 ${boards}`,
+  statusStale: '狀態重新整理失敗 — 顯示上次已知狀態，執行數量未知',
+  dispatchRunning: '調度正常執行中',
+  pauseBusy: '正在執行一次調度週期，請稍後再試。',
+  pauseAllBoards: '暫停所有面板',
+  resumeAllBoards: '恢復所有面板',
+  boardsPaused: (paused: number, total: number) => `${total} 個面板中有 ${paused} 個已暫停`,
+  pauseHint: '停止領取與啟動新的工作者。已在執行的工作者不會被終止 — 請等待計數歸零後再重啟閘道。',
+  estopEngaged: (reason: string) =>
+    `Hermes 已暫停（hermes pause${reason ? `：${reason}` : ''}）— 在 \`hermes resume\` 之前所有面板都不會調度。`
 } satisfies PluginMessages
 
 export type KanbanForkMessages = typeof en
