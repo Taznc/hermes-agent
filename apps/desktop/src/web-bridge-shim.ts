@@ -41,10 +41,10 @@
  */
 
 import { getApiRequestProfile } from '@/api/client'
+
 // >>> FORK ANCHOR: web-desktop-plugin-removal <<<
 import { createWebDesktopPluginRemoval } from './fork/web-desktop-plugin-removal'
 // <<< FORK ANCHOR >>>
-
 import type { DesktopBootstrapState, DesktopMarketplaceThemeResult } from './global'
 import { extractVsixThemes } from './lib/vsix-archive'
 
