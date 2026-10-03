@@ -5,7 +5,7 @@
  *
  * Every field is structurally compatible with upstream's `KanbanTask` /
  * `KanbanBoard` (a superset object type-checks against these), plus the three
- * fields only the fork's backend (`plugins/kanban-fork`) adds:
+ * fields only the fork's backend (`plugins/fork-kanban`) adds:
  *  - `board` / `board_name` on a task in the merged All Boards payload;
  *  - `link_edges` on a board payload (bare pairs for one board, tagged objects
  *    for All Boards).

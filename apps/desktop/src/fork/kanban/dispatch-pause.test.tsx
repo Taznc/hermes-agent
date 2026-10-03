@@ -3,7 +3,7 @@
  * orchestration panel, wired through `host.fork.kanban` exactly as production
  * is (the `kanban-dispatch-pause` anchor in orchestration.tsx and the
  * `boardOverlay` anchor in board.tsx). Only the network doors are faked:
- * upstream's plugin REST door and the fork backend's `pluginRest('kanban-fork', …)`,
+ * upstream's plugin REST door and the fork backend's `pluginRest('fork-kanban', …)`,
  * which here holds real per-board pause state so a click round-trips.
  */
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
@@ -65,7 +65,7 @@ const forkRest = vi.fn(async (_plugin: string, path: string, opts?: PluginRestOp
   }
 
   if (pathname === '/dispatch/status') {
-    // Mirrors kanban-fork: unreadable boards land in `errors`, count toward
+    // Mirrors fork-kanban: unreadable boards land in `errors`, count toward
     // board_count, and make running_count unknown (null).
     const boards = slugs.filter(s => !unreadable.has(s)).map(boardStatus)
     const errors = slugs.filter(s => unreadable.has(s)).map(board => ({ board, detail: 'disk gone' }))
@@ -244,8 +244,8 @@ describe('single board', () => {
     expect(banner()?.textContent).toContain('Dispatch paused · 0 running — safe to restart')
 
     forkUp = false
-    await client.invalidateQueries({ queryKey: ['kanban-fork', 'dispatch'] })
-    await waitFor(() => expect(client.getQueryState(['kanban-fork', 'dispatch', 'local', 'alpha'])?.status).toBe('error'))
+    await client.invalidateQueries({ queryKey: ['fork-kanban', 'dispatch'] })
+    await waitFor(() => expect(client.getQueryState(['fork-kanban', 'dispatch', 'local', 'alpha'])?.status).toBe('error'))
     expect(summary()).toBe('status refresh failed — last known state, running count unknown')
     expect(banner()?.textContent).toContain('Dispatch paused · status refresh failed')
     expect(control()?.dataset.stale).toBe('true')
@@ -257,7 +257,7 @@ describe('single board', () => {
     await waitFor(() => expect(summary()).toBe('Dispatching normally'))
 
     forkUp = false
-    await client.invalidateQueries({ queryKey: ['kanban-fork', 'dispatch'] })
+    await client.invalidateQueries({ queryKey: ['fork-kanban', 'dispatch'] })
     await waitFor(() => expect(control()?.dataset.stale).toBe('true'))
     expect(summary()).toBe('status refresh failed — last known state, running count unknown')
     // Nothing was paused, so the page banner stays out of the way.
@@ -288,11 +288,11 @@ describe('All Boards', () => {
     expect(banner()?.textContent).toContain('safe to restart')
 
     forkUp = false
-    await client.invalidateQueries({ queryKey: ['kanban-fork', 'dispatch'] })
+    await client.invalidateQueries({ queryKey: ['fork-kanban', 'dispatch'] })
     await waitFor(() =>
-      expect(client.getQueryState(['kanban-fork', 'dispatch', 'local', ALL_BOARDS])?.status).toBe('error')
+      expect(client.getQueryState(['fork-kanban', 'dispatch', 'local', ALL_BOARDS])?.status).toBe('error')
     )
-    expect(client.getQueryState(['kanban-fork', 'dispatch', 'local', ALL_BOARDS])?.data).toBeDefined()
+    expect(client.getQueryState(['fork-kanban', 'dispatch', 'local', ALL_BOARDS])?.data).toBeDefined()
     // The cached paused/zero-running data stays, but it is no longer a drain signal.
     expect(summary()).toBe('2 of 2 boards paused · status refresh failed — last known state, running count unknown')
     expect(banner()?.textContent).toContain('2 of 2 boards paused · status refresh failed')
@@ -302,7 +302,7 @@ describe('All Boards', () => {
 
     // A later good read restores clearance.
     forkUp = true
-    await client.invalidateQueries({ queryKey: ['kanban-fork', 'dispatch'] })
+    await client.invalidateQueries({ queryKey: ['fork-kanban', 'dispatch'] })
     await waitFor(() => expect(summary()).toBe('2 of 2 boards paused · 0 running — safe to restart'))
     expect(control()?.dataset.stale).toBeUndefined()
   })

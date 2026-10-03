@@ -203,7 +203,7 @@ export function BoardOverlay({
   const { data: edges } = useQuery({
     enabled: on && !isAll && Boolean(board),
     queryFn: () => fetchLinkEdges(slug),
-    queryKey: ['kanban-fork', 'edges', scope, slug, tail, cardCount],
+    queryKey: ['fork-kanban', 'edges', scope, slug, tail, cardCount],
     retry: false,
     staleTime: Infinity
   })

@@ -64,7 +64,7 @@ function deliver(id: string, sessionId: string, messages: ChatMessage[], payload
     fail: vi.fn(),
     id,
     method: 'plugin.request',
-    params: { kind: 'ask/questions', payload, session_id: sessionId },
+    params: { kind: 'fork-ask/questions', payload, session_id: sessionId },
     profile: 'default',
     replayed: false,
     respond: vi.fn()
@@ -128,7 +128,7 @@ beforeEach(() => {
   resetUiBridgeForTests()
   dispose = registry.register({
     area: UI_REQUEST_AREA,
-    data: { kind: 'ask/questions', render: Card, renderResult: Settled, tool: 'ask' },
+    data: { kind: 'fork-ask/questions', render: Card, renderResult: Settled, tool: 'ask' },
     id: 'ask:questions'
   })
 })
@@ -221,7 +221,7 @@ describe('inline slot (mounted)', () => {
     dispose()
     dispose = registry.register({
       area: UI_REQUEST_AREA,
-      data: { kind: 'ask/questions', render: Card },
+      data: { kind: 'fork-ask/questions', render: Card },
       id: 'ask:questions'
     })
 
@@ -253,6 +253,6 @@ describe('inline slot (mounted)', () => {
 
     const card = screen.getByTestId('card')
     expect(card.textContent).toContain('via anchor?')
-    expect(card.closest('[data-fork-ui-request="ask/questions"]')).toBeTruthy()
+    expect(card.closest('[data-fork-ui-request="fork-ask/questions"]')).toBeTruthy()
   })
 })

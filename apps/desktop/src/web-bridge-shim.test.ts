@@ -81,7 +81,7 @@ describe('web-bridge-shim api() default timeout', () => {
   })
 })
 
-// ── desktop-plugin door (web-desktop-bridge backend plugin) ─────────────────
+// ── desktop-plugin door (fork-web-desktop-bridge backend plugin) ─────────────────
 interface BridgeMembers {
   desktopPluginsRoot: () => Promise<string>
   agentPluginsRoot: () => Promise<string>
@@ -121,7 +121,7 @@ describe('web-bridge-shim desktop-plugin door', () => {
   function bridgeCalls(): [URL, RequestInit][] {
     return fetchMock.mock.calls
       .map(([input, init]) => [new URL(String(input)), (init ?? {}) as RequestInit] as [URL, RequestInit])
-      .filter(([url]) => url.pathname.startsWith('/api/plugins/web-desktop-bridge/'))
+      .filter(([url]) => url.pathname.startsWith('/api/plugins/fork-web-desktop-bridge/'))
   }
 
   function calledUrl(index = 0): URL {
@@ -133,7 +133,7 @@ describe('web-bridge-shim desktop-plugin door', () => {
     const bridge = await loadBridge()
 
     await expect(bridge.desktopPluginsRoot()).resolves.toBe('/srv/home/desktop-plugins')
-    expect(calledUrl().pathname).toBe('/api/plugins/web-desktop-bridge/desktop-plugins-root')
+    expect(calledUrl().pathname).toBe('/api/plugins/fork-web-desktop-bridge/desktop-plugins-root')
   })
 
   it('desktopPluginsRoot answers "" on 404 and stops re-requesting the absent route', async () => {
@@ -177,7 +177,7 @@ describe('web-bridge-shim desktop-plugin door', () => {
     const bridge = await loadBridge()
 
     await expect(bridge.readPluginSource('/r/p/plugin.js')).resolves.toMatchObject({ text: 'x()' })
-    expect(calledUrl().pathname).toBe('/api/plugins/web-desktop-bridge/read-plugin-source')
+    expect(calledUrl().pathname).toBe('/api/plugins/fork-web-desktop-bridge/read-plugin-source')
     expect(calledUrl().searchParams.get('path')).toBe('/r/p/plugin.js')
   })
 
@@ -198,7 +198,7 @@ describe('web-bridge-shim desktop-plugin door', () => {
       warnings: []
     })
     const [, init] = bridgeCalls()[0]
-    expect(calledUrl().pathname).toBe('/api/plugins/web-desktop-bridge/probe')
+    expect(calledUrl().pathname).toBe('/api/plugins/fork-web-desktop-bridge/probe')
     expect(init.method).toBe('POST')
     expect(JSON.parse(String(init.body))).toEqual({ identifier: 'owner/repo' })
   })
@@ -231,7 +231,7 @@ describe('web-bridge-shim desktop-plugin door', () => {
       path: '/r/p'
     })
     const [, init] = bridgeCalls()[0]
-    expect(calledUrl().pathname).toBe('/api/plugins/web-desktop-bridge/desktop-install')
+    expect(calledUrl().pathname).toBe('/api/plugins/fork-web-desktop-bridge/desktop-install')
     expect(calledUrl().searchParams.has('profile')).toBe(false)
     expect(JSON.parse(String(init.body))).toEqual({ identifier: 'owner/repo', force: true })
   })

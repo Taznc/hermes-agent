@@ -4,7 +4,7 @@
  *
  * `$forkBackend` is `null` until the probe resolves, then true/false for the
  * active connection. Everything the fork adds is gated on it being `true`, so
- * a backend without the `kanban-fork` plugin renders upstream's board exactly:
+ * a backend without the `fork-kanban` plugin renders upstream's board exactly:
  * no All Boards option, no trace affordance (counts stay upstream's own), and
  * no errors or toasts — the probe swallows every failure.
  */

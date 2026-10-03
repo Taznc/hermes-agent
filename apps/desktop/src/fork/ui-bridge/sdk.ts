@@ -18,7 +18,7 @@ export type {
  * tool call that asked:
  *
  *   ctx.register({ id: 'ask', area: host.fork.ui.UI_REQUEST_AREA,
- *                  data: { kind: 'ask/questions', render: props => … } })
+ *                  data: { kind: 'fork-ask/questions', render: props => … } })
  *
  * `render({params, respond, cancel, sessionId, isActive, kind})`; `respond(payload)` is
  * what `ui.request` returns, `cancel()` makes it return None. No renderer for `kind` →

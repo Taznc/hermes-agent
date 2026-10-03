@@ -1,6 +1,6 @@
 /**
  * All Boards: one merged view of every live board, served by the fork's
- * backend plugin (`GET /api/plugins/kanban-fork/board/all`). Selecting it sets
+ * backend plugin (`GET /api/plugins/fork-kanban/board/all`). Selecting it sets
  * upstream's `$boardSlug` to the `ALL_BOARDS` sentinel; upstream's kanban then
  * reaches this module through ONE anchored call in its `api.ts` REST funnel
  * (`call` → `routeCall`):
@@ -29,7 +29,7 @@ export type Rest = <T>(path: string, opts?: PluginRestOptions) => Promise<T>
 
 export const ALL_BOARDS = '*'
 
-export const FORK_PLUGIN_ID = 'kanban-fork'
+export const FORK_PLUGIN_ID = 'fork-kanban'
 
 export interface AllBoardsInfo {
   color?: string
@@ -74,7 +74,7 @@ function indexTasks(payload: AllBoardsPayload): void {
   }
 
   if (clashes.size > 0) {
-    console.warn('[kanban-fork] task ids shared across boards; actions route to the first board:', [...clashes])
+    console.warn('[fork-kanban] task ids shared across boards; actions route to the first board:', [...clashes])
   }
 }
 

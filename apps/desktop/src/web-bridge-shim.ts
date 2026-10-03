@@ -80,7 +80,7 @@ interface SpikeReadFileTextResult {
   truncated?: boolean
 }
 
-// Wire shapes of the web-desktop-bridge plugin's probe and desktop-install
+// Wire shapes of the fork-web-desktop-bridge plugin's probe and desktop-install
 // routes. Deliberately identical to
 // PluginProbeResult / DesktopPluginInstallResult in global.d.ts (and to what
 // electron/desktop-plugin-install.ts returns) so the backend response is
@@ -776,12 +776,12 @@ async function api<T>(request: SpikeApiRequest, responseType: 'json' | 'response
 // ── Desktop-plugin door ─────────────────────────────────────────────────────
 // Electron answers these five members from its main process (electron/fs-ipc.ts
 // + electron/desktop-plugin-install.ts). A browser tab has no main process, so
-// they proxy to the opt-in `web-desktop-bridge` backend plugin:
+// they proxy to the opt-in `fork-web-desktop-bridge` backend plugin:
 //   GET  desktop-plugins-root / agent-plugins-root  -> { path }
 //   GET  read-plugin-source?path=                    -> HermesReadFileTextResult
 //   POST probe { identifier }                        -> PluginProbeResult
 //   POST desktop-install { identifier, force }       -> DesktopPluginInstallResult
-// all under /api/plugins/web-desktop-bridge/, token-gated like every /api route
+// all under /api/plugins/fork-web-desktop-bridge/, token-gated like every /api route
 // (api() carries the session token and the 30s timeout ceiling).
 //
 // The plugin is opt-in, so every member must survive a backend that does not
@@ -807,8 +807,8 @@ async function api<T>(request: SpikeApiRequest, responseType: 'json' | 'response
 // be the very root the scan reads. agentPluginsRoot IS profile-scoped in
 // Electron (<HERMES_HOME>/profiles/<p>/plugins), so it carries the active
 // request profile like the shim's other profile-scoped calls.
-const BRIDGE_API = '/api/plugins/web-desktop-bridge'
-const BRIDGE_NOT_ENABLED = 'The web-desktop-bridge plugin is not enabled on this backend.'
+const BRIDGE_API = '/api/plugins/fork-web-desktop-bridge'
+const BRIDGE_NOT_ENABLED = 'The fork-web-desktop-bridge plugin is not enabled on this backend.'
 
 // Git clone + validation server-side budgets ~60s; the 30s api() default would
 // abort a legitimate slow clone first.
@@ -1177,7 +1177,7 @@ const shim = {
   readFileText: async (filePath: string) =>
     api<SpikeReadFileTextResult>({ path: `/api/fs/read-text?path=${encodeURIComponent(filePath)}` }),
 
-  // ── desktop-plugin door (web-desktop-bridge backend plugin) ─────────────
+  // ── desktop-plugin door (fork-web-desktop-bridge backend plugin) ─────────────
   // desktopPluginsRoot / agentPluginsRoot / readPluginSource and the
   // probePluginRepo / installDesktopPlugin install door. See the
   // "Desktop-plugin door" block above for the routes and how each member
@@ -1464,7 +1464,7 @@ const shim = {
   // instead of a push notification; disk plugins (account-limits included)
   // still discover and load correctly on the initial scan/poll via
   // desktopPluginsRoot/agentPluginsRoot + readDir/readPluginSource above —
-  // when the web-desktop-bridge backend plugin is enabled. Without it those
+  // when the fork-web-desktop-bridge backend plugin is enabled. Without it those
   // members answer '' / { ok: false } (see the "Desktop-plugin door" block)
   // and the disk door stays empty, as before. reconcileDesktopPlugins and
   // openDir remain omitted: the bridge plugin serves no route for them and

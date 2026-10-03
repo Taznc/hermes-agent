@@ -14,7 +14,7 @@ it('removes a standalone plugin through the authenticated backend route and repo
   const bridge = window.hermesDesktop!
   expect(await bridge.removeDesktopPlugin?.({ name: 'demo' })).toMatchObject({ ok: true })
   const [url, request] = fetchMock.mock.calls.find(([input]) => String(input).includes('desktop-remove'))!
-  expect(new URL(String(url)).pathname).toBe('/api/plugins/web-desktop-bridge/desktop-remove')
+  expect(new URL(String(url)).pathname).toBe('/api/plugins/fork-web-desktop-bridge/desktop-remove')
   expect(request.method).toBe('POST')
   expect(JSON.parse(String(request.body))).toEqual({ name: 'demo' })
 

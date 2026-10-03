@@ -1,6 +1,6 @@
 /**
  * Typed access to the fork's Kanban strings (`i18n.ts`, registered under the
- * `kanban-fork` plugin id) plus upstream kanban's own column labels, so a
+ * `fork-kanban` plugin id) plus upstream kanban's own column labels, so a
  * status reads the same in the answer bar as on the lane header.
  */
 
@@ -10,7 +10,7 @@ import { en, KANBAN_FORK_LOCALES } from '@/fork/kanban/i18n'
 import { type PluginTranslate, registerPluginLocales, translatePlugin, usePluginI18n } from '@/i18n/plugin-i18n'
 import { getRuntimeI18nLocale } from '@/i18n/runtime'
 
-export const KANBAN_FORK_I18N_ID = 'kanban-fork'
+export const KANBAN_FORK_I18N_ID = 'fork-kanban'
 
 // Idempotent (registry merges per locale); module scope so the strings exist
 // before the first card renders.
