@@ -50,8 +50,7 @@ def _annotation_read_only_hint(mcp_tool: Any) -> bool:
     annotations = getattr(mcp_tool, "annotations", None)
     # >>> FORK ANCHOR: mcp-read-only-hint <<<
     from hermes_fork.mcp_hints import read_only_hint
-    return read_only_hint(annotations)
-    # <<< FORK ANCHOR >>>
+    return read_only_hint(annotations)  # <<< FORK ANCHOR >>>
 
 
 def _record_tool_trust_metadata(server_name: str, config: dict, tools: List[Any], key=None) -> None:
