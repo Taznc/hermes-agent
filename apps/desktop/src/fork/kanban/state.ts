@@ -49,7 +49,7 @@ export function toggleFocus(key: string): void {
 
 /** A localStorage-backed boolean atom (answer-bar display toggles). */
 function persisted(key: string, fallback: boolean) {
-  const storageKey = `hermes.kanban-fork.${key}`
+  const storageKey = `hermes.kanban-fork.${key}` // pre-rename key, kept so saved board choices survive
   let initial = fallback
 
   try {

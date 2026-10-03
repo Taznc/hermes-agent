@@ -1,6 +1,6 @@
 /**
  * Dispatch pause/resume for one board or every board (dev 95bea51183 parity),
- * served by the `kanban-fork` backend's `/dispatch/*` routes (T0) over the
+ * served by the `fork-kanban` backend's `/dispatch/*` routes (T0) over the
  * fork's T1 `hermes_fork.kanban.dispatch_pause`.
  *
  *  - `DispatchControl`: the orchestration panel's control, mounted by one
@@ -67,7 +67,7 @@ const NO_SLUG = atom('')
 export const dispatchPath = (route: string, slug: string) =>
   slug ? `/dispatch/${route}?board=${encodeURIComponent(slug)}` : `/dispatch/${route}`
 
-export const dispatchKey = (scope: string, slug: string) => ['kanban-fork', 'dispatch', scope, slug] as const
+export const dispatchKey = (scope: string, slug: string) => ['fork-kanban', 'dispatch', scope, slug] as const
 
 const fetchStatus = (slug: string) => pluginRest<DispatchStatus>(FORK_PLUGIN_ID, dispatchPath('status', slug))
 
@@ -123,7 +123,7 @@ export function DispatchControl() {
   const slug = useSlug()
   const isAll = slug === ALL_BOARDS
   const { data: status, error } = useDispatchStatus(slug, backend === true)
-  const refresh = () => void qc.invalidateQueries({ queryKey: ['kanban-fork', 'dispatch'] })
+  const refresh = () => void qc.invalidateQueries({ queryKey: ['fork-kanban', 'dispatch'] })
 
   const pause = useMutation({
     mutationFn: () => pluginRest<PauseReply>(FORK_PLUGIN_ID, dispatchPath('pause', slug), { body: {}, method: 'POST' }),

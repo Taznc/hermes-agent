@@ -17,7 +17,7 @@
  *                                      dispatch for the board or all boards.
  *
  * Plugins feature-detect: `host.fork?.kanban?.version >= 1`, falling back to
- * upstream behaviour when absent. With no `kanban-fork` backend on the
+ * upstream behaviour when absent. With no `fork-kanban` backend on the
  * connection every member degrades to a no-op/pass-through.
  */
 

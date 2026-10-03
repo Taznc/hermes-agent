@@ -2,7 +2,7 @@
  * All Boards in upstream's board switcher: the dropdown item (anchored into
  * `board-switcher.tsx`'s menu) and the trigger label while it is selected.
  * Both render nothing / fall through unless the fork backend answered the
- * probe, so a backend without `kanban-fork` never offers the option.
+ * probe, so a backend without `fork-kanban` never offers the option.
  */
 
 import { Codicon } from '@/components/ui/codicon'

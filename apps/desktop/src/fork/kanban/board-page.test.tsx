@@ -3,7 +3,7 @@
  * board switcher, wired through `host.fork.kanban` exactly as production is.
  * Only the two network doors are faked: upstream's plugin REST door (handed
  * to `bindApi`, as the plugin loader does) and the fork backend's
- * `pluginRest('kanban-fork', …)`. Adapted from dev's board.all-boards,
+ * `pluginRest('fork-kanban', …)`. Adapted from dev's board.all-boards,
  * board.answer-bar, board.dependency-arrows and board.focus-depth tests.
  */
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
@@ -224,7 +224,7 @@ describe('focus mode', () => {
 
     expect(traceButton('f')).not.toBeNull()
     expect(traceButton('h2')).toBeNull()
-    expect(forkRest).toHaveBeenCalledWith('kanban-fork', '/link-edges')
+    expect(forkRest).toHaveBeenCalledWith('fork-kanban', '/link-edges')
   })
 
   it('focusing a card rings its links, dims the rest, and opens the answer bar', async () => {
@@ -355,7 +355,7 @@ describe('All Boards', () => {
 
     expect(await screen.findByText('Ship the feature')).toBeTruthy()
     expect($boardSlug.get()).toBe(ALL_BOARDS)
-    expect(forkRest).toHaveBeenCalledWith('kanban-fork', '/board/all')
+    expect(forkRest).toHaveBeenCalledWith('fork-kanban', '/board/all')
     expect(screen.getByRole('button', { name: 'Board: All Boards' })).toBeTruthy()
     // Board badges + filter chips.
     expect(cardByKey('homelab\u0000t_home01')?.querySelector('[data-board-badge="homelab"]')).not.toBeNull()
@@ -440,7 +440,7 @@ describe('routeCall (pure)', () => {
 
 // ── graceful degradation ─────────────────────────────────────────────────────
 
-describe('without the kanban-fork backend (404)', () => {
+describe('without the fork-kanban backend (404)', () => {
   it('renders upstream\'s board unchanged: no All Boards, no trace, no errors', async () => {
     forkUp = false
     mount({ switcher: true })

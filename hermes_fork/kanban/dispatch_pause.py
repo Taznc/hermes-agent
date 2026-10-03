@@ -32,8 +32,8 @@ still runs.
 reports ``paused``, no tick that started earlier can still spawn. If a tick
 holds the lock past the wait it reports ``busy`` and writes nothing.
 
-The routes live in the T0 ``kanban-fork`` dashboard plugin
-(``hermes-customizations/plugins/kanban-fork``), which calls this module.
+The routes live in the T0 ``fork-kanban`` dashboard plugin
+(``hermes-customizations/plugins/fork-kanban``), which calls this module.
 """
 
 from __future__ import annotations

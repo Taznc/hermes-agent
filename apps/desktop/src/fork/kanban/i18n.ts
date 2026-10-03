@@ -1,6 +1,6 @@
 /**
  * Strings for the fork's Kanban additions (focus mode + All Boards), registered
- * under their own plugin id (`kanban-fork`) so upstream's kanban catalog and
+ * under their own plugin id (`fork-kanban`) so upstream's kanban catalog and
  * the core locale files stay untouched. Text is dev's, verbatim. Keys missing
  * from a locale fall back to English (plugin-i18n's DEFAULT_LOCALE fallback).
  */

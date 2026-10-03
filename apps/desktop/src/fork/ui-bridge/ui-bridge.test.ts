@@ -72,7 +72,7 @@ beforeEach(() => {
   resetUiBridgeForTests()
   disposeContribution = registry.register({
     area: UI_REQUEST_AREA,
-    data: { kind: 'ask/questions', render: () => null },
+    data: { kind: 'fork-ask/questions', render: () => null },
     id: 'ask:questions'
   })
 })
@@ -99,10 +99,10 @@ describe('plugin.request handler', () => {
     const background = [user('u2'), assistant('a2', [toolCall('bg-call')])]
     const { deliver, states } = harness({ 's-bg': background, 's-fg': foreground }, 's-fg')
 
-    deliver('srq-bg', { kind: 'ask/questions', payload: { q: 1 }, session_id: 's-bg' })
+    deliver('srq-bg', { kind: 'fork-ask/questions', payload: { q: 1 }, session_id: 's-bg' })
 
     const parked = $uiRequests.get()['srq-bg']
-    expect(parked).toMatchObject({ kind: 'ask/questions', params: { q: 1 }, sessionId: 's-bg', toolCallId: 'bg-call' })
+    expect(parked).toMatchObject({ kind: 'fork-ask/questions', params: { q: 1 }, sessionId: 's-bg', toolCallId: 'bg-call' })
     // The foreground's own open tool row does not claim it…
     expect(parkedForRow($uiRequests.get(), 's-fg', 'fg-call', () => foreground)).toBeNull()
     // …the background row does, and only the background session is flagged.
@@ -113,13 +113,13 @@ describe('plugin.request handler', () => {
 
   it('answers {payload} through the request and dismisses as unanswered on cancel', () => {
     const { deliver } = harness({ 's-a': [assistant('a1', [toolCall('c1')])] }, 's-a')
-    const first = deliver('srq-1', { kind: 'ask/questions', payload: {}, session_id: 's-a' }).request
+    const first = deliver('srq-1', { kind: 'fork-ask/questions', payload: {}, session_id: 's-a' }).request
 
     expect(respondUiRequest('srq-1', { answers: ['x'] })).toBe(true)
     expect(first.respond).toHaveBeenCalledWith({ payload: { answers: ['x'] } })
     expect(respondUiRequest('srq-1', 'again')).toBe(false)
 
-    const second = deliver('srq-2', { kind: 'ask/questions', payload: {}, session_id: 's-a' }).request
+    const second = deliver('srq-2', { kind: 'fork-ask/questions', payload: {}, session_id: 's-a' }).request
     expect(cancelUiRequest('srq-2')).toBe(true)
     expect(second.fail).toHaveBeenCalledTimes(1)
     expect(second.respond).not.toHaveBeenCalled()
@@ -129,8 +129,8 @@ describe('plugin.request handler', () => {
   it('re-renders a pending request after a reconnect replay (open_requests), answering the new socket', () => {
     const transcript = [user('u1'), assistant('a1', [toolCall('c1')])]
     const { deliver } = harness({ 's-a': transcript }, 's-a')
-    const live = deliver('srq-1', { kind: 'ask/questions', payload: { v: 1 }, session_id: 's-a' }).request
-    const replay = deliver('srq-1', { kind: 'ask/questions', payload: { v: 1 }, session_id: 's-a' }, true).request
+    const live = deliver('srq-1', { kind: 'fork-ask/questions', payload: { v: 1 }, session_id: 's-a' }).request
+    const replay = deliver('srq-1', { kind: 'fork-ask/questions', payload: { v: 1 }, session_id: 's-a' }, true).request
 
     expect(Object.keys($uiRequests.get())).toEqual(['srq-1'])
     expect(parkedForRow($uiRequests.get(), 's-a', 'c1', () => transcript)?.requestId).toBe('srq-1')
@@ -144,13 +144,13 @@ describe('plugin.request handler', () => {
     const sealed = [user('u1'), assistant('a1', [toolCall('c1', { completedAt: 5 })])]
     const { deliver, states } = harness({ 's-a': sealed, 's-cold': [] }, 's-a')
 
-    deliver('srq-1', { kind: 'ask/questions', payload: {}, session_id: 's-a' }, true)
+    deliver('srq-1', { kind: 'fork-ask/questions', payload: {}, session_id: 's-a' }, true)
     const rearmed = states.get('s-a')!.messages[1].parts[0] as { completedAt?: number }
     expect(rearmed.completedAt).toBeUndefined()
     expect($uiRequests.get()['srq-1'].toolCallId).toBe('c1')
 
     // Cold session: nothing hydrated yet, so the tool call is unresolved at park time…
-    deliver('srq-cold', { kind: 'ask/questions', payload: {}, session_id: 's-cold' }, true)
+    deliver('srq-cold', { kind: 'fork-ask/questions', payload: {}, session_id: 's-cold' }, true)
     expect($uiRequests.get()['srq-cold'].toolCallId).toBeUndefined()
 
     // …and the hydrated transcript's open row claims it; a settled row does not.
@@ -167,8 +167,8 @@ describe('teardown via the host.onEvent tap', () => {
       's-a'
     )
 
-    deliver('srq-a1', { kind: 'ask/questions', payload: {}, session_id: 's-a' })
-    deliver('srq-b1', { kind: 'ask/questions', payload: {}, session_id: 's-b' })
+    deliver('srq-a1', { kind: 'fork-ask/questions', payload: {}, session_id: 's-a' })
+    deliver('srq-b1', { kind: 'fork-ask/questions', payload: {}, session_id: 's-b' })
 
     emitGatewayEvent({
       payload: { id: 'srq-a1', method: 'plugin.request', reason: 'interrupted' },
@@ -177,7 +177,7 @@ describe('teardown via the host.onEvent tap', () => {
     })
     expect(Object.keys($uiRequests.get())).toEqual(['srq-b1'])
 
-    deliver('srq-a2', { kind: 'ask/questions', payload: {}, session_id: 's-a' })
+    deliver('srq-a2', { kind: 'fork-ask/questions', payload: {}, session_id: 's-a' })
     emitGatewayEvent({ payload: { settled: true, text: '' } as never, session_id: 's-b', type: 'message.complete' })
     expect(Object.keys($uiRequests.get())).toEqual(['srq-a2'])
 

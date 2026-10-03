@@ -135,7 +135,7 @@ const VERIFIED_SAFE: Record<string, string> = {
   // `bridge?.onSkip(...)` short-circuits on the namespace.
   'store/intro-reveal.ts:onSkip': 'optional introReveal namespace short-circuits',
   'store/intro-reveal.ts:onClosed': 'optional introReveal namespace short-circuits',
-  // The shim now defines desktopPluginsRoot (web-desktop-bridge plugin), so
+  // The shim now defines desktopPluginsRoot (fork-web-desktop-bridge plugin), so
   // the disk door is reachable once that plugin is enabled. The shim still
   // omits the preview-file watch pair: watchDiskPluginFile() calls
   // watchPreviewFile inside try/catch, so the "not a function" TypeError is
