@@ -57,12 +57,13 @@ async def _check_and_refresh(server) -> None:
 
 
 def _polls_tool_list(server) -> bool:
-    """Capabilities captured and ``tools`` advertised (prompt-/resource-only servers would -32601).
+    """The same gate discovery and the keepalive use (``_advertises_tools``): skip only servers
+    whose captured capabilities omit ``tools`` (prompt-/resource-only, tools/list would -32601);
+    no capability info is the legacy fallback and is polled, since its tools were discovered.
     ``tools.listChanged`` is deliberately NOT a reason to skip: the TypeScript SDK's ``McpServer``
     advertises it unconditionally, including on stateless transports that have no channel to
     deliver it (the Our House gateway: sdk 1.29, ``sessionIdGenerator: undefined``)."""
-    caps = getattr(getattr(server, "initialize_result", None), "capabilities", None)
-    return caps is not None and getattr(caps, "tools", None) is not None
+    return server._advertises_tools()
 
 
 def schedule_keepalive_tool_refresh(server) -> None:

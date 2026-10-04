@@ -264,6 +264,21 @@ def test_running_session_sees_new_tool_at_its_next_turn(connect, monkeypatch, to
         assert _tool("calendar_list") in json.dumps(found)
 
 
+@pytest.mark.parametrize("mode", ["ping", "noping"])
+def test_server_without_captured_capabilities_is_still_polled(connect, mode):
+    """No capability info is ``_advertises_tools``' legacy fallback (tools were discovered and
+    the keepalive treats the server as tool-capable), so the poll must not skip it either."""
+    import tools.mcp_tool as mcp_core
+    house = connect(mode)
+    server = next(s for s in mcp_core._servers.values() if s.name == _SERVER)
+    server.initialize_result = None  # a session that captured no capabilities
+    assert _dispatch("link_gmail", {}).get("result") == "linked"
+
+    google = {_tool(n) for n in _GOOGLE}
+    assert _wait_for(lambda: google <= _registered(), timeout=_KEEPALIVE * 3 + 5), (
+        f"{mode}: new tools never registered; server saw {house.methods()}")
+
+
 @pytest.mark.parametrize("tools_cap, polls", [
     (SimpleNamespace(list_changed=False), True),
     # Advertised but undeliverable on a stateless transport (the TS SDK always sets it): still poll.
@@ -275,6 +290,6 @@ def test_servers_advertising_tools_are_polled(tools_cap, polls):
     from tools.mcp_tool import MCPServerTask
 
     server = MCPServerTask("house")
-    assert _polls_tool_list(server) is False  # no captured capabilities: upstream behaviour unchanged
+    assert _polls_tool_list(server) is True  # no captured capabilities: legacy fallback, as _advertises_tools
     server.initialize_result = SimpleNamespace(capabilities=SimpleNamespace(tools=tools_cap))
     assert _polls_tool_list(server) is polls
