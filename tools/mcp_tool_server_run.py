@@ -144,6 +144,10 @@ class MCPServerRunMixin:
                     # Survived a full keepalive interval: real proof of health.
                     # Clear the rapid-drop budget (#62212).
                     self._mark_session_proven()
+                    # >>> FORK ANCHOR: mcp-keepalive-tool-refresh <<<
+                    from hermes_fork.mcp_keepalive_refresh import schedule_keepalive_tool_refresh
+                    schedule_keepalive_tool_refresh(self)  # stateless servers can't push list_changed
+                    # <<< FORK ANCHOR >>>
         finally:
             await self._cancel_waiters(*waiters)
         if self._shutdown_event.is_set():
