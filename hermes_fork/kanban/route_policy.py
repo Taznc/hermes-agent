@@ -57,7 +57,9 @@ _log = logging.getLogger(__name__)
 APPROVED_UNATTENDED_ROUTES: frozenset[tuple[str, str, str]] = frozenset({
     ("anthropic", "claude-opus-5-5", "high"),
     ("anthropic", "claude-opus-5", "high"),
+    ("anthropic", "claude-sonnet-5-5", "high"),
     ("anthropic", "claude-sonnet-5", "high"),
+    ("openai-codex", "gpt-6.1-sol", "medium"),
     ("openai-codex", "gpt-6-sol", "medium"),
     ("openai-codex", "gpt-5.6-sol", "medium"),
     ("openai-codex", "gpt-5.6-terra", "medium"),

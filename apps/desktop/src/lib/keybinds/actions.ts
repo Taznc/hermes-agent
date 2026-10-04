@@ -7,8 +7,10 @@
 
 import { registry } from '@/contrib/registry'
 import type { Contribution } from '@/contrib/types'
+import { isMacPlatform } from '@/lib/platform'
 
-import { IS_MAC } from './combo'
+// Read platform metadata without importing combo.ts, which depends on these actions.
+const IS_MAC = isMacPlatform()
 
 export type KeybindCategory = 'composer' | 'profiles' | 'session' | 'navigation' | 'view'
 
