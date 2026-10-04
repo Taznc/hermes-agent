@@ -57,13 +57,20 @@ async def _check_and_refresh(server) -> None:
 
 
 def _polls_tool_list(server) -> bool:
-    """The same gate discovery and the keepalive use (``_advertises_tools``): skip only servers
-    whose captured capabilities omit ``tools`` (prompt-/resource-only, tools/list would -32601);
-    no capability info is the legacy fallback and is polled, since its tools were discovered.
+    """Aligned with ``_advertises_tools`` (the discovery/keepalive gate): never poll a server whose
+    captured capabilities omit ``tools`` (prompt-/resource-only, tools/list would -32601). With no
+    capability info (``_advertises_tools``' legacy fallback) poll only once discovery actually
+    listed tools: that is proof tools/list works, and it keeps the upstream contract that a bare
+    legacy keepalive pings without a spurious list_tools
+    (tests/tools/test_mcp_capability_gating.py::test_keepalive_uses_ping_legacy_fallback).
     ``tools.listChanged`` is deliberately NOT a reason to skip: the TypeScript SDK's ``McpServer``
     advertises it unconditionally, including on stateless transports that have no channel to
     deliver it (the Our House gateway: sdk 1.29, ``sessionIdGenerator: undefined``)."""
-    return server._advertises_tools()
+    if not server._advertises_tools():
+        return False
+    if getattr(getattr(server, "initialize_result", None), "capabilities", None) is not None:
+        return True
+    return bool(server._tools)
 
 
 def schedule_keepalive_tool_refresh(server) -> None:

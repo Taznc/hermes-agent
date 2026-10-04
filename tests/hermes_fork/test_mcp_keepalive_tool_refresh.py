@@ -266,8 +266,8 @@ def test_running_session_sees_new_tool_at_its_next_turn(connect, monkeypatch, to
 
 @pytest.mark.parametrize("mode", ["ping", "noping"])
 def test_server_without_captured_capabilities_is_still_polled(connect, mode):
-    """No capability info is ``_advertises_tools``' legacy fallback (tools were discovered and
-    the keepalive treats the server as tool-capable), so the poll must not skip it either."""
+    """No capability info is ``_advertises_tools``' legacy fallback: a server whose tools were
+    discovered and whose keepalive treats it as tool-capable must be polled too."""
     import tools.mcp_tool as mcp_core
     house = connect(mode)
     server = next(s for s in mcp_core._servers.values() if s.name == _SERVER)
@@ -290,6 +290,10 @@ def test_servers_advertising_tools_are_polled(tools_cap, polls):
     from tools.mcp_tool import MCPServerTask
 
     server = MCPServerTask("house")
-    assert _polls_tool_list(server) is True  # no captured capabilities: legacy fallback, as _advertises_tools
+    # No captured capabilities (_advertises_tools' legacy fallback): polled once discovery listed
+    # tools; with none listed the bare keepalive stays ping-only (upstream capability-gating test).
+    assert _polls_tool_list(server) is False
+    server._tools = [SimpleNamespace(name="lights_on")]
+    assert _polls_tool_list(server) is True
     server.initialize_result = SimpleNamespace(capabilities=SimpleNamespace(tools=tools_cap))
     assert _polls_tool_list(server) is polls
