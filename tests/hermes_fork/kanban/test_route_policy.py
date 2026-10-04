@@ -287,6 +287,18 @@ def test_categorical_denial_precedes_allowlist(monkeypatch):
     assert "'free'" in rp.route_denial(rp.Route("primary", "openrouter", "x:free", "high"))
 
 
+@pytest.mark.parametrize("provider,model,effort", [
+    ("anthropic", "claude-sonnet-5-5", "high"),
+    ("openai-codex", "gpt-6.1-sol", "medium"),
+])
+def test_current_generation_routes_approved(provider, model, effort):
+    """Sonnet 5.5 and GPT-6.1 Sol are fleet routes; Sol stays medium-only like 6-Sol."""
+    assert rp.route_denial(rp.Route("primary", provider, model, effort)) is None
+    assert rp.route_denial(rp.Route("fallback[0]", provider, model, effort)) is None
+    if provider == "openai-codex":
+        assert "not an approved" in rp.route_denial(rp.Route("primary", provider, model, "high"))
+
+
 def test_free_marker_is_whole_token_only():
     """A substring like 'freeform' or 'minimax' is not a marker; the allowlist still decides."""
     assert "not an approved" in rp.route_denial(rp.Route("primary", "custom", "freeform-7b", "high"))
