@@ -18,6 +18,7 @@ import logging
 import subprocess
 import sys
 import time
+import urllib.request
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -43,7 +44,6 @@ log_path, port_path, mode = sys.argv[1], sys.argv[2], sys.argv[3]
 server = MCPServer("house")
 GOOGLE = ("gmail_search", "gmail_send", "calendar_list")
 
-@server.tool()
 def lights_on(room: str) -> str:
     return f"lights on in {room}"
 
@@ -52,14 +52,23 @@ def google_tool(name):
         return f"{name}:{query}"
     return tool
 
-@server.tool()
 def link_gmail() -> str:
     for name in GOOGLE:
         server.add_tool(google_tool(name), name=name, description=f"Google tool {name}")
     return "linked"
 
+if not mode.startswith("empty-"):
+    server.add_tool(lights_on)
+    server.add_tool(link_gmail)
+
 def wrapped(app):
     async def asgi(scope, receive, send):
+        if scope["type"] == "http" and scope.get("path") == "/add":
+            server.add_tool(lights_on)
+            await send({"type": "http.response.start", "status": 200,
+                        "headers": [(b"content-type", b"text/plain")]})
+            await send({"type": "http.response.body", "body": b"added"})
+            return
         if scope["type"] != "http" or scope.get("method") != "POST":
             return await app(scope, receive, send)
         body = b""
@@ -75,7 +84,7 @@ def wrapped(app):
         method = msg.get("method") if isinstance(msg, dict) else None
         with open(log_path, "a", encoding="utf-8") as fh:
             fh.write(json.dumps(method) + "\n")
-        if mode == "noping" and method == "ping":
+        if mode.endswith("noping") and method == "ping":
             payload = json.dumps({"jsonrpc": "2.0", "id": msg.get("id"),
                                   "error": {"code": -32601, "message": "Method not found"}}).encode()
             await send({"type": "http.response.start", "status": 200,
@@ -141,12 +150,15 @@ def connect(tmp_path, monkeypatch):
     monkeypatch.setattr(mcp_core, "_MIN_KEEPALIVE_INTERVAL", 0.1)  # floor only; the loop is real
     houses = []
 
-    def _connect(mode: str) -> _House:
+    def _connect(mode: str, *, empty: bool = False) -> _House:
         from tools.mcp_tool_discovery import register_mcp_servers
         house = _House(tmp_path, mode)
         houses.append(house)
         register_mcp_servers({_SERVER: {"url": house.url, "keepalive_interval": _KEEPALIVE}})
-        assert _registered() >= {_tool("lights_on"), _tool("link_gmail")}
+        if empty:
+            assert _tool("lights_on") not in _registered() and _tool("link_gmail") not in _registered()
+        else:
+            assert _registered() >= {_tool("lights_on"), _tool("link_gmail")}
         return house
 
     yield _connect
@@ -279,20 +291,43 @@ def test_server_without_captured_capabilities_is_still_polled(connect, mode):
         f"{mode}: new tools never registered; server saw {house.methods()}")
 
 
+@pytest.mark.parametrize("mode", ["ping", "noping"])
+@pytest.mark.parametrize("legacy", [False, True])
+def test_initially_empty_tool_list_grows_after_keepalive(connect, mode, legacy):
+    """A completed empty discovery is not evidence that tools/list is unsupported."""
+    import tools.mcp_tool as mcp_core
+
+    house = connect(f"empty-{mode}", empty=True)
+    server = next(s for s in mcp_core._servers.values() if s.name == _SERVER)
+    assert server._ready.is_set() and server._ever_connected and not server._tools
+    if legacy:
+        server.initialize_result = None  # no capability info, as on legacy servers
+    before = _keepalives(house, "tools/list")
+    with urllib.request.urlopen(house.url.replace("/mcp", "/add"), timeout=3) as response:
+        assert response.read() == b"added"
+    assert _wait_for(lambda: _tool("lights_on") in _registered(), timeout=_KEEPALIVE * 3 + 5), (
+        f"{mode}/{legacy}: first tool never registered; server saw {house.methods()}")
+    assert _keepalives(house, "tools/list") > before
+    assert "ping" in house.methods()
+    assert _dispatch("lights_on", {"room": "kitchen"}).get("result") == "lights on in kitchen"
+
+
 @pytest.mark.parametrize("tools_cap, polls", [
     (SimpleNamespace(list_changed=False), True),
-    # Advertised but undeliverable on a stateless transport (the TS SDK always sets it): still poll.
+    # Advertised but undeliverable on a stateless transport: still poll.
     (SimpleNamespace(list_changed=True), True),
-    (None, False),                                 # prompt-/resource-only: tools/list would -32601
+    (None, False),
 ])
 def test_servers_advertising_tools_are_polled(tools_cap, polls):
     from hermes_fork.mcp_keepalive_refresh import _polls_tool_list
     from tools.mcp_tool import MCPServerTask
 
     server = MCPServerTask("house")
-    # No captured capabilities (_advertises_tools' legacy fallback): polled once discovery listed
-    # tools; with none listed the bare keepalive stays ping-only (upstream capability-gating test).
+    # No captured capabilities (_advertises_tools' legacy fallback): a bare task stays
+    # ping-only, but discovery must poll even when the first list was empty.
     assert _polls_tool_list(server) is False
+    server._ever_connected = True
+    assert _polls_tool_list(server) is True
     server._tools = [SimpleNamespace(name="lights_on")]
     assert _polls_tool_list(server) is True
     server.initialize_result = SimpleNamespace(capabilities=SimpleNamespace(tools=tools_cap))
