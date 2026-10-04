@@ -51,6 +51,7 @@ def test_local_delivery_resolves_sibling_hermes(tmp_path, monkeypatch):
     sibling.touch()
     sibling.chmod(0o755)
     monkeypatch.setattr("sys.executable", str(bin_dir / "python"))
+    monkeypatch.setattr(bot_relay, "__file__", str(tmp_path / "bot_relay.py"))
 
     argv = bot_relay.local_delivery_command("ops", "query.json")
     assert argv[0] == str(sibling)
@@ -64,6 +65,9 @@ def test_local_delivery_uses_shutil_which_when_no_sibling(tmp_path, monkeypatch)
     empty = tmp_path / "nowhere"
     empty.mkdir(parents=True)
     monkeypatch.setattr("sys.executable", str(empty / "python"))
+    # Keep this checkout's own published install launcher out of the resolution
+    # when probing the fallback ladder (#124868).
+    monkeypatch.setattr(bot_relay, "__file__", str(empty / "bot_relay.py"))
     which_hit = str(tmp_path / "usr-local-bin" / "hermes")
     monkeypatch.setattr(
         bot_relay.shutil, "which", lambda name: which_hit if name == "hermes" else None
@@ -78,6 +82,7 @@ def test_local_delivery_falls_back_to_bare_name(tmp_path, monkeypatch):
     empty.mkdir(parents=True)
     monkeypatch.setattr("sys.executable", str(empty / "python"))
     monkeypatch.setattr(bot_relay.shutil, "which", lambda name: None)
+    monkeypatch.setattr(bot_relay, "__file__", str(empty / "bot_relay.py"))
 
     argv = bot_relay.local_delivery_command("ops", "query.json")
     assert argv[0] == "hermes"

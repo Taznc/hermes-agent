@@ -38,6 +38,7 @@ function harness(transcripts: Record<string, ChatMessage[]>, activeSessionId: nu
   const deps: ServerRequestContext['deps'] = {
     activeSessionIdRef: { current: activeSessionId },
     sessionInterrupted: () => false,
+    sessionStateByRuntimeIdRef: { current: states },
     updateSessionState: (sid, update) => {
       const next = update(states.get(sid) ?? createClientSessionState(sid))
       states.set(sid, next)

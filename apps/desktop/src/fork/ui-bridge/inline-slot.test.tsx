@@ -75,6 +75,7 @@ function deliver(id: string, sessionId: string, messages: ChatMessage[], payload
   const deps: ServerRequestContext['deps'] = {
     activeSessionIdRef: { current: sessionId },
     sessionInterrupted: () => false,
+    sessionStateByRuntimeIdRef: { current: new Map() },
     updateSessionState: (_sid, update) => (state = update(state)),
     upsertToolCall: () => undefined
   }
