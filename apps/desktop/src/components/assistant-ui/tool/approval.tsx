@@ -10,18 +10,9 @@ import { SCAFFOLD_LABEL_CLASS, ScaffoldRow } from '@/components/chat/scaffold-ro
 import { Button } from '@/components/ui/button'
 import { CardStack, type CardStackAction } from '@/components/ui/card-stack'
 import { Codicon } from '@/components/ui/codicon'
-import {
-  Dialog,
-  DialogContent,
-  DialogDescription,
-  DialogFooter,
-  DialogHeader,
-  DialogTitle
-} from '@/components/ui/dialog'
-import { DropdownMenu, DropdownMenuContent, DropdownMenuItem, DropdownMenuTrigger } from '@/components/ui/dropdown-menu'
 import { useI18n } from '@/i18n'
 import { triggerHaptic } from '@/lib/haptics'
-import { ChevronDown, Loader2 } from '@/lib/icons'
+import { Loader2 } from '@/lib/icons'
 import { releaseApprovalKey } from '@/lib/keybinds/approval-keys'
 import { cn } from '@/lib/utils'
 import { $gateway } from '@/store/gateway'
@@ -241,9 +232,6 @@ const ApprovalCard: FC<ApprovalCardProps> = ({ request, total, position, stack }
   const gateway = useStore($gateway)
   const [submitting, setSubmitting] = useState<ApprovalChoice | null>(null)
   const submittingRef = useRef(false)
-  // "Always allow" persists the pattern to ~/.hermes/config.yaml permanently, so
-  // it goes through a confirm step rather than firing straight from the menu.
-  const [confirmAlways, setConfirmAlways] = useState(false)
 
   const present = stack.active
   const busy = submitting !== null || !present || stack.busy
@@ -281,7 +269,6 @@ const ApprovalCard: FC<ApprovalCardProps> = ({ request, total, position, stack }
   const choices = request.choices ?? (request.smartDenied ? ['once', 'deny'] : undefined)
   const allowSession = choices ? choices.includes('session') : true
   const allowAlways = choices ? choices.includes('always') : allowPermanent
-  const hasMoreOptions = allowSession || allowAlways
   const hasCommand = request.command.trim().length > 0
   // A plugin `approve` rule escalates through the same gate with a synthetic
   // display target (`<tool> (plugin approval rule)`) while the real command /
@@ -352,72 +339,34 @@ const ApprovalCard: FC<ApprovalCardProps> = ({ request, total, position, stack }
         <Button data-approval-deny="" disabled={busy} onClick={() => void respond('deny')} size="sm" variant="text">
           {submitting === 'deny' ? <Loader2 className="size-3 animate-spin" /> : copy.reject}
         </Button>
-        {hasMoreOptions && (
-          <DropdownMenu>
-            <DropdownMenuTrigger asChild>
-              <Button aria-label={copy.moreOptions} disabled={busy} size="sm" variant="secondary">
-                {copy.alwaysAllowMenu}
-                <ChevronDown className="size-3" />
-              </Button>
-            </DropdownMenuTrigger>
-            <DropdownMenuContent align="end" className="min-w-44">
-              {allowSession && (
-                <DropdownMenuItem onSelect={() => void respond('session')}>{copy.allowSession}</DropdownMenuItem>
-              )}
-              {allowAlways && (
-                <DropdownMenuItem
-                  onSelect={() => {
-                    // Defer one tick so the menu fully unmounts before the dialog
-                    // mounts — otherwise Radix's focus-return races the dialog and
-                    // dismisses it via onInteractOutside.
-                    setTimeout(() => setConfirmAlways(true), 0)
-                  }}
-                >
-                  {copy.alwaysAllowMenu}
-                </DropdownMenuItem>
-              )}
-              <DropdownMenuItem onSelect={() => void respond('deny')} variant="destructive">
-                {copy.reject}
-              </DropdownMenuItem>
-            </DropdownMenuContent>
-          </DropdownMenu>
+        {/* FORK: inline scope buttons (one click each) instead of upstream's options dropdown + always-confirm dialog. */}
+        {allowSession && (
+          <Button
+            data-approval-session=""
+            disabled={busy}
+            onClick={() => void respond('session')}
+            size="sm"
+            variant="secondary"
+          >
+            {submitting === 'session' ? <Loader2 className="size-3 animate-spin" /> : copy.allowSession}
+          </Button>
+        )}
+        {allowAlways && (
+          <Button
+            data-approval-always=""
+            disabled={busy}
+            onClick={() => void respond('always')}
+            size="sm"
+            variant="secondary"
+          >
+            {submitting === 'always' ? <Loader2 className="size-3 animate-spin" /> : copy.alwaysAllow}
+          </Button>
         )}
         <Button data-approval-run="" disabled={busy} onClick={() => void respond('once')} size="sm">
           {submitting === 'once' ? <Loader2 className="size-3 animate-spin" /> : copy.run}
           <span className="opacity-60">↵</span>
         </Button>
       </div>
-
-      <Dialog onOpenChange={setConfirmAlways} open={confirmAlways}>
-        <DialogContent className="max-w-md">
-          <DialogHeader>
-            <DialogTitle>{copy.alwaysTitle}</DialogTitle>
-            <DialogDescription>{copy.alwaysDescription(request.description)}</DialogDescription>
-          </DialogHeader>
-
-          {request.command.trim() && (
-            <pre className="max-h-32 overflow-auto whitespace-pre-wrap break-words rounded-md border border-(--ui-stroke-tertiary) bg-(--ui-chat-surface-background) px-2.5 py-1.5 font-mono text-xs leading-snug text-foreground">
-              {request.command.trim()}
-            </pre>
-          )}
-
-          <DialogFooter>
-            <Button onClick={() => setConfirmAlways(false)} size="sm" variant="ghost">
-              {t.common.cancel}
-            </Button>
-            <Button
-              onClick={() => {
-                setConfirmAlways(false)
-                void respond('always')
-              }}
-              size="sm"
-              variant="destructive"
-            >
-              {copy.alwaysAllow}
-            </Button>
-          </DialogFooter>
-        </DialogContent>
-      </Dialog>
     </article>
   )
 }
