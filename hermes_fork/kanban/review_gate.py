@@ -9,9 +9,11 @@ instead of burning a review round. Other receipt keys (lint, pushed,
 mergeable, acceptance) are accepted but not enforced.
 
 Called from exactly one site: the ``pre-review-gate`` FORK ANCHOR at the top
-of ``hermes_cli.kanban_db.request_review``, before any row is read or written,
+of ``hermes_cli.kanban_db.request_review``, before any mutation,
 so every non-forced caller (``kanban_request_review`` tool, ``hermes kanban
 request-review`` CLI) is covered and a refusal leaves the task untouched.
+The same seam composes the opt-in, DB-reading ``rework_items`` gate after
+this receipt check; the two configuration switches are independent.
 ``force=True`` (the dashboard's human drag-to-review and CLI ``--force``) is an
 explicit operator override and bypasses the gate, as it bypasses the live-claim
 fence. Off by default, so upstream behaviour is unchanged.
@@ -56,12 +58,14 @@ def gate_enabled() -> bool:
     return value is True
 
 
-def refusal(metadata: Optional[dict]) -> Optional[str]:
-    """Actionable refusal reason when the gate is on and unmet, else ``None``."""
-    if not gate_enabled():
-        return None
-    missing = missing_keys(metadata)
+def refusal(metadata: Optional[dict], *, conn=None, task_id=None) -> Optional[str]:
+    """Shared admission: receipt first, then the opt-in rework-items gate."""
+    missing = missing_keys(metadata) if gate_enabled() else []
     if not missing:
+        if conn is not None and task_id is not None:
+            from hermes_fork.kanban.rework_items import refusal as rework_refusal
+
+            return rework_refusal(conn, task_id, metadata)
         return None
     names = ", ".join(f"pre_review_gate.{key}" for key in missing)
     return (
