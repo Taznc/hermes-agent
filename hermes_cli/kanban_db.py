@@ -3384,7 +3384,7 @@ def request_review(
 
     # >>> FORK ANCHOR: pre-review-gate <<<
     from hermes_fork.kanban.review_gate import refusal as _fork_review_refusal
-    if not force and (_fork_gate_err := _fork_review_refusal(metadata)):
+    if not force and (_fork_gate_err := _fork_review_refusal(metadata, conn=conn, task_id=task_id)):
         return _ret(False, _fork_gate_err)
     # <<< FORK ANCHOR >>>
     summary = redact_review_value(summary)
