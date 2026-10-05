@@ -1160,6 +1160,10 @@ def _(rid, params: dict) -> dict:
     """Set/clear ``archived`` (out of the default list, messages kept — the Desktop PATCH parity flag)
     on a session + lineage: LIVE runtime id first (unpersisted drafts via ``pending_archived``),
     then a stored id/key in the profile db, like ``session.set_hidden``."""
+    # >>> FORK ANCHOR: session-archive-rpc-guard <<<
+    from hermes_fork.session_archive.transports import archive_rpc
+    if is_truthy_value(params.get("archived", True)):
+        return archive_rpc(rid, params, globals())
     archived = is_truthy_value(params.get("archived", True))
     target = str(params.get("session_id") or params.get("session_key") or "")
     if not target:

@@ -34,6 +34,7 @@ from hermes_cli.config import get_hermes_home
 
 from tools.process_registry_notifications import format_process_notification
 from tools.process_registry_checkpoint import ProcessCheckpointMixin
+from hermes_fork.session_archive.activity import owner_home
 from tools.process_registry_results import load_completed_results, save_completed_result
 
 logger = logging.getLogger(__name__)
@@ -558,6 +559,8 @@ class ProcessSession:
     # Session-db id of the spawning conversation; lets the gateway drop completions whose
     # session was closed at a user boundary (/new) instead of injecting into the NEW one.
     parent_session_id: str = ""
+    # >>> FORK ANCHOR: session-archive-process-owner <<<
+    profile_home: str = ""
     notify_on_complete: bool = False            # Queue agent notification on exit
     completion_output_chars: int = 0            # Output chars the completion carries; 0 = COMPLETION_OUTPUT_CHARS
     watch_patterns: List[str] = field(default_factory=list)
@@ -581,6 +584,7 @@ class ProcessSession:
     _pty: Any = field(default=None, repr=False)  # ptyprocess handle (use_pty=True)
 
     def __post_init__(self):
+        self.profile_home = owner_home(self.profile_home)
         # A session built without an explicit owner is owned by its own task, so ownership checks compare
         # ``owner_task_id`` alone instead of repeating an ``or task_id`` fallback at every call site.
         if not self.owner_task_id:
@@ -610,6 +614,7 @@ _WATCHER_ROUTE_KEYS = ("platform", "chat_id", "user_id", "user_name", "thread_id
 # Session fields persisted verbatim in the crash-recovery checkpoint (plus
 # ``session_id``; ``command`` is redacted and ``owner_task_id`` defaulted on write).
 _CHECKPOINT_FIELDS = (
+    "profile_home",
     "command", "pid", "pid_scope", "host_start_time", "systemd_unit", "cwd",
     "started_at", "task_id", "owner_task_id", "session_key",
     *(f"watcher_{k}" for k in _WATCHER_ROUTE_KEYS), "watcher_interval",

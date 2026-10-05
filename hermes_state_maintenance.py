@@ -271,6 +271,9 @@ class SessionMaintenanceMixin:
         open_where = f"s.ended_at IS NULL{where[len(ended_guard):]}"
         return int(self._read_one(f"SELECT COUNT(*) FROM sessions s WHERE {open_where}", params)[0])
 
+    # >>> FORK ANCHOR: session-archive-retention-guard <<<
+    from hermes_fork.session_archive.retention import skip_busy_archive
+    @skip_busy_archive
     def archive_stale_sessions(self, idle_days: float, *, exclude_pinned: bool = True) -> int:
         """Archive every session untouched for ``idle_days`` (freshest of ``last_activity_at`` /
         latest message / ``started_at``); may archive unended sessions.  ``archived = 0`` makes

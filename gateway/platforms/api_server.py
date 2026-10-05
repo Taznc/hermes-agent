@@ -3180,6 +3180,10 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
         db = await self._ensure_session_db_async()
         if db is None:
             return self._session_db_unavailable()
+        # >>> FORK ANCHOR: session-archive-messaging-guard <<<
+        from hermes_fork.session_archive.transports import messaging_patch
+        if body.get("archived") is True:
+            return await messaging_patch(self, db, session_id, body)
         if "title" in body:
             try:
                 await asyncio.to_thread(

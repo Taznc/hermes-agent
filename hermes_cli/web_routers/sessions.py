@@ -794,6 +794,10 @@ _RENAME_FLAG_SETTERS = (
 async def rename_session_endpoint(session_id: str, body: SessionRename):
     """Update ``title`` (empty clears) and/or the flags; ``pinned`` exempts from
     the auto-archive sweep, ``unread=False`` marks read up to now."""
+    # >>> FORK ANCHOR: session-archive-rest-guard <<<
+    from hermes_fork.session_archive.transports import rest_patch
+    if body.archived is True:
+        return await rest_patch(session_id, body, globals())
     flags = [flag for flag, _ in _RENAME_FLAG_SETTERS]
 
     def _update(db):
