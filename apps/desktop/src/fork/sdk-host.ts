@@ -12,6 +12,7 @@ import {
   $archiveSessionRows,
   type ArchiveBlocker,
   canArchiveSession,
+  observeArchiveSession,
   takeForkArchiveRefusal
 } from './archive-guard'
 import { SIDEBAR_GROUP_ACTION_AREA } from './sidebar-group-actions'
@@ -150,7 +151,9 @@ export const forkHost = {
     /** Reactive work blockers; absent entries are idle, not absent runtimes. */
     archiveBlockers: $archiveBlockers,
     /** Synchronous renderer hint; the canonical action and backend recheck. */
-    canArchive: canArchiveSession
+    canArchive: canArchiveSession,
+    /** Observe mounted archive affordances; unsubscribe on row disposal. */
+    observeArchive: observeArchiveSession
   },
   sidebar: {
     version: 1 as const,

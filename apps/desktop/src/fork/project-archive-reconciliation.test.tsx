@@ -173,6 +173,43 @@ describe('real project stores + React archive/refresh/show-all sequence', () => 
     expect($removedSessionIds.get().has('s1')).toBe(false)
     expect(screen.getByTestId('rows').textContent).toBe('s2,s3,s4,s5')
   })
+  it('restores an explicitly unarchived live row after exclusion outlives its tombstone', async () => {
+    render(<Overview />)
+    fireEvent.click(screen.getByRole('button', { name: 'Show all 5 sessions' }))
+    await waitFor(() => expect(screen.getByTestId('rows').textContent).toBe('s1,s2,s3,s4,s5'))
+    act(() => {
+      tombstoneSessions(['s1'])
+      $sessions.set(five.slice(1))
+    })
+    await act(() => refreshProjectTree())
+    expect(screen.getByTestId('rows').textContent).not.toContain('s1')
+    act(() => {
+      untombstoneSessions(['s1'])
+      $sessions.set(five.map(s => ({ ...s, archived: false })))
+    })
+    expect(screen.getByTestId('rows').textContent).toBe('s1,s2,s3,s4,s5')
+  })
+  it('rejects project hydration from a previous profile', async () => {
+    render(<Overview />)
+    let resolve!: (value: unknown) => void
+
+    const response = new Promise(r => {
+      resolve = r
+    })
+
+    gateway.request.mockImplementationOnce(() => response)
+    fireEvent.click(screen.getByRole('button', { name: 'Show all 5 sessions' }))
+    act(() => {
+      $activeGatewayProfile.set('other')
+      $sessions.set([])
+      $projectTree.set([tree([])])
+    })
+    await act(async () => {
+      resolve({ project: tree() })
+      await response
+    })
+    expect(screen.queryByTestId('rows')?.textContent ?? '').toBe('')
+  })
   it('counts the complete current membership, not loaded rows already evicted by archive', () => {
     act(() => {
       tombstoneSessions(['s1'])

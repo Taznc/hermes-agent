@@ -1,9 +1,9 @@
-import { computed } from 'nanostores'
+import { atom, computed } from 'nanostores'
 
 import { isMissingRpcMethod } from '@/lib/gateway-rpc'
 import { $clarifyRequests } from '@/store/clarify'
 import { $queuedPromptsBySession } from '@/store/composer-queue'
-import { requestGatewayForProfile } from '@/store/gateway'
+import { $gateway, requestGatewayForProfile } from '@/store/gateway'
 import { notify, notifyError } from '@/store/notifications'
 import { $activeGatewayProfile, normalizeProfileKey } from '@/store/profile'
 import { $projectTree } from '@/store/projects'
@@ -15,7 +15,14 @@ import {
   $vaultSaveLoginRequests,
   $vaultUnlockRequests
 } from '@/store/prompts'
-import { $cronSessions, $messagingSessions, $sessions, lineageAliases } from '@/store/session'
+import {
+  $connection,
+  $cronSessions,
+  $messagingSessions,
+  $sessions,
+  lineageAliases,
+  sessionMatchesStoredId
+} from '@/store/session'
 import { $sessionDotStateById } from '@/store/session-dot-state'
 import { $sessionStates } from '@/store/session-states'
 
@@ -53,7 +60,7 @@ const $promptOwners = computed(
  * Dot state already owns the runtime/stored/lineage bridge for active turns,
  * pending input, live descendants (including background children) and processes.
  * Queue/UI-request stores add work which can exist after the parent goes idle. */
-export const $archiveBlockers = computed(
+const $localArchiveBlockers = computed(
   [$sessionDotStateById, $queuedPromptsBySession, $sessionStates, $archiveSessionRows, $uiRequests, $promptOwners],
   (dots, queues, states, sessions, requests, promptOwners) => {
     const blockers: Record<string, ArchiveBlocker> = {}
@@ -96,6 +103,183 @@ export const $archiveBlockers = computed(
   }
 )
 
+// One observer loop for mounted plugin rows: at most 16 reads per sweep,
+// four in flight, no per-row timers. Unknown/transient errors hide the icon;
+// a confirmed missing method preserves older gateways' renderer-only hints.
+const $remoteArchiveBlockers = atom<Record<string, ArchiveBlocker>>({})
+const observed = new Map<string, number>()
+const statusCache = new Map<string, boolean>()
+const unsupportedProfiles = new Set<string>()
+let observationEpoch = 0
+let cursor = 0
+let observationTimer: ReturnType<typeof setTimeout> | undefined
+let observationFlight = false
+let unlistenObservation: (() => void)[] = []
+
+function archiveTarget(id: string) {
+  const row = $archiveSessionRows.get().find(s => sessionMatchesStoredId(s, id))
+  const profile = normalizeProfileKey(row?.profile ?? $activeGatewayProfile.get())
+  const live = row?.id ?? id
+
+  return { profile, id: live, key: JSON.stringify([profile, live]) }
+}
+
+function publishArchiveObservation() {
+  const blockers: Record<string, ArchiveBlocker> = {}
+  const keys = new Set<string>()
+
+  for (const id of observed.keys()) {
+    const target = archiveTarget(id)
+    keys.add(target.key)
+
+    if (statusCache.get(target.key) !== true) {
+      for (const alias of lineageAliases(id, $archiveSessionRows.get())) {
+        blockers[alias] = 'backend-work'
+      }
+    }
+  }
+
+  for (const key of statusCache.keys()) {
+    if (!keys.has(key)) {
+      statusCache.delete(key)
+    }
+  }
+
+  $remoteArchiveBlockers.set(blockers)
+}
+
+function scheduleArchiveObservation(delay: number) {
+  if (observationTimer !== undefined || !observed.size) {
+    return
+  }
+
+  observationTimer = setTimeout(() => {
+    observationTimer = undefined
+    void pollArchiveObservation()
+  }, delay)
+}
+
+async function pollArchiveObservation() {
+  if (observationFlight || !observed.size) {
+    return
+  }
+
+  observationFlight = true
+  const epoch = observationEpoch
+
+  const targets = [
+    ...new Map(
+      [...observed.keys()].map(id => {
+        const target = archiveTarget(id)
+
+        return [target.key, target] as const
+      })
+    ).values()
+  ]
+
+  const queue = Array.from({ length: Math.min(16, targets.length) }, (_, i) => targets[(cursor + i) % targets.length])
+  cursor = (cursor + queue.length) % targets.length
+
+  const worker = async () => {
+    for (let target = queue.shift(); target; target = queue.shift()) {
+      if (epoch !== observationEpoch || !observed.size) {
+        break
+      }
+
+      let archivable = unsupportedProfiles.has(target.profile)
+
+      try {
+        if (archivable) {
+          statusCache.set(target.key, true)
+          publishArchiveObservation()
+
+          continue
+        }
+
+        const status = await requestGatewayForProfile<{ archivable: boolean }>(
+          target.profile,
+          'fork.session.archive_status',
+          { session_id: target.id, profile: target.profile },
+          5000
+        )
+
+        archivable = status?.archivable === true
+      } catch (error) {
+        archivable = isMissingRpcMethod(error)
+
+        if (archivable && epoch === observationEpoch) {
+          unsupportedProfiles.add(target.profile)
+        }
+      }
+
+      if (epoch === observationEpoch && [...observed.keys()].some(id => archiveTarget(id).key === target.key)) {
+        statusCache.set(target.key, archivable)
+        publishArchiveObservation()
+      }
+    }
+  }
+
+  try {
+    await Promise.all(Array.from({ length: Math.min(4, queue.length) }, worker))
+  } finally {
+    observationFlight = false
+    scheduleArchiveObservation(epoch === observationEpoch ? 5000 : 0)
+  }
+}
+
+export function observeArchiveSession(id: string): () => void {
+  observed.set(id, (observed.get(id) ?? 0) + 1)
+
+  if (observed.size === 1 && !unlistenObservation.length) {
+    const reset = () => {
+      observationEpoch++
+      statusCache.clear()
+      unsupportedProfiles.clear()
+      publishArchiveObservation()
+      scheduleArchiveObservation(0)
+    }
+
+    unlistenObservation = [
+      $activeGatewayProfile.listen(reset),
+      $connection.listen(reset),
+      $gateway.listen(reset),
+      $archiveSessionRows.listen(() => {
+        publishArchiveObservation()
+        scheduleArchiveObservation(0)
+      })
+    ]
+  }
+
+  publishArchiveObservation()
+  scheduleArchiveObservation(0)
+
+  return () => {
+    const count = (observed.get(id) ?? 1) - 1
+
+    if (count) {
+      observed.set(id, count)
+    } else {
+      observed.delete(id)
+    }
+
+    publishArchiveObservation()
+
+    if (!observed.size) {
+      observationEpoch++
+      clearTimeout(observationTimer)
+      observationTimer = undefined
+      unlistenObservation.forEach(stop => stop())
+      unlistenObservation = []
+      statusCache.clear()
+      unsupportedProfiles.clear()
+    }
+  }
+}
+
+export const $archiveBlockers = computed([$localArchiveBlockers, $remoteArchiveBlockers], (local, remote) => ({
+  ...remote,
+  ...local
+}))
 export const canArchiveSession = (id: string): boolean => !$archiveBlockers.get()[id]
 
 /** Per-attempt refusals let batches distinguish a skipped remote worker from rollback. */
@@ -122,7 +306,7 @@ export async function guardForkSessionArchive(id: string, profile: string | unde
     return false
   }
 
-  const local = $archiveBlockers.get()[id]
+  const local = $localArchiveBlockers.get()[id]
 
   if (local) {
     return refuse(local)
@@ -150,7 +334,7 @@ export async function guardForkSessionArchive(id: string, profile: string | unde
     }
   }
 
-  const after = $archiveBlockers.get()[id]
+  const after = $localArchiveBlockers.get()[id]
 
   return after ? refuse(after) : true
 }

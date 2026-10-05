@@ -120,8 +120,7 @@ export function ProjectOverviewRow({
   ref,
   style
 }: ProjectOverviewRowProps) {
-  // >>> FORK ANCHOR: project-archive-view <<<
-  const view = useArchiveView(project, previewSessions, isSessionHidden, hiddenSessionCount)
+  const view = useArchiveView(project, previewSessions, isSessionHidden, hiddenSessionCount) // >>> FORK ANCHOR: project-archive-view <<<
 
   ;[project, isSessionHidden, hiddenSessionCount] = view // <<< FORK ANCHOR >>>
   const { t } = useI18n()
