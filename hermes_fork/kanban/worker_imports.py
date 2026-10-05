@@ -17,9 +17,10 @@ Fix, using only built-ins:
   user project) keep normal script-dir semantics. ``venv_sync.relaunch_command`` and
   ``_early_recovery`` both carry interpreter options across a relaunch.
 * ``cron.scheduler_worker_env.pin_hermes_tree_on_pythonpath``: the same pin cron's external
-  worker and upstream's later ``_propagate_module_import_root`` (#122299/#122487) use, so
-  without the cwd entry the worker still imports exactly the dispatcher's tree. Idempotent,
-  so it stays correct once that upstream fix arrives with a sync.
+  worker and upstream's ``_propagate_module_import_root`` (#122299/#122487, called just before
+  the anchor) use, so without the cwd entry the worker still imports exactly the
+  dispatcher's tree. Idempotent: re-applied here only so the root stays first after the
+  filter below, and so the guarantee does not depend on that upstream call staying put.
 * Empty / relative PYTHONPATH entries are dropped: Python resolves them against the cwd,
   which would reopen the same hole.
 
@@ -29,7 +30,8 @@ AGENTS.md / context loading stay rooted in the workspace. A resolved shim
 directory on ``sys.path``, not the cwd, so it already owns its imports.
 
 Called from exactly one site: the ``worker-import-isolation`` FORK ANCHOR in
-``hermes_cli.kanban_db_dispatch._default_spawn``, before the restart-safe systemd wrapper.
+``hermes_cli.kanban_db_dispatch._default_spawn``, right after upstream's
+``_propagate_module_import_root`` and before the restart-safe systemd wrapper.
 """
 
 from __future__ import annotations
