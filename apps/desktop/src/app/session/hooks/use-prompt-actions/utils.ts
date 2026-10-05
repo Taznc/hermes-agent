@@ -435,12 +435,13 @@ export function imageFilenameFromPath(filePath: string): string {
 export async function readImageForRemoteAttach(
   filePath: string
 ): Promise<{ contentBase64: string; filename: string } | null> {
-  // readDesktopFileDataUrlLocalFirst, not the raw bridge: it prefers this
-  // machine's disk (picker/clipboard/drop paths) and falls back to the
-  // gateway's /api/fs/read-data-url. The bare bridge call threw
-  // "readFileDataUrl is not a function" in the web-served build, where the
-  // member is deliberately omitted so the remote read stays in charge.
+  // Local disk first, then the gateway: the web-served build has no bridge readFileDataUrl.
   const dataUrl = await readDesktopFileDataUrlLocalFirst(filePath)
+
+  if (isReadFileErrorResult(dataUrl)) {
+    return null
+  }
+
   const contentBase64 = dataUrl ? base64FromDataUrl(dataUrl) : ''
 
   return contentBase64 ? { contentBase64, filename: imageFilenameFromPath(filePath) } : null
@@ -453,20 +454,12 @@ export async function readImageForRemoteAttach(
 export async function readFileDataUrlForAttach(filePath: string): Promise<string | null> {
   const reader = window.hermesDesktop?.readFileDataUrlForAttach ?? window.hermesDesktop?.readFileDataUrl
 
-  if (reader) {
-    const dataUrl = await reader(filePath)
-
-    return isReadFileErrorResult(dataUrl) ? null : dataUrl || null
+  if (!reader) {
+    // Web-served build: no bridge reader, and a picker/drop path is the gateway's own disk.
+    return isDesktopFsRemoteMode() ? (await readDesktopFileDataUrl(filePath)) || null : null
   }
 
-  // The web-served build has no local bridge reader (web-bridge-shim.ts omits
-  // readFileDataUrl on purpose) and a picker/drop path there is the GATEWAY's
-  // own disk, so read it back through /api/fs/read-data-url.
-  if (!isDesktopFsRemoteMode()) {
-    return null
-  }
-
-  const dataUrl = await readDesktopFileDataUrl(filePath)
+  const dataUrl = await reader(filePath)
 
   if (isReadFileErrorResult(dataUrl)) {
     return null
