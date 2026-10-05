@@ -36,6 +36,7 @@ def _compress(db, parent, child):
     db.publish_compression_child(
         parent_session_id=parent, child_session_id=child, source="telegram", system_prompt="p",
         messages=[{"role": "user", "content": f"summary for {child}"}], compression_lock_holder=holder)
+    db.release_compression_lock(parent, holder)  # as the compression lifecycle does after publish
 
 
 def _flags(db, *ids):
