@@ -1,5 +1,6 @@
 import type { ToolLabel } from '@hermes/shared'
 
+import { bridgedCallOverride } from '@/fork/ui-bridge/bridged-call'
 import { TOOL_LABELS_ARG } from '@/lib/connector-tools'
 import { firstStringField, normalize } from '@/lib/text'
 import { isTodoToolName, parseTodos } from '@/lib/todos'
@@ -801,6 +802,8 @@ export function toolPartFromStoredCall(
     toolName,
     args: args as never,
     argsText: Object.keys(args).length ? JSON.stringify(args) : '',
+    // >>> FORK ANCHOR: bridged-plugin-cards <<<
+    ...bridgedCallOverride(toolName, args),
     ...(timestamp !== undefined ? { timestamp } : {})
   }
 }
