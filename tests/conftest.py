@@ -1421,5 +1421,5 @@ def real_bash() -> str:
 
 
 # >>> FORK ANCHOR: superseded-upstream-tests <<<
-from tests.hermes_fork.superseded_upstream import pytest_itemcollected  # noqa: E402,F401
+from hermes_fork.testing.superseded_upstream import pytest_itemcollected  # noqa: E402,F401
 # <<< FORK ANCHOR >>>

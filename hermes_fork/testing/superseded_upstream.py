@@ -11,7 +11,7 @@ ANCHOR. The name is a pytest hook that upstream's conftest does not define, so t
 
 from __future__ import annotations
 
-import pytest
+
 
 _LIFECYCLE = ("t_3c25b726 lifecycle consent (hermes_fork/lifecycle_consent.py): reboot/shutdown ASK instead "
               "of hardline-deny, and lifecycle commands are never auto-approved by any mode. Replacement "
@@ -43,4 +43,5 @@ def _relative_nodeid(item) -> str:
 def pytest_itemcollected(item) -> None:
     reason = SUPERSEDED.get(_relative_nodeid(item))
     if reason is not None:
+        import pytest  # test-only dependency; never imported at runtime
         item.add_marker(pytest.mark.xfail(strict=True, reason=reason))
