@@ -255,6 +255,9 @@ def _close_run_state(self) -> None:
         logger.debug("Failed to close run idempotency store for %s", self.name, exc_info=True)
 
 
+# >>> FORK ANCHOR: session-archive-api-work <<<
+from hermes_fork.session_archive.api import protect_run_status
+@protect_run_status
 def _set_run_status(self, run_id: str, status: str, **fields: Any) -> Dict[str, Any]:
     """Update pollable run status without exposing private agent objects."""
     now = time.time()

@@ -52,6 +52,9 @@ def _register_subagent(record: Dict[str, Any]) -> None:
     if not sid:
         return
     record.setdefault("accepting_steer", True)
+    # >>> FORK ANCHOR: session-archive-subagent-owner <<<
+    from hermes_fork.session_archive.activity import owner_home
+    record.setdefault("owner_profile_home", owner_home())
     with _active_subagents_lock:
         _active_subagents[sid] = record
 

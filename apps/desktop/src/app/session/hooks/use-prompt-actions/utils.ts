@@ -3,7 +3,12 @@ import { JsonRpcGatewayError } from '@hermes/shared'
 
 import { translateNow, type Translations } from '@/i18n'
 import type { ChatMessage } from '@/lib/chat-messages'
-import { isDesktopFsRemoteMode, readDesktopFileDataUrl, readDesktopFileDataUrlLocalFirst } from '@/lib/desktop-fs'
+import {
+  isDesktopFsRemoteMode,
+  isReadFileErrorResult,
+  readDesktopFileDataUrl,
+  readDesktopFileDataUrlLocalFirst
+} from '@/lib/desktop-fs'
 import { type CommandsCatalogLike, filterDesktopCommandsCatalog } from '@/lib/desktop-slash-commands'
 import { isProviderSetupErrorMessage } from '@/lib/provider-setup-errors'
 import type { ComposerAttachment } from '@/store/composer'
@@ -422,30 +427,21 @@ export function imageFilenameFromPath(filePath: string): string {
 // not the gateway's, so read the bytes here and upload them via
 // image.attach_bytes. Returns null when the file can't be read.
 //
-// `cachedDataUrl` is the attachment's `previewUrl` when the composer already
-// read the file for the chip thumbnail — that preview is the FULL file as a
-// base64 data URL (attachmentPreviewDataUrl → readFileDataUrl), not a
-// downscaled copy, so reusing it skips a second disk read + IPC round-trip of
-// the same bytes at submit. Only a `;base64,` data URL qualifies; anything
-// else falls through to the disk read.
+// Always re-reads from disk rather than trusting `attachment.previewUrl` as a
+// cache: once a thumbnail is generated, `attachImagePath` keeps only the
+// bounded (≤512px) `thumbnailUrl` and drops `previewUrl` — so a cached
+// `previewUrl` is never guaranteed to be the full-resolution bytes the model
+// needs, and trusting it here would risk silently uploading a downscaled copy.
 export async function readImageForRemoteAttach(
-  filePath: string,
-  cachedDataUrl?: string
+  filePath: string
 ): Promise<{ contentBase64: string; filename: string } | null> {
-  if (cachedDataUrl?.includes(';base64,')) {
-    const cached = base64FromDataUrl(cachedDataUrl)
+  // Local disk first, then the gateway: the web-served build has no bridge readFileDataUrl.
+  const dataUrl = await readDesktopFileDataUrlLocalFirst(filePath)
 
-    if (cached) {
-      return { contentBase64: cached, filename: imageFilenameFromPath(filePath) }
-    }
+  if (isReadFileErrorResult(dataUrl)) {
+    return null
   }
 
-  // readDesktopFileDataUrlLocalFirst, not the raw bridge: it prefers this
-  // machine's disk (picker/clipboard/drop paths) and falls back to the
-  // gateway's /api/fs/read-data-url. The bare bridge call threw
-  // "readFileDataUrl is not a function" in the web-served build, where the
-  // member is deliberately omitted so the remote read stays in charge.
-  const dataUrl = await readDesktopFileDataUrlLocalFirst(filePath)
   const contentBase64 = dataUrl ? base64FromDataUrl(dataUrl) : ''
 
   return contentBase64 ? { contentBase64, filename: imageFilenameFromPath(filePath) } : null
@@ -458,20 +454,16 @@ export async function readImageForRemoteAttach(
 export async function readFileDataUrlForAttach(filePath: string): Promise<string | null> {
   const reader = window.hermesDesktop?.readFileDataUrlForAttach ?? window.hermesDesktop?.readFileDataUrl
 
-  if (reader) {
-    const dataUrl = await reader(filePath)
-
-    return dataUrl || null
+  if (!reader) {
+    // Web-served build: no bridge reader, and a picker/drop path is the gateway's own disk.
+    return isDesktopFsRemoteMode() ? (await readDesktopFileDataUrl(filePath)) || null : null
   }
 
-  // The web-served build has no local bridge reader (web-bridge-shim.ts omits
-  // readFileDataUrl on purpose) and a picker/drop path there is the GATEWAY's
-  // own disk, so read it back through /api/fs/read-data-url.
-  if (!isDesktopFsRemoteMode()) {
+  const dataUrl = await reader(filePath)
+
+  if (isReadFileErrorResult(dataUrl)) {
     return null
   }
-
-  const dataUrl = await readDesktopFileDataUrl(filePath)
 
   return dataUrl || null
 }
@@ -728,6 +720,8 @@ export interface SubmitTextOptions {
    *  (queue drain, steer, external submit requests): the check is a no-op
    *  without it. */
   composerScope?: string | null
+  /** This submit's fresh draft acquired a stored key. Never fired for navigation. */
+  onComposerScopeAssigned?: (scope: string) => void
   /** What the transcript shows for this send, when it differs from the text
    *  the agent receives. A `/skill` invocation expands into the whole skill
    *  body — model-facing scaffolding the UI must never render — so the slash
@@ -745,6 +739,13 @@ export interface SubmitTextOptions {
    *  model-bound note by the gateway (never persisted, never rendered). */
   voiceContext?: string
   fromQueue?: boolean
+  /** Called once with the EXACT session identity the backend accepted the
+   *  prompt into — the live runtime id after any stale-runtime recovery, plus
+   *  the durable stored id when the caller knows it. A caller that must prove
+   *  delivery to another surface (Quick Entry) uses this instead of guessing
+   *  from the foreground session. Never called for a rejected or aborted
+   *  submit, and never for slash commands, which never reach prompt.submit. */
+  onAccepted?: (identity: { runtimeSessionId: string; storedSessionId: null | string }) => void
   /** Runtime session id to submit into. Queue drains pass this so a
    *  backgrounded/source session cannot be replaced by the current foreground
    *  session between enqueue and drain. */

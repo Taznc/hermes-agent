@@ -155,12 +155,12 @@ def test_no_requeue_stays_guarded(board):
     assert _events(conn, tid, "active_pr_recovery") == []
 
 
-def test_newer_unrelated_pr_comment_rearms_guard(board):
+def test_newer_matching_worker_pr_comment_rearms_guard(board):
     conn, spawned, spawn = board
     parent, tid = _pr_then_dependency_block(conn, spawned, spawn)
     _land_parent(conn, parent, tid)
     _age(conn, tid, 50)
-    kb.add_comment(conn, tid, "someone", f"see also {OTHER_PR}")
+    kb.add_comment(conn, tid, "coder", f"see also {OTHER_PR}")
 
     res = kbd.dispatch_once(conn, spawn_fn=spawn)
 

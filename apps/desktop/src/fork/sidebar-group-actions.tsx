@@ -1,7 +1,7 @@
 import { useStore } from '@nanostores/react'
 import { atom } from 'nanostores'
 import type { ReactNode } from 'react'
-import { useEffect, useMemo } from 'react'
+import { useEffect, useMemo, useState } from 'react'
 
 import { useContributions } from '@/contrib'
 import { ContribBoundary, ContribRender } from '@/contrib/react/boundary'
@@ -9,6 +9,7 @@ import type { SessionInfo } from '@/hermes'
 import { useI18n } from '@/i18n'
 import type { SidebarListRow } from '@/lib/session-date-groups'
 import { sessionBucketLabel } from '@/lib/time'
+import { $projectTree, fetchProjectSessions, projectProfile } from '@/store/projects'
 
 /**
  * Fork extension point (ledger Part C, X02): a plugin seam on every sidebar
@@ -21,6 +22,8 @@ import { sessionBucketLabel } from '@/lib/time'
  * Additive only: nothing renders unless a plugin registers at
  * `SIDEBAR_GROUP_ACTION_AREA`, so stock behaviour is unchanged.
  */
+
+export { useArchiveView } from './project-archive-view'
 
 export const SIDEBAR_GROUP_ACTION_AREA = 'fork.sidebar.groupAction'
 
@@ -172,32 +175,13 @@ function SidebarSessionsGroupActionMembers({
   return <SidebarGroupActionSlot groupKey={groupKey} kind={kind} label={label} sessionIds={sessionIds} />
 }
 
-/** Project flavour: the backend's complete owner set, else the loaded rows. */
-function SidebarProjectGroupActionMembers({
-  project
-}: {
-  project: {
-    id: string
-    label: string
-    previewSessions?: Pick<SessionInfo, 'id'>[]
-    repos?: { groups?: { sessions?: Pick<SessionInfo, 'id'>[] }[] }[]
-    sessionIds?: string[]
-  }
-}) {
-  const sessionIds = useMemo(() => {
-    const ids = project.sessionIds?.length
-      ? project.sessionIds
-      : [
-          ...(project.previewSessions ?? []).map(session => session.id),
-          ...(project.repos ?? []).flatMap(repo =>
-            (repo.groups ?? []).flatMap(group => (group.sessions ?? []).map(session => session.id))
-          )
-        ]
-
-    return [...new Set(ids)]
-  }, [project])
-
-  return <SidebarGroupActionSlot groupKey={project.id} kind="project" label={project.label} sessionIds={sessionIds} />
+type ProjectActionSource = {
+  id: string
+  label: string
+  profile?: string
+  previewSessions?: Pick<SessionInfo, 'id'>[]
+  repos?: { groups?: { sessions?: Pick<SessionInfo, 'id'>[] }[] }[]
+  sessionIds?: string[]
 }
 
 // ── Anchor helpers: each upstream call site is ONE call into these (T2). ──
@@ -238,14 +222,57 @@ function useHasGroupActions(): boolean {
   return useContributions(SIDEBAR_GROUP_ACTION_AREA).length > 0
 }
 
-function ForkListDividerGroupAction(props: { row: Extract<SidebarListRow, { kind: 'divider' }> }) {
-  return useHasGroupActions() ? <ForkListDividerGroupActionMembers {...props} /> : null
-}
-
-export function SidebarProjectGroupAction(props: Parameters<typeof SidebarProjectGroupActionMembers>[0]) {
+export function SidebarProjectGroupAction(props: { project: ProjectActionSource }) {
   return useHasGroupActions() ? <SidebarProjectGroupActionMembers {...props} /> : null
 }
 
 export function SidebarSessionsGroupAction(props: Parameters<typeof SidebarSessionsGroupActionMembers>[0]) {
   return useHasGroupActions() ? <SidebarSessionsGroupActionMembers {...props} /> : null
+}
+
+function ForkListDividerGroupAction(props: { row: Extract<SidebarListRow, { kind: 'divider' }> }) {
+  return useHasGroupActions() ? <ForkListDividerGroupActionMembers {...props} /> : null
+}
+
+function SidebarProjectGroupActionMembers({ project }: { project: ProjectActionSource }) {
+  const [hydrated, setHydrated] = useState<{ key: string; ids: string[] } | null>(null)
+  const profile = projectProfile()
+  const key = `${profile ?? ''}:${project.id}`
+  const needsHydration = project.sessionIds === undefined
+  useEffect(() => {
+    if (!needsHydration || !profile) {
+      return
+    }
+
+    let cancelled = false
+    void fetchProjectSessions(project.id, { supersedable: false })
+      .then(full => {
+        if (cancelled || !full) {
+          return
+        }
+
+        const rows = full.repos.flatMap(repo => repo.groups.flatMap(group => group.sessions))
+        setHydrated({ key, ids: [...new Set(rows.map(s => s.id))] })
+        // Hydrated members carry profile/connection and lineage; publish them to
+        // the existing owner resolver, not an approximation from the 3-row preview.
+        $projectTree.set(
+          $projectTree.get().map(current => (current.id === full.id && projectProfile() === profile ? full : current))
+        )
+      })
+      .catch(() => {
+        /* no complete membership: do not offer a partial archive */
+      })
+
+    return () => {
+      cancelled = true
+    }
+  }, [key, needsHydration, profile, project.id])
+
+  const sessionIds = project.sessionIds ?? (hydrated?.key === key ? hydrated.ids : null)
+
+  if (!sessionIds) {
+    return null
+  }
+
+  return <SidebarGroupActionSlot groupKey={project.id} kind="project" label={project.label} sessionIds={sessionIds} />
 }

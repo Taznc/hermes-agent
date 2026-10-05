@@ -73,6 +73,11 @@ def pr_requeue_recovery(conn: sqlite3.Connection, task_id: str, now: int) -> Opt
         if newest_at is None:
             newest_at = int(c["created_at"] or 0)
         urls.extend(u for u in found if u not in urls)
+    return recovery_for_evidence(conn, task_id, newest_at, urls)
+
+
+def recovery_for_evidence(conn, task_id, newest_at, urls):
+    """The deliberate-requeue predicate, reusable with author/repo-scoped evidence."""
     if newest_at is None:
         return None
     requeue = conn.execute(
@@ -103,11 +108,16 @@ def release(
         return guard_reason
     import time
 
-    from hermes_cli import kanban_db as kb
-
     recovery = pr_requeue_recovery(conn, task_id, int(time.time()))
     if recovery is None:
         return guard_reason
+    write_receipt(conn, task_id, recovery, dry_run=dry_run)
+    return None
+
+
+def write_receipt(conn, task_id, recovery, *, dry_run):
+    """Keep duplicate protection in the resumed worker packet; previews write nothing."""
+    from hermes_cli import kanban_db as kb
     if not dry_run:
         with kb.write_txn(conn):
             kb._append_event(conn, task_id, "active_pr_recovery", recovery)
@@ -118,7 +128,7 @@ def release(
                 f"{RECEIPT_PREFIX} {', '.join(recovery['pr_urls'])}\n{recovery['recovery']}",
             )
         kb._log.info(
-            "kanban active_pr released by requeue task=%s event=%s prs=%s",
-            task_id, recovery["requeue_event"], recovery["pr_urls"],
+            "kanban active_pr released task=%s reason=%s prs=%s",
+            task_id, recovery["recovery_reason"], recovery["pr_urls"],
         )
     return None

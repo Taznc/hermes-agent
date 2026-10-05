@@ -61,7 +61,7 @@ def provenance(path: Path) -> Optional[tuple[str, str]]:
     worktree has this git-admin marker; DB rows and branch spelling alone are caller-controlled and
     cannot authorize teardown."""
     ws = _ws()
-    git_dir = ws._git_dir(path)
+    git_dir = ws._git_abs_path(path, "--git-dir")
     if git_dir is None or ws._git_common_dir(path) == git_dir:
         return None
     try:
@@ -173,7 +173,7 @@ def ensure_git_worktree(repo_root: Path, target: Path, branch_name: str, task_id
             f"git worktree add failed for {target} on branch {branch_name}: {stderr}"
         )
     if task_id:
-        git_dir = ws._git_dir(target)
+        git_dir = ws._git_abs_path(target, "--git-dir")
         if git_dir is None or ws._git_common_dir(target) == git_dir:
             raise RuntimeError(f"Cannot record worktree ownership for {target}")
         (git_dir / PROVENANCE_FILE).write_text(
@@ -298,7 +298,7 @@ def cleanup_worktree_workspace(task_id: str, path: str, branch_name: Optional[st
             return  # never remove the main checkout
         if not worktree_owned_by_task(task_id, wp, branch_name):
             return  # someone else's checkout (served tree, sibling task, user branch)
-        if _worktree_is_dirty(str(wp)) or _worktree_has_unpushed_commits(str(wp)):
+        if _worktree_is_dirty(str(wp), str(repo_root)) or _worktree_has_unpushed_commits(str(wp)):
             ws._kb._log.info(
                 "Preserving worktree for task %s: dirty or unpushed work at %s",
                 task_id, wp,

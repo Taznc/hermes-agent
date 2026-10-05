@@ -12,5 +12,5 @@ def release(conn, task_id, guard_reason, *, dry_run):
     reason = admit(conn, row, row["assignee"])
     if reason:
         return reason
-    from hermes_fork.kanban.pr_requeue import release as release_pr
+    from hermes_fork.kanban.pr_evidence import release as release_pr
     return release_pr(conn, task_id, guard_reason, dry_run=dry_run)

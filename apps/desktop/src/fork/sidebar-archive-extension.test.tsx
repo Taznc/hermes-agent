@@ -23,7 +23,16 @@ import {
 vi.mock('@/i18n', () => ({
   useI18n: () => ({ t: { sidebar: { dateDivider: { today: 'Today', yesterday: 'Yesterday' } } } })
 }))
-vi.mock('@/store/projects', () => ({ refreshProjectTree: vi.fn(() => Promise.resolve()) }))
+vi.mock('@/store/projects', async () => {
+  const { atom } = await import('nanostores')
+
+  return {
+    $projectTree: atom([]),
+    refreshProjectTree: vi.fn(() => Promise.resolve()),
+    fetchProjectSessions: vi.fn(async () => null),
+    projectProfile: () => 'default'
+  }
+})
 vi.mock('@/store/sidebar-archive', async () => {
   const { atom } = await import('nanostores')
 
@@ -120,6 +129,19 @@ describe('group action slot', () => {
     expect(screen.getByTestId('act-status-status:working').textContent).toBe('w1')
   })
 
+  it('waits for COMPLETE hydrated members when the backend omits owner ids', async () => {
+    const { fetchProjectSessions } = await import('@/store/projects')
+    vi.mocked(fetchProjectSessions).mockResolvedValueOnce({
+      id: 'p4',
+      repos: [{ groups: [{ sessions: [session('a'), session('b'), session('c')] }] }]
+    } as never)
+    render(
+      <SidebarProjectGroupAction project={{ id: 'p4', label: 'Full', previewSessions: [session('a')], repos: [] }} />
+    )
+    const { waitFor } = await import('@testing-library/react')
+    await waitFor(() => expect(screen.getByTestId('act-project-p4').textContent).toBe('a,b,c'))
+  })
+
   it('project action prefers the backend complete owner set over the preview', () => {
     render(
       <SidebarProjectGroupAction
@@ -136,7 +158,7 @@ describe('group action slot', () => {
     expect(screen.getByTestId('act-project-p1').textContent).toBe('a,b,c')
   })
 
-  it('project action falls back to loaded rows (deduped) on older backends', () => {
+  it('project action refuses a partial preview when full hydration is unavailable', () => {
     render(
       <SidebarProjectGroupAction
         project={{
@@ -148,13 +170,13 @@ describe('group action slot', () => {
       />
     )
 
-    expect(screen.getByTestId('act-project-p2').textContent).toBe('a,b')
+    expect(screen.queryByTestId('act-project-p2')).toBeNull()
   })
 
   it('project action tolerates a partial payload (no repos) without crashing the row', () => {
     render(<SidebarProjectGroupAction project={{ id: 'p3', label: 'Bare' }} />)
 
-    expect(screen.getByTestId('act-project-p3').textContent).toBe('')
+    expect(screen.queryByTestId('act-project-p3')).toBeNull()
   })
 })
 
@@ -209,6 +231,82 @@ describe('host.fork.sessions.archive', () => {
     expect(result.failed).toEqual([{ error: 'boom', id: 'bad' }])
   })
 
+  it('skips active members, retaining an accurate mixed-group result', async () => {
+    const { $sessionStates } = await import('@/store/session-states')
+    $sessionStates.set({ rt: { storedSessionId: 'busy', busy: true, messages: [] } } as never)
+    archiveSession.mockImplementation(async id => tombstoneSessions([id]))
+
+    try {
+      const result = await forkHost.sessions.archive(['busy', 'idle'])
+      expect(archiveSession.mock.calls.map(([id]) => id)).toEqual(['idle'])
+      expect(result).toEqual({ archived: ['idle'], failed: [], skipped: [{ id: 'busy', reason: 'running' }] })
+      expect(forkHost.sessions.canArchive('busy')).toBe(false)
+      expect(forkHost.sessions.archiveBlockers.get().busy).toBe('running')
+    } finally {
+      $sessionStates.set({})
+    }
+  })
+
+  it('reports work that starts during canonical owner resolution as skipped', async () => {
+    const { $sessionStates } = await import('@/store/session-states')
+    archiveSession.mockImplementation(async id => {
+      $sessionStates.set({ rt: { storedSessionId: id, busy: true, messages: [] } } as never)
+    })
+
+    try {
+      expect(await forkHost.sessions.archive(['race'])).toEqual({
+        archived: [],
+        failed: [],
+        skipped: [{ id: 'race', reason: 'running' }]
+      })
+    } finally {
+      $sessionStates.set({})
+    }
+  })
+
+  it('projects-only compressed members use lineage blockers and dedupe aliases', async () => {
+    const { $projectTree } = await import('@/store/projects')
+    const { $sessionStates } = await import('@/store/session-states')
+    $projectTree.set([
+      { id: 'project', repos: [], previewSessions: [{ ...session('tip'), _lineage_root_id: 'root', profile: 'other' }] }
+    ] as never)
+    $sessionStates.set({ rt: { storedSessionId: 'root', busy: true, messages: [] } } as never)
+
+    try {
+      expect(forkHost.sessions.canArchive('tip')).toBe(false)
+      $sessionStates.set({})
+      archiveSession.mockImplementation(async id => tombstoneSessions([id]))
+      const result = await forkHost.sessions.archive(['root', 'tip'])
+      expect(archiveSession.mock.calls.map(([id]) => id)).toEqual(['tip'])
+      expect(result.archived).toEqual(['tip'])
+    } finally {
+      $sessionStates.set({})
+      $projectTree.set([])
+    }
+  })
+
+  it('reports a backend-discovered active member as skipped, not rolled back', async () => {
+    const gateway = await import('@/store/gateway')
+
+    const probe = vi
+      .spyOn(gateway, 'requestGatewayForProfile')
+      .mockResolvedValue({ archivable: false, blockers: ['process'], session_key: 'remote' })
+
+    const { guardForkSessionArchive } = await import('./archive-guard')
+    archiveSession.mockImplementation(async id => {
+      await guardForkSessionArchive(id, 'default')
+    })
+
+    try {
+      expect(await forkHost.sessions.archive(['remote'])).toEqual({
+        archived: [],
+        failed: [],
+        skipped: [{ id: 'remote', reason: 'backend-work' }]
+      })
+    } finally {
+      probe.mockRestore()
+    }
+  })
   it('caps concurrency at 4', async () => {
     let inFlight = 0
     let peak = 0

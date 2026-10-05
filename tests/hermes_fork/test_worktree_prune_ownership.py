@@ -100,7 +100,7 @@ def test_cli_reexports_reach_the_fork_functions(git_repo):
 def test_tree_on_trunk_branch_never_reaped(git_repo):
     import cli
     served = _mk_on(git_repo, "served-next", branch="next")
-    assert not worktree_ops._worktree_is_dirty(str(served))
+    assert not worktree_ops._worktree_is_dirty(str(served), str(git_repo))
     assert not worktree_ops._worktree_has_unpushed_commits(str(served)), (
         "precondition: every upstream gate passes — only ownership can save this tree"
     )

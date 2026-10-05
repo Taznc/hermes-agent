@@ -8,10 +8,13 @@ import { Thread } from '@/components/assistant-ui/thread'
 import { splitRunItems } from '@/components/assistant-ui/tool/fallback'
 import { registry } from '@/contrib/registry'
 import { UI_REQUEST_AREA } from '@/fork/ui-bridge/types'
+import { toChatMessages } from '@/lib/chat-messages/hydration'
+import { toRuntimeMessage } from '@/lib/chat-runtime'
 import { messagePaintWeight } from '@/lib/render-weight'
 import { isCardTool } from '@/lib/tool-render-class'
 import { $activeSessionId } from '@/store/session'
 import { $toolDisclosureStates } from '@/store/tool-view'
+import type { SessionMessage } from '@/types/hermes'
 
 stubThreadEnvironment()
 stubThreadViewportSize()
@@ -99,6 +102,41 @@ describe('plugin result cards in the transcript', () => {
     ])
     dispose()
     expect(isCardTool('private_followup')).toBe(false)
+  })
+
+  it('renders a deferred tool reached through the tool_call bridge after a transcript reload', async () => {
+    registerCard()
+
+    const history = toChatMessages([
+      { role: 'user', content: 'offer follow-ups', timestamp: 1 },
+      {
+        role: 'assistant',
+        content: '',
+        timestamp: 2,
+        tool_calls: [
+          {
+            id: 'bridged-1',
+            type: 'function',
+            function: {
+              name: 'tool_call',
+              arguments: JSON.stringify({ calls: [{ name: 'spawn_session', arguments: { wait: false, tasks: [] } }] })
+            }
+          }
+        ]
+      },
+      {
+        role: 'tool',
+        tool_call_id: 'bridged-1',
+        tool_name: 'spawn_session',
+        content: JSON.stringify({ status: 'offered', wait: false, tasks: [] }),
+        timestamp: 3
+      },
+      { role: 'assistant', content: 'Offered.', timestamp: 4 }
+    ] as SessionMessage[])
+
+    const assistant = history.find(entry => entry.role === 'assistant')!
+    render(<Harness value={toRuntimeMessage(assistant)} />)
+    expect(await screen.findByRole('button', { name: 'Count plugin tests' })).toBeTruthy()
   })
 
   it('prices plugin result cards above collapsed activity rows', () => {
