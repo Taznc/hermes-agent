@@ -11,6 +11,7 @@ import {
 import { defaultNewSessionTarget, prepareDefaultNewSession } from '@/app/session/new-session-route'
 import { revealTreePane } from '@/components/pane-shell/tree/store'
 import { setWorkspaceScope } from '@/components/pane-shell/workspace-scope'
+import { guardForkSessionArchive } from '@/fork/archive-guard'
 import {
   deleteSession,
   fetchStoredTranscriptAcrossBackends,
@@ -3050,6 +3051,10 @@ export function useSessionActions({
         notifyError(new Error('Session ownership could not be resolved'), copy.archiveFailed)
 
         return
+      }
+
+      if (!guardForkSessionArchive(storedSessionId)) {
+        return // FORK ANCHOR: active-work-archive-guard
       }
 
       const wasSelected = selectedStoredSessionIdRef.current === storedSessionId

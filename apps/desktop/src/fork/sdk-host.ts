@@ -7,6 +7,7 @@ import { $removedSessionIds } from '@/store/session-removal'
 import { sessionTileDelegate } from '@/store/session-states'
 import { $archivedSessions, loadArchivedSessions } from '@/store/sidebar-archive'
 
+import { $archiveBlockers, $archiveSessionRows, type ArchiveBlocker, canArchiveSession } from './archive-guard'
 import { SIDEBAR_GROUP_ACTION_AREA } from './sidebar-group-actions'
 import { forkUi } from './ui-bridge/sdk'
 
@@ -21,7 +22,7 @@ import { forkUi } from './ui-bridge/sdk'
  *  the id the app's own row menu archives with. Unloaded ids pass through;
  *  the archive verb resolves their owner profile itself. */
 function liveId(id: string): string {
-  const session = $sessions.get().find(s => sessionMatchesStoredId(s, id))
+  const session = $archiveSessionRows.get().find(s => sessionMatchesStoredId(s, id))
 
   return session ? session.id : id
 }
@@ -29,6 +30,8 @@ function liveId(id: string): string {
 export interface ForkArchiveResult {
   archived: string[]
   failed: { error: string; id: string }[]
+  /** Additive v1 capability: present only when active members were skipped. */
+  skipped?: { id: string; reason: ArchiveBlocker }[]
 }
 
 // Bounded fan-out: each archive is one PATCH plus local cleanup; a 200-row
@@ -55,6 +58,14 @@ async function archiveMany(ids: readonly string[]): Promise<ForkArchiveResult> {
 
   const worker = async () => {
     for (let id = queue.shift(); id; id = queue.shift()) {
+      const blocker = $archiveBlockers.get()[id]
+
+      if (blocker) {
+        ;(result.skipped ??= []).push({ id, reason: blocker })
+
+        continue
+      }
+
       try {
         // THE app archive verb (use-session-actions archiveSession): drops the
         // row from every sidebar slice, tombstones the lineage ids, unpins,
@@ -68,7 +79,13 @@ async function archiveMany(ids: readonly string[]): Promise<ForkArchiveResult> {
         // on rollback, never set when ownership can't be resolved. Works for
         // rows this window never loaded (project members past the preview).
         if (!$removedSessionIds.get().has(id)) {
-          result.failed.push({ error: 'archive rolled back', id })
+          const after = $archiveBlockers.get()[id]
+
+          if (after) {
+            ;(result.skipped ??= []).push({ id, reason: after })
+          } else {
+            result.failed.push({ error: 'archive rolled back', id })
+          }
         } else {
           result.archived.push(id)
         }
@@ -122,7 +139,11 @@ export const forkHost = {
      *  per-row failure — inspect `failed`. */
     archive: (ids: readonly string[]): Promise<ForkArchiveResult> => archiveMany(ids),
     /** Read-only set of ids known archived (subscribe with `useValue`). */
-    archivedIds: $archivedIds
+    archivedIds: $archivedIds,
+    /** Reactive work blockers; absent entries are idle, not absent runtimes. */
+    archiveBlockers: $archiveBlockers,
+    /** Synchronous renderer hint; the canonical action and backend recheck. */
+    canArchive: canArchiveSession
   },
   sidebar: {
     version: 1 as const,

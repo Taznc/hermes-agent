@@ -5,7 +5,7 @@ import { useRef, useState } from 'react'
 import { type NewSessionSplitHandler, startNewSessionDrag } from '@/app/chat/new-session-drag'
 import { Codicon } from '@/components/ui/codicon'
 import { Tip } from '@/components/ui/tooltip'
-import { SidebarProjectGroupAction } from '@/fork/sidebar-group-actions'
+import { SidebarProjectGroupAction, useArchiveView } from '@/fork/sidebar-group-actions'
 import type { SessionInfo } from '@/hermes'
 import { useI18n } from '@/i18n'
 import { cn } from '@/lib/utils'
@@ -120,6 +120,10 @@ export function ProjectOverviewRow({
   ref,
   style
 }: ProjectOverviewRowProps) {
+  // >>> FORK ANCHOR: project-archive-view <<<
+  const view = useArchiveView(project, previewSessions, isSessionHidden, hiddenSessionCount)
+
+  ;[project, isSessionHidden, hiddenSessionCount] = view // <<< FORK ANCHOR >>>
   const { t } = useI18n()
   const s = t.sidebar
   const isActive = project.id === activeProjectId
