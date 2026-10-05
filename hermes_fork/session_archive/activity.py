@@ -201,9 +201,7 @@ class WorkSnapshot:
         api = sys.modules.get("hermes_fork.session_archive.api")
         if api is not None:
             result.extend(api.blockers(self.db, ids))
-        from hermes_fork.session_archive.durable import (
-            blockers as durable_work_blockers,
-        )
+        import hermes_fork.session_archive.durable as durable_work
 
-        result.extend(durable_work_blockers(self.db, aliases, conn))
+        result.extend(durable_work.blockers(self.db, aliases, conn))
         return result

@@ -120,9 +120,9 @@ export function ProjectOverviewRow({
   ref,
   style
 }: ProjectOverviewRowProps) {
-  const view = useArchiveView(project, previewSessions, isSessionHidden, hiddenSessionCount) // >>> FORK ANCHOR: project-archive-view <<<
-
-  ;[project, isSessionHidden, hiddenSessionCount] = view // <<< FORK ANCHOR >>>
+  // >>> FORK ANCHOR: project-archive-view <<<
+  const view = useArchiveView(project, previewSessions, isSessionHidden, hiddenSessionCount)
+  ;[project, isSessionHidden, hiddenSessionCount] = view
   const { t } = useI18n()
   const s = t.sidebar
   const isActive = project.id === activeProjectId
