@@ -14,13 +14,23 @@ def skip_busy_archive(fn):
             def __getattr__(self, name):
                 return getattr(db, name)
 
-            def set_session_archived(self, session_id, archived):
+            def _admit(self, archive):
                 try:
-                    changed = db.set_session_archived(session_id, archived)
+                    changed = archive()
                 except SessionArchiveBlocked:
                     return False
                 self.archived += bool(changed)
                 return changed
+
+            def set_session_archived(self, session_id, archived):
+                return self._admit(lambda: db.set_session_archived(session_id, archived))
+
+            def _auto_archive_lineage(self, session_id):
+                # Upstream's sweep archives through this provenance-stamping
+                # helper; it must pass the same owned-work admission.
+                from .storage import auto_archive
+
+                return self._admit(lambda: auto_archive(db, session_id))
 
         view = RetentionView()
         fn(view, *args, **kwargs)
