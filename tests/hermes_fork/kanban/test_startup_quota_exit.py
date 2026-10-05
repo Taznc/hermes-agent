@@ -145,6 +145,54 @@ def test_startup_quota_wall_requeues_without_counting_a_failure(board, monkeypat
     assert kbd.detect_crashed_workers._last_rate_limited == [tid]
 
 
+def test_exhausted_provider_429_flows_through_worker_exit_to_dispatcher(board, monkeypatch):
+    """A fake provider repeatedly returns HTTP 429 after credential setup succeeds."""
+    import httpx
+    import openai
+    from unittest.mock import MagicMock
+    from run_agent import AIAgent
+
+    tid = kb.create_task(board, title="429 in turn", assignee="a")
+    _claim_running(board, tid, 93000)
+    request = httpx.Request("POST", "https://fake.example/v1/chat/completions")
+    response = httpx.Response(429, request=request, json={"error": {"message": "rate limit exceeded"}})
+    calls = []
+
+    def provider_call(_kwargs):
+        calls.append(1)
+        raise openai.RateLimitError("HTTP 429: rate limit exceeded", response=response,
+                                    body={"error": {"message": "rate limit exceeded"}})
+
+    monkeypatch.setattr("model_tools.get_tool_definitions", lambda *a, **kw: [])
+    monkeypatch.setattr("model_tools.check_toolset_requirements", lambda *a, **kw: {})
+    monkeypatch.setattr("agent.process_bootstrap.OpenAI", lambda *a, **kw: MagicMock())
+    agent = AIAgent(api_key="fake", base_url="https://fake.example/v1", provider="custom",
+                    model="fake-model", quiet_mode=True, skip_context_files=True, skip_memory=True,
+                    fallback_model=[])
+    agent._api_max_retries = 3
+    monkeypatch.setattr(agent, "_interruptible_api_call", provider_call)
+    monkeypatch.setattr(agent, "_persist_session", lambda *a, **kw: None)
+    monkeypatch.setattr(agent, "_save_trajectory", lambda *a, **kw: None)
+    monkeypatch.setattr(agent, "_cleanup_task_resources", lambda *a, **kw: None)
+    monkeypatch.setattr("agent.agent_runtime_helpers.time.sleep", lambda *_: None)
+    shell = _worker_shell(monkeypatch, startup_error=None)
+
+    def chat(query, *, images=None):
+        shell._last_turn_result = agent.run_conversation(query)
+        return shell._last_turn_result.get("final_response")
+
+    shell.chat = chat
+    assert _run_worker(monkeypatch, tid, shell) == kb.KANBAN_RATE_LIMIT_EXIT_CODE
+    assert len(calls) >= 3, "the provider must exhaust its retry budget"
+    assert shell._last_turn_result["failure_reason"] == "rate_limit"
+    kbd.detect_crashed_workers(board)
+    kb.recompute_ready(board)
+    assert kb.get_task(board, tid).consecutive_failures == 0
+    assert kb.get_task(board, tid).status == "ready"
+    assert board.execute("SELECT outcome FROM task_runs WHERE task_id=?", (tid,)).fetchone()[0] == "rate_limited"
+    assert kbd.check_respawn_guard(board, tid) == "rate_limit_cooldown"
+
+
 def test_a_real_startup_failure_still_counts(board, monkeypatch):
     """Control: an unclassified startup failure (transport error) keeps exit 1 and is a counted crash."""
     tid = kb.create_task(board, title="crash", assignee="a")
