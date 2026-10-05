@@ -15,8 +15,9 @@ from tools.mcp_tool_common import mcp_field
 def read_only_hint(annotations: Any) -> bool:
     """True only when *annotations* — an SDK ``ToolAnnotations`` object or a schema-cache
     dict — carries ``read_only_hint``/``readOnlyHint`` exactly ``True``. Missing annotations,
-    an explicit ``False``, and a non-bool truthy hint (a server lying with ``"yes"``) all fail
-    closed to write-capable, matching the original camelCase-only contract.
+    an explicit ``False``, and non-bool hints that survive in cache dicts are write-capable.
+    The MCP SDK coerces some malformed wire values (e.g. ``"yes"``) to bool before this
+    hook sees a Tool; this helper cannot reject those already-coerced values.
     """
     if isinstance(annotations, dict):
         hint = annotations.get("read_only_hint", annotations.get("readOnlyHint"))

@@ -41,6 +41,13 @@ class TestRealSdkToolAnnotations:
         tool = _real_tool(False)
         assert _annotation_read_only_hint(tool) is False
 
+    def test_sdk_coerces_non_bool_before_hook(self):
+        # SDK validation loses the raw type; rejecting malformed wire input is a separate fix.
+        tool = _real_tool("yes")
+        assert tool.annotations is not None
+        assert tool.annotations.read_only_hint is True
+        assert _annotation_read_only_hint(tool) is True
+
 
 class TestCacheDictAnnotations:
     """Schema-cache replay carries annotations as a plain dict on a ``SimpleNamespace``."""
