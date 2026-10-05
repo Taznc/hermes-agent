@@ -8,6 +8,9 @@
  * rather than inside either one.
  */
 
+// >>> FORK ANCHOR: plugin-result-card-classification <<<
+import { isPluginResultCard } from '@/fork/ui-bridge/card-classification'
+
 const FILE_EDIT_TOOL_NAMES = new Set(['edit_file', 'patch', 'write_file'])
 
 /** Renders a diff — the deliverable of the turn, and the one card whose cost scales. */
@@ -35,6 +38,7 @@ export const CONNECTION_CARD_KEY = 'manage_connections:card'
 
 export function isCardTool(toolName: string): boolean {
   return (
+    isPluginResultCard(toolName) ||
     CARD_TOOL_NAMES.has(toolName) ||
     toolName === CONNECTION_CARD_KEY ||
     isFileEditTool(toolName) ||
