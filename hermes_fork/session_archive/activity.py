@@ -32,6 +32,11 @@ def record_home(record):
         or record.get("profile_home")
         or owner.get("profile_home")
         or agent_home(record.get("agent"))
+        or (
+            record["_context"].copy().run(get_hermes_home)
+            if record.get("_context") is not None
+            else None
+        )
     )
 
 
@@ -173,8 +178,7 @@ class WorkSnapshot:
         if self.async_work is not None:
             for record in self.async_work._records.values():
                 if (
-                    record.get("profile_key")
-                    == hermes_home_key(Path(self.db.db_path).parent)
+                    home_matches(record_home(record), self.db)
                     and record.get("status") in self.async_work._LIVE_STATES
                     and (
                         record.get("parent_session_id") in ids
@@ -197,7 +201,9 @@ class WorkSnapshot:
         api = sys.modules.get("hermes_fork.session_archive.api")
         if api is not None:
             result.extend(api.blockers(self.db, ids))
-        from .durable import blockers as durable_work_blockers
+        from hermes_fork.session_archive.durable import (
+            blockers as durable_work_blockers,
+        )
 
         result.extend(durable_work_blockers(self.db, aliases, conn))
         return result

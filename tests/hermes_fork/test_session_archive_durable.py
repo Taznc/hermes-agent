@@ -57,7 +57,7 @@ def test_checkpoint_process_blocks_without_live_registry(tmp_path, monkeypatch):
     record = {field: getattr(process, field) for field in _CHECKPOINT_FIELDS}
     record["session_id"] = process.id
     checkpoint = tmp_path / "processes.json"
-    checkpoint.write_text(json.dumps({"sessions": [record]}))
+    checkpoint.write_text(json.dumps([record]))
     try:
         with pytest.raises(ValueError, match="active owned work"):
             db.set_session_archived("parent", True)

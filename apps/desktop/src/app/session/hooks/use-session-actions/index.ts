@@ -3053,10 +3053,10 @@ export function useSessionActions({
         return
       }
 
+      // >>> FORK ANCHOR: active-work-archive-guard <<<
       if (!(await guardForkSessionArchive(storedSessionId, profile))) {
-        return // FORK ANCHOR: active-work-archive-guard
+        return
       }
-
       const wasSelected = selectedStoredSessionIdRef.current === storedSessionId
       const previousPinned = $pinnedSessionIds.get()
       // Pins are keyed on the durable lineage-root id; the stored id may be the

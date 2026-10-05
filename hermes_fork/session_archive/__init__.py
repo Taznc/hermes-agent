@@ -108,17 +108,5 @@ def archive_blockers(db, session_id, aliases=()):
         return blockers_on_conn(db, conn, session_id, work)
 
 
-def set_archived(db, session_id, archived):
-    if not archived:
-        return db._set_lineage_column("archived", session_id, 0)
-    from .activity import owned_work_scope
-
-    with owned_work_scope(db, session_id) as work:
-
-        def update(conn):
-            assert_archivable(db, conn, session_id, work)
-            return TransactionView(db, conn)._set_lineage_column(
-                "archived", session_id, 1
-            )
-
-        return db._execute_write(update)
+# Public API retained for existing fork callers.
+from .storage import set_archived as set_archived

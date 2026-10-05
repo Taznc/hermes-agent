@@ -48,13 +48,13 @@ def _process_blockers(db, home, ids):
         ProcessSession,
     )
 
-    checkpoint = json.loads(path.read_text(encoding="utf-8"))
-    if not isinstance(checkpoint, dict) or not isinstance(
-        checkpoint.get("sessions", []), list
+    checkpoint = json.loads(path.read_text(encoding="utf-8-sig"))
+    if not isinstance(checkpoint, list) or any(
+        not isinstance(row, dict) for row in checkpoint
     ):
         raise ValueError("Invalid process ownership checkpoint")
     probe = object.__new__(ProcessRegistry)
-    for row in checkpoint.get("sessions", []):
+    for row in checkpoint:
         if not {row.get("parent_session_id"), row.get("session_key")} & ids:
             continue
         if not home_matches(row.get("profile_home") or home, db):

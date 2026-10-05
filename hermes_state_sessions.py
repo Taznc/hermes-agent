@@ -903,7 +903,7 @@ class SessionSessionsMixin:
     def set_session_archived(self, session_id: str, archived: bool) -> bool:
         """Soft-hide (or unhide) a session and its compression lineage; messages are kept."""
         # >>> FORK ANCHOR: session-archive-storage-guard <<<
-        from hermes_fork.session_archive import set_archived
+        from hermes_fork.session_archive.storage import set_archived
         return set_archived(self, session_id, archived)
 
     # Accidental end reasons recovery treats as resumable (also interpolated into
