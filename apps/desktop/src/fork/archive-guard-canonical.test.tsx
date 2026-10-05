@@ -70,6 +70,7 @@ function Harness({ onReady }: { onReady: (handle: Handle) => void }) {
     getRouteToken: () => 'token',
     getRoutedStoredSessionId: () => null,
     navigate: vi.fn() as never,
+    routedSessionId: null,
     requestGateway: vi.fn().mockResolvedValue(undefined),
     resetViewSync: vi.fn(),
     runtimeIdByStoredSessionIdRef: ref(new Map<string, string>()),

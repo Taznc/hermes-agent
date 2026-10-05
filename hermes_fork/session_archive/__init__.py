@@ -5,6 +5,10 @@ from __future__ import annotations
 from contextlib import contextmanager
 from types import MethodType
 
+# Deliberate (user/CLI/API/transport) archive state clears the idle sweep's
+# provenance stamp so upstream reopen never un-hides an intentional archive.
+DELIBERATE_ARCHIVE_SET_SQL = ", auto_archived = 0"
+
 
 class SessionArchiveBlocked(ValueError):
     """Owned work must finish or be explicitly controlled before archiving."""
@@ -48,7 +52,9 @@ class TransactionView:
 
     def set_session_archived(self, session_id, archived):
         # Admission was already performed for this transaction.
-        return self._set_lineage_column("archived", session_id, int(archived))
+        return self._set_lineage_column(
+            "archived", session_id, int(archived), extra_set_sql=DELIBERATE_ARCHIVE_SET_SQL
+        )
 
     def _execute_write(self, fn, **kwargs):
         return fn(self.conn)

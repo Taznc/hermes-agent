@@ -47,6 +47,8 @@ vi.mock('@/store/gateway', async () => {
   return {
     $gateway: atom(null),
     activeGateway: () => gateway,
+    activeGatewayConnectionId: () => null,
+    isActivePrimary: () => true,
     ensureActiveGatewayOpen: async () => gateway,
     requestGatewayForProfile: vi.fn().mockResolvedValue({ archivable: true, blockers: [], session_key: 's1' })
   }
@@ -74,6 +76,7 @@ function Harness({ onReady }: { onReady: (handle: Handle) => void }) {
     getRouteToken: () => 'token',
     getRoutedStoredSessionId: () => null,
     navigate: vi.fn() as never,
+    routedSessionId: null,
     requestGateway: vi.fn().mockResolvedValue(undefined),
     resetViewSync: vi.fn(),
     runtimeIdByStoredSessionIdRef: ref(new Map<string, string>()),
