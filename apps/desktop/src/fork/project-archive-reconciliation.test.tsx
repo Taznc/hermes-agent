@@ -44,7 +44,12 @@ const gateway = vi.hoisted(() => ({ request: vi.fn(), connectionState: 'open' })
 vi.mock('@/store/gateway', async () => {
   const { atom } = await import('nanostores')
 
-  return { $gateway: atom(null), activeGateway: () => gateway, ensureActiveGatewayOpen: async () => gateway }
+  return {
+    $gateway: atom(null),
+    activeGateway: () => gateway,
+    ensureActiveGatewayOpen: async () => gateway,
+    requestGatewayForProfile: vi.fn().mockResolvedValue({ archivable: true, blockers: [], session_key: 's1' })
+  }
 })
 vi.mock('@/store/profile', async original => ({
   ...(await original<Record<string, unknown>>()),

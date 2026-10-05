@@ -3053,7 +3053,7 @@ export function useSessionActions({
         return
       }
 
-      if (!guardForkSessionArchive(storedSessionId)) {
+      if (!(await guardForkSessionArchive(storedSessionId, profile))) {
         return // FORK ANCHOR: active-work-archive-guard
       }
 

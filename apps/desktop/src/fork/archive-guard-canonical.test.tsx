@@ -1,9 +1,4 @@
-// Regression: deleting a session from the Archived filter view left a ghost
-// row. Archived rows live in $archivedSessions (their own capped store —
-// they're excluded from $sessions by design), and removeSession only pruned
-// $sessions. The ghost row then resumed into a hard-deleted id: resume 404 →
-// goneSessionVerdict saw the row still listed → 'retry' → an unrecoverable
-// spinner (Aug 2026 desktop audit, F8).
+// Canonical pre-optimistic archive admission: real hook and stores, mocked transports.
 import { act, cleanup, render, waitFor } from '@testing-library/react'
 import type { MutableRefObject } from 'react'
 import { useEffect } from 'react'
@@ -14,10 +9,16 @@ import type { ClientSessionState } from '@/app/types'
 import { type SessionInfo, setSessionArchived } from '@/hermes'
 import { $queuedPromptsBySession } from '@/store/composer-queue'
 import { $backgroundStatusBySession } from '@/store/composer-status'
+import { requestGatewayForProfile } from '@/store/gateway'
 import { $sessions, setSessions } from '@/store/session'
 import { $removedSessionIds } from '@/store/session-removal'
 import { $sessionStates, $sessionTiles } from '@/store/session-states'
 import { $subagentsBySession, type SubagentProgress } from '@/store/subagents'
+
+vi.mock('@/store/gateway', async original => ({
+  ...(await original<Record<string, unknown>>()),
+  requestGatewayForProfile: vi.fn().mockResolvedValue({ archivable: true, blockers: [], session_key: 'arch-1' })
+}))
 
 vi.mock('@/hermes', async importOriginal => ({
   ...(await importOriginal<Record<string, unknown>>()),
@@ -104,6 +105,9 @@ describe('canonical archive active-work guard', () => {
     $removedSessionIds.set(new Set())
     $sessionTiles.set([{ storedSessionId: 'arch-1', runtimeId: 'rt', dir: 'right' }])
     vi.mocked(setSessionArchived).mockReset().mockResolvedValue({ ok: true })
+    vi.mocked(requestGatewayForProfile)
+      .mockReset()
+      .mockResolvedValue({ archivable: true, blockers: [], session_key: 'arch-1' })
   })
   afterEach(() => {
     cleanup()
@@ -157,6 +161,49 @@ describe('canonical archive active-work guard', () => {
     } finally {
       clearAllPrompts()
     }
+  })
+  it('rejects backend-owned work absent from renderer stores before any optimistic mutation', async () => {
+    vi.mocked(requestGatewayForProfile).mockResolvedValue({
+      archivable: false,
+      blockers: ['process'],
+      session_key: 'arch-1'
+    })
+    const handle = await mountHarness()
+    await act(() => handle.archiveSession('arch-1'))
+    expect(setSessionArchived).not.toHaveBeenCalled()
+    expect($sessions.get()).toHaveLength(1)
+    expect($removedSessionIds.get().size).toBe(0)
+    expect($sessionTiles.get()).toHaveLength(1)
+  })
+  it('fails closed on discovery network errors without evicting the row', async () => {
+    vi.mocked(requestGatewayForProfile).mockRejectedValue(new Error('offline'))
+    const handle = await mountHarness()
+    await act(() => handle.archiveSession('arch-1'))
+    expect(setSessionArchived).not.toHaveBeenCalled()
+    expect($removedSessionIds.get().size).toBe(0)
+  })
+  it('feature detects only a missing additive RPC on older gateways', async () => {
+    vi.mocked(requestGatewayForProfile).mockRejectedValue(
+      Object.assign(new Error('Method not found'), { code: -32601 })
+    )
+    const handle = await mountHarness()
+    await act(() => handle.archiveSession('arch-1'))
+    expect(setSessionArchived).toHaveBeenCalledWith('arch-1', true, 'default')
+  })
+  it('rechecks local activity that begins during the read-only backend probe', async () => {
+    vi.mocked(requestGatewayForProfile).mockImplementation(async () => {
+      $sessionStates.set({ rt: { storedSessionId: 'arch-1', busy: true, messages: [] } } as never)
+
+      return { archivable: true, blockers: [], session_key: 'arch-1' }
+    })
+    const handle = await mountHarness()
+    await act(() => handle.archiveSession('arch-1'))
+    expect(setSessionArchived).not.toHaveBeenCalled()
+    expect(requestGatewayForProfile).toHaveBeenCalledWith('default', 'fork.session.archive_status', {
+      session_id: 'arch-1',
+      profile: 'default'
+    })
+    expect($sessionTiles.get()).toHaveLength(1)
   })
   it('allows an idle OPEN runtime; tab presence and is_active are not work', async () => {
     $sessionStates.set({

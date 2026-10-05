@@ -285,6 +285,28 @@ describe('host.fork.sessions.archive', () => {
     }
   })
 
+  it('reports a backend-discovered active member as skipped, not rolled back', async () => {
+    const gateway = await import('@/store/gateway')
+
+    const probe = vi
+      .spyOn(gateway, 'requestGatewayForProfile')
+      .mockResolvedValue({ archivable: false, blockers: ['process'], session_key: 'remote' })
+
+    const { guardForkSessionArchive } = await import('./archive-guard')
+    archiveSession.mockImplementation(async id => {
+      await guardForkSessionArchive(id, 'default')
+    })
+
+    try {
+      expect(await forkHost.sessions.archive(['remote'])).toEqual({
+        archived: [],
+        failed: [],
+        skipped: [{ id: 'remote', reason: 'backend-work' }]
+      })
+    } finally {
+      probe.mockRestore()
+    }
+  })
   it('caps concurrency at 4', async () => {
     let inFlight = 0
     let peak = 0

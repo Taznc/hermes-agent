@@ -7,7 +7,13 @@ import { $removedSessionIds } from '@/store/session-removal'
 import { sessionTileDelegate } from '@/store/session-states'
 import { $archivedSessions, loadArchivedSessions } from '@/store/sidebar-archive'
 
-import { $archiveBlockers, $archiveSessionRows, type ArchiveBlocker, canArchiveSession } from './archive-guard'
+import {
+  $archiveBlockers,
+  $archiveSessionRows,
+  type ArchiveBlocker,
+  canArchiveSession,
+  takeForkArchiveRefusal
+} from './archive-guard'
 import { SIDEBAR_GROUP_ACTION_AREA } from './sidebar-group-actions'
 import { forkUi } from './ui-bridge/sdk'
 
@@ -72,6 +78,7 @@ async function archiveMany(ids: readonly string[]): Promise<ForkArchiveResult> {
         // closes the tile + runtime state, clears persisted unread, and rolls
         // all of it back on failure. The backend flips `sessions.archived` for
         // the whole compression lineage in one transaction.
+        takeForkArchiveRefusal(id)
         await delegate.archiveSession(id)
 
         // archiveSession reports failure by rolling back + toasting rather
@@ -79,7 +86,7 @@ async function archiveMany(ids: readonly string[]): Promise<ForkArchiveResult> {
         // on rollback, never set when ownership can't be resolved. Works for
         // rows this window never loaded (project members past the preview).
         if (!$removedSessionIds.get().has(id)) {
-          const after = $archiveBlockers.get()[id]
+          const after = $archiveBlockers.get()[id] ?? takeForkArchiveRefusal(id)
 
           if (after) {
             ;(result.skipped ??= []).push({ id, reason: after })
