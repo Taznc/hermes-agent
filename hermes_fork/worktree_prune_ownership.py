@@ -29,6 +29,7 @@ import json
 import logging
 import os
 import re
+import subprocess
 import sys
 from pathlib import Path
 from typing import Optional
@@ -196,7 +197,7 @@ def reap_prune_verdicts(repo_root: str, verdicts: list, stale_work_cutoff: float
         if not owned or not is_prune_owned_worktree(str(entry), current or ""):
             logger.warning("Preserving worktree %s: ownership changed before removal", entry)
             continue
-        if ops._worktree_is_dirty(str(entry), timeout=5):
+        if ops._worktree_is_dirty(str(entry), repo_root, timeout=5):
             logger.debug("Preserving worktree %s: state changed or unpushed at removal", entry)
             continue
         if ops._worktree_has_unpushed_commits(str(entry), timeout=5) and not (
@@ -228,7 +229,9 @@ def reap_prune_verdicts(repo_root: str, verdicts: list, stale_work_cutoff: float
             if branch and verdict == "reap-keep-branch":
                 kept_branches.add(branch)
             elif branch:
-                ops._git(["branch", "-D", branch], repo_root)
+                # Unattended sweep: the repository's reference-transaction hook must not run.
+                ops._git(["branch", "-D", branch], repo_root,
+                         stdin=subprocess.DEVNULL, env=ops.noninteractive_git_env())
             logger.debug("Pruned stale worktree: %s (force=%s)", entry.name, force)
         except Exception as e:
             logger.debug("Failed to prune worktree %s: %s", entry.name, e)

@@ -10,6 +10,9 @@ the card was given up while the quota reset ~59 minutes later.
 These tests drive the real raise site -> real ``CLIChatTurnMixin.chat`` -> real
 ``_run_single_query_mode`` exit (incl. the ``[kanban-worker-exit]`` trailer the worker
 writes to its log) -> real ``detect_crashed_workers`` on an isolated board.
+
+The fork's ``startup-quota-exit`` shim was retired when upstream 25b6a9f010 brought the
+same fix inline; these tests now pin upstream's ``-q`` exit against that incident.
 """
 
 from __future__ import annotations
@@ -225,8 +228,7 @@ def test_quota_flag_is_ignored_outside_a_kanban_worker(monkeypatch):
 )
 def test_a_turn_result_wins_over_a_stale_startup_flag(monkeypatch, turn_result, expected):
     """The flag only describes a run that never produced a turn; a real result decides."""
-    from hermes_fork.kanban.startup_quota_exit import single_query_exit_code
+    from hermes_cli.cli_single_query import _single_query_exit_code
 
     monkeypatch.setenv("HERMES_KANBAN_TASK", "t_fixture")
-    stub = SimpleNamespace(_last_turn_result=turn_result, _credentials_rate_limited=True)
-    assert single_query_exit_code(stub) == expected
+    assert _single_query_exit_code(turn_result, credentials_rate_limited=True) == expected

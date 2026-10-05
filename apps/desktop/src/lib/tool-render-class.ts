@@ -7,9 +7,8 @@
  * what the grouping actually renders, so the classification lives on its own
  * rather than inside either one.
  */
-
 // >>> FORK ANCHOR: plugin-result-card-classification <<<
-import { isPluginResultCard } from '@/fork/ui-bridge/card-classification'
+import { isPluginResultCard as isPlugin } from '@/fork/ui-bridge/card-classification'
 
 const FILE_EDIT_TOOL_NAMES = new Set(['edit_file', 'patch', 'write_file'])
 
@@ -31,19 +30,19 @@ export function isFileEditTool(toolName: string): boolean {
 //
 // Everything else is ephemeral activity — reads, searches, commands — which is
 // what a run summarizes and what the live ticker cycles through.
-const CARD_TOOL_NAMES = new Set(['clarify', 'delegate_task', 'image_generate', 'manage_catalog'])
+const CARD_TOOL_NAMES = ['clarify', 'delegate_task', 'image_generate', 'manage_catalog', 'manage_connections'] as const
+
+export type CardToolName = (typeof CARD_TOOL_NAMES)[number]
+
+export function isCardToolName(toolName: string): toolName is CardToolName {
+  return (CARD_TOOL_NAMES as readonly string[]).includes(toolName)
+}
 
 // Name the run splitter uses for a manage_connections part it has classified as a card.
 export const CONNECTION_CARD_KEY = 'manage_connections:card'
 
 export function isCardTool(toolName: string): boolean {
-  return (
-    isPluginResultCard(toolName) ||
-    CARD_TOOL_NAMES.has(toolName) ||
-    toolName === CONNECTION_CARD_KEY ||
-    isFileEditTool(toolName) ||
-    toolName === 'manage_connections'
-  )
+  return isPlugin(toolName) || isCardToolName(toolName) || toolName === CONNECTION_CARD_KEY || isFileEditTool(toolName)
 }
 
 // Activity tools that render nothing at all: `todo` parts are hoisted to a
