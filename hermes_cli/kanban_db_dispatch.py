@@ -2964,6 +2964,10 @@ def _default_spawn(task: Task, workspace: str, *, board: Optional[str] = None) -
     # The module argv must carry the import context that made it resolvable:
     # the shim's in-process path injection is invisible to the bare child.
     _propagate_module_import_root(cmd, env)
+    # >>> FORK ANCHOR: worker-import-isolation <<<
+    from hermes_fork.kanban.worker_imports import isolate_worker_imports
+    cmd = isolate_worker_imports(cmd, env)
+    # <<< FORK ANCHOR >>>
     # A worker spawned by a managed systemd gateway must leave the gateway's
     # cgroup before startup; otherwise restarting the service kills the worker
     # that is performing the handoff.
