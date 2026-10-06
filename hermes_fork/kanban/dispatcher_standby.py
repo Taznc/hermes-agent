@@ -32,6 +32,12 @@ What this changes relative to upstream ``next``:
   started), and exposes where an in-flight tick is waiting (``phase``,
   ``phase_elapsed_seconds``, ``stalled``). Snapshots are payload-free: no task
   ids, board names, paths or error text.
+* Capacity wait vs starvation. A tick that spawns nothing because every
+  spawnable row is held by an occupied concurrency limit (``max_in_progress``,
+  ``max_spawn``, ``max_in_progress_per_profile``) is ``last_outcome=capacity_wait``
+  (``capacity_wait_boards``, ``capacity_wait_streak``) and does not feed the
+  "dispatcher stuck" streak; free capacity with no spawn still does. Rules:
+  :mod:`hermes_fork.kanban.capacity_wait`.
 
 Observable per watcher at ``runner._fork_kanban_dispatcher_health.snapshot()``
 (every role, including standby and disabled), and machine-wide in the leader
@@ -75,6 +81,7 @@ from gateway.kanban_watchers_dispatcher import (
     _log_spawn_results,
     _resolve_dispatcher_settings,
 )
+from hermes_fork.kanban.capacity_wait import tick_capacity_wait_boards
 
 HEALTH_ATTR = "_fork_kanban_dispatcher_health"
 _ACTIVE_ATTR = "_fork_kanban_dispatcher_active"
@@ -111,6 +118,7 @@ class DispatcherHealth:
             "spawned": 0, "spawned_total": 0, "last_progress_at": None,
             "guard_deferred_boards": 0, "no_capacity_boards": 0, "error_boards": 0,
             "ready_pending": False, "no_spawn_streak": 0,
+            "capacity_wait_boards": 0, "capacity_wait_streak": 0,
         }
 
     # -- role -------------------------------------------------------------
@@ -148,7 +156,8 @@ class DispatcherHealth:
 
     def finish_tick(self, results: Optional[Iterable[tuple[str, Any]]] = (), *,
                     ready_pending: bool = False, error_type: Optional[str] = None,
-                    paused: bool = False, no_spawn_streak: int = 0) -> None:
+                    paused: bool = False, no_spawn_streak: int = 0,
+                    capacity_wait_boards: int = 0, capacity_wait_streak: int = 0) -> None:
         results = list(results or ())
         spawned = sum(len(getattr(res, "spawned", ()) or ()) for _, res in results)
         guarded = sum(bool(
@@ -161,10 +170,12 @@ class DispatcherHealth:
         ) for _, res in results)
         errors = sum(res is None for _, res in results)
         # Precedence: an error outranks everything; "no_spawn" means ready work
-        # exists but nothing started for no reported reason (not an inferred hang).
+        # exists but nothing started for no reported reason (not an inferred hang);
+        # "capacity_wait" means every pending row is held by an occupied limit.
         outcome = next((name for cond, name in (
             (error_type or errors, "error"), (spawned, "spawned"),
-            (paused or guarded, "guard_deferred"), (capped, "no_capacity"),
+            (paused or guarded, "guard_deferred"), (capacity_wait_boards, "capacity_wait"),
+            (capped, "no_capacity"),
             (ready_pending, "no_spawn"),
         ) if cond), "idle")
         now = self._clock()
@@ -179,6 +190,7 @@ class DispatcherHealth:
             spawned_total=self._state["spawned_total"] + spawned,
             guard_deferred_boards=guarded, no_capacity_boards=capped, error_boards=errors,
             ready_pending=bool(ready_pending), no_spawn_streak=no_spawn_streak,
+            capacity_wait_boards=capacity_wait_boards, capacity_wait_streak=capacity_wait_streak,
         )
         if outcome != "error":
             self._state["last_success_at"] = finished  # liveness, even when idle
@@ -363,12 +375,12 @@ async def _lead(runner: Any, health: DispatcherHealth, service: _Service, publis
 
     from hermes_cli import kanban_db_dispatch as kbd
 
-    bad_ticks, last_warn_at = 0, 0.0
+    bad_ticks, cap_ticks, last_warn_at = 0, 0, 0.0
     logger.info("kanban dispatcher: embedded in gateway (interval=%.1fs)", interval)
     while runner._running:
         health.begin_tick()
         results: Optional[list] = None
-        ready_pending, paused, error_type = False, False, None
+        ready_pending, paused, error_type, cap_boards = False, False, None, 0
         try:
             # Reap before per-board work so a board DB failure cannot block cleanup.
             pids = await service("reap", kbd.reap_worker_zombies)
@@ -379,7 +391,7 @@ async def _lead(runner: Any, health: DispatcherHealth, service: _Service, publis
             logger.exception("kanban dispatcher: zombie reaper failed")
         try:
             if not _kanban_dispatch_allowed():  # `hermes pause`
-                bad_ticks, paused = 0, True
+                bad_ticks, cap_ticks, paused = 0, 0, True
             else:
                 health.phase("configure")
                 ad_enabled, ad_per_tick = _resolve_auto_decompose_settings(load_config)  # live, #49638
@@ -388,7 +400,10 @@ async def _lead(runner: Any, health: DispatcherHealth, service: _Service, publis
                 results = await service("dispatch", dispatcher.tick_once)
                 any_spawned = _log_spawn_results(results)
                 ready_pending = await service("ready_probe", dispatcher.ready_nonempty)
-                bad_ticks = bad_ticks + 1 if ready_pending and not any_spawned else 0
+                if ready_pending and not any_spawned:
+                    cap_boards = await service("capacity_probe", tick_capacity_wait_boards, results)
+                bad_ticks = bad_ticks + 1 if ready_pending and not any_spawned and not cap_boards else 0
+                cap_ticks = cap_ticks + 1 if cap_boards else 0
             now = time.time()
             if bad_ticks >= _HEALTH_WINDOW and now - last_warn_at >= _REPORT_EVERY_S:
                 held = kbd.describe_suppression(res for _slug, res in (results or []))
@@ -406,7 +421,8 @@ async def _lead(runner: Any, health: DispatcherHealth, service: _Service, publis
             error_type = type(exc).__name__
             logger.exception("kanban dispatcher: unexpected watcher error")
         health.finish_tick(results, ready_pending=ready_pending, error_type=error_type,
-                           paused=paused, no_spawn_streak=bad_ticks)
+                           paused=paused, no_spawn_streak=bad_ticks,
+                           capacity_wait_boards=cap_boards, capacity_wait_streak=cap_ticks)
         publish()
         await runner._sleep_between_ticks(interval)
 
