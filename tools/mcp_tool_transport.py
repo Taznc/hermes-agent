@@ -284,7 +284,9 @@ class MCPServerTransportMixin:
         not unpacked (mcp 1.x yields a 3-tuple, 2.x a pair); a TaskGroup drop maps to ``"reconnect"``."""
         try:
             async with transport_cm as _streams:
-                async with _core.ClientSession(_streams[0], _streams[1], **self._session_kwargs()) as session:
+                # >>> FORK ANCHOR: mcp-raw-annotations <<<
+                from hermes_fork.mcp_raw_hints import client_session
+                async with client_session(_core.ClientSession, _streams[0], _streams[1], self.name, **self._session_kwargs()) as session:  # <<< FORK ANCHOR >>>
                     return await self._serve_session(session, connect_timeout, label)
         except BaseExceptionGroup as _eg:
             return self._reconnect_or_reraise_group(_eg)
@@ -407,7 +409,9 @@ class MCPServerTransportMixin:
                 if new_pids:
                     self._track_spawned_children(new_pids)
                 self._stdio_child_pids = set(new_pids)  # so in-flight calls fail fast when the child dies
-                async with _core.ClientSession(read_stream, write_stream, **self._session_kwargs()) as session:
+                # >>> FORK ANCHOR: mcp-raw-annotations <<<
+                from hermes_fork.mcp_raw_hints import client_session
+                async with client_session(_core.ClientSession, read_stream, write_stream, self.name, **self._session_kwargs()) as session:  # <<< FORK ANCHOR >>>
                     # Bound the handshake here (``connect_timeout`` only bounds the caller's ``.result()``):
                     # a server that never answers ``initialize`` would leak child + pipes per retry until EMFILE.
                     connect_timeout = float(config.get("connect_timeout", _core._DEFAULT_CONNECT_TIMEOUT))
