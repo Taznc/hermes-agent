@@ -1,4 +1,5 @@
 import { isSessionNotOwnedError } from '@/app/session/hooks/use-prompt-actions/utils'
+import { isAskSideQuestion } from '@/fork/side-question'
 import { runtimeTranslations, translateNow } from '@/i18n'
 import { textPart } from '@/lib/chat-messages'
 import { coerceGatewayText } from '@/lib/chat-runtime'
@@ -147,7 +148,8 @@ export function handleStatusEvent(ctx: GatewayEventContext): boolean {
     // prompt.btw answers a side question and emits this on the originating
     // session. Persistent transcript line, matching the TUI's `[btw "q"]`
     // — without it Desktop only ever showed the acknowledgement (#99065).
-    const text = coerceGatewayText(payload?.text).trim()
+    // >>> FORK ANCHOR: ask-side-question-echo <<<
+    const text = isAskSideQuestion(payload?.question) ? '' : coerceGatewayText(payload?.text).trim()
 
     if (text && sessionId) {
       const taskId = String(payload?.task_id ?? '').trim()
