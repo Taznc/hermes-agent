@@ -128,8 +128,15 @@ def admit(
     is the fork's only per-tick seam that runs under the board's tick lock
     before the lanes are enumerated, so a card handed back from a diagnosis
     hop is dispatched in this same tick without a second upstream anchor.
+
+    It is also the only seam that sees upstream's own verdict, so it marks a
+    tick refused on a full concurrency cap for dispatcher health
+    (:func:`hermes_fork.kanban.capacity_wait.mark`).
     """
+    from hermes_fork.kanban.capacity_wait import mark as mark_capacity_wait
     from hermes_fork.kanban.review_routing import return_diagnosed
+
+    mark_capacity_wait(result, may_spawn)
 
     try:
         return_diagnosed(conn, dry_run=dry_run)
