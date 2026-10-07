@@ -25,6 +25,9 @@ _UPSTREAM_LIMIT_RE = re.compile(
     r"^@ context injection (refused|warning): (\d+) tokens exceeds the (\d+)% (hard|soft) limit \((\d+)\)\.$"
 )
 
+# Upstream's generated warnings header (agent/context_references.py:243).
+_WARNINGS_MARKER = "\n\n--- Context Warnings ---\n"
+
 _NEXT_STEP = (
     "Reference fewer or smaller files, use a line range such as @file:path:1-200, "
     "or name the file without @ so Hermes reads only what it needs with its tools."
@@ -77,27 +80,25 @@ def with_actionable_limit_copy(fn: Callable[..., Awaitable[Any]]) -> Callable[..
         else:
             new_warning = _actionable_warning(tokens, limit, pct, window)
 
+        # H (refused) returns before upstream builds result.message (line 234), so the
+        # message is still the user's text: only the warning changes.
+        # S (warning) builds (user text + generated warnings block + Attached Context)
+        # .strip() (lines 241-246). Either the user text or an attached file can hold the
+        # marker or the old line verbatim, so search-and-replace is unsafe. Only leading
+        # whitespace is stripped from the user text, so the generated block starts exactly
+        # at len(original_message.lstrip()). Rewrite only when the block there is exactly
+        # the one rebuilt from result.warnings; otherwise pass through untouched so
+        # result.message and result.warnings never disagree.
+        if kind == "warning":
+            message = result.message
+            start = len(result.original_message.lstrip())
+            old_block = _WARNINGS_MARKER + "\n".join(f"- {w}" for w in result.warnings)
+            if not message.startswith(old_block, start):
+                return result
+            new_block = old_block[: -len(old_warning)] + new_warning
+            result.message = message[:start] + new_block + message[start + len(old_block):]
+
         result.warnings[-1] = new_warning
-
-        # H (refused) returns before upstream rebuilds result.message (line 234), so
-        # result.message is still the original text there: nothing to rewrite.
-        # S (warning) proceeds to expansion, so upstream appends "- " + old_warning
-        # after the GENERATED "\n\n--- Context Warnings ---\n" marker (line 243). That
-        # marker is only ever generated once, appended after the (possibly user-typed)
-        # original message, so the LAST occurrence of the marker string in the final
-        # message is always the generated one — a user who types the same marker/old
-        # warning text earlier in their message leaves an occurrence that sorts before
-        # it. rpartition (not partition) targets that trailing generated block only,
-        # so user-authored text is never touched.
-        if kind == "warning" and result.expanded and result.message:
-            marker = "\n\n--- Context Warnings ---\n"
-            head, sep, tail = result.message.rpartition(marker)
-            if sep:
-                old_line = f"- {old_warning}"
-                new_tail = tail.replace(old_line, f"- {new_warning}", 1)
-                if new_tail != tail:
-                    result.message = head + sep + new_tail
-
         return result
 
     return wrapper

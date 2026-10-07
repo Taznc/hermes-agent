@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import asyncio
 import inspect
+import re
 from pathlib import Path
 
 import agent.context_references as ctx_mod
@@ -30,8 +31,6 @@ def test_hard_refusal_is_actionable(tmp_path: Path):
     assert not result.expanded
     last = result.warnings[-1]
     assert last.startswith("@ context injection refused: ")
-    import re
-
     assert re.search(r"about [\d,]+ tokens, over the 500-token limit", last)
     assert "50% of this model's 1,000-token context window" in last
     assert "Nothing was attached, and this message was not sent to the model." in last
@@ -65,7 +64,6 @@ def test_soft_warning_is_actionable_and_expansion_proceeds(tmp_path: Path):
     assert last in result.message
     marker = "\n\n--- Context Warnings ---\n"
     assert marker in result.message
-    assert "soft limit" not in result.warnings[0] if result.warnings else True
     assert "soft limit" not in "\n".join(result.warnings)
     assert "soft limit" not in result.message
 
@@ -130,8 +128,7 @@ def test_wrapper_contract(tmp_path: Path):
     assert inspect.iscoroutinefunction(ctx_mod.preprocess_context_references_async)
     assert ctx_mod.preprocess_context_references_async.__wrapped__ is not None
 
-    # Unmatched last warning (no refs at all -> no warnings -> early return) returns
-    # the same object unchanged.
+    # No refs at all -> no warnings -> the wrapper's early return leaves warnings empty.
     result = asyncio.run(
         ctx_mod.preprocess_context_references_async("no refs here", cwd=tmp_path, context_length=1_000)
     )
@@ -153,7 +150,7 @@ def test_wrapper_contract(tmp_path: Path):
 def test_user_typed_marker_and_old_warning_text_preserved(tmp_path: Path):
     """Regression: a user message that happens to contain the literal generated
     marker plus upstream old-style warning text must be preserved byte-for-byte;
-    only the GENERATED trailing block (after the last marker) is rewritten."""
+    only the generated block that follows the user text is rewritten."""
     (tmp_path / "only.txt").write_text("x" * 1200, encoding="utf-8")
 
     fake_old_warning = "@ context injection warning: 60000 tokens exceeds the 25% soft limit (50000)."
@@ -170,3 +167,72 @@ def test_user_typed_marker_and_old_warning_text_preserved(tmp_path: Path):
     # The real (generated, trailing) warning must be the new actionable copy.
     assert result.warnings[-1].startswith("@ context injection warning: the @ references")
     assert result.warnings[-1] in result.message
+
+
+_MARKER = "\n\n--- Context Warnings ---\n"
+_ATTACHED = "\n\n--- Attached Context ---\n\n"
+
+
+def _assert_only_generated_block_rewritten(tmp_path: Path, user_text: str, body: str) -> None:
+    upstream_fn = ctx_mod.preprocess_context_references_async.__wrapped__
+    upstream = asyncio.run(upstream_fn(user_text, cwd=tmp_path, context_length=1_000))
+    wrapped = ctx_mod.preprocess_context_references(user_text, cwd=tmp_path, context_length=1_000)
+
+    assert wrapped.expanded and not wrapped.blocked
+    new_warning = wrapped.warnings[-1]
+    assert new_warning.startswith("@ context injection warning: the @ references")
+
+    # The Attached Context region holding the file body is byte-identical to upstream's.
+    assert body in upstream.message
+    attached_at = wrapped.message.index(_ATTACHED)
+    assert wrapped.message[attached_at:] == upstream.message[upstream.message.index(_ATTACHED):]
+    assert body in wrapped.message[attached_at:]
+
+    # The generated block, directly after the user text, carries only the new copy.
+    assert wrapped.message[len(user_text.strip()):attached_at] == _MARKER + "- " + new_warning
+
+
+def test_attached_file_containing_marker_is_untouched(tmp_path: Path):
+    """An attached file whose body contains the generated marker must not hijack the
+    rewrite (review t_f1978d20 failure mode a): the file body stays byte-identical and
+    the generated block shows the new copy."""
+    body = "notes" + _MARKER + "- some unrelated bullet\n" + "x" * 1200 + "\n"
+    (tmp_path / "only.txt").write_text(body, encoding="utf-8")
+
+    _assert_only_generated_block_rewritten(tmp_path, "Inspect @file:only.txt", body)
+
+
+def test_attached_file_containing_marker_and_exact_old_line_is_untouched(tmp_path: Path):
+    """Failure mode b: the attached body holds the marker AND the exact old warning line
+    upstream generates for this very request; the body must not be rewritten."""
+    upstream_fn = ctx_mod.preprocess_context_references_async.__wrapped__
+    user_text = "Inspect @file:only.txt"
+
+    def body_for(tokens: int) -> str:
+        line = f"- @ context injection warning: {tokens} tokens exceeds the 25% soft limit (250)."
+        return "notes" + _MARKER + line + "\n" + "x" * 1200 + "\n"
+
+    # A fixed-width (3-digit) count keeps the body length, hence the token estimate, constant.
+    (tmp_path / "only.txt").write_text(body_for(999), encoding="utf-8")
+    tokens = asyncio.run(upstream_fn(user_text, cwd=tmp_path, context_length=1_000)).injected_tokens
+    assert 100 <= tokens <= 999
+    body = body_for(tokens)
+    (tmp_path / "only.txt").write_text(body, encoding="utf-8")
+    upstream = asyncio.run(upstream_fn(user_text, cwd=tmp_path, context_length=1_000))
+    assert "- " + upstream.warnings[-1] in body  # the file really holds the exact old line
+
+    _assert_only_generated_block_rewritten(tmp_path, user_text, body)
+
+
+def test_user_text_surrounding_whitespace_keeps_offset_exact(tmp_path: Path):
+    """Upstream strips the final message, removing the user text's leading whitespace
+    but keeping trailing whitespace; the rewrite must still land on the generated block."""
+    (tmp_path / "only.txt").write_text("x" * 1200, encoding="utf-8")
+    user_text = "  \n Inspect @file:only.txt \n\n"
+    result = ctx_mod.preprocess_context_references(user_text, cwd=tmp_path, context_length=1_000)
+
+    assert result.warnings[-1].startswith("@ context injection warning: the @ references")
+    start = len(user_text.lstrip())
+    assert result.message[:start] == user_text.lstrip()
+    assert result.message.startswith(_MARKER + "- " + result.warnings[-1], start)
+    assert "soft limit" not in result.message
