@@ -35,6 +35,9 @@ logger = logging.getLogger(__name__)
 
 KEY = "fork_compaction_watermark"
 RECORD_VERSION = 1
+# Durable tombstone written by a clear: same behaviour as an absent key, but it stops a rotating-compaction
+# child from re-inheriting its parent's record after the user reset the child (JSON ``false``).
+CLEARED = False
 
 # Spec Q3: module constants, fractions of the usable input window.
 STEP_RATIO = 0.10
@@ -124,7 +127,8 @@ def _record_applies(cc: Any, record: Optional[dict]) -> bool:
 def _lazy_load(cc: Any, state: dict) -> None:
     """Consult the durable row once per bound session id (spec §3). Never raises."""
     session_id = getattr(cc, "_session_id", "") or ""
-    if state.get(_LOADED_FOR) == session_id:
+    previous_loaded = state.get(_LOADED_FOR)
+    if previous_loaded == session_id:
         return
     state[_LOADED_FOR] = session_id  # first, so a reentrant read cannot repeat the load
     if not session_id:
@@ -140,14 +144,18 @@ def _lazy_load(cc: Any, state: dict) -> None:
             parent_id = _continuation_parent_id(db, session_id)
             if parent_id:
                 current = state.get(_SLOT)
-                # Prefer the in-memory record: a defer just before rotation may not have flushed yet.
-                raw = (_durable_form(current) if current is not None and current.get("session_id") == parent_id
-                       else db.get_session_model_config_value(parent_id, KEY))
+                if previous_loaded == parent_id:
+                    # Same compressor rotated in-process: its in-memory state is authoritative (a defer or a
+                    # clear just before rotation may still be queued on the write executor).
+                    raw = (_durable_form(current) if current is not None and current.get("session_id") == parent_id
+                           else None)
+                else:
+                    raw = db.get_session_model_config_value(parent_id, KEY)
                 inherited = raw is not None
     except Exception:
         logger.debug("compaction watermark load failed for session %s", session_id, exc_info=True)
         return
-    if raw is None:
+    if raw is None or raw is CLEARED:
         return
     record, reason = validate_record(raw)
     if record is None:
@@ -326,7 +334,7 @@ def _get_executor() -> ThreadPoolExecutor:
 
 
 def schedule_durable_write(cc: Any, record: Optional[dict]) -> Optional[Future]:
-    """Persist (or clear, when *record* is None) on the fork's single-worker executor.
+    """Persist (or tombstone with :data:`CLEARED`, when *record* is None) on the fork's single-worker executor.
 
     Returns the Future, or None when the compressor has no durable session row to write.
     """
@@ -334,7 +342,7 @@ def schedule_durable_write(cc: Any, record: Optional[dict]) -> Optional[Future]:
     db = getattr(cc, "_session_db", None)
     if not session_id or db is None or not callable(getattr(type(db), "patch_session_model_config", None)):
         return None
-    value = _durable_form(record) if record is not None else None
+    value = _durable_form(record) if record is not None else CLEARED
 
     def _write() -> None:
         try:

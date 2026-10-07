@@ -137,7 +137,7 @@ def _clear_durable(session: dict) -> None:
     def _write() -> None:
         with _owner_db(session) as db:
             if db is not None:
-                db.patch_session_model_config(key, {wm.KEY: None})
+                db.patch_session_model_config(key, {wm.KEY: wm.CLEARED})
 
     wm._get_executor().submit(_write)
 

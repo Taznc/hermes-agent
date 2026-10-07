@@ -130,7 +130,7 @@ def test_defer_round_trip_and_write_lands_on_the_fork_executor(server, db):
     cleared = _call(server, "fork.session.compaction_watermark", {"session_id": "S", "action": "clear"})["result"]
     assert cleared["active"] is False and cleared["threshold_tokens"] == 484_000
     _flush()
-    assert db.get_session_model_config_value("KEY", wm.KEY) is None
+    assert db.get_session_model_config_value("KEY", wm.KEY) is wm.CLEARED
 
 
 def test_get_lazily_loads_the_durable_record_after_restart(server, db):
@@ -157,4 +157,5 @@ def test_get_and_clear_without_an_agent_use_the_durable_row(server, db, monkeypa
     assert got["active"] is True and got["watermark_tokens"] == 586_800 and got["threshold_tokens"] is None
     _call(server, "fork.session.compaction_watermark", {"session_id": "S", "action": "clear"})
     _flush()
-    assert db.get_session_model_config_value("KEY", wm.KEY) is None
+    assert db.get_session_model_config_value("KEY", wm.KEY) is wm.CLEARED
+    assert _call(server, "fork.session.compaction_watermark", {"session_id": "S"})["result"]["active"] is False
