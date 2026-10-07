@@ -697,3 +697,8 @@ def _file_metadata(path: Path) -> str:
             return f"{lines + 1} lines"
     except (LiveConnectionError, OSError):
         return f"{size} bytes"
+
+# >>> FORK ANCHOR: context-limit-copy <<<
+from hermes_fork.context_limit_messages import with_actionable_limit_copy
+preprocess_context_references_async = with_actionable_limit_copy(preprocess_context_references_async)  # type: ignore[assignment]
+# <<< FORK ANCHOR >>>
