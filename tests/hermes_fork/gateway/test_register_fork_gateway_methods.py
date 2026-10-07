@@ -74,7 +74,10 @@ def test_fork_ping_contract_is_enforced_at_admission(server):
 def test_reregistration_is_idempotent(server):
     """tests re-import the server under ``patch.dict(sys.modules)``; the anchor runs again."""
     handler_before = server._methods["fork.ping"]
-    assert fork_gateway.register_fork_gateway_methods(server) == ["fork.ping", "fork.session.archive_status"]
+    assert fork_gateway.register_fork_gateway_methods(server) == [
+        "fork.ping", "fork.session.archive_status",
+        "fork.session.compaction_defer", "fork.session.compaction_watermark",
+    ]
     assert server._methods["fork.ping"] is not handler_before
     assert server.dispatch({"jsonrpc": "2.0", "id": 9, "method": "fork.ping"})["result"]["ok"] is True
 

@@ -99,9 +99,9 @@ upstream_methods = upstream_only  # F24 name, kept for callers of the original a
 
 def _fork_method_modules() -> tuple[ModuleType, ...]:
     """Every fork gateway method module. Add each new ``methods_*`` module here."""
-    from hermes_fork.gateway import methods_ping, methods_session_archive
+    from hermes_fork.gateway import methods_compaction, methods_ping, methods_session_archive
 
-    return (methods_ping, methods_session_archive)
+    return (methods_ping, methods_session_archive, methods_compaction)
 
 
 def _default_modules() -> tuple[ModuleType, ...]:

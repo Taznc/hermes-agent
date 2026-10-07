@@ -2319,7 +2319,10 @@ class ContextCompressor(SummaryDispatchMixin, MicroCompactionMixin, ContextEngin
             _ctx = self.context_length
             self._threshold_tokens = self._compute_threshold_tokens(_ctx, self.threshold_percent, self.max_tokens)
             self._apply_threshold_tokens_cap()
-        return self._threshold_tokens
+        # >>> FORK ANCHOR: session-compaction-watermark <<<
+        from hermes_fork.compaction.watermark import effective_threshold_tokens
+        return effective_threshold_tokens(self, self._threshold_tokens)
+        # <<< FORK ANCHOR >>>
 
     @threshold_tokens.setter
     def threshold_tokens(self, value: int) -> None:

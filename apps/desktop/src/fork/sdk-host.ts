@@ -15,8 +15,13 @@ import {
   observeArchiveSession,
   takeForkArchiveRefusal
 } from './archive-guard'
+import { installCompactionWatermarkChip } from './compaction-watermark'
 import { SIDEBAR_GROUP_ACTION_AREA } from './sidebar-group-actions'
 import { forkUi } from './ui-bridge/sdk'
+
+// "Keep full context" statusbar chip (spec t_07c75c42): always mounted, so it
+// is registered once at module load (this module is on the SDK boot chain).
+installCompactionWatermarkChip()
 
 /**
  * `host.fork` — the fork's namespaced, versioned Desktop plugin capabilities
