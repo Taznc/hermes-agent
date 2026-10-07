@@ -1443,3 +1443,8 @@ def real_bash() -> str:
             if candidate.exists():
                 return str(candidate)
     return found or "bash"
+
+
+# >>> FORK ANCHOR: superseded-upstream-tests <<<
+from hermes_fork.testing.superseded_upstream import pytest_itemcollected  # noqa: E402,F401
+# <<< FORK ANCHOR >>>

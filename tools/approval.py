@@ -1175,6 +1175,11 @@ def check_all_command_guards(command: str, env_type: str,
     if _should_skip_container_guards(env_type, has_host_access=has_host_access):
         return _user_deny_block(command) or _approved()
 
+    # >>> FORK ANCHOR: lifecycle-consent <<<
+    from hermes_fork.lifecycle_consent import guard as _fork_lifecycle_guard
+    if (_fork_lifecycle := _fork_lifecycle_guard(command, env_type, has_host_access)) is not None:
+        return _fork_lifecycle
+    # <<< FORK ANCHOR >>>
     blocked = _floor_block(command, sudo_guard=True)
     if blocked is not None:
         return blocked
