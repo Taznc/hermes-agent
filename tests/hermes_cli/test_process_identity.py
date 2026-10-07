@@ -362,12 +362,32 @@ def test_reclaim_spares_unprovable_spawner():
 def test_reclaim_reaps_null_spawner_orphan_to_init():
     from hermes_cli import dashboard_procs
 
+    from hermes_cli import main_dashboard
+
     with patch.object(dashboard_procs, "_process_ppid", return_value=1), \
-         patch.object(dashboard_procs, "_lock_owned_serve_pids", return_value=set()):
+         patch.object(dashboard_procs, "_lock_owned_serve_pids", return_value=set()), \
+         patch.object(main_dashboard, "_get_systemd_service_for_pid", return_value=None):
         # Ancient orphan: create_time far past vs real clock → past the lock-write grace.
         result, kills = _reap(procs={555: 1000.0}, create=1000.0)
     assert result == 555
     assert kills == [555]
+
+
+def test_reclaim_spares_systemd_unit_main_pid():
+    """A unit's MainPID has ppid 1 and no recorded spawner, but systemd supervises it.
+
+    A `serve` and a `dashboard` unit on one HERMES_HOME must not reap each other on restart.
+    """
+    from hermes_cli import dashboard_procs
+    from hermes_cli import main_dashboard
+
+    with patch.object(dashboard_procs, "_process_ppid", return_value=1), \
+         patch.object(dashboard_procs, "_lock_owned_serve_pids", return_value=set()), \
+         patch.object(main_dashboard, "_get_systemd_service_for_pid",
+                      return_value="hermes-webdesktop-next-backend.service"):
+        result, kills = _reap(procs={555: 1000.0}, create=1000.0)
+    assert result is None
+    assert kills == []
 
 
 def test_reclaim_spares_null_spawner_with_live_parent():

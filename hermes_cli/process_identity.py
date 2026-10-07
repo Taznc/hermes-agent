@@ -402,8 +402,8 @@ def _reparented_orphan(pid: int) -> bool:
     """Null-spawner owner with no live supervisor: reparented to init, old, lock-unclaimed.
 
     Mirrors ``_reap_orphaned_desktop_local_serves``: operator-managed remote backends legitimately
-    sit at ppid 1 (systemd, an exited sshd), so ppid alone is never proof — the SSH-lock claim
-    and the 180 s lock-write grace exclude live-supervised backends. Windows: the ppid probe is
+    sit at ppid 1 (systemd, an exited sshd), so ppid alone is never proof — a systemd unit's
+    MainPID, the SSH-lock claim and the 180 s lock-write grace exclude live-supervised backends. Windows: the ppid probe is
     unavailable there, so this rung never fires (desktop tree-kill reaps instead).
     """
     try:
@@ -412,6 +412,13 @@ def _reparented_orphan(pid: int) -> bool:
         if _process_ppid(pid) not in (0, 1):
             return False
         if pid in (_lock_owned_serve_pids() or ()):
+            return False
+        # A systemd unit's MainPID also sits at ppid 1 with no recorded spawner, but it is
+        # supervised, not orphaned: a `serve` and a `dashboard` unit sharing one HERMES_HOME
+        # would otherwise reap each other on every restart, and systemd reads our SIGTERM as a
+        # clean stop, so Restart=on-failure leaves the victim down.
+        from hermes_cli.main_dashboard import _get_systemd_service_for_pid
+        if _get_systemd_service_for_pid(pid):
             return False
         import time as _time
 
