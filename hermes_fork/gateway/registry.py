@@ -125,6 +125,14 @@ def _install_gateway_seams(server) -> None:
             raise
         logger.exception("plugin UI bridge failed to install; plugin ui.request will fall back")
 
+    try:
+        from hermes_fork.gateway.config_cache import install as install_config_cache
+        install_config_cache(server)
+    except Exception:
+        if _contracts.STRICT:
+            raise
+        logger.exception("config cache adapter failed to install; retaining upstream raw config handling")
+
 
 def _rpc_handler(method: ForkMethod):
     def handle(rid, params: dict) -> dict:
