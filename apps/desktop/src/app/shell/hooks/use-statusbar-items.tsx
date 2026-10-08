@@ -15,9 +15,9 @@ import { $paneVisible } from '@/components/pane-shell/tree/store'
 import { Badge } from '@/components/ui/badge'
 import { Codicon } from '@/components/ui/codicon'
 import { GlyphSpinner } from '@/components/ui/glyph-spinner'
+import { useMemoizedStatusBarGatewayHealth } from '@/fork/statusbar-gateway-health' // >>> FORK ANCHOR: statusbar-health-memo <<<
 import { useI18n } from '@/i18n'
 import { displayPath, pathLeaf } from '@/lib/display-path'
-import { statusBarGatewayHealth } from '@/lib/gateway-health-pill'
 import {
   Activity,
   AlertCircle,
@@ -367,7 +367,7 @@ export function useStatusbarItems({
   const gatewayOpen = gatewayState === 'open'
   const gatewayConnecting = gatewayState === 'connecting'
 
-  const gatewayHealth = statusBarGatewayHealth({
+  const gatewayHealth = useMemoizedStatusBarGatewayHealth({
     connectionState: gatewayState,
     copy: {
       backend: copy.backend,

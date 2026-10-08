@@ -15,6 +15,7 @@
 
 import { atom } from 'nanostores'
 
+import { tailEntriesForSession } from '@/fork/transcript-tail-index' // >>> FORK ANCHOR: transcript-tail-index <<<
 import type { SessionMessagesResponse } from '@/types/hermes'
 
 export interface TranscriptTailState {
@@ -69,7 +70,7 @@ function transcriptTailKey(storedSessionId: string, profile?: TranscriptProfileS
 }
 
 function matchingTailEntries(storedSessionId: string): Array<[string, TranscriptTailState]> {
-  return Object.entries($transcriptTailBySessionId.get()).filter(([key]) => {
+  return tailEntriesForSession($transcriptTailBySessionId.get(), storedSessionId).matching(([key]) => {
     if (key === storedSessionId) {
       return true
     }
@@ -81,7 +82,7 @@ function matchingTailEntries(storedSessionId: string): Array<[string, Transcript
     } catch {
       return false
     }
-  })
+  }) // <<< FORK ANCHOR >>>
 }
 
 /**

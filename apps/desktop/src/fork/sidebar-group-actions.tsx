@@ -24,6 +24,8 @@ import { $projectTree, fetchProjectSessions, projectProfile } from '@/store/proj
  */
 
 export { useArchiveView } from './project-archive-view'
+export { $sidebarLiveDotStateById as $sessionDotStateById } from './sidebar-status-projections'
+export { hasLiveTurn } from '@/store/session-dot-state'
 
 export const SIDEBAR_GROUP_ACTION_AREA = 'fork.sidebar.groupAction'
 

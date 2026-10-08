@@ -7,7 +7,7 @@ import { type NewSessionSplitHandler, startNewSessionDrag } from '@/app/chat/new
 import { SidebarPanelLabel } from '@/app/shell/sidebar-label'
 import { DisclosureCaret } from '@/components/ui/disclosure-caret'
 import { SidebarGroup, SidebarGroupContent } from '@/components/ui/sidebar'
-import { forkListDividerAction, useForkPublishListRows } from '@/fork/sidebar-group-actions'
+import { $sessionDotStateById, forkListDividerAction, hasLiveTurn, useForkPublishListRows } from '@/fork/sidebar-groups'
 import type { HermesGitWorktree } from '@/global'
 import type { SessionInfo } from '@/hermes'
 import { useI18n } from '@/i18n'
@@ -29,7 +29,6 @@ import {
   toggleWorkspaceNodeCollapsed
 } from '@/store/layout'
 import { sessionPinId } from '@/store/session'
-import { $sessionDotStateById, hasLiveTurn } from '@/store/session-dot-state'
 
 import { SidebarDateDivider, SidebarSectionMeta } from './chrome'
 import { GatewayProfileGroups } from './gateway-groups'
