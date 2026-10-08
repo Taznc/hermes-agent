@@ -454,6 +454,11 @@ def reap_orphaned_backend_owner(
         return None
     if entry is None:
         return None
+    # >>> FORK ANCHOR: reap-spare-systemd-owner <<<
+    from hermes_fork.supervised_owner import is_service_supervised
+    if is_service_supervised(pid):
+        return None  # a unit's MainPID has a supervisor: never an orphan
+    # <<< FORK ANCHOR >>>
     if spawner_is_dead(entry) is not True and not (
             entry.get("spawner_pid") is None and _reparented_orphan(pid)):
         return None  # live or unprovable spawner → never touch
