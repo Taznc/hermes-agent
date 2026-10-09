@@ -34,7 +34,7 @@ _ENV = ("HERMES_YOLO_MODE", "HERMES_INTERACTIVE", "HERMES_GATEWAY_SESSION", "HER
 
 @pytest.fixture
 def env(monkeypatch):
-    """Isolated approval state: manual mode, no yolo, empty allowlist, no persistence, no tirith."""
+    """Isolated approval state: manual mode, no yolo, empty allowlist, no persistence."""
     for name in _ENV:
         monkeypatch.delenv(name, raising=False)
     monkeypatch.setattr(ctx, "_get_approval_config", lambda: {"mode": "manual"})
@@ -44,7 +44,6 @@ def env(monkeypatch):
     A._permanent_set().clear()
     saves: list = []
     monkeypatch.setattr(A, "save_permanent_allowlist", lambda s: saves.append(set(s)))
-    monkeypatch.setattr(A, "_tirith_scan", lambda c: {"action": "allow", "findings": [], "summary": ""})
     A._gateway_queues.clear()
     A._gateway_notify_cbs.clear()
     A._session_approved.pop(SK, None)
